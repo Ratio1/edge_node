@@ -118,11 +118,11 @@ class EpochManager01Plugin(BasePlugin):
   def __eth_to_internal(self, eth_node_address):
     result = self.netmon.epoch_manager.eth_to_internal(eth_node_address)
     if result is None:
-      result = f"<Unknown/Bad eth addr {eth_node_address}>"
+      result = f"unknown:{eth_node_address}"
     return result
   
   
-  def __get_signed_data(self, node_addr : str, epochs : list, epochs_vals : list, sign=True):
+  def __get_signed_data(self, node_addr : str, epochs : list, epochs_vals : list, sign=True, node_addr_eth=None):
     """    
     Sign the given data using the blockchain engine.
     Returns the signature. 
@@ -135,8 +135,13 @@ class EpochManager01Plugin(BasePlugin):
       The internal node address (not EVM)
     
     """
-    node_addr_eth = self.bc.node_address_to_eth_address(node_addr)
-    node_alias = self.netmon.network_node_eeid(addr=node_addr)
+    if node_addr_eth is None:
+      node_addr_eth = self.bc.node_address_to_eth_address(node_addr)
+    try:
+      node_alias = self.netmon.network_node_eeid(addr=node_addr)
+    except:
+      node_alias = "unknown"
+    # end if node_addr_eth is not None
     if sign:
       res = self.bc.eth_sign_node_epochs(
         node=node_addr_eth, 
@@ -205,6 +210,7 @@ class EpochManager01Plugin(BasePlugin):
             
 
     """
+    unknown_address = False
     error_msg = None
     if end_epoch is None:
       end_epoch = self.__get_current_epoch() - 1
@@ -230,51 +236,68 @@ class EpochManager01Plugin(BasePlugin):
     
     node_eth_address = None
     try:
-      node_eth_address = self.bc.node_address_to_eth_address(node_addr)
+      if "unknown:" in node_addr.lower(): # node is actually a error message
+        error_msg = node_addr
+        unknown_address = True
+        node_eth_address = node_addr.replace("unknown:", "")
+      else:
+        node_eth_address = self.bc.node_address_to_eth_address(node_addr)
     except Exception as e:            
       str_except = f"Error converting node address <{node_addr}> to eth address: {e}"
       error_msg = str_except if error_msg is None else f"{error_msg}. {str_except}"
     # end try
-    if error_msg is not None:
-      data = {
-        'node': node_addr,
-        'node_eth_address': node_eth_address,
-        'error': error_msg,
-      }
-    else:
+    
+    epochs_vals = None
+    if error_msg is None:   
       self.P(f"Getting epochs for node {node_addr} from {start_epoch} to {end_epoch}")
       epochs_vals = self.netmon.epoch_manager.get_node_epochs(
         node_addr, 
         autocomplete=True,
         as_list=False
       )    
-      if epochs_vals is None:
-        data = {
-          'node': node_addr,
-          'node_eth_address': node_eth_address,
-          'error': "No epochs found for the given node",
-        }
-      else:
-        epochs = list(range(start_epoch, end_epoch + 1)) 
-        epochs_vals_selected = [epochs_vals[x] for x in epochs]
-        oracle_state = self.netmon.epoch_manager.get_oracle_state(
-          start_epoch=start_epoch, end_epoch=end_epoch
-        )
-        valid = oracle_state['manager']['valid']
-        data = self.__get_signed_data(node_addr, epochs, epochs_vals_selected, sign=valid)
-        try:
-          last_seen = round(self.netmon.network_node_last_seen(node_addr),2)
-        except:
-          last_seen = -1
-        data['node_last_seen_sec'] = last_seen
+    if epochs_vals is None and not unknown_address:
+      data = {
+        'node': node_addr,
+        'node_eth_address': node_eth_address,
+        'error': "No epochs found for the given node",
+      }
+    else:      
+      epochs = list(range(start_epoch, end_epoch + 1)) 
+      if unknown_address:
+        epochs_vals = {x : 0 for x in epochs}
+      epochs_vals_selected = [epochs_vals[x] for x in epochs]
+      # end try
+      oracle_state = self.netmon.epoch_manager.get_oracle_state(
+        start_epoch=start_epoch, end_epoch=end_epoch
+      )
+      valid = oracle_state['manager']['valid']
+      data = self.__get_signed_data(
+        node_addr=node_addr, epochs=epochs, epochs_vals=epochs_vals_selected, 
+        sign=valid, node_addr_eth=node_eth_address
+      )
+      try:
+        last_seen = round(self.netmon.network_node_last_seen(node_addr),2)
+      except:
+        last_seen = -1
+      data['node_last_seen_sec'] = last_seen
+      try:
         data['node_is_online'] = self.netmon.network_node_is_online(node_addr)
         data['node_version'] = self.netmon.network_node_version(node_addr)
         data['node_is_oracle'] = self.netmon.network_node_is_supervisor(node_addr)
-        if not valid:
-          data["error"] = "Oracle state is not valid for some of the epochs. Please check [result.oracle.manager.certainty] and report to devs. For testing purposes try using valid/certain epochs."
-        # now add the certainty for each requested epoch
-        data["oracle"] = oracle_state
-      # end if epochs_vals is None
+      except:
+        data['node_is_online'] = False
+        data['node_version'] = "unknown"
+        data['node_is_oracle'] = False
+      # end try
+      if not valid:
+        data["error"] = "Oracle state is not valid for some of the epochs. Please check [result.oracle.manager.certainty] and report to devs. For testing purposes try using valid/certain epochs."
+      # now add the certainty for each requested epoch
+      data["oracle"] = oracle_state
+      if error_msg is not None:
+        data["error"] = error_msg
+      if unknown_address:
+        data["error"] = f"[No internal node address found]:  {node_addr}"
+      # end if error_msg is not None
     #endif
     return data
 

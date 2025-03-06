@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Namespace
 metadata:
-  name: naeural
+  name: ratio1
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: edgenode-config
-  namespace: naeural
+  namespace: ratio1
 data:
   ee_mqtt_host: ''
   ee_mqtt_port: '1883'

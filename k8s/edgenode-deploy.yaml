@@ -3,7 +3,7 @@ apiVersion: apps/v1
 kind: StatefulSet
 metadata:
   name: edgenode
-  namespace: naeural
+  namespace: ratio1
 spec:
   serviceName: edgenode
   # TODO: automatic node identity for multi-replica k8s deployments
@@ -20,7 +20,7 @@ spec:
       containers:
       - name: edgenode
         imagePullPolicy: Always
-        image: naeural/edge_node
+        image: ratio1/edge_node
         resources:
           requests:
             memory: "512Mi"
@@ -86,45 +86,45 @@ spec:
         - name: EE_MINIO_ACCESS_KEY
           valueFrom:
             secretKeyRef:
-              name: naeural-secrets
+              name: ratio1-secrets
               key: ee_minio_access_key
 
         - name: EE_MINIO_SECRET_KEY
           valueFrom:
             secretKeyRef:
-              name: naeural-secrets
+              name: ratio1-secrets
               key: ee_minio_secret_key
 
         # MQTT
         - name: EE_MQTT_USER
           valueFrom:
             secretKeyRef:
-              name: naeural-secrets
+              name: ratio1-secrets
               key: ee_mqtt_user
 
         - name: EE_MQTT
           valueFrom:
             secretKeyRef:
-              name: naeural-secrets
+              name: ratio1-secrets
               key: ee_mqtt
           
         # EXTRA
         - name: EE_GITVER
           valueFrom:
             secretKeyRef:
-              name: naeural-secrets
+              name: ratio1-secrets
               key: ee_gitver
 
         - name: EE_OPENAI
           valueFrom:
             secretKeyRef:
-              name: naeural-secrets
+              name: ratio1-secrets
               key: ee_openai
 
         - name: EE_HF_TOKEN
           valueFrom:
             secretKeyRef:
-              name: naeural-secrets
+              name: ratio1-secrets
               key: ee_hf_token
         
         #volume mounts
