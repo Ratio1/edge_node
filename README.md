@@ -1,4 +1,4 @@
-# Ratio1 Edge Node (Naeural Edge Protocol Edge Node)
+# Ratio1 Edge Node 
 
 Welcome to the **Ratio1 Edge Node** repository, formerly known as the **Naeural Edge Protocol Edge Node**. As a pivotal component of the Ratio1 ecosystem, this Edge Node software empowers a decentralized, privacy-preserving, and secure edge computing network. By enabling a collaborative network of edge nodes, Ratio1 facilitates the secure sharing of resources and the seamless execution of computation tasks across diverse devices.
 
@@ -16,7 +16,7 @@ Documentation sections:
 
 ## Introduction
 
-The Ratio1 Edge Node is a meta Operating System designed to operate on edge devices, providing them the essential functionality required to join and thrive within the Ratio1 network. Each Edge Node manages the device’s resources, executes computation tasks efficiently, and communicates securely with other nodes in the network. Leveraging the powerful Ratio1 core libraries (formely knwon as Naeural Edge Protocol libraries) `naeural_core` and `ratio1`— the Ratio1 Edge Node offers out-of-the-box usability starting in 2025. Users can deploy the Edge Node and SDK (`ratio1`) effortlessly without the need for intricate configurations, local subscriptions, tenants, user accounts, passwords, or broker setups.
+The Ratio1 Edge Node is a meta Operating System designed to operate on edge devices, providing them the essential functionality required to join and thrive within the Ratio1 network. Each Edge Node manages the device’s resources, executes computation tasks efficiently, and communicates securely with other nodes in the network. Leveraging the powerful Ratio1 core libraries (formely known as Naeural Edge Protocol libraries) `naeural_core` and `ratio1`— the Ratio1 Edge Node offers out-of-the-box usability starting in 2025. Users can deploy the Edge Node and SDK (`ratio1`) effortlessly without the need for intricate configurations, local subscriptions, tenants, user accounts, passwords, or broker setups.
 
 ## Running the Edge Node
 
@@ -26,29 +26,28 @@ The Ratio1 Edge Node is a meta Operating System designed to operate on edge devi
 Deploying a Ratio1 Edge Node within a development network is straightforward. Execute the following Docker command to launch the node making sure you mount a persistent volume to the container to preserve the node data between restarts:
 
 ```bash
-docker run -d --rm --name r1node --pull=always -v r1vol:/edge_node/_local_cache/ naeural/edge_node:develop
+docker run -d --rm --name r1node --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:develop
 ```
 
 - `-d`: Runs the container in the background.
 - `--rm`: Removes the container upon stopping.
 - `--name r1node`: Assigns the name `r1node` to the container.
 - `--pull=always`: Ensures the latest image version is always pulled.
-- `naeural/edge_node:develop`: Specifies the Docker image to run.
+- `ratio1/edge_node:develop`: Specifies the Docker image to run.
 - `-v r1vol:/edge_node/_local_cache/`: Mounts the `r1vol` volume to the `/edge_node/_local_cache/` directory within the container.
 
 This command initializes the Ratio1 Edge Node in development mode, automatically connecting it to the Ratio1 development network and preparing it to receive computation tasks while ensuring that all node data is stored in `r1vol`, preserving it between container restarts.
 
-> NOTE: currently we are using `naeural` DockerHub repository for the Edge Node image. In the future, we will move the image to the `ratio1` DockerHub repository.
 
 If for some reason you encounter issues when running the Edge Node, you can try to run the container with the `--platform linux/amd64` flag to ensure that the container runs on the correct platform.
 
 ```bash
-docker run -d --rm --name r1node --platform linux/amd64 --pull=always -v r1vol:/edge_node/_local_cache/ naeural/edge_node:develop
+docker run -d --rm --name r1node --platform linux/amd64 --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:develop
 ```
 Also, if you have GPU(s) on your machine, you can enable GPU support by adding the `--gpus all` flag to the Docker command. This flag allows the Edge Node to utilize the GPU(s) for computation tasks.
 
 ```bash
-docker run -d --rm --name r1node --gpus all --pull=always -v r1vol:/edge_node/_local_cache/ naeural/edge_node:develop
+docker run -d --rm --name r1node --gpus all --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:develop
 ```
 
 This will ensure that your node will be able to utilize the GPU(s) for computation tasks and will accept training and inference jobs that require GPU acceleration.
@@ -58,8 +57,8 @@ This will ensure that your node will be able to utilize the GPU(s) for computati
 If you want to run multiple Edge Nodes on the same machine, you can do so by specifying different names for each container but more importantly, you need to specify different volumes for each container to avoid conflicts between the nodes. You can do this by creating a new volume for each node and mounting it to the container as follows:
 
 ```bash
-docker run -d --rm --name r1node1 --pull=always -v r1vol1:/edge_node/_local_cache/ naeural/edge_node:develop
-docker run -d --rm --name r1node2 --pull=always -v r1vol2:/edge_node/_local_cache/ naeural/edge_node:develop
+docker run -d --rm --name r1node1 --pull=always -v r1vol1:/edge_node/_local_cache/ ratio1/edge_node:develop
+docker run -d --rm --name r1node2 --pull=always -v r1vol2:/edge_node/_local_cache/ ratio1/edge_node:develop
 ```
 
 Now you can run multiple Edge Nodes on the same machine without any conflicts between them.
@@ -260,7 +259,7 @@ If you want to run multiple nodes on the same machine the best option is to use 
 ```yaml
 services:
   r1node1:
-    image: naeural/edge_node:develop
+    image: ratio1/edge_node:testnet
     container_name: r1node1
     platform: linux/amd64
     restart: always
@@ -271,7 +270,7 @@ services:
       - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
 
   r1node2:
-    image: naeural/edge_node:develop
+    image: ratio1/edge_node:testnet
     container_name: r1node2
     platform: linux/amd64
     restart: always
@@ -324,7 +323,7 @@ docker-compose down
 
 Now, lets dissect the `docker-compose.yml` file:
   - we have a variable number of nodes - in our case 2 nodes - `r1node1` and `r1node2` as services (we commented out the third node for simplicity)
-  - each node is using the `naeural/edge_node:develop` image
+  - each node is using the `ratio1/edge_node:testnet` image
   - each node has own unique volume mounted to it
   - we have a watchtower service that will check for new images every 1 minute and will update the nodes if a new image is available
 
@@ -356,6 +355,6 @@ If you use the Ratio1 Edge Node in your research or projects, please cite it as 
   author = {Ratio1.AI},
   title = {Ratio1: Edge Node},
   year = {2024-2025},
-  howpublished = {\url{https://github.com/NaeuralEdgeProtocol/edge_node}},
+  howpublished = {\url{https://github.com/Ratio1/edge_node}},
 }
 ```
