@@ -1673,10 +1673,15 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         try:
           if self.r1fs_warmup_passed():
             data_cid = self.r1fs.add_pickle(data_dict)
-            message_dict[data_key] = data_cid
-            if self.cfg_debug_sync:
-              self.P(f'Successfully added data to R1FS using CID {data_cid}.')
-            success = True
+            if data_cid is not None:
+              message_dict[data_key] = data_cid
+              if self.cfg_debug_sync:
+                self.P(f'Successfully added data to R1FS using CID {data_cid}.')
+              success = True
+            else:
+              self.P(f"Failed to add data to R1FS. Adding data entirely to message.", color='r')
+              message_dict[data_key] = self.deepcopy(data_dict)
+            # endif data_cid is not None
           else:
             self.P(f"R1FS warmup period has not passed. Adding data entirely to message.", color='r')
             message_dict[data_key] = self.deepcopy(data_dict)
