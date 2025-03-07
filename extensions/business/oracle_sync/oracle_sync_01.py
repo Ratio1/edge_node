@@ -64,6 +64,7 @@ TODO list:
 MAX_RECEIVED_MESSAGES_SIZE = 1000
 DEBUG_MODE = False
 SIGNATURES_EXCHANGE_MULTIPLIER = 5
+REQUEST_AGREEMENT_TABLE_MULTIPLIER = 30 if DEBUG_MODE else 1
 LOCAL_TABLE_SEND_MULTIPLIER = 3 if DEBUG_MODE else 1
 
 # Full availability means that the node was seen online for at least SUPERVISOR_MIN_AVAIL_PRC% of the time.
@@ -489,7 +490,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           if success:
             # In case of success the cid needs to also be added to the epoch_manager
             agreement_cid = dct_epoch__agreed_median_table[epoch_key]
-            self.netmon.epoch_manager.add_cid_for_epoch(epoch=epoch, cid=agreement_cid)
+            self.netmon.epoch_manager.add_cid_for_epoch(epoch=epoch, agreement_cid=agreement_cid)
             newly_uploaded_epochs.append(epoch)
           else:
             self.P(f"Failed to upload agreement for epoch {epoch}.")
@@ -1418,7 +1419,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       if self.first_time_request_agreed_median_table_sent is None:
         return False
       # 10 times the normal period because we want to make sure that oracles can respond
-      timeout_expired = self.time() - self.first_time_request_agreed_median_table_sent > self.cfg_send_period * 10
+      wait_threshold = self.cfg_send_period * REQUEST_AGREEMENT_TABLE_MULTIPLIER
+      timeout_expired = self.time() - self.first_time_request_agreed_median_table_sent > wait_threshold
 
       n_received = len(self.dct_agreed_availability_table)
       if n_received >= self.min_oracle_reports_received():
