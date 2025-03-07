@@ -7,16 +7,12 @@ __VER__ = '0.1.0.0'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
-  'USE_NGROK': False,
-  'NGROK_ENABLED': False,
-  'NGROK_DOMAIN': None,
-  'NGROK_EDGE_LABEL': None,
 
   'SAVE_PERIOD': 60,
   'REQUEST_TIMEOUT': 10,
   "PROCESS_DELAY": 0,
 
-  'PORT': 5000,
+  # 'PORT': 5000,
   'ASSETS': 'extensions/business/fastapi/_ai4everyone',
   'JINJA_ARGS': {
     'html_files': [
@@ -75,6 +71,7 @@ class AI4EveryonePlugin(BasePlugin):
       job_id = job_data_to_id(node_id, pipeline, signature, instance)
       if job_id not in self.jobs_data:
         self.jobs_data[job_id] = Job(
+          owner=self,
           session=self.session, job_id=job_id,
           node_id=node_id, pipeline=pipeline,
           signature=signature, instance=instance
@@ -102,19 +99,40 @@ class AI4EveryonePlugin(BasePlugin):
       )
       return status, msg, request_id
 
+    def solve_postponed_process_request(
+        self, request_id: str, job: Job, request_ts: float, **request_kwargs
+    ):
+      if request_id in self.requests_responses:
+        response = self.requests_responses.pop(request_id)
+        return True, response.data
+      if self.time() - request_ts > self.cfg_request_timeout:
+        return False, {"error": "Request timed out"}
+      return self.create_postponed_request(
+        solver_method=self.solve_postponed_process_request,
+        method_kwargs={
+          'request_id': request_id,
+          'job': job,
+          'request_ts': request_ts,
+          **request_kwargs
+        }
+      )
+
     def process_request(self, job: Job, **request_kwargs):
       status, msg, request_id = self.send_request(job, **request_kwargs)
       if not status:
         return False, {"error": f"Failed to send request: {msg}"}
       request_ts = self.time()
-      while self.time() - request_ts <= self.cfg_request_timeout and request_id not in self.requests_responses:
-        self.sleep(0.1)
-      if request_id not in self.requests_responses:
-        return False, {"error": "Request timed out"}
-      response = self.requests_responses.pop(request_id)
-      return True, response.data
+      return self.create_postponed_request(
+        solver_method=self.solve_postponed_process_request,
+        method_kwargs={
+          'request_id': request_id,
+          'job': job,
+          'request_ts': request_ts,
+          **request_kwargs
+        }
+      )
 
-    def cache_request_data(self, job_id, data_id, data):
+    def cache_request_data(self, job_id: str, data_id: str, data: dict):
       if job_id not in self.request_cache:
         self.request_cache[job_id] = {}
       # endif job_id not in cache
@@ -124,42 +142,73 @@ class AI4EveryonePlugin(BasePlugin):
       self.request_cache[job_id][data_id] = {**data}
       return
 
-    def get_cached_request_data(self, job_id, data_id):
+    def get_cached_request_data(self, job_id: str, data_id: str):
       return self.request_cache.get(job_id, {}).get(data_id)
 
-    def process_sample_request(self, job: Job, handle_votes=False, vote_required=False):
-      request_kwargs = {'SAMPLE_DATAPOINT': True} if vote_required else {'SAMPLE': True}
-      success, response_data = self.process_request(job, **request_kwargs)
-      if not success:
-        return success, response_data
-      sample_filename = response_data.get('SAMPLE_FILENAME')
-      if sample_filename is None:
-        return False, {"error": "Sample not found"}
-      img = response_data.get('IMG')
-      votes = None
-      cache_kwargs = {
-        'img': img
-      }
-      if img is not None:
+    def solve_postponed_process_sample_request(
+        self, request_id: str, job: Job, request_ts: float, handle_votes: bool = False,
+        **request_kwargs
+    ):
+      if request_id in self.requests_responses:
+        response = self.requests_responses.pop(request_id)
+        response_data = response.data
+        sample_filename = response_data.get('SAMPLE_FILENAME')
+        if sample_filename is None:
+          return False, {"error": "Sample not found"}
+        img = response_data.get('IMG')
+        votes = None
+        cache_kwargs = {
+          'img': img
+        }
+        if img is not None:
+          if handle_votes:
+            votes = response_data.get('VOTES')
+            cache_kwargs['votes'] = votes
+          # endif handle votes
+          current_data = self.get_cached_request_data(job.job_id, sample_filename)
+          new_data = {} if current_data is None else current_data
+          new_data = {**new_data, **cache_kwargs}
+          self.cache_request_data(job.job_id, data_id=sample_filename, data=new_data)
+        # endif img is not None
+        res = {"name": sample_filename, "content": img}
         if handle_votes:
-          votes = response_data.get('VOTES')
-          cache_kwargs['votes'] = votes
+          res['classes'] = job.classes
+          if votes is not None:
+            res['votes'] = votes
+          # endif votes is not None
         # endif handle votes
-        current_data = self.get_cached_request_data(job.job_id, sample_filename)
-        new_data = {} if current_data is None else current_data
-        new_data = {**new_data, **cache_kwargs}
-        self.cache_request_data(job.job_id, data_id=sample_filename, data=new_data)
-      # endif img is not None
-      res = {"name": sample_filename, "content": img}
-      if handle_votes:
-        res['classes'] = job.classes
-        if votes is not None:
-          res['votes'] = votes
-        # endif votes is not None
-      # endif handle votes
-      return True, res
+        return True, res
+      if self.time() - request_ts > self.cfg_request_timeout:
+        return False, {"error": "Request timed out"}
+      return self.create_postponed_request(
+        solver_method=self.solve_postponed_process_sample_request,
+        method_kwargs={
+          'request_id': request_id,
+          'job': job,
+          'request_ts': request_ts,
+          'handle_votes': handle_votes,
+          **request_kwargs
+        }
+      )
 
-    def data_to_response(self, data: dict, mandatory_fields=['img']):
+    def process_sample_request(self, job: Job, handle_votes: bool = False, vote_required: bool = False):
+      request_kwargs = {'SAMPLE_DATAPOINT': True} if vote_required else {'SAMPLE': True}
+      status, msg, request_id = self.send_request(job, **request_kwargs)
+      if not status:
+        return False, {"error": f"Failed to send request: {msg}"}
+      request_ts = self.time()
+      return self.create_postponed_request(
+        solver_method=self.solve_postponed_process_sample_request,
+        method_kwargs={
+          'request_id': request_id,
+          'job': job,
+          'request_ts': request_ts,
+          'handle_votes': handle_votes,
+          **request_kwargs
+        }
+      )
+
+    def data_to_response(self, data: dict, mandatory_fields: list = ['img']):
       processed_data = {k.lower(): v for k, v in data.items()}
       mandatory_fields = [field.lower() for field in mandatory_fields]
       for field in mandatory_fields:
@@ -182,18 +231,20 @@ class AI4EveryonePlugin(BasePlugin):
         if cached_data is not None:
           return self.data_to_response(cached_data)
       # endif not force_refresh
-      success, response_data = self.process_request(job, FILENAME=filename, FILENAME_REQUEST=True)
-      if not success:
-        return success, response_data
-      return self.data_to_response(response_data)
+      res = self.process_request(job, FILENAME=filename, FILENAME_REQUEST=True)
+      if isinstance(res, tuple):
+        success, response_data = res
+        if not success:
+          return success, response_data
+        return self.data_to_response(response_data)
+      return res
 
-    def start_job(self, body: dict):
+    def start_job(self, nodeAddress: str, job_config: dict):
       job_id = self.uuid()
-      node_addr = body.get('nodeAddress', self.node_addr)
-      job_config = get_job_config(job_id, body, self.now_str())
+      job_config = get_job_config(job_id, job_config=job_config, creation_date=self.now_str())
       pipeline_name = f'cte2e_{job_id}'
       self.session.create_pipeline(
-        node=node_addr,
+        node=nodeAddress,
         name=pipeline_name,
         data_source="VOID",
         plugins=[job_config]
@@ -207,50 +258,82 @@ class AI4EveryonePlugin(BasePlugin):
       return [job.to_msg() for job in self.jobs_data.values()]
 
     @BasePlugin.endpoint
-    def job(self, job_id):
+    def job(self, job_id: str):
       if job_id in self.jobs_data:
         return self.jobs_data[job_id].to_msg()
       return None
 
     @BasePlugin.endpoint(method="post")
-    def create_job(self, body: dict):
-      # Extract the data from the body
-      node_addr = body.get('nodeAddress')
-      name = body.get('name')
-      desc = body.get('description')
-      self.P(f'Received job creation request for {node_addr}: `{name}` - `{desc}`')
-      return self.start_job(body)
+    def create_job(
+        self, name: str, description: str, target: list or str,
+        rewards: dict, dataSources: list, dataset: dict,
+        classes: list[dict], nodeAddress: str = None,
+    ):
+      if not isinstance(target, list):
+        target = [target]
+      # Pack the job config
+      job_config = {
+        "name": name,
+        "description": description,
+        "target": target,
+        "rewards": rewards,
+        "dataSources": dataSources,
+        "dataset": dataset,
+        "classes": classes,
+      }
+      nodeAddress = nodeAddress or self.e2_addr
+      self.P(f'Received job creation request for {nodeAddress}: `{name}` - `{description}`')
+      return self.start_job(nodeAddress=nodeAddress, job_config=job_config)
 
     @BasePlugin.endpoint(method="post")
-    def stop_job(self, job_id, body: dict):
+    def stop_job(self, job_id: str):
       if job_id in self.jobs_data:
         success, result = self.jobs_data[job_id].stop_acquisition()
         return result if success else None
       return None
 
     @BasePlugin.endpoint(method="post")
-    def publish_job(self, job_id, body: dict):
+    def publish_job_2(
+        self, job_id: str, body: dict
+
+        # self, job_id: str, name: str, description: str, target: list or str,
+        # rewards: dict, dataSources: list, dataset: dict,
+        # classes: list[dict]
+    ):
+      classes = body.get('classes')
+      rewards = body.get('rewards')
       if job_id in self.jobs_data:
-        success, result = self.jobs_data[job_id].publish_job(body)
+        success, result = self.jobs_data[job_id].publish_job(classes=classes, rewards=rewards)
         return result if success else None
       return None
 
     @BasePlugin.endpoint(method="post")
-    def vote(self, job_id, body: dict):
+    def publish_job(
+        self, job_id: str, name: str, description: str, target: list or str,
+        rewards: dict, dataSources: list, dataset: dict,
+        classes: list[dict]
+    ):
       if job_id in self.jobs_data:
-        success, result = self.jobs_data[job_id].send_vote(body)
+        success, result = self.jobs_data[job_id].publish_job(classes=classes, rewards=rewards)
         return result if success else None
       return None
 
     @BasePlugin.endpoint(method="post")
-    def stop_labeling(self, job_id, body: dict):
+    def vote(self, job_id: str, filename: str, label: dict):
+      if job_id in self.jobs_data:
+        success, result = self.jobs_data[job_id].send_vote(filename=filename, label=label)
+        return result if success else None
+      return None
+
+    @BasePlugin.endpoint(method="post")
+    def stop_labeling(self, job_id: str):
       if job_id in self.jobs_data:
         success, result = self.jobs_data[job_id].stop_labeling()
         return result if success else None
       return None
 
     @BasePlugin.endpoint(method="post")
-    def publish_labels(self, job_id, body: dict):
+    def publish_labels(self, job_id: str):
       if job_id in self.jobs_data:
         success, result = self.jobs_data[job_id].publish_labels()
         if success:
@@ -259,7 +342,7 @@ class AI4EveryonePlugin(BasePlugin):
       return None
 
     @BasePlugin.endpoint(method="post")
-    def train(self, job_id, body: dict):
+    def train(self, job_id: str, body: dict):
       if job_id in self.jobs_data:
         success, result = self.jobs_data[job_id].start_train(body)
         if success:
@@ -268,7 +351,7 @@ class AI4EveryonePlugin(BasePlugin):
       return None
 
     @BasePlugin.endpoint(method="post")
-    def deploy_job(self, job_id, body: dict):
+    def deploy_job(self, job_id: str, body: dict):
       if job_id in self.jobs_data:
         """
         After starting the deploy the status will change to "Deploying"
@@ -288,56 +371,71 @@ class AI4EveryonePlugin(BasePlugin):
     """
 
     @BasePlugin.endpoint(method="get")
-    def job_status(self, job_id):
+    def job_status(self, job_id: str):
       if job_id in self.jobs_data:
         return self.jobs_data[job_id].get_status()
       return None
 
     @BasePlugin.endpoint(method="get")
-    def labeling_status(self, job_id):
+    def labeling_status(self, job_id: str):
       if job_id in self.jobs_data:
         return self.jobs_data[job_id].get_labeling_status()
       return None
 
     @BasePlugin.endpoint(method="get")
-    def training_status(self, job_id):
+    def training_status(self, job_id: str):
       if job_id in self.jobs_data:
         return self.jobs_data[job_id].get_train_status()
       return None
 
     @BasePlugin.endpoint(method="get")
-    def data_sample(self, job_id):
+    def data_sample(self, job_id: str):
       if job_id in self.jobs_data:
-        success, result = self.process_sample_request(self.jobs_data[job_id])
-        return result if success else None
+        res = self.process_sample_request(self.jobs_data[job_id])
+        if isinstance(res, tuple):
+          success, result = res
+          return result if success else None
+        return res
       return None
 
     @BasePlugin.endpoint(method="get")
-    def data_filename(self, job_id, filename):
+    def data_filename(self, job_id: str, filename: str):
       if job_id in self.jobs_data:
-        success, result = self.process_filename_request(self.jobs_data[job_id], filename=filename)
-        return result if success else None
+        res = self.process_filename_request(self.jobs_data[job_id], filename=filename)
+        if isinstance(res, tuple):
+          success, result = res
+          return result if success else None
+        return res
       return None
 
     @BasePlugin.endpoint(method="get")
-    def datapoint(self, job_id):
+    def datapoint(self, job_id: str):
       if job_id in self.jobs_data:
-        success, result = self.process_sample_request(self.jobs_data[job_id], handle_votes=True)
-        return result if success else None
+        res = self.process_sample_request(self.jobs_data[job_id], handle_votes=True)
+        if isinstance(res, tuple):
+          success, result = res
+          return result if success else None
+        return res
       return None
 
     @BasePlugin.endpoint(method="get")
-    def datapoint_sample(self, job_id):
+    def datapoint_sample(self, job_id: str):
       if job_id in self.jobs_data:
-        success, result = self.process_sample_request(self.jobs_data[job_id], handle_votes=True, vote_required=True)
-        return result if success else None
+        res = self.process_sample_request(self.jobs_data[job_id], handle_votes=True, vote_required=True)
+        if isinstance(res, tuple):
+          success, result = res
+          return result if success else None
+        return res
       return None
 
     @BasePlugin.endpoint(method="get")
-    def datapoint_filename(self, job_id, filename):
+    def datapoint_filename(self, job_id: str, filename: str):
       if job_id in self.jobs_data:
-        success, result = self.process_filename_request(self.jobs_data[job_id], filename=filename)
-        return result if success else None
+        res = self.process_filename_request(self.jobs_data[job_id], filename=filename)
+        if isinstance(res, tuple):
+          success, result = res
+          return result if success else None
+        return res
       return None
 
     @BasePlugin.endpoint(method="get")
@@ -390,6 +488,7 @@ class AI4EveryonePlugin(BasePlugin):
           node_id, pipeline = data.get('node_id'), data.get('pipeline')
           signature, instance = data.get('signature'), data.get('instance_id')
           res[key] = Job(
+            owner=self,
             session=self.session, job_id=key,
             node_id=node_id, pipeline=pipeline,
             signature=signature, instance=instance

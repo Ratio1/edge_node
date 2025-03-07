@@ -25,15 +25,15 @@ def process_data_sources(data_sources):
 
 
 def get_job_config(
-  job_id: str, body: dict, creation_date: str
+  job_id: str, job_config: dict, creation_date: str
 ):
-  name = body.get('name')
-  desc = body.get('description')
-  data_sources = process_data_sources(body.get('dataSources'))
-  target = body.get('target')
-  classes = body.get('classes')
-  rewards = body.get('rewards')
-  dataset = body.get('dataset')
+  name = job_config.get('name')
+  desc = job_config.get('description')
+  data_sources = process_data_sources(job_config.get('dataSources'))
+  target = job_config.get('target')
+  classes = job_config.get('classes')
+  rewards = job_config.get('rewards')
+  dataset = job_config.get('dataset')
   plugin_config = {
     "SIGNATURE": "AI4E_END_TO_END_TRAINING",
     "INSTANCES": []
@@ -56,7 +56,8 @@ def get_job_config(
 
 
 class Job:
-  def __init__(self, session: Session, job_id: str, node_id: str, pipeline: str, signature: str, instance: str):
+  def __init__(self, owner, session: Session, job_id: str, node_id: str, pipeline: str, signature: str, instance: str):
+    self.owner = owner
     self.session = session
     self.job_id = job_id
     # TODO: instead of single values for instance_id and the rest, use a dict to
@@ -328,26 +329,51 @@ class Job:
     return curr_pipeline, curr_instance, ""
 
   def send_instance_command(self, node=None, pipeline=None, signature=None, instance_id=None, **kwargs):
-    pipeline, instance, error = self.__get_pipeline_and_instance(
-      node=node, pipeline=pipeline, signature=signature, instance_id=instance_id
-    )
-    if error != "":
-      return False, error
+    node = node or self.node_id
+    pipeline = pipeline or self.pipeline
+    signature = signature or self.signature
+    instance_id = instance_id or self.instance_id
     command_kwargs = {
       k.upper(): v
       for k, v in kwargs.items()
     }
-    instance.send_instance_command(command_kwargs)
+    self.owner.cmdapi_send_instance_command(
+      pipeline=pipeline, signature=signature, instance_id=instance_id,
+      node_address=node, instance_command=command_kwargs
+    )
     return True, "Command sent successfully"
+    #
+    #
+    # pipeline, instance, error = self.__get_pipeline_and_instance(
+    #   node=node, pipeline=pipeline, signature=signature, instance_id=instance_id
+    # )
+    # if error != "":
+    #   return False, error
+    # command_kwargs = {
+    #   k.upper(): v
+    #   for k, v in kwargs.items()
+    # }
+    # instance.send_instance_command(command_kwargs)
+    # return True, "Command sent successfully"
 
   def send_instance_update(self, config: dict, node=None, pipeline=None, signature=None, instance_id=None):
-    pipeline, instance, error = self.__get_pipeline_and_instance(
-      node=node, pipeline=pipeline, signature=signature, instance_id=instance_id
+    node = node or self.node_id
+    pipeline = pipeline or self.pipeline
+    signature = signature or self.signature
+    instance_id = instance_id or self.instance_id
+    self.owner.cmdapi_update_instance_config(
+      pipeline=pipeline, signature=signature, instance_id=instance_id,
+      node_address=node, instance_config=config
     )
-    if error != "":
-      return False, error
-    instance.update_instance_config(config)
-    pipeline.deploy()
+
+
+    # pipeline, instance, error = self.__get_pipeline_and_instance(
+    #   node=node, pipeline=pipeline, signature=signature, instance_id=instance_id
+    # )
+    # if error != "":
+    #   return False, error
+    # instance.update_instance_config(config)
+    # pipeline.deploy()
     return True, "Config updated successfully"
 
   def stop_acquisition(self):
@@ -357,10 +383,10 @@ class Job:
       return False, err_msg
     return True, "Successfully stopped acquisition for job"
 
-  def publish_job(self, body: dict):
+  def publish_job(self, classes: list[dict], rewards: dict):
     update_config = {
-      'CLASSES': classes_msg_to_dict(body.get('classes')),
-      'REWARDS': body.get('rewards'),
+      'CLASSES': classes_msg_to_dict(classes),
+      'REWARDS': rewards,
     }
     e2e_update_config = {
       'CLASSES': update_config['CLASSES'],
@@ -379,10 +405,10 @@ class Job:
       return False, err_msg
     return self.send_instance_command(start_voting=True)
 
-  def send_vote(self, body):
+  def send_vote(self, filename: str, label: str):
     datapoint = {
-      'FILENAME': body.get('filename'),
-      'LABEL': body.get('label')
+      'FILENAME': filename,
+      'LABEL': label
     }
     return self.send_instance_command(datapoint=datapoint, worker_id='default')
 
