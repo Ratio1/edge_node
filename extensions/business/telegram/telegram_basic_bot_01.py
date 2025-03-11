@@ -51,17 +51,24 @@ class TelegramBasicBot01Plugin(
     self.__bot_name = self.cfg_telegram_bot_name
         
     self.__last_status_check = 0
-    self._create_custom_reply_executor(
+
+    self.P(f"Preparing custom reply executor with arguments: {self.cfg_message_handler_args}...")        
+    self._reply_handler = self._create_custom_handler(
       str_base64_code=self.cfg_message_handler,
       lst_arguments=self.cfg_message_handler_args,
     )
     
-    self._create_tbot_loop_processing_handler(
-      str_base64_code=self.cfg_processing_handler,
-      lst_arguments=self.cfg_processing_handler_args,
-    )
+    if self.cfg_processing_handler is not None:
+      self.P(f"Preparing custom loop process handler...")
+      self._process_handler = self._create_custom_handler(
+        str_base64_code=self.cfg_processing_handler,
+        lst_arguments=self.cfg_processing_handler_args,
+      )
+    else:
+      self._process_handler = None
     
-    if self._custom_handler is not None:
+    
+    if self._reply_handler is not None:
       self.P("Building and running the Telegram bot...")  
       self.bot_build(
         token=self.__token,
@@ -85,8 +92,21 @@ class TelegramBasicBot01Plugin(
 
 
   def bot_msg_handler(self, message, user, **kwargs):
-    result = self._custom_handler(plugin=self, message=message, user=user)
+    result = self._reply_handler(plugin=self, message=message, user=user)
     return result
+
+
+  def maybe_process_and_auto_messages(self):
+    if getattr(self, "_process_handler", None) is not None:
+      result = self._process_handler(plugin=self)
+      if result is not None:
+        if isinstance(result, dict):
+          self.add_payload_by_fields(**result)
+        else:
+          self.add_payload_by_fields(result=result)
+      # endif result is not None
+    # endif _tbot_loop_processing_handler is not None
+    return  
 
 
   def process(self):
@@ -95,5 +115,5 @@ class TelegramBasicBot01Plugin(
       self.__last_status_check = self.time()
       if not self.__failed:
         self.bot_dump_stats()
-    self.maybe_process_tbot_loop()    
+    self.maybe_process_and_auto_messages()    
     return payload

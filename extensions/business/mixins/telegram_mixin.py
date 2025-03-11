@@ -55,63 +55,29 @@ class _TelegramChatbotMixin(object):
     return self.deepcopy(self.__stats[user])
 
 
-  def _create_custom_reply_executor(self, str_base64_code, lst_arguments):
+  def _create_custom_handler(self, str_base64_code, lst_arguments):
     """
-    This method creates a custom reply executor for the bot. It is used to process incoming messages 
+    This method creates a custom handler for the bot. It is used to process incoming messages 
     and generate responses.
     """
-    self.P(f"Preparing custom reply executor with arguments: {lst_arguments}...")
+    self.P(f"Preparing custom handler with arguments: {lst_arguments}...")
     #
-    self._custom_handler, errors, warnings = self._get_method_from_custom_code(
+    _custom_handler, errors, warnings = self._get_method_from_custom_code(
       str_b64code=str_base64_code,
       self_var='plugin',
       method_arguments=['plugin'] + lst_arguments,
-
       debug=True,
     )
     #
     if errors:
-      self.P(f"Errors found in custom reply executor: {errors}")
+      self.P(f"Errors found in custom handler: {errors}")
     if warnings:
-      self.P(f"Warnings found in custom reply executor: {warnings}")
-    if self._custom_handler is None:
-      self.P("Custom reply executor could not be created", color='r')
+      self.P(f"Warnings found in custom handler: {warnings}")
+    if _custom_handler is None:
+      self.P("Custom handler could not be created", color='r')
     else:
-      self.P(f"Custom reply executor created: {self._custom_handler}")
-    return
-
-
-  def _create_tbot_loop_processing_handler(self, str_base64_code, lst_arguments):
-    """
-    This method creates a custom loop processing handler for the bot (called each plugin loop iteration).
-    It is used to process the bot's state and perform any necessary actions.
-    """
-    if str_base64_code is None:
-      self.P("No loop processing handler provided, skipping...", color='y')
-      self._processing_handler = None
-    else:
-      self.P(f"Preparing custom loop processing handler with arguments: {lst_arguments}...")    
-      self._tbot_loop_processing_handler, errors, warnings = self._get_method_from_custom_code(
-        str_b64code=str_base64_code,
-        self_var='plugin',
-        method_arguments=['plugin'] + lst_arguments,
-        
-        debug=True,
-      )
-    return  
-
-
-  def maybe_process_tbot_loop(self):
-    if getattr(self, "_tbot_loop_processing_handler", None) is not None:
-      result = self._tbot_loop_processing_handler(plugin=self)
-      if result is not None:
-        if isinstance(result, dict):
-          self.add_payload_by_fields(**result)
-        else:
-          self.add_payload_by_fields(result=result)
-      # endif result is not None
-    # endif _tbot_loop_processing_handler is not None
-    return
+      self.P(f"Custom handler created: {_custom_handler}")
+    return _custom_handler
 
     
   def __reply_wrapper(self, question, user):
@@ -217,32 +183,37 @@ class _TelegramChatbotMixin(object):
     return    
   
 
-  def __bot_runner(self):
-    # Create and set a new event loop for this thread
-    self.bot_log("Creating asyncio loop...")
+  def _init_asyncio_loop(self):
+    self.bot_log("Creating new asyncio event loop...")
     self.__asyncio_loop = asyncio.new_event_loop()
-    self.bot_log("Setting asyncio loop...")
     asyncio.set_event_loop(self.__asyncio_loop)
-
-    # Create an asyncio Event to signal stopping
     self.__stop_event = asyncio.Event()
+    return
 
+
+  def _teardown_asyncio_loop(self):
+    self.bot_log("Shutting down asyncio event loop...")
+    self.__asyncio_loop.run_until_complete(self.__asyncio_loop.shutdown_asyncgens())
+    self.__asyncio_loop.close()
+    self.bot_log("Event loop closed.")
+    return
+
+
+  def __bot_runner(self):
+    # Perform all initialization
     try:
-      # Run the bot's main coroutine
-      self.bot_log("Running bot async loop run_until_complete ...")
+      self._init_asyncio_loop()
+      self.bot_log("Running bot main coroutine...")
       self.__asyncio_loop.run_until_complete(self.__run_bot())
       self.bot_log("Bot main coroutine finished.")
     except Exception as e:
       self.bot_log(f"Error in bot_runner: {e}", color='r')
     finally:
-      self.bot_log("Closing asyncio loop...")
-      # Shutdown asynchronous generators
-      self.__asyncio_loop.run_until_complete(self.__asyncio_loop.shutdown_asyncgens())
-      # Close the event loop
-      self.__asyncio_loop.close()
-    
+      self._teardown_asyncio_loop()
+    #try-finally block to ensure cleanup
     self.bot_log("Bot runner thread exit.", color='g')
     return
+
     
 
   async def __run_bot(self):
