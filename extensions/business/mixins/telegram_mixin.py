@@ -30,13 +30,62 @@ class _TelegramChatbotMixin(object):
         'questions': 0,
         'last_question': None,
         # 'last_answer': None,
+        'last_message_ts': None,
       }
     self.__stats[user]['questions'] += 1
     self.__stats[user]['last_question'] = question
+    self.__stats[user]['last_message_ts'] = self.time()
     return     
+  
+  
+  @property
+  def users(self):
+    """
+    Returns the list of users who have interacted with the bot.
+    """
+    return list(self.__stats.keys())
+  
+  
+  def get_user_stats(self, user):
+    """
+    Returns the statistics for a specific user.
+    """
+    if user not in self.users_stats:
+      return None
+    return self.deepcopy(self.__stats[user])
+
+
+  def _create_custom_reply_executor(self, str_base64_code, lst_arguments):
+    """
+    This method creates a custom reply executor for the bot. It is used to process incoming messages 
+    and generate responses.
+    """
+    self.P(f"Preparing custom reply executor with arguments: {lst_arguments}...")
+    #
+    self._custom_handler, errors, warnings = self._get_method_from_custom_code(
+      str_b64code=str_base64_code,
+      self_var='plugin',
+      method_arguments=['plugin'] + lst_arguments,
+
+      debug=True,
+    )
+    #
+    if errors:
+      self.P(f"Errors found in custom reply executor: {errors}")
+    if warnings:
+      self.P(f"Warnings found in custom reply executor: {warnings}")
+    if self._custom_handler is None:
+      self.P("Custom reply executor could not be created", color='r')
+    else:
+      self.P(f"Custom reply executor created: {self._custom_handler}")
+    return
 
 
   def _create_tbot_loop_processing_handler(self, str_base64_code, lst_arguments):
+    """
+    This method creates a custom loop processing handler for the bot (called each plugin loop iteration).
+    It is used to process the bot's state and perform any necessary actions.
+    """
     if str_base64_code is None:
       self.P("No loop processing handler provided, skipping...", color='y')
       self._processing_handler = None
@@ -50,7 +99,8 @@ class _TelegramChatbotMixin(object):
         debug=True,
       )
     return  
-  
+
+
   def maybe_process_tbot_loop(self):
     if getattr(self, "_tbot_loop_processing_handler", None) is not None:
       result = self._tbot_loop_processing_handler(plugin=self)
@@ -62,6 +112,7 @@ class _TelegramChatbotMixin(object):
       # endif result is not None
     # endif _tbot_loop_processing_handler is not None
     return
+
     
   def __reply_wrapper(self, question, user):
     self.__add_user_info(user=user, question=question)
@@ -234,7 +285,6 @@ class _TelegramChatbotMixin(object):
     )
     return
 
-
   
   def __run_blocking(self):
     self.__running_threaded = False
@@ -324,7 +374,41 @@ class _TelegramChatbotMixin(object):
     )
     return
   
-  def on_close(self):
-    self.P("Initiating bot shutdown procedure...")
-    self.bot_stop()
+
+  def send_message_to_user(self, user_id: int, text: str):
+    """
+    Sends a Telegram message to 'user_id' from this bot, even if no message was just received.
+    Safe to call from outside the main bot thread/loop.
+    
+    Example
+    ---------
+    
+    ```python
+
+      def loop_processing(plugin: CustomPlugin):
+        result = None
+        for user in plugin.users:
+          user_stats = plugin.get_user_stats(user)
+          if user_stats['questions'] == 5:
+            plugin.send_message_to_user(user_id=user, text="You have asked quite a few question, ser!")
+            if result is None:
+              result = {}
+            result[user] = user_stats
+        return result
+
+    ```
+    
+    """
+    if not self.__asyncio_loop or not self.__app:
+      self.bot_log("Cannot send message as the bot is not fully initialized!", color='r')
+      return
+    # run_coroutine_threadsafe is thread-safe and allows you to run a coroutine in the event loop
+    # is meant to be called from a different OS thread than the one where the event loop is running.
+    # so in our case, we are calling it from the plugin instance thread
+    # and the event loop is running in the bot thread.
+    future = asyncio.run_coroutine_threadsafe(
+      self.__app.bot.send_message(chat_id=user_id, text=text),
+      self.__asyncio_loop
+    )
+    # You can optionally call future.result() if you want to block until it's sent.
     return

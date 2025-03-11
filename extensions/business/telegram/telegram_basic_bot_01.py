@@ -44,35 +44,14 @@ class TelegramBasicBot01Plugin(
   BasePlugin,
   ):  
   CONFIG = _CONFIG
-  
-  def __create_custom_reply_executor(self, str_base64_code, lst_arguments):
-    self.P(f"Preparing custom reply executor with arguments: {lst_arguments}...")
-    #
-    self.__custom_handler, errors, warnings = self._get_method_from_custom_code(
-      str_b64code=str_base64_code,
-      self_var='plugin',
-      method_arguments=['plugin'] + lst_arguments,
-
-      debug=True,
-    )
-    #
-    if errors:
-      self.P(f"Errors found in custom reply executor: {errors}")
-    if warnings:
-      self.P(f"Warnings found in custom reply executor: {warnings}")
-    if self.__custom_handler is None:
-      self.P("Custom reply executor could not be created", color='r')
-    else:
-      self.P(f"Custom reply executor created: {self.__custom_handler}")
-    return
-  
+    
   
   def on_init(self):
     self.__token = self.cfg_telegram_bot_token
     self.__bot_name = self.cfg_telegram_bot_name
         
     self.__last_status_check = 0
-    self.__create_custom_reply_executor(
+    self._create_custom_reply_executor(
       str_base64_code=self.cfg_message_handler,
       lst_arguments=self.cfg_message_handler_args,
     )
@@ -82,7 +61,7 @@ class TelegramBasicBot01Plugin(
       lst_arguments=self.cfg_processing_handler_args,
     )
     
-    if self.__custom_handler is not None:
+    if self._custom_handler is not None:
       self.P("Building and running the Telegram bot...")  
       self.bot_build(
         token=self.__token,
@@ -99,8 +78,14 @@ class TelegramBasicBot01Plugin(
     return
 
 
+  def on_close(self):
+    self.P("Initiating bot shutdown procedure...")
+    self.bot_stop()
+    return  
+
+
   def bot_msg_handler(self, message, user, **kwargs):
-    result = self.__custom_handler(plugin=self, message=message, user=user)
+    result = self._custom_handler(plugin=self, message=message, user=user)
     return result
 
 
