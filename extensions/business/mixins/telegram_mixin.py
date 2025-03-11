@@ -1,3 +1,12 @@
+"""
+telegram_mixin.py
+-----------------
+
+The following code is a mixin class for creating a Telegram bot using the python-telegram-bot library.
+It provides methods for handling messages, processing responses, and managing the bot's lifecycle.
+
+"""
+
 import traceback
 import threading
 import time

@@ -1,3 +1,17 @@
+"""
+telegram_basic_bot_01.py
+------------------------
+
+This file contains the implementation of a basic Telegram bot plugin for the Ratio1 Edge Node ecosystem.
+It extends the functionality of the base plugin executor and integrates with the 
+Telegram API to handle messages and process responses.
+
+The plugin instance receives two main handlers as base64 encoded python code:
+1. `MESSAGE_HANDLER`: A custom message handler that processes incoming messages.
+2. `PROCESSING_HANDLER`: A custom processing handler that runs in a loop to handle bot operations.
+
+
+"""
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
 from extensions.business.mixins.telegram_mixin import _TelegramChatbotMixin
 
@@ -38,7 +52,7 @@ class TelegramBasicBot01Plugin(
       str_b64code=str_base64_code,
       self_var='plugin',
       method_arguments=['plugin'] + lst_arguments,
-      
+
       debug=True,
     )
     #
@@ -83,12 +97,12 @@ class TelegramBasicBot01Plugin(
       self.__failed = True
       raise ValueError("Custom reply executor could not be created")
     return
-  
-  
-  
+
+
   def bot_msg_handler(self, message, user, **kwargs):
     result = self.__custom_handler(plugin=self, message=message, user=user)
     return result
+
 
   def process(self):
     payload = None
