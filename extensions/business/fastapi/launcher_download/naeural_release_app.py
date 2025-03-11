@@ -1,6 +1,6 @@
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.2.0.0'
+__VER__ = '0.3.1'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -117,26 +117,145 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           <title>Edge Node Launcher Releases</title>
           <style>
               body {
-                  font-family: Arial, sans-serif;
+                  font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+                  line-height: 1.6;
+                  color: #333;
+                  max-width: 1200px;
+                  margin: 0 auto;
+                  padding: 0 20px;
               }
               .jumbo {
-                  background-color: #f8f9fa;
-                  padding: 2em;
+                  background: linear-gradient(135deg, #4b6cb7 0%, #182848 100%);
+                  color: white;
+                  padding: 3em 2em;
                   text-align: center;
+                  border-radius: 8px;
+                  margin-top: 20px;
+                  box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+              }
+              .jumbo h1 {
+                  margin-top: 0;
+                  font-size: 2.5em;
+              }
+              .jumbo button {
+                  background-color: #ff7e5f;
+                  color: white;
+                  border: none;
+                  padding: 12px 24px;
+                  font-size: 1.1em;
+                  border-radius: 4px;
+                  cursor: pointer;
+                  transition: background-color 0.3s;
+                  margin-top: 15px;
+              }
+              .jumbo button:hover {
+                  background-color: #ff6347;
               }
               .latest-release, .previous-releases {
-                  margin: 2em;
+                  margin: 2em 0;
+                  background-color: white;
+                  padding: 2em;
+                  border-radius: 8px;
+                  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+              }
+              .latest-release h2, .previous-releases h2 {
+                  color: #4b6cb7;
+                  border-bottom: 2px solid #f0f0f0;
+                  padding-bottom: 10px;
               }
               table {
                   width: 100%;
                   border-collapse: collapse;
+                  margin-top: 20px;
               }
               table, th, td {
-                  border: 1px solid #ddd;
+                  border: 1px solid #e0e0e0;
+              }
+              th {
+                  background-color: #f8f9fa;
+                  font-weight: 600;
               }
               th, td {
-                  padding: 0.5em;
+                  padding: 12px 15px;
                   text-align: left;
+              }
+              tr:nth-child(even) {
+                  background-color: #f9f9f9;
+              }
+              a {
+                  color: #4b6cb7;
+                  text-decoration: none;
+              }
+              a:hover {
+                  text-decoration: underline;
+              }
+              .download-btn {
+                  display: inline-block;
+                  background-color: #4CAF50;
+                  color: white;
+                  padding: 6px 12px;
+                  border-radius: 4px;
+                  text-decoration: none;
+                  margin-top: 5px;
+              }
+              .download-btn:hover {
+                  background-color: #45a049;
+                  text-decoration: none;
+              }
+              pre {
+                  background-color: #f8f9fa;
+                  padding: 10px;
+                  border-radius: 4px;
+                  white-space: pre-wrap;
+                  font-size: 0.9em;
+                  max-height: 100px;
+                  overflow: hidden;
+                  transition: max-height 0.3s ease-out;
+              }
+              .expanded {
+                  max-height: 1000px;
+              }
+              .see-more-btn {
+                  background-color: #f0f0f0;
+                  border: none;
+                  padding: 5px 10px;
+                  font-size: 0.8em;
+                  border-radius: 4px;
+                  cursor: pointer;
+                  margin-top: 5px;
+                  color: #666;
+              }
+              .see-more-btn:hover {
+                  background-color: #e0e0e0;
+              }
+              .show-all-btn {
+                  display: block;
+                  margin: 20px auto;
+                  background-color: #4b6cb7;
+                  color: white;
+                  border: none;
+                  padding: 10px 20px;
+                  font-size: 1em;
+                  border-radius: 4px;
+                  cursor: pointer;
+                  transition: background-color 0.3s;
+              }
+              .show-all-btn:hover {
+                  background-color: #3a5795;
+              }
+              .release-row {
+                  display: none;
+              }
+              .release-row.visible {
+                  display: table-row;
+              }
+              .commit-message {
+                  list-style-type: disc;
+                  padding-left: 20px;
+                  margin: 5px 0;
+              }
+              .commit-message li {
+                  margin-bottom: 3px;
               }
           </style>
       </head>
@@ -148,7 +267,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               <h1>Edge Node Launcher Releases</h1>
               <p>Download the latest version of Edge Node Launcher to stay up-to-date with new features and improvements.</p>
               <p>This page was proudly generated by Edge Node <code>{self.ee_id}:{self.ee_addr}</code> at {last_update}.</p>
-              <button onclick="document.getElementById('latest-release').scrollIntoView();">Download Edge Node Launcher</button>
+              <button onclick="document.getElementById('latest-release').scrollIntoView({behavior: 'smooth'});" class="download-btn">Download Edge Node Launcher</button>
           </div>
       """
 
@@ -164,7 +283,8 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               <h2>Latest Release: {latest_release['tag_name'].replace("'","")}</h2>
               <h3>Details:</h3>
               <div style="margin-left: 2em;">            
-                <pre style="">{latest_release['commit_info']['commit']['message']}</pre>
+                <pre id="latest-release-info">{latest_release['commit_info']['commit']['message']}</pre>
+                <button class="see-more-btn" onclick="toggleContent('latest-release-info')">See More</button>
               </div>
               <p>Date Published: {self.datetime.strptime(latest_release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}</p>
               <ul>
@@ -173,14 +293,14 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       assets = latest_release['assets']
       for asset in assets:
         if self.re.search(r'LINUX_Ubuntu-20\.04\.zip', asset['name']):
-          latest_release_section += f'<li>Linux Ubuntu 20.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}">Download</a></li>'
+          latest_release_section += f'<li>Linux Ubuntu 20.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
         if self.re.search(r'LINUX_Ubuntu-22\.04\.zip', asset['name']):
-          latest_release_section += f'<li>Linux Ubuntu 22.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}">Download</a></li>'
+          latest_release_section += f'<li>Linux Ubuntu 22.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
         if self.re.search(r'WIN32\.zip', asset['name']):
-          latest_release_section += f'<li>Windows: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}">Download</a></li>'
+          latest_release_section += f'<li>Windows: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
 
       latest_release_section += f"""
-                  <li>Source Code: <a href="{latest_release['tarball_url']}">.tar</a>, <a href="{latest_release['zipball_url']}">.zip</a></li>
+                  <li>Source Code: <a href="{latest_release['tarball_url']}" class="download-btn">.tar</a>, <a href="{latest_release['zipball_url']}" class="download-btn">.zip</a></li>
               </ul>
           </div>
       """
@@ -191,7 +311,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       previous_releases_section = """
           <div class="previous-releases">
               <h2>Previous Releases</h2>
-              <table>
+              <table id="previous-releases-table">
                   <thead>
                       <tr>
                           <th>Release Info</th>
@@ -204,16 +324,41 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                   <tbody>
       """
 
-      for release in releases[1:]:
+      for i, release in enumerate(releases[1:]):
         if release is None:
           continue
         try:
+          # Format the commit message to be more readable with bullet points
+          commit_message = release['commit_info']['commit']['message']
+          formatted_message = ""
+          
+          # Process the commit message to format it with bullet points if it contains line breaks
+          if '\n' in commit_message:
+            lines = commit_message.strip().split('\n')
+            formatted_message = f"<div class='commit-title'>{lines[0]}</div>"
+            if len(lines) > 1:
+              formatted_message += "<ul class='commit-message'>"
+              for line in lines[1:]:
+                if line.strip().startswith('*'):
+                  formatted_message += f"<li>{line.strip()[1:].strip()}</li>"
+                elif line.strip():
+                  formatted_message += f"<li>{line.strip()}</li>"
+              formatted_message += "</ul>"
+          else:
+            formatted_message = commit_message
+          
+          # Determine if this row should be visible initially (first 2 rows)
+          visible_class = "visible" if i < 2 else ""
+          
           release_row = f"""
-                      <tr>
+                      <tr class="release-row {visible_class}" id="release-row-{i}">
                           <td>
                             {release['tag_name'].replace("'","")}
                             <div style="margin-left: 1em;">            
-                              <pre style="">{release['commit_info']['commit']['message']}</pre>
+                              <div id="release-info-{release['tag_name'].replace('.', '-')}" class="commit-info">
+                                {formatted_message}
+                              </div>
+                              <button class="see-more-btn" onclick="toggleContent('release-info-{release['tag_name'].replace('.', '-')}')">See More</button>
                             </div>
                           </td>
                           
@@ -228,27 +373,62 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           windows = next((asset for asset in release['assets'] if self.re.search(r'WIN32\.zip', asset['name'])), None)
 
           if linux_20_04:
-            release_row += f'Ubuntu 20.04: {linux_20_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_20_04["browser_download_url"]}">Download</a><br>'
+            release_row += f'Ubuntu 20.04: {linux_20_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_20_04["browser_download_url"]}" class="download-btn">Download</a><br>'
           if linux_22_04:
-            release_row += f'Ubuntu 22.04: {linux_22_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_22_04["browser_download_url"]}">Download</a>'
+            release_row += f'Ubuntu 22.04: {linux_22_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_22_04["browser_download_url"]}" class="download-btn">Download</a>'
 
           release_row += '</td><td>'
 
           if windows:
-            release_row += f'{windows["size"] / (1024 * 1024):.2f} MB - <a href="{windows["browser_download_url"]}">Download</a>'
+            release_row += f'{windows["size"] / (1024 * 1024):.2f} MB - <a href="{windows["browser_download_url"]}" class="download-btn">Download</a>'
 
-          release_row += f'</td><td><a href="{release["tarball_url"]}">.tar</a>, <a href="{release["zipball_url"]}">.zip</a></td></tr>'
+          release_row += f'</td><td><a href="{release["tarball_url"]}" class="download-btn">.tar</a>, <a href="{release["zipball_url"]}" class="download-btn">.zip</a></td></tr>'
 
           previous_releases_section += release_row
         except:
           continue
       # end for all releases
 
+      # Add a "Show All Releases" button
       previous_releases_section += """
                   </tbody>
               </table>
+              <button id="show-all-btn" class="show-all-btn" onclick="toggleAllReleases()">Show All Releases</button>
           </div>
       </body>
+      <script>
+          function toggleContent(id) {
+              const element = document.getElementById(id);
+              element.classList.toggle('expanded');
+              
+              const button = element.nextElementSibling;
+              if (element.classList.contains('expanded')) {
+                  button.textContent = 'See Less';
+              } else {
+                  button.textContent = 'See More';
+              }
+          }
+          
+          function toggleAllReleases() {
+              const button = document.getElementById('show-all-btn');
+              const rows = document.querySelectorAll('.release-row');
+              const hiddenRows = document.querySelectorAll('.release-row:not(.visible)');
+              
+              if (hiddenRows.length > 0) {
+                  // Show all rows
+                  rows.forEach(row => row.classList.add('visible'));
+                  button.textContent = 'Show Less';
+              } else {
+                  // Hide all except first two rows
+                  rows.forEach((row, index) => {
+                      if (index >= 2) {
+                          row.classList.remove('visible');
+                      }
+                  });
+                  button.textContent = 'Show All Releases';
+              }
+          }
+      </script>
       </html>
       """
 
