@@ -203,12 +203,13 @@ class _DauthMixin(object):
         for a, b in zip(oracles, oracles_names)
       ]
     
-    if self.is_seed_node():
-      # if this is a seed node, we will add the local whitelist to the normal list
-      wl, aliases = self.bc.get_whitelist_with_names()
-      for _node, _alias in zip(wl, aliases):
-        if _node not in oracles:
-          full_whitelist.append(_node + (f"  {_alias}" if len(_alias) > 0 else ""))
+    # normally this used to be ran only if the current node is a seed oracle however
+    # this means that auto-oracles will NOT send their whitelist (which where receved
+    # from the seed oracle) to the other nodes thus creating a problem
+    wl, aliases = self.bc.get_whitelist_with_names()
+    for _node, _alias in zip(wl, aliases):
+      if _node not in oracles:
+        full_whitelist.append(_node + (f"  {_alias}" if len(_alias) > 0 else ""))
     
     dauth_data[dAuthCt.DAUTH_WHITELIST] = full_whitelist
 
