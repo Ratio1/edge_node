@@ -51,7 +51,8 @@ class _DauthMixin(object):
     Check if this is a seed node via a heuristic.
     """
     url = self.os_environ.get(self.const.BASE_CT.dAuth.EvmNetData.DAUTH_URL_KEY)
-    if isinstance(url, str) and url.startswith("http"):
+    if isinstance(url, str) and not url.startswith("http"):
+      # if the url is not a http url, we assume this is a seed node
       return True
     return False
 
