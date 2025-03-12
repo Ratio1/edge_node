@@ -51,7 +51,7 @@ class _DauthMixin(object):
     Check if this is a seed node via a heuristic.
     """
     url = self.os_environ.get(self.const.BASE_CT.dAuth.EvmNetData.DAUTH_URL_KEY)
-    if isinstance(url, str) and len(url) < 10:
+    if isinstance(url, str) and url.startswith("http"):
       return True
     return False
 
@@ -410,7 +410,10 @@ if __name__ == '__main__':
   os.environ[ct.BASE_CT.dAuth.EvmNetData.DAUTH_URL_KEY] = 'N/A'
   
   l = Logger("DAUTH", base_folder=".", app_folder="_local_cache")
-  bc_eng = DefaultBlockEngine(log=l, name="default")
+  bc_eng = DefaultBlockEngine(
+    log=l, name="dr1s-db-1",
+    config={"PEM_FILE" : "dr1s-db-1.pem"},
+  )
   
   bc = BCWrapper(bc_eng, owner=l)
   
@@ -461,16 +464,16 @@ if __name__ == '__main__':
     }
   
   good_request = {
-    "nonce": "5bac7d5f",
-    "sender_app_ver": "2.8.79",
-    "sender_sdk_ver": "3.3.5",
+    "nonce": "a780cbf5",
+    "sender_app_ver": "2.8.90",
+    "sender_sdk_ver": "3.3.7",
     "sender_core_ver": "7.7.1",
     "sender_alias": "aid01",
-    "EE_SIGN": "MEYCIQDNd4WAzZKWkTLeRPs74_uFRkJmQysZFO1-oAaMy9cXtQIhAJHbT91LIa1UtB95BvTqERKNNV_8KJhF1wBiQr13n2PR",
+    "EE_SIGN": "MEQCIDm0tMGaXCbd27cvy8Yv6u1PRXbE869C7ae-lT57H3V6AiBBkNJPJgdgHzESvaoRmR8WQeunALkicWsIigfxb0to_Q==",
     "EE_SENDER": "0xai_A74xZKZJa4LekjvJ6oJz29qxOOs5nLClXAZEhYv59t3Z",
     "EE_ETH_SENDER": "0x37379B80c7657620E5631832c4437B51D67A88cB",
     "EE_ETH_SIGN": "0xBEEF",
-    "EE_HASH": "e60c7c4af125b1563953c720fc51c78bd767fb76f79a1a8f31a49804f0a8c582"
+    "EE_HASH": "850c7a12fa7e6d3fe4216613bc8fea67c8d94721d5e18aa3f944f2df970c0c36"
   }
 
   
