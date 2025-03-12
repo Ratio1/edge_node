@@ -89,7 +89,7 @@ class DauthManagerPlugin(
     -------
     int
         The current epoch of the node.
-    """
+    """    
     return self.netmon.epoch_manager.get_current_epoch()
     
   

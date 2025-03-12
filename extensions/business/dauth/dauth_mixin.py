@@ -45,6 +45,15 @@ class _DauthMixin(object):
       s = "[DDBG] " + s
       self.P(s, *args, **kwargs)
     return  
+  
+  def is_seed_node(self):
+    """
+    Check if this is a seed node via a heuristic.
+    """
+    url = self.os_environ.get(self.const.BASE_CT.dAuth.EvmNetData.DAUTH_URL_KEY)
+    if isinstance(url, str) and len(url) < 10:
+      return True
+    return False
 
   
   def version_check(
@@ -71,32 +80,38 @@ class _DauthMixin(object):
     
     if int_sender_app_version == 0 and int_sender_core_version == 0 and int_sender_sdk_version > 0:
       output.requester_type = dAuthCt.DAUTH_SENDER_TYPE_SDK
-      output.message += f"SDK v{sender_sdk_version} accepted for dAuth request."
+      output.message += f"INFO: SDK v{sender_sdk_version} accepted for dAuth request."
     elif int_sender_app_version == 0 and int_sender_core_version >0 and int_sender_sdk_version > 0:
       output.requester_type = dAuthCt.DAUTH_SENDER_TYPE_CORE
       output.result = False # we should block this
-      output.message += "Invalid sender version data - core and sdk only not allowed for dAuth"
+      output.message += "FAIL: Invalid sender version data - core and sdk only not allowed for dAuth"
     elif int_sender_app_version > 0 and int_sender_core_version > 0 and int_sender_sdk_version > 0:
       output.requester_type = dAuthCt.DAUTH_SENDER_TYPE_NODE
-      output.message += f"Edge Node v{sender_app_version} pre-accepted for dAuth request."
+      output.message += f"INFO: Edge Node v{sender_app_version} pre-accepted for dAuth request."
     else:
       output.requester_type = "unknown"
       output.result = False
-      output.message += "Invalid sender version data: {} {} {} vs this server: {} {} {}".format(
+      output.message += "FAIL: Invalid sender version data: {} {} {} vs this server: {} {} {}".format(
         sender_app_version, sender_core_version, sender_sdk_version,
         self.ee_ver, self.ee_core_ver, self.ee_sdk_ver
       )
     
     if int_sender_app_version > 0 and int_sender_app_version < int_server_app_version:
-      output.message += f" Sender app version {sender_app_version} is lower than server app version {self.ee_ver}."
-      # maybe we should block below a certain level
+      output.message += f" WARNING: Sender app version {sender_app_version} is lower than server app version {self.ee_ver}."
+      diff = int_server_app_version - int_sender_app_version
+      if diff >= 10:
+        output.result = False
+        output.message += f" FAIL: Sender app version {sender_app_version} is too old (diff: {diff})."
+    #end app version check
+      
     if int_sender_core_version > 0 and int_sender_core_version < int_server_core_version:
-      output.message += f" Sender core version {sender_core_version} is lower than server core version {self.ee_core_ver}."
+      output.message += f" WARNING: Sender core version {sender_core_version} is lower than server core version {self.ee_core_ver}."
       # maybe we should block below a certain level
+      
     if int_sender_sdk_version > 0 and int_sender_sdk_version < int_server_sdk_version:
-      output.message += f" Sender sdk version {sender_sdk_version} is lower than server sdk version {self.ee_sdk_ver}."
+      output.message += f" WARNING: Sender sdk version {sender_sdk_version} is lower than server sdk version {self.ee_sdk_ver}."
     elif int_sender_sdk_version != int_server_sdk_version:
-      output.message += f" Sender sdk version {sender_sdk_version} is different from server sdk version {self.ee_sdk_ver}."
+      output.message += f" INFO: Sender sdk version {sender_sdk_version} is different from server sdk version {self.ee_sdk_ver}."
       # maybe we should block below a certain level
     return output
   
@@ -174,14 +189,26 @@ class _DauthMixin(object):
       raise ValueError("No predefined keys defined (AUTH_PREDEFINED_KEYS==null). Please check the configuration")
     
     full_whitelist = []
+    oracles = []
     if is_node:
       ### get the mandatory oracles whitelist and populate answer  ###  
       oracles, oracles_names, oracles_eth = self.bc.get_oracles(include_eth_addrs=True)   
-      self.Pd(f"Oracles on {self.evm_network}: {oracles_eth}")
+      if len(oracles_eth) > 0 and len(oracles) == 0:
+        self.P(f"Oracle check failed: found ETH oracles {oracles_eth} but conversion to nodes failed.", color='r')
+      else:
+        self.Pd(f"Oracles on {self.evm_network}: {oracles_eth}")
       full_whitelist = [
         a + (f"  {b}" if len(b) > 0 else "") 
         for a, b in zip(oracles, oracles_names)
       ]
+    
+    if self.is_seed_node():
+      # if this is a seed node, we will add the local whitelist to the normal list
+      wl, aliases = self.bc.get_whitelist_with_names()
+      for _node, _alias in zip(wl, aliases):
+        if _node not in oracles:
+          full_whitelist.append(_node + (f"  {_alias}" if len(_alias) > 0 else ""))
+    
     dauth_data[dAuthCt.DAUTH_WHITELIST] = full_whitelist
 
     #####  finally prepare the env auth data #####
@@ -234,6 +261,7 @@ class _DauthMixin(object):
     data[dAuthConst.DAUTH_SERVER_INFO] = {
       dAuthConst.DAUTH_SENDER_ETH : sender_eth_address,
       dAuthConst.DAUTH_SENDER_TYPE : version_check_data.requester_type,
+      dAuthConst.DAUTH_SERVER_IS_SEED : self.is_seed_node(),
       # "info" : str(version_check_data), 
     }
 
@@ -379,6 +407,8 @@ if __name__ == '__main__':
   from ratio1 import Logger
   from ver import __VER__ as ee_ver
   
+  os.environ[ct.BASE_CT.dAuth.EvmNetData.DAUTH_URL_KEY] = 'N/A'
+  
   l = Logger("DAUTH", base_folder=".", app_folder="_local_cache")
   bc_eng = DefaultBlockEngine(log=l, name="default")
   
@@ -402,7 +432,7 @@ if __name__ == '__main__':
   eng.cfg_auth_predefined_keys = ADMIN_PIPELINE["DAUTH_MANAGER"]["AUTH_PREDEFINED_KEYS"]
   eng.cfg_auth_node_env_keys = ADMIN_PIPELINE["DAUTH_MANAGER"]["AUTH_NODE_ENV_KEYS"]
   
-  
+  l.P("Starting dAuth Mixin. is_seed_node: {}".format(eng.is_seed_node()))
   
   request_sdk = {
       "sender_alias": "test1",
@@ -430,13 +460,27 @@ if __name__ == '__main__':
       "EE_HASH": "6e8b5267f163d7bdb476cbb75d305c755bfb9534be7aee9083c142d9d371de9c"
     }
   
+  good_request = {
+    "nonce": "5bac7d5f",
+    "sender_app_ver": "2.8.79",
+    "sender_sdk_ver": "3.3.5",
+    "sender_core_ver": "7.7.1",
+    "sender_alias": "aid01",
+    "EE_SIGN": "MEYCIQDNd4WAzZKWkTLeRPs74_uFRkJmQysZFO1-oAaMy9cXtQIhAJHbT91LIa1UtB95BvTqERKNNV_8KJhF1wBiQr13n2PR",
+    "EE_SENDER": "0xai_A74xZKZJa4LekjvJ6oJz29qxOOs5nLClXAZEhYv59t3Z",
+    "EE_ETH_SENDER": "0x37379B80c7657620E5631832c4437B51D67A88cB",
+    "EE_ETH_SIGN": "0xBEEF",
+    "EE_HASH": "e60c7c4af125b1563953c720fc51c78bd767fb76f79a1a8f31a49804f0a8c582"
+  }
+
+  
   
   request_faulty = {
     "EE_SENDER" : "0xai_AjcIThkOqrPlp35-S8czHUOV-y4mnhksnLs8NGjTbmty",
   }
   
   # res = eng.process_dauth_request(request_faulty)
-  res = eng.process_dauth_request(request_sdk)
+  res = eng.process_dauth_request(good_request)
   # res = eng.process_dauth_request(request_bad)
   l.P(f"Result:\n{json.dumps(res, indent=2)}")
       
