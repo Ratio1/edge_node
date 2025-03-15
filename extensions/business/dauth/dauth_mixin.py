@@ -203,13 +203,14 @@ class _DauthMixin(object):
         for a, b in zip(oracles, oracles_names)
       ]
     
-    # normally this used to be ran only if the current node is a seed oracle however
-    # this means that auto-oracles will NOT send their whitelist (which where receved
-    # from the seed oracle) to the other nodes thus creating a problem
-    wl, aliases = self.bc.get_whitelist_with_names()
-    for _node, _alias in zip(wl, aliases):
-      if _node not in oracles:
-        full_whitelist.append(_node + (f"  {_alias}" if len(_alias) > 0 else ""))
+      # normally this used to be ran only if the current node is a seed oracle however
+      # this means that auto-oracles will NOT send their whitelist (which where receved
+      # from the seed oracle) to the other nodes thus creating a problem
+      wl, aliases = self.bc.get_whitelist_with_names()
+      for _node, _alias in zip(wl, aliases):
+        if _node not in oracles:
+          full_whitelist.append(_node + (f"  {_alias}" if len(_alias) > 0 else ""))
+    # end if is_node
     
     dauth_data[dAuthCt.DAUTH_WHITELIST] = full_whitelist
 
@@ -485,7 +486,7 @@ if __name__ == '__main__':
   }
   
   # res = eng.process_dauth_request(request_faulty)
-  res = eng.process_dauth_request(good_request)
+  res = eng.process_dauth_request(request_sdk)
   # res = eng.process_dauth_request(request_bad)
   l.P(f"Result:\n{json.dumps(res, indent=2)}")
       
