@@ -12,7 +12,7 @@ NaeuralReleaseAppPlugin
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.3.1'
+__VER__ = '0.3.2'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -305,8 +305,21 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                   overflow: hidden;
                   transition: max-height 0.3s ease-out;
               }
+              .commit-info {
+                  background-color: #f8f9fa;
+                  padding: 10px;
+                  border-radius: 4px;
+                  font-size: 0.9em;
+                  max-height: 80px;
+                  overflow: hidden;
+                  transition: max-height 0.3s ease-out;
+              }
               .expanded {
-                  max-height: 1000px;
+                  max-height: 1000px !important;
+              }
+              .commit-title {
+                  font-weight: bold;
+                  margin-bottom: 5px;
               }
               .see-more-btn {
                   background-color: #f0f0f0;
@@ -349,6 +362,12 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               }
               .commit-message li {
                   margin-bottom: 3px;
+              }
+              .commit-message li.hidden {
+                  display: none;
+              }
+              .commit-message li.visible {
+                  display: list-item;
               }
           </style>
       </head>
@@ -431,11 +450,12 @@ class NaeuralReleaseAppPlugin(BasePlugin):
             formatted_message = f"<div class='commit-title'>{lines[0]}</div>"
             if len(lines) > 1:
               formatted_message += "<ul class='commit-message'>"
-              for line in lines[1:]:
+              for i, line in enumerate(lines[1:]):
+                css_class = "visible" if i < 2 else "hidden"
                 if line.strip().startswith('*'):
-                  formatted_message += f"<li>{line.strip()[1:].strip()}</li>"
+                  formatted_message += f"<li class='{css_class}'>{line.strip()[1:].strip()}</li>"
                 elif line.strip():
-                  formatted_message += f"<li>{line.strip()}</li>"
+                  formatted_message += f"<li class='{css_class}'>{line.strip()}</li>"
               formatted_message += "</ul>"
           else:
             formatted_message = commit_message
@@ -494,8 +514,22 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               const button = element.nextElementSibling;
               if (element.classList.contains('expanded')) {
                   button.textContent = 'See Less';
+                  // Show all list items when expanded
+                  const listItems = element.querySelectorAll('li');
+                  listItems.forEach(item => {
+                      item.classList.add('visible');
+                      item.classList.remove('hidden');
+                  });
               } else {
                   button.textContent = 'See More';
+                  // Hide items beyond the first 2 when collapsed
+                  const listItems = element.querySelectorAll('li');
+                  listItems.forEach((item, index) => {
+                      if (index >= 2) {
+                          item.classList.add('hidden');
+                          item.classList.remove('visible');
+                      }
+                  });
               }
           }
 
@@ -516,6 +550,21 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                   button.textContent = 'Show All Releases';
               }
           }
+
+          // Initialize to hide list items beyond the first 2 on page load
+          document.addEventListener('DOMContentLoaded', function() {
+              const commitInfos = document.querySelectorAll('.commit-info');
+              commitInfos.forEach(info => {
+                  const listItems = info.querySelectorAll('li');
+                  listItems.forEach((item, index) => {
+                      if (index >= 2) {
+                          item.classList.add('hidden');
+                      } else {
+                          item.classList.add('visible');
+                      }
+                  });
+              });
+          });
       </script>
       </html>
       """
