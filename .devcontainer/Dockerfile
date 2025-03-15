@@ -41,9 +41,6 @@ ENV EE_NETMON_SEND_ONLY_ONLINE=true
 ENV EE_EVM_NET=devnet
 
 
-ENV TZ=Europe/Bucharest
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
-
 # also can use EE_DEVICE to define target such as cuda:0 or cuda:1 instead of cpu
 # althouh this is not recommended as it should be in .env file
 # ENV EE_DEVICE=cuda:0
