@@ -820,7 +820,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           win_zip = next((asset for asset in release.get('assets', []) if self.re.search(r'WIN32\.zip', asset['name'])), None)
           win_exe = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.exe$', asset['name'])), None)
           win_msi = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.msi$', asset['name'])), None)
-          macos_intel = next((asset for asset in release.get('assets', []) if self.re.search(r'macOS\.app\.zip', asset['name'])), None)
           macos_arm = next((asset for asset in release.get('assets', []) if self.re.search(r'OSX-arm64\.zip', asset['name'])), None)
 
           if linux_20_04:
@@ -841,8 +840,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
             
           release_row += '</td><td>'
           
-          if macos_intel:
-            release_row += f'Intel: {macos_intel["size"] / (1024 * 1024):.2f} MB - <a href="{macos_intel["browser_download_url"]}" class="download-btn">Download</a><br>'
           if macos_arm:
             release_row += f'Apple Silicon: {macos_arm["size"] / (1024 * 1024):.2f} MB - <a href="{macos_arm["browser_download_url"]}" class="download-btn">Download</a>'
 
