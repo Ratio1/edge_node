@@ -9,6 +9,7 @@ NaeuralReleaseAppPlugin
   Subclass of the SupervisorFastApiWebApp, providing overrides for release fetching
   and HTML generation functionality.
 """
+import traceback
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
@@ -34,7 +35,7 @@ _CONFIG = {
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
-  'DEBUG_MODE': True,  # Enable detailed error reporting
+  'DEBUG_MODE': False,  # Enable detailed error reporting
   'SHOW_ALL_RELEASES_BY_DEFAULT': False,
 }
 
