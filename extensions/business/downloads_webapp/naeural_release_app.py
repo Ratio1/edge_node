@@ -58,6 +58,8 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     Fetches the latest tags from the GitHub repository.
   get_commit_info(commit_sha)
     Fetches commit information for a given commit SHA.
+  get_release_by_tag(tag_name)
+    Fetches information for a specific release by its tag name.
   compile_release_info(releases, tags)
     Associates commit information with each release record.
   check_for_rate_limit(response, raise_exception=True)
@@ -118,8 +120,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     try:
       releases_url = f"{self.cfg_releases_repo_url}/releases"
       self.P(f"{func_name}: Requesting releases from: {releases_url}")
+      
+      # Use a higher per_page value to ensure we get all the releases we need
       response = self.requests.get(releases_url,
-                                   params={"per_page": self.cfg_nr_previous_releases + 1})
+                                   params={"per_page": 100})
       
       if response.status_code != 200:
         error_msg = f"Failed to fetch releases. Status code: {response.status_code}, Response: {response.text}"
@@ -129,6 +133,15 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       releases = response.json()
       self.check_for_rate_limit(releases)
       self.P(f"{func_name}: Successfully fetched {len(releases)} releases")
+      
+      # Debug: Print full release data for inspection
+      for i, release in enumerate(releases):
+        self.P(f"{func_name}: Release {i} - Tag: {release.get('tag_name', 'Unknown')}")
+        self.P(f"{func_name}: Release {i} - Has body: {bool(release.get('body'))}")
+        if release.get('body'):
+          self.P(f"{func_name}: Release {i} - Body preview: {release.get('body')[:100]}...")
+        self.P(f"{func_name}: Release {i} - Keys: {sorted(release.keys())}")
+      
       return releases
     except Exception as e:
       error_msg = f"Failed to fetch releases: {str(e)}"
@@ -198,6 +211,122 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.log_error(func_name, error_msg, e)
       return None
 
+  def get_release_by_tag(self, tag_name):
+    """
+    Fetch information for a specific release by its tag name.
+    
+    Parameters
+    ----------
+    tag_name : str
+      The tag name of the release to fetch.
+      
+    Returns
+    -------
+    dict
+      JSON object with information about the specified release, or None if not found.
+    """
+    func_name = f"get_release_by_tag({tag_name})"
+    try:
+      release_url = f"{self.cfg_releases_repo_url}/releases/tags/{tag_name}"
+      self.P(f"{func_name}: Requesting specific release from: {release_url}")
+      response = self.requests.get(release_url)
+      
+      if response.status_code != 200:
+        error_msg = f"Failed to fetch release. Status code: {response.status_code}, Response: {response.text}"
+        self.log_error(func_name, error_msg)
+        return None
+        
+      release_info = response.json()
+      self.check_for_rate_limit(release_info)
+      self.P(f"{func_name}: Successfully fetched release for tag {tag_name}")
+      return release_info
+    except Exception as e:
+      error_msg = f"Failed to fetch release: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return None
+
+  def get_commit_message_for_tag(self, tag_name):
+    """
+    Fetch the commit message for a specific tag.
+    
+    Parameters
+    ----------
+    tag_name : str
+      The tag name to fetch the commit message for.
+      
+    Returns
+    -------
+    str
+      The commit message for the tag, or None if not found.
+    """
+    func_name = f"get_commit_message_for_tag({tag_name})"
+    try:
+      # First get the tag to find the commit SHA
+      tag_url = f"{self.cfg_releases_repo_url}/git/refs/tags/{tag_name}"
+      self.P(f"{func_name}: Requesting tag reference from: {tag_url}")
+      tag_response = self.requests.get(tag_url)
+      
+      if tag_response.status_code != 200:
+        error_msg = f"Failed to fetch tag reference. Status code: {tag_response.status_code}, Response: {tag_response.text}"
+        self.log_error(func_name, error_msg)
+        return None
+        
+      tag_data = tag_response.json()
+      self.check_for_rate_limit(tag_data)
+      
+      # Get the object type and SHA
+      if tag_data.get('object', {}).get('type') == 'tag':
+        # This is an annotated tag, we need to get the tag object first
+        tag_object_url = tag_data['object']['url']
+        self.P(f"{func_name}: Requesting annotated tag object from: {tag_object_url}")
+        tag_object_response = self.requests.get(tag_object_url)
+        
+        if tag_object_response.status_code != 200:
+          error_msg = f"Failed to fetch tag object. Status code: {tag_object_response.status_code}, Response: {tag_object_response.text}"
+          self.log_error(func_name, error_msg)
+          return None
+          
+        tag_object_data = tag_object_response.json()
+        self.check_for_rate_limit(tag_object_data)
+        
+        # Get the commit SHA from the tag object
+        commit_sha = tag_object_data.get('object', {}).get('sha')
+      else:
+        # This is a lightweight tag, we can use the SHA directly
+        commit_sha = tag_data.get('object', {}).get('sha')
+      
+      if not commit_sha:
+        error_msg = f"Could not find commit SHA for tag {tag_name}"
+        self.log_error(func_name, error_msg)
+        return None
+      
+      # Now get the commit information
+      commit_url = f"{self.cfg_releases_repo_url}/commits/{commit_sha}"
+      self.P(f"{func_name}: Requesting commit information from: {commit_url}")
+      commit_response = self.requests.get(commit_url)
+      
+      if commit_response.status_code != 200:
+        error_msg = f"Failed to fetch commit information. Status code: {commit_response.status_code}, Response: {commit_response.text}"
+        self.log_error(func_name, error_msg)
+        return None
+        
+      commit_data = commit_response.json()
+      self.check_for_rate_limit(commit_data)
+      
+      # Extract the commit message
+      commit_message = commit_data.get('commit', {}).get('message')
+      if commit_message:
+        self.P(f"{func_name}: Successfully retrieved commit message for tag {tag_name}")
+        return commit_message
+      else:
+        error_msg = f"No commit message found for tag {tag_name}"
+        self.log_error(func_name, error_msg)
+        return None
+    except Exception as e:
+      error_msg = f"Failed to fetch commit message for tag {tag_name}: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return None
+
   def compile_release_info(self, releases, tags):
     """
     Sorts releases by publish date, trims to NR_PREVIOUS_RELEASES,
@@ -226,12 +355,30 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       for i, release in enumerate(releases):
         try:
           release_tag = release['tag_name'].strip("'")
+          self.P(f"{func_name}: Processing release {i} - Tag: {release_tag}")
+          
+          # If the release doesn't have a body, try to fetch it directly
+          if not release.get('body') or not release['body'].strip():
+            self.P(f"{func_name}: Release {release_tag} has no body, trying to fetch directly")
+            specific_release = self.get_release_by_tag(release_tag)
+            if specific_release and specific_release.get('body') and specific_release['body'].strip():
+              release['body'] = specific_release['body']
+              self.P(f"{func_name}: Successfully fetched body for release {release_tag}")
+            else:
+              # If still no body, try to get the commit message for the tag
+              self.P(f"{func_name}: No body found for release {release_tag}, trying to get commit message")
+              commit_message = self.get_commit_message_for_tag(release_tag)
+              if commit_message:
+                release['body'] = commit_message
+                self.P(f"{func_name}: Successfully fetched commit message for release {release_tag}")
+          
           tag = next((tag for tag in tags if tag['name'].strip("'") == release_tag), None)
           if tag:
             try:
               commit_info = self.get_commit_info(tag['commit']['sha'])
               self.check_for_rate_limit(commit_info)
               release['commit_info'] = commit_info
+              self.P(f"{func_name}: Added commit info for release {release_tag}")
             except Exception as e:
               error_msg = f"Failed to get commit info for release {release_tag}, index {i}: {str(e)}"
               self.log_error(func_name, error_msg, e)
@@ -241,6 +388,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           else:
             self.P(f"{func_name}: Warning - No matching tag found for release {release_tag}")
             release['commit_info'] = None
+            
+          # Debug: Print release information after processing
+          self.P(f"{func_name}: Release {i} after processing - Tag: {release_tag}")
+          self.P(f"{func_name}: Release {i} - Has body: {bool(release.get('body'))}")
+          if release.get('body'):
+            self.P(f"{func_name}: Release {i} - Body preview: {release.get('body')[:100]}...")
+          self.P(f"{func_name}: Release {i} - Has commit_info: {bool(release.get('commit_info'))}")
         except Exception as e:
           error_msg = f"Failed to process release at index {i}: {str(e)}"
           self.log_error(func_name, error_msg, e)
@@ -705,17 +859,37 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       }
       self.P(f"{func_name}: latest_release:\n{self.json_dumps(dct_info, indent=2)}")
       
-      # Safely get commit message
-      commit_message = "No commit information available"
-      if latest_release.get('commit_info') and latest_release['commit_info'].get('commit'):
-        commit_message = latest_release['commit_info']['commit'].get('message', commit_message)
+      # Get release information - use body if available, otherwise fall back to commit message or name
+      release_info = "No release information available"
+      
+      # First try to use the release body
+      if latest_release.get('body') and latest_release['body'].strip():
+        release_info = latest_release['body'].strip()
+        self.P(f"{func_name}: Using release body for latest release {latest_release['tag_name']}")
+      # Then try to use the commit message from the commit_info
+      elif latest_release.get('commit_info') and latest_release['commit_info'].get('commit'):
+        release_info = latest_release['commit_info']['commit'].get('message', release_info)
+        self.P(f"{func_name}: Using commit message for latest release {latest_release['tag_name']}")
+      # Try to get the commit message directly from the tag
+      else:
+        commit_message = self.get_commit_message_for_tag(latest_release['tag_name'])
+        if commit_message:
+          release_info = commit_message
+          self.P(f"{func_name}: Using commit message from tag for latest release {latest_release['tag_name']}")
+        # Finally, use the release name or tag as a last resort
+        elif latest_release.get('name') and latest_release['name'].strip():
+          release_info = f"Release {latest_release['name']}"
+          self.P(f"{func_name}: Using release name for latest release {latest_release['tag_name']}")
+        else:
+          release_info = f"Release {latest_release['tag_name']}"
+          self.P(f"{func_name}: Using tag name for latest release {latest_release['tag_name']}")
       
       latest_release_section = f"""
           <div class="latest-release" id="latest-release">
               <h2>Latest Release: {latest_release['tag_name'].replace("'","")}</h2>
               <h3>Details:</h3>
               <div style="margin-left: 2em;">
-                <pre id="latest-release-info">{commit_message}</pre>
+                <pre id="latest-release-info">{release_info}</pre>
                 <button class="see-more-btn" onclick="toggleContent('latest-release-info')">See More</button>
               </div>
               <p>Date Published: {self.datetime.strptime(latest_release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}</p>
@@ -770,27 +944,46 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         if release is None:
           continue
         try:
-          # Safely get commit message
-          commit_message = "No commit information available"
+          # Get release information with better fallbacks
+          commit_message = "No release information available"
           formatted_message = commit_message
           
-          if release.get('commit_info') and release['commit_info'].get('commit'):
+          # First try to use the release body
+          if release.get('body') and release['body'].strip():
+            commit_message = release['body'].strip()
+            self.P(f"{func_name}: Using release body for release {release['tag_name']}")
+          # Then try to use the commit message from commit_info
+          elif release.get('commit_info') and release['commit_info'].get('commit'):
             commit_message = release['commit_info']['commit'].get('message', commit_message)
-            
-            if '\n' in commit_message:
-              lines = commit_message.strip().split('\n')
-              formatted_message = f"<div class='commit-title'>{lines[0]}</div>"
-              if len(lines) > 1:
-                formatted_message += "<ul class='commit-message'>"
-                for j, line in enumerate(lines[1:]):
-                  css_class = "visible" if j < 2 else "hidden"
-                  if line.strip().startswith('*'):
-                    formatted_message += f"<li class='{css_class}'>{line.strip()[1:].strip()}</li>"
-                  elif line.strip():
-                    formatted_message += f"<li class='{css_class}'>{line.strip()}</li>"
-                formatted_message += "</ul>"
+            self.P(f"{func_name}: Using commit message for release {release['tag_name']}")
+          # Try to get the commit message directly from the tag
+          else:
+            tag_commit_message = self.get_commit_message_for_tag(release['tag_name'])
+            if tag_commit_message:
+              commit_message = tag_commit_message
+              self.P(f"{func_name}: Using commit message from tag for release {release['tag_name']}")
+            # Finally, use the release name or tag as a last resort
+            elif release.get('name') and release['name'].strip():
+              commit_message = f"Release {release['name']}"
+              self.P(f"{func_name}: Using release name for release {release['tag_name']}")
             else:
-              formatted_message = commit_message
+              commit_message = f"Release {release['tag_name']}"
+              self.P(f"{func_name}: Using tag name for release {release['tag_name']}")
+          
+          if '\n' in commit_message:
+            lines = commit_message.strip().split('\n')
+            formatted_message = f"<div class='commit-title'>{lines[0]}</div>"
+            if len(lines) > 1:
+              formatted_message += "<ul class='commit-message'>"
+              for j, line in enumerate(lines[1:]):
+                css_class = "visible" if j < 2 else "hidden"
+                if line.strip().startswith('*'):
+                  formatted_message += f"<li class='{css_class}'>{line.strip()[1:].strip()}</li>"
+                elif line.strip():
+                  formatted_message += f"<li class='{css_class}'>{line.strip()}</li>"
+              formatted_message += "</ul>"
+          else:
+            formatted_message = commit_message
 
           # Make all releases visible by default if configured to do so
           visible_class = "visible" if (i < 2 or self.cfg_show_all_releases_by_default) else ""
@@ -992,7 +1185,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         web_server_path = self.get_web_server_path()
         output_path = self.os_path.join(web_server_path, 'assets/releases.html')
         file_exists = self.os_path.isfile(output_path)
-        
+        self.P(f"Output Path: {output_path} | file_exists: {file_exists}")
         # Attempt to regenerate the HTML
         result = self._regenerate_index_html()
         
