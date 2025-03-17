@@ -708,57 +708,131 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               }
               .latest-release h2, .previous-releases h2 {
                   color: #4b6cb7;
+                  margin-top: 0;
+                  font-size: 1.8em;
+              }
+              .release-header {
+                  display: flex;
+                  justify-content: space-between;
+                  align-items: center;
                   border-bottom: 2px solid #f0f0f0;
-                  padding-bottom: 10px;
+                  padding-bottom: 15px;
+                  margin-bottom: 20px;
               }
-              table {
-                  width: 100%;
-                  border-collapse: collapse;
-                  margin-top: 20px;
+              .release-date {
+                  color: #666;
+                  font-size: 0.9em;
               }
-              table, th, td {
+              .release-content {
+                  display: flex;
+                  flex-direction: column;
+                  gap: 30px;
+              }
+              @media (min-width: 768px) {
+                  .release-content {
+                      flex-direction: row;
+                  }
+                  .release-details {
+                      flex: 1;
+                      padding-right: 30px;
+                  }
+                  .download-options {
+                      flex: 1;
+                  }
+              }
+              .release-notes-container {
+                  position: relative;
+                  margin-bottom: 20px;
+              }
+              .release-notes {
+                  background-color: #f8f9fa;
+                  padding: 15px;
+                  border-radius: 6px;
+                  white-space: pre-wrap;
+                  font-size: 0.9em;
+                  max-height: 200px;
+                  overflow: hidden;
+                  transition: max-height 0.3s ease-out;
+                  margin: 0;
                   border: 1px solid #e0e0e0;
               }
-              th {
+              .download-grid {
+                  display: grid;
+                  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                  gap: 15px;
+              }
+              .download-item {
+                  display: flex;
+                  align-items: center;
+                  padding: 15px;
+                  border-radius: 8px;
                   background-color: #f8f9fa;
-                  font-weight: 600;
+                  border: 1px solid #e0e0e0;
+                  transition: transform 0.2s, box-shadow 0.2s;
               }
-              th, td {
-                  padding: 12px 15px;
-                  text-align: left;
+              .download-item:hover {
+                  transform: translateY(-2px);
+                  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
               }
-              tr:nth-child(even) {
-                  background-color: #f9f9f9;
+              .os-icon {
+                  font-size: 24px;
+                  margin-right: 15px;
               }
-              a {
-                  color: #4b6cb7;
-                  text-decoration: none;
+              .download-details {
+                  flex: 1;
+                  display: flex;
+                  flex-direction: column;
               }
-              a:hover {
-                  text-decoration: underline;
+              .os-name {
+                  font-weight: bold;
+                  margin-bottom: 5px;
+              }
+              .file-size {
+                  color: #666;
+                  font-size: 0.8em;
+                  margin-bottom: 10px;
               }
               .download-btn {
                   display: inline-block;
                   background-color: #4CAF50;
                   color: white;
-                  padding: 6px 12px;
+                  padding: 8px 16px;
                   border-radius: 4px;
                   text-decoration: none;
-                  margin-top: 5px;
+                  text-align: center;
+                  font-weight: 500;
+                  transition: background-color 0.2s;
               }
               .download-btn:hover {
                   background-color: #45a049;
-                  text-decoration: none;
               }
-              pre {
-                  background-color: #f8f9fa;
-                  padding: 10px;
+              .see-more-btn {
+                  background-color: #f0f0f0;
+                  border: none;
+                  padding: 5px 10px;
+                  font-size: 0.8em;
                   border-radius: 4px;
-                  white-space: pre-wrap;
-                  font-size: 0.9em;
-                  max-height: 100px;
-                  overflow: hidden;
-                  transition: max-height 0.3s ease-out;
+                  cursor: pointer;
+                  margin-top: 10px;
+                  color: #666;
+                  display: block;
+                  width: 100%;
+                  text-align: center;
+              }
+              .see-more-btn:hover {
+                  background-color: #e0e0e0;
+              }
+              .see-less-text {
+                  display: none;
+              }
+              .expanded .see-more-text {
+                  display: none;
+              }
+              .expanded .see-less-text {
+                  display: inline;
+              }
+              .expanded {
+                  max-height: 1000px !important;
               }
               .commit-info {
                   background-color: #f8f9fa;
@@ -769,25 +843,65 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                   overflow: hidden;
                   transition: max-height 0.3s ease-out;
               }
-              .expanded {
-                  max-height: 1000px !important;
-              }
               .commit-title {
                   font-weight: bold;
                   margin-bottom: 5px;
               }
-              .see-more-btn {
-                  background-color: #f0f0f0;
-                  border: none;
-                  padding: 5px 10px;
-                  font-size: 0.8em;
-                  border-radius: 4px;
-                  cursor: pointer;
-                  margin-top: 5px;
-                  color: #666;
+              .commit-message {
+                  list-style-type: disc;
+                  padding-left: 20px;
+                  margin: 5px 0;
               }
-              .see-more-btn:hover {
-                  background-color: #e0e0e0;
+              .commit-message li {
+                  margin-bottom: 3px;
+              }
+              .commit-message li.hidden {
+                  display: none;
+              }
+              .commit-message li.visible {
+                  display: list-item;
+              }
+              .release-row {
+                  display: none;
+              }
+              .release-row.visible {
+                  display: table-row;
+              }
+              table {
+                  width: 100%;
+                  border-collapse: collapse;
+                  margin-top: 20px;
+                  border-radius: 8px;
+                  overflow: hidden;
+                  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+              }
+              table, th, td {
+                  border: 1px solid #e0e0e0;
+              }
+              th {
+                  background-color: #f8f9fa;
+                  font-weight: 600;
+                  padding: 15px;
+                  text-align: left;
+                  color: #4b6cb7;
+              }
+              td {
+                  padding: 15px;
+                  text-align: left;
+                  vertical-align: top;
+              }
+              tr:nth-child(even) {
+                  background-color: #f9f9f9;
+              }
+              tr:hover {
+                  background-color: #f0f4f8;
+              }
+              a {
+                  color: #4b6cb7;
+                  text-decoration: none;
+              }
+              a:hover {
+                  text-decoration: underline;
               }
               .show-all-btn {
                   display: block;
@@ -803,26 +917,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               }
               .show-all-btn:hover {
                   background-color: #3a5795;
-              }
-              .release-row {
-                  display: none;
-              }
-              .release-row.visible {
-                  display: table-row;
-              }
-              .commit-message {
-                  list-style-type: disc;
-                  padding-left: 20px;
-                  margin: 5px 0;
-              }
-              .commit-message li {
-                  margin-bottom: 3px;
-              }
-              .commit-message li.hidden {
-                  display: none;
-              }
-              .commit-message li.visible {
-                  display: list-item;
               }
           </style>
       </head>
@@ -883,38 +977,100 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         else:
           release_info = f"Release {latest_release['tag_name']}"
           self.P(f"{func_name}: Using tag name for latest release {latest_release['tag_name']}")
-      
+        
       latest_release_section = f"""
           <div class="latest-release" id="latest-release">
-              <h2>Latest Release: {latest_release['tag_name'].replace("'","")}</h2>
-              <h3>Details:</h3>
-              <div style="margin-left: 2em;">
-                <pre id="latest-release-info">{release_info}</pre>
-                <button class="see-more-btn" onclick="toggleContent('latest-release-info')">See More</button>
+              <div class="release-header">
+                  <h2>Latest Release: {latest_release['tag_name'].replace("'","")}</h2>
+                  <span class="release-date">Released on {self.datetime.strptime(latest_release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}</span>
               </div>
-              <p>Date Published: {self.datetime.strptime(latest_release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}</p>
-              <ul>
-      """
+              
+              <div class="release-content">
+                  <div class="release-details">
+                      <h3>Release Details:</h3>
+                      <div class="release-notes-container">
+                          <pre id="latest-release-info" class="release-notes">{release_info}</pre>
+                          <button class="see-more-btn" onclick="toggleContent('latest-release-info')">
+                              <span class="see-more-text">See More</span>
+                              <span class="see-less-text">See Less</span>
+                          </button>
+                      </div>
+                  </div>
+                  
+                  <div class="download-options">
+                      <h3>Download Options:</h3>
+                      <div class="download-grid">
+        """
 
       assets = latest_release.get('assets', [])
       for asset in assets:
         if self.re.search(r'LINUX_Ubuntu-20\.04\.AppImage', asset['name']):
-          latest_release_section += f'<li>Linux Ubuntu 20.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item linux">
+                    <div class="os-icon">🐧</div>
+                    <div class="download-details">
+                        <span class="os-name">Linux Ubuntu 20.04</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
         if self.re.search(r'LINUX_Ubuntu-22\.04\.AppImage', asset['name']):
-          latest_release_section += f'<li>Linux Ubuntu 22.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item linux">
+                    <div class="os-icon">🐧</div>
+                    <div class="download-details">
+                        <span class="os-name">Linux Ubuntu 22.04</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
         if self.re.search(r'LINUX_Ubuntu-24\.04\.AppImage', asset['name']):
-          latest_release_section += f'<li>Linux Ubuntu 24.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item linux">
+                    <div class="os-icon">🐧</div>
+                    <div class="download-details">
+                        <span class="os-name">Linux Ubuntu 24.04</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
         if self.re.search(r'OSX-arm64\.zip', asset['name']):
-          latest_release_section += f'<li>macOS (Apple Silicon): {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item macos">
+                    <div class="os-icon">🍎</div>
+                    <div class="download-details">
+                        <span class="os-name">macOS (Apple Silicon)</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
         if self.re.search(r'WIN32\.zip', asset['name']):
-          latest_release_section += f'<li>Windows (ZIP): {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item windows">
+                    <div class="os-icon">🪟</div>
+                    <div class="download-details">
+                        <span class="os-name">Windows (ZIP)</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
         if self.re.search(r'Windows\.msi$', asset['name']):
-          latest_release_section += f'<li>Windows (MSI): {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item windows">
+                    <div class="os-icon">🪟</div>
+                    <div class="download-details">
+                        <span class="os-name">Windows (MSI)</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
 
       latest_release_section += f"""
-              </ul>
+                      </div>
+                  </div>
+              </div>
           </div>
-      """
+        """
 
       html_content += latest_release_section
     except Exception as e:
@@ -997,7 +1153,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                               <div id="release-info-{safe_tag_name}" class="commit-info">
                                 {formatted_message}
                               </div>
-                              <button class="see-more-btn" onclick="toggleContent('release-info-{safe_tag_name}')">See More</button>
+                              <button class="see-more-btn" onclick="toggleContent('release-info-{safe_tag_name}')">
+                                <span class="see-more-text">See More</span>
+                                <span class="see-less-text">See Less</span>
+                              </button>
                             </div>
                           </td>
 
@@ -1056,16 +1215,16 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               element.classList.toggle('expanded');
 
               const button = element.nextElementSibling;
+              button.classList.toggle('expanded');
+              
+              // Show all list items when expanded
               if (element.classList.contains('expanded')) {{
-                  button.textContent = 'See Less';
-                  // Show all list items when expanded
                   const listItems = element.querySelectorAll('li');
                   listItems.forEach(item => {{
                       item.classList.add('visible');
                       item.classList.remove('hidden');
                   }});
               }} else {{
-                  button.textContent = 'See More';
                   // Hide items beyond the first 2 when collapsed
                   const listItems = element.querySelectorAll('li');
                   listItems.forEach((item, index) => {{
