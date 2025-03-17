@@ -1,3 +1,19 @@
+"""
+dauth_mixin.py
+==============
+
+This module contains the dAuth mixin class that handles the decentralized authentication process.
+This mixin is responsible for processing dAuth requests and performin various checks such as:
+- default verification of the request signature (via de public key empeddedn in the rrquester node address)
+- checking using EVM smart-contract if the node is linked to a valid on-chain license
+- checking the version of the node that is sending the request
+- checking if the node is a oracle node (including a seed node)
+- other heuristic checks
+This module is part of the Ratio1e ecosystem and is used in conjunction with the dAuth manager
+plugin to provide a complete decentralized authentication solution.
+
+"""
+
 
 def version_to_int(version):
   """
