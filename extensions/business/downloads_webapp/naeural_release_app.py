@@ -708,74 +708,116 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               }
               .latest-release h2, .previous-releases h2 {
                   color: #4b6cb7;
-                  margin-top: 0;
-                  font-size: 1.8em;
+                  border-bottom: 2px solid #f0f0f0;
+                  padding-bottom: 10px;
               }
               .release-header {
                   display: flex;
                   justify-content: space-between;
                   align-items: center;
-                  border-bottom: 2px solid #f0f0f0;
-                  padding-bottom: 15px;
-                  margin-bottom: 20px;
+                  flex-wrap: wrap;
+                  margin-bottom: 1em;
               }
               .release-date {
                   color: #666;
-                  font-size: 0.9em;
+                  font-style: italic;
               }
               .release-content {
                   display: flex;
-                  flex-direction: column;
-                  gap: 30px;
+                  flex-wrap: wrap;
+                  gap: 2em;
               }
-              @media (min-width: 768px) {
-                  .release-content {
-                      flex-direction: row;
-                  }
-                  .release-details {
-                      flex: 1;
-                      padding-right: 30px;
-                  }
-                  .download-options {
-                      flex: 1;
-                  }
+              .release-details {
+                  flex: 1;
+                  min-width: 300px;
+              }
+              .download-options {
+                  flex: 1;
+                  min-width: 300px;
               }
               .release-notes-container {
                   position: relative;
-                  margin-bottom: 20px;
               }
               .release-notes {
                   background-color: #f8f9fa;
                   padding: 15px;
-                  border-radius: 6px;
+                  border-radius: 4px;
                   white-space: pre-wrap;
-                  font-size: 0.9em;
+                  font-size: 0.95em;
                   max-height: 200px;
                   overflow: hidden;
                   transition: max-height 0.3s ease-out;
                   margin: 0;
-                  border: 1px solid #e0e0e0;
+              }
+              .commit-info {
+                  background-color: #f8f9fa;
+                  padding: 10px;
+                  border-radius: 4px;
+                  font-size: 0.9em;
+                  max-height: 100px;
+                  overflow: hidden;
+                  transition: max-height 0.3s ease-out;
+              }
+              .expanded {
+                  max-height: 1000px !important;
+              }
+              .commit-title {
+                  font-weight: bold;
+                  margin-bottom: 5px;
+              }
+              .see-more-btn {
+                  background-color: #f0f0f0;
+                  border: none;
+                  padding: 5px 10px;
+                  font-size: 0.8em;
+                  border-radius: 4px;
+                  cursor: pointer;
+                  margin-top: 5px;
+                  color: #666;
+                  display: none;
+                  position: relative;
+              }
+              .see-more-btn:hover {
+                  background-color: #e0e0e0;
+              }
+              .see-more-btn .see-less-text {
+                  display: none;
+              }
+              .see-more-btn.expanded .see-more-text {
+                  display: none;
+              }
+              .see-more-btn.expanded .see-less-text {
+                  display: inline;
               }
               .download-grid {
                   display: grid;
                   grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
                   gap: 15px;
+                  margin-top: 1em;
               }
               .download-item {
                   display: flex;
                   align-items: center;
-                  padding: 15px;
+                  background-color: #f9f9f9;
                   border-radius: 8px;
-                  background-color: #f8f9fa;
-                  border: 1px solid #e0e0e0;
+                  padding: 10px 15px;
                   transition: transform 0.2s, box-shadow 0.2s;
               }
               .download-item:hover {
                   transform: translateY(-2px);
-                  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+                  box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+              }
+              .linux {
+                  border-left: 4px solid #f0ad4e;
+              }
+              .windows {
+                  border-left: 4px solid #5bc0de;
+              }
+              .macos {
+                  border-left: 4px solid #5cb85c;
               }
               .os-icon {
-                  font-size: 24px;
+                  font-size: 1.8em;
                   margin-right: 15px;
               }
               .download-details {
@@ -785,95 +827,31 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               }
               .os-name {
                   font-weight: bold;
-                  margin-bottom: 5px;
+                  margin-bottom: 3px;
               }
               .file-size {
-                  color: #666;
+                  color: #777;
                   font-size: 0.8em;
-                  margin-bottom: 10px;
+                  margin-bottom: 5px;
               }
               .download-btn {
                   display: inline-block;
                   background-color: #4CAF50;
                   color: white;
-                  padding: 8px 16px;
+                  padding: 6px 12px;
                   border-radius: 4px;
                   text-decoration: none;
-                  text-align: center;
-                  font-weight: 500;
-                  transition: background-color 0.2s;
+                  font-size: 0.9em;
+                  align-self: flex-start;
               }
               .download-btn:hover {
                   background-color: #45a049;
-              }
-              .see-more-btn {
-                  background-color: #f0f0f0;
-                  border: none;
-                  padding: 5px 10px;
-                  font-size: 0.8em;
-                  border-radius: 4px;
-                  cursor: pointer;
-                  margin-top: 10px;
-                  color: #666;
-                  display: block;
-                  width: 100%;
-                  text-align: center;
-              }
-              .see-more-btn:hover {
-                  background-color: #e0e0e0;
-              }
-              .see-less-text {
-                  display: none;
-              }
-              .expanded .see-more-text {
-                  display: none;
-              }
-              .expanded .see-less-text {
-                  display: inline;
-              }
-              .expanded {
-                  max-height: 1000px !important;
-              }
-              .commit-info {
-                  background-color: #f8f9fa;
-                  padding: 10px;
-                  border-radius: 4px;
-                  font-size: 0.9em;
-                  max-height: 80px;
-                  overflow: hidden;
-                  transition: max-height 0.3s ease-out;
-              }
-              .commit-title {
-                  font-weight: bold;
-                  margin-bottom: 5px;
-              }
-              .commit-message {
-                  list-style-type: disc;
-                  padding-left: 20px;
-                  margin: 5px 0;
-              }
-              .commit-message li {
-                  margin-bottom: 3px;
-              }
-              .commit-message li.hidden {
-                  display: none;
-              }
-              .commit-message li.visible {
-                  display: list-item;
-              }
-              .release-row {
-                  display: none;
-              }
-              .release-row.visible {
-                  display: table-row;
+                  text-decoration: none;
               }
               table {
                   width: 100%;
                   border-collapse: collapse;
                   margin-top: 20px;
-                  border-radius: 8px;
-                  overflow: hidden;
-                  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
               }
               table, th, td {
                   border: 1px solid #e0e0e0;
@@ -881,20 +859,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               th {
                   background-color: #f8f9fa;
                   font-weight: 600;
-                  padding: 15px;
-                  text-align: left;
-                  color: #4b6cb7;
               }
-              td {
-                  padding: 15px;
+              th, td {
+                  padding: 12px 15px;
                   text-align: left;
-                  vertical-align: top;
               }
               tr:nth-child(even) {
                   background-color: #f9f9f9;
-              }
-              tr:hover {
-                  background-color: #f0f4f8;
               }
               a {
                   color: #4b6cb7;
@@ -902,6 +873,17 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               }
               a:hover {
                   text-decoration: underline;
+              }
+              .commit-message {
+                  list-style-type: disc;
+                  padding-left: 20px;
+                  margin: 5px 0;
+              }
+              .commit-message li.hidden {
+                  display: none;
+              }
+              .commit-message li.visible {
+                  display: list-item;
               }
               .show-all-btn {
                   display: block;
@@ -917,6 +899,12 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               }
               .show-all-btn:hover {
                   background-color: #3a5795;
+              }
+              .release-row {
+                  display: none;
+              }
+              .release-row.visible {
+                  display: table-row;
               }
           </style>
       </head>
@@ -990,7 +978,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                       <h3>Release Details:</h3>
                       <div class="release-notes-container">
                           <pre id="latest-release-info" class="release-notes">{release_info}</pre>
-                          <button class="see-more-btn" onclick="toggleContent('latest-release-info')">
+                          <button id="latest-release-btn" class="see-more-btn" onclick="toggleContent('latest-release-info')" style="display: none;">
                               <span class="see-more-text">See More</span>
                               <span class="see-less-text">See Less</span>
                           </button>
@@ -1153,7 +1141,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                               <div id="release-info-{safe_tag_name}" class="commit-info">
                                 {formatted_message}
                               </div>
-                              <button class="see-more-btn" onclick="toggleContent('release-info-{safe_tag_name}')">
+                              <button id="btn-{safe_tag_name}" class="see-more-btn" onclick="toggleContent('release-info-{safe_tag_name}')" style="display: none;">
                                 <span class="see-more-text">See More</span>
                                 <span class="see-less-text">See Less</span>
                               </button>
@@ -1210,12 +1198,40 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           </div>
       </body>
       <script>
+          // Check if content needs expansion and show button only if needed
+          function checkContentOverflow(contentId, buttonId) {{
+              const content = document.getElementById(contentId);
+              const button = document.getElementById(buttonId);
+              
+              if (!content || !button) return;
+              
+              // For pre elements (latest release)
+              if (content.tagName === 'PRE') {{
+                  // Only show button if content is taller than default height or has multiple paragraphs
+                  if (content.scrollHeight > content.clientHeight || content.textContent.split('\\n').length > 4) {{
+                      button.style.display = 'block';
+                  }}
+              }}
+              // For div elements with commit info (previous releases)
+              else {{
+                  // Check if there are hidden list items or if content is overflowing
+                  const hasHiddenItems = content.querySelectorAll('li.hidden').length > 0;
+                  const isOverflowing = content.scrollHeight > content.clientHeight;
+                  const hasManyParagraphs = content.textContent.split('\\n').length > 3;
+                  
+                  if (hasHiddenItems || isOverflowing || hasManyParagraphs) {{
+                      button.style.display = 'block';
+                  }}
+              }}
+          }}
+          
           function toggleContent(id) {{
               const element = document.getElementById(id);
+              const buttonId = id === 'latest-release-info' ? 'latest-release-btn' : 'btn-' + id.replace('release-info-', '');
+              const button = document.getElementById(buttonId);
+              
               element.classList.toggle('expanded');
-
-              const button = element.nextElementSibling;
-              button.classList.toggle('expanded');
+              if (button) button.classList.toggle('expanded');
               
               // Show all list items when expanded
               if (element.classList.contains('expanded')) {{
@@ -1254,10 +1270,15 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               }}
           }}
 
-          // Initialize to hide list items beyond the first 2 on page load
+          // Initialize on page load
           document.addEventListener('DOMContentLoaded', function() {{
+              // Initialize latest release
+              checkContentOverflow('latest-release-info', 'latest-release-btn');
+              
+              // Initialize previous releases
               const commitInfos = document.querySelectorAll('.commit-info');
               commitInfos.forEach(info => {{
+                  // Process list items
                   const listItems = info.querySelectorAll('li');
                   listItems.forEach((item, index) => {{
                       if (index >= 2) {{
@@ -1266,6 +1287,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                           item.classList.add('visible');
                       }}
                   }});
+                  
+                  // Check if button should be shown
+                  const infoId = info.id;
+                  const btnId = 'btn-' + infoId.replace('release-info-', '');
+                  checkContentOverflow(infoId, btnId);
               }});
           }});
       </script>
