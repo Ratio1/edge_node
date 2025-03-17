@@ -11,8 +11,10 @@ NaeuralReleaseAppPlugin
 """
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
+import traceback
+import sys
 
-__VER__ = '0.3.2'
+__VER__ = '0.3.3'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -33,6 +35,7 @@ _CONFIG = {
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
+  'DEBUG_MODE': True,  # Enable detailed error reporting
 }
 
 class NaeuralReleaseAppPlugin(BasePlugin):
@@ -77,6 +80,26 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.__last_generation_time = 0
     return
 
+  def log_error(self, func_name, error_msg, exc_info=None):
+    """
+    Log an error with contextual information and optional traceback.
+    
+    Parameters
+    ----------
+    func_name : str
+      The name of the function where the error occurred.
+    error_msg : str
+      The error message to log.
+    exc_info : Exception, optional
+      The exception object if available.
+    """
+    error_details = f"ERROR in {func_name}: {error_msg}"
+    if exc_info and self.cfg_debug_mode:
+      tb_str = ''.join(traceback.format_exception(type(exc_info), exc_info, exc_info.__traceback__))
+      error_details += f"\nTraceback:\n{tb_str}"
+    self.P(error_details)
+    return error_details
+
   def get_latest_releases(self):
     """
     Fetch the latest releases from GitHub, up to NR_PREVIOUS_RELEASES + 1.
@@ -86,13 +109,26 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     list
       A list of JSON objects corresponding to recent GitHub releases.
     """
-    releases_url = f"{self.cfg_releases_repo_url}/releases"
-    self.P("Requesting releases from: {}".format(releases_url))
-    response = self.requests.get(releases_url,
-                                 params={"per_page": self.cfg_nr_previous_releases + 1})
-    releases = response.json()
-    self.check_for_rate_limit(releases)
-    return releases
+    func_name = "get_latest_releases"
+    try:
+      releases_url = f"{self.cfg_releases_repo_url}/releases"
+      self.P(f"{func_name}: Requesting releases from: {releases_url}")
+      response = self.requests.get(releases_url,
+                                   params={"per_page": self.cfg_nr_previous_releases + 1})
+      
+      if response.status_code != 200:
+        error_msg = f"Failed to fetch releases. Status code: {response.status_code}, Response: {response.text}"
+        self.log_error(func_name, error_msg)
+        return []
+        
+      releases = response.json()
+      self.check_for_rate_limit(releases)
+      self.P(f"{func_name}: Successfully fetched {len(releases)} releases")
+      return releases
+    except Exception as e:
+      error_msg = f"Failed to fetch releases: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return []
 
   def get_latest_tags(self):
     """
@@ -103,13 +139,26 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     list
       A list of JSON objects corresponding to recent GitHub tags.
     """
-    tags_url = f"{self.cfg_releases_repo_url}/tags"
-    self.P("Requesting tags from: {}".format(tags_url))
-    response = self.requests.get(tags_url,
-                                 params={"per_page": self.cfg_nr_previous_releases + 1})
-    tags = response.json()
-    self.check_for_rate_limit(tags)
-    return tags
+    func_name = "get_latest_tags"
+    try:
+      tags_url = f"{self.cfg_releases_repo_url}/tags"
+      self.P(f"{func_name}: Requesting tags from: {tags_url}")
+      response = self.requests.get(tags_url,
+                                   params={"per_page": self.cfg_nr_previous_releases + 1})
+      
+      if response.status_code != 200:
+        error_msg = f"Failed to fetch tags. Status code: {response.status_code}, Response: {response.text}"
+        self.log_error(func_name, error_msg)
+        return []
+        
+      tags = response.json()
+      self.check_for_rate_limit(tags)
+      self.P(f"{func_name}: Successfully fetched {len(tags)} tags")
+      return tags
+    except Exception as e:
+      error_msg = f"Failed to fetch tags: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return []
 
   def get_commit_info(self, commit_sha):
     """
@@ -125,12 +174,24 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     dict
       JSON object with information about the specified commit.
     """
-    commit_url = f"{self.cfg_releases_repo_url}/commits/{commit_sha}"
-    self.P("Requesting commit info from: {}".format(commit_url))
-    response = self.requests.get(commit_url)
-    commit_info = response.json()
-    self.check_for_rate_limit(commit_info)
-    return commit_info
+    func_name = f"get_commit_info({commit_sha})"
+    try:
+      commit_url = f"{self.cfg_releases_repo_url}/commits/{commit_sha}"
+      self.P(f"{func_name}: Requesting commit info from: {commit_url}")
+      response = self.requests.get(commit_url)
+      
+      if response.status_code != 200:
+        error_msg = f"Failed to fetch commit info. Status code: {response.status_code}, Response: {response.text}"
+        self.log_error(func_name, error_msg)
+        return None
+        
+      commit_info = response.json()
+      self.check_for_rate_limit(commit_info)
+      return commit_info
+    except Exception as e:
+      error_msg = f"Failed to fetch commit info: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return None
 
   def compile_release_info(self, releases, tags):
     """
@@ -149,22 +210,41 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     list
       The updated list of release objects, each including a 'commit_info' key.
     """
-    releases.sort(key=lambda x: x['published_at'], reverse=True)
-    releases = releases[:self.cfg_nr_previous_releases]
-    for i, release in enumerate(releases):
-      release_tag = release['tag_name'].strip("'")
-      tag = next((tag for tag in tags if tag['name'].strip("'") == release_tag), None)
-      if tag:
+    func_name = "compile_release_info"
+    if not releases:
+      self.log_error(func_name, "No releases provided")
+      return []
+    
+    try:
+      releases.sort(key=lambda x: x['published_at'], reverse=True)
+      releases = releases[:self.cfg_nr_previous_releases]
+      for i, release in enumerate(releases):
         try:
-          commit_info = self.get_commit_info(tag['commit']['sha'])
-          self.check_for_rate_limit(commit_info)
+          release_tag = release['tag_name'].strip("'")
+          tag = next((tag for tag in tags if tag['name'].strip("'") == release_tag), None)
+          if tag:
+            try:
+              commit_info = self.get_commit_info(tag['commit']['sha'])
+              self.check_for_rate_limit(commit_info)
+              release['commit_info'] = commit_info
+            except Exception as e:
+              error_msg = f"Failed to get commit info for release {release_tag}, index {i}: {str(e)}"
+              self.log_error(func_name, error_msg, e)
+              if i > 1:
+                return releases
+              release['commit_info'] = None
+          else:
+            self.P(f"{func_name}: Warning - No matching tag found for release {release_tag}")
+            release['commit_info'] = None
         except Exception as e:
-          if i > 1:
-            return releases
-        release['commit_info'] = commit_info
-      else:
-        release['commit_info'] = None
-    return releases
+          error_msg = f"Failed to process release at index {i}: {str(e)}"
+          self.log_error(func_name, error_msg, e)
+          release['commit_info'] = None
+      return releases
+    except Exception as e:
+      error_msg = f"Failed to compile release info: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return releases[:1] if releases else []
 
   def check_for_rate_limit(self, response, raise_exception=True):
     """
@@ -182,11 +262,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     bool
       True if rate limit is reached, otherwise False.
     """
+    func_name = "check_for_rate_limit"
     result = False
-    if 'message' in response:
+    if isinstance(response, dict) and 'message' in response:
       if 'rate limit' in response['message']:
-        msg = "Rate limit reached!"
+        msg = f"GitHub API rate limit reached! Details: {response.get('message')}"
         if raise_exception:
+          self.log_error(func_name, msg)
           raise Exception(msg)
         self.P(msg)
         result = True
@@ -196,11 +278,47 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     """
     Regenerate the index.html file listing the latest releases and metadata.
     """
+    func_name = "_regenerate_index_html"
+    self.P(f"{func_name}: Starting HTML regeneration...")
+    
+    # Step 1: Fetch releases
     try:
       raw_releases = self.get_latest_releases()
+      if not raw_releases:
+        error_msg = "Failed to get any releases, aborting HTML generation"
+        self.log_error(func_name, error_msg)
+        return False
+    except Exception as e:
+      error_msg = f"Failed during release fetching: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return False
+    
+    # Step 2: Fetch tags
+    try:
       raw_tags = self.get_latest_tags()
-
+      if not raw_tags:
+        error_msg = "Failed to get any tags, proceeding with limited information"
+        self.log_error(func_name, error_msg)
+        # We continue anyway, as we can still generate some HTML with just releases
+    except Exception as e:
+      error_msg = f"Failed during tag fetching: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      raw_tags = []
+    
+    # Step 3: Compile release information
+    try:
       releases = self.compile_release_info(raw_releases, raw_tags)
+      if not releases:
+        error_msg = "Failed to compile any release information, aborting HTML generation"
+        self.log_error(func_name, error_msg)
+        return False
+    except Exception as e:
+      error_msg = f"Failed during release compilation: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return False
+    
+    # Step 4: Generate HTML header
+    try:
       html_content = """
       <!DOCTYPE html>
       <html lang="en">
@@ -372,7 +490,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           </style>
       </head>
       """
-
+    except Exception as e:
+      error_msg = f"Failed during HTML header generation: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return False
+    
+    # Step 5: Generate HTML body with latest update info
+    try:
       last_update = self.datetime_to_str()
       # NOTE: We must escape curly braces in f-strings for literal JS object usage.
       html_content += f"""
@@ -384,27 +508,38 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               <button onclick="document.getElementById('latest-release').scrollIntoView({{behavior: 'smooth'}});" class="download-btn">Download Edge Node Launcher</button>
           </div>
       """
-
-      # Add the latest release section
+    except Exception as e:
+      error_msg = f"Failed during HTML body generation: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return False
+    
+    # Step 6: Generate latest release section
+    try:
       latest_release = releases[0]
       dct_info = {
         k : v for k, v in latest_release.items()
         if k in ['tag_name', 'published_at', 'tarball_url', 'zipball_url', 'created_at']
       }
-      self.P("latest_release:\n{} ".format(self.json_dumps(dct_info, indent=2)))
+      self.P(f"{func_name}: latest_release:\n{self.json_dumps(dct_info, indent=2)}")
+      
+      # Safely get commit message
+      commit_message = "No commit information available"
+      if latest_release.get('commit_info') and latest_release['commit_info'].get('commit'):
+        commit_message = latest_release['commit_info']['commit'].get('message', commit_message)
+      
       latest_release_section = f"""
           <div class="latest-release" id="latest-release">
               <h2>Latest Release: {latest_release['tag_name'].replace("'","")}</h2>
               <h3>Details:</h3>
               <div style="margin-left: 2em;">
-                <pre id="latest-release-info">{latest_release['commit_info']['commit']['message']}</pre>
+                <pre id="latest-release-info">{commit_message}</pre>
                 <button class="see-more-btn" onclick="toggleContent('latest-release-info')">See More</button>
               </div>
               <p>Date Published: {self.datetime.strptime(latest_release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}</p>
               <ul>
       """
 
-      assets = latest_release['assets']
+      assets = latest_release.get('assets', [])
       for asset in assets:
         if self.re.search(r'LINUX_Ubuntu-20\.04\.zip', asset['name']):
           latest_release_section += f'<li>Linux Ubuntu 20.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
@@ -420,8 +555,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       """
 
       html_content += latest_release_section
-
-      # Add the previous releases section
+    except Exception as e:
+      error_msg = f"Failed during latest release section generation: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      # Continue anyway, we can still show previous releases
+    
+    # Step 7: Generate previous releases section
+    try:
       previous_releases_section = """
           <div class="previous-releases">
               <h2>Previous Releases</h2>
@@ -442,35 +582,40 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         if release is None:
           continue
         try:
-          commit_message = release['commit_info']['commit']['message']
-          formatted_message = ""
-
-          if '\n' in commit_message:
-            lines = commit_message.strip().split('\n')
-            formatted_message = f"<div class='commit-title'>{lines[0]}</div>"
-            if len(lines) > 1:
-              formatted_message += "<ul class='commit-message'>"
-              for i, line in enumerate(lines[1:]):
-                css_class = "visible" if i < 2 else "hidden"
-                if line.strip().startswith('*'):
-                  formatted_message += f"<li class='{css_class}'>{line.strip()[1:].strip()}</li>"
-                elif line.strip():
-                  formatted_message += f"<li class='{css_class}'>{line.strip()}</li>"
-              formatted_message += "</ul>"
-          else:
-            formatted_message = commit_message
+          # Safely get commit message
+          commit_message = "No commit information available"
+          formatted_message = commit_message
+          
+          if release.get('commit_info') and release['commit_info'].get('commit'):
+            commit_message = release['commit_info']['commit'].get('message', commit_message)
+            
+            if '\n' in commit_message:
+              lines = commit_message.strip().split('\n')
+              formatted_message = f"<div class='commit-title'>{lines[0]}</div>"
+              if len(lines) > 1:
+                formatted_message += "<ul class='commit-message'>"
+                for i, line in enumerate(lines[1:]):
+                  css_class = "visible" if i < 2 else "hidden"
+                  if line.strip().startswith('*'):
+                    formatted_message += f"<li class='{css_class}'>{line.strip()[1:].strip()}</li>"
+                  elif line.strip():
+                    formatted_message += f"<li class='{css_class}'>{line.strip()}</li>"
+                formatted_message += "</ul>"
+            else:
+              formatted_message = commit_message
 
           visible_class = "visible" if i < 2 else ""
+          safe_tag_name = release['tag_name'].replace("'", "").replace('.', '-')
 
           release_row = f"""
                       <tr class="release-row {visible_class}" id="release-row-{i}">
                           <td>
                             {release['tag_name'].replace("'","")}
                             <div style="margin-left: 1em;">
-                              <div id="release-info-{release['tag_name'].replace('.', '-')}" class="commit-info">
+                              <div id="release-info-{safe_tag_name}" class="commit-info">
                                 {formatted_message}
                               </div>
-                              <button class="see-more-btn" onclick="toggleContent('release-info-{release['tag_name'].replace('.', '-')}')">See More</button>
+                              <button class="see-more-btn" onclick="toggleContent('release-info-{safe_tag_name}')">See More</button>
                             </div>
                           </td>
 
@@ -480,9 +625,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
                           <td>
           """
-          linux_20_04 = next((asset for asset in release['assets'] if self.re.search(r'LINUX_Ubuntu-20\.04\.zip', asset['name'])), None)
-          linux_22_04 = next((asset for asset in release['assets'] if self.re.search(r'LINUX_Ubuntu-22\.04\.zip', asset['name'])), None)
-          windows = next((asset for asset in release['assets'] if self.re.search(r'WIN32\.zip', asset['name'])), None)
+          linux_20_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-20\.04\.zip', asset['name'])), None)
+          linux_22_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-22\.04\.zip', asset['name'])), None)
+          windows = next((asset for asset in release.get('assets', []) if self.re.search(r'WIN32\.zip', asset['name'])), None)
 
           if linux_20_04:
             release_row += f'Ubuntu 20.04: {linux_20_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_20_04["browser_download_url"]}" class="download-btn">Download</a><br>'
@@ -497,7 +642,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           release_row += f'</td><td><a href="{release["tarball_url"]}" class="download-btn">.tar</a>, <a href="{release["zipball_url"]}" class="download-btn">.zip</a></td></tr>'
 
           previous_releases_section += release_row
-        except:
+        except Exception as e:
+          error_msg = f"Failed to process release at index {i}: {str(e)}"
+          self.log_error(func_name, error_msg, e)
           continue
 
       previous_releases_section += """
@@ -570,34 +717,57 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       """
 
       html_content += previous_releases_section
-
-      # Write the HTML content to a file
-      self.P(self.get_web_server_path())
-      with open(self.os_path.join(self.get_web_server_path(), 'assets/releases.html'), 'w') as fd:
+    except Exception as e:
+      error_msg = f"Failed during previous releases section generation: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      # If we can't generate previous releases section, at least try to close the HTML properly
+      html_content += "</body></html>"
+    
+    # Step 8: Write the HTML to file
+    try:
+      web_server_path = self.get_web_server_path()
+      self.P(f"{func_name}: Writing to web server path: {web_server_path}")
+      output_path = self.os_path.join(web_server_path, 'assets/releases.html')
+      
+      with open(output_path, 'w') as fd:
         fd.write(html_content)
 
-      self.P("releases.html has been generated successfully.")
+      self.P(f"{func_name}: releases.html has been generated successfully.")
+      return True
     except Exception as e:
-      self.P("ERROR: {}".format(e))
-      return
-    return
+      error_msg = f"Failed to write HTML to file: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return False
 
   def _maybe_regenerate_index_html(self):
     """
     Regenerate the html files if the last regeneration was more than
     cfg_regeneration_interval seconds ago.
     """
-    current_day = self.datetime.now().day
-    if (self.time() - self.__last_generation_time) > self.cfg_regeneration_interval:
-      self.P("Regenerating releases.html ...")
-      self._regenerate_index_html()
-      self._last_day_regenerated = current_day
-      self.__last_generation_time = self.time()
-    return
+    func_name = "_maybe_regenerate_index_html"
+    try:
+      current_day = self.datetime.now().day
+      if (self.time() - self.__last_generation_time) > self.cfg_regeneration_interval:
+        self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
+        success = self._regenerate_index_html()
+        if success:
+          self._last_day_regenerated = current_day
+          self.__last_generation_time = self.time()
+          self.P(f"{func_name}: HTML regeneration successful")
+        else:
+          self.P(f"{func_name}: HTML regeneration failed")
+      return True
+    except Exception as e:
+      error_msg = f"Failed to check regeneration condition: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return False
 
   def process(self):
     """
     Called periodically. Triggers the conditional regeneration of the HTML.
     """
-    self._maybe_regenerate_index_html()
+    try:
+      self._maybe_regenerate_index_html()
+    except Exception as e:
+      self.log_error("process", f"Unhandled error in process method: {str(e)}", e)
     return
