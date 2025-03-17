@@ -1,4 +1,15 @@
 """
+dauth_manager.py
+================
+
+This module implements the dAuth Manager plugin for the Ratio1e ecosystem. It provides a FastAPI web app
+for decentralized authentication. The plugin is responsible for handling authentication requests and
+providing authentication data to other nodes in the network using the dAuth protocol mainly defined in the
+`extensions/business/dauth/dauth_mixin.py` module.
+
+
+
+
 
 EE_HB_CONTAINS_PIPELINES=0
 EE_HB_CONTAINS_ACTIVE_PLUGINS=1
