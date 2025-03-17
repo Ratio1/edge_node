@@ -9,6 +9,7 @@ NaeuralReleaseAppPlugin
   Subclass of the SupervisorFastApiWebApp, providing overrides for release fetching
   and HTML generation functionality.
 """
+import traceback
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
@@ -34,7 +35,7 @@ _CONFIG = {
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
-  'DEBUG_MODE': True,  # Enable detailed error reporting
+  'DEBUG_MODE': False,  # Enable detailed error reporting
   'SHOW_ALL_RELEASES_BY_DEFAULT': False,
 }
 
@@ -817,9 +818,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           linux_22_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-22\.04\.AppImage', asset['name'])), None)
           linux_24_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-24\.04\.AppImage', asset['name'])), None)
           win_zip = next((asset for asset in release.get('assets', []) if self.re.search(r'WIN32\.zip', asset['name'])), None)
-          win_exe = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.exe$', asset['name'])), None)
           win_msi = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.msi$', asset['name'])), None)
-          macos_intel = next((asset for asset in release.get('assets', []) if self.re.search(r'macOS\.app\.zip', asset['name'])), None)
           macos_arm = next((asset for asset in release.get('assets', []) if self.re.search(r'OSX-arm64\.zip', asset['name'])), None)
 
           if linux_20_04:
@@ -833,15 +832,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
           if win_zip:
             release_row += f'ZIP: {win_zip["size"] / (1024 * 1024):.2f} MB - <a href="{win_zip["browser_download_url"]}" class="download-btn">Download</a><br>'
-          if win_exe:
-            release_row += f'EXE: {win_exe["size"] / (1024 * 1024):.2f} MB - <a href="{win_exe["browser_download_url"]}" class="download-btn">Download</a><br>'
           if win_msi:
             release_row += f'MSI: {win_msi["size"] / (1024 * 1024):.2f} MB - <a href="{win_msi["browser_download_url"]}" class="download-btn">Download</a>'
             
           release_row += '</td><td>'
           
-          if macos_intel:
-            release_row += f'Intel: {macos_intel["size"] / (1024 * 1024):.2f} MB - <a href="{macos_intel["browser_download_url"]}" class="download-btn">Download</a><br>'
           if macos_arm:
             release_row += f'Apple Silicon: {macos_arm["size"] / (1024 * 1024):.2f} MB - <a href="{macos_arm["browser_download_url"]}" class="download-btn">Download</a>'
 
