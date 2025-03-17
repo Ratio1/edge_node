@@ -392,13 +392,19 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   def _regenerate_index_html(self):
     """
     Regenerate the index.html file listing the latest releases and metadata.
-    If releases cannot be fetched due to GitHub API rate limits, it generates a fallback page.
+    If releases cannot be fetched due to GitHub API rate limits, it generates a fallback page,
+    but only if no HTML file already exists.
     """
     func_name = "_regenerate_index_html"
     self.P(f"{func_name}: Starting HTML regeneration...")
     
     rate_limited = False
     error_message = ""
+    
+    # Check if HTML file already exists
+    web_server_path = self.get_web_server_path()
+    output_path = self.os_path.join(web_server_path, 'assets/releases.html')
+    file_exists = self.os_path.isfile(output_path)
     
     # Step 1: Fetch releases
     try:
@@ -412,9 +418,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           error_message = "Failed to get any releases"
         self.log_error(func_name, error_message)
         
-        # Generate fallback page instead of returning False
+        # Generate fallback page instead of returning False only if no file exists
         if rate_limited or error_response.status_code != 200:
-          return self._generate_fallback_html_and_save(error_message)
+          if file_exists:
+            self.P(f"{func_name}: Rate limit exceeded, but existing HTML file was preserved")
+            return False
+          else:
+            return self._generate_fallback_html_and_save(error_message)
         return False
     except Exception as e:
       error_message = f"Failed during release fetching: {str(e)}"
@@ -423,7 +433,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
         rate_limited = True
-        return self._generate_fallback_html_and_save(error_message)
+        if file_exists:
+          self.P(f"{func_name}: Rate limit exception encountered, but existing HTML file was preserved")
+          return False
+        else:
+          return self._generate_fallback_html_and_save(error_message)
       return False
     
     # Step 2: Fetch tags
@@ -434,7 +448,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         if error_response.status_code == 403 and 'rate limit' in error_response.text.lower():
           error_message = f"GitHub API rate limit exceeded. Response: {error_response.text}"
           rate_limited = True
-          return self._generate_fallback_html_and_save(error_message)
+          if file_exists:
+            self.P(f"{func_name}: Rate limit exceeded during tag fetching, but existing HTML file was preserved")
+            return False
+          else:
+            return self._generate_fallback_html_and_save(error_message)
         else:
           error_msg = "Failed to get any tags, proceeding with limited information"
           self.log_error(func_name, error_msg)
@@ -447,7 +465,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if "rate limit" in str(e).lower():
         rate_limited = True
         error_message = f"GitHub API rate limit exceeded during tag fetching: {str(e)}"
-        return self._generate_fallback_html_and_save(error_message)
+        if file_exists:
+          self.P(f"{func_name}: Rate limit exception during tag fetching, but existing HTML file was preserved")
+          return False
+        else:
+          return self._generate_fallback_html_and_save(error_message)
       
       raw_tags = []
     
@@ -457,7 +479,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if not releases:
         error_message = "Failed to compile any release information, aborting HTML generation"
         self.log_error(func_name, error_message)
-        return self._generate_fallback_html_and_save(error_message)
+        if file_exists:
+          self.P(f"{func_name}: Failed to compile release information, but existing HTML file was preserved")
+          return False
+        else:
+          return self._generate_fallback_html_and_save(error_message)
     except Exception as e:
       error_message = f"Failed during release compilation: {str(e)}"
       self.log_error(func_name, error_message, e)
@@ -465,7 +491,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
         rate_limited = True
-        return self._generate_fallback_html_and_save(error_message)
+        if file_exists:
+          self.P(f"{func_name}: Rate limit exception during compilation, but existing HTML file was preserved")
+          return False
+        else:
+          return self._generate_fallback_html_and_save(error_message)
         
       return False
     
@@ -693,16 +723,18 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       assets = latest_release.get('assets', [])
       for asset in assets:
-        if self.re.search(r'LINUX_Ubuntu-20\.04\.zip', asset['name']):
+        if self.re.search(r'LINUX_Ubuntu-20\.04\.AppImage', asset['name']):
           latest_release_section += f'<li>Linux Ubuntu 20.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
-        if self.re.search(r'LINUX_Ubuntu-22\.04\.zip', asset['name']):
+        if self.re.search(r'LINUX_Ubuntu-22\.04\.AppImage', asset['name']):
           latest_release_section += f'<li>Linux Ubuntu 22.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
-        if self.re.search(r'LINUX_Ubuntu-24\.04\.zip', asset['name']):
+        if self.re.search(r'LINUX_Ubuntu-24\.04\.AppImage', asset['name']):
           latest_release_section += f'<li>Linux Ubuntu 24.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+        if self.re.search(r'OSX-arm64\.zip', asset['name']):
+          latest_release_section += f'<li>macOS (Apple Silicon): {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
         if self.re.search(r'WIN32\.zip', asset['name']):
-          latest_release_section += f'<li>Windows: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
-        if self.re.search(r'MACOS\.zip', asset['name']):
-          latest_release_section += f'<li>macOS: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'<li>Windows (ZIP): {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+        if self.re.search(r'Windows\.msi$', asset['name']):
+          latest_release_section += f'<li>Windows (MSI): {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
 
       latest_release_section += f"""
               </ul>
@@ -781,11 +813,14 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
                           <td>
           """
-          linux_20_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-20\.04\.zip', asset['name'])), None)
-          linux_22_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-22\.04\.zip', asset['name'])), None)
-          linux_24_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-24\.04\.zip', asset['name'])), None)
-          windows = next((asset for asset in release.get('assets', []) if self.re.search(r'WIN32\.zip', asset['name'])), None)
-          macos = next((asset for asset in release.get('assets', []) if self.re.search(r'MACOS\.zip', asset['name'])), None)
+          linux_20_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-20\.04\.AppImage', asset['name'])), None)
+          linux_22_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-22\.04\.AppImage', asset['name'])), None)
+          linux_24_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-24\.04\.AppImage', asset['name'])), None)
+          win_zip = next((asset for asset in release.get('assets', []) if self.re.search(r'WIN32\.zip', asset['name'])), None)
+          win_exe = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.exe$', asset['name'])), None)
+          win_msi = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.msi$', asset['name'])), None)
+          macos_intel = next((asset for asset in release.get('assets', []) if self.re.search(r'macOS\.app\.zip', asset['name'])), None)
+          macos_arm = next((asset for asset in release.get('assets', []) if self.re.search(r'OSX-arm64\.zip', asset['name'])), None)
 
           if linux_20_04:
             release_row += f'Ubuntu 20.04: {linux_20_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_20_04["browser_download_url"]}" class="download-btn">Download</a><br>'
@@ -796,13 +831,19 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
           release_row += '</td><td>'
 
-          if windows:
-            release_row += f'{windows["size"] / (1024 * 1024):.2f} MB - <a href="{windows["browser_download_url"]}" class="download-btn">Download</a>'
+          if win_zip:
+            release_row += f'ZIP: {win_zip["size"] / (1024 * 1024):.2f} MB - <a href="{win_zip["browser_download_url"]}" class="download-btn">Download</a><br>'
+          if win_exe:
+            release_row += f'EXE: {win_exe["size"] / (1024 * 1024):.2f} MB - <a href="{win_exe["browser_download_url"]}" class="download-btn">Download</a><br>'
+          if win_msi:
+            release_row += f'MSI: {win_msi["size"] / (1024 * 1024):.2f} MB - <a href="{win_msi["browser_download_url"]}" class="download-btn">Download</a>'
             
           release_row += '</td><td>'
           
-          if macos:
-            release_row += f'{macos["size"] / (1024 * 1024):.2f} MB - <a href="{macos["browser_download_url"]}" class="download-btn">Download</a>'
+          if macos_intel:
+            release_row += f'Intel: {macos_intel["size"] / (1024 * 1024):.2f} MB - <a href="{macos_intel["browser_download_url"]}" class="download-btn">Download</a><br>'
+          if macos_arm:
+            release_row += f'Apple Silicon: {macos_arm["size"] / (1024 * 1024):.2f} MB - <a href="{macos_arm["browser_download_url"]}" class="download-btn">Download</a>'
 
           release_row += '</td></tr>'
 
@@ -943,19 +984,37 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     """
     Regenerate the html files if the last regeneration was more than
     cfg_regeneration_interval seconds ago.
+    If regeneration fails and an HTML file already exists, keep the existing file
+    instead of replacing it with a fallback page.
     """
     func_name = "_maybe_regenerate_index_html"
     try:
       current_day = self.datetime.now().day
       if (self.time() - self.__last_generation_time) > self.cfg_regeneration_interval:
         self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
+        
+        # Check if an HTML file already exists before attempting regeneration
+        web_server_path = self.get_web_server_path()
+        output_path = self.os_path.join(web_server_path, 'assets/releases.html')
+        file_exists = self.os_path.isfile(output_path)
+        
+        # Attempt to regenerate the HTML
         result = self._regenerate_index_html()
+        
         if result:
+          # Successful regeneration
           self._last_day_regenerated = current_day
           self.__last_generation_time = self.time()
           self.P(f"{func_name}: HTML regeneration successful")
         else:
-          self.P(f"{func_name}: HTML regeneration failed or fallback page was generated")
+          # Failed regeneration
+          if file_exists:
+            # If file already exists, keep it and don't overwrite with fallback
+            self.P(f"{func_name}: HTML regeneration failed but existing file was preserved")
+          else:
+            # If no file exists, the fallback page was likely generated in _regenerate_index_html
+            self.P(f"{func_name}: HTML regeneration failed and fallback page was generated")
+          
           # Update the generation time anyway to avoid constant retries when failing
           self.__last_generation_time = self.time()
       return True
