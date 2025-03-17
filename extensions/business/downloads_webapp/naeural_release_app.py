@@ -818,7 +818,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           linux_22_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-22\.04\.AppImage', asset['name'])), None)
           linux_24_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-24\.04\.AppImage', asset['name'])), None)
           win_zip = next((asset for asset in release.get('assets', []) if self.re.search(r'WIN32\.zip', asset['name'])), None)
-          win_exe = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.exe$', asset['name'])), None)
           win_msi = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.msi$', asset['name'])), None)
           macos_arm = next((asset for asset in release.get('assets', []) if self.re.search(r'OSX-arm64\.zip', asset['name'])), None)
 
@@ -833,8 +832,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
           if win_zip:
             release_row += f'ZIP: {win_zip["size"] / (1024 * 1024):.2f} MB - <a href="{win_zip["browser_download_url"]}" class="download-btn">Download</a><br>'
-          if win_exe:
-            release_row += f'EXE: {win_exe["size"] / (1024 * 1024):.2f} MB - <a href="{win_exe["browser_download_url"]}" class="download-btn">Download</a><br>'
           if win_msi:
             release_row += f'MSI: {win_msi["size"] / (1024 * 1024):.2f} MB - <a href="{win_msi["browser_download_url"]}" class="download-btn">Download</a>'
             
