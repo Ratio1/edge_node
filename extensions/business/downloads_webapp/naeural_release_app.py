@@ -11,8 +11,6 @@ NaeuralReleaseAppPlugin
 """
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
-import traceback
-import sys
 
 __VER__ = '0.3.4'
 
@@ -699,11 +697,14 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           latest_release_section += f'<li>Linux Ubuntu 20.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
         if self.re.search(r'LINUX_Ubuntu-22\.04\.zip', asset['name']):
           latest_release_section += f'<li>Linux Ubuntu 22.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+        if self.re.search(r'LINUX_Ubuntu-24\.04\.zip', asset['name']):
+          latest_release_section += f'<li>Linux Ubuntu 24.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
         if self.re.search(r'WIN32\.zip', asset['name']):
           latest_release_section += f'<li>Windows: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+        if self.re.search(r'MACOS\.zip', asset['name']):
+          latest_release_section += f'<li>macOS: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
 
       latest_release_section += f"""
-                  <li>Source Code: <a href="{latest_release['tarball_url']}" class="download-btn">.tar</a>, <a href="{latest_release['zipball_url']}" class="download-btn">.zip</a></li>
               </ul>
           </div>
       """
@@ -726,7 +727,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                           <th>Date</th>
                           <th>Linux</th>
                           <th>Windows</th>
-                          <th>Source Code</th>
+                          <th>macOS</th>
                       </tr>
                   </thead>
                   <tbody>
@@ -782,19 +783,28 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           """
           linux_20_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-20\.04\.zip', asset['name'])), None)
           linux_22_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-22\.04\.zip', asset['name'])), None)
+          linux_24_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-24\.04\.zip', asset['name'])), None)
           windows = next((asset for asset in release.get('assets', []) if self.re.search(r'WIN32\.zip', asset['name'])), None)
+          macos = next((asset for asset in release.get('assets', []) if self.re.search(r'MACOS\.zip', asset['name'])), None)
 
           if linux_20_04:
             release_row += f'Ubuntu 20.04: {linux_20_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_20_04["browser_download_url"]}" class="download-btn">Download</a><br>'
           if linux_22_04:
-            release_row += f'Ubuntu 22.04: {linux_22_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_22_04["browser_download_url"]}" class="download-btn">Download</a>'
+            release_row += f'Ubuntu 22.04: {linux_22_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_22_04["browser_download_url"]}" class="download-btn">Download</a><br>'
+          if linux_24_04:
+            release_row += f'Ubuntu 24.04: {linux_24_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_24_04["browser_download_url"]}" class="download-btn">Download</a>'
 
           release_row += '</td><td>'
 
           if windows:
             release_row += f'{windows["size"] / (1024 * 1024):.2f} MB - <a href="{windows["browser_download_url"]}" class="download-btn">Download</a>'
+            
+          release_row += '</td><td>'
+          
+          if macos:
+            release_row += f'{macos["size"] / (1024 * 1024):.2f} MB - <a href="{macos["browser_download_url"]}" class="download-btn">Download</a>'
 
-          release_row += f'</td><td><a href="{release["tarball_url"]}" class="download-btn">.tar</a>, <a href="{release["zipball_url"]}" class="download-btn">.zip</a></td></tr>'
+          release_row += '</td></tr>'
 
           previous_releases_section += release_row
         except Exception as e:
