@@ -13,7 +13,7 @@ import traceback
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.3.4'
+__VER__ = '0.3.5'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
