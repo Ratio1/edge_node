@@ -583,7 +583,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         return False
     except Exception as e:
       error_message = f"Failed during release fetching: {str(e)}"
-      self.log_error(func_name, error_message, e)
+      self.log_error(func_name, error_msg, e)
       
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
@@ -906,6 +906,107 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               .release-row.visible {
                   display: table-row;
               }
+              .release-card {
+                  background-color: white;
+                  border-radius: 8px;
+                  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                  margin-bottom: 20px;
+                  overflow: hidden;
+                  transition: transform 0.2s;
+                  display: none;
+              }
+              .release-card.visible {
+                  display: block;
+              }
+              .release-card:hover {
+                  transform: translateY(-2px);
+                  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+              }
+              .release-card-header {
+                  display: flex;
+                  justify-content: space-between;
+                  align-items: center;
+                  padding: 15px 20px;
+                  background-color: #f8f9fa;
+                  border-bottom: 1px solid #e0e0e0;
+              }
+              .release-card-header h3 {
+                  margin: 0;
+                  color: #4b6cb7;
+                  font-size: 1.2em;
+              }
+              .release-card-content {
+                  padding: 20px;
+                  display: flex;
+                  flex-wrap: wrap;
+                  gap: 20px;
+              }
+              .release-info {
+                  flex: 1;
+                  min-width: 250px;
+              }
+              .release-downloads {
+                  flex: 2;
+                  min-width: 300px;
+                  display: flex;
+                  flex-wrap: wrap;
+                  gap: 15px;
+              }
+              .download-section {
+                  flex: 1;
+                  min-width: 150px;
+              }
+              .download-section h4 {
+                  margin-top: 0;
+                  margin-bottom: 10px;
+                  color: #555;
+                  font-size: 1em;
+                  border-bottom: 1px solid #eee;
+                  padding-bottom: 5px;
+              }
+              .download-list {
+                  display: flex;
+                  flex-direction: column;
+                  gap: 8px;
+              }
+              .download-item-small {
+                  display: flex;
+                  flex-direction: column;
+                  padding: 8px 10px;
+                  border-radius: 6px;
+                  background-color: #f9f9f9;
+                  transition: background-color 0.2s;
+              }
+              .download-item-small:hover {
+                  background-color: #f0f0f0;
+              }
+              .download-item-small.linux {
+                  border-left: 3px solid #f0ad4e;
+              }
+              .download-item-small.windows {
+                  border-left: 3px solid #5bc0de;
+              }
+              .download-item-small.macos {
+                  border-left: 3px solid #5cb85c;
+              }
+              .download-btn-small {
+                  display: inline-block;
+                  background-color: #4CAF50;
+                  color: white;
+                  padding: 4px 8px;
+                  border-radius: 4px;
+                  text-decoration: none;
+                  font-size: 0.8em;
+                  margin-top: 5px;
+                  align-self: flex-start;
+              }
+              .download-btn-small:hover {
+                  background-color: #45a049;
+                  text-decoration: none;
+              }
+              .releases-container {
+                  margin-top: 20px;
+              }
           </style>
       </head>
       """
@@ -1069,20 +1170,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     # Step 7: Generate previous releases section
     try:
       previous_releases_section = """
-          <div class="previous-releases">
-              <h2>Previous Releases</h2>
-              <table id="previous-releases-table">
-                  <thead>
-                      <tr>
-                          <th>Release Info</th>
-                          <th>Date</th>
-                          <th>Linux</th>
-                          <th>Windows</th>
-                          <th>macOS</th>
-                      </tr>
-                  </thead>
-                  <tbody>
-      """
+            <div class="previous-releases">
+                <h2>Previous Releases</h2>
+                <div class="releases-container">
+        """
 
       for i, release in enumerate(releases[1:]):
         if release is None:
@@ -1091,7 +1182,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           # Get release information with better fallbacks
           commit_message = "No release information available"
           formatted_message = commit_message
-          
+            
           # First try to use the release body
           if release.get('body') and release['body'].strip():
             commit_message = release['body'].strip()
@@ -1113,7 +1204,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
             else:
               commit_message = f"Release {release['tag_name']}"
               self.P(f"{func_name}: Using tag name for release {release['tag_name']}")
-          
+            
           if '\n' in commit_message:
             lines = commit_message.strip().split('\n')
             formatted_message = f"<div class='commit-title'>{lines[0]}</div>"
@@ -1126,34 +1217,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                 elif line.strip():
                   formatted_message += f"<li class='{css_class}'>{line.strip()}</li>"
               formatted_message += "</ul>"
-          else:
-            formatted_message = commit_message
+            else:
+              formatted_message = commit_message
 
           # Make all releases visible by default if configured to do so
           visible_class = "visible" if (i < 2 or self.cfg_show_all_releases_by_default) else ""
           safe_tag_name = release['tag_name'].replace("'", "").replace('.', '-')
 
-          release_row = f"""
-                      <tr class="release-row {visible_class}" id="release-row-{i}">
-                          <td>
-                            {release['tag_name'].replace("'","")}
-                            <div style="margin-left: 1em;">
-                              <div id="release-info-{safe_tag_name}" class="commit-info">
-                                {formatted_message}
-                              </div>
-                              <button id="btn-{safe_tag_name}" class="see-more-btn" onclick="toggleContent('release-info-{safe_tag_name}')" style="display: none;">
-                                <span class="see-more-text">See More</span>
-                                <span class="see-less-text">See Less</span>
-                              </button>
-                            </div>
-                          </td>
-
-                          <td>
-                            {self.datetime.strptime(release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}
-                          </td>
-
-                          <td>
-          """
           linux_20_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-20\.04\.AppImage', asset['name'])), None)
           linux_22_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-22\.04\.AppImage', asset['name'])), None)
           linux_24_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-24\.04\.AppImage', asset['name'])), None)
@@ -1161,28 +1231,98 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           win_msi = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.msi$', asset['name'])), None)
           macos_arm = next((asset for asset in release.get('assets', []) if self.re.search(r'OSX-arm64\.zip', asset['name'])), None)
 
-          if linux_20_04:
-            release_row += f'Ubuntu 20.04: {linux_20_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_20_04["browser_download_url"]}" class="download-btn">Download</a><br>'
-          if linux_22_04:
-            release_row += f'Ubuntu 22.04: {linux_22_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_22_04["browser_download_url"]}" class="download-btn">Download</a><br>'
-          if linux_24_04:
-            release_row += f'Ubuntu 24.04: {linux_24_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_24_04["browser_download_url"]}" class="download-btn">Download</a>'
+          release_card = f"""
+                <div class="release-card {visible_class}" id="release-row-{i}">
+                    <div class="release-card-header">
+                        <h3>{release['tag_name'].replace("'","")}</h3>
+                        <span class="release-date">{self.datetime.strptime(release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}</span>
+                    </div>
+                    <div class="release-card-content">
+                        <div class="release-info">
+                            <div id="release-info-{safe_tag_name}" class="commit-info">
+                                {formatted_message}
+                            </div>
+                            <button id="btn-{safe_tag_name}" class="see-more-btn" onclick="toggleContent('release-info-{safe_tag_name}')" style="display: none;">
+                                <span class="see-more-text">See More</span>
+                                <span class="see-less-text">See Less</span>
+                            </button>
+                        </div>
+                        <div class="release-downloads">
+                            <div class="download-section">
+                                <h4>Linux</h4>
+                                <div class="download-list">
+            """
 
-          release_row += '</td><td>'
+          if linux_20_04:
+            release_card += f'''
+                                    <div class="download-item-small linux">
+                                        <span class="os-name">Ubuntu 20.04</span>
+                                        <span class="file-size">{linux_20_04["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{linux_20_04["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
+          if linux_22_04:
+            release_card += f'''
+                                    <div class="download-item-small linux">
+                                        <span class="os-name">Ubuntu 22.04</span>
+                                        <span class="file-size">{linux_22_04["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{linux_22_04["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
+          if linux_24_04:
+            release_card += f'''
+                                    <div class="download-item-small linux">
+                                        <span class="os-name">Ubuntu 24.04</span>
+                                        <span class="file-size">{linux_24_04["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{linux_24_04["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
+
+          release_card += """
+                                </div>
+                            </div>
+                            <div class="download-section">
+                                <h4>Windows</h4>
+                                <div class="download-list">
+            """
 
           if win_zip:
-            release_row += f'ZIP: {win_zip["size"] / (1024 * 1024):.2f} MB - <a href="{win_zip["browser_download_url"]}" class="download-btn">Download</a><br>'
+            release_card += f'''
+                                    <div class="download-item-small windows">
+                                        <span class="os-name">ZIP</span>
+                                        <span class="file-size">{win_zip["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{win_zip["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
           if win_msi:
-            release_row += f'MSI: {win_msi["size"] / (1024 * 1024):.2f} MB - <a href="{win_msi["browser_download_url"]}" class="download-btn">Download</a>'
-            
-          release_row += '</td><td>'
-          
+            release_card += f'''
+                                    <div class="download-item-small windows">
+                                        <span class="os-name">MSI</span>
+                                        <span class="file-size">{win_msi["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{win_msi["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
+
+          release_card += """
+                                </div>
+                            </div>
+                            <div class="download-section">
+                                <h4>macOS</h4>
+                                <div class="download-list">
+            """
+
           if macos_arm:
-            release_row += f'Apple Silicon: {macos_arm["size"] / (1024 * 1024):.2f} MB - <a href="{macos_arm["browser_download_url"]}" class="download-btn">Download</a>'
+            release_card += f'''
+                                    <div class="download-item-small macos">
+                                        <span class="os-name">Apple Silicon</span>
+                                        <span class="file-size">{macos_arm["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{macos_arm["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
 
-          release_row += '</td></tr>'
+          release_card += """
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            """
 
-          previous_releases_section += release_row
+          previous_releases_section += release_card
         except Exception as e:
           error_msg = f"Failed to process release at index {i}: {str(e)}"
           self.log_error(func_name, error_msg, e)
@@ -1190,112 +1330,111 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       # Update the Show/Hide button text based on default visibility setting
       show_all_button_text = "Show Less" if self.cfg_show_all_releases_by_default else "Show All Releases"
-      
+        
       previous_releases_section += f"""
-                  </tbody>
-              </table>
-              <button id="show-all-btn" class="show-all-btn" onclick="toggleAllReleases()">{show_all_button_text}</button>
-          </div>
-      </body>
-      <script>
-          // Check if content needs expansion and show button only if needed
-          function checkContentOverflow(contentId, buttonId) {{
-              const content = document.getElementById(contentId);
-              const button = document.getElementById(buttonId);
-              
-              if (!content || !button) return;
-              
-              // For pre elements (latest release)
-              if (content.tagName === 'PRE') {{
-                  // Only show button if content is taller than default height or has multiple paragraphs
-                  if (content.scrollHeight > content.clientHeight || content.textContent.split('\\n').length > 4) {{
-                      button.style.display = 'block';
-                  }}
-              }}
-              // For div elements with commit info (previous releases)
-              else {{
-                  // Check if there are hidden list items or if content is overflowing
-                  const hasHiddenItems = content.querySelectorAll('li.hidden').length > 0;
-                  const isOverflowing = content.scrollHeight > content.clientHeight;
-                  const hasManyParagraphs = content.textContent.split('\\n').length > 3;
-                  
-                  if (hasHiddenItems || isOverflowing || hasManyParagraphs) {{
-                      button.style.display = 'block';
-                  }}
-              }}
-          }}
-          
-          function toggleContent(id) {{
-              const element = document.getElementById(id);
-              const buttonId = id === 'latest-release-info' ? 'latest-release-btn' : 'btn-' + id.replace('release-info-', '');
-              const button = document.getElementById(buttonId);
-              
-              element.classList.toggle('expanded');
-              if (button) button.classList.toggle('expanded');
-              
-              // Show all list items when expanded
-              if (element.classList.contains('expanded')) {{
-                  const listItems = element.querySelectorAll('li');
-                  listItems.forEach(item => {{
-                      item.classList.add('visible');
-                      item.classList.remove('hidden');
-                  }});
-              }} else {{
-                  // Hide items beyond the first 2 when collapsed
-                  const listItems = element.querySelectorAll('li');
-                  listItems.forEach((item, index) => {{
-                      if (index >= 2) {{
-                          item.classList.add('hidden');
-                          item.classList.remove('visible');
-                      }}
-                  }});
-              }}
-          }}
+                </div>
+                <button id="show-all-btn" class="show-all-btn" onclick="toggleAllReleases()">{show_all_button_text}</button>
+            </div>
+        </body>
+        <script>
+            // Check if content needs expansion and show button only if needed
+            function checkContentOverflow(contentId, buttonId) {{
+                const content = document.getElementById(contentId);
+                const button = document.getElementById(buttonId);
+                
+                if (!content || !button) return;
+                
+                // For pre elements (latest release)
+                if (content.tagName === 'PRE') {{
+                    // Only show button if content is taller than default height or has multiple paragraphs
+                    if (content.scrollHeight > content.clientHeight || content.textContent.split('\\n').length > 4) {{
+                        button.style.display = 'block';
+                    }}
+                }}
+                // For div elements with commit info (previous releases)
+                else {{
+                    // Check if there are hidden list items or if content is overflowing
+                    const hasHiddenItems = content.querySelectorAll('li.hidden').length > 0;
+                    const isOverflowing = content.scrollHeight > content.clientHeight;
+                    const hasManyParagraphs = content.textContent.split('\\n').length > 3;
+                    
+                    if (hasHiddenItems || isOverflowing || hasManyParagraphs) {{
+                        button.style.display = 'block';
+                    }}
+                }}
+            }}
+            
+            function toggleContent(id) {{
+                const element = document.getElementById(id);
+                const buttonId = id === 'latest-release-info' ? 'latest-release-btn' : 'btn-' + id.replace('release-info-', '');
+                const button = document.getElementById(buttonId);
+                
+                element.classList.toggle('expanded');
+                if (button) button.classList.toggle('expanded');
+                
+                // Show all list items when expanded
+                if (element.classList.contains('expanded')) {{
+                    const listItems = element.querySelectorAll('li');
+                    listItems.forEach(item => {{
+                        item.classList.add('visible');
+                        item.classList.remove('hidden');
+                    }});
+                }} else {{
+                    // Hide items beyond the first 2 when collapsed
+                    const listItems = element.querySelectorAll('li');
+                    listItems.forEach((item, index) => {{
+                        if (index >= 2) {{
+                            item.classList.add('hidden');
+                            item.classList.remove('visible');
+                        }}
+                    }});
+                }}
+            }}
 
-          function toggleAllReleases() {{
-              const button = document.getElementById('show-all-btn');
-              const rows = document.querySelectorAll('.release-row');
-              const hiddenRows = document.querySelectorAll('.release-row:not(.visible)');
+            function toggleAllReleases() {{
+                const button = document.getElementById('show-all-btn');
+                const rows = document.querySelectorAll('.release-card');
+                const hiddenRows = document.querySelectorAll('.release-card:not(.visible)');
 
-              if (hiddenRows.length > 0) {{
-                  rows.forEach(row => row.classList.add('visible'));
-                  button.textContent = 'Show Less';
-              }} else {{
-                  rows.forEach((row, index) => {{
-                      if (index >= 2) {{
-                          row.classList.remove('visible');
-                      }}
-                  }});
-                  button.textContent = 'Show All Releases';
-              }}
-          }}
+                if (hiddenRows.length > 0) {{
+                    rows.forEach(row => row.classList.add('visible'));
+                    button.textContent = 'Show Less';
+                }} else {{
+                    rows.forEach((row, index) => {{
+                        if (index >= 2) {{
+                            row.classList.remove('visible');
+                        }}
+                    }});
+                    button.textContent = 'Show All Releases';
+                }}
+            }}
 
-          // Initialize on page load
-          document.addEventListener('DOMContentLoaded', function() {{
-              // Initialize latest release
-              checkContentOverflow('latest-release-info', 'latest-release-btn');
-              
-              // Initialize previous releases
-              const commitInfos = document.querySelectorAll('.commit-info');
-              commitInfos.forEach(info => {{
-                  // Process list items
-                  const listItems = info.querySelectorAll('li');
-                  listItems.forEach((item, index) => {{
-                      if (index >= 2) {{
-                          item.classList.add('hidden');
-                      }} else {{
-                          item.classList.add('visible');
-                      }}
-                  }});
-                  
-                  // Check if button should be shown
-                  const infoId = info.id;
-                  const btnId = 'btn-' + infoId.replace('release-info-', '');
-                  checkContentOverflow(infoId, btnId);
-              }});
-          }});
-      </script>
-      </html>
+            // Initialize on page load
+            document.addEventListener('DOMContentLoaded', function() {{
+                // Initialize latest release
+                checkContentOverflow('latest-release-info', 'latest-release-btn');
+                
+                // Initialize previous releases
+                const commitInfos = document.querySelectorAll('.commit-info');
+                commitInfos.forEach(info => {{
+                    // Process list items
+                    const listItems = info.querySelectorAll('li');
+                    listItems.forEach((item, index) => {{
+                        if (index >= 2) {{
+                            item.classList.add('hidden');
+                        }} else {{
+                            item.classList.add('visible');
+                        }}
+                    }});
+                    
+                    // Check if button should be shown
+                    const infoId = info.id;
+                    const btnId = 'btn-' + infoId.replace('release-info-', '');
+                    checkContentOverflow(infoId, btnId);
+                }});
+            }});
+        </script>
+        </html>
       """
 
       html_content += previous_releases_section
@@ -1366,7 +1505,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if (self.time() - self.__last_generation_time) > self.cfg_regeneration_interval:
         self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
         
-        # Check if an HTML file already exists before attempting regeneration
+        # Check if HTML file already exists
         web_server_path = self.get_web_server_path()
         output_path = self.os_path.join(web_server_path, 'assets/releases.html')
         file_exists = self.os_path.isfile(output_path)
