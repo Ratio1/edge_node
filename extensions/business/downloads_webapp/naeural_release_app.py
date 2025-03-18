@@ -33,7 +33,6 @@ _CONFIG = {
   'NR_PREVIOUS_RELEASES': 10,
   'REGENERATION_INTERVAL': 10*60,
   "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
-  "GITHUB_REPO_URL": "https://github.com/Ratio1/edge_node_launcher/releases",
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -461,13 +460,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   def _regenerate_index_html(self):
     """
     Regenerate the index.html file listing the latest releases and metadata.
-    If releases cannot be fetched due to GitHub API rate limits, it generates a fallback page,
-    but only if no HTML file already exists.
     """
     func_name = "_regenerate_index_html"
     self.P(f"{func_name}: Starting HTML regeneration...")
-    
-    error_message = ""
     
     # Check if HTML file already exists
     web_server_path = self.get_web_server_path()
@@ -485,26 +480,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           error_message = "Failed to get any releases"
         
         self.log_error(func_name, error_message)
-        
-        # Generate fallback page instead of returning False only if no file exists
-        if "rate limit" in error_message.lower():
-          if file_exists:
-            self.P(f"{func_name}: Rate limit exceeded, but existing HTML file was preserved")
-            return False
-          else:
-            return self._generate_fallback_html_and_save(error_message)
         return False
     except Exception as e:
       error_message = f"Failed during release fetching: {str(e)}"
       self.log_error(func_name, error_message, e)
-      
-      # Check if it's a rate limit exception
-      if "rate limit" in str(e).lower():
-        if file_exists:
-          self.P(f"{func_name}: Rate limit exception encountered, but existing HTML file was preserved")
-          return False
-        else:
-          return self._generate_fallback_html_and_save(error_message)
       return False
     
     # Step 2: Fetch tags
@@ -514,21 +493,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if not raw_tags and tag_error and tag_error.get('rate_limited', False):
         error_message = tag_error.get('message', "Failed to get any tags")
         self.log_error(func_name, error_message)
-        if file_exists:
-          self.P(f"{func_name}: Rate limit exceeded during tag fetching, but existing HTML file was preserved")
-          return False
-        else:
-          return self._generate_fallback_html_and_save(error_message)
+        return False
     except Exception as e:
       error_message = f"Failed during tag fetching: {str(e)}"
       self.log_error(func_name, error_message, e)
-      
-      if "rate limit" in str(e).lower():
-        if file_exists:
-          self.P(f"{func_name}: Rate limit exception during tag fetching, but existing HTML file was preserved")
-          return False
-        else:
-          return self._generate_fallback_html_and_save(error_message)
+      return False
     
     # Step 3: Compile release information
     try:
@@ -536,11 +505,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if not raw_releases_with_commits:
         error_message = "Failed to compile any release information"
         self.log_error(func_name, error_message)
-        if file_exists:
-          self.P(f"{func_name}: Failed to compile release information, but existing HTML file was preserved")
-          return False
-        else:
-          return self._generate_fallback_html_and_save(error_message)
+        return False
           
       # Convert raw releases to ReleaseInfo objects
       releases = self.data_processor.process_releases(raw_releases_with_commits, raw_tags)
@@ -548,13 +513,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     except Exception as e:
       error_msg = f"Failed during release compilation: {str(e)}"
       self.log_error(func_name, error_msg, e)
-      
-      if "rate limit" in str(e).lower():
-        if file_exists:
-          self.P(f"{func_name}: Rate limit exception during compilation, but existing HTML file was preserved")
-          return False
-        else:
-          return self._generate_fallback_html_and_save(error_message)
       return False
     
     # Step 4: Generate HTML
@@ -573,38 +531,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       return True
     except Exception as e:
       error_msg = f"Failed to generate or write HTML: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      return False
-
-  def _generate_fallback_html_and_save(self, error_message):
-    """
-    Generate a fallback HTML page and save it to the web server path.
-    
-    Parameters
-    ----------
-    error_message : str
-      The error message to display on the fallback page.
-      
-    Returns
-    -------
-    bool
-      True if the fallback page was generated and saved successfully.
-    """
-    func_name = "_generate_fallback_html_and_save"
-    try:
-      html_content = self.html_generator._generate_fallback_html(error_message)
-      
-      web_server_path = self.get_web_server_path()
-      self.P(f"{func_name}: Writing fallback page to web server path: {web_server_path}")
-      output_path = self.os_path.join(web_server_path, 'assets/releases.html')
-      
-      with open(output_path, 'w') as fd:
-        fd.write(html_content)
-
-      self.P(f"{func_name}: Fallback releases.html has been generated successfully.")
-      return True
-    except Exception as e:
-      error_msg = f"Failed to write fallback HTML to file: {str(e)}"
       self.log_error(func_name, error_msg, e)
       return False
 
@@ -1381,7 +1307,7 @@ class HtmlGenerator:
         Complete HTML page
     """
     if not releases:
-      return self._generate_fallback_html("No releases available")
+      return "<html><body><h1>No releases available</h1></body></html>"
 
     return (
         self.generate_html_head() +
@@ -1391,91 +1317,6 @@ class HtmlGenerator:
         self.generate_javascript() +
         "</body></html>"
     )
-
-  def _generate_fallback_html(self, error_message: str) -> str:
-    """
-    Generate a fallback HTML page when the GitHub API rate limit is exceeded or releases cannot be fetched.
-
-    Parameters
-    ----------
-    error_message : str
-        The error message to display
-
-    Returns
-    -------
-    str
-        HTML content for the fallback page
-    """
-    return f"""
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Edge Node Launcher Releases</title>
-            <style>
-                body {{
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 1000px;
-                    margin: 0 auto;
-                    padding: 20px;
-                    text-align: center;
-                }}
-                .error-container {{
-                    background: linear-gradient(135deg, #f5f7fa 0%, #c3cfe2 100%);
-                    border-radius: 8px;
-                    padding: 40px 20px;
-                    margin: 40px auto;
-                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-                }}
-                h1 {{
-                    color: #3a5795;
-                    margin-bottom: 20px;
-                }}
-                p {{
-                    margin-bottom: 20px;
-                    font-size: 1.1em;
-                }}
-                .error-message {{
-                    background-color: #ffecec;
-                    color: #d8000c;
-                    padding: 15px;
-                    border-radius: 4px;
-                    margin: 20px 0;
-                    font-family: monospace;
-                    text-align: left;
-                    max-width: 100%;
-                    overflow-x: auto;
-                }}
-                .redirect-button {{
-                    display: inline-block;
-                    background-color: #4b6cb7;
-                    color: white;
-                    text-decoration: none;
-                    padding: 12px 24px;
-                    border-radius: 4px;
-                    font-weight: bold;
-                    margin-top: 20px;
-                    transition: background-color 0.3s;
-                }}
-                .redirect-button:hover {{
-                    background-color: #3a5795;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="error-container">
-                <h1>Edge Node Launcher Releases</h1>
-                {"<p>⚠️ We're currently experiencing limitations with GitHub's API service.</p>" if "rate limit" in error_message.lower() else "<p>⚠️ We're currently experiencing difficulties retrieving release information.</p>"}
-                <div class="error-message">{error_message}</div>
-                <p>Please visit the official GitHub releases page to download the Edge Node Launcher:</p>
-                <a href="{self.config['GITHUB_REPO_URL']}" class="redirect-button">Go to GitHub Releases</a>
-            </div>
-        </body>
-        </html>
-        """
 
 
 class ReleaseDataProcessor:
