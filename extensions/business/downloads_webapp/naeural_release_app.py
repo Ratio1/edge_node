@@ -151,8 +151,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       error_msg = f"Failed to fetch releases: {str(e)}"
       self.log_error(func_name, error_msg, e)
       # Check if the exception indicates rate limiting
-      is_rate_limited = "rate limit" in str(e).lower()
-      return [], {'message': error_msg, 'rate_limited': is_rate_limited}
+      if "rate limit" in str(e).lower():
+        error_msg = f"GitHub API rate limit exceeded during release fetching: {str(e)}"
+        return [], {'message': error_msg, 'rate_limited': True}
+      return [], {'message': error_msg, 'rate_limited': False}
 
   def get_latest_tags(self):
     """
@@ -187,8 +189,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       error_msg = f"Failed to fetch tags: {str(e)}"
       self.log_error(func_name, error_msg, e)
       # Check if the exception indicates rate limiting
-      is_rate_limited = "rate limit" in str(e).lower()
-      return [], {'message': error_msg, 'rate_limited': is_rate_limited}
+      if "rate limit" in str(e).lower():
+        error_msg = f"GitHub API rate limit exceeded during tag fetching: {str(e)}"
+        return [], {'message': error_msg, 'rate_limited': True}
+      return [], {'message': error_msg, 'rate_limited': False}
 
   def get_commit_info(self, commit_sha):
     """
@@ -570,7 +574,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     func_name = "_regenerate_index_html"
     self.P(f"{func_name}: Starting HTML regeneration...")
     
-    rate_limited = False
     error_message = ""
     
     # Check if HTML file already exists
@@ -584,7 +587,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if not raw_releases:
         # Use the error information returned from get_latest_releases instead of making a redundant API call
         if release_error:
-          rate_limited = release_error.get('rate_limited', False)
           error_message = release_error.get('message', "Failed to get any releases")
         else:
           error_message = "Failed to get any releases"
@@ -592,7 +594,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         self.log_error(func_name, error_message)
         
         # Generate fallback page instead of returning False only if no file exists
-        if rate_limited:
+        if "rate limit" in error_message.lower():
           if file_exists:
             self.P(f"{func_name}: Rate limit exceeded, but existing HTML file was preserved")
             return False
@@ -605,7 +607,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
-        rate_limited = True
         if file_exists:
           self.P(f"{func_name}: Rate limit exception encountered, but existing HTML file was preserved")
           return False
@@ -620,7 +621,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       # This allows us to use cached or previously fetched release data
       raw_tags, tag_error = self.get_latest_tags()
       if not raw_tags and tag_error and tag_error.get('rate_limited', False):
-        rate_limited = True
         error_message = tag_error.get('message', "Failed to get any tags")
         self.log_error(func_name, error_message)
         if file_exists:
@@ -637,7 +637,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
-        rate_limited = True
         error_message = f"GitHub API rate limit exceeded during tag fetching: {str(e)}"
         if file_exists:
           self.P(f"{func_name}: Rate limit exception during tag fetching, but existing HTML file was preserved")
@@ -662,7 +661,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
-        rate_limited = True
         if file_exists:
           self.P(f"{func_name}: Rate limit exception during compilation, but existing HTML file was preserved")
           return False
