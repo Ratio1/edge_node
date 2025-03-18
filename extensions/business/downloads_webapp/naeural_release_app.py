@@ -30,7 +30,7 @@ _CONFIG = {
       }
     ]
   },
-  'NR_PREVIOUS_RELEASES': 5,
+  'NR_PREVIOUS_RELEASES': 10,
   'REGENERATION_INTERVAL': 10*60,
   "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
   "GITHUB_REPO_URL": "https://github.com/Ratio1/edge_node_launcher/releases",
@@ -56,7 +56,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     Initializes the plugin and sets up state.
   get_latest_releases()
     Fetches the latest releases from the GitHub repository.
-  get_latest_tags(release_tags=None)
+  get_latest_tags()
     Fetches the latest tags from the GitHub repository.
   get_commit_info(commit_sha)
     Fetches commit information for a given commit SHA.
@@ -76,8 +76,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     Conditionally regenerates the HTML if enough time has passed.
   process()
     Periodically checks whether to regenerate the HTML.
-  _fetch_complete_release_info(tag_name)
-    Fetches all available information for a release.
   """
 
   CONFIG = _CONFIG
@@ -91,9 +89,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.__last_generation_time = 0
     self.html_generator = HtmlGenerator(self.CONFIG, self)
     self.data_processor = ReleaseDataProcessor(self)
-    self._cached_releases = None
-    self._releases_file = self.os_path.join(self.get_web_server_path(), 'assets/releases.json')
-    self.P(f"Releases file: {self._releases_file}")
     return
 
   def log_error(self, func_name, error_msg, exc_info=None):
@@ -116,145 +111,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.P(error_details)
     return error_details
 
-  def _load_cached_releases(self):
-    """
-    Load cached releases from the JSON file.
-    
-    Returns
-    -------
-    tuple
-      (releases_list, last_update_time) or (None, None) if no cache exists
-    """
-    try:
-      if self.os_path.exists(self._releases_file):
-        with open(self._releases_file, 'r') as f:
-            data = self.json.loads(f.read())
-        if data and isinstance(data, dict):
-          # Convert the releases dict back to a list, sorted by published_at
-          releases_dict = data.get('releases', {})
-          releases_list = list(releases_dict.values())
-          releases_list.sort(key=lambda x: x.get('published_at', ''), reverse=True)
-          # Limit to configured number of releases
-          releases_list = releases_list[:self.cfg_nr_previous_releases]
-          return releases_list, data.get('last_update', 0)
-    except Exception as e:
-      self.log_error("_load_cached_releases", f"Failed to load cached releases: {str(e)}", e)
-    return None, None
-
-  def _save_releases_cache(self, releases):
-    """
-    Save releases to the JSON cache file.
-    
-    Parameters
-    ----------
-    releases : list
-      List of release objects to cache
-    """
-    try:
-      # Sort releases by published date and limit to configured number
-      releases.sort(key=lambda x: x.get('published_at', ''), reverse=True)
-            
-      # Convert releases list to a dictionary with tag_name as key
-      releases_dict = {
-        release.get('tag_name'): release 
-        for release in releases 
-        if release.get('tag_name')
-      }
-      
-      data = {
-        'releases': releases_dict,
-        'last_update': self.time()
-      }
-      # Save to the correct location
-      self.diskapi_save_json_to_data(data, self._releases_file)
-      self.P("_save_releases_cache: Successfully saved releases to cache")
-    except Exception as e:
-      self.log_error("_save_releases_cache", f"Failed to save releases cache: {str(e)}", e)
-
-  def _get_latest_release_date(self, releases):
-    """
-    Get the latest release date from a list of releases.
-    
-    Parameters
-    ----------
-    releases : list
-      List of release objects
-      
-    Returns
-    -------
-    str or None
-      ISO format date string of the latest release or None if no releases
-    """
-    if not releases:
-      return None
-    try:
-      dates = [r.get('published_at') for r in releases if r.get('published_at')]
-      return max(dates) if dates else None
-    except Exception as e:
-      self.log_error("_get_latest_release_date", f"Failed to get latest release date: {str(e)}", e)
-      return None
-
-  def _fetch_complete_release_info(self, tag_name):
-    """
-    Fetch all available information for a release.
-    
-    Parameters
-    ----------
-    tag_name : str
-      The tag name of the release
-      
-    Returns
-    -------
-    dict
-      Complete release information including commit data, messages, etc.
-    """
-    func_name = "_fetch_complete_release_info"
-    self.P(f"{func_name}: Fetching complete info for release {tag_name}")
-    
-    try:
-      # Get detailed release info
-      release_info = self.get_release_by_tag(tag_name)
-      if not release_info:
-        self.P(f"{func_name}: Could not fetch release info for {tag_name}")
-        return None
-        
-      # Get commit message from tag
-      commit_message = self.get_commit_message_for_tag(tag_name)
-      if commit_message:
-        release_info['tag_commit_message'] = commit_message
-        
-      # Get commit info if available
-      if release_info.get('commit_url'):
-        commit_sha = release_info['commit_url'].split('/')[-1]
-        commit_info = self.get_commit_info(commit_sha)
-        if commit_info:
-          release_info['commit_info'] = commit_info
-          # Store the full commit message separately
-          if commit_info.get('commit', {}).get('message'):
-            release_info['commit_message'] = commit_info['commit']['message']
-            
-      # Ensure we have a body, try different sources if not
-      if not release_info.get('body') or not release_info['body'].strip():
-        # Try commit message first
-        if release_info.get('commit_message'):
-          release_info['body'] = release_info['commit_message']
-        # Then try tag commit message
-        elif release_info.get('tag_commit_message'):
-          release_info['body'] = release_info['tag_commit_message']
-        # Finally use tag name as last resort
-        else:
-          release_info['body'] = f"Release {tag_name}"
-          
-      return release_info
-    except Exception as e:
-      error_msg = f"Failed to fetch complete info for release {tag_name}: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      return None
-
   def get_latest_releases(self):
     """
-    Fetch the latest releases from GitHub, using cache when possible.
-    Downloads complete information for new releases and stores in cache.
+    Fetch the latest releases from GitHub, up to NR_PREVIOUS_RELEASES + 1.
 
     Returns
     -------
@@ -265,104 +124,45 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     """
     func_name = "get_latest_releases"
     try:
-      # Try to load cached releases first
-      cached_releases, last_update = self._load_cached_releases()
-      latest_cached_date = self._get_latest_release_date(cached_releases) if cached_releases else None
-      
-      # Fetch latest releases from GitHub
       releases_url = f"{self.cfg_releases_repo_url}/releases"
       self.P(f"{func_name}: Requesting releases from: {releases_url}")
       
-      response = self.requests.get(releases_url, params={"per_page": self.cfg_nr_previous_releases})
+      # Use a higher per_page value to ensure we get all the releases we need
+      response = self.requests.get(releases_url,
+                                   params={"per_page": 100})
       
       if response.status_code != 200:
         error_msg = f"Failed to fetch releases. Status code: {response.status_code}, Response: {response.text}"
         self.log_error(func_name, error_msg)
-        # Return cached releases if available, otherwise return error
-        if cached_releases:
-          return cached_releases, None
+        # Return error data with information about rate limiting
         is_rate_limited = response.status_code == 403 and 'rate limit' in response.text.lower()
         return [], {'message': error_msg, 'rate_limited': is_rate_limited, 'response': response}
         
-      new_releases = response.json()
-      self.check_for_rate_limit(new_releases)
-
-      # If we have cached releases, only process newer ones
-      if cached_releases and latest_cached_date:
-        new_releases_to_process = []
-        new_release_tags = []
-        for release in new_releases:
-          if release.get('published_at', '') > latest_cached_date:
-            tag_name = release.get('tag_name')
-            self.P(f"{func_name}: Found new release {tag_name} newer than cache")
-            new_release_tags.append(tag_name)
-            new_releases_to_process.append(release)
-          else:
-            break  # Since releases are ordered by date, we can stop once we hit an old one
-        
-        # Only fetch tags and commits for new releases
-        if new_releases_to_process:
-          self.P(f"{func_name}: Fetching tags for {len(new_release_tags)} new releases")
-          tags, tag_error = self.get_latest_tags(new_release_tags)
-          if tags and not tag_error:
-            # Process each new release with its tag info
-            complete_releases = []
-            for release in new_releases_to_process:
-              complete_release = self._fetch_complete_release_info(release.get('tag_name'))
-              if complete_release:
-                complete_releases.append(complete_release)
-            
-            if complete_releases:
-              self.P(f"{func_name}: Adding {len(complete_releases)} new releases to cache")
-              all_releases = complete_releases + cached_releases
-              # Sort and limit to configured number
-              all_releases.sort(key=lambda x: x.get('published_at', ''), reverse=True)
-              all_releases = all_releases[:self.cfg_nr_previous_releases]
-              # Save updated cache
-              self._save_releases_cache(all_releases)
-              return all_releases, None
-        
-        self.P(f"{func_name}: No new releases found or processed, using cache")
-        return cached_releases, None
+      releases = response.json()
+      self.check_for_rate_limit(releases)
+      self.P(f"{func_name}: Successfully fetched {len(releases)} releases")
       
-      # If no cache or cache is invalid, process all releases
-      processed_releases = []
-      release_tags = [r.get('tag_name') for r in new_releases[:self.cfg_nr_previous_releases]]
-      tags, tag_error = self.get_latest_tags(release_tags)
+      # Debug: Print full release data for inspection
+      for i, release in enumerate(releases):
+        self.P(f"{func_name}: Release {i} - Tag: {release.get('tag_name', 'Unknown')}")
+        self.P(f"{func_name}: Release {i} - Has body: {bool(release.get('body'))}")
+        if release.get('body'):
+          self.P(f"{func_name}: Release {i} - Body preview: {release.get('body')[:100]}...")
+        self.P(f"{func_name}: Release {i} - Keys: {sorted(release.keys())}")
       
-      if tags and not tag_error:
-        for release in new_releases[:self.cfg_nr_previous_releases]:
-          complete_release = self._fetch_complete_release_info(release.get('tag_name'))
-          if complete_release:
-            processed_releases.append(complete_release)
-      
-      if processed_releases:
-        self._save_releases_cache(processed_releases)
-        return processed_releases, None
-      
-      return [], {'message': "No releases could be processed", 'rate_limited': False}
-      
+      return releases, None
     except Exception as e:
       error_msg = f"Failed to fetch releases: {str(e)}"
       self.log_error(func_name, error_msg, e)
-      # Return cached releases if available
-      if cached_releases:
-        return cached_releases, None
-      # Otherwise return error
+      # Check if the exception indicates rate limiting
       if "rate limit" in str(e).lower():
         error_msg = f"GitHub API rate limit exceeded during release fetching: {str(e)}"
         return [], {'message': error_msg, 'rate_limited': True}
       return [], {'message': error_msg, 'rate_limited': False}
 
-  def get_latest_tags(self, release_tags=None):
+  def get_latest_tags(self):
     """
     Fetch the latest tags from GitHub, up to NR_PREVIOUS_RELEASES + 1.
-    If release_tags is provided, only fetch those specific tags.
-
-    Parameters
-    ----------
-    release_tags : List[str], optional
-        List of specific tag names to fetch. If None, fetches latest tags.
 
     Returns
     -------
@@ -375,35 +175,24 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     try:
       tags_url = f"{self.cfg_releases_repo_url}/tags"
       self.P(f"{func_name}: Requesting tags from: {tags_url}")
+      response = self.requests.get(tags_url,
+                                   params={"per_page": self.cfg_nr_previous_releases + 1})
       
-      if release_tags:
-        # If we have specific tags, fetch only those
-        tags = []
-        for tag_name in release_tags:
-          tag_url = f"{self.cfg_releases_repo_url}/git/refs/tags/{tag_name}"
-          response = self.requests.get(tag_url)
-          if response.status_code == 200:
-            tag_data = response.json()
-            tags.append({
-              'name': tag_name,
-              'commit': {'sha': tag_data['object']['sha']}
-            })
-      else:
-        # Otherwise fetch latest tags
-        response = self.requests.get(tags_url, params={"per_page": self.cfg_nr_previous_releases})
-        if response.status_code != 200:
-          error_msg = f"Failed to fetch tags. Status code: {response.status_code}, Response: {response.text}"
-          self.log_error(func_name, error_msg)
-          is_rate_limited = response.status_code == 403 and 'rate limit' in response.text.lower()
-          return [], {'message': error_msg, 'rate_limited': is_rate_limited, 'response': response}
-        tags = response.json()
-      
+      if response.status_code != 200:
+        error_msg = f"Failed to fetch tags. Status code: {response.status_code}, Response: {response.text}"
+        self.log_error(func_name, error_msg)
+        # Return error data with information about rate limiting
+        is_rate_limited = response.status_code == 403 and 'rate limit' in response.text.lower()
+        return [], {'message': error_msg, 'rate_limited': is_rate_limited, 'response': response}
+        
+      tags = response.json()
       self.check_for_rate_limit(tags)
       self.P(f"{func_name}: Successfully fetched {len(tags)} tags")
       return tags, None
     except Exception as e:
       error_msg = f"Failed to fetch tags: {str(e)}"
       self.log_error(func_name, error_msg, e)
+      # Check if the exception indicates rate limiting
       if "rate limit" in str(e).lower():
         error_msg = f"GitHub API rate limit exceeded during tag fetching: {str(e)}"
         return [], {'message': error_msg, 'rate_limited': True}
@@ -1764,5 +1553,4 @@ class ReleaseDataProcessor:
         commit_info = release.get('commit_info')
 
       releases.append(self.convert_to_release_info(release, commit_info))
-
     return releases
