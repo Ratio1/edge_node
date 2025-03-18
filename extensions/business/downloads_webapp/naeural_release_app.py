@@ -1133,7 +1133,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                         <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
                     </div>
                 </div>'''
-        if self.re.search(r'WIN32\.zip', asset['name']):
+        if self.re.search(r'Windows_msi\.zip', asset['name']):
           latest_release_section += f'''
                 <div class="download-item windows">
                     <div class="os-icon">🪟</div>
@@ -1227,7 +1227,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           linux_20_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-20\.04\.AppImage', asset['name'])), None)
           linux_22_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-22\.04\.AppImage', asset['name'])), None)
           linux_24_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-24\.04\.AppImage', asset['name'])), None)
-          win_zip = next((asset for asset in release.get('assets', []) if self.re.search(r'WIN32\.zip', asset['name'])), None)
+          win_zip = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows_msi\.zip', asset['name'])), None)
           win_msi = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.msi$', asset['name'])), None)
           macos_arm = next((asset for asset in release.get('assets', []) if self.re.search(r'OSX-arm64\.zip', asset['name'])), None)
 
