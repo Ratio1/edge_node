@@ -10,10 +10,11 @@ NaeuralReleaseAppPlugin
   and HTML generation functionality.
 """
 import traceback
-from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any, NamedTuple
-from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple, Any, NamedTuple, TypedDict, Literal
+from dataclasses import dataclass, field
 from functools import lru_cache
+from enum import Enum
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
@@ -44,206 +45,6 @@ _CONFIG = {
   'MAX_RETRIES': 3,  # Maximum number of retries for failed API requests
 }
 
-@dataclass
-class GitHubReleaseData:
-    """Data class for GitHub release information."""
-    tag_name: str
-    published_at: str
-    body: str
-    assets: List[Dict[str, Any]]
-    commit_sha: Optional[str] = None
-    commit_info: Optional[Dict[str, Any]] = None
-    tag_info: Optional[Dict[str, Any]] = None
-
-class GitHubApiError(Exception):
-    """Exception raised for GitHub API errors."""
-    def __init__(self, message: str, status_code: Optional[int] = None, is_rate_limit: bool = False):
-        self.status_code = status_code
-        self.is_rate_limit = is_rate_limit
-        super().__init__(message)
-
-class ReleaseDataFetcher:
-    """Class responsible for fetching release data from GitHub."""
-    
-    def __init__(self, config: Dict[str, Any], logger: Any):
-        """
-        Initialize the fetcher.
-        
-        Parameters
-        ----------
-        config : Dict[str, Any]
-            Configuration dictionary
-        logger : Any
-            Logger object that implements P() method
-        """
-        self.config = config
-        self.logger = logger
-        self.requests = logger.requests  # Using the same requests session as the plugin
-        
-    def _log(self, message: str) -> None:
-        """Log a message using the logger."""
-        self.logger.P(f"ReleaseDataFetcher: {message}")
-        
-    def _check_rate_limit(self, response: Any) -> None:
-        """
-        Check if the response indicates rate limiting.
-        
-        Raises
-        ------
-        GitHubApiError
-            If rate limit is reached
-        """
-        if response.status_code == 403 and 'rate limit' in response.text.lower():
-            raise GitHubApiError(
-                f"GitHub API rate limit reached: {response.text}",
-                status_code=403,
-                is_rate_limit=True
-            )
-            
-    def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        """
-        Make a request to GitHub API with retries and error handling.
-        
-        Parameters
-        ----------
-        url : str
-            API endpoint URL
-        params : Optional[Dict[str, Any]]
-            Query parameters
-            
-        Returns
-        -------
-        Any
-            JSON response from the API
-            
-        Raises
-        ------
-        GitHubApiError
-            If the request fails
-        """
-        retries = 0
-        while retries < self.config['MAX_RETRIES']:
-            try:
-                self._log(f"Making request to: {url}")
-                response = self.requests.get(
-                    url,
-                    params=params,
-                    timeout=self.config['GITHUB_API_TIMEOUT']
-                )
-                
-                self._check_rate_limit(response)
-                
-                if response.status_code == 200:
-                    return response.json()
-                    
-                if response.status_code == 404:
-                    raise GitHubApiError(
-                        f"Resource not found: {url}",
-                        status_code=404
-                    )
-                    
-                raise GitHubApiError(
-                    f"GitHub API request failed: {response.text}",
-                    status_code=response.status_code
-                )
-                
-            except Exception as e:
-                retries += 1
-                if retries >= self.config['MAX_RETRIES']:
-                    raise GitHubApiError(f"Failed after {retries} retries: {str(e)}")
-                self._log(f"Request failed, retrying ({retries}/{self.config['MAX_RETRIES']}): {str(e)}")
-                
-    def get_all_releases(self) -> List[Dict[str, Any]]:
-        """
-        Fetch all releases from GitHub.
-        
-        Returns
-        -------
-        List[Dict[str, Any]]
-            List of all releases
-        """
-        url = f"{self.config['RELEASES_REPO_URL']}/releases"
-        return self._make_request(url, params={"per_page": 100})
-        
-    def get_release_details(self, release_id: str) -> GitHubReleaseData:
-        """
-        Fetch detailed information for a specific release.
-        
-        Parameters
-        ----------
-        release_id : str
-            Release identifier (tag name)
-            
-        Returns
-        -------
-        GitHubReleaseData
-            Detailed release information
-        """
-        # Fetch release information
-        release_url = f"{self.config['RELEASES_REPO_URL']}/releases/tags/{release_id}"
-        release_data = self._make_request(release_url)
-        
-        # Fetch tag information
-        tag_url = f"{self.config['RELEASES_REPO_URL']}/git/refs/tags/{release_id}"
-        try:
-            tag_data = self._make_request(tag_url)
-        except GitHubApiError as e:
-            self._log(f"Failed to fetch tag data: {str(e)}")
-            tag_data = None
-            
-        # Get commit SHA from tag or release
-        commit_sha = None
-        if tag_data:
-            if tag_data['object']['type'] == 'tag':
-                # Annotated tag - fetch the tag object
-                tag_object = self._make_request(tag_data['object']['url'])
-                commit_sha = tag_object['object']['sha']
-            else:
-                # Lightweight tag
-                commit_sha = tag_data['object']['sha']
-                
-        # Fetch commit information if we have SHA
-        commit_info = None
-        if commit_sha:
-            try:
-                commit_url = f"{self.config['RELEASES_REPO_URL']}/commits/{commit_sha}"
-                commit_info = self._make_request(commit_url)
-            except GitHubApiError as e:
-                self._log(f"Failed to fetch commit info: {str(e)}")
-                
-        return GitHubReleaseData(
-            tag_name=release_data['tag_name'],
-            published_at=release_data['published_at'],
-            body=release_data.get('body', ''),
-            assets=release_data.get('assets', []),
-            commit_sha=commit_sha,
-            commit_info=commit_info,
-            tag_info=tag_data
-        )
-        
-    @lru_cache(maxsize=100)
-    def get_commit_message(self, commit_sha: str) -> Optional[str]:
-        """
-        Fetch commit message for a specific commit SHA.
-        Results are cached to avoid redundant API calls.
-        
-        Parameters
-        ----------
-        commit_sha : str
-            Commit SHA
-            
-        Returns
-        -------
-        Optional[str]
-            Commit message if available
-        """
-        try:
-            commit_url = f"{self.config['RELEASES_REPO_URL']}/commits/{commit_sha}"
-            commit_data = self._make_request(commit_url)
-            return commit_data['commit']['message']
-        except GitHubApiError as e:
-            self._log(f"Failed to fetch commit message: {str(e)}")
-            return None
 
 class NaeuralReleaseAppPlugin(BasePlugin):
   """
@@ -273,7 +74,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   CONFIG = _CONFIG
 
   def on_init(self, **kwargs):
-    """Initialize the plugin, setting last regeneration times and creating helpers."""
+    """Initialize the plugin with improved state management."""
     super(NaeuralReleaseAppPlugin, self).on_init(**kwargs)
     self._last_day_regenerated = (self.datetime.now() - self.timedelta(days=1)).day
     self.__last_generation_time = 0
@@ -282,121 +83,105 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self)
     return
 
-  def log_error(self, func_name, error_msg, exc_info=None):
-    """
-    Log an error with contextual information and optional traceback.
-    
-    Parameters
-    ----------
-    func_name : str
-      The name of the function where the error occurred.
-    error_msg : str
-      The error message to log.
-    exc_info : Exception, optional
-      The exception object if available.
-    """
-    error_details = f"ERROR in {func_name}: {error_msg}"
+  def log_error(self, func_name: str, error_msg: str, exc_info: Optional[Exception] = None) -> str:
+    """Log an error with improved formatting and context."""
+    error_details = [f"ERROR in {func_name}:"]
+    error_details.append(error_msg)
+
     if exc_info and self.cfg_debug_mode:
       tb_str = ''.join(traceback.format_exception(type(exc_info), exc_info, exc_info.__traceback__))
-      error_details += f"\nTraceback:\n{tb_str}"
-    self.P(error_details)
-    return error_details
+      error_details.append("Traceback:")
+      error_details.append(tb_str)
 
-  def get_latest_releases(self):
-    """
-    Fetch and process release information.
-    
-    Returns
-    -------
-    tuple
-        A tuple containing (releases_list, error_data) where:
-        - releases_list is a list of processed releases with all required information
-        - error_data is None on success, or a dict with error details on failure
-    """
+    error_message = "\n".join(error_details)
+    self.P(error_message)
+    return error_message
+
+  def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Fetch and process release information with improved error handling."""
     func_name = "get_latest_releases"
     try:
-      # Fetch all releases first
       all_releases = self.release_fetcher.get_all_releases()
       if not all_releases:
         return [], {'message': "No releases found", 'rate_limited': False}
-      
-      # Process the releases
+
       processed_releases = self.compile_release_info(all_releases)
       return processed_releases, None
-      
+
     except GitHubApiError as e:
       error_msg = f"Failed to fetch releases: {str(e)}"
       self.log_error(func_name, error_msg)
-      return [], {'message': error_msg, 'rate_limited': e.is_rate_limit}
-      
+      return [], {
+        'message': error_msg,
+        'rate_limited': e.is_rate_limit,
+        'error_type': e.error_type.value
+      }
+
     except Exception as e:
       error_msg = f"Unexpected error while fetching releases: {str(e)}"
       self.log_error(func_name, error_msg, e)
       return [], {'message': error_msg, 'rate_limited': False}
 
-  def compile_release_info(self, releases):
-    """
-    Process releases into the format expected by the UI.
-    
-    Parameters
-    ----------
-    releases : list
-        List of basic release information from GitHub API
-        
-    Returns
-    -------
-    list
-        List of processed releases with all required information
-    """
+  def compile_release_info(self, releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Process releases with improved error recovery and validation."""
     func_name = "compile_release_info"
     if not releases:
-        self.log_error(func_name, "No releases provided")
-        return []
-        
+      self.log_error(func_name, "No releases provided")
+      return []
+
     try:
-        # Sort releases by publication date and take only the required number
-        releases.sort(key=lambda x: x['published_at'], reverse=True)
-        releases = releases[:self.cfg_nr_previous_releases]
-        
-        processed_releases = []
-        for release in releases:
-            try:
-                # Fetch detailed release information
-                release_data = self.release_fetcher.get_release_details(release['tag_name'])
-                
-                # If the release doesn't have a body, try to get commit message
-                if not release_data.body.strip() and release_data.commit_sha:
-                    commit_message = self.release_fetcher.get_commit_message(release_data.commit_sha)
-                    if commit_message:
-                        release_data.body = commit_message
-                
-                # Convert to the format expected by the UI
-                processed_release = {
-                    'tag_name': release_data.tag_name,
-                    'published_at': release_data.published_at,
-                    'body': release_data.body,
-                    'assets': release_data.assets,
-                    'commit_info': release_data.commit_info
-                }
-                
-                processed_releases.append(processed_release)
-                self.P(f"{func_name}: Successfully processed release {release_data.tag_name}")
-                
-            except GitHubApiError as e:
-                self.log_error(func_name, f"Failed to process release {release.get('tag_name', 'unknown')}: {str(e)}")
-                if e.is_rate_limit:
-                    # If we hit rate limit, return what we have so far
-                    return processed_releases
-                # For other errors, continue processing remaining releases
-                continue
-                    
-        return processed_releases
-        
+      # Sort and filter releases
+      releases.sort(key=lambda x: x['published_at'], reverse=True)
+      releases = releases[:self.cfg_nr_previous_releases]
+
+      processed_releases = []
+      for release in releases:
+        try:
+          # Get release details
+          release_data = self.release_fetcher.get_release_details(release['tag_name'])
+
+          # Try to get commit message if needed
+          if not release_data.has_valid_body and release_data.commit_sha:
+            commit_message = self.release_fetcher.get_commit_message(release_data.commit_sha)
+            if commit_message:
+              # Create new instance with updated body due to frozen=True
+              release_data = GitHubReleaseData(
+                tag_name=release_data.tag_name,
+                published_at=release_data.published_at,
+                body=commit_message,
+                assets=release_data.assets,
+                commit_sha=release_data.commit_sha,
+                commit_info=release_data.commit_info,
+                tag_info=release_data.tag_info
+              )
+
+          # Convert to UI format
+          processed_release = {
+            'tag_name': release_data.tag_name,
+            'published_at': release_data.published_at,
+            'body': release_data.body,
+            'assets': release_data.assets,
+            'commit_info': release_data.commit_info
+          }
+
+          processed_releases.append(processed_release)
+          self.P(f"{func_name}: Processed release {release_data.tag_name}")
+
+        except GitHubApiError as e:
+          self.log_error(
+            func_name,
+            f"Failed to process release {release.get('tag_name', 'unknown')}: {str(e)}"
+          )
+          if e.is_rate_limit:
+            return processed_releases
+          continue
+
+      return processed_releases
+
     except Exception as e:
-        error_msg = f"Failed to compile release info: {str(e)}"
-        self.log_error(func_name, error_msg, e)
-        # Return the first release if available, otherwise empty list
-        return processed_releases[:1] if processed_releases else []
+      error_msg = f"Failed to compile release info: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return processed_releases[:1] if processed_releases else []
 
   def _regenerate_index_html(self):
     """
@@ -404,12 +189,12 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     """
     func_name = "_regenerate_index_html"
     self.P(f"{func_name}: Starting HTML regeneration...")
-    
+
     # Check if HTML file already exists
     web_server_path = self.get_web_server_path()
     output_path = self.os_path.join(web_server_path, 'assets/releases.html')
     file_exists = self.os_path.isfile(output_path)
-    
+
     # Step 1: Fetch releases
     try:
       raw_releases, release_error = self.get_latest_releases()
@@ -419,14 +204,14 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           error_message = release_error.get('message', "Failed to get any releases")
         else:
           error_message = "Failed to get any releases"
-        
+
         self.log_error(func_name, error_message)
         return False
     except Exception as e:
       error_message = f"Failed during release fetching: {str(e)}"
       self.log_error(func_name, error_message, e)
       return False
-    
+
     # Step 2: Compile release information
     try:
       raw_releases_with_commits = self.compile_release_info(raw_releases)
@@ -434,24 +219,24 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         error_message = "Failed to compile any release information"
         self.log_error(func_name, error_message)
         return False
-          
+
       # Convert raw releases to ReleaseInfo objects
       releases = self.data_processor.process_releases(raw_releases_with_commits, [])
-        
+
     except Exception as e:
       error_msg = f"Failed during release compilation: {str(e)}"
       self.log_error(func_name, error_msg, e)
       return False
-    
+
     # Step 3: Generate HTML
     try:
       html_content = self.html_generator.generate_complete_html(
-          releases=releases,
-          ee_id=self.ee_id,
-          ee_addr=self.ee_addr,
-          last_update=self.datetime_to_str()
+        releases=releases,
+        ee_id=self.ee_id,
+        ee_addr=self.ee_addr,
+        last_update=self.datetime_to_str()
       )
-      
+
       with open(output_path, 'w') as fd:
         fd.write(html_content)
 
@@ -507,6 +292,231 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     except Exception as e:
       self.log_error("process", f"Unhandled error in process method: {str(e)}", e)
     return
+
+class ReleaseAssetType(Enum):
+    """Types of release assets we support."""
+    LINUX_20_04 = "LINUX_Ubuntu-20.04.AppImage"
+    LINUX_22_04 = "LINUX_Ubuntu-22.04.AppImage"
+    LINUX_24_04 = "LINUX_Ubuntu-24.04.AppImage"
+    WINDOWS_ZIP = "Windows_msi.zip"
+    WINDOWS_MSI = "Windows.msi"
+    MACOS_ARM = "OSX-arm64.zip"
+
+class AssetInfo(TypedDict):
+    """Type definition for asset information."""
+    name: str
+    size: int
+    browser_download_url: str
+
+@dataclass(frozen=True)
+class GitHubReleaseData:
+    """Data class for GitHub release information with validation and helper methods."""
+    tag_name: str
+    published_at: str
+    body: str
+    assets: List[AssetInfo] = field(default_factory=list)
+    commit_sha: Optional[str] = None
+    commit_info: Optional[Dict[str, Any]] = None
+    tag_info: Optional[Dict[str, Any]] = None
+
+    def __post_init__(self):
+        """Validate the data after initialization."""
+        if not self.tag_name:
+            raise ValueError("tag_name cannot be empty")
+        if not self.published_at:
+            raise ValueError("published_at cannot be empty")
+            
+    @property
+    def formatted_date(self) -> str:
+        """Return formatted publication date."""
+        dt = datetime.strptime(self.published_at, '%Y-%m-%dT%H:%M:%SZ')
+        return dt.strftime('%B %d, %Y')
+        
+    @property
+    def has_valid_body(self) -> bool:
+        """Check if the release has a valid body."""
+        return bool(self.body and self.body.strip())
+        
+    def get_asset_by_type(self, asset_type: ReleaseAssetType) -> Optional[AssetInfo]:
+        """Get asset information by type."""
+        return next(
+            (a for a in self.assets if asset_type.value in a['name']),
+            None
+        )
+
+class GitHubApiErrorType(Enum):
+    """Types of GitHub API errors."""
+    RATE_LIMIT = "rate_limit"
+    NOT_FOUND = "not_found"
+    NETWORK = "network"
+    UNKNOWN = "unknown"
+
+class GitHubApiError(Exception):
+    """Exception raised for GitHub API errors with improved error categorization."""
+    def __init__(
+        self,
+        message: str,
+        error_type: GitHubApiErrorType,
+        status_code: Optional[int] = None,
+        response_text: Optional[str] = None
+    ):
+        self.error_type = error_type
+        self.status_code = status_code
+        self.response_text = response_text
+        super().__init__(message)
+
+    @property
+    def is_rate_limit(self) -> bool:
+        """Check if this is a rate limit error."""
+        return self.error_type == GitHubApiErrorType.RATE_LIMIT
+
+    @classmethod
+    def from_response(cls, response: Any, message: Optional[str] = None) -> 'GitHubApiError':
+        """Create an error instance from a response object."""
+        if response.status_code == 403 and 'rate limit' in response.text.lower():
+            error_type = GitHubApiErrorType.RATE_LIMIT
+        elif response.status_code == 404:
+            error_type = GitHubApiErrorType.NOT_FOUND
+        else:
+            error_type = GitHubApiErrorType.UNKNOWN
+            
+        return cls(
+            message or f"GitHub API error: {response.text}",
+            error_type=error_type,
+            status_code=response.status_code,
+            response_text=response.text
+        )
+
+class ReleaseDataFetcher:
+    """Class responsible for fetching release data from GitHub with improved caching."""
+    
+    def __init__(self, config: Dict[str, Any], logger: Any):
+        self.config = config
+        self.logger = logger
+        self.requests = logger.requests
+        self._cache_timeout = timedelta(minutes=10)
+        self._last_cache_clear = datetime.now()
+        
+    def _log(self, message: str, level: Literal["info", "error", "debug"] = "info") -> None:
+        """Enhanced logging with levels."""
+        prefix = "ReleaseDataFetcher"
+        if level == "error":
+            self.logger.P(f"{prefix} ERROR: {message}")
+        elif level == "debug" and self.config.get('DEBUG_MODE'):
+            self.logger.P(f"{prefix} DEBUG: {message}")
+        else:
+            self.logger.P(f"{prefix}: {message}")
+            
+    def _check_and_clear_cache(self) -> None:
+        """Clear caches if they're too old."""
+        now = datetime.now()
+        if now - self._last_cache_clear > self._cache_timeout:
+            self.get_commit_message.cache_clear()
+            self.get_release_details.cache_clear()
+            self._last_cache_clear = now
+            self._log("Cache cleared", level="debug")
+            
+    def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """Make a request to GitHub API with improved error handling."""
+        retries = 0
+        last_error = None
+        
+        while retries < self.config['MAX_RETRIES']:
+            try:
+                self._log(f"Request to: {url}", level="debug")
+                response = self.requests.get(
+                    url,
+                    params=params,
+                    timeout=self.config['GITHUB_API_TIMEOUT']
+                )
+                
+                if response.status_code == 200:
+                    return response.json()
+                    
+                raise GitHubApiError.from_response(response)
+                
+            except GitHubApiError as e:
+                if e.is_rate_limit or retries >= self.config['MAX_RETRIES'] - 1:
+                    raise
+                last_error = e
+                
+            except Exception as e:
+                if retries >= self.config['MAX_RETRIES'] - 1:
+                    raise GitHubApiError(
+                        f"Network error: {str(e)}",
+                        error_type=GitHubApiErrorType.NETWORK
+                    )
+                last_error = e
+                
+            retries += 1
+            self._log(
+                f"Request failed ({retries}/{self.config['MAX_RETRIES']}): {str(last_error)}",
+                level="error"
+            )
+            
+    def get_all_releases(self) -> List[Dict[str, Any]]:
+        """Fetch all releases from GitHub."""
+        self._check_and_clear_cache()
+        url = f"{self.config['RELEASES_REPO_URL']}/releases"
+        return self._make_request(url, params={"per_page": 100})
+        
+    @lru_cache(maxsize=50)
+    def get_release_details(self, release_id: str) -> GitHubReleaseData:
+        """Fetch detailed information for a specific release with caching."""
+        # Fetch release information
+        release_url = f"{self.config['RELEASES_REPO_URL']}/releases/tags/{release_id}"
+        release_data = self._make_request(release_url)
+        
+        # Fetch tag information
+        tag_url = f"{self.config['RELEASES_REPO_URL']}/git/refs/tags/{release_id}"
+        try:
+            tag_data = self._make_request(tag_url)
+        except GitHubApiError as e:
+            self._log(f"Failed to fetch tag data: {str(e)}", level="error")
+            tag_data = None
+            
+        # Get commit SHA and info
+        commit_sha = None
+        commit_info = None
+        
+        if tag_data:
+            try:
+                if tag_data['object']['type'] == 'tag':
+                    tag_object = self._make_request(tag_data['object']['url'])
+                    commit_sha = tag_object['object']['sha']
+                else:
+                    commit_sha = tag_data['object']['sha']
+                    
+                if commit_sha:
+                    commit_info = self._get_commit_info(commit_sha)
+            except GitHubApiError as e:
+                self._log(f"Failed to fetch commit data: {str(e)}", level="error")
+                
+        return GitHubReleaseData(
+            tag_name=release_data['tag_name'],
+            published_at=release_data['published_at'],
+            body=release_data.get('body', ''),
+            assets=release_data.get('assets', []),
+            commit_sha=commit_sha,
+            commit_info=commit_info,
+            tag_info=tag_data
+        )
+        
+    @lru_cache(maxsize=100)
+    def _get_commit_info(self, commit_sha: str) -> Optional[Dict[str, Any]]:
+        """Internal method to fetch commit information with caching."""
+        try:
+            commit_url = f"{self.config['RELEASES_REPO_URL']}/commits/{commit_sha}"
+            return self._make_request(commit_url)
+        except GitHubApiError as e:
+            self._log(f"Failed to fetch commit info: {str(e)}", level="error")
+            return None
+            
+    @lru_cache(maxsize=100)
+    def get_commit_message(self, commit_sha: str) -> Optional[str]:
+        """Fetch commit message with caching."""
+        commit_info = self._get_commit_info(commit_sha)
+        return commit_info['commit']['message'] if commit_info else None
 
 
 class ReleaseAsset:
