@@ -113,8 +113,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
     Returns
     -------
-    list
-      A list of JSON objects corresponding to recent GitHub releases.
+    tuple
+      A tuple containing (releases_list, error_data) where:
+      - releases_list is a list of JSON objects corresponding to recent GitHub releases
+      - error_data is a dict with 'message' and 'rate_limited' keys or None if no error
     """
     func_name = "get_latest_releases"
     try:
@@ -128,7 +130,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if response.status_code != 200:
         error_msg = f"Failed to fetch releases. Status code: {response.status_code}, Response: {response.text}"
         self.log_error(func_name, error_msg)
-        return []
+        # Return error data with information about rate limiting
+        is_rate_limited = response.status_code == 403 and 'rate limit' in response.text.lower()
+        return [], {'message': error_msg, 'rate_limited': is_rate_limited, 'response': response}
         
       releases = response.json()
       self.check_for_rate_limit(releases)
@@ -142,11 +146,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           self.P(f"{func_name}: Release {i} - Body preview: {release.get('body')[:100]}...")
         self.P(f"{func_name}: Release {i} - Keys: {sorted(release.keys())}")
       
-      return releases
+      return releases, None
     except Exception as e:
       error_msg = f"Failed to fetch releases: {str(e)}"
       self.log_error(func_name, error_msg, e)
-      return []
+      # Check if the exception indicates rate limiting
+      is_rate_limited = "rate limit" in str(e).lower()
+      return [], {'message': error_msg, 'rate_limited': is_rate_limited}
 
   def get_latest_tags(self):
     """
@@ -154,8 +160,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
     Returns
     -------
-    list
-      A list of JSON objects corresponding to recent GitHub tags.
+    tuple
+      A tuple containing (tags_list, error_data) where:
+      - tags_list is a list of JSON objects corresponding to recent GitHub tags
+      - error_data is a dict with 'message' and 'rate_limited' keys or None if no error
     """
     func_name = "get_latest_tags"
     try:
@@ -167,16 +175,20 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if response.status_code != 200:
         error_msg = f"Failed to fetch tags. Status code: {response.status_code}, Response: {response.text}"
         self.log_error(func_name, error_msg)
-        return []
+        # Return error data with information about rate limiting
+        is_rate_limited = response.status_code == 403 and 'rate limit' in response.text.lower()
+        return [], {'message': error_msg, 'rate_limited': is_rate_limited, 'response': response}
         
       tags = response.json()
       self.check_for_rate_limit(tags)
       self.P(f"{func_name}: Successfully fetched {len(tags)} tags")
-      return tags
+      return tags, None
     except Exception as e:
       error_msg = f"Failed to fetch tags: {str(e)}"
       self.log_error(func_name, error_msg, e)
-      return []
+      # Check if the exception indicates rate limiting
+      is_rate_limited = "rate limit" in str(e).lower()
+      return [], {'message': error_msg, 'rate_limited': is_rate_limited}
 
   def get_commit_info(self, commit_sha):
     """
@@ -563,18 +575,19 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     
     # Step 1: Fetch releases
     try:
-      raw_releases = self.get_latest_releases()
+      raw_releases, release_error = self.get_latest_releases()
       if not raw_releases:
-        error_response = self.requests.get(f"{self.cfg_releases_repo_url}/releases")
-        if error_response.status_code == 403 and 'rate limit' in error_response.text.lower():
-          error_message = f"GitHub API rate limit exceeded. Response: {error_response.text}"
-          rate_limited = True
+        # Use the error information returned from get_latest_releases instead of making a redundant API call
+        if release_error:
+          rate_limited = release_error.get('rate_limited', False)
+          error_message = release_error.get('message', "Failed to get any releases")
         else:
           error_message = "Failed to get any releases"
+        
         self.log_error(func_name, error_message)
         
         # Generate fallback page instead of returning False only if no file exists
-        if rate_limited or error_response.status_code != 200:
+        if rate_limited:
           if file_exists:
             self.P(f"{func_name}: Rate limit exceeded, but existing HTML file was preserved")
             return False
@@ -583,7 +596,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         return False
     except Exception as e:
       error_message = f"Failed during release fetching: {str(e)}"
-      self.log_error(func_name, error_msg, e)
+      self.log_error(func_name, error_message, e)
       
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
@@ -597,24 +610,30 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     
     # Step 2: Fetch tags
     try:
-      raw_tags = self.get_latest_tags()
+      raw_tags, tag_error = self.get_latest_tags()
       if not raw_tags:
-        error_response = self.requests.get(f"{self.cfg_releases_repo_url}/tags")
-        if error_response.status_code == 403 and 'rate limit' in error_response.text.lower():
-          error_message = f"GitHub API rate limit exceeded. Response: {error_response.text}"
-          rate_limited = True
+        # Use the error information returned from get_latest_tags instead of making a redundant API call
+        if tag_error:
+          rate_limited = tag_error.get('rate_limited', False)
+          error_message = tag_error.get('message', "Failed to get any tags")
+        else:
+          error_message = "Failed to get any tags, proceeding with limited information"
+        
+        if rate_limited:
+          self.log_error(func_name, error_message)
           if file_exists:
             self.P(f"{func_name}: Rate limit exceeded during tag fetching, but existing HTML file was preserved")
             return False
           else:
             return self._generate_fallback_html_and_save(error_message)
         else:
-          error_msg = "Failed to get any tags, proceeding with limited information"
-          self.log_error(func_name, error_msg)
+          # Just log a warning but continue with empty tags
+          self.log_error(func_name, error_message)
           # We continue anyway, as we can still generate some HTML with just releases
+      
     except Exception as e:
-      error_msg = f"Failed during tag fetching: {str(e)}"
-      self.log_error(func_name, error_msg, e)
+      error_message = f"Failed during tag fetching: {str(e)}"
+      self.log_error(func_name, error_message, e)
       
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
