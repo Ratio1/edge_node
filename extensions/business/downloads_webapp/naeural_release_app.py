@@ -1217,7 +1217,7 @@ class HtmlGenerator:
 
                         // Check if button should be shown
                         const infoId = info.id;
-                        const btnId = 'btn-' + infoId.rre.eplace('release-info-', '');
+                        const btnId = 'btn-' + infoId.replace('release-info-', '');
                         checkContentOverflow(infoId, btnId);
                     });
                 });
