@@ -254,7 +254,8 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   def get_latest_releases(self):
     """
     Fetch the latest releases from GitHub, using cache when possible.
-    Downloads complete information for new releases and stores in cache.
+    Downloads complete information only for new releases and stores in cache.
+    Cached releases are used as-is without re-fetching their information.
 
     Returns
     -------
@@ -289,52 +290,58 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       # If we have cached releases, only process newer ones
       if cached_releases and latest_cached_date:
+        # Create a dict of cached releases for quick lookup
+        cached_releases_dict = {
+          release.get('tag_name'): release 
+          for release in cached_releases 
+          if release.get('tag_name')
+        }
+        
         new_releases_to_process = []
-        new_release_tags = []
         for release in new_releases:
-          if release.get('published_at', '') > latest_cached_date:
-            tag_name = release.get('tag_name')
-            self.P(f"{func_name}: Found new release {tag_name} newer than cache")
-            new_release_tags.append(tag_name)
-            new_releases_to_process.append(release)
-          else:
-            break  # Since releases are ordered by date, we can stop once we hit an old one
-        
-        # Only fetch tags and commits for new releases
-        if new_releases_to_process:
-          self.P(f"{func_name}: Fetching tags for {len(new_release_tags)} new releases")
-          tags, tag_error = self.get_latest_tags(new_release_tags)
-          if tags and not tag_error:
-            # Process each new release with its tag info
-            complete_releases = []
-            for release in new_releases_to_process:
-              complete_release = self._fetch_complete_release_info(release.get('tag_name'))
-              if complete_release:
-                complete_releases.append(complete_release)
+          tag_name = release.get('tag_name')
+          published_at = release.get('published_at', '')
+          
+          # Skip if this release is already in cache
+          if tag_name in cached_releases_dict:
+            continue
             
-            if complete_releases:
-              self.P(f"{func_name}: Adding {len(complete_releases)} new releases to cache")
-              all_releases = complete_releases + cached_releases
-              # Sort and limit to configured number
-              all_releases.sort(key=lambda x: x.get('published_at', ''), reverse=True)
-              all_releases = all_releases[:self.cfg_nr_previous_releases]
-              # Save updated cache
-              self._save_releases_cache(all_releases)
-              return all_releases, None
+          # Skip if this release is older than our newest cached release
+          if published_at <= latest_cached_date:
+            break  # Since releases are ordered by date, we can stop here
+            
+          self.P(f"{func_name}: Found new release {tag_name} newer than cache")
+          new_releases_to_process.append(release)
         
-        self.P(f"{func_name}: No new releases found or processed, using cache")
+        # Only fetch info for genuinely new releases
+        if new_releases_to_process:
+          self.P(f"{func_name}: Processing {len(new_releases_to_process)} new releases")
+          complete_releases = []
+          for release in new_releases_to_process:
+            complete_release = self._fetch_complete_release_info(release.get('tag_name'))
+            if complete_release:
+              complete_releases.append(complete_release)
+          
+          if complete_releases:
+            self.P(f"{func_name}: Adding {len(complete_releases)} new releases to cache")
+            # Combine new releases with cached ones and sort
+            all_releases = complete_releases + cached_releases
+            all_releases.sort(key=lambda x: x.get('published_at', ''), reverse=True)
+            all_releases = all_releases[:self.cfg_nr_previous_releases]
+            # Save updated cache
+            self._save_releases_cache(all_releases)
+            return all_releases, None
+        
+        self.P(f"{func_name}: No new releases found, using cache as-is")
         return cached_releases, None
       
-      # If no cache or cache is invalid, process all releases
+      # If no cache exists, process all releases
+      self.P(f"{func_name}: No cache exists, processing all releases")
       processed_releases = []
-      release_tags = [r.get('tag_name') for r in new_releases[:self.cfg_nr_previous_releases]]
-      tags, tag_error = self.get_latest_tags(release_tags)
-      
-      if tags and not tag_error:
-        for release in new_releases[:self.cfg_nr_previous_releases]:
-          complete_release = self._fetch_complete_release_info(release.get('tag_name'))
-          if complete_release:
-            processed_releases.append(complete_release)
+      for release in new_releases[:self.cfg_nr_previous_releases]:
+        complete_release = self._fetch_complete_release_info(release.get('tag_name'))
+        if complete_release:
+          processed_releases.append(complete_release)
       
       if processed_releases:
         self._save_releases_cache(processed_releases)
