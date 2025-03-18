@@ -13,7 +13,7 @@ import traceback
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.3.4'
+__VER__ = '0.3.5'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -58,6 +58,8 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     Fetches the latest tags from the GitHub repository.
   get_commit_info(commit_sha)
     Fetches commit information for a given commit SHA.
+  get_release_by_tag(tag_name)
+    Fetches information for a specific release by its tag name.
   compile_release_info(releases, tags)
     Associates commit information with each release record.
   check_for_rate_limit(response, raise_exception=True)
@@ -118,8 +120,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     try:
       releases_url = f"{self.cfg_releases_repo_url}/releases"
       self.P(f"{func_name}: Requesting releases from: {releases_url}")
+      
+      # Use a higher per_page value to ensure we get all the releases we need
       response = self.requests.get(releases_url,
-                                   params={"per_page": self.cfg_nr_previous_releases + 1})
+                                   params={"per_page": 100})
       
       if response.status_code != 200:
         error_msg = f"Failed to fetch releases. Status code: {response.status_code}, Response: {response.text}"
@@ -129,6 +133,15 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       releases = response.json()
       self.check_for_rate_limit(releases)
       self.P(f"{func_name}: Successfully fetched {len(releases)} releases")
+      
+      # Debug: Print full release data for inspection
+      for i, release in enumerate(releases):
+        self.P(f"{func_name}: Release {i} - Tag: {release.get('tag_name', 'Unknown')}")
+        self.P(f"{func_name}: Release {i} - Has body: {bool(release.get('body'))}")
+        if release.get('body'):
+          self.P(f"{func_name}: Release {i} - Body preview: {release.get('body')[:100]}...")
+        self.P(f"{func_name}: Release {i} - Keys: {sorted(release.keys())}")
+      
       return releases
     except Exception as e:
       error_msg = f"Failed to fetch releases: {str(e)}"
@@ -198,6 +211,122 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.log_error(func_name, error_msg, e)
       return None
 
+  def get_release_by_tag(self, tag_name):
+    """
+    Fetch information for a specific release by its tag name.
+    
+    Parameters
+    ----------
+    tag_name : str
+      The tag name of the release to fetch.
+      
+    Returns
+    -------
+    dict
+      JSON object with information about the specified release, or None if not found.
+    """
+    func_name = f"get_release_by_tag({tag_name})"
+    try:
+      release_url = f"{self.cfg_releases_repo_url}/releases/tags/{tag_name}"
+      self.P(f"{func_name}: Requesting specific release from: {release_url}")
+      response = self.requests.get(release_url)
+      
+      if response.status_code != 200:
+        error_msg = f"Failed to fetch release. Status code: {response.status_code}, Response: {response.text}"
+        self.log_error(func_name, error_msg)
+        return None
+        
+      release_info = response.json()
+      self.check_for_rate_limit(release_info)
+      self.P(f"{func_name}: Successfully fetched release for tag {tag_name}")
+      return release_info
+    except Exception as e:
+      error_msg = f"Failed to fetch release: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return None
+
+  def get_commit_message_for_tag(self, tag_name):
+    """
+    Fetch the commit message for a specific tag.
+    
+    Parameters
+    ----------
+    tag_name : str
+      The tag name to fetch the commit message for.
+      
+    Returns
+    -------
+    str
+      The commit message for the tag, or None if not found.
+    """
+    func_name = f"get_commit_message_for_tag({tag_name})"
+    try:
+      # First get the tag to find the commit SHA
+      tag_url = f"{self.cfg_releases_repo_url}/git/refs/tags/{tag_name}"
+      self.P(f"{func_name}: Requesting tag reference from: {tag_url}")
+      tag_response = self.requests.get(tag_url)
+      
+      if tag_response.status_code != 200:
+        error_msg = f"Failed to fetch tag reference. Status code: {tag_response.status_code}, Response: {tag_response.text}"
+        self.log_error(func_name, error_msg)
+        return None
+        
+      tag_data = tag_response.json()
+      self.check_for_rate_limit(tag_data)
+      
+      # Get the object type and SHA
+      if tag_data.get('object', {}).get('type') == 'tag':
+        # This is an annotated tag, we need to get the tag object first
+        tag_object_url = tag_data['object']['url']
+        self.P(f"{func_name}: Requesting annotated tag object from: {tag_object_url}")
+        tag_object_response = self.requests.get(tag_object_url)
+        
+        if tag_object_response.status_code != 200:
+          error_msg = f"Failed to fetch tag object. Status code: {tag_object_response.status_code}, Response: {tag_object_response.text}"
+          self.log_error(func_name, error_msg)
+          return None
+          
+        tag_object_data = tag_object_response.json()
+        self.check_for_rate_limit(tag_object_data)
+        
+        # Get the commit SHA from the tag object
+        commit_sha = tag_object_data.get('object', {}).get('sha')
+      else:
+        # This is a lightweight tag, we can use the SHA directly
+        commit_sha = tag_data.get('object', {}).get('sha')
+      
+      if not commit_sha:
+        error_msg = f"Could not find commit SHA for tag {tag_name}"
+        self.log_error(func_name, error_msg)
+        return None
+      
+      # Now get the commit information
+      commit_url = f"{self.cfg_releases_repo_url}/commits/{commit_sha}"
+      self.P(f"{func_name}: Requesting commit information from: {commit_url}")
+      commit_response = self.requests.get(commit_url)
+      
+      if commit_response.status_code != 200:
+        error_msg = f"Failed to fetch commit information. Status code: {commit_response.status_code}, Response: {commit_response.text}"
+        self.log_error(func_name, error_msg)
+        return None
+        
+      commit_data = commit_response.json()
+      self.check_for_rate_limit(commit_data)
+      
+      # Extract the commit message
+      commit_message = commit_data.get('commit', {}).get('message')
+      if commit_message:
+        self.P(f"{func_name}: Successfully retrieved commit message for tag {tag_name}")
+        return commit_message
+      else:
+        error_msg = f"No commit message found for tag {tag_name}"
+        self.log_error(func_name, error_msg)
+        return None
+    except Exception as e:
+      error_msg = f"Failed to fetch commit message for tag {tag_name}: {str(e)}"
+      self.log_error(func_name, error_msg, e)
+      return None
+
   def compile_release_info(self, releases, tags):
     """
     Sorts releases by publish date, trims to NR_PREVIOUS_RELEASES,
@@ -226,12 +355,30 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       for i, release in enumerate(releases):
         try:
           release_tag = release['tag_name'].strip("'")
+          self.P(f"{func_name}: Processing release {i} - Tag: {release_tag}")
+          
+          # If the release doesn't have a body, try to fetch it directly
+          if not release.get('body') or not release['body'].strip():
+            self.P(f"{func_name}: Release {release_tag} has no body, trying to fetch directly")
+            specific_release = self.get_release_by_tag(release_tag)
+            if specific_release and specific_release.get('body') and specific_release['body'].strip():
+              release['body'] = specific_release['body']
+              self.P(f"{func_name}: Successfully fetched body for release {release_tag}")
+            else:
+              # If still no body, try to get the commit message for the tag
+              self.P(f"{func_name}: No body found for release {release_tag}, trying to get commit message")
+              commit_message = self.get_commit_message_for_tag(release_tag)
+              if commit_message:
+                release['body'] = commit_message
+                self.P(f"{func_name}: Successfully fetched commit message for release {release_tag}")
+          
           tag = next((tag for tag in tags if tag['name'].strip("'") == release_tag), None)
           if tag:
             try:
               commit_info = self.get_commit_info(tag['commit']['sha'])
               self.check_for_rate_limit(commit_info)
               release['commit_info'] = commit_info
+              self.P(f"{func_name}: Added commit info for release {release_tag}")
             except Exception as e:
               error_msg = f"Failed to get commit info for release {release_tag}, index {i}: {str(e)}"
               self.log_error(func_name, error_msg, e)
@@ -241,6 +388,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           else:
             self.P(f"{func_name}: Warning - No matching tag found for release {release_tag}")
             release['commit_info'] = None
+            
+          # Debug: Print release information after processing
+          self.P(f"{func_name}: Release {i} after processing - Tag: {release_tag}")
+          self.P(f"{func_name}: Release {i} - Has body: {bool(release.get('body'))}")
+          if release.get('body'):
+            self.P(f"{func_name}: Release {i} - Body preview: {release.get('body')[:100]}...")
+          self.P(f"{func_name}: Release {i} - Has commit_info: {bool(release.get('commit_info'))}")
         except Exception as e:
           error_msg = f"Failed to process release at index {i}: {str(e)}"
           self.log_error(func_name, error_msg, e)
@@ -429,7 +583,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         return False
     except Exception as e:
       error_message = f"Failed during release fetching: {str(e)}"
-      self.log_error(func_name, error_message, e)
+      self.log_error(func_name, error_msg, e)
       
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
@@ -557,6 +711,143 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                   border-bottom: 2px solid #f0f0f0;
                   padding-bottom: 10px;
               }
+              .release-header {
+                  display: flex;
+                  justify-content: space-between;
+                  align-items: center;
+                  flex-wrap: wrap;
+                  margin-bottom: 1em;
+              }
+              .release-date {
+                  color: #666;
+                  font-style: italic;
+              }
+              .release-content {
+                  display: flex;
+                  flex-wrap: wrap;
+                  gap: 2em;
+              }
+              .release-details {
+                  flex: 1;
+                  min-width: 300px;
+              }
+              .download-options {
+                  flex: 1;
+                  min-width: 300px;
+              }
+              .release-notes-container {
+                  position: relative;
+              }
+              .release-notes {
+                  background-color: #f8f9fa;
+                  padding: 15px;
+                  border-radius: 4px;
+                  white-space: pre-wrap;
+                  font-size: 0.95em;
+                  max-height: 200px;
+                  overflow: hidden;
+                  transition: max-height 0.3s ease-out;
+                  margin: 0;
+              }
+              .commit-info {
+                  background-color: #f8f9fa;
+                  padding: 10px;
+                  border-radius: 4px;
+                  font-size: 0.9em;
+                  max-height: 100px;
+                  overflow: hidden;
+                  transition: max-height 0.3s ease-out;
+              }
+              .expanded {
+                  max-height: 1000px !important;
+              }
+              .commit-title {
+                  font-weight: bold;
+                  margin-bottom: 5px;
+              }
+              .see-more-btn {
+                  background-color: #f0f0f0;
+                  border: none;
+                  padding: 5px 10px;
+                  font-size: 0.8em;
+                  border-radius: 4px;
+                  cursor: pointer;
+                  margin-top: 5px;
+                  color: #666;
+                  display: none;
+                  position: relative;
+              }
+              .see-more-btn:hover {
+                  background-color: #e0e0e0;
+              }
+              .see-more-btn .see-less-text {
+                  display: none;
+              }
+              .see-more-btn.expanded .see-more-text {
+                  display: none;
+              }
+              .see-more-btn.expanded .see-less-text {
+                  display: inline;
+              }
+              .download-grid {
+                  display: grid;
+                  grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+                  gap: 15px;
+                  margin-top: 1em;
+              }
+              .download-item {
+                  display: flex;
+                  align-items: center;
+                  background-color: #f9f9f9;
+                  border-radius: 8px;
+                  padding: 10px 15px;
+                  transition: transform 0.2s, box-shadow 0.2s;
+              }
+              .download-item:hover {
+                  transform: translateY(-2px);
+                  box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+              }
+              .linux {
+                  border-left: 4px solid #f0ad4e;
+              }
+              .windows {
+                  border-left: 4px solid #5bc0de;
+              }
+              .macos {
+                  border-left: 4px solid #5cb85c;
+              }
+              .os-icon {
+                  font-size: 1.8em;
+                  margin-right: 15px;
+              }
+              .download-details {
+                  flex: 1;
+                  display: flex;
+                  flex-direction: column;
+              }
+              .os-name {
+                  font-weight: bold;
+                  margin-bottom: 3px;
+              }
+              .file-size {
+                  color: #777;
+                  font-size: 0.8em;
+                  margin-bottom: 5px;
+              }
+              .download-btn {
+                  display: inline-block;
+                  background-color: #4CAF50;
+                  color: white;
+                  padding: 6px 12px;
+                  border-radius: 4px;
+                  text-decoration: none;
+                  font-size: 0.9em;
+                  align-self: flex-start;
+              }
+              .download-btn:hover {
+                  background-color: #45a049;
+                  text-decoration: none;
+              }
               table {
                   width: 100%;
                   border-collapse: collapse;
@@ -583,57 +874,16 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               a:hover {
                   text-decoration: underline;
               }
-              .download-btn {
-                  display: inline-block;
-                  background-color: #4CAF50;
-                  color: white;
-                  padding: 6px 12px;
-                  border-radius: 4px;
-                  text-decoration: none;
-                  margin-top: 5px;
+              .commit-message {
+                  list-style-type: disc;
+                  padding-left: 20px;
+                  margin: 5px 0;
               }
-              .download-btn:hover {
-                  background-color: #45a049;
-                  text-decoration: none;
+              .commit-message li.hidden {
+                  display: none;
               }
-              pre {
-                  background-color: #f8f9fa;
-                  padding: 10px;
-                  border-radius: 4px;
-                  white-space: pre-wrap;
-                  font-size: 0.9em;
-                  max-height: 100px;
-                  overflow: hidden;
-                  transition: max-height 0.3s ease-out;
-              }
-              .commit-info {
-                  background-color: #f8f9fa;
-                  padding: 10px;
-                  border-radius: 4px;
-                  font-size: 0.9em;
-                  max-height: 80px;
-                  overflow: hidden;
-                  transition: max-height 0.3s ease-out;
-              }
-              .expanded {
-                  max-height: 1000px !important;
-              }
-              .commit-title {
-                  font-weight: bold;
-                  margin-bottom: 5px;
-              }
-              .see-more-btn {
-                  background-color: #f0f0f0;
-                  border: none;
-                  padding: 5px 10px;
-                  font-size: 0.8em;
-                  border-radius: 4px;
-                  cursor: pointer;
-                  margin-top: 5px;
-                  color: #666;
-              }
-              .see-more-btn:hover {
-                  background-color: #e0e0e0;
+              .commit-message li.visible {
+                  display: list-item;
               }
               .show-all-btn {
                   display: block;
@@ -656,19 +906,106 @@ class NaeuralReleaseAppPlugin(BasePlugin):
               .release-row.visible {
                   display: table-row;
               }
-              .commit-message {
-                  list-style-type: disc;
-                  padding-left: 20px;
-                  margin: 5px 0;
-              }
-              .commit-message li {
-                  margin-bottom: 3px;
-              }
-              .commit-message li.hidden {
+              .release-card {
+                  background-color: white;
+                  border-radius: 8px;
+                  box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+                  margin-bottom: 20px;
+                  overflow: hidden;
+                  transition: transform 0.2s;
                   display: none;
               }
-              .commit-message li.visible {
-                  display: list-item;
+              .release-card.visible {
+                  display: block;
+              }
+              .release-card:hover {
+                  transform: translateY(-2px);
+                  box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+              }
+              .release-card-header {
+                  display: flex;
+                  justify-content: space-between;
+                  align-items: center;
+                  padding: 15px 20px;
+                  background-color: #f8f9fa;
+                  border-bottom: 1px solid #e0e0e0;
+              }
+              .release-card-header h3 {
+                  margin: 0;
+                  color: #4b6cb7;
+                  font-size: 1.2em;
+              }
+              .release-card-content {
+                  padding: 20px;
+                  display: flex;
+                  flex-wrap: wrap;
+                  gap: 20px;
+              }
+              .release-info {
+                  flex: 1;
+                  min-width: 250px;
+              }
+              .release-downloads {
+                  flex: 2;
+                  min-width: 300px;
+                  display: flex;
+                  flex-wrap: wrap;
+                  gap: 15px;
+              }
+              .download-section {
+                  flex: 1;
+                  min-width: 150px;
+              }
+              .download-section h4 {
+                  margin-top: 0;
+                  margin-bottom: 10px;
+                  color: #555;
+                  font-size: 1em;
+                  border-bottom: 1px solid #eee;
+                  padding-bottom: 5px;
+              }
+              .download-list {
+                  display: flex;
+                  flex-direction: column;
+                  gap: 8px;
+              }
+              .download-item-small {
+                  display: flex;
+                  flex-direction: column;
+                  padding: 8px 10px;
+                  border-radius: 6px;
+                  background-color: #f9f9f9;
+                  transition: background-color 0.2s;
+              }
+              .download-item-small:hover {
+                  background-color: #f0f0f0;
+              }
+              .download-item-small.linux {
+                  border-left: 3px solid #f0ad4e;
+              }
+              .download-item-small.windows {
+                  border-left: 3px solid #5bc0de;
+              }
+              .download-item-small.macos {
+                  border-left: 3px solid #5cb85c;
+              }
+              .download-btn-small {
+                  display: inline-block;
+                  background-color: #4CAF50;
+                  color: white;
+                  padding: 4px 8px;
+                  border-radius: 4px;
+                  text-decoration: none;
+                  font-size: 0.8em;
+                  margin-top: 5px;
+                  align-self: flex-start;
+              }
+              .download-btn-small:hover {
+                  background-color: #45a049;
+                  text-decoration: none;
+              }
+              .releases-container {
+                  margin-top: 20px;
               }
           </style>
       </head>
@@ -705,42 +1042,124 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       }
       self.P(f"{func_name}: latest_release:\n{self.json_dumps(dct_info, indent=2)}")
       
-      # Safely get commit message
-      commit_message = "No commit information available"
-      if latest_release.get('commit_info') and latest_release['commit_info'].get('commit'):
-        commit_message = latest_release['commit_info']['commit'].get('message', commit_message)
+      # Get release information - use body if available, otherwise fall back to commit message or name
+      release_info = "No release information available"
       
+      # First try to use the release body
+      if latest_release.get('body') and latest_release['body'].strip():
+        release_info = latest_release['body'].strip()
+        self.P(f"{func_name}: Using release body for latest release {latest_release['tag_name']}")
+      # Then try to use the commit message from the commit_info
+      elif latest_release.get('commit_info') and latest_release['commit_info'].get('commit'):
+        release_info = latest_release['commit_info']['commit'].get('message', release_info)
+        self.P(f"{func_name}: Using commit message for latest release {latest_release['tag_name']}")
+      # Try to get the commit message directly from the tag
+      else:
+        commit_message = self.get_commit_message_for_tag(latest_release['tag_name'])
+        if commit_message:
+          release_info = commit_message
+          self.P(f"{func_name}: Using commit message from tag for latest release {latest_release['tag_name']}")
+        # Finally, use the release name or tag as a last resort
+        elif latest_release.get('name') and latest_release['name'].strip():
+          release_info = f"Release {latest_release['name']}"
+          self.P(f"{func_name}: Using release name for latest release {latest_release['tag_name']}")
+        else:
+          release_info = f"Release {latest_release['tag_name']}"
+          self.P(f"{func_name}: Using tag name for latest release {latest_release['tag_name']}")
+        
       latest_release_section = f"""
           <div class="latest-release" id="latest-release">
-              <h2>Latest Release: {latest_release['tag_name'].replace("'","")}</h2>
-              <h3>Details:</h3>
-              <div style="margin-left: 2em;">
-                <pre id="latest-release-info">{commit_message}</pre>
-                <button class="see-more-btn" onclick="toggleContent('latest-release-info')">See More</button>
+              <div class="release-header">
+                  <h2>Latest Release: {latest_release['tag_name'].replace("'","")}</h2>
+                  <span class="release-date">Released on {self.datetime.strptime(latest_release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}</span>
               </div>
-              <p>Date Published: {self.datetime.strptime(latest_release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}</p>
-              <ul>
-      """
+              
+              <div class="release-content">
+                  <div class="release-details">
+                      <h3>Release Details:</h3>
+                      <div class="release-notes-container">
+                          <pre id="latest-release-info" class="release-notes">{release_info}</pre>
+                          <button id="latest-release-btn" class="see-more-btn" onclick="toggleContent('latest-release-info')" style="display: none;">
+                              <span class="see-more-text">See More</span>
+                              <span class="see-less-text">See Less</span>
+                          </button>
+                      </div>
+                  </div>
+                  
+                  <div class="download-options">
+                      <h3>Download Options:</h3>
+                      <div class="download-grid">
+        """
 
       assets = latest_release.get('assets', [])
       for asset in assets:
         if self.re.search(r'LINUX_Ubuntu-20\.04\.AppImage', asset['name']):
-          latest_release_section += f'<li>Linux Ubuntu 20.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item linux">
+                    <div class="os-icon">🐧</div>
+                    <div class="download-details">
+                        <span class="os-name">Linux Ubuntu 20.04</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
         if self.re.search(r'LINUX_Ubuntu-22\.04\.AppImage', asset['name']):
-          latest_release_section += f'<li>Linux Ubuntu 22.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item linux">
+                    <div class="os-icon">🐧</div>
+                    <div class="download-details">
+                        <span class="os-name">Linux Ubuntu 22.04</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
         if self.re.search(r'LINUX_Ubuntu-24\.04\.AppImage', asset['name']):
-          latest_release_section += f'<li>Linux Ubuntu 24.04: {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item linux">
+                    <div class="os-icon">🐧</div>
+                    <div class="download-details">
+                        <span class="os-name">Linux Ubuntu 24.04</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
         if self.re.search(r'OSX-arm64\.zip', asset['name']):
-          latest_release_section += f'<li>macOS (Apple Silicon): {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
-        if self.re.search(r'WIN32\.zip', asset['name']):
-          latest_release_section += f'<li>Windows (ZIP): {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item macos">
+                    <div class="os-icon">🍎</div>
+                    <div class="download-details">
+                        <span class="os-name">macOS (Apple Silicon)</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
+        if self.re.search(r'Windows_msi\.zip', asset['name']):
+          latest_release_section += f'''
+                <div class="download-item windows">
+                    <div class="os-icon">🪟</div>
+                    <div class="download-details">
+                        <span class="os-name">Windows (ZIP)</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
         if self.re.search(r'Windows\.msi$', asset['name']):
-          latest_release_section += f'<li>Windows (MSI): {asset["size"] / (1024 * 1024):.2f} MB - <a href="{asset["browser_download_url"]}" class="download-btn">Download</a></li>'
+          latest_release_section += f'''
+                <div class="download-item windows">
+                    <div class="os-icon">🪟</div>
+                    <div class="download-details">
+                        <span class="os-name">Windows (MSI)</span>
+                        <span class="file-size">{asset["size"] / (1024 * 1024):.2f} MB</span>
+                        <a href="{asset["browser_download_url"]}" class="download-btn">Download</a>
+                    </div>
+                </div>'''
 
       latest_release_section += f"""
-              </ul>
+                      </div>
+                  </div>
+              </div>
           </div>
-      """
+        """
 
       html_content += latest_release_section
     except Exception as e:
@@ -751,44 +1170,53 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     # Step 7: Generate previous releases section
     try:
       previous_releases_section = """
-          <div class="previous-releases">
-              <h2>Previous Releases</h2>
-              <table id="previous-releases-table">
-                  <thead>
-                      <tr>
-                          <th>Release Info</th>
-                          <th>Date</th>
-                          <th>Linux</th>
-                          <th>Windows</th>
-                          <th>macOS</th>
-                      </tr>
-                  </thead>
-                  <tbody>
-      """
+            <div class="previous-releases">
+                <h2>Previous Releases</h2>
+                <div class="releases-container">
+        """
 
       for i, release in enumerate(releases[1:]):
         if release is None:
           continue
         try:
-          # Safely get commit message
-          commit_message = "No commit information available"
+          # Get release information with better fallbacks
+          commit_message = "No release information available"
           formatted_message = commit_message
-          
-          if release.get('commit_info') and release['commit_info'].get('commit'):
-            commit_message = release['commit_info']['commit'].get('message', commit_message)
             
-            if '\n' in commit_message:
-              lines = commit_message.strip().split('\n')
-              formatted_message = f"<div class='commit-title'>{lines[0]}</div>"
-              if len(lines) > 1:
-                formatted_message += "<ul class='commit-message'>"
-                for j, line in enumerate(lines[1:]):
-                  css_class = "visible" if j < 2 else "hidden"
-                  if line.strip().startswith('*'):
-                    formatted_message += f"<li class='{css_class}'>{line.strip()[1:].strip()}</li>"
-                  elif line.strip():
-                    formatted_message += f"<li class='{css_class}'>{line.strip()}</li>"
-                formatted_message += "</ul>"
+          # First try to use the release body
+          if release.get('body') and release['body'].strip():
+            commit_message = release['body'].strip()
+            self.P(f"{func_name}: Using release body for release {release['tag_name']}")
+          # Then try to use the commit message from commit_info
+          elif release.get('commit_info') and release['commit_info'].get('commit'):
+            commit_message = release['commit_info']['commit'].get('message', commit_message)
+            self.P(f"{func_name}: Using commit message for release {release['tag_name']}")
+          # Try to get the commit message directly from the tag
+          else:
+            tag_commit_message = self.get_commit_message_for_tag(release['tag_name'])
+            if tag_commit_message:
+              commit_message = tag_commit_message
+              self.P(f"{func_name}: Using commit message from tag for release {release['tag_name']}")
+            # Finally, use the release name or tag as a last resort
+            elif release.get('name') and release['name'].strip():
+              commit_message = f"Release {release['name']}"
+              self.P(f"{func_name}: Using release name for release {release['tag_name']}")
+            else:
+              commit_message = f"Release {release['tag_name']}"
+              self.P(f"{func_name}: Using tag name for release {release['tag_name']}")
+            
+          if '\n' in commit_message:
+            lines = commit_message.strip().split('\n')
+            formatted_message = f"<div class='commit-title'>{lines[0]}</div>"
+            if len(lines) > 1:
+              formatted_message += "<ul class='commit-message'>"
+              for j, line in enumerate(lines[1:]):
+                css_class = "visible" if j < 2 else "hidden"
+                if line.strip().startswith('*'):
+                  formatted_message += f"<li class='{css_class}'>{line.strip()[1:].strip()}</li>"
+                elif line.strip():
+                  formatted_message += f"<li class='{css_class}'>{line.strip()}</li>"
+              formatted_message += "</ul>"
             else:
               formatted_message = commit_message
 
@@ -796,53 +1224,105 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           visible_class = "visible" if (i < 2 or self.cfg_show_all_releases_by_default) else ""
           safe_tag_name = release['tag_name'].replace("'", "").replace('.', '-')
 
-          release_row = f"""
-                      <tr class="release-row {visible_class}" id="release-row-{i}">
-                          <td>
-                            {release['tag_name'].replace("'","")}
-                            <div style="margin-left: 1em;">
-                              <div id="release-info-{safe_tag_name}" class="commit-info">
-                                {formatted_message}
-                              </div>
-                              <button class="see-more-btn" onclick="toggleContent('release-info-{safe_tag_name}')">See More</button>
-                            </div>
-                          </td>
-
-                          <td>
-                            {self.datetime.strptime(release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}
-                          </td>
-
-                          <td>
-          """
           linux_20_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-20\.04\.AppImage', asset['name'])), None)
           linux_22_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-22\.04\.AppImage', asset['name'])), None)
           linux_24_04 = next((asset for asset in release.get('assets', []) if self.re.search(r'LINUX_Ubuntu-24\.04\.AppImage', asset['name'])), None)
-          win_zip = next((asset for asset in release.get('assets', []) if self.re.search(r'WIN32\.zip', asset['name'])), None)
+          win_zip = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows_msi\.zip', asset['name'])), None)
           win_msi = next((asset for asset in release.get('assets', []) if self.re.search(r'Windows\.msi$', asset['name'])), None)
           macos_arm = next((asset for asset in release.get('assets', []) if self.re.search(r'OSX-arm64\.zip', asset['name'])), None)
 
-          if linux_20_04:
-            release_row += f'Ubuntu 20.04: {linux_20_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_20_04["browser_download_url"]}" class="download-btn">Download</a><br>'
-          if linux_22_04:
-            release_row += f'Ubuntu 22.04: {linux_22_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_22_04["browser_download_url"]}" class="download-btn">Download</a><br>'
-          if linux_24_04:
-            release_row += f'Ubuntu 24.04: {linux_24_04["size"] / (1024 * 1024):.2f} MB - <a href="{linux_24_04["browser_download_url"]}" class="download-btn">Download</a>'
+          release_card = f"""
+                <div class="release-card {visible_class}" id="release-row-{i}">
+                    <div class="release-card-header">
+                        <h3>{release['tag_name'].replace("'","")}</h3>
+                        <span class="release-date">{self.datetime.strptime(release['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%B %d, %Y')}</span>
+                    </div>
+                    <div class="release-card-content">
+                        <div class="release-info">
+                            <div id="release-info-{safe_tag_name}" class="commit-info">
+                                {formatted_message}
+                            </div>
+                            <button id="btn-{safe_tag_name}" class="see-more-btn" onclick="toggleContent('release-info-{safe_tag_name}')" style="display: none;">
+                                <span class="see-more-text">See More</span>
+                                <span class="see-less-text">See Less</span>
+                            </button>
+                        </div>
+                        <div class="release-downloads">
+                            <div class="download-section">
+                                <h4>Linux</h4>
+                                <div class="download-list">
+            """
 
-          release_row += '</td><td>'
+          if linux_20_04:
+            release_card += f'''
+                                    <div class="download-item-small linux">
+                                        <span class="os-name">Ubuntu 20.04</span>
+                                        <span class="file-size">{linux_20_04["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{linux_20_04["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
+          if linux_22_04:
+            release_card += f'''
+                                    <div class="download-item-small linux">
+                                        <span class="os-name">Ubuntu 22.04</span>
+                                        <span class="file-size">{linux_22_04["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{linux_22_04["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
+          if linux_24_04:
+            release_card += f'''
+                                    <div class="download-item-small linux">
+                                        <span class="os-name">Ubuntu 24.04</span>
+                                        <span class="file-size">{linux_24_04["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{linux_24_04["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
+
+          release_card += """
+                                </div>
+                            </div>
+                            <div class="download-section">
+                                <h4>Windows</h4>
+                                <div class="download-list">
+            """
 
           if win_zip:
-            release_row += f'ZIP: {win_zip["size"] / (1024 * 1024):.2f} MB - <a href="{win_zip["browser_download_url"]}" class="download-btn">Download</a><br>'
+            release_card += f'''
+                                    <div class="download-item-small windows">
+                                        <span class="os-name">ZIP</span>
+                                        <span class="file-size">{win_zip["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{win_zip["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
           if win_msi:
-            release_row += f'MSI: {win_msi["size"] / (1024 * 1024):.2f} MB - <a href="{win_msi["browser_download_url"]}" class="download-btn">Download</a>'
-            
-          release_row += '</td><td>'
-          
+            release_card += f'''
+                                    <div class="download-item-small windows">
+                                        <span class="os-name">MSI</span>
+                                        <span class="file-size">{win_msi["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{win_msi["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
+
+          release_card += """
+                                </div>
+                            </div>
+                            <div class="download-section">
+                                <h4>macOS</h4>
+                                <div class="download-list">
+            """
+
           if macos_arm:
-            release_row += f'Apple Silicon: {macos_arm["size"] / (1024 * 1024):.2f} MB - <a href="{macos_arm["browser_download_url"]}" class="download-btn">Download</a>'
+            release_card += f'''
+                                    <div class="download-item-small macos">
+                                        <span class="os-name">Apple Silicon</span>
+                                        <span class="file-size">{macos_arm["size"] / (1024 * 1024):.2f} MB</span>
+                                        <a href="{macos_arm["browser_download_url"]}" class="download-btn-small">Download</a>
+                                    </div>'''
 
-          release_row += '</td></tr>'
+          release_card += """
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            """
 
-          previous_releases_section += release_row
+          previous_releases_section += release_card
         except Exception as e:
           error_msg = f"Failed to process release at index {i}: {str(e)}"
           self.log_error(func_name, error_msg, e)
@@ -850,74 +1330,111 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       # Update the Show/Hide button text based on default visibility setting
       show_all_button_text = "Show Less" if self.cfg_show_all_releases_by_default else "Show All Releases"
-      
+        
       previous_releases_section += f"""
-                  </tbody>
-              </table>
-              <button id="show-all-btn" class="show-all-btn" onclick="toggleAllReleases()">{show_all_button_text}</button>
-          </div>
-      </body>
-      <script>
-          function toggleContent(id) {{
-              const element = document.getElementById(id);
-              element.classList.toggle('expanded');
+                </div>
+                <button id="show-all-btn" class="show-all-btn" onclick="toggleAllReleases()">{show_all_button_text}</button>
+            </div>
+        </body>
+        <script>
+            // Check if content needs expansion and show button only if needed
+            function checkContentOverflow(contentId, buttonId) {{
+                const content = document.getElementById(contentId);
+                const button = document.getElementById(buttonId);
+                
+                if (!content || !button) return;
+                
+                // For pre elements (latest release)
+                if (content.tagName === 'PRE') {{
+                    // Only show button if content is taller than default height or has multiple paragraphs
+                    if (content.scrollHeight > content.clientHeight || content.textContent.split('\\n').length > 4) {{
+                        button.style.display = 'block';
+                    }}
+                }}
+                // For div elements with commit info (previous releases)
+                else {{
+                    // Check if there are hidden list items or if content is overflowing
+                    const hasHiddenItems = content.querySelectorAll('li.hidden').length > 0;
+                    const isOverflowing = content.scrollHeight > content.clientHeight;
+                    const hasManyParagraphs = content.textContent.split('\\n').length > 3;
+                    
+                    if (hasHiddenItems || isOverflowing || hasManyParagraphs) {{
+                        button.style.display = 'block';
+                    }}
+                }}
+            }}
+            
+            function toggleContent(id) {{
+                const element = document.getElementById(id);
+                const buttonId = id === 'latest-release-info' ? 'latest-release-btn' : 'btn-' + id.replace('release-info-', '');
+                const button = document.getElementById(buttonId);
+                
+                element.classList.toggle('expanded');
+                if (button) button.classList.toggle('expanded');
+                
+                // Show all list items when expanded
+                if (element.classList.contains('expanded')) {{
+                    const listItems = element.querySelectorAll('li');
+                    listItems.forEach(item => {{
+                        item.classList.add('visible');
+                        item.classList.remove('hidden');
+                    }});
+                }} else {{
+                    // Hide items beyond the first 2 when collapsed
+                    const listItems = element.querySelectorAll('li');
+                    listItems.forEach((item, index) => {{
+                        if (index >= 2) {{
+                            item.classList.add('hidden');
+                            item.classList.remove('visible');
+                        }}
+                    }});
+                }}
+            }}
 
-              const button = element.nextElementSibling;
-              if (element.classList.contains('expanded')) {{
-                  button.textContent = 'See Less';
-                  // Show all list items when expanded
-                  const listItems = element.querySelectorAll('li');
-                  listItems.forEach(item => {{
-                      item.classList.add('visible');
-                      item.classList.remove('hidden');
-                  }});
-              }} else {{
-                  button.textContent = 'See More';
-                  // Hide items beyond the first 2 when collapsed
-                  const listItems = element.querySelectorAll('li');
-                  listItems.forEach((item, index) => {{
-                      if (index >= 2) {{
-                          item.classList.add('hidden');
-                          item.classList.remove('visible');
-                      }}
-                  }});
-              }}
-          }}
+            function toggleAllReleases() {{
+                const button = document.getElementById('show-all-btn');
+                const rows = document.querySelectorAll('.release-card');
+                const hiddenRows = document.querySelectorAll('.release-card:not(.visible)');
 
-          function toggleAllReleases() {{
-              const button = document.getElementById('show-all-btn');
-              const rows = document.querySelectorAll('.release-row');
-              const hiddenRows = document.querySelectorAll('.release-row:not(.visible)');
+                if (hiddenRows.length > 0) {{
+                    rows.forEach(row => row.classList.add('visible'));
+                    button.textContent = 'Show Less';
+                }} else {{
+                    rows.forEach((row, index) => {{
+                        if (index >= 2) {{
+                            row.classList.remove('visible');
+                        }}
+                    }});
+                    button.textContent = 'Show All Releases';
+                }}
+            }}
 
-              if (hiddenRows.length > 0) {{
-                  rows.forEach(row => row.classList.add('visible'));
-                  button.textContent = 'Show Less';
-              }} else {{
-                  rows.forEach((row, index) => {{
-                      if (index >= 2) {{
-                          row.classList.remove('visible');
-                      }}
-                  }});
-                  button.textContent = 'Show All Releases';
-              }}
-          }}
-
-          // Initialize to hide list items beyond the first 2 on page load
-          document.addEventListener('DOMContentLoaded', function() {{
-              const commitInfos = document.querySelectorAll('.commit-info');
-              commitInfos.forEach(info => {{
-                  const listItems = info.querySelectorAll('li');
-                  listItems.forEach((item, index) => {{
-                      if (index >= 2) {{
-                          item.classList.add('hidden');
-                      }} else {{
-                          item.classList.add('visible');
-                      }}
-                  }});
-              }});
-          }});
-      </script>
-      </html>
+            // Initialize on page load
+            document.addEventListener('DOMContentLoaded', function() {{
+                // Initialize latest release
+                checkContentOverflow('latest-release-info', 'latest-release-btn');
+                
+                // Initialize previous releases
+                const commitInfos = document.querySelectorAll('.commit-info');
+                commitInfos.forEach(info => {{
+                    // Process list items
+                    const listItems = info.querySelectorAll('li');
+                    listItems.forEach((item, index) => {{
+                        if (index >= 2) {{
+                            item.classList.add('hidden');
+                        }} else {{
+                            item.classList.add('visible');
+                        }}
+                    }});
+                    
+                    // Check if button should be shown
+                    const infoId = info.id;
+                    const btnId = 'btn-' + infoId.replace('release-info-', '');
+                    checkContentOverflow(infoId, btnId);
+                }});
+            }});
+        </script>
+        </html>
       """
 
       html_content += previous_releases_section
@@ -988,11 +1505,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if (self.time() - self.__last_generation_time) > self.cfg_regeneration_interval:
         self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
         
-        # Check if an HTML file already exists before attempting regeneration
+        # Check if HTML file already exists
         web_server_path = self.get_web_server_path()
         output_path = self.os_path.join(web_server_path, 'assets/releases.html')
         file_exists = self.os_path.isfile(output_path)
-        
+        self.P(f"Output Path: {output_path} | file_exists: {file_exists}")
         # Attempt to regenerate the HTML
         result = self._regenerate_index_html()
         
