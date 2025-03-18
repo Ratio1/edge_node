@@ -11,7 +11,9 @@ NaeuralReleaseAppPlugin
 """
 import traceback
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, NamedTuple
+from dataclasses import dataclass
+from functools import lru_cache
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
@@ -30,7 +32,7 @@ _CONFIG = {
       }
     ]
   },
-  'NR_PREVIOUS_RELEASES': 10,
+  'NR_PREVIOUS_RELEASES': 5,
   'REGENERATION_INTERVAL': 10*60,
   "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
   'VALIDATION_RULES': {
@@ -38,7 +40,210 @@ _CONFIG = {
   },
   'DEBUG_MODE': False,  # Enable detailed error reporting
   'SHOW_ALL_RELEASES_BY_DEFAULT': False,
+  'GITHUB_API_TIMEOUT': 30,  # Timeout for GitHub API requests in seconds
+  'MAX_RETRIES': 3,  # Maximum number of retries for failed API requests
 }
+
+@dataclass
+class GitHubReleaseData:
+    """Data class for GitHub release information."""
+    tag_name: str
+    published_at: str
+    body: str
+    assets: List[Dict[str, Any]]
+    commit_sha: Optional[str] = None
+    commit_info: Optional[Dict[str, Any]] = None
+    tag_info: Optional[Dict[str, Any]] = None
+
+class GitHubApiError(Exception):
+    """Exception raised for GitHub API errors."""
+    def __init__(self, message: str, status_code: Optional[int] = None, is_rate_limit: bool = False):
+        self.status_code = status_code
+        self.is_rate_limit = is_rate_limit
+        super().__init__(message)
+
+class ReleaseDataFetcher:
+    """Class responsible for fetching release data from GitHub."""
+    
+    def __init__(self, config: Dict[str, Any], logger: Any):
+        """
+        Initialize the fetcher.
+        
+        Parameters
+        ----------
+        config : Dict[str, Any]
+            Configuration dictionary
+        logger : Any
+            Logger object that implements P() method
+        """
+        self.config = config
+        self.logger = logger
+        self.requests = logger.requests  # Using the same requests session as the plugin
+        
+    def _log(self, message: str) -> None:
+        """Log a message using the logger."""
+        self.logger.P(f"ReleaseDataFetcher: {message}")
+        
+    def _check_rate_limit(self, response: Any) -> None:
+        """
+        Check if the response indicates rate limiting.
+        
+        Raises
+        ------
+        GitHubApiError
+            If rate limit is reached
+        """
+        if response.status_code == 403 and 'rate limit' in response.text.lower():
+            raise GitHubApiError(
+                f"GitHub API rate limit reached: {response.text}",
+                status_code=403,
+                is_rate_limit=True
+            )
+            
+    def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+        """
+        Make a request to GitHub API with retries and error handling.
+        
+        Parameters
+        ----------
+        url : str
+            API endpoint URL
+        params : Optional[Dict[str, Any]]
+            Query parameters
+            
+        Returns
+        -------
+        Any
+            JSON response from the API
+            
+        Raises
+        ------
+        GitHubApiError
+            If the request fails
+        """
+        retries = 0
+        while retries < self.config['MAX_RETRIES']:
+            try:
+                self._log(f"Making request to: {url}")
+                response = self.requests.get(
+                    url,
+                    params=params,
+                    timeout=self.config['GITHUB_API_TIMEOUT']
+                )
+                
+                self._check_rate_limit(response)
+                
+                if response.status_code == 200:
+                    return response.json()
+                    
+                if response.status_code == 404:
+                    raise GitHubApiError(
+                        f"Resource not found: {url}",
+                        status_code=404
+                    )
+                    
+                raise GitHubApiError(
+                    f"GitHub API request failed: {response.text}",
+                    status_code=response.status_code
+                )
+                
+            except Exception as e:
+                retries += 1
+                if retries >= self.config['MAX_RETRIES']:
+                    raise GitHubApiError(f"Failed after {retries} retries: {str(e)}")
+                self._log(f"Request failed, retrying ({retries}/{self.config['MAX_RETRIES']}): {str(e)}")
+                
+    def get_all_releases(self) -> List[Dict[str, Any]]:
+        """
+        Fetch all releases from GitHub.
+        
+        Returns
+        -------
+        List[Dict[str, Any]]
+            List of all releases
+        """
+        url = f"{self.config['RELEASES_REPO_URL']}/releases"
+        return self._make_request(url, params={"per_page": 100})
+        
+    def get_release_details(self, release_id: str) -> GitHubReleaseData:
+        """
+        Fetch detailed information for a specific release.
+        
+        Parameters
+        ----------
+        release_id : str
+            Release identifier (tag name)
+            
+        Returns
+        -------
+        GitHubReleaseData
+            Detailed release information
+        """
+        # Fetch release information
+        release_url = f"{self.config['RELEASES_REPO_URL']}/releases/tags/{release_id}"
+        release_data = self._make_request(release_url)
+        
+        # Fetch tag information
+        tag_url = f"{self.config['RELEASES_REPO_URL']}/git/refs/tags/{release_id}"
+        try:
+            tag_data = self._make_request(tag_url)
+        except GitHubApiError as e:
+            self._log(f"Failed to fetch tag data: {str(e)}")
+            tag_data = None
+            
+        # Get commit SHA from tag or release
+        commit_sha = None
+        if tag_data:
+            if tag_data['object']['type'] == 'tag':
+                # Annotated tag - fetch the tag object
+                tag_object = self._make_request(tag_data['object']['url'])
+                commit_sha = tag_object['object']['sha']
+            else:
+                # Lightweight tag
+                commit_sha = tag_data['object']['sha']
+                
+        # Fetch commit information if we have SHA
+        commit_info = None
+        if commit_sha:
+            try:
+                commit_url = f"{self.config['RELEASES_REPO_URL']}/commits/{commit_sha}"
+                commit_info = self._make_request(commit_url)
+            except GitHubApiError as e:
+                self._log(f"Failed to fetch commit info: {str(e)}")
+                
+        return GitHubReleaseData(
+            tag_name=release_data['tag_name'],
+            published_at=release_data['published_at'],
+            body=release_data.get('body', ''),
+            assets=release_data.get('assets', []),
+            commit_sha=commit_sha,
+            commit_info=commit_info,
+            tag_info=tag_data
+        )
+        
+    @lru_cache(maxsize=100)
+    def get_commit_message(self, commit_sha: str) -> Optional[str]:
+        """
+        Fetch commit message for a specific commit SHA.
+        Results are cached to avoid redundant API calls.
+        
+        Parameters
+        ----------
+        commit_sha : str
+            Commit SHA
+            
+        Returns
+        -------
+        Optional[str]
+            Commit message if available
+        """
+        try:
+            commit_url = f"{self.config['RELEASES_REPO_URL']}/commits/{commit_sha}"
+            commit_data = self._make_request(commit_url)
+            return commit_data['commit']['message']
+        except GitHubApiError as e:
+            self._log(f"Failed to fetch commit message: {str(e)}")
+            return None
 
 class NaeuralReleaseAppPlugin(BasePlugin):
   """
@@ -54,21 +259,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   on_init(**kwargs)
     Initializes the plugin and sets up state.
   get_latest_releases()
-    Fetches the latest releases from the GitHub repository.
-  get_latest_tags()
-    Fetches the latest tags from the GitHub repository.
-  get_commit_info(commit_sha)
-    Fetches commit information for a given commit SHA.
-  get_release_by_tag(tag_name)
-    Fetches information for a specific release by its tag name.
-  compile_release_info(releases, tags)
-    Associates commit information with each release record.
-  check_for_rate_limit(response, raise_exception=True)
-    Checks API responses for GitHub rate limit warnings.
-  _generate_fallback_html(error_message)
-    Generates a fallback HTML page when GitHub API issues occur.
-  _generate_fallback_html_and_save(error_message)
-    Generates and saves a fallback HTML page.
+    Fetches and processes the latest releases from GitHub.
+  compile_release_info(releases)
+    Processes releases into the format expected by the UI.
   _regenerate_index_html()
     Regenerates the releases.html file with updated release info.
   _maybe_regenerate_index_html()
@@ -80,14 +273,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   CONFIG = _CONFIG
 
   def on_init(self, **kwargs):
-    """
-    Initialize the plugin, setting last regeneration times and creating helpers.
-    """
+    """Initialize the plugin, setting last regeneration times and creating helpers."""
     super(NaeuralReleaseAppPlugin, self).on_init(**kwargs)
     self._last_day_regenerated = (self.datetime.now() - self.timedelta(days=1)).day
     self.__last_generation_time = 0
     self.html_generator = HtmlGenerator(self.CONFIG, self)
     self.data_processor = ReleaseDataProcessor(self)
+    self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self)
     return
 
   def log_error(self, func_name, error_msg, exc_info=None):
@@ -112,350 +304,99 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
   def get_latest_releases(self):
     """
-    Fetch the latest releases from GitHub, up to NR_PREVIOUS_RELEASES + 1.
-
+    Fetch and process release information.
+    
     Returns
     -------
     tuple
-      A tuple containing (releases_list, error_data) where:
-      - releases_list is a list of JSON objects corresponding to recent GitHub releases
-      - error_data is a dict with 'message' and 'rate_limited' keys or None if no error
+        A tuple containing (releases_list, error_data) where:
+        - releases_list is a list of processed releases with all required information
+        - error_data is None on success, or a dict with error details on failure
     """
     func_name = "get_latest_releases"
     try:
-      releases_url = f"{self.cfg_releases_repo_url}/releases"
-      self.P(f"{func_name}: Requesting releases from: {releases_url}")
+      # Fetch all releases first
+      all_releases = self.release_fetcher.get_all_releases()
+      if not all_releases:
+        return [], {'message': "No releases found", 'rate_limited': False}
       
-      # Use a higher per_page value to ensure we get all the releases we need
-      response = self.requests.get(releases_url,
-                                   params={"per_page": 100})
+      # Process the releases
+      processed_releases = self.compile_release_info(all_releases)
+      return processed_releases, None
       
-      if response.status_code != 200:
-        error_msg = f"Failed to fetch releases. Status code: {response.status_code}, Response: {response.text}"
-        self.log_error(func_name, error_msg)
-        # Return error data with information about rate limiting
-        is_rate_limited = response.status_code == 403 and 'rate limit' in response.text.lower()
-        return [], {'message': error_msg, 'rate_limited': is_rate_limited, 'response': response}
-        
-      releases = response.json()
-      self.check_for_rate_limit(releases)
-      self.P(f"{func_name}: Successfully fetched {len(releases)} releases")
-      
-      # Debug: Print full release data for inspection
-      for i, release in enumerate(releases):
-        self.P(f"{func_name}: Release {i} - Tag: {release.get('tag_name', 'Unknown')}")
-        self.P(f"{func_name}: Release {i} - Has body: {bool(release.get('body'))}")
-        if release.get('body'):
-          self.P(f"{func_name}: Release {i} - Body preview: {release.get('body')[:100]}...")
-        self.P(f"{func_name}: Release {i} - Keys: {sorted(release.keys())}")
-      
-      return releases, None
-    except Exception as e:
+    except GitHubApiError as e:
       error_msg = f"Failed to fetch releases: {str(e)}"
+      self.log_error(func_name, error_msg)
+      return [], {'message': error_msg, 'rate_limited': e.is_rate_limit}
+      
+    except Exception as e:
+      error_msg = f"Unexpected error while fetching releases: {str(e)}"
       self.log_error(func_name, error_msg, e)
-      # Check if the exception indicates rate limiting
-      if "rate limit" in str(e).lower():
-        error_msg = f"GitHub API rate limit exceeded during release fetching: {str(e)}"
-        return [], {'message': error_msg, 'rate_limited': True}
       return [], {'message': error_msg, 'rate_limited': False}
 
-  def get_latest_tags(self):
+  def compile_release_info(self, releases):
     """
-    Fetch the latest tags from GitHub, up to NR_PREVIOUS_RELEASES + 1.
-
-    Returns
-    -------
-    tuple
-      A tuple containing (tags_list, error_data) where:
-      - tags_list is a list of JSON objects corresponding to recent GitHub tags
-      - error_data is a dict with 'message' and 'rate_limited' keys or None if no error
-    """
-    func_name = "get_latest_tags"
-    try:
-      tags_url = f"{self.cfg_releases_repo_url}/tags"
-      self.P(f"{func_name}: Requesting tags from: {tags_url}")
-      response = self.requests.get(tags_url,
-                                   params={"per_page": self.cfg_nr_previous_releases + 1})
-      
-      if response.status_code != 200:
-        error_msg = f"Failed to fetch tags. Status code: {response.status_code}, Response: {response.text}"
-        self.log_error(func_name, error_msg)
-        # Return error data with information about rate limiting
-        is_rate_limited = response.status_code == 403 and 'rate limit' in response.text.lower()
-        return [], {'message': error_msg, 'rate_limited': is_rate_limited, 'response': response}
-        
-      tags = response.json()
-      self.check_for_rate_limit(tags)
-      self.P(f"{func_name}: Successfully fetched {len(tags)} tags")
-      return tags, None
-    except Exception as e:
-      error_msg = f"Failed to fetch tags: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      # Check if the exception indicates rate limiting
-      if "rate limit" in str(e).lower():
-        error_msg = f"GitHub API rate limit exceeded during tag fetching: {str(e)}"
-        return [], {'message': error_msg, 'rate_limited': True}
-      return [], {'message': error_msg, 'rate_limited': False}
-
-  def get_commit_info(self, commit_sha):
-    """
-    Fetch commit information for a given commit SHA from GitHub.
-
-    Parameters
-    ----------
-    commit_sha : str
-      The commit SHA for which to fetch information.
-
-    Returns
-    -------
-    dict
-      JSON object with information about the specified commit.
-    """
-    func_name = f"get_commit_info({commit_sha})"
-    try:
-      commit_url = f"{self.cfg_releases_repo_url}/commits/{commit_sha}"
-      self.P(f"{func_name}: Requesting commit info from: {commit_url}")
-      response = self.requests.get(commit_url)
-      
-      if response.status_code != 200:
-        error_msg = f"Failed to fetch commit info. Status code: {response.status_code}, Response: {response.text}"
-        self.log_error(func_name, error_msg)
-        return None
-        
-      commit_info = response.json()
-      self.check_for_rate_limit(commit_info)
-      return commit_info
-    except Exception as e:
-      error_msg = f"Failed to fetch commit info: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      return None
-
-  def get_release_by_tag(self, tag_name):
-    """
-    Fetch information for a specific release by its tag name.
+    Process releases into the format expected by the UI.
     
-    Parameters
-    ----------
-    tag_name : str
-      The tag name of the release to fetch.
-      
-    Returns
-    -------
-    dict
-      JSON object with information about the specified release, or None if not found.
-    """
-    func_name = f"get_release_by_tag({tag_name})"
-    try:
-      release_url = f"{self.cfg_releases_repo_url}/releases/tags/{tag_name}"
-      self.P(f"{func_name}: Requesting specific release from: {release_url}")
-      response = self.requests.get(release_url)
-      
-      if response.status_code != 200:
-        error_msg = f"Failed to fetch release. Status code: {response.status_code}, Response: {response.text}"
-        self.log_error(func_name, error_msg)
-        return None
-        
-      release_info = response.json()
-      self.check_for_rate_limit(release_info)
-      self.P(f"{func_name}: Successfully fetched release for tag {tag_name}")
-      return release_info
-    except Exception as e:
-      error_msg = f"Failed to fetch release: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      return None
-
-  def get_commit_message_for_tag(self, tag_name):
-    """
-    Fetch the commit message for a specific tag.
-    
-    Parameters
-    ----------
-    tag_name : str
-      The tag name to fetch the commit message for.
-      
-    Returns
-    -------
-    str
-      The commit message for the tag, or None if not found.
-    """
-    func_name = f"get_commit_message_for_tag({tag_name})"
-    try:
-      # First get the tag to find the commit SHA
-      tag_url = f"{self.cfg_releases_repo_url}/git/refs/tags/{tag_name}"
-      self.P(f"{func_name}: Requesting tag reference from: {tag_url}")
-      tag_response = self.requests.get(tag_url)
-      
-      if tag_response.status_code != 200:
-        error_msg = f"Failed to fetch tag reference. Status code: {tag_response.status_code}, Response: {tag_response.text}"
-        self.log_error(func_name, error_msg)
-        return None
-        
-      tag_data = tag_response.json()
-      self.check_for_rate_limit(tag_data)
-      
-      # Get the object type and SHA
-      if tag_data.get('object', {}).get('type') == 'tag':
-        # This is an annotated tag, we need to get the tag object first
-        tag_object_url = tag_data['object']['url']
-        self.P(f"{func_name}: Requesting annotated tag object from: {tag_object_url}")
-        tag_object_response = self.requests.get(tag_object_url)
-        
-        if tag_object_response.status_code != 200:
-          error_msg = f"Failed to fetch tag object. Status code: {tag_object_response.status_code}, Response: {tag_object_response.text}"
-          self.log_error(func_name, error_msg)
-          return None
-          
-        tag_object_data = tag_object_response.json()
-        self.check_for_rate_limit(tag_object_data)
-        
-        # Get the commit SHA from the tag object
-        commit_sha = tag_object_data.get('object', {}).get('sha')
-      else:
-        # This is a lightweight tag, we can use the SHA directly
-        commit_sha = tag_data.get('object', {}).get('sha')
-      
-      if not commit_sha:
-        error_msg = f"Could not find commit SHA for tag {tag_name}"
-        self.log_error(func_name, error_msg)
-        return None
-      
-      # Now get the commit information
-      commit_url = f"{self.cfg_releases_repo_url}/commits/{commit_sha}"
-      self.P(f"{func_name}: Requesting commit information from: {commit_url}")
-      commit_response = self.requests.get(commit_url)
-      
-      if commit_response.status_code != 200:
-        error_msg = f"Failed to fetch commit information. Status code: {commit_response.status_code}, Response: {commit_response.text}"
-        self.log_error(func_name, error_msg)
-        return None
-        
-      commit_data = commit_response.json()
-      self.check_for_rate_limit(commit_data)
-      
-      # Extract the commit message
-      commit_message = commit_data.get('commit', {}).get('message')
-      if commit_message:
-        self.P(f"{func_name}: Successfully retrieved commit message for tag {tag_name}")
-        return commit_message
-      else:
-        error_msg = f"No commit message found for tag {tag_name}"
-        self.log_error(func_name, error_msg)
-        return None
-    except Exception as e:
-      error_msg = f"Failed to fetch commit message for tag {tag_name}: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      return None
-
-  def check_for_rate_limit(self, response, raise_exception=True):
-    """
-    Checks the response body for GitHub rate limit messages.
-
-    Parameters
-    ----------
-    response : dict
-      The response JSON to check.
-    raise_exception : bool, optional
-      Whether to raise an exception if the rate limit is reached.
-
-    Returns
-    -------
-    bool
-      True if rate limit is reached, otherwise False.
-    """
-    func_name = "check_for_rate_limit"
-    result = False
-    if isinstance(response, dict) and 'message' in response:
-      if 'rate limit' in response['message']:
-        msg = f"GitHub API rate limit reached! Details: {response.get('message')}"
-        if raise_exception:
-          self.log_error(func_name, msg)
-          raise Exception(msg)
-        self.P(msg)
-        result = True
-    return result
-
-  def compile_release_info(self, releases, tags):
-    """
-    Sorts releases by publish date, trims to NR_PREVIOUS_RELEASES,
-    and augments each with commit info if available.
-
     Parameters
     ----------
     releases : list
-      A list of release JSON objects.
-    tags : list
-      A list of tag JSON objects.
-
+        List of basic release information from GitHub API
+        
     Returns
     -------
     list
-      The updated list of release objects, each including a 'commit_info' key.
+        List of processed releases with all required information
     """
     func_name = "compile_release_info"
     if not releases:
-      self.log_error(func_name, "No releases provided")
-      return []
-    
+        self.log_error(func_name, "No releases provided")
+        return []
+        
     try:
-      # Create a dictionary of tags for faster lookup
-      tags_dict = {tag['name'].strip("'"): tag for tag in tags} if tags else {}
-      
-      releases.sort(key=lambda x: x['published_at'], reverse=True)
-      releases = releases[:self.cfg_nr_previous_releases]
-      
-      for i, release in enumerate(releases):
-        try:
-          release_tag = release['tag_name'].strip("'")
-          self.P(f"{func_name}: Processing release {i} - Tag: {release_tag}")
-          
-          # If the release doesn't have a body, try to fetch it directly
-          if not release.get('body') or not release['body'].strip():
-            self.P(f"{func_name}: Release {release_tag} has no body, trying to fetch directly")
-            specific_release = self.get_release_by_tag(release_tag)
-            if specific_release and specific_release.get('body') and specific_release['body'].strip():
-              release['body'] = specific_release['body']
-              self.P(f"{func_name}: Successfully fetched body for release {release_tag}")
-            else:
-              # If still no body, try to get the commit message for the tag
-              self.P(f"{func_name}: No body found for release {release_tag}, trying to get commit message")
-              commit_message = self.get_commit_message_for_tag(release_tag)
-              if commit_message:
-                release['body'] = commit_message
-                self.P(f"{func_name}: Successfully fetched commit message for release {release_tag}")
-          
-          # Get tag from dictionary instead of searching through the list
-          tag = tags_dict.get(release_tag)
-          if tag:
+        # Sort releases by publication date and take only the required number
+        releases.sort(key=lambda x: x['published_at'], reverse=True)
+        releases = releases[:self.cfg_nr_previous_releases]
+        
+        processed_releases = []
+        for release in releases:
             try:
-              commit_info = self.get_commit_info(tag['commit']['sha'])
-              self.check_for_rate_limit(commit_info)
-              release['commit_info'] = commit_info
-              self.P(f"{func_name}: Added commit info for release {release_tag}")
-            except Exception as e:
-              error_msg = f"Failed to get commit info for release {release_tag}, index {i}: {str(e)}"
-              self.log_error(func_name, error_msg, e)
-              if i > 1:
-                return releases
-              release['commit_info'] = None
-          else:
-            self.P(f"{func_name}: Warning - No matching tag found for release {release_tag}")
-            release['commit_info'] = None
-            
-          # Debug: Print release information after processing
-          self.P(f"{func_name}: Release {i} after processing - Tag: {release_tag}")
-          self.P(f"{func_name}: Release {i} - Has body: {bool(release.get('body'))}")
-          if release.get('body'):
-            self.P(f"{func_name}: Release {i} - Body preview: {release.get('body')[:100]}...")
-          self.P(f"{func_name}: Release {i} - Has commit_info: {bool(release.get('commit_info'))}")
-        except Exception as e:
-          error_msg = f"Failed to process release at index {i}: {str(e)}"
-          self.log_error(func_name, error_msg, e)
-          release['commit_info'] = None
-      return releases
+                # Fetch detailed release information
+                release_data = self.release_fetcher.get_release_details(release['tag_name'])
+                
+                # If the release doesn't have a body, try to get commit message
+                if not release_data.body.strip() and release_data.commit_sha:
+                    commit_message = self.release_fetcher.get_commit_message(release_data.commit_sha)
+                    if commit_message:
+                        release_data.body = commit_message
+                
+                # Convert to the format expected by the UI
+                processed_release = {
+                    'tag_name': release_data.tag_name,
+                    'published_at': release_data.published_at,
+                    'body': release_data.body,
+                    'assets': release_data.assets,
+                    'commit_info': release_data.commit_info
+                }
+                
+                processed_releases.append(processed_release)
+                self.P(f"{func_name}: Successfully processed release {release_data.tag_name}")
+                
+            except GitHubApiError as e:
+                self.log_error(func_name, f"Failed to process release {release.get('tag_name', 'unknown')}: {str(e)}")
+                if e.is_rate_limit:
+                    # If we hit rate limit, return what we have so far
+                    return processed_releases
+                # For other errors, continue processing remaining releases
+                continue
+                    
+        return processed_releases
+        
     except Exception as e:
-      error_msg = f"Failed to compile release info: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      return releases[:1] if releases else []
+        error_msg = f"Failed to compile release info: {str(e)}"
+        self.log_error(func_name, error_msg, e)
+        # Return the first release if available, otherwise empty list
+        return processed_releases[:1] if processed_releases else []
 
   def _regenerate_index_html(self):
     """
@@ -486,36 +427,23 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.log_error(func_name, error_message, e)
       return False
     
-    # Step 2: Fetch tags
-    raw_tags = []
+    # Step 2: Compile release information
     try:
-      raw_tags, tag_error = self.get_latest_tags()
-      if not raw_tags and tag_error and tag_error.get('rate_limited', False):
-        error_message = tag_error.get('message', "Failed to get any tags")
-        self.log_error(func_name, error_message)
-        return False
-    except Exception as e:
-      error_message = f"Failed during tag fetching: {str(e)}"
-      self.log_error(func_name, error_message, e)
-      return False
-    
-    # Step 3: Compile release information
-    try:
-      raw_releases_with_commits = self.compile_release_info(raw_releases, raw_tags)
+      raw_releases_with_commits = self.compile_release_info(raw_releases)
       if not raw_releases_with_commits:
         error_message = "Failed to compile any release information"
         self.log_error(func_name, error_message)
         return False
           
       # Convert raw releases to ReleaseInfo objects
-      releases = self.data_processor.process_releases(raw_releases_with_commits, raw_tags)
+      releases = self.data_processor.process_releases(raw_releases_with_commits, [])
         
     except Exception as e:
       error_msg = f"Failed during release compilation: {str(e)}"
       self.log_error(func_name, error_msg, e)
       return False
     
-    # Step 4: Generate HTML
+    # Step 3: Generate HTML
     try:
       html_content = self.html_generator.generate_complete_html(
           releases=releases,
