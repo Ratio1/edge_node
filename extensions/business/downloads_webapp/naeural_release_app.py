@@ -362,8 +362,12 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       return []
     
     try:
+      # Create a dictionary of tags for faster lookup
+      tags_dict = {tag['name'].strip("'"): tag for tag in tags} if tags else {}
+      
       releases.sort(key=lambda x: x['published_at'], reverse=True)
       releases = releases[:self.cfg_nr_previous_releases]
+      
       for i, release in enumerate(releases):
         try:
           release_tag = release['tag_name'].strip("'")
@@ -384,7 +388,8 @@ class NaeuralReleaseAppPlugin(BasePlugin):
                 release['body'] = commit_message
                 self.P(f"{func_name}: Successfully fetched commit message for release {release_tag}")
           
-          tag = next((tag for tag in tags if tag['name'].strip("'") == release_tag), None)
+          # Get tag from dictionary instead of searching through the list
+          tag = tags_dict.get(release_tag)
           if tag:
             try:
               commit_info = self.get_commit_info(tag['commit']['sha'])
@@ -608,29 +613,24 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           return self._generate_fallback_html_and_save(error_message)
       return False
     
-    # Step 2: Fetch tags
+    # Step 2: Fetch tags - even if we don't have new releases, we might have cached data
+    raw_tags = []
     try:
+      # We fetch tags regardless of whether we have new releases
+      # This allows us to use cached or previously fetched release data
       raw_tags, tag_error = self.get_latest_tags()
-      if not raw_tags:
-        # Use the error information returned from get_latest_tags instead of making a redundant API call
-        if tag_error:
-          rate_limited = tag_error.get('rate_limited', False)
-          error_message = tag_error.get('message', "Failed to get any tags")
+      if not raw_tags and tag_error and tag_error.get('rate_limited', False):
+        rate_limited = True
+        error_message = tag_error.get('message', "Failed to get any tags")
+        self.log_error(func_name, error_message)
+        if file_exists:
+          self.P(f"{func_name}: Rate limit exceeded during tag fetching, but existing HTML file was preserved")
+          return False
         else:
-          error_message = "Failed to get any tags, proceeding with limited information"
-        
-        if rate_limited:
-          self.log_error(func_name, error_message)
-          if file_exists:
-            self.P(f"{func_name}: Rate limit exceeded during tag fetching, but existing HTML file was preserved")
-            return False
-          else:
-            return self._generate_fallback_html_and_save(error_message)
-        else:
-          # Just log a warning but continue with empty tags
-          self.log_error(func_name, error_message)
-          # We continue anyway, as we can still generate some HTML with just releases
-      
+          return self._generate_fallback_html_and_save(error_message)
+      elif not raw_tags:
+        # Just log a warning but continue with empty tags
+        self.log_error(func_name, "Failed to get any tags, proceeding with limited information")
     except Exception as e:
       error_message = f"Failed during tag fetching: {str(e)}"
       self.log_error(func_name, error_message, e)
@@ -644,8 +644,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           return False
         else:
           return self._generate_fallback_html_and_save(error_message)
-      
-      raw_tags = []
     
     # Step 3: Compile release information
     try:
@@ -659,8 +657,8 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         else:
           return self._generate_fallback_html_and_save(error_message)
     except Exception as e:
-      error_message = f"Failed during release compilation: {str(e)}"
-      self.log_error(func_name, error_message, e)
+      error_msg = f"Failed during release compilation: {str(e)}"
+      self.log_error(func_name, error_msg, e)
       
       # Check if it's a rate limit exception
       if "rate limit" in str(e).lower():
@@ -1520,34 +1518,27 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     """
     func_name = "_maybe_regenerate_index_html"
     try:
-      current_day = self.datetime.now().day
-      if (self.time() - self.__last_generation_time) > self.cfg_regeneration_interval:
+      current_time = self.time()
+
+      # Only regenerate if enough time has passed since last generation
+      if (current_time - self.__last_generation_time) > self.cfg_regeneration_interval:
         self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
-        
-        # Check if HTML file already exists
-        web_server_path = self.get_web_server_path()
-        output_path = self.os_path.join(web_server_path, 'assets/releases.html')
-        file_exists = self.os_path.isfile(output_path)
-        self.P(f"Output Path: {output_path} | file_exists: {file_exists}")
+
         # Attempt to regenerate the HTML
         result = self._regenerate_index_html()
-        
+        current_day = self.datetime.now().day
+
         if result:
           # Successful regeneration
           self._last_day_regenerated = current_day
-          self.__last_generation_time = self.time()
+          self.__last_generation_time = current_time
           self.P(f"{func_name}: HTML regeneration successful")
         else:
-          # Failed regeneration
-          if file_exists:
-            # If file already exists, keep it and don't overwrite with fallback
-            self.P(f"{func_name}: HTML regeneration failed but existing file was preserved")
-          else:
-            # If no file exists, the fallback page was likely generated in _regenerate_index_html
-            self.P(f"{func_name}: HTML regeneration failed and fallback page was generated")
-          
+          # Failed regeneration - _regenerate_index_html already handles the file_exists check
+          self.P(f"{func_name}: HTML regeneration failed, but _regenerate_index_html handled fallback")
+
           # Update the generation time anyway to avoid constant retries when failing
-          self.__last_generation_time = self.time()
+          self.__last_generation_time = current_time
       return True
     except Exception as e:
       error_msg = f"Failed to check regeneration condition: {str(e)}"
