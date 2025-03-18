@@ -20,6 +20,9 @@ from naeural_core.business.default.web_app.supervisor_fast_api_web_app import Su
 
 __VER__ = '0.3.5'
 
+# Constants
+RELEASES_CACHE_FILE = 'releases_history.pkl'
+
 _CONFIG = {
   **BasePlugin.CONFIG,
 
@@ -42,7 +45,8 @@ _CONFIG = {
   'DEBUG_MODE': False,  # Enable detailed error reporting
   'SHOW_ALL_RELEASES_BY_DEFAULT': False,
   'GITHUB_API_TIMEOUT': 30,  # Timeout for GitHub API requests in seconds
-  'MAX_RETRIES': 3,  # Maximum number of retries for failed API requests
+  'MAX_RETRIES': 3,  # Maximum number of retries for failed API requests,
+  'RELEASES_CACHE_FILE': RELEASES_CACHE_FILE  # Path to the releases cache file
 }
 
 
@@ -83,6 +87,77 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self)
     return
 
+  def _load_cached_releases(self) -> List[Dict[str, Any]]:
+    """
+    Load cached releases from the pickle file.
+    
+    Returns
+    -------
+    List[Dict[str, Any]]
+        List of cached releases, or empty list if no cache exists
+    """
+    try:
+      cached_data = self.diskapi_load_pickle_from_data(self.cfg_releases_cache_file)
+      if cached_data:
+        self.P(f"Loaded {len(cached_data)} releases from cache")
+        return cached_data
+    except Exception as e:
+      self.log_error("_load_cached_releases", f"Failed to load cached releases: {str(e)}")
+    return []
+
+  def _save_cached_releases(self, releases: List[Dict[str, Any]]) -> bool:
+    """
+    Save releases to the pickle cache file.
+    
+    Parameters
+    ----------
+    releases : List[Dict[str, Any]]
+        List of releases to cache
+        
+    Returns
+    -------
+    bool
+        True if save was successful, False otherwise
+    """
+    try:
+      self.diskapi_save_pickle_to_data(releases, self.cfg_releases_cache_file)
+      self.P(f"Saved {len(releases)} releases to cache")
+      return True
+    except Exception as e:
+      self.log_error("_save_cached_releases", f"Failed to save releases to cache: {str(e)}")
+      return False
+
+  def _merge_with_cached_releases(self, new_releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Merge new releases with cached releases, avoiding duplicates.
+    
+    Parameters
+    ----------
+    new_releases : List[Dict[str, Any]]
+        List of newly fetched releases
+        
+    Returns
+    -------
+    List[Dict[str, Any]]
+        Combined list of new and cached releases, sorted by date
+    """
+    cached_releases = self._load_cached_releases()
+    
+    # Create a set of existing tag names for O(1) lookup
+    existing_tags = {release['tag_name'] for release in cached_releases}
+    
+    # Add only new releases that aren't already cached
+    merged_releases = cached_releases.copy()
+    for release in new_releases:
+      if release['tag_name'] not in existing_tags:
+        merged_releases.append(release)
+        existing_tags.add(release['tag_name'])
+    
+    # Sort by published_at date, newest first
+    merged_releases.sort(key=lambda x: x['published_at'], reverse=True)
+    
+    return merged_releases
+
   def log_error(self, func_name: str, error_msg: str, exc_info: Optional[Exception] = None) -> str:
     """Log an error with improved formatting and context."""
     error_details = [f"ERROR in {func_name}:"]
@@ -98,19 +173,46 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     return error_message
 
   def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Fetch and process release information with improved error handling."""
+    """
+    Fetch and process release information with improved error handling.
+    Uses caching to avoid reloading already fetched releases.
+
+    Returns
+    -------
+    Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]
+        A tuple containing (releases_list, error_data) where:
+        - releases_list is a list of JSON objects corresponding to recent GitHub releases
+        - error_data is a dict with 'message' and 'rate_limited' keys or None if no error
+    """
     func_name = "get_latest_releases"
     try:
+      # First try to get new releases from GitHub
       all_releases = self.release_fetcher.get_all_releases()
-      if not all_releases:
-        return [], {'message': "No releases found", 'rate_limited': False}
-
-      processed_releases = self.compile_release_info(all_releases)
-      return processed_releases, None
+      if all_releases:
+        # Merge with cached releases to avoid duplicates
+        merged_releases = self._merge_with_cached_releases(all_releases)
+        # Save the updated cache
+        self._save_cached_releases(merged_releases)
+        return merged_releases, None
+      else:
+        # If we can't get new releases, try to use cached ones
+        cached_releases = self._load_cached_releases()
+        if cached_releases:
+          self.P(f"{func_name}: Using {len(cached_releases)} cached releases due to GitHub API failure")
+          return cached_releases, None
+        else:
+          return [], {'message': "No releases found and no cache available", 'rate_limited': False}
 
     except GitHubApiError as e:
       error_msg = f"Failed to fetch releases: {str(e)}"
       self.log_error(func_name, error_msg)
+      
+      # Try to use cached releases if available
+      cached_releases = self._load_cached_releases()
+      if cached_releases:
+        self.P(f"{func_name}: Using {len(cached_releases)} cached releases due to GitHub API error")
+        return cached_releases, None
+      
       return [], {
         'message': error_msg,
         'rate_limited': e.is_rate_limit,
@@ -120,6 +222,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     except Exception as e:
       error_msg = f"Unexpected error while fetching releases: {str(e)}"
       self.log_error(func_name, error_msg, e)
+      
+      # Try to use cached releases if available
+      cached_releases = self._load_cached_releases()
+      if cached_releases:
+        self.P(f"{func_name}: Using {len(cached_releases)} cached releases due to unexpected error")
+        return cached_releases, None
+      
       return [], {'message': error_msg, 'rate_limited': False}
 
   def compile_release_info(self, releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -457,18 +566,18 @@ class ReleaseDataFetcher:
     def get_all_releases(self) -> List[Dict[str, Any]]:
         """Fetch all releases from GitHub."""
         self._check_and_clear_cache()
-        url = f"{self.config['RELEASES_REPO_URL']}/releases"
+        url = f"{self.cfg_releases_repo_url}/releases"
         return self._make_request(url, params={"per_page": 100})
         
     @lru_cache(maxsize=50)
     def get_release_details(self, release_id: str) -> GitHubReleaseData:
         """Fetch detailed information for a specific release with caching."""
         # Fetch release information
-        release_url = f"{self.config['RELEASES_REPO_URL']}/releases/tags/{release_id}"
+        release_url = f"{self.cfg_releases_repo_url}/releases/tags/{release_id}"
         release_data = self._make_request(release_url)
         
         # Fetch tag information
-        tag_url = f"{self.config['RELEASES_REPO_URL']}/git/refs/tags/{release_id}"
+        tag_url = f"{self.cfg_releases_repo_url}/git/refs/tags/{release_id}"
         try:
             tag_data = self._make_request(tag_url)
         except GitHubApiError as e:
@@ -506,7 +615,7 @@ class ReleaseDataFetcher:
     def _get_commit_info(self, commit_sha: str) -> Optional[Dict[str, Any]]:
         """Internal method to fetch commit information with caching."""
         try:
-            commit_url = f"{self.config['RELEASES_REPO_URL']}/commits/{commit_sha}"
+            commit_url = f"{self.cfg_releases_repo_url}/commits/{commit_sha}"
             return self._make_request(commit_url)
         except GitHubApiError as e:
             self._log(f"Failed to fetch commit info: {str(e)}", level="error")
