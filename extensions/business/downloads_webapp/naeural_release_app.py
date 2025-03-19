@@ -193,7 +193,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       # Sort descending by published date
       sorted_releases = sorted(releases, key=lambda x: x['published_at'], reverse=True)
       # Optionally, you can slice them *here* if you only want to SHOW the last N, but
-      # the user said “all from cache are displayed,” so we skip slicing.
+      # the user said "all from cache are displayed," so we skip slicing.
       # sorted_releases = sorted_releases[:self.cfg_nr_previous_releases]  # <--- if you wanted
       return sorted_releases
 
@@ -235,6 +235,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       # Convert compiled data into our ReleaseInfo objects for HTML
       releases_for_html = self.data_processor.process_releases(compiled_releases)
+      self.P(f"{func_name}: Successfully processed {len(releases_for_html)} releases for HTML generation")
 
     except Exception as e:
       error_msg = f"{func_name}: Error in compile_release_info or data_processor: {str(e)}"
@@ -253,6 +254,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         fd.write(html_content)
 
       self.P(f"{func_name}: releases.html generated successfully at {output_path}")
+      self.P(f"{func_name}: HTML generation complete with {len(releases_for_html)} releases, size: {len(html_content)} bytes")
       return True
 
     except Exception as e:
@@ -416,10 +418,13 @@ class ReleaseDataFetcher:
     while retries < self.config['MAX_RETRIES']:
       try:
         self._log(f"GET {url} with {params}")
+        self.logger.P(f"[ReleaseDataFetcher] Making API request to: {url}")
         resp = self.requests.get(url, params=params, timeout=self.config['GITHUB_API_TIMEOUT'])
         if resp.status_code == 200:
+          self.logger.P(f"[ReleaseDataFetcher] API request successful: {url} (status: 200)")
           return resp.json()
         else:
+          self.logger.P(f"[ReleaseDataFetcher] API request failed: {url} (status: {resp.status_code})")
           raise GitHubApiError.from_response(resp)
       except GitHubApiError as ghe:
         if ghe.is_rate_limit or retries >= (self.config['MAX_RETRIES'] - 1):
@@ -430,6 +435,7 @@ class ReleaseDataFetcher:
           raise GitHubApiError(str(e), GitHubApiErrorType.NETWORK)
         last_exc = e
       retries += 1
+      self.logger.P(f"[ReleaseDataFetcher] Retry {retries}/{self.config['MAX_RETRIES']} for {url}")
     # If we reach here, re-raise last error
     raise last_exc
 
