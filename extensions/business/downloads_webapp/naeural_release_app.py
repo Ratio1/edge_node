@@ -32,8 +32,7 @@ _CONFIG = {
     'DEBUG_MODE': False,  # or True if you want more logs
     'SHOW_ALL_RELEASES_BY_DEFAULT': False,
     'GITHUB_API_TIMEOUT': 30,
-    'MAX_RETRIES': 3,
-    'RELEASES_CACHE_FILE': RELEASES_CACHE_FILE
+    'MAX_RETRIES': 3
 }
 
 class NaeuralReleaseAppPlugin(BasePlugin):
@@ -52,7 +51,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   def _load_cached_releases(self) -> List[Dict[str, Any]]:
       """Load cached releases from pickle, or return an empty list on failure."""
       try:
-          data = self.diskapi_load_pickle_from_data(self.cfg_releases_cache_file)
+          data = self.diskapi_load_pickle_from_data(RELEASES_CACHE_FILE)
           if data:
               self.P(f"_load_cached_releases: Loaded {len(data)} from cache.")
               return data
@@ -63,7 +62,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   def _save_cached_releases(self, releases: List[Dict[str, Any]]) -> bool:
       """Save the entire release list back to pickle cache."""
       try:
-          self.diskapi_save_pickle_to_data(releases, self.cfg_releases_cache_file)
+          self.diskapi_save_pickle_to_data(releases, RELEASES_CACHE_FILE)
           self.P(f"_save_cached_releases: Saved {len(releases)} release(s) to cache.")
           return True
       except Exception as e:
@@ -403,7 +402,6 @@ class ReleaseDataFetcher:
     while retries < self._max_retries:
       try:
         self._log(f"GET {url} with {params}")
-        self.logger.P(f"[ReleaseDataFetcher] Making API request to: {url}")
         resp = self.requests.get(url, params=params, timeout=self._github_api_timeout)
         if resp.status_code == 200:
           self.logger.P(f"[ReleaseDataFetcher] API request successful: {url} (status: 200)")
