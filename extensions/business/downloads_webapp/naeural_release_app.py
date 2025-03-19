@@ -45,28 +45,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.__last_generation_time = 0
       self.html_generator = HtmlGenerator(self.CONFIG, self)
       self.data_processor = ReleaseDataProcessor(self)
-      self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self)
+      self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self, self.cfg_releases_repo_url, self.cfg_max_retries, self.cfg_github_api_timeout, self.cfg_debug_mode)
       return
 
-  @property
-  def cfg_releases_cache_file(self) -> str:
-      return self.CONFIG['RELEASES_CACHE_FILE']
-
-  @property
-  def cfg_debug_mode(self) -> bool:
-      return self.CONFIG['DEBUG_MODE']
-
-  @property
-  def cfg_nr_previous_releases(self) -> int:
-      return self.CONFIG['NR_PREVIOUS_RELEASES']
-
-  @property
-  def cfg_releases_repo_url(self) -> str:
-      return self.CONFIG['RELEASES_REPO_URL']
-
-  @property
-  def cfg_regeneration_interval(self) -> int:
-      return self.CONFIG['REGENERATION_INTERVAL']
 
   def _load_cached_releases(self) -> List[Dict[str, Any]]:
       """Load cached releases from pickle, or return an empty list on failure."""
@@ -393,15 +374,19 @@ class ReleaseDataFetcher:
   Only calls get_top_n_releases(...) to limit the fetch to the last N releases.
   """
 
-  def __init__(self, config: Dict[str, Any], logger: Any):
+  def __init__(self, config: Dict[str, Any], logger: Any, releases_repo_url: str, max_retries: int, github_api_timeout: int, debug_mode: bool):
     self.config = config
     self.logger = logger
     self.requests = logger.requests
     self._cache_timeout = timedelta(minutes=10)
     self._last_cache_clear = datetime.now()
+    self._releases_repo_url = releases_repo_url
+    self._max_retries = max_retries
+    self._debug_mode = debug_mode
+    self._github_api_timeout = github_api_timeout
 
   def _log(self, msg: str):
-    if self.config.get('DEBUG_MODE'):
+    if self._debug_mode:
       self.logger.P(f"[ReleaseDataFetcher] {msg}")
 
   def _check_and_clear_cache(self):
@@ -415,11 +400,11 @@ class ReleaseDataFetcher:
   def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
     retries = 0
     last_exc = None
-    while retries < self.config['MAX_RETRIES']:
+    while retries < self._max_retries:
       try:
         self._log(f"GET {url} with {params}")
         self.logger.P(f"[ReleaseDataFetcher] Making API request to: {url}")
-        resp = self.requests.get(url, params=params, timeout=self.config['GITHUB_API_TIMEOUT'])
+        resp = self.requests.get(url, params=params, timeout=self._github_api_timeout)
         if resp.status_code == 200:
           self.logger.P(f"[ReleaseDataFetcher] API request successful: {url} (status: 200)")
           return resp.json()
@@ -427,15 +412,15 @@ class ReleaseDataFetcher:
           self.logger.P(f"[ReleaseDataFetcher] API request failed: {url} (status: {resp.status_code})")
           raise GitHubApiError.from_response(resp)
       except GitHubApiError as ghe:
-        if ghe.is_rate_limit or retries >= (self.config['MAX_RETRIES'] - 1):
+        if ghe.is_rate_limit or retries >= (self._max_retries - 1):
           raise
         last_exc = ghe
       except Exception as e:
-        if retries >= (self.config['MAX_RETRIES'] - 1):
+        if retries >= (self._max_retries - 1):
           raise GitHubApiError(str(e), GitHubApiErrorType.NETWORK)
         last_exc = e
       retries += 1
-      self.logger.P(f"[ReleaseDataFetcher] Retry {retries}/{self.config['MAX_RETRIES']} for {url}")
+      self.logger.P(f"[ReleaseDataFetcher] Retry {retries}/{self._max_retries} for {url}")
     # If we reach here, re-raise last error
     raise last_exc
 
@@ -444,7 +429,7 @@ class ReleaseDataFetcher:
     Fetch from GitHub the last n release objects (basic info only).
     """
     self._check_and_clear_cache()
-    url = f"{self.config['RELEASES_REPO_URL']}/releases"
+    url = f"{self._releases_repo_url}/releases"
     # param per_page=n will limit to the top n (most recent) releases
     return self._make_request(url, params={"per_page": n}) or []
 
@@ -452,11 +437,11 @@ class ReleaseDataFetcher:
   def get_release_details(self, tag_name: str) -> 'GitHubReleaseData':
     self._check_and_clear_cache()
     # 1) fetch the release by its tag
-    rurl = f"{self.config['RELEASES_REPO_URL']}/releases/tags/{tag_name}"
+    rurl = f"{self._releases_repo_url}/releases/tags/{tag_name}"
     release_data = self._make_request(rurl)
 
     # 2) fetch tag info to get commit sha
-    turl = f"{self.config['RELEASES_REPO_URL']}/git/refs/tags/{tag_name}"
+    turl = f"{self._releases_repo_url}/git/refs/tags/{tag_name}"
     try:
       tag_data = self._make_request(turl)
     except GitHubApiError as e:
@@ -495,7 +480,7 @@ class ReleaseDataFetcher:
 
   @lru_cache(maxsize=100)
   def _get_commit_info(self, commit_sha: str) -> Optional[Dict[str, Any]]:
-    curl = f"{self.config['RELEASES_REPO_URL']}/commits/{commit_sha}"
+    curl = f"{self._releases_repo_url}/commits/{commit_sha}"
     return self._make_request(curl)
 
   @lru_cache(maxsize=100)
