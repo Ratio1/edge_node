@@ -23,7 +23,8 @@ _CONFIG = {
             }
         ]
     },
-    'NR_PREVIOUS_RELEASES': 5,            # We only fetch these many from GitHub
+    'NR_PREVIOUS_RELEASES': 5,
+    'RELEASES_TO_FETCH': 50,
     'REGENERATION_INTERVAL': 10*60,
     "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
     'VALIDATION_RULES': {
@@ -94,7 +95,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           cached_tags = {c['tag_name'] for c in cached}
 
           # 2) Get the *latest N* from GitHub (just basic info)
-          n = self.cfg_nr_previous_releases
+          n = self.cfg_releases_to_fetch
           top_n_basic = self.release_fetcher.get_top_n_releases(n)
           if not top_n_basic:
               # If GitHub returned nothing, fallback to cache if we have any
@@ -280,9 +281,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
 class ReleaseAssetType(Enum):
     """Types of release assets we support."""
-    LINUX_20_04 = "LINUX_Ubuntu-20.04.AppImage"
     LINUX_22_04 = "LINUX_Ubuntu-22.04.AppImage"
-    LINUX_24_04 = "LINUX_Ubuntu-24.04.AppImage"
     WINDOWS_ZIP = "Windows_msi.zip"
     WINDOWS_MSI = "Windows.msi"
     MACOS_ARM = "OSX-arm64.zip"
@@ -901,9 +900,7 @@ class HtmlGenerator:
       return next((a for a in assets if self.plugin.re.search(pattern, a.name)), None)
 
     # Linux assets
-    linux_20_04 = find_asset(r'LINUX_Ubuntu-20\.04\.AppImage')
     linux_22_04 = find_asset(r'LINUX_Ubuntu-22\.04\.AppImage')
-    linux_24_04 = find_asset(r'LINUX_Ubuntu-24\.04\.AppImage')
 
     # Windows assets
     win_zip = find_asset(r'Windows_msi\.zip')
@@ -913,18 +910,14 @@ class HtmlGenerator:
     macos_arm = find_asset(r'OSX-arm64\.zip')
 
     if is_latest:
-      if linux_20_04:
-        download_items.append(self._generate_download_item(linux_20_04, "linux", "Linux Ubuntu 20.04", "🐧"))
-      if linux_22_04:
-        download_items.append(self._generate_download_item(linux_22_04, "linux", "Linux Ubuntu 22.04", "🐧"))
-      if linux_24_04:
-        download_items.append(self._generate_download_item(linux_24_04, "linux", "Linux Ubuntu 24.04", "🐧"))
-      if macos_arm:
-        download_items.append(self._generate_download_item(macos_arm, "macos", "macOS (Apple Silicon)", "🍎"))
       if win_zip:
         download_items.append(self._generate_download_item(win_zip, "windows", "Windows (ZIP)", "🪟"))
       if win_msi:
         download_items.append(self._generate_download_item(win_msi, "windows", "Windows (MSI)", "🪟"))
+      if linux_22_04:
+        download_items.append(self._generate_download_item(linux_22_04, "linux", "Linux Ubuntu 22.04", "🐧"))
+      if macos_arm:
+        download_items.append(self._generate_download_item(macos_arm, "macos", "macOS (Apple Silicon)", "🍎"))
 
       return f"""
         <div class="download-options">
@@ -937,14 +930,12 @@ class HtmlGenerator:
     else:
       # group for previous releases
       sections = {
-        "Linux": [
-          (linux_20_04, "Ubuntu 20.04"),
-          (linux_22_04, "Ubuntu 22.04"),
-          (linux_24_04, "Ubuntu 24.04"),
-        ],
         "Windows": [
           (win_zip, "Windows ZIP"),
           (win_msi, "Windows MSI"),
+        ],
+        "Linux": [
+          (linux_22_04, "Ubuntu 22.04"),
         ],
         "macOS": [
           (macos_arm, "Apple Silicon"),
