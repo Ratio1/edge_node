@@ -1,406 +1,299 @@
-"""
-This module implements a FastAPI supervisor plugin that fetches release information
-for the Edge Node Launcher from a GitHub repository, compiles it, and regenerates
-an HTML page with the latest releases and download links.
-
-Classes
--------
-NaeuralReleaseAppPlugin
-  Subclass of the SupervisorFastApiWebApp, providing overrides for release fetching
-  and HTML generation functionality.
-"""
 import traceback
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Any, NamedTuple, TypedDict, Literal
+from typing import Dict, List, Optional, Tuple, Any, TypedDict
 from dataclasses import dataclass, field
 from functools import lru_cache
 from enum import Enum
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.3.5'
+__VER__ = '0.4.0'
 
-# Constants
 RELEASES_CACHE_FILE = 'releases_history.pkl'
 
 _CONFIG = {
-  **BasePlugin.CONFIG,
-
-  'ASSETS' : 'plugins/business/fastapi/launcher_download',
-  'JINJA_ARGS': {
-    'html_files' : [
-      {
-        'name'  : 'releases.html',
-        'route' : '/',
-        'method' : 'get'
-      }
-    ]
-  },
-  'NR_PREVIOUS_RELEASES': 5,
-  'REGENERATION_INTERVAL': 10*60,
-  "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
-  'VALIDATION_RULES': {
-    **BasePlugin.CONFIG['VALIDATION_RULES'],
-  },
-  'DEBUG_MODE': False,  # Enable detailed error reporting
-  'SHOW_ALL_RELEASES_BY_DEFAULT': False,
-  'GITHUB_API_TIMEOUT': 30,  # Timeout for GitHub API requests in seconds
-  'MAX_RETRIES': 3,  # Maximum number of retries for failed API requests,
-  'RELEASES_CACHE_FILE': RELEASES_CACHE_FILE  # Path to the releases cache file
+    **BasePlugin.CONFIG,
+    'ASSETS' : 'plugins/business/fastapi/launcher_download',
+    'JINJA_ARGS': {
+        'html_files': [
+            {
+                'name'  : 'releases.html',
+                'route' : '/',
+                'method': 'get'
+            }
+        ]
+    },
+    'NR_PREVIOUS_RELEASES': 5,            # We only fetch these many from GitHub
+    'REGENERATION_INTERVAL': 10*60,
+    "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
+    'VALIDATION_RULES': {
+        **BasePlugin.CONFIG['VALIDATION_RULES'],
+    },
+    'DEBUG_MODE': False,  # or True if you want more logs
+    'SHOW_ALL_RELEASES_BY_DEFAULT': False,
+    'GITHUB_API_TIMEOUT': 30,
+    'MAX_RETRIES': 3,
+    'RELEASES_CACHE_FILE': RELEASES_CACHE_FILE
 }
 
-
 class NaeuralReleaseAppPlugin(BasePlugin):
-  """
-  A plugin to fetch and display release information for Edge Node Launcher.
-
-  Attributes
-  ----------
-  CONFIG : dict
-    The configuration dictionary for this plugin.
-
-  Methods
-  -------
-  on_init(**kwargs)
-    Initializes the plugin and sets up state.
-  get_latest_releases()
-    Fetches and processes the latest releases from GitHub.
-  compile_release_info(releases)
-    Processes releases into the format expected by the UI.
-  _regenerate_index_html()
-    Regenerates the releases.html file with updated release info.
-  _maybe_regenerate_index_html()
-    Conditionally regenerates the HTML if enough time has passed.
-  process()
-    Periodically checks whether to regenerate the HTML.
-  """
-
   CONFIG = _CONFIG
 
   def on_init(self, **kwargs):
-    """Initialize the plugin with improved state management."""
-    super(NaeuralReleaseAppPlugin, self).on_init(**kwargs)
-    self._last_day_regenerated = (self.datetime.now() - self.timedelta(days=1)).day
-    self.__last_generation_time = 0
-    self.html_generator = HtmlGenerator(self.CONFIG, self)
-    self.data_processor = ReleaseDataProcessor(self)
-    self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self)
-    return
+      super(NaeuralReleaseAppPlugin, self).on_init(**kwargs)
+      self._last_day_regenerated = (self.datetime.now() - self.timedelta(days=1)).day
+      self.__last_generation_time = 0
+      self.html_generator = HtmlGenerator(self.CONFIG, self)
+      self.data_processor = ReleaseDataProcessor(self)
+      self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self)
+      return
+
+  @property
+  def cfg_releases_cache_file(self) -> str:
+      return self.CONFIG['RELEASES_CACHE_FILE']
+
+  @property
+  def cfg_debug_mode(self) -> bool:
+      return self.CONFIG['DEBUG_MODE']
+
+  @property
+  def cfg_nr_previous_releases(self) -> int:
+      return self.CONFIG['NR_PREVIOUS_RELEASES']
+
+  @property
+  def cfg_releases_repo_url(self) -> str:
+      return self.CONFIG['RELEASES_REPO_URL']
+
+  @property
+  def cfg_regeneration_interval(self) -> int:
+      return self.CONFIG['REGENERATION_INTERVAL']
 
   def _load_cached_releases(self) -> List[Dict[str, Any]]:
-    """
-    Load cached releases from the pickle file.
-    
-    Returns
-    -------
-    List[Dict[str, Any]]
-        List of cached releases, or empty list if no cache exists
-    """
-    try:
-      cached_data = self.diskapi_load_pickle_from_data(self.cfg_releases_cache_file)
-      if cached_data:
-        self.P(f"Loaded {len(cached_data)} releases from cache")
-        return cached_data
-    except Exception as e:
-      self.log_error("_load_cached_releases", f"Failed to load cached releases: {str(e)}")
-    return []
-
-  def _save_cached_releases(self, releases: List[Dict[str, Any]]) -> bool:
-    """
-    Save releases to the pickle cache file.
-    
-    Parameters
-    ----------
-    releases : List[Dict[str, Any]]
-        List of releases to cache
-        
-    Returns
-    -------
-    bool
-        True if save was successful, False otherwise
-    """
-    try:
-      self.diskapi_save_pickle_to_data(releases, self.cfg_releases_cache_file)
-      self.P(f"Saved {len(releases)} releases to cache")
-      return True
-    except Exception as e:
-      self.log_error("_save_cached_releases", f"Failed to save releases to cache: {str(e)}")
-      return False
-
-  def _merge_with_cached_releases(self, new_releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Merge new releases with cached releases, avoiding duplicates.
-    
-    Parameters
-    ----------
-    new_releases : List[Dict[str, Any]]
-        List of newly fetched releases
-        
-    Returns
-    -------
-    List[Dict[str, Any]]
-        Combined list of new and cached releases, sorted by date
-    """
-    cached_releases = self._load_cached_releases()
-    
-    # Create a set of existing tag names for O(1) lookup
-    existing_tags = {release['tag_name'] for release in cached_releases}
-    
-    # Add only new releases that aren't already cached
-    merged_releases = cached_releases.copy()
-    for release in new_releases:
-      if release['tag_name'] not in existing_tags:
-        merged_releases.append(release)
-        existing_tags.add(release['tag_name'])
-    
-    # Sort by published_at date, newest first
-    merged_releases.sort(key=lambda x: x['published_at'], reverse=True)
-    
-    return merged_releases
-
-  def log_error(self, func_name: str, error_msg: str, exc_info: Optional[Exception] = None) -> str:
-    """Log an error with improved formatting and context."""
-    error_details = [f"ERROR in {func_name}:"]
-    error_details.append(error_msg)
-
-    if exc_info and self.cfg_debug_mode:
-      tb_str = ''.join(traceback.format_exception(type(exc_info), exc_info, exc_info.__traceback__))
-      error_details.append("Traceback:")
-      error_details.append(tb_str)
-
-    error_message = "\n".join(error_details)
-    self.P(error_message)
-    return error_message
-
-  def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """
-    Fetch and process release information with improved error handling.
-    Uses caching to avoid reloading already fetched releases.
-
-    Returns
-    -------
-    Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]
-        A tuple containing (releases_list, error_data) where:
-        - releases_list is a list of JSON objects corresponding to recent GitHub releases
-        - error_data is a dict with 'message' and 'rate_limited' keys or None if no error
-    """
-    func_name = "get_latest_releases"
-    try:
-      # First try to get new releases from GitHub
-      all_releases = self.release_fetcher.get_all_releases()
-      if all_releases:
-        # Merge with cached releases to avoid duplicates
-        merged_releases = self._merge_with_cached_releases(all_releases)
-        # Save the updated cache
-        self._save_cached_releases(merged_releases)
-        return merged_releases, None
-      else:
-        # If we can't get new releases, try to use cached ones
-        cached_releases = self._load_cached_releases()
-        if cached_releases:
-          self.P(f"{func_name}: Using {len(cached_releases)} cached releases due to GitHub API failure")
-          return cached_releases, None
-        else:
-          return [], {'message': "No releases found and no cache available", 'rate_limited': False}
-
-    except GitHubApiError as e:
-      error_msg = f"Failed to fetch releases: {str(e)}"
-      self.log_error(func_name, error_msg)
-      
-      # Try to use cached releases if available
-      cached_releases = self._load_cached_releases()
-      if cached_releases:
-        self.P(f"{func_name}: Using {len(cached_releases)} cached releases due to GitHub API error")
-        return cached_releases, None
-      
-      return [], {
-        'message': error_msg,
-        'rate_limited': e.is_rate_limit,
-        'error_type': e.error_type.value
-      }
-
-    except Exception as e:
-      error_msg = f"Unexpected error while fetching releases: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      
-      # Try to use cached releases if available
-      cached_releases = self._load_cached_releases()
-      if cached_releases:
-        self.P(f"{func_name}: Using {len(cached_releases)} cached releases due to unexpected error")
-        return cached_releases, None
-      
-      return [], {'message': error_msg, 'rate_limited': False}
-
-  def compile_release_info(self, releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Process releases with improved error recovery and validation."""
-    func_name = "compile_release_info"
-    if not releases:
-      self.log_error(func_name, "No releases provided")
+      """Load cached releases from pickle, or return an empty list on failure."""
+      try:
+          data = self.diskapi_load_pickle_from_data(self.cfg_releases_cache_file)
+          if data:
+              self.P(f"_load_cached_releases: Loaded {len(data)} from cache.")
+              return data
+      except Exception as e:
+          self.log_error("_load_cached_releases", f"Failed to load cache: {str(e)}")
       return []
 
-    try:
-      # Sort and filter releases
-      releases.sort(key=lambda x: x['published_at'], reverse=True)
-      releases = releases[:self.cfg_nr_previous_releases]
+  def _save_cached_releases(self, releases: List[Dict[str, Any]]) -> bool:
+      """Save the entire release list back to pickle cache."""
+      try:
+          self.diskapi_save_pickle_to_data(releases, self.cfg_releases_cache_file)
+          self.P(f"_save_cached_releases: Saved {len(releases)} release(s) to cache.")
+          return True
+      except Exception as e:
+          self.log_error("_save_cached_releases", f"Failed to save cache: {str(e)}")
+          return False
 
-      processed_releases = []
-      for release in releases:
-        try:
-          # Get release details
-          release_data = self.release_fetcher.get_release_details(release['tag_name'])
+  def log_error(self, func_name: str, error_msg: str, exc_info: Optional[Exception] = None) -> str:
+      details = [f"ERROR in {func_name}:", error_msg]
+      if exc_info and self.cfg_debug_mode:
+          import traceback
+          details.append("Traceback:")
+          details.append(''.join(traceback.format_exception(type(exc_info), exc_info, exc_info.__traceback__)))
+      msg = "\n".join(details)
+      self.P(msg)
+      return msg
 
-          # Try to get commit message if needed
-          if not release_data.has_valid_body and release_data.commit_sha:
-            commit_message = self.release_fetcher.get_commit_message(release_data.commit_sha)
-            if commit_message:
-              # Create new instance with updated body due to frozen=True
-              release_data = GitHubReleaseData(
-                tag_name=release_data.tag_name,
-                published_at=release_data.published_at,
-                body=commit_message,
-                assets=release_data.assets,
-                commit_sha=release_data.commit_sha,
-                commit_info=release_data.commit_info,
-                tag_info=release_data.tag_info
-              )
+  def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+      """
+      Fetch from GitHub only the last `cfg_nr_previous_releases` basic releases.
+      For each of those that are not yet cached, fetch full details and add them to the cache.
+      Keep old releases in the cache (never remove them).
+      Return the *entire* cached release list (including older ones), sorted desc by date.
+      """
+      func_name = "get_latest_releases"
+      try:
+          # 1) Load current cache
+          cached = self._load_cached_releases()
+          cached_tags = {c['tag_name'] for c in cached}
 
-          # Convert to UI format
-          processed_release = {
-            'tag_name': release_data.tag_name,
-            'published_at': release_data.published_at,
-            'body': release_data.body,
-            'assets': release_data.assets,
-            'commit_info': release_data.commit_info
-          }
+          # 2) Get the *latest N* from GitHub (just basic info)
+          n = self.cfg_nr_previous_releases
+          top_n_basic = self.release_fetcher.get_top_n_releases(n)
+          if not top_n_basic:
+              # If GitHub returned nothing, fallback to cache if we have any
+              if cached:
+                  self.P(f"{func_name}: GitHub returned 0, using cached = {len(cached)}.")
+                  # Sort cache by date desc for consistency
+                  cached.sort(key=lambda x: x['published_at'], reverse=True)
+                  return cached, None
+              else:
+                  return [], {'message': "No releases found & no cache available", 'rate_limited': False}
 
-          processed_releases.append(processed_release)
-          self.P(f"{func_name}: Processed release {release_data.tag_name}")
+          # 3) For each of those top N, if not in cache, fetch details
+          new_full = []
+          for r in top_n_basic:
+              tag = r['tag_name']
+              if tag not in cached_tags:
+                  # fetch and store
+                  try:
+                      details = self.release_fetcher.get_release_details(tag)
+                      new_full.append({
+                          'tag_name': details.tag_name,
+                          'published_at': details.published_at,
+                          'body': details.body,
+                          'assets': details.assets,
+                          'commit_sha': details.commit_sha,
+                          'commit_info': details.commit_info,
+                          'tag_info': details.tag_info
+                      })
+                      self.P(f"{func_name}: Downloaded new release: {tag}")
+                  except GitHubApiError as e:
+                      if e.is_rate_limit:
+                          raise
+                      # else log and skip
+                      self.log_error(func_name, f"Failed to fetch release details for {tag}: {str(e)}")
 
-        except GitHubApiError as e:
-          self.log_error(
-            func_name,
-            f"Failed to process release {release.get('tag_name', 'unknown')}: {str(e)}"
-          )
-          if e.is_rate_limit:
-            return processed_releases
-          continue
+          # 4) Add newly fetched items to the cache, never removing older items
+          if new_full:
+              extended_cache = cached + new_full
+              extended_cache.sort(key=lambda x: x['published_at'], reverse=True)
+              self._save_cached_releases(extended_cache)
+              return extended_cache, None
+          else:
+              # No new releases discovered => just return the existing cache sorted
+              cached.sort(key=lambda x: x['published_at'], reverse=True)
+              return cached, None
 
-      return processed_releases
+      except GitHubApiError as gh_e:
+          msg = f"{func_name}: GitHubApiError {gh_e}"
+          self.log_error(func_name, msg)
+          # fallback to cache if possible
+          fallback = self._load_cached_releases()
+          if fallback:
+              fallback.sort(key=lambda x: x['published_at'], reverse=True)
+              self.P(f"{func_name}: returning fallback from cache: {len(fallback)} items.")
+              return fallback, None
+          return [], {'message': msg, 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}
 
-    except Exception as e:
-      error_msg = f"Failed to compile release info: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      return processed_releases[:1] if processed_releases else []
+      except Exception as e:
+          msg = f"{func_name}: Unexpected error: {str(e)}"
+          self.log_error(func_name, msg, e)
+          fallback = self._load_cached_releases()
+          if fallback:
+              fallback.sort(key=lambda x: x['published_at'], reverse=True)
+              self.P(f"{func_name}: returning fallback from cache: {len(fallback)} items.")
+              return fallback, None
+          return [], {'message': msg, 'rate_limited': False}
 
-  def _regenerate_index_html(self):
+  def compile_release_info(self, releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+      """
+      Turn the raw release dicts (already fully fetched) into the final shape needed for HTML.
+      We do not re-fetch from GitHub here. We simply trust what's in the cache.
+      """
+      if not releases:
+          self.log_error("compile_release_info", "No releases provided.")
+          return []
+
+      # Sort descending by published date
+      sorted_releases = sorted(releases, key=lambda x: x['published_at'], reverse=True)
+      # Optionally, you can slice them *here* if you only want to SHOW the last N, but
+      # the user said “all from cache are displayed,” so we skip slicing.
+      # sorted_releases = sorted_releases[:self.cfg_nr_previous_releases]  # <--- if you wanted
+      return sorted_releases
+
+  def _regenerate_index_html(self) -> bool:
     """
-    Regenerate the index.html file listing the latest releases and metadata.
+    Fetch/compile the full set of releases from cache+GitHub, then
+    generate the final releases.html for display.
+    Returns True if successful.
     """
     func_name = "_regenerate_index_html"
     self.P(f"{func_name}: Starting HTML regeneration...")
 
-    # Check if HTML file already exists
+    # Where we will write the HTML
     web_server_path = self.get_web_server_path()
     output_path = self.os_path.join(web_server_path, 'assets/releases.html')
-    file_exists = self.os_path.isfile(output_path)
 
-    # Step 1: Fetch releases
+    # 1) Retrieve the full set of releases
     try:
       raw_releases, release_error = self.get_latest_releases()
       if not raw_releases:
-        # Use the error information returned from get_latest_releases
+        # Use the error info from get_latest_releases if present
         if release_error:
           error_message = release_error.get('message', "Failed to get any releases")
         else:
           error_message = "Failed to get any releases"
-
         self.log_error(func_name, error_message)
         return False
     except Exception as e:
-      error_message = f"Failed during release fetching: {str(e)}"
+      error_message = f"{func_name}: Exception while fetching releases: {str(e)}"
       self.log_error(func_name, error_message, e)
       return False
 
-    # Step 2: Compile release information
+    # 2) Compile them (no re-fetch) and transform them into the shape the HTML generator expects
     try:
-      raw_releases_with_commits = self.compile_release_info(raw_releases)
-      if not raw_releases_with_commits:
-        error_message = "Failed to compile any release information"
-        self.log_error(func_name, error_message)
+      compiled_releases = self.compile_release_info(raw_releases)
+      if not compiled_releases:
+        self.log_error(func_name, "No compiled releases available, skipping HTML generation")
         return False
 
-      # Convert raw releases to ReleaseInfo objects
-      releases = self.data_processor.process_releases(raw_releases_with_commits, [])
+      # Convert compiled data into our ReleaseInfo objects for HTML
+      releases_for_html = self.data_processor.process_releases(compiled_releases)
 
     except Exception as e:
-      error_msg = f"Failed during release compilation: {str(e)}"
+      error_msg = f"{func_name}: Error in compile_release_info or data_processor: {str(e)}"
       self.log_error(func_name, error_msg, e)
       return False
 
-    # Step 3: Generate HTML
+    # 3) Generate and write the HTML
     try:
       html_content = self.html_generator.generate_complete_html(
-        releases=releases,
+        releases=releases_for_html,
         ee_id=self.ee_id,
         ee_addr=self.ee_addr,
         last_update=self.datetime_to_str()
       )
-
       with open(output_path, 'w') as fd:
         fd.write(html_content)
 
-      self.P(f"{func_name}: releases.html has been generated successfully.")
+      self.P(f"{func_name}: releases.html generated successfully at {output_path}")
       return True
+
     except Exception as e:
-      error_msg = f"Failed to generate or write HTML: {str(e)}"
+      error_msg = f"{func_name}: Error writing HTML file: {str(e)}"
       self.log_error(func_name, error_msg, e)
       return False
 
-  def _maybe_regenerate_index_html(self):
+  def _maybe_regenerate_index_html(self) -> bool:
     """
-    Regenerate the html files if the last regeneration was more than
-    cfg_regeneration_interval seconds ago.
-    If regeneration fails and an HTML file already exists, keep the existing file
-    instead of replacing it with a fallback page.
+    Check if enough time has passed since last regeneration. If so, regenerate.
     """
     func_name = "_maybe_regenerate_index_html"
     try:
       current_time = self.time()
-
-      # Only regenerate if enough time has passed since last generation
       if (current_time - self.__last_generation_time) > self.cfg_regeneration_interval:
         self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
-
-        # Attempt to regenerate the HTML
         result = self._regenerate_index_html()
         current_day = self.datetime.now().day
 
-        if result:
-          # Successful regeneration
-          self._last_day_regenerated = current_day
-          self.__last_generation_time = current_time
-          self.P(f"{func_name}: HTML regeneration successful")
-        else:
-          # Failed regeneration - _regenerate_index_html already handles the file_exists check
-          self.P(f"{func_name}: HTML regeneration failed, but _regenerate_index_html handled fallback")
+        # Whether success or failure, update the generation time to avoid repeated attempts
+        self.__last_generation_time = current_time
 
-          # Update the generation time anyway to avoid constant retries when failing
-          self.__last_generation_time = current_time
+        if result:
+          self._last_day_regenerated = current_day
+          self.P(f"{func_name}: HTML regeneration successful.")
+        else:
+          self.P(f"{func_name}: HTML regeneration failed (see logs).")
       return True
     except Exception as e:
-      error_msg = f"Failed to check regeneration condition: {str(e)}"
+      error_msg = f"{func_name}: Unhandled error: {str(e)}"
       self.log_error(func_name, error_msg, e)
       return False
 
   def process(self):
-    """
-    Called periodically. Triggers the conditional regeneration of the HTML.
-    """
+    """Called periodically. Triggers the conditional regeneration of the HTML."""
     try:
       self._maybe_regenerate_index_html()
     except Exception as e:
-      self.log_error("process", f"Unhandled error in process method: {str(e)}", e)
+      self.log_error("process", f"Unhandled error in process(): {str(e)}", e)
     return
+
 
 class ReleaseAssetType(Enum):
     """Types of release assets we support."""
@@ -419,11 +312,11 @@ class AssetInfo(TypedDict):
 
 @dataclass(frozen=True)
 class GitHubReleaseData:
-    """Data class for GitHub release information with validation and helper methods."""
+    """Holds all fetched data about one GitHub release."""
     tag_name: str
     published_at: str
     body: str
-    assets: List[AssetInfo] = field(default_factory=list)
+    assets: List[Dict[str, Any]] = field(default_factory=list)
     commit_sha: Optional[str] = None
     commit_info: Optional[Dict[str, Any]] = None
     tag_info: Optional[Dict[str, Any]] = None
@@ -434,18 +327,18 @@ class GitHubReleaseData:
             raise ValueError("tag_name cannot be empty")
         if not self.published_at:
             raise ValueError("published_at cannot be empty")
-            
+
     @property
     def formatted_date(self) -> str:
         """Return formatted publication date."""
         dt = datetime.strptime(self.published_at, '%Y-%m-%dT%H:%M:%SZ')
         return dt.strftime('%B %d, %Y')
-        
+
     @property
     def has_valid_body(self) -> bool:
         """Check if the release has a valid body."""
         return bool(self.body and self.body.strip())
-        
+
     def get_asset_by_type(self, asset_type: ReleaseAssetType) -> Optional[AssetInfo]:
         """Get asset information by type."""
         return next(
@@ -453,184 +346,161 @@ class GitHubReleaseData:
             None
         )
 
+
 class GitHubApiErrorType(Enum):
-    """Types of GitHub API errors."""
-    RATE_LIMIT = "rate_limit"
-    NOT_FOUND = "not_found"
-    NETWORK = "network"
-    UNKNOWN = "unknown"
+  RATE_LIMIT = "rate_limit"
+  NOT_FOUND = "not_found"
+  NETWORK = "network"
+  UNKNOWN = "unknown"
+
 
 class GitHubApiError(Exception):
-    """Exception raised for GitHub API errors with improved error categorization."""
-    def __init__(
-        self,
-        message: str,
-        error_type: GitHubApiErrorType,
-        status_code: Optional[int] = None,
-        response_text: Optional[str] = None
-    ):
-        self.error_type = error_type
-        self.status_code = status_code
-        self.response_text = response_text
-        super().__init__(message)
+  def __init__(self, message: str, error_type: GitHubApiErrorType, status_code: Optional[int] = None,
+               response_text: Optional[str] = None):
+    self.error_type = error_type
+    self.status_code = status_code
+    self.response_text = response_text
+    super().__init__(message)
 
-    @property
-    def is_rate_limit(self) -> bool:
-        """Check if this is a rate limit error."""
-        return self.error_type == GitHubApiErrorType.RATE_LIMIT
+  @property
+  def is_rate_limit(self) -> bool:
+    return self.error_type == GitHubApiErrorType.RATE_LIMIT
 
-    @classmethod
-    def from_response(cls, response: Any, message: Optional[str] = None) -> 'GitHubApiError':
-        """Create an error instance from a response object."""
-        if response.status_code == 403 and 'rate limit' in response.text.lower():
-            error_type = GitHubApiErrorType.RATE_LIMIT
-        elif response.status_code == 404:
-            error_type = GitHubApiErrorType.NOT_FOUND
-        else:
-            error_type = GitHubApiErrorType.UNKNOWN
-            
-        return cls(
-            message or f"GitHub API error: {response.text}",
-            error_type=error_type,
-            status_code=response.status_code,
-            response_text=response.text
-        )
+  @classmethod
+  def from_response(cls, response, message: Optional[str] = None) -> 'GitHubApiError':
+    if response.status_code == 403 and 'rate limit' in response.text.lower():
+      return cls(message or f"GitHub API rate limit: {response.text}",
+                 error_type=GitHubApiErrorType.RATE_LIMIT,
+                 status_code=response.status_code,
+                 response_text=response.text)
+    elif response.status_code == 404:
+      return cls(message or f"Not found: {response.text}",
+                 error_type=GitHubApiErrorType.NOT_FOUND,
+                 status_code=response.status_code,
+                 response_text=response.text)
+    else:
+      return cls(message or f"GitHub API error: {response.text}",
+                 error_type=GitHubApiErrorType.UNKNOWN,
+                 status_code=response.status_code,
+                 response_text=response.text)
+
 
 class ReleaseDataFetcher:
-    """Class responsible for fetching release data from GitHub with improved caching."""
-    
-    def __init__(self, config: Dict[str, Any], logger: Any):
-        self.config = config
-        self.logger = logger
-        self.requests = logger.requests
-        self._cache_timeout = timedelta(minutes=10)
-        self._last_cache_clear = datetime.now()
-        
-    def _log(self, message: str, level: Literal["info", "error", "debug"] = "info") -> None:
-        """Enhanced logging with levels."""
-        prefix = "ReleaseDataFetcher"
-        if level == "error":
-            self.logger.P(f"{prefix} ERROR: {message}")
-        elif level == "debug" and self.config.get('DEBUG_MODE'):
-            self.logger.P(f"{prefix} DEBUG: {message}")
-        else:
-            self.logger.P(f"{prefix}: {message}")
-            
-    def _check_and_clear_cache(self) -> None:
-        """Clear caches if they're too old."""
-        now = datetime.now()
-        if now - self._last_cache_clear > self._cache_timeout:
-            self.get_commit_message.cache_clear()
-            self.get_release_details.cache_clear()
-            self._last_cache_clear = now
-            self._log("Cache cleared", level="debug")
-            
-    def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
-        """Make a request to GitHub API with improved error handling."""
-        retries = 0
-        last_error = None
-        
-        while retries < self.config['MAX_RETRIES']:
-            try:
-                self._log(f"Request to: {url}", level="debug")
-                response = self.requests.get(
-                    url,
-                    params=params,
-                    timeout=self.config['GITHUB_API_TIMEOUT']
-                )
-                
-                if response.status_code == 200:
-                    return response.json()
-                    
-                raise GitHubApiError.from_response(response)
-                
-            except GitHubApiError as e:
-                if e.is_rate_limit or retries >= self.config['MAX_RETRIES'] - 1:
-                    raise
-                last_error = e
-                
-            except Exception as e:
-                if retries >= self.config['MAX_RETRIES'] - 1:
-                    raise GitHubApiError(
-                        f"Network error: {str(e)}",
-                        error_type=GitHubApiErrorType.NETWORK
-                    )
-                last_error = e
-                
-            retries += 1
-            self._log(
-                f"Request failed ({retries}/{self.config['MAX_RETRIES']}): {str(last_error)}",
-                level="error"
-            )
-            
-    def get_all_releases(self) -> List[Dict[str, Any]]:
-        """Fetch all releases from GitHub."""
-        self._check_and_clear_cache()
-        url = f"{self.cfg_releases_repo_url}/releases"
-        return self._make_request(url, params={"per_page": 100})
-        
-    @lru_cache(maxsize=50)
-    def get_release_details(self, release_id: str) -> GitHubReleaseData:
-        """Fetch detailed information for a specific release with caching."""
-        # Fetch release information
-        release_url = f"{self.cfg_releases_repo_url}/releases/tags/{release_id}"
-        release_data = self._make_request(release_url)
-        
-        # Fetch tag information
-        tag_url = f"{self.cfg_releases_repo_url}/git/refs/tags/{release_id}"
-        try:
-            tag_data = self._make_request(tag_url)
-        except GitHubApiError as e:
-            self._log(f"Failed to fetch tag data: {str(e)}", level="error")
-            tag_data = None
-            
-        # Get commit SHA and info
-        commit_sha = None
-        commit_info = None
-        
-        if tag_data:
-            try:
-                if tag_data['object']['type'] == 'tag':
-                    tag_object = self._make_request(tag_data['object']['url'])
-                    commit_sha = tag_object['object']['sha']
-                else:
-                    commit_sha = tag_data['object']['sha']
-                    
-                if commit_sha:
-                    commit_info = self._get_commit_info(commit_sha)
-            except GitHubApiError as e:
-                self._log(f"Failed to fetch commit data: {str(e)}", level="error")
-                
-        return GitHubReleaseData(
-            tag_name=release_data['tag_name'],
-            published_at=release_data['published_at'],
-            body=release_data.get('body', ''),
-            assets=release_data.get('assets', []),
-            commit_sha=commit_sha,
-            commit_info=commit_info,
-            tag_info=tag_data
-        )
-        
-    @lru_cache(maxsize=100)
-    def _get_commit_info(self, commit_sha: str) -> Optional[Dict[str, Any]]:
-        """Internal method to fetch commit information with caching."""
-        try:
-            commit_url = f"{self.cfg_releases_repo_url}/commits/{commit_sha}"
-            return self._make_request(commit_url)
-        except GitHubApiError as e:
-            self._log(f"Failed to fetch commit info: {str(e)}", level="error")
-            return None
-            
-    @lru_cache(maxsize=100)
-    def get_commit_message(self, commit_sha: str) -> Optional[str]:
-        """Fetch commit message with caching."""
-        commit_info = self._get_commit_info(commit_sha)
-        return commit_info['commit']['message'] if commit_info else None
+  """
+  Fetches release data from GitHub.
+  Only calls get_top_n_releases(...) to limit the fetch to the last N releases.
+  """
 
+  def __init__(self, config: Dict[str, Any], logger: Any):
+    self.config = config
+    self.logger = logger
+    self.requests = logger.requests
+    self._cache_timeout = timedelta(minutes=10)
+    self._last_cache_clear = datetime.now()
+
+  def _log(self, msg: str):
+    if self.config.get('DEBUG_MODE'):
+      self.logger.P(f"[ReleaseDataFetcher] {msg}")
+
+  def _check_and_clear_cache(self):
+    now = datetime.now()
+    if now - self._last_cache_clear > self._cache_timeout:
+      self.get_release_details.cache_clear()
+      self.get_commit_message.cache_clear()
+      self._last_cache_clear = now
+      self._log("Cleared internal lru_cache")
+
+  def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    retries = 0
+    last_exc = None
+    while retries < self.config['MAX_RETRIES']:
+      try:
+        self._log(f"GET {url} with {params}")
+        resp = self.requests.get(url, params=params, timeout=self.config['GITHUB_API_TIMEOUT'])
+        if resp.status_code == 200:
+          return resp.json()
+        else:
+          raise GitHubApiError.from_response(resp)
+      except GitHubApiError as ghe:
+        if ghe.is_rate_limit or retries >= (self.config['MAX_RETRIES'] - 1):
+          raise
+        last_exc = ghe
+      except Exception as e:
+        if retries >= (self.config['MAX_RETRIES'] - 1):
+          raise GitHubApiError(str(e), GitHubApiErrorType.NETWORK)
+        last_exc = e
+      retries += 1
+    # If we reach here, re-raise last error
+    raise last_exc
+
+  def get_top_n_releases(self, n: int) -> List[Dict[str, Any]]:
+    """
+    Fetch from GitHub the last n release objects (basic info only).
+    """
+    self._check_and_clear_cache()
+    url = f"{self.config['RELEASES_REPO_URL']}/releases"
+    # param per_page=n will limit to the top n (most recent) releases
+    return self._make_request(url, params={"per_page": n}) or []
+
+  @lru_cache(maxsize=50)
+  def get_release_details(self, tag_name: str) -> 'GitHubReleaseData':
+    self._check_and_clear_cache()
+    # 1) fetch the release by its tag
+    rurl = f"{self.config['RELEASES_REPO_URL']}/releases/tags/{tag_name}"
+    release_data = self._make_request(rurl)
+
+    # 2) fetch tag info to get commit sha
+    turl = f"{self.config['RELEASES_REPO_URL']}/git/refs/tags/{tag_name}"
+    try:
+      tag_data = self._make_request(turl)
+    except GitHubApiError as e:
+      self._log(f"Failed to fetch tag refs for {tag_name}: {e}")
+      tag_data = None
+
+    commit_sha = None
+    commit_info = None
+    if tag_data:
+      if tag_data['object']['type'] == 'tag':
+        # We have an annotated tag that points to another object
+        tag_obj = self._make_request(tag_data['object']['url'])
+        commit_sha = tag_obj['object']['sha']
+      else:
+        commit_sha = tag_data['object']['sha']
+
+      if commit_sha:
+        commit_info = self._get_commit_info(commit_sha)
+
+    body_text = release_data.get('body', '') or ""
+    if not body_text.strip() and commit_sha:
+      # fallback to commit message
+      msg = self.get_commit_message(commit_sha)
+      if msg:
+        body_text = msg
+
+    return GitHubReleaseData(
+      tag_name=release_data['tag_name'],
+      published_at=release_data['published_at'],
+      body=body_text,
+      assets=release_data.get('assets', []),
+      commit_sha=commit_sha,
+      commit_info=commit_info,
+      tag_info=tag_data,
+    )
+
+  @lru_cache(maxsize=100)
+  def _get_commit_info(self, commit_sha: str) -> Optional[Dict[str, Any]]:
+    curl = f"{self.config['RELEASES_REPO_URL']}/commits/{commit_sha}"
+    return self._make_request(curl)
+
+  @lru_cache(maxsize=100)
+  def get_commit_message(self, commit_sha: str) -> Optional[str]:
+    ci = self._get_commit_info(commit_sha)
+    if ci and 'commit' in ci and 'message' in ci['commit']:
+      return ci['commit']['message']
+    return None
 
 class ReleaseAsset:
   """Data class for release assets."""
-
   def __init__(self, name: str, size: int, browser_download_url: str):
     self.name = name
     self.size = size
@@ -643,8 +513,7 @@ class ReleaseAsset:
 
 
 class ReleaseInfo:
-  """Data class for release information."""
-
+  """Data class for release information suitable for HTML rendering."""
   def __init__(self, tag_name: str, published_at: str, body: str, assets: List[ReleaseAsset]):
     self.tag_name = tag_name
     self.published_at = published_at
@@ -665,18 +534,7 @@ class ReleaseInfo:
 
 class HtmlGenerator:
   """Class responsible for generating HTML content for the releases page."""
-
   def __init__(self, config: Dict[str, Any], plugin: 'NaeuralReleaseAppPlugin'):
-    """
-    Initialize the HTML generator.
-
-    Parameters
-    ----------
-    config : Dict[str, Any]
-        Configuration dictionary
-    plugin : NaeuralReleaseAppPlugin
-        Plugin instance that implements P() method for logging and provides re module
-    """
     self.config = config
     self.plugin = plugin
 
@@ -1000,8 +858,8 @@ class HtmlGenerator:
         <body>
             <div class="jumbo">
                 <h1>Edge Node Launcher Releases</h1>
-                <p>Download the latest version of Edge Node Launcher to stay up-to-date with new features and improvements.</p>
-                <p>This page was proudly generated by Edge Node <code>{ee_id}:{ee_addr}</code> at {last_update}.</p>
+                <p>Download the latest version of Edge Node Launcher to stay up-to-date with new features.</p>
+                <p>This page was generated by Edge Node <code>{ee_id}:{ee_addr}</code> at {last_update}.</p>
                 <button onclick="document.getElementById('latest-release').scrollIntoView({{behavior: 'smooth'}});" class="download-btn">
                     Download Edge Node Launcher
                 </button>
@@ -1022,8 +880,8 @@ class HtmlGenerator:
         """
 
   def _format_release_info(self, release: ReleaseInfo) -> str:
-    """Format release information for display."""
-    if not release.body or not release.body.strip():
+    """Format release body text for display."""
+    if not release.body.strip():
       return "No release information available"
 
     lines = release.body.strip().split('\n')
@@ -1045,22 +903,10 @@ class HtmlGenerator:
   def _generate_download_section(self, assets: List[ReleaseAsset], is_latest: bool = False) -> str:
     """
     Generate the download section HTML for a release.
-
-    Parameters
-    ----------
-    assets : List[ReleaseAsset]
-        List of release assets
-    is_latest : bool
-        Whether this is for the latest release section
-
-    Returns
-    -------
-    str
-        HTML for the download section
+    (Same as your previous logic, except no changes required here.)
     """
     download_items = []
-
-    # Helper function to find assets by pattern
+    # Helper to match by name
     def find_asset(pattern: str) -> Optional[ReleaseAsset]:
       return next((a for a in assets if self.plugin.re.search(pattern, a.name)), None)
 
@@ -1076,7 +922,6 @@ class HtmlGenerator:
     # macOS assets
     macos_arm = find_asset(r'OSX-arm64\.zip')
 
-    # Generate download items based on whether it's latest or previous release
     if is_latest:
       if linux_20_04:
         download_items.append(self._generate_download_item(linux_20_04, "linux", "Linux Ubuntu 20.04", "🐧"))
@@ -1090,355 +935,250 @@ class HtmlGenerator:
         download_items.append(self._generate_download_item(win_zip, "windows", "Windows (ZIP)", "🪟"))
       if win_msi:
         download_items.append(self._generate_download_item(win_msi, "windows", "Windows (MSI)", "🪟"))
+
+      return f"""
+        <div class="download-options">
+          <h3>Download Options:</h3>
+          <div class="download-grid">
+            {''.join(download_items)}
+          </div>
+        </div>
+      """
     else:
-      # For previous releases, organize by OS type
+      # group for previous releases
       sections = {
-        "Linux": [(linux_20_04, "Ubuntu 20.04"), (linux_22_04, "Ubuntu 22.04"), (linux_24_04, "Ubuntu 24.04")],
-        "Windows": [(win_zip, "ZIP"), (win_msi, "MSI")],
-        "macOS": [(macos_arm, "Apple Silicon")]
+        "Linux": [
+          (linux_20_04, "Ubuntu 20.04"),
+          (linux_22_04, "Ubuntu 22.04"),
+          (linux_24_04, "Ubuntu 24.04"),
+        ],
+        "Windows": [
+          (win_zip, "Windows ZIP"),
+          (win_msi, "Windows MSI"),
+        ],
+        "macOS": [
+          (macos_arm, "Apple Silicon"),
+        ],
       }
-
-      for os_name, assets in sections.items():
+      for os_name, asset_pairs in sections.items():
         items = []
-        for asset, variant in assets:
-          if asset:
+        for asset_obj, variant in asset_pairs:
+          if asset_obj:
             items.append(f"""
-                            <div class="download-item-small {os_name.lower()}">
-                                <span class="os-name">{variant}</span>
-                                <span class="file-size">{asset.size_mb:.2f} MB</span>
-                                <a href="{asset.browser_download_url}" class="download-btn-small">Download</a>
-                            </div>
-                        """)
-
+              <div class="download-item-small {os_name.lower()}">
+                <span class="os-name">{variant}</span>
+                <span class="file-size">{asset_obj.size_mb:.2f} MB</span>
+                <a href="{asset_obj.browser_download_url}" class="download-btn-small">Download</a>
+              </div>
+            """)
         if items:
           download_items.append(f"""
-                        <div class="download-section">
-                            <h4>{os_name}</h4>
-                            <div class="download-list">
-                                {''.join(items)}
-                            </div>
-                        </div>
-                    """)
+            <div class="download-section">
+              <h4>{os_name}</h4>
+              <div class="download-list">
+                {''.join(items)}
+              </div>
+            </div>
+          """)
 
-    if is_latest:
       return f"""
-                <div class="download-options">
-                    <h3>Download Options:</h3>
-                    <div class="download-grid">
-                        {''.join(download_items)}
-                    </div>
-                </div>
-            """
-    else:
-      return f"""
-                <div class="release-downloads">
-                    {''.join(download_items)}
-                </div>
-            """
+        <div class="release-downloads">
+          {''.join(download_items)}
+        </div>
+      """
 
   def generate_latest_release_section(self, release: ReleaseInfo) -> str:
-    """
-    Generate the latest release section HTML.
-
-    Parameters
-    ----------
-    release : ReleaseInfo
-        The latest release information
-
-    Returns
-    -------
-    str
-        HTML for the latest release section
-    """
     release_info = self._format_release_info(release)
     download_section = self._generate_download_section(release.assets, is_latest=True)
 
     return f"""
-            <div class="latest-release" id="latest-release">
-                <div class="release-header">
-                    <h2>Latest Release: {release.tag_name.replace("'", "")}</h2>
-                    <span class="release-date">Released on {release.formatted_date}</span>
-                </div>
-
-                <div class="release-content">
-                    <div class="release-details">
-                        <h3>Release Details:</h3>
-                        <div class="release-notes-container">
-                            <pre id="latest-release-info" class="release-notes">{release_info}</pre>
-                            <button id="latest-release-btn" class="see-more-btn" onclick="toggleContent('latest-release-info')" style="display: none;">
-                                <span class="see-more-text">See More</span>
-                                <span class="see-less-text">See Less</span>
-                            </button>
-                        </div>
-                    </div>
-                    {download_section}
-                </div>
+      <div class="latest-release" id="latest-release">
+        <div class="release-header">
+          <h2>Latest Release: {release.tag_name}</h2>
+          <span class="release-date">Released on {release.formatted_date}</span>
+        </div>
+        <div class="release-content">
+          <div class="release-details">
+            <h3>Release Details:</h3>
+            <div class="release-notes-container">
+              <pre id="latest-release-info" class="release-notes">{release_info}</pre>
+              <button id="latest-release-btn" class="see-more-btn" onclick="toggleContent('latest-release-info')" style="display: none;">
+                <span class="see-more-text">See More</span>
+                <span class="see-less-text">See Less</span>
+              </button>
             </div>
-        """
+          </div>
+          {download_section}
+        </div>
+      </div>
+    """
 
   def generate_previous_releases_section(self, releases: List[ReleaseInfo]) -> str:
     """
-    Generate the previous releases section HTML.
-
-    Parameters
-    ----------
-    releases : List[ReleaseInfo]
-        List of previous releases
-
-    Returns
-    -------
-    str
-        HTML for the previous releases section
+    Generate the previous releases section.
+    We now show *all* older releases (though the user can still click 'Show All' to expand).
     """
     release_cards = []
-    for i, release in enumerate(releases[1:]):  # Skip the latest release
-      visible_class = "visible" if (i < 2 or self.config.get('SHOW_ALL_RELEASES_BY_DEFAULT', False)) else ""
+    # releases[0] is the "latest"; so we skip that for "previous"
+    for i, release in enumerate(releases[1:], start=1):
+      visible_class = "visible" if (i <= 2 or self.config.get('SHOW_ALL_RELEASES_BY_DEFAULT', False)) else ""
       release_info = self._format_release_info(release)
       download_section = self._generate_download_section(release.assets, is_latest=False)
-
       release_cards.append(f"""
-                <div class="release-card {visible_class}" id="release-row-{i}">
-                    <div class="release-card-header">
-                        <h3>{release.tag_name.replace("'", "")}</h3>
-                        <span class="release-date">{release.formatted_date}</span>
-                    </div>
-                    <div class="release-card-content">
-                        <div class="release-info">
-                            <div id="release-info-{release.safe_tag_name}" class="commit-info">
-                                {release_info}
-                            </div>
-                            <button id="btn-{release.safe_tag_name}" class="see-more-btn" onclick="toggleContent('release-info-{release.safe_tag_name}')" style="display: none;">
-                                <span class="see-more-text">See More</span>
-                                <span class="see-less-text">See Less</span>
-                            </button>
-                        </div>
-                        {download_section}
-                    </div>
-                </div>
-            """)
+        <div class="release-card {visible_class}" id="release-row-{i}">
+          <div class="release-card-header">
+            <h3>{release.tag_name}</h3>
+            <span class="release-date">{release.formatted_date}</span>
+          </div>
+          <div class="release-card-content">
+            <div class="release-info">
+              <div id="release-info-{release.safe_tag_name}" class="commit-info">
+                {release_info}
+              </div>
+              <button id="btn-{release.safe_tag_name}" class="see-more-btn" onclick="toggleContent('release-info-{release.safe_tag_name}')" style="display: none;">
+                <span class="see-more-text">See More</span>
+                <span class="see-less-text">See Less</span>
+              </button>
+            </div>
+            {download_section}
+          </div>
+        </div>
+      """)
 
-    show_all_button_text = "Show Less" if self.config.get('SHOW_ALL_RELEASES_BY_DEFAULT',
-                                                          False) else "Show All Releases"
+    show_all_button_text = "Show Less" if self.config.get('SHOW_ALL_RELEASES_BY_DEFAULT', False) else "Show All Releases"
 
     return f"""
-            <div class="previous-releases">
-                <h2>Previous Releases</h2>
-                <div class="releases-container">
-                    {''.join(release_cards)}
-                </div>
-                <button id="show-all-btn" class="show-all-btn" onclick="toggleAllReleases()">{show_all_button_text}</button>
-            </div>
-        """
+      <div class="previous-releases">
+        <h2>Previous Releases</h2>
+        <div class="releases-container">
+          {''.join(release_cards)}
+        </div>
+        <button id="show-all-btn" class="show-all-btn" onclick="toggleAllReleases()">
+          {show_all_button_text}
+        </button>
+      </div>
+    """
 
   def generate_javascript(self) -> str:
-    """Generate the JavaScript code for the page."""
+    """Same JS as before, unmodified."""
     return """
-            <script>
-                // Check if content needs expansion and show button only if needed
-                function checkContentOverflow(contentId, buttonId) {
-                    const content = document.getElementById(contentId);
-                    const button = document.getElementById(buttonId);
+      <script>
+        function checkContentOverflow(contentId, buttonId) {
+          const content = document.getElementById(contentId);
+          const button = document.getElementById(buttonId);
+          if (!content || !button) return;
 
-                    if (!content || !button) return;
+          if (content.tagName === 'PRE') {
+            if (content.scrollHeight > content.clientHeight || content.textContent.split('\\n').length > 4) {
+              button.style.display = 'block';
+            }
+          } else {
+            const hasHiddenItems = content.querySelectorAll('li.hidden').length > 0;
+            const isOverflowing = content.scrollHeight > content.clientHeight;
+            const hasManyParagraphs = content.textContent.split('\\n').length > 3;
+            if (hasHiddenItems || isOverflowing || hasManyParagraphs) {
+              button.style.display = 'block';
+            }
+          }
+        }
+        function toggleContent(id) {
+          const element = document.getElementById(id);
+          const buttonId = id === 'latest-release-info' ? 'latest-release-btn' : 'btn-' + id.replace('release-info-', '');
+          const button = document.getElementById(buttonId);
 
-                    // For pre elements (latest release)
-                    if (content.tagName === 'PRE') {
-                        // Only show button if content is taller than default height or has multiple paragraphs
-                        if (content.scrollHeight > content.clientHeight || content.textContent.split('\\n').length > 4) {
-                            button.style.display = 'block';
-                        }
-                    }
-                    // For div elements with commit info (previous releases)
-                    else {
-                        // Check if there are hidden list items or if content is overflowing
-                        const hasHiddenItems = content.querySelectorAll('li.hidden').length > 0;
-                        const isOverflowing = content.scrollHeight > content.clientHeight;
-                        const hasManyParagraphs = content.textContent.split('\\n').length > 3;
+          element.classList.toggle('expanded');
+          if (button) button.classList.toggle('expanded');
 
-                        if (hasHiddenItems || isOverflowing || hasManyParagraphs) {
-                            button.style.display = 'block';
-                        }
-                    }
-                }
-
-                function toggleContent(id) {
-                    const element = document.getElementById(id);
-                    const buttonId = id === 'latest-release-info' ? 'latest-release-btn' : 'btn-' + id.replace('release-info-', '');
-                    const button = document.getElementById(buttonId);
-
-                    element.classList.toggle('expanded');
-                    if (button) button.classList.toggle('expanded');
-
-                    // Show all list items when expanded
-                    if (element.classList.contains('expanded')) {
-                        const listItems = element.querySelectorAll('li');
-                        listItems.forEach(item => {
-                            item.classList.add('visible');
-                            item.classList.remove('hidden');
-                        });
-                    } else {
-                        // Hide items beyond the first 2 when collapsed
-                        const listItems = element.querySelectorAll('li');
-                        listItems.forEach((item, index) => {
-                            if (index >= 2) {
-                                item.classList.add('hidden');
-                                item.classList.remove('visible');
-                            }
-                        });
-                    }
-                }
-
-                function toggleAllReleases() {
-                    const button = document.getElementById('show-all-btn');
-                    const rows = document.querySelectorAll('.release-card');
-                    const hiddenRows = document.querySelectorAll('.release-card:not(.visible)');
-
-                    if (hiddenRows.length > 0) {
-                        rows.forEach(row => row.classList.add('visible'));
-                        button.textContent = 'Show Less';
-                    } else {
-                        rows.forEach((row, index) => {
-                            if (index >= 2) {
-                                row.classList.remove('visible');
-                            }
-                        });
-                        button.textContent = 'Show All Releases';
-                    }
-                }
-
-                // Initialize on page load
-                document.addEventListener('DOMContentLoaded', function() {
-                    // Initialize latest release
-                    checkContentOverflow('latest-release-info', 'latest-release-btn');
-
-                    // Initialize previous releases
-                    const commitInfos = document.querySelectorAll('.commit-info');
-                    commitInfos.forEach(info => {
-                        // Process list items
-                        const listItems = info.querySelectorAll('li');
-                        listItems.forEach((item, index) => {
-                            if (index >= 2) {
-                                item.classList.add('hidden');
-                            } else {
-                                item.classList.add('visible');
-                            }
-                        });
-
-                        // Check if button should be shown
-                        const infoId = info.id;
-                        const btnId = 'btn-' + infoId.replace('release-info-', '');
-                        checkContentOverflow(infoId, btnId);
-                    });
-                });
-            </script>
-        """
+          if (element.classList.contains('expanded')) {
+            const listItems = element.querySelectorAll('li');
+            listItems.forEach(item => {
+              item.classList.add('visible');
+              item.classList.remove('hidden');
+            });
+          } else {
+            const listItems = element.querySelectorAll('li');
+            listItems.forEach((item, index) => {
+              if (index >= 2) {
+                item.classList.add('hidden');
+                item.classList.remove('visible');
+              }
+            });
+          }
+        }
+        function toggleAllReleases() {
+          const button = document.getElementById('show-all-btn');
+          const rows = document.querySelectorAll('.release-card');
+          const hiddenRows = document.querySelectorAll('.release-card:not(.visible)');
+          if (hiddenRows.length > 0) {
+            rows.forEach(row => row.classList.add('visible'));
+            button.textContent = 'Show Less';
+          } else {
+            rows.forEach((row, index) => {
+              if (index >= 2) {
+                row.classList.remove('visible');
+              }
+            });
+            button.textContent = 'Show All Releases';
+          }
+        }
+        document.addEventListener('DOMContentLoaded', function() {
+          checkContentOverflow('latest-release-info', 'latest-release-btn');
+          const commitInfos = document.querySelectorAll('.commit-info');
+          commitInfos.forEach(info => {
+            const listItems = info.querySelectorAll('li');
+            listItems.forEach((item, index) => {
+              if (index >= 2) {
+                item.classList.add('hidden');
+              } else {
+                item.classList.add('visible');
+              }
+            });
+            const infoId = info.id;
+            const btnId = 'btn-' + infoId.replace('release-info-', '');
+            checkContentOverflow(infoId, btnId);
+          });
+        });
+      </script>
+    """
 
   def generate_complete_html(self, releases: List[ReleaseInfo], ee_id: str, ee_addr: str, last_update: str) -> str:
     """
-    Generate the complete HTML page.
-
-    Parameters
-    ----------
-    releases : List[ReleaseInfo]
-        List of all releases
-    ee_id : str
-        Edge Node ID
-    ee_addr : str
-        Edge Node address
-    last_update : str
-        Last update timestamp
-
-    Returns
-    -------
-    str
-        Complete HTML page
+    Generate the complete HTML page from the list of ReleaseInfo objects.
+    The first release is the "latest," and everything else is in "previous" section.
     """
     if not releases:
       return "<html><body><h1>No releases available</h1></body></html>"
 
     return (
-        self.generate_html_head() +
-        self.generate_jumbo_section(ee_id, ee_addr, last_update) +
-        self.generate_latest_release_section(releases[0]) +
-        self.generate_previous_releases_section(releases) +
-        self.generate_javascript() +
-        "</body></html>"
+      self.generate_html_head() +
+      self.generate_jumbo_section(ee_id, ee_addr, last_update) +
+      self.generate_latest_release_section(releases[0]) +
+      self.generate_previous_releases_section(releases) +
+      self.generate_javascript() +
+      "</body></html>"
     )
 
 
 class ReleaseDataProcessor:
-  """Class responsible for processing and converting release data."""
-
   def __init__(self, logger):
-    """
-    Initialize the processor.
-
-    Parameters
-    ----------
-    logger : Any
-        Logger object that implements P() method
-    """
     self.logger = logger
 
-  def convert_to_release_info(self, release_data: dict, commit_info: Optional[dict] = None) -> ReleaseInfo:
-    """
-    Convert raw release data to a ReleaseInfo object.
-
-    Parameters
-    ----------
-    release_data : dict
-        Raw release data from GitHub API
-    commit_info : Optional[dict]
-        Optional commit information
-
-    Returns
-    -------
-    ReleaseInfo
-        Structured release information
-    """
+  def convert_to_release_info(self, release_data: Dict[str, Any]) -> 'ReleaseInfo':
+    # same as before
     assets = []
-    for asset_data in release_data.get('assets', []):
-      assets.append(ReleaseAsset(
-        name=asset_data['name'],
-        size=asset_data['size'],
-        browser_download_url=asset_data['browser_download_url']
-      ))
-
-    # Get release body, falling back to commit message if needed
-    body = release_data.get('body', '').strip()
-    if not body and commit_info and commit_info.get('commit'):
-      body = commit_info['commit'].get('message', '')
-
+    for a in release_data.get('assets', []):
+      assets.append(ReleaseAsset(a['name'], a['size'], a['browser_download_url']))
     return ReleaseInfo(
       tag_name=release_data['tag_name'],
       published_at=release_data['published_at'],
-      body=body,
+      body=release_data.get('body', '') or '',
       assets=assets
     )
 
-  def process_releases(self, raw_releases: List[dict], raw_tags: List[dict]) -> List[ReleaseInfo]:
-    """
-    Process raw releases and tags into ReleaseInfo objects.
-
-    Parameters
-    ----------
-    raw_releases : List[dict]
-        List of raw release data from GitHub API
-    raw_tags : List[dict]
-        List of raw tag data from GitHub API
-
-    Returns
-    -------
-    List[ReleaseInfo]
-        List of processed release information
-    """
+  def process_releases(self, raw_releases: List[Dict[str, Any]]) -> List['ReleaseInfo']:
+    """Turn the fully-fetched release dicts into a list of ReleaseInfo."""
     releases = []
-    for release in raw_releases:
-      # Find matching tag
-      tag = next((t for t in raw_tags if t['name'] == release['tag_name']), None)
-      commit_info = None
-      if tag:
-        commit_info = release.get('commit_info')
-
-      releases.append(self.convert_to_release_info(release, commit_info))
+    for r in raw_releases:
+      ri = self.convert_to_release_info(r)
+      releases.append(ri)
     return releases
