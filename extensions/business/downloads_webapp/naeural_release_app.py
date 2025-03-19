@@ -45,6 +45,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.html_generator = HtmlGenerator(self.CONFIG, self)
       self.data_processor = ReleaseDataProcessor(self)
       self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self, self.cfg_releases_repo_url, self.cfg_max_retries, self.cfg_github_api_timeout, self.cfg_debug_mode)
+      self._cached_releases = self._load_cached_releases()
       return
 
 
@@ -89,7 +90,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       func_name = "get_latest_releases"
       try:
           # 1) Load current cache
-          cached = self._load_cached_releases()
+          cached = self._cached_releases
           cached_tags = {c['tag_name'] for c in cached}
 
           # 2) Get the *latest N* from GitHub (just basic info)
@@ -144,7 +145,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           msg = f"{func_name}: GitHubApiError {gh_e}"
           self.log_error(func_name, msg)
           # fallback to cache if possible
-          fallback = self._load_cached_releases()
+          fallback = self._cached_releases
           if fallback:
               fallback.sort(key=lambda x: x['published_at'], reverse=True)
               self.P(f"{func_name}: returning fallback from cache: {len(fallback)} items.")
@@ -154,7 +155,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       except Exception as e:
           msg = f"{func_name}: Unexpected error: {str(e)}"
           self.log_error(func_name, msg, e)
-          fallback = self._load_cached_releases()
+          fallback = self._cached_releases
           if fallback:
               fallback.sort(key=lambda x: x['published_at'], reverse=True)
               self.P(f"{func_name}: returning fallback from cache: {len(fallback)} items.")
