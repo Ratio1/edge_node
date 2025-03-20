@@ -1,4 +1,14 @@
-import traceback
+"""
+This module implements a FastAPI supervisor plugin that fetches release information
+for the Edge Node Launcher from a GitHub repository, compiles it, and regenerates
+an HTML page with the latest releases and download links.
+
+Classes
+-------
+NaeuralReleaseAppPlugin
+  Subclass of the SupervisorFastApiWebApp, providing overrides for release fetching
+  and HTML generation functionality.
+"""
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, TypedDict
 from dataclasses import dataclass, field
@@ -23,8 +33,8 @@ _CONFIG = {
       }
     ]
   },
-  'NR_PREVIOUS_RELEASES': 5,
-  'RELEASES_TO_FETCH': 50,
+  'NR_PREVIOUS_RELEASES': 5, # The number of previous releases that has to be fetched
+  'RELEASES_TO_FETCH': 50, # The amount of releases to check from GitHub
   'REGENERATION_INTERVAL': 10 * 60,
   "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
   'VALIDATION_RULES': {
