@@ -83,100 +83,170 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
   def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
       """
-      Fetch from GitHub only the last `cfg_nr_previous_releases` basic releases.
-      For each of those that are not yet cached, fetch full details and add them to the cache.
-      Keep old releases in the cache (never remove them).
-      Return the *entire* cached release list (including older ones), sorted desc by date.
+      1. Check GitHub releases until we find NR_PREVIOUS_RELEASES valid ones
+      2. Check which of those valid ones are already in our cache
+      3. Download complete details for valid ones not in cache
+      4. Add these to cache
+      5. Return the NR_PREVIOUS_RELEASES valid releases
+      
+      A valid release has all required assets: Ubuntu 22.04, Windows MSI, Windows ZIP, macOS ARM.
       """
       func_name = "get_latest_releases"
       try:
           # 1) Load current cache
           cached = self._cached_releases
           cached_tags = {c['tag_name'] for c in cached}
+          self.P(f"{func_name}: Loaded {len(cached)} releases from cache")
 
-          # 2) Get the *latest N* from GitHub (just basic info)
+          # 2) Get releases from GitHub (basic info)
           n = self.cfg_releases_to_fetch
-          top_n_basic = self.release_fetcher.get_top_n_releases(n)
-          if not top_n_basic:
-              # If GitHub returned nothing, fallback to cache if we have any
+          github_releases = self.release_fetcher.get_top_n_releases(n)
+          
+          if not github_releases:
+              # If GitHub returned nothing, use what's in cache
               if cached:
-                  self.P(f"{func_name}: GitHub returned 0, using cached = {len(cached)}.")
-                  # Sort cache by date desc for consistency
                   cached.sort(key=lambda x: x['published_at'], reverse=True)
-                  return cached, None
+                  top_cached = cached[:self.cfg_nr_previous_releases]
+                  self.P(f"{func_name}: GitHub returned 0 releases, using {len(top_cached)} cached releases")
+                  return top_cached, None
               else:
-                  return [], {'message': "No releases found & no cache available", 'rate_limited': False}
+                  return [], {'message': "No releases found from GitHub & no cache available", 'rate_limited': False}
 
-          # 3) For each of those top N, if not in cache, fetch details
-          new_full = []
-          for r in top_n_basic:
+          self.P(f"{func_name}: GitHub returned {len(github_releases)} basic releases")
+          
+          # 3) Find NR_PREVIOUS_RELEASES valid releases from GitHub
+          valid_github_releases = []
+          for release in github_releases:
+              assets = release.get('assets', [])
+              asset_names = [a.get('name', '') for a in assets]
+              
+              # Check for all required assets
+              has_ubuntu_22_04 = any('LINUX_Ubuntu-22.04.AppImage' in name for name in asset_names)
+              has_windows_zip = any('Windows_msi.zip' in name for name in asset_names)
+              has_windows_msi = any(name.endswith('Windows.msi') for name in asset_names)
+              has_macos_arm = any('OSX-arm64.zip' in name for name in asset_names)
+              
+              if has_ubuntu_22_04 and has_windows_zip and has_windows_msi and has_macos_arm:
+                  valid_github_releases.append(release)
+                  self.P(f"{func_name}: Found valid release {release['tag_name']} with all required assets")
+                  
+                  # Stop once we've found enough valid releases
+                  if len(valid_github_releases) >= self.cfg_nr_previous_releases:
+                      self.P(f"{func_name}: Found {self.cfg_nr_previous_releases} valid releases, stopping search")
+                      break
+              else:
+                  missing = []
+                  if not has_ubuntu_22_04: missing.append("Ubuntu 22.04")
+                  if not has_windows_zip: missing.append("Windows ZIP")
+                  if not has_windows_msi: missing.append("Windows MSI")
+                  if not has_macos_arm: missing.append("macOS ARM")
+                  self.P(f"{func_name}: Skipping invalid release {release['tag_name']} - missing assets: {', '.join(missing)}")
+          
+          if not valid_github_releases:
+              # If no valid releases found on GitHub, use what's in cache
+              if cached:
+                  cached.sort(key=lambda x: x['published_at'], reverse=True)
+                  top_cached = cached[:self.cfg_nr_previous_releases]
+                  self.P(f"{func_name}: No valid releases from GitHub, using {len(top_cached)} cached releases")
+                  return top_cached, None
+              else:
+                  return [], {'message': "No valid releases found with all required assets", 'rate_limited': False}
+          
+          self.P(f"{func_name}: Found {len(valid_github_releases)} valid releases from GitHub")
+          
+          # 4) Check which valid releases are already in cache
+          new_valid_releases = []
+          cached_valid_releases = []
+          
+          for release in valid_github_releases:
+              if release['tag_name'] in cached_tags:
+                  cached_release = next(c for c in cached if c['tag_name'] == release['tag_name'])
+                  cached_valid_releases.append(cached_release)
+                  self.P(f"{func_name}: Release {release['tag_name']} already in cache")
+              else:
+                  new_valid_releases.append(release)
+                  self.P(f"{func_name}: Release {release['tag_name']} needs to be downloaded")
+          
+          self.P(f"{func_name}: {len(cached_valid_releases)} valid releases in cache, {len(new_valid_releases)} need download")
+          
+          # 5) Download complete details for new valid releases
+          new_full_releases = []
+          
+          for r in new_valid_releases:
               tag = r['tag_name']
-              if tag not in cached_tags:
-                  # fetch and store
-                  try:
-                      details = self.release_fetcher.get_release_details(tag)
-                      new_full.append({
-                          'tag_name': details.tag_name,
-                          'published_at': details.published_at,
-                          'body': details.body,
-                          'assets': details.assets,
-                          'commit_sha': details.commit_sha,
-                          'commit_info': details.commit_info,
-                          'tag_info': details.tag_info
-                      })
-                      self.P(f"{func_name}: Downloaded new release: {tag}")
-                  except GitHubApiError as e:
-                      if e.is_rate_limit:
-                          raise
-                      # else log and skip
-                      self.log_error(func_name, f"Failed to fetch release details for {tag}: {str(e)}")
-
-          # 4) Add newly fetched items to the cache, never removing older items
-          if new_full:
-              extended_cache = cached + new_full
-              extended_cache.sort(key=lambda x: x['published_at'], reverse=True)
-              self._save_cached_releases(extended_cache)
-              return extended_cache, None
-          else:
-              # No new releases discovered => just return the existing cache sorted
-              cached.sort(key=lambda x: x['published_at'], reverse=True)
-              return cached, None
+              try:
+                  details = self.release_fetcher.get_release_details(tag)
+                  new_release = {
+                      'tag_name': details.tag_name,
+                      'published_at': details.published_at,
+                      'body': details.body,
+                      'assets': details.assets,
+                      'commit_sha': details.commit_sha,
+                      'commit_info': details.commit_info,
+                      'tag_info': details.tag_info
+                  }
+                  new_full_releases.append(new_release)
+                  self.P(f"{func_name}: Downloaded complete details for release: {tag}")
+              except GitHubApiError as e:
+                  if e.is_rate_limit:
+                      raise
+                  self.log_error(func_name, f"Failed to fetch release details for {tag}: {str(e)}")
+          
+          # 6) Add new valid releases to cache
+          if new_full_releases:
+              updated_cache = [r for r in cached if r['tag_name'] not in {nf['tag_name'] for nf in new_full_releases}]
+              updated_cache.extend(new_full_releases)
+              updated_cache.sort(key=lambda x: x['published_at'], reverse=True)
+              self._save_cached_releases(updated_cache)
+              self.P(f"{func_name}: Added {len(new_full_releases)} new releases to cache")
+          
+          # 7) Combine cached valid releases with new full releases and return
+          result = cached_valid_releases + new_full_releases
+          result.sort(key=lambda x: x['published_at'], reverse=True)
+          
+          # In case we couldn't download some releases, ensure we don't exceed NR_PREVIOUS_RELEASES
+          result = result[:self.cfg_nr_previous_releases]
+          
+          self.P(f"{func_name}: Returning {len(result)} valid releases")
+          return result, None
 
       except GitHubApiError as gh_e:
           msg = f"{func_name}: GitHubApiError {gh_e}"
           self.log_error(func_name, msg)
-          # fallback to cache if possible
-          fallback = self._cached_releases
-          if fallback:
-              fallback.sort(key=lambda x: x['published_at'], reverse=True)
-              self.P(f"{func_name}: returning fallback from cache: {len(fallback)} items.")
-              return fallback, None
+          # fallback to cached releases
+          if self._cached_releases:
+              fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
+              result = fallback[:self.cfg_nr_previous_releases]
+              self.P(f"{func_name}: GitHub API error, using {len(result)} cached releases")
+              return result, None
+          
           return [], {'message': msg, 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}
 
       except Exception as e:
           msg = f"{func_name}: Unexpected error: {str(e)}"
           self.log_error(func_name, msg, e)
-          fallback = self._cached_releases
-          if fallback:
-              fallback.sort(key=lambda x: x['published_at'], reverse=True)
-              self.P(f"{func_name}: returning fallback from cache: {len(fallback)} items.")
-              return fallback, None
+          # fallback to cached releases
+          if self._cached_releases:
+              fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
+              result = fallback[:self.cfg_nr_previous_releases]
+              self.P(f"{func_name}: Unexpected error, using {len(result)} cached releases")
+              return result, None
+          
           return [], {'message': msg, 'rate_limited': False}
 
   def compile_release_info(self, releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
       """
       Turn the raw release dicts (already fully fetched) into the final shape needed for HTML.
-      We do not re-fetch from GitHub here. We simply trust what's in the cache.
+      All releases passed to this method are already verified to have all required assets.
       """
       if not releases:
-          self.log_error("compile_release_info", "No releases provided.")
+          self.log_error("compile_release_info", "No valid releases provided.")
           return []
 
-      # Sort descending by published date
+      # Make sure they're sorted descending by published date
       sorted_releases = sorted(releases, key=lambda x: x['published_at'], reverse=True)
-      # Optionally, you can slice them *here* if you only want to SHOW the last N, but
-      # the user said "all from cache are displayed," so we skip slicing.
-      # sorted_releases = sorted_releases[:self.cfg_nr_previous_releases]  # <--- if you wanted
+      
+      self.P(f"compile_release_info: Processing {len(sorted_releases)} valid releases")
       return sorted_releases
 
   def _regenerate_index_html(self) -> bool:
@@ -910,12 +980,12 @@ class HtmlGenerator:
     macos_arm = find_asset(r'OSX-arm64\.zip')
 
     if is_latest:
-      if win_zip:
-        download_items.append(self._generate_download_item(win_zip, "windows", "Windows (ZIP)", "🪟"))
       if win_msi:
         download_items.append(self._generate_download_item(win_msi, "windows", "Windows (MSI)", "🪟"))
       if linux_22_04:
         download_items.append(self._generate_download_item(linux_22_04, "linux", "Linux Ubuntu 22.04", "🐧"))
+      if win_zip:
+        download_items.append(self._generate_download_item(win_zip, "windows", "Windows (ZIP)", "🪟"))
       if macos_arm:
         download_items.append(self._generate_download_item(macos_arm, "macos", "macOS (Apple Silicon)", "🍎"))
 
@@ -1157,9 +1227,17 @@ class ReleaseDataProcessor:
     )
 
   def process_releases(self, raw_releases: List[Dict[str, Any]]) -> List['ReleaseInfo']:
-    """Turn the fully-fetched release dicts into a list of ReleaseInfo."""
+    """
+    Turn the fully-fetched release dicts into a list of ReleaseInfo.
+    All releases passed to this method are already verified to have all required assets.
+    """
     releases = []
+    
     for r in raw_releases:
+      # Convert to ReleaseInfo object
       ri = self.convert_to_release_info(r)
       releases.append(ri)
+      self.logger.P(f"[ReleaseDataProcessor] Processed valid release {r.get('tag_name')}")
+        
+    self.logger.P(f"[ReleaseDataProcessor] Processed {len(releases)} valid releases")
     return releases
