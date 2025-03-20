@@ -45,7 +45,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self._last_day_regenerated = (self.datetime.now() - self.timedelta(days=1)).day
     self.__last_generation_time = 0
     self.html_generator = HtmlGenerator(self.CONFIG, self)
-    self.data_processor = ReleaseDataProcessor(self)
     self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self, self.cfg_releases_repo_url, self.cfg_max_retries,
                                               self.cfg_github_api_timeout, self.cfg_debug_mode)
     self._cached_releases = self._load_cached_releases()
@@ -257,12 +256,25 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
     # 2) Process the releases into the shape the HTML generator expects
     try:
-      # Convert raw releases directly into our ReleaseInfo objects for HTML
-      releases_for_html = self.data_processor.process_releases(raw_releases)
+      # Convert raw_releases directly to ReleaseInfo objects
+      releases_for_html = []
+      for release_data in raw_releases:
+        assets = []
+        for asset in release_data.get('assets', []):
+          assets.append(ReleaseAsset(asset['name'], asset['size'], asset['browser_download_url']))
+        
+        release_info = ReleaseInfo(
+          tag_name=release_data['tag_name'],
+          published_at=release_data['published_at'],
+          body=release_data.get('body', '') or '',
+          assets=assets
+        )
+        releases_for_html.append(release_info)
+      
       self.P(f"{func_name}: Successfully processed {len(releases_for_html)} releases for HTML generation")
 
     except Exception as e:
-      error_msg = f"{func_name}: Error in data_processor: {str(e)}"
+      error_msg = f"{func_name}: Error processing release data: {str(e)}"
       self.log_error(func_name, error_msg, e)
       return False
 
@@ -1195,35 +1207,3 @@ class HtmlGenerator:
         self.generate_javascript() +
         "</body></html>"
     )
-
-
-class ReleaseDataProcessor:
-  def __init__(self, logger):
-    self.logger = logger
-
-  def convert_to_release_info(self, release_data: Dict[str, Any]) -> 'ReleaseInfo':
-    # same as before
-    assets = []
-    for a in release_data.get('assets', []):
-      assets.append(ReleaseAsset(a['name'], a['size'], a['browser_download_url']))
-    return ReleaseInfo(
-      tag_name=release_data['tag_name'],
-      published_at=release_data['published_at'],
-      body=release_data.get('body', '') or '',
-      assets=assets
-    )
-
-  def process_releases(self, raw_releases: List[Dict[str, Any]]) -> List['ReleaseInfo']:
-    """
-    Turn the fully-fetched release dicts into a list of ReleaseInfo.
-    All releases passed to this method are already verified to have all required assets.
-    """
-    releases = []
-
-    for r in raw_releases:
-      # Convert to ReleaseInfo object
-      ri = self.convert_to_release_info(r)
-      releases.append(ri)
-
-    self.logger.P(f"[ReleaseDataProcessor] Processed {len(releases)} valid releases")
-    return releases
