@@ -2,7 +2,7 @@ import traceback
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, TypedDict
 from dataclasses import dataclass, field
-from functools import lru_cache
+from functools import lru_cache, wraps
 from enum import Enum
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
@@ -37,6 +37,28 @@ _CONFIG = {
 }
 
 
+def handle_errors(func_name=None, fallback_value=None):
+    """Decorator for handling errors in methods.
+    Args:
+      func_name: The name to use in error messages. If None, uses the method name.
+      fallback_value: The value to return if an exception occurs.
+    """
+    def decorator(method):
+        @wraps(method)
+        def wrapper(self, *args, **kwargs):
+            nonlocal func_name
+            if func_name is None:
+                func_name = method.__name__
+            try:
+                return method(self, *args, **kwargs)
+            except Exception as e:
+                error_msg = f"{func_name}: Error: {str(e)}"
+                self.log_error(func_name, error_msg, e)
+                return fallback_value
+        return wrapper
+    return decorator
+
+
 class NaeuralReleaseAppPlugin(BasePlugin):
   CONFIG = _CONFIG
 
@@ -50,26 +72,21 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self._cached_releases = self._load_cached_releases()
     return
 
+  @handle_errors(fallback_value=[])
   def _load_cached_releases(self) -> List[Dict[str, Any]]:
     """Load cached releases from pickle, or return an empty list on failure."""
-    try:
-      data = self.diskapi_load_pickle_from_data(RELEASES_CACHE_FILE)
-      if data:
-        self.P(f"_load_cached_releases: Loaded {len(data)} from cache.")
-        return data
-    except Exception as e:
-      self.log_error("_load_cached_releases", f"Failed to load cache: {str(e)}")
+    data = self.diskapi_load_pickle_from_data(RELEASES_CACHE_FILE)
+    if data:
+      self.P(f"_load_cached_releases: Loaded {len(data)} from cache.")
+      return data
     return []
 
+  @handle_errors(fallback_value=False)
   def _save_cached_releases(self, releases: List[Dict[str, Any]]) -> bool:
     """Save the entire release list back to pickle cache."""
-    try:
-      self.diskapi_save_pickle_to_data(releases, RELEASES_CACHE_FILE)
-      self.P(f"_save_cached_releases: Saved {len(releases)} release(s) to cache.")
-      return True
-    except Exception as e:
-      self.log_error("_save_cached_releases", f"Failed to save cache: {str(e)}")
-      return False
+    self.diskapi_save_pickle_to_data(releases, RELEASES_CACHE_FILE)
+    self.P(f"_save_cached_releases: Saved {len(releases)} release(s) to cache.")
+    return True
 
   def log_error(self, func_name: str, error_msg: str, exc_info: Optional[Exception] = None) -> str:
     details = [f"ERROR in {func_name}:", error_msg]
@@ -192,6 +209,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           updated_cache = [r for r in self._cached_releases if r['tag_name'] not in {nf['tag_name'] for nf in new_full_releases}]
           updated_cache.extend(new_full_releases)
           updated_cache.sort(key=lambda x: x['published_at'], reverse=True)
+          self._cached_releases = updated_cache
           self._save_cached_releases(updated_cache)
           self.P(f"{func_name}: Added {len(new_full_releases)} new releases to cache")
       else:
@@ -229,6 +247,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       return [], {'message': msg, 'rate_limited': False}
 
+  @handle_errors(fallback_value=True)
   def _regenerate_index_html(self) -> bool:
     """
     Fetch/compile the full set of releases from cache+GitHub, then
@@ -256,20 +275,19 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
     # 2) Process the releases into the shape the HTML generator expects
     try:
-      # Convert raw_releases directly to ReleaseInfo objects
-      releases_for_html = []
-      for release_data in raw_releases:
-        assets = []
-        for asset in release_data.get('assets', []):
-          assets.append(ReleaseAsset(asset['name'], asset['size'], asset['browser_download_url']))
-        
-        release_info = ReleaseInfo(
+      # Convert raw_releases directly to ReleaseInfo objects using list comprehension
+      releases_for_html = [
+        ReleaseInfo(
           tag_name=release_data['tag_name'],
           published_at=release_data['published_at'],
           body=release_data.get('body', '') or '',
-          assets=assets
+          assets=[
+            ReleaseAsset(asset['name'], asset['size'], asset['browser_download_url']) 
+            for asset in release_data.get('assets', [])
+          ]
         )
-        releases_for_html.append(release_info)
+        for release_data in raw_releases
+      ]
       
       self.P(f"{func_name}: Successfully processed {len(releases_for_html)} releases for HTML generation")
 
@@ -304,31 +322,27 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.log_error(func_name, error_msg, e)
       return False
 
+  @handle_errors(fallback_value=True)
   def _maybe_regenerate_index_html(self) -> bool:
     """
     Check if enough time has passed since last regeneration. If so, regenerate.
     """
     func_name = "_maybe_regenerate_index_html"
-    try:
-      current_time = self.time()
-      if (current_time - self.__last_generation_time) > self.cfg_regeneration_interval:
-        self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
-        result = self._regenerate_index_html()
-        current_day = self.datetime.now().day
+    current_time = self.time()
+    if (current_time - self.__last_generation_time) > self.cfg_regeneration_interval:
+      self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
+      result = self._regenerate_index_html()
+      current_day = self.datetime.now().day
 
-        # Whether success or failure, update the generation time to avoid repeated attempts
-        self.__last_generation_time = current_time
+      # Whether success or failure, update the generation time to avoid repeated attempts
+      self.__last_generation_time = current_time
 
-        if result:
-          self._last_day_regenerated = current_day
-          self.P(f"{func_name}: HTML regeneration successful.")
-        else:
-          self.P(f"{func_name}: HTML regeneration failed (see logs).")
-      return True
-    except Exception as e:
-      error_msg = f"{func_name}: Unhandled error: {str(e)}"
-      self.log_error(func_name, error_msg, e)
-      return False
+      if result:
+        self._last_day_regenerated = current_day
+        self.P(f"{func_name}: HTML regeneration successful.")
+      else:
+        self.P(f"{func_name}: HTML regeneration failed (see logs).")
+    return True
 
   def process(self):
     """Called periodically. Triggers the conditional regeneration of the HTML."""
@@ -552,13 +566,12 @@ class ReleaseDataFetcher:
     return None
 
 
+@dataclass
 class ReleaseAsset:
   """Data class for release assets."""
-
-  def __init__(self, name: str, size: int, browser_download_url: str):
-    self.name = name
-    self.size = size
-    self.browser_download_url = browser_download_url
+  name: str
+  size: int
+  browser_download_url: str
 
   @property
   def size_mb(self) -> float:
@@ -566,14 +579,13 @@ class ReleaseAsset:
     return self.size / (1024 * 1024)
 
 
+@dataclass
 class ReleaseInfo:
   """Data class for release information suitable for HTML rendering."""
-
-  def __init__(self, tag_name: str, published_at: str, body: str, assets: List[ReleaseAsset]):
-    self.tag_name = tag_name
-    self.published_at = published_at
-    self.body = body
-    self.assets = assets
+  tag_name: str
+  published_at: str
+  body: str
+  assets: List[ReleaseAsset]
 
   @property
   def safe_tag_name(self) -> str:
@@ -957,36 +969,29 @@ class HtmlGenerator:
     return formatted
 
   def _generate_download_section(self, assets: List[ReleaseAsset], is_latest: bool = False) -> str:
-    """
-    Generate the download section HTML for a release.
-    (Same as your previous logic, except no changes required here.)
-    """
-    download_items = []
-
-    # Helper to match by name
-    def find_asset(pattern: str) -> Optional[ReleaseAsset]:
-      return next((a for a in assets if self.plugin.re.search(pattern, a.name)), None)
-
-    # Linux assets
-    linux_22_04 = find_asset(r'LINUX_Ubuntu-22\.04\.AppImage')
-
-    # Windows assets
-    win_zip = find_asset(r'Windows_msi\.zip')
-    win_msi = find_asset(r'Windows\.msi$')
-
-    # macOS assets
-    macos_arm = find_asset(r'OSX-arm64\.zip')
-
+    """Generate the download section HTML for a release."""
+    # Define all asset patterns and their properties
+    asset_configs = [
+      # (regex pattern, os_type, display_name, icon)
+      (r'Windows_msi\.zip', 'windows', 'Windows (ZIP)', '🪟'),
+      (r'Windows\.msi$', 'windows', 'Windows (MSI)', '🪟'),
+      (r'OSX-arm64\.zip', 'macos', 'macOS (Apple Silicon)', '🍎')
+      (r'LINUX_Ubuntu-22\.04\.AppImage', 'linux', 'Linux Ubuntu 22.04', '🐧'),
+    ]
+    
+    # Create a lookup dictionary of assets by pattern
+    found_assets = {}
+    for pattern, _, _, _ in asset_configs:
+      found_assets[pattern] = next((a for a in assets if self.plugin.re.search(pattern, a.name)), None)
+    
     if is_latest:
-      if win_msi:
-        download_items.append(self._generate_download_item(win_msi, "windows", "Windows (MSI)", "🪟"))
-      if linux_22_04:
-        download_items.append(self._generate_download_item(linux_22_04, "linux", "Linux Ubuntu 22.04", "🐧"))
-      if win_zip:
-        download_items.append(self._generate_download_item(win_zip, "windows", "Windows (ZIP)", "🪟"))
-      if macos_arm:
-        download_items.append(self._generate_download_item(macos_arm, "macos", "macOS (Apple Silicon)", "🍎"))
-
+      # Generate HTML for the latest release (all assets in a grid)
+      download_items = [
+        self._generate_download_item(found_assets[pattern], os_type, display_name, icon)
+        for pattern, os_type, display_name, icon in asset_configs
+        if found_assets[pattern]  # Only include if asset exists
+      ]
+      
       return f"""
         <div class="download-options">
           <h3>Download Options:</h3>
@@ -996,32 +1001,31 @@ class HtmlGenerator:
         </div>
       """
     else:
-      # group for previous releases
-      sections = {
-        "Windows": [
-          (win_zip, "Windows ZIP"),
-          (win_msi, "Windows MSI"),
-        ],
-        "Linux": [
-          (linux_22_04, "Ubuntu 22.04"),
-        ],
-        "macOS": [
-          (macos_arm, "Apple Silicon"),
-        ],
+      # Generate HTML for previous releases (grouped by OS type)
+      os_groups = {
+        "Windows": [(r'Windows_msi\.zip', 'Windows ZIP'), (r'Windows\.msi$', 'Windows MSI')],
+        "macOS": [(r'OSX-arm64\.zip', 'Apple Silicon')],
+        "Linux": [(r'LINUX_Ubuntu-22\.04\.AppImage', 'Ubuntu 22.04')],
       }
-      for os_name, asset_pairs in sections.items():
-        items = []
-        for asset_obj, variant in asset_pairs:
-          if asset_obj:
-            items.append(f"""
-              <div class="download-item-small {os_name.lower()}">
-                <span class="os-name">{variant}</span>
-                <span class="file-size">{asset_obj.size_mb:.2f} MB</span>
-                <a href="{asset_obj.browser_download_url}" class="download-btn-small">Download</a>
-              </div>
-            """)
+
+      download_sections = []
+      for os_name, pattern_variants in os_groups.items():
+        # Create HTML items for each asset in this OS category
+        items = [
+          f"""
+          <div class="download-item-small {os_name.lower()}">
+            <span class="os-name">{variant}</span>
+            <span class="file-size">{found_assets[pattern].size_mb:.2f} MB</span>
+            <a href="{found_assets[pattern].browser_download_url}" class="download-btn-small">Download</a>
+          </div>
+          """
+          for pattern, variant in pattern_variants
+          if found_assets[pattern]  # Only include if asset exists
+        ]
+        
+        # Only add this OS section if it has items
         if items:
-          download_items.append(f"""
+          download_sections.append(f"""
             <div class="download-section">
               <h4>{os_name}</h4>
               <div class="download-list">
@@ -1029,10 +1033,10 @@ class HtmlGenerator:
               </div>
             </div>
           """)
-
+      
       return f"""
         <div class="release-downloads">
-          {''.join(download_items)}
+          {''.join(download_sections)}
         </div>
       """
 
@@ -1201,7 +1205,7 @@ class HtmlGenerator:
 
     return (
         self.generate_html_head() +
-        self.generate_jumbo_section(ee_id, ee_addr, last_update) +
+        self. generate_jumbo_section(ee_id, ee_addr, last_update) +
         self.generate_latest_release_section(releases[0]) +
         self.generate_previous_releases_section(releases) +
         self.generate_javascript() +
