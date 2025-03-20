@@ -95,21 +95,18 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     func_name = "get_latest_releases"
     try:
       # 1) Load current cache
-      cached = self._cached_releases
-      cached_tags = {c['tag_name'] for c in cached}
-      self.P(f"{func_name}: Loaded {len(cached)} releases from cache")
+      cached_tags = {c['tag_name'] for c in self._cached_releases}
+      self.P(f"{func_name}: Loaded {len(self._cached_releases)} releases from cache")
 
       # 2) Get releases from GitHub (basic info)
-      n = self.cfg_releases_to_fetch
-      github_releases = self.release_fetcher.get_top_n_releases(n)
+      github_releases = self.release_fetcher.get_top_n_releases(self.cfg_releases_to_fetch)
 
       if not github_releases:
         # If GitHub returned nothing, use what's in cache
-        if cached:
-          cached.sort(key=lambda x: x['published_at'], reverse=True)
-          top_cached = cached[:self.cfg_nr_previous_releases]
-          self.P(f"{func_name}: GitHub returned 0 releases, using {len(top_cached)} cached releases")
-          return top_cached, None
+        if self._cached_releases:
+          self._cached_releases.sort(key=lambda x: x['published_at'], reverse=True)
+          self.P(f"{func_name}: GitHub returned 0 releases, using {len(self._cached_releases)} cached releases")
+          return self._cached_releases, None
         else:
           return [], {'message': "No releases found from GitHub & no cache available", 'rate_limited': False}
 
@@ -145,11 +142,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       if not valid_github_releases:
         # If no valid releases found on GitHub, use what's in cache
-        if cached:
-          cached.sort(key=lambda x: x['published_at'], reverse=True)
-          top_cached = cached[:self.cfg_nr_previous_releases]
-          self.P(f"{func_name}: No valid releases from GitHub, using {len(top_cached)} cached releases")
-          return top_cached, None
+        if self._cached_releases:
+          self.P(f"{func_name}: No valid releases from GitHub, using {len(self._cached_releases)} cached releases")
+          return self._cached_releases, None
         else:
           return [], {'message': "No valid releases found with all required assets", 'rate_limited': False}
 
@@ -161,7 +156,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       for release in valid_github_releases:
         if release['tag_name'] in cached_tags:
-          cached_release = next(c for c in cached if c['tag_name'] == release['tag_name'])
+          cached_release = next(c for c in self._cached_releases if c['tag_name'] == release['tag_name'])
           cached_valid_releases.append(cached_release)
           self.P(f"{func_name}: Cache hit for release {release['tag_name']}")
         else:
@@ -195,7 +190,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
         # 6) Add new valid releases to cache
         if new_full_releases:
-          updated_cache = [r for r in cached if r['tag_name'] not in {nf['tag_name'] for nf in new_full_releases}]
+          updated_cache = [r for r in self._cached_releases if r['tag_name'] not in {nf['tag_name'] for nf in new_full_releases}]
           updated_cache.extend(new_full_releases)
           updated_cache.sort(key=lambda x: x['published_at'], reverse=True)
           self._save_cached_releases(updated_cache)
@@ -207,9 +202,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       # 7) Combine cached valid releases with new full releases and return
       result = cached_valid_releases + new_full_releases
       result.sort(key=lambda x: x['published_at'], reverse=True)
-
-      # In case we couldn't download some releases, ensure we don't exceed NR_PREVIOUS_RELEASES
-      result = result[:self.cfg_nr_previous_releases]
 
       self.P(f"{func_name}: Returning {len(result)} valid releases")
       return result, None
@@ -238,21 +230,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       return [], {'message': msg, 'rate_limited': False}
 
-  def compile_release_info(self, releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Turn the raw release dicts (already fully fetched) into the final shape needed for HTML.
-    All releases passed to this method are already verified to have all required assets.
-    """
-    if not releases:
-      self.log_error("compile_release_info", "No valid releases provided.")
-      return []
-
-    # Make sure they're sorted descending by published date
-    sorted_releases = sorted(releases, key=lambda x: x['published_at'], reverse=True)
-
-    self.P(f"compile_release_info: Processing {len(sorted_releases)} valid releases")
-    return sorted_releases
-
   def _regenerate_index_html(self) -> bool:
     """
     Fetch/compile the full set of releases from cache+GitHub, then
@@ -261,10 +238,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     """
     func_name = "_regenerate_index_html"
     self.P(f"{func_name}: Starting HTML regeneration...")
-
-    # Where we will write the HTML
-    web_server_path = self.get_web_server_path()
-    output_path = self.os_path.join(web_server_path, 'assets/releases.html')
 
     # 1) Retrieve the full set of releases
     try:
@@ -282,19 +255,14 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.log_error(func_name, error_message, e)
       return False
 
-    # 2) Compile them (no re-fetch) and transform them into the shape the HTML generator expects
+    # 2) Process the releases into the shape the HTML generator expects
     try:
-      compiled_releases = self.compile_release_info(raw_releases)
-      if not compiled_releases:
-        self.log_error(func_name, "No compiled releases available, skipping HTML generation")
-        return False
-
-      # Convert compiled data into our ReleaseInfo objects for HTML
-      releases_for_html = self.data_processor.process_releases(compiled_releases)
+      # Convert raw releases directly into our ReleaseInfo objects for HTML
+      releases_for_html = self.data_processor.process_releases(raw_releases)
       self.P(f"{func_name}: Successfully processed {len(releases_for_html)} releases for HTML generation")
 
     except Exception as e:
-      error_msg = f"{func_name}: Error in compile_release_info or data_processor: {str(e)}"
+      error_msg = f"{func_name}: Error in data_processor: {str(e)}"
       self.log_error(func_name, error_msg, e)
       return False
 
@@ -306,6 +274,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         ee_addr=self.ee_addr,
         last_update=self.datetime_to_str()
       )
+
+      # Where we will write the HTML
+      web_server_path = self.get_web_server_path()
+      output_path = self.os_path.join(web_server_path, 'assets/releases.html')
+
       with open(output_path, 'w') as fd:
         fd.write(html_content)
 
@@ -1251,7 +1224,6 @@ class ReleaseDataProcessor:
       # Convert to ReleaseInfo object
       ri = self.convert_to_release_info(r)
       releases.append(ri)
-      self.logger.P(f"[ReleaseDataProcessor] Processed valid release {r.get('tag_name')}")
 
     self.logger.P(f"[ReleaseDataProcessor] Processed {len(releases)} valid releases")
     return releases
