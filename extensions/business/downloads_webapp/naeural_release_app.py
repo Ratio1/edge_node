@@ -12,242 +12,246 @@ __VER__ = '0.4.0'
 RELEASES_CACHE_FILE = 'releases_history.pkl'
 
 _CONFIG = {
-    **BasePlugin.CONFIG,
-    'ASSETS' : 'plugins/business/fastapi/launcher_download',
-    'JINJA_ARGS': {
-        'html_files': [
-            {
-                'name'  : 'releases.html',
-                'route' : '/',
-                'method': 'get'
-            }
-        ]
-    },
-    'NR_PREVIOUS_RELEASES': 5,
-    'RELEASES_TO_FETCH': 50,
-    'REGENERATION_INTERVAL': 10*60,
-    "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
-    'VALIDATION_RULES': {
-        **BasePlugin.CONFIG['VALIDATION_RULES'],
-    },
-    'DEBUG_MODE': False,  # or True if you want more logs
-    'SHOW_ALL_RELEASES_BY_DEFAULT': False,
-    'GITHUB_API_TIMEOUT': 30,
-    'MAX_RETRIES': 3
+  **BasePlugin.CONFIG,
+  'ASSETS': 'plugins/business/fastapi/launcher_download',
+  'JINJA_ARGS': {
+    'html_files': [
+      {
+        'name': 'releases.html',
+        'route': '/',
+        'method': 'get'
+      }
+    ]
+  },
+  'NR_PREVIOUS_RELEASES': 5,
+  'RELEASES_TO_FETCH': 50,
+  'REGENERATION_INTERVAL': 10 * 60,
+  "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
+  'VALIDATION_RULES': {
+    **BasePlugin.CONFIG['VALIDATION_RULES'],
+  },
+  'DEBUG_MODE': False,  # or True if you want more logs
+  'SHOW_ALL_RELEASES_BY_DEFAULT': False,
+  'GITHUB_API_TIMEOUT': 30,
+  'MAX_RETRIES': 3
 }
+
 
 class NaeuralReleaseAppPlugin(BasePlugin):
   CONFIG = _CONFIG
 
   def on_init(self, **kwargs):
-      super(NaeuralReleaseAppPlugin, self).on_init(**kwargs)
-      self._last_day_regenerated = (self.datetime.now() - self.timedelta(days=1)).day
-      self.__last_generation_time = 0
-      self.html_generator = HtmlGenerator(self.CONFIG, self)
-      self.data_processor = ReleaseDataProcessor(self)
-      self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self, self.cfg_releases_repo_url, self.cfg_max_retries, self.cfg_github_api_timeout, self.cfg_debug_mode)
-      self._cached_releases = self._load_cached_releases()
-      return
-
+    super(NaeuralReleaseAppPlugin, self).on_init(**kwargs)
+    self._last_day_regenerated = (self.datetime.now() - self.timedelta(days=1)).day
+    self.__last_generation_time = 0
+    self.html_generator = HtmlGenerator(self.CONFIG, self)
+    self.data_processor = ReleaseDataProcessor(self)
+    self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self, self.cfg_releases_repo_url, self.cfg_max_retries,
+                                              self.cfg_github_api_timeout, self.cfg_debug_mode)
+    self._cached_releases = self._load_cached_releases()
+    return
 
   def _load_cached_releases(self) -> List[Dict[str, Any]]:
-      """Load cached releases from pickle, or return an empty list on failure."""
-      try:
-          data = self.diskapi_load_pickle_from_data(RELEASES_CACHE_FILE)
-          if data:
-              self.P(f"_load_cached_releases: Loaded {len(data)} from cache.")
-              return data
-      except Exception as e:
-          self.log_error("_load_cached_releases", f"Failed to load cache: {str(e)}")
-      return []
+    """Load cached releases from pickle, or return an empty list on failure."""
+    try:
+      data = self.diskapi_load_pickle_from_data(RELEASES_CACHE_FILE)
+      if data:
+        self.P(f"_load_cached_releases: Loaded {len(data)} from cache.")
+        return data
+    except Exception as e:
+      self.log_error("_load_cached_releases", f"Failed to load cache: {str(e)}")
+    return []
 
   def _save_cached_releases(self, releases: List[Dict[str, Any]]) -> bool:
-      """Save the entire release list back to pickle cache."""
-      try:
-          self.diskapi_save_pickle_to_data(releases, RELEASES_CACHE_FILE)
-          self.P(f"_save_cached_releases: Saved {len(releases)} release(s) to cache.")
-          return True
-      except Exception as e:
-          self.log_error("_save_cached_releases", f"Failed to save cache: {str(e)}")
-          return False
+    """Save the entire release list back to pickle cache."""
+    try:
+      self.diskapi_save_pickle_to_data(releases, RELEASES_CACHE_FILE)
+      self.P(f"_save_cached_releases: Saved {len(releases)} release(s) to cache.")
+      return True
+    except Exception as e:
+      self.log_error("_save_cached_releases", f"Failed to save cache: {str(e)}")
+      return False
 
   def log_error(self, func_name: str, error_msg: str, exc_info: Optional[Exception] = None) -> str:
-      details = [f"ERROR in {func_name}:", error_msg]
-      if exc_info and self.cfg_debug_mode:
-          import traceback
-          details.append("Traceback:")
-          details.append(''.join(traceback.format_exception(type(exc_info), exc_info, exc_info.__traceback__)))
-      msg = "\n".join(details)
-      self.P(msg)
-      return msg
+    details = [f"ERROR in {func_name}:", error_msg]
+    if exc_info and self.cfg_debug_mode:
+      import traceback
+      details.append("Traceback:")
+      details.append(''.join(traceback.format_exception(type(exc_info), exc_info, exc_info.__traceback__)))
+    msg = "\n".join(details)
+    self.P(msg)
+    return msg
 
   def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-      """
-      1. Check GitHub releases until we find NR_PREVIOUS_RELEASES valid ones
-      2. Check which of those valid ones are already in our cache
-      3. Download complete details for valid ones not in cache
-      4. Add these to cache
-      5. Return the NR_PREVIOUS_RELEASES valid releases
-      
-      A valid release has all required assets: Ubuntu 22.04, Windows MSI, Windows ZIP, macOS ARM.
-      """
-      func_name = "get_latest_releases"
-      try:
-          # 1) Load current cache
-          cached = self._cached_releases
-          cached_tags = {c['tag_name'] for c in cached}
-          self.P(f"{func_name}: Loaded {len(cached)} releases from cache")
+    """
+    1. Check GitHub releases until we find NR_PREVIOUS_RELEASES valid ones
+    2. Check which of those valid ones are already in our cache
+    3. Download complete details for valid ones not in cache
+    4. Add these to cache
+    5. Return the NR_PREVIOUS_RELEASES valid releases
 
-          # 2) Get releases from GitHub (basic info)
-          n = self.cfg_releases_to_fetch
-          github_releases = self.release_fetcher.get_top_n_releases(n)
-          
-          if not github_releases:
-              # If GitHub returned nothing, use what's in cache
-              if cached:
-                  cached.sort(key=lambda x: x['published_at'], reverse=True)
-                  top_cached = cached[:self.cfg_nr_previous_releases]
-                  self.P(f"{func_name}: GitHub returned 0 releases, using {len(top_cached)} cached releases")
-                  return top_cached, None
-              else:
-                  return [], {'message': "No releases found from GitHub & no cache available", 'rate_limited': False}
+    A valid release has all required assets: Ubuntu 22.04, Windows MSI, Windows ZIP, macOS ARM.
+    """
+    func_name = "get_latest_releases"
+    try:
+      # 1) Load current cache
+      cached = self._cached_releases
+      cached_tags = {c['tag_name'] for c in cached}
+      self.P(f"{func_name}: Loaded {len(cached)} releases from cache")
 
-          self.P(f"{func_name}: GitHub returned {len(github_releases)} basic releases")
-          
-          # 3) Find NR_PREVIOUS_RELEASES valid releases from GitHub
-          valid_github_releases = []
-          for release in github_releases:
-              assets = release.get('assets', [])
-              asset_names = [a.get('name', '') for a in assets]
-              
-              # Check for all required assets
-              has_ubuntu_22_04 = any('LINUX_Ubuntu-22.04.AppImage' in name for name in asset_names)
-              has_windows_zip = any('Windows_msi.zip' in name for name in asset_names)
-              has_windows_msi = any(name.endswith('Windows.msi') for name in asset_names)
-              has_macos_arm = any('OSX-arm64.zip' in name for name in asset_names)
-              
-              if has_ubuntu_22_04 and has_windows_zip and has_windows_msi and has_macos_arm:
-                  valid_github_releases.append(release)
-                  self.P(f"{func_name}: Found valid release {release['tag_name']} with all required assets")
-                  
-                  # Stop once we've found enough valid releases
-                  if len(valid_github_releases) >= self.cfg_nr_previous_releases:
-                      self.P(f"{func_name}: Found {self.cfg_nr_previous_releases} valid releases, stopping search")
-                      break
-              else:
-                  missing = []
-                  if not has_ubuntu_22_04: missing.append("Ubuntu 22.04")
-                  if not has_windows_zip: missing.append("Windows ZIP")
-                  if not has_windows_msi: missing.append("Windows MSI")
-                  if not has_macos_arm: missing.append("macOS ARM")
-                  self.P(f"{func_name}: Skipping invalid release {release['tag_name']} - missing assets: {', '.join(missing)}")
-          
-          if not valid_github_releases:
-              # If no valid releases found on GitHub, use what's in cache
-              if cached:
-                  cached.sort(key=lambda x: x['published_at'], reverse=True)
-                  top_cached = cached[:self.cfg_nr_previous_releases]
-                  self.P(f"{func_name}: No valid releases from GitHub, using {len(top_cached)} cached releases")
-                  return top_cached, None
-              else:
-                  return [], {'message': "No valid releases found with all required assets", 'rate_limited': False}
-          
-          self.P(f"{func_name}: Found {len(valid_github_releases)} valid releases from GitHub")
-          
-          # 4) Check which valid releases are already in cache
-          new_valid_releases = []
-          cached_valid_releases = []
-          
-          for release in valid_github_releases:
-              if release['tag_name'] in cached_tags:
-                  cached_release = next(c for c in cached if c['tag_name'] == release['tag_name'])
-                  cached_valid_releases.append(cached_release)
-                  self.P(f"{func_name}: Release {release['tag_name']} already in cache")
-              else:
-                  new_valid_releases.append(release)
-                  self.P(f"{func_name}: Release {release['tag_name']} needs to be downloaded")
-          
-          self.P(f"{func_name}: {len(cached_valid_releases)} valid releases in cache, {len(new_valid_releases)} need download")
-          
-          # 5) Download complete details for new valid releases
-          new_full_releases = []
-          
-          for r in new_valid_releases:
-              tag = r['tag_name']
-              try:
-                  details = self.release_fetcher.get_release_details(tag)
-                  new_release = {
-                      'tag_name': details.tag_name,
-                      'published_at': details.published_at,
-                      'body': details.body,
-                      'assets': details.assets,
-                      'commit_sha': details.commit_sha,
-                      'commit_info': details.commit_info,
-                      'tag_info': details.tag_info
-                  }
-                  new_full_releases.append(new_release)
-                  self.P(f"{func_name}: Downloaded complete details for release: {tag}")
-              except GitHubApiError as e:
-                  if e.is_rate_limit:
-                      raise
-                  self.log_error(func_name, f"Failed to fetch release details for {tag}: {str(e)}")
-          
-          # 6) Add new valid releases to cache
-          if new_full_releases:
-              updated_cache = [r for r in cached if r['tag_name'] not in {nf['tag_name'] for nf in new_full_releases}]
-              updated_cache.extend(new_full_releases)
-              updated_cache.sort(key=lambda x: x['published_at'], reverse=True)
-              self._save_cached_releases(updated_cache)
-              self.P(f"{func_name}: Added {len(new_full_releases)} new releases to cache")
-          
-          # 7) Combine cached valid releases with new full releases and return
-          result = cached_valid_releases + new_full_releases
-          result.sort(key=lambda x: x['published_at'], reverse=True)
-          
-          # In case we couldn't download some releases, ensure we don't exceed NR_PREVIOUS_RELEASES
-          result = result[:self.cfg_nr_previous_releases]
-          
-          self.P(f"{func_name}: Returning {len(result)} valid releases")
-          return result, None
+      # 2) Get releases from GitHub (basic info)
+      n = self.cfg_releases_to_fetch
+      github_releases = self.release_fetcher.get_top_n_releases(n)
 
-      except GitHubApiError as gh_e:
-          msg = f"{func_name}: GitHubApiError {gh_e}"
-          self.log_error(func_name, msg)
-          # fallback to cached releases
-          if self._cached_releases:
-              fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
-              result = fallback[:self.cfg_nr_previous_releases]
-              self.P(f"{func_name}: GitHub API error, using {len(result)} cached releases")
-              return result, None
-          
-          return [], {'message': msg, 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}
+      if not github_releases:
+        # If GitHub returned nothing, use what's in cache
+        if cached:
+          cached.sort(key=lambda x: x['published_at'], reverse=True)
+          top_cached = cached[:self.cfg_nr_previous_releases]
+          self.P(f"{func_name}: GitHub returned 0 releases, using {len(top_cached)} cached releases")
+          return top_cached, None
+        else:
+          return [], {'message': "No releases found from GitHub & no cache available", 'rate_limited': False}
 
-      except Exception as e:
-          msg = f"{func_name}: Unexpected error: {str(e)}"
-          self.log_error(func_name, msg, e)
-          # fallback to cached releases
-          if self._cached_releases:
-              fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
-              result = fallback[:self.cfg_nr_previous_releases]
-              self.P(f"{func_name}: Unexpected error, using {len(result)} cached releases")
-              return result, None
-          
-          return [], {'message': msg, 'rate_limited': False}
+      self.P(f"{func_name}: GitHub returned {len(github_releases)} basic releases")
+
+      # 3) Find NR_PREVIOUS_RELEASES valid releases from GitHub
+      valid_github_releases = []
+      for release in github_releases:
+        assets = release.get('assets', [])
+        asset_names = [a.get('name', '') for a in assets]
+
+        # Check for all required assets
+        has_ubuntu_22_04 = any('LINUX_Ubuntu-22.04.AppImage' in name for name in asset_names)
+        has_windows_zip = any('Windows_msi.zip' in name for name in asset_names)
+        has_windows_msi = any(name.endswith('Windows.msi') for name in asset_names)
+        has_macos_arm = any('OSX-arm64.zip' in name for name in asset_names)
+
+        if has_ubuntu_22_04 and has_windows_zip and has_windows_msi and has_macos_arm:
+          valid_github_releases.append(release)
+          self.P(f"{func_name}: Found valid release {release['tag_name']} with all required assets")
+
+          # Stop once we've found enough valid releases
+          if len(valid_github_releases) >= self.cfg_nr_previous_releases:
+            self.P(f"{func_name}: Found {self.cfg_nr_previous_releases} valid releases, stopping search")
+            break
+        else:
+          missing = []
+          if not has_ubuntu_22_04: missing.append("Ubuntu 22.04")
+          if not has_windows_zip: missing.append("Windows ZIP")
+          if not has_windows_msi: missing.append("Windows MSI")
+          if not has_macos_arm: missing.append("macOS ARM")
+          self.P(f"{func_name}: Skipping invalid release {release['tag_name']} - missing assets: {', '.join(missing)}")
+
+      if not valid_github_releases:
+        # If no valid releases found on GitHub, use what's in cache
+        if cached:
+          cached.sort(key=lambda x: x['published_at'], reverse=True)
+          top_cached = cached[:self.cfg_nr_previous_releases]
+          self.P(f"{func_name}: No valid releases from GitHub, using {len(top_cached)} cached releases")
+          return top_cached, None
+        else:
+          return [], {'message': "No valid releases found with all required assets", 'rate_limited': False}
+
+      self.P(f"{func_name}: Found {len(valid_github_releases)} valid releases from GitHub")
+
+      # 4) Check which valid releases are already in cache
+      new_valid_releases = []
+      cached_valid_releases = []
+
+      for release in valid_github_releases:
+        if release['tag_name'] in cached_tags:
+          cached_release = next(c for c in cached if c['tag_name'] == release['tag_name'])
+          cached_valid_releases.append(cached_release)
+          self.P(f"{func_name}: Cache hit for release {release['tag_name']}")
+        else:
+          new_valid_releases.append(release)
+
+      if new_valid_releases:
+        self.P(
+          f"{func_name}: Found {len(cached_valid_releases)} releases in cache, fetching {len(new_valid_releases)} missing releases")
+
+        # 5) Download complete details for new valid releases
+        new_full_releases = []
+
+        for r in new_valid_releases:
+          tag = r['tag_name']
+          try:
+            details = self.release_fetcher.get_release_details(tag)
+            new_release = {
+              'tag_name': details.tag_name,
+              'published_at': details.published_at,
+              'body': details.body,
+              'assets': details.assets,
+              'commit_sha': details.commit_sha,
+              'commit_info': details.commit_info,
+              'tag_info': details.tag_info
+            }
+            new_full_releases.append(new_release)
+          except GitHubApiError as e:
+            if e.is_rate_limit:
+              raise
+            self.log_error(func_name, f"Failed to fetch release details for {tag}: {str(e)}")
+
+        # 6) Add new valid releases to cache
+        if new_full_releases:
+          updated_cache = [r for r in cached if r['tag_name'] not in {nf['tag_name'] for nf in new_full_releases}]
+          updated_cache.extend(new_full_releases)
+          updated_cache.sort(key=lambda x: x['published_at'], reverse=True)
+          self._save_cached_releases(updated_cache)
+          self.P(f"{func_name}: Added {len(new_full_releases)} new releases to cache")
+      else:
+        self.P(f"{func_name}: All releases already in cache, no downloads needed")
+        new_full_releases = []
+
+      # 7) Combine cached valid releases with new full releases and return
+      result = cached_valid_releases + new_full_releases
+      result.sort(key=lambda x: x['published_at'], reverse=True)
+
+      # In case we couldn't download some releases, ensure we don't exceed NR_PREVIOUS_RELEASES
+      result = result[:self.cfg_nr_previous_releases]
+
+      self.P(f"{func_name}: Returning {len(result)} valid releases")
+      return result, None
+
+    except GitHubApiError as gh_e:
+      msg = f"{func_name}: GitHubApiError {gh_e}"
+      self.log_error(func_name, msg)
+      # fallback to cached releases
+      if self._cached_releases:
+        fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
+        result = fallback[:self.cfg_nr_previous_releases]
+        self.P(f"{func_name}: GitHub API error, using {len(result)} cached releases")
+        return result, None
+
+      return [], {'message': msg, 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}
+
+    except Exception as e:
+      msg = f"{func_name}: Unexpected error: {str(e)}"
+      self.log_error(func_name, msg, e)
+      # fallback to cached releases
+      if self._cached_releases:
+        fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
+        result = fallback[:self.cfg_nr_previous_releases]
+        self.P(f"{func_name}: Unexpected error, using {len(result)} cached releases")
+        return result, None
+
+      return [], {'message': msg, 'rate_limited': False}
 
   def compile_release_info(self, releases: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-      """
-      Turn the raw release dicts (already fully fetched) into the final shape needed for HTML.
-      All releases passed to this method are already verified to have all required assets.
-      """
-      if not releases:
-          self.log_error("compile_release_info", "No valid releases provided.")
-          return []
+    """
+    Turn the raw release dicts (already fully fetched) into the final shape needed for HTML.
+    All releases passed to this method are already verified to have all required assets.
+    """
+    if not releases:
+      self.log_error("compile_release_info", "No valid releases provided.")
+      return []
 
-      # Make sure they're sorted descending by published date
-      sorted_releases = sorted(releases, key=lambda x: x['published_at'], reverse=True)
-      
-      self.P(f"compile_release_info: Processing {len(sorted_releases)} valid releases")
-      return sorted_releases
+    # Make sure they're sorted descending by published date
+    sorted_releases = sorted(releases, key=lambda x: x['published_at'], reverse=True)
+
+    self.P(f"compile_release_info: Processing {len(sorted_releases)} valid releases")
+    return sorted_releases
 
   def _regenerate_index_html(self) -> bool:
     """
@@ -306,7 +310,8 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         fd.write(html_content)
 
       self.P(f"{func_name}: releases.html generated successfully at {output_path}")
-      self.P(f"{func_name}: HTML generation complete with {len(releases_for_html)} releases, size: {len(html_content)} bytes")
+      self.P(
+        f"{func_name}: HTML generation complete with {len(releases_for_html)} releases, size: {len(html_content)} bytes")
       return True
 
     except Exception as e:
@@ -350,53 +355,55 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
 
 class ReleaseAssetType(Enum):
-    """Types of release assets we support."""
-    LINUX_22_04 = "LINUX_Ubuntu-22.04.AppImage"
-    WINDOWS_ZIP = "Windows_msi.zip"
-    WINDOWS_MSI = "Windows.msi"
-    MACOS_ARM = "OSX-arm64.zip"
+  """Types of release assets we support."""
+  LINUX_22_04 = "LINUX_Ubuntu-22.04.AppImage"
+  WINDOWS_ZIP = "Windows_msi.zip"
+  WINDOWS_MSI = "Windows.msi"
+  MACOS_ARM = "OSX-arm64.zip"
+
 
 class AssetInfo(TypedDict):
-    """Type definition for asset information."""
-    name: str
-    size: int
-    browser_download_url: str
+  """Type definition for asset information."""
+  name: str
+  size: int
+  browser_download_url: str
+
 
 @dataclass(frozen=True)
 class GitHubReleaseData:
-    """Holds all fetched data about one GitHub release."""
-    tag_name: str
-    published_at: str
-    body: str
-    assets: List[Dict[str, Any]] = field(default_factory=list)
-    commit_sha: Optional[str] = None
-    commit_info: Optional[Dict[str, Any]] = None
-    tag_info: Optional[Dict[str, Any]] = None
+  """Holds all fetched data about one GitHub release."""
+  tag_name: str
+  published_at: str
+  body: str
+  assets: List[Dict[str, Any]] = field(default_factory=list)
+  commit_sha: Optional[str] = None
+  commit_info: Optional[Dict[str, Any]] = None
+  tag_info: Optional[Dict[str, Any]] = None
 
-    def __post_init__(self):
-        """Validate the data after initialization."""
-        if not self.tag_name:
-            raise ValueError("tag_name cannot be empty")
-        if not self.published_at:
-            raise ValueError("published_at cannot be empty")
+  def __post_init__(self):
+    """Validate the data after initialization."""
+    if not self.tag_name:
+      raise ValueError("tag_name cannot be empty")
+    if not self.published_at:
+      raise ValueError("published_at cannot be empty")
 
-    @property
-    def formatted_date(self) -> str:
-        """Return formatted publication date."""
-        dt = datetime.strptime(self.published_at, '%Y-%m-%dT%H:%M:%SZ')
-        return dt.strftime('%B %d, %Y')
+  @property
+  def formatted_date(self) -> str:
+    """Return formatted publication date."""
+    dt = datetime.strptime(self.published_at, '%Y-%m-%dT%H:%M:%SZ')
+    return dt.strftime('%B %d, %Y')
 
-    @property
-    def has_valid_body(self) -> bool:
-        """Check if the release has a valid body."""
-        return bool(self.body and self.body.strip())
+  @property
+  def has_valid_body(self) -> bool:
+    """Check if the release has a valid body."""
+    return bool(self.body and self.body.strip())
 
-    def get_asset_by_type(self, asset_type: ReleaseAssetType) -> Optional[AssetInfo]:
-        """Get asset information by type."""
-        return next(
-            (a for a in self.assets if asset_type.value in a['name']),
-            None
-        )
+  def get_asset_by_type(self, asset_type: ReleaseAssetType) -> Optional[AssetInfo]:
+    """Get asset information by type."""
+    return next(
+      (a for a in self.assets if asset_type.value in a['name']),
+      None
+    )
 
 
 class GitHubApiErrorType(Enum):
@@ -443,7 +450,8 @@ class ReleaseDataFetcher:
   Only calls get_top_n_releases(...) to limit the fetch to the last N releases.
   """
 
-  def __init__(self, config: Dict[str, Any], logger: Any, releases_repo_url: str, max_retries: int, github_api_timeout: int, debug_mode: bool):
+  def __init__(self, config: Dict[str, Any], logger: Any, releases_repo_url: str, max_retries: int,
+               github_api_timeout: int, debug_mode: bool):
     self.config = config
     self.logger = logger
     self.requests = logger.requests
@@ -558,8 +566,10 @@ class ReleaseDataFetcher:
       return ci['commit']['message']
     return None
 
+
 class ReleaseAsset:
   """Data class for release assets."""
+
   def __init__(self, name: str, size: int, browser_download_url: str):
     self.name = name
     self.size = size
@@ -573,6 +583,7 @@ class ReleaseAsset:
 
 class ReleaseInfo:
   """Data class for release information suitable for HTML rendering."""
+
   def __init__(self, tag_name: str, published_at: str, body: str, assets: List[ReleaseAsset]):
     self.tag_name = tag_name
     self.published_at = published_at
@@ -593,6 +604,7 @@ class ReleaseInfo:
 
 class HtmlGenerator:
   """Class responsible for generating HTML content for the releases page."""
+
   def __init__(self, config: Dict[str, Any], plugin: 'NaeuralReleaseAppPlugin'):
     self.config = config
     self.plugin = plugin
@@ -600,315 +612,315 @@ class HtmlGenerator:
   def generate_html_head(self) -> str:
     """Generate the HTML head section with styles."""
     return """
-        <!DOCTYPE html>
-        <html lang="en">
-        <head>
-            <meta charset="UTF-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <title>Edge Node Launcher Releases</title>
-            <style>
-                body {
-                    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-                    line-height: 1.6;
-                    color: #333;
-                    max-width: 1200px;
-                    margin: 0 auto;
-                    padding: 0 20px;
-                }
-                .jumbo {
-                    background: linear-gradient(135deg, #4b6cb7 0%, #182848 100%);
-                    color: white;
-                    padding: 3em 2em;
-                    text-align: center;
-                    border-radius: 8px;
-                    margin-top: 20px;
-                    box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-                }
-                .jumbo h1 {
-                    margin-top: 0;
-                    font-size: 2.5em;
-                }
-                .jumbo button {
-                    background-color: #ff7e5f;
-                    color: white;
-                    border: none;
-                    padding: 12px 24px;
-                    font-size: 1.1em;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    transition: background-color 0.3s;
-                    margin-top: 15px;
-                }
-                .jumbo button:hover {
-                    background-color: #ff6347;
-                }
-                .latest-release, .previous-releases {
-                    margin: 2em 0;
-                    background-color: white;
-                    padding: 2em;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
-                }
-                .latest-release h2, .previous-releases h2 {
-                    color: #4b6cb7;
-                    border-bottom: 2px solid #f0f0f0;
-                    padding-bottom: 10px;
-                }
-                .release-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    flex-wrap: wrap;
-                    margin-bottom: 1em;
-                }
-                .release-date {
-                    color: #666;
-                    font-style: italic;
-                }
-                .release-content {
-                    display: flex;
-                    flex-wrap: wrap;
-                    gap: 2em;
-                }
-                .release-details {
-                    flex: 1;
-                    min-width: 300px;
-                }
-                .download-options {
-                    flex: 1;
-                    min-width: 300px;
-                }
-                .release-notes-container {
-                    position: relative;
-                }
-                .release-notes {
-                    background-color: #f8f9fa;
-                    padding: 15px;
-                    border-radius: 4px;
-                    white-space: pre-wrap;
-                    font-size: 0.95em;
-                    max-height: 200px;
-                    overflow: hidden;
-                    transition: max-height 0.3s ease-out;
-                    margin: 0;
-                }
-                .commit-info {
-                    background-color: #f8f9fa;
-                    padding: 10px;
-                    border-radius: 4px;
-                    font-size: 0.9em;
-                    max-height: 100px;
-                    overflow: hidden;
-                    transition: max-height 0.3s ease-out;
-                }
-                .expanded {
-                    max-height: 1000px !important;
-                }
-                .commit-title {
-                    font-weight: bold;
-                    margin-bottom: 5px;
-                }
-                .see-more-btn {
-                    background-color: #f0f0f0;
-                    border: none;
-                    padding: 5px 10px;
-                    font-size: 0.8em;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    margin-top: 5px;
-                    color: #666;
-                    display: none;
-                    position: relative;
-                }
-                .see-more-btn:hover {
-                    background-color: #e0e0e0;
-                }
-                .see-more-btn .see-less-text {
-                    display: none;
-                }
-                .see-more-btn.expanded .see-more-text {
-                    display: none;
-                }
-                .see-more-btn.expanded .see-less-text {
-                    display: inline;
-                }
-                .download-grid {
-                    display: grid;
-                    grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-                    gap: 15px;
-                    margin-top: 1em;
-                }
-                .download-item {
-                    display: flex;
-                    align-items: center;
-                    background-color: #f9f9f9;
-                    border-radius: 8px;
-                    padding: 10px 15px;
-                    transition: transform 0.2s, box-shadow 0.2s;
-                }
-                .download-item:hover {
-                    transform: translateY(-2px);
-                    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
-                }
-                .linux {
-                    border-left: 4px solid #f0ad4e;
-                }
-                .windows {
-                    border-left: 4px solid #5bc0de;
-                }
-                .macos {
-                    border-left: 4px solid #5cb85c;
-                }
-                .os-icon {
-                    font-size: 1.8em;
-                    margin-right: 15px;
-                }
-                .download-details {
-                    flex: 1;
-                    display: flex;
-                    flex-direction: column;
-                }
-                .os-name {
-                    font-weight: bold;
-                    margin-bottom: 3px;
-                }
-                .file-size {
-                    color: #777;
-                    font-size: 0.8em;
-                    margin-bottom: 5px;
-                }
-                .download-btn {
-                    display: inline-block;
-                    background-color: #4CAF50;
-                    color: white;
-                    padding: 6px 12px;
-                    border-radius: 4px;
-                    text-decoration: none;
-                    font-size: 0.9em;
-                    align-self: flex-start;
-                }
-                .download-btn:hover {
-                    background-color: #45a049;
-                    text-decoration: none;
-                }
-                .release-card {
-                    background-color: white;
-                    border-radius: 8px;
-                    box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-                    margin-bottom: 20px;
-                    overflow: hidden;
-                    transition: transform 0.2s;
-                    display: none;
-                }
-                .release-card.visible {
-                    display: block;
-                }
-                .release-card:hover {
-                    transform: translateY(-2px);
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
-                }
-                .release-card-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    padding: 15px 20px;
-                    background-color: #f8f9fa;
-                    border-bottom: 1px solid #e0e0e0;
-                }
-                .release-card-header h3 {
-                    margin: 0;
-                    color: #4b6cb7;
-                    font-size: 1.2em;
-                }
-                .release-card-content {
-                    padding: 20px;
-                    display: flex;
-                    flex-wrap: wrap;
-                    gap: 20px;
-                }
-                .release-info {
-                    flex: 1;
-                    min-width: 250px;
-                }
-                .release-downloads {
-                    flex: 2;
-                    min-width: 300px;
-                    display: flex;
-                    flex-wrap: wrap;
-                    gap: 15px;
-                }
-                .download-section {
-                    flex: 1;
-                    min-width: 150px;
-                }
-                .download-section h4 {
-                    margin-top: 0;
-                    margin-bottom: 10px;
-                    color: #555;
-                    font-size: 1em;
-                    border-bottom: 1px solid #eee;
-                    padding-bottom: 5px;
-                }
-                .download-list {
-                    display: flex;
-                    flex-direction: column;
-                    gap: 8px;
-                }
-                .download-item-small {
-                    display: flex;
-                    flex-direction: column;
-                    padding: 8px 10px;
-                    border-radius: 6px;
-                    background-color: #f9f9f9;
-                    transition: background-color 0.2s;
-                }
-                .download-item-small:hover {
-                    background-color: #f0f0f0;
-                }
-                .download-item-small.linux {
-                    border-left: 3px solid #f0ad4e;
-                }
-                .download-item-small.windows {
-                    border-left: 3px solid #5bc0de;
-                }
-                .download-item-small.macos {
-                    border-left: 3px solid #5cb85c;
-                }
-                .download-btn-small {
-                    display: inline-block;
-                    background-color: #4CAF50;
-                    color: white;
-                    padding: 4px 8px;
-                    border-radius: 4px;
-                    text-decoration: none;
-                    font-size: 0.8em;
-                    margin-top: 5px;
-                    align-self: flex-start;
-                }
-                .download-btn-small:hover {
-                    background-color: #45a049;
-                    text-decoration: none;
-                }
-                .releases-container {
-                    margin-top: 20px;
-                }
-                .show-all-btn {
-                    display: block;
-                    margin: 20px auto;
-                    background-color: #4b6cb7;
-                    color: white;
-                    border: none;
-                    padding: 10px 20px;
-                    font-size: 1em;
-                    border-radius: 4px;
-                    cursor: pointer;
-                    transition: background-color 0.3s;
-                }
-                .show-all-btn:hover {
-                    background-color: #3a5795;
-                }
-            </style>
-        </head>
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>Edge Node Launcher Releases</title>
+        <style>
+          body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            line-height: 1.6;
+            color: #333;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+          }
+          .jumbo {
+            background: linear-gradient(135deg, #4b6cb7 0%, #182848 100%);
+            color: white;
+            padding: 3em 2em;
+            text-align: center;
+            border-radius: 8px;
+            margin-top: 20px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+          }
+          .jumbo h1 {
+            margin-top: 0;
+            font-size: 2.5em;
+          }
+          .jumbo button {
+            background-color: #ff7e5f;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            font-size: 1.1em;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+            margin-top: 15px;
+          }
+          .jumbo button:hover {
+            background-color: #ff6347;
+          }
+          .latest-release, .previous-releases {
+            margin: 2em 0;
+            background-color: white;
+            padding: 2em;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
+          }
+          .latest-release h2, .previous-releases h2 {
+              color: #4b6cb7;
+              border-bottom: 2px solid #f0f0f0;
+              padding-bottom: 10px;
+          }
+          .release-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-bottom: 1em;
+          }
+          .release-date {
+            color: #666;
+            font-style: italic;
+          }
+          .release-content {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 2em;
+          }
+          .release-details {
+            flex: 1;
+            min-width: 300px;
+          }
+          .download-options {
+            flex: 1;
+            min-width: 300px;
+          }
+          .release-notes-container {
+            position: relative;
+          }
+          .release-notes {
+            background-color: #f8f9fa;
+            padding: 15px;
+            border-radius: 4px;
+            white-space: pre-wrap;
+            font-size: 0.95em;
+            max-height: 200px;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out;
+            margin: 0;
+          }
+          .commit-info {
+            background-color: #f8f9fa;
+            padding: 10px;
+            border-radius: 4px;
+            font-size: 0.9em;
+            max-height: 100px;
+            overflow: hidden;
+            transition: max-height 0.3s ease-out;
+          }
+          .expanded {
+            max-height: 1000px !important;
+          }
+          .commit-title {
+            font-weight: bold;
+            margin-bottom: 5px;
+          }
+          .see-more-btn {
+            background-color: #f0f0f0;
+            border: none;
+            padding: 5px 10px;
+            font-size: 0.8em;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-top: 5px;
+            color: #666;
+            display: none;
+            position: relative;
+          }
+          .see-more-btn:hover {
+            background-color: #e0e0e0;
+          }
+          .see-more-btn .see-less-text {
+            display: none;
+          }
+          .see-more-btn.expanded .see-more-text {
+            display: none;
+          }
+          .see-more-btn.expanded .see-less-text {
+            display: inline;
+          }
+          .download-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+            gap: 15px;
+            margin-top: 1em;
+          }
+          .download-item {
+            display: flex;
+            align-items: center;
+            background-color: #f9f9f9;
+            border-radius: 8px;
+            padding: 10px 15px;
+            transition: transform 0.2s, box-shadow 0.2s;
+          }
+          .download-item:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+          }
+          .linux {
+            border-left: 4px solid #f0ad4e;
+          }
+          .windows {
+            border-left: 4px solid #5bc0de;
+          }
+          .macos {
+            border-left: 4px solid #5cb85c;
+          }
+          .os-icon {
+            font-size: 1.8em;
+            margin-right: 15px;
+          }
+          .download-details {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+          }
+          .os-name {
+            font-weight: bold;
+            margin-bottom: 3px;
+          }
+          .file-size {
+            color: #777;
+            font-size: 0.8em;
+            margin-bottom: 5px;
+          }
+          .download-btn {
+            display: inline-block;
+            background-color: #4CAF50;
+            color: white;
+            padding: 6px 12px;
+            border-radius: 4px;
+            text-decoration: none;
+            font-size: 0.9em;
+            align-self: flex-start;
+          }
+          .download-btn:hover {
+            background-color: #45a049;
+            text-decoration: none;
+          }
+          .release-card {
+            background-color: white;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+            overflow: hidden;
+            transition: transform 0.2s;
+            display: none;
+          }
+          .release-card.visible {
+            display: block;
+          }
+          .release-card:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+          }
+          .release-card-header {
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              padding: 15px 20px;
+              background-color: #f8f9fa;
+              border-bottom: 1px solid #e0e0e0;
+          }
+          .release-card-header h3 {
+              margin: 0;
+              color: #4b6cb7;
+              font-size: 1.2em;
+          }
+          .release-card-content {
+              padding: 20px;
+              display: flex;
+              flex-wrap: wrap;
+              gap: 20px;
+          }
+          .release-info {
+              flex: 1;
+              min-width: 250px;
+          }
+          .release-downloads {
+              flex: 2;
+              min-width: 300px;
+              display: flex;
+              flex-wrap: wrap;
+              gap: 15px;
+          }
+          .download-section {
+              flex: 1;
+              min-width: 150px;
+          }
+          .download-section h4 {
+              margin-top: 0;
+              margin-bottom: 10px;
+              color: #555;
+              font-size: 1em;
+              border-bottom: 1px solid #eee;
+              padding-bottom: 5px;
+          }
+          .download-list {
+              display: flex;
+              flex-direction: column;
+              gap: 8px;
+          }
+          .download-item-small {
+              display: flex;
+              flex-direction: column;
+              padding: 8px 10px;
+              border-radius: 6px;
+              background-color: #f9f9f9;
+              transition: background-color 0.2s;
+          }
+          .download-item-small:hover {
+              background-color: #f0f0f0;
+          }
+          .download-item-small.linux {
+              border-left: 3px solid #f0ad4e;
+          }
+          .download-item-small.windows {
+              border-left: 3px solid #5bc0de;
+          }
+          .download-item-small.macos {
+              border-left: 3px solid #5cb85c;
+          }
+          .download-btn-small {
+              display: inline-block;
+              background-color: #4CAF50;
+              color: white;
+              padding: 4px 8px;
+              border-radius: 4px;
+              text-decoration: none;
+              font-size: 0.8em;
+              margin-top: 5px;
+              align-self: flex-start;
+          }
+          .download-btn-small:hover {
+              background-color: #45a049;
+              text-decoration: none;
+          }
+          .releases-container {
+              margin-top: 20px;
+          }
+          .show-all-btn {
+              display: block;
+              margin: 20px auto;
+              background-color: #4b6cb7;
+              color: white;
+              border: none;
+              padding: 10px 20px;
+              font-size: 1em;
+              border-radius: 4px;
+              cursor: pointer;
+              transition: background-color 0.3s;
+          }
+          .show-all-btn:hover {
+              background-color: #3a5795;
+          }
+        </style>
+      </head>
         """
 
   def generate_jumbo_section(self, ee_id: str, ee_addr: str, last_update: str) -> str:
@@ -965,6 +977,7 @@ class HtmlGenerator:
     (Same as your previous logic, except no changes required here.)
     """
     download_items = []
+
     # Helper to match by name
     def find_asset(pattern: str) -> Optional[ReleaseAsset]:
       return next((a for a in assets if self.plugin.re.search(pattern, a.name)), None)
@@ -1096,7 +1109,8 @@ class HtmlGenerator:
         </div>
       """)
 
-    show_all_button_text = "Show Less" if self.config.get('SHOW_ALL_RELEASES_BY_DEFAULT', False) else "Show All Releases"
+    show_all_button_text = "Show Less" if self.config.get('SHOW_ALL_RELEASES_BY_DEFAULT',
+                                                          False) else "Show All Releases"
 
     return f"""
       <div class="previous-releases">
@@ -1201,12 +1215,12 @@ class HtmlGenerator:
       return "<html><body><h1>No releases available</h1></body></html>"
 
     return (
-      self.generate_html_head() +
-      self.generate_jumbo_section(ee_id, ee_addr, last_update) +
-      self.generate_latest_release_section(releases[0]) +
-      self.generate_previous_releases_section(releases) +
-      self.generate_javascript() +
-      "</body></html>"
+        self.generate_html_head() +
+        self.generate_jumbo_section(ee_id, ee_addr, last_update) +
+        self.generate_latest_release_section(releases[0]) +
+        self.generate_previous_releases_section(releases) +
+        self.generate_javascript() +
+        "</body></html>"
     )
 
 
@@ -1232,12 +1246,12 @@ class ReleaseDataProcessor:
     All releases passed to this method are already verified to have all required assets.
     """
     releases = []
-    
+
     for r in raw_releases:
       # Convert to ReleaseInfo object
       ri = self.convert_to_release_info(r)
       releases.append(ri)
       self.logger.P(f"[ReleaseDataProcessor] Processed valid release {r.get('tag_name')}")
-        
+
     self.logger.P(f"[ReleaseDataProcessor] Processed {len(releases)} valid releases")
     return releases
