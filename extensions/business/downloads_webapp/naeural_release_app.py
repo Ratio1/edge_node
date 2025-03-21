@@ -314,8 +314,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         for release_data in raw_releases
       ]
       
-      self.P(f"{func_name}: Successfully processed {len(releases_for_html)} releases for HTML generation")
-
     except Exception as e:
       error_msg = f"{func_name}: Error processing release data: {str(e)}"
       self.log_error(func_name, error_msg, e)
