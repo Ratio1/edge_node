@@ -468,8 +468,6 @@ class ReleaseDataFetcher:
     self.config = config
     self.logger = logger
     self.requests = logger.requests
-    self._cache_timeout = timedelta(minutes=10)
-    self._last_cache_clear = datetime.now()
     self._releases_repo_url = releases_repo_url
     self._max_retries = max_retries
     self._debug_mode = debug_mode
@@ -478,14 +476,6 @@ class ReleaseDataFetcher:
   def _log(self, msg: str):
     if self._debug_mode:
       self.logger.P(f"[ReleaseDataFetcher] {msg}")
-
-  def _check_and_clear_cache(self):
-    now = datetime.now()
-    if now - self._last_cache_clear > self._cache_timeout:
-      self.get_release_details.cache_clear()
-      self.get_commit_message.cache_clear()
-      self._last_cache_clear = now
-      self._log("Cleared internal lru_cache")
 
   def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
     retries = 0
@@ -517,14 +507,12 @@ class ReleaseDataFetcher:
     """
     Fetch from GitHub the last n release objects (basic info only).
     """
-    self._check_and_clear_cache()
     url = f"{self._releases_repo_url}/releases"
     # param per_page=n will limit to the top n (most recent) releases
     return self._make_request(url, params={"per_page": n}) or []
 
   @lru_cache(maxsize=50)
   def get_release_details(self, tag_name: str) -> 'GitHubReleaseData':
-    self._check_and_clear_cache()
     # 1) fetch the release by its tag
     rurl = f"{self._releases_repo_url}/releases/tags/{tag_name}"
     release_data = self._make_request(rurl)
