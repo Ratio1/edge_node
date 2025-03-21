@@ -80,7 +80,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self, self.cfg_releases_repo_url, self.cfg_max_retries,
                                               self.cfg_github_api_timeout, self.cfg_debug_mode)
     self._cached_releases = self._load_cached_releases()
-    self._assets_html_path = ''
+    self._assets_html_file_path = ''
     return
 
   @handle_errors(fallback_value=[])
@@ -109,7 +109,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.P(msg)
     return msg
 
-  def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+  def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], bool]:
     """
     1. Check GitHub releases until we find NR_PREVIOUS_RELEASES valid ones
     2. Check which of those valid ones are already in our cache
@@ -118,6 +118,12 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     5. Return the NR_PREVIOUS_RELEASES valid releases
 
     A valid release has all required assets: Ubuntu 22.04, Windows MSI, Windows ZIP, macOS ARM.
+
+    Returns:
+        Tuple containing:
+        - List of release dictionaries
+        - Optional error information dictionary
+        - Boolean indicating if any changes were detected (True = changes found)
     """
     func_name = "get_latest_releases"
     try:
@@ -132,15 +138,16 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         # If GitHub returned nothing, use what's in cache
         if self._cached_releases:
           self.P(f"{func_name}: GitHub returned 0 releases, using {len(self._cached_releases)} cached releases")
-          return self._cached_releases, {'message': "Using cached data - unable to fetch updates from GitHub", 'rate_limited': False}
-        else:
-          return [], {'message': "No releases found from GitHub & no cache available", 'rate_limited': False}
+          return self._cached_releases, {'message': "Using cached data - unable to fetch updates from GitHub", 'rate_limited': False}, False
+
+        return [], {'message': "No releases found from GitHub & no cache available", 'rate_limited': False}, False
 
       self.P(f"{func_name}: GitHub returned {len(github_releases)} basic releases")
 
       # 3) Find NR_PREVIOUS_RELEASES valid releases from GitHub
       valid_github_releases = []
       skipped_releases = []
+      changes_detected = False
 
       for release in github_releases:
         assets = release.get('assets', [])
@@ -154,6 +161,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
         if has_ubuntu_22_04 and has_windows_zip and has_windows_msi and has_macos_arm:
           valid_github_releases.append(release)
+          # If this is a new release or not in cache, mark as changed
+          if release['tag_name'] not in cached_tags:
+            changes_detected = True
           if len(valid_github_releases) >= self.cfg_nr_previous_releases:
             break
         else:
@@ -177,9 +187,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         # If no valid releases found on GitHub, use what's in cache
         if self._cached_releases:
           self.P(f"{func_name}: No valid releases from GitHub, using {len(self._cached_releases)} cached releases")
-          return self._cached_releases, None
+          return self._cached_releases, None, False
         else:
-          return [], {'message': "No valid releases found with all required assets", 'rate_limited': False}
+          return [], {'message': "No valid releases found with all required assets", 'rate_limited': False}, False
 
       self.P(f"{func_name}: Found {len(valid_github_releases)} valid releases from GitHub")
 
@@ -195,6 +205,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           cache_hits.append(release['tag_name'])
         else:
           new_valid_releases.append(release)
+          changes_detected = True
 
       if cache_hits:
         self.P(f"{func_name}: Cache hits for releases: {', '.join(cache_hits)}")
@@ -241,7 +252,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       result = cached_valid_releases + new_full_releases
 
       self.P(f"{func_name}: Returning {len(result)} valid releases")
-      return result, None
+      return result, None, changes_detected
 
     except GitHubApiError as gh_e:
       msg = f"{func_name}: GitHubApiError {gh_e}"
@@ -251,9 +262,9 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
         result = fallback[:self.cfg_nr_previous_releases]
         self.P(f"{func_name}: GitHub API error, using {len(result)} cached releases")
-        return result, {'message': f"Using cached data - GitHub API error: {str(gh_e)}", 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}
+        return result, {'message': f"Using cached data - GitHub API error: {str(gh_e)}", 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}, False
 
-      return [], {'message': msg, 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}
+      return [], {'message': msg, 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}, False
 
     except Exception as e:
       msg = f"{func_name}: Unexpected error: {str(e)}"
@@ -263,27 +274,38 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
         result = fallback[:self.cfg_nr_previous_releases]
         self.P(f"{func_name}: Unexpected error, using {len(result)} cached releases")
-        return result, {'message': f"Using cached data - Failed to fetch updates: {str(e)}", 'rate_limited': False}
+        return result, {'message': f"Using cached data - Failed to fetch updates: {str(e)}", 'rate_limited': False}, False
 
-      return [], {'message': msg, 'rate_limited': False}
+      return [], {'message': msg, 'rate_limited': False}, False
 
   @handle_errors(fallback_value=True)
-  def _regenerate_index_html(self) -> bool:
+  def _regenerate_index_html(self, releases_data: Optional[Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], bool]] = None) -> bool:
     """
     Fetch/compile the full set of releases from cache+GitHub, then
     generate the final releases.html for display.
-    Returns True if successful.
+    
+    Args:
+        releases_data: Optional tuple containing (releases, error, changes_detected) from a previous get_latest_releases call
+    
+    Returns:
+        True if successful.
     """
     func_name = "_regenerate_index_html"
-    self.P(f"{func_name}: Fetching data for HTML regeneration...")
+    self.P(f"{func_name}: Starting HTML regeneration...")
 
     # Where we will write the HTML
     web_server_path = self.get_web_server_path()
     output_path = self.os_path.join(web_server_path, 'assets/releases.html')
-
-    # 1) Retrieve the full set of releases
+    # Save the output path for later use
+    self._assets_html_file_path = output_path
+    
+    # 1) Get or retrieve the full set of releases
     try:
-      raw_releases, release_error = self.get_latest_releases()
+      if releases_data is None:
+        raw_releases, release_error, _ = self.get_latest_releases()
+      else:
+        raw_releases, release_error, _ = releases_data
+        
       if not raw_releases:
         # Use the error info from get_latest_releases if present
         if release_error:
@@ -297,7 +319,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.log_error(func_name, error_message, e)
       return False
 
-    self.P(f"{func_name}: Starting HTML regeneration...")
     # 2) Process the releases into the shape the HTML generator expects
     try:
       # Convert raw_releases directly to ReleaseInfo objects using list comprehension
@@ -348,13 +369,40 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   @handle_errors(fallback_value=True)
   def _maybe_regenerate_index_html(self) -> bool:
     """
-    Check if enough time has passed since last regeneration. If so, regenerate.
+    Check if HTML regeneration is needed. Regenerate if:
+    1. Enough time has passed since last regeneration (and file exists)
+    2. Changes are detected in releases
     """
     func_name = "_maybe_regenerate_index_html"
     current_time = self.time()
-    if (current_time - self.__last_generation_time) > self.cfg_regeneration_interval:
-      self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
-      result = self._regenerate_index_html()
+    releases_data = None
+    
+    # First check if we need to regenerate due to time elapsed (cheapest check)
+    time_to_regenerate = (current_time - self.__last_generation_time) > self.cfg_regeneration_interval
+    
+    # If time elapsed, verify the file still exists
+    if time_to_regenerate:
+      self.P(f"{func_name}: Regeneration interval elapsed, checking file exists...")
+      file_exists = bool(self._assets_html_file_path and self.os_path.exists(self._assets_html_file_path))
+      if not file_exists:
+        self.P(f"{func_name}: HTML file not found at {self._assets_html_file_path}")
+    
+    # If not regenerating yet, check for changes
+    if not time_to_regenerate:
+      try:
+        releases_data = self.get_latest_releases()
+        if releases_data[2]:  # Check changes_detected flag
+          self.P(f"{func_name}: Changes detected in releases, triggering regeneration...")
+          time_to_regenerate = True
+      except Exception as e:
+        self.log_error(func_name, f"Error checking for changes: {str(e)}")
+        # On error, fall back to time-based check only
+        pass
+    
+    if time_to_regenerate:
+      self.P(f"{func_name}: Regenerating releases.html...")
+      # Pass the already fetched releases data if we have it
+      result = self._regenerate_index_html(releases_data)
       current_day = self.datetime.now().day
 
       # Whether success or failure, update the generation time to avoid repeated attempts
@@ -365,6 +413,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         self.P(f"{func_name}: HTML regeneration successful.")
       else:
         self.P(f"{func_name}: HTML regeneration failed (see logs).")
+    
     return True
 
   def process(self):
