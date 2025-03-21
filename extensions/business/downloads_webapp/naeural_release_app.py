@@ -369,51 +369,60 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   @handle_errors(fallback_value=True)
   def _maybe_regenerate_index_html(self) -> bool:
     """
-    Check if HTML regeneration is needed. Regenerate if:
-    1. Enough time has passed since last regeneration (and file exists)
-    2. Changes are detected in releases
+    Check if HTML regeneration is needed and regenerate if necessary.
+    
+    The function follows this logic:
+    1. Check if enough time has elapsed since last generation
+    2. If time elapsed, verify if the HTML file exists
+    3. If file exists, check for new releases
+    4. Regenerate HTML if:
+       - Time elapsed and file doesn't exist
+       - New valid releases are detected
     """
     func_name = "_maybe_regenerate_index_html"
     current_time = self.time()
-    releases_data = None
     
-    # First check if we need to regenerate due to time elapsed (cheapest check)
-    time_to_regenerate = (current_time - self.__last_generation_time) > self.cfg_regeneration_interval
+    # Step 1: Check if enough time has elapsed
+    time_elapsed = (current_time - self.__last_generation_time) > self.cfg_regeneration_interval
+    if not time_elapsed:
+        return True
     
-    # If time elapsed, verify the file still exists
-    if time_to_regenerate:
-      self.P(f"{func_name}: Regeneration interval elapsed, checking file exists...")
-      file_exists = bool(self._assets_html_file_path and self.os_path.exists(self._assets_html_file_path))
-      if not file_exists:
-        self.P(f"{func_name}: HTML file not found at {self._assets_html_file_path}")
+    self.P(f"{func_name}: Regeneration interval elapsed")
     
-    # If not regenerating yet, check for changes
-    if not time_to_regenerate:
-      try:
+    # Step 2: Check if HTML file exists
+    file_exists = bool(self._assets_html_file_path and self.os_path.exists(self._assets_html_file_path))
+    if not file_exists:
+        self.P(f"{func_name}: HTML file not found, regenerating...")
+        return self._regenerate_and_update_time(current_time)
+    
+    # Step 3: Check for new releases
+    try:
         releases_data = self.get_latest_releases()
-        if releases_data[2]:  # Check changes_detected flag
-          self.P(f"{func_name}: Changes detected in releases, triggering regeneration...")
-          time_to_regenerate = True
-      except Exception as e:
-        self.log_error(func_name, f"Error checking for changes: {str(e)}")
-        # On error, fall back to time-based check only
-        pass
+        has_new_releases = releases_data[2]  # Check changes_detected flag
+        
+        if has_new_releases:
+            self.P(f"{func_name}: New releases detected, regenerating...")
+            return self._regenerate_and_update_time(current_time, releases_data)
+            
+        self.P(f"{func_name}: No new releases found, skipping regeneration")
+        self.__last_generation_time = current_time
+        return True
+        
+    except Exception as e:
+        self.log_error(func_name, f"Error checking for new releases: {str(e)}")
+        return True
     
-    if time_to_regenerate:
-      self.P(f"{func_name}: Regenerating releases.html...")
-      # Pass the already fetched releases data if we have it
-      result = self._regenerate_index_html(releases_data)
-      current_day = self.datetime.now().day
-
-      # Whether success or failure, update the generation time to avoid repeated attempts
-      self.__last_generation_time = current_time
-
-      if result:
-        self._last_day_regenerated = current_day
-        self.P(f"{func_name}: HTML regeneration successful.")
-      else:
-        self.P(f"{func_name}: HTML regeneration failed (see logs).")
+  def _regenerate_and_update_time(self, current_time: float, releases_data=None) -> bool:
+    """Helper function to regenerate HTML and update timestamps."""
+    result = self._regenerate_index_html(releases_data)
+    self.__last_generation_time = current_time
     
+    if result:
+        self._last_day_regenerated = self.datetime.now().day
+        self.P("HTML regeneration successful")
+    else:
+        self.P("HTML regeneration failed (see logs)")
+        
     return True
 
   def process(self):
