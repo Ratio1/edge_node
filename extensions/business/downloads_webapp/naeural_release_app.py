@@ -227,7 +227,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       # 7) Combine cached valid releases with new full releases and return
       result = cached_valid_releases + new_full_releases
-      result.sort(key=lambda x: x['published_at'], reverse=True)
 
       self.P(f"{func_name}: Returning {len(result)} valid releases")
       return result, None
@@ -364,21 +363,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     except Exception as e:
       self.log_error("process", f"Unhandled error in process(): {str(e)}", e)
     return
-
-
-class ReleaseAssetType(Enum):
-  """Types of release assets we support."""
-  LINUX_22_04 = "LINUX_Ubuntu-22.04.AppImage"
-  WINDOWS_ZIP = "Windows_msi.zip"
-  WINDOWS_MSI = "Windows.msi"
-  MACOS_ARM = "OSX-arm64.zip"
-
-
-class AssetInfo(TypedDict):
-  """Type definition for asset information."""
-  name: str
-  size: int
-  browser_download_url: str
 
 
 @dataclass(frozen=True)
