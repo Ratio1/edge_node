@@ -80,6 +80,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self, self.cfg_releases_repo_url, self.cfg_max_retries,
                                               self.cfg_github_api_timeout, self.cfg_debug_mode)
     self._cached_releases = self._load_cached_releases()
+    self._assets_html_path = ''
     return
 
   @handle_errors(fallback_value=[])
@@ -274,7 +275,11 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     Returns True if successful.
     """
     func_name = "_regenerate_index_html"
-    self.P(f"{func_name}: Starting HTML regeneration...")
+    self.P(f"{func_name}: Fetching data for HTML regeneration...")
+
+    # Where we will write the HTML
+    web_server_path = self.get_web_server_path()
+    output_path = self.os_path.join(web_server_path, 'assets/releases.html')
 
     # 1) Retrieve the full set of releases
     try:
@@ -292,6 +297,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.log_error(func_name, error_message, e)
       return False
 
+    self.P(f"{func_name}: Starting HTML regeneration...")
     # 2) Process the releases into the shape the HTML generator expects
     try:
       # Convert raw_releases directly to ReleaseInfo objects using list comprehension
@@ -327,10 +333,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         using_cached_data=using_cached_data,
         error_message=release_error.get('message', '') if release_error else ''
       )
-
-      # Where we will write the HTML
-      web_server_path = self.get_web_server_path()
-      output_path = self.os_path.join(web_server_path, 'assets/releases.html')
 
       with open(output_path, 'w') as fd:
         fd.write(html_content)
