@@ -191,8 +191,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         else:
           return [], {'message': "No valid releases found with all required assets", 'rate_limited': False}, False
 
-      self.P(f"{func_name}: Found {len(valid_github_releases)} valid releases from GitHub")
-
       # 4) Check which valid releases are already in cache
       new_valid_releases = []
       cached_valid_releases = []
@@ -251,7 +249,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       # 7) Combine cached valid releases with new full releases and return
       result = cached_valid_releases + new_full_releases
 
-      self.P(f"{func_name}: Returning {len(result)} valid releases")
       return result, None, changes_detected
 
     except GitHubApiError as gh_e:
