@@ -464,7 +464,6 @@ class ReleaseDataFetcher:
 
   def __init__(self, config: Dict[str, Any], logger: Any, releases_repo_url: str, max_retries: int,
                github_api_timeout: int, debug_mode: bool):
-    self.config = config
     self.logger = logger
     self.requests = logger.requests
     self._releases_repo_url = releases_repo_url
@@ -482,17 +481,17 @@ class ReleaseDataFetcher:
     while retries < self._max_retries:
       try:
         self._log(f"GET {url} with {params}")
-        resp = self.requests.get(url, params=params, timeout=self._github_api_timeout)
-        if resp.status_code == 200:
+        response = self.requests.get(url, params=params, timeout=self._github_api_timeout)
+        if response.status_code == 200:
           self.logger.P(f"[ReleaseDataFetcher] API request successful: {url} (status: 200)")
-          return resp.json()
+          return response.json()
         else:
-          self.logger.P(f"[ReleaseDataFetcher] API request failed: {url} (status: {resp.status_code})")
-          raise GitHubApiError.from_response(resp)
-      except GitHubApiError as ghe:
-        if ghe.is_rate_limit or retries >= (self._max_retries - 1):
+          self.logger.P(f"[ReleaseDataFetcher] API request failed: {url} (status: {response.status_code})")
+          raise GitHubApiError.from_response(response)
+      except GitHubApiError as github_error:
+        if github_error.is_rate_limit or retries >= (self._max_retries - 1):
           raise
-        last_exc = ghe
+        last_exc = github_error
       except Exception as e:
         if retries >= (self._max_retries - 1):
           raise GitHubApiError(str(e), GitHubApiErrorType.NETWORK)
@@ -537,11 +536,9 @@ class ReleaseDataFetcher:
         commit_info = self._get_commit_info(commit_sha)
 
     body_text = release_data.get('body', '') or ""
-    if not body_text.strip() and commit_sha:
-      # fallback to commit message
-      msg = self.get_commit_message(commit_sha)
-      if msg:
-        body_text = msg
+    if not body_text.strip() and commit_info and 'commit' in commit_info and 'message' in commit_info['commit']:
+      # fallback to commit message, using already fetched commit_info
+      body_text = commit_info['commit']['message']
 
     return GitHubReleaseData(
       tag_name=release_data['tag_name'],
@@ -556,12 +553,6 @@ class ReleaseDataFetcher:
   def _get_commit_info(self, commit_sha: str) -> Optional[Dict[str, Any]]:
     curl = f"{self._releases_repo_url}/commits/{commit_sha}"
     return self._make_request(curl)
-
-  def get_commit_message(self, commit_sha: str) -> Optional[str]:
-    ci = self._get_commit_info(commit_sha)
-    if ci and 'commit' in ci and 'message' in ci['commit']:
-      return ci['commit']['message']
-    return None
 
 
 @dataclass
