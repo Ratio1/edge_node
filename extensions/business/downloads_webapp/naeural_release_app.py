@@ -263,7 +263,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.log_error(func_name, msg, e)
       # fallback to cached releases
       if self._cached_releases:
-        result = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
+        result = self._cached_releases
         self.P(f"{func_name}: Unexpected error, using {len(result)} cached releases")
         return result, {'message': f"Using cached data - Failed to fetch updates: {str(e)}", 'rate_limited': False}, False
 
