@@ -50,7 +50,7 @@ class _TelegramChatbotMixin(object):
     """
     Returns the statistics for a specific user.
     """
-    if user not in self.users_stats:
+    if user not in self.__stats:
       return None
     return self.deepcopy(self.__stats[user])
 
