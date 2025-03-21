@@ -115,7 +115,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     2. Check which of those valid ones are already in our cache
     3. Download complete details for valid ones not in cache
     4. Add these to cache
-    5. Return the NR_PREVIOUS_RELEASES valid releases
+    5. Return all the cached valid releases
 
     A valid release has all required assets: Ubuntu 22.04, Windows MSI, Windows ZIP, macOS ARM.
 
@@ -244,20 +244,15 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           self.P(f"{func_name}: Added {len(new_full_releases)} new releases to cache")
       else:
         self.P(f"{func_name}: All releases already in cache, no downloads needed")
-        new_full_releases = []
 
-      # 7) Combine cached valid releases with new full releases and return
-      result = cached_valid_releases + new_full_releases
-
-      return result, None, changes_detected
+      return self._cached_releases, None, changes_detected
 
     except GitHubApiError as gh_e:
       msg = f"{func_name}: GitHubApiError {gh_e}"
       self.log_error(func_name, msg)
       # fallback to cached releases
       if self._cached_releases:
-        fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
-        result = fallback[:self.cfg_nr_previous_releases]
+        result = self._cached_releases
         self.P(f"{func_name}: GitHub API error, using {len(result)} cached releases")
         return result, {'message': f"Using cached data - GitHub API error: {str(gh_e)}", 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}, False
 
@@ -268,8 +263,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       self.log_error(func_name, msg, e)
       # fallback to cached releases
       if self._cached_releases:
-        fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
-        result = fallback[:self.cfg_nr_previous_releases]
+        result = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
         self.P(f"{func_name}: Unexpected error, using {len(result)} cached releases")
         return result, {'message': f"Using cached data - Failed to fetch updates: {str(e)}", 'rate_limited': False}, False
 
