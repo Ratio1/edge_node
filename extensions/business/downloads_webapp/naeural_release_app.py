@@ -12,7 +12,7 @@ NaeuralReleaseAppPlugin
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, TypedDict
 from dataclasses import dataclass, field
-from functools import lru_cache, wraps
+from functools import wraps
 from enum import Enum
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
@@ -130,7 +130,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if not github_releases:
         # If GitHub returned nothing, use what's in cache
         if self._cached_releases:
-          self._cached_releases.sort(key=lambda x: x['published_at'], reverse=True)
           self.P(f"{func_name}: GitHub returned 0 releases, using {len(self._cached_releases)} cached releases")
           return self._cached_releases, {'message': "Using cached data - unable to fetch updates from GitHub", 'rate_limited': False}
         else:
@@ -511,16 +510,15 @@ class ReleaseDataFetcher:
     # param per_page=n will limit to the top n (most recent) releases
     return self._make_request(url, params={"per_page": n}) or []
 
-  @lru_cache(maxsize=50)
   def get_release_details(self, tag_name: str) -> 'GitHubReleaseData':
     # 1) fetch the release by its tag
-    rurl = f"{self._releases_repo_url}/releases/tags/{tag_name}"
-    release_data = self._make_request(rurl)
+    release_url = f"{self._releases_repo_url}/releases/tags/{tag_name}"
+    release_data = self._make_request(release_url)
 
     # 2) fetch tag info to get commit sha
-    turl = f"{self._releases_repo_url}/git/refs/tags/{tag_name}"
+    tag_url = f"{self._releases_repo_url}/git/refs/tags/{tag_name}"
     try:
-      tag_data = self._make_request(turl)
+      tag_data = self._make_request(tag_url)
     except GitHubApiError as e:
       self._log(f"Failed to fetch tag refs for {tag_name}: {e}")
       tag_data = None
@@ -555,12 +553,10 @@ class ReleaseDataFetcher:
       tag_info=tag_data,
     )
 
-  @lru_cache(maxsize=100)
   def _get_commit_info(self, commit_sha: str) -> Optional[Dict[str, Any]]:
     curl = f"{self._releases_repo_url}/commits/{commit_sha}"
     return self._make_request(curl)
 
-  @lru_cache(maxsize=100)
   def get_commit_message(self, commit_sha: str) -> Optional[str]:
     ci = self._get_commit_info(commit_sha)
     if ci and 'commit' in ci and 'message' in ci['commit']:
