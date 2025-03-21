@@ -442,6 +442,7 @@ class ReleaseDataFetcher:
       self.logger.P(f"[ReleaseDataFetcher] {msg}")
 
   def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """Make a request to the GitHub API with retries and specific error handling."""
     retries = 0
     last_exc = None
     while retries < self._max_retries:
@@ -953,9 +954,9 @@ class HtmlGenerator:
     # Define all asset patterns and their properties
     asset_configs = [
       # (regex pattern, os_type, display_name, icon)
-      (r'Windows_msi\.zip', 'windows', 'Windows (ZIP)', '🪟'),
       (r'Windows\.msi$', 'windows', 'Windows (MSI)', '🪟'),
       (r'OSX-arm64\.zip', 'macos', 'macOS (Apple Silicon)', '🍎'),
+      (r'Windows_msi\.zip', 'windows', 'Windows (ZIP)', '🪟'),
       (r'LINUX_Ubuntu-22\.04\.AppImage', 'linux', 'Linux Ubuntu 22.04', '🐧'),
     ]
     
@@ -983,7 +984,7 @@ class HtmlGenerator:
     else:
       # Generate HTML for previous releases (grouped by OS type)
       os_groups = {
-        "Windows": [(r'Windows_msi\.zip', 'Windows ZIP'), (r'Windows\.msi$', 'Windows MSI')],
+        "Windows": [(r'Windows\.msi$', 'Windows MSI'), (r'Windows_msi\.zip', 'Windows ZIP')],
         "macOS": [(r'OSX-arm64\.zip', 'Apple Silicon')],
         "Linux": [(r'LINUX_Ubuntu-22\.04\.AppImage', 'Ubuntu 22.04')],
       }
