@@ -399,24 +399,6 @@ class GitHubReleaseData:
     if not self.published_at:
       raise ValueError("published_at cannot be empty")
 
-  @property
-  def formatted_date(self) -> str:
-    """Return formatted publication date."""
-    dt = datetime.strptime(self.published_at, '%Y-%m-%dT%H:%M:%SZ')
-    return dt.strftime('%B %d, %Y')
-
-  @property
-  def has_valid_body(self) -> bool:
-    """Check if the release has a valid body."""
-    return bool(self.body and self.body.strip())
-
-  def get_asset_by_type(self, asset_type: ReleaseAssetType) -> Optional[AssetInfo]:
-    """Get asset information by type."""
-    return next(
-      (a for a in self.assets if asset_type.value in a['name']),
-      None
-    )
-
 
 class GitHubApiErrorType(Enum):
   RATE_LIMIT = "rate_limit"
