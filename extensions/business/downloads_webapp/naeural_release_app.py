@@ -139,6 +139,8 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
       # 3) Find NR_PREVIOUS_RELEASES valid releases from GitHub
       valid_github_releases = []
+      skipped_releases = []
+
       for release in github_releases:
         assets = release.get('assets', [])
         asset_names = [a.get('name', '') for a in assets]
@@ -151,11 +153,7 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
         if has_ubuntu_22_04 and has_windows_zip and has_windows_msi and has_macos_arm:
           valid_github_releases.append(release)
-          self.P(f"{func_name}: Found valid release {release['tag_name']} with all required assets")
-
-          # Stop once we've found enough valid releases
           if len(valid_github_releases) >= self.cfg_nr_previous_releases:
-            self.P(f"{func_name}: Found {self.cfg_nr_previous_releases} valid releases, stopping search")
             break
         else:
           missing = []
@@ -163,7 +161,16 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           if not has_windows_zip: missing.append("Windows ZIP")
           if not has_windows_msi: missing.append("Windows MSI")
           if not has_macos_arm: missing.append("macOS ARM")
-          self.P(f"{func_name}: Skipping invalid release {release['tag_name']} - missing assets: {', '.join(missing)}")
+          skipped_releases.append((release['tag_name'], missing))
+
+      # Log summary of valid and invalid releases
+      if valid_github_releases:
+        valid_tags = [r['tag_name'] for r in valid_github_releases]
+        self.P(f"{func_name}: Found {len(valid_github_releases)} valid releases: {', '.join(valid_tags)}")
+      
+      if skipped_releases:
+        skip_summary = [f"{tag} (missing: {', '.join(missing)})" for tag, missing in skipped_releases]
+        self.P(f"{func_name}: Skipped {len(skipped_releases)} invalid releases: {'; '.join(skip_summary)}")
 
       if not valid_github_releases:
         # If no valid releases found on GitHub, use what's in cache
@@ -178,14 +185,18 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       # 4) Check which valid releases are already in cache
       new_valid_releases = []
       cached_valid_releases = []
+      cache_hits = []
 
       for release in valid_github_releases:
         if release['tag_name'] in cached_tags:
           cached_release = next(c for c in self._cached_releases if c['tag_name'] == release['tag_name'])
           cached_valid_releases.append(cached_release)
-          self.P(f"{func_name}: Cache hit for release {release['tag_name']}")
+          cache_hits.append(release['tag_name'])
         else:
           new_valid_releases.append(release)
+
+      if cache_hits:
+        self.P(f"{func_name}: Cache hits for releases: {', '.join(cache_hits)}")
 
       if new_valid_releases:
         self.P(
@@ -447,7 +458,6 @@ class ReleaseDataFetcher:
     last_exc = None
     while retries < self._max_retries:
       try:
-        self._log(f"GET {url} with {params}")
         response = self.requests.get(url, params=params, timeout=self._github_api_timeout)
         if response.status_code == 200:
           self.logger.P(f"[ReleaseDataFetcher] API request successful: {url} (status: 200)")
