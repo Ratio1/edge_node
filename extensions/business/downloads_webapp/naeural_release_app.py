@@ -1215,7 +1215,22 @@ class HtmlGenerator:
             button.textContent = 'Show All Releases';
           }
         }
+
+        // Check if we need the show all button
+        function updateShowAllButtonVisibility() {
+          const button = document.getElementById('show-all-btn');
+          const rows = document.querySelectorAll('.release-card');
+          // Hide button if we have 2 or fewer releases (all are shown by default)
+          if (rows.length <= 2) {
+            button.style.display = 'none';
+          } else {
+            button.style.display = 'block';
+          }
+        }
+
         document.addEventListener('DOMContentLoaded', function() {
+          // Add the new visibility check
+          updateShowAllButtonVisibility();
           checkContentOverflow('latest-release-info', 'latest-release-btn');
           const commitInfos = document.querySelectorAll('.commit-info');
           commitInfos.forEach(info => {
