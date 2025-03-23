@@ -35,6 +35,7 @@ _CONFIG = {
   },
   'NR_PREVIOUS_RELEASES': 5, # The number of previous releases that has to be fetched
   'RELEASES_TO_FETCH': 50, # The amount of releases to check from GitHub
+  'MAX_CACHED_RELEASES': 10,  # Maximum number of releases to keep in cache
   'REGENERATION_INTERVAL': 10 * 60,
   "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
   'VALIDATION_RULES': {
@@ -80,6 +81,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self, self.cfg_releases_repo_url, self.cfg_max_retries,
                                               self.cfg_github_api_timeout, self.cfg_debug_mode)
     self._cached_releases = self._load_cached_releases()
+    
+    # Ensure existing cache respects the size limit
+    trimmed_cache = self._trim_cache(self._cached_releases, "on_init")
+    if trimmed_cache is not None and trimmed_cache != self._cached_releases:
+        self._cached_releases = trimmed_cache
+        self._save_cached_releases(self._cached_releases)
+        
     self._assets_html_file_path = ''
     return
 
@@ -98,6 +106,31 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.diskapi_save_pickle_to_data(releases, RELEASES_CACHE_FILE)
     self.P(f"_save_cached_releases: Saved {len(releases)} release(s) to cache.")
     return True
+
+  @handle_errors(fallback_value=None)
+  def _trim_cache(self, cache: List[Dict[str, Any]], caller_name: str = "unknown") -> List[Dict[str, Any]]:
+    """
+    Trim the cache to the maximum configured size.
+    
+    Args:
+        cache: The list of releases to trim
+        caller_name: Name of the calling function/context for logging purposes
+        
+    Returns:
+        The trimmed cache list, sorted by published_at in reverse order (newest first)
+    """
+    if not cache:
+      return []
+      
+    # Always sort by published date, newest first
+    sorted_cache = sorted(cache, key=lambda x: x['published_at'], reverse=True)
+    
+    # Only trim if needed
+    if len(sorted_cache) > self.cfg_max_cached_releases:
+      self.P(f"_trim_cache ({caller_name}): Trimming cache from {len(sorted_cache)} to {self.cfg_max_cached_releases} releases")
+      return sorted_cache[:self.cfg_max_cached_releases]
+    
+    return sorted_cache
 
   def log_error(self, func_name: str, error_msg: str, exc_info: Optional[Exception] = None) -> str:
     details = [f"ERROR in {func_name}:", error_msg]
@@ -238,10 +271,13 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         if new_full_releases:
           updated_cache = [r for r in self._cached_releases if r['tag_name'] not in {nf['tag_name'] for nf in new_full_releases}]
           updated_cache.extend(new_full_releases)
-          updated_cache.sort(key=lambda x: x['published_at'], reverse=True)
-          self._cached_releases = updated_cache
-          self._save_cached_releases(updated_cache)
-          self.P(f"{func_name}: Added {len(new_full_releases)} new releases to cache")
+          
+          # Trim the cache to respect the configured size limit
+          updated_cache = self._trim_cache(updated_cache, func_name)
+          if updated_cache is not None:
+              self._cached_releases = updated_cache
+              self._save_cached_releases(updated_cache)
+              self.P(f"{func_name}: Added {len(new_full_releases)} new releases to cache")
       else:
         self.P(f"{func_name}: All releases already in cache, no downloads needed")
 
