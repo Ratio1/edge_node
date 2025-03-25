@@ -17,7 +17,7 @@ from enum import Enum
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.4.1'
+__VER__ = '0.4.2'
 
 RELEASES_CACHE_FILE = 'releases_history.pkl'
 
