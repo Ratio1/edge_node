@@ -77,14 +77,14 @@ class DeeployManagerPlugin(
     
     
 
-  @BasePlugin.endpoint(method="post")
+  @BasePlugin.endpoint(method="get")
   # /create_pipeline
   def create_pipeline(
     self, 
     app_name: str = "some_app_name", 
     plugin_signature: str = "PLUGIN_SIGNATURE_01",  
     target_nodes: list[str] = ["0xai_node1", "0xai_node2"], 
-    app_params: dict = {"param1": "value1", "param2": "value2"},
+    # app_params: dict = {"param1": "value1", "param2": "value2"},
   ):
     """
     Receive a request for creating a new pipeline on a target node
@@ -99,6 +99,43 @@ class DeeployManagerPlugin(
         'target_nodes': target_nodes,
         'signature': plugin_signature,
         'params': app_params
+      }
+    
+    except Exception as e:
+      self.P("Error processing request: {}".format(e), color='r')
+      data = {
+        'error' : str(e)
+      }
+    
+    response = self._get_response({
+      **data
+    })
+    return response
+
+
+  @BasePlugin.endpoint(method="get")
+  def delete_pipeline(self, app_name, target_nodes):
+    """
+    Receive a request for deleting a pipeline on a target node(s)
+
+    Parameters
+    ----------
+    app_name : str
+        The name of the app to delete
+        
+    target_nodes : list[str]
+        The nodes to delete the app from
+
+    Returns
+    -------
+    dict
+        A dictionary with the result of the operation
+    """
+    try:
+      self.P("Received request for deleting pipeline data")
+      data = {
+        'name': app_name,
+        'target_nodes': target_nodes,
       }
     
     except Exception as e:
