@@ -77,14 +77,14 @@ class DeeployManagerPlugin(
     
     
 
-  @BasePlugin.endpoint(method="get")
+  @BasePlugin.endpoint(method="post")
   # /create_pipeline
   def create_pipeline(
     self, 
     app_name: str = "some_app_name", 
     plugin_signature: str = "PLUGIN_SIGNATURE_01",  
     target_nodes: list[str] = ["0xai_node1", "0xai_node2"], 
-    # app_params: dict = {"param1": "value1", "param2": "value2"},
+    app_params: dict = {"param1": "value1", "param2": "value2"},
   ):
     """
     Receive a request for creating a new pipeline on a target node
