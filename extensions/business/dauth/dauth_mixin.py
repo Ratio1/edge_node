@@ -58,7 +58,7 @@ class _DauthMixin(object):
     Print a message to the console.
     """
     if self.cfg_dauth_verbose:
-      s = "[DDBG] " + s
+      s = "[dDBG] " + s
       self.P(s, *args, **kwargs)
     return  
   

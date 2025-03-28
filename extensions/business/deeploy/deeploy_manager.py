@@ -3,7 +3,10 @@
 
 """
 
+from .deeploy_mixin import _DeeployMixin
+
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
+from naeural_core.constants import BASE_CT
 
 __VER__ = '0.1.0'
 
@@ -16,7 +19,7 @@ _CONFIG = {
   
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
-  
+    
   
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -27,11 +30,13 @@ _CONFIG = {
 
 class DeeployManagerPlugin(
   BasePlugin,
+  _DeeployMixin
   ):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
   """
   CONFIG = _CONFIG
+  
 
   def __init__(self, **kwargs):
     super(DeeployManagerPlugin, self).__init__(**kwargs)
@@ -49,9 +54,16 @@ class DeeployManagerPlugin(
     return
     
 
-  @BasePlugin.endpoint(method="get")
+  @BasePlugin.endpoint(method="post")
   # /get_apps
-  def get_apps(self):
+  def get_apps(
+    self, 
+    request: dict = {
+      BASE_CT.BCctbase.ETH_SENDER: "0xethaddr355",
+      BASE_CT.BCctbase.ETH_SIGN: "0xethsig123",
+      "nonce" : "hex_nonce", # recoverable via int(nonce, 16)
+    }
+  ):
     """
     Get the list of apps that are running on the node.
 
@@ -62,16 +74,23 @@ class DeeployManagerPlugin(
     """
     try:
       self.P("Received request for apps")
-      data = {
-        'apps': []
+      inputs = self.NestedDotDict(request)
+      verified_sender = self._verify_get_apps_request(inputs)
+      sender = request[self.ct.BASE_CT.BCctbase.ETH_SENDER]
+      result = {
+        'apps': [],
+        'auth' : {
+          'sender' : sender,
+          'verified_sender' : verified_sender,
+        },
       }
     except Exception as e:
       self.P("Error processing request: {}".format(e), color='r')
-      data = {
+      result = {
         'error' : str(e)
       }
     response = self._get_response({
-      **data
+      **result
     })
     return response
     
@@ -81,10 +100,34 @@ class DeeployManagerPlugin(
   # /create_pipeline
   def create_pipeline(
     self, 
-    app_name: str = "some_app_name", 
-    plugin_signature: str = "PLUGIN_SIGNATURE_01",  
-    target_nodes: list[str] = ["0xai_node1", "0xai_node2"], 
-    app_params: dict = {"param1": "value1", "param2": "value2"},
+    request: dict =  {
+      "app_name" : "SOME_APP_NAME", 
+      "plugin_signature" : "SOME_PLUGIN_01",
+      "nonce" : "hex_nonce", # recoverable via int(nonce, 16)
+      "target_nodes" : [
+        "0xai_node_1",
+        "0xai_node_2",
+      ],
+      "target_nodes_count" : 0,
+      "app_params" : {
+        "IMAGE" : "repo/image:tag",
+        "REGISTRY" : "docker.io",
+        "USERNAME" : "user",
+        "PASSWORD" : "password",
+        "PORT" : 5000,
+        "OTHER_PARAM1" : "value1",
+        "OTHER_PARAM2" : "value2",
+        "OTHER_PARAM3" : "value3",
+        "OTHER_PARAM4" : "value4",
+        "OTHER_PARAM5" : "value5",
+        "ENV" : {
+          "ENV1" : "value1",
+          "ENV2" : "value2",
+          "ENV3" : "value3",
+          "ENV4" : "value4",
+        }
+      }    
+    }
   ):
     """
     Receive a request for creating a new pipeline on a target node
@@ -94,27 +137,49 @@ class DeeployManagerPlugin(
     """
     try:
       self.P("Received request for new pipeline data")
-      data = {
-        'name': app_name,
-        'target_nodes': target_nodes,
-        'signature': plugin_signature,
-        'params': app_params
+      inputs = self.NestedDotDict(request)  
+      verified_sender = self._verify_request(inputs)
+      result = {
+        'request' : {
+          'app_name' : inputs.app_name,
+          'plugin_signature' : inputs.plugin_signature,
+          'nonce' : inputs.nonce,
+          'target_nodes' : inputs.target_nodes,
+          'target_nodes_count' : inputs.target_nodes_count,
+          'app_params_image' : inputs.app_params.IMAGE,
+          'app_params_registry' : inputs.app_params.REGISTRY,
+        },        
+        'auth' : {
+          'sender' : inputs[self.ct.BASE_CT.BCctbase.ETH_SENDER],
+          'verified_sender' : verified_sender,
+        },
       }
     
     except Exception as e:
       self.P("Error processing request: {}".format(e), color='r')
-      data = {
+      result = {
         'error' : str(e)
       }
     
     response = self._get_response({
-      **data
+      **result
     })
     return response
 
 
-  @BasePlugin.endpoint(method="get")
-  def delete_pipeline(self, app_name, target_nodes):
+  @BasePlugin.endpoint(method="post")
+  def delete_pipeline(self, 
+    request: dict = {
+      "app_name" : "SOME_APP_NAME",
+      "target_nodes" : [
+        "0xai_node_1",
+        "0xai_node_2",
+      ],
+      BASE_CT.BCctbase.ETH_SENDER: "0xethaddr355",
+      BASE_CT.BCctbase.ETH_SIGN: "0xethsig123",
+      "nonce" : "hex_nonce", # recoverable via int(nonce, 16)
+    }
+  ):
     """
     Receive a request for deleting a pipeline on a target node(s)
 
@@ -133,18 +198,29 @@ class DeeployManagerPlugin(
     """
     try:
       self.P("Received request for deleting pipeline data")
-      data = {
-        'name': app_name,
-        'target_nodes': target_nodes,
+      inputs = self.NestedDotDict(request)
+      verified_sender = self._verify_delete_request(inputs)
+      sender = request[self.ct.BASE_CT.BCctbase.ETH_SENDER]
+      result = {
+        'request' : {
+          'app_name' : inputs.app_name,
+          'plugin_signature' : inputs.plugin_signature,
+          'nonce' : inputs.nonce,
+          'target_nodes' : inputs.target_nodes,
+        },
+        'auth' : {
+          'sender' : sender,
+          'verified_sender' : verified_sender,
+        },
       }
     
     except Exception as e:
       self.P("Error processing request: {}".format(e), color='r')
-      data = {
+      result = {
         'error' : str(e)
       }
     
     response = self._get_response({
-      **data
+      **result
     })
     return response
