@@ -68,7 +68,7 @@ from .deeploy_mixin import _DeeployMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
 
-__VER__ = '0.1.0'
+__VER__ = '0.2.1'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -147,6 +147,9 @@ class DeeployManagerPlugin(
       result = {
         'error' : str(e)
       }
+      if self.cfg_deeploy_verbose:
+        result['trace'] = self.trace_info()
+      #endif
     response = self._get_response({
       **result
     })

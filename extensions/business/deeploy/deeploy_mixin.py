@@ -8,6 +8,7 @@ class _DeeployMixin:
     super(_DeeployMixin, self).__init__()    
     return
 
+
   def Pd(self, s, *args, **kwargs):
     """
     Print a message to the console.
@@ -16,8 +17,8 @@ class _DeeployMixin:
       s = "[DEPDBG] " + s
       self.P(s, *args, **kwargs)
     return  
-  
-  
+
+
   def __get_emv_types(self, values):
     types = []
     known_types = self.bc.eth_types
@@ -34,8 +35,8 @@ class _DeeployMixin:
       elif isinstance(value, list) and isinstance(value[0], int):
         types.append(known_types.ETH_ARRAY_INT)
     return types  
-  
-  
+
+
   def __verify_signature(self, values, signature):
     """
     Verify the signature of the request.
@@ -50,24 +51,24 @@ class _DeeployMixin:
       signature=signature,
     )
     return sender
-  
-  
+
+
   def _get_online_apps(self):
-    dct_node_pipelines = self.netmon.network_known_configs()
-    filtered = {
-      node : pipelines for node, pipelines in dct_node_pipelines.items() 
-      if self.netmon.network_node_is_online(node)
-    }
+    if self.cfg_deeploy_verbose:
+      full_data = self.netmon.network_known_nodes()
+      self.Pd(f"Full data:\n{self.json_dumps(full_data, indent=2)}")
+    pipelines = self.netmon.network_known_configs()
+    non_admin_pipelines = {
+      node : [x for x in pipelines[node] if x['NAME'].lower() != 'admin_pipeline'] 
+      for node in pipelines      
+    }   
     result = {
-      node : {
-        'apps' : pipelines,
-        'status' : self.netmon.network_node_status(node),
-      } 
-      for node, pipelines in filtered.items() 
-    }
+      'configs': non_admin_pipelines,
+      'details': self.netmon.network_known_apps(),
+    }     
     return result
-  
-  
+
+
   def deeploy_get_nonce(self, hex_nonce):
     """
     Convert a hex nonce to a timestamp.
@@ -119,7 +120,8 @@ class _DeeployMixin:
       signature=inputs.get(BASE_CT.BCctbase.ETH_SIGN),
     )
     return sender
-  
+
+
   def deeploy_verify_delete_request(self, inputs):
     values = [
       inputs.app_name,
