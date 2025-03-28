@@ -19,6 +19,8 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
+  'DEEPLOY_VERBOSE' : True,
+  
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
     
@@ -49,6 +51,7 @@ class DeeployManagerPlugin(
     super(DeeployManagerPlugin, self).on_init()
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
+    # supported_evm_types = self.bc.eth_types
     self.P("Started {} plugin on {} / {}".format(
         self.__class__.__name__, my_address, my_eth_address,
       )
@@ -73,16 +76,15 @@ class DeeployManagerPlugin(
         
     """
     try:
-      self.P("Received request for apps")
       sender, inputs = self.deeploy_get_inputs(request)
-      verified_sender = self._verify_get_apps_request(inputs)
+      verified_sender = self.deeploy_verify_get_apps_request(inputs)
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
       result = {
         'apps': [],
         **dct_auth,
       }
     except Exception as e:
-      self.P("Error processing request: {}".format(e), color='r')
+      self.P("Error processing request: {}, Inputs: {}".format(e, inputs), color='r')
       result = {
         'error' : str(e)
       }
@@ -133,7 +135,6 @@ class DeeployManagerPlugin(
     ----------
     """
     try:
-      self.P("Received request for new pipeline data")
       sender, inputs = self.deeploy_get_inputs(request)
       verified_sender = self.deeploy_verify_create_request(inputs)
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
@@ -141,7 +142,6 @@ class DeeployManagerPlugin(
         'request' : {
           'app_name' : inputs.app_name,
           'plugin_signature' : inputs.plugin_signature,
-          'nonce' : inputs.nonce,
           'target_nodes' : inputs.target_nodes,
           'target_nodes_count' : inputs.target_nodes_count,
           'app_params_image' : inputs.app_params.IMAGE,
@@ -151,7 +151,7 @@ class DeeployManagerPlugin(
       }
     
     except Exception as e:
-      self.P("Error processing request: {}".format(e), color='r')
+      self.P("Error processing request: {}, Inputs: {}".format(e, inputs), color='r')
       result = {
         'error' : str(e)
       }
@@ -190,23 +190,20 @@ class DeeployManagerPlugin(
         A dictionary with the result of the operation
     """
     try:
-      self.P("Received request for deleting pipeline data")
-      inputs = self.NestedDotDict(request)
-      verified_sender = self._verify_delete_request(inputs)
-      sender = request[self.ct.BASE_CT.BCctbase.ETH_SENDER]
+      sender, inputs = self.deeploy_get_inputs(request)
+      verified_sender = self.deeploy_verify_delete_request(inputs)
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
       result = {
         'request' : {
           'app_name' : inputs.app_name,
           'plugin_signature' : inputs.plugin_signature,
-          'nonce' : inputs.nonce,
           'target_nodes' : inputs.target_nodes,
         },
         **dct_auth,
       }
     
     except Exception as e:
-      self.P("Error processing request: {}".format(e), color='r')
+      self.P("Error processing request: {}, Inputs: {}".format(e, inputs), color='r')
       result = {
         'error' : str(e)
       }
