@@ -137,8 +137,9 @@ class DeeployManagerPlugin(
       sender, inputs = self.deeploy_get_inputs(request)
       verified_sender = self.deeploy_verify_get_apps_request(inputs)
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
+      apps = self._get_online_apps()
       result = {
-        'apps': [],
+        'apps': apps,
         **dct_auth,
       }
     except Exception as e:

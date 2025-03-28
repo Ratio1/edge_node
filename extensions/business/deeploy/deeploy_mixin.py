@@ -52,6 +52,22 @@ class _DeeployMixin:
     return sender
   
   
+  def _get_online_apps(self):
+    dct_node_pipelines = self.netmon.network_known_configs()
+    filtered = {
+      node : pipelines for node, pipelines in dct_node_pipelines.items() 
+      if self.netmon.network_node_is_online(node)
+    }
+    result = {
+      node : {
+        'apps' : pipelines,
+        'status' : self.netmon.network_node_status(node),
+      } 
+      for node, pipelines in filtered.items() 
+    }
+    return result
+  
+  
   def deeploy_get_nonce(self, hex_nonce):
     """
     Convert a hex nonce to a timestamp.
