@@ -1,4 +1,4 @@
-
+from naeural_core.constants import BASE_CT
 
 class _DeeployMixin:
   def __init__(self):
@@ -15,13 +15,39 @@ class _DeeployMixin:
     return  
   
   
-  def _verify_create_request(self, inputs):
+  def deeploy_get_nonce(self, hex_nonce):
+    """
+    Convert a hex nonce to a timestamp.
+    """
+    str_nonce = hex_nonce.replace("0x", "")
+    result = int(str_nonce, 16)
+    str_timestamp = self.time_to_str(result)
+    return str_timestamp
+  
+  
+  def deeploy_get_inputs(self, request: dict):
+    sender = request.get(BASE_CT.BCctbase.ETH_SENDER)
+    inputs = self.NestedDotDict(request)    
+    return sender, inputs
+  
+  
+  def deeploy_get_auth_result(self, inputs, sender : str, verified_sender: str):
+    result = {
+      'auth' : {
+        'sender' : sender,
+        'verified_sender' : verified_sender,
+      },
+    }
+    return result
+  
+  
+  def deeploy_verify_create_request(self, inputs):
     values = [
       inputs.app_name,
       inputs.plugin_signature,
       inputs.nonce,
       inputs.target_nodes,
-      inputs.arget_nodes_count,
+      inputs.target_nodes_count,
       inputs.app_params.IMAGE,
       inputs.app_params.REGISTRY,
     ]
@@ -43,7 +69,7 @@ class _DeeployMixin:
     )
     return sender
   
-  def _verify_delete_request(self, inputs):
+  def deeploy_verify_delete_request(self, inputs):
     values = [
       inputs.app_name,
       inputs.plugin_signature,
@@ -63,7 +89,7 @@ class _DeeployMixin:
     )
     return sender
   
-  def _verify_get_apps_request(self, inputs):
+  def deeploy_verify_get_apps_request(self, inputs):
     values = [
       inputs.nonce,
     ]

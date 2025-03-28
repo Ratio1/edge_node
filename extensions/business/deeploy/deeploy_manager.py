@@ -1,12 +1,14 @@
 """
 
 
+Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
+
 """
 
 from .deeploy_mixin import _DeeployMixin
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
-from naeural_core.constants import BASE_CT
+
 
 __VER__ = '0.1.0'
 
@@ -59,8 +61,6 @@ class DeeployManagerPlugin(
   def get_apps(
     self, 
     request: dict = {
-      BASE_CT.BCctbase.ETH_SENDER: "0xethaddr355",
-      BASE_CT.BCctbase.ETH_SIGN: "0xethsig123",
       "nonce" : "hex_nonce", # recoverable via int(nonce, 16)
     }
   ):
@@ -74,15 +74,12 @@ class DeeployManagerPlugin(
     """
     try:
       self.P("Received request for apps")
-      inputs = self.NestedDotDict(request)
+      sender, inputs = self.deeploy_get_inputs(request)
       verified_sender = self._verify_get_apps_request(inputs)
-      sender = request[self.ct.BASE_CT.BCctbase.ETH_SENDER]
+      dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
       result = {
         'apps': [],
-        'auth' : {
-          'sender' : sender,
-          'verified_sender' : verified_sender,
-        },
+        **dct_auth,
       }
     except Exception as e:
       self.P("Error processing request: {}".format(e), color='r')
@@ -137,8 +134,9 @@ class DeeployManagerPlugin(
     """
     try:
       self.P("Received request for new pipeline data")
-      inputs = self.NestedDotDict(request)  
-      verified_sender = self._verify_request(inputs)
+      sender, inputs = self.deeploy_get_inputs(request)
+      verified_sender = self.deeploy_verify_create_request(inputs)
+      dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
       result = {
         'request' : {
           'app_name' : inputs.app_name,
@@ -149,10 +147,7 @@ class DeeployManagerPlugin(
           'app_params_image' : inputs.app_params.IMAGE,
           'app_params_registry' : inputs.app_params.REGISTRY,
         },        
-        'auth' : {
-          'sender' : inputs[self.ct.BASE_CT.BCctbase.ETH_SENDER],
-          'verified_sender' : verified_sender,
-        },
+        **dct_auth,
       }
     
     except Exception as e:
@@ -175,8 +170,6 @@ class DeeployManagerPlugin(
         "0xai_node_1",
         "0xai_node_2",
       ],
-      BASE_CT.BCctbase.ETH_SENDER: "0xethaddr355",
-      BASE_CT.BCctbase.ETH_SIGN: "0xethsig123",
       "nonce" : "hex_nonce", # recoverable via int(nonce, 16)
     }
   ):
@@ -201,6 +194,7 @@ class DeeployManagerPlugin(
       inputs = self.NestedDotDict(request)
       verified_sender = self._verify_delete_request(inputs)
       sender = request[self.ct.BASE_CT.BCctbase.ETH_SENDER]
+      dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
       result = {
         'request' : {
           'app_name' : inputs.app_name,
@@ -208,10 +202,7 @@ class DeeployManagerPlugin(
           'nonce' : inputs.nonce,
           'target_nodes' : inputs.target_nodes,
         },
-        'auth' : {
-          'sender' : sender,
-          'verified_sender' : verified_sender,
-        },
+        **dct_auth,
       }
     
     except Exception as e:
