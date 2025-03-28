@@ -12,12 +12,12 @@ NaeuralReleaseAppPlugin
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any, TypedDict
 from dataclasses import dataclass, field
-from functools import lru_cache, wraps
+from functools import wraps
 from enum import Enum
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.4.0'
+__VER__ = '0.4.2'
 
 RELEASES_CACHE_FILE = 'releases_history.pkl'
 
@@ -35,6 +35,7 @@ _CONFIG = {
   },
   'NR_PREVIOUS_RELEASES': 5, # The number of previous releases that has to be fetched
   'RELEASES_TO_FETCH': 50, # The amount of releases to check from GitHub
+  'MAX_CACHED_RELEASES': 10,  # Maximum number of releases to keep in cache
   'REGENERATION_INTERVAL': 10 * 60,
   "RELEASES_REPO_URL": "https://api.github.com/repos/Ratio1/edge_node_launcher",
   'VALIDATION_RULES': {
@@ -80,6 +81,14 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.release_fetcher = ReleaseDataFetcher(self.CONFIG, self, self.cfg_releases_repo_url, self.cfg_max_retries,
                                               self.cfg_github_api_timeout, self.cfg_debug_mode)
     self._cached_releases = self._load_cached_releases()
+    
+    # Ensure existing cache respects the size limit
+    trimmed_cache = self._trim_cache(self._cached_releases, "on_init")
+    if trimmed_cache is not None and trimmed_cache != self._cached_releases:
+        self._cached_releases = trimmed_cache
+        self._save_cached_releases(self._cached_releases)
+        
+    self._assets_html_file_path = ''
     return
 
   @handle_errors(fallback_value=[])
@@ -98,6 +107,31 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.P(f"_save_cached_releases: Saved {len(releases)} release(s) to cache.")
     return True
 
+  @handle_errors(fallback_value=None)
+  def _trim_cache(self, cache: List[Dict[str, Any]], caller_name: str = "unknown") -> List[Dict[str, Any]]:
+    """
+    Trim the cache to the maximum configured size.
+    
+    Args:
+        cache: The list of releases to trim
+        caller_name: Name of the calling function/context for logging purposes
+        
+    Returns:
+        The trimmed cache list, sorted by published_at in reverse order (newest first)
+    """
+    if not cache:
+      return []
+      
+    # Always sort by published date, newest first
+    sorted_cache = sorted(cache, key=lambda x: x['published_at'], reverse=True)
+    
+    # Only trim if needed
+    if len(sorted_cache) > self.cfg_max_cached_releases:
+      self.P(f"_trim_cache ({caller_name}): Trimming cache from {len(sorted_cache)} to {self.cfg_max_cached_releases} releases")
+      return sorted_cache[:self.cfg_max_cached_releases]
+    
+    return sorted_cache
+
   def log_error(self, func_name: str, error_msg: str, exc_info: Optional[Exception] = None) -> str:
     details = [f"ERROR in {func_name}:", error_msg]
     if exc_info and self.cfg_debug_mode:
@@ -108,15 +142,21 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     self.P(msg)
     return msg
 
-  def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
+  def get_latest_releases(self) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], bool]:
     """
     1. Check GitHub releases until we find NR_PREVIOUS_RELEASES valid ones
     2. Check which of those valid ones are already in our cache
     3. Download complete details for valid ones not in cache
     4. Add these to cache
-    5. Return the NR_PREVIOUS_RELEASES valid releases
+    5. Return all the cached valid releases
 
     A valid release has all required assets: Ubuntu 22.04, Windows MSI, Windows ZIP, macOS ARM.
+
+    Returns:
+        Tuple containing:
+        - List of release dictionaries
+        - Optional error information dictionary
+        - Boolean indicating if any changes were detected (True = changes found)
     """
     func_name = "get_latest_releases"
     try:
@@ -130,16 +170,18 @@ class NaeuralReleaseAppPlugin(BasePlugin):
       if not github_releases:
         # If GitHub returned nothing, use what's in cache
         if self._cached_releases:
-          self._cached_releases.sort(key=lambda x: x['published_at'], reverse=True)
           self.P(f"{func_name}: GitHub returned 0 releases, using {len(self._cached_releases)} cached releases")
-          return self._cached_releases, {'message': "Using cached data - unable to fetch updates from GitHub", 'rate_limited': False}
-        else:
-          return [], {'message': "No releases found from GitHub & no cache available", 'rate_limited': False}
+          return self._cached_releases, {'message': "Using cached data - unable to fetch updates from GitHub", 'rate_limited': False}, False
+
+        return [], {'message': "No releases found from GitHub & no cache available", 'rate_limited': False}, False
 
       self.P(f"{func_name}: GitHub returned {len(github_releases)} basic releases")
 
       # 3) Find NR_PREVIOUS_RELEASES valid releases from GitHub
       valid_github_releases = []
+      skipped_releases = []
+      changes_detected = False
+
       for release in github_releases:
         assets = release.get('assets', [])
         asset_names = [a.get('name', '') for a in assets]
@@ -152,11 +194,10 @@ class NaeuralReleaseAppPlugin(BasePlugin):
 
         if has_ubuntu_22_04 and has_windows_zip and has_windows_msi and has_macos_arm:
           valid_github_releases.append(release)
-          self.P(f"{func_name}: Found valid release {release['tag_name']} with all required assets")
-
-          # Stop once we've found enough valid releases
+          # If this is a new release or not in cache, mark as changed
+          if release['tag_name'] not in cached_tags:
+            changes_detected = True
           if len(valid_github_releases) >= self.cfg_nr_previous_releases:
-            self.P(f"{func_name}: Found {self.cfg_nr_previous_releases} valid releases, stopping search")
             break
         else:
           missing = []
@@ -164,29 +205,41 @@ class NaeuralReleaseAppPlugin(BasePlugin):
           if not has_windows_zip: missing.append("Windows ZIP")
           if not has_windows_msi: missing.append("Windows MSI")
           if not has_macos_arm: missing.append("macOS ARM")
-          self.P(f"{func_name}: Skipping invalid release {release['tag_name']} - missing assets: {', '.join(missing)}")
+          skipped_releases.append((release['tag_name'], missing))
+
+      # Log summary of valid and invalid releases
+      if valid_github_releases:
+        valid_tags = [r['tag_name'] for r in valid_github_releases]
+        self.P(f"{func_name}: Found {len(valid_github_releases)} valid releases: {', '.join(valid_tags)}")
+      
+      if skipped_releases:
+        skip_summary = [f"{tag} (missing: {', '.join(missing)})" for tag, missing in skipped_releases]
+        self.P(f"{func_name}: Skipped {len(skipped_releases)} invalid releases: {'; '.join(skip_summary)}")
 
       if not valid_github_releases:
         # If no valid releases found on GitHub, use what's in cache
         if self._cached_releases:
           self.P(f"{func_name}: No valid releases from GitHub, using {len(self._cached_releases)} cached releases")
-          return self._cached_releases, None
+          return self._cached_releases, None, False
         else:
-          return [], {'message': "No valid releases found with all required assets", 'rate_limited': False}
-
-      self.P(f"{func_name}: Found {len(valid_github_releases)} valid releases from GitHub")
+          return [], {'message': "No valid releases found with all required assets", 'rate_limited': False}, False
 
       # 4) Check which valid releases are already in cache
       new_valid_releases = []
       cached_valid_releases = []
+      cache_hits = []
 
       for release in valid_github_releases:
         if release['tag_name'] in cached_tags:
           cached_release = next(c for c in self._cached_releases if c['tag_name'] == release['tag_name'])
           cached_valid_releases.append(cached_release)
-          self.P(f"{func_name}: Cache hit for release {release['tag_name']}")
+          cache_hits.append(release['tag_name'])
         else:
           new_valid_releases.append(release)
+          changes_detected = True
+
+      if cache_hits:
+        self.P(f"{func_name}: Cache hits for releases: {', '.join(cache_hits)}")
 
       if new_valid_releases:
         self.P(
@@ -218,58 +271,68 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         if new_full_releases:
           updated_cache = [r for r in self._cached_releases if r['tag_name'] not in {nf['tag_name'] for nf in new_full_releases}]
           updated_cache.extend(new_full_releases)
-          updated_cache.sort(key=lambda x: x['published_at'], reverse=True)
-          self._cached_releases = updated_cache
-          self._save_cached_releases(updated_cache)
-          self.P(f"{func_name}: Added {len(new_full_releases)} new releases to cache")
+          
+          # Trim the cache to respect the configured size limit
+          updated_cache = self._trim_cache(updated_cache, func_name)
+          if updated_cache is not None:
+              self._cached_releases = updated_cache
+              self._save_cached_releases(updated_cache)
+              self.P(f"{func_name}: Added {len(new_full_releases)} new releases to cache")
       else:
         self.P(f"{func_name}: All releases already in cache, no downloads needed")
-        new_full_releases = []
 
-      # 7) Combine cached valid releases with new full releases and return
-      result = cached_valid_releases + new_full_releases
-      result.sort(key=lambda x: x['published_at'], reverse=True)
-
-      self.P(f"{func_name}: Returning {len(result)} valid releases")
-      return result, None
+      return self._cached_releases, None, changes_detected
 
     except GitHubApiError as gh_e:
       msg = f"{func_name}: GitHubApiError {gh_e}"
       self.log_error(func_name, msg)
       # fallback to cached releases
       if self._cached_releases:
-        fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
-        result = fallback[:self.cfg_nr_previous_releases]
+        result = self._cached_releases
         self.P(f"{func_name}: GitHub API error, using {len(result)} cached releases")
-        return result, {'message': f"Using cached data - GitHub API error: {str(gh_e)}", 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}
+        return result, {'message': f"Using cached data - GitHub API error: {str(gh_e)}", 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}, False
 
-      return [], {'message': msg, 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}
+      return [], {'message': msg, 'rate_limited': gh_e.is_rate_limit, 'error_type': gh_e.error_type.value}, False
 
     except Exception as e:
       msg = f"{func_name}: Unexpected error: {str(e)}"
       self.log_error(func_name, msg, e)
       # fallback to cached releases
       if self._cached_releases:
-        fallback = sorted(self._cached_releases, key=lambda x: x['published_at'], reverse=True)
-        result = fallback[:self.cfg_nr_previous_releases]
+        result = self._cached_releases
         self.P(f"{func_name}: Unexpected error, using {len(result)} cached releases")
-        return result, {'message': f"Using cached data - Failed to fetch updates: {str(e)}", 'rate_limited': False}
+        return result, {'message': f"Using cached data - Failed to fetch updates: {str(e)}", 'rate_limited': False}, False
 
-      return [], {'message': msg, 'rate_limited': False}
+      return [], {'message': msg, 'rate_limited': False}, False
 
   @handle_errors(fallback_value=True)
-  def _regenerate_index_html(self) -> bool:
+  def _regenerate_index_html(self, releases_data: Optional[Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]], bool]] = None) -> bool:
     """
     Fetch/compile the full set of releases from cache+GitHub, then
     generate the final releases.html for display.
-    Returns True if successful.
+    
+    Args:
+        releases_data: Optional tuple containing (releases, error, changes_detected) from a previous get_latest_releases call
+    
+    Returns:
+        True if successful.
     """
     func_name = "_regenerate_index_html"
     self.P(f"{func_name}: Starting HTML regeneration...")
 
-    # 1) Retrieve the full set of releases
+    # Where we will write the HTML
+    web_server_path = self.get_web_server_path()
+    output_path = self.os_path.join(web_server_path, 'assets/releases.html')
+    # Save the output path for later use
+    self._assets_html_file_path = output_path
+    
+    # 1) Get or retrieve the full set of releases
     try:
-      raw_releases, release_error = self.get_latest_releases()
+      if releases_data is None:
+        raw_releases, release_error, _ = self.get_latest_releases()
+      else:
+        raw_releases, release_error, _ = releases_data
+        
       if not raw_releases:
         # Use the error info from get_latest_releases if present
         if release_error:
@@ -299,8 +362,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         for release_data in raw_releases
       ]
       
-      self.P(f"{func_name}: Successfully processed {len(releases_for_html)} releases for HTML generation")
-
     except Exception as e:
       error_msg = f"{func_name}: Error processing release data: {str(e)}"
       self.log_error(func_name, error_msg, e)
@@ -319,10 +380,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
         error_message=release_error.get('message', '') if release_error else ''
       )
 
-      # Where we will write the HTML
-      web_server_path = self.get_web_server_path()
-      output_path = self.os_path.join(web_server_path, 'assets/releases.html')
-
       with open(output_path, 'w') as fd:
         fd.write(html_content)
 
@@ -339,23 +396,60 @@ class NaeuralReleaseAppPlugin(BasePlugin):
   @handle_errors(fallback_value=True)
   def _maybe_regenerate_index_html(self) -> bool:
     """
-    Check if enough time has passed since last regeneration. If so, regenerate.
+    Check if HTML regeneration is needed and regenerate if necessary.
+    
+    The function follows this logic:
+    1. Check if enough time has elapsed since last generation
+    2. If time elapsed, verify if the HTML file exists
+    3. If file exists, check for new releases
+    4. Regenerate HTML if:
+       - Time elapsed and file doesn't exist
+       - New valid releases are detected
     """
     func_name = "_maybe_regenerate_index_html"
     current_time = self.time()
-    if (current_time - self.__last_generation_time) > self.cfg_regeneration_interval:
-      self.P(f"{func_name}: Regeneration interval elapsed, regenerating releases.html...")
-      result = self._regenerate_index_html()
-      current_day = self.datetime.now().day
-
-      # Whether success or failure, update the generation time to avoid repeated attempts
-      self.__last_generation_time = current_time
-
-      if result:
-        self._last_day_regenerated = current_day
-        self.P(f"{func_name}: HTML regeneration successful.")
-      else:
-        self.P(f"{func_name}: HTML regeneration failed (see logs).")
+    
+    # Step 1: Check if enough time has elapsed
+    time_elapsed = (current_time - self.__last_generation_time) > self.cfg_regeneration_interval
+    if not time_elapsed:
+        return True
+    
+    self.P(f"{func_name}: Regeneration interval elapsed")
+    
+    # Step 2: Check if HTML file exists
+    file_exists = bool(self._assets_html_file_path and self.os_path.exists(self._assets_html_file_path))
+    if not file_exists:
+        self.P(f"{func_name}: HTML file not found, regenerating...")
+        return self._regenerate_and_update_time(current_time)
+    
+    # Step 3: Check for new releases
+    try:
+        releases_data = self.get_latest_releases()
+        has_new_releases = releases_data[2]  # Check changes_detected flag
+        
+        if has_new_releases:
+            self.P(f"{func_name}: New releases detected, regenerating...")
+            return self._regenerate_and_update_time(current_time, releases_data)
+            
+        self.P(f"{func_name}: No new releases found, skipping regeneration")
+        self.__last_generation_time = current_time
+        return True
+        
+    except Exception as e:
+        self.log_error(func_name, f"Error checking for new releases: {str(e)}")
+        return True
+    
+  def _regenerate_and_update_time(self, current_time: float, releases_data=None) -> bool:
+    """Helper function to regenerate HTML and update timestamps."""
+    result = self._regenerate_index_html(releases_data)
+    self.__last_generation_time = current_time
+    
+    if result:
+        self._last_day_regenerated = self.datetime.now().day
+        self.P("HTML regeneration successful")
+    else:
+        self.P("HTML regeneration failed (see logs)")
+        
     return True
 
   def process(self):
@@ -365,21 +459,6 @@ class NaeuralReleaseAppPlugin(BasePlugin):
     except Exception as e:
       self.log_error("process", f"Unhandled error in process(): {str(e)}", e)
     return
-
-
-class ReleaseAssetType(Enum):
-  """Types of release assets we support."""
-  LINUX_22_04 = "LINUX_Ubuntu-22.04.AppImage"
-  WINDOWS_ZIP = "Windows_msi.zip"
-  WINDOWS_MSI = "Windows.msi"
-  MACOS_ARM = "OSX-arm64.zip"
-
-
-class AssetInfo(TypedDict):
-  """Type definition for asset information."""
-  name: str
-  size: int
-  browser_download_url: str
 
 
 @dataclass(frozen=True)
@@ -399,24 +478,6 @@ class GitHubReleaseData:
       raise ValueError("tag_name cannot be empty")
     if not self.published_at:
       raise ValueError("published_at cannot be empty")
-
-  @property
-  def formatted_date(self) -> str:
-    """Return formatted publication date."""
-    dt = datetime.strptime(self.published_at, '%Y-%m-%dT%H:%M:%SZ')
-    return dt.strftime('%B %d, %Y')
-
-  @property
-  def has_valid_body(self) -> bool:
-    """Check if the release has a valid body."""
-    return bool(self.body and self.body.strip())
-
-  def get_asset_by_type(self, asset_type: ReleaseAssetType) -> Optional[AssetInfo]:
-    """Get asset information by type."""
-    return next(
-      (a for a in self.assets if asset_type.value in a['name']),
-      None
-    )
 
 
 class GitHubApiErrorType(Enum):
@@ -465,11 +526,8 @@ class ReleaseDataFetcher:
 
   def __init__(self, config: Dict[str, Any], logger: Any, releases_repo_url: str, max_retries: int,
                github_api_timeout: int, debug_mode: bool):
-    self.config = config
     self.logger = logger
     self.requests = logger.requests
-    self._cache_timeout = timedelta(minutes=10)
-    self._last_cache_clear = datetime.now()
     self._releases_repo_url = releases_repo_url
     self._max_retries = max_retries
     self._debug_mode = debug_mode
@@ -479,31 +537,23 @@ class ReleaseDataFetcher:
     if self._debug_mode:
       self.logger.P(f"[ReleaseDataFetcher] {msg}")
 
-  def _check_and_clear_cache(self):
-    now = datetime.now()
-    if now - self._last_cache_clear > self._cache_timeout:
-      self.get_release_details.cache_clear()
-      self.get_commit_message.cache_clear()
-      self._last_cache_clear = now
-      self._log("Cleared internal lru_cache")
-
   def _make_request(self, url: str, params: Optional[Dict[str, Any]] = None) -> Any:
+    """Make a request to the GitHub API with retries and specific error handling."""
     retries = 0
     last_exc = None
     while retries < self._max_retries:
       try:
-        self._log(f"GET {url} with {params}")
-        resp = self.requests.get(url, params=params, timeout=self._github_api_timeout)
-        if resp.status_code == 200:
+        response = self.requests.get(url, params=params, timeout=self._github_api_timeout)
+        if response.status_code == 200:
           self.logger.P(f"[ReleaseDataFetcher] API request successful: {url} (status: 200)")
-          return resp.json()
+          return response.json()
         else:
-          self.logger.P(f"[ReleaseDataFetcher] API request failed: {url} (status: {resp.status_code})")
-          raise GitHubApiError.from_response(resp)
-      except GitHubApiError as ghe:
-        if ghe.is_rate_limit or retries >= (self._max_retries - 1):
+          self.logger.P(f"[ReleaseDataFetcher] API request failed: {url} (status: {response.status_code})")
+          raise GitHubApiError.from_response(response)
+      except GitHubApiError as github_error:
+        if github_error.is_rate_limit or retries >= (self._max_retries - 1):
           raise
-        last_exc = ghe
+        last_exc = github_error
       except Exception as e:
         if retries >= (self._max_retries - 1):
           raise GitHubApiError(str(e), GitHubApiErrorType.NETWORK)
@@ -517,22 +567,19 @@ class ReleaseDataFetcher:
     """
     Fetch from GitHub the last n release objects (basic info only).
     """
-    self._check_and_clear_cache()
     url = f"{self._releases_repo_url}/releases"
     # param per_page=n will limit to the top n (most recent) releases
     return self._make_request(url, params={"per_page": n}) or []
 
-  @lru_cache(maxsize=50)
   def get_release_details(self, tag_name: str) -> 'GitHubReleaseData':
-    self._check_and_clear_cache()
     # 1) fetch the release by its tag
-    rurl = f"{self._releases_repo_url}/releases/tags/{tag_name}"
-    release_data = self._make_request(rurl)
+    release_url = f"{self._releases_repo_url}/releases/tags/{tag_name}"
+    release_data = self._make_request(release_url)
 
     # 2) fetch tag info to get commit sha
-    turl = f"{self._releases_repo_url}/git/refs/tags/{tag_name}"
+    tag_url = f"{self._releases_repo_url}/git/refs/tags/{tag_name}"
     try:
-      tag_data = self._make_request(turl)
+      tag_data = self._make_request(tag_url)
     except GitHubApiError as e:
       self._log(f"Failed to fetch tag refs for {tag_name}: {e}")
       tag_data = None
@@ -551,11 +598,9 @@ class ReleaseDataFetcher:
         commit_info = self._get_commit_info(commit_sha)
 
     body_text = release_data.get('body', '') or ""
-    if not body_text.strip() and commit_sha:
-      # fallback to commit message
-      msg = self.get_commit_message(commit_sha)
-      if msg:
-        body_text = msg
+    if not body_text.strip() and commit_info and 'commit' in commit_info and 'message' in commit_info['commit']:
+      # fallback to commit message, using already fetched commit_info
+      body_text = commit_info['commit']['message']
 
     return GitHubReleaseData(
       tag_name=release_data['tag_name'],
@@ -567,17 +612,9 @@ class ReleaseDataFetcher:
       tag_info=tag_data,
     )
 
-  @lru_cache(maxsize=100)
   def _get_commit_info(self, commit_sha: str) -> Optional[Dict[str, Any]]:
     curl = f"{self._releases_repo_url}/commits/{commit_sha}"
     return self._make_request(curl)
-
-  @lru_cache(maxsize=100)
-  def get_commit_message(self, commit_sha: str) -> Optional[str]:
-    ci = self._get_commit_info(commit_sha)
-    if ci and 'commit' in ci and 'message' in ci['commit']:
-      return ci['commit']['message']
-    return None
 
 
 @dataclass
@@ -1012,9 +1049,9 @@ class HtmlGenerator:
     # Define all asset patterns and their properties
     asset_configs = [
       # (regex pattern, os_type, display_name, icon)
-      (r'Windows_msi\.zip', 'windows', 'Windows (ZIP)', '🪟'),
       (r'Windows\.msi$', 'windows', 'Windows (MSI)', '🪟'),
       (r'OSX-arm64\.zip', 'macos', 'macOS (Apple Silicon)', '🍎'),
+      (r'Windows_msi\.zip', 'windows', 'Windows (ZIP)', '🪟'),
       (r'LINUX_Ubuntu-22\.04\.AppImage', 'linux', 'Linux Ubuntu 22.04', '🐧'),
     ]
     
@@ -1042,7 +1079,7 @@ class HtmlGenerator:
     else:
       # Generate HTML for previous releases (grouped by OS type)
       os_groups = {
-        "Windows": [(r'Windows_msi\.zip', 'Windows ZIP'), (r'Windows\.msi$', 'Windows MSI')],
+        "Windows": [(r'Windows\.msi$', 'Windows MSI'), (r'Windows_msi\.zip', 'Windows ZIP')],
         "macOS": [(r'OSX-arm64\.zip', 'Apple Silicon')],
         "Linux": [(r'LINUX_Ubuntu-22\.04\.AppImage', 'Ubuntu 22.04')],
       }
@@ -1214,7 +1251,22 @@ class HtmlGenerator:
             button.textContent = 'Show All Releases';
           }
         }
+
+        // Check if we need the show all button
+        function updateShowAllButtonVisibility() {
+          const button = document.getElementById('show-all-btn');
+          const rows = document.querySelectorAll('.release-card');
+          // Hide button if we have 2 or fewer releases (all are shown by default)
+          if (rows.length <= 2) {
+            button.style.display = 'none';
+          } else {
+            button.style.display = 'block';
+          }
+        }
+
         document.addEventListener('DOMContentLoaded', function() {
+          // Add the new visibility check
+          updateShowAllButtonVisibility();
           checkContentOverflow('latest-release-info', 'latest-release-btn');
           const commitInfos = document.querySelectorAll('.commit-info');
           commitInfos.forEach(info => {
