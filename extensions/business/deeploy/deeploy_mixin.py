@@ -54,6 +54,7 @@ class _DeeployMixin:
 
 
   def _get_online_apps(self):
+    """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
       self.Pd(f"Full data:\n{self.json_dumps(full_data, indent=2)}")
@@ -61,11 +62,14 @@ class _DeeployMixin:
     non_admin_pipelines = {
       node : [x for x in pipelines[node] if x['NAME'].lower() != 'admin_pipeline'] 
       for node in pipelines      
-    }   
+    }  
     result = {
       'configs': non_admin_pipelines,
       'details': self.netmon.network_known_apps(),
     }     
+    
+    """
+    result = self.netmon.network_known_apps()
     return result
 
 

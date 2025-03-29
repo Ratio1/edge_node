@@ -1,69 +1,11 @@
 """
-Examples:
-
-Create request nonce 2025-03-28 10:36:37:
-{
-  "request": {
-    "app_name": "SOME_APP_NAME",
-    "plugin_signature": "SOME_PLUGIN_01",
-    "nonce": "0x195dc533d7b",
-    "target_nodes": [
-      "0xai_Amfnbt3N-qg2-qGtywZIPQBTVlAnoADVRmSAsdDhlQ-6",
-      "0xai_Amfnbt3N-qg2-qGtywZIPQBTVlAnoADVRmSAsdDhlQ-7"
-    ],
-    "target_nodes_count": 0,
-    "app_params": {
-      "IMAGE": "repo/image:tag",
-      "REGISTRY": "docker.io",
-      "USERNAME": "user",
-      "PASSWORD": "password",
-      "PORT": 5000,
-      "OTHER_PARAM1": "value1",
-      "OTHER_PARAM2": "value2",
-      "OTHER_PARAM3": "value3",
-      "OTHER_PARAM4": "value4",
-      "OTHER_PARAM5": "value5",
-      "ENV": {
-        "ENV1": "value1",
-        "ENV2": "value2",
-        "ENV3": "value3",
-        "ENV4": "value4"
-      }
-    },
-    "EE_ETH_SIGN": "0x8350f9600dc872d2d37d25d8cbe672dd2d1ee23cc80366a9d3b0f30d2f3249872fac116db5aee6d88911a180fae6c4e7ec0e5750de320221b7a14e1cb6ad8ad91c",
-    "EE_ETH_SENDER": "0x168f051A021E0cCaD836DA6968C09Fc5F0E92A06"
-  }
-}
-
-Get apps request nonce 2025-03-28 10:36:37:
-{
-  "request": {
-    "nonce": "0x195dc533d7b",
-    "EE_ETH_SIGN": "0x35aef39f6e5cb32cefaecd5d852fa786e855e1d8bd4bacf78cc286103bf9bdb3600785710306ff72e2bc4bac76b99ca3ab920e16ca898c0692fbea0a2c1f043a1c",
-    "EE_ETH_SENDER": "0x168f051A021E0cCaD836DA6968C09Fc5F0E92A06"
-  }
-}
-
-Delete request nonce 2025-03-28 10:36:37:
-{
-  "request": {
-    "app_name": "SOME_APP_NAME",
-    "target_nodes": [
-      "0xai_node_1",
-      "0xai_node_2"
-    ],
-    "nonce": "0x195dc533d7b",
-    "EE_ETH_SIGN": "0xfcab3eb3133edc1b35ec7866279160302635ab3b0159a7ec10c5ed0966bc30a634180b024ee477368ee0f413a581d122a070f9a5473922e9aa487c9a624270251c",
-    "EE_ETH_SENDER": "0x168f051A021E0cCaD836DA6968C09Fc5F0E92A06"
-  }
-}
-
 
 Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
 
 from .deeploy_mixin import _DeeployMixin
+from .deeploy_requests import *
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
@@ -115,15 +57,34 @@ class DeeployManagerPlugin(
       )
     )        
     return
+  
+  def _check_and_maybe_convert_address(self, node_addr, raise_if_error=True):
+    result = None
+    if node_addr.startswith("0x"):
+      is_eth = self.bc.is_valid_eth_address(node_addr)
+      if is_eth:
+        result = self.bc.eth_addr_to_internal_addr(node_addr)
+      else:
+        is_internal = self.bc.is_valid_internal_address(node_addr)
+        if is_internal:
+          result = node_addr
+        #endif
+      #endif
+    #endif
+    if result is None:
+      msg = "Invalid node address: {}".format(node_addr)
+      if raise_if_error:
+        raise ValueError(msg)
+      else:
+        self.P(msg, color='r')
+    return result
     
 
   @BasePlugin.endpoint(method="post")
   # /get_apps
   def get_apps(
     self, 
-    request: dict = {
-      "nonce" : "hex_nonce", # recoverable via int(nonce, 16)
-    }
+    request: dict = DEEPLOY_GET_APPS_REQUEST
   ):
     """
     Get the list of apps that are running on the node.
@@ -154,6 +115,23 @@ class DeeployManagerPlugin(
       **result
     })
     return response
+  
+  
+  def deeploy_prepare_single_plugin_instance(self, inputs):
+    """
+    Prepare the plugins for the pipeline creation.
+    """
+    instance_id = inputs.plugin_signature.upper() + "_INST"
+    plugin ={
+      self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
+      self.ct.CONFIG_PLUGIN.K_INSTANCES : [
+        {
+          self.ct.CONFIG_INSTANCE.K_INSTANCE_ID : instance_id,
+          **inputs.app_params
+        }
+      ]
+    }
+    return plugin
     
     
 
@@ -161,34 +139,7 @@ class DeeployManagerPlugin(
   # /create_pipeline
   def create_pipeline(
     self, 
-    request: dict =  {
-      "app_name" : "SOME_APP_NAME", 
-      "plugin_signature" : "SOME_PLUGIN_01",
-      "nonce" : "hex_nonce", # recoverable via int(nonce, 16)
-      "target_nodes" : [
-        "0xai_node_1",
-        "0xai_node_2",
-      ],
-      "target_nodes_count" : 0,
-      "app_params" : {
-        "IMAGE" : "repo/image:tag",
-        "REGISTRY" : "docker.io",
-        "USERNAME" : "user",
-        "PASSWORD" : "password",
-        "PORT" : 5000,
-        "OTHER_PARAM1" : "value1",
-        "OTHER_PARAM2" : "value2",
-        "OTHER_PARAM3" : "value3",
-        "OTHER_PARAM4" : "value4",
-        "OTHER_PARAM5" : "value5",
-        "ENV" : {
-          "ENV1" : "value1",
-          "ENV2" : "value2",
-          "ENV3" : "value3",
-          "ENV4" : "value4",
-        }
-      }    
-    }
+    request: dict = DEEPLOY_CREATE_REQUEST
   ):
     """
     Receive a request for creating a new pipeline on a target node
@@ -199,7 +150,28 @@ class DeeployManagerPlugin(
     try:
       sender, inputs = self.deeploy_get_inputs(request)
       verified_sender = self.deeploy_verify_create_request(inputs)
+      assert sender == verified_sender, "Request verification failed. Sender: {}, Verified sender: {}".format(sender, verified_sender)
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
+      
+      # TODO: move to the mixin when ready
+      plugins = self.deeploy_prepare_single_plugin_instance(inputs)
+      app_name = inputs.app_name
+      app_type = inputs.pipeline_input_type
+      for target_node in inputs.target_nodes:
+        addr = self._check_and_maybe_convert_address(target_node)
+        self.P(f"Starting pipeline '{app_name}' on {addr}")
+        if addr is not None:
+          self.cmdapi_start_pipeline_by_params(
+            name=app_name,
+            pipeline_type=app_type,
+            node_address=addr,
+            owner=sender,
+            url=inputs.pipeline_input_uri,
+            plugins=plugins,
+          )
+        #endif addr is valid
+      #endfor each target node
+      
       result = {
         'request' : {
           'app_name' : inputs.app_name,
@@ -226,14 +198,7 @@ class DeeployManagerPlugin(
 
   @BasePlugin.endpoint(method="post")
   def delete_pipeline(self, 
-    request: dict = {
-      "app_name" : "SOME_APP_NAME",
-      "target_nodes" : [
-        "0xai_node_1",
-        "0xai_node_2",
-      ],
-      "nonce" : "hex_nonce", # recoverable via int(nonce, 16)
-    }
+    request: dict = DEEPLOY_DELETE_REQUEST
   ):
     """
     Receive a request for deleting a pipeline on a target node(s)
@@ -255,6 +220,18 @@ class DeeployManagerPlugin(
       sender, inputs = self.deeploy_get_inputs(request)
       verified_sender = self.deeploy_verify_delete_request(inputs)
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
+      
+      # TODO: move to the mixin when ready
+      app_name = inputs.app_name
+      for target_node in inputs.target_nodes:
+        addr = self._check_and_maybe_convert_address(target_node)
+        self.P(f"Stopping pipeline '{app_name}' on {addr}")
+        self.cmdapi_stop_pipeline(
+          node_address=addr,
+          name=inputs.app_name,
+        )
+      #endfor each target node
+      
       result = {
         'request' : {
           'app_name' : inputs.app_name,
