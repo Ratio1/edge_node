@@ -10,7 +10,7 @@ from .deeploy_requests import *
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
 
-__VER__ = '0.2.1'
+__VER__ = '0.3.1'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -182,8 +182,19 @@ class DeeployManagerPlugin(
       plugins = self.deeploy_prepare_plugins(inputs)
       app_name = inputs.app_name
       app_type = inputs.pipeline_input_type
-      for target_node in inputs.target_nodes:
-        addr = self._check_and_maybe_convert_address(target_node)
+      nodes = []
+      for node in inputs.target_nodes:
+        addr = self._check_and_maybe_convert_address(node)
+        is_online = self.netmon.network_node_is_online(addr)
+        if is_online:
+          nodes.append(addr)
+        else:
+          raise ValueError("Node {} is not online".format(addr))
+        #endif is_online
+      #endfor each target node check address and status
+      if len(nodes) == 0:
+        raise ValueError("No valid nodes provided")        
+      for addr in nodes:
         self.P(f"Starting pipeline '{app_name}' on {addr}")
         if addr is not None:
           self.cmdapi_start_pipeline_by_params(
@@ -261,8 +272,10 @@ class DeeployManagerPlugin(
       
       # TODO: move to the mixin when ready
       app_name = inputs.app_name
-      for target_node in inputs.target_nodes:
-        addr = self._check_and_maybe_convert_address(target_node)
+      nodes = [self._check_and_maybe_convert_address(node) for node in inputs.target_nodes]
+      if len(nodes) == 0:
+        raise ValueError("No valid nodes provided")        
+      for addr in nodes:
         self.P(f"Stopping pipeline '{app_name}' on {addr}")
         self.cmdapi_stop_pipeline(
           node_address=addr,

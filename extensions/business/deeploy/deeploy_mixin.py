@@ -115,8 +115,8 @@ class _DeeployMixin:
       inputs.nonce,
       inputs.target_nodes,
       inputs.target_nodes_count,
-      inputs.app_params.CR_IMAGE,
-      inputs.app_params.CR_REGISTRY,
+      inputs.app_params.IMAGE,
+      inputs.app_params.CR,
     ]
     
     sender = self.__verify_signature(
