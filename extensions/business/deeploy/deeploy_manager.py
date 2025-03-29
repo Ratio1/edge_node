@@ -119,10 +119,10 @@ class DeeployManagerPlugin(
   
   def deeploy_prepare_single_plugin_instance(self, inputs):
     """
-    Prepare the plugins for the pipeline creation.
+    Prepare the a single plugin instance for the pipeline creation.
     """
     instance_id = inputs.plugin_signature.upper() + "_INST"
-    plugin ={
+    plugin = {
       self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
       self.ct.CONFIG_PLUGIN.K_INSTANCES : [
         {
@@ -132,6 +132,17 @@ class DeeployManagerPlugin(
       ]
     }
     return plugin
+  
+  def deeploy_prepare_plugins(self, inputs):    
+    """
+    Prepare the plugins for the pipeline creation.
+    
+    OBS: This must be modified in order to support multiple 
+    instances if needed
+    """
+    plugin = self.deeploy_prepare_single_plugin_instance(inputs)
+    plugins = [plugin]
+    return plugins
     
     
 
@@ -154,7 +165,7 @@ class DeeployManagerPlugin(
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
       
       # TODO: move to the mixin when ready
-      plugins = self.deeploy_prepare_single_plugin_instance(inputs)
+      plugins = self.deeploy_prepare_plugins(inputs)
       app_name = inputs.app_name
       app_type = inputs.pipeline_input_type
       for target_node in inputs.target_nodes:
