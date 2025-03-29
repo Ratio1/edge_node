@@ -88,6 +88,19 @@ class DeeployManagerPlugin(
   ):
     """
     Get the list of apps that are running on the node.
+    
+    Parameters
+    ----------
+    
+    nonce : str
+        The nonce used for signing the request
+        
+    EE_ETH_SIGN : str
+        The signature of the request
+        
+    EE_ETH_SENDER : str
+        The sender of the request
+        
 
     Returns
     -------
@@ -100,8 +113,9 @@ class DeeployManagerPlugin(
       assert sender == verified_sender, "Request verification failed. Sender: {}, Verified sender: {}".format(sender, verified_sender)      
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
       apps = self._get_online_apps()
-      result = {
+      result = {        
         'apps': apps,
+        'status' : 'success',
         **dct_auth,
       }
     except Exception as e:
@@ -125,10 +139,38 @@ class DeeployManagerPlugin(
     request: dict = DEEPLOY_CREATE_REQUEST
   ):
     """
-    Receive a request for creating a new pipeline on a target node
+    Create a new pipeline on a target node(s)
+        
 
     Parameters
     ----------
+    
+    app_name : str
+        The name of the app to create
+        
+    plugin_signature : str
+        The signature of the plugin to use
+        
+    target_nodes : list[str]
+        The nodes to create the app on
+        
+    target_nodes_count : int
+        The number of nodes to create the app on
+        
+    nonce : str
+        The nonce used for signing the request
+        
+    app_params : dict
+        The parameters to pass to the app
+        
+    app_params.IMAGE : str
+        The image to use for the app
+    app_params.REGISTRY : str 
+        The registry to use for the app
+    app_params.USERNAME : str 
+        The username to use for the app
+    app_params.PASSWORD : str 
+    
     """
     try:
       sender, inputs = self.deeploy_get_inputs(request)
@@ -162,8 +204,9 @@ class DeeployManagerPlugin(
           'target_nodes' : inputs.target_nodes,
           'target_nodes_count' : inputs.target_nodes_count,
           'app_params_image' : inputs.app_params.IMAGE,
-          'app_params_registry' : inputs.app_params.REGISTRY,
+          'app_params_registry' : inputs.app_params.CR,
         },        
+        'status' : 'success',
         **dct_auth,
       }
     
@@ -186,7 +229,7 @@ class DeeployManagerPlugin(
     request: dict = DEEPLOY_DELETE_REQUEST
   ):
     """
-    Receive a request for deleting a pipeline on a target node(s)
+    Deletes a given app (pipeline) on target node(s)
 
     Parameters
     ----------
@@ -195,6 +238,15 @@ class DeeployManagerPlugin(
         
     target_nodes : list[str]
         The nodes to delete the app from
+        
+    nonce : str
+        The nonce used for signing the request
+        
+    EE_ETH_SIGN : str
+        The signature of the request
+        
+    EE_ETH_SENDER : str
+        The sender of the request
 
     Returns
     -------
@@ -223,6 +275,7 @@ class DeeployManagerPlugin(
           'app_name' : inputs.app_name,
           'target_nodes' : inputs.target_nodes,
         },
+        'status' : 'success',
         **dct_auth,
       }
     

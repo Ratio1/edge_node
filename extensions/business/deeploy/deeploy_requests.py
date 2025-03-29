@@ -7,7 +7,6 @@ Examples:
 
 
 
-
 """
 from time import time
 from uuid import uuid4
@@ -23,9 +22,9 @@ DEEPLOY_CREATE_REQUEST = {
   "target_nodes_count" : 0,
   "app_params" : {
     "IMAGE" : "repo/image:tag",
-    "REGISTRY" : "docker.io",
-    "USERNAME" : "user",
-    "PASSWORD" : "password",
+    "CR" : "docker.io",
+    "CR_USERNAME" : "user",
+    "CR_PASSWORD" : "password",
     "PORT" : 5000,
     "OTHER_PARAM1" : "value1",
     "OTHER_PARAM2" : "value2",
