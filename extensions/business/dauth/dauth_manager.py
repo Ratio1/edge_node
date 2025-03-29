@@ -22,7 +22,6 @@ WHITELIST (oracles)
 """
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
-from ratio1.bc import DefaultBlockEngine
 from extensions.business.dauth.dauth_mixin import _DauthMixin
 
 __VER__ = '0.2.2'
