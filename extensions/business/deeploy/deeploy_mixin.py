@@ -129,9 +129,8 @@ class _DeeployMixin:
   def deeploy_verify_delete_request(self, inputs):
     values = [
       inputs.app_name,
-      inputs.plugin_signature,
-      inputs.nonce,
       inputs.target_nodes,
+      inputs.nonce,
     ]
     sender = self.__verify_signature(
       values=values,
@@ -151,3 +150,30 @@ class _DeeployMixin:
     )
     return sender
       
+
+  def deeploy_prepare_single_plugin_instance(self, inputs):
+    """
+    Prepare the a single plugin instance for the pipeline creation.
+    """
+    instance_id = inputs.plugin_signature.upper() + "_INST"
+    plugin = {
+      self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
+      self.ct.CONFIG_PLUGIN.K_INSTANCES : [
+        {
+          self.ct.CONFIG_INSTANCE.K_INSTANCE_ID : instance_id,
+          **inputs.app_params
+        }
+      ]
+    }
+    return plugin
+  
+  def deeploy_prepare_plugins(self, inputs):    
+    """
+    Prepare the plugins for the pipeline creation.
+    
+    OBS: This must be modified in order to support multiple 
+    instances if needed
+    """
+    plugin = self.deeploy_prepare_single_plugin_instance(inputs)
+    plugins = [plugin]
+    return plugins      

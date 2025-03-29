@@ -97,6 +97,7 @@ class DeeployManagerPlugin(
     try:
       sender, inputs = self.deeploy_get_inputs(request)
       verified_sender = self.deeploy_verify_get_apps_request(inputs)
+      assert sender == verified_sender, "Request verification failed. Sender: {}, Verified sender: {}".format(sender, verified_sender)      
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
       apps = self._get_online_apps()
       result = {
@@ -117,35 +118,6 @@ class DeeployManagerPlugin(
     return response
   
   
-  def deeploy_prepare_single_plugin_instance(self, inputs):
-    """
-    Prepare the a single plugin instance for the pipeline creation.
-    """
-    instance_id = inputs.plugin_signature.upper() + "_INST"
-    plugin = {
-      self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
-      self.ct.CONFIG_PLUGIN.K_INSTANCES : [
-        {
-          self.ct.CONFIG_INSTANCE.K_INSTANCE_ID : instance_id,
-          **inputs.app_params
-        }
-      ]
-    }
-    return plugin
-  
-  def deeploy_prepare_plugins(self, inputs):    
-    """
-    Prepare the plugins for the pipeline creation.
-    
-    OBS: This must be modified in order to support multiple 
-    instances if needed
-    """
-    plugin = self.deeploy_prepare_single_plugin_instance(inputs)
-    plugins = [plugin]
-    return plugins
-    
-    
-
   @BasePlugin.endpoint(method="post")
   # /create_pipeline
   def create_pipeline(
@@ -200,6 +172,8 @@ class DeeployManagerPlugin(
       result = {
         'error' : str(e)
       }
+      if self.cfg_deeploy_verbose:
+        result['trace'] = self.trace_info()    
     
     response = self._get_response({
       **result
@@ -230,6 +204,7 @@ class DeeployManagerPlugin(
     try:
       sender, inputs = self.deeploy_get_inputs(request)
       verified_sender = self.deeploy_verify_delete_request(inputs)
+      assert sender == verified_sender, "Request verification failed. Sender: {}, Verified sender: {}".format(sender, verified_sender)
       dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
       
       # TODO: move to the mixin when ready
@@ -256,6 +231,8 @@ class DeeployManagerPlugin(
       result = {
         'error' : str(e)
       }
+      if self.cfg_deeploy_verbose:
+        result['trace'] = self.trace_info()      
     
     response = self._get_response({
       **result

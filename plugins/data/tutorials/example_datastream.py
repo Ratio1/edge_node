@@ -1,3 +1,25 @@
+"""
+{
+    "CAP_RESOLUTION": 0.5,
+    "LIVE_FEED": true,
+    "NAME": "test",
+    "PLUGINS": [
+
+        {
+            "INSTANCES": [
+                {
+                    "INSTANCE_ID": "DEFAULT"
+                }
+            ],
+            "SIGNATURE": "A_SIMPLE_PLUGIN"
+        }
+        
+    ],
+    "TYPE": "ExampleDatastream", 
+    "URL": ""
+} 
+
+"""
 from naeural_core.data.base import BaseStructuredDataCapture
 
 _CONFIG = {

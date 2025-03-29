@@ -32,6 +32,8 @@ _CONFIG = {
   **BaseClass.CONFIG,
   
   'ALLOW_EMPTY_INPUTS' : False,
+  
+  'PROCESS_DELAY' : 5,
 
   'VALIDATION_RULES' : {
     **BaseClass.CONFIG['VALIDATION_RULES'],
