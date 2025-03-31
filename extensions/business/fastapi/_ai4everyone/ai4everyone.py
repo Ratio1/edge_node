@@ -104,9 +104,9 @@ class AI4EveryonePlugin(BasePlugin):
     ):
       if request_id in self.requests_responses:
         response = self.requests_responses.pop(request_id)
-        return True, response.data
+        return response.data
       if self.time() - request_ts > self.cfg_request_timeout:
-        return False, {"error": "Request timed out"}
+        return {"error": "Request timed out"}
       return self.create_postponed_request(
         solver_method=self.solve_postponed_process_request,
         method_kwargs={
@@ -154,7 +154,7 @@ class AI4EveryonePlugin(BasePlugin):
         response_data = response.data
         sample_filename = response_data.get('SAMPLE_FILENAME')
         if sample_filename is None:
-          return False, {"error": "Sample not found"}
+          return {"error": "Sample not found"}
         img = response_data.get('IMG')
         votes = None
         cache_kwargs = {
@@ -177,9 +177,9 @@ class AI4EveryonePlugin(BasePlugin):
             res['votes'] = votes
           # endif votes is not None
         # endif handle votes
-        return True, res
+        return res
       if self.time() - request_ts > self.cfg_request_timeout:
-        return False, {"error": "Request timed out"}
+        return {"error": "Request timed out"}
       return self.create_postponed_request(
         solver_method=self.solve_postponed_process_sample_request,
         method_kwargs={
@@ -267,7 +267,7 @@ class AI4EveryonePlugin(BasePlugin):
     def create_job(
         self, name: str, description: str, target: list or str,
         rewards: dict, dataSources: list, dataset: dict,
-        classes: list[dict], nodeAddress: str = None,
+        nodeAddress: str = None,
     ):
       if not isinstance(target, list):
         target = [target]
@@ -279,7 +279,7 @@ class AI4EveryonePlugin(BasePlugin):
         "rewards": rewards,
         "dataSources": dataSources,
         "dataset": dataset,
-        "classes": classes,
+        # "classes": classes,
       }
       nodeAddress = nodeAddress or self.e2_addr
       self.P(f'Received job creation request for {nodeAddress}: `{name}` - `{description}`')
