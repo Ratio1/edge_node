@@ -55,6 +55,7 @@ To deploy for the first time:
 
 from naeural_core.business.base.network_processor import NetworkProcessorPlugin
 from naeural_core.constants import SUPERVISOR_MIN_AVAIL_PRC, EPOCH_MAX_VALUE
+import os
 
 """
 TODO list:
@@ -62,7 +63,8 @@ TODO list:
 """
 
 MAX_RECEIVED_MESSAGES_SIZE = 1000
-DEBUG_MODE = False
+# TODO: remove this after debug
+DEBUG_MODE = os.environ.get('EE_ORACLE_SYNC_DEBUG_MODE', False)
 SIGNATURES_EXCHANGE_MULTIPLIER = 5
 REQUEST_AGREEMENT_TABLE_MULTIPLIER = 60 if DEBUG_MODE else 10
 LOCAL_TABLE_SEND_MULTIPLIER = 3 if DEBUG_MODE else 1
