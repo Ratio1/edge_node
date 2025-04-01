@@ -12,7 +12,7 @@ from time import time
 from uuid import uuid4
 
 DEEPLOY_CREATE_REQUEST = {
-  "app_name" : "app_" + str(uuid4())[:8], 
+  "app_name" : "some_app_name", 
   "plugin_signature" : "SOME_PLUGIN_01",
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
   "target_nodes" : [
