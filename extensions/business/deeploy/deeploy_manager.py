@@ -146,7 +146,7 @@ class DeeployManagerPlugin(
     ----------
     
     app_name : str
-        The name of the app to create
+        The name (alias) of the app to create
         
     plugin_signature : str
         The signature of the plugin to use
@@ -181,7 +181,8 @@ class DeeployManagerPlugin(
       # TODO: move to the mixin when ready
       plugins = self.deeploy_prepare_plugins(inputs)
       app_name = inputs.app_name
-      app_type = inputs.pipeline_input_type
+      app_type = inputs.pipeline_input_type 
+      app_id = app_name.lower()[:4] + "_" + + self.uuid()[:10]
       nodes = []
       for node in inputs.target_nodes:
         addr = self._check_and_maybe_convert_address(node)
@@ -198,7 +199,8 @@ class DeeployManagerPlugin(
         self.P(f"Starting pipeline '{app_name}' on {addr}")
         if addr is not None:
           self.cmdapi_start_pipeline_by_params(
-            name=app_name,
+            name=app_id,
+            app_alias=app_name,
             pipeline_type=app_type,
             node_address=addr,
             owner=sender,
@@ -210,7 +212,8 @@ class DeeployManagerPlugin(
       
       result = {
         'request' : {
-          'app_name' : inputs.app_name,
+          'app_name' : app_name,
+          'app_id' : app_id,
           'plugin_signature' : inputs.plugin_signature,
           'target_nodes' : inputs.target_nodes,
           'target_nodes_count' : inputs.target_nodes_count,
