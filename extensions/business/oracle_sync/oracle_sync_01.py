@@ -605,13 +605,13 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       """
       Receive requests from the oracles and send responses.
       """
-      if self.cfg_debug_sync:
+      if self.cfg_debug_sync_full:
         self.P(f"Parsing received messages from oracles.[{self.__get_current_state()}]")
       cnt = 0
       for dct_message in self.get_received_messages_from_oracles():
         cnt += 1
         self.__maybe_process_request_agreed_median_table(dct_message)
-      if self.cfg_debug_sync:
+      if self.cfg_debug_sync_full:
         self.P(f"Processed {cnt} messages from oracles.[{self.__get_current_state()}]")
       return
 
