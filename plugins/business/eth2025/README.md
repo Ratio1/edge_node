@@ -1,0 +1,1 @@
+# This folder contains plugins for the 2025 edition of the ETH Bucharest
