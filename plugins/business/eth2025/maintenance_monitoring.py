@@ -17,16 +17,16 @@ _CONFIG = {
 }
 
 
-class TemperatureMonitoringPlugin(BasePlugin):
+class MaintenanceMonitoringPlugin(BasePlugin):
   """
   Plugin for monitoring temperature and humidity using Sensibo devices.
   """
   CONFIG = _CONFIG
-  SIGNATURE = 'TEMPERATURE_MONITORING'  # This is the signature used in pipeline config
+  SIGNATURE = 'MAINTENANCE_MONITORING'  # This is the signature used in pipeline config
 
   def on_init(self):
     """Initialize the plugin"""
-    self.P(f"Initializing TemperatureMonitoringPlugin v{__VER__}")
+    self.P(f"Initializing MaintenanceMonitoringPlugin v{__VER__}")
     self.__pod_uid = None
     # Store measurement history
     self.__measurement_history = []
@@ -107,7 +107,8 @@ class TemperatureMonitoringPlugin(BasePlugin):
     self.P(f"Fetching measurements")
     # Only fetch if enough time has passed
     temperature, humidity = self._fetch_measurements()
-
+    self.P("Measurements history:")
+    self.P(self.__measurement_history)
     if temperature is not None and humidity is not None:
       payload = self._create_payload(
         temperature=temperature,
