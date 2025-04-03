@@ -7,14 +7,14 @@ set USE_LOCAL_IMAGE=true
 
 
 REM Hardcoded number of containers
-set NUM_CONTAINERS=4
-set NUM_SUPERVISORS=4
+set NUM_CONTAINERS=1
+set NUM_SUPERVISORS=1
 
 
 if !USE_LOCAL_IMAGE! == true (
     set CONTAINER_IMAGE=local_edge_node
 ) else (
-    set CONTAINER_IMAGE=naeural/edge_node:develop
+    set CONTAINER_IMAGE=ratio1/edge_node:develop
 )
 
 if !DEPLOY_DEBUG! == true (
@@ -84,8 +84,13 @@ for /l %%i in (1,1,%NUM_CONTAINERS%) do (
     REM Generate the service for the container
     echo   !CONTAINER_ID!: >> docker-compose.yaml
     echo     image: !CONTAINER_IMAGE! >> docker-compose.yaml
+@REM     echo     deploy: >> docker-compose.yaml
+@REM     echo       resources: >> docker-compose.yaml
+@REM     echo         limits: >> docker-compose.yaml
+@REM     echo           cpus: '1' >> docker-compose.yaml
+@REM     echo           memory: 4G >> docker-compose.yaml
     echo     container_name: !CONTAINER_ID! >> docker-compose.yaml
-    echo     restart: always >> docker-compose.yaml
+@REM     echo     restart: always >> docker-compose.yaml
     echo     environment: >> docker-compose.yaml
     REM The line below will use the EE_ID_0%%i from the !ENV_FILE! file.
     REM This can be done in case there need to be custom IDs for each container.
