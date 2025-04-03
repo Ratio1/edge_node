@@ -26,8 +26,11 @@ class TemperatureMonitoringPlugin(BasePlugin):
     def on_init(self):
         """Initialize the plugin"""
         self.P(f"Initializing TemperatureMonitoringPlugin v{__VER__}")
-        self.__last_fetch_time = 0
         self.__pod_uid = None
+        # Store measurement history
+        self.__measurement_history = []
+        # Maximum number of history entries to keep
+        self.__max_history_size = 1000
         self._fetch_pod_uid()  # Fetch pod UID on initialization
         return
 
@@ -73,8 +76,21 @@ class TemperatureMonitoringPlugin(BasePlugin):
                 latest_measurement = data['result'][0]
                 temperature = latest_measurement.get('temperature')
                 humidity = latest_measurement.get('humidity')
+                measurement_time = latest_measurement.get('time', {}).get('time')
                 
-                self.P(f"Fetched measurements - Temperature: {temperature}°C, Humidity: {humidity}%")
+                # Add to history
+                if temperature is not None and humidity is not None:
+                    history_entry = {
+                        'temperature': temperature,
+                        'humidity': humidity,
+                        'timestamp': measurement_time
+                    }
+                    self.__measurement_history.append(history_entry)
+                    # Limit history size
+                    if len(self.__measurement_history) > self.__max_history_size:
+                        self.__measurement_history.pop(0)
+                
+                self.P(f"Fetched measurements - Temperature: {temperature}°C, Humidity: {humidity}%, Time: {measurement_time}")
                 return temperature, humidity
             else:
                 self.P("No measurement data available", color='y')
@@ -86,20 +102,18 @@ class TemperatureMonitoringPlugin(BasePlugin):
 
     def process(self):
         """Main processing method called every PROCESS_DELAY seconds"""
-        current_time = self.time()
 
+        self.P(f"Fetching measurements")
         # Only fetch if enough time has passed
-        if current_time - self.__last_fetch_time >= self.cfg_process_delay:
-            temperature, humidity = self._fetch_measurements()
-            self.__last_fetch_time = current_time
-            
-            if temperature is not None and humidity is not None:
-                payload = self._create_payload(
-                    temperature=temperature,
-                    humidity=humidity,
-                    pod_uid=self.__pod_uid,
-                    timestamp=self.time_to_str(),
-                )
-                return payload
+        temperature, humidity = self._fetch_measurements()
+        
+        if temperature is not None and humidity is not None:
+            payload = self._create_payload(
+                temperature=temperature,
+                humidity=humidity,
+                pod_uid=self.__pod_uid,
+                timestamp=self.time_to_str(),
+            )
+            return payload
         
         return None
