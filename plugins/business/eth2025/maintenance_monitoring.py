@@ -10,6 +10,10 @@ _CONFIG = {
   'API_URL': 'https://home.sensibo.com/api/v2',
   'API_KEY': None,  # Sensibo API key should be configured in instance config
   'POD_UID': None,  # If not provided, will automatically fetch the first available pod UID from the account
+  
+  # Anomaly detection parameters
+  'ANOMALY_THRESHOLD': 3.0,  # Z-score threshold for anomaly detection
+  'MIN_SAMPLES_FOR_ANOMALY': 10,  # Minimum samples needed for anomaly detection
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -101,20 +105,76 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       self.P(f"Error fetching measurements: {str(e)}", color='r')
       return None, None
 
+  def _check_anomalies(self, temperature, humidity):
+    """Check for anomalies in temperature and humidity data"""
+    import numpy as np
+    
+    anomalies = {}
+    
+    # Need enough samples for statistical significance
+    if len(self.__measurement_history) >= self.cfg_min_samples_for_anomaly:
+      # Extract historical values
+      temp_history = [entry.get('temperature') for entry in self.__measurement_history 
+                      if entry.get('temperature') is not None]
+      humid_history = [entry.get('humidity') for entry in self.__measurement_history 
+                       if entry.get('humidity') is not None]
+      
+      # Check temperature anomaly using z-score
+      if temperature is not None and len(temp_history) >= self.cfg_min_samples_for_anomaly:
+        temp_mean = np.mean(temp_history)
+        temp_std = np.std(temp_history)
+        if temp_std > 0:  # Avoid division by zero
+          temp_zscore = abs((temperature - temp_mean) / temp_std)
+          if temp_zscore > self.cfg_anomaly_threshold:
+            anomalies['temperature'] = {
+              'value': temperature,
+              'z_score': temp_zscore,
+              'threshold': self.cfg_anomaly_threshold,
+              'mean': temp_mean,
+              'std': temp_std
+            }
+            self.P(f"ANOMALY DETECTED: Temperature {temperature}°C has z-score {temp_zscore:.2f}", color='r')
+      
+      # Check humidity anomaly using z-score
+      if humidity is not None and len(humid_history) >= self.cfg_min_samples_for_anomaly:
+        humid_mean = np.mean(humid_history)
+        humid_std = np.std(humid_history)
+        if humid_std > 0:  # Avoid division by zero
+          humid_zscore = abs((humidity - humid_mean) / humid_std)
+          if humid_zscore > self.cfg_anomaly_threshold:
+            anomalies['humidity'] = {
+              'value': humidity,
+              'z_score': humid_zscore,
+              'threshold': self.cfg_anomaly_threshold,
+              'mean': humid_mean,
+              'std': humid_std
+            }
+            self.P(f"ANOMALY DETECTED: Humidity {humidity}% has z-score {humid_zscore:.2f}", color='r')
+    
+    return anomalies
+
   def process(self):
     """Main processing method called every PROCESS_DELAY seconds"""
 
     self.P(f"Fetching measurements")
     # Only fetch if enough time has passed
     temperature, humidity = self._fetch_measurements()
+    
+    # Check for anomalies
+    anomalies = {}
+    if temperature is not None and humidity is not None:
+      anomalies = self._check_anomalies(temperature, humidity)
+    
     self.P("Measurements history:")
     self.P(self.__measurement_history)
+    
     if temperature is not None and humidity is not None:
       payload = self._create_payload(
         temperature=temperature,
         humidity=humidity,
         pod_uid=self.__pod_uid,
         timestamp=self.time_to_str(),
+        anomalies=anomalies
       )
       return payload
 
