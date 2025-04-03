@@ -4,6 +4,7 @@ __VER__ = '0.0.0.1'
 
 # Constants
 HISTORY_FILE_PATH = 'sensibo_history.pickle'
+ANOMALIES_FILE_PATH = 'sensibo_anomalies.pickle'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -37,41 +38,57 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     self.__pod_uid = None
     # Store measurement history
     self.__measurement_history = []
+    # Store anomalies history
+    self.__anomalies_history = []
     # Maximum number of history entries to keep
     self.__max_history_size = 1000
     # Flag to track if history has been modified
     self.__history_modified = False
+    # Flag to track if anomalies have been modified
+    self.__anomalies_modified = False
     # Load measurement history from pickle file
-    self._load_measurement_history()
+    self._load_data(HISTORY_FILE_PATH, '_MaintenanceMonitoringPlugin__measurement_history')
+    self._load_data(ANOMALIES_FILE_PATH, '_MaintenanceMonitoringPlugin__anomalies_history')
     self._fetch_pod_uid()  # Fetch pod UID on initialization
     return
 
-  def _load_measurement_history(self):
-    """Load measurement history from pickle file"""
+  def _load_data(self, file_path, attribute_name):
+    """Generic function to load data from pickle file"""
     try:
-      data = self.diskapi_load_pickle_from_data(HISTORY_FILE_PATH)
+      data = self.diskapi_load_pickle_from_data(file_path)
       if data:
-        self.__measurement_history = data
-        self.P(f"Loaded {len(self.__measurement_history)} historical measurements from {HISTORY_FILE_PATH}")
+        setattr(self, attribute_name, data)
+        self.P(f"Loaded {len(data)} records from {file_path}")
       else:
-        self.P(f"No history file found at {HISTORY_FILE_PATH}, starting with empty history")
+        self.P(f"No file found at {file_path}, starting with empty data")
     except Exception as e:
-      self.P(f"Error loading measurement history: {str(e)}", color='r')
-      # Start with empty history in case of error
-      self.__measurement_history = []
+      self.P(f"Error loading data from {file_path}: {str(e)}", color='r')
+      # Keep the default empty list in case of error
       
-  def _save_measurement_history(self):
-    """Save measurement history to pickle file if modified"""
-    if not self.__history_modified:
+  def _save_data(self, data, file_path, modified_flag_name):
+    """Generic function to save data to pickle file if modified"""
+    if not getattr(self, modified_flag_name):
       return
       
     try:
-      # Save history to file
-      self.diskapi_save_pickle_to_data(self.__measurement_history, HISTORY_FILE_PATH)
-      self.P(f"Saved {len(self.__measurement_history)} measurements to {HISTORY_FILE_PATH}")
-      self.__history_modified = False
+      # Save data to file
+      self.diskapi_save_pickle_to_data(data, file_path)
+      self.P(f"Saved {len(data)} records to {file_path}")
+      setattr(self, modified_flag_name, False)
     except Exception as e:
-      self.P(f"Error saving measurement history: {str(e)}", color='r')
+      self.P(f"Error saving data to {file_path}: {str(e)}", color='r')
+
+  def _load_measurement_history(self):
+    """Load measurement history from pickle file"""
+    self._load_data(HISTORY_FILE_PATH, '_MaintenanceMonitoringPlugin__measurement_history')
+      
+  def _save_measurement_history(self):
+    """Save measurement history to pickle file if modified"""
+    self._save_data(self.__measurement_history, HISTORY_FILE_PATH, '_MaintenanceMonitoringPlugin__history_modified')
+
+  def _save_anomalies_history(self):
+    """Save anomalies history to pickle file if modified"""
+    self._save_data(self.__anomalies_history, ANOMALIES_FILE_PATH, '_MaintenanceMonitoringPlugin__anomalies_modified')
 
   def _fetch_pod_uid(self):
     """Fetch the pod UID from Sensibo API"""
@@ -186,6 +203,22 @@ class MaintenanceMonitoringPlugin(BasePlugin):
               'std': humid_std
             }
             self.P(f"ANOMALY DETECTED: Humidity {humidity}% has z-score {humid_zscore:.2f}", color='r')
+    
+    # If anomalies were detected, save them to history
+    if anomalies:
+      anomaly_entry = {
+        'timestamp': self.time_to_str(),
+        'pod_uid': self.__pod_uid,
+        'anomalies': anomalies
+      }
+      self.__anomalies_history.append(anomaly_entry)
+      # Limit anomalies history size
+      if len(self.__anomalies_history) > self.__max_history_size:
+        self.__anomalies_history.pop(0)
+      # Mark anomalies as modified
+      self.__anomalies_modified = True
+      # Save anomalies after modification
+      self._save_anomalies_history()
     
     return anomalies
 
