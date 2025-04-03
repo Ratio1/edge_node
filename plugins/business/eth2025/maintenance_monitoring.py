@@ -2,6 +2,9 @@ from naeural_core.business.base import BasePluginExecutor as BasePlugin
 
 __VER__ = '0.0.0.1'
 
+# Constants
+HISTORY_FILE_PATH = 'sensibo_history.pickle'
+
 _CONFIG = {
   **BasePlugin.CONFIG,
 
@@ -36,8 +39,39 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     self.__measurement_history = []
     # Maximum number of history entries to keep
     self.__max_history_size = 1000
+    # Flag to track if history has been modified
+    self.__history_modified = False
+    # Load measurement history from pickle file
+    self._load_measurement_history()
     self._fetch_pod_uid()  # Fetch pod UID on initialization
     return
+
+  def _load_measurement_history(self):
+    """Load measurement history from pickle file"""
+    try:
+      data = self.diskapi_load_pickle_from_data(HISTORY_FILE_PATH)
+      if data:
+        self.__measurement_history = data
+        self.P(f"Loaded {len(self.__measurement_history)} historical measurements from {HISTORY_FILE_PATH}")
+      else:
+        self.P(f"No history file found at {HISTORY_FILE_PATH}, starting with empty history")
+    except Exception as e:
+      self.P(f"Error loading measurement history: {str(e)}", color='r')
+      # Start with empty history in case of error
+      self.__measurement_history = []
+      
+  def _save_measurement_history(self):
+    """Save measurement history to pickle file if modified"""
+    if not self.__history_modified:
+      return
+      
+    try:
+      # Save history to file
+      self.diskapi_save_pickle_to_data(self.__measurement_history, HISTORY_FILE_PATH)
+      self.P(f"Saved {len(self.__measurement_history)} measurements to {HISTORY_FILE_PATH}")
+      self.__history_modified = False
+    except Exception as e:
+      self.P(f"Error saving measurement history: {str(e)}", color='r')
 
   def _fetch_pod_uid(self):
     """Fetch the pod UID from Sensibo API"""
@@ -94,6 +128,10 @@ class MaintenanceMonitoringPlugin(BasePlugin):
           # Limit history size
           if len(self.__measurement_history) > self.__max_history_size:
             self.__measurement_history.pop(0)
+          # Mark history as modified
+          self.__history_modified = True
+          # Save history after modification
+          self._save_measurement_history()
 
         self.P(f"Fetched measurements - Temperature: {temperature}°C, Humidity: {humidity}%, Time: {measurement_time}")
         return temperature, humidity
@@ -107,8 +145,6 @@ class MaintenanceMonitoringPlugin(BasePlugin):
 
   def _check_anomalies(self, temperature, humidity):
     """Check for anomalies in temperature and humidity data"""
-    import numpy as np
-    
     anomalies = {}
     
     # Need enough samples for statistical significance
@@ -121,8 +157,8 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       
       # Check temperature anomaly using z-score
       if temperature is not None and len(temp_history) >= self.cfg_min_samples_for_anomaly:
-        temp_mean = np.mean(temp_history)
-        temp_std = np.std(temp_history)
+        temp_mean = self.np.mean(temp_history)
+        temp_std = self.np.std(temp_history)
         if temp_std > 0:  # Avoid division by zero
           temp_zscore = abs((temperature - temp_mean) / temp_std)
           if temp_zscore > self.cfg_anomaly_threshold:
@@ -137,8 +173,8 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       
       # Check humidity anomaly using z-score
       if humidity is not None and len(humid_history) >= self.cfg_min_samples_for_anomaly:
-        humid_mean = np.mean(humid_history)
-        humid_std = np.std(humid_history)
+        humid_mean = self.np.mean(humid_history)
+        humid_std = self.np.std(humid_history)
         if humid_std > 0:  # Avoid division by zero
           humid_zscore = abs((humidity - humid_mean) / humid_std)
           if humid_zscore > self.cfg_anomaly_threshold:
