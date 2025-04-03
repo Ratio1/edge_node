@@ -21,9 +21,7 @@ _CONFIG = {
   
   'DEEPLOY_VERBOSE' : True,
   
-  
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
-    
   
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -78,6 +76,20 @@ class DeeployManagerPlugin(
       else:
         self.P(msg, color='r')
     return result
+  
+  
+  def __handle_error(self, exc, inputs):
+    """
+    Handle the error and return a response.
+    """
+    self.P("Error processing request: {}, Inputs: {}".format(exc, inputs), color='r')
+    result = {
+      'status' : 'fail',
+      'error' : str(exc),
+    }
+    if self.cfg_deeploy_verbose:
+      result['trace'] = self.trace_info()
+    return result
     
 
   @BasePlugin.endpoint(method="post")
@@ -108,24 +120,17 @@ class DeeployManagerPlugin(
         
     """
     try:
-      sender, inputs = self.deeploy_get_inputs(request)
-      verified_sender = self.deeploy_verify_get_apps_request(inputs)
-      assert sender == verified_sender, "Request verification failed. Sender: {}, Verified sender: {}".format(sender, verified_sender)      
-      dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
       apps = self._get_online_apps()
+      #
       result = {        
-        'apps': apps,
         'status' : 'success',
-        **dct_auth,
+        'apps': apps,
+        'auth' : self.deeploy_get_auth_result(inputs),
       }
     except Exception as e:
-      self.P("Error processing request: {}, Inputs: {}".format(e, inputs), color='r')
-      result = {
-        'error' : str(e)
-      }
-      if self.cfg_deeploy_verbose:
-        result['trace'] = self.trace_info()
-      #endif
+      self.__handle_error(e, inputs)
+    #endtry
     response = self._get_response({
       **result
     })
@@ -145,7 +150,7 @@ class DeeployManagerPlugin(
     Parameters
     ----------
     
-    app_name : str
+    app_alias : str
         The name (alias) of the app to create
         
     plugin_signature : str
@@ -161,28 +166,26 @@ class DeeployManagerPlugin(
         The nonce used for signing the request
         
     app_params : dict
-        The parameters to pass to the app
-        
-    app_params.IMAGE : str
-        The image to use for the app
-    app_params.REGISTRY : str 
-        The registry to use for the app
-    app_params.USERNAME : str 
-        The username to use for the app
-    app_params.PASSWORD : str 
+        The parameters to pass to the app such as:
+          
+          app_params.IMAGE : str
+              The image to use for the app
+          app_params.REGISTRY : str 
+              The registry to use for the app
+          app_params.USERNAME : str 
+              The username to use for the app
+          app_params.PASSWORD : str 
     
     """
     try:
-      sender, inputs = self.deeploy_get_inputs(request)
-      verified_sender = self.deeploy_verify_create_request(inputs)
-      assert sender == verified_sender, "Request verification failed. Sender: {}, Verified sender: {}".format(sender, verified_sender)
-      dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      
       
       # TODO: move to the mixin when ready
       plugins = self.deeploy_prepare_plugins(inputs)
-      app_name = inputs.app_name
+      app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type 
-      app_id = app_name.lower()[:4] + "_" + + self.uuid()[:10]
+      app_id = app_alias.lower()[:4] + "_" + + self.uuid()[:10]
       nodes = []
       for node in inputs.target_nodes:
         addr = self._check_and_maybe_convert_address(node)
@@ -196,11 +199,11 @@ class DeeployManagerPlugin(
       if len(nodes) == 0:
         raise ValueError("No valid nodes provided")        
       for addr in nodes:
-        self.P(f"Starting pipeline '{app_name}' on {addr}")
+        self.P(f"Starting pipeline '{app_alias}' on {addr}")
         if addr is not None:
           self.cmdapi_start_pipeline_by_params(
             name=app_id,
-            app_alias=app_name,
+            app_alias=app_alias,
             pipeline_type=app_type,
             node_address=addr,
             owner=sender,
@@ -211,26 +214,22 @@ class DeeployManagerPlugin(
       #endfor each target node
       
       result = {
+        'status' : 'success',
+        'app_id' : app_id,
         'request' : {
-          'app_name' : app_name,
-          'app_id' : app_id,
+          'app_alias' : app_alias,
           'plugin_signature' : inputs.plugin_signature,
           'target_nodes' : inputs.target_nodes,
           'target_nodes_count' : inputs.target_nodes_count,
           'app_params_image' : inputs.app_params.IMAGE,
           'app_params_registry' : inputs.app_params.CR,
         },        
-        'status' : 'success',
-        **dct_auth,
+        'auth' : self.deeploy_get_auth_result(inputs),
       }
     
     except Exception as e:
-      self.P("Error processing request: {}, Inputs: {}".format(e, inputs), color='r')
-      result = {
-        'error' : str(e)
-      }
-      if self.cfg_deeploy_verbose:
-        result['trace'] = self.trace_info()    
+      self.__handle_error(e, inputs)
+    #endtry
     
     response = self._get_response({
       **result
@@ -247,8 +246,8 @@ class DeeployManagerPlugin(
 
     Parameters
     ----------
-    app_name : str
-        The name of the app to delete
+    app_id : str
+        The identificator of the app to delete as given by the /create_pipeline endpoint
         
     target_nodes : list[str]
         The nodes to delete the app from
@@ -268,40 +267,33 @@ class DeeployManagerPlugin(
         A dictionary with the result of the operation
     """
     try:
-      sender, inputs = self.deeploy_get_inputs(request)
-      verified_sender = self.deeploy_verify_delete_request(inputs)
-      assert sender == verified_sender, "Request verification failed. Sender: {}, Verified sender: {}".format(sender, verified_sender)
-      dct_auth = self.deeploy_get_auth_result(inputs, sender, verified_sender)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
       
       # TODO: move to the mixin when ready
-      app_name = inputs.app_name
+      app_id = inputs.app_id
       nodes = [self._check_and_maybe_convert_address(node) for node in inputs.target_nodes]
       if len(nodes) == 0:
         raise ValueError("No valid nodes provided")        
       for addr in nodes:
-        self.P(f"Stopping pipeline '{app_name}' on {addr}")
+        self.P(f"Stopping pipeline '{app_id}' on {addr}")
         self.cmdapi_stop_pipeline(
           node_address=addr,
-          name=inputs.app_name,
+          name=inputs.app_id,
         )
       #endfor each target node
       
       result = {
         'request' : {
-          'app_name' : inputs.app_name,
+          'status' : 'success',          
+          'app_id' : inputs.app_id,
           'target_nodes' : inputs.target_nodes,
         },
-        'status' : 'success',
-        **dct_auth,
+        'auth' : self.deeploy_get_auth_result(inputs),
       }
     
     except Exception as e:
-      self.P("Error processing request: {}, Inputs: {}".format(e, inputs), color='r')
-      result = {
-        'error' : str(e)
-      }
-      if self.cfg_deeploy_verbose:
-        result['trace'] = self.trace_info()      
+      self.__handle_error(e, inputs)
+    #endtry
     
     response = self._get_response({
       **result

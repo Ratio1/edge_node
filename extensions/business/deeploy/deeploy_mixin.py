@@ -3,6 +3,8 @@ from naeural_core.constants import BASE_CT
 
 DEEPLOY_DEBUG = True
 
+MESSAGE_PREFIX = "Please sign this message for Deeploy: "
+
 class _DeeployMixin:
   def __init__(self):
     super(_DeeployMixin, self).__init__()    
@@ -37,18 +39,15 @@ class _DeeployMixin:
     return types  
 
 
-  def __verify_signature(self, values, signature):
+  def __verify_signature(self, payload):
     """
     Verify the signature of the request.
     """
-    assert signature is not None, "Missing request signature"
-    types = self.__get_emv_types(values)
-    if DEEPLOY_DEBUG:
-      self.Pd(f"Verifying signature {signature} for {len(values)} vals with types {types}")
-    sender = self.bc.eth_verify_message_signature(
-      values=values,
-      types=types,
-      signature=signature,
+    sender = self.bc.eth_verify_payload_signature(
+      payload=payload,
+      message_prefix=MESSAGE_PREFIX,
+      no_hash=True,
+      indent=1,
     )
     return sender
 
@@ -90,65 +89,27 @@ class _DeeployMixin:
     return str_timestamp
   
   
-  def deeploy_get_inputs(self, request: dict):
+  def deeploy_verify_and_get_inputs(self, request: dict):
     sender = request.get(BASE_CT.BCctbase.ETH_SENDER)
     inputs = self.NestedDotDict(request)    
-    self.P(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else ''}")
+    self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
+    
+    addr = self.__verify_signature(request)
+    if addr != sender:
+      raise ValueError("Invalid signature: recovered {} != {}".format(addr, sender))    
+    
     return sender, inputs
   
   
-  def deeploy_get_auth_result(self, inputs, sender : str, verified_sender: str):
+  def deeploy_get_auth_result(self, inputs):
+    sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
     result = {
       'auth' : {
         'sender' : sender,
-        'verified_sender' : verified_sender,
         'nonce' : self.deeploy_get_nonce(inputs.nonce),
       },
     }
     return result
-  
-  
-  def deeploy_verify_create_request(self, inputs):
-    values = [
-      inputs.app_name,
-      inputs.plugin_signature,
-      inputs.nonce,
-      inputs.target_nodes,
-      inputs.target_nodes_count,
-      inputs.app_params.IMAGE,
-      inputs.app_params.CR,
-    ]
-    
-    sender = self.__verify_signature(
-      values=values,
-      signature=inputs.get(BASE_CT.BCctbase.ETH_SIGN),
-    )
-    return sender
-
-
-  def deeploy_verify_delete_request(self, inputs):
-    values = [
-      inputs.app_name,
-      inputs.target_nodes,
-      inputs.nonce,
-    ]
-    sender = self.__verify_signature(
-      values=values,
-      signature=inputs.get(BASE_CT.BCctbase.ETH_SIGN),
-    )
-    return sender
-
-
-  def deeploy_verify_get_apps_request(self, inputs):
-    values = [
-      inputs.nonce,
-    ]
-
-    sender = self.__verify_signature(
-      values=values,
-      signature=inputs.get(BASE_CT.BCctbase.ETH_SIGN),
-    )
-    return sender
       
 
   def deeploy_prepare_single_plugin_instance(self, inputs):
