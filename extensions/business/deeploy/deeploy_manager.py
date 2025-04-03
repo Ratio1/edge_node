@@ -10,7 +10,7 @@ from .deeploy_requests import *
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
 
-__VER__ = '0.3.1'
+__VER__ = '0.5.1'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -78,17 +78,18 @@ class DeeployManagerPlugin(
     return result
   
   
-  def __handle_error(self, exc, inputs):
+  def __handle_error(self, exc, request):
     """
     Handle the error and return a response.
     """
-    self.P("Error processing request: {}, Inputs: {}".format(exc, inputs), color='r')
+    self.Pd("Error processing request: {}, Inputs: {}".format(exc, request), color='r')
     result = {
       'status' : 'fail',
       'error' : str(exc),
     }
     if self.cfg_deeploy_verbose:
-      result['trace'] = self.trace_info()
+      lines = self.trace_info().splitlines()
+      result['trace'] = lines[-5:-1]
     return result
     
 
@@ -129,7 +130,7 @@ class DeeployManagerPlugin(
         'auth' : self.deeploy_get_auth_result(inputs),
       }
     except Exception as e:
-      self.__handle_error(e, inputs)
+      result = self.__handle_error(e, request)
     #endtry
     response = self._get_response({
       **result
@@ -178,14 +179,13 @@ class DeeployManagerPlugin(
     
     """
     try:
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
-      
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)   
       
       # TODO: move to the mixin when ready
       plugins = self.deeploy_prepare_plugins(inputs)
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type 
-      app_id = app_alias.lower()[:4] + "_" + + self.uuid()[:10]
+      app_id = (app_alias.lower()[:8] + "_" + self.uuid(7)).lower()
       nodes = []
       for node in inputs.target_nodes:
         addr = self._check_and_maybe_convert_address(node)
@@ -228,7 +228,7 @@ class DeeployManagerPlugin(
       }
     
     except Exception as e:
-      self.__handle_error(e, inputs)
+      result = self.__handle_error(e, request)
     #endtry
     
     response = self._get_response({
@@ -292,7 +292,7 @@ class DeeployManagerPlugin(
       }
     
     except Exception as e:
-      self.__handle_error(e, inputs)
+      result = self.__handle_error(e, request)
     #endtry
     
     response = self._get_response({

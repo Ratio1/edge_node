@@ -71,6 +71,32 @@ class _DeeployMixin:
     result = self.netmon.network_known_apps()
     return result
 
+  
+  def __check_allowed_wallet(self, inputs):
+    sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
+    eth_nodes = self.bc.get_wallet_nodes(sender)
+    if len(eth_nodes) == 0:
+      raise ValueError("No nodes found for wallet {}".format(sender))
+    eth_oracles = self.bc.get_eth_oracles()
+    if len(eth_oracles) == 0:
+      raise ValueError("No oracles found - this is a critical issue!")
+    oracle_found = False
+    wallet_oracles = []
+    wallet_nodes = []
+    for node in eth_nodes:
+      if node in eth_oracles:
+        oracle_found = True
+        wallet_oracles.append(node)
+      else:
+        wallet_nodes.append(node)
+      #endif 
+    #endfor each node
+    if not oracle_found:
+      raise ValueError("No oracles found for wallet {}".format(sender))
+    inputs.wallet_nodes = wallet_nodes
+    inputs.wallet_oracles = wallet_oracles
+    return inputs
+
 
   def deeploy_get_nonce(self, hex_nonce):
     """
@@ -91,12 +117,17 @@ class _DeeployMixin:
   
   def deeploy_verify_and_get_inputs(self, request: dict):
     sender = request.get(BASE_CT.BCctbase.ETH_SENDER)
+    assert self.bc.is_valid_eth_address(sender), f"Invalid sender address: {sender}"
+    
     inputs = self.NestedDotDict(request)    
     self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
     
     addr = self.__verify_signature(request)
-    if addr != sender:
+    if addr.lower() != sender.lower():
       raise ValueError("Invalid signature: recovered {} != {}".format(addr, sender))    
+    
+    # Check if the sender is allowed to create pipelines
+    self.__check_allowed_wallet(inputs)
     
     return sender, inputs
   
@@ -104,11 +135,12 @@ class _DeeployMixin:
   def deeploy_get_auth_result(self, inputs):
     sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
     result = {
-      'auth' : {
-        'sender' : sender,
-        'nonce' : self.deeploy_get_nonce(inputs.nonce),
-      },
-    }
+      'sender' : sender,
+      'nonce' : self.deeploy_get_nonce(inputs.nonce),
+      'sender_oracles' : inputs.wallet_oracles,
+      'sender_nodes_count' : len(inputs.wallet_nodes),
+      'sender_total_count' : len(inputs.wallet_nodes) + len(inputs.wallet_oracles),
+  }
     return result
       
 
