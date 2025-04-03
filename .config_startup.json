@@ -72,7 +72,7 @@
       "access_key": "$EE_MINIO_ACCESS_KEY",
       "secret_key": "$EE_MINIO_SECRET_KEY",
       "secure": "$EE_MINIO_SECURE",
-      "bucket_name": "model-zoo"
+      "bucket_name": "$EE_MINIO_MODEL_BUCKET"
     }    
   },
 

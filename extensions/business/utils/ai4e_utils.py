@@ -42,7 +42,7 @@ def get_job_config(
     "INSTANCE_ID": job_id,
     "OBJECTIVE_NAME": name,
     "GENERAL_DETECTOR_OBJECT_TYPE": target,
-    "CLASSES": classes_msg_to_dict(classes),
+    "CLASSES": classes_msg_to_dict(classes) if classes is not None else {},
     "DESCRIPTION": desc,
     "DATA": {
       "SOURCES": data_sources

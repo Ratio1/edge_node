@@ -284,6 +284,7 @@ class EpochManager01Plugin(BasePlugin):
         data['node_is_online'] = self.netmon.network_node_is_online(node_addr)
         data['node_version'] = self.netmon.network_node_version(node_addr)
         data['node_is_oracle'] = self.netmon.network_node_is_supervisor(node_addr)
+        data['node_licese_info'] = self.bc.get_node_license_info(node_addr)
       except:
         data['node_is_online'] = False
         data['node_version'] = "unknown"

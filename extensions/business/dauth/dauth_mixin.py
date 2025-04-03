@@ -58,7 +58,7 @@ class _DauthMixin(object):
     Print a message to the console.
     """
     if self.cfg_dauth_verbose:
-      s = "[DDBG] " + s
+      s = "[dDBG] " + s
       self.P(s, *args, **kwargs)
     return  
   
@@ -101,14 +101,14 @@ class _DauthMixin(object):
     elif int_sender_app_version == 0 and int_sender_core_version >0 and int_sender_sdk_version > 0:
       output.requester_type = dAuthCt.DAUTH_SENDER_TYPE_CORE
       output.result = False # we should block this
-      output.message += "FAIL: Invalid sender version data - core and sdk only not allowed for dAuth"
+      output.message = "FAIL: Invalid sender version data - core and sdk only not allowed for dAuth"
     elif int_sender_app_version > 0 and int_sender_core_version > 0 and int_sender_sdk_version > 0:
       output.requester_type = dAuthCt.DAUTH_SENDER_TYPE_NODE
       output.message += f"INFO: Edge Node v{sender_app_version} pre-accepted for dAuth request."
     else:
       output.requester_type = "unknown"
       output.result = False
-      output.message += "FAIL: Invalid sender version data: {} {} {} vs this server: {} {} {}".format(
+      output.message = "FAIL: Invalid sender version data: {} {} {} vs this server: {} {} {}".format(
         sender_app_version, sender_core_version, sender_sdk_version,
         self.ee_ver, self.ee_core_ver, self.ee_sdk_ver
       )
@@ -118,7 +118,7 @@ class _DauthMixin(object):
       diff = int_server_app_version - int_sender_app_version
       if diff >= 10:
         output.result = False
-        output.message += f" FAIL: Sender app version {sender_app_version} is too old (diff: {diff})."
+        output.message = f" FAIL: Sender app version {sender_app_version} is too old (diff: {diff})."
     #end app version check
       
     if int_sender_core_version > 0 and int_sender_core_version < int_server_core_version:

@@ -64,7 +64,7 @@ TODO list:
 MAX_RECEIVED_MESSAGES_SIZE = 1000
 DEBUG_MODE = False
 SIGNATURES_EXCHANGE_MULTIPLIER = 5
-REQUEST_AGREEMENT_TABLE_MULTIPLIER = 30 if DEBUG_MODE else 1
+REQUEST_AGREEMENT_TABLE_MULTIPLIER = 60 if DEBUG_MODE else 10
 LOCAL_TABLE_SEND_MULTIPLIER = 3 if DEBUG_MODE else 1
 
 # Full availability means that the node was seen online for at least SUPERVISOR_MIN_AVAIL_PRC% of the time.
@@ -91,8 +91,8 @@ _CONFIG = {
   'ALLOW_EMPTY_INPUTS': True,
   'PROCESS_DELAY': 0,
 
-  'SEND_PERIOD': 15,  # seconds
-  'SEND_INTERVAL': 5,  # seconds
+  'SEND_PERIOD': 30,  # seconds
+  'SEND_INTERVAL': 15,  # seconds
 
   # This flag will be enabled after further testing of R1FS.
   "USE_R1FS": True,
@@ -114,8 +114,8 @@ _CONFIG = {
 
 if DEBUG_MODE:
   # In the case of debug mode, messages may need to be sent more often.
-  _CONFIG['SEND_PERIOD'] = 3
-  _CONFIG['SEND_INTERVAL'] = 2
+  _CONFIG['SEND_PERIOD'] = 10
+  _CONFIG['SEND_INTERVAL'] = 5
 # endif DEBUG_MODE
 
 __VER__ = '0.1.0'
@@ -464,6 +464,10 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       newly_uploaded_epochs = []
 
       epoch_keys = list(range(start_epoch, end_epoch + 1))
+      # TODO: Refactor this to retrieve all the data in one call and separate the data for each epoch after.
+      valid_epochs, invalid_epochs = [], []
+      added_success, added_failed = [], []
+      already_uploaded, epochs_with_empty = [], []
       for epoch in epoch_keys:
         availability_table, dct_signatures, agreement_cid = self.netmon.epoch_manager.get_epoch_availability(
           epoch=epoch, return_additional=True
@@ -473,9 +477,10 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         dct_epoch__signatures[epoch_key] = dct_signatures
         dct_epoch__is_valid[epoch_key] = self.netmon.epoch_manager.is_epoch_valid(epoch)
 
-        if self.cfg_debug_sync:
-          valid_str = 'valid' if current_epoch_is_valid else 'invalid'
-          self.P(f"Preparing availability of {valid_str} {epoch=} for broadcast")
+        if current_epoch_is_valid:
+          valid_epochs.append(epoch)
+        else:
+          invalid_epochs.append(epoch)
 
         if agreement_cid is None and current_epoch_is_valid:
           # The agreement was never uploaded in the R1FS, so we try to upload it now.
@@ -486,25 +491,33 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
             message_dict=dct_epoch__agreed_median_table,
             data_dict=availability_table,
             data_key=epoch_key,
+            debug=self.cfg_debug_sync_full
           )
           if success:
             # In case of success the cid needs to also be added to the epoch_manager
             agreement_cid = dct_epoch__agreed_median_table[epoch_key]
-            self.netmon.epoch_manager.add_cid_for_epoch(epoch=epoch, agreement_cid=agreement_cid)
+            self.netmon.epoch_manager.add_cid_for_epoch(
+              epoch=epoch, agreement_cid=agreement_cid,
+              debug=self.cfg_debug_sync_full
+            )
+            added_success.append(epoch)
             newly_uploaded_epochs.append(epoch)
           else:
-            self.P(f"Failed to upload agreement for epoch {epoch}.")
+            added_failed.append(epoch)
+            # self.P(f"Failed to upload agreement for epoch {epoch}.")
           # endif success
         else:
           # Here either the epoch is not valid or the agreement was already uploaded.
           if agreement_cid is not None:
             # The agreement was already uploaded, so we just add the cid to the message.
-            if self.cfg_debug_sync:
+            already_uploaded.append(epoch)
+            if self.cfg_debug_sync_full:
               self.P(f"Agreement for epoch {epoch} was already uploaded. Adding the CID to the message.")
             dct_epoch__agreed_median_table[epoch_key] = agreement_cid
           else:
             # The epoch is not valid, so we just add an empty object.
-            if self.cfg_debug_sync:
+            epochs_with_empty.append(epoch)
+            if self.cfg_debug_sync_full:
               self.P(f"Epoch {epoch} is not valid. Both availability table and signatures will be empty objects.")
             dct_epoch__agreed_median_table[epoch_key] = {}
             # We also remove the signatures for this epoch.
@@ -512,6 +525,13 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           # endif agreement_cid is not None
         # endif agreement needs uploading
       # end for epoch keys
+
+      if self.cfg_debug_sync:
+        stats_msg = f'{len(valid_epochs)} valid | {len(invalid_epochs)} invalid'
+        stats_msg += f' | {len(added_success)} added | {len(added_failed)} failed'
+        stats_msg += f' | {len(already_uploaded)} already uploaded | {len(epochs_with_empty)} empty'
+        self.P(f"Epochs: {stats_msg}.")
+      # endif debug_sync
 
       if len(newly_uploaded_epochs) > 0:
         self.P(f"Uploaded agreements for epochs: {newly_uploaded_epochs}. Saving the epoch manager status.")
@@ -585,8 +605,14 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       """
       Receive requests from the oracles and send responses.
       """
+      if self.cfg_debug_sync_full:
+        self.P(f"Parsing received messages from oracles.[{self.__get_current_state()}]")
+      cnt = 0
       for dct_message in self.get_received_messages_from_oracles():
+        cnt += 1
         self.__maybe_process_request_agreed_median_table(dct_message)
+      if self.cfg_debug_sync_full:
+        self.P(f"Processed {cnt} messages from oracles.[{self.__get_current_state()}]")
       return
 
     def __check_epoch_finished(self):
@@ -1157,7 +1183,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
     # S7_UPDATE_EPOCH_MANAGER
     def __update_epoch_manager_with_agreed_median_table(
         self, epoch=None, compiled_agreed_median_table=None, agreement_signatures=None,
-        epoch_is_valid=None, agreement_cid=None
+        epoch_is_valid=None, agreement_cid=None, debug=True
     ):
       """
       Update the epoch manager with the compiled agreed median table and the agreement signatures for the epoch.
@@ -1180,6 +1206,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           An epoch will be valid if consensus was reached for it.
       agreement_cid : str, optional
           The CID of the agreement table, by default None
+      debug : bool, optional
+          Print debug messages, by default True
       """
 
       if epoch is None:
@@ -1205,13 +1233,15 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       # endif epoch_is_valid
 
       if epoch <= self.__last_epoch_synced:
-        self.P("Epoch manager history already updated with this epoch", color='r')
+        if debug:
+          self.P("Epoch manager history already updated with this epoch", color='r')
         return
 
       if epoch > self.__last_epoch_synced + 1:
-        self.P(f"Detected a skip in epoch sync algorithm. "
-               f"Last known epoch synced {self.__last_epoch_synced} "
-               f"Current epoch {epoch}", color='r')
+        if debug:
+          self.P(f"Detected a skip in epoch sync algorithm. "
+                 f"Last known epoch synced {self.__last_epoch_synced} "
+                 f"Current epoch {epoch}", color='r')
         # If we skip the update here, the epoch manager will not be able to update in case
         # it receives the agreed median table for several epochs at once(maybe
         # at init when syncing with other active oracles).
@@ -1236,14 +1266,16 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       else:
         success = self.netmon.epoch_manager.mark_epoch_as_faulty(
           epoch=epoch,
+          debug=debug
         )
       # endif epoch_is_valid
 
       if success:
-        valid_str = "VALID" if epoch_is_valid else "INVALID"
-        self.P(f'Successfully synced epoch {epoch} with {valid_str} agreed median table!')
-        if self.cfg_debug_sync_full:
-          self.P(f'DEBUG EM data after update:\n{self.netmon.epoch_manager.data}')
+        if debug:
+          valid_str = "VALID" if epoch_is_valid else "INVALID"
+          self.P(f'Successfully synced epoch {epoch} with {valid_str} agreed median table!')
+          if self.cfg_debug_sync_full:
+            self.P(f'DEBUG EM data after update:\n{self.netmon.epoch_manager.data}')
         self.__last_epoch_synced = epoch
       return
 
@@ -1258,140 +1290,144 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       - if node connects at 0X:00, receives availability from prev day, transition back to s0
       """
 
-      # Receive agreed values from oracles
-      for dct_message in self.get_received_messages_from_oracles():
-        sender = dct_message.get(self.ct.PAYLOAD_DATA.EE_SENDER)
-        oracle_data = dct_message.get('ORACLE_DATA')
+      if self.first_time_request_agreed_median_table_sent is not None:
+        # Receive agreed values from oracles
+        for dct_message in self.get_received_messages_from_oracles():
+          sender = dct_message.get(self.ct.PAYLOAD_DATA.EE_SENDER)
+          oracle_data = dct_message.get('ORACLE_DATA')
 
-        if not self.__check_received_epoch__agreed_median_table_ok(sender, oracle_data):
-          continue
+          if not self.__check_received_epoch__agreed_median_table_ok(sender, oracle_data):
+            continue
 
-        # Here, both the agreed median table and the agreement signatures should have the same keys,
-        # but as string instead of int. We also know that in epoch_keys we have
-        # the keys in int format. Thus, we need to convert the keys of the received tables
-        dct_epoch_agreed_median_table = oracle_data[OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE]
-        dct_epoch_agreement_signatures = oracle_data[OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES]
-        dct_epoch_is_valid = oracle_data[OracleSyncCt.EPOCH__IS_VALID]
-        dct_epoch_agreement_cid = {}
-        epoch_keys = oracle_data[OracleSyncCt.EPOCH_KEYS]
+          # Here, both the agreed median table and the agreement signatures should have the same keys,
+          # but as string instead of int. We also know that in epoch_keys we have
+          # the keys in int format. Thus, we need to convert the keys of the received tables
+          dct_epoch_agreed_median_table = oracle_data[OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE]
+          dct_epoch_agreement_signatures = oracle_data[OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES]
+          dct_epoch_is_valid = oracle_data[OracleSyncCt.EPOCH__IS_VALID]
+          dct_epoch_agreement_cid = {}
+          epoch_keys = oracle_data[OracleSyncCt.EPOCH_KEYS]
 
-        # sort epoch_keys in ascending order
-        received_epochs = sorted(epoch_keys)
+          # sort epoch_keys in ascending order
+          received_epochs = sorted(epoch_keys)
 
-        # Maybe download the epochs data from R1FS if the data is not present in the message.
-        for epoch in received_epochs:
-          msg_received_data = dct_epoch_agreed_median_table.get(str(epoch))
-          retrieved_data = self.r1fs_get_data_from_message(
-            message_dict=dct_epoch_agreed_median_table,
-            data_key=str(epoch)
-          )
-          if retrieved_data is not None and isinstance(msg_received_data, str):
-            # Received a CID in the message and successfully retrieved the data from R1FS.
-            dct_epoch_agreement_cid[epoch] = msg_received_data
-          # endif retrieval from R1FS successful
-        # endfor epochs
-        # convert to dict with int keys
-        dct_epoch_agreed_median_table = {
-          # In case the agreement table is sent through R1FS, the keys will already be in int format.
-          epoch: dct_epoch_agreed_median_table[str(epoch)]
-          for epoch in received_epochs
-        }
-        dct_epoch_agreement_signatures = {
-          epoch: dct_epoch_agreement_signatures[str(epoch)]
-          for epoch in received_epochs
-        }
-        dct_epoch_is_valid = {
-          epoch: dct_epoch_is_valid[str(epoch)]
-          for epoch in received_epochs
-        }
-        if self.cfg_debug_sync_full:
-          msg = f"DEBUG Decoded following dct_epoch_agreed_median_table:\n"
-          msg += f"{dct_epoch_agreed_median_table}\n"
-          msg += f'With the following validities: {dct_epoch_is_valid}\n'
-          msg += f"And the following signatures: {dct_epoch_agreement_signatures}\n"
-          self.P(msg)
-        # endif debug_sync_full
-
-        message_invalid = False
-        for epoch, agreed_median_table in dct_epoch_agreed_median_table.items():
-          # At this point we did not need to convert the keys of the dictionaries yet,
-          # because in valid messages both the agreement table and the agreement signatures
-          # should have the same keys and in the checked sub-dictionaries there weren't any
-          # non-string keys to begin with.
-          # However, we converted it before in order for the epoch key to be in int format,
-          # since at the verification of the signatures we also need the epoch as int.
-          epoch_signatures = dct_epoch_agreement_signatures.get(epoch)
-          epoch_is_valid = dct_epoch_is_valid.get(epoch)
+          # Maybe download the epochs data from R1FS if the data is not present in the message.
+          for epoch in received_epochs:
+            msg_received_data = dct_epoch_agreed_median_table.get(str(epoch))
+            retrieved_data = self.r1fs_get_data_from_message(
+              message_dict=dct_epoch_agreed_median_table,
+              data_key=str(epoch),
+              debug=self.cfg_debug_sync_full
+            )
+            if retrieved_data is not None and isinstance(msg_received_data, str):
+              # Received a CID in the message and successfully retrieved the data from R1FS.
+              dct_epoch_agreement_cid[epoch] = msg_received_data
+            # endif retrieval from R1FS successful
+          # endfor epochs
+          # convert to dict with int keys
+          dct_epoch_agreed_median_table = {
+            # In case the agreement table is sent through R1FS, the keys will already be in int format.
+            epoch: dct_epoch_agreed_median_table[str(epoch)]
+            for epoch in received_epochs
+          }
+          dct_epoch_agreement_signatures = {
+            epoch: dct_epoch_agreement_signatures[str(epoch)]
+            for epoch in received_epochs
+          }
+          dct_epoch_is_valid = {
+            epoch: dct_epoch_is_valid[str(epoch)]
+            for epoch in received_epochs
+          }
           if self.cfg_debug_sync_full:
-            msg = f'##########################\n'
-            msg += f'DEBUG Received availability table for epoch {epoch} from {sender = } with values:\n'
-            msg += f'{agreed_median_table}\n AND signatures:\n{epoch_signatures}\n###################'
+            msg = f"DEBUG Decoded following dct_epoch_agreed_median_table:\n"
+            msg += f"{dct_epoch_agreed_median_table}\n"
+            msg += f'With the following validities: {dct_epoch_is_valid}\n'
+            msg += f"And the following signatures: {dct_epoch_agreement_signatures}\n"
             self.P(msg)
           # endif debug_sync_full
 
-          if not self.__check_agreed_median_table(
-              sender=sender, agreed_median_table=agreed_median_table,
-              epoch_signatures=epoch_signatures, epoch=epoch,
-              epoch_is_valid=epoch_is_valid
-          ):
-            # if one signature for the received table is invalid, ignore the entire message
-            message_invalid = True
-            break
-        # end for epoch agreed table
+          message_invalid = False
+          for epoch, agreed_median_table in dct_epoch_agreed_median_table.items():
+            # At this point we did not need to convert the keys of the dictionaries yet,
+            # because in valid messages both the agreement table and the agreement signatures
+            # should have the same keys and in the checked sub-dictionaries there weren't any
+            # non-string keys to begin with.
+            # However, we converted it before in order for the epoch key to be in int format,
+            # since at the verification of the signatures we also need the epoch as int.
+            epoch_signatures = dct_epoch_agreement_signatures.get(epoch)
+            epoch_is_valid = dct_epoch_is_valid.get(epoch)
+            if self.cfg_debug_sync_full:
+              msg = f'##########################\n'
+              msg += f'DEBUG Received availability table for epoch {epoch} from {sender = } with values:\n'
+              msg += f'{agreed_median_table}\n AND signatures:\n{epoch_signatures}\n###################'
+              self.P(msg)
+            # endif debug_sync_full
 
-        if message_invalid:
-          if self.cfg_debug_sync:
-            self.P(f"Received invalid availability table from {sender = }. Ignoring", color='r')
-          continue
-        # endif
+            if not self.__check_agreed_median_table(
+                sender=sender, agreed_median_table=agreed_median_table,
+                epoch_signatures=epoch_signatures, epoch=epoch,
+                epoch_is_valid=epoch_is_valid,
+                debug=False
+            ):
+              # if one signature for the received table is invalid, ignore the entire message
+              message_invalid = True
+              break
+          # end for epoch agreed table
 
-        if self.__last_epoch_synced + 1 not in received_epochs or self.__current_epoch - 1 not in received_epochs:
-          # Expected epochs in range [last_epoch_synced + 1, current_epoch - 1]
-          # received epochs don t contain the full range
-          if self.cfg_debug_sync:
-            min_epoch = min(received_epochs) if len(received_epochs) > 0 else None
-            max_epoch = max(received_epochs) if len(received_epochs) > 0 else None
-            msg = (f'Expected epochs in range [{self.__last_epoch_synced + 1}, {self.__current_epoch - 1}] '
-                   f'and received only {len(received_epochs)} epochs (min: {min_epoch}, max: {max_epoch}). '
-                   f'Ignoring...')
-            self.P(msg, color='r')
-          continue
-        # endif received epochs not containing the full requested interval
+          if message_invalid:
+            if self.cfg_debug_sync:
+              self.P(f"Received invalid availability table from {sender = }. Ignoring", color='r')
+            continue
+          # endif
 
-        self.P(f"Received availability table for epochs {received_epochs} from {sender = }. Keeping only the "
-               f"tables for epochs in range [{self.__last_epoch_synced + 1}, {self.__current_epoch - 1}]")
-        epochs_range = range(self.__last_epoch_synced + 1, self.__current_epoch)
-        self.dct_agreed_availability_table[sender] = {
-          # No need for get here, since in S0 we send a continuous range of epochs.
-          i: dct_epoch_agreed_median_table[i]
-          for i in epochs_range
-        }
-        self.dct_agreed_availability_signatures[sender] = {
-          # No need for get here, since in S0 we send a continuous range of epochs.
-          i: dct_epoch_agreement_signatures[i]
-          for i in epochs_range
-        }
-        self.dct_agreed_availability_is_valid[sender] = {
-          # No need for get here, since in S0 we send a continuous range of epochs.
-          i: dct_epoch_is_valid[i]
-          for i in epochs_range
-        }
-        self.dct_agreed_availability_cid[sender] = {
-          i: dct_epoch_agreement_cid.get(i)
-          for i in epochs_range
-        }
-      # end for received messages
+          if self.__last_epoch_synced + 1 not in received_epochs or self.__current_epoch - 1 not in received_epochs:
+            # Expected epochs in range [last_epoch_synced + 1, current_epoch - 1]
+            # received epochs don t contain the full range
+            if self.cfg_debug_sync:
+              min_epoch = min(received_epochs) if len(received_epochs) > 0 else None
+              max_epoch = max(received_epochs) if len(received_epochs) > 0 else None
+              msg = (f'Expected epochs in range [{self.__last_epoch_synced + 1}, {self.__current_epoch - 1}] '
+                     f'and received only {len(received_epochs)} epochs (min: {min_epoch}, max: {max_epoch}). '
+                     f'Ignoring...')
+              self.P(msg, color='r')
+            continue
+          # endif received epochs not containing the full requested interval
+
+          self.P(f"Received availability for epochs {received_epochs} from {sender = }. Keeping only "
+                 f"tables for epochs [{self.__last_epoch_synced + 1}, {self.__current_epoch - 1}]")
+          epochs_range = range(self.__last_epoch_synced + 1, self.__current_epoch)
+          self.dct_agreed_availability_table[sender] = {
+            # No need for get here, since in S0 we send a continuous range of epochs.
+            i: dct_epoch_agreed_median_table[i]
+            for i in epochs_range
+          }
+          self.dct_agreed_availability_signatures[sender] = {
+            # No need for get here, since in S0 we send a continuous range of epochs.
+            i: dct_epoch_agreement_signatures[i]
+            for i in epochs_range
+          }
+          self.dct_agreed_availability_is_valid[sender] = {
+            # No need for get here, since in S0 we send a continuous range of epochs.
+            i: dct_epoch_is_valid[i]
+            for i in epochs_range
+          }
+          self.dct_agreed_availability_cid[sender] = {
+            i: dct_epoch_agreement_cid.get(i)
+            for i in epochs_range
+          }
+        # end for received messages
+      # endif first agreement request sent
+
+      # Return if no need to sync; the last epoch synced is the previous epoch
+      if self.__last_epoch_synced_is_previous_epoch():
+        self.P("Last epoch synced is the previous epoch. No need to sync")
+        return
 
       # Send request to get agreed value from oracles
       if self.first_time_request_agreed_median_table_sent is None:
         self.first_time_request_agreed_median_table_sent = self.time()
 
       if self.last_time_request_agreed_median_table_sent is not None and self.time() - self.last_time_request_agreed_median_table_sent < self.cfg_send_interval:
-        return
-
-      # Return if no need to sync; the last epoch synced is the previous epoch
-      if self.__last_epoch_synced_is_previous_epoch():
-        self.P("Last epoch synced is the previous epoch. No need to sync")
         return
 
       oracle_data = {
@@ -1401,11 +1437,17 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         'END_EPOCH': self.__current_epoch - 1,
       }
 
-      self.P("Sending broadcast request for agreed median table for epochs "
-             f"{self.__last_epoch_synced + 1} to {self.__current_epoch - 1}")
+      # TODO: log the number of the request
+      current_time = self.time()
+      elapsed_time = round(current_time - self.first_time_request_agreed_median_table_sent, 1)
+      self.P(f"Request for agreed median table for epochs {self.__last_epoch_synced + 1} to {self.__current_epoch - 1}"
+             f"[e:{elapsed_time}/t:{self.get_request_agreement_timeout()}]")
       self.add_payload_by_fields(oracle_data=oracle_data)
       self.last_time_request_agreed_median_table_sent = self.time()
       return
+
+    def get_request_agreement_timeout(self):
+      return self.cfg_send_period * REQUEST_AGREEMENT_TABLE_MULTIPLIER
 
     def __send_request_agreed_median_table_timeout(self):
       """
@@ -1419,7 +1461,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       if self.first_time_request_agreed_median_table_sent is None:
         return False
       # 10 times the normal period because we want to make sure that oracles can respond
-      wait_threshold = self.cfg_send_period * REQUEST_AGREEMENT_TABLE_MULTIPLIER
+      wait_threshold = self.get_request_agreement_timeout()
       timeout_expired = self.time() - self.first_time_request_agreed_median_table_sent > wait_threshold
 
       n_received = len(self.dct_agreed_availability_table)
@@ -1451,7 +1493,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         color='r'
       )
       for epoch in range(requested_start_epoch, requested_end_epoch + 1):
-        self.netmon.epoch_manager.mark_epoch_as_faulty(epoch=epoch)
+        self.netmon.epoch_manager.mark_epoch_as_faulty(epoch=epoch, debug=self.cfg_debug_sync_full)
       # endfor epoch
       return
 
@@ -1622,7 +1664,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           compiled_agreed_median_table=agreement_table,
           agreement_signatures=agreement_signatures,
           epoch_is_valid=epoch_is_valid,
-          agreement_cid=agreement_cid
+          agreement_cid=agreement_cid,
+          debug=self.cfg_debug_sync_full
         )
       # endfor epoch
       return
@@ -1646,6 +1689,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         message_dict: dict,
         data_dict: dict,
         data_key: str,
+        debug=None
     ):
       """
       Helper method for adding data to a message with the help of R1FS.
@@ -1668,28 +1712,33 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       success : bool
           True if the data was successfully added to the message, False otherwise
       """
+      r1fs_show_logs = debug is None or debug
+      debug = self.cfg_debug_sync if debug is None else debug
       success = False
       if self.cfg_use_r1fs:
         try:
           if self.r1fs_warmup_passed():
-            data_cid = self.r1fs.add_pickle(data_dict)
+            data_cid = self.r1fs.add_pickle(data_dict, show_logs=r1fs_show_logs)
             if data_cid is not None:
               message_dict[data_key] = data_cid
-              if self.cfg_debug_sync:
+              if debug:
                 self.P(f'Successfully added data to R1FS using CID {data_cid}.')
               success = True
             else:
-              self.P(f"Failed to add data to R1FS. Adding data entirely to message.", color='r')
+              if debug:
+                self.P(f"Failed to add data to R1FS. Adding data entirely to message.", color='r')
               message_dict[data_key] = self.deepcopy(data_dict)
             # endif data_cid is not None
           else:
-            self.P(f"R1FS warmup period has not passed. Adding data entirely to message.", color='r')
+            if debug:
+              self.P(f"R1FS warmup period has not passed. Adding data entirely to message.", color='r')
             message_dict[data_key] = self.deepcopy(data_dict)
         except Exception as e:
-          self.P(f"Failed to add data to R1FS. Adding data entirely to message. Error: {e}", color='r')
+          if debug:
+            self.P(f"Failed to add data to R1FS. Adding data entirely to message. Error: {e}", color='r')
           message_dict[data_key] = self.deepcopy(data_dict)
       else:
-        if self.cfg_debug_sync:
+        if debug:
           self.P(f"R1FS use is disabled. Adding data entirely to message.")
         message_dict[data_key] = self.deepcopy(data_dict)
       # endif R1FS use
@@ -1699,6 +1748,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         self,
         message_dict: dict,
         data_key: str,
+        debug=True
     ):
       """
       Helper method for getting data from a message with the help of R1FS.
@@ -1712,6 +1762,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           The message dictionary from which the data should be extracted
       data_key : str
           The key of the data in the message_dict
+      debug : bool, optional
+          Whether to print debug messages, by default True
 
       Returns
       -------
@@ -1724,26 +1776,28 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       data_from_message = message_dict.get(data_key)
       if data_from_message is None:
         # 1.1. No data found in message.
-        self.P(f"Failed to extract data from {data_key}. Nothing provided.", color='r')
+        if debug:
+          self.P(f"Failed to extract data from {data_key}. Nothing provided.", color='r')
       else:
         # 1.2. Data found in message. Check if CID or data.
         if isinstance(data_from_message, str):
           # 2.1. Data is a CID. Attempt to get the data from R1FS.
-          self.P(f"Attempting to get data from R1FS using CID {data_from_message}.")
-          res = self.r1fs_get_pickle(cid=data_from_message)
-          if res is not None and self.cfg_debug_sync:
+          if debug:
+            self.P(f"Attempting to get data from R1FS using CID {data_from_message}.")
+          res = self.r1fs_get_pickle(cid=data_from_message, debug=debug)
+          if res is not None and debug:
             self.P(f"Successfully retrieved data from R1FS using CID {data_from_message}.")
         else:
           # 2.2. Data is not a CID. Use the data directly.
           res = data_from_message
-          if self.cfg_debug_sync:
+          if debug:
             self.P(f'Using data directly from message for {data_key}.')
         # endif CID or data
       # endif extraction successful
       message_dict[data_key] = res
       return res
 
-    def r1fs_get_pickle(self, cid: str):
+    def r1fs_get_pickle(self, cid: str, debug=True):
       """
       Get the data from the IPFS using the CID.
       The CID will be used for retrieving the file from the IPFS.
@@ -1753,6 +1807,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       ----------
       cid : str
           The CID of the data
+      debug : bool, optional
+          Print debug messages, by default True
 
       Returns
       -------
@@ -1763,17 +1819,19 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       retrieved_data = None
       for i in range(total_retries):
         try:
-          data_fn = self.r1fs.get_file(cid=cid)
+          data_fn = self.r1fs.get_file(cid=cid, show_logs=debug)
           data_full_path = self.os_path.abspath(data_fn)
           retrieved_data = self.diskapi_load_pickle_from_output(filename=data_full_path)
           if retrieved_data is not None:
             break
         except Exception as e:
-          self.P(f"Failed try {i + 1}/{total_retries} to retrieve data from IPFS using CID {cid}.")
+          if debug:
+            self.P(f"Failed try {i + 1}/{total_retries} to retrieve data from IPFS using CID {cid}.")
         # endtry to retrieve data
       # endif retries
       if retrieved_data is None:
-        self.P(f"Failed to retrieve data from IPFS using CID {cid} from {total_retries} retries.", color='r')
+        if debug:
+          self.P(f"Failed to retrieve data from IPFS using CID {cid} from {total_retries} retries.", color='r')
       return retrieved_data
 
     def get_oracle_list(self):
@@ -1911,7 +1969,6 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       -------
       generator : The messages received from the oracles
       """
-      # dct_messages = self.dataapi_struct_datas()
       # retrieve messages from self.__received_messages_from_oracles
       dct_messages = list(self.__received_messages_from_oracles)
       self.__received_messages_from_oracles.clear()
@@ -2316,7 +2373,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
 
     def __check_agreement_signature(
         self, sender: str, signature_dict: dict, epoch: int = None,
-        compiled_agreed_median_table: dict = None,
+        compiled_agreed_median_table: dict = None, debug: bool = False
     ):
       """
       Check the agreement signature.
@@ -2334,13 +2391,16 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       compiled_agreed_median_table : dict
           The compiled agreed median table received from an oracle for a particular epoch.
           If None, the method will use the one from the cache, by default None
+      debug : bool, optional
+          Whether to print debug messages, by default False
 
       Returns
       -------
       bool : True if the compiled agreed median table is valid, False otherwise
       """
       if signature_dict is None:
-        self.P(f"Invalid agreement signature for {epoch=} from oracle {sender}: No signature provided", color='r')
+        if debug:
+          self.P(f"Invalid agreement signature for {epoch=} from oracle {sender}: No signature provided", color='r')
         return False
 
       if compiled_agreed_median_table is None:
@@ -2351,7 +2411,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         # Thus, the epoch is the current epoch - 1.
         epoch = self.__current_epoch - 1
 
-      if self.cfg_debug_sync:
+      if debug:
         self.P(f"DEBUG Received agreement signature for epoch {epoch} from oracle {sender}")
 
       # Rebuild the original signed data dictionary.
@@ -2374,7 +2434,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       if not verify_result.valid:
         if self.cfg_debug_sync_full:
           self.P(f"DEBUG FULL invalid verify dictionary: {data_to_verify}")
-        self.P(f"Invalid agreement signature for {epoch=} from oracle {sender}:{verify_result.message}", color='r')
+        if debug:
+          self.P(f"Invalid agreement signature for {epoch=} from oracle {sender}:{verify_result.message}", color='r')
         return False
       return True
 
@@ -2557,7 +2618,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
     def __check_agreed_median_table(
         self, sender: str, agreed_median_table: dict,
         epoch_signatures: dict, epoch: int,
-        epoch_is_valid: bool
+        epoch_is_valid: bool, debug: bool = True
     ):
       """
       Check if the agreed median table is valid.
@@ -2574,21 +2635,27 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           The epoch for which the agreement table was received.
       epoch_is_valid: bool
           The validity of the epoch.
+      debug: bool, optional
+          Whether to print debug messages, by default True
       """
       if not epoch_is_valid:
-        self.P(f"For epoch {epoch} from {sender} no consensus was reached. Skipping...", color='r')
+        if debug:
+          self.P(f"For epoch {epoch} from {sender} no consensus was reached. Skipping...", color='r')
         return True
 
       if agreed_median_table is None:
-        self.P(f"Received agreed median table from oracle {sender} is None. ignoring...", color='r')
+        if debug:
+          self.P(f"Received agreed median table from oracle {sender} is None. ignoring...", color='r')
         return False
 
       if epoch_signatures is None:
-        self.P(f"Received epoch {epoch} signatures table from oracle {sender} is None. Ignoring...", color='r')
+        if debug:
+          self.P(f"Received epoch {epoch} signatures table from oracle {sender} is None. Ignoring...", color='r')
         return False
 
       if len(epoch_signatures) == 0:
-        self.P(f"Received empty epoch {epoch} signatures table from oracle {sender}. Ignoring...", color='r')
+        if debug:
+          self.P(f"Received empty epoch {epoch} signatures table from oracle {sender}. Ignoring...", color='r')
         return False
 
       if self.cfg_debug_sync_full:
@@ -2597,9 +2664,10 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       for oracle_addr, oracle_signature in epoch_signatures.items():
         if not self.__check_agreement_signature(
           sender=sender, signature_dict=oracle_signature,
-          epoch=epoch, compiled_agreed_median_table=agreed_median_table
+          epoch=epoch, compiled_agreed_median_table=agreed_median_table,
+          debug=debug
         ):
-          if self.cfg_debug_sync:
+          if debug:
             self.P(f'Invalid signature of {oracle_addr} in signatures received from {sender}!', color='r')
           # endif debug_sync
           return False

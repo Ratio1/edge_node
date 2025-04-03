@@ -2,6 +2,27 @@
 Demo for a plugin that only sends the data from the pipeline DCT and the serving (if any).
 
 
+Pipeline config with no serving:
+
+{
+    "CAP_RESOLUTION": 0.5,
+    "LIVE_FEED": true,
+    "NAME": "test",
+    "PLUGINS": [
+
+        {
+            "INSTANCES": [
+                {
+                    "INSTANCE_ID": "DEFAULT"
+                }
+            ],
+            "SIGNATURE": "A_SIMPLE_PLUGIN"
+        }
+        
+    ],
+    "TYPE": "ExampleDatastream", 
+    "URL": ""
+} 
 """
 
 
@@ -11,6 +32,8 @@ _CONFIG = {
   **BaseClass.CONFIG,
   
   'ALLOW_EMPTY_INPUTS' : False,
+  
+  'PROCESS_DELAY' : 5,
 
   'VALIDATION_RULES' : {
     **BaseClass.CONFIG['VALIDATION_RULES'],
