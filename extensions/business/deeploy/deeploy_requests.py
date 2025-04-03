@@ -12,7 +12,7 @@ from time import time
 from uuid import uuid4
 
 DEEPLOY_CREATE_REQUEST = {
-  "app_name" : "app_" + str(uuid4())[:8], 
+  "app_alias" : "some_app_name", 
   "plugin_signature" : "SOME_PLUGIN_01",
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
   "target_nodes" : [
@@ -25,6 +25,11 @@ DEEPLOY_CREATE_REQUEST = {
     "CR" : "docker.io",
     "CR_USERNAME" : "user",
     "CR_PASSWORD" : "password",
+    "CONTAINER_RESOURCES" : {
+      "cpu" : 1,
+      "memory" : 2,
+      "gpu" : 0,
+    },
     "PORT" : 5000,
     "OTHER_PARAM1" : "value1",
     "OTHER_PARAM2" : "value2",
@@ -48,7 +53,7 @@ DEEPLOY_GET_APPS_REQUEST = {
 }
 
 DEEPLOY_DELETE_REQUEST = {
-  "app_name" : "target_app_name",
+  "app_id" : "target_app_name_id_returned_by_get_apps_or_create_pipeline",
   "target_nodes" : [
     "0xai_target_node_1",
     "0xai_target_node_2",
