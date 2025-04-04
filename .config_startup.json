@@ -14,7 +14,7 @@
 
   "CHECK_RAM_ON_SHUTDOWN" : false,
 
-  
+  "RESET_ADMIN_PIPELINE" : true,
   
   "SECONDS_HEARTBEAT" : 15,  
   "HEARTBEAT_TIMERS" : false,
