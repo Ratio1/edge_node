@@ -59,15 +59,14 @@ class HomeSafetyPlugin(BasePlugin):
     instance_inferences = self.dataapi_image_instance_inferences()
 
     # Check for objects with tracking time greater than alert threshold
-    self.P('Checking for objects with extended tracking time...')
-    self.P(instance_inferences)
+    self.P(f"Nr of people in image {len(instance_inferences)}")
     if len(instance_inferences) > 0:
       self.alerter_add_observation(1)
     else:
       self.alerter_add_observation(0)
 
     if self.alerter_is_new_raise() or self.alerter_is_new_lower():
-      is_alert = self.alerter_is_alert()
+      is_alert = self.alerter_is_new_raise()
 
       np_witness = self.get_witness_image(
         draw_witness_image_kwargs={
