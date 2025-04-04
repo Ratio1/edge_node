@@ -17,6 +17,7 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
 
   def __init__(self, **kwargs):
     self._home_security_events = {}
+    self._property_documents = {}
     super(FastapiAihoPlugin, self).__init__(**kwargs)
     return
 
@@ -30,6 +31,7 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     self.P("Running post-init setup")
     # Dict with url -> answer, done
     self.request_data = {}
+    self.my_id = f'r1:aiho{self.ee_id}'
     return
 
   @FastApiWebAppPlugin.endpoint(method="post")
@@ -79,7 +81,59 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
       "status": "ok",
       "events": events,
     }
+  
+  # R1FS
 
-  def _on_command(self, data, **kwargs):
-    self.P(f"_on_command: {data}")
-    return
+  @FastApiWebAppPlugin.endpoint(method="post")
+  def new_property_document(self, propertyId: int, fileName:str, base64document: str):
+    self.P(f"new_property_document")
+    if propertyId not in self._property_documents:
+      self._property_documents[propertyId] = []
+    fn = self.diskapi_save_bytes_to_output(data=base64document, filename=fileName, from_base64=True)
+    self.P(f"new_property_document : {fn}")
+    cid = self.r1fs.add_file(fn)
+    self.P(f"new_property_document cid : {cid}")
+    self._property_documents[propertyId].append({
+      "timestamp": int(self.time()),
+      "fileName": fileName,
+      "cid": cid,
+    })
+    return {
+      "status": "ok",
+    }
+  
+  @FastApiWebAppPlugin.endpoint
+  def get_property_documents_list(self, propertyId: int):
+    self.P(f"get_property_documents_list")
+    if propertyId not in self._property_documents:
+      self._property_documents[propertyId] = []
+    return {
+      "status": "ok",
+      "documents": self._property_documents[propertyId],
+    }
+  
+  @FastApiWebAppPlugin.endpoint
+  def get_property_document(self, propertyId: int, cid: str):
+    self.P(f"get_property_document")
+    if propertyId not in self._property_documents:
+      self._property_documents[propertyId] = []
+    for doc in self._property_documents[propertyId]:
+      if doc["cid"] == cid:
+        fn = self.r1fs.get_file(cid)
+        self.P(f"get_property_document: {fn}")
+        if fn is not None:
+          base64document = self.diskapi_load_r1fs_file(filename=fn, to_base64=True)
+          return {
+            "status": "ok",
+            "document": base64document,
+          }
+        else:
+          self.P(f"get_property_document: file not found")
+          return {
+            "status": "error",
+            "message": "File not found",
+          }
+    return {
+      "status": "error",
+      "message": "Document not found",
+    }
