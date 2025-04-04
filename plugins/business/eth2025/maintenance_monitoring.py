@@ -16,6 +16,9 @@ _CONFIG = {
   'ANOMALY_PROBABILITY_THRESHOLD': 0.1,
   # 'ANOMALY_PROBABILITY_THRESHOLD': 0.8,
 
+  "AIHO_ANOMALIES_URL": "https://api.aiho.ai/new_predictive_maintenance_event",
+  "AIHO_HISTORY_URL": "https://api.aiho.ai/new_predictive_maintenance_measurements",
+
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -54,7 +57,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
         timestamp1 = timestamp1.replace('Z', '+00:00')
       if isinstance(timestamp2, str) and timestamp2.endswith('Z'):
         timestamp2 = timestamp2.replace('Z', '+00:00')
-        
+
       dt1 = self.datetime.fromisoformat(timestamp1)
       dt2 = self.datetime.fromisoformat(timestamp2)
       return dt1 >= dt2
@@ -82,7 +85,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     """Create an ISO timestamp from a time value (epoch)"""
     if time_value is None:
       time_value = self.time()
-    
+
     if isinstance(time_value, (int, float)):
       return self.datetime.fromtimestamp(time_value).isoformat()
     elif isinstance(time_value, str):
@@ -90,7 +93,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       if time_value.endswith('Z'):
         return time_value.replace('Z', '+00:00')
       return time_value
-    
+
     return self.datetime.now().isoformat()
 
   def _load_measurement_history(self, file_path):
@@ -108,7 +111,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
             # Handle Z timezone notation
             elif measurement['timestamp'].endswith('Z'):
               measurement['timestamp'] = measurement['timestamp'].replace('Z', '+00:00')
-        
+
         self.__measurement_history = data
         self.P(f"Loaded {len(data)} records from {file_path}")
       else:
@@ -116,7 +119,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     except Exception as e:
       self.P(f"Error loading data from {file_path}: {str(e)}", color='r')
       # Keep the default empty list in case of error
-      
+
   def _save_measurement_history(self):
     """Save measurement history to pickle file if modified"""
     if not self.__history_modified:
@@ -133,7 +136,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
   def _prune_old_measurements(self):
     """Remove measurements older than the history time window"""
     cutoff_time_iso = self._get_cutoff_time_iso()
-    
+
     original_length = len(self.__measurement_history)
     # Filter measurements based on ISO format timestamps
     new_history = []
@@ -146,9 +149,9 @@ class MaintenanceMonitoringPlugin(BasePlugin):
           self.P(f"Error comparing timestamps: {str(e)}", color='r')
           # Keep the measurement if we can't compare (benefit of doubt)
           new_history.append(m)
-    
+
     self.__measurement_history = new_history
-    
+
     if len(self.__measurement_history) < original_length:
       self.__history_modified = True
       self.P(f"Pruned {original_length - len(self.__measurement_history)} old records from history")
@@ -167,7 +170,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     """Add a new measurement to the history with a timestamp"""
     if not measurement:
       return
-      
+
     # Add timestamp if not already present
     if 'timestamp' not in measurement:
       measurement['timestamp'] = self._get_current_time_iso()
@@ -175,11 +178,11 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       # Ensure timestamp is in ISO format
       if not isinstance(measurement['timestamp'], str):
         measurement['timestamp'] = self._create_iso_timestamp_from_time(measurement['timestamp'])
-      
+
     # Add to history
     self.__measurement_history.append(measurement)
     self.__history_modified = True
-    
+
     # Prune old measurements
     # self._prune_old_measurements()
 
@@ -188,23 +191,23 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     # Extract temperature and humidity data separately
     temp_data = []
     humidity_data = []
-    
+
     for measurement in self.__measurement_history:
       if 'temperature' in measurement:
         temp_data.append(measurement['temperature'])
       if 'humidity' in measurement:
         humidity_data.append(measurement['humidity'])
-    
+
     # Skip if we don't have enough data points
     if len(temp_data) < 5 or len(humidity_data) < 5:  # Minimum samples needed for meaningful anomaly detection
       self.P("Not enough data points for anomaly detection")
       return []
-    
+
     # Convert to numpy arrays (required format for anomaly detection)
     # Reshape to make 2D arrays with one feature
     temp_data_np = self.np.array(temp_data).reshape(-1, 1)
     humidity_data_np = self.np.array(humidity_data).reshape(-1, 1)
-    
+
     # Call the anomaly detection API for each data type
     try:
       # Process temperature anomalies
@@ -214,11 +217,11 @@ class MaintenanceMonitoringPlugin(BasePlugin):
         proba=True
       )
 
-      
+
       # Get current datetime for results
       dt = self.datetime.now()
       res = {}
-      
+
       # Process humidity anomalies
       humidity_result = self.mlapi_anomaly_fit_predict(
         x_train=humidity_data_np,
@@ -229,14 +232,11 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       # Set ISO format timestamp
       res['read_time'] = dt.isoformat()
 
-      self.P(f"Humidity anomaly detection results:")
-      self.P(humidity_result)
-      
       # Combine anomaly results
       anomalies = []
-      
+
       self.P("Processing temperature and humidity anomalies...")
-      
+
       # Process temperature anomalies
       temp_anomalies = []
       try:
@@ -248,7 +248,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
             self.P(f"ALERT: Temperature anomaly detected at index {idx} with probability {prob_value}", color='r')
       except Exception as e:
         self.P(f"Error processing temperature anomalies: {str(e)}", color='r')
-        
+
       # Process detected temperature anomalies
       for idx in temp_anomalies:
         if idx < len(self.__measurement_history):
@@ -257,21 +257,11 @@ class MaintenanceMonitoringPlugin(BasePlugin):
             'timestamp': anomaly_record.get('timestamp', self._get_current_time_iso()),
             'temperature': anomaly_record.get('temperature', None),
             'humidity': anomaly_record.get('humidity', None),
-            'reason': 'Anomaly detected in temperature values'
+            'reason_key': 'temperature'
           })
-      
+
       # Process humidity anomalies
       humidity_anomalies = []
-      try:
-        for idx, [item] in enumerate(humidity_result):
-          # Convert to float and compare with threshold
-          prob_value = float(item)
-          if prob_value > self.cfg_anomaly_probability_threshold:
-            humidity_anomalies.append(idx)
-            self.P(f"ALERT: Humidity anomaly detected at index {idx} with probability {prob_value}", color='r')
-      except Exception as e:
-        self.P(f"Error processing humidity anomalies: {str(e)}", color='r')
-        
       # Process detected humidity anomalies
       for idx in humidity_anomalies:
         if idx < len(self.__measurement_history):
@@ -279,24 +269,24 @@ class MaintenanceMonitoringPlugin(BasePlugin):
           already_reported = False
           for existing_anomaly in anomalies:
             # Compare ISO format timestamps - direct string comparison should work
-            if existing_anomaly['timestamp'] == self.__measurement_history[idx].get('timestamp', self._get_current_time_iso()):
+            if existing_anomaly['timestamp'] == self.__measurement_history[idx].get('read_time', self._get_current_time_iso()):
               # Update reason for existing anomaly
-              existing_anomaly['reason'] = 'Anomaly detected in temperature and humidity values'
+              existing_anomaly['reason_key'] = 'both' # both temperature and humidity
               already_reported = True
               break
-          
+
           if not already_reported:
             anomaly_record = self.__measurement_history[idx]
             anomalies.append({
               'timestamp': anomaly_record.get('timestamp', self._get_current_time_iso()),
               'temperature': anomaly_record.get('temperature', None),
               'humidity': anomaly_record.get('humidity', None),
-              'reason': 'Anomaly detected in humidity values'
+              'reason_key': 'humidity'
             })
-      
+
       self.P(f"Detected {len(anomalies)} anomalies in temperature and humidity data")
       return anomalies
-      
+
     except Exception as e:
       self.P(f"Error in anomaly detection: {str(e)}", color='r')
       return []
@@ -307,7 +297,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     self.P(f"Fetching measurements")
     # Only fetch if enough time has passed
     measurements = self._fetch_measurements()
-    
+
     if measurements:
       # Add measurements to history
       self._add_measurement_to_history(measurements)
@@ -320,6 +310,20 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       temperature = measurements.get('temperature')
       humidity = measurements.get('humidity')
       anomalies = self._check_anomalies(temperature, humidity)
+      self.P('anomalies:')
+      self.P(anomalies)
+
+      # Only send POST request if anomalies exist
+      if anomalies:
+        # Create request data to send to AIHO
+        request_data = {
+          'anomalies': anomalies,
+          'timestamp': self._get_current_time_iso(),
+          'device_id': self.__pod_uid
+        }
+        # Send POST request with anomalies data
+        self.requests.post(url=self.cfg_aiho_anomalies_url, json=request_data)
+        self.P(f"Sent {len(anomalies)} anomalies to {self.cfg_aiho_url}")
 
     payload = self._create_payload(
       measurements=measurements,
