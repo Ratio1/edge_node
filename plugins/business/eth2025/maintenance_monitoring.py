@@ -13,7 +13,8 @@ _CONFIG = {
   'PROCESS_DELAY': 30,
   'ALLOW_EMPTY_INPUTS': False,
 
-  'ANOMALY_PROBABILITY_THRESHOLD': 0.8,
+  'ANOMALY_PROBABILITY_THRESHOLD': 0.1,
+  # 'ANOMALY_PROBABILITY_THRESHOLD': 0.8,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -212,8 +213,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
         x_test=temp_data_np,
         proba=True
       )
-      self.P(f"Temperature anomaly detection results: temp_result")
-      self.P(temp_result)
+
       
       # Get current datetime for results
       dt = self.datetime.now()
@@ -225,6 +225,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
         x_test=humidity_data_np,
         proba=True
       )
+
       # Set ISO format timestamp
       res['read_time'] = dt.isoformat()
 
@@ -234,72 +235,64 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       # Combine anomaly results
       anomalies = []
       
+      self.P("Processing temperature and humidity anomalies...")
+      
       # Process temperature anomalies
-      if temp_result:
-        temp_anomalies = []
-        # Check if result is a numpy array or nested list
-        if isinstance(temp_result, list) or (hasattr(temp_result, 'shape') and len(temp_result.shape) > 0):
-          # Flatten if needed and process
-          temp_probs = temp_result
-          if hasattr(temp_result, 'flatten'):
-            temp_probs = temp_result.flatten()
+      temp_anomalies = []
+      try:
+        for idx, [item] in enumerate(temp_result):
+          # Convert to float and compare with threshold
+          prob_value = float(item)
+          if prob_value > self.cfg_anomaly_probability_threshold:
+            temp_anomalies.append(idx)
+            self.P(f"ALERT: Temperature anomaly detected at index {idx} with probability {prob_value}", color='r')
+      except Exception as e:
+        self.P(f"Error processing temperature anomalies: {str(e)}", color='r')
+        
+      # Process detected temperature anomalies
+      for idx in temp_anomalies:
+        if idx < len(self.__measurement_history):
+          anomaly_record = self.__measurement_history[idx]
+          anomalies.append({
+            'timestamp': anomaly_record.get('timestamp', self._get_current_time_iso()),
+            'temperature': anomaly_record.get('temperature', None),
+            'humidity': anomaly_record.get('humidity', None),
+            'reason': 'Anomaly detected in temperature values'
+          })
+      
+      # Process humidity anomalies
+      humidity_anomalies = []
+      try:
+        for idx, [item] in enumerate(humidity_result):
+          # Convert to float and compare with threshold
+          prob_value = float(item)
+          if prob_value > self.cfg_anomaly_probability_threshold:
+            humidity_anomalies.append(idx)
+            self.P(f"ALERT: Humidity anomaly detected at index {idx} with probability {prob_value}", color='r')
+      except Exception as e:
+        self.P(f"Error processing humidity anomalies: {str(e)}", color='r')
+        
+      # Process detected humidity anomalies
+      for idx in humidity_anomalies:
+        if idx < len(self.__measurement_history):
+          # Check if this anomaly is not already reported from temperature
+          already_reported = False
+          for existing_anomaly in anomalies:
+            # Compare ISO format timestamps - direct string comparison should work
+            if existing_anomaly['timestamp'] == self.__measurement_history[idx].get('timestamp', self._get_current_time_iso()):
+              # Update reason for existing anomaly
+              existing_anomaly['reason'] = 'Anomaly detected in temperature and humidity values'
+              already_reported = True
+              break
           
-          # Find indices where values > ANOMALY_PROBABILITY_THRESHOLD
-          for idx, prob in enumerate(temp_probs):
-            prob_value = prob[0] if isinstance(prob, list) else prob
-            if prob_value > self.cfg_anomaly_probability_threshold:
-              temp_anomalies.append(idx)
-              self.P(f"ALERT: Temperature anomaly detected at index {idx} with probability {prob_value}", color='r')
-
-        # Process detected anomalies
-        for idx in temp_anomalies:
-          if idx < len(self.__measurement_history):
+          if not already_reported:
             anomaly_record = self.__measurement_history[idx]
             anomalies.append({
               'timestamp': anomaly_record.get('timestamp', self._get_current_time_iso()),
               'temperature': anomaly_record.get('temperature', None),
               'humidity': anomaly_record.get('humidity', None),
-              'reason': 'Anomaly detected in temperature values'
+              'reason': 'Anomaly detected in humidity values'
             })
-      
-      # Process humidity anomalies
-      if humidity_result:
-        humidity_anomalies = []
-        # Check if result is a numpy array or nested list
-        if isinstance(humidity_result, list) or (hasattr(humidity_result, 'shape') and len(humidity_result.shape) > 0):
-          # Flatten if needed and process
-          humidity_probs = humidity_result
-          if hasattr(humidity_result, 'flatten'):
-            humidity_probs = humidity_result.flatten()
-          
-          # Find indices where values > 0.8
-          for idx, prob in enumerate(humidity_probs):
-            prob_value = prob[0] if isinstance(prob, list) else prob
-            if prob_value > 0.8:
-              humidity_anomalies.append(idx)
-              self.P(f"ALERT: Humidity anomaly detected at index {idx} with probability {prob_value}", color='r')
-
-        # Process detected anomalies
-        for idx in humidity_anomalies:
-          if idx < len(self.__measurement_history):
-            # Check if this anomaly is not already reported from temperature
-            already_reported = False
-            for existing_anomaly in anomalies:
-              # Compare ISO format timestamps - direct string comparison should work
-              if existing_anomaly['timestamp'] == self.__measurement_history[idx].get('timestamp', self._get_current_time_iso()):
-                # Update reason for existing anomaly
-                existing_anomaly['reason'] = 'Anomaly detected in temperature and humidity values'
-                already_reported = True
-                break
-            
-            if not already_reported:
-              anomaly_record = self.__measurement_history[idx]
-              anomalies.append({
-                'timestamp': anomaly_record.get('timestamp', self._get_current_time_iso()),
-                'temperature': anomaly_record.get('temperature', None),
-                'humidity': anomaly_record.get('humidity', None),
-                'reason': 'Anomaly detected in humidity values'
-              })
       
       self.P(f"Detected {len(anomalies)} anomalies in temperature and humidity data")
       return anomalies
