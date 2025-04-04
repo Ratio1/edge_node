@@ -31,18 +31,22 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     self.P("Running post-init setup")
     # Dict with url -> answer, done
     self.request_data = {}
+    self._home_security_events = {}
+    self._last_home_security_ping = 0
     self.my_id = f'r1:aiho{self.ee_id}'
     return
 
   @FastApiWebAppPlugin.endpoint(method="post")
-  def new_home_security_event(self, propertyId: int, base64img: str):
+  def new_home_security_event(self, propertyId: int, base64img: str, isAlert: bool):
     self.P(f"new_home_security_event")
+    self._last_home_security_ping = int(self.time())
     if propertyId not in self._home_security_events:
-      self._home_security_events[propertyId] = []
-    self._home_security_events[propertyId].append({
-      "timestamp": int(self.time()),
-      "base64img": base64img,
-    })
+        self._home_security_events[propertyId] = []
+    if isAlert:
+        self._home_security_events[propertyId].append({
+            "timestamp": int(self.time()),
+            "base64img": base64img,
+        })
     return {
       "status": "ok",
       "length": len(self._home_security_events[propertyId]),
@@ -62,6 +66,7 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     return {
       "status": "ok",
       "event": event,
+      "last_home_security_ping": self._last_home_security_ping,
     }
   
   @FastApiWebAppPlugin.endpoint
@@ -69,17 +74,12 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     self.P(f"get_last_home_security_event")
     if propertyId not in self._home_security_events:
       self._home_security_events[propertyId] = []
-    if len(self._home_security_events[propertyId]) == 0:
-      return {
-        "status": "no_event",
-        "event": None,
-      }
     if nEvents > len(self._home_security_events[propertyId]):
       nEvents = len(self._home_security_events[propertyId])
-    events = self._home_security_events[propertyId][-nEvents:]
     return {
       "status": "ok",
-      "events": events,
+      "events": self._home_security_events[propertyId][-nEvents:],
+      "last_home_security_ping": self._last_home_security_ping,
     }
   
   # R1FS
@@ -90,7 +90,7 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     if propertyId not in self._property_documents:
       self._property_documents[propertyId] = []
     fn = self.diskapi_save_bytes_to_output(data=base64document, filename=fileName, from_base64=True)
-    self.P(f"new_property_document : {fn}")
+    self.P(f"new_property_document: {fn}")
     cid = self.r1fs.add_file(fn)
     self.P(f"new_property_document cid : {cid}")
     self._property_documents[propertyId].append({
