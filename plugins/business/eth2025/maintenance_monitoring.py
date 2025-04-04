@@ -42,6 +42,8 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     self.__history_modified = False
     # Load measurement history from pickle file
     self._load_measurement_history(HISTORY_FILE_PATH)
+    
+    self._last_history_sent_time = None
     return
 
   def _get_current_time_iso(self):
@@ -304,6 +306,26 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       # Save updated history
       self._save_measurement_history()
 
+    # Send measurement history to AIHO every 60 seconds
+    current_time = self.time()
+    if self._last_history_sent_time is None or current_time - self._last_history_sent_time >= 60:
+      self.P("Sending measurement history to AIHO")
+      # Create request data with measurement history
+      history_data = {
+        'measurements': self.__measurement_history,
+        'timestamp': self._get_current_time_iso(),
+        'device_id': self.__pod_uid,
+        'propertyId': 1
+      }
+      # Send POST request with history data
+      try:
+        self.requests.post(url=self.cfg_aiho_history_url, json=history_data)
+        self.P(f"Sent {len(self.__measurement_history)} measurement records to {self.cfg_aiho_history_url}")
+        # Update last sent time
+        self._last_history_sent_time = current_time
+      except Exception as e:
+        self.P(f"Error sending measurement history to AIHO: {str(e)}", color='r')
+
     # Check for anomalies using the latest data
     anomalies = []
     if measurements and 'temperature' in measurements and 'humidity' in measurements:
@@ -319,11 +341,12 @@ class MaintenanceMonitoringPlugin(BasePlugin):
         request_data = {
           'anomalies': anomalies,
           'timestamp': self._get_current_time_iso(),
-          'device_id': self.__pod_uid
+          'device_id': self.__pod_uid,
+          'propertyId': 1
         }
         # Send POST request with anomalies data
         self.requests.post(url=self.cfg_aiho_anomalies_url, json=request_data)
-        self.P(f"Sent {len(anomalies)} anomalies to {self.cfg_aiho_url}")
+        self.P(f"Sent {len(anomalies)} anomalies to {self.cfg_aiho_anomalies_url}")
 
     payload = self._create_payload(
       measurements=measurements,
