@@ -90,30 +90,35 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
   # PREDICTIVE MAINTENANCE
 
   @FastApiWebAppPlugin.endpoint(method="post")
-  def new_predictive_maintenance_event(self, propertyId: int, temperature: int, humidity: int, reason_key: str):
+  def new_predictive_maintenance_event(self, propertyId: int, anomalies: list[dict]):
     self.P(f"new_predictive_maintenance_event")
     self._last_predictive_maintenance_ping = int(self.time())
     if propertyId not in self._predictive_maintenance_events:
         self._predictive_maintenance_events[propertyId] = []
-    if reason_key == "temperature":
-        self._predictive_maintenance_events[propertyId].append({
-            "timestamp": int(self.time()),
-            "temperature": temperature,
-        })
-    elif reason_key == "humidity":
-        self._predictive_maintenance_events[propertyId].append({
-            "timestamp": int(self.time()),
-            "humidity": humidity,
-        })
-    elif reason_key == "both":
-        self._predictive_maintenance_events[propertyId].append({
-            "timestamp": int(self.time()),
-            "temperature": temperature,
-        })
-        self._predictive_maintenance_events[propertyId].append({
-            "timestamp": int(self.time()),
-            "humidity": humidity,
-        })
+    for anomaly in anomalies:
+        reason_key = anomaly.get("reason_key")
+        temperature = anomaly.get("temperature")
+        humidity = anomaly.get("humidity")
+
+        if reason_key == "temperature":
+            self._predictive_maintenance_events[propertyId].append({
+                "timestamp": int(self.time()),
+                "temperature": temperature,
+            })
+        elif reason_key == "humidity":
+            self._predictive_maintenance_events[propertyId].append({
+                "timestamp": int(self.time()),
+                "humidity": humidity,
+            })
+        elif reason_key == "both":
+            self._predictive_maintenance_events[propertyId].append({
+                "timestamp": int(self.time()),
+                "temperature": temperature,
+            })
+            self._predictive_maintenance_events[propertyId].append({
+                "timestamp": int(self.time()),
+                "humidity": humidity,
+            })
     return {
       "status": "ok",
     }
@@ -124,7 +129,7 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     self._last_predictive_maintenance_ping = int(self.time())
     if propertyId not in self._predictive_maintenance_measurements:
         self._predictive_maintenance_measurements[propertyId] = []
-    self._predictive_maintenance_events[propertyId] = measurements
+    self._predictive_maintenance_measurements[propertyId] = measurements
     return {
       "status": "ok",
     }
