@@ -16,8 +16,6 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
   CONFIG = _CONFIG
 
   def __init__(self, **kwargs):
-    self._home_security_events = {}
-    self._property_documents = {}
     super(FastapiAihoPlugin, self).__init__(**kwargs)
     return
 
@@ -32,9 +30,15 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     # Dict with url -> answer, done
     self.request_data = {}
     self._home_security_events = {}
+    self._predictive_maintenance_events = {}
+    self._predictive_maintenance_measurements = {}
+    self._property_documents = {}
     self._last_home_security_ping = 0
+    self._last_predictive_maintenance_ping = 0
     self.my_id = f'r1:aiho{self.ee_id}'
     return
+  
+  # HOME SAFETY
 
   @FastApiWebAppPlugin.endpoint(method="post")
   def new_home_security_event(self, propertyId: int, base64img: str, isAlert: bool):
@@ -80,6 +84,71 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
       "status": "ok",
       "events": self._home_security_events[propertyId][-nEvents:],
       "last_home_security_ping": self._last_home_security_ping,
+    }
+  
+  
+  # PREDICTIVE MAINTENANCE
+
+  @FastApiWebAppPlugin.endpoint(method="post")
+  def new_predictive_maintenance_event(self, propertyId: int, temperature: int, humidity: int, reason_key: str):
+    self.P(f"new_predictive_maintenance_event")
+    self._last_predictive_maintenance_ping = int(self.time())
+    if propertyId not in self._predictive_maintenance_events:
+        self._predictive_maintenance_events[propertyId] = []
+    if reason_key == "temperature":
+        self._predictive_maintenance_events[propertyId].append({
+            "timestamp": int(self.time()),
+            "temperature": temperature,
+        })
+    elif reason_key == "humidity":
+        self._predictive_maintenance_events[propertyId].append({
+            "timestamp": int(self.time()),
+            "humidity": humidity,
+        })
+    elif reason_key == "both":
+        self._predictive_maintenance_events[propertyId].append({
+            "timestamp": int(self.time()),
+            "temperature": temperature,
+        })
+        self._predictive_maintenance_events[propertyId].append({
+            "timestamp": int(self.time()),
+            "humidity": humidity,
+        })
+    return {
+      "status": "ok",
+    }
+
+  @FastApiWebAppPlugin.endpoint(method="post")
+  def new_predictive_maintenance_measurements(self, propertyId: int, measurements: list[dict]):
+    self.P(f"new_predictive_maintenance_measurements")
+    self._last_predictive_maintenance_ping = int(self.time())
+    if propertyId not in self._predictive_maintenance_measurements:
+        self._predictive_maintenance_measurements[propertyId] = []
+    self._predictive_maintenance_events[propertyId] = measurements
+    return {
+      "status": "ok",
+    }
+  
+  @FastApiWebAppPlugin.endpoint
+  def get_predictive_maintenance_events(self, propertyId: int, nEvents: int):
+    self.P(f"get_predictive_maintenance_events")
+    if propertyId not in self._predictive_maintenance_events:
+      self._predictive_maintenance_events[propertyId] = []
+    if nEvents > len(self._predictive_maintenance_events[propertyId]):
+      nEvents = len(self._predictive_maintenance_events[propertyId])
+    return {
+      "status": "ok",
+      "events": self._predictive_maintenance_events[propertyId][-nEvents:],
+    }
+  
+  @FastApiWebAppPlugin.endpoint
+  def get_predictive_maintenance_measurements(self, propertyId: int):
+    self.P(f"get_predictive_maintenance_measurements")
+    if propertyId not in self._predictive_maintenance_measurements:
+      self._predictive_maintenance_measurements[propertyId] = []
+    return {
+      "status": "ok",
+      "measurements": self._predictive_maintenance_measurements[propertyId],
     }
   
   # R1FS
