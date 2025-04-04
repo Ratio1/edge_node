@@ -5,11 +5,20 @@ _CONFIG = {
   **BasePlugin.CONFIG,
   'PROCESS_DELAY': 0,
 
+  'ALERT_DATA_COUNT'              : 2,
+  "ALERT_RAISE_VALUE"             : 6/8,
+  "ALERT_LOWER_VALUE"             : 0,
+  'ALERT_RAISE_CONFIRMATION_TIME' : 15,
+  'ALERT_LOWER_CONFIRMATION_TIME' : 15,
+  "ALERT_MODE"                    : 'mean',
+
+
   "AI_ENGINE": "lowres_general_detector",
   "COLOR_TAGGING": True,
   "DEBUG_DETECTIONS": False,
-
   "OBJECT_TYPE": ["person"],
+  "TRACKING_ALIVE_TIME_ALERT": 15,
+
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES']
@@ -17,7 +26,7 @@ _CONFIG = {
 }
 
 
-class HomeCameraSecurityPlugin(BasePlugin):
+class HomeSafetyPlugin(BasePlugin):
   """
   Demo plugin for checking the video object detection.
   """
@@ -46,20 +55,26 @@ class HomeCameraSecurityPlugin(BasePlugin):
     return img
 
   def process(self):
+    self.P('!!!!!!!CAMERA PROCESSING!!!!!!!')
     instance_inferences = self.dataapi_image_instance_inferences()
 
-    payload_kwargs = {
-      "objects": instance_inferences,
-    }
+    # Check for objects with tracking time greater than alert threshold
+    self.P('Checking for objects with extended tracking time...')
+    self.P(instance_inferences)
+    if len(instance_inferences) > 0:
+      self.alerter_add_observation(1)
 
-    np_witness = self.get_witness_image(
-      draw_witness_image_kwargs={
-        "inferences": instance_inferences,
-      }
-    )
+    if self.alerter_is_new_raise() or self.alerter_is_new_lower():
+      is_alert = self.alerter_is_alert()
 
-    payload_kwargs["img"] = np_witness
-    # endif demo_mode
-    # The timestamp will be added to the payload in the base plugin.
-    payload = self._create_payload(**payload_kwargs)
-    return payload
+      np_witness = self.get_witness_image(
+        draw_witness_image_kwargs={
+          "inferences": instance_inferences,
+        }
+      )
+      base64_img = self.img_to_base64(np_witness)
+      self.requests.post('')
+      # send request image & is_alert
+
+
+
