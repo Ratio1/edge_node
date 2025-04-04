@@ -40,9 +40,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     self.__measurement_history = []
     # Flag to track if history has been modified
     self.__history_modified = False
-    # Load measurement history from pickle file
-    self._load_measurement_history(HISTORY_FILE_PATH)
-    
+
     self._last_history_sent_time = None
     return
 
@@ -97,43 +95,6 @@ class MaintenanceMonitoringPlugin(BasePlugin):
       return time_value
 
     return self.datetime.now().isoformat()
-
-  def _load_measurement_history(self, file_path):
-    """Generic function to load data from pickle file"""
-    try:
-      data = self.diskapi_load_pickle_from_data(file_path)
-      if data:
-        # Ensure timestamps are in ISO format
-        for measurement in data:
-          if 'timestamp' in measurement:
-            # If timestamp is not a string (ISO format), convert it
-            if not isinstance(measurement['timestamp'], str):
-              # Convert to ISO string
-              measurement['timestamp'] = self._create_iso_timestamp_from_time(measurement['timestamp'])
-            # Handle Z timezone notation
-            elif measurement['timestamp'].endswith('Z'):
-              measurement['timestamp'] = measurement['timestamp'].replace('Z', '+00:00')
-
-        self.__measurement_history = data
-        self.P(f"Loaded {len(data)} records from {file_path}")
-      else:
-        self.P(f"No file found at {file_path}, starting with empty data")
-    except Exception as e:
-      self.P(f"Error loading data from {file_path}: {str(e)}", color='r')
-      # Keep the default empty list in case of error
-
-  def _save_measurement_history(self):
-    """Save measurement history to pickle file if modified"""
-    if not self.__history_modified:
-      return
-
-    try:
-      # Save data to file
-      self.diskapi_save_pickle_to_data(self.__measurement_history, HISTORY_FILE_PATH)
-      self.P(f"Saved {len(self.__measurement_history)} records to {HISTORY_FILE_PATH}")
-      self.__history_modified = False
-    except Exception as e:
-      self.P(f"Error saving data to {HISTORY_FILE_PATH}: {str(e)}", color='r')
 
   def _prune_old_measurements(self):
     """Remove measurements older than the history time window"""
@@ -303,8 +264,6 @@ class MaintenanceMonitoringPlugin(BasePlugin):
     if measurements:
       # Add measurements to history
       self._add_measurement_to_history(measurements)
-      # Save updated history
-      self._save_measurement_history()
 
     # Send measurement history to AIHO every 60 seconds
     current_time = self.time()
