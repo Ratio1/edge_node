@@ -4,8 +4,7 @@ _CONFIG = {
 
   **DataCaptureThread.CONFIG,
 
-  "PROCESS_DELAY": 40,
-
+  "CAP_RESOLUTION": 0.033,  # Run every 30 seconds
   "SENSIBO_API_KEY": "8F8dpe6w3bYbE2cfucSwxRJd6dczL0",
   "SENSIBO_DEVICE_NAME": "R1 Sensibo",
   "SENSIBO_POD_UID": "Zxcm5pQX",  # If provided, will use this instead of looking up by device name
@@ -23,6 +22,7 @@ class SensiboMaintenanceSensorDataCapture(DataCaptureThread):
 
   def __init__(self, **kwargs):
     super(SensiboMaintenanceSensorDataCapture, self).__init__(**kwargs)
+    self._last_acquisition_time = None
     return
 
   def startup(self):
@@ -82,7 +82,17 @@ class SensiboMaintenanceSensorDataCapture(DataCaptureThread):
     return res[-1]
 
   def _run_data_aquisition_step(self):  # MANDATORY
+    current_time = self.datetime.now()
+    
+    # Check if 30 seconds have elapsed since the last acquisition
+    if self._last_acquisition_time is not None:
+      elapsed_seconds = (current_time - self._last_acquisition_time).total_seconds()
+      if elapsed_seconds < 30:
+        self.P(f"Skipping data acquisition, only {elapsed_seconds:.1f} seconds elapsed (< 30s required)")
+        return
+    
     _obs = self.__get_data_from_sensibo()
+    self._last_acquisition_time = current_time
 
     self._add_inputs(
       [
