@@ -6,8 +6,8 @@ _CONFIG = {
   'PROCESS_DELAY': 0,
 
   'ALERT_DATA_COUNT'              : 2,
-  "ALERT_RAISE_VALUE"             : 6/8,
-  "ALERT_LOWER_VALUE"             : 0,
+  "ALERT_RAISE_VALUE"             : 0.75,
+  "ALERT_LOWER_VALUE"             : 0.25,
   'ALERT_RAISE_CONFIRMATION_TIME' : 15,
   'ALERT_LOWER_CONFIRMATION_TIME' : 15,
   "ALERT_MODE"                    : 'mean',
@@ -16,6 +16,8 @@ _CONFIG = {
   "COLOR_TAGGING": True,
   "DEBUG_DETECTIONS": False,
   "OBJECT_TYPE": ["person"],
+  "CONFIDENCE_THRESHOLD": 0.4,
+
   "TRACKING_ALIVE_TIME_ALERT": 15,
 
   "AIHO_URL": "https://api.aiho.ai/new_home_security_event",
@@ -54,7 +56,6 @@ class HomeSafetyPlugin(BasePlugin):
     return img
 
   def process(self):
-    self.P('!!!!!!!CAMERA PROCESSING!!!!!!!')
     instance_inferences = self.dataapi_image_instance_inferences()
 
     # Check for objects with tracking time greater than alert threshold
@@ -62,6 +63,8 @@ class HomeSafetyPlugin(BasePlugin):
     self.P(instance_inferences)
     if len(instance_inferences) > 0:
       self.alerter_add_observation(1)
+    else:
+      self.alerter_add_observation(0)
 
     if self.alerter_is_new_raise() or self.alerter_is_new_lower():
       is_alert = self.alerter_is_alert()
@@ -77,5 +80,10 @@ class HomeSafetyPlugin(BasePlugin):
         "base64img": base64_img,
         "isAlert": is_alert,
       }
+      self.P("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!ALERT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+      self.P("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!ALERT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
+      self.P(request)
+
       self.requests.post(url=self.cfg_aiho_url, json=request)
+      self.alerter_maybe_force_lower()
 
