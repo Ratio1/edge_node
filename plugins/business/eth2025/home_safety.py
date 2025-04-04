@@ -12,12 +12,13 @@ _CONFIG = {
   'ALERT_LOWER_CONFIRMATION_TIME' : 15,
   "ALERT_MODE"                    : 'mean',
 
-
   "AI_ENGINE": "lowres_general_detector",
   "COLOR_TAGGING": True,
   "DEBUG_DETECTIONS": False,
   "OBJECT_TYPE": ["person"],
   "TRACKING_ALIVE_TIME_ALERT": 15,
+
+  "AIHO_URL": "https://api.aiho.ai/new_home_security_event",
 
 
   'VALIDATION_RULES': {
@@ -39,8 +40,6 @@ class HomeSafetyPlugin(BasePlugin):
       box_tlbr = inference[self.consts.TLBR_POS]
       lbl = inference[self.consts.TYPE]
       lbl += f" | {inference.get(self.consts.COLOR_TAG)}"
-      if self.consts.COLOR_TAG_MEDIAN in inference:
-        lbl += f" | {inference[self.consts.COLOR_TAG_MEDIAN]}"
 
       img = self._painter.draw_detection_box(
         image=img,
@@ -73,8 +72,10 @@ class HomeSafetyPlugin(BasePlugin):
         }
       )
       base64_img = self.img_to_base64(np_witness)
-      self.requests.post('')
-      # send request image & is_alert
-
-
+      request = {
+        "propertyId": 1,
+        "base64img": base64_img,
+        "isAlert": is_alert,
+      }
+      self.requests.post(url=self.cfg_aiho_url, json=request)
 
