@@ -1,6 +1,6 @@
 """
 
-The EpochManager01Plugin is a FastAPI web app that provides endpoints to interact with the
+The OracleApiPlugin is a FastAPI web app that provides endpoints to interact with the
 oracle network of the Naeural Edge Protocol
 
 Each request will generate data as follows:
@@ -8,6 +8,25 @@ Each request will generate data as follows:
 - the data is signed with EVM signature and signature/address is added
 - other oracle peers signatures are added - all must be on same agreed availability
 - package is node-signed and returned to the client
+
+
+Overall serving algorithm:
+
+1. OracleManager.can_serve = false
+2. OracleAPI waits on_init for OracleManager.can_serve
+3. OracleSync:
+3.1. If UP_TO_DATE:
+3.1.1. OracleManager.can_serve = true
+3.2. If NOT UP_TO_DATE:
+3.2.1. WAIT for R1FS
+3.2.2. Perform sync
+3.2.3. OracleManager.can_serve = true
+
+Assumptions:
+- OracleSync uses get_file(timeout=0.1) to get the file, 2 retries, 2 sec delay even
+  if the R1FS is warmed up
+- UP_TO_DATE == true assumes that the last synced epoch is the last epoch so the
+  OracleManager can provide the full history to OracleAPI
 
 """
 
@@ -26,7 +45,7 @@ _CONFIG = {
 }
 
 
-class EpochManager01Plugin(BasePlugin):
+class OracleApiPlugin(BasePlugin):
   """
   This plugin is a FastAPI web app that provides endpoints to interact with the
   EpochManager of the Neural Core.
@@ -34,12 +53,12 @@ class EpochManager01Plugin(BasePlugin):
   CONFIG = _CONFIG
 
   def __init__(self, **kwargs):
-    super(EpochManager01Plugin, self).__init__(**kwargs)
+    super(OracleApiPlugin, self).__init__(**kwargs)
     return
   
 
   def on_init(self):
-    super(EpochManager01Plugin, self).on_init()
+    super(OracleApiPlugin, self).on_init()
     my_address = self.bc.address
     current_epoch = self.__get_current_epoch()
     start_epoch = current_epoch - 6
@@ -55,6 +74,7 @@ class EpochManager01Plugin(BasePlugin):
     self.P("Started {} plugin in epoch {}. Local node info:\n{}".format(
       self.__class__.__name__, current_epoch, self.json_dumps(my_node_info, indent=2))
     )
+    # TODO: Bleo lock it until we `can_serve` it
     return
 
 
