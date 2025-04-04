@@ -13,8 +13,7 @@ _CONFIG = {
   'PROCESS_DELAY': 30,
   'ALLOW_EMPTY_INPUTS': False,
 
-  'ANOMALY_PROBABILITY_THRESHOLD': 0.1,
-  # 'ANOMALY_PROBABILITY_THRESHOLD': 0.8,
+  'ANOMALY_PROBABILITY_THRESHOLD': 0.8,
 
   "AIHO_ANOMALIES_URL": "https://api.aiho.ai/new_predictive_maintenance_event",
   "AIHO_HISTORY_URL": "https://api.aiho.ai/new_predictive_maintenance_measurements",
