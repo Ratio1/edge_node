@@ -12,16 +12,16 @@ _CONFIG = {
   'ALERT_LOWER_CONFIRMATION_TIME' : 15,
   "ALERT_MODE"                    : 'mean',
 
+  'LIVE_FEED': True,
   "AI_ENGINE": "lowres_general_detector",
   "COLOR_TAGGING": True,
   "DEBUG_DETECTIONS": False,
   "OBJECT_TYPE": ["person"],
-  "CONFIDENCE_THRESHOLD": 0.4,
-
-  "TRACKING_ALIVE_TIME_ALERT": 15,
+  "CONFIDENCE_THRESHOLD": 0.3,
+  # "POINTS": [[], [], [], []], # RULE: the last point === the first point || Top Left & Bottom Right
+  "DEBUGGING_MODE": False,
 
   "AIHO_URL": "https://api.aiho.ai/new_home_security_event",
-
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES']
@@ -65,8 +65,14 @@ class HomeSafetyPlugin(BasePlugin):
     else:
       self.alerter_add_observation(0)
 
-    if self.alerter_is_new_raise() or self.alerter_is_new_lower():
-      is_alert = self.alerter_is_new_raise()
+    is_new_raise = self.alerter_is_new_raise()
+    is_new_lower = self.alerter_is_new_lower()
+    is_alert = self.alerter_is_alert()
+
+    self.P(f"is_new_raise: {is_new_raise} | is_new_lower: {is_new_lower} | is_alert: {is_alert}")
+
+    if is_new_raise or is_new_lower:
+      is_alert = self.alerter_is_alert()
 
       np_witness = self.get_witness_image(
         draw_witness_image_kwargs={
@@ -79,10 +85,5 @@ class HomeSafetyPlugin(BasePlugin):
         "base64img": base64_img,
         "isAlert": is_alert,
       }
-      self.P("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!ALERT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-      self.P("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!ALERT!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-      self.P(request)
-
       self.requests.post(url=self.cfg_aiho_url, json=request)
-      self.alerter_maybe_force_lower()
 
