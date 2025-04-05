@@ -17,6 +17,7 @@ _CONFIG = {
 
   "AIHO_ANOMALIES_URL": "https://api.aiho.ai/new_predictive_maintenance_event",
   "AIHO_HISTORY_URL": "https://api.aiho.ai/new_predictive_maintenance_measurements",
+  "DEBUGGING_MODE": False,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -191,6 +192,36 @@ class MaintenanceMonitoringPlugin(BasePlugin):
         proba=True
       )
 
+      # Debug output with better formatting
+      if self.cfg_debugging_mode:
+        self.P('--- DEBUGGING INFORMATION ---')
+        
+        self.P(f"anomaly_probability_threshold: {self.cfg_anomaly_probability_threshold}")
+
+        self.P('Temperature anomaly probabilities:')
+        # Format numpy array for better readability
+        temp_formatted = []
+        for i, p in enumerate(temp_result):
+          temp_formatted.append(f"Index {i}: {float(p[0]):.4f}")
+        self.P(' | '.join(temp_formatted))
+        
+        self.P("\nHumidity anomaly probabilities:")
+        # Format numpy array for better readability
+        humidity_formatted = []
+        for i, p in enumerate(humidity_result):
+          humidity_formatted.append(f"Index {i}: {float(p[0]):.4f}")
+        self.P(' | '.join(humidity_formatted))
+        
+        self.P("\nMeasurement history data:")
+        # Format the measurement history for better readability
+        for i, measurement in enumerate(self.__measurement_history):
+          timestamp = measurement.get('timestamp', 'N/A')
+          temp = measurement.get('temperature', 'N/A')
+          humid = measurement.get('humidity', 'N/A')
+          self.P(f"Record {i}: Time={timestamp}, Temp={temp}, Humidity={humid}")
+        
+        self.P('--- END DEBUGGING INFORMATION ---')
+
       # Set ISO format timestamp
       res['read_time'] = dt.isoformat()
 
@@ -205,7 +236,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
         for idx, [item] in enumerate(temp_result):
           # Convert to float and compare with threshold
           prob_value = float(item)
-          if prob_value > self.cfg_anomaly_probability_threshold:
+          if prob_value >= self.cfg_anomaly_probability_threshold:
             temp_anomalies.append(idx)
             self.P(f"ALERT: Temperature anomaly detected at index {idx} with probability {prob_value}", color='r')
       except Exception as e:
@@ -224,27 +255,38 @@ class MaintenanceMonitoringPlugin(BasePlugin):
 
       # Process humidity anomalies
       humidity_anomalies = []
-      # Process detected humidity anomalies
-      for idx in humidity_anomalies:
-        if idx < len(self.__measurement_history):
-          # Check if this anomaly is not already reported from temperature
-          already_reported = False
-          for existing_anomaly in anomalies:
-            # Compare ISO format timestamps - direct string comparison should work
-            if existing_anomaly['timestamp'] == self.__measurement_history[idx].get('read_time', self._get_current_time_iso()):
-              # Update reason for existing anomaly
-              existing_anomaly['reason_key'] = 'both' # both temperature and humidity
-              already_reported = True
-              break
+      if humidity_result:
+        try:
+          for idx, [item] in enumerate(humidity_result):
+            # Convert to float and compare with threshold
+            prob_value = float(item)
+            if prob_value >= self.cfg_anomaly_probability_threshold:
+              humidity_anomalies.append(idx)
+              self.P(f"ALERT: Humidity anomaly detected at index {idx} with probability {prob_value}", color='r')
+        except Exception as e:
+          self.P(f"Error processing humidity anomalies: {str(e)}", color='r')
+        
+        # Process detected humidity anomalies
+        for idx in humidity_anomalies:
+          if idx < len(self.__measurement_history):
+            # Check if this anomaly is not already reported from temperature
+            already_reported = False
+            for existing_anomaly in anomalies:
+              # Compare ISO format timestamps - direct string comparison should work
+              if existing_anomaly['timestamp'] == self.__measurement_history[idx].get('timestamp', self._get_current_time_iso()):
+                # Update reason for existing anomaly
+                existing_anomaly['reason_key'] = 'both' # both temperature and humidity
+                already_reported = True
+                break
 
-          if not already_reported:
-            anomaly_record = self.__measurement_history[idx]
-            anomalies.append({
-              'timestamp': anomaly_record.get('timestamp', self._get_current_time_iso()),
-              'temperature': anomaly_record.get('temperature', None),
-              'humidity': anomaly_record.get('humidity', None),
-              'reason_key': 'humidity'
-            })
+            if not already_reported:
+              anomaly_record = self.__measurement_history[idx]
+              anomalies.append({
+                'timestamp': anomaly_record.get('timestamp', self._get_current_time_iso()),
+                'temperature': anomaly_record.get('temperature', None),
+                'humidity': anomaly_record.get('humidity', None),
+                'reason_key': 'humidity'
+              })
 
       self.P(f"Detected {len(anomalies)} anomalies in temperature and humidity data")
       return anomalies
