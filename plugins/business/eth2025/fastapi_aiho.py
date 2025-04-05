@@ -29,10 +29,10 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     self.P("Running post-init setup")
     # Dict with url -> answer, done
     self.request_data = {}
-    self._home_security_events = {}
-    self._predictive_maintenance_events = {}
-    self._predictive_maintenance_measurements = {}
-    self._property_documents = {}
+    self._home_security_events = self.diskapi_load_pickle_from_data("aiho_home_security_events.pkl")
+    self._predictive_maintenance_events = self.diskapi_load_pickle_from_data("aiho_predictive_maintenance_events.pkl")
+    self._predictive_maintenance_measurements = self.diskapi_load_pickle_from_data("aiho_predictive_maintenance_measurements.pkl")
+    self._property_documents = self.diskapi_load_pickle_from_data("aiho_property_documents.pkl")
     self._last_home_security_ping = 0
     self._last_predictive_maintenance_ping = 0
     self.my_id = f'r1:aiho{self.ee_id}'
@@ -51,6 +51,7 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
             "timestamp": int(self.time()),
             "base64img": base64img,
         })
+    self.diskapi_save_pickle_to_data(self._home_security_events, "aiho_home_security_events.pkl")
     return {
       "status": "ok",
       "length": len(self._home_security_events[propertyId]),
@@ -119,6 +120,8 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
                 "timestamp": int(self.time()),
                 "humidity": humidity,
             })
+
+    self.diskapi_save_pickle_to_data(self._predictive_maintenance_events, "aiho_predictive_maintenance_events.pkl")
     return {
       "status": "ok",
     }
@@ -130,6 +133,7 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     if propertyId not in self._predictive_maintenance_measurements:
         self._predictive_maintenance_measurements[propertyId] = []
     self._predictive_maintenance_measurements[propertyId] = measurements
+    self.diskapi_save_pickle_to_data(self._predictive_maintenance_measurements, "aiho_predictive_maintenance_measurements.pkl")
     return {
       "status": "ok",
     }
@@ -172,6 +176,7 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
       "fileName": fileName,
       "cid": cid,
     })
+    self.diskapi_save_pickle_to_data(self._property_documents, "aiho_property_documents.pkl")
     return {
       "status": "ok",
     }
