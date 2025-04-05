@@ -30,9 +30,17 @@ class FastapiAihoPlugin(FastApiWebAppPlugin):
     # Dict with url -> answer, done
     self.request_data = {}
     self._home_security_events = self.diskapi_load_pickle_from_data("aiho_home_security_events.pkl")
+    if self._home_security_events is None:
+        self._home_security_events = {}
     self._predictive_maintenance_events = self.diskapi_load_pickle_from_data("aiho_predictive_maintenance_events.pkl")
+    if self._predictive_maintenance_events is None:
+        self._predictive_maintenance_events = {}
     self._predictive_maintenance_measurements = self.diskapi_load_pickle_from_data("aiho_predictive_maintenance_measurements.pkl")
+    if self._predictive_maintenance_measurements is None:
+        self._predictive_maintenance_measurements = {}
     self._property_documents = self.diskapi_load_pickle_from_data("aiho_property_documents.pkl")
+    if self._property_documents is None:
+        self._property_documents = {}
     self._last_home_security_ping = 0
     self._last_predictive_maintenance_ping = 0
     self.my_id = f'r1:aiho{self.ee_id}'
