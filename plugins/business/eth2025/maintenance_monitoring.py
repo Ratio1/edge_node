@@ -232,15 +232,16 @@ class MaintenanceMonitoringPlugin(BasePlugin):
 
       # Process temperature anomalies
       temp_anomalies = []
-      try:
-        for idx, [item] in enumerate(temp_result):
-          # Convert to float and compare with threshold
-          prob_value = float(item)
-          if prob_value >= self.cfg_anomaly_probability_threshold:
-            temp_anomalies.append(idx)
-            self.P(f"ALERT: Temperature anomaly detected at index {idx} with probability {prob_value}", color='r')
-      except Exception as e:
-        self.P(f"Error processing temperature anomalies: {str(e)}", color='r')
+      if temp_result is not None and len(temp_result) > 0:
+        try:
+          for idx, [item] in enumerate(temp_result):
+            # Convert to float and compare with threshold
+            prob_value = float(item)
+            if prob_value >= self.cfg_anomaly_probability_threshold:
+              temp_anomalies.append(idx)
+              self.P(f"ALERT: Temperature anomaly detected at index {idx} with probability {prob_value}", color='r')
+        except Exception as e:
+          self.P(f"Error processing temperature anomalies: {str(e)}", color='r')
 
       # Process detected temperature anomalies
       for idx in temp_anomalies:
@@ -255,7 +256,7 @@ class MaintenanceMonitoringPlugin(BasePlugin):
 
       # Process humidity anomalies
       humidity_anomalies = []
-      if humidity_result:
+      if humidity_result is not None and len(humidity_result) > 0:
         try:
           for idx, [item] in enumerate(humidity_result):
             # Convert to float and compare with threshold
