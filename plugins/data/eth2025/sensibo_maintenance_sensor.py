@@ -81,7 +81,7 @@ class SensiboMaintenanceSensorDataCapture(DataCaptureThread):
     res = self.__get_measurement(self._uid)
     return res[-1]
 
-  def _run_data_aquisition_step(self):  # MANDATORY
+  def _run_data_acquisition_step(self):  # MANDATORY
     current_time = self.datetime.now()
     
     # Check if 30 seconds have elapsed since the last acquisition
