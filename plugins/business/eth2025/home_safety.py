@@ -67,9 +67,6 @@ class HomeSafetyPlugin(BasePlugin):
 
     is_new_raise = self.alerter_is_new_raise()
     is_new_lower = self.alerter_is_new_lower()
-    is_alert = self.alerter_is_alert()
-
-    self.P(f"is_new_raise: {is_new_raise} | is_new_lower: {is_new_lower} | is_alert: {is_alert}")
 
     if is_new_raise or is_new_lower:
       is_alert = self.alerter_is_alert()
