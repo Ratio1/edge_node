@@ -85,7 +85,8 @@ class ContainerAppRunnerPlugin(
     - Runs the container with optional CPU and memory constraints.
     - Captures logs in real-time using the LogReader class.
     - Stores logs to disk upon plugin close using diskapi_save_pickle_to_output.
-    - Supports a restart policy: "finish", "restart", or "pull-and-restart".
+    - Supports a restart policy: "always" or ... not
+    - Supports pull policy: "always" or ... not
   """
 
   CONFIG = _CONFIG
