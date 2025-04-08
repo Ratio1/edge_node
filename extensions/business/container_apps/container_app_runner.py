@@ -168,9 +168,10 @@ class ContainerAppRunnerPlugin(
     ]
 
     # Resource limits
-    if self.cfg_cpu_limit:
+    if self._cpu_limit:
       cmd += ["--cpus", str(self._cpu_limit)]
-    if self.cfg_mem_limit:
+      
+    if self._mem_limit:
       cmd += ["--memory", str(self._mem_limit)]
 
     # Port mapping if we have a host port
