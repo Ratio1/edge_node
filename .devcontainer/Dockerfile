@@ -1,4 +1,4 @@
-FROM aidamian/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3
+FROM ratio1/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-d
 
 # Install IPFS
 RUN apt-get update && apt-get install -y wget && apt-get install -y tar
