@@ -79,18 +79,19 @@ class ContainerAppRunnerPlugin(
     """
     msg = "Container info:\n"
     msg += f"  Container ID: {self.container_id}\n"
-    msg += f"  CPU: {self._cpu_limit} cores\n"
-    msg += f"  GPU: {self._gpu_limit} cores\n"
-    msg += f"  Memory: {self._mem_limit}\n"
-    msg += f"  Image: {self.cfg_image}\n"
-    msg += f"  Registry: {self.cfg_cr}\n"
-    msg += f"  Registry User: {self.cfg_cr_user}\n"
-    msg += f"  Registry Password: {'*' * len(self.cfg_cr_password) if self.cfg_cr_password else 'None'}\n"
-    msg += f"  Environment Variables: {self.cfg_env}\n"
-    msg += f"  Port: {self.cfg_port}\n"
-    msg += f"  Restart Policy: {self.cfg_restart_policy}\n"
-    msg += f"  Host Port: {self._host_port}\n"
-    msg += f"  CLI Tool: {self.cli_tool}\n"
+    msg += f"  Start Time:   {self.time_to_str(self.container_start_time)}\n"
+    msg += f"  Resource CPU: {self._cpu_limit} cores\n"
+    msg += f"  Resource GPU: {self._gpu_limit} cores\n"
+    msg += f"  Resource Mem: {self._mem_limit}\n"
+    msg += f"  Target Image: {self.cfg_image}\n"
+    msg += f"  CR:           {self.cfg_cr}\n"
+    msg += f"  CR User:      {self.cfg_cr_user}\n"
+    msg += f"  CR Pass:      {'*' * len(self.cfg_cr_password) if self.cfg_cr_password else 'None'}\n"
+    msg += f"  Env Vars:     {self.cfg_env}\n"
+    msg += f"  Cont. Port:   {self.cfg_port}\n"
+    msg += f"  Restart:      {self.cfg_restart_policy}\n"
+    msg += f"  Host Port:    {self._host_port}\n"
+    msg += f"  CLI Tool:     {self.cli_tool}\n"
     self.P(msg)
     return
   
@@ -155,6 +156,7 @@ class ContainerAppRunnerPlugin(
       raise RuntimeError(f"Error starting container: {err}")
 
     self.container_id = res.stdout.decode("utf-8").strip()
+    self.container_start_time = time.time()
     return self.container_id
 
 
@@ -183,7 +185,8 @@ class ContainerAppRunnerPlugin(
       err = res.stderr.decode("utf-8", errors="ignore")
       self.P(f"Error stopping container {cid}: {err}", color='r')
     else:
-      self.P(f"Container {cid} stopped successfully.")        
+      self.P(f"Container {cid} stopped successfully.")       
+    return 
 
 
   def start_capture_container_logs(self):
@@ -389,18 +392,16 @@ class ContainerAppRunnerPlugin(
 
     # Stop ngrok if needed
     self.maybe_stop_ngrok()
+    
+    # TODO: check if the log process is running and kill it
 
     # Save logs to disk
     # We'll store them in a single structure: a list of lines from dct_logs or so
     # We can do: logs, err_logs = self._get_delta_logs() or a custom approach
-    all_logs = {
-      "stdout": self.logs,
-      "stderr": self.err_logs
-    }
     try:
       # using parent class method to save logs
       self.diskapi_save_pickle_to_output(
-        obj=all_logs, filename="container_logs.pkl"
+        obj=self.__container_log, filename="container_logs.pkl"
       )
       self.P("Container logs saved to disk.")
     except Exception as exc:
