@@ -5,9 +5,9 @@ _CONFIG = {
   **DataCaptureThread.CONFIG,
 
   "CAP_RESOLUTION": 0.003,
-  "SENSIBO_API_KEY": "8F8dpe6w3bYbE2cfucSwxRJd6dczL0",
+  "SENSIBO_API_KEY": "",
   "SENSIBO_DEVICE_NAME": "R1 Sensibo",
-  "SENSIBO_POD_UID": "Zxcm5pQX",  # If provided, will use this instead of looking up by device name
+  "SENSIBO_POD_UID": "",  # If provided, will use this instead of looking up by device name
 
   'VALIDATION_RULES': {
     **DataCaptureThread.CONFIG['VALIDATION_RULES'],
