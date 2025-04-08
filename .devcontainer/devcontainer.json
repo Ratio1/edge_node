@@ -3,15 +3,18 @@
   "dockerFile" : "Dockerfile",
   // "image": "aidamian/ds101_2024",
 
+
+  
   "runArgs": [
     //"--gpus=all", // Use this option if you have a GPU
     "--hostname",
     "edge_dev",
     
     "--name",
-    "r1_edge_devenv"    
-  ],  
+    "r1_edge_devenv",
 
+    "--privileged"
+  ],  
   
   "customizations": {
     "vscode" : {
