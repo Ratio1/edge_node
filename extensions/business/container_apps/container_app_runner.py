@@ -147,12 +147,12 @@ class ContainerAppRunnerPlugin(
       full_ref = f"{self.cfg_cr.rstrip('/')}/{self.cfg_image}"
       cmd = [self.cli_tool, "pull", full_ref]
     self.P(f"Pulling image {full_ref} ...")
-    result = subprocess.check_output(cmd)
-    if result.returncode != 0:
-      err = result.stderr.decode("utf-8", errors="ignore")
-      raise RuntimeError(f"Error pulling image: {err}")
+    try:
+      result = subprocess.check_output(cmd)
+    except Exception as exc:
+      raise RuntimeError(f"Error pulling image: {exc}")
     #end if result
-    self.P(f"Image {full_ref} pulled successfull: {result}")
+    self.P(f"Image {full_ref} pulled successfull: {result.decode('utf-8', errors='ignore')}")
     return
   
 
