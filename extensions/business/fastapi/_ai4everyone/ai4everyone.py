@@ -319,7 +319,7 @@ class AI4EveryonePlugin(BasePlugin):
       return None
 
     @BasePlugin.endpoint(method="post")
-    def vote(self, job_id: str, filename: str, label: dict):
+    def vote(self, job_id: str, filename: str, label: str):
       if job_id in self.jobs_data:
         success, result = self.jobs_data[job_id].send_vote(filename=filename, label=label)
         return result if success else None
