@@ -89,7 +89,7 @@ class R1fsDemoPlugin(BasePlugin):
     self.__start_time = self.time() # start time of the plugin
     self.__r1fs_demo_iter = 0 # iteration counter
     self.P(f"Starting R1fsDemoPlugin v{__VER__} with ID: {self.my_id}. Plugin instance will now wait for {self.cfg_initial_wait} sec")
-    self.last_logged = self.time() # last time we logged something
+    self._last_log_show_time = 0 # last time we logged something
     return
   
   def __save_some_data(self):
@@ -168,9 +168,9 @@ class R1fsDemoPlugin(BasePlugin):
 
   def process(self):
     if not self.r1fs.is_ipfs_warmed:
-      if self.time() < self.last_logged + 60: # log every 60 sec
+      if self.time() < self._last_log_show_time + 60: # log every 60 sec
         self.P(f"Waiting for R1FS to warm up. Time elapsed since plugin start {self.time() - self.__start_time} seconds.")
-        self.last_logged= self.time()
+        self._last_log_show_time= self.time()
       return
     self.__r1fs_demo_iter += 1
     self.P(f'R1fsDemoPlugin is processing iter #{self.__r1fs_demo_iter}')
