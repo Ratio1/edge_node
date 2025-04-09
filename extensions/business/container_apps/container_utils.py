@@ -145,7 +145,7 @@ class _ContainerUtilsMixin:
     self.container_log_proc = subprocess.Popen(log_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     # get the stdout of the `docker logs`` command
     # LogReader uses a separate thread to read the logs in chunks of size=50
-    self.container_logreader = self.LogReader(self, self.container_log_proc.stdout, size=50)
+    self.container_logreader = self.LogReader(self.container_log_proc.stdout, size=50)
     return
   
   def _container_maybe_stop_log_reader(self):    
