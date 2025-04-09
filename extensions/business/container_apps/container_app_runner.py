@@ -202,7 +202,7 @@ class ContainerAppRunnerPlugin(
     """
     self.P("Stopping container app ...")
     # Stop the container if it's running
-    if self.container_exists(self.container_id):
+    if self._container_exists(self.container_id):
       self.P("Stopping container ...")
       self._container_kill(self.container_id)
       self._container_maybe_stop_log_reader()
