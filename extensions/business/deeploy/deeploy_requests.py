@@ -26,11 +26,12 @@ DEEPLOY_CREATE_REQUEST = {
     "CR_USERNAME" : "user",
     "CR_PASSWORD" : "password",
     "CONTAINER_RESOURCES" : {
-      "cpu" : 1,
-      "memory" : 2,
+      "cpu" : 2,
+      "memory" : "512m",
       "gpu" : 0,
     },
     "PORT" : 5000,
+    "NGROK_EDGE_LABEL" : None,
     "ENV" : {
       "ENV1" : "value1",
       "ENV2" : "value2",
