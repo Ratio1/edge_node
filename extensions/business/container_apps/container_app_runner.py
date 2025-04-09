@@ -200,15 +200,19 @@ class ContainerAppRunnerPlugin(
     Ensures the log process is killed.
     Stops ngrok tunnel if started.
     """
-    
+    self.P("Stopping container app ...")
     # Stop the container if it's running
     if self.container_exists(self.container_id):
+      self.P("Stopping container ...")
       self._container_kill(self.container_id)
       self._container_maybe_stop_log_reader()
+      self.P("Container stopped.")
 
     # Stop ngrok if needed
+    self.P("Stopping ngrok tunnel ...")
     self.maybe_stop_ngrok()
-    
+    self.P("Ngrok tunnel stopped.")
+
     # Save logs to disk
     # We'll store them in a single structure: a list of lines from dct_logs or so
     # We can do: logs, err_logs = self._get_delta_logs() or a custom approach
