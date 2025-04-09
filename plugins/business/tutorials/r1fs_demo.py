@@ -70,8 +70,7 @@ _CONFIG = {
   **BasePlugin.CONFIG,
   # our overwritten props
   'PROCESS_DELAY' : 15,  
-  'INITIAL_WAIT'  : 15,
-  # due to the fact that we are using a "void" pipeline, 
+  # due to the fact that we are using a "void" pipeline,
   # we need to allow empty inputs as we are not getting any 
   # data from the pipeline
   'ALLOW_EMPTY_INPUTS': True, 
@@ -90,6 +89,7 @@ class R1fsDemoPlugin(BasePlugin):
     self.__start_time = self.time() # start time of the plugin
     self.__r1fs_demo_iter = 0 # iteration counter
     self.P(f"Starting R1fsDemoPlugin v{__VER__} with ID: {self.my_id}. Plugin instance will now wait for {self.cfg_initial_wait} sec")
+    self.last_logged = self.time() # last time we logged something
     return
   
   def __save_some_data(self):
@@ -167,8 +167,10 @@ class R1fsDemoPlugin(BasePlugin):
 
 
   def process(self):
-    if self.time() - self.__start_time < self.cfg_initial_wait:
-      self.P(f"Waiting for {self.cfg_initial_wait} sec to start processing...")
+    if not self.r1fs.is_ipfs_warmed:
+      if self.time() < self.last_logged + 60: # log every 60 sec
+        self.P("Waiting for R1FS to warm up...")
+        self.last_logged= self.time()
       return
     self.__r1fs_demo_iter += 1
     self.P(f'R1fsDemoPlugin is processing iter #{self.__r1fs_demo_iter}')
