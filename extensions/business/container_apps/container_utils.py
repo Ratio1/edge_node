@@ -26,6 +26,8 @@ class _ContainerUtilsMixin:
       except subprocess.CalledProcessError as e:
         err_msg = e.stderr.decode("utf-8", errors="ignore")
         raise RuntimeError(f"Registry login failed for {self.cfg_cr}: {err_msg}")
+    else:
+      self.P(f"CR Login missing: {self.cfg_cr_user} / {self.cfg_cr_password} @ {self.cfg_cr}")
     return    
 
 
