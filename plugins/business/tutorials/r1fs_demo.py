@@ -88,7 +88,7 @@ class R1fsDemoPlugin(BasePlugin):
     self.__known_cids = [] # keep track of known CIDs
     self.__start_time = self.time() # start time of the plugin
     self.__r1fs_demo_iter = 0 # iteration counter
-    self.P(f"Starting R1fsDemoPlugin v{__VER__} with ID: {self.my_id}. Plugin instance will now wait for {self.cfg_initial_wait} sec")
+    self.P(f"Starting R1fsDemoPlugin v{__VER__} with ID: {self.my_id}.")
     self._last_log_show_time = 0 # last time we logged something
     return
   
