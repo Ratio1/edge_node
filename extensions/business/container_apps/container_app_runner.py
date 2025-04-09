@@ -40,7 +40,7 @@ _CONFIG = {
   
   "NGROK_EDGE_LABEL": None,  # Optional ngrok edge label for the tunnel
   "NGROK_AUTH_TOKEN" : None,  # Optional ngrok auth token for the tunnel
-  "NGROK_USE_API": False,
+  "NGROK_USE_API": True,
 
   # Container-specific config options  
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"

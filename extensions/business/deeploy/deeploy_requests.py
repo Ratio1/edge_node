@@ -32,7 +32,7 @@ DEEPLOY_CREATE_REQUEST = {
     },
     "PORT" : 5000,
     "NGROK_EDGE_LABEL" : None,
-    "NGROK_USE_API": False,
+    "NGROK_USE_API": True,
     "ENV" : {
       "ENV1" : "value1",
       "ENV2" : "value2",
