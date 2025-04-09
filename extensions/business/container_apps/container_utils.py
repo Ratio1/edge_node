@@ -93,7 +93,7 @@ class _ContainerUtilsMixin:
     
     self.container_proc = res
     self.container_id = res.stdout.decode("utf-8").strip()
-    self.container_start_time = time.time()
+    self.container_start_time = self.time()
     return self.container_id
 
 
@@ -204,7 +204,7 @@ class _ContainerUtilsMixin:
         lines = logs.split("\n")
         for log_line in lines:
           if len(log_line) > 0:
-            timestamp = self.time() # get the current time 
+            timestamp = self.time() # get the current time
             self.container_logs.append((timestamp, log_line))
           # end if line valid
         # end for each line
@@ -218,7 +218,7 @@ class _ContainerUtilsMixin:
     Check if the logs should be shown based on the configured interval.
     """
     self.retrieve_logs()
-    current_time = time.time()
+    current_time = self.time()
     if (current_time - self.__last_log_show_time) > self.cfg_show_log_each:
       nr_lines = self.cfg_show_log_last_lines
       self.__last_log_show_time = current_time
