@@ -15,15 +15,6 @@ _CONFIG = {
 class FastapiAihoPlugin(FastApiWebAppPlugin):
   CONFIG = _CONFIG
 
-  def __init__(self, **kwargs):
-    super(FastapiAihoPlugin, self).__init__(**kwargs)
-    return
-
-  def get_jinja_template_args(self) -> dict:
-    return {
-      **super(FastapiAihoPlugin, self).get_jinja_template_args()
-    }
-
   def on_init(self):
     super(FastapiAihoPlugin, self).on_init()
     self.P("Running post-init setup")
