@@ -8,6 +8,10 @@ import subprocess
 
 class _ContainerUtilsMixin:
 
+  def __init__(self, **kwargs):
+    self.__last_log_show_time = 0
+    super(_ContainerUtilsMixin, self).__init__(**kwargs)
+
   ### START CONTAINER MIXIN METHODS ###
   
   def _container_maybe_login(self):
