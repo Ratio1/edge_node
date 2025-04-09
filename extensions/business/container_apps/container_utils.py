@@ -217,7 +217,7 @@ class _ContainerUtilsMixin:
     """
     Check if the logs should be shown based on the configured interval.
     """
-    self.retrieve_logs()
+    self._container_retrieve_logs()
     current_time = self.time()
     if (current_time - self.__last_log_show_time) > self.cfg_show_log_each:
       nr_lines = self.cfg_show_log_last_lines
