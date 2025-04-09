@@ -25,10 +25,6 @@ class SensiboMaintenanceSensorDataCapture(DataCaptureThread):
     self._last_acquisition_time = None
     return
 
-  def startup(self):
-    super().startup()
-    return
-
   def _init(self):
     self._maybe_reconnect()
     return
