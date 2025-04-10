@@ -207,8 +207,8 @@ class _ContainerUtilsMixin:
         lines[0] = self.container_log_last_line_start + lines[0] # add the last line start to the first line
         if not ends_with_newline:
           # if not, remove the last line from the list
-          lines = lines[:-1]
           self.container_log_last_line_start = lines[-1]
+          lines = lines[:-1]
         else:
           self.container_log_last_line_start = ""
         #endif
