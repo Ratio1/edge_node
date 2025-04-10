@@ -135,10 +135,9 @@ class ContainerAppRunnerPlugin(
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
     self.container_proc = None
     
-    self.__last_log_show_time = 0
-    self._last_line_start = ""
+    self.container_log_last_show_time = 0
+    self.container_log_last_line_start = ""
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
-    # self.__stderr_logreader = None # no need for now as we are monitoring `docker logs`
     self.container_log_proc = None    
     self.container_logreader = None
     

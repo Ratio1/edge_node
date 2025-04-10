@@ -8,10 +8,6 @@ import subprocess
 
 class _ContainerUtilsMixin:
 
-  def __init__(self, **kwargs):
-    self.__last_log_show_time = 0
-    super(_ContainerUtilsMixin, self).__init__(**kwargs)
-
   ### START CONTAINER MIXIN METHODS ###
   
   def _container_maybe_login(self):
@@ -195,7 +191,7 @@ class _ContainerUtilsMixin:
       
       if log_needs_restart:
         # Restart the log reader
-        self.__last_log_show_time = 0
+        self.container_log_last_show_time = 0
         self.container_logs.clear()
         self._container_start_capture_logs()
     return
@@ -208,13 +204,13 @@ class _ContainerUtilsMixin:
         # first check if the last line is complete (ends with \n)
         ends_with_newline = logs.endswith("\n")
         lines = logs.split("\n")
-        lines[0] = self._last_line_start + lines[0] # add the last line start to the first line
+        lines[0] = self.container_log_last_line_start + lines[0] # add the last line start to the first line
         if not ends_with_newline:
           # if not, remove the last line from the list
           lines = lines[:-1]
-          self._last_line_start = lines[-1]
+          self.container_log_last_line_start = lines[-1]
         else:
-          self._last_line_start = ""
+          self.container_log_last_line_start = ""
         #endif
         #endif last line
         for log_line in lines:
@@ -234,9 +230,9 @@ class _ContainerUtilsMixin:
     """
     self._container_retrieve_logs()
     current_time = self.time()
-    if (current_time - self.__last_log_show_time) > self.cfg_show_log_each:
+    if (current_time - self.container_log_last_show_time) > self.cfg_show_log_each:
       nr_lines = self.cfg_show_log_last_lines
-      self.__last_log_show_time = current_time
+      self.container_log_last_show_time = current_time
       msg = f"Container logs (last {nr_lines} lines):\n"
       lines = list(self.container_logs)[-nr_lines:]
       for timestamp, line in lines:
