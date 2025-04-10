@@ -130,6 +130,8 @@ class ContainerAppRunnerPlugin(
     DEFAULT_GPU_LIMIT = 0
     DEFAULT_MEM_LIMIT = "512m"
     
+
+    self._reset_ngrok() # call ngrok var init
     
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
