@@ -109,7 +109,9 @@ class _DeeployMixin:
       raise ValueError("Nonce is invalid!")
     _time = scaled / 1000
     diff = self.time() - _time
-    if diff > 24*60*60:
+    if diff < 0:
+      raise ValueError("Nonce is invalid(f)!")
+    if diff > 12*60*60:
       raise ValueError("Nonce is expired!")      
     str_timestamp = self.time_to_str(_time)
     return str_timestamp
