@@ -122,12 +122,14 @@ class DeeployManagerPlugin(
     """
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      auth_result = self.deeploy_get_auth_result(inputs)
+      
       apps = self._get_online_apps()
       #
       result = {        
         'status' : 'success',
         'apps': apps,
-        'auth' : self.deeploy_get_auth_result(inputs),
+        'auth' : auth_result,
       }
     except Exception as e:
       result = self.__handle_error(e, request)
@@ -180,6 +182,7 @@ class DeeployManagerPlugin(
     """
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)   
+      auth_result = self.deeploy_get_auth_result(inputs)
       
       # TODO: move to the mixin when ready
       plugins = self.deeploy_prepare_plugins(inputs)
@@ -224,7 +227,7 @@ class DeeployManagerPlugin(
           'app_params_image' : inputs.app_params.IMAGE,
           'app_params_registry' : inputs.app_params.CR,
         },        
-        'auth' : self.deeploy_get_auth_result(inputs),
+        'auth' : auth_result,
       }
     
     except Exception as e:
@@ -268,6 +271,7 @@ class DeeployManagerPlugin(
     """
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      auth_result = self.deeploy_get_auth_result(inputs)
       
       # TODO: move to the mixin when ready
       app_id = inputs.app_id
@@ -288,7 +292,7 @@ class DeeployManagerPlugin(
           'app_id' : inputs.app_id,
           'target_nodes' : inputs.target_nodes,
         },
-        'auth' : self.deeploy_get_auth_result(inputs),
+        'auth' : auth_result,
       }
     
     except Exception as e:
