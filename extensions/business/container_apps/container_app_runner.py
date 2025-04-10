@@ -32,10 +32,12 @@ from naeural_core.business.mixins_libs.ngrok_mixin import _NgrokMixinPlugin # pr
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
+__VER__ = "0.3.1"
+
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  "PROCESS_DELAY": 10,  # seconds to wait between process calls
+  "PROCESS_DELAY": 5,  # seconds to wait between process calls
   "ALLOW_EMPTY_INPUTS": True,
   
   "NGROK_EDGE_LABEL": None,  # Optional ngrok edge label for the tunnel
@@ -134,6 +136,7 @@ class ContainerAppRunnerPlugin(
     self.container_proc = None
     
     self.__last_log_show_time = 0
+    self._last_line_start = ""
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
     # self.__stderr_logreader = None # no need for now as we are monitoring `docker logs`
     self.container_log_proc = None    

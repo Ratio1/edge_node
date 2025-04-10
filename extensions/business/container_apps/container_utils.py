@@ -205,7 +205,18 @@ class _ContainerUtilsMixin:
     if self.container_logreader is not None:
       logs = self.container_logreader.get_next_characters()
       if len(logs) > 0:
+        # first check if the last line is complete (ends with \n)
+        ends_with_newline = logs.endswith("\n")
         lines = logs.split("\n")
+        lines[0] = self._last_line_start + lines[0] # add the last line start to the first line
+        if not ends_with_newline:
+          # if not, remove the last line from the list
+          lines = lines[:-1]
+          self._last_line_start = lines[-1]
+        else:
+          self._last_line_start = ""
+        #endif
+        #endif last line
         for log_line in lines:
           if len(log_line) > 0:
             timestamp = self.time() # get the current time
