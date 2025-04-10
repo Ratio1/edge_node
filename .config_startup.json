@@ -96,7 +96,7 @@
     },
     
     "UPDATE_MONITOR_01" : {
-      "PROCESS_DELAY"   : 60,
+      "PROCESS_DELAY"   : 300,
       "VERSION_TOKEN"   : "$EE_GITVER",
       "RESTART_ON_BEHIND": true,
       "VERSION_URL"     : "https://raw.githubusercontent.com/ratio1/edge_node/{}/ver.py",
