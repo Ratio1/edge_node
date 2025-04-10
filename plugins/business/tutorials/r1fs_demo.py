@@ -170,7 +170,7 @@ class R1fsDemoPlugin(BasePlugin):
     if not self.r1fs.is_ipfs_warmed:
       current_time = self.time()
       if current_time - self._last_log_show_time > 60: # log every 60 sec
-        self.P(f"Waiting for R1FS to warm up. Time elapsed since plugin start {int(current_time - self.__start_time)} seconds.")
+        self.P(f"Waiting for R1FS to warm up. Time elapsed since plugin start {current_time - self.__start_time:.1f} seconds.")
         self._last_log_show_time= current_time
       return
     self.__r1fs_demo_iter += 1
