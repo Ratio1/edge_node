@@ -69,8 +69,8 @@ class _ContainerUtilsMixin:
       cmd += ["--memory", str(self._mem_limit)]
 
     # Port mapping if we have a host port
-    if self._host_port and self.cfg_port:
-      cmd += ["-p", f"{self._host_port}:{self.cfg_port}"]
+    if self.port and self.cfg_port:
+      cmd += ["-p", f"{self.port}:{self.cfg_port}"]
 
     # Env vars
     for key, val in self.cfg_env.items():

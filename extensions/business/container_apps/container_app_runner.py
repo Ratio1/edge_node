@@ -44,6 +44,9 @@ _CONFIG = {
   "NGROK_AUTH_TOKEN" : None,  # Optional ngrok auth token for the tunnel
   "NGROK_USE_API": True,
 
+  # TODO: this flag needs to be renamed both here and in the ngrok mixin
+  "DEBUG_WEB_APP": False,  # If True, will run the web app in debug mode
+
   # Container-specific config options  
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"
   "CR": None,               # Optional container registry URL
@@ -112,7 +115,7 @@ class ContainerAppRunnerPlugin(
     msg += f"  Cont. Port:   {self.cfg_port}\n"
     msg += f"  Restart:      {self.cfg_restart_policy}\n"
     msg += f"  Image Pull:   {self.cfg_image_pull_policy}\n"
-    msg += f"  Host Port:    {self._host_port}\n"
+    msg += f"  Host Port:    {self.port}\n"
     msg += f"  CLI Tool:     {self.cli_tool}\n"
     self.P(msg)
     return
@@ -167,7 +170,7 @@ class ContainerAppRunnerPlugin(
 
     # If a container port is specified, we treat it as a web app
     # and request a host port for local binding
-    self._host_port = None
+    self.port = None
     if self.cfg_port:
       self.P(f"Container port {self.cfg_port} specified. Finding available host port ...")
       # Allocate a host port for the container
@@ -177,9 +180,9 @@ class ContainerAppRunnerPlugin(
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
       sock.bind(("", 0))
-      self._host_port = sock.getsockname()[1]
+      self.port = sock.getsockname()[1]
       sock.close()
-      self.P(f"Allocated free host port {self._host_port} for container port {self.cfg_port}.")    
+      self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")    
       
       self.maybe_init_ngrok()
     #endif port
@@ -187,7 +190,7 @@ class ContainerAppRunnerPlugin(
     # start the container app
     self._container_run()
     
-    if self._host_port is not None:
+    if self.port is not None:
       self.maybe_start_ngrok()
     
     self._container_start_capture_logs()
