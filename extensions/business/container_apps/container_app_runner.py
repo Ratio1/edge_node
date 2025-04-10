@@ -32,15 +32,17 @@ from naeural_core.business.mixins_libs.ngrok_mixin import _NgrokMixinPlugin # pr
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
+__VER__ = "0.3.1"
+
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  "PROCESS_DELAY": 10,  # seconds to wait between process calls
+  "PROCESS_DELAY": 5,  # seconds to wait between process calls
   "ALLOW_EMPTY_INPUTS": True,
   
   "NGROK_EDGE_LABEL": None,  # Optional ngrok edge label for the tunnel
   "NGROK_AUTH_TOKEN" : None,  # Optional ngrok auth token for the tunnel
-  
+  "NGROK_USE_API": True,
 
   # Container-specific config options  
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"
@@ -128,14 +130,16 @@ class ContainerAppRunnerPlugin(
     DEFAULT_GPU_LIMIT = 0
     DEFAULT_MEM_LIMIT = "512m"
     
+
+    self._reset_ngrok() # call ngrok var init
     
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
     self.container_proc = None
     
-    self.__last_log_show_time = 0
+    self.container_log_last_show_time = 0
+    self.container_log_last_line_start = ""
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
-    # self.__stderr_logreader = None # no need for now as we are monitoring `docker logs`
     self.container_log_proc = None    
     self.container_logreader = None
     
@@ -200,15 +204,19 @@ class ContainerAppRunnerPlugin(
     Ensures the log process is killed.
     Stops ngrok tunnel if started.
     """
-    
+    self.P("Stopping container app ...")
     # Stop the container if it's running
-    if self.container_exists(self.container_id):
+    if self._container_exists(self.container_id):
+      self.P("Stopping container ...")
       self._container_kill(self.container_id)
       self._container_maybe_stop_log_reader()
+      self.P("Container stopped.")
 
     # Stop ngrok if needed
+    self.P("Stopping ngrok tunnel ...")
     self.maybe_stop_ngrok()
-    
+    self.P("Ngrok tunnel stopped.")
+
     # Save logs to disk
     # We'll store them in a single structure: a list of lines from dct_logs or so
     # We can do: logs, err_logs = self._get_delta_logs() or a custom approach

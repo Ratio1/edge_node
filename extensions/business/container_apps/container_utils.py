@@ -26,6 +26,8 @@ class _ContainerUtilsMixin:
       except subprocess.CalledProcessError as e:
         err_msg = e.stderr.decode("utf-8", errors="ignore")
         raise RuntimeError(f"Registry login failed for {self.cfg_cr}: {err_msg}")
+    else:
+      self.P(f"CR Login missing: {self.cfg_cr_user} / {self.cfg_cr_password} @ {self.cfg_cr}")
     return    
 
 
@@ -91,7 +93,7 @@ class _ContainerUtilsMixin:
     
     self.container_proc = res
     self.container_id = res.stdout.decode("utf-8").strip()
-    self.container_start_time = time.time()
+    self.container_start_time = self.time()
     return self.container_id
 
 
@@ -143,7 +145,7 @@ class _ContainerUtilsMixin:
     self.container_log_proc = subprocess.Popen(log_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     # get the stdout of the `docker logs`` command
     # LogReader uses a separate thread to read the logs in chunks of size=50
-    self.container_logreader = self.LogReader(self, self.container_log_proc.stdout, size=50)
+    self.container_logreader = self.LogReader(self.container_log_proc.stdout, size=50)
     return
   
   def _container_maybe_stop_log_reader(self):    
@@ -189,7 +191,7 @@ class _ContainerUtilsMixin:
       
       if log_needs_restart:
         # Restart the log reader
-        self.__last_log_show_time = 0
+        self.container_log_last_show_time = 0
         self.container_logs.clear()
         self._container_start_capture_logs()
     return
@@ -199,10 +201,21 @@ class _ContainerUtilsMixin:
     if self.container_logreader is not None:
       logs = self.container_logreader.get_next_characters()
       if len(logs) > 0:
+        # first check if the last line is complete (ends with \n)
+        ends_with_newline = logs.endswith("\n")
         lines = logs.split("\n")
+        lines[0] = self.container_log_last_line_start + lines[0] # add the last line start to the first line
+        if not ends_with_newline:
+          # if not, remove the last line from the list
+          lines = lines[:-1]
+          self.container_log_last_line_start = lines[-1]
+        else:
+          self.container_log_last_line_start = ""
+        #endif
+        #endif last line
         for log_line in lines:
           if len(log_line) > 0:
-            timestamp = self.time() # get the current time 
+            timestamp = self.time() # get the current time
             self.container_logs.append((timestamp, log_line))
           # end if line valid
         # end for each line
@@ -215,11 +228,11 @@ class _ContainerUtilsMixin:
     """
     Check if the logs should be shown based on the configured interval.
     """
-    self.retrieve_logs()
-    current_time = time.time()
-    if (current_time - self.__last_log_show_time) > self.cfg_show_log_each:
+    self._container_retrieve_logs()
+    current_time = self.time()
+    if (current_time - self.container_log_last_show_time) > self.cfg_show_log_each:
       nr_lines = self.cfg_show_log_last_lines
-      self.__last_log_show_time = current_time
+      self.container_log_last_show_time = current_time
       msg = f"Container logs (last {nr_lines} lines):\n"
       lines = list(self.container_logs)[-nr_lines:]
       for timestamp, line in lines:

@@ -30,8 +30,9 @@ DEEPLOY_CREATE_REQUEST = {
       "memory" : "512m",
       "gpu" : 0,
     },
-    "PORT" : 5000,
+    "PORT" : None,
     "NGROK_EDGE_LABEL" : None,
+    "NGROK_USE_API": True,
     "ENV" : {
       "ENV1" : "value1",
       "ENV2" : "value2",
