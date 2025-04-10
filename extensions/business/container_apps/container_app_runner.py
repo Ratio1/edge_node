@@ -64,9 +64,9 @@ _CONFIG = {
   
   
   #### Logging
-  "SHOW_LOG_EACH" : 30,  # seconds to show logs
-  "SHOW_LOG_LAST_LINES" : 20,  # last lines to show  
-  "MAX_LOG_LINES" : 10_000,  # max lines to keep in memory
+  "SHOW_LOG_EACH" : 60,       # seconds to show logs
+  "SHOW_LOG_LAST_LINES" : 5,  # last lines to show  
+  "MAX_LOG_LINES" : 10_000,   # max lines to keep in memory
   
   # end of container-specific config options
   
@@ -207,13 +207,14 @@ class ContainerAppRunnerPlugin(
     Ensures the log process is killed.
     Stops ngrok tunnel if started.
     """
-    self.P("Stopping container app ...")
+    self.P(f"Stopping container app '{self.container_id}' ...")
     # Stop the container if it's running
     if self._container_exists(self.container_id):
-      self.P("Stopping container ...")
       self._container_kill(self.container_id)
       self._container_maybe_stop_log_reader()
-      self.P("Container stopped.")
+      self.P("Container and log stopped.")
+    else:
+      self.P(f"Container '{self.container_id}' does not exist. Stop command canceled.")
 
     # Stop ngrok if needed
     self.P("Stopping ngrok tunnel ...")

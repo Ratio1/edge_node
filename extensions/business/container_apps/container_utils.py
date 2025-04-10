@@ -101,14 +101,31 @@ class _ContainerUtilsMixin:
     """
     Check if container with ID cid is still running.
     """
-    if cid is None:
-      return False
-    ps_cmd = [self.cli_tool, "ps", "-q", "-f", f"id={cid}"]
-    ps_res = subprocess.run(ps_cmd, capture_output=True)
-    if ps_res.returncode != 0:
-      return False
-    output = ps_res.stdout.decode("utf-8", errors="ignore").strip()
-    return (output == cid)
+    result = False
+    if cid is not None:
+      ps_cmd = [self.cli_tool, "ps", "-q", "-f", f"id={cid}"]
+      try:
+        ps_res = subprocess.run(ps_cmd, capture_output=True)
+        if ps_res.returncode == 0:
+          output = ps_res.stdout.decode("utf-8", errors="ignore").strip()
+          result = len(output) > 0 and output in cid
+      except Exception as e:
+        self.P(f"Error checking container existence: {e}", color='r')
+    return result
+
+
+  def _container_is_running(self, cid):
+    """
+    Check if the container is still running similar to _container_exists.
+    """
+    cmd = [self.cli_tool, "inspect", "-f", "{{.State.Running}}", cid]
+    try:
+      res = subprocess.run(cmd, capture_output=True, check=True)
+      is_running = res.stdout.decode("utf-8").strip() == "true"
+    except Exception as e:
+      self.P("Container status check: {e}", color='r')
+      is_running = False    
+    return is_running
 
 
   def _container_kill(self, cid):
@@ -128,7 +145,7 @@ class _ContainerUtilsMixin:
     else:
       self.P(f"Container {cid} stopped successfully.")       
     return 
-    
+
 
   def _container_start_capture_logs(self):
     """
@@ -147,6 +164,7 @@ class _ContainerUtilsMixin:
     # LogReader uses a separate thread to read the logs in chunks of size=50
     self.container_logreader = self.LogReader(self.container_log_proc.stdout, size=50)
     return
+  
   
   def _container_maybe_stop_log_reader(self):    
     if self.container_log_proc is not None:
@@ -168,15 +186,8 @@ class _ContainerUtilsMixin:
     if self.container_id is None:
       self.P("Container ID is not set. Cannot check container status.")
       return
-
-    # Check if the container is still running
-    cmd = [self.cli_tool, "inspect", "-f", "{{.State.Running}}", self.container_id]
-    try:
-      res = subprocess.run(cmd, capture_output=True, check=True)
-      is_running = res.stdout.decode("utf-8").strip() == "true"
-    except subprocess.CalledProcessError as e:
-      err_msg = e.stderr.decode("utf-8", errors="ignore")
-      raise RuntimeError(f"Failed to check container status: {err_msg}")
+    
+    is_running = self._container_is_running(self.container_id)
 
     if not is_running:
       self.P(f"Container {self.container_id} has stopped.")
