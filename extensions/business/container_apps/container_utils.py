@@ -168,12 +168,12 @@ class _ContainerUtilsMixin:
   
   def _container_maybe_stop_log_reader(self):    
     if self.container_log_proc is not None:
-      self.P("Stopping existing LogReader...")
+      self.P("Stopping LogReader...")
       self.container_logreader.stop()
-      self.P("Stopping existing log process ...")
+      self.P("Stopping existing docker log process ...")
       self.container_log_proc.terminate()
       self.container_log_proc.wait()
-      self.P("Existing log process stopped.")
+      self.P("Existing docker log process stopped.")
       self.container_log_proc = None
     #endif log process & LogReader
     return  
