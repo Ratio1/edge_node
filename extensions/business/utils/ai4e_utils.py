@@ -441,7 +441,7 @@ class Job:
       return False, err_msg
     return True, "Training started"
 
-  def deploy_configs(self, lst_allowed):
+  def deploy_configs(self, lst_allowed, deploy_ngrok_edge_label):
     """
     2 pipelines will be deployed:
       1. One custom detection pipeline to run the freshly obtained custom model
@@ -452,12 +452,15 @@ class Job:
     lst_allowed: list
       Nodes where the above-mentioned pipelines can be deployed.
 
+    deploy_ngrok_edge_label: str
+      The label of the ngrok edge node where the pipelines will be deployed.
+
     Returns
     -------
 
     """
-    chosen_node = np.random.choice(lst_allowed)
-    chosen_node = 'bleo_edge_node'
+    # chosen_node = np.random.choice(lst_allowed)
+    chosen_node = self.owner.e2_addr
     # START DETECTION PIPELINE
     instance_config = {
       "AI_ENGINE": "custom_second_stage_detector",
@@ -485,6 +488,7 @@ class Job:
     # END DETECTION PIPELINE
     # START FASTAPI PIPELINE
     fastapi_instance_config = {
+      "NGROK_EDGE_LABEL": deploy_ngrok_edge_label,
     }
     pipeline = self.session.create_or_attach_to_pipeline(
       node=chosen_node,
@@ -515,7 +519,10 @@ class Job:
     if len(lst_allowed) == 0:
       self.started_deploying = False
       return False, "No node available at the moment."
-    self.deploy_configs(lst_allowed)
+    self.deploy_configs(
+      lst_allowed=lst_allowed,
+      deploy_ngrok_edge_label=self.cfg_deploy_ngrok_edge_label,
+    )
 
     self.started_deploying = False
     self.deployed = True
