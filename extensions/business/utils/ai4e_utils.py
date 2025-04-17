@@ -521,7 +521,7 @@ class Job:
       return False, "No node available at the moment."
     self.deploy_configs(
       lst_allowed=lst_allowed,
-      deploy_ngrok_edge_label=self.cfg_deploy_ngrok_edge_label,
+      deploy_ngrok_edge_label=self.owner.cfg_deploy_ngrok_edge_label,
     )
 
     self.started_deploying = False

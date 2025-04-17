@@ -12,6 +12,7 @@ _CONFIG = {
   'REQUEST_TIMEOUT': 10,
   "PROCESS_DELAY": 0,
   "DEPLOY_NGROK_EDGE_LABEL": None,
+  "LOG_REQUESTS": True,
 
   # 'PORT': 5000,
   'ASSETS': 'extensions/business/fastapi/_ai4everyone',
