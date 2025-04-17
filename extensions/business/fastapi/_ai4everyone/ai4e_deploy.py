@@ -163,26 +163,22 @@ class Ai4eDeployPlugin(BasePlugin):
       )
 
     @BasePlugin.endpoint(method='post')
-    def inference(self, body: dict):
-      self.P(f'Inference request received with body keys: {list(body.keys())}')
-      body = {(k.upper() if isinstance(k, str) else k): v for k, v in body.items()}
-      job_id = body.get('MODEL_ID')
-      if job_id is None:
+    def inference(self, model_id: str = None, image: str = None):
+      if model_id is None:
         return f'Model ID not provided! Please specify it through the "MODEL_ID" key.'
       models = self.get_instances()
-      if job_id not in models.keys():
-        return f'Custom model {job_id} not found! You can try the following: {list(models.keys())}'
-      img = body.get('IMAGE')
-      if img is None:
+      if model_id not in models.keys():
+        return f'Custom model {model_id} not found! You can try the following: {list(models.keys())}'
+      if image is None:
         return f'Image not provided!'
       request_id = self.uuid()
-      img_ = self.base64_to_img(img)
-      self.P(f'Request {request_id} received for job {job_id} with image of shape {img_.shape}')
-      self.maybe_refresh_model_instance(job_id)
+      img_ = self.base64_to_img(image)
+      self.P(f'Request {request_id} received for job {model_id} with image of shape {img_.shape}')
+      self.maybe_refresh_model_instance(model_id)
       self.cmdapi_send_pipeline_command(
-        pipeline_name=f'deploy_{job_id}',
+        pipeline_name=f'deploy_{model_id}',
         command={
-          'IMG': img,
+          'IMG': image,
           'PAYLOAD_CONTEXT': {
             'REQUEST_ID': request_id
           }
