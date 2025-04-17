@@ -163,7 +163,7 @@ class Ai4eDeployPlugin(BasePlugin):
       )
 
     @BasePlugin.endpoint(method='post')
-    def inference(self, body):
+    def inference(self, body: dict):
       self.P(f'Inference request received with body keys: {list(body.keys())}')
       body = {(k.upper() if isinstance(k, str) else k): v for k, v in body.items()}
       job_id = body.get('MODEL_ID')
