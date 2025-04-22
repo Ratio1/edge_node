@@ -1,7 +1,0 @@
-#!/bin/bash
-###
-### reset_supervisor:
-###   This script will create the file /shutdown_reset to reset the supervisor.
-###
-
-echo "something" > /shutdown_reset
