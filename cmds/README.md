@@ -9,7 +9,6 @@ This directory contains the command scripts for controlling and monitoring edge 
 - Setup scripts in root directory:
   - `setup_compilation.py`: Installs required dependencies
   - `compile_binaries.py`: Compiles the Python scripts into binaries
-  - `install_binaries.py`: Installs compiled binaries to a target directory
   - `build_in_docker.sh`: Builds binaries in a Docker container (recommended method)
 
 ## Converted Commands
@@ -68,18 +67,6 @@ If you prefer to compile directly on your system:
 3. The compiled binaries will be available in the `bin/` directory.
 
 ### Installing Binaries
-
-To install the compiled binaries to a target directory:
-
-```
-python install_binaries.py <target_directory>
-```
-
-For example, to install to a local bin directory:
-
-```
-python install_binaries.py /usr/local/bin
-```
 
 For Docker integration, you can install the binaries during the Docker build process:
 
