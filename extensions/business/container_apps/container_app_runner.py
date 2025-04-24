@@ -54,6 +54,7 @@ _CONFIG = {
   "CR_PASSWORD": None,      # Optional registry password or token
   "ENV": {},                # dict of env vars for the container
   "PORT": None,             # internal container port if it's a web app (int)
+  "EXTRA_PORTS": [],        # list of additional container ports to expose (list of ints)
   "CONTAINER_RESOURCES" : {
     "cpu": 1,         # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,
@@ -102,21 +103,25 @@ class ContainerAppRunnerPlugin(
     This is a placeholder method and can be expanded as needed.
     """
     msg = "Container info:\n"
-    msg += f"  Container ID: {self.container_id}\n"
-    msg += f"  Start Time:   {self.time_to_str(self.container_start_time)}\n"
-    msg += f"  Resource CPU: {self._cpu_limit} cores\n"
-    msg += f"  Resource GPU: {self._gpu_limit}\n"
-    msg += f"  Resource Mem: {self._mem_limit}\n"
-    msg += f"  Target Image: {self.cfg_image}\n"
-    msg += f"  CR:           {self.cfg_cr}\n"
-    msg += f"  CR User:      {self.cfg_cr_user}\n"
-    msg += f"  CR Pass:      {'*' * len(self.cfg_cr_password) if self.cfg_cr_password else 'None'}\n"
-    msg += f"  Env Vars:     {self.cfg_env}\n"
-    msg += f"  Cont. Port:   {self.cfg_port}\n"
-    msg += f"  Restart:      {self.cfg_restart_policy}\n"
-    msg += f"  Image Pull:   {self.cfg_image_pull_policy}\n"
-    msg += f"  Host Port:    {self.port}\n"
-    msg += f"  CLI Tool:     {self.cli_tool}\n"
+    msg += f"  Container ID:     {self.container_id}\n"
+    msg += f"  Start Time:       {self.time_to_str(self.container_start_time)}\n"
+    msg += f"  Resource CPU:     {self._cpu_limit} cores\n"
+    msg += f"  Resource GPU:     {self._gpu_limit}\n"
+    msg += f"  Resource Mem:     {self._mem_limit}\n"
+    msg += f"  Target Image:     {self.cfg_image}\n"
+    msg += f"  CR:               {self.cfg_cr}\n"
+    msg += f"  CR User:          {self.cfg_cr_user}\n"
+    msg += f"  CR Pass:          {'*' * len(self.cfg_cr_password) if self.cfg_cr_password else 'None'}\n"
+    msg += f"  Env Vars:         {self.cfg_env}\n"
+    msg += f"  Cont. Port:       {self.cfg_port}\n"
+    msg += f"  Restart:          {self.cfg_restart_policy}\n"
+    msg += f"  Image Pull:       {self.cfg_image_pull_policy}\n"
+    if self.extra_ports_mapping:
+      msg += "  Extra Ports Mapping:\n"
+      for container_port, host_port in self.extra_ports_mapping.items():
+        msg += f"    Container {container_port} → Host {host_port}\n"
+    msg += f"  Ngrok Host Port:  {self.port}\n"
+    msg += f"  CLI Tool:         {self.cli_tool}\n"
     self.P(msg)
     return
   
@@ -168,30 +173,32 @@ class ContainerAppRunnerPlugin(
 
     self._container_maybe_login()
 
-    # If a container port is specified, we treat it as a web app
-    # and request a host port for local binding
+    # Handle port allocation for main port and additional ports
     self.port = None
+    self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
+    
+    # Process main port if specified
     if self.cfg_port:
       self.P(f"Container port {self.cfg_port} specified. Finding available host port ...")
-      # Allocate a host port for the container
-      # We'll use a socket to find an available port
-      # This is a common approach to find an available port
-      # We'll bind to port 0, which tells the OS to pick an available port
-      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-      sock.bind(("", 0))
-      self.port = sock.getsockname()[1]
-      sock.close()
+      # Allocate a host port for the container using the utility method
+      self.port = self._allocate_free_port()
+      self.extra_ports_mapping[self.cfg_port] = self.port
       self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")    
       
       self.maybe_init_ngrok()
     #endif port
+    
+    # Process additional ports if specified in PORTS
+    if isinstance(self.cfg_extra_ports, list) and len(self.cfg_extra_ports) > 0:
+      for container_port in self.cfg_extra_ports:
+        self.P(f"Additional container port {container_port} specified. Finding available host port ...")
+        host_port = self._allocate_free_port()
+        self.extra_ports_mapping[container_port] = host_port
+        self.P(f"Allocated free host port {host_port} for container port {container_port}.")
+    #endif additional ports
 
     # start the container app
     self._container_run()
-    
-    if self.port is not None:
-      self.maybe_start_ngrok()
     
     self._container_start_capture_logs()
         
@@ -199,6 +206,25 @@ class ContainerAppRunnerPlugin(
     self.__show_container_app_info()
     return
 
+  def _allocate_free_port(self):
+    """
+    Allocates an available port on the host system.
+    
+    This method uses a common technique for finding an available port:
+    1. Create a new socket
+    2. Bind to port 0, which tells the OS to select any available port
+    3. Get the port number that was assigned
+    4. Close the socket to release it for actual use
+    
+    Returns:
+        int: The allocated port number
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
   def on_close(self):
     """
