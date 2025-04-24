@@ -63,6 +63,7 @@ _CONFIG = {
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
   
+  "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   
   #### Logging
   "SHOW_LOG_EACH" : 60,       # seconds to show logs
@@ -116,6 +117,10 @@ class ContainerAppRunnerPlugin(
     msg += f"  Cont. Port:       {self.cfg_port}\n"
     msg += f"  Restart:          {self.cfg_restart_policy}\n"
     msg += f"  Image Pull:       {self.cfg_image_pull_policy}\n"
+    if self.volumes and len(self.volumes) > 0:
+      msg += "  Volumes:\n"
+      for host_path, container_path in self.volumes.items():
+        msg += f"    Host {host_path} → Container {container_path}\n"
     if self.extra_ports_mapping:
       msg += "  Extra Ports Mapping:\n"
       for container_port, host_port in self.extra_ports_mapping.items():
@@ -182,12 +187,11 @@ class ContainerAppRunnerPlugin(
       self.P(f"Container port {self.cfg_port} specified. Finding available host port ...")
       # Allocate a host port for the container using the utility method
       self.port = self._allocate_free_port()
-      self.extra_ports_mapping[self.cfg_port] = self.port
-      self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")    
+      self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")
       
       self.maybe_init_ngrok()
     #endif port
-    
+
     # Process additional ports if specified in PORTS
     if isinstance(self.cfg_extra_ports, list) and len(self.cfg_extra_ports) > 0:
       for container_port in self.cfg_extra_ports:
@@ -196,6 +200,20 @@ class ContainerAppRunnerPlugin(
         self.extra_ports_mapping[container_port] = host_port
         self.P(f"Allocated free host port {host_port} for container port {container_port}.")
     #endif additional ports
+
+    self.volumes = {}
+    # Process volumes if specified
+    if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
+      for host_path, container_path in self.cfg_volumes.items():
+        original_path = str(host_path)
+        sanitized_name = self._sanitize_path(original_path)
+
+        # Prefix the sanitized name with the instance ID
+        prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
+        self.volumes[prefixed_name] = container_path
+
+        # Log the conversion from path to named volume
+        self.P(f"  Converting '{original_path}' → named volume '{prefixed_name}'")
 
     # start the container app
     self._container_run()
@@ -225,6 +243,31 @@ class ContainerAppRunnerPlugin(
     port = sock.getsockname()[1]
     sock.close()
     return port
+
+  def _sanitize_path(self, path):
+    """
+    Sanitize a path by replacing slashes with underscores.
+
+    Examples:
+        "/var/cache/keysoft/storage" -> "var_cache_keysoft_storage"
+        "data/logs/" -> "data_logs"
+
+    Args:
+        path (str): The path to sanitize
+
+    Returns:
+        str: The sanitized path with slashes replaced by underscores
+    """
+    if not path:
+      return ""
+
+    # Remove leading and trailing slashes
+    path = str(path).strip('/')
+
+    # Replace remaining slashes with underscores
+    sanitized = path.replace('/', '_')
+
+    return sanitized
 
   def on_close(self):
     """
