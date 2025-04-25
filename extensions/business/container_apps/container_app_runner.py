@@ -230,8 +230,11 @@ class ContainerAppRunnerPlugin(
 
         # Prefix the sanitized name with the instance ID
         prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
-        self.volumes[prefixed_name] = container_path
         self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
+
+        full_container_path = self.os_path.join("/edge_node/_local_cache/_data/container_volumes", prefixed_name)
+        self.volumes[prefixed_name] = full_container_path
+
       # endfor each host path
     # endif volumes
     return

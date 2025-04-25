@@ -81,12 +81,12 @@ class _ContainerUtilsMixin:
       cmd += ["-e", f"{key}={val}"]
 
     # Volume mounts
-    if hasattr(self, 'volumes') and self.volumes and len(self.volumes) > 0:
-      for host_path, container_path in self.volumes.items():
+    if len(self.volumes) > 0:
+      for volume_label, container_path in self.volumes.items():
         # Create a named volume with the prefixed sanitized name
-        volume_spec = f"{host_path}:{container_path}"
+        volume_spec = f"{volume_label}:{container_path}"
         cmd += ["-v", volume_spec]
-        
+      #endfor
       self.P("Note: These named volumes will persist until manually removed with 'docker volume rm'")
 
     # Possibly prefix the registry to the image reference
