@@ -190,7 +190,6 @@ class DeeployManagerPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
       
       # TODO: move to the mixin when ready
-      plugins = self.deeploy_prepare_plugins(inputs)
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type 
       app_id = (app_alias.lower()[:8] + "_" + self.uuid(7)).lower()
@@ -207,8 +206,18 @@ class DeeployManagerPlugin(
       #endfor each target node check address and status
       if len(nodes) == 0:
         msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
-        raise ValueError(msg)        
+        raise ValueError(msg)
+
+      plugins = self.deeploy_prepare_plugins(inputs)
+
       for addr in nodes:
+        # Nodes to peer with for CHAINSTORE
+        nodes_to_peer = [n for n in nodes if n != addr]
+        node_plugins = self.deepcopy(plugins)
+        if len(nodes_to_peer) > 0:
+          for plugin in node_plugins:
+            for plugin_instance in plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES]:
+              plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
         self.P(f"Starting pipeline '{app_alias}' on {addr}")
         if addr is not None:
           self.cmdapi_start_pipeline_by_params(
@@ -218,7 +227,7 @@ class DeeployManagerPlugin(
             node_address=addr,
             owner=sender,
             url=inputs.pipeline_input_uri,
-            plugins=plugins,
+            plugins=node_plugins,
           )
         #endif addr is valid
       #endfor each target node
