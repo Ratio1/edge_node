@@ -69,7 +69,10 @@ _CONFIG = {
   # mandatory area
   **BasePlugin.CONFIG,
   # our overwritten props
-  'PROCESS_DELAY' : 15,  
+  'PROCESS_DELAY' : 15,
+
+  'FORCE_R1FS_FASTER_WARMUP': None,
+
   # due to the fact that we are using a "void" pipeline,
   # we need to allow empty inputs as we are not getting any 
   # data from the pipeline
@@ -90,6 +93,10 @@ class R1fsDemoPlugin(BasePlugin):
     self.__r1fs_demo_iter = 0 # iteration counter
     self.P(f"Starting R1fsDemoPlugin v{__VER__} with ID: {self.my_id}.")
     self._last_log_show_time = 0 # last time we logged something
+
+    if isinstance(self.cfg_force_r1fs_faster_warmup, int) and self.cfg_force_r1fs_faster_warmup > 0:
+      self.P(f"Force R1FS faster warmup: {self.cfg_force_r1fs_faster_warmup}")
+      self.r1fs._set_min_connection_age(self.cfg_force_r1fs_faster_warmup)
     return
   
   def __save_some_data(self):
