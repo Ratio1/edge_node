@@ -5,7 +5,11 @@ Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 """
 
 from .deeploy_mixin import _DeeployMixin
-from .deeploy_requests import *
+from .deeploy_const import (
+  DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
+  DEEPLOY_ERRORS,
+)
+  
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
@@ -19,7 +23,7 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
-  'DEEPLOY_VERBOSE' : True,
+  'DEEPLOY_VERBOSE' : 1,
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   
@@ -70,7 +74,7 @@ class DeeployManagerPlugin(
       #endif
     #endif
     if result is None:
-      msg = "Invalid node address: {}".format(node_addr)
+      msg = f"{DEEPLOY_ERRORS.NODES4}: Invalid node address: {node_addr}"
       if raise_if_error:
         raise ValueError(msg)
       else:
@@ -78,7 +82,7 @@ class DeeployManagerPlugin(
     return result
   
   
-  def __handle_error(self, exc, request):
+  def __handle_error(self, exc, request, extra_error_code=DEEPLOY_ERRORS.GENERIC):
     """
     Handle the error and return a response.
     """
@@ -86,8 +90,9 @@ class DeeployManagerPlugin(
     result = {
       'status' : 'fail',
       'error' : str(exc),
+      'request' : request,
     }
-    if self.cfg_deeploy_verbose:
+    if self.cfg_deeploy_verbose > 1:
       lines = self.trace_info().splitlines()
       result['trace'] = lines[-5:-1]
     return result
@@ -196,11 +201,13 @@ class DeeployManagerPlugin(
         if is_online:
           nodes.append(addr)
         else:
-          raise ValueError("Node {} is not online".format(addr))
+          msg = f"{DEEPLOY_ERRORS.NODES1}: Node {addr} is not online"
+          raise ValueError(msg)
         #endif is_online
       #endfor each target node check address and status
       if len(nodes) == 0:
-        raise ValueError("No valid nodes provided")        
+        msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
+        raise ValueError(msg)        
       for addr in nodes:
         self.P(f"Starting pipeline '{app_alias}' on {addr}")
         if addr is not None:
@@ -277,7 +284,8 @@ class DeeployManagerPlugin(
       app_id = inputs.app_id
       nodes = [self._check_and_maybe_convert_address(node) for node in inputs.target_nodes]
       if len(nodes) == 0:
-        raise ValueError("No valid nodes provided")        
+        msg = f"{DEEPLOY_ERRORS.NODES3}: No valid nodes provided"
+        raise ValueError(msg)        
       for addr in nodes:
         self.P(f"Stopping pipeline '{app_id}' on {addr}")
         self.cmdapi_stop_pipeline(
