@@ -488,6 +488,7 @@ class Job:
     # END DETECTION PIPELINE
     # START FASTAPI PIPELINE
     fastapi_instance_config = {
+      "RESPONSE_FORMAT": self.owner.cfg_response_format,
       "NGROK_EDGE_LABEL": deploy_ngrok_edge_label,
     }
     pipeline = self.session.create_or_attach_to_pipeline(
@@ -521,7 +522,7 @@ class Job:
       return False, "No node available at the moment."
     self.deploy_configs(
       lst_allowed=lst_allowed,
-      deploy_ngrok_edge_label=self.cfg_deploy_ngrok_edge_label,
+      deploy_ngrok_edge_label=self.owner.cfg_deploy_ngrok_edge_label,
     )
 
     self.started_deploying = False
