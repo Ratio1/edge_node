@@ -287,10 +287,14 @@ class ContainerAppRunnerPlugin(
     if not path:
       return ""
 
-    # Remove leading and trailing slashes
-    path = str(path).strip('/')
-    # Replace remaining slashes with underscores
-    sanitized = path.replace('/', '_')
+    # # Remove leading and trailing slashes
+    # path = str(path).strip('/')
+    # # Replace remaining slashes with underscores
+    # sanitized = path.replace('/', '_')
+    
+    # above approach is wrong - please use the API
+    # we have (almost) for anything a intenal API method
+    sanitized = self.sanitize_name(path)
 
     return sanitized
 
