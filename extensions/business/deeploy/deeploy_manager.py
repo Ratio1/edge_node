@@ -199,6 +199,10 @@ class DeeployManagerPlugin(
         is_online = self.netmon.network_node_is_online(addr)
         if is_online:
           nodes.append(addr)
+          avail_mem = self.netmon.network_node_available_memory(addr)
+          avail_disk = self.netmon.network_node_available_disk(addr)
+          # etc etc + move this check into mixin as `check_node_resources(addr, inputs)` 
+          # and raise error `ERR06_DEEPLOY_TARGET_NODE_RESOURCES1`
         else:
           msg = f"{DEEPLOY_ERRORS.NODES1}: Node {addr} is not online"
           raise ValueError(msg)

@@ -150,7 +150,8 @@ class _DeeployMixin:
     """
     Prepare the a single plugin instance for the pipeline creation.
     """
-    instance_id = inputs.plugin_signature.upper() + "_INST"
+    # 10 chars unique id using self.uuid() (inherited from utils)
+    instance_id = inputs.plugin_signature.upper()[13] + '_' + self.uuid(6) 
     plugin = {
       self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
       self.ct.CONFIG_PLUGIN.K_INSTANCES : [
