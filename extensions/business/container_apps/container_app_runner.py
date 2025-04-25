@@ -54,11 +54,11 @@ _CONFIG = {
   "CR_PASSWORD": None,      # Optional registry password or token
   "ENV": {},                # dict of env vars for the container
   "PORT": None,             # internal container port if it's a web app (int)
-  "EXTRA_PORTS": [],        # list of additional container ports to expose (list of ints)
   "CONTAINER_RESOURCES" : {
     "cpu": 1,         # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,
-    "memory": "512m"  # e.g. "512m" for 512MB
+    "memory": "512m",  # e.g. "512m" for 512MB,
+    "ports": []  # list of additional container ports to expose (list of ints)
   },
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
@@ -139,13 +139,7 @@ class ContainerAppRunnerPlugin(
     Determines whether Docker or Podman is available, sets up port (if needed),
     and prepares for container run.    
     """
-    DEFAULT_CPU_LIMIT = 1
-    DEFAULT_GPU_LIMIT = 0
-    DEFAULT_MEM_LIMIT = "512m"
-    
 
-    self._reset_ngrok() # call ngrok var init
-    
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
     self.container_proc = None
@@ -155,76 +149,108 @@ class ContainerAppRunnerPlugin(
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
     self.container_log_proc = None    
     self.container_logreader = None
+
+    # Handle port allocation for main port and additional ports
+    self.port = None
+    self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
+
+    self.volumes = {}
+
+    self._reset_ngrok() # call ngrok var init
+
+    self._detect_cli_tool() # detect if we have docker or podman
+    self._container_maybe_login() # login to the container registry if needed
+
+    self._setup_app_ngrok_port() # allocate the main port if needed
+    self._setup_resource_limits() # setup container resource limits (CPU, GPU, memory, ports)
+    self._setup_volumes() # setup container volumes
+
+    self._container_run() # start the container app
     
-    
-    resource_limits = self.cfg_container_resources
-    if isinstance(resource_limits, dict) and len(resource_limits) > 0:
-      self._cpu_limit = resource_limits.get("cpu", DEFAULT_CPU_LIMIT)
-      self._gpu_limit = resource_limits.get("gpu", DEFAULT_GPU_LIMIT)
-      self._mem_limit = resource_limits.get("memory", DEFAULT_MEM_LIMIT)
-    else:
-      self._cpu_limit = DEFAULT_CPU_LIMIT
-      self._gpu_limit = DEFAULT_GPU_LIMIT
-      self._mem_limit = DEFAULT_MEM_LIMIT
-    #endif resource limits
-    
-    # Detect CLI tool (docker or podman)
+    self._container_start_capture_logs() # start the log reader process
+        
+    self.__show_container_app_info() # show container app info
+    return
+
+  def _detect_cli_tool(self):
+    """
+    Detects whether Docker or Podman is available on the system.
+    """
     if shutil.which("docker"):
       self.cli_tool = "docker"
     elif shutil.which("podman"):
       self.cli_tool = "podman"
     else:
       raise RuntimeError("No container runtime (Docker/Podman) found on this system.")
+    #endif
+    return
 
-    self._container_maybe_login()
 
-    # Handle port allocation for main port and additional ports
-    self.port = None
-    self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
-    
-    # Process main port if specified
-    if self.cfg_port:
-      self.P(f"Container port {self.cfg_port} specified. Finding available host port ...")
-      # Allocate a host port for the container using the utility method
-      self.port = self._allocate_free_port()
-      self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")
-      
-      self.maybe_init_ngrok()
-    #endif port
+  def _setup_resource_limits(self):
+    """
+    Sets up resource limits for the container based on the configuration.
+    """
+    DEFAULT_CPU_LIMIT = 1
+    DEFAULT_GPU_LIMIT = 0
+    DEFAULT_MEM_LIMIT = "512m"
+    DEFAULT_PORTS = []
 
-    # Process additional ports if specified in PORTS
-    if isinstance(self.cfg_extra_ports, list) and len(self.cfg_extra_ports) > 0:
-      for container_port in self.cfg_extra_ports:
-        self.P(f"Additional container port {container_port} specified. Finding available host port ...")
-        host_port = self._allocate_free_port()
-        self.extra_ports_mapping[container_port] = host_port
-        self.P(f"Allocated free host port {host_port} for container port {container_port}.")
-    #endif additional ports
+    container_resources = self.cfg_container_resources
+    if isinstance(container_resources, dict) and len(container_resources) > 0:
+      self._cpu_limit = container_resources.get("cpu", DEFAULT_CPU_LIMIT)
+      self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
+      self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
 
-    self.volumes = {}
-    # Process volumes if specified
+      ports = container_resources.get("ports", DEFAULT_PORTS)
+      # Process additional ports if specified in PORTS
+      if len(ports) > 0:
+        for container_port in ports:
+          self.P(f"Additional container port {container_port} specified. Finding available host port ...")
+          host_port = self.__allocate_free_port()
+          self.extra_ports_mapping[container_port] = host_port
+          self.P(f"Allocated free host port {host_port} for container port {container_port}.")
+        # endfor each additional port
+      # endif additional ports
+    else:
+      self._cpu_limit = DEFAULT_CPU_LIMIT
+      self._gpu_limit = DEFAULT_GPU_LIMIT
+      self._mem_limit = DEFAULT_MEM_LIMIT
+    # endif resource limits
+    return
+
+
+  def _setup_volumes(self):
+    """
+    Processes the volumes specified in the configuration.
+    """
     if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
       for host_path, container_path in self.cfg_volumes.items():
         original_path = str(host_path)
-        sanitized_name = self._sanitize_path(original_path)
+        sanitized_name = self.__sanitize_path(original_path)
 
         # Prefix the sanitized name with the instance ID
         prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
         self.volumes[prefixed_name] = container_path
-
-        # Log the conversion from path to named volume
-        self.P(f"  Converting '{original_path}' → named volume '{prefixed_name}'")
-
-    # start the container app
-    self._container_run()
-    
-    self._container_start_capture_logs()
-        
-    # Show container app info
-    self.__show_container_app_info()
+        self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
+      # endfor each host path
+    # endif volumes
     return
 
-  def _allocate_free_port(self):
+  def _setup_app_ngrok_port(self):
+    """
+    Processes the main port if specified in the configuration.
+    """
+    if self.cfg_port:
+      self.P(f"Container port {self.cfg_port} specified. Finding available host port ...")
+      # Allocate a host port for the container using the utility method
+      self.port = self.__allocate_free_port()
+      self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")
+
+      self.maybe_init_ngrok()
+    # endif port
+    return
+
+  def __allocate_free_port(self):
     """
     Allocates an available port on the host system.
     
@@ -244,17 +270,14 @@ class ContainerAppRunnerPlugin(
     sock.close()
     return port
 
-  def _sanitize_path(self, path):
+  def __sanitize_path(self, path):
     """
     Sanitize a path by replacing slashes with underscores.
-
     Examples:
         "/var/cache/keysoft/storage" -> "var_cache_keysoft_storage"
         "data/logs/" -> "data_logs"
-
     Args:
         path (str): The path to sanitize
-
     Returns:
         str: The sanitized path with slashes replaced by underscores
     """
@@ -263,7 +286,6 @@ class ContainerAppRunnerPlugin(
 
     # Remove leading and trailing slashes
     path = str(path).strip('/')
-
     # Replace remaining slashes with underscores
     sanitized = path.replace('/', '_')
 
