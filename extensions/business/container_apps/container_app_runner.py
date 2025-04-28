@@ -34,6 +34,9 @@ from .container_utils import _ContainerUtilsMixin # provides container managemen
 
 __VER__ = "0.3.1"
 
+# Path for container volumes
+CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
+
 _CONFIG = {
   **BasePlugin.CONFIG,
 
@@ -226,13 +229,13 @@ class ContainerAppRunnerPlugin(
     if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
       for host_path, container_path in self.cfg_volumes.items():
         original_path = str(host_path)
-        sanitized_name = self.__sanitize_path(original_path)
+        sanitized_name = self.sanitize_name(original_path)
 
         # Prefix the sanitized name with the instance ID
         prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
         self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
 
-        full_host_path = self.os_path.join("/edge_node/_local_cache/_data/container_volumes", prefixed_name)
+        full_host_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
         self.volumes[full_host_path] = container_path
 
       # endfor each host path
@@ -273,30 +276,6 @@ class ContainerAppRunnerPlugin(
     sock.close()
     return port
 
-  def __sanitize_path(self, path):
-    """
-    Sanitize a path by replacing slashes with underscores.
-    Examples:
-        "/var/cache/keysoft/storage" -> "var_cache_keysoft_storage"
-        "data/logs/" -> "data_logs"
-    Args:
-        path (str): The path to sanitize
-    Returns:
-        str: The sanitized path with slashes replaced by underscores
-    """
-    if not path:
-      return ""
-
-    # # Remove leading and trailing slashes
-    # path = str(path).strip('/')
-    # # Replace remaining slashes with underscores
-    # sanitized = path.replace('/', '_')
-    
-    # above approach is wrong - please use the API
-    # we have (almost) for anything a intenal API method
-    sanitized = self.sanitize_name(path)
-
-    return sanitized
 
   def on_close(self):
     """
