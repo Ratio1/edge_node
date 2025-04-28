@@ -11,6 +11,15 @@ Examples:
 from time import time
 from uuid import uuid4
 
+class DEEPLOY_ERRORS:
+  GENERIC = "ERR01_DEEPLOY_GENERIC_ERROR"
+  NODES1 = "ERR02_DEEPLOY_NODES1"
+  NODES2 = "ERR03_DEEPLOY_NODES2"
+  NODES3 = "ERR04_DEEPLOY_NODES3"
+  NODES4 = "ERR05_DEEPLOY_NODES4"
+  NODERES1 = "ERR06_DEEPLOY_TARGET_NODE_RESOURCES1"
+  
+
 DEEPLOY_CREATE_REQUEST = {
   "app_alias" : "some_app_name", 
   "plugin_signature" : "SOME_PLUGIN_01",

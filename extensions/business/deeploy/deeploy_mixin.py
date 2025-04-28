@@ -97,6 +97,80 @@ class _DeeployMixin:
     inputs.wallet_oracles = wallet_oracles
     return inputs
 
+  def __parse_memory(self, mem_str):
+    """
+    Convert memory string to bytes.
+    Args:
+        mem_str (str): Memory string in format '512m', '1g', or bytes
+    Returns:
+        int: Memory in bytes
+    """
+    if mem_str.endswith('m'):
+      return int(mem_str[:-1]) * 1024 * 1024  # MB to bytes
+    elif mem_str.endswith('g'):
+      return int(mem_str[:-1]) * 1024 * 1024 * 1024  # GB to bytes
+    else:
+      return int(mem_str)  # assume bytes
+
+  def check_node_resources(self, addr, inputs):
+    """
+    Check if the node has sufficient resources for the requested deployment.
+    Returns:
+        dict: {
+            'status': bool,  # True if all checks pass, False otherwise
+            'details': list, # List of resource issues if any
+            'available': dict, # Available resources
+            'required': dict  # Required resources
+        }
+    """
+    result = {
+        'status': True,
+        'details': [],
+        'available': {},
+        'required': {}
+    }
+    
+    # Get available resources
+    avail_cpu = self.netmon.network_node_get_cpu_avail_cores(addr)
+    avail_mem = self.netmon.network_node_available_memory(addr)  # in bytes
+    avail_disk = self.netmon.network_node_available_disk(addr)  # in bytes
+
+    # Get required resources from the request
+    required_resources = inputs.app_params.get('CONTAINER_RESOURCES', {})
+    required_mem = required_resources.get('memory', '512m')
+    required_cpu = required_resources.get('cpu', 1)
+
+    required_mem_bytes = self.__parse_memory(required_mem)
+
+    # CPU check
+    if avail_cpu < required_cpu:
+      result['available']['cpu'] = avail_cpu
+      result['required']['cpu'] = required_cpu
+
+      result['status'] = False
+      result['details'].append({
+          'resource': 'CPU',
+          'available': avail_cpu,
+          'required': required_cpu,
+          'unit': 'cores'
+      })
+
+    # Check memory
+    if avail_mem < required_mem_bytes:
+      result['available']['memory'] = avail_mem
+      result['required']['memory'] = required_mem_bytes
+
+      result['status'] = False
+      avail_mem_mb = avail_mem / (1024 * 1024)
+      required_mem_mb = result['required']['memory'] / (1024 * 1024)
+      result['details'].append({
+          'resource': 'Memory',
+          'available': avail_mem_mb,
+          'required': required_mem_mb,
+          'unit': 'MB'
+      })
+
+    return result
 
   def deeploy_get_nonce(self, hex_nonce):
     """
@@ -150,7 +224,8 @@ class _DeeployMixin:
     """
     Prepare the a single plugin instance for the pipeline creation.
     """
-    instance_id = inputs.plugin_signature.upper() + "_INST"
+    # 10 chars unique id using self.uuid() (inherited from utils)
+    instance_id = inputs.plugin_signature.upper()[13] + '_' + self.uuid(6) 
     plugin = {
       self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
       self.ct.CONFIG_PLUGIN.K_INSTANCES : [
