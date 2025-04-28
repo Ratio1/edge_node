@@ -97,6 +97,69 @@ class _DeeployMixin:
     inputs.wallet_oracles = wallet_oracles
     return inputs
 
+  def __parse_memory(self, mem_str):
+    """
+    Convert memory string to bytes.
+    Args:
+        mem_str (str): Memory string in format '512m', '1g', or bytes
+    Returns:
+        int: Memory in bytes
+    """
+    if mem_str.endswith('m'):
+      return int(mem_str[:-1]) * 1024 * 1024  # MB to bytes
+    elif mem_str.endswith('g'):
+      return int(mem_str[:-1]) * 1024 * 1024 * 1024  # GB to bytes
+    else:
+      return int(mem_str)  # assume bytes
+
+  def check_node_resources(self, addr, inputs):
+    """
+    Check if the node has sufficient resources for the requested deployment.
+    Returns:
+        dict: {
+            'status': bool,  # True if all checks pass, False otherwise
+            'details': list, # List of resource issues if any
+            'available': dict, # Available resources
+            'required': dict  # Required resources
+        }
+    """
+    result = {
+        'status': True,
+        'details': [],
+        'available': {},
+        'required': {}
+    }
+    
+    # Get available resources
+    avail_mem = self.netmon.network_node_available_memory(addr)  # in bytes
+    avail_disk = self.netmon.network_node_available_disk(addr)  # in bytes
+
+    # Get required resources from the request
+    required_resources = inputs.app_params.get('CONTAINER_RESOURCES', {})
+    required_mem = required_resources.get('memory', '512m')
+    required_cpu = required_resources.get('cpu', 1)
+
+    # Store available and required resources
+    required_mem_bytes = self.__parse_memory(required_mem)
+    # Check memory
+    self.Pd("Available memory: {} bytes".format(avail_mem))
+    self.Pd("Required memory: {} bytes".format(required_mem_bytes))
+
+    if avail_mem < required_mem_bytes:
+      result['available']['memory'] = avail_mem
+      result['required']['memory'] = required_mem_bytes
+
+      result['status'] = False
+      avail_mem_mb = avail_mem / (1024 * 1024)
+      required_mem_mb = result['required']['memory'] / (1024 * 1024)
+      result['details'].append({
+          'resource': 'Memory',
+          'available': avail_mem_mb,
+          'required': required_mem_mb,
+          'unit': 'MB'
+      })
+
+    return result
 
   def deeploy_get_nonce(self, hex_nonce):
     """

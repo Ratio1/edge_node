@@ -198,11 +198,13 @@ class DeeployManagerPlugin(
         addr = self._check_and_maybe_convert_address(node)
         is_online = self.netmon.network_node_is_online(addr)
         if is_online:
+          node_resources = self.check_node_resources(addr, inputs)
+          if not node_resources['status']:
+            error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
+            for detail in node_resources['details']:
+              error_msg += f"- {detail['resource']}: available {detail['available']:.2f}{detail['unit']} < required {detail['required']:.2f}{detail['unit']}\n"
+            raise ValueError(error_msg)
           nodes.append(addr)
-          avail_mem = self.netmon.network_node_available_memory(addr)
-          avail_disk = self.netmon.network_node_available_disk(addr)
-          # etc etc + move this check into mixin as `check_node_resources(addr, inputs)` 
-          # and raise error `ERR06_DEEPLOY_TARGET_NODE_RESOURCES1`
         else:
           msg = f"{DEEPLOY_ERRORS.NODES1}: Node {addr} is not online"
           raise ValueError(msg)
