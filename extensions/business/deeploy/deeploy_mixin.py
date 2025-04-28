@@ -139,12 +139,9 @@ class _DeeployMixin:
     required_mem = required_resources.get('memory', '512m')
     required_cpu = required_resources.get('cpu', 1)
 
-    # Store available and required resources
     required_mem_bytes = self.__parse_memory(required_mem)
-    # Check memory
-    self.Pd("Available memory: {} bytes".format(avail_mem))
-    self.Pd("Required memory: {} bytes".format(required_mem_bytes))
 
+    # Check memory
     if avail_mem < required_mem_bytes:
       result['available']['memory'] = avail_mem
       result['required']['memory'] = required_mem_bytes
