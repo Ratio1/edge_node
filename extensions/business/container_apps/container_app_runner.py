@@ -34,6 +34,9 @@ from .container_utils import _ContainerUtilsMixin # provides container managemen
 
 __VER__ = "0.3.1"
 
+# Path for container volumes
+CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
+
 _CONFIG = {
   **BasePlugin.CONFIG,
 
@@ -57,11 +60,13 @@ _CONFIG = {
   "CONTAINER_RESOURCES" : {
     "cpu": 1,         # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,
-    "memory": "512m"  # e.g. "512m" for 512MB
+    "memory": "512m",  # e.g. "512m" for 512MB,
+    "ports": []  # list of additional container ports to expose (list of ints)
   },
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
   
+  "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   
   #### Logging
   "SHOW_LOG_EACH" : 60,       # seconds to show logs
@@ -102,21 +107,29 @@ class ContainerAppRunnerPlugin(
     This is a placeholder method and can be expanded as needed.
     """
     msg = "Container info:\n"
-    msg += f"  Container ID: {self.container_id}\n"
-    msg += f"  Start Time:   {self.time_to_str(self.container_start_time)}\n"
-    msg += f"  Resource CPU: {self._cpu_limit} cores\n"
-    msg += f"  Resource GPU: {self._gpu_limit}\n"
-    msg += f"  Resource Mem: {self._mem_limit}\n"
-    msg += f"  Target Image: {self.cfg_image}\n"
-    msg += f"  CR:           {self.cfg_cr}\n"
-    msg += f"  CR User:      {self.cfg_cr_user}\n"
-    msg += f"  CR Pass:      {'*' * len(self.cfg_cr_password) if self.cfg_cr_password else 'None'}\n"
-    msg += f"  Env Vars:     {self.cfg_env}\n"
-    msg += f"  Cont. Port:   {self.cfg_port}\n"
-    msg += f"  Restart:      {self.cfg_restart_policy}\n"
-    msg += f"  Image Pull:   {self.cfg_image_pull_policy}\n"
-    msg += f"  Host Port:    {self.port}\n"
-    msg += f"  CLI Tool:     {self.cli_tool}\n"
+    msg += f"  Container ID:     {self.container_id}\n"
+    msg += f"  Start Time:       {self.time_to_str(self.container_start_time)}\n"
+    msg += f"  Resource CPU:     {self._cpu_limit} cores\n"
+    msg += f"  Resource GPU:     {self._gpu_limit}\n"
+    msg += f"  Resource Mem:     {self._mem_limit}\n"
+    msg += f"  Target Image:     {self.cfg_image}\n"
+    msg += f"  CR:               {self.cfg_cr}\n"
+    msg += f"  CR User:          {self.cfg_cr_user}\n"
+    msg += f"  CR Pass:          {'*' * len(self.cfg_cr_password) if self.cfg_cr_password else 'None'}\n"
+    msg += f"  Env Vars:         {self.cfg_env}\n"
+    msg += f"  Cont. Port:       {self.cfg_port}\n"
+    msg += f"  Restart:          {self.cfg_restart_policy}\n"
+    msg += f"  Image Pull:       {self.cfg_image_pull_policy}\n"
+    if self.volumes and len(self.volumes) > 0:
+      msg += "  Volumes:\n"
+      for host_path, container_path in self.volumes.items():
+        msg += f"    Host {host_path} → Container {container_path}\n"
+    if self.extra_ports_mapping:
+      msg += "  Extra Ports Mapping:\n"
+      for container_port, host_port in self.extra_ports_mapping.items():
+        msg += f"    Container {container_port} → Host {host_port}\n"
+    msg += f"  Ngrok Host Port:  {self.port}\n"
+    msg += f"  CLI Tool:         {self.cli_tool}\n"
     self.P(msg)
     return
   
@@ -129,13 +142,7 @@ class ContainerAppRunnerPlugin(
     Determines whether Docker or Podman is available, sets up port (if needed),
     and prepares for container run.    
     """
-    DEFAULT_CPU_LIMIT = 1
-    DEFAULT_GPU_LIMIT = 0
-    DEFAULT_MEM_LIMIT = "512m"
-    
 
-    self._reset_ngrok() # call ngrok var init
-    
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
     self.container_proc = None
@@ -145,59 +152,129 @@ class ContainerAppRunnerPlugin(
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
     self.container_log_proc = None    
     self.container_logreader = None
+
+    # Handle port allocation for main port and additional ports
+    self.port = None
+    self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
+
+    self.volumes = {}
+
+    self._reset_ngrok() # call ngrok var init
+
+    self._detect_cli_tool() # detect if we have docker or podman
+    self._container_maybe_login() # login to the container registry if needed
+
+    self._setup_app_ngrok_port() # allocate the main port if needed
+    self._setup_resource_limits() # setup container resource limits (CPU, GPU, memory, ports)
+    self._setup_volumes() # setup container volumes
+
+    self._container_run() # start the container app
     
-    
-    resource_limits = self.cfg_container_resources
-    if isinstance(resource_limits, dict) and len(resource_limits) > 0:
-      self._cpu_limit = resource_limits.get("cpu", DEFAULT_CPU_LIMIT)
-      self._gpu_limit = resource_limits.get("gpu", DEFAULT_GPU_LIMIT)
-      self._mem_limit = resource_limits.get("memory", DEFAULT_MEM_LIMIT)
-    else:
-      self._cpu_limit = DEFAULT_CPU_LIMIT
-      self._gpu_limit = DEFAULT_GPU_LIMIT
-      self._mem_limit = DEFAULT_MEM_LIMIT
-    #endif resource limits
-    
-    # Detect CLI tool (docker or podman)
+    self._container_start_capture_logs() # start the log reader process
+        
+    self.__show_container_app_info() # show container app info
+    return
+
+  def _detect_cli_tool(self):
+    """
+    Detects whether Docker or Podman is available on the system.
+    """
     if shutil.which("docker"):
       self.cli_tool = "docker"
     elif shutil.which("podman"):
       self.cli_tool = "podman"
     else:
       raise RuntimeError("No container runtime (Docker/Podman) found on this system.")
+    #endif
+    return
 
-    self._container_maybe_login()
 
-    # If a container port is specified, we treat it as a web app
-    # and request a host port for local binding
-    self.port = None
+  def _setup_resource_limits(self):
+    """
+    Sets up resource limits for the container based on the configuration.
+    """
+    DEFAULT_CPU_LIMIT = 1
+    DEFAULT_GPU_LIMIT = 0
+    DEFAULT_MEM_LIMIT = "512m"
+    DEFAULT_PORTS = []
+
+    container_resources = self.cfg_container_resources
+    if isinstance(container_resources, dict) and len(container_resources) > 0:
+      self._cpu_limit = container_resources.get("cpu", DEFAULT_CPU_LIMIT)
+      self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
+      self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
+
+      ports = container_resources.get("ports", DEFAULT_PORTS)
+      # Process additional ports if specified in PORTS
+      if len(ports) > 0:
+        for container_port in ports:
+          self.P(f"Additional container port {container_port} specified. Finding available host port ...")
+          host_port = self.__allocate_free_port()
+          self.extra_ports_mapping[container_port] = host_port
+          self.P(f"Allocated free host port {host_port} for container port {container_port}.")
+        # endfor each additional port
+      # endif additional ports
+    else:
+      self._cpu_limit = DEFAULT_CPU_LIMIT
+      self._gpu_limit = DEFAULT_GPU_LIMIT
+      self._mem_limit = DEFAULT_MEM_LIMIT
+    # endif resource limits
+    return
+
+
+  def _setup_volumes(self):
+    """
+    Processes the volumes specified in the configuration.
+    """
+    if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
+      for host_path, container_path in self.cfg_volumes.items():
+        original_path = str(host_path)
+        sanitized_name = self.sanitize_name(original_path)
+
+        # Prefix the sanitized name with the instance ID
+        prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
+        self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
+
+        full_host_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
+        self.volumes[full_host_path] = container_path
+
+      # endfor each host path
+    # endif volumes
+    return
+
+  def _setup_app_ngrok_port(self):
+    """
+    Processes the main port if specified in the configuration.
+    """
     if self.cfg_port:
       self.P(f"Container port {self.cfg_port} specified. Finding available host port ...")
-      # Allocate a host port for the container
-      # We'll use a socket to find an available port
-      # This is a common approach to find an available port
-      # We'll bind to port 0, which tells the OS to pick an available port
-      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-      sock.bind(("", 0))
-      self.port = sock.getsockname()[1]
-      sock.close()
-      self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")    
-      
-      self.maybe_init_ngrok()
-    #endif port
+      # Allocate a host port for the container using the utility method
+      self.port = self.__allocate_free_port()
+      self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")
 
-    # start the container app
-    self._container_run()
-    
-    if self.port is not None:
-      self.maybe_start_ngrok()
-    
-    self._container_start_capture_logs()
-        
-    # Show container app info
-    self.__show_container_app_info()
+      self.maybe_init_ngrok()
+    # endif port
     return
+
+  def __allocate_free_port(self):
+    """
+    Allocates an available port on the host system.
+    
+    This method uses a common technique for finding an available port:
+    1. Create a new socket
+    2. Bind to port 0, which tells the OS to select any available port
+    3. Get the port number that was assigned
+    4. Close the socket to release it for actual use
+    
+    Returns:
+        int: The allocated port number
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind(("", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return port
 
 
   def on_close(self):
