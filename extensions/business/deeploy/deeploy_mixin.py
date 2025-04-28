@@ -131,6 +131,7 @@ class _DeeployMixin:
     }
     
     # Get available resources
+    avail_cpu = self.netmon.network_node_get_cpu_avail_cores(addr)
     avail_mem = self.netmon.network_node_available_memory(addr)  # in bytes
     avail_disk = self.netmon.network_node_available_disk(addr)  # in bytes
 
@@ -140,6 +141,19 @@ class _DeeployMixin:
     required_cpu = required_resources.get('cpu', 1)
 
     required_mem_bytes = self.__parse_memory(required_mem)
+
+    # CPU check
+    if avail_cpu < required_cpu:
+      result['available']['cpu'] = avail_cpu
+      result['required']['cpu'] = required_cpu
+
+      result['status'] = False
+      result['details'].append({
+          'resource': 'CPU',
+          'available': avail_cpu,
+          'required': required_cpu,
+          'unit': 'cores'
+      })
 
     # Check memory
     if avail_mem < required_mem_bytes:
