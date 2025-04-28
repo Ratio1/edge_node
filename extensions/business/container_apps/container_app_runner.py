@@ -61,7 +61,7 @@ _CONFIG = {
     "cpu": 1,         # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,
     "memory": "512m",  # e.g. "512m" for 512MB,
-    "ports": []  # list of additional container ports to expose (list of ints)
+    "ports_mapping": {}  # dict of additional container ports to host ports, e.g. {8080: 8081}
   },
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
@@ -196,7 +196,7 @@ class ContainerAppRunnerPlugin(
     DEFAULT_CPU_LIMIT = 1
     DEFAULT_GPU_LIMIT = 0
     DEFAULT_MEM_LIMIT = "512m"
-    DEFAULT_PORTS = []
+    DEFAULT_PORTS_MAPPING = {}
 
     container_resources = self.cfg_container_resources
     if isinstance(container_resources, dict) and len(container_resources) > 0:
@@ -204,16 +204,20 @@ class ContainerAppRunnerPlugin(
       self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
       self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
 
-      ports = container_resources.get("ports", DEFAULT_PORTS)
-      # Process additional ports if specified in PORTS
-      if len(ports) > 0:
-        for container_port in ports:
-          self.P(f"Additional container port {container_port} specified. Finding available host port ...")
-          host_port = self.__allocate_free_port()
-          self.extra_ports_mapping[container_port] = host_port
-          self.P(f"Allocated free host port {host_port} for container port {container_port}.")
-        # endfor each additional port
-      # endif additional ports
+      ports_mapping = container_resources.get("ports_mapping", DEFAULT_PORTS_MAPPING)
+
+      if len(ports_mapping) > 0:
+        for host_port, container_port in ports_mapping.items():
+          try:
+            host_port = int(host_port)
+            self.__allocate_port(host_port)
+            self.extra_ports_mapping[container_port] = host_port
+          except Exception as e:
+            self.P(f"Port {host_port} is not available.")
+            self.P(e)
+          # endtry
+        # endfor each port mapping
+      # endif ports_mapping
     else:
       self._cpu_limit = DEFAULT_CPU_LIMIT
       self._gpu_limit = DEFAULT_GPU_LIMIT
@@ -249,29 +253,43 @@ class ContainerAppRunnerPlugin(
     if self.cfg_port:
       self.P(f"Container port {self.cfg_port} specified. Finding available host port ...")
       # Allocate a host port for the container using the utility method
-      self.port = self.__allocate_free_port()
+      self.port = self.__allocate_port()
       self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")
 
       self.maybe_init_ngrok()
     # endif port
     return
 
-  def __allocate_free_port(self):
+  def __allocate_port(self, required_port = 0):
     """
-    Allocates an available port on the host system.
+    Allocates an available port on the host system for container port mapping.
     
-    This method uses a common technique for finding an available port:
-    1. Create a new socket
-    2. Bind to port 0, which tells the OS to select any available port
-    3. Get the port number that was assigned
-    4. Close the socket to release it for actual use
+    This method finds an available port on the host system that can be used for container port mapping.
+    If required_port is 0 (default), the OS will automatically select any available port.
+    If required_port is specified, the method will attempt to bind to that specific port.
+    
+    The method uses a socket-based approach to port allocation:
+    1. Creates a new TCP socket
+    2. Sets SO_REUSEADDR option to allow immediate reuse of the port
+    3. Binds to the specified port (or any available port if 0)
+    4. Retrieves the actual port number that was bound
+    5. Closes the socket to release it for actual use
+    
+    Args:
+        required_port (int, optional): The specific port number to allocate. 
+            If 0 (default), the OS will select any available port.
     
     Returns:
-        int: The allocated port number
+        int: The allocated port number. This will be the same as required_port if specified
+             and available, or a randomly assigned port if required_port is 0.
+    
+    Note:
+        The socket is closed immediately after port allocation to allow the port to be used
+        by the container. This is a common technique for port allocation in container runtimes.
     """
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("", 0))
+    sock.bind(("", required_port))
     port = sock.getsockname()[1]
     sock.close()
     return port
