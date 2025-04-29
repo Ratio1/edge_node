@@ -35,6 +35,7 @@ class AI4EveryonePlugin(BasePlugin):
   CONFIG = _CONFIG
 
   def __init__(self, **kwargs):
+    self.__init_done = False
     super(AI4EveryonePlugin, self).__init__(**kwargs)
     self.jobs_data = {}
     self.requests_responses = {}
@@ -54,12 +55,15 @@ class AI4EveryonePlugin(BasePlugin):
   def on_init(self):
     super(AI4EveryonePlugin, self).on_init()
     self.jobs_data = self.load_persistence_data()
+    self.__init_done = True
     return
 
   """SESSION SECTION"""
   if True:
     def on_payload(self, sess: Session, node_id: str, pipeline: str, signature: str, instance: str, payload: Payload):
       if signature.lower() not in AI4E_CONSTANTS.RELEVANT_PLUGIN_SIGNATURES:
+        return
+      if not self.__init_done:
         return
       is_status = payload.data.get('IS_STATUS', False)
       is_final_dataset_status = payload.data.get('IS_FINAL_DATASET_STATUS', False)

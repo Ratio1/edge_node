@@ -217,8 +217,12 @@ class Job:
     if signature.lower() in AI4E_CONSTANTS.TRAINING_PLUGIN_SIGNATURES:
       self.train_status_full_payload = data
     if 'TRAIN_STATUS' in data.keys():
-      self.train_status['status'] = data.get('JOB_STATUS', self.train_status['status'])
       full_train_data = data.get('TRAIN_STATUS', {})
+      if not isinstance(full_train_data, dict):
+        if self.owner.cfg_debug_web_app:
+          self.owner.P(f"Training status is not a dict: {full_train_data}")
+        return
+      self.train_status['status'] = data.get('JOB_STATUS', self.train_status['status'])
       train_data = full_train_data.get('STATUS', {})
       self.train_status['remaining'] = train_data.get('REMAINING', self.train_status['remaining'])
       self.train_status['elapsed'] = train_data.get('ELAPSED', self.train_status['elapsed'])
@@ -304,6 +308,8 @@ class Job:
     }
 
   def get_train_status(self):
+    if self.train_status.get('status') is None:
+      return {}
     elapsed = self.train_status.get('elapsed') or 0
     remaining = self.train_status.get('remaining') or 0
     total = elapsed + remaining

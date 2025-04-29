@@ -21,6 +21,7 @@ class CustomTrainingPipeline(BaseExeEngTrainingPipeline, abc.ABC):
         f'CLASSES not provided or incorrect format! Please provide list of classes instead of {classes}'
       )
     # endif classes not provided
+    classes = [cls.strip() if isinstance(cls, str) else cls for cls in classes]
     grid_search = self.config.get('GRID_SEARCH', {})
     factory_config = get_factory_config(model_arch)['GRID_SEARCH']
     self.config['GRID_SEARCH'] = {**factory_config, **grid_search}
