@@ -178,19 +178,32 @@ class _DeeployMixin:
     # endfor each target node
     return response_keys
 
-  def __get_responses_status(self, response_keys):
+  def __monitor_pipeline_responses(self, response_keys, timeout_seconds=300):
     """
-    Wait until all the responses are received via CSTORE and compose status response
+    Wait until all the responses are received via CSTORE and compose status response.
+    Args:
+        response_keys (dict): Dictionary mapping response keys to node addresses
+        timeout_seconds (int): Maximum time to wait for responses in seconds
+    Returns:
+        tuple: (dct_status, str_status) where:
+            dct_status: Dictionary of response statuses
+            str_status: Overall status ('success', 'timeout', or 'pending')
     """
     dct_status = {}
     str_status = 'pending'
     done = False if len(response_keys) > 0 else True
+    start_time = self.time()
+    
     while not done:
+      current_time = self.time()
+      if current_time - start_time > timeout_seconds:
+        str_status = 'timeout'
+        done = True
+        break
+        
       for response_key in response_keys:
-        # now check the status of the response
-        # and wait with timeout until the response is received
         node_addr = response_keys[response_key]
-        res = self.chainstore_get(response_key)  # TODO: make sure the container-runner is chainstor_set-ing
+        res = self.chainstore_get(response_key)
         if res is not None:
           dct_status[response_key] = {
             'node': node_addr,
@@ -199,7 +212,6 @@ class _DeeployMixin:
       if len(dct_status) == len(response_keys):
         str_status = 'success'
         done = True
-      # TODO: add timeout
       # end for each response key
     # endwhile cycle until all responses are received
     return dct_status, str_status
@@ -355,8 +367,8 @@ class _DeeployMixin:
     response_keys = self.__launch_pipeline_on_nodes(nodes, inputs, app_id, app_alias, app_type, sender)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response (TODO: method)
-    dct_status, str_status = self.__get_responses_status(response_keys)
+    dct_status, str_status = self.__monitor_pipeline_responses(response_keys)
 
-    # TODO: we must defind failure and success conditions (after initial implementation is done)
+    # TODO: we must define failure and success conditions (after initial implementation is done)
 
     return dct_status, str_status
