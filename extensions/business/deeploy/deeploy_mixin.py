@@ -352,7 +352,7 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def validate_and_deploy_pipeline(self, sender, inputs, app_id, app_alias, app_type):
+  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """

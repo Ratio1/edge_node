@@ -23,7 +23,7 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
-  'DEEPLOY_VERBOSE' : 1,
+  'DEEPLOY_VERBOSE' : 10,
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   
@@ -193,8 +193,8 @@ class DeeployManagerPlugin(
       app_type = inputs.pipeline_input_type
       app_id = (app_alias.lower()[:8] + "_" + self.uuid(7)).lower()
 
-      dct_status, str_status = self.validate_and_deploy_pipeline(sender, inputs, app_id, app_alias, app_type)
-      
+      dct_status, str_status = self.check_and_deploy_pipelines(sender, inputs, app_id, app_alias, app_type)
+
       result = {
         'status' : str_status,
         'status_details' : dct_status,
