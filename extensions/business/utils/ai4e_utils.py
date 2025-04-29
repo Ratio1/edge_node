@@ -295,7 +295,9 @@ class Job:
     }
 
   def get_train_status(self):
-    total = self.train_status['elapsed'] + self.train_status['remaining']
+    elapsed = self.train_status.get('elapsed') or 0
+    remaining = self.train_status.get('remaining') or 0
+    total = elapsed + remaining
     progress = 0
     if total > 0:
       progress = self.train_status['elapsed'] / total
