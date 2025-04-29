@@ -58,10 +58,10 @@ _CONFIG = {
   "ENV": {},                # dict of env vars for the container
   "PORT": None,             # internal container port if it's a web app (int)
   "CONTAINER_RESOURCES" : {
-    "cpu": 1,         # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
+    "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,
     "memory": "512m",  # e.g. "512m" for 512MB,
-    "ports_mapping": {}  # dict of additional container ports to host ports, e.g. {8080: 8081}
+    "ports": []        # dict of container_port: host_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
@@ -196,7 +196,7 @@ class ContainerAppRunnerPlugin(
     DEFAULT_CPU_LIMIT = 1
     DEFAULT_GPU_LIMIT = 0
     DEFAULT_MEM_LIMIT = "512m"
-    DEFAULT_PORTS_MAPPING = {}
+    DEFAULT_PORTS = []
 
     container_resources = self.cfg_container_resources
     if isinstance(container_resources, dict) and len(container_resources) > 0:
@@ -204,20 +204,27 @@ class ContainerAppRunnerPlugin(
       self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
       self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
 
-      ports_mapping = container_resources.get("ports_mapping", DEFAULT_PORTS_MAPPING)
+      ports = container_resources.get("ports", DEFAULT_PORTS)
 
-      if len(ports_mapping) > 0:
-        for host_port, container_port in ports_mapping.items():
-          try:
-            host_port = int(host_port)
-            self.__allocate_port(host_port)
+      if len(ports) > 0:
+        if isinstance(ports, list):
+          # Handle list of container ports
+          for container_port in ports:
+            self.P(f"Additional container port {container_port} specified. Finding available host port ...")
+            host_port = self.__allocate_free_port()
             self.extra_ports_mapping[container_port] = host_port
-          except Exception as e:
-            self.P(f"Port {host_port} is not available.")
-            self.P(e)
-          # endtry
-        # endfor each port mapping
-      # endif ports_mapping
+            self.P(f"Allocated free host port {host_port} for container port {container_port}.")
+        else:
+          # Handle dict of port mappings
+          for host_port, container_port in ports.items():
+            try:
+              host_port = int(host_port)
+              self.__allocate_port(host_port)
+              self.extra_ports_mapping[container_port] = host_port
+            except Exception as e:
+              self.P(f"Port {host_port} is not available.")
+              self.P(e)
+      # endif ports
     else:
       self._cpu_limit = DEFAULT_CPU_LIMIT
       self._gpu_limit = DEFAULT_GPU_LIMIT
