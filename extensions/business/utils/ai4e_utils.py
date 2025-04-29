@@ -7,12 +7,18 @@ def job_data_to_id(node_id, pipeline, signature, instance):
   return instance
 
 
+def maybe_strip(s):
+  if isinstance(s, str):
+    return s.strip()
+  return s
+
+
 def classes_dict_to_msg(classes):
-  return [{'name': k, 'description': v} for k, v in classes.items()]
+  return [{'name': maybe_strip(k), 'description': v} for k, v in classes.items()]
 
 
 def classes_msg_to_dict(classes):
-  return {c['name']: c['description'] for c in classes}
+  return {maybe_strip(c['name']): c['description'] for c in classes}
 
 
 def process_data_sources(data_sources):
@@ -188,6 +194,9 @@ class Job:
     cd_datetime = datetime.strptime(cd_str[:-6], '%Y%m%d%H%M%S') if cd_str is not None else None
     self.creation_date = int(cd_datetime.timestamp()) if cd_datetime is not None else None
     self.classes = data.get('CLASSES', self.classes)
+    if self.classes is not None:
+      self.classes = {maybe_strip(k): v for k, v in self.classes.items()}
+    # endif classes
     self.job_status = data.get('JOB_STATUS', self.job_status)
 
     self.crop_status['total_stats'] = data.get('COUNTS', self.crop_status['total_stats'])
@@ -295,7 +304,9 @@ class Job:
     }
 
   def get_train_status(self):
-    total = self.train_status['elapsed'] + self.train_status['remaining']
+    elapsed = self.train_status.get('elapsed') or 0
+    remaining = self.train_status.get('remaining') or 0
+    total = elapsed + remaining
     progress = 0
     if total > 0:
       progress = self.train_status['elapsed'] / total

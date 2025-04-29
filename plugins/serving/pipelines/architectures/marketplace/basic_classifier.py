@@ -58,9 +58,16 @@ class BasicClassifierModelFactory(th.nn.Module):
     # endfor hidden layers
     final = th.nn.Linear(hidden2, output_size)
     self.blocks.append(final)
+    self.softmax = th.nn.Softmax(dim=1)
     return
 
   def forward(self, th_x):
     for block in self.blocks:
       th_x = block(th_x)
+    return th_x
+
+  @th.jit.export
+  def predict(self, th_x):
+    th_x = self.forward(th_x)
+    th_x = self.softmax(th_x)
     return th_x

@@ -82,6 +82,10 @@ class ThYoloSecondStage(BaseServingProcess):
     self._second_stage_model_warmup()
     return
 
+  def model_call(self, model, th_inputs):
+    # this method defines default behavior for model call
+    return model.predict(th_inputs) if hasattr(model, 'predict') else model(th_inputs)
+
   def _second_stage_model_warmup(self):
     # this method defines default behavior for second stage model warmup
 
@@ -120,6 +124,38 @@ class ThYoloSecondStage(BaseServingProcess):
       #endfor
     #endif
     return lst_yolo_results
+
+  def is_prob_tensor(self, t, dim: int = 1,
+                   atol: float = 1e-4, rtol: float = 1e-3) -> bool:
+    """
+    Heuristic: tensor is in [0,1] and sums to 1 on `dim`.
+    Works for softmaxed class scores.
+    """
+    if t.dtype.is_floating_point is False:
+      return False
+    if not self.th.all((t >= 0) & (t <= 1)):
+      return False
+    # sum-to-1 check (allows small numerical drift)
+    ones = self.th.ones(t.size(dim), device=t.device)
+    return self.th.allclose(t.sum(dim=dim), ones, atol=atol, rtol=rtol)
+
+  def maybe_softmax(self, th_x):
+    """
+    This will be removed in the future.
+    Applies softmax to the input tensor if it is not already a probability distribution.
+    Parameters
+    ----------
+    th_x : torch.Tensor
+        The input tensor to be processed.
+
+    Returns
+    -------
+
+    """
+    if self.is_prob_tensor(th_x):
+      return th_x
+    return self.th.nn.functional.softmax(th_x, dim=1)
+
 
   def _second_stage_classifier(self, pred_nms, th_inputs):
     crop_imgs = []
@@ -169,7 +205,9 @@ class ThYoloSecondStage(BaseServingProcess):
     #endif
 
     self._start_timer("second_stage_fw")
-    out = self.second_stage_model(batch)
+    out = self.model_call(model=self.second_stage_model, th_inputs=batch)
+    out = self.maybe_softmax(out)
+    self.P(f"Second stage model output: {out}")
     out = self.th.max(out, dim=1)#.tolist()
     results = []
     self._stop_timer("second_stage_fw")
