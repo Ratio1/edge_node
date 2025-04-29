@@ -102,16 +102,16 @@ class _DeeployMixin:
     """
     Convert memory string to bytes.
     Args:
-        mem_str (str): Memory string in format '512m', '1g', or bytes
+        mem_str (str): Memory string in format '512m', '1g', '1.3g, or bytes
     Returns:
         int: Memory in bytes
     """
     if mem_str.endswith('m'):
-      return int(mem_str[:-1]) * 1024 * 1024  # MB to bytes
+      return int(float(mem_str[:-1]) * 1024 * 1024)  # MB to bytes
     elif mem_str.endswith('g'):
-      return int(mem_str[:-1]) * 1024 * 1024 * 1024  # GB to bytes
+      return int(float(mem_str[:-1]) * 1024 * 1024 * 1024)  # GB to bytes
     else:
-      return int(mem_str)  # assume bytes
+      return int(float(mem_str))  # assume bytes
 
   def __check_nodes_availability(self, inputs):
     """
@@ -155,7 +155,7 @@ class _DeeployMixin:
 
             if inputs.chainstore_response:
               plugin_instance[
-                self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key  # TODO: add CHAINSTORE_RESPONSE_KEY const
+                self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
               response_keys[response_key] = addr
           # endfor each plugin instance
         # enford each plugin
@@ -236,7 +236,8 @@ class _DeeployMixin:
     
     # Get available resources
     avail_cpu = self.netmon.network_node_get_cpu_avail_cores(addr)
-    avail_mem = self.netmon.network_node_available_memory(addr)  # in bytes
+    avail_mem = self.netmon.network_node_available_memory(addr)  # in GB
+    avail_mem_bytes = self.__parse_memory(f"{avail_mem}g")
     avail_disk = self.netmon.network_node_available_disk(addr)  # in bytes
 
     # Get required resources from the request
@@ -260,12 +261,12 @@ class _DeeployMixin:
       })
 
     # Check memory
-    if avail_mem < required_mem_bytes:
-      result['available']['memory'] = avail_mem
+    if avail_mem_bytes < required_mem_bytes:
+      result['available']['memory'] = avail_mem_bytes
       result['required']['memory'] = required_mem_bytes
 
       result['status'] = False
-      avail_mem_mb = avail_mem / (1024 * 1024)
+      avail_mem_mb = avail_mem_bytes / (1024 * 1024)
       required_mem_mb = result['required']['memory'] / (1024 * 1024)
       result['details'].append({
           'resource': 'Memory',
