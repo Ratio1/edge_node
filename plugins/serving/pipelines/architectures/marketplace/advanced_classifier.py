@@ -140,6 +140,7 @@ class AdvancedClassifierModelFactory(th.nn.Module):
       act=activation
     )
 
+    self.softmax = th.nn.Softmax(dim=1)
     return
 
   def post_backbone(self, th_x):
@@ -152,4 +153,10 @@ class AdvancedClassifierModelFactory(th.nn.Module):
     th_x = th_x.to(next(self.parameters()).dtype)
     th_x = self.backbone(th_x)
     th_x = self.post_backbone(th_x)
+    return th_x
+
+  @th.jit.export
+  def predict(self, th_x):
+    th_x = self(th_x)
+    th_x = self.softmax(th_x)
     return th_x
