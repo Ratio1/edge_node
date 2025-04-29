@@ -236,8 +236,11 @@ class DeeployManagerPlugin(
                 response_keys[response_key] = addr
             #endfor each plugin instance
           #enford each plugin
-        #endif
-        self.P(f"Starting pipeline '{app_alias}' on {addr}")
+        #endif        
+        msg = ''
+        if self.cfg_deeploy_verbose > 1:
+          msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
+        self.P(f"Starting pipeline '{app_alias}' on {addr}{msg}")        
         if addr is not None:
           self.cmdapi_start_pipeline_by_params(
             name=app_id,
