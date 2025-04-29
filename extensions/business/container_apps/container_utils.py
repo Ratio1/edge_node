@@ -79,6 +79,8 @@ class _ContainerUtilsMixin:
     # Env vars
     for key, val in self.cfg_env.items():
       cmd += ["-e", f"{key}={val}"]
+      
+    # TODO: add edge-node IP to env vars as EDGE_NODE_IP
 
     # Volume mounts
     if len(self.volumes) > 0:
