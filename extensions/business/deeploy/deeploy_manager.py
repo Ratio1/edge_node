@@ -190,9 +190,12 @@ class DeeployManagerPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
       
       # TODO: move to the mixin when ready
+      # START MOVE TO mixin            
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type 
       app_id = (app_alias.lower()[:8] + "_" + self.uuid(7)).lower()
+      
+      # Phase 1: Check if nodes are available (TODO: method)
       nodes = []
       for node in inputs.target_nodes:
         addr = self._check_and_maybe_convert_address(node)
@@ -213,17 +216,27 @@ class DeeployManagerPlugin(
       if len(nodes) == 0:
         msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
         raise ValueError(msg)
-
+ 
+      # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action (TODO: method)
       plugins = self.deeploy_prepare_plugins(inputs)
-
+      response_keys = {}
       for addr in nodes:
         # Nodes to peer with for CHAINSTORE
         nodes_to_peer = [n for n in nodes if n != addr]
         node_plugins = self.deepcopy(plugins)
         if len(nodes_to_peer) > 0:
           for plugin in node_plugins:
-            for plugin_instance in plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES]:
+            for plugin_instance in plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES]: 
+              # currenly `for` is redundant but in future we will be able to have multiple instances of the same plugin
+              response_key = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] + '_' + self.uuid(4)
               plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
+              
+              if inputs.chainstore_response:             
+                plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key # TODO: add CHAINSTORE_RESPONSE_KEY const
+                response_keys[response_key] = addr
+            #endfor each plugin instance
+          #enford each plugin
+        #endif
         self.P(f"Starting pipeline '{app_alias}' on {addr}")
         if addr is not None:
           self.cmdapi_start_pipeline_by_params(
@@ -233,13 +246,40 @@ class DeeployManagerPlugin(
             node_address=addr,
             owner=sender,
             url=inputs.pipeline_input_uri,
-            plugins=node_plugins,
+            plugins=node_plugins,            
           )
         #endif addr is valid
       #endfor each target node
       
+      # Phase 3: Wait until all the responses are received via CSTORE and compose status response (TODO: method)
+      dct_status = {}
+      str_status = 'pending'      
+      done = False if len(response_keys) > 0 else True
+      while not done:
+        for response_key in response_keys:
+          # now check the status of the response
+          # and wait with timeout until the response is received
+          node_addr = response_keys[response_key]
+          res = self.chainstore_get(response_key) # TODO: make sure the container-runner is chainstor_set-ing
+          if res is not None:
+            dct_status[response_key] = {
+              'node' : node_addr,
+              'details' : res
+            }
+        if len(dct_status) == len(response_keys):
+          str_status = 'success'
+          done = True
+        # TODO: add timeout
+        #end for each response key
+      #endwhile cycle until all responses are received
+      
+      # TODO: we must defind failure and success conditions (after initial implementation is done)
+      # END MOVE TO mixin
+      
+      
       result = {
-        'status' : 'success',
+        'status' : str_status,
+        'status_details' : dct_status,
         'app_id' : app_id,
         'request' : {
           'app_alias' : app_alias,

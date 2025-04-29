@@ -59,6 +59,7 @@ DEEPLOY_CREATE_REQUEST = {
   },
   "pipeline_input_type"  : "void",
   "pipeline_input_uri" : None,
+  "chainstore_response" : False,
 }
 
 
