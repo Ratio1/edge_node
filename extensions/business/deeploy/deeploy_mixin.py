@@ -1,5 +1,6 @@
 from naeural_core.constants import BASE_CT
 
+from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS
 
 DEEPLOY_DEBUG = True
 
@@ -111,6 +112,97 @@ class _DeeployMixin:
       return int(mem_str[:-1]) * 1024 * 1024 * 1024  # GB to bytes
     else:
       return int(mem_str)  # assume bytes
+
+  def __check_nodes_availability(self, inputs):
+    """
+    Check if the target nodes are online and have sufficient resources.
+    """
+    nodes = []
+    for node in inputs.target_nodes:
+      addr = self._check_and_maybe_convert_address(node)
+      is_online = self.netmon.network_node_is_online(addr)
+      if is_online:
+        node_resources = self.check_node_resources(addr, inputs)
+        if not node_resources['status']:
+          error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
+          for detail in node_resources['details']:
+            error_msg += f"- {detail['resource']}: available {detail['available']:.2f}{detail['unit']} < required {detail['required']:.2f}{detail['unit']}\n"
+          raise ValueError(error_msg)
+        nodes.append(addr)
+      else:
+        msg = f"{DEEPLOY_ERRORS.NODES1}: Node {addr} is not online"
+        raise ValueError(msg)
+      # endif is_online
+    # endfor each target node check address and status
+    return nodes
+
+  def __launch_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender):
+    """
+    Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
+    """
+    plugins = self.deeploy_prepare_plugins(inputs)
+    response_keys = {}
+    for addr in nodes:
+      # Nodes to peer with for CHAINSTORE
+      nodes_to_peer = [n for n in nodes if n != addr]
+      node_plugins = self.deepcopy(plugins)
+      if len(nodes_to_peer) > 0:
+        for plugin in node_plugins:
+          for plugin_instance in plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES]:
+            # currenly `for` is redundant but in future we will be able to have multiple instances of the same plugin
+            response_key = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] + '_' + self.uuid(4)
+            plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
+
+            if inputs.chainstore_response:
+              plugin_instance[
+                self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key  # TODO: add CHAINSTORE_RESPONSE_KEY const
+              response_keys[response_key] = addr
+          # endfor each plugin instance
+        # enford each plugin
+      # endif
+      msg = ''
+      if self.cfg_deeploy_verbose > 1:
+        msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
+      self.P(f"Starting pipeline '{app_alias}' on {addr}{msg}")
+      if addr is not None:
+        self.cmdapi_start_pipeline_by_params(
+          name=app_id,
+          app_alias=app_alias,
+          pipeline_type=app_type,
+          node_address=addr,
+          owner=sender,
+          url=inputs.pipeline_input_uri,
+          plugins=node_plugins,
+        )
+      # endif addr is valid
+    # endfor each target node
+    return response_keys
+
+  def __get_responses_status(self, response_keys):
+    """
+    Wait until all the responses are received via CSTORE and compose status response
+    """
+    dct_status = {}
+    str_status = 'pending'
+    done = False if len(response_keys) > 0 else True
+    while not done:
+      for response_key in response_keys:
+        # now check the status of the response
+        # and wait with timeout until the response is received
+        node_addr = response_keys[response_key]
+        res = self.chainstore_get(response_key)  # TODO: make sure the container-runner is chainstor_set-ing
+        if res is not None:
+          dct_status[response_key] = {
+            'node': node_addr,
+            'details': res
+          }
+      if len(dct_status) == len(response_keys):
+        str_status = 'success'
+        done = True
+      # TODO: add timeout
+      # end for each response key
+    # endwhile cycle until all responses are received
+    return dct_status, str_status
 
   def check_node_resources(self, addr, inputs):
     """
@@ -246,4 +338,25 @@ class _DeeployMixin:
     """
     plugin = self.deeploy_prepare_single_plugin_instance(inputs)
     plugins = [plugin]
-    return plugins      
+    return plugins
+
+  def validate_and_deploy_pipeline(self, sender, inputs, app_id, app_alias, app_type):
+    """
+    Validate the inputs and deploy the pipeline on the target nodes.
+    """
+    # Phase 1: Check if nodes are available
+    nodes = self.__check_nodes_availability(inputs)
+
+    if len(nodes) == 0:
+      msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
+      raise ValueError(msg)
+
+    # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
+    response_keys = self.__launch_pipeline_on_nodes(nodes, inputs, app_id, app_alias, app_type, sender)
+
+    # Phase 3: Wait until all the responses are received via CSTORE and compose status response (TODO: method)
+    dct_status, str_status = self.__get_responses_status(response_keys)
+
+    # TODO: we must defind failure and success conditions (after initial implementation is done)
+
+    return dct_status, str_status
