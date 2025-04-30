@@ -158,23 +158,7 @@ class ContainerAppRunnerPlugin(
     Determines whether Docker or Podman is available, sets up port (if needed),
     and prepares for container run.    
     """
-
-    self.container_id = None
-    self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
-    self.container_proc = None
-    
-    self.container_log_last_show_time = 0
-    self.container_log_last_line_start = ""
-    self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
-    self.container_log_proc = None    
-    self.container_logreader = None
-
-    # Handle port allocation for main port and additional ports
-    self.port = None
-    self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
-
-    self.volumes = {}
-
+    self.__reset_vars()
     self._reset_ngrok() # call ngrok var init
 
     self._detect_cli_tool() # detect if we have docker or podman
