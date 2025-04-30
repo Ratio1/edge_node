@@ -47,6 +47,28 @@ DEEPLOY_CREATE_REQUEST = {
       "ENV3" : "value3",
       "ENV4" : "value4",
     },
+    "DYNAMIC_ENV" : {
+      "ENV5" : [
+        {
+          "type" : "static",
+          "value" : "http://"
+        },
+        {
+          "type" : "host_ip",
+          "value" : None
+        },
+        {
+          "type" : "static",
+          "value" : ":5080/test_api_endpoint"
+        }
+      ],
+      "ENV6" : [
+        {
+          "type" : "host_ip",
+          "value" : "http://"
+        }
+      ],
+    },
     "RESTART_POLICY" : "always",
     "IMAGE_PULL_POLICY" : "always",
     
