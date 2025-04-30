@@ -64,6 +64,7 @@ class AI4EveryonePlugin(BasePlugin):
       if signature.lower() not in AI4E_CONSTANTS.RELEVANT_PLUGIN_SIGNATURES:
         return
       if not self.__init_done:
+        sess.P(f"[DEBUG_AI4E]Session not initialized yet, ignoring payload.")
         return
       is_status = payload.data.get('IS_STATUS', False)
       is_final_dataset_status = payload.data.get('IS_FINAL_DATASET_STATUS', False)
