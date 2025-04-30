@@ -132,8 +132,24 @@ class ContainerAppRunnerPlugin(
     msg += f"  CLI Tool:         {self.cli_tool}\n"
     self.P(msg)
     return
-  
-  
+
+  def __reset_vars(self):
+    self.container_id = None
+    self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
+    self.container_proc = None
+
+    self.container_log_last_show_time = 0
+    self.container_log_last_line_start = ""
+    self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
+    self.container_log_proc = None
+    self.container_logreader = None
+
+    # Handle port allocation for main port and additional ports
+    self.port = None
+    self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
+
+    self.volumes = {}
+    return
 
   def on_init(self):
     """
@@ -173,7 +189,11 @@ class ContainerAppRunnerPlugin(
     self._container_start_capture_logs() # start the log reader process
         
     self.__show_container_app_info() # show container app info
+
+    self._maybe_send_plugin_start_confirmation()
+
     return
+
 
   def _detect_cli_tool(self):
     """

@@ -281,6 +281,21 @@ class _ContainerUtilsMixin:
       #endif
     #end for each log line
     return logs
-    
-  
+
+  def _maybe_send_plugin_start_confirmation(self):
+    """
+    Sets up confirmation data about plugin start in CHAINSTORE.
+    TODO: Generalize this function and move it to the base class.
+    """
+    self.P(f"Responding to key {response_key}")
+    if response_key is not None:
+      response_info = {
+        'container_id': self.container_id,
+        'start_time': self.time_to_str(self.container_start_time),
+        'ports_mapping': self.extra_ports_mapping,
+      }
+      self.P(f"Response to key {response_key}: {self.json_dumps(response_info)}")
+      self.chainstore_set(response_key, response_info)
+    return
+
   ## END CONTAINER MIXIN ###
