@@ -7,6 +7,7 @@ _CONFIG = {
 
   'PORT': 5081,
   'NGROK_ENABLED': False,
+  'NGROK_USE_API': False,
   'ASSETS': '',
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
