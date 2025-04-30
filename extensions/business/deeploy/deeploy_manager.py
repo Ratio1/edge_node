@@ -23,7 +23,7 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
-  'DEEPLOY_VERBOSE' : 1,
+  'DEEPLOY_VERBOSE' : 10,
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   
@@ -188,58 +188,16 @@ class DeeployManagerPlugin(
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)   
       auth_result = self.deeploy_get_auth_result(inputs)
-      
-      # TODO: move to the mixin when ready
+
       app_alias = inputs.app_alias
-      app_type = inputs.pipeline_input_type 
+      app_type = inputs.pipeline_input_type
       app_id = (app_alias.lower()[:8] + "_" + self.uuid(7)).lower()
-      nodes = []
-      for node in inputs.target_nodes:
-        addr = self._check_and_maybe_convert_address(node)
-        is_online = self.netmon.network_node_is_online(addr)
-        if is_online:
-          node_resources = self.check_node_resources(addr, inputs)
-          if not node_resources['status']:
-            error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
-            for detail in node_resources['details']:
-              error_msg += f"- {detail['resource']}: available {detail['available']:.2f}{detail['unit']} < required {detail['required']:.2f}{detail['unit']}\n"
-            raise ValueError(error_msg)
-          nodes.append(addr)
-        else:
-          msg = f"{DEEPLOY_ERRORS.NODES1}: Node {addr} is not online"
-          raise ValueError(msg)
-        #endif is_online
-      #endfor each target node check address and status
-      if len(nodes) == 0:
-        msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
-        raise ValueError(msg)
 
-      plugins = self.deeploy_prepare_plugins(inputs)
+      dct_status, str_status = self.check_and_deploy_pipelines(sender, inputs, app_id, app_alias, app_type)
 
-      for addr in nodes:
-        # Nodes to peer with for CHAINSTORE
-        nodes_to_peer = [n for n in nodes if n != addr]
-        node_plugins = self.deepcopy(plugins)
-        if len(nodes_to_peer) > 0:
-          for plugin in node_plugins:
-            for plugin_instance in plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES]:
-              plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
-        self.P(f"Starting pipeline '{app_alias}' on {addr}")
-        if addr is not None:
-          self.cmdapi_start_pipeline_by_params(
-            name=app_id,
-            app_alias=app_alias,
-            pipeline_type=app_type,
-            node_address=addr,
-            owner=sender,
-            url=inputs.pipeline_input_uri,
-            plugins=node_plugins,
-          )
-        #endif addr is valid
-      #endfor each target node
-      
       result = {
-        'status' : 'success',
+        'status' : str_status,
+        'status_details' : dct_status,
         'app_id' : app_id,
         'request' : {
           'app_alias' : app_alias,

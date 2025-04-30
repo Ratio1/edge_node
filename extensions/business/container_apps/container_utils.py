@@ -70,7 +70,7 @@ class _ContainerUtilsMixin:
 
     # Port mappings if we have any
     if hasattr(self, 'extra_ports_mapping') and self.extra_ports_mapping:
-      for container_port, host_port in self.extra_ports_mapping.items():
+      for host_port, container_port  in self.extra_ports_mapping.items():
         cmd += ["-p", f"{host_port}:{container_port}"]
 
     if self.port and self.cfg_port:
@@ -79,6 +79,8 @@ class _ContainerUtilsMixin:
     # Env vars
     for key, val in self.cfg_env.items():
       cmd += ["-e", f"{key}={val}"]
+      
+    # TODO: add edge-node IP to env vars as EDGE_NODE_IP
 
     # Volume mounts
     if len(self.volumes) > 0:
@@ -279,6 +281,22 @@ class _ContainerUtilsMixin:
       #endif
     #end for each log line
     return logs
-    
-  
+
+  def _maybe_send_plugin_start_confirmation(self):
+    """
+    Sets up confirmation data about plugin start in CHAINSTORE.
+    TODO: Generalize this function and move it to the base class.
+    """
+    response_key = self.cfg_chainstore_response_key
+    self.P(f"Responding to key {response_key}")
+    if response_key is not None:
+      response_info = {
+        'container_id': self.container_id,
+        'start_time': self.time_to_str(self.container_start_time),
+        'ports_mapping': self.extra_ports_mapping,
+      }
+      self.P(f"Response to key {response_key}: {self.json_dumps(response_info)}")
+      self.chainstore_set(response_key, response_info)
+    return
+
   ## END CONTAINER MIXIN ###
