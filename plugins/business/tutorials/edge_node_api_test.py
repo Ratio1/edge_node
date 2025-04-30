@@ -23,6 +23,7 @@ class EdgeNodeApiTestPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method='post')
   def some_j33ves_endpoint(self, message: str = "Create a simple users table DDL", domain: str = "sql"):
+    self.P(f"Received request: message={message} | domain={domain}")
     response = {
       'request': {
         'message': message,
