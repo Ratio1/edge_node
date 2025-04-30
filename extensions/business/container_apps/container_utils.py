@@ -287,6 +287,7 @@ class _ContainerUtilsMixin:
     Sets up confirmation data about plugin start in CHAINSTORE.
     TODO: Generalize this function and move it to the base class.
     """
+    response_key = self.cfg_chainstore_response_key
     self.P(f"Responding to key {response_key}")
     if response_key is not None:
       response_info = {
