@@ -216,7 +216,7 @@ class ContainerAppRunnerPlugin(
           for container_port in ports:
             self.P(f"Additional container port {container_port} specified. Finding available host port ...")
             host_port = self.__allocate_free_port()
-            self.extra_ports_mapping[container_port] = host_port
+            self.extra_ports_mapping[host_port] = container_port
             self.P(f"Allocated free host port {host_port} for container port {container_port}.")
         else:
           # Handle dict of port mappings
@@ -224,7 +224,7 @@ class ContainerAppRunnerPlugin(
             try:
               host_port = int(host_port)
               self.__allocate_port(host_port)
-              self.extra_ports_mapping[container_port] = host_port
+              self.extra_ports_mapping[host_port] = container_port
             except Exception as e:
               self.P(f"Port {host_port} is not available.")
               self.P(e)

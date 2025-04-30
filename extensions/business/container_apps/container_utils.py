@@ -70,7 +70,7 @@ class _ContainerUtilsMixin:
 
     # Port mappings if we have any
     if hasattr(self, 'extra_ports_mapping') and self.extra_ports_mapping:
-      for container_port, host_port in self.extra_ports_mapping.items():
+      for host_port, container_port  in self.extra_ports_mapping.items():
         cmd += ["-p", f"{host_port}:{container_port}"]
 
     if self.port and self.cfg_port:
