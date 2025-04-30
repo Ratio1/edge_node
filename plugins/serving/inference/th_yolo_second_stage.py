@@ -189,6 +189,9 @@ class ThYoloSecondStage(BaseServingProcess):
     #endfor
     self._stop_timer("crop")
 
+    if len(crop_imgs) == 0:
+      return []
+
     if apply_custom_transforms:
       self._start_timer("full_preprocess")
       batch = self._transform(crop_imgs)

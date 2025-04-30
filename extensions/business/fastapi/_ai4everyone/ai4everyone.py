@@ -13,6 +13,7 @@ _CONFIG = {
   "PROCESS_DELAY": 0,
   "DEPLOY_NGROK_EDGE_LABEL": None,
   "LOG_REQUESTS": True,
+  "DEBUG_WEB_APP": True,
 
   # 'PORT': 5000,
   'ASSETS': 'extensions/business/fastapi/_ai4everyone',
@@ -69,9 +70,19 @@ class AI4EveryonePlugin(BasePlugin):
       is_status = payload.data.get('IS_STATUS', False)
       is_final_dataset_status = payload.data.get('IS_FINAL_DATASET_STATUS', False)
       if is_status or is_final_dataset_status:
-        self.maybe_update_job_data(node_id, pipeline, signature, instance, payload)
+        try:
+          self.maybe_update_job_data(node_id, pipeline, signature, instance, payload)
+        except Exception as e:
+          if self.cfg_debug_web_app:
+            self.P(f"[DEBUG_AI4E]Error while updating job data: {e}")
+        # endtry
       else:
-        self.register_request_response(node_id, pipeline, signature, instance, payload)
+        try:
+          self.register_request_response(node_id, pipeline, signature, instance, payload)
+        except Exception as e:
+          if self.cfg_debug_web_app:
+            self.P(f"[DEBUG_AI4E]Error while registering request response: {e}")
+        # endtry
       return
 
     def maybe_update_job_data(self, node_id: str, pipeline: str, signature: str, instance: str, payload: Payload):
