@@ -55,7 +55,8 @@ def get_job_config(
     },
     "REWARDS": rewards,
     "DATASET": dataset,
-    "CREATION_DATE": creation_date
+    "CREATION_DATE": creation_date,
+    "AUTO_DEPLOY": None
   }
   plugin_config["INSTANCES"].append(instance_config)
   return plugin_config
@@ -314,15 +315,17 @@ class Job:
   def get_train_status(self):
     if self.train_status.get('status') is None:
       return {}
-    elapsed = self.train_status.get('elapsed') or 0
-    remaining = self.train_status.get('remaining') or 0
+    elapsed = self.train_status.get('elapsed')
+    remaining = self.train_status.get('remaining')
+    if elapsed is None or remaining is None:
+      return {}
     total = elapsed + remaining
     progress = 0
     if total > 0:
-      progress = self.train_status['elapsed'] / total
+      progress = elapsed / total
     return {
-      'remaining': self.train_status['remaining'],
-      'elapsed': self.train_status['elapsed'],
+      'remaining': remaining,
+      'elapsed': elapsed,
       'score': self.train_status['best'],
       'progress': progress,
       'currentGridIteration': self.train_status['current_grid_iteration'],
