@@ -19,6 +19,7 @@ class EdgeNodeApiTestPlugin(BasePlugin):
   CONFIG = _CONFIG
 
   def on_init(self):
+    super(EdgeNodeApiTestPlugin, self).on_init()
     return
 
 
