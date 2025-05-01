@@ -79,6 +79,9 @@ class _ContainerUtilsMixin:
     # Env vars
     for key, val in self.cfg_env.items():
       cmd += ["-e", f"{key}={val}"]
+
+    for key, val in self.dynamic_env.items():
+      cmd += ["-e", f"{key}={val}"]
       
     # TODO: add edge-node IP to env vars as EDGE_NODE_IP
 
@@ -299,4 +302,27 @@ class _ContainerUtilsMixin:
       self.chainstore_set(response_key, response_info)
     return
 
+  def _setup_dynamic_env(self):
+    """
+    Set up dynamic environment variables based on the configuration.
+
+    This method iterates over the `cfg_dynamic_env` dictionary, which contains
+    environment variable names as keys and a list of value parts as values. Each
+    value part specifies its type (e.g., "static" or "host_ip") and its value.
+    The method constructs the final value for each environment variable by
+    concatenating its parts.
+    """
+    if len(self.cfg_dynamic_env):
+      for variable_name, variable_value_list  in self.cfg_dynamic_env.items():
+        variable_value = ''
+        for variable_part in variable_value_list:
+          if variable_part['type'] == "static" :
+            variable_value += variable_part['value']
+          elif variable_part['type'] == "host_ip":
+            variable_value += self.log.get_localhost_ip()
+          # endif
+        # endfor each part
+        self.dynamic_env[variable_name] = variable_value
+        self.P(f"Dynamic env var {variable_name} = {variable_value}")
+      #endfor each variable
   ## END CONTAINER MIXIN ###

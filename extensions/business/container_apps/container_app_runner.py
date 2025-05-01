@@ -149,6 +149,8 @@ class ContainerAppRunnerPlugin(
     self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
 
     self.volumes = {}
+    self.dynamic_env = {}
+
     return
 
   def on_init(self):
@@ -164,6 +166,7 @@ class ContainerAppRunnerPlugin(
     self._detect_cli_tool() # detect if we have docker or podman
     self._container_maybe_login() # login to the container registry if needed
 
+    self._setup_dynamic_env() # setup dynamic env vars for the container
     self._setup_app_ngrok_port() # allocate the main port if needed
     self._setup_resource_limits() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
