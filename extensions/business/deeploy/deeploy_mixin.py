@@ -146,20 +146,24 @@ class _DeeployMixin:
       # Nodes to peer with for CHAINSTORE
       nodes_to_peer = [n for n in nodes if n != addr]
       node_plugins = self.deepcopy(plugins)
-      if len(nodes_to_peer) > 0:
-        for plugin in node_plugins:
-          for plugin_instance in plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES]:
-            # currenly `for` is redundant but in future we will be able to have multiple instances of the same plugin
-            response_key = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] + '_' + self.uuid(4)
+      
+      # Configure chainstore peers and response keys
+      for plugin in node_plugins:
+        for plugin_instance in plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES]:
+          # Configure peers if there are any
+          if len(nodes_to_peer) > 0:
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
-
-            if inputs.chainstore_response:
-              plugin_instance[
-                self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
-              response_keys[response_key] = addr
-          # endfor each plugin instance
-        # enford each plugin
-      # endif
+          # endif
+          
+          # Configure response keys if needed
+          if inputs.chainstore_response:
+            response_key = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] + '_' + self.uuid(4)
+            plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
+            response_keys[response_key] = addr
+          # endif
+        # endfor each plugin instance
+      # endfor each plugin
+  
       msg = ''
       if self.cfg_deeploy_verbose > 1:
         msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
@@ -178,7 +182,7 @@ class _DeeployMixin:
     # endfor each target node
     return response_keys
 
-  def __get_pipeline_responses(self, response_keys, timeout_seconds=60):
+  def __get_pipeline_responses(self, response_keys, timeout_seconds=90):
     """
     Wait until all the responses are received via CSTORE and compose status response.
     Args:
@@ -198,7 +202,6 @@ class _DeeployMixin:
       current_time = self.time()
       if current_time - start_time > timeout_seconds:
         str_status = 'timeout'
-        done = True
         break
         
       for response_key in response_keys:
