@@ -141,7 +141,7 @@ class _ContainerUtilsMixin:
       res = subprocess.run(cmd, capture_output=True, check=True)
       is_running = res.stdout.decode("utf-8").strip() == "true"
     except Exception as e:
-      self.P("Container status check: {e}", color='r')
+      self.P(f"Container status check: {e}", color='r')
       is_running = False    
     return is_running
 
