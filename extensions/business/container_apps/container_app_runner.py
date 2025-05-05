@@ -231,6 +231,9 @@ class ContainerAppRunnerPlugin(
             except Exception as e:
               self.P(f"Port {host_port} is not available.")
               self.P(e)
+              raise RuntimeError(f"Port {host_port} is not available.")
+          # endfor each port
+        # endif ports list or dict
       # endif ports
     else:
       self._cpu_limit = DEFAULT_CPU_LIMIT
