@@ -27,6 +27,7 @@ class DEEPLOY_KEYS:
   APP_PARAMS_IMAGE = "app_params_image"
   APP_PARAMS_REGISTRY = "app_params_registry"
   AUTH = "auth"
+  # Auth result keys
   SENDER = "sender"
   SENDER_ORACLES = "sender_oracles"
   SENDER_NODES_COUNT = "sender_nodes_count"
@@ -46,6 +47,41 @@ class DEEPLOY_ERRORS:
   NODES4 = "ERR05_DEEPLOY_NODES4"
   NODERES1 = "ERR06_DEEPLOY_TARGET_NODE_RESOURCES1"
   
+
+class DEEPLOY_RESOURCES:
+  # Result dictionary keys
+  STATUS = 'status'
+  DETAILS = 'details'
+  AVAILABLE = 'available'
+  REQUIRED = 'required'
+  
+  # Resource types
+  CPU = 'CPU'
+  MEMORY = 'Memory'
+  
+  # Units
+  CORES = 'cores'
+  MB = 'MB'
+  
+  # Resource keys in app_params
+  CONTAINER_RESOURCES = 'CONTAINER_RESOURCES'
+
+  # Default values
+  DEFAULT_MEMORY = '512m'
+  DEFAULT_CPU = 1
+
+  # Resource detail dictionary keys
+  RESOURCE = 'resource'
+  AVAILABLE_VALUE = 'available'
+  REQUIRED_VALUE = 'required'
+  UNIT = 'unit'
+
+DEFAULT_RESOURCES = {
+    DEEPLOY_RESOURCES.CONTAINER_RESOURCES: {
+        'cpu': DEEPLOY_RESOURCES.DEFAULT_CPU,
+        'memory': DEEPLOY_RESOURCES.DEFAULT_MEMORY
+    }
+}
 
 DEEPLOY_CREATE_REQUEST = {
   "app_alias" : "some_app_name", 

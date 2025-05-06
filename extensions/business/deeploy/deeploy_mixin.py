@@ -1,6 +1,6 @@
 from naeural_core.constants import BASE_CT
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS
+from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES
 
 DEEPLOY_DEBUG = True
 
@@ -230,12 +230,11 @@ class _DeeployMixin:
             'required': dict  # Required resources
         }
     """
-    # TODO: move keys to consts DEEPLOY_KEYS    
     result = {
-        'status': True,
-        'details': [],
-        'available': {},
-        'required': {}
+        DEEPLOY_RESOURCES.STATUS: True,
+        DEEPLOY_RESOURCES.DETAILS: [],
+        DEEPLOY_RESOURCES.AVAILABLE: {},
+        DEEPLOY_RESOURCES.REQUIRED: {}
     }
     
     # Get available resources
@@ -245,40 +244,38 @@ class _DeeployMixin:
     avail_disk = self.netmon.network_node_available_disk(addr)  # in bytes
 
     # Get required resources from the request
-    required_resources = inputs.app_params.get('CONTAINER_RESOURCES', {})
-    required_mem = required_resources.get('memory', '512m')
-    required_cpu = required_resources.get('cpu', 1)
+    required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEEPLOY_RESOURCES.DEFAULT_MEMORY)
+    required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEEPLOY_RESOURCES.DEFAULT_CPU)
 
     required_mem_bytes = self.__parse_memory(required_mem)
 
     # CPU check
-    # TODO: move keys to consts DEEPLOY_KEYS    
     if avail_cpu < required_cpu:
-      result['available']['cpu'] = avail_cpu
-      result['required']['cpu'] = required_cpu
+      result[DEEPLOY_RESOURCES.AVAILABLE][DEEPLOY_RESOURCES.CPU] = avail_cpu
+      result[DEEPLOY_RESOURCES.REQUIRED][DEEPLOY_RESOURCES.CPU] = required_cpu
 
-      result['status'] = False
-      result['details'].append({
-          'resource': 'CPU',
-          'available': avail_cpu,
-          'required': required_cpu,
-          'unit': 'cores'
+      result[DEEPLOY_RESOURCES.STATUS] = False
+      result[DEEPLOY_RESOURCES.DETAILS].append({
+          DEEPLOY_RESOURCES.RESOURCE: DEEPLOY_RESOURCES.CPU,
+          DEEPLOY_RESOURCES.AVAILABLE_VALUE: avail_cpu,
+          DEEPLOY_RESOURCES.REQUIRED_VALUE: required_cpu,
+          DEEPLOY_RESOURCES.UNIT: DEEPLOY_RESOURCES.CORES
       })
 
     # Check memory
-    # TODO: move keys to consts DEEPLOY_KEYS
     if avail_mem_bytes < required_mem_bytes:
-      result['available']['memory'] = avail_mem_bytes
-      result['required']['memory'] = required_mem_bytes
+      result[DEEPLOY_RESOURCES.AVAILABLE][DEEPLOY_RESOURCES.MEMORY] = avail_mem_bytes
+      result[DEEPLOY_RESOURCES.REQUIRED][DEEPLOY_RESOURCES.MEMORY] = required_mem_bytes
 
-      result['status'] = False
+      result[DEEPLOY_RESOURCES.STATUS] = False
       avail_mem_mb = avail_mem_bytes / (1024 * 1024)
-      required_mem_mb = result['required']['memory'] / (1024 * 1024)
-      result['details'].append({
-          'resource': 'Memory',
-          'available': avail_mem_mb,
-          'required': required_mem_mb,
-          'unit': 'MB'
+      required_mem_mb = result[DEEPLOY_RESOURCES.REQUIRED][DEEPLOY_RESOURCES.MEMORY] / (1024 * 1024)
+      result[DEEPLOY_RESOURCES.DETAILS].append({
+          DEEPLOY_RESOURCES.RESOURCE: DEEPLOY_RESOURCES.MEMORY,
+          DEEPLOY_RESOURCES.AVAILABLE_VALUE: avail_mem_mb,
+          DEEPLOY_RESOURCES.REQUIRED_VALUE: required_mem_mb,
+          DEEPLOY_RESOURCES.UNIT: DEEPLOY_RESOURCES.MB
       })
 
     return result
