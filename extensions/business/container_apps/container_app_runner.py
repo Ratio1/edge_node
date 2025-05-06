@@ -56,6 +56,7 @@ _CONFIG = {
   "CR_USER": None,          # Optional registry username
   "CR_PASSWORD": None,      # Optional registry password or token
   "ENV": {},                # dict of env vars for the container
+  "DYNAMIC_ENV": {},        # dict of dynamic env vars for the container
   "PORT": None,             # internal container port if it's a web app (int)
   "CONTAINER_RESOURCES" : {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
