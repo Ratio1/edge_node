@@ -25,6 +25,9 @@ class DEEPLOY_KEYS:
   TARGET_NODES = "target_nodes"
   TARGET_NODES_COUNT = "target_nodes_count"
   AUTH = "auth"
+  CHAINSTORE_RESPONSE = "chainstore_response"
+  PIPELINE_INPUT_TYPE = "pipeline_input_type"
+  PIPELINE_INPUT_URI = "pipeline_input_uri"
   # App params keys
   APP_PARAMS = "app_params"
   APP_PARAMS_IMAGE = "IMAGE"

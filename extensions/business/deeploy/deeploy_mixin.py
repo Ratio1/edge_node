@@ -124,10 +124,12 @@ class _DeeployMixin:
       is_online = self.netmon.network_node_is_online(addr)
       if is_online:
         node_resources = self.check_node_resources(addr, inputs)
-        if not node_resources['status']:
+        if not node_resources[DEEPLOY_RESOURCES.STATUS]:
           error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
-          for detail in node_resources['details']:
-            error_msg += f"- {detail['resource']}: available {detail['available']:.2f}{detail['unit']} < required {detail['required']:.2f}{detail['unit']}\n"
+          for detail in node_resources[DEEPLOY_RESOURCES.DETAILS]:
+            error_msg += (
+                  f"- {detail[DEEPLOY_RESOURCES.RESOURCE]}: available {detail[DEEPLOY_RESOURCES.AVAILABLE]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]} < " +
+                  "required {detail[DEEPLOY_RESOURCES.REQUIRED]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]}\n")
           raise ValueError(error_msg)
         nodes.append(addr)
       else:
@@ -310,11 +312,11 @@ class _DeeployMixin:
     
     # Create a copy of the request with default values
     request_with_defaults = {
-      'target_nodes_count': 0,
-      'pipeline_input_type': 'void',
-      'pipeline_input_uri': None,
-      'chainstore_response': False,
-      'app_params': {},
+      DEEPLOY_KEYS.TARGET_NODES: 0,
+      DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: 'void',
+      DEEPLOY_KEYS.PIPELINE_INPUT_URI: None,
+      DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+      DEEPLOY_KEYS.APP_PARAMS: {},
       **request
     }
     
