@@ -1,6 +1,7 @@
 from naeural_core.constants import BASE_CT
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, DEFAULT_RESOURCES
+from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
+  DEFAULT_RESOURCES, DEEPLOY_STATUS
 
 DEEPLOY_DEBUG = True
 
@@ -194,14 +195,18 @@ class _DeeployMixin:
             str_status: Overall status ('success', 'timeout', or 'pending')
     """
     dct_status = {}
-    str_status = 'pending'
+    str_status = DEEPLOY_STATUS.PENDING
     done = False if len(response_keys) > 0 else True
     start_time = self.time()
-    
+
+    if len(response_keys) == 0:
+      str_status = DEEPLOY_STATUS.SUCCESS
+      return dct_status, str_status
+
     while not done:
       current_time = self.time()
       if current_time - start_time > timeout_seconds:
-        str_status = 'timeout'
+        str_status = DEEPLOY_STATUS.TIMEOUT
         break
         
       for response_key in response_keys:
@@ -213,7 +218,7 @@ class _DeeployMixin:
             'details': res
           }
       if len(dct_status) == len(response_keys):
-        str_status = 'success'
+        str_status = DEEPLOY_STATUS.SUCCESS
         done = True
       # end for each response key
     # endwhile cycle until all responses are received
