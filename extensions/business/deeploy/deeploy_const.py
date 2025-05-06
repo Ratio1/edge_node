@@ -16,6 +16,9 @@ class DEEPLOY_KEYS:
   STATUS_DETAILS = "status_details"
   APPS = "apps"
   APP_ID = "app_id"
+  NONCE = "nonce"
+  APP_ALIAS = "app_alias"
+  PLUGIN_SIGNATURE = "plugin_signature"
 
 class DEEPLOY_ERRORS:
   GENERIC = "ERR01_DEEPLOY_GENERIC_ERROR"

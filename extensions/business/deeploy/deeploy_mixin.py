@@ -230,8 +230,7 @@ class _DeeployMixin:
             'required': dict  # Required resources
         }
     """
-    # TODO: move keys to consts DEEPLOY_KEYS
-    
+    # TODO: move keys to consts DEEPLOY_KEYS    
     result = {
         'status': True,
         'details': [],
@@ -329,7 +328,7 @@ class _DeeployMixin:
       'sender_oracles' : inputs.wallet_oracles,
       'sender_nodes_count' : len(inputs.wallet_nodes),
       'sender_total_count' : len(inputs.wallet_nodes) + len(inputs.wallet_oracles),
-  }
+    }
     return result
       
 

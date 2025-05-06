@@ -301,6 +301,16 @@ class _ContainerUtilsMixin:
       self.P(f"Response to key {response_key}: {self.json_dumps(response_info)}")
       self.chainstore_set(response_key, response_info)
     return
+  
+  
+  def _setup_dynamic_env_var_host_ip(self):
+    """ Definition for `host_ip` dynamic env var type. """
+    return self.log.get_localhost_ip()
+  
+  def _setup_dynamic_env_var_some_other_calc_type(self):
+    """ Example definition for `some_other_calc_type` dynamic env var type. """
+    return "some_other_value"
+
 
   def _setup_dynamic_env(self):
     """
@@ -316,10 +326,22 @@ class _ContainerUtilsMixin:
       for variable_name, variable_value_list  in self.cfg_dynamic_env.items():
         variable_value = ''
         for variable_part in variable_value_list:
-          if variable_part['type'] == "static" :
-            variable_value += variable_part['value']
-          elif variable_part['type'] == "host_ip":
-            variable_value += self.log.get_localhost_ip()
+          part_type = variable_part['type']
+          candidate_value = variable_part.get('value')
+          if part_type == "static" :
+            variable_value += candidate_value
+          else:
+            func_name = f"_setup_dynamic_env_var_{part_type}"
+            found = False
+            if hasattr(self, func_name):
+              func = getattr(self, func_name)
+              if callable(func):
+                # Call the function and append its result to the variable value
+                part_value = func()
+                variable_value += part_value
+                found = True
+            if not found:
+              self.P(f"Dynamic env var {variable_name} has invalid type: {part_type}", color='r')
           # endif
         # endfor each part
         self.dynamic_env[variable_name] = variable_value
