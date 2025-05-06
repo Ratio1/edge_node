@@ -13,12 +13,26 @@ from uuid import uuid4
 
 class DEEPLOY_KEYS:
   STATUS = "status"
+  ERROR = "error"
+  TRACE = "trace"
+  REQUEST = "request"
   STATUS_DETAILS = "status_details"
   APPS = "apps"
   APP_ID = "app_id"
   NONCE = "nonce"
   APP_ALIAS = "app_alias"
   PLUGIN_SIGNATURE = "plugin_signature"
+  TARGET_NODES = "target_nodes"
+  TARGET_NODES_COUNT = "target_nodes_count"
+  APP_PARAMS_IMAGE = "app_params_image"
+  APP_PARAMS_REGISTRY = "app_params_registry"
+  AUTH = "auth"
+
+class DEEPLOY_STATUS:
+  SUCCESS = "success"
+  FAIL = "fail"
+  ERROR = "error"
+  PENDING = "pending"
 
 class DEEPLOY_ERRORS:
   GENERIC = "ERR01_DEEPLOY_GENERIC_ERROR"
