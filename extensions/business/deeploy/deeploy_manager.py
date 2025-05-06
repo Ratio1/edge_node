@@ -203,8 +203,8 @@ class DeeployManagerPlugin(
           DEEPLOY_KEYS.PLUGIN_SIGNATURE: inputs.plugin_signature,
           DEEPLOY_KEYS.TARGET_NODES: inputs.target_nodes,
           DEEPLOY_KEYS.TARGET_NODES_COUNT: inputs.target_nodes_count,
-          DEEPLOY_KEYS.APP_PARAMS_IMAGE: inputs.app_params.IMAGE,
-          DEEPLOY_KEYS.APP_PARAMS_REGISTRY: inputs.app_params.CR,
+          **({'APP_PARAMS_IMAGE': inputs.app_params.IMAGE} if hasattr(inputs.app_params, 'IMAGE') else {}),
+          **({'APP_PARAMS_REGISTRY': inputs.app_params.CR} if hasattr(inputs.app_params, 'CR') else {}),
         },        
         DEEPLOY_KEYS.AUTH: auth_result,
       }
