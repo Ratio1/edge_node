@@ -13,12 +13,33 @@ from uuid import uuid4
 
 class DEEPLOY_KEYS:
   STATUS = "status"
+  ERROR = "error"
+  TRACE = "trace"
+  REQUEST = "request"
   STATUS_DETAILS = "status_details"
   APPS = "apps"
   APP_ID = "app_id"
   NONCE = "nonce"
   APP_ALIAS = "app_alias"
   PLUGIN_SIGNATURE = "plugin_signature"
+  TARGET_NODES = "target_nodes"
+  TARGET_NODES_COUNT = "target_nodes_count"
+  AUTH = "auth"
+  # App params keys
+  APP_PARAMS = "app_params"
+  APP_PARAMS_IMAGE = "IMAGE"
+  APP_PARAMS_CR = "CR"
+  # Auth result keys
+  SENDER = "sender"
+  SENDER_ORACLES = "sender_oracles"
+  SENDER_NODES_COUNT = "sender_nodes_count"
+  SENDER_TOTAL_COUNT = "sender_total_count"
+
+class DEEPLOY_STATUS:
+  SUCCESS = "success"
+  FAIL = "fail"
+  ERROR = "error"
+  PENDING = "pending"
 
 class DEEPLOY_ERRORS:
   GENERIC = "ERR01_DEEPLOY_GENERIC_ERROR"
@@ -28,6 +49,38 @@ class DEEPLOY_ERRORS:
   NODES4 = "ERR05_DEEPLOY_NODES4"
   NODERES1 = "ERR06_DEEPLOY_TARGET_NODE_RESOURCES1"
   
+
+class DEEPLOY_RESOURCES:
+  # Result dictionary keys
+  STATUS = 'status'
+  DETAILS = 'details'
+  AVAILABLE = 'available'
+  REQUIRED = 'required'
+  
+  # Resource types
+  CPU = 'CPU'
+  MEMORY = 'Memory'
+  
+  # Units
+  CORES = 'cores'
+  MB = 'MB'
+  
+  # Resource keys in app_params
+  CONTAINER_RESOURCES = 'CONTAINER_RESOURCES'
+
+  # Default values
+  DEFAULT_MEMORY = '512m'
+  DEFAULT_CPU = 1
+
+  # Resource detail dictionary keys
+  RESOURCE = 'resource'
+  AVAILABLE_VALUE = 'available'
+  REQUIRED_VALUE = 'required'
+  UNIT = 'unit'
+
+class DEFAULT_RESOURCES:
+  CPU = 1
+  MEMORY = '512m'
 
 DEEPLOY_CREATE_REQUEST = {
   "app_alias" : "some_app_name", 

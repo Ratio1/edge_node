@@ -7,7 +7,7 @@ Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 from .deeploy_mixin import _DeeployMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
-  DEEPLOY_ERRORS,
+  DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS
 )
   
 
@@ -88,13 +88,13 @@ class DeeployManagerPlugin(
     """
     self.Pd("Error processing request: {}, Inputs: {}".format(exc, request), color='r')
     result = {
-      'status' : 'fail',
-      'error' : str(exc),
-      'request' : request,
+      DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.FAIL,
+      DEEPLOY_KEYS.ERROR : str(exc),
+      DEEPLOY_KEYS.REQUEST : request,
     }
     if self.cfg_deeploy_verbose > 1:
       lines = self.trace_info().splitlines()
-      result['trace'] = lines[-5:-1]
+      result[DEEPLOY_KEYS.TRACE] = lines[-5:-1]
     return result
     
 
@@ -130,11 +130,10 @@ class DeeployManagerPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
       
       apps = self._get_online_apps()
-      # TODO: move keys to consts DEEPLOY_KEYS  
-      result = {        
-        'status' : 'success',
-        'status': apps,
-        'auth' : auth_result,
+      result = {
+        DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.APPS: apps,
+        DEEPLOY_KEYS.AUTH : auth_result,
       }
     except Exception as e:
       result = self.__handle_error(e, request)
@@ -195,23 +194,27 @@ class DeeployManagerPlugin(
 
       dct_status, str_status = self.check_and_deploy_pipelines(sender, inputs, app_id, app_alias, app_type)
 
-      # TODO: move keys to consts DEEPLOY_KEYS
-      
       result = {
-        'status' : str_status,
-        'status_details' : dct_status,
-        'app_id' : app_id,
-        'request' : {
-          'app_alias' : app_alias,
-          'plugin_signature' : inputs.plugin_signature,
-          'target_nodes' : inputs.target_nodes,
-          'target_nodes_count' : inputs.target_nodes_count,
-          'app_params_image' : inputs.app_params.IMAGE,
-          'app_params_registry' : inputs.app_params.CR,
-        },        
-        'auth' : auth_result,
+        DEEPLOY_KEYS.STATUS: str_status,
+        DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
+        DEEPLOY_KEYS.APP_ID: app_id,
+        DEEPLOY_KEYS.REQUEST: {
+          DEEPLOY_KEYS.APP_ALIAS: app_alias,
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: inputs.plugin_signature,
+          DEEPLOY_KEYS.TARGET_NODES: inputs.target_nodes,
+          DEEPLOY_KEYS.TARGET_NODES_COUNT: inputs.target_nodes_count,
+        },
+        DEEPLOY_KEYS.AUTH: auth_result,
       }
-    
+
+      # Safely add app_params if they exist and are not empty
+      if hasattr(inputs, DEEPLOY_KEYS.APP_PARAMS):
+        app_params = getattr(inputs, DEEPLOY_KEYS.APP_PARAMS, {})
+        if isinstance(app_params, dict) and app_params:
+          if DEEPLOY_KEYS.APP_PARAMS_IMAGE in app_params:
+            result[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.APP_PARAMS_IMAGE] = app_params[DEEPLOY_KEYS.APP_PARAMS_IMAGE]
+          if DEEPLOY_KEYS.APP_PARAMS_CR in app_params:
+            result[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.APP_PARAMS_CR] = app_params[DEEPLOY_KEYS.APP_PARAMS_CR]
     except Exception as e:
       result = self.__handle_error(e, request)
     #endtry
@@ -269,14 +272,13 @@ class DeeployManagerPlugin(
         )
       #endfor each target node
       
-      # TODO: move keys to consts DEEPLOY_KEYS
       result = {
-        'request' : {
-          'status' : 'success',          
-          'app_id' : inputs.app_id,
-          'target_nodes' : inputs.target_nodes,
+        DEEPLOY_KEYS.REQUEST : {
+          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
+          DEEPLOY_KEYS.APP_ID : inputs.app_id,
+          DEEPLOY_KEYS.TARGET_NODES : inputs.target_nodes,
         },
-        'auth' : auth_result,
+        DEEPLOY_KEYS.AUTH : auth_result,
       }
     
     except Exception as e:
