@@ -76,12 +76,9 @@ class DEEPLOY_RESOURCES:
   REQUIRED_VALUE = 'required'
   UNIT = 'unit'
 
-DEFAULT_RESOURCES = {
-    DEEPLOY_RESOURCES.CONTAINER_RESOURCES: {
-        'cpu': DEEPLOY_RESOURCES.DEFAULT_CPU,
-        'memory': DEEPLOY_RESOURCES.DEFAULT_MEMORY
-    }
-}
+class DEFAULT_RESOURCES:
+  CPU = 1
+  MEMORY = '512m'
 
 DEEPLOY_CREATE_REQUEST = {
   "app_alias" : "some_app_name", 

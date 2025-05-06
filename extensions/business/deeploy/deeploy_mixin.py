@@ -1,6 +1,6 @@
 from naeural_core.constants import BASE_CT
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES
+from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, DEFAULT_RESOURCES
 
 DEEPLOY_DEBUG = True
 
@@ -245,8 +245,8 @@ class _DeeployMixin:
 
     # Get required resources from the request
     required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
-    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEEPLOY_RESOURCES.DEFAULT_MEMORY)
-    required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEEPLOY_RESOURCES.DEFAULT_CPU)
+    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_RESOURCES.MEMORY)
+    required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_RESOURCES.CPU)
 
     required_mem_bytes = self.__parse_memory(required_mem)
 
