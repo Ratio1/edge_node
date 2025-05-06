@@ -1,6 +1,6 @@
 from naeural_core.constants import BASE_CT
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS
+from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS
 
 DEEPLOY_DEBUG = True
 
@@ -321,13 +321,12 @@ class _DeeployMixin:
   
   def deeploy_get_auth_result(self, inputs):
     sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
-    # TODO: move keys to consts DEEPLOY_KEYS
     result = {
-      'sender' : sender,
-      'nonce' : self.deeploy_get_nonce(inputs.nonce),
-      'sender_oracles' : inputs.wallet_oracles,
-      'sender_nodes_count' : len(inputs.wallet_nodes),
-      'sender_total_count' : len(inputs.wallet_nodes) + len(inputs.wallet_oracles),
+      DEEPLOY_KEYS.SENDER: sender,
+      DEEPLOY_KEYS.NONCE: self.deeploy_get_nonce(inputs.nonce),
+      DEEPLOY_KEYS.SENDER_ORACLES: inputs.wallet_oracles,
+      DEEPLOY_KEYS.SENDER_NODES_COUNT: len(inputs.wallet_nodes),
+      DEEPLOY_KEYS.SENDER_TOTAL_COUNT: len(inputs.wallet_nodes) + len(inputs.wallet_oracles),
     }
     return result
       

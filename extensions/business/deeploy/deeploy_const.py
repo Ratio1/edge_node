@@ -27,6 +27,10 @@ class DEEPLOY_KEYS:
   APP_PARAMS_IMAGE = "app_params_image"
   APP_PARAMS_REGISTRY = "app_params_registry"
   AUTH = "auth"
+  SENDER = "sender"
+  SENDER_ORACLES = "sender_oracles"
+  SENDER_NODES_COUNT = "sender_nodes_count"
+  SENDER_TOTAL_COUNT = "sender_total_count"
 
 class DEEPLOY_STATUS:
   SUCCESS = "success"
