@@ -79,6 +79,9 @@ class _ContainerUtilsMixin:
     # Env vars
     for key, val in self.cfg_env.items():
       cmd += ["-e", f"{key}={val}"]
+
+    for key, val in self.dynamic_env.items():
+      cmd += ["-e", f"{key}={val}"]
       
     # TODO: add edge-node IP to env vars as EDGE_NODE_IP
 
@@ -138,7 +141,7 @@ class _ContainerUtilsMixin:
       res = subprocess.run(cmd, capture_output=True, check=True)
       is_running = res.stdout.decode("utf-8").strip() == "true"
     except Exception as e:
-      self.P("Container status check: {e}", color='r')
+      self.P(f"Container status check: {e}", color='r')
       is_running = False    
     return is_running
 
@@ -298,5 +301,53 @@ class _ContainerUtilsMixin:
       self.P(f"Response to key {response_key}: {self.json_dumps(response_info)}")
       self.chainstore_set(response_key, response_info)
     return
+  
+  
+  def _setup_dynamic_env_var_host_ip(self):
+    """ Definition for `host_ip` dynamic env var type. """
+    return self.log.get_localhost_ip()
+  
+  def _setup_dynamic_env_var_some_other_calc_type(self):
+    """ Example definition for `some_other_calc_type` dynamic env var type. """
+    return "some_other_value"
 
+
+  def _setup_dynamic_env(self):
+    """
+    Set up dynamic environment variables based on the configuration.
+
+    This method iterates over the `cfg_dynamic_env` dictionary, which contains
+    environment variable names as keys and a list of value parts as values. Each
+    value part specifies its type (e.g., "static" or "host_ip") and its value.
+    The method constructs the final value for each environment variable by
+    concatenating its parts.
+    """
+    if len(self.cfg_dynamic_env):
+      for variable_name, variable_value_list  in self.cfg_dynamic_env.items():
+        variable_value = ''
+        for variable_part in variable_value_list:
+          part_type = variable_part['type']
+          candidate_value = variable_part.get('value', 'UNK')
+          if part_type != "static" :
+            func_name = f"_setup_dynamic_env_var_{part_type}"
+            found = False
+            if hasattr(self, func_name):
+              func = getattr(self, func_name)
+              if callable(func):
+                # Call the function and append its result to the variable value
+                try:
+                  candidate_value = func()
+                  found = True
+                except:
+                  self.P(f"Error calling function {func_name} for dynamic env var {variable_name}", color='r')
+              #endif callable
+            #endif hasattr
+            if not found:
+              self.P(f"Dynamic env var {variable_name} has invalid type: {part_type}", color='r')
+          # endif part_type
+          variable_value += candidate_value
+        # endfor each part
+        self.dynamic_env[variable_name] = variable_value
+        self.P(f"Dynamic env var {variable_name} = {variable_value}")
+      #endfor each variable
   ## END CONTAINER MIXIN ###

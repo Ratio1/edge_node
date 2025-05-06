@@ -11,6 +11,15 @@ Examples:
 from time import time
 from uuid import uuid4
 
+class DEEPLOY_KEYS:
+  STATUS = "status"
+  STATUS_DETAILS = "status_details"
+  APPS = "apps"
+  APP_ID = "app_id"
+  NONCE = "nonce"
+  APP_ALIAS = "app_alias"
+  PLUGIN_SIGNATURE = "plugin_signature"
+
 class DEEPLOY_ERRORS:
   GENERIC = "ERR01_DEEPLOY_GENERIC_ERROR"
   NODES1 = "ERR02_DEEPLOY_NODES1"
@@ -46,6 +55,28 @@ DEEPLOY_CREATE_REQUEST = {
       "ENV2" : "value2",
       "ENV3" : "value3",
       "ENV4" : "value4",
+    },
+    "DYNAMIC_ENV" : {
+      "ENV5" : [
+        {
+          "type" : "static",
+          "value" : "http://"
+        },
+        {
+          "type" : "host_ip",
+          "value" : None
+        },
+        {
+          "type" : "static",
+          "value" : ":5080/test_api_endpoint"
+        }
+      ],
+      "ENV6" : [
+        {
+          "type" : "host_ip",
+          "value" : "http://"
+        }
+      ],
     },
     "RESTART_POLICY" : "always",
     "IMAGE_PULL_POLICY" : "always",
