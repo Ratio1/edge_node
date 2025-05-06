@@ -130,10 +130,10 @@ class DeeployManagerPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
       
       apps = self._get_online_apps()
-      #
+      # TODO: move keys to consts DEEPLOY_KEYS  
       result = {        
         'status' : 'success',
-        'apps': apps,
+        'status': apps,
         'auth' : auth_result,
       }
     except Exception as e:
@@ -195,6 +195,8 @@ class DeeployManagerPlugin(
 
       dct_status, str_status = self.check_and_deploy_pipelines(sender, inputs, app_id, app_alias, app_type)
 
+      # TODO: move keys to consts DEEPLOY_KEYS
+      
       result = {
         'status' : str_status,
         'status_details' : dct_status,
@@ -267,6 +269,7 @@ class DeeployManagerPlugin(
         )
       #endfor each target node
       
+      # TODO: move keys to consts DEEPLOY_KEYS
       result = {
         'request' : {
           'status' : 'success',          

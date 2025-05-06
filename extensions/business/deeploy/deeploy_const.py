@@ -11,6 +11,12 @@ Examples:
 from time import time
 from uuid import uuid4
 
+class DEEPLOY_KEYS:
+  STATUS = "status"
+  STATUS_DETAILS = "status_details"
+  APPS = "apps"
+  APP_ID = "app_id"
+
 class DEEPLOY_ERRORS:
   GENERIC = "ERR01_DEEPLOY_GENERIC_ERROR"
   NODES1 = "ERR02_DEEPLOY_NODES1"

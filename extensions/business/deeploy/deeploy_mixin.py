@@ -230,6 +230,8 @@ class _DeeployMixin:
             'required': dict  # Required resources
         }
     """
+    # TODO: move keys to consts DEEPLOY_KEYS
+    
     result = {
         'status': True,
         'details': [],
@@ -251,6 +253,7 @@ class _DeeployMixin:
     required_mem_bytes = self.__parse_memory(required_mem)
 
     # CPU check
+    # TODO: move keys to consts DEEPLOY_KEYS    
     if avail_cpu < required_cpu:
       result['available']['cpu'] = avail_cpu
       result['required']['cpu'] = required_cpu
@@ -264,6 +267,7 @@ class _DeeployMixin:
       })
 
     # Check memory
+    # TODO: move keys to consts DEEPLOY_KEYS
     if avail_mem_bytes < required_mem_bytes:
       result['available']['memory'] = avail_mem_bytes
       result['required']['memory'] = required_mem_bytes
@@ -318,6 +322,7 @@ class _DeeployMixin:
   
   def deeploy_get_auth_result(self, inputs):
     sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
+    # TODO: move keys to consts DEEPLOY_KEYS
     result = {
       'sender' : sender,
       'nonce' : self.deeploy_get_nonce(inputs.nonce),
