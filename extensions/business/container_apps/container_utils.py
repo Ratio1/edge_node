@@ -327,22 +327,25 @@ class _ContainerUtilsMixin:
         variable_value = ''
         for variable_part in variable_value_list:
           part_type = variable_part['type']
-          candidate_value = variable_part.get('value')
-          if part_type == "static" :
-            variable_value += candidate_value
-          else:
+          candidate_value = variable_part.get('value', 'UNK')
+          if part_type != "static" :
             func_name = f"_setup_dynamic_env_var_{part_type}"
             found = False
             if hasattr(self, func_name):
               func = getattr(self, func_name)
               if callable(func):
                 # Call the function and append its result to the variable value
-                part_value = func()
-                variable_value += part_value
-                found = True
+                try:
+                  candidate_value = func()
+                  found = True
+                except:
+                  self.P(f"Error calling function {func_name} for dynamic env var {variable_name}", color='r')
+              #endif callable
+            #endif hasattr
             if not found:
               self.P(f"Dynamic env var {variable_name} has invalid type: {part_type}", color='r')
-          # endif
+          # endif part_type
+          variable_value += candidate_value
         # endfor each part
         self.dynamic_env[variable_name] = variable_value
         self.P(f"Dynamic env var {variable_name} = {variable_value}")
