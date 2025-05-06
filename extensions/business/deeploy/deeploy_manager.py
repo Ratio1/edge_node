@@ -203,12 +203,18 @@ class DeeployManagerPlugin(
           DEEPLOY_KEYS.PLUGIN_SIGNATURE: inputs.plugin_signature,
           DEEPLOY_KEYS.TARGET_NODES: inputs.target_nodes,
           DEEPLOY_KEYS.TARGET_NODES_COUNT: inputs.target_nodes_count,
-          **({'APP_PARAMS_IMAGE': inputs.app_params.IMAGE} if hasattr(inputs, 'app_params') and hasattr(inputs.app_params, 'IMAGE') else {}),
-          **({'APP_PARAMS_REGISTRY': inputs.app_params.CR} if hasattr(inputs, 'app_params') and hasattr(inputs.app_params, 'CR') else {}),
-        },        
+        },
         DEEPLOY_KEYS.AUTH: auth_result,
       }
-    
+
+      # Safely add app_params if they exist and are not empty
+      if hasattr(inputs, DEEPLOY_KEYS.APP_PARAMS):
+        app_params = getattr(inputs, DEEPLOY_KEYS.APP_PARAMS, {})
+        if isinstance(app_params, dict) and app_params:
+          if DEEPLOY_KEYS.APP_PARAMS_IMAGE in app_params:
+            result[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.APP_PARAMS_IMAGE] = app_params[DEEPLOY_KEYS.APP_PARAMS_IMAGE]
+          if DEEPLOY_KEYS.APP_PARAMS_CR in app_params:
+            result[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.APP_PARAMS_CR] = app_params[DEEPLOY_KEYS.APP_PARAMS_CR]
     except Exception as e:
       result = self.__handle_error(e, request)
     #endtry

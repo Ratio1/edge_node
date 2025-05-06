@@ -303,7 +303,17 @@ class _DeeployMixin:
     sender = request.get(BASE_CT.BCctbase.ETH_SENDER)
     assert self.bc.is_valid_eth_address(sender), f"Invalid sender address: {sender}"
     
-    inputs = self.NestedDotDict(request)    
+    # Create a copy of the request with default values
+    request_with_defaults = {
+      'target_nodes_count': 0,
+      'pipeline_input_type': 'void',
+      'pipeline_input_uri': None,
+      'chainstore_response': False,
+      'app_params': {},
+      **request
+    }
+    
+    inputs = self.NestedDotDict(request_with_defaults)    
     self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
     
     addr = self.__verify_signature(request)

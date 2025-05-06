@@ -24,9 +24,11 @@ class DEEPLOY_KEYS:
   PLUGIN_SIGNATURE = "plugin_signature"
   TARGET_NODES = "target_nodes"
   TARGET_NODES_COUNT = "target_nodes_count"
-  APP_PARAMS_IMAGE = "app_params_image"
-  APP_PARAMS_REGISTRY = "app_params_registry"
   AUTH = "auth"
+  # App params keys
+  APP_PARAMS = "app_params"
+  APP_PARAMS_IMAGE = "IMAGE"
+  APP_PARAMS_CR = "CR"
   # Auth result keys
   SENDER = "sender"
   SENDER_ORACLES = "sender_oracles"
