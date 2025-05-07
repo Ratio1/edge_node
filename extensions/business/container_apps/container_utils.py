@@ -35,7 +35,8 @@ class _ContainerUtilsMixin:
     """
     Pull the container image (Docker/Podman).
     """
-    cmd = [self.cli_tool, "pull", str(self.cfg_image)]
+    full_ref = str(self.cfg_image)
+    cmd = [self.cli_tool, "pull", full_ref]
     if self.cfg_cr and not str(self.cfg_image).startswith(self.cfg_cr):
       # If image doesn't have the registry prefix, prepend it
       full_ref = f"{self.cfg_cr.rstrip('/')}/{self.cfg_image}"
@@ -290,9 +291,9 @@ class _ContainerUtilsMixin:
     Sets up confirmation data about plugin start in CHAINSTORE.
     TODO: Generalize this function and move it to the base class.
     """
-    response_key = self.cfg_chainstore_response_key
-    self.P(f"Responding to key {response_key}")
+    response_key = getattr(self, 'cfg_chainstore_response_key', None)
     if response_key is not None:
+      self.P(f"Responding to key {response_key}")
       response_info = {
         'container_id': self.container_id,
         'start_time': self.time_to_str(self.container_start_time),
