@@ -194,16 +194,22 @@ class DeeployManagerPlugin(
 
       dct_status, str_status = self.check_and_deploy_pipelines(sender, inputs, app_id, app_alias, app_type)
 
-      result = {
-        DEEPLOY_KEYS.STATUS: str_status,
-        DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
-        DEEPLOY_KEYS.APP_ID: app_id,
-        DEEPLOY_KEYS.REQUEST: {
+      return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
+      if return_request:
+        dct_request = self.deepcopy(request)
+      else:
+        dct_request = {
           DEEPLOY_KEYS.APP_ALIAS: app_alias,
           DEEPLOY_KEYS.PLUGIN_SIGNATURE: inputs.plugin_signature,
           DEEPLOY_KEYS.TARGET_NODES: inputs.target_nodes,
           DEEPLOY_KEYS.TARGET_NODES_COUNT: inputs.target_nodes_count,
-        },
+        }
+
+      result = {
+        DEEPLOY_KEYS.STATUS: str_status,
+        DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
+        DEEPLOY_KEYS.APP_ID: app_id,
+        DEEPLOY_KEYS.REQUEST: dct_request,
         DEEPLOY_KEYS.AUTH: auth_result,
       }
 

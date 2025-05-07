@@ -16,6 +16,7 @@ class DEEPLOY_KEYS:
   ERROR = "error"
   TRACE = "trace"
   REQUEST = "request"
+  RETURN_REQUEST = "return_request"
   STATUS_DETAILS = "status_details"
   APPS = "apps"
   APP_ID = "app_id"
