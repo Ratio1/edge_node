@@ -202,7 +202,7 @@ class _DeeployMixin:
     start_time = self.time()
 
     if len(response_keys) == 0:
-      str_status = DEEPLOY_STATUS.SUCCESS
+      str_status = DEEPLOY_STATUS.COMMAND_DELIVERED
       return dct_status, str_status
 
     while not done:
