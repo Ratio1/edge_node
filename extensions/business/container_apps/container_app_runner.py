@@ -46,6 +46,8 @@ _CONFIG = {
   "NGROK_EDGE_LABEL": None,  # Optional ngrok edge label for the tunnel
   "NGROK_AUTH_TOKEN" : None,  # Optional ngrok auth token for the tunnel
   "NGROK_USE_API": True,
+  'NGROK_DOMAIN': None,
+  'NGROK_URL_PING_INTERVAL': 30, # seconds to ping the ngrok URL and to send it in payload
 
   # TODO: this flag needs to be renamed both here and in the ngrok mixin
   "DEBUG_WEB_APP": False,  # If True, will run the web app in debug mode
@@ -135,6 +137,8 @@ class ContainerAppRunnerPlugin(
     return
 
   def __reset_vars(self):
+    self.__last_ngrok_url_ping_ts = 0
+
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
     self.container_proc = None
@@ -275,6 +279,7 @@ class ContainerAppRunnerPlugin(
       self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")
 
       self.maybe_init_ngrok()
+      self.maybe_start_ngrok()
     # endif port
     return
 
@@ -348,6 +353,30 @@ class ContainerAppRunnerPlugin(
     return
 
 
+  def __maybe_ngrok_ping(self):
+    """
+    This method checks if the ngrok tunnel is running and updates the ngrok URL if needed.
+    TODO: move it to a separate mixin, as it's used in base_web_app_plugin.py in naeural_core.
+    """
+    self.P(f"Checking if ngrok is running ...")
+    # Check if the Ngrok API is used.
+    if not self.cfg_ngrok_use_api:
+      return
+    # Check if the listener is available.
+    if self.ngrok_listener is None:
+      return
+    # Check if the listener has a URL.
+    # In case a Ngrok edge label or domain is provided no URL will be available since the user should already have it.
+    if self.ngrok_listener.url() is None:
+      return
+    if self.__last_ngrok_url_ping_ts is None or self.time() - self.__last_ngrok_url_ping_ts >= self.cfg_ngrok_url_ping_interval:
+      self.__last_ngrok_url_ping_ts = self.time()
+      self.add_payload_by_fields(
+        ngrok_url=self.ngrok_listener.url(),
+      )
+    # endif last ngrok url ping
+    return
+
 
   def process(self):
     """
@@ -361,4 +390,6 @@ class ContainerAppRunnerPlugin(
     """
     self._container_maybe_reload()
     self._container_retrieve_and_maybe_show_logs()
+    self.__maybe_ngrok_ping()
+
     return
