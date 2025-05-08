@@ -47,7 +47,9 @@ _CONFIG = {
   "NGROK_AUTH_TOKEN" : None,  # Optional ngrok auth token for the tunnel
   "NGROK_USE_API": True,
   'NGROK_DOMAIN': None,
-  'NGROK_URL_PING_INTERVAL': 30, # seconds to ping the ngrok URL and to send it in payload
+  
+  'NGROK_URL_PING_INTERVAL': 10, # seconds to ping the ngrok URL and to send it in payload
+  'NGROK_URL_PING_COUNT': 10, # nr or times we send payload with ngrok url
 
   # TODO: this flag needs to be renamed both here and in the ngrok mixin
   "DEBUG_WEB_APP": False,  # If True, will run the web app in debug mode
@@ -138,10 +140,12 @@ class ContainerAppRunnerPlugin(
 
   def __reset_vars(self):
     self.__last_ngrok_url_ping_ts = 0
+    self.__last_ngrok_url_ping_count = 0
 
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
     self.container_proc = None
+    
 
     self.container_log_last_show_time = 0
     self.container_log_last_line_start = ""
@@ -353,12 +357,12 @@ class ContainerAppRunnerPlugin(
     return
 
 
-  def __maybe_ngrok_ping(self):
+  def __maybe_send_ngrok_dynamic_url(self):
     """
     This method checks if the ngrok tunnel is running and updates the ngrok URL if needed.
+
     TODO: move it to a separate mixin, as it's used in base_web_app_plugin.py in naeural_core.
     """
-    self.P(f"Checking if ngrok is running ...")
     # Check if the Ngrok API is used.
     if not self.cfg_ngrok_use_api:
       return
@@ -369,10 +373,21 @@ class ContainerAppRunnerPlugin(
     # In case a Ngrok edge label or domain is provided no URL will be available since the user should already have it.
     if self.ngrok_listener.url() is None:
       return
-    if self.__last_ngrok_url_ping_ts is None or self.time() - self.__last_ngrok_url_ping_ts >= self.cfg_ngrok_url_ping_interval:
+    
+    max_payloads_exceeded = self.__last_ngrok_url_ping_count >= self.cfg_ngrok_url_ping_count
+    timeout_exceeded = (
+      self.__last_ngrok_url_ping_ts is None or 
+      (self.time() - self.__last_ngrok_url_ping_ts) >= self.cfg_ngrok_url_ping_interval
+    )
+    
+    if not max_payloads_exceeded and timeout_exceeded:
+      # TODO: check what happens if use use ngrok edge label (endpoint)
+      ngrok_url = self.ngrok_listener.url()      
+      self.__last_ngrok_url_ping_count += 1
       self.__last_ngrok_url_ping_ts = self.time()
+      self.P(f"Sending #{self.__last_ngrok_url_ping_count} ngrok URL: {ngrok_url}")
       self.add_payload_by_fields(
-        ngrok_url=self.ngrok_listener.url(),
+        ngrok_url=ngrok_url,
       )
     # endif last ngrok url ping
     return
@@ -390,6 +405,6 @@ class ContainerAppRunnerPlugin(
     """
     self._container_maybe_reload()
     self._container_retrieve_and_maybe_show_logs()
-    self.__maybe_ngrok_ping()
+    self.__maybe_send_ngrok_dynamic_url()
 
     return
