@@ -45,6 +45,7 @@ class DEEPLOY_STATUS:
   ERROR = "error"
   PENDING = "pending"
   TIMEOUT = "timeout"
+  COMMAND_DELIVERED = "command_delivered"
 
 class DEEPLOY_ERRORS:
   GENERIC = "ERR01_DEEPLOY_GENERIC_ERROR"
