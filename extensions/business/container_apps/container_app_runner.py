@@ -189,6 +189,51 @@ class ContainerAppRunnerPlugin(
     self._maybe_send_plugin_start_confirmation()
 
     return
+  
+  
+  def on_command(self, data, **kwargs):
+    """
+    Called when a INSTANCE_COMMAND is received by the plugin instance.
+    
+    The command is sent via `cmdapi_send_instance_command` from a commanding node (Deeploy plugin)
+    as in below simplified example:
+    
+    ```python
+      pipeline = "some_app_pipeline"
+      signature = "CONTAINER_APP_RUNNER"
+      instance_id = "CONTAINER_APP_1e8dac"
+      node_address = "0xai_1asdfG11sammamssdjjaggxffaffaheASSsa"
+      
+      instance_command = "RESTART"
+      
+      plugin.cmdapi_send_instance_command(
+        pipeline=pipeline,
+        signature=signature,
+        instance_id=instance_id,
+        instance_command=instance_command,
+        node_address=node_address,
+      )
+    ```
+    
+    while the `on_command` method should look like this:
+    
+    ```python
+      def on_command(self, data, **kwargs):
+        if data == "RESTART":
+          self.P("Restarting container...")
+          ...
+        elif data == "STOP":
+          self.P("Stopping container (restart policy still applies)...")
+          ...
+        else:
+          self.P(f"Unknown command: {data}")
+        return
+    ```
+      
+    """
+    # TODO: https://ratio1.atlassian.net/browse/R1-254 
+    # TODO: Vitalii implement this method as instructed
+    return
 
 
   def _detect_cli_tool(self):

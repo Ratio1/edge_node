@@ -165,3 +165,25 @@ DEEPLOY_DELETE_REQUEST = {
   ],
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
 }  
+
+DEEPLOY_INSTANCE_COMMAND_REQUEST = {
+  "app_id" : "target_app_name_id_returned_by_get_apps_or_create_pipeline",
+  "target_nodes" : [
+    "0xai_target_node_1",
+    "0xai_target_node_2",
+  ],
+  
+  "plugin_signature" : "SOME_PLUGIN_01",
+  "instance_id" : "SOME_PLUGIN_01_INSTANCE_ID",
+  "instance_command" : "RESTART",
+
+  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
+}  
+
+DEEPLOY_APP_COMMAND_REQUEST = {
+  "app_id" : "target_app_name_id_returned_by_get_apps_or_create_pipeline",
+  
+  "instance_command" : "RESTART",
+
+  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
+}  

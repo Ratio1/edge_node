@@ -7,7 +7,8 @@ Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 from .deeploy_mixin import _DeeployMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
-  DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS
+  DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
+  DEEPLOY_APP_COMMAND_REQUEST,
 )
   
 
@@ -192,7 +193,10 @@ class DeeployManagerPlugin(
       app_type = inputs.pipeline_input_type
       app_id = (app_alias.lower()[:8] + "_" + self.uuid(7)).lower()
 
-      dct_status, str_status = self.check_and_deploy_pipelines(sender, inputs, app_id, app_alias, app_type)
+      dct_status, str_status = self.check_and_deploy_pipelines(
+        sender=sender, inputs=inputs, app_id=app_id, 
+        app_alias=app_alias, app_type=app_type
+      )
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
@@ -242,10 +246,11 @@ class DeeployManagerPlugin(
     ----------
     app_id : str
         The identificator of the app to delete as given by the /create_pipeline endpoint
+        knowing that all decentralized distributed pipelines share the same app_id
         
     target_nodes : list[str]
         The nodes to delete the app from
-        
+                
     nonce : str
         The nonce used for signing the request
         
@@ -295,3 +300,131 @@ class DeeployManagerPlugin(
       **result
     })
     return response
+
+
+  @BasePlugin.endpoint(method="post")
+  def send_instance_command(self, 
+    request: dict = DEEPLOY_INSTANCE_COMMAND_REQUEST
+  ):
+    """
+    Sends a command to a given app instance on target node(s).
+    
+    IMPORTANT: This generic command does not make any discovery of the nodes, plugin or instances tied to the given app_id.
+    It is the responsibility of the caller to provide the correct target_nodes, instance_id and plugin_signature. 
+
+    Parameters
+    ----------
+    app_id : str
+        The identificator of the app to delete as given by the /create_pipeline endpoint
+        knowing that all decentralized distributed pipelines share the same app_id
+        
+    target_nodes : list[str]
+        The nodes where the app runs
+        
+    plugin_signature : str
+        The signature of the plugin that will receive the command
+    
+    instance_id : str
+        The plugin instance that will receive the command
+        
+    instance_command : any
+        The command to send to each app instance (processed by each individual plugin instance)
+                
+    nonce : str
+        The nonce used for signing the request
+        
+    EE_ETH_SIGN : str
+        The signature of the request
+        
+    EE_ETH_SENDER : str
+        The sender of the request
+
+    Returns
+    -------
+    dict
+        A dictionary with the result of the operation
+    """
+    try:
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      auth_result = self.deeploy_get_auth_result(inputs)
+      
+      # TODO: https://ratio1.atlassian.net/browse/R1-254 
+      # TODO: Implement instance generic command 
+      # TODO: test it with RESTART and STOP commands on CONTAINER_APP_RUNNERS
+
+      result = {
+        DEEPLOY_KEYS.REQUEST : {
+          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
+          DEEPLOY_KEYS.APP_ID : inputs.app_id,
+          DEEPLOY_KEYS.TARGET_NODES : inputs.target_nodes,
+        },
+        DEEPLOY_KEYS.AUTH : auth_result,
+      }
+
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+    
+    response = self._get_response({
+      **result
+    })
+    return response
+  
+
+  @BasePlugin.endpoint(method="post")
+  def send_app_command(self, 
+    request: dict = DEEPLOY_APP_COMMAND_REQUEST
+  ):
+    """
+    Sends a command to a given app on all its target node(s).
+    
+    IMPORTANT: This function will discover the plugin instances and the nodes where the app is running.
+
+    Parameters
+    ----------
+    app_id : str
+        The identificator of the app to delete as given by the /create_pipeline endpoint
+        knowing that all decentralized distributed pipelines share the same app_id
+                
+    instance_command : any
+        The command to send to each app instance (processed by each individual plugin instance)
+                
+    nonce : str
+        The nonce used for signing the request
+        
+    EE_ETH_SIGN : str
+        The signature of the request
+        
+    EE_ETH_SENDER : str
+        The sender of the request
+
+    Returns
+    -------
+    dict
+        A dictionary with the result of the operation
+    """
+    try:
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      auth_result = self.deeploy_get_auth_result(inputs)
+      
+      # TODO: https://ratio1.atlassian.net/browse/R1-254 
+      # TODO: Implement app_id info discovery: target_nodes, plugin_signature, instance_id
+      # TODO: test it with RESTART and STOP commands on CONTAINER_APP_RUNNERS
+
+      result = {
+        DEEPLOY_KEYS.REQUEST : {
+          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
+          DEEPLOY_KEYS.APP_ID : inputs.app_id,
+          DEEPLOY_KEYS.TARGET_NODES : inputs.target_nodes,
+        },
+        DEEPLOY_KEYS.AUTH : auth_result,
+      }
+
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+    
+    response = self._get_response({
+      **result
+    })
+    return response  
