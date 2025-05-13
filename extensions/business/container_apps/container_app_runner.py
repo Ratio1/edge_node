@@ -272,7 +272,7 @@ class ContainerAppRunnerPlugin(
           # Handle list of container ports
           for container_port in ports:
             self.P(f"Additional container port {container_port} specified. Finding available host port ...")
-            host_port = self.__allocate_free_port()
+            host_port = self.__allocate_port()
             self.extra_ports_mapping[host_port] = container_port
             self.P(f"Allocated free host port {host_port} for container port {container_port}.")
         else:
