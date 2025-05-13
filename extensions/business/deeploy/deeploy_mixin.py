@@ -162,7 +162,10 @@ class _DeeployMixin:
           if inputs.chainstore_response:
             response_key = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] + '_' + self.uuid(4)
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
-            response_keys[response_key] = addr
+            response_keys[response_key] = {
+              'addr': addr,
+              'instance_id': plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
+            }
           # endif
         # endfor each plugin instance
       # endfor each plugin
@@ -212,12 +215,14 @@ class _DeeployMixin:
         break
         
       for response_key in response_keys:
-        node_addr = response_keys[response_key]
+        node_info = response_keys[response_key]
+        node_addr = node_info['addr']
         res = self.chainstore_get(response_key)
         if res is not None:
           dct_status[response_key] = {
             'node': node_addr,
-            'details': res
+            'details': res,
+            'instance_id': node_info['instance_id']
           }
       if len(dct_status) == len(response_keys):
         str_status = DEEPLOY_STATUS.SUCCESS
