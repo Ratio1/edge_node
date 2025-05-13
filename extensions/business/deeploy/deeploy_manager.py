@@ -8,7 +8,7 @@ from .deeploy_mixin import _DeeployMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
-  DEEPLOY_APP_COMMAND_REQUEST,
+  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_ALLOWED_PLUGIN_SIGNATURES,
 )
   
 
@@ -352,6 +352,19 @@ class DeeployManagerPlugin(
       # TODO: Implement instance generic command 
       # TODO: test it with RESTART and STOP commands on CONTAINER_APP_RUNNERS
 
+      if inputs.plugin_signature not in DEEPLOY_ALLOWED_PLUGIN_SIGNATURES:
+        msg = f"{DEEPLOY_ERRORS.PLUGIN_SIGNATURE}: Command not allowed for plugin signature {inputs.plugin_signature}"
+        raise ValueError(msg)
+
+      try:
+        for addr in inputs.target_nodes:
+          self.cmdapi_send_instance_command(pipeline=inputs.app_id, signature=inputs.plugin_signature,
+                                            instance_id=inputs.instance_id, instance_command=inputs.instance_command,
+                                            node_address=addr)
+      except Exception as e:
+        self.P(f"Error sending command to instance: {e}", color='r')
+
+
       result = {
         DEEPLOY_KEYS.REQUEST : {
           DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
@@ -410,6 +423,8 @@ class DeeployManagerPlugin(
       # TODO: https://ratio1.atlassian.net/browse/R1-254 
       # TODO: Implement app_id info discovery: target_nodes, plugin_signature, instance_id
       # TODO: test it with RESTART and STOP commands on CONTAINER_APP_RUNNERS
+      apps = self._get_online_apps()
+
 
       result = {
         DEEPLOY_KEYS.REQUEST : {
