@@ -160,6 +160,8 @@ class ContainerAppRunnerPlugin(
     self.volumes = {}
     self.dynamic_env = {}
 
+    self._is_manually_stopped = False # Flag to indicate if the container was manually stopped
+
     return
 
   def on_init(self):
@@ -191,7 +193,7 @@ class ContainerAppRunnerPlugin(
     return
   
   
-  def on_command(self, data, **kwargs):
+  def _on_command(self, data, **kwargs):
     """
     Called when a INSTANCE_COMMAND is received by the plugin instance.
     
@@ -231,8 +233,24 @@ class ContainerAppRunnerPlugin(
     ```
       
     """
-    # TODO: https://ratio1.atlassian.net/browse/R1-254 
-    # TODO: Vitalii implement this method as instructed
+    self.P("A command was received")
+    self.P(f"Received command: {data}")
+    self.P(f"Command kwargs: {kwargs}")
+
+    if data == "RESTART":
+      self.P("Restarting container...")
+      self._is_manually_stopped = False
+      self._stop_container_and_save_logs_to_disk()
+      self._container_maybe_reload()
+      return
+
+    elif data == "STOP":
+      self.P("Stopping container (restart policy still applies)...")
+      self._stop_container_and_save_logs_to_disk()
+      self._is_manually_stopped = True
+      return
+    else:
+      self.P(f"Unknown command: {data}")
     return
 
 
@@ -366,13 +384,10 @@ class ContainerAppRunnerPlugin(
     sock.close()
     return port
 
-
-  def on_close(self):
+  def _stop_container_and_save_logs_to_disk(self):
     """
-    Lifecycle hook called when plugin is stopping.
-    Ensures container is shut down and logs are saved.
-    Ensures the log process is killed.
-    Stops ngrok tunnel if started.
+    Stops the container and ngrok tunnel.
+    Then logs are saved to disk.
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
     # Stop the container if it's running
@@ -400,6 +415,15 @@ class ContainerAppRunnerPlugin(
     except Exception as exc:
       self.P(f"Failed to save logs: {exc}", color='r')
     return
+
+  def on_close(self):
+    """
+    Lifecycle hook called when plugin is stopping.
+    Ensures container is shut down and logs are saved.
+    Ensures the log process is killed.
+    Stops ngrok tunnel if started.
+    """
+    self._stop_container_and_save_logs_to_disk()
 
 
   def __maybe_send_ngrok_dynamic_url(self):
