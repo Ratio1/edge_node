@@ -351,22 +351,14 @@ class DeeployManagerPlugin(
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
-      
+
       # TODO: https://ratio1.atlassian.net/browse/R1-254 
       # TODO: Implement instance generic command 
       # TODO: test it with RESTART and STOP commands on CONTAINER_APP_RUNNERS
 
-      if inputs.plugin_signature not in DEEPLOY_ALLOWED_PLUGIN_SIGNATURES:
-        msg = f"{DEEPLOY_ERRORS.PLUGIN_SIGNATURE}: Command not allowed for plugin signature {inputs.plugin_signature}"
-        raise ValueError(msg)
-
-      try:
-        for addr in inputs.target_nodes:
-          self.cmdapi_send_instance_command(pipeline=inputs.app_id, signature=inputs.plugin_signature,
-                                            instance_id=inputs.instance_id, instance_command=inputs.instance_command,
-                                            node_address=addr)
-      except Exception as e:
-        self.P(f"Error sending command to instance: {e}", color='r')
+      self.send_instance_command_to_nodes(inputs)
+    except Exception as e:
+      self.P(f"Error sending command to instance: {e}", color='r')
 
 
       result = {

@@ -402,6 +402,22 @@ class _DeeployMixin:
 
     return dct_status, str_status
 
+
+  def send_instance_command_to_nodes(self, inputs):
+    """
+    Send a command to the specified nodes for the given plugin instance.
+    """
+    if inputs.plugin_signature not in DEEPLOY_ALLOWED_PLUGIN_SIGNATURES:
+      msg = f"{DEEPLOY_ERRORS.PLUGIN_SIGNATURE}: Command not allowed for plugin signature {inputs.plugin_signature}"
+      raise ValueError(msg)
+
+    try:
+      for addr in inputs.target_nodes:
+        self.cmdapi_send_instance_command(pipeline=inputs.app_id, signature=inputs.plugin_signature,
+                                          instance_id=inputs.instance_id, instance_command=inputs.instance_command,
+                                          node_address=addr)
+    return
+
   def discover_and_send_pipeline_command(self, inputs):
     """
     Discover the running pipelines by app_id and send the command to each instance.
