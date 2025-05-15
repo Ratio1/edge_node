@@ -352,10 +352,6 @@ class DeeployManagerPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
 
-      # TODO: https://ratio1.atlassian.net/browse/R1-254 
-      # TODO: Implement instance generic command 
-      # TODO: test it with RESTART and STOP commands on CONTAINER_APP_RUNNERS
-
       self.send_instance_command_to_nodes(inputs)
     except Exception as e:
       self.P(f"Error sending command to instance: {e}", color='r')
