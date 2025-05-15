@@ -1,6 +1,12 @@
 """
 ```bash
 pip install openai
+
+
+In this xperimental script we have two prompts:
+1. A extended prompt for generating complext SQL DDL with foreign keys and indexes.
+2. A simple prompt for generating simple SQL DDL without complete table structure, foreign keys and indexes.
+
 ```
 
 """
@@ -178,7 +184,6 @@ CREATE TABLE invoice_items (
 );
 
 -- End of DDL for Basic Invoice Management System.
-
 
 """
 
