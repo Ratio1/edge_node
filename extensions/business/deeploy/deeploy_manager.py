@@ -3,6 +3,7 @@
 Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
+from naeural_core.main.net_mon import NetMonCt
 
 from .deeploy_mixin import _DeeployMixin
 from .deeploy_const import (
@@ -95,7 +96,7 @@ class DeeployManagerPlugin(
     }
     if self.cfg_deeploy_verbose > 1:
       lines = self.trace_info().splitlines()
-      result[DEEPLOY_KEYS.TRACE] = lines[-5:-1]
+      result[DEEPLOY_KEYS.TRACE] = lines[-20:-1]
     return result
     
 
@@ -216,6 +217,9 @@ class DeeployManagerPlugin(
         DEEPLOY_KEYS.REQUEST: dct_request,
         DEEPLOY_KEYS.AUTH: auth_result,
       }
+
+      if self.cfg_deeploy_verbose > 1:
+        self.P(f"Request Result: {result}")
 
       # Safely add app_params if they exist and are not empty
       if hasattr(inputs, DEEPLOY_KEYS.APP_PARAMS):
@@ -420,18 +424,40 @@ class DeeployManagerPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
-      # TODO: https://ratio1.atlassian.net/browse/R1-254 
-      # TODO: Implement app_id info discovery: target_nodes, plugin_signature, instance_id
-      # TODO: test it with RESTART and STOP commands on CONTAINER_APP_RUNNERS
+      app_id = inputs.app_id
       apps = self._get_online_apps()
+      discovered_pipelines = {}
 
+
+      for node, pipelines in apps.items():
+        if app_id in pipelines:
+          discovered_pipelines[node] = pipelines[app_id]
+          filtered_plugins = {key: value for key, value in pipelines[app_id][NetMonCt.PLUGINS].items() if
+                     key in DEEPLOY_ALLOWED_PLUGIN_SIGNATURES}
+
+          for plugin_signature, plugins_instances in filtered_plugins.items():
+            # plugins_instances is a list of dictionaries
+            for instance_dict in plugins_instances:
+              instance_id = instance_dict['instance']
+              if self.cfg_deeploy_verbose > 1:
+                self.P(f"Sending command to {plugin_signature} instance {instance_id} on {node}")
+              try:
+                self.cmdapi_send_instance_command(pipeline=app_id, signature=plugin_signature,
+                                                  instance_id=instance_id, instance_command=inputs.instance_command,
+                                                  node_address=node)
+              except Exception as e:
+                self.P(f"Error sending command to instance: {e}", color='r')
+              # endtry
+            # endfor each instance
+        # endif
+      # endfor
 
       result = {
         DEEPLOY_KEYS.REQUEST : {
-          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
+          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.COMMAND_DELIVERED,
           DEEPLOY_KEYS.APP_ID : inputs.app_id,
-          DEEPLOY_KEYS.TARGET_NODES : inputs.target_nodes,
         },
+        DEEPLOY_KEYS.TARGET_NODES: list(discovered_pipelines.keys()),
         DEEPLOY_KEYS.AUTH : auth_result,
       }
 
