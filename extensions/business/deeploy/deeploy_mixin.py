@@ -1,7 +1,8 @@
 from naeural_core.constants import BASE_CT
+from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_RESOURCES, DEEPLOY_STATUS
+  DEFAULT_RESOURCES, DEEPLOY_STATUS, DEEPLOY_ALLOWED_PLUGIN_SIGNATURES
 
 DEEPLOY_DEBUG = True
 
@@ -400,3 +401,36 @@ class _DeeployMixin:
     # TODO: we must define failure and success conditions (after initial implementation is done)
 
     return dct_status, str_status
+
+  def discover_and_send_pipeline_command(self, inputs):
+    """
+    Discover the running pipelines by app_id and send the command to each instance.
+    """
+    app_id = inputs.app_id
+    apps = self._get_online_apps()
+    discovered_pipelines = {}
+
+    for node, pipelines in apps.items():
+      if app_id in pipelines:
+        discovered_pipelines[node] = pipelines[app_id]
+        filtered_plugins = {key: value for key, value in pipelines[app_id][NetMonCt.PLUGINS].items() if
+                            key in DEEPLOY_ALLOWED_PLUGIN_SIGNATURES}
+
+        for plugin_signature, plugins_instances in filtered_plugins.items():
+          # plugins_instances is a list of dictionaries
+          for instance_dict in plugins_instances:
+            instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
+            if self.cfg_deeploy_verbose > 1:
+              self.P(f"Sending command to {plugin_signature} instance {instance_id} on {node}")
+            try:
+              self.cmdapi_send_instance_command(pipeline=app_id, signature=plugin_signature,
+                                                instance_id=instance_id, instance_command=inputs.instance_command,
+                                                node_address=node)
+            except Exception as e:
+              self.P(f"Error sending command to instance: {e}", color='r')
+            # endtry
+          # endfor each instance
+      # endif
+    # endfor
+
+    return discovered_pipelines

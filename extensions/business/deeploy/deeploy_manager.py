@@ -424,33 +424,7 @@ class DeeployManagerPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
-      app_id = inputs.app_id
-      apps = self._get_online_apps()
-      discovered_pipelines = {}
-
-
-      for node, pipelines in apps.items():
-        if app_id in pipelines:
-          discovered_pipelines[node] = pipelines[app_id]
-          filtered_plugins = {key: value for key, value in pipelines[app_id][NetMonCt.PLUGINS].items() if
-                     key in DEEPLOY_ALLOWED_PLUGIN_SIGNATURES}
-
-          for plugin_signature, plugins_instances in filtered_plugins.items():
-            # plugins_instances is a list of dictionaries
-            for instance_dict in plugins_instances:
-              instance_id = instance_dict['instance']
-              if self.cfg_deeploy_verbose > 1:
-                self.P(f"Sending command to {plugin_signature} instance {instance_id} on {node}")
-              try:
-                self.cmdapi_send_instance_command(pipeline=app_id, signature=plugin_signature,
-                                                  instance_id=instance_id, instance_command=inputs.instance_command,
-                                                  node_address=node)
-              except Exception as e:
-                self.P(f"Error sending command to instance: {e}", color='r')
-              # endtry
-            # endfor each instance
-        # endif
-      # endfor
+      discovered_pipelines = self.discover_and_send_pipeline_command(inputs)
 
       result = {
         DEEPLOY_KEYS.REQUEST : {
