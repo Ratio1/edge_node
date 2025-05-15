@@ -353,8 +353,6 @@ class DeeployManagerPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
 
       self.send_instance_command_to_nodes(inputs)
-    except Exception as e:
-      self.P(f"Error sending command to instance: {e}", color='r')
 
 
       result = {

@@ -416,6 +416,9 @@ class _DeeployMixin:
         self.cmdapi_send_instance_command(pipeline=inputs.app_id, signature=inputs.plugin_signature,
                                           instance_id=inputs.instance_id, instance_command=inputs.instance_command,
                                           node_address=addr)
+    except Exception as e:
+      self.P(f"Error sending command to instance: {e}", color='r')
+
     return
 
   def discover_and_send_pipeline_command(self, inputs):
