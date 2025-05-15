@@ -233,8 +233,7 @@ class ContainerAppRunnerPlugin(
     ```
       
     """
-    self.P("A command was received")
-    self.P(f"Received command: {data}")
+    self.P(f"Received a command: {data}")
     self.P(f"Command kwargs: {kwargs}")
 
     if data == "RESTART":
