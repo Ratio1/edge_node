@@ -193,7 +193,7 @@ class ContainerAppRunnerPlugin(
     return
   
   
-  def _on_command(self, data, **kwargs):
+  def on_command(self, data, **kwargs):
     """
     Called when a INSTANCE_COMMAND is received by the plugin instance.
     
