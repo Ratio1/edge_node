@@ -415,16 +415,13 @@ class _DeeployMixin:
 
     discovered_plugins = []
     for node, pipelines in apps.items():
-      self.P(f"Node: {node}")
       if target_nodes is not None and node not in target_nodes:
         continue
       if app_id in pipelines:
         for current_plugin_signature, plugins_instances in pipelines[app_id][NetMonCt.PLUGINS].items():
-          self.P(f"Plugin signature: {current_plugin_signature}")
           # plugins_instances is a list of dictionaries
           for instance_dict in plugins_instances:
             current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
-            self.P(f"Plugin instance: {current_instance_id}")
             if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
               # If we find a match by signature and instance_id, add it to the list and break.
               discovered_plugins.append({
@@ -448,7 +445,6 @@ class _DeeployMixin:
         # endfor each plugin signature
       # endif app_id found
     # endfor each node
-    self.P(discovered_plugins)
     return discovered_plugins
 
   def __send_instance_command_to_targets(self, plugins: list[dict], command: str):
