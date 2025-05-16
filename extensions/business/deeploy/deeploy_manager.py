@@ -357,7 +357,7 @@ class DeeployManagerPlugin(
 
       result = {
         DEEPLOY_KEYS.REQUEST : {
-          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
+          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.COMMAND_DELIVERED,
           DEEPLOY_KEYS.APP_ID : inputs.app_id,
           DEEPLOY_KEYS.TARGET_NODES : inputs.target_nodes,
         },
