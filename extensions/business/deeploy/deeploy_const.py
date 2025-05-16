@@ -89,6 +89,12 @@ class DEFAULT_RESOURCES:
   CPU = 1
   MEMORY = '512m'
 
+class PLUGIN_INSTANCE_FIELDS:
+  PLUGIN_SIGNATURE = "plugin_signature"
+  PLUGIN_INSTANCE = "plugin_instance"
+  INSTANCE_ID = "instance_id"
+  APP_ID = "app_id"
+  NODE = "NODE"
 
 DEEPLOY_CREATE_REQUEST = {
   "app_alias" : "some_app_name", 

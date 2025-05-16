@@ -9,7 +9,7 @@ from .deeploy_mixin import _DeeployMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
-  DEEPLOY_APP_COMMAND_REQUEST,
+  DEEPLOY_APP_COMMAND_REQUEST, PLUGIN_INSTANCE_FIELDS,
 )
   
 
@@ -411,12 +411,12 @@ class DeeployManagerPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
       
       discovered_pipelines = self.discover_and_send_pipeline_command(inputs)
-
-      targets = [
-          [node_addr, pipeline.app_id, pipeline.plugin_signature, pipeline.instance_id]
-          for node_addr, pipeline in discovered_pipelines.items()
-      ]
-
+      targets = []
+      for discovered_pipeline in discovered_pipelines:
+        targets.append([discovered_pipeline[PLUGIN_INSTANCE_FIELDS.NODE],
+                  discovered_pipeline[PLUGIN_INSTANCE_FIELDS.APP_ID],
+                  discovered_pipeline[PLUGIN_INSTANCE_FIELDS.PLUGIN_SIGNATURE],
+                  discovered_pipeline[PLUGIN_INSTANCE_FIELDS.INSTANCE_ID]])
       result = {
         DEEPLOY_KEYS.REQUEST : {
           DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.COMMAND_DELIVERED,
