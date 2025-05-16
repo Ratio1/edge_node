@@ -89,7 +89,7 @@ class DEFAULT_RESOURCES:
   CPU = 1
   MEMORY = '512m'
 
-class PLUGIN_INSTANCE_FIELDS:
+class DEEPLOY_PLUGIN_DATA:
   PLUGIN_SIGNATURE = "plugin_signature"
   PLUGIN_INSTANCE = "plugin_instance"
   INSTANCE_ID = "instance_id"

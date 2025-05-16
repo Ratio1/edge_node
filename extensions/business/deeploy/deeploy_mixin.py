@@ -2,7 +2,7 @@ from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_RESOURCES, DEEPLOY_STATUS, PLUGIN_INSTANCE_FIELDS
+  DEFAULT_RESOURCES, DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA
 
 DEEPLOY_DEBUG = True
 
@@ -428,21 +428,21 @@ class _DeeployMixin:
             if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
               # If we find a match by signature and instance_id, add it to the list and break.
               discovered_plugins.append({
-                PLUGIN_INSTANCE_FIELDS.APP_ID : app_id,
-                PLUGIN_INSTANCE_FIELDS.INSTANCE_ID : current_instance_id,
-                PLUGIN_INSTANCE_FIELDS.PLUGIN_SIGNATURE : current_plugin_signature,
-                PLUGIN_INSTANCE_FIELDS.PLUGIN_INSTANCE : instance_dict,
-                PLUGIN_INSTANCE_FIELDS.NODE: node
+                DEEPLOY_PLUGIN_DATA.APP_ID : app_id,
+                DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
+                DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
+                DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE : instance_dict,
+                DEEPLOY_PLUGIN_DATA.NODE: node
               })
               break
             if plugin_signature is None and instance_id is None:
               # If no specific signature or instance_id is provided, add all instances
               discovered_plugins.append({
-                PLUGIN_INSTANCE_FIELDS.APP_ID : app_id,
-                PLUGIN_INSTANCE_FIELDS.INSTANCE_ID : current_instance_id,
-                PLUGIN_INSTANCE_FIELDS.PLUGIN_SIGNATURE : current_plugin_signature,
-                PLUGIN_INSTANCE_FIELDS.PLUGIN_INSTANCE : instance_dict,
-                PLUGIN_INSTANCE_FIELDS.NODE: node
+                DEEPLOY_PLUGIN_DATA.APP_ID : app_id,
+                DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
+                DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
+                DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE : instance_dict,
+                DEEPLOY_PLUGIN_DATA.NODE: node
               })
           # endfor each instance
         # endfor each plugin signature
@@ -456,11 +456,11 @@ class _DeeployMixin:
     Send a command to the specified nodes for the given plugin instance.
     """
     for plugin in plugins:
-      self.cmdapi_send_instance_command(pipeline=plugin[PLUGIN_INSTANCE_FIELDS.APP_ID],
-                                        signature=plugin[PLUGIN_INSTANCE_FIELDS.PLUGIN_SIGNATURE],
-                                        instance_id=plugin[PLUGIN_INSTANCE_FIELDS.INSTANCE_ID],
+      self.cmdapi_send_instance_command(pipeline=plugin[DEEPLOY_PLUGIN_DATA.APP_ID],
+                                        signature=plugin[DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE],
+                                        instance_id=plugin[DEEPLOY_PLUGIN_DATA.INSTANCE_ID],
                                         instance_command=command,
-                                        node_address=plugin[PLUGIN_INSTANCE_FIELDS.NODE])
+                                        node_address=plugin[DEEPLOY_PLUGIN_DATA.NODE])
 
   def send_instance_command_to_nodes(self, inputs):
     """
