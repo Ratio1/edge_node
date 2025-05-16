@@ -409,13 +409,11 @@ class _DeeployMixin:
     """
     matching_plugin_instance = None
     apps = self._get_online_apps()
-    # validate data, check if such plugin instance exists
     for node, pipelines in apps.items():
       if node not in inputs.target_nodes:
         continue
       if inputs.app_id in pipelines:
-        filtered_plugins = {key: value for key, value in pipelines[inputs.app_id][NetMonCt.PLUGINS].items()}
-        for plugin_signature, plugins_instances in filtered_plugins.items():
+        for plugin_signature, plugins_instances in pipelines[inputs.app_id][NetMonCt.PLUGINS].items():
           # plugins_instances is a list of dictionaries
           for instance_dict in plugins_instances:
             instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
@@ -430,8 +428,10 @@ class _DeeployMixin:
         f"{DEEPLOY_ERRORS.PLINST1}: Plugin instance {inputs.plugin_signature} with ID {inputs.instance_id} not found in app {inputs.app_id}")
 
     for addr in inputs.target_nodes:
-      self.cmdapi_send_instance_command(pipeline=inputs.app_id, signature=inputs.plugin_signature,
-                                        instance_id=inputs.instance_id, instance_command=inputs.instance_command,
+      self.cmdapi_send_instance_command(pipeline=inputs.app_id,
+                                        signature=inputs.plugin_signature,
+                                        instance_id=inputs.instance_id,
+                                        instance_command=inputs.instance_command,
                                         node_address=addr)
 
     return
@@ -447,22 +447,24 @@ class _DeeployMixin:
     for node, pipelines in apps.items():
       if app_id in pipelines:
         discovered_pipelines[node] = pipelines[app_id]
-        filtered_plugins = {key: value for key, value in pipelines[app_id][NetMonCt.PLUGINS].items()}
 
-        for plugin_signature, plugins_instances in filtered_plugins.items():
+        for plugin_signature, plugins_instances in pipelines[app_id][NetMonCt.PLUGINS].items():
           # plugins_instances is a list of dictionaries
           for instance_dict in plugins_instances:
             instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
             if self.cfg_deeploy_verbose > 1:
               self.P(f"Sending command to {plugin_signature} instance {instance_id} on {node}")
             try:
-              self.cmdapi_send_instance_command(pipeline=app_id, signature=plugin_signature,
-                                                instance_id=instance_id, instance_command=inputs.instance_command,
+              self.cmdapi_send_instance_command(pipeline=app_id,
+                                                signature=plugin_signature,
+                                                instance_id=instance_id,
+                                                instance_command=inputs.instance_command,
                                                 node_address=node)
             except Exception as e:
               self.P(f"Error sending command to instance: {e}", color='r')
             # endtry
           # endfor each instance
+        # endfor
       # endif
     # endfor
 

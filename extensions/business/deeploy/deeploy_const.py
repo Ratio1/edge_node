@@ -24,6 +24,7 @@ class DEEPLOY_KEYS:
   APP_ALIAS = "app_alias"
   PLUGIN_SIGNATURE = "plugin_signature"
   TARGET_NODES = "target_nodes"
+  TARGETS = "targets"
   TARGET_NODES_COUNT = "target_nodes_count"
   AUTH = "auth"
   CHAINSTORE_RESPONSE = "chainstore_response"

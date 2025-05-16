@@ -412,12 +412,17 @@ class DeeployManagerPlugin(
       
       discovered_pipelines = self.discover_and_send_pipeline_command(inputs)
 
+      targets = [
+          [node_addr, pipeline.app_id, pipeline.plugin_signature, pipeline.instance_id]
+          for node_addr, pipeline in discovered_pipelines.items()
+      ]
+
       result = {
         DEEPLOY_KEYS.REQUEST : {
           DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.COMMAND_DELIVERED,
           DEEPLOY_KEYS.APP_ID : inputs.app_id,
         },
-        DEEPLOY_KEYS.TARGET_NODES: list(discovered_pipelines.keys()),
+        DEEPLOY_KEYS.TARGETS: targets,
         DEEPLOY_KEYS.AUTH : auth_result,
       }
 
