@@ -3,12 +3,13 @@
 Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
+from naeural_core.main.net_mon import NetMonCt
 
 from .deeploy_mixin import _DeeployMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
-  DEEPLOY_APP_COMMAND_REQUEST,
+  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_PLUGIN_DATA,
 )
   
 
@@ -95,7 +96,7 @@ class DeeployManagerPlugin(
     }
     if self.cfg_deeploy_verbose > 1:
       lines = self.trace_info().splitlines()
-      result[DEEPLOY_KEYS.TRACE] = lines[-5:-1]
+      result[DEEPLOY_KEYS.TRACE] = lines[-20:-1]
     return result
     
 
@@ -216,6 +217,9 @@ class DeeployManagerPlugin(
         DEEPLOY_KEYS.REQUEST: dct_request,
         DEEPLOY_KEYS.AUTH: auth_result,
       }
+
+      if self.cfg_deeploy_verbose > 1:
+        self.P(f"Request Result: {result}")
 
       # Safely add app_params if they exist and are not empty
       if hasattr(inputs, DEEPLOY_KEYS.APP_PARAMS):
@@ -347,14 +351,13 @@ class DeeployManagerPlugin(
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
-      
-      # TODO: https://ratio1.atlassian.net/browse/R1-254 
-      # TODO: Implement instance generic command 
-      # TODO: test it with RESTART and STOP commands on CONTAINER_APP_RUNNERS
+
+      self.send_instance_command_to_nodes(inputs)
+
 
       result = {
         DEEPLOY_KEYS.REQUEST : {
-          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
+          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.COMMAND_DELIVERED,
           DEEPLOY_KEYS.APP_ID : inputs.app_id,
           DEEPLOY_KEYS.TARGET_NODES : inputs.target_nodes,
         },
@@ -407,16 +410,19 @@ class DeeployManagerPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
-      # TODO: https://ratio1.atlassian.net/browse/R1-254 
-      # TODO: Implement app_id info discovery: target_nodes, plugin_signature, instance_id
-      # TODO: test it with RESTART and STOP commands on CONTAINER_APP_RUNNERS
-
+      discovered_pipelines = self.discover_and_send_pipeline_command(inputs)
+      targets = []
+      for discovered_pipeline in discovered_pipelines:
+        targets.append([discovered_pipeline[DEEPLOY_PLUGIN_DATA.NODE],
+                        discovered_pipeline[DEEPLOY_PLUGIN_DATA.APP_ID],
+                        discovered_pipeline[DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE],
+                        discovered_pipeline[DEEPLOY_PLUGIN_DATA.INSTANCE_ID]])
       result = {
         DEEPLOY_KEYS.REQUEST : {
-          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
+          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.COMMAND_DELIVERED,
           DEEPLOY_KEYS.APP_ID : inputs.app_id,
-          DEEPLOY_KEYS.TARGET_NODES : inputs.target_nodes,
         },
+        DEEPLOY_KEYS.TARGETS: targets,
         DEEPLOY_KEYS.AUTH : auth_result,
       }
 

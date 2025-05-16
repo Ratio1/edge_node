@@ -205,7 +205,11 @@ class _ContainerUtilsMixin:
     if self.container_id is None:
       self.P("Container ID is not set. Cannot check container status.")
       return
-    
+
+    if self._is_manually_stopped == True:
+      self.P("Container is manually stopped. No action taken.")
+      return
+
     is_running = self._container_is_running(self.container_id)
 
     if not is_running:

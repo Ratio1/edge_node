@@ -24,6 +24,7 @@ class DEEPLOY_KEYS:
   APP_ALIAS = "app_alias"
   PLUGIN_SIGNATURE = "plugin_signature"
   TARGET_NODES = "target_nodes"
+  TARGETS = "targets"
   TARGET_NODES_COUNT = "target_nodes_count"
   AUTH = "auth"
   CHAINSTORE_RESPONSE = "chainstore_response"
@@ -54,7 +55,8 @@ class DEEPLOY_ERRORS:
   NODES3 = "ERR04_DEEPLOY_NODES3"
   NODES4 = "ERR05_DEEPLOY_NODES4"
   NODERES1 = "ERR06_DEEPLOY_TARGET_NODE_RESOURCES1"
-  
+  PLINST1 = "ERR07_DEEPLOY_PLUGIN_INSTANCE1"
+  APP1 = "ERR08_DEEPLOY_APP1"
 
 class DEEPLOY_RESOURCES:
   # Result dictionary keys
@@ -87,6 +89,13 @@ class DEEPLOY_RESOURCES:
 class DEFAULT_RESOURCES:
   CPU = 1
   MEMORY = '512m'
+
+class DEEPLOY_PLUGIN_DATA:
+  PLUGIN_SIGNATURE = "plugin_signature"
+  PLUGIN_INSTANCE = "plugin_instance"
+  INSTANCE_ID = "instance_id"
+  APP_ID = "app_id"
+  NODE = "NODE"
 
 DEEPLOY_CREATE_REQUEST = {
   "app_alias" : "some_app_name", 

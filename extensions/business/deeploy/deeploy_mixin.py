@@ -1,7 +1,8 @@
 from naeural_core.constants import BASE_CT
+from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_RESOURCES, DEEPLOY_STATUS
+  DEFAULT_RESOURCES, DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA
 
 DEEPLOY_DEBUG = True
 
@@ -162,7 +163,10 @@ class _DeeployMixin:
           if inputs.chainstore_response:
             response_key = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] + '_' + self.uuid(4)
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
-            response_keys[response_key] = addr
+            response_keys[response_key] = {
+              'addr': addr,
+              'instance_id': plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
+            }
           # endif
         # endfor each plugin instance
       # endfor each plugin
@@ -212,12 +216,14 @@ class _DeeployMixin:
         break
         
       for response_key in response_keys:
-        node_addr = response_keys[response_key]
+        node_info = response_keys[response_key]
+        node_addr = node_info['addr']
         res = self.chainstore_get(response_key)
         if res is not None:
           dct_status[response_key] = {
             'node': node_addr,
-            'details': res
+            'details': res,
+            'instance_id': node_info['instance_id']
           }
       if len(dct_status) == len(response_keys):
         str_status = DEEPLOY_STATUS.SUCCESS
@@ -395,3 +401,95 @@ class _DeeployMixin:
     # TODO: we must define failure and success conditions (after initial implementation is done)
 
     return dct_status, str_status
+
+  def __discover_plugin_instances(self,
+                                  app_id: str,
+                                  target_nodes: list[str] = None,
+                                  plugin_signature: str = None,
+                                  instance_id: str = None):
+    """
+    Discover the plugin instances for the given app_id and target nodes.
+    Returns a list of dictionaries containing infomration about plugin instances.
+    """
+    apps = self._get_online_apps()
+
+    discovered_plugins = []
+    for node, pipelines in apps.items():
+      if target_nodes is not None and node not in target_nodes:
+        continue
+      if app_id in pipelines:
+        for current_plugin_signature, plugins_instances in pipelines[app_id][NetMonCt.PLUGINS].items():
+          # plugins_instances is a list of dictionaries
+          for instance_dict in plugins_instances:
+            current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
+            if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
+              # If we find a match by signature and instance_id, add it to the list and break.
+              discovered_plugins.append({
+                DEEPLOY_PLUGIN_DATA.APP_ID : app_id,
+                DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
+                DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
+                DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE : instance_dict,
+                DEEPLOY_PLUGIN_DATA.NODE: node
+              })
+              break
+            if plugin_signature is None and instance_id is None:
+              # If no specific signature or instance_id is provided, add all instances
+              discovered_plugins.append({
+                DEEPLOY_PLUGIN_DATA.APP_ID : app_id,
+                DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
+                DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
+                DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE : instance_dict,
+                DEEPLOY_PLUGIN_DATA.NODE: node
+              })
+          # endfor each instance
+        # endfor each plugin signature
+      # endif app_id found
+    # endfor each node
+    return discovered_plugins
+
+  def __send_instance_command_to_targets(self, plugins: list[dict], command: str):
+    """
+    Send a command to the specified nodes for the given plugin instance.
+    """
+    for plugin in plugins:
+      self.cmdapi_send_instance_command(pipeline=plugin[DEEPLOY_PLUGIN_DATA.APP_ID],
+                                        signature=plugin[DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE],
+                                        instance_id=plugin[DEEPLOY_PLUGIN_DATA.INSTANCE_ID],
+                                        instance_command=command,
+                                        node_address=plugin[DEEPLOY_PLUGIN_DATA.NODE])
+
+  def send_instance_command_to_nodes(self, inputs):
+    """
+    Send a command to the specified nodes for the given plugin instance.
+    """
+    discovered_plugins = self.__discover_plugin_instances(
+      app_id=inputs.app_id,
+      target_nodes=inputs.target_nodes,
+      plugin_signature=inputs.plugin_signature,
+      instance_id=inputs.instance_id
+    )
+    if len(discovered_plugins) == 0:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.PLINST1}: Plugin instance {inputs.plugin_signature} with ID {inputs.instance_id} not found in app {inputs.app_id}")
+
+    self.__send_instance_command_to_targets(plugins=discovered_plugins, command=inputs.instance_command)
+
+    return discovered_plugins
+
+  def discover_and_send_pipeline_command(self, inputs):
+    """
+    Discover the running pipelines by app_id and send the command to each instance.
+
+    Returns:
+        dict: A dictionary containing the discovered pipelines,
+              where the keys are node addresses and the values are the pipelines.
+    """
+    discovered_plugins = self.__discover_plugin_instances(app_id=inputs.app_id)
+
+    if len(discovered_plugins) == 0:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.APP1}: App {inputs.app_id} not found on any node")
+
+    self.__send_instance_command_to_targets(discovered_plugins, inputs.instance_command)
+
+    return discovered_plugins

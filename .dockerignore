@@ -13,3 +13,4 @@ config_startup.json
 */_logs/*
 */_models/*
 */_output/*
+.venv
