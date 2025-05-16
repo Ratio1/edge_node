@@ -407,14 +407,32 @@ class _DeeployMixin:
     """
     Send a command to the specified nodes for the given plugin instance.
     """
+    matching_plugin_instance = None
+    apps = self._get_online_apps()
+    # validate data, check if such plugin instance exists
+    for node, pipelines in apps.items():
+      if node not in inputs.target_nodes:
+        continue
+      if inputs.app_id in pipelines:
+        filtered_plugins = {key: value for key, value in pipelines[inputs.app_id][NetMonCt.PLUGINS].items()}
+        for plugin_signature, plugins_instances in filtered_plugins.items():
+          # plugins_instances is a list of dictionaries
+          for instance_dict in plugins_instances:
+            instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
+            if instance_id == inputs.instance_id and plugin_signature == inputs.plugin_signature:
+              matching_plugin_instance = instance_dict
+              break
+          # endfor each instance
+        # endfor each plugin signature
+      # endif app_id found
+    if matching_plugin_instance is None:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.PLINST1}: Plugin instance {inputs.plugin_signature} with ID {inputs.instance_id} not found in app {inputs.app_id}")
 
-    try:
-      for addr in inputs.target_nodes:
-        self.cmdapi_send_instance_command(pipeline=inputs.app_id, signature=inputs.plugin_signature,
-                                          instance_id=inputs.instance_id, instance_command=inputs.instance_command,
-                                          node_address=addr)
-    except Exception as e:
-      self.P(f"Error sending command to instance: {e}", color='r')
+    for addr in inputs.target_nodes:
+      self.cmdapi_send_instance_command(pipeline=inputs.app_id, signature=inputs.plugin_signature,
+                                        instance_id=inputs.instance_id, instance_command=inputs.instance_command,
+                                        node_address=addr)
 
     return
 
