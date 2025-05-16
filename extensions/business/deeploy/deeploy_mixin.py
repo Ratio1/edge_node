@@ -490,6 +490,10 @@ class _DeeployMixin:
     """
     discovered_plugins = self.__discover_plugin_instances(app_id=inputs.app_id)
 
+    if len(discovered_plugins) == 0:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.APP1}: App {inputs.app_id} not found on any node")
+
     self.__send_instance_command_to_targets(discovered_plugins, inputs.instance_command)
 
     return discovered_plugins
