@@ -2,7 +2,7 @@ from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_RESOURCES, DEEPLOY_STATUS, DEEPLOY_ALLOWED_PLUGIN_SIGNATURES
+  DEFAULT_RESOURCES, DEEPLOY_STATUS
 
 DEEPLOY_DEBUG = True
 
@@ -407,9 +407,6 @@ class _DeeployMixin:
     """
     Send a command to the specified nodes for the given plugin instance.
     """
-    if inputs.plugin_signature not in DEEPLOY_ALLOWED_PLUGIN_SIGNATURES:
-      msg = f"{DEEPLOY_ERRORS.PLUGIN_SIGNATURE}: Command not allowed for plugin signature {inputs.plugin_signature}"
-      raise ValueError(msg)
 
     try:
       for addr in inputs.target_nodes:
@@ -432,8 +429,7 @@ class _DeeployMixin:
     for node, pipelines in apps.items():
       if app_id in pipelines:
         discovered_pipelines[node] = pipelines[app_id]
-        filtered_plugins = {key: value for key, value in pipelines[app_id][NetMonCt.PLUGINS].items() if
-                            key in DEEPLOY_ALLOWED_PLUGIN_SIGNATURES}
+        filtered_plugins = {key: value for key, value in pipelines[app_id][NetMonCt.PLUGINS].items()}
 
         for plugin_signature, plugins_instances in filtered_plugins.items():
           # plugins_instances is a list of dictionaries
