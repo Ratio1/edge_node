@@ -1,3 +1,4 @@
+# TODO: some of these packages must be eliminate/replaced for arm64 native builds
 onnx
 openvino==2024.1.0
 onnxruntime-openvino==1.17.1
@@ -11,5 +12,6 @@ ratio1
 decentra-vision 
 python-telegram-bot
 protobuf==5.28.3
+openai
 vectordb
 ngrok
