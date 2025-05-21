@@ -15,3 +15,5 @@ protobuf==5.28.3
 openai
 vectordb
 ngrok
+
+openai

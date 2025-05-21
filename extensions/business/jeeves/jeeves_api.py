@@ -1,0 +1,1146 @@
+from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
+from naeural_core.business.mixins_libs.network_processor_mixin import _NetworkProcessorMixin
+from constants import JeevesCt
+
+
+_CONFIG = {
+  **BasePlugin.CONFIG,
+
+  'PORT': 15033,  # TODO: decide the specific port for this
+  'ASSETS': 'extensions/business/fastapi/jeeves_api',
+  'REQUEST_TIMEOUT': 180,  # seconds
+  "MAX_COMMANDS_SENT": 10,
+  'R1FS_SLEEP_PERIOD': 5,
+
+  'SHORT_TERM_MEMORY_SIZE': 10,
+
+  # !! ONLY FOR TESTING PURPOSES !!
+  'SKIP_R1FS_WARMUP': True,
+
+  # Definition of the domains that need additional context
+  # along with the context itself.
+  # This is a dictionary where the key is the domain name and the value is
+  # the context to be used for that domain.
+  "PREDEFINED_ADDITIONAL_CONTEXT_DOMAINS": {
+
+  },
+
+  'PREDEFINED_DOMAINS': {
+
+  },
+
+  'PREDEFINED_USER_TOKENS': [],
+
+  "DEFAULT_SYSTEM_PROMPT": JeevesCt.DEFAULT_SYSTEM_PROMPT,
+
+  "JINJA_ARGS": {
+    # Done in order for this API to not have user interface.
+    'html_files': []
+  },
+  'DEBUG_LOGS': True,
+  'VALIDATION_RULES': {
+    **BasePlugin.CONFIG['VALIDATION_RULES'],
+  },
+}
+
+
+class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
+  CONFIG = _CONFIG
+
+  def maybe_wait_for_r1fs(self):
+    if self.cfg_skip_r1fs_warmup:
+      self.P("Skipping R1FS warmup due to testing mode active...", color="yellow", boxed=True)
+      return
+    start_time = self.time()
+    sleep_period = self.cfg_r1fs_sleep_period
+    while not self.r1fs.is_ipfs_warmed:
+      elapsed = (self.time() - start_time).seconds
+      self.P(f'IPFS is warming up ({elapsed}s passed so far)...', color="yellow")
+      self.P(f"Waiting another {sleep_period}s for IPFS to be warmed up...", color="yellow")
+      self.sleep(sleep_period)
+    # endwhile
+    self.P("IPFS is warmed up!", color="green")
+    return
+
+  def get_predefined_user_tokens(self):
+    return self.cfg_predefined_user_tokens or []
+
+  def on_init(self):
+    super(JeevesApiPlugin, self).on_init()
+    self.network_processor_init()
+    self.__command_payloads = []
+    self.__requests = {}
+    self.__user_data = {}
+    self.__domains_data = {}
+
+    predefined_user_tokens = self.get_predefined_user_tokens()
+    for user_token in predefined_user_tokens:
+      self._create_user_token(user_token=user_token)
+    # endfor predefined user tokens
+
+    predefined_domains = self.cfg_predefined_domains or {}
+    for domain, domain_data in predefined_domains.items():
+      self.maybe_create_domain(
+        domain_name=domain,
+        domain_prompt=domain_data.get('prompt'),
+        user_token=domain_data.get('user_token'),
+        contains_additional_context=domain_data.get('contains_additional_context', False),
+      )
+    # endfor predefined domains
+
+    predefined_additional_context_domains = self.cfg_predefined_additional_context_domains or {}
+    for domain, domain_data in predefined_additional_context_domains.items():
+      self.maybe_create_domain(
+        domain_name=domain,
+        domain_prompt=domain_data.get('prompt'),
+        user_token=domain_data.get('user_token'),
+        contains_additional_context=True,
+      )
+
+    self.maybe_wait_for_r1fs()
+    return
+
+  def Pd(self, msg, *args, **kwargs):
+    """
+    Print debug message.
+    """
+    if self.cfg_debug_logs:
+      self.P(msg, *args, **kwargs)
+    return
+
+  def verify_user_token(self, user_token: str):
+    """
+    Validate the user token.
+
+    Parameters
+    ----------
+    user_token : str
+        The user token to validate.
+
+    Returns
+    -------
+    bool
+        True if the user token is valid, False otherwise.
+    """
+    # return True
+    return user_token in self.__user_data
+
+  def invalid_token_response(self):
+    """
+    Returns an invalid token response.
+    Returns
+    -------
+    """
+    return {
+      'error': 'Invalid user token',
+      'status': 'error',
+    }
+
+  def register_request(self, request_id=None, **kwargs):
+    """
+    Helper method to register a request from the Jeeves API to different agents.
+
+    Returns
+    -------
+    str
+        The request ID.
+    """
+    request_data = {
+      **kwargs
+    }
+    if request_id is None:
+      request_id = self.uuid()
+      request_data = {
+        'start_time': self.time(),
+        'finished': False,
+        'request_id': request_id,
+        'timeout': self.cfg_request_timeout,
+        **request_data
+      }
+    else:
+      request_data = {
+        **self.__requests.get(request_id, {}),
+        **request_data
+      }
+    # endif new request_id
+    self.__requests[request_id] = request_data
+    # endif new request is being processed
+    # TODO: maybe handle `next_request_params`, as it may need removal from the
+    #  command to the agent.
+    jeeves_content = {
+      'REQUEST_ID': request_id,
+      **kwargs
+    }
+    if 'next_request_params' in jeeves_content:
+      jeeves_content.pop('next_request_params')
+    # endif next_request_params in jeeves_content
+    self.__command_payloads.append({
+      'JEEVES_CONTENT': jeeves_content
+    })
+    return request_id
+
+  """SOLVED POSTPONED REQUESTS SECTION"""
+  if True:
+    def solve_postponed_request(self, request_id):
+      """
+      Helper method to handle postponed requests.
+      This method is called when a request is postponed and needs to be solved.
+      It checks if the request is finished or if it has timed out.
+      If the request is finished, it returns the result.
+      If the request has timed out, it marks the request as finished and returns an error message.
+      If the request is not ready, it is further postponed.
+      """
+      if request_id in self.__requests:
+        request = self.__requests[request_id]
+        start_time = request['start_time']
+        timeout = request['timeout']
+        if request['finished']:
+          return request['result']
+        elif self.time() - start_time > timeout:
+          request['finished'] = True
+          request['result'] = {
+            'error': 'Request timed out',
+            'request_id': request_id,
+          }
+          return request['result']
+        # endif
+      # endif
+      # Maybe handle case where request_id is not in __requests?
+      return self.create_postponed_request(
+        solver_method=self.solve_postponed_request,
+        method_kwargs={
+          'request_id': request_id,
+        }
+      )
+  """END SOLVED POSTPONED REQUESTS SECTION"""
+
+  """RAG SECTION"""
+  if True:
+    def register_add_documents_request(
+        self,
+        documents_cid: str,
+        context_id: str,
+    ):
+      """
+      Register a request to add documents to the RAG agents' context.
+
+      Parameters
+      ----------
+      documents_cid : str
+          The context ID to which the documents will be added.
+
+      context_id : str
+          The context ID to which the documents will be added.
+
+      Returns
+      -------
+      str
+          The request ID.
+      """
+      return self.register_request(
+        request_type='ADD_DOC',
+        request_params={
+          "documents_cid": documents_cid,
+          "context_id": context_id,
+        }
+      )
+
+    def add_documents(
+        self,
+        context_id: str,
+        documents: list[str],
+    ):
+      """
+      Add one or more documents to the RAG agents' context.
+
+      Parameters
+      ----------
+      context_id : str
+          The context ID to which the documents will be added.
+
+      documents : list[str]
+          List of documents to add to the context. Each document should be a string.
+          The documents will be added to the context of the user with the given token.
+
+      Returns
+      -------
+
+      """
+      documents_cid = self.r1fs.add_pickle(
+        data={
+          'DOCUMENTS': documents,
+          'CONTEXT_ID': context_id,
+        },
+        secret=context_id
+      )
+      if documents_cid is None:
+        msg = f"Failed to add documents to context '{context_id}'"
+        return {
+          'error': msg,
+        }
+      # endif documents_cid is None
+      request_id = self.register_add_documents_request(
+        documents_cid=documents_cid,
+        context_id=context_id,
+      )
+      return self.solve_postponed_request(request_id=request_id)
+
+    @BasePlugin.endpoint(method='post')
+    def add_documents_for_user(
+        self,
+        user_token: str,
+        documents: list[str],
+    ):
+      """
+      Add one or more documents to the RAG agents' context for a specific user.
+      Parameters
+      ----------
+      user_token : str
+          The user token to which the documents will be added.
+      documents : list[str]
+          List of documents to add to the context. Each document should be a string.
+          The documents will be added to the context of the user with the given token.
+
+      Returns
+      -------
+
+      """
+      if not self.verify_user_token(user_token):
+        return self.invalid_token_response()
+      # endif user token is valid
+      return self.add_documents(
+        context_id=user_token,
+        documents=documents,
+      )
+
+    @BasePlugin.endpoint(method='post')
+    def add_documents_for_domain(
+        self,
+        user_token: str,
+        domain: str,
+        documents: list[str],
+    ):
+      """
+      Add one or more documents to the RAG agents' context for a specific domain.
+      A domain is a specific context that will be accessible to multiple users.
+
+      Parameters
+      ----------
+      user_token : str
+          The user token to which the documents will be added.
+
+      domain : str
+          The domain to which the documents will be added.
+
+      documents : list[str]
+          List of documents to add to the context. Each document should be a string.
+          The documents will be added to the context of the user with the given token.
+
+      Returns
+      -------
+
+      """
+      if not self.verify_user_token(user_token):
+        return self.invalid_token_response()
+      # endif user token is valid
+
+      if domain in self.__domains_data:
+        self.__domains_data[domain]['contains_additional_context'] = True
+      else:
+        self.maybe_create_domain(
+          domain_name=domain,
+          user_token=user_token,
+          contains_additional_context=True,
+        )
+      # endif domain already existent
+      return self.add_documents(
+        context_id=domain,
+        documents=documents,
+      )
+
+    def register_retrieve_documents_request(
+        self,
+        context_id: str,
+        query: str,
+        k: int = 5,
+        next_request_params: dict = None,
+    ):
+      """
+      Register a request to retrieve documents from the RAG agents' context.
+      Parameters
+      ----------
+      context_id : str
+          The context ID from which the documents will be retrieved.
+      query : str
+          The query to use for retrieving the documents.
+      k : int
+          The number of documents to retrieve. Default is 5.
+      next_request_params : dict
+          Additional parameters for the request that needs the result of the
+          retrieval. In the case of a simple retrieve action this will be None.
+          In case of a retrieval for a chat, this will be the parameters for the
+          chat request.
+
+      Returns
+      -------
+      str
+          The request ID.
+      """
+      return self.register_request(
+        request_type='QUERY',
+        request_params={
+          "context_id": context_id,
+          "query": query,
+          "k": k,
+        },
+        next_request_params=next_request_params
+      )
+
+    # TODO: this will not be an endpoint, but will be used for debug for now.
+    @BasePlugin.endpoint()
+    def retrieve_documents(
+        self,
+        context_id: str,
+        query: str,
+        k: int = 5,
+        next_request_params: dict = None,
+    ):
+      """
+      Retrieve documents from the RAG agents' context based on a query.
+
+      Parameters
+      ----------
+      context_id : str
+          The context ID from which the documents will be retrieved.
+
+      query : str
+          The query to use for retrieving the documents.
+
+      k : int
+          The number of documents to retrieve. Default is 5.
+
+      next_request_params : dict
+          Additional parameters for the request that needs the result of the
+          retrieval. In the case of a simple retrieve action this will be None.
+          In case of a retrieval for a chat, this will be the parameters for the
+          chat request.
+
+      Returns
+      -------
+      list[str]
+          List of documents retrieved from the context. Each document is a string.
+      """
+      request_id = self.register_retrieve_documents_request(
+        context_id=context_id,
+        query=query,
+        k=k,
+        next_request_params=next_request_params,
+      )
+      return self.solve_postponed_request(request_id=request_id)
+
+    def messages_to_documents(self, messages: list[dict]):
+      return [
+        msg.get("content") or ""
+        for msg in messages
+      ]
+
+    def maybe_short_term_memory_to_long_term_memory(self, user_token: str):
+      """
+      Move the short term memory to the long term memory.
+      Parameters
+      ----------
+      user_token : str
+          The user token to use for the API. Default is None.
+
+      Returns
+      -------
+      str
+          The request ID.
+      """
+      current_short_term_memory = self.__user_data[user_token].get('messages') or []
+      transfer_threshold = self.cfg_short_term_memory_size // 2
+      if len(current_short_term_memory) > transfer_threshold:
+        self.P(f"Moving short term memory to long term memory for user '{user_token}'")
+        current_role = current_short_term_memory[transfer_threshold].get('role')
+        while transfer_threshold > 0 and current_role != "user":
+          transfer_threshold -= 1
+          current_role = current_short_term_memory[transfer_threshold].get('role')
+        if transfer_threshold == 0:
+          return
+        first_half = current_short_term_memory[:transfer_threshold]
+        second_half = current_short_term_memory[transfer_threshold:]
+        self.__user_data[user_token]['messages'] = second_half
+        self.add_documents(
+          context_id=user_token,
+          documents=self.messages_to_documents(first_half),
+        )
+        self.__user_data[user_token]['long_term_memory_is_empty'] = False
+      return
+  """END RAG SECTION"""
+
+  """LLM SECTION"""
+  if True:
+    def maybe_retrieve_domain_additional_data(
+        self, domain: str, query: str = None,
+        next_request_params: dict = None,
+        user_token: str = None,
+    ):
+      """
+      Retrieve the domain data from the RAG agents' context.
+      Parameters
+      ----------
+      domain : str
+          The domain to retrieve data from.
+
+      query : str
+          The query to use for retrieving the data. Default is None.
+          If not provided, the function will retrieve all documents from the domain.
+
+      next_request_params : dict
+          Additional parameters for the request that needs the result of the
+          retrieval. In the case of a simple retrieve action this will be None.
+          In case of a retrieval for a chat, this will be the parameters for the
+          chat request.
+
+      user_token : str
+          The user token to use for the API. Default is None.
+
+      Returns
+      -------
+      str
+          The domain data.
+      """
+      # No specific domain is needed.
+      if domain is None:
+        return None
+      # endif domain is None
+
+      if domain == user_token:
+        is_long_term_empty = self.__user_data[user_token].get('long_term_memory_is_empty', True)
+        if not is_long_term_empty:
+          return self.retrieve_documents(
+            context_id=user_token,
+            query=query,
+            k=5,
+            next_request_params=next_request_params,
+          )
+        # endif long term memory is not empty
+      # endif retrieval for long term memory
+
+      # Check if the domain is sufficiently covered by the LLM or if it needs
+      # additional data.
+      additional_domains = self.cfg_predefined_additional_context_domains or {}
+      if domain not in additional_domains:
+        return None
+
+      # endif domain not in additional domains
+      return self.retrieve_documents(
+        context_id=domain,
+        query=query,
+        k=5,
+        next_request_params=next_request_params,
+      )
+
+    def register_chat_request(
+        self,
+        request_id: str = None,
+        messages: list[dict] = None,
+        user_token: str = None,
+        **kwargs
+    ):
+      """
+      Register a chat request with the Jeeves API.
+      Parameters
+      ----------
+      request_id : str
+          The request ID to use for the API. Default is None.
+      messages : list[dict]
+          List of messages to send to the API. Each message should be a dictionary with
+          the following keys:
+              - role: str
+                  The role of the message. Can be 'user', 'assistant', or 'system'.
+              - content: str
+                  The content of the message.
+      user_token : str
+          The user token to use for the API. Default is None.
+      kwargs : dict
+          Additional parameters to send to the API. Default is None.
+
+      Returns
+      -------
+      str
+          The request ID.
+      """
+      return self.register_request(
+        request_id=request_id,
+        messages=messages,
+        user_token=user_token,
+        request_type='LLM',
+        **kwargs
+      )
+
+    def get_messages_of_user(
+        self,
+        user_token: str = None,
+        message: str = None,
+        domain_prompt: str = None,
+        **kwargs
+    ):
+      """
+      Get the messages of the user.
+
+      Parameters
+      ----------
+      user_token : str
+          The user token to use for the API. Default is None.
+      message : str
+          The message to send to the API. Default is None.
+      domain_prompt: str
+          The system prompt for the following request.
+      kwargs : dict
+          Additional parameters to send to the API. Default is None.
+
+      Returns
+      -------
+      list[dict]
+          List of messages to send to the API. Each message should be a dictionary with
+          the following keys:
+              - role: str
+                  The role of the message. Can be 'user', 'assistant', or 'system'.
+              - content: str
+                  The content of the message.
+      """
+      res = [
+        {
+          'role': 'user',
+          'content': message,
+        }
+      ]
+      if user_token is not None:
+        short_term_messages = self.__user_data[user_token].get('messages')
+        if short_term_messages is not None:
+          res = short_term_messages + res
+        # endif short term messages existent
+      # endif user_token provided
+      if domain_prompt is not None:
+        res += [
+          {
+            'role': 'system',
+            'content': domain_prompt
+          }
+        ]
+      # endif domain prompt provided
+      return res
+
+    def get_domain_prompt(
+        self,
+        user_token: str = None,
+        domain: str = None,
+    ):
+      """
+      Get the domain prompt for the Jeeves API.
+
+      Parameters
+      ----------
+      user_token : str
+          The user token to use for the API. Default is None.
+      domain : str
+          The domain to use for the API. Default is None.
+
+      Returns
+      -------
+      str
+          The domain prompt.
+      """
+      if domain is not None and domain in self.__domains_data:
+        return self.__domains_data[domain].get('domain_prompt', None)
+      # endif domain is not None
+      return self.cfg_default_system_prompt
+
+    @BasePlugin.endpoint(method="post")
+    # TODO: change to jeeves_agent_request?
+    def chat(
+        self,
+        user_token: str = None,
+        message: str = None,
+        domain: str = None,
+        # **kwargs
+    ):
+      """
+      Chat with the Jeeves API.
+      Parameters
+      ----------
+
+      user_token : str
+          The user token to use for the API. Default is None.
+      message : str
+          The message to send to the API. Default is None.
+      domain : str
+          The domain to use for the API. Default is None.
+      kwargs : dict
+          Additional parameters to send to the API. Default is None.
+
+      Returns
+      -------
+
+      """
+      if not self.verify_user_token(user_token):
+        return self.invalid_token_response()
+      # endif user token is valid
+      if message is None:
+        return {
+          'error': 'Message not provided',
+          'status': 'error',
+        }
+      # endif message is None
+
+      domain_prompt = self.get_domain_prompt(
+        user_token=user_token,
+        domain=domain,
+      )
+
+      # Wrap the message
+      messages = self.get_messages_of_user(
+        # This is None, because this endpoint does not
+        # use any conversation history.
+        user_token=None,
+        message=message,
+        domain_prompt=domain_prompt,
+        # **kwargs
+      )
+
+      request_id = self.maybe_retrieve_domain_additional_data(
+        domain=domain,
+        query=message,
+        next_request_params={
+          'user_token': user_token,
+          'messages': messages,
+          'use_long_term_memory': False,
+        }
+      )
+      # Check if the request needs 
+      if request_id is not None:
+        return self.solve_postponed_request(request_id=request_id)
+      # endif request_id is not None
+
+      request_id = self.register_chat_request(
+        messages=messages,
+        user_token=user_token,
+        use_long_term_memory=False,
+      )
+      return self.solve_postponed_request(request_id=request_id)
+
+    @BasePlugin.endpoint(method="post")
+    def chat_user(
+        self,
+        user_token: str = None,
+        message: str = None,
+        domain: str = None,
+        # **kwargs
+    ):
+      """
+      Chat with the Jeeves API.
+      This method will keep track of all the user's messages.
+
+      Parameters
+      ----------
+      user_token : str
+          The user token to use for the API. Default is None.
+      message : str
+          The message to send to the API. Default is None.
+      domain : str
+          The domain to use for the API. Default is None.
+      kwargs
+
+      Returns
+      -------
+
+      """
+      if not self.verify_user_token(user_token):
+        return self.invalid_token_response()
+      # endif user token is valid
+      if message is None:
+        return {
+          'error': 'Message not provided',
+          'status': 'error',
+        }
+      # endif message is None
+
+      domain_prompt = self.get_domain_prompt(
+        user_token=user_token,
+        domain=domain,
+      )
+
+      messages = self.get_messages_of_user(
+        user_token=user_token,
+        message=message,
+        domain_prompt=domain_prompt,
+        # **kwargs
+      )
+
+      # The long term memory for the user conversation will be a domain identified with his
+      # user token.
+      request_id = self.maybe_retrieve_domain_additional_data(
+        domain=user_token,
+        query=message,
+        next_request_params={
+          'user_token': user_token,
+          'messages': messages,
+          'use_long_term_memory': True,
+        },
+        user_token=user_token
+      )
+      # Check if the request needs 
+      if request_id is not None:
+        return self.solve_postponed_request(request_id=request_id)
+      # endif request_id is not None
+      
+      # TODO: add domain additional data retrieval
+      
+      request_id = self.register_chat_request(
+        messages=messages,
+        user_token=user_token,
+        use_long_term_memory=True,
+      )
+      return self.solve_postponed_request(request_id=request_id)
+
+  """END LLM SECTION"""
+
+  def _create_user_token(
+      self, user_token: str = None,
+  ):
+    # TODO: integrate chainstore for user tokens
+    if user_token is None:
+      user_token = self.uuid()
+      # This is redundant, but we need to make sure that the token is unique.
+      while user_token in self.__user_data:
+        user_token = self.uuid()
+    # endif preexistent user_token
+    # endwhile token is not unique
+    new_user_data = {
+      'creation_time': self.time(),
+      'last_access_time': self.time(),
+      'n_requests': 0,
+      'messages': []
+    }
+    self.__user_data[user_token] = new_user_data
+    return user_token
+
+  @BasePlugin.endpoint(method='post')
+  # TODO: add configurable parameter with preexistent user tokens
+  def get_user_token(self, dummy_param: str = None):
+    """
+    Create a new user token.
+
+    Returns
+    -------
+    str
+        The user token.
+    """
+    return self._create_user_token()
+
+  def maybe_create_domain(
+      self, domain_name: str, domain_prompt: str = None,
+      user_token: str = None, contains_additional_context: bool = False,
+  ):
+    if domain_name not in self.__domains_data:
+      self.__domains_data[domain_name] = {
+        'creation_time': self.time(),
+        'last_access_time': self.time(),
+        'n_requests': 0,
+        'domain_prompt': domain_prompt,
+        'domain_name': domain_name,
+        'user_token': user_token,
+        'contains_additional_context': contains_additional_context,
+      }
+    else:
+      if domain_prompt is not None:
+        self.__domains_data[domain_name]['domain_prompt'] = domain_prompt
+      if user_token is not None:
+        self.__domains_data[domain_name]['user_token'] = user_token
+      if contains_additional_context is not None:
+        self.__domains_data[domain_name]['contains_additional_context'] = contains_additional_context
+    # endif domain already existent
+    return domain_name
+
+  @BasePlugin.endpoint(method='post')
+  def create_domain(
+      self, user_token: str, domain_name: str, domain_prompt: str
+  ):
+    """
+    Create a new domain.
+
+    Parameters
+    ----------
+    user_token : str
+        The user token to use for the API. Default is None.
+    domain_name : str
+        The name of the domain to create.
+    domain_prompt : str
+        The prompt to use for the domain.
+
+    Returns
+    -------
+    str
+        The domain ID.
+    """
+    if not self.verify_user_token(user_token):
+      return self.invalid_token_response()
+    # endif user token is valid
+    if domain_name is None:
+      return {
+        'error': 'Domain name not provided',
+        'status': 'error',
+      }
+    # endif domain name is None
+    if domain_prompt is None:
+      return {
+        'error': 'Domain prompt not provided',
+        'status': 'error',
+      }
+    # endif domain prompt is None
+    # TODO: decide if domain should be upgradeable
+    if domain_name in self.__domains_data:
+      return {
+        'error': f"Domain '{domain_name}' already exists",
+        'status': 'error',
+      }
+    
+    self.maybe_create_domain(
+      domain_name=domain_name,
+      domain_prompt=domain_prompt,
+      user_token=user_token,
+    )
+    
+    return {
+      'domain': domain_name,
+      'status': 'success',
+    }
+
+  def get_domain_data(self, domain_data: dict, include_prompt: bool = False):
+    """
+    Get the domain data.
+
+    Parameters
+    ----------
+    domain_data : dict
+        The domain data to retrieve. This should be a dictionary containing all the data about the domain.
+
+    include_prompt : bool
+        Whether to include the prompt for the domain. Default is False.
+        If True, the prompt will be included in the response.
+
+    Returns
+    -------
+    dict
+        The domain data.
+    """
+    domain_data_keys = [
+      'creation_time',
+      'domain_name',
+    ]
+    res = {
+      k: domain_data.get(k)
+      for k in domain_data_keys
+    }
+    if include_prompt:
+      res['domain_prompt'] = domain_data.get('domain_prompt')
+    
+    return res
+
+  @BasePlugin.endpoint()
+  def get_domains(self, user_token: str = None, include_prompt: bool = False):
+    """
+    Get the domains for the user.
+
+    Parameters
+    ----------
+    user_token : str
+        The user token to use for the API. Default is None.
+    
+    include_prompt : bool
+        Whether to include the prompts for the domains. Default is False.
+        If True, the prompts will be included in the response.
+
+    Returns
+    -------
+    list[str]
+        List of domains for the user.
+    """
+    if not self.verify_user_token(user_token):
+      return self.invalid_token_response()
+    # endif user token is valid
+    # TODO: maybe filter based on the user_token
+    return {
+      'domains': [
+        self.get_domain_data(domain_data=domain_data, include_prompt=include_prompt)
+        for domain_name, domain_data in self.__domains_data.items()
+      ]
+    }
+
+  """PAYLOAD HANDLERS SECTION"""
+  if True:
+    @_NetworkProcessorMixin.payload_handler(signature="DOC_EMBEDDING_AGENT")
+    def handle_payload_doc_embedding_agent(self, data):
+      request_id = data.get('REQUEST_ID', None)
+      if request_id is not None:
+        if request_id in self.__requests:
+          request_data = self.__requests[request_id]
+          request_finished = request_data.get('finished', False)
+          if request_finished:
+            self.Pd(f"Request ID '{request_id}' to DocEmbedding agents already finished.", color="red")
+            return
+          request_type = request_data.get('request_type', None)
+          error_message = (data.get('RESULT') or {}).get('ERROR_MESSAGE')
+          if error_message is not None:
+            request_data['finished'] = True
+            request_data['result'] = {
+              'error': error_message,
+              'request_id': request_id,
+            }
+            self.Pd(f"Request ID '{request_id}' to DocEmbedding failed with error: {error_message}", color="red")
+            return
+          if request_type == 'ADD_DOC':
+            request_data['finished'] = True
+            request_result = data.get('RESULT') or {}
+            request_data['result'] = {
+              'elapsed_time': self.time() - request_data['start_time'],
+              'request_id': request_id,
+              **request_result,
+            }
+            self.Pd(f"'ADD_DOC' request ID '{request_id}' to DocEmbedding successfully processed.", color="green")
+          elif request_type == 'QUERY':
+            request_result = data.get('RESULT') or {}
+            docs = request_result.get('DOCS', [])
+
+            next_request_params = request_data.get('next_request_params')
+            self.P(f"Next request params: {next_request_params}")
+            if isinstance(next_request_params, dict):
+              # Union of the kwargs in case of overlapping keys
+              chat_request_kwargs = {
+                self.ct.JeevesCt.REQUEST_ID: request_id,
+                **next_request_params,
+                self.ct.JeevesCt.CONTEXT: '\n'.join(docs) if isinstance(docs, list) > 0 else None,
+                **request_result
+              }
+              # normalize the kwargs
+              chat_request_kwargs = {
+                (k.lower() if isinstance(k, str) else k): v
+                for k, v in chat_request_kwargs.items()
+              }
+              self.P(f"Continuing with chat request: {chat_request_kwargs}")
+
+              self.register_chat_request(
+                **chat_request_kwargs,
+              )
+            else:
+              request_data['finished'] = True
+              request_data['result'] = {
+                'elapsed_time': self.time() - request_data['start_time'],
+                'request_id': request_id,
+                'docs': docs,
+              }
+            # endif request finished or not
+
+            self.Pd(f"'QUERY' request ID '{request_id}' to DocEmbedding successfully processed.", color="green")
+          else:
+            self.Pd(f"Unknown request type for request ID '{request_id}': '{request_type}'!", color="red")
+        else:
+          self.Pd(f"Request ID '{request_id}' not found in requests.", color="red")
+      else:
+        self.Pd(f"`REQUEST_ID` not provided in {data}")
+      # endif request_id available
+      return
+
+    def get_last_user_message(self, user_messages: list[dict]):
+      """
+      Get the last user message from the list of user messages.
+      Parameters
+      ----------
+      user_messages : list[dict]
+          List of user messages. Each message should be a dictionary with
+          the following keys:
+              - role: str
+                  The role of the message. Can be 'user', 'assistant', or 'system'.
+              - content: str
+                  The content of the message.
+
+      Returns
+      -------
+      dict or None
+          The last user message or None if not found.
+      """
+      if user_messages is None:
+        return None
+      # endif user messages is None
+      for message in reversed(user_messages):
+        if isinstance(message, dict) and message.get('role') == 'user':
+          return message
+      # endfor
+      return None
+
+    @_NetworkProcessorMixin.payload_handler(signature="LLM_AGENT")
+    def handle_payload_llm_agent(self, data):
+      request_id = data.get('REQUEST_ID', None)
+      if request_id is not None:
+        if request_id in self.__requests:
+          request_data = self.__requests[request_id]
+          request_finished = request_data.get('finished', False)
+          if request_finished:
+            self.Pd(f"Request ID '{request_id}' to LLM agent already finished.", color="red")
+            return
+          error_message = (data.get('RESULT') or {}).get('ERROR_MESSAGE')
+          if error_message is not None:
+            request_data['finished'] = True
+            request_data['result'] = {
+              'error': error_message,
+              'request_id': request_id,
+            }
+            self.Pd(f"Request ID '{request_id}' to LLM failed with error: {error_message}", color="red")
+            return
+          text_response = data.get('RESULT', {}).get('TEXT_RESPONSE', "")
+          if text_response is not None:
+            request_data['finished'] = True
+            request_data['result'] = {
+              'response': text_response,
+              'elapsed_time': self.time() - request_data['start_time'],
+              'model_name': data.get('MODEL_NAME', None),
+              'request_id': request_id,
+            }
+            user_token = request_data.get('user_token', None)
+            user_messages = request_data.get('messages', [])
+            self.P(f"User messages: {user_messages}")
+            last_user_message = self.get_last_user_message(user_messages)
+            if last_user_message is not None:
+              self.__user_data[user_token]['messages'].append(last_user_message)
+            self.__user_data[user_token]['messages'].append({
+              'role': 'assistant',
+              'content': text_response,
+            })
+            use_long_term_memory = request_data.get('use_long_term_memory', False)
+            self.P(f"Done processing request for user {user_token} with {use_long_term_memory=}")
+            if use_long_term_memory:
+              self.maybe_short_term_memory_to_long_term_memory(user_token)
+            # endif request made through /chat_user endpoint
+            self.Pd(f"Request ID '{request_id}' to LLM successfully processed.", color="green")
+        else:
+          self.Pd(f"Request ID '{request_id}' not found in requests.", color="red")
+      else:
+        self.Pd(f"`REQUEST_ID` not provided in {data}")
+      # endif request_id available
+      return
+  """END PAYLOAD HANDLERS SECTION"""
+
+  def __maybe_send_command_payloads(self):
+    current_commands = self.__command_payloads[:self.cfg_max_commands_sent]
+    for payload in current_commands:
+      self.add_payload_by_fields(**payload)
+    self.__command_payloads = self.__command_payloads[len(current_commands):]
+    return
+
+  def _process(self):
+    super(JeevesApiPlugin, self)._process()
+    self.network_processor_loop()
+    self.__maybe_send_command_payloads()
+    return
+

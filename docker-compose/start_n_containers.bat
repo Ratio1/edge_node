@@ -4,11 +4,14 @@ setlocal enabledelayedexpansion
 REM DEPLOY DEBUG FLAGS
 set DEPLOY_DEBUG=false
 set USE_LOCAL_IMAGE=true
+set USE_GPU=true
+set USE_IPC_HOST=true
+set EXPOSED_PORT=15033
 
 
 REM Hardcoded number of containers
 set NUM_CONTAINERS=1
-set NUM_SUPERVISORS=1
+set NUM_SUPERVISORS=0
 
 
 if !USE_LOCAL_IMAGE! == true (
@@ -101,6 +104,23 @@ for /l %%i in (1,1,%NUM_CONTAINERS%) do (
     echo     env_file: !ENV_FILE! >> docker-compose.yaml
     echo     volumes: >> docker-compose.yaml
     echo       - ./!CONTAINER_VOLUME!:/edge_node/_local_cache >> docker-compose.yaml
+    echo     privileged: true >> docker-compose.yaml
+    if !USE_GPU! == true (
+        echo     deploy: >> docker-compose.yaml
+        echo       resources: >> docker-compose.yaml
+        echo         reservations: >> docker-compose.yaml
+        echo           devices: >> docker-compose.yaml
+        echo             - driver: nvidia >> docker-compose.yaml
+@REM                       This can be changed to a specific number (e.g. '1') if needed.
+        echo               count: all >> docker-compose.yaml
+        echo               capabilities: [gpu] >> docker-compose.yaml
+    )
+    if !USE_IPC_HOST! == true (
+        echo     ipc: host >> docker-compose.yaml
+        echo     ports: >> docker-compose.yaml
+        echo        - "!EXPOSED_PORT!:!EXPOSED_PORT!" >> docker-compose.yaml
+    )
+
     REM Empty line for readability
     echo. >> docker-compose.yaml
 
