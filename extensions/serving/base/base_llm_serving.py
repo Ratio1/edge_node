@@ -258,10 +258,30 @@ class BaseLlmServing(
 
 
   def _warmup(self):
+    relevant_signature = self.cfg_relevant_signatures[0] if self.cfg_relevant_signatures else None
+    payload_path = [
+      None,
+      None,
+      relevant_signature,
+      None
+    ]
+    supported_request_type = self.cfg_supported_request_types[0] if self.cfg_supported_request_types else None
     warmup_request = {
-      LlmCT.REQ: "hello",
-      LlmCT.HIST: [],
-      LlmCT.SYS: "You are a python assistant. Generate some python code."
+      "JEEVES_CONTENT": {
+        LlmCT.REQUEST_TYPE: supported_request_type,
+        LlmCT.REQUEST_ID: "warmup_request",
+        LlmCT.MESSAGES: [
+          {
+            LlmCT.ROLE_KEY: LlmCT.SYSTEM_ROLE,
+            LlmCT.DATA_KEY: "You are a helpful python assistant. Generate some python code.."
+          },
+          {
+            LlmCT.ROLE_KEY: LlmCT.REQUEST_ROLE,
+            LlmCT.DATA_KEY: "hello"
+          }
+        ],
+      },
+      self.ct.PAYLOAD_DATA.EE_PAYLOAD_PATH: payload_path
     }
     # Perform a prediction with a batch of one request.
     warmup_inputs_one = {

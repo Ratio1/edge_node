@@ -6,16 +6,17 @@ from constants import JeevesCt
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'PORT': 15033,  # TODO: decide the specific port for this
+  'PORT': 15033,
   'ASSETS': 'extensions/business/fastapi/jeeves_api',
   'REQUEST_TIMEOUT': 180,  # seconds
   "MAX_COMMANDS_SENT": 10,
   'R1FS_SLEEP_PERIOD': 5,
+  "SAVE_PERIOD": 60 * 5,  # seconds
 
   'SHORT_TERM_MEMORY_SIZE': 10,
 
   # !! ONLY FOR TESTING PURPOSES !!
-  'SKIP_R1FS_WARMUP': True,
+  'SKIP_R1FS_WARMUP': False,
 
   # Definition of the domains that need additional context
   # along with the context itself.
@@ -72,6 +73,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     self.__requests = {}
     self.__user_data = {}
     self.__domains_data = {}
+    self.last_persistent_save = 0
 
     predefined_user_tokens = self.get_predefined_user_tokens()
     for user_token in predefined_user_tokens:
@@ -96,9 +98,131 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         user_token=domain_data.get('user_token'),
         contains_additional_context=True,
       )
-
+    # endfor predefined additional context domains
+    self.maybe_load_persistence_data()
     self.maybe_wait_for_r1fs()
     return
+
+  def maybe_persistence_save(self, force: bool = False):
+    """
+    Save the current state of the Jeeves API to a persistent storage.
+    This method is called when the Jeeves API is stopped or restarted.
+    """
+    if force or self.time() - self.last_persistent_save > self.cfg_save_period:
+      self.P("Saving current state to persistent storage...", color="yellow")
+      self.cacheapi_save_pickle(
+        obj={
+          'USER_DATA': self.__user_data,
+          'DOMAINS_DATA': self.__domains_data,
+          'REQUESTS': self.__requests,
+        },
+      )
+      self.last_persistent_save = self.time()
+    # endif force or time passed
+    return
+
+  def _create_user_token(
+      self, user_token: str = None,
+  ):
+    # TODO: integrate chainstore for user tokens
+    if user_token is None:
+      user_token = self.uuid()
+      # This is redundant, but we need to make sure that the token is unique.
+      while user_token in self.__user_data:
+        user_token = self.uuid()
+    # endif preexistent user_token
+    # endwhile token is not unique
+    new_user_data = {
+      'creation_time': self.time(),
+      'last_access_time': self.time(),
+      'n_requests': 0,
+      'messages': [],
+      'long_term_memory_is_empty': True
+    }
+    self.__user_data[user_token] = new_user_data
+    self.maybe_persistence_save(force=True)
+    return user_token
+
+  def __merge_user_data(self, loaded_user_data: dict, in_memory_user_data: dict):
+    """
+    Merge the loaded user data with the in-memory user data.
+    Parameters
+    ----------
+    loaded_user_data : dict
+        The loaded user data from the persistent storage.
+    in_memory_user_data : dict
+        The in-memory user data from the Jeeves API.
+
+    Returns
+    -------
+    dict
+        The merged user data.
+    """
+    def choose_min(a, b):
+      if a is None:
+        return b
+      if b is None:
+        return a
+      return min(a, b)
+
+    def choose_max(a, b):
+      if a is None:
+        return b
+      if b is None:
+        return a
+      return max(a, b)
+
+    def choose_sum(a, b):
+      if a is None:
+        return b
+      if b is None:
+        return a
+      return a + b
+
+    merging_methods = {
+      'creation_time': choose_min,
+      'last_access_time': choose_max,
+      'messages': choose_sum,
+      'n_requests': choose_sum,
+      'long_term_memory_is_empty': choose_min,
+    }
+    in_memory_user_data = in_memory_user_data or {}
+    return {
+      k: merging_methods[k](loaded_user_data.get(k), in_memory_user_data.get(k))
+      for k in loaded_user_data.keys()
+    }
+
+  def maybe_load_persistence_data(self):
+    """
+    Load the current state of the Jeeves API from a persistent storage.
+    """
+    saved_data = self.cacheapi_load_pickle()
+    if saved_data is not None:
+      loaded_user_data = saved_data['USER_DATA']
+      loaded_domains_data = saved_data['DOMAINS_DATA']
+      loaded_requests = saved_data['REQUESTS']
+
+      for user_token, user_data in loaded_user_data.items():
+        self.__user_data[user_token] = self.__merge_user_data(
+          loaded_user_data=user_data,
+          in_memory_user_data=self.__user_data.get(user_token, {}),
+        )
+      # endfor user tokens
+      for domain, domain_data in loaded_domains_data.items():
+        self.__domains_data[domain] = {
+          **domain_data,
+          **self.__domains_data.get(domain, {}),
+        }
+      # endfor domains
+      for request_id, request_data in loaded_requests.items():
+        self.__requests[request_id] = {
+          **request_data,
+          **self.__requests.get(request_id, {}),
+        }
+      # endfor requests
+    # endif saved_data is not None
+    return
+
 
   def Pd(self, msg, *args, **kwargs):
     """
@@ -191,19 +315,22 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       If the request is not ready, it is further postponed.
       """
       if request_id in self.__requests:
+        self.Pd(f"Checking request {request_id}...", color="yellow")
         request = self.__requests[request_id]
         start_time = request['start_time']
         timeout = request['timeout']
         if request['finished']:
           return request['result']
         elif self.time() - start_time > timeout:
-          request['finished'] = True
           request['result'] = {
             'error': 'Request timed out',
             'request_id': request_id,
           }
+          request['finished'] = True
           return request['result']
         # endif
+      else:
+        self.P(f"Request {request_id} not found in __requests.", color="red")
       # endif
       # Maybe handle case where request_id is not in __requests?
       return self.create_postponed_request(
@@ -460,13 +587,13 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       current_short_term_memory = self.__user_data[user_token].get('messages') or []
       transfer_threshold = self.cfg_short_term_memory_size // 2
       if len(current_short_term_memory) > transfer_threshold:
-        self.P(f"Moving short term memory to long term memory for user '{user_token}'")
         current_role = current_short_term_memory[transfer_threshold].get('role')
         while transfer_threshold > 0 and current_role != "user":
           transfer_threshold -= 1
           current_role = current_short_term_memory[transfer_threshold].get('role')
         if transfer_threshold == 0:
           return
+        self.P(f"Moving {transfer_threshold} messages to short term memory to long term memory for user '{user_token}'")
         first_half = current_short_term_memory[:transfer_threshold]
         second_half = current_short_term_memory[transfer_threshold:]
         self.__user_data[user_token]['messages'] = second_half
@@ -659,7 +786,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
 
     @BasePlugin.endpoint(method="post")
     # TODO: change to jeeves_agent_request?
-    def chat(
+    def query(
         self,
         user_token: str = None,
         message: str = None,
@@ -667,7 +794,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         # **kwargs
     ):
       """
-      Chat with the Jeeves API.
+      Send a query to the Jeeves API.
       Parameters
       ----------
 
@@ -677,6 +804,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           The message to send to the API. Default is None.
       domain : str
           The domain to use for the API. Default is None.
+      # TODO: add kwargs (e.g. temperature or function calling)
       kwargs : dict
           Additional parameters to send to the API. Default is None.
 
@@ -709,7 +837,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         # **kwargs
       )
 
-      request_id = self.maybe_retrieve_domain_additional_data(
+      postponed_request = self.maybe_retrieve_domain_additional_data(
         domain=domain,
         query=message,
         next_request_params={
@@ -719,8 +847,8 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         }
       )
       # Check if the request needs 
-      if request_id is not None:
-        return self.solve_postponed_request(request_id=request_id)
+      if postponed_request is not None:
+        return postponed_request
       # endif request_id is not None
 
       request_id = self.register_chat_request(
@@ -731,7 +859,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       return self.solve_postponed_request(request_id=request_id)
 
     @BasePlugin.endpoint(method="post")
-    def chat_user(
+    def chat(
         self,
         user_token: str = None,
         message: str = None,
@@ -750,6 +878,8 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           The message to send to the API. Default is None.
       domain : str
           The domain to use for the API. Default is None.
+
+      # TODO: add kwargs (e.g. temperature or function calling)
       kwargs
 
       Returns
@@ -780,7 +910,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
 
       # The long term memory for the user conversation will be a domain identified with his
       # user token.
-      request_id = self.maybe_retrieve_domain_additional_data(
+      postponed_request = self.maybe_retrieve_domain_additional_data(
         domain=user_token,
         query=message,
         next_request_params={
@@ -791,8 +921,8 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         user_token=user_token
       )
       # Check if the request needs 
-      if request_id is not None:
-        return self.solve_postponed_request(request_id=request_id)
+      if postponed_request is not None:
+        return postponed_request
       # endif request_id is not None
       
       # TODO: add domain additional data retrieval
@@ -805,27 +935,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       return self.solve_postponed_request(request_id=request_id)
 
   """END LLM SECTION"""
-
-  def _create_user_token(
-      self, user_token: str = None,
-  ):
-    # TODO: integrate chainstore for user tokens
-    if user_token is None:
-      user_token = self.uuid()
-      # This is redundant, but we need to make sure that the token is unique.
-      while user_token in self.__user_data:
-        user_token = self.uuid()
-    # endif preexistent user_token
-    # endwhile token is not unique
-    new_user_data = {
-      'creation_time': self.time(),
-      'last_access_time': self.time(),
-      'n_requests': 0,
-      'messages': []
-    }
-    self.__user_data[user_token] = new_user_data
-    return user_token
-
   @BasePlugin.endpoint(method='post')
   # TODO: add configurable parameter with preexistent user tokens
   def get_user_token(self, dummy_param: str = None):
@@ -861,6 +970,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       if contains_additional_context is not None:
         self.__domains_data[domain_name]['contains_additional_context'] = contains_additional_context
     # endif domain already existent
+    self.maybe_persistence_save(force=True)
     return domain_name
 
   @BasePlugin.endpoint(method='post')
@@ -993,21 +1103,21 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           request_type = request_data.get('request_type', None)
           error_message = (data.get('RESULT') or {}).get('ERROR_MESSAGE')
           if error_message is not None:
-            request_data['finished'] = True
             request_data['result'] = {
               'error': error_message,
               'request_id': request_id,
             }
+            request_data['finished'] = True
             self.Pd(f"Request ID '{request_id}' to DocEmbedding failed with error: {error_message}", color="red")
             return
           if request_type == 'ADD_DOC':
-            request_data['finished'] = True
             request_result = data.get('RESULT') or {}
             request_data['result'] = {
               'elapsed_time': self.time() - request_data['start_time'],
               'request_id': request_id,
               **request_result,
             }
+            request_data['finished'] = True
             self.Pd(f"'ADD_DOC' request ID '{request_id}' to DocEmbedding successfully processed.", color="green")
           elif request_type == 'QUERY':
             request_result = data.get('RESULT') or {}
@@ -1020,7 +1130,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
               chat_request_kwargs = {
                 self.ct.JeevesCt.REQUEST_ID: request_id,
                 **next_request_params,
-                self.ct.JeevesCt.CONTEXT: '\n'.join(docs) if isinstance(docs, list) > 0 else None,
+                self.ct.JeevesCt.CONTEXT: docs,
                 **request_result
               }
               # normalize the kwargs
@@ -1034,12 +1144,12 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
                 **chat_request_kwargs,
               )
             else:
-              request_data['finished'] = True
               request_data['result'] = {
                 'elapsed_time': self.time() - request_data['start_time'],
                 'request_id': request_id,
                 'docs': docs,
               }
+              request_data['finished'] = True
             # endif request finished or not
 
             self.Pd(f"'QUERY' request ID '{request_id}' to DocEmbedding successfully processed.", color="green")
@@ -1091,37 +1201,37 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
             return
           error_message = (data.get('RESULT') or {}).get('ERROR_MESSAGE')
           if error_message is not None:
-            request_data['finished'] = True
             request_data['result'] = {
               'error': error_message,
               'request_id': request_id,
             }
+            request_data['finished'] = True
             self.Pd(f"Request ID '{request_id}' to LLM failed with error: {error_message}", color="red")
             return
           text_response = data.get('RESULT', {}).get('TEXT_RESPONSE', "")
           if text_response is not None:
-            request_data['finished'] = True
             request_data['result'] = {
               'response': text_response,
               'elapsed_time': self.time() - request_data['start_time'],
               'model_name': data.get('MODEL_NAME', None),
               'request_id': request_id,
             }
+            request_data['finished'] = True
             user_token = request_data.get('user_token', None)
             user_messages = request_data.get('messages', [])
-            self.P(f"User messages: {user_messages}")
-            last_user_message = self.get_last_user_message(user_messages)
-            if last_user_message is not None:
-              self.__user_data[user_token]['messages'].append(last_user_message)
-            self.__user_data[user_token]['messages'].append({
-              'role': 'assistant',
-              'content': text_response,
-            })
             use_long_term_memory = request_data.get('use_long_term_memory', False)
-            self.P(f"Done processing request for user {user_token} with {use_long_term_memory=}")
+            self.P(f"Done processing request '{request_id}' for user {user_token} with {use_long_term_memory=}. Response is:\n {text_response}", color="green")
             if use_long_term_memory:
+              self.P(f"User messages: {user_messages}")
+              last_user_message = self.get_last_user_message(user_messages)
+              if last_user_message is not None:
+                self.__user_data[user_token]['messages'].append(last_user_message)
+              self.__user_data[user_token]['messages'].append({
+                'role': 'assistant',
+                'content': text_response,
+              })
               self.maybe_short_term_memory_to_long_term_memory(user_token)
-            # endif request made through /chat_user endpoint
+            # endif request made through /chat endpoint
             self.Pd(f"Request ID '{request_id}' to LLM successfully processed.", color="green")
         else:
           self.Pd(f"Request ID '{request_id}' not found in requests.", color="red")
@@ -1134,6 +1244,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
   def __maybe_send_command_payloads(self):
     current_commands = self.__command_payloads[:self.cfg_max_commands_sent]
     for payload in current_commands:
+      self.Pd(f"Sending command payload: {self.json_dumps(payload)}", color="blue")
       self.add_payload_by_fields(**payload)
     self.__command_payloads = self.__command_payloads[len(current_commands):]
     return
@@ -1142,5 +1253,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     super(JeevesApiPlugin, self)._process()
     self.network_processor_loop()
     self.__maybe_send_command_payloads()
+    self.maybe_persistence_save()
     return
 
