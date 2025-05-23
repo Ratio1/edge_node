@@ -57,7 +57,7 @@
     "COMM_ENGINE": "queue",
     "USE_AMP"        : false,
     "MAX_WAIT_TIME_MULTIPLIER" : 50,
-    "SERVER_COLLECTOR_TIMEDELTA" : 3600,
+    "#SERVER_COLLECTOR_TIMEDELTA" : 3600,
     "AUTO_WARMUPS" : {},
     "COMM_METHOD": "default",
     "SHM_MAX_IMAGE_SHAPE": [1520, 2688, 3],
@@ -72,7 +72,7 @@
       "access_key": "$EE_MINIO_ACCESS_KEY",
       "secret_key": "$EE_MINIO_SECRET_KEY",
       "secure": "$EE_MINIO_SECURE",
-      "bucket_name": "model-zoo"
+      "bucket_name": "$EE_MINIO_MODEL_BUCKET"
     }    
   },
 
