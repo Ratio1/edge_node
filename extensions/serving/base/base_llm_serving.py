@@ -115,6 +115,8 @@ _CONFIG = {
 
   "USE_FLASH_ATTENTION"   : False,
 
+  "HF_TOKEN": None,
+
   "DEFAULT_TEMPERATURE" : 0.7,
   "DEFAULT_TOP_P"      : 1,
   "DEFAULT_MAX_TOKENS" : 512,
@@ -173,7 +175,9 @@ class BaseLlmServing(
 
   @property
   def hf_token(self):
-    return self.os_environ.get(LlmCT.EE_HF_TOKEN, None)
+    env_hf_token = self.os_environ.get(LlmCT.EE_HF_TOKEN, None)
+    cfg_hf_token = self.cfg_hf_token
+    return cfg_hf_token or env_hf_token
 
 
   @property
