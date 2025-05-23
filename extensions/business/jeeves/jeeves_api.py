@@ -55,7 +55,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     start_time = self.time()
     sleep_period = self.cfg_r1fs_sleep_period
     while not self.r1fs.is_ipfs_warmed:
-      elapsed = (self.time() - start_time).seconds
+      elapsed = round(self.time() - start_time, 1)
       self.P(f'IPFS is warming up ({elapsed}s passed so far)...', color="yellow")
       self.P(f"Waiting another {sleep_period}s for IPFS to be warmed up...", color="yellow")
       self.sleep(sleep_period)
