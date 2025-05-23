@@ -596,13 +596,18 @@ class BaseLlmServing(
     # TODO: explore more generation strategies, as this is currently
     # using the greedy strategy.
 
+    # TODO: check how to add additional parameters from predict_kwargs_lst
     model_args = {
       'attention_mask': attn_mask,
+      'temperature': self.cfg_default_temperature,
+      'top_p': self.cfg_default_top_p,
+      'max_new_tokens': self.cfg_default_max_tokens,
+      'repetition_penalty': self.cfg_repetition_penalty,
     }
     if self.cfg_prompt_lookup_num_tokens is not None:
       model_args['prompt_lookup_num_tokens'] = int(self.cfg_prompt_lookup_num_tokens)
 
-    self.P("Running with repetition penalty {}".format(self.cfg_repetition_penalty))
+    self.P(f"Running with following model args:\n{self.json_dumps(model_args, indent=2)}")
 
     # TODO: test if some gpu mem can be freed after this
     with th.no_grad():
@@ -613,8 +618,6 @@ class BaseLlmServing(
       #  https://huggingface.co/docs/transformers/v4.44.2/en/llm_optims
       yhat = self.model.generate(
         inputs=batch_tokens,
-        max_new_tokens=512,
-        repetition_penalty=self.cfg_repetition_penalty,
         **model_args
       )
       elapsed = self.time() - t0
