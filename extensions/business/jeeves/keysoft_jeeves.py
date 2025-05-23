@@ -21,7 +21,7 @@ class KeysoftJeevesPlugin(BasePlugin):
   CONFIG = _CONFIG
 
   def get_predefined_user_tokens(self):
-    env_predefined_tokens_str = self.os_environ.get("EE_KEYSOFT_JEEVES_TOKENS")
+    env_predefined_tokens_str = self.os_environ.get("EE_KEYSOFT_JEEVES_TOKENS") or ""
     env_predefined_tokens = [tok.strip() for tok in env_predefined_tokens_str.split(',')]
     env_predefined_tokens = [tok for tok in env_predefined_tokens if tok]
 
