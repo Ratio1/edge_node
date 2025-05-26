@@ -116,8 +116,14 @@ DEEPLOY_CREATE_REQUEST = {
       "memory" : "512m"
     },
     "PORT" : None,
-    "NGROK_EDGE_LABEL" : None,
-    "NGROK_USE_API": True,
+    "NGROK_EDGE_LABEL" : None,  # if we have a already created ngrok edge, we can use it here
+    "NGROK_ENABLED" : False, # this tells that the destination plugin instance will USE ngrok
+    # TODO: (and observations)
+    # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is True => normal use
+    # - if NGROK_EDGE_LABEL is None and NGROK_ENABLED is True => create/use dynamic url
+    # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is False => consider NGROK_ENABLED=True
+    
+    "NGROK_USE_API": True,  # use API or shell for ngrok tunnel creation
     "ENV" : {
       "ENV1" : "value1",
       "ENV2" : "value2",

@@ -184,6 +184,10 @@ class DeeployManagerPlugin(
           app_params.USERNAME : str 
               The username to use for the app
           app_params.PASSWORD : str 
+          
+          
+    TODO: (Vitalii)
+      - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
     
     """
     try:
