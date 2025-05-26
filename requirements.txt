@@ -1,7 +1,19 @@
+# TODO: some of these packages must be eliminate/replaced for arm64 native builds
+onnx
+openvino==2024.1.0
+onnxruntime-openvino==1.17.1
+onnxsim
+nvidia-cudnn-cu12<9.0
+accelerate==0.30.1
+bitsandbytes==0.43.1
+#
 kmonitor 
 ratio1 
 decentra-vision 
 python-telegram-bot
 protobuf==5.28.3
+openai
 vectordb
 ngrok
+
+openai

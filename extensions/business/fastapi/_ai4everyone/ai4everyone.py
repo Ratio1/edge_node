@@ -11,6 +11,9 @@ _CONFIG = {
   'SAVE_PERIOD': 60,
   'REQUEST_TIMEOUT': 10,
   "PROCESS_DELAY": 0,
+  "DEPLOY_NGROK_EDGE_LABEL": None,
+  "LOG_REQUESTS": True,
+  "DEBUG_WEB_APP": True,
 
   # 'PORT': 5000,
   'ASSETS': 'extensions/business/fastapi/_ai4everyone',
@@ -33,6 +36,7 @@ class AI4EveryonePlugin(BasePlugin):
   CONFIG = _CONFIG
 
   def __init__(self, **kwargs):
+    self.__init_done = False
     super(AI4EveryonePlugin, self).__init__(**kwargs)
     self.jobs_data = {}
     self.requests_responses = {}
@@ -52,6 +56,7 @@ class AI4EveryonePlugin(BasePlugin):
   def on_init(self):
     super(AI4EveryonePlugin, self).on_init()
     self.jobs_data = self.load_persistence_data()
+    self.__init_done = True
     return
 
   """SESSION SECTION"""
@@ -59,12 +64,25 @@ class AI4EveryonePlugin(BasePlugin):
     def on_payload(self, sess: Session, node_id: str, pipeline: str, signature: str, instance: str, payload: Payload):
       if signature.lower() not in AI4E_CONSTANTS.RELEVANT_PLUGIN_SIGNATURES:
         return
+      if not self.__init_done:
+        sess.P(f"[DEBUG_AI4E]Session not initialized yet, ignoring payload.")
+        return
       is_status = payload.data.get('IS_STATUS', False)
       is_final_dataset_status = payload.data.get('IS_FINAL_DATASET_STATUS', False)
       if is_status or is_final_dataset_status:
-        self.maybe_update_job_data(node_id, pipeline, signature, instance, payload)
+        try:
+          self.maybe_update_job_data(node_id, pipeline, signature, instance, payload)
+        except Exception as e:
+          if self.cfg_debug_web_app:
+            self.P(f"[DEBUG_AI4E]Error while updating job data: {e}")
+        # endtry
       else:
-        self.register_request_response(node_id, pipeline, signature, instance, payload)
+        try:
+          self.register_request_response(node_id, pipeline, signature, instance, payload)
+        except Exception as e:
+          if self.cfg_debug_web_app:
+            self.P(f"[DEBUG_AI4E]Error while registering request response: {e}")
+        # endtry
       return
 
     def maybe_update_job_data(self, node_id: str, pipeline: str, signature: str, instance: str, payload: Payload):
@@ -319,7 +337,7 @@ class AI4EveryonePlugin(BasePlugin):
       return None
 
     @BasePlugin.endpoint(method="post")
-    def vote(self, job_id: str, filename: str, label: dict):
+    def vote(self, job_id: str, filename: str, label: str):
       if job_id in self.jobs_data:
         success, result = self.jobs_data[job_id].send_vote(filename=filename, label=label)
         return result if success else None

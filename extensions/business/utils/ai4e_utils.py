@@ -7,12 +7,18 @@ def job_data_to_id(node_id, pipeline, signature, instance):
   return instance
 
 
+def maybe_strip(s):
+  if isinstance(s, str):
+    return s.strip()
+  return s
+
+
 def classes_dict_to_msg(classes):
-  return [{'name': k, 'description': v} for k, v in classes.items()]
+  return [{'name': maybe_strip(k), 'description': v} for k, v in classes.items()]
 
 
 def classes_msg_to_dict(classes):
-  return {c['name']: c['description'] for c in classes}
+  return {maybe_strip(c['name']): c['description'] for c in classes}
 
 
 def process_data_sources(data_sources):
@@ -49,7 +55,8 @@ def get_job_config(
     },
     "REWARDS": rewards,
     "DATASET": dataset,
-    "CREATION_DATE": creation_date
+    "CREATION_DATE": creation_date,
+    "AUTO_DEPLOY": None
   }
   plugin_config["INSTANCES"].append(instance_config)
   return plugin_config
@@ -188,6 +195,9 @@ class Job:
     cd_datetime = datetime.strptime(cd_str[:-6], '%Y%m%d%H%M%S') if cd_str is not None else None
     self.creation_date = int(cd_datetime.timestamp()) if cd_datetime is not None else None
     self.classes = data.get('CLASSES', self.classes)
+    if self.classes is not None:
+      self.classes = {maybe_strip(k): v for k, v in self.classes.items()}
+    # endif classes
     self.job_status = data.get('JOB_STATUS', self.job_status)
 
     self.crop_status['total_stats'] = data.get('COUNTS', self.crop_status['total_stats'])
@@ -208,9 +218,17 @@ class Job:
     if signature.lower() in AI4E_CONSTANTS.TRAINING_PLUGIN_SIGNATURES:
       self.train_status_full_payload = data
     if 'TRAIN_STATUS' in data.keys():
+      full_train_data = data.get('TRAIN_STATUS', None)
+      if not isinstance(full_train_data, dict):
+        if self.owner.cfg_debug_web_app:
+          self.owner.P(f"`TRAIN_STATUS` is not a dict: {full_train_data}")
+        return
       self.train_status['status'] = data.get('JOB_STATUS', self.train_status['status'])
-      full_train_data = data.get('TRAIN_STATUS', {})
-      train_data = full_train_data.get('STATUS', {})
+      train_data = full_train_data.get('STATUS', None)
+      if not isinstance(train_data, dict):
+        if self.owner.cfg_debug_web_app:
+          self.owner.P(f"`TRAIN_STATUS[`STATUS`]` is not a dict: {train_data}")
+        return
       self.train_status['remaining'] = train_data.get('REMAINING', self.train_status['remaining'])
       self.train_status['elapsed'] = train_data.get('ELAPSED', self.train_status['elapsed'])
 
@@ -295,13 +313,19 @@ class Job:
     }
 
   def get_train_status(self):
-    total = self.train_status['elapsed'] + self.train_status['remaining']
+    if self.train_status.get('status') is None:
+      return {}
+    elapsed = self.train_status.get('elapsed')
+    remaining = self.train_status.get('remaining')
+    if elapsed is None or remaining is None:
+      return {}
+    total = elapsed + remaining
     progress = 0
     if total > 0:
-      progress = self.train_status['elapsed'] / total
+      progress = elapsed / total
     return {
-      'remaining': self.train_status['remaining'],
-      'elapsed': self.train_status['elapsed'],
+      'remaining': remaining,
+      'elapsed': elapsed,
       'score': self.train_status['best'],
       'progress': progress,
       'currentGridIteration': self.train_status['current_grid_iteration'],
@@ -441,7 +465,7 @@ class Job:
       return False, err_msg
     return True, "Training started"
 
-  def deploy_configs(self, lst_allowed):
+  def deploy_configs(self, lst_allowed, deploy_ngrok_edge_label):
     """
     2 pipelines will be deployed:
       1. One custom detection pipeline to run the freshly obtained custom model
@@ -452,12 +476,15 @@ class Job:
     lst_allowed: list
       Nodes where the above-mentioned pipelines can be deployed.
 
+    deploy_ngrok_edge_label: str
+      The label of the ngrok edge node where the pipelines will be deployed.
+
     Returns
     -------
 
     """
-    chosen_node = np.random.choice(lst_allowed)
-    chosen_node = 'bleo_edge_node'
+    # chosen_node = np.random.choice(lst_allowed)
+    chosen_node = self.owner.e2_addr
     # START DETECTION PIPELINE
     instance_config = {
       "AI_ENGINE": "custom_second_stage_detector",
@@ -485,6 +512,8 @@ class Job:
     # END DETECTION PIPELINE
     # START FASTAPI PIPELINE
     fastapi_instance_config = {
+      "RESPONSE_FORMAT": self.owner.cfg_response_format,
+      "NGROK_EDGE_LABEL": deploy_ngrok_edge_label,
     }
     pipeline = self.session.create_or_attach_to_pipeline(
       node=chosen_node,
@@ -515,7 +544,10 @@ class Job:
     if len(lst_allowed) == 0:
       self.started_deploying = False
       return False, "No node available at the moment."
-    self.deploy_configs(lst_allowed)
+    self.deploy_configs(
+      lst_allowed=lst_allowed,
+      deploy_ngrok_edge_label=self.owner.cfg_deploy_ngrok_edge_label,
+    )
 
     self.started_deploying = False
     self.deployed = True

@@ -69,9 +69,11 @@ _CONFIG = {
   # mandatory area
   **BasePlugin.CONFIG,
   # our overwritten props
-  'PROCESS_DELAY' : 15,  
-  'INITIAL_WAIT'  : 15,
-  # due to the fact that we are using a "void" pipeline, 
+  'PROCESS_DELAY' : 15,
+
+  'FORCE_R1FS_FASTER_WARMUP': None,
+
+  # due to the fact that we are using a "void" pipeline,
   # we need to allow empty inputs as we are not getting any 
   # data from the pipeline
   'ALLOW_EMPTY_INPUTS': True, 
@@ -89,7 +91,12 @@ class R1fsDemoPlugin(BasePlugin):
     self.__known_cids = [] # keep track of known CIDs
     self.__start_time = self.time() # start time of the plugin
     self.__r1fs_demo_iter = 0 # iteration counter
-    self.P(f"Starting R1fsDemoPlugin v{__VER__} with ID: {self.my_id}. Plugin instance will now wait for {self.cfg_initial_wait} sec")
+    self.P(f"Starting R1fsDemoPlugin v{__VER__} with ID: {self.my_id}.")
+    self._last_log_show_time = 0 # last time we logged something
+
+    if isinstance(self.cfg_force_r1fs_faster_warmup, int) and self.cfg_force_r1fs_faster_warmup > 0:
+      self.P(f"Force R1FS faster warmup: {self.cfg_force_r1fs_faster_warmup}")
+      self.r1fs._set_min_connection_age(self.cfg_force_r1fs_faster_warmup)
     return
   
   def __save_some_data(self):
@@ -167,8 +174,11 @@ class R1fsDemoPlugin(BasePlugin):
 
 
   def process(self):
-    if self.time() - self.__start_time < self.cfg_initial_wait:
-      self.P(f"Waiting for {self.cfg_initial_wait} sec to start processing...")
+    if not self.r1fs.is_ipfs_warmed:
+      current_time = self.time()
+      if current_time - self._last_log_show_time > 60: # log every 60 sec
+        self.P(f"Waiting for R1FS to warm up. Time elapsed since plugin start {current_time - self.__start_time:.1f} seconds.")
+        self._last_log_show_time= current_time
       return
     self.__r1fs_demo_iter += 1
     self.P(f'R1fsDemoPlugin is processing iter #{self.__r1fs_demo_iter}')

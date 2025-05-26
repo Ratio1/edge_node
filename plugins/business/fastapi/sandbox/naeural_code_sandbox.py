@@ -9,7 +9,6 @@ _CONFIG = {
   'SAVE_PERIOD': 60,
   "PROCESS_DELAY": 0.2,
 
-  'PORT': 5002,
   'ASSETS': 'plugins/business/fastapi/sandbox',
   'JINJA_ARGS': {
     'html_files': [

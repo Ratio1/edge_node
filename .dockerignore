@@ -13,3 +13,6 @@ config_startup.json
 */_logs/*
 */_models/*
 */_output/*
+*/_vector_db*
+*/ratio1_*
+.venv
