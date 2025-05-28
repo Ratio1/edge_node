@@ -32,6 +32,7 @@ class LlmCT:
   CONTEXT = 'CONTEXT'
   REQUEST_ID = 'REQUEST_ID'
   REQUEST_TYPE = 'REQUEST_TYPE'
+  VALID_MASK = 'VALID_MASK'
 
   # Constants for encoding a prompt using chat templates
   REQUEST_ROLE = 'user'

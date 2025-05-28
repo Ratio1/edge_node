@@ -52,6 +52,7 @@ class LlmTokenizerMixin(object):
         f"---\n"
         f"Please consider the following retrieved context when responding:\n\n"
         f"{formatted_context}\n"
+        f"Feel free to use or ignore the context as you see fit.\n"
         f"---"
     )
 

@@ -376,6 +376,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self,
         context_id: str,
         documents: list[str],
+        documents_cid: str = ""
     ):
       """
       Add one or more documents to the RAG agents' context.
@@ -393,19 +394,21 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       -------
 
       """
-      documents_cid = self.r1fs.add_pickle(
-        data={
-          'DOCUMENTS': documents,
-          'CONTEXT_ID': context_id,
-        },
-        secret=context_id
-      )
-      if documents_cid is None:
-        msg = f"Failed to add documents to context '{context_id}'"
-        return {
-          'error': msg,
-        }
-      # endif documents_cid is None
+      if len(documents_cid) == 0:
+        documents_cid = self.r1fs.add_pickle(
+          data={
+            'DOCUMENTS': documents,
+            'CONTEXT_ID': context_id,
+          },
+          secret=context_id
+        )
+        if documents_cid is None:
+          msg = f"Failed to add documents to context '{context_id}'"
+          return {
+            'error': msg,
+          }
+        # endif documents_cid is None
+      # endif documents_cid provided already
       request_id = self.register_add_documents_request(
         documents_cid=documents_cid,
         context_id=context_id,
@@ -417,6 +420,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self,
         user_token: str,
         documents: list[str],
+        documents_cid: str = ""
     ):
       """
       Add one or more documents to the RAG agents' context for a specific user.
@@ -438,6 +442,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       return self.add_documents(
         context_id=user_token,
         documents=documents,
+        documents_cid=documents_cid
       )
 
     @BasePlugin.endpoint(method='post')
@@ -446,6 +451,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         user_token: str,
         domain: str,
         documents: list[str],
+        documents_cid: str = ""
     ):
       """
       Add one or more documents to the RAG agents' context for a specific domain.
@@ -483,6 +489,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       return self.add_documents(
         context_id=domain,
         documents=documents,
+        documents_cid=documents_cid
       )
 
     def register_retrieve_documents_request(
@@ -523,9 +530,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         next_request_params=next_request_params
       )
 
-    # TODO: this will not be an endpoint, but will be used for debug for now.
-    @BasePlugin.endpoint()
-    def retrieve_documents(
+    def retrieve_documents_helper(
         self,
         context_id: str,
         query: str,
@@ -564,6 +569,40 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         next_request_params=next_request_params,
       )
       return self.solve_postponed_request(request_id=request_id)
+
+    # TODO: this will not be an endpoint, but will be used for debug for now.
+    @BasePlugin.endpoint()
+    def retrieve_documents(
+        self,
+        context_id: str,
+        query: str,
+        k: int = 5,
+    ):
+      """
+      Retrieve documents from the RAG agents' context based on a query.
+
+      Parameters
+      ----------
+      context_id : str
+          The context ID from which the documents will be retrieved.
+
+      query : str
+          The query to use for retrieving the documents.
+
+      k : int
+          The number of documents to retrieve. Default is 5.
+
+      Returns
+      -------
+      list[str]
+          List of documents retrieved from the context. Each document is a string.
+      """
+      return self.retrieve_documents_helper(
+        context_id=context_id,
+        query=query,
+        k=k,
+        next_request_params=None,  # This is None, because this is a simple retrieve action.
+      )
 
     def messages_to_documents(self, messages: list[dict]):
       return [
@@ -645,7 +684,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       if domain == user_token:
         is_long_term_empty = self.__user_data[user_token].get('long_term_memory_is_empty', True)
         if not is_long_term_empty:
-          return self.retrieve_documents(
+          return self.retrieve_documents_helper(
             context_id=user_token,
             query=query,
             k=5,
@@ -661,7 +700,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         return None
 
       # endif domain not in additional domains
-      return self.retrieve_documents(
+      return self.retrieve_documents_helper(
         context_id=domain,
         query=query,
         k=5,

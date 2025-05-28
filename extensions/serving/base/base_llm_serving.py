@@ -120,7 +120,7 @@ _CONFIG = {
   "DEFAULT_TEMPERATURE" : 0.7,
   "DEFAULT_TOP_P"      : 1,
   "DEFAULT_MAX_TOKENS" : 2048,
-  "SKIP_ERRORS"           : False,
+  "SKIP_ERRORS"           : True,
   "RELEVANT_SIGNATURES": None,
 
   "SUPPORTED_REQUEST_TYPES": [
@@ -143,6 +143,20 @@ _CONFIG = {
 
 }
 
+"""
+TODO:
+Make this inherit the ContinuousServingProcess so that it can run in a continuous mode.
+1. The model init should be in the continuous process.
+2. Payloads should be accumulated in the inputs deque.
+2.1. Payloads will be filtered using the `keep_message` method.
+2.2. Payloads may not be sent immediately to the inference.
+`message_ready` method will be used to check if the payload is ready for inference.
+2.3. Payloads will be processed in batches of size `BATCH_SIZE`.
+
+3. After the inference is done, the results will be added in the results deque.
+4. Ping payloads will be sent from the DCT in order for the serving to be able to send the results
+as fast as possible.
+"""
 
 class BaseLlmServing(
   BaseServingProcess,
@@ -351,97 +365,16 @@ class BaseLlmServing(
     device_map = "auto"
     return device_map
 
-  def keep_message(self, dict_message: dict, **kwargs):
-    """
-    Method for checking if the message should be kept or not during the filtering process.
-    The checks are based on the following criteria:
-    1. The message must be a dictionary.
-    2. The message must contain the key "PAYLOAD_PATH" with a list of four elements
-    (node address, pipeline name, signature and instance id of the instance the message was
-    sent from).
-    3. The third element of the "PAYLOAD_PATH" list must be a relevant signature.
-    4. The message must contain the key "JEEVES_CONTENT" with a dictionary.
-    5. The "JEEVES_CONTENT" dictionary must contain the key "REQUEST_ID" with a string value.
-    6. The "REQUEST_ID" must not be in the set of processed requests.
-
-    Parameters
-    ----------
-    dict_message : dict
-        The message to be checked.
-
-    Returns
-    -------
-    bool
-        True if the message should be kept, False otherwise.
-    """
-    result = False
-    if not isinstance(dict_message, dict):
-      return result
-    # endif
-    payload_path = dict_message.get(self.ct.PAYLOAD_DATA.EE_PAYLOAD_PATH) or [None, None, None, None]
-    signature = payload_path[2] if isinstance(payload_path, (list, tuple)) and len(payload_path) > 2 else None
-    # No longer mandatory since the filtering is done in the DCT plugin.
-    if self.cfg_relevant_signatures:
-      relevant_signatures = [rs.upper() for rs in self.cfg_relevant_signatures]
-      if signature is None or signature.upper() not in relevant_signatures:
-        self.P(f"Signature {signature} not in relevant signatures {relevant_signatures}", color='r')
-        return result
-    # endif relevant signatures specified
-
-    if "JEEVES_CONTENT" not in dict_message:
-      self.P(f"Message does not contain JEEVES_CONTENT: {dict_message}", color='r')
-      return result
-
-    jeeves_content = dict_message.get("JEEVES_CONTENT")
-    if not isinstance(jeeves_content, dict):
-      self.P(f"JEEVES_CONTENT is not a dict: {type(jeeves_content)}: {self.shorten_str(dict_message)}", color='r')
-      return result
-
-    jeeves_content = {
-      (k.upper() if isinstance(k, str) else k): v
-      for k, v in jeeves_content.items()
-    }
-    request_id = jeeves_content.get(LlmCT.REQUEST_ID, None)
-    if request_id is None or request_id in self.processed_requests:
-      self.P(f"Request ID {request_id} already processed or not provided", color='r')
-      return result
-
-    supported_request_types = self.cfg_supported_request_types or []
-    if not isinstance(supported_request_types, list):
-      self.P(f"Supported request types must be a list. Received {type(supported_request_types)}: {self.shorten_str(dict_message)}", color='r')
-      return result
-    normalized_supported_request_types = [
-      srt.upper() if isinstance(srt, str) else srt for srt in supported_request_types
-    ]
-    request_type = jeeves_content.get(LlmCT.REQUEST_TYPE, None)
-    request_type = request_type.upper() if isinstance(request_type, str) else request_type
-
-    result = request_type in normalized_supported_request_types
-    if not result:
-      self.P(f"Request type {request_type} not in supported request types {normalized_supported_request_types}", color='r')
-      return result
-    return result
-
-  def filter_inputs(self, inputs_data: list):
-    res_inputs = []
-    for i, inp in enumerate(inputs_data):
-      if self.keep_message(dict_message=inp):
-        res_inputs.append(inp)
-      # endif keep_message
-    # endfor each input
-    return res_inputs
-
   def _pre_process(self, inputs):
     """
     Pre-process the inputs for the model.
     The expected inputs is a dictionary with the key "DATA" containing a list of
     dictionaries. Each dictionary represents a message received from the network.
-    Each message will be filtered using the `keep_message` method.
-    The filtered messages will be passed to the tokenizer to generate the input
+    The messages will be passed to the tokenizer to generate the input
     tensors for the model. The input tensors will be padded to the maximum length
     of the input tensors in the batch. The attention mask will be generated
     accordingly.
-    Each valid message should contain the `JEEVES_CONTENT` key with a dictionary
+    Each message should contain the `JEEVES_CONTENT` key with a dictionary
     in the following format:
     {
       "REQUEST_ID": "request_id",
@@ -493,13 +426,9 @@ class BaseLlmServing(
             The list of dictionaries containing additional information for each
             input in the batch. Each dictionary corresponds to an input in the
             batch.
-      or
-      None if no relevant inputs are found.
     """
     lst_inputs = inputs.get('DATA', [])
-    lst_inputs = self.filter_inputs(lst_inputs)
-    if len(lst_inputs) > 0:
-      self.P(f"[DEBUG_LLM]Found {len(lst_inputs)} relevant inputs for processing")
+    self.P(f"[DEBUG_LLM]Received {len(lst_inputs)} inputs for processing")
 
     tokens_lst = []
     predict_kwargs_lst = []
@@ -507,16 +436,7 @@ class BaseLlmServing(
     additional_lst = []
 
     for i, inp in enumerate(lst_inputs):
-      if not isinstance(inp, dict):
-        msg = f"Each input must be a dict. Received {type(inp)}: {self.shorten_str(inp)}"
-        self.maybe_exception(msg)
-      # endif input not dict
-
       jeeves_content = inp.get("JEEVES_CONTENT")
-      if not isinstance(jeeves_content, dict):
-        msg = f"Each input must have a `JEEVES_CONTENT` dict. Received {type(jeeves_content)}: {self.shorten_str(inp)}"
-        self.maybe_exception(msg)
-      # endif jeeves_content not dict
       jeeves_content = {
         (k.upper() if isinstance(k, str) else k): v
         for k, v in jeeves_content.items()
@@ -537,12 +457,6 @@ class BaseLlmServing(
         msg = f"Each input must have a list of messages. Received {type(messages)}: {self.shorten_str(inp)}"
         self.maybe_exception(msg)
       # endif messages not list
-
-      if request_id is None or not isinstance(request_id, str):
-        type_str = type(request_id) if request_id is not None else None
-        msg = f"Each input must have a `REQUEST_ID`. Received {type_str}: {self.shorten_str(inp)}"
-        self.maybe_exception(msg)
-      # endif request_id not provided
 
       prompt = self._get_prompt_from_template(
         messages=messages,
@@ -565,9 +479,6 @@ class BaseLlmServing(
       })
     # endfor lst_inputs
 
-    if len(tokens_lst) == 0:
-      return None
-
     # Build the batch tensor. Ideally we should be calling encode on the
     # list of strings directly, however that seems to failing. Additionally
     # __call__ doesn't actually do the infilling.
@@ -584,8 +495,6 @@ class BaseLlmServing(
 
 
   def _predict(self, preprocessed_batch):
-    if preprocessed_batch is None:
-      return None
     self._counter += 1
     batch_tokens, attn_mask, predict_kwargs_lst, prompt_lst, additional_lst = preprocessed_batch
     # Perform generation using tokens and parameters.
