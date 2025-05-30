@@ -106,16 +106,27 @@ DEEPLOY_CREATE_REQUEST = {
     "0xai_node_2",
   ],
   "target_nodes_count" : 0,
+  "node_res_req" : { # this is the resource requirements for the target nodes
+      "cpu" : 4,
+      "memory" : "16GiB"   
+  },
   "app_params" : {
     "IMAGE" : "repo/image:tag",
-    "CR" : "docker.io",
-    "CR_USERNAME" : "user",
-    "CR_PASSWORD" : "password",
-    "CONTAINER_RESOURCES" : {
+    "CR_DATA" : {
+      "SERVER" : "docker.io",
+      "USERNAME" : "user",
+      "PASSWORD" : "password",
+    },
+    "CONTAINER_RESOURCES" : { # this are the resources that will be constrained for the container
       "cpu" : 1,
-      "memory" : "512m"
+      "memory" : "512m",
+      "ports": {
+        "31250": 1849,
+        "31251": 80
+      }      
     },
     "PORT" : None,
+    "NGROK_AUTH_TOKEN" : None,  # put your ngrok API key here
     "NGROK_EDGE_LABEL" : None,  # if we have a already created ngrok edge, we can use it here
     "NGROK_ENABLED" : False, # this tells that the destination plugin instance will USE ngrok
     # TODO: (and observations)
@@ -166,6 +177,221 @@ DEEPLOY_CREATE_REQUEST = {
   "pipeline_input_uri" : None,
   "chainstore_response" : False,
 }
+
+###################################################################################################################
+
+DEEPLOY_CREATE_REQUEST_CONTAINER_APP = {
+  "app_alias" : "some_app_name", 
+  "plugin_signature" : "CONTAINER_APP_RUNNER",
+  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
+  "target_nodes" : [
+    "0xai_node_1",
+    "0xai_node_2",
+  ],
+  "target_nodes_count" : 0,
+  "node_res_req" : { # this is the resource requirements for the target nodes
+      "cpu" : 4,
+      "memory" : "16GiB"   
+  },
+  "app_params" : {
+    "IMAGE" : "repo/image:tag",
+    "CR_DATA" : {
+      "SERVER" : "docker.io",
+      "USERNAME" : "user",
+      "PASSWORD" : "password",
+    },
+    "CONTAINER_RESOURCES" : {
+      "cpu" : 1,
+      "memory" : "512m"
+    },
+    "PORT" : None,
+    "NGROK_AUTH_TOKEN" : None,  # put your ngrok API key here
+    "NGROK_EDGE_LABEL" : None,  # if we have a already created ngrok edge, we can use it here
+    "NGROK_ENABLED" : False, # this tells that the destination plugin instance will USE ngrok
+    # TODO: (and observations)
+    # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is True => normal use
+    # - if NGROK_EDGE_LABEL is None and NGROK_ENABLED is True => create/use dynamic url
+    # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is False => consider NGROK_ENABLED=True
+    
+    "NGROK_USE_API": True,  # use API or shell for ngrok tunnel creation
+    "VOLUMES" : {
+      "vol1" : "/host/path/vol1",
+      "vol2" : "/host/path/vol2",
+    },
+    "ENV" : {
+      "ENV1" : "value1",
+      "ENV2" : "value2",
+      "ENV3" : "value3",
+      "ENV4" : "value4",
+    },
+    "DYNAMIC_ENV" : {
+      "ENV5" : [
+        {
+          "type" : "static",
+          "value" : "http://"
+        },
+        {
+          "type" : "host_ip",
+          "value" : None
+        },
+        {
+          "type" : "static",
+          "value" : ":5080/test_api_endpoint"
+        }
+      ],
+      "ENV6" : [
+        {
+          "type" : "host_ip",
+          "value" : "http://"
+        }
+      ],
+    },
+    "RESTART_POLICY" : "always",
+    "IMAGE_PULL_POLICY" : "always",    
+  },
+  "pipeline_input_type"  : "void", # no other option
+  "pipeline_input_uri" : None, # no other option
+  "chainstore_response" : True,
+}
+
+DEEPLOY_CREATE_REQUEST_SERVICE_APP = {
+  "app_alias" : "service_<service>_etc", 
+  "plugin_signature" : "CONTAINER_APP_RUNNER",
+  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
+  "target_nodes" : [
+    "0xai_node_1", # always single node for service apps
+  ],
+  "service_replica" : "0xai_service_replica_1", # this is the service replica name, it will be used to create the service app
+  "node_res_req" : { # this is the resource requirements for the target nodes
+      "cpu" : 4,
+      "memory" : "16GiB"   
+  },
+  "app_params" : {
+    "IMAGE" : "repo/image:tag", # Postgres image or MSSQL image or MySQL image
+    "CR_DATA" : {
+      "SERVER" : "docker.io",
+      "USERNAME" : None,
+      "PASSWORD" : None,
+    },
+    "CONTAINER_RESOURCES" : { # this are the resources that will be constrained for the container
+      "cpu" : 2,
+      "memory" : "2048m"
+    },
+    "PORT" : None, # export port 5432 to the host as well as 1433, 3306
+    "NGROK_AUTH_TOKEN" : None,  # put your ngrok API key here
+    "NGROK_EDGE_LABEL" : None,  # if we have a already created ngrok edge, we can use it here
+    "NGROK_ENABLED" : False, # this tells that the destination plugin instance will USE ngrok
+    # TODO: (and observations)
+    # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is True => normal use
+    # - if NGROK_EDGE_LABEL is None and NGROK_ENABLED is True => create/use dynamic url
+    # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is False => consider NGROK_ENABLED=True
+    
+    "NGROK_USE_API": True,  # use API or shell for ngrok tunnel creation
+    "ENV" : {
+      "ENV1" : "value1",
+      "ENV2" : "value2",
+      "ENV3" : "value3",
+      "ENV4" : "value4",
+    },
+    "DYNAMIC_ENV" : {
+      "ENV5" : [
+        {
+          "type" : "static",
+          "value" : "http://"
+        },
+        {
+          "type" : "host_ip",
+          "value" : None
+        },
+        {
+          "type" : "static",
+          "value" : ":5080/test_api_endpoint"
+        }
+      ],
+      "ENV6" : [
+        {
+          "type" : "host_ip",
+          "value" : "http://"
+        }
+      ],
+    },
+    "RESTART_POLICY" : "always",
+    "IMAGE_PULL_POLICY" : "always"    
+  },
+  "pipeline_input_type"  : "void",
+  "pipeline_input_uri" : None,
+  "chainstore_response" : True,
+}
+
+DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
+  "app_alias" : "some_app_name", 
+  "plugin_signature" : "SOME_PLUGIN_01",
+  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
+  "target_nodes" : [
+    "0xai_node_1",
+    "0xai_node_2",
+  ],
+  "target_nodes_count" : 0,
+  "node_res_req" : { # this is the resource requirements for the target nodes
+      "cpu" : 4,
+      "memory" : "16GiB"   
+  },
+  "app_params" : {
+    "PORT" : None,
+    "NGROK_AUTH_TOKEN" : None,  # put your ngrok API key here
+    "NGROK_EDGE_LABEL" : None,  # if we have a already created ngrok edge, we can use it here
+    "NGROK_ENABLED" : False, # this tells that the destination plugin instance will USE ngrok
+    # TODO: (and observations)
+    # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is True => normal use
+    # - if NGROK_EDGE_LABEL is None and NGROK_ENABLED is True => create/use dynamic url
+    # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is False => consider NGROK_ENABLED=True
+    
+    "NGROK_USE_API": True,  # use API or shell for ngrok tunnel creation
+    "ENV" : {
+      "ENV1" : "value1",
+      "ENV2" : "value2",
+      "ENV3" : "value3",
+      "ENV4" : "value4",
+    },
+    "DYNAMIC_ENV" : {
+      "ENV5" : [
+        {
+          "type" : "static",
+          "value" : "http://"
+        },
+        {
+          "type" : "host_ip",
+          "value" : None
+        },
+        {
+          "type" : "static",
+          "value" : ":5080/test_api_endpoint"
+        }
+      ],
+      "ENV6" : [
+        {
+          "type" : "host_ip",
+          "value" : "http://"
+        }
+      ],
+    },    
+    
+    "OTHER_PARAM1" : "value1",
+    "OTHER_PARAM2" : "value2",
+    "OTHER_PARAM3" : "value3",
+    "OTHER_PARAM4" : "value4",
+    "OTHER_PARAM5" : "value5",
+  },
+  "pipeline_input_type"  : "void", # DCT
+  "pipeline_input_uri" : None, # DCT URL
+  "pipeline_params" : {
+    "pipeline_input_other1" : "ExampleDatastream", # this will be added to DCT config
+    "pipeline_input_other2" : "other param",       # this will be added to DCT config
+  },
+  "chainstore_response" : False,
+}
+
+###################################################################################################################
 
 
 DEEPLOY_GET_APPS_REQUEST = {
