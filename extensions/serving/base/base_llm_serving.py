@@ -72,6 +72,8 @@ import torch as th
 import transformers
 import tokenizers
 import accelerate
+import re
+from sqlfluff.core import Linter
 
 
 from extensions.serving.mixins_llm import LlmTokenizerMixin, LlmModelMixin
@@ -434,6 +436,8 @@ class BaseLlmServing(
     predict_kwargs_lst = []
     prompt_lst = []
     additional_lst = []
+    valid_conditions = []
+    process_methods = []
 
     for i, inp in enumerate(lst_inputs):
       jeeves_content = inp.get("JEEVES_CONTENT")
@@ -447,6 +451,8 @@ class BaseLlmServing(
       top_p = jeeves_content.get(LlmCT.TOP_P) or self.cfg_default_top_p
       max_tokens = jeeves_content.get(LlmCT.MAX_TOKENS) or self.cfg_default_max_tokens
       request_context = jeeves_content.get(LlmCT.CONTEXT, None)
+      valid_condition = jeeves_content.get(LlmCT.VALID_CONDITION, None)
+      process_method = jeeves_content.get(LlmCT.PROCESS_METHOD, None)
       predict_kwargs = {
         'temperature': temperature,
         'top_p': top_p,
@@ -477,6 +483,8 @@ class BaseLlmServing(
       additional_lst.append({
         LlmCT.REQUEST_ID: request_id,
       })
+      valid_conditions.append(valid_condition)
+      process_methods.append(process_method)
     # endfor lst_inputs
 
     # Build the batch tensor. Ideally we should be calling encode on the
@@ -491,12 +499,183 @@ class BaseLlmServing(
 
     self.P(f"Generated tokens batch of shape {batch_tokens.shape}")
     self.P(f"Found attention mask of shape {attn_mask.shape}")
-    return [batch_tokens, attn_mask, predict_kwargs_lst, prompt_lst, additional_lst]
+    return [batch_tokens, attn_mask, predict_kwargs_lst, prompt_lst, additional_lst, valid_conditions, process_methods]
 
+  def aggregate_mean(self, values: list):
+    """
+    Aggregate the values by taking the mean.
+    Parameters
+    ----------
+    values : list
+        The list of values to be aggregated.
+    Returns
+    -------
+    float
+        The mean of the values.
+    """
+    if len(values) == 0:
+      return 0.0
+    return sum(values) / len(values)
+
+  def aggregate_mean_int(self, values: list):
+    """
+    Aggregate the values by taking the mean and converting to int.
+    Parameters
+    ----------
+    values : list
+        The list of values to be aggregated.
+    Returns
+    -------
+    int
+        The mean of the values as an integer.
+    """
+    return int(self.aggregate_mean(values))
+
+  def aggregate_max(self, values: list, default_value=0.0):
+    """
+    Aggregate the values by taking the maximum.
+    Parameters
+    ----------
+    values : list
+        The list of values to be aggregated.
+    default_value : any
+        The default value to return if the list is empty.
+        Defaults to 0.0.
+    Returns
+    -------
+    float
+        The maximum of the values.
+    """
+    if len(values) == 0:
+      return default_value
+    return max(values)
+
+  def is_valid_sql(self, text: str):
+    """
+    Check if the text is a valid SQL query.
+    Parameters
+    ----------
+    text : str
+        The text to be checked.
+    Returns
+    -------
+    bool
+        True if the text is a valid SQL query, False otherwise.
+    """
+    if len(text) == 0:
+      return False
+    lnt = Linter(dialect="ansi", rules=())  # rules=() = “no style lint”
+
+    linted = lnt.parse_string(text)  # :contentReference[oaicite:0]{index=0}
+
+    if linted.tree is None:
+      return False
+
+    # 3) *Any* fatal violation (‘PRS’ = parse, ‘TMP’ = templater) ⇒ invalid.
+    fatal = {"PRS", "TMP"}
+    has_fatal = any(getattr(v, "rule_code", lambda: None)() in fatal for v in linted.violations)
+    if has_fatal:
+      # self.P(f"Invalid SQL: {text}", color='r')
+      self.P(f"Violations: {linted.violations}", color='r')
+    else:
+      self.P(f"Valid SQL", color='g')
+
+    return not has_fatal
+
+  def check_condition(self, text: str, valid_condition: str):
+    """
+    Check if the text satisfies the valid condition.
+    Parameters
+    ----------
+    text : str
+        The text to be checked.
+    valid_condition : str
+        The valid condition to be checked against.
+    Returns
+    -------
+    bool
+        True if the text satisfies the valid condition, False otherwise.
+    """
+    if valid_condition is None or len(valid_condition) == 0:
+      return True
+
+    if valid_condition == 'sql':
+      return self.is_valid_sql(text)
+
+    try:
+      regex = re.compile(valid_condition, re.I | re.X | re.M)
+      return bool(regex.fullmatch(text))
+    except:
+      self.P(f"Invalid regex condition: {valid_condition}", color='r')
+    return False
+
+  def extract_sql(self, text: str):
+    """
+    Extracts an SQL script from LLM output.
+    Priority order:
+    1. If the string contains '-- BEGIN_DDL' … '-- END_DDL', return that
+       block **including** the two marker lines.
+    2. Otherwise, if it contains a fenced ```sql … ``` code block, return
+       the SQL inside the fence (the back-ticks are *not* included).
+    3. If no known delimiter is found, return the original text unchanged.
+    Parameters
+    ----------
+    text : str
+        The text to be processed.
+    Returns
+    -------
+    str
+        The extracted SQL code or the original text if no SQL code block is found.
+    """
+    # ── 1. Look for the DDL markers (tolerate optional spaces after “--”)
+    ddl_match = re.search(
+      rf"(?m)^\s*--\s*BEGIN_DDL\s*$.*?^\s*--\s*END_DDL\s*$",
+      text,
+      flags=re.DOTALL
+    )
+    if ddl_match:
+      match_without_markers = ddl_match.group(0).replace(
+        '-- BEGIN_DDL', ''
+      ).replace('-- END_DDL', '').strip()
+      return ddl_match.group(0) if len(match_without_markers) > 0 else ""  # include both marker lines if non-empty
+    # endif ddl_match
+
+    # ── 2. Look for fenced ```sql … ``` blocks (case-insensitive “sql”)
+    fence_match = re.search(
+      r"```sql\s*(.*?)\s*```",
+      text,
+      flags=re.DOTALL | re.IGNORECASE
+    )
+    if fence_match:
+      return fence_match.group(1).strip()  # exclude the back-ticks
+
+    # ── 3. Nothing found → give back the original string
+    return text
+
+  def maybe_process_text(self, text: str, process_method: str):
+    """
+    Process the text based on the process method.
+    Parameters
+    ----------
+    text : str
+        The text to be processed.
+    process_method : str
+        The process method to be applied to the text.
+    Returns
+    -------
+    str
+        The processed text.
+    """
+    if process_method is None or len(process_method) == 0:
+      return text
+
+    if process_method == 'sql':
+      return self.extract_sql(text)
+    return text
 
   def _predict(self, preprocessed_batch):
     self._counter += 1
-    batch_tokens, attn_mask, predict_kwargs_lst, prompt_lst, additional_lst = preprocessed_batch
+    batch_tokens, attn_mask, predict_kwargs_lst, prompt_lst, additional_lst, valid_conditions, process_methods = preprocessed_batch
     # Perform generation using tokens and parameters.
     # Note that it's not appropriate to call the forward function
     # here unless we want to re-implement the wheel (various searching
@@ -506,51 +685,135 @@ class BaseLlmServing(
     # using the greedy strategy.
 
     # TODO: check how to add additional parameters from predict_kwargs_lst
+    alterable_kwargs = {
+      'temperature': {
+        'default_value': self.cfg_default_temperature,
+        'aggregate_method': self.aggregate_mean,
+      },
+      'top_p': {
+        'default_value': self.cfg_default_top_p,
+        'aggregate_method': self.aggregate_mean,
+      },
+      'max_new_tokens': {
+        'default_value': self.cfg_default_max_tokens,
+        'aggregate_method': self.aggregate_mean_int,
+      },
+      'repetition_penalty': {
+        'default_value': self.cfg_repetition_penalty,
+        'aggregate_method': self.aggregate_max,
+      },
+    }
+    predict_kwargs_values = {
+      k: [kwargs.get(k, details['default_value']) for kwargs in predict_kwargs_lst]
+      for k, details in alterable_kwargs.items()
+    }
+    # Aggregate the values using the specified method.
+    predict_kwargs = {}
+    for k, details in alterable_kwargs.items():
+      if details['aggregate_method'] is not None:
+        predict_kwargs[k] = details['aggregate_method'](predict_kwargs_values[k])
+      # endif aggregate method
+    # endfor each key in alterable kwargs
+
     model_args = {
       'attention_mask': attn_mask,
-      'temperature': self.cfg_default_temperature,
-      'top_p': self.cfg_default_top_p,
-      'max_new_tokens': self.cfg_default_max_tokens,
-      'repetition_penalty': self.cfg_repetition_penalty,
+      **predict_kwargs,
     }
-    if self.cfg_prompt_lookup_num_tokens is not None:
-      model_args['prompt_lookup_num_tokens'] = int(self.cfg_prompt_lookup_num_tokens)
+    # if self.cfg_prompt_lookup_num_tokens is not None:
+    #   model_args['prompt_lookup_num_tokens'] = int(self.cfg_prompt_lookup_num_tokens)
 
     self.P(f"Running with following model args:\n{self.json_dumps(model_args, indent=2)}")
 
     # TODO: test if some gpu mem can be freed after this
-    with th.no_grad():
-      t0 = self.time()
-      # Note that there's no need to set the padding ID since we've passed
-      # the appropriate attention mask.
-      # TODO: maybe explore assistant_model parameter from
-      #  https://huggingface.co/docs/transformers/v4.44.2/en/llm_optims
-      yhat = self.model.generate(
-        inputs=batch_tokens,
-        **model_args
-      )
-      elapsed = self.time() - t0
-    # endwith
-    self.P(f'Done inference in {elapsed} seconds')
-    yhat = yhat.cpu().numpy()
-    batch_tokens = batch_tokens.cpu().numpy()
-    self.th_utils.clear_cache()
-    # Calculate number of generated token per seconds and add it to __tps
-    # in order to track inference performance. Generated padding is not
-    # counted since it is an artefact of the batching strategy.
-    batch_y_size = batch_tokens.shape[1]
-    num_generated_toks = (yhat[:, batch_y_size:] != self.padding_id).astype(self.np.int32).sum().item()
-    num_tps = num_generated_toks / elapsed
-    self.__tps.append(num_tps)
+    results = [
+      # (idx, valid, process_method, tokens, text)
+      (idx, valid_condition, process_methods[idx], None, None)
+      for idx, valid_condition in enumerate(valid_conditions)
+    ]
+    obj_for_inference = [
+      # original index, current index
+      (idx, idx) for idx in range(batch_tokens.shape[0])
+    ]
+    conditions_satisfied = False
+    max_tries = 10
+    tries = 0
+    while not conditions_satisfied:
+      with th.no_grad():
+        t0 = self.time()
+        # Note that there's no need to set the padding ID since we've passed
+        # the appropriate attention mask.
+        # TODO: maybe explore assistant_model parameter from
+        #  https://huggingface.co/docs/transformers/v4.44.2/en/llm_optims
+        # self.P(f"[DEBUG] batch_tokens shape: {batch_tokens.shape}, ")
+        # self.P(f"[DEBUG] attn_mask : {model_args['attention_mask'].shape}")
+        yhat = self.model.generate(
+          inputs=batch_tokens,
+          **model_args
+        )
+        elapsed = self.time() - t0
+      # endwith
+      self.P(f'Done inference in {elapsed} seconds')
+      yhat = yhat.cpu().numpy()
+      np_batch_tokens = batch_tokens.cpu().numpy()
+      self.th_utils.clear_cache()
 
-    self.P("Model ran at {} tokens per second".format(num_tps))
+      # Calculate number of generated token per seconds and add it to __tps
+      # in order to track inference performance. Generated padding is not
+      # counted since it is an artefact of the batching strategy.
+      batch_y_size = np_batch_tokens.shape[1]
+      num_generated_toks = (yhat[:, batch_y_size:] != self.padding_id).astype(self.np.int32).sum().item()
+      num_tps = num_generated_toks / elapsed
+      self.__tps.append(num_tps)
+      self.P("Model ran at {} tokens per second".format(num_tps))
+
+      # Decode each output in the batch, omitting the input tokens.
+      text_lst = self.tokenizer.batch_decode(
+        yhat[:, np_batch_tokens.shape[1]:],
+        skip_special_tokens=True
+      )
+
+      invalid_objects = []
+      invalid_tokens = []
+      invalid_attn_mask = []
+      tries += 1
+      for (idx_orig, idx_curr) in obj_for_inference:
+        # Get the result for the current index.
+        valid_condition = results[idx_orig][1]
+        process_method = results[idx_orig][2]
+        current_text = text_lst[idx_curr]
+        self.P(f"Checking condition for object {idx_orig}:\nvalid:`{valid_condition}`|process:`{process_method}`|text:\n{current_text}")
+        current_text = self.maybe_process_text(current_text, process_method)
+        self.P(f"Processed text:\n{current_text}")
+        if ((len(current_text) > 0 and (valid_condition is None or self.check_condition(current_text, valid_condition)))
+            or tries >= max_tries):
+          # If the condition is satisfied, we can decode the text.
+          tokens = yhat[idx_curr].tolist()
+          results[idx_orig] = (idx_orig, valid_condition, process_method, tokens, current_text)
+        else:
+          invalid_objects.append((idx_orig, len(invalid_objects)))
+          invalid_tokens.append(batch_tokens[idx_curr: idx_curr + 1])
+          invalid_attn_mask.append(attn_mask[idx_curr: idx_curr + 1])
+      # endfor each object in the batch
+
+      if len(invalid_objects) == 0 or tries >= max_tries:
+        # If no invalid objects, we can stop the loop.
+        conditions_satisfied = True
+      else:
+        batch_tokens = self.th.cat(invalid_tokens, dim=0)
+        attn_mask = self.th.cat(invalid_attn_mask, dim=0)
+        model_args['attention_mask'] = attn_mask
+        obj_for_inference = invalid_objects
+    # endwhile conditions satisfied
+
+    text_lst = [text for _, _, _, _, text in results]
 
     dct_result = {
-      LlmCT.PRED: yhat,
+      # LlmCT.PRED: yhat,
       LlmCT.PRMP: prompt_lst,
-      LlmCT.TKNS: batch_tokens,
-      LlmCT.TPS: num_tps,
+      # LlmCT.TKNS: batch_tokens,
+      # LlmCT.TPS: num_tps,
       LlmCT.ADDITIONAL: additional_lst,
+      LlmCT.TEXT: text_lst,
     }
     return dct_result
 
@@ -559,29 +822,24 @@ class BaseLlmServing(
     if preds_batch is None:
       return []
     result = []
-    yhat = preds_batch[LlmCT.PRED]
+    # yhat = preds_batch[LlmCT.PRED]
     prompts = preds_batch[LlmCT.PRMP]
-    tokens = preds_batch[LlmCT.TKNS]
-    tps = preds_batch[LlmCT.TPS]
+    # tokens = preds_batch[LlmCT.TKNS]
+    # tps = preds_batch[LlmCT.TPS]
     additionals = preds_batch[LlmCT.ADDITIONAL]
+    text_lst = preds_batch[LlmCT.TEXT]
 
     for i, additional in enumerate(additionals):
       self.processed_requests.add(additional[LlmCT.REQUEST_ID])
 
-    # Decode each output in the batch, omitting the input tokens.
-    text_lst = self.tokenizer.batch_decode(
-      yhat[:,tokens.shape[1]:],
-      skip_special_tokens=True
-    )
-
     self.P(f"Found batch text prediction for {len(text_lst)} texts:\n{self.shorten_str(text_lst)}")
     for i, decoded in enumerate(text_lst):
       dct_result = {
-        LlmCT.PRED : yhat[i].tolist(),
+        # LlmCT.PRED : yhat[i].tolist(),
         LlmCT.PRMP : prompts[i],
         LlmCT.TEXT : decoded,
-        LlmCT.TKNS : tokens[i].tolist(),
-        LlmCT.TPS  : tps,
+        # LlmCT.TKNS : tokens[i].tolist(),
+        # LlmCT.TPS  : tps,
         **preds_batch[LlmCT.ADDITIONAL][i],
         # TODO: find a way to send the model metadata to the plugin, other than through the inferences.
         'MODEL_NAME': self.cfg_model_name

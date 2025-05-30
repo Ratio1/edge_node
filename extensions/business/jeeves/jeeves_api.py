@@ -8,7 +8,7 @@ _CONFIG = {
 
   'PORT': 15033,
   'ASSETS': 'extensions/business/fastapi/jeeves_api',
-  'REQUEST_TIMEOUT': 180,  # seconds
+  'REQUEST_TIMEOUT': 240,  # seconds
   "MAX_COMMANDS_SENT": 10,
   'R1FS_SLEEP_PERIOD': 5,
   "SAVE_PERIOD": 60 * 5,  # seconds
@@ -87,6 +87,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         domain_prompt=domain_data.get('prompt'),
         user_token=domain_data.get('user_token'),
         contains_additional_context=domain_data.get('contains_additional_context', False),
+        additional_kwargs=domain_data.get('additional_kwargs') or {},
       )
     # endfor predefined domains
 
@@ -97,6 +98,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         domain_prompt=domain_data.get('prompt'),
         user_token=domain_data.get('user_token'),
         contains_additional_context=True,
+        additional_kwargs=domain_data.get('additional_kwargs') or {},
       )
     # endfor predefined additional context domains
     self.maybe_load_persistence_data()
@@ -802,6 +804,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self,
         user_token: str = None,
         domain: str = None,
+        return_additional_kwargs: bool = False,
     ):
       """
       Get the domain prompt for the Jeeves API.
@@ -812,16 +815,21 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           The user token to use for the API. Default is None.
       domain : str
           The domain to use for the API. Default is None.
+      return_additional_kwargs : bool
+          Whether to return the additional kwargs for the domain prompt.
 
       Returns
       -------
-      str
+      str or tuple
           The domain prompt.
+      If return_additional_kwargs is True, returns a tuple with the domain prompt and additional kwargs.
       """
       if domain is not None and domain in self.__domains_data:
-        return self.__domains_data[domain].get('domain_prompt', None)
+        additional_kwargs = self.__domains_data[domain].get('additional_kwargs') or {}
+        domain_prompt = self.__domains_data[domain].get('domain_prompt', None)
+        return (domain_prompt, additional_kwargs) if return_additional_kwargs else domain_prompt
       # endif domain is not None
-      return self.cfg_default_system_prompt
+      return (self.cfg_default_system_prompt, {}) if return_additional_kwargs else self.cfg_default_system_prompt
 
     @BasePlugin.endpoint(method="post")
     # TODO: change to jeeves_agent_request?
@@ -861,9 +869,10 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         }
       # endif message is None
 
-      domain_prompt = self.get_domain_prompt(
+      domain_prompt, additional_kwargs = self.get_domain_prompt(
         user_token=user_token,
         domain=domain,
+        return_additional_kwargs=True,
       )
 
       # Wrap the message
@@ -883,6 +892,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           'user_token': user_token,
           'messages': messages,
           'use_long_term_memory': False,
+          **additional_kwargs,
         }
       )
       # Check if the request needs 
@@ -894,6 +904,64 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         messages=messages,
         user_token=user_token,
         use_long_term_memory=False,
+        **additional_kwargs,
+      )
+      return self.solve_postponed_request(request_id=request_id)
+
+    @BasePlugin.endpoint(method='post')
+    def query_debug(
+        self,
+        user_token: str = None,
+        message: str = None,
+        domain: str = None,
+        system_prompt: str = "",
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        valid_condition: str = "",
+        process_method: str = "",
+    ):
+      """
+      Debug endpoint for the Jeeves API.
+      This endpoint is used to test the Jeeves API and should not be used in production.
+      It is used to test the query endpoint and should not be used in production.
+      """
+      if not self.verify_user_token(user_token):
+        return self.invalid_token_response()
+      # endif user token is valid
+      if message is None:
+        return {
+          'error': 'Message not provided',
+          'status': 'error',
+        }
+      # endif message is None
+      domain_prompt, additional_kwargs = self.get_domain_prompt(
+        user_token=user_token,
+        domain=domain,
+        return_additional_kwargs=True,
+      ) if len(system_prompt) == 0 else (system_prompt, {})
+
+      messages = self.get_messages_of_user(
+        user_token=None,
+        message=message,
+        domain_prompt=domain_prompt,
+      )
+
+      request_kwargs = {
+        'messages': messages,
+        'user_token': user_token,
+        'use_long_term_memory': False,
+        'temperature': temperature,
+        'top_p': top_p,
+        'valid_condition': valid_condition,
+        'process_method': process_method,
+      }
+      request_kwargs = {
+        k: v or additional_kwargs.get(k)
+        for k, v in request_kwargs.items()
+      }
+
+      request_id = self.register_chat_request(
+        **request_kwargs
       )
       return self.solve_postponed_request(request_id=request_id)
 
@@ -938,6 +1006,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       domain_prompt = self.get_domain_prompt(
         user_token=user_token,
         domain=domain,
+        return_additional_kwargs=False
       )
 
       messages = self.get_messages_of_user(
@@ -990,6 +1059,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
   def maybe_create_domain(
       self, domain_name: str, domain_prompt: str = None,
       user_token: str = None, contains_additional_context: bool = False,
+      additional_kwargs: dict = None
   ):
     if domain_name not in self.__domains_data:
       self.__domains_data[domain_name] = {
@@ -1000,6 +1070,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         'domain_name': domain_name,
         'user_token': user_token,
         'contains_additional_context': contains_additional_context,
+        'additional_kwargs': additional_kwargs or {},
       }
     else:
       if domain_prompt is not None:
@@ -1008,6 +1079,11 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self.__domains_data[domain_name]['user_token'] = user_token
       if contains_additional_context is not None:
         self.__domains_data[domain_name]['contains_additional_context'] = contains_additional_context
+      if additional_kwargs is not None:
+        self.__domains_data[domain_name]['additional_kwargs'] = {
+          **(self.__domains_data[domain_name].get('additional_kwargs') or {}),
+          **additional_kwargs,
+        }
     # endif domain already existent
     self.maybe_persistence_save(force=True)
     return domain_name
