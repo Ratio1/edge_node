@@ -41,21 +41,21 @@ Each plugin defines a `_CONFIG` dictionary (or class attribute `CONFIG`) to decl
 
 ```python
 _CONFIG = {
-    **BasePluginClass.CONFIG,   # start with all base defaults
-    # Override or add new config entries:
-    'PARAM_NAME': <default_value>,
-    ...,
-    'VALIDATION_RULES': {
-        **BasePluginClass.CONFIG['VALIDATION_RULES'],
-        # Add validation for new params:
-        'PARAM_NAME': {
-            'TYPE': <type_or_list_of_types>,
-            'MIN': <min_value_if_applicable>,
-            'MAX': <max_value_if_applicable>,
-            'DESCRIPTION': '<description of the param>',
-        },
-        ...
+  **BasePluginClass.CONFIG,   # start with all base defaults
+  # Override or add new config entries:
+  'PARAM_NAME': <default_value>,
+  ...,
+  'VALIDATION_RULES': {
+    **BasePluginClass.CONFIG['VALIDATION_RULES'],
+    # Add validation for new params:
+    'PARAM_NAME': {
+      'TYPE': <type_or_list_of_types>,
+      'MIN': <min_value_if_applicable>,
+      'MAX': <max_value_if_applicable>,
+      'DESCRIPTION': '<description of the param>',
     },
+    ...
+  },
 }
 ```
 
@@ -103,41 +103,41 @@ from naeural_core.data.base import DataCaptureThread
 
 # Define plugin configuration by extending the base DataCaptureThread config
 _CONFIG = {
-    **DataCaptureThread.CONFIG,
-    'CAP_RESOLUTION': 2.0,  # capture data every 2 seconds
-    'VALIDATION_RULES': {
-        **DataCaptureThread.CONFIG['VALIDATION_RULES'],
-        'CAP_RESOLUTION': {
-            'TYPE': 'float',
-            'MIN_VAL': 0.1,
-            'MAX_VAL': 3600,
-            'DESCRIPTION': 'Data capture interval in seconds (0.1 sec to 1 hour)'
-        }
+  **DataCaptureThread.CONFIG,
+  'CAP_RESOLUTION': 2.0,  # capture data every 2 seconds
+  'VALIDATION_RULES': {
+    **DataCaptureThread.CONFIG['VALIDATION_RULES'],
+    'CAP_RESOLUTION': {
+      'TYPE': 'float',
+      'MIN_VAL': 0.1,
+      'MAX_VAL': 3600,
+      'DESCRIPTION': 'Data capture interval in seconds (0.1 sec to 1 hour)'
     }
+  }
 }
 
 class MySensorDataCapture(DataCaptureThread):
-    """A data capture plugin that emits an incremental counter value every interval."""
-    CONFIG = _CONFIG  # attach our config dict to the class (optional, for clarity)
+  """A data capture plugin that emits an incremental counter value every interval."""
+  CONFIG = _CONFIG  # attach our config dict to the class (optional, for clarity)
 
-    def on_init(self):
-        # Initialize metadata or state
-        self._metadata.update(counter=0)
-        self.P("MySensorDataCapture initialized. Starting counter at 0.")
-        return
+  def on_init(self):
+    # Initialize metadata or state
+    self._metadata.update(counter=0)
+    self.P("MySensorDataCapture initialized. Starting counter at 0.")
+    return
 
-    def data_step(self):
-        """Capture one data point and push it to the pipeline."""
-        # Create an observation payload. Here we just use the counter as data.
-        obs_value = self._metadata.counter
-        data_point = {'value': obs_value}
-        # Increment counter for next reading
-        self._metadata.counter += 1
-        # Log the captured data
-        self.P(f"Captured new data value: {obs_value}")
-        # Push the data into the pipeline as a structured input
-        self._add_struct_data_input(obs=data_point)  # field name 'OBS' will carry our data
-        return
+  def data_step(self):
+    """Capture one data point and push it to the pipeline."""
+    # Create an observation payload. Here we just use the counter as data.
+    obs_value = self._metadata.counter
+    data_point = {'value': obs_value}
+    # Increment counter for next reading
+    self._metadata.counter += 1
+    # Log the captured data
+    self.P(f"Captured new data value: {obs_value}")
+    # Push the data into the pipeline as a structured input
+    self._add_struct_data_input(obs=data_point)  # field name 'OBS' will carry our data
+    return
 ```
 
 ```json
@@ -145,19 +145,19 @@ class MySensorDataCapture(DataCaptureThread):
   "NAME": "sensor_demo_pipeline",
   "TYPE": "Void",  
   "PLUGINS": [
+  {
+    "SIGNATURE": "MySensorDataCapture",  <!-- The plugin's unique signature or class name -->
+    "INSTANCES": [
     {
-      "SIGNATURE": "MySensorDataCapture",  <!-- The plugin's unique signature or class name -->
-      "INSTANCES": [
-        {
-          "INSTANCE_ID": "sensor1",
-          "CAP_RESOLUTION": 2.0  <!-- Override default if needed; here using the same value as default -->
-        }
-      ]
-    },
-    {
-      "SIGNATURE": "SomeBusinessPlugin",  <!-- Downstream business plugin to consume the data -->
-      "INSTANCES": [ { "INSTANCE_ID": "processor1" } ]
+      "INSTANCE_ID": "sensor1",
+      "CAP_RESOLUTION": 2.0  <!-- Override default if needed; here using the same value as default -->
     }
+    ]
+  },
+  {
+    "SIGNATURE": "SomeBusinessPlugin",  <!-- Downstream business plugin to consume the data -->
+    "INSTANCES": [ { "INSTANCE_ID": "processor1" } ]
+  }
   ]
 }
 ```
@@ -173,107 +173,107 @@ from naeural_core.business.base import BasePluginExecutor as BasePlugin
 
 # Configuration: extend base plugin config, can add custom options if needed
 _CONFIG = {
-    **BasePlugin.CONFIG,
-    "SHARE_INTERVAL": 3600,  # how often (in seconds) to share data to R1FS (default 1 hour)
-    "VALIDATION_RULES": {
-        **BasePlugin.CONFIG['VALIDATION_RULES'],
-        "SHARE_INTERVAL": {
-            "TYPE": "int",
-            "MIN": 60,
-            "MAX": 86400,
-            "DESCRIPTION": "Time interval (seconds) between data shares to R1FS"
-        }
+  **BasePlugin.CONFIG,
+  "SHARE_INTERVAL": 3600,  # how often (in seconds) to share data to R1FS (default 1 hour)
+  "VALIDATION_RULES": {
+    **BasePlugin.CONFIG['VALIDATION_RULES'],
+    "SHARE_INTERVAL": {
+      "TYPE": "int",
+      "MIN": 60,
+      "MAX": 86400,
+      "DESCRIPTION": "Time interval (seconds) between data shares to R1FS"
     }
+  }
 }
 
 class DataSharePlugin(BasePlugin):
-    """
-    A business plugin that shares data via R1FS and ChainStore.
-    Each instance periodically saves a random data snippet to R1FS and announces its CID on ChainStore.
-    It also retrieves and outputs data shared by other instances.
-    """
-    CONFIG = _CONFIG
+  """
+  A business plugin that shares data via R1FS and ChainStore.
+  Each instance periodically saves a random data snippet to R1FS and announces its CID on ChainStore.
+  It also retrieves and outputs data shared by other instances.
+  """
+  CONFIG = _CONFIG
 
-    def on_init(self):
-        # Unique instance identifier for sharing (use node and instance IDs)
-        self.instance_key = f"{self.alias}_{self.cfg_instance_id}"  # alias = node alias, typically
-        self._last_share_time = 0
-        self._known_remote_cids = set()
-        self.P(f"DataSharePlugin initialized (instance_key={self.instance_key}). Ready to share data.")
-        return
+  def on_init(self):
+    # Unique instance identifier for sharing (use node and instance IDs)
+    self.instance_key = f"{self.alias}_{self.cfg_instance_id}"  # alias = node alias, typically
+    self._last_share_time = 0
+    self._known_remote_cids = set()
+    self.P(f"DataSharePlugin initialized (instance_key={self.instance_key}). Ready to share data.")
+    return
 
-    def _save_to_r1fs(self):
-        """Save a new random data item to R1FS and return its CID."""
-        # Generate some dummy data to share
-        random_uuid = self.uuid()            # unique ID (string)
-        random_value = self.np.random.randint(1, 100)  # random integer
-        data = {
-            "uuid": random_uuid,
-            "value": random_value,
-            "source": self.instance_key
-        }
-        # Save data as YAML to R1FS (filename can be derived from instance and time or counter)
-        filename = f"share_{self.instance_key}"
-        cid = self.r1fs.add_yaml(data, fn=filename)  # returns content ID (CID):contentReference[oaicite:31]{index=31}
-        self.P(f"Saved data to R1FS: CID={cid}, data={data}")
-        return cid
+  def _save_to_r1fs(self):
+    """Save a new random data item to R1FS and return its CID."""
+    # Generate some dummy data to share
+    random_uuid = self.uuid()      # unique ID (string)
+    random_value = self.np.random.randint(1, 100)  # random integer
+    data = {
+      "uuid": random_uuid,
+      "value": random_value,
+      "source": self.instance_key
+    }
+    # Save data as YAML to R1FS (filename can be derived from instance and time or counter)
+    filename = f"share_{self.instance_key}"
+    cid = self.r1fs.add_yaml(data, fn=filename)  # returns content ID (CID):contentReference[oaicite:31]{index=31}
+    self.P(f"Saved data to R1FS: CID={cid}, data={data}")
+    return cid
 
-    def _announce_cid(self, cid):
-        """Announce the given CID on ChainStore under a common hash key."""
-        hkey = "shared_data_cids"
-        self.chainstore_hset(hkey=hkey, key=self.instance_key, value=cid)  # publish CID:contentReference[oaicite:32]{index=32}
-        self.P(f"Announced CID {cid} on ChainStore (hkey={hkey}).")
+  def _announce_cid(self, cid):
+    """Announce the given CID on ChainStore under a common hash key."""
+    hkey = "shared_data_cids"
+    self.chainstore_hset(hkey=hkey, key=self.instance_key, value=cid)  # publish CID:contentReference[oaicite:32]{index=32}
+    self.P(f"Announced CID {cid} on ChainStore (hkey={hkey}).")
 
-    def _fetch_remote_data(self):
-        """Fetch new data shared by other instances via ChainStore & R1FS."""
-        hkey = "shared_data_cids"
-        all_entries = self.chainstore_hgetall(hkey) or {}  # get all announced CIDs:contentReference[oaicite:33]{index=33}
-        # Filter out our own entry and any CID we already processed
-        new_cids = [cid for key, cid in all_entries.items()
-                    if key != self.instance_key and cid not in self._known_remote_cids]
-        if not new_cids:
-            return None  # no new data to fetch
-        results = []
-        for cid in new_cids:
-            self._known_remote_cids.add(cid)  # mark as seen
-            self.P(f"Retrieving file for CID={cid} from R1FS...")
-            file_path = self.r1fs.get_file(cid)  # download file from R1FS:contentReference[oaicite:34]{index=34}
-            if file_path is None:
-                self.P(f"Failed to retrieve CID {cid}", color='r')
-                continue
-            # If it's a YAML or JSON, load it into a Python dict
-            data = {}
-            if file_path.endswith(('.yml', '.yaml')):
-                data = self.diskapi_load_yaml(file_path, verbose=False) or {}
-            elif file_path.endswith('.json'):
-                data = self.diskapi_load_json(file_path, verbose=False) or {}
-            else:
-                self.P(f"Unsupported file type for CID {cid}: {file_path}", color='r')
-                continue
-            self.P(f"Loaded remote data from {cid}: {data}")
-            results.append(data)
-            # Optionally, output the data immediately as a payload for downstream plugins
-            self.add_payload_by_fields(shared_data=data)  # send to pipeline:contentReference[oaicite:35]{index=35}
-        return results
+  def _fetch_remote_data(self):
+    """Fetch new data shared by other instances via ChainStore & R1FS."""
+    hkey = "shared_data_cids"
+    all_entries = self.chainstore_hgetall(hkey) or {}  # get all announced CIDs:contentReference[oaicite:33]{index=33}
+    # Filter out our own entry and any CID we already processed
+    new_cids = [cid for key, cid in all_entries.items()
+          if key != self.instance_key and cid not in self._known_remote_cids]
+    if not new_cids:
+      return None  # no new data to fetch
+    results = []
+    for cid in new_cids:
+      self._known_remote_cids.add(cid)  # mark as seen
+      self.P(f"Retrieving file for CID={cid} from R1FS...")
+      file_path = self.r1fs.get_file(cid)  # download file from R1FS:contentReference[oaicite:34]{index=34}
+      if file_path is None:
+        self.P(f"Failed to retrieve CID {cid}", color='r')
+        continue
+      # If it's a YAML or JSON, load it into a Python dict
+      data = {}
+      if file_path.endswith(('.yml', '.yaml')):
+        data = self.diskapi_load_yaml(file_path, verbose=False) or {}
+      elif file_path.endswith('.json'):
+        data = self.diskapi_load_json(file_path, verbose=False) or {}
+      else:
+        self.P(f"Unsupported file type for CID {cid}: {file_path}", color='r')
+        continue
+      self.P(f"Loaded remote data from {cid}: {data}")
+      results.append(data)
+      # Optionally, output the data immediately as a payload for downstream plugins
+      self.add_payload_by_fields(shared_data=data)  # send to pipeline:contentReference[oaicite:35]{index=35}
+    return results
 
-    def process(self):
-        # Ensure R1FS is ready before attempting to use it (if not warmed up yet, skip processing) 
-        if not self.r1fs.is_ipfs_warmed:
-            # Log a message periodically until IPFS (R1FS) is ready
-            if self.time() - getattr(self, "_last_log_time", 0) > 60:
-                self._last_log_time = self.time()
-                self.P("Waiting for R1FS to warm up... (plugin will start sharing once ready)")
-            return  # skip this cycle
-        current_time = self.time()
-        # Share local data at configured intervals
-        if current_time - self._last_share_time >= self.cfg_share_interval:
-            cid = self._save_to_r1fs()
-            self._announce_cid(cid)
-            self._last_share_time = current_time
-        # Always attempt to fetch any new remote data and output it
-        self._fetch_remote_data()
-        # (No direct return needed; any outputs have been sent via add_payload_by_fields)
-        return
+  def process(self):
+    # Ensure R1FS is ready before attempting to use it (if not warmed up yet, skip processing) 
+    if not self.r1fs.is_ipfs_warmed:
+      # Log a message periodically until IPFS (R1FS) is ready
+      if self.time() - getattr(self, "_last_log_time", 0) > 60:
+        self._last_log_time = self.time()
+        self.P("Waiting for R1FS to warm up... (plugin will start sharing once ready)")
+      return  # skip this cycle
+    current_time = self.time()
+    # Share local data at configured intervals
+    if current_time - self._last_share_time >= self.cfg_share_interval:
+      cid = self._save_to_r1fs()
+      self._announce_cid(cid)
+      self._last_share_time = current_time
+    # Always attempt to fetch any new remote data and output it
+    self._fetch_remote_data()
+    # (No direct return needed; any outputs have been sent via add_payload_by_fields)
+    return
 ```
 
 ```json
@@ -281,13 +281,13 @@ class DataSharePlugin(BasePlugin):
   "NAME": "data_sharing_pipeline",
   "TYPE": "Void",
   "PLUGINS": [
-    {
-      "SIGNATURE": "DataSharePlugin",
-      "INSTANCES": [
-        { "INSTANCE_ID": "share1", "SHARE_INTERVAL": 300 },
-        { "INSTANCE_ID": "share2", "SHARE_INTERVAL": 300 }
-      ]
-    }
+  {
+    "SIGNATURE": "DataSharePlugin",
+    "INSTANCES": [
+    { "INSTANCE_ID": "share1", "SHARE_INTERVAL": 300 },
+    { "INSTANCE_ID": "share2", "SHARE_INTERVAL": 300 }
+    ]
+  }
   ]
 }
 ```
@@ -303,69 +303,69 @@ from naeural_core.serving.base import ModelServingProcess as BaseServingProcess
 
 # Extend the base serving config with a custom parameter
 _CONFIG = {
-    **BaseServingProcess.CONFIG,
-    "THRESHOLD": 0,  # example custom parameter (e.g., threshold for output filtering)
-    "VALIDATION_RULES": {
-        **BaseServingProcess.CONFIG['VALIDATION_RULES'],
-        "THRESHOLD": {
-            "TYPE": "int",
-            "MIN": 0,
-            "MAX": 1000,
-            "DESCRIPTION": "Example parameter to demonstrate config usage (not used in logic here)"
-        }
+  **BaseServingProcess.CONFIG,
+  "THRESHOLD": 0,  # example custom parameter (e.g., threshold for output filtering)
+  "VALIDATION_RULES": {
+    **BaseServingProcess.CONFIG['VALIDATION_RULES'],
+    "THRESHOLD": {
+      "TYPE": "int",
+      "MIN": 0,
+      "MAX": 1000,
+      "DESCRIPTION": "Example parameter to demonstrate config usage (not used in logic here)"
     }
+  }
 }
 
 class SumNumbersModel(BaseServingProcess):
+  """
+  A simple serving plugin that sums a list of numbers given in the input payload.
+  Demonstrates the pre-process, predict, post-process lifecycle for inference plugins.
+  """
+  CONFIG = _CONFIG
+
+  def on_init(self):
+    # Initialize any state if needed (e.g., load ML model). Here, just log start.
+    self.P("SumNumbersModel initialized. Ready to sum numbers.")
+    return
+
+  def pre_process(self, inputs: dict):
     """
-    A simple serving plugin that sums a list of numbers given in the input payload.
-    Demonstrates the pre-process, predict, post-process lifecycle for inference plugins.
+    Extract the list of numbers from input and prepare for prediction.
+    Expected input format: {'DATA': [[x1, x2, ...]], 'SERVING_PARAMS': [ {...} ]}.
     """
-    CONFIG = _CONFIG
+    # Get list of data points from 'DATA' key (each data point could be a list of numbers)
+    data_list = inputs.get('DATA', [])
+    # For simplicity, assume first (and only) data entry is our list of numbers
+    numbers = data_list[0] if len(data_list) > 0 else []
+    # Log the received inputs
+    self.P(f"Pre-processing inputs: {numbers}")
+    # In a real scenario, could normalize or reshape data here
+    return numbers  # pass the list of numbers to predict
 
-    def on_init(self):
-        # Initialize any state if needed (e.g., load ML model). Here, just log start.
-        self.P("SumNumbersModel initialized. Ready to sum numbers.")
-        return
+  def predict(self, inputs):
+    """
+    Perform the core computation (inference). Sums the input list of numbers.
+    """
+    # inputs is the object returned by pre_process (here, a list of numbers)
+    numbers = inputs if inputs is not None else []
+    result_value = sum(numbers)
+    self.P(f"Predicted (summed) value: {result_value}")
+    # Return the raw prediction result (could be more complex, e.g., probabilities from a model)
+    return {"sum": result_value}
 
-    def pre_process(self, inputs: dict):
-        """
-        Extract the list of numbers from input and prepare for prediction.
-        Expected input format: {'DATA': [[x1, x2, ...]], 'SERVING_PARAMS': [ {...} ]}.
-        """
-        # Get list of data points from 'DATA' key (each data point could be a list of numbers)
-        data_list = inputs.get('DATA', [])
-        # For simplicity, assume first (and only) data entry is our list of numbers
-        numbers = data_list[0] if len(data_list) > 0 else []
-        # Log the received inputs
-        self.P(f"Pre-processing inputs: {numbers}")
-        # In a real scenario, could normalize or reshape data here
-        return numbers  # pass the list of numbers to predict
-
-    def predict(self, inputs):
-        """
-        Perform the core computation (inference). Sums the input list of numbers.
-        """
-        # inputs is the object returned by pre_process (here, a list of numbers)
-        numbers = inputs if inputs is not None else []
-        result_value = sum(numbers)
-        self.P(f"Predicted (summed) value: {result_value}")
-        # Return the raw prediction result (could be more complex, e.g., probabilities from a model)
-        return {"sum": result_value}
-
-    def post_process(self, preds):
-        """
-        Format the prediction result into the output payload structure.
-        """
-        # preds is the output from predict (here a dict with the sum)
-        output = {"result": preds, "model": "SumNumbersModel"}
-        # Optionally, could apply threshold or additional rules using self.cfg_threshold if needed
-        if self.cfg_threshold and isinstance(preds.get("sum"), (int, float)):
-            # (This threshold logic is just illustrative and not particularly meaningful here)
-            output["exceeds_threshold"] = (preds["sum"] > self.cfg_threshold)
-        self.P(f"Post-processed output: {output}")
-        # The returned dict will be sent as a payload
-        return output
+  def post_process(self, preds):
+    """
+    Format the prediction result into the output payload structure.
+    """
+    # preds is the output from predict (here a dict with the sum)
+    output = {"result": preds, "model": "SumNumbersModel"}
+    # Optionally, could apply threshold or additional rules using self.cfg_threshold if needed
+    if self.cfg_threshold and isinstance(preds.get("sum"), (int, float)):
+      # (This threshold logic is just illustrative and not particularly meaningful here)
+      output["exceeds_threshold"] = (preds["sum"] > self.cfg_threshold)
+    self.P(f"Post-processed output: {output}")
+    # The returned dict will be sent as a payload
+    return output
 ```
 
 ```json
@@ -373,15 +373,15 @@ class SumNumbersModel(BaseServingProcess):
   "NAME": "sum_model_pipeline",
   "TYPE": "OnDemandInput",
   "PLUGINS": [
+  {
+    "SIGNATURE": "SumNumbersModel",
+    "INSTANCES": [
     {
-      "SIGNATURE": "SumNumbersModel",
-      "INSTANCES": [
-        {
-          "INSTANCE_ID": "default",
-          "THRESHOLD": 50   <!-- Example override: set threshold to 50 for this instance -->
-        }
-      ]
+      "INSTANCE_ID": "default",
+      "THRESHOLD": 50   <!-- Example override: set threshold to 50 for this instance -->
     }
+    ]
+  }
   ]
 }
 ```
@@ -392,10 +392,10 @@ class SumNumbersModel(BaseServingProcess):
 {
   "ACTION": "PIPELINE_COMMAND",
   "PAYLOAD": {
-    "NAME": "sum_model_pipeline",
-    "PIPELINE_COMMAND": {
-      "STRUCT_DATA": [5, 15, 30]   // this list will be passed as 'DATA' to the plugin
-    }
+  "NAME": "sum_model_pipeline",
+  "PIPELINE_COMMAND": {
+    "STRUCT_DATA": [5, 15, 30]   // this list will be passed as 'DATA' to the plugin
+  }
   }
 }
 ```
