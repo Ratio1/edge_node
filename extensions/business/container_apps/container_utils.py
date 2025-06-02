@@ -10,12 +10,22 @@ class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
   
+  def _get_cr_data(self):
+    """
+    Helper method to extract container registry data from configuration.
+    
+    Returns:
+        tuple: (cr_server, cr_username, cr_password) extracted from cfg_cr_data
+    """
+    cr_data = getattr(self, 'cfg_cr_data', {})
+    cr_server = cr_data.get('SERVER')
+    cr_username = cr_data.get('USERNAME')
+    cr_password = cr_data.get('PASSWORD')
+    return cr_server, cr_username, cr_password
+  
   def _container_maybe_login(self):
     # Login to container registry if provided
-    cr_data = getattr(self, 'cfg_cr_data', {})
-    cr_server = cr_data.get('SERVER') or cr_data.get('server')
-    cr_username = cr_data.get('USERNAME') or cr_data.get('username')
-    cr_password = cr_data.get('PASSWORD') or cr_data.get('password')
+    cr_server, cr_username, cr_password = self._get_cr_data()
     
     if cr_server and cr_username and cr_password:
       login_cmd = [
@@ -43,8 +53,7 @@ class _ContainerUtilsMixin:
     full_ref = str(self.cfg_image)
     cmd = [self.cli_tool, "pull", full_ref]
     
-    cr_data = getattr(self, 'cfg_cr_data', {})
-    cr_server = cr_data.get('SERVER') or cr_data.get('server')
+    cr_server, _, _ = self._get_cr_data()
     
     if cr_server and not str(self.cfg_image).startswith(cr_server):
       # If image doesn't have the registry prefix, prepend it
@@ -110,8 +119,7 @@ class _ContainerUtilsMixin:
 
     # Possibly prefix the registry to the image reference
     image_ref = str(self.cfg_image)
-    cr_data = getattr(self, 'cfg_cr_data', {})
-    cr_server = cr_data.get('SERVER') or cr_data.get('server')
+    cr_server, _, _ = self._get_cr_data()
     
     if cr_server and not image_ref.startswith(str(cr_server)):
       image_ref = f"{cr_server.rstrip('/')}/{image_ref}"

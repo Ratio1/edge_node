@@ -120,11 +120,8 @@ class ContainerAppRunnerPlugin(
     Displays the current resource limits for the container.
     This is a placeholder method and can be expanded as needed.
     """
-    cr_data = getattr(self, 'cfg_cr_data', {})
-    cr_server = cr_data.get('SERVER') or cr_data.get('server')
-    cr_username = cr_data.get('USERNAME') or cr_data.get('username')
-    cr_password = cr_data.get('PASSWORD') or cr_data.get('password')
-
+    cr_server, cr_username, cr_password = self._get_cr_data()
+    
     msg = "Container info:\n"
     msg += f"  Container ID:     {self.container_id}\n"
     msg += f"  Start Time:       {self.time_to_str(self.container_start_time)}\n"
