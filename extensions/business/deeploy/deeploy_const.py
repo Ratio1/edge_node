@@ -202,7 +202,11 @@ DEEPLOY_CREATE_REQUEST_CONTAINER_APP = {
     },
     "CONTAINER_RESOURCES" : {
       "cpu" : 1,
-      "memory" : "512m"
+      "memory" : "512m",
+      "ports": {
+        "31250": 1849,
+        "31251": 80
+      }
     },
     "PORT" : None,
     "NGROK_AUTH_TOKEN" : None,  # put your ngrok API key here
