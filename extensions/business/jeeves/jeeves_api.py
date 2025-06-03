@@ -777,6 +777,11 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
                   The role of the message. Can be 'user', 'assistant', or 'system'.
               - content: str
                   The content of the message.
+                  
+      TODO:
+        - Short-term memory must be implemented via ChainStore as the API will 
+          be balanced over multiple instances.
+          
       """
       res = [
         {
