@@ -1215,6 +1215,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       request_id = data.get('REQUEST_ID', None)
       if request_id is not None:
         if request_id in self.__requests:
+            #
+            #
+            #
           request_data = self.__requests[request_id]
           request_finished = request_data.get('finished', False)
           if request_finished:
@@ -1231,6 +1234,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
             self.Pd(f"Request ID '{request_id}' to DocEmbedding failed with error: {error_message}", color="red")
             return
           if request_type == 'ADD_DOC':
+            #
+            #
+            #
             request_result = data.get('RESULT') or {}
             request_data['result'] = {
               'elapsed_time': self.time() - request_data['start_time'],
@@ -1240,12 +1246,18 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
             request_data['finished'] = True
             self.Pd(f"'ADD_DOC' request ID '{request_id}' to DocEmbedding successfully processed.", color="green")
           elif request_type == 'QUERY':
+            #
+            #
+            #
             request_result = data.get('RESULT') or {}
             docs = request_result.get('DOCS', [])
 
             next_request_params = request_data.get('next_request_params')
             self.P(f"Next request params: {next_request_params}")
             if isinstance(next_request_params, dict):
+              #
+              #
+              #
               # Union of the kwargs in case of overlapping keys
               chat_request_kwargs = {
                 self.ct.JeevesCt.REQUEST_ID: request_id,

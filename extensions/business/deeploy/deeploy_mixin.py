@@ -220,7 +220,7 @@ class _DeeployMixin:
           app_alias=app_alias,
           pipeline_type=app_type,
           node_address=addr,
-          owner=sender,
+          owner=sender, 
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
         )

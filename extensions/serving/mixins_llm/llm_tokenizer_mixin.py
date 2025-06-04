@@ -43,16 +43,16 @@ class LlmTokenizerMixin(object):
         the request with context
     """
     formatted_context = "\n\n".join(
-      f"[Context {i + 1}]\n{segment.strip()}"
+      f"## Context {i + 1}:\n{segment.strip()}"
       for i, segment in enumerate(context)
       if isinstance(segment, str)
     )
     return  (
         f"{request.strip()}\n\n"
         f"---\n"
-        f"Please consider the following retrieved context when responding:\n\n"
+        f"# Context data:\n\n"
         f"{formatted_context}\n"
-        f"Feel free to use or ignore the context as you see fit.\n"
+        # f"Feel free to use or ignore the context as you see fit.\n" # use only when using reasoning model
         f"---"
     )
 
@@ -131,6 +131,6 @@ class LlmTokenizerMixin(object):
 
     from_template = self.tokenizer.apply_chat_template(
       chat, tokenize=False,
-      add_generation_prompt=self.cfg_add_generation_prompt
+      add_generation_prompt=self.cfg_add_generation_prompt # TODO: check if False is ok and when is not
     )
     return from_template
