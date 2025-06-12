@@ -2,7 +2,8 @@ from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_RESOURCES, DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA
+  DEFAULT_NODE_RESOURCES, DEFAULT_CONTAINER_RESOURCES, DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, \
+  CONTAINER_APP_RUNNER_SIGNATURE
 
 DEEPLOY_DEBUG = True
 
@@ -120,14 +121,14 @@ class _DeeployMixin:
     Check if the target nodes are online and have sufficient resources.
     
     TODO: (Vitalii)
-      - implement the case where `target_nodes` is None or empty but `target_node_count` is set
-        - get all online non supervisor nodes
+      - implement the case where `target_nodes` is None or empty but `target_nodes_count` is set
+        - get all online non supervisor nodes ✅
         - filter if they have the required resources (available memory, CPU, disk)
           - check the node if it has `node_res_req`
           - check the node if is has _available_ resources required by `CONTAINER_RESOURCES`
         - check if they have other pipelines running/deploy recently
         - get node scores (order desc by score)
-        - select target_node_count nodes:
+        - select target_nodes_count nodes:
           - select top scored nodes that did not receive deployment recently
           
         - Outcome: 
@@ -158,12 +159,64 @@ class _DeeployMixin:
         - Penalize nodes that have history less than 50 epochs (1 epoch = 24 hours)
     
     """
+    # Get required resources from the request
+    required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
+    required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
+
+    required_mem_bytes = self.__parse_memory(required_mem)
+
     nodes = []
+
+    if not inputs.target_nodes:
+      # If no specific nodes are provided, we can use all online nodes
+      if not inputs.target_nodes_count:
+        msg = f"{DEEPLOY_ERRORS.NODES3}: No valid nodes provided"
+        raise ValueError(msg)
+
+      # If target_nodes_count is set, we will select the top nodes based on their scores
+      network_nodes = self.netmon.network_nodes_status()
+
+      self.Pd(f"Online nodes: {self.json_dumps(network_nodes, indent=2)}")
+
+      trusted_non_oracle_nodes = {key: value for key, value in network_nodes.items() if value.get('trusted') is True and value.get('is_supervisor') is False}
+
+      self.Pd("Trusted non-oracle nodes: {}".format(self.json_dumps(trusted_non_oracle_nodes, indent=2)))
+
+      suitable_nodes = []
+
+      for addr, value in network_nodes.items():
+        if value.get('trusted') is False or value.get('is_supervisor') is True:
+          continue
+
+        # TODO: Add here check for node resources (node_res_req)
+
+        if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
+          # If the plugin signature is CONTAINER_APP_RUNNER_SIGNATURE, we can use the node resources
+          # from the network nodes status
+          node_avail_disk = value.get('avail_disk', 1)
+          node_avail_mem = value.get('avail_mem', 1)
+          node_avail_mem_bytes = self.__parse_memory(node_avail_mem)
+
+          if node_avail_mem_bytes < required_mem_bytes:
+            self.Pd(f"Node {addr} has insufficient memory: {node_avail_mem} < {required_mem_bytes}")
+          else:
+            suitable_nodes.append(addr)
+          continue
+
+        suitable_nodes.append(addr)
+
+      if len(suitable_nodes) < inputs.target_nodes_count:
+        msg = f"{DEEPLOY_ERRORS.NODES5}: Not enough online nodes available. Required: {inputs.target_nodes_count}, Available: {len(suitable_nodes)}"
+        raise ValueError(msg)
+
+      return suitable_nodes
+
     for node in inputs.target_nodes:
       addr = self._check_and_maybe_convert_address(node)
       is_online = self.netmon.network_node_is_online(addr)
       if is_online:
-        node_resources = self.check_node_resources(addr, inputs)
+        node_resources = self.check_node_available_resources(addr, inputs)
         if not node_resources[DEEPLOY_RESOURCES.STATUS]:
           error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
           for detail in node_resources[DEEPLOY_RESOURCES.DETAILS]:
@@ -271,7 +324,7 @@ class _DeeployMixin:
     # endwhile cycle until all responses are received
     return dct_status, str_status
 
-  def check_node_resources(self, addr, inputs):
+  def check_node_available_resources(self, addr, inputs):
     """
     Check if the node has sufficient resources for the requested deployment.
     Returns:
@@ -297,8 +350,8 @@ class _DeeployMixin:
 
     # Get required resources from the request
     required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
-    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_RESOURCES.MEMORY)
-    required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_RESOURCES.CPU)
+    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
+    required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
 
     required_mem_bytes = self.__parse_memory(required_mem)
 
@@ -424,6 +477,8 @@ class _DeeployMixin:
     """
     # Phase 1: Check if nodes are available
     nodes = self.__check_nodes_availability(inputs)
+
+    self.Pd('Available nodes for deployment: {}'.format(self.json_dumps(nodes, indent=2)))
 
     if len(nodes) == 0:
       msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
