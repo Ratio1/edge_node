@@ -73,7 +73,7 @@ import transformers
 import tokenizers
 import accelerate
 import re
-from sqlfluff.core import Linter
+from sqlfluff.core import Linter # TODO: move sql linter to a child serving process
 
 
 from extensions.serving.mixins_llm import LlmTokenizerMixin, LlmModelMixin
@@ -564,7 +564,7 @@ class BaseLlmServing(
     """
     if len(text) == 0:
       return False
-    lnt = Linter(dialect="ansi", rules=())  # rules=() = “no style lint”
+    lnt = Linter(dialect="ansi", rules=())  # rules=() = “no style lint” # TODO: move to on-init in child serving
 
     linted = lnt.parse_string(text)  # :contentReference[oaicite:0]{index=0}
 

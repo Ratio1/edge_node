@@ -1,5 +1,5 @@
 from extensions.business.jeeves.jeeves_api import JeevesApiPlugin as BasePlugin
-from extensions.business.jeeves.keysoft_jeeves_constants import KeysoftJeevesConstants
+from .keysoft_jeeves_constants import KeysoftJeevesConstants
 
 
 _CONFIG = {

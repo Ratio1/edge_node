@@ -1,4 +1,5 @@
-FROM aidamian/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3
+# -d for dind
+FROM aidamian/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-d
 
 # Install IPFS
 RUN apt-get update && apt-get install -y wget && apt-get install -y tar
@@ -30,6 +31,7 @@ ENV AINODE_ENV_VER=$AI_ENV_VER
 ENV EE_CONFIG=.config_startup.json
 
 ENV EE_ETH_ENABLED=true
+
 ENV EE_HB_CONTAINS_PIPELINES=0
 ENV EE_HB_CONTAINS_ACTIVE_PLUGINS=1
 ENV EE_EPOCH_MANAGER_DEBUG=1
@@ -46,7 +48,6 @@ ENV EE_DEBUG_R1FS=true
 # ENV TZ=Europe/Bucharest
 # RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 # #### END TO BE REMOVED
-
 
 # also can use EE_DEVICE to define target such as cuda:0 or cuda:1 instead of cpu
 # althouh this is not recommended as it should be in .env file
