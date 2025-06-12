@@ -192,8 +192,6 @@ class _DeeployMixin:
         # TODO: Add here check for node resources (node_res_req)
 
         if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
-          # If the plugin signature is CONTAINER_APP_RUNNER_SIGNATURE, we can use the node resources
-          # from the network nodes status
           node_avail_disk = value.get('avail_disk', 1)
           node_avail_mem = value.get('avail_mem', 1)
           node_avail_mem_bytes = self.__parse_memory(node_avail_mem)
@@ -206,11 +204,34 @@ class _DeeployMixin:
 
         suitable_nodes.append(addr)
 
-      if len(suitable_nodes) < inputs.target_nodes_count:
-        msg = f"{DEEPLOY_ERRORS.NODES5}: Not enough online nodes available. Required: {inputs.target_nodes_count}, Available: {len(suitable_nodes)}"
+      apps = self._get_online_apps()
+      most_recently_deployed_nodes = {}
+      for addr in suitable_nodes:
+        most_recent_config = None
+
+        for node, pipelines in apps.items():
+          for pipeline_name, pipeline_data in pipelines.items():
+            if pipeline_name == "admin_pipeline":
+              continue
+            ts = self.datetime.fromisoformat(pipeline_data.get('last_config', '1970-01-01T00:00:00'))
+
+            if most_recent_config is None or ts > most_recent_config:
+              most_recent_config = ts
+
+        most_recently_deployed_nodes[addr] = most_recent_config
+
+      sorted_nodes = sorted(suitable_nodes,
+                       key=lambda kv: (
+                         -network_nodes[kv]["SCORE"],
+                         -(most_recently_deployed_nodes[kv].timestamp()) if
+                         most_recently_deployed_nodes[kv] else 0
+                       ))
+
+      if len(sorted_nodes) < inputs.target_nodes_count:
+        msg = f"{DEEPLOY_ERRORS.NODES5}: Not enough online nodes available. Required: {inputs.target_nodes_count}, Available: {len(sorted_nodes)}"
         raise ValueError(msg)
 
-      return suitable_nodes
+      return sorted_nodes[inputs.target_nodes_count:]
 
     for node in inputs.target_nodes:
       addr = self._check_and_maybe_convert_address(node)
