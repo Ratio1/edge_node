@@ -507,11 +507,6 @@ class BaseDocEmbServing(BaseServingProcess):
       """
       lst_inputs = inputs.get('DATA', [])
       self.P(f"Pre-processing {len(lst_inputs)} requests.")
-      lst_inputs = self.filter_inputs(lst_inputs)
-      if len(lst_inputs) == 0:
-        return []
-      # endif no inputs
-      self.P(f"Filtered {len(lst_inputs)} requests.")
 
       processed_requests = []
       for i, inp in enumerate(lst_inputs):

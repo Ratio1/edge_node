@@ -81,15 +81,11 @@ class DocEmbeddingAgentPlugin(BasePlugin):
     return
 
   def _process(self):
-    data = self.dataapi_struct_data()
     inf_meta = self.dataapi_inferences_meta().get(self.cfg_ai_engine)
     self.maybe_send_status(inf_meta)
-    if data is None or len(data) == 0:
-      return
     inferences = self.dataapi_struct_data_inferences()
-    if isinstance(inferences[0], list):
+    if inferences is None or len(inferences) == 0 or isinstance(inferences[0], list):
       return
-    self.D(f'[Agent]Processing data: {str(data)[:50]}')
     self.D(f'[Agent]Processing inferences: {str(inferences)[:50]}')
     for inf in inferences:
       self.D(f'[Agent]Processing inference: {inf["REQUEST_ID"]}')

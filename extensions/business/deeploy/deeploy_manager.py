@@ -132,6 +132,9 @@ class DeeployManagerPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
       
       apps = self._get_online_apps()
+      
+      # TODO: (Vitalii) filter apps by the sender address (OWNER)
+      
       result = {
         DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
         DEEPLOY_KEYS.APPS: apps,
@@ -184,6 +187,10 @@ class DeeployManagerPlugin(
           app_params.USERNAME : str 
               The username to use for the app
           app_params.PASSWORD : str 
+          
+          
+    TODO: (Vitalii)
+      - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
     
     """
     try:

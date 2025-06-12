@@ -77,6 +77,7 @@ class JeevesCt:
   Jeeves constants
   """
   # Jeeves specific constants
+  JEEVES_CONTENT = 'JEEVES_CONTENT'
   DOCUMENTS_CID = 'DOCUMENTS_CID'
   DOCUMENTS = 'DOCUMENTS'
   DOCS = 'DOCS'
@@ -86,6 +87,7 @@ class JeevesCt:
   USER = 'USER'
   SYSTEM = 'SYSTEM'
   REQUEST_ID = 'REQUEST_ID'
+  REQUEST_TYPE = 'REQUEST_TYPE'
   MESSAGES = 'MESSAGES'
   CONTEXT = 'CONTEXT'
 
@@ -94,7 +96,18 @@ class JeevesCt:
   K = 'K'
   QUERY = 'QUERY'
   ADD_DOC = 'ADD_DOC'
+  LIST_CONTEXT = 'LIST_CONTEXT'
   LLM = 'LLM'
+
+  LLM_REQUEST_TYPES = [
+    LLM
+  ]
+
+  EMBED_REQUEST_TYPES = [
+    QUERY,
+    ADD_DOC,
+    LIST_CONTEXT
+  ]
 
   FINISHED = 'FINISHED'
   RESULT = 'RESULT'

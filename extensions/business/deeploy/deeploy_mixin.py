@@ -118,6 +118,45 @@ class _DeeployMixin:
   def __check_nodes_availability(self, inputs):
     """
     Check if the target nodes are online and have sufficient resources.
+    
+    TODO: (Vitalii)
+      - implement the case where `target_nodes` is None or empty but `target_node_count` is set
+        - get all online non supervisor nodes
+        - filter if they have the required resources (available memory, CPU, disk)
+          - check the node if it has `node_res_req`
+          - check the node if is has _available_ resources required by `CONTAINER_RESOURCES`
+        - check if they have other pipelines running/deploy recently
+        - get node scores (order desc by score)
+        - select target_node_count nodes:
+          - select top scored nodes that did not receive deployment recently
+          
+        - Outcome: 
+          - only nodes that have available resources and are online will be returned
+          - only top avail nodes will be used for deployment
+          - nodes that did not receive deployment recently will be preferred
+        
+        Example - 2 node job with 6 GB mem:
+          N1: 99 score, 1 pipeline recent, 9 GB avail, 2 cores avail, 100 GB disk avail
+          N2: 95 score, 0 pipelines recent, 8 GB avail, 4 cores avail, 200 GB disk avail
+          N3: 99 score, 2 pipelines recent, 90 GB avail, 1 core avail, 900 GB disk avail
+          N4: 85 score, 0 pipelines recent, 6 GB avail, 2 cores avail, 300 GB disk avail
+          N5: 99 score, 1 pipeline recent, 16 GB avail, 3 cores avail, 150 GB disk avail
+          N6: 99 score, 0 pipelines recent, 5 GB avail, 1 core avail, 400 GB disk avail
+          N7: failed comms
+          N8: failed comms
+          
+          Returns:
+          - N7, N8 filterted out
+          - N6 filtered out (not enough memory)
+          - SORT: N1, N5, N3, N2, N4
+          - OUTPUT: N1, N5
+          
+    TODO: (Andrei)
+      - Harden the node scores based on a longer history (currently gets to 99 after 2-3 hours of uptime)
+        - Score use exponential moving average of the node pre-score for the last 24 hours
+        - Use oracle network for whole series
+        - Penalize nodes that have history less than 50 epochs (1 epoch = 24 hours)
+    
     """
     nodes = []
     for node in inputs.target_nodes:
@@ -181,7 +220,7 @@ class _DeeployMixin:
           app_alias=app_alias,
           pipeline_type=app_type,
           node_address=addr,
-          owner=sender,
+          owner=sender, 
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
         )

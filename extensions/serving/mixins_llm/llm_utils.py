@@ -30,8 +30,11 @@ class LlmCT:
   TOP_P = 'TOP_P'
   MAX_TOKENS = 'MAX_TOKENS'
   CONTEXT = 'CONTEXT'
+  VALID_CONDITION = 'VALID_CONDITION'
+  PROCESS_METHOD = 'PROCESS_METHOD'
   REQUEST_ID = 'REQUEST_ID'
   REQUEST_TYPE = 'REQUEST_TYPE'
+  VALID_MASK = 'VALID_MASK'
 
   # Constants for encoding a prompt using chat templates
   REQUEST_ROLE = 'user'

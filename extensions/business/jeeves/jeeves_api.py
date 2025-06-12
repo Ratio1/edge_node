@@ -8,7 +8,7 @@ _CONFIG = {
 
   'PORT': 15033,
   'ASSETS': 'extensions/business/fastapi/jeeves_api',
-  'REQUEST_TIMEOUT': 180,  # seconds
+  'REQUEST_TIMEOUT': 240,  # seconds
   "MAX_COMMANDS_SENT": 10,
   'R1FS_SLEEP_PERIOD': 5,
   "SAVE_PERIOD": 60 * 5,  # seconds
@@ -87,6 +87,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         domain_prompt=domain_data.get('prompt'),
         user_token=domain_data.get('user_token'),
         contains_additional_context=domain_data.get('contains_additional_context', False),
+        additional_kwargs=domain_data.get('additional_kwargs') or {},
       )
     # endfor predefined domains
 
@@ -97,6 +98,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         domain_prompt=domain_data.get('prompt'),
         user_token=domain_data.get('user_token'),
         contains_additional_context=True,
+        additional_kwargs=domain_data.get('additional_kwargs') or {},
       )
     # endfor predefined additional context domains
     self.maybe_load_persistence_data()
@@ -376,6 +378,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self,
         context_id: str,
         documents: list[str],
+        documents_cid: str = ""
     ):
       """
       Add one or more documents to the RAG agents' context.
@@ -393,19 +396,21 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       -------
 
       """
-      documents_cid = self.r1fs.add_pickle(
-        data={
-          'DOCUMENTS': documents,
-          'CONTEXT_ID': context_id,
-        },
-        secret=context_id
-      )
-      if documents_cid is None:
-        msg = f"Failed to add documents to context '{context_id}'"
-        return {
-          'error': msg,
-        }
-      # endif documents_cid is None
+      if len(documents_cid) == 0:
+        documents_cid = self.r1fs.add_pickle(
+          data={
+            'DOCUMENTS': documents,
+            'CONTEXT_ID': context_id,
+          },
+          secret=context_id
+        )
+        if documents_cid is None:
+          msg = f"Failed to add documents to context '{context_id}'"
+          return {
+            'error': msg,
+          }
+        # endif documents_cid is None
+      # endif documents_cid provided already
       request_id = self.register_add_documents_request(
         documents_cid=documents_cid,
         context_id=context_id,
@@ -417,6 +422,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self,
         user_token: str,
         documents: list[str],
+        documents_cid: str = ""
     ):
       """
       Add one or more documents to the RAG agents' context for a specific user.
@@ -438,6 +444,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       return self.add_documents(
         context_id=user_token,
         documents=documents,
+        documents_cid=documents_cid
       )
 
     @BasePlugin.endpoint(method='post')
@@ -446,6 +453,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         user_token: str,
         domain: str,
         documents: list[str],
+        documents_cid: str = ""
     ):
       """
       Add one or more documents to the RAG agents' context for a specific domain.
@@ -483,6 +491,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       return self.add_documents(
         context_id=domain,
         documents=documents,
+        documents_cid=documents_cid
       )
 
     def register_retrieve_documents_request(
@@ -523,9 +532,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         next_request_params=next_request_params
       )
 
-    # TODO: this will not be an endpoint, but will be used for debug for now.
-    @BasePlugin.endpoint()
-    def retrieve_documents(
+    def retrieve_documents_helper(
         self,
         context_id: str,
         query: str,
@@ -564,6 +571,40 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         next_request_params=next_request_params,
       )
       return self.solve_postponed_request(request_id=request_id)
+
+    # TODO: this will not be an endpoint, but will be used for debug for now.
+    @BasePlugin.endpoint()
+    def retrieve_documents(
+        self,
+        context_id: str,
+        query: str,
+        k: int = 5,
+    ):
+      """
+      Retrieve documents from the RAG agents' context based on a query.
+
+      Parameters
+      ----------
+      context_id : str
+          The context ID from which the documents will be retrieved.
+
+      query : str
+          The query to use for retrieving the documents.
+
+      k : int
+          The number of documents to retrieve. Default is 5.
+
+      Returns
+      -------
+      list[str]
+          List of documents retrieved from the context. Each document is a string.
+      """
+      return self.retrieve_documents_helper(
+        context_id=context_id,
+        query=query,
+        k=k,
+        next_request_params=None,  # This is None, because this is a simple retrieve action.
+      )
 
     def messages_to_documents(self, messages: list[dict]):
       return [
@@ -645,7 +686,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       if domain == user_token:
         is_long_term_empty = self.__user_data[user_token].get('long_term_memory_is_empty', True)
         if not is_long_term_empty:
-          return self.retrieve_documents(
+          return self.retrieve_documents_helper(
             context_id=user_token,
             query=query,
             k=5,
@@ -661,7 +702,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         return None
 
       # endif domain not in additional domains
-      return self.retrieve_documents(
+      return self.retrieve_documents_helper(
         context_id=domain,
         query=query,
         k=5,
@@ -736,6 +777,11 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
                   The role of the message. Can be 'user', 'assistant', or 'system'.
               - content: str
                   The content of the message.
+                  
+      TODO:
+        - Short-term memory must be implemented via ChainStore as the API will 
+          be balanced over multiple instances.
+          
       """
       res = [
         {
@@ -763,6 +809,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self,
         user_token: str = None,
         domain: str = None,
+        return_additional_kwargs: bool = False,
     ):
       """
       Get the domain prompt for the Jeeves API.
@@ -773,16 +820,21 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           The user token to use for the API. Default is None.
       domain : str
           The domain to use for the API. Default is None.
+      return_additional_kwargs : bool
+          Whether to return the additional kwargs for the domain prompt.
 
       Returns
       -------
-      str
+      str or tuple
           The domain prompt.
+      If return_additional_kwargs is True, returns a tuple with the domain prompt and additional kwargs.
       """
       if domain is not None and domain in self.__domains_data:
-        return self.__domains_data[domain].get('domain_prompt', None)
+        additional_kwargs = self.__domains_data[domain].get('additional_kwargs') or {}
+        domain_prompt = self.__domains_data[domain].get('domain_prompt', None)
+        return (domain_prompt, additional_kwargs) if return_additional_kwargs else domain_prompt
       # endif domain is not None
-      return self.cfg_default_system_prompt
+      return (self.cfg_default_system_prompt, {}) if return_additional_kwargs else self.cfg_default_system_prompt
 
     @BasePlugin.endpoint(method="post")
     # TODO: change to jeeves_agent_request?
@@ -822,9 +874,10 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         }
       # endif message is None
 
-      domain_prompt = self.get_domain_prompt(
+      domain_prompt, additional_kwargs = self.get_domain_prompt(
         user_token=user_token,
         domain=domain,
+        return_additional_kwargs=True,
       )
 
       # Wrap the message
@@ -844,6 +897,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           'user_token': user_token,
           'messages': messages,
           'use_long_term_memory': False,
+          **additional_kwargs,
         }
       )
       # Check if the request needs 
@@ -855,6 +909,64 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         messages=messages,
         user_token=user_token,
         use_long_term_memory=False,
+        **additional_kwargs,
+      )
+      return self.solve_postponed_request(request_id=request_id)
+
+    @BasePlugin.endpoint(method='post')
+    def query_debug(
+        self,
+        user_token: str = None,
+        message: str = None,
+        domain: str = None,
+        system_prompt: str = "",
+        temperature: float = 0.7,
+        top_p: float = 1.0,
+        valid_condition: str = "",
+        process_method: str = "",
+    ):
+      """
+      Debug endpoint for the Jeeves API.
+      This endpoint is used to test the Jeeves API and should not be used in production.
+      It is used to test the query endpoint and should not be used in production.
+      """
+      if not self.verify_user_token(user_token):
+        return self.invalid_token_response()
+      # endif user token is valid
+      if message is None:
+        return {
+          'error': 'Message not provided',
+          'status': 'error',
+        }
+      # endif message is None
+      domain_prompt, additional_kwargs = self.get_domain_prompt(
+        user_token=user_token,
+        domain=domain,
+        return_additional_kwargs=True,
+      ) if len(system_prompt) == 0 else (system_prompt, {})
+
+      messages = self.get_messages_of_user(
+        user_token=None,
+        message=message,
+        domain_prompt=domain_prompt,
+      )
+
+      request_kwargs = {
+        'messages': messages,
+        'user_token': user_token,
+        'use_long_term_memory': False,
+        'temperature': temperature,
+        'top_p': top_p,
+        'valid_condition': valid_condition,
+        'process_method': process_method,
+      }
+      request_kwargs = {
+        k: v or additional_kwargs.get(k)
+        for k, v in request_kwargs.items()
+      }
+
+      request_id = self.register_chat_request(
+        **request_kwargs
       )
       return self.solve_postponed_request(request_id=request_id)
 
@@ -899,6 +1011,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       domain_prompt = self.get_domain_prompt(
         user_token=user_token,
         domain=domain,
+        return_additional_kwargs=False
       )
 
       messages = self.get_messages_of_user(
@@ -951,6 +1064,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
   def maybe_create_domain(
       self, domain_name: str, domain_prompt: str = None,
       user_token: str = None, contains_additional_context: bool = False,
+      additional_kwargs: dict = None
   ):
     if domain_name not in self.__domains_data:
       self.__domains_data[domain_name] = {
@@ -961,6 +1075,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         'domain_name': domain_name,
         'user_token': user_token,
         'contains_additional_context': contains_additional_context,
+        'additional_kwargs': additional_kwargs or {},
       }
     else:
       if domain_prompt is not None:
@@ -969,6 +1084,11 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self.__domains_data[domain_name]['user_token'] = user_token
       if contains_additional_context is not None:
         self.__domains_data[domain_name]['contains_additional_context'] = contains_additional_context
+      if additional_kwargs is not None:
+        self.__domains_data[domain_name]['additional_kwargs'] = {
+          **(self.__domains_data[domain_name].get('additional_kwargs') or {}),
+          **additional_kwargs,
+        }
     # endif domain already existent
     self.maybe_persistence_save(force=True)
     return domain_name
@@ -1095,6 +1215,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       request_id = data.get('REQUEST_ID', None)
       if request_id is not None:
         if request_id in self.__requests:
+            #
+            #
+            #
           request_data = self.__requests[request_id]
           request_finished = request_data.get('finished', False)
           if request_finished:
@@ -1111,6 +1234,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
             self.Pd(f"Request ID '{request_id}' to DocEmbedding failed with error: {error_message}", color="red")
             return
           if request_type == 'ADD_DOC':
+            #
+            #
+            #
             request_result = data.get('RESULT') or {}
             request_data['result'] = {
               'elapsed_time': self.time() - request_data['start_time'],
@@ -1120,12 +1246,18 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
             request_data['finished'] = True
             self.Pd(f"'ADD_DOC' request ID '{request_id}' to DocEmbedding successfully processed.", color="green")
           elif request_type == 'QUERY':
+            #
+            #
+            #
             request_result = data.get('RESULT') or {}
             docs = request_result.get('DOCS', [])
 
             next_request_params = request_data.get('next_request_params')
             self.P(f"Next request params: {next_request_params}")
             if isinstance(next_request_params, dict):
+              #
+              #
+              #
               # Union of the kwargs in case of overlapping keys
               chat_request_kwargs = {
                 self.ct.JeevesCt.REQUEST_ID: request_id,

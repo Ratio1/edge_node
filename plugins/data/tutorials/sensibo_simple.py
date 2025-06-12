@@ -62,16 +62,8 @@ class SensiboSimpleDataCapture(DataCaptureThread):
 
   CONFIG = _CONFIG
 
-  def __init__(self, **kwargs):
-    super(SensiboSimpleDataCapture, self).__init__(**kwargs)
-    return
- 
-  def startup(self):
-    super().startup()
-    return
-
   
-  def _init(self):
+  def on_init(self):
     self._maybe_reconnect()
     return
   
@@ -102,7 +94,7 @@ class SensiboSimpleDataCapture(DataCaptureThread):
     return results
 
    
-  def _maybe_reconnect(self): # MANDATORY
+  def connect(self): # MANDATORY
     if self.has_connection:
       return
     self.has_connection = True
@@ -118,7 +110,7 @@ class SensiboSimpleDataCapture(DataCaptureThread):
     return res[-1]  
     
     
-  def _run_data_aquisition_step(self): # MANDATORY    
+  def data_step(self): # MANDATORY    
     _obs = self.__get_data_from_sensibo()    
 
     self._add_inputs(

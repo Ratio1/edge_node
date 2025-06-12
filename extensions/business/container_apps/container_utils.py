@@ -84,7 +84,11 @@ class _ContainerUtilsMixin:
     for key, val in self.dynamic_env.items():
       cmd += ["-e", f"{key}={val}"]
       
-    # TODO: add edge-node IP to env vars as EDGE_NODE_IP
+    cmd += ["-e", f"CONTAINER_NAME={self.container_name}"]
+    
+    # TODO: check if this is a potential security issue (host is a container itself but we need to make sure)
+    cmd += ["-e", f"EE_HOST_ID={self._setup_dynamic_env_var_host_ip()}"] 
+      
 
     # Volume mounts
     if len(self.volumes) > 0:
