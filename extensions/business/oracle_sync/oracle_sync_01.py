@@ -64,7 +64,7 @@ TODO list:
 MAX_RECEIVED_MESSAGES_SIZE = 1000
 DEBUG_MODE = False
 SIGNATURES_EXCHANGE_MULTIPLIER = 5
-REQUEST_AGREEMENT_TABLE_MULTIPLIER = 60 if DEBUG_MODE else 10
+REQUEST_AGREEMENT_TABLE_MULTIPLIER = 60 if DEBUG_MODE else 20
 LOCAL_TABLE_SEND_MULTIPLIER = 3 if DEBUG_MODE else 1
 
 # Full availability means that the node was seen online for at least SUPERVISOR_MIN_AVAIL_PRC% of the time.
@@ -216,6 +216,19 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       self.P(f"Waiting for epoch manager to be initialized for {self.__name__} to start.")
       self.sleep(1)
     # endwhile
+    it = 0
+    sleep_time = 5
+    log_period = 24
+    start_time = self.time()
+    while not self.r1fs.is_ipfs_warmed:
+      it += 1
+      if it % log_period == 0:
+        elapsed_time = self.time() - start_time
+        self.P(f"R1FS is not warmed up yet.[Elapsed: {elapsed_time:.2f}s] ")
+      self.sleep(sleep_time)
+    # endwhile
+    elapsed_time = self.time() - start_time
+    self.P(f"R1FS is warmed up after {elapsed_time:.2f} seconds.")
     self.__oracle_list = []
     self.__last_oracle_list_refresh = None
     self.maybe_refresh_oracle_list()
@@ -304,10 +317,16 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           'TRANSITIONS': [
             {
               'NEXT_STATE': self.STATES.S4_SEND_MEDIAN_TABLE,
-              'TRANSITION_CONDITION': self.state_machine_api_callback_always_true,
+              'TRANSITION_CONDITION': self.__check_median_computed,
               'ON_TRANSITION_CALLBACK': self.state_machine_api_callback_do_nothing,
               'DESCRIPTION': "Begin the exchange process of the median tables between oracles",
-            }
+            },
+            {
+              'NEXT_STATE': self.STATES.S8_SEND_REQUEST_AGREED_MEDIAN_TABLE,
+              'TRANSITION_CONDITION': self.__check_median_not_computed,
+              'ON_TRANSITION_CALLBACK': self.state_machine_api_callback_do_nothing,
+              'DESCRIPTION': "Median computing failed, wait for other oracles to reach consensus and request form them",
+            },
           ],
         },
         self.STATES.S4_SEND_MEDIAN_TABLE: {
@@ -764,6 +783,12 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       return self.time() - self.first_time_local_table_sent > self.cfg_send_period * LOCAL_TABLE_SEND_MULTIPLIER
 
     # S3_COMPUTE_MEDIAN_TABLE
+    def __check_median_computed(self):
+      return self.median_table is not None and len(self.median_table) > 0
+
+    def __check_median_not_computed(self):
+      return self.median_table is None or len(self.median_table) == 0
+
     def __compute_median_table(self):
       """
       Compute the median table from the local tables received from the oracles.
@@ -1680,8 +1705,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       -------
       bool: True if the warmup has passed, False otherwise
       """
-      current_node_uptime = self.get_node_running_time()
-      return current_node_uptime > self.cfg_r1fs_warmup_period
+      return self.r1fs.is_ipfs_warmed
 
 
     def r1fs_add_data_to_message(
@@ -1817,6 +1841,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       """
       total_retries = 5
       retrieved_data = None
+      sleep_time = 3
       for i in range(total_retries):
         try:
           data_fn = self.r1fs.get_file(cid=cid, show_logs=debug)
@@ -1827,6 +1852,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         except Exception as e:
           if debug:
             self.P(f"Failed try {i + 1}/{total_retries} to retrieve data from IPFS using CID {cid}.")
+          self.sleep(sleep_time)
         # endtry to retrieve data
       # endif retries
       if retrieved_data is None:
