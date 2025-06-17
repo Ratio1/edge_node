@@ -87,12 +87,22 @@ class R1fsDemoPlugin(BasePlugin):
   def on_init(self):
     # we store a unique ID for this worker (instance) asuming it is unique
     self.my_id = f'r1:{self.ee_id}' # node alias is just a naive approach
+    self.chainstore_key = 'r1fs-demo' # ChainStore key for this demo
     self.__file_send_time = 0 # last time we sent a file
     self.__known_cids = [] # keep track of known CIDs
     self.__start_time = self.time() # start time of the plugin
     self.__r1fs_demo_iter = 0 # iteration counter
     self.P(f"Starting R1fsDemoPlugin v{__VER__} with ID: {self.my_id}.")
     self._last_log_show_time = 0 # last time we logged something
+
+    hset_dump = self.chainstore_hgetall(self.chainstore_key)
+    if hset_dump is not None:
+      self.P(f"ChainStore hset dump for '{self.chainstore_key}':\n{self.json_dumps(hset_dump, indent=2)}")
+    else:
+      self.P(f"No ChainStore hset data found for '{self.chainstore_key}'.")
+
+    self.P(f"Resetting chainstore key {self.chainstore_key}.{self.my_id}...")
+    self.chainstore_hset(hkey=self.chainstore_key, key=self.my_id, value=None)
 
     if isinstance(self.cfg_force_r1fs_faster_warmup, int) and self.cfg_force_r1fs_faster_warmup > 0:
       self.P(f"Force R1FS faster warmup: {self.cfg_force_r1fs_faster_warmup}")
@@ -118,7 +128,7 @@ class R1fsDemoPlugin(BasePlugin):
   def __announce_cid(self, cid):
     """ Announce the CID to the network via ChainStore hsets"""
     self.P(f'Announcing CID: {cid} for {self.my_id}')
-    self.chainstore_hset(hkey='r1fs-demo', key=self.my_id, value=cid)
+    self.chainstore_hset(hkey='self.chainstore_key', key=self.my_id, value=cid)
     return    
   
   def __get_announced_cids(self):
@@ -127,7 +137,7 @@ class R1fsDemoPlugin(BasePlugin):
     self.P("Checking for any announced CIDs...")
     # get full dictionary of all announced CIDs under the key 'r1fs-demo'
     # we assume all demo instances are using the same hkey and their own key
-    dct_data = self.chainstore_hgetall('r1fs-demo')
+    dct_data = self.chainstore_hgetall(self.chainstore_key)
     self.P(f"Extracted hset data ({self.my_id=}):\n {self.json_dumps(dct_data, indent=2)}")
     if dct_data:
       # extract all the CIDs except our own
@@ -159,7 +169,8 @@ class R1fsDemoPlugin(BasePlugin):
       self.P(f"Retrieving: {cid}")
       fn = self.r1fs.get_file(cid)
       if fn is None:
-        self.P(f"Failed to retrieve file for CID: {cid}", color='r')
+        swarm_peers = self.r1fs._get_swarm_peers()
+        self.P(f"Failed to retrieve file for CID: {cid}. Swarm peers: {swarm_peers}.", color='r')
         continue
       self.P(f"Retrieved: {fn}")
       if fn.endswith('.yaml') or fn.endswith('.yml'):
