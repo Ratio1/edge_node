@@ -158,6 +158,9 @@ class R1fsDemoPlugin(BasePlugin):
     for cid in cids:
       self.P(f"Retrieving: {cid}")
       fn = self.r1fs.get_file(cid)
+      if fn is None:
+        self.P(f"Failed to retrieve file for CID: {cid}", color='r')
+        continue
       self.P(f"Retrieved: {fn}")
       if fn.endswith('.yaml') or fn.endswith('.yml'):
         data = self.diskapi_load_yaml(fn, verbose=False)        
