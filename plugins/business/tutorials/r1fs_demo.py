@@ -128,7 +128,7 @@ class R1fsDemoPlugin(BasePlugin):
   def __announce_cid(self, cid):
     """ Announce the CID to the network via ChainStore hsets"""
     self.P(f'Announcing CID: {cid} for {self.my_id}')
-    self.chainstore_hset(hkey='self.chainstore_key', key=self.my_id, value=cid)
+    self.chainstore_hset(hkey=self.chainstore_key, key=self.my_id, value=cid)
     return    
   
   def __get_announced_cids(self):
