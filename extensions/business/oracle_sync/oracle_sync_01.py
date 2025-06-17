@@ -95,10 +95,7 @@ _CONFIG = {
   'SEND_INTERVAL': 15,  # seconds
 
   # This flag will be enabled after further testing of R1FS.
-  "USE_R1FS": True,
-
-  # This will be moved in the actual R1FS.
-  'R1FS_WARMUP_PERIOD': 30 * 60,  # seconds
+  "USE_R1FS": False,
 
   'EPOCH_START_SYNC': 0,
   # TODO: disable this flag in the future after further testing
@@ -216,19 +213,21 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       self.P(f"Waiting for epoch manager to be initialized for {self.__name__} to start.")
       self.sleep(1)
     # endwhile
-    it = 0
-    sleep_time = 5
-    log_period = 24
-    start_time = self.time()
-    while not self.r1fs.is_ipfs_warmed:
-      it += 1
-      if it % log_period == 0:
-        elapsed_time = self.time() - start_time
-        self.P(f"R1FS is not warmed up yet.[Elapsed: {elapsed_time:.2f}s] ")
-      self.sleep(sleep_time)
-    # endwhile
-    elapsed_time = self.time() - start_time
-    self.P(f"R1FS is warmed up after {elapsed_time:.2f} seconds.")
+    if not self.cfg_use_r1fs:
+      it = 0
+      sleep_time = 5
+      log_period = 24
+      start_time = self.time()
+      while not self.r1fs.is_ipfs_warmed:
+        it += 1
+        if it % log_period == 0:
+          elapsed_time = self.time() - start_time
+          self.P(f"R1FS is not warmed up yet.[Elapsed: {elapsed_time:.2f}s] ")
+        self.sleep(sleep_time)
+      # endwhile
+      elapsed_time = self.time() - start_time
+      self.P(f"R1FS is warmed up after {elapsed_time:.2f} seconds.")
+    # endif not cfg_use_r1fs
     self.__oracle_list = []
     self.__last_oracle_list_refresh = None
     self.maybe_refresh_oracle_list()
