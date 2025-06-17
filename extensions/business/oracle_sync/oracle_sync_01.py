@@ -500,7 +500,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         else:
           invalid_epochs.append(epoch)
 
-        if agreement_cid is None and current_epoch_is_valid:
+        if (not self.cfg_use_r1fs) or (agreement_cid is None and current_epoch_is_valid):
           # The agreement was never uploaded in the R1FS, so we try to upload it now.
           # This will add the agreement table for the current epoch to `dct_epoch__agreed_median_table`
           # regardless of the success of the upload.
@@ -513,13 +513,15 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           )
           if success:
             # In case of success the cid needs to also be added to the epoch_manager
-            agreement_cid = dct_epoch__agreed_median_table[epoch_key]
-            self.netmon.epoch_manager.add_cid_for_epoch(
-              epoch=epoch, agreement_cid=agreement_cid,
-              debug=self.cfg_debug_sync_full
-            )
+            if self.cfg_use_r1fs:
+              agreement_cid = dct_epoch__agreed_median_table[epoch_key]
+              self.netmon.epoch_manager.add_cid_for_epoch(
+                epoch=epoch, agreement_cid=agreement_cid,
+                debug=self.cfg_debug_sync_full
+              )
+              newly_uploaded_epochs.append(epoch)
+            # endif use_r1fs
             added_success.append(epoch)
-            newly_uploaded_epochs.append(epoch)
           else:
             added_failed.append(epoch)
             # self.P(f"Failed to upload agreement for epoch {epoch}.")
@@ -1764,6 +1766,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         if debug:
           self.P(f"R1FS use is disabled. Adding data entirely to message.")
         message_dict[data_key] = self.deepcopy(data_dict)
+        success = True
       # endif R1FS use
       return success
 
