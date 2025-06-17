@@ -119,6 +119,7 @@ class OracleApiPlugin(BasePlugin):
     dct_data['server_version'] = self.ee_ver
     dct_data['server_time'] = str_utc_date
     dct_data['server_current_epoch'] = self.__get_current_epoch()
+    dct_data['server_last_synced_epoch'] = self.__get_synced_epoch()
     dct_data['server_uptime'] = str(self.timedelta(seconds=int(self.time_alive)))
     self.__sign(dct_data) # add the signature over full data
     return dct_data
@@ -132,7 +133,20 @@ class OracleApiPlugin(BasePlugin):
     int
         The current epoch of the node.
     """
-    return self.netmon.epoch_manager.get_current_epoch()
+    real_epoch = self.netmon.epoch_manager.get_current_epoch()
+    return real_epoch  
+  
+  
+  def __get_synced_epoch(self):
+    """
+    Get the last synced epoch of the node.
+
+    Returns
+    -------
+    int
+        The last synced epoch of the node.
+    """
+    return self.netmon.epoch_manager.get_last_sync_epoch()
   
   
   def __eth_to_internal(self, eth_node_address):
