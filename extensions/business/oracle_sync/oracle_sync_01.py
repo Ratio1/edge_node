@@ -213,7 +213,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       self.P(f"Waiting for epoch manager to be initialized for {self.__name__} to start.")
       self.sleep(1)
     # endwhile
-    if not self.cfg_use_r1fs:
+    if self.cfg_use_r1fs:
       it = 0
       sleep_time = 5
       log_period = 24
