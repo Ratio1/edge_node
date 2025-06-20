@@ -32,19 +32,7 @@
     "PASSWORD"      : null,
     "PEM_LOCATION"  : "data"  
    },
-  
-  "#DEFAULT_EMAIL_CONFIG" : {
-    "COMMENT1"    : "generic email notification",
-    "USER"        : "source@email.com",
-    "PASSWORD"    : "",
-    "SERVER"      : "smtp.gmail.com",
-    "PORT"        : 587,
-    
-    "COMMENT2"    : "below should be configured individually",
-    "DESTINATION" : "destination@email.com" 
-  }, 
-    
-  
+
   "CAPTURE_ENVIRONMENT" : {
     "FORCE_CAP_RESOLUTION" : -1,
     "DEFAULT_PLUGIN" : false,

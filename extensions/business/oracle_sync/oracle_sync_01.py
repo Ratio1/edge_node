@@ -1872,7 +1872,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
     def maybe_refresh_oracle_list(self):
       if DEBUG_MODE:
         return
-      if self.__last_oracle_list_refresh is None or self.time() - self.__last_oracle_list_refresh < self.cfg_oracle_list_refresh_interval:
+      if self.__last_oracle_list_refresh is None or self.time() - self.__last_oracle_list_refresh > self.cfg_oracle_list_refresh_interval:
         self.P(f'Refreshing oracle list.')
         self.__oracle_list, _ = self.bc.get_oracles()
         if len(self.__oracle_list) == 0:
@@ -2748,5 +2748,6 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       return simple_agreed_value_table
 
   def process(self):
+    self.maybe_refresh_oracle_list()
     self.state_machine_api_step(self.state_machine_name)
     return
