@@ -414,9 +414,12 @@ class OracleApiPlugin(BasePlugin):
     #   if self.netmon.network_node_simple_status(addr=x) == self.const.DEVICE_STATUS_ONLINE
     # }
     nodes = self.netmon.epoch_manager.get_stats(display=True, online_only=True)
-    if alias_pattern is not None and alias_pattern != '':
-      nodes = {k: v for k, v in nodes.items() if alias_pattern.lower() in v['alias'].lower()}
     error = nodes.pop("error", None)
+    if alias_pattern is not None and alias_pattern != '' and isinstance(nodes, dict):
+      nodes = {
+        k: v for k, v in nodes.items() 
+        if isinstance(v, dict) and v.get('alias') is not None and alias_pattern.lower() in v['alias'].lower()
+      }
     keys = sorted(list(nodes.keys()))
     total_items = len(keys)
     total_pages = (total_items + items_per_page - 1) // items_per_page
@@ -427,6 +430,7 @@ class OracleApiPlugin(BasePlugin):
     start = (page - 1) * items_per_page
     end = start + items_per_page
     nodes = {k: nodes[k] for k in keys[start:end]}
+    
     response = self.__get_response({
       'error' : error,
       'nodes_total_items': total_items,
