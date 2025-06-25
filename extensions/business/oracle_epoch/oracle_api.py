@@ -381,7 +381,7 @@ class OracleApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint
   # /active_nodes_list
-  def active_nodes_list(self, items_per_page: int = 10, page: int = 1):
+  def active_nodes_list(self, alias_pattern: str = '', items_per_page: int = 10, page: int = 1):
     """
     Returns the list of known and currently active nodes in the network.
     For all the nodes use the `nodes_list` endpoint.
@@ -414,6 +414,8 @@ class OracleApiPlugin(BasePlugin):
     #   if self.netmon.network_node_simple_status(addr=x) == self.const.DEVICE_STATUS_ONLINE
     # }
     nodes = self.netmon.epoch_manager.get_stats(display=True, online_only=True)
+    if alias_pattern is not None and alias_pattern != '':
+      nodes = {k: v for k, v in nodes.items() if alias_pattern.lower() in v['alias'].lower()}
     error = nodes.pop("error", None)
     keys = sorted(list(nodes.keys()))
     total_items = len(keys)
