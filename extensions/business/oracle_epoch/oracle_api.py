@@ -147,7 +147,7 @@ class OracleApiPlugin(BasePlugin):
         The last synced epoch of the node.
     """
     return self.netmon.epoch_manager.get_last_sync_epoch()
-  
+
   
   def __eth_to_internal(self, eth_node_address):
     result = self.netmon.epoch_manager.eth_to_internal(eth_node_address)
@@ -377,7 +377,65 @@ class OracleApiPlugin(BasePlugin):
       'nodes': nodes,
     })
     return response
-  
+
+  def compute_total_resources(self, nodes):
+    """
+    Compute the total resources of the given nodes.
+    The total resources will consist of the sum of all resources of the nodes.
+    The resources are:
+    - mem_total: total memory in bytes
+    - mem_avail: available memory in bytes
+    - cpu_cores: total number of CPU cores
+    - cpu_cores_avail: available number of CPU cores
+    - disk_total: total disk space in bytes
+    - disk_avail: available disk space in bytes
+
+    Parameters
+    ----------
+    nodes : dict
+        Dictionary of nodes, where each key is the node address and the value is a dictionary with the resources.
+
+    Returns
+    -------
+    total_resources : dict
+        A dictionary with the total resources of the nodes.
+    """
+    resources_keys_for_sum = [
+      "mem_total", "mem_avail",
+      "cpu_cores", "cpu_cores_avail",
+      "disk_total", "disk_avail",
+    ]
+
+    resources_keys_for_count = [
+      "default_cuda"
+    ]
+
+    resources_keys = resources_keys_for_sum + resources_keys_for_count
+
+    total_resources_for_sum = {k: 0 for k in resources_keys}
+    total_resources_for_count = {k: {} for k in resources_keys_for_count}
+
+    for node_addr, node_info in nodes.items():
+      if isinstance(node_info, dict):
+        for key in resources_keys_for_sum:
+          current_node_resource_amount = node_info.get(key, 0)
+          if isinstance(current_node_resource_amount, (int, float)):
+            total_resources_for_sum[key] += node_info[key]
+        # endfor resources_keys for sum
+        for key in resources_keys_for_count:
+          current_node_resource = node_info.get(key)
+          if key not in total_resources_for_count[key].keys():
+            total_resources_for_count[key][current_node_resource] = 0
+          # endif first time counting this resource value
+          total_resources_for_count[key][current_node_resource] += 1
+        # endfor resources_keys for count
+      # endif isinstance(node_info, dict)
+    # endfor nodes
+    total_resources = {
+      **total_resources_for_sum,
+      **total_resources_for_count,
+    }
+    return total_resources
 
   @BasePlugin.endpoint
   # /active_nodes_list
@@ -419,7 +477,7 @@ class OracleApiPlugin(BasePlugin):
     error = nodes.pop("error", None)
     if alias_pattern is not None and alias_pattern != '' and isinstance(nodes, dict):
       nodes = {
-        k: v for k, v in nodes.items() 
+        k: v for k, v in nodes.items()
         if isinstance(v, dict) and v.get('alias') is not None and alias_pattern.lower() in v['alias'].lower()
       }
     keys = sorted(list(nodes.keys()))
@@ -432,19 +490,20 @@ class OracleApiPlugin(BasePlugin):
     start = (page - 1) * items_per_page
     end = start + items_per_page
     nodes = {k: nodes[k] for k in keys[start:end]}
-    
+
     response = self.__get_response({
       'error' : error,
       'nodes_total_items': total_items,
       'nodes_total_pages': total_pages,
       'nodes_items_per_page': items_per_page,
       'nodes_page': page,
-      'nodes': nodes,    
+      'nodes': nodes,
+      "resources_total": self.compute_total_resources(nodes),
       'query_time': round(elapsed, 2),
     })
     return response
-  
-  
+
+
   @BasePlugin.endpoint
   def node_epochs_range(
     self, 
