@@ -372,7 +372,7 @@ class OracleApiPlugin(BasePlugin):
     #     "eth_address" : self.bc.node_address_to_eth_address(x),
     #   } for x in nodes 
     # }    
-    nodes = self.netmon.epoch_manager.get_stats(display=True, online_only=False)
+    nodes = self.netmon.epoch_manager.get_stats(display=False, online_only=False)
     response = self.__get_response({
       'nodes': nodes,
     })
@@ -414,7 +414,7 @@ class OracleApiPlugin(BasePlugin):
     #   if self.netmon.network_node_simple_status(addr=x) == self.const.DEVICE_STATUS_ONLINE
     # }
     start = self.time()
-    nodes = self.netmon.epoch_manager.get_stats(display=True, online_only=True)
+    nodes = self.netmon.epoch_manager.get_stats(display=False, online_only=True)
     elapsed = self.time() - start
     error = nodes.pop("error", None)
     if alias_pattern is not None and alias_pattern != '' and isinstance(nodes, dict):
