@@ -426,7 +426,7 @@ class OracleApiPlugin(BasePlugin):
           # endfor resources_keys for sum
           for key in resources_keys_for_count:
             current_node_resource = node_resources.get(key)
-            if key not in total_resources_for_count[key].keys():
+            if current_node_resource not in total_resources_for_count[key].keys():
               total_resources_for_count[key][current_node_resource] = 0
             # endif first time counting this resource value
             total_resources_for_count[key][current_node_resource] += 1
