@@ -417,18 +417,21 @@ class OracleApiPlugin(BasePlugin):
 
     for node_addr, node_info in nodes.items():
       if isinstance(node_info, dict):
-        for key in resources_keys_for_sum:
-          current_node_resource_amount = node_info.get(key, 0)
-          if isinstance(current_node_resource_amount, (int, float)):
-            total_resources_for_sum[key] += node_info[key]
-        # endfor resources_keys for sum
-        for key in resources_keys_for_count:
-          current_node_resource = node_info.get(key)
-          if key not in total_resources_for_count[key].keys():
-            total_resources_for_count[key][current_node_resource] = 0
-          # endif first time counting this resource value
-          total_resources_for_count[key][current_node_resource] += 1
-        # endfor resources_keys for count
+        node_resources = node_info.get("resources")
+        if isinstance(node_resources, dict):
+          for key in resources_keys_for_sum:
+            current_node_resource_amount = node_resources.get(key, 0)
+            if isinstance(current_node_resource_amount, (int, float)):
+              total_resources_for_sum[key] += node_resources[key]
+          # endfor resources_keys for sum
+          for key in resources_keys_for_count:
+            current_node_resource = node_resources.get(key)
+            if key not in total_resources_for_count[key].keys():
+              total_resources_for_count[key][current_node_resource] = 0
+            # endif first time counting this resource value
+            total_resources_for_count[key][current_node_resource] += 1
+          # endfor resources_keys for count
+        # endif node_resources is dict
       # endif isinstance(node_info, dict)
     # endfor nodes
     total_resources = {
