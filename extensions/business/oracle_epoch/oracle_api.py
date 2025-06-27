@@ -71,6 +71,21 @@ class OracleApiPlugin(BasePlugin):
       my_address, 
       start_epoch=start_epoch, end_epoch=end_epoch
     )
+    last_synced_epoch = self.__get_synced_epoch()
+    start_time = self.time()
+    while last_synced_epoch < current_epoch - 1:
+      sleep_period = 15
+      log_msg = f"Last synced epoch {last_synced_epoch} is less than last finished epoch {current_epoch - 1}.\n"
+      elapsed = (self.time() - start_time)
+      log_msg += f"Waiting another {sleep_period}s for sync with the other oracles...[Elapsed: {elapsed:.2f}s]"
+      self.P(log_msg, color='y', boxed=True)
+      self.sleep(sleep_period)
+      last_synced_epoch = self.__get_synced_epoch()
+      current_epoch = self.__get_current_epoch()
+    # endwhile last_synced_epoch < current_epoch - 1
+
+    self.P(f"Current epoch: {current_epoch} and last synced epoch: {last_synced_epoch}.\nReady to start.", boxed=True)
+
     self.P("Started {} plugin in epoch {}. Local node info:\n{}".format(
       self.__class__.__name__, current_epoch, self.json_dumps(my_node_info, indent=2))
     )
@@ -147,7 +162,7 @@ class OracleApiPlugin(BasePlugin):
         The last synced epoch of the node.
     """
     return self.netmon.epoch_manager.get_last_sync_epoch()
-  
+
   
   def __eth_to_internal(self, eth_node_address):
     result = self.netmon.epoch_manager.eth_to_internal(eth_node_address)
@@ -247,7 +262,7 @@ class OracleApiPlugin(BasePlugin):
     unknown_address = False
     error_msg = None
     if end_epoch is None:
-      end_epoch = self.__get_current_epoch() - 1
+      end_epoch = self.__get_synced_epoch()
     if node_addr is None:
       error_msg = "Node address is None"
     if not isinstance(node_addr, str):
@@ -264,8 +279,8 @@ class OracleApiPlugin(BasePlugin):
       error_msg = "Start epoch is greater than end epoch"
     if end_epoch < 1:
       error_msg = "End epoch is less than 1"
-    if end_epoch >= self.__get_current_epoch():
-      error_msg = "End epoch is greater or equal than the current epoch"
+    if end_epoch > self.__get_synced_epoch():
+      error_msg = "End epoch is greater than the last synced epoch"
     # end if checks
     
     node_eth_address = None
@@ -372,16 +387,77 @@ class OracleApiPlugin(BasePlugin):
     #     "eth_address" : self.bc.node_address_to_eth_address(x),
     #   } for x in nodes 
     # }    
-    nodes = self.netmon.epoch_manager.get_stats(display=True, online_only=False)
+    nodes = self.netmon.epoch_manager.get_stats(display=False, online_only=False)
     response = self.__get_response({
       'nodes': nodes,
     })
     return response
-  
+
+  def compute_total_resources(self, nodes):
+    """
+    Compute the total resources of the given nodes.
+    The total resources will consist of the sum of all resources of the nodes.
+    The resources are:
+    - mem_total: total memory in bytes
+    - mem_avail: available memory in bytes
+    - cpu_cores: total number of CPU cores
+    - cpu_cores_avail: available number of CPU cores
+    - disk_total: total disk space in bytes
+    - disk_avail: available disk space in bytes
+
+    Parameters
+    ----------
+    nodes : dict
+        Dictionary of nodes, where each key is the node address and the value is a dictionary with the resources.
+
+    Returns
+    -------
+    total_resources : dict
+        A dictionary with the total resources of the nodes.
+    """
+    resources_keys_for_sum = [
+      "mem_total", "mem_avail",
+      "cpu_cores", "cpu_cores_avail",
+      "disk_total", "disk_avail",
+    ]
+
+    resources_keys_for_count = [
+      "default_cuda"
+    ]
+
+    resources_keys = resources_keys_for_sum + resources_keys_for_count
+
+    total_resources_for_sum = {k: 0 for k in resources_keys}
+    total_resources_for_count = {k: {} for k in resources_keys_for_count}
+
+    for node_addr, node_info in nodes.items():
+      if isinstance(node_info, dict):
+        node_resources = node_info.get("resources")
+        if isinstance(node_resources, dict):
+          for key in resources_keys_for_sum:
+            current_node_resource_amount = node_resources.get(key, 0)
+            if isinstance(current_node_resource_amount, (int, float)):
+              total_resources_for_sum[key] += node_resources[key]
+          # endfor resources_keys for sum
+          for key in resources_keys_for_count:
+            current_node_resource = node_resources.get(key)
+            if current_node_resource not in total_resources_for_count[key].keys():
+              total_resources_for_count[key][current_node_resource] = 0
+            # endif first time counting this resource value
+            total_resources_for_count[key][current_node_resource] += 1
+          # endfor resources_keys for count
+        # endif node_resources is dict
+      # endif isinstance(node_info, dict)
+    # endfor nodes
+    total_resources = {
+      **total_resources_for_sum,
+      **total_resources_for_count,
+    }
+    return total_resources
 
   @BasePlugin.endpoint
   # /active_nodes_list
-  def active_nodes_list(self, items_per_page: int = 10, page: int = 1):
+  def active_nodes_list(self, alias_pattern: str = '', items_per_page: int = 10, page: int = 1):
     """
     Returns the list of known and currently active nodes in the network.
     For all the nodes use the `nodes_list` endpoint.
@@ -413,8 +489,15 @@ class OracleApiPlugin(BasePlugin):
     #   } for x in nodes 
     #   if self.netmon.network_node_simple_status(addr=x) == self.const.DEVICE_STATUS_ONLINE
     # }
-    nodes = self.netmon.epoch_manager.get_stats(display=True, online_only=True)
+    start = self.time()
+    nodes = self.netmon.epoch_manager.get_stats(display=False, online_only=True)
+    elapsed = self.time() - start
     error = nodes.pop("error", None)
+    if alias_pattern is not None and alias_pattern != '' and isinstance(nodes, dict):
+      nodes = {
+        k: v for k, v in nodes.items()
+        if isinstance(v, dict) and v.get('alias') is not None and alias_pattern.lower() in v['alias'].lower()
+      }
     keys = sorted(list(nodes.keys()))
     total_items = len(keys)
     total_pages = (total_items + items_per_page - 1) // items_per_page
@@ -425,17 +508,20 @@ class OracleApiPlugin(BasePlugin):
     start = (page - 1) * items_per_page
     end = start + items_per_page
     nodes = {k: nodes[k] for k in keys[start:end]}
+
     response = self.__get_response({
       'error' : error,
       'nodes_total_items': total_items,
       'nodes_total_pages': total_pages,
       'nodes_items_per_page': items_per_page,
       'nodes_page': page,
-      'nodes': nodes,      
+      'nodes': nodes,
+      "resources_total": self.compute_total_resources(nodes),
+      'query_time': round(elapsed, 2),
     })
     return response
-  
-  
+
+
   @BasePlugin.endpoint
   def node_epochs_range(
     self, 
@@ -620,7 +706,7 @@ class OracleApiPlugin(BasePlugin):
     elif node_addr is None:
       raise ValueError("Please provide either `eth_node_addr` or `node_addr`")
     
-    epoch = self.__get_current_epoch() - 1
+    epoch = self.__get_synced_epoch()
     data = self.__get_node_epochs(node_addr, start_epoch=epoch, end_epoch=epoch)
     if isinstance(data.get('epochs_vals'), list) and len(data['epochs_vals']) > 0:
       epoch_val = data['epochs_vals'][0]
