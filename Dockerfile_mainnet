@@ -4,8 +4,8 @@ FROM aidamian/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-d
 # Install IPFS
 RUN apt-get update && apt-get install -y wget && apt-get install -y tar
          
-RUN wget https://dist.ipfs.tech/kubo/v0.32.1/kubo_v0.32.1_linux-amd64.tar.gz && \
-  tar -xvzf kubo_v0.32.1_linux-amd64.tar.gz && \
+RUN wget https://dist.ipfs.tech/kubo/v0.35.0/kubo_v0.35.0_linux-amd64.tar.gz && \
+  tar -xvzf kubo_v0.35.0_linux-amd64.tar.gz && \
   cd kubo && \
   bash install.sh
 # End Install IPFS
