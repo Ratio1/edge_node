@@ -71,6 +71,21 @@ class OracleApiPlugin(BasePlugin):
       my_address, 
       start_epoch=start_epoch, end_epoch=end_epoch
     )
+    last_synced_epoch = self.__get_synced_epoch()
+    start_time = self.time()
+    while last_synced_epoch < current_epoch - 1:
+      sleep_period = 15
+      log_msg = f"Last synced epoch {last_synced_epoch} is less than last finished epoch {current_epoch - 1}.\n"
+      elapsed = (self.time() - start_time)
+      log_msg += f"Waiting another {sleep_period}s for sync with the other oracles...[Elapsed: {elapsed:.2f}s]"
+      self.P(log_msg, color='y', boxed=True)
+      self.sleep(sleep_period)
+      last_synced_epoch = self.__get_synced_epoch()
+      current_epoch = self.__get_current_epoch()
+    # endwhile last_synced_epoch < current_epoch - 1
+
+    self.P(f"Current epoch: {current_epoch} and last synced epoch: {last_synced_epoch}.\nReady to start.", boxed=True)
+
     self.P("Started {} plugin in epoch {}. Local node info:\n{}".format(
       self.__class__.__name__, current_epoch, self.json_dumps(my_node_info, indent=2))
     )
@@ -247,7 +262,7 @@ class OracleApiPlugin(BasePlugin):
     unknown_address = False
     error_msg = None
     if end_epoch is None:
-      end_epoch = self.__get_current_epoch() - 1
+      end_epoch = self.__get_synced_epoch()
     if node_addr is None:
       error_msg = "Node address is None"
     if not isinstance(node_addr, str):
@@ -264,8 +279,8 @@ class OracleApiPlugin(BasePlugin):
       error_msg = "Start epoch is greater than end epoch"
     if end_epoch < 1:
       error_msg = "End epoch is less than 1"
-    if end_epoch >= self.__get_current_epoch():
-      error_msg = "End epoch is greater or equal than the current epoch"
+    if end_epoch > self.__get_synced_epoch():
+      error_msg = "End epoch is greater than the last synced epoch"
     # end if checks
     
     node_eth_address = None
@@ -691,7 +706,7 @@ class OracleApiPlugin(BasePlugin):
     elif node_addr is None:
       raise ValueError("Please provide either `eth_node_addr` or `node_addr`")
     
-    epoch = self.__get_current_epoch() - 1
+    epoch = self.__get_synced_epoch()
     data = self.__get_node_epochs(node_addr, start_epoch=epoch, end_epoch=epoch)
     if isinstance(data.get('epochs_vals'), list) and len(data['epochs_vals']) > 0:
       epoch_val = data['epochs_vals'][0]
