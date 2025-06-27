@@ -63,8 +63,8 @@ TODO list:
 
 MAX_RECEIVED_MESSAGES_SIZE = 1000
 DEBUG_MODE = False
-SIGNATURES_EXCHANGE_MULTIPLIER = 5
-REQUEST_AGREEMENT_TABLE_MULTIPLIER = 60 if DEBUG_MODE else 20
+SIGNATURES_EXCHANGE_MULTIPLIER = 3
+REQUEST_AGREEMENT_TABLE_MULTIPLIER = 10 if DEBUG_MODE else 10
 LOCAL_TABLE_SEND_MULTIPLIER = 3 if DEBUG_MODE else 1
 
 # Full availability means that the node was seen online for at least SUPERVISOR_MIN_AVAIL_PRC% of the time.
@@ -91,8 +91,8 @@ _CONFIG = {
   'ALLOW_EMPTY_INPUTS': True,
   'PROCESS_DELAY': 0,
 
-  'SEND_PERIOD': 30,  # seconds
-  'SEND_INTERVAL': 15,  # seconds
+  'SEND_PERIOD': 60,  # seconds
+  'SEND_INTERVAL': 30,  # seconds
 
   # This flag will be enabled after further testing of R1FS.
   "USE_R1FS": False,
@@ -103,6 +103,8 @@ _CONFIG = {
   # More powerful debug sync
   'DEBUG_SYNC_FULL': False,
   'ORACLE_LIST_REFRESH_INTERVAL': 300,  # seconds
+
+  'SQUEEZE_EPOCH_DICTIONARIES': True,
 
   'VALIDATION_RULES': {
     **NetworkProcessorPlugin.CONFIG['VALIDATION_RULES'],
@@ -128,6 +130,7 @@ class OracleSyncCt:
   EPOCH__AGREEMENT_SIGNATURES = 'EPOCH__AGREEMENT_SIGNATURES'
   EPOCH__IS_VALID = 'EPOCH__IS_VALID'
   EPOCH_KEYS = 'EPOCH_KEYS'
+  ID_TO_NODE_ADDRESS = 'ID_TO_NODE_ADDRESS'
   STAGE = 'STAGE'
   EPOCH = 'EPOCH'
   NODE = 'NODE'
@@ -142,6 +145,9 @@ VALUE_STANDARDS = {
     # 'type': dict,
     'type': (str, dict),
     'maybe_cid': True
+  },
+  OracleSyncCt.ID_TO_NODE_ADDRESS: {
+    'type': dict,
   },
   OracleSyncCt.EPOCH_KEYS: {
     'type': list,
@@ -475,6 +481,160 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       return
 
     # S0_WAIT_FOR_EPOCH_CHANGE
+    def __maybe_squeeze_epoch_dictionaries(self, lst_epoch_dictionaries: list[dict]):
+      """
+      Squeeze the epoch dictionaries to reduce their size.
+      This method will iterate over the list of epoch dictionaries(dictionaries with
+      epoch indexes as keys on the first level).
+      Each epoch dictionary that contains full data (instead of just CIDs) will be squeezed by replacing every key
+      on the second level with a unique ID.
+
+      For example, a possible input list of dictionaries would look like this:
+      [
+        {  # the availability table for every epoch
+          "0": {"node1_addr": 1, "node2_addr": 0},
+          "1": {"node1_addr": 1, "node3_addr": 1},
+          ...
+        },
+        {  # the signatures for every epoch
+          "0": {"node1_addr": "signature1", "node2_addr": "signature2"},
+          "1": {"node1_addr": "signature3", "node3_addr": "signature4"},
+          ...
+        }
+      ]
+      For this, the squeezed dictionaries will be:
+      [
+        {
+          "0": {"0": 1, "1": 0},
+          "1": {"0": 1, "2": 1},
+          ...
+        },
+        {
+          "0": {"0": "signature1", "1": "signature2"},
+          "1": {"0": "signature3", "2": "signature4"},
+          ...
+        }
+      ]
+      and the keys mapping will be:
+      {
+        "0": "node1_addr",
+        "1": "node2_addr",
+        "2": "node3_addr",
+        ...
+      }
+
+      Parameters
+      ----------
+      lst_epoch_dictionaries : list[dict]
+        A list of dictionaries with epoch indexes as keys on the first level.
+        Each dictionary should contain the full data for each epoch, with node addresses as keys
+        and their availability as values.
+
+      Returns
+      -------
+      lst_squeezed_epoch_dictionaries : list[dict]
+        A list of squeezed dictionaries with epoch indexes as keys on the first level.
+        Each dictionary will contain the squeezed data, with unique IDs as keys on the second level.
+      id_to_keys : dict
+        A dictionary mapping unique IDs to their corresponding keys.
+        This will be used to reconstruct the full dictionaries later.
+        If the dictionaries already contain CIDs, this will be {}.
+      """
+      squeezed_epoch_dictionaries = []
+      id_to_keys = {}
+      keys_to_ids = {}
+
+      if not self.cfg_squeeze_epoch_dictionaries:
+        # TODO: in future this will be moved to stronger debug mode
+        if self.cfg_debug_sync:
+          self.P(f"Skipping squeezing of epoch dictionaries, because 'SQUEEZE_EPOCH_DICTIONARIES' is False.")
+        return lst_epoch_dictionaries, id_to_keys
+
+      initial_total_size = sum([
+        len(self.json_dumps(dct=epoch_dict))
+        for epoch_dict in lst_epoch_dictionaries
+      ]) if len(lst_epoch_dictionaries) else 0
+      if self.cfg_debug_sync:
+        self.P(f"Squeezing epoch dictionaries, because 'SQUEEZE_EPOCH_DICTIONARIES' is True.")
+
+      for epoch_dict in lst_epoch_dictionaries:
+        squeezed_epoch_dict = {}
+        for epoch, epoch_content in epoch_dict.items():
+          if isinstance(epoch_content, str):
+            # The epoch content is a CID, so we don't need to squeeze it.
+            squeezed_epoch_dict[epoch] = epoch_content
+            continue
+
+          # If the epoch content is a dict, we need to squeeze it.
+          squeezed_content_dict = {}
+          for key, value in epoch_content.items():
+            if key not in keys_to_ids:
+              keys_to_ids[key] = str(len(keys_to_ids))
+            # endif first time the current key is seen
+            key_id = keys_to_ids[key]
+            squeezed_content_dict[key_id] = value
+            id_to_keys[key_id] = key
+          # end for node address
+          squeezed_epoch_dict[epoch] = squeezed_content_dict
+        # end for epoch
+        squeezed_epoch_dictionaries.append(squeezed_epoch_dict)
+      # end for epoch dictionary
+
+      squeezed_total_size = sum([
+        len(self.json_dumps(dct=epoch_dict))
+        for epoch_dict in squeezed_epoch_dictionaries
+      ]) if len(squeezed_epoch_dictionaries) else 0
+
+      if self.cfg_debug_sync:
+        self.P(f"Squeezed dictionaries from initial total size: {initial_total_size} to {squeezed_total_size}.")
+
+      return squeezed_epoch_dictionaries, id_to_keys
+
+    def __maybe_unsqueeze_epoch_dictionaries(
+        self,
+        lst_squeezed_epoch_dictionaries: list[dict],
+        id_to_keys: dict
+    ):
+      """
+      Un-squeeze the epoch dictionaries to restore the original structure.
+      This is the inverse operation of `__maybe_squeeze_epoch_dictionaries`.
+      Parameters
+      ----------
+      lst_squeezed_epoch_dictionaries : list[dict]
+        A list of squeezed dictionaries with epoch indexes as keys on the first level.
+        Each dictionary will contain the squeezed data, with unique IDs as keys on the second level.
+      id_to_keys : dict
+        A dictionary mapping unique IDs to their corresponding keys.
+        This will be used to reconstruct the full dictionaries.
+        If the dictionaries already contain CIDs, this will be {}.
+
+      Returns
+      -------
+      lst_unsqueezed_epoch_dictionaries : list[dict]
+        A list of un-squeezed dictionaries with epoch indexes as keys on the first level.
+        Each dictionary will contain the full data for each epoch, with node addresses as keys
+        and their availability as values.
+      """
+      if len(id_to_keys) < 1:
+        # If there are no IDs to keys, we assume the dictionaries are already in the correct format.
+        # This can happen if the initial dictionaries contained CIDs instead of full data.
+        return lst_squeezed_epoch_dictionaries
+
+      lst_unsqueezed_epoch_dictionaries = []
+      for squeezed_epoch_dict in lst_squeezed_epoch_dictionaries:
+        unsqueezed_epoch_dict = {}
+        for epoch, epoch_content in squeezed_epoch_dict.items():
+          unsqueezed_content_dict = {}
+          for key_id, value in epoch_content.items():
+            key = id_to_keys[key_id]
+            unsqueezed_content_dict[key] = value
+          # end for node id
+          unsqueezed_epoch_dict[epoch] = unsqueezed_content_dict
+        # end for epoch
+        lst_unsqueezed_epoch_dictionaries.append(unsqueezed_epoch_dict)
+      # end for epoch dictionary
+      return lst_unsqueezed_epoch_dictionaries
+
     def __send_epoch__agreed_median_table(self, start_epoch, end_epoch):
       dct_epoch__agreed_median_table = {}
       dct_epoch__signatures = {}
@@ -572,9 +732,13 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         self.P(msg)
       # endif debug_sync_full
 
+      [squeezed_availabilities, squeezed_signatures], id_to_node_address = self.__maybe_squeeze_epoch_dictionaries(
+        lst_epoch_dictionaries=[dct_epoch__agreed_median_table, dct_epoch__signatures]
+      )
       oracle_data = {
-        OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE: dct_epoch__agreed_median_table,
-        OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES: dct_epoch__signatures,
+        OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE: squeezed_availabilities,
+        OracleSyncCt.ID_TO_NODE_ADDRESS: id_to_node_address,
+        OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES: squeezed_signatures,
         OracleSyncCt.EPOCH__IS_VALID: dct_epoch__is_valid,
         OracleSyncCt.EPOCH_KEYS: epoch_keys,
         OracleSyncCt.STAGE: self.__get_current_state(),
@@ -1333,6 +1497,12 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           dct_epoch_is_valid = oracle_data[OracleSyncCt.EPOCH__IS_VALID]
           dct_epoch_agreement_cid = {}
           epoch_keys = oracle_data[OracleSyncCt.EPOCH_KEYS]
+          id_to_node_address = oracle_data.get(OracleSyncCt.ID_TO_NODE_ADDRESS, {})
+          # Unsqueeze the epoch dictionaries if they are squeezed.
+          [dct_epoch_agreed_median_table, dct_epoch_agreement_signatures] = self.__maybe_unsqueeze_epoch_dictionaries(
+            lst_squeezed_epoch_dictionaries=[dct_epoch_agreed_median_table, dct_epoch_agreement_signatures],
+            id_to_keys=id_to_node_address,
+          )
 
           # sort epoch_keys in ascending order
           received_epochs = sorted(epoch_keys)
@@ -2594,7 +2764,9 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         expected_variable_names=[
           OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE, OracleSyncCt.EPOCH_KEYS,
           OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES,
-          OracleSyncCt.EPOCH__IS_VALID
+          OracleSyncCt.EPOCH__IS_VALID,
+          # This might not need checking
+          # OracleSyncCt.ID_TO_NODE_ADDRESS
         ],
         expected_stage=self.STATES.S0_WAIT_FOR_EPOCH_CHANGE,
         verify=False,
