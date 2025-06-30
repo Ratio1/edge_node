@@ -16,6 +16,7 @@ import json
 import telegram
 from telegram import Update, Message
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from typing import Optional
 
 
 
@@ -80,13 +81,13 @@ class _TelegramChatbotMixin(object):
     return _custom_handler
 
     
-  def __reply_wrapper(self, question, user):
+  def __reply_wrapper(self, question, user, chat_id):
     self.__add_user_info(user=user, question=question)
-    result = self.__message_handler(message=question, user=user)
+    result = self.__message_handler(message=question, user=user, chat_id=chat_id)
     return result
     
 
-  async def __handle_response(self, user: str, text: str) -> str:    
+  async def __handle_response(self, user: str, text: str, chat_id: str) -> Optional[str]:    
     self.bot_log("  Preparing response for {}...".format(user), low_priority=True)    
     # Create your own response logic
     question: str = text.lower()
@@ -96,7 +97,8 @@ class _TelegramChatbotMixin(object):
       None,  # Use the default executor (a ThreadPoolExecutor)
       self.__reply_wrapper,
       question,
-      usr
+      usr,
+      chat_id
     )
     return answer    
   
@@ -158,11 +160,14 @@ class _TelegramChatbotMixin(object):
     await context.bot.send_chat_action(chat_id=chat_id, action=telegram.constants.ChatAction.TYPING)
     
     # next line is the main logic of the bot
-    response: str = await self.__handle_response(user=initiator_id, text=text)
+    response: Optional[str] = await self.__handle_response(user=initiator_id, text=text, chat_id=chat_id)
 
     # Reply normal if the message is in private
-    self.bot_log('  Bot resp: {}'.format(response), color='m', low_priority=True)    
-    await message.reply_text(response)
+    if response is None:
+      self.bot_log('  Bot resp: No response generated.', color='m', low_priority=True)
+    else:
+      self.bot_log('  Bot resp: {}'.format(response), color='m', low_priority=True)    
+      await message.reply_text(response)
     if self.bot_debug:
       self.bot_dump_stats()
     return    
