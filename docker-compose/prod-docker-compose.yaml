@@ -1,7 +1,6 @@
-
 services:
-  naeural_01:
-    image: naeural/edge_node:develop
+  ratio1_01:
+    image: ratio1/edge_node:mainnet
     container_name: r1node1
     restart: always
     volumes:
@@ -10,8 +9,8 @@ services:
       - "com.centurylinklabs.watchtower.enable=true"         
       - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
 
-  naeural_02:
-    image: naeural/edge_node:develop
+  ratio1_02:
+    image: ratio1/edge_node:mainnet
     container_name: r1node2
     restart: always
     volumes:
@@ -20,8 +19,8 @@ services:
       - "com.centurylinklabs.watchtower.enable=true"         
       - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
 
-  naeural_03:
-    image: naeural/edge_node:develop
+  ratio1_03:
+    image: ratio1/edge_node:mainnet
     container_name: r1node3
     restart: always
     volumes:
@@ -29,6 +28,56 @@ services:
     labels:
       - "com.centurylinklabs.watchtower.enable=true"         
       - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
+
+  ratio1_04:
+    image: ratio1/edge_node:mainnet
+    container_name: r1node4
+    restart: always
+    volumes:
+      - r1vol4:/edge_node/_local_cache
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"         
+      - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
+
+  ratio1_05:
+    image: ratio1/edge_node:mainnet
+    container_name: r1node5
+    restart: always
+    volumes:
+      - r1vol5:/edge_node/_local_cache
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"         
+      - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
+
+  ratio1_06:
+    image: ratio1/edge_node:mainnet
+    container_name: r1node6
+    restart: always
+    volumes:
+      - r1vol6:/edge_node/_local_cache
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"         
+      - "com.centurylinklabs.watchtower.stop-signal=SIGINT"
+
+  ratio1_07:
+    image: ratio1/edge_node:mainnet
+    container_name: r1node7
+    restart: always
+    volumes:
+      - r1vol7:/edge_node/_local_cache
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"         
+      - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
+
+  ratio1_08:
+    image: ratio1/edge_node:mainnet
+    container_name: r1node8
+    restart: always
+    volumes:
+      - r1vol8:/edge_node/_local_cache
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"         
+      - "com.centurylinklabs.watchtower.stop-signal=SIGINT"   
 
 
   watchtower:
@@ -47,3 +96,4 @@ volumes:
   r1vol1:
   r1vol2:
   r1vol3:
+  r1vol4:  
