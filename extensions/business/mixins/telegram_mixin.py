@@ -81,13 +81,13 @@ class _TelegramChatbotMixin(object):
     return _custom_handler
 
     
-  def __reply_wrapper(self, question, user, chat_id):
+  def __reply_wrapper(self, question, user, chat_id: str = None):
     self.__add_user_info(user=user, question=question)
     result = self.__message_handler(message=question, user=user, chat_id=chat_id)
     return result
     
 
-  async def __handle_response(self, user: str, text: str, chat_id: str) -> Optional[str]:    
+  async def __handle_response(self, user: str, text: str, chat_id: str = None) -> Optional[str]:
     self.bot_log("  Preparing response for {}...".format(user), low_priority=True)    
     # Create your own response logic
     question: str = text.lower()
