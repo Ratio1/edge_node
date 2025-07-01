@@ -63,9 +63,9 @@ TODO list:
 
 MAX_RECEIVED_MESSAGES_SIZE = 1000
 DEBUG_MODE = False
-SIGNATURES_EXCHANGE_MULTIPLIER = 3
-REQUEST_AGREEMENT_TABLE_MULTIPLIER = 10 if DEBUG_MODE else 10
-LOCAL_TABLE_SEND_MULTIPLIER = 3 if DEBUG_MODE else 1
+SIGNATURES_EXCHANGE_MULTIPLIER = 2
+REQUEST_AGREEMENT_TABLE_MULTIPLIER = 5 if DEBUG_MODE else 6
+LOCAL_TABLE_SEND_MULTIPLIER = 3 if DEBUG_MODE else 2
 
 # Full availability means that the node was seen online for at least SUPERVISOR_MIN_AVAIL_PRC% of the time.
 FULL_AVAILABILITY_THRESHOLD = round(SUPERVISOR_MIN_AVAIL_PRC * EPOCH_MAX_VALUE)
@@ -91,7 +91,7 @@ _CONFIG = {
   'ALLOW_EMPTY_INPUTS': True,
   'PROCESS_DELAY': 0,
 
-  'SEND_PERIOD': 60,  # seconds
+  'SEND_PERIOD': 90,  # seconds
   'SEND_INTERVAL': 30,  # seconds
 
   # This flag will be enabled after further testing of R1FS.
@@ -113,7 +113,7 @@ _CONFIG = {
 
 if DEBUG_MODE:
   # In the case of debug mode, messages may need to be sent more often.
-  _CONFIG['SEND_PERIOD'] = 10
+  _CONFIG['SEND_PERIOD'] = 20
   _CONFIG['SEND_INTERVAL'] = 5
 # endif DEBUG_MODE
 
@@ -267,6 +267,65 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       self.bc.maybe_add_prefix(node_addr)
       for node_addr in lst_nodes_short
     ]
+
+  def __maybe_early_stop_phase(
+      self,
+      data: dict,
+      phase: str,
+      tables_str: str,
+      ignore_tolerance: bool = False,
+  ):
+    """
+    Check to see if the current phase should be stopped early.
+    This can be done during the sharing phases in case we already have enough
+    data collected.
+
+    Parameters
+    -------
+    data : dict
+      The data collected during the current phase.
+      This can be a local table, median table, or agreed median table.
+    phase : str
+      The current phase of the sync process.
+    tables_str : str
+      A string representation of the tables involved in the phase.
+    ignore_tolerance : bool
+      If True, the tolerance will be 0 (there has to be data from all the oracles).
+      If False, the early stop will happen if there is data collected from at least
+      (all_oracles - tolerance) oracles.
+
+    Returns
+    -------
+    res : bool
+      True if the phase should be stopped early, False otherwise.
+    """
+    n_received = len(data)
+    threshold = self.min_oracle_reports_received(ignore_tolerance=ignore_tolerance)
+    total_participating_oracles = self.total_participating_oracles()
+    if n_received >= threshold:
+      log_str = f"Received {n_received}/{total_participating_oracles} {tables_str} from oracles.\n"
+      log_str += f"{n_received} >= {threshold}, thus early stopping {phase} is possible."
+      self.P(log_str, boxed=True)
+      return True
+    # endif early stop
+    return False
+
+  def log_received_message(
+      self,
+      sender: str,
+      stage: str,
+      data: dict,
+      return_str: bool = False,
+  ):
+    is_duplicated = sender in data.keys()
+    current_count = len(data) + (1 - is_duplicated)
+    duplicated_str = "(duplicated)" if is_duplicated else ""
+    progress_str = f"[{current_count}/{self.total_participating_oracles()}]"
+    log_str = f"Received message{duplicated_str} from oracle {sender}{progress_str}: {stage = }"
+
+    if return_str:
+      return log_str
+    self.P(log_str)
 
   # State machine callbacks
   if True:
@@ -448,6 +507,10 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       self.current_epoch_computed = False
 
       self.should_expect_to_participate = {}
+
+      self.initial_participating = 0
+      self.initial_maybe_participating = 0
+      self.initial_not_participating = 0
 
       self.local_table = {}
       self.dct_local_tables = {}
@@ -844,7 +907,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       self.local_table = {
         # self.netmon.epoch_manager.get_node_previous_epoch uses self.__data
         # self.__data uses full address
-        node: self.netmon.epoch_manager.get_node_previous_epoch(node)
+        node: self.oracle_sync_get_node_local_availability(node, skip_log=True)
+        # node: self.netmon.epoch_manager.get_node_previous_epoch(node)
         # self.netmon.all_nodes uses self.all_heartbeats
         # self.all_heartbeats uses self.__network_heartbeats
         # self.__network_heartbeats uses short address
@@ -852,9 +916,33 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       }
 
       # if self is full online, it should participate in the sync process
-      # mark oracles that were seen full online in the previous epoch as True
+      # mark oracles that were seen as potentially full online in the previous epoch as True.
+      lst_sure, lst_potential, lst_out = [], [], []
       for oracle in self.get_oracle_list():
-        self.should_expect_to_participate[oracle] = self.__was_potentially_full_online(oracle)
+        oracle_previous_availability = self.oracle_sync_get_node_local_availability(oracle)
+        is_sure = self.__was_full_online(oracle, previous_availability=oracle_previous_availability)
+        is_potential = self.__was_potentially_full_online(oracle, previous_availability=oracle_previous_availability)
+        self.should_expect_to_participate[oracle] = is_potential
+        if is_sure:
+          lst_sure.append((oracle, oracle_previous_availability))
+        elif is_potential:
+          lst_potential.append((oracle, oracle_previous_availability))
+        else:
+          lst_out.append((oracle, oracle_previous_availability))
+      # endfor oracles
+
+      log_msg = f"Start of sync process for epoch {prev_epoch}:\n"
+      sure_str = "\n\t".join(f"{oracle} ({availability})" for oracle, availability in lst_sure)
+      potential_str = "\n\t".join(f"{oracle} ({availability})" for oracle, availability in lst_potential)
+      out_str = "\n\t".join(f"{oracle} ({availability})" for oracle, availability in lst_out)
+      log_msg += f"\n{len(lst_sure)} oracles that will participate:\n\t{sure_str}\n"
+      log_msg += f"\n{len(lst_potential)} oracles that will maybe participate (availability between "
+      log_msg += f"{POTENTIALLY_FULL_AVAILABILITY_THRESHOLD} and {FULL_AVAILABILITY_THRESHOLD}):\n\t{potential_str}\n"
+      log_msg += f"\n{len(lst_out)} oracles that will not participate:\n\t{out_str}\n"
+      self.P(log_msg)
+      self.initial_participating = len(lst_sure)
+      self.initial_maybe_participating = len(lst_potential)
+      self.initial_not_participating = len(lst_out)
 
       self.P(f"Computed local table {self.local_table}")
       return
@@ -903,7 +991,12 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         stage = oracle_data[OracleSyncCt.STAGE]
         local_table = oracle_data[OracleSyncCt.LOCAL_TABLE]
 
-        log_str = f"Received message from oracle {sender}: {stage = }"
+        log_str = self.log_received_message(
+          sender=sender,
+          stage=stage,
+          data=self.dct_local_tables,
+          return_str=True
+        )
         if self.cfg_debug_sync:
           log_str += f", local_table=\n{local_table}"
         # endif debug_sync
@@ -945,7 +1038,13 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       -------
       bool: True if the exchange phase of the local table has finished, False otherwise
       """
-      return self.time() - self.first_time_local_table_sent > self.cfg_send_period * LOCAL_TABLE_SEND_MULTIPLIER
+      timeout_reached = (self.time() - self.first_time_local_table_sent) > (self.cfg_send_period * LOCAL_TABLE_SEND_MULTIPLIER)
+      early_stopping = self.__maybe_early_stop_phase(
+        data=self.dct_local_tables,
+        phase=self.STATES.S2_SEND_LOCAL_TABLE,
+        tables_str="local tables",
+      )
+      return early_stopping or timeout_reached
 
     # S3_COMPUTE_MEDIAN_TABLE
     def __check_median_computed(self):
@@ -979,9 +1078,15 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       valid_local_tables = [x for x in self.dct_local_tables.values() if x is not None]
       valid_local_tables_count = len(valid_local_tables)
 
-      if valid_local_tables_count <= self.__count_half_of_valid_oracles():
+      min_thr = self.__count_half_of_valid_oracles()
+      if valid_local_tables_count <= min_thr:
         self.median_table = None
-        self.P("Could not compute median. Too few valid values", color='r', boxed=True)
+        sender_list_str = '\n'.join(list(self.dct_local_tables.keys()))
+        self.P(
+          f"Could not compute median. Too few valid values({valid_local_tables_count} <= {min_thr}).",
+          color='r', boxed=True
+        )
+        self.P(f"Gathered data from only {valid_local_tables_count} oracles:\n{sender_list_str}", color='r')
         return
 
       # compute median for each node in list
@@ -1059,7 +1164,13 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
 
         simple_median = self.__compute_simple_median_table(median_table)
         if self.cfg_debug_sync:
-          self.P(f"Received message from oracle {sender}: {stage = }, {simple_median = }")
+          log_str = self.log_received_message(
+            sender=sender,
+            stage=stage,
+            data=self.dct_median_tables,
+            return_str=True,
+          )
+          self.P(f"{log_str}, {simple_median = }")
         # endif debug_sync
 
         self.dct_median_tables[sender] = median_table
@@ -1099,7 +1210,13 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       -------
       bool: True if the exchange phase of the median table has finished, False otherwise
       """
-      return self.time() - self.first_time_median_table_sent > self.cfg_send_period
+      timeout_reached = (self.time() - self.first_time_median_table_sent) > self.cfg_send_period
+      early_stopping = self.__maybe_early_stop_phase(
+        data=self.dct_median_tables,
+        phase=self.STATES.S4_SEND_MEDIAN_TABLE,
+        tables_str="median tables",
+      )
+      return early_stopping or timeout_reached
 
     # S5_COMPUTE_AGREED_MEDIAN_TABLE
     def __compute_agreed_median_table(self):
@@ -1177,7 +1294,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         median_frequency = len(lst_dct_freq_median)
         min_frequency = self.__count_half_of_valid_oracles()
         if median_frequency > min_frequency:
-          if self.cfg_debug_sync:
+          if self.cfg_debug_sync_full:
             self.P(f"Computed agreed median table for node {node}: {most_frequent_median}. "
                    f"Dct freq {dct_median_frequency}")
           # endif debug_sync
@@ -1217,6 +1334,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       # endif agreed_median_table empty
 
       self.compiled_agreed_median_table = self.__compute_simple_agreed_value_table(self.agreed_median_table)
+      self.P(f"Successfully computed agreed median table from {len(self.dct_median_tables)} median tables.")
 
       self.current_epoch_computed = True
       return
@@ -1264,12 +1382,19 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           continue
 
         signature_dict = oracle_data[OracleSyncCt.AGREEMENT_SIGNATURE]
-        self.compiled_agreed_median_table_signatures[sender] = signature_dict
 
         if self.cfg_debug_sync:
           stage = oracle_data[OracleSyncCt.STAGE]
-          self.P(f"Received agreement signature message from oracle {sender}: {stage = }, {signature_dict = }")
+          log_str = self.log_received_message(
+            sender=sender,
+            stage=stage,
+            data=self.compiled_agreed_median_table_signatures,
+            return_str=True
+          )
+          self.P(f"{log_str}, {signature_dict = }")
         # endif debug_sync
+        self.compiled_agreed_median_table_signatures[sender] = signature_dict
+
       # end for
 
       # Send agreed value to oracles
@@ -1358,7 +1483,13 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       -------
       bool: True if the exchange phase of the agreed median table has finished, False otherwise
       """
-      return self.time() - self.first_time__agreement_signature_sent > self.cfg_send_period
+      timeout_reached = (self.time() - self.first_time__agreement_signature_sent) > self.cfg_send_period
+      early_stopping = self.__maybe_early_stop_phase(
+        data=self.compiled_agreed_median_table_signatures,
+        phase=self.STATES.S6_SEND_AGREED_MEDIAN_TABLE,
+        tables_str="agreement tables",
+      )
+      return early_stopping or timeout_reached
 
     def __exchange_signatures_timeout(self):
       """
@@ -1368,7 +1499,14 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       -------
       bool: True if the exchange phase of the agreement signatures has finished, False otherwise
       """
-      return self.time() - self.first_time__agreement_signatures_exchanged > self.cfg_send_period * SIGNATURES_EXCHANGE_MULTIPLIER
+      timeout_reached = (self.time() - self.first_time__agreement_signatures_exchanged) > (self.cfg_send_period * SIGNATURES_EXCHANGE_MULTIPLIER)
+      early_stopping = self.__maybe_early_stop_phase(
+        data=self.compiled_agreed_median_table_signatures,
+        phase=self.STATES.S10_EXCHANGE_AGREEMENT_SIGNATURES,
+        tables_str="agreement signatures",
+        ignore_tolerance=True
+      )
+      return early_stopping or timeout_reached
 
     # S7_UPDATE_EPOCH_MANAGER
     def __update_epoch_manager_with_agreed_median_table(
@@ -1463,7 +1601,12 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       if success:
         if debug:
           valid_str = "VALID" if epoch_is_valid else "INVALID"
-          self.P(f'Successfully synced epoch {epoch} with {valid_str} agreed median table!')
+          sure_cnt, potential_cnt = self.initial_participating, self.initial_not_participating
+          log_str = f'Successfully synced epoch {epoch} with {valid_str} agreed median table '
+          log_str += f'and {len(agreement_signatures)} agreement signatures from '
+          log_str += f'{sure_cnt} sure and {potential_cnt} potential participants at the start.'
+          self.P(log_str)
+
           if self.cfg_debug_sync_full:
             self.P(f'DEBUG EM data after update:\n{self.netmon.epoch_manager.data}')
         self.__last_epoch_synced = epoch
@@ -1589,8 +1732,16 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
             continue
           # endif received epochs not containing the full requested interval
 
-          self.P(f"Received availability for epochs {received_epochs} from {sender = }. Keeping only "
-                 f"tables for epochs [{self.__last_epoch_synced + 1}, {self.__current_epoch - 1}]")
+          stage = oracle_data[OracleSyncCt.STAGE]
+          log_str = self.log_received_message(
+            sender=sender,
+            data=self.dct_agreed_availability_signatures,
+            stage=stage,
+            return_str=True
+          )
+          log_str += f", {received_epochs = }\n"
+          log_str += f"Keeping only tables for epochs [{self.__last_epoch_synced + 1}, {self.__current_epoch - 1}]"
+          self.P(log_str)
           epochs_range = range(self.__last_epoch_synced + 1, self.__current_epoch)
           self.dct_agreed_availability_table[sender] = {
             # No need for get here, since in S0 we send a continuous range of epochs.
@@ -1659,14 +1810,12 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       # 10 times the normal period because we want to make sure that oracles can respond
       wait_threshold = self.get_request_agreement_timeout()
       timeout_expired = self.time() - self.first_time_request_agreed_median_table_sent > wait_threshold
-
-      n_received = len(self.dct_agreed_availability_table)
-      if n_received >= self.min_oracle_reports_received():
-        self.P(f'Received {n_received}/{self.min_oracle_reports_received()} reports. Early stopping `SEND_REQUEST_AGREED_MEDIAN_TABLE`')
-        return True
-      # Early stopping
-
-      return not self.__last_epoch_synced_is_previous_epoch() and timeout_expired
+      early_stopping = self.__maybe_early_stop_phase(
+        data=self.dct_agreed_availability_table,
+        phase=self.STATES.S8_SEND_REQUEST_AGREED_MEDIAN_TABLE,
+        tables_str="agreement tables",
+      )
+      return not self.__last_epoch_synced_is_previous_epoch() and (early_stopping or timeout_expired)
 
     def __last_epoch_synced_is_previous_epoch(self):
       """
@@ -1864,6 +2013,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           debug=self.cfg_debug_sync_full
         )
       # endfor epoch
+      self.P(f"Successfully computed requested agreed median table from {len(candidates)} oracles. ")
       return
 
   # Utils
@@ -2051,11 +2201,22 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       # endif refresh time
       return
 
-    def min_oracle_reports_received(self):
+    def total_participating_oracles(self):
+      oracle_list = self.get_oracle_list()
+      total_participating_oracles = sum(self.should_expect_to_participate.values())
+      if total_participating_oracles == 0:
+        total_participating_oracles = len(oracle_list)
+      # endif total_participating_oracles
+      return total_participating_oracles
+
+    def min_oracle_reports_received(self, ignore_tolerance=False):
       oracle_list = self.get_oracle_list()
       if oracle_list is None or len(oracle_list) == 0:
         return 9999999999999999999
-      return max(len(oracle_list) - ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD, 1)
+      total_oracles = self.total_participating_oracles()
+      # In case we ignore the tolerance, we will use the total number of oracles.
+      threshold = (total_oracles - ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD) if not ignore_tolerance else total_oracles
+      return max(threshold, 1)
 
     def __is_oracle(self, node: str):
       """
@@ -2072,7 +2233,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       """
       return node in self.get_oracle_list()
 
-    def oracle_sync_get_node_local_availability(self, node: str):
+    def oracle_sync_get_node_local_availability(self, node: str, skip_log=False):
       """
       Get the local availability of a node for last epoch.
       Parameters
@@ -2084,11 +2245,11 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       -------
       int : The local availability of the node
       """
-      if self.cfg_debug_sync:
+      if not skip_log and self.cfg_debug_sync_full:
         self.P(f"Getting local availability for {node}")
       return self.netmon.epoch_manager.get_node_previous_epoch(node)
 
-    def __was_full_online(self, node: str):
+    def __was_full_online(self, node: str, previous_availability: int = None):
       """
       Check if the node was full online in the previous epoch.
 
@@ -2101,12 +2262,14 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       -------
       bool : True if the node was full online in the previous epoch, False otherwise
       """
-      if self.cfg_debug_sync:
+      if previous_availability is None:
+        previous_availability = self.oracle_sync_get_node_local_availability(node, skip_log=True)
+      if self.cfg_debug_sync_full:
         self.P(f"Checking if {node} was full online in the previous epoch. "
-               f"Local availability value: {self.oracle_sync_get_node_local_availability(node)}")
-      return self.oracle_sync_get_node_local_availability(node) >= FULL_AVAILABILITY_THRESHOLD
+               f"Local availability value: {previous_availability}")
+      return previous_availability >= FULL_AVAILABILITY_THRESHOLD
 
-    def __was_potentially_full_online(self, node: str):
+    def __was_potentially_full_online(self, node: str, previous_availability: int = None):
       """
       Check if the node was potentially full online in the previous epoch.
       For details about the potentially full online, check the `POTENTIALLY_FULL_AVAILABILITY_THRESHOLD` constant.
@@ -2120,7 +2283,10 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       -------
       bool : True if the node was potentially full online in the previous epoch, False otherwise
       """
-      return self.oracle_sync_get_node_local_availability(node) >= POTENTIALLY_FULL_AVAILABILITY_THRESHOLD
+      if previous_availability is None:
+        previous_availability = self.oracle_sync_get_node_local_availability(node, skip_log=True)
+      # endif previous_availability is None
+      return previous_availability >= POTENTIALLY_FULL_AVAILABILITY_THRESHOLD
 
     def __get_current_state(self):
       """
@@ -2841,7 +3007,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       if not epoch_is_valid:
         if debug:
           self.P(f"For epoch {epoch} from {sender} no consensus was reached. Skipping...", color='r')
-        return True
+        return False
 
       if agreed_median_table is None:
         if debug:

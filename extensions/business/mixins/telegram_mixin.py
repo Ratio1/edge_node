@@ -80,7 +80,7 @@ class _TelegramChatbotMixin(object):
       self.P(f"Custom handler created: {_custom_handler}")
     return _custom_handler
 
-    
+
   def __reply_wrapper(self, question, user, chat_id: str = None):
     self.__add_user_info(user=user, question=question)
     result = self.__message_handler(message=question, user=user, chat_id=chat_id)
@@ -90,8 +90,8 @@ class _TelegramChatbotMixin(object):
   async def __handle_response(self, user: str, text: str, chat_id: str = None) -> Optional[str]:
     self.bot_log("  Preparing response for {}...".format(user), low_priority=True)    
     # Create your own response logic
-    question: str = text.lower()
-    usr =  str(user).lower()
+    question: str = text
+    usr = str(user).lower()
     loop = asyncio.get_running_loop()
     answer = await loop.run_in_executor(
       None,  # Use the default executor (a ThreadPoolExecutor)
@@ -100,8 +100,8 @@ class _TelegramChatbotMixin(object):
       usr,
       chat_id
     )
-    return answer    
-  
+    return answer
+
   
   async def __handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
     message : Message = update.message
