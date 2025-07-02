@@ -103,6 +103,7 @@ _CONFIG = {
   # More powerful debug sync
   'DEBUG_SYNC_FULL': False,
   'ORACLE_LIST_REFRESH_INTERVAL': 300,  # seconds
+  "SELF_ASSESSMENT_INTERVAL": 30 * 60,  # seconds
 
   'SQUEEZE_EPOCH_DICTIONARIES': True,
 
@@ -236,6 +237,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
     # endif not cfg_use_r1fs
     self.__oracle_list = []
     self.__last_oracle_list_refresh = None
+    self.__last_self_assessment_ts = None
     self.maybe_refresh_oracle_list()
     self.__reset_to_initial_state()
 
@@ -327,7 +329,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       return log_str
     self.P(log_str)
 
-  # State machine callbacks
+  """STATE MACHINE SECTION"""
   if True:
     def _prepare_job_state_transition_map(self):
       job_state_transition_map = {
@@ -997,7 +999,7 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
           data=self.dct_local_tables,
           return_str=True
         )
-        if self.cfg_debug_sync:
+        if self.cfg_debug_sync_full:
           log_str += f", local_table=\n{local_table}"
         # endif debug_sync
         self.P(log_str)
@@ -1170,7 +1172,10 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
             data=self.dct_median_tables,
             return_str=True,
           )
-          self.P(f"{log_str}, {simple_median = }")
+          if self.cfg_debug_sync_full:
+            log_str += f", {simple_median = }"
+          # endif debug_sync_full
+          self.P(log_str)
         # endif debug_sync
 
         self.dct_median_tables[sender] = median_table
@@ -1391,7 +1396,10 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
             data=self.compiled_agreed_median_table_signatures,
             return_str=True
           )
-          self.P(f"{log_str}, {signature_dict = }")
+          if self.cfg_debug_sync_full:
+            log_str += f", {signature_dict = }"
+          # endif debug_sync_full
+          self.P(log_str)
         # endif debug_sync
         self.compiled_agreed_median_table_signatures[sender] = signature_dict
 
@@ -1455,7 +1463,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         if self.cfg_debug_sync:
           stage = oracle_data[OracleSyncCt.STAGE]
           senders = list(signatures_dict.keys())
-          self.P(f"Received {len(signatures_dict)} agreement signatures from oracle {sender}: {stage = }, {senders = }")
+          total_number_of_oracles = self.total_participating_oracles()
+          self.P(f"Received {len(signatures_dict)}/{total_number_of_oracles} agreement signatures from oracle {sender}: {stage = }, {senders = }")
         # endif debug_sync
       # end for
 
@@ -2015,172 +2024,176 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
       # endfor epoch
       self.P(f"Successfully computed requested agreed median table from {len(candidates)} oracles. ")
       return
+  """END STATE MACHINE SECTION"""
 
-  # Utils
+  """UTILS SECTION"""
   if True:
-    def r1fs_warmup_passed(self):
-      """
-      Check if the R1FS warmup has passed.
+    """R1FS UTILS SUBSECTION"""
+    if True:
+      def r1fs_warmup_passed(self):
+        """
+        Check if the R1FS warmup has passed.
 
-      Returns
-      -------
-      bool: True if the warmup has passed, False otherwise
-      """
-      return self.r1fs.is_ipfs_warmed
+        Returns
+        -------
+        bool: True if the warmup has passed, False otherwise
+        """
+        return self.r1fs.is_ipfs_warmed
 
 
-    def r1fs_add_data_to_message(
-        self,
-        message_dict: dict,
-        data_dict: dict,
-        data_key: str,
-        debug=None
-    ):
-      """
-      Helper method for adding data to a message with the help of R1FS.
-      This method will attempt to load the data in the R1FS and add only the CID to the message.
-      If the R1FS adding fails, the data will be added entirely to the message.
-      If R1FS adding succeeds, only the retrieved CID will be added to the message.
-      In both cases the data_key will be used
+      def r1fs_add_data_to_message(
+          self,
+          message_dict: dict,
+          data_dict: dict,
+          data_key: str,
+          debug=None
+      ):
+        """
+        Helper method for adding data to a message with the help of R1FS.
+        This method will attempt to load the data in the R1FS and add only the CID to the message.
+        If the R1FS adding fails, the data will be added entirely to the message.
+        If R1FS adding succeeds, only the retrieved CID will be added to the message.
+        In both cases the data_key will be used
 
-      Parameters
-      ----------
-      message_dict : dict
-          The message dictionary to which the data should be added
-      data_dict : dict
-          The data dictionary to be added to the message
-      data_key : str
-          The key of the data in the message_dict
+        Parameters
+        ----------
+        message_dict : dict
+            The message dictionary to which the data should be added
+        data_dict : dict
+            The data dictionary to be added to the message
+        data_key : str
+            The key of the data in the message_dict
 
-      Returns
-      -------
-      success : bool
-          True if the data was successfully added to the message, False otherwise
-      """
-      r1fs_show_logs = debug is None or debug
-      debug = self.cfg_debug_sync if debug is None else debug
-      success = False
-      if self.cfg_use_r1fs:
-        try:
-          if self.r1fs_warmup_passed():
-            data_cid = self.r1fs.add_pickle(data_dict, show_logs=r1fs_show_logs)
-            if data_cid is not None:
-              message_dict[data_key] = data_cid
-              if debug:
-                self.P(f'Successfully added data to R1FS using CID {data_cid}.')
-              success = True
+        Returns
+        -------
+        success : bool
+            True if the data was successfully added to the message, False otherwise
+        """
+        r1fs_show_logs = debug is None or debug
+        debug = self.cfg_debug_sync if debug is None else debug
+        success = False
+        if self.cfg_use_r1fs:
+          try:
+            if self.r1fs_warmup_passed():
+              data_cid = self.r1fs.add_pickle(data_dict, show_logs=r1fs_show_logs)
+              if data_cid is not None:
+                message_dict[data_key] = data_cid
+                if debug:
+                  self.P(f'Successfully added data to R1FS using CID {data_cid}.')
+                success = True
+              else:
+                if debug:
+                  self.P(f"Failed to add data to R1FS. Adding data entirely to message.", color='r')
+                message_dict[data_key] = self.deepcopy(data_dict)
+              # endif data_cid is not None
             else:
               if debug:
-                self.P(f"Failed to add data to R1FS. Adding data entirely to message.", color='r')
+                self.P(f"R1FS warmup period has not passed. Adding data entirely to message.", color='r')
               message_dict[data_key] = self.deepcopy(data_dict)
-            # endif data_cid is not None
-          else:
+          except Exception as e:
             if debug:
-              self.P(f"R1FS warmup period has not passed. Adding data entirely to message.", color='r')
+              self.P(f"Failed to add data to R1FS. Adding data entirely to message. Error: {e}", color='r')
             message_dict[data_key] = self.deepcopy(data_dict)
-        except Exception as e:
-          if debug:
-            self.P(f"Failed to add data to R1FS. Adding data entirely to message. Error: {e}", color='r')
-          message_dict[data_key] = self.deepcopy(data_dict)
-      else:
-        if debug:
-          self.P(f"R1FS use is disabled. Adding data entirely to message.")
-        message_dict[data_key] = self.deepcopy(data_dict)
-        success = True
-      # endif R1FS use
-      return success
-
-    def r1fs_get_data_from_message(
-        self,
-        message_dict: dict,
-        data_key: str,
-        debug=True
-    ):
-      """
-      Helper method for getting data from a message with the help of R1FS.
-      This method will check if the received value for the data_key is a CID or the data itself.
-      Will then attempt to extract the data from the R1FS using the CID if needed and add it back
-      to the message.
-
-      Parameters
-      ----------
-      message_dict : dict
-          The message dictionary from which the data should be extracted
-      data_key : str
-          The key of the data in the message_dict
-      debug : bool, optional
-          Whether to print debug messages, by default True
-
-      Returns
-      -------
-      dict or None
-          The data dictionary extracted from the message.
-          If the extraction fails the method will return None.
-      """
-      res = None
-      # 1. Extract the data from the message.
-      data_from_message = message_dict.get(data_key)
-      if data_from_message is None:
-        # 1.1. No data found in message.
-        if debug:
-          self.P(f"Failed to extract data from {data_key}. Nothing provided.", color='r')
-      else:
-        # 1.2. Data found in message. Check if CID or data.
-        if isinstance(data_from_message, str):
-          # 2.1. Data is a CID. Attempt to get the data from R1FS.
-          if debug:
-            self.P(f"Attempting to get data from R1FS using CID {data_from_message}.")
-          res = self.r1fs_get_pickle(cid=data_from_message, debug=debug)
-          if res is not None and debug:
-            self.P(f"Successfully retrieved data from R1FS using CID {data_from_message}.")
         else:
-          # 2.2. Data is not a CID. Use the data directly.
-          res = data_from_message
           if debug:
-            self.P(f'Using data directly from message for {data_key}.')
-        # endif CID or data
-      # endif extraction successful
-      message_dict[data_key] = res
-      return res
+            self.P(f"R1FS use is disabled. Adding data entirely to message.")
+          message_dict[data_key] = self.deepcopy(data_dict)
+          success = True
+        # endif R1FS use
+        return success
 
-    def r1fs_get_pickle(self, cid: str, debug=True):
-      """
-      Get the data from the IPFS using the CID.
-      The CID will be used for retrieving the file from the IPFS.
-      That file should be a pickle file.
+      def r1fs_get_data_from_message(
+          self,
+          message_dict: dict,
+          data_key: str,
+          debug=True
+      ):
+        """
+        Helper method for getting data from a message with the help of R1FS.
+        This method will check if the received value for the data_key is a CID or the data itself.
+        Will then attempt to extract the data from the R1FS using the CID if needed and add it back
+        to the message.
 
-      Parameters
-      ----------
-      cid : str
-          The CID of the data
-      debug : bool, optional
-          Print debug messages, by default True
+        Parameters
+        ----------
+        message_dict : dict
+            The message dictionary from which the data should be extracted
+        data_key : str
+            The key of the data in the message_dict
+        debug : bool, optional
+            Whether to print debug messages, by default True
 
-      Returns
-      -------
-      dict
-          The data from the IPFS
-      """
-      total_retries = 5
-      retrieved_data = None
-      sleep_time = 3
-      for i in range(total_retries):
-        try:
-          data_fn = self.r1fs.get_file(cid=cid, show_logs=debug)
-          data_full_path = self.os_path.abspath(data_fn)
-          retrieved_data = self.diskapi_load_pickle_from_output(filename=data_full_path)
-          if retrieved_data is not None:
-            break
-        except Exception as e:
+        Returns
+        -------
+        dict or None
+            The data dictionary extracted from the message.
+            If the extraction fails the method will return None.
+        """
+        res = None
+        # 1. Extract the data from the message.
+        data_from_message = message_dict.get(data_key)
+        if data_from_message is None:
+          # 1.1. No data found in message.
           if debug:
-            self.P(f"Failed try {i + 1}/{total_retries} to retrieve data from IPFS using CID {cid}.")
-          self.sleep(sleep_time)
-        # endtry to retrieve data
-      # endif retries
-      if retrieved_data is None:
-        if debug:
-          self.P(f"Failed to retrieve data from IPFS using CID {cid} from {total_retries} retries.", color='r')
-      return retrieved_data
+            self.P(f"Failed to extract data from {data_key}. Nothing provided.", color='r')
+        else:
+          # 1.2. Data found in message. Check if CID or data.
+          if isinstance(data_from_message, str):
+            # 2.1. Data is a CID. Attempt to get the data from R1FS.
+            if debug:
+              self.P(f"Attempting to get data from R1FS using CID {data_from_message}.")
+            res = self.r1fs_get_pickle(cid=data_from_message, debug=debug)
+            if res is not None and debug:
+              self.P(f"Successfully retrieved data from R1FS using CID {data_from_message}.")
+          else:
+            # 2.2. Data is not a CID. Use the data directly.
+            res = data_from_message
+            if debug:
+              self.P(f'Using data directly from message for {data_key}.')
+          # endif CID or data
+        # endif extraction successful
+        message_dict[data_key] = res
+        return res
+
+      def r1fs_get_pickle(self, cid: str, debug=True):
+        """
+        Get the data from the IPFS using the CID.
+        The CID will be used for retrieving the file from the IPFS.
+        That file should be a pickle file.
+
+        Parameters
+        ----------
+        cid : str
+            The CID of the data
+        debug : bool, optional
+            Print debug messages, by default True
+
+        Returns
+        -------
+        dict
+            The data from the IPFS
+        """
+        total_retries = 5
+        retrieved_data = None
+        sleep_time = 3
+        for i in range(total_retries):
+          try:
+            data_fn = self.r1fs.get_file(cid=cid, show_logs=debug)
+            data_full_path = self.os_path.abspath(data_fn)
+            retrieved_data = self.diskapi_load_pickle_from_output(filename=data_full_path)
+            if retrieved_data is not None:
+              break
+          except Exception as e:
+            if debug:
+              self.P(f"Failed try {i + 1}/{total_retries} to retrieve data from IPFS using CID {cid}.")
+            self.sleep(sleep_time)
+          # endtry to retrieve data
+        # endif retries
+        if retrieved_data is None:
+          if debug:
+            self.P(f"Failed to retrieve data from IPFS using CID {cid} from {total_retries} retries.", color='r')
+        return retrieved_data
+    """END R1FS UTILS SUBSECTION"""
 
     def get_oracle_list(self):
       if DEBUG_MODE:
@@ -3084,8 +3097,41 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         simple_agreed_value_table[node] = dct_node['VALUE']
 
       return simple_agreed_value_table
+  """END UTILS SECTION"""
+
+  def maybe_self_assessment(self):
+    """
+    Perform self-assessment throughout the epoch to know the local availability so far and
+    to predict the final availability of the node at the end of the epoch.
+    """
+    if self.__get_current_state() != self.STATES.S0_WAIT_FOR_EPOCH_CHANGE:
+      return
+    elapsed = self.time() - self.__last_self_assessment_ts if self.__last_self_assessment_ts is not None else None
+    if self.__last_self_assessment_ts is not None and elapsed < self.cfg_self_assessment_interval:
+      return
+    self.__last_self_assessment_ts = self.time()
+    total_seconds_availability, total_seconds_from_start = self.netmon.epoch_manager.get_current_epoch_availability(
+      return_absolute=True,
+      return_max=True
+    )
+    total_epoch_seconds = self.netmon.epoch_manager.epoch_length
+    prc_node_availability = total_seconds_availability / total_epoch_seconds
+    prc_max_availability = total_seconds_from_start / total_epoch_seconds
+    prc_missed_availability = prc_max_availability - prc_node_availability
+    prc_predicted_availability = 1 - prc_missed_availability
+    will_participate = prc_predicted_availability >= SUPERVISOR_MIN_AVAIL_PRC
+    comparing_str = f"{'>=' if will_participate else '<='} {SUPERVISOR_MIN_AVAIL_PRC:.2%}"
+    comparing_str += f" => {'will' if will_participate else 'will not'} participate in the sync process."
+    log_str = f"Current self-assessment:\n"
+    log_str += f"\tNode current availability: {prc_node_availability:.2%}\n"
+    log_str += f"\tPassed from epoch: {prc_max_availability:.2%}\n"
+    log_str += f"\tMissed availability so far: {prc_missed_availability:.2%}\n"
+    log_str += f"\tPredicted availability at the end of epoch: {prc_predicted_availability:.2%}{comparing_str}\n"
+    self.P(log_str, color='g')
+    return
 
   def process(self):
     self.maybe_refresh_oracle_list()
     self.state_machine_api_step(self.state_machine_name)
+    self.maybe_self_assessment()
     return
