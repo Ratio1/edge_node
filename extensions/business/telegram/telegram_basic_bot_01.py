@@ -91,8 +91,8 @@ class TelegramBasicBot01Plugin(
     return  
 
 
-  def bot_msg_handler(self, message, user, **kwargs):
-    result = self._reply_handler(plugin=self, message=message, user=user)
+  def bot_msg_handler(self, message, user, chat_id, **kwargs):
+    result = self._reply_handler(plugin=self, message=message, user=user, chat_id=chat_id)
     return result
 
 
