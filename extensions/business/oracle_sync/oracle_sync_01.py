@@ -64,7 +64,7 @@ TODO list:
 MAX_RECEIVED_MESSAGES_SIZE = 1000
 DEBUG_MODE = False
 SIGNATURES_EXCHANGE_MULTIPLIER = 2
-REQUEST_AGREEMENT_TABLE_MULTIPLIER = 5 if DEBUG_MODE else 6
+REQUEST_AGREEMENT_TABLE_MULTIPLIER = 5 if DEBUG_MODE else 10
 LOCAL_TABLE_SEND_MULTIPLIER = 3 if DEBUG_MODE else 2
 
 # Full availability means that the node was seen online for at least SUPERVISOR_MIN_AVAIL_PRC% of the time.
@@ -323,7 +323,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
     current_count = len(data) + (1 - is_duplicated)
     duplicated_str = "(duplicated)" if is_duplicated else ""
     progress_str = f"[{current_count}/{self.total_participating_oracles()}]"
-    log_str = f"Received message{duplicated_str} from oracle {sender}{progress_str}: {stage = }"
+    sender_alias = self.netmon.network_node_eeid(sender)
+    log_str = f"{progress_str}Received message{duplicated_str} from oracle {sender_alias} <{sender}>: {stage = }"
 
     if return_str:
       return log_str
@@ -844,7 +845,8 @@ class OracleSync01Plugin(NetworkProcessorPlugin):
         return processed
 
       if request_agreed_median_table:
-        self.P(f"Received request from oracle {sender}: {stage = }, {start_epoch = }, {end_epoch = }")
+        sender_alias = self.netmon.network_node_eeid(sender)
+        self.P(f"Received request from oracle {sender_alias} <{sender}>: {stage = }, {start_epoch = }, {end_epoch = }")
         self.__send_epoch__agreed_median_table(start_epoch, end_epoch)
         processed = True
       # endif request_agreed_median_table
