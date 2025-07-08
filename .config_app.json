@@ -40,7 +40,7 @@
                 "TOPIC": "naeural/payloads"
             },
             "PORT": "$EE_MQTT_PORT",
-            "QOS": 0,
+            "QOS": 2,
             "USER": "$EE_MQTT_USER",
             "SUBTOPIC" : "$EE_MQTT_SUBTOPIC",
             "SECURED" : 1,
