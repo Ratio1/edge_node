@@ -74,7 +74,8 @@ _CONFIG = {
   # due to the fact that we are using a "void" pipeline,
   # we need to allow empty inputs as we are not getting any 
   # data from the pipeline
-  'ALLOW_EMPTY_INPUTS': True, 
+  'ALLOW_EMPTY_INPUTS': True,
+  'RESET_CHAINSTORE_ON_INIT': False, # reset the chainstore entries for the plugin on init
   'VALIDATION_RULES' : {
     **BasePlugin.CONFIG['VALIDATION_RULES'],    
   },  
@@ -102,8 +103,17 @@ class R1fsDemoPlugin(BasePlugin):
     self.P(f"Resetting chainstore key {self.chainstore_key}.{self.my_id}...")
     self.chainstore_hset(hkey=self.chainstore_key, key=self.my_id, value=None)
 
+    if self.cfg_reset_chainstore_on_init:
+      self.P(f"Resetting all ChainStore entries for {self.chainstore_key}...")
+      self.__reset_chainstore_entries()
+
     return
-  
+
+  def __reset_chainstore_entries(self):
+    hset_dump = self.chainstore_hgetall(self.chainstore_key)
+    for k, v in hset_dump.items():
+      self.chainstore_hset(hkey=self.chainstore_key, key=k, value=None)
+
   def __save_some_data(self):
     """ Save some data to the R1FS """
     self.P("Saving some data...")
@@ -141,7 +151,7 @@ class R1fsDemoPlugin(BasePlugin):
       ]
       # now we filter based on already known CIDs
       cids = [
-        cid for cid in cids if cid not in self.__known_cids
+        cid for cid in cids if cid and cid not in self.__known_cids
       ]
     if len(cids) > 0:
       self.P(f"Found {len(cids)} CIDs ")
@@ -161,6 +171,9 @@ class R1fsDemoPlugin(BasePlugin):
     cids = self.__get_announced_cids()
     self.P(f"Found {len(cids)} shared data...")
     for cid in cids:
+      if not cid:
+        self.P("CID cannot be None or empty string, skipping...")
+        continue
       self.P(f"Retrieving: {cid}")
       fn = self.r1fs.get_file(cid)
       if fn is None:
