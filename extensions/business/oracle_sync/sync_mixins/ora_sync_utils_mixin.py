@@ -208,19 +208,19 @@ class _OraSyncUtilsMixin:
 
     def update_participant_oracles(
         self, updated_participant_oracles: list,
-        phase: str = None,
+        state: str = None,
     ):
       """
       Update the participant oracles depending on what oracles took part in the
-      last sync phase.
+      last sync state.
       Parameters
       ----------
       updated_participant_oracles : list
           The list of updated participant oracles.
-          This should be a list of addresses of the oracles that took part in the last sync phase.
+          This should be a list of addresses of the oracles that took part in the last sync state.
           If an oracle is not in this list, it will be considered as not participating.
-      phase : str, optional
-          The phase of the sync process. If provided, this will be used for logging purposes.
+      state : str, optional
+          The state of the sync process. If provided, this will be used for logging purposes.
       """
       lst_oracle_addrs = list(self.is_participating.keys())
       disappearing_oracles = []
@@ -234,8 +234,8 @@ class _OraSyncUtilsMixin:
         # endif was participating and not currently participating
       # endfor
       total_current_participants = sum(self.is_participating.values())
-      if phase is not None:
-        log_str = f"Updating participating oracles based on {phase = }.\n"
+      if state is not None:
+        log_str = f"Updating participating oracles based on {state = }.\n"
         log_str += f"{total_previous_participants} previous participants => "
         log_str += f"{total_current_participants} current participants.\n"
         if len(disappearing_oracles) > 0:
@@ -245,7 +245,7 @@ class _OraSyncUtilsMixin:
             for oracle_addr in disappearing_oracles
           ])
         # endif disappearing oracles
-      # endif phase is not None
+      # endif state is not None
       return
 
     def maybe_refresh_oracle_list(self):

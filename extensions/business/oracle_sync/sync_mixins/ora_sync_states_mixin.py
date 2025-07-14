@@ -330,7 +330,10 @@ class _OraSyncStatesCallbacksMixin:
       return
 
     def _can_participate_and_announcement_timeout(self):
-      timeout_passed = (self.time() - self.first_time_announce_participants) > self.get_announce_participants_timeout()
+      timeout_passed = False
+      # This can be None if the current oracle does not participate
+      if self.first_time_announce_participants is not None:
+        timeout_passed = (self.time() - self.first_time_announce_participants) > self.get_announce_participants_timeout()
       # This sequence of checks is important in order to avoid computing the local availability multiple times.
       return timeout_passed and self._can_participate_in_sync()
   """END S11_ANNOUNCE_PARTICIPANTS CALLBACKS"""
