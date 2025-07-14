@@ -344,8 +344,14 @@ class OracleSync01Plugin(
           'DESCRIPTION': "Compute the agreed median table of availability, based on the received tables",
           'TRANSITIONS': [
             {
+              'NEXT_STATE': self.STATES.S8_SEND_REQUEST_AGREED_MEDIAN_TABLE,
+              'TRANSITION_CONDITION': self._last_epoch_synced_is_not_previous_epoch,
+              'ON_TRANSITION_CALLBACK': self._reset_for_agreement_request_retry,
+              'DESCRIPTION': "If the agreement could not be computed retry."
+            },
+            {
               'NEXT_STATE': self.STATES.S0_WAIT_FOR_EPOCH_CHANGE,
-              'TRANSITION_CONDITION': self.state_machine_api_callback_always_true,
+              'TRANSITION_CONDITION': self._last_epoch_synced_is_previous_epoch,
               'ON_TRANSITION_CALLBACK': self._reset_to_initial_state,
               'DESCRIPTION': "Begin the exchange process of the agreed median tables between oracles",
             }

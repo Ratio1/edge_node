@@ -383,7 +383,7 @@ class _OraSyncStatesCallbacksMixin:
         for oracle, oracle_alias, availability in lst_out
       )
       log_msg += f"POTENTIAL_THRESHOLD={self._potentially_full_availability_threshold} | "
-      log_msg += f"FULL_THRESHOLD={FULL_AVAILABILITY_THRESHOLD})"
+      log_msg += f"FULL_THRESHOLD={FULL_AVAILABILITY_THRESHOLD}"
       log_msg += f"\n{len(lst_announced)} oracles that will participate:\n\t{announced_str}\n"
       log_msg += f"\n{len(lst_out)} oracles that will not participate:\n\t{out_str}\n"
       self.P(log_msg)
@@ -1072,13 +1072,16 @@ class _OraSyncStatesCallbacksMixin:
       debug : bool, optional
           Print debug messages, by default True
       """
-
+      # Check if this is a single call in the consensus process or part
+      # of the agreement request process that may include multiple updates.
+      is_single_call = False
       if epoch is None:
         # update previous epoch, since if this method is called without epoch,
         # it is part of the consensus process for the previous epoch.
         # TODO: should we switch to self.netmon.epoch_manager.get_current_epoch() - 1 everywhere?
         #  both should be equivalent
         epoch = self._current_epoch - 1
+        is_single_call = True
       # end if
 
       if compiled_agreed_median_table is None:
@@ -1166,6 +1169,10 @@ class _OraSyncStatesCallbacksMixin:
           if self.cfg_debug_sync_full:
             self.P(f'DEBUG EM data after update:\n{self.netmon.epoch_manager.data}')
         self._last_epoch_synced = epoch
+        # In case of multiple updates, the save is only needed after the last update.
+        if is_single_call:
+          self.netmon.epoch_manager.save_status()
+        # endif part of consensus process
       return
   """END S7_UPDATE_EPOCH_MANAGER CALLBACKS"""
 
@@ -1373,6 +1380,9 @@ class _OraSyncStatesCallbacksMixin:
         data=self.dct_agreed_availability_table,
         phase=self.STATES.S8_SEND_REQUEST_AGREED_MEDIAN_TABLE,
         tables_str="agreement tables",
+        # Here, tolerance is 1, since at least the current oracle is not able
+        # to respond.
+        tolerance=1,
       )
       return not self._last_epoch_synced_is_previous_epoch() and (early_stopping or timeout_expired)
 
@@ -1386,10 +1396,28 @@ class _OraSyncStatesCallbacksMixin:
       """
       return self._last_epoch_synced == self._current_epoch - 1
 
+    def _last_epoch_synced_is_not_previous_epoch(self):
+      """
+      Check if the agreed median table for the last epoch has not been received.
+
+      Returns
+      -------
+      bool: True if the agreed median table for the last epoch has not been received, False otherwise
+      """
+      return not self._last_epoch_synced_is_previous_epoch()
+
   """END S8_SEND_REQUEST_AGREED_MEDIAN_TABLE CALLBACKS"""
 
   """S9_COMPUTE_REQUESTED_AGREED_MEDIAN_TABLE CALLBACKS"""
   if True:
+    def _reset_for_agreement_request_retry(self):
+      log_str = f"Failed to compute requested agreed median table.\n"
+      log_str += f"Resetting to initial state and retrying the agreement request."
+      self.P(log_str, color='r', boxed=True)
+      self._reset_to_initial_state()
+      return
+
+
     def _mark_requested_epochs_as_faulty(self):
       # If no agreed median table received, mark all requested epochs as invalid.
       requested_start_epoch = self._last_epoch_synced + 1
@@ -1576,5 +1604,7 @@ class _OraSyncStatesCallbacksMixin:
         )
       # endfor epoch
       self.P(f"Successfully computed requested agreed median table from {len(candidates)} oracles. ")
+      # Save the epoch manager status after the update.
+      self.netmon.epoch_manager.save_status()
       return
   """END S9_COMPUTE_REQUESTED_AGREED_MEDIAN_TABLE CALLBACKS"""

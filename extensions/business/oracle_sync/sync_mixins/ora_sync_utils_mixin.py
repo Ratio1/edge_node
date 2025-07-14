@@ -245,6 +245,7 @@ class _OraSyncUtilsMixin:
             for oracle_addr in disappearing_oracles
           ])
         # endif disappearing oracles
+        self.P(log_str, boxed=True)
       # endif state is not None
       return
 
@@ -270,13 +271,19 @@ class _OraSyncUtilsMixin:
       # endif total_participating_oracles
       return total_participating_oracles
 
-    def min_oracle_reports_received(self, ignore_tolerance=False):
+    def min_oracle_reports_received(
+        self, ignore_tolerance: bool = False,
+        tolerance: int = ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD
+    ):
       oracle_list = self.get_oracle_list()
       if oracle_list is None or len(oracle_list) == 0:
         return 9999999999999999999
+      if not isinstance(tolerance, int):
+        tolerance = ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD
+      # endif tolerance is not int
       total_oracles = self.total_participating_oracles()
       # In case we ignore the tolerance, we will use the total number of oracles.
-      threshold = (total_oracles - ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD) if not ignore_tolerance else total_oracles
+      threshold = (total_oracles - tolerance) if not ignore_tolerance else total_oracles
       return max(threshold, 1)
 
     def _is_oracle(self, node: str):
@@ -380,6 +387,7 @@ class _OraSyncUtilsMixin:
         phase: str,
         tables_str: str,
         ignore_tolerance: bool = False,
+        tolerance: int = ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD
     ):
       """
       Check to see if the current phase should be stopped early.
@@ -399,6 +407,10 @@ class _OraSyncUtilsMixin:
         If True, the tolerance will be 0 (there has to be data from all the oracles).
         If False, the early stop will happen if there is data collected from at least
         (all_oracles - tolerance) oracles.
+      tolerance : int
+        The number of oracles that can be ignored for the early stop.
+        This will be used only if ignore_tolerance is False.
+        Default is ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD.
 
       Returns
       -------
@@ -406,7 +418,10 @@ class _OraSyncUtilsMixin:
         True if the phase should be stopped early, False otherwise.
       """
       n_received = len(data)
-      threshold = self.min_oracle_reports_received(ignore_tolerance=ignore_tolerance)
+      threshold = self.min_oracle_reports_received(
+        ignore_tolerance=ignore_tolerance,
+        tolerance=tolerance,
+      )
       total_participating_oracles = self.total_participating_oracles()
       if n_received >= threshold:
         log_str = f"Received {n_received}/{total_participating_oracles} {tables_str} from oracles.\n"
@@ -734,7 +749,7 @@ class _OraSyncUtilsMixin:
         sender=sender,
         oracle_data=oracle_data,
         expected_variable_names=[OracleSyncCt.STAGE, OracleSyncCt.ANNOUNCED_PARTICIPANTS],
-        expected_stage=self.STATES.S1_ANNOUNCE_PARTICIPANTS,
+        expected_stage=self.STATES.S11_ANNOUNCE_PARTICIPANTS,
         verify=True,
       ):
         return False
