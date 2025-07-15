@@ -187,11 +187,8 @@ class _DeeployMixin:
       # If target_nodes_count is set, we will select the top nodes based on their scores
       network_nodes = self.netmon.network_nodes_status()
 
-      self.Pd(f"Online nodes: {self.json_dumps(network_nodes, indent=2)}")
-
-      trusted_non_oracle_nodes = {key: value for key, value in network_nodes.items() if value.get('trusted') is True and value.get('is_supervisor') is False}
-
-      self.Pd("Trusted non-oracle nodes: {}".format(self.json_dumps(trusted_non_oracle_nodes, indent=2)))
+      self.Pd(f"Network nodes count: {len(network_nodes)}")
+      self.Pd(self.json_dumps(network_nodes))
 
       suitable_nodes = []
 
@@ -213,7 +210,9 @@ class _DeeployMixin:
             self.Pd(f"Node {addr} has not enough CPU cores in total. Skipping...")
             continue
 
-        # TODO: Add here check for node resources (node_res_req)
+          if total_memory_bytes < node_req_memory_bytes:
+            self.Pd(f"Node {addr} has not enought RAM in total. Skipping...")
+            continue
 
         if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
           node_avail_disk = value.get('avail_disk', 1)
@@ -235,32 +234,53 @@ class _DeeployMixin:
 
       apps = self._get_online_apps()
       most_recently_deployed_nodes = {}
+      self.Pd(f"Online Apps: {apps}")
+
+      most_recently_deployed_nodes = {}
       for addr in suitable_nodes:
         most_recent_config = None
 
-        for node, pipelines in apps.items():
-          for pipeline_name, pipeline_data in pipelines.items():
+        ai_addr = f"0xai_{addr}"
+        current_node_pipelines = apps.get(ai_addr)
+
+        if not current_node_pipelines:
+          most_recent_config = self.datetime.fromisoformat('1970-01-01T00:00:00')
+        else:
+          for pipeline_name, pipeline_data in current_node_pipelines.items():
             if pipeline_name == "admin_pipeline":
-              continue
-            ts = self.datetime.fromisoformat(pipeline_data.get('last_config', '1970-01-01T00:00:00'))
+              ts = self.datetime.fromisoformat('1970-01-01T00:00:00')
+            else:
+              ts = self.datetime.fromisoformat(pipeline_data.get('last_config', '1970-01-01T00:00:00'))
 
             if most_recent_config is None or ts > most_recent_config:
               most_recent_config = ts
+          # endfor node pipelines
 
         most_recently_deployed_nodes[addr] = most_recent_config
+
+      self.Pd("most_recently_deployed_nodes:")
+      self.Pd(self.json_dumps(most_recently_deployed_nodes))
+
+      self.Pd("Suitable Nodes:")
+      self.Pd(self.json_dumps(suitable_nodes))
 
       sorted_nodes = sorted(suitable_nodes,
                        key=lambda kv: (
                          -network_nodes[kv]["SCORE"],
-                         -(most_recently_deployed_nodes[kv].timestamp()) if
+                         -(self.datetime.fromisoformat(most_recently_deployed_nodes[kv]).timestamp()) if
                          most_recently_deployed_nodes[kv] else 0
                        ))
+
+      self.Pd("Sorted Nodes:")
+      self.Pd(self.json_dumps(sorted_nodes, indent=2))
 
       if len(sorted_nodes) < inputs.target_nodes_count:
         msg = f"{DEEPLOY_ERRORS.NODES5}: Not enough online nodes available. Required: {inputs.target_nodes_count}, Available: {len(sorted_nodes)}"
         raise ValueError(msg)
 
-      return sorted_nodes[inputs.target_nodes_count:]
+      nodes_to_run = sorted_nodes[:inputs.target_nodes_count]
+      self.Pd(f"Nodes to run: {nodes_to_run}")
+      return nodes_to_run
 
     for node in inputs.target_nodes:
       addr = self._check_and_maybe_convert_address(node)
@@ -274,6 +294,7 @@ class _DeeployMixin:
                   f"- {detail[DEEPLOY_RESOURCES.RESOURCE]}: available {detail[DEEPLOY_RESOURCES.AVAILABLE]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]} < " +
                   "required {detail[DEEPLOY_RESOURCES.REQUIRED]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]}\n")
           raise ValueError(error_msg)
+        # endif not node_resources
         nodes.append(addr)
       else:
         msg = f"{DEEPLOY_ERRORS.NODES1}: Node {addr} is not online"
