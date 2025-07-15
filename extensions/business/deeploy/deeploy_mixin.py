@@ -101,20 +101,25 @@ class _DeeployMixin:
     inputs.wallet_oracles = wallet_oracles
     return inputs
 
-  def __parse_memory(self, mem_str):
+  def __parse_memory(self, mem):
     """
     Convert memory string to bytes.
     Args:
-        mem_str (str): Memory string in format '512m', '1g', '1.3g, or bytes
+        mem (str | float | int): Memory string in format '512m', '1g', '1.3g, or bytes
     Returns:
         int: Memory in bytes
     """
-    if mem_str.endswith('m'):
-      return int(float(mem_str[:-1]) * 1024 * 1024)  # MB to bytes
-    elif mem_str.endswith('g'):
-      return int(float(mem_str[:-1]) * 1024 * 1024 * 1024)  # GB to bytes
+    # If it's float, we suppose, that it's provided in GB.
+    if not mem:
+      return 0
+    if type(mem) is float or type(mem) is int:
+      return int(mem * 1024 * 1024 * 1024) # GB to bytes
+    elif mem.endswith('m'):
+      return int(float(mem[:-1]) * 1024 * 1024)  # MB to bytes
+    elif mem.endswith('g'):
+      return int(float(mem[:-1]) * 1024 * 1024 * 1024)  # GB to bytes
     else:
-      return int(float(mem_str))  # assume bytes
+      return int(float(mem))  # assume bytes
 
   def __check_nodes_availability(self, inputs):
     """
@@ -161,10 +166,15 @@ class _DeeployMixin:
     """
     # Get required resources from the request
     required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
-    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
     required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
-
+    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
     required_mem_bytes = self.__parse_memory(required_mem)
+
+    node_req_res = inputs.get(DEEPLOY_RESOURCES.NODE_RESOURCES_REQUEST, {})
+
+    node_req_cpu = node_req_res.get(DEEPLOY_RESOURCES.CPU)
+    node_req_memory = node_req_res.get(DEEPLOY_RESOURCES.MEMORY)
+    node_req_memory_bytes = self.__parse_memory(node_req_memory)
 
     nodes = []
 
@@ -186,23 +196,42 @@ class _DeeployMixin:
       suitable_nodes = []
 
       for addr, value in network_nodes.items():
-        if value.get('trusted') is False or value.get('is_supervisor') is True:
+        # FIXME
+        # if value.get('trusted') is False or value.get('is_supervisor') is True:
+        #   continue
+        if value.get('is_supervisor') is True:
+          self.Pd(f"Node {addr} is an oracle. Skipping...")
           continue
+
+        if node_req_res:
+          total_cpu = self.netmon.network_node_total_cpu_cores(addr)
+
+          total_memory = self.netmon.network_node_total_mem(addr)
+          total_memory_bytes = self.__parse_memory(total_memory)
+
+          if total_cpu < node_req_cpu:
+            self.Pd(f"Node {addr} has not enough CPU cores in total. Skipping...")
+            continue
 
         # TODO: Add here check for node resources (node_res_req)
 
         if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
           node_avail_disk = value.get('avail_disk', 1)
+          node_avail_cpu = self.netmon.network_node_avail_cpu_cores(addr)
           node_avail_mem = value.get('avail_mem', 1)
           node_avail_mem_bytes = self.__parse_memory(node_avail_mem)
 
+          if node_avail_cpu < required_cpu:
+            self.Pd(f"Node {addr} has not enough CPU cores in total. Skipping...")
+            continue
           if node_avail_mem_bytes < required_mem_bytes:
             self.Pd(f"Node {addr} has insufficient memory: {node_avail_mem} < {required_mem_bytes}")
-          else:
-            suitable_nodes.append(addr)
+            continue
+          suitable_nodes.append(addr)
           continue
-
+        # endif plugin_signature check
         suitable_nodes.append(addr)
+      # endfor each node
 
       apps = self._get_online_apps()
       most_recently_deployed_nodes = {}
