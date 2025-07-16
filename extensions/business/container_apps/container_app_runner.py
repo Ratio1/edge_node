@@ -47,9 +47,17 @@ _CONFIG = {
   "NGROK_AUTH_TOKEN" : None,  # Optional ngrok auth token for the tunnel
   "NGROK_USE_API": True,
   'NGROK_DOMAIN': None,
-  
   'NGROK_URL_PING_INTERVAL': 10, # seconds to ping the ngrok URL and to send it in payload
   'NGROK_URL_PING_COUNT': 10, # nr or times we send payload with ngrok url
+
+  # Generic tunnel engine Section
+  "TUNNEL_ENGINE": "ngrok",  # or "cloudflare"
+
+  "TUNNEL_ENGINE_ENABLED": True,
+  "TUNNEL_ENGINE_PING_INTERVAL": 30,  # seconds
+  "TUNNEL_ENGINE_PARAMETERS": {
+  },
+
 
   # TODO: this flag needs to be renamed both here and in the ngrok mixin
   "DEBUG_WEB_APP": False,  # If True, will run the web app in debug mode
