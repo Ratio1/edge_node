@@ -47,7 +47,8 @@ _CONFIG = {
   "NGROK_AUTH_TOKEN" : None,  # Optional ngrok auth token for the tunnel
   "NGROK_USE_API": True,
   'NGROK_DOMAIN': None,
-  
+  'NGROK_ENABLED': False, # If True, will start ngrok tunnel if port is specified
+
   'NGROK_URL_PING_INTERVAL': 10, # seconds to ping the ngrok URL and to send it in payload
   'NGROK_URL_PING_COUNT': 10, # nr or times we send payload with ngrok url
 
@@ -56,9 +57,11 @@ _CONFIG = {
 
   # Container-specific config options  
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"
-  "CR": None,               # Optional container registry URL
-  "CR_USER": None,          # Optional registry username
-  "CR_PASSWORD": None,      # Optional registry password or token
+  "CR_DATA": {              # dict of container registry data
+    "SERVER": 'docker.io',  # Optional container registry URL
+    "USERNAME": None,       # Optional registry username
+    "PASSWORD": None,       # Optional registry password or token
+  },
   "ENV": {},                # dict of env vars for the container
   "DYNAMIC_ENV": {},        # dict of dynamic env vars for the container
   "PORT": None,             # internal container port if it's a web app (int)
@@ -111,6 +114,8 @@ class ContainerAppRunnerPlugin(
     Displays the current resource limits for the container.
     This is a placeholder method and can be expanded as needed.
     """
+    cr_server, cr_username, cr_password = self._get_cr_data()
+    
     msg = "Container info:\n"
     msg += f"  Container ID:     {self.container_id}\n"
     msg += f"  Start Time:       {self.time_to_str(self.container_start_time)}\n"
@@ -118,9 +123,9 @@ class ContainerAppRunnerPlugin(
     msg += f"  Resource GPU:     {self._gpu_limit}\n"
     msg += f"  Resource Mem:     {self._mem_limit}\n"
     msg += f"  Target Image:     {self.cfg_image}\n"
-    msg += f"  CR:               {self.cfg_cr}\n"
-    msg += f"  CR User:          {self.cfg_cr_user}\n"
-    msg += f"  CR Pass:          {'*' * len(self.cfg_cr_password) if self.cfg_cr_password else 'None'}\n"
+    msg += f"  CR:               {cr_server}\n"
+    msg += f"  CR User:          {cr_username}\n"
+    msg += f"  CR Pass:          {'*' * len(cr_password) if cr_password else 'None'}\n"
     msg += f"  Env Vars:         {self.cfg_env}\n"
     msg += f"  Cont. Port:       {self.cfg_port}\n"
     msg += f"  Restart:          {self.cfg_restart_policy}\n"

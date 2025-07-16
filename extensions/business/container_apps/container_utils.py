@@ -10,24 +10,39 @@ class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
   
+  def _get_cr_data(self):
+    """
+    Helper method to extract container registry data from configuration.
+    
+    Returns:
+        tuple: (cr_server, cr_username, cr_password) extracted from cfg_cr_data
+    """
+    cr_data = getattr(self, 'cfg_cr_data', {})
+    cr_server = cr_data.get('SERVER')
+    cr_username = cr_data.get('USERNAME')
+    cr_password = cr_data.get('PASSWORD')
+    return cr_server, cr_username, cr_password
+  
   def _container_maybe_login(self):
     # Login to container registry if provided
-    if self.cfg_cr and self.cfg_cr_user and self.cfg_cr_password:
+    cr_server, cr_username, cr_password = self._get_cr_data()
+    
+    if cr_server and cr_username and cr_password:
       login_cmd = [
         self.cli_tool, "login",
-        str(self.cfg_cr),
-        "-u", str(self.cfg_cr_user),
-        "-p", str(self.cfg_cr_password),
+        str(cr_server),
+        "-u", str(cr_username),
+        "-p", str(cr_password),
       ]
       try:
-        self.P(f"Logging in to registry {self.cfg_cr} as {self.cfg_cr_user} ...")
+        self.P(f"Logging in to registry {cr_server} as {cr_username} ...")
         resp = subprocess.run(login_cmd, capture_output=True, check=True)
-        self.P(f"Logged in to registry {self.cfg_cr} as {self.cfg_cr_user}.")
+        self.P(f"Logged in to registry {cr_server} as {cr_username}.")
       except subprocess.CalledProcessError as e:
         err_msg = e.stderr.decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Registry login failed for {self.cfg_cr}: {err_msg}")
+        raise RuntimeError(f"Registry login failed for {cr_server}: {err_msg}")
     else:
-      self.P(f"CR Login missing: {self.cfg_cr_user} / {self.cfg_cr_password} @ {self.cfg_cr}")
+      self.P(f"CR Login missing: {cr_username} / {cr_password} @ {cr_server}")
     return    
 
 
@@ -37,9 +52,12 @@ class _ContainerUtilsMixin:
     """
     full_ref = str(self.cfg_image)
     cmd = [self.cli_tool, "pull", full_ref]
-    if self.cfg_cr and not str(self.cfg_image).startswith(self.cfg_cr):
+    
+    cr_server, _, _ = self._get_cr_data()
+    
+    if cr_server and not str(self.cfg_image).startswith(cr_server):
       # If image doesn't have the registry prefix, prepend it
-      full_ref = f"{self.cfg_cr.rstrip('/')}/{self.cfg_image}"
+      full_ref = f"{cr_server.rstrip('/')}/{self.cfg_image}"
       cmd = [self.cli_tool, "pull", full_ref]
     self.P(f"Pulling image {full_ref} ...")
     try:
@@ -101,8 +119,10 @@ class _ContainerUtilsMixin:
 
     # Possibly prefix the registry to the image reference
     image_ref = str(self.cfg_image)
-    if self.cfg_cr and not image_ref.startswith(str(self.cfg_cr)):
-      image_ref = f"{self.cfg_cr.rstrip('/')}/{image_ref}"
+    cr_server, _, _ = self._get_cr_data()
+    
+    if cr_server and not image_ref.startswith(str(cr_server)):
+      image_ref = f"{cr_server.rstrip('/')}/{image_ref}"
       
     cmd.append(image_ref)
     
