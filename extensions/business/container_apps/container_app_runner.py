@@ -26,9 +26,9 @@ import socket
 import subprocess
 import time
 
-# 
-from naeural_core.business.base import BasePluginExecutor as BasePlugin  # provides all the self.api_call methods
-from naeural_core.business.mixins_libs.ngrok_mixin import _NgrokMixinPlugin # provides ngrok support
+# from naeural_core.business.base import BasePluginExecutor as BasePlugin  # provides all the self.api_call methods
+from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
+# from naeural_core.business.mixins_libs.ngrok_mixin import _NgrokMixinPlugin # provides ngrok support
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
@@ -95,7 +95,6 @@ _CONFIG = {
 
 
 class ContainerAppRunnerPlugin(
-  _NgrokMixinPlugin, 
   BasePlugin,
   _ContainerUtilsMixin,
 ):
