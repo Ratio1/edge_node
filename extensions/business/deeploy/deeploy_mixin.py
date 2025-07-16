@@ -193,11 +193,7 @@ class _DeeployMixin:
       suitable_nodes = []
 
       for addr, value in network_nodes.items():
-        # FIXME
-        # if value.get('trusted') is False or value.get('is_supervisor') is True:
-        #   continue
-        if value.get('is_supervisor') is True:
-          self.Pd(f"Node {addr} is an oracle. Skipping...")
+        if value.get('trusted') is False or value.get('is_supervisor') is True:
           continue
 
         if node_req_res:
