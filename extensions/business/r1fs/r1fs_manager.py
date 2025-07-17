@@ -1,16 +1,15 @@
-from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
+from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
 __VER__ = '0.2.2'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'PORT': 31235,
+  'PORT': 31235, # dynamic
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
   'R1FS_VERBOSE' : True,
-  
   
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -118,11 +117,11 @@ class R1fsManagerPlugin(BasePlugin):
 
 
   # @BasePlugin.endpoint(method="post", require_token=False)
-  # def add_file(self, file, fn=None: str, secret: str=''):   # first parameter must be named token
+  # def add_file(self, file, fn: str = None, secret: str = None):   # first parameter must be named token
   #   """
   #   """
   #   self.P(f"Adding data={file} to R1FS, secret='{secret}'", color='g')
-  #   cid = self.r1fs.add_file(data=data, fn=fn, secret=secret)
+  #   cid = self.r1fs.add_file(data=file, fn=fn, secret=secret)
   #   self.P(f"Cid='{cid}'")
   #
   #   response_data = {
@@ -139,10 +138,9 @@ class R1fsManagerPlugin(BasePlugin):
     """
     """
     self.P(f"New base64 File={file_base64_str}")
-    self.P(f"New base64 File={file_base64_str}")
-    self.P(f"New base64 File={file_base64_str}")
-    # bytes_data = self.base64_to_bytes(file_base64_str)
-    # self.P(f"bytes_data={bytes_data}")
+    if not filename:
+      filename = self.r1fs._get_unique_or_complete_upload_name()
+
     fn = self.diskapi_save_bytes_to_output(data=file_base64_str, filename=filename, from_base64=True)
     self.P(f"File saved to {fn}")
     self.P("Saving to R1FS")
