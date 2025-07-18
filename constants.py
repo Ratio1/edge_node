@@ -81,7 +81,11 @@ ADMIN_PIPELINE = {
     "TUNNEL_ENGINE": "$EE_TUNNEL_ENGINE",
     "PROCESS_DELAY": 0,
   },
-  
+
+  'R1FS_MANAGER': {
+    "PROCESS_DELAY": 0,
+    'TUNNEL_ENGINE_ENABLED': False,
+  }
 }
 
 
