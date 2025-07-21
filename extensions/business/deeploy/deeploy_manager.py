@@ -62,28 +62,6 @@ class DeeployManagerPlugin(
     )        
     return
   
-  def _check_and_maybe_convert_address(self, node_addr, raise_if_error=True):
-    result = None
-    if node_addr.startswith("0x"):
-      is_eth = self.bc.is_valid_eth_address(node_addr)
-      if is_eth:
-        result = self.bc.eth_addr_to_internal_addr(node_addr)
-      else:
-        is_internal = self.bc.is_valid_internal_address(node_addr)
-        if is_internal:
-          result = node_addr
-        #endif
-      #endif
-    #endif
-    if result is None:
-      msg = f"{DEEPLOY_ERRORS.NODES4}: Invalid node address: {node_addr}"
-      if raise_if_error:
-        raise ValueError(msg)
-      else:
-        self.P(msg, color='r')
-    return result
-  
-  
   def __handle_error(self, exc, request, extra_error_code=DEEPLOY_ERRORS.GENERIC):
     """
     Handle the error and return a response.
