@@ -299,8 +299,8 @@ class _DeeployTargetNodesMixin:
 
     sorted_nodes = sorted(nodes_that_fit,
                           key=lambda kv: (
-                            network_nodes[kv]["SCORE"],
-                            -nodes_that_fit[kv]
+                            -network_nodes[kv]["SCORE"],
+                            nodes_that_fit[kv]
                           ))
 
     self.Pd(f"Sorted Nodes: {self.json_dumps(sorted_nodes, indent=2)}.")
