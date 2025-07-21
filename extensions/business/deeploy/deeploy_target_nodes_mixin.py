@@ -275,11 +275,17 @@ class _DeeployTargetNodesMixin:
     # If target_nodes_count is set, we will select the top nodes based on their scores
     network_nodes = self.netmon.network_nodes_status()
 
-    # non_supervisor_nodes = [k for k, v in network_nodes.items() if
-    #                         v.get('is_supervisor') is False and v.get('trusted', False)]
 
-    non_supervisor_nodes = [k for k, v in network_nodes.items() if
-                            v.get('is_supervisor') is False]
+    non_supervisor_nodes = []
+    for k, v in network_nodes.items():
+      ai_addr = f"0xai_{addr}"
+
+      addr = self._check_and_maybe_convert_address(ai_addr)
+      is_online = self.netmon.network_node_is_online(addr)
+      if v.get('is_supervisor') is True or not is_online:
+      # if v.get('is_supervisor') is True or not v.get('trusted', False) or not is_online:
+        continue
+      non_supervisor_nodes.append(k)
 
     self.Pd(f"Network nodes: {self.json_dumps(network_nodes)}")
     self.Pd(f"Non supervisor Network nodes: {self.json_dumps(non_supervisor_nodes)}")
@@ -305,23 +311,11 @@ class _DeeployTargetNodesMixin:
 
     self.Pd(f"Sorted Nodes: {self.json_dumps(sorted_nodes, indent=2)}.")
 
-    # DO A CHECK IF NODES ARE ONLINE
-    online_sorted_nodes = []
-    for node in sorted_nodes:
-      ai_addr = f"0xai_{node}"
-      is_online = self.netmon.network_node_is_online(ai_addr)
-      if is_online:
-        online_sorted_nodes.append(ai_addr)
-      else:
-        self.Pd(f"Node {ai_addr} is not online. Skipping...", color='y')
-
-    self.Pd(f"online_sorted_nodes = {self.json_dumps(online_sorted_nodes)}")
-
-    if len(online_sorted_nodes) < inputs.target_nodes_count:
-      msg = f"{DEEPLOY_ERRORS.NODES5}: Not enough online nodes available. Required: {inputs.target_nodes_count}, Available: {len(online_sorted_nodes)}"
+    if len(sorted_nodes) < inputs.target_nodes_count:
+      msg = f"{DEEPLOY_ERRORS.NODES5}: Not enough online nodes available. Required: {inputs.target_nodes_count}, Available: {len(sorted_nodes)}"
       raise ValueError(msg)
 
-    nodes_to_run = online_sorted_nodes[:inputs.target_nodes_count]
+    nodes_to_run = sorted_nodes[:inputs.target_nodes_count]
     self.Pd(f"Nodes to run: {nodes_to_run}")
 
     return nodes_to_run
