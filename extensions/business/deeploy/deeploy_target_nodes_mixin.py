@@ -23,35 +23,6 @@ class _DeeployTargetNodesMixin:
       self.P(s, *args, **kwargs)
     return
 
-  def _get_online_apps(self):
-    """
-    if self.cfg_deeploy_verbose:
-      full_data = self.netmon.network_known_nodes()
-      self.Pd(f"Full data:\n{self.json_dumps(full_data, indent=2)}")
-    pipelines = self.netmon.network_known_configs()
-    non_admin_pipelines = {
-      node : [x for x in pipelines[node] if x['NAME'].lower() != 'admin_pipeline']
-      for node in pipelines
-    }
-    result = {
-      'configs': non_admin_pipelines,
-      'details': self.netmon.network_known_apps(),
-    }
-
-    """
-    result = self.netmon.network_known_apps()
-    return result
-
-
-  def _get_online_pipelines(self, nodes):
-    """
-    Returns online pipelines for each node.
-    """
-    result = {}
-    for addr in nodes:
-      result[addr] = self.netmon.network_node_pipelines(addr)
-    return result
-
 
   def _parse_memory(self, mem):
     """
@@ -223,11 +194,11 @@ class _DeeployTargetNodesMixin:
       # Check if the node has enough resources
       has_failed = False
       if used_cpu > node_resources['cpu']:
-        self.Pd(f"Node {addr} has not enough CPU cores. used_cpu={used_cpu} > node_resources['cpu']={node_resources['cpu']}")
+        self.Pd(f"Node {addr} has not enough CPU cores. used_cpu ({used_cpu}) > node_cpu ({node_resources['cpu']})")
         has_failed = True
 
       if used_memory > node_resources['memory']:
-        self.Pd(f"Node {addr} has not enough RAM. used_memory={used_memory} > node_resources['memory']={node_resources['memory']}")
+        self.Pd(f"Node {addr} has not enough RAM. used_memory ({used_memory}) > node_memory ({node_resources['memory']})")
         has_failed = True
 
       if has_failed:

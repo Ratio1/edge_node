@@ -6,6 +6,7 @@ Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 from naeural_core.main.net_mon import NetMonCt
 
 from .deeploy_mixin import _DeeployMixin
+from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
@@ -16,7 +17,8 @@ from .deeploy_const import (
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
 
-__VER__ = '0.5.1'
+__VER__ = '0.6.0'
+
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -38,7 +40,8 @@ _CONFIG = {
 
 class DeeployManagerPlugin(
   BasePlugin,
-  _DeeployMixin
+  _DeeployMixin,
+  _DeeployTargetNodesMixin
   ):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
@@ -179,9 +182,15 @@ class DeeployManagerPlugin(
       app_type = inputs.pipeline_input_type
       app_id = (app_alias.lower()[:8] + "_" + self.uuid(7)).lower()
 
+      nodes = self._check_nodes_availability(inputs)
+
       dct_status, str_status = self.check_and_deploy_pipelines(
-        sender=sender, inputs=inputs, app_id=app_id, 
-        app_alias=app_alias, app_type=app_type
+        sender=sender,
+        inputs=inputs,
+        app_id=app_id,
+        app_alias=app_alias,
+        app_type=app_type,
+        nodes=nodes
       )
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
@@ -418,4 +427,23 @@ class DeeployManagerPlugin(
     response = self._get_response({
       **result
     })
-    return response  
+    return response
+
+  def _get_online_apps(self):
+    """
+    if self.cfg_deeploy_verbose:
+      full_data = self.netmon.network_known_nodes()
+      self.Pd(f"Full data:\n{self.json_dumps(full_data, indent=2)}")
+    pipelines = self.netmon.network_known_configs()
+    non_admin_pipelines = {
+      node : [x for x in pipelines[node] if x['NAME'].lower() != 'admin_pipeline']
+      for node in pipelines
+    }
+    result = {
+      'configs': non_admin_pipelines,
+      'details': self.netmon.network_known_apps(),
+    }
+
+    """
+    result = self.netmon.network_known_apps()
+    return result

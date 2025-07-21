@@ -10,9 +10,7 @@ DEEPLOY_DEBUG = True
 
 MESSAGE_PREFIX = "Please sign this message for Deeploy: "
 
-class _DeeployMixin(
-  _DeeployTargetNodesMixin
-):
+class _DeeployMixin:
   def __init__(self):
     super(_DeeployMixin, self).__init__()    
     return
@@ -265,12 +263,11 @@ class _DeeployMixin(
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type):
+  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, nodes):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
     # Phase 1: Check if nodes are available
-    nodes = self._check_nodes_availability(inputs)
 
     if len(nodes) == 0:
       msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
