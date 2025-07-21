@@ -98,7 +98,7 @@ class _DeeployTargetNodesMixin:
     suitable_nodes = {}
     for addr in nodes:
 
-      ai_addr = f"0xai_{addr}"
+      ai_addr = self.bc.maybe_add_prefix(addr)
       current_node_pipelines = apps.get(ai_addr)
 
       # if we didn't manage to get node pipelines, skip it.
@@ -163,7 +163,7 @@ class _DeeployTargetNodesMixin:
     required_mem_bytes = self._parse_memory(required_mem)
 
     for addr, node_resources in nodes_with_resources.items():
-      ai_addr = f"0xai_{addr}"
+      ai_addr = self.bc.maybe_add_prefix(addr)
 
       used_container_resources = []
       last_deeployment_ts = 0
@@ -179,7 +179,7 @@ class _DeeployTargetNodesMixin:
           continue
 
         pipeline_plugins = pipeline_data.get(NetMonCt.PLUGINS, [])
-        has_different_signatures = not all(sign == CONTAINER_APP_RUNNER_SIGNATURE for sign in pipeline_plugins.keys())
+        has_different_signatures = not all(sign == CONTAINER_APP_RUNNER_SIGNATURE for sign in pipeline_plugins.keys()) #FIX CAR OR WORKER APP RUNNER
 
         if has_different_signatures:
           self.Pd(f"Node {addr} has pipeline '{pipeline_name}' with Native Apps signature. Skipping...")
@@ -290,10 +290,11 @@ class _DeeployTargetNodesMixin:
 
     non_supervisor_nodes = []
     for addr, value in network_nodes.items():
-      ai_addr = f"0xai_{addr}"
+      ai_addr = self.bc.maybe_add_prefix(addr)
 
       is_online = self.netmon.network_node_is_online(ai_addr)
       if value.get('is_supervisor') is True or not is_online:
+      # FIXME: Disabled for now, as the most of the nodes are are marked as non-trusted.
       # if value.get('is_supervisor') is True or not value.get('trusted', False) or not is_online:
         continue
       non_supervisor_nodes.append(addr)
@@ -307,7 +308,7 @@ class _DeeployTargetNodesMixin:
     apps = self._get_online_apps()
     nodes_that_fit = {}
 
-    if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
+    if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE: # if plugin in ['CONTAINER APP RUNNER' || WORKER APP RUNNER].
       nodes_that_fit = self.__find_suitable_nodes_for_container_app(nodes_with_resources=suitable_nodes_with_resources,
                                                                     container_requested_resources=required_resources,
                                                                     apps=apps)
@@ -316,11 +317,12 @@ class _DeeployTargetNodesMixin:
 
     self.Pd(f"nodes_that_fit={self.json_dumps(nodes_that_fit)}")
 
-    sorted_nodes = sorted(nodes_that_fit,
-                          key=lambda kv: (
-                            -network_nodes[kv]["SCORE"],
-                            nodes_that_fit[kv]
-                          ))
+    sorted_nodes = sorted(
+      nodes_that_fit,
+      key=lambda kv: (
+        -network_nodes[kv]["SCORE"],
+        nodes_that_fit[kv]
+      ))
 
     self.Pd(f"Sorted Nodes: {self.json_dumps(sorted_nodes, indent=2)}.")
 
