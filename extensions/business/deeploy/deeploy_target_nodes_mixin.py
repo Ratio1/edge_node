@@ -147,8 +147,20 @@ class _DeeployTargetNodesMixin:
     container_resources = selected_instance.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
     return container_resources
 
-  def __find_suitable_nodes_for_container_app(self, nodes_with_resources, apps):
+  def __find_suitable_nodes_for_container_app(self, nodes_with_resources, container_requested_resources, apps):
+    """
+    Find suitable nodes for a container app deployment.
+    Args:
+        nodes_with_resources (dict): Dictionary with node addresses as keys and their resources as values
+        apps (dict): Dictionary with node addresses as keys and their apps as values
+    Returns:
+        dict: Dictionary with node addresses (without 0xai_ part) as keys and their last deployment timestamp as values
+    """
     suitable_nodes = {}
+
+    required_cpu = container_requested_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
+    required_mem = container_requested_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
+    required_mem_bytes = self._parse_memory(required_mem)
 
     for addr, node_resources in nodes_with_resources.items():
       ai_addr = f"0xai_{addr}"
@@ -194,7 +206,7 @@ class _DeeployTargetNodesMixin:
 
       if skip_node:
         continue
-
+      self.Pd(f"Node {addr} has {self.json_dumps(used_container_resources)} used container resources.")
       # Sum up resources used by node.
       used_cpu = 0
       used_memory = 0
@@ -203,6 +215,10 @@ class _DeeployTargetNodesMixin:
         memory = res.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
         used_cpu += cpu
         used_memory += self._parse_memory(memory)
+
+      # Add the required resources for the new container app.
+      used_cpu += required_cpu
+      used_memory += required_mem_bytes
 
       # Check if the node has enough resources
       has_failed = False
@@ -215,7 +231,7 @@ class _DeeployTargetNodesMixin:
         has_failed = True
 
       if has_failed:
-        self.Pd(f"Node {addr} has not enough resources for the container app. Skipping...", color='y')
+        self.Pd(f"Node {addr} has not enough available resources for the container app. Skipping...", color='y')
         continue
 
       suitable_nodes[addr] = last_deeployment_ts
@@ -263,9 +279,6 @@ class _DeeployTargetNodesMixin:
   def _find_nodes_for_deeployment(self, inputs):
     # Get required resources from the request
     required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
-    required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
-    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
-    required_mem_bytes = self._parse_memory(required_mem)
 
 
     if not inputs.target_nodes_count:
@@ -275,29 +288,29 @@ class _DeeployTargetNodesMixin:
     # If target_nodes_count is set, we will select the top nodes based on their scores
     network_nodes = self.netmon.network_nodes_status()
 
-
     non_supervisor_nodes = []
-    for k, v in network_nodes.items():
+    for addr, value in network_nodes.items():
       ai_addr = f"0xai_{addr}"
 
-      addr = self._check_and_maybe_convert_address(ai_addr)
-      is_online = self.netmon.network_node_is_online(addr)
-      if v.get('is_supervisor') is True or not is_online:
-      # if v.get('is_supervisor') is True or not v.get('trusted', False) or not is_online:
+      is_online = self.netmon.network_node_is_online(ai_addr)
+      if value.get('is_supervisor') is True or not is_online:
+      # if value.get('is_supervisor') is True or not value.get('trusted', False) or not is_online:
         continue
-      non_supervisor_nodes.append(k)
+      non_supervisor_nodes.append(addr)
 
     self.Pd(f"Network nodes: {self.json_dumps(network_nodes)}")
     self.Pd(f"Non supervisor Network nodes: {self.json_dumps(non_supervisor_nodes)}")
 
     suitable_nodes_with_resources = self.__check_nodes_required_resources_and_extract_resources(
       nodes=non_supervisor_nodes, inputs=inputs)
-
+    self.Pd(f"Suitable nodes with resources: {self.json_dumps(suitable_nodes_with_resources)}")
     apps = self._get_online_apps()
     nodes_that_fit = {}
 
     if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
-      nodes_that_fit = self.__find_suitable_nodes_for_container_app(nodes_with_resources=suitable_nodes_with_resources, apps=apps)
+      nodes_that_fit = self.__find_suitable_nodes_for_container_app(nodes_with_resources=suitable_nodes_with_resources,
+                                                                    container_requested_resources=required_resources,
+                                                                    apps=apps)
     else:
       nodes_that_fit = self.__find_nodes_without_deeployed_apps(suitable_nodes_with_resources, apps)
 
