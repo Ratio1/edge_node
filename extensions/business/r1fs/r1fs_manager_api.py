@@ -116,22 +116,66 @@ class R1fsManagerApiPlugin(BasePlugin):
     return response
 
 
-  # @BasePlugin.endpoint(method="post", require_token=False)
-  # def add_file(self, file, fn: str = None, secret: str = None):   # first parameter must be named token
-  #   """
-  #   """
-  #   self.P(f"Adding data={file} to R1FS, secret='{secret}'", color='g')
-  #   cid = self.r1fs.add_file(data=file, fn=fn, secret=secret)
-  #   self.P(f"Cid='{cid}'")
+  @BasePlugin.endpoint(method="post", require_token=False)
+  async def add_file(self, file: str, fn: str = None, secret: str = None):
+    """
+    """
+    # folder_name = self.r1fs._get_unique_or_complete_upload_name()
+    fn = self.r1fs._get_unique_or_complete_upload_name()
+
+    # 1. Stream into RAM
+    data = await self.__read_upload_to_memory(file)
+
+    res = self.diskapi_save_bytes_to_output(data=data, filename=fn, from_base64=False)
+
+    self.Pd(f"File saved to {res}", color='g')
+    #
+    # self.P(f"Adding data={file} to R1FS, secret='{secret}'", color='g')
+    # cid = self.r1fs.add_file(data=file, fn=fn, secret=secret)
+    # self.P(f"Cid='{cid}'")
+
+    response_data = {
+      "cid" : res
+    }
+
+    response = self.__get_response({
+      **response_data
+    })
+    return response
+
+
+  @BasePlugin.endpoint(method="get", require_token=False)
+  def get_file(self, cid: str, secret: str = None):
+    """
+    """
+    self.P(f"Retrieving file with CID='{cid}', secret='{secret}'...")
+
+    fn = self.r1fs.get_file(cid=cid, secret=secret)
+    self.P(f"fn: {fn}")
+    file_data = self.diskapi_load_r1fs_file(fn, verbose=True, to_base64=True)
+    self.P(f"file_data={file_data}")
+    data = {
+      "file_data" : file_data
+    }
+
+    response = self.__get_response({
+      **data
+    })
+    return response
+
+
+  # @app.get("/get_file/{filename}")
+  # async def get_file(filename: str):
+  #   """Stream the requested *filename* back to the caller."""
+  #   file_path = DOWNLOADS_DIR / filename
+  #   if not file_path.is_file():
+  #     raise HTTPException(404, detail="File not found")
   #
-  #   response_data = {
-  #     "cid" : cid
-  #   }
-  #
-  #   response = self.__get_response({
-  #     **response_data
-  #   })
-  #   return response
+  #   return FileResponse(
+  #     file_path,
+  #     media_type="application/octet-stream",
+  #     filename=filename,
+  #   )
 
   @BasePlugin.endpoint(method="post", require_token=False)
   def add_file_base64(self, file_base64_str: str, filename: str = None, secret: str = None):  # first parameter must be named token
@@ -175,24 +219,6 @@ class R1fsManagerApiPlugin(BasePlugin):
     })
     return response
 
-  @BasePlugin.endpoint(method="get", require_token=False)
-  def get_file(self, cid: str, secret: str = None):
-    """
-    """
-    self.P(f"Retrieving file with CID='{cid}', secret='{secret}'...")
-
-    fn = self.r1fs.get_file(cid=cid, secret=secret)
-    self.P(f"fn: {fn}")
-    file_data = self.diskapi_load_r1fs_file(fn, verbose=True, to_base64=True)
-    self.P(f"file_data={file_data}")
-    data = {
-      "file_data" : file_data
-    }
-
-    response = self.__get_response({
-      **data
-    })
-    return response
 
   @BasePlugin.endpoint(method="get", require_token=False)
   def get_yaml(self, cid: str, secret: str = None):
@@ -306,3 +332,13 @@ class R1fsManagerApiPlugin(BasePlugin):
     })
     return response
 
+  async def __read_upload_to_memory(self, upload) -> bytes:
+    """Read *upload* in chunks into a bytes object (bytearray under the hood)."""
+    CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB
+    buffer = bytearray()
+    while True:
+      chunk = await upload.read(CHUNK_SIZE)
+      if not chunk:
+        break
+      buffer.extend(chunk)
+    return bytes(buffer)
