@@ -18,18 +18,18 @@ _CONFIG = {
 
 DEFAULT_CHAINSTORE_KEY = 'r1fs'
 
-class R1fsManagerPlugin(BasePlugin):
+class R1fsManagerApiPlugin(BasePlugin):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for R1FS.
   """
   CONFIG = _CONFIG
 
   def __init__(self, **kwargs):
-    super(R1fsManagerPlugin, self).__init__(**kwargs)
+    super(R1fsManagerApiPlugin, self).__init__(**kwargs)
     return
 
   def on_init(self):
-    super(R1fsManagerPlugin, self).on_init()
+    super(R1fsManagerApiPlugin, self).on_init()
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
     self.P("#2323123")
