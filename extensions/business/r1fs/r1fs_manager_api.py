@@ -117,7 +117,7 @@ class R1fsManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  async def add_file(self, file: str, fn: str = None, secret: str = None):
+  async def add_file(self, file: str, filename: str = None, secret: str = None):
     """
     """
     # folder_name = self.r1fs._get_unique_or_complete_upload_name()
@@ -152,10 +152,11 @@ class R1fsManagerApiPlugin(BasePlugin):
 
     fn = self.r1fs.get_file(cid=cid, secret=secret)
     self.P(f"fn: {fn}")
-    file_data = self.diskapi_load_r1fs_file(fn, verbose=True, to_base64=True)
-    self.P(f"file_data={file_data}")
+    file = self.diskapi_load_r1fs_file(fn, verbose=True, to_base64=True)
+    filename = file.split('/')[-1] if file else None
+    self.P(f"file={file}")
     data = {
-      "file_data" : file_data
+      "file" : file, "filename" : filename
     }
 
     response = self.__get_response({
@@ -194,6 +195,27 @@ class R1fsManagerApiPlugin(BasePlugin):
 
     response_data = {
       "cid" : cid
+    }
+
+    response = self.__get_response({
+      **response_data
+    })
+    return response
+
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def get_file_base64(self, cid: str, secret: str = None):  # first parameter must be named token
+    """
+    """
+    self.P(f"Trying to download file -> {cid}")
+    file = self.r1fs.get_file(cid=cid, secret=secret)
+    filename = file.split('/')[-1] if file else None
+    self.P(f"File retrieved: {file}")
+    file_base64 = self.diskapi_load_r1fs_file(file, verbose=True, to_base64=True)
+    self.P("file retrieved: {}".format(file_base64))
+
+    response_data = {
+      "file_base64_str": file_base64,
+      "filename": filename
     }
 
     response = self.__get_response({
