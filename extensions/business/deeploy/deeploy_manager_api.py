@@ -38,7 +38,7 @@ _CONFIG = {
 
 
 
-class DeeployManagerPlugin(
+class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
   _DeeployTargetNodesMixin
@@ -50,12 +50,12 @@ class DeeployManagerPlugin(
   
 
   def __init__(self, **kwargs):
-    super(DeeployManagerPlugin, self).__init__(**kwargs)
+    super(DeeployManagerApiPlugin, self).__init__(**kwargs)
     return
 
 
   def on_init(self):
-    super(DeeployManagerPlugin, self).on_init()
+    super(DeeployManagerApiPlugin, self).on_init()
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
     # supported_evm_types = self.bc.eth_types

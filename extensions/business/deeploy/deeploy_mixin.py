@@ -1,10 +1,8 @@
 from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_NODE_RESOURCES, DEFAULT_CONTAINER_RESOURCES, DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, \
-  CONTAINER_APP_RUNNER_SIGNATURE
-from extensions.business.deeploy.deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
+from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
+  DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA
 
 DEEPLOY_DEBUG = True
 

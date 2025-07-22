@@ -1,10 +1,8 @@
 from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_NODE_RESOURCES, DEFAULT_CONTAINER_RESOURCES, DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, \
-  CONTAINER_APP_RUNNER_SIGNATURE
+  DEFAULT_CONTAINER_RESOURCES,  CONTAINER_APP_RUNNER_SIGNATURE
 from naeural_core import constants as ct
-from ratio1.const.plugins.deeploy_const import DEFAULT_RESOURCES
 
 DEEPLOY_DEBUG = True
 
