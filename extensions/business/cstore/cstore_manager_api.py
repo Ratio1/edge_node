@@ -1,6 +1,8 @@
-from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
+from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
 __VER__ = '0.2.2'
+
+CHAINSTORE_MANAGER_API_PLUGIN_DEBUG = True
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -18,18 +20,18 @@ _CONFIG = {
 }
 
 
-class CstoreManagerPlugin(BasePlugin):
+class CstoreManagerApiPlugin(BasePlugin):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
   """
   CONFIG = _CONFIG
 
   def __init__(self, **kwargs):
-    super(CstoreManagerPlugin, self).__init__(**kwargs)
+    super(CstoreManagerApiPlugin, self).__init__(**kwargs)
     return
 
   def on_init(self):
-    super(CstoreManagerPlugin, self).on_init()
+    super(CstoreManagerApiPlugin, self).on_init()
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
     self.P("Started {} plugin on {} / {}".format(
@@ -126,7 +128,7 @@ class CstoreManagerPlugin(BasePlugin):
     if token not in ['admin']:
       return "Unauthorized token"
     
-    value = self.chainstore_get(key=cstore_key, debug=True)
+    value = self.chainstore_get(key=cstore_key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
     
     data = {
       cstore_key : value
@@ -137,25 +139,96 @@ class CstoreManagerPlugin(BasePlugin):
     })
     return response
 
-  @BasePlugin.endpoint(method="get", require_token=True) 
-  def set_value(self, token, cstore_key : str, cstore_value : str):   # first parameter must be named token
+
+  @BasePlugin.endpoint(method="post", require_token=True)
+  def set_value(self, token: str, cstore_key : str, chainstore_value : str):   # first parameter must be named token
     """
     """
     
     if token not in ['admin']:
       return "Unauthorized token"
     
-    value = self.chainstore_set(
+    chainstore_value = self.chainstore_set(
       key=cstore_key, 
-      value=cstore_value,
-      debug=True
+      value=chainstore_value,
+      debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG
     )
     
     data = {
-      cstore_key : value
+      cstore_key : chainstore_value
     }
     
     response = self.__get_response({
       **data
     })
     return response
+
+
+  @BasePlugin.endpoint(method="post", require_token=True)
+  def hset(self, token, hkey: str, key: str, value : str):  # first parameter must be named token
+    """
+    """
+
+    if token not in ['admin']:
+      return "Unauthorized token"
+
+    value = self.chainstore_hset(
+      hkey=hkey,
+      key=key,
+      value=value,
+      debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG
+    )
+
+    data = {
+      hkey: {
+        key: value
+      },
+    }
+
+    response = self.__get_response({
+      **data
+    })
+    return response
+
+
+  @BasePlugin.endpoint(method="get", require_token=True)
+  def hget(self, token, hkey: str, key: str):  # first parameter must be named token
+    """
+    """
+
+    if token not in ['admin']:
+      return "Unauthorized token"
+
+    value = self.chainstore_hget(hkey=hkey, key=key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
+
+    data = {
+      hkey: {
+        key: value
+      }
+    }
+
+    response = self.__get_response({
+      **data
+    })
+    return response
+
+
+  @BasePlugin.endpoint(method="get", require_token=True)
+  def hgetall(self, token, hkey: str):  # first parameter must be named token
+    """
+    """
+
+    if token not in ['admin']:
+      return "Unauthorized token"
+
+    value = self.chainstore_hgetall(hkey=hkey, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
+
+    data = {
+      hkey: value
+    }
+
+    response = self.__get_response({
+      **data
+    })
+    return response
+
