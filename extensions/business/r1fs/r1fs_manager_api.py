@@ -16,7 +16,7 @@ _CONFIG = {
   },
 }
 
-DEFAULT_CHAINSTORE_KEY = 'r1fs'
+DEFAULT_TOKENS = ['admin']
 
 class R1fsManagerApiPlugin(BasePlugin):
   """
@@ -32,7 +32,6 @@ class R1fsManagerApiPlugin(BasePlugin):
     super(R1fsManagerApiPlugin, self).on_init()
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
-    self.P("#2323123")
     self.P("Started {} plugin on {} / {}".format(
       self.__class__.__name__, my_address, my_eth_address,
     ))
@@ -94,94 +93,73 @@ class R1fsManagerApiPlugin(BasePlugin):
     dct_data['server_uptime'] = str(self.timedelta(seconds=int(self.time_alive)))
     self.__sign(dct_data) # add the signature over full data
     return dct_data
-  
 
 
-  @BasePlugin.endpoint(method="get", require_token=False) 
-  def get_status(self, chainstore_key=DEFAULT_CHAINSTORE_KEY):   # /get_status
+  @BasePlugin.endpoint(method="get", require_token=False)
+  def get_status(self):   # /get_status
     """
     """
+    # RETURN INFO HERE
     self.P("Getting all", color='g')
-    hset_dump = self.chainstore_hgetall(chainstore_key)
+    hset_dump = self.chainstore_hgetall('r1fs')
 
     self.P(f"dump: {hset_dump}", color='g')
 
     data = {
       'keys' : hset_dump
     }
-    
-    response = self.__get_response({
-      **data
-    })
-    return response
+
+    return data
 
 
-  @BasePlugin.endpoint(method="post", require_token=False)
-  async def add_file(self, file: str, filename: str = None, secret: str = None):
-    """
-    """
-    # folder_name = self.r1fs._get_unique_or_complete_upload_name()
-    fn = self.r1fs._get_unique_or_complete_upload_name()
+  @BasePlugin.endpoint(method="post", streaming_type="upload", require_token=True)
+  def add_file(self, token: str, file_path: str, body: dict):
+    """Process the uploaded file located at file_path"""
 
-    # 1. Stream into RAM
-    data = await self.__read_upload_to_memory(file)
+    self.P(f"Starting upload_large_file with uploaded file at: {file_path}")
+    self.P(f"body: {body}")
 
-    res = self.diskapi_save_bytes_to_output(data=data, filename=fn, from_base64=False)
+    if not token or token not in DEFAULT_TOKENS:
+      self.P(f"Invalid token: {token}", color='r')
+      return {"error": "Invalid token"}
 
-    self.Pd(f"File saved to {res}", color='g')
-    #
-    # self.P(f"Adding data={file} to R1FS, secret='{secret}'", color='g')
-    # cid = self.r1fs.add_file(data=file, fn=fn, secret=secret)
-    # self.P(f"Cid='{cid}'")
+    secret = body.get('secret', None)
 
-    response_data = {
-      "cid" : res
+    cid = self.r1fs.add_file(file_path=file_path, secret=secret)
+
+    data = {
+      "message": f"File uploaded successfully",
+      "cid": cid
     }
 
-    response = self.__get_response({
-      **response_data
-    })
-    return response
+    return data
 
 
-  @BasePlugin.endpoint(method="get", require_token=False)
-  def get_file(self, cid: str, secret: str = None):
+  @BasePlugin.endpoint(method="get", streaming_type="download", require_token=True)
+  def get_file(self, token: str, cid: str, secret: str = None):
     """
     """
     self.P(f"Retrieving file with CID='{cid}', secret='{secret}'...")
 
+    if not token or token not in DEFAULT_TOKENS:
+      self.P(f"Invalid token: {token}", color='r')
+      return {"error": "Invalid token"}
+
     fn = self.r1fs.get_file(cid=cid, secret=secret)
     self.P(f"fn: {fn}")
-    file = self.diskapi_load_r1fs_file(fn, verbose=True, to_base64=True)
-    filename = file.split('/')[-1] if file else None
-    self.P(f"file={file}")
-    data = {
-      "file" : file, "filename" : filename
-    }
 
-    response = self.__get_response({
-      **data
-    })
-    return response
+    return fn
 
 
-  # @app.get("/get_file/{filename}")
-  # async def get_file(filename: str):
-  #   """Stream the requested *filename* back to the caller."""
-  #   file_path = DOWNLOADS_DIR / filename
-  #   if not file_path.is_file():
-  #     raise HTTPException(404, detail="File not found")
-  #
-  #   return FileResponse(
-  #     file_path,
-  #     media_type="application/octet-stream",
-  #     filename=filename,
-  #   )
-
-  @BasePlugin.endpoint(method="post", require_token=False)
-  def add_file_base64(self, file_base64_str: str, filename: str = None, secret: str = None):  # first parameter must be named token
+  @BasePlugin.endpoint(method="post", require_token=True)
+  def add_file_base64(self, token: str, file_base64_str: str, filename: str = None, secret: str = None):  # first parameter must be named token
     """
     """
+
+    if not token or token not in DEFAULT_TOKENS:
+      self.P(f"Invalid token: {token}", color='r')
+      return {"error": "Invalid token"}
+
     self.P(f"New base64 File={file_base64_str}")
     if not filename:
       filename = self.r1fs._get_unique_or_complete_upload_name()
@@ -193,19 +171,22 @@ class R1fsManagerApiPlugin(BasePlugin):
     self.P(f"Added to R1FS, secret='{secret}'", color='g')
     self.P(f"Cid='{cid}'")
 
-    response_data = {
+    data = {
       "cid" : cid
     }
 
-    response = self.__get_response({
-      **response_data
-    })
-    return response
+    return data
+
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def get_file_base64(self, cid: str, secret: str = None):  # first parameter must be named token
+  def get_file_base64(self, token: str, cid: str, secret: str = None):  # first parameter must be named token
     """
     """
+
+    if not token or token not in DEFAULT_TOKENS:
+      self.P(f"Invalid token: {token}", color='r')
+      return {"error": "Invalid token"}
+
     self.P(f"Trying to download file -> {cid}")
     file = self.r1fs.get_file(cid=cid, secret=secret)
     filename = file.split('/')[-1] if file else None
@@ -213,40 +194,43 @@ class R1fsManagerApiPlugin(BasePlugin):
     file_base64 = self.diskapi_load_r1fs_file(file, verbose=True, to_base64=True)
     self.P("file retrieved: {}".format(file_base64))
 
-    response_data = {
+    data = {
       "file_base64_str": file_base64,
       "filename": filename
     }
 
-    response = self.__get_response({
-      **response_data
-    })
-    return response
+    return data
 
 
-  @BasePlugin.endpoint(method="post", require_token=False)
-  def add_yaml(self, data: dict, fn: str = None, secret: str = None):   # first parameter must be named token
+  @BasePlugin.endpoint(method="post", require_token=True)
+  def add_yaml(self, token: str, data: dict, fn: str = None, secret: str = None):   # first parameter must be named token
     """
     """
     self.P(f"Adding data={data} to yaml, secret='{secret}'", color='g')
+
+    if not token or token not in DEFAULT_TOKENS:
+      self.P(f"Invalid token: {token}", color='r')
+      return {"error": "Invalid token"}
+
     cid = self.r1fs.add_yaml(data=data, fn=fn, secret=secret)
     self.P(f"Cid='{cid}'")
 
-    response_data = {
+    data = {
       "cid" : cid
     }
 
-    response = self.__get_response({
-      **response_data
-    })
-    return response
+    return data
 
 
-  @BasePlugin.endpoint(method="get", require_token=False)
-  def get_yaml(self, cid: str, secret: str = None):
+  @BasePlugin.endpoint(method="get", require_token=True)
+  def get_yaml(self, token: str, cid: str, secret: str = None):
     """
     """
     self.P(f"Retrieving file with CID='{cid}', secret='{secret}'...")
+
+    if not token or token not in DEFAULT_TOKENS:
+      self.P(f"Invalid token: {token}", color='r')
+      return {"error": "Invalid token"}
 
     fn = self.r1fs.get_file(cid=cid, secret=secret)
     self.P(f"fn: {fn}")
@@ -256,111 +240,13 @@ class R1fsManagerApiPlugin(BasePlugin):
 
     else:
       self.P(f"Error retrieving file: {fn}")
-      file_data = "error"
+      return "error"
+
     data = {
       "file_data" : file_data
     }
 
-    response = self.__get_response({
-      **data
-    })
-    return response
+    return data
 
-  @BasePlugin.endpoint(method="get", require_token=False)
-  def test1(self):
-    """
-    """
-    cid="QmRsXRzeDVuQHJbQb6UQQYFYGz9AjiGo2CeUZiE5V29BeF"
-    self.P(f"Retrieving file with CID={cid}...")
-
-    d = {'key2': 'val2'}
-    cid = self.r1fs.add_yaml(data=d)
-    self.P(f"Saved file with CID={cid}, d={d}")
-
-    fn = self.r1fs.get_file(cid)
-
-    self.P(f"fn: {fn}")
-
-    if fn.endswith('.yaml') or fn.endswith('.yml'):
-      file_data = self.diskapi_load_yaml(fn, verbose=False)
-      self.P(f"File found: {file_data}")
-
-    else:
-      self.P(f"Error retrieving file: {fn}")
-      file_data = "error"
-    data = {
-      "file_data" : file_data
-    }
-
-    response = self.__get_response({
-      **data
-    })
-    return response
-
-  @BasePlugin.endpoint(method="get", require_token=False)
-  def test2(self):
-    """
-    """
-    d = {'key1': 'val1'}
-    secret = 's1'
-    cid = self.r1fs.add_yaml(data=d, secret=secret)
-    self.P(f"Saved file with CID='{cid}', secret='{secret}', d='{d}'")
-
-    fn = self.r1fs.get_file(cid, secret=secret)
-
-    self.P(f"fn: {fn}")
-
-    if fn.endswith('.yaml') or fn.endswith('.yml'):
-      file_data = self.diskapi_load_yaml(fn, verbose=False)
-      self.P(f"File found: {file_data}")
-
-    else:
-      self.P(f"Error retrieving file: {fn}")
-      file_data = "error"
-    data = {
-      "file_data" : file_data
-    }
-
-    response = self.__get_response({
-      **data
-    })
-    return response
-
-  @BasePlugin.endpoint(method="get", require_token=False)
-  def test3(self):
-    """
-    """
-    secret = 's1'
-    cid = "Qmc7QpGJJ9MMXi5FdTB8DadXt2ydWrM6jMaSRfjwcBr5Df"
-    self.P(f"Saved file with CID={cid}, secret={secret}")
-
-    fn = self.r1fs.get_file(cid, secret=secret)
-
-    self.P(f"fn: {fn}")
-
-    if fn.endswith('.yaml') or fn.endswith('.yml'):
-      file_data = self.diskapi_load_yaml(fn, verbose=False)
-      self.P(f"File found: {file_data}")
-
-    else:
-      self.P(f"Error retrieving file: {fn}")
-      file_data = "error"
-    data = {
-      "file_data" : file_data
-    }
-
-    response = self.__get_response({
-      **data
-    })
-    return response
-
-  async def __read_upload_to_memory(self, upload) -> bytes:
-    """Read *upload* in chunks into a bytes object (bytearray under the hood)."""
-    CHUNK_SIZE = 1 * 1024 * 1024  # 1 MiB
-    buffer = bytearray()
-    while True:
-      chunk = await upload.read(CHUNK_SIZE)
-      if not chunk:
-        break
-      buffer.extend(chunk)
-    return bytes(buffer)
+#########################################################################
+#########################################################################
