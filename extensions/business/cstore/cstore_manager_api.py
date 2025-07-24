@@ -19,6 +19,7 @@ _CONFIG = {
   },
 }
 
+DEFAULT_TOKENS = ['admin']
 
 class CstoreManagerApiPlugin(BasePlugin):
   """
@@ -114,54 +115,45 @@ class CstoreManagerApiPlugin(BasePlugin):
       'keys' : self.__get_keys()
     }
     
-    response = self.__get_response({
-      **data
-    })
-    return response
+    return data
 
-
-  @BasePlugin.endpoint(method="get", require_token=True) 
-  def get_value(self, token, cstore_key : str):   # first parameter must be named token
-    """
-    """
-    
-    if token not in ['admin']:
-      return "Unauthorized token"
-    
-    value = self.chainstore_get(key=cstore_key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
-    
-    data = {
-      cstore_key : value
-    }
-    
-    response = self.__get_response({
-      **data
-    })
-    return response
 
 
   @BasePlugin.endpoint(method="post", require_token=True)
-  def set_value(self, token: str, cstore_key : str, chainstore_value : str):   # first parameter must be named token
+  def set_value(self, token: str, key : str, value : str):   # first parameter must be named token
     """
     """
     
-    if token not in ['admin']:
+    if token not in DEFAULT_TOKENS:
       return "Unauthorized token"
     
-    chainstore_value = self.chainstore_set(
-      key=cstore_key, 
-      value=chainstore_value,
+    value = self.chainstore_set(
+      key=key,
+      value=value,
       debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG
     )
     
     data = {
-      cstore_key : chainstore_value
+      key : value
     }
-    
-    response = self.__get_response({
-      **data
-    })
-    return response
+
+    return data
+
+  @BasePlugin.endpoint(method="get", require_token=True)
+  def get_value(self, token, key: str):  # first parameter must be named token
+    """
+    """
+
+    if token not in DEFAULT_TOKENS:
+      return "Unauthorized token"
+
+    value = self.chainstore_get(key=key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
+
+    data = {
+      key: value
+    }
+
+    return data
 
 
   @BasePlugin.endpoint(method="post", require_token=True)
@@ -169,7 +161,7 @@ class CstoreManagerApiPlugin(BasePlugin):
     """
     """
 
-    if token not in ['admin']:
+    if token not in DEFAULT_TOKENS:
       return "Unauthorized token"
 
     value = self.chainstore_hset(
@@ -185,18 +177,15 @@ class CstoreManagerApiPlugin(BasePlugin):
       },
     }
 
-    response = self.__get_response({
-      **data
-    })
-    return response
+    return data
 
 
   @BasePlugin.endpoint(method="get", require_token=True)
-  def hget(self, token, hkey: str, key: str):  # first parameter must be named token
+  def hget(self, token, hkey: str, key: str):
     """
     """
 
-    if token not in ['admin']:
+    if token not in DEFAULT_TOKENS:
       return "Unauthorized token"
 
     value = self.chainstore_hget(hkey=hkey, key=key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
@@ -207,10 +196,7 @@ class CstoreManagerApiPlugin(BasePlugin):
       }
     }
 
-    response = self.__get_response({
-      **data
-    })
-    return response
+    return data
 
 
   @BasePlugin.endpoint(method="get", require_token=True)
@@ -218,7 +204,7 @@ class CstoreManagerApiPlugin(BasePlugin):
     """
     """
 
-    if token not in ['admin']:
+    if token not in DEFAULT_TOKENS:
       return "Unauthorized token"
 
     value = self.chainstore_hgetall(hkey=hkey, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
@@ -227,8 +213,5 @@ class CstoreManagerApiPlugin(BasePlugin):
       hkey: value
     }
 
-    response = self.__get_response({
-      **data
-    })
-    return response
+    return data
 
