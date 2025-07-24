@@ -1,12 +1,12 @@
 """
 container_app_runner.py
-A Ratio1 plugin to run a single Docker/Podman container and (if needed) expose it via ngrok.
+A Ratio1 plugin to run a single Docker/Podman container and (if needed) expose it via tunnel engine.
 
 On-init:
   - CR login
   - Port allocation (optional)
   - Container run
-  - ngrok tunnel (optional)
+  - tunnel (optional)
  
 Loop:
   - check and maybe reload container
@@ -14,7 +14,7 @@ Loop:
   
 On-close:
   - stop container
-  - stop ngrok tunnel (if needed)
+  - stop tunnel (if needed)
   - stop logs process
   - save logs to disk
 
@@ -26,9 +26,7 @@ import socket
 import subprocess
 import time
 
-# from naeural_core.business.base import BasePluginExecutor as BasePlugin  # provides all the self.api_call methods
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
-# from naeural_core.business.mixins_libs.ngrok_mixin import _NgrokMixinPlugin # provides ngrok support
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
@@ -51,7 +49,7 @@ _CONFIG = {
   'NGROK_URL_PING_COUNT': 10, # nr or times we send payload with ngrok url
 
   # Generic tunnel engine Section
-  "TUNNEL_ENGINE": "ngrok",  # or "cloudflare"
+  "TUNNEL_ENGINE": "cloudflare",
 
   "TUNNEL_ENGINE_ENABLED": True,
   "TUNNEL_ENGINE_PING_INTERVAL": 30,  # seconds
@@ -81,7 +79,7 @@ _CONFIG = {
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
-  
+
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   
   #### Logging
@@ -106,7 +104,7 @@ class ContainerAppRunnerPlugin(
 
   This plugin:
     - Logs in to a container registry if CR_USER and CR_PASSWORD are provided.
-    - Allocates a host port if PORT is provided and exposes it via ngrok using an edge label.
+    - Allocates a host port if PORT is provided and exposes it via cloudflare using an access token.
     - Runs the container with optional CPU and memory constraints.
     - Captures logs in real-time using the LogReader class.
     - Stores logs to disk upon plugin close using diskapi_save_pickle_to_output.
@@ -151,9 +149,6 @@ class ContainerAppRunnerPlugin(
     return
 
   def __reset_vars(self):
-    self.__last_ngrok_url_ping_ts = 0
-    self.__last_ngrok_url_ping_count = 0
-
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
     self.container_proc = None
@@ -184,13 +179,13 @@ class ContainerAppRunnerPlugin(
     and prepares for container run.    
     """
     self.__reset_vars()
-    self._reset_ngrok() # call ngrok var init
+    self.reset_tunnel_engine() # call cloudflare var init
 
     self._detect_cli_tool() # detect if we have docker or podman
     self._container_maybe_login() # login to the container registry if needed
 
     self._setup_dynamic_env() # setup dynamic env vars for the container
-    self._setup_app_ngrok_port() # allocate the main port if needed
+    self._setup_app_tunnel_engine_port() # allocate the main port if needed
     self._setup_resource_limits() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
 
@@ -346,7 +341,7 @@ class ContainerAppRunnerPlugin(
     # endif volumes
     return
 
-  def _setup_app_ngrok_port(self):
+  def _setup_app_tunnel_engine_port(self):
     """
     Processes the main port if specified in the configuration.
     """
@@ -356,8 +351,8 @@ class ContainerAppRunnerPlugin(
       self.port = self.__allocate_port()
       self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")
 
-      self.maybe_init_ngrok()
-      self.maybe_start_ngrok()
+      self.maybe_init_tunnel_engine()
+      self.maybe_start_tunnel_engine()
     # endif port
     return
 
@@ -413,20 +408,20 @@ class ContainerAppRunnerPlugin(
         # endtry
       # endwhile done
     #endif required_port != 0
-    
+
     if required_port == 0 and port is None:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
       sock.bind(("", 0))
       port = sock.getsockname()[1]
       sock.close()
-    #endif        
+    #endif
     return port
 
 
   def _stop_container_and_save_logs_to_disk(self):
     """
-    Stops the container and ngrok tunnel.
+    Stops the container and cloudflare tunnel.
     Then logs are saved to disk.
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
@@ -438,10 +433,10 @@ class ContainerAppRunnerPlugin(
     else:
       self.P(f"Container '{self.container_id}' does not exist. Stop command canceled.")
 
-    # Stop ngrok if needed
-    self.P("Stopping ngrok tunnel ...")
-    self.maybe_stop_ngrok()
-    self.P("Ngrok tunnel stopped.")
+    # Stop tunnel engine if needed
+    self.P("Stopping tunnel engine tunnel ...")
+    self.maybe_stop_tunnel_engine()
+    self.P("Tunnel engine stopped.")
 
     # Save logs to disk
     # We'll store them in a single structure: a list of lines from dct_logs or so
@@ -461,47 +456,19 @@ class ContainerAppRunnerPlugin(
     Lifecycle hook called when plugin is stopping.
     Ensures container is shut down and logs are saved.
     Ensures the log process is killed.
-    Stops ngrok tunnel if started.
+    Stops tunnel if started.
     """
     self._stop_container_and_save_logs_to_disk()
 
 
-  def __maybe_send_ngrok_dynamic_url(self):
-    """
-    This method checks if the ngrok tunnel is running and updates the ngrok URL if needed.
-
-    TODO: move it to a separate mixin, as it's used in base_web_app_plugin.py in naeural_core.
-    """
-    # Check if the Ngrok API is used.
-    if not self.cfg_ngrok_use_api:
-      return
-    # Check if the listener is available.
-    if self.ngrok_listener is None:
-      return
-    # Check if the listener has a URL.
-    # In case a Ngrok edge label or domain is provided no URL will be available since the user should already have it.
-    if self.ngrok_listener.url() is None:
-      return
-    
-    max_payloads_exceeded = self.__last_ngrok_url_ping_count >= self.cfg_ngrok_url_ping_count
-    timeout_exceeded = (
-      self.__last_ngrok_url_ping_ts is None or 
-      (self.time() - self.__last_ngrok_url_ping_ts) >= self.cfg_ngrok_url_ping_interval
+  def __maybe_send_app_dynamic_url(self):
+    self.add_payload_by_fields(
+      app_url=self.app_url,
     )
-    
-    if not max_payloads_exceeded and timeout_exceeded:
-      # TODO: check what happens if use use ngrok edge label (endpoint)
-      ngrok_url = self.ngrok_listener.url()      
-      self.__last_ngrok_url_ping_count += 1
-      self.__last_ngrok_url_ping_ts = self.time()
-      self.P(f"Sending #{self.__last_ngrok_url_ping_count} ngrok URL: {ngrok_url}")
-      self.add_payload_by_fields(
-        ngrok_url=ngrok_url,
-      )
-    # endif last ngrok url ping
+
     return
-  
-  
+
+
   def _maybe_autoupdate_container(self):
     if self.cfg_autoupdate and self.container_id is not None:
       # Check if the image exists and pull it if needed
@@ -536,7 +503,6 @@ class ContainerAppRunnerPlugin(
     self._maybe_autoupdate_container()
     self._container_maybe_reload()
     self._container_retrieve_and_maybe_show_logs()
-    self.__maybe_send_ngrok_dynamic_url()
-    
+    self.__maybe_send_app_dynamic_url()
 
     return
