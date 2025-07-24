@@ -297,13 +297,16 @@ class OracleApiPlugin(BasePlugin):
     # end try
     
     epochs_vals = None
-    if error_msg is None:   
+    resources = {}
+    if error_msg is None:
       self.P(f"Getting epochs for node {node_addr} from {start_epoch} to {end_epoch}")
       epochs_vals = self.netmon.epoch_manager.get_node_epochs(
         node_addr, 
         autocomplete=True,
         as_list=False
-      )    
+      )
+      stats = self.netmon.epoch_manager.get_stats()
+      resources = stats.get(node_addr, {}).get("resources", {})
     if epochs_vals is None and not unknown_address:
       data = {
         'node': node_addr,
@@ -329,6 +332,7 @@ class OracleApiPlugin(BasePlugin):
       except:
         last_seen = -1
       data['node_last_seen_sec'] = last_seen
+      data['resources'] = resources
       try:
         data['node_is_online'] = self.netmon.network_node_is_online(node_addr)
         data['node_version'] = self.netmon.network_node_version(node_addr)
