@@ -1,8 +1,8 @@
 from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_RESOURCES, DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA
+from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
+  DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA
 
 DEEPLOY_DEBUG = True
 
@@ -55,26 +55,7 @@ class _DeeployMixin:
     return sender
 
 
-  def _get_online_apps(self):
-    """
-    if self.cfg_deeploy_verbose:
-      full_data = self.netmon.network_known_nodes()
-      self.Pd(f"Full data:\n{self.json_dumps(full_data, indent=2)}")
-    pipelines = self.netmon.network_known_configs()
-    non_admin_pipelines = {
-      node : [x for x in pipelines[node] if x['NAME'].lower() != 'admin_pipeline'] 
-      for node in pipelines      
-    }  
-    result = {
-      'configs': non_admin_pipelines,
-      'details': self.netmon.network_known_apps(),
-    }     
-    
-    """
-    result = self.netmon.network_known_apps()
-    return result
 
-  
   def __check_allowed_wallet(self, inputs):
     sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
     eth_nodes = self.bc.get_wallet_nodes(sender)
@@ -100,84 +81,6 @@ class _DeeployMixin:
     inputs.wallet_oracles = wallet_oracles
     return inputs
 
-  def __parse_memory(self, mem_str):
-    """
-    Convert memory string to bytes.
-    Args:
-        mem_str (str): Memory string in format '512m', '1g', '1.3g, or bytes
-    Returns:
-        int: Memory in bytes
-    """
-    if mem_str.endswith('m'):
-      return int(float(mem_str[:-1]) * 1024 * 1024)  # MB to bytes
-    elif mem_str.endswith('g'):
-      return int(float(mem_str[:-1]) * 1024 * 1024 * 1024)  # GB to bytes
-    else:
-      return int(float(mem_str))  # assume bytes
-
-  def __check_nodes_availability(self, inputs):
-    """
-    Check if the target nodes are online and have sufficient resources.
-    
-    TODO: (Vitalii)
-      - implement the case where `target_nodes` is None or empty but `target_node_count` is set
-        - get all online non supervisor nodes
-        - filter if they have the required resources (available memory, CPU, disk)
-          - check the node if it has `node_res_req`
-          - check the node if is has _available_ resources required by `CONTAINER_RESOURCES`
-        - check if they have other pipelines running/deploy recently
-        - get node scores (order desc by score)
-        - select target_node_count nodes:
-          - select top scored nodes that did not receive deployment recently
-          
-        - Outcome: 
-          - only nodes that have available resources and are online will be returned
-          - only top avail nodes will be used for deployment
-          - nodes that did not receive deployment recently will be preferred
-        
-        Example - 2 node job with 6 GB mem:
-          N1: 99 score, 1 pipeline recent, 9 GB avail, 2 cores avail, 100 GB disk avail
-          N2: 95 score, 0 pipelines recent, 8 GB avail, 4 cores avail, 200 GB disk avail
-          N3: 99 score, 2 pipelines recent, 90 GB avail, 1 core avail, 900 GB disk avail
-          N4: 85 score, 0 pipelines recent, 6 GB avail, 2 cores avail, 300 GB disk avail
-          N5: 99 score, 1 pipeline recent, 16 GB avail, 3 cores avail, 150 GB disk avail
-          N6: 99 score, 0 pipelines recent, 5 GB avail, 1 core avail, 400 GB disk avail
-          N7: failed comms
-          N8: failed comms
-          
-          Returns:
-          - N7, N8 filterted out
-          - N6 filtered out (not enough memory)
-          - SORT: N1, N5, N3, N2, N4
-          - OUTPUT: N1, N5
-          
-    TODO: (Andrei)
-      - Harden the node scores based on a longer history (currently gets to 99 after 2-3 hours of uptime)
-        - Score use exponential moving average of the node pre-score for the last 24 hours
-        - Use oracle network for whole series
-        - Penalize nodes that have history less than 50 epochs (1 epoch = 24 hours)
-    
-    """
-    nodes = []
-    for node in inputs.target_nodes:
-      addr = self._check_and_maybe_convert_address(node)
-      is_online = self.netmon.network_node_is_online(addr)
-      if is_online:
-        node_resources = self.check_node_resources(addr, inputs)
-        if not node_resources[DEEPLOY_RESOURCES.STATUS]:
-          error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
-          for detail in node_resources[DEEPLOY_RESOURCES.DETAILS]:
-            error_msg += (
-                  f"- {detail[DEEPLOY_RESOURCES.RESOURCE]}: available {detail[DEEPLOY_RESOURCES.AVAILABLE]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]} < " +
-                  "required {detail[DEEPLOY_RESOURCES.REQUIRED]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]}\n")
-          raise ValueError(error_msg)
-        nodes.append(addr)
-      else:
-        msg = f"{DEEPLOY_ERRORS.NODES1}: Node {addr} is not online"
-        raise ValueError(msg)
-      # endif is_online
-    # endfor each target node check address and status
-    return nodes
 
   def __launch_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender):
     """
@@ -223,6 +126,7 @@ class _DeeployMixin:
           owner=sender, 
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
+          is_deeployed=True,
         )
       # endif addr is valid
     # endfor each target node
@@ -270,67 +174,6 @@ class _DeeployMixin:
       # end for each response key
     # endwhile cycle until all responses are received
     return dct_status, str_status
-
-  def check_node_resources(self, addr, inputs):
-    """
-    Check if the node has sufficient resources for the requested deployment.
-    Returns:
-        dict: {
-            'status': bool,  # True if all checks pass, False otherwise
-            'details': list, # List of resource issues if any
-            'available': dict, # Available resources
-            'required': dict  # Required resources
-        }
-    """
-    result = {
-        DEEPLOY_RESOURCES.STATUS: True,
-        DEEPLOY_RESOURCES.DETAILS: [],
-        DEEPLOY_RESOURCES.AVAILABLE: {},
-        DEEPLOY_RESOURCES.REQUIRED: {}
-    }
-    
-    # Get available resources
-    avail_cpu = self.netmon.network_node_get_cpu_avail_cores(addr)
-    avail_mem = self.netmon.network_node_available_memory(addr)  # in GB
-    avail_mem_bytes = self.__parse_memory(f"{avail_mem}g")
-    avail_disk = self.netmon.network_node_available_disk(addr)  # in bytes
-
-    # Get required resources from the request
-    required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
-    required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_RESOURCES.MEMORY)
-    required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_RESOURCES.CPU)
-
-    required_mem_bytes = self.__parse_memory(required_mem)
-
-    # CPU check
-    if avail_cpu < required_cpu:
-      result[DEEPLOY_RESOURCES.AVAILABLE][DEEPLOY_RESOURCES.CPU] = avail_cpu
-      result[DEEPLOY_RESOURCES.REQUIRED][DEEPLOY_RESOURCES.CPU] = required_cpu
-
-      result[DEEPLOY_RESOURCES.STATUS] = False
-      result[DEEPLOY_RESOURCES.DETAILS].append({
-          DEEPLOY_RESOURCES.RESOURCE: DEEPLOY_RESOURCES.CPU,
-          DEEPLOY_RESOURCES.AVAILABLE_VALUE: avail_cpu,
-          DEEPLOY_RESOURCES.REQUIRED_VALUE: required_cpu,
-          DEEPLOY_RESOURCES.UNIT: DEEPLOY_RESOURCES.CORES
-      })
-
-    # Check memory
-    if avail_mem_bytes < required_mem_bytes:
-      result[DEEPLOY_RESOURCES.AVAILABLE][DEEPLOY_RESOURCES.MEMORY] = avail_mem_bytes
-      result[DEEPLOY_RESOURCES.REQUIRED][DEEPLOY_RESOURCES.MEMORY] = required_mem_bytes
-
-      result[DEEPLOY_RESOURCES.STATUS] = False
-      avail_mem_mb = avail_mem_bytes / (1024 * 1024)
-      required_mem_mb = result[DEEPLOY_RESOURCES.REQUIRED][DEEPLOY_RESOURCES.MEMORY] / (1024 * 1024)
-      result[DEEPLOY_RESOURCES.DETAILS].append({
-          DEEPLOY_RESOURCES.RESOURCE: DEEPLOY_RESOURCES.MEMORY,
-          DEEPLOY_RESOURCES.AVAILABLE_VALUE: avail_mem_mb,
-          DEEPLOY_RESOURCES.REQUIRED_VALUE: required_mem_mb,
-          DEEPLOY_RESOURCES.UNIT: DEEPLOY_RESOURCES.MB
-      })
-
-    return result
 
   def deeploy_get_nonce(self, hex_nonce):
     """
@@ -418,12 +261,11 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type):
+  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, nodes):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
     # Phase 1: Check if nodes are available
-    nodes = self.__check_nodes_availability(inputs)
 
     if len(nodes) == 0:
       msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"

@@ -10,6 +10,27 @@ RUN wget https://dist.ipfs.tech/kubo/v0.35.0/kubo_v0.35.0_linux-amd64.tar.gz && 
   bash install.sh
 # End Install IPFS
 
+# Install Cloudflared
+ARG CLOUDFLARED_VERSION=2025.7.0
+
+RUN set -eux; \
+    # --- map architecture names to Cloudflare’s file names -------
+    arch="$(uname -m)";                     \
+    case "$arch" in                         \
+      x86_64)  arch=amd64  ;;               \
+      aarch64 | arm64) arch=arm64 ;;        \
+      armv7l)  arch=armv7  ;;               \
+      *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+    esac;                                   \
+    # --- download the pinned release --------------------------------
+    curl -L "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}" \
+         -o /usr/local/bin/cloudflared;     \
+    chmod +x /usr/local/bin/cloudflared;    \
+    # --- (optional) show version so it appears in build logs --------
+    cloudflared --version
+# End Install Cloudflared
+
+
 COPY ./cmds /usr/local/bin/
 RUN chmod +x /usr/local/bin/*
 
