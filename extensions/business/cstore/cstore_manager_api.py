@@ -60,27 +60,21 @@ class CstoreManagerApiPlugin(BasePlugin):
     
     return data
 
-
-
   @BasePlugin.endpoint(method="post", require_token=True)
-  def set_value(self, token: str, key : str, value : str):   # first parameter must be named token
+  def set_value(self, token: str, key: str, value: str):  # first parameter must be named token
     """
     """
     
     if token not in DEFAULT_TOKENS:
       return "Unauthorized token"
     
-    value = self.chainstore_set(
+    write_result = self.chainstore_set(
       key=key,
       value=value,
       debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG
     )
-    
-    data = {
-      key : value
-    }
 
-    return data
+    return write_result
 
   @BasePlugin.endpoint(method="get", require_token=True)
   def get_value(self, token, key: str):  # first parameter must be named token
@@ -92,35 +86,25 @@ class CstoreManagerApiPlugin(BasePlugin):
 
     value = self.chainstore_get(key=key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
 
-    data = {
-      key: value
-    }
-
-    return data
+    return value
 
 
   @BasePlugin.endpoint(method="post", require_token=True)
-  def hset(self, token, hkey: str, key: str, value : str):  # first parameter must be named token
+  def hset(self, token, hkey: str, key: str, value: str):  # first parameter must be named token
     """
     """
 
     if token not in DEFAULT_TOKENS:
       return "Unauthorized token"
 
-    value = self.chainstore_hset(
+    write_result = self.chainstore_hset(
       hkey=hkey,
       key=key,
       value=value,
       debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG
     )
 
-    data = {
-      hkey: {
-        key: value
-      },
-    }
-
-    return data
+    return write_result
 
 
   @BasePlugin.endpoint(method="get", require_token=True)
@@ -133,13 +117,7 @@ class CstoreManagerApiPlugin(BasePlugin):
 
     value = self.chainstore_hget(hkey=hkey, key=key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
 
-    data = {
-      hkey: {
-        key: value
-      }
-    }
-
-    return data
+    return value
 
 
   @BasePlugin.endpoint(method="get", require_token=True)
@@ -152,9 +130,5 @@ class CstoreManagerApiPlugin(BasePlugin):
 
     value = self.chainstore_hgetall(hkey=hkey, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
 
-    data = {
-      hkey: value
-    }
-
-    return data
+    return value
 
