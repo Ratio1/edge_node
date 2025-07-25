@@ -57,45 +57,33 @@ class CstoreManagerApiPlugin(BasePlugin):
     data = {
       'keys' : self.__get_keys()
     }
-    
     return data
 
-  @BasePlugin.endpoint(method="post", require_token=True)
-  def set_value(self, token: str, key: str, value: str):  # first parameter must be named token
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def set(self, key: str, value: str):  
     """
     """
-    
-    if token not in DEFAULT_TOKENS:
-      return "Unauthorized token"
-    
+
     write_result = self.chainstore_set(
       key=key,
       value=value,
       debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG
     )
-
     return write_result
 
-  @BasePlugin.endpoint(method="get", require_token=True)
-  def get_value(self, token, key: str):  # first parameter must be named token
+  @BasePlugin.endpoint(method="get", require_token=False)
+  def get(self, key: str):
     """
     """
-
-    if token not in DEFAULT_TOKENS:
-      return "Unauthorized token"
 
     value = self.chainstore_get(key=key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
-
     return value
 
 
-  @BasePlugin.endpoint(method="post", require_token=True)
-  def hset(self, token, hkey: str, key: str, value: str):  # first parameter must be named token
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def hset(self, hkey: str, key: str, value: str):  
     """
     """
-
-    if token not in DEFAULT_TOKENS:
-      return "Unauthorized token"
 
     write_result = self.chainstore_hset(
       hkey=hkey,
@@ -103,32 +91,23 @@ class CstoreManagerApiPlugin(BasePlugin):
       value=value,
       debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG
     )
-
     return write_result
 
 
-  @BasePlugin.endpoint(method="get", require_token=True)
-  def hget(self, token, hkey: str, key: str):
+  @BasePlugin.endpoint(method="get", require_token=False)
+  def hget(self, hkey: str, key: str):
     """
     """
-
-    if token not in DEFAULT_TOKENS:
-      return "Unauthorized token"
 
     value = self.chainstore_hget(hkey=hkey, key=key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
-
     return value
 
 
-  @BasePlugin.endpoint(method="get", require_token=True)
-  def hgetall(self, token, hkey: str):  # first parameter must be named token
+  @BasePlugin.endpoint(method="get", require_token=False)
+  def hgetall(self, hkey: str):  
     """
     """
-
-    if token not in DEFAULT_TOKENS:
-      return "Unauthorized token"
 
     value = self.chainstore_hgetall(hkey=hkey, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
-
     return value
 

@@ -55,18 +55,15 @@ class R1fsManagerApiPlugin(BasePlugin):
     return data
 
 
-  @BasePlugin.endpoint(method="post", streaming_type="upload", require_token=True)
-  def add_file(self, token: str, file_path: str, body: dict):
+  @BasePlugin.endpoint(method="post", streaming_type="upload", require_token=False)
+  def add_file(self, file_path: str, body_json: any):
     """Process the uploaded file located at file_path"""
 
-    self.P(f"Starting upload_large_file with uploaded file at: {file_path}")
-    self.P(f"body: {body}")
+    self.P(f"Starting add_file with uploaded file at: {file_path}")
+    self.P(f"Body: {self.json.dumps(body_json, indent=2)}")
 
-    if not token or token not in DEFAULT_TOKENS:
-      self.P(f"Invalid token: {token}", color='r')
-      return {"error": "Invalid token"}
-
-    secret = body.get('secret', None)
+    secret = body_json.get('secret', None)
+    self.P(f"Extracted secret: {secret}")
 
     cid = self.r1fs.add_file(file_path=file_path, secret=secret)
 
@@ -78,30 +75,32 @@ class R1fsManagerApiPlugin(BasePlugin):
     return data
 
 
-  @BasePlugin.endpoint(method="get", streaming_type="download", require_token=True)
-  def get_file(self, token: str, cid: str, secret: str = None):
+  @BasePlugin.endpoint(method="get", streaming_type="download", require_token=False)
+  def get_file(self, cid: str, secret: str = None):
     """
     """
     self.P(f"Retrieving file with CID='{cid}', secret='{secret}'...")
 
-    if not token or token not in DEFAULT_TOKENS:
-      self.P(f"Invalid token: {token}", color='r')
-      return {"error": "Invalid token"}
-
     fn = self.r1fs.get_file(cid=cid, secret=secret)
-    self.P(f"fn: {fn}")
 
-    return fn
+    meta = {
+      'file': fn,
+      'filename': self.os_path.basename(fn)
+    }
+    response = {
+      'file_path': fn,
+      'meta': meta
+    }
+
+    self.P(f"response: {self.json.dumps(response, indent=2)}")
+
+    return response
 
 
-  @BasePlugin.endpoint(method="post", require_token=True)
-  def add_file_base64(self, token: str, file_base64_str: str, filename: str = None, secret: str = None):  # first parameter must be named token
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def add_file_base64(self, file_base64_str: str, filename: str = None, secret: str = None):  # first parameter must be named token
     """
     """
-
-    if not token or token not in DEFAULT_TOKENS:
-      self.P(f"Invalid token: {token}", color='r')
-      return {"error": "Invalid token"}
 
     self.P(f"New base64 File={file_base64_str}")
     if not filename:
@@ -117,18 +116,13 @@ class R1fsManagerApiPlugin(BasePlugin):
     data = {
       "cid" : cid
     }
-
     return data
 
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def get_file_base64(self, token: str, cid: str, secret: str = None):  # first parameter must be named token
+  def get_file_base64(self, cid: str, secret: str = None):  # first parameter must be named token
     """
     """
-
-    if not token or token not in DEFAULT_TOKENS:
-      self.P(f"Invalid token: {token}", color='r')
-      return {"error": "Invalid token"}
 
     self.P(f"Trying to download file -> {cid}")
     file = self.r1fs.get_file(cid=cid, secret=secret)
@@ -141,19 +135,14 @@ class R1fsManagerApiPlugin(BasePlugin):
       "file_base64_str": file_base64,
       "filename": filename
     }
-
     return data
 
 
-  @BasePlugin.endpoint(method="post", require_token=True)
-  def add_yaml(self, token: str, data: dict, fn: str = None, secret: str = None):   # first parameter must be named token
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def add_yaml(self, data: dict, fn: str = None, secret: str = None):   # first parameter must be named token
     """
     """
     self.P(f"Adding data={data} to yaml, secret='{secret}'", color='g')
-
-    if not token or token not in DEFAULT_TOKENS:
-      self.P(f"Invalid token: {token}", color='r')
-      return {"error": "Invalid token"}
 
     cid = self.r1fs.add_yaml(data=data, fn=fn, secret=secret)
     self.P(f"Cid='{cid}'")
@@ -161,19 +150,14 @@ class R1fsManagerApiPlugin(BasePlugin):
     data = {
       "cid" : cid
     }
-
     return data
 
 
-  @BasePlugin.endpoint(method="get", require_token=True)
-  def get_yaml(self, token: str, cid: str, secret: str = None):
+  @BasePlugin.endpoint(method="get", require_token=False)
+  def get_yaml(self, cid: str, secret: str = None):
     """
     """
     self.P(f"Retrieving file with CID='{cid}', secret='{secret}'...")
-
-    if not token or token not in DEFAULT_TOKENS:
-      self.P(f"Invalid token: {token}", color='r')
-      return {"error": "Invalid token"}
 
     fn = self.r1fs.get_file(cid=cid, secret=secret)
     self.P(f"fn: {fn}")
@@ -188,7 +172,6 @@ class R1fsManagerApiPlugin(BasePlugin):
     data = {
       "file_data" : file_data
     }
-
     return data
 
 #########################################################################
