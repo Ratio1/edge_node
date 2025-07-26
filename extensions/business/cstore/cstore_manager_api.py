@@ -19,7 +19,6 @@ _CONFIG = {
   },
 }
 
-DEFAULT_TOKENS = ['admin']
 
 class CstoreManagerApiPlugin(BasePlugin):
   """

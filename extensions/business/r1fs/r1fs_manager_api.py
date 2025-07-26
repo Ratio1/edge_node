@@ -16,7 +16,6 @@ _CONFIG = {
   },
 }
 
-DEFAULT_TOKENS = ['admin']
 
 class R1fsManagerApiPlugin(BasePlugin):
   """
