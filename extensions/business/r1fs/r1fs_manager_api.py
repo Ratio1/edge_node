@@ -56,14 +56,10 @@ class R1fsManagerApiPlugin(BasePlugin):
     
     status = self.r1fs.get_ipfs_id()
 
-    data = {
-      'status' : status
-    }
-
     # Log response
-    self._log_request_response("GET_STATUS", response_data=data)
+    self._log_request_response("GET_STATUS", response_data=status)
 
-    return data
+    return status
 
 
   @BasePlugin.endpoint(method="post", streaming_type="upload", require_token=False)

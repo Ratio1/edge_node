@@ -11,7 +11,7 @@ _CONFIG = {
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
-  'CSTORE_VERBOSE' : 0,
+  'CSTORE_VERBOSE' : 11,
   
   
   'VALIDATION_RULES': {
