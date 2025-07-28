@@ -105,8 +105,11 @@ class _ContainerUtilsMixin:
     cmd += ["-e", f"CONTAINER_NAME={self.container_name}"]
     
     # TODO: check if this is a potential security issue (host is a container itself but we need to make sure)
-    cmd += ["-e", f"EE_HOST_ID={self._setup_dynamic_env_var_host_ip()}"] 
-      
+    host_ip = self._setup_dynamic_env_var_host_ip()
+    cmd += ["-e", f"EE_HOST_ID={host_ip}"]
+    cmd += ["-e", f"EE_CHAINSTORE_API_URL={self._setup_dynamic_env_var_host_ip()}:31234"]
+    cmd += ["-e", f"EE_R1FS_API_URL={self._setup_dynamic_env_var_host_ip()}:31235"]
+
 
     # Volume mounts
     if len(self.volumes) > 0:
