@@ -58,7 +58,7 @@ class R1fsManagerApiPlugin(BasePlugin):
     # Log request
     self._log_request_response("GET_STATUS", request_data={})
     
-    status = self.r1fs.get_ipfs_id()
+    status = self.r1fs.get_ipfs_id_data()
 
     # Log response
     self._log_request_response("GET_STATUS", response_data=status)
