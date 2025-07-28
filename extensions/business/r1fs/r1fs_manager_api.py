@@ -50,6 +50,10 @@ class R1fsManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="get", require_token=False)
   def get_status(self):   # /get_status
     """
+    Get the current status of the R1FS service.
+    
+    Returns:
+        dict: IPFS node information including node ID and connection status
     """
     # Log request
     self._log_request_response("GET_STATUS", request_data={})
@@ -64,8 +68,20 @@ class R1fsManagerApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint(method="post", streaming_type="upload", require_token=False)
   def add_file(self, file_path: str, body_json: any):
-    """Process the uploaded file located at file_path"""
-
+    """
+    Upload a file to R1FS (Ratio1 File System) via IPFS.
+    
+    This endpoint accepts a file upload and stores it in the decentralized file system.
+    The file is encrypted with an optional secret key for security.
+    
+    Args:
+        file_path (str): Path to the uploaded file on the server
+        body_json (dict): JSON body containing metadata including:
+            - secret (str, optional): Encryption key for the file
+    
+    Returns:
+        dict: Response containing success message and the Content Identifier (CID)
+    """
     # Log request
     request_data = {
       'file_path': file_path,
@@ -95,6 +111,20 @@ class R1fsManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="get", streaming_type="download", require_token=False)
   def get_file(self, cid: str, secret: str = None):
     """
+    Download a file from R1FS using its Content Identifier (CID).
+    
+    This endpoint retrieves a file from the decentralized file system and
+    provides it as a downloadable stream. The file is decrypted using the
+    provided secret key if it was encrypted during upload.
+    
+    Args:
+        cid (str): Content Identifier of the file to retrieve
+        secret (str, optional): Decryption key if the file was encrypted
+    
+    Returns:
+        octet-stream: The file content as a binary stream
+        x-meta header: Metadata containing file information including:
+            - filename: Original filename
     """
     # Log request
     request_data = {
@@ -127,6 +157,19 @@ class R1fsManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="post", require_token=False)
   def add_file_base64(self, file_base64_str: str, filename: str = None, secret: str = None):  # first parameter must be named token
     """
+    Upload a file to R1FS using base64-encoded data.
+    
+    This endpoint accepts file data as a base64 string and stores it in the
+    decentralized file system. Useful for uploading files directly from web
+    applications without multipart form data.
+    
+    Args:
+        file_base64_str (str): Base64-encoded file data
+        filename (str, optional): Name for the file. If not provided, a unique name is generated
+        secret (str, optional): Encryption key for the file
+    
+    Returns:
+        dict: Response containing the Content Identifier (CID) of the uploaded file
     """
     # Log request (truncate base64 string for readability)
     request_data = {
@@ -156,6 +199,18 @@ class R1fsManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="post", require_token=False)
   def get_file_base64(self, cid: str, secret: str = None):  # first parameter must be named token
     """
+    Download a file from R1FS and return it as base64-encoded data.
+    
+    This endpoint retrieves a file from the decentralized file system and
+    returns it as a base64 string. Useful for web applications that need
+    to handle file data directly in JavaScript.
+    
+    Args:
+        cid (str): Content Identifier of the file to retrieve
+        secret (str, optional): Decryption key if the file was encrypted
+    
+    Returns:
+        dict: Response containing base64-encoded file data and filename
     """
     # Log request
     request_data = {
@@ -189,6 +244,19 @@ class R1fsManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="post", require_token=False)
   def add_yaml(self, data: dict, fn: str = None, secret: str = None):   # first parameter must be named token
     """
+    Store YAML data in R1FS.
+    
+    This endpoint converts a Python dictionary to YAML format and stores it
+    in the decentralized file system. The data can be encrypted with an
+    optional secret key for security.
+    
+    Args:
+        data (dict): Python dictionary to be stored as YAML
+        fn (str, optional): Filename for the YAML file. If not provided, a unique name is generated
+        secret (str, optional): Encryption key for the YAML data
+    
+    Returns:
+        dict: Response containing the Content Identifier (CID) of the stored YAML
     """
     # Log request
     request_data = {
@@ -216,6 +284,19 @@ class R1fsManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="get", require_token=False)
   def get_yaml(self, cid: str, secret: str = None):
     """
+    Retrieve and parse YAML data from R1FS.
+    
+    This endpoint downloads a YAML file from the decentralized file system
+    and parses it back into a Python dictionary. The file is decrypted
+    using the provided secret key if it was encrypted during storage.
+    
+    Args:
+        cid (str): Content Identifier of the YAML file to retrieve
+        secret (str, optional): Decryption key if the YAML was encrypted
+    
+    Returns:
+        dict: Response containing the parsed YAML data as a Python dictionary,
+              or error message if the file is not a valid YAML file
     """
     # Log request
     request_data = {

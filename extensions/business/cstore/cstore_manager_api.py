@@ -61,6 +61,10 @@ class CstoreManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="get", require_token=False) 
   def get_status(self):   # /get_status
     """
+    Get the current status of the chainstore.
+    
+    Returns:
+        dict: A dictionary containing the list of all keys currently stored in the chainstore.
     """
     # Log request
     self._log_request_response("GET_STATUS", request_data={})
@@ -77,6 +81,14 @@ class CstoreManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="post", require_token=False)
   def set(self, key: str, value: str):  
     """
+    Set a key-value pair in the chainstore.
+    
+    Args:
+        key (str): The key to store the value under
+        value (str): The value to store
+        
+    Returns:
+        boolean: The result of the write operation
     """
     # Log request
     request_data = {
@@ -99,6 +111,13 @@ class CstoreManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="get", require_token=False)
   def get(self, key: str):
     """
+    Retrieve a value from the chainstore by key.
+    
+    Args:
+        key (str): The key to retrieve the value for
+        
+    Returns:
+        str: The value associated with the given key, or None if not found
     """
     # Log request
     request_data = {
@@ -117,6 +136,15 @@ class CstoreManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="post", require_token=False)
   def hset(self, hkey: str, key: str, value: str):  
     """
+    Set a field-value pair within a hash in the chainstore.
+    
+    Args:
+        hkey (str): The hash key (outer key)
+        key (str): The field key within the hash
+        value (str): The value to store for the field
+        
+    Returns:
+        boolean: The result of the write operation
     """
     # Log request
     request_data = {
@@ -142,6 +170,14 @@ class CstoreManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="get", require_token=False)
   def hget(self, hkey: str, key: str):
     """
+    Retrieve a field value from a hset in the chainstore.
+    
+    Args:
+        hkey (str): The hash key (outer key)
+        key (str): The field key within the hset
+        
+    Returns:
+        str: The value associated with the given field in the hset, or None if not found
     """
     # Log request
     request_data = {
@@ -161,6 +197,13 @@ class CstoreManagerApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="get", require_token=False)
   def hgetall(self, hkey: str):  
     """
+    Retrieve all field-value pairs from a hset in the chainstore.
+    
+    Args:
+        hkey (str): The hash key to retrieve all fields for
+        
+    Returns:
+        list: A list containing all hset keys
     """
     # Log request
     request_data = {
