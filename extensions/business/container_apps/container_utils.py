@@ -106,9 +106,9 @@ class _ContainerUtilsMixin:
     
     # TODO: check if this is a potential security issue (host is a container itself but we need to make sure)
     host_ip = self._setup_dynamic_env_var_host_ip()
-    cmd += ["-e", f"EE_HOST_ID={host_ip}"]
-    cmd += ["-e", f"EE_CHAINSTORE_API_URL={self._setup_dynamic_env_var_host_ip()}:31234"]
-    cmd += ["-e", f"EE_R1FS_API_URL={self._setup_dynamic_env_var_host_ip()}:31235"]
+    cmd += ["-e", f"EE_HOST_Ip={host_ip}"]
+    cmd += ["-e", f"EE_CHAINSTORE_API_URL=http://{self._setup_dynamic_env_var_host_ip()}:31234"]
+    cmd += ["-e", f"EE_R1FS_API_URL=http://{self._setup_dynamic_env_var_host_ip()}:31235"]
 
     chainstore_peers = getattr(self, 'cfg_chainstore_peers', [])
     cmd += ["-e", f"EE_CHAINSTORE_PEERS={chainstore_peers}"]
