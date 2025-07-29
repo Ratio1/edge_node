@@ -106,7 +106,7 @@ class _ContainerUtilsMixin:
     
     # TODO: check if this is a potential security issue (host is a container itself but we need to make sure)
     host_ip = self._setup_dynamic_env_var_host_ip()
-    cmd += ["-e", f"EE_HOST_Ip={host_ip}"]
+    cmd += ["-e", f"EE_HOST_IP={host_ip}"]
     cmd += ["-e", f"EE_CHAINSTORE_API_URL=http://{self._setup_dynamic_env_var_host_ip()}:31234"]
     cmd += ["-e", f"EE_R1FS_API_URL=http://{self._setup_dynamic_env_var_host_ip()}:31235"]
 
