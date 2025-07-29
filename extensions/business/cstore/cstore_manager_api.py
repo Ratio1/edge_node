@@ -79,7 +79,7 @@ class CstoreManagerApiPlugin(BasePlugin):
     return data
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def set(self, key: str, value: str, chainstore_peers: list = []):
+  def set(self, key: str, value: str, chainstore_peers: list = None):
     """
     Set a key-value pair in the chainstore.
     
@@ -92,9 +92,12 @@ class CstoreManagerApiPlugin(BasePlugin):
         boolean: The result of the write operation
     """
     # Log request
+    if chainstore_peers is None:
+      chainstore_peers = []
     request_data = {
       'key': key,
-      'value': value
+      'value': value,
+      'chainstore_peers': chainstore_peers
     }
     self._log_request_response("SET", request_data=request_data)
 
@@ -136,7 +139,7 @@ class CstoreManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def hset(self, hkey: str, key: str, value: str, chainstore_peers: list = []):
+  def hset(self, hkey: str, key: str, value: str, chainstore_peers: list = None):
     """
     Set a field-value pair within a hash in the chainstore.
     
@@ -150,10 +153,14 @@ class CstoreManagerApiPlugin(BasePlugin):
         boolean: The result of the write operation
     """
     # Log request
+    if chainstore_peers is None:
+      chainstore_peers = []
+
     request_data = {
       'hkey': hkey,
       'key': key,
-      'value': value
+      'value': value,
+      'chainstore_peers': chainstore_peers
     }
     self._log_request_response("HSET", request_data=request_data)
 
