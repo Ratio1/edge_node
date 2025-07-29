@@ -2,7 +2,6 @@ from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebApp
 
 __VER__ = '0.2.2'
 
-CHAINSTORE_MANAGER_API_PLUGIN_DEBUG = True
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -12,7 +11,8 @@ _CONFIG = {
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
   'CSTORE_VERBOSE' : 11,
-  
+
+  'DEBUG': True,
   
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -79,28 +79,33 @@ class CstoreManagerApiPlugin(BasePlugin):
     return data
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def set(self, key: str, value: str):  
+  def set(self, key: str, value: str, chainstore_peers: list = None):
     """
     Set a key-value pair in the chainstore.
     
     Args:
         key (str): The key to store the value under
         value (str): The value to store
-        
+        chainstore_peers (list): Extra chainstore peers
+
     Returns:
         boolean: The result of the write operation
     """
     # Log request
+    if chainstore_peers is None:
+      chainstore_peers = []
     request_data = {
       'key': key,
-      'value': value
+      'value': value,
+      'chainstore_peers': chainstore_peers
     }
     self._log_request_response("SET", request_data=request_data)
 
     write_result = self.chainstore_set(
       key=key,
       value=value,
-      debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG
+      debug=self.cfg_debug,
+      extra_peers=chainstore_peers,
     )
     
     # Log response
@@ -125,7 +130,7 @@ class CstoreManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("GET", request_data=request_data)
 
-    value = self.chainstore_get(key=key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
+    value = self.chainstore_get(key=key, debug=self.cfg_debug)
     
     # Log response
     self._log_request_response("GET", response_data=value)
@@ -134,7 +139,7 @@ class CstoreManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def hset(self, hkey: str, key: str, value: str):  
+  def hset(self, hkey: str, key: str, value: str, chainstore_peers: list = None):
     """
     Set a field-value pair within a hash in the chainstore.
     
@@ -142,15 +147,20 @@ class CstoreManagerApiPlugin(BasePlugin):
         hkey (str): The hash key (outer key)
         key (str): The field key within the hash
         value (str): The value to store for the field
-        
+        chainstore_peers (list): Extra chainstore peers
+
     Returns:
         boolean: The result of the write operation
     """
     # Log request
+    if chainstore_peers is None:
+      chainstore_peers = []
+
     request_data = {
       'hkey': hkey,
       'key': key,
-      'value': value
+      'value': value,
+      'chainstore_peers': chainstore_peers
     }
     self._log_request_response("HSET", request_data=request_data)
 
@@ -158,7 +168,8 @@ class CstoreManagerApiPlugin(BasePlugin):
       hkey=hkey,
       key=key,
       value=value,
-      debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG
+      debug=self.cfg_debug,
+      extra_peers=chainstore_peers,
     )
     
     # Log response
@@ -186,7 +197,7 @@ class CstoreManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("HGET", request_data=request_data)
 
-    value = self.chainstore_hget(hkey=hkey, key=key, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
+    value = self.chainstore_hget(hkey=hkey, key=key, debug=self.cfg_debug)
     
     # Log response
     self._log_request_response("HGET", response_data=value)
@@ -211,7 +222,7 @@ class CstoreManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("HGETALL", request_data=request_data)
 
-    value = self.chainstore_hgetall(hkey=hkey, debug=CHAINSTORE_MANAGER_API_PLUGIN_DEBUG)
+    value = self.chainstore_hgetall(hkey=hkey, debug=self.cfg_debug)
     
     # Log response
     self._log_request_response("HGETALL", response_data=value)
