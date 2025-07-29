@@ -279,7 +279,7 @@ class _OraSyncStatesCallbacksMixin:
         if last_ts is not None and self.time() - last_ts < send_interval:
           return
 
-        log_str = "Announcing participants:"
+        log_str = f"Announcing {len(self._announced_participating)} participants:"
         log_str += "".join([
           f"\n\t{self.netmon.network_node_eeid(oracle)} <{oracle}> {self.oracle_sync_get_node_local_availability(oracle)}"
           for oracle in self._announced_participating
@@ -543,19 +543,11 @@ class _OraSyncStatesCallbacksMixin:
       """
       # should not have received any None values
       valid_local_tables = [x for x in self.dct_local_tables.values() if x is not None]
-      valid_local_tables_count = len(valid_local_tables)
 
-      min_thr = self._count_half_of_valid_oracles()
-      if valid_local_tables_count <= min_thr:
-        self.median_table = None
-        sender_list_str = '\n'.join(list(self.dct_local_tables.keys()))
-        self.P(
-          f"Could not compute median. Too few valid values({valid_local_tables_count} <= {min_thr}).",
-          color='r', boxed=True
-        )
-        self.P(f"Gathered data from only {valid_local_tables_count} oracles:\n{sender_list_str}", color='r')
+      if not self._check_enough_oracles(participating_oracles=list(self.dct_local_tables.keys())):
+        self.P("Could not compute median.", color='r')
         return
-
+      # endif not enough oracles
       # compute median for each node in list
       self.median_table = {}
 
@@ -761,7 +753,10 @@ class _OraSyncStatesCallbacksMixin:
         ...
       }
       """
-      # endif current oracle did not manage to compute its own median table
+      if not self._check_enough_oracles(participating_oracles=list(self.dct_median_tables.keys())):
+        self.P("Could not compute agreed median table.", color='r')
+        return
+      # endif not enough oracles
 
       # expecting all median tables to contain all nodes
       # but some errors can occur, so this does no harm
