@@ -27,6 +27,8 @@ class DEEPLOY_KEYS:
   TARGETS = "targets"
   TARGET_NODES_COUNT = "target_nodes_count"
   AUTH = "auth"
+  ALLOW_UNPAID_JOB = "allow_unpaid_job"
+  JOB_ID = "job_id"
   CHAINSTORE_RESPONSE = "chainstore_response"
   PIPELINE_INPUT_TYPE = "pipeline_input_type"
   PIPELINE_INPUT_URI = "pipeline_input_uri"
@@ -58,6 +60,7 @@ class DEEPLOY_ERRORS:
   NODERES1 = "ERR06_DEEPLOY_TARGET_NODE_RESOURCES1"
   PLINST1 = "ERR07_DEEPLOY_PLUGIN_INSTANCE1"
   APP1 = "ERR08_DEEPLOY_APP1"
+  PAYMENT1 = "ERR08_DEEPLOY_PAYMENT1"
 
 class DEEPLOY_RESOURCES:
   # Result dictionary keys
