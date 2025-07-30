@@ -233,6 +233,25 @@ class _DeeployMixin:
     return result
       
 
+  def deeploy_check_payment(self, inputs):
+    """
+    Check if the payment is valid for the given job.
+    """
+    job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+    if not job_id:
+      return False
+    # Check if the job is paid
+    is_paid = False
+    try:
+      job = self.bc.web3_get_job_details(job_id=job_id)
+      if job:
+        is_paid = True
+    except Exception as e:
+      self.P(f"Error checking payment for job {job_id}: {e}")
+      is_paid = False
+
+    return is_paid
+
   def deeploy_prepare_single_plugin_instance(self, inputs):
     """
     Prepare the a single plugin instance for the pipeline creation.
