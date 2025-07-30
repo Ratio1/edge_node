@@ -23,7 +23,7 @@ class _ContainerUtilsMixin:
     cr_password = cr_data.get('PASSWORD')
     return cr_server, cr_username, cr_password
   
-  def _container_maybe_login(self):
+  def _get_container_login_command(self):
     # Login to container registry if provided
     cr_server, cr_username, cr_password = self._get_cr_data()
     
@@ -34,23 +34,15 @@ class _ContainerUtilsMixin:
         "-u", str(cr_username),
         "-p", str(cr_password),
       ]
-      try:
-        self.P(f"Logging in to registry {cr_server} as {cr_username} ...")
-        resp = subprocess.run(login_cmd, capture_output=True, check=True)
-        self.P(f"Logged in to registry {cr_server} as {cr_username}.")
-      except subprocess.CalledProcessError as e:
-        err_msg = e.stderr.decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Registry login failed for {cr_server}: {err_msg}")
-    else:
-      self.P(f"CR Login missing: {cr_username} / {cr_password} @ {cr_server}")
-    return    
+      return " ".join(login_cmd)
+
+    return None
 
 
-  def _container_pull_image(self):
+  def _get_container_pull_image_command(self):
     """
     Pull the container image (Docker/Podman).
     """
-    pulled = False
     full_ref = str(self.cfg_image)
     cmd = [self.cli_tool, "pull", full_ref]
     
@@ -60,7 +52,16 @@ class _ContainerUtilsMixin:
       # If image doesn't have the registry prefix, prepend it
       full_ref = f"{cr_server.rstrip('/')}/{self.cfg_image}"
       cmd = [self.cli_tool, "pull", full_ref]
-    self.P(f"Pulling image {full_ref} ...")
+
+    return " ".join(cmd)
+
+  def _container_pull_image(self):
+    """
+    Pull the container image (Docker/Podman).
+    """
+    pulled = False
+    full_ref = str(self.cfg_image)
+    cmd = self._get_container_pull_image_command()
     try:
       result = subprocess.check_output(cmd)
       # now check if the image was pulled or if it was already present
@@ -74,17 +75,15 @@ class _ContainerUtilsMixin:
     #end if result
     self.P(f"Image {full_ref} pulled successfull: {result.decode('utf-8', errors='ignore')}")
     return pulled
-  
 
-  def _container_run(self):
+
+  def _get_container_run_command(self):
     """
     Launch the container in detached mode, returning its ID.
     """
-    if self.cfg_image_pull_policy == "always":
-      self._container_pull_image()
 
     cmd = [
-      self.cli_tool, "run", "--rm", "-d", "--name", str(self.container_name),
+      self.cli_tool, "run", "--rm", "--name", str(self.container_name),
     ]
 
     # Resource limits
@@ -141,16 +140,7 @@ class _ContainerUtilsMixin:
     
     str_cmd = " ".join(cmd)
 
-    self.P(f"Running container: {str_cmd}")
-    res = subprocess.run(cmd, capture_output=True)
-    if res.returncode != 0:
-      err = res.stderr.decode("utf-8", errors="ignore")
-      raise RuntimeError(f"Error starting container: {err}")
-    
-    self.container_proc = res
-    self.container_id = res.stdout.decode("utf-8").strip()
-    self.container_start_time = self.time()
-    return self.container_id
+    return str_cmd
 
 
   def _container_exists(self, cid):
@@ -183,62 +173,25 @@ class _ContainerUtilsMixin:
       is_running = False    
     return is_running
 
+  def _get_container_id(self):
+    cmd = [self.cli_tool, "ps", "-q", "-f", f"name={self.container_name}"]
+    try:
+      res = subprocess.run(cmd, capture_output=True, check=True)
+      container_id = res.stdout.decode("utf-8").strip()
+      if container_id:
+        self.container_id = container_id
+        self.P(f"Container ID: {self.container_id}")
+        return container_id
+      else:
+        self.P("No container found with the specified name.", color='r')
+    except subprocess.CalledProcessError as e:
+      self.P(f"Error getting container ID: {e}", color='r')
+    return None
 
-  def _container_kill(self, cid):
-    """
-    Force kill a container by ID (if it exists).
-    """
-    if not self._container_exists(cid):
-      self.P(f"Container {cid} does not exist. Cannot kill.")
-      return
-    # Use the CLI tool to kill the container
-    kill_cmd = [self.cli_tool, "rm", "-f", cid]
-    self.P(f"Stopping container {cid} ...")    
-    res = subprocess.run(kill_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    if res.returncode != 0:
-      err = res.stderr.decode("utf-8", errors="ignore")
-      self.P(f"Error stopping container {cid}: {err}", color='r')
-    else:
-      self.P(f"Container {cid} stopped successfully.")       
-    return 
-
-
-  def _container_start_capture_logs(self):
-    """
-    Start capturing logs from the container in real-time using the CLI tool and a parallel process.
-    """
-    if self.container_id is None:
-      raise RuntimeError("Container ID is not set. Cannot capture logs.")
-    
-    self._container_maybe_stop_log_reader()
-    
-    # Start a new log process
-    log_cmd = [self.cli_tool, "logs", "-f", self.container_id]
-    self.P(f"Capturing logs for container {self.container_id} ...")
-    self.container_log_proc = subprocess.Popen(log_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    # get the stdout of the `docker logs`` command
-    # LogReader uses a separate thread to read the logs in chunks of size=50
-    self.container_logreader = self.LogReader(self.container_log_proc.stdout, size=50)
-    return
-  
-  
-  def _container_maybe_stop_log_reader(self):    
-    if self.container_log_proc is not None:
-      self.P("Stopping LogReader...")
-      self.container_logreader.stop()
-      self.P("Stopping existing docker log process ...")
-      self.container_log_proc.terminate()
-      self.container_log_proc.wait()
-      self.P("Existing docker log process stopped.")
-      self.container_log_proc = None
-    #endif log process & LogReader
-    return  
-  
-  
-  def _container_maybe_reload(self):
+  def _container_maybe_reload(self, force_restart=False):
     """
     Check if the container is still running and perform the policy specified in the restart policy.
-    
+
     """
     if self.container_id is None:
       self.P("Container ID is not set. Cannot check container status.")
@@ -250,83 +203,24 @@ class _ContainerUtilsMixin:
 
     is_running = self._container_is_running(self.container_id)
 
-    if not is_running:
+    if not is_running or force_restart:
       self.P(f"Container {self.container_id} has stopped.")
-      log_needs_restart = False
       # Handle restart policy
       if self.cfg_restart_policy == "always":
         self.P(f"Restarting container {self.container_id} ...")
-        self._container_run()
-        log_needs_restart = True
+        self._reload_server()
+        self.container_start_time = self.time()
       else:
         self.P(f"Container {self.container_id} has stopped. No action taken.")
-      
-      if log_needs_restart:
-        # Restart the log reader
-        self.container_log_last_show_time = 0
-        self.container_logs.clear()
-        self._container_start_capture_logs()
-    return
-  
-  
-  def _container_retrieve_logs(self):
-    if self.container_logreader is not None:
-      logs = self.container_logreader.get_next_characters()
-      if len(logs) > 0:
-        # first check if the last line is complete (ends with \n)
-        ends_with_newline = logs.endswith("\n")
-        lines = logs.split("\n")
-        lines[0] = self.container_log_last_line_start + lines[0] # add the last line start to the first line
-        if not ends_with_newline:
-          # if not, remove the last line from the list
-          self.container_log_last_line_start = lines[-1]
-          lines = lines[:-1]
-        else:
-          self.container_log_last_line_start = ""
-        #endif
-        #endif last line
-        for log_line in lines:
-          if len(log_line) > 0:
-            timestamp = self.time() # get the current time
-            self.container_logs.append((timestamp, log_line))
-          # end if line valid
-        # end for each line
-      # end if logs
-    #endif stdout log reader
     return
 
-
-  def _container_retrieve_and_maybe_show_logs(self):
-    """
-    Check if the logs should be shown based on the configured interval.
-    """
-    self._container_retrieve_logs()
-    current_time = self.time()
-    if (current_time - self.container_log_last_show_time) > self.cfg_show_log_each:
-      nr_lines = self.cfg_show_log_last_lines
-      self.container_log_last_show_time = current_time
-      msg = f"Container logs (last {nr_lines} lines):\n"
-      lines = list(self.container_logs)[-nr_lines:]
-      for timestamp, line in lines:
-        str_timestamp = self.time_to_str(timestamp)
-        msg += f"{str_timestamp}: {line}\n"
-      # Show the logs
-      self.P(msg)      
-    #endif show log interval
-    return
-  
-  
-  def _container_get_log_from_to(self, start_time: float, end_time: float) -> list[str]:
-    """
-    Get logs from the container between start_time and end_time.
-    """
-    logs = []
-    for timestamp, line in self.container_logs:
-      if timestamp >= start_time and timestamp <= end_time:
-        logs.append(line)
-      #endif
-    #end for each log line
-    return logs
+  def _maybe_set_container_id_and_show_app_info(self):
+    if self.container_id is None:
+      container_id = self._get_container_id()
+      if container_id:
+        self.container_id = container_id
+        self.P(f"Container ID set to: {self.container_id}")
+        self._show_container_app_info()
 
   def _maybe_send_plugin_start_confirmation(self):
     """
@@ -345,7 +239,7 @@ class _ContainerUtilsMixin:
       self.chainstore_set(response_key, response_info)
     return
   
-  
+
   def _setup_dynamic_env_var_host_ip(self):
     """ Definition for `host_ip` dynamic env var type. """
     return self.log.get_localhost_ip()
@@ -393,4 +287,38 @@ class _ContainerUtilsMixin:
         self.dynamic_env[variable_name] = variable_value
         self.P(f"Dynamic env var {variable_name} = {variable_value}")
       #endfor each variable
+
+  def _show_container_app_info(self):
+    """
+    Displays the current resource limits for the container.
+    This is a placeholder method and can be expanded as needed.
+    """
+    cr_server, cr_username, cr_password = self._get_cr_data()
+
+    msg = "Container info:\n"
+    msg += f"  Container ID:     {self.container_id}\n"
+    msg += f"  Start Time:       {self.time_to_str(self.container_start_time)}\n"
+    msg += f"  Resource CPU:     {self._cpu_limit} cores\n"
+    msg += f"  Resource GPU:     {self._gpu_limit}\n"
+    msg += f"  Resource Mem:     {self._mem_limit}\n"
+    msg += f"  Target Image:     {self.cfg_image}\n"
+    msg += f"  CR:               {cr_server}\n"
+    msg += f"  CR User:          {cr_username}\n"
+    msg += f"  CR Pass:          {'*' * len(cr_password) if cr_password else 'None'}\n"
+    msg += f"  Env Vars:         {self.cfg_env}\n"
+    msg += f"  Cont. Port:       {self.cfg_port}\n"
+    msg += f"  Restart:          {self.cfg_restart_policy}\n"
+    msg += f"  Image Pull:       {self.cfg_image_pull_policy}\n"
+    if self.volumes and len(self.volumes) > 0:
+      msg += "  Volumes:\n"
+      for host_path, container_path in self.volumes.items():
+        msg += f"    Host {host_path} → Container {container_path}\n"
+    if self.extra_ports_mapping:
+      msg += "  Extra Ports Mapping:\n"
+      for host_port, container_port in self.extra_ports_mapping.items():
+        msg += f"   Host {host_port} → Container {container_port}\n"
+    msg += f"  Ngrok Host Port:  {self.port}\n"
+    msg += f"  CLI Tool:         {self.cli_tool}\n"
+    self.P(msg)
+    return
   ## END CONTAINER MIXIN ###

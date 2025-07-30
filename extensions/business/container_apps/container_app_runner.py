@@ -26,7 +26,7 @@ import socket
 import subprocess
 import time
 
-from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
+from naeural_core.business.base.web_app.base_web_app_plugin import BaseWebAppPlugin as BasePlugin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
@@ -40,7 +40,7 @@ _CONFIG = {
 
   "PROCESS_DELAY": 5,  # seconds to wait between process calls
   "ALLOW_EMPTY_INPUTS": True,
-  
+
   "NGROK_EDGE_LABEL": None,  # Optional ngrok edge label for the tunnel
   "NGROK_AUTH_TOKEN" : None,  # Optional ngrok auth token for the tunnel
   "NGROK_USE_API": True,
@@ -59,6 +59,7 @@ _CONFIG = {
 
   # TODO: this flag needs to be renamed both here and in the ngrok mixin
   "DEBUG_WEB_APP": False,  # If True, will run the web app in debug mode
+  "CAR_DEBUG": True,  # If True, will print debug messages to the console
 
   # Container-specific config options  
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"
@@ -113,55 +114,26 @@ class ContainerAppRunnerPlugin(
   """
 
   CONFIG = _CONFIG
-  
-  def __show_container_app_info(self):
+
+  def Pd(self, s, *args, **kwargs):
     """
-    Displays the current resource limits for the container.
-    This is a placeholder method and can be expanded as needed.
+    Print a message to the console.
     """
-    cr_server, cr_username, cr_password = self._get_cr_data()
-    
-    msg = "Container info:\n"
-    msg += f"  Container ID:     {self.container_id}\n"
-    msg += f"  Start Time:       {self.time_to_str(self.container_start_time)}\n"
-    msg += f"  Resource CPU:     {self._cpu_limit} cores\n"
-    msg += f"  Resource GPU:     {self._gpu_limit}\n"
-    msg += f"  Resource Mem:     {self._mem_limit}\n"
-    msg += f"  Target Image:     {self.cfg_image}\n"
-    msg += f"  CR:               {cr_server}\n"
-    msg += f"  CR User:          {cr_username}\n"
-    msg += f"  CR Pass:          {'*' * len(cr_password) if cr_password else 'None'}\n"
-    msg += f"  Env Vars:         {self.cfg_env}\n"
-    msg += f"  Cont. Port:       {self.cfg_port}\n"
-    msg += f"  Restart:          {self.cfg_restart_policy}\n"
-    msg += f"  Image Pull:       {self.cfg_image_pull_policy}\n"
-    if self.volumes and len(self.volumes) > 0:
-      msg += "  Volumes:\n"
-      for host_path, container_path in self.volumes.items():
-        msg += f"    Host {host_path} → Container {container_path}\n"
-    if self.extra_ports_mapping:
-      msg += "  Extra Ports Mapping:\n"
-      for container_port, host_port in self.extra_ports_mapping.items():
-        msg += f"    Container {container_port} → Host {host_port}\n"
-    msg += f"  Ngrok Host Port:  {self.port}\n"
-    msg += f"  CLI Tool:         {self.cli_tool}\n"
-    self.P(msg)
+    if self.cfg_car_debug:
+      s = "[DEPDBG] " + s
+      self.P(s, *args, **kwargs)
     return
+
 
   def __reset_vars(self):
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
     self.container_proc = None
-    
+    self.container_run_command_idx = -1
 
-    self.container_log_last_show_time = 0
-    self.container_log_last_line_start = ""
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
-    self.container_log_proc = None
-    self.container_logreader = None
 
     # Handle port allocation for main port and additional ports
-    self.port = None
     self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
 
     self.volumes = {}
@@ -179,26 +151,20 @@ class ContainerAppRunnerPlugin(
     and prepares for container run.    
     """
     self.__reset_vars()
-    self.reset_tunnel_engine() # call cloudflare var init
+
+    super(ContainerAppRunnerPlugin, self).on_init()
+    self.container_start_time = self.time()
 
     self._detect_cli_tool() # detect if we have docker or podman
-    self._container_maybe_login() # login to the container registry if needed
 
     self._setup_dynamic_env() # setup dynamic env vars for the container
-    self._setup_app_tunnel_engine_port() # allocate the main port if needed
     self._setup_resource_limits() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
-
-    self._container_run() # start the container app
-    
-    self._container_start_capture_logs() # start the log reader process
-        
-    self.__show_container_app_info() # show container app info
 
     self._maybe_send_plugin_start_confirmation()
 
     return
-  
+
   
   def on_command(self, data, **kwargs):
     """
@@ -246,8 +212,8 @@ class ContainerAppRunnerPlugin(
     if data == "RESTART":
       self.P("Restarting container...")
       self._is_manually_stopped = False
-      self._stop_container_and_save_logs_to_disk()
-      self._container_maybe_reload()
+      self._container_maybe_reload(force_restart=True)
+      self.container_start_time = self.time()  # Reset the start time after restart
       return
 
     elif data == "STOP":
@@ -256,9 +222,50 @@ class ContainerAppRunnerPlugin(
       self._is_manually_stopped = True
       return
     else:
-      self.P(f"Unknown command: {data}")
+      self.P(f"Unknown plugin command: {data}")
     return
 
+  def get_setup_commands(self):
+    cfg_setup_commands = self.cfg_setup_commands
+    setup_commands = []
+    if isinstance(cfg_setup_commands, str):
+      setup_commands.append(cfg_setup_commands)
+    elif isinstance(cfg_setup_commands, list):
+      setup_commands.extend(cfg_setup_commands)
+    container_login_command = self._get_container_login_command()
+
+    if container_login_command:
+      setup_commands.append(container_login_command)
+
+    if self.cfg_image_pull_policy == "always":
+      setup_commands.append(self._get_container_pull_image_command())
+
+    try:
+      setup_commands = super(ContainerAppRunnerPlugin, self).get_setup_commands() + setup_commands
+    except Exception as e:
+      pass
+
+    return setup_commands
+
+  def get_start_commands(self):
+    cfg_start_commands = self.cfg_start_commands
+    start_commands = []
+    if isinstance(cfg_start_commands, str):
+      start_commands.append(cfg_start_commands)
+    elif isinstance(cfg_start_commands, list):
+      start_commands.extend(cfg_start_commands)
+    start_commands.append(self._get_container_run_command())
+    self.container_run_command_idx = len(start_commands) - 1
+    try:
+      start_commands = start_commands + super(ContainerAppRunnerPlugin, self).get_start_commands()
+    except Exception as e:
+      pass
+    return start_commands
+
+  def on_log_handler(self, log, key):
+    container_key = f"start_{self.container_run_command_idx}"
+    if key == container_key:
+      self.container_logs.append(log)
 
   def _detect_cli_tool(self):
     """
@@ -341,21 +348,6 @@ class ContainerAppRunnerPlugin(
     # endif volumes
     return
 
-  def _setup_app_tunnel_engine_port(self):
-    """
-    Processes the main port if specified in the configuration.
-    """
-    if self.cfg_port:
-      self.P(f"Container port {self.cfg_port} specified. Finding available host port ...")
-      # Allocate a host port for the container using the utility method
-      self.port = self.__allocate_port()
-      self.P(f"Allocated free host port {self.port} for container port {self.cfg_port}.")
-
-      self.maybe_init_tunnel_engine()
-      self.maybe_start_tunnel_engine()
-    # endif port
-    return
-
   # TODO: move to base class
   def _allocate_port(self, required_port=0, allow_dynamic=False, sleep_time=5):
     """
@@ -426,12 +418,10 @@ class ContainerAppRunnerPlugin(
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
     # Stop the container if it's running
-    if self._container_exists(self.container_id):
-      self._container_kill(self.container_id)
-      self._container_maybe_stop_log_reader()
-      self.P("Container and log stopped.")
-    else:
-      self.P(f"Container '{self.container_id}' does not exist. Stop command canceled.")
+
+    self._maybe_close_setup_commands()
+    self._maybe_close_start_commands()
+    self._maybe_read_and_stop_all_log_readers()
 
     # Stop tunnel engine if needed
     self.P("Stopping tunnel engine tunnel ...")
@@ -500,9 +490,9 @@ class ContainerAppRunnerPlugin(
       2. self._container_retrieve_and_maybe_show_logs() - check if the logs should be show as well as complete the logs
     
     """
+    self._maybe_set_container_id_and_show_app_info()
     self._maybe_autoupdate_container()
     self._container_maybe_reload()
-    self._container_retrieve_and_maybe_show_logs()
     self.__maybe_send_app_dynamic_url()
 
     return
