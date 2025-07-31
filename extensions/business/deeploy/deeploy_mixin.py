@@ -119,6 +119,12 @@ class _DeeployMixin:
         msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
       self.P(f"Starting pipeline '{app_alias}' on {addr}{msg}")
       if addr is not None:
+        dct_deeploy_specs = {
+          'job_id': inputs.job_id,
+          'project_id': project_id,
+          'nr_target_nodes': len(nodes),
+          'initial_target_nodes': nodes,
+        }
         self.cmdapi_start_pipeline_by_params(
           name=app_id,
           app_alias=app_alias,
@@ -128,7 +134,7 @@ class _DeeployMixin:
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
           is_deeployed=True,
-          deeploy_project_id=project_id,
+          deeploy_specs=dct_deeploy_specs,
         )
       # endif addr is valid
     # endfor each target node

@@ -1,3 +1,39 @@
+"""
+
+Job state:
+- (requested) but not start
+- (pending) started but not validated by consensus
+- running
+- (in-change) running but needs target nodes validation consensus
+
+
+Pre-launch:
+1.1. select each job type (UI)
+1.2. eval nodes (Deeploy API from arbitrary orcle) - @Serban to add request specs
+1.3. review project (UI)
+1.4. pay all jobs USDC (UI + SC) - we need defined
+
+
+Launch:
+2.1. UI sends to Deeploy API jobs (including job-id and project-id)
+2.2. (1 oracle) Deeploy API launches each job on all target nodes after checking via SC the payment (with job-id)
+- `getJobDetails` => balance > 0
+- `submitNodeUpdate` (target node list)
+
+
+Post-Launch:
+3.1. C=1/3 oracles will see each new job, check if if target nodes are indeed running and confirm via SC
+- get all pending or in-change ?????
+- confirm via `submitNodeUpdate`
+3.2. if less than C oracles confirm => raise some error?
+
+
+
+Epoch-end:
+4.1. 
+
+
+"""
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
 
 
@@ -11,32 +47,86 @@ _CONFIG = {
   "RUNS_ONLY_ON_SUPERVISOR_NODE" : True,
 
   # our overwritten props
-  'PROCESS_DELAY' : 1,
+  'PROCESS_DELAY' : 5,
 }
 
 class ChainDistMonitorPlugin(BasePlugin):
   
   def on_init(self):
+    self.epochs_closed = {}
     self.chainstore_hset(
       hkey='chain_dist_monitor',
       key=self.node_addr,
       value=self.time(),
     )
     self.last_live_check = self.time()
+    
+    # check if node in list and add if not
     return
   
   
   def check_all_jobs(self):
-    #
+    # check if there are any jobs that need to be validated bc.web3_get_unvalidated_jobs() (returns PENDING or IN-CHANGE jobs)
+    # for each unvalidated job:
+      # get all running apps via netmon.network_known_apps
+        # find in these apps the one with the same deeploy_specs.job_id -> collect all running nodes
+           # bc.web3_submit_node_update
+           
+    unvalidated_jobs = self.bc.web3_get_unvalidated_jobs()
+    if not unvalidated_jobs:
+      pass
+    else:
+      known_apps = self.netmon.network_known_apps()
+      for job in unvalidated_jobs:
+        job_id = job.get('job_id')
+        if not job_id:
+          continue
+        
+        # find all running apps with the same job_id
+        running_nodes = []
+        for node in known_apps:
+          deeploy_specs = known_apps[node].get('deeploy_specs', {})
+          if deeploy_specs.get('job_id') == job_id:
+            running_nodes.extend(node)
+        
+        self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes}")
+        # if we have running nodes, submit the update
+        if running_nodes:
+          self.bc.web3_submit_node_update(
+            job_id=job_id,
+            nodes=running_nodes,
+          )
     return
     
     
   def maybe_distribute_rewards(self):
+    # v1
     # check if epoch has been closed > 10m < 1h
-      # check if current node is the next in line to call rewards distribution    
-        # if so call bc.web3_distribute_rewards() THEN move token to the next oracle in line
-    # >1h check if last epoch rewards have been distributed
-      # if not then check if next in line -> then assume token -> call bc.web3_distribute_rewards() THEN move token
+      # check if current node is the next in line to call rewards distribution (has rewards TOKEN in chainstore)
+        # if so call bc.web3_distribute_rewards() THEN move TOKEN to the next oracle in line
+    # >1h check if last epoch rewards have been distributed - self.bc.web3_check_last_epoch_rewards_distributed()    
+      # ALL oracles call bc.web3_distribute_rewards() to distribute rewards
+      # arbitrary online oracle get TOKEN
+      
+    # v2:
+    last_epoch = self.netmon.epoch_manager.get_current_epoch() - 1
+    if last_epoch not in self.epochs_closed:
+      # epoch just closed we can start timer
+      self.epochs_closed[last_epoch] = {
+        'epoch': last_epoch,
+        'start_timer': self.time(),
+        'rewards_distributed': False,
+        'delay' : self.np.randint(5, 500)
+      }
+        
+    if not self.epochs_closed[last_epoch]['rewards_distributed']:
+      if self.bc.web3_check_last_epoch_rewards_distributed():
+        self.epochs_closed[last_epoch]['rewards_distributed'] = True
+      elif (self.time() - self.epochs_closed[last_epoch]['start_timer']) > self.epochs_closed[last_epoch]['delay']:
+        self.bc.web3_distribute_rewards()
+        self.epochs_closed[last_epoch]['rewards_distributed'] = True
+        #endif
+      #endif
     return
   
   def maybe_update_liveness(self):
@@ -52,4 +142,7 @@ class ChainDistMonitorPlugin(BasePlugin):
     return
   
   def process(self):
+    self.check_all_jobs()
+    self.maybe_distribute_rewards()
+    self.maybe_update_liveness()
     return
