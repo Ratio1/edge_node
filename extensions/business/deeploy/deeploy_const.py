@@ -217,12 +217,13 @@ DEEPLOY_CREATE_REQUEST_CONTAINER_APP = {
     "CONTAINER_RESOURCES" : {
       "cpu" : 1,
       "memory" : "512m",
-      "ports": {
+      "ports": { 
+      # OPTIONAL: these are extra ports that will be exposed to the host => v2
         "31250": 1849,
         "31251": 80
       }
     },
-    "PORT" : None,
+    "PORT" : None, # this is the app port (container port) that will be exposed to a dynamic host port
     "NGROK_AUTH_TOKEN" : None,  # put your ngrok API key here
     "NGROK_EDGE_LABEL" : None,  # if we have a already created ngrok edge, we can use it here
     "NGROK_ENABLED" : False, # this tells that the destination plugin instance will USE ngrok
