@@ -36,11 +36,11 @@ RUN chmod +x /usr/local/bin/*
 
 WORKDIR /edge_node
 COPY . .
-RUN #rm -rf /edge_node/cmds
+RUN rm -rf /edge_node/cmds
 
-# set a generic env variable
+# set a generic env variable 
 ENV AINODE_DOCKER=Yes
-# set a generic env variable
+# set a generic env variable 
 ENV AINODE_DOCKER_SOURCE=develop
 # set default Execution Engine id
 ENV EE_ID=E2dkr
@@ -73,13 +73,7 @@ ENV EE_DEBUG_R1FS=true
 # althouh this is not recommended as it should be in .env file
 # ENV EE_DEVICE=cuda:0
 
-RUN pip install -r requirements.txt
-#RUN pip install  --no-deps naeural-core
-
-COPY ./ratio1_sdk .
-RUN pip install -e ratio1_sdk
-
-COPY ./naeural_core .
-RUN pip install -e naeural_core
+RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --no-deps naeural-core
 
 CMD ["python3","device.py"]
