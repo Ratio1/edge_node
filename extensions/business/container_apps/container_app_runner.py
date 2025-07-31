@@ -137,7 +137,7 @@ class ContainerAppRunnerPlugin(
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
     self.container_proc = None
-    self.container_run_command_idx = -1
+    self.container_run_command_key = ""
 
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
 
@@ -265,7 +265,8 @@ class ContainerAppRunnerPlugin(
     elif isinstance(cfg_start_commands, list):
       start_commands.extend(cfg_start_commands)
     start_commands.append(self._get_container_run_command())
-    self.container_run_command_idx = len(start_commands) - 1
+    self.container_run_command_key = f"start_{len(start_commands) - 1}"
+
     try:
       start_commands = start_commands + super(ContainerAppRunnerPlugin, self).get_start_commands()
     except Exception as e:
@@ -273,8 +274,7 @@ class ContainerAppRunnerPlugin(
     return start_commands
 
   def on_log_handler(self, log, key):
-    container_key = f"start_{self.container_run_command_idx}"
-    if key == container_key:
+    if key == self.container_run_command_key:
       self.container_logs.append(log)
 
   def _detect_cli_tool(self):
