@@ -238,8 +238,8 @@ class _ContainerUtilsMixin:
 
   def _restart_container(self):
     self._container_kill(self.container_id)
-    self.container_id = None
     self._reload_server()
+    self.container_id = None
     self.container_start_time = self.time()  # Reset the start time after restart
 
   def _maybe_set_container_id_and_show_app_info(self):
