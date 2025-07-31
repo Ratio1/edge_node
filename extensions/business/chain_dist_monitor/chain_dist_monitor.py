@@ -72,7 +72,7 @@ class ChainDistMonitorPlugin(BasePlugin):
         # find in these apps the one with the same deeploy_specs.job_id -> collect all running nodes
            # bc.web3_submit_node_update
            
-    unvalidated_job_ids = self.bc.web3_get_unvalidated_job_ids()
+    unvalidated_job_ids = self.bc.get_unvalidated_job_ids()
     if not unvalidated_job_ids or not len(unvalidated_job_ids):
       pass
     else:
@@ -91,9 +91,10 @@ class ChainDistMonitorPlugin(BasePlugin):
         self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes}")
         # if we have running nodes, submit the update
         if len(running_nodes):
-          self.bc.web3_submit_node_update(
+          running_nodes_eth = [self.bc.node_address_to_eth_address(node) for node in running_nodes]
+          self.bc.submit_node_update(
             job_id=job_id,
-            nodes=running_nodes,
+            nodes=running_nodes_eth,
           )
     return
     
@@ -103,7 +104,7 @@ class ChainDistMonitorPlugin(BasePlugin):
     # check if epoch has been closed > 10m < 1h
       # check if current node is the next in line to call rewards distribution (has rewards TOKEN in chainstore)
         # if so call bc.web3_distribute_rewards() THEN move TOKEN to the next oracle in line
-    # >1h check if last epoch rewards have been distributed - self.bc.web3_check_last_epoch_rewards_distributed()    
+    # >1h check if last epoch rewards have been distributed - self.bc.get_is_last_epoch_allocated()    
       # ALL oracles call bc.web3_distribute_rewards() to distribute rewards
       # arbitrary online oracle get TOKEN
       
@@ -119,10 +120,10 @@ class ChainDistMonitorPlugin(BasePlugin):
       }
         
     if not self.epochs_closed[last_epoch]['rewards_distributed']:
-      if self.bc.web3_check_last_epoch_rewards_distributed():
+      if self.bc.get_is_last_epoch_allocated():
         self.epochs_closed[last_epoch]['rewards_distributed'] = True
       elif (self.time() - self.epochs_closed[last_epoch]['start_timer']) > self.epochs_closed[last_epoch]['delay']:
-        self.bc.web3_distribute_rewards()
+        self.bc.allocate_rewards_across_all_escrows()
         self.epochs_closed[last_epoch]['rewards_distributed'] = True
         #endif
       #endif
