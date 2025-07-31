@@ -76,7 +76,6 @@ ADMIN_PIPELINE = {
   },
 
   'CHAIN_DIST_MONITOR': {
-
   },
 
   'CSTORE_MANAGER_API': {
