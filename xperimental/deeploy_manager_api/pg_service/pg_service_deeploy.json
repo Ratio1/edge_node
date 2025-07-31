@@ -1,0 +1,32 @@
+{
+  "request": {
+    "app_alias": "pg_service_deeploy",
+    "plugin_signature": "CONTAINER_APP_RUNNER",
+    "nonce": "0x19861f54e7f",
+    "target_nodes": [
+      "SPECIFY_YOUR_TARGET_NODE_HERE"
+    ],
+    "target_nodes_count": 0,
+    "app_params": {
+      "CONTAINER_RESOURCES": {
+        "cpu": 1,
+        "memory": "512m"
+      },
+      "CR": "docker.io",
+      "RESTART_POLICY": "always",
+      "IMAGE_PULL_POLICY": "always",
+
+      "TUNNEL_ENGINE": "cloudflare",
+      "CLOUDFLARE_TOKEN": "YOUR_CLOUDFLARE_TOKEN_HERE",
+
+      "ENV": {
+        "POSTGRES_PASSWORD": "super-password"
+      },
+      "IMAGE": "postgres:17",
+      "PORT": 5432
+    },
+    "pipeline_input_type": "void",
+    "pipeline_input_uri": null,
+    "chainstore_response": true
+  }
+}
