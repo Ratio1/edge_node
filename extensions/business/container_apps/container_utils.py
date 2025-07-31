@@ -224,7 +224,6 @@ class _ContainerUtilsMixin:
     if force_restart:
       self.P(f"Force restarting container {self.container_id} ...")
       self._restart_container()
-      self.container_start_time = self.time()
       return
 
     if not is_running:

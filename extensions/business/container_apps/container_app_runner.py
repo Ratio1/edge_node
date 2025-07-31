@@ -222,8 +222,8 @@ class ContainerAppRunnerPlugin(
     if data == "RESTART":
       self.P("Restarting container...")
       self._is_manually_stopped = False
+      self._stop_container_and_save_logs_to_disk()
       self._container_maybe_reload(force_restart=True)
-      self.container_start_time = self.time()  # Reset the start time after restart
       return
 
     elif data == "STOP":
