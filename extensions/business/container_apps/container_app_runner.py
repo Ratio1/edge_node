@@ -477,8 +477,7 @@ class ContainerAppRunnerPlugin(
             self._stop_container_and_save_logs_to_disk()
             self._restart_container()
           else:
-            pass
-            # self.Pd("No updates found for the container image.")
+            self.Pd("No updates found for the container image.", score=30)
         except Exception as e:
           self.P(f"Failed to pull image {self.cfg_image}: {e}", color='r')
       else:
