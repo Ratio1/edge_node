@@ -67,14 +67,14 @@ class _ContainerUtilsMixin:
       result = subprocess.check_output(cmd)
       # now check if the image was pulled or if it was already present
       if "Image is up to date" in result.decode("utf-8", errors="ignore"):
-        self.P(f"Image {full_ref} is already up to date.")
+        self.Pd(f"Image {full_ref} is already up to date.", score=30)
       else:
-        self.P(f"Image {full_ref} pulled successfully.")
+        self.Pd(f"Image {full_ref} pulled successfully.")
         pulled = True
     except Exception as exc:
       raise RuntimeError(f"Error pulling image: {exc}")
     # end if result
-    self.P(f"Image {full_ref} pulled successfull: {result.decode('utf-8', errors='ignore')}")
+    self.Pd(f"Image {full_ref} pulled successfully: {result.decode('utf-8', errors='ignore')}", score=30)
     return pulled
 
 

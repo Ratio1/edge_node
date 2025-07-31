@@ -59,7 +59,7 @@ _CONFIG = {
 
   # TODO: this flag needs to be renamed both here and in the ngrok mixin
   "DEBUG_WEB_APP": False,  # If True, will run the web app in debug mode
-  "CAR_DEBUG": True,  # If True, will print debug messages to the console
+  "CAR_VERBOSE": 1,
 
   # Container-specific config options  
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"
@@ -123,11 +123,11 @@ class ContainerAppRunnerPlugin(
   def port(self, value):
       self._port = value
 
-  def Pd(self, s, *args, **kwargs):
+  def Pd(self, s, *args, score=-1, **kwargs):
     """
     Print a message to the console.
     """
-    if self.cfg_car_debug:
+    if self.cfg_car_verbose > score:
       s = "[DEPDBG] " + s
       self.P(s, *args, **kwargs)
     return
@@ -472,7 +472,7 @@ class ContainerAppRunnerPlugin(
     if self.cfg_autoupdate and self.container_id is not None:
       # Check if the image exists and pull it if needed
       if self._container_exists(self.container_id):
-        self.P("Checking for container image updates ...")
+        self.Pd("Checking for container image updates ...", score=30)
         try:
           # TODO: use get container has instead of pulling the image
           pulled = self._container_pull_image()
@@ -482,7 +482,8 @@ class ContainerAppRunnerPlugin(
             self._stop_container_and_save_logs_to_disk()
             self._restart_container()
           else:
-            self.P("No updates found for the container image.")
+            pass
+            # self.Pd("No updates found for the container image.")
         except Exception as e:
           self.P(f"Failed to pull image {self.cfg_image}: {e}", color='r')
       else:
