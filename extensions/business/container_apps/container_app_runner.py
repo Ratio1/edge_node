@@ -462,12 +462,6 @@ class ContainerAppRunnerPlugin(
     self._container_kill(self.container_id)
     super(ContainerAppRunnerPlugin, self).on_close()
 
-  def __maybe_send_app_dynamic_url(self):
-    self.add_payload_by_fields(
-      app_url=self.app_url,
-    )
-    return
-
 
   def _maybe_autoupdate_container(self):
     if self.cfg_autoupdate and self.container_id is not None:
@@ -505,6 +499,5 @@ class ContainerAppRunnerPlugin(
     self._maybe_set_container_id_and_show_app_info()
     self._maybe_autoupdate_container()
     self._container_maybe_reload()
-    self.__maybe_send_app_dynamic_url()
 
     return
