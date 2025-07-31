@@ -72,7 +72,7 @@ class _ContainerUtilsMixin:
         pulled = True
     except Exception as exc:
       raise RuntimeError(f"Error pulling image: {exc}")
-    #end if result
+    # end if result
     self.P(f"Image {full_ref} pulled successfull: {result.decode('utf-8', errors='ignore')}")
     return pulled
 
@@ -89,7 +89,7 @@ class _ContainerUtilsMixin:
     # Resource limits
     if self._cpu_limit:
       cmd += ["--cpus", str(self._cpu_limit)]
-      
+
     if self._mem_limit:
       cmd += ["--memory", str(self._mem_limit)]
 
@@ -173,6 +173,24 @@ class _ContainerUtilsMixin:
       is_running = False    
     return is_running
 
+  def _container_kill(self, cid):
+    """
+    Force kill a container by ID (if it exists).
+    """
+    if not self._container_exists(cid):
+      self.P(f"Container {cid} does not exist. Cannot kill.")
+      return
+    # Use the CLI tool to kill the container
+    kill_cmd = [self.cli_tool, "rm", "-f", cid]
+    self.P(f"Stopping container {cid} ...")
+    res = subprocess.run(kill_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res.returncode != 0:
+      err = res.stderr.decode("utf-8", errors="ignore")
+      self.P(f"Error stopping container {cid}: {err}", color='r')
+    else:
+      self.P(f"Container {cid} stopped successfully.")
+    return
+
   def _get_container_id(self):
     cmd = [self.cli_tool, "ps", "-q", "-f", f"name={self.container_name}"]
     try:
@@ -182,8 +200,6 @@ class _ContainerUtilsMixin:
         self.container_id = container_id
         self.P(f"Container ID: {self.container_id}")
         return container_id
-      else:
-        self.P("No container found with the specified name.", color='r')
     except subprocess.CalledProcessError as e:
       self.P(f"Error getting container ID: {e}", color='r')
     return None
@@ -194,25 +210,35 @@ class _ContainerUtilsMixin:
 
     """
     if self.container_id is None:
-      self.P("Container ID is not set. Cannot check container status.")
+      self.Pd("Container ID is not set. Cannot check container status.")
       return
 
     if self._is_manually_stopped == True:
-      self.P("Container is manually stopped. No action taken.")
+      self.Pd("Container is manually stopped. No action taken.")
       return
 
     is_running = self._container_is_running(self.container_id)
 
-    if not is_running or force_restart:
+    if force_restart:
+      self.P(f"Force restarting container {self.container_id} ...")
+      self._restart_container()
+      return
+
+    if not is_running:
       self.P(f"Container {self.container_id} has stopped.")
       # Handle restart policy
       if self.cfg_restart_policy == "always":
         self.P(f"Restarting container {self.container_id} ...")
-        self._reload_server()
-        self.container_start_time = self.time()
+        self._restart_container()
       else:
         self.P(f"Container {self.container_id} has stopped. No action taken.")
     return
+
+  def _restart_container(self):
+    self.container_id = None
+    self._container_kill(self.container_id)
+    self._reload_server()
+    self.container_start_time = self.time()  # Reset the start time after restart
 
   def _maybe_set_container_id_and_show_app_info(self):
     if self.container_id is None:

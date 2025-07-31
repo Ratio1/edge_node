@@ -419,10 +419,10 @@ class ContainerAppRunnerPlugin(
     self.P(f"Stopping container app '{self.container_id}' ...")
     # Stop the container if it's running
 
+    self._container_kill(self.container_id)
     self._maybe_close_setup_commands()
     self._maybe_close_start_commands()
     self._maybe_read_and_stop_all_log_readers()
-
     # Stop tunnel engine if needed
     self.P("Stopping tunnel engine tunnel ...")
     self.maybe_stop_tunnel_engine()
@@ -455,7 +455,6 @@ class ContainerAppRunnerPlugin(
     self.add_payload_by_fields(
       app_url=self.app_url,
     )
-
     return
 
 
@@ -471,6 +470,7 @@ class ContainerAppRunnerPlugin(
             # If the image was pulled, we can restart the container
             self.P("Stopping container to use the new image ...")
             self._stop_container_and_save_logs_to_disk()
+            self._restart_container()
           else:
             self.P("No updates found for the container image.")
         except Exception as e:
