@@ -113,6 +113,8 @@ CONTAINER_APP_RUNNER_SIGNATURE = 'CONTAINER_APP_RUNNER'
 
 DEEPLOY_CREATE_REQUEST = {
   "app_alias" : "some_app_name", 
+  "project_id" : "DELIVERD_BY_UI = SHA256(UUID)",
+  "job_id" : "DELIVERED_BY_UI_FROM_SC",
   "plugin_signature" : "SOME_PLUGIN_01",
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
   "target_nodes" : [
@@ -121,6 +123,10 @@ DEEPLOY_CREATE_REQUEST = {
   ],
   "target_nodes_count" : 0,
   "node_res_req" : { # this is the resource requirements for the target nodes
+    # this is the resource requirements for the target nodes
+    # and is usable for the case when we want to deploy our service on a much 
+    # powerful node than the actual container app needs
+    # TODO: to be added in UI
       "cpu" : 4,
       "memory" : "16GiB"   
   },
@@ -196,6 +202,8 @@ DEEPLOY_CREATE_REQUEST = {
 
 DEEPLOY_CREATE_REQUEST_CONTAINER_APP = {
   "app_alias" : "some_app_name", 
+  "project_id" : "DELIVERD_BY_UI = SHA256(UUID)",
+  "job_id" : "DELIVERED_BY_UI_FROM_SC",
   "plugin_signature" : "CONTAINER_APP_RUNNER",
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
   "target_nodes" : [
@@ -204,6 +212,10 @@ DEEPLOY_CREATE_REQUEST_CONTAINER_APP = {
   ],
   "target_nodes_count" : 0,
   "node_res_req" : { # this is the resource requirements for the target nodes
+    # this is the resource requirements for the target nodes
+    # and is usable for the case when we want to deploy our service on a much 
+    # powerful node than the actual container app needs
+    # TODO: to be added in UI
       "cpu" : 4,
       "memory" : "16GiB"   
   },
@@ -275,13 +287,19 @@ DEEPLOY_CREATE_REQUEST_CONTAINER_APP = {
 
 DEEPLOY_CREATE_REQUEST_SERVICE_APP = {
   "app_alias" : "service_<service>_etc", 
+  "project_id" : "DELIVERD_BY_UI = SHA256(UUID)",
+  "job_id" : "DELIVERED_BY_UI_FROM_SC",
   "plugin_signature" : "CONTAINER_APP_RUNNER",
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
   "target_nodes" : [
     "0xai_node_1", # always single node for service apps
   ],
   "service_replica" : "0xai_service_replica_1", # this is the service replica name, it will be used to create the service app
-  "node_res_req" : { # this is the resource requirements for the target nodes
+  "node_res_req" : { 
+    # this is the resource requirements for the target nodes
+    # and is usable for the case when we want to deploy our service on a much 
+    # powerful node than the actual container app needs
+    # TODO: to be added in UI
       "cpu" : 4,
       "memory" : "16GiB"   
   },
@@ -344,6 +362,8 @@ DEEPLOY_CREATE_REQUEST_SERVICE_APP = {
 
 DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
   "app_alias" : "some_app_name", 
+  "project_id" : "DELIVERD_BY_UI = SHA256(UUID)",
+  "job_id" : "DELIVERED_BY_UI_FROM_SC",
   "plugin_signature" : "SOME_PLUGIN_01",
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
   "target_nodes" : [
@@ -353,7 +373,7 @@ DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
   "target_nodes_count" : 0,
   "node_res_req" : { # this is the resource requirements for the target nodes
       "cpu" : 4,
-      "memory" : "16GiB"   
+      "memory" : "16GiB"   # 16GB 16G 16Gi 16Gib 16000
   },
   "app_params" : {
     "PORT" : None,

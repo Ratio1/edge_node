@@ -360,7 +360,8 @@ class ContainerAppRunnerPlugin(
     # endif port
     return
 
-  def __allocate_port(self, required_port = 0):
+  # TODO: move to base class
+  def _allocate_port(self, required_port=0, allow_dynamic=False, sleep_time=5):
     """
     Allocates an available port on the host system for container port mapping.
     
@@ -387,12 +388,40 @@ class ContainerAppRunnerPlugin(
         The socket is closed immediately after port allocation to allow the port to be used
         by the container. This is a common technique for port allocation in container runtimes.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("", required_port))
-    port = sock.getsockname()[1]
-    sock.close()
+    port = None
+    if required_port != 0:
+      self.P(f"Trying to allocate required port {required_port} ...")
+      done = False
+      while not done:
+        try:
+          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          sock.bind(("", required_port))
+          port = sock.getsockname()[1]
+          sock.close()
+          done = True
+        except Exception as e:
+          port = None
+          if allow_dynamic:
+            self.P(f"Failed to allocate required port {required_port}: {e}", color='r')
+            done = True  # if allow_dynamic is True, we stop trying to bind to the required port
+            required_port = 0  # reset to allow dynamic port allocation
+          else:
+            self.P(f"Port {required_port} is not available. Retrying in {sleep_time} seconds...", color='r')
+            self.sleep(sleep_time)  # wait before retrying
+        # endtry
+      # endwhile done
+    #endif required_port != 0
+    
+    if required_port == 0 and port is None:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      sock.bind(("", 0))
+      port = sock.getsockname()[1]
+      sock.close()
+    #endif        
     return port
+
 
   def _stop_container_and_save_logs_to_disk(self):
     """
