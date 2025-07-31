@@ -61,7 +61,8 @@ class _ContainerUtilsMixin:
     """
     pulled = False
     full_ref = str(self.cfg_image)
-    cmd = self._get_container_pull_image_command()
+    cmd_str = self._get_container_pull_image_command()
+    cmd = cmd_str.split()
     try:
       result = subprocess.check_output(cmd)
       # now check if the image was pulled or if it was already present

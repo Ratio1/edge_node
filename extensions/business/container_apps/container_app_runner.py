@@ -115,6 +115,14 @@ class ContainerAppRunnerPlugin(
 
   CONFIG = _CONFIG
 
+  @property
+  def port(self):
+      return getattr(self, '_port', None)
+
+  @port.setter
+  def port(self, value):
+      self._port = value
+
   def Pd(self, s, *args, **kwargs):
     """
     Print a message to the console.
@@ -160,6 +168,8 @@ class ContainerAppRunnerPlugin(
     self._setup_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
+
+    self.port = self._allocate_port(allow_dynamic=True) # Allocate a port for the container if needed
 
     self._maybe_send_plugin_start_confirmation()
 
@@ -303,7 +313,7 @@ class ContainerAppRunnerPlugin(
           # Handle list of container ports
           for container_port in ports:
             self.P(f"Additional container port {container_port} specified. Finding available host port ...")
-            host_port = self.__allocate_port()
+            host_port = self._allocate_port()
             self.extra_ports_mapping[host_port] = container_port
             self.P(f"Allocated free host port {host_port} for container port {container_port}.")
         else:
@@ -311,7 +321,7 @@ class ContainerAppRunnerPlugin(
           for host_port, container_port in ports.items():
             try:
               host_port = int(host_port)
-              self.__allocate_port(host_port)
+              self._allocate_port(host_port)
               self.extra_ports_mapping[host_port] = container_port
             except Exception as e:
               self.P(f"Port {host_port} is not available.")
