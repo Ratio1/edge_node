@@ -365,35 +365,10 @@ DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
     # - if NGROK_EDGE_LABEL is None and NGROK_ENABLED is True => create/use dynamic url
     # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is False => consider NGROK_ENABLED=True
     
-    "NGROK_USE_API": True,  # use API or shell for ngrok tunnel creation
-    "ENV" : {
-      "ENV1" : "value1",
-      "ENV2" : "value2",
-      "ENV3" : "value3",
-      "ENV4" : "value4",
-    },
-    "DYNAMIC_ENV" : {
-      "ENV5" : [
-        {
-          "type" : "static",
-          "value" : "http://"
-        },
-        {
-          "type" : "host_ip",
-          "value" : None
-        },
-        {
-          "type" : "static",
-          "value" : ":5080/test_api_endpoint"
-        }
-      ],
-      "ENV6" : [
-        {
-          "type" : "host_ip",
-          "value" : "http://"
-        }
-      ],
-    },    
+    "NGROK_USE_API": True,  # use API or shell for ngrok tunnel creation  
+    
+    # TODO: in v2 we need to have for each native plugin a set of default params and their values
+    #       thus the below params will be pre-completed with these default key-values
     
     "OTHER_PARAM1" : "value1",
     "OTHER_PARAM2" : "value2",
