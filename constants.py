@@ -74,7 +74,11 @@ ADMIN_PIPELINE = {
       "EE_SECURED" : 1
     },
   },
-  
+
+  'CHAIN_DIST_MONITOR': {
+
+  },
+
   'CSTORE_MANAGER_API': {
     "PROCESS_DELAY": 0,
     'TUNNEL_ENGINE_ENABLED': False,
