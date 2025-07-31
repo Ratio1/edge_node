@@ -459,7 +459,8 @@ class ContainerAppRunnerPlugin(
     Stops tunnel if started.
     """
     self._stop_container_and_save_logs_to_disk()
-
+    self._container_kill(self.container_id)
+    super(ContainerAppRunnerPlugin, self).on_close()
 
   def __maybe_send_app_dynamic_url(self):
     self.add_payload_by_fields(

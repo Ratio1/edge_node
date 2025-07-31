@@ -201,6 +201,8 @@ class _ContainerUtilsMixin:
         self.container_id = container_id
         self.P(f"Container ID: {self.container_id}")
         return container_id
+      else:
+        self.Pd("No container found with the specified name.", color='r', score=29)
     except subprocess.CalledProcessError as e:
       self.P(f"Error getting container ID: {e}", color='r')
     return None
