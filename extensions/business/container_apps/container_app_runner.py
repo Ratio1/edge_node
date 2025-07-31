@@ -80,6 +80,7 @@ _CONFIG = {
   },
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
+  "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
   
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   
@@ -360,7 +361,8 @@ class ContainerAppRunnerPlugin(
     # endif port
     return
 
-  def __allocate_port(self, required_port = 0):
+  # TODO: move to base class
+  def _allocate_port(self, required_port=0, allow_dynamic=False, sleep_time=5):
     """
     Allocates an available port on the host system for container port mapping.
     
@@ -387,12 +389,40 @@ class ContainerAppRunnerPlugin(
         The socket is closed immediately after port allocation to allow the port to be used
         by the container. This is a common technique for port allocation in container runtimes.
     """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.bind(("", required_port))
-    port = sock.getsockname()[1]
-    sock.close()
+    port = None
+    if required_port != 0:
+      self.P(f"Trying to allocate required port {required_port} ...")
+      done = False
+      while not done:
+        try:
+          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          sock.bind(("", required_port))
+          port = sock.getsockname()[1]
+          sock.close()
+          done = True
+        except Exception as e:
+          port = None
+          if allow_dynamic:
+            self.P(f"Failed to allocate required port {required_port}: {e}", color='r')
+            done = True  # if allow_dynamic is True, we stop trying to bind to the required port
+            required_port = 0  # reset to allow dynamic port allocation
+          else:
+            self.P(f"Port {required_port} is not available. Retrying in {sleep_time} seconds...", color='r')
+            self.sleep(sleep_time)  # wait before retrying
+        # endtry
+      # endwhile done
+    #endif required_port != 0
+    
+    if required_port == 0 and port is None:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      sock.bind(("", 0))
+      port = sock.getsockname()[1]
+      sock.close()
+    #endif        
     return port
+
 
   def _stop_container_and_save_logs_to_disk(self):
     """
@@ -470,6 +500,27 @@ class ContainerAppRunnerPlugin(
       )
     # endif last ngrok url ping
     return
+  
+  
+  def _maybe_autoupdate_container(self):
+    if self.cfg_autoupdate and self.container_id is not None:
+      # Check if the image exists and pull it if needed
+      if self._container_exists(self.container_id):
+        self.P("Checking for container image updates ...")
+        try:
+          # TODO: use get container has instead of pulling the image
+          pulled = self._container_pull_image()
+          if pulled:
+            # If the image was pulled, we can restart the container
+            self.P("Stopping container to use the new image ...")
+            self._stop_container_and_save_logs_to_disk()
+          else:
+            self.P("No updates found for the container image.")
+        except Exception as e:
+          self.P(f"Failed to pull image {self.cfg_image}: {e}", color='r')
+      else:
+        self.P("Container does not exist, skipping image update check.")
+    return
 
 
   def process(self):
@@ -482,8 +533,10 @@ class ContainerAppRunnerPlugin(
       2. self._container_retrieve_and_maybe_show_logs() - check if the logs should be show as well as complete the logs
     
     """
+    self._maybe_autoupdate_container()
     self._container_maybe_reload()
     self._container_retrieve_and_maybe_show_logs()
     self.__maybe_send_ngrok_dynamic_url()
+    
 
     return

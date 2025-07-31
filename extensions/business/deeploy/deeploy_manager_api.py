@@ -177,15 +177,17 @@ class DeeployManagerApiPlugin(
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)   
       auth_result = self.deeploy_get_auth_result(inputs)
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+      is_confirmable_job = inputs.chainstore_response
 
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
-      app_id = (app_alias.lower()[:8] + "_" + self.uuid(7)).lower()
+      app_id = (app_alias.lower()[:13] + "_" + self.uuid(7)).lower()
 
       # check payment
-      allow_unpaid_job = inputs[DEEPLOY_KEYS.ALLOW_UNPAID_JOB] if DEEPLOY_KEYS.ALLOW_UNPAID_JOB in inputs else False
+      allow_unpaid_job = inputs.get(DEEPLOY_KEYS.ALLOW_UNPAID_JOB, False)
       if not allow_unpaid_job:
-        is_paid = self.deeploy_check_payment(inputs)
+        is_paid = self.deeploy_check_payment(inputs, debug=self.cfg_deeploy_verbose > 1)
         if not is_paid:
           msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid. Please pay the required amount to proceed."
           raise ValueError(msg)
@@ -201,6 +203,16 @@ class DeeployManagerApiPlugin(
         app_type=app_type,
         nodes=nodes
       )
+      
+      if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+        if (dct_status is not None and is_confirmable_job and len(nodes) == len(dct_status)) or not is_confirmable_job:
+          eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in nodes]
+          self.bc.web3_submit_node_update(
+            job_id=job_id,
+            nodes=eth_nodes,
+          )
+        #endif
+      #endif
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
