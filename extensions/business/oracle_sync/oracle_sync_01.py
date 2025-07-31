@@ -207,16 +207,16 @@ class OracleSync01Plugin(
               # 'TRANSITION_CONDITION': self._can_participate_in_sync,
               # This will always happen because the current oracle already checked
               # if it can participate in the sync process.
-              'TRANSITION_CONDITION': self.state_machine_api_callback_always_true,
+              'TRANSITION_CONDITION': self._check_no_exception_occurred,
               'ON_TRANSITION_CALLBACK': self.state_machine_api_callback_do_nothing,
               'DESCRIPTION': "If the node can participate, join the sync process",
             },
-            # {
-            #   'NEXT_STATE': self.STATES.S8_SEND_REQUEST_AGREED_MEDIAN_TABLE,
-            #   'TRANSITION_CONDITION': self._cannot_participate_in_sync,
-            #   'ON_TRANSITION_CALLBACK': self.state_machine_api_callback_do_nothing,
-            #   'DESCRIPTION': "If the node cannot participate, periodically request the agreed median table from the oracles",
-            # }
+            {
+              'NEXT_STATE': self.STATES.S8_SEND_REQUEST_AGREED_MEDIAN_TABLE,
+              'TRANSITION_CONDITION': self._check_exception_occurred,
+              'ON_TRANSITION_CALLBACK': self.state_machine_api_callback_do_nothing,
+              'DESCRIPTION': "If the node cannot participate, periodically request the agreed median table from the oracles",
+            }
           ],
         },
         self.STATES.S2_SEND_LOCAL_TABLE: {
@@ -412,6 +412,7 @@ class OracleSync01Plugin(
     self.P(f'Resetting to initial state')
     self._current_epoch = self.netmon.epoch_manager.get_current_epoch()
     self.current_epoch_computed = False
+    self.exception_occurred = False
 
     self.is_participating = {}
 
@@ -530,7 +531,14 @@ class OracleSync01Plugin(
     return
 
   def process(self):
-    self.maybe_refresh_oracle_list()
-    self.state_machine_api_step(self.state_machine_name)
-    self.maybe_self_assessment()
+    try:
+      self.maybe_refresh_oracle_list()
+      self.state_machine_api_step(self.state_machine_name)
+      self.maybe_self_assessment()
+    except Exception as e:
+      sleep_period = 0.1
+      self.exception_occurred = True
+      self.P(f"Exception during process:\n{self.trace_info()}\nSleeping for {sleep_period} seconds.", color='r')
+      self.sleep(sleep_period)
+    # endtry-except
     return

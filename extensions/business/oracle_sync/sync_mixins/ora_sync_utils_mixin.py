@@ -6,6 +6,8 @@ from extensions.business.oracle_sync.sync_mixins.ora_sync_constants import (
   
   ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD,
   ORACLE_SYNC_ACCEPTED_MEDIAN_ERROR_MARGIN,
+  ORACLE_SYNC_BLOCKCHAIN_PRESENCE_MIN_THRESHOLD,
+  ORACLE_SYNC_ONLINE_PRESENCE_MIN_THRESHOLD,
   
   DEBUG_MODE,
   VALUE_STANDARDS
@@ -607,6 +609,44 @@ class _OraSyncUtilsMixin:
 
   """CHECKERS SECTION"""
   if True:
+    def _check_enough_oracles(self, participating_oracles: list[str], show_logs: bool = True):
+      blockchain_oracles = self.get_oracle_list()
+      # TODO: review if is_online or is_potentially_full_online is better here.
+      online_oracles = [oracle for oracle in blockchain_oracles if self.netmon.network_node_is_online(oracle)]
+
+      blockchain_min_threshold = len(blockchain_oracles) * ORACLE_SYNC_BLOCKCHAIN_PRESENCE_MIN_THRESHOLD
+      online_min_threshold = len(online_oracles) * ORACLE_SYNC_ONLINE_PRESENCE_MIN_THRESHOLD
+      cnt_participating = len(participating_oracles)
+
+      participating_str = ''.join([
+        f"\n\t{self.netmon.network_node_eeid(oracle)} <{oracle}>"
+        for oracle in participating_oracles
+      ])
+
+      if cnt_participating <= blockchain_min_threshold:
+        log_msg = "Not enough participating oracles!"
+        log_msg += f"{cnt_participating}/{len(blockchain_oracles)} <= {ORACLE_SYNC_BLOCKCHAIN_PRESENCE_MIN_THRESHOLD}"
+        log_msg += f" (blockchain presence threshold: {blockchain_min_threshold})"
+        log_msg += f"\nParticipating oracles:{participating_str}"
+        if show_logs:
+          self.P(log_msg, color='r')
+        return False
+      if cnt_participating <= online_min_threshold:
+        log_msg = "Not enough online oracles!"
+        log_msg += f"{cnt_participating}/{len(online_oracles)} <= {ORACLE_SYNC_ONLINE_PRESENCE_MIN_THRESHOLD}"
+        log_msg += f" (online presence threshold: {online_min_threshold})"
+        log_msg += f"\nParticipating oracles:{participating_str}"
+        if show_logs:
+          self.P(log_msg, color='r')
+        return False
+      return True
+
+    def _check_exception_occurred(self):
+      return self.exception_occurred
+
+    def _check_no_exception_occurred(self):
+      return not self._check_exception_occurred()
+
     def _check_received_oracle_data_for_values(
         self, sender: str, oracle_data: dict,
         expected_variable_names: list[str],
