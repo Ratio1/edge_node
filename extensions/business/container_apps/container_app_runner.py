@@ -80,6 +80,7 @@ _CONFIG = {
   },
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
+  "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
   
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   
@@ -499,6 +500,27 @@ class ContainerAppRunnerPlugin(
       )
     # endif last ngrok url ping
     return
+  
+  
+  def _maybe_autoupdate_container(self):
+    if self.cfg_autoupdate and self.container_id is not None:
+      # Check if the image exists and pull it if needed
+      if self._container_exists(self.container_id):
+        self.P("Checking for container image updates ...")
+        try:
+          # TODO: use get container has instead of pulling the image
+          pulled = self._container_pull_image()
+          if pulled:
+            # If the image was pulled, we can restart the container
+            self.P("Stopping container to use the new image ...")
+            self._stop_container_and_save_logs_to_disk()
+          else:
+            self.P("No updates found for the container image.")
+        except Exception as e:
+          self.P(f"Failed to pull image {self.cfg_image}: {e}", color='r')
+      else:
+        self.P("Container does not exist, skipping image update check.")
+    return
 
 
   def process(self):
@@ -511,8 +533,10 @@ class ContainerAppRunnerPlugin(
       2. self._container_retrieve_and_maybe_show_logs() - check if the logs should be show as well as complete the logs
     
     """
+    self._maybe_autoupdate_container()
     self._container_maybe_reload()
     self._container_retrieve_and_maybe_show_logs()
     self.__maybe_send_ngrok_dynamic_url()
+    
 
     return

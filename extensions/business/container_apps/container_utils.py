@@ -50,6 +50,7 @@ class _ContainerUtilsMixin:
     """
     Pull the container image (Docker/Podman).
     """
+    pulled = False
     full_ref = str(self.cfg_image)
     cmd = [self.cli_tool, "pull", full_ref]
     
@@ -62,11 +63,17 @@ class _ContainerUtilsMixin:
     self.P(f"Pulling image {full_ref} ...")
     try:
       result = subprocess.check_output(cmd)
+      # now check if the image was pulled or if it was already present
+      if "Image is up to date" in result.decode("utf-8", errors="ignore"):
+        self.P(f"Image {full_ref} is already up to date.")
+      else:
+        self.P(f"Image {full_ref} pulled successfully.")
+        pulled = True
     except Exception as exc:
       raise RuntimeError(f"Error pulling image: {exc}")
     #end if result
     self.P(f"Image {full_ref} pulled successfull: {result.decode('utf-8', errors='ignore')}")
-    return
+    return pulled
   
 
   def _container_run(self):
@@ -231,6 +238,7 @@ class _ContainerUtilsMixin:
   def _container_maybe_reload(self):
     """
     Check if the container is still running and perform the policy specified in the restart policy.
+    
     """
     if self.container_id is None:
       self.P("Container ID is not set. Cannot check container status.")
