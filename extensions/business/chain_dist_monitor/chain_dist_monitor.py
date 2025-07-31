@@ -72,13 +72,12 @@ class ChainDistMonitorPlugin(BasePlugin):
         # find in these apps the one with the same deeploy_specs.job_id -> collect all running nodes
            # bc.web3_submit_node_update
            
-    unvalidated_jobs = self.bc.web3_get_unvalidated_jobs()
-    if not unvalidated_jobs:
+    unvalidated_job_ids = self.bc.web3_get_unvalidated_job_ids()
+    if not unvalidated_job_ids or not len(unvalidated_job_ids):
       pass
     else:
       known_apps = self.netmon.network_known_apps()
-      for job in unvalidated_jobs:
-        job_id = job.get('job_id')
+      for job_id in unvalidated_job_ids:
         if not job_id:
           continue
         
@@ -91,7 +90,7 @@ class ChainDistMonitorPlugin(BasePlugin):
         
         self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes}")
         # if we have running nodes, submit the update
-        if running_nodes:
+        if len(running_nodes):
           self.bc.web3_submit_node_update(
             job_id=job_id,
             nodes=running_nodes,
