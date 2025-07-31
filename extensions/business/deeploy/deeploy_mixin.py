@@ -251,7 +251,7 @@ class _DeeployMixin:
     # Check if the job is paid
     is_paid = False
     try:
-      job = self.bc.web3_get_job_details(job_id=job_id)
+      job = self.bc.get_job_details(job_id=job_id)
       if job:
         is_paid = True
         if debug:
