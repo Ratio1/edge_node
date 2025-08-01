@@ -241,7 +241,7 @@ class _DeeployMixin:
     return result
       
 
-  def deeploy_check_payment(self, inputs, debug=False):
+  def deeploy_check_payment_and_job_owner(self, inputs, sender, debug=False):
     """
     Check if the payment is valid for the given job.
     """
@@ -249,11 +249,12 @@ class _DeeployMixin:
     if not job_id:
       return False
     # Check if the job is paid
-    is_paid = False
+    is_valid = False
     try:
       job = self.bc.get_job_details(job_id=job_id)
       if job:
-        is_paid = True
+        job_owner = job.get('escrowOwner', None)
+        is_valid = (sender == job_owner) if sender and job_owner else False
         if debug:
           self.P(f"Job {job_id} is paid:\n{self.json_dumps(job, indent=2)}")
       else:
@@ -262,9 +263,9 @@ class _DeeployMixin:
       # endif
     except Exception as e:
       self.P(f"Error checking payment for job {job_id}: {e}")
-      is_paid = False
+      is_valid = False
 
-    return is_paid
+    return is_valid
 
   def deeploy_prepare_single_plugin_instance(self, inputs):
     """
