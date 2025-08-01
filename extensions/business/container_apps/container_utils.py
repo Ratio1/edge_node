@@ -118,7 +118,7 @@ class _ContainerUtilsMixin:
     cmd += ["-e", f"EE_R1FS_API_URL=http://{self._setup_dynamic_env_var_host_ip()}:31235"]
 
     chainstore_peers = getattr(self, 'cfg_chainstore_peers', [])
-    cmd += ["-e", f"EE_CHAINSTORE_PEERS={chainstore_peers}"]
+    cmd += ["-e", f"EE_CHAINSTORE_PEERS='{self.json_dumps(chainstore_peers)}'"]
 
 
     # Volume mounts
