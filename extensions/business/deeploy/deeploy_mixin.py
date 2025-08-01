@@ -164,13 +164,18 @@ class _DeeployMixin:
       current_time = self.time()
       if current_time - start_time > timeout_seconds:
         str_status = DEEPLOY_STATUS.TIMEOUT
+        self.P(f"Timeout reached ({timeout_seconds} seconds) while waiting for responses. Current status: {self.json_dumps(dct_status, indent=2)}")
+        self.P(f"Response keys: {self.json_dumps(response_keys, indent=2)}")
         break
         
       for response_key in response_keys:
+        if response_key in dct_status:
+          continue
         node_info = response_keys[response_key]
         node_addr = node_info['addr']
         res = self.chainstore_get(response_key)
         if res is not None:
+          self.Pd(f"Received response for {response_key} from {node_addr}: {self.json_dumps(res)}. Node Info: {self.json_dumps(node_info)}")
           dct_status[response_key] = {
             'node': node_addr,
             'details': res,

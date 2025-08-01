@@ -172,7 +172,11 @@ class DeeployManagerApiPlugin(
           
     TODO: (Vitalii)
       - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
-    
+    TODO: (Vitalii)
+      - Change from sync to async.
+        Sending the jobs to nodes, while UI will do pooling for the job status.
+        1. Request comes in. Response command sent.
+        2. Move while checker for chainstore keys in process.
     """
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)   
