@@ -248,6 +248,7 @@ class _ContainerUtilsMixin:
       if container_id:
         self.container_id = container_id
         self.P(f"Container ID set to: {self.container_id}")
+        self._maybe_send_plugin_start_confirmation()
         self._show_container_app_info()
 
   def _maybe_send_plugin_start_confirmation(self):
