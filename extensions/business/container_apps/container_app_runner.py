@@ -171,8 +171,6 @@ class ContainerAppRunnerPlugin(
 
     self.port = self._allocate_port(allow_dynamic=True) # Allocate a port for the container if needed
 
-    self._maybe_send_plugin_start_confirmation()
-
     return
 
   

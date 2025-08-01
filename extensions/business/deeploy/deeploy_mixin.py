@@ -140,7 +140,7 @@ class _DeeployMixin:
     # endfor each target node
     return response_keys
 
-  def __get_pipeline_responses(self, response_keys, timeout_seconds=90):
+  def __get_pipeline_responses(self, response_keys, timeout_seconds=300):
     """
     Wait until all the responses are received via CSTORE and compose status response.
     Args:
@@ -309,7 +309,7 @@ class _DeeployMixin:
     response_keys = self.__launch_pipeline_on_nodes(nodes, inputs, app_id, app_alias, app_type, sender)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
-    dct_status, str_status = self.__get_pipeline_responses(response_keys)
+    dct_status, str_status = self.__get_pipeline_responses(response_keys, 300)
 
     self.P(f"Pipeline responses: str_status = {str_status} | dct_status =\n {self.json_dumps(dct_status, indent=2)}")
     
