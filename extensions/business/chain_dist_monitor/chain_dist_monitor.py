@@ -109,6 +109,8 @@ class ChainDistMonitorPlugin(BasePlugin):
       # arbitrary online oracle get TOKEN
       
     # v2:
+    MIN_THRESHOLD = self.cfg_process_delay * 2 # seconds
+    MAX_THRESHOLD = self.cfg_process_delay * 100 # seconds
     last_epoch = self.netmon.epoch_manager.get_current_epoch() - 1
     if last_epoch not in self.epochs_closed:
       # epoch just closed we can start timer
@@ -116,7 +118,7 @@ class ChainDistMonitorPlugin(BasePlugin):
         'epoch': last_epoch,
         'start_timer': self.time(),
         'rewards_distributed': False,
-        'delay' : self.np.randint(5, 500)
+        'delay' : self.np.random.randint(MIN_THRESHOLD, MAX_THRESHOLD)
       }
         
     if not self.epochs_closed[last_epoch]['rewards_distributed']:
