@@ -270,7 +270,9 @@ class _DeeployTargetNodesMixin:
       ai_addr = self.bc.maybe_add_prefix(addr)
 
       is_online = self.netmon.network_node_is_online(ai_addr)
-      if value.get('is_supervisor') is True or not value.get('trusted', False) or not is_online:
+      if value.get('is_supervisor') is True or not is_online:
+      # FIXME: Disabled for now, as the most of the nodes are are marked as non-trusted.
+      # if value.get('is_supervisor') is True or not value.get('trusted', False) or not is_online:
         continue
       non_supervisor_nodes.append(addr)
 
