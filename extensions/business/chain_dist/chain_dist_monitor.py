@@ -59,7 +59,7 @@ class ChainDistMonitorPlugin(BasePlugin):
     Print a message to the console.
     """
     if self.cfg_chain_dist_monitor_verbosity > verbosity:
-      s = "[DEPDBG] " + s
+      s = "[DEDUG] " + s
       self.P(s, *args, **kwargs)
     return
 
