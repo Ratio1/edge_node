@@ -160,7 +160,13 @@ class ChainDistMonitorPlugin(BasePlugin):
     return
   
   def process(self):
-    self.check_all_jobs()
-    self.maybe_distribute_rewards()
-    self.maybe_update_liveness()
+    try:
+      self.check_all_jobs()
+      self.maybe_distribute_rewards()
+      self.maybe_update_liveness()
+    except Exception as e:
+      sleep_period = 0.1
+      self.P(f"Exception during process:\n{self.trace_info()}\nSleeping for {sleep_period} seconds.", color='r')
+      self.sleep(sleep_period)
+    # endtry-except
     return
