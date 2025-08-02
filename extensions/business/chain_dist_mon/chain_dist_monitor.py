@@ -72,7 +72,7 @@ class ChainDistMonitorPlugin(BasePlugin):
         # find in these apps the one with the same deeploy_specs.job_id -> collect all running nodes
            # bc.web3_submit_node_update
            
-    unvalidated_job_ids = self.bc.get_unvalidated_job_ids()
+    unvalidated_job_ids = self.bc.get_unvalidated_job_ids(oracle_address=self.bc.eth_address)
     if not unvalidated_job_ids or not len(unvalidated_job_ids):
       pass
     else:
