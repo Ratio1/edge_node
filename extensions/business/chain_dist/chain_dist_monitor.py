@@ -46,12 +46,24 @@ _CONFIG = {
   
   "RUNS_ONLY_ON_SUPERVISOR_NODE" : True,
 
+  "CHAIN_DIST_MONITOR_VERBOSITY": 5,
+
   # our overwritten props
   'PROCESS_DELAY' : 5,
 }
 
 class ChainDistMonitorPlugin(BasePlugin):
-  
+
+  def Pd(self, s, *args, verbosity=0, **kwargs):
+    """
+    Print a message to the console.
+    """
+    if self.cfg_chain_dist_monitor_verbosity > verbosity:
+      s = "[DEDUG] " + s
+      self.P(s, *args, **kwargs)
+    return
+
+
   def on_init(self):
     self.epochs_closed = {}
     self.chainstore_hset(
@@ -83,12 +95,16 @@ class ChainDistMonitorPlugin(BasePlugin):
         
         # find all running apps with the same job_id
         running_nodes = []
-        for node in known_apps:
-          deeploy_specs = known_apps[node].get('deeploy_specs', {})
-          if deeploy_specs.get('job_id') == job_id:
-            running_nodes.extend(node)
+        self.Pd(f"Checking for running nodes for job {job_id}...", verbosity=3)
+
+        for node, apps in known_apps.items():
+          for pipeline_name, pipeline in apps.items():
+            # TODO: Use const from sdk for deeploy_specs.
+            deeploy_specs = pipeline.get('deeploy_specs', {})
+            if deeploy_specs.get('job_id') == job_id:
+              running_nodes.append(node)
         
-        self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes}")
+        self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes}", verbosity=3)
         # if we have running nodes, submit the update
         if len(running_nodes):
           running_nodes_eth = [self.bc.node_address_to_eth_address(node) for node in running_nodes]
@@ -144,7 +160,13 @@ class ChainDistMonitorPlugin(BasePlugin):
     return
   
   def process(self):
-    self.check_all_jobs()
-    self.maybe_distribute_rewards()
-    self.maybe_update_liveness()
+    try:
+      self.check_all_jobs()
+      self.maybe_distribute_rewards()
+      self.maybe_update_liveness()
+    except Exception as e:
+      sleep_period = 0.1
+      self.P(f"Exception during process:\n{self.trace_info()}\nSleeping for {sleep_period} seconds.", color='r')
+      self.sleep(sleep_period)
+    # endtry-except
     return
