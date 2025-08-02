@@ -1,0 +1,35 @@
+{
+  "request": {
+    "app_alias": "pg_service",
+    "plugin_signature": "CONTAINER_APP_RUNNER",
+    "nonce": "0x198616a2034",
+    "target_nodes": [
+      "SPECIFY_YOUR_TARGET_NODE_HERE"
+    ],
+    "target_nodes_count": 0,
+    "app_params": {
+      "CONTAINER_RESOURCES": {
+        "cpu": 1,
+        "memory": "512m"
+      },
+      "VOLUMES": {
+        "data": "/var/lib/postgresql/data"
+      },
+      "CR": "docker.io",
+      "CR_PASSWORD": "password",
+      "CR_USER": "user",
+      "RESTART_POLICY": "always",
+      "IMAGE_PULL_POLICY": "always",
+      "ENV": {
+        "POSTGRES_PASSWORD": "password"
+      },
+      "IMAGE": "postgres:17",
+      "PORT": 5432,
+      "NGROK_EDGE_LABEL": "YOUR_LABEL HERE",
+      "TUNNEL_ENGINE": "ngrok"
+    },
+    "pipeline_input_type": "void",
+    "pipeline_input_uri": null,
+    "chainstore_response": true
+  }
+}

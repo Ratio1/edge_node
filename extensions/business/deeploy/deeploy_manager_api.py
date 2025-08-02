@@ -172,15 +172,30 @@ class DeeployManagerApiPlugin(
           
     TODO: (Vitalii)
       - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
-    
+    TODO: (Vitalii)
+      - Change from sync to async.
+        Sending the jobs to nodes, while UI will do pooling for the job status.
+        1. Request comes in. Response command sent.
+        2. Move while checker for chainstore keys in process.
     """
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)   
       auth_result = self.deeploy_get_auth_result(inputs)
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+      is_confirmable_job = inputs.chainstore_response
 
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
-      app_id = (app_alias.lower()[:8] + "_" + self.uuid(7)).lower()
+      app_id = (app_alias.lower()[:13] + "_" + self.uuid(7)).lower()
+
+      # check payment
+      allow_unpaid_job = inputs.get(DEEPLOY_KEYS.ALLOW_UNPAID_JOB, False)
+      if not allow_unpaid_job:
+        is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
+        if not is_valid:
+          msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
+          raise ValueError(msg)
+      # TODO: Add check if jobType resources match the requested resources.
 
       nodes = self._check_nodes_availability(inputs)
 
@@ -192,6 +207,16 @@ class DeeployManagerApiPlugin(
         app_type=app_type,
         nodes=nodes
       )
+      
+      if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+        if (dct_status is not None and is_confirmable_job and len(nodes) == len(dct_status)) or not is_confirmable_job:
+          eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in nodes]
+          self.bc.submit_node_update(
+            job_id=job_id,
+            nodes=eth_nodes,
+          )
+        #endif
+      #endif
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:

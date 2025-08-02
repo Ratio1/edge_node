@@ -207,9 +207,10 @@ class _DeeployTargetNodesMixin:
     return suitable_nodes
 
 
-  def __check_nodes_required_resources_and_extract_resources(self, nodes: list['str'], inputs):
+  def __check_nodes_capabilities_and_extract_resources(self, nodes: list['str'], inputs):
     """
-    Check if the nodes have required resources for the deeployment.
+    Check if the nodes have required resources for the deeployment and if it supports the requested plugin.
+      Checks if the node is capable of deploying the container app.
     Returns a dictionary with node addresses as keys and their total resources as values.
     """
     node_req_res = inputs.get(DEEPLOY_RESOURCES.NODE_RESOURCES_REQUEST, {})
@@ -220,6 +221,13 @@ class _DeeployTargetNodesMixin:
 
     suitable_nodes_with_resources = {}
     for addr in nodes:
+      # Check if the node supports the requested plugin
+      if inputs.plugin_signature in [CONTAINER_APP_RUNNER_SIGNATURE]:
+        is_did_supported = self.netmon.network_node_has_did(addr=addr)
+        if not is_did_supported:
+          self.Pd(f"Node {addr} does not support the requested plugin {inputs.plugin_signature}. Skipping...")
+          continue
+
       total_cpu = self.netmon.network_node_total_cpu_cores(addr)
 
       total_memory = self.netmon.network_node_total_mem(addr)
@@ -271,7 +279,7 @@ class _DeeployTargetNodesMixin:
     self.Pd(f"Network nodes: {self.json_dumps(network_nodes)}")
     self.Pd(f"Non supervisor Network nodes: {self.json_dumps(non_supervisor_nodes)}")
 
-    suitable_nodes_with_resources = self.__check_nodes_required_resources_and_extract_resources(
+    suitable_nodes_with_resources = self.__check_nodes_capabilities_and_extract_resources(
       nodes=non_supervisor_nodes, inputs=inputs)
     self.Pd(f"Suitable nodes with resources: {self.json_dumps(suitable_nodes_with_resources)}")
     apps = self._get_online_apps()

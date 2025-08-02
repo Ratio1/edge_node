@@ -87,6 +87,7 @@ class _DeeployMixin:
     Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
     """
     plugins = self.deeploy_prepare_plugins(inputs)
+    project_id = inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
     response_keys = {}
     for addr in nodes:
       # Nodes to peer with for CHAINSTORE
@@ -103,7 +104,7 @@ class _DeeployMixin:
           
           # Configure response keys if needed
           if inputs.chainstore_response:
-            response_key = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] + '_' + self.uuid(4)
+            response_key = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] + '_' + self.uuid(8)
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
             response_keys[response_key] = {
               'addr': addr,
@@ -118,6 +119,12 @@ class _DeeployMixin:
         msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
       self.P(f"Starting pipeline '{app_alias}' on {addr}{msg}")
       if addr is not None:
+        dct_deeploy_specs = {
+          'job_id': inputs.job_id,
+          'project_id': project_id,
+          'nr_target_nodes': len(nodes),
+          'initial_target_nodes': nodes,
+        }
         self.cmdapi_start_pipeline_by_params(
           name=app_id,
           app_alias=app_alias,
@@ -127,12 +134,13 @@ class _DeeployMixin:
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
           is_deeployed=True,
+          deeploy_specs=dct_deeploy_specs,
         )
       # endif addr is valid
     # endfor each target node
     return response_keys
 
-  def __get_pipeline_responses(self, response_keys, timeout_seconds=90):
+  def __get_pipeline_responses(self, response_keys, timeout_seconds=300):
     """
     Wait until all the responses are received via CSTORE and compose status response.
     Args:
@@ -156,13 +164,18 @@ class _DeeployMixin:
       current_time = self.time()
       if current_time - start_time > timeout_seconds:
         str_status = DEEPLOY_STATUS.TIMEOUT
+        self.P(f"Timeout reached ({timeout_seconds} seconds) while waiting for responses. Current status: {self.json_dumps(dct_status, indent=2)}")
+        self.P(f"Response keys: {self.json_dumps(response_keys, indent=2)}")
         break
         
       for response_key in response_keys:
+        if response_key in dct_status:
+          continue
         node_info = response_keys[response_key]
         node_addr = node_info['addr']
         res = self.chainstore_get(response_key)
         if res is not None:
+          self.Pd(f"Received response for {response_key} from {node_addr}: {self.json_dumps(res)}. Node Info: {self.json_dumps(node_info)}")
           dct_status[response_key] = {
             'node': node_addr,
             'details': res,
@@ -233,6 +246,32 @@ class _DeeployMixin:
     return result
       
 
+  def deeploy_check_payment_and_job_owner(self, inputs, sender, debug=False):
+    """
+    Check if the payment is valid for the given job.
+    """
+    job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+    if not job_id:
+      return False
+    # Check if the job is paid
+    is_valid = False
+    try:
+      job = self.bc.get_job_details(job_id=job_id)
+      if job:
+        job_owner = job.get('escrowOwner', None)
+        is_valid = (sender == job_owner) if sender and job_owner else False
+        if debug:
+          self.P(f"Job {job_id} is paid:\n{self.json_dumps(job, indent=2)}")
+      else:
+        if debug:
+          self.P(f"Job {job_id} is not paid or does not exist.")
+      # endif
+    except Exception as e:
+      self.P(f"Error checking payment for job {job_id}: {e}")
+      is_valid = False
+
+    return is_valid
+
   def deeploy_prepare_single_plugin_instance(self, inputs):
     """
     Prepare the a single plugin instance for the pipeline creation.
@@ -275,19 +314,22 @@ class _DeeployMixin:
     response_keys = self.__launch_pipeline_on_nodes(nodes, inputs, app_id, app_alias, app_type, sender)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
-    dct_status, str_status = self.__get_pipeline_responses(response_keys)
+    dct_status, str_status = self.__get_pipeline_responses(response_keys, 300)
 
-    self.P(f"Pipeline responses: str_status = {str_status} | dct_status = {self.json_dumps(dct_status)}")
-
-    # TODO: we must define failure and success conditions (after initial implementation is done)
+    self.P(f"Pipeline responses: str_status = {str_status} | dct_status =\n {self.json_dumps(dct_status, indent=2)}")
+    
+    # if pipelines to not use CHAINSTORE_RESPONSE, we can assume nodes reveived the command (BLIND) - to be modified in native plugins
+    # else we consider all good if str_status is SUCCESS
 
     return dct_status, str_status
 
-  def __discover_plugin_instances(self,
-                                  app_id: str,
-                                  target_nodes: list[str] = None,
-                                  plugin_signature: str = None,
-                                  instance_id: str = None):
+  def __discover_plugin_instances(
+    self,
+    app_id: str,
+    target_nodes: list[str] = None,
+    plugin_signature: str = None,
+    instance_id: str = None
+  ):
     """
     Discover the plugin instances for the given app_id and target nodes.
     Returns a list of dictionaries containing infomration about plugin instances.
