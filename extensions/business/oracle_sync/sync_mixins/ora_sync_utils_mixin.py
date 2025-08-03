@@ -639,6 +639,15 @@ class _OraSyncUtilsMixin:
         if show_logs:
           self.P(log_msg, color='r')
         return False
+      if show_logs:
+        log_msg = f"Consensus possible: "
+        log_msg += f"{cnt_participating}/{len(blockchain_oracles)} > {ORACLE_SYNC_BLOCKCHAIN_PRESENCE_MIN_THRESHOLD}"
+        log_msg += f"{cnt_participating}/{len(online_oracles)} > {ORACLE_SYNC_ONLINE_PRESENCE_MIN_THRESHOLD}"
+        log_msg += f" (bc thr: {blockchain_min_threshold})"
+        log_msg += f" (on thr: {online_min_threshold})"
+        log_msg += f"part: {participating_str}"
+        self.P(log_msg, boxed=True, color='g')
+      # endif show_logs
       return True
 
     def _check_exception_occurred(self):
