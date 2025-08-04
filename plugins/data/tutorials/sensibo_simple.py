@@ -21,7 +21,7 @@
     "CAP_RESOLUTION" : 0.5,
     "TYPE": "SensiboSimple",
     
-    "SENSIBO_DEVICE_NAME" : "Alex's device",
+    "SENSIBO_DEVICE_NAME" : "<device name>",
     "SENSIBO_API_KEY" : "0B073b470DeXHoqmXmdeBpVzBbHcLh",
     
     "URL" : ""
@@ -48,7 +48,7 @@ _CONFIG = {
   **DataCaptureThread.CONFIG,
   
   "SENSIBO_API_KEY"       : "0B073b470DeXHoqmXmdeBpVzBbHcLh",
-  "SENSIBO_DEVICE_NAME"   : "Alex's device",
+  "SENSIBO_DEVICE_NAME"   : "",
   
   
   'VALIDATION_RULES' : {
