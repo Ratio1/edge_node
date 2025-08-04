@@ -188,6 +188,7 @@ class DeeployManagerApiPlugin(
       app_type = inputs.pipeline_input_type
       app_id = (app_alias.lower()[:13] + "_" + self.uuid(7)).lower()
 
+      self.__check_plugin_signature(inputs.signature)
       # check payment
       allow_unpaid_job = inputs.get(DEEPLOY_KEYS.ALLOW_UNPAID_JOB, False)
       if not allow_unpaid_job:
