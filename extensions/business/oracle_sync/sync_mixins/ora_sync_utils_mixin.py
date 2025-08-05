@@ -661,7 +661,9 @@ class _OraSyncUtilsMixin:
         for epoch, epoch_content in squeezed_epoch_dict.items():
           unsqueezed_content_dict = {}
           for key_id, value in epoch_content.items():
-            key = id_to_keys[key_id]
+            # In case the data was extracted through R1FS, the extracted content
+            # might not be squeezed.
+            key = id_to_keys.get(key_id, key_id)
             unsqueezed_content_dict[key] = value
           # end for node id
           unsqueezed_epoch_dict[epoch] = unsqueezed_content_dict
