@@ -108,7 +108,7 @@ class OracleApiPlugin(BasePlugin):
     return signature
 
 
-  def __get_response(self, dct_data: dict):
+  def __get_response(self, dct_data: dict, **kwargs):
     """
     Create a response dictionary with the given data.
 
@@ -141,6 +141,10 @@ class OracleApiPlugin(BasePlugin):
     dct_data['server_current_epoch'] = self.__get_current_epoch()
     dct_data['server_last_synced_epoch'] = self.__get_synced_epoch()
     dct_data['server_uptime'] = str(self.timedelta(seconds=int(self.time_alive)))
+    for k, v in kwargs.items():
+      # some filters may be applied to the data
+      dct_data[k] = v
+    # end for kwargs
     self.__sign(dct_data) # add the signature over full data
     return dct_data
 
@@ -526,7 +530,7 @@ class OracleApiPlugin(BasePlugin):
       'nodes_items_per_page': items_per_page,
       'nodes_page': page,
       'nodes': nodes,
-      "resources_total": self.compute_total_resources(all_nodes),
+      'resources_total': self.compute_total_resources(all_nodes),
       'query_time': round(elapsed, 2),
     })
     return response
@@ -587,6 +591,72 @@ class OracleApiPlugin(BasePlugin):
     response = self.__get_response(self.__get_node_epochs(
       node_addr, start_epoch=start_epoch, end_epoch=end_epoch
     ))
+    return response
+  
+  @BasePlugin.endpoint
+  def multi_node_epochs_range(
+    self, 
+    dct_eth_nodes_request: dict, # {node_addr: [start_epoch, end_epoch]}
+  ):
+    """
+    Returns the list of epochs availabilities for a list of given nodes each with start-end epochs.
+
+    Parameters
+    ----------
+    
+    dct_node_request : dict
+        A dictionary where each key is the eth address of a node and the value is a list with start and end epochs.
+
+    Returns
+    -------
+    dict
+        A dictionary with the following keys:
+        - node: str
+            The address of the node.
+
+        - epochs_vals: list
+            A list of integers, each integer is the epoch value for the node.
+
+        - server_id: str
+            The address of the responding node.
+
+        - server_time: str
+            The current time in UTC of the responding node.
+
+        - server_current_epoch: int
+            The current epoch of the responding node.
+
+        - server_uptime: str
+            The time that the responding node has been running.
+    """  
+    
+    if not isinstance(dct_eth_nodes_request, dict):
+      raise ValueError("Please provide a dictionary with ETH node addresses as keys and [start_epoch, end_epoch] as values.")
+    if len(dct_eth_nodes_request) == 0:
+      raise ValueError("Please provide a non-empty dictionary with node addresses and epochs.")
+    
+    all_nodes = {}
+    request_start = self.time()
+    for eth_node_addr, epochs in dct_eth_nodes_request.items():
+      if not isinstance(epochs, list) or len(epochs) != 2:
+        raise ValueError(f"Invalid epochs for node {eth_node_addr}. Please provide a list with [start_epoch, end_epoch].")
+      if not isinstance(eth_node_addr, str):
+        raise ValueError(f"Invalid node address {eth_node_addr}. Please provide a string.")
+      if not all(isinstance(epoch, int) for epoch in epochs):
+        raise ValueError(f"Invalid epochs {epochs} for node {eth_node_addr}. Please provide integers.")
+      if epochs[0] > epochs[1]:
+        raise ValueError(f"Start epoch {epochs[0]} is greater than end epoch {epochs[1]} for node {eth_node_addr}.")
+      
+      node_addr_internal = self.__eth_to_internal(eth_node_addr)
+      node_data = self.__get_node_epochs(
+        node_addr_internal, 
+        start_epoch=epochs[0], 
+        end_epoch=epochs[1]
+      )
+      all_nodes[eth_node_addr] = node_data
+    # endfor eth_node_addr, epochs in dct_eth_nodes_request.items()
+    request_elapsed = self.time() - request_start
+    response = self.__get_response(all_nodes, query_time=request_elapsed)
     return response
 
 
