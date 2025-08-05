@@ -2,7 +2,7 @@ from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
-  DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA
+  DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES
 
 DEEPLOY_DEBUG = True
 
@@ -54,6 +54,23 @@ class _DeeployMixin:
     )
     return sender
 
+
+  def __check_plugin_signature(self, signature: str):
+    """
+    Check if an app with the requested signature can be run through deeploy.
+    """
+
+    if not signature:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.REQUEST1}. Signature not provided."
+      )
+
+    if signature in DEEPLOY_FORBIDDEN_SIGNATURES:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.REQUEST2}. Signature '{signature}' is not allowed."
+      )
+
+    return
 
 
   def __check_allowed_wallet(self, inputs):
@@ -230,6 +247,9 @@ class _DeeployMixin:
     
     # Check if the sender is allowed to create pipelines
     self.__check_allowed_wallet(inputs)
+
+    # Check request mandatory fields.
+    self.__check_plugin_signature(inputs.plugin_signature)
     
     return sender, inputs
   

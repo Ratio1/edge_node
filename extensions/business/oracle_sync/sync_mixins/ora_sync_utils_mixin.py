@@ -8,6 +8,8 @@ from extensions.business.oracle_sync.sync_mixins.ora_sync_constants import (
   ORACLE_SYNC_ACCEPTED_MEDIAN_ERROR_MARGIN,
   ORACLE_SYNC_BLOCKCHAIN_PRESENCE_MIN_THRESHOLD,
   ORACLE_SYNC_ONLINE_PRESENCE_MIN_THRESHOLD,
+
+  ORACLE_SYNC_IGNORE_REQUESTS_SECONDS,
   
   DEBUG_MODE,
   VALUE_STANDARDS
@@ -145,6 +147,63 @@ class _OraSyncUtilsMixin:
       message_dict[data_key] = res
       return res
 
+    def r1fs_get_data_from_nested_message(
+        self,
+        nested_message_dict: dict,
+        ignore_keys: list = None,
+        debug=True
+    ):
+      """
+      Helper method for extracting data from a message with the help of R1FS.
+      This method will iterate over all the keys in the nested message dictionary
+      and will attempt to extract the data from the R1FS using the CID if needed.
+      Parameters
+      ----------
+      nested_message_dict : dict
+          The nested message dictionary from which the data should be extracted.
+          This should be a dictionary with keys that are the data keys and values that are either CIDs or data.
+      ignore_keys : list, optional
+          A list of keys to ignore when extracting data from the message.
+          This can be used to skip certain keys that are not relevant for the extraction.
+          By default, None, which means no keys will be ignored.
+      debug : bool, optional
+          Whether to print debug messages, by default True
+
+      Returns
+      -------
+      dict
+          The processed data dictionary, where any CIDs will be replaced with either
+          the content from the R1FS or None if the retrieval failed.
+      """
+      if isinstance(ignore_keys, str):
+        ignore_keys = [ignore_keys]
+      # endif ignore_keys is str
+      if not isinstance(ignore_keys, list):
+        if debug:
+          self.P(f"`ignore_keys` is {type(ignore_keys)} != list. Using empty list instead.", color='r')
+        ignore_keys = []
+      # endif ignore_keys is not list
+      updated_values = {}
+      for key, msg_data in nested_message_dict.items():
+        # 1. Check if the key is in the ignore keys.
+        if key in ignore_keys:
+          continue
+        # 2. Check if the data is a CID or data.
+        if isinstance(msg_data, str):
+          if debug:
+            self.P(f"Attempting to get data from R1FS using CID {msg_data}.")
+          # 3. Attempt to get the data from R1FS.
+          res = self.r1fs_get_pickle(cid=msg_data, debug=debug)
+          if res is not None and debug:
+            # 4. If the retrieval was successful, store the result.
+            updated_values[key] = res
+            self.P(f"Successfully retrieved data from R1FS using CID {msg_data}.")
+        # endif
+      # endfor key, data
+      # 5. Update the nested message dictionary with the retrieved values.
+      nested_message_dict.update(updated_values)
+      return nested_message_dict
+
     def r1fs_get_pickle(self, cid: str, debug=True):
       """
       Get the data from the IPFS using the CID.
@@ -254,12 +313,16 @@ class _OraSyncUtilsMixin:
     def maybe_refresh_oracle_list(self):
       if DEBUG_MODE:
         return
-      if self._last_oracle_list_refresh is None or self.time() - self._last_oracle_list_refresh > self.cfg_oracle_list_refresh_interval:
+      if self._last_oracle_list_refresh is None or self.time() - self._last_oracle_list_refresh_attempt > self.cfg_oracle_list_refresh_interval:
         self.P(f'Refreshing oracle list.')
-        self._oracle_list, _ = self.bc.get_oracles()
-        if len(self._oracle_list) == 0:
+        current_oracle_list, _ = self.bc.get_oracles()
+        if len(current_oracle_list) == 0:
           self.P(f'NO ORACLES FOUND. BLOCKCHAIN ERROR', boxed=True, color='r')
-        self._last_oracle_list_refresh = self.time()
+        else:
+          self._oracle_list = current_oracle_list
+          self._last_oracle_list_refresh = self.time()
+        # endif current_oracle_list retrieved successfully
+        self._last_oracle_list_refresh_attempt = self.time()
       # endif refresh time
       return
 
@@ -315,11 +378,12 @@ class _OraSyncUtilsMixin:
       -------
       int : The local availability of the node
       """
+      res = self.netmon.epoch_manager.get_node_previous_epoch(node)
       if not skip_log and self.cfg_debug_sync_full:
-        self.P(f"Getting local availability for {node}")
-      return self.netmon.epoch_manager.get_node_previous_epoch(node)
+        self.P(f"Retrieved local availability for {node}: {res}")
+      return res
 
-    def _was_full_online(self, node: str, previous_availability: int = None):
+    def _was_full_online(self, node: str, previous_availability: int = None, show_logs=False):
       """
       Check if the node was full online in the previous epoch.
 
@@ -334,7 +398,7 @@ class _OraSyncUtilsMixin:
       """
       if previous_availability is None:
         previous_availability = self.oracle_sync_get_node_local_availability(node, skip_log=True)
-      if self.cfg_debug_sync_full:
+      if show_logs or self.cfg_debug_sync_full:
         self.P(f"Checking if {node} was full online in the previous epoch. "
                f"Local availability value: {previous_availability}")
       return previous_availability >= FULL_AVAILABILITY_THRESHOLD
@@ -597,7 +661,9 @@ class _OraSyncUtilsMixin:
         for epoch, epoch_content in squeezed_epoch_dict.items():
           unsqueezed_content_dict = {}
           for key_id, value in epoch_content.items():
-            key = id_to_keys[key_id]
+            # In case the data was extracted through R1FS, the extracted content
+            # might not be squeezed.
+            key = id_to_keys.get(key_id, key_id)
             unsqueezed_content_dict[key] = value
           # end for node id
           unsqueezed_epoch_dict[epoch] = unsqueezed_content_dict
@@ -639,6 +705,15 @@ class _OraSyncUtilsMixin:
         if show_logs:
           self.P(log_msg, color='r')
         return False
+      if show_logs:
+        log_msg = f"Consensus possible: "
+        log_msg += f"{cnt_participating}/{len(blockchain_oracles)} > {ORACLE_SYNC_BLOCKCHAIN_PRESENCE_MIN_THRESHOLD}"
+        log_msg += f"{cnt_participating}/{len(online_oracles)} > {ORACLE_SYNC_ONLINE_PRESENCE_MIN_THRESHOLD}"
+        log_msg += f" (bc thr: {blockchain_min_threshold})"
+        log_msg += f" (on thr: {online_min_threshold})"
+        log_msg += f"part: {participating_str}"
+        self.P(log_msg, boxed=True, color='g')
+      # endif show_logs
       return True
 
     def _check_exception_occurred(self):
@@ -646,6 +721,26 @@ class _OraSyncUtilsMixin:
 
     def _check_no_exception_occurred(self):
       return not self._check_exception_occurred()
+
+    def to_utc(self, dt):
+      return dt.replace(tzinfo=self.timezone.utc) if dt.tzinfo is None else dt.astimezone(self.timezone.utc)
+
+    def _check_too_close_to_epoch_change(self, show_logs: bool = True):
+      current_epoch_end = self.netmon.epoch_manager.get_current_epoch_end(
+        current_epoch=self._current_epoch
+      )
+      current_epoch_end = self.to_utc(current_epoch_end)
+      current_time = self.datetime.now(self.timezone.utc)
+
+      left_from_current_epoch = current_epoch_end - current_time
+      if left_from_current_epoch.total_seconds() < ORACLE_SYNC_IGNORE_REQUESTS_SECONDS:
+        if self.cfg_debug_sync and show_logs:
+          warn_msg = f"Too close to epoch change."
+          warn_msg += f"Left from current epoch: {left_from_current_epoch.total_seconds()} seconds."
+          warn_msg += f"Ignoring request."
+          self.P(warn_msg, color='r')
+        return True
+      return False
 
     def _check_received_oracle_data_for_values(
         self, sender: str, oracle_data: dict,

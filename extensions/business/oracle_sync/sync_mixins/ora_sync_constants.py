@@ -1,4 +1,4 @@
-from naeural_core.constants import SUPERVISOR_MIN_AVAIL_PRC, EPOCH_MAX_VALUE
+from naeural_core.constants import SUPERVISOR_MIN_AVAIL_PRC, EPOCH_MAX_VALUE, ORACLE_SYNC_USE_R1FS
 
 MAX_RECEIVED_MESSAGES_SIZE = 1000
 DEBUG_MODE = False
@@ -24,6 +24,8 @@ ORACLE_SYNC_ACCEPTED_MEDIAN_ERROR_MARGIN = EPOCH_MAX_VALUE - POTENTIALLY_FULL_AV
 ORACLE_SYNC_BLOCKCHAIN_PRESENCE_MIN_THRESHOLD = 0.3
 ORACLE_SYNC_ONLINE_PRESENCE_MIN_THRESHOLD = 0.4
 
+ORACLE_SYNC_IGNORE_REQUESTS_SECONDS = 3 * 60  # 3 minutes before the epoch end requests will be ignored
+
 class OracleSyncCt:
   MEDIAN_TABLE = 'MEDIAN_TABLE'
   AGREED_MEDIAN_TABLE = 'AGREED_MEDIAN_TABLE'
@@ -48,8 +50,8 @@ class OracleSyncCt:
 VALUE_STANDARDS = {
   OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE: {
     # 'type': dict,
-    'type': (str, dict),
-    'maybe_cid': True
+    'type': dict,
+    'maybe_cid': False
   },
   OracleSyncCt.ID_TO_NODE_ADDRESS: {
     'type': dict,

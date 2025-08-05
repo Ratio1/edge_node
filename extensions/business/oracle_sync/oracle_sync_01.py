@@ -64,6 +64,7 @@ from extensions.business.oracle_sync.sync_mixins.ora_sync_constants import (
 
   SUPERVISOR_MIN_AVAIL_PRC,
   MAX_RECEIVED_MESSAGES_SIZE,
+  ORACLE_SYNC_USE_R1FS,
 )
 
 """
@@ -88,7 +89,7 @@ _CONFIG = {
   'SEND_INTERVAL': 30,  # seconds
 
   # This flag will be enabled after further testing of R1FS.
-  "USE_R1FS": False,
+  "USE_R1FS": ORACLE_SYNC_USE_R1FS,
 
   'EPOCH_START_SYNC': 0,
   # TODO: disable this flag in the future after further testing
@@ -383,8 +384,18 @@ class OracleSync01Plugin(
     # endif not cfg_use_r1fs
     self._oracle_list = []
     self._last_oracle_list_refresh = None
+    self._last_oracle_list_refresh_attempt = None
     self._last_self_assessment_ts = None
+
     self.maybe_refresh_oracle_list()
+    current_oracle_list = self.get_oracle_list()
+    while current_oracle_list is not None and len(current_oracle_list) == 0:
+      sleep_period = 5
+      self.P(f"No oracles found. Re-attempting to refresh the oracle list in {sleep_period} seconds.")
+      self.sleep(sleep_period)
+      self.maybe_refresh_oracle_list()
+      current_oracle_list = self.get_oracle_list()
+    # endwhile oracle list is empty
     self._reset_to_initial_state()
 
     self.P(
