@@ -1606,5 +1606,6 @@ class _OraSyncStatesCallbacksMixin:
       self.P(f"Successfully computed requested agreed median table from {len(candidates)} oracles. ")
       # Save the epoch manager status after the update.
       self.netmon.epoch_manager.save_status()
+      self.netmon.epoch_manager.maybe_update_cached_data(force=True)
       return
   """END S9_COMPUTE_REQUESTED_AGREED_MEDIAN_TABLE CALLBACKS"""
