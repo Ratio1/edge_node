@@ -662,11 +662,15 @@ class _OraSyncUtilsMixin:
     def _check_no_exception_occurred(self):
       return not self._check_exception_occurred()
 
+    def to_utc(self, dt):
+      return dt.replace(tzinfo=self.timezone.utc) if dt.tzinfo is None else dt.astimezone(self.timezone.utc)
+
     def _check_too_close_to_epoch_change(self, show_logs: bool = True):
       current_epoch_end = self.netmon.epoch_manager.get_current_epoch_end(
         current_epoch=self._current_epoch
       )
-      current_time = self.datetime.now()
+      current_epoch_end = self.to_utc(current_epoch_end)
+      current_time = self.datetime.now(self.timezone.utc)
 
       left_from_current_epoch = current_epoch_end - current_time
       if left_from_current_epoch.total_seconds() < ORACLE_SYNC_IGNORE_REQUESTS_SECONDS:
