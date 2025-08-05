@@ -160,6 +160,8 @@ class ContainerAppRunnerPlugin(
     """
     self.__reset_vars()
 
+    super(ContainerAppRunnerPlugin, self).on_init()
+
     self.container_start_time = self.time()
 
     self._detect_cli_tool() # detect if we have docker or podman
@@ -167,8 +169,6 @@ class ContainerAppRunnerPlugin(
     self._setup_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
-
-    super(ContainerAppRunnerPlugin, self).on_init()
 
     return
 
@@ -348,9 +348,10 @@ class ContainerAppRunnerPlugin(
       self._cpu_limit = DEFAULT_CPU_LIMIT
       self._gpu_limit = DEFAULT_GPU_LIMIT
       self._mem_limit = DEFAULT_MEM_LIMIT
-
-      self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
     # endif resource limits
+
+    if not self.port and self.cfg_port:
+      self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
     return
 
 
