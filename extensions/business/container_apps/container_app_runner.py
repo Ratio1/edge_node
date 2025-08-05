@@ -161,15 +161,14 @@ class ContainerAppRunnerPlugin(
     self.__reset_vars()
 
     super(ContainerAppRunnerPlugin, self).on_init()
+
     self.container_start_time = self.time()
 
     self._detect_cli_tool() # detect if we have docker or podman
 
     self._setup_dynamic_env() # setup dynamic env vars for the container
-    self._setup_resource_limits() # setup container resource limits (CPU, GPU, memory, ports)
+    self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
-
-    self.port = self._allocate_port(allow_dynamic=True) # Allocate a port for the container if needed
 
     return
 
@@ -289,7 +288,7 @@ class ContainerAppRunnerPlugin(
     return
 
 
-  def _setup_resource_limits(self):
+  def _setup_resource_limits_and_ports(self):
     """
     Sets up resource limits for the container based on the configuration.
     """
@@ -316,9 +315,26 @@ class ContainerAppRunnerPlugin(
             self.P(f"Allocated free host port {host_port} for container port {container_port}.")
         else:
           # Handle dict of port mappings
+          # Check if main app port is mapped to a specific host port
+          if self.cfg_port and isinstance(ports, dict) and self.cfg_port in ports.values():
+            container_port = self.cfg_port
+            requested_host_port = int(next((k for k, v in ports.items() if v == container_port), 0))
+
+            self.P(f"Main app port {self.cfg_port} is not mapped to any host port in the ports dict. Allocating a new host port ...")
+
+            self.port = self._allocate_port(requested_host_port, allow_dynamic=True)
+
+            if self.port != requested_host_port:
+              self.P(f"Requested host port {requested_host_port} is not available. Allocated port {self.port} instead.")
+
+            self.extra_ports_mapping[self.port] = container_port
+
           for host_port, container_port in ports.items():
             try:
               host_port = int(host_port)
+              if host_port in self.extra_ports_mapping:
+                self.Pd(f"Host port {host_port} is already allocated for container port {self.extra_ports_mapping[host_port]}. Skipping allocation.")
+                continue
               self._allocate_port(host_port)
               self.extra_ports_mapping[host_port] = container_port
             except Exception as e:
@@ -333,6 +349,9 @@ class ContainerAppRunnerPlugin(
       self._gpu_limit = DEFAULT_GPU_LIMIT
       self._mem_limit = DEFAULT_MEM_LIMIT
     # endif resource limits
+
+    if not self.port and self.cfg_port:
+      self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
     return
 
 
@@ -386,7 +405,7 @@ class ContainerAppRunnerPlugin(
     """
     port = None
     if required_port != 0:
-      self.P(f"Trying to allocate required port {required_port} ...")
+      self.P(f"Trying to allocate requested port {required_port} ...")
       done = False
       while not done:
         try:
@@ -399,7 +418,7 @@ class ContainerAppRunnerPlugin(
         except Exception as e:
           port = None
           if allow_dynamic:
-            self.P(f"Failed to allocate required port {required_port}: {e}", color='r')
+            self.P(f"Failed to allocate requested port {required_port}: {e}", color='r')
             done = True  # if allow_dynamic is True, we stop trying to bind to the required port
             required_port = 0  # reset to allow dynamic port allocation
           else:
