@@ -184,6 +184,8 @@ class DeeployManagerApiPlugin(
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       is_confirmable_job = inputs.chainstore_response
 
+      self._validate_request_input_for_signature(inputs)
+
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
       app_id = (app_alias.lower()[:13] + "_" + self.uuid(7)).lower()

@@ -252,7 +252,24 @@ class _DeeployMixin:
     self.__check_plugin_signature(inputs.plugin_signature)
     
     return sender, inputs
-  
+
+  def _validate_request_input_for_signature(self, inputs):
+    """
+    Validate the request input for the given signature.
+    This method checks if the input is valid for the given signature.
+    """
+    # Check if the plugin signature is valid
+    if not inputs.plugin_signature or inputs.plugin_signature == "":
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST3}. Plugin signature not provided.")
+
+    if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
+      # Check that image and container resources are provided
+      if not inputs.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE):
+        raise ValueError(f"{DEEPLOY_ERRORS.REQUEST4}. Image not provided for plugin signature {inputs.plugin_signature}.")
+      if not inputs.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES):
+        raise ValueError(f"{DEEPLOY_ERRORS.REQUEST5}. Container resources not provided for plugin signature {inputs.plugin_signature}.")
+      pass
+    return
   
   def deeploy_get_auth_result(self, inputs):
     sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
