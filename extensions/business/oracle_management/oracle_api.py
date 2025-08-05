@@ -593,7 +593,7 @@ class OracleApiPlugin(BasePlugin):
     ))
     return response
   
-  @BasePlugin.endpoint
+  @BasePlugin.endpoint(method='POST')
   def multi_node_epochs_range(
     self, 
     dct_eth_nodes_request: dict, # {node_addr: [start_epoch, end_epoch]}
