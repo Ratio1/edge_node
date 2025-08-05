@@ -179,7 +179,7 @@ class _OraSyncUtilsMixin:
         ignore_keys = [ignore_keys]
       # endif ignore_keys is str
       if not isinstance(ignore_keys, list):
-        if debug:
+        if debug and ignore_keys is not None:
           self.P(f"`ignore_keys` is {type(ignore_keys)} != list. Using empty list instead.", color='r')
         ignore_keys = []
       # endif ignore_keys is not list
