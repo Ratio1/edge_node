@@ -2,7 +2,7 @@ from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
-  DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES
+  DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, DEEPLOY_RESOURCES
 
 DEEPLOY_DEBUG = True
 
@@ -271,12 +271,14 @@ class _DeeployMixin:
     Check if the payment is valid for the given job.
     """
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+    self.Pd(f"Checking payment for job {job_id} by sender {sender}{' (debug mode)' if debug else ''}")
     if not job_id:
       return False
     # Check if the job is paid
     is_valid = False
     try:
       job = self.bc.get_job_details(job_id=job_id)
+      self.Pd(f"Job details: {self.json_dumps(job, indent=2)}")
       if job:
         job_owner = job.get('escrowOwner', None)
         is_valid = (sender == job_owner) if sender and job_owner else False

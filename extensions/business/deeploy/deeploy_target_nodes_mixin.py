@@ -37,8 +37,12 @@ class _DeeployTargetNodesMixin:
       return int(mem * 1024 * 1024 * 1024) # GB to bytes
     elif mem.endswith('m'):
       return int(float(mem[:-1]) * 1024 * 1024)  # MB to bytes
+    elif mem.endswith('mb'):
+      return int(float(mem[:-2]) * 1024 * 1024)  # MB to bytes
     elif mem.endswith('g'):
       return int(float(mem[:-1]) * 1024 * 1024 * 1024)  # GB to bytes
+    elif mem.endswith('gb'):
+      return int(float(mem[:-2]) * 1024 * 1024 * 1024)  # GB to bytes
     else:
       return int(float(mem))  # assume bytes
 
@@ -213,10 +217,10 @@ class _DeeployTargetNodesMixin:
       Checks if the node is capable of deploying the container app.
     Returns a dictionary with node addresses as keys and their total resources as values.
     """
-    node_req_res = inputs.get(DEEPLOY_RESOURCES.NODE_RESOURCES_REQUEST, {})
+    node_res_req = inputs.get(DEEPLOY_RESOURCES.NODE_RESOURCES_REQUEST, {})
 
-    node_req_cpu = node_req_res.get(DEEPLOY_RESOURCES.CPU)
-    node_req_memory = node_req_res.get(DEEPLOY_RESOURCES.MEMORY)
+    node_req_cpu = node_res_req.get(DEEPLOY_RESOURCES.CPU)
+    node_req_memory = node_res_req.get(DEEPLOY_RESOURCES.MEMORY)
     node_req_memory_bytes = self._parse_memory(node_req_memory)
 
     suitable_nodes_with_resources = {}
@@ -238,7 +242,7 @@ class _DeeployTargetNodesMixin:
         'memory': total_memory_bytes,
       }
 
-      if node_req_res:
+      if node_res_req:
 
         if total_cpu < node_req_cpu:
           self.Pd(f"Node {addr} has not enough CPU cores in total. Skipping...")
