@@ -256,7 +256,7 @@ class _OraSyncStatesCallbacksMixin:
                  f'This is likely because the genesis date is in the future.')
           return
         # Check if the current node can participate in the sync process.
-        if self._cannot_participate_in_sync():
+        if self._cannot_participate_in_sync(show_logs=self.cfg_debug_sync):
           is_oracle = self._is_oracle(self.node_addr)
           reason_str = "not an oracle" if not is_oracle else "not full online"
           self.P(
@@ -393,7 +393,7 @@ class _OraSyncStatesCallbacksMixin:
       self.P(f"Computed local table {self.local_table}")
       return
 
-    def _can_participate_in_sync(self):
+    def _can_participate_in_sync(self, show_logs=False):
       """
       Check if the current node can participate in the sync process.
       A node can participate if it is a supervisor and was full online in the previous epoch.
@@ -402,9 +402,9 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool : True if the node can participate in the sync process, False otherwise
       """
-      return self._is_oracle(self.node_addr) and self._was_full_online(self.node_addr, show_logs=self.cfg_debug_sync)
+      return self._is_oracle(self.node_addr) and self._was_full_online(self.node_addr, show_logs=show_logs)
 
-    def _cannot_participate_in_sync(self):
+    def _cannot_participate_in_sync(self, show_logs=False):
       """
       Check if the current node cannot participate in the sync process.
       A node can participate if it is a supervisor and was full online in the previous epoch.
@@ -413,7 +413,7 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool : True if the node cannot participate in the sync process, False otherwise
       """
-      return not self._can_participate_in_sync()
+      return not self._can_participate_in_sync(show_logs=show_logs)
   """END S1_COMPUTE_LOCAL_TABLE CALLBACKS"""
 
   """S2_SEND_LOCAL_TABLE CALLBACKS"""
