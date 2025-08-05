@@ -402,7 +402,7 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool : True if the node can participate in the sync process, False otherwise
       """
-      return self._is_oracle(self.node_addr) and self._was_full_online(self.node_addr)
+      return self._is_oracle(self.node_addr) and self._was_full_online(self.node_addr, show_logs=self.cfg_debug_sync)
 
     def _cannot_participate_in_sync(self):
       """

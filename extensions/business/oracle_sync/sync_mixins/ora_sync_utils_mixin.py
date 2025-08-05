@@ -321,11 +321,12 @@ class _OraSyncUtilsMixin:
       -------
       int : The local availability of the node
       """
+      res = self.netmon.epoch_manager.get_node_previous_epoch(node)
       if not skip_log and self.cfg_debug_sync_full:
-        self.P(f"Getting local availability for {node}")
-      return self.netmon.epoch_manager.get_node_previous_epoch(node)
+        self.P(f"Retrieved local availability for {node}: {res}")
+      return res
 
-    def _was_full_online(self, node: str, previous_availability: int = None):
+    def _was_full_online(self, node: str, previous_availability: int = None, show_logs=False):
       """
       Check if the node was full online in the previous epoch.
 
@@ -340,7 +341,7 @@ class _OraSyncUtilsMixin:
       """
       if previous_availability is None:
         previous_availability = self.oracle_sync_get_node_local_availability(node, skip_log=True)
-      if self.cfg_debug_sync_full:
+      if show_logs or self.cfg_debug_sync_full:
         self.P(f"Checking if {node} was full online in the previous epoch. "
                f"Local availability value: {previous_availability}")
       return previous_availability >= FULL_AVAILABILITY_THRESHOLD
