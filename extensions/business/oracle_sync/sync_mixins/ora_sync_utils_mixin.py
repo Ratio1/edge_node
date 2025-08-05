@@ -8,6 +8,8 @@ from extensions.business.oracle_sync.sync_mixins.ora_sync_constants import (
   ORACLE_SYNC_ACCEPTED_MEDIAN_ERROR_MARGIN,
   ORACLE_SYNC_BLOCKCHAIN_PRESENCE_MIN_THRESHOLD,
   ORACLE_SYNC_ONLINE_PRESENCE_MIN_THRESHOLD,
+
+  ORACLE_SYNC_IGNORE_REQUESTS_SECONDS,
   
   DEBUG_MODE,
   VALUE_STANDARDS
@@ -254,12 +256,16 @@ class _OraSyncUtilsMixin:
     def maybe_refresh_oracle_list(self):
       if DEBUG_MODE:
         return
-      if self._last_oracle_list_refresh is None or self.time() - self._last_oracle_list_refresh > self.cfg_oracle_list_refresh_interval:
+      if self._last_oracle_list_refresh is None or self.time() - self._last_oracle_list_refresh_attempt > self.cfg_oracle_list_refresh_interval:
         self.P(f'Refreshing oracle list.')
-        self._oracle_list, _ = self.bc.get_oracles()
-        if len(self._oracle_list) == 0:
+        current_oracle_list, _ = self.bc.get_oracles()
+        if len(current_oracle_list) == 0:
           self.P(f'NO ORACLES FOUND. BLOCKCHAIN ERROR', boxed=True, color='r')
-        self._last_oracle_list_refresh = self.time()
+        else:
+          self._oracle_list = current_oracle_list
+          self._last_oracle_list_refresh = self.time()
+        # endif current_oracle_list retrieved successfully
+        self._last_oracle_list_refresh_attempt = self.time()
       # endif refresh time
       return
 
@@ -655,6 +661,22 @@ class _OraSyncUtilsMixin:
 
     def _check_no_exception_occurred(self):
       return not self._check_exception_occurred()
+
+    def _check_too_close_to_epoch_change(self, show_logs: bool = True):
+      current_epoch_end = self.netmon.epoch_manager.get_current_epoch_end(
+        current_epoch=self._current_epoch
+      )
+      current_time = self.datetime.now()
+
+      left_from_current_epoch = current_epoch_end - current_time
+      if left_from_current_epoch.total_seconds() < ORACLE_SYNC_IGNORE_REQUESTS_SECONDS:
+        if self.cfg_debug_sync and show_logs:
+          warn_msg = f"Too close to epoch change."
+          warn_msg += f"Left from current epoch: {left_from_current_epoch.total_seconds()} seconds."
+          warn_msg += f"Ignoring request."
+          self.P(warn_msg, color='r')
+        return True
+      return False
 
     def _check_received_oracle_data_for_values(
         self, sender: str, oracle_data: dict,

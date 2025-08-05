@@ -28,6 +28,11 @@ Assumptions:
 - UP_TO_DATE == true assumes that the last synced epoch is the last epoch so the
   OracleManager can provide the full history to OracleAPI
 
+TODO LEDGER :
+  - each epoch committed to local ledger via oracle sync
+  - epoch hash returned together with epoch availability(requested epoch + last epoch)
+  - randomly requesting hash from other oracles for validating oracles
+
 """
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin

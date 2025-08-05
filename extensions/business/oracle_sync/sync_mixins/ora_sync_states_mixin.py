@@ -163,6 +163,9 @@ class _OraSyncStatesCallbacksMixin:
         # received a message with missing epochs
         return processed
 
+      if self._check_too_close_to_epoch_change():
+        return processed
+
       if request_agreed_median_table:
         sender_alias = self.netmon.network_node_eeid(sender)
         self.P(
@@ -853,7 +856,7 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool : True if the self.compiled_agreed_median_table is not None, False otherwise
       """
-      return self.compiled_agreed_median_table is not None
+      return self.compiled_agreed_median_table is not None and len(self.compiled_agreed_median_table) > 0
 
     def _agreement_not_reached(self):
       """
@@ -1166,6 +1169,7 @@ class _OraSyncStatesCallbacksMixin:
         self._last_epoch_synced = epoch
         # In case of multiple updates, the save is only needed after the last update.
         if is_single_call:
+          self.netmon.epoch_manager.maybe_update_cached_data(force=True)
           self.netmon.epoch_manager.save_status()
         # endif part of consensus process
       return
