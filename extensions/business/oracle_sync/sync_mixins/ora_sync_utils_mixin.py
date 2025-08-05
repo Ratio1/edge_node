@@ -147,6 +147,63 @@ class _OraSyncUtilsMixin:
       message_dict[data_key] = res
       return res
 
+    def r1fs_get_data_from_nested_message(
+        self,
+        nested_message_dict: dict,
+        ignore_keys: list = None,
+        debug=True
+    ):
+      """
+      Helper method for extracting data from a message with the help of R1FS.
+      This method will iterate over all the keys in the nested message dictionary
+      and will attempt to extract the data from the R1FS using the CID if needed.
+      Parameters
+      ----------
+      nested_message_dict : dict
+          The nested message dictionary from which the data should be extracted.
+          This should be a dictionary with keys that are the data keys and values that are either CIDs or data.
+      ignore_keys : list, optional
+          A list of keys to ignore when extracting data from the message.
+          This can be used to skip certain keys that are not relevant for the extraction.
+          By default, None, which means no keys will be ignored.
+      debug : bool, optional
+          Whether to print debug messages, by default True
+
+      Returns
+      -------
+      dict
+          The processed data dictionary, where any CIDs will be replaced with either
+          the content from the R1FS or None if the retrieval failed.
+      """
+      if isinstance(ignore_keys, str):
+        ignore_keys = [ignore_keys]
+      # endif ignore_keys is str
+      if not isinstance(ignore_keys, list):
+        if debug:
+          self.P(f"`ignore_keys` is {type(ignore_keys)} != list. Using empty list instead.", color='r')
+        ignore_keys = []
+      # endif ignore_keys is not list
+      updated_values = {}
+      for key, msg_data in nested_message_dict.items():
+        # 1. Check if the key is in the ignore keys.
+        if key in ignore_keys:
+          continue
+        # 2. Check if the data is a CID or data.
+        if isinstance(msg_data, str):
+          if debug:
+            self.P(f"Attempting to get data from R1FS using CID {msg_data}.")
+          # 3. Attempt to get the data from R1FS.
+          res = self.r1fs_get_pickle(cid=msg_data, debug=debug)
+          if res is not None and debug:
+            # 4. If the retrieval was successful, store the result.
+            updated_values[key] = res
+            self.P(f"Successfully retrieved data from R1FS using CID {msg_data}.")
+        # endif
+      # endfor key, data
+      # 5. Update the nested message dictionary with the retrieved values.
+      nested_message_dict.update(updated_values)
+      return nested_message_dict
+
     def r1fs_get_pickle(self, cid: str, debug=True):
       """
       Get the data from the IPFS using the CID.

@@ -50,8 +50,8 @@ class OracleSyncCt:
 VALUE_STANDARDS = {
   OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE: {
     # 'type': dict,
-    'type': (str, dict),
-    'maybe_cid': True
+    'type': dict,
+    'maybe_cid': False
   },
   OracleSyncCt.ID_TO_NODE_ADDRESS: {
     'type': dict,

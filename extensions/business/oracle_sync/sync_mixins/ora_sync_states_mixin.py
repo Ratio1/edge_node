@@ -1200,6 +1200,7 @@ class _OraSyncStatesCallbacksMixin:
           # but as string instead of int. We also know that in epoch_keys we have
           # the keys in int format. Thus, we need to convert the keys of the received tables
           dct_epoch_agreed_median_table = oracle_data[OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE]
+          dct_epoch_agreed_median_table = self.r1fs_get_data_from_nested_message(dct_epoch_agreed_median_table)
           dct_epoch_agreement_signatures = oracle_data[OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES]
           dct_epoch_is_valid = oracle_data[OracleSyncCt.EPOCH__IS_VALID]
           dct_epoch_agreement_cid = {}
