@@ -489,23 +489,27 @@ class ContainerAppRunnerPlugin(
       # Check if the image exists and pull it if needed
       last_checked = self.time() - self.__last_autoupdate_check
       needs_update = last_checked > self.cfg_autoupdate_interval
-      if self._container_exists(self.container_id) and needs_update:
-        self.__last_autoupdate_check = self.time()
-        self.Pd("Checking for container image updates ...", score=30)
-        try:
-          # TODO: use get container has instead of pulling the image
-          pulled = self._container_pull_image()
-          if pulled:
-            # If the image was pulled, we can restart the container
-            self.P("Stopping container to use the new image ...")
-            self._stop_container_and_save_logs_to_disk()
-            self._restart_container()
-          else:
-            self.Pd("No updates found for the container image.", score=30)
-        except Exception as e:
-          self.P(f"Failed to pull image {self.cfg_image}: {e}", color='r')
-      else:
-        self.P("Container does not exist, skipping image update check.")
+      if needs_update:
+        if self._container_exists(self.container_id):
+          self.__last_autoupdate_check = self.time()
+          self.Pd("Checking for container image updates ...", score=30)
+          try:
+            # TODO: use get container has instead of pulling the image
+            pulled = self._container_pull_image()
+            if pulled:
+              # If the image was pulled, we can restart the container
+              self.P("Stopping container to use the new image ...")
+              self._stop_container_and_save_logs_to_disk()
+              self._restart_container()
+            else:
+              self.Pd("No updates found for the container image.", score=30)
+          except Exception as e:
+            self.P(f"Failed to pull image {self.cfg_image}: {e}", color='r')
+        else:
+          self.P("Container does not exist, skipping image update check.")
+        #endif container exists
+      # endif needs_update  
+    #endif autoupdate enabled      
     return
 
 
