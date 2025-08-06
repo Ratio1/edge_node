@@ -65,6 +65,10 @@ class DEEPLOY_ERRORS:
   PAYMENT1 = "ERR08_DEEPLOY_PAYMENT1"
   REQUEST1 = "ERR09_REQUEST1"
   REQUEST2 = "ERR10_REQUEST2"
+  REQUEST3 = "ERR11_REQUEST3"
+  REQUEST4 = "ERR12_REQUEST4"
+  REQUEST5 = "ERR13_REQUEST5"
+  REQUEST6 = "ERR14_REQUEST6"
 
 class DEEPLOY_RESOURCES:
   # Result dictionary keys
@@ -74,8 +78,8 @@ class DEEPLOY_RESOURCES:
   REQUIRED = 'required'
   
   # Resource types
-  CPU = 'CPU'
-  MEMORY = 'Memory'
+  CPU = 'cpu'
+  MEMORY = 'memory'
   
   # Units
   CORES = 'cores'
