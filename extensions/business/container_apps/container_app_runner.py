@@ -80,6 +80,7 @@ _CONFIG = {
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
+  "AUTOUPDATE_INTERVAL": 100,  
 
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   
@@ -158,6 +159,9 @@ class ContainerAppRunnerPlugin(
     Determines whether Docker or Podman is available, sets up port (if needed),
     and prepares for container run.    
     """
+    
+    self.__last_autoupdate_check = 0
+    
     self.__reset_vars()
 
     super(ContainerAppRunnerPlugin, self).on_init()
@@ -483,7 +487,10 @@ class ContainerAppRunnerPlugin(
   def _maybe_autoupdate_container(self):
     if self.cfg_autoupdate and self.container_id is not None:
       # Check if the image exists and pull it if needed
-      if self._container_exists(self.container_id):
+      last_checked = self.time() - self.__last_autoupdate_check
+      needs_update = last_checked > self.cfg_autoupdate_interval
+      if self._container_exists(self.container_id) and needs_update:
+        self.__last_autoupdate_check = self.time()
         self.Pd("Checking for container image updates ...", score=30)
         try:
           # TODO: use get container has instead of pulling the image
