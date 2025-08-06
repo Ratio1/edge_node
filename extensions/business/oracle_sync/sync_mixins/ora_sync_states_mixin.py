@@ -256,7 +256,9 @@ class _OraSyncStatesCallbacksMixin:
                  f'This is likely because the genesis date is in the future.')
           return
         # Check if the current node can participate in the sync process.
-        if self._cannot_participate_in_sync(show_logs=self.cfg_debug_sync):
+        # The logs will be shown only the first time passing through this method.
+        show_logs = self.first_time_announce_participants is None and self.cfg_debug_sync
+        if self._cannot_participate_in_sync(show_logs=show_logs):
           is_oracle = self._is_oracle(self.node_addr)
           reason_str = "not an oracle" if not is_oracle else "not full online"
           self.P(
