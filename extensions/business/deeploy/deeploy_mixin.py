@@ -263,11 +263,14 @@ class _DeeployMixin:
       raise ValueError(f"{DEEPLOY_ERRORS.REQUEST3}. Plugin signature not provided.")
 
     if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
-      # Check that image and container resources are provided
-      if not inputs.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE):
-        raise ValueError(f"{DEEPLOY_ERRORS.REQUEST4}. Image not provided for plugin signature {inputs.plugin_signature}.")
-      if not inputs.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES):
-        raise ValueError(f"{DEEPLOY_ERRORS.REQUEST5}. Container resources not provided for plugin signature {inputs.plugin_signature}.")
+      # Check that image and container resources are
+      app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, None)
+      if not app_params:
+        raise ValueError(f"{DEEPLOY_ERRORS.REQUEST4}. App params not provided for plugin signature {inputs.plugin_signature}.")
+      if not app_params.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE):
+        raise ValueError(f"{DEEPLOY_ERRORS.REQUEST5}. Image not provided for plugin signature {inputs.plugin_signature}.")
+      if not app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES):
+        raise ValueError(f"{DEEPLOY_ERRORS.REQUEST6}. Container resources not provided for plugin signature {inputs.plugin_signature}.")
       pass
     return
   
