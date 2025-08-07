@@ -51,6 +51,9 @@ To deploy for the first time:
    is the same as the last epoch synced (X-1) + 1
 4. Let all oracles run through epoch X, until they enter epoch X+1
 5. When they enter epoch X+1, the plugin will start the sync process
+
+
+echo 'journalctl -u edge_node_service.service -a -S "2025-08-05 18:00:00" | grep -A 9 "self-assessment"' > predict_consensus.sh && chmod +x predict_consensus.sh
 """
 
 from naeural_core.business.base.network_processor import NetworkProcessorPlugin
@@ -389,7 +392,7 @@ class OracleSync01Plugin(
 
     self._self_assessment_data = {
       'series': self.deque(maxlen=10),
-      'last_avail' : None,
+      'last_missed_avail' : None,
       'recorded_epoch' : None,
     }
 
@@ -548,12 +551,12 @@ class OracleSync01Plugin(
     if self.netmon.epoch_manager.get_current_epoch() != self._self_assessment_data['recorded_epoch']:
       # Reset the self-assessment data if the epoch has changed
       self._self_assessment_data['series'] = []
-      self._self_assessment_data['last_avail'] = None
+      self._self_assessment_data['last_missed_avail'] = None
       self._self_assessment_data['recorded_epoch'] = self.netmon.epoch_manager.get_current_epoch()
     # endif
-    if self._self_assessment_data['last_avail'] is not None:
-      # If the last availability is recorded, compute the difference
-      diff = prc_node_availability - self._self_assessment_data['last_avail']
+    if self._self_assessment_data['last_missed_avail'] is not None:
+      # If the last missed availability is recorded, compute the difference
+      diff = prc_missed_availability - self._self_assessment_data['last_missed_avail'] # compute how much increased the missed availability
       self._self_assessment_data['series'].append(diff)
       if len(self._self_assessment_data['series']) > 1:
         # Compute the mean degrade per interval
@@ -568,7 +571,7 @@ class OracleSync01Plugin(
     comparing_str = f"{'>=' if will_participate else '<='} {SUPERVISOR_MIN_AVAIL_PRC:.2%}"
     comparing_str += f" => {'will' if will_participate else 'will not'} participate in the sync process."
 
-    self._self_assessment_data['last_avail'] = prc_node_availability
+    self._self_assessment_data['last_missed_avail'] = prc_missed_availability
     
     log_str = f"Current self-assessment:\n"
     log_str += f'\tTime until epoch end:    {seconds_left / 3600:.2f} hours\n'
@@ -576,9 +579,9 @@ class OracleSync01Plugin(
     log_str += f"\tPassed from epoch:       {prc_max_availability:.2%}\n"
     log_str += f"\tMissed avail so far:     {prc_missed_availability:.2%}\n"
     log_str += f"\tDegrade from last check: {diff:.2%}\n"
-    log_str += f"\tMean degrading per hour: {mean_degrade:.2%}\n"
+    log_str += f"\tMean degrade per check:  {mean_degrade:.2%}\n"
     log_str += f"\tMaximal at epoch end:    {prc_max_predicted_availability:.2%}{comparing_str_on_max}\n"
-    log_str += f"\tPredicted at epoch end:  {prc_predicted_availability:.2%}{comparing_str}\n"
+    log_str += f"\tPredicted at epoch end:  {prc_predicted_availability:.0%}{comparing_str}\n"
 
     self.P(log_str, color='g')
     return
