@@ -185,6 +185,8 @@ class DeeployManagerApiPlugin(
       is_confirmable_job = inputs.chainstore_response
 
       self._validate_request_input_for_signature(inputs)
+      # Check request mandatory fields.
+      self._check_plugin_signature(inputs.plugin_signature)
 
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type

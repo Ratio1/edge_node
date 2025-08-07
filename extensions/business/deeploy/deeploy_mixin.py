@@ -55,7 +55,7 @@ class _DeeployMixin:
     return sender
 
 
-  def __check_plugin_signature(self, signature: str):
+  def _check_plugin_signature(self, signature: str):
     """
     Check if an app with the requested signature can be run through deeploy.
     """
@@ -249,9 +249,6 @@ class _DeeployMixin:
     
     # Check if the sender is allowed to create pipelines
     self.__check_allowed_wallet(inputs)
-
-    # Check request mandatory fields.
-    self.__check_plugin_signature(inputs.plugin_signature)
     
     return sender, inputs
 
