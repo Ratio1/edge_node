@@ -387,6 +387,12 @@ class OracleSync01Plugin(
     self._last_oracle_list_refresh_attempt = None
     self._last_self_assessment_ts = None
 
+    self._self_assessment_data = {
+      'series': self.deque(maxlen=10),
+      'last_avail' : None,
+      'recorded_epoch' : None,
+    }
+
     self.maybe_refresh_oracle_list()
     current_oracle_list = self.get_oracle_list()
     while current_oracle_list is not None and len(current_oracle_list) == 0:
@@ -525,19 +531,55 @@ class OracleSync01Plugin(
       return_absolute=True,
       return_max=True
     )
+    
     total_epoch_seconds = self.netmon.epoch_manager.epoch_length
+    seconds_left = total_epoch_seconds - total_seconds_from_start
     prc_node_availability = total_seconds_availability / total_epoch_seconds
     prc_max_availability = total_seconds_from_start / total_epoch_seconds
     prc_missed_availability = prc_max_availability - prc_node_availability
-    prc_predicted_availability = 1 - prc_missed_availability
-    will_participate = prc_predicted_availability >= SUPERVISOR_MIN_AVAIL_PRC
+    prc_max_predicted_availability = 1 - prc_missed_availability
+    prc_predicted_availability = prc_max_predicted_availability
+    
+    will_participate_on_max = prc_max_predicted_availability >= SUPERVISOR_MIN_AVAIL_PRC        
+    comparing_str_on_max = f"{'>=' if will_participate_on_max else '<='} {SUPERVISOR_MIN_AVAIL_PRC:.2%}"
+    comparing_str_on_max += f" => {'will' if will_participate_on_max else 'will not'} participate in the sync process."
+        
+    diff, mean_degrade = 0.0, 0.0
+    if self.netmon.epoch_manager.get_current_epoch() != self._self_assessment_data['recorded_epoch']:
+      # Reset the self-assessment data if the epoch has changed
+      self._self_assessment_data['series'] = []
+      self._self_assessment_data['last_avail'] = None
+      self._self_assessment_data['recorded_epoch'] = self.netmon.epoch_manager.get_current_epoch()
+    # endif
+    if self._self_assessment_data['last_avail'] is not None:
+      # If the last availability is recorded, compute the difference
+      diff = prc_node_availability - self._self_assessment_data['last_avail']
+      self._self_assessment_data['series'].append(diff)
+      if len(self._self_assessment_data['series']) > 1:
+        # Compute the mean degrade per interval
+        mean_degrade = self.np.mean(self._self_assessment_data['series'])
+        mean_degrade_per_second = mean_degrade / self.cfg_self_assessment_interval
+        future_degrade = mean_degrade_per_second * seconds_left
+        # now compute the predicted availability at the end of the epoch        
+        prc_predicted_availability = prc_max_predicted_availability - future_degrade # 1 - prc_missed_availability - future_degrade
+    # endif
+
+    will_participate = prc_predicted_availability >= SUPERVISOR_MIN_AVAIL_PRC        
     comparing_str = f"{'>=' if will_participate else '<='} {SUPERVISOR_MIN_AVAIL_PRC:.2%}"
     comparing_str += f" => {'will' if will_participate else 'will not'} participate in the sync process."
+
+    self._self_assessment_data['last_avail'] = prc_node_availability
+    
     log_str = f"Current self-assessment:\n"
-    log_str += f"\tNode current availability: {prc_node_availability:.2%}\n"
-    log_str += f"\tPassed from epoch: {prc_max_availability:.2%}\n"
-    log_str += f"\tMissed availability so far: {prc_missed_availability:.2%}\n"
-    log_str += f"\tPredicted availability at the end of epoch: {prc_predicted_availability:.2%}{comparing_str}\n"
+    log_str += f'\tTime until epoch end:    {seconds_left / 3600:.2f} hours\n'
+    log_str += f"\tNode current avail:      {prc_node_availability:.2%}\n"
+    log_str += f"\tPassed from epoch:       {prc_max_availability:.2%}\n"
+    log_str += f"\tMissed avail so far:     {prc_missed_availability:.2%}\n"
+    log_str += f"\tDegrade from last check: {diff:.2%}\n"
+    log_str += f"\tMean degrading per hour: {mean_degrade:.2%}\n"
+    log_str += f"\tMaximal at epoch end:    {prc_max_predicted_availability:.2%}{comparing_str_on_max}\n"
+    log_str += f"\tPredicted at epoch end:  {prc_predicted_availability:.2%}{comparing_str}\n"
+
     self.P(log_str, color='g')
     return
 
