@@ -112,7 +112,7 @@ class DeeployManagerApiPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
-      apps = self._get_online_apps()
+      apps = self._get_online_apps(owner=sender)
       
       # TODO: (Vitalii) filter apps by the sender address (OWNER)
       
@@ -185,6 +185,8 @@ class DeeployManagerApiPlugin(
       is_confirmable_job = inputs.chainstore_response
 
       self._validate_request_input_for_signature(inputs)
+      # Check request mandatory fields.
+      self._check_plugin_signature(inputs.plugin_signature)
 
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
@@ -456,7 +458,7 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  def _get_online_apps(self):
+  def _get_online_apps(self, owner):
     """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
@@ -473,4 +475,10 @@ class DeeployManagerApiPlugin(
 
     """
     result = self.netmon.network_known_apps()
-    return result
+    filtered_result = self.defaultdict(dict)
+    for node, apps in result.items():
+      for app_name, app_data in apps.items():
+        if app_data[NetMonCt.OWNER] != owner:
+          continue
+        filtered_result[node][app_name] = app_data
+    return filtered_result
