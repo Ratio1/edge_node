@@ -2,6 +2,11 @@
 worker_app_runner.py
 
 
+TODO:
+- add git clone command after each container is started
+- OBS: cannot use the parent already existing git helper functions as they deploy in the Edge Node host not in the container.
+- fix running the build and run commands 
+
 """
 
 from .container_app_runner import ContainerAppRunnerPlugin as BasePlugin
@@ -12,6 +17,8 @@ _CONFIG = {
   **BasePlugin.CONFIG,
 
   "IMAGE": "node:lts-alpine",   # default image to run
+  
+  "GIT_URL" : None,         # clone mandatory url of the git repository
   
   "BUILD_AND_RUN_COMMANDS" : [], 
   
