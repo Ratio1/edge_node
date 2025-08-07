@@ -27,7 +27,9 @@ _CONFIG = {
   },
 
   'PREDEFINED_DOMAINS': {
-
+    'telegram_bot_community': {
+      'prompt': JeevesCt.COMMUNITY_CHATBOT_SYSTEM_PROMPT
+    },
   },
 
   'PREDEFINED_USER_TOKENS': [],
@@ -836,6 +838,69 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       # endif domain is not None
       return (self.cfg_default_system_prompt, {}) if return_additional_kwargs else self.cfg_default_system_prompt
 
+    def validate_llm_kwargs(self, **kwargs):
+      """
+      Validate the LLM kwargs for the Jeeves API.
+      This method checks if the provided kwargs are valid for the LLM request.
+
+      Parameters
+      ----------
+      kwargs : dict
+          The kwargs to validate.
+
+      Returns
+      -------
+      dict
+          The validated kwargs.
+      """
+      valid_kwargs = {}
+      supported_kwargs = {
+        "temperature": {
+          "type": float,
+          "min_value": 0.0,
+          "max_value": 1.0,
+        },
+        "top_p": {
+          "type": float,
+          "min_value": 0.5,
+          "max_value": 1.0,
+        },
+        "max_tokens": {
+          "type": int,
+          "min_value": 128,  # This is a common minimum for LLMs
+          "max_value": 4096,  # This is a common limit for LLMs
+        },
+        "repetition_penalty": {
+          "type": float,
+          "min_value": 1.0,
+          "max_value": 1.2,
+        }
+      }
+      msg_logs = []
+      self.P(f"Received kwargs: {kwargs}")
+      for key, value in kwargs.items():
+        if key.lower() in supported_kwargs:
+          rule = supported_kwargs[key.lower()]
+          if isinstance(value, rule["type"]) and \
+             (rule.get("min_value") is None or value >= rule["min_value"]) and \
+             (rule.get("max_value") is None or value <= rule["max_value"]):
+            valid_kwargs[key.lower()] = value
+          else:
+            msg_logs.append(
+              f"Invalid value for {key}: {value}. Expected type {rule['type']} with "
+              f"range [{rule.get('min_value', 'N/A')}, {rule.get('max_value', 'N/A')}]."
+            )
+          # endif value is valid
+        else:
+          msg_logs.append(f"Unsupported keyword argument: {key}")
+        # endif key is supported
+      # endfor kwargs
+      self.P(f"Valid kwargs: {valid_kwargs}")
+      if msg_logs:
+        msg_str = "\n".join(msg_logs)
+        self.Pd(f"Validation errors: {msg_str}", color="red")
+      return valid_kwargs
+
     @BasePlugin.endpoint(method="post")
     # TODO: change to jeeves_agent_request?
     def query(
@@ -843,7 +908,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         user_token: str = None,
         message: str = None,
         domain: str = None,
-        # **kwargs
+        **kwargs
     ):
       """
       Send a query to the Jeeves API.
@@ -879,6 +944,12 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         domain=domain,
         return_additional_kwargs=True,
       )
+
+      validated_kwargs = self.validate_llm_kwargs(**kwargs)
+      additional_kwargs = {
+        **additional_kwargs,
+        **validated_kwargs
+      }
 
       # Wrap the message
       messages = self.get_messages_of_user(
@@ -976,7 +1047,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         user_token: str = None,
         message: str = None,
         domain: str = None,
-        # **kwargs
+        **kwargs
     ):
       """
       Chat with the Jeeves API.
@@ -1021,6 +1092,8 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         # **kwargs
       )
 
+      validated_kwargs = self.validate_llm_kwargs(**kwargs)
+
       # The long term memory for the user conversation will be a domain identified with his
       # user token.
       postponed_request = self.maybe_retrieve_domain_additional_data(
@@ -1030,6 +1103,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           'user_token': user_token,
           'messages': messages,
           'use_long_term_memory': True,
+          **validated_kwargs,
         },
         user_token=user_token
       )
@@ -1044,6 +1118,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         messages=messages,
         user_token=user_token,
         use_long_term_memory=True,
+        **validated_kwargs,
       )
       return self.solve_postponed_request(request_id=request_id)
 

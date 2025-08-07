@@ -2,7 +2,13 @@ import torch as th
 
 from transformers import AutoTokenizer as LlmTokenizer
 from transformers import AutoModelForCausalLM as LlmForCausalLM
-from transformers import BitsAndBytesConfig
+from transformers import BitsAndBytesConfig, LogitsProcessorList
+from extensions.serving.mixins_llm.llm_utils import (
+  PerSampleTemperature,
+  PerSampleTopP,
+  PerSampleRepetitionPenalty,
+  PerSampleMaxLength,
+)
 
 
 class LlmModelMixin(object):
@@ -156,6 +162,7 @@ class LlmModelMixin(object):
     self.P(f'Trying to load pretrained for {model_id} with the following params:\n {model_params}')
 
     self.model = self.load_pretrained_model(model_id, **model_params)
+    self.model.eval()
 
     compiled = self.cfg_th_compile
     if compiled:
@@ -182,3 +189,40 @@ class LlmModelMixin(object):
     self.P("First weight is on device: {}".format(device))
 
     return
+
+  def get_model_predict_kwargs(
+      self,
+      attention_mask,
+      predict_kwargs_lst,
+      batch_tokens,
+      **kwargs
+  ):
+    res = {
+      "attention_mask": attention_mask,
+      "do_sample": True,
+      **kwargs
+    }
+
+    prompt_lens = attention_mask.sum(dim=1).tolist()
+    temperatures = [pkwargs.get("temperature", self.cfg_default_temperature) for pkwargs in predict_kwargs_lst]
+    top_ps = [pkwargs.get("top_p", self.cfg_default_top_p) for pkwargs in predict_kwargs_lst]
+    penalties = [pkwargs.get("repetition_penalty", self.cfg_repetition_penalty) for pkwargs in
+                 predict_kwargs_lst]
+    max_new_tokens = [pkwargs.get("max_new_tokens", self.cfg_default_max_tokens) for pkwargs in predict_kwargs_lst]
+
+    eos_token_id = self.tokenizer.eos_token_id
+
+    logits_processors = LogitsProcessorList([
+      PerSampleTemperature(temperatures),
+      PerSampleTopP(top_ps),
+      PerSampleRepetitionPenalty(penalties),
+      PerSampleMaxLength(prompt_lens, max_new_tokens, eos_token_id),
+    ])
+
+    max_ceiling = max(pl + mnt for pl, mnt in zip(prompt_lens, max_new_tokens))
+    res["max_length"] = max_ceiling
+    res["logits_processor"] = logits_processors
+    res["inputs"] = batch_tokens
+
+    return res
+
