@@ -73,6 +73,7 @@ import transformers
 import tokenizers
 import accelerate
 import re
+import os
 from sqlfluff.core import Linter # TODO: move sql linter to a child serving process
 
 
@@ -124,6 +125,7 @@ _CONFIG = {
   "DEFAULT_MAX_TOKENS" : 2048,
   "SKIP_ERRORS"           : True,
   "RELEVANT_SIGNATURES": None,
+  "GENERATION_SEED": 42,  # Seed for generation, can be set to None for random seed
 
   "SUPPORTED_REQUEST_TYPES": [
     "LLM"
@@ -237,6 +239,44 @@ class BaseLlmServing(
     else:
       return self.log.get_folder_size(path)[0]
 
+  def maybe_reseed(self, seed=None):
+    """
+    Reseed the random number generators if a seed is provided.
+    Parameters
+    ----------
+    seed : int, optional
+        The seed to use for reseeding. If None, no reseeding is done.
+    """
+    if seed is None:
+      seed = self.cfg_generation_seed
+    # endif seed provided
+
+    if isinstance(seed, int):
+      self.th.manual_seed(seed)
+      self.np.random.seed(seed)
+      if self.th.cuda.is_available():
+        self.th.cuda.manual_seed(seed)
+        self.th.cuda.manual_seed_all(seed)
+      # endif cuda available
+    # endif seed is int
+    return
+
+  def enable_deterministic_mode(self):
+    # cuDNN / TF32 switches -----------------------------------------------
+    self.th.backends.cuda.matmul.allow_tf32 = False
+    self.th.backends.cudnn.deterministic = True
+    self.th.backends.cudnn.benchmark = False
+
+    # Try to request deterministic algos, but *warn* instead of raising ----
+    try:
+      self.th.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+      # PyTorch < 2.0 – no warn_only flag.  We have to live without it.
+      self.P("'warn_only' flag not supported; some ops may be nondeterministic")
+    # endtry
+
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+    return
 
   def _startup(self):
     # check some params that can be re-configured from biz plugins or
@@ -258,6 +298,8 @@ class BaseLlmServing(
     for module_test in TEST_MODULES:
       self.P("    {} version: {}".format(module_test.__name__, module_test.__version__))
     #endfor each module
+
+    self.enable_deterministic_mode()
 
     # setup device
     self._setup_device()
@@ -329,7 +371,6 @@ class BaseLlmServing(
 
 
   def _setup_llm(self):
-    raise NotImplementedError("Must be implemented in derived class")
     return
 
 
@@ -684,45 +725,19 @@ class BaseLlmServing(
     # TODO: explore more generation strategies, as this is currently
     # using the greedy strategy.
 
-    # TODO: check how to add additional parameters from predict_kwargs_lst
-    alterable_kwargs = {
-      'temperature': {
-        'default_value': self.cfg_default_temperature,
-        'aggregate_method': self.aggregate_mean,
-      },
-      'top_p': {
-        'default_value': self.cfg_default_top_p,
-        'aggregate_method': self.aggregate_mean,
-      },
-      'max_new_tokens': {
-        'default_value': self.cfg_default_max_tokens,
-        'aggregate_method': self.aggregate_mean_int,
-      },
-      'repetition_penalty': {
-        'default_value': self.cfg_repetition_penalty,
-        'aggregate_method': self.aggregate_max,
-      },
-    }
-    predict_kwargs_values = {
-      k: [kwargs.get(k, details['default_value']) for kwargs in predict_kwargs_lst]
-      for k, details in alterable_kwargs.items()
-    }
-    # Aggregate the values using the specified method.
-    predict_kwargs = {}
-    for k, details in alterable_kwargs.items():
-      if details['aggregate_method'] is not None:
-        predict_kwargs[k] = details['aggregate_method'](predict_kwargs_values[k])
-      # endif aggregate method
-    # endfor each key in alterable kwargs
-
-    model_args = {
-      'attention_mask': attn_mask,
-      **predict_kwargs,
-    }
     # if self.cfg_prompt_lookup_num_tokens is not None:
     #   model_args['prompt_lookup_num_tokens'] = int(self.cfg_prompt_lookup_num_tokens)
+    generate_kwargs = self.get_model_predict_kwargs(
+      attention_mask=attn_mask,
+      predict_kwargs_lst=predict_kwargs_lst,
+      batch_tokens=batch_tokens,
+    )
 
-    self.P(f"Running with following model args:\n{self.json_dumps(model_args, indent=2)}")
+    generate_str = "\n".join(
+      f"{k}={v},"
+      for k, v in generate_kwargs.items()
+    )
+    self.P(f"Running with following model args:\n{generate_str}")
 
     # TODO: test if some gpu mem can be freed after this
     results = [
@@ -739,6 +754,7 @@ class BaseLlmServing(
     tries = 0
     while not conditions_satisfied:
       with th.no_grad():
+        self.maybe_reseed()
         t0 = self.time()
         # Note that there's no need to set the padding ID since we've passed
         # the appropriate attention mask.
@@ -747,8 +763,7 @@ class BaseLlmServing(
         # self.P(f"[DEBUG] batch_tokens shape: {batch_tokens.shape}, ")
         # self.P(f"[DEBUG] attn_mask : {model_args['attention_mask'].shape}")
         yhat = self.model.generate(
-          inputs=batch_tokens,
-          **model_args
+          **generate_kwargs
         )
         elapsed = self.time() - t0
       # endwith
@@ -775,6 +790,7 @@ class BaseLlmServing(
       invalid_objects = []
       invalid_tokens = []
       invalid_attn_mask = []
+      invalid_predict_kwargs = []
       tries += 1
       for (idx_orig, idx_curr) in obj_for_inference:
         # Get the result for the current index.
@@ -793,6 +809,7 @@ class BaseLlmServing(
           invalid_objects.append((idx_orig, len(invalid_objects)))
           invalid_tokens.append(batch_tokens[idx_curr: idx_curr + 1])
           invalid_attn_mask.append(attn_mask[idx_curr: idx_curr + 1])
+          invalid_predict_kwargs.append(predict_kwargs_lst[idx_curr])
       # endfor each object in the batch
 
       if len(invalid_objects) == 0 or tries >= max_tries:
@@ -801,7 +818,12 @@ class BaseLlmServing(
       else:
         batch_tokens = self.th.cat(invalid_tokens, dim=0)
         attn_mask = self.th.cat(invalid_attn_mask, dim=0)
-        model_args['attention_mask'] = attn_mask
+        # Rebuild the predict_kwargs_lst for the invalid objects.
+        generate_kwargs = self.get_model_predict_kwargs(
+          attention_mask=attn_mask,
+          predict_kwargs_lst=invalid_predict_kwargs,
+          batch_tokens=batch_tokens,
+        )
         obj_for_inference = invalid_objects
     # endwhile conditions satisfied
 
