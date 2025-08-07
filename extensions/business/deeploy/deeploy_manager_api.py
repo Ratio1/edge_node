@@ -474,5 +474,11 @@ class DeeployManagerApiPlugin(
     }
 
     """
-    result = self.netmon.network_known_apps(owner=owner)
-    return result
+    result = self.netmon.network_known_apps()
+    filtered_result = self.defaultdict(dict)
+    for node, apps in result.items():
+      for app_name, app_data in apps.items():
+        if app_data[NetMonCt.OWNER] != owner:
+          continue
+        filtered_result[node][app_name] = app_data
+    return filtered_result
