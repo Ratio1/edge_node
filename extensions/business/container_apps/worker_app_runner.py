@@ -5,7 +5,11 @@ worker_app_runner.py
 TODO:
 - add git clone command after each container is started
 - OBS: cannot use the parent already existing git helper functions as they deploy in the Edge Node host not in the container.
-- fix running the build and run commands 
+  - use `remote_commit = self.git_get_last_commit_hash(repo_url=url, user=username, token=token)` to check if the repo is at the latest version
+    - save latest commit hash in plugin state
+    - if last version restart the container and re-run the clone & build-and-run commands
+
+- (fix running the build and run commands)
 
 """
 
