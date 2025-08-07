@@ -112,7 +112,7 @@ class DeeployManagerApiPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
-      apps = self._get_online_apps()
+      apps = self._get_online_apps(owner=sender)
       
       # TODO: (Vitalii) filter apps by the sender address (OWNER)
       
@@ -458,7 +458,7 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  def _get_online_apps(self):
+  def _get_online_apps(self, owner):
     """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
@@ -474,5 +474,5 @@ class DeeployManagerApiPlugin(
     }
 
     """
-    result = self.netmon.network_known_apps()
+    result = self.netmon.network_known_apps(owner=owner)
     return result
