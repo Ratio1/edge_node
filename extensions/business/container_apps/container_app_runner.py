@@ -235,8 +235,24 @@ class ContainerAppRunnerPlugin(
     else:
       self.P(f"Unknown plugin command: {data}")
     return
+  
+  def on_post_container_start(self):
+    """
+    Lifecycle hook called after the container is started.
+    Runs commands in the container if specified in the config.
+
+      - after the container first start
+      - after the container is restarted
+    """
+    self.P("Container started, running post-start commands...")
+    return
+
 
   def get_setup_commands(self):
+    """
+    TODO: fix the attack vector here, we should not allow arbitrary commands to be run
+    
+    """
     cfg_setup_commands = self.cfg_setup_commands
     setup_commands = []
     if isinstance(cfg_setup_commands, str):
@@ -258,7 +274,12 @@ class ContainerAppRunnerPlugin(
 
     return setup_commands
 
+
   def get_start_commands(self):
+    """
+    TODO: fix the attack vector here, we should not allow arbitrary commands to be run
+    
+    """
     cfg_start_commands = self.cfg_start_commands
     start_commands = []
     if isinstance(cfg_start_commands, str):

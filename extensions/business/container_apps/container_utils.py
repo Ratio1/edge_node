@@ -243,15 +243,21 @@ class _ContainerUtilsMixin:
     self._reload_server()
     self.container_id = None
     self.container_start_time = self.time()  # Reset the start time after restart
+    return
 
   def _maybe_set_container_id_and_show_app_info(self):
     if self.container_id is None:
+      # this is the first time we are starting the container, so we need to get its ID
       container_id = self._get_container_id()
       if container_id:
         self.container_id = container_id
         self.P(f"Container ID set to: {self.container_id}")
+        self.on_post_container_start()  # Call the lifecycle hoo        
         self._maybe_send_plugin_start_confirmation()
         self._show_container_app_info()
+      #endif
+    #endif
+    return
 
   def _maybe_send_plugin_start_confirmation(self):
     """
@@ -352,4 +358,24 @@ class _ContainerUtilsMixin:
     msg += f"  CLI Tool:         {self.cli_tool}\n"
     self.P(msg)
     return
+
+  
+  def _run_command_in_container(self, command):
+    """
+    Run a command inside the container.
+    
+    Args:
+        command (str): The command to run inside the container.
+    """
+    if not self.container_id:
+      self.P("Container ID is not set. Cannot run command.")
+      return
+    
+    cmd = [self.cli_tool, "exec", "-i", self.container_id] + command.split()
+    try:
+      result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+      self.P(f"Command output: {result.stdout}")
+    except subprocess.CalledProcessError as e:
+      self.P(f"Error running command in container: {e.stderr}", color='r')
+      
   ## END CONTAINER MIXIN ###
