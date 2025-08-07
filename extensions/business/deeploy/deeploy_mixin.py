@@ -105,6 +105,7 @@ class _DeeployMixin:
     """
     plugins = self.deeploy_prepare_plugins(inputs)
     project_id = inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
+    project_name = inputs.get(DEEPLOY_KEYS.PROJECT_NAME, None)
     response_keys = {}
     for addr in nodes:
       # Nodes to peer with for CHAINSTORE
@@ -139,6 +140,7 @@ class _DeeployMixin:
         dct_deeploy_specs = {
           'job_id': inputs.job_id,
           'project_id': project_id,
+          'project_name': project_name,
           'nr_target_nodes': len(nodes),
           'initial_target_nodes': nodes,
         }
