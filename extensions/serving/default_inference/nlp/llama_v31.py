@@ -72,7 +72,4 @@ _CONFIG = {
 
 
 class LlamaV31(BaseServingProcess):
-
-  def _setup_llm(self):
-    # just override this method as the base class has a virtual method that raises an exception
-    return
+  CONFIG = _CONFIG
