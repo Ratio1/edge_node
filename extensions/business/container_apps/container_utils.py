@@ -76,6 +76,31 @@ class _ContainerUtilsMixin:
     # end if result
     self.Pd(f"Image {full_ref} pulled successfully: {result.decode('utf-8', errors='ignore')}", score=30)
     return pulled
+  
+  
+  def _get_default_env_vars(self):
+    """
+    Get the default environment variables for the container.
+    
+    WARNING: This is a critical method that should be thoroughly reviewed for attack vectors.
+    
+    Returns:
+        dict: Default environment variables.
+    """
+    localhost_ip = self.log.get_localhost_ip()
+    dct_env = {
+      "CONTAINER_NAME": self.container_name,
+      "EE_HOST_IP": localhost_ip,
+      "EE_HOST_ID": self.ee_id,
+      "EE_HOST_ADDR": self.ee_addr,
+      "EE_HOST_ETH_ADDR": self.bc.eth_address,
+      "EE_CHAINSTORE_API_URL": f"http://{localhost_ip}:31234",
+      "EE_R1FS_API_URL": f"http://{localhost_ip}:31235",
+    }
+    chainstore_peers = getattr(self, 'cfg_chainstore_peers', [])
+    dct_env["EE_CHAINSTORE_PEERS"] = self.json_dumps(chainstore_peers)
+
+    return dct_env
 
 
   def _get_container_run_command(self):
@@ -110,18 +135,10 @@ class _ContainerUtilsMixin:
 
     for key, val in self.dynamic_env.items():
       cmd += ["-e", f"{key}={val}"]
-      
-    cmd += ["-e", f"CONTAINER_NAME={self.container_name}"]
-    
-    # TODO: check if this is a potential security issue (host is a container itself but we need to make sure)
-    host_ip = self._setup_dynamic_env_var_host_ip()
-    cmd += ["-e", f"EE_HOST_IP={host_ip}"]
-    cmd += ["-e", f"EE_CHAINSTORE_API_URL=http://{self._setup_dynamic_env_var_host_ip()}:31234"]
-    cmd += ["-e", f"EE_R1FS_API_URL=http://{self._setup_dynamic_env_var_host_ip()}:31235"]
 
-    chainstore_peers = getattr(self, 'cfg_chainstore_peers', [])
-    cmd += ["-e", f"EE_CHAINSTORE_PEERS='{self.json_dumps(chainstore_peers)}'"]
-
+    # now add the default env vars
+    for key, val in self._get_default_env_vars().items():
+      cmd += ["-e", f"{key}={val}"]      
 
     # Volume mounts
     if len(self.volumes) > 0:
