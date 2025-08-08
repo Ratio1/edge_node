@@ -1,0 +1,25 @@
+services:
+  ratio1_01:
+    image: ratio1/edge_node:mainnet
+    container_name: r1node1
+    restart: always
+    volumes:
+      - r1vol1:/edge_node/_local_cache
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"         
+      - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
+
+  watchtower:
+    image: containrrr/watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=60 # Check every 1 minute
+      - WATCHTOWER_CHECK_NEW_IMAGES=true      
+      - WATCHTOWER_LABEL_ENABLE=true        
+
+
+volumes:
+  r1vol1:
