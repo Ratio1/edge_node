@@ -76,6 +76,33 @@ class _ContainerUtilsMixin:
     # end if result
     self.Pd(f"Image {full_ref} pulled successfully: {result.decode('utf-8', errors='ignore')}", score=30)
     return pulled
+  
+  
+  def _get_default_env_vars(self):
+    """
+    Get the default environment variables for the container.
+    
+    WARNING: This is a critical method that should be thoroughly reviewed for attack vectors.
+    
+    Returns:
+        dict: Default environment variables.
+    """
+    localhost_ip = self.log.get_localhost_ip()
+    chainstore_peers = getattr(self, 'cfg_chainstore_peers', [])
+    str_chainstore_peers = self.json_dumps(chainstore_peers)
+    dct_env = {
+      "CONTAINER_NAME": self.container_name,
+      "EE_CONTAINER_NAME": self.container_name,
+      "EE_HOST_IP": localhost_ip,
+      "EE_HOST_ID": self.ee_id,
+      "EE_HOST_ADDR": self.ee_addr,
+      "EE_HOST_ETH_ADDR": self.bc.eth_address,
+      "EE_CHAINSTORE_API_URL": f"http://{localhost_ip}:31234",
+      "EE_R1FS_API_URL": f"http://{localhost_ip}:31235",
+      "EE_CHAINSTORE_PEERS": str_chainstore_peers,
+    }
+
+    return dct_env
 
 
   def _get_container_run_command(self):
@@ -110,18 +137,10 @@ class _ContainerUtilsMixin:
 
     for key, val in self.dynamic_env.items():
       cmd += ["-e", f"{key}={val}"]
-      
-    cmd += ["-e", f"CONTAINER_NAME={self.container_name}"]
-    
-    # TODO: check if this is a potential security issue (host is a container itself but we need to make sure)
-    host_ip = self._setup_dynamic_env_var_host_ip()
-    cmd += ["-e", f"EE_HOST_IP={host_ip}"]
-    cmd += ["-e", f"EE_CHAINSTORE_API_URL=http://{self._setup_dynamic_env_var_host_ip()}:31234"]
-    cmd += ["-e", f"EE_R1FS_API_URL=http://{self._setup_dynamic_env_var_host_ip()}:31235"]
 
-    chainstore_peers = getattr(self, 'cfg_chainstore_peers', [])
-    cmd += ["-e", f"EE_CHAINSTORE_PEERS='{self.json_dumps(chainstore_peers)}'"]
-
+    # now add the default env vars
+    for key, val in self._get_default_env_vars().items():
+      cmd += ["-e", f"{key}={val}"]      
 
     # Volume mounts
     if len(self.volumes) > 0:
@@ -243,15 +262,21 @@ class _ContainerUtilsMixin:
     self._reload_server()
     self.container_id = None
     self.container_start_time = self.time()  # Reset the start time after restart
+    return
 
   def _maybe_set_container_id_and_show_app_info(self):
     if self.container_id is None:
+      # this is the first time we are starting the container, so we need to get its ID
       container_id = self._get_container_id()
       if container_id:
         self.container_id = container_id
         self.P(f"Container ID set to: {self.container_id}")
+        self.on_post_container_start()  # Call the lifecycle hoo        
         self._maybe_send_plugin_start_confirmation()
         self._show_container_app_info()
+      #endif
+    #endif
+    return
 
   def _maybe_send_plugin_start_confirmation(self):
     """
@@ -352,4 +377,24 @@ class _ContainerUtilsMixin:
     msg += f"  CLI Tool:         {self.cli_tool}\n"
     self.P(msg)
     return
+
+  
+  def _run_command_in_container(self, command):
+    """
+    Run a command inside the container.
+    
+    Args:
+        command (str): The command to run inside the container.
+    """
+    if not self.container_id:
+      self.P("Container ID is not set. Cannot run command.")
+      return
+    
+    cmd = [self.cli_tool, "exec", "-i", self.container_id] + command.split()
+    try:
+      result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+      self.P(f"Command output: {result.stdout}")
+    except subprocess.CalledProcessError as e:
+      self.P(f"Error running command in container: {e.stderr}", color='r')
+      
   ## END CONTAINER MIXIN ###
