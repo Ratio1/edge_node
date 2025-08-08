@@ -88,17 +88,19 @@ class _ContainerUtilsMixin:
         dict: Default environment variables.
     """
     localhost_ip = self.log.get_localhost_ip()
+    chainstore_peers = getattr(self, 'cfg_chainstore_peers', [])
+    str_chainstore_peers = self.json_dumps(chainstore_peers)
     dct_env = {
       "CONTAINER_NAME": self.container_name,
+      "EE_CONTAINER_NAME": self.container_name,
       "EE_HOST_IP": localhost_ip,
       "EE_HOST_ID": self.ee_id,
       "EE_HOST_ADDR": self.ee_addr,
       "EE_HOST_ETH_ADDR": self.bc.eth_address,
       "EE_CHAINSTORE_API_URL": f"http://{localhost_ip}:31234",
       "EE_R1FS_API_URL": f"http://{localhost_ip}:31235",
+      "EE_CHAINSTORE_PEERS": str_chainstore_peers,
     }
-    chainstore_peers = getattr(self, 'cfg_chainstore_peers', [])
-    dct_env["EE_CHAINSTORE_PEERS"] = self.json_dumps(chainstore_peers)
 
     return dct_env
 
