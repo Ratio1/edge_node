@@ -6,26 +6,6 @@ class LlmTokenizerMixin(object):
     super(LlmTokenizerMixin, self).__init__(*args, **kwargs)
     return
 
-  def _set_tokenizer_chat_template(self):
-    """
-    Update the chat template of the tokenizer for cases
-    where transformers doesn't set the correct values.
-    For now this covers mistral and llama-3.
-
-    Parameters
-    ----------
-    None
-
-    Returns
-    -------
-    None
-    """
-    if 'mistral' in self.cfg_model_name.lower():
-      self.tokenizer.chat_template = LlmCT.MISTRAL_CHAT_TEMPLATE
-    if 'llama-3' in self.cfg_model_name.lower():
-      self.tokenizer.chat_template = LlmCT.LLAMA3_CHAT_TEMPLATE
-    return
-
   def add_context_to_request(self, request, context: list):
     """
     Adds context to the request.

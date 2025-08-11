@@ -126,6 +126,7 @@ _CONFIG = {
   "SKIP_ERRORS"           : True,
   "RELEVANT_SIGNATURES": None,
   "GENERATION_SEED": 42,  # Seed for generation, can be set to None for random seed
+  "DETERMINISTIC_MODE": False,  # If True, will use deterministic algorithms in PyTorch
 
   "SUPPORTED_REQUEST_TYPES": [
     "LLM"
@@ -261,21 +262,22 @@ class BaseLlmServing(
     # endif seed is int
     return
 
-  def enable_deterministic_mode(self):
-    # cuDNN / TF32 switches -----------------------------------------------
-    self.th.backends.cuda.matmul.allow_tf32 = False
-    self.th.backends.cudnn.deterministic = True
-    self.th.backends.cudnn.benchmark = False
+  def maybe_enable_deterministic_mode(self):
+    if self.cfg_deterministic_mode:
+      # cuDNN / TF32 switches -----------------------------------------------
+      self.th.backends.cuda.matmul.allow_tf32 = False
+      self.th.backends.cudnn.deterministic = True
+      self.th.backends.cudnn.benchmark = False
 
-    # Try to request deterministic algos, but *warn* instead of raising ----
-    try:
-      self.th.use_deterministic_algorithms(True, warn_only=True)
-    except TypeError:
-      # PyTorch < 2.0 – no warn_only flag.  We have to live without it.
-      self.P("'warn_only' flag not supported; some ops may be nondeterministic")
-    # endtry
+      # Try to request deterministic algos, but *warn* instead of raising ----
+      try:
+        self.th.use_deterministic_algorithms(True, warn_only=True)
+      except TypeError:
+        # PyTorch < 2.0 – no warn_only flag.  We have to live without it.
+        self.P("'warn_only' flag not supported; some ops may be nondeterministic")
+      # endtry
 
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+      os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
     return
 
   def _startup(self):
@@ -299,7 +301,7 @@ class BaseLlmServing(
       self.P("    {} version: {}".format(module_test.__name__, module_test.__version__))
     #endfor each module
 
-    self.enable_deterministic_mode()
+    self.maybe_enable_deterministic_mode()
 
     # setup device
     self._setup_device()
