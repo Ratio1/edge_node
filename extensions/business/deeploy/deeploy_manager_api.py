@@ -458,7 +458,7 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  def _get_online_apps(self, owner):
+  def _get_online_apps(self, owner=None):
     """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
@@ -475,10 +475,12 @@ class DeeployManagerApiPlugin(
 
     """
     result = self.netmon.network_known_apps()
-    filtered_result = self.defaultdict(dict)
-    for node, apps in result.items():
-      for app_name, app_data in apps.items():
-        if app_data[NetMonCt.OWNER] != owner:
-          continue
-        filtered_result[node][app_name] = app_data
-    return filtered_result
+    if owner is not None:  
+      filtered_result = self.defaultdict(dict)
+      for node, apps in result.items():
+        for app_name, app_data in apps.items():
+          if app_data[NetMonCt.OWNER] != owner:
+            continue
+          filtered_result[node][app_name] = app_data
+      result = filtered_result
+    return result

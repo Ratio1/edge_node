@@ -425,6 +425,7 @@ class _DeeployMixin:
   def send_instance_command_to_nodes(self, inputs):
     """
     Send a command to the specified nodes for the given plugin instance.
+    TODO: (Vitalii, Andrei) send instance command to the nodes DOES NOT need discovery
     """
     discovered_plugins = self.__discover_plugin_instances(
       app_id=inputs.app_id,
