@@ -314,12 +314,20 @@ class OracleApiPlugin(BasePlugin):
         autocomplete=True,
         as_list=False
       )
-      stats = self.netmon.epoch_manager.get_stats()
-      resources = stats.get(node_addr, {}).get("resources", {})
+      if epochs_vals is None:
+        error_msg = f"No epochs found for node {node_addr} in the range {start_epoch}-{end_epoch}"
+        stats, resources = {}, {}
+      else:
+        stats = self.netmon.epoch_manager.get_stats()
+        resources = stats.get(node_addr, {}).get("resources", {})
+      # end if epochs_vals is None
+    #endif no errors
     if epochs_vals is None and not unknown_address:
       data = {
         'node': node_addr,
         'node_eth_address': node_eth_address,
+        'node_alias' : self.netmon.network_node_eeid(node_addr),
+        'node_is_online' : self.netmon.network_node_is_online(node_addr),
         'error': "No epochs found for the given node",
       }
     else:      
