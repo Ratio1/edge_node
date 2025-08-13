@@ -296,6 +296,7 @@ class _ContainerUtilsMixin:
         self.P(f"Sending confirmation {confirmation + 1} to {response_key}: {self.json_dumps(response_info)}")
         response_info['confirmation'] = confirmation + 1
         self.chainstore_set(response_key, response_info)
+        self.sleep(0.100) # wait 100 ms
     return
   
 
