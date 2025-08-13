@@ -1,3 +1,5 @@
+import os.path
+
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 from naeural_core.business.mixins_libs.network_processor_mixin import _NetworkProcessorMixin
 from constants import JeevesCt
@@ -28,7 +30,11 @@ _CONFIG = {
 
   'PREDEFINED_DOMAINS': {
     'telegram_bot_community': {
-      'prompt': JeevesCt.COMMUNITY_CHATBOT_SYSTEM_PROMPT
+      'prompt_default': JeevesCt.COMMUNITY_CHATBOT_SYSTEM_PROMPT,
+      'prompt': JeevesCt.COMMUNITY_CHATBOT_SYSTEM_PROMPT_PATH,
+      "additional_kwargs": {
+        "temperature": 0.3
+      }
     },
   },
 
@@ -87,6 +93,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       self.maybe_create_domain(
         domain_name=domain,
         domain_prompt=domain_data.get('prompt'),
+        domain_prompt_default=domain_data.get('prompt_default'),
         user_token=domain_data.get('user_token'),
         contains_additional_context=domain_data.get('contains_additional_context', False),
         additional_kwargs=domain_data.get('additional_kwargs') or {},
@@ -98,6 +105,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       self.maybe_create_domain(
         domain_name=domain,
         domain_prompt=domain_data.get('prompt'),
+        domain_prompt_default=domain_data.get('prompt_default'),
         user_token=domain_data.get('user_token'),
         contains_additional_context=True,
         additional_kwargs=domain_data.get('additional_kwargs') or {},
@@ -831,12 +839,29 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           The domain prompt.
       If return_additional_kwargs is True, returns a tuple with the domain prompt and additional kwargs.
       """
+      additional_kwargs = {}
+      domain_prompt = self.cfg_default_system_prompt
       if domain is not None and domain in self.__domains_data:
         additional_kwargs = self.__domains_data[domain].get('additional_kwargs') or {}
         domain_prompt = self.__domains_data[domain].get('domain_prompt', None)
-        return (domain_prompt, additional_kwargs) if return_additional_kwargs else domain_prompt
       # endif domain is not None
-      return (self.cfg_default_system_prompt, {}) if return_additional_kwargs else self.cfg_default_system_prompt
+      if isinstance(domain_prompt, str) and domain_prompt.startswith("file://"):
+        # This is a path to a file.
+        # Remove the "file://" prefix.
+        domain_prompt = domain_prompt[7:]  # Remove "file://"
+        if os.path.exists(domain_prompt):
+          if self.is_path_safe(domain_prompt):
+            with open(domain_prompt, 'r', encoding='utf-8') as f:
+              domain_prompt = f.read()
+          # endif path is safe
+        else:
+          domain_prompt_default = self.__domains_data.get(domain, {}).get('domain_prompt_default', None)
+          if isinstance(domain_prompt_default, str):
+            domain_prompt = domain_prompt_default
+          # endif domain_prompt_default specified
+        # endif domain_prompt is a path and exists
+      # endif domain_prompt is a path
+      return (domain_prompt, additional_kwargs) if return_additional_kwargs else domain_prompt
 
     def validate_llm_kwargs(self, **kwargs):
       """
@@ -1138,7 +1163,8 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
 
   def maybe_create_domain(
       self, domain_name: str, domain_prompt: str = None,
-      user_token: str = None, contains_additional_context: bool = False,
+      domain_prompt_default: str = None, user_token: str = None,
+      contains_additional_context: bool = False,
       additional_kwargs: dict = None
   ):
     if domain_name not in self.__domains_data:
@@ -1146,6 +1172,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         'creation_time': self.time(),
         'last_access_time': self.time(),
         'n_requests': 0,
+        'domain_prompt_default': domain_prompt_default,
         'domain_prompt': domain_prompt,
         'domain_name': domain_name,
         'user_token': user_token,
@@ -1153,6 +1180,8 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         'additional_kwargs': additional_kwargs or {},
       }
     else:
+      if isinstance(domain_prompt_default, str) and len(domain_prompt_default) > 0:
+        self.__domains_data[domain_name]['domain_prompt_default'] = domain_prompt_default
       if domain_prompt is not None:
         self.__domains_data[domain_name]['domain_prompt'] = domain_prompt
       if user_token is not None:
@@ -1170,19 +1199,25 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
 
   @BasePlugin.endpoint(method='post')
   def create_domain(
-      self, user_token: str, domain_name: str, domain_prompt: str
+      self, user_token: str, domain_name: str, domain_prompt: str,
+      domain_prompt_default: str = None,
   ):
     """
     Create a new domain.
 
     Parameters
     ----------
+
     user_token : str
         The user token to use for the API. Default is None.
     domain_name : str
         The name of the domain to create.
     domain_prompt : str
-        The prompt to use for the domain.
+        The prompt to use for the domain. It can be a string or a path to a file.
+    domain_prompt_default : str
+        The default prompt to use for the domain in case the domain prompt is a
+        path to a file and the file does not exist.
+        If not specified, the default prompt will be used in cases mentioned above.
 
     Returns
     -------
@@ -1214,6 +1249,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     self.maybe_create_domain(
       domain_name=domain_name,
       domain_prompt=domain_prompt,
+      domain_prompt_default=domain_prompt_default,
       user_token=user_token,
     )
     
@@ -1250,6 +1286,11 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     }
     if include_prompt:
       res['domain_prompt'] = domain_data.get('domain_prompt')
+      domain_prompt_default = domain_data.get('domain_prompt_default')
+      if domain_prompt_default is not None:
+        res['domain_prompt_default'] = domain_prompt_default
+      # endif domain_prompt_default is specified
+    # endif include prompt
     
     return res
 
@@ -1290,9 +1331,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       request_id = data.get('REQUEST_ID', None)
       if request_id is not None:
         if request_id in self.__requests:
-            #
-            #
-            #
           request_data = self.__requests[request_id]
           request_finished = request_data.get('finished', False)
           if request_finished:

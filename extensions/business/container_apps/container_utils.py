@@ -285,14 +285,19 @@ class _ContainerUtilsMixin:
     """
     response_key = getattr(self, 'cfg_chainstore_response_key', None)
     if response_key is not None:
-      self.P(f"Responding to key {response_key}")
+      N_CONFIRMATIONS = 3
+      self.P(f"Responding to key {response_key} in {N_CONFIRMATIONS} confirmations")
       response_info = {
         'container_id': self.container_id,
         'start_time': self.time_to_str(self.container_start_time),
         'ports_mapping': self.extra_ports_mapping,
       }
-      self.P(f"Response to key {response_key}: {self.json_dumps(response_info)}")
-      self.chainstore_set(response_key, response_info)
+      for confirmation in range(N_CONFIRMATIONS):
+        self.P(f"Sending confirmation {confirmation + 1} to {response_key}: {self.json_dumps(response_info)}")
+        response_info['confirmation'] = confirmation + 1
+        to_save = self.deepcopy(response_info)
+        self.chainstore_set(response_key, to_save)
+        self.sleep(0.100) # wait 100 ms
     return
   
 

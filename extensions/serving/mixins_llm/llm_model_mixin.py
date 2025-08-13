@@ -85,9 +85,6 @@ class LlmModelMixin(object):
       cache_dir=cache_dir,
       use_auth_token=token,
     )
-
-    # Fix for missing system roles in transformers.
-    self._set_tokenizer_chat_template()
     return
 
   def _load_tokenizer(self):
