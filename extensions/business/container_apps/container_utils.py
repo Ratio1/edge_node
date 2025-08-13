@@ -295,7 +295,8 @@ class _ContainerUtilsMixin:
       for confirmation in range(N_CONFIRMATIONS):
         self.P(f"Sending confirmation {confirmation + 1} to {response_key}: {self.json_dumps(response_info)}")
         response_info['confirmation'] = confirmation + 1
-        self.chainstore_set(response_key, response_info)
+        to_save = self.deepcopy(response_info)
+        self.chainstore_set(response_key, to_save)
         self.sleep(0.100) # wait 100 ms
     return
   
