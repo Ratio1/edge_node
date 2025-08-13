@@ -1,7 +1,7 @@
 
 from unittest import result
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
-from ratio1.const.evm_net import EvmNetData, EVM_NET_DATA
+from ratio1.const.evm_net import EvmNetData
 
 __VER__ = '0.1.0'
 
@@ -37,17 +37,19 @@ class LivenessApiPlugin(BasePlugin):
     super(LivenessApiPlugin, self).on_init()
     self.const.BASE_CT.dAuth
     current_epoch = self.netmon.epoch_manager.get_current_epoch()
-    self.P("Started {} plugin in epoch {}".format(
-      self.__class__.__name__, current_epoch)
-    )
+    data = self.__get_all_services_statuses()
+    self.P("Started {} plugin in epoch {}. Services statuses:\n{}".format(
+      self.__class__.__name__, current_epoch,
+      self.json_dumps(data, indent=2),
+    ))
+
     return
   
 
   def __get_service_url_mapping(self, service_key=''):
     dct_mapping = self.cfg_monitored_services
     url_key = dct_mapping.get(service_key.upper())
-    evm_net = self.bc.get_evm_network()
-    evm_net_data = EVM_NET_DATA.get(evm_net, {})
+    evm_net_data = self.bc.get_evm_net_data()
     url = evm_net_data.get(url_key, None)
     return url
 
@@ -58,8 +60,9 @@ class LivenessApiPlugin(BasePlugin):
     """
     if url is None:
       return {"error": "Service URL is not available."}
-  
+    self.P("Checking service status for URL: {}".format(url))
     response = self.requests.get(url, timeout=5)
+    self.P("Received response {} for {}".format(response.status_code, url))
     if response.status_code == 200:
       return {"status": "running"}
     else:
