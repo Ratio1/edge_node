@@ -99,8 +99,7 @@ def to_docs_url(raw: str, default_scheme: str = "https") -> str:
 
 class LivenessApiPlugin(BasePlugin):
   """
-  This plugin is a FastAPI web app that provides endpoints to interact with the
-  EpochManager of the Neural Core.
+  This plugin is a FastAPI web app that status info for various services
   """
   CONFIG = _CONFIG
 
@@ -111,7 +110,7 @@ class LivenessApiPlugin(BasePlugin):
 
   def on_init(self):
     super(LivenessApiPlugin, self).on_init()
-    self.const.BASE_CT.dAuth
+    self.evm_net_data = self.bc.get_evm_net_data()
     current_epoch = self.netmon.epoch_manager.get_current_epoch()
     data = self.__get_all_services_statuses()
     self.P("Started {} plugin in epoch {}. Services statuses:\n{}".format(
@@ -125,8 +124,9 @@ class LivenessApiPlugin(BasePlugin):
   def __get_service_url_mapping(self, service_key=''):
     dct_mapping = self.cfg_monitored_services
     url_key = dct_mapping.get(service_key.upper())
-    evm_net_data = self.bc.get_evm_net_data()
-    url = evm_net_data.get(url_key, None)
+    url = self.evm_net_data.get(url_key, None)
+    if url is None:
+      url = url_key  # fallback to the key itself if not found
     return url
 
 
