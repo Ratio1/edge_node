@@ -104,12 +104,12 @@ class ChainDistMonitorPlugin(BasePlugin):
             if deeploy_specs.get('job_id') == job_id:
               running_nodes.append(node)
         
-        self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes}", verbosity=3)
         # if we have running nodes, submit the update
         if len(running_nodes):
           running_nodes_eth = [self.bc.node_address_to_eth_address(node) for node in running_nodes]
           running_nodes_eth = sorted(running_nodes_eth)
-          # time_blocked returns 0 if the update was delivered on the nr of seconds 
+          self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes_eth}", verbosity=3)
+          # time_blocked returns 0 if the update was delivered on the nr of seconds
           # until the update is possible
           time_blocked = self.bc.submit_node_update( 
             job_id=job_id,
