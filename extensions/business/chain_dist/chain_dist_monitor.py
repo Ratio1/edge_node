@@ -108,10 +108,14 @@ class ChainDistMonitorPlugin(BasePlugin):
         # if we have running nodes, submit the update
         if len(running_nodes):
           running_nodes_eth = [self.bc.node_address_to_eth_address(node) for node in running_nodes]
-          self.bc.submit_node_update(
+          running_nodes_eth = sorted(running_nodes_eth)
+          # time_blocked returns 0 if the update was delivered on the nr of seconds 
+          # until the update is possible
+          time_blocked = self.bc.submit_node_update( 
             job_id=job_id,
             nodes=running_nodes_eth,
           )
+          # time_blocked will be used to postpone the state
     return
     
     

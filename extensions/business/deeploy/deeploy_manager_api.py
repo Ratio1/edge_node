@@ -215,6 +215,7 @@ class DeeployManagerApiPlugin(
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
         if (dct_status is not None and is_confirmable_job and len(nodes) == len(dct_status)) or not is_confirmable_job:
           eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in nodes]
+          eth_nodes = sorted(eth_nodes)
           self.bc.submit_node_update(
             job_id=job_id,
             nodes=eth_nodes,
