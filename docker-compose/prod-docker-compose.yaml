@@ -2,6 +2,7 @@ services:
   ratio1_01:
     image: ratio1/edge_node:mainnet
     container_name: r1node1
+    privileged: true
     restart: always
     volumes:
       - r1vol1:/edge_node/_local_cache
@@ -11,7 +12,9 @@ services:
 
   ratio1_02:
     image: ratio1/edge_node:mainnet
+    privileged: true
     container_name: r1node2
+    privileged: true
     restart: always
     volumes:
       - r1vol2:/edge_node/_local_cache
@@ -22,6 +25,7 @@ services:
   ratio1_03:
     image: ratio1/edge_node:mainnet
     container_name: r1node3
+    privileged: true
     restart: always
     volumes:
       - r1vol3:/edge_node/_local_cache
@@ -31,6 +35,7 @@ services:
 
   ratio1_04:
     image: ratio1/edge_node:mainnet
+    privileged: true
     container_name: r1node4
     restart: always
     volumes:
@@ -41,6 +46,7 @@ services:
 
   ratio1_05:
     image: ratio1/edge_node:mainnet
+    privileged: true
     container_name: r1node5
     restart: always
     volumes:
@@ -51,6 +57,7 @@ services:
 
   ratio1_06:
     image: ratio1/edge_node:mainnet
+    privileged: true
     container_name: r1node6
     restart: always
     volumes:
@@ -61,6 +68,7 @@ services:
 
   ratio1_07:
     image: ratio1/edge_node:mainnet
+    privileged: true
     container_name: r1node7
     restart: always
     volumes:
@@ -71,6 +79,7 @@ services:
 
   ratio1_08:
     image: ratio1/edge_node:mainnet
+    privileged: true
     container_name: r1node8
     restart: always
     volumes:
@@ -94,6 +103,18 @@ services:
 
 volumes:
   r1vol1:
+    name: r1vol1
   r1vol2:
+    name: r1vol2
   r1vol3:
-  r1vol4:  
+    name: r1vol3
+  r1vol4:
+    name: r1vol4
+  r1vol5:
+    name: r1vol5
+  r1vol6:
+    name: r1vol6
+  r1vol7:
+    name: r1vol7
+  r1vol8:
+    name: r1vol8

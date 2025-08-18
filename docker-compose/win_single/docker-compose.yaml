@@ -1,10 +1,11 @@
 services:
   ratio1_01:
     image: ratio1/edge_node:mainnet
-    container_name: r1node1
+    container_name: r1node
+    privileged: true
     restart: always
     volumes:
-      - r1vol1:/edge_node/_local_cache
+      - r1vol:/edge_node/_local_cache
     labels:
       - "com.centurylinklabs.watchtower.enable=true"         
       - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
@@ -22,4 +23,5 @@ services:
 
 
 volumes:
-  r1vol1:
+  r1vol:
+    name: r1vol
