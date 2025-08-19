@@ -368,6 +368,10 @@ class _DeeployTargetNodesMixin:
 
     for node in inputs.target_nodes:
       addr = self._check_and_maybe_convert_address(node)
+      is_supervisor = self.netmon.network_node_is_supervisor(addr=addr)
+      if is_supervisor:
+        msg = f"{DEEPLOY_ERRORS.NODES6}: Node {addr} is a supervisor node and cannot be used for deeployment"
+        raise ValueError(msg)
       is_online = self.netmon.network_node_is_online(addr)
       if is_online:
         node_resources = self.check_node_available_resources(addr, inputs)
