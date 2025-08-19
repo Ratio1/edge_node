@@ -380,7 +380,7 @@ class _DeeployTargetNodesMixin:
           for detail in node_resources[DEEPLOY_RESOURCES.DETAILS]:
             error_msg += (
                   f"- {detail[DEEPLOY_RESOURCES.RESOURCE]}: available {detail[DEEPLOY_RESOURCES.AVAILABLE]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]} < " +
-                  "required {detail[DEEPLOY_RESOURCES.REQUIRED]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]}\n")
+                  f"required {detail[DEEPLOY_RESOURCES.REQUIRED]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]}\n")
           raise ValueError(error_msg)
         # endif not node_resources
         nodes.append(addr)
