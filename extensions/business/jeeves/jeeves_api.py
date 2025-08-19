@@ -622,13 +622,16 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         for msg in messages
       ]
 
-    def maybe_short_term_memory_to_long_term_memory(self, user_token: str):
+    def maybe_short_term_memory_to_long_term_memory(self, user_token: str, use_long_term_memory: bool = True):
       """
       Move the short term memory to the long term memory.
       Parameters
       ----------
       user_token : str
           The user token to use for the API. Default is None.
+
+      use_long_term_memory : bool
+          Whether to use the long term memory for the user token. Default is True.
 
       Returns
       -------
@@ -637,7 +640,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       """
       current_short_term_memory = self.__user_data[user_token].get('messages') or []
       transfer_threshold = self.cfg_short_term_memory_size // 2
-      if len(current_short_term_memory) > transfer_threshold:
+      if len(current_short_term_memory) > self.cfg_short_term_memory_size:
         current_role = current_short_term_memory[transfer_threshold].get('role')
         while transfer_threshold > 0 and current_role != "user":
           transfer_threshold -= 1
@@ -648,11 +651,13 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         first_half = current_short_term_memory[:transfer_threshold]
         second_half = current_short_term_memory[transfer_threshold:]
         self.__user_data[user_token]['messages'] = second_half
-        self.add_documents(
-          context_id=user_token,
-          documents=self.messages_to_documents(first_half),
-        )
-        self.__user_data[user_token]['long_term_memory_is_empty'] = False
+        if use_long_term_memory:
+          self.add_documents(
+            context_id=user_token,
+            documents=self.messages_to_documents(first_half),
+          )
+          self.__user_data[user_token]['long_term_memory_is_empty'] = False
+        # endif use long term memory
       return
   """END RAG SECTION"""
 
@@ -662,6 +667,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self, domain: str, query: str = None,
         next_request_params: dict = None,
         user_token: str = None,
+        short_term_memory_only: bool = False
     ):
       """
       Retrieve the domain data from the RAG agents' context.
@@ -683,6 +689,10 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       user_token : str
           The user token to use for the API. Default is None.
 
+      short_term_memory_only : bool
+          Whether to retrieve only the short term memory for the user token.
+          If True, documents retrieval will be used for older messages of the user.
+
       Returns
       -------
       str
@@ -695,7 +705,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
 
       if domain == user_token:
         is_long_term_empty = self.__user_data[user_token].get('long_term_memory_is_empty', True)
-        if not is_long_term_empty:
+        if not is_long_term_empty and not short_term_memory_only:
           return self.retrieve_documents_helper(
             context_id=user_token,
             query=query,
@@ -992,6 +1002,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         next_request_params={
           'user_token': user_token,
           'messages': messages,
+          'keep_conversation_history': False,
           'use_long_term_memory': False,
           **additional_kwargs,
         }
@@ -1004,6 +1015,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       request_id = self.register_chat_request(
         messages=messages,
         user_token=user_token,
+        keep_conversation_history=False,
         use_long_term_memory=False,
         **additional_kwargs,
       )
@@ -1050,6 +1062,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       request_kwargs = {
         'messages': messages,
         'user_token': user_token,
+        'keep_conversation_history': False,
         'use_long_term_memory': False,
         'temperature': temperature,
         'top_p': top_p,
@@ -1072,6 +1085,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         user_token: str = None,
         message: str = None,
         domain: str = None,
+        short_term_memory_only: bool = False,
         **kwargs
     ):
       """
@@ -1086,6 +1100,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           The message to send to the API. Default is None.
       domain : str
           The domain to use for the API. Default is None.
+      short_term_memory_only : bool
+          Whether to use only the short term memory for the chat. Default is False.
+          If True, the chat will not use the long term memory.
 
       # TODO: add kwargs (e.g. temperature or function calling)
       kwargs
@@ -1121,16 +1138,19 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
 
       # The long term memory for the user conversation will be a domain identified with his
       # user token.
+      use_long_term_memory = not short_term_memory_only
       postponed_request = self.maybe_retrieve_domain_additional_data(
         domain=user_token,
         query=message,
         next_request_params={
           'user_token': user_token,
           'messages': messages,
-          'use_long_term_memory': True,
+          'keep_conversation_history': True,
+          'use_long_term_memory': use_long_term_memory,
           **validated_kwargs,
         },
-        user_token=user_token
+        user_token=user_token,
+        short_term_memory_only=short_term_memory_only,
       )
       # Check if the request needs 
       if postponed_request is not None:
@@ -1142,7 +1162,8 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       request_id = self.register_chat_request(
         messages=messages,
         user_token=user_token,
-        use_long_term_memory=True,
+        keep_conversation_history=True,
+        use_long_term_memory=use_long_term_memory,
         **validated_kwargs,
       )
       return self.solve_postponed_request(request_id=request_id)
@@ -1347,9 +1368,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
             self.Pd(f"Request ID '{request_id}' to DocEmbedding failed with error: {error_message}", color="red")
             return
           if request_type == 'ADD_DOC':
-            #
-            #
-            #
             request_result = data.get('RESULT') or {}
             request_data['result'] = {
               'elapsed_time': self.time() - request_data['start_time'],
@@ -1359,18 +1377,12 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
             request_data['finished'] = True
             self.Pd(f"'ADD_DOC' request ID '{request_id}' to DocEmbedding successfully processed.", color="green")
           elif request_type == 'QUERY':
-            #
-            #
-            #
             request_result = data.get('RESULT') or {}
             docs = request_result.get('DOCS', [])
 
             next_request_params = request_data.get('next_request_params')
             self.P(f"Next request params: {next_request_params}")
             if isinstance(next_request_params, dict):
-              #
-              #
-              #
               # Union of the kwargs in case of overlapping keys
               chat_request_kwargs = {
                 self.ct.JeevesCt.REQUEST_ID: request_id,
@@ -1465,8 +1477,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
             user_token = request_data.get('user_token', None)
             user_messages = request_data.get('messages', [])
             use_long_term_memory = request_data.get('use_long_term_memory', False)
+            keep_conversation_history = request_data.get('keep_conversation_history', False)
             self.P(f"Done processing request '{request_id}' for user {user_token} with {use_long_term_memory=}. Response is:\n {text_response}", color="green")
-            if use_long_term_memory:
+            if keep_conversation_history:
               self.P(f"User messages: {user_messages}")
               last_user_message = self.get_last_user_message(user_messages)
               if last_user_message is not None:
@@ -1475,7 +1488,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
                 'role': 'assistant',
                 'content': text_response,
               })
-              self.maybe_short_term_memory_to_long_term_memory(user_token)
+              self.maybe_short_term_memory_to_long_term_memory(user_token, use_long_term_memory=use_long_term_memory)
             # endif request made through /chat endpoint
             self.Pd(f"Request ID '{request_id}' to LLM successfully processed.", color="green")
         else:

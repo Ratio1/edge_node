@@ -111,6 +111,6 @@ class LlmTokenizerMixin(object):
 
     from_template = self.tokenizer.apply_chat_template(
       chat, tokenize=False,
-      add_generation_prompt=self.cfg_add_generation_prompt # TODO: check if False is ok and when is not
+      add_generation_prompt=self.cfg_add_generation_prompt
     )
     return from_template

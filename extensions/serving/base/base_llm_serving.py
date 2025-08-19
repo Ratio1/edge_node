@@ -110,7 +110,7 @@ _CONFIG = {
   "REPETITION_PENALTY"    : 1.1,
 
   "ADD_SPECIAL_TOKENS": False,
-  "ADD_GENERATION_PROMPT": False,
+  "ADD_GENERATION_PROMPT": True,
 
   "TH_COMPILE"            : False,
 
@@ -493,6 +493,7 @@ class BaseLlmServing(
       temperature = jeeves_content.get(LlmCT.TEMPERATURE) or self.cfg_default_temperature
       top_p = jeeves_content.get(LlmCT.TOP_P) or self.cfg_default_top_p
       max_tokens = jeeves_content.get(LlmCT.MAX_TOKENS) or self.cfg_default_max_tokens
+      repetition_penalty = jeeves_content.get("REPETITION_PENALTY", self.cfg_repetition_penalty)
       request_context = jeeves_content.get(LlmCT.CONTEXT, None)
       valid_condition = jeeves_content.get(LlmCT.VALID_CONDITION, None)
       process_method = jeeves_content.get(LlmCT.PROCESS_METHOD, None)
@@ -500,6 +501,7 @@ class BaseLlmServing(
         'temperature': temperature,
         'top_p': top_p,
         'max_new_tokens': max_tokens,
+        'repetition_penalty': repetition_penalty,
       }
 
       if not isinstance(messages, list):
