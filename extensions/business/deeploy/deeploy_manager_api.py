@@ -275,10 +275,7 @@ class DeeployManagerApiPlugin(
     app_id : str
         The identificator of the app to delete as given by the /create_pipeline endpoint
         knowing that all decentralized distributed pipelines share the same app_id
-        
-    target_nodes : list[str]
-        The nodes to delete the app from
-                
+
     nonce : str
         The nonce used for signing the request
         
@@ -299,14 +296,15 @@ class DeeployManagerApiPlugin(
       
       # TODO: move to the mixin when ready
       app_id = inputs.app_id
-      nodes = [self._check_and_maybe_convert_address(node) for node in inputs.target_nodes]
-      if len(nodes) == 0:
-        msg = f"{DEEPLOY_ERRORS.NODES3}: No valid nodes provided"
-        raise ValueError(msg)        
-      for addr in nodes:
-        self.P(f"Stopping pipeline '{app_id}' on {addr}")
+      discovered_instances = self._discover_plugin_instances(app_id=app_id)
+
+      if len(discovered_instances) == 0:
+        msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for app_id '{app_id}'."
+        raise ValueError(msg)
+      for instance in discovered_instances:
+        self.P(f"Stopping pipeline '{app_id}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
         self.cmdapi_stop_pipeline(
-          node_address=addr,
+          node_address=instance[DEEPLOY_PLUGIN_DATA.NODE],
           name=inputs.app_id,
         )
       #endfor each target node
@@ -315,7 +313,7 @@ class DeeployManagerApiPlugin(
         DEEPLOY_KEYS.REQUEST : {
           DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
           DEEPLOY_KEYS.APP_ID : inputs.app_id,
-          DEEPLOY_KEYS.TARGET_NODES : inputs.target_nodes,
+          DEEPLOY_KEYS.TARGETS : discovered_instances,
         },
         DEEPLOY_KEYS.AUTH : auth_result,
       }

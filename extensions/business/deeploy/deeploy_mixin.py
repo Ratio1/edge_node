@@ -402,7 +402,7 @@ class _DeeployMixin:
 
     return dct_status, str_status
 
-  def __discover_plugin_instances(
+  def _discover_plugin_instances(
     self,
     app_id: str,
     target_nodes: list[str] = None,
@@ -486,7 +486,7 @@ class _DeeployMixin:
               where the keys are node addresses and the values are the pipelines.
     """
     plugin_signature = inputs.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, None)
-    discovered_plugins = self.__discover_plugin_instances(app_id=inputs.app_id, plugin_signature=plugin_signature)
+    discovered_plugins = self._discover_plugin_instances(app_id=inputs.app_id, plugin_signature=plugin_signature)
 
     if len(discovered_plugins) == 0:
       raise ValueError(
