@@ -376,8 +376,10 @@ class DeeployManagerApiPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
 
-      self.send_instance_command_to_nodes(inputs)
+      # Validate the request fields.
+      self._validate_send_instance_command_request(inputs)
 
+      self.send_instance_command_to_nodes(inputs)
 
       result = {
         DEEPLOY_KEYS.REQUEST : {
@@ -413,7 +415,7 @@ class DeeployManagerApiPlugin(
         The identificator of the app to delete as given by the /create_pipeline endpoint
         knowing that all decentralized distributed pipelines share the same app_id
                 
-    instance_command : any
+    command : any
         The command to send to each app instance (processed by each individual plugin instance)
                 
     nonce : str
@@ -433,7 +435,10 @@ class DeeployManagerApiPlugin(
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
-      
+
+      # Validate the request fields.
+      self._validate_send_app_command_request(inputs)
+
       discovered_pipelines = self.discover_and_send_pipeline_command(inputs)
       targets = []
       for discovered_pipeline in discovered_pipelines:
