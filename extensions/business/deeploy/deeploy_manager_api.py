@@ -275,6 +275,7 @@ class DeeployManagerApiPlugin(
     request: dict containing next fields:
       app_id : str
       job_id: int
+        app_id and job_id are interchangeable identifiers of job / pipeline
       target_nodes : list[str]
       nonce : str
       EE_ETH_SIGN : str
@@ -398,6 +399,7 @@ class DeeployManagerApiPlugin(
     request: dict with keys below:
       app_id : str
       job_id: int
+        app_id and job_id are interchangeable identifiers of job / pipeline
       instance_command : any
       nonce : str
       EE_ETH_SIGN : str
