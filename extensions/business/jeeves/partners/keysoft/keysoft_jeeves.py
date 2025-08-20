@@ -117,12 +117,14 @@ class KeysoftJeevesPlugin(BasePlugin):
     # For future support, we can have the dialect as a parameter, but for now we will use ANSI.
     # dialect = "ansi"
     aggregated_request = f"""
-DB_SCHEMA:
+<DB_SCHEMA>
 ````sql
 {db_schema}
 ````
-USER_REQUEST:
+</DB_SCHEMA>
+<USER_REQUEST>
 {message.strip()}
+</USER_REQUEST>
     """
     return self.query(
       user_token=user_token,

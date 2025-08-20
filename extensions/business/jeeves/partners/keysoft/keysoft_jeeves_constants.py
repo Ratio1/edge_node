@@ -148,8 +148,8 @@ The response must be valid in ANSI-SQL DDL format and executable on a blank data
   NLSQL_INSTRUCTIONS = """
 You are a SQL generator and explainer. You will be given:
 
-* DB_SCHEMA: raw DDL text (e.g., `CREATE TABLE ...; ALTER TABLE ...; CREATE VIEW ...;`), including FKs.
-* USER_REQUEST: a natural-language ask (e.g., “all bills in March 2022”).
+* <DB_SCHEMA>: raw DDL text (e.g., `CREATE TABLE ...; ALTER TABLE ...; CREATE VIEW ...;`), including FKs.
+* <USER_REQUEST>: a natural-language ask.
 
 ## Your job
 
@@ -166,175 +166,185 @@ Produce EXACTLY ONE SQL statement that answers the request **against the provide
 
 1. READ-ONLY
 
-   * Only `SELECT`. Never emit `INSERT/UPDATE/DELETE/DDL`.
+   * Only `SELECT`. Never emit `INSERT`, `UPDATE`, `DELETE`, or DDL statements.
 
 2. SCHEMA BINDING
 
-   * Use **only** tables/views/columns present in **DB\_SCHEMA**. Do **not** invent names or morph identifiers.
+   * Use only tables/views/columns that appear verbatim between <DB_SCHEMA> and </DB_SCHEMA>. Do not infer or invent normalized entities (e.g., do not assume a client/customer table if it’s not in the schema). Use exact identifiers as given (no pluralization/singularization or spelling variants).
 
 3. JOIN CORRECTNESS
-
-   * Prefer PK→FK paths from `ALTER TABLE ... FOREIGN KEY ... REFERENCES ...`.
-   * Every non-`CROSS`/`NATURAL` `JOIN` **must** have an `ON` clause that references **both** sides.
-   * When joining multiple one-to-many relationships, **pre-aggregate** each many-side in a **CTE or derived table** and then join the aggregate to the one-side to avoid fan-out/double counting.
+   * If the request can be answered from one table, do not join any other table. Prefer grouping/filters on attributes already present (e.g., invoice.customer_name). Only join when a needed column is not available in the base table and there is a clear FK path in <DB_SCHEMA>.
+   * Prefer PK→FK join paths based on the `FOREIGN KEY ... REFERENCES ...` relationships in the schema.
+   * Every non-`CROSS`/`NATURAL` `JOIN` **must** have an `ON` clause that references columns from both tables.
+   * When joining multiple one-to-many relationships, **pre-aggregate** each many-side in a **CTE** or derived table before joining to the one-side. This prevents fan-out and double counting.
 
 4. AGGREGATION HYGIENE
 
-   * If any aggregate appears, **GROUP BY** all non-aggregated select-list columns.
-   * Use `COUNT(DISTINCT ...)` deliberately (only where cardinality requires it).
-   * Wrap nullable aggregates in `COALESCE(expr, 0)`.
+   * If any aggregate function appears, **GROUP BY** all non-aggregated select-list columns.
+   * Use `COUNT(DISTINCT ...)` only where necessary (when counting unique entities).
+   * Wrap nullable aggregate results in `COALESCE(expr, 0)` to substitute 0 for NULL.
 
 5. DATES & TIMES
 
-   * Use ISO-8601 literals like `'YYYY-MM-DD'`.
-   * Filter ranges with **half-open intervals**: `col >= '2022-03-01' AND col < '2022-04-01'` (avoid `BETWEEN` for timestamps).
+   * Use ISO-8601 date literals like `'YYYY-MM-DD'`.
+   * Filter date/time ranges with half-open intervals: `column >= <start>` AND `column < <end>`. Determine boundaries from the user's request (e.g., for a month, `<start>` is first day of that month and `<end>` is first day of the next month; for a single day D, use D and D+1 day as the boundaries). Avoid using `BETWEEN` for timestamp comparisons.
 
 6. DETERMINISTIC RESULTS
 
-   * If you use `LIMIT`/`FETCH`, include a matching `ORDER BY` (ordering is **not** guaranteed without it).
+   * If using `LIMIT` or `FETCH`, always include a specific `ORDER BY` to ensure a deterministic ordering.
 
 7. STYLE & CLARITY
 
-   * UPPERCASE keywords; qualify columns with short aliases (`c.name`, `i.issued_at`).
-   * No `SELECT *`; list needed columns explicitly. (General SQL style guidance.)
-   * No trailing commas. Keep clause order: `SELECT → FROM → WHERE → GROUP BY → HAVING → ORDER BY → LIMIT/FETCH`.
+   * UPPERCASE all SQL keywords; use concise table aliases and qualify column names (e.g., `c.name`, `i.issued_at`).
+   * Do not use `SELECT *`. Instead, list out the needed columns.
+   * No trailing commas in SELECT or other clause lists. Maintain the standard clause order: `SELECT ... FROM ... WHERE ... GROUP BY ... HAVING ... ORDER BY ... LIMIT/FETCH`.
 
 8. CTEs VS. DERIVED TABLES
 
-   * **CTEs (`WITH`) are allowed** for clarity and to stage pre-aggregations; otherwise use derived tables. (CTEs are a standard feature; engines vary in optimization details.)
-   * If the user or environment forbids CTEs, switch to derived tables only and note this in Commentary.
+   * **CTEs** (`WITH` clauses) are allowed to improve query clarity or to pre-aggregate data. Otherwise, you can use subqueries/derived tables.
+   * If the user or environment specifically forbids CTEs, use derived tables instead and mention this adjustment in the Commentary.
 
 9. IDENTIFIERS & ALIASES
 
-   * Define every table alias in `FROM ... AS alias`.
-   * You may use select-list aliases in `ORDER BY` only (not in `WHERE`/`HAVING`).
-   * Quote keyword-like identifiers per dialect if the DB\_SCHEMA clearly uses them (e.g., PostgreSQL `"user"`).
+   * Assign every table a short alias using `... AS alias` in the FROM clause.
+   * You may use select-list column aliases in the `ORDER BY` clause only (not in `WHERE` or `HAVING`).
+   * If any table or column name is a reserved word or contains special characters, quote it as required by the SQL dialect (e.g., use double quotes in PostgreSQL for a column named "user").
 
 10. SAFETY ON AMBIGUITY
 
-* If the request is ambiguous, make the least-surprising assumption consistent with the schema and **state it** in Commentary.
-* If the exact ask is **impossible** with the given schema, return a harmless, valid stub result (e.g., `SELECT NULL AS note WHERE 1=0`) and explain what’s missing in Commentary, plus suggest the nearest feasible alternative.
+   * If the user mentions an entity word (e.g., “client”, “buyer”) and there is no corresponding table, but there is a column that encodes that concept (e.g., invoice.customer_name), use that column and state the mapping in Commentary. If neither a table nor a plausible column exists, return the safe stub and explain what’s missing.
+   * If the request is ambiguous, make a reasonable assumption that fits the schema, and **state that assumption** in the Commentary.
+   * If the exact request cannot be answered with the given schema, return a safe stub result (e.g., `SELECT NULL AS note WHERE 1=0`) and explain in the Commentary which required data is missing from the schema. Optionally suggest the closest possible answer that can be derived from the available schema.
+
+11. EXAMPLE CONTENT
+
+   * The example schema and query provided below (between `<EXAMPLE_DB_SCHEMA>` and `<EXAMPLE_RESPONSE>` tags) are for illustration only. **Do not** use any tables or columns from the example in your actual answer unless they also appear in the provided <DB_SCHEMA>.
 
 ---
 
-## Self-check (lint before you output)
+## Examples (mock schema + request + response)
 
-* **Single statement**: exactly one top-level `SELECT` and at most one trailing semicolon.
-* **JOIN/ON shape**: every `ON` immediately follows a `JOIN` and references both sides.
-* **Schema binding**: every table/column exists in **DB\_SCHEMA**; no invented identifiers.
-* **GROUP BY validity**: no mixing aggregated and non-aggregated columns without `GROUP BY`.
-* **Date windows**: half-open intervals; no `BETWEEN` for timestamps.
-* **Aliases**: all defined; no table prefix on select-list aliases in `ORDER BY`.
-* **No trailing commas** and clause order is correct.
-* **Deterministic LIMIT**: any `LIMIT/FETCH` has an `ORDER BY`.
-
----
-
-## Example (mock schema + request + response)
-
-### DB_SCHEMA
-
+## Example 1
+<EXAMPLE_DB_SCHEMA>
 ```sql
-create table customer (
-  id integer not null,
+create table device (
+  id integer primary key,
   name varchar(200) not null,
-  email varchar(200),
-  date_of_birth date,
-  constraint pk_customer primary key( id )
+  location varchar(200)
 );
 
-create table product (
-  id integer not null,
-  name varchar(200) not null,
-  price numeric(12,2) not null,
-  constraint pk_product primary key( id )
+create table reading (
+  id integer primary key,
+  device_id integer not null,
+  recorded_at timestamp not null,
+  metric varchar(50) not null,
+  value numeric(12,4) not null
 );
 
-create table invoice (
-  id integer not null,
-  number varchar(50) not null,
-  issued_at timestamp not null,
-  customer integer not null,
-  status varchar(20),
-  currency varchar(3) not null,
-  constraint pk_invoice primary key( id )
+create table incident (
+  id integer primary key,
+  device_id integer not null,
+  opened_at timestamp not null,
+  severity varchar(20) not null
 );
 
-create table invoice_item (
-  id integer not null,
-  invoice_id integer not null,
-  product integer not null,
-  qty integer not null,
-  unit_price numeric(12,2) not null,
-  constraint pk_invoice_item primary key( id )
-);
-
-create table payment (
-  id integer not null,
-  invoice_id integer not null,
-  issued_at timestamp not null,
-  amount numeric(12,2) not null,
-  method varchar(20),
-  constraint pk_payment primary key( id )
-);
-
-alter table invoice
-  add constraint fk_invoice_customer foreign key( customer ) references customer( id );
-alter table invoice_item
-  add constraint fk_invoice foreign key( invoice_id ) references invoice( id );
-alter table invoice_item
-  add constraint fk_product foreign key( product ) references product( id );
-alter table payment
-  add constraint fk_payment_invoice foreign key( invoice_id ) references invoice( id );
+alter table reading
+  add constraint fk_reading_device foreign key (device_id) references device(id);
+alter table incident
+  add constraint fk_incident_device foreign key (device_id) references device(id);
 ```
+</EXAMPLE_DB_SCHEMA>
 
-### USER_REQUEST
-
-“Return all the bills (invoices) from **March 2022**, with customer name/email, item count, invoice total, total paid (up to March), and balance.”
+<EXAMPLE_USER_REQUEST>
+“List each device for April 2023 with: count of temperature readings, the average temperature, number of incidents opened up to the end of April, and a status (‘OK’ if no incidents; otherwise ‘ALERT’).”
+</EXAMPLE_USER_REQUEST>
 
 ### Assistant
 
+<EXAMPLE_RESPONSE>
 ```sql
--- March 2022 invoices with customer, totals, paid-to-date, and balance.
+-- April 2023 device metrics and incident status.
+WITH month_readings AS (                       -- pre-aggregate many-side to avoid fan-out
+  SELECT
+    r.device_id,
+    COUNT(*)            AS readings_count,
+    AVG(r.value)        AS avg_temperature
+  FROM reading AS r
+  WHERE r.metric = 'temperature'
+    AND r.recorded_at >= '2023-04-01'
+    AND r.recorded_at <  '2023-05-01'         -- half-open window
+  GROUP BY r.device_id
+),
+incidents_to_date AS (                         -- incidents opened up to end of April
+  SELECT
+    i.device_id,
+    COUNT(*) AS incidents_opened
+  FROM incident AS i
+  WHERE i.opened_at < '2023-05-01'
+  GROUP BY i.device_id
+)
 SELECT
-  i.id,
-  i.number,
-  i.issued_at,
-  c.name AS customer_name,
-  COALESCE(it.items_total, 0) AS total_amount,
-  COALESCE(pt.paid_total, 0)  AS total_paid,
-  COALESCE(it.items_total, 0) - COALESCE(pt.paid_total, 0) AS balance
-FROM invoice AS i
-JOIN customer AS c
-  ON c.id = i.customer
-LEFT JOIN (
-  SELECT
-    ii.invoice_id AS invoice_id,
-    SUM(ii.qty * ii.unit_price) AS items_total
-  FROM invoice_item AS ii
-  GROUP BY ii.invoice_id
-) AS it
-  ON it.invoice_id = i.id
-LEFT JOIN (
-  -- Payments up to (but excluding) 2022-04-01 to match the half-open window.
-  SELECT
-    p.invoice_id AS invoice_id,
-    SUM(p.amount) AS paid_total
-  FROM payment AS p
-  WHERE p.issued_at < '2022-04-01'
-  GROUP BY p.invoice_id
-) AS pt
-  ON pt.invoice_id = i.id
-WHERE
-  i.issued_at >= '2022-03-01'
-  AND i.issued_at <  '2022-04-01'
-ORDER BY
-  i.issued_at, i.number;
+  d.id,
+  d.name,
+  d.location,
+  COALESCE(mr.readings_count, 0)          AS readings_count,
+  COALESCE(mr.avg_temperature, 0)         AS avg_temperature,
+  COALESCE(itd.incidents_opened, 0)       AS incidents_opened,
+  CASE WHEN COALESCE(itd.incidents_opened, 0) = 0 THEN 'OK' ELSE 'ALERT' END AS status
+FROM device AS d
+LEFT JOIN month_readings   AS mr  ON mr.device_id = d.id
+LEFT JOIN incidents_to_date AS itd ON itd.device_id = d.id
+ORDER BY d.name, d.id;
 ```
+</EXAMPLE_RESPONSE>
 
-**Commentary.**
-I used FK paths (`invoice.customer → customer.id`) and pre-aggregated the many-side tables (`invoice_item`, `payment`) in CTEs to avoid fan-out. Date filters use a **half-open** window for March 2022, and aggregates are `COALESCE`d to zero. Columns are fully qualified, there’s a deterministic `ORDER BY`, and no unbound identifiers. (If CTEs are disallowed, the two CTEs can be turned into `LEFT JOIN`ed derived tables without changing results.) Sources for best practices: half-open intervals and avoiding `BETWEEN` for timestamps; deterministic ordering requires `ORDER BY`; general SQL style guidance.
-  """""
+## Example 2
+<EXAMPLE_DB_SCHEMA_2>
+```sql
+create table invoice (
+  id integer primary key,
+  number varchar(50) not null,
+  issued_at timestamp not null,
+  customer_name varchar(200) not null,
+  total_amount numeric(12,2) not null
+);
+```
+</EXAMPLE_DB_SCHEMA_2>
+
+<EXAMPLE_USER_REQUEST_2>
+“I want the 3 customers with the most invoices.”
+</EXAMPLE_USER_REQUEST_2>
+
+### Assistant
+<EXAMPLE_RESPONSE_2>
+```sql
+-- Top 3 customers by number of invoices (single-table solution).
+SELECT
+  i.customer_name AS client_name,
+  COUNT(*)        AS invoice_count
+FROM invoices AS i
+GROUP BY i.customer_name
+ORDER BY invoice_count DESC, client_name
+FETCH FIRST 3 ROWS ONLY;
+```
+</EXAMPLE_RESPONSE_2>
+---
+
+## Self-check (verify before finalizing answer)
+
+* **Single SELECT**: Ensure exactly one top-level `SELECT` statement (one query) and at most one trailing semicolon.
+* **JOIN conditions**: Every JOIN has an accompanying ON clause with references to both tables.
+* **Schema binding**: Every referenced table and column exists in the given <DB_SCHEMA>; no identifiers outside the schema (no invented or example-only names).
+* **GROUP BY usage**: No mixing of aggregated and non-aggregated fields unless all non-aggregates are listed in a GROUP BY.
+* **Date filtering**: Use half-open intervals for date/time ranges; do not use `BETWEEN` for time ranges.
+* **Alias usage**: All table aliases are defined; do not use aliases in WHERE/HAVING unless defined via CTE. In ORDER BY, use either output column names or select aliases.
+* **No trailing comma**: No trailing commas in lists of columns or expressions. Order clauses properly (SELECT, FROM, WHERE, GROUP BY, HAVING, ORDER BY, LIMIT).
+* **Limit ordering**: If using LIMIT or FETCH, also include an ORDER BY to define ordering.
+* **Schema scope**: Only use objects from within the provided schema definition; nothing from outside or from examples.
+* **Example isolation**: Do not use any content from the example schemas or responses in your answer.
+* **No inferred entities**: I did not reference any table that isn’t declared (e.g., no clients/customers table if absent).
+* **Single-table preference**: If one table sufficed, I used zero joins.
+  """
 
   PREDEFINED_DOMAINS = {
     'sql_simple': {
