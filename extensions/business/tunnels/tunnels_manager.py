@@ -15,14 +15,6 @@ _CONFIG = {
 
   'BASE_CLOUDFLARE_URL': 'https://api.cloudflare.com',
 
-  'ADMIN_ADDRESSES': [
-    '0x95E9EeEf459a9cDA096af7C6033D4d9582B9513c',
-    '0xDA05C48CDbA9A67A422cFA40b4C0F6b7FFB0E4a5',
-    '0xA59eF3f6B10723577e7F8966dC88670233B8a0d5',
-    '0x13a457188877781AF4263109296312AAbE6A2905',
-    '0x98590B0926B7d329E90e103e60689D041a7d0457'
-  ],
-
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -80,6 +72,7 @@ class TunnelsManagerPlugin(BasePlugin):
       indent=1,
     )
     secrets = self.chainstore_hget(hkey="tunnels_manager_secrets", key=sender)
+    # TODO we should add a CSP password to be used as token in cstore
     if secrets is None:
       raise Exception("No secrets found for sender: " + sender)
     return secrets
@@ -87,25 +80,33 @@ class TunnelsManagerPlugin(BasePlugin):
   @BasePlugin.endpoint(method="post")
   def add_secrets(self, payload: dict):
     """
-    Admin endpoint to add Cloudflare secrets for a specific address.
+    Endpoint for CSP addresses to add their own Cloudflare secrets.
     """
     sender = self.bc.eth_verify_payload_signature(
       payload=payload,
       no_hash=True,
       indent=1,
     )
-    admin_addresses = self.cfg_admin_addresses
-    if sender not in admin_addresses:
-      raise Exception(f"Sender {sender} is not authorized to add secrets.")
     secrets = {
       "cloudflare_api_key": payload['cloudflare_api_key'],
       "cloudflare_account_id": payload['cloudflare_account_id'],
       "cloudflare_zone_id": payload['cloudflare_zone_id'],
       "cloudflare_domain": payload['cloudflare_domain'],
     }
-    self.chainstore_hset(hkey="tunnels_manager_secrets", key=payload['csp_address'], value=secrets)
+    self.chainstore_hset(hkey="tunnels_manager_secrets", key=sender, value=secrets)
     return {
       "success": True
+    }
+
+  @BasePlugin.endpoint(method="get")
+  def check_secrets_exist(self, csp_address: str):
+    """
+    Public endpoint to check if Cloudflare secrets exist for a specific CSP address.
+    Returns only whether secrets exist, not the actual secrets.
+    """
+    secrets = self.chainstore_hget(hkey="tunnels_manager_secrets", key=csp_address)
+    return {
+      "exists": secrets is not None
     }
 
   @BasePlugin.endpoint(method="post")
