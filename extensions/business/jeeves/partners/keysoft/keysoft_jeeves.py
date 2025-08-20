@@ -30,6 +30,50 @@ class KeysoftJeevesPlugin(BasePlugin):
 
     return env_predefined_tokens + configured_tokens
 
+  # Wrapper method for easier testing of multiple endpoints
+  @BasePlugin.endpoint(method="post")
+  def query(
+      self,
+      user_token: str,
+      message: str,
+      db_schema: str = None,
+      domain: str = None,
+      request_type: str = "query",
+      **kwargs
+  ):
+    if request_type == "query":
+      return super(KeysoftJeevesPlugin, self).query(
+        user_token=user_token,
+        message=message,
+        domain=domain,
+        **kwargs
+      )
+    elif request_type == "nlsql_query":
+      if db_schema is None:
+        return {
+          "error": "db_schema must be provided for nlsql_query."
+        }
+      # endif db_schema is None
+      return self.nlsql_query(
+        user_token=user_token,
+        message=message,
+        db_schema=db_schema,
+        domain=domain,
+        **kwargs
+      )
+    elif request_type == "chat":
+      return super(KeysoftJeevesPlugin, self).chat(
+        user_token=user_token,
+        message=message,
+        domain=domain,
+        short_term_memory_only=True,
+        **kwargs
+      )
+    # endif request_type is not query, nlsql_query or chat
+    return {
+      "error": f"Unknown request_type: {request_type}. Supported types are: query, nlsql_query, chat."
+    }
+
   @BasePlugin.endpoint(method="post")
   def nlsql_query(
       self,
