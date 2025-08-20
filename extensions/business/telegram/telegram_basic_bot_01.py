@@ -18,6 +18,7 @@ from extensions.business.mixins.telegram_mixin import _TelegramChatbotMixin
 _CONFIG = {
   **BasePlugin.CONFIG,
   
+  
   "PROCESS_DELAY"           : 1,
   "ALLOW_EMPTY_INPUTS"      : True,
   
@@ -26,6 +27,10 @@ _CONFIG = {
   "TELEGRAM_BOT_NAME"       : None,
   "TELEGRAM_BOT_TOKEN"      : None,
   
+  "BOT_DEBUG"               : False,
+
+  "CONNECTION_POOL_SIZE"    : 50,
+
   "MESSAGE_HANDLER"         : None,
   "MESSAGE_HANDLER_ARGS"    : [],
   "MESSAGE_HANDLER_NAME"    : None,
@@ -47,6 +52,7 @@ class TelegramBasicBot01Plugin(
     
   
   def on_init(self):
+    
     self.__token = self.cfg_telegram_bot_token
     self.__bot_name = self.cfg_telegram_bot_name
         
@@ -75,6 +81,7 @@ class TelegramBasicBot01Plugin(
         bot_name=self.__bot_name,
         message_handler=self.bot_msg_handler,
         run_threaded=True,
+        bot_debug=self.cfg_bot_debug,
       )      
       self.bot_run()
       self.__failed = False

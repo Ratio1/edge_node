@@ -1,7 +1,7 @@
 kmonitor 
 ratio1 
 decentra-vision 
-python-telegram-bot
+python-telegram-bot[rate-limiter]
 protobuf==5.28.3
 vectordb
 ngrok

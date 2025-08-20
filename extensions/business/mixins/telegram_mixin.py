@@ -15,27 +15,33 @@ import json
 
 import telegram
 from telegram import Update, Message
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, AIORateLimiter
 from typing import Optional
 
 
 
 __VERSION__ = '4.0.3'
 
+TEL_STATS_LOCK = 'TEL_STATS_LOCK'
+
 
 class _TelegramChatbotMixin(object):
   
   def __add_user_info(self, user, question):
-    if user not in self.__stats:
-      self.__stats[user] = {
-        'questions': 0,
-        'last_question': None,
-        # 'last_answer': None,
-        'last_message_ts': None,
-      }
-    self.__stats[user]['questions'] += 1
-    self.__stats[user]['last_question'] = question
-    self.__stats[user]['last_message_ts'] = self.time()
+    with self.managed_lock_resource(TEL_STATS_LOCK):
+      try:
+        if user not in self.__stats:
+          self.__stats[user] = {
+            'questions': 0,
+            'last_question': None,
+            # 'last_answer': None,
+            'last_message_ts': None,
+          }
+        self.__stats[user]['questions'] += 1
+        self.__stats[user]['last_question'] = question
+        self.__stats[user]['last_message_ts'] = self.time()
+      except:
+        pass
     return     
   
   
@@ -44,16 +50,27 @@ class _TelegramChatbotMixin(object):
     """
     Returns the list of users who have interacted with the bot.
     """
-    return list(self.__stats.keys())
-  
-  
+    lst = []
+    with self.managed_lock_resource(TEL_STATS_LOCK):
+      try:
+        lst = list(self.__stats.keys())
+      except:
+        pass
+    return lst
+
+
   def get_user_stats(self, user):
     """
     Returns the statistics for a specific user.
     """
-    if user not in self.__stats:
-      return None
-    return self.deepcopy(self.__stats[user])
+    res = None
+    if user in self.__stats:
+      with self.managed_lock_resource(TEL_STATS_LOCK):
+        try:
+          res = self.deepcopy(self.__stats[user])
+        except:
+          pass
+    return res
 
 
   def _create_custom_handler(self, str_base64_code, lst_arguments):
@@ -125,11 +142,10 @@ class _TelegramChatbotMixin(object):
     text = text.replace(bot_name , '').strip()
     chat_name = message.chat.title
     
-    if self.bot_debug:
-      self.bot_log(
-        f'User {initiator_name} ({initiator_id}) in `{chat_name}` ({message_type}): "{text}"',
-        low_priority=True
-      )
+    self.bot_log(
+      f'User {initiator_name} ({initiator_id}) in `{chat_name}` [chat_id: {chat_id}, {is_bot_in_text=}] ({message_type}): "{text}"',
+      low_priority=False
+    )
     
     allow = False
     # React to group messages only if users mention the bot directly
@@ -139,7 +155,7 @@ class _TelegramChatbotMixin(object):
       else:
         reply_to = message.reply_to_message
         if reply_to is not None:
-          self.bot_log(f"Reply from '{initiator_name}' to {reply_to.from_user} ", low_priority=True)
+          self.bot_log(f"Reply from '{initiator_name}' to {reply_to.from_user} ", low_priority=False)
           if reply_to.from_user.is_bot:
             allow = True
     else:
@@ -222,7 +238,14 @@ class _TelegramChatbotMixin(object):
     
 
   async def __run_bot(self):
-    self.__app = Application.builder().token(self.__token).build()
+    self.__app = (
+      Application.builder()
+      .token(self.__token)
+      .concurrent_updates(True)
+      .connection_pool_size(self.cfg_connection_pool_size)
+      .rate_limiter(AIORateLimiter())
+      .build()
+    )
 
     # Add handlers
     self.__app.add_handler(MessageHandler(filters.TEXT, self.__handle_message))
@@ -234,7 +257,7 @@ class _TelegramChatbotMixin(object):
     self.bot_log('Bot started.')
 
     # Start polling without installing signal handlers
-    await self.__app.updater.start_polling(poll_interval=3)
+    await self.__app.updater.start_polling(poll_interval=1)
 
     # Wait until the stop event is set
     await self.__stop_event.wait()
@@ -272,7 +295,13 @@ class _TelegramChatbotMixin(object):
   ## Public methods
   
   def bot_dump_stats(self):
-    self.bot_log("Bot stats:\n{}".format(json.dumps(self.__stats, indent=2)))
+    stats = {}
+    with self.managed_lock_resource(TEL_STATS_LOCK):
+      try:
+        stats = self.deepcopy(self.__stats)
+      except:
+        pass
+    self.bot_log("Bot stats:\n{}".format(stats))
     return
   
   def bot_stop(self):

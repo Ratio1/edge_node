@@ -264,7 +264,7 @@ class DeeployManagerApiPlugin(
 
 
   @BasePlugin.endpoint(method="post")
-  def delete_pipeline(self, 
+  def delete_pipeline(self,
     request: dict = DEEPLOY_DELETE_REQUEST
   ):
     """
@@ -272,22 +272,14 @@ class DeeployManagerApiPlugin(
 
     Parameters
     ----------
-    app_id : str
-        The identificator of the app to delete as given by the /create_pipeline endpoint
-        knowing that all decentralized distributed pipelines share the same app_id
-        
-    target_nodes : list[str]
-        The nodes to delete the app from
-                
-    nonce : str
-        The nonce used for signing the request
-        
-    EE_ETH_SIGN : str
-        The signature of the request
-        
-    EE_ETH_SENDER : str
-        The sender of the request
-
+    request: dict containing next fields:
+      app_id : str
+      job_id: int
+        app_id and job_id are interchangeable identifiers of job / pipeline
+      target_nodes : list[str]
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str
     Returns
     -------
     dict
@@ -298,25 +290,34 @@ class DeeployManagerApiPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
       
       # TODO: move to the mixin when ready
-      app_id = inputs.app_id
-      nodes = [self._check_and_maybe_convert_address(node) for node in inputs.target_nodes]
-      if len(nodes) == 0:
-        msg = f"{DEEPLOY_ERRORS.NODES3}: No valid nodes provided"
-        raise ValueError(msg)        
-      for addr in nodes:
-        self.P(f"Stopping pipeline '{app_id}' on {addr}")
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+      app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
+
+      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=sender)
+
+      if len(discovered_instances) == 0:
+        msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for provided job_id/app_id and owner '{sender}'."
+        raise ValueError(msg)
+      for instance in discovered_instances:
+        self.P(f"Stopping pipeline '{instance[DEEPLOY_PLUGIN_DATA.APP_ID]}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
         self.cmdapi_stop_pipeline(
-          node_address=addr,
-          name=inputs.app_id,
+          node_address=instance[DEEPLOY_PLUGIN_DATA.NODE],
+          name=instance[DEEPLOY_PLUGIN_DATA.APP_ID],
         )
       #endfor each target node
-      
+
+      request_payload = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.TARGETS: discovered_instances,
+      }
+
+      if job_id is not None:
+        request_payload[DEEPLOY_KEYS.JOB_ID] = job_id
+      elif app_id is not None:
+        request_payload[DEEPLOY_KEYS.APP_ID] = app_id
+
       result = {
-        DEEPLOY_KEYS.REQUEST : {
-          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
-          DEEPLOY_KEYS.APP_ID : inputs.app_id,
-          DEEPLOY_KEYS.TARGET_NODES : inputs.target_nodes,
-        },
+        DEEPLOY_KEYS.REQUEST : request_payload,
         DEEPLOY_KEYS.AUTH : auth_result,
       }
     
@@ -342,31 +343,15 @@ class DeeployManagerApiPlugin(
 
     Parameters
     ----------
-    app_id : str
-        The identificator of the app to delete as given by the /create_pipeline endpoint
-        knowing that all decentralized distributed pipelines share the same app_id
-        
-    target_nodes : list[str]
-        The nodes where the app runs
-        
-    plugin_signature : str
-        The signature of the plugin that will receive the command
-    
-    instance_id : str
-        The plugin instance that will receive the command
-        
-    instance_command : any
-        The command to send to each app instance (processed by each individual plugin instance)
-                
-    nonce : str
-        The nonce used for signing the request
-        
-    EE_ETH_SIGN : str
-        The signature of the request
-        
-    EE_ETH_SENDER : str
-        The sender of the request
-
+    request: dict containing next keys:
+      app_id : str
+      target_nodes : list[str]
+      plugin_signature : str
+      instance_id : str
+      instance_command : any
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str
     Returns
     -------
     dict
@@ -376,8 +361,10 @@ class DeeployManagerApiPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
 
-      self.send_instance_command_to_nodes(inputs)
+      # Validate the request fields.
+      self._validate_send_instance_command_request(inputs)
 
+      self.send_instance_command_to_nodes(inputs, owner=sender)
 
       result = {
         DEEPLOY_KEYS.REQUEST : {
@@ -409,22 +396,14 @@ class DeeployManagerApiPlugin(
 
     Parameters
     ----------
-    app_id : str
-        The identificator of the app to delete as given by the /create_pipeline endpoint
-        knowing that all decentralized distributed pipelines share the same app_id
-                
-    instance_command : any
-        The command to send to each app instance (processed by each individual plugin instance)
-                
-    nonce : str
-        The nonce used for signing the request
-        
-    EE_ETH_SIGN : str
-        The signature of the request
-        
-    EE_ETH_SENDER : str
-        The sender of the request
-
+    request: dict with keys below:
+      app_id : str
+      job_id: int
+        app_id and job_id are interchangeable identifiers of job / pipeline
+      instance_command : any
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str
     Returns
     -------
     dict
@@ -433,21 +412,34 @@ class DeeployManagerApiPlugin(
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
-      
-      discovered_pipelines = self.discover_and_send_pipeline_command(inputs)
+
+      # Validate the request fields.
+      self._validate_send_app_command_request(inputs)
+
+      discovered_pipelines = self.discover_and_send_instance_command(inputs, owner=sender)
       targets = []
       for discovered_pipeline in discovered_pipelines:
         targets.append([discovered_pipeline[DEEPLOY_PLUGIN_DATA.NODE],
                         discovered_pipeline[DEEPLOY_PLUGIN_DATA.APP_ID],
                         discovered_pipeline[DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE],
                         discovered_pipeline[DEEPLOY_PLUGIN_DATA.INSTANCE_ID]])
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+      app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
+
+      request_payload = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.COMMAND_DELIVERED,
+      }
+
+      # Prefer JOB_ID if both are present; otherwise use APP_ID; add nothing if neither.
+      if job_id is not None:
+        request_payload[DEEPLOY_KEYS.JOB_ID] = job_id
+      elif app_id is not None:
+        request_payload[DEEPLOY_KEYS.APP_ID] = app_id
+
       result = {
-        DEEPLOY_KEYS.REQUEST : {
-          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.COMMAND_DELIVERED,
-          DEEPLOY_KEYS.APP_ID : inputs.app_id,
-        },
+        DEEPLOY_KEYS.REQUEST: request_payload,
         DEEPLOY_KEYS.TARGETS: targets,
-        DEEPLOY_KEYS.AUTH : auth_result,
+        DEEPLOY_KEYS.AUTH: auth_result,
       }
 
     except Exception as e:
@@ -459,7 +451,7 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  def _get_online_apps(self, owner=None):
+  def _get_online_apps(self, owner=None, target_nodes=None):
     """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
@@ -475,7 +467,7 @@ class DeeployManagerApiPlugin(
     }
 
     """
-    result = self.netmon.network_known_apps()
+    result = self.netmon.network_known_apps(target_nodes=target_nodes)
     if owner is not None:  
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():

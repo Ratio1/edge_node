@@ -60,6 +60,7 @@ class DEEPLOY_ERRORS:
   NODES3 = "ERR04_DEEPLOY_NODES3"
   NODES4 = "ERR05_DEEPLOY_NODES4"
   NODES5 = "ERR09_DEEPLOY_NODES5"
+  NODES6 = "ERR018_DEEPLOY_NODES6"
   NODERES1 = "ERR06_DEEPLOY_TARGET_NODE_RESOURCES1"
   PLINST1 = "ERR07_DEEPLOY_PLUGIN_INSTANCE1"
   APP1 = "ERR08_DEEPLOY_APP1"
@@ -70,6 +71,10 @@ class DEEPLOY_ERRORS:
   REQUEST4 = "ERR12_REQUEST4"
   REQUEST5 = "ERR13_REQUEST5"
   REQUEST6 = "ERR14_REQUEST6"
+  REQUEST7 = "ERR15_REQUEST7"
+  REQUEST8 = "ERR16_REQUEST8"
+  REQUEST9 = "ERR17_REQUEST9"
+  REQUEST10 = "ERR18_REQUEST10"
 
 class DEEPLOY_RESOURCES:
   # Result dictionary keys
@@ -449,8 +454,9 @@ DEEPLOY_INSTANCE_COMMAND_REQUEST = {
 
 DEEPLOY_APP_COMMAND_REQUEST = {
   "app_id" : "target_app_name_id_returned_by_get_apps_or_create_pipeline",
-  
-  "instance_command" : "RESTART",
+  "plugin_singature" : "CONTAINER_APP_RUNNER", # optional plugin signature
+
+  "command": "RESTART",
 
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
 }  

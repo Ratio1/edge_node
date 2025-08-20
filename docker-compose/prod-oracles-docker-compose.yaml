@@ -1,40 +1,43 @@
 
 services:
-  naeural_01:
-    image: naeural/edge_node:develop
-    container_name: naeural_01
+  ratio1_01:
+    image: ratio1/edge_node:develop
+    container_name: ratio1_01
     restart: always
+    privileged: true
     environment:
       EE_ID: ${EE_ID_01?You must set the EE_ID_01 environment variable}
     env_file: .env
     volumes:
-      - naeural_01:/edge_node/_local_cache
+      - ratio1_01:/edge_node/_local_cache
     labels:
       - "com.centurylinklabs.watchtower.enable=true"         
       - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
 
-  naeural_02:
-    image: naeural/edge_node:develop
-    container_name: naeural_02
+  ratio1_02:
+    image: ratio1/edge_node:develop
+    container_name: ratio1_02
     restart: always
+    privileged: true
     environment:
       EE_ID: ${EE_ID_02?You must set the EE_ID_02 environment variable}
     env_file: .env
     volumes:
-      - naeural_02:/edge_node/_local_cache
+      - ratio1_02:/edge_node/_local_cache
     labels:
       - "com.centurylinklabs.watchtower.enable=true"         
       - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
 
-  naeural_03:
-    image: naeural/edge_node:develop
-    container_name: naeural_03
+  ratio1_03:
+    image: ratio1/edge_node:develop
+    container_name: ratio1_03
     restart: always
+    privileged: true
     environment:
       EE_ID: ${EE_ID_03?You must set the EE_ID_03 environment variable3}
     env_file: .env
     volumes:
-      - naeural_03:/edge_node/_local_cache
+      - ratio1_03:/edge_node/_local_cache
     labels:
       - "com.centurylinklabs.watchtower.enable=true"         
       - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
@@ -52,6 +55,9 @@ services:
       - WATCHTOWER_LABEL_ENABLE=true        
 
 volumes:
-  naeural_01:
-  naeural_02:
-  naeural_03:
+  ratio1_01:
+    name: ratio1_01
+  ratio1_02:
+    name: ratio1_02
+  ratio1_03:
+    name: ratio1_03
