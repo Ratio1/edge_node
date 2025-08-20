@@ -481,7 +481,7 @@ class _DeeployMixin:
     return discovered_plugins
 
 
-  def discover_and_send_pipeline_command(self, inputs):
+  def discover_and_send_instance_command(self, inputs, owner):
     """
     Discover the running pipelines by app_id and send the command to each instance.
 
@@ -490,7 +490,11 @@ class _DeeployMixin:
               where the keys are node addresses and the values are the pipelines.
     """
     plugin_signature = inputs.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, None)
-    discovered_plugins = self._discover_plugin_instances(app_id=inputs.app_id, plugin_signature=plugin_signature)
+    discovered_plugins = self._discover_plugin_instances(
+      app_id=inputs.app_id,
+      plugin_signature=plugin_signature,
+      owner=owner
+    )
 
     if len(discovered_plugins) == 0:
       raise ValueError(

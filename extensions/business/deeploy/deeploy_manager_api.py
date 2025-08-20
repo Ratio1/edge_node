@@ -264,27 +264,16 @@ class DeeployManagerApiPlugin(
 
 
   @BasePlugin.endpoint(method="post")
-  def delete_pipeline(self, 
+  def delete_job(self,
     request: dict = DEEPLOY_DELETE_REQUEST
   ):
+    # TODO: Should accept job_id or app_id and delete the job from all machines.
     """
     Deletes a given app (pipeline) on target node(s)
 
     Parameters
     ----------
-    app_id : str
-        The identificator of the app to delete as given by the /create_pipeline endpoint
-        knowing that all decentralized distributed pipelines share the same app_id
-
-    nonce : str
-        The nonce used for signing the request
-        
-    EE_ETH_SIGN : str
-        The signature of the request
-        
-    EE_ETH_SENDER : str
-        The sender of the request
-
+    request: dict
     Returns
     -------
     dict
@@ -340,31 +329,7 @@ class DeeployManagerApiPlugin(
 
     Parameters
     ----------
-    app_id : str
-        The identificator of the app to delete as given by the /create_pipeline endpoint
-        knowing that all decentralized distributed pipelines share the same app_id
-        
-    target_nodes : list[str]
-        The nodes where the app runs
-        
-    plugin_signature : str
-        The signature of the plugin that will receive the command
-    
-    instance_id : str
-        The plugin instance that will receive the command
-        
-    instance_command : any
-        The command to send to each app instance (processed by each individual plugin instance)
-                
-    nonce : str
-        The nonce used for signing the request
-        
-    EE_ETH_SIGN : str
-        The signature of the request
-        
-    EE_ETH_SENDER : str
-        The sender of the request
-
+    request: dict
     Returns
     -------
     dict
@@ -402,6 +367,7 @@ class DeeployManagerApiPlugin(
   def send_app_command(self, 
     request: dict = DEEPLOY_APP_COMMAND_REQUEST
   ):
+    # TODO: Should accept app_id or job_id and send the command to all instances of the app on all target node(s).
     """
     Sends a command to a given app on all its target node(s).
     
@@ -409,22 +375,7 @@ class DeeployManagerApiPlugin(
 
     Parameters
     ----------
-    app_id : str
-        The identificator of the app to delete as given by the /create_pipeline endpoint
-        knowing that all decentralized distributed pipelines share the same app_id
-                
-    command : any
-        The command to send to each app instance (processed by each individual plugin instance)
-                
-    nonce : str
-        The nonce used for signing the request
-        
-    EE_ETH_SIGN : str
-        The signature of the request
-        
-    EE_ETH_SENDER : str
-        The sender of the request
-
+    request: dict
     Returns
     -------
     dict
@@ -437,7 +388,7 @@ class DeeployManagerApiPlugin(
       # Validate the request fields.
       self._validate_send_app_command_request(inputs)
 
-      discovered_pipelines = self.discover_and_send_pipeline_command(inputs)
+      discovered_pipelines = self.discover_and_send_instance_command(inputs, owner=sender)
       targets = []
       for discovered_pipeline in discovered_pipelines:
         targets.append([discovered_pipeline[DEEPLOY_PLUGIN_DATA.NODE],
