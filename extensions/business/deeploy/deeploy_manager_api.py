@@ -264,10 +264,9 @@ class DeeployManagerApiPlugin(
 
 
   @BasePlugin.endpoint(method="post")
-  def delete_job(self,
+  def delete_pipeline(self,
     request: dict = DEEPLOY_DELETE_REQUEST
   ):
-    # TODO: Should accept job_id or app_id and delete the job from all machines.
     """
     Deletes a given app (pipeline) on target node(s)
 
@@ -284,26 +283,34 @@ class DeeployManagerApiPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
       
       # TODO: move to the mixin when ready
-      app_id = inputs.app_id
-      discovered_instances = self._discover_plugin_instances(app_id=app_id, owner=sender)
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+      app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
+
+      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=sender)
 
       if len(discovered_instances) == 0:
-        msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for app_id '{app_id}' and owner '{sender}'."
+        msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for provided job_id/app_id and owner '{sender}'."
         raise ValueError(msg)
       for instance in discovered_instances:
-        self.P(f"Stopping pipeline '{app_id}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
+        self.P(f"Stopping pipeline '{instance[DEEPLOY_PLUGIN_DATA.APP_ID]}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
         self.cmdapi_stop_pipeline(
           node_address=instance[DEEPLOY_PLUGIN_DATA.NODE],
-          name=inputs.app_id,
+          name=instance[DEEPLOY_PLUGIN_DATA.APP_ID],
         )
       #endfor each target node
-      
+
+      request_payload = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.TARGETS: discovered_instances,
+      }
+
+      if job_id is not None:
+        request_payload[DEEPLOY_KEYS.JOB_ID] = job_id
+      elif app_id is not None:
+        request_payload[DEEPLOY_KEYS.APP_ID] = app_id
+
       result = {
-        DEEPLOY_KEYS.REQUEST : {
-          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
-          DEEPLOY_KEYS.APP_ID : inputs.app_id,
-          DEEPLOY_KEYS.TARGETS : discovered_instances,
-        },
+        DEEPLOY_KEYS.REQUEST : request_payload,
         DEEPLOY_KEYS.AUTH : auth_result,
       }
     
@@ -395,13 +402,23 @@ class DeeployManagerApiPlugin(
                         discovered_pipeline[DEEPLOY_PLUGIN_DATA.APP_ID],
                         discovered_pipeline[DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE],
                         discovered_pipeline[DEEPLOY_PLUGIN_DATA.INSTANCE_ID]])
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+      app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
+
+      request_payload = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.COMMAND_DELIVERED,
+      }
+
+      # Prefer JOB_ID if both are present; otherwise use APP_ID; add nothing if neither.
+      if job_id is not None:
+        request_payload[DEEPLOY_KEYS.JOB_ID] = job_id
+      elif app_id is not None:
+        request_payload[DEEPLOY_KEYS.APP_ID] = app_id
+
       result = {
-        DEEPLOY_KEYS.REQUEST : {
-          DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.COMMAND_DELIVERED,
-          DEEPLOY_KEYS.APP_ID : inputs.app_id,
-        },
+        DEEPLOY_KEYS.REQUEST: request_payload,
         DEEPLOY_KEYS.TARGETS: targets,
-        DEEPLOY_KEYS.AUTH : auth_result,
+        DEEPLOY_KEYS.AUTH: auth_result,
       }
 
     except Exception as e:
