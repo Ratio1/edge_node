@@ -272,7 +272,13 @@ class DeeployManagerApiPlugin(
 
     Parameters
     ----------
-    request: dict
+    request: dict containing next fields:
+      app_id : str
+      job_id: int
+      target_nodes : list[str]
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str
     Returns
     -------
     dict
@@ -336,7 +342,15 @@ class DeeployManagerApiPlugin(
 
     Parameters
     ----------
-    request: dict
+    request: dict containing next keys:
+      app_id : str
+      target_nodes : list[str]
+      plugin_signature : str
+      instance_id : str
+      instance_command : any
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str
     Returns
     -------
     dict
@@ -374,7 +388,6 @@ class DeeployManagerApiPlugin(
   def send_app_command(self, 
     request: dict = DEEPLOY_APP_COMMAND_REQUEST
   ):
-    # TODO: Should accept app_id or job_id and send the command to all instances of the app on all target node(s).
     """
     Sends a command to a given app on all its target node(s).
     
@@ -382,7 +395,13 @@ class DeeployManagerApiPlugin(
 
     Parameters
     ----------
-    request: dict
+    request: dict with keys below:
+      app_id : str
+      job_id: int
+      instance_command : any
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str
     Returns
     -------
     dict
