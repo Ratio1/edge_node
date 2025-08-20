@@ -461,22 +461,26 @@ class _DeeployMixin:
                                         instance_command=command,
                                         node_address=plugin[DEEPLOY_PLUGIN_DATA.NODE])
 
-  def send_instance_command_to_nodes(self, inputs):
+  def send_instance_command_to_nodes(self, inputs, owner):
     """
     Send a command to the specified nodes for the given plugin instance.
+    TODO: (Vitalii, Andrei) send instance command to the nodes DOES NOT need discovery
     """
-    plugins = []
-    for node_addr in inputs.target_nodes:
-      plugin = {
-        DEEPLOY_PLUGIN_DATA.APP_ID: inputs.app_id,
-        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: inputs.plugin_signature,
-        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: inputs.instance_id,
-        DEEPLOY_PLUGIN_DATA.NODE: node_addr
-      }
-      plugins.append(plugin)
-    self.__send_instance_command_to_targets(plugins=plugins, command=inputs.instance_command)
+    discovered_plugins = self._discover_plugin_instances(
+      app_id=inputs.app_id,
+      owner=owner,
+      target_nodes=inputs.target_nodes,
+      plugin_signature=inputs.plugin_signature,
+      instance_id=inputs.instance_id
+    )
+    if len(discovered_plugins) == 0:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.PLINST1}: Plugin instance {inputs.plugin_signature} with ID {inputs.instance_id} not found in app {inputs.app_id} for owner {owner}.")
 
-    return plugin
+    self.__send_instance_command_to_targets(plugins=discovered_plugins, command=inputs.instance_command)
+
+    return discovered_plugins
+
 
   def discover_and_send_pipeline_command(self, inputs):
     """

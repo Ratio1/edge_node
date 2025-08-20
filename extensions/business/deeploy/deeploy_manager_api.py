@@ -377,7 +377,7 @@ class DeeployManagerApiPlugin(
       # Validate the request fields.
       self._validate_send_instance_command_request(inputs)
 
-      self.send_instance_command_to_nodes(inputs)
+      self.send_instance_command_to_nodes(inputs, owner=sender)
 
       result = {
         DEEPLOY_KEYS.REQUEST : {
