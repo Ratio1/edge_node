@@ -272,7 +272,50 @@ class _DeeployMixin:
         raise ValueError(f"{DEEPLOY_ERRORS.REQUEST6}. Container resources not provided for plugin signature {inputs.plugin_signature}.")
       pass
     return
-  
+
+  def _validate_send_app_command_request(self, inputs):
+    """
+    Validate the request input for sending an app command.
+    Checks if all required fields are present and valid.
+    """
+    app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
+    job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+
+    if not app_id and not job_id:
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST8}. 'app_id' or 'job_id' should be provided.")
+
+    if not inputs.command or inputs.command == "":
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST9}. 'command' not provided.")
+
+    return
+
+
+  def _validate_send_instance_command_request(self, inputs):
+    """
+    Validate the request input for sending an instance command.
+    Checks if all required fields are present and valid.
+    """
+    app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
+    job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+
+    if not app_id and not job_id:
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST8}. 'app_id' or 'job_id' should be provided.")
+
+    if not inputs.target_nodes or len(inputs.target_nodes) == 0:
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST8}. 'target_nodes' are not provided.")
+
+    if not inputs.plugin_signature or inputs.plugin_signature == "":
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST7}. 'plugin_signature' not provided.")
+
+    if not inputs.instance_id or inputs.instance_id == "":
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST10}. 'instance_id' not provided.")
+
+    if not inputs.instance_command or inputs.instance_command == "":
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST9}. 'instance_command' not provided.")
+
+    return
+
+
   def deeploy_get_auth_result(self, inputs):
     sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
     result = {
@@ -364,10 +407,12 @@ class _DeeployMixin:
 
     return dct_status, str_status
 
-  def __discover_plugin_instances(
+  def _discover_plugin_instances(
     self,
-    app_id: str,
+    app_id: str = None,
+    job_id: str = None,
     target_nodes: list[str] = None,
+    owner: str = None,
     plugin_signature: str = None,
     instance_id: str = None
   ):
@@ -375,13 +420,43 @@ class _DeeployMixin:
     Discover the plugin instances for the given app_id and target nodes.
     Returns a list of dictionaries containing infomration about plugin instances.
     """
-    apps = self._get_online_apps()
+    apps = self._get_online_apps(owner=owner, target_nodes=target_nodes)
 
     discovered_plugins = []
     for node, pipelines in apps.items():
       if target_nodes is not None and node not in target_nodes:
         continue
-      if app_id in pipelines:
+      # search by job_id
+      if job_id is not None:
+        for current_pipeline_app_id, pipeline in pipelines.items():
+          current_pipeline_deeploy_specs = pipeline.get(NetMonCt.DEEPLOY_SPECS, None)
+          current_pipeline_job_id = current_pipeline_deeploy_specs.get(DEEPLOY_KEYS.JOB_ID, None) if current_pipeline_deeploy_specs else None
+          if not current_pipeline_job_id or current_pipeline_job_id != job_id:
+            continue
+          for current_plugin_signature, plugins_instances in pipeline[NetMonCt.PLUGINS].items():
+            for instance_dict in plugins_instances:
+              current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
+              if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
+                # If we find a match by signature and instance_id, add it to the list and break.
+                discovered_plugins.append({
+                  DEEPLOY_PLUGIN_DATA.APP_ID: current_pipeline_app_id,
+                  DEEPLOY_PLUGIN_DATA.INSTANCE_ID: current_instance_id,
+                  DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: current_plugin_signature,
+                  DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: instance_dict,
+                  DEEPLOY_PLUGIN_DATA.NODE: node
+                })
+                break
+              if instance_id is None and (plugin_signature is None or plugin_signature == current_plugin_signature):
+                # If no specific signature or instance_id is provided, add all instances
+                discovered_plugins.append({
+                  DEEPLOY_PLUGIN_DATA.APP_ID: current_pipeline_app_id,
+                  DEEPLOY_PLUGIN_DATA.INSTANCE_ID: current_instance_id,
+                  DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: current_plugin_signature,
+                  DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: instance_dict,
+                  DEEPLOY_PLUGIN_DATA.NODE: node
+                })
+      # search by app_id
+      if app_id is not None and app_id in pipelines:
         for current_plugin_signature, plugins_instances in pipelines[app_id][NetMonCt.PLUGINS].items():
           # plugins_instances is a list of dictionaries
           for instance_dict in plugins_instances:
@@ -396,7 +471,7 @@ class _DeeployMixin:
                 DEEPLOY_PLUGIN_DATA.NODE: node
               })
               break
-            if plugin_signature is None and instance_id is None:
+            if instance_id is None and (plugin_signature is None or plugin_signature == current_plugin_signature):
               # If no specific signature or instance_id is provided, add all instances
               discovered_plugins.append({
                 DEEPLOY_PLUGIN_DATA.APP_ID : app_id,
@@ -422,26 +497,27 @@ class _DeeployMixin:
                                         instance_command=command,
                                         node_address=plugin[DEEPLOY_PLUGIN_DATA.NODE])
 
-  def send_instance_command_to_nodes(self, inputs):
+  def send_instance_command_to_nodes(self, inputs, owner):
     """
     Send a command to the specified nodes for the given plugin instance.
-    TODO: (Vitalii, Andrei) send instance command to the nodes DOES NOT need discovery
     """
-    discovered_plugins = self.__discover_plugin_instances(
+    discovered_plugins = self._discover_plugin_instances(
       app_id=inputs.app_id,
+      owner=owner,
       target_nodes=inputs.target_nodes,
       plugin_signature=inputs.plugin_signature,
       instance_id=inputs.instance_id
     )
     if len(discovered_plugins) == 0:
       raise ValueError(
-        f"{DEEPLOY_ERRORS.PLINST1}: Plugin instance {inputs.plugin_signature} with ID {inputs.instance_id} not found in app {inputs.app_id}")
+        f"{DEEPLOY_ERRORS.PLINST1}: Plugin instance {inputs.plugin_signature} with ID {inputs.instance_id} not found in app {inputs.app_id} for owner {owner}.")
 
     self.__send_instance_command_to_targets(plugins=discovered_plugins, command=inputs.instance_command)
 
     return discovered_plugins
 
-  def discover_and_send_pipeline_command(self, inputs):
+
+  def discover_and_send_instance_command(self, inputs, owner):
     """
     Discover the running pipelines by app_id and send the command to each instance.
 
@@ -449,12 +525,21 @@ class _DeeployMixin:
         dict: A dictionary containing the discovered pipelines,
               where the keys are node addresses and the values are the pipelines.
     """
-    discovered_plugins = self.__discover_plugin_instances(app_id=inputs.app_id)
+    app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
+    job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+
+    plugin_signature = inputs.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, None)
+    discovered_plugins = self._discover_plugin_instances(
+      app_id=app_id,
+      job_id=job_id,
+      plugin_signature=plugin_signature,
+      owner=owner
+    )
 
     if len(discovered_plugins) == 0:
       raise ValueError(
         f"{DEEPLOY_ERRORS.APP1}: App {inputs.app_id} not found on any node")
 
-    self.__send_instance_command_to_targets(discovered_plugins, inputs.instance_command)
+    self.__send_instance_command_to_targets(discovered_plugins, inputs.command)
 
     return discovered_plugins
