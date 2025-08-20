@@ -299,7 +299,7 @@ class DeeployManagerApiPlugin(
       discovered_instances = self._discover_plugin_instances(app_id=app_id, owner=sender)
 
       if len(discovered_instances) == 0:
-        msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for app_id '{app_id}'."
+        msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for app_id '{app_id}' and owner '{sender}'."
         raise ValueError(msg)
       for instance in discovered_instances:
         self.P(f"Stopping pipeline '{app_id}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
@@ -462,7 +462,7 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  def _get_online_apps(self, owner=None):
+  def _get_online_apps(self, owner=None, target_nodes=None):
     """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
@@ -478,7 +478,7 @@ class DeeployManagerApiPlugin(
     }
 
     """
-    result = self.netmon.network_known_apps()
+    result = self.netmon.network_known_apps(target_nodes=target_nodes)
     if owner is not None:  
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
