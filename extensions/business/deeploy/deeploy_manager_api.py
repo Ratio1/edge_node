@@ -296,7 +296,7 @@ class DeeployManagerApiPlugin(
       
       # TODO: move to the mixin when ready
       app_id = inputs.app_id
-      discovered_instances = self._discover_plugin_instances(app_id=app_id)
+      discovered_instances = self._discover_plugin_instances(app_id=app_id, owner=sender)
 
       if len(discovered_instances) == 0:
         msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for app_id '{app_id}'."

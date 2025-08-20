@@ -406,6 +406,7 @@ class _DeeployMixin:
     self,
     app_id: str,
     target_nodes: list[str] = None,
+    owner: str = None,
     plugin_signature: str = None,
     instance_id: str = None
   ):
@@ -413,7 +414,7 @@ class _DeeployMixin:
     Discover the plugin instances for the given app_id and target nodes.
     Returns a list of dictionaries containing infomration about plugin instances.
     """
-    apps = self._get_online_apps()
+    apps = self._get_online_apps(owner=owner)
 
     discovered_plugins = []
     for node, pipelines in apps.items():
