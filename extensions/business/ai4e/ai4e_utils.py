@@ -1,4 +1,4 @@
-from ratio1 import Session, Pipeline, Instance
+# from ratio1 import Session, Pipeline, Instance
 from datetime import datetime
 import numpy as np
 
@@ -63,9 +63,9 @@ def get_job_config(
 
 
 class Job:
-  def __init__(self, owner, session: Session, job_id: str, node_id: str, pipeline: str, signature: str, instance: str):
+  def __init__(self, owner, job_id: str, node_id: str, pipeline: str, signature: str, instance: str):
     self.owner = owner
-    self.session = session
+    # self.session = session
     self.job_id = job_id
     # TODO: instead of single values for instance_id and the rest, use a dict to
     # have a set of properties for each subtask(each signature)
@@ -249,7 +249,6 @@ class Job:
       self.train_status['total_grid_iterations'] = train_data.get('NR_ALL_GRID_ITER', self.train_status['total_grid_iterations'])
       if 'TRAIN_FINAL' in data.keys():
         self.train_final = data.get('TRAIN_FINAL', self.train_final)
-        self.deploy_job({})
       # endif training finished
 
     # endif status for training
@@ -333,24 +332,24 @@ class Job:
       # 'full_last_payload': self.train_status_full_payload
     }
 
-  def __get_pipeline_and_instance(self, node=None, pipeline=None, signature=None, instance_id=None):
-    node = node or self.node_id
-    active_pipelines = self.session.get_active_pipelines(node=node)
-    if active_pipelines is None:
-      return None, None, f"Node_ID {node} not found"
-    pipeline = pipeline or self.pipeline
-    curr_pipeline = self.session.attach_to_pipeline(node=node, name=pipeline)
-    if curr_pipeline is None:
-      return None, None, f"Pipeline {pipeline} not found on {node}"
-    signature = signature or self.signature
-    instance_id = instance_id or self.instance_id
-    curr_instance = curr_pipeline.attach_to_plugin_instance(
-      signature=signature,
-      instance_id=instance_id
-    )
-    if curr_instance is None:
-      return curr_pipeline, None, f"Instance {instance_id} of {signature} not found on {pipeline}"
-    return curr_pipeline, curr_instance, ""
+  # def __get_pipeline_and_instance(self, node=None, pipeline=None, signature=None, instance_id=None):
+  #   node = node or self.node_id
+  #   active_pipelines = self.session.get_active_pipelines(node=node)
+  #   if active_pipelines is None:
+  #     return None, None, f"Node_ID {node} not found"
+  #   pipeline = pipeline or self.pipeline
+  #   curr_pipeline = self.session.attach_to_pipeline(node=node, name=pipeline)
+  #   if curr_pipeline is None:
+  #     return None, None, f"Pipeline {pipeline} not found on {node}"
+  #   signature = signature or self.signature
+  #   instance_id = instance_id or self.instance_id
+  #   curr_instance = curr_pipeline.attach_to_plugin_instance(
+  #     signature=signature,
+  #     instance_id=instance_id
+  #   )
+  #   if curr_instance is None:
+  #     return curr_pipeline, None, f"Instance {instance_id} of {signature} not found on {pipeline}"
+  #   return curr_pipeline, curr_instance, ""
 
   def send_instance_command(self, node=None, pipeline=None, signature=None, instance_id=None, **kwargs):
     node = node or self.node_id
@@ -443,7 +442,7 @@ class Job:
     return self.send_instance_command(publish=True)
 
   def start_train(self, body: dict):
-    self.session.P(f'Starting training for {self.job_id} on {self.node_id}...')
+    self.owner.P(f'Starting training for {self.job_id} on {self.node_id}...')
     success, err_msg = self.send_instance_update(
       config={
         'START_TRAINING': True,
@@ -495,38 +494,58 @@ class Job:
         'MODEL_INSTANCE_ID': self.train_meta['MODEL_INSTANCE_ID']
       },
       'DESCRIPTION': self.description,
-      'OBJECTIVE_NAME': self.objective_name
+      'OBJECTIVE_NAME': self.objective_name,
+      "INSTANCE_ID": self.job_id,
     }
-    pipeline = self.session.create_or_attach_to_pipeline(
-      node=chosen_node,
-      name=f'deploy_{self.job_id}',
-      data_source='ON_DEMAND_INPUT',
-      # plugins=[det_plugin_config]
+    inference_pipeline_config = {
+      "TYPE": "ON_DEMAND_INPUT",
+      "NAME": f"deploy_{self.job_id}",
+      "PLUGINS": [
+        {
+          "INSTANCES": [
+            instance_config
+          ],
+          "SIGNATURE": "ai4e_custom_inference_agent",
+        }
+      ]
+    }
+    self.owner.cmadpi_start_pipeline(
+      config=inference_pipeline_config,
+      node_address=chosen_node,
     )
-    instance = pipeline.create_or_attach_to_plugin_instance(
-      signature='ai4e_custom_inference_agent',
-      instance_id=self.job_id,
-      config=instance_config
-    )
-    pipeline.deploy()
     # END DETECTION PIPELINE
     # START FASTAPI PIPELINE
+    fastapi_instance_id = "AI4EveryoneDeploys"
     fastapi_instance_config = {
       "RESPONSE_FORMAT": self.owner.cfg_response_format,
       "NGROK_EDGE_LABEL": deploy_ngrok_edge_label,
+      "INSTANCE_ID": fastapi_instance_id,
     }
-    pipeline = self.session.create_or_attach_to_pipeline(
+    fastapi_pipeline_name = f"AI4EveryoneDeploys"
+    fastapi_signature = "AI4E_DEPLOY"
+    fastapi_pipeline_config = {
+      "NAME": fastapi_pipeline_name,
+      "TYPE": "VOID",  # Change to custom NetworkListener
+      "PLUGINS": [
+        {
+          "INSTANCES": [
+            {
+              fastapi_instance_config
+            }
+          ],
+          "SIGNATURE": fastapi_signature,
+        }
+      ]
+    }
+    self.owner.cmadpi_start_pipeline(
+      config=fastapi_pipeline_config,
+      node_address=chosen_node,
+    )
+    self.send_instance_command(
       node=chosen_node,
-      name=f'AI4EveryoneDeploys',
-      data_source='VOID',
-    )
-    instance = pipeline.create_or_attach_to_plugin_instance(
-      signature="AI4E_DEPLOY",
-      instance_id='AI4EveryoneDeploys',
-      config=fastapi_instance_config
-    )
-    pipeline.deploy()
-    instance.send_instance_command(
+      pipeline=fastapi_pipeline_name,
+      signature=fastapi_signature,
+      instance_id=fastapi_instance_id,
       command='REGISTER',
       command_params={
         'CONFIG': instance_config
@@ -539,8 +558,9 @@ class Job:
     if self.deployed:
       return True, "Job already deployed"
     self.started_deploying = True
-    lst_allowed = self.session.get_allowed_nodes()
-    self.session.P(f"Allowed nodes: {lst_allowed}")
+    # lst_allowed = self.session.get_allowed_nodes()
+    lst_allowed = self.owner.netmon.accessible_nodes()
+    self.owner.P(f"Allowed nodes: {lst_allowed}")
     if len(lst_allowed) == 0:
       self.started_deploying = False
       return False, "No node available at the moment."

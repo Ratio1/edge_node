@@ -1466,11 +1466,12 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
             self.Pd(f"Request ID '{request_id}' to LLM failed with error: {error_message}", color="red")
             return
           text_response = data.get('RESULT', {}).get('TEXT_RESPONSE', "")
+          model_name = data.get('RESULT', {}).get('MODEL_NAME', None)
           if text_response is not None:
             request_data['result'] = {
               'response': text_response,
               'elapsed_time': self.time() - request_data['start_time'],
-              'model_name': data.get('MODEL_NAME', None),
+              'model_name': model_name,
               'request_id': request_id,
             }
             request_data['finished'] = True
