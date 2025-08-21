@@ -1,14 +1,15 @@
-from ratio1 import Payload, Session
+# from ratio1 import Payload, Session
 
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
-from extensions.business.utils.ai4e_utils import AI4E_CONSTANTS, Job, get_job_config, job_data_to_id
+from naeural_core.business.mixins_libs.network_processor_mixin import _NetworkProcessorMixin
+from extensions.business.ai4e.ai4e_utils import AI4E_CONSTANTS, Job, get_job_config, job_data_to_id
 
 __VER__ = '0.1.0.0'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'SAVE_PERIOD': 60,
+  'SAVE_PERIOD': 300,
   'REQUEST_TIMEOUT': 10,
   "PROCESS_DELAY": 0,
   "DEPLOY_NGROK_EDGE_LABEL": None,
@@ -16,7 +17,7 @@ _CONFIG = {
   "DEBUG_WEB_APP": True,
 
   # 'PORT': 5000,
-  'ASSETS': 'extensions/business/fastapi/_ai4everyone',
+  'ASSETS': 'extensions/business/ai4e',
   'JINJA_ARGS': {
     'html_files': [
       {
@@ -32,81 +33,120 @@ _CONFIG = {
 }
 
 
-class AI4EveryonePlugin(BasePlugin):
+class AI4EveryonePlugin(
+  BasePlugin, 
+  _NetworkProcessorMixin
+):
   CONFIG = _CONFIG
 
   def __init__(self, **kwargs):
-    self.__init_done = False
+    # self.__init_done = False
     super(AI4EveryonePlugin, self).__init__(**kwargs)
     self.jobs_data = {}
     self.requests_responses = {}
     self.last_persistence_save = self.time()
     self.request_cache = {}
     self.force_persistence = False
-    # !!!This approach, although works, will not be allowed in the future because it's not safe
-    self.session = Session(
-      name=f'{self.str_unique_identification}',
-      config=self.global_shmem['config_communication']['PARAMS'],
-      log=self.log,
-      bc_engine=self.global_shmem[self.ct.BLOCKCHAIN_MANAGER],
-      on_payload=self.on_payload,
-    )
     return
 
   def on_init(self):
     super(AI4EveryonePlugin, self).on_init()
+    self.network_processor_init()
     self.jobs_data = self.load_persistence_data()
-    self.__init_done = True
+    # self.__init_done = True
     return
 
-  """SESSION SECTION"""
+  """PAYLOAD HANDLING SECTION"""
   if True:
-    def on_payload(self, sess: Session, node_id: str, pipeline: str, signature: str, instance: str, payload: Payload):
-      if signature.lower() not in AI4E_CONSTANTS.RELEVANT_PLUGIN_SIGNATURES:
-        return
-      if not self.__init_done:
-        sess.P(f"[DEBUG_AI4E]Session not initialized yet, ignoring payload.")
-        return
-      is_status = payload.data.get('IS_STATUS', False)
-      is_final_dataset_status = payload.data.get('IS_FINAL_DATASET_STATUS', False)
+    def payload_handler_helper(self, data):
+      is_status = data.get('IS_STATUS', False)
+      is_final_dataset_status = data.get('IS_FINAL_DATASET_STATUS', False)
       if is_status or is_final_dataset_status:
         try:
-          self.maybe_update_job_data(node_id, pipeline, signature, instance, payload)
+          self.maybe_update_job_data(data)
         except Exception as e:
           if self.cfg_debug_web_app:
             self.P(f"[DEBUG_AI4E]Error while updating job data: {e}")
         # endtry
       else:
         try:
-          self.register_request_response(node_id, pipeline, signature, instance, payload)
+          self.register_request_response(data)
         except Exception as e:
           if self.cfg_debug_web_app:
             self.P(f"[DEBUG_AI4E]Error while registering request response: {e}")
         # endtry
+      # endif is_status or is_final_dataset_status
       return
 
-    def maybe_update_job_data(self, node_id: str, pipeline: str, signature: str, instance: str, payload: Payload):
+    @_NetworkProcessorMixin.payload_handler(signature="AI4E_CROP_DATA")
+    def on_payload_crop_data(self, data):
+      return self.payload_handler_helper(data)
+
+    @_NetworkProcessorMixin.payload_handler(signature="AI4E_LABEL_DATA")
+    def on_payload_label_data(self, data):
+      return self.payload_handler_helper(data)
+
+    @_NetworkProcessorMixin.payload_handler(signature="SECOND_STAGE_TRAINING_PROCESS")
+    def on_payload_second_stage_training(self, data):
+      return self.payload_handler_helper(data)
+
+    @_NetworkProcessorMixin.payload_handler(signature="GENERAL_TRAINING_PROCESS")
+    def on_payload_general_training(self, data):
+      return self.payload_handler_helper(data)
+
+    @_NetworkProcessorMixin.payload_handler(signature="MINIO_UPLOAD_DATASET")
+    def on_payload_minio_upload_dataset(self, data):
+      return self.payload_handler_helper(data)
+
+    # def on_payload(self, sess: Session, node_id: str, pipeline: str, signature: str, instance: str, payload: Payload):
+    #   if signature.lower() not in AI4E_CONSTANTS.RELEVANT_PLUGIN_SIGNATURES:
+    #     return
+    #   if not self.__init_done:
+    #     sess.P(f"[DEBUG_AI4E]Session not initialized yet, ignoring payload.")
+    #     return
+    #   is_status = payload.data.get('IS_STATUS', False)
+    #   is_final_dataset_status = payload.data.get('IS_FINAL_DATASET_STATUS', False)
+    #   if is_status or is_final_dataset_status:
+    #     try:
+    #       self.maybe_update_job_data(node_id, pipeline, signature, instance, payload)
+    #     except Exception as e:
+    #       if self.cfg_debug_web_app:
+    #         self.P(f"[DEBUG_AI4E]Error while updating job data: {e}")
+    #     # endtry
+    #   else:
+    #     try:
+    #       self.register_request_response(node_id, pipeline, signature, instance, payload)
+    #     except Exception as e:
+    #       if self.cfg_debug_web_app:
+    #         self.P(f"[DEBUG_AI4E]Error while registering request response: {e}")
+    #     # endtry
+    #   return
+
+    def maybe_update_job_data(self, data):
+      payload_path = data.get(self.ct.PAYLOAD_DATA.EE_PAYLOAD_PATH)
+      if payload_path is None:
+        return
+      node_id, pipeline, signature, instance = payload_path
       job_id = job_data_to_id(node_id, pipeline, signature, instance)
       if job_id not in self.jobs_data:
         self.jobs_data[job_id] = Job(
-          owner=self,
-          session=self.session, job_id=job_id,
+          owner=self, job_id=job_id,
           node_id=node_id, pipeline=pipeline,
           signature=signature, instance=instance
         )
       job = self.jobs_data[job_id]
       job.maybe_update_data(
-        data=payload.data,
+        data=data,
         pipeline=pipeline,
         signature=signature
       )
       return
 
-    def register_request_response(self, node_id: str, pipeline: str, signature: str, instance: str, payload: Payload):
-      request_id = payload.data.get('REQUEST_ID')
+    def register_request_response(self, data: dict):
+      request_id = data.get('REQUEST_ID')
       if request_id is None:
         return
-      self.requests_responses[request_id] = payload
+      self.requests_responses[request_id] = data
       return
 
     def send_request(self, job: Job, **kwargs):
@@ -121,8 +161,8 @@ class AI4EveryonePlugin(BasePlugin):
         self, request_id: str, job: Job, request_ts: float, **request_kwargs
     ):
       if request_id in self.requests_responses:
-        response = self.requests_responses.pop(request_id)
-        return response.data
+        data = self.requests_responses.pop(request_id)
+        return data
       if self.time() - request_ts > self.cfg_request_timeout:
         return {"error": "Request timed out"}
       return self.create_postponed_request(
@@ -168,8 +208,7 @@ class AI4EveryonePlugin(BasePlugin):
         **request_kwargs
     ):
       if request_id in self.requests_responses:
-        response = self.requests_responses.pop(request_id)
-        response_data = response.data
+        response_data = self.requests_responses.pop(request_id)
         sample_filename = response_data.get('SAMPLE_FILENAME')
         if sample_filename is None:
           return {"error": "Sample not found"}
@@ -267,7 +306,7 @@ class AI4EveryonePlugin(BasePlugin):
         data_source="VOID",
         plugins=[job_config]
       ).deploy()
-  """END SESSION SECTION"""
+  """END PAYLOAD HANDLING SECTION"""
 
   """ENDPOINTS SECTION"""
   if True:
@@ -337,6 +376,7 @@ class AI4EveryonePlugin(BasePlugin):
       return None
 
     @BasePlugin.endpoint(method="post")
+    # TODO: receive list of votes
     def vote(self, job_id: str, filename: str, label: str):
       if job_id in self.jobs_data:
         success, result = self.jobs_data[job_id].send_vote(filename=filename, label=label)
@@ -506,8 +546,7 @@ class AI4EveryonePlugin(BasePlugin):
           node_id, pipeline = data.get('node_id'), data.get('pipeline')
           signature, instance = data.get('signature'), data.get('instance_id')
           res[key] = Job(
-            owner=self,
-            session=self.session, job_id=key,
+            owner=self, job_id=key,
             node_id=node_id, pipeline=pipeline,
             signature=signature, instance=instance
           )
@@ -518,6 +557,7 @@ class AI4EveryonePlugin(BasePlugin):
 
   def process(self):
     super(AI4EveryonePlugin, self).process()
+    self.network_processor_loop()
     self.maybe_persistence_save()
     return
 

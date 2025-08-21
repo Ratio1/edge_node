@@ -1,6 +1,7 @@
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
 
+
 _CONFIG = {
   **BasePlugin.CONFIG,
 
@@ -9,7 +10,7 @@ _CONFIG = {
   "PROCESS_DELAY": 0,
 
   # 'PORT': 5001,
-  'ASSETS': 'extensions/business/fastapi/_ai4everyone',
+  'ASSETS': 'extensions/business/ai4e',
   'JINJA_ARGS': {
     'html_files': [
       {
