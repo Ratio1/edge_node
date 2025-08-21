@@ -8,7 +8,7 @@ __VER__ = '0.1.0.0'
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'SAVE_PERIOD': 60,
+  'SAVE_PERIOD': 300,
   'REQUEST_TIMEOUT': 10,
   "PROCESS_DELAY": 0,
   "DEPLOY_NGROK_EDGE_LABEL": None,
@@ -16,7 +16,7 @@ _CONFIG = {
   "DEBUG_WEB_APP": True,
 
   # 'PORT': 5000,
-  'ASSETS': 'extensions/business/fastapi/_ai4everyone',
+  'ASSETS': 'extensions/business/ai4e',
   'JINJA_ARGS': {
     'html_files': [
       {
