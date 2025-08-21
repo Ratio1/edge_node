@@ -1,7 +1,7 @@
 from ratio1 import Payload, Session
 
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
-from extensions.business.utils.ai4e_utils import AI4E_CONSTANTS, Job, get_job_config, job_data_to_id
+from extensions.business.ai4e.ai4e_utils import AI4E_CONSTANTS, Job, get_job_config, job_data_to_id
 
 __VER__ = '0.1.0.0'
 
@@ -283,7 +283,7 @@ class AI4EveryonePlugin(BasePlugin):
 
     @BasePlugin.endpoint(method="post")
     def create_job(
-        self, name: str, description: str, target: list or str,
+        self, name: str, description: str, target: any,
         rewards: dict, dataSources: list, dataset: dict,
         nodeAddress: str = None,
     ):
@@ -327,7 +327,7 @@ class AI4EveryonePlugin(BasePlugin):
 
     @BasePlugin.endpoint(method="post")
     def publish_job(
-        self, job_id: str, name: str, description: str, target: list or str,
+        self, job_id: str, name: str, description: str, target: any,
         rewards: dict, dataSources: list, dataset: dict,
         classes: list[dict]
     ):
