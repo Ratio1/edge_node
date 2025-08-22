@@ -193,12 +193,10 @@ class DeeployManagerApiPlugin(
       app_id = (app_alias.lower()[:13] + "_" + self.uuid(7)).lower()
 
       # check payment
-      allow_unpaid_job = inputs.get(DEEPLOY_KEYS.ALLOW_UNPAID_JOB, False)
-      if not allow_unpaid_job:
-        is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
-        if not is_valid:
-          msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
-          raise ValueError(msg)
+      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
+      if not is_valid:
+        msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
+        raise ValueError(msg)
       # TODO: Add check if jobType resources match the requested resources.
 
       nodes = self._check_nodes_availability(inputs)
