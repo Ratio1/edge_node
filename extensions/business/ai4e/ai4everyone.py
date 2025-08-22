@@ -4,7 +4,7 @@ from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebApp
 from naeural_core.business.mixins_libs.network_processor_mixin import _NetworkProcessorMixin
 from extensions.business.ai4e.ai4e_utils import AI4E_CONSTANTS, Job, get_job_config, job_data_to_id
 
-__VER__ = '0.1.0.0'
+__VER__ = '0.1.1.0'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
