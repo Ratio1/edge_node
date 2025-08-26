@@ -29,15 +29,15 @@ class _OraSyncStatesCallbacksMixin:
       epoch_keys = list(range(start_epoch, end_epoch + 1))
       # TODO: Refactor this to retrieve all the data in one call and separate the data for each epoch after.
       valid_epochs, invalid_epochs = [], []
-      added_success, added_failed = [], []
+      added_agreement_success, added_agreement_failed = [], []
+      added_signatures_success, added_signatures_failed = [], []
       already_uploaded, epochs_with_empty = [], []
       for epoch in epoch_keys:
-        availability_table, dct_signatures, agreement_cid = self.netmon.epoch_manager.get_epoch_availability(
+        availability_table, dct_signatures, agreement_cid, signatures_cid = self.netmon.epoch_manager.get_epoch_availability(
           epoch=epoch, return_additional=True
         )
         current_epoch_is_valid = self.netmon.epoch_manager.is_epoch_valid(epoch)
         epoch_key = str(epoch)
-        dct_epoch__signatures[epoch_key] = dct_signatures
         dct_epoch__is_valid[epoch_key] = self.netmon.epoch_manager.is_epoch_valid(epoch)
 
         if current_epoch_is_valid:
@@ -45,40 +45,47 @@ class _OraSyncStatesCallbacksMixin:
         else:
           invalid_epochs.append(epoch)
 
-        if (not self.cfg_use_r1fs) or (agreement_cid is None and current_epoch_is_valid):
-          # The agreement was never uploaded in the R1FS, so we try to upload it now.
-          # This will add the agreement table for the current epoch to `dct_epoch__agreed_median_table`
-          # regardless of the success of the upload.
-          # In case of success, the value added will be the cid, otherwise the full table.
-          success = self.r1fs_add_data_to_message(
+        not_added_to_r1fs = current_epoch_is_valid and (agreement_cid is None or signatures_cid is None)
+        if (not self.cfg_use_r1fs) or not_added_to_r1fs:
+          # The agreement or the signatures were never uploaded in the R1FS, so we try to upload them now.
+          agreement_success, newly_added_agreement = self.maybe_add_data_to_message(
             message_dict=dct_epoch__agreed_median_table,
             data_dict=availability_table,
             data_key=epoch_key,
-            debug=self.cfg_debug_sync_full
+            data_cid=agreement_cid,
+            debug=self.cfg_debug_sync_full,
           )
-          if success:
-            # In case of success the cid needs to also be added to the epoch_manager
-            if self.cfg_use_r1fs:
-              agreement_cid = dct_epoch__agreed_median_table[epoch_key]
-              self.netmon.epoch_manager.add_cid_for_epoch(
-                epoch=epoch, agreement_cid=agreement_cid,
-                debug=self.cfg_debug_sync_full
-              )
-              newly_uploaded_epochs.append(epoch)
-            # endif use_r1fs
-            added_success.append(epoch)
+
+          signatures_success, newly_added_signatures = self.maybe_add_data_to_message(
+            message_dict=dct_epoch__signatures,
+            data_dict=dct_signatures,
+            data_key=epoch_key,
+            data_cid=signatures_cid,
+            debug=self.cfg_debug_sync_full,
+          )
+
+          if newly_added_signatures or newly_added_agreement:
+            newly_uploaded_epochs.append(epoch)
+          # endif newly added signatures or agreement
+          if agreement_success:
+            added_agreement_success.append(epoch)
           else:
-            added_failed.append(epoch)
-            # self.P(f"Failed to upload agreement for epoch {epoch}.")
-          # endif success
+            added_agreement_failed.append(epoch)
+          # endif agreement success
+          if signatures_success:
+            added_signatures_success.append(epoch)
+          else:
+            added_signatures_failed.append(epoch)
+          # endif signatures success
         else:
           # Here either the epoch is not valid or the agreement was already uploaded.
-          if agreement_cid is not None:
+          if agreement_cid is not None and signatures_cid is not None:
             # The agreement was already uploaded, so we just add the cid to the message.
             already_uploaded.append(epoch)
             if self.cfg_debug_sync_full:
-              self.P(f"Agreement for epoch {epoch} was already uploaded. Adding the CID to the message.")
+              self.P(f"Agreement and signatures for epoch {epoch} were already uploaded. Adding the CIDs to the message.")
             dct_epoch__agreed_median_table[epoch_key] = agreement_cid
+            dct_epoch__signatures[epoch_key] = signatures_cid
           else:
             # The epoch is not valid, so we just add an empty object.
             epochs_with_empty.append(epoch)
@@ -93,7 +100,8 @@ class _OraSyncStatesCallbacksMixin:
 
       if self.cfg_debug_sync:
         stats_msg = f'{len(valid_epochs)} valid | {len(invalid_epochs)} invalid'
-        stats_msg += f' | {len(added_success)} added | {len(added_failed)} failed'
+        stats_msg += f' | {len(added_agreement_success)}a {len(added_signatures_success)}s added'
+        stats_msg += f' | {len(added_agreement_failed)}a {len(added_signatures_failed)}s failed'
         stats_msg += f' | {len(already_uploaded)} already uploaded | {len(epochs_with_empty)} empty'
         self.P(f"Epochs: {stats_msg}.")
       # endif debug_sync
@@ -442,13 +450,15 @@ class _OraSyncStatesCallbacksMixin:
           OracleSyncCt.STAGE: self._get_current_state()
         }
         self.bc.sign(oracle_data, add_data=True, use_digest=True)
-        # Will add cid to the message instead of self.local_table if
-        # the upload to R1FS is successful.
-        self.r1fs_add_data_to_message(
-          message_dict=oracle_data,
-          data_dict=self.local_table,
-          data_key=OracleSyncCt.LOCAL_TABLE
-        )
+        if self.cfg_use_r1fs_during_consensus:
+          # Will add cid to the message instead of self.local_table if
+          # the upload to R1FS is successful.
+          self.r1fs_add_data_to_message(
+            message_dict=oracle_data,
+            data_dict=self.local_table,
+            data_key=OracleSyncCt.LOCAL_TABLE
+          )
+        # endif use r1fs during consensus
 
         self.add_payload_by_fields(oracle_data=oracle_data)
         self.last_time_local_table_sent = self.time()
@@ -643,13 +653,15 @@ class _OraSyncStatesCallbacksMixin:
           OracleSyncCt.MEDIAN_TABLE: self.median_table,
         }
         self.bc.sign(oracle_data, add_data=True, use_digest=True)
-        # Will add cid to the message instead of self.median_table if
-        # the upload to R1FS is successful.
-        self.r1fs_add_data_to_message(
-          message_dict=oracle_data,
-          data_dict=self.median_table,
-          data_key=OracleSyncCt.MEDIAN_TABLE
-        )
+        if self.cfg_use_r1fs_during_consensus:
+          # Will add cid to the message instead of self.median_table if
+          # the upload to R1FS is successful.
+          self.r1fs_add_data_to_message(
+            message_dict=oracle_data,
+            data_dict=self.median_table,
+            data_key=OracleSyncCt.MEDIAN_TABLE
+          )
+        # endif use r1fs during consensus
         self.add_payload_by_fields(oracle_data=oracle_data)
         self.last_time_median_table_sent = self.time()
       # endif send
@@ -1046,7 +1058,7 @@ class _OraSyncStatesCallbacksMixin:
   if True:
     def _update_epoch_manager_with_agreed_median_table(
         self, epoch=None, compiled_agreed_median_table=None, agreement_signatures=None,
-        epoch_is_valid=None, agreement_cid=None, debug=True
+        epoch_is_valid=None, agreement_cid=None, signatures_cid=None, debug=True
     ):
       """
       Update the epoch manager with the compiled agreed median table and the agreement signatures for the epoch.
@@ -1069,6 +1081,8 @@ class _OraSyncStatesCallbacksMixin:
           An epoch will be valid if consensus was reached for it.
       agreement_cid : str, optional
           The CID of the agreement table, by default None
+      signatures_cid : str, optional
+          The CID of the agreement signatures, by default None
       debug : bool, optional
           Print debug messages, by default True
       """
@@ -1128,7 +1142,8 @@ class _OraSyncStatesCallbacksMixin:
           availability_table=compiled_agreed_median_table,
           agreement_signatures=agreement_signatures,
           debug=self.cfg_debug_sync_full,
-          agreement_cid=agreement_cid
+          agreement_cid=agreement_cid,
+          signatures_cid=signatures_cid
         )
       else:
         success = self.netmon.epoch_manager.mark_epoch_as_faulty(
@@ -1202,10 +1217,16 @@ class _OraSyncStatesCallbacksMixin:
           # but as string instead of int. We also know that in epoch_keys we have
           # the keys in int format. Thus, we need to convert the keys of the received tables
           dct_epoch_agreed_median_table = oracle_data[OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE]
-          dct_epoch_agreed_median_table = self.r1fs_get_data_from_nested_message(dct_epoch_agreed_median_table)
+          dct_epoch_agreed_median_table, dct_epoch_agreement_cid = self.r1fs_get_data_from_nested_message(
+            nested_message_dict=dct_epoch_agreed_median_table,
+            return_cids=True,
+          )
           dct_epoch_agreement_signatures = oracle_data[OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES]
+          dct_epoch_agreement_signatures, dct_epoch_signatures_cid = self.r1fs_get_data_from_nested_message(
+            nested_message_dict=dct_epoch_agreement_signatures,
+            return_cids=True,
+          )
           dct_epoch_is_valid = oracle_data[OracleSyncCt.EPOCH__IS_VALID]
-          dct_epoch_agreement_cid = {}
           epoch_keys = oracle_data[OracleSyncCt.EPOCH_KEYS]
           id_to_node_address = oracle_data.get(OracleSyncCt.ID_TO_NODE_ADDRESS, {})
           # Unsqueeze the epoch dictionaries if they are squeezed.
@@ -1217,19 +1238,6 @@ class _OraSyncStatesCallbacksMixin:
           # sort epoch_keys in ascending order
           received_epochs = sorted(epoch_keys)
 
-          # Maybe download the epochs data from R1FS if the data is not present in the message.
-          for epoch in received_epochs:
-            msg_received_data = dct_epoch_agreed_median_table.get(str(epoch))
-            retrieved_data = self.r1fs_get_data_from_message(
-              message_dict=dct_epoch_agreed_median_table,
-              data_key=str(epoch),
-              debug=self.cfg_debug_sync_full
-            )
-            if retrieved_data is not None and isinstance(msg_received_data, str):
-              # Received a CID in the message and successfully retrieved the data from R1FS.
-              dct_epoch_agreement_cid[epoch] = msg_received_data
-            # endif retrieval from R1FS successful
-          # endfor epochs
           # convert to dict with int keys
           dct_epoch_agreed_median_table = {
             # In case the agreement table is sent through R1FS, the keys will already be in int format.
@@ -1327,6 +1335,10 @@ class _OraSyncStatesCallbacksMixin:
           }
           self.dct_agreed_availability_cid[sender] = {
             i: dct_epoch_agreement_cid.get(i)
+            for i in epochs_range
+          }
+          self.dct_agreement_signatures_cid[sender] = {
+            i: dct_epoch_signatures_cid.get(i)
             for i in epochs_range
           }
         # end for received messages
@@ -1592,16 +1604,19 @@ class _OraSyncStatesCallbacksMixin:
       epoch__agreement_signatures = self.dct_agreed_availability_signatures[chosen_oracle]
       epoch__agreed_is_valid = self.dct_agreed_availability_is_valid[chosen_oracle]
       epoch__agreed_cid = self.dct_agreed_availability_cid[chosen_oracle]
+      epoch__signatures_cid = self.dct_agreement_signatures_cid[chosen_oracle]
       for epoch, agreement_table in epoch__agreed_median_table.items():
         agreement_signatures = epoch__agreement_signatures[epoch]
         epoch_is_valid = epoch__agreed_is_valid[epoch]
         agreement_cid = epoch__agreed_cid[epoch]
+        signatures_cid = epoch__signatures_cid[epoch]
         self._update_epoch_manager_with_agreed_median_table(
           epoch=epoch,
           compiled_agreed_median_table=agreement_table,
           agreement_signatures=agreement_signatures,
           epoch_is_valid=epoch_is_valid,
           agreement_cid=agreement_cid,
+          signatures_cid=signatures_cid,
           debug=self.cfg_debug_sync_full
         )
       # endfor epoch

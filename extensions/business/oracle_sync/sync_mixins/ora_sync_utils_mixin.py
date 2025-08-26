@@ -151,6 +151,7 @@ class _OraSyncUtilsMixin:
         self,
         nested_message_dict: dict,
         ignore_keys: list = None,
+        return_cids: bool = False,
         debug=True
     ):
       """
@@ -184,6 +185,7 @@ class _OraSyncUtilsMixin:
         ignore_keys = []
       # endif ignore_keys is not list
       updated_values = {}
+      cids = {}
       for key, msg_data in nested_message_dict.items():
         # 1. Check if the key is in the ignore keys.
         if key in ignore_keys:
@@ -197,12 +199,13 @@ class _OraSyncUtilsMixin:
           if res is not None and debug:
             # 4. If the retrieval was successful, store the result.
             updated_values[key] = res
+            cids[key] = msg_data
             self.P(f"Successfully retrieved data from R1FS using CID {msg_data}.")
         # endif
       # endfor key, data
       # 5. Update the nested message dictionary with the retrieved values.
       nested_message_dict.update(updated_values)
-      return nested_message_dict
+      return (nested_message_dict, cids) if return_cids else nested_message_dict
 
     def r1fs_get_pickle(self, cid: str, debug=True):
       """
@@ -671,6 +674,57 @@ class _OraSyncUtilsMixin:
         lst_unsqueezed_epoch_dictionaries.append(unsqueezed_epoch_dict)
       # end for epoch dictionary
       return lst_unsqueezed_epoch_dictionaries
+
+    def maybe_add_data_to_message(
+        self,
+        message_dict: dict,
+        data_dict: dict,
+        data_key: str,
+        data_cid: str = None,
+        debug: bool = None,
+    ):
+      """
+      Helper method for adding data to a message.
+      This will use the R1FS to add the data to the message.
+      If R1FS is not available, the data will be added directly to the message.
+
+      Parameters
+      ----------
+      message_dict : dict
+          The message dictionary to which the data should be added
+      data_dict : dict
+          The data dictionary to be added to the message
+      data_key : str
+          The key of the data in the message_dict
+      data_cid : str, optional
+          CID for data in case it is already available in the R1FS.
+      debug : bool, optional
+          Whether to print debug messages, by default None
+
+      Returns
+      -------
+      (success, newly_added), where:
+      success : bool
+          True if the data was successfully added to the message, False otherwise
+      newly_added : bool
+          True if the data was newly added to R1FS, False otherwise
+      """
+      newly_added = False
+      if data_cid is None:
+        success = self.r1fs_add_data_to_message(
+          message_dict=message_dict,
+          data_dict=data_dict,
+          data_key=data_key,
+          debug=debug,
+        )
+        newly_added = success and self.cfg_use_r1fs
+      else:
+        if self.cfg_use_r1fs:
+          message_dict[data_key] = data_cid
+        success = True
+      # endif data_cid is provided
+      return success, newly_added
+
   """END GENERIC UTILS SECTION"""
 
   """CHECKERS SECTION"""
