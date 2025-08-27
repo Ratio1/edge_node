@@ -111,17 +111,16 @@ class PentestLocalWorker(
   
   @staticmethod
   def get_worker_specific_result_fields():
-    return [
-      "start_port",
-      "end_port",
-      "ports_scanned",      
-      "nr_open_ports",
+    return {
+      "start_port" : min,
+      "end_port" : max,
+      "ports_scanned" : sum,      
       
-      "open_ports",
-      "service_info",
-      "web_tests_info",
-      "completed_tests",
-    ]
+      "open_ports" : list,
+      "service_info" : dict,
+      "web_tests_info" : dict,
+      "completed_tests" : list,
+    }
   
   
   def get_status(self, for_aggregations=False):    
