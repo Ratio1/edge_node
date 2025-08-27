@@ -73,6 +73,9 @@ ENV EE_DEBUG_R1FS=true
 # althouh this is not recommended as it should be in .env file
 # ENV EE_DEVICE=cuda:0
 
+# to avoid issues with hnswlib and building from source
+ENV HNSWLIB_NO_NATIVE=1
+
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir --no-deps naeural-core
 
