@@ -222,6 +222,7 @@ class BaseDocEmbServing(BaseServingProcess):
     """
     Backup the contexts to ensure their persistence.
     """
+    self.P(f"Backing up contexts: {list(self.__dbs.keys())}")
     self.persistence_serialization_save(
       obj={
         'contexts': list(self.__dbs.keys()),
@@ -699,6 +700,7 @@ class BaseDocEmbServing(BaseServingProcess):
       -------
 
       """
+      self.P(f"Embedding {len(texts) if isinstance(texts, list) else 1} texts...")
       if not isinstance(texts, list):
         texts = [texts]
       # endif texts is not a list
@@ -734,6 +736,7 @@ class BaseDocEmbServing(BaseServingProcess):
       context = self.__context_identifier(context)
       # endif context is None
       if context not in self.__dbs:
+        self.P(f"Creating new context: {context}")
         self.__dbs[context] = HNSWVectorDB[NaeuralDoc](
           workspace=self.__db_cache_workspace(context)
         )
@@ -747,6 +750,7 @@ class BaseDocEmbServing(BaseServingProcess):
         for i, (segment, emb) in enumerate(zip(segments, segments_embeddings))
       ]
       # TODO: maybe check for duplicates
+      self.P(f"Indexing {len(lst_docs)} documents in context '{context}'...")
       self.__dbs[context].index(inputs=DocList[NaeuralDoc](lst_docs))
       return
 
@@ -846,6 +850,7 @@ class BaseDocEmbServing(BaseServingProcess):
           query_embedding = self.embed_texts(query)
           query_doc = NaeuralDoc(text=query, embedding=query_embedding, idx=-1)
           # Search for the closest documents.
+          self.P(f"Searching for the closest {k} documents to the query in context '{context}'...")
           search_results = self.__dbs[context].search(
             inputs=DocList[NaeuralDoc]([query_doc]), limit=k
           )[0]
