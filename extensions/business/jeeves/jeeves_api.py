@@ -870,10 +870,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         # endif long term memory is not empty
       # endif retrieval for long term memory
 
-      # Check if the domain is sufficiently covered by the LLM or if it needs
-      # additional data.
-      additional_domains = self.cfg_predefined_additional_context_domains or {}
-      if domain in additional_domains or domain not in self.__domains_data:
+      # Check if the domain contains additional context.
+      contains_additional_context = self.__domains_data.get(domain, {}).get('contains_additional_context', False)
+      if not contains_additional_context:
         return None
 
       # endif domain not in additional domains
