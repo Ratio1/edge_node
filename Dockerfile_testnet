@@ -64,6 +64,8 @@ ENV EE_EVM_NET=testnet
 
 ENV EE_DEBUG_R1FS=true
 
+ENV EE_DAPP_API_URL_KEY=https://testnet-dapp-api.ratio1.ai
+
 # #### TO BE REMOVED AND TESTED !!!
 # ENV TZ=Europe/Bucharest
 # RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone

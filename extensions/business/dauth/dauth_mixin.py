@@ -179,7 +179,11 @@ class _DauthMixin(object):
     return
   
   
-  def fill_dauth_data(self, dauth_data, requester_node_address, is_node=False):
+  def fill_dauth_data(self,
+                      dauth_data,
+                      requester_node_address,
+                      is_node=False,
+                      sender_eth_address=None):
     """
     Fill the data with the authentication data.
     """
@@ -247,7 +251,17 @@ class _DauthMixin(object):
     # overwrite the predefined keys
     for key in dct_auth_predefined_keys:
       dauth_data[key] = dct_auth_predefined_keys[key]
-    
+
+    # set node tags
+    tags = self.get_node_tags(sender_eth_address=sender_eth_address)
+    if isinstance(tags, dict) and len(tags) > 0:
+      for key, value in tags.items():
+        self.P("Tag: {}={}".format(key, value))
+        if isinstance(key, str) and key.startswith(dAuthCt.DAUTH_ENV_KEYS_PREFIX):
+          dauth_data[key] = value
+
+    # end set node tags
+
     # set the supervisor flag if this is identified as an oracle
     if is_node and requester_node_address in oracles:
       dauth_data["EE_SUPERVISOR"] = True
@@ -389,7 +403,8 @@ class _DauthMixin(object):
         self.Pd("Non-critical error on request from {}: {}".format(requester, _non_critical_error))
       ### Finally we fill the data with the authentication data
       self.fill_dauth_data(
-        dauth_data=dct_dauth, requester_node_address=requester, is_node=is_requester_a_node
+        dauth_data=dct_dauth, requester_node_address=requester, is_node=is_requester_a_node,
+        sender_eth_address=requester_eth
       )
       self.P("dAuth req '{}' success for <{}> '{}' (ETH: {})".format(
         sender_nonce, short_eth, requester_alias, short_eth)
@@ -409,8 +424,40 @@ class _DauthMixin(object):
       version_check_data=version_check_data
     )
     return data
-      
-  
+
+
+  def get_node_tags(self, sender_eth_address: str):
+    tags = {}
+    try:
+      base_url = self.os_environ.get(self.const.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY)
+      self.P("Base URL for dApp API: {}".format(base_url))
+      if not base_url:
+        base_url = "https://devnet-dapp-api.ratio1.ai"
+      url = "".join([base_url, "/accounts/is-kyb"])
+      params = {
+        "walletAddress": sender_eth_address,
+      }
+      response = self.requests.get(url, params=params)
+      is_kyb = False
+      if response.status_code == 200:
+        try:
+          json = response.json()
+          is_kyb = json.get("data", False)
+        except Exception as e:
+          self.P("Error parsing JSON response: {}".format(e), color='r')
+      else:
+        self.P("Could not fetch is_kyb for wallet {}. Response status code: {}".format(
+          sender_eth_address,
+          response.status_code
+        ))
+
+      tags["EE_NODETAG_KYB"] = is_kyb
+
+    except Exception as e:
+      self.P("Error getting node tags: {}".format(e), color='r')
+    return tags
+
+
 if __name__ == '__main__':
   import json
   import os
