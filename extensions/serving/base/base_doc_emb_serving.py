@@ -4,6 +4,8 @@ from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServi
 from transformers import AutoTokenizer, AutoModel
 import re
 import pickle
+from pypdf import PdfReader
+from docx import Document
 
 from docarray import BaseDoc, DocList
 from docarray.typing import NdArray
@@ -317,6 +319,122 @@ class BaseDocEmbServing(BaseServingProcess):
         'PREDICT_KWARGS': predict_kwargs or {},
       }
 
+    """FILE EXTRACTION"""
+    if True:
+      def extract_from_txt(self, file_path: str):
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+          result = f.readlines()
+        # endwith open
+        return result
+
+      def extract_from_pdf(self, file_path: str):
+        warnings = []
+        reader = PdfReader(file_path)
+        if getattr(reader, "is_encrypted", False):
+          # Best-effort: attempt empty password; otherwise fail with a useful warning.
+          try:
+            reader.decrypt("")
+          except Exception as e:
+            warnings.append("PDF is encrypted and could not be decrypted.")
+            return ([], warnings)
+        # endif encrypted
+
+        text_chunks = []
+        for page in reader.pages:
+          try:
+            t = page.extract_text() or ""
+            if t is not None and len(t.strip()) > 0:
+              text_chunks.append(t)
+          except Exception as e:
+            # Continue best-effort if one page fails
+            warnings.append(f"Failed to extract text from a PDF page due to: {e}")
+            continue
+        # endfor each page
+
+        total_texts_len = sum(len(t.strip()) if isinstance(t, str) else 0 for t in text_chunks)
+        if total_texts_len == 0:
+          warnings.append("No selectable text found in PDF (it may be scanned images).")
+        return text_chunks, warnings
+
+      def extract_from_docx(self, file_path: str):
+        doc = Document(file_path)
+        # Join paragraph text; tables/runs could be added if you need richer extraction
+        return [
+          p.text
+          for p in doc.paragraphs if p.text is not None and len(p.text.strip()) > 0
+        ]
+    """END FILE EXTRACTION"""
+
+    def maybe_merge_lines(
+        self,
+        documents: list[str],
+        document_max_length: int = MAX_SEGMENT_SIZE,
+    ):
+      """
+      Merge lines that are too short into a single line.
+      Parameters
+      ----------
+      documents : list[str] - the list of documents
+
+      Returns
+      -------
+
+      """
+      if not isinstance(documents, list) or len(documents) == 0:
+        return documents
+      # endif documents is not a list or is empty
+      merged_documents = []
+      current_doc = ""
+      for doc in documents:
+        if not isinstance(doc, str):
+          continue
+        # endif doc is not a string
+        doc = doc.strip()
+        if len(doc) == 0:
+          continue
+        # endif doc is empty
+        if (len(current_doc) + len(doc) + 1) <= document_max_length:
+          if len(current_doc) > 0:
+            current_doc += "\n" + doc
+          else:
+            current_doc = doc
+          # endif current_doc is not empty
+        else:
+          if len(current_doc) > 0:
+            merged_documents.append(current_doc)
+            current_doc = ""
+          # endif current_doc is not empty
+          merged_documents.append(doc)
+        # endif doc is short or long
+      # endfor each document
+      if len(current_doc) > 0:
+        merged_documents.append(current_doc)
+      # endif current_doc is not empty after the loop
+      return merged_documents
+
+    def retrieve_documents_from_path(self, documents_path: str):
+      path_ext = self.os_path.splitext(documents_path)[1].lower()
+      documents = None
+      try:
+        if path_ext == '.pkl':
+          with open(documents_path, 'rb') as f:
+            documents_data = pickle.load(f)
+            documents = documents_data.get(DocEmbCt.DOCUMENTS, [])
+          # endwith open documents_path
+        elif path_ext == '.txt':
+          documents = self.extract_from_txt(documents_path)
+        elif path_ext == '.pdf':
+          documents, warnings = self.extract_from_pdf(documents_path)
+        elif path_ext in ['.docx', '.docs']:
+          documents = self.extract_from_docx(documents_path)
+        # endif supported extension
+        documents = self.maybe_merge_lines(documents)
+        documents_str = "\n".join(documents)[:100]
+        self.P(f"Extracted {len(documents)} documents from {documents_path}. Sample:\n{documents_str}", color='g')
+      except Exception as e:
+        self.P(f"Error reading documents from {documents_path}: {e}", color='r')
+      return documents
+
     """VALIDATION OF REQUESTS"""
     if True:
       def doc_embedding_valid_docs(self, documents: list[str]):
@@ -402,10 +520,7 @@ class BaseDocEmbServing(BaseServingProcess):
                          f"Received {documents_cid}.")
               is_bad_request = True
             else:
-              with open(documents_path, 'rb') as f:
-                documents_data = pickle.load(f)
-                documents = documents_data.get(DocEmbCt.DOCUMENTS, [])
-              # endwith open documents_path
+              documents = self.retrieve_documents_from_path(documents_path)
               is_bad_request, processed_request_params, err_msg = self.doc_embedding_valid_docs(
                 documents=documents,
               )

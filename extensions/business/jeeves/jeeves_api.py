@@ -1,12 +1,15 @@
-import os.path
-
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 from naeural_core.business.mixins_libs.network_processor_mixin import _NetworkProcessorMixin
 from constants import JeevesCt
 
+import os
+import shutil
+import base64
 
 _CONFIG = {
   **BasePlugin.CONFIG,
+
+  "MAX_INPUTS_QUEUE_SIZE": 100,
 
   'PORT': 15033,
   'ASSETS': 'extensions/business/fastapi/jeeves_api',
@@ -15,7 +18,7 @@ _CONFIG = {
   'R1FS_SLEEP_PERIOD': 5,
   "SAVE_PERIOD": 60 * 5,  # seconds
 
-  'SHORT_TERM_MEMORY_SIZE': 10,
+  'SHORT_TERM_MEMORY_SIZE': 20,
 
   # !! ONLY FOR TESTING PURPOSES !!
   'SKIP_R1FS_WARMUP': False,
@@ -41,6 +44,7 @@ _CONFIG = {
   'PREDEFINED_USER_TOKENS': [],
 
   "DEFAULT_SYSTEM_PROMPT": JeevesCt.DEFAULT_SYSTEM_PROMPT,
+  "DEFAULT_ASSISTANT_SYSTEM_PROMPT": JeevesCt.GENERAL_ASSISTANT_SYSTEM_PROMPT,
 
   "JINJA_ARGS": {
     # Done in order for this API to not have user interface.
@@ -73,6 +77,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
 
   def get_predefined_user_tokens(self):
     return self.cfg_predefined_user_tokens or []
+
+  def get_supported_file_extensions(self):
+    return JeevesCt.SUPPORTED_FILE_TYPES
 
   def on_init(self):
     super(JeevesApiPlugin, self).on_init()
@@ -241,6 +248,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     Print debug message.
     """
     if self.cfg_debug_logs:
+      msg = f"[DEBUG] {msg}"
       self.P(msg, *args, **kwargs)
     return
 
@@ -327,7 +335,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       If the request is not ready, it is further postponed.
       """
       if request_id in self.__requests:
-        self.Pd(f"Checking request {request_id}...", color="yellow")
+        self.Pd(f"Checking request '{request_id}'...", color="yellow")
         request = self.__requests[request_id]
         start_time = request['start_time']
         timeout = request['timeout']
@@ -387,7 +395,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     def add_documents(
         self,
         context_id: str,
-        documents: list[str],
+        documents: list[str] = None,
         documents_cid: str = ""
     ):
       """
@@ -401,12 +409,20 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       documents : list[str]
           List of documents to add to the context. Each document should be a string.
           The documents will be added to the context of the user with the given token.
+          If no documents are provided, the documents_cid must be provided.
 
+      documents_cid : str
+          The CID of the documents to add to the context. If not provided,
+          the documents will be added to IPFS and the CID will be used.
       Returns
       -------
 
       """
       if len(documents_cid) == 0:
+        if documents is None:
+          return {
+            'error': 'Either documents or documents_cid must be provided',
+          }
         documents_cid = self.r1fs.add_pickle(
           data={
             'DOCUMENTS': documents,
@@ -427,11 +443,141 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       )
       return self.solve_postponed_request(request_id=request_id)
 
+    def upload_document_helper(
+        self,
+        file_base64: str = None,
+        filename: str = None,
+        file_path: str = None,
+        body: dict = None,
+    ):
+      # 1. Retrieve and validate user_token and domain from body
+      user_token = body.get('user_token')
+      domain = body.get('domain')
+      if not self.verify_user_token(user_token):
+        return self.invalid_token_response()
+      # endif user token is valid
+      if not isinstance(domain, str) or len(domain) == 0:
+        return {
+          'error': 'Domain must be provided and must be a non-empty string.'
+        }
+      # endif domain is valid
+
+      # 2. Validate file input method
+      new_file_path_dir = self.os_path.join(
+        self.get_output_folder(), 'j33ves_uploads',
+        self.get_signature(), domain
+      )
+      os.makedirs(new_file_path_dir, exist_ok=True)
+      file_content, file_real_path = None, None
+      if file_base64 is None and filename is None and file_path is not None:
+        file_real_path = file_path
+      elif file_base64 is not None and filename is not None and file_path is None:
+        file_real_path = self.os_path.join(new_file_path_dir, filename)
+        file_content = file_base64
+      else:
+        return {
+          'error': 'Either file_base64 and filename or file_path must be provided, but not both and not none.'
+        }
+      # endif file input method
+
+      # 3. Check file extension
+      file_ext = self.os_path.splitext(file_real_path)[1].lower()
+      supported_exts = self.get_supported_file_extensions()
+      if file_ext not in supported_exts:
+        return {
+          'error': f"File extension '{file_ext}' not supported. Supported extensions are: {', '.join(supported_exts)}."
+        }
+      # endif file extension is supported
+
+      # 4. Save the file (or copy it if file_path was provided since it is a temp file)
+      if file_content is not None:
+        # The file content is provided as base64 string.
+        try:
+          file_bytes = base64.b64decode(file_content, validate=True)
+        except Exception as e:
+          return {
+            'error': f"Failed to decode base64 file content: {str(e)}"
+          }
+        # Save decoded content to file
+        with open(file_real_path, 'wb') as f:
+          f.write(file_bytes)
+      else:
+        # The temporary file will be copied to a new location, as the
+        # temporary file will be deleted after the request is finished.
+        filename = file_real_path.split(self.os_path.sep)[-1]
+        new_file_path = self.os_path.join(new_file_path_dir, filename)
+        shutil.copy2(file_real_path, new_file_path)
+        file_real_path = new_file_path
+      # endif file content is provided
+
+      # 5. Add the file to R1FS and get the CID
+      file_cid = self.r1fs.add_file(
+        file_path=file_real_path,
+        secret=domain
+      )
+      return self.add_documents_for_domain(
+        user_token=user_token,
+        domain=domain,
+        documents_cid=file_cid,
+      )
+
+    @BasePlugin.endpoint(method="post")
+    def upload_document_for_domain_base64(
+        self,
+        file_base64: str,
+        filename: str,
+        body: dict = None,
+    ):
+      """
+      Upload a document to the RAG agents' context for a specific user.
+      Same as upload_document_for_domain, but the file is provided as a base64 string.
+      Parameters
+      ----------
+      file_base64 : str
+          The file to upload as a base64 string.
+      filename : str
+          The name of the file to upload.
+      body : dict
+          The body of the request. Should contain the user_token and domain.
+
+      Returns
+      -------
+
+      """
+      return self.upload_document_helper(
+        file_base64=file_base64,
+        filename=filename,
+        body=body,
+      )
+
+    @BasePlugin.endpoint(method="post", streaming_type="upload")
+    def upload_document_for_domain(
+        self,
+        file_path: str,
+        body: dict = None,
+    ):
+      """
+      Upload a document to the RAG agents' context for a specific user.
+      Parameters
+      ----------
+      file_path : str
+          The path to the file to upload.
+      body : dict
+          The body of the request. Should contain the user_token and domain.
+      Returns
+      -------
+
+      """
+      return self.upload_document_helper(
+        file_path=file_path,
+        body=body,
+      )
+
     @BasePlugin.endpoint(method='post')
     def add_documents_for_user(
         self,
         user_token: str,
-        documents: list[str],
+        documents: list[str] = None,
         documents_cid: str = ""
     ):
       """
@@ -443,7 +589,10 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       documents : list[str]
           List of documents to add to the context. Each document should be a string.
           The documents will be added to the context of the user with the given token.
-
+          If no documents are provided, the documents_cid must be provided.
+      documents_cid : str
+          The CID of the documents to add to the context. If not provided,
+          the documents will be added to IPFS and the CID will be used.
       Returns
       -------
 
@@ -462,7 +611,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self,
         user_token: str,
         domain: str,
-        documents: list[str],
+        documents: list[str] = None,
         documents_cid: str = ""
     ):
       """
@@ -481,6 +630,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           List of documents to add to the context. Each document should be a string.
           The documents will be added to the context of the user with the given token.
 
+      documents_cid : str
+          The CID of the documents to add to the context. If not provided,
+          the documents will be added to IPFS and the CID will be used.
       Returns
       -------
 
@@ -492,8 +644,11 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       if domain in self.__domains_data:
         self.__domains_data[domain]['contains_additional_context'] = True
       else:
+        # New domains will use the general assistant system prompt.
+        domain_prompt = self.cfg_default_assistant_system_prompt
         self.maybe_create_domain(
           domain_name=domain,
+          domain_prompt=domain_prompt,
           user_token=user_token,
           contains_additional_context=True,
         )
@@ -718,7 +873,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       # Check if the domain is sufficiently covered by the LLM or if it needs
       # additional data.
       additional_domains = self.cfg_predefined_additional_context_domains or {}
-      if domain not in additional_domains:
+      if domain in additional_domains or domain not in self.__domains_data:
         return None
 
       # endif domain not in additional domains
@@ -859,7 +1014,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         # This is a path to a file.
         # Remove the "file://" prefix.
         domain_prompt = domain_prompt[7:]  # Remove "file://"
-        if os.path.exists(domain_prompt):
+        if self.os_path.exists(domain_prompt):
           if self.is_path_safe(domain_prompt):
             with open(domain_prompt, 'r', encoding='utf-8') as f:
               domain_prompt = f.read()
@@ -967,9 +1122,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       if not self.verify_user_token(user_token):
         return self.invalid_token_response()
       # endif user token is valid
-      if message is None:
+      if not isinstance(message, str):
         return {
-          'error': 'Message not provided',
+          'error': 'Message not provided as string',
           'status': 'error',
         }
       # endif message is None
@@ -1114,9 +1269,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       if not self.verify_user_token(user_token):
         return self.invalid_token_response()
       # endif user token is valid
-      if message is None:
+      if not isinstance(message, str):
         return {
-          'error': 'Message not provided',
+          'error': 'Message not provided as string',
           'status': 'error',
         }
       # endif message is None
@@ -1155,9 +1310,24 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       # Check if the request needs 
       if postponed_request is not None:
         return postponed_request
-      # endif request_id is not None
+      # endif postponed_request is not None
       
       # TODO: add domain additional data retrieval
+      postponed_request = self.maybe_retrieve_domain_additional_data(
+        domain=domain,
+        query=message,
+        next_request_params={
+          'user_token': user_token,
+          'messages': messages,
+          'keep_conversation_history': True,
+          'use_long_term_memory': use_long_term_memory,
+          **validated_kwargs,
+        },
+        user_token=user_token
+      )
+      if postponed_request is not None:
+        return postponed_request
+      # endif postponed_request is not None
       
       request_id = self.register_chat_request(
         messages=messages,

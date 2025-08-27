@@ -1203,7 +1203,7 @@ class _OraSyncUtilsMixin:
       # in the is_participating dictionary, only oracles that were seen
       # as full online are marked as True
       if not self.is_participating.get(sender, False):
-        self.P(f"Oracle {sender} should not have sent median {median}. ignoring...", color='r')
+        self.P(f"Oracle {sender} should not have sent median! Ignoring...", color='r')
         return False
 
       if median is None:

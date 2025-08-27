@@ -697,6 +697,9 @@ class BaseLlmServing(
     # ── 3. Nothing found → give back the original string
     return text
 
+  def remove_sql_comments(self, text: str):
+    return "\n".join(re.sub(r"--.*$", "", ln) for ln in text.splitlines())
+
   def maybe_process_text(self, text: str, process_method: str):
     """
     Process the text based on the process method.
@@ -715,7 +718,9 @@ class BaseLlmServing(
       return text
 
     if process_method == 'sql':
-      return self.extract_sql(text)
+      extracted_sql = self.extract_sql(text)
+      # TODO: remove this or move to api
+      text = self.remove_sql_comments(extracted_sql)
     return text
 
   def _predict(self, preprocessed_batch):

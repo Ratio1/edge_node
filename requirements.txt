@@ -18,3 +18,5 @@ ngrok
 
 openai
 sqlfluff
+pypdf
+python-docx
