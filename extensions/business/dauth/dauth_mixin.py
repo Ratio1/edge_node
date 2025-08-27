@@ -451,7 +451,7 @@ class _DauthMixin(object):
           response.status_code
         ))
 
-      tags["EE_NODETAG_KYB"] = is_kyb
+      tags[self.const.BASE_CT.dAuth.EvmNetData.EE_NODETAG_KYB] = is_kyb
 
     except Exception as e:
       self.P("Error getting node tags: {}".format(e), color='r')
