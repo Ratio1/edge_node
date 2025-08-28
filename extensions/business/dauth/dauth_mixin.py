@@ -431,8 +431,6 @@ class _DauthMixin(object):
     try:
       base_url = self.bc.get_network_data().get(self.const.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY)
       self.P("Base URL for dApp API: {}".format(base_url))
-      if not base_url:
-        base_url = "https://devnet-dapp-api.ratio1.ai"
       url = "".join([base_url, "/accounts/is-kyb"])
       params = {
         "walletAddress": sender_eth_address,
