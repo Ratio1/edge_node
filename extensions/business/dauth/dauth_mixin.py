@@ -256,7 +256,6 @@ class _DauthMixin(object):
     tags = self.get_node_tags(sender_eth_address=sender_eth_address)
     if isinstance(tags, dict) and len(tags) > 0:
       for key, value in tags.items():
-        self.P("Tag: {}={}".format(key, value))
         if isinstance(key, str) and key.startswith(dAuthCt.DAUTH_ENV_KEYS_PREFIX):
           dauth_data[key] = value
 
