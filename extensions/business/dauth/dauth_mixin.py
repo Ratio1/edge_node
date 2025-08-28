@@ -429,7 +429,9 @@ class _DauthMixin(object):
   def get_node_tags(self, sender_eth_address: str):
     tags = {}
     try:
-      base_url = self.os_environ.get(self.const.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY)
+
+      network = self.bc.evm_network
+      base_url = self.bc.get_network_data(network=network).get(self.const.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY)
       self.P("Base URL for dApp API: {}".format(base_url))
       if not base_url:
         base_url = "https://devnet-dapp-api.ratio1.ai"
