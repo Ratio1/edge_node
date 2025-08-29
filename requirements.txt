@@ -8,7 +8,7 @@ accelerate==0.30.1
 bitsandbytes==0.43.1
 #
 kmonitor 
-ratio1 
+#ratio1
 decentra-vision 
 python-telegram-bot[rate-limiter]
 protobuf==5.28.3

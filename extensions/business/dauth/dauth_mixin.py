@@ -253,7 +253,7 @@ class _DauthMixin(object):
       dauth_data[key] = dct_auth_predefined_keys[key]
 
     # set node tags
-    tags = self.get_node_tags(get_node_tags=sender_eth_address)
+    tags = self.fetch_node_tags(node_address=sender_eth_address)
     if isinstance(tags, dict) and len(tags) > 0:
       for key, value in tags.items():
         if isinstance(key, str) and key.startswith(dAuthCt.DAUTH_ENV_KEYS_PREFIX):
@@ -423,25 +423,6 @@ class _DauthMixin(object):
       version_check_data=version_check_data
     )
     return data
-
-  def get_node_tags(self, node_address):
-    """Get all available node tags for a given address"""
-    tags = {}
-
-    # Get all methods that follow the pattern get_ee_nodetag_{tag_name}
-    for method_name in dir(self):
-      if method_name.startswith('get_ee_nodetag_'):
-        self.P("Getting tag using method: {}".format(method_name), color='g')
-        tag_name = method_name.replace('get_', '').upper()
-        method = getattr(self, method_name)
-        if callable(method):
-          try:
-            tag_constant, tag_value = method(node_address)
-            tags[tag_constant] = tag_value
-          except Exception as e:
-            self.P(f"Error getting tag {tag_name}: {e}", color='r')
-
-    return tags
 
 
 if __name__ == '__main__':

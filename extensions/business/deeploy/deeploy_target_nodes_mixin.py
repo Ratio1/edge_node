@@ -222,6 +222,7 @@ class _DeeployTargetNodesMixin:
     node_req_cpu = node_res_req.get(DEEPLOY_RESOURCES.CPU)
     node_req_memory = node_res_req.get(DEEPLOY_RESOURCES.MEMORY)
     node_req_memory_bytes = self._parse_memory(node_req_memory)
+    job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
 
     suitable_nodes_with_resources = {}
     for addr in nodes:
@@ -232,6 +233,19 @@ class _DeeployTargetNodesMixin:
           self.Pd(f"Node {addr} does not support the requested plugin {inputs.plugin_signature}. Skipping...")
           continue
 
+      if len(job_tags) > 0:
+        skip_node = False
+        for tag in job_tags:
+          self.P(f"Checking if node {addr} has the tag {tag}...")
+          # Check if node has the required tag
+          if not self.netmon.network_node_has_tag(addr, tag):
+            self.Pd(f"Node {addr} does not have the tag {tag}. Skipping...")
+            skip_node = True
+            break
+        if skip_node:
+          continue
+
+      self.Pd(f"Node {addr} cont in function.")
       total_cpu = self.netmon.network_node_total_cpu_cores(addr)
 
       total_memory = self.netmon.network_node_total_mem(addr)
@@ -260,9 +274,9 @@ class _DeeployTargetNodesMixin:
   def _find_nodes_for_deeployment(self, inputs):
     # Get required resources from the request
     required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+    target_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, None)
 
-
-    if not inputs.target_nodes_count:
+    if not target_nodes_count:
       msg = f"{DEEPLOY_ERRORS.NODES3}: Nodes count was not provided!"
       raise ValueError(msg)
 
