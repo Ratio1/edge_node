@@ -253,7 +253,7 @@ class _DauthMixin(object):
       dauth_data[key] = dct_auth_predefined_keys[key]
 
     # set node tags
-    tags = self.get_node_tags(sender_eth_address=sender_eth_address)
+    tags = self.get_node_tags(get_node_tags=sender_eth_address)
     if isinstance(tags, dict) and len(tags) > 0:
       for key, value in tags.items():
         if isinstance(key, str) and key.startswith(dAuthCt.DAUTH_ENV_KEYS_PREFIX):
@@ -424,33 +424,23 @@ class _DauthMixin(object):
     )
     return data
 
-
-  def get_node_tags(self, sender_eth_address: str):
+  def get_node_tags(self, node_address):
+    """Get all available node tags for a given address"""
     tags = {}
-    try:
-      base_url = self.bc.get_network_data().get(self.const.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY)
-      url = "".join([base_url, "/accounts/is-kyb"])
-      params = {
-        "walletAddress": sender_eth_address,
-      }
-      response = self.requests.get(url, params=params)
-      is_kyb = False
-      if response.status_code == 200:
-        try:
-          json = response.json()
-          is_kyb = json.get("data", False)
-        except Exception as e:
-          self.P("Error parsing JSON response: {}".format(e), color='r')
-      else:
-        self.P("Could not fetch is_kyb for wallet {}. Response status code: {}".format(
-          sender_eth_address,
-          response.status_code
-        ))
 
-      tags[self.const.BASE_CT.dAuth.EvmNetData.EE_NODETAG_KYB] = is_kyb
+    # Get all methods that follow the pattern get_ee_nodetag_{tag_name}
+    for method_name in dir(self):
+      if method_name.startswith('get_ee_nodetag_'):
+        self.P("Getting tag using method: {}".format(method_name), color='g')
+        tag_name = method_name.replace('get_', '').upper()
+        method = getattr(self, method_name)
+        if callable(method):
+          try:
+            tag_constant, tag_value = method(node_address)
+            tags[tag_constant] = tag_value
+          except Exception as e:
+            self.P(f"Error getting tag {tag_name}: {e}", color='r')
 
-    except Exception as e:
-      self.P("Error getting node tags: {}".format(e), color='r')
     return tags
 
 
