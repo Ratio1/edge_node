@@ -65,7 +65,13 @@ ENV EE_EVM_NET=devnet
 # althouh this is not recommended as it should be in .env file
 # ENV EE_DEVICE=cuda:0
 
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir --no-deps --upgrade naeural_core
+RUN pip install -r requirements.txt
+#RUN pip install  --no-deps naeural-core
+
+COPY ./ratio1_sdk .
+RUN pip install -e ratio1_sdk
+
+COPY ./naeural_core .
+RUN pip install -e naeural_core
 
 CMD ["python3","device.py"]

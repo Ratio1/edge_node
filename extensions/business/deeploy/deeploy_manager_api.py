@@ -143,32 +143,33 @@ class DeeployManagerApiPlugin(
     Parameters
     ----------
     
-    app_alias : str
+    request: dict containing next fields:
+      app_alias : str
         The name (alias) of the app to create
-        
-    plugin_signature : str
-        The signature of the plugin to use
-        
-    target_nodes : list[str]
-        The nodes to create the app on
-        
-    target_nodes_count : int
-        The number of nodes to create the app on
-        
-    nonce : str
-        The nonce used for signing the request
-        
-    app_params : dict
-        The parameters to pass to the app such as:
-          
-          app_params.IMAGE : str
-              The image to use for the app
-          app_params.REGISTRY : str 
-              The registry to use for the app
-          app_params.USERNAME : str 
-              The username to use for the app
-          app_params.PASSWORD : str 
-          
+
+      plugin_signature : str
+          The signature of the plugin to use
+
+      target_nodes : list[str]
+          The nodes to create the app on
+
+      target_nodes_count : int
+          The number of nodes to create the app on
+
+      nonce : str
+          The nonce used for signing the request
+
+      app_params : dict
+          The parameters to pass to the app such as:
+
+            app_params.IMAGE : str
+                The image to use for the app
+            app_params.REGISTRY : str
+                The registry to use for the app
+            app_params.USERNAME : str
+                The username to use for the app
+            app_params.PASSWORD : str
+
           
     TODO: (Vitalii)
       - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
