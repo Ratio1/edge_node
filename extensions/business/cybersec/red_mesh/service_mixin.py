@@ -17,7 +17,7 @@ class _ServiceInfoMixin:
         url = f"{scheme}://{target}"
         if port not in (80, 443):
           url = f"{scheme}://{target}:{port}"
-        self.logger(f"[{target}] Fetching {url} for banner...")
+        self.P("Fetching {url} for banner...")
         resp = requests.get(url, timeout=3, verify=False)
         info = (f"HTTP {resp.status_code} {resp.reason}; Server: {resp.headers.get('Server')}")
     except Exception as e:
@@ -50,7 +50,7 @@ class _ServiceInfoMixin:
     try:
       if port in (443,):
         url = f"https://{target}"
-        self.logger(f"[{target}] Fetching {url} for banner...")
+        self.P("Fetching {url} for banner...")
         resp = requests.get(url, timeout=3, verify=False)
         info = (f"HTTPS {resp.status_code} {resp.reason}; Server: {resp.headers.get('Server')}")
     except Exception as e:

@@ -22,8 +22,9 @@ class LlmTokenizerMixin(object):
     str
         the request with context
     """
+    # TODO: adapt this to support dictionary context items
     formatted_context = "\n\n".join(
-      f"## Context {i + 1}:\n{segment.strip()}"
+      f"<context_{i + 1}>:\n{segment.strip()}\n</context_{i + 1}>"
       for i, segment in enumerate(context)
       if isinstance(segment, str)
     )
@@ -109,8 +110,10 @@ class LlmTokenizerMixin(object):
 
     self.P(f"Processing chat:\n{chat}")
 
+    date_string = self.datetime.now(self.timezone.utc).date().isoformat()
     from_template = self.tokenizer.apply_chat_template(
       chat, tokenize=False,
-      add_generation_prompt=self.cfg_add_generation_prompt
+      add_generation_prompt=self.cfg_add_generation_prompt,
+      date_string=date_string
     )
     return from_template

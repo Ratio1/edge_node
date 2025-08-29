@@ -93,6 +93,7 @@ _CONFIG = {
 
   # This flag will be enabled after further testing of R1FS.
   "USE_R1FS": ORACLE_SYNC_USE_R1FS,
+  "USE_R1FS_DURING_CONSENSUS": False,
 
   'EPOCH_START_SYNC': 0,
   # TODO: disable this flag in the future after further testing
@@ -466,6 +467,7 @@ class OracleSync01Plugin(
     self.dct_agreed_availability_signatures = {}
     self.dct_agreed_availability_is_valid = {}
     self.dct_agreed_availability_cid = {}
+    self.dct_agreement_signatures_cid = {}
 
     self._last_epoch_synced = self.netmon.epoch_manager.get_last_sync_epoch()
     self.first_time_request_agreed_median_table_sent = None
