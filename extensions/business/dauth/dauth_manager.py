@@ -20,7 +20,7 @@ WHITELIST (oracles)
 
 
 """
-
+from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from extensions.business.dauth.dauth_mixin import _DauthMixin
 
@@ -78,6 +78,7 @@ _CONFIG = {
 class DauthManagerPlugin(
   BasePlugin,
   _DauthMixin,
+  _NodeTagsMixin
   ):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
