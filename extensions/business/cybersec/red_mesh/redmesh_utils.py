@@ -47,13 +47,16 @@ class PentestLocalWorker(
     target, 
     job_id : str,
     initiator : str, 
+    local_id_prefix : str,
     worker_target_ports=COMMON_PORTS,
     exceptions=[],
   ):
     self.target = target
     self.job_id = job_id
     self.initiator = initiator
-    self.local_worker_id = "RM-" + str(uuid.uuid4())[:4]
+    self.local_worker_id = "RM-{}-{}".format(
+      local_id_prefix, str(uuid.uuid4())[:4]
+    )
     self.owner = owner
 
     # port handling
