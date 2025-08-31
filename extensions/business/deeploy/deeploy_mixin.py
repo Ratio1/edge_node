@@ -275,8 +275,10 @@ class _DeeployMixin:
         raise ValueError(f"{DEEPLOY_ERRORS.NODETAGS2}. Invalid tag in job_tags: {tag}. All tags must be strings.")
 
       # Validate tag against allowed tags
-      if tag not in ct.HB.ALLOWED_NODE_TAGS:
-        raise ValueError(f"{DEEPLOY_ERRORS.NODETAGS3}. Invalid tag '{tag}' in job_tags. Allowed tags: {ct.HB.ALLOWED_NODE_TAGS}")
+      allowed_tags = self.get_allowed_node_tags_list()
+
+      if tag not in allowed_tags:
+        raise ValueError(f"{DEEPLOY_ERRORS.NODETAGS3}. Invalid tag '{tag}' in job_tags. Allowed tags: {allowed_tags}")
 
     if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
       # Check that image and container resources are
