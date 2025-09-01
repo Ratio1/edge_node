@@ -234,11 +234,14 @@ class _DeeployTargetNodesMixin:
           continue
 
       if len(job_tags) > 0:
+        # TODO: update the processing to work well with the new structure
+        node_tags = self.netmon.get_network_node_tags(addr)
+        self.P(f"Node {addr} tags: {self.json_dumps(node_tags)}")
         skip_node = False
         for tag in job_tags:
           self.P(f"Checking if node {addr} has the tag {tag}...")
           # Check if node has the required tag
-          if not self.netmon.network_node_has_tag(addr, tag):
+          if tag not in node_tags or node_tags.get(tag):
             self.Pd(f"Node {addr} does not have the tag {tag}. Skipping...")
             skip_node = True
             break

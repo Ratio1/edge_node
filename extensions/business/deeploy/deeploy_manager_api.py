@@ -161,6 +161,11 @@ class DeeployManagerApiPlugin(
       nonce : str
           The nonce used for signing the request
 
+      job_tags: list
+          Tags and their expected values that the target nodes must have
+        Example: ["KYB","DC:HOSTINGER", "CT:FR|IT|RO", "REG:EU"]
+
+
       app_params : dict
           The parameters to pass to the app such as:
 

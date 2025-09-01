@@ -25,7 +25,7 @@ class _NodeTagsMixin(object):
 
     # Get all methods that follow the pattern get_ee_nodetag_{tag_name}
     for method_name in dir(self):
-      if method_name.startswith('get_ee_nodetag_'):
+      if method_name.startswith(f"get_{ct.HB.PREFIX_EE_NODETAG}"):
         tag_name = method_name.replace('get_', '').upper()
         method = getattr(self, method_name)
         if callable(method):
@@ -36,7 +36,7 @@ class _NodeTagsMixin(object):
             self.P(f"Error getting tag {tag_name}: {e}", color='r')
     return tags
 
-  def get_ee_nodetag_kyb(self, node_address):
+  def get_ee_nt_is_kyb(self, node_address):
     """
     Get the EE_NODETAG_KYB tag for node_address.
     Returns tag_value.
@@ -62,3 +62,22 @@ class _NodeTagsMixin(object):
       ))
 
     return is_kyb
+
+
+  def get_ee_nt_dc(self, node_address):
+    """
+    Get the EE_NODETAG_DATACENTER tag for node_address.
+    Returns tag_value.
+    """
+    # mock for now, as no backend endpoint exists
+
+    is_datacenter = False
+    if node_address in ["0x9BE4D2D6F920Fe9aaD921261063Ee3d347acc5ff"]:
+      is_datacenter = True
+    else:
+      self.P("Could not fetch is_datacenter for wallet {}. Response status code:".format(
+        node_address
+      ))
+
+    return is_datacenter
+
