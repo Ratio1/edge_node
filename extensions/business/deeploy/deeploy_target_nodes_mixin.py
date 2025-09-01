@@ -211,6 +211,38 @@ class _DeeployTargetNodesMixin:
     return suitable_nodes
 
 
+  def __check_node_has_tags(self, node_addr, required_tags):
+    """
+    Check if the node has the required tags.
+    Args:
+        node_addr (str): Node address
+        required_tags (list): List of required tags
+    Returns:
+        bool: True if the node has all required tags, False otherwise
+    """
+    node_tags = self.netmon.get_network_node_tags(node_addr)
+
+    self.Pd(f"Node {node_addr} tags: {self.json_dumps(node_tags)}")
+    self.Pd(f"Required tags: {self.json_dumps(required_tags)}")
+
+    for required_tag in required_tags:
+      if isinstance(required_tag, str):
+        rtag_opts = [required_tag.upper().replace('*', '')]
+      elif isinstance(required_tag, list):
+        rtag_opts = [x.upper().replace('*', '') for x in required_tag]
+      found = False
+      for node_tag in node_tags:
+        for rt in rtag_opts:
+          if node_tag in rt:
+            found = True
+            break
+        if found:
+          break
+      if not found:
+        return False
+    return True
+
+
   def __check_nodes_capabilities_and_extract_resources(self, nodes: list['str'], inputs):
     """
     Check if the nodes have required resources for the deeployment and if it supports the requested plugin.
@@ -234,18 +266,9 @@ class _DeeployTargetNodesMixin:
           continue
 
       if len(job_tags) > 0:
-        # TODO: update the processing to work well with the new structure
-        node_tags = self.netmon.get_network_node_tags(addr)
-        self.P(f"Node {addr} tags: {self.json_dumps(node_tags)}")
-        skip_node = False
-        for tag in job_tags:
-          self.P(f"Checking if node {addr} has the tag {tag}...")
-          # Check if node has the required tag
-          if tag not in node_tags or node_tags.get(tag):
-            self.Pd(f"Node {addr} does not have the tag {tag}. Skipping...")
-            skip_node = True
-            break
-        if skip_node:
+        node_has_required_tags = self.__check_node_has_tags(node_addr=addr, required_tags=job_tags)
+        if not node_has_required_tags:
+          self.Pd(f"Node {addr} does not have the required tags. Skipping...")
           continue
 
       self.Pd(f"Node {addr} cont in function.")

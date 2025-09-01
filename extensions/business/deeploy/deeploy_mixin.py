@@ -265,21 +265,6 @@ class _DeeployMixin:
     if not inputs.plugin_signature or inputs.plugin_signature == "":
       raise ValueError(f"{DEEPLOY_ERRORS.REQUEST3}. Plugin signature not provided.")
 
-    # Validate job tags if provided
-    job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
-    if not isinstance(job_tags, list):
-      raise ValueError(f"{DEEPLOY_ERRORS.NODETAGS1}. Job tags must be a list.")
-
-    for tag in job_tags:
-      if not isinstance(tag, str):
-        raise ValueError(f"{DEEPLOY_ERRORS.NODETAGS2}. Invalid tag in job_tags: {tag}. All tags must be strings.")
-
-      # Validate tag against allowed tags
-      allowed_tags = self.get_allowed_node_tags_list()
-
-      if tag not in allowed_tags:
-        raise ValueError(f"{DEEPLOY_ERRORS.NODETAGS3}. Invalid tag '{tag}' in job_tags. Allowed tags: {allowed_tags}")
-
     if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE:
       # Check that image and container resources are
       app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, None)
