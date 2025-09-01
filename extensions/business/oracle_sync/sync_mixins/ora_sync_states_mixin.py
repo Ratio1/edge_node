@@ -1194,6 +1194,155 @@ class _OraSyncStatesCallbacksMixin:
 
   """S8_SEND_REQUEST_AGREED_MEDIAN_TABLE CALLBACKS"""
   if True:
+    def handle_received_agreed_median_table(self, dct_message: dict):
+      success = False
+      sender = dct_message.get(self.ct.PAYLOAD_DATA.EE_SENDER)
+      oracle_data = dct_message.get('ORACLE_DATA')
+
+      if not self._check_received_epoch__agreed_median_table_ok(sender, oracle_data):
+        return success
+
+      # Here, both the agreed median table and the agreement signatures should have the same keys,
+      # but as string instead of int. We also know that in epoch_keys we have
+      # the keys in int format. Thus, we need to convert the keys of the received tables
+      dct_epoch_agreed_median_table = oracle_data[OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE]
+      agreement_success, dct_epoch_agreed_median_table, dct_epoch_agreement_cid = self.r1fs_get_data_from_nested_message(
+        nested_message_dict=dct_epoch_agreed_median_table,
+        return_cids=True,
+      )
+      if not agreement_success:
+        if self.cfg_debug_sync:
+          self.P(f"Failed to download agreed median table from R1FS for oracle {sender}. Ignoring", color='r')
+        return success
+      # endif not agreement_success
+      dct_epoch_agreement_signatures = oracle_data[OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES]
+      signatures_success, dct_epoch_agreement_signatures, dct_epoch_signatures_cid = self.r1fs_get_data_from_nested_message(
+        nested_message_dict=dct_epoch_agreement_signatures,
+        return_cids=True,
+      )
+      if not signatures_success:
+        if self.cfg_debug_sync:
+          self.P(f"Failed to download agreement signatures from R1FS for oracle {sender}. Ignoring", color='r')
+        return success
+      # endif not signatures_success
+      dct_epoch_is_valid = oracle_data[OracleSyncCt.EPOCH__IS_VALID]
+      epoch_keys = oracle_data[OracleSyncCt.EPOCH_KEYS]
+      id_to_node_address = oracle_data.get(OracleSyncCt.ID_TO_NODE_ADDRESS, {})
+      # Unsqueeze the epoch dictionaries if they are squeezed.
+      [dct_epoch_agreed_median_table, dct_epoch_agreement_signatures] = self._maybe_unsqueeze_epoch_dictionaries(
+        lst_squeezed_epoch_dictionaries=[dct_epoch_agreed_median_table, dct_epoch_agreement_signatures],
+        id_to_keys=id_to_node_address,
+      )
+
+      # sort epoch_keys in ascending order
+      received_epochs = sorted(epoch_keys)
+
+      # convert to dict with int keys
+      dct_epoch_agreed_median_table = {
+        # In case the agreement table is sent through R1FS, the keys will already be in int format.
+        epoch: dct_epoch_agreed_median_table[str(epoch)]
+        for epoch in received_epochs
+      }
+      dct_epoch_agreement_signatures = {
+        epoch: dct_epoch_agreement_signatures[str(epoch)]
+        for epoch in received_epochs
+      }
+      dct_epoch_is_valid = {
+        epoch: dct_epoch_is_valid[str(epoch)]
+        for epoch in received_epochs
+      }
+      if self.cfg_debug_sync_full:
+        msg = f"DEBUG Decoded following dct_epoch_agreed_median_table:\n"
+        msg += f"{dct_epoch_agreed_median_table}\n"
+        msg += f'With the following validities: {dct_epoch_is_valid}\n'
+        msg += f"And the following signatures: {dct_epoch_agreement_signatures}\n"
+        self.P(msg)
+      # endif debug_sync_full
+
+      message_invalid = False
+      for epoch, agreed_median_table in dct_epoch_agreed_median_table.items():
+        # At this point we did not need to convert the keys of the dictionaries yet,
+        # because in valid messages both the agreement table and the agreement signatures
+        # should have the same keys and in the checked sub-dictionaries there weren't any
+        # non-string keys to begin with.
+        # However, we converted it before in order for the epoch key to be in int format,
+        # since at the verification of the signatures we also need the epoch as int.
+        epoch_signatures = dct_epoch_agreement_signatures.get(epoch)
+        epoch_is_valid = dct_epoch_is_valid.get(epoch)
+        if self.cfg_debug_sync_full:
+          msg = f'##########################\n'
+          msg += f'DEBUG Received availability table for epoch {epoch} from {sender = } with values:\n'
+          msg += f'{agreed_median_table}\n AND signatures:\n{epoch_signatures}\n###################'
+          self.P(msg)
+        # endif debug_sync_full
+
+        if not self._check_agreed_median_table(
+            sender=sender, agreed_median_table=agreed_median_table,
+            epoch_signatures=epoch_signatures, epoch=epoch,
+            epoch_is_valid=epoch_is_valid,
+            debug=False
+        ):
+          # if one signature for the received table is invalid, ignore the entire message
+          message_invalid = True
+          break
+      # end for epoch agreed table
+
+      if message_invalid:
+        if self.cfg_debug_sync:
+          self.P(f"Received invalid availability table from {sender = }. Ignoring", color='r')
+        return success
+      # endif
+
+      if self._last_epoch_synced + 1 not in received_epochs or self._current_epoch - 1 not in received_epochs:
+        # Expected epochs in range [last_epoch_synced + 1, current_epoch - 1]
+        # received epochs don t contain the full range
+        if self.cfg_debug_sync:
+          min_epoch = min(received_epochs) if len(received_epochs) > 0 else None
+          max_epoch = max(received_epochs) if len(received_epochs) > 0 else None
+          msg = (f'Expected epochs in range [{self._last_epoch_synced + 1}, {self._current_epoch - 1}] '
+                 f'and received only {len(received_epochs)} epochs (min: {min_epoch}, max: {max_epoch}). '
+                 f'Ignoring...')
+          self.P(msg, color='r')
+        return success
+      # endif received epochs not containing the full requested interval
+
+      stage = oracle_data[OracleSyncCt.STAGE]
+      log_str = self.log_received_message(
+        sender=sender,
+        data=self.dct_agreed_availability_signatures,
+        stage=stage,
+        return_str=True
+      )
+      log_str += f", {received_epochs = }\n"
+      log_str += f"Keeping only tables for epochs [{self._last_epoch_synced + 1}, {self._current_epoch - 1}]"
+      self.P(log_str)
+      epochs_range = range(self._last_epoch_synced + 1, self._current_epoch)
+      self.dct_agreed_availability_table[sender] = {
+        # No need for get here, since in S0 we send a continuous range of epochs.
+        i: dct_epoch_agreed_median_table[i]
+        for i in epochs_range
+      }
+      self.dct_agreed_availability_signatures[sender] = {
+        # No need for get here, since in S0 we send a continuous range of epochs.
+        i: dct_epoch_agreement_signatures[i]
+        for i in epochs_range
+      }
+      self.dct_agreed_availability_is_valid[sender] = {
+        # No need for get here, since in S0 we send a continuous range of epochs.
+        i: dct_epoch_is_valid[i]
+        for i in epochs_range
+      }
+      self.dct_agreed_availability_cid[sender] = {
+        i: dct_epoch_agreement_cid.get(i)
+        for i in epochs_range
+      }
+      self.dct_agreement_signatures_cid[sender] = {
+        i: dct_epoch_signatures_cid.get(i)
+        for i in epochs_range
+      }
+      success = True
+      return success
+
     def _receive_agreed_median_table_and_maybe_request_agreed_median_table(self):
       """
       Receive the agreed median table from the oracles and
@@ -1207,140 +1356,7 @@ class _OraSyncStatesCallbacksMixin:
       if self.first_time_request_agreed_median_table_sent is not None:
         # Receive agreed values from oracles
         for dct_message in self.get_received_messages_from_oracles():
-          sender = dct_message.get(self.ct.PAYLOAD_DATA.EE_SENDER)
-          oracle_data = dct_message.get('ORACLE_DATA')
-
-          if not self._check_received_epoch__agreed_median_table_ok(sender, oracle_data):
-            continue
-
-          # Here, both the agreed median table and the agreement signatures should have the same keys,
-          # but as string instead of int. We also know that in epoch_keys we have
-          # the keys in int format. Thus, we need to convert the keys of the received tables
-          dct_epoch_agreed_median_table = oracle_data[OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE]
-          dct_epoch_agreed_median_table, dct_epoch_agreement_cid = self.r1fs_get_data_from_nested_message(
-            nested_message_dict=dct_epoch_agreed_median_table,
-            return_cids=True,
-          )
-          dct_epoch_agreement_signatures = oracle_data[OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES]
-          dct_epoch_agreement_signatures, dct_epoch_signatures_cid = self.r1fs_get_data_from_nested_message(
-            nested_message_dict=dct_epoch_agreement_signatures,
-            return_cids=True,
-          )
-          dct_epoch_is_valid = oracle_data[OracleSyncCt.EPOCH__IS_VALID]
-          epoch_keys = oracle_data[OracleSyncCt.EPOCH_KEYS]
-          id_to_node_address = oracle_data.get(OracleSyncCt.ID_TO_NODE_ADDRESS, {})
-          # Unsqueeze the epoch dictionaries if they are squeezed.
-          [dct_epoch_agreed_median_table, dct_epoch_agreement_signatures] = self._maybe_unsqueeze_epoch_dictionaries(
-            lst_squeezed_epoch_dictionaries=[dct_epoch_agreed_median_table, dct_epoch_agreement_signatures],
-            id_to_keys=id_to_node_address,
-          )
-
-          # sort epoch_keys in ascending order
-          received_epochs = sorted(epoch_keys)
-
-          # convert to dict with int keys
-          dct_epoch_agreed_median_table = {
-            # In case the agreement table is sent through R1FS, the keys will already be in int format.
-            epoch: dct_epoch_agreed_median_table[str(epoch)]
-            for epoch in received_epochs
-          }
-          dct_epoch_agreement_signatures = {
-            epoch: dct_epoch_agreement_signatures[str(epoch)]
-            for epoch in received_epochs
-          }
-          dct_epoch_is_valid = {
-            epoch: dct_epoch_is_valid[str(epoch)]
-            for epoch in received_epochs
-          }
-          if self.cfg_debug_sync_full:
-            msg = f"DEBUG Decoded following dct_epoch_agreed_median_table:\n"
-            msg += f"{dct_epoch_agreed_median_table}\n"
-            msg += f'With the following validities: {dct_epoch_is_valid}\n'
-            msg += f"And the following signatures: {dct_epoch_agreement_signatures}\n"
-            self.P(msg)
-          # endif debug_sync_full
-
-          message_invalid = False
-          for epoch, agreed_median_table in dct_epoch_agreed_median_table.items():
-            # At this point we did not need to convert the keys of the dictionaries yet,
-            # because in valid messages both the agreement table and the agreement signatures
-            # should have the same keys and in the checked sub-dictionaries there weren't any
-            # non-string keys to begin with.
-            # However, we converted it before in order for the epoch key to be in int format,
-            # since at the verification of the signatures we also need the epoch as int.
-            epoch_signatures = dct_epoch_agreement_signatures.get(epoch)
-            epoch_is_valid = dct_epoch_is_valid.get(epoch)
-            if self.cfg_debug_sync_full:
-              msg = f'##########################\n'
-              msg += f'DEBUG Received availability table for epoch {epoch} from {sender = } with values:\n'
-              msg += f'{agreed_median_table}\n AND signatures:\n{epoch_signatures}\n###################'
-              self.P(msg)
-            # endif debug_sync_full
-
-            if not self._check_agreed_median_table(
-                sender=sender, agreed_median_table=agreed_median_table,
-                epoch_signatures=epoch_signatures, epoch=epoch,
-                epoch_is_valid=epoch_is_valid,
-                debug=False
-            ):
-              # if one signature for the received table is invalid, ignore the entire message
-              message_invalid = True
-              break
-          # end for epoch agreed table
-
-          if message_invalid:
-            if self.cfg_debug_sync:
-              self.P(f"Received invalid availability table from {sender = }. Ignoring", color='r')
-            continue
-          # endif
-
-          if self._last_epoch_synced + 1 not in received_epochs or self._current_epoch - 1 not in received_epochs:
-            # Expected epochs in range [last_epoch_synced + 1, current_epoch - 1]
-            # received epochs don t contain the full range
-            if self.cfg_debug_sync:
-              min_epoch = min(received_epochs) if len(received_epochs) > 0 else None
-              max_epoch = max(received_epochs) if len(received_epochs) > 0 else None
-              msg = (f'Expected epochs in range [{self._last_epoch_synced + 1}, {self._current_epoch - 1}] '
-                     f'and received only {len(received_epochs)} epochs (min: {min_epoch}, max: {max_epoch}). '
-                     f'Ignoring...')
-              self.P(msg, color='r')
-            continue
-          # endif received epochs not containing the full requested interval
-
-          stage = oracle_data[OracleSyncCt.STAGE]
-          log_str = self.log_received_message(
-            sender=sender,
-            data=self.dct_agreed_availability_signatures,
-            stage=stage,
-            return_str=True
-          )
-          log_str += f", {received_epochs = }\n"
-          log_str += f"Keeping only tables for epochs [{self._last_epoch_synced + 1}, {self._current_epoch - 1}]"
-          self.P(log_str)
-          epochs_range = range(self._last_epoch_synced + 1, self._current_epoch)
-          self.dct_agreed_availability_table[sender] = {
-            # No need for get here, since in S0 we send a continuous range of epochs.
-            i: dct_epoch_agreed_median_table[i]
-            for i in epochs_range
-          }
-          self.dct_agreed_availability_signatures[sender] = {
-            # No need for get here, since in S0 we send a continuous range of epochs.
-            i: dct_epoch_agreement_signatures[i]
-            for i in epochs_range
-          }
-          self.dct_agreed_availability_is_valid[sender] = {
-            # No need for get here, since in S0 we send a continuous range of epochs.
-            i: dct_epoch_is_valid[i]
-            for i in epochs_range
-          }
-          self.dct_agreed_availability_cid[sender] = {
-            i: dct_epoch_agreement_cid.get(i)
-            for i in epochs_range
-          }
-          self.dct_agreement_signatures_cid[sender] = {
-            i: dct_epoch_signatures_cid.get(i)
-            for i in epochs_range
-          }
+          success = self.handle_received_agreed_median_table(dct_message=dct_message)
         # end for received messages
       # endif first agreement request sent
 
