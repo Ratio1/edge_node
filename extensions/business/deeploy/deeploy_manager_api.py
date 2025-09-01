@@ -201,10 +201,13 @@ class DeeployManagerApiPlugin(
       app_id = (app_alias.lower()[:13] + "_" + self.uuid(7)).lower()
 
       # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
-      if not is_valid:
-        msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
-        raise ValueError(msg)
+      allow_unpaid_job = inputs.get("allow_unpaid_job", False)
+
+      if not allow_unpaid_job:
+        is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
+        if not is_valid:
+          msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
+          raise ValueError(msg)
       # TODO: Add check if jobType resources match the requested resources.
 
       nodes = self._check_nodes_availability(inputs)
@@ -474,6 +477,7 @@ class DeeployManagerApiPlugin(
 
     """
     result = self.netmon.network_known_apps(target_nodes=target_nodes)
+    self.Pd(f"All online apps:\n{self.json_dumps(result, indent=2)}")
     if owner is not None:  
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
