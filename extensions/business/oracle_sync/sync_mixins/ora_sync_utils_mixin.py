@@ -157,7 +157,8 @@ class _OraSyncUtilsMixin:
       """
       Helper method for extracting data from a message with the help of R1FS.
       This method will iterate over all the keys in the nested message dictionary
-      and will attempt to extract the data from the R1FS using the CID if needed.
+      and will attempt to extract the data from the R1FS using the CID if provided.
+      In case the value of the key is not a string it will not be affected.
       Parameters
       ----------
       nested_message_dict : dict
@@ -172,10 +173,17 @@ class _OraSyncUtilsMixin:
 
       Returns
       -------
+      success : bool
+          True if all data was successfully extracted from the message, False otherwise.
       dict
           The processed data dictionary, where any CIDs will be replaced with either
           the content from the R1FS or None if the retrieval failed.
+      dict, optional
+          If `return_cids` is True, this will be a dictionary with the keys that were CIDs
+          and the values that are the corresponding CIDs.
+          If `return_cids` is False, this will be None.
       """
+      success = True
       if isinstance(ignore_keys, str):
         ignore_keys = [ignore_keys]
       # endif ignore_keys is str
@@ -201,11 +209,14 @@ class _OraSyncUtilsMixin:
             updated_values[key] = res
             cids[key] = msg_data
             self.P(f"Successfully retrieved data from R1FS using CID {msg_data}.")
+          else:
+            success = False
+            break
         # endif
       # endfor key, data
       # 5. Update the nested message dictionary with the retrieved values.
       nested_message_dict.update(updated_values)
-      return (nested_message_dict, cids) if return_cids else nested_message_dict
+      return (success, nested_message_dict, cids) if return_cids else (success, nested_message_dict)
 
     def r1fs_get_pickle(self, cid: str, debug=True):
       """
@@ -225,7 +236,7 @@ class _OraSyncUtilsMixin:
       dict
           The data from the IPFS
       """
-      total_retries = 5
+      total_retries = 3
       retrieved_data = None
       sleep_time = 3
       for i in range(total_retries):
@@ -1520,6 +1531,11 @@ class _OraSyncUtilsMixin:
       if len(epoch_signatures) == 0:
         if debug:
           self.P(f"Received empty epoch {epoch} signatures table from oracle {sender}. Ignoring...", color='r')
+        return False
+
+      if isinstance(epoch_signatures, str):
+        if debug:
+          self.P(f"Received invalid signatures table for epoch {epoch} from oracle {sender}. Ignoring...", color='r')
         return False
 
       if self.cfg_debug_sync_full:
