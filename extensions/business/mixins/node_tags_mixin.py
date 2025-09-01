@@ -63,21 +63,3 @@ class _NodeTagsMixin(object):
 
     return is_kyb
 
-
-  def get_ee_nt_dc(self, node_address):
-    """
-    Get the EE_NODETAG_DATACENTER tag for node_address.
-    Returns tag_value.
-    """
-    # mock for now, as no backend endpoint exists
-
-    is_datacenter = False
-    if node_address in ["0x9BE4D2D6F920Fe9aaD921261063Ee3d347acc5ff"]:
-      is_datacenter = True
-    else:
-      self.P("Could not fetch is_datacenter for wallet {}. Response status code:".format(
-        node_address
-      ))
-
-    return is_datacenter
-
