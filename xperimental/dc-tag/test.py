@@ -179,6 +179,7 @@ class _GeoLocatorMixin:
       try:
         # pip install pystun3
         import stun
+        self.P("Using stun to detect public IP...")
         nat_type, external_ip, external_port = stun.get_ip_info(
           stun_host="stun.l.google.com",
           stun_port=19302,
@@ -219,13 +220,18 @@ class _GeoLocatorMixin:
       r = requests.get(f"https://ipapi.co/{ip}/json/", timeout=3)
       if r.ok:
         data = r.json()
-        self.P("IP geolocation data retrieved successfully:\n{}".format(json.dumps(data, indent=2)))
+        city = data.get("city")
+        country_name = data.get("country_name")
+        country = data.get("country")
+        country_code_iso = data.get("country_code_iso3")
+        continent_code = data.get("continent_code")
+        self.P(f"IP geolocation: {country_name=} ({country_code_iso=}), {city=}, {continent_code=}")
         if full_data:
           return data
-        if return_iso and data.get("country"):
-          return data.get("country")
-        if not return_iso and data.get("country_name"):
-          return data.get("country_name")
+        if return_iso and country_code_iso:
+          return country_code_iso
+        if not return_iso and country_name:
+          return country_name
     except Exception:
       pass
 
@@ -536,4 +542,7 @@ if __name__ == "__main__":
   eng.P = lambda x: l.P(x)
   
   l.P("=== Testing geolocate_ip() ===")
-  l.P(eng.geolocate_ip(return_iso=True))
+  l.P(eng.geolocate_ip())
+  
+  l.P("=== Checking if host is in a datacenter ===")
+  l.P(eng.is_host_in_datacenter())
