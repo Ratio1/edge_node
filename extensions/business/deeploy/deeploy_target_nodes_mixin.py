@@ -226,10 +226,10 @@ class _DeeployTargetNodesMixin:
     self.Pd(f"Required tags: {self.json_dumps(required_tags)}")
 
     for required_tag in required_tags:
-      if isinstance(required_tag, str):
+      if '||' not in required_tag:
         rtag_opts = [required_tag.upper().replace('*', '')]
-      elif isinstance(required_tag, list):
-        rtag_opts = [x.upper().replace('*', '') for x in required_tag]
+      else:
+        rtag_opts = [x.upper().replace('*', '') for x in required_tag.split('')]
       found = False
       for node_tag in node_tags:
         for rt in rtag_opts:
