@@ -229,7 +229,7 @@ class _DeeployTargetNodesMixin:
       if '||' not in required_tag:
         rtag_opts = [required_tag.upper().replace('*', '')]
       else:
-        rtag_opts = [x.upper().replace('*', '') for x in required_tag.split('')]
+        rtag_opts = [x.upper().replace('*', '') for x in required_tag.split('||')]
       found = False
       for node_tag in node_tags:
         for rt in rtag_opts:
