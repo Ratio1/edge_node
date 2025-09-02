@@ -33,6 +33,9 @@ _CONFIG = {
 }
 
 
+
+
+
 class AI4EveryonePlugin(
   BasePlugin, 
   _NetworkProcessorMixin
@@ -498,28 +501,35 @@ class AI4EveryonePlugin(
 
     @BasePlugin.endpoint(method="get")
     def baseclasses(self):
-      return self.get_available_first_stage_classes()
+      return self._get_available_first_stage_classes()
 
     @BasePlugin.endpoint
     def datasourcetypes(self):
-      return self.get_available_data_source_types()
+      return self._get_available_data_source_types()
 
     @BasePlugin.endpoint
     def stage2classifiers(self):
-      return self.get_available_model_architectures()
+      return self._get_available_model_architectures()
+
+    @BasePlugin.endpoint
+    def get_job_categories_list(self):
+      return self._get_job_categories_list()
 
   """END ENDPOINTS SECTION"""
 
   """ADDITIONAL SECTION"""
   if True:
-    def get_available_first_stage_classes(self):
+    def _get_available_first_stage_classes(self):
       return AI4E_CONSTANTS.FIRST_STAGE_CLASSES
 
-    def get_available_model_architectures(self):
+    def _get_available_model_architectures(self):
       return AI4E_CONSTANTS.AVAILABLE_ARCHITECTURES
 
-    def get_available_data_source_types(self):
+    def _get_available_data_source_types(self):
       return AI4E_CONSTANTS.AVAILABLE_DATA_SOURCES
+    
+    def _get_job_categories_list(self):
+      return AI4E_CONSTANTS.JOB_CATEGORIES_LIST
   """END ADDITIONAL SECTION"""
 
   """PERIODIC SECTION"""
