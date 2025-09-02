@@ -7,6 +7,7 @@ from naeural_core.main.net_mon import NetMonCt
 
 from .deeploy_mixin import _DeeployMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
+from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
@@ -41,7 +42,8 @@ _CONFIG = {
 class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
-  _DeeployTargetNodesMixin
+  _DeeployTargetNodesMixin,
+  _NodeTagsMixin
   ):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
@@ -143,32 +145,38 @@ class DeeployManagerApiPlugin(
     Parameters
     ----------
     
-    app_alias : str
+    request: dict containing next fields:
+      app_alias : str
         The name (alias) of the app to create
-        
-    plugin_signature : str
-        The signature of the plugin to use
-        
-    target_nodes : list[str]
-        The nodes to create the app on
-        
-    target_nodes_count : int
-        The number of nodes to create the app on
-        
-    nonce : str
-        The nonce used for signing the request
-        
-    app_params : dict
-        The parameters to pass to the app such as:
-          
-          app_params.IMAGE : str
-              The image to use for the app
-          app_params.REGISTRY : str 
-              The registry to use for the app
-          app_params.USERNAME : str 
-              The username to use for the app
-          app_params.PASSWORD : str 
-          
+
+      plugin_signature : str
+          The signature of the plugin to use
+
+      target_nodes : list[str]
+          The nodes to create the app on
+
+      target_nodes_count : int
+          The number of nodes to create the app on
+
+      nonce : str
+          The nonce used for signing the request
+
+      job_tags: list
+          Tags and their expected values that the target nodes must have
+        Example: ["KYB","DC:HOSTINGER", "CT:FR|IT|RO", "REG:EU"]
+
+
+      app_params : dict
+          The parameters to pass to the app such as:
+
+            app_params.IMAGE : str
+                The image to use for the app
+            app_params.REGISTRY : str
+                The registry to use for the app
+            app_params.USERNAME : str
+                The username to use for the app
+            app_params.PASSWORD : str
+
           
     TODO: (Vitalii)
       - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
@@ -466,7 +474,8 @@ class DeeployManagerApiPlugin(
 
     """
     result = self.netmon.network_known_apps(target_nodes=target_nodes)
-    if owner is not None:  
+    self.Pd(f"All online apps:\n{self.json_dumps(result, indent=2)}")
+    if owner is not None:
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
         for app_name, app_data in apps.items():

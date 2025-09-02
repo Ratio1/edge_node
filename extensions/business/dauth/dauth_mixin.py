@@ -253,7 +253,7 @@ class _DauthMixin(object):
       dauth_data[key] = dct_auth_predefined_keys[key]
 
     # set node tags
-    tags = self.get_node_tags(sender_eth_address=sender_eth_address)
+    tags = self.fetch_node_tags(node_address=sender_eth_address)
     if isinstance(tags, dict) and len(tags) > 0:
       for key, value in tags.items():
         if isinstance(key, str) and key.startswith(dAuthCt.DAUTH_ENV_KEYS_PREFIX):
@@ -423,35 +423,6 @@ class _DauthMixin(object):
       version_check_data=version_check_data
     )
     return data
-
-
-  def get_node_tags(self, sender_eth_address: str):
-    tags = {}
-    try:
-      base_url = self.bc.get_network_data().get(self.const.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY)
-      url = "".join([base_url, "/accounts/is-kyb"])
-      params = {
-        "walletAddress": sender_eth_address,
-      }
-      response = self.requests.get(url, params=params)
-      is_kyb = False
-      if response.status_code == 200:
-        try:
-          json = response.json()
-          is_kyb = json.get("data", False)
-        except Exception as e:
-          self.P("Error parsing JSON response: {}".format(e), color='r')
-      else:
-        self.P("Could not fetch is_kyb for wallet {}. Response status code: {}".format(
-          sender_eth_address,
-          response.status_code
-        ))
-
-      tags[self.const.BASE_CT.dAuth.EvmNetData.EE_NODETAG_KYB] = is_kyb
-
-    except Exception as e:
-      self.P("Error getting node tags: {}".format(e), color='r')
-    return tags
 
 
 if __name__ == '__main__':
