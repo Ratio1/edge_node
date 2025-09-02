@@ -38,7 +38,7 @@ class _NodeTagsMixin(object):
 
   def get_ee_nt_is_kyb(self, node_address):
     """
-    Get the EE_NODETAG_KYB tag for node_address.
+    Get the EE_NT_IS_KYB tag for node_address.
     Returns tag_value.
     """
     base_url = self.bc.get_network_data().get(self.const.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY)
