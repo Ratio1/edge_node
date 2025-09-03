@@ -211,6 +211,38 @@ class _DeeployTargetNodesMixin:
     return suitable_nodes
 
 
+  def __check_node_has_tags(self, node_addr, required_tags):
+    """
+    Check if the node has the required tags.
+    Args:
+        node_addr (str): Node address
+        required_tags (list): List of required tags
+    Returns:
+        bool: True if the node has all required tags, False otherwise
+    """
+    node_tags = self.netmon.get_network_node_tags(node_addr)
+
+    self.Pd(f"Node {node_addr} tags: {self.json_dumps(node_tags)}")
+    self.Pd(f"Required tags: {self.json_dumps(required_tags)}")
+
+    for required_tag in required_tags:
+      if '||' not in required_tag:
+        rtag_opts = [required_tag.upper().replace('*', '')]
+      else:
+        rtag_opts = [x.upper().replace('*', '') for x in required_tag.split('||')]
+      found = False
+      for node_tag in node_tags:
+        for rt in rtag_opts:
+          if node_tag in rt:
+            found = True
+            break
+        if found:
+          break
+      if not found:
+        return False
+    return True
+
+
   def __check_nodes_capabilities_and_extract_resources(self, nodes: list['str'], inputs):
     """
     Check if the nodes have required resources for the deeployment and if it supports the requested plugin.
@@ -222,6 +254,7 @@ class _DeeployTargetNodesMixin:
     node_req_cpu = node_res_req.get(DEEPLOY_RESOURCES.CPU)
     node_req_memory = node_res_req.get(DEEPLOY_RESOURCES.MEMORY)
     node_req_memory_bytes = self._parse_memory(node_req_memory)
+    job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
 
     suitable_nodes_with_resources = {}
     for addr in nodes:
@@ -232,6 +265,13 @@ class _DeeployTargetNodesMixin:
           self.Pd(f"Node {addr} does not support the requested plugin {inputs.plugin_signature}. Skipping...")
           continue
 
+      if len(job_tags) > 0:
+        node_has_required_tags = self.__check_node_has_tags(node_addr=addr, required_tags=job_tags)
+        if not node_has_required_tags:
+          self.Pd(f"Node {addr} does not have the required tags. Skipping...")
+          continue
+
+      self.Pd(f"Node {addr} cont in function.")
       total_cpu = self.netmon.network_node_total_cpu_cores(addr)
 
       total_memory = self.netmon.network_node_total_mem(addr)
@@ -260,9 +300,9 @@ class _DeeployTargetNodesMixin:
   def _find_nodes_for_deeployment(self, inputs):
     # Get required resources from the request
     required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+    target_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, None)
 
-
-    if not inputs.target_nodes_count:
+    if not target_nodes_count:
       msg = f"{DEEPLOY_ERRORS.NODES3}: Nodes count was not provided!"
       raise ValueError(msg)
 
