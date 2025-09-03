@@ -46,7 +46,11 @@ _CONFIG = {
 
   "PROCESS_DELAY": 5,
   "ALLOW_EMPTY_INPUTS": True,
+  "TUNNEL_ENGINE_ENABLED": True,
   "TUNNEL_ENGINE": "cloudflare",
+  "TUNNEL_ENGINE_PING_INTERVAL": 30,  # seconds
+  "CLOUDFLARE_TOKEN": None,
+  "TUNNEL_ENGINE_PARAMETERS": {},
 
   # Container configuration
   "IMAGE": "node:22",  # default Docker image to use
@@ -115,6 +119,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     super(WorkerAppRunnerPlugin, self).on_init()
 
     self.__reset_vars()
+
+    self.reset_tunnel_engine()
 
     self._set_default_branch()
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
@@ -550,16 +556,23 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.log_thread.join(timeout=5)
     super(WorkerAppRunnerPlugin, self).on_close()
 
+    self.maybe_stop_tunnel_engine()
+
     self.P("WorkerAppRunnerPlugin has shut down.", color='y')
     return
 
   def process(self):
+    self.maybe_init_tunnel_engine()
+
     if not self.container:
       self._handle_initial_launch()
+
+    self.maybe_start_tunnel_engine()
 
     if not self._check_container_status():
       return
 
     self._perform_periodic_monitoring()
+    self.maybe_tunnel_engine_ping()
 
     return
