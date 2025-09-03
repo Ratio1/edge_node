@@ -29,14 +29,13 @@ On-close:
   - Save logs to disk
 """
 
-import os
 import docker
 import requests
 import threading
 import time
 import json
-from urllib.parse import urlparse
 
+from extensions.business.container_apps.container_utils import _ContainerUtilsMixin
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
 
@@ -45,12 +44,12 @@ __VER__ = "1.0.0"
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  "PROCESS_DELAY": 30,  # seconds to wait between process calls
+  "PROCESS_DELAY": 5,
   "ALLOW_EMPTY_INPUTS": True,
+  "TUNNEL_ENGINE": "cloudflare",
 
   # Container configuration
-  "IMAGE": "node:18",  # default Docker image to use
-  "REPO_URL": None,  # Git repository URL (without credentials)
+  "IMAGE": "node:22",  # default Docker image to use
   "BUILD_AND_RUN_COMMANDS": ["npm install", "npm run build", "npm start"],  # commands to run in container
 
   # Container registry configuration
@@ -62,9 +61,13 @@ _CONFIG = {
 
   # Environment variables for the container
   "ENV": {},
+  "DYNAMIC_ENV": {},
 
-  # Container port mapping
-  "PORT": 3000,  # internal container port
+  # Git config
+  "GIT_USERNAME": None,  # GitHub username for cloning (if private repo)
+  "GIT_TOKEN": None,  # GitHub personal access token for cloning (if private repo)
+  "GIT_REPO_OWNER": None,  # GitHub repository owner (user or org)
+  "GIT_REPO_NAME": None,  # GitHub repository name
 
   # Git monitoring configuration
   "GIT_BRANCH": "main",  # branch to monitor for updates
@@ -75,15 +78,20 @@ _CONFIG = {
 
   "POLL_COUNT": 0,
 
+  "RESTART_POLICY": "always",  # "always" will restart the container if it stops
+  "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
+
   # Application endpoint polling
   "ENDPOINT_POLL_INTERVAL": 30,  # seconds between endpoint health checks
   "ENDPOINT_URL": "/edgenode",  # endpoint to poll for health checks
+  "PORT": None,  # internal container port if it's a web app (int)
 
   # Container resource limits
   "CONTAINER_RESOURCES": {
-    "cpu": 1,
+    "cpu": 1,  # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,
-    "memory": "512m",
+    "memory": "512m",  # e.g. "512m" for 512MB,
+    "ports": [] # dict of container_port: host_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
 
   'VALIDATION_RULES': {
@@ -92,10 +100,34 @@ _CONFIG = {
 }
 
 
-class WorkerAppRunnerPlugin(BasePlugin):
+class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
+
+  @property
+  def port(self):
+    return getattr(self, '_port', None)
+
+  @port.setter
+  def port(self, value):
+    self._port = value
+
+
   def on_init(self):
     super(WorkerAppRunnerPlugin, self).on_init()
 
+    self.__reset_vars()
+
+    self._set_default_branch()
+    self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
+    self._setup_dynamic_env() # setup dynamic env vars for the container
+
+    self.repo_url = f"https://{self.cfg_git_username}:{self.cfg_git_token}@github.com/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}.git"
+
+    self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
+    return
+
+
+  def __reset_vars(self):
+    """Reset internal state variables."""
     self.container = None
 
     self.done = False  # Flag to indicate when to stop the main loop
@@ -109,42 +141,71 @@ class WorkerAppRunnerPlugin(BasePlugin):
 
     # Determine default branch via GitHub API (so we know which branch to monitor)
     self.branch = None
-    if self.cfg_repo_owner and self.cfg_repo_name:
+
+    # Internal state
+    self.container = None
+    self.log_thread = None
+    self._stop_event = threading.Event()
+    self.extra_ports_mapping = {}
+    self.volumes = {}
+    self.dynamic_env = {}
+
+    return
+
+
+  def _set_default_branch(self):
+    """Determine the default branch of the repository via GitHub API."""
+    if self.cfg_git_repo_owner and self.cfg_git_repo_name:
       try:
         resp = self._get_latest_commit(return_data=True)
         if resp is not None:
           _, data = resp
           self.P(f"Repository info:\n {json.dumps(data, indent=2)}", color='b')
           self.branch = data.get("default_branch", None)
-          self.P(f"Default branch for {self.cfg_repo_owner}/{self.cfg_repo_name} is '{self.branch}'", color='y')
+          self.P(f"Default branch for {self.cfg_git_repo_owner}/{self.cfg_git_repo_name} is '{self.branch}'", color='y')
       except Exception as e:
         self.P(f"[WARN] Could not determine default branch: {e}")
     if not self.branch:
       self.branch = "main"  # Fallback to 'main' if not determined
-
-    # Internal state
-    self.container = None
-    self.log_thread = None
-    self._stop_event = threading.Event()
-
-
-    self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
-
     return
-
-
 
 
   def start_container(self):
     """Start the Docker container without running build or app commands."""
     self.P(f"Launching container with image '{self.cfg_image}'...")
-    # Run the base container in detached mode with a long running sleep so it stays alive
+    # Run the base container in detached mode with a long-running sleep so it stays alive
+
+    # todo: move these operations to a separate method, to prepare the container config
+    # Ports mapping
+    ports_mapping = self.extra_ports_mapping.copy() if self.extra_ports_mapping else {}
+    if self.cfg_port and self.port:
+      ports_mapping[self.port] = self.cfg_port
+
+    inverted_ports_mapping = {f"{v}/tcp": k for k, v in ports_mapping.items()}
+
+    # Volumes mapping (if any)
+
+    # Environment variables
+    env = self.cfg_env.copy() if self.cfg_env else {}
+    if self.dynamic_env:
+      env.update(self.dynamic_env)
+
+    self.P(f"Container data:")
+    self.P(f"  Image: {self.cfg_image}")
+    self.P(f"  Ports: {self.json_dumps(inverted_ports_mapping) if inverted_ports_mapping else 'None'}")
+    self.P(f"  Env: {self.json_dumps(env) if env else 'None'}")
+    self.P(f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}")
+    self.P(f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}")
+    self.P(f"  Restart policy: {self.cfg_restart_policy}")
+    self.P(f"  Pull policy: {self.cfg_image_pull_policy}")
+    self.P(f"  Build/Run commands: {self.cfg_build_and_run_commands if self.cfg_build_and_run_commands else 'None'}")
+
     self.container = self.docker_client.containers.run(
       self.cfg_image,
       command=["sh", "-c", "while true; do sleep 3600; done"],
       detach=True,
-      ports={"3000/tcp": 3000},
-      environment=self.cfg_env,
+      ports=inverted_ports_mapping,
+      environment=env,
     )
     self.P(f"Container started (ID: {self.container.short_id}).")
     return self.container
@@ -156,7 +217,7 @@ class WorkerAppRunnerPlugin(BasePlugin):
       raise RuntimeError("Container must be started before executing commands")
 
     shell_cmd = (
-      f"git clone {self.cfg_repo_url} /app && cd /app && " +
+      f"git clone {self.repo_url} /app && cd /app && " +
       " && ".join(self.cfg_build_and_run_commands)
     )
     self.P("Running command in container: {}".format(shell_cmd))
@@ -245,7 +306,7 @@ class WorkerAppRunnerPlugin(BasePlugin):
   def _poll_endpoint(self):
     """Poll the container's health endpoint and log the response."""
 
-    url = f"http://localhost:{self.cfg_port}{self.cfg_endpoint_url}"
+    url = f"http://localhost:{self.port}{self.cfg_endpoint_url}"
 
     try:
       self.P(f"Polling health endpoint: {url}", color='b')
@@ -263,12 +324,12 @@ class WorkerAppRunnerPlugin(BasePlugin):
 
   def _get_latest_commit(self, return_data=False):
     """Fetch the latest commit SHA of the repository's monitored branch via GitHub API."""
-    if not self.cfg_repo_owner or not self.cfg_repo_name:
+    if not self.cfg_git_repo_owner or not self.cfg_git_repo_name:
       return None
     if self.branch is None:
-      api_url = f"https://api.github.com/repos/{self.cfg_repo_owner}/{self.cfg_repo_name}"
+      api_url = f"https://api.github.com/repos/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}"
     else:
-      api_url = f"https://api.github.com/repos/{self.cfg_repo_owner}/{self.cfg_repo_name}/branches/{self.branch}"
+      api_url = f"https://api.github.com/repos/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}/branches/{self.branch}"
     headers = {"Authorization": f"token {self.cfg_git_token}"} if self.cfg_git_token else {}
     try:
       self.P(f"Commit check: {api_url}", color='b')
@@ -481,6 +542,7 @@ class WorkerAppRunnerPlugin(BasePlugin):
 
   def on_close(self):
     """Cleanup on plugin close."""
+    self.P("Shutting down WorkerAppRunnerPlugin...", color='y')
     self.done = True
     self.stop_container()
     self._stop_event.set()
@@ -488,6 +550,7 @@ class WorkerAppRunnerPlugin(BasePlugin):
       self.log_thread.join(timeout=5)
     super(WorkerAppRunnerPlugin, self).on_close()
 
+    self.P("WorkerAppRunnerPlugin has shut down.", color='y')
     return
 
   def process(self):
