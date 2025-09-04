@@ -26,7 +26,7 @@ import socket
 import subprocess
 import time
 
-from naeural_core.business.base.web_app.base_web_app_plugin import BaseWebAppPlugin as BasePlugin
+from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
@@ -48,9 +48,9 @@ _CONFIG = {
 
   # Generic tunnel engine Section
   "TUNNEL_ENGINE": "cloudflare",
-
   "TUNNEL_ENGINE_ENABLED": True,
   "TUNNEL_ENGINE_PING_INTERVAL": 30,  # seconds
+  "CLOUDFLARE_TOKEN": None,
   "TUNNEL_ENGINE_PARAMETERS": {
   },
 
@@ -148,6 +148,9 @@ class ContainerAppRunnerPlugin(
 
     self._is_manually_stopped = False # Flag to indicate if the container was manually stopped
 
+    # Initialize tunnel process
+    self.tunnel_process = None
+
     return
 
   def on_init(self):
@@ -171,6 +174,9 @@ class ContainerAppRunnerPlugin(
     self._setup_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
+
+    # Initialize tunnel engine
+    self.reset_tunnel_engine()
 
     return
 
@@ -232,6 +238,30 @@ class ContainerAppRunnerPlugin(
       return
     else:
       self.P(f"Unknown plugin command: {data}")
+    return
+
+  def start_cloudflare_tunnel(self):
+    """
+    Start the cloudflare tunnel using the base tunnel engine functionality.
+    """
+    if self.cfg_tunnel_engine_enabled and self.use_cloudflare():
+      self.P("Starting Cloudflare tunnel...", color='b')
+      self.tunnel_process = self.run_cloudflare_tunnel()
+      if self.tunnel_process:
+        self.P("Cloudflare tunnel started successfully", color='g')
+      else:
+        self.P("Failed to start Cloudflare tunnel", color='r')
+    return
+
+  def stop_cloudflare_tunnel(self):
+    """
+    Stop the cloudflare tunnel.
+    """
+    if self.tunnel_process:
+      self.P("Stopping Cloudflare tunnel...", color='b')
+      self.stop_start_command(self.tunnel_process)
+      self.tunnel_process = None
+      self.P("Cloudflare tunnel stopped", color='g')
     return
   
   def on_post_container_start(self):
@@ -308,6 +338,85 @@ class ContainerAppRunnerPlugin(
     else:
       raise RuntimeError("No container runtime (Docker/Podman) found on this system.")
     #endif
+    return
+
+  def _maybe_close_setup_commands(self):
+    """
+    Close setup commands if they are running.
+    """
+    if hasattr(self, 'setup_commands_processes'):
+      for i, process in enumerate(self.setup_commands_processes):
+        if process and process.poll() is None:
+          self.P(f"Stopping setup command {i}...")
+          process.terminate()
+          try:
+            process.wait(timeout=5)
+          except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    return
+
+  def _maybe_close_start_commands(self):
+    """
+    Close start commands if they are running.
+    """
+    if hasattr(self, 'start_commands_processes'):
+      for i, process in enumerate(self.start_commands_processes):
+        if process and process.poll() is None:
+          self.P(f"Stopping start command {i}...")
+          process.terminate()
+          try:
+            process.wait(timeout=5)
+          except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    return
+
+  def _maybe_read_and_stop_all_log_readers(self):
+    """
+    Read and stop all log readers.
+    """
+    if hasattr(self, 'dct_logs_reader'):
+      for key, reader in self.dct_logs_reader.items():
+        if reader:
+          reader.stop()
+          logs = reader.get_next_characters()
+          if logs:
+            self.on_log_handler(logs, key)
+    
+    if hasattr(self, 'dct_err_logs_reader'):
+      for key, reader in self.dct_err_logs_reader.items():
+        if reader:
+          reader.stop()
+          err_logs = reader.get_next_characters()
+          if err_logs:
+            self.P(f"[stderr][{key}]: {err_logs}")
+    return
+
+  def _container_retrieve_and_maybe_show_logs(self):
+    """
+    Retrieve and maybe show container logs.
+    """
+    if hasattr(self, 'container_logs') and self.container_logs:
+      # Show logs every SHOW_LOG_EACH seconds
+      if hasattr(self, 'last_log_show_time'):
+        if self.time() - self.last_log_show_time >= self.cfg_show_log_each:
+          self.last_log_show_time = self.time()
+          # Show last few lines
+          last_lines = list(self.container_logs)[-self.cfg_show_log_last_lines:]
+          for line in last_lines:
+            self.P(f"[CONTAINER] {line}", color='d')
+      else:
+        self.last_log_show_time = self.time()
+    return
+
+  def _reload_server(self):
+    """
+    Reload the server by restarting the container.
+    """
+    self.P("Reloading server...")
+    # This method is called when the container needs to be restarted
+    # The actual restart logic is handled by the container utils mixin
     return
 
 
@@ -388,6 +497,7 @@ class ContainerAppRunnerPlugin(
     self._maybe_read_and_stop_all_log_readers()
     # Stop tunnel engine if needed
     self.P("Stopping tunnel engine tunnel ...")
+    self.stop_cloudflare_tunnel()
     self.maybe_stop_tunnel_engine()
     self.P("Tunnel engine stopped.")
 
@@ -413,7 +523,13 @@ class ContainerAppRunnerPlugin(
     """
     self._stop_container_and_save_logs_to_disk()
     self._container_kill(self.container_id)
+    
+    # Stop cloudflare tunnel if running
+    self.stop_cloudflare_tunnel()
+    
     super(ContainerAppRunnerPlugin, self).on_close()
+    
+    self.maybe_stop_tunnel_engine()
 
 
   def _maybe_autoupdate_container(self):
@@ -450,13 +566,27 @@ class ContainerAppRunnerPlugin(
     This is the main process loop for the plugin that gets called each PROCESS_DELAY seconds and
     it performs the following:
     
-      1. self._container_maybe_reload() - check if the container is still running and perform the policy
+      1. Initialize tunnel engine if needed
+      2. Start tunnel engine if needed
+      3. Start cloudflare tunnel if needed
+      4. self._container_maybe_reload() - check if the container is still running and perform the policy
           specified in the restart policy.
-      2. self._container_retrieve_and_maybe_show_logs() - check if the logs should be show as well as complete the logs
+      5. self._container_retrieve_and_maybe_show_logs() - check if the logs should be show as well as complete the logs
+      6. Tunnel engine ping
     
     """
+    self.maybe_init_tunnel_engine()
+    self.maybe_start_tunnel_engine()
+    
+    # Start cloudflare tunnel if not already running
+    if self.cfg_tunnel_engine_enabled and self.use_cloudflare() and not self.tunnel_process:
+      self.start_cloudflare_tunnel()
+    
     self._maybe_set_container_id_and_show_app_info()
     self._maybe_autoupdate_container()
     self._container_maybe_reload()
+    self._container_retrieve_and_maybe_show_logs()
+    
+    self.maybe_tunnel_engine_ping()
 
     return
