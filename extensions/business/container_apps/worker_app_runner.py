@@ -99,6 +99,9 @@ _CONFIG = {
     "ports": [] # dict of container_port: host_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
 
+  # Chainstore response configuration
+  "CHAINSTORE_RESPONSE_KEY": None,  # Optional key to send confirmation data to chainstore
+
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
 
@@ -205,6 +208,11 @@ _CONFIG = {
       'TYPE': 'dict',
       'DESCRIPTION': 'Dynamic environment variables for the container',
     },
+
+    'CHAINSTORE_RESPONSE_KEY': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'Optional key to send confirmation data to chainstore',
+    },
   },
 }
 
@@ -263,6 +271,10 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self.extra_ports_mapping = {}
     self.volumes = {}
     self.dynamic_env = {}
+    
+    # Container start time tracking
+    self.container_start_time = None
+    self.container_id = None
 
     return
 
@@ -347,6 +359,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       ports=inverted_ports_mapping,
       environment=env,
     )
+    self.container_id = self.container.short_id
     self.P(f"Container started (ID: {self.container.short_id})", color='g')
     return self.container
 
@@ -389,6 +402,10 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
   def _launch_container_app(self):
     """Start container, then build and run the app, recording memory usage before and after."""
     container = self.start_container()
+    
+    # Set container start time
+    self.container_start_time = self.time()
+    
     # Memory usage before installing the app
     mem_before_mb = self._get_container_memory() / (1024 ** 2)
 
@@ -400,6 +417,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     mem_after_mb = self._get_container_memory() / (1024 ** 2)
     self.P(f"Container memory usage before build/run: {mem_before_mb:>5.0f} MB", color='d')
     self.P(f"Container memory usage after build/run:  {mem_after_mb:>5.0f} MB", color='d')
+
+    # Send plugin start confirmation to chainstore if configured
+    self._maybe_send_plugin_start_confirmation()
 
     return container
 
@@ -641,6 +661,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.P(f"Error removing container: {e}", color='r')
     finally:
       self.container = None
+      self.container_id = None
     return
 
   def run(self):
