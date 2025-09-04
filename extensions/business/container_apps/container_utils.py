@@ -560,3 +560,156 @@ class _ContainerUtilsMixin:
 
 
   ### END NEW CONTAINER MIXIN METHODS ###
+
+  ### COMMON CONTAINER UTILITY METHODS ###
+  
+  def _validate_container_config(self):
+    """Validate container configuration before starting."""
+    if not self.cfg_image:
+      raise ValueError("IMAGE is required")
+    
+    if not isinstance(self.cfg_image, str):
+      raise ValueError("IMAGE must be a string")
+    
+    # Validate container resources if provided
+    if hasattr(self, 'cfg_container_resources') and self.cfg_container_resources:
+      if not isinstance(self.cfg_container_resources, dict):
+        raise ValueError("CONTAINER_RESOURCES must be a dictionary")
+    
+    # Validate environment variables if provided
+    if hasattr(self, 'cfg_env') and self.cfg_env:
+      if not isinstance(self.cfg_env, dict):
+        raise ValueError("ENV must be a dictionary")
+    
+    return True
+
+  def _get_container_health_status(self):
+    """Get container health status."""
+    if not hasattr(self, 'container_id') or not self.container_id:
+      return "not_started"
+    
+    try:
+      is_running = self._container_is_running(self.container_id)
+      return "running" if is_running else "stopped"
+    except Exception as e:
+      self.P(f"Error checking container health: {e}", color='r')
+      return "error"
+
+  def _cleanup_container_resources(self):
+    """Clean up container resources on shutdown."""
+    if hasattr(self, 'container_id') and self.container_id:
+      self.P(f"Cleaning up container resources for {self.container_id}", color='b')
+      self._container_kill(self.container_id)
+      self.container_id = None
+      self.P("Container resources cleaned up", color='g')
+
+  def _validate_git_config(self):
+    """Validate Git configuration for repository access."""
+    if not hasattr(self, 'cfg_git_repo_owner') or not hasattr(self, 'cfg_git_repo_name'):
+      return False
+    
+    if not self.cfg_git_repo_owner or not self.cfg_git_repo_name:
+      self.P("Git repository owner or name not configured", color='y')
+      return False
+    
+    # Check if we have credentials for private repos
+    if hasattr(self, 'cfg_git_token') and not self.cfg_git_token:
+      self.P("Warning: No Git token provided, repository must be public", color='y')
+    
+    return True
+
+  def _validate_endpoint_config(self):
+    """Validate endpoint configuration for health checks."""
+    if not hasattr(self, 'cfg_endpoint_url') or not self.cfg_endpoint_url:
+      return False
+    
+    # Basic URL validation
+    if not isinstance(self.cfg_endpoint_url, str):
+      self.P("Endpoint URL must be a string", color='r')
+      return False
+    
+    if not self.cfg_endpoint_url.startswith('/'):
+      self.P("Endpoint URL must start with '/'", color='r')
+      return False
+    
+    if '..' in self.cfg_endpoint_url:
+      self.P("Endpoint URL contains invalid path traversal", color='r')
+      return False
+    
+    return True
+
+  def _get_container_info(self):
+    """Get comprehensive container information."""
+    info = {
+      'container_id': getattr(self, 'container_id', None),
+      'container_name': getattr(self, 'container_name', None),
+      'image': getattr(self, 'cfg_image', None),
+      'status': self._get_container_health_status(),
+      'port': getattr(self, 'port', None),
+      'start_time': getattr(self, 'container_start_time', None),
+    }
+    
+    if hasattr(self, 'extra_ports_mapping') and self.extra_ports_mapping:
+      info['extra_ports'] = self.extra_ports_mapping
+    
+    if hasattr(self, 'volumes') and self.volumes:
+      info['volumes'] = self.volumes
+    
+    return info
+
+  def _log_container_info(self):
+    """Log comprehensive container information."""
+    info = self._get_container_info()
+    self.P("Container Information:", color='b')
+    for key, value in info.items():
+      if value is not None:
+        self.P(f"  {key}: {value}", color='d')
+
+  def _validate_port_allocation(self, port):
+    """Validate that a port is properly allocated."""
+    if not port:
+      return False
+    
+    if not isinstance(port, int):
+      return False
+    
+    if port < 1 or port > 65535:
+      return False
+    
+    return True
+
+  def _safe_get_container_stats(self):
+    """Safely get container statistics without raising exceptions."""
+    if not hasattr(self, 'container_id') or not self.container_id:
+      return None
+    
+    try:
+      # This would need to be implemented based on the container runtime
+      # For now, return basic info
+      return {
+        'id': self.container_id,
+        'status': self._get_container_health_status(),
+        'running': self._container_is_running(self.container_id) if self.container_id else False
+      }
+    except Exception as e:
+      self.P(f"Error getting container stats: {e}", color='r')
+      return None
+
+  def _validate_docker_image_format(self, image_name):
+    """Validate Docker image name format."""
+    if not isinstance(image_name, str):
+      return False
+    
+    # Basic validation - should contain at least one colon or slash
+    if ':' not in image_name and '/' not in image_name:
+      return False
+    
+    # Check for invalid characters
+    invalid_chars = [' ', '\t', '\n', '\r']
+    for char in invalid_chars:
+      if char in image_name:
+        return False
+    
+    return True
+
+  ### END COMMON CONTAINER UTILITY METHODS ###

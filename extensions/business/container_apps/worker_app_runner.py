@@ -95,11 +95,116 @@ _CONFIG = {
     "cpu": 1,  # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,
     "memory": "512m",  # e.g. "512m" for 512MB,
+    # TODO: add disk usage and limit
     "ports": [] # dict of container_port: host_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
 
   'VALIDATION_RULES': {
-    **BasePlugin.CONFIG['VALIDATION_RULES']
+    **BasePlugin.CONFIG['VALIDATION_RULES'],
+
+    'IMAGE': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'Docker image to use for the container',
+      'REQUIRED': True,
+    },
+
+    'BUILD_AND_RUN_COMMANDS': {
+      'TYPE': 'list',
+      'DESCRIPTION': 'Commands to run in container for building and starting the app',
+      'MIN_LEN': 1,
+    },
+
+    'GIT_REPO_OWNER': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'GitHub repository owner (user or org)',
+    },
+
+    'GIT_REPO_NAME': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'GitHub repository name',
+    },
+
+    'GIT_USERNAME': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'GitHub username for cloning (if private repo)',
+    },
+
+    'GIT_TOKEN': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'GitHub personal access token for cloning (if private repo)',
+    },
+
+    'GIT_BRANCH': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'Branch to monitor for updates',
+      'DEFAULT': 'main',
+    },
+
+    'GIT_POLL_INTERVAL': {
+      'TYPE': 'int',
+      'MIN_VAL': 10,
+      'MAX_VAL': 3600,
+      'DESCRIPTION': 'Seconds between Git commit checks',
+    },
+
+    'IMAGE_POLL_INTERVAL': {
+      'TYPE': 'int',
+      'MIN_VAL': 60,
+      'MAX_VAL': 3600,
+      'DESCRIPTION': 'Seconds between Docker image checks',
+    },
+
+    'ENDPOINT_POLL_INTERVAL': {
+      'TYPE': 'int',
+      'MIN_VAL': 5,
+      'MAX_VAL': 300,
+      'DESCRIPTION': 'Seconds between endpoint health checks',
+    },
+
+    'ENDPOINT_URL': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'Endpoint to poll for health checks',
+      'DEFAULT': '/edgenode',
+    },
+
+    'PORT': {
+      'TYPE': 'int',
+      'MIN_VAL': 1,
+      'MAX_VAL': 65535,
+      'DESCRIPTION': 'Internal container port if it\'s a web app',
+    },
+
+    'RESTART_POLICY': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'Container restart policy',
+      'ALLOWED_VALUES': ['always', 'on-failure', 'unless-stopped', 'no'],
+    },
+
+    'IMAGE_PULL_POLICY': {
+      'TYPE': 'str',
+      'DESCRIPTION': 'Docker image pull policy',
+      'ALLOWED_VALUES': ['always', 'if-not-present', 'never'],
+    },
+
+    'CONTAINER_RESOURCES': {
+      'TYPE': 'dict',
+      'DESCRIPTION': 'Container resource limits (CPU, GPU, memory, ports)',
+    },
+
+    'CR_DATA': {
+      'TYPE': 'dict',
+      'DESCRIPTION': 'Container registry data (server, username, password)',
+    },
+
+    'ENV': {
+      'TYPE': 'dict',
+      'DESCRIPTION': 'Environment variables for the container',
+    },
+
+    'DYNAMIC_ENV': {
+      'TYPE': 'dict',
+      'DESCRIPTION': 'Dynamic environment variables for the container',
+    },
   },
 }
 
@@ -240,7 +345,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       ports=inverted_ports_mapping,
       environment=env,
     )
-    self.P(f"Container started (ID: {self.container.short_id}).")
+    self.P(f"Container started (ID: {self.container.short_id})", color='g')
     return self.container
 
 
@@ -253,7 +358,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       f"git clone {self.repo_url} /app && cd /app && " +
       " && ".join(self.cfg_build_and_run_commands)
     )
-    self.P("Running command in container: {}".format(shell_cmd))
+    self.P(f"Running command in container: {shell_cmd}", color='b')
     # Execute the command and obtain a streaming iterator without blocking
     # although detach is set to False, we can still stream logs and the exec_run is not
     # blocking the calling thread
@@ -291,14 +396,14 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     # Allow some time for the app to start before measuring again
     time.sleep(1)
     mem_after_mb = self._get_container_memory() / (1024 ** 2)
-    self.P(f"Container memory usage before build/run: {mem_before_mb:>5.0f} MB")
-    self.P(f"Container memory usage after build/run:  {mem_after_mb:>5.0f} MB")
+    self.P(f"Container memory usage before build/run: {mem_before_mb:>5.0f} MB", color='d')
+    self.P(f"Container memory usage after build/run:  {mem_after_mb:>5.0f} MB", color='d')
 
     return container
 
   def _restart_from_scratch(self):
     """Stop the current container and start a new one from scratch."""
-    self.P("Restarting container from scratch...")
+    self.P("Restarting container from scratch...", color='b')
     self.stop_container()
     self._stop_event.set()  # signal log thread to stop if running
     if self.log_thread:
@@ -311,20 +416,27 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
   def _stream_logs(self, log_stream):
     """Consume a log iterator from exec_run and print its output."""
     if not log_stream:
+      self.P("No log stream provided", color='y')
       return
+    
     try:
       for log_bytes in log_stream:
         if log_bytes is None:
           break
         try:
           log_str = log_bytes.decode("utf-8", errors="replace")
-        except Exception:
+        except Exception as e:
+          self.P(f"Warning: Could not decode log bytes: {e}", color='y')
           log_str = str(log_bytes)
+        
         self.P(f"[CONTAINER] {log_str}", color='d', end='')
+        
         if self._stop_event.is_set():
+          self.P("Log streaming stopped by stop event", color='y')
           break
+          
     except Exception as e:
-      self.P(f"[ERROR] Exception while streaming logs: {e}")
+      self.P(f"Exception while streaming logs: {e}", color='r')
     return
 
   def _check_health_endpoint(self, current_time=None):
@@ -338,6 +450,18 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def _poll_endpoint(self):
     """Poll the container's health endpoint and log the response."""
+    if not self.port:
+      self.P("No port allocated, cannot poll endpoint", color='r')
+      return
+
+    if not self.cfg_endpoint_url:
+      self.P("No endpoint URL configured, skipping health check", color='y')
+      return
+
+    # Validate endpoint URL to prevent injection attacks
+    if ".." in self.cfg_endpoint_url or not self.cfg_endpoint_url.startswith("/"):
+      self.P(f"Invalid endpoint URL: {self.cfg_endpoint_url}", color='r')
+      return
 
     url = f"http://localhost:{self.port}{self.cfg_endpoint_url}"
 
@@ -353,29 +477,45 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     except requests.RequestException as e:
       self.P(f"Health check failed: {url} - {e}", color='r')
+    except Exception as e:
+      self.P(f"Unexpected error during health check: {e}", color='r')
     return
 
   def _get_latest_commit(self, return_data=False):
     """Fetch the latest commit SHA of the repository's monitored branch via GitHub API."""
     if not self.cfg_git_repo_owner or not self.cfg_git_repo_name:
+      self.P("Git repository owner or name not configured", color='y')
       return None
+
     if self.branch is None:
       api_url = f"https://api.github.com/repos/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}"
     else:
       api_url = f"https://api.github.com/repos/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}/branches/{self.branch}"
+    
     headers = {"Authorization": f"token {self.cfg_git_token}"} if self.cfg_git_token else {}
+    
     try:
       self.P(f"Commit check: {api_url}", color='b')
-      resp = requests.get(api_url, headers=headers, timeout=5)
-      data = resp.json() if resp.status_code == 200 else {}
-      if resp.status_code != 200:
-        self.P(f"[ERROR] Failed to fetch latest commit: {resp.text}", color='r')
-      latest_sha = data.get("commit", {}).get("sha", None)
-      if return_data:
-        return latest_sha, data
-      return latest_sha
+      resp = requests.get(api_url, headers=headers, timeout=10)
+      
+      if resp.status_code == 200:
+        data = resp.json()
+        latest_sha = data.get("commit", {}).get("sha", None)
+        if return_data:
+          return latest_sha, data
+        return latest_sha
+      elif resp.status_code == 404:
+        self.P(f"Repository or branch not found: {api_url}", color='r')
+      elif resp.status_code == 403:
+        self.P("GitHub API rate limit exceeded or access denied", color='r')
+      else:
+        self.P(f"Failed to fetch latest commit (HTTP {resp.status_code}): {resp.text}", color='r')
+        
+    except requests.RequestException as e:
+      self.P(f"Network error while fetching latest commit: {e}", color='r')
     except Exception as e:
-      self.P(f"[WARN] Failed to fetch latest commit: {e}", color='r')
+      self.P(f"Unexpected error while fetching latest commit: {e}", color='r')
+    
     return None
 
   def _check_git_updates(self, current_time=None):
@@ -383,7 +523,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     if current_time - self._last_git_check < self.cfg_git_poll_interval:
       latest_commit = self._get_latest_commit()
       if latest_commit and self.current_commit and latest_commit != self.current_commit:
-        self.P(f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restarting container...")
+        self.P(f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restarting container...", color='y')
         # Update current_commit to the new one
         self.current_commit = latest_commit
         # Restart container from scratch
@@ -414,6 +554,10 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       credentials configured.
     - This call contacts the registry; tune ``poll_interval`` appropriately.
     """
+    if not self.cfg_image:
+      self.P("No Docker image configured", color='r')
+      return None
+
     try:
       self.P(f"Image check: pulling '{self.cfg_image}' for metadata...", color='b')
       img = self.docker_client.images.pull(self.cfg_image)
@@ -423,8 +567,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       # Ensure attributes loaded
       try:
         img.reload()
-      except Exception:
-        pass
+      except Exception as e:
+        self.P(f"Warning: Could not reload image attributes: {e}", color='y')
+      
       attrs = getattr(img, "attrs", {}) or {}
       repo_digests = attrs.get("RepoDigests") or []
       if repo_digests:
@@ -433,23 +578,27 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         return digest
       # Fallback to image id (sha256:...)
       return getattr(img, "id", None)
+      
     except Exception as e:
-      self.P(f"[WARN] Image pull failed: {e}", color='r')
+      self.P(f"Image pull failed: {e}", color='r')
       # Fallback: check local image only
       try:
+        self.P(f"Checking local image: {self.cfg_image}", color='b')
         img = self.docker_client.images.get(self.cfg_image)
         try:
           img.reload()
-        except Exception:
-          pass
+        except Exception as e:
+          self.P(f"Warning: Could not reload local image attributes: {e}", color='y')
+        
         attrs = getattr(img, "attrs", {}) or {}
         repo_digests = attrs.get("RepoDigests") or []
         if repo_digests:
           digest = repo_digests[0].split("@")[-1]
           return digest
         return getattr(img, "id", None)
+        
       except Exception as e2:
-        self.P(f"[WARN] Could not get local image: {e2}", color='r')
+        self.P(f"Could not get local image: {e2}", color='r')
         return None
 
   def _check_image_updates(self, current_time=None):
@@ -458,7 +607,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self._last_image_check = current_time
       latest_image_hash = self._get_latest_image_hash()
       if latest_image_hash and self.current_image_hash and latest_image_hash != self.current_image_hash:
-        self.P(f"New image version detected ({latest_image_hash} != {self.current_image_hash}). Restarting container...")
+        self.P(f"New image version detected ({latest_image_hash} != {self.current_image_hash}). Restarting container...", color='y')
         # Update current_image_hash to the new one
         self.current_image_hash = latest_image_hash
         # Restart container from scratch
@@ -470,27 +619,35 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def stop_container(self):
     """Stop and remove the Docker container if it is running."""
-    if self.container:
-      try:
-        # Stop the container (gracefully)
-        self.container.stop(timeout=5)
-      except Exception as e:
-        self.P(f"[WARN] Error stopping container: {e}", color='r')
-      try:
-        self.container.remove()
-      except Exception as e:
-        self.P(f"[WARN] Error removing container: {e}", color='r')
-      finally:
-        self.container = None
+    if not self.container:
+      self.P("No container to stop", color='y')
+      return
+
+    try:
+      # Stop the container (gracefully)
+      self.P(f"Stopping container {self.container.short_id}...", color='b')
+      self.container.stop(timeout=5)
+      self.P(f"Container {self.container.short_id} stopped successfully", color='g')
+    except Exception as e:
+      self.P(f"Error stopping container: {e}", color='r')
+    
+    try:
+      self.P(f"Removing container {self.container.short_id}...", color='b')
+      self.container.remove()
+      self.P(f"Container {self.container.short_id} removed successfully", color='g')
+    except Exception as e:
+      self.P(f"Error removing container: {e}", color='r')
+    finally:
+      self.container = None
     return
 
   def run(self):
     """Run the container and monitor it, restarting on new commits and handling graceful shutdown."""
-    self.P("Starting container manager...")
+    self.P("Starting container manager...", color='b')
     self.current_commit = self._get_latest_commit()
     self.current_image_hash = self._get_latest_image_hash()
     if self.current_commit:
-      self.P(f"Latest commit on {self.branch}: {self.current_commit}")
+      self.P(f"Latest commit on {self.branch}: {self.current_commit}", color='d')
 
     try:
       # Initial container launch
@@ -505,7 +662,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         latest_commit = self._get_latest_commit()
         trigger_restart = False
         if latest_commit and self.current_commit and latest_commit != self.current_commit:
-          self.P(f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restarting container...")
+          self.P(f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restarting container...", color='y')
           # Update current_commit to the new one
           self.current_commit = latest_commit
           trigger_restart = True
@@ -520,7 +677,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         # If container has stopped on its own (unexpectedly), break out to end the loop
     except KeyboardInterrupt:
       # Handle Ctrl+C gracefully (SIGINT handled by signal handler too)
-      self.P("\nKeyboardInterrupt received. Shutting down...")
+      self.P("\nKeyboardInterrupt received. Shutting down...", color='y')
       # (The signal handler will also invoke stop_container)
     finally:
       # Ensure container is cleaned up if still running
@@ -529,23 +686,23 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self._stop_event.set()
       if self.log_thread:
         self.log_thread.join(timeout=5)
-      self.P("Container manager has exited.")
+      self.P("Container manager has exited", color='g')
     return
 
 
   def _handle_initial_launch(self):
     try:
-      self.P("Initial container launch...")
+      self.P("Initial container launch...", color='b')
       self.current_commit = self._get_latest_commit()
       self.current_image_hash = self._get_latest_image_hash()
       self.container = self._launch_container_app()
-      self.P("Container launched successfully.", color='g')
+      self.P("Container launched successfully", color='g')
       self.P(self.container)
       if self.current_commit:
-        self.P(f"Latest commit on {self.branch}: {self.current_commit}")
+        self.P(f"Latest commit on {self.branch}: {self.current_commit}", color='d')
 
     except Exception as e:
-      self.P(f"[ERR] Could not start container: {e}", color='r')
+      self.P(f"Could not start container: {e}", color='r')
 
   def _check_container_status(self):
     try:
@@ -553,14 +710,13 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         # Refresh container status
         self.container.reload()
         if self.container.status != "running":
-          self.P("[ERROR] Container stopped unexpectedly (exit code {}).".format(
-            self.container.attrs.get("State", {}).get("ExitCode")))
+          self.P(f"Container stopped unexpectedly (exit code {self.container.attrs.get('State', {}).get('ExitCode')})", color='r')
           return False
         # end if container not running
       # end if self.container
       return True
     except Exception as e:
-      self.P(f"[ERROR] Could not check container status: {e}", color='r')
+      self.P(f"Could not check container status: {e}", color='r')
       self.container = None
       return False
 
@@ -575,19 +731,21 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def on_close(self):
     """Cleanup on plugin close."""
-    self.P("Shutting down WorkerAppRunnerPlugin...", color='y')
+    self.P("Shutting down WorkerAppRunnerPlugin...", color='b')
     self.done = True
     self.stop_container()
     self._stop_event.set()
     if self.log_thread:
       self.log_thread.join(timeout=5)
+    
+    # Stop cloudflare tunnel if running
+    self.stop_cloudflare_tunnel()
+    
     super(WorkerAppRunnerPlugin, self).on_close()
 
     self.maybe_stop_tunnel_engine()
-    # Stop cloudflare tunnel if running
-    self.stop_cloudflare_tunnel()
 
-    self.P("WorkerAppRunnerPlugin has shut down.", color='y')
+    self.P("WorkerAppRunnerPlugin has shut down", color='g')
     return
 
   def process(self):
@@ -601,10 +759,6 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     # Start cloudflare tunnel if not already running
     if self.cfg_tunnel_engine_enabled and self.use_cloudflare() and not self.tunnel_process:
       self.start_cloudflare_tunnel()
-
-    # Read tunnel logs if tunnel is running
-    if self.tunnel_process:
-      self.read_tunnel_logs()
 
     if not self._check_container_status():
       return
