@@ -128,6 +128,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     self.repo_url = f"https://{self.cfg_git_username}:{self.cfg_git_token}@github.com/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}.git"
 
+    # Initialize tunnel process
+    self.tunnel_process = None
+
     self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
     return
 
@@ -156,6 +159,30 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self.volumes = {}
     self.dynamic_env = {}
 
+    return
+
+  def start_cloudflare_tunnel(self):
+    """
+    Start the cloudflare tunnel using the base tunnel engine functionality.
+    """
+    if self.cfg_tunnel_engine_enabled and self.use_cloudflare():
+      self.P("Starting Cloudflare tunnel...", color='b')
+      self.tunnel_process = self.run_cloudflare_tunnel()
+      if self.tunnel_process:
+        self.P("Cloudflare tunnel started successfully", color='g')
+      else:
+        self.P("Failed to start Cloudflare tunnel", color='r')
+    return
+
+  def stop_cloudflare_tunnel(self):
+    """
+    Stop the cloudflare tunnel.
+    """
+    if self.tunnel_process:
+      self.P("Stopping Cloudflare tunnel...", color='b')
+      self.stop_start_command(self.tunnel_process)
+      self.tunnel_process = None
+      self.P("Cloudflare tunnel stopped", color='g')
     return
 
 
@@ -544,7 +571,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     self._check_git_updates(current_time)
 
-    # self._check
+    return
 
   def on_close(self):
     """Cleanup on plugin close."""
@@ -568,6 +595,14 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self._handle_initial_launch()
 
     self.maybe_start_tunnel_engine()
+    
+    # Start cloudflare tunnel if not already running
+    if self.cfg_tunnel_engine_enabled and self.use_cloudflare() and not self.tunnel_process:
+      self.start_cloudflare_tunnel()
+
+    # Read tunnel logs if tunnel is running
+    if self.tunnel_process:
+      self.read_tunnel_logs()
 
     if not self._check_container_status():
       return
