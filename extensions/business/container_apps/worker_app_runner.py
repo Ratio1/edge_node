@@ -584,6 +584,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     super(WorkerAppRunnerPlugin, self).on_close()
 
     self.maybe_stop_tunnel_engine()
+    # Stop cloudflare tunnel if running
+    self.stop_cloudflare_tunnel()
 
     self.P("WorkerAppRunnerPlugin has shut down.", color='y')
     return
