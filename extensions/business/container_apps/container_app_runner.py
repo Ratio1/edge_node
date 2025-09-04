@@ -26,14 +26,12 @@ import socket
 import subprocess
 import time
 
-from naeural_core.business.base.web_app.base_web_app_plugin import BaseWebAppPlugin as BasePlugin
+from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
 __VER__ = "0.3.1"
 
-# Path for container volumes
-CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -50,9 +48,9 @@ _CONFIG = {
 
   # Generic tunnel engine Section
   "TUNNEL_ENGINE": "cloudflare",
-
   "TUNNEL_ENGINE_ENABLED": True,
   "TUNNEL_ENGINE_PING_INTERVAL": 30,  # seconds
+  "CLOUDFLARE_TOKEN": None,
   "TUNNEL_ENGINE_PARAMETERS": {
   },
 
@@ -150,6 +148,9 @@ class ContainerAppRunnerPlugin(
 
     self._is_manually_stopped = False # Flag to indicate if the container was manually stopped
 
+    # Initialize tunnel process
+    self.tunnel_process = None
+
     return
 
   def on_init(self):
@@ -173,6 +174,9 @@ class ContainerAppRunnerPlugin(
     self._setup_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
+
+    # Initialize tunnel engine
+    self.reset_tunnel_engine()
 
     return
 
@@ -234,6 +238,30 @@ class ContainerAppRunnerPlugin(
       return
     else:
       self.P(f"Unknown plugin command: {data}")
+    return
+
+  def start_cloudflare_tunnel(self):
+    """
+    Start the cloudflare tunnel using the base tunnel engine functionality.
+    """
+    if self.cfg_tunnel_engine_enabled and self.use_cloudflare():
+      self.P("Starting Cloudflare tunnel...", color='b')
+      self.tunnel_process = self.run_cloudflare_tunnel()
+      if self.tunnel_process:
+        self.P("Cloudflare tunnel started successfully", color='g')
+      else:
+        self.P("Failed to start Cloudflare tunnel", color='r')
+    return
+
+  def stop_cloudflare_tunnel(self):
+    """
+    Stop the cloudflare tunnel.
+    """
+    if self.tunnel_process:
+      self.P("Stopping Cloudflare tunnel...", color='b')
+      self.stop_start_command(self.tunnel_process)
+      self.tunnel_process = None
+      self.P("Cloudflare tunnel stopped", color='g')
     return
   
   def on_post_container_start(self):
@@ -312,93 +340,85 @@ class ContainerAppRunnerPlugin(
     #endif
     return
 
-
-  def _setup_resource_limits_and_ports(self):
+  def _maybe_close_setup_commands(self):
     """
-    Sets up resource limits for the container based on the configuration.
+    Close setup commands if they are running.
     """
-    DEFAULT_CPU_LIMIT = 1
-    DEFAULT_GPU_LIMIT = 0
-    DEFAULT_MEM_LIMIT = "512m"
-    DEFAULT_PORTS = []
-
-    container_resources = self.cfg_container_resources
-    if isinstance(container_resources, dict) and len(container_resources) > 0:
-      self._cpu_limit = container_resources.get("cpu", DEFAULT_CPU_LIMIT)
-      self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
-      self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
-
-      ports = container_resources.get("ports", DEFAULT_PORTS)
-
-      if len(ports) > 0:
-        if isinstance(ports, list):
-          # Handle list of container ports
-          for container_port in ports:
-            self.P(f"Additional container port {container_port} specified. Finding available host port ...")
-            host_port = self._allocate_port()
-            self.extra_ports_mapping[host_port] = container_port
-            self.P(f"Allocated free host port {host_port} for container port {container_port}.")
-        else:
-          # Handle dict of port mappings
-          # Check if main app port is mapped to a specific host port
-          if self.cfg_port and isinstance(ports, dict) and self.cfg_port in ports.values():
-            container_port = self.cfg_port
-            requested_host_port = int(next((k for k, v in ports.items() if v == container_port), 0))
-
-            self.P(f"Main app port {self.cfg_port} is not mapped to any host port in the ports dict. Allocating a new host port ...")
-
-            self.port = self._allocate_port(requested_host_port, allow_dynamic=True)
-
-            if self.port != requested_host_port:
-              self.P(f"Requested host port {requested_host_port} is not available. Allocated port {self.port} instead.")
-
-            self.extra_ports_mapping[self.port] = container_port
-
-          for host_port, container_port in ports.items():
-            try:
-              host_port = int(host_port)
-              if host_port in self.extra_ports_mapping:
-                self.Pd(f"Host port {host_port} is already allocated for container port {self.extra_ports_mapping[host_port]}. Skipping allocation.")
-                continue
-              self._allocate_port(host_port)
-              self.extra_ports_mapping[host_port] = container_port
-            except Exception as e:
-              self.P(f"Port {host_port} is not available.")
-              self.P(e)
-              raise RuntimeError(f"Port {host_port} is not available.")
-          # endfor each port
-        # endif ports list or dict
-      # endif ports
-    else:
-      self._cpu_limit = DEFAULT_CPU_LIMIT
-      self._gpu_limit = DEFAULT_GPU_LIMIT
-      self._mem_limit = DEFAULT_MEM_LIMIT
-    # endif resource limits
-
-    if not self.port and self.cfg_port:
-      self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
+    if hasattr(self, 'setup_commands_processes'):
+      for i, process in enumerate(self.setup_commands_processes):
+        if process and process.poll() is None:
+          self.P(f"Stopping setup command {i}...")
+          process.terminate()
+          try:
+            process.wait(timeout=5)
+          except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
     return
 
-
-  def _setup_volumes(self):
+  def _maybe_close_start_commands(self):
     """
-    Processes the volumes specified in the configuration.
+    Close start commands if they are running.
     """
-    if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
-      for host_path, container_path in self.cfg_volumes.items():
-        original_path = str(host_path)
-        sanitized_name = self.sanitize_name(original_path)
-
-        # Prefix the sanitized name with the instance ID
-        prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
-        self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
-
-        full_host_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
-        self.volumes[full_host_path] = container_path
-
-      # endfor each host path
-    # endif volumes
+    if hasattr(self, 'start_commands_processes'):
+      for i, process in enumerate(self.start_commands_processes):
+        if process and process.poll() is None:
+          self.P(f"Stopping start command {i}...")
+          process.terminate()
+          try:
+            process.wait(timeout=5)
+          except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
     return
+
+  def _maybe_read_and_stop_all_log_readers(self):
+    """
+    Read and stop all log readers.
+    """
+    if hasattr(self, 'dct_logs_reader'):
+      for key, reader in self.dct_logs_reader.items():
+        if reader:
+          reader.stop()
+          logs = reader.get_next_characters()
+          if logs:
+            self.on_log_handler(logs, key)
+    
+    if hasattr(self, 'dct_err_logs_reader'):
+      for key, reader in self.dct_err_logs_reader.items():
+        if reader:
+          reader.stop()
+          err_logs = reader.get_next_characters()
+          if err_logs:
+            self.P(f"[stderr][{key}]: {err_logs}")
+    return
+
+  def _container_retrieve_and_maybe_show_logs(self):
+    """
+    Retrieve and maybe show container logs.
+    """
+    if hasattr(self, 'container_logs') and self.container_logs:
+      # Show logs every SHOW_LOG_EACH seconds
+      if hasattr(self, 'last_log_show_time'):
+        if self.time() - self.last_log_show_time >= self.cfg_show_log_each:
+          self.last_log_show_time = self.time()
+          # Show last few lines
+          last_lines = list(self.container_logs)[-self.cfg_show_log_last_lines:]
+          for line in last_lines:
+            self.P(f"[CONTAINER] {line}", color='d')
+      else:
+        self.last_log_show_time = self.time()
+    return
+
+  def _reload_server(self):
+    """
+    Reload the server by restarting the container.
+    """
+    self.P("Reloading server...")
+    # This method is called when the container needs to be restarted
+    # The actual restart logic is handled by the container utils mixin
+    return
+
 
   # TODO: move to base class
   def _allocate_port(self, required_port=0, allow_dynamic=False, sleep_time=5):
@@ -477,6 +497,7 @@ class ContainerAppRunnerPlugin(
     self._maybe_read_and_stop_all_log_readers()
     # Stop tunnel engine if needed
     self.P("Stopping tunnel engine tunnel ...")
+    self.stop_cloudflare_tunnel()
     self.maybe_stop_tunnel_engine()
     self.P("Tunnel engine stopped.")
 
@@ -502,7 +523,13 @@ class ContainerAppRunnerPlugin(
     """
     self._stop_container_and_save_logs_to_disk()
     self._container_kill(self.container_id)
+    
+    # Stop cloudflare tunnel if running
+    self.stop_cloudflare_tunnel()
+    
     super(ContainerAppRunnerPlugin, self).on_close()
+    
+    self.maybe_stop_tunnel_engine()
 
 
   def _maybe_autoupdate_container(self):
@@ -539,13 +566,27 @@ class ContainerAppRunnerPlugin(
     This is the main process loop for the plugin that gets called each PROCESS_DELAY seconds and
     it performs the following:
     
-      1. self._container_maybe_reload() - check if the container is still running and perform the policy
+      1. Initialize tunnel engine if needed
+      2. Start tunnel engine if needed
+      3. Start cloudflare tunnel if needed
+      4. self._container_maybe_reload() - check if the container is still running and perform the policy
           specified in the restart policy.
-      2. self._container_retrieve_and_maybe_show_logs() - check if the logs should be show as well as complete the logs
+      5. self._container_retrieve_and_maybe_show_logs() - check if the logs should be show as well as complete the logs
+      6. Tunnel engine ping
     
     """
+    self.maybe_init_tunnel_engine()
+    self.maybe_start_tunnel_engine()
+    
+    # Start cloudflare tunnel if not already running
+    if self.cfg_tunnel_engine_enabled and self.use_cloudflare() and not self.tunnel_process:
+      self.start_cloudflare_tunnel()
+    
     self._maybe_set_container_id_and_show_app_info()
     self._maybe_autoupdate_container()
     self._container_maybe_reload()
+    self._container_retrieve_and_maybe_show_logs()
+    
+    self.maybe_tunnel_engine_ping()
 
     return
