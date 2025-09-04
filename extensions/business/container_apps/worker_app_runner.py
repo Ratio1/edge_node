@@ -266,28 +266,30 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     return
 
-  def start_cloudflare_tunnel(self):
+  def start_tunnel_engine(self):
     """
-    Start the cloudflare tunnel using the base tunnel engine functionality.
+    Start the tunnel engine using the base tunnel engine functionality.
     """
-    if self.cfg_tunnel_engine_enabled and self.use_cloudflare():
-      self.P("Starting Cloudflare tunnel...", color='b')
-      self.tunnel_process = self.run_cloudflare_tunnel()
+    if self.cfg_tunnel_engine_enabled:
+      engine_name = "Cloudflare" if self.use_cloudflare() else "ngrok"
+      self.P(f"Starting {engine_name} tunnel...", color='b')
+      self.tunnel_process = self.run_tunnel_engine()
       if self.tunnel_process:
-        self.P("Cloudflare tunnel started successfully", color='g')
+        self.P(f"{engine_name} tunnel started successfully", color='g')
       else:
-        self.P("Failed to start Cloudflare tunnel", color='r')
+        self.P(f"Failed to start {engine_name} tunnel", color='r')
     return
 
-  def stop_cloudflare_tunnel(self):
+  def stop_tunnel_engine(self):
     """
-    Stop the cloudflare tunnel.
+    Stop the tunnel engine.
     """
     if self.tunnel_process:
-      self.P("Stopping Cloudflare tunnel...", color='b')
-      self.stop_start_command(self.tunnel_process)
+      engine_name = "Cloudflare" if self.use_cloudflare() else "ngrok"
+      self.P(f"Stopping {engine_name} tunnel...", color='b')
+      self.stop_tunnel_command(self.tunnel_process)
       self.tunnel_process = None
-      self.P("Cloudflare tunnel stopped", color='g')
+      self.P(f"{engine_name} tunnel stopped", color='g')
     return
 
 
@@ -738,8 +740,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     if self.log_thread:
       self.log_thread.join(timeout=5)
     
-    # Stop cloudflare tunnel if running
-    self.stop_cloudflare_tunnel()
+    # Stop tunnel engine if running
+    self.stop_tunnel_engine()
     
     super(WorkerAppRunnerPlugin, self).on_close()
 
@@ -756,9 +758,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     self.maybe_start_tunnel_engine()
     
-    # Start cloudflare tunnel if not already running
-    if self.cfg_tunnel_engine_enabled and self.use_cloudflare() and not self.tunnel_process:
-      self.start_cloudflare_tunnel()
+    # Start tunnel engine if not already running
+    if self.cfg_tunnel_engine_enabled and not self.tunnel_process:
+      self.start_tunnel_engine()
 
     if not self._check_container_status():
       return
