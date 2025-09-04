@@ -135,6 +135,7 @@ _CONFIG = {
     'GIT_TOKEN': {
       'TYPE': 'str',
       'DESCRIPTION': 'GitHub personal access token for cloning (if private repo)',
+      'DEFAULT': '',
     },
 
     'GIT_BRANCH': {
@@ -148,6 +149,7 @@ _CONFIG = {
       'MIN_VAL': 10,
       'MAX_VAL': 3600,
       'DESCRIPTION': 'Seconds between Git commit checks',
+      'DEFAULT': 90,
     },
 
     'IMAGE_POLL_INTERVAL': {
@@ -155,6 +157,7 @@ _CONFIG = {
       'MIN_VAL': 60,
       'MAX_VAL': 3600,
       'DESCRIPTION': 'Seconds between Docker image checks',
+      'DEFAULT': 600,
     },
 
     'ENDPOINT_POLL_INTERVAL': {
@@ -167,7 +170,7 @@ _CONFIG = {
     'ENDPOINT_URL': {
       'TYPE': 'str',
       'DESCRIPTION': 'Endpoint to poll for health checks',
-      'DEFAULT': '/edgenode',
+      'DEFAULT': None,
     },
 
     'PORT': {
@@ -181,12 +184,14 @@ _CONFIG = {
       'TYPE': 'str',
       'DESCRIPTION': 'Container restart policy',
       'ALLOWED_VALUES': ['always', 'on-failure', 'unless-stopped', 'no'],
+      'DEFAULT': 'always',
     },
 
     'IMAGE_PULL_POLICY': {
       'TYPE': 'str',
       'DESCRIPTION': 'Docker image pull policy',
       'ALLOWED_VALUES': ['always', 'if-not-present', 'never'],
+      'DEFAULT': 'always',
     },
 
     'CONTAINER_RESOURCES': {
@@ -202,16 +207,19 @@ _CONFIG = {
     'ENV': {
       'TYPE': 'dict',
       'DESCRIPTION': 'Environment variables for the container',
+      'DEFAULT': {},
     },
 
     'DYNAMIC_ENV': {
       'TYPE': 'dict',
       'DESCRIPTION': 'Dynamic environment variables for the container',
+      'DEFAULT': {},
     },
 
     'CHAINSTORE_RESPONSE_KEY': {
       'TYPE': 'str',
       'DESCRIPTION': 'Optional key to send confirmation data to chainstore',
+      'DEFAULT': '',
     },
   },
 }
@@ -488,7 +496,6 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     url = f"http://localhost:{self.port}{self.cfg_endpoint_url}"
 
     try:
-      self.P(f"Polling health endpoint: {url}", color='b')
       resp = requests.get(url, timeout=5)
       status = resp.status_code
 
