@@ -406,7 +406,8 @@ class _ContainerUtilsMixin:
       self.P(f"Command output: {result.stdout}")
     except subprocess.CalledProcessError as e:
       self.P(f"Error running command in container: {e.stderr}", color='r')
-      
+
+    return
   ## END CONTAINER MIXIN ###
 
   ### NEW CONTAINER MIXIN METHODS ###

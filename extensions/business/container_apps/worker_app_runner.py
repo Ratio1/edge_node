@@ -476,6 +476,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     if current_time - self._last_endpoint_check >= self.cfg_endpoint_poll_interval:
       self._last_endpoint_check = current_time
       self._poll_endpoint()
+    return
 
 
   def _poll_endpoint(self):
@@ -671,54 +672,6 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.container_id = None
     return
 
-  def run(self):
-    """Run the container and monitor it, restarting on new commits and handling graceful shutdown."""
-    self.P("Starting container manager...", color='b')
-    self.current_commit = self._get_latest_commit()
-    self.current_image_hash = self._get_latest_image_hash()
-    if self.current_commit:
-      self.P(f"Latest commit on {self.branch}: {self.current_commit}", color='d')
-
-    try:
-      # Initial container launch
-      self._launch_container_app()
-      self.done = False
-      while not self.done:
-        # Sleep for the poll interval
-        time.sleep(self.poll_interval)
-        # Poll the application endpoint
-        self._poll_endpoint()
-        # Check for new commits in the repository
-        latest_commit = self._get_latest_commit()
-        trigger_restart = False
-        if latest_commit and self.current_commit and latest_commit != self.current_commit:
-          self.P(f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restarting container...", color='y')
-          # Update current_commit to the new one
-          self.current_commit = latest_commit
-          trigger_restart = True
-
-        if trigger_restart:
-          # Stop and remove current container, and end its log thread
-          self._restart_from_scratch()
-          continue  # continue monitoring with new container
-
-        elif latest_commit:
-          self.P(f"Latest commit on {self.branch}: {latest_commit} vs {self.current_commit}")
-        # If container has stopped on its own (unexpectedly), break out to end the loop
-    except KeyboardInterrupt:
-      # Handle Ctrl+C gracefully (SIGINT handled by signal handler too)
-      self.P("\nKeyboardInterrupt received. Shutting down...", color='y')
-      # (The signal handler will also invoke stop_container)
-    finally:
-      # Ensure container is cleaned up if still running
-      self.stop_container()
-      # Ensure log thread is stopped
-      self._stop_event.set()
-      if self.log_thread:
-        self.log_thread.join(timeout=5)
-      self.P("Container manager has exited", color='g')
-    return
-
 
   def _handle_initial_launch(self):
     try:
@@ -733,6 +686,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     except Exception as e:
       self.P(f"Could not start container: {e}", color='r')
+    return
 
   def _check_container_status(self):
     try:
