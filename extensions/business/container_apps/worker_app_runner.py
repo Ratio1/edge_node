@@ -404,7 +404,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       return stats.get("memory_stats", {}).get("usage", 0)
     except Exception as e:
       self.P(f"[WARN] Could not fetch memory usage: {e}")
-      return 0
+    # end try
+    return 0
 
 
   def _launch_container_app(self):
@@ -464,9 +465,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         if self._stop_event.is_set():
           self.P("Log streaming stopped by stop event", color='y')
           break
-          
     except Exception as e:
       self.P(f"Exception while streaming logs: {e}", color='r')
+    # end try
     return
 
   def _check_health_endpoint(self, current_time=None):
@@ -476,6 +477,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     if current_time - self._last_endpoint_check >= self.cfg_endpoint_poll_interval:
       self._last_endpoint_check = current_time
       self._poll_endpoint()
+    # end if time elapsed
     return
 
 
@@ -489,11 +491,6 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.P("No endpoint URL configured, skipping health check", color='y')
       return
 
-    # Validate endpoint URL to prevent injection attacks
-    if ".." in self.cfg_endpoint_url or not self.cfg_endpoint_url.startswith("/"):
-      self.P(f"Invalid endpoint URL: {self.cfg_endpoint_url}", color='r')
-      return
-
     url = f"http://localhost:{self.port}{self.cfg_endpoint_url}"
 
     try:
@@ -504,11 +501,11 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         self.P(f"Health check: {url} -> {status} OK", color='g')
       else:
         self.P(f"Health check: {url} -> {status} Error", color='r')
-
     except requests.RequestException as e:
       self.P(f"Health check failed: {url} - {e}", color='r')
     except Exception as e:
       self.P(f"Unexpected error during health check: {e}", color='r')
+    # end try
     return
 
   def _get_latest_commit(self, return_data=False):
@@ -521,9 +518,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       api_url = f"https://api.github.com/repos/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}"
     else:
       api_url = f"https://api.github.com/repos/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}/branches/{self.branch}"
-    
     headers = {"Authorization": f"token {self.cfg_git_token}"} if self.cfg_git_token else {}
-    
+
     try:
       self.P(f"Commit check: {api_url}", color='b')
       resp = requests.get(api_url, headers=headers, timeout=10)
@@ -540,12 +536,12 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         self.P("GitHub API rate limit exceeded or access denied", color='r')
       else:
         self.P(f"Failed to fetch latest commit (HTTP {resp.status_code}): {resp.text}", color='r')
-        
+      # end if response status
     except requests.RequestException as e:
       self.P(f"Network error while fetching latest commit: {e}", color='r')
     except Exception as e:
       self.P(f"Unexpected error while fetching latest commit: {e}", color='r')
-    
+    # end try
     return None
 
   def _check_git_updates(self, current_time=None):
@@ -560,6 +556,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         self._restart_from_scratch()
       elif latest_commit:
         self.P(f"Latest commit on {self.branch}: {latest_commit} vs {self.current_commit}")
+      # end if new commit
+    # end if time elapsed
     return
 
   def _get_latest_image_hash(self):
@@ -599,7 +597,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         img.reload()
       except Exception as e:
         self.P(f"Warning: Could not reload image attributes: {e}", color='y')
-      
+      # end try
+
       attrs = getattr(img, "attrs", {}) or {}
       repo_digests = attrs.get("RepoDigests") or []
       if repo_digests:
@@ -619,7 +618,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
           img.reload()
         except Exception as e:
           self.P(f"Warning: Could not reload local image attributes: {e}", color='y')
-        
+        # end try reload
         attrs = getattr(img, "attrs", {}) or {}
         repo_digests = attrs.get("RepoDigests") or []
         if repo_digests:
@@ -629,7 +628,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         
       except Exception as e2:
         self.P(f"Could not get local image: {e2}", color='r')
-        return None
+      # end try check for local image
+    # end try
+    return None
 
   def _check_image_updates(self, current_time=None):
     """Check for a new version of the Docker image and restart container if found."""
@@ -644,6 +645,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
         self._restart_from_scratch()
       elif latest_image_hash:
         self.P(f"Current image hash: {self.current_image_hash} vs latest: {latest_image_hash}")
+      # end if new image hash
+    # end if time elapsed
     return
 
 
@@ -660,7 +663,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.P(f"Container {self.container.short_id} stopped successfully", color='g')
     except Exception as e:
       self.P(f"Error stopping container: {e}", color='r')
-    
+    # end try
+
     try:
       self.P(f"Removing container {self.container.short_id}...", color='b')
       self.container.remove()
@@ -670,6 +674,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     finally:
       self.container = None
       self.container_id = None
+    # end try
     return
 
 
@@ -686,6 +691,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     except Exception as e:
       self.P(f"Could not start container: {e}", color='r')
+    # end try
     return
 
   def _check_container_status(self):
@@ -702,7 +708,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     except Exception as e:
       self.P(f"Could not check container status: {e}", color='r')
       self.container = None
-      return False
+    # end try
+    return False
 
   def _perform_periodic_monitoring(self):
     current_time = self.time()
