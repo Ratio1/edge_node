@@ -100,7 +100,7 @@ _CONFIG = {
   },
 
   # Chainstore response configuration
-  "CHAINSTORE_RESPONSE_KEY": None,  # Optional key to send confirmation data to chainstore
+  "CHAINSTORE_RESPONSE_KEY": '',  # Optional key to send confirmation data to chainstore
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -214,13 +214,7 @@ _CONFIG = {
       'TYPE': 'dict',
       'DESCRIPTION': 'Dynamic environment variables for the container',
       'DEFAULT': {},
-    },
-
-    'CHAINSTORE_RESPONSE_KEY': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'Optional key to send confirmation data to chainstore',
-      'DEFAULT': '',
-    },
+    }
   },
 }
 
