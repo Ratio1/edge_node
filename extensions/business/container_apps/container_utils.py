@@ -5,6 +5,11 @@ The utility mixin for container management used by ContainerAppRunnerPlugin
 """
 
 import subprocess
+import socket
+
+# Path for container volumes
+CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
+
 
 class _ContainerUtilsMixin:
 
@@ -401,5 +406,311 @@ class _ContainerUtilsMixin:
       self.P(f"Command output: {result.stdout}")
     except subprocess.CalledProcessError as e:
       self.P(f"Error running command in container: {e.stderr}", color='r')
-      
+
+    return
   ## END CONTAINER MIXIN ###
+
+  ### NEW CONTAINER MIXIN METHODS ###
+  # Don't change the signature of this method as it overwrites the base class method.
+  def _allocate_port(self, required_port=0, allow_dynamic=False, sleep_time=5):
+    """
+    Allocates an available port on the host system for container port mapping.
+
+    This method finds an available port on the host system that can be used for container port mapping.
+    If required_port is 0 (default), the OS will automatically select any available port.
+    If required_port is specified, the method will attempt to bind to that specific port.
+
+    The method uses a socket-based approach to port allocation:
+    1. Creates a new TCP socket
+    2. Sets SO_REUSEADDR option to allow immediate reuse of the port
+    3. Binds to the specified port (or any available port if 0)
+    4. Retrieves the actual port number that was bound
+    5. Closes the socket to release it for actual use
+
+    Args:
+        required_port (int, optional): The specific port number to allocate.
+            If 0 (default), the OS will select any available port.
+
+    Returns:
+        int: The allocated port number. This will be the same as required_port if specified
+             and available, or a randomly assigned port if required_port is 0.
+
+    Note:
+        The socket is closed immediately after port allocation to allow the port to be used
+        by the container. This is a common technique for port allocation in container runtimes.
+    """
+    port = None
+    if required_port != 0:
+      self.P(f"Trying to allocate requested port {required_port} ...")
+      done = False
+      while not done:
+        try:
+          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+          sock.bind(("", required_port))
+          port = sock.getsockname()[1]
+          sock.close()
+          done = True
+        except Exception as e:
+          port = None
+          if allow_dynamic:
+            self.P(f"Failed to allocate requested port {required_port}: {e}", color='r')
+            done = True  # if allow_dynamic is True, we stop trying to bind to the required port
+            required_port = 0  # reset to allow dynamic port allocation
+          else:
+            self.P(f"Port {required_port} is not available. Retrying in {sleep_time} seconds...", color='r')
+            self.sleep(sleep_time)  # wait before retrying
+        # endtry
+      # endwhile done
+    # endif required_port != 0
+
+    if required_port == 0 and port is None:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+      sock.bind(("", 0))
+      port = sock.getsockname()[1]
+      sock.close()
+    # endif
+    return port
+
+  def _setup_resource_limits_and_ports(self):
+    """
+    Sets up resource limits for the container based on the configuration.
+    """
+    DEFAULT_CPU_LIMIT = 1
+    DEFAULT_GPU_LIMIT = 0
+    DEFAULT_MEM_LIMIT = "512m"
+    DEFAULT_PORTS = []
+
+    container_resources = self.cfg_container_resources
+    if isinstance(container_resources, dict) and len(container_resources) > 0:
+      self._cpu_limit = container_resources.get("cpu", DEFAULT_CPU_LIMIT)
+      self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
+      self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
+
+      ports = container_resources.get("ports", DEFAULT_PORTS)
+
+      if len(ports) > 0:
+        if isinstance(ports, list):
+          # Handle list of container ports
+          for container_port in ports:
+            self.P(f"Additional container port {container_port} specified. Finding available host port ...")
+            host_port = self._allocate_port()
+            self.extra_ports_mapping[host_port] = container_port
+            self.P(f"Allocated free host port {host_port} for container port {container_port}.")
+        else:
+          # Handle dict of port mappings
+          # Check if main app port is mapped to a specific host port
+          if self.cfg_port and isinstance(ports, dict) and self.cfg_port in ports.values():
+            container_port = self.cfg_port
+            requested_host_port = int(next((k for k, v in ports.items() if v == container_port), 0))
+
+            self.P(f"Main app port {self.cfg_port} is not mapped to any host port in the ports dict. Allocating a new host port ...")
+
+            self.port = self._allocate_port(requested_host_port, allow_dynamic=True)
+
+            if self.port != requested_host_port:
+              self.P(f"Requested host port {requested_host_port} is not available. Allocated port {self.port} instead.")
+
+            self.extra_ports_mapping[self.port] = container_port
+
+          for host_port, container_port in ports.items():
+            try:
+              host_port = int(host_port)
+              if host_port in self.extra_ports_mapping:
+                self.Pd(f"Host port {host_port} is already allocated for container port {self.extra_ports_mapping[host_port]}. Skipping allocation.")
+                continue
+              self._allocate_port(host_port)
+              self.extra_ports_mapping[host_port] = container_port
+            except Exception as e:
+              self.P(f"Port {host_port} is not available.")
+              self.P(e)
+              raise RuntimeError(f"Port {host_port} is not available.")
+          # endfor each port
+        # endif ports list or dict
+      # endif ports
+    else:
+      self._cpu_limit = DEFAULT_CPU_LIMIT
+      self._gpu_limit = DEFAULT_GPU_LIMIT
+      self._mem_limit = DEFAULT_MEM_LIMIT
+    # endif resource limits
+
+    if not self.port and self.cfg_port:
+      self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
+    return
+
+  def _setup_volumes(self):
+    """
+    Processes the volumes specified in the configuration.
+    """
+    if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
+      for host_path, container_path in self.cfg_volumes.items():
+        original_path = str(host_path)
+        sanitized_name = self.sanitize_name(original_path)
+
+        # Prefix the sanitized name with the instance ID
+        prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
+        self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
+
+        full_host_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
+        self.volumes[full_host_path] = container_path
+
+      # endfor each host path
+    # endif volumes
+    return
+
+
+  ### END NEW CONTAINER MIXIN METHODS ###
+
+  ### COMMON CONTAINER UTILITY METHODS ###
+  
+  def _validate_container_config(self):
+    """Validate container configuration before starting."""
+    if not self.cfg_image:
+      raise ValueError("IMAGE is required")
+    
+    if not isinstance(self.cfg_image, str):
+      raise ValueError("IMAGE must be a string")
+    
+    # Validate container resources if provided
+    if hasattr(self, 'cfg_container_resources') and self.cfg_container_resources:
+      if not isinstance(self.cfg_container_resources, dict):
+        raise ValueError("CONTAINER_RESOURCES must be a dictionary")
+    
+    # Validate environment variables if provided
+    if hasattr(self, 'cfg_env') and self.cfg_env:
+      if not isinstance(self.cfg_env, dict):
+        raise ValueError("ENV must be a dictionary")
+    
+    return True
+
+  def _get_container_health_status(self):
+    """Get container health status."""
+    if not hasattr(self, 'container_id') or not self.container_id:
+      return "not_started"
+    
+    try:
+      is_running = self._container_is_running(self.container_id)
+      return "running" if is_running else "stopped"
+    except Exception as e:
+      self.P(f"Error checking container health: {e}", color='r')
+      return "error"
+
+  def _cleanup_container_resources(self):
+    """Clean up container resources on shutdown."""
+    if hasattr(self, 'container_id') and self.container_id:
+      self.P(f"Cleaning up container resources for {self.container_id}", color='b')
+      self._container_kill(self.container_id)
+      self.container_id = None
+      self.P("Container resources cleaned up", color='g')
+
+  def _validate_git_config(self):
+    """Validate Git configuration for repository access."""
+    if not hasattr(self, 'cfg_git_repo_owner') or not hasattr(self, 'cfg_git_repo_name'):
+      return False
+    
+    if not self.cfg_git_repo_owner or not self.cfg_git_repo_name:
+      self.P("Git repository owner or name not configured", color='y')
+      return False
+    
+    # Check if we have credentials for private repos
+    if hasattr(self, 'cfg_git_token') and not self.cfg_git_token:
+      self.P("Warning: No Git token provided, repository must be public", color='y')
+    
+    return True
+
+  def _validate_endpoint_config(self):
+    """Validate endpoint configuration for health checks."""
+    if not hasattr(self, 'cfg_endpoint_url') or not self.cfg_endpoint_url:
+      return False
+    
+    # Basic URL validation
+    if not isinstance(self.cfg_endpoint_url, str):
+      self.P("Endpoint URL must be a string", color='r')
+      return False
+    
+    if not self.cfg_endpoint_url.startswith('/'):
+      self.P("Endpoint URL must start with '/'", color='r')
+      return False
+    
+    if '..' in self.cfg_endpoint_url:
+      self.P("Endpoint URL contains invalid path traversal", color='r')
+      return False
+    
+    return True
+
+  def _get_container_info(self):
+    """Get comprehensive container information."""
+    info = {
+      'container_id': getattr(self, 'container_id', None),
+      'container_name': getattr(self, 'container_name', None),
+      'image': getattr(self, 'cfg_image', None),
+      'status': self._get_container_health_status(),
+      'port': getattr(self, 'port', None),
+      'start_time': getattr(self, 'container_start_time', None),
+    }
+    
+    if hasattr(self, 'extra_ports_mapping') and self.extra_ports_mapping:
+      info['extra_ports'] = self.extra_ports_mapping
+    
+    if hasattr(self, 'volumes') and self.volumes:
+      info['volumes'] = self.volumes
+    
+    return info
+
+  def _log_container_info(self):
+    """Log comprehensive container information."""
+    info = self._get_container_info()
+    self.P("Container Information:", color='b')
+    for key, value in info.items():
+      if value is not None:
+        self.P(f"  {key}: {value}", color='d')
+
+  def _validate_port_allocation(self, port):
+    """Validate that a port is properly allocated."""
+    if not port:
+      return False
+    
+    if not isinstance(port, int):
+      return False
+    
+    if port < 1 or port > 65535:
+      return False
+    
+    return True
+
+  def _safe_get_container_stats(self):
+    """Safely get container statistics without raising exceptions."""
+    if not hasattr(self, 'container_id') or not self.container_id:
+      return None
+    
+    try:
+      # This would need to be implemented based on the container runtime
+      # For now, return basic info
+      return {
+        'id': self.container_id,
+        'status': self._get_container_health_status(),
+        'running': self._container_is_running(self.container_id) if self.container_id else False
+      }
+    except Exception as e:
+      self.P(f"Error getting container stats: {e}", color='r')
+      return None
+
+  def _validate_docker_image_format(self, image_name):
+    """Validate Docker image name format."""
+    if not isinstance(image_name, str):
+      return False
+    
+    # Basic validation - should contain at least one colon or slash
+    if ':' not in image_name and '/' not in image_name:
+      return False
+    
+    # Check for invalid characters
+    invalid_chars = [' ', '\t', '\n', '\r']
+    for char in invalid_chars:
+      if char in image_name:
+        return False
+    
+    return True
+
+  ### END COMMON CONTAINER UTILITY METHODS ###
