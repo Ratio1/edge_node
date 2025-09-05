@@ -32,8 +32,6 @@ from .container_utils import _ContainerUtilsMixin # provides container managemen
 
 __VER__ = "0.3.1"
 
-# Path for container volumes
-CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -312,93 +310,6 @@ class ContainerAppRunnerPlugin(
     #endif
     return
 
-
-  def _setup_resource_limits_and_ports(self):
-    """
-    Sets up resource limits for the container based on the configuration.
-    """
-    DEFAULT_CPU_LIMIT = 1
-    DEFAULT_GPU_LIMIT = 0
-    DEFAULT_MEM_LIMIT = "512m"
-    DEFAULT_PORTS = []
-
-    container_resources = self.cfg_container_resources
-    if isinstance(container_resources, dict) and len(container_resources) > 0:
-      self._cpu_limit = container_resources.get("cpu", DEFAULT_CPU_LIMIT)
-      self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
-      self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
-
-      ports = container_resources.get("ports", DEFAULT_PORTS)
-
-      if len(ports) > 0:
-        if isinstance(ports, list):
-          # Handle list of container ports
-          for container_port in ports:
-            self.P(f"Additional container port {container_port} specified. Finding available host port ...")
-            host_port = self._allocate_port()
-            self.extra_ports_mapping[host_port] = container_port
-            self.P(f"Allocated free host port {host_port} for container port {container_port}.")
-        else:
-          # Handle dict of port mappings
-          # Check if main app port is mapped to a specific host port
-          if self.cfg_port and isinstance(ports, dict) and self.cfg_port in ports.values():
-            container_port = self.cfg_port
-            requested_host_port = int(next((k for k, v in ports.items() if v == container_port), 0))
-
-            self.P(f"Main app port {self.cfg_port} is not mapped to any host port in the ports dict. Allocating a new host port ...")
-
-            self.port = self._allocate_port(requested_host_port, allow_dynamic=True)
-
-            if self.port != requested_host_port:
-              self.P(f"Requested host port {requested_host_port} is not available. Allocated port {self.port} instead.")
-
-            self.extra_ports_mapping[self.port] = container_port
-
-          for host_port, container_port in ports.items():
-            try:
-              host_port = int(host_port)
-              if host_port in self.extra_ports_mapping:
-                self.Pd(f"Host port {host_port} is already allocated for container port {self.extra_ports_mapping[host_port]}. Skipping allocation.")
-                continue
-              self._allocate_port(host_port)
-              self.extra_ports_mapping[host_port] = container_port
-            except Exception as e:
-              self.P(f"Port {host_port} is not available.")
-              self.P(e)
-              raise RuntimeError(f"Port {host_port} is not available.")
-          # endfor each port
-        # endif ports list or dict
-      # endif ports
-    else:
-      self._cpu_limit = DEFAULT_CPU_LIMIT
-      self._gpu_limit = DEFAULT_GPU_LIMIT
-      self._mem_limit = DEFAULT_MEM_LIMIT
-    # endif resource limits
-
-    if not self.port and self.cfg_port:
-      self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
-    return
-
-
-  def _setup_volumes(self):
-    """
-    Processes the volumes specified in the configuration.
-    """
-    if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
-      for host_path, container_path in self.cfg_volumes.items():
-        original_path = str(host_path)
-        sanitized_name = self.sanitize_name(original_path)
-
-        # Prefix the sanitized name with the instance ID
-        prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
-        self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
-
-        full_host_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
-        self.volumes[full_host_path] = container_path
-
-      # endfor each host path
-    # endif volumes
-    return
 
   # TODO: move to base class
   def _allocate_port(self, required_port=0, allow_dynamic=False, sleep_time=5):

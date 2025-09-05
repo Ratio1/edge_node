@@ -24,13 +24,15 @@ class _NodeTagsMixin(object):
     tags = {}
 
     # Get all methods that follow the pattern get_ee_nodetag_{tag_name}
+    tag_fetch_method_name = f"get_{ct.HB.PREFIX_EE_NODETAG}"
+    tag_fetch_method_name = tag_fetch_method_name.lower()
     for method_name in dir(self):
-      if method_name.startswith(f"get_{ct.HB.PREFIX_EE_NODETAG}"):
+      if method_name.startswith(tag_fetch_method_name):
         tag_name = method_name.replace('get_', '').upper()
-        method = getattr(self, method_name)
-        if callable(method):
+        _method = getattr(self, method_name)
+        if callable(_method):
           try:
-            tag_value = method(node_address)
+            tag_value = _method(node_address)
             tags[tag_name] = tag_value
           except Exception as e:
             self.P(f"Error getting tag {tag_name}: {e}", color='r')
