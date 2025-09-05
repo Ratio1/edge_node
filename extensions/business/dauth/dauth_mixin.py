@@ -253,7 +253,7 @@ class _DauthMixin(object):
       dauth_data[key] = dct_auth_predefined_keys[key]
 
     # set node tags
-    tags = self.fetch_node_tags(node_address=sender_eth_address)
+    tags = self.fetch_node_tags(node_address_eth=sender_eth_address)
     if isinstance(tags, dict) and len(tags) > 0:
       for key, value in tags.items():
         if isinstance(key, str) and key.startswith(dAuthCt.DAUTH_ENV_KEYS_PREFIX):
