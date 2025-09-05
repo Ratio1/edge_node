@@ -44,11 +44,15 @@ class _NodeTagsMixin(object):
     Returns tag_value.
     """
     base_url = self.bc.get_network_data().get(self.const.BASE_CT.dAuth.EvmNetData.EE_DAPP_API_URL_KEY)
+    node_info = self.bc.web3_get_node_info(node_address=node_address)
+
+    node_owner = node_info.get("owner", None)
 
     url = "".join([base_url, "/accounts/is-kyb"])
     params = {
-      "walletAddress": node_address,
+      "walletAddress": node_owner,
     }
+
     response = self.requests.get(url, params=params)
     is_kyb = False
     if response.status_code == 200:
