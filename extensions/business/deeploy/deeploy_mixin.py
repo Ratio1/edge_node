@@ -1,5 +1,6 @@
 from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
+from naeural_core import constants as ct
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, DEEPLOY_RESOURCES
@@ -104,7 +105,9 @@ class _DeeployMixin:
     Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
     """
     plugins = self.deeploy_prepare_plugins(inputs)
+    job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
     project_id = inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
+    job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
     project_name = inputs.get(DEEPLOY_KEYS.PROJECT_NAME, None)
     response_keys = {}
     for addr in nodes:
@@ -138,11 +141,12 @@ class _DeeployMixin:
       self.P(f"Starting pipeline '{app_alias}' on {addr}{msg}")
       if addr is not None:
         dct_deeploy_specs = {
-          'job_id': inputs.job_id,
+          'job_id': job_id,
           'project_id': project_id,
           'project_name': project_name,
           'nr_target_nodes': len(nodes),
           'initial_target_nodes': nodes,
+          'job_tags': job_tags
         }
         self.cmdapi_start_pipeline_by_params(
           name=app_id,
@@ -391,6 +395,10 @@ class _DeeployMixin:
     # Phase 1: Check if nodes are available
 
     if len(nodes) == 0:
+      msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
+      raise ValueError(msg)
+
+    if inputs.target_nodes_count and len(nodes) < inputs.target_nodes_count:
       msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
       raise ValueError(msg)
 
