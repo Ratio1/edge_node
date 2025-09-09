@@ -84,8 +84,8 @@ _CONFIG = {
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
 
   # Application endpoint polling
-  "ENDPOINT_POLL_INTERVAL": 30,  # seconds between endpoint health checks
-  "ENDPOINT_URL": "/edgenode",  # endpoint to poll for health checks
+  "ENDPOINT_POLL_INTERVAL": 0,  # seconds between endpoint health checks
+  "ENDPOINT_URL": None,  # endpoint to poll for health checks
 
   #### Logging
   "SHOW_LOG_EACH" : 60,       # seconds to show logs
@@ -318,15 +318,21 @@ class ContainerAppRunnerPlugin(
     self.P(f"  Restart policy: {self.cfg_restart_policy}")
     self.P(f"  Pull policy: {self.cfg_image_pull_policy}")
 
-    self.container = self.docker_client.containers.run(
-      self.cfg_image,
-      detach=True,
-      ports=inverted_ports_mapping,
-      environment=env,
-      volumes=self.volumes,
-      restart_policy={"Name": self.cfg_restart_policy} if self.cfg_restart_policy != "no" else None,
-      name=self.container_name,
-    )
+    try:
+      self.container = self.docker_client.containers.run(
+        self.cfg_image,
+        detach=True,
+        ports=inverted_ports_mapping,
+        environment=env,
+        volumes=self.volumes,
+        restart_policy={"Name": self.cfg_restart_policy} if self.cfg_restart_policy != "no" else None,
+        name=self.container_name,
+      )
+    except Exception as e:
+      self.P(f"Could not start container: {e}", color='r')
+      self.container = None
+      return None
+
     self.container_id = self.container.short_id
     self.P(f"Container started (ID: {self.container.short_id})", color='g')
     return self.container
@@ -386,7 +392,7 @@ class ContainerAppRunnerPlugin(
     return
 
   def _check_health_endpoint(self, current_time=None):
-    if not self.container or not self.cfg_endpoint_url:
+    if not self.container or not self.cfg_endpoint_url or self.cfg_audit_dump_time <= 0:
       return
 
     if current_time - self._last_endpoint_check >= self.cfg_endpoint_poll_interval:
