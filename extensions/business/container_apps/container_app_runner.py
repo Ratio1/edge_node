@@ -302,12 +302,19 @@ class ContainerAppRunnerPlugin(
     if self.cfg_port and self.port:
       ports_mapping[self.port] = self.cfg_port
 
-    inverted_ports_mapping = {f"{v}/tcp": k for k, v in ports_mapping.items()}
+    inverted_ports_mapping = {f"{v}/tcp": str(k) for k, v in ports_mapping.items()}
 
     # Environment variables
     env = self.cfg_env.copy() if self.cfg_env else {}
     if self.dynamic_env:
       env.update(self.dynamic_env)
+    
+    # Ensure all environment variable values are strings (Docker requirement)
+    # env = {k: str(v) for k, v in env.items()}
+
+    configured_volumes = {}
+    for k, v in self.volumes.items():
+      configured_volumes[k] = {'bind': v, 'mode': 'rw'}
 
     self.P(f"Container data:")
     self.P(f"  Image: {self.cfg_image}")
@@ -324,8 +331,9 @@ class ContainerAppRunnerPlugin(
         detach=True,
         ports=inverted_ports_mapping,
         environment=env,
-        volumes=self.volumes,
-        restart_policy={"Name": self.cfg_restart_policy} if self.cfg_restart_policy != "no" else None,
+        volumes=configured_volumes,
+        # TODO: reformat this
+        # restart_policy={"Name": self.cfg_restart_policy} if self.cfg_restart_policy != "no" else None,
         name=self.container_name,
       )
     except Exception as e:
@@ -392,7 +400,7 @@ class ContainerAppRunnerPlugin(
     return
 
   def _check_health_endpoint(self, current_time=None):
-    if not self.container or not self.cfg_endpoint_url or self.cfg_audit_dump_time <= 0:
+    if not self.container or not self.cfg_endpoint_url or self.cfg_endpoint_poll_interval <= 0:
       return
 
     if current_time - self._last_endpoint_check >= self.cfg_endpoint_poll_interval:
