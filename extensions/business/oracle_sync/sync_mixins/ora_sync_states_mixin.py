@@ -77,6 +77,19 @@ class _OraSyncStatesCallbacksMixin:
           else:
             added_signatures_failed.append(epoch)
           # endif signatures success
+          if agreement_success and signatures_success:
+            # Save the epoch CIDs, in order to not upload it again
+            if self.cfg_use_r1fs:
+              agreement_cid = dct_epoch__agreed_median_table[epoch_key]
+              signatures_cid = dct_epoch__signatures[epoch_key]
+              self.netmon.epoch_manager.add_cid_for_epoch(
+                epoch=epoch,
+                agreement_cid=agreement_cid,
+                signatures_cid=signatures_cid,
+                debug=self.cfg_debug_sync_full,
+              )
+            # endif use_r1fs
+          # endif both addings successful
         else:
           # Here either the epoch is not valid or the agreement was already uploaded.
           if agreement_cid is not None and signatures_cid is not None:
@@ -108,6 +121,8 @@ class _OraSyncStatesCallbacksMixin:
 
       if len(newly_uploaded_epochs) > 0:
         self.P(f"Uploaded agreements for epochs: {newly_uploaded_epochs}. Saving the epoch manager status.")
+        # Here, the epoch manager cache data does not need to also be forcefully update.
+        # The only updates done are for the epochs CIDs
         self.netmon.epoch_manager.save_status()
         self.P(f"Epoch manager status saved.")
       # endif newly uploaded epochs
@@ -1249,6 +1264,14 @@ class _OraSyncStatesCallbacksMixin:
       }
       dct_epoch_is_valid = {
         epoch: dct_epoch_is_valid[str(epoch)]
+        for epoch in received_epochs
+      }
+      dct_epoch_agreement_cid = {
+        epoch: dct_epoch_agreement_cid.get(str(epoch))
+        for epoch in received_epochs
+      }
+      dct_epoch_signatures_cid = {
+        epoch: dct_epoch_signatures_cid.get(str(epoch))
         for epoch in received_epochs
       }
       if self.cfg_debug_sync_full:
