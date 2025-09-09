@@ -75,6 +75,8 @@ class DEEPLOY_ERRORS:
   REQUEST8 = "ERR16_REQUEST8"
   REQUEST9 = "ERR17_REQUEST9"
   REQUEST10 = "ERR18_REQUEST10"
+  REQUEST11 = "ERR19_REQUEST11"
+  REQUEST12 = "ERR20_REQUEST12"
   NODETAGS1 = "ERR19_NODETAGS1"
   NODETAGS2 = "ERR20_NODETAGS2"
   NODETAGS3 = "ERR21_NODETAGS3"
@@ -463,3 +465,8 @@ DEEPLOY_APP_COMMAND_REQUEST = {
 
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
 }  
+
+DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST = {
+  "job_id" : 1, # The job ID to retrieve details for
+  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
+}

@@ -11,7 +11,7 @@ from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
-  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_PLUGIN_DATA,
+  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_PLUGIN_DATA,
 )
   
 
@@ -457,7 +457,65 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  def _get_online_apps(self, owner=None, target_nodes=None):
+  @BasePlugin.endpoint(method="post")
+  def get_oracle_job_details(
+    self, 
+    request: dict = DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST
+  ):
+    """
+    Get the details of a job by its job ID.
+    This endpoint is restricted to oracles only.
+    
+    Parameters
+    ----------
+    request: dict containing next fields:
+      job_id : int
+        The job ID to retrieve details for
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str (must be an oracle)
+
+    Returns
+    -------
+    dict
+        A dictionary containing the job details
+    """
+    try:
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, require_sender_is_oracle=True, no_hash=False)
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+      if not job_id:
+        msg = f"{DEEPLOY_ERRORS.REQUEST11}: Job ID is required."
+        raise ValueError(msg)
+      
+      apps = self._get_online_apps(job_id=job_id)
+      found_app = None
+      found_app_alias = None
+      for node, app in apps.items():
+        for pipeline_name, details in app.items():
+          found_app = details
+          found_app_alias = pipeline_name
+          break
+      if not found_app:
+        msg = f"{DEEPLOY_ERRORS.REQUEST12}: Job with ID {job_id} not found."
+        raise ValueError(msg)
+
+      bc_job_details = self.bc.get_job_details(job_id=job_id)
+      result = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.PROJECT_NAME: found_app.get(NetMonCt.DEEPLOY_SPECS, None).get(DEEPLOY_KEYS.PROJECT_NAME, None),
+        'job_name': found_app_alias,
+        'job_type': bc_job_details.get("jobType")
+      }
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+    response = self._get_response({
+      **result
+    })
+    return response
+
+  def _get_online_apps(self, owner=None, target_nodes=None, job_id=None):
     """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
@@ -480,6 +538,14 @@ class DeeployManagerApiPlugin(
       for node, apps in result.items():
         for app_name, app_data in apps.items():
           if app_data[NetMonCt.OWNER] != owner:
+            continue
+          filtered_result[node][app_name] = app_data
+      result = filtered_result
+    if job_id is not None:
+      filtered_result = self.defaultdict(dict)
+      for node, apps in result.items():
+        for app_name, app_data in apps.items():
+          if app_data.get(NetMonCt.DEEPLOY_SPECS, None).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
             continue
           filtered_result[node][app_name] = app_data
       result = filtered_result
