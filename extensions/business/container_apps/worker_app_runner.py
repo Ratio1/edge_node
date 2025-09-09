@@ -711,6 +711,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self._check_health_endpoint(current_time)
 
     self._check_git_updates(current_time)
+    
+    self._check_image_updates(current_time)
 
     return
 
