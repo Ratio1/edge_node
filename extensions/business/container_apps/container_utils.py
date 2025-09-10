@@ -90,53 +90,6 @@ class _ContainerUtilsMixin:
 
     return dct_env
 
-
-
-
-  def _docker_container_exists(self, container):
-    """Check if container exists using Docker client."""
-    if container is None:
-      return False
-    try:
-      container.reload()
-      return True
-    except Exception as e:
-      self.P(f"Error checking container existence: {e}", color='r')
-      return False
-
-  def _docker_container_is_running(self, container):
-    """Check if container is running using Docker client."""
-    if container is None:
-      return False
-    try:
-      container.reload()
-      return container.status == "running"
-    except Exception as e:
-      self.P(f"Container status check: {e}", color='r')
-      return False
-
-  def _docker_stop_container(self, container):
-    """Stop and remove container using Docker client."""
-    if container is None:
-      self.P("No container to stop", color='y')
-      return
-
-    try:
-      self.P(f"Stopping container {container.short_id}...", color='b')
-      container.stop(timeout=5)
-      self.P(f"Container {container.short_id} stopped successfully", color='g')
-    except Exception as e:
-      self.P(f"Error stopping container: {e}", color='r')
-
-    try:
-      self.P(f"Removing container {container.short_id}...", color='b')
-      container.remove()
-      self.P(f"Container {container.short_id} removed successfully", color='g')
-    except Exception as e:
-      self.P(f"Error removing container: {e}", color='r')
-    return
-
-
   def _maybe_send_plugin_start_confirmation(self):
     """
     Sets up confirmation data about plugin start in CHAINSTORE.
@@ -208,63 +161,6 @@ class _ContainerUtilsMixin:
         self.P(f"Dynamic env var {variable_name} = {variable_value}")
       #endfor each variable
 
-  def _show_container_app_info(self):
-    """
-    Displays the current resource limits for the container.
-    This is a placeholder method and can be expanded as needed.
-    """
-    cr_server, cr_username, cr_password = self._get_cr_data()
-
-    msg = "Container info:\n"
-    msg += f"  Container ID:     {getattr(self, 'container_id', 'None')}\n"
-    msg += f"  Start Time:       {self.time_to_str(getattr(self, 'container_start_time', 0))}\n"
-    msg += f"  Resource CPU:     {getattr(self, '_cpu_limit', 'N/A')} cores\n"
-    msg += f"  Resource GPU:     {getattr(self, '_gpu_limit', 'N/A')}\n"
-    msg += f"  Resource Mem:     {getattr(self, '_mem_limit', 'N/A')}\n"
-    msg += f"  Target Image:     {self.cfg_image}\n"
-    msg += f"  CR:               {cr_server}\n"
-    msg += f"  CR User:          {cr_username}\n"
-    msg += f"  CR Pass:          {'*' * len(cr_password) if cr_password else 'None'}\n"
-    msg += f"  Env Vars:         {getattr(self, 'cfg_env', {})}\n"
-    msg += f"  Cont. Port:       {getattr(self, 'cfg_port', 'None')}\n"
-    msg += f"  Restart:          {getattr(self, 'cfg_restart_policy', 'N/A')}\n"
-    msg += f"  Image Pull:       {getattr(self, 'cfg_image_pull_policy', 'N/A')}\n"
-    if hasattr(self, 'volumes') and self.volumes and len(self.volumes) > 0:
-      msg += "  Volumes:\n"
-      for host_path, container_path in self.volumes.items():
-        msg += f"    Host {host_path} → Container {container_path}\n"
-    if hasattr(self, 'extra_ports_mapping') and self.extra_ports_mapping:
-      msg += "  Extra Ports Mapping:\n"
-      for host_port, container_port in self.extra_ports_mapping.items():
-        msg += f"   Host {host_port} → Container {container_port}\n"
-    msg += f"  Tunnel Host Port: {getattr(self, 'port', 'None')}\n"
-    msg += f"  Docker Client:    Available\n"
-    self.P(msg)
-    return
-
-
-  def _run_command_in_container(self, container, command):
-    """
-    Run a command inside the container using Docker client.
-
-    Args:
-        container: Docker container object
-        command (str): The command to run inside the container.
-    """
-    if not container:
-      self.P("Container is not available. Cannot run command.")
-      return
-
-    try:
-      result = container.exec_run(command)
-      if result.exit_code == 0:
-        self.P(f"Command output: {result.output.decode('utf-8', errors='replace')}")
-      else:
-        self.P(f"Command failed with exit code {result.exit_code}: {result.output.decode('utf-8', errors='replace')}", color='r')
-    except Exception as e:
-      self.P(f"Error running command in container: {e}", color='r')
-
-    return
   ## END CONTAINER MIXIN ###
 
   ### NEW CONTAINER MIXIN METHODS ###
@@ -470,13 +366,6 @@ class _ContainerUtilsMixin:
       self.P(f"Error checking container health: {e}", color='r')
       return "error"
 
-  def _cleanup_container_resources(self):
-    """Clean up container resources on shutdown using Docker client."""
-    container = getattr(self, 'container', None)
-    if container:
-      self.P(f"Cleaning up container resources for {container.short_id}", color='b')
-      self._docker_stop_container(container)
-      self.P("Container resources cleaned up", color='g')
 
   def _validate_git_config(self):
     """Validate Git configuration for repository access."""
