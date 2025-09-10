@@ -400,6 +400,7 @@ class _ContainerUtilsMixin:
     """
     Processes the volumes specified in the configuration.
     """
+    default_volume_rights = "rw"
     if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
       for host_path, container_path in self.cfg_volumes.items():
         original_path = str(host_path)
@@ -410,7 +411,7 @@ class _ContainerUtilsMixin:
         self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
 
         full_host_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
-        self.volumes[full_host_path] = container_path
+        self.volumes[full_host_path] = {"bind": container_path, "mode": default_volume_rights}
 
       # endfor each host path
     # endif volumes

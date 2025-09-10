@@ -308,13 +308,7 @@ class ContainerAppRunnerPlugin(
     env = self.cfg_env.copy() if self.cfg_env else {}
     if self.dynamic_env:
       env.update(self.dynamic_env)
-    
-    # Ensure all environment variable values are strings (Docker requirement)
-    # env = {k: str(v) for k, v in env.items()}
 
-    configured_volumes = {}
-    for k, v in self.volumes.items():
-      configured_volumes[k] = {'bind': v, 'mode': 'rw'}
 
     self.P(f"Container data:")
     self.P(f"  Image: {self.cfg_image}")
@@ -331,8 +325,7 @@ class ContainerAppRunnerPlugin(
         detach=True,
         ports=inverted_ports_mapping,
         environment=env,
-        volumes=configured_volumes,
-        # TODO: reformat this
+        volumes=self.volumes,
         # restart_policy={"Name": self.cfg_restart_policy} if self.cfg_restart_policy != "no" else None,
         name=self.container_name,
       )
