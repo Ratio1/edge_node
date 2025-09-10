@@ -503,7 +503,7 @@ class DeeployManagerApiPlugin(
       result = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
         DEEPLOY_KEYS.JOB_ID: job_id,
-        DEEPLOY_KEYS.PROJECT_NAME: found_app.get(NetMonCt.DEEPLOY_SPECS, None).get(DEEPLOY_KEYS.PROJECT_NAME, None),
+        DEEPLOY_KEYS.PROJECT_NAME: found_app.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.PROJECT_NAME, None),
         'job_name': found_app_alias,
         'job_type': bc_job_details.get("jobType")
       }
