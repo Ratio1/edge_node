@@ -545,7 +545,7 @@ class DeeployManagerApiPlugin(
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
         for app_name, app_data in apps.items():
-          if app_data.get(NetMonCt.DEEPLOY_SPECS, None).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
+          if app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
             continue
           filtered_result[node][app_name] = app_data
       result = filtered_result
