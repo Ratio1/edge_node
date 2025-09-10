@@ -239,12 +239,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     self._set_default_branch()
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
-    self._setup_dynamic_env() # setup dynamic env vars for the container
+    self._prepare_dynamic_env() # setup dynamic env vars for the container
 
     self.repo_url = f"https://{self.cfg_git_username}:{self.cfg_git_token}@github.com/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}.git"
-
-    # Initialize tunnel process
-    self.tunnel_process = None
 
     self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
     return
@@ -262,6 +259,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self._last_git_check = 0
     self._last_image_check = 0
     self._last_endpoint_check = 0
+
+    # Initialize tunnel process
+    self.tunnel_process = None
 
     # Determine default branch via GitHub API (so we know which branch to monitor)
     self.branch = None

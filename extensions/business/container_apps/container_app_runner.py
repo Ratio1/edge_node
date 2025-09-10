@@ -190,22 +190,13 @@ class ContainerAppRunnerPlugin(
 
     self.reset_tunnel_engine()
 
-    self._setup_dynamic_env() # setup dynamic env vars for the container
+    self._prepare_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
 
-    # Environment variables
-    self.env = self.cfg_env.copy() if self.cfg_env else {}
-    if self.dynamic_env:
-      self.env.update(self.dynamic_env)
-    # Ports mapping
-    ports_mapping = self.extra_ports_mapping.copy() if self.extra_ports_mapping else {}
-    if self.cfg_port and self.port:
-      ports_mapping[self.port] = self.cfg_port
-    self.inverted_ports_mapping = {f"{v}/tcp": str(k) for k, v in ports_mapping.items()}
+    self._setup_env_and_ports()
 
     return
-
 
   def on_command(self, data, **kwargs):
     """

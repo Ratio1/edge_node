@@ -169,7 +169,7 @@ class _ContainerUtilsMixin:
     return "some_other_value"
 
 
-  def _setup_dynamic_env(self):
+  def _prepare_dynamic_env(self):
     """
     Set up dynamic environment variables based on the configuration.
 
@@ -421,6 +421,19 @@ class _ContainerUtilsMixin:
   ### END NEW CONTAINER MIXIN METHODS ###
 
   ### COMMON CONTAINER UTILITY METHODS ###
+  def _setup_env_and_ports(self):
+    # Environment variables
+    self.env = self.cfg_env.copy() if self.cfg_env else {}
+    if self.dynamic_env:
+      self.env.update(self.dynamic_env)
+    # Ports mapping
+    ports_mapping = self.extra_ports_mapping.copy() if self.extra_ports_mapping else {}
+    if self.cfg_port and self.port:
+      ports_mapping[self.port] = self.cfg_port
+    # end if main port
+    self.inverted_ports_mapping = {f"{v}/tcp": str(k) for k, v in ports_mapping.items()}
+
+    return
 
   def _validate_container_config(self):
     """Validate container configuration before starting."""
