@@ -190,9 +190,9 @@ class ContainerAppRunnerPlugin(
 
     self.reset_tunnel_engine()
 
-    self._prepare_dynamic_env() # setup dynamic env vars for the container
+    self._configure_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
-    self._setup_volumes() # setup container volumes
+    self._configure_volumes() # setup container volumes
 
     self._setup_env_and_ports()
 

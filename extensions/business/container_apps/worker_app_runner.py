@@ -239,7 +239,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     self._set_default_branch()
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
-    self._prepare_dynamic_env() # setup dynamic env vars for the container
+    self._configure_dynamic_env() # setup dynamic env vars for the container
 
     self.repo_url = f"https://{self.cfg_git_username}:{self.cfg_git_token}@github.com/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}.git"
 

@@ -49,7 +49,7 @@ class AdminContainerAppRunnerPlugin(
     return
 
 
-  def _setup_volumes(self):
+  def _configure_volumes(self):
     """
     Processes the volumes specified in the configuration.
     """

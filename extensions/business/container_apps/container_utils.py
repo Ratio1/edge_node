@@ -169,7 +169,7 @@ class _ContainerUtilsMixin:
     return "some_other_value"
 
 
-  def _prepare_dynamic_env(self):
+  def _configure_dynamic_env(self):
     """
     Set up dynamic environment variables based on the configuration.
 
@@ -396,7 +396,7 @@ class _ContainerUtilsMixin:
       self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
     return
 
-  def _setup_volumes(self):
+  def _configure_volumes(self):
     """
     Processes the volumes specified in the configuration.
     """
