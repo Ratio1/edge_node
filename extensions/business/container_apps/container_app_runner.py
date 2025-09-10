@@ -149,6 +149,7 @@ class ContainerAppRunnerPlugin(
     self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
 
     self.volumes = {}
+    self.env = {}
     self.dynamic_env = {}
 
     self._is_manually_stopped = False # Flag to indicate if the container was manually stopped
@@ -192,6 +193,10 @@ class ContainerAppRunnerPlugin(
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._setup_volumes() # setup container volumes
 
+    # Environment variables
+    self.env = self.cfg_env.copy() if self.cfg_env else {}
+    if self.dynamic_env:
+      self.env.update(self.dynamic_env)
     return
 
 
@@ -304,16 +309,10 @@ class ContainerAppRunnerPlugin(
 
     inverted_ports_mapping = {f"{v}/tcp": str(k) for k, v in ports_mapping.items()}
 
-    # Environment variables
-    env = self.cfg_env.copy() if self.cfg_env else {}
-    if self.dynamic_env:
-      env.update(self.dynamic_env)
-
-
     self.P(f"Container data:")
     self.P(f"  Image: {self.cfg_image}")
     self.P(f"  Ports: {self.json_dumps(inverted_ports_mapping) if inverted_ports_mapping else 'None'}")
-    self.P(f"  Env: {self.json_dumps(env) if env else 'None'}")
+    self.P(f"  Env: {self.json_dumps(self.env) if self.env else 'None'}")
     self.P(f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}")
     self.P(f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}")
     self.P(f"  Restart policy: {self.cfg_restart_policy}")
@@ -324,7 +323,7 @@ class ContainerAppRunnerPlugin(
         self.cfg_image,
         detach=True,
         ports=inverted_ports_mapping,
-        environment=env,
+        environment=self.env,
         volumes=self.volumes,
         # restart_policy={"Name": self.cfg_restart_policy} if self.cfg_restart_policy != "no" else None,
         name=self.container_name,
