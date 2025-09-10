@@ -43,14 +43,14 @@ class _DeeployMixin:
     return types  
 
 
-  def __verify_signature(self, payload):
+  def __verify_signature(self, payload, no_hash=True):
     """
     Verify the signature of the request.
     """
     sender = self.bc.eth_verify_payload_signature(
       payload=payload,
       message_prefix=MESSAGE_PREFIX,
-      no_hash=True,
+      no_hash=no_hash,
       indent=1,
     )
     return sender
@@ -99,6 +99,14 @@ class _DeeployMixin:
     inputs.wallet_oracles = wallet_oracles
     return inputs
 
+  def __check_is_oracle(self, inputs):
+    sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
+    eth_oracles = self.bc.get_eth_oracles()
+    if len(eth_oracles) == 0:
+      raise ValueError("No oracles found - this is a critical issue!")
+    if not sender in eth_oracles:
+      raise ValueError("Sender {} is not an oracle".format(sender))
+    return True
 
   def __launch_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender):
     """
@@ -230,7 +238,7 @@ class _DeeployMixin:
     return str_timestamp
   
   
-  def deeploy_verify_and_get_inputs(self, request: dict):
+  def deeploy_verify_and_get_inputs(self, request: dict, require_sender_is_oracle: bool = False, no_hash: bool = True):
     sender = request.get(BASE_CT.BCctbase.ETH_SENDER)
     assert self.bc.is_valid_eth_address(sender), f"Invalid sender address: {sender}"
     
@@ -247,12 +255,15 @@ class _DeeployMixin:
     inputs = self.NestedDotDict(request_with_defaults)    
     self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
     
-    addr = self.__verify_signature(request)
+    addr = self.__verify_signature(request, no_hash=no_hash)
     if addr.lower() != sender.lower():
       raise ValueError("Invalid signature: recovered {} != {}".format(addr, sender))    
     
     # Check if the sender is allowed to create pipelines
-    self.__check_allowed_wallet(inputs)
+    if require_sender_is_oracle:
+      self.__check_is_oracle(inputs)
+    else:
+      self.__check_allowed_wallet(inputs)
     
     return sender, inputs
 
