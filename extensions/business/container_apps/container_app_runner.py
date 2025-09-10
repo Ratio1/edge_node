@@ -74,7 +74,7 @@ _CONFIG = {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,
     "memory": "512m",  # e.g. "512m" for 512MB,
-    "ports": []        # dict of container_port: host_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
+    "ports": []        # dict of host_port: container_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
@@ -146,7 +146,8 @@ class ContainerAppRunnerPlugin(
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
 
     # Handle port allocation for main port and additional ports
-    self.extra_ports_mapping = {}  # Dictionary to store container_port -> host_port mappings
+    self.extra_ports_mapping = {}  # Dictionary to store host_port -> container_port mappings
+    self.inverted_ports_mapping = {} # inverted mapping for docker-py container_port -> host_port
 
     self.volumes = {}
     self.env = {}
@@ -197,6 +198,12 @@ class ContainerAppRunnerPlugin(
     self.env = self.cfg_env.copy() if self.cfg_env else {}
     if self.dynamic_env:
       self.env.update(self.dynamic_env)
+    # Ports mapping
+    ports_mapping = self.extra_ports_mapping.copy() if self.extra_ports_mapping else {}
+    if self.cfg_port and self.port:
+      ports_mapping[self.port] = self.cfg_port
+    self.inverted_ports_mapping = {f"{v}/tcp": str(k) for k, v in ports_mapping.items()}
+
     return
 
 
@@ -302,16 +309,9 @@ class ContainerAppRunnerPlugin(
     """Start the Docker container."""
     self.P(f"Launching container with image '{self.cfg_image}'...")
 
-    # Ports mapping
-    ports_mapping = self.extra_ports_mapping.copy() if self.extra_ports_mapping else {}
-    if self.cfg_port and self.port:
-      ports_mapping[self.port] = self.cfg_port
-
-    inverted_ports_mapping = {f"{v}/tcp": str(k) for k, v in ports_mapping.items()}
-
     self.P(f"Container data:")
     self.P(f"  Image: {self.cfg_image}")
-    self.P(f"  Ports: {self.json_dumps(inverted_ports_mapping) if inverted_ports_mapping else 'None'}")
+    self.P(f"  Ports: {self.json_dumps(self.inverted_ports_mapping) if self.inverted_ports_mapping else 'None'}")
     self.P(f"  Env: {self.json_dumps(self.env) if self.env else 'None'}")
     self.P(f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}")
     self.P(f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}")
@@ -322,7 +322,7 @@ class ContainerAppRunnerPlugin(
       self.container = self.docker_client.containers.run(
         self.cfg_image,
         detach=True,
-        ports=inverted_ports_mapping,
+        ports=self.inverted_ports_mapping,
         environment=self.env,
         volumes=self.volumes,
         # restart_policy={"Name": self.cfg_restart_policy} if self.cfg_restart_policy != "no" else None,
