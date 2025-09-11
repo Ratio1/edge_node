@@ -44,20 +44,21 @@ class AdminContainerAppRunnerPlugin(
     if not self.volumes:
       self.volumes = {}
 
-    if self.cfg_mount_edge_node_data_volume == True:
-      self.volumes[EDGE_NODE_DATA_PATH] = EDGE_NODE_DATA_MOUNT_POINT
     return
 
 
-  def _setup_volumes(self):
+  def _configure_volumes(self):
     """
     Processes the volumes specified in the configuration.
     """
+    default_volume_rights = "rw"
+
+    if self.cfg_mount_edge_node_data_volume == True:
+      self.volumes[EDGE_NODE_DATA_PATH] = {"bind": EDGE_NODE_DATA_MOUNT_POINT, "mode": default_volume_rights}
     if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
       for host_path, container_path in self.cfg_volumes.items():
         original_path = str(host_path)
-        self.volumes[original_path] = container_path
-
+        self.volumes[original_path] = {"bind": container_path, "mode": default_volume_rights}
       # endfor each host path
     # endif volumes
     return

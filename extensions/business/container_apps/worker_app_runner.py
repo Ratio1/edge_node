@@ -63,19 +63,19 @@ _CONFIG = {
     "PASSWORD": None,  # Optional registry password or token
   },
 
+  "VCS_DATA": {
+    "PROVIDER": "github",  # currently only "github" is supported
+    "USERNAME": None,  # GitHub username for cloning (if private repo)
+    "TOKEN": None,  # GitHub personal access token for cloning (if private repo)
+    "REPO_OWNER": None,  # GitHub repository owner (user or org)
+    "REPO_NAME": None,  # GitHub repository name
+    "BRANCH": "main",  # branch to monitor for updates
+    "POLL_INTERVAL": 60,  # seconds between Git commit checks
+  },
+
   # Environment variables for the container
   "ENV": {},
   "DYNAMIC_ENV": {},
-
-  # Git config
-  "GIT_USERNAME": None,  # GitHub username for cloning (if private repo)
-  "GIT_TOKEN": None,  # GitHub personal access token for cloning (if private repo)
-  "GIT_REPO_OWNER": None,  # GitHub repository owner (user or org)
-  "GIT_REPO_NAME": None,  # GitHub repository name
-
-  # Git monitoring configuration
-  "GIT_BRANCH": "main",  # branch to monitor for updates
-  "GIT_POLL_INTERVAL": 60,  # seconds between Git commit checks
 
   # Docker image monitoring
   "IMAGE_POLL_INTERVAL": 300,  # seconds between Docker image checks
@@ -87,7 +87,7 @@ _CONFIG = {
 
   # Application endpoint polling
   "ENDPOINT_POLL_INTERVAL": 30,  # seconds between endpoint health checks
-  "ENDPOINT_URL": "/edgenode",  # endpoint to poll for health checks
+  "ENDPOINT_URL": None,  # endpoint to poll for health checks, for example "/edgenode" or "/health"
   "PORT": None,  # internal container port if it's a web app (int)
 
   # Container resource limits
@@ -100,122 +100,8 @@ _CONFIG = {
   },
 
   # Chainstore response configuration
-  "CHAINSTORE_RESPONSE_KEY": '',  # Optional key to send confirmation data to chainstore
+  "CHAINSTORE_RESPONSE_KEY": None,  # Optional key to send confirmation data to chainstore
 
-  'VALIDATION_RULES': {
-    **BasePlugin.CONFIG['VALIDATION_RULES'],
-
-    'IMAGE': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'Docker image to use for the container',
-      'REQUIRED': True,
-    },
-
-    'BUILD_AND_RUN_COMMANDS': {
-      'TYPE': 'list',
-      'DESCRIPTION': 'Commands to run in container for building and starting the app',
-      'MIN_LEN': 1,
-    },
-
-    'GIT_REPO_OWNER': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'GitHub repository owner (user or org)',
-    },
-
-    'GIT_REPO_NAME': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'GitHub repository name',
-    },
-
-    'GIT_USERNAME': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'GitHub username for cloning (if private repo)',
-    },
-
-    'GIT_TOKEN': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'GitHub personal access token for cloning (if private repo)',
-      'DEFAULT': '',
-    },
-
-    'GIT_BRANCH': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'Branch to monitor for updates',
-      'DEFAULT': 'main',
-    },
-
-    'GIT_POLL_INTERVAL': {
-      'TYPE': 'int',
-      'MIN_VAL': 10,
-      'MAX_VAL': 3600,
-      'DESCRIPTION': 'Seconds between Git commit checks',
-      'DEFAULT': 90,
-    },
-
-    'IMAGE_POLL_INTERVAL': {
-      'TYPE': 'int',
-      'MIN_VAL': 60,
-      'MAX_VAL': 3600,
-      'DESCRIPTION': 'Seconds between Docker image checks',
-      'DEFAULT': 600,
-    },
-
-    'ENDPOINT_POLL_INTERVAL': {
-      'TYPE': 'int',
-      'MIN_VAL': 5,
-      'MAX_VAL': 300,
-      'DESCRIPTION': 'Seconds between endpoint health checks',
-    },
-
-    'ENDPOINT_URL': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'Endpoint to poll for health checks',
-      'DEFAULT': None,
-    },
-
-    'PORT': {
-      'TYPE': 'int',
-      'MIN_VAL': 1,
-      'MAX_VAL': 65535,
-      'DESCRIPTION': 'Internal container port if it\'s a web app',
-    },
-
-    'RESTART_POLICY': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'Container restart policy',
-      'ALLOWED_VALUES': ['always', 'on-failure', 'unless-stopped', 'no'],
-      'DEFAULT': 'always',
-    },
-
-    'IMAGE_PULL_POLICY': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'Docker image pull policy',
-      'ALLOWED_VALUES': ['always', 'if-not-present', 'never'],
-      'DEFAULT': 'always',
-    },
-
-    'CONTAINER_RESOURCES': {
-      'TYPE': 'dict',
-      'DESCRIPTION': 'Container resource limits (CPU, GPU, memory, ports)',
-    },
-
-    'CR_DATA': {
-      'TYPE': 'dict',
-      'DESCRIPTION': 'Container registry data (server, username, password)',
-    },
-
-    'ENV': {
-      'TYPE': 'dict',
-      'DESCRIPTION': 'Environment variables for the container',
-      'DEFAULT': {},
-    },
-
-    'DYNAMIC_ENV': {
-      'TYPE': 'dict',
-      'DESCRIPTION': 'Dynamic environment variables for the container',
-      'DEFAULT': {},
-    }
-  },
 }
 
 
@@ -239,12 +125,10 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     self._set_default_branch()
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
-    self._setup_dynamic_env() # setup dynamic env vars for the container
+    self._configure_dynamic_env() # setup dynamic env vars for the container
 
-    self.repo_url = f"https://{self.cfg_git_username}:{self.cfg_git_token}@github.com/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}.git"
-
-    # Initialize tunnel process
-    self.tunnel_process = None
+    vcs_data = self.cfg_vcs_data or {}
+    self.repo_url = f"https://{vcs_data.get('USERNAME')}:{vcs_data.get('TOKEN')}@github.com/{vcs_data.get('REPO_OWNER')}/{vcs_data.get('REPO_NAME')}.git"
 
     self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
     return
@@ -262,6 +146,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self._last_git_check = 0
     self._last_image_check = 0
     self._last_endpoint_check = 0
+
+    # Initialize tunnel process
+    self.tunnel_process = None
 
     # Determine default branch via GitHub API (so we know which branch to monitor)
     self.branch = None
@@ -309,18 +196,22 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def _set_default_branch(self):
     """Determine the default branch of the repository via GitHub API."""
-    if self.cfg_git_repo_owner and self.cfg_git_repo_name:
+    vcs_data = self.cfg_vcs_data or {}
+    repo_owner = vcs_data.get('REPO_OWNER')
+    repo_name = vcs_data.get('REPO_NAME')
+    
+    if repo_owner and repo_name:
       try:
         resp = self._get_latest_commit(return_data=True)
         if resp is not None:
           _, data = resp
           self.P(f"Repository info:\n {json.dumps(data, indent=2)}", color='b')
           self.branch = data.get("default_branch", None)
-          self.P(f"Default branch for {self.cfg_git_repo_owner}/{self.cfg_git_repo_name} is '{self.branch}'", color='y')
+          self.P(f"Default branch for {repo_owner}/{repo_name} is '{self.branch}'", color='y')
       except Exception as e:
         self.P(f"[WARN] Could not determine default branch: {e}")
     if not self.branch:
-      self.branch = "main"  # Fallback to 'main' if not determined
+      self.branch = vcs_data.get('BRANCH', "main")  # Use VCS_DATA branch or fallback to 'main'
     return
 
 
@@ -468,6 +359,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     if not self.container or not self.cfg_endpoint_url:
       return
 
+    if not current_time:
+      current_time = self.time()
+
     if current_time - self._last_endpoint_check >= self.cfg_endpoint_poll_interval:
       self._last_endpoint_check = current_time
       self._poll_endpoint()
@@ -504,15 +398,20 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def _get_latest_commit(self, return_data=False):
     """Fetch the latest commit SHA of the repository's monitored branch via GitHub API."""
-    if not self.cfg_git_repo_owner or not self.cfg_git_repo_name:
+    vcs_data = self.cfg_vcs_data or {}
+    repo_owner = vcs_data.get('REPO_OWNER')
+    repo_name = vcs_data.get('REPO_NAME')
+    token = vcs_data.get('TOKEN')
+    
+    if not repo_owner or not repo_name:
       self.P("Git repository owner or name not configured", color='y')
       return None
 
     if self.branch is None:
-      api_url = f"https://api.github.com/repos/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}"
+      api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
     else:
-      api_url = f"https://api.github.com/repos/{self.cfg_git_repo_owner}/{self.cfg_git_repo_name}/branches/{self.branch}"
-    headers = {"Authorization": f"token {self.cfg_git_token}"} if self.cfg_git_token else {}
+      api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/branches/{self.branch}"
+    headers = {"Authorization": f"token {token}"} if token else {}
 
     try:
       self.P(f"Commit check: {api_url}", color='b')
@@ -540,7 +439,14 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def _check_git_updates(self, current_time=None):
     """Check for a new commit in the monitored branch and restart container if found."""
-    if current_time - self._last_git_check < self.cfg_git_poll_interval:
+    if not current_time:
+      current_time = self.time()
+
+    vcs_data = self.cfg_vcs_data or {}
+    poll_interval = vcs_data.get('POLL_INTERVAL', 60)
+    
+    if current_time - self._last_git_check >= poll_interval:
+      self._last_git_check = current_time
       latest_commit = self._get_latest_commit()
       if latest_commit and self.current_commit and latest_commit != self.current_commit:
         self.P(f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restarting container...", color='y')
@@ -585,13 +491,19 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       img = self.docker_client.images.pull(self.cfg_image)
       # docker-py may return Image or list[Image]
       if isinstance(img, list) and img:
+        self.P("Multiple images returned, using the last one", color='y')
+        self.P(self.json_dumps([i.id for i in img]), color='y')
         img = img[-1]
       # Ensure attributes loaded
+      self.P(f"Image pulled: {getattr(img, 'id', 'unknown id')}", color='g')
       try:
         img.reload()
       except Exception as e:
         self.P(f"Warning: Could not reload image attributes: {e}", color='y')
       # end try
+
+      self.P("Image loaded")
+
 
       attrs = getattr(img, "attrs", {}) or {}
       repo_digests = attrs.get("RepoDigests") or []
@@ -628,6 +540,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def _check_image_updates(self, current_time=None):
     """Check for a new version of the Docker image and restart container if found."""
+    if not current_time:
+      current_time = self.time()
     if current_time - self._last_image_check >= self.cfg_image_poll_interval:
       self._last_image_check = current_time
       latest_image_hash = self._get_latest_image_hash()
@@ -711,6 +625,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self._check_health_endpoint(current_time)
 
     self._check_git_updates(current_time)
+    
+    self._check_image_updates(current_time)
 
     return
 
