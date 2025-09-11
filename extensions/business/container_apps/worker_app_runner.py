@@ -359,6 +359,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     if not self.container or not self.cfg_endpoint_url:
       return
 
+    if not current_time:
+      current_time = self.time()
+
     if current_time - self._last_endpoint_check >= self.cfg_endpoint_poll_interval:
       self._last_endpoint_check = current_time
       self._poll_endpoint()
@@ -436,6 +439,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def _check_git_updates(self, current_time=None):
     """Check for a new commit in the monitored branch and restart container if found."""
+    if not current_time:
+      current_time = self.time()
+
     vcs_data = self.cfg_vcs_data or {}
     poll_interval = vcs_data.get('POLL_INTERVAL', 60)
     
@@ -534,6 +540,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def _check_image_updates(self, current_time=None):
     """Check for a new version of the Docker image and restart container if found."""
+    if not current_time:
+      current_time = self.time()
     if current_time - self._last_image_check >= self.cfg_image_poll_interval:
       self._last_image_check = current_time
       latest_image_hash = self._get_latest_image_hash()
