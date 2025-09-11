@@ -583,12 +583,11 @@ class ContainerAppRunnerPlugin(
   def _restart_container(self):
     """Restart the container from scratch."""
     self.P("Restarting container from scratch...", color='b')
-    self._stop_event.set()  # signal log thread to stop if running
-    if self.log_thread:
-      self.log_thread.join(timeout=5)
+    self._stop_container_and_save_logs_to_disk()
     # Start a new container
     self._stop_event.clear()  # reset stop flag for new log thread
     self.container = self.start_container()
+    self.start_tunnel_engine()
     self.container_start_time = self.time()
 
     # Start log streaming
