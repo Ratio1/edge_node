@@ -27,42 +27,35 @@ class _ContainerUtilsMixin:
     cr_username = cr_data.get('USERNAME')
     cr_password = cr_data.get('PASSWORD')
     return cr_server, cr_username, cr_password
-  
-  def _docker_login(self):
-    """Login to container registry using Docker client."""
+
+  def _login_to_registry(self):
+    """
+    Login to a private container registry using credentials from _get_cr_data.
+    
+    Returns:
+        bool: True if login successful, False otherwise
+    """
     cr_server, cr_username, cr_password = self._get_cr_data()
+    self.P(f"Container registry data: SERVER={cr_server}, USERNAME={cr_username}, PASSWORD={'***' if cr_password else None}")
+    # Skip login if no credentials provided
+    if not cr_username or not cr_password or not cr_server:
+      self.P("No registry credentials provided, skipping login", color='y')
+      return True
 
-    if cr_server and cr_username and cr_password:
-      try:
-        self.docker_client.login(
-          username=cr_username,
-          password=cr_password,
-          registry=cr_server
-        )
-        self.P(f"Successfully logged into registry {cr_server}", color='g')
-        return True
-      except Exception as e:
-        self.P(f"Failed to login to registry {cr_server}: {e}", color='r')
-        return False
-    return True  # No registry configured, consider it successful
+    self.P(f"Logging into container registry: {cr_server}", color='b')
 
-  def _docker_pull_image(self):
-    """Pull the container image using Docker client."""
     try:
-      full_ref = str(self.cfg_image)
-      cr_server, _, _ = self._get_cr_data()
-
-      if cr_server and not str(self.cfg_image).startswith(cr_server):
-        full_ref = f"{cr_server.rstrip('/')}/{self.cfg_image}"
-
-      self.P(f"Pulling image {full_ref}...", color='b')
-      image = self.docker_client.images.pull(full_ref)
-      self.P(f"Image {full_ref} pulled successfully", color='g')
+      result = self.docker_client.login(
+        username=cr_username,
+        password=cr_password,
+        registry=cr_server
+      )
+      self.P(f"Successfully logged into registry {cr_server}", color='g')
       return True
     except Exception as e:
-      self.P(f"Failed to pull image {self.cfg_image}: {e}", color='r')
-      return False
+      self.P(f"Docker client login failed: {e}", color='y')
 
+    return False
 
   def _get_default_env_vars(self):
     """

@@ -188,6 +188,10 @@ class ContainerAppRunnerPlugin(
 
     self.container_start_time = self.time()
 
+    # Login to container registry if credentials are provided
+    if not self._login_to_registry():
+      raise RuntimeError("Failed to login to container registry. Cannot proceed without authentication.")
+
     self.reset_tunnel_engine()
 
     self._configure_dynamic_env() # setup dynamic env vars for the container
@@ -505,6 +509,10 @@ class ContainerAppRunnerPlugin(
     if not self.cfg_image:
       self.P("No Docker image configured", color='r')
       return None
+
+    # Ensure we're logged in to the registry before pulling
+    if not self._login_to_registry():
+      raise RuntimeError("Failed to login to container registry. Cannot proceed without authentication.")
 
     try:
       self.P(f"Image check: pulling '{self.cfg_image}' for metadata...", color='b')
