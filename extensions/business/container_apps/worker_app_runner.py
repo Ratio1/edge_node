@@ -100,95 +100,8 @@ _CONFIG = {
   },
 
   # Chainstore response configuration
-  "CHAINSTORE_RESPONSE_KEY": '',  # Optional key to send confirmation data to chainstore
+  "CHAINSTORE_RESPONSE_KEY": None,  # Optional key to send confirmation data to chainstore
 
-  'VALIDATION_RULES': {
-    **BasePlugin.CONFIG['VALIDATION_RULES'],
-
-    'IMAGE': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'Docker image to use for the container',
-      'REQUIRED': True,
-    },
-
-    'BUILD_AND_RUN_COMMANDS': {
-      'TYPE': 'list',
-      'DESCRIPTION': 'Commands to run in container for building and starting the app',
-      'MIN_LEN': 1,
-    },
-
-    'IMAGE_POLL_INTERVAL': {
-      'TYPE': 'int',
-      'MIN_VAL': 60,
-      'MAX_VAL': 3600,
-      'DESCRIPTION': 'Seconds between Docker image checks',
-      'DEFAULT': 600,
-    },
-
-    'ENDPOINT_POLL_INTERVAL': {
-      'TYPE': 'int',
-      'MIN_VAL': 5,
-      'MAX_VAL': 300,
-      'DESCRIPTION': 'Seconds between endpoint health checks',
-    },
-
-    'ENDPOINT_URL': {
-      'TYPE': ['str', 'NoneType'],
-      'DESCRIPTION': 'Endpoint to poll for health checks',
-      'DEFAULT': None,
-    },
-
-    'PORT': {
-      'TYPE': 'int',
-      'MIN_VAL': 1,
-      'MAX_VAL': 65535,
-      'DESCRIPTION': 'Internal container port if it\'s a web app',
-    },
-
-    'RESTART_POLICY': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'Container restart policy',
-      'ALLOWED_VALUES': ['always', 'on-failure', 'unless-stopped', 'no'],
-      'DEFAULT': 'always',
-    },
-
-    'IMAGE_PULL_POLICY': {
-      'TYPE': 'str',
-      'DESCRIPTION': 'Docker image pull policy',
-      'ALLOWED_VALUES': ['always', 'if-not-present', 'never'],
-      'DEFAULT': 'always',
-    },
-
-    'CONTAINER_RESOURCES': {
-      'TYPE': 'dict',
-      'DESCRIPTION': 'Container resource limits (CPU, GPU, memory, ports)',
-      'DEFAULT': {}
-    },
-
-    'CR_DATA': {
-      'TYPE': 'dict',
-      'DESCRIPTION': 'Container registry data (server, username, password)',
-      'DEFAULT': {}
-    },
-
-    'ENV': {
-      'TYPE': 'dict',
-      'DESCRIPTION': 'Environment variables for the container',
-      'DEFAULT': {},
-    },
-
-    'DYNAMIC_ENV': {
-      'TYPE': 'dict',
-      'DESCRIPTION': 'Dynamic environment variables for the container',
-      'DEFAULT': {},
-    },
-
-    'VCS_DATA': {
-      'TYPE': 'dict',
-      'DESCRIPTION': 'Version control system data (provider, credentials, repository info)',
-      'DEFAULT': {},
-    }
-  },
 }
 
 
@@ -572,13 +485,19 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       img = self.docker_client.images.pull(self.cfg_image)
       # docker-py may return Image or list[Image]
       if isinstance(img, list) and img:
+        self.P("Multiple images returned, using the last one", color='y')
+        self.P(self.json_dumps([i.id for i in img]), color='y')
         img = img[-1]
       # Ensure attributes loaded
+      self.P(f"Image pulled: {getattr(img, 'id', 'unknown id')}", color='g')
       try:
         img.reload()
       except Exception as e:
         self.P(f"Warning: Could not reload image attributes: {e}", color='y')
       # end try
+
+      self.P("Image loaded")
+
 
       attrs = getattr(img, "attrs", {}) or {}
       repo_digests = attrs.get("RepoDigests") or []
