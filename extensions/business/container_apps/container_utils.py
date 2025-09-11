@@ -312,9 +312,15 @@ class _ContainerUtilsMixin:
   ### COMMON CONTAINER UTILITY METHODS ###
   def _setup_env_and_ports(self):
     # Environment variables
-    self.env = self.cfg_env.copy() if self.cfg_env else {}
+    # allow cfg_env to override default env vars
+    self.env = self._get_default_env_vars()
+    self.env.update(self.dynamic_env)
+    if self.cfg_env:
+      self.env.update(self.cfg_env)
     if self.dynamic_env:
       self.env.update(self.dynamic_env)
+    # endif dynamic env
+
     # Ports mapping
     ports_mapping = self.extra_ports_mapping.copy() if self.extra_ports_mapping else {}
     if self.cfg_port and self.port:
