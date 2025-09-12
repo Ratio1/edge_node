@@ -151,6 +151,7 @@ class _OraSyncUtilsMixin:
         self,
         nested_message_dict: dict,
         ignore_keys: list = None,
+        process_only_keys: list = None,
         return_cids: bool = False,
         debug=True
     ):
@@ -168,6 +169,10 @@ class _OraSyncUtilsMixin:
           A list of keys to ignore when extracting data from the message.
           This can be used to skip certain keys that are not relevant for the extraction.
           By default, None, which means no keys will be ignored.
+      process_only_keys : list, optional
+          If provided, only the keys in this list will be processed.
+          If empty list, no keys will be processed.
+          By default, None, which means all keys will be processed.
       debug : bool, optional
           Whether to print debug messages, by default True
 
@@ -192,20 +197,36 @@ class _OraSyncUtilsMixin:
           self.P(f"`ignore_keys` is {type(ignore_keys)} != list. Using empty list instead.", color='r')
         ignore_keys = []
       # endif ignore_keys is not list
+
+      if isinstance(process_only_keys, str):
+        process_only_keys = [process_only_keys]
+      # endif process_only_keys is str
+      if not isinstance(process_only_keys, list):
+        if debug and process_only_keys is not None:
+          self.P(f"`process_only_keys` is {type(process_only_keys)} != list. Using None instead.", color='r')
+        process_only_keys = None
+      else:
+        if debug:
+          self.P(f"Processing only keys in `process_only_keys`: {process_only_keys}.")
+      # endif process_only_keys is not list
+
       updated_values = {}
       cids = {}
       for key, msg_data in nested_message_dict.items():
-        # 1. Check if the key is in the ignore keys.
+        # 1. Check if process_only_keys is provided and if the current key is in it.
+        if process_only_keys is not None and key not in process_only_keys:
+          continue
+        # 2. Check if the key is in the ignore keys.
         if key in ignore_keys:
           continue
-        # 2. Check if the data is a CID or data.
+        # 3. Check if the data is a CID or data.
         if isinstance(msg_data, str):
           if debug:
             self.P(f"Attempting to get data from R1FS using CID {msg_data}.")
-          # 3. Attempt to get the data from R1FS.
+          # 4. Attempt to get the data from R1FS.
           res = self.r1fs_get_pickle(cid=msg_data, debug=debug)
           if res is not None and debug:
-            # 4. If the retrieval was successful, store the result.
+            # 5. If the retrieval was successful, store the result.
             updated_values[key] = res
             cids[key] = msg_data
             self.P(f"Successfully retrieved data from R1FS using CID {msg_data}.")
@@ -214,7 +235,7 @@ class _OraSyncUtilsMixin:
             break
         # endif
       # endfor key, data
-      # 5. Update the nested message dictionary with the retrieved values.
+      # 6. Update the nested message dictionary with the retrieved values.
       nested_message_dict.update(updated_values)
       return (success, nested_message_dict, cids) if return_cids else (success, nested_message_dict)
 
