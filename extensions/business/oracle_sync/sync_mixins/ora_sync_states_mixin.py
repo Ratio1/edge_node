@@ -1360,7 +1360,7 @@ class _OraSyncStatesCallbacksMixin:
         ):
           # if one signature for the received table is invalid, ignore the entire message
           if self.cfg_debug_sync:
-            self.P(f"Received invalid availability table from {sender = }. Ignoring", color='r')
+            self.P(f"Received invalid availability table from {sender = }[{epoch=} invalid]. Ignoring", color='r')
           return success
       # end for epoch agreed table
 
