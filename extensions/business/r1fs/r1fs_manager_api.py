@@ -221,6 +221,7 @@ class R1fsManagerApiPlugin(BasePlugin):
 
     self.P(f"Trying to download file -> {cid}")
     file = self.r1fs.get_file(cid=cid, secret=secret)
+    file = file.replace("/edge_node", ".") if file else file
     filename = file.split('/')[-1] if file else None
     self.P(f"File retrieved: {file}")
     file_base64 = self.diskapi_load_r1fs_file(file, verbose=True, to_base64=True)

@@ -1217,10 +1217,63 @@ class _OraSyncStatesCallbacksMixin:
       if not self._check_received_epoch__agreed_median_table_ok(sender, oracle_data):
         return success
 
+      first_needed_epoch = self._last_epoch_synced + 1
+      last_needed_epoch = self._current_epoch - 1
+      epochs_range = range(first_needed_epoch, last_needed_epoch + 1)
+
+      # In case the message contains more than the needed epoch keys
+      # only the needed keys will be downloaded from R1FS if needed.
+      needed_epoch_keys = [
+        str(x)
+        for x in epochs_range
+      ]
+
+      # sort epoch_keys in ascending order
+      epoch_keys = oracle_data[OracleSyncCt.EPOCH_KEYS]
+      received_epochs = sorted(list(set(epoch_keys)))
+      # filter received epochs to keep only the needed ones
+      received_epochs = [
+        epoch for epoch in received_epochs
+        if epoch in epochs_range
+      ]
+
+      stage = oracle_data[OracleSyncCt.STAGE]
+      log_str = self.log_received_message(
+        sender=sender,
+        data=self.dct_agreed_availability_signatures,
+        stage=stage,
+        return_str=True
+      )
+      log_str += f", {received_epochs = }\n"
+      log_str += f"Keeping only tables for epochs [{first_needed_epoch}, {last_needed_epoch}]"
+      self.P(log_str)
+
+      cnt_expected_epochs = last_needed_epoch - first_needed_epoch + 1
+      enough_data_received = len(received_epochs) == cnt_expected_epochs
+      limits_received = first_needed_epoch in received_epochs and last_needed_epoch in received_epochs
+
+      if not enough_data_received or not limits_received:
+        # Expected epochs in range [last_epoch_synced + 1, current_epoch - 1]
+        # received epochs don t contain the full range
+        if self.cfg_debug_sync:
+          min_epoch = min(received_epochs) if len(received_epochs) > 0 else None
+          max_epoch = max(received_epochs) if len(received_epochs) > 0 else None
+          cnt_epochs = len(received_epochs)
+          msg = f'Expected epochs {cnt_epochs} in range [{first_needed_epoch}, {last_needed_epoch}] '
+          msg += f'and received only {len(received_epochs)} epochs (min: {min_epoch}, max: {max_epoch}). '
+          msg += f'Ignoring...'
+          self.P(msg, color='r')
+        return success
+      # endif received epochs not containing the full requested interval
+
       # Here, both the agreed median table and the agreement signatures should have the same keys,
       # but as string instead of int. We also know that in epoch_keys we have
       # the keys in int format. Thus, we need to convert the keys of the received tables
       dct_epoch_agreed_median_table = oracle_data[OracleSyncCt.EPOCH__AGREED_MEDIAN_TABLE]
+      dct_epoch_agreed_median_table = {
+        k: v
+        for k, v in dct_epoch_agreed_median_table.items() if k in needed_epoch_keys
+      }
       agreement_success, dct_epoch_agreed_median_table, dct_epoch_agreement_cid = self.r1fs_get_data_from_nested_message(
         nested_message_dict=dct_epoch_agreed_median_table,
         return_cids=True,
@@ -1231,9 +1284,14 @@ class _OraSyncStatesCallbacksMixin:
         return success
       # endif not agreement_success
       dct_epoch_agreement_signatures = oracle_data[OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES]
+      dct_epoch_agreement_signatures = {
+        k: v
+        for k, v in dct_epoch_agreement_signatures.items() if k in needed_epoch_keys
+      }
       signatures_success, dct_epoch_agreement_signatures, dct_epoch_signatures_cid = self.r1fs_get_data_from_nested_message(
         nested_message_dict=dct_epoch_agreement_signatures,
         return_cids=True,
+        process_only_keys=needed_epoch_keys
       )
       if not signatures_success:
         if self.cfg_debug_sync:
@@ -1241,16 +1299,12 @@ class _OraSyncStatesCallbacksMixin:
         return success
       # endif not signatures_success
       dct_epoch_is_valid = oracle_data[OracleSyncCt.EPOCH__IS_VALID]
-      epoch_keys = oracle_data[OracleSyncCt.EPOCH_KEYS]
       id_to_node_address = oracle_data.get(OracleSyncCt.ID_TO_NODE_ADDRESS, {})
       # Unsqueeze the epoch dictionaries if they are squeezed.
       [dct_epoch_agreed_median_table, dct_epoch_agreement_signatures] = self._maybe_unsqueeze_epoch_dictionaries(
         lst_squeezed_epoch_dictionaries=[dct_epoch_agreed_median_table, dct_epoch_agreement_signatures],
         id_to_keys=id_to_node_address,
       )
-
-      # sort epoch_keys in ascending order
-      received_epochs = sorted(epoch_keys)
 
       # convert to dict with int keys
       dct_epoch_agreed_median_table = {
@@ -1282,7 +1336,6 @@ class _OraSyncStatesCallbacksMixin:
         self.P(msg)
       # endif debug_sync_full
 
-      message_invalid = False
       for epoch, agreed_median_table in dct_epoch_agreed_median_table.items():
         # At this point we did not need to convert the keys of the dictionaries yet,
         # because in valid messages both the agreement table and the agreement signatures
@@ -1306,40 +1359,11 @@ class _OraSyncStatesCallbacksMixin:
             debug=False
         ):
           # if one signature for the received table is invalid, ignore the entire message
-          message_invalid = True
-          break
+          if self.cfg_debug_sync:
+            self.P(f"Received invalid availability table from {sender = }[{epoch=} invalid]. Ignoring", color='r')
+          return success
       # end for epoch agreed table
 
-      if message_invalid:
-        if self.cfg_debug_sync:
-          self.P(f"Received invalid availability table from {sender = }. Ignoring", color='r')
-        return success
-      # endif
-
-      if self._last_epoch_synced + 1 not in received_epochs or self._current_epoch - 1 not in received_epochs:
-        # Expected epochs in range [last_epoch_synced + 1, current_epoch - 1]
-        # received epochs don t contain the full range
-        if self.cfg_debug_sync:
-          min_epoch = min(received_epochs) if len(received_epochs) > 0 else None
-          max_epoch = max(received_epochs) if len(received_epochs) > 0 else None
-          msg = (f'Expected epochs in range [{self._last_epoch_synced + 1}, {self._current_epoch - 1}] '
-                 f'and received only {len(received_epochs)} epochs (min: {min_epoch}, max: {max_epoch}). '
-                 f'Ignoring...')
-          self.P(msg, color='r')
-        return success
-      # endif received epochs not containing the full requested interval
-
-      stage = oracle_data[OracleSyncCt.STAGE]
-      log_str = self.log_received_message(
-        sender=sender,
-        data=self.dct_agreed_availability_signatures,
-        stage=stage,
-        return_str=True
-      )
-      log_str += f", {received_epochs = }\n"
-      log_str += f"Keeping only tables for epochs [{self._last_epoch_synced + 1}, {self._current_epoch - 1}]"
-      self.P(log_str)
-      epochs_range = range(self._last_epoch_synced + 1, self._current_epoch)
       self.dct_agreed_availability_table[sender] = {
         # No need for get here, since in S0 we send a continuous range of epochs.
         i: dct_epoch_agreed_median_table[i]
