@@ -181,6 +181,21 @@ class _DeeployMixin:
         tuple: (dct_status, str_status) where:
             dct_status: Dictionary of response statuses
             str_status: Overall status ('success', 'timeout', or 'pending')
+
+    Async job deeploy:
+
+    1. Oracle A receives launch and sends command then responds with command-hash "X"
+       setting `async_status=true` so that the API does NOT return immediately.
+       Default async_status=true!
+       X must be unique and stored in the pipeline definition (maybe the pipeline name or job_id)
+    2. UI checks X via Oracle B
+    3. Oracle B checks pipeline status (already received via net-config) via netmon AND looks at
+       chainstore-response var from plugin instance and will respond False (not ready yet)
+    4. UI again checks X via Oracle C
+    5. Oracle C checks pipeline status via netmon AND looks at chainstore-response and sees
+       correct status (job status updated from CAR/WAR to CStore)
+    6. UI shows success
+
     """
     dct_status = {}
     str_status = DEEPLOY_STATUS.PENDING
