@@ -366,21 +366,6 @@ class _ContainerUtilsMixin:
       return "error"
 
 
-  def _validate_git_config(self):
-    """Validate Git configuration for repository access."""
-    if not hasattr(self, 'cfg_git_repo_owner') or not hasattr(self, 'cfg_git_repo_name'):
-      return False
-
-    if not self.cfg_git_repo_owner or not self.cfg_git_repo_name:
-      self.P("Git repository owner or name not configured", color='y')
-      return False
-
-    # Check if we have credentials for private repos
-    if hasattr(self, 'cfg_git_token') and not self.cfg_git_token:
-      self.P("Warning: No Git token provided, repository must be public", color='y')
-
-    return True
-
   def _validate_endpoint_config(self):
     """Validate endpoint configuration for health checks."""
     if not hasattr(self, 'cfg_endpoint_url') or not self.cfg_endpoint_url:
