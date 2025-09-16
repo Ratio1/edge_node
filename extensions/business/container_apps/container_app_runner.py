@@ -330,6 +330,9 @@ class ContainerAppRunnerPlugin(
 
     self.container_id = self.container.short_id
     self.P(f"Container started (ID: {self.container.short_id})", color='g')
+
+    self._maybe_send_plugin_start_confirmation()
+
     return self.container
 
   def stop_container(self):
