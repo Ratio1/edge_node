@@ -1,5 +1,7 @@
 from naeural_core import constants as ct
 
+ADDRESS_ZERO = "0x0000000000000000000000000000000000000000"
+
 class _NodeTagsMixin(object):
   def __init__(self):
     super(_NodeTagsMixin, self).__init__()
@@ -48,6 +50,9 @@ class _NodeTagsMixin(object):
 
     node_owner = node_info.get("owner", None)
 
+    if node_owner == ADDRESS_ZERO:
+      return False
+
     url = "".join([base_url, "/accounts/is-kyb"])
     params = {
       "walletAddress": node_owner,
@@ -64,7 +69,8 @@ class _NodeTagsMixin(object):
       except Exception as e:
         self.P("Error parsing JSON response: {}".format(e), color='r')
     else:
-      self.P("Could not fetch is_kyb for wallet {}. Response status code: {}".format(
+      self.P("Could not fetch is_kyb for wallet {} (node addr {}). Response status code: {}".format(
+        node_owner,
         node_address_eth,
         response.status_code
       ))
