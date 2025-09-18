@@ -248,6 +248,7 @@ class ContainerAppRunnerPlugin(
     if data == "RESTART":
       self.P("Restarting container...")
       self._is_manually_stopped = False
+      self._stop_container_and_save_logs_to_disk()
       self._restart_container()
       return
 
@@ -262,6 +263,7 @@ class ContainerAppRunnerPlugin(
 
   def on_config(self):
     self.Pd("Received an updated config for ContainerAppRunner")
+    self._stop_container_and_save_logs_to_disk()
     self._restart_container()
 
     return
@@ -654,6 +656,10 @@ class ContainerAppRunnerPlugin(
       4. Tunnel engine ping and maintenance
 
     """
+    if self._is_manually_stopped:
+      self.P("Manually stopped app. Skipping launch...", color='y')
+      return
+
     self.maybe_init_tunnel_engine()
 
     if not self.container:
