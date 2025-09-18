@@ -657,7 +657,6 @@ class ContainerAppRunnerPlugin(
 
     """
     if self._is_manually_stopped:
-      self.P("Manually stopped app. Skipping launch...", color='y')
       return
 
     self.maybe_init_tunnel_engine()

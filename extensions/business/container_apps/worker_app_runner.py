@@ -747,12 +747,11 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     
     super(WorkerAppRunnerPlugin, self).on_close()
 
-    self.P("WorkerAppRunnerPlugin has shut down", color='g')
+    self.Pd("WorkerAppRunnerPlugin has shut down", color='g')
     return
 
   def process(self):
     if self._is_manually_stopped:
-      self.P("Manually stopped app. Skipping launch...", color='y')
       return
 
     self.maybe_init_tunnel_engine()
