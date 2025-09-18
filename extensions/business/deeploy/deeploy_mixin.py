@@ -108,9 +108,9 @@ class _DeeployMixin:
       raise ValueError("Sender {} is not an oracle".format(sender))
     return True
 
-  def __launch_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender):
+  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender):
     """
-    Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
+    Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
     plugins = self.deeploy_prepare_plugins(inputs)
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
@@ -118,6 +118,7 @@ class _DeeployMixin:
     job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
     project_name = inputs.get(DEEPLOY_KEYS.PROJECT_NAME, None)
     response_keys = {}
+    
     for addr in nodes:
       # Nodes to peer with for CHAINSTORE
       nodes_to_peer = [n for n in nodes if n != addr]
@@ -146,7 +147,8 @@ class _DeeployMixin:
       msg = ''
       if self.cfg_deeploy_verbose > 1:
         msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
-      self.P(f"Starting pipeline '{app_alias}' on {addr}{msg}")
+      self.P(f"Creating pipeline '{app_alias}' on {addr}{msg}")
+      
       if addr is not None:
         dct_deeploy_specs = {
           'job_id': job_id,
@@ -156,6 +158,7 @@ class _DeeployMixin:
           'initial_target_nodes': nodes,
           'job_tags': job_tags
         }
+        
         self.cmdapi_start_pipeline_by_params(
           name=app_id,
           app_alias=app_alias,
@@ -167,6 +170,94 @@ class _DeeployMixin:
           is_deeployed=True,
           deeploy_specs=dct_deeploy_specs,
         )
+      # endif addr is valid
+    # endfor each target node
+    return response_keys
+
+  def __prepare_plugins_for_update(self, inputs, discovered_plugin_instances):
+    """
+    Prepare plugins for update using discovered instances instead of creating new ones
+    """
+    # Get the base plugin configuration from inputs
+    base_plugin = self.deeploy_prepare_single_plugin_instance(inputs)
+    
+    # Group discovered instances by node and create plugin instances with proper IDs
+    instances_by_node = {}
+    for instance in discovered_plugin_instances:
+      node = instance.get("NODE")
+      instance_id = instance.get("instance_id")
+      plugin_signature = instance.get("plugin_signature")
+      
+      if node not in instances_by_node:
+        instances_by_node[node] = []
+      
+      # Create plugin instance config with discovered instance ID
+      plugin_instance_config = self.deepcopy(base_plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES][0])
+      plugin_instance_config[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] = instance_id
+      
+      # Store the prepared instance directly
+      instances_by_node[node].append(plugin_instance_config)
+    
+    return instances_by_node, base_plugin
+
+  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances=[]):
+    """
+    Update existing pipelines on each node and set CSTORE `response_key` for the "callback" action
+    """
+    response_keys = {}
+    
+    # Prepare plugins for update using discovered instances
+    instances_by_node, base_plugin = self.__prepare_plugins_for_update(inputs, discovered_plugin_instances)
+    
+    # Get all unique nodes from discovered instances
+    all_nodes = list(instances_by_node.keys())
+    
+    for addr in all_nodes:
+      node_plugin_instances = instances_by_node[addr]
+      
+      # Nodes to peer with for CHAINSTORE
+      nodes_to_peer = [n for n in all_nodes if n != addr]
+      
+      # Configure peers and response keys for each plugin instance
+      for plugin_instance in node_plugin_instances:
+        instance_id = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
+        
+        # Configure peers if there are any
+        if len(nodes_to_peer) > 0:
+          plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
+        
+        # Configure response keys if needed
+        if inputs.chainstore_response:
+          response_key = instance_id + '_' + self.uuid(8)
+          plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
+          response_keys[response_key] = {
+            'addr': addr,
+            'instance_id': instance_id
+          }
+      
+      # Create plugin structure for this node
+      node_plugin = {
+        self.ct.CONFIG_PLUGIN.K_SIGNATURE: base_plugin[self.ct.CONFIG_PLUGIN.K_SIGNATURE],
+        self.ct.CONFIG_PLUGIN.K_INSTANCES: node_plugin_instances
+      }
+      
+      msg = ''
+      if self.cfg_deeploy_verbose > 1:
+        msg = f":\n {self.json_dumps([node_plugin], indent=2)}"
+      self.P(f"Updating pipeline '{app_alias}' on {addr}{msg}")
+      
+      if addr is not None:
+        # Update each plugin instance on this node
+        for plugin_instance in node_plugin_instances:
+          instance_id = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
+          plugin_signature = node_plugin[self.ct.CONFIG_PLUGIN.K_SIGNATURE]
+          self.cmdapi_update_instance_config(
+            pipeline=app_id,
+            signature=plugin_signature,
+            instance_id=instance_id,
+            instance_config=plugin_instance,
+            node_address=addr,
+          )
       # endif addr is valid
     # endfor each target node
     return response_keys
@@ -201,6 +292,9 @@ class _DeeployMixin:
     str_status = DEEPLOY_STATUS.PENDING
     done = False if len(response_keys) > 0 else True
     start_time = self.time()
+
+    self.Pd("Waiting for responses from nodes...")
+    self.Pd(f"Response keys to wait for: {self.json_dumps(response_keys, indent=2)}")
 
     if len(response_keys) == 0:
       str_status = DEEPLOY_STATUS.COMMAND_DELIVERED
@@ -414,7 +508,7 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, nodes):
+  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, nodes, discovered_plugin_instances=[], is_create=True):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
@@ -424,12 +518,11 @@ class _DeeployMixin:
       msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
       raise ValueError(msg)
 
-    if inputs.target_nodes_count and len(nodes) < inputs.target_nodes_count:
-      msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
-      raise ValueError(msg)
-
     # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
-    response_keys = self.__launch_pipeline_on_nodes(nodes, inputs, app_id, app_alias, app_type, sender)
+    if is_create:
+      response_keys = self.__create_pipeline_on_nodes(nodes, inputs, app_id, app_alias, app_type, sender)
+    else:
+      response_keys = self.__update_pipeline_on_nodes(nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
     dct_status, str_status = self.__get_pipeline_responses(response_keys, 300)
@@ -489,6 +582,7 @@ class _DeeployMixin:
                   DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: instance_dict,
                   DEEPLOY_PLUGIN_DATA.NODE: node
                 })
+        return discovered_plugins
       # search by app_id
       if app_id is not None and app_id in pipelines:
         for current_plugin_signature, plugins_instances in pipelines[app_id][NetMonCt.PLUGINS].items():
