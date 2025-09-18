@@ -260,6 +260,12 @@ class ContainerAppRunnerPlugin(
       self.P(f"Unknown plugin command: {data}")
     return
 
+  def on_config(self):
+    self.Pd("Received an updated config for ContainerAppRunner")
+    self._restart_container()
+
+    return
+
   def on_post_container_start(self):
     """
     Lifecycle hook called after the container is started.

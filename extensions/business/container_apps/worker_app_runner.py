@@ -115,6 +115,15 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
   def port(self, value):
     self._port = value
 
+  def Pd(self, s, *args, score=-1, **kwargs):
+    """
+    Print a message to the console.
+    """
+    if self.cfg_car_verbose > score:
+      s = "[DEBUG] " + s
+      self.P(s, *args, **kwargs)
+    return
+
 
   def on_init(self):
     super(WorkerAppRunnerPlugin, self).on_init()
@@ -133,6 +142,11 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
     return
 
+  def on_config(self):
+    self.Pd("Received an updated config for WorkerAppRunner")
+    self._restart_from_scratch()
+
+    return
 
   def __reset_vars(self):
     """Reset internal state variables."""
