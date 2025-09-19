@@ -466,11 +466,11 @@ class ContainerAppRunnerPlugin(
     if self.log_thread:
       self.log_thread.join(timeout=5)
 
-    # Stop the container if it's running
-    self.stop_container()
-
     # Stop tunnel engine if needed
     self.stop_tunnel_engine()
+
+    # Stop the container if it's running
+    self.stop_container()
 
     # Save logs to disk
     try:
@@ -660,10 +660,10 @@ class ContainerAppRunnerPlugin(
       self.Pd("Manually stopped app. Skipping launch...", color='y')
       return
 
-    self.maybe_init_tunnel_engine()
-
     if not self.container:
       self._handle_initial_launch()
+
+    self.maybe_init_tunnel_engine()
 
     self.maybe_start_tunnel_engine()
 
