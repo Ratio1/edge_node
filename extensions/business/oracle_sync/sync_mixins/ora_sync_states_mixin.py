@@ -455,28 +455,27 @@ class _OraSyncStatesCallbacksMixin:
           self.dct_local_tables[self.node_addr] = self.local_table
         # endif first iteration of the current state
 
-        if self.last_time_local_table_sent is not None and self.time() - self.last_time_local_table_sent < self.cfg_send_interval:
-          return
+        if self.last_time_local_table_sent is None or self.time() - self.last_time_local_table_sent >= self.cfg_send_interval:
+          self.P(f"Sending {self.local_table=}")
 
-        self.P(f"Sending {self.local_table=}")
+          oracle_data = {
+            OracleSyncCt.LOCAL_TABLE: self.local_table,
+            OracleSyncCt.STAGE: self._get_current_state()
+          }
+          self.bc.sign(oracle_data, add_data=True, use_digest=True)
+          if self.cfg_use_r1fs_during_consensus:
+            # Will add cid to the message instead of self.local_table if
+            # the upload to R1FS is successful.
+            self.r1fs_add_data_to_message(
+              message_dict=oracle_data,
+              data_dict=self.local_table,
+              data_key=OracleSyncCt.LOCAL_TABLE
+            )
+          # endif use r1fs during consensus
 
-        oracle_data = {
-          OracleSyncCt.LOCAL_TABLE: self.local_table,
-          OracleSyncCt.STAGE: self._get_current_state()
-        }
-        self.bc.sign(oracle_data, add_data=True, use_digest=True)
-        if self.cfg_use_r1fs_during_consensus:
-          # Will add cid to the message instead of self.local_table if
-          # the upload to R1FS is successful.
-          self.r1fs_add_data_to_message(
-            message_dict=oracle_data,
-            data_dict=self.local_table,
-            data_key=OracleSyncCt.LOCAL_TABLE
-          )
-        # endif use r1fs during consensus
-
-        self.add_payload_by_fields(oracle_data=oracle_data)
-        self.last_time_local_table_sent = self.time()
+          self.add_payload_by_fields(oracle_data=oracle_data)
+          self.last_time_local_table_sent = self.time()
+        # endif need to send
       # endif send
 
       # Receive values from oracles
@@ -657,28 +656,27 @@ class _OraSyncStatesCallbacksMixin:
             self.dct_median_tables[self.node_addr] = self.median_table
         # endif first iteration of the current state
 
-        if self.last_time_median_table_sent is not None and self.time() - self.last_time_median_table_sent < self.cfg_send_interval:
-          return
-
-        if self.cfg_debug_sync:
-          self.P(f"Sending median {self._compute_simple_median_table(self.median_table)}")
-        # endif debug_sync
-        oracle_data = {
-          OracleSyncCt.STAGE: self._get_current_state(),
-          OracleSyncCt.MEDIAN_TABLE: self.median_table,
-        }
-        self.bc.sign(oracle_data, add_data=True, use_digest=True)
-        if self.cfg_use_r1fs_during_consensus:
-          # Will add cid to the message instead of self.median_table if
-          # the upload to R1FS is successful.
-          self.r1fs_add_data_to_message(
-            message_dict=oracle_data,
-            data_dict=self.median_table,
-            data_key=OracleSyncCt.MEDIAN_TABLE
-          )
-        # endif use r1fs during consensus
-        self.add_payload_by_fields(oracle_data=oracle_data)
-        self.last_time_median_table_sent = self.time()
+        if self.last_time_median_table_sent is None or self.time() - self.last_time_median_table_sent >= self.cfg_send_interval:
+          if self.cfg_debug_sync:
+            self.P(f"Sending median {self._compute_simple_median_table(self.median_table)}")
+          # endif debug_sync
+          oracle_data = {
+            OracleSyncCt.STAGE: self._get_current_state(),
+            OracleSyncCt.MEDIAN_TABLE: self.median_table,
+          }
+          self.bc.sign(oracle_data, add_data=True, use_digest=True)
+          if self.cfg_use_r1fs_during_consensus:
+            # Will add cid to the message instead of self.median_table if
+            # the upload to R1FS is successful.
+            self.r1fs_add_data_to_message(
+              message_dict=oracle_data,
+              data_dict=self.median_table,
+              data_key=OracleSyncCt.MEDIAN_TABLE
+            )
+          # endif use r1fs during consensus
+          self.add_payload_by_fields(oracle_data=oracle_data)
+          self.last_time_median_table_sent = self.time()
+        # endif need to send
       # endif send
 
       # Receive medians from oracles
@@ -923,39 +921,38 @@ class _OraSyncStatesCallbacksMixin:
           is_first_iteration = True
         # endif first iteration of the current state
 
-        if self.last_time__agreement_signature_sent is not None and self.time() - self.last_time__agreement_signature_sent < self.cfg_send_interval:
-          return
+        if self.last_time__agreement_signature_sent is None or self.time() - self.last_time__agreement_signature_sent >= self.cfg_send_interval:
+          # Remove 0 values from the compiled agreed median table.
+          # This is done to both reduce the size of the signed data and to avoid
+          # additional zero values appearing when verifying the table.
+          non_zero_compiled_agreed_table = {k: v for k, v in self.compiled_agreed_median_table.items() if v != 0}
 
-        # Remove 0 values from the compiled agreed median table.
-        # This is done to both reduce the size of the signed data and to avoid
-        # additional zero values appearing when verifying the table.
-        non_zero_compiled_agreed_table = {k: v for k, v in self.compiled_agreed_median_table.items() if v != 0}
+          signature_dict = {
+            OracleSyncCt.COMPILED_AGREED_MEDIAN_TABLE: non_zero_compiled_agreed_table,
+            # self._current_epoch - 1, since the consensus is for the previous epoch
+            OracleSyncCt.EPOCH: self._current_epoch - 1,
+          }
+          self.bc.sign(signature_dict, add_data=True, use_digest=True)
+          signature_dict.pop(OracleSyncCt.EPOCH)
+          signature_dict.pop(OracleSyncCt.COMPILED_AGREED_MEDIAN_TABLE)
 
-        signature_dict = {
-          OracleSyncCt.COMPILED_AGREED_MEDIAN_TABLE: non_zero_compiled_agreed_table,
-          # self._current_epoch - 1, since the consensus is for the previous epoch
-          OracleSyncCt.EPOCH: self._current_epoch - 1,
-        }
-        self.bc.sign(signature_dict, add_data=True, use_digest=True)
-        signature_dict.pop(OracleSyncCt.EPOCH)
-        signature_dict.pop(OracleSyncCt.COMPILED_AGREED_MEDIAN_TABLE)
+          oracle_data = {
+            # The compiled agreed median table itself will not be sent,
+            # since we only need to verify the signature to know if the table is the same as
+            # the cached one.
+            OracleSyncCt.STAGE: self._get_current_state(),
+            OracleSyncCt.AGREEMENT_SIGNATURE: signature_dict
+          }
 
-        oracle_data = {
-          # The compiled agreed median table itself will not be sent,
-          # since we only need to verify the signature to know if the table is the same as
-          # the cached one.
-          OracleSyncCt.STAGE: self._get_current_state(),
-          OracleSyncCt.AGREEMENT_SIGNATURE: signature_dict
-        }
+          if is_first_iteration:
+            self.compiled_agreed_median_table_signatures[self.node_addr] = signature_dict
+          # endif first iteration
 
-        if is_first_iteration:
-          self.compiled_agreed_median_table_signatures[self.node_addr] = signature_dict
-        # endif first iteration
-
-        if self.cfg_debug_sync:
-          self.P(f"Sending agreement signature for: {non_zero_compiled_agreed_table}")
-        self.add_payload_by_fields(oracle_data=oracle_data)
-        self.last_time__agreement_signature_sent = self.time()
+          if self.cfg_debug_sync:
+            self.P(f"Sending agreement signature for: {non_zero_compiled_agreed_table}")
+          self.add_payload_by_fields(oracle_data=oracle_data)
+          self.last_time__agreement_signature_sent = self.time()
+        # endif need to send
       # endif send
 
       # Receive agreed values from oracles
@@ -998,15 +995,14 @@ class _OraSyncStatesCallbacksMixin:
           self.first_time__agreement_signatures_exchanged = self.time()
 
         last_sent_time = self.last_time__agreement_signatures_exchanged
-        if last_sent_time is not None and self.time() - last_sent_time < self.cfg_send_interval:
-          return
-
-        oracle_data = {
-          OracleSyncCt.STAGE: self._get_current_state(),
-          OracleSyncCt.AGREEMENT_SIGNATURES: self.compiled_agreed_median_table_signatures,
-        }
-        self.add_payload_by_fields(oracle_data=oracle_data)
-        self.last_time__agreement_signatures_exchanged = self.time()
+        if last_sent_time is None or self.time() - last_sent_time >= self.cfg_send_interval:
+          oracle_data = {
+            OracleSyncCt.STAGE: self._get_current_state(),
+            OracleSyncCt.AGREEMENT_SIGNATURES: self.compiled_agreed_median_table_signatures,
+          }
+          self.add_payload_by_fields(oracle_data=oracle_data)
+          self.last_time__agreement_signatures_exchanged = self.time()
+        # endif need to send
       # endif send
 
       # Receive signatures from oracles
