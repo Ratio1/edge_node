@@ -137,7 +137,7 @@ class _DeeployMixin:
 
     for addr in nodes:
       # Nodes to peer with for CHAINSTORE
-      nodes_to_peer = [n for n in nodes if n != addr]
+      nodes_to_peer = nodes
       node_plugins = self.deepcopy(plugins)
       
       # Configure chainstore peers and response keys
