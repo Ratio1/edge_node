@@ -204,7 +204,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.P(f"Unknown plugin command: {data}")
     return
 
-  def on_config(self):
+  def _on_config_changed(self):
     self.Pd("Received an updated config for WorkerAppRunner")
     self._stop_container_and_save_logs_to_disk()
     self._restart_from_scratch()
@@ -752,6 +752,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def process(self):
     if self._is_manually_stopped:
+      self.Pd("Manually stopped app. Skipping launch...", color='y')
       return
 
     self.maybe_init_tunnel_engine()

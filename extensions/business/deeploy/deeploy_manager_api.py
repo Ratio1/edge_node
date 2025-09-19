@@ -111,6 +111,7 @@ class DeeployManagerApiPlugin(
         
     """
     try:
+      self.Pd(f"Called Deeploy get_apps endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
@@ -305,6 +306,7 @@ class DeeployManagerApiPlugin(
         1. Request comes in. Response command sent.
         2. Move while checker for chainstore keys in process.
     """
+    self.Pd(f"Called Deeploy create_pipeline endpoint")
     return self._process_pipeline_request(request, is_create=True)
 
   @BasePlugin.endpoint(method="post")
@@ -379,6 +381,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
+      self.Pd(f"Called Deeploy delete_pipeline endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
@@ -451,6 +454,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
+      self.Pd(f"Called Deeploy send_instance_command endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
 
@@ -503,6 +507,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
+      self.Pd(f"Called Deeploy send_app_command endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
 

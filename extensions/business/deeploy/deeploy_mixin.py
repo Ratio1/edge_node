@@ -117,8 +117,24 @@ class _DeeployMixin:
     project_id = inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
     job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
     project_name = inputs.get(DEEPLOY_KEYS.PROJECT_NAME, None)
+    spare_nodes = inputs.get(DEEPLOY_KEYS.SPARE_NODES, [])
+    allow_replication_in_the_wild = inputs.get(DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD, False)
     response_keys = {}
-    
+
+    ts = self.time()
+    dct_deeploy_specs = {
+      DEEPLOY_KEYS.JOB_ID: job_id,
+      DEEPLOY_KEYS.PROJECT_ID: project_id,
+      DEEPLOY_KEYS.PROJECT_NAME: project_name,
+      DEEPLOY_KEYS.NR_TARGET_NODES: len(nodes),
+      DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+      DEEPLOY_KEYS.JOB_TAGS: job_tags,
+      DEEPLOY_KEYS.DATE_CREATED: ts,
+      DEEPLOY_KEYS.DATE_UPDATED: ts,
+      DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
+      DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
+    }
+
     for addr in nodes:
       # Nodes to peer with for CHAINSTORE
       nodes_to_peer = [n for n in nodes if n != addr]
@@ -150,14 +166,6 @@ class _DeeployMixin:
       self.P(f"Creating pipeline '{app_alias}' on {addr}{msg}")
       
       if addr is not None:
-        dct_deeploy_specs = {
-          'job_id': job_id,
-          'project_id': project_id,
-          'project_name': project_name,
-          'nr_target_nodes': len(nodes),
-          'initial_target_nodes': nodes,
-          'job_tags': job_tags
-        }
         
         self.cmdapi_start_pipeline_by_params(
           name=app_id,
@@ -618,12 +626,15 @@ class _DeeployMixin:
     """
     Send a command to the specified nodes for the given plugin instance.
     """
+    self.Pd("Sending instance command to targets...")
     for plugin in plugins:
+      self.Pd(self.json_dumps(plugin))
       self.cmdapi_send_instance_command(pipeline=plugin[DEEPLOY_PLUGIN_DATA.APP_ID],
                                         signature=plugin[DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE],
                                         instance_id=plugin[DEEPLOY_PLUGIN_DATA.INSTANCE_ID],
                                         instance_command=command,
                                         node_address=plugin[DEEPLOY_PLUGIN_DATA.NODE])
+    return
 
   def send_instance_command_to_nodes(self, inputs, owner):
     """
