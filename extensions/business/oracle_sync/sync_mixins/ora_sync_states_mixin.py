@@ -304,23 +304,22 @@ class _OraSyncStatesCallbacksMixin:
         # Check if should announce the participants this time.
         send_interval = self.get_announce_participants_send_interval()
         last_ts = self.last_time_announce_participants
-        if last_ts is not None and self.time() - last_ts < send_interval:
-          return
+        if last_ts is None or self.time() - last_ts >= send_interval:
+          log_str = f"Announcing {len(self._announced_participating)} participants:"
+          log_str += "".join([
+            f"\n\t{self.netmon.network_node_eeid(oracle)} <{oracle}> {self.oracle_sync_get_node_local_availability(oracle)}"
+            for oracle in self._announced_participating
+          ])
+          self.P(log_str)
 
-        log_str = f"Announcing {len(self._announced_participating)} participants:"
-        log_str += "".join([
-          f"\n\t{self.netmon.network_node_eeid(oracle)} <{oracle}> {self.oracle_sync_get_node_local_availability(oracle)}"
-          for oracle in self._announced_participating
-        ])
-        self.P(log_str)
-
-        oracle_data = {
-          OracleSyncCt.ANNOUNCED_PARTICIPANTS: list(self._announced_participating),
-          OracleSyncCt.STAGE: self._get_current_state(),
-        }
-        self.bc.sign(oracle_data, add_data=True, use_digest=True)
-        self.add_payload_by_fields(oracle_data=oracle_data)
-        self.last_time_announce_participants = self.time()
+          oracle_data = {
+            OracleSyncCt.ANNOUNCED_PARTICIPANTS: list(self._announced_participating),
+            OracleSyncCt.STAGE: self._get_current_state(),
+          }
+          self.bc.sign(oracle_data, add_data=True, use_digest=True)
+          self.add_payload_by_fields(oracle_data=oracle_data)
+          self.last_time_announce_participants = self.time()
+        # endif need to announce
       # endif announce participants
 
       # Observe the other oracles' announcements.
