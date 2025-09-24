@@ -166,8 +166,8 @@ class _DeeployMixin:
       self.P(f"Creating pipeline '{app_alias}' on {addr}{msg}")
       
       if addr is not None:
-        
-        self.cmdapi_start_pipeline_by_params(
+
+        pipeline = self.cmdapi_start_pipeline_by_params(
           name=app_id,
           app_alias=app_alias,
           pipeline_type=app_type,
@@ -178,6 +178,9 @@ class _DeeployMixin:
           is_deeployed=True,
           deeploy_specs=dct_deeploy_specs,
         )
+
+        self.Pd(f"Pipeline started: {self.json_dumps(pipeline, indent=2)}")
+        self.save_pipeline_to_r1fs(pipeline)
       # endif addr is valid
     # endfor each target node
     return response_keys
