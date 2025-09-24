@@ -1,3 +1,5 @@
+NONCE = 42
+
 class _DeeployJobMixin:
   """
   A mixin that provides deep job related functionality.
@@ -81,11 +83,17 @@ class _DeeployJobMixin:
     self.P(f"Pipeline: {self.json_dumps(pipeline, indent=2)}")
 
     sanitized_pipeline = self.extract_unvariable_data_from_pipeline(pipeline)
-    jsonified_pipeline = self.sort_and_jsonify_pipeline(sanitized_pipeline)
+    sorted_pipeline = self.recursively_sort_pipeline_data(sanitized_pipeline)
 
-    self.P(f"JSONified pipeline: {jsonified_pipeline}")
-
-    return
+    self.P(f"JSONified pipeline: {sorted_pipeline}")
+    try:
+      cid = self.r1fs.add_json(sorted_pipeline, nonce=NONCE)
+      self.P(f"Pipeline saved to R1FS with CID: {cid}")
+    except Exception as e:
+      self.P(f"Error saving pipeline to R1FS: {e}")
+      return None
+    
+    return cid
 
   def recursively_sort_pipeline_data(self, data):
     """
@@ -118,28 +126,3 @@ class _DeeployJobMixin:
     else:
       # Return primitive values as-is
       return data
-
-  def sort_and_jsonify_pipeline(self, pipeline: dict):
-    """
-    Extract pipeline data without TIME, sort it recursively, and return as JSON string.
-    
-    Args:
-        pipeline (dict): The pipeline data dictionary
-        
-    Returns:
-        str: JSON string of sorted pipeline data without TIME field
-    """
-    self.P("Sorting and JSONifying pipeline data...")
-    
-    # Extract data without TIME
-    pipeline_without_time = self.extract_unvariable_data_from_pipeline(pipeline)
-    
-    # Recursively sort the data
-    sorted_pipeline = self.recursively_sort_pipeline_data(pipeline_without_time)
-    
-    # Convert to JSON string
-    json_result = self.json_dumps(sorted_pipeline, indent=2)
-    
-    self.P(f"Sorted and JSONified pipeline: {json_result}")
-    
-    return json_result
