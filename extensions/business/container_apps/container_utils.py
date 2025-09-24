@@ -76,7 +76,7 @@ class _ContainerUtilsMixin:
       "EE_HOST_ID": self.ee_id,
       "EE_HOST_ADDR": self.ee_addr,
       "EE_HOST_ETH_ADDR": self.bc.eth_address,
-      "EE_EVM_NET": self.bc.evm_network,
+      "EE_EVM_NET": self.bc.get_evm_network(),
       "EE_CHAINSTORE_API_URL": f"http://{localhost_ip}:31234",
       "EE_R1FS_API_URL": f"http://{localhost_ip}:31235",
       "EE_CHAINSTORE_PEERS": str_chainstore_peers,
