@@ -1,4 +1,6 @@
 NONCE = 42
+R1FS_FILENAME = 'data.json'
+DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLY_DEPLOYED_JOBS"
 
 class _DeeployJobMixin:
   """
@@ -9,9 +11,9 @@ class _DeeployJobMixin:
     super(_DeeployJobMixin, self).__init__()
     return
 
-  def extract_unvariable_data_from_pipeline(self, pipeline: dict):
+  def extract_invariable_data_from_pipeline(self, pipeline: dict):
     """
-    Extract the main unvariable data from the pipeline (excluding TIME field).
+    Extract the main invariable data from the pipeline (excluding TIME field).
     
     Example pipeline data:
     {
@@ -64,7 +66,7 @@ class _DeeployJobMixin:
       "TYPE":"void"
     }
     """
-    self.P("Extracting unvariable data from pipeline (excluding TIME)...")
+    self.P("Extracting invariable data from pipeline (excluding TIME)...")
     self.P(f"Config: {self.json_dumps(pipeline, indent=2)}")
 
     # Create a copy of the pipeline and remove the TIME field
@@ -75,20 +77,44 @@ class _DeeployJobMixin:
 
     return extracted_data
 
+  def save_job_pipeline_in_cstore(self, pipeline: dict, job_id: int):
+    """
+    Save the pipeline to CSTORE.
+    Args:
+        pipeline (dict): The pipeline to save.
+        job_id (int): The job ID.
+
+    Returns:
+        None
+    """
+    self.P("Saving pipeline to CSTORE...")
+    self.P(f"Pipeline: {self.json_dumps(pipeline, indent=2)}")
+
+    sanitized_pipeline = self.extract_invariable_data_from_pipeline(pipeline)
+    sorted_pipeline = self.recursively_sort_pipeline_data(sanitized_pipeline)
+    cid = self.save_pipeline_to_r1fs(sorted_pipeline)
+
+    if cid is None:
+      self.P("Failed to save pipeline to R1FS.")
+
+    result = self.chainstore_hset(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id, value=cid)
+
+    return result
+
   def save_pipeline_to_r1fs(self, pipeline: dict):
     """
     Save the pipeline to R1FS.
     """
-    self.P("Saving pipeline to R1FS...")
-    self.P(f"Pipeline: {self.json_dumps(pipeline, indent=2)}")
 
-    sanitized_pipeline = self.extract_unvariable_data_from_pipeline(pipeline)
-    sorted_pipeline = self.recursively_sort_pipeline_data(sanitized_pipeline)
-
-    self.P(f"JSONified pipeline: {sorted_pipeline}")
+    self.P(f"JSONified pipeline: {pipeline}")
     try:
-      cid = self.r1fs.add_json(sorted_pipeline, nonce=NONCE)
+      self.P(f"Using nonce: {NONCE}")  # Add this line before the add_json call
+      cid = self.r1fs.add_json(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
       self.P(f"Pipeline saved to R1FS with CID: {cid}")
+      calc_cid = self.r1fs.calculate_json_cid(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
+      self.P(f"Calculated CID: {calc_cid}")
+      calc_cid2 = self.r1fs.calculate_json_cid(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
+      self.P(f"Calculated CID2: {calc_cid2}")
     except Exception as e:
       self.P(f"Error saving pipeline to R1FS: {e}")
       return None
