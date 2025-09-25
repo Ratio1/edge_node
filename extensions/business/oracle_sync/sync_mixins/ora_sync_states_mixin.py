@@ -572,6 +572,13 @@ class _OraSyncStatesCallbacksMixin:
       # should not have received any None values
       valid_local_tables = [x for x in self.dct_local_tables.values() if x is not None]
 
+      self.update_participant_oracles(
+        updated_participant_oracles=list(self.dct_local_tables.keys()),
+        # The provided state is S2_SEND_LOCAL_TABLE, since the median table is computed
+        # from the local tables sent in S2_SEND_LOCAL_TABLE state.
+        state=self.STATES.S2_SEND_LOCAL_TABLE
+      )
+
       if not self._check_enough_oracles(participating_oracles=list(self.dct_local_tables.keys())):
         self.P("Could not compute median.", color='r')
         return
@@ -608,13 +615,6 @@ class _OraSyncStatesCallbacksMixin:
       # end for all_nodes
 
       self.P(f"Computed median table {self._compute_simple_median_table(self.median_table)}")
-
-      self.update_participant_oracles(
-        updated_participant_oracles=list(self.dct_local_tables.keys()),
-        # The provided state is S2_SEND_LOCAL_TABLE, since the median table is computed
-        # from the local tables sent in S2_SEND_LOCAL_TABLE state.
-        state=self.STATES.S2_SEND_LOCAL_TABLE
-      )
       return
   """END S3_COMPUTE_MEDIAN_TABLE CALLBACKS"""
 
@@ -746,7 +746,10 @@ class _OraSyncStatesCallbacksMixin:
         return None
       simple_agreed_value_table = {}
       for node, dct_node in agreed_value_table.items():
-        simple_agreed_value_table[node] = dct_node['VALUE']
+        if dct_node.get('VALUE', 0) > 0:
+          simple_agreed_value_table[node] = dct_node['VALUE']
+        # endif node has value > 0
+      # end for node
 
       return simple_agreed_value_table
 
@@ -782,6 +785,13 @@ class _OraSyncStatesCallbacksMixin:
         ...
       }
       """
+      self.update_participant_oracles(
+        updated_participant_oracles=list(self.dct_median_tables.keys()),
+        # The provided state is S4_SEND_MEDIAN_TABLE, since the median table is computed
+        # from the local tables sent in S4_SEND_MEDIAN_TABLE state.
+        state=self.STATES.S4_SEND_MEDIAN_TABLE
+      )
+
       if not self._check_enough_oracles(participating_oracles=list(self.dct_median_tables.keys())):
         self.P("Could not compute agreed median table.", color='r')
         return
@@ -802,9 +812,12 @@ class _OraSyncStatesCallbacksMixin:
       # end for node
 
       # compute the frequency of each median value for each node
+      faulty_nodes = []
+      min_frequency = self._count_half_of_valid_oracles()
       for node in all_nodes:
         dct_median_frequency = {}
-        for median in (dct_median['VALUE'] for dct_median in dct_node_median_signed_values[node]):
+        total_cnt_medians = len(dct_node_median_signed_values[node])
+        for median in (dct_median.get('VALUE', 0) for dct_median in dct_node_median_signed_values[node]):
           if median not in dct_median_frequency:
             dct_median_frequency[median] = 0
           dct_median_frequency[median] += 1
@@ -818,11 +831,10 @@ class _OraSyncStatesCallbacksMixin:
         lst_dct_freq_median = [
           dct_median
           for dct_median in dct_node_median_signed_values[node]
-          if dct_median['VALUE'] == most_frequent_median
+          if dct_median.get('VALUE', 0) == most_frequent_median
         ]
 
         median_frequency = len(lst_dct_freq_median)
-        min_frequency = self._count_half_of_valid_oracles()
         if median_frequency > min_frequency:
           if self.cfg_debug_sync_full:
             self.P(f"Computed agreed median table for node {node}: {most_frequent_median}. "
@@ -833,46 +845,67 @@ class _OraSyncStatesCallbacksMixin:
             'SIGNATURES': lst_dct_freq_median,
           }
         else:
-          all_valid_oracles = []
-          self.P(f"Failed to compute agreed median table for node {node}. "
-                 f"Could not achieve consensus. Highest median frequency is {median_frequency}, while the minimum frequency is"
-                 f"{min_frequency}. Dct freq:\n{self.json_dumps(dct_median_frequency, indent=2)}\n"
-                 f"{self.json_dumps(self.dct_median_tables, indent=2)}", color='r')
-          self.P(
-            f"Current oracle will request epoch consensus from the other oracles. If no consensus is reached"
-            f"epoch {self._current_epoch - 1} will be marked as faulty.",
-            color='r'
-          )
-          # Failure at this point is a serious issue, since it means that the oracles did not reach consensus.
-          # This can happen in only 2 cases:
-          # 1. The network is attacked through malicious oracles or other means(e.g. oracle impersonation).
-          # 2. Massive system failure in the network that led to all oracles failing to reach consensus.
-          self.compiled_agreed_median_table = None
-          return
+          # If the frequency of the most frequent median is not above the minimum frequency,
+          # but the total number of oracles that reported this node is also not above the minimum frequency,
+          # then the node is considered faulty and will not be included in the agreed median table.
+          # This is done in order to resist attacks where malicious oracles report fictive nodes.
+          # In case enough oracles reported this node, but they could not reach consensus,
+          # it means that the network is under heavy attack or there is a serious system failure.
+          if total_cnt_medians <= min_frequency:
+            faulty_nodes.append({
+              'NODE': node,
+              'MOST_FREQUENT_MEDIAN': most_frequent_median,
+              'FREQUENCY': median_frequency,
+              'TOTAL_FREQUENCY': total_cnt_medians,
+            })
+          else:
+            all_valid_oracles = []
+            dct_value_senders = {}
+            for dct_median in dct_node_median_signed_values[node]:
+              curr_value = dct_median.get('VALUE', 0)
+              dct_value_senders[curr_value] = dct_value_senders.get(curr_value, [])
+              dct_value_senders[curr_value].append(dct_median.get('EE_SENDER'))
+            # end for dct_median
+            log_str = f"Failed to compute agreed median table for node {node}. "
+            log_str += f"Could not achieve consensus. Highest median frequency is {median_frequency} <= "
+            log_str += f"{min_frequency}. Dct freq:\n{self.json_dumps(dct_median_frequency, indent=2)}\n"
+            log_str += f"Senders for each value:\n{self.json_dumps(dct_value_senders, indent=2)}\n"
+            log_str += f"{self.json_dumps(self.dct_median_tables, indent=2)}\n"
+            log_str += f"Current oracle will request epoch consensus from the other oracles. If no consensus is reached"
+            log_str += f"epoch {self._current_epoch - 1} will be marked as faulty."
+            self.P(log_str, color='r')
+            # Failure at this point is a serious issue, since it means that the oracles did not reach consensus.
+            # This can happen in only 2 cases:
+            # 1. The network is attacked through malicious oracles or other means(e.g. oracle impersonation).
+            # 2. Massive system failure in the network that led to all oracles failing to reach consensus.
+            self.compiled_agreed_median_table = None
+            return
+          # endif not enough reports for node
         # endif median_frequency above min_frequency
       # end for
 
       if len(self.agreed_median_table) == 0:
-        self.P("Failed to compute agreed median table. Not enough online oracles", color='r')
-        self.P(
-          f"Current oracle will request epoch consensus from the other oracles. If no consensus is reached"
-          f"epoch {self._current_epoch - 1} will be marked as faulty.",
-          color='r'
-        )
+        log_str = "Failed to compute agreed median table. Not enough online oracles"
+        log_str += f"Current oracle will request epoch consensus from the other oracles. If no consensus is reached"
+        log_str += f"epoch {self._current_epoch - 1} will be marked as faulty."
+        self.P(log_str, color='r')
         self.compiled_agreed_median_table = None
         return
       # endif agreed_median_table empty
+      if len(faulty_nodes) > 0:
+        log_str = f"{len(faulty_nodes)} faulty nodes(<{min_frequency} reports) detected and not included:\n"
+        log_str += "\n".join(
+          f"\n\t{self.get_sender_str(faulty_node['NODE'])} | V:{faulty_node['MOST_FREQUENT_MEDIAN']} | "
+          f"Frq: {faulty_node['FREQUENCY']} | T: {faulty_node['TOTAL_FREQUENCY']}"
+          for faulty_node in faulty_nodes
+        )
+        self.P(log_str)
+      # endif faulty nodes detected
 
       self.compiled_agreed_median_table = self._compute_simple_agreed_value_table(self.agreed_median_table)
       self.P(f"Successfully computed agreed median table from {len(self.dct_median_tables)} median tables.")
 
       self.current_epoch_computed = True
-      self.update_participant_oracles(
-        updated_participant_oracles=list(self.dct_median_tables.keys()),
-        # The provided state is S4_SEND_MEDIAN_TABLE, since the median table is computed
-        # from the local tables sent in S4_SEND_MEDIAN_TABLE state.
-        state=self.STATES.S4_SEND_MEDIAN_TABLE
-      )
       return
 
     def _agreement_reached(self):
@@ -1023,8 +1056,9 @@ class _OraSyncStatesCallbacksMixin:
           stage = oracle_data[OracleSyncCt.STAGE]
           senders = list(signatures_dict.keys())
           total_number_of_oracles = self.total_participating_oracles()
+          sender_str = self.get_sender_str(sender)
           self.P(
-            f"Received {len(signatures_dict)}/{total_number_of_oracles} agreement signatures from oracle {sender}: {stage = }, {senders = }")
+            f"Received {len(signatures_dict)}/{total_number_of_oracles} agreement signatures from oracle {sender_str}: {stage = }, {senders = }")
         # endif debug_sync
       # endfor received messages
       return
@@ -1273,9 +1307,10 @@ class _OraSyncStatesCallbacksMixin:
         nested_message_dict=dct_epoch_agreed_median_table,
         return_cids=True,
       )
+      sender_str = self.get_sender_str(sender)
       if not agreement_success:
         if self.cfg_debug_sync:
-          self.P(f"Failed to download agreed median table from R1FS for oracle {sender}. Ignoring", color='r')
+          self.P(f"Failed to download agreed median table from R1FS for oracle {sender_str}. Ignoring", color='r')
         return success
       # endif not agreement_success
       dct_epoch_agreement_signatures = oracle_data[OracleSyncCt.EPOCH__AGREEMENT_SIGNATURES]
@@ -1290,7 +1325,7 @@ class _OraSyncStatesCallbacksMixin:
       )
       if not signatures_success:
         if self.cfg_debug_sync:
-          self.P(f"Failed to download agreement signatures from R1FS for oracle {sender}. Ignoring", color='r')
+          self.P(f"Failed to download agreement signatures from R1FS for oracle {sender_str}. Ignoring", color='r')
         return success
       # endif not signatures_success
       dct_epoch_is_valid = oracle_data[OracleSyncCt.EPOCH__IS_VALID]
