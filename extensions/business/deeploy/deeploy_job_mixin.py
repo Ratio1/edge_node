@@ -87,17 +87,27 @@ class _DeeployJobMixin:
     Returns:
         None
     """
-    self.P("Saving pipeline to CSTORE...")
-    self.P(f"Pipeline: {self.json_dumps(pipeline, indent=2)}")
+    result = False
+    try: 
+      self.P("Saving pipeline to CSTORE...")
+      self.P(f"Pipeline: {self.json_dumps(pipeline, indent=2)}")
 
-    sanitized_pipeline = self.extract_invariable_data_from_pipeline(pipeline)
-    sorted_pipeline = self.recursively_sort_pipeline_data(sanitized_pipeline)
-    cid = self.save_pipeline_to_r1fs(sorted_pipeline)
+      sanitized_pipeline = self.extract_invariable_data_from_pipeline(pipeline)
+      sorted_pipeline = self.recursively_sort_pipeline_data(sanitized_pipeline)
+      cid = self.save_pipeline_to_r1fs(sorted_pipeline)
 
-    if cid is None:
-      self.P("Failed to save pipeline to R1FS.")
+      if cid is None:
+        self.P("Failed to save pipeline to R1FS.")
+      self.P(f"Pipeline saved to R1FS with CID: {cid}")
+      self.P(f"Saving pipeline to CSTORE with job ID: {job_id}")
+      self.P(f"Pipeline: {self.json_dumps(sorted_pipeline)}")
+      
+      pipeline_key = str(job_id)
 
-    result = self.chainstore_hset(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=job_id, value=cid)
+      result = self.chainstore_hset(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=pipeline_key, value=cid)
+    except Exception as e:
+      self.P(f"Error saving pipeline to CSTORE: {e}", color='r')
+      return False
 
     return result
 
