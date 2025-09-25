@@ -181,10 +181,10 @@ class _DeeployMixin:
 
         self.Pd(f"Pipeline started: {self.json_dumps(pipeline, indent=2)}")
         try:
-          save_result = self.save_job_pipeline_in_cstore(pipeline)
+          save_result = self.save_job_pipeline_in_cstore(pipeline, job_id)
           self.P(f"Pipeline saved in CSTORE: {save_result}")
         except Exception as e:
-          self.P(f"Error saving pipeline in CSTORE: {e}")
+          self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
       # endif addr is valid
     # endfor each target node
     return response_keys
