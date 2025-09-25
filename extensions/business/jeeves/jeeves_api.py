@@ -122,6 +122,30 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     self.maybe_wait_for_r1fs()
     return
 
+  def get_requests_persistence_data(self):
+    requests_persistence_data = {}
+
+    excluded_fields = [
+      'preprocess_request_method', 'compute_request_result_method'
+    ]
+
+    for request_id, request_data in self.__requests.items():
+      request_steps = request_data.get('request_steps') or []
+      request_steps = [
+        {
+          # Maybe save name of excluded values instead of None?
+          k: (v if k not in excluded_fields else None)
+          for k, v in step.items()
+        }
+        for step in request_steps
+      ]
+      requests_persistence_data[request_id] = {
+        **request_data,
+        'request_steps': request_steps,
+      }
+    # endfor requests
+    return requests_persistence_data
+
   def maybe_persistence_save(self, force: bool = False):
     """
     Save the current state of the Jeeves API to a persistent storage.
@@ -133,7 +157,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         obj={
           'USER_DATA': self.__user_data,
           'DOMAINS_DATA': self.__domains_data,
-          'REQUESTS': self.__requests,
+          'REQUESTS': self.get_requests_persistence_data(),
         },
       )
       self.last_persistent_save = self.time()
@@ -252,6 +276,69 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       self.P(msg, *args, **kwargs)
     return
 
+  def deepcopy_request_data_helper(self, data: any):
+    """
+    Helper method to deepcopy the request data.
+    This method is used to deepcopy the request data, except for the callables,
+    which are copied by reference.
+    Parameters
+    ----------
+    data : any
+        The data to deepcopy.
+
+    Returns
+    -------
+    any
+        The deep copied data.
+    """
+    if callable(data):
+      return data
+    elif isinstance(data, dict):
+      return {
+        k: self.deepcopy_request_data_helper(v)
+        for k, v in data.items()
+      }
+    elif isinstance(data, list):
+      return [
+        self.deepcopy_request_data_helper(v)
+        for v in data
+      ]
+    elif isinstance(data, set):
+      return {
+        self.deepcopy_request_data_helper(v)
+        for v in data
+      }
+    elif isinstance(data, tuple):
+      return tuple(
+        self.deepcopy_request_data_helper(v)
+        for v in data
+      )
+    else:
+      try:
+        return self.deepcopy(data)
+      except Exception as e:
+        self.P(f"Failed to deepcopy data '{data}': {e}", color="red")
+        return data
+    # endif callable
+
+  def deepcopy_request_data(self, request_id: str, default_value=None):
+    """
+    Deep copy the request data for a given request ID.
+    This deepcopy all the fields, except for the callables, which are
+    copied by reference.
+    Parameters
+    ----------
+    request_id : str
+        The request ID to copy the data for.
+
+    Returns
+    -------
+    request_data : dict
+        The deep copied request data.
+    """
+    request_data = self.__requests.get(request_id, default_value)
+    return self.deepcopy_request_data_helper(request_data)
+
   def verify_user_token(self, user_token: str):
     """
     Validate the user token.
@@ -280,7 +367,12 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       'status': 'error',
     }
 
-  def register_request(self, request_id=None, **kwargs):
+  def register_request(
+      self,
+      return_request_data: bool = False,
+      request_id: str = None,
+      **kwargs
+  ):
     """
     Helper method to register a request from the Jeeves API to different agents.
 
@@ -294,8 +386,10 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     }
     if request_id is None:
       request_id = self.uuid()
+      start_time = self.time()
       request_data = {
-        'start_time': self.time(),
+        'start_time': start_time,
+        'last_request_time': start_time,
         'finished': False,
         'request_id': request_id,
         'timeout': self.cfg_request_timeout,
@@ -304,7 +398,8 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     else:
       request_data = {
         **self.__requests.get(request_id, {}),
-        **request_data
+        **request_data,
+        'last_request_time': self.time(),
       }
     # endif new request_id
     self.__requests[request_id] = request_data
@@ -318,10 +413,13 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     if 'next_request_params' in jeeves_content:
       jeeves_content.pop('next_request_params')
     # endif next_request_params in jeeves_content
+    if 'next_request_steps' in jeeves_content:
+      jeeves_content.pop('next_request_steps')
+    # endif next_request_steps in jeeves_content
     self.__command_payloads.append({
       'JEEVES_CONTENT': jeeves_content
     })
-    return request_id
+    return (request_id, request_data) if return_request_data else request_id
 
   """SOLVED POSTPONED REQUESTS SECTION"""
   if True:
@@ -664,7 +762,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         context_id: str,
         query: str,
         k: int = 5,
-        next_request_params: dict = None,
     ):
       """
       Register a request to retrieve documents from the RAG agents' context.
@@ -676,11 +773,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           The query to use for retrieving the documents.
       k : int
           The number of documents to retrieve. Default is 5.
-      next_request_params : dict
-          Additional parameters for the request that needs the result of the
-          retrieval. In the case of a simple retrieve action this will be None.
-          In case of a retrieval for a chat, this will be the parameters for the
-          chat request.
 
       Returns
       -------
@@ -694,7 +786,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           "query": query,
           "k": k,
         },
-        next_request_params=next_request_params
       )
 
     def retrieve_documents_helper(
@@ -702,7 +793,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         context_id: str,
         query: str,
         k: int = 5,
-        next_request_params: dict = None,
     ):
       """
       Retrieve documents from the RAG agents' context based on a query.
@@ -718,12 +808,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       k : int
           The number of documents to retrieve. Default is 5.
 
-      next_request_params : dict
-          Additional parameters for the request that needs the result of the
-          retrieval. In the case of a simple retrieve action this will be None.
-          In case of a retrieval for a chat, this will be the parameters for the
-          chat request.
-
       Returns
       -------
       list[str]
@@ -733,7 +817,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         context_id=context_id,
         query=query,
         k=k,
-        next_request_params=next_request_params,
       )
       return self.solve_postponed_request(request_id=request_id)
 
@@ -768,7 +851,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         context_id=context_id,
         query=query,
         k=k,
-        next_request_params=None,  # This is None, because this is a simple retrieve action.
       )
 
     def messages_to_documents(self, messages: list[dict]):
@@ -818,14 +900,65 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
 
   """LLM SECTION"""
   if True:
-    def maybe_retrieve_domain_additional_data(
-        self, domain: str, query: str = None,
-        next_request_params: dict = None,
+    def get_description_of_chat_step(
+        self,
+        domain: str,
         user_token: str = None,
-        short_term_memory_only: bool = False
+        messages: list[dict] = None,
+        keep_conversation_history: bool = False,
+        use_long_term_memory: bool = False,
+        preprocess_request_method: callable = None,
+        compute_request_result_method: callable = None,
+        extracted_param_names: list = None,
+        **kwargs
+    ):
+      extracted_param_names = extracted_param_names or []
+      if not isinstance(extracted_param_names, list):
+        extracted_param_names = []
+      # endif extracted_param_names is not a list
+      extracted_param_names = list(set(extracted_param_names))
+      domain_additional_kwargs = self.__domains_data.get(domain, {}).get('additional_kwargs', {})
+      domain_additional_tuples = {
+        (k, v)
+        for k, v in domain_additional_kwargs.items()
+      }
+      return {
+        'preprocess_request_method': preprocess_request_method,
+        'compute_request_result_method': compute_request_result_method,
+        'request_type': 'LLM',
+        'request_param_names': [
+          *extracted_param_names,
+          ('user_token', user_token),
+          ('messages', messages or []),
+          ('keep_conversation_history', keep_conversation_history),
+          ('use_long_term_memory', use_long_term_memory),
+          *domain_additional_tuples,
+          *[
+            (k, v) for k, v in kwargs.items()
+            if k not in [
+              'user_token',
+              'messages',
+              'keep_conversation_history',
+              'use_long_term_memory',
+              'additional_kwargs',
+            ]
+          ]
+        ]
+      }
+
+    def get_description_of_retrieval_step(
+        self,
+        domain: str,
+        query: str = None,
+        user_token: str = None,
+        short_term_memory_only: bool = False,
+        preprocess_request_method: callable = None,
+        compute_request_result_method: callable = None,
+        extracted_param_names: list = None,
+        explicit_param_names: list = None,
     ):
       """
-      Retrieve the domain data from the RAG agents' context.
+      Get the description of the retrieval step for a specific RAG agents' context.
       Parameters
       ----------
       domain : str
@@ -835,12 +968,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           The query to use for retrieving the data. Default is None.
           If not provided, the function will retrieve all documents from the domain.
 
-      next_request_params : dict
-          Additional parameters for the request that needs the result of the
-          retrieval. In the case of a simple retrieve action this will be None.
-          In case of a retrieval for a chat, this will be the parameters for the
-          chat request.
-
       user_token : str
           The user token to use for the API. Default is None.
 
@@ -848,78 +975,73 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           Whether to retrieve only the short term memory for the user token.
           If True, documents retrieval will be used for older messages of the user.
 
+      preprocess_request_method : callable
+          The method to preprocess the request before sending it to the agent.
+
+      compute_request_result_method : callable
+          The method to compute the result of the request after receiving it from the agent.
+
+      extracted_param_names : list
+          List of parameter names to extract from the request.
+
+      explicit_param_names : list
+          List of parameter names to include explicitly in the request.
+
       Returns
       -------
-      str
-          The domain data.
+      res - dict or None
+          The description of the retrieval step.
+          None if no retrieval is needed.
       """
-      # No specific domain is needed.
       if domain is None:
         return None
       # endif domain is None
 
+      processed_extracted_param_names = extracted_param_names or []
+      if not isinstance(processed_extracted_param_names, list):
+        processed_extracted_param_names = []
+      # endif processed_extracted_param_names is not a list
+      processed_extracted_param_names = list(set(processed_extracted_param_names))
+
+      explicit_param_names = explicit_param_names or []
+      if not isinstance(explicit_param_names, list):
+        explicit_param_names = []
+      # endif explicit_param_names is not a list
+      explicit_param_names = [
+        (k, v)
+        for k, v in explicit_param_names
+        if k not in processed_extracted_param_names
+      ]
+
+      result = {
+        'preprocess_request_method': preprocess_request_method,
+        'compute_request_result_method': compute_request_result_method,
+        'request_type': 'QUERY',
+        'request_param_names': [
+          *processed_extracted_param_names,
+          *explicit_param_names,
+          ('user_token', user_token),
+          ('request_params', {
+            'query': query,
+            'context_id': domain,
+            'k': 5,
+          }),
+        ]
+      }
+
       if domain == user_token:
         is_long_term_empty = self.__user_data[user_token].get('long_term_memory_is_empty', True)
-        if not is_long_term_empty and not short_term_memory_only:
-          return self.retrieve_documents_helper(
-            context_id=user_token,
-            query=query,
-            k=5,
-            next_request_params=next_request_params,
-          )
-        # endif long term memory is not empty
+        if is_long_term_empty or short_term_memory_only:
+          result = None
+        # endif long term memory is empty
       # endif retrieval for long term memory
 
-      # Check if the domain contains additional context.
       contains_additional_context = self.__domains_data.get(domain, {}).get('contains_additional_context', False)
       if not contains_additional_context:
-        return None
-
+        result = None
       # endif domain not in additional domains
-      return self.retrieve_documents_helper(
-        context_id=domain,
-        query=query,
-        k=5,
-        next_request_params=next_request_params,
-      )
 
-    def register_chat_request(
-        self,
-        request_id: str = None,
-        messages: list[dict] = None,
-        user_token: str = None,
-        **kwargs
-    ):
-      """
-      Register a chat request with the Jeeves API.
-      Parameters
-      ----------
-      request_id : str
-          The request ID to use for the API. Default is None.
-      messages : list[dict]
-          List of messages to send to the API. Each message should be a dictionary with
-          the following keys:
-              - role: str
-                  The role of the message. Can be 'user', 'assistant', or 'system'.
-              - content: str
-                  The content of the message.
-      user_token : str
-          The user token to use for the API. Default is None.
-      kwargs : dict
-          Additional parameters to send to the API. Default is None.
-
-      Returns
-      -------
-      str
-          The request ID.
-      """
-      return self.register_request(
-        request_id=request_id,
-        messages=messages,
-        user_token=user_token,
-        request_type='LLM',
-        **kwargs
-      )
+      return result
 
     def get_messages_of_user(
         self,
@@ -1027,7 +1149,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       # endif domain_prompt is a path
       return (domain_prompt, additional_kwargs) if return_additional_kwargs else domain_prompt
 
-    def validate_llm_kwargs(self, **kwargs):
+    def _validate_llm_kwargs(self, **kwargs):
       """
       Validate the LLM kwargs for the Jeeves API.
       This method checks if the provided kwargs are valid for the LLM request.
@@ -1090,6 +1212,113 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         self.Pd(f"Validation errors: {msg_str}", color="red")
       return valid_kwargs
 
+    def preprocess_request_method_query(
+        self,
+        request_data: dict,
+    ):
+      """
+      Method for preprocessing the request before sending it to the LLM agent.
+      Parameters
+      ----------
+      request_data : dict
+          The request data from the Jeeves API.
+
+      Returns
+      -------
+      result_data : dict
+          The processed data for the next request that is not already
+      """
+      domain_context = request_data.get('domain_additional_context', [])
+      return {
+        self.ct.JeevesCt.CONTEXT: domain_context
+        # 'messages', 'user_token' and additional kwargs are already present in request_data.
+      }
+
+    def pre_process_chat_request(
+        self,
+        user_token: str = None,
+        message: str = None,
+        domain: str = None,
+        short_term_memory_only: bool = False,
+        is_chat_request: bool = False,
+        **kwargs,
+    ):
+      """
+      Helper method for preprocessing both the query and chat endpoints.
+      Parameters
+      ----------
+      user_token : str
+          The user token to use for the API. Default is None.
+      message : str
+          The message to send to the API. Default is None.
+      domain : str
+          The domain to use for the API. Default is None.
+      short_term_memory_only : bool
+          Whether to retrieve only the short term memory for the user token.
+          If False, documents retrieval will be used in case it is needed.
+      is_chat_request : bool
+          Whether this is a chat request. In that case, the short-term history
+          will be used to check for previous messages. If False, no conversation
+          history will be used.
+          This is relevant for the message wrapping.
+      kwargs : dict
+          Additional parameters to send to the API. Default is None.
+
+      Returns
+      -------
+      result: dict
+          A dictionary with the following keys:
+          - 'err_response': None or dict
+              If an error occurred, this will contain the error response.
+              Otherwise, it will be None.
+          - 'domain_prompt': str or None
+              The domain prompt to use for the request.
+          - 'additional_kwargs': dict
+              The additional kwargs to use for the request.
+          - 'messages': list[dict] or None
+              The messages to use for the request.
+              None if an error occurred.
+      """
+      result = {
+        'err_response': None,
+        'domain_prompt': None,
+        'additional_kwargs': {},
+        'messages': None,
+      }
+      if not self.verify_user_token(user_token):
+        result['err_response'] = self.invalid_token_response()
+        return result
+      # endif user token is valid
+      if not isinstance(message, str):
+        result['err_response'] = {
+          'error': 'Message not provided as string',
+          'status': 'error',
+        }
+        return result
+      # endif message is None
+
+      domain_prompt, additional_kwargs = self.get_domain_prompt(
+        user_token=user_token,
+        domain=domain,
+        return_additional_kwargs=True,
+      )
+
+      validated_kwargs = self._validate_llm_kwargs(**kwargs)
+      additional_kwargs = {
+        **additional_kwargs,
+        **validated_kwargs
+      }
+
+      messages = self.get_messages_of_user(
+        # In case of non-chat requests, no conversation history is used.
+        user_token=user_token if is_chat_request else None,
+        message=message,
+        domain_prompt=domain_prompt,
+      )
+      result['additional_kwargs'] = additional_kwargs
+      result['messages'] = messages
+      return result
+
     @BasePlugin.endpoint(method="post")
     # TODO: change to jeeves_agent_request?
     def query(
@@ -1118,62 +1347,53 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       -------
 
       """
-      if not self.verify_user_token(user_token):
-        return self.invalid_token_response()
-      # endif user token is valid
-      if not isinstance(message, str):
-        return {
-          'error': 'Message not provided as string',
-          'status': 'error',
-        }
-      # endif message is None
-
-      domain_prompt, additional_kwargs = self.get_domain_prompt(
+      processed_request = self.pre_process_chat_request(
         user_token=user_token,
-        domain=domain,
-        return_additional_kwargs=True,
-      )
-
-      validated_kwargs = self.validate_llm_kwargs(**kwargs)
-      additional_kwargs = {
-        **additional_kwargs,
-        **validated_kwargs
-      }
-
-      # Wrap the message
-      messages = self.get_messages_of_user(
-        # This is None, because this endpoint does not
-        # use any conversation history.
-        user_token=None,
         message=message,
-        domain_prompt=domain_prompt,
-        # **kwargs
+        domain=domain,
+        **kwargs,
       )
+      if processed_request['err_response'] is not None:
+        return processed_request['err_response']
 
-      postponed_request = self.maybe_retrieve_domain_additional_data(
+      additional_kwargs = processed_request['additional_kwargs']
+      messages = processed_request['messages']
+
+      domain_additional_data_step_description = self.get_description_of_retrieval_step(
         domain=domain,
         query=message,
-        next_request_params={
-          'user_token': user_token,
-          'messages': messages,
-          'keep_conversation_history': False,
-          'use_long_term_memory': False,
-          **additional_kwargs,
-        }
-      )
-      # Check if the request needs 
-      if postponed_request is not None:
-        return postponed_request
-      # endif request_id is not None
-
-      request_id = self.register_chat_request(
-        messages=messages,
         user_token=user_token,
+        short_term_memory_only=False,
+        # optional, since no preprocessing is needed
+        preprocess_request_method=None,
+        compute_request_result_method=self.compute_request_result_retrieval_domain_additional_data,
+      )
+      chat_step_description = self.get_description_of_chat_step(
+        domain=domain,
+        user_token=user_token,
+        messages=messages,
         keep_conversation_history=False,
         use_long_term_memory=False,
-        **additional_kwargs,
+        preprocess_request_method=self.preprocess_request_method_query,
+        compute_request_result_method=self.compute_request_result_chat,
+        extracted_param_names=[
+          self.ct.JeevesCt.CONTEXT
+        ],
+        **additional_kwargs
       )
-      return self.solve_postponed_request(request_id=request_id)
+
+      request_steps = [
+        domain_additional_data_step_description,
+        chat_step_description,
+      ]
+      request_steps = [
+        step for step in request_steps
+        if step is not None
+      ]
+      postponed_request = self.start_request_steps(
+        request_steps=request_steps
+      )
+      return postponed_request
 
     @BasePlugin.endpoint(method='post')
     def query_debug(
@@ -1228,10 +1448,152 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         for k, v in request_kwargs.items()
       }
 
-      request_id = self.register_chat_request(
+      chat_step_description = self.get_description_of_chat_step(
+        domain=domain,
+        user_token=user_token,
+        messages=messages,
+        keep_conversation_history=False,
+        use_long_term_memory=False,
+        preprocess_request_method=None,
+        compute_request_result_method=self.compute_request_result_chat,
         **request_kwargs
       )
-      return self.solve_postponed_request(request_id=request_id)
+
+      postponed_request = self.start_request_steps(
+        request_steps=[chat_step_description]
+      )
+      return postponed_request
+
+    def compute_request_result_retrieval_long_term_memory(
+        self, request_data: dict,
+        payload_response: dict,
+    ):
+      """
+      Method for preparing the RAG retrieval request for the long term memory.
+      Parameters
+      ----------
+      request_data : dict
+          The request data from the Jeeves API.
+      payload_response : dict
+          The processed payload from the Document Retrieval agent.
+
+      Returns
+      -------
+      res : dict
+          The processed data for the next request that is not already
+          present in the request_data.
+      """
+      # If this point is reached, that means no error occurred thus far.
+      query_data = request_data.get('query_data', {})
+      extracted_docs = query_data.get('docs')
+      request_data['long_term_memory_context'] = extracted_docs
+      return request_data
+
+    def compute_request_result_retrieval_domain_additional_data(
+        self, request_data: dict,
+        payload_response: dict,
+    ):
+      """
+      Method for preparing the RAG retrieval request for the domain additional data.
+      Parameters
+      ----------
+      request_data : dict
+          The request data from the Jeeves API.
+      payload_response : dict
+          The processed payload from the Document Retrieval agent.
+
+      Returns
+      -------
+      res : dict
+          The processed data for the next request that is not already
+          present in the request_data.
+      """
+      # If this point is reached, that means no error occurred thus far.
+      query_data = request_data.get('query_data', {})
+      extracted_docs = query_data.get('docs')
+      request_data['domain_additional_context'] = extracted_docs
+      return request_data
+
+    def preprocess_request_method_chat(
+        self,
+        request_data: dict,
+    ):
+      """
+      Method for preprocessing the current data before sending it to the LLM agent.
+      Parameters
+      ----------
+      request_data : dict
+          The request data gathered thus far.
+
+      Returns
+      -------
+      result_data : dict
+          The processed data for the next request that is not already
+          present in the request_data.
+      """
+      # In the future, both contexts could will merged or included in the messages.
+      domain_context = request_data.get('domain_additional_context', [])
+      long_term_memory_context = request_data.get('long_term_memory_context', [])
+      messages = request_data.get('messages', [])
+      return {
+        self.ct.JeevesCt.CONTEXT: long_term_memory_context
+      }
+
+    def compute_request_result_chat(
+        self,
+        request_data: dict,
+        payload_response: dict,
+    ):
+      """
+      Method for processing the response from the LLM agent.
+      Parameters
+      ----------
+      request_data : dict
+          The request data from the Jeeves API.
+      payload_response : dict
+          The response from the LLM agent.
+
+      Returns
+      -------
+      result_data : dict
+          The processed data for the next request that is not already
+          present in the request_data.
+      """
+      result = None
+      reply_data = request_data.get("reply_data", {})
+      reply_text = reply_data.get("text", "")
+      request_id = request_data.get('request_id', 'N/A')
+
+      if reply_text:
+        result = {
+          **reply_data,
+        }
+        user_token = request_data.get('user_token', None)
+        user_messages = request_data.get('messages', [])
+        use_long_term_memory = request_data.get('use_long_term_memory', False)
+        keep_conversation_history = request_data.get('keep_conversation_history', False)
+        self.P(
+          f"Done processing request '{request_id}' for user {user_token} with {use_long_term_memory=}. Response is:\n {reply_text}",
+          color="green"
+        )
+
+        if keep_conversation_history:
+          self.P(f"User messages: {user_messages}")
+          last_user_message = self.get_last_user_message(user_messages)
+          if last_user_message is not None:
+            self.__user_data[user_token]['messages'].append(last_user_message)
+          self.__user_data[user_token]['messages'].append({
+            'role': 'assistant',
+            'content': reply_text,
+          })
+          self.maybe_short_term_memory_to_long_term_memory(user_token, use_long_term_memory=use_long_term_memory)
+        # endif keep conversation history
+      # endif reply_text is not empty
+      self.Pd(f"Request ID '{request_id}' to LLM successfully processed.", color="green")
+
+      return {
+        "result": result,
+      }
 
     @BasePlugin.endpoint(method="post")
     def chat(
@@ -1265,79 +1627,67 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       -------
 
       """
-      if not self.verify_user_token(user_token):
-        return self.invalid_token_response()
-      # endif user token is valid
-      if not isinstance(message, str):
-        return {
-          'error': 'Message not provided as string',
-          'status': 'error',
-        }
-      # endif message is None
-
-      domain_prompt = self.get_domain_prompt(
-        user_token=user_token,
-        domain=domain,
-        return_additional_kwargs=False
-      )
-
-      messages = self.get_messages_of_user(
+      processed_request = self.pre_process_chat_request(
         user_token=user_token,
         message=message,
-        domain_prompt=domain_prompt,
-        # **kwargs
+        domain=domain,
+        short_term_memory_only=short_term_memory_only,
+        is_chat_request=True,
+        **kwargs,
       )
+      if processed_request['err_response'] is not None:
+        return processed_request['err_response']
 
-      validated_kwargs = self.validate_llm_kwargs(**kwargs)
-
+      additional_kwargs = processed_request['additional_kwargs']
+      messages = processed_request['messages']
       # The long term memory for the user conversation will be a domain identified with his
       # user token.
       use_long_term_memory = not short_term_memory_only
-      postponed_request = self.maybe_retrieve_domain_additional_data(
+
+      long_term_memory_step_description = self.get_description_of_retrieval_step(
         domain=user_token,
         query=message,
-        next_request_params={
-          'user_token': user_token,
-          'messages': messages,
-          'keep_conversation_history': True,
-          'use_long_term_memory': use_long_term_memory,
-          **validated_kwargs,
-        },
         user_token=user_token,
         short_term_memory_only=short_term_memory_only,
+        # optional, since no preprocessing is needed
+        preprocess_request_method=None,
+        compute_request_result_method=self.compute_request_result_retrieval_long_term_memory,
       )
-      # Check if the request needs 
-      if postponed_request is not None:
-        return postponed_request
-      # endif postponed_request is not None
-      
-      # TODO: add domain additional data retrieval
-      postponed_request = self.maybe_retrieve_domain_additional_data(
+      domain_additional_data_step_description = self.get_description_of_retrieval_step(
         domain=domain,
         query=message,
-        next_request_params={
-          'user_token': user_token,
-          'messages': messages,
-          'keep_conversation_history': True,
-          'use_long_term_memory': use_long_term_memory,
-          **validated_kwargs,
-        },
-        user_token=user_token
-      )
-      if postponed_request is not None:
-        return postponed_request
-      # endif postponed_request is not None
-      
-      request_id = self.register_chat_request(
-        messages=messages,
         user_token=user_token,
+        short_term_memory_only=False,
+        # optional, since no preprocessing is needed
+        preprocess_request_method=None,
+        compute_request_result_method=self.compute_request_result_retrieval_domain_additional_data,
+      )
+      chat_step_description = self.get_description_of_chat_step(
+        domain=domain,
+        user_token=user_token,
+        messages=messages,
         keep_conversation_history=True,
         use_long_term_memory=use_long_term_memory,
-        **validated_kwargs,
+        preprocess_request_method=self.preprocess_request_method_chat,
+        compute_request_result_method=self.compute_request_result_chat,
+        extracted_param_names=[
+          self.ct.JeevesCt.CONTEXT
+        ],
+        **additional_kwargs
       )
-      return self.solve_postponed_request(request_id=request_id)
 
+      request_steps = [
+        long_term_memory_step_description,
+        domain_additional_data_step_description,
+        chat_step_description,
+      ]
+      request_steps = [step for step in request_steps if step is not None]
+      postponed_request = self.start_request_steps(
+        request_steps=request_steps,
+      )
+      return postponed_request
   """END LLM SECTION"""
+
   @BasePlugin.endpoint(method='post')
   # TODO: add configurable parameter with preexistent user tokens
   def get_user_token(self, dummy_param: str = None):
@@ -1514,19 +1864,464 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       ]
     }
 
+  """REQUEST STEPS SECTION"""
+  if True:
+    def default_payload_processing_method(self, payload_data: dict):
+      return payload_data
+
+    def default_preprocess_request_method(self, request_data: dict):
+      """
+      The result of this method will be merged with the request data.
+      Parameters
+      ----------
+      request_data : dict
+          The request data that contains all the information about the request.
+
+      Returns
+      -------
+      result_data : dict
+          The processed data for the next request that is not already
+          present in the request_data.
+      """
+      return {}
+
+    def default_compute_request_result_method(self, request_data: dict, payload_response: dict):
+      """
+      The result of this method will be merged with the request data.
+      Parameters
+      ----------
+      request_data : dict
+          The request data that contains all the information about the request.
+      payload_response : dict
+          The response from the worker agent.
+
+      Returns
+      -------
+      result_data : dict
+          The processed data for the next request that is not already
+          present in the request_data.
+      """
+      return {
+        **payload_response
+      }
+
+    def get_request_step_data_dictionary(self):
+      return {
+        "step_start_time": None,
+        "step_end_time": None,
+        "error": None,
+      }
+
+    def _validate_and_extract_request_step(
+        self,
+        request_id: str,
+        request_step_idx: int,
+        request_data: dict,
+        check_if_started: bool = True,
+    ):
+      """
+      Validate and extract the request step from the request data.
+      Parameters
+      ----------
+      request_id : str
+          The request ID to validate.
+      request_step_idx : int
+          The request step index to validate.
+      request_data : dict
+          The request data that contains the request steps.
+
+      Returns
+      -------
+      tuple (bool, dict, dict, dict)
+          A tuple containing:
+          - dict: the extracted request step.
+          - dict: the extracted request step data.
+          - dict: the request result if the request is already finished or the step has already been started.
+      """
+      extracted_step = None
+      extracted_step_data = None
+      is_finished = request_data.get('finished', False)
+      request_result = None
+      if is_finished:
+        self.Pd(f"Request '{request_id}' is already finished.", color="r")
+        # If the request is already finished, it should have the 'result' key set.
+        # In case it is not set, return a generic error.
+        request_result = request_data.get('result', {
+          'error': "Error occurred in solving the request.",
+        })
+        return extracted_step, extracted_step_data, request_result
+      # endif request is finished
+
+      request_steps = request_data.get('request_steps', [])
+      if len(request_steps) == 0:
+        self.Pd(f"Request '{request_id}' has no specific request steps. Will mark as finished")
+        # request_result being an empty dict means no error occurred, but
+        # no further processing is needed.
+        request_result = {
+          "result": None
+        }
+        return extracted_step, extracted_step_data, request_result
+      if request_step_idx >= len(request_steps):
+        self.Pd(f"Request step index '{request_step_idx}' is out of bounds for request '{request_id}'. Only {len(request_steps)} steps exist.", color="r")
+        request_result = {
+          'error': f"Request step index '{request_step_idx}' is out of bounds. Only {len(request_steps)} steps exist.",
+        }
+        return extracted_step, extracted_step_data, request_result
+      # endif request step index is out of bounds
+
+      # Extract the current step and its data
+      extracted_step = request_steps[request_step_idx]
+      request_steps_data = request_data.get('request_steps_data', {})
+      current_step_data = request_steps_data.get(str(request_step_idx), {})
+
+      if check_if_started:
+        # Check if the current step has already been started
+        current_step_start_time = current_step_data.get('step_start_time')
+        if current_step_start_time is not None:
+          self.Pd(
+            f"Request step index '{request_step_idx}' for request '{request_id}' has already been started.",
+            color="r"
+          )
+          request_result = self.solve_postponed_request(request_id=request_id)
+        # endif current step has already been started
+      # endif check if started
+      return extracted_step, current_step_data, request_result
+
+    def start_request_step(
+        self,
+        request_id: str,
+        request_step_idx: int,
+    ):
+      # Validate the request step.
+      request_data = self.deepcopy_request_data(request_id=request_id, default_value={})
+      # self.Pd(f"Current request_data:\n{request_data}")
+      current_step, current_step_data, result = self._validate_and_extract_request_step(
+        request_id=request_id,
+        request_step_idx=request_step_idx,
+        request_data=request_data
+      )
+      if result is not None:
+        self.__requests[request_id] = {
+          **request_data,
+          **result,
+          'finished': True,
+        }
+        return result
+
+      # Start processing the current step
+      try:
+        request_steps_data = request_data.get('request_steps_data', {})
+        current_step_data = self.get_request_step_data_dictionary()
+        current_step_data['step_start_time'] = self.time()
+        request_steps_data[str(request_step_idx)] = current_step_data
+        request_data['request_steps_data'] = request_steps_data
+        preprocess_request_method = current_step.get('preprocess_request_method', None)
+        if not callable(preprocess_request_method):
+          preprocess_request_method = self.default_preprocess_request_method
+        try:
+          result_data = preprocess_request_method(request_data)
+        except Exception as e:
+          self.Pd(f"Error in custom preprocess request method: {e}\nFallback to default method.", color="r")
+          result_data = self.default_preprocess_request_method(request_data)
+        # endtry except preprocess_request_method
+
+        result_data = result_data or {}
+        request_data = {
+          **request_data,
+          **result_data,
+        }
+
+        current_step_request_param_names = current_step.get('request_param_names', [])
+        current_step_request_type = current_step.get('request_type', None)
+        log_msg = f"[{request_id}]Processing request step {request_step_idx} of type '{current_step_request_type}' "
+        log_msg += f"with param names: {current_step_request_param_names}."
+        self.Pd(log_msg)
+
+        # The elements in `request_param_name` can be either strings or tuples.
+        # - string means only the parameter name was specified and the value will be retrieved from request_data.
+        # - tuple means both the parameter name and its value were specified(the tuple will have to be of length 2).
+        current_step_request_kwargs_explicit = {}
+        current_step_request_kwargs_extracted = {}
+        for param in current_step_request_param_names:
+          # If the request parameter is a tuple of length 2, the value
+          if isinstance(param, tuple) and len(param) == 2:
+            current_step_request_kwargs_explicit[param[0]] = param[1]
+          else:
+            current_step_request_kwargs_extracted[str(param).lower()] = request_data.get(param)
+          # endif
+        # endfor current_step_request_param_names
+        current_step_request_kwargs = {
+          **current_step_request_kwargs_explicit,
+          **current_step_request_kwargs_extracted,
+          'request_type': current_step_request_type,
+          'request_id': request_id,
+        }
+
+        self.Pd(f"Request step {request_step_idx} kwargs:\n{current_step_request_kwargs}")
+
+        _, request_data = self.register_request(
+          return_request_data=True,
+          **current_step_request_kwargs,
+        )
+      except Exception as e:
+        self.Pd(f"Error in handling request step {request_step_idx}: {e}", color="red")
+        request_data['result'] = {
+          'error': str(e),
+          'request_id': request_data.get('request_id', 'unknown'),
+        }
+        request_data[str(request_step_idx)]['error'] = str(e)
+        request_data['finished'] = True
+      # endtry except next request steps
+
+      request_data['current_request_step_idx'] = request_step_idx
+      self.__requests[request_id] = request_data
+      return self.solve_postponed_request(request_id=request_id)
+
+    def start_request_steps(self, request_steps: list, **kwargs):
+      request_id = self.uuid()
+      start_time = self.time()
+      self.__requests[request_id] = {
+        "request_id": request_id,
+        "start_time": start_time,
+        "last_request_time": start_time,
+        'finished': False,
+        'timeout': self.cfg_request_timeout,
+        'request_steps': request_steps,
+        'current_request_step_idx': 0,
+        'request_steps_data': {},
+        **kwargs,
+      }
+
+      postponed_request = self.start_request_step(
+        request_id=request_id,
+        request_step_idx=0,
+      )
+      return postponed_request
+
+    def resolve_request_step(
+        self,
+        request_id: str,
+        request_data: dict,
+        request_step_idx: int,
+        payload_response: dict
+    ):
+      # Validate the request step.
+      current_step, current_step_data, result = self._validate_and_extract_request_step(
+        request_id=request_id,
+        request_step_idx=request_step_idx,
+        request_data=request_data,
+        check_if_started=False
+      )
+      if result is not None:
+        self.__requests[request_id] = {
+          **request_data,
+          **result,
+          'finished': True,
+        }
+        return result
+
+      # Process the current step
+      try:
+        request_steps_data = request_data.get('request_steps_data', {})
+        compute_request_result_method = current_step.get('compute_request_result_method', None)
+        if not callable(compute_request_result_method):
+          compute_request_result_method = self.default_compute_request_result_method
+        try:
+          result_data = compute_request_result_method(request_data=request_data, payload_response=payload_response)
+        except Exception as e:
+          self.Pd(f"Error in custom compute request result method: {e}\nFallback to default method.", color="r")
+          result_data = self.default_compute_request_result_method(
+            request_data=request_data, payload_response=payload_response
+          )
+        # endtry except compute_request_result_method
+
+        result_data = result_data or {}
+        request_data = {
+          **request_data,
+          **result_data,
+        }
+
+        current_time = self.time()
+        current_step_data['step_end_time'] = current_time
+        request_steps_data[str(request_step_idx)] = current_step_data
+        request_data['request_steps_data'] = request_steps_data
+      except Exception as e:
+        self.Pd(f"Error in handling request `{request_id}` at step {request_step_idx}: {e}", color="red")
+        request_data['result'] = {
+          'error': str(e),
+          'request_id': request_id,
+        }
+        current_step_data['error'] = str(e)
+        current_step_data['step_end_time'] = self.time()
+        request_steps_data = request_data.get('request_steps_data', {})
+        request_steps_data[str(request_step_idx)] = current_step_data
+        request_data['request_steps_data'] = request_steps_data
+        request_data['finished'] = True
+      # endtry except next request steps
+
+      self.__requests[request_id] = request_data
+
+      is_finished = request_data.get('finished', False)
+      request_number_of_steps = len(request_data.get('request_steps', []))
+      if request_step_idx == request_number_of_steps - 1:
+        is_finished = True
+      # endif last step
+      request_data['finished'] = is_finished
+
+      self.__requests[request_id] = request_data
+
+      if not is_finished:
+        # Move to the next step
+        next_request_step_idx = request_step_idx + 1
+        return self.start_request_step(
+          request_id=request_id,
+          request_step_idx=next_request_step_idx,
+        )
+      return self.solve_postponed_request(request_id=request_id)
+  """END REQUEST STEPS SECTION"""
+
   """PAYLOAD HANDLERS SECTION"""
   if True:
-    @_NetworkProcessorMixin.payload_handler(signature="DOC_EMBEDDING_AGENT")
-    def handle_payload_doc_embedding_agent(self, data):
+    def handle_payload_helper_doc_embedding(
+        self,
+        request_id: str,
+        request_data: dict,
+        payload_data: dict
+    ):
+      """
+      Specific handling of the payload from a DocEmbedding agent.
+      Parameters
+      ----------
+      request_id : str
+          The request ID.
+      request_data : dict
+          The entire request data available thus far.
+      payload_data : dict
+          The payload data from the DocEmbedding agent.
+
+      Returns
+      -------
+      res : dict
+          The updated request data.
+      """
+      request_type = request_data.get('request_type', None)
+      if request_type is None:
+        # If request type is not specified in the request data,
+        # try to extract it from the current request step.
+        current_request_step_idx = request_data.get('current_request_step_idx', 0)
+        request_steps = request_data.get('request_steps', [])
+        if current_request_step_idx < len(request_steps):
+          request_type = request_steps[current_request_step_idx].get('request_type', None)
+      # endif request type is None
+
+      error_message = None
+      request_result = payload_data.get('RESULT') or {}
+      if request_type == 'ADD_DOC':
+        request_data['result'] = {
+          **request_result,
+          'elapsed_time': self.time() - request_data['last_request_time'],
+          'request_id': request_id,
+        }
+      elif request_type == 'QUERY':
+        docs = request_result.get('DOCS', [])
+        request_data['query_data'] = {
+          'elapsed_time': self.time() - request_data['last_request_time'],
+          'request_id': request_id,
+          'docs': docs,
+        }
+      else:
+        error_message = f"Unknown request type for request ID '{request_id}': '{request_type}'!"
+      # endif request type specific handling
+
+      if error_message is None:
+        log_msg = f"`{request_type}` payload from DocEmbedding agent successfully processed for request ID '{request_id}'."
+        self.Pd(log_msg, color="g")
+      # endif no error
+
+      request_data['error'] = error_message
+      return request_data
+
+    def handle_payload_helper_llm(
+        self,
+        request_id: str,
+        request_data: dict,
+        payload_data: dict,
+    ):
+      """
+      Specific handling of the payload from an LLM agent.
+      Parameters
+      ----------
+      request_id : str
+          The request ID.
+      request_data : dict
+          The entire request data available thus far.
+      payload_data : dict
+          The payload data from the LLM agent.
+
+      Returns
+      -------
+      res : dict
+          The updated request data.
+      """
+      error_message = None
+      request_result = payload_data.get('RESULT') or {}
+      text_response = request_result.get('TEXT_RESPONSE', "")
+      model_name = request_result.get('MODEL_NAME', None)
+      if text_response is not None and isinstance(text_response, str):
+        request_data['reply_data'] = {
+          'elapsed_time': self.time() - request_data['last_request_time'],
+          'text': text_response,
+          'model_name': model_name,
+          # TODO: check if necessary
+          'request_id': request_id,
+        }
+      else:
+        error_message = f"Invalid text response from LLM agent for request ID '{request_id}'!"
+      # endif text response is valid
+
+      request_data['error'] = error_message
+      return request_data
+
+    def handle_payload_helper(
+        self,
+        data: dict,
+        agent_type: str = None,
+    ):
+      """
+      Helper method for handling payloads from agent responses.
+      Parameters
+      ----------
+      data : dict
+          The payload data to handle.
+
+      agent_type : str
+          The type of agent that sent the payload.
+
+      Returns
+      -------
+      success : bool
+          True if the payload was handled successfully, False otherwise.
+      """
+      success = False
       request_id = data.get('REQUEST_ID', None)
-      if request_id is not None:
+      # Check if the request ID is valid.
+      if isinstance(request_id, str) and len(request_id) > 0:
+        # Check if the request ID exists in the requests dictionary.
         if request_id in self.__requests:
-          request_data = self.__requests[request_id]
+          # Extract the request data and copy it to avoid modifying the original data.
+          # These copies will be used for all the processing of the request.
+          request_data = self.deepcopy_request_data(request_id=request_id, default_value={})
+          payload_data = self.deepcopy(data)
+          # Check if the request is already finished.
           request_finished = request_data.get('finished', False)
           if request_finished:
-            self.Pd(f"Request ID '{request_id}' to DocEmbedding agents already finished.", color="red")
+            self.Pd(f"Request ID '{request_id}' to {agent_type} agents already finished.", color="red")
             return
-          request_type = request_data.get('request_type', None)
+          # endif request already finished
+
+          # Check error in current payload.
+          # Maybe change the error handling in the future
+          # to allow for partial results in case of requests with multiple steps.
           error_message = (data.get('RESULT') or {}).get('ERROR_MESSAGE')
           if error_message is not None:
             request_data['result'] = {
@@ -1534,59 +2329,73 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
               'request_id': request_id,
             }
             request_data['finished'] = True
-            self.Pd(f"Request ID '{request_id}' to DocEmbedding failed with error: {error_message}", color="red")
-            return
-          if request_type == 'ADD_DOC':
-            request_result = data.get('RESULT') or {}
-            request_data['result'] = {
-              'elapsed_time': self.time() - request_data['start_time'],
-              'request_id': request_id,
-              **request_result,
-            }
-            request_data['finished'] = True
-            self.Pd(f"'ADD_DOC' request ID '{request_id}' to DocEmbedding successfully processed.", color="green")
-          elif request_type == 'QUERY':
-            request_result = data.get('RESULT') or {}
-            docs = request_result.get('DOCS', [])
+            self.Pd(f"Request ID '{request_id}' to {agent_type} failed with error: {error_message}", color="red")
+          # endif error message is not None
 
-            next_request_params = request_data.get('next_request_params')
-            self.P(f"Next request params: {next_request_params}")
-            if isinstance(next_request_params, dict):
-              # Union of the kwargs in case of overlapping keys
-              chat_request_kwargs = {
-                self.ct.JeevesCt.REQUEST_ID: request_id,
-                **next_request_params,
-                self.ct.JeevesCt.CONTEXT: docs,
-                **request_result
-              }
-              # normalize the kwargs
-              chat_request_kwargs = {
-                (k.lower() if isinstance(k, str) else k): v
-                for k, v in chat_request_kwargs.items()
-              }
-              self.P(f"Continuing with chat request: {chat_request_kwargs}")
-
-              self.register_chat_request(
-                **chat_request_kwargs,
+          # Specific handling for the current agent type.
+          try:
+            handling_error_message = None
+            if agent_type == "DOC_EMBEDDING":
+              request_data = self.handle_payload_helper_doc_embedding(
+                request_id=request_id,
+                request_data=request_data,
+                payload_data=payload_data
+              )
+            elif agent_type == "LLM":
+              request_data = self.handle_payload_helper_llm(
+                request_id=request_id,
+                request_data=request_data,
+                payload_data=payload_data
               )
             else:
-              request_data['result'] = {
-                'elapsed_time': self.time() - request_data['start_time'],
-                'request_id': request_id,
-                'docs': docs,
-              }
-              request_data['finished'] = True
-            # endif request finished or not
+              handling_error_message = f"Unknown agent type '{agent_type}' for request ID '{request_id}'!"
+            # endif agent type specific handling
+            if handling_error_message is None:
+              # Check if the specific handling set an error in the request data.
+              handling_error_message = request_data.get('error', None)
+            # endif specific handling finished successfully
+          except Exception as e:
+            handling_error_message = f"Error in {agent_type} specific payload handling for request ID '{request_id}': {e}"
+          # endtry except agent type specific handling
 
-            self.Pd(f"'QUERY' request ID '{request_id}' to DocEmbedding successfully processed.", color="green")
+          # Resolve request steps if no error occurred.
+          if handling_error_message is None:
+            request_step_idx = request_data.get('current_request_step_idx', 0)
+            self.resolve_request_step(
+              request_id=request_id,
+              request_step_idx=request_step_idx,
+              payload_response=payload_data,
+              request_data=request_data,
+            )
+            # endif no error in processing next steps
+          # endif no error in agent type specific handling
+          # Separate check in case of exception in next steps handling.
           else:
-            self.Pd(f"Unknown request type for request ID '{request_id}': '{request_type}'!", color="red")
+            request_data['result'] = {
+              'error': handling_error_message,
+              'request_id': request_id,
+            }
+            request_data['finished'] = True
+            self.Pd(handling_error_message, color="red")
+            # Update the request data in the requests dictionary.
+            self.__requests[request_id] = request_data
+          # endif handling error message is not None
         else:
           self.Pd(f"Request ID '{request_id}' not found in requests.", color="red")
+          # debug_msg = f"Known requests: {list(self.__requests.keys())}"
+          # self.Pd(debug_msg, color="red")
+        # endif request_id exists
       else:
         self.Pd(f"`REQUEST_ID` not provided in {data}")
       # endif request_id available
-      return
+      return success
+
+    @_NetworkProcessorMixin.payload_handler(signature="DOC_EMBEDDING_AGENT")
+    def handle_payload_doc_embedding_agent(self, data):
+      return self.handle_payload_helper(
+        data=data,
+        agent_type="DOC_EMBEDDING",
+      )
 
     def get_last_user_message(self, user_messages: list[dict]):
       """
@@ -1617,56 +2426,10 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
 
     @_NetworkProcessorMixin.payload_handler(signature="LLM_AGENT")
     def handle_payload_llm_agent(self, data):
-      request_id = data.get('REQUEST_ID', None)
-      if request_id is not None:
-        if request_id in self.__requests:
-          request_data = self.__requests[request_id]
-          request_finished = request_data.get('finished', False)
-          if request_finished:
-            self.Pd(f"Request ID '{request_id}' to LLM agent already finished.", color="red")
-            return
-          error_message = (data.get('RESULT') or {}).get('ERROR_MESSAGE')
-          if error_message is not None:
-            request_data['result'] = {
-              'error': error_message,
-              'request_id': request_id,
-            }
-            request_data['finished'] = True
-            self.Pd(f"Request ID '{request_id}' to LLM failed with error: {error_message}", color="red")
-            return
-          text_response = data.get('RESULT', {}).get('TEXT_RESPONSE', "")
-          model_name = data.get('RESULT', {}).get('MODEL_NAME', None)
-          if text_response is not None:
-            request_data['result'] = {
-              'response': text_response,
-              'elapsed_time': self.time() - request_data['start_time'],
-              'model_name': model_name,
-              'request_id': request_id,
-            }
-            request_data['finished'] = True
-            user_token = request_data.get('user_token', None)
-            user_messages = request_data.get('messages', [])
-            use_long_term_memory = request_data.get('use_long_term_memory', False)
-            keep_conversation_history = request_data.get('keep_conversation_history', False)
-            self.P(f"Done processing request '{request_id}' for user {user_token} with {use_long_term_memory=}. Response is:\n {text_response}", color="green")
-            if keep_conversation_history:
-              self.P(f"User messages: {user_messages}")
-              last_user_message = self.get_last_user_message(user_messages)
-              if last_user_message is not None:
-                self.__user_data[user_token]['messages'].append(last_user_message)
-              self.__user_data[user_token]['messages'].append({
-                'role': 'assistant',
-                'content': text_response,
-              })
-              self.maybe_short_term_memory_to_long_term_memory(user_token, use_long_term_memory=use_long_term_memory)
-            # endif request made through /chat endpoint
-            self.Pd(f"Request ID '{request_id}' to LLM successfully processed.", color="green")
-        else:
-          self.Pd(f"Request ID '{request_id}' not found in requests.", color="red")
-      else:
-        self.Pd(f"`REQUEST_ID` not provided in {data}")
-      # endif request_id available
-      return
+      return self.handle_payload_helper(
+        data=data,
+        agent_type="LLM",
+      )
   """END PAYLOAD HANDLERS SECTION"""
 
   def __maybe_send_command_payloads(self):
