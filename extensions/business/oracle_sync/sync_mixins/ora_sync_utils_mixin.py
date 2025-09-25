@@ -483,6 +483,20 @@ class _OraSyncUtilsMixin:
       """
       return self.state_machine_api_get_current_state(self.state_machine_name)
 
+    def check_early_stop_report(self, phase: str):
+      """
+      Check if at the current iteration a message should be sent due to early stopping.
+      Parameters
+      ----------
+      phase : str
+
+      Returns
+      -------
+      True if a message should be sent, False otherwise
+      """
+      additional_iteration_number = self.early_stopping_iterations.get(phase, 0)
+      return additional_iteration_number % 2 > 0
+
     def _maybe_early_stop_phase(
         self,
         data: dict,
@@ -535,7 +549,7 @@ class _OraSyncUtilsMixin:
         log_str = f"Received {n_received}/{total_participating_oracles} {tables_str} from oracles.\n"
         log_str += f"{n_received} >= {threshold}, thus early stopping {phase} is possible"
         log_str += f"({iterations_left}/{additional_iterations} iterations left)."
-        self.P(log_str, boxed=True)
+        self.P(log_str, boxed=early_stop)
         return early_stop
       # endif early stop
       return False

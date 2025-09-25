@@ -28,7 +28,7 @@ ORACLE_SYNC_ACCEPTED_MEDIAN_ERROR_MARGIN = EPOCH_MAX_VALUE - POTENTIALLY_FULL_AV
 ORACLE_SYNC_IGNORE_REQUESTS_SECONDS = 3 * 60  # 3 minutes before the epoch end requests will be ignored
 
 # Number of additional iterations to perform after early stopping is possible.
-ORACLE_SYNC_EARLY_STOP_ADDITIONAL_ITERATIONS = 5
+ORACLE_SYNC_EARLY_STOP_ADDITIONAL_ITERATIONS = 3
 
 
 class OracleSyncCt:

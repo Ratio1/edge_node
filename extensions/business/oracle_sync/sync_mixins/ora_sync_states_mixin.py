@@ -454,7 +454,9 @@ class _OraSyncStatesCallbacksMixin:
           self.dct_local_tables[self.node_addr] = self.local_table
         # endif first iteration of the current state
 
-        if self.last_time_local_table_sent is None or self.time() - self.last_time_local_table_sent >= self.cfg_send_interval:
+        early_stop_report = self.check_early_stop_report(self.STATES.S2_SEND_LOCAL_TABLE)
+        send_time = (self.last_time_local_table_sent is None) or (self.time() - self.last_time_local_table_sent >= self.cfg_send_interval)
+        if early_stop_report or send_time:
           self.P(f"Sending {self.local_table=}")
 
           oracle_data = {
@@ -655,7 +657,9 @@ class _OraSyncStatesCallbacksMixin:
             self.dct_median_tables[self.node_addr] = self.median_table
         # endif first iteration of the current state
 
-        if self.last_time_median_table_sent is None or self.time() - self.last_time_median_table_sent >= self.cfg_send_interval:
+        early_stop_report = self.check_early_stop_report(self.STATES.S4_SEND_MEDIAN_TABLE)
+        send_time = (self.last_time_median_table_sent is None) or (self.time() - self.last_time_median_table_sent >= self.cfg_send_interval)
+        if early_stop_report or send_time:
           if self.cfg_debug_sync:
             self.P(f"Sending median {self._compute_simple_median_table(self.median_table)}")
           # endif debug_sync
@@ -953,7 +957,9 @@ class _OraSyncStatesCallbacksMixin:
           is_first_iteration = True
         # endif first iteration of the current state
 
-        if self.last_time__agreement_signature_sent is None or self.time() - self.last_time__agreement_signature_sent >= self.cfg_send_interval:
+        early_stop_report = self.check_early_stop_report(self.STATES.S6_SEND_AGREED_MEDIAN_TABLE)
+        send_time = (self.last_time__agreement_signature_sent is None) or (self.time() - self.last_time__agreement_signature_sent >= self.cfg_send_interval)
+        if early_stop_report or send_time:
           # Remove 0 values from the compiled agreed median table.
           # This is done to both reduce the size of the signed data and to avoid
           # additional zero values appearing when verifying the table.
@@ -1013,6 +1019,22 @@ class _OraSyncStatesCallbacksMixin:
         self.compiled_agreed_median_table_signatures[sender] = signature_dict
       # endfor received messages
       return
+
+    def _send_agreement_signature_timeout(self):
+      """
+      Check if the exchange phase of the agreed median table has finished.
+
+      Returns
+      -------
+      bool: True if the exchange phase of the agreed median table has finished, False otherwise
+      """
+      timeout_reached = (self.time() - self.first_time__agreement_signature_sent) > self.cfg_send_period
+      early_stopping = self._maybe_early_stop_phase(
+        data=self.compiled_agreed_median_table_signatures,
+        phase=self.STATES.S6_SEND_AGREED_MEDIAN_TABLE,
+        tables_str="agreement tables",
+      )
+      return early_stopping or timeout_reached
   """END S6_SEND_AGREED_MEDIAN_TABLE CALLBACKS"""
 
   """S10_EXCHANGE_AGREEMENT_SIGNATURES CALLBACKS"""
@@ -1026,8 +1048,9 @@ class _OraSyncStatesCallbacksMixin:
         if self.first_time__agreement_signatures_exchanged is None:
           self.first_time__agreement_signatures_exchanged = self.time()
 
+        early_stop_report = self.check_early_stop_report(self.STATES.S10_EXCHANGE_AGREEMENT_SIGNATURES)
         last_sent_time = self.last_time__agreement_signatures_exchanged
-        if last_sent_time is None or self.time() - last_sent_time >= self.cfg_send_interval:
+        if early_stop_report or last_sent_time is None or self.time() - last_sent_time >= self.cfg_send_interval:
           oracle_data = {
             OracleSyncCt.STAGE: self._get_current_state(),
             OracleSyncCt.AGREEMENT_SIGNATURES: self.compiled_agreed_median_table_signatures,
@@ -1062,22 +1085,6 @@ class _OraSyncStatesCallbacksMixin:
         # endif debug_sync
       # endfor received messages
       return
-
-    def _send_agreement_signature_timeout(self):
-      """
-      Check if the exchange phase of the agreed median table has finished.
-
-      Returns
-      -------
-      bool: True if the exchange phase of the agreed median table has finished, False otherwise
-      """
-      timeout_reached = (self.time() - self.first_time__agreement_signature_sent) > self.cfg_send_period
-      early_stopping = self._maybe_early_stop_phase(
-        data=self.compiled_agreed_median_table_signatures,
-        phase=self.STATES.S6_SEND_AGREED_MEDIAN_TABLE,
-        tables_str="agreement tables",
-      )
-      return early_stopping or timeout_reached
 
     def _exchange_signatures_timeout(self):
       """
