@@ -49,7 +49,10 @@ _CONFIG = {
   "CHAIN_DIST_MONITOR_VERBOSITY": 5,
 
   # our overwritten props
-  'PROCESS_DELAY' : 5,
+  'PROCESS_DELAY' : 10,
+
+  # Plugin Sleep period in case of an error.
+  'SLEEP_PERIOD' : 0.1,
 }
 
 class ChainDistMonitorPlugin(BasePlugin):
@@ -169,8 +172,7 @@ class ChainDistMonitorPlugin(BasePlugin):
       self.maybe_distribute_rewards()
       self.maybe_update_liveness()
     except Exception as e:
-      sleep_period = 0.1
-      self.P(f"Exception during process:\n{self.trace_info()}\nSleeping for {sleep_period} seconds.", color='r')
-      self.sleep(sleep_period)
+      self.P(f"Exception during process:\n{self.trace_info()}\nSleeping for {self.cfg_sleep_period} seconds.", color='r')
+      self.sleep(self.cfg_sleep_period)
     # endtry-except
     return

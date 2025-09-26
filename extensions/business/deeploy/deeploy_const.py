@@ -24,6 +24,10 @@ class DEEPLOY_KEYS:
   APP_ALIAS = "app_alias"
   PLUGIN_SIGNATURE = "plugin_signature"
   TARGET_NODES = "target_nodes"
+  CURRENT_TARGET_NODES = "current_target_nodes"
+  SPARE_NODES = "spare_nodes"
+  ALLOW_REPLICATION_IN_THE_WILD = "allow_replication_in_the_wild" # if target nodes are not available
+  NR_TARGET_NODES = "nr_target_nodes" # if target nodes are not available
   TARGETS = "targets"
   TARGET_NODES_COUNT = "target_nodes_count"
   AUTH = "auth"
@@ -43,6 +47,10 @@ class DEEPLOY_KEYS:
   SENDER_ORACLES = "sender_oracles"
   SENDER_NODES_COUNT = "sender_nodes_count"
   SENDER_TOTAL_COUNT = "sender_total_count"
+
+  # Config keys
+  DATE_UPDATED = "date_updated"
+  DATE_CREATED = "date_created"
   
 
 class DEEPLOY_STATUS:
@@ -75,6 +83,9 @@ class DEEPLOY_ERRORS:
   REQUEST8 = "ERR16_REQUEST8"
   REQUEST9 = "ERR17_REQUEST9"
   REQUEST10 = "ERR18_REQUEST10"
+  REQUEST11 = "ERR22_REQUEST11"
+  REQUEST12 = "ERR23_REQUEST12"
+  REQUEST13 = "ERR24_REQUEST13"
   NODETAGS1 = "ERR19_NODETAGS1"
   NODETAGS2 = "ERR20_NODETAGS2"
   NODETAGS3 = "ERR21_NODETAGS3"
@@ -138,7 +149,13 @@ DEEPLOY_CREATE_REQUEST = {
     "0xai_node_1",
     "0xai_node_2",
   ],
+  "spare_nodes" : [
+    "0xai_node_1",
+    "0xai_node_2",
+  ],
   "target_nodes_count" : 0,
+  "allow_replication_in_the_wild": False,
+  "job_tags": ["REG:EU", "CT:*"],
   "node_res_req" : { # this is the resource requirements for the target nodes
     # this is the resource requirements for the target nodes
     # and is usable for the case when we want to deploy our service on a much 
@@ -463,3 +480,8 @@ DEEPLOY_APP_COMMAND_REQUEST = {
 
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
 }  
+
+DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST = {
+  "job_id" : 1, # The job ID to retrieve details for
+  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
+}

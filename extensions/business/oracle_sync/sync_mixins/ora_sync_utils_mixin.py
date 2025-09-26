@@ -10,6 +10,7 @@ from extensions.business.oracle_sync.sync_mixins.ora_sync_constants import (
   ORACLE_SYNC_ONLINE_PRESENCE_MIN_THRESHOLD,
 
   ORACLE_SYNC_IGNORE_REQUESTS_SECONDS,
+  ORACLE_SYNC_EARLY_STOP_ADDITIONAL_ITERATIONS,
   
   DEBUG_MODE,
   VALUE_STANDARDS
@@ -151,6 +152,7 @@ class _OraSyncUtilsMixin:
         self,
         nested_message_dict: dict,
         ignore_keys: list = None,
+        process_only_keys: list = None,
         return_cids: bool = False,
         debug=True
     ):
@@ -168,6 +170,10 @@ class _OraSyncUtilsMixin:
           A list of keys to ignore when extracting data from the message.
           This can be used to skip certain keys that are not relevant for the extraction.
           By default, None, which means no keys will be ignored.
+      process_only_keys : list, optional
+          If provided, only the keys in this list will be processed.
+          If empty list, no keys will be processed.
+          By default, None, which means all keys will be processed.
       debug : bool, optional
           Whether to print debug messages, by default True
 
@@ -192,20 +198,36 @@ class _OraSyncUtilsMixin:
           self.P(f"`ignore_keys` is {type(ignore_keys)} != list. Using empty list instead.", color='r')
         ignore_keys = []
       # endif ignore_keys is not list
+
+      if isinstance(process_only_keys, str):
+        process_only_keys = [process_only_keys]
+      # endif process_only_keys is str
+      if not isinstance(process_only_keys, list):
+        if debug and process_only_keys is not None:
+          self.P(f"`process_only_keys` is {type(process_only_keys)} != list. Using None instead.", color='r')
+        process_only_keys = None
+      else:
+        if debug:
+          self.P(f"Processing only keys in `process_only_keys`: {process_only_keys}.")
+      # endif process_only_keys is not list
+
       updated_values = {}
       cids = {}
       for key, msg_data in nested_message_dict.items():
-        # 1. Check if the key is in the ignore keys.
+        # 1. Check if process_only_keys is provided and if the current key is in it.
+        if process_only_keys is not None and key not in process_only_keys:
+          continue
+        # 2. Check if the key is in the ignore keys.
         if key in ignore_keys:
           continue
-        # 2. Check if the data is a CID or data.
+        # 3. Check if the data is a CID or data.
         if isinstance(msg_data, str):
           if debug:
             self.P(f"Attempting to get data from R1FS using CID {msg_data}.")
-          # 3. Attempt to get the data from R1FS.
+          # 4. Attempt to get the data from R1FS.
           res = self.r1fs_get_pickle(cid=msg_data, debug=debug)
           if res is not None and debug:
-            # 4. If the retrieval was successful, store the result.
+            # 5. If the retrieval was successful, store the result.
             updated_values[key] = res
             cids[key] = msg_data
             self.P(f"Successfully retrieved data from R1FS using CID {msg_data}.")
@@ -214,7 +236,7 @@ class _OraSyncUtilsMixin:
             break
         # endif
       # endfor key, data
-      # 5. Update the nested message dictionary with the retrieved values.
+      # 6. Update the nested message dictionary with the retrieved values.
       nested_message_dict.update(updated_values)
       return (success, nested_message_dict, cids) if return_cids else (success, nested_message_dict)
 
@@ -461,13 +483,28 @@ class _OraSyncUtilsMixin:
       """
       return self.state_machine_api_get_current_state(self.state_machine_name)
 
+    def check_early_stop_report(self, phase: str):
+      """
+      Check if at the current iteration a message should be sent due to early stopping.
+      Parameters
+      ----------
+      phase : str
+
+      Returns
+      -------
+      True if a message should be sent, False otherwise
+      """
+      additional_iteration_number = self.early_stopping_iterations.get(phase, 0)
+      return additional_iteration_number % 2 > 0
+
     def _maybe_early_stop_phase(
         self,
         data: dict,
         phase: str,
         tables_str: str,
         ignore_tolerance: bool = False,
-        tolerance: int = ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD
+        tolerance: int = ORACLE_SYNC_ACCEPTED_REPORTS_THRESHOLD,
+        additional_iterations: int = ORACLE_SYNC_EARLY_STOP_ADDITIONAL_ITERATIONS
     ):
       """
       Check to see if the current phase should be stopped early.
@@ -504,12 +541,34 @@ class _OraSyncUtilsMixin:
       )
       total_participating_oracles = self.total_participating_oracles()
       if n_received >= threshold:
+        early_stop_iterations = self.early_stopping_iterations.get(phase, 0)
+        self.early_stopping_iterations[phase] = early_stop_iterations + 1
+        early_stop = early_stop_iterations >= additional_iterations
+        iterations_left = max(0, additional_iterations - early_stop_iterations)
+
         log_str = f"Received {n_received}/{total_participating_oracles} {tables_str} from oracles.\n"
-        log_str += f"{n_received} >= {threshold}, thus early stopping {phase} is possible."
-        self.P(log_str, boxed=True)
-        return True
+        log_str += f"{n_received} >= {threshold}, thus early stopping {phase} is possible"
+        log_str += f"({iterations_left}/{additional_iterations} iterations left)."
+        self.P(log_str, boxed=early_stop)
+        return early_stop
       # endif early stop
       return False
+
+    def get_sender_str(self, sender: str):
+      """
+      Get the string representation of the sender.
+      This will return the EEID of the sender if it is known, otherwise it will return the address.
+
+      Parameters
+      ----------
+      sender : str
+          The address of the sender
+
+      Returns
+      -------
+      str : The string representation of the sender
+      """
+      return f"`{self.netmon.network_node_eeid(sender)}` <{sender}>"
 
     def log_received_message(
         self,
@@ -522,8 +581,8 @@ class _OraSyncUtilsMixin:
       current_count = len(data) + (1 - is_duplicated)
       duplicated_str = "(duplicated)" if is_duplicated else ""
       progress_str = f"[{current_count}/{self.total_participating_oracles()}]"
-      sender_alias = self.netmon.network_node_eeid(sender)
-      log_str = f"{progress_str}Received message{duplicated_str} from oracle `{sender_alias}` <{sender}>: {stage = }"
+      sender_str = self.get_sender_str(sender)
+      log_str = f"{progress_str}Received message{duplicated_str} from oracle {sender_str}: {stage = }"
 
       if return_str:
         return log_str
@@ -760,7 +819,7 @@ class _OraSyncUtilsMixin:
         log_msg += f" (blockchain presence threshold: {blockchain_min_threshold})"
         log_msg += f"\nParticipating oracles:{participating_str}"
         if show_logs:
-          self.P(log_msg, color='r')
+          self.P(log_msg, boxed=True, color='r')
         return False
       if cnt_participating <= online_min_threshold:
         log_msg = "Not enough online oracles!"
@@ -768,7 +827,7 @@ class _OraSyncUtilsMixin:
         log_msg += f" (online presence threshold: {online_min_threshold})"
         log_msg += f"\nParticipating oracles:{participating_str}"
         if show_logs:
-          self.P(log_msg, color='r')
+          self.P(log_msg, boxed=True, color='r')
         return False
       if show_logs:
         log_msg = f"Consensus possible: "
@@ -834,9 +893,10 @@ class _OraSyncUtilsMixin:
       -------
       bool : True if the received values are ok, False otherwise
       """
+      sender_str = self.get_sender_str(sender=sender)
       # This can also happen if oracle is processing message not meant for OracleSync.
       if not isinstance(oracle_data, dict) and self.cfg_debug_sync:
-        self.P(f"Received message from oracle {sender} with wrong type for oracle_data: "
+        self.P(f"Received message from oracle {sender_str} with wrong type for oracle_data: "
                f"{type(oracle_data) = }. Expected dict", color='r')
         return False
 
@@ -870,17 +930,17 @@ class _OraSyncUtilsMixin:
       received_fields = list(oracle_data.keys())
 
       if any(is_missing):
-        self.P(f"Received message from oracle {sender} with missing fields: "
+        self.P(f"Received message from oracle {sender_str} with missing fields: "
                f"{missing_fields}. All {received_fields = }", color='r')
         return False
 
       if any(is_none):
-        self.P(f"Received message from oracle {sender} with `None` fields: "
+        self.P(f"Received message from oracle {sender_str} with `None` fields: "
                f"{none_fields}. All {received_fields = }", color='r')
         return False
 
       if any(is_invalid_type):
-        msg = f"Received message from oracle {sender} with wrong type for fields:\n"
+        msg = f"Received message from oracle {sender_str} with wrong type for fields:\n"
         msg += '\n'.join([
           f"\t{field} is {type(value)}. Expected {expected_type}"
           for field, value, expected_type in invalid_type_fields
@@ -901,7 +961,7 @@ class _OraSyncUtilsMixin:
           retrieved_data = oracle_data.get(var_name)
           if retrieved_data is None:
             self.P(
-              f"Received message from oracle {sender} and failed to retrieve data for {var_name} from R1FS."
+              f"Received message from oracle {sender_str} and failed to retrieve data for {var_name} from R1FS."
               f"Ignoring...",
               color='r'
             )
@@ -915,7 +975,7 @@ class _OraSyncUtilsMixin:
           expected_stage = [expected_stage]
         stage = oracle_data.get(OracleSyncCt.STAGE, sentinel)
         if stage not in expected_stage:
-          self.P(f"Received message from oracle {sender} with wrong stage: "
+          self.P(f"Received message from oracle {sender_str} with wrong stage: "
                  f"{stage = }. Expected {expected_stage}", color='r')
           return False
         # endif stage not as expected
@@ -924,7 +984,7 @@ class _OraSyncUtilsMixin:
       if verify:
         result = self.bc.verify(dct_data=oracle_data, str_signature=None, sender_address=None)
         if not result.valid:
-          self.P(f"Invalid signature from oracle {sender}: {result.message}", color='r')
+          self.P(f"Invalid signature from oracle {sender_str}: {result.message}", color='r')
           return False
         # endif valid signature
       # endif verify
@@ -955,14 +1015,16 @@ class _OraSyncUtilsMixin:
         return False
       # endif generic checks
 
+      sender_str = self.get_sender_str(sender=sender)
       announced_participants = oracle_data[OracleSyncCt.ANNOUNCED_PARTICIPANTS]
       for node_addr in announced_participants:
         if not self.bc.address_is_valid(node_addr):
-          self.P(f"Invalid address {node_addr} in announced participants from oracle {sender}. Ignoring...", color='r')
+          self.P(f"Invalid address {node_addr} in announced participants from oracle {sender_str}. Ignoring...", color='r')
           return False
         # endif invalid address
+        node_addr_str = self.get_sender_str(node_addr)
         if node_addr not in self.get_oracle_list():
-          self.P(f"Node {node_addr} is not an oracle. Ignoring...", color='r')
+          self.P(f"Node {node_addr_str} is not an oracle. Ignoring...", color='r')
           return False
       # endfor announced_participants
 
@@ -995,16 +1057,17 @@ class _OraSyncUtilsMixin:
 
       # If the previous checks passed, we can safely assume that the keys are in the dictionary.
       local_table = oracle_data[OracleSyncCt.LOCAL_TABLE]
+      sender_str = self.get_sender_str(sender=sender)
 
       if not self.is_participating.get(sender, False) and local_table is not None:
         local_table_str = f'{local_table = }'
         if not self.cfg_debug_sync and len(local_table_str) > 100:
           local_table_str = f'{local_table_str[:100]}...'
-        self.P(f"Node {sender} should not have sent value {local_table_str}. ignoring...", color='r')
+        self.P(f"Node {sender_str} should not have sent value {local_table_str}. ignoring...", color='r')
         return False
 
       if self.is_participating.get(sender, False) and local_table is None:
-        self.P(f"Oracle {sender} should have sent value. ignoring...", color='r')
+        self.P(f"Oracle {sender_str} should have sent value. ignoring...", color='r')
         return False
 
       return True
@@ -1055,6 +1118,8 @@ class _OraSyncUtilsMixin:
         for result in verify_results
       ) and len(verify_results) > 0
 
+      sender_str = self.get_sender_str(sender=sender)
+
       if not verified_all:
         messages = [result.message for result in verify_results if not result.valid]
         str_messages = '\n'.join([
@@ -1062,7 +1127,7 @@ class _OraSyncUtilsMixin:
           for message in messages
         ])
         reason_str = f'\n{str_messages}' if self.cfg_debug_sync_full else ''
-        self.P(f"Invalid {dict_name} from oracle {sender}: Verification failed:{reason_str}", color='r')
+        self.P(f"Invalid {dict_name} from oracle {sender_str}: Verification failed:{reason_str}", color='r')
         return False
       # verified_all
 
@@ -1071,7 +1136,7 @@ class _OraSyncUtilsMixin:
 
         is_own_message = len(senders) == 1 and list(senders)[0] == sender
         if not is_own_message:
-          self.P(f'Invalid {dict_name} from oracle {sender}: Sender sent data from {list(senders)}', color='r')
+          self.P(f'Invalid {dict_name} from oracle {sender_str}: Sender sent data from {list(senders)}', color='r')
         # endif is_own_message
       # endif check_identity
       return True
@@ -1146,6 +1211,7 @@ class _OraSyncUtilsMixin:
         ]
         for dct_value in dct_values.values()
       ]
+      sender_str = self.get_sender_str(sender=sender)
       median_signatures_ok = all(
         all(result.valid for result in value_results) and len(value_results) > 0
         for value_results in verify_results
@@ -1161,7 +1227,7 @@ class _OraSyncUtilsMixin:
           for message in messages
         ])
         reason_str = f'\n{str_messages}' if self.cfg_debug_sync_full else ''
-        self.P(f"Invalid {dict_name} from oracle {sender}: Verification failed{reason_str}", color='r')
+        self.P(f"Invalid {dict_name} from oracle {sender_str}: Verification failed{reason_str}", color='r')
         return False
       # endif median_signatures_ok
 
@@ -1171,7 +1237,7 @@ class _OraSyncUtilsMixin:
         for dct_node in dct_values.values()
       ) and len(dct_values) > 0
       if not values_same_as_signatures:
-        self.P(f"Invalid {dict_name} from oracle {sender}: Values in signatures do not match", color='r')
+        self.P(f"Invalid {dict_name} from oracle {sender_str}: Values in signatures do not match", color='r')
         return False
       # endif values_same_as_signatures
 
@@ -1210,15 +1276,16 @@ class _OraSyncUtilsMixin:
         return False
 
       median = oracle_data[OracleSyncCt.MEDIAN_TABLE]
+      sender_str = self.get_sender_str(sender=sender)
 
       # in the is_participating dictionary, only oracles that were seen
       # as full online are marked as True
       if not self.is_participating.get(sender, False):
-        self.P(f"Oracle {sender} should not have sent median! Ignoring...", color='r')
+        self.P(f"Oracle {sender_str} should not have sent median! Ignoring...", color='r')
         return False
 
       if median is None:
-        self.P(f"Oracle {sender} could not compute median. ignoring...", color='r')
+        self.P(f"Oracle {sender_str} could not compute median. ignoring...", color='r')
         return False
 
       # Rebuilding the original signed data dictionaries.
@@ -1271,9 +1338,10 @@ class _OraSyncUtilsMixin:
       -------
       bool : True if the compiled agreed median table is valid, False otherwise
       """
+      sender_str = self.get_sender_str(sender=sender)
       if signature_dict is None:
         if debug:
-          self.P(f"Invalid agreement signature for {epoch=} from oracle {sender}: No signature provided", color='r')
+          self.P(f"Invalid agreement signature for {epoch=} from oracle {sender_str}: No signature provided", color='r')
         return False
 
       if compiled_agreed_median_table is None:
@@ -1285,7 +1353,7 @@ class _OraSyncUtilsMixin:
         epoch = self._current_epoch - 1
 
       if debug:
-        self.P(f"DEBUG Received agreement signature for epoch {epoch} from oracle {sender}")
+        self.P(f"DEBUG Received agreement signature for epoch {epoch} from oracle {sender_str}")
 
       # Rebuild the original signed data dictionary.
       # For additional info check method
@@ -1308,7 +1376,7 @@ class _OraSyncUtilsMixin:
         if self.cfg_debug_sync_full:
           self.P(f"DEBUG FULL invalid verify dictionary: {data_to_verify}")
         if debug:
-          self.P(f"Invalid agreement signature for {epoch=} from oracle {sender}:{verify_result.message}", color='r')
+          self.P(f"Invalid agreement signature for {epoch=} from oracle {sender_str}:{verify_result.message}", color='r')
         return False
       return True
 
@@ -1341,12 +1409,13 @@ class _OraSyncUtilsMixin:
         return False
 
       signature_dict = oracle_data[OracleSyncCt.AGREEMENT_SIGNATURE]
+      sender_str = self.get_sender_str(sender=sender)
 
       # In the is_participating dictionary, only oracles that were seen
       # as full online are marked as True
       # If the signature was None it wouldn't have passed the previous check.
       if not self.is_participating.get(sender, False):
-        self.P(f"Oracle {sender} should not have sent signature for agreement. ignoring...", color='r')
+        self.P(f"Oracle {sender_str} should not have sent signature for agreement. ignoring...", color='r')
         return False
 
       if not self._check_agreement_signature(
@@ -1357,7 +1426,7 @@ class _OraSyncUtilsMixin:
 
       if sender != signature_dict.get('EE_SENDER'):
         self.P(
-          f"Agreement signature from oracle {sender} does not match the sender! Possible impersonation attack!",
+          f"Agreement signature from oracle {sender_str} does not match the sender! Possible impersonation attack!",
           color='r'
         )
         return False
@@ -1391,18 +1460,20 @@ class _OraSyncUtilsMixin:
       ):
         return False
 
+      sender_str = self.get_sender_str(sender=sender)
       # In the is_participating dictionary, only oracles that were seen
       # as full online are marked as True
       # If the signature was None it wouldn't have passed the previous check.
       if not self.is_participating.get(sender, False):
-        self.P(f"Oracle {sender} should not have sent signatures for agreement exchange. ignoring...", color='r')
+        self.P(f"Oracle {sender_str} should not have sent signatures for agreement exchange. ignoring...", color='r')
         return False
 
       agreement_signatures = oracle_data[OracleSyncCt.AGREEMENT_SIGNATURES]
 
       for sig_sender, signature_dict in agreement_signatures.items():
+        sig_sender_str = self.get_sender_str(sender=sig_sender)
         if not self.is_participating.get(sig_sender, False):
-          self.P(f"Oracle {sig_sender} should not have sent signature for agreement. ignoring...", color='r')
+          self.P(f"Oracle {sig_sender_str} should not have sent signature for agreement. ignoring...", color='r')
           # TODO: review if this should make the entire message invalid
           # One node can be seen as potentially full online by some oracles and not by others.
           # But for the node to actually participate in the agreement, it has to see itself as full online.
@@ -1414,7 +1485,7 @@ class _OraSyncUtilsMixin:
             sender=sig_sender,
             signature_dict=signature_dict
         ):
-          self.P(f"Invalid agreement signature from oracle {sig_sender}!", color='r')
+          self.P(f"Invalid agreement signature from oracle {sig_sender_str}!", color='r')
           return False
         # endif agreement signature
       # endfor agreement signatures
@@ -1513,42 +1584,44 @@ class _OraSyncUtilsMixin:
       debug: bool, optional
           Whether to print debug messages, by default True
       """
+      sender_str = self.get_sender_str(sender=sender)
       if not epoch_is_valid:
         if debug:
-          self.P(f"For epoch {epoch} from {sender} no consensus was reached. Skipping...", color='r')
+          self.P(f"For epoch {epoch} from {sender_str} no consensus was reached. Skipping...", color='r')
         return False
 
       if agreed_median_table is None:
         if debug:
-          self.P(f"Received agreed median table from oracle {sender} is None. ignoring...", color='r')
+          self.P(f"Received agreed median table from oracle {sender_str} is None. ignoring...", color='r')
         return False
 
       if epoch_signatures is None:
         if debug:
-          self.P(f"Received epoch {epoch} signatures table from oracle {sender} is None. Ignoring...", color='r')
+          self.P(f"Received epoch {epoch} signatures table from oracle {sender_str} is None. Ignoring...", color='r')
         return False
 
       if len(epoch_signatures) == 0:
         if debug:
-          self.P(f"Received empty epoch {epoch} signatures table from oracle {sender}. Ignoring...", color='r')
+          self.P(f"Received empty epoch {epoch} signatures table from oracle {sender_str}. Ignoring...", color='r')
         return False
 
       if isinstance(epoch_signatures, str):
         if debug:
-          self.P(f"Received invalid signatures table for epoch {epoch} from oracle {sender}. Ignoring...", color='r')
+          self.P(f"Received invalid signatures table for epoch {epoch} from oracle {sender_str}. Ignoring...", color='r')
         return False
 
       if self.cfg_debug_sync_full:
-        self.P(f"DEBUG Received agreed median table from oracle {sender}: {agreed_median_table}")
+        self.P(f"DEBUG Received agreed median table from oracle {sender_str}: {agreed_median_table}")
 
       for oracle_addr, oracle_signature in epoch_signatures.items():
+        oracle_addr_str = self.get_sender_str(sender=oracle_addr)
         if not self._check_agreement_signature(
             sender=sender, signature_dict=oracle_signature,
             epoch=epoch, compiled_agreed_median_table=agreed_median_table,
             debug=debug
         ):
           if debug:
-            self.P(f'Invalid signature of {oracle_addr} in signatures received from {sender}!', color='r')
+            self.P(f'Invalid signature of {oracle_addr_str} in signatures received from {sender_str}!', color='r')
           # endif debug_sync
           return False
         # endif agreement signature ok for received table

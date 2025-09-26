@@ -11,7 +11,7 @@ from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
-  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_PLUGIN_DATA,
+  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_PLUGIN_DATA,
 )
   
 
@@ -111,6 +111,7 @@ class DeeployManagerApiPlugin(
         
     """
     try:
+      self.Pd(f"Called Deeploy get_apps endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
@@ -132,59 +133,25 @@ class DeeployManagerApiPlugin(
     return response
   
   
-  @BasePlugin.endpoint(method="post")
-  # /create_pipeline
-  def create_pipeline(
-    self, 
-    request: dict = DEEPLOY_CREATE_REQUEST
+  def _process_pipeline_request(
+    self,
+    request: dict,
+    is_create: bool = True
   ):
     """
-    Create a new pipeline on a target node(s)
-        
-
+    Common logic for processing pipeline create/update requests.
+    
     Parameters
     ----------
-    
-    request: dict containing next fields:
-      app_alias : str
-        The name (alias) of the app to create
-
-      plugin_signature : str
-          The signature of the plugin to use
-
-      target_nodes : list[str]
-          The nodes to create the app on
-
-      target_nodes_count : int
-          The number of nodes to create the app on
-
-      nonce : str
-          The nonce used for signing the request
-
-      job_tags: list
-          Tags and their expected values that the target nodes must have
-        Example: ["KYB","DC:HOSTINGER", "CT:FR|IT|RO", "REG:EU"]
-
-
-      app_params : dict
-          The parameters to pass to the app such as:
-
-            app_params.IMAGE : str
-                The image to use for the app
-            app_params.REGISTRY : str
-                The registry to use for the app
-            app_params.USERNAME : str
-                The username to use for the app
-            app_params.PASSWORD : str
-
-          
-    TODO: (Vitalii)
-      - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
-    TODO: (Vitalii)
-      - Change from sync to async.
-        Sending the jobs to nodes, while UI will do pooling for the job status.
-        1. Request comes in. Response command sent.
-        2. Move while checker for chainstore keys in process.
+    request : dict
+        The request dictionary
+    is_create : bool
+        True for create operations, False for update operations
+        
+    Returns
+    -------
+    dict
+        The response dictionary
     """
     try:
       sender, inputs = self.deeploy_verify_and_get_inputs(request)   
@@ -198,7 +165,15 @@ class DeeployManagerApiPlugin(
 
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
-      app_id = (app_alias.lower()[:13] + "_" + self.uuid(7)).lower()
+      
+      # Generate or get app_id based on operation type
+      if is_create:
+        app_id = (app_alias.lower()[:13] + "_" + self.uuid(7)).lower()
+      else:
+        app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
+        if not app_id:
+          msg = f"{DEEPLOY_ERRORS.REQUEST13}: App ID is required."
+          raise ValueError(msg)
 
       # check payment
       is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
@@ -207,7 +182,15 @@ class DeeployManagerApiPlugin(
         raise ValueError(msg)
       # TODO: Add check if jobType resources match the requested resources.
 
-      nodes = self._check_nodes_availability(inputs)
+      # Get nodes based on operation type
+      discovered_plugin_instances = []
+      if is_create:
+        nodes = self._check_nodes_availability(inputs)
+      else:
+        discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=sender)
+
+        self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
+        nodes = [instance[DEEPLOY_PLUGIN_DATA.NODE] for instance in discovered_plugin_instances]
 
       dct_status, str_status = self.check_and_deploy_pipelines(
         sender=sender,
@@ -215,7 +198,9 @@ class DeeployManagerApiPlugin(
         app_id=app_id,
         app_alias=app_alias,
         app_type=app_type,
-        nodes=nodes
+        nodes=nodes,
+        discovered_plugin_instances=discovered_plugin_instances,
+        is_create=is_create
       )
       
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
@@ -268,6 +253,110 @@ class DeeployManagerApiPlugin(
     })
     return response
 
+  @BasePlugin.endpoint(method="post")
+  # /create_pipeline
+  def create_pipeline(
+    self, 
+    request: dict = DEEPLOY_CREATE_REQUEST
+  ):
+    """
+    Create a new pipeline on a target node(s)
+        
+
+    Parameters
+    ----------
+    
+    request: dict containing next fields:
+      app_alias : str
+        The name (alias) of the app to create
+
+      plugin_signature : str
+          The signature of the plugin to use
+
+      target_nodes : list[str]
+          The nodes to create the app on
+
+      target_nodes_count : int
+          The number of nodes to create the app on
+
+      nonce : str
+          The nonce used for signing the request
+
+      job_tags: list
+          Tags and their expected values that the target nodes must have
+        Example: ["KYB","DC:HOSTINGER", "CT:FR|IT|RO", "REG:EU"]
+
+
+      app_params : dict
+          The parameters to pass to the app such as:
+
+            app_params.IMAGE : str
+                The image to use for the app
+            app_params.REGISTRY : str
+                The registry to use for the app
+            app_params.USERNAME : str
+                The username to use for the app
+            app_params.PASSWORD : str
+          
+    TODO: (Vitalii)
+      - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
+    TODO: (Vitalii)
+      - Change from sync to async.
+        Sending the jobs to nodes, while UI will do pooling for the job status.
+        1. Request comes in. Response command sent.
+        2. Move while checker for chainstore keys in process.
+    """
+    self.Pd(f"Called Deeploy create_pipeline endpoint")
+    return self._process_pipeline_request(request, is_create=True)
+
+  @BasePlugin.endpoint(method="post")
+  # /update_pipeline
+  def update_pipeline(
+    self,
+    request: dict = DEEPLOY_CREATE_REQUEST
+  ):
+    """
+    Update a pipeline on node(s)
+
+    Parameters
+    ----------
+
+    request: dict containing next fields:
+      app_alias : str
+        The name (alias) of the app to create
+
+      plugin_signature : str
+          The signature of the plugin to use
+
+      target_nodes : list[str]
+          The nodes to create the app on
+
+      target_nodes_count : int
+          The number of nodes to create the app on
+
+      nonce : str
+          The nonce used for signing the request
+
+      job_tags: list
+          Tags and their expected values that the target nodes must have
+        Example: ["KYB","DC:HOSTINGER", "CT:FR|IT|RO", "REG:EU"]
+
+
+      app_params : dict
+          The parameters to pass to the app such as:
+
+            app_params.IMAGE : str
+                The image to use for the app
+            app_params.REGISTRY : str
+                The registry to use for the app
+            app_params.USERNAME : str
+                The username to use for the app
+            app_params.PASSWORD : str
+
+    """
+    self.P(f"Received an update_pipeline request with body: {self.json_dumps(request)}")
+    return self._process_pipeline_request(request, is_create=False)
+
 
   @BasePlugin.endpoint(method="post")
   def delete_pipeline(self,
@@ -292,6 +381,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
+      self.Pd(f"Called Deeploy delete_pipeline endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
@@ -364,6 +454,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
+      self.Pd(f"Called Deeploy send_instance_command endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
 
@@ -416,6 +507,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
+      self.Pd(f"Called Deeploy send_app_command endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
 
@@ -457,7 +549,65 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  def _get_online_apps(self, owner=None, target_nodes=None):
+  @BasePlugin.endpoint(method="post")
+  def get_oracle_job_details(
+    self, 
+    request: dict = DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST
+  ):
+    """
+    Get the details of a job by its job ID.
+    This endpoint is restricted to oracles only.
+    
+    Parameters
+    ----------
+    request: dict containing next fields:
+      job_id : int
+        The job ID to retrieve details for
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str (must be an oracle)
+
+    Returns
+    -------
+    dict
+        A dictionary containing the job details
+    """
+    try:
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, require_sender_is_oracle=True, no_hash=False)
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+      if not job_id:
+        msg = f"{DEEPLOY_ERRORS.REQUEST11}: Job ID is required."
+        raise ValueError(msg)
+      
+      apps = self._get_online_apps(job_id=job_id)
+      found_app = None
+      found_app_alias = None
+      for node, app in apps.items():
+        for pipeline_name, details in app.items():
+          found_app = details
+          found_app_alias = pipeline_name
+          break
+      if not found_app:
+        msg = f"{DEEPLOY_ERRORS.REQUEST12}: Job with ID {job_id} not found."
+        raise ValueError(msg)
+
+      bc_job_details = self.bc.get_job_details(job_id=job_id)
+      result = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.PROJECT_NAME: found_app.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.PROJECT_NAME, None),
+        'job_name': found_app_alias,
+        'job_type': bc_job_details.get("jobType")
+      }
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+    response = self._get_response({
+      **result
+    })
+    return response
+
+  def _get_online_apps(self, owner=None, target_nodes=None, job_id=None):
     """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
@@ -480,6 +630,14 @@ class DeeployManagerApiPlugin(
       for node, apps in result.items():
         for app_name, app_data in apps.items():
           if app_data[NetMonCt.OWNER] != owner:
+            continue
+          filtered_result[node][app_name] = app_data
+      result = filtered_result
+    if job_id is not None:
+      filtered_result = self.defaultdict(dict)
+      for node, apps in result.items():
+        for app_name, app_data in apps.items():
+          if app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
             continue
           filtered_result[node][app_name] = app_data
       result = filtered_result
