@@ -624,7 +624,15 @@ class DeeployManagerApiPlugin(
 
     """
     result = self.netmon.network_known_apps(target_nodes=target_nodes)
-    self.Pd(f"All online apps:\n{self.json_dumps(result, indent=2)}")
+    
+    # Count nodes and app instances
+    node_count = len(result)
+    total_pipelines = 0
+    
+    for node, pipelines in result.items():
+      total_pipelines += len(pipelines)
+    
+    self.Pd(f"Found {node_count} nodes with a total of {total_pipelines} pipelines")
     if owner is not None:
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
