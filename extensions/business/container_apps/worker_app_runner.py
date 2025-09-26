@@ -99,6 +99,9 @@ _CONFIG = {
     "ports": [] # dict of container_port: host_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
 
+  #### Logging
+  "MAX_LOG_LINES": 10_000,  # max lines to keep in memory
+
   # Chainstore response configuration
   "CHAINSTORE_RESPONSE_KEY": None,  # Optional key to send confirmation data to chainstore
 
@@ -114,6 +117,15 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
   @port.setter
   def port(self, value):
     self._port = value
+
+  def Pd(self, s, *args, score=-1, **kwargs):
+    """
+    Print a message to the console.
+    """
+    if self.cfg_car_verbose > score:
+      s = "[DEBUG] " + s
+      self.P(s, *args, **kwargs)
+    return
 
 
   def on_init(self):
@@ -133,14 +145,80 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
     return
 
+  def on_command(self, data, **kwargs):
+    """
+    Called when a INSTANCE_COMMAND is received by the plugin instance.
+
+    The command is sent via `cmdapi_send_instance_command` from a commanding node (Deeploy plugin)
+    as in below simplified example:
+
+    ```python
+      pipeline = "some_app_pipeline"
+      signature = "CONTAINER_APP_RUNNER"
+      instance_id = "CONTAINER_APP_1e8dac"
+      node_address = "0xai_1asdfG11sammamssdjjaggxffaffaheASSsa"
+
+      instance_command = "RESTART"
+
+      plugin.cmdapi_send_instance_command(
+        pipeline=pipeline,
+        signature=signature,
+        instance_id=instance_id,
+        instance_command=instance_command,
+        node_address=node_address,
+      )
+    ```
+
+    while the `on_command` method should look like this:
+
+    ```python
+      def on_command(self, data, **kwargs):
+        if data == "RESTART":
+          self.P("Restarting container...")
+          ...
+        elif data == "STOP":
+          self.P("Stopping container (restart policy still applies)...")
+          ...
+        else:
+          self.P(f"Unknown command: {data}")
+        return
+    ```
+
+    """
+    self.P(f"Received a command: {data}")
+    self.P(f"Command kwargs: {kwargs}")
+
+    if data == "RESTART":
+      self.P("Restarting WAR...")
+      self._is_manually_stopped = False
+      self._stop_container_and_save_logs_to_disk()
+      self._restart_from_scratch()
+      return
+
+    elif data == "STOP":
+      self.P("Stopping container (restart policy still applies)...")
+      self._stop_container_and_save_logs_to_disk()
+      self._is_manually_stopped = True
+      return
+    else:
+      self.P(f"Unknown plugin command: {data}")
+    return
+
+  def _on_config_changed(self):
+    self.Pd("Received an updated config for WorkerAppRunner")
+    self._stop_container_and_save_logs_to_disk()
+    self._restart_from_scratch()
+
+    return
 
   def __reset_vars(self):
     """Reset internal state variables."""
     self.container = None
 
-    self.done = False  # Flag to indicate when to stop the main loop
     self.current_commit = None  # Track the current commit SHA
     self.docker_client = docker.from_env()
+
+    self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
 
     # Periodic intervals
     self._last_git_check = 0
@@ -160,7 +238,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self.extra_ports_mapping = {}
     self.volumes = {}
     self.dynamic_env = {}
-    
+
+    self._is_manually_stopped = False # Flag to indicate if the container was manually stopped
+
     # Container start time tracking
     self.container_start_time = None
     self.container_id = None
@@ -346,7 +426,8 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
           log_str = str(log_bytes)
         
         self.P(f"[CONTAINER] {log_str}", color='d', end='')
-        
+        self.container_logs.append(log_str)
+
         if self._stop_event.is_set():
           self.P("Log streaming stopped by stop event", color='y')
           break
@@ -557,6 +638,35 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     # end if time elapsed
     return
 
+  def _stop_container_and_save_logs_to_disk(self):
+    """
+    Stops the container and cloudflare tunnel.
+    Then logs are saved to disk.
+    """
+    self.P(f"Stopping container app '{self.container_id}' ...")
+
+    # Stop log streaming
+    self._stop_event.set()
+    if self.log_thread:
+      self.log_thread.join(timeout=5)
+
+    # Stop tunnel engine if needed
+    self.stop_tunnel_engine()
+
+    # Stop the container if it's running
+    self.stop_container()
+
+    # Save logs to disk
+    try:
+      # using parent class method to save logs
+      self.diskapi_save_pickle_to_output(
+        obj=list(self.container_logs), filename="worker_app_runner_logs.pkl"
+      )
+      self.P("Container logs saved to disk.")
+    except Exception as exc:
+      self.P(f"Failed to save logs: {exc}", color='r')
+    return
+
 
   def stop_container(self):
     """Stop and remove the Docker container if it is running."""
@@ -633,27 +743,22 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
   def on_close(self):
     """Cleanup on plugin close."""
     self.P("Shutting down WorkerAppRunnerPlugin...", color='b')
-    self.done = True
-    self.stop_container()
-    self._stop_event.set()
-    if self.log_thread:
-      self.log_thread.join(timeout=5)
-    
-    # Stop tunnel engine if running
-    self.stop_tunnel_engine()
+    self._stop_container_and_save_logs_to_disk()
     
     super(WorkerAppRunnerPlugin, self).on_close()
 
-    self.maybe_stop_tunnel_engine()
-
-    self.P("WorkerAppRunnerPlugin has shut down", color='g')
+    self.Pd("WorkerAppRunnerPlugin has shut down", color='g')
     return
 
   def process(self):
-    self.maybe_init_tunnel_engine()
+    if self._is_manually_stopped:
+      self.Pd("Manually stopped app. Skipping launch...", color='y')
+      return
 
     if not self.container:
       self._handle_initial_launch()
+
+    self.maybe_init_tunnel_engine()
 
     self.maybe_start_tunnel_engine()
     
