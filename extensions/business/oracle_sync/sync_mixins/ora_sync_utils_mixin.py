@@ -332,9 +332,14 @@ class _OraSyncUtilsMixin:
       # endfor
       total_current_participants = sum(self.is_participating.values())
       if state is not None:
+        elapsed, total = self.get_elapsed_and_total_time_of_stage(stage=state)
+        elapsed_str = ""
+        if elapsed_str is not None and total is not None:
+          elapsed_str = f"[elapsed: {elapsed:.2f}s/{total:.2f}s]"
+        # endif elapsed and total
         log_str = f"Updating participating oracles based on {state = }.\n"
         log_str += f"{total_previous_participants} previous participants => "
-        log_str += f"{total_current_participants} current participants.\n"
+        log_str += f"{total_current_participants} current participants.{elapsed_str}\n"
         if len(disappearing_oracles) > 0:
           log_str += f"{len(disappearing_oracles)} oracles disappeared:"
           log_str += "".join([
@@ -568,7 +573,52 @@ class _OraSyncUtilsMixin:
       -------
       str : The string representation of the sender
       """
-      return f"`{self.netmon.network_node_eeid(sender)}` <{sender}>"
+      short_sender = self.shorten_address(sender)
+      return f"`{self.netmon.network_node_eeid(sender)}` <{short_sender}>"
+
+    def get_elapsed_and_total_time_of_stage(self, stage: str):
+      """
+      Get the elapsed and total time of a stage.
+      Parameters
+      ----------
+      stage : str
+          The stage to get the elapsed and total time for.
+
+      Returns
+      -------
+      (elapsed, total) : tuple
+          The elapsed and total time of the stage.
+          If the stage is not found or the stage does not have a timeout period, (None, None) is returned.
+      """
+      elapsed = None
+      total = None
+      values = {
+        self.STATES.S2_SEND_LOCAL_TABLE: {
+          'started': self.first_time_local_table_sent,
+          'total': self.get_local_table_timeout()
+        },
+        self.STATES.S4_SEND_MEDIAN_TABLE: {
+          'started': self.first_time_median_table_sent,
+          'total': self.get_median_table_timeout()
+        },
+        self.STATES.S6_SEND_AGREED_MEDIAN_TABLE: {
+          'started': self.first_time__agreement_signature_sent,
+          'total': self.get_agreement_signature_timeout()
+        },
+        self.STATES.S10_EXCHANGE_AGREEMENT_SIGNATURES: {
+          'started': self.first_time__agreement_signatures_exchanged,
+          'total': self.get_exchange_signatures_timeout()
+        }
+      }
+      stage_values = values.get(stage)
+      if stage_values is not None:
+        started = stage_values.get('started')
+        total = stage_values.get('total')
+        if started is not None:
+          elapsed = self.time() - started
+        # endif started exists
+      # endif stage_values is not None
+      return elapsed, total
 
     def log_received_message(
         self,
@@ -583,6 +633,12 @@ class _OraSyncUtilsMixin:
       progress_str = f"[{current_count}/{self.total_participating_oracles()}]"
       sender_str = self.get_sender_str(sender)
       log_str = f"{progress_str}Received message{duplicated_str} from oracle {sender_str}: {stage = }"
+
+      elapsed, total = self.get_elapsed_and_total_time_of_stage(stage)
+
+      if elapsed is not None and total is not None:
+        log_str += f" | elapsed: {elapsed:.2f}s/{total:.2f}s"
+      # endif elapsed and total
 
       if return_str:
         return log_str

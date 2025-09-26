@@ -9,6 +9,7 @@ from extensions.business.oracle_sync.sync_mixins.ora_sync_constants import (
   ORACLE_SYNC_ACCEPTED_MEDIAN_ERROR_MARGIN,
 
   LOCAL_TABLE_SEND_MULTIPLIER,
+  MEDIAN_TABLE_SEND_MULTIPLIER,
   REQUEST_AGREEMENT_TABLE_MULTIPLIER,
   SIGNATURES_EXCHANGE_MULTIPLIER,
 )
@@ -509,6 +510,9 @@ class _OraSyncStatesCallbacksMixin:
       # end for
       return
 
+    def get_local_table_timeout(self):
+      return self.cfg_send_period * LOCAL_TABLE_SEND_MULTIPLIER
+
     def _send_local_table_timeout(self):
       """
       Check if the exchange phase of the local table has finished.
@@ -517,8 +521,8 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool: True if the exchange phase of the local table has finished, False otherwise
       """
-      timeout_reached = (self.time() - self.first_time_local_table_sent) > (
-            self.cfg_send_period * LOCAL_TABLE_SEND_MULTIPLIER)
+      first_time = self.first_time_local_table_sent
+      timeout_reached = first_time is not None and (self.time() - first_time) > self.get_local_table_timeout()
       early_stopping = self._maybe_early_stop_phase(
         data=self.dct_local_tables,
         phase=self.STATES.S2_SEND_LOCAL_TABLE,
@@ -713,6 +717,9 @@ class _OraSyncStatesCallbacksMixin:
       # end for
       return
 
+    def get_median_table_timeout(self):
+      return self.cfg_send_period * MEDIAN_TABLE_SEND_MULTIPLIER
+
     def _send_median_table_timeout(self):
       """
       Check if the exchange phase of the median table has finished.
@@ -721,7 +728,8 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool: True if the exchange phase of the median table has finished, False otherwise
       """
-      timeout_reached = (self.time() - self.first_time_median_table_sent) > self.cfg_send_period
+      first_time = self.first_time_median_table_sent
+      timeout_reached = first_time is not None and (self.time() - first_time) > self.get_median_table_timeout()
       early_stopping = self._maybe_early_stop_phase(
         data=self.dct_median_tables,
         phase=self.STATES.S4_SEND_MEDIAN_TABLE,
@@ -1020,6 +1028,9 @@ class _OraSyncStatesCallbacksMixin:
       # endfor received messages
       return
 
+    def get_agreement_signature_timeout(self):
+      return self.cfg_send_period
+
     def _send_agreement_signature_timeout(self):
       """
       Check if the exchange phase of the agreed median table has finished.
@@ -1028,7 +1039,8 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool: True if the exchange phase of the agreed median table has finished, False otherwise
       """
-      timeout_reached = (self.time() - self.first_time__agreement_signature_sent) > self.cfg_send_period
+      first_time = self.first_time__agreement_signature_sent
+      timeout_reached = first_time is not None and (self.time() - first_time) > self.get_agreement_signature_timeout()
       early_stopping = self._maybe_early_stop_phase(
         data=self.compiled_agreed_median_table_signatures,
         phase=self.STATES.S6_SEND_AGREED_MEDIAN_TABLE,
@@ -1086,6 +1098,9 @@ class _OraSyncStatesCallbacksMixin:
       # endfor received messages
       return
 
+    def get_exchange_signatures_timeout(self):
+      return self.cfg_send_period * SIGNATURES_EXCHANGE_MULTIPLIER
+
     def _exchange_signatures_timeout(self):
       """
       Check if the exchange phase of the agreement signatures has finished.
@@ -1094,8 +1109,8 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool: True if the exchange phase of the agreement signatures has finished, False otherwise
       """
-      timeout_reached = (self.time() - self.first_time__agreement_signatures_exchanged) > (
-          self.cfg_send_period * SIGNATURES_EXCHANGE_MULTIPLIER)
+      first_time = self.first_time__agreement_signatures_exchanged
+      timeout_reached = first_time is not None and (self.time() - first_time) > self.get_exchange_signatures_timeout()
       early_stopping = self._maybe_early_stop_phase(
         data=self.compiled_agreed_median_table_signatures,
         phase=self.STATES.S10_EXCHANGE_AGREEMENT_SIGNATURES,
