@@ -68,8 +68,11 @@ class _WebTestsMixin:
     """
     result = ""
     try:
-      url = f"http://{target}:{port}"
-      resp_main = requests.get(url, timeout=3, verify=False)
+      scheme = "https" if port in (443, 8443) else "http"
+      base_url = f"{scheme}://{target}"
+      if port not in (80, 443):
+        base_url = f"{scheme}://{target}:{port}"
+      resp_main = requests.get(base_url, timeout=3, verify=False)
       # Check for missing security headers
       security_headers = [
         "Content-Security-Policy",
@@ -80,8 +83,8 @@ class _WebTestsMixin:
       ]
       for header in security_headers:
         if header not in resp_main.headers:
-          self.P(f"Missing security header {header} on {url}.")
-          result += f"Missing security header: {header} on {url}.\n"
+          self.P(f"Missing security header {header} on {base_url}.")
+          result += f"Missing security header: {header} on {base_url}.\n"
     except Exception as e:
       self.P(f"Web test error on port {port}: {e}")
     return result
@@ -98,8 +101,7 @@ class _WebTestsMixin:
       base_url = f"{scheme}://{target}:{port}"
           
     try:
-      url = f"http://{target}:{port}"
-      resp_main = requests.get(url, timeout=3, verify=False)
+      resp_main = requests.get(base_url, timeout=3, verify=False)
       # Check cookies for Secure/HttpOnly flags
       cookies_hdr = resp_main.headers.get("Set-Cookie", "")
       if cookies_hdr:
@@ -115,8 +117,8 @@ class _WebTestsMixin:
         result += f"Directory listing exposed at {base_url}.\n"
         self.P(f"Directory listing exposed at {base_url}.")
     except Exception as e:
-      self.P("fWeb test error on port {port}: {e}")
-    return result        
+      self.P(f"Web test error on port {port}: {e}")
+    return result
 
 
   def _web_test_xss(self, target, port):

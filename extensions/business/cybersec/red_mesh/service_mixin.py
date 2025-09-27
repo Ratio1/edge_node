@@ -32,7 +32,8 @@ class _ServiceInfoMixin:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(2)
         sock.connect((target, port))
-        sock.send(b"HEAD / HTTP/1.1\r\nHost: {}\r\n\r\n".format(target).encode('utf-8'))
+        msg = "HEAD / HTTP/1.1\r\nHost: {}\r\n\r\n".format(target).encode('utf-8')
+        sock.send(bytes(msg))
         data = sock.recv(1024).decode('utf-8', errors='ignore')
         if data:
           banner = ''.join(ch if 32 <= ord(ch) < 127 else '.' for ch in data)
@@ -50,7 +51,7 @@ class _ServiceInfoMixin:
     try:
       if port in (443,):
         url = f"https://{target}"
-        self.P("Fetching {url} for banner...")
+        self.P(f"Fetching {url} for banner...")
         resp = requests.get(url, timeout=3, verify=False)
         info = (f"HTTPS {resp.status_code} {resp.reason}; Server: {resp.headers.get('Server')}")
     except Exception as e:

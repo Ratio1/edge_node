@@ -49,8 +49,10 @@ class PentestLocalWorker(
     initiator : str, 
     local_id_prefix : str,
     worker_target_ports=COMMON_PORTS,
-    exceptions=[],
+    exceptions=None,
   ):
+    if exceptions is None:
+      exceptions = []
     self.target = target
     self.job_id = job_id
     self.initiator = initiator
@@ -62,16 +64,18 @@ class PentestLocalWorker(
     # port handling
     if exceptions:
       self.P("Given exceptions: {}".format(exceptions))
-    if set(exceptions) & set(worker_target_ports):
+    if set(exceptions or []) & set(worker_target_ports or []):
       self.P("Some target ports are in the exceptions list, adjusting...")
-      self.exceptions = exceptions 
+      self.exceptions = list(exceptions)
     else:
-      if len(exceptions) > 0:
+      if exceptions:
         self.P("Given exceptions not matching worker target ports. Skipping exceptions.")
       self.exceptions = []
     if worker_target_ports is None:
       worker_target_ports = ALL_PORTS      
     worker_target_ports = [p for p in worker_target_ports if p not in exceptions]
+    if not worker_target_ports:
+      raise ValueError("No ports available for worker after applying exceptions.")
     self.initial_ports = list(worker_target_ports)
     # end port handling
 
