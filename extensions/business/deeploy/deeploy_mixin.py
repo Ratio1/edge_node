@@ -166,8 +166,8 @@ class _DeeployMixin:
       self.P(f"Creating pipeline '{app_alias}' on {addr}{msg}")
       
       if addr is not None:
-        
-        self.cmdapi_start_pipeline_by_params(
+
+        pipeline = self.cmdapi_start_pipeline_by_params(
           name=app_id,
           app_alias=app_alias,
           pipeline_type=app_type,
@@ -178,6 +178,13 @@ class _DeeployMixin:
           is_deeployed=True,
           deeploy_specs=dct_deeploy_specs,
         )
+
+        self.Pd(f"Pipeline started: {self.json_dumps(pipeline, indent=2)}")
+        try:
+          save_result = self.save_job_pipeline_in_cstore(pipeline, job_id)
+          self.P(f"Pipeline saved in CSTORE: {save_result}")
+        except Exception as e:
+          self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
       # endif addr is valid
     # endfor each target node
     return response_keys

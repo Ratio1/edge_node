@@ -4,6 +4,7 @@ Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
 from naeural_core.main.net_mon import NetMonCt
+from .deeploy_job_mixin import _DeeployJobMixin
 
 from .deeploy_mixin import _DeeployMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
@@ -43,7 +44,8 @@ class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
   _DeeployTargetNodesMixin,
-  _NodeTagsMixin
+  _NodeTagsMixin,
+  _DeeployJobMixin,
   ):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
