@@ -469,6 +469,10 @@ class OracleSync01Plugin(
     self.dct_agreed_availability_cid = {}
     self.dct_agreement_signatures_cid = {}
 
+    # This will store the number of iterations the oracle has performed after the early stopping condition
+    # is met.
+    self.early_stopping_iterations = {}
+
     self._last_epoch_synced = self.netmon.epoch_manager.get_last_sync_epoch()
     self.first_time_request_agreed_median_table_sent = None
     self.last_time_request_agreed_median_table_sent = None

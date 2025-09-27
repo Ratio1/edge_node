@@ -698,7 +698,12 @@ class BaseLlmServing(
     return text
 
   def remove_sql_comments(self, text: str):
-    return "\n".join(re.sub(r"--.*$", "", ln) for ln in text.splitlines())
+    lines_without_comments = [
+      re.sub(r"--.*$", "", ln) for ln in text.splitlines()
+    ]
+    return "\n".join([
+      ln for ln in lines_without_comments if ln.strip()
+    ])
 
   def maybe_process_text(self, text: str, process_method: str):
     """
