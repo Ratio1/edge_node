@@ -39,12 +39,12 @@ class R1fsManagerApiPlugin(BasePlugin):
   def _log_request_response(self, endpoint_name: str, request_data: dict = None, response_data: dict = None):
     """Helper method to log requests and responses when verbose mode is enabled"""
     if hasattr(self, 'cfg_r1fs_verbose') and self.cfg_r1fs_verbose > 10:
-      self.P(f"=== {endpoint_name} ENDPOINT ===", color='y')
       if request_data:
+        self.P(f"=== {endpoint_name} ENDPOINT ===", color='y')
         self.P(f"REQUEST: {self.json.dumps(request_data, indent=2)}", color='c')
       if response_data:
         self.P(f"RESPONSE: {self.json.dumps(response_data, indent=2)}", color='g')
-      self.P(f"=== END {endpoint_name} ===", color='y')
+        self.P(f"=== END {endpoint_name} ===", color='y')
 
 
   @BasePlugin.endpoint(method="get", require_token=False)
@@ -67,7 +67,7 @@ class R1fsManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="post", streaming_type="upload", require_token=False)
-  def add_file(self, file_path: str, body_json: any):
+  def add_file(self, file_path: str, body_json: any, secret: str, nonce: int = None):
     """
     Upload a file to R1FS (Ratio1 File System) via IPFS.
     
@@ -78,6 +78,8 @@ class R1fsManagerApiPlugin(BasePlugin):
         file_path (str): Path to the uploaded file on the server
         body_json (dict): JSON body containing metadata including:
             - secret (str, optional): Encryption key for the file
+        secret (str): Encryption key for the file (passed as parameter)
+        nonce (int, optional): Nonce value for encryption
     
     Returns:
         dict: Response containing success message and the Content Identifier (CID)
@@ -85,7 +87,9 @@ class R1fsManagerApiPlugin(BasePlugin):
     # Log request
     request_data = {
       'file_path': file_path,
-      'body_json': body_json
+      'body_json': body_json,
+      'nonce': nonce,
+      'secret': "***" if secret else None,
     }
     self._log_request_response("ADD_FILE", request_data=request_data)
 
@@ -95,7 +99,7 @@ class R1fsManagerApiPlugin(BasePlugin):
     secret = body_json.get('secret', None)
     self.P(f"Extracted secret: {secret}")
 
-    cid = self.r1fs.add_file(file_path=file_path, secret=secret)
+    cid = self.r1fs.add_file(file_path=file_path, secret=secret, nonce=nonce)
 
     data = {
       "message": f"File uploaded successfully",
@@ -122,14 +126,16 @@ class R1fsManagerApiPlugin(BasePlugin):
         secret (str, optional): Decryption key if the file was encrypted
     
     Returns:
-        octet-stream: The file content as a binary stream
-        x-meta header: Metadata containing file information including:
-            - filename: Original filename
+        dict: Response containing file path and metadata including:
+            - file_path: Path to the retrieved file
+            - meta: Dictionary containing file information
+                - file: Full file path
+                - filename: Original filename
     """
     # Log request
     request_data = {
       'cid': cid,
-      'secret': "***"
+      'secret': "***" if secret else None,
     }
     self._log_request_response("GET_FILE", request_data=request_data)
 
@@ -155,7 +161,7 @@ class R1fsManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def add_file_base64(self, file_base64_str: str, filename: str = None, secret: str = None):  # first parameter must be named token
+  def add_file_base64(self, file_base64_str: str, filename: str = None, secret: str = None, nonce: int = None):  # first parameter must be named token
     """
     Upload a file to R1FS using base64-encoded data.
     
@@ -167,6 +173,7 @@ class R1fsManagerApiPlugin(BasePlugin):
         file_base64_str (str): Base64-encoded file data
         filename (str, optional): Name for the file. If not provided, a unique name is generated
         secret (str, optional): Encryption key for the file
+        nonce (int, optional): Nonce value for encryption
     
     Returns:
         dict: Response containing the Content Identifier (CID) of the uploaded file
@@ -175,7 +182,8 @@ class R1fsManagerApiPlugin(BasePlugin):
     request_data = {
       'file_base64_str': file_base64_str[:100] + "..." if len(file_base64_str) > 100 else file_base64_str,
       'filename': filename,
-      'secret': '***'
+      'nonce': nonce,
+      'secret': "***" if secret else None,
     }
     self._log_request_response("ADD_FILE_BASE64", request_data=request_data)
 
@@ -184,7 +192,7 @@ class R1fsManagerApiPlugin(BasePlugin):
       filename = self.r1fs._get_unique_or_complete_upload_name()
 
     fn = self.diskapi_save_bytes_to_output(data=file_base64_str, filename=filename, from_base64=True)
-    cid = self.r1fs.add_file(file_path=fn, secret=secret)
+    cid = self.r1fs.add_file(file_path=fn, secret=secret, nonce=nonce)
 
     data = {
       "cid" : cid
@@ -210,12 +218,14 @@ class R1fsManagerApiPlugin(BasePlugin):
         secret (str, optional): Decryption key if the file was encrypted
     
     Returns:
-        dict: Response containing base64-encoded file data and filename
+        dict: Response containing base64-encoded file data and filename:
+            - file_base64_str: Base64-encoded file content
+            - filename: Original filename
     """
     # Log request
     request_data = {
       'cid': cid,
-      'secret': secret
+      'secret': "***" if secret else None,
     }
     self._log_request_response("GET_FILE_BASE64", request_data=request_data)
 
@@ -243,7 +253,7 @@ class R1fsManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def add_yaml(self, data: dict, fn: str = None, secret: str = None):   # first parameter must be named token
+  def add_yaml(self, data: dict, fn: str = None, secret: str = None, nonce: int = None):   # first parameter must be named token
     """
     Store YAML data in R1FS.
     
@@ -255,15 +265,18 @@ class R1fsManagerApiPlugin(BasePlugin):
         data (dict): Python dictionary to be stored as YAML
         fn (str, optional): Filename for the YAML file. If not provided, a unique name is generated
         secret (str, optional): Encryption key for the YAML data
+        nonce (int, optional): Nonce value for encryption
     
     Returns:
-        dict: Response containing the Content Identifier (CID) of the stored YAML
+        dict: Response containing the Content Identifier (CID) of the stored YAML:
+            - cid: Content Identifier of the uploaded YAML file
     """
     # Log request
     request_data = {
       'data': data,
       'fn': fn,
-      'secret': secret
+      'nonce': nonce,
+      'secret': "***" if secret else None,
     }
     self._log_request_response("ADD_YAML", request_data=request_data)
 
@@ -296,8 +309,9 @@ class R1fsManagerApiPlugin(BasePlugin):
         secret (str, optional): Decryption key if the YAML was encrypted
     
     Returns:
-        dict: Response containing the parsed YAML data as a Python dictionary,
-              or error message if the file is not a valid YAML file
+        dict: Response containing the parsed YAML data as a Python dictionary:
+            - file_data: Parsed YAML content as a Python dictionary
+        str: Error message if the file is not a valid YAML file
     """
     # Log request
     request_data = {
@@ -326,6 +340,89 @@ class R1fsManagerApiPlugin(BasePlugin):
     
     # Log response
     self._log_request_response("GET_YAML", response_data=data)
+    
+    return data
+
+
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def add_json(self, data: dict, fn: str = None, secret: str = None, nonce: int = None):
+    """
+    Store JSON data in R1FS.
+    
+    This endpoint converts a Python dictionary to JSON format and stores it
+    in the decentralized file system. The data can be encrypted with an
+    optional secret key for security.
+    
+    Args:
+        data (dict): Python dictionary to be stored as JSON
+        fn (str, optional): Filename for the JSON file. If not provided, a default name is used
+        secret (str, optional): Encryption key for the JSON data
+        nonce (int, optional): Nonce value for encryption
+    
+    Returns:
+        dict: Response containing the Content Identifier (CID) of the stored JSON:
+            - cid: Content Identifier of the uploaded JSON file
+    """
+    # Log request
+
+    request_data = {
+      'data': data,
+      'fn': fn,
+      'nonce': nonce,
+      'secret': "***" if secret else None,
+    }
+    self._log_request_response("ADD_JSON", request_data=request_data)
+
+    cid = self.r1fs.add_json(data=data, fn=fn, secret=secret, nonce=nonce)
+    self.P(f"Cid='{cid}'")
+
+    data = {
+      "cid" : cid
+    }
+    
+    # Log response
+    self._log_request_response("ADD_JSON", response_data=data)
+    
+    return data
+
+
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def calculate_json_cid(self, data: dict, nonce: int, fn: str = None, secret: str = None):
+    """
+    Calculate the Content Identifier (CID) of JSON data without storing it in R1FS.
+    
+    This endpoint calculates what the CID would be if the JSON data were to be
+    stored in the decentralized file system. Useful for determining the CID
+    before actually uploading the data.
+    
+    Args:
+        data (dict): Python dictionary to calculate CID for
+        nonce (int): Nonce value for encryption (required for deterministic CID calculation)
+        fn (str, optional): Filename for the JSON file. If not provided, a default name is used
+        secret (str, optional): Encryption key for the JSON data
+    
+    Returns:
+        dict: Response containing the calculated Content Identifier (CID):
+            - cid: Content Identifier that would be generated for this JSON data
+    """
+    # Log request
+    request_data = {
+      'data': data,
+      'nonce': nonce,
+      'fn': fn,
+      'secret': "***" if secret else None,
+    }
+    self._log_request_response("CALCULATE_JSON_CID", request_data=request_data)
+
+    cid = self.r1fs.calculate_json_cid(data=data, nonce=nonce, fn=fn, secret=secret)
+    self.P(f"Calculated Cid='{cid}'")
+
+    data = {
+      "cid" : cid
+    }
+    
+    # Log response
+    self._log_request_response("CALCULATE_JSON_CID", response_data=data)
     
     return data
 
