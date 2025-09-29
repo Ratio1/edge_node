@@ -387,6 +387,47 @@ class R1fsManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="post", require_token=False)
+  def add_pickle(self, data: object, fn: str = None, secret: str = None, nonce: int = None):
+    """
+    Store pickle data in R1FS.
+    
+    This endpoint serializes a Python object to pickle format and stores it
+    in the decentralized file system. The data can be encrypted with an
+    optional secret key for security.
+    
+    Args:
+        data (object): Python object to be stored as pickle
+        fn (str, optional): Filename for the pickle file. If not provided, a unique name is generated
+        secret (str, optional): Encryption key for the pickle data
+        nonce (int, optional): Nonce value for encryption
+    
+    Returns:
+        dict: Response containing the Content Identifier (CID) of the stored pickle:
+            - cid: Content Identifier of the uploaded pickle file
+    """
+    # Log request
+    request_data = {
+      'data': data,
+      'fn': fn,
+      'nonce': nonce,
+      'secret': "***" if secret else None,
+    }
+    self._log_request_response("ADD_PICKLE", request_data=request_data)
+
+    cid = self.r1fs.add_pickle(data=data, fn=fn, secret=secret, nonce=nonce)
+    self.P(f"Cid='{cid}'")
+
+    data = {
+      "cid" : cid
+    }
+    
+    # Log response
+    self._log_request_response("ADD_PICKLE", response_data=data)
+    
+    return data
+
+
+  @BasePlugin.endpoint(method="post", require_token=False)
   def calculate_json_cid(self, data: dict, nonce: int, fn: str = None, secret: str = None):
     """
     Calculate the Content Identifier (CID) of JSON data without storing it in R1FS.
@@ -423,6 +464,47 @@ class R1fsManagerApiPlugin(BasePlugin):
     
     # Log response
     self._log_request_response("CALCULATE_JSON_CID", response_data=data)
+    
+    return data
+
+
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def calculate_pickle_cid(self, data: object, nonce: int, fn: str = None, secret: str = None):
+    """
+    Calculate the Content Identifier (CID) of pickle data without storing it in R1FS.
+    
+    This endpoint calculates what the CID would be if the pickle data were to be
+    stored in the decentralized file system. Useful for determining the CID
+    before actually uploading the data.
+    
+    Args:
+        data (object): Python object to calculate CID for
+        nonce (int): Nonce value for encryption (required for deterministic CID calculation)
+        fn (str, optional): Filename for the pickle file. If not provided, a unique name is generated
+        secret (str, optional): Encryption key for the pickle data
+    
+    Returns:
+        dict: Response containing the calculated Content Identifier (CID):
+            - cid: Content Identifier that would be generated for this pickle data
+    """
+    # Log request
+    request_data = {
+      'data': data,
+      'nonce': nonce,
+      'fn': fn,
+      'secret': "***" if secret else None,
+    }
+    self._log_request_response("CALCULATE_PICKLE_CID", request_data=request_data)
+
+    cid = self.r1fs.calculate_pickle_cid(data=data, nonce=nonce, fn=fn, secret=secret)
+    self.P(f"Calculated Cid='{cid}'")
+
+    data = {
+      "cid" : cid
+    }
+    
+    # Log response
+    self._log_request_response("CALCULATE_PICKLE_CID", response_data=data)
     
     return data
 
