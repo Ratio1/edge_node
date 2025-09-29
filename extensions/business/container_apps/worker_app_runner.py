@@ -204,7 +204,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.P(f"Unknown plugin command: {data}")
     return
 
-  def _on_config_changed(self):
+  def _on_config(self):
     self.Pd("Received an updated config for WorkerAppRunner")
     self._stop_container_and_save_logs_to_disk()
     self._restart_from_scratch()
