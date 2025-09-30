@@ -119,7 +119,7 @@ class _DeeployMixin:
     project_name = inputs.get(DEEPLOY_KEYS.PROJECT_NAME, None)
     spare_nodes = inputs.get(DEEPLOY_KEYS.SPARE_NODES, [])
     allow_replication_in_the_wild = inputs.get(DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD, False)
-    response_keys = {}
+    response_keys = self.defaultdict(list)
 
     ts = self.time()
     dct_deeploy_specs = {
@@ -150,12 +150,9 @@ class _DeeployMixin:
           
           # Configure response keys if needed
           if inputs.chainstore_response:
-            response_key = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] + '_' + self.uuid(8)
+            response_key = self._generate_chainstore_response_key(plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID])
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
-            response_keys[response_key] = {
-              'addr': addr,
-              'instance_id': plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
-            }
+            response_keys[addr].append(response_key)
           # endif
         # endfor each plugin instance
       # endfor each plugin
@@ -219,7 +216,7 @@ class _DeeployMixin:
     """
     Update existing pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
-    response_keys = {}
+    response_keys = self.defaultdict(list)
     
     # Prepare plugins for update using discovered instances
     instances_by_node, base_plugin = self.__prepare_plugins_for_update(inputs, discovered_plugin_instances)
@@ -231,7 +228,7 @@ class _DeeployMixin:
       node_plugin_instances = instances_by_node[addr]
       
       # Nodes to peer with for CHAINSTORE
-      nodes_to_peer = [n for n in all_nodes if n != addr]
+      nodes_to_peer = nodes
       
       # Configure peers and response keys for each plugin instance
       for plugin_instance in node_plugin_instances:
@@ -243,12 +240,9 @@ class _DeeployMixin:
         
         # Configure response keys if needed
         if inputs.chainstore_response:
-          response_key = instance_id + '_' + self.uuid(8)
+          response_key = self._generate_chainstore_response_key(instance_id)
           plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
-          response_keys[response_key] = {
-            'addr': addr,
-            'instance_id': instance_id
-          }
+          response_keys[addr].append(response_key)
       
       # Create plugin structure for this node
       node_plugin = {
@@ -277,11 +271,12 @@ class _DeeployMixin:
     # endfor each target node
     return response_keys
 
-  def __get_pipeline_responses(self, response_keys, timeout_seconds=300):
+  def _get_pipeline_responses(self, response_keys, timeout_seconds=300):
     """
     Wait until all the responses are received via CSTORE and compose status response.
     Args:
         response_keys (dict): Dictionary mapping response keys to node addresses
+                              {"node_addr": [key1, key2, ...], ...}
         timeout_seconds (int): Maximum time to wait for responses in seconds
     Returns:
         tuple: (dct_status, str_status) where:
@@ -323,20 +318,21 @@ class _DeeployMixin:
         self.P(f"Response keys: {self.json_dumps(response_keys, indent=2)}")
         break
         
-      for response_key in response_keys:
-        if response_key in dct_status:
-          continue
-        node_info = response_keys[response_key]
-        node_addr = node_info['addr']
-        res = self.chainstore_get(response_key)
-        if res is not None:
-          self.Pd(f"Received response for {response_key} from {node_addr}: {self.json_dumps(res)}. Node Info: {self.json_dumps(node_info)}")
-          dct_status[response_key] = {
-            'node': node_addr,
-            'details': res,
-            'instance_id': node_info['instance_id']
-          }
-      if len(dct_status) == len(response_keys):
+      for node_addr, response_keys_list in response_keys.items():
+        for response_key in response_keys_list:
+          if response_key in dct_status:
+            continue
+          res = self.chainstore_get(response_key)
+          if res is not None:
+            self.Pd(
+              f"Received response for {response_key} from {node_addr}: {self.json_dumps(res)}. Node Addr: {node_addr}")
+            dct_status[response_key] = {
+              'node': node_addr,
+              'details': res,
+              'response_key': response_key
+            }
+      total_response_keys = sum(len(keys) for keys in response_keys.values())
+      if len(dct_status) == total_response_keys:
         str_status = DEEPLOY_STATUS.SUCCESS
         done = True
       # end for each response key
@@ -499,8 +495,7 @@ class _DeeployMixin:
     """
     Prepare the a single plugin instance for the pipeline creation.
     """
-    # 20 chars unique id using self.uuid() (inherited from utils)
-    instance_id = inputs.plugin_signature.upper()[:13] + '_' + self.uuid(6)
+    instance_id = self._generate_plugin_instance_id(signature=inputs.plugin_signature)
     plugin = {
       self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
       self.ct.CONFIG_PLUGIN.K_INSTANCES : [
@@ -511,7 +506,22 @@ class _DeeployMixin:
       ]
     }
     return plugin
-  
+
+  def _generate_plugin_instance_id(self, signature: str):
+    """
+    Generate a unique plugin instance ID based on the plugin signature.
+    """
+    # 20 chars unique id using self.uuid() (inherited from utils)
+    instance_id = signature.upper()[:13] + '_' + self.uuid(6)
+    return instance_id
+
+  def _generate_chainstore_response_key(self, instance_id: str):
+    """
+    Generate a unique chainstore response key based on the plugin instance ID.
+    """
+    response_key = instance_id + '_' + self.uuid(8)
+    return response_key
+
   def deeploy_prepare_plugins(self, inputs):    
     """
     Prepare the plugins for the pipeline creation.
@@ -523,24 +533,27 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, nodes, discovered_plugin_instances=[], is_create=True):
+  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[]):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
     # Phase 1: Check if nodes are available
 
-    if len(nodes) == 0:
+    if len(update_nodes) == 0 and len(new_nodes) == 0:
       msg = f"{DEEPLOY_ERRORS.NODES2}: No valid nodes provided"
       raise ValueError(msg)
 
     # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
-    if is_create:
-      response_keys = self.__create_pipeline_on_nodes(nodes, inputs, app_id, app_alias, app_type, sender)
-    else:
-      response_keys = self.__update_pipeline_on_nodes(nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances)
+    response_keys = {}
+    if len(update_nodes) > 0:
+      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances)
+      response_keys.update(update_response_keys)
+    if len(new_nodes) > 0:
+      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender)
+      response_keys.update(new_response_keys)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
-    dct_status, str_status = self.__get_pipeline_responses(response_keys, 300)
+    dct_status, str_status = self._get_pipeline_responses(response_keys, 300)
 
     self.P(f"Pipeline responses: str_status = {str_status} | dct_status =\n {self.json_dumps(dct_status, indent=2)}")
     
@@ -689,3 +702,233 @@ class _DeeployMixin:
     self.__send_instance_command_to_targets(discovered_plugins, inputs.command)
 
     return discovered_plugins
+
+  def get_job_base_pipeline_from_apps(self, apps):
+    """
+    Get the base pipeline from the apps.
+    - pipeline only for one node has to be processed
+    1. Get one pipeline from the apps.
+    2. get deeploy_data from pipeline
+    3. get plugins
+    
+    input apps will look like this:
+    {
+    "0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g": {
+      "xxxxxxxxxxxxx_330037f": {
+        "initiator": "0xai_AzMjCS6GuOV8Q3O-XvQfkvy9J-9F20M_yCGDzLFOd4mn",
+        "owner": "0x311a63B88df90f19cd9bD7D9000B70480d842472",
+        "last_config": "2025-09-29 14:51:43.458917",
+        "is_deeployed": true,
+        "deeploy_specs": {
+          "allow_replication_in_the_wild": false,
+          "current_target_nodes": [
+            "0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g"
+          ],
+          "date_created": 1759157077.267864,
+          "date_updated": 1759157077.267864,
+          "job_id": 66,
+          "job_tags": [],
+          "nr_target_nodes": 1,
+          "project_id": null,
+          "project_name": null,
+          "spare_nodes": []
+        },
+        "plugins": {
+          "CONTAINER_APP_RUNNER": [
+            {
+              "instance": "CONTAINER_APP_77eeea",
+              "start": "2025-09-29 14:44:37.844865",
+              "last_alive": "2025-09-29 15:04:31.459053",
+              "last_error": null,
+              "instance_conf": {
+                "CHAINSTORE_PEERS": [
+                  "0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g"
+                ],
+                "CHAINSTORE_RESPONSE_KEY": "CONTAINER_APP_77eeea_c56bd384",
+                "CLOUDFLARE_TOKEN": "",
+                "CONTAINER_RESOURCES": {
+                  "cpu": 1,
+                  "memory": "128m"
+                },
+                "CR": "docker.io",
+                "IMAGE": "tvitalii/ratio1-drive",
+                "IMAGE_PULL_POLICY": "always",
+                "INSTANCE_ID": "CONTAINER_APP_77eeea",
+                "NGROK_USE_API": true,
+                "PORT": 3333,
+                "RESTART_POLICY": "always",
+                "TUNNEL_ENGINE": "cloudflare"
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+    
+    Returns:
+    dict: The base pipeline
+    app_id: The app_id of the base pipeline
+    deeploy_specs: The deeploy specs of the base pipeline
+    plugins: The plugins that run on that pipeline pipeline
+      plugins will have the next structure:
+       [
+        {
+          "INSTANCES":[
+            {
+              "CHAINSTORE_PEERS":[
+                "0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g"
+              ],
+              "CHAINSTORE_RESPONSE_KEY":"CONTAINER_APP_bc367a_09e1f1e1",
+              "CLOUDFLARE_TOKEN":"",
+              "CONTAINER_RESOURCES":{
+                "cpu":1,
+                "memory":"128m"
+              },
+              "CR":"docker.io",
+              "IMAGE":"tvitalii/ratio1-drive",
+              "IMAGE_PULL_POLICY":"always",
+              "INSTANCE_ID":"CONTAINER_APP_bc367a",
+              "NGROK_USE_API":true,
+              "PORT":3333,
+              "RESTART_POLICY":"always",
+              "TUNNEL_ENGINE":"cloudflare"
+            }
+          ],
+          "SIGNATURE":"CONTAINER_APP_RUNNER"
+        }
+      ]
+    """
+    
+    if not apps or len(apps) == 0:
+      return {}
+    
+    # 1. Get one pipeline from the apps (get the first node and first app)
+    first_node = next(iter(apps.keys()))
+    node_pipelines = apps[first_node]
+    
+    if not node_pipelines or len(node_pipelines) == 0:
+      return {}
+    
+    first_app_id = next(iter(node_pipelines.keys()))
+    base_pipeline = node_pipelines[first_app_id]
+    
+    # 2. Get deeploy_specs from pipeline
+    deeploy_specs = base_pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
+    
+    # 3. Get plugins and transform them to the expected structure
+    plugins_data = base_pipeline.get(NetMonCt.PLUGINS, {})
+    transformed_plugins = []
+    
+    for plugin_signature, plugin_instances in plugins_data.items():
+      plugin_instances_list = []
+      
+      for instance_data in plugin_instances:
+        # Get the instance configuration and filter out runtime fields
+        instance_conf = instance_data.get(NetMonCt.INSTANCE_CONF, {})
+        
+        # Remove runtime fields that shouldn't be in the output
+        filtered_instance_conf = {k: v for k, v in instance_conf.items() 
+                                 if k not in [NetMonCt.PLUGIN_INSTANCE, NetMonCt.PLUGIN_START, 
+                                             NetMonCt.PLUGIN_LAST_ALIVE, NetMonCt.PLUGIN_LAST_ERROR]}
+        
+        plugin_instances_list.append(filtered_instance_conf)
+      
+      # Create the plugin structure with SIGNATURE and INSTANCES
+      # todo: use constants
+      transformed_plugin = {
+        "SIGNATURE": plugin_signature,
+        "INSTANCES": plugin_instances_list
+      }
+      transformed_plugins.append(transformed_plugin)
+
+    # todo: use constants
+    return {
+      "base_pipeline": base_pipeline,
+      "app_id": first_app_id,
+      "deeploy_specs": deeploy_specs,
+      "plugins": transformed_plugins,
+      "pipeline_type": base_pipeline.get("TYPE", "void"),
+      "url": base_pipeline.get("URL", None)
+    }
+
+  def prepare_create_update_pipelines(self, base_pipeline, new_nodes, update_nodes, discovered_plugin_instances):
+    """
+    Prepare the create and update pipelines.
+    """
+    self.Pd("Preparing create and update pipelines...")
+    self.Pd(f"Base pipeline: {self.json_dumps(base_pipeline, indent=2)}")
+    self.Pd(f"New nodes {type(new_nodes)}: {self.json_dumps(new_nodes)}")
+    self.Pd(f"Update nodes{type(update_nodes)}: {self.json_dumps(update_nodes)}")
+
+    chainstore_peers = list(set(new_nodes + update_nodes))
+    deeploy_specs = self.deepcopy(base_pipeline[NetMonCt.DEEPLOY_SPECS])
+    deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
+    deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+
+    chainstore_response_keys = self.defaultdict(list)
+
+    # prepare create pipelines:
+    create_pipelines = {}
+    for node in new_nodes:
+      create_pipelines[node] = self.deepcopy(base_pipeline)
+      for plugin in create_pipelines[node][NetMonCt.PLUGINS]:
+        plugin_signature = plugin["SIGNATURE"]
+        plugin_instances = plugin["INSTANCES"]
+        for instance in plugin_instances:
+          instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = chainstore_peers
+          instance_id = self._generate_plugin_instance_id(signature=plugin_signature)
+          chainstore_response_key = self._generate_chainstore_response_key(
+            instance_id=instance_id)
+          instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = instance_id
+          instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_response_key
+          chainstore_response_keys[node].append(chainstore_response_key)
+
+    # prepare update pipelines:
+    update_pipelines = {}
+    for plugin_instance in discovered_plugin_instances:
+      node = plugin_instance[DEEPLOY_PLUGIN_DATA.NODE]
+      update_pipelines[node] = self.deepcopy(base_pipeline)
+      for plugin in update_pipelines[node][NetMonCt.PLUGINS]:
+        plugin_signature = plugin["SIGNATURE"]
+        plugin_instances = plugin["INSTANCES"]
+        for instance in plugin_instances:
+          instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = chainstore_peers
+          instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = plugin_instance[DEEPLOY_PLUGIN_DATA.INSTANCE_ID]
+          chainstore_response_key = instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY]
+          if not chainstore_response_key or chainstore_response_key == "":
+            chainstore_response_key = self._generate_chainstore_response_key(
+              instance_id=plugin_instance[DEEPLOY_PLUGIN_DATA.INSTANCE_ID])
+            instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_response_key
+          chainstore_response_keys[node].append(chainstore_response_key)
+
+    return create_pipelines, update_pipelines, chainstore_response_keys
+
+  def _start_create_update_pipelines(self, create_pipelines, update_pipelines, sender):
+    """
+    Start the create and update pipelines.
+    """
+    for node, pipeline in create_pipelines.items():
+      self.cmdapi_start_pipeline_by_params(
+        name=pipeline['app_id'],
+        pipeline_type=pipeline['pipeline_type'],
+        node_address=node,
+        owner=sender, 
+        url=pipeline['url'],
+        plugins=pipeline['plugins'],
+        is_deeployed=True,
+        deeploy_specs=pipeline['deeploy_specs'],
+      )    
+    for node, pipeline in update_pipelines.items():
+      # For update pipelines, we need to iterate through the plugins and instances
+      for plugin in pipeline['plugins']:
+        plugin_signature = plugin['SIGNATURE']
+        for instance in plugin['INSTANCES']:
+          self.cmdapi_update_instance_config(
+            pipeline=pipeline['app_id'],
+            signature=plugin_signature,
+            instance_id=instance['INSTANCE_ID'],
+            instance_config=instance,
+            node_address=node,
+          )
+    return

@@ -443,6 +443,22 @@ DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
 }
 
 ###################################################################################################################
+DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST = {
+  "job_id" : 1, # The job ID to extend the workers for
+  "app_id" : "app_id_returned_by_get_apps_or_create_pipeline", # interchange app_id with job_id
+  "target_nodes" : [
+    "0xai_target_node_1",
+    "0xai_target_node_2",
+  ],
+  "target_nodes_count" : 0,
+  "node_res_req" : {
+    "cpu" : 4,
+    "memory" : "16GiB"
+  },
+  "chainstore_response" : True,
+  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
+}
+###################################################################################################################
 
 
 DEEPLOY_GET_APPS_REQUEST = {
