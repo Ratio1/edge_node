@@ -232,6 +232,9 @@ class _DeeployMixin:
       
       # Configure peers and response keys for each plugin instance
       for plugin_instance in node_plugin_instances:
+        self.P("=-=-=-=-=-=-=-=-=-=-==-=")
+        self.P(f"Processing plugin instance {self.json_dumps(plugin_instance)}")
+        self.P("=-=-=-=-=-=-=-=-=-=-==-=")
         instance_id = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
         
         # Configure peers if there are any
@@ -328,8 +331,7 @@ class _DeeployMixin:
               f"Received response for {response_key} from {node_addr}: {self.json_dumps(res)}. Node Addr: {node_addr}")
             dct_status[response_key] = {
               'node': node_addr,
-              'details': res,
-              'response_key': response_key
+              'details': res
             }
       total_response_keys = sum(len(keys) for keys in response_keys.values())
       if len(dct_status) == total_response_keys:
@@ -579,6 +581,7 @@ class _DeeployMixin:
 
     discovered_plugins = []
     for node, pipelines in apps.items():
+      iter_plugins = []
       if target_nodes is not None and node not in target_nodes:
         continue
       # search by job_id
@@ -593,7 +596,7 @@ class _DeeployMixin:
               current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
               if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
                 # If we find a match by signature and instance_id, add it to the list and break.
-                discovered_plugins.append({
+                iter_plugins.append({
                   DEEPLOY_PLUGIN_DATA.APP_ID: current_pipeline_app_id,
                   DEEPLOY_PLUGIN_DATA.INSTANCE_ID: current_instance_id,
                   DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: current_plugin_signature,
@@ -603,15 +606,17 @@ class _DeeployMixin:
                 break
               if instance_id is None and (plugin_signature is None or plugin_signature == current_plugin_signature):
                 # If no specific signature or instance_id is provided, add all instances
-                discovered_plugins.append({
+                iter_plugins.append({
                   DEEPLOY_PLUGIN_DATA.APP_ID: current_pipeline_app_id,
                   DEEPLOY_PLUGIN_DATA.INSTANCE_ID: current_instance_id,
                   DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: current_plugin_signature,
                   DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: instance_dict,
                   DEEPLOY_PLUGIN_DATA.NODE: node
                 })
-        return discovered_plugins
       # search by app_id
+      if len(iter_plugins) > 0:
+        discovered_plugins.extend(iter_plugins)
+        continue
       if app_id is not None and app_id in pipelines:
         for current_plugin_signature, plugins_instances in pipelines[app_id][NetMonCt.PLUGINS].items():
           # plugins_instances is a list of dictionaries
@@ -619,7 +624,7 @@ class _DeeployMixin:
             current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
             if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
               # If we find a match by signature and instance_id, add it to the list and break.
-              discovered_plugins.append({
+              iter_plugins.append({
                 DEEPLOY_PLUGIN_DATA.APP_ID : app_id,
                 DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
                 DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
@@ -629,7 +634,7 @@ class _DeeployMixin:
               break
             if instance_id is None and (plugin_signature is None or plugin_signature == current_plugin_signature):
               # If no specific signature or instance_id is provided, add all instances
-              discovered_plugins.append({
+              iter_plugins.append({
                 DEEPLOY_PLUGIN_DATA.APP_ID : app_id,
                 DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
                 DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
@@ -639,6 +644,8 @@ class _DeeployMixin:
           # endfor each instance
         # endfor each plugin signature
       # endif app_id found
+      discovered_plugins.extend(iter_plugins)
+
     # endfor each node
     return discovered_plugins
 
@@ -852,9 +859,11 @@ class _DeeployMixin:
       "url": base_pipeline.get("URL", None)
     }
 
-  def prepare_create_update_pipelines(self, base_pipeline, new_nodes, update_nodes, discovered_plugin_instances):
+  def prepare_create_update_pipelines(self, base_pipeline, new_nodes, update_nodes, running_apps_for_job):
     """
     Prepare the create and update pipelines.
+    Running Apps for job example:
+    {"0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g":{"xxxxxxxxxxxxx_74524a2":{"deeploy_specs":{"allow_replication_in_the_wild":false,"current_target_nodes":["0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g"],"date_created":1759258054.05717,"date_updated":1759258054.05717,"job_id":66,"job_tags":[],"nr_target_nodes":1,"project_id":null,"project_name":null,"spare_nodes":[]},"initiator":"0xai_AzMjCS6GuOV8Q3O-XvQfkvy9J-9F20M_yCGDzLFOd4mn","is_deeployed":true,"last_config":"2025-09-30 21:17:50.119197","owner":"0x311a63B88df90f19cd9bD7D9000B70480d842472","plugins":{"CONTAINER_APP_RUNNER":[{"instance":"CONTAINER_APP_52d2c8","instance_conf":{"CHAINSTORE_PEERS":["0xai_A5UKxpSizb-O-4nE23vog8ioR-kQy64W3iePncYo4Jfc","0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g"],"CHAINSTORE_RESPONSE_KEY":"CONTAINER_APP_52d2c8_4280c161","CLOUDFLARE_TOKEN":"some-test-token","CONTAINER_RESOURCES":{"cpu":1,"memory":"128m"},"CR":"docker.io","ENV":{"env3":3,"env4":4,"upd":"ok1","var1":2222222},"IMAGE":"tvitalii/ratio1-drive","IMAGE_PULL_POLICY":"always","INSTANCE_ID":"CONTAINER_APP_52d2c8","NGROK_USE_API":true,"PORT":3333,"RESTART_POLICY":"always","TUNNEL_ENGINE":"cloudflare"},"last_alive":null,"last_error":null,"start":"2025-09-30 21:53:01.643950"}]}}}}
     """
     self.Pd("Preparing create and update pipelines...")
     self.Pd(f"Base pipeline: {self.json_dumps(base_pipeline, indent=2)}")
@@ -886,21 +895,48 @@ class _DeeployMixin:
 
     # prepare update pipelines:
     update_pipelines = {}
-    for plugin_instance in discovered_plugin_instances:
-      node = plugin_instance[DEEPLOY_PLUGIN_DATA.NODE]
-      update_pipelines[node] = self.deepcopy(base_pipeline)
-      for plugin in update_pipelines[node][NetMonCt.PLUGINS]:
-        plugin_signature = plugin["SIGNATURE"]
-        plugin_instances = plugin["INSTANCES"]
-        for instance in plugin_instances:
-          instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = chainstore_peers
-          instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = plugin_instance[DEEPLOY_PLUGIN_DATA.INSTANCE_ID]
-          chainstore_response_key = instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY]
-          if not chainstore_response_key or chainstore_response_key == "":
-            chainstore_response_key = self._generate_chainstore_response_key(
-              instance_id=plugin_instance[DEEPLOY_PLUGIN_DATA.INSTANCE_ID])
-            instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_response_key
-          chainstore_response_keys[node].append(chainstore_response_key)
+    for node in update_nodes:
+      if node in running_apps_for_job:
+        # Get the first app from running_apps_for_job for this node
+        node_apps = running_apps_for_job[node]
+        app_id = list(node_apps.keys())[0]  # Get the first app_id
+        app_data = node_apps[app_id]
+        plugins = app_data.get("plugins", {})
+        
+        update_pipelines[node] = self.deepcopy(base_pipeline)
+        for plugin in update_pipelines[node][NetMonCt.PLUGINS]:
+          plugin_signature = plugin["SIGNATURE"]
+          plugin_instances = plugin["INSTANCES"]
+          
+          # Get the corresponding plugin instances from running_apps_for_job
+          running_plugin_instances = plugins.get(plugin_signature, [])
+          
+          for i, instance in enumerate(plugin_instances):
+            instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = chainstore_peers
+            
+            # Use instance data from running_apps_for_job if available
+            if i < len(running_plugin_instances):
+              running_instance = running_plugin_instances[i]
+              instance_id = running_instance.get("instance", "")
+              instance_conf = running_instance.get("instance_conf", {})
+              
+              # Use existing instance_id and chainstore_response_key from running app
+              instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = instance_id
+              chainstore_response_key = instance_conf.get(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, "")
+              
+              if not chainstore_response_key or chainstore_response_key == "":
+                chainstore_response_key = self._generate_chainstore_response_key(instance_id=instance_id)
+                instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_response_key
+              else:
+                instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_response_key
+            else:
+              # Fallback: generate new instance_id if no running instance found
+              instance_id = self._generate_plugin_instance_id(signature=plugin_signature)
+              chainstore_response_key = self._generate_chainstore_response_key(instance_id=instance_id)
+              instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = instance_id
+              instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_response_key
+            
+            chainstore_response_keys[node].append(chainstore_response_key)
 
     return create_pipelines, update_pipelines, chainstore_response_keys
 
