@@ -564,6 +564,42 @@ class _DeeployMixin:
 
     return dct_status, str_status
 
+  def scale_up_job(self, new_nodes, update_nodes, job_id, sender, running_apps_for_job):
+    """
+    Scale up the job workers.
+    """
+
+    # todo: get pipeline from R1FS.
+    # Prepare updated app pipeline
+    base_pipeline = self.get_job_base_pipeline_from_apps(running_apps_for_job)
+    create_pipelines, update_pipelines, chainstore_response_keys = (
+      self.prepare_create_update_pipelines(base_pipeline,
+                                            new_nodes,
+                                            update_nodes,
+                                            running_apps_for_job))
+
+    self.P(f"Prepared create pipelines: {self.json_dumps(create_pipelines)}")
+    self.P(f"Prepared update pipelines: {self.json_dumps(update_pipelines)}")
+    self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")
+
+    # RESET chainstore_response_keys here
+    try:
+      self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
+      for node_addr, response_keys in chainstore_response_keys.items():
+        for response_key in response_keys:
+          self.chainstore_set(response_key, None)
+    except Exception as e:
+      self.P(f"Error resetting chainstore keys: {e}", color='r')
+
+    # Start pipelines on nodes.
+    self._start_create_update_pipelines(create_pipelines=create_pipelines,
+                                        update_pipelines=update_pipelines,
+                                        sender=sender)
+
+    dct_status, str_status = self._get_pipeline_responses(chainstore_response_keys, 300)
+
+    return dct_status, str_status
+
   def _discover_plugin_instances(
     self,
     app_id: str = None,
@@ -968,3 +1004,33 @@ class _DeeployMixin:
             node_address=node,
           )
     return
+
+  def _submit_bc_job_confirmation(self, str_status, dct_status, nodes, job_id, is_confirmable_job):
+    """
+    Submit the BC job confirmation.
+
+    Args:
+        str_status (str): The status of the job.
+        dct_status (dict): The status details of the job.
+        nodes (list): The nodes that are being confirmed.
+        job_id (int): The ID of the job.
+        is_confirmable_job (bool): Whether the job is confirmable.
+
+    Returns:
+        _type_: _description_
+    """
+    try:
+      if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+        if (dct_status is not None and is_confirmable_job and len(nodes) == len(dct_status)) or not is_confirmable_job:
+          eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in nodes]
+          eth_nodes = sorted(eth_nodes)
+          self.bc.submit_node_update(
+            job_id=job_id,
+            nodes=eth_nodes,
+          )
+        #endif
+      #endif
+    except Exception as e:
+      self.P(f"Error submitting BC job confirmation: {e}")
+      return False
+    return True
