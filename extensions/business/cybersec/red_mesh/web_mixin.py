@@ -2,17 +2,10 @@ import requests
 from urllib.parse import quote
 
 class _WebTestsMixin:
-  """
-  Mixin class providing web vulnerability testing capabilities.
-  """
+  """HTTP-centric probes that emulate manual red-team playbooks."""
 
   def _web_test_common(self, target, port):
-    """
-    Execute web vulnerability tests against the target.
-    
-    TODO:
-     - encode results for `_run_web_tests` caller
-    """
+    """Look for exposed common endpoints and weak access controls."""
     result = ""
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -34,12 +27,7 @@ class _WebTestsMixin:
 
   
   def _web_test_homepage(self, target, port):
-    """
-    Execute web vulnerability tests against the target.
-    
-    TODO:
-     - encode results for `_run_web_tests` caller
-    """
+    """Scan landing pages for clear-text secrets or database dumps."""
     result = ""
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -63,9 +51,7 @@ class _WebTestsMixin:
 
 
   def _web_test_security_headers(self, target, port):
-    """
-    Check for missing security headers in the response.
-    """
+    """Flag missing HTTP security headers (OWASP A05/A06)."""
     result = ""
     try:
       scheme = "https" if port in (443, 8443) else "http"
@@ -91,9 +77,7 @@ class _WebTestsMixin:
 
 
   def _web_test_flags(self, target, port):
-    """
-    Check for security flags in cookies and other headers.
-    """
+    """Check cookies for Secure/HttpOnly/SameSite and directory listing."""
     result = ""
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -112,6 +96,9 @@ class _WebTestsMixin:
           if "HttpOnly" not in cookie:
             result += f"Cookie missing HttpOnly flag: {cookie.strip()} on {base_url}.\n"
             self.P(f"Cookie missing HttpOnly flag: {cookie.strip()} on {base_url}.")
+          if "SameSite" not in cookie:
+            result += f"Cookie missing SameSite flag: {cookie.strip()} on {base_url}.\n"
+            self.P(f"Cookie missing SameSite flag: {cookie.strip()} on {base_url}.")
       # Detect directory listing
       if "Index of /" in resp_main.text:
         result += f"Directory listing exposed at {base_url}.\n"
@@ -122,9 +109,7 @@ class _WebTestsMixin:
 
 
   def _web_test_xss(self, target, port):
-    """
-    Check for Cross-Site Scripting (XSS) vulnerabilities.
-    """
+    """Probe reflected XSS by injecting a harmless script tag."""
     result = ""
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -144,9 +129,7 @@ class _WebTestsMixin:
 
 
   def _web_test_path_traversal(self, target, port):
-    """
-    Check for Path Traversal vulnerabilities.
-    """
+    """Attempt basic path traversal payload against the target."""
     result = ""
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -165,9 +148,7 @@ class _WebTestsMixin:
   
   
   def _web_test_sql_injection(self, target, port):
-    """
-    Check for SQL Injection vulnerabilities.
-    """
+    """Send boolean SQLi payload and look for database error leakage."""
     result = ""
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -185,4 +166,82 @@ class _WebTestsMixin:
         result += f"Potential SQL injection vulnerability found at {inj_url}.\n"
     except Exception as e:
       self.P(f"Web test error on port {port}: {e}", color='r')
+    return result
+
+
+  def _web_test_cors_misconfiguration(self, target, port):
+    """Detect overly permissive CORS policies (OWASP A01/A05)."""
+    result = ""
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}"
+    if port not in (80, 443):
+      base_url = f"{scheme}://{target}:{port}"
+    try:
+      malicious_origin = "https://attacker.example"
+      resp = requests.get(
+        base_url,
+        timeout=3,
+        verify=False,
+        headers={"Origin": malicious_origin}
+      )
+      acao = resp.headers.get("Access-Control-Allow-Origin", "")
+      acac = resp.headers.get("Access-Control-Allow-Credentials", "")
+      if acao in ("*", malicious_origin):
+        finding = f"CORS misconfiguration: {acao} allowed on {base_url}."
+        self.P(finding)
+        result += finding + "\n"
+        if acao == "*" and acac.lower() == "true":
+          finding = f"CORS allows credentials for wildcard origin on {base_url}."
+          self.P(finding, color='r')
+          result += finding + "\n"
+    except Exception as e:
+      self.P(f"Web test error on port {port}: {e}")
+    return result
+
+
+  def _web_test_open_redirect(self, target, port):
+    """Check common redirect parameters for open redirect abuse."""
+    result = ""
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}"
+    if port not in (80, 443):
+      base_url = f"{scheme}://{target}:{port}"
+    try:
+      payload = "https://attacker.example"
+      redirect_url = base_url.rstrip("/") + f"/login?next={quote(payload, safe=':/')}"
+      resp = requests.get(
+        redirect_url,
+        timeout=3,
+        verify=False,
+        allow_redirects=False
+      )
+      if 300 <= resp.status_code < 400:
+        location = resp.headers.get("Location", "")
+        if payload in location:
+          finding = f"Open redirect via next parameter at {redirect_url}."
+          self.P(finding)
+          result += finding + "\n"
+    except Exception as e:
+      self.P(f"Web test error on port {port}: {e}")
+    return result
+
+
+  def _web_test_http_methods(self, target, port):
+    """Surface risky HTTP verbs enabled on the root resource."""
+    result = ""
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}"
+    if port not in (80, 443):
+      base_url = f"{scheme}://{target}:{port}"
+    try:
+      resp = requests.options(base_url, timeout=3, verify=False)
+      allow = resp.headers.get("Allow", "")
+      if allow:
+        risky = [method for method in ("PUT", "DELETE", "TRACE", "CONNECT") if method in allow.upper()]
+        if risky:
+          finding = f"Risky HTTP methods {', '.join(risky)} enabled on {base_url}."
+          self.P(finding)
+          result += finding + "\n"
+    except Exception as e:
+      self.P(f"Web test error on port {port}: {e}")
     return result

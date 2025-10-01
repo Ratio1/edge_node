@@ -1,7 +1,11 @@
+import sys
 import unittest
 from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.redmesh_utils import PentestLocalWorker
+
+
+MANUAL_RUN = __name__ == "__main__"
 
 
 class DummyOwner:
@@ -10,9 +14,19 @@ class DummyOwner:
 
   def P(self, message, **kwargs):
     self.messages.append(message)
+    if MANUAL_RUN:
+      print(f"[DummyOwner] {message}")
 
 
 class RedMeshOWASPTests(unittest.TestCase):
+  def setUp(self):
+    if MANUAL_RUN:
+      print(f"\n\n[MANUAL] >>> Starting {self._testMethodName}")
+
+  def tearDown(self):
+    if MANUAL_RUN:
+      print(f"[MANUAL] <<< Finished {self._testMethodName}")
+
   def _build_worker(self, ports=None, exceptions=None):
     if ports is None:
       ports = [80]
@@ -65,6 +79,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       result = worker._web_test_flags("example.com", 443)
     self.assertIn("Secure flag", result)
     self.assertIn("HttpOnly", result)
+    self.assertIn("SameSite", result)
 
   def test_injection_sql_detected(self):
     owner, worker = self._build_worker()
@@ -260,6 +275,126 @@ class RedMeshOWASPTests(unittest.TestCase):
     self.assertNotIn(81, worker.state["open_ports"])
     self.assertIn("scan_ports_step_completed", worker.state["completed_tests"])
 
+  def test_service_telnet_banner(self):
+    owner, worker = self._build_worker(ports=[23])
+
+    class DummySocket:
+      def __init__(self, *args, **kwargs):
+        self.closed = False
+
+      def settimeout(self, timeout):
+        return None
+
+      def connect(self, addr):
+        return None
+
+      def recv(self, nbytes):
+        return b"Welcome to telnet"
+
+      def close(self):
+        self.closed = True
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      info = worker._service_info_23("example.com", 23)
+    self.assertIn("Telnet banner", info)
+
+  def test_service_smb_probe(self):
+    owner, worker = self._build_worker(ports=[445])
+
+    class DummySocket:
+      def __init__(self, *args, **kwargs):
+        self.sent = b""
+
+      def settimeout(self, timeout):
+        return None
+
+      def connect(self, addr):
+        return None
+
+      def sendall(self, data):
+        self.sent = data
+
+      def recv(self, nbytes):
+        return b"\x00\x00\x00\x00"
+
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      info = worker._service_info_445("example.com", 445)
+    self.assertIn("SMB service responded", info)
+
+  def test_service_vnc_banner(self):
+    owner, worker = self._build_worker(ports=[5900])
+
+    class DummySocket:
+      def __init__(self, *args, **kwargs):
+        pass
+
+      def settimeout(self, timeout):
+        return None
+
+      def connect(self, addr):
+        return None
+
+      def recv(self, nbytes):
+        return b"RFB 003.008\n"
+
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      info = worker._service_info_5900("example.com", 5900)
+    self.assertIn("VNC protocol banner", info)
+
+  def test_cors_misconfiguration_detection(self):
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.headers = {
+      "Access-Control-Allow-Origin": "https://attacker.example",
+      "Access-Control-Allow-Credentials": "false",
+    }
+    resp.status_code = 200
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_cors_misconfiguration("example.com", 80)
+    self.assertIn("CORS misconfiguration", result)
+
+  def test_open_redirect_detection(self):
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 302
+    resp.headers = {"Location": "https://attacker.example"}
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_open_redirect("example.com", 80)
+    self.assertIn("Open redirect", result)
+
+  def test_http_methods_detection(self):
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.headers = {"Allow": "GET, POST, PUT"}
+    resp.status_code = 200
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_mixin.requests.options",
+      return_value=resp,
+    ):
+      result = worker._web_test_http_methods("example.com", 80)
+    self.assertIn("Risky HTTP methods", result)
+
 
 if __name__ == "__main__":
-  unittest.main()
+  unittest.main(verbosity=2)
