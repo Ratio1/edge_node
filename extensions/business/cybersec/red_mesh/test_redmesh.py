@@ -21,7 +21,7 @@ class DummyOwner:
 class RedMeshOWASPTests(unittest.TestCase):
   def setUp(self):
     if MANUAL_RUN:
-      print(f"\n\n[MANUAL] >>> Starting {self._testMethodName}")
+      print(f"\n[MANUAL] >>> Starting {self._testMethodName}")
 
   def tearDown(self):
     if MANUAL_RUN:
@@ -396,5 +396,11 @@ class RedMeshOWASPTests(unittest.TestCase):
     self.assertIn("Risky HTTP methods", result)
 
 
+class VerboseResult(unittest.TextTestResult):
+  def addSuccess(self, test):
+    super().addSuccess(test)
+    self.stream.writeln()  # emits an extra “\n” after the usual “ok”
+
 if __name__ == "__main__":
-  unittest.main(verbosity=2)
+  runner = unittest.TextTestRunner(verbosity=2, resultclass=VerboseResult)
+  runner.run(unittest.defaultTestLoader.loadTestsFromTestCase(RedMeshOWASPTests))
