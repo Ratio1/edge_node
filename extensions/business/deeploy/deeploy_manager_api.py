@@ -417,13 +417,10 @@ class DeeployManagerApiPlugin(
       
       running_apps_for_job = self._get_online_apps(job_id=job_id, owner=sender)
 
-      discovered_plugin_instances = self._discover_plugin_instances(job_id=job_id, owner=sender)
-
       # todo: check the count of running workers and compare with the amount of allowed workers count from blockchain.
       
       self.P(f"Discovered running apps for job: {self.json_dumps(running_apps_for_job)}")
-      self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
-      
+
       if not running_apps_for_job or not len(running_apps_for_job):
         msg = f"{DEEPLOY_ERRORS.NODES3}: No running workers found for provided job_id and owner '{sender}'."
         raise ValueError(msg)
@@ -438,7 +435,11 @@ class DeeployManagerApiPlugin(
         self.prepare_create_update_pipelines(base_pipeline,
                                              new_nodes,
                                              update_nodes,
-                                             discovered_plugin_instances))
+                                             running_apps_for_job))
+
+      self.P(f"Prepared create pipelines: {self.json_dumps(create_pipelines)}")
+      self.P(f"Prepared update pipelines: {self.json_dumps(update_pipelines)}")
+      self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")
 
       # RESET chainstore_response_keys here
       try:
@@ -471,7 +472,7 @@ class DeeployManagerApiPlugin(
       if return_request:
         dct_request = self.deepcopy(request)
       else:
-        dct_request = inputs
+        dct_request = None
 
       result = {
         DEEPLOY_KEYS.STATUS: str_status,
@@ -484,14 +485,6 @@ class DeeployManagerApiPlugin(
       if self.cfg_deeploy_verbose > 1:
         self.P(f"Request Result: {result}")
 
-      # Safely add app_params if they exist and are not empty
-      if hasattr(inputs, DEEPLOY_KEYS.APP_PARAMS):
-        app_params = getattr(inputs, DEEPLOY_KEYS.APP_PARAMS, {})
-        if isinstance(app_params, dict) and app_params:
-          if DEEPLOY_KEYS.APP_PARAMS_IMAGE in app_params:
-            result[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.APP_PARAMS_IMAGE] = app_params[DEEPLOY_KEYS.APP_PARAMS_IMAGE]
-          if DEEPLOY_KEYS.APP_PARAMS_CR in app_params:
-            result[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.APP_PARAMS_CR] = app_params[DEEPLOY_KEYS.APP_PARAMS_CR]
     except Exception as e:
       result = self.__handle_error(e, request)
     #endtry
