@@ -298,68 +298,6 @@ class _DeeployMixin:
     
     return instances_by_node, base_plugin
 
-  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances=[]):
-    """
-    Update existing pipelines on each node and set CSTORE `response_key` for the "callback" action
-    """
-    response_keys = self.defaultdict(list)
-    
-    # Prepare plugins for update using discovered instances
-    instances_by_node, base_plugin = self.__prepare_plugins_for_update(inputs, discovered_plugin_instances)
-    
-    # Get all unique nodes from discovered instances
-    all_nodes = list(instances_by_node.keys())
-    
-    for addr in all_nodes:
-      node_plugin_instances = instances_by_node[addr]
-      
-      # Nodes to peer with for CHAINSTORE
-      nodes_to_peer = nodes
-      
-      # Configure peers and response keys for each plugin instance
-      for plugin_instance in node_plugin_instances:
-        self.P("=-=-=-=-=-=-=-=-=-=-==-=")
-        self.P(f"Processing plugin instance {self.json_dumps(plugin_instance)}")
-        self.P("=-=-=-=-=-=-=-=-=-=-==-=")
-        instance_id = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
-        
-        # Configure peers if there are any
-        if len(nodes_to_peer) > 0:
-          plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
-        
-        # Configure response keys if needed
-        if inputs.chainstore_response:
-          response_key = self._generate_chainstore_response_key(instance_id)
-          plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
-          response_keys[addr].append(response_key)
-      
-      # Create plugin structure for this node
-      node_plugin = {
-        self.ct.CONFIG_PLUGIN.K_SIGNATURE: base_plugin[self.ct.CONFIG_PLUGIN.K_SIGNATURE],
-        self.ct.CONFIG_PLUGIN.K_INSTANCES: node_plugin_instances
-      }
-      
-      msg = ''
-      if self.cfg_deeploy_verbose > 1:
-        msg = f":\n {self.json_dumps([node_plugin], indent=2)}"
-      self.P(f"Updating pipeline '{app_alias}' on {addr}{msg}")
-      
-      if addr is not None:
-        # Update each plugin instance on this node
-        for plugin_instance in node_plugin_instances:
-          instance_id = plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
-          plugin_signature = node_plugin[self.ct.CONFIG_PLUGIN.K_SIGNATURE]
-          self.cmdapi_update_instance_config(
-            pipeline=app_id,
-            signature=plugin_signature,
-            instance_id=instance_id,
-            instance_config=plugin_instance,
-            node_address=addr,
-          )
-      # endif addr is valid
-    # endfor each target node
-    return response_keys
-
   def _get_pipeline_responses(self, response_keys, timeout_seconds=300):
     """
     Wait until all the responses are received via CSTORE and compose status response.
@@ -595,6 +533,21 @@ class _DeeployMixin:
     }
     return plugin
 
+  def deeploy_prepare_single_plugin_instance_update(self, inputs, instance_id):
+    """
+    Prepare the a single plugin instance for the pipeline creation.
+    """
+    plugin = {
+      self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
+      self.ct.CONFIG_PLUGIN.K_INSTANCES : [
+        {
+          self.ct.CONFIG_INSTANCE.K_INSTANCE_ID : instance_id,
+          **inputs.app_params
+        }
+      ]
+    }
+    return plugin
+
   def _generate_plugin_instance_id(self, signature: str):
     """
     Generate a unique plugin instance ID based on the plugin signature.
@@ -621,7 +574,7 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[]):
+  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
@@ -634,7 +587,7 @@ class _DeeployMixin:
     # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
     response_keys = {}
     if len(update_nodes) > 0:
-      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances)
+      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs)
       response_keys.update(update_response_keys)
     if len(new_nodes) > 0:
       new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender)
@@ -716,6 +669,7 @@ class _DeeployMixin:
           for current_plugin_signature, plugins_instances in pipeline[NetMonCt.PLUGINS].items():
             for instance_dict in plugins_instances:
               current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
+              chainstore_key = instance_dict['instance_conf'].get(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, None)
               if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
                 # If we find a match by signature and instance_id, add it to the list and break.
                 iter_plugins.append({
@@ -723,7 +677,8 @@ class _DeeployMixin:
                   DEEPLOY_PLUGIN_DATA.INSTANCE_ID: current_instance_id,
                   DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: current_plugin_signature,
                   DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: instance_dict,
-                  DEEPLOY_PLUGIN_DATA.NODE: node
+                  DEEPLOY_PLUGIN_DATA.NODE: node,
+                  DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: chainstore_key,
                 })
                 break
               if instance_id is None and (plugin_signature is None or plugin_signature == current_plugin_signature):
@@ -733,7 +688,8 @@ class _DeeployMixin:
                   DEEPLOY_PLUGIN_DATA.INSTANCE_ID: current_instance_id,
                   DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: current_plugin_signature,
                   DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: instance_dict,
-                  DEEPLOY_PLUGIN_DATA.NODE: node
+                  DEEPLOY_PLUGIN_DATA.NODE: node,
+                  DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: chainstore_key,
                 })
       # search by app_id
       if len(iter_plugins) > 0:
@@ -744,6 +700,7 @@ class _DeeployMixin:
           # plugins_instances is a list of dictionaries
           for instance_dict in plugins_instances:
             current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
+            chainstore_key = instance_dict['instance_conf'].get(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, None)
             if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
               # If we find a match by signature and instance_id, add it to the list and break.
               iter_plugins.append({
@@ -751,7 +708,8 @@ class _DeeployMixin:
                 DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
                 DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
                 DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE : instance_dict,
-                DEEPLOY_PLUGIN_DATA.NODE: node
+                DEEPLOY_PLUGIN_DATA.NODE: node,
+                DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: chainstore_key,
               })
               break
             if instance_id is None and (plugin_signature is None or plugin_signature == current_plugin_signature):
@@ -761,7 +719,8 @@ class _DeeployMixin:
                 DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
                 DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
                 DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE : instance_dict,
-                DEEPLOY_PLUGIN_DATA.NODE: node
+                DEEPLOY_PLUGIN_DATA.NODE: node,
+                DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: chainstore_key,
               })
           # endfor each instance
         # endfor each plugin signature

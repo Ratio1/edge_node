@@ -66,8 +66,6 @@ class _DeeployJobMixin:
       "TYPE":"void"
     }
     """
-    self.P("Extracting invariable data from pipeline (excluding TIME)...")
-    self.P(f"Config: {self.json_dumps(pipeline, indent=2)}")
 
     # Create a copy of the pipeline and remove the TIME field
     extracted_data = pipeline.copy()
@@ -75,8 +73,6 @@ class _DeeployJobMixin:
     extracted_data.pop("SESSION_ID", None)
     extracted_data.pop("LAST_UPDATE_TIME", None)
     extracted_data.pop("plugins", None)
-
-    self.P(f"Extracted data without TIME: {self.json_dumps(extracted_data, indent=2)}")
 
     return extracted_data
 
@@ -141,15 +137,11 @@ class _DeeployJobMixin:
     Save the pipeline to R1FS.
     """
 
-    self.P(f"JSONified pipeline: {pipeline}")
     try:
-      self.P(f"Using nonce: {NONCE}")  # Add this line before the add_json call
       cid = self.r1fs.add_json(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
       self.P(f"Pipeline saved to R1FS with CID: {cid}")
       calc_cid = self.r1fs.calculate_json_cid(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
       self.P(f"Calculated CID: {calc_cid}")
-      calc_cid2 = self.r1fs.calculate_json_cid(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
-      self.P(f"Calculated CID2: {calc_cid2}")
     except Exception as e:
       self.P(f"Error saving pipeline to R1FS: {e}")
       return None
