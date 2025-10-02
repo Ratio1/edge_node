@@ -89,15 +89,13 @@ class _DeeployJobMixin:
     result = False
     try: 
       self.P("Saving pipeline to CSTORE...")
-      self.P(f"Pipeline: {self.json_dumps(pipeline, indent=2)}")
 
       sanitized_pipeline = self.extract_invariable_data_from_pipeline(pipeline)
       sorted_pipeline = self._recursively_sort_pipeline_data(sanitized_pipeline)
       cid = self._save_pipeline_to_r1fs(sorted_pipeline)
 
       self.P(f"Pipeline {job_id} saved to R1FS with CID: {cid}")
-      self.P(f"Pipeline: {self.json_dumps(sorted_pipeline)}")
-      
+
       pipeline_key = str(job_id)
 
       result = self.chainstore_hset(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=pipeline_key, value=cid)
@@ -141,12 +139,13 @@ class _DeeployJobMixin:
     """
 
     try:
+      self.Pd(f"Saving pipeline to R1FS: {self.json_dumps(pipeline)}")
       cid = self.r1fs.add_json(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
-      self.P(f"Pipeline saved to R1FS with CID: {cid}")
+      self.Pd(f"Pipeline saved to R1FS with CID: {cid}")
       calc_cid = self.r1fs.calculate_json_cid(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
-      self.P(f"Calculated CID: {calc_cid}")
+      self.Pd(f"Calculated CID: {calc_cid}")
     except Exception as e:
-      self.P(f"Error saving pipeline to R1FS: {e}")
+      self.Pd(f"Error saving pipeline to R1FS: {e}")
       return None
     
     return cid

@@ -176,7 +176,7 @@ class _DeeployMixin:
           deeploy_specs=dct_deeploy_specs,
         )
 
-        self.Pd(f"Pipeline started: {self.json_dumps(pipeline, indent=2)}")
+        self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
         try:
           save_result = self.save_job_pipeline_in_cstore(pipeline, job_id)
           self.P(f"Pipeline saved in CSTORE: {save_result}")
@@ -947,7 +947,7 @@ class _DeeployMixin:
     {"0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g":{"xxxxxxxxxxxxx_74524a2":{"deeploy_specs":{"allow_replication_in_the_wild":false,"current_target_nodes":["0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g"],"date_created":1759258054.05717,"date_updated":1759258054.05717,"job_id":66,"job_tags":[],"nr_target_nodes":1,"project_id":null,"project_name":null,"spare_nodes":[]},"initiator":"0xai_AzMjCS6GuOV8Q3O-XvQfkvy9J-9F20M_yCGDzLFOd4mn","is_deeployed":true,"last_config":"2025-09-30 21:17:50.119197","owner":"0x311a63B88df90f19cd9bD7D9000B70480d842472","plugins":{"CONTAINER_APP_RUNNER":[{"instance":"CONTAINER_APP_52d2c8","instance_conf":{"CHAINSTORE_PEERS":["0xai_A5UKxpSizb-O-4nE23vog8ioR-kQy64W3iePncYo4Jfc","0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g"],"CHAINSTORE_RESPONSE_KEY":"CONTAINER_APP_52d2c8_4280c161","CLOUDFLARE_TOKEN":"some-test-token","CONTAINER_RESOURCES":{"cpu":1,"memory":"128m"},"CR":"docker.io","ENV":{"env3":3,"env4":4,"upd":"ok1","var1":2222222},"IMAGE":"tvitalii/ratio1-drive","IMAGE_PULL_POLICY":"always","INSTANCE_ID":"CONTAINER_APP_52d2c8","NGROK_USE_API":true,"PORT":3333,"RESTART_POLICY":"always","TUNNEL_ENGINE":"cloudflare"},"last_alive":null,"last_error":null,"start":"2025-09-30 21:53:01.643950"}]}}}}
     """
     self.Pd("Preparing create and update pipelines...")
-    self.Pd(f"Base pipeline: {self.json_dumps(base_pipeline, indent=2)}")
+    self.Pd(f"Base pipeline: {self.json_dumps(base_pipeline)}")
     self.Pd(f"New nodes {type(new_nodes)}: {self.json_dumps(new_nodes)}")
     self.Pd(f"Update nodes{type(update_nodes)}: {self.json_dumps(update_nodes)}")
 
