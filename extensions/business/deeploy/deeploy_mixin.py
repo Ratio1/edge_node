@@ -1079,3 +1079,25 @@ class _DeeployMixin:
       self.P(f"Error submitting BC job confirmation: {e}")
       return False
     return True
+
+  def check_running_pipelines_and_add_to_r1fs(self):
+    self.P(f"Checking running pipelines and adding them to R1FS...")
+    running_pipelines = self.netmon.network_known_pipelines()
+    listed_job_ids = self.list_all_deployed_jobs_from_cstore()
+    netmon_job_ids = {}
+    for node, pipelines in running_pipelines.items():
+      for pipeline in pipelines:
+        deeploy_specs = pipeline.get(ct.CONFIG_STREAM.DEEPLOY_SPECS, None)
+        if deeploy_specs:
+          job_id = deeploy_specs.get(DEEPLOY_KEYS.JOB_ID, None)
+          if job_id in netmon_job_ids or not job_id:
+            continue
+          netmon_job_ids[job_id] = pipeline
+    for netmon_job_id, pipeline in netmon_job_ids.items():
+      listed_job_cid = listed_job_ids.get(str(netmon_job_id), None)
+      if listed_job_cid and len(listed_job_cid)  == 46:
+        continue
+      self.save_job_pipeline_in_cstore(pipeline, netmon_job_id)
+    
+    return netmon_job_ids
+  

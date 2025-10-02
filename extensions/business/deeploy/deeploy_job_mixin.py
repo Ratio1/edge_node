@@ -95,21 +95,24 @@ class _DeeployJobMixin:
       sorted_pipeline = self._recursively_sort_pipeline_data(sanitized_pipeline)
       cid = self._save_pipeline_to_r1fs(sorted_pipeline)
 
-      if cid is None:
-        self.P("Failed to save pipeline to R1FS.")
-      self.P(f"Pipeline saved to R1FS with CID: {cid}")
-      self.P(f"Saving pipeline to CSTORE with job ID: {job_id}")
+      self.P(f"Pipeline {job_id} saved to R1FS with CID: {cid}")
       self.P(f"Pipeline: {self.json_dumps(sorted_pipeline)}")
       
       pipeline_key = str(job_id)
 
       result = self.chainstore_hset(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=pipeline_key, value=cid)
     except Exception as e:
-      self.P(f"Error saving pipeline to CSTORE: {e}", color='r')
+      self.P(f"Error saving pipeline for job {job_id} to CSTORE: {e}", color='r')
       return False
 
     return result
-  
+
+  def list_all_deployed_jobs_from_cstore(self):
+    """
+    Get all the job pipelines from CSTORE.
+    """
+    return self.chainstore_hgetall(hkey=DEEPLOY_JOBS_CSTORE_HKEY)
+
   def get_job_pipeline_from_cstore(self, job_id: int):
     """
     Get the pipeline from CSTORE and download it from R1FS.

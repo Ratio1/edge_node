@@ -33,7 +33,9 @@ _CONFIG = {
   'DEEPLOY_VERBOSE' : 10,
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
-  
+  'WARMUP_DELAY' : 300,
+  'PIPELINES_CHECK_DELAY' : 300,
+
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -67,7 +69,9 @@ class DeeployManagerApiPlugin(
     self.P("Started {} plugin on {} / {}".format(
         self.__class__.__name__, my_address, my_eth_address,
       )
-    )        
+    )
+    self.__warmup_start_time = self.time()
+    self.__last_pipelines_check_time = 0
     return
   
   def __handle_error(self, exc, request, extra_error_code=DEEPLOY_ERRORS.GENERIC):
@@ -720,6 +724,22 @@ class DeeployManagerApiPlugin(
     })
     return response
 
+  def is_deeploy_warmed_up(self):
+    return (self.time() - self.__warmup_start_time) > self.cfg_warmup_delay
+
+  def process(self):
+    if not self.is_deeploy_warmed_up():
+      return
+
+    if (self.time() - self.__last_pipelines_check_time) > self.cfg_pipelines_check_delay:
+      try:
+        self.check_running_pipelines_and_add_to_r1fs()
+      except Exception as e:
+        self.P(f"Error checking running pipelines: {e}", color='r')
+      self.__last_pipelines_check_time = self.time()
+
+    return
+
   def _get_online_apps(self, owner=None, target_nodes=None, job_id=None):
     """
     if self.cfg_deeploy_verbose:
@@ -758,7 +778,7 @@ class DeeployManagerApiPlugin(
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
         for app_name, app_data in apps.items():
-          if app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
+          if app_data.get(ct.CONFIG_STREAM.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
             continue
           filtered_result[node][app_name] = app_data
       result = filtered_result
