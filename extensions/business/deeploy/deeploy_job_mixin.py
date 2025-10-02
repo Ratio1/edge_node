@@ -1,6 +1,6 @@
 NONCE = 42
 R1FS_FILENAME = 'data.json'
-DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLY_DEPLOYED_JOBS"
+DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
 
 class _DeeployJobMixin:
   """
@@ -72,6 +72,9 @@ class _DeeployJobMixin:
     # Create a copy of the pipeline and remove the TIME field
     extracted_data = pipeline.copy()
     extracted_data.pop("TIME", None)
+    extracted_data.pop("SESSION_ID", None)
+    extracted_data.pop("LAST_UPDATE_TIME", None)
+    extracted_data.pop("plugins", None)
 
     self.P(f"Extracted data without TIME: {self.json_dumps(extracted_data, indent=2)}")
 
@@ -93,8 +96,8 @@ class _DeeployJobMixin:
       self.P(f"Pipeline: {self.json_dumps(pipeline, indent=2)}")
 
       sanitized_pipeline = self.extract_invariable_data_from_pipeline(pipeline)
-      sorted_pipeline = self.recursively_sort_pipeline_data(sanitized_pipeline)
-      cid = self.save_pipeline_to_r1fs(sorted_pipeline)
+      sorted_pipeline = self._recursively_sort_pipeline_data(sanitized_pipeline)
+      cid = self._save_pipeline_to_r1fs(sorted_pipeline)
 
       if cid is None:
         self.P("Failed to save pipeline to R1FS.")
@@ -110,8 +113,30 @@ class _DeeployJobMixin:
       return False
 
     return result
+  
+  def get_job_pipeline_from_cstore(self, job_id: int):
+    """
+    Get the pipeline from CSTORE and download it from R1FS.
+    """
+    cid = self._get_pipeline_from_cstore(job_id)
+    if not cid:
+      return None
+    
+    return self.get_pipeline_from_r1fs(cid)
+    
+  def _get_pipeline_from_cstore(self, job_id: int):
+    """
+    Get the pipeline from CSTORE.
+    """
+    return self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=str(job_id))
+  
+  def get_pipeline_from_r1fs(self, cid: str):
+    """
+    Get the pipeline from R1FS.
+    """
+    return self.r1fs.get_json(cid, show_logs=True)
 
-  def save_pipeline_to_r1fs(self, pipeline: dict):
+  def _save_pipeline_to_r1fs(self, pipeline: dict):
     """
     Save the pipeline to R1FS.
     """
@@ -131,7 +156,7 @@ class _DeeployJobMixin:
     
     return cid
 
-  def recursively_sort_pipeline_data(self, data):
+  def _recursively_sort_pipeline_data(self, data):
     """
     Recursively sort pipeline data including items within arrays.
     
@@ -145,13 +170,13 @@ class _DeeployJobMixin:
       # Sort dictionary by keys and recursively sort values
       sorted_dict = {}
       for key in sorted(data.keys()):
-        sorted_dict[key] = self.recursively_sort_pipeline_data(data[key])
+        sorted_dict[key] = self._recursively_sort_pipeline_data(data[key])
       return sorted_dict
     elif isinstance(data, list):
       # Sort list items recursively
       sorted_list = []
       for item in data:
-        sorted_list.append(self.recursively_sort_pipeline_data(item))
+        sorted_list.append(self._recursively_sort_pipeline_data(item))
       # Sort the list items themselves if they are comparable
       try:
         sorted_list.sort()

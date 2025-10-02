@@ -67,7 +67,7 @@ class R1fsManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="post", streaming_type="upload", require_token=False)
-  def add_file(self, file_path: str, body_json: any, secret: str, nonce: int = None):
+  def add_file(self, file_path: str, body_json: any = None, secret: str = None, nonce: int = None):
     """
     Upload a file to R1FS (Ratio1 File System) via IPFS.
     
@@ -142,6 +142,15 @@ class R1fsManagerApiPlugin(BasePlugin):
     self.P(f"Retrieving file with CID='{cid}', secret='{secret}'...")
 
     fn = self.r1fs.get_file(cid=cid, secret=secret)
+
+    if fn is None:
+      error_msg = f"Failed to retrieve file with CID '{cid}'. The file may not exist or the IPFS download failed."
+      self.P(error_msg, color='r')
+      return {
+        'error': error_msg,
+        'file_path': None,
+        'meta': None
+      }
 
     meta = {
       'file': fn,
@@ -231,6 +240,16 @@ class R1fsManagerApiPlugin(BasePlugin):
 
     self.P(f"Trying to download file -> {cid}")
     file = self.r1fs.get_file(cid=cid, secret=secret)
+    
+    if file is None:
+      error_msg = f"Failed to retrieve file with CID '{cid}'. The file may not exist or the IPFS download failed."
+      self.P(error_msg, color='r')
+      return {
+        'error': error_msg,
+        'file_base64_str': None,
+        'filename': None
+      }
+    
     file = file.replace("/edge_node", ".") if file else file
     filename = file.split('/')[-1] if file else None
     self.P(f"File retrieved: {file}")
@@ -324,6 +343,13 @@ class R1fsManagerApiPlugin(BasePlugin):
 
     fn = self.r1fs.get_file(cid=cid, secret=secret)
     self.P(f"fn: {fn}")
+    
+    if fn is None:
+      error_msg = f"Failed to retrieve file with CID '{cid}'. The file may not exist or the IPFS download failed."
+      self.P(error_msg, color='r')
+      self._log_request_response("GET_YAML", response_data={'error': error_msg})
+      return {'error': error_msg}
+    
     if fn.endswith('.yaml') or fn.endswith('.yml'):
       file_data = self.diskapi_load_yaml(fn, verbose=False)
       self.P(f"File found: {file_data}")

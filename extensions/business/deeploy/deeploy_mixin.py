@@ -186,6 +186,92 @@ class _DeeployMixin:
     # endfor each target node
     return response_keys
 
+  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs = None):
+    """
+    Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
+    """
+
+    # for plugin_instan
+    job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+    project_id = inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
+    job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
+    project_name = inputs.get(DEEPLOY_KEYS.PROJECT_NAME, None)
+    spare_nodes = inputs.get(DEEPLOY_KEYS.SPARE_NODES, [])
+    allow_replication_in_the_wild = inputs.get(DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD, False)
+    response_keys = self.defaultdict(list)
+
+    ts = self.time()
+    if not dct_deeploy_specs:
+      dct_deeploy_specs = {
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.PROJECT_ID: project_id,
+        DEEPLOY_KEYS.PROJECT_NAME: project_name,
+        DEEPLOY_KEYS.NR_TARGET_NODES: len(nodes),
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+        DEEPLOY_KEYS.JOB_TAGS: job_tags,
+        DEEPLOY_KEYS.DATE_CREATED: ts,
+        DEEPLOY_KEYS.DATE_UPDATED: ts,
+        DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
+        DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
+      }
+
+    nodes = [node for plugin_instance in discovered_plugin_instances if (node := plugin_instance.get("NODE")) is not None]
+
+    pipeline_to_save = None
+    for plugin in discovered_plugin_instances:
+      addr = plugin.get("NODE")
+      plugins = [self.deeploy_prepare_single_plugin_instance_update(inputs=inputs, instance_id=plugin.get("instance_id"))]
+
+      nodes_to_peer = nodes
+      node_plugins = self.deepcopy(plugins)
+
+      # Configure chainstore peers and response keys
+      for plugin in node_plugins:
+        for plugin_instance in plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES]:
+          # Configure peers if there are any
+          if len(nodes_to_peer) > 0:
+            plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
+          # endif
+
+          # Configure response keys if needed
+          if inputs.chainstore_response:
+            response_key = plugin.get(DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, self._generate_chainstore_response_key(plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]))
+            plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
+            response_keys[addr].append(response_key)
+          # endif
+        # endfor each plugin instance
+      # endfor each plugin
+
+      msg = ''
+      if self.cfg_deeploy_verbose > 1:
+        msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
+      self.P(f"Creating pipeline '{app_alias}' on {addr}{msg}")
+
+      if addr is not None:
+
+        pipeline = self.cmdapi_start_pipeline_by_params(
+          name=app_id,
+          app_alias=app_alias,
+          pipeline_type=app_type,
+          node_address=addr,
+          owner=sender,
+          url=inputs.pipeline_input_uri,
+          plugins=node_plugins,
+          is_deeployed=True,
+          deeploy_specs=dct_deeploy_specs,
+        )
+
+        self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
+        pipelin_to_save = pipeline
+      # endif addr is valid
+    # endfor each target node
+    try:
+      save_result = self.save_job_pipeline_in_cstore(pipelin_to_save, job_id)
+      self.P(f"Pipeline saved in CSTORE: {save_result}")
+    except Exception as e:
+      self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
+    return response_keys
+
   def __prepare_plugins_for_update(self, inputs, discovered_plugin_instances):
     """
     Prepare plugins for update using discovered instances instead of creating new ones

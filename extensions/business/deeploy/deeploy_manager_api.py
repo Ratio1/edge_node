@@ -4,6 +4,7 @@ Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
 from naeural_core.main.net_mon import NetMonCt
+from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
 
 from .deeploy_mixin import _DeeployMixin
