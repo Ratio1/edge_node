@@ -261,7 +261,7 @@ class ContainerAppRunnerPlugin(
       self.P(f"Unknown plugin command: {data}")
     return
 
-  def _on_config_changed(self):
+  def _on_config(self):
     self.Pd("Received an updated config for ContainerAppRunner")
     self._stop_container_and_save_logs_to_disk()
     self._restart_container()
@@ -597,6 +597,13 @@ class ContainerAppRunnerPlugin(
     self._stop_container_and_save_logs_to_disk()
     # Start a new container
     self._stop_event.clear()  # reset stop flag for new log thread
+
+    self.__reset_vars()
+    self._setup_resource_limits_and_ports()
+    self._configure_dynamic_env() # setup dynamic env vars for the container
+    self._configure_volumes() # setup container volumes
+    self._setup_env_and_ports()  # re-setup env and ports
+
     self.container = self.start_container()
     self.start_tunnel_engine()
     self.container_start_time = self.time()

@@ -4,13 +4,15 @@ Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
 from naeural_core.main.net_mon import NetMonCt
+from naeural_core import constants as ct
+from .deeploy_job_mixin import _DeeployJobMixin
 
 from .deeploy_mixin import _DeeployMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
-  DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
+  DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
   DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_PLUGIN_DATA,
 )
   
@@ -31,7 +33,9 @@ _CONFIG = {
   'DEEPLOY_VERBOSE' : 10,
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
-  
+  'WARMUP_DELAY' : 300,
+  'PIPELINES_CHECK_DELAY' : 300,
+
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -43,7 +47,8 @@ class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
   _DeeployTargetNodesMixin,
-  _NodeTagsMixin
+  _NodeTagsMixin,
+  _DeeployJobMixin,
   ):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
@@ -64,7 +69,9 @@ class DeeployManagerApiPlugin(
     self.P("Started {} plugin on {} / {}".format(
         self.__class__.__name__, my_address, my_eth_address,
       )
-    )        
+    )
+    self.__warmup_start_time = self.time()
+    self.__last_pipelines_check_time = 0
     return
   
   def __handle_error(self, exc, request, extra_error_code=DEEPLOY_ERRORS.GENERIC):
@@ -192,16 +199,28 @@ class DeeployManagerApiPlugin(
         self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
         nodes = [instance[DEEPLOY_PLUGIN_DATA.NODE] for instance in discovered_plugin_instances]
 
-      dct_status, str_status = self.check_and_deploy_pipelines(
-        sender=sender,
-        inputs=inputs,
-        app_id=app_id,
-        app_alias=app_alias,
-        app_type=app_type,
-        nodes=nodes,
-        discovered_plugin_instances=discovered_plugin_instances,
-        is_create=is_create
-      )
+      if is_create:
+        dct_status, str_status = self.check_and_deploy_pipelines(
+          sender=sender,
+          inputs=inputs,
+          app_id=app_id,
+          app_alias=app_alias,
+          app_type=app_type,
+          new_nodes=nodes,
+          update_nodes=[],
+          discovered_plugin_instances=discovered_plugin_instances,
+        )
+      else:
+        dct_status, str_status = self.check_and_deploy_pipelines(
+          sender=sender,
+          inputs=inputs,
+          app_id=app_id,
+          app_alias=app_alias,
+          app_type=app_type,
+          new_nodes=[],
+          update_nodes=nodes,
+          discovered_plugin_instances=discovered_plugin_instances,
+        )
       
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
         if (dct_status is not None and is_confirmable_job and len(nodes) == len(dct_status)) or not is_confirmable_job:
@@ -357,6 +376,104 @@ class DeeployManagerApiPlugin(
     self.P(f"Received an update_pipeline request with body: {self.json_dumps(request)}")
     return self._process_pipeline_request(request, is_create=False)
 
+  @BasePlugin.endpoint(method="post")
+  def scale_up_job_workers(self,
+    request: dict = DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST
+  ):
+    """
+    Scales up the number of workers for a given job (pipeline) on target node(s)
+    This endpoint does the next job:
+    1. Get nodes on which the job is running
+    2. Update the config, chainstore_allowed, etc.
+    3. Send update command to the nodes, on which it was running and send create command to the new nodes.
+    4. Wait until all the responses are received via CSTORE and compose status response
+    5. Return the status response
+    Parameters
+    ----------
+    request: dict containing next fields:
+      job_id : int
+      app_id : str
+      target_nodes : list[str]
+      target_nodes_count : int
+      node_res_req : dict
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str
+    Returns
+    -------
+    dict
+        A dictionary with the result of the operation
+    """
+    try:
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)   
+      auth_result = self.deeploy_get_auth_result(inputs)
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+      if not job_id:
+        msg = f"{DEEPLOY_ERRORS.REQUEST13}: Job ID is required."
+        raise ValueError(msg)
+      
+      is_confirmable_job = inputs.chainstore_response
+
+      # check payment
+      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
+      if not is_valid:
+        msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
+        raise ValueError(msg)
+      
+      running_apps_for_job = self._get_online_apps(job_id=job_id, owner=sender)
+
+      # todo: check the count of running workers and compare with the amount of allowed workers count from blockchain.
+      
+      self.P(f"Discovered running apps for job: {self.json_dumps(running_apps_for_job)}")
+
+      if not running_apps_for_job or not len(running_apps_for_job):
+        msg = f"{DEEPLOY_ERRORS.NODES3}: No running workers found for provided job_id and owner '{sender}'."
+        raise ValueError(msg)
+      
+      update_nodes = list(running_apps_for_job.keys())
+      new_nodes = self._check_nodes_availability(inputs)
+      
+      dct_status, str_status = self.scale_up_job(new_nodes=new_nodes, 
+                                                 update_nodes=update_nodes, 
+                                                 sender=sender, 
+                                                 job_id=job_id,
+                                                 running_apps_for_job=running_apps_for_job)
+      
+      nodes = list(cstore_response["node"] for cstore_response in dct_status.values())
+      self.Pd(f"Nodes to confirm: {self.json_dumps(nodes, indent=2)}")
+      
+      self._submit_bc_job_confirmation(str_status=str_status, 
+                                       dct_status=dct_status, 
+                                       nodes=nodes, 
+                                       job_id=job_id, 
+                                       is_confirmable_job=is_confirmable_job)
+
+
+      return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
+      if return_request:
+        dct_request = self.deepcopy(request)
+      else:
+        dct_request = None
+
+      result = {
+        DEEPLOY_KEYS.STATUS: str_status,
+        DEEPLOY_KEYS.STATUS_DETAILS: dct_status,
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.REQUEST: dct_request,
+        DEEPLOY_KEYS.AUTH: auth_result,
+      }
+
+      if self.cfg_deeploy_verbose > 1:
+        self.P(f"Request Result: {result}")
+
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+    
+    response = self._get_response({
+      **result
+    })
+    return response
 
   @BasePlugin.endpoint(method="post")
   def delete_pipeline(self,
@@ -607,6 +724,22 @@ class DeeployManagerApiPlugin(
     })
     return response
 
+  def is_deeploy_warmed_up(self):
+    return (self.time() - self.__warmup_start_time) > self.cfg_warmup_delay
+
+  def process(self):
+    if not self.is_deeploy_warmed_up():
+      return
+
+    if (self.time() - self.__last_pipelines_check_time) > self.cfg_pipelines_check_delay:
+      try:
+        self.check_running_pipelines_and_add_to_r1fs()
+      except Exception as e:
+        self.P(f"Error checking running pipelines: {e}", color='r')
+      self.__last_pipelines_check_time = self.time()
+
+    return
+
   def _get_online_apps(self, owner=None, target_nodes=None, job_id=None):
     """
     if self.cfg_deeploy_verbose:
@@ -645,7 +778,7 @@ class DeeployManagerApiPlugin(
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
         for app_name, app_data in apps.items():
-          if app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
+          if app_data.get(ct.CONFIG_STREAM.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
             continue
           filtered_result[node][app_name] = app_data
       result = filtered_result

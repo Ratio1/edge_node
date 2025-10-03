@@ -102,6 +102,8 @@ _CONFIG = {
   #### Logging
   "MAX_LOG_LINES": 10_000,  # max lines to keep in memory
 
+  "CAR_VERBOSE": 10,  # max lines to keep in memory
+
   # Chainstore response configuration
   "CHAINSTORE_RESPONSE_KEY": None,  # Optional key to send confirmation data to chainstore
 
@@ -138,9 +140,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self._set_default_branch()
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._configure_dynamic_env() # setup dynamic env vars for the container
-
-    vcs_data = self.cfg_vcs_data or {}
-    self.repo_url = f"https://{vcs_data.get('USERNAME')}:{vcs_data.get('TOKEN')}@github.com/{vcs_data.get('REPO_OWNER')}/{vcs_data.get('REPO_NAME')}.git"
+    self._configure_repo_url()
 
     self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
     return
@@ -204,7 +204,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.P(f"Unknown plugin command: {data}")
     return
 
-  def _on_config_changed(self):
+  def _on_config(self):
     self.Pd("Received an updated config for WorkerAppRunner")
     self._stop_container_and_save_logs_to_disk()
     self._restart_from_scratch()
@@ -273,6 +273,12 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.P(f"{engine_name} tunnel stopped", color='g')
     return
 
+
+  def _configure_repo_url(self):
+    # TODO: support other git providers
+    vcs_data = self.cfg_vcs_data or {}
+    self.repo_url = f"https://{vcs_data.get('USERNAME')}:{vcs_data.get('TOKEN')}@github.com/{vcs_data.get('REPO_OWNER')}/{vcs_data.get('REPO_NAME')}.git"
+    return
 
   def _set_default_branch(self):
     """Determine the default branch of the repository via GitHub API."""
@@ -406,6 +412,13 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.log_thread.join(timeout=5)
     # Start a new container with the updated code
     self._stop_event.clear()  # reset stop flag for new log thread
+
+    self.__reset_vars()
+    self._set_default_branch()
+    self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
+    self._configure_dynamic_env() # setup dynamic env vars for the container
+    self._configure_repo_url()
+
     return self._launch_container_app()
 
 
