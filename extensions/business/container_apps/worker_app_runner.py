@@ -102,6 +102,8 @@ _CONFIG = {
   #### Logging
   "MAX_LOG_LINES": 10_000,  # max lines to keep in memory
 
+  "CAR_VERBOSE": 10,  # max lines to keep in memory
+
   # Chainstore response configuration
   "CHAINSTORE_RESPONSE_KEY": None,  # Optional key to send confirmation data to chainstore
 
