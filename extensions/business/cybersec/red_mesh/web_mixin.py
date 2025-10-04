@@ -6,7 +6,7 @@ class _WebTestsMixin:
 
   def _web_test_common(self, target, port):
     """Look for exposed common endpoints and weak access controls."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -19,17 +19,24 @@ class _WebTestsMixin:
         if resp.status_code == 200:
           finding = f"VULNERABILITY: Accessible resource at {url} (200 OK)."
           self.P(finding)
-          result += finding + "\n"
+          findings.append(finding)
         elif resp.status_code in (401, 403):
           self.P(f"Protected resource {url} (status {resp.status_code}).")
+          findings.append(
+            f"INFO: Access control enforced at {url} (status {resp.status_code})."
+          )
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: Common endpoint probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: No common endpoint exposures detected on {base_url}.")
+    return "\n".join(findings)
 
   
   def _web_test_homepage(self, target, port):
     """Scan landing pages for clear-text secrets or database dumps."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -43,21 +50,25 @@ class _WebTestsMixin:
           finding = (
             f"VULNERABILITY: sensitive '{marker}' found on {base_url}."
           )
-          result += finding + "\n"
+          findings.append(finding)
           self.P(finding)
       # Check for other potential leaks
       if "database" in text.lower():
         finding = f"VULNERABILITY: potential database leak at {base_url}."
-        result += finding + "\n"
+        findings.append(finding)
         self.P(finding)
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: Homepage probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: No sensitive markers detected on {base_url} homepage.")
+    return "\n".join(findings)
 
 
   def _web_test_security_headers(self, target, port):
     """Flag missing HTTP security headers (OWASP A05/A06)."""
-    result = ""
+    findings = []
     try:
       scheme = "https" if port in (443, 8443) else "http"
       base_url = f"{scheme}://{target}"
@@ -76,15 +87,21 @@ class _WebTestsMixin:
         if header not in resp_main.headers:
           finding = f"VULNERABILITY: Missing security header {header} on {base_url}."
           self.P(finding)
-          result += finding + "\n"
+          findings.append(finding)
+        else:
+          findings.append(f"OK: Security header {header} present on {base_url}.")
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: Security header probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: Security header check found no issues on {base_url}.")
+    return "\n".join(findings)
 
 
   def _web_test_flags(self, target, port):
     """Check cookies for Secure/HttpOnly/SameSite and directory listing."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -98,29 +115,33 @@ class _WebTestsMixin:
         for cookie in cookies_hdr.split(","):
           if "Secure" not in cookie:
             finding = f"VULNERABILITY: Cookie missing Secure flag: {cookie.strip()} on {base_url}."
-            result += finding + "\n"
+            findings.append(finding)
             self.P(finding)
           if "HttpOnly" not in cookie:
             finding = f"VULNERABILITY: Cookie missing HttpOnly flag: {cookie.strip()} on {base_url}."
-            result += finding + "\n"
+            findings.append(finding)
             self.P(finding)
           if "SameSite" not in cookie:
             finding = f"VULNERABILITY: Cookie missing SameSite flag: {cookie.strip()} on {base_url}."
-            result += finding + "\n"
+            findings.append(finding)
             self.P(finding)
       # Detect directory listing
       if "Index of /" in resp_main.text:
         finding = f"VULNERABILITY: Directory listing exposed at {base_url}."
-        result += finding + "\n"
+        findings.append(finding)
         self.P(finding)
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: Cookie/flags probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: Cookie flags and directory listing checks passed for {base_url}.")
+    return "\n".join(findings)
 
 
   def _web_test_xss(self, target, port):
     """Probe reflected XSS by injecting a harmless script tag."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -133,15 +154,19 @@ class _WebTestsMixin:
       if payload in resp_test.text:
         finding = f"VULNERABILITY: Reflected XSS at {test_url}."
         self.P(finding)
-        result += finding + "\n"
+        findings.append(finding)
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result     
+      message = f"ERROR: XSS probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: Reflected XSS not observed at {base_url}.")
+    return "\n".join(findings)
 
 
   def _web_test_path_traversal(self, target, port):
     """Attempt basic path traversal payload against the target."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -153,15 +178,19 @@ class _WebTestsMixin:
       if "root:x:" in resp_trav.text:
         finding = f"VULNERABILITY: Path traversal at {trav_url}."
         self.P(finding)
-        result += finding + "\n"
+        findings.append(finding)
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}", color='r')
-    return result     
+      message = f"ERROR: Path traversal probe failed on {base_url}: {e}"
+      self.P(message, color='r')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: Path traversal payload not successful on {base_url}.")
+    return "\n".join(findings)
   
   
   def _web_test_sql_injection(self, target, port):
     """Send boolean SQLi payload and look for database error leakage."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -176,15 +205,19 @@ class _WebTestsMixin:
       if any(err in body for err in errors):
         finding = f"VULNERABILITY: Potential SQL injection at {inj_url}."
         self.P(finding)
-        result += finding + "\n"
+        findings.append(finding)
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}", color='r')
-    return result
+      message = f"ERROR: SQL injection probe failed on {base_url}: {e}"
+      self.P(message, color='r')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: SQL injection probe did not reveal errors on {base_url}.")
+    return "\n".join(findings)
 
 
   def _web_test_cors_misconfiguration(self, target, port):
     """Detect overly permissive CORS policies (OWASP A01/A05)."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -202,19 +235,29 @@ class _WebTestsMixin:
       if acao in ("*", malicious_origin):
         finding = f"VULNERABILITY: CORS misconfiguration: {acao} allowed on {base_url}."
         self.P(finding)
-        result += finding + "\n"
+        findings.append(finding)
         if acao == "*" and acac.lower() == "true":
           finding = f"VULNERABILITY: CORS allows credentials for wildcard origin on {base_url}."
           self.P(finding, color='r')
-          result += finding + "\n"
+          findings.append(finding)
+      elif acao:
+        info = f"OK: CORS allow origin {acao} on {base_url}."
+        self.P(info)
+        findings.append(info)
+      else:
+        findings.append(f"OK: No permissive CORS headers detected on {base_url}.")
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: CORS probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: CORS probe did not detect misconfiguration on {base_url}.")
+    return "\n".join(findings)
 
 
   def _web_test_open_redirect(self, target, port):
     """Check common redirect parameters for open redirect abuse."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -233,15 +276,23 @@ class _WebTestsMixin:
         if payload in location:
           finding = f"VULNERABILITY: Open redirect via next parameter at {redirect_url}."
           self.P(finding)
-          result += finding + "\n"
+          findings.append(finding)
+      else:
+        findings.append(
+          f"OK: Redirect endpoint at {redirect_url} did not expose open redirect behavior."
+        )
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: Open redirect probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: Open redirect not detected at {base_url}.")
+    return "\n".join(findings)
 
 
   def _web_test_http_methods(self, target, port):
     """Surface risky HTTP verbs enabled on the root resource."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -254,15 +305,23 @@ class _WebTestsMixin:
         if risky:
           finding = f"VULNERABILITY: Risky HTTP methods {', '.join(risky)} enabled on {base_url}."
           self.P(finding)
-          result += finding + "\n"
+          findings.append(finding)
+        else:
+          findings.append(f"OK: Only safe HTTP methods exposed on {base_url} ({allow}).")
+      else:
+        findings.append(f"OK: OPTIONS response missing Allow header on {base_url}.")
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: HTTP methods probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: HTTP methods probe did not detect risky verbs on {base_url}.")
+    return "\n".join(findings)
 
 
   def _web_test_graphql_introspection(self, target, port):
     """Check if GraphQL introspection is exposed in production endpoints."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -274,15 +333,21 @@ class _WebTestsMixin:
       if resp.status_code == 200 and "__schema" in resp.text:
         finding = f"VULNERABILITY: GraphQL introspection enabled at {graphql_url}."
         self.P(finding)
-        result += finding + "\n"
+        findings.append(finding)
+      else:
+        findings.append(f"OK: GraphQL introspection disabled or unreachable at {graphql_url}.")
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: GraphQL probe failed on {graphql_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: GraphQL introspection probe reported no issues at {graphql_url}.")
+    return "\n".join(findings)
 
 
   def _web_test_metadata_endpoints(self, target, port):
     """Probe cloud metadata paths to detect SSRF-style exposure."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -299,15 +364,19 @@ class _WebTestsMixin:
         if resp.status_code == 200:
           finding = f"VULNERABILITY: Cloud metadata endpoint exposed at {url}."
           self.P(finding)
-          result += finding + "\n"
+          findings.append(finding)
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: Metadata endpoint probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: Metadata endpoint probe did not detect exposure on {base_url}.")
+    return "\n".join(findings)
 
 
   def _web_test_api_auth_bypass(self, target, port):
     """Detect APIs that succeed despite invalid Authorization headers."""
-    result = ""
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -325,7 +394,13 @@ class _WebTestsMixin:
         if resp.status_code in (200, 204):
           finding = f"VULNERABILITY: API endpoint {url} accepts invalid Authorization header."
           self.P(finding)
-          result += finding + "\n"
+          findings.append(finding)
+        else:
+          findings.append(f"OK: API endpoint {url} rejected invalid Authorization header (status {resp.status_code}).")
     except Exception as e:
-      self.P(f"Web test error on port {port}: {e}")
-    return result
+      message = f"ERROR: API auth bypass probe failed on {base_url}: {e}"
+      self.P(message, color='y')
+      findings.append(message)
+    if not findings:
+      findings.append(f"OK: API auth bypass not detected on {base_url}.")
+    return "\n".join(findings)

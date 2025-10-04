@@ -19,7 +19,7 @@
 
 ## Testing Guidelines
 - Prioritize business workflows in `plugins/business/tutorials/` and Oracle sync checks in `extensions/business/oracle_sync/`.
-- Name new regression files `*test*.py` so they are auto-discovered; when editing shared pipeline logic, also run `pytest` (or `python -m unittest`) inside cloned `naeural_core` and targeted SDK tutorials.
+- Name new regression files `*test*.py` so they are auto-discovered; when editing shared pipeline logic, also run `pytest` (or `python3 -m unittest`) inside cloned `naeural_core` and targeted SDK tutorials.
 - Prefer lightweight mocks to live services; for container checks, attach with `docker exec -it r1node /bin/bash` and replay scripts from `cmds/`.
 
 ## Commit & Pull Request Guidelines

@@ -105,7 +105,7 @@ class PentestLocalWorker(
       max(worker_target_ports)
     ))
     return
-  
+
   def _get_all_features(self, categs=False):
     features = {} if categs else []
     PREFIXES = ["_service_info_", "_web_test_"]
@@ -301,26 +301,26 @@ class PentestLocalWorker(
     self.P(f"Gathering service info for {len(open_ports)} open ports.")
     target = self.target
     service_info_methods = [method for method in dir(self) if method.startswith("_service_info_")]
-    full_info = []
+    aggregated_info = []
     for method in service_info_methods:
       func = getattr(self, method)
+      method_info = []
       for port in open_ports:
-        if port in self.state["service_info"] or self.stop_event.is_set():
+        if self.stop_event.is_set():
           continue
-        # get all methods that start with _service_info_
         info = func(target, port)
-        if info:
-          full_info.append(f"{method}: {port}: {info}")
         if port not in self.state["service_info"]:
           self.state["service_info"][port] = {}
         self.state["service_info"][port][method] = info
-      #end for each port of current method
-      # run each method for the current open port
-      if full_info:
-        self.P(f"Method {method} info:\n{json.dumps(full_info, indent=2)}")
-      self.state["completed_tests"].append(method) # register completed method for port
-    # end for each method
-    return full_info
+        if info is not None:
+          method_info.append(f"{method}: {port}: {info}")
+      if method_info:
+        aggregated_info.extend(method_info)
+        self.P(
+          f"Method {method} findings:\n{json.dumps(method_info, indent=2)}"
+        )
+      self.state["completed_tests"].append(method)
+    return aggregated_info
 
 
   def _run_web_tests(self):
@@ -332,18 +332,20 @@ class PentestLocalWorker(
       self.P("No open ports to run web tests on.")
       return
     
-    self.P(f"Running web tests on {len(open_ports)} open ports.")
+    ports_to_test = list(open_ports)
+    self.P(
+      f"Running web tests on {len(ports_to_test)} ports."
+    )
     target = self.target
     
-    web_ports = [p for p in open_ports if p in (80, 443, 8080, 8443)]
-    if not web_ports:
+    if not ports_to_test:
       self.state["web_tested"] = True
       return
     result = []
     web_tests_methods = [method for method in dir(self) if method.startswith("_web_test_")]
     for method in web_tests_methods:
       func = getattr(self, method)
-      for port in web_ports:
+      for port in ports_to_test:
         if self.stop_event.is_set():
           return      
         iter_result = func(target, port)

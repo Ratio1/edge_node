@@ -5,8 +5,10 @@ from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.redmesh_utils import PentestLocalWorker
 
+from xperimental.utils import color_print
 
 MANUAL_RUN = __name__ == "__main__"
+
 
 
 class DummyOwner:
@@ -16,17 +18,28 @@ class DummyOwner:
   def P(self, message, **kwargs):
     self.messages.append(message)
     if MANUAL_RUN:
-      print(f"[DummyOwner] {message}")
+      if "VULNERABILITY" in message:
+        color = 'r'
+      elif any(x in message for x in ["WARNING", "findings:"]):
+        color = 'y'
+      else:
+        color = 'd'
+      color_print(f"[DummyOwner] {message}", color=color)
+    return
 
 
 class RedMeshOWASPTests(unittest.TestCase):
+  
+
+  
   def setUp(self):
     if MANUAL_RUN:
-      print(f"\n[MANUAL] >>> Starting {self._testMethodName}")
+      print()
+      color_print(f"[MANUAL] >>> Starting <{self._testMethodName}>", color='b')
 
   def tearDown(self):
     if MANUAL_RUN:
-      print(f"[MANUAL] <<< Finished {self._testMethodName}")
+      color_print(f"[MANUAL] <<< Finished <{self._testMethodName}>", color='b')
 
   def _build_worker(self, ports=None, exceptions=None):
     if ports is None:
@@ -162,6 +175,56 @@ class RedMeshOWASPTests(unittest.TestCase):
       result = worker._service_info_21("example.com", 21)
     self.assertIn("VULNERABILITY: FTP allows anonymous login", result)
 
+  def test_service_checks_cover_non_standard_ports(self):
+    owner, worker = self._build_worker(ports=[2121])
+
+    class DummyFTP:
+      def __init__(self, timeout=3):
+        pass
+
+      def connect(self, target, port, timeout=3):
+        return None
+
+      def getwelcome(self):
+        return "220 Welcome"
+
+      def login(self):
+        return None
+
+      def quit(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.ftplib.FTP",
+      return_value=DummyFTP(),
+    ):
+      result = worker._service_info_21("example.com", 2121)
+    self.assertIn("FTP allows anonymous login", result)
+
+  def test_service_info_runs_all_methods_for_each_port(self):
+    owner, worker = self._build_worker(ports=[1234])
+    worker.state["open_ports"] = [1234]
+
+    def fake_service_one(target, port):
+      return f"fake_service_one:{port}"
+
+    def fake_service_two(target, port):
+      return f"fake_service_two:{port}"
+
+    setattr(worker, "_service_info_fake_one", fake_service_one)
+    setattr(worker, "_service_info_fake_two", fake_service_two)
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_utils.dir",
+      return_value=["_service_info_fake_one", "_service_info_fake_two"],
+    ):
+      worker._gather_service_info()
+
+    service_snap = worker.state["service_info"][1234]
+    self.assertEqual(len(service_snap), 2)
+    self.assertEqual(service_snap["_service_info_fake_one"], "fake_service_one:1234")
+    self.assertEqual(service_snap["_service_info_fake_two"], "fake_service_two:1234")
+
   def test_software_data_integrity_secret_leak(self):
     owner, worker = self._build_worker()
     resp = MagicMock()
@@ -191,6 +254,53 @@ class RedMeshOWASPTests(unittest.TestCase):
     self.assertTrue(worker.state["done"])
     self.assertIn("scan", worker.state["completed_tests"])
     self.assertTrue(any("Starting pentest job." in msg for msg in owner.messages))
+
+  def test_web_tests_include_uncommon_ports(self):
+    owner, worker = self._build_worker(ports=[9000])
+    worker.state["open_ports"] = [9000]
+
+    def fake_get(url, timeout=2, verify=False):
+      resp = MagicMock()
+      resp.headers = {}
+      resp.text = ""
+      resp.status_code = 404
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_utils.dir",
+      return_value=["_web_test_common"],
+    ), patch(
+      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      worker._run_web_tests()
+    self.assertIn(9000, worker.state["web_tests_info"])
+    self.assertIn("_web_test_common", worker.state["web_tests_info"][9000])
+    self.assertTrue(worker.state["web_tests_info"][9000]["_web_test_common"])  # message stored
+
+  def test_web_tests_execute_all_methods_for_each_port(self):
+    owner, worker = self._build_worker(ports=[10000])
+    worker.state["open_ports"] = [10000]
+
+    def fake_web_one(target, port):
+      return f"web-one:{port}"
+
+    def fake_web_two(target, port):
+      return f"web-two:{port}"
+
+    setattr(worker, "_web_test_fake_one", fake_web_one)
+    setattr(worker, "_web_test_fake_two", fake_web_two)
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_utils.dir",
+      return_value=["_web_test_fake_one", "_web_test_fake_two"],
+    ):
+      worker._run_web_tests()
+
+    web_snap = worker.state["web_tests_info"][10000]
+    self.assertEqual(len(web_snap), 2)
+    self.assertEqual(web_snap["_web_test_fake_one"], "web-one:10000")
+    self.assertEqual(web_snap["_web_test_fake_two"], "web-two:10000")
 
   def test_ssrf_protection_respects_exceptions(self):
     owner, worker = self._build_worker(ports=[80, 9000], exceptions=[9000])
