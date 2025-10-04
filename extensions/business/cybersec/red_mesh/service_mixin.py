@@ -1,4 +1,6 @@
+import random
 import socket
+import struct
 import ftplib
 import requests
 import ssl
@@ -81,15 +83,19 @@ class _ServiceInfoMixin:
             proto = ssock.version()
             cipher = ssock.cipher()
             expires = cert.get("notAfter")
+            info = f"TLS {proto} {cipher[0]}"
+            if proto and proto.upper() in ("SSLV3", "SSLV2", "TLSV1", "TLSV1.1"):
+              info = f"VULNERABILITY: Obsolete TLS protocol negotiated ({proto}) using {cipher[0]}"
             if expires:
               try:
                 exp = datetime.strptime(expires, "%b %d %H:%M:%S %Y %Z")
                 days = (exp - datetime.utcnow()).days
-                info = f"TLS {proto} {cipher[0]}; cert exp in {days} days"
+                if days <= 30:
+                  info = f"VULNERABILITY: TLS {proto} {cipher[0]}; certificate expires in {days} days"
+                else:
+                  info = f"TLS {proto} {cipher[0]}; cert exp in {days} days"
               except Exception:
                 info = f"TLS {proto} {cipher[0]}; cert expires {expires}"
-            else:
-              info = f"TLS {proto} {cipher[0]}"
     except Exception as e:
       info = f"TLS info fetch failed on port {port}: {e}"
     return info
@@ -106,9 +112,9 @@ class _ServiceInfoMixin:
         info = f"FTP banner: {banner}"
         try:
           ftp.login()  # attempt anonymous login
-          info += " | Anonymous login allowed"
+          info = f"VULNERABILITY: FTP allows anonymous login (banner: {banner})"
         except Exception:
-          info += " | Anonymous login not allowed"
+          info = f"FTP banner: {banner} | Anonymous login not allowed"
         ftp.quit()
     except Exception as e:
       info = f"FTP banner grab failed on port {port}: {e}"
@@ -184,7 +190,7 @@ class _ServiceInfoMixin:
         sock.send(b"PING\r\n")
         data = sock.recv(64).decode('utf-8', errors='ignore')
         if data.startswith("+PONG"):
-          info = "Redis responded to PING (no auth)."
+          info = "VULNERABILITY: Redis responded to PING (no authentication)."
         elif data.upper().startswith("-NOAUTH"):
           info = "Redis requires authentication (NOAUTH)."
         else:
@@ -204,7 +210,10 @@ class _ServiceInfoMixin:
         sock.settimeout(2)
         sock.connect((target, port))
         banner = sock.recv(1024).decode('utf-8', errors='ignore')
-        info = f"Telnet banner: {banner.strip()}" if banner else "Telnet open with no banner"
+        if banner:
+          info = f"VULNERABILITY: Telnet banner: {banner.strip()}"
+        else:
+          info = "VULNERABILITY: Telnet open with no banner"
         sock.close()
     except Exception as e:
       info = f"Telnet banner grab failed on port {port}: {e}"
@@ -223,7 +232,7 @@ class _ServiceInfoMixin:
         sock.sendall(probe)
         data = sock.recv(4)
         if data:
-          info = "SMB service responded to negotiation probe."
+          info = "VULNERABILITY: SMB service responded to negotiation probe."
         else:
           info = "SMB port open but no negotiation response."
         sock.close()
@@ -241,11 +250,248 @@ class _ServiceInfoMixin:
         sock.settimeout(3)
         sock.connect((target, port))
         banner = sock.recv(12).decode('ascii', errors='ignore')
-        info = f"VNC protocol banner: {banner.strip()}" if banner else "VNC open with no banner"
+        if banner:
+          info = f"VULNERABILITY: VNC protocol banner: {banner.strip()}"
+        else:
+          info = "VULNERABILITY: VNC open with no banner"
         sock.close()
     except Exception as e:
       info = f"VNC banner grab failed on port {port}: {e}"
     return info
+
+
+  def _service_info_161(self, target, port):
+    """Attempt SNMP community string disclosure using 'public'."""
+    info = None
+    sock = None
+    try:
+      if port == 161:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2)
+        packet = bytes.fromhex(
+          "302e020103300702010304067075626c6963a019020405f5e10002010002010030100406082b060102010101000500"
+        )
+        sock.sendto(packet, (target, port))
+        data, _ = sock.recvfrom(512)
+        readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+        if 'public' in readable.lower():
+          info = (
+            f"VULNERABILITY: SNMP responds to community 'public' on {target}:{port}"
+            f" (response: {readable.strip()[:120]})"
+          )
+        else:
+          info = f"SNMP response: {readable.strip()[:120]}"
+    except socket.timeout:
+      info = None
+    except Exception as e:
+      info = f"SNMP probe failed on port {port}: {e}"
+    finally:
+      if sock is not None:
+        sock.close()
+    return info
+
+
+  def _service_info_53(self, target, port):
+    """Query CHAOS TXT version.bind to detect DNS version disclosure."""
+    info = None
+    sock = None
+    try:
+      if port == 53:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2)
+        tid = random.randint(0, 0xffff)
+        header = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)
+        qname = b'\x07version\x04bind\x00'
+        question = struct.pack('>HH', 16, 3)
+        packet = header + qname + question
+        sock.sendto(packet, (target, port))
+        data, _ = sock.recvfrom(512)
+        if len(data) < 12:
+          return None
+        if struct.unpack('>H', data[:2])[0] != tid:
+          return None
+        ancount = struct.unpack('>H', data[6:8])[0]
+        if not ancount:
+          return None
+        idx = 12 + len(qname) + 4
+        if idx >= len(data):
+          return None
+        if data[idx] & 0xc0 == 0xc0:
+          idx += 2
+        else:
+          while idx < len(data) and data[idx] != 0:
+            idx += data[idx] + 1
+          idx += 1
+        idx += 8
+        if idx + 2 > len(data):
+          return None
+        rdlength = struct.unpack('>H', data[idx:idx+2])[0]
+        idx += 2
+        if idx >= len(data):
+          return None
+        txt_length = data[idx]
+        txt = data[idx+1:idx+1+txt_length].decode('utf-8', errors='ignore')
+        if txt:
+          info = (
+            f"VULNERABILITY: DNS version disclosure '{txt}' via CHAOS TXT on {target}:{port}"
+          )
+        if info is None:
+          readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+          if 'bind' in readable.lower() or 'version' in readable.lower():
+            info = (
+              f"VULNERABILITY: DNS version disclosure via CHAOS TXT on {target}:{port}"
+            )
+    except socket.timeout:
+      info = None
+    except Exception as e:
+      info = f"DNS CHAOS query failed on port {port}: {e}"
+    finally:
+      if sock is not None:
+        sock.close()
+    return info
+
+
+  def _service_info_1433(self, target, port):
+    """Send a TDS prelogin probe to expose SQL Server version data."""
+    info = None
+    try:
+      if port == 1433:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((target, port))
+        prelogin = bytes.fromhex(
+          "1201001600000000000000000000000000000000000000000000000000000000"
+        )
+        sock.sendall(prelogin)
+        data = sock.recv(256)
+        if data:
+          readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+          info = (
+            f"VULNERABILITY: MSSQL prelogin succeeded on {target}:{port}"
+            f" (response: {readable.strip()[:120]})"
+          )
+        sock.close()
+    except Exception as e:
+      info = f"MSSQL prelogin failed on port {port}: {e}"
+    return info
+
+
+  def _service_info_5432(self, target, port):
+    """Probe PostgreSQL for weak authentication methods."""
+    info = None
+    try:
+      if port == 5432:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((target, port))
+        payload = b'user\x00postgres\x00database\x00postgres\x00\x00'
+        startup = struct.pack('!I', len(payload) + 8) + struct.pack('!I', 196608) + payload
+        sock.sendall(startup)
+        data = sock.recv(128)
+        if b'AuthenticationCleartextPassword' in data:
+          info = (
+            f"VULNERABILITY: PostgreSQL requests cleartext passwords on {target}:{port}"
+          )
+        elif b'AuthenticationOk' in data:
+          info = f"PostgreSQL responded with AuthenticationOk on {target}:{port}"
+        sock.close()
+    except Exception as e:
+      info = f"PostgreSQL probe failed on port {port}: {e}"
+    return info
+
+
+  def _service_info_11211(self, target, port):
+    """Issue Memcached stats command to detect unauthenticated access."""
+    info = None
+    try:
+      if port == 11211:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        sock.connect((target, port))
+        sock.sendall(b'stats\r\n')
+        data = sock.recv(128)
+        if data.startswith(b'STAT'):
+          info = (
+            f"VULNERABILITY: Memcached stats accessible without auth on {target}:{port}"
+          )
+        sock.close()
+    except Exception as e:
+      info = f"Memcached probe failed on port {port}: {e}"
+    return info
+
+
+  def _service_info_9200(self, target, port):
+    """Detect Elasticsearch/OpenSearch nodes leaking cluster metadata."""
+    info = None
+    try:
+      if port == 9200:
+        url = f"http://{target}:9200"
+        resp = requests.get(url, timeout=3)
+        if resp.ok and 'cluster_name' in resp.text:
+          info = (
+            f"VULNERABILITY: Elasticsearch cluster metadata exposed at {url}"
+          )
+    except Exception as e:
+      info = f"Elasticsearch probe failed on port {port}: {e}"
+    return info
+
+
+  def _service_info_502(self, target, port):
+    """Send Modbus device identification request to detect exposed PLCs."""
+    info = None
+    try:
+      if port == 502:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((target, port))
+        request = b'\x00\x01\x00\x00\x00\x06\x01\x2b\x0e\x01\x00'
+        sock.sendall(request)
+        data = sock.recv(256)
+        if data:
+          readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
+          info = (
+            f"VULNERABILITY: Modbus device responded to identification request on {target}:{port}"
+            f" (response: {readable.strip()[:120]})"
+          )
+        sock.close()
+    except Exception as e:
+      info = f"Modbus probe failed on port {port}: {e}"
+    return info
+
+
+  def _service_info_27017(self, target, port):
+    """Attempt MongoDB isMaster handshake to detect unauthenticated access."""
+    info = None
+    try:
+      if port == 27017:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((target, port))
+        doc = bytearray(b"\x00\x00\x00\x00\x10isMaster\x00")
+        doc.extend(struct.pack('<i', 1))
+        doc.append(0x00)
+        struct.pack_into('<i', doc, 0, len(doc) + 4)
+        header_len = 16
+        collection = b'admin.$cmd\x00'
+        flags = struct.pack('<i', 0)
+        number_to_skip = struct.pack('<i', 0)
+        number_to_return = struct.pack('<i', -1)
+        message = (
+          flags + collection + number_to_skip + number_to_return + doc
+        )
+        total_length = header_len + len(message)
+        header = struct.pack('<iiii', total_length, 1, 0, 2004)
+        sock.sendall(header + message)
+        data = sock.recv(256)
+        if b'isMaster' in data or b'ismaster' in data:
+          info = (
+            f"VULNERABILITY: MongoDB isMaster responded without auth on {target}:{port}"
+          )
+        sock.close()
+    except Exception as e:
+      info = f"MongoDB probe failed on port {port}: {e}"
+    return info
+
 
 
   def _service_info_generic(self, target, port):

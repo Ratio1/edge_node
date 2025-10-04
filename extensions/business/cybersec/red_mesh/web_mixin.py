@@ -17,8 +17,9 @@ class _WebTestsMixin:
         url = base_url + path
         resp = requests.get(url, timeout=2, verify=False)
         if resp.status_code == 200:
-          self.P(f"Accessible resource at {url} (200 OK).")
-          result += f"Accessible resource: {url}\n"
+          finding = f"VULNERABILITY: Accessible resource at {url} (200 OK)."
+          self.P(finding)
+          result += finding + "\n"
         elif resp.status_code in (401, 403):
           self.P(f"Protected resource {url} (status {resp.status_code}).")
     except Exception as e:
@@ -39,12 +40,16 @@ class _WebTestsMixin:
       text = resp_main.text[:10000]
       for marker in ["API_KEY", "PASSWORD", "SECRET", "BEGIN RSA PRIVATE KEY"]:
         if marker in text:
-          result += f"Sensitive marker '{marker}' found on {base_url}.\n"
-          self.P(f"Sensitive '{marker}' found on {base_url}.")
+          finding = (
+            f"VULNERABILITY: sensitive '{marker}' found on {base_url}."
+          )
+          result += finding + "\n"
+          self.P(finding)
       # Check for other potential leaks
       if "database" in text.lower():
-        result += f"Potential database leak found on {base_url}.\n"
-        self.P(f"Potential database leak found on {base_url}.")
+        finding = f"VULNERABILITY: potential database leak at {base_url}."
+        result += finding + "\n"
+        self.P(finding)
     except Exception as e:
       self.P(f"Web test error on port {port}: {e}")
     return result
@@ -69,8 +74,9 @@ class _WebTestsMixin:
       ]
       for header in security_headers:
         if header not in resp_main.headers:
-          self.P(f"Missing security header {header} on {base_url}.")
-          result += f"Missing security header: {header} on {base_url}.\n"
+          finding = f"VULNERABILITY: Missing security header {header} on {base_url}."
+          self.P(finding)
+          result += finding + "\n"
     except Exception as e:
       self.P(f"Web test error on port {port}: {e}")
     return result
@@ -91,18 +97,22 @@ class _WebTestsMixin:
       if cookies_hdr:
         for cookie in cookies_hdr.split(","):
           if "Secure" not in cookie:
-            result += f"Cookie missing Secure flag: {cookie.strip()} on {base_url}.\n"
-            self.P(f"Cookie missing Secure flag: {cookie.strip()} on {base_url}.")
+            finding = f"VULNERABILITY: Cookie missing Secure flag: {cookie.strip()} on {base_url}."
+            result += finding + "\n"
+            self.P(finding)
           if "HttpOnly" not in cookie:
-            result += f"Cookie missing HttpOnly flag: {cookie.strip()} on {base_url}.\n"
-            self.P(f"Cookie missing HttpOnly flag: {cookie.strip()} on {base_url}.")
+            finding = f"VULNERABILITY: Cookie missing HttpOnly flag: {cookie.strip()} on {base_url}."
+            result += finding + "\n"
+            self.P(finding)
           if "SameSite" not in cookie:
-            result += f"Cookie missing SameSite flag: {cookie.strip()} on {base_url}.\n"
-            self.P(f"Cookie missing SameSite flag: {cookie.strip()} on {base_url}.")
+            finding = f"VULNERABILITY: Cookie missing SameSite flag: {cookie.strip()} on {base_url}."
+            result += finding + "\n"
+            self.P(finding)
       # Detect directory listing
       if "Index of /" in resp_main.text:
-        result += f"Directory listing exposed at {base_url}.\n"
-        self.P(f"Directory listing exposed at {base_url}.")
+        finding = f"VULNERABILITY: Directory listing exposed at {base_url}."
+        result += finding + "\n"
+        self.P(finding)
     except Exception as e:
       self.P(f"Web test error on port {port}: {e}")
     return result
@@ -121,8 +131,9 @@ class _WebTestsMixin:
       test_url = base_url.rstrip("/") + f"/{payload}"
       resp_test = requests.get(test_url, timeout=3, verify=False)
       if payload in resp_test.text:
-        self.P(f"VULNERABLE: Reflected XSS at {test_url}.")
-        result += f"Reflected XSS vulnerability found at {test_url}.\n"
+        finding = f"VULNERABILITY: Reflected XSS at {test_url}."
+        self.P(finding)
+        result += finding + "\n"
     except Exception as e:
       self.P(f"Web test error on port {port}: {e}")
     return result     
@@ -140,8 +151,9 @@ class _WebTestsMixin:
       trav_url = base_url.rstrip("/") + "/../../../../etc/passwd"
       resp_trav = requests.get(trav_url, timeout=2, verify=False)
       if "root:x:" in resp_trav.text:
-        self.P(f"VULNERABLE: Path traversal at {trav_url}.")
-        result += f"Path traversal vulnerability found at {trav_url}.\n"
+        finding = f"VULNERABILITY: Path traversal at {trav_url}."
+        self.P(finding)
+        result += finding + "\n"
     except Exception as e:
       self.P(f"Web test error on port {port}: {e}", color='r')
     return result     
@@ -162,8 +174,9 @@ class _WebTestsMixin:
       errors = ["sql", "syntax", "mysql", "psql", "postgres", "sqlite", "ora-"]
       body = resp_inj.text.lower()
       if any(err in body for err in errors):
-        self.P(f"Potential SQL injection response at {inj_url}.")
-        result += f"Potential SQL injection vulnerability found at {inj_url}.\n"
+        finding = f"VULNERABILITY: Potential SQL injection at {inj_url}."
+        self.P(finding)
+        result += finding + "\n"
     except Exception as e:
       self.P(f"Web test error on port {port}: {e}", color='r')
     return result
@@ -187,11 +200,11 @@ class _WebTestsMixin:
       acao = resp.headers.get("Access-Control-Allow-Origin", "")
       acac = resp.headers.get("Access-Control-Allow-Credentials", "")
       if acao in ("*", malicious_origin):
-        finding = f"CORS misconfiguration: {acao} allowed on {base_url}."
+        finding = f"VULNERABILITY: CORS misconfiguration: {acao} allowed on {base_url}."
         self.P(finding)
         result += finding + "\n"
         if acao == "*" and acac.lower() == "true":
-          finding = f"CORS allows credentials for wildcard origin on {base_url}."
+          finding = f"VULNERABILITY: CORS allows credentials for wildcard origin on {base_url}."
           self.P(finding, color='r')
           result += finding + "\n"
     except Exception as e:
@@ -218,7 +231,7 @@ class _WebTestsMixin:
       if 300 <= resp.status_code < 400:
         location = resp.headers.get("Location", "")
         if payload in location:
-          finding = f"Open redirect via next parameter at {redirect_url}."
+          finding = f"VULNERABILITY: Open redirect via next parameter at {redirect_url}."
           self.P(finding)
           result += finding + "\n"
     except Exception as e:
@@ -239,7 +252,78 @@ class _WebTestsMixin:
       if allow:
         risky = [method for method in ("PUT", "DELETE", "TRACE", "CONNECT") if method in allow.upper()]
         if risky:
-          finding = f"Risky HTTP methods {', '.join(risky)} enabled on {base_url}."
+          finding = f"VULNERABILITY: Risky HTTP methods {', '.join(risky)} enabled on {base_url}."
+          self.P(finding)
+          result += finding + "\n"
+    except Exception as e:
+      self.P(f"Web test error on port {port}: {e}")
+    return result
+
+
+  def _web_test_graphql_introspection(self, target, port):
+    """Check if GraphQL introspection is exposed in production endpoints."""
+    result = ""
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}"
+    if port not in (80, 443):
+      base_url = f"{scheme}://{target}:{port}"
+    graphql_url = base_url.rstrip("/") + "/graphql"
+    try:
+      payload = {"query": "{__schema{types{name}}}"}
+      resp = requests.post(graphql_url, json=payload, timeout=5, verify=False)
+      if resp.status_code == 200 and "__schema" in resp.text:
+        finding = f"VULNERABILITY: GraphQL introspection enabled at {graphql_url}."
+        self.P(finding)
+        result += finding + "\n"
+    except Exception as e:
+      self.P(f"Web test error on port {port}: {e}")
+    return result
+
+
+  def _web_test_metadata_endpoints(self, target, port):
+    """Probe cloud metadata paths to detect SSRF-style exposure."""
+    result = ""
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}"
+    if port not in (80, 443):
+      base_url = f"{scheme}://{target}:{port}"
+    metadata_paths = [
+      "/latest/meta-data/",
+      "/metadata/computeMetadata/v1/",
+      "/computeMetadata/v1/",
+    ]
+    try:
+      for path in metadata_paths:
+        url = base_url.rstrip("/") + path
+        resp = requests.get(url, timeout=3, verify=False, headers={"Metadata-Flavor": "Google"})
+        if resp.status_code == 200:
+          finding = f"VULNERABILITY: Cloud metadata endpoint exposed at {url}."
+          self.P(finding)
+          result += finding + "\n"
+    except Exception as e:
+      self.P(f"Web test error on port {port}: {e}")
+    return result
+
+
+  def _web_test_api_auth_bypass(self, target, port):
+    """Detect APIs that succeed despite invalid Authorization headers."""
+    result = ""
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}"
+    if port not in (80, 443):
+      base_url = f"{scheme}://{target}:{port}"
+    candidate_paths = ["/api/", "/api/health", "/api/status"]
+    try:
+      for path in candidate_paths:
+        url = base_url.rstrip("/") + path
+        resp = requests.get(
+          url,
+          timeout=3,
+          verify=False,
+          headers={"Authorization": "Bearer invalid-token"},
+        )
+        if resp.status_code in (200, 204):
+          finding = f"VULNERABILITY: API endpoint {url} accepts invalid Authorization header."
           self.P(finding)
           result += finding + "\n"
     except Exception as e:
