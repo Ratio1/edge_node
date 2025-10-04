@@ -18,6 +18,13 @@ Documentation sections:
 
 The Ratio1 Edge Node is a meta Operating System designed to operate on edge devices, providing them the essential functionality required to join and thrive within the Ratio1 network. Each Edge Node manages the device’s resources, executes computation tasks efficiently, and communicates securely with other nodes in the network. Leveraging the powerful Ratio1 core libraries (formely known as Naeural Edge Protocol libraries) `naeural_core` and `ratio1`— the Ratio1 Edge Node offers out-of-the-box usability starting in 2025. Users can deploy the Edge Node and SDK (`ratio1`) effortlessly without the need for intricate configurations, local subscriptions, tenants, user accounts, passwords, or broker setups.
 
+## Related Repositories
+
+- [ratio1/naeural_core](https://github.com/ratio1/naeural_core) provides the modular pipeline engine that powers data ingestion, processing, and serving inside this node. Extend or troubleshoot runtime behavior by mirroring the folder layout in `extensions/` against the upstream modules.
+- [Ratio1/ratio1_sdk](https://github.com/Ratio1/ratio1_sdk) is the client toolkit for building and dispatching jobs to Ratio1 nodes. Its tutorials pair with the workflows in `plugins/business/tutorials/` and are the best place to validate end-to-end scenarios.
+
+When developing custom logic, install the three repositories in the same virtual environment (`pip install -e . ../naeural_core ../ratio1_sdk`) so interface changes remain consistent across the stack.
+
 ## Running the Edge Node
 
 > Note on requirements: the minimal hardware requirements to run a Ratio1 Edge Node are a 64-bit CPU, 6GB of RAM, 2 cores (vCores just fine) and 10GB of storage. The Edge Node is compatible with Linux, Windows, and macOS operating systems. Make sure you have Docker installed on your machine before proceeding so for Windows and Mac probably you will need to install Docker Desktop.
@@ -129,6 +136,26 @@ will result in a result such as:
   }
 }
 ```
+
+## Developing With the Ratio1 SDK
+
+The [Ratio1 SDK](https://github.com/Ratio1/ratio1_sdk) is the recommended way to build, test, and ship workloads to your node. Install it alongside the edge node source:
+
+```bash
+pip install -e ../ratio1_sdk
+```
+
+- Use the `nepctl` (formerly `r1ctl`) CLI that ships with the SDK to inspect the network, configure clients, and dispatch jobs.
+- Explore `ratio1_sdk/tutorials/` for end-to-end examples; most have matching runtime counterparts in `plugins/business/tutorials/` inside this repository.
+- SDK releases 2.6+ perform automatic dAuth configuration. After whitelisting your client, you can submit jobs without additional secrets.
+
+## Extending Pipelines With naeural_core
+
+Edge node execution relies on the [ratio1/naeural_core](https://github.com/ratio1/naeural_core) package. When building custom data sources or business logic:
+
+- Mirror the structure of `naeural_core` modules (`data`, `serving`, `business`, etc.) under `extensions/` so plugin discovery stays consistent.
+- Develop and run unit tests in the cloned `naeural_core` repository before importing the new module here; its abstractions (`manager.Manager`, `CustomPluginTemplate`, etc.) define the contracts used by `device.py`.
+- Keep configuration defaults in sync by reusing `naeural_core/constants.py` values or extending them via local `CONFIG` dictionaries.
 
 ## Inspecting the node performance
 
