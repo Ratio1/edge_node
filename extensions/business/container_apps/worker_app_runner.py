@@ -79,6 +79,8 @@ _CONFIG = {
 
   # Docker image monitoring
   "IMAGE_POLL_INTERVAL": 300,  # seconds between Docker image checks
+  "AUTOUPDATE": True,
+  "AUTOUPDATE_INTERVAL": 300,
 
   "POLL_COUNT": 0,
 
@@ -131,15 +133,22 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
 
   def on_init(self):
+    self.__reset_vars()
+
     super(WorkerAppRunnerPlugin, self).on_init()
 
-    self.__reset_vars()
+    self.container_start_time = self.time()
+
+    if not self._login_to_registry():
+      raise RuntimeError("Failed to login to container registry. Cannot proceed without authentication.")
 
     self.reset_tunnel_engine()
 
     self._set_default_branch()
-    self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._configure_dynamic_env() # setup dynamic env vars for the container
+    self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
+    self._configure_volumes() # setup container volumes
+    self._setup_env_and_ports()  # setup default env/port mappings
     self._configure_repo_url()
 
     self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
@@ -236,6 +245,7 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self.log_thread = None
     self._stop_event = threading.Event()
     self.extra_ports_mapping = {}
+    self.inverted_ports_mapping = {}
     self.volumes = {}
     self.dynamic_env = {}
 
@@ -277,7 +287,27 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
   def _configure_repo_url(self):
     # TODO: support other git providers
     vcs_data = self.cfg_vcs_data or {}
-    self.repo_url = f"https://{vcs_data.get('USERNAME')}:{vcs_data.get('TOKEN')}@github.com/{vcs_data.get('REPO_OWNER')}/{vcs_data.get('REPO_NAME')}.git"
+    repo_owner = vcs_data.get('REPO_OWNER')
+    repo_name = vcs_data.get('REPO_NAME')
+    username = vcs_data.get('USERNAME')
+    token = vcs_data.get('TOKEN')
+
+    if not repo_owner or not repo_name:
+      self.repo_url = None
+      return
+
+    auth_segment = ""
+    if username and token:
+      auth_segment = f"{username}:{token}@"
+    elif token and not username:
+      auth_segment = f"{token}@"
+    elif username and not token:
+      auth_segment = f"{username}@"
+
+    if auth_segment:
+      self.repo_url = f"https://{auth_segment}github.com/{repo_owner}/{repo_name}.git"
+    else:
+      self.repo_url = f"https://github.com/{repo_owner}/{repo_name}.git"
     return
 
   def _set_default_branch(self):
@@ -303,28 +333,15 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def start_container(self):
     """Start the Docker container without running build or app commands."""
+    self._setup_env_and_ports()
+
     self.P(f"Launching container with image '{self.cfg_image}'...")
     # Run the base container in detached mode with a long-running sleep so it stays alive
 
-    # todo: move these operations to a separate method, to prepare the container config
-    # Ports mapping
-    ports_mapping = self.extra_ports_mapping.copy() if self.extra_ports_mapping else {}
-    if self.cfg_port and self.port:
-      ports_mapping[self.port] = self.cfg_port
-
-    inverted_ports_mapping = {f"{v}/tcp": k for k, v in ports_mapping.items()}
-
-    # Volumes mapping (if any)
-
-    # Environment variables
-    env = self.cfg_env.copy() if self.cfg_env else {}
-    if self.dynamic_env:
-      env.update(self.dynamic_env)
-
     self.P(f"Container data:")
     self.P(f"  Image: {self.cfg_image}")
-    self.P(f"  Ports: {self.json_dumps(inverted_ports_mapping) if inverted_ports_mapping else 'None'}")
-    self.P(f"  Env: {self.json_dumps(env) if env else 'None'}")
+    self.P(f"  Ports: {self.json_dumps(self.inverted_ports_mapping) if self.inverted_ports_mapping else 'None'}")
+    self.P(f"  Env: {self.json_dumps(self.env) if self.env else 'None'}")
     self.P(f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}")
     self.P(f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}")
     self.P(f"  Restart policy: {self.cfg_restart_policy}")
@@ -335,8 +352,9 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.cfg_image,
       command=["sh", "-c", "while true; do sleep 3600; done"],
       detach=True,
-      ports=inverted_ports_mapping,
-      environment=env,
+      ports=self.inverted_ports_mapping,
+      environment=self.env,
+      volumes=self.volumes or None,
     )
     self.container_id = self.container.short_id
     self.P(f"Container started (ID: {self.container.short_id})", color='g')
@@ -415,9 +433,15 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
     self.__reset_vars()
     self._set_default_branch()
-    self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._configure_dynamic_env() # setup dynamic env vars for the container
+    self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
+    self._configure_volumes() # setup container volumes
+    self._setup_env_and_ports()  # setup default env/port mappings
     self._configure_repo_url()
+
+    # Re-authenticate with the registry if credentials are provided
+    if not self._login_to_registry():
+      self.P("Warning: registry login failed during restart; continuing with existing credentials", color='y')
 
     return self._launch_container_app()
 
@@ -634,9 +658,15 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
 
   def _check_image_updates(self, current_time=None):
     """Check for a new version of the Docker image and restart container if found."""
+    if not getattr(self, 'cfg_autoupdate', True):
+      return
+
     if not current_time:
       current_time = self.time()
-    if current_time - self._last_image_check >= self.cfg_image_poll_interval:
+
+    interval = getattr(self, 'cfg_autoupdate_interval', getattr(self, 'cfg_image_poll_interval', 300))
+
+    if current_time - self._last_image_check >= interval:
       self._last_image_check = current_time
       latest_image_hash = self._get_latest_image_hash()
       if latest_image_hash and self.current_image_hash and latest_image_hash != self.current_image_hash:
