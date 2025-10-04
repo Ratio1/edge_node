@@ -1,4 +1,8 @@
+import os
+import shutil
+import stat
 import sys
+import tempfile
 import types
 import unittest
 
@@ -74,6 +78,7 @@ def _install_dummy_base_plugin():
 _install_dummy_base_plugin()
 
 from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
+from extensions.business.container_apps import container_utils
 
 
 class WorkerAppRunnerConfigTests(unittest.TestCase):
@@ -83,6 +88,8 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     plugin.P = lambda *args, **kwargs: None
     from collections import deque
     plugin.deque = deque
+    plugin.os_path = os.path
+    plugin.os = os
     plugin.cfg_instance_id = "test_instance"
     plugin.uuid = lambda *a, **k: "abcd"
     plugin.time = lambda: 0
@@ -95,6 +102,13 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     plugin.cfg_autoupdate = True
     plugin.cfg_autoupdate_interval = 10
     plugin.cfg_image_poll_interval = 10
+    plugin.cfg_chainstore_response_key = None
+    plugin.cfg_chainstore_peers = []
+    plugin.volumes = {}
+    plugin.extra_ports_mapping = {}
+    plugin.inverted_ports_mapping = {}
+    plugin.log = types.SimpleNamespace(get_localhost_ip=lambda: "127.0.0.1")
+    plugin.bc = types.SimpleNamespace(eth_address="0x0", get_evm_network=lambda: "testnet")
     return plugin
 
   def test_configure_repo_url_public(self):
@@ -152,6 +166,23 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
 
     self.assertEqual(plugin.current_image_hash, "new")
     self.assertEqual(restart_calls, ["called"])
+
+  def test_configure_volumes_primary_path(self):
+    plugin = self._make_plugin()
+    plugin.cfg_volumes = {"/data": "/app/data"}
+
+    temp_dir = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+    volumes_base = os.path.join(temp_dir, "volumes")
+
+    with unittest.mock.patch.object(container_utils, "CONTAINER_VOLUMES_PATH", volumes_base):
+      plugin._configure_volumes()
+
+    self.assertEqual(len(plugin.volumes), 1)
+    host_path = next(iter(plugin.volumes.keys()))
+    self.assertTrue(host_path.startswith(volumes_base))
+    self.assertTrue(os.path.isdir(host_path))
+    self.assertEqual(stat.S_IMODE(os.stat(host_path).st_mode), 0o777)
 
 
 if __name__ == "__main__":
