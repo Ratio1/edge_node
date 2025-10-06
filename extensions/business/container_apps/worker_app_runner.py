@@ -213,12 +213,11 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
       self.P(f"Unknown plugin command: {data}")
     return
 
-  def _on_config(self):
-    self.Pd("Received an updated config for WorkerAppRunner")
-    self._stop_container_and_save_logs_to_disk()
-    self._restart_from_scratch()
+  def on_config(self, *args, **kwargs):
+    return self._handle_config_restart(self._restart_from_scratch)
 
-    return
+  def _on_config(self):
+    return self.on_config()
 
   def __reset_vars(self):
     """Reset internal state variables."""
@@ -315,19 +314,22 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     vcs_data = self.cfg_vcs_data or {}
     repo_owner = vcs_data.get('REPO_OWNER')
     repo_name = vcs_data.get('REPO_NAME')
+    repo_branch = vcs_data.get('BRANCH')
+    self.branch = None
     
-    if repo_owner and repo_name:
-      try:
-        resp = self._get_latest_commit(return_data=True)
-        if resp is not None:
-          _, data = resp
-          self.P(f"Repository info:\n {json.dumps(data, indent=2)}", color='b')
-          self.branch = data.get("default_branch", None)
-          self.P(f"Default branch for {repo_owner}/{repo_name} is '{self.branch}'", color='y')
-      except Exception as e:
-        self.P(f"[WARN] Could not determine default branch: {e}")
+    if repo_branch is None:
+      if repo_owner and repo_name:
+        try:
+          resp = self._get_latest_commit(return_data=True)
+          if resp is not None:
+            _, data = resp
+            self.P(f"Repository info:\n {json.dumps(data, indent=2)}", color='b')
+            self.branch = data.get("default_branch", None)
+            self.P(f"Default branch for {repo_owner}/{repo_name} is '{self.branch}'", color='y')
+        except Exception as e:
+          self.P(f"[WARN] Could not determine default branch: {e}")
     if not self.branch:
-      self.branch = vcs_data.get('BRANCH', "main")  # Use VCS_DATA branch or fallback to 'main'
+      self.branch = repo_branch or "main"  # Use VCS_DATA branch or fallback to 'main'
     return
 
 
@@ -432,11 +434,12 @@ class WorkerAppRunnerPlugin(BasePlugin, _ContainerUtilsMixin):
     self._stop_event.clear()  # reset stop flag for new log thread
 
     self.__reset_vars()
-    self._set_default_branch()
     self._configure_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._configure_volumes() # setup container volumes
     self._setup_env_and_ports()  # setup default env/port mappings
+    
+    self._set_default_branch()
     self._configure_repo_url()
 
     # Re-authenticate with the registry if credentials are provided

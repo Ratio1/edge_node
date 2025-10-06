@@ -261,12 +261,9 @@ class ContainerAppRunnerPlugin(
       self.P(f"Unknown plugin command: {data}")
     return
 
-  def _on_config(self):
-    self.Pd("Received an updated config for ContainerAppRunner")
-    self._stop_container_and_save_logs_to_disk()
-    self._restart_container()
+  def on_config(self, *args, **kwargs):
+    return self._handle_config_restart(self._restart_container)
 
-    return
 
   def on_post_container_start(self):
     """

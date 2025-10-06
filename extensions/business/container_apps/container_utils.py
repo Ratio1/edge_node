@@ -16,6 +16,13 @@ class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
   
+  def _handle_config_restart(self, restart_callable):
+    """Common handler to restart container instances when configuration changes."""
+    self.P(f"Received an updated config for {self.__class__.__name__}")
+    self._stop_container_and_save_logs_to_disk()
+    restart_callable()
+    return
+  
   def _get_cr_data(self):
     """
     Helper method to extract container registry data from configuration.

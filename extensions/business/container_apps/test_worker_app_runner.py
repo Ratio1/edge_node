@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 
 
 class _DummyBasePlugin:
@@ -79,6 +80,7 @@ _install_dummy_base_plugin()
 
 from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
 from extensions.business.container_apps import container_utils
+from extensions.business.container_apps.container_app_runner import ContainerAppRunnerPlugin
 
 
 class WorkerAppRunnerConfigTests(unittest.TestCase):
@@ -104,6 +106,7 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     plugin.cfg_image_poll_interval = 10
     plugin.cfg_chainstore_response_key = None
     plugin.cfg_chainstore_peers = []
+    plugin.cfg_car_verbose = 10
     plugin.volumes = {}
     plugin.extra_ports_mapping = {}
     plugin.inverted_ports_mapping = {}
@@ -183,6 +186,74 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     self.assertTrue(host_path.startswith(volumes_base))
     self.assertTrue(os.path.isdir(host_path))
     self.assertEqual(stat.S_IMODE(os.stat(host_path).st_mode), 0o777)
+
+  def test_on_config_triggers_restart(self):
+    plugin = self._make_plugin()
+    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
+         mock.patch.object(plugin, "_restart_from_scratch") as restart_mock:
+      plugin.on_config()
+
+    stop_mock.assert_called_once()
+    restart_mock.assert_called_once()
+
+  def test__on_config_aliases_to_on_config(self):
+    plugin = self._make_plugin()
+    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
+         mock.patch.object(plugin, "_restart_from_scratch") as restart_mock:
+      plugin._on_config()
+
+    stop_mock.assert_called_once()
+    restart_mock.assert_called_once()
+
+
+class ContainerAppRunnerConfigTests(unittest.TestCase):
+
+  def _make_plugin(self):
+    plugin = ContainerAppRunnerPlugin.__new__(ContainerAppRunnerPlugin)
+    plugin.P = lambda *args, **kwargs: None
+    from collections import deque
+    plugin.deque = deque
+    plugin.os_path = os.path
+    plugin.os = os
+    plugin.cfg_instance_id = "car_instance"
+    plugin.uuid = lambda *a, **k: "efgh"
+    plugin.time = lambda: 0
+    plugin.cfg_max_log_lines = 10
+    plugin.cfg_env = {}
+    plugin.cfg_dynamic_env = {}
+    plugin.cfg_container_resources = {}
+    plugin.cfg_volumes = {}
+    plugin.cfg_port = None
+    plugin.cfg_autoupdate = True
+    plugin.cfg_autoupdate_interval = 10
+    plugin.cfg_image_poll_interval = 10
+    plugin.cfg_chainstore_response_key = None
+    plugin.cfg_chainstore_peers = []
+    plugin.cfg_car_verbose = 10
+    plugin.volumes = {}
+    plugin.extra_ports_mapping = {}
+    plugin.inverted_ports_mapping = {}
+    plugin.log = types.SimpleNamespace(get_localhost_ip=lambda: "127.0.0.1")
+    plugin.bc = types.SimpleNamespace(eth_address="0x0", get_evm_network=lambda: "testnet")
+    return plugin
+
+  def test_on_config_triggers_restart(self):
+    plugin = self._make_plugin()
+    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
+         mock.patch.object(plugin, "_restart_container") as restart_mock:
+      plugin.on_config()
+
+    stop_mock.assert_called_once()
+    restart_mock.assert_called_once()
+
+  def test__on_config_aliases_to_on_config(self):
+    plugin = self._make_plugin()
+    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
+         mock.patch.object(plugin, "_restart_container") as restart_mock:
+      plugin._on_config()
+
+    stop_mock.assert_called_once()
+    restart_mock.assert_called_once()
 
 
 if __name__ == "__main__":
