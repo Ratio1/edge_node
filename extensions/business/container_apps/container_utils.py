@@ -4,6 +4,7 @@ The utility mixin for container management used by ContainerAppRunnerPlugin
 
 """
 
+import os
 import subprocess
 import socket
 
@@ -14,6 +15,13 @@ CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
+  
+  def _handle_config_restart(self, restart_callable):
+    """Common handler to restart container instances when configuration changes."""
+    self.P(f"Received an updated config for {self.__class__.__name__}")
+    self._stop_container_and_save_logs_to_disk()
+    restart_callable()
+    return
   
   def _get_cr_data(self):
     """
@@ -286,12 +294,29 @@ class _ContainerUtilsMixin:
       self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
     return
 
+  def _set_directory_permissions(self, path, mode=0o777):
+    """Ensure directory permissions allow non-root container access."""
+    try:
+      os.chmod(path, mode)
+    except PermissionError:
+      self.P(
+        f"Permission denied when adjusting permissions for '{path}'. Container access may fail.",
+        color='y'
+      )
+    except OSError as exc:
+      self.P(
+        f"Failed to adjust permissions for '{path}': {exc}",
+        color='y'
+      )
+
   def _configure_volumes(self):
     """
     Processes the volumes specified in the configuration.
     """
     default_volume_rights = "rw"
     if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
+      os.makedirs(CONTAINER_VOLUMES_PATH, exist_ok=True)
+      self._set_directory_permissions(CONTAINER_VOLUMES_PATH)
       for host_path, container_path in self.cfg_volumes.items():
         original_path = str(host_path)
         sanitized_name = self.sanitize_name(original_path)
@@ -300,8 +325,21 @@ class _ContainerUtilsMixin:
         prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
         self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
 
-        full_host_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
-        self.volumes[full_host_path] = {"bind": container_path, "mode": default_volume_rights}
+        host_volume_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
+        try:
+          os.makedirs(host_volume_path, exist_ok=True)
+        except PermissionError as exc:
+          raise RuntimeError(
+            f"Insufficient permissions to create volume directory '{host_volume_path}': {exc}"
+          ) from exc
+        except OSError as exc:
+          raise RuntimeError(
+            f"Failed to prepare volume directory '{host_volume_path}': {exc}"
+          ) from exc
+
+        self._set_directory_permissions(host_volume_path)
+
+        self.volumes[host_volume_path] = {"bind": container_path, "mode": default_volume_rights}
 
       # endfor each host path
     # endif volumes
