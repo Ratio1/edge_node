@@ -10,6 +10,7 @@ This plugin:
 """
 
 import requests
+from urllib.parse import urlsplit
 
 from extensions.business.container_apps.container_app_runner import ContainerAppRunnerPlugin
 
@@ -31,8 +32,9 @@ _CONFIG = {
     "PROVIDER": "github",
     "USERNAME": None,
     "TOKEN": None,
-    "REPO_OWNER": None,
-    "REPO_NAME": None,
+    "REPO_OWNER": None,  # optional legacy support
+    "REPO_NAME": None,   # optional legacy support
+    "REPO_URL": None,
     "BRANCH": "main",
     "POLL_INTERVAL": 60,
   },
@@ -66,6 +68,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     self.repo_url = None
     self._last_git_check = 0
     self._repo_configured = False
+    self._repo_owner = None
+    self._repo_name = None
     return
 
   def _validate_subclass_config(self):
@@ -78,9 +82,12 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       raise ValueError("BUILD_AND_RUN_COMMANDS must contain at least one command for WorkerAppRunner")
 
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
-    for key in ('REPO_OWNER', 'REPO_NAME'):
-      if not vcs_data.get(key):
-        raise ValueError(f"VCS_DATA must include '{key}' for WorkerAppRunner")
+    owner, name = self._extract_repo_identifier(vcs_data)
+    if not owner or not name:
+      raise ValueError("VCS_DATA must provide a GitHub repository via REPO_URL or REPO_OWNER/REPO_NAME")
+
+    self._repo_owner = owner
+    self._repo_name = name
 
     poll_interval = vcs_data.get('POLL_INTERVAL', 60)
     try:
@@ -107,6 +114,10 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       return []
 
     self._ensure_repo_state()
+
+    if not self.repo_url:
+      self.P("Repository URL is not configured; skipping build/run commands", color='r')
+      return []
 
     repo_path = REPO_CLONE_PATH
     commands = [
@@ -179,35 +190,33 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
   def _configure_repo_url(self):
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
-    repo_owner = vcs_data.get('REPO_OWNER')
-    repo_name = vcs_data.get('REPO_NAME')
     username = vcs_data.get('USERNAME')
     token = vcs_data.get('TOKEN')
 
-    if not repo_owner or not repo_name:
+    owner = self._repo_owner
+    repo = self._repo_name
+
+    if not owner or not repo:
       self.repo_url = None
       return
 
-    auth_segment = ""
-    if username and token:
-      auth_segment = f"{username}:{token}@"
-    elif token and not username:
-      auth_segment = f"{token}@"
-    elif username and not token:
-      auth_segment = f"{username}@"
+    base_url = f"https://github.com/{owner}/{repo}.git"
 
-    base_url = f"github.com/{repo_owner}/{repo_name}.git"
-    if auth_segment:
-      self.repo_url = f"https://{auth_segment}{base_url}"
+    if username and token:
+      self.repo_url = f"https://{username}:{token}@github.com/{owner}/{repo}.git"
+    elif token and not username:
+      self.repo_url = f"https://{token}@github.com/{owner}/{repo}.git"
+    elif username and not token:
+      self.repo_url = f"https://{username}@github.com/{owner}/{repo}.git"
     else:
-      self.repo_url = f"https://{base_url}"
+      self.repo_url = base_url
     return
 
   def _set_default_branch(self):
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
     repo_branch = vcs_data.get('BRANCH')
-    repo_owner = vcs_data.get('REPO_OWNER')
-    repo_name = vcs_data.get('REPO_NAME')
+    repo_owner = self._repo_owner or vcs_data.get('REPO_OWNER')
+    repo_name = self._repo_name or vcs_data.get('REPO_NAME')
 
     self.branch = repo_branch or self.branch
 
@@ -228,8 +237,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
   def _get_latest_commit(self, return_data=False):
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
-    repo_owner = vcs_data.get('REPO_OWNER')
-    repo_name = vcs_data.get('REPO_NAME')
+    repo_owner = self._repo_owner or vcs_data.get('REPO_OWNER')
+    repo_name = self._repo_name or vcs_data.get('REPO_NAME')
     token = vcs_data.get('TOKEN')
 
     if not repo_owner or not repo_name:
@@ -265,3 +274,32 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       self.P(f"Unexpected error while fetching latest commit: {exc}", color='r')
 
     return (None, None) if return_data else None
+
+  # --- Helpers ---------------------------------------------------------------
+
+  def _extract_repo_identifier(self, vcs_data):
+    """Derive repository owner and name from VCS configuration."""
+    repo_url = vcs_data.get('REPO_URL')
+    owner = vcs_data.get('REPO_OWNER')
+    name = vcs_data.get('REPO_NAME')
+
+    if owner and name:
+      return owner, name
+
+    if not repo_url:
+      return owner, name
+
+    try:
+      parsed = urlsplit(repo_url)
+      path = parsed.path or ""
+      path = path.strip('/')
+      if path.endswith('.git'):
+        path = path[:-4]
+      segments = [segment for segment in path.split('/') if segment]
+      if len(segments) >= 2:
+        owner = segments[0]
+        name = segments[1]
+    except Exception as exc:
+      self.Pd(f"Failed to parse REPO_URL '{repo_url}': {exc}", score=5, color='y')
+
+    return owner, name
