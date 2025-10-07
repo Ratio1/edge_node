@@ -146,7 +146,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     else:
       if not self.current_commit:
         self.current_commit = latest_commit
-      self.P(f"Latest commit on {self.branch}: {latest_commit}", color='d')
+      self.P(f"Commit check ({self.branch}): {latest_commit}", color='d')
     return
 
   # --- Git helpers -----------------------------------------------------------
@@ -244,7 +244,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     headers = {"Authorization": f"token {token}"} if token else {}
 
     try:
-      self.P(f"Commit check: {api_url}", color='b')
+      self.Pd(f"Commit check URL: {api_url}", score=5, color='b')
       resp = requests.get(api_url, headers=headers, timeout=10)
 
       if resp.status_code == 200:
