@@ -5,7 +5,6 @@ The utility mixin for container management used by ContainerAppRunnerPlugin
 """
 
 import os
-import subprocess
 import socket
 
 # Path for container volumes

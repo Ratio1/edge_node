@@ -62,6 +62,8 @@ _CONFIG = {
 
   # Container-specific config options
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"
+  "CONTAINER_START_COMMAND": None,  # Optional command list executed when launching the container
+  "BUILD_AND_RUN_COMMANDS": [],     # Optional commands executed inside the running container
   "CR_DATA": {              # dict of container registry data
     "SERVER": 'docker.io',  # Optional container registry URL
     "USERNAME": None,       # Optional registry username
@@ -160,6 +162,7 @@ class ContainerAppRunnerPlugin(
 
     # Log streaming
     self.log_thread = None
+    self.exec_threads = []
     self._stop_event = threading.Event()
 
     # Container start time tracking
@@ -172,6 +175,68 @@ class ContainerAppRunnerPlugin(
     # Image update tracking
     self.current_image_hash = None
 
+    # Command execution state
+    self._commands_started = False
+
+    self._after_reset()
+
+    return
+
+  def _after_reset(self):
+    """Hook for subclasses to reset additional state."""
+    return
+
+  def _normalize_container_command(self, value, *, field_name):
+    """Normalize a container command into a Docker-compatible representation."""
+    if value is None:
+      return None
+
+    if isinstance(value, str):
+      normalized = value.strip()
+      return normalized or None
+
+    if isinstance(value, (list, tuple)):
+      command = [str(part).strip() for part in value]
+      if not all(command):
+        raise ValueError(f"{field_name} entries must be non-empty strings")
+      return command
+
+    raise ValueError(f"{field_name} must be None, a string, or a list/tuple of strings")
+
+  def _normalize_command_sequence(self, value, *, field_name):
+    """Normalize build/run command sequences into a list of shell fragments."""
+    if value is None:
+      return []
+
+    if isinstance(value, str):
+      normalized = value.strip()
+      return [normalized] if normalized else []
+
+    if isinstance(value, (list, tuple)):
+      commands = [str(cmd).strip() for cmd in value if str(cmd).strip()]
+      if len(commands) != len(value):
+        raise ValueError(f"{field_name} entries must be non-empty strings")
+      return commands
+
+    raise ValueError(f"{field_name} must be a string or an iterable of strings")
+
+  def _validate_runner_config(self):
+    """Validate configuration and prepare normalized command data."""
+    self._start_command = self._normalize_container_command(
+      getattr(self, 'cfg_container_start_command', None),
+      field_name='CONTAINER_START_COMMAND',
+    )
+
+    self._build_commands = self._normalize_command_sequence(
+      getattr(self, 'cfg_build_and_run_commands', None),
+      field_name='BUILD_AND_RUN_COMMANDS',
+    )
+
+    self._validate_subclass_config()
+    return
+
+  def _validate_subclass_config(self):
+    """Hook for subclasses to enforce additional validation."""
     return
 
   def on_init(self):
@@ -199,6 +264,8 @@ class ContainerAppRunnerPlugin(
     self._configure_volumes() # setup container volumes
 
     self._setup_env_and_ports()
+
+    self._validate_runner_config()
 
     return
 
@@ -317,16 +384,22 @@ class ContainerAppRunnerPlugin(
     self.P(f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}")
     self.P(f"  Restart policy: {self.cfg_restart_policy}")
     self.P(f"  Pull policy: {self.cfg_image_pull_policy}")
+    self.P(f"  Start command: {self._start_command if self._start_command else 'Image default'}")
 
     try:
-      self.container = self.docker_client.containers.run(
-        self.cfg_image,
+      run_kwargs = dict(
         detach=True,
         ports=self.inverted_ports_mapping,
         environment=self.env,
         volumes=self.volumes,
-        # restart_policy={"Name": self.cfg_restart_policy} if self.cfg_restart_policy != "no" else None,
         name=self.container_name,
+      )
+      if self._start_command:
+        run_kwargs['command'] = self._start_command
+
+      self.container = self.docker_client.containers.run(
+        self.cfg_image,
+        **run_kwargs,
       )
     except Exception as e:
       self.P(f"Could not start container: {e}", color='r')
@@ -394,6 +467,80 @@ class ContainerAppRunnerPlugin(
     # end try
     return
 
+  def _start_container_log_stream(self):
+    """Start following container logs if not already streaming."""
+    if not self.container:
+      return
+
+    if self.log_thread and self.log_thread.is_alive():
+      return
+
+    try:
+      log_stream = self.container.logs(stream=True, follow=True)
+      self.log_thread = threading.Thread(
+        target=self._stream_logs,
+        args=(log_stream,),
+        daemon=True,
+      )
+      self.log_thread.start()
+    except Exception as exc:
+      self.P(f"Could not start container log stream: {exc}", color='r')
+    return
+
+  def _collect_exec_commands(self):
+    """Return the list of commands to execute inside the container."""
+    return list(self._build_commands) if getattr(self, '_build_commands', None) else []
+
+  def _compose_exec_shell(self, commands):
+    """Compose a shell command string out of the command fragments."""
+    if not commands:
+      return None
+    return " && ".join(commands)
+
+  def _run_container_exec(self, shell_cmd):
+    """Run a shell command inside the container and stream its output."""
+    if not self.container or not shell_cmd:
+      return
+
+    try:
+      self.P(f"Running container exec command: {shell_cmd}", color='b')
+      exec_result = self.container.exec_run(
+        ["sh", "-c", shell_cmd],
+        stream=True,
+        detach=False,
+      )
+      thread = threading.Thread(
+        target=self._stream_logs,
+        args=(exec_result.output,),
+        daemon=True,
+      )
+      thread.start()
+      self.exec_threads.append(thread)
+    except Exception as exc:
+      self.P(f"Container exec command failed: {exc}", color='r')
+      self._commands_started = False
+    return
+
+  def _maybe_execute_build_and_run(self):
+    """Execute configured build/run commands if necessary."""
+    if self._commands_started:
+      return
+
+    if not self.container:
+      return
+
+    commands = self._collect_exec_commands()
+    if not commands:
+      return
+
+    shell_cmd = self._compose_exec_shell(commands)
+    if not shell_cmd:
+      return
+
+    self._commands_started = True
+    self._run_container_exec(shell_cmd)
+    return
+
   def _check_health_endpoint(self, current_time=None):
     if not self.container or not self.cfg_endpoint_url or self.cfg_endpoint_poll_interval <= 0:
       return
@@ -437,7 +584,11 @@ class ContainerAppRunnerPlugin(
         # Refresh container status
         self.container.reload()
         if self.container.status != "running":
-          self.P(f"Container stopped unexpectedly (exit code {self.container.attrs.get('State', {}).get('ExitCode')})", color='r')
+          self.P(
+            f"Container stopped unexpectedly (exit code {self.container.attrs.get('State', {}).get('ExitCode')})",
+            color='r'
+          )
+          self._commands_started = False
           return False
         # end if container not running
       # end if self.container
@@ -445,6 +596,7 @@ class ContainerAppRunnerPlugin(
     except Exception as e:
       self.P(f"Could not check container status: {e}", color='r')
       self.container = None
+      self._commands_started = False
     # end try
     return False
 
@@ -462,6 +614,16 @@ class ContainerAppRunnerPlugin(
     self._stop_event.set()
     if self.log_thread:
       self.log_thread.join(timeout=5)
+      self.log_thread = None
+
+    if getattr(self, 'exec_threads', None):
+      for thread in self.exec_threads:
+        if thread and thread.is_alive():
+          thread.join(timeout=5)
+      self.exec_threads = []
+
+    self._stop_event = threading.Event()
+    self._commands_started = False
 
     # Stop tunnel engine if needed
     self.stop_tunnel_engine()
@@ -592,46 +754,36 @@ class ContainerAppRunnerPlugin(
     """Restart the container from scratch."""
     self.P("Restarting container from scratch...", color='b')
     self._stop_container_and_save_logs_to_disk()
-    # Start a new container
-    self._stop_event.clear()  # reset stop flag for new log thread
-
     self.__reset_vars()
+    self._configure_dynamic_env()
     self._setup_resource_limits_and_ports()
-    self._configure_dynamic_env() # setup dynamic env vars for the container
-    self._configure_volumes() # setup container volumes
-    self._setup_env_and_ports()  # re-setup env and ports
+    self._configure_volumes()
+    self._setup_env_and_ports()
+
+    self._validate_runner_config()
 
     self.container = self.start_container()
-    self.start_tunnel_engine()
-    self.container_start_time = self.time()
+    if not self.container:
+      return
 
-    # Start log streaming
-    if self.container:
-      self.log_thread = threading.Thread(
-        target=self._stream_logs,
-        args=(self.container.logs(stream=True, follow=True),),
-        daemon=True,
-      )
-      self.log_thread.start()
+    self.container_start_time = self.time()
+    self._start_container_log_stream()
+    self._maybe_execute_build_and_run()
     return
 
   def _handle_initial_launch(self):
     """Handle the initial container launch."""
     try:
       self.P("Initial container launch...", color='b')
-      # Initialize current image hash for update tracking
-      self.current_image_hash = self._get_latest_image_hash()
+      if self.cfg_autoupdate:
+        self.current_image_hash = self._get_latest_image_hash()
       self.container = self.start_container()
-      self.container_start_time = self.time()
+      if not self.container:
+        return
 
-      # Start log streaming
-      if self.container:
-        self.log_thread = threading.Thread(
-          target=self._stream_logs,
-          args=(self.container.logs(stream=True, follow=True),),
-          daemon=True,
-        )
-        self.log_thread.start()
+      self.container_start_time = self.time()
+      self._start_container_log_stream()
+      self._maybe_execute_build_and_run()
 
       self.P("Container launched successfully", color='g')
       self.P(self.container)
@@ -646,7 +798,13 @@ class ContainerAppRunnerPlugin(
     """Perform periodic monitoring tasks."""
     current_time = self.time()
     self._check_health_endpoint(current_time)
-    self._check_image_updates(current_time)
+    if self.cfg_autoupdate:
+      self._check_image_updates(current_time)
+    self._perform_additional_checks(current_time)
+    return
+
+  def _perform_additional_checks(self, current_time):
+    """Hook for subclasses to implement additional monitoring checks."""
     return
 
   def process(self):
@@ -677,6 +835,9 @@ class ContainerAppRunnerPlugin(
 
     if not self._check_container_status():
       return
+
+    self._start_container_log_stream()
+    self._maybe_execute_build_and_run()
 
     self._perform_periodic_monitoring()
     self.maybe_tunnel_engine_ping()
