@@ -3,7 +3,8 @@ from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
-  DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, DEEPLOY_RESOURCES
+  DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
+  DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS
 
 DEEPLOY_DEBUG = True
 
@@ -505,12 +506,43 @@ class _DeeployMixin:
       if job:
         job_owner = job.get('escrowOwner', None)
         is_valid = (sender == job_owner) if sender and job_owner else False
-        if debug:
-          self.P(f"Job {job_id} is paid:\n{self.json_dumps(job, indent=2)}")
-      else:
-        if debug:
-          self.P(f"Job {job_id} is not paid or does not exist.")
-      # endif
+        if is_valid:
+          job_type = job.get('jobType')
+          if job_type is None:
+            self.P(f"Job type missing or invalid for job {job_id}. Cannot validate resources.")
+            return False
+          #endif
+          expected_resources = JOB_TYPE_RESOURCE_SPECS.get(job_type)
+          if expected_resources is None:
+            self.P(f"No resource specs configured for job type {job_type}. Cannot validate resources.")
+            return False
+          #endif
+          if expected_resources:
+            required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+            requested_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU)
+            requested_memory = required_resources.get(DEEPLOY_RESOURCES.MEMORY)
+            expected_cpu = expected_resources.get(DEEPLOY_RESOURCES.CPU)
+            expected_memory = expected_resources.get(DEEPLOY_RESOURCES.MEMORY)
+            #TODO should also check disk and gpu
+            resources_match = (
+              requested_cpu is not None and
+              requested_memory is not None and
+              requested_cpu == expected_cpu and
+              requested_memory == expected_memory
+            )
+            if not resources_match:
+              self.P(
+                f"Requested resources {required_resources} do not match paid resources "
+                f"{expected_resources} for job type {job_type}."
+              )
+              is_valid = False
+            #endif resources match
+          #endif expected resources
+        # endif is valid
+      else: # job not found
+        self.P(f"Job {job_id} not found.")
+        is_valid = False
+      # endif job found
     except Exception as e:
       self.P(f"Error checking payment for job {job_id}: {e}")
       is_valid = False
