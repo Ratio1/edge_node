@@ -523,7 +523,7 @@ class _DeeployMixin:
             requested_memory = required_resources.get(DEEPLOY_RESOURCES.MEMORY)
             expected_cpu = expected_resources.get(DEEPLOY_RESOURCES.CPU)
             expected_memory = expected_resources.get(DEEPLOY_RESOURCES.MEMORY)
-            #TODO should also check disk and gpu
+            #TODO should also check disk and gpu as soon as they are supported and sent in the request
             resources_match = (
               requested_cpu is not None and
               requested_memory is not None and
