@@ -1,5 +1,6 @@
 from extensions.business.jeeves.jeeves_api import JeevesApiPlugin as BasePlugin
 from .keysoft_jeeves_constants import KeysoftJeevesConstants
+from extensions.business.jeeves.partners.keysoft.utils.pdf_parser import PDFParser
 
 
 _CONFIG = {
@@ -18,8 +19,12 @@ class KeysoftJeevesPlugin(BasePlugin):
   """
   A plugin which handles a Jeeves API web app hosted through FastAPI.
   """
-
   CONFIG = _CONFIG
+
+  def on_init(self):
+    super(KeysoftJeevesPlugin, self).on_init()
+    self.pdf_parser = PDFParser()
+    return
 
   def get_predefined_user_tokens(self):
     env_predefined_tokens_str = self.os_environ.get("EE_KEYSOFT_JEEVES_TOKENS") or ""
@@ -83,10 +88,56 @@ class KeysoftJeevesPlugin(BasePlugin):
         short_term_memory_only=True,
         **kwargs
       )
+    elif request_type == "parse_pdf":
+      return self.parse_pdf(
+        user_token=user_token,
+        pdf_base64=message,
+      )
     # endif request_type is not query, nlsql_query or chat
     return {
       "error": f"Unknown request_type: {request_type}. Supported types are: query, nlsql_query, chat."
     }
+
+  @BasePlugin.endpoint(method="post")
+  def parse_pdf(
+      self,
+      user_token: str,
+      pdf_base64: str,
+  ):
+    """
+    Parse a PDF file and return its text content.
+
+    Parameters
+    ----------
+    user_token : str
+        The user token to use for the API.
+    pdf_base64 : str
+        The base64-encoded PDF file content.
+
+    Returns
+    -------
+    dict
+        A dictionary containing the parsed text or an error message.
+    """
+    if not self.verify_user_token(user_token):
+      return self.invalid_token_response()
+    if not isinstance(pdf_base64, str) or not pdf_base64.strip():
+      return {
+        "error": "pdf_base64 must be a non-empty string."
+      }
+    # endif pdf_base64 is not a valid string
+
+    try:
+      records = self.pdf_parser.pdf_base64_to_dicts(pdf_base64)
+      # endif empty content
+      return {
+        "records": records
+      }
+    except Exception as e:
+      return {
+        "error": f"Failed to parse PDF: {str(e)}"
+      }
+    # endtry
 
   def compute_request_result_initial_ddl(
         self,
