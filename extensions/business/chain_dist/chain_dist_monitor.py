@@ -107,9 +107,13 @@ class ChainDistMonitorPlugin(BasePlugin):
             deeploy_specs = pipeline.get('deeploy_specs', {})
             if deeploy_specs.get('job_id') == job_id:
               running_nodes.append(node)
+            #endif
+          #endfor
+        #endfor
         
         # if we have running nodes, submit the update
-        if len(running_nodes):
+        is_job_to_be_closed = self.bc.get_first_closable_job_id() == job_id
+        if ((not is_job_to_be_closed) and len(running_nodes) > 0) or (is_job_to_be_closed and (len(running_nodes) == 0)):
           running_nodes_eth = [self.bc.node_address_to_eth_address(node) for node in running_nodes]
           running_nodes_eth = sorted(running_nodes_eth)
           self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes_eth}", verbosity=3)
@@ -117,6 +121,9 @@ class ChainDistMonitorPlugin(BasePlugin):
             job_id=job_id,
             nodes=running_nodes_eth,
           )
+        #endif
+      #endfor
+    #endif
     return
     
     
