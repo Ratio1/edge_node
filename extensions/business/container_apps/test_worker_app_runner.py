@@ -255,6 +255,90 @@ class ContainerAppRunnerConfigTests(unittest.TestCase):
     stop_mock.assert_called_once()
     restart_mock.assert_called_once()
 
+  def test_configure_file_volumes(self):
+    """Test FILE_VOLUMES feature creates files with correct content and mounts them."""
+    plugin = self._make_plugin()
+    plugin.cfg_file_volumes = {
+      "app_config": {
+        "content": "server_port=8080\ndebug=true",
+        "mounting_point": "/app/config/settings.conf"
+      },
+      "secret_key": {
+        "content": "my-secret-api-key-12345",
+        "mounting_point": "/etc/secrets/api.key"
+      }
+    }
+
+    temp_dir = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+    volumes_base = os.path.join(temp_dir, "volumes")
+
+    with unittest.mock.patch.object(container_utils, "CONTAINER_VOLUMES_PATH", volumes_base):
+      plugin._configure_file_volumes()
+
+    # Verify two file volumes were created
+    self.assertEqual(len(plugin.volumes), 2)
+    
+    # Check that files were created with correct content
+    for host_path, mount_config in plugin.volumes.items():
+      self.assertTrue(os.path.isfile(host_path))
+      
+      if mount_config["bind"] == "/app/config/settings.conf":
+        with open(host_path, 'r') as f:
+          content = f.read()
+        self.assertEqual(content, "server_port=8080\ndebug=true")
+        self.assertTrue(host_path.endswith("settings.conf"))
+      
+      elif mount_config["bind"] == "/etc/secrets/api.key":
+        with open(host_path, 'r') as f:
+          content = f.read()
+        self.assertEqual(content, "my-secret-api-key-12345")
+        self.assertTrue(host_path.endswith("api.key"))
+
+  def test_configure_file_volumes_empty_config(self):
+    """Test FILE_VOLUMES with empty config does nothing."""
+    plugin = self._make_plugin()
+    plugin.cfg_file_volumes = {}
+    
+    plugin._configure_file_volumes()
+    
+    self.assertEqual(len(plugin.volumes), 0)
+
+  def test_configure_file_volumes_missing_fields(self):
+    """Test FILE_VOLUMES handles missing fields gracefully."""
+    plugin = self._make_plugin()
+    plugin.cfg_file_volumes = {
+      "incomplete1": {
+        "content": "test"
+        # missing mounting_point
+      },
+      "incomplete2": {
+        "mounting_point": "/test/file.txt"
+        # missing content
+      },
+      "valid": {
+        "content": "valid content",
+        "mounting_point": "/valid/file.txt"
+      }
+    }
+
+    temp_dir = tempfile.mkdtemp()
+    self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
+    volumes_base = os.path.join(temp_dir, "volumes")
+
+    with unittest.mock.patch.object(container_utils, "CONTAINER_VOLUMES_PATH", volumes_base):
+      plugin._configure_file_volumes()
+
+    # Only the valid entry should be processed
+    self.assertEqual(len(plugin.volumes), 1)
+    
+    # Verify the valid file was created
+    host_path = next(iter(plugin.volumes.keys()))
+    self.assertTrue(os.path.isfile(host_path))
+    with open(host_path, 'r') as f:
+      content = f.read()
+    self.assertEqual(content, "valid content")
+
 
 if __name__ == "__main__":
   unittest.main()

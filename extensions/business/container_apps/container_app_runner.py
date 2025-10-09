@@ -5,6 +5,7 @@ A Ratio1 plugin to run a single Docker/Podman container and (if needed) expose i
 On-init:
   - CR login
   - Port allocation (optional)
+  - Volume configuration (including FILE_VOLUMES)
   - Container run
   - tunnel (optional)
  
@@ -17,6 +18,27 @@ On-close:
   - stop tunnel (if needed)
   - stop logs process
   - save logs to disk
+
+FILE_VOLUMES Feature:
+  Allows dynamic creation and mounting of files with specified content into containers.
+  
+  Example configuration:
+    FILE_VOLUMES = {
+      "app_config": {
+        "content": "server_port=8080\ndebug=true",
+        "mounting_point": "/app/config/settings.conf"
+      },
+      "secret_key": {
+        "content": "my-secret-api-key-12345",
+        "mounting_point": "/etc/secrets/api.key"
+      }
+    }
+  
+  The plugin will:
+    1. Extract filename from mounting_point (e.g., "settings.conf", "api.key")
+    2. Create a directory under /edge_node/_local_cache/_data/container_volumes/
+    3. Write the content to the file
+    4. Mount the file into the container at the specified mounting_point
 
 
 """
@@ -84,6 +106,7 @@ _CONFIG = {
   "AUTOUPDATE_INTERVAL": 100,
 
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
+  "FILE_VOLUMES": {},           # dict mapping host paths to file configs: {"host_path": {"content": "...", "mounting_point": "..."}}
 
   # Application endpoint polling
   "ENDPOINT_POLL_INTERVAL": 0,  # seconds between endpoint health checks
@@ -262,6 +285,7 @@ class ContainerAppRunnerPlugin(
     self._configure_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._configure_volumes() # setup container volumes
+    self._configure_file_volumes() # setup file volumes with dynamic content
 
     self._setup_env_and_ports()
 
@@ -758,6 +782,7 @@ class ContainerAppRunnerPlugin(
     self._configure_dynamic_env()
     self._setup_resource_limits_and_ports()
     self._configure_volumes()
+    self._configure_file_volumes()
     self._setup_env_and_ports()
 
     self._validate_runner_config()
