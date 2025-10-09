@@ -505,7 +505,8 @@ class _DeeployMixin:
       self.Pd(f"Job details: {self.json_dumps(job, indent=2)}")
       if job:
         job_owner = job.get('escrowOwner', None)
-        is_valid = (sender == job_owner) if sender and job_owner else False
+        start_timestamp = job.get('startTimestamp', None)
+        is_valid = (sender == job_owner) if sender and job_owner and (not start_timestamp) else False
         if is_valid:
           job_type = job.get('jobType')
           if job_type is None:
