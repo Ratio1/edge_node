@@ -38,7 +38,7 @@ from naeural_core.business.base import BasePluginExecutor as BasePlugin
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 
 
-__VER__ = '0.1.0.0'
+__VER__ = '0.2.0'
 
 _CONFIG = {
   # mandatory area
