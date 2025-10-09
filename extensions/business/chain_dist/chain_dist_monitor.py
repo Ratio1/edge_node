@@ -35,9 +35,10 @@ Epoch-end:
 
 """
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
+from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 
 
-__VER__ = '0.1.0.0'
+__VER__ = '0.2.0'
 
 _CONFIG = {
   # mandatory area
@@ -52,10 +53,16 @@ _CONFIG = {
   'PROCESS_DELAY' : 10,
 
   # Plugin Sleep period in case of an error.
-  'SLEEP_PERIOD' : 0.1,
+  'SLEEP_PERIOD' : 30,
+
+  # Random thresholds limits for delaying actions.
+  'MIN_THRESHOLD_REWARDS' : 1,
+  'MAX_THRESHOLD_REWARDS' : 100,
+  'MIN_THRESHOLD_CLOSE_JOB' : 1,
+  'MAX_THRESHOLD_CLOSE_JOB' : 250,
 }
 
-class ChainDistMonitorPlugin(BasePlugin):
+class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
 
   def Pd(self, s, *args, verbosity=0, **kwargs):
     """
@@ -69,6 +76,7 @@ class ChainDistMonitorPlugin(BasePlugin):
 
   def on_init(self):
     self.epochs_closed = {}
+    self.jobs_to_close = {}
     self.chainstore_hset(
       hkey='chain_dist_monitor',
       key=self.node_addr,
@@ -106,19 +114,23 @@ class ChainDistMonitorPlugin(BasePlugin):
             deeploy_specs = pipeline.get('deeploy_specs', {})
             if deeploy_specs.get('job_id') == job_id:
               running_nodes.append(node)
+            #endif
+          #endfor
+        #endfor
         
         # if we have running nodes, submit the update
-        if len(running_nodes):
+        is_job_to_be_closed = self.bc.get_first_closable_job_id() == job_id
+        if ((not is_job_to_be_closed) and len(running_nodes) > 0) or (is_job_to_be_closed and (len(running_nodes) == 0)):
           running_nodes_eth = [self.bc.node_address_to_eth_address(node) for node in running_nodes]
           running_nodes_eth = sorted(running_nodes_eth)
           self.P(f"Found {len(running_nodes)} running nodes for job {job_id}: {running_nodes_eth}", verbosity=3)
-          # time_blocked returns 0 if the update was delivered on the nr of seconds
-          # until the update is possible
-          time_blocked = self.bc.submit_node_update( 
+          self.bc.submit_node_update( 
             job_id=job_id,
             nodes=running_nodes_eth,
           )
-          # time_blocked will be used to postpone the state
+        #endif
+      #endfor
+    #endif
     return
     
     
@@ -132,26 +144,53 @@ class ChainDistMonitorPlugin(BasePlugin):
       # arbitrary online oracle get TOKEN
       
     # v2:
-    MIN_THRESHOLD = self.cfg_process_delay * 1    # 10 * 1 = 10 seconds
-    MAX_THRESHOLD = self.cfg_process_delay * 10   # 10 * 10 = 100 seconds
     last_epoch = self.netmon.epoch_manager.get_current_epoch() - 1
     if last_epoch not in self.epochs_closed:
       # epoch just closed we can start timer
+      delay = self.np.random.randint(self.cfg_min_threshold_rewards, self.cfg_max_threshold_rewards)
       self.epochs_closed[last_epoch] = {
         'epoch': last_epoch,
         'start_timer': self.time(),
         'rewards_distributed': False,
-        'delay' : self.np.random.randint(MIN_THRESHOLD, MAX_THRESHOLD)
+        'delay': delay
       }
+      self.P(f"Will try to distribute rewards for epoch {last_epoch} in {delay} seconds.")
         
     if not self.epochs_closed[last_epoch]['rewards_distributed']:
-      if self.bc.get_is_last_epoch_allocated():
-        self.epochs_closed[last_epoch]['rewards_distributed'] = True
-      elif (self.time() - self.epochs_closed[last_epoch]['start_timer']) > self.epochs_closed[last_epoch]['delay']:
-        self.bc.allocate_rewards_across_all_escrows()
-        self.epochs_closed[last_epoch]['rewards_distributed'] = True
+      if (self.time() - self.epochs_closed[last_epoch]['start_timer']) > self.epochs_closed[last_epoch]['delay']:
+        if self.bc.get_is_last_epoch_allocated():
+          self.epochs_closed[last_epoch]['rewards_distributed'] = True
+        else:
+          self.bc.allocate_rewards_across_all_escrows()
+          self.epochs_closed[last_epoch]['rewards_distributed'] = True
         #endif
       #endif
+    return
+  
+  def check_closable_jobs(self):
+    # check if there are any jobs that need to be closed with bc.get_first_closable_job_id (returns first job that can be closed or None)
+
+    closable_job_id = self.bc.get_first_closable_job_id()
+    if closable_job_id is None:
+      return
+
+    if closable_job_id not in self.jobs_to_close:
+      delay = self.np.random.randint(self.cfg_min_threshold_close_job, self.cfg_max_threshold_close_job)
+      self.jobs_to_close[closable_job_id] = {
+        'job_id': closable_job_id,
+        'start_timer': self.time(),
+        'job_closed': False,
+        'delay': delay
+      }
+      self.P(f"Will try to close job {closable_job_id} in {delay} seconds.")
+
+    if not self.jobs_to_close[closable_job_id]['job_closed']:
+      if (self.time() - self.jobs_to_close[closable_job_id]['start_timer']) > self.jobs_to_close[closable_job_id]['delay']:
+        self.delete_pipeline_from_nodes(job_id=closable_job_id)
+        self.bc.submit_node_update(job_id=closable_job_id, nodes=[])
+        self.jobs_to_close[closable_job_id]['job_closed'] = True
+      #endif
+    #endif
     return
   
   def maybe_update_liveness(self):
@@ -170,6 +209,7 @@ class ChainDistMonitorPlugin(BasePlugin):
     try:
       self.check_all_jobs()
       self.maybe_distribute_rewards()
+      self.check_closable_jobs()
       self.maybe_update_liveness()
     except Exception as e:
       self.P(f"Exception during process:\n{self.trace_info()}\nSleeping for {self.cfg_sleep_period} seconds.", color='r')

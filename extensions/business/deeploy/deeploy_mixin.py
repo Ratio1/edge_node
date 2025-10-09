@@ -490,7 +490,7 @@ class _DeeployMixin:
     return result
       
 
-  def deeploy_check_payment_and_job_owner(self, inputs, sender, debug=False):
+  def deeploy_check_payment_and_job_owner(self, inputs, sender, is_create, debug=False):
     """
     Check if the payment is valid for the given job.
     """
@@ -505,7 +505,10 @@ class _DeeployMixin:
       self.Pd(f"Job details: {self.json_dumps(job, indent=2)}")
       if job:
         job_owner = job.get('escrowOwner', None)
+        start_timestamp = job.get('startTimestamp', None)
         is_valid = (sender == job_owner) if sender and job_owner else False
+        if is_create and start_timestamp:
+          is_valid = False
         if is_valid:
           job_type = job.get('jobType')
           if job_type is None:
@@ -1133,3 +1136,62 @@ class _DeeployMixin:
     
     return netmon_job_ids
   
+  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None):
+    discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+
+    if len(discovered_instances) == 0:
+      msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for provided job_id/app_id and owner '{owner}'."
+      raise ValueError(msg)
+    #endif
+    for instance in discovered_instances:
+      self.P(f"Stopping pipeline '{instance[DEEPLOY_PLUGIN_DATA.APP_ID]}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
+      self.cmdapi_stop_pipeline(
+        node_address=instance[DEEPLOY_PLUGIN_DATA.NODE],
+        name=instance[DEEPLOY_PLUGIN_DATA.APP_ID],
+      )
+    #endfor each target node
+    return discovered_instances
+
+  def _get_online_apps(self, owner=None, target_nodes=None, job_id=None):
+    """
+    if self.cfg_deeploy_verbose:
+      full_data = self.netmon.network_known_nodes()
+      self.Pd(f"Full data:\n{self.json_dumps(full_data, indent=2)}")
+    pipelines = self.netmon.network_known_configs()
+    non_admin_pipelines = {
+      node : [x for x in pipelines[node] if x['NAME'].lower() != 'admin_pipeline']
+      for node in pipelines
+    }
+    result = {
+      'configs': non_admin_pipelines,
+      'details': self.netmon.network_known_apps(),
+    }
+
+    """
+    result = self.netmon.network_known_apps(target_nodes=target_nodes)
+    
+    # Count nodes and app instances
+    node_count = len(result)
+    total_pipelines = 0
+    
+    for node, pipelines in result.items():
+      total_pipelines += len(pipelines)
+    
+    self.Pd(f"Found {node_count} nodes with a total of {total_pipelines} pipelines")
+    if owner is not None:
+      filtered_result = self.defaultdict(dict)
+      for node, apps in result.items():
+        for app_name, app_data in apps.items():
+          if app_data[NetMonCt.OWNER] != owner:
+            continue
+          filtered_result[node][app_name] = app_data
+      result = filtered_result
+    if job_id is not None:
+      filtered_result = self.defaultdict(dict)
+      for node, apps in result.items():
+        for app_name, app_data in apps.items():
+          if app_data.get(ct.CONFIG_STREAM.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
+            continue
+          filtered_result[node][app_name] = app_data
+      result = filtered_result
+    return result

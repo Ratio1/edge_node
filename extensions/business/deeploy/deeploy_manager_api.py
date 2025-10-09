@@ -183,7 +183,7 @@ class DeeployManagerApiPlugin(
           raise ValueError(msg)
 
       # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
+      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
       if not is_valid:
         msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
         raise ValueError(msg)
@@ -415,7 +415,7 @@ class DeeployManagerApiPlugin(
       is_confirmable_job = inputs.chainstore_response
 
       # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
+      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, is_create=False, debug=self.cfg_deeploy_verbose > 1)
       if not is_valid:
         msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
         raise ValueError(msg)
@@ -501,24 +501,10 @@ class DeeployManagerApiPlugin(
       self.Pd(f"Called Deeploy delete_pipeline endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
-      
-      # TODO: move to the mixin when ready
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
 
-      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=sender)
-
-      if len(discovered_instances) == 0:
-        msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for provided job_id/app_id and owner '{sender}'."
-        raise ValueError(msg)
-      for instance in discovered_instances:
-        self.P(f"Stopping pipeline '{instance[DEEPLOY_PLUGIN_DATA.APP_ID]}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
-        self.cmdapi_stop_pipeline(
-          node_address=instance[DEEPLOY_PLUGIN_DATA.NODE],
-          name=instance[DEEPLOY_PLUGIN_DATA.APP_ID],
-        )
-      #endfor each target node
-
+      discovered_instances = self.delete_pipeline_from_nodes(app_id=app_id, job_id=job_id, owner=sender)
       request_payload = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
         DEEPLOY_KEYS.TARGETS: discovered_instances,
@@ -739,47 +725,3 @@ class DeeployManagerApiPlugin(
       self.__last_pipelines_check_time = self.time()
 
     return
-
-  def _get_online_apps(self, owner=None, target_nodes=None, job_id=None):
-    """
-    if self.cfg_deeploy_verbose:
-      full_data = self.netmon.network_known_nodes()
-      self.Pd(f"Full data:\n{self.json_dumps(full_data, indent=2)}")
-    pipelines = self.netmon.network_known_configs()
-    non_admin_pipelines = {
-      node : [x for x in pipelines[node] if x['NAME'].lower() != 'admin_pipeline']
-      for node in pipelines
-    }
-    result = {
-      'configs': non_admin_pipelines,
-      'details': self.netmon.network_known_apps(),
-    }
-
-    """
-    result = self.netmon.network_known_apps(target_nodes=target_nodes)
-    
-    # Count nodes and app instances
-    node_count = len(result)
-    total_pipelines = 0
-    
-    for node, pipelines in result.items():
-      total_pipelines += len(pipelines)
-    
-    self.Pd(f"Found {node_count} nodes with a total of {total_pipelines} pipelines")
-    if owner is not None:
-      filtered_result = self.defaultdict(dict)
-      for node, apps in result.items():
-        for app_name, app_data in apps.items():
-          if app_data[NetMonCt.OWNER] != owner:
-            continue
-          filtered_result[node][app_name] = app_data
-      result = filtered_result
-    if job_id is not None:
-      filtered_result = self.defaultdict(dict)
-      for node, apps in result.items():
-        for app_name, app_data in apps.items():
-          if app_data.get(ct.CONFIG_STREAM.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
-            continue
-          filtered_result[node][app_name] = app_data
-      result = filtered_result
-    return result
