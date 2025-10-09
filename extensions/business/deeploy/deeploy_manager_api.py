@@ -183,7 +183,7 @@ class DeeployManagerApiPlugin(
           raise ValueError(msg)
 
       # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
+      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
       if not is_valid:
         msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
         raise ValueError(msg)
@@ -415,7 +415,7 @@ class DeeployManagerApiPlugin(
       is_confirmable_job = inputs.chainstore_response
 
       # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, debug=self.cfg_deeploy_verbose > 1)
+      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, is_create=False, debug=self.cfg_deeploy_verbose > 1)
       if not is_valid:
         msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
         raise ValueError(msg)

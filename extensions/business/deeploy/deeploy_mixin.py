@@ -490,7 +490,7 @@ class _DeeployMixin:
     return result
       
 
-  def deeploy_check_payment_and_job_owner(self, inputs, sender, debug=False):
+  def deeploy_check_payment_and_job_owner(self, inputs, sender, is_create, debug=False):
     """
     Check if the payment is valid for the given job.
     """
@@ -506,7 +506,9 @@ class _DeeployMixin:
       if job:
         job_owner = job.get('escrowOwner', None)
         start_timestamp = job.get('startTimestamp', None)
-        is_valid = (sender == job_owner) if sender and job_owner and (not start_timestamp) else False
+        is_valid = (sender == job_owner) if sender and job_owner else False
+        if is_create and start_timestamp:
+          is_valid = False
         if is_valid:
           job_type = job.get('jobType')
           if job_type is None:
