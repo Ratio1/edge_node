@@ -35,6 +35,7 @@ Epoch-end:
 
 """
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
+from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 
 
 __VER__ = '0.1.0.0'
@@ -52,10 +53,16 @@ _CONFIG = {
   'PROCESS_DELAY' : 10,
 
   # Plugin Sleep period in case of an error.
-  'SLEEP_PERIOD' : 0.1,
+  'SLEEP_PERIOD' : 30,
+
+  # Random thresholds limits for delaying actions.
+  'MIN_THRESHOLD_REWARDS' : 1,
+  'MAX_THRESHOLD_REWARDS' : 100,
+  'MIN_THRESHOLD_CLOSE_JOB' : 1,
+  'MAX_THRESHOLD_CLOSE_JOB' : 250,
 }
 
-class ChainDistMonitorPlugin(BasePlugin):
+class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
 
   def Pd(self, s, *args, verbosity=0, **kwargs):
     """
@@ -137,12 +144,10 @@ class ChainDistMonitorPlugin(BasePlugin):
       # arbitrary online oracle get TOKEN
       
     # v2:
-    MIN_THRESHOLD = self.cfg_process_delay * 1    # 10 * 1 = 10 seconds
-    MAX_THRESHOLD = self.cfg_process_delay * 10   # 10 * 10 = 100 seconds
     last_epoch = self.netmon.epoch_manager.get_current_epoch() - 1
     if last_epoch not in self.epochs_closed:
       # epoch just closed we can start timer
-      delay = self.np.random.randint(MIN_THRESHOLD, MAX_THRESHOLD)
+      delay = self.np.random.randint(self.cfg_min_threshold_rewards, self.cfg_max_threshold_rewards)
       self.epochs_closed[last_epoch] = {
         'epoch': last_epoch,
         'start_timer': self.time(),
@@ -169,10 +174,8 @@ class ChainDistMonitorPlugin(BasePlugin):
     if closable_job_id is None:
       return
 
-    MIN_THRESHOLD = self.cfg_process_delay * 1    # 10 * 1 = 10 seconds
-    MAX_THRESHOLD = self.cfg_process_delay * 25   # 10 * 25 = 250 seconds
     if closable_job_id not in self.jobs_to_close:
-      delay = self.np.random.randint(MIN_THRESHOLD, MAX_THRESHOLD)
+      delay = self.np.random.randint(self.cfg_min_threshold_close_job, self.cfg_max_threshold_close_job)
       self.jobs_to_close[closable_job_id] = {
         'job_id': closable_job_id,
         'start_timer': self.time(),
@@ -183,7 +186,8 @@ class ChainDistMonitorPlugin(BasePlugin):
 
     if not self.jobs_to_close[closable_job_id]['job_closed']:
       if (self.time() - self.jobs_to_close[closable_job_id]['start_timer']) > self.jobs_to_close[closable_job_id]['delay']:
-        #TODO (Vitalii): close the job on the nodes, then submit_node_update with empty nodes list
+        self.delete_pipeline_from_nodes(job_id=closable_job_id)
+        self.bc.submit_node_update(job_id=closable_job_id, nodes=[])
         self.jobs_to_close[closable_job_id]['job_closed'] = True
       #endif
     #endif
