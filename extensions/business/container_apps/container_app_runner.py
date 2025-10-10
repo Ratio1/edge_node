@@ -292,7 +292,7 @@ class ContainerAppRunnerPlugin(
     self._validate_runner_config()
 
     self._extra_on_init()
-    self.P(f"{self.__class_.__name__} initialized (version {__VER__})", color='g')
+    self.P(f"{self.__class__.__name__} initialized (version {__VER__})", color='g')
     return
   
   def _extra_on_init(self):
