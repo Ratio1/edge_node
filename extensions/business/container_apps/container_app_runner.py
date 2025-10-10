@@ -291,6 +291,12 @@ class ContainerAppRunnerPlugin(
 
     self._validate_runner_config()
 
+    self._extra_on_init()
+    self.P(f"{self.__class_.__name__} initialized (version {__VER__})", color='g')
+    return
+  
+  def _extra_on_init(self):
+    """Hook for subclasses to perform additional initialization."""
     return
 
   def on_command(self, data, **kwargs):
@@ -826,6 +832,9 @@ class ContainerAppRunnerPlugin(
     if self.cfg_autoupdate:
       self._check_image_updates(current_time)
     self._perform_additional_checks(current_time)
+    
+    # if required:
+    #   self._restart_container()
     return
 
   def _perform_additional_checks(self, current_time):

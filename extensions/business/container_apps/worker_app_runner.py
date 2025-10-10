@@ -100,10 +100,9 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
     return
 
-  def on_init(self):
-    super(WorkerAppRunnerPlugin, self).on_init()
+  def _extra_on_init(self):
+    super()._extra_on_init()
     self._ensure_repo_state(initial=True)
-    self.P(f"WorkerAppRunnerPlugin initialized (version {__VER__})", color='g')
     return
 
   # --- Command orchestration -------------------------------------------------
@@ -124,6 +123,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       f"rm -rf {repo_path}",
       f"git clone {self.repo_url} {repo_path}",
     ]
+    # last_commit = commit
     commands.extend([f"cd {repo_path} && {cmd}" for cmd in base_commands])
     return commands
 
@@ -153,7 +153,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
         color='y',
       )
       self.current_commit = latest_commit
-      self._restart_container()
+      self._restart_container() # this should be in ContainerAppRunnerPlugin
     else:
       if not self.current_commit:
         self.current_commit = latest_commit
