@@ -4,7 +4,7 @@ The utility mixin for container management used by ContainerAppRunnerPlugin
 
 """
 
-import subprocess
+import os
 import socket
 
 # Path for container volumes
@@ -14,6 +14,13 @@ CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
+  
+  def _handle_config_restart(self, restart_callable):
+    """Common handler to restart container instances when configuration changes."""
+    self.P(f"Received an updated config for {self.__class__.__name__}")
+    self._stop_container_and_save_logs_to_disk()
+    restart_callable()
+    return
   
   def _get_cr_data(self):
     """
@@ -286,12 +293,29 @@ class _ContainerUtilsMixin:
       self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
     return
 
+  def _set_directory_permissions(self, path, mode=0o777):
+    """Ensure directory permissions allow non-root container access."""
+    try:
+      os.chmod(path, mode)
+    except PermissionError:
+      self.P(
+        f"Permission denied when adjusting permissions for '{path}'. Container access may fail.",
+        color='y'
+      )
+    except OSError as exc:
+      self.P(
+        f"Failed to adjust permissions for '{path}': {exc}",
+        color='y'
+      )
+
   def _configure_volumes(self):
     """
     Processes the volumes specified in the configuration.
     """
     default_volume_rights = "rw"
     if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
+      os.makedirs(CONTAINER_VOLUMES_PATH, exist_ok=True)
+      self._set_directory_permissions(CONTAINER_VOLUMES_PATH)
       for host_path, container_path in self.cfg_volumes.items():
         original_path = str(host_path)
         sanitized_name = self.sanitize_name(original_path)
@@ -300,11 +324,144 @@ class _ContainerUtilsMixin:
         prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
         self.P(f"  Converted '{original_path}' → named volume '{prefixed_name}'")
 
-        full_host_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
-        self.volumes[full_host_path] = {"bind": container_path, "mode": default_volume_rights}
+        host_volume_path = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
+        try:
+          os.makedirs(host_volume_path, exist_ok=True)
+        except PermissionError as exc:
+          raise RuntimeError(
+            f"Insufficient permissions to create volume directory '{host_volume_path}': {exc}"
+          ) from exc
+        except OSError as exc:
+          raise RuntimeError(
+            f"Failed to prepare volume directory '{host_volume_path}': {exc}"
+          ) from exc
+
+        self._set_directory_permissions(host_volume_path)
+
+        self.volumes[host_volume_path] = {"bind": container_path, "mode": default_volume_rights}
 
       # endfor each host path
     # endif volumes
+    return
+
+  def _configure_file_volumes(self):
+    """
+    Processes FILE_VOLUMES configuration to create files with specified content
+    and mount them into the container.
+    
+    FILE_VOLUMES format:
+      {
+        "logical_name": {
+          "content": "file content here...",
+          "mounting_point": "/container/path/to/filename.ext"
+        }
+      }
+    
+    The method will:
+      1. Extract filename from mounting_point
+      2. Create a directory under CONTAINER_VOLUMES_PATH
+      3. Write content to a file with the extracted filename
+      4. Add volume mapping to self.volumes
+    """
+    default_volume_rights = "rw"
+    
+    if not hasattr(self, 'cfg_file_volumes') or not self.cfg_file_volumes:
+      return
+    
+    if not isinstance(self.cfg_file_volumes, dict):
+      self.P("FILE_VOLUMES must be a dictionary, skipping file volume configuration", color='r')
+      return
+    
+    os.makedirs(CONTAINER_VOLUMES_PATH, exist_ok=True)
+    self._set_directory_permissions(CONTAINER_VOLUMES_PATH)
+    
+    for logical_name, file_config in self.cfg_file_volumes.items():
+      try:
+        # Validate file_config structure
+        if not isinstance(file_config, dict):
+          self.P(f"FILE_VOLUMES['{logical_name}'] must be a dict with 'content' and 'mounting_point', skipping", color='r')
+          continue
+        
+        content = file_config.get('content')
+        mounting_point = file_config.get('mounting_point')
+        
+        if content is None:
+          self.P(f"FILE_VOLUMES['{logical_name}'] missing 'content' field, skipping", color='r')
+          continue
+        
+        if not mounting_point:
+          self.P(f"FILE_VOLUMES['{logical_name}'] missing 'mounting_point' field, skipping", color='r')
+          continue
+        
+        # Extract filename from mounting_point
+        mounting_point = str(mounting_point)
+        path_parts = mounting_point.rstrip('/').split('/')
+        filename = path_parts[-1]
+        
+        if not filename:
+          self.P(f"FILE_VOLUMES['{logical_name}'] could not extract filename from mounting_point '{mounting_point}', skipping", color='r')
+          continue
+        
+        # Create sanitized directory for this file volume
+        sanitized_name = self.sanitize_name(str(logical_name))
+        prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
+        self.P(f"  Processing file volume '{logical_name}' → '{prefixed_name}/{filename}' → container '{mounting_point}'")
+        
+        # Create host directory
+        host_volume_dir = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
+        try:
+          os.makedirs(host_volume_dir, exist_ok=True)
+        except PermissionError as exc:
+          raise RuntimeError(
+            f"Insufficient permissions to create file volume directory '{host_volume_dir}': {exc}"
+          ) from exc
+        except OSError as exc:
+          raise RuntimeError(
+            f"Failed to prepare file volume directory '{host_volume_dir}': {exc}"
+          ) from exc
+        
+        self._set_directory_permissions(host_volume_dir)
+        
+        # Write content to file
+        host_file_path = self.os_path.join(host_volume_dir, filename)
+        try:
+          # Ensure content is a string
+          content_str = str(content)
+          with open(host_file_path, 'w', encoding='utf-8') as f:
+            f.write(content_str)
+          self.P(f"    Created file: {host_file_path} ({len(content_str)} chars)")
+          
+          # Set file permissions (readable by all, writable by owner)
+          try:
+            os.chmod(host_file_path, 0o644)
+          except (PermissionError, OSError) as exc:
+            self.P(f"    Warning: Could not set permissions for '{host_file_path}': {exc}", color='y')
+          
+        except PermissionError as exc:
+          raise RuntimeError(
+            f"Insufficient permissions to write file '{host_file_path}': {exc}"
+          ) from exc
+        except OSError as exc:
+          raise RuntimeError(
+            f"Failed to write file '{host_file_path}': {exc}"
+          ) from exc
+        
+        # Add volume mapping (file-level mount)
+        self.volumes[host_file_path] = {
+          "bind": mounting_point,
+          "mode": default_volume_rights
+        }
+        self.P(f"    Mapped: {host_file_path} → {mounting_point}", color='g')
+        
+      except Exception as exc:
+        self.P(
+          f"Error configuring file volume '{logical_name}': {exc}",
+          color='r'
+        )
+        # Continue processing other file volumes
+        continue
+    
+    # endfor each file volume
     return
 
 

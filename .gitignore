@@ -181,3 +181,6 @@ blur_debugger/blur_debugger_draw__BLUR_DEBUGGER_DRAW_STEP__Tracking/
 *.parquet
 
 .blog.md
+
+.prompt.md
+prompt.md

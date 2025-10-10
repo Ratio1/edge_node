@@ -20,3 +20,4 @@ openai
 sqlfluff
 pypdf
 python-docx
+pdfplumber

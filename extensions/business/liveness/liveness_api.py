@@ -148,9 +148,11 @@ class LivenessApiPlugin(BasePlugin):
     if response.status_code == 200:
       result["status"] = "live"
       result["message"] = "Service is running smoothly."
+      result["color"] = "#1B47F7"
     else:
       result["status"] = "down"
       result["message"] = "Service is in maintenance mode."
+      result["color"] = "#F261A2"
     return result
     
     
@@ -221,8 +223,11 @@ class LivenessApiPlugin(BasePlugin):
           response = "please provide a valid service"
         else:
           data = self.__get_service_status(url)
-          if extended_message:
+          if extended_message == 1:
             response = data["message"]
+          elif extended_message == 2:
+            color = data["color"]
+            response = color #f"<span style='color:{color}'>{data['message']}</span
           else:
             response = data["status"]
         #endif

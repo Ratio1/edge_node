@@ -214,11 +214,13 @@ class _DeeployTargetNodesMixin:
   def __check_node_has_tags(self, node_addr, required_tags):
     """
     Check if the node has the required tags.
+    Example of required tags: ["IS_KYB", "DC:*", "REG:EU||REG:US", "CT:US||CT:FR||CT:IT", "!IS_BLOCKED", "!CT:FR"]
+    Tags prefixed with "!" are excluded tags - the node must NOT have them.
     Args:
         node_addr (str): Node address
-        required_tags (list): List of required tags
+        required_tags (list): List of required tags (and excluded tags prefixed with "!")
     Returns:
-        bool: True if the node has all required tags, False otherwise
+        bool: True if the node has all required tags and none of the excluded tags, False otherwise
     """
     node_tags = self.netmon.get_network_node_tags(node_addr)
 
@@ -226,20 +228,49 @@ class _DeeployTargetNodesMixin:
     self.Pd(f"Required tags: {self.json_dumps(required_tags)}")
 
     for required_tag in required_tags:
-      if '||' not in required_tag:
-        rtag_opts = [required_tag.upper().replace('*', '')]
+      # Skip empty or invalid tags
+      if not required_tag or not isinstance(required_tag, str):
+        continue
+      
+      # Check if this is an excluded tag (prefixed with "!")
+      is_excluded = required_tag.startswith('!')
+      
+      # Extract the actual tag, removing the "!" prefix if present
+      if is_excluded:
+        tag_to_check = required_tag[1:].strip()
+        # Skip if tag is just "!" with nothing after it
+        if not tag_to_check:
+          self.P(f"Warning: Invalid excluded tag '{required_tag}' - skipping", color='warning')
+          continue
       else:
-        rtag_opts = [x.upper().replace('*', '') for x in required_tag.split('||')]
+        tag_to_check = required_tag.strip()
+      
+      if '||' not in tag_to_check:
+        rtag_opts = [tag_to_check.upper().replace('*', '')]
+      else:
+        rtag_opts = [x.strip().upper().replace('*', '') for x in tag_to_check.split('||') if x.strip()]
+      
+      # Skip if no valid tag options remain
+      if not rtag_opts:
+        continue
+      
       found = False
       for node_tag in node_tags:
         for rt in rtag_opts:
-          if node_tag in rt:
+          if rt and node_tag in rt:
             found = True
             break
         if found:
           break
-      if not found:
-        return False
+      
+      # For excluded tags, the node should NOT have them (found should be False)
+      # For required tags, the node SHOULD have them (found should be True)
+      if is_excluded:
+        if found:
+          return False  # Node has an excluded tag, reject it
+      else:
+        if not found:
+          return False  # Node doesn't have a required tag, reject it
     return True
 
 
