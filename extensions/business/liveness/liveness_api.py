@@ -148,11 +148,11 @@ class LivenessApiPlugin(BasePlugin):
     if response.status_code == 200:
       result["status"] = "live"
       result["message"] = "Service is running smoothly."
-      result["color"] = "1B47F7"
+      result["color"] = "#1B47F7"
     else:
       result["status"] = "down"
       result["message"] = "Service is in maintenance mode."
-      result["color"] = "F261A2"
+      result["color"] = "#F261A2"
     return result
     
     
