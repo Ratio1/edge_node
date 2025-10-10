@@ -831,15 +831,22 @@ class ContainerAppRunnerPlugin(
     self._check_health_endpoint(current_time)
     if self.cfg_autoupdate:
       self._check_image_updates(current_time)
-    self._perform_additional_checks(current_time)
+    restart_required = self._perform_additional_checks(current_time)
     
-    # if required:
-    #   self._restart_container()
+    if restart_required:
+      self._restart_container()
     return
 
   def _perform_additional_checks(self, current_time):
-    """Hook for subclasses to implement additional monitoring checks."""
-    return
+    """
+    Hook for subclasses to implement additional monitoring checks.
+    
+    Returns
+    -------
+    bool
+      True if container restart is required, False otherwise.
+    """
+    return False
 
   def process(self):
     """

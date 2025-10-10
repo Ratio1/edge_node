@@ -130,35 +130,43 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
   # --- Monitoring ------------------------------------------------------------
 
   def _perform_additional_checks(self, current_time):
-    self._check_git_updates(current_time)
-    return
+    """Check for git updates and return whether restart is required."""
+    return self._check_git_updates(current_time)
 
   def _check_git_updates(self, current_time=None):
+    """
+    Check for new commits in the repository.
+    
+    Returns
+    -------
+    bool
+      True if a new commit was detected and restart is required, False otherwise.
+    """
     if not current_time:
       current_time = self.time()
 
     poll_interval = self._git_poll_interval
     if current_time - self._last_git_check < poll_interval:
-      return
+      return False
 
     self._last_git_check = current_time
     latest_commit = self._get_latest_commit()
 
     if not latest_commit:
-      return
+      return False
 
     if self.current_commit and latest_commit != self.current_commit:
       self.P(
-        f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restarting container...",
+        f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restart required.",
         color='y',
       )
       self.current_commit = latest_commit
-      self._restart_container() # this should be in ContainerAppRunnerPlugin
+      return True
     else:
       if not self.current_commit:
         self.current_commit = latest_commit
       self.P(f"Commit check ({self.branch}): {latest_commit}", color='d')
-    return
+    return False
 
   # --- Git helpers -----------------------------------------------------------
 
