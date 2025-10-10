@@ -1140,7 +1140,8 @@ class _DeeployMixin:
     discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
 
     if len(discovered_instances) == 0:
-      msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for provided job_id/app_id and owner '{owner}'."
+      msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for provided "
+      msg += f"{f'app_id {app_id}' if app_id else f'job_id {job_id}'} and owner '{owner}'."
       raise ValueError(msg)
     #endif
     for instance in discovered_instances:
