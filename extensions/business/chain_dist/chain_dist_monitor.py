@@ -207,10 +207,10 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
   
   def process(self):
     try:
-      self.check_all_jobs()
-      self.maybe_distribute_rewards()
-      self.check_closable_jobs()
       self.maybe_update_liveness()
+      self.check_all_jobs()
+      self.check_closable_jobs()
+      self.maybe_distribute_rewards()
     except Exception as e:
       self.P(f"Exception during process:\n{self.trace_info()}\nSleeping for {self.cfg_sleep_period} seconds.", color='r')
       self.sleep(self.cfg_sleep_period)
