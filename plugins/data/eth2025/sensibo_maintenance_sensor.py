@@ -82,45 +82,58 @@ class SensiboMaintenanceSensorDataCapture(DataCaptureThread):
 
   def connect(self):  # MANDATORY
     if self.has_connection and self._uid:
-      self._log("Connection already established, skipping new connect", verbosity_level=3)
+      self._log("Connection already established, skipping new connect", verbosity_level=2)
       return True
 
-    self._log("Establishing connection to Sensibo API", verbosity_level=1)
-    self._api_key = self.cfg_sensibo_api_key
+    self._log("Connecting to Sensibo API", verbosity_level=0)
+    self._api_key = (self.cfg_sensibo_api_key or '').strip()
     if not self._api_key:
       self._log("SENSIBO_API_KEY is missing", verbosity_level=0, color='r')
-      raise ValueError("SENSIBO_API_KEY is required")
+      self.has_connection = False
+      return False
 
     self._log(
       f"Using API key prefix: {self._api_key[:8]}...",
-      verbosity_level=3,
+      verbosity_level=2,
     )
 
-    # Use the pod UID directly if provided
-    if self.cfg_sensibo_pod_uid:
-      self._uid = self.cfg_sensibo_pod_uid
-      self._log(f"Using provided pod UID: {self._uid}", verbosity_level=1)
+    pod_uid = (self.cfg_sensibo_pod_uid or '').strip()
+    if pod_uid:
+      self._uid = pod_uid
+      self.has_connection = True
+      self._log(f"Using provided pod UID: {self._uid}", verbosity_level=0)
       return True
 
-    self._device_name = self.cfg_sensibo_device_name
+    self._device_name = (self.cfg_sensibo_device_name or '').strip()
     if not self._device_name:
       self._log("SENSIBO_DEVICE_NAME is missing", verbosity_level=0, color='r')
-      raise ValueError("SENSIBO_DEVICE_NAME is required when SENSIBO_POD_UID is not provided")
+      self.has_connection = False
+      return False
 
-    self._log(f"Looking up device by name: {self._device_name}", verbosity_level=2)
-    devices = self.__list_devices()
+    self._log(f"Looking up device by name: {self._device_name}", verbosity_level=1)
+    try:
+      devices = self.__list_devices()
+    except Exception as exc:
+      self._log(f"Failed to list Sensibo devices: {exc}", verbosity_level=0, color='r')
+      self.has_connection = False
+      return False
 
     if self._device_name not in devices:
-      available = ', '.join(devices.keys())
+      available = ', '.join(devices.keys()) if devices else 'none'
       self._log(
-        f"ERROR: Device '{self._device_name}' not found. Available devices: {available}",
+        f"Device '{self._device_name}' not found. Available devices: {available}",
         verbosity_level=0,
         color='r',
       )
-      raise ValueError(f"Device '{self._device_name}' not found")
+      self.has_connection = False
+      return False
 
     self._uid = devices[self._device_name]
-    self._log(f"Successfully connected to device '{self._device_name}' with UID: {self._uid}", verbosity_level=1)
+    self.has_connection = True
+    self._log(
+      f"Successfully connected to device '{self._device_name}' with UID: {self._uid}",
+      verbosity_level=0,
+    )
     return True
 
   def _release(self):  # MANDATORY
@@ -142,7 +155,8 @@ class SensiboMaintenanceSensorDataCapture(DataCaptureThread):
     return latest_data
 
   def data_step(self):  # MANDATORY
-    if not self._maybe_reconnect():
+    self._maybe_reconnect()
+    if not self.has_connection:
       self._log("Unable to establish connection to Sensibo API", verbosity_level=0, color='r')
       return
 
