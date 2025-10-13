@@ -1,6 +1,6 @@
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.0.1'
+__VER__ = '0.0.2'
 
 MESSAGE_PREFIX = "Please sign this message to manage your tunnels: "
 
@@ -216,10 +216,12 @@ class TunnelsManagerPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="post")
-  def add_custom_hostname(self, tunnel_id: str, hostname: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str):
+  def add_custom_hostname(self, tunnel_id: str, hostname: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str, cloudflare_domain: str):
     """
     Add a new custom hostname for a specific tunnel based on its ID.
     """
+    if hostname.endswith(cloudflare_domain):
+      raise Exception(f"Hostname cannot be a subdomain of the main domain {cloudflare_domain}. Use add_alias instead.")
     value = self.get_tunnel(tunnel_id, cloudflare_account_id, cloudflare_api_key)
     if value is None:
       raise Exception(f"Tunnel {tunnel_id} not found.")
@@ -290,6 +292,83 @@ class TunnelsManagerPlugin(BasePlugin):
       "success": True,
     }
   
+  @BasePlugin.endpoint(method="post")
+  def add_alias(self, tunnel_id: str, alias: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str, cloudflare_domain: str):
+    """
+    Add a new alias (CNAME) on the same domain for a specific tunnel based on its ID.
+    """
+    if not alias.endswith(cloudflare_domain):
+      raise Exception(f"Alias must be a subdomain of the main domain {cloudflare_domain}. Use add_custom_hostname instead.")
+    value = self.get_tunnel(tunnel_id, cloudflare_account_id, cloudflare_api_key)
+    if value is None:
+      raise Exception(f"Tunnel {tunnel_id} not found.")
+
+    url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records"
+    headers = {
+      "Authorization": f"Bearer {cloudflare_api_key}"
+    }
+    data = {
+      "type": "CNAME",
+      "proxied": True,
+      "name": alias,
+      "content": f"{value['id']}.cfargotunnel.com",
+    }
+    dns_record = self.requests.post(url, headers=headers, json=data).json()
+    if dns_record["success"] is False:
+      raise Exception("Error creating alias: " + str(dns_record['errors']))
+
+    if 'aliases' not in value['metadata']:
+      value['metadata']['aliases'] = []
+    value['metadata']['aliases'].append({
+      "id": dns_record['result']['id'],
+      "name": alias
+    })
+    self._cloudflare_update_metadata(
+      tunnel_id=tunnel_id,
+      metadata=value['metadata'],
+      cloudflare_account_id=cloudflare_account_id,
+      cloudflare_api_key=cloudflare_api_key
+    )
+    return {
+      "success": True,
+    }
+
+  @BasePlugin.endpoint(method="delete")
+  def delete_alias(self, tunnel_id: str, alias_id: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str):
+    """
+    Remove an alias (CNAME) from a specific tunnel based on its ID.
+    """
+    value = self.get_tunnel(tunnel_id, cloudflare_account_id, cloudflare_api_key)
+    if value is None:
+      raise Exception(f"Tunnel {tunnel_id} not found.")
+
+    if 'aliases' not in value['metadata']:
+      raise Exception(f"No aliases found for tunnel {tunnel_id}.")
+
+    alias = next((a for a in value['metadata']['aliases'] if a['id'] == alias_id), None)
+    if alias is None:
+      raise Exception(f"Alias {alias_id} not found for tunnel {tunnel_id}.")
+
+    url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records/{alias_id}"
+    headers = {
+      "Authorization": f"Bearer {cloudflare_api_key}"
+    }
+    response = self.requests.delete(url, headers=headers).json()
+    if response["success"] is False:
+      raise Exception("Error deleting alias: " + str(response['errors']))
+
+    value['metadata']['aliases'].remove(alias)
+    self._cloudflare_update_metadata(
+      tunnel_id=tunnel_id,
+      metadata=value['metadata'],
+      cloudflare_account_id=cloudflare_account_id,
+      cloudflare_api_key=cloudflare_api_key
+    )
+
+    return {
+      "success": True,
+    }
+
   @BasePlugin.endpoint(method="post")
   def rename_tunnel(self, tunnel_id: str, new_alias: str, cloudflare_account_id: str, cloudflare_api_key: str):
     """
