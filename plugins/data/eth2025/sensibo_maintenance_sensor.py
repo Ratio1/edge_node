@@ -85,7 +85,7 @@ class SensiboMaintenanceSensorDataCapture(DataCaptureThread):
       self._log("Connection already established, skipping new connect", verbosity_level=2)
       return True
 
-    self._log("Connecting to Sensibo API", verbosity_level=0)
+    self._log("Establishing connection to Sensibo API", verbosity_level=0)
     self._api_key = (self.cfg_sensibo_api_key or '').strip()
     if not self._api_key:
       self._log("SENSIBO_API_KEY is missing", verbosity_level=0, color='r')
