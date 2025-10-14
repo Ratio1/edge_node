@@ -13,7 +13,7 @@ from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
-  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_PLUGIN_DATA,
+  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
 )
   
 
@@ -172,6 +172,16 @@ class DeeployManagerApiPlugin(
 
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
+      job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE, None)
+      if job_app_type:
+        job_app_type = str(job_app_type).lower()
+        if job_app_type not in JOB_APP_TYPES_ALL:
+          raise ValueError(f"Invalid job_app_type '{job_app_type}'. Expected one of {JOB_APP_TYPES_ALL}.")
+      else:
+        job_app_type = self.deeploy_detect_job_app_type(self.deeploy_prepare_plugins(inputs))
+        if job_app_type not in JOB_APP_TYPES_ALL:
+          job_app_type = JOB_APP_TYPES.NATIVE
+      self.P(f"Detected job app type: {job_app_type}")
       
       # Generate or get app_id based on operation type
       if is_create:
@@ -209,6 +219,7 @@ class DeeployManagerApiPlugin(
           new_nodes=nodes,
           update_nodes=[],
           discovered_plugin_instances=discovered_plugin_instances,
+          job_app_type=job_app_type,
         )
       else:
         dct_status, str_status = self.check_and_deploy_pipelines(
@@ -220,6 +231,7 @@ class DeeployManagerApiPlugin(
           new_nodes=[],
           update_nodes=nodes,
           discovered_plugin_instances=discovered_plugin_instances,
+          job_app_type=job_app_type,
         )
       
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
@@ -242,6 +254,7 @@ class DeeployManagerApiPlugin(
           DEEPLOY_KEYS.PLUGIN_SIGNATURE: inputs.plugin_signature,
           DEEPLOY_KEYS.TARGET_NODES: inputs.target_nodes,
           DEEPLOY_KEYS.TARGET_NODES_COUNT: inputs.target_nodes_count,
+          DEEPLOY_KEYS.JOB_APP_TYPE: job_app_type
         }
 
       result = {

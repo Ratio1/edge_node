@@ -4,7 +4,7 @@ from naeural_core import constants as ct
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
-  DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS
+  DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL
 
 DEEPLOY_DEBUG = True
 
@@ -109,7 +109,7 @@ class _DeeployMixin:
       raise ValueError("Sender {} is not an oracle".format(sender))
     return True
 
-  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender):
+  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=None):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
@@ -135,6 +135,9 @@ class _DeeployMixin:
       DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
       DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
     }
+    detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
+    if detected_job_app_type in JOB_APP_TYPES_ALL:
+      dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
     for addr in nodes:
       # Nodes to peer with for CHAINSTORE
@@ -187,7 +190,7 @@ class _DeeployMixin:
     # endfor each target node
     return response_keys
 
-  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs = None):
+  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
@@ -202,6 +205,11 @@ class _DeeployMixin:
     response_keys = self.defaultdict(list)
 
     ts = self.time()
+    detected_job_app_type = job_app_type
+    if not detected_job_app_type:
+      plugins_for_detection = self.deeploy_prepare_plugins(inputs)
+      detected_job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
+
     if not dct_deeploy_specs:
       dct_deeploy_specs = {
         DEEPLOY_KEYS.JOB_ID: job_id,
@@ -215,6 +223,8 @@ class _DeeployMixin:
         DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
         DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
       }
+    if detected_job_app_type in JOB_APP_TYPES_ALL:
+      dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
     nodes = [node for plugin_instance in discovered_plugin_instances if (node := plugin_instance.get("NODE")) is not None]
 
@@ -396,6 +406,7 @@ class _DeeployMixin:
       DEEPLOY_KEYS.PIPELINE_INPUT_URI: None,
       DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
       DEEPLOY_KEYS.APP_PARAMS: {},
+      DEEPLOY_KEYS.JOB_APP_TYPE: None,
       **request
     }
     
@@ -556,6 +567,77 @@ class _DeeployMixin:
 
     return is_valid
 
+  def deeploy_detect_job_app_type(self, pipeline_plugins):
+    """
+    Detect the job application type based on the pipeline plugins configuration.
+    """
+    def extract_instance_confs(instances):
+      result = []
+      if not instances:
+        return result
+      for instance in instances:
+        if not isinstance(instance, dict):
+          continue
+        instance_conf = instance.get('instance_conf') if isinstance(instance.get('instance_conf'), dict) else instance
+        if instance_conf:
+          result.append(instance_conf)
+      return result
+
+    normalized_plugins = []
+
+    if isinstance(pipeline_plugins, dict):
+      for signature, instances in pipeline_plugins.items():
+        normalized_plugins.append((signature, extract_instance_confs(instances)))
+    elif isinstance(pipeline_plugins, list):
+      for plugin in pipeline_plugins:
+        if not isinstance(plugin, dict):
+          continue
+        signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+        instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES)
+        if signature is None:
+          signature = plugin.get("SIGNATURE") or plugin.get("signature")
+        if instances is None:
+          instances = plugin.get("INSTANCES") or plugin.get("instances")
+        if signature is None and len(plugin) == 1:
+          signature, instances = next(iter(plugin.items()))
+        normalized_plugins.append((signature, extract_instance_confs(instances)))
+
+    normalized_plugins = [
+      (signature, instances)
+      for signature, instances in normalized_plugins
+      if signature
+    ]
+
+    plugin_count = len(normalized_plugins)
+    # if no plugins were found, we define it as native app. (normally, shouldn't happen)
+    if plugin_count == 0:
+      return JOB_APP_TYPES.NATIVE
+
+    if plugin_count > 1:
+      return JOB_APP_TYPES.NATIVE
+
+    signature, instances = normalized_plugins[0]
+    normalized_signature = signature.upper() if isinstance(signature, str) else ''
+
+    if normalized_signature == CONTAINER_APP_RUNNER_SIGNATURE:
+      service_keywords = ('postgresql', 'postgres', 'mongo', 'mongodb', 'mysql', 'mssql')
+      for instance_conf in instances:
+        if not isinstance(instance_conf, dict):
+          continue
+        image_value = (
+          instance_conf.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE)
+          or instance_conf.get('IMAGE')
+          or instance_conf.get('image')
+        )
+        if image_value and any(keyword in str(image_value).lower() for keyword in service_keywords):
+          return JOB_APP_TYPES.SERVICE
+      return JOB_APP_TYPES.GENERIC
+
+    if normalized_signature == WORKER_APP_RUNNER_SIGNATURE:
+      return JOB_APP_TYPES.GENERIC
+
+    return JOB_APP_TYPES.NATIVE
+
   def deeploy_prepare_single_plugin_instance(self, inputs):
     """
     Prepare the a single plugin instance for the pipeline creation.
@@ -613,7 +695,7 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None):
+  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
@@ -626,10 +708,10 @@ class _DeeployMixin:
     # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
     response_keys = {}
     if len(update_nodes) > 0:
-      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs)
+      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs, job_app_type=job_app_type)
       response_keys.update(update_response_keys)
     if len(new_nodes) > 0:
-      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender)
+      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=job_app_type)
       response_keys.update(new_response_keys)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
@@ -945,6 +1027,12 @@ class _DeeployMixin:
     
     # 3. Get plugins and transform them to the expected structure
     plugins_data = base_pipeline.get(NetMonCt.PLUGINS, {})
+    if isinstance(deeploy_specs, dict):
+      current_job_app_type = deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+      if not current_job_app_type:
+        detected_job_app_type = self.deeploy_detect_job_app_type(plugins_data)
+        if detected_job_app_type in JOB_APP_TYPES_ALL:
+          deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
     transformed_plugins = []
     
     for plugin_signature, plugin_instances in plugins_data.items():
@@ -992,6 +1080,13 @@ class _DeeployMixin:
 
     chainstore_peers = list(set(new_nodes + update_nodes))
     deeploy_specs = self.deepcopy(base_pipeline[NetMonCt.DEEPLOY_SPECS])
+    job_app_type = None
+    if isinstance(deeploy_specs, dict):
+      job_app_type = deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+      if not job_app_type:
+        job_app_type = self.deeploy_detect_job_app_type(base_pipeline.get(NetMonCt.PLUGINS, []))
+        if job_app_type in JOB_APP_TYPES_ALL:
+          deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
     deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
     deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
 
