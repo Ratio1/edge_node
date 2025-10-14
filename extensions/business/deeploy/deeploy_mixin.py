@@ -513,12 +513,14 @@ class _DeeployMixin:
           job_type = job.get('jobType')
           if job_type is None:
             self.P(f"Job type missing or invalid for job {job_id}. Cannot validate resources.")
-            return False
+            msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES1}: Job type missing or invalid for job {job_id}.")
+            raise ValueError(msg)
           #endif
           expected_resources = JOB_TYPE_RESOURCE_SPECS.get(job_type)
           if expected_resources is None:
             self.P(f"No resource specs configured for job type {job_type}. Cannot validate resources.")
-            return False
+            msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES2}: No resource specs configured for job type {job_type}.")
+            raise ValueError(msg)
           #endif
           if expected_resources:
             required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
@@ -538,9 +540,11 @@ class _DeeployMixin:
                 f"Requested resources {required_resources} do not match paid resources "
                 f"{expected_resources} for job type {job_type}."
               )
-              is_valid = False
-            #endif resources match
-          #endif expected resources
+              msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Requested resources {required_resources} " +
+                     f"do not match paid resources {expected_resources} for job type {job_type}.")
+              raise ValueError(msg)
+            # endif resources match
+          # endif expected resources
         # endif is valid
       else: # job not found
         self.P(f"Job {job_id} not found.")
