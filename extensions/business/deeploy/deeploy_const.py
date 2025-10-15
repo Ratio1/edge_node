@@ -43,6 +43,10 @@ class DEEPLOY_KEYS:
   APP_PARAMS = "app_params"
   APP_PARAMS_IMAGE = "IMAGE"
   APP_PARAMS_CR = "CR"
+  # Multi-plugin keys
+  PLUGINS = "plugins"
+  PLUGIN_INSTANCES = "instances"
+  PLUGIN_INSTANCE_ID = "instance_id"
   # Auth result keys
   SENDER = "sender"
   SENDER_ORACLES = "sender_oracles"
@@ -93,6 +97,9 @@ class DEEPLOY_ERRORS:
   JOB_RESOURCES1 = "ERR22_JOB_RESOURCES1"
   JOB_RESOURCES2 = "ERR23_JOB_RESOURCES2"
   JOB_RESOURCES3 = "ERR24_JOB_RESOURCES3"
+  PLUGINS1 = "ERR25_DEEPLOY_PLUGINS1"  # Invalid plugins array structure
+  PLUGINS2 = "ERR26_DEEPLOY_PLUGINS2"  # Plugin missing required field
+  PLUGINS3 = "ERR27_DEEPLOY_PLUGINS3"  # Instance validation failed
 
 class DEEPLOY_RESOURCES:
   # Result dictionary keys
@@ -465,7 +472,7 @@ DEEPLOY_CREATE_REQUEST_SERVICE_APP = {
 }
 
 DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
-  "app_alias" : "some_app_name", 
+  "app_alias" : "some_app_name",
   "project_id" : "DELIVERD_BY_UI = SHA256(UUID)",
   "project_name": "human-readable-project-name",
   "job_id" : "DELIVERED_BY_UI_FROM_SC",
@@ -489,12 +496,12 @@ DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
     # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is True => normal use
     # - if NGROK_EDGE_LABEL is None and NGROK_ENABLED is True => create/use dynamic url
     # - if NGROK_EDGE_LABEL is not None and NGROK_ENABLED is False => consider NGROK_ENABLED=True
-    
-    "NGROK_USE_API": True,  # use API or shell for ngrok tunnel creation  
-    
+
+    "NGROK_USE_API": True,  # use API or shell for ngrok tunnel creation
+
     # TODO: in v2 we need to have for each native plugin a set of default params and their values
     #       thus the below params will be pre-completed with these default key-values
-    
+
     "OTHER_PARAM1" : "value1",
     "OTHER_PARAM2" : "value2",
     "OTHER_PARAM3" : "value3",
@@ -508,6 +515,75 @@ DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
     "pipeline_input_other2" : "other param",       # this will be added to DCT config
   },
   "chainstore_response" : False,
+}
+
+###################################################################################################################
+# Multi-plugin request format (NEW - recommended for multiple plugins)
+DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN = {
+  # Pipeline-level configuration
+  "app_alias" : "JeevesAPI",
+  "project_id" : "DELIVERD_BY_UI = SHA256(UUID)",
+  "project_name": "human-readable-project-name",
+  "job_id" : "DELIVERED_BY_UI_FROM_SC",
+  "job_app_type": "native",
+  "nonce" : hex(int(time() * 1000)),
+
+  # Node selection
+  "target_nodes" : [
+    "0xai_node_1",
+  ],
+  "target_nodes_count" : 0,  # Use this OR target_nodes
+  "spare_nodes" : [],
+  "job_tags": ["KYB", "REG:EU"],
+  "node_res_req" : {
+    "cpu" : 4,
+    "memory" : "16GiB"
+  },
+
+  # Pipeline data source
+  "pipeline_input_type"  : "JeevesApiListener",  # Pipeline TYPE
+  "pipeline_input_uri" : None,
+  "chainstore_response" : True,
+
+  # Plugins array (NEW FORMAT - each object is a plugin instance)
+  "plugins": [
+    {
+      # Plugin instance 1: KEYSOFT_JEEVES
+      "signature": "KEYSOFT_JEEVES",
+      "PREDEFINED_USER_TOKENS": ["uz22y5zc7r9p", "ca0b759c76d3"],
+    },
+    {
+      # Plugin instance 2: CONTAINER_APP_RUNNER
+      "signature": "CONTAINER_APP_RUNNER",
+      "IMAGE": "rokeysoft/keysoft:latest",
+      "CONTAINER_RESOURCES": {
+        "cpu": 2,
+        "memory": "4096m",
+        "ports": {
+          "31250": 1849,
+          "31251": 80
+        }
+      },
+      "CR": "docker.io",
+      "ENV": {
+        "INSTANCE_NAME": "R1TEST_INSTANCE"
+      },
+      "DYNAMIC_ENV": {
+        "RATIO1_AGENT_ENDPOINT": [
+          {"type": "static", "value": "http://"},
+          {"type": "host_ip", "value": ""},
+          {"type": "static", "value": ":15033/query"}
+        ]
+      },
+      "VOLUMES": {
+        "ks_data": "/keysoft/storage"
+      },
+      "PORT": None,
+      "RESTART_POLICY": "always",
+      "IMAGE_PULL_POLICY": "always",
+      "TUNNEL_ENGINE_ENABLED": False
+    }
+  ]
 }
 
 ###################################################################################################################
