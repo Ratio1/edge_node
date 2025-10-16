@@ -3,6 +3,8 @@
 Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
+from collections import defaultdict
+
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
@@ -214,6 +216,14 @@ class DeeployManagerApiPlugin(
         discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=sender)
 
         self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
+        if job_app_type == JOB_APP_TYPES.NATIVE:
+          discovered_plugin_instances = self._ensure_native_plugin_instance_ids(
+            inputs=inputs,
+            discovered_plugin_instances=discovered_plugin_instances,
+            owner=sender,
+            app_id=app_id,
+            job_id=job_id,
+          )
         nodes = [instance[DEEPLOY_PLUGIN_DATA.NODE] for instance in discovered_plugin_instances]
 
       if is_create:
@@ -289,6 +299,222 @@ class DeeployManagerApiPlugin(
     })
     return response
 
+  def _ensure_native_plugin_instance_ids(self, inputs, discovered_plugin_instances, owner=None, app_id=None, job_id=None):
+    """
+    Backfill missing instance_id values for native app plugin updates using discovered plugin instances.
+    """
+    try:
+      plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS, None) if hasattr(inputs, 'get') else None
+    except Exception:
+      plugins_array = None
+
+    if not plugins_array or not isinstance(plugins_array, list):
+      return discovered_plugin_instances
+
+    if not discovered_plugin_instances and (app_id or job_id):
+      try:
+        discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+      except Exception as exc:
+        self.Pd(f"Failed to auto-discover plugin instances for native job: {exc}", color='r')
+        discovered_plugin_instances = []
+
+    if not discovered_plugin_instances:
+      return discovered_plugin_instances
+
+    instance_id_key = getattr(ct.CONFIG_INSTANCE, "K_INSTANCE_ID", "INSTANCE_ID")
+    chainstore_response_key = getattr(ct.BIZ_PLUGIN_DATA, "CHAINSTORE_RESPONSE_KEY", "CHAINSTORE_RESPONSE_KEY")
+    chainstore_peers_key = getattr(ct.BIZ_PLUGIN_DATA, "CHAINSTORE_PEERS", "CHAINSTORE_PEERS")
+
+    used_instance_ids = set()
+    for plugin_entry in plugins_array:
+      existing_id = (
+        plugin_entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or plugin_entry.get("instance_id")
+        or plugin_entry.get(instance_id_key)
+      )
+      if existing_id:
+        used_instance_ids.add(existing_id)
+
+    discovered_by_signature = defaultdict(list)
+    for plugin in discovered_plugin_instances:
+      signature = plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE)
+      instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if not signature or not instance_id:
+        continue
+      discovered_by_signature[signature.upper()].append(plugin)
+
+    for signature in discovered_by_signature:
+      discovered_by_signature[signature] = sorted(
+        discovered_by_signature[signature],
+        key=lambda item: item.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID) or ""
+      )
+
+    for plugin_entry in plugins_array:
+      current_id = (
+        plugin_entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or plugin_entry.get("instance_id")
+        or plugin_entry.get(instance_id_key)
+      )
+      if current_id:
+        continue
+
+      signature = plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE) or plugin_entry.get("signature")
+      if not signature:
+        continue
+
+      normalized_signature = signature.upper()
+      candidates = discovered_by_signature.get(normalized_signature, [])
+      if not candidates:
+        continue
+
+      match = self._match_native_plugin_candidate(
+        plugin_entry,
+        candidates,
+        used_instance_ids,
+        instance_id_key=instance_id_key,
+        chainstore_response_key=chainstore_response_key,
+        chainstore_peers_key=chainstore_peers_key,
+      )
+
+      if not match:
+        continue
+
+      matched_instance_id = match.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if not matched_instance_id:
+        continue
+
+      plugin_entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = matched_instance_id
+      plugin_entry["instance_id"] = matched_instance_id
+      used_instance_ids.add(matched_instance_id)
+
+      self.Pd(
+        f"Inferred instance_id '{matched_instance_id}' for native plugin '{signature}'.",
+        color='g'
+      )
+
+    return discovered_plugin_instances
+
+  def _match_native_plugin_candidate(
+    self,
+    plugin_entry,
+    candidates,
+    used_instance_ids,
+    instance_id_key,
+    chainstore_response_key,
+    chainstore_peers_key,
+  ):
+    """
+    Match a plugin update payload without instance_id to an existing discovered instance.
+    """
+    requested_conf = self._extract_plugin_request_conf(
+      plugin_entry,
+      instance_id_key=instance_id_key,
+      chainstore_response_key=chainstore_response_key,
+      chainstore_peers_key=chainstore_peers_key,
+    )
+
+    best_candidate = None
+    best_score = -1
+    for candidate in candidates:
+      candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if not candidate_instance_id or candidate_instance_id in used_instance_ids:
+        continue
+      candidate_conf = self._extract_discovered_plugin_conf(
+        candidate,
+        instance_id_key=instance_id_key,
+        chainstore_response_key=chainstore_response_key,
+        chainstore_peers_key=chainstore_peers_key,
+      )
+      score = self._score_plugin_config_match(requested_conf, candidate_conf)
+      if score > best_score:
+        best_score = score
+        best_candidate = candidate
+
+    if best_candidate is None:
+      for candidate in candidates:
+        candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+        if candidate_instance_id and candidate_instance_id not in used_instance_ids:
+          best_candidate = candidate
+          break
+
+    return best_candidate
+
+  def _extract_plugin_request_conf(self, plugin_entry, instance_id_key, chainstore_response_key, chainstore_peers_key):
+    """
+    Produce a sanitized configuration dict from the update request plugin payload.
+    """
+    ignore_keys = {
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE,
+      DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
+      "signature",
+      "instance_id",
+      instance_id_key,
+      chainstore_response_key,
+      chainstore_peers_key,
+    }
+
+    result = {}
+    for key, value in plugin_entry.items():
+      if key in ignore_keys:
+        continue
+      result[key] = value
+
+    return result
+
+  def _extract_discovered_plugin_conf(self, discovered_plugin, instance_id_key, chainstore_response_key, chainstore_peers_key):
+    """
+    Produce a sanitized configuration dict from an already running plugin instance.
+    """
+    plugin_instance = discovered_plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE, {})
+    instance_conf = {}
+    if isinstance(plugin_instance, dict):
+      instance_conf = plugin_instance.get("instance_conf", plugin_instance)
+      if not isinstance(instance_conf, dict):
+        instance_conf = {}
+
+    ignore_keys = {
+      instance_id_key,
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE,
+      "signature",
+      chainstore_response_key,
+      chainstore_peers_key,
+    }
+
+    result = {}
+    for key, value in instance_conf.items():
+      if key in ignore_keys:
+        continue
+      result[key] = value
+
+    return result
+
+  # TODO: Remove this once instance_ids are sent and make sure instance_id is mandatory.
+  # Update should be done strictly by instance_id.
+  def _score_plugin_config_match(self, requested_conf, existing_conf):
+    """
+    Compute a similarity score between a request payload and an existing instance configuration.
+    """
+    if not requested_conf:
+      return 0
+
+    score = 0
+    for key, value in requested_conf.items():
+      if key not in existing_conf:
+        continue
+      existing_value = existing_conf[key]
+      if isinstance(value, (dict, list)) and isinstance(existing_value, (dict, list)):
+        try:
+          if self.json_dumps(value, sort_keys=True) == self.json_dumps(existing_value, sort_keys=True):
+            score += 3
+        except TypeError:
+          continue
+      elif value == existing_value:
+        score += 2
+      elif str(value) == str(existing_value):
+        score += 1
+
+    return score
+
   @BasePlugin.endpoint(method="post")
   # /create_pipeline
   def create_pipeline(
@@ -335,7 +561,7 @@ class DeeployManagerApiPlugin(
       **Plugin instances:**
         plugins : list
             Array of plugin instance configurations. Each object represents ONE plugin instance:
-            - signature : str (required)
+            - plugin_signature : str (required)
                 The plugin signature (e.g., 'CONTAINER_APP_RUNNER', 'EDGE_NODE_API_TEST')
             - **instance-specific parameters** (varies by plugin type)
                 For CONTAINER_APP_RUNNER:
@@ -355,10 +581,10 @@ class DeeployManagerApiPlugin(
           "target_nodes_count": 1,
           "plugins": [
             {
-              "signature": "EDGE_NODE_API_TEST"
+              "plugin_signature": "EDGE_NODE_API_TEST"
             },
             {
-              "signature": "CONTAINER_APP_RUNNER",
+              "plugin_signature": "CONTAINER_APP_RUNNER",
               "IMAGE": "tvitalii/ratio1-drive:latest",
               "CONTAINER_RESOURCES": {
                 "cpu": 2,
@@ -393,8 +619,8 @@ class DeeployManagerApiPlugin(
     - Multi-plugin pipelines are automatically classified as JOB_APP_TYPE.NATIVE
     - Single CONTAINER_APP_RUNNER is classified as GENERIC or SERVICE
     - Resource requirements are aggregated across all container plugins
-    - Multiple instances of the same plugin: Include multiple objects with the same signature
-    - Example: [{"signature": "PLUGIN_A", ...}, {"signature": "PLUGIN_A", ...}] creates 2 instances
+    - Multiple instances of the same plugin: Include multiple objects with the same plugin_signature
+    - Example: [{"plugin_signature": "PLUGIN_A", ...}, {"plugin_signature": "PLUGIN_A", ...}] creates 2 instances
     - For multi-plugin templates, see DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN in deeploy_const.py
 
     TODO: (Vitalii)
@@ -450,8 +676,10 @@ class DeeployManagerApiPlugin(
       **Plugin instances:**
         plugins : list
             Array of plugin instance configurations. Each object represents ONE plugin instance:
-            - signature : str (required)
-            - **instance-specific parameters**
+            - plugin_signature : str (required)
+            - instance_id : str (required when updating an existing plugin instance)
+            - **instance-specific parameters** (payload merged into the instance configuration)
+              - Omit instance_id to attach a brand new plugin instance; supported for native apps only
 
       **Legacy format:**
         plugin_signature : str
@@ -469,6 +697,7 @@ class DeeployManagerApiPlugin(
     - For multi-plugin pipelines, all plugins are updated with new configurations
     - Resource validation applies the same as create operations
     - The simplified plugins array format is the same as create_pipeline
+    - New plugin instances can be introduced by omitting `instance_id` (native job type only)
     - See create_pipeline endpoint for detailed parameter documentation and examples
 
     """

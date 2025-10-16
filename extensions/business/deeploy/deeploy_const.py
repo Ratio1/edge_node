@@ -549,11 +549,11 @@ DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN = {
   "plugins": [
     {
       # Plugin instance 1: EDGE_NODE_API_TEST
-      "signature": "EDGE_NODE_API_TEST"
+      "plugin_signature": "EDGE_NODE_API_TEST"
     },
     {
       # Plugin instance 2: CONTAINER_APP_RUNNER
-      "signature": "CONTAINER_APP_RUNNER",
+      "plugin_signature": "CONTAINER_APP_RUNNER",
       "IMAGE": "tvitalii/ratio1-drive:latest",
       "CONTAINER_RESOURCES": {
         "cpu": 2,
