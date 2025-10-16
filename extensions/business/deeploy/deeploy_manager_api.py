@@ -336,7 +336,7 @@ class DeeployManagerApiPlugin(
         plugins : list
             Array of plugin instance configurations. Each object represents ONE plugin instance:
             - signature : str (required)
-                The plugin signature (e.g., 'CONTAINER_APP_RUNNER', 'KEYSOFT_JEEVES')
+                The plugin signature (e.g., 'CONTAINER_APP_RUNNER', 'EDGE_NODE_API_TEST')
             - **instance-specific parameters** (varies by plugin type)
                 For CONTAINER_APP_RUNNER:
                   - IMAGE : str (required)
@@ -349,19 +349,17 @@ class DeeployManagerApiPlugin(
 
       **Example request:**
         {
-          "app_alias": "JeevesAPI",
-          "pipeline_input_type": "JeevesApiListener",
+          "app_alias": "EdgeNodeApiTest",
+          "pipeline_input_type": "void",
           "job_id": 123,
           "target_nodes_count": 1,
           "plugins": [
             {
-              "signature": "KEYSOFT_JEEVES",
-              "PREDEFINED_USER_TOKENS": ["token123"],
-              "MAX_CONCURRENT_CONNECTIONS": 100
+              "signature": "EDGE_NODE_API_TEST"
             },
             {
               "signature": "CONTAINER_APP_RUNNER",
-              "IMAGE": "rokeysoft/keysoft:latest",
+              "IMAGE": "tvitalii/ratio1-drive:latest",
               "CONTAINER_RESOURCES": {
                 "cpu": 2,
                 "memory": "4096m"

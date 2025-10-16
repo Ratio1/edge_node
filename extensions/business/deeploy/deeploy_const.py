@@ -521,7 +521,7 @@ DEEPLOY_CREATE_REQUES_NATIVE_APPS = {
 # Multi-plugin request format (NEW - recommended for multiple plugins)
 DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN = {
   # Pipeline-level configuration
-  "app_alias" : "JeevesAPI",
+  "app_alias" : "EdgeNodeApiTest",
   "project_id" : "DELIVERD_BY_UI = SHA256(UUID)",
   "project_name": "human-readable-project-name",
   "job_id" : "DELIVERED_BY_UI_FROM_SC",
@@ -541,28 +541,24 @@ DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN = {
   },
 
   # Pipeline data source
-  "pipeline_input_type"  : "JeevesApiListener",  # Pipeline TYPE
+  "pipeline_input_type"  : "void",  # Pipeline TYPE
   "pipeline_input_uri" : None,
   "chainstore_response" : True,
 
   # Plugins array (NEW FORMAT - each object is a plugin instance)
   "plugins": [
     {
-      # Plugin instance 1: KEYSOFT_JEEVES
-      "signature": "KEYSOFT_JEEVES",
-      "PREDEFINED_USER_TOKENS": ["uz22y5zc7r9p", "ca0b759c76d3"],
+      # Plugin instance 1: EDGE_NODE_API_TEST
+      "signature": "EDGE_NODE_API_TEST"
     },
     {
       # Plugin instance 2: CONTAINER_APP_RUNNER
       "signature": "CONTAINER_APP_RUNNER",
-      "IMAGE": "rokeysoft/keysoft:latest",
+      "IMAGE": "tvitalii/ratio1-drive:latest",
       "CONTAINER_RESOURCES": {
         "cpu": 2,
         "memory": "4096m",
-        "ports": {
-          "31250": 1849,
-          "31251": 80
-        }
+        "ports": {}
       },
       "CR": "docker.io",
       "ENV": {
