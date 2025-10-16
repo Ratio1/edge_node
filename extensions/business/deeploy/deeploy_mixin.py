@@ -914,6 +914,9 @@ class _DeeployMixin:
     """
     Check if the payment is valid for the given job.
     """
+    allow_unpaid = inputs.get("allow_unpaid_job", False)
+    if allow_unpaid:
+      return True
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
     self.Pd(f"Checking payment for job {job_id} by sender {sender}{' (debug mode)' if debug else ''}")
     if not job_id:
@@ -1888,9 +1891,9 @@ class _DeeployMixin:
     if not discovered_plugin_instances:
       return discovered_plugin_instances
 
-    instance_id_key = getattr(ct.CONFIG_INSTANCE, "K_INSTANCE_ID", "INSTANCE_ID")
-    chainstore_response_key = getattr(ct.BIZ_PLUGIN_DATA, "CHAINSTORE_RESPONSE_KEY", "CHAINSTORE_RESPONSE_KEY")
-    chainstore_peers_key = getattr(ct.BIZ_PLUGIN_DATA, "CHAINSTORE_PEERS", "CHAINSTORE_PEERS")
+    instance_id_key = ct.BIZ_PLUGIN_DATA.INSTANCE_ID
+    chainstore_response_key = ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
+    chainstore_peers_key = ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS
 
     used_instance_ids = set()
     for plugin_entry in plugins_array:
