@@ -1863,3 +1863,218 @@ class _DeeployMixin:
           filtered_result[node][app_name] = app_data
       result = filtered_result
     return result
+
+  # TODO: REMOVE THIS, once instance_id is coming from ui for instances that have to be updated
+  # Maybe add is_new_instance:bool for native apps, that want to add an extra plugin
+  def _ensure_plugin_instance_ids(self, inputs, discovered_plugin_instances, owner=None, app_id=None, job_id=None):
+    """
+    Backfill missing instance_id values for plugin updates using discovered plugin instances.
+    """
+    try:
+      plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS, None) if hasattr(inputs, 'get') else None
+    except Exception:
+      plugins_array = None
+
+    if not plugins_array or not isinstance(plugins_array, list):
+      return discovered_plugin_instances
+
+    if not discovered_plugin_instances and (app_id or job_id):
+      try:
+        discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+      except Exception as exc:
+        self.Pd(f"Failed to auto-discover plugin instances for update: {exc}", color='r')
+        discovered_plugin_instances = []
+
+    if not discovered_plugin_instances:
+      return discovered_plugin_instances
+
+    instance_id_key = getattr(ct.CONFIG_INSTANCE, "K_INSTANCE_ID", "INSTANCE_ID")
+    chainstore_response_key = getattr(ct.BIZ_PLUGIN_DATA, "CHAINSTORE_RESPONSE_KEY", "CHAINSTORE_RESPONSE_KEY")
+    chainstore_peers_key = getattr(ct.BIZ_PLUGIN_DATA, "CHAINSTORE_PEERS", "CHAINSTORE_PEERS")
+
+    used_instance_ids = set()
+    for plugin_entry in plugins_array:
+      existing_id = (
+        plugin_entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or plugin_entry.get("instance_id")
+        or plugin_entry.get(instance_id_key)
+      )
+      if existing_id:
+        used_instance_ids.add(existing_id)
+
+    discovered_by_signature = self.defaultdict(list)
+    for plugin in discovered_plugin_instances:
+      signature = plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE)
+      instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if not signature or not instance_id:
+        continue
+      discovered_by_signature[signature.upper()].append(plugin)
+
+    for signature in discovered_by_signature:
+      discovered_by_signature[signature] = sorted(
+        discovered_by_signature[signature],
+        key=lambda item: item.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID) or ""
+      )
+
+    for plugin_entry in plugins_array:
+      current_id = (
+        plugin_entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or plugin_entry.get("instance_id")
+        or plugin_entry.get(instance_id_key)
+      )
+      if current_id:
+        continue
+
+      signature = plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE) or plugin_entry.get("signature")
+      if not signature:
+        continue
+
+      normalized_signature = signature.upper()
+      candidates = discovered_by_signature.get(normalized_signature, [])
+      if not candidates:
+        continue
+
+      match = self._match_native_plugin_candidate(
+        plugin_entry,
+        candidates,
+        used_instance_ids,
+        instance_id_key=instance_id_key,
+        chainstore_response_key=chainstore_response_key,
+        chainstore_peers_key=chainstore_peers_key,
+      )
+
+      if not match:
+        continue
+
+      matched_instance_id = match.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if not matched_instance_id:
+        continue
+
+      plugin_entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = matched_instance_id
+      plugin_entry["instance_id"] = matched_instance_id
+      used_instance_ids.add(matched_instance_id)
+
+      self.Pd(f"Inferred instance_id '{matched_instance_id}' for plugin '{signature}'.", color='g')
+
+    return discovered_plugin_instances
+
+  def _match_native_plugin_candidate(
+    self,
+    plugin_entry,
+    candidates,
+    used_instance_ids,
+    instance_id_key,
+    chainstore_response_key,
+    chainstore_peers_key,
+  ):
+    """
+    Match a plugin update payload without instance_id to an existing discovered instance.
+    """
+    requested_conf = self._extract_plugin_request_conf(
+      plugin_entry,
+      instance_id_key=instance_id_key,
+      chainstore_response_key=chainstore_response_key,
+      chainstore_peers_key=chainstore_peers_key,
+    )
+
+    best_candidate = None
+    best_score = -1
+    for candidate in candidates:
+      candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if not candidate_instance_id or candidate_instance_id in used_instance_ids:
+        continue
+      candidate_conf = self._extract_discovered_plugin_conf(
+        candidate,
+        instance_id_key=instance_id_key,
+        chainstore_response_key=chainstore_response_key,
+        chainstore_peers_key=chainstore_peers_key,
+      )
+      score = self._score_plugin_config_match(requested_conf, candidate_conf)
+      if score > best_score:
+        best_score = score
+        best_candidate = candidate
+
+    if best_candidate is None:
+      for candidate in candidates:
+        candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+        if candidate_instance_id and candidate_instance_id not in used_instance_ids:
+          best_candidate = candidate
+          break
+
+    return best_candidate
+
+  def _extract_plugin_request_conf(self, plugin_entry, instance_id_key, chainstore_response_key, chainstore_peers_key):
+    """
+    Produce a sanitized configuration dict from the update request plugin payload.
+    """
+    ignore_keys = {
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE,
+      DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
+      "signature",
+      "instance_id",
+      instance_id_key,
+      chainstore_response_key,
+      chainstore_peers_key,
+    }
+
+    result = {}
+    for key, value in plugin_entry.items():
+      if key in ignore_keys:
+        continue
+      result[key] = value
+
+    return result
+
+  def _extract_discovered_plugin_conf(self, discovered_plugin, instance_id_key, chainstore_response_key, chainstore_peers_key):
+    """
+    Produce a sanitized configuration dict from an already running plugin instance.
+    """
+    plugin_instance = discovered_plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE, {})
+    instance_conf = {}
+    if isinstance(plugin_instance, dict):
+      instance_conf = plugin_instance.get("instance_conf", plugin_instance)
+      if not isinstance(instance_conf, dict):
+        instance_conf = {}
+
+    ignore_keys = {
+      instance_id_key,
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE,
+      "signature",
+      chainstore_response_key,
+      chainstore_peers_key,
+    }
+
+    result = {}
+    for key, value in instance_conf.items():
+      if key in ignore_keys:
+        continue
+      result[key] = value
+
+    return result
+
+  # TODO: Remove this once instance_ids are sent and make sure instance_id is mandatory.
+  # Update should be done strictly by instance_id.
+  def _score_plugin_config_match(self, requested_conf, existing_conf):
+    """
+    Compute a similarity score between a request payload and an existing instance configuration.
+    """
+    if not requested_conf:
+      return 0
+
+    score = 0
+    for key, value in requested_conf.items():
+      if key not in existing_conf:
+        continue
+      existing_value = existing_conf[key]
+      if isinstance(value, (dict, list)) and isinstance(existing_value, (dict, list)):
+        try:
+          if self.json_dumps(value, sort_keys=True) == self.json_dumps(existing_value, sort_keys=True):
+            score += 3
+        except TypeError:
+          continue
+      elif value == existing_value:
+        score += 2
+      elif str(value) == str(existing_value):
+        score += 1
+
+    return score
