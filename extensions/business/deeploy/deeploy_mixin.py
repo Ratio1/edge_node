@@ -253,6 +253,8 @@ class _DeeployMixin:
         plugin_config = requested_by_instance_id.pop(instance_id, None)
         candidate_list = requested_by_signature.get(normalized_signature, [])
         if plugin_config and candidate_list:
+          # Safe to modify list during iteration here because we break immediately after pop
+          # This avoids the typical issue of modifying a list while iterating over it
           for idx, candidate in enumerate(candidate_list):
             if candidate is plugin_config:
               candidate_list.pop(idx)
