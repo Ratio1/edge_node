@@ -223,17 +223,111 @@ class _DeeployMixin:
         DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
         DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
       }
+    else:
+      dct_deeploy_specs = self.deepcopy(dct_deeploy_specs)
+      dct_deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = ts
+      if DEEPLOY_KEYS.DATE_CREATED not in dct_deeploy_specs:
+        dct_deeploy_specs[DEEPLOY_KEYS.DATE_CREATED] = ts
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
-    nodes = [node for plugin_instance in discovered_plugin_instances if (node := plugin_instance.get("NODE")) is not None]
+    requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
+
+    nodes = []
+    plugins_by_node = self.defaultdict(list)
+    for plugin in discovered_plugin_instances:
+      addr = plugin.get(DEEPLOY_PLUGIN_DATA.NODE)
+      if not addr:
+        continue
+
+      if addr not in nodes:
+        nodes.append(addr)
+
+      signature = plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE)
+      normalized_signature = signature.upper() if isinstance(signature, str) else signature
+
+      instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      plugin_config = None
+
+      if instance_id:
+        plugin_config = requested_by_instance_id.pop(instance_id, None)
+        candidate_list = requested_by_signature.get(normalized_signature, [])
+        if plugin_config and candidate_list:
+          # Safe to modify list during iteration here because we break immediately after pop
+          # This avoids the typical issue of modifying a list while iterating over it
+          for idx, candidate in enumerate(candidate_list):
+            if candidate is plugin_config:
+              candidate_list.pop(idx)
+              break
+      else:
+        candidate_list = requested_by_signature.get(normalized_signature, [])
+        for idx, candidate in enumerate(candidate_list):
+          candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+          if not candidate_instance_id:
+            plugin_config = candidate_list.pop(idx)
+            break
+
+      if not plugin_config:
+        config_candidates = requested_by_signature.get(normalized_signature, [])
+        if config_candidates:
+          for idx, candidate in enumerate(config_candidates):
+            candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+            if candidate_instance_id:
+              plugin_config = config_candidates.pop(idx)
+              break
+
+      prepared_plugin = self.deeploy_prepare_single_plugin_instance_update(
+        inputs=inputs,
+        instance_id=plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID),
+        plugin_signature=signature,
+        plugin_config=plugin_config,
+        fallback_instance=plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE),
+      )
+
+      chainstore_key = plugin.get(DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY)
+      if chainstore_key:
+        prepared_plugin[DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_key
+
+      plugins_by_node[addr].append(prepared_plugin)
+
+    unique_nodes = nodes if nodes else []
+
+    if not unique_nodes:
+      target_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, []) if hasattr(inputs, 'get') else []
+      if not target_nodes and hasattr(inputs, DEEPLOY_KEYS.TARGET_NODES):
+        target_nodes = getattr(inputs, DEEPLOY_KEYS.TARGET_NODES)
+      if isinstance(target_nodes, list):
+        unique_nodes = list(target_nodes)
+
+    if requested_by_instance_id:
+      missing_ids = list(requested_by_instance_id.keys())
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.PLUGINS3}: Unknown plugin instance_id(s) in update request: {missing_ids}"
+      )
+
+    if new_plugin_configs:
+      if detected_job_app_type != JOB_APP_TYPES.NATIVE:
+        raise ValueError(
+          f"{DEEPLOY_ERRORS.PLUGINS3}. Adding new plugin instances via update is currently supported only for native apps."
+        )
+      for addr in unique_nodes:
+        for plugin_config in new_plugin_configs:
+          plugin_signature = (
+            plugin_config.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+            or plugin_config.get("signature")
+          )
+          prepared_plugin = self.deeploy_prepare_single_plugin_instance_update(
+            inputs=inputs,
+            instance_id=None,
+            plugin_signature=plugin_signature,
+            plugin_config=plugin_config,
+            fallback_instance=None,
+          )
+          plugins_by_node[addr].append(prepared_plugin)
 
     pipeline_to_save = None
-    for plugin in discovered_plugin_instances:
-      addr = plugin.get("NODE")
-      plugins = [self.deeploy_prepare_single_plugin_instance_update(inputs=inputs, instance_id=plugin.get("instance_id"))]
-
-      nodes_to_peer = nodes
+    for addr, plugins in plugins_by_node.items():
+      nodes_to_peer = unique_nodes
       node_plugins = self.deepcopy(plugins)
 
       # Configure chainstore peers and response keys
@@ -282,6 +376,47 @@ class _DeeployMixin:
     except Exception as e:
       self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
     return response_keys
+
+  def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
+    """
+    Retrieve existing deeploy_specs and refresh the update timestamp.
+    """
+    nodes = []
+    for instance in discovered_plugin_instances:
+      node = instance.get(DEEPLOY_PLUGIN_DATA.NODE)
+      if node and node not in nodes:
+        nodes.append(node)
+
+    try:
+      online_apps = self._get_online_apps(
+        owner=owner,
+        target_nodes=nodes if nodes else None,
+        job_id=job_id,
+      )
+    except Exception as exc:
+      self.Pd(f"Unable to retrieve existing deeploy_specs for update: {exc}", color='r')
+      return None
+
+    specs = None
+    for node, apps in online_apps.items():
+      if app_id and app_id in apps:
+        specs = apps[app_id].get(NetMonCt.DEEPLOY_SPECS)
+        if specs:
+          break
+      for pipeline_name, data in apps.items():
+        candidate_specs = data.get(NetMonCt.DEEPLOY_SPECS)
+        if candidate_specs:
+          specs = candidate_specs
+          break
+      if specs:
+        break
+
+    if not specs or not isinstance(specs, dict):
+      return None
+
+    refreshed_specs = self.deepcopy(specs)
+    refreshed_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+    return refreshed_specs
 
   def __prepare_plugins_for_update(self, inputs, discovered_plugin_instances):
     """
@@ -727,12 +862,63 @@ class _DeeployMixin:
       DEEPLOY_RESOURCES.CPU: total_cpu,
       DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m"
     }
+
+  def _organize_requested_plugins(self, inputs):
+    """
+    Organize requested plugin configurations by instance_id and signature,
+    and separate newly requested plugin instances.
+    """
+    plugins_by_instance_id = {}
+    plugins_by_signature = self.defaultdict(list)
+    new_plugin_configs = []
+
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if not plugins_array or not isinstance(plugins_array, list):
+      return plugins_by_instance_id, plugins_by_signature, new_plugin_configs
+
+    for plugin_instance in plugins_array:
+      if not isinstance(plugin_instance, dict):
+        continue
+
+      signature = (
+        plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+        or plugin_instance.get("signature")
+      )
+      if not signature:
+        continue
+
+      normalized_signature = signature.upper() if isinstance(signature, str) else signature
+      instance_id = (
+        plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or plugin_instance.get("instance_id")
+        or plugin_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+      )
+
+      plugin_copy = self.deepcopy(plugin_instance)
+      legacy_signature_value = plugin_copy.pop("signature", None)
+      if DEEPLOY_KEYS.PLUGIN_SIGNATURE not in plugin_copy and legacy_signature_value is not None:
+        plugin_copy[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = legacy_signature_value
+      plugin_copy[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = plugin_copy.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, signature)
+
+      if instance_id:
+        plugin_copy[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
+        plugins_by_instance_id[instance_id] = plugin_copy
+      else:
+        plugin_copy.pop(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID, None)
+        new_plugin_configs.append(plugin_copy)
+
+      plugins_by_signature[normalized_signature].append(plugin_copy)
+
+    return plugins_by_instance_id, plugins_by_signature, new_plugin_configs
   # TODO: END FIXME
 
   def deeploy_check_payment_and_job_owner(self, inputs, sender, is_create, debug=False):
     """
     Check if the payment is valid for the given job.
     """
+    allow_unpaid = inputs.get("allow_unpaid_job", False)
+    if allow_unpaid:
+      return True
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
     self.Pd(f"Checking payment for job {job_id} by sender {sender}{' (debug mode)' if debug else ''}")
     if not job_id:
@@ -912,16 +1098,79 @@ class _DeeployMixin:
     }
     return plugin
 
-  def deeploy_prepare_single_plugin_instance_update(self, inputs, instance_id):
+  def deeploy_prepare_single_plugin_instance_update(self, inputs, instance_id, plugin_signature=None, plugin_config=None, fallback_instance=None):
     """
     Prepare the a single plugin instance for the pipeline creation.
     """
+    signature = plugin_signature
+
+    if not signature and plugin_config:
+      signature = (
+        plugin_config.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+        or plugin_config.get("signature")
+      )
+
+    if not signature:
+      try:
+        signature = inputs.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, None)
+      except Exception:
+        signature = None
+
+    if not signature and hasattr(inputs, DEEPLOY_KEYS.PLUGIN_SIGNATURE):
+      signature = getattr(inputs, DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+
+    if not signature and fallback_instance and isinstance(fallback_instance, dict):
+      signature = (
+        fallback_instance.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+        or fallback_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+        or fallback_instance.get("signature")
+      )
+
+    if not signature:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.REQUEST7}. 'plugin_signature' not provided for update."
+      )
+
+    if not instance_id:
+      instance_id = self._generate_plugin_instance_id(signature=signature)
+
+    instance_payload = {}
+
+    if plugin_config:
+      config_copy = self.deepcopy(plugin_config)
+      config_copy.pop(DEEPLOY_KEYS.PLUGIN_SIGNATURE, None)
+      config_copy.pop("signature", None)
+      instance_payload = config_copy
+    else:
+      app_params = None
+      try:
+        app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, None)
+      except Exception:
+        app_params = None
+
+      if not app_params and hasattr(inputs, DEEPLOY_KEYS.APP_PARAMS):
+        app_params = getattr(inputs, DEEPLOY_KEYS.APP_PARAMS)
+
+      if app_params and isinstance(app_params, dict):
+        instance_payload = self.deepcopy(app_params)
+      elif fallback_instance and isinstance(fallback_instance, dict):
+        instance_conf = fallback_instance.get("instance_conf")
+        if instance_conf and isinstance(instance_conf, dict):
+          instance_payload = self.deepcopy(instance_conf)
+          instance_payload.pop(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID, None)
+          instance_payload.pop(DEEPLOY_KEYS.PLUGIN_SIGNATURE, None)
+          instance_payload.pop("signature", None)
+        else:
+          instance_payload = {}
+      else:
+        instance_payload = {}
+
     plugin = {
-      self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
-      self.ct.CONFIG_PLUGIN.K_INSTANCES : [
+      self.ct.CONFIG_PLUGIN.K_SIGNATURE: signature,
+      self.ct.CONFIG_PLUGIN.K_INSTANCES: [
         {
-          self.ct.CONFIG_INSTANCE.K_INSTANCE_ID : instance_id,
-          **inputs.app_params
+          self.ct.CONFIG_INSTANCE.K_INSTANCE_ID: instance_id,
+          **instance_payload
         }
       ]
     }
@@ -1098,7 +1347,7 @@ class _DeeployMixin:
     Returns a list of dictionaries containing infomration about plugin instances.
     """
     apps = self._get_online_apps(owner=owner, target_nodes=target_nodes)
-
+    self.P(f"online apps for owner {owner} and target_nodes {target_nodes}: {self.json_dumps(apps)}")
     discovered_plugins = []
     for node, pipelines in apps.items():
       iter_plugins = []
@@ -1619,3 +1868,218 @@ class _DeeployMixin:
           filtered_result[node][app_name] = app_data
       result = filtered_result
     return result
+
+  # TODO: REMOVE THIS, once instance_id is coming from ui for instances that have to be updated
+  # Maybe add is_new_instance:bool for native apps, that want to add an extra plugin
+  def _ensure_plugin_instance_ids(self, inputs, discovered_plugin_instances, owner=None, app_id=None, job_id=None):
+    """
+    Backfill missing instance_id values for plugin updates using discovered plugin instances.
+    """
+    try:
+      plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS, None) if hasattr(inputs, 'get') else None
+    except Exception:
+      plugins_array = None
+
+    if not plugins_array or not isinstance(plugins_array, list):
+      return discovered_plugin_instances
+
+    if not discovered_plugin_instances and (app_id or job_id):
+      try:
+        discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+      except Exception as exc:
+        self.Pd(f"Failed to auto-discover plugin instances for update: {exc}", color='r')
+        discovered_plugin_instances = []
+
+    if not discovered_plugin_instances:
+      return discovered_plugin_instances
+
+    instance_id_key = ct.BIZ_PLUGIN_DATA.INSTANCE_ID
+    chainstore_response_key = ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
+    chainstore_peers_key = ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS
+
+    used_instance_ids = set()
+    for plugin_entry in plugins_array:
+      existing_id = (
+        plugin_entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or plugin_entry.get("instance_id")
+        or plugin_entry.get(instance_id_key)
+      )
+      if existing_id:
+        used_instance_ids.add(existing_id)
+
+    discovered_by_signature = self.defaultdict(list)
+    for plugin in discovered_plugin_instances:
+      signature = plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE)
+      instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if not signature or not instance_id:
+        continue
+      discovered_by_signature[signature.upper()].append(plugin)
+
+    for signature in discovered_by_signature:
+      discovered_by_signature[signature] = sorted(
+        discovered_by_signature[signature],
+        key=lambda item: item.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID) or ""
+      )
+
+    for plugin_entry in plugins_array:
+      current_id = (
+        plugin_entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or plugin_entry.get("instance_id")
+        or plugin_entry.get(instance_id_key)
+      )
+      if current_id:
+        continue
+
+      signature = plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE) or plugin_entry.get("signature")
+      if not signature:
+        continue
+
+      normalized_signature = signature.upper()
+      candidates = discovered_by_signature.get(normalized_signature, [])
+      if not candidates:
+        continue
+
+      match = self._match_native_plugin_candidate(
+        plugin_entry,
+        candidates,
+        used_instance_ids,
+        instance_id_key=instance_id_key,
+        chainstore_response_key=chainstore_response_key,
+        chainstore_peers_key=chainstore_peers_key,
+      )
+
+      if not match:
+        continue
+
+      matched_instance_id = match.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if not matched_instance_id:
+        continue
+
+      plugin_entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = matched_instance_id
+      plugin_entry["instance_id"] = matched_instance_id
+      used_instance_ids.add(matched_instance_id)
+
+      self.Pd(f"Inferred instance_id '{matched_instance_id}' for plugin '{signature}'.", color='g')
+
+    return discovered_plugin_instances
+
+  def _match_native_plugin_candidate(
+    self,
+    plugin_entry,
+    candidates,
+    used_instance_ids,
+    instance_id_key,
+    chainstore_response_key,
+    chainstore_peers_key,
+  ):
+    """
+    Match a plugin update payload without instance_id to an existing discovered instance.
+    """
+    requested_conf = self._extract_plugin_request_conf(
+      plugin_entry,
+      instance_id_key=instance_id_key,
+      chainstore_response_key=chainstore_response_key,
+      chainstore_peers_key=chainstore_peers_key,
+    )
+
+    best_candidate = None
+    best_score = -1
+    for candidate in candidates:
+      candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if not candidate_instance_id or candidate_instance_id in used_instance_ids:
+        continue
+      candidate_conf = self._extract_discovered_plugin_conf(
+        candidate,
+        instance_id_key=instance_id_key,
+        chainstore_response_key=chainstore_response_key,
+        chainstore_peers_key=chainstore_peers_key,
+      )
+      score = self._score_plugin_config_match(requested_conf, candidate_conf)
+      if score > best_score:
+        best_score = score
+        best_candidate = candidate
+
+    if best_candidate is None:
+      for candidate in candidates:
+        candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+        if candidate_instance_id and candidate_instance_id not in used_instance_ids:
+          best_candidate = candidate
+          break
+
+    return best_candidate
+
+  def _extract_plugin_request_conf(self, plugin_entry, instance_id_key, chainstore_response_key, chainstore_peers_key):
+    """
+    Produce a sanitized configuration dict from the update request plugin payload.
+    """
+    ignore_keys = {
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE,
+      DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
+      "signature",
+      "instance_id",
+      instance_id_key,
+      chainstore_response_key,
+      chainstore_peers_key,
+    }
+
+    result = {}
+    for key, value in plugin_entry.items():
+      if key in ignore_keys:
+        continue
+      result[key] = value
+
+    return result
+
+  def _extract_discovered_plugin_conf(self, discovered_plugin, instance_id_key, chainstore_response_key, chainstore_peers_key):
+    """
+    Produce a sanitized configuration dict from an already running plugin instance.
+    """
+    plugin_instance = discovered_plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE, {})
+    instance_conf = {}
+    if isinstance(plugin_instance, dict):
+      instance_conf = plugin_instance.get("instance_conf", plugin_instance)
+      if not isinstance(instance_conf, dict):
+        instance_conf = {}
+
+    ignore_keys = {
+      instance_id_key,
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE,
+      "signature",
+      chainstore_response_key,
+      chainstore_peers_key,
+    }
+
+    result = {}
+    for key, value in instance_conf.items():
+      if key in ignore_keys:
+        continue
+      result[key] = value
+
+    return result
+
+  # TODO: Remove this once instance_ids are sent and make sure instance_id is mandatory.
+  # Update should be done strictly by instance_id.
+  def _score_plugin_config_match(self, requested_conf, existing_conf):
+    """
+    Compute a similarity score between a request payload and an existing instance configuration.
+    """
+    if not requested_conf:
+      return 0
+
+    score = 0
+    for key, value in requested_conf.items():
+      if key not in existing_conf:
+        continue
+      existing_value = existing_conf[key]
+      if isinstance(value, (dict, list)) and isinstance(existing_value, (dict, list)):
+        try:
+          if self.json_dumps(value, sort_keys=True) == self.json_dumps(existing_value, sort_keys=True):
+            score += 3
+        except TypeError:
+          continue
+      elif value == existing_value:
+        score += 2
+      elif str(value) == str(existing_value):
+        score += 1
+
+    return score

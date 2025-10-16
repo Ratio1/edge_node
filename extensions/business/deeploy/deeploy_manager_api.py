@@ -214,6 +214,21 @@ class DeeployManagerApiPlugin(
         discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=sender)
 
         self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
+        deeploy_specs_for_update = None
+        if job_app_type in (JOB_APP_TYPES.NATIVE, JOB_APP_TYPES.GENERIC, JOB_APP_TYPES.SERVICE):
+          discovered_plugin_instances = self._ensure_plugin_instance_ids(
+            inputs=inputs,
+            discovered_plugin_instances=discovered_plugin_instances,
+            owner=sender,
+            app_id=app_id,
+            job_id=job_id,
+          )
+          deeploy_specs_for_update = self._prepare_updated_deeploy_specs(
+            owner=sender,
+            app_id=app_id,
+            job_id=job_id,
+            discovered_plugin_instances=discovered_plugin_instances,
+          )
         nodes = [instance[DEEPLOY_PLUGIN_DATA.NODE] for instance in discovered_plugin_instances]
 
       if is_create:
@@ -238,6 +253,7 @@ class DeeployManagerApiPlugin(
           new_nodes=[],
           update_nodes=nodes,
           discovered_plugin_instances=discovered_plugin_instances,
+          dct_deeploy_specs=deeploy_specs_for_update,
           job_app_type=job_app_type,
         )
       
@@ -335,7 +351,7 @@ class DeeployManagerApiPlugin(
       **Plugin instances:**
         plugins : list
             Array of plugin instance configurations. Each object represents ONE plugin instance:
-            - signature : str (required)
+            - plugin_signature : str (required)
                 The plugin signature (e.g., 'CONTAINER_APP_RUNNER', 'EDGE_NODE_API_TEST')
             - **instance-specific parameters** (varies by plugin type)
                 For CONTAINER_APP_RUNNER:
@@ -355,10 +371,10 @@ class DeeployManagerApiPlugin(
           "target_nodes_count": 1,
           "plugins": [
             {
-              "signature": "EDGE_NODE_API_TEST"
+              "plugin_signature": "EDGE_NODE_API_TEST"
             },
             {
-              "signature": "CONTAINER_APP_RUNNER",
+              "plugin_signature": "CONTAINER_APP_RUNNER",
               "IMAGE": "tvitalii/ratio1-drive:latest",
               "CONTAINER_RESOURCES": {
                 "cpu": 2,
@@ -393,8 +409,8 @@ class DeeployManagerApiPlugin(
     - Multi-plugin pipelines are automatically classified as JOB_APP_TYPE.NATIVE
     - Single CONTAINER_APP_RUNNER is classified as GENERIC or SERVICE
     - Resource requirements are aggregated across all container plugins
-    - Multiple instances of the same plugin: Include multiple objects with the same signature
-    - Example: [{"signature": "PLUGIN_A", ...}, {"signature": "PLUGIN_A", ...}] creates 2 instances
+    - Multiple instances of the same plugin: Include multiple objects with the same plugin_signature
+    - Example: [{"plugin_signature": "PLUGIN_A", ...}, {"plugin_signature": "PLUGIN_A", ...}] creates 2 instances
     - For multi-plugin templates, see DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN in deeploy_const.py
 
     TODO: (Vitalii)
@@ -450,8 +466,10 @@ class DeeployManagerApiPlugin(
       **Plugin instances:**
         plugins : list
             Array of plugin instance configurations. Each object represents ONE plugin instance:
-            - signature : str (required)
-            - **instance-specific parameters**
+            - plugin_signature : str (required)
+            - instance_id : str (required when updating an existing plugin instance)
+            - **instance-specific parameters** (payload merged into the instance configuration)
+              - Omit instance_id to attach a brand new plugin instance; supported for native apps only
 
       **Legacy format:**
         plugin_signature : str
@@ -469,6 +487,7 @@ class DeeployManagerApiPlugin(
     - For multi-plugin pipelines, all plugins are updated with new configurations
     - Resource validation applies the same as create operations
     - The simplified plugins array format is the same as create_pipeline
+    - New plugin instances can be introduced by omitting `instance_id` (native job type only)
     - See create_pipeline endpoint for detailed parameter documentation and examples
 
     """
