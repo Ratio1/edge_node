@@ -216,13 +216,20 @@ class DeeployManagerApiPlugin(
         discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=sender)
 
         self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
-        if job_app_type == JOB_APP_TYPES.NATIVE:
-          discovered_plugin_instances = self._ensure_native_plugin_instance_ids(
+        deeploy_specs_for_update = None
+        if job_app_type in (JOB_APP_TYPES.NATIVE, JOB_APP_TYPES.GENERIC, JOB_APP_TYPES.SERVICE):
+          discovered_plugin_instances = self._ensure_plugin_instance_ids(
             inputs=inputs,
             discovered_plugin_instances=discovered_plugin_instances,
             owner=sender,
             app_id=app_id,
             job_id=job_id,
+          )
+          deeploy_specs_for_update = self._prepare_updated_deeploy_specs(
+            owner=sender,
+            app_id=app_id,
+            job_id=job_id,
+            discovered_plugin_instances=discovered_plugin_instances,
           )
         nodes = [instance[DEEPLOY_PLUGIN_DATA.NODE] for instance in discovered_plugin_instances]
 
@@ -248,6 +255,7 @@ class DeeployManagerApiPlugin(
           new_nodes=[],
           update_nodes=nodes,
           discovered_plugin_instances=discovered_plugin_instances,
+          dct_deeploy_specs=deeploy_specs_for_update,
           job_app_type=job_app_type,
         )
       
@@ -299,9 +307,9 @@ class DeeployManagerApiPlugin(
     })
     return response
 
-  def _ensure_native_plugin_instance_ids(self, inputs, discovered_plugin_instances, owner=None, app_id=None, job_id=None):
+  def _ensure_plugin_instance_ids(self, inputs, discovered_plugin_instances, owner=None, app_id=None, job_id=None):
     """
-    Backfill missing instance_id values for native app plugin updates using discovered plugin instances.
+    Backfill missing instance_id values for plugin updates using discovered plugin instances.
     """
     try:
       plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS, None) if hasattr(inputs, 'get') else None
@@ -315,7 +323,7 @@ class DeeployManagerApiPlugin(
       try:
         discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
       except Exception as exc:
-        self.Pd(f"Failed to auto-discover plugin instances for native job: {exc}", color='r')
+        self.Pd(f"Failed to auto-discover plugin instances for update: {exc}", color='r')
         discovered_plugin_instances = []
 
     if not discovered_plugin_instances:
@@ -387,10 +395,7 @@ class DeeployManagerApiPlugin(
       plugin_entry["instance_id"] = matched_instance_id
       used_instance_ids.add(matched_instance_id)
 
-      self.Pd(
-        f"Inferred instance_id '{matched_instance_id}' for native plugin '{signature}'.",
-        color='g'
-      )
+      self.Pd(f"Inferred instance_id '{matched_instance_id}' for plugin '{signature}'.", color='g')
 
     return discovered_plugin_instances
 

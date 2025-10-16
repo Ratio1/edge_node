@@ -223,6 +223,11 @@ class _DeeployMixin:
         DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
         DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
       }
+    else:
+      dct_deeploy_specs = self.deepcopy(dct_deeploy_specs)
+      dct_deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = ts
+      if DEEPLOY_KEYS.DATE_CREATED not in dct_deeploy_specs:
+        dct_deeploy_specs[DEEPLOY_KEYS.DATE_CREATED] = ts
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
@@ -369,6 +374,47 @@ class _DeeployMixin:
     except Exception as e:
       self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
     return response_keys
+
+  def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
+    """
+    Retrieve existing deeploy_specs and refresh the update timestamp.
+    """
+    nodes = []
+    for instance in discovered_plugin_instances:
+      node = instance.get(DEEPLOY_PLUGIN_DATA.NODE)
+      if node and node not in nodes:
+        nodes.append(node)
+
+    try:
+      online_apps = self._get_online_apps(
+        owner=owner,
+        target_nodes=nodes if nodes else None,
+        job_id=job_id,
+      )
+    except Exception as exc:
+      self.Pd(f"Unable to retrieve existing deeploy_specs for update: {exc}", color='r')
+      return None
+
+    specs = None
+    for node, apps in online_apps.items():
+      if app_id and app_id in apps:
+        specs = apps[app_id].get(NetMonCt.DEEPLOY_SPECS)
+        if specs:
+          break
+      for pipeline_name, data in apps.items():
+        candidate_specs = data.get(NetMonCt.DEEPLOY_SPECS)
+        if candidate_specs:
+          specs = candidate_specs
+          break
+      if specs:
+        break
+
+    if not specs or not isinstance(specs, dict):
+      return None
+
+    refreshed_specs = self.deepcopy(specs)
+    refreshed_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+    return refreshed_specs
 
   def __prepare_plugins_for_update(self, inputs, discovered_plugin_instances):
     """
