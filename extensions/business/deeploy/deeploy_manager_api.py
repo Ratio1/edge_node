@@ -11,9 +11,9 @@ from .deeploy_mixin import _DeeployMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from .deeploy_const import (
-  DEEPLOY_CREATE_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
+  DEEPLOY_CREATE_REQUEST, DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
-  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_PLUGIN_DATA,
+  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
 )
   
 
@@ -161,17 +161,34 @@ class DeeployManagerApiPlugin(
         The response dictionary
     """
     try:
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)   
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      normalized_request = self._normalize_plugins_input(self.deepcopy(request))
+      if DEEPLOY_KEYS.PLUGINS in normalized_request:
+        inputs[DEEPLOY_KEYS.PLUGINS] = normalized_request[DEEPLOY_KEYS.PLUGINS]
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       is_confirmable_job = inputs.chainstore_response
 
-      self._validate_request_input_for_signature(inputs)
-      # Check request mandatory fields.
-      self._check_plugin_signature(inputs.plugin_signature)
+      # Validate plugins array structure and required fields for each plugin
+      plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+      if plugins_array:
+        self._validate_plugins_array(plugins_array)
+      else:
+        # This shouldn't happen after normalization, but handle as fallback
+        raise ValueError(f"{DEEPLOY_ERRORS.REQUEST3}. No plugins array found after normalization.")
 
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
+      job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE, None)
+      if job_app_type:
+        job_app_type = str(job_app_type).lower()
+        if job_app_type not in JOB_APP_TYPES_ALL:
+          raise ValueError(f"Invalid job_app_type '{job_app_type}'. Expected one of {JOB_APP_TYPES_ALL}.")
+      else:
+        job_app_type = self.deeploy_detect_job_app_type(self.deeploy_prepare_plugins(inputs))
+        if job_app_type not in JOB_APP_TYPES_ALL:
+          job_app_type = JOB_APP_TYPES.NATIVE
+      self.P(f"Detected job app type: {job_app_type}")
       
       # Generate or get app_id based on operation type
       if is_create:
@@ -197,6 +214,21 @@ class DeeployManagerApiPlugin(
         discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=sender)
 
         self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
+        deeploy_specs_for_update = None
+        if job_app_type in (JOB_APP_TYPES.NATIVE, JOB_APP_TYPES.GENERIC, JOB_APP_TYPES.SERVICE):
+          discovered_plugin_instances = self._ensure_plugin_instance_ids(
+            inputs=inputs,
+            discovered_plugin_instances=discovered_plugin_instances,
+            owner=sender,
+            app_id=app_id,
+            job_id=job_id,
+          )
+          deeploy_specs_for_update = self._prepare_updated_deeploy_specs(
+            owner=sender,
+            app_id=app_id,
+            job_id=job_id,
+            discovered_plugin_instances=discovered_plugin_instances,
+          )
         nodes = [instance[DEEPLOY_PLUGIN_DATA.NODE] for instance in discovered_plugin_instances]
 
       if is_create:
@@ -209,6 +241,7 @@ class DeeployManagerApiPlugin(
           new_nodes=nodes,
           update_nodes=[],
           discovered_plugin_instances=discovered_plugin_instances,
+          job_app_type=job_app_type,
         )
       else:
         dct_status, str_status = self.check_and_deploy_pipelines(
@@ -220,6 +253,8 @@ class DeeployManagerApiPlugin(
           new_nodes=[],
           update_nodes=nodes,
           discovered_plugin_instances=discovered_plugin_instances,
+          dct_deeploy_specs=deeploy_specs_for_update,
+          job_app_type=job_app_type,
         )
       
       if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
@@ -236,13 +271,20 @@ class DeeployManagerApiPlugin(
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
         dct_request = self.deepcopy(request)
+        dct_request.pop(DEEPLOY_KEYS.APP_PARAMS, None)
       else:
+        # Build simplified request summary (no app_params - data is in plugins array now)
         dct_request = {
           DEEPLOY_KEYS.APP_ALIAS: app_alias,
-          DEEPLOY_KEYS.PLUGIN_SIGNATURE: inputs.plugin_signature,
           DEEPLOY_KEYS.TARGET_NODES: inputs.target_nodes,
           DEEPLOY_KEYS.TARGET_NODES_COUNT: inputs.target_nodes_count,
+          DEEPLOY_KEYS.JOB_APP_TYPE: job_app_type,
         }
+
+        # Include plugins count summary
+        plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+        if plugins_array:
+          dct_request['plugins_count'] = len(plugins_array)
 
       result = {
         DEEPLOY_KEYS.STATUS: str_status,
@@ -254,15 +296,6 @@ class DeeployManagerApiPlugin(
 
       if self.cfg_deeploy_verbose > 1:
         self.P(f"Request Result: {result}")
-
-      # Safely add app_params if they exist and are not empty
-      if hasattr(inputs, DEEPLOY_KEYS.APP_PARAMS):
-        app_params = getattr(inputs, DEEPLOY_KEYS.APP_PARAMS, {})
-        if isinstance(app_params, dict) and app_params:
-          if DEEPLOY_KEYS.APP_PARAMS_IMAGE in app_params:
-            result[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.APP_PARAMS_IMAGE] = app_params[DEEPLOY_KEYS.APP_PARAMS_IMAGE]
-          if DEEPLOY_KEYS.APP_PARAMS_CR in app_params:
-            result[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.APP_PARAMS_CR] = app_params[DEEPLOY_KEYS.APP_PARAMS_CR]
     except Exception as e:
       result = self.__handle_error(e, request)
     #endtry
@@ -275,48 +308,111 @@ class DeeployManagerApiPlugin(
   @BasePlugin.endpoint(method="post")
   # /create_pipeline
   def create_pipeline(
-    self, 
+    self,
     request: dict = DEEPLOY_CREATE_REQUEST
   ):
     """
-    Create a new pipeline on a target node(s)
-        
+    Create a new pipeline on target node(s) with support for multiple plugins.
+
+    Supports two request formats:
+    1. **Plugin instances array (recommended)**: Use 'plugins' array for pipelines with multiple plugins
+    2. **Legacy single-plugin format**: Provide 'plugin_signature'; legacy payloads are normalized into the plugins array
 
     Parameters
     ----------
-    
+
     request: dict containing next fields:
+
       app_alias : str
-        The name (alias) of the app to create
+          The name (alias) of the app to create
 
-      plugin_signature : str
-          The signature of the plugin to use
+      pipeline_input_type : str
+          The pipeline type (e.g., 'void', 'JeevesApiListener')
 
-      target_nodes : list[str]
-          The nodes to create the app on
+      job_id : int
+          The job ID from blockchain
 
-      target_nodes_count : int
-          The number of nodes to create the app on
+      target_nodes : list[str] or target_nodes_count : int
+          Either specific nodes or count of nodes to deploy on
+
+      job_tags : list
+          Tags for filtering target nodes
+          Example: ["KYB", "DC:HOSTINGER", "CT:FR|IT|RO", "REG:EU"]
 
       nonce : str
           The nonce used for signing the request
 
-      job_tags: list
-          Tags and their expected values that the target nodes must have
-        Example: ["KYB","DC:HOSTINGER", "CT:FR|IT|RO", "REG:EU"]
+      EE_ETH_SIGN : str
+          The signature of the request
 
+      EE_ETH_SENDER : str
+          The sender wallet address
 
-      app_params : dict
-          The parameters to pass to the app such as:
+      **Plugin instances:**
+        plugins : list
+            Array of plugin instance configurations. Each object represents ONE plugin instance:
+            - plugin_signature : str (required)
+                The plugin signature (e.g., 'CONTAINER_APP_RUNNER', 'EDGE_NODE_API_TEST')
+            - **instance-specific parameters** (varies by plugin type)
+                For CONTAINER_APP_RUNNER:
+                  - IMAGE : str (required)
+                  - CONTAINER_RESOURCES : dict (required)
+                      - cpu : int
+                      - memory : str (e.g., "4096m", "4g")
+                  - CR, PORT, ENV, VOLUMES, TUNNEL_ENGINE_ENABLED, etc.
+                For native plugins:
+                  - Plugin-specific configuration parameters
 
-            app_params.IMAGE : str
-                The image to use for the app
-            app_params.REGISTRY : str
-                The registry to use for the app
-            app_params.USERNAME : str
-                The username to use for the app
-            app_params.PASSWORD : str
-          
+      **Example request:**
+        {
+          "app_alias": "EdgeNodeApiTest",
+          "pipeline_input_type": "void",
+          "job_id": 123,
+          "target_nodes_count": 1,
+          "plugins": [
+            {
+              "plugin_signature": "EDGE_NODE_API_TEST"
+            },
+            {
+              "plugin_signature": "CONTAINER_APP_RUNNER",
+              "IMAGE": "tvitalii/ratio1-drive:latest",
+              "CONTAINER_RESOURCES": {
+                "cpu": 2,
+                "memory": "4096m"
+              },
+              "PORT": 8080
+            }
+          ],
+          "nonce": "0x...",
+          "EE_ETH_SIGN": "0x...",
+          "EE_ETH_SENDER": "0x..."
+        }
+
+      **Legacy single-plugin format (deprecated):**
+        plugin_signature : str
+            The signature of the single plugin to use. Configuration should remain embedded with the
+            plugin instance data; legacy `app_params` payloads are normalized into the plugins array
+            and omitted from responses.
+
+    Returns
+    -------
+    dict
+        Response containing:
+        - status : str
+        - app_id : str
+        - status_details : dict
+        - request : dict
+        - auth : dict
+
+    Notes
+    -----
+    - Multi-plugin pipelines are automatically classified as JOB_APP_TYPE.NATIVE
+    - Single CONTAINER_APP_RUNNER is classified as GENERIC or SERVICE
+    - Resource requirements are aggregated across all container plugins
+    - Multiple instances of the same plugin: Include multiple objects with the same plugin_signature
+    - Example: [{"plugin_signature": "PLUGIN_A", ...}, {"plugin_signature": "PLUGIN_A", ...}] creates 2 instances
+    - For multi-plugin templates, see DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN in deeploy_const.py
+
     TODO: (Vitalii)
       - Add support to get the ngrok url if NO edge/endpoint is provided but ngrok is STILL used
     TODO: (Vitalii)
@@ -335,42 +431,64 @@ class DeeployManagerApiPlugin(
     request: dict = DEEPLOY_CREATE_REQUEST
   ):
     """
-    Update a pipeline on node(s)
+    Update a pipeline on node(s) with support for multiple plugins.
+
+    Supports the same formats as create_pipeline:
+    1. **Plugin instances array**: Use 'plugins' array for pipelines with multiple plugins
+    2. **Legacy format**: Provide 'plugin_signature'; legacy payloads are normalized into the plugins array
 
     Parameters
     ----------
 
     request: dict containing next fields:
+
+      app_id : str
+          The ID of the app to update (required for updates)
+
       app_alias : str
-        The name (alias) of the app to create
+          The name (alias) of the app
 
-      plugin_signature : str
-          The signature of the plugin to use
+      pipeline_input_type : str
+          The pipeline type
 
-      target_nodes : list[str]
-          The nodes to create the app on
-
-      target_nodes_count : int
-          The number of nodes to create the app on
+      job_id : int
+          The job ID from blockchain
 
       nonce : str
           The nonce used for signing the request
 
-      job_tags: list
-          Tags and their expected values that the target nodes must have
-        Example: ["KYB","DC:HOSTINGER", "CT:FR|IT|RO", "REG:EU"]
+      EE_ETH_SIGN : str
+          The signature of the request
 
+      EE_ETH_SENDER : str
+          The sender wallet address
 
-      app_params : dict
-          The parameters to pass to the app such as:
+      **Plugin instances:**
+        plugins : list
+            Array of plugin instance configurations. Each object represents ONE plugin instance:
+            - plugin_signature : str (required)
+            - instance_id : str (required when updating an existing plugin instance)
+            - **instance-specific parameters** (payload merged into the instance configuration)
+              - Omit instance_id to attach a brand new plugin instance; supported for native apps only
 
-            app_params.IMAGE : str
-                The image to use for the app
-            app_params.REGISTRY : str
-                The registry to use for the app
-            app_params.USERNAME : str
-                The username to use for the app
-            app_params.PASSWORD : str
+      **Legacy format:**
+        plugin_signature : str
+            The signature of the single plugin. Legacy payloads without the plugins array are
+            normalized internally; any deprecated `app_params` field is ignored in responses.
+
+    Returns
+    -------
+    dict
+        Response containing update status and details
+
+    Notes
+    -----
+    - Updates are applied to existing plugin instances on the same nodes
+    - For multi-plugin pipelines, all plugins are updated with new configurations
+    - Resource validation applies the same as create operations
+    - The simplified plugins array format is the same as create_pipeline
+    - New plugin instances can be introduced by omitting `instance_id` (native job type only)
+    - See create_pipeline endpoint for detailed parameter documentation and examples
 
     """
     self.P(f"Received an update_pipeline request with body: {self.json_dumps(request)}")
