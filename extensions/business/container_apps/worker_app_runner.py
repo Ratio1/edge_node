@@ -107,6 +107,30 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
   # --- Command orchestration -------------------------------------------------
 
+  def _build_git_bootstrap_command(self):
+    """Return a shell snippet that installs git if it is missing in the container."""
+    installers = [
+      ("apk", "apk add --no-cache git openssh-client"),
+      ("apt-get", "apt-get update && apt-get install -y git openssh-client"),
+      ("apt", "apt update && apt install -y git openssh-client"),
+      ("yum", "yum install -y git openssh-clients"),
+      ("dnf", "dnf install -y git openssh-clients"),
+      ("microdnf", "microdnf install -y git openssh-clients"),
+      ("pacman", "pacman -Sy --noconfirm git openssh"),
+      ("zypper", "zypper refresh && zypper install -y git openssh"),
+    ]
+
+    checks = []
+    for idx, (binary, install_cmd) in enumerate(installers):
+      clause = "elif" if idx else "if"
+      checks.append(
+        f"{clause} command -v {binary} >/dev/null 2>&1; then echo \"Installing git via {binary}\" && {install_cmd}"
+      )
+    checks.append("else echo \"git is required but no supported package manager was found.\" >&2; exit 1")
+
+    inner_block = " ".join(f"{part};" for part in checks) + " fi;"
+    return f"if ! command -v git >/dev/null 2>&1; then {inner_block} fi"
+
   def _collect_exec_commands(self):
     base_commands = super()._collect_exec_commands()
     if not base_commands:
@@ -120,6 +144,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
     repo_path = REPO_CLONE_PATH
     commands = [
+      self._build_git_bootstrap_command(),
       f"rm -rf {repo_path}",
       f"git clone {self.repo_url} {repo_path}",
     ]
