@@ -27,6 +27,7 @@ _CONFIG = {
   "IMAGE": "node:22",
   "CONTAINER_START_COMMAND": ["sh", "-c", "while true; do sleep 3600; done"],
   "BUILD_AND_RUN_COMMANDS": ["npm install", "npm run build", "npm start"],
+  "SETUP_REPO": True, # defines if we have to set up the repo (should add git clone commands or not)
 
   "VCS_DATA": {
     "PROVIDER": "github",
@@ -141,10 +142,12 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
     repo_path = REPO_CLONE_PATH
     commands = [
-      self._build_git_bootstrap_command(),
-      f"rm -rf {repo_path}",
-      f"git clone {self.repo_url} {repo_path}",
+      self._build_git_bootstrap_command()
     ]
+    if self.cfg_setup_repo:
+      commands.append(f"rm -rf {repo_path}")
+      commands.append(f"git clone {self.repo_url} {repo_path}")
+    # endif
     # last_commit = commit
     commands.extend([f"cd {repo_path} && {cmd}" for cmd in base_commands])
     return commands
