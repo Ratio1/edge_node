@@ -75,8 +75,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
   def _validate_subclass_config(self):
     super()._validate_subclass_config()
 
-    if not self._start_command:
-      raise ValueError("CONTAINER_START_COMMAND is required for WorkerAppRunner")
+    # if not self._start_command:
+    #   raise ValueError("CONTAINER_START_COMMAND is required for WorkerAppRunner")
 
     if not self._build_commands:
       raise ValueError("BUILD_AND_RUN_COMMANDS must contain at least one command for WorkerAppRunner")
@@ -95,7 +95,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     except (TypeError, ValueError) as exc:
       raise ValueError("VCS_DATA.POLL_INTERVAL must be an integer") from exc
 
-    if poll_interval <= 0:
+    if poll_interval < 0:
       raise ValueError("VCS_DATA.POLL_INTERVAL must be positive")
 
     return
