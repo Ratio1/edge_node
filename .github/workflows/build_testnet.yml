@@ -60,13 +60,22 @@ jobs:
           driver: cloud
           endpoint: "naeural/naeural-builder"
 
+      - name: Debug Buildx
+        run: |
+          docker --version
+          docker buildx version
+          echo "=== buildx ls ==="
+          docker buildx ls
+          echo "=== buildx inspect (bootstrap) ==="
+          docker buildx inspect --bootstrap
+
       - name: Cleanup space
         run: |
-              echo "===========docker buildx du ==================="
+              echo "===========docker buildx du (before) ==================="
               docker buildx du
-              echo "===========docker buildx prune -f. Add -af if any other space issues. ============"
-              docker buildx prune -f
-              echo "===========docker buildx du ================="
+              echo "===========docker buildx prune -f --verbose. Add -af if any other space issues. ============"
+              docker buildx prune -f --verbose
+              echo "===========docker buildx du (after) ================="
               docker buildx du
               echo "========================================"
     
