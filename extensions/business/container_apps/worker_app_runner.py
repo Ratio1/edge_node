@@ -27,6 +27,7 @@ _CONFIG = {
   "IMAGE": "node:22",
   "CONTAINER_START_COMMAND": ["sh", "-c", "while true; do sleep 3600; done"],
   "BUILD_AND_RUN_COMMANDS": ["npm install", "npm run build", "npm start"],
+  "SETUP_REPO": True, # defines if we have to set up the repo (should add git clone commands or not)
 
   "VCS_DATA": {
     "PROVIDER": "github",
@@ -75,9 +76,6 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
   def _validate_subclass_config(self):
     super()._validate_subclass_config()
 
-    if not self._start_command:
-      raise ValueError("CONTAINER_START_COMMAND is required for WorkerAppRunner")
-
     if not self._build_commands:
       raise ValueError("BUILD_AND_RUN_COMMANDS must contain at least one command for WorkerAppRunner")
 
@@ -95,7 +93,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     except (TypeError, ValueError) as exc:
       raise ValueError("VCS_DATA.POLL_INTERVAL must be an integer") from exc
 
-    if poll_interval <= 0:
+    if poll_interval < 0:
       raise ValueError("VCS_DATA.POLL_INTERVAL must be positive")
 
     return
@@ -106,6 +104,30 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     return
 
   # --- Command orchestration -------------------------------------------------
+
+  def _build_git_bootstrap_command(self):
+    """Return a shell snippet that installs git if it is missing in the container."""
+    installers = [
+      ("apk", "apk add --no-cache git openssh-client"),
+      ("apt-get", "apt-get update && apt-get install -y git openssh-client"),
+      ("apt", "apt update && apt install -y git openssh-client"),
+      ("yum", "yum install -y git openssh-clients"),
+      ("dnf", "dnf install -y git openssh-clients"),
+      ("microdnf", "microdnf install -y git openssh-clients"),
+      ("pacman", "pacman -Sy --noconfirm git openssh"),
+      ("zypper", "zypper refresh && zypper install -y git openssh"),
+    ]
+
+    checks = []
+    for idx, (binary, install_cmd) in enumerate(installers):
+      clause = "elif" if idx else "if"
+      checks.append(
+        f"{clause} command -v {binary} >/dev/null 2>&1; then echo \"Installing git via {binary}\" && {install_cmd}"
+      )
+    checks.append("else echo \"git is required but no supported package manager was found.\" >&2; exit 1")
+
+    inner_block = " ".join(f"{part};" for part in checks) + " fi;"
+    return f"if ! command -v git >/dev/null 2>&1; then {inner_block} fi"
 
   def _collect_exec_commands(self):
     base_commands = super()._collect_exec_commands()
@@ -120,9 +142,12 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
     repo_path = REPO_CLONE_PATH
     commands = [
-      f"rm -rf {repo_path}",
-      f"git clone {self.repo_url} {repo_path}",
+      self._build_git_bootstrap_command()
     ]
+    if self.cfg_setup_repo:
+      commands.append(f"rm -rf {repo_path}")
+      commands.append(f"git clone {self.repo_url} {repo_path}")
+    # endif
     # last_commit = commit
     commands.extend([f"cd {repo_path} && {cmd}" for cmd in base_commands])
     return commands
