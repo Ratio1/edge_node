@@ -54,26 +54,37 @@ jobs:
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Set up Docker Buildx
+        id: buildx
         uses: docker/setup-buildx-action@v3
         with:
           version: "lab:latest"
           driver: cloud
           endpoint: "naeural/naeural-builder"
 
+      - name: Debug Buildx
+        run: |
+          docker --version
+          docker buildx version
+          echo "=== buildx ls ==="
+          docker buildx ls
+          echo "=== buildx inspect --bootstrap ==="
+          docker buildx inspect --bootstrap
+
       - name: Cleanup space
         run: |
-              echo "===========docker buildx du ==================="
-              docker buildx du
-              echo "===========docker buildx prune -f. Add -af if any other space issues. ============"
-              docker buildx prune -f
-              echo "===========docker buildx du ================="
-              docker buildx du
+              echo "===========docker buildx du  --builder "${{ steps.buildx.outputs.name }}"(before) ==================="
+              docker buildx du --builder "${{ steps.buildx.outputs.name }}"
+              echo "===========docker buildx prune -f --verbose --builder "${{ steps.buildx.outputs.name }}". Add -af if any other space issues. ============"
+              docker buildx prune -f --verbose --builder "${{ steps.buildx.outputs.name }}"
+              echo "===========docker buildx du  --builder "${{ steps.buildx.outputs.name }}"(after) ================="
+              docker buildx du --builder "${{ steps.buildx.outputs.name }}"
               echo "========================================"
     
 
       - name: Build and push Amd64 TESTNET image
         uses: docker/build-push-action@v5
         with:
+          builder: ${{ steps.buildx.outputs.name }}
           context: .
           file: ./Dockerfile_testnet
           push: true
@@ -85,6 +96,7 @@ jobs:
       - name: Build and push Amd64 DEVNET image
         uses: docker/build-push-action@v5
         with:
+          builder: ${{ steps.buildx.outputs.name }}
           context: .
           file: ./Dockerfile_devnet
           push: true
