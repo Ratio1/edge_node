@@ -1813,7 +1813,7 @@ class _DeeployMixin:
 
     if len(discovered_instances) == 0:
       if allow_missing:
-        self.Pd(f"Skipping pipeline stop for job_id={job_id} and owner={owner}")
+        self.Pd(f"Skipping pipeline stop for job_id={job_id} and owner={owner}", color='y')
         return []
       msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for provided "
       msg += f"{f'app_id {app_id}' if app_id else f'job_id {job_id}'} and owner '{owner}'."
