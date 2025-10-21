@@ -94,7 +94,7 @@ jobs:
                 ratio1/edge_node:testnet
 
       - name: Build and push Amd64 DEVNET image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           builder: ${{ steps.buildx.outputs.name }}
           context: .

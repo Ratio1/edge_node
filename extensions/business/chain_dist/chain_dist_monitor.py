@@ -186,7 +186,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
 
     if not self.jobs_to_close[closable_job_id]['job_closed']:
       if (self.time() - self.jobs_to_close[closable_job_id]['start_timer']) > self.jobs_to_close[closable_job_id]['delay']:
-        self.delete_pipeline_from_nodes(job_id=closable_job_id)
+        self.delete_pipeline_from_nodes(job_id=closable_job_id, allow_missing=True)
         self.bc.submit_node_update(job_id=closable_job_id, nodes=[])
         self.jobs_to_close[closable_job_id]['job_closed'] = True
       #endif
