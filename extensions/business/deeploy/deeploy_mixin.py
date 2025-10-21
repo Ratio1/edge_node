@@ -1808,10 +1808,13 @@ class _DeeployMixin:
     
     return netmon_job_ids
   
-  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None):
+  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, allow_missing=False):
     discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
 
     if len(discovered_instances) == 0:
+      if allow_missing:
+        self.Pd(f"Skipping pipeline stop for job_id={job_id} and owner={owner}")
+        return []
       msg = f"{DEEPLOY_ERRORS.NODES3}: No instances found for provided "
       msg += f"{f'app_id {app_id}' if app_id else f'job_id {job_id}'} and owner '{owner}'."
       raise ValueError(msg)
