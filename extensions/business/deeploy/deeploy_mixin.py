@@ -917,7 +917,7 @@ class _DeeployMixin:
     Check if the payment is valid for the given job.
     """
     allow_unpaid = inputs.get("allow_unpaid_job", False)
-    if allow_unpaid:
+    if allow_unpaid and self.bc.get_evm_network() == 'devnet':
       return True
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
     self.Pd(f"Checking payment for job {job_id} by sender {sender}{' (debug mode)' if debug else ''}")
