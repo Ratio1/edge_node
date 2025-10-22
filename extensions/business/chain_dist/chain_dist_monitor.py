@@ -100,6 +100,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
       pass
     else:
       known_apps = self.netmon.network_known_apps()
+      first_closable_job_id = self.bc.get_first_closable_job_id()
       for job_id in unvalidated_job_ids:
         if not job_id:
           continue
@@ -119,7 +120,7 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
         #endfor
         
         # if we have running nodes, submit the update
-        is_job_to_be_closed = self.bc.get_first_closable_job_id() == job_id
+        is_job_to_be_closed = first_closable_job_id == job_id
         if ((not is_job_to_be_closed) and len(running_nodes) > 0) or (is_job_to_be_closed and (len(running_nodes) == 0)):
           running_nodes_eth = [self.bc.node_address_to_eth_address(node) for node in running_nodes]
           running_nodes_eth = sorted(running_nodes_eth)

@@ -229,7 +229,17 @@ class _ContainerUtilsMixin:
 
   def _setup_resource_limits_and_ports(self):
     """
-    Sets up resource limits for the container based on the configuration.
+    Sets up resource limits and port mappings for the container based on configuration.
+
+    Port Handling Logic:
+      1. Process all ports from CONTAINER_RESOURCES["ports"] first
+      2. If main PORT exists and not in ports mapping, allocate it
+      3. All ports (including main PORT) go into extra_ports_mapping
+      4. Validate no duplicate container ports
+
+    Priority:
+      - Explicit mappings in CONTAINER_RESOURCES["ports"] take precedence
+      - Main PORT is allocated dynamically if not explicitly mapped
     """
     DEFAULT_CPU_LIMIT = 1
     DEFAULT_GPU_LIMIT = 0
@@ -244,53 +254,122 @@ class _ContainerUtilsMixin:
 
       ports = container_resources.get("ports", DEFAULT_PORTS)
 
+      # Track which container ports have been mapped to avoid duplicates
+      mapped_container_ports = set()
+      main_port_mapped = False
+
       if len(ports) > 0:
         if isinstance(ports, list):
-          # Handle list of container ports
+          # Handle list of container ports - allocate dynamic host ports
+          self.P("Processing container ports list...")
           for container_port in ports:
-            self.P(f"Additional container port {container_port} specified. Finding available host port ...")
+            if container_port in mapped_container_ports:
+              self.P(f"Warning: Container port {container_port} already mapped, skipping duplicate", color='y')
+              continue
+
+            self.P(f"Container port {container_port} specified. Finding available host port...")
             host_port = self._allocate_port()
             self.extra_ports_mapping[host_port] = container_port
-            self.P(f"Allocated free host port {host_port} for container port {container_port}.")
-        else:
-          # Handle dict of port mappings
-          # Check if main app port is mapped to a specific host port
-          if self.cfg_port and isinstance(ports, dict) and self.cfg_port in ports.values():
-            container_port = self.cfg_port
-            requested_host_port = int(next((k for k, v in ports.items() if v == container_port), 0))
+            mapped_container_ports.add(container_port)
+            self.P(f"Allocated host port {host_port} -> container port {container_port}")
 
-            self.P(f"Main app port {self.cfg_port} is not mapped to any host port in the ports dict. Allocating a new host port ...")
+            # Check if this is the main port
+            if self.cfg_port and container_port == self.cfg_port:
+              self.port = host_port
+              main_port_mapped = True
+              self.P(f"Main PORT {self.cfg_port} mapped to host port {host_port}", color='g')
 
-            self.port = self._allocate_port(requested_host_port, allow_dynamic=True)
+        elif isinstance(ports, dict):
+          # Handle dict of explicit host_port -> container_port mappings
+          self.P("Processing explicit port mappings...")
 
-            if self.port != requested_host_port:
-              self.P(f"Requested host port {requested_host_port} is not available. Allocated port {self.port} instead.")
+          # First, validate for duplicate container ports
+          container_ports_in_dict = list(ports.values())
+          if len(container_ports_in_dict) != len(set(container_ports_in_dict)):
+            raise ValueError(
+              f"Duplicate container ports found in CONTAINER_RESOURCES['ports']: {ports}. "
+              "Each container port can only be mapped once."
+            )
 
-            self.extra_ports_mapping[self.port] = container_port
-
+          # Process all explicit mappings
           for host_port, container_port in ports.items():
             try:
               host_port = int(host_port)
+              container_port = int(container_port)
+
+              # Check if this mapping was already processed
               if host_port in self.extra_ports_mapping:
-                self.Pd(f"Host port {host_port} is already allocated for container port {self.extra_ports_mapping[host_port]}. Skipping allocation.")
-                continue
-              self._allocate_port(host_port)
+                existing_container_port = self.extra_ports_mapping[host_port]
+                if existing_container_port == container_port:
+                  self.Pd(f"Port mapping {host_port}->{container_port} already exists, skipping")
+                  continue
+                else:
+                  raise ValueError(
+                    f"Host port {host_port} is already mapped to container port {existing_container_port}. "
+                    f"Cannot map it to {container_port}"
+                  )
+
+              # Allocate the requested host port
+              self.P(f"Allocating requested host port {host_port} for container port {container_port}...")
+              allocated_port = self._allocate_port(host_port, allow_dynamic=False)
+
+              if allocated_port != host_port:
+                raise RuntimeError(
+                  f"Failed to allocate requested host port {host_port}. "
+                  f"Port may be in use by another process."
+                )
+
               self.extra_ports_mapping[host_port] = container_port
+              mapped_container_ports.add(container_port)
+              self.P(f"Allocated host port {host_port} -> container port {container_port}", color='g')
+
+              # Check if this is the main port
+              if self.cfg_port and container_port == self.cfg_port:
+                self.port = host_port
+                main_port_mapped = True
+                self.P(f"Main PORT {self.cfg_port} mapped to host port {host_port} (from explicit mapping)", color='g')
+
+            except ValueError as e:
+              raise ValueError(f"Invalid port mapping {host_port}:{container_port} - {e}")
             except Exception as e:
-              self.P(f"Port {host_port} is not available.")
-              self.P(e)
-              raise RuntimeError(f"Port {host_port} is not available.")
-          # endfor each port
-        # endif ports list or dict
-      # endif ports
+              self.P(f"Failed to allocate port {host_port}: {e}", color='r')
+              raise RuntimeError(f"Port allocation failed for {host_port}:{container_port}")
+        else:
+          self.P(f"Invalid ports configuration type: {type(ports)}. Expected list or dict.", color='r')
+
+      # Handle main PORT if it exists and wasn't mapped yet
+      if self.cfg_port and not main_port_mapped:
+        if self.cfg_port in mapped_container_ports:
+          # Main PORT was mapped to a different host port in the loop above
+          # Find which host port it was mapped to
+          for h_port, c_port in self.extra_ports_mapping.items():
+            if c_port == self.cfg_port:
+              self.port = h_port
+              self.P(f"Main PORT {self.cfg_port} already mapped to host port {h_port}", color='d')
+              break
+        else:
+          # Allocate a dynamic host port for the main PORT
+          self.P(f"Main PORT {self.cfg_port} not in explicit mappings. Allocating dynamic host port...")
+          self.port = self._allocate_port(allow_dynamic=True)
+          self.extra_ports_mapping[self.port] = self.cfg_port
+          mapped_container_ports.add(self.cfg_port)
+          self.P(f"Allocated host port {self.port} -> main PORT {self.cfg_port}", color='g')
+        # endif main PORT
+      # endif main_port_mapped
     else:
+      # No container resources specified, use defaults
       self._cpu_limit = DEFAULT_CPU_LIMIT
       self._gpu_limit = DEFAULT_GPU_LIMIT
       self._mem_limit = DEFAULT_MEM_LIMIT
-    # endif resource limits
 
-    if not self.port and self.cfg_port:
-      self.port = self._allocate_port(allow_dynamic=True)  # Allocate a port for the container if needed
+      # Still handle main PORT if specified
+      if self.cfg_port:
+        self.P(f"No CONTAINER_RESOURCES specified. Allocating dynamic host port for main PORT {self.cfg_port}...")
+        self.port = self._allocate_port(allow_dynamic=True)
+        self.extra_ports_mapping[self.port] = self.cfg_port
+        self.P(f"Allocated host port {self.port} -> main PORT {self.cfg_port}", color='g')
+      # endif main PORT
+    # endif container_resources
     return
 
   def _set_directory_permissions(self, path, mode=0o777):
@@ -469,6 +548,12 @@ class _ContainerUtilsMixin:
 
   ### COMMON CONTAINER UTILITY METHODS ###
   def _setup_env_and_ports(self):
+    """
+    Sets up environment variables and formats port mappings for Docker.
+
+    This method should NOT allocate ports - only format already-allocated ports.
+    All port allocations happen in _setup_resource_limits_and_ports.
+    """
     # Environment variables
     # allow cfg_env to override default env vars
     self.env = self._get_default_env_vars()
@@ -479,12 +564,21 @@ class _ContainerUtilsMixin:
       self.env.update(self.dynamic_env)
     # endif dynamic env
 
-    # Ports mapping
-    ports_mapping = self.extra_ports_mapping.copy() if self.extra_ports_mapping else {}
-    if self.cfg_port and self.port:
-      ports_mapping[self.port] = self.cfg_port
-    # end if main port
-    self.inverted_ports_mapping = {f"{v}/tcp": str(k) for k, v in ports_mapping.items()}
+    # Format ports for Docker API
+    # Docker expects: {"container_port/tcp": "host_port"}
+    # extra_ports_mapping contains: {host_port: container_port}
+    # All ports (including main PORT) are already in extra_ports_mapping
+    self.inverted_ports_mapping = {
+      f"{container_port}/tcp": str(host_port)
+      for host_port, container_port in self.extra_ports_mapping.items()
+    }
+
+    # Log the final port mapping
+    if self.inverted_ports_mapping:
+      self.P("Final port mappings:", color='b')
+      for container_port, host_port in self.inverted_ports_mapping.items():
+        is_main = "(main)" if self.cfg_port and str(self.cfg_port) in container_port else ""
+        self.P(f"  Container {container_port} -> Host {host_port} {is_main}", color='d')
 
     return
 
