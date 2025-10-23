@@ -472,6 +472,46 @@ class ContainerAppRunnerPlugin(
 
     return result
 
+  def maybe_extra_tunnels_ping(self):
+    """
+    Emit periodic pings with extra tunnel URLs and status.
+    Similar to maybe_tunnel_engine_ping but for extra tunnels.
+    """
+    if not self.extra_tunnel_urls:
+      return
+
+    ping_interval = self.cfg_extra_tunnels_ping_interval
+    if ping_interval is None or not isinstance(ping_interval, (int, float)):
+      return
+
+    ping_interval = max(ping_interval, 0)
+    current_time = self.time()
+
+    if current_time - self._last_extra_tunnels_ping >= ping_interval:
+      ping_data = {}
+
+      # Add extra tunnel URLs
+      if self.extra_tunnel_urls:
+        ping_data['extra_tunnel_urls'] = self.deepcopy(self.extra_tunnel_urls)
+
+      # Add status for each tunnel
+      if self.extra_tunnel_processes:
+        tunnel_status = {}
+        for container_port, process in self.extra_tunnel_processes.items():
+          tunnel_status[container_port] = {
+            "running": process.poll() is None,
+            "url": self.extra_tunnel_urls.get(container_port),
+            "uptime_seconds": int(current_time - self.extra_tunnel_start_times.get(container_port, current_time)),
+          }
+        ping_data['extra_tunnel_status'] = tunnel_status
+
+      if ping_data:
+        self.add_payload_by_fields(**ping_data)
+        self._last_extra_tunnels_ping = current_time
+        self.Pd(f"Extra tunnels ping sent: {len(self.extra_tunnel_urls)} tunnel(s)")
+
+    return
+
   def _get_host_port_for_container_port(self, container_port):
     """
     Get the host port mapped to a container port.
@@ -639,14 +679,32 @@ class ContainerAppRunnerPlugin(
           process.kill()
           process.wait()
 
-      # Clean up log readers
+      # Clean up log readers (following base class pattern)
       log_readers = self.extra_tunnel_log_readers.get(container_port, {})
-      for reader_type, reader in log_readers.items():
-        if reader:
-          try:
-            reader.stop()
-          except Exception as e:
-            self.Pd(f"Error stopping log reader: {e}")
+
+      # Stop stdout reader and read remaining logs
+      stdout_reader = log_readers.get("stdout")
+      if stdout_reader:
+        try:
+          stdout_reader.stop()
+          # Read any remaining logs before cleanup
+          remaining_logs = stdout_reader.get_next_characters()
+          if remaining_logs:
+            self._process_extra_tunnel_log(container_port, remaining_logs, is_error=False)
+        except Exception as e:
+          self.Pd(f"Error stopping stdout reader: {e}")
+
+      # Stop stderr reader and read remaining logs
+      stderr_reader = log_readers.get("stderr")
+      if stderr_reader:
+        try:
+          stderr_reader.stop()
+          # Read any remaining error logs before cleanup
+          remaining_err_logs = stderr_reader.get_next_characters()
+          if remaining_err_logs:
+            self._process_extra_tunnel_log(container_port, remaining_err_logs, is_error=True)
+        except Exception as e:
+          self.Pd(f"Error stopping stderr reader: {e}")
 
       # Clean up references
       self.extra_tunnel_processes.pop(container_port, None)
@@ -1258,5 +1316,6 @@ class ContainerAppRunnerPlugin(
     # Only ping if tunneling is enabled
     if self.cfg_tunnel_engine_enabled:
       self.maybe_tunnel_engine_ping()
+      self.maybe_extra_tunnels_ping()
 
     return
