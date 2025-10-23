@@ -8,20 +8,22 @@ On-init:
   - Volume configuration (including FILE_VOLUMES)
   - Container run
   - tunnel (optional)
- 
+  - extra tunnels (optional)
+
 Loop:
   - check and maybe reload container
   - retrieve logs and maybe show them
-  
+
 On-close:
   - stop container
   - stop tunnel (if needed)
+  - stop extra tunnels (if configured)
   - stop logs process
   - save logs to disk
 
 FILE_VOLUMES Feature:
   Allows dynamic creation and mounting of files with specified content into containers.
-  
+
   Example configuration:
     FILE_VOLUMES = {
       "app_config": {
@@ -33,12 +35,29 @@ FILE_VOLUMES Feature:
         "mounting_point": "/etc/secrets/api.key"
       }
     }
-  
+
   The plugin will:
     1. Extract filename from mounting_point (e.g., "settings.conf", "api.key")
     2. Create a directory under /edge_node/_local_cache/_data/container_volumes/
     3. Write the content to the file
     4. Mount the file into the container at the specified mounting_point
+
+EXTRA_TUNNELS Feature:
+  Allows exposing multiple container ports via Cloudflare tunnels.
+
+  Example configuration:
+    EXTRA_TUNNELS = {
+      9000: "eyJhIjoiY2xvdWRmbGFyZV90b2tlbl8xIn0=",
+      9090: "eyJhIjoiY2xvdWRmbGFyZV90b2tlbl8yIn0=",
+    }
+
+  Notes:
+    - Dict keys can be strings or integers (container ports)
+    - Values are Cloudflare tunnel tokens
+    - Ports can be defined only in EXTRA_TUNNELS (not in CONTAINER_RESOURCES)
+    - If TUNNEL_ENGINE_ENABLED=False, all tunnels (main + extra) are disabled
+    - Each extra tunnel runs independently and auto-restarts on failure
+    - URLs are extracted from logs and included in payloads
 
 
 """
@@ -48,12 +67,13 @@ import requests
 import threading
 import time
 import socket
+import subprocess
 
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
-__VER__ = "0.3.1"
+__VER__ = "0.4.0"
 
 
 _CONFIG = {
@@ -76,6 +96,13 @@ _CONFIG = {
   "TUNNEL_ENGINE_PING_INTERVAL": 30,  # seconds
   "TUNNEL_ENGINE_PARAMETERS": {
   },
+
+  # Cloudflare token for main tunnel (backward compatibility)
+  "CLOUDFLARE_TOKEN": None,
+
+  # Extra tunnels for additional ports: {container_port: "cloudflare_token"}
+  "EXTRA_TUNNELS": {},
+  "EXTRA_TUNNELS_PING_INTERVAL": 30,  # seconds to ping extra tunnel URLs
 
 
   # TODO: this flag needs to be renamed both here and in the ngrok mixin
@@ -183,6 +210,13 @@ class ContainerAppRunnerPlugin(
     # Initialize tunnel process
     self.tunnel_process = None
 
+    # Extra tunnels management
+    self.extra_tunnel_processes = {}  # Dict: {container_port: process_handle}
+    self.extra_tunnel_urls = {}       # Dict: {container_port: public_url}
+    self.extra_tunnel_log_readers = {}  # Dict: {container_port: {"stdout": reader, "stderr": reader}}
+    self.extra_tunnel_configs = {}    # Dict: {container_port: token}
+    self.extra_tunnel_start_times = {}  # Dict: {container_port: timestamp}
+
     # Log streaming
     self.log_thread = None
     self.exec_threads = []
@@ -194,7 +228,8 @@ class ContainerAppRunnerPlugin(
     # Periodic intervals
     self._last_endpoint_check = 0
     self._last_image_check = 0
-    
+    self._last_extra_tunnels_ping = 0
+
     # Image update tracking
     self.current_image_hash = None
 
@@ -288,6 +323,9 @@ class ContainerAppRunnerPlugin(
     self._configure_file_volumes() # setup file volumes with dynamic content
 
     self._setup_env_and_ports()
+
+    # Validate extra tunnels configuration
+    self._validate_extra_tunnels_config()
 
     self._validate_runner_config()
 
@@ -401,6 +439,361 @@ class ContainerAppRunnerPlugin(
       self.tunnel_process = None
       self.P(f"{engine_name} tunnel stopped", color='g')
     return
+
+  def get_tunnel_engine_ping_data(self):
+    """
+    Override to include extra tunnel URLs in payloads.
+
+    Returns:
+      dict: Tunnel data including main app_url and extra tunnel URLs
+    """
+    result = {}
+
+    # Main tunnel URL (backward compatible)
+    if self.app_url is not None:
+      result['app_url'] = self.app_url
+
+    # Extra tunnel URLs
+    if self.extra_tunnel_urls:
+      result['extra_tunnel_urls'] = self.deepcopy(self.extra_tunnel_urls)
+      # Format: {8080: "https://xxx.trycloudflare.com", 9000: "https://yyy.trycloudflare.com"}
+
+    # Extra tunnel status
+    if self.extra_tunnel_processes:
+      tunnel_status = {}
+      for container_port, process in self.extra_tunnel_processes.items():
+        tunnel_status[container_port] = {
+          "running": process.poll() is None,
+          "url": self.extra_tunnel_urls.get(container_port),
+          "start_time": self.time_to_str(self.extra_tunnel_start_times.get(container_port)),
+          "uptime_seconds": int(self.time() - self.extra_tunnel_start_times.get(container_port, self.time())),
+        }
+      result['extra_tunnel_status'] = tunnel_status
+
+    return result
+
+  def maybe_extra_tunnels_ping(self):
+    """
+    Emit periodic pings with extra tunnel URLs and status.
+    Similar to maybe_tunnel_engine_ping but for extra tunnels.
+    """
+    if not self.extra_tunnel_urls:
+      return
+
+    ping_interval = self.cfg_extra_tunnels_ping_interval
+    if ping_interval is None or not isinstance(ping_interval, (int, float)):
+      return
+
+    ping_interval = max(ping_interval, 0)
+    current_time = self.time()
+
+    if current_time - self._last_extra_tunnels_ping >= ping_interval:
+      ping_data = {}
+
+      # Add extra tunnel URLs
+      if self.extra_tunnel_urls:
+        ping_data['extra_tunnel_urls'] = self.deepcopy(self.extra_tunnel_urls)
+
+      # Add status for each tunnel
+      if self.extra_tunnel_processes:
+        tunnel_status = {}
+        for container_port, process in self.extra_tunnel_processes.items():
+          tunnel_status[container_port] = {
+            "running": process.poll() is None,
+            "url": self.extra_tunnel_urls.get(container_port),
+            "uptime_seconds": int(current_time - self.extra_tunnel_start_times.get(container_port, current_time)),
+          }
+        ping_data['extra_tunnel_status'] = tunnel_status
+
+      if ping_data:
+        self.add_payload_by_fields(**ping_data)
+        self._last_extra_tunnels_ping = current_time
+        self.Pd(f"Extra tunnels ping sent: {len(self.extra_tunnel_urls)} tunnel(s)")
+
+    return
+
+  def _get_host_port_for_container_port(self, container_port):
+    """
+    Get the host port mapped to a container port.
+
+    Args:
+      container_port: Container port (int)
+
+    Returns:
+      int or None: Host port if found, None otherwise
+    """
+    for host_port, c_port in self.extra_ports_mapping.items():
+      if c_port == container_port:
+        return host_port
+    return None
+
+  def _build_tunnel_command(self, container_port, token):
+    """
+    Build Cloudflare tunnel command for a specific port.
+
+    Args:
+      container_port: Container port to tunnel
+      token: Cloudflare tunnel token
+
+    Returns:
+      str or None: Command string to execute, or None if error
+    """
+    host_port = self._get_host_port_for_container_port(container_port)
+    if not host_port:
+      self.P(f"No host port found for container port {container_port}", color='r')
+      return None
+
+    return f"cloudflared tunnel --no-autoupdate run --token {token} --url http://127.0.0.1:{host_port}"
+
+  def _should_start_main_tunnel(self):
+    """
+    Determine if the main tunnel should be started.
+
+    Main tunnel starts if:
+    1. TUNNEL_ENGINE_ENABLED=True (checked by caller)
+    2. PORT is defined OR CLOUDFLARE_TOKEN is defined
+    3. Main PORT is not handled by EXTRA_TUNNELS
+
+    Returns:
+      bool: True if main tunnel should start
+    """
+    # Check if we have a token (backward compatibility)
+    has_cloudflare_token = bool(getattr(self, 'cfg_cloudflare_token', None))
+    has_params_token = bool(
+      self.cfg_tunnel_engine_parameters and
+      self.cfg_tunnel_engine_parameters.get("CLOUDFLARE_TOKEN")
+    )
+
+    has_main_token = has_cloudflare_token or has_params_token
+
+    # If no token at all, no main tunnel
+    if not has_main_token:
+      # self.Pd("No main tunnel token configured, skipping main tunnel")
+      return False
+
+    # If PORT is defined and in EXTRA_TUNNELS, skip main tunnel
+    if self.cfg_port and self.cfg_port in self.extra_tunnel_configs:
+      self.P(
+        f"Main PORT {self.cfg_port} is defined in EXTRA_TUNNELS, using extra tunnel instead",
+        color='y'
+      )
+      return False
+
+    return True
+
+  def _start_extra_tunnel(self, container_port, token):
+    """
+    Start a single extra tunnel for a specific container port.
+
+    Args:
+      container_port: Container port to expose
+      token: Cloudflare tunnel token
+
+    Returns:
+      bool: True if tunnel started successfully, False otherwise
+    """
+    if not token:
+      self.P(f"No token provided for extra tunnel on port {container_port}", color='r')
+      return False
+
+    # Build tunnel command
+    command = self._build_tunnel_command(container_port, token)
+    if not command:
+      return False
+
+    # Start tunnel process
+    try:
+      host_port = self._get_host_port_for_container_port(container_port)
+      self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...", color='b')
+      self.Pd(f"  Command: {command}")
+
+      process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0
+      )
+
+      # Create log readers for this tunnel
+      logs_reader = self.LogReader(process.stdout, size=100, daemon=None)
+      err_logs_reader = self.LogReader(process.stderr, size=100, daemon=None)
+
+      # Store process and log readers
+      self.extra_tunnel_processes[container_port] = process
+      self.extra_tunnel_log_readers[container_port] = {
+        "stdout": logs_reader,
+        "stderr": err_logs_reader,
+      }
+      self.extra_tunnel_start_times[container_port] = self.time()
+
+      self.P(f"Extra tunnel for port {container_port} started (PID: {process.pid})", color='g')
+      return True
+
+    except Exception as e:
+      self.P(f"Failed to start extra tunnel for port {container_port}: {e}", color='r')
+      return False
+
+  def start_extra_tunnels(self):
+    """Start all configured extra tunnels."""
+    if not self.extra_tunnel_configs:
+      self.Pd("No extra tunnels configured")
+      return
+
+    self.P(f"Starting {len(self.extra_tunnel_configs)} extra tunnel(s)...", color='b')
+
+    started_count = 0
+    for container_port, token in self.extra_tunnel_configs.items():
+      if self._start_extra_tunnel(container_port, token):
+        started_count += 1
+
+    self.P(
+      f"Started {started_count}/{len(self.extra_tunnel_configs)} extra tunnels",
+      color='g' if started_count == len(self.extra_tunnel_configs) else 'y'
+    )
+    return
+
+  def _stop_extra_tunnel(self, container_port):
+    """
+    Stop a single extra tunnel.
+
+    Args:
+      container_port: Container port whose tunnel should be stopped
+    """
+    process = self.extra_tunnel_processes.get(container_port)
+    if not process:
+      return
+
+    try:
+      self.P(f"Stopping extra tunnel for port {container_port}...", color='b')
+
+      # Read remaining logs before stopping
+      self._read_extra_tunnel_logs(container_port)
+
+      # Stop process
+      if process.poll() is None:  # Still running
+        process.terminate()
+        try:
+          process.wait(timeout=5)
+        except Exception:
+          process.kill()
+          process.wait()
+
+      # Clean up log readers (following base class pattern)
+      log_readers = self.extra_tunnel_log_readers.get(container_port, {})
+
+      # Stop stdout reader and read remaining logs
+      stdout_reader = log_readers.get("stdout")
+      if stdout_reader:
+        try:
+          stdout_reader.stop()
+          # Read any remaining logs before cleanup
+          remaining_logs = stdout_reader.get_next_characters()
+          if remaining_logs:
+            self._process_extra_tunnel_log(container_port, remaining_logs, is_error=False)
+        except Exception as e:
+          self.Pd(f"Error stopping stdout reader: {e}")
+
+      # Stop stderr reader and read remaining logs
+      stderr_reader = log_readers.get("stderr")
+      if stderr_reader:
+        try:
+          stderr_reader.stop()
+          # Read any remaining error logs before cleanup
+          remaining_err_logs = stderr_reader.get_next_characters()
+          if remaining_err_logs:
+            self._process_extra_tunnel_log(container_port, remaining_err_logs, is_error=True)
+        except Exception as e:
+          self.Pd(f"Error stopping stderr reader: {e}")
+
+      # Clean up references
+      self.extra_tunnel_processes.pop(container_port, None)
+      self.extra_tunnel_log_readers.pop(container_port, None)
+      self.extra_tunnel_urls.pop(container_port, None)
+      self.extra_tunnel_start_times.pop(container_port, None)
+
+      self.P(f"Extra tunnel for port {container_port} stopped", color='g')
+
+    except Exception as e:
+      self.P(f"Error stopping extra tunnel for port {container_port}: {e}", color='r')
+
+  def stop_extra_tunnels(self):
+    """Stop all extra tunnels."""
+    if not self.extra_tunnel_processes:
+      return
+
+    self.P(f"Stopping {len(self.extra_tunnel_processes)} extra tunnel(s)...", color='b')
+
+    for container_port in list(self.extra_tunnel_processes.keys()):
+      self._stop_extra_tunnel(container_port)
+
+    self.P("All extra tunnels stopped", color='g')
+
+  def _read_extra_tunnel_logs(self, container_port):
+    """
+    Read and process logs from an extra tunnel.
+
+    Args:
+      container_port: Container port whose tunnel logs to read
+    """
+    log_readers = self.extra_tunnel_log_readers.get(container_port, {})
+
+    # Read stdout
+    stdout_reader = log_readers.get("stdout")
+    if stdout_reader:
+      try:
+        logs = stdout_reader.get_next_characters()
+        if logs:
+          self._process_extra_tunnel_log(container_port, logs, is_error=False)
+      except Exception as e:
+        self.Pd(f"Error reading stdout for tunnel {container_port}: {e}")
+
+    # Read stderr
+    stderr_reader = log_readers.get("stderr")
+    if stderr_reader:
+      try:
+        err_logs = stderr_reader.get_next_characters()
+        if err_logs:
+          self._process_extra_tunnel_log(container_port, err_logs, is_error=True)
+      except Exception as e:
+        self.Pd(f"Error reading stderr for tunnel {container_port}: {e}")
+
+  def _process_extra_tunnel_log(self, container_port, text, is_error=False):
+    """
+    Process tunnel logs and extract URL.
+
+    For Cloudflare: Extract URL from pattern https://*.trycloudflare.com
+
+    Args:
+      container_port: Container port
+      text: Log text
+      is_error: Whether this is error output
+    """
+    log_prefix = f"[TUNNEL:{container_port}]"
+    color = 'r' if is_error else 'd'
+
+    # Log the output
+    for line in text.split('\n'):
+      if line.strip():
+        self.Pd(f"{log_prefix} {line}", score=0)
+
+    # Extract URL if not already found
+    if container_port not in self.extra_tunnel_urls:
+      # Extract Cloudflare URL: https://xxx.trycloudflare.com
+      url_pattern = r'https://[a-z0-9-]+\.trycloudflare\.com'
+      match = self.re.search(url_pattern, text)
+      if match:
+        url = match.group(0)
+        self.extra_tunnel_urls[container_port] = url
+        self.P(f"Extra tunnel URL for port {container_port}: {url}", color='g')
+
+  def read_all_extra_tunnel_logs(self):
+    """Read logs from all extra tunnels."""
+    for container_port in list(self.extra_tunnel_processes.keys()):
+      try:
+        self._read_extra_tunnel_logs(container_port)
+      except Exception as e:
+        self.Pd(f"Error reading logs for tunnel {container_port}: {e}")
 
   def start_container(self):
     """Start the Docker container."""
@@ -630,6 +1023,24 @@ class ContainerAppRunnerPlugin(
     # end try
     return False
 
+  def _check_extra_tunnel_health(self):
+    """
+    Check health of extra tunnels and restart if needed.
+    """
+    for container_port, process in list(self.extra_tunnel_processes.items()):
+      if process.poll() is not None:  # Process exited
+        exit_code = process.returncode
+        self.P(f"Extra tunnel for port {container_port} exited (code {exit_code})", color='r')
+
+        # Clean up dead tunnel
+        self._stop_extra_tunnel(container_port)
+
+        # Restart tunnel
+        token = self.extra_tunnel_configs.get(container_port)
+        if token:
+          self.P(f"Restarting extra tunnel for port {container_port}...", color='y')
+          self._start_extra_tunnel(container_port, token)
+
 
 
 
@@ -657,6 +1068,9 @@ class ContainerAppRunnerPlugin(
 
     # Stop tunnel engine if needed
     self.stop_tunnel_engine()
+
+    # Stop extra tunnels
+    self.stop_extra_tunnels()
 
     # Stop the container if it's running
     self.stop_container()
@@ -791,6 +1205,9 @@ class ContainerAppRunnerPlugin(
     self._configure_file_volumes()
     self._setup_env_and_ports()
 
+    # Revalidate extra tunnels
+    self._validate_extra_tunnels_config()
+
     self._validate_runner_config()
 
     self.container = self.start_container()
@@ -831,8 +1248,13 @@ class ContainerAppRunnerPlugin(
     self._check_health_endpoint(current_time)
     if self.cfg_autoupdate:
       self._check_image_updates(current_time)
+
+    # Check extra tunnel health
+    if self.extra_tunnel_processes:
+      self._check_extra_tunnel_health()
+
     restart_required = self._perform_additional_checks(current_time)
-    
+
     if restart_required:
       self._restart_container()
     return
@@ -866,13 +1288,22 @@ class ContainerAppRunnerPlugin(
     if not self.container:
       self._handle_initial_launch()
 
-    self.maybe_init_tunnel_engine()
+    # Tunnel management (only if TUNNEL_ENGINE_ENABLED=True)
+    if self.cfg_tunnel_engine_enabled:
+      self.maybe_init_tunnel_engine()
+      self.maybe_start_tunnel_engine()
 
-    self.maybe_start_tunnel_engine()
+      # Start main tunnel if configured and not already running
+      if not self.tunnel_process and self._should_start_main_tunnel():
+        self.start_tunnel_engine()
 
-    # Start tunnel engine if not already running
-    if self.cfg_tunnel_engine_enabled and not self.tunnel_process:
-      self.start_tunnel_engine()
+      # Start extra tunnels if configured and not already running
+      if self.extra_tunnel_configs and not self.extra_tunnel_processes:
+        self.start_extra_tunnels()
+
+      # Read logs from all extra tunnels
+      if self.extra_tunnel_processes:
+        self.read_all_extra_tunnel_logs()
 
     if not self._check_container_status():
       return
@@ -881,6 +1312,10 @@ class ContainerAppRunnerPlugin(
     self._maybe_execute_build_and_run()
 
     self._perform_periodic_monitoring()
-    self.maybe_tunnel_engine_ping()
+
+    # Only ping if tunneling is enabled
+    if self.cfg_tunnel_engine_enabled:
+      self.maybe_tunnel_engine_ping()
+      self.maybe_extra_tunnels_ping()
 
     return
