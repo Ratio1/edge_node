@@ -724,15 +724,23 @@ class _ContainerUtilsMixin:
     """
     Normalize extra tunnel config to standard format.
 
-    Supports simple string format: "token" (recommended)
-    Dict keys can be strings or integers.
+    Currently supports simple string format: "token"
+    Named "tunnel config" for future extensibility (e.g., dict with engine, enabled, etc.)
 
     Args:
       container_port: Container port (int)
-      config: Token string
+      config: Token string (future: could be dict with {"token": str, "engine": str, "enabled": bool})
 
     Returns:
-      str: Normalized token string
+      str: Normalized token string (future: could return dict)
+
+    Note:
+      This method is designed to be extended in the future to support more complex
+      tunnel configurations beyond simple token strings, such as:
+      - Different tunnel engines (cloudflare, ngrok, custom)
+      - Per-tunnel enabled/disabled flags
+      - Custom tunnel parameters
+      For now, it only handles string tokens for simplicity.
     """
     if isinstance(config, str):
       return config.strip()
