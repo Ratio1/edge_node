@@ -46,6 +46,31 @@ class _DeeployTargetNodesMixin:
     else:
       return int(float(mem))  # assume bytes
 
+  def _get_request_plugin_signatures(self, inputs):
+    """
+    Extract plugin signatures from normalized request payload.
+    Returns a set of upper-cased signatures covering both legacy and plugins-array formats.
+    """
+    plugin_signatures = set()
+
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if plugins_array and isinstance(plugins_array, list):
+      for plugin_instance in plugins_array:
+        if not isinstance(plugin_instance, dict):
+          continue
+        signature = (
+          plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+          or plugin_instance.get("signature")
+        )
+        if signature:
+          plugin_signatures.add(str(signature).upper())
+
+    legacy_signature = inputs.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+    if legacy_signature:
+      plugin_signatures.add(str(legacy_signature).upper())
+
+    return plugin_signatures
+
   def _check_and_maybe_convert_address(self, node_addr, raise_if_error=True):
     result = None
     if node_addr.startswith("0x"):
@@ -286,14 +311,16 @@ class _DeeployTargetNodesMixin:
     node_req_memory = node_res_req.get(DEEPLOY_RESOURCES.MEMORY)
     node_req_memory_bytes = self._parse_memory(node_req_memory)
     job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
+    plugin_signatures = self._get_request_plugin_signatures(inputs)
+    requires_container_capabilities = CONTAINER_APP_RUNNER_SIGNATURE in plugin_signatures
 
     suitable_nodes_with_resources = {}
     for addr in nodes:
       # Check if the node supports the requested plugin
-      if inputs.plugin_signature in [CONTAINER_APP_RUNNER_SIGNATURE]:
+      if requires_container_capabilities:
         is_did_supported = self.netmon.network_node_has_did(addr=addr)
         if not is_did_supported:
-          self.Pd(f"Node {addr} does not support the requested plugin {inputs.plugin_signature}. Skipping...")
+          self.Pd(f"Node {addr} does not support container deployments. Skipping...")
           continue
 
       if len(job_tags) > 0:
@@ -330,7 +357,9 @@ class _DeeployTargetNodesMixin:
 
   def _find_nodes_for_deeployment(self, inputs):
     # Get required resources from the request
-    required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+    required_resources = self._aggregate_container_resources(inputs) or {}
+    plugin_signatures = self._get_request_plugin_signatures(inputs)
+    has_container_plugins = CONTAINER_APP_RUNNER_SIGNATURE in plugin_signatures
     target_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, None)
 
     if not target_nodes_count:
@@ -360,7 +389,7 @@ class _DeeployTargetNodesMixin:
     apps = self._get_online_apps()
     nodes_that_fit = {}
 
-    if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE: # if plugin in ['CONTAINER APP RUNNER' || WORKER APP RUNNER].
+    if has_container_plugins: # if plugin in ['CONTAINER APP RUNNER' || WORKER APP RUNNER].
       nodes_that_fit = self.__find_suitable_nodes_for_container_app(nodes_with_resources=suitable_nodes_with_resources,
                                                                     container_requested_resources=required_resources,
                                                                     apps=apps)
@@ -481,6 +510,11 @@ class _DeeployTargetNodesMixin:
         DEEPLOY_RESOURCES.REQUIRED: {}
     }
     
+    plugin_signatures = self._get_request_plugin_signatures(inputs)
+    has_container_plugins = CONTAINER_APP_RUNNER_SIGNATURE in plugin_signatures
+    if not has_container_plugins:
+      return result
+
     # Get available resources
     avail_cpu = self.netmon.network_node_get_cpu_avail_cores(addr)
     avail_mem = self.netmon.network_node_available_memory(addr)  # in GB
@@ -488,7 +522,7 @@ class _DeeployTargetNodesMixin:
     avail_disk = self.netmon.network_node_available_disk(addr)  # in bytes
 
     # Get required resources from the request
-    required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+    required_resources = self._aggregate_container_resources(inputs) or {}
     required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
     required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
 
