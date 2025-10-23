@@ -528,7 +528,7 @@ class ContainerAppRunnerPlugin(
 
     # If no token at all, no main tunnel
     if not has_main_token:
-      self.Pd("No main tunnel token configured, skipping main tunnel")
+      # self.Pd("No main tunnel token configured, skipping main tunnel")
       return False
 
     # If PORT is defined and in EXTRA_TUNNELS, skip main tunnel
