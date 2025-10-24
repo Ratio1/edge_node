@@ -1247,18 +1247,32 @@ class ContainerAppRunnerPlugin(
     """Check for a new version of the Docker image and restart container if found."""
     if not self.cfg_autoupdate:
       return
-      
+
     if current_time - self._last_image_check >= self.cfg_autoupdate_interval:
       self._last_image_check = current_time
       latest_image_hash = self._get_latest_image_hash()
-      if latest_image_hash and self.current_image_hash and latest_image_hash != self.current_image_hash:
+
+      # Handle pull failure during update check
+      if not latest_image_hash:
+        self.P("Failed to check for image updates (pull failed). Container continues running.", color='y')
+        return
+
+      # Check if we have a baseline hash to compare
+      if not self.current_image_hash:
+        self.P(f"Establishing baseline image hash: {latest_image_hash}", color='b')
+        self.current_image_hash = latest_image_hash
+        return
+
+      # Check for version change
+      if latest_image_hash != self.current_image_hash:
         self.P(f"New image version detected ({latest_image_hash} != {self.current_image_hash}). Restarting container...", color='y')
-        # Update current_image_hash to the new one
+        # Update current_image_hash to the new one BEFORE restart
+        # This way if restart fails, we don't keep retrying the same version
         self.current_image_hash = latest_image_hash
         # Restart container from scratch
         self._restart_container()
-      elif latest_image_hash:
-        self.P(f"Current image hash: {self.current_image_hash} vs latest: {latest_image_hash}")
+      else:
+        self.Pd(f"Image up to date: {self.current_image_hash}")
       # end if new image hash
     # end if time elapsed
     return
