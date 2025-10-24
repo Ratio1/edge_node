@@ -1143,15 +1143,6 @@ class ContainerAppRunnerPlugin(
       self.P(f"Image pull failed: {e}", color='r')
       return None
 
-  def _ensure_registry_authentication(self):
-    """
-    Ensure registry authentication is performed.
-
-    Returns:
-      bool: True if authenticated or no auth needed, False if auth failed
-    """
-    return self._login_to_registry()
-
   def _pull_image_with_fallback(self):
     """
     Pull image from registry with fallback to local image.
@@ -1168,8 +1159,8 @@ class ContainerAppRunnerPlugin(
     Raises:
       RuntimeError: If authentication fails and no local image exists
     """
-    # Step 1: Ensure authentication
-    if not self._ensure_registry_authentication():
+    # Step 1: Authenticate with registry
+    if not self._login_to_registry():
       self.P("Registry authentication failed", color='y')
       # Try to use local image if authentication fails
       local_img = self._get_local_image()
@@ -1243,38 +1234,84 @@ class ContainerAppRunnerPlugin(
     img = self._pull_image_with_fallback()
     return self._get_image_digest(img)
 
+  def _has_image_hash_changed(self, latest_hash):
+    """
+    Check if image hash has changed from current version.
+
+    Args:
+      latest_hash: Latest image hash from registry
+
+    Returns:
+      bool: True if hash changed and update needed, False otherwise
+    """
+    if not latest_hash:
+      # Pull failed, can't determine if update needed
+      return False
+
+    if not self.current_image_hash:
+      # First time - establish baseline
+      self.P(f"Establishing baseline image hash: {latest_hash}", color='b')
+      self.current_image_hash = latest_hash
+      return False
+
+    # Compare hashes
+    return latest_hash != self.current_image_hash
+
+  def _handle_image_update(self, new_hash):
+    """
+    Handle detected image update by updating hash and restarting container.
+
+    Args:
+      new_hash: New image hash detected
+    """
+    self.P(f"New image version detected ({new_hash} != {self.current_image_hash}). Restarting container...", color='y')
+
+    # Update current_image_hash BEFORE restart
+    # This prevents infinite retry loops if restart fails
+    old_hash = self.current_image_hash
+    self.current_image_hash = new_hash
+
+    try:
+      self._restart_container()
+    except Exception as e:
+      self.P(f"Container restart failed after image update: {e}", color='r')
+      # Hash already updated, won't retry this version
+      self.P(f"Image hash updated from {old_hash} to {new_hash}, but container restart failed", color='y')
+
   def _check_image_updates(self, current_time=None):
-    """Check for a new version of the Docker image and restart container if found."""
+    """
+    Periodic check for image updates when AUTOUPDATE is enabled.
+
+    This method:
+    1. Checks if update check is due (based on interval)
+    2. Pulls latest image and gets its hash
+    3. Compares with current hash
+    4. Triggers restart if changed
+
+    Args:
+      current_time: Current timestamp (for interval checking)
+    """
     if not self.cfg_autoupdate:
       return
 
-    if current_time - self._last_image_check >= self.cfg_autoupdate_interval:
-      self._last_image_check = current_time
-      latest_image_hash = self._get_latest_image_hash()
+    # Check if update check is due
+    if current_time - self._last_image_check < self.cfg_autoupdate_interval:
+      return
 
-      # Handle pull failure during update check
-      if not latest_image_hash:
-        self.P("Failed to check for image updates (pull failed). Container continues running.", color='y')
-        return
+    self._last_image_check = current_time
 
-      # Check if we have a baseline hash to compare
-      if not self.current_image_hash:
-        self.P(f"Establishing baseline image hash: {latest_image_hash}", color='b')
-        self.current_image_hash = latest_image_hash
-        return
+    # Get latest image hash
+    latest_hash = self._get_latest_image_hash()
+    if not latest_hash:
+      self.P("Failed to check for image updates (pull failed). Container continues running.", color='y')
+      return
 
-      # Check for version change
-      if latest_image_hash != self.current_image_hash:
-        self.P(f"New image version detected ({latest_image_hash} != {self.current_image_hash}). Restarting container...", color='y')
-        # Update current_image_hash to the new one BEFORE restart
-        # This way if restart fails, we don't keep retrying the same version
-        self.current_image_hash = latest_image_hash
-        # Restart container from scratch
-        self._restart_container()
-      else:
-        self.Pd(f"Image up to date: {self.current_image_hash}")
-      # end if new image hash
-    # end if time elapsed
+    # Check if update is needed
+    if self._has_image_hash_changed(latest_hash):
+      self._handle_image_update(latest_hash)
+    else:
+      self.Pd(f"Image up to date: {self.current_image_hash}")
+
     return
 
   def _restart_container(self):
@@ -1306,15 +1343,6 @@ class ContainerAppRunnerPlugin(
     self._start_container_log_stream()
     self._maybe_execute_build_and_run()
     return
-
-  def _should_always_pull_image(self):
-    """
-    Determine if image should always be pulled based on configuration.
-
-    Returns:
-      bool: True if AUTOUPDATE or IMAGE_PULL_POLICY requires always pulling
-    """
-    return self.cfg_autoupdate or self.cfg_image_pull_policy == "always"
 
   def _ensure_image_with_autoupdate(self):
     """
