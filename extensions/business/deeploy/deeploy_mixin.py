@@ -4,7 +4,8 @@ from naeural_core import constants as ct
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
-  DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL
+  DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL, \
+  CONTAINERIZED_APPS_SIGNATURES
 
 DEEPLOY_DEBUG = True
 
@@ -855,7 +856,7 @@ class _DeeployMixin:
       self.Pd(f"Plugin {idx}: signature={signature}")
 
       # Only aggregate for CONTAINER_APP_RUNNER and WORKER_APP_RUNNER plugins
-      if signature in [CONTAINER_APP_RUNNER_SIGNATURE, WORKER_APP_RUNNER_SIGNATURE]:
+      if signature in CONTAINERIZED_APPS_SIGNATURES:
         resources = plugin_instance.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
         cpu = resources.get(DEEPLOY_RESOURCES.CPU, 0)
         memory = resources.get(DEEPLOY_RESOURCES.MEMORY, "0m")
