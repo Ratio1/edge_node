@@ -534,5 +534,125 @@ class R1fsManagerApiPlugin(BasePlugin):
     
     return data
 
+
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def delete_file(
+    self,
+    cid: str,
+    unpin_remote: bool = True,
+    run_gc: bool = False,
+    cleanup_local_files: bool = False
+  ):
+    """
+    Delete a file from R1FS by unpinning it locally and optionally on the relay.
+
+    This endpoint removes a file from the decentralized file system by unpinning it.
+    The file is marked for garbage collection and will be removed when GC runs.
+
+    Args:
+        cid (str): Content Identifier of the file to delete
+        unpin_remote (bool, optional): Whether to also unpin from the relay. Default is True
+        run_gc (bool, optional): Whether to run garbage collection immediately. Default is False
+        cleanup_local_files (bool, optional): Whether to remove local downloaded files. Default is False
+
+    Returns:
+        dict: Response containing success status and message:
+            - success: Boolean indicating if deletion was successful
+            - message: Status message
+            - cid: The CID that was deleted
+    """
+    # Log request
+    request_data = {
+      'cid': cid,
+      'unpin_remote': unpin_remote,
+      'run_gc': run_gc,
+      'cleanup_local_files': cleanup_local_files
+    }
+    self._log_request_response("DELETE_FILE", request_data=request_data)
+
+    self.P(f"Deleting file with CID='{cid}', unpin_remote={unpin_remote}, run_gc={run_gc}")
+
+    success = self.r1fs.delete_file(
+      cid=cid,
+      unpin_remote=unpin_remote,
+      run_gc=run_gc,
+      cleanup_local_files=cleanup_local_files,
+      show_logs=True,
+      raise_on_error=False
+    )
+
+    if success:
+      message = f"File {cid} deleted successfully"
+      self.P(message, color='g')
+    else:
+      message = f"Failed to delete file {cid}"
+      self.P(message, color='r')
+
+    response = {
+      "success": success,
+      "message": message,
+      "cid": cid
+    }
+
+    # Log response
+    self._log_request_response("DELETE_FILE", response_data=response)
+
+    return response
+
+
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def delete_files(
+    self,
+    cids: list,
+    unpin_remote: bool = True,
+    run_gc_after_all: bool = True,
+    cleanup_local_files: bool = False
+  ):
+    """
+    Delete multiple files from R1FS in bulk.
+
+    This endpoint removes multiple files from the decentralized file system by
+    unpinning them. More efficient than calling delete_file repeatedly as it
+    can run garbage collection once at the end.
+
+    Args:
+        cids (list): List of Content Identifiers to delete
+        unpin_remote (bool, optional): Whether to also unpin from the relay. Default is True
+        run_gc_after_all (bool, optional): Whether to run GC once after all deletions. Default is True
+        cleanup_local_files (bool, optional): Whether to remove local downloaded files. Default is False
+
+    Returns:
+        dict: Response containing deletion results:
+            - success: List of successfully deleted CIDs
+            - failed: List of CIDs that failed to delete
+            - total: Total number of CIDs processed
+            - success_count: Number of successful deletions
+            - failed_count: Number of failed deletions
+    """
+    # Log request
+    request_data = {
+      'cids': cids,
+      'unpin_remote': unpin_remote,
+      'run_gc_after_all': run_gc_after_all,
+      'cleanup_local_files': cleanup_local_files
+    }
+    self._log_request_response("DELETE_FILES", request_data=request_data)
+
+    self.P(f"Bulk deleting {len(cids)} files, unpin_remote={unpin_remote}, run_gc_after_all={run_gc_after_all}")
+
+    result = self.r1fs.delete_files(
+      cids=cids,
+      unpin_remote=unpin_remote,
+      run_gc_after_all=run_gc_after_all,
+      cleanup_local_files=cleanup_local_files,
+      show_logs=True,
+      raise_on_error=False
+    )
+
+    # Log response
+    self._log_request_response("DELETE_FILES", response_data=result)
+
+    return result
+
 #########################################################################
 #########################################################################
