@@ -1098,15 +1098,135 @@ class ContainerAppRunnerPlugin(
     super(ContainerAppRunnerPlugin, self).on_close()
 
 
+  def _get_local_image(self):
+    """
+    Get the local Docker image if it exists.
+
+    Returns:
+      Image object or None if image doesn't exist locally
+    """
+    if not self.cfg_image:
+      return None
+
+    try:
+      img = self.docker_client.images.get(self.cfg_image)
+      return img
+    except Exception:
+      return None
+
+  def _pull_image_from_registry(self):
+    """
+    Pull image from registry (assumes authentication already done).
+
+    Returns:
+      Image object or None if pull failed
+
+    Raises:
+      RuntimeError: If authentication hasn't been performed
+    """
+    if not self.cfg_image:
+      self.P("No Docker image configured", color='r')
+      return None
+
+    try:
+      self.P(f"Pulling image '{self.cfg_image}'...", color='b')
+      img = self.docker_client.images.pull(self.cfg_image)
+
+      # docker-py may return Image or list[Image]
+      if isinstance(img, list) and img:
+        img = img[-1]
+
+      self.P(f"Successfully pulled image '{self.cfg_image}'", color='g')
+      return img
+
+    except Exception as e:
+      self.P(f"Image pull failed: {e}", color='r')
+      return None
+
+  def _ensure_registry_authentication(self):
+    """
+    Ensure registry authentication is performed.
+
+    Returns:
+      bool: True if authenticated or no auth needed, False if auth failed
+    """
+    return self._login_to_registry()
+
+  def _pull_image_with_fallback(self):
+    """
+    Pull image from registry with fallback to local image.
+
+    This is the main image acquisition method that:
+    1. Authenticates with registry
+    2. Attempts to pull from registry
+    3. Falls back to local image if pull fails
+    4. Returns None only if both pull and local check fail
+
+    Returns:
+      Image object or None if no image is available
+
+    Raises:
+      RuntimeError: If authentication fails and no local image exists
+    """
+    # Step 1: Ensure authentication
+    if not self._ensure_registry_authentication():
+      self.P("Registry authentication failed", color='y')
+      # Try to use local image if authentication fails
+      local_img = self._get_local_image()
+      if local_img:
+        self.P(f"Using local image (registry login failed): {self.cfg_image}", color='y')
+        return local_img
+      raise RuntimeError("Failed to authenticate with registry and no local image available.")
+
+    # Step 2: Attempt to pull from registry
+    img = self._pull_image_from_registry()
+    if img:
+      return img
+
+    # Step 3: Fallback to local image
+    self.P(f"Pull failed, checking for local image: {self.cfg_image}", color='b')
+    local_img = self._get_local_image()
+    if local_img:
+      self.P(f"Using local image as fallback: {self.cfg_image}", color='y')
+      return local_img
+
+    # Step 4: No image available
+    self.P(f"No image available (pull failed and no local image): {self.cfg_image}", color='r')
+    return None
+
+  def _get_image_digest(self, img):
+    """
+    Extract digest hash from image object.
+
+    Args:
+      img: Docker image object
+
+    Returns:
+      str or None: Digest hash (sha256:...) or None
+    """
+    if not img:
+      return None
+
+    try:
+      img.reload()
+    except Exception as e:
+      self.Pd(f"Warning: Could not reload image attributes: {e}")
+
+    attrs = getattr(img, "attrs", {}) or {}
+    repo_digests = attrs.get("RepoDigests") or []
+    if repo_digests:
+      # 'repo@sha256:...'
+      digest = repo_digests[0].split("@")[-1]
+      return digest
+    # Fallback to image id (sha256:...)
+    return getattr(img, "id", None)
+
   def _get_latest_image_hash(self):
     """
     Get the latest identifier for the configured Docker image tag.
 
-    This method tries to resolve the remote content digest for ``self.cfg_image`` by
-    asking the Docker daemon to perform a metadata-only pull (if the image is
-    already up to date, no layers are re-downloaded). It returns the repo digest
-    (e.g., ``sha256:...``) when available; if not available, it falls back to the
-    local image ID.
+    This method pulls the image and extracts its digest for version tracking.
+    Used by AUTOUPDATE feature to detect image changes.
 
     Returns
     -------
@@ -1120,59 +1240,8 @@ class ContainerAppRunnerPlugin(
       credentials configured.
     - This call contacts the registry; tune ``poll_interval`` appropriately.
     """
-    if not self.cfg_image:
-      self.P("No Docker image configured", color='r')
-      return None
-
-    # Ensure we're logged in to the registry before pulling
-    if not self._login_to_registry():
-      raise RuntimeError("Failed to login to container registry. Cannot proceed without authentication.")
-
-    try:
-      self.P(f"Image check: pulling '{self.cfg_image}' for metadata...", color='b')
-      img = self.docker_client.images.pull(self.cfg_image)
-      # docker-py may return Image or list[Image]
-      if isinstance(img, list) and img:
-        img = img[-1]
-      # Ensure attributes loaded
-      try:
-        img.reload()
-      except Exception as e:
-        self.P(f"Warning: Could not reload image attributes: {e}", color='y')
-      # end try
-
-      attrs = getattr(img, "attrs", {}) or {}
-      repo_digests = attrs.get("RepoDigests") or []
-      if repo_digests:
-        # 'repo@sha256:...'
-        digest = repo_digests[0].split("@")[-1]
-        return digest
-      # Fallback to image id (sha256:...)
-      return getattr(img, "id", None)
-      
-    except Exception as e:
-      self.P(f"Image pull failed: {e}", color='r')
-      # Fallback: check local image only
-      try:
-        self.P(f"Checking local image: {self.cfg_image}", color='b')
-        img = self.docker_client.images.get(self.cfg_image)
-        try:
-          img.reload()
-        except Exception as e:
-          self.P(f"Warning: Could not reload local image attributes: {e}", color='y')
-        # end try reload
-        attrs = getattr(img, "attrs", {}) or {}
-        repo_digests = attrs.get("RepoDigests") or []
-        if repo_digests:
-          digest = repo_digests[0].split("@")[-1]
-          return digest
-        return getattr(img, "id", None)
-        
-      except Exception as e2:
-        self.P(f"Could not get local image: {e2}", color='r')
-      # end try check for local image
-    # end try
-    return None
+    img = self._pull_image_with_fallback()
+    return self._get_image_digest(img)
 
   def _check_image_updates(self, current_time=None):
     """Check for a new version of the Docker image and restart container if found."""
@@ -1210,6 +1279,11 @@ class ContainerAppRunnerPlugin(
 
     self._validate_runner_config()
 
+    # Ensure image is available (respecting AUTOUPDATE and IMAGE_PULL_POLICY)
+    if not self._ensure_image_available():
+      self.P("Failed to ensure image availability during restart, cannot start container", color='r')
+      return
+
     self.container = self.start_container()
     if not self.container:
       return
@@ -1219,12 +1293,51 @@ class ContainerAppRunnerPlugin(
     self._maybe_execute_build_and_run()
     return
 
+  def _ensure_image_available(self):
+    """
+    Ensure the container image is available before starting container.
+
+    This method respects both IMAGE_PULL_POLICY and AUTOUPDATE configurations:
+    - If AUTOUPDATE is enabled, always pulls and tracks image hash
+    - If IMAGE_PULL_POLICY is "always", pulls the image
+    - Otherwise, checks if image exists locally and pulls if missing
+
+    Returns:
+      bool: True if image is available, False otherwise
+    """
+    # AUTOUPDATE takes precedence - always pull and track hash
+    if self.cfg_autoupdate:
+      self.Pd("AUTOUPDATE enabled, pulling image and tracking hash")
+      self.current_image_hash = self._get_latest_image_hash()
+      return self.current_image_hash is not None
+
+    # Check IMAGE_PULL_POLICY
+    if self.cfg_image_pull_policy == "always":
+      self.Pd("IMAGE_PULL_POLICY is 'always', pulling image")
+      img = self._pull_image(for_update_check=False)
+      return img is not None
+
+    # Check if image exists locally
+    try:
+      self.docker_client.images.get(self.cfg_image)
+      self.P(f"Image '{self.cfg_image}' found locally", color='g')
+      return True
+    except Exception:
+      # Image not found locally, pull it
+      self.P(f"Image not found locally, pulling '{self.cfg_image}'...", color='b')
+      img = self._pull_image(for_update_check=False)
+      return img is not None
+
   def _handle_initial_launch(self):
     """Handle the initial container launch."""
     try:
       self.P("Initial container launch...", color='b')
-      if self.cfg_autoupdate:
-        self.current_image_hash = self._get_latest_image_hash()
+
+      # Ensure image is available before starting container
+      if not self._ensure_image_available():
+        self.P("Failed to ensure image availability, cannot start container", color='r')
+        return
+
       self.container = self.start_container()
       if not self.container:
         return
