@@ -1293,40 +1293,80 @@ class ContainerAppRunnerPlugin(
     self._maybe_execute_build_and_run()
     return
 
+  def _should_always_pull_image(self):
+    """
+    Determine if image should always be pulled based on configuration.
+
+    Returns:
+      bool: True if AUTOUPDATE or IMAGE_PULL_POLICY requires always pulling
+    """
+    return self.cfg_autoupdate or self.cfg_image_pull_policy == "always"
+
+  def _ensure_image_with_autoupdate(self):
+    """
+    Ensure image is available with autoupdate enabled.
+    Always pulls and tracks hash for version comparison.
+
+    Returns:
+      bool: True if image available and hash tracked, False otherwise
+    """
+    self.Pd("AUTOUPDATE enabled, pulling image and tracking hash")
+    self.current_image_hash = self._get_latest_image_hash()
+    return self.current_image_hash is not None
+
+  def _ensure_image_always_pull(self):
+    """
+    Ensure image is available with 'always' pull policy.
+    Pulls image without tracking hash.
+
+    Returns:
+      bool: True if image pulled successfully, False otherwise
+    """
+    self.Pd("IMAGE_PULL_POLICY is 'always', pulling image")
+    img = self._pull_image_with_fallback()
+    return img is not None
+
+  def _ensure_image_if_not_present(self):
+    """
+    Ensure image is available with 'if-not-present' policy.
+    Only pulls if image doesn't exist locally.
+
+    Returns:
+      bool: True if image is available (locally or after pull), False otherwise
+    """
+    # Check if image exists locally
+    local_img = self._get_local_image()
+    if local_img:
+      self.P(f"Image '{self.cfg_image}' found locally", color='g')
+      return True
+
+    # Image not found locally, pull it
+    self.P(f"Image not found locally, pulling '{self.cfg_image}'...", color='b')
+    img = self._pull_image_with_fallback()
+    return img is not None
+
   def _ensure_image_available(self):
     """
     Ensure the container image is available before starting container.
 
-    This method respects both IMAGE_PULL_POLICY and AUTOUPDATE configurations:
-    - If AUTOUPDATE is enabled, always pulls and tracks image hash
-    - If IMAGE_PULL_POLICY is "always", pulls the image
-    - Otherwise, checks if image exists locally and pulls if missing
+    This method uses a strategy pattern based on configuration:
+    - AUTOUPDATE enabled: Always pull + track hash (update detection)
+    - IMAGE_PULL_POLICY='always': Always pull (no tracking)
+    - IMAGE_PULL_POLICY='if-not-present' or default: Pull only if missing locally
 
     Returns:
       bool: True if image is available, False otherwise
     """
-    # AUTOUPDATE takes precedence - always pull and track hash
+    # Strategy 1: AUTOUPDATE (takes precedence)
     if self.cfg_autoupdate:
-      self.Pd("AUTOUPDATE enabled, pulling image and tracking hash")
-      self.current_image_hash = self._get_latest_image_hash()
-      return self.current_image_hash is not None
+      return self._ensure_image_with_autoupdate()
 
-    # Check IMAGE_PULL_POLICY
+    # Strategy 2: Always pull policy
     if self.cfg_image_pull_policy == "always":
-      self.Pd("IMAGE_PULL_POLICY is 'always', pulling image")
-      img = self._pull_image(for_update_check=False)
-      return img is not None
+      return self._ensure_image_always_pull()
 
-    # Check if image exists locally
-    try:
-      self.docker_client.images.get(self.cfg_image)
-      self.P(f"Image '{self.cfg_image}' found locally", color='g')
-      return True
-    except Exception:
-      # Image not found locally, pull it
-      self.P(f"Image not found locally, pulling '{self.cfg_image}'...", color='b')
-      img = self._pull_image(for_update_check=False)
-      return img is not None
+    # Strategy 3: If-not-present policy (default)
+    return self._ensure_image_if_not_present()
 
   def _handle_initial_launch(self):
     """Handle the initial container launch."""
