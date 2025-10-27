@@ -215,6 +215,7 @@ class DeeployManagerApiPlugin(
         deployment_nodes = self._check_nodes_availability(inputs)
         confirmation_nodes = list(deployment_nodes)
       else:
+        # Discover the live deployment so we can validate node affinity and reuse existing specs.
         pipeline_context = self._gather_running_pipeline_context(
           owner=sender,
           app_id=app_id,
@@ -231,6 +232,7 @@ class DeeployManagerApiPlugin(
         ] if requested_nodes else []
 
         if normalized_requested_nodes:
+          # Reject updates that request a different node set than the one currently running.
           if set(normalized_requested_nodes) != set(current_nodes):
             msg = (
               f"{DEEPLOY_ERRORS.NODES2}: Update request must target existing nodes {current_nodes}. "
@@ -251,6 +253,7 @@ class DeeployManagerApiPlugin(
         inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(current_nodes)
         inputs.target_nodes_count = len(current_nodes)
 
+        # TODO: Assess whether removing the running pipeline before redeploying is safe when the new launch fails.
         self.delete_pipeline_from_nodes(
           app_id=app_id,
           job_id=job_id,
@@ -512,6 +515,7 @@ class DeeployManagerApiPlugin(
 
     Notes
     -----
+    - Existing pipelines are stopped and redeployed in place; requests must reference the active node set.
     - Updates are applied to existing plugin instances on the same nodes
     - For multi-plugin pipelines, all plugins are updated with new configurations
     - Resource validation applies the same as create operations

@@ -439,6 +439,8 @@ class _DeeployMixin:
     """
     Collect information about currently running pipeline instances for a job/app.
 
+    Ensures follow-up operations keep parity with the active deployment state.
+
     Returns
     -------
     dict
