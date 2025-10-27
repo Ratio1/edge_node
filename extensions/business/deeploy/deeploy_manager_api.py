@@ -208,58 +208,90 @@ class DeeployManagerApiPlugin(
 
       # Get nodes based on operation type
       discovered_plugin_instances = []
+      deployment_nodes = []
+      confirmation_nodes = []
+      deeploy_specs_for_update = None
       if is_create:
-        nodes = self._check_nodes_availability(inputs)
+        deployment_nodes = self._check_nodes_availability(inputs)
+        confirmation_nodes = list(deployment_nodes)
       else:
-        discovered_plugin_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=sender)
-
+        # Discover the live deployment so we can validate node affinity and reuse existing specs.
+        pipeline_context = self._gather_running_pipeline_context(
+          owner=sender,
+          app_id=app_id,
+          job_id=job_id,
+        )
+        discovered_plugin_instances = pipeline_context["discovered_instances"]
+        current_nodes = pipeline_context["nodes"]
+        deeploy_specs_for_update = pipeline_context["deeploy_specs"]
         self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
-        deeploy_specs_for_update = None
-        if job_app_type in (JOB_APP_TYPES.NATIVE, JOB_APP_TYPES.GENERIC, JOB_APP_TYPES.SERVICE):
-          discovered_plugin_instances = self._ensure_plugin_instance_ids(
-            inputs=inputs,
-            discovered_plugin_instances=discovered_plugin_instances,
-            owner=sender,
-            app_id=app_id,
-            job_id=job_id,
-          )
-          deeploy_specs_for_update = self._prepare_updated_deeploy_specs(
-            owner=sender,
-            app_id=app_id,
-            job_id=job_id,
-            discovered_plugin_instances=discovered_plugin_instances,
-          )
-        nodes = [instance[DEEPLOY_PLUGIN_DATA.NODE] for instance in discovered_plugin_instances]
 
-      if is_create:
-        dct_status, str_status = self.check_and_deploy_pipelines(
-          sender=sender,
-          inputs=inputs,
+        requested_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None) or []
+        normalized_requested_nodes = [
+          self._check_and_maybe_convert_address(node) for node in requested_nodes
+        ] if requested_nodes else []
+
+        if normalized_requested_nodes:
+          # Reject updates that request a different node set than the one currently running.
+          if set(normalized_requested_nodes) != set(current_nodes):
+            msg = (
+              f"{DEEPLOY_ERRORS.NODES2}: Update request must target existing nodes {current_nodes}. "
+              f"Received {normalized_requested_nodes}."
+            )
+            raise ValueError(msg)
+
+        requested_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, 0)
+        if requested_nodes_count and requested_nodes_count != len(current_nodes):
+          msg = (
+            f"{DEEPLOY_ERRORS.NODES2}: Update request must keep the original number of nodes "
+            f"({len(current_nodes)}). Received {requested_nodes_count}."
+          )
+          raise ValueError(msg)
+
+        inputs[DEEPLOY_KEYS.TARGET_NODES] = current_nodes
+        inputs.target_nodes = current_nodes
+        inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(current_nodes)
+        inputs.target_nodes_count = len(current_nodes)
+
+        # TODO: Assess whether removing the running pipeline before redeploying is safe when the new launch fails.
+        self.delete_pipeline_from_nodes(
           app_id=app_id,
-          app_alias=app_alias,
-          app_type=app_type,
-          new_nodes=nodes,
-          update_nodes=[],
-          discovered_plugin_instances=discovered_plugin_instances,
-          job_app_type=job_app_type,
+          job_id=job_id,
+          owner=sender,
+          discovered_instances=discovered_plugin_instances,
         )
-      else:
-        dct_status, str_status = self.check_and_deploy_pipelines(
-          sender=sender,
-          inputs=inputs,
-          app_id=app_id,
-          app_alias=app_alias,
-          app_type=app_type,
-          new_nodes=[],
-          update_nodes=nodes,
-          discovered_plugin_instances=discovered_plugin_instances,
-          dct_deeploy_specs=deeploy_specs_for_update,
-          job_app_type=job_app_type,
-        )
+
+        deployment_nodes = self._check_nodes_availability(inputs)
+        if set(deployment_nodes) != set(current_nodes):
+          msg = (
+            f"{DEEPLOY_ERRORS.NODES2}: Failed to validate that update runs on existing nodes. "
+            f"Expected {current_nodes}, validated {deployment_nodes}."
+          )
+          raise ValueError(msg)
+        confirmation_nodes = list(deployment_nodes)
+        discovered_plugin_instances = []
+
+      inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_nodes
+      inputs.target_nodes = deployment_nodes
+      inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_nodes)
+      inputs.target_nodes_count = len(deployment_nodes)
+
+      dct_status, str_status = self.check_and_deploy_pipelines(
+        sender=sender,
+        inputs=inputs,
+        app_id=app_id,
+        app_alias=app_alias,
+        app_type=app_type,
+        new_nodes=deployment_nodes,
+        update_nodes=[],
+        discovered_plugin_instances=discovered_plugin_instances,
+        dct_deeploy_specs_create=deeploy_specs_for_update,
+        job_app_type=job_app_type,
+      )
       
-      if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
-        if (dct_status is not None and is_confirmable_job and len(nodes) == len(dct_status)) or not is_confirmable_job:
-          eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in nodes]
+      if is_create and str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+        if (dct_status is not None and is_confirmable_job and len(confirmation_nodes) == len(dct_status)) or not is_confirmable_job:
+          eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in confirmation_nodes]
           eth_nodes = sorted(eth_nodes)
           self.bc.submit_node_update(
             job_id=job_id,
@@ -483,6 +515,7 @@ class DeeployManagerApiPlugin(
 
     Notes
     -----
+    - Existing pipelines are stopped and redeployed in place; requests must reference the active node set.
     - Updates are applied to existing plugin instances on the same nodes
     - For multi-plugin pipelines, all plugins are updated with new configurations
     - Resource validation applies the same as create operations

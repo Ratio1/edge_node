@@ -110,7 +110,7 @@ class _DeeployMixin:
       raise ValueError("Sender {} is not an oracle".format(sender))
     return True
 
-  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=None):
+  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=None, dct_deeploy_specs=None):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
@@ -124,18 +124,34 @@ class _DeeployMixin:
     response_keys = self.defaultdict(list)
 
     ts = self.time()
-    dct_deeploy_specs = {
-      DEEPLOY_KEYS.JOB_ID: job_id,
-      DEEPLOY_KEYS.PROJECT_ID: project_id,
-      DEEPLOY_KEYS.PROJECT_NAME: project_name,
-      DEEPLOY_KEYS.NR_TARGET_NODES: len(nodes),
-      DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
-      DEEPLOY_KEYS.JOB_TAGS: job_tags,
-      DEEPLOY_KEYS.DATE_CREATED: ts,
-      DEEPLOY_KEYS.DATE_UPDATED: ts,
-      DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
-      DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
-    }
+    if dct_deeploy_specs:
+      dct_deeploy_specs = self.deepcopy(dct_deeploy_specs)
+      dct_deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = ts
+      if DEEPLOY_KEYS.DATE_CREATED not in dct_deeploy_specs:
+        dct_deeploy_specs[DEEPLOY_KEYS.DATE_CREATED] = ts
+    else:
+      dct_deeploy_specs = {
+        DEEPLOY_KEYS.NR_TARGET_NODES: len(nodes),
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+        DEEPLOY_KEYS.JOB_TAGS: job_tags,
+        DEEPLOY_KEYS.DATE_CREATED: ts,
+        DEEPLOY_KEYS.DATE_UPDATED: ts,
+        DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
+        DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
+      }
+
+    if job_id is not None or DEEPLOY_KEYS.JOB_ID not in dct_deeploy_specs:
+      dct_deeploy_specs[DEEPLOY_KEYS.JOB_ID] = job_id
+    if project_id is not None or DEEPLOY_KEYS.PROJECT_ID not in dct_deeploy_specs:
+      dct_deeploy_specs[DEEPLOY_KEYS.PROJECT_ID] = project_id
+    if project_name is not None or DEEPLOY_KEYS.PROJECT_NAME not in dct_deeploy_specs:
+      dct_deeploy_specs[DEEPLOY_KEYS.PROJECT_NAME] = project_name
+    dct_deeploy_specs[DEEPLOY_KEYS.NR_TARGET_NODES] = len(nodes)
+    dct_deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = nodes
+    dct_deeploy_specs[DEEPLOY_KEYS.JOB_TAGS] = job_tags
+    dct_deeploy_specs[DEEPLOY_KEYS.SPARE_NODES] = spare_nodes
+    dct_deeploy_specs[DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD] = allow_replication_in_the_wild
+
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
@@ -418,6 +434,46 @@ class _DeeployMixin:
     refreshed_specs = self.deepcopy(specs)
     refreshed_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     return refreshed_specs
+
+  def _gather_running_pipeline_context(self, owner, app_id=None, job_id=None):
+    """
+    Collect information about currently running pipeline instances for a job/app.
+
+    Ensures follow-up operations keep parity with the active deployment state.
+
+    Returns
+    -------
+    dict
+      {
+        'discovered_instances': list,
+        'nodes': list[str],
+        'deeploy_specs': dict | None,
+      }
+    """
+    discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+    nodes = []
+    for instance in discovered_instances:
+      node_addr = instance.get(DEEPLOY_PLUGIN_DATA.NODE)
+      if node_addr and node_addr not in nodes:
+        nodes.append(node_addr)
+
+    if not nodes:
+      msg = f"{DEEPLOY_ERRORS.NODES3}: No running workers found for provided "
+      msg += f"{f'app_id {app_id}' if app_id else f'job_id {job_id}'} and owner '{owner}'."
+      raise ValueError(msg)
+
+    deeploy_specs = self._prepare_updated_deeploy_specs(
+      owner=owner,
+      app_id=app_id,
+      job_id=job_id,
+      discovered_plugin_instances=discovered_instances,
+    )
+
+    return {
+      "discovered_instances": discovered_instances,
+      "nodes": nodes,
+      "deeploy_specs": deeploy_specs,
+    }
 
   def __prepare_plugins_for_update(self, inputs, discovered_plugin_instances):
     """
@@ -1333,7 +1389,7 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None):
+  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None, dct_deeploy_specs_create=None):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
@@ -1349,7 +1405,7 @@ class _DeeployMixin:
       update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs, job_app_type=job_app_type)
       response_keys.update(update_response_keys)
     if len(new_nodes) > 0:
-      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=job_app_type)
+      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=job_app_type, dct_deeploy_specs=dct_deeploy_specs_create)
       response_keys.update(new_response_keys)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
@@ -1873,8 +1929,9 @@ class _DeeployMixin:
     
     return netmon_job_ids
   
-  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, allow_missing=False):
-    discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, allow_missing=False, discovered_instances=None):
+    if discovered_instances is None:
+      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
 
     if len(discovered_instances) == 0:
       if allow_missing:
