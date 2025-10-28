@@ -4,10 +4,23 @@ from io import BytesIO
 
 import base64
 import pdfplumber
-
+import json
+import numpy as np
 
 DEFAULT_X_TOLERANCE = 3
 DEFAULT_Y_TOLERANCE = 3
+DEFAULT_LOOKAHEAD_PX = "auto"
+DEFAULT_LOOKAHEAD_PX_VALUE = 12.0
+
+# DEFAULT_TABLE_SETTINGS = {
+#   "vertical_strategy": "lines",
+#   "horizontal_strategy": "text",
+#   "snap_tolerance": 3,
+#   "join_tolerance": 3,
+#   "edge_min_length": 3,
+#   'min_words_horizontal': 2,
+#   'intersection_x_tolerance': 8,
+# }
 
 
 class PDFParser:
@@ -285,6 +298,70 @@ class PDFParser:
 
     return res
 
+  def maybe_detect_missing_horizontal_lines(
+      self, page: pdfplumber.page.Page, tables,
+      lookahead_px: float = DEFAULT_LOOKAHEAD_PX, epsilon_px: float = 1.0,
+      min_gain_px: float = 2.0
+  ):
+    """
+    For each detected table bbox, peek slightly below its bottom for words aligned within its x-span.
+    If such words exist (likely the "missing" last row), place a synthetic bottom rule just below them.
+    Returns a sorted list of y positions for explicit_horizontal_lines (page-level).
+    """
+    words = page.extract_words(keep_blank_chars=False) or []
+    if not tables or not words:
+      return []
+
+    y_candidates = []
+    page_h = page.height
+
+    for t in tables:
+      if not t.bbox:
+        continue
+      x0, top, x1, bottom = t.bbox  # pdfplumber coords: smaller y = higher on page
+      # Allow a small lookahead below current bbox to catch the unclosed last row
+      if lookahead_px == "auto" or lookahead_px is None:
+        # Compute median gap between rows and median row height to set lookahead
+        rows = [r for r in t.rows if getattr(r, "bbox", None) is not None]
+        rows.sort(key=lambda r: r.bbox[1])  # sort by top y
+        tops = [r.bbox[1] for r in rows]
+        heights = [r.bbox[3] - r.bbox[1] for r in rows]
+        gaps = [tops[i] - tops[i - 1] for i in range(1, len(tops))]
+        gap_median = float(np.median(gaps)) if len(gaps) > 0 else 0.0
+        heights_median = float(np.median(heights))
+        lookahead_px = max(
+          # only 75% to avoid overshooting into footer of page or next table
+          0.75 * max(gap_median,  heights_median),
+          DEFAULT_LOOKAHEAD_PX_VALUE
+        )
+      # endif lookahead_px
+      if not isinstance(lookahead_px, float):
+        lookahead_px = DEFAULT_LOOKAHEAD_PX_VALUE
+      # endif lookahead_px type
+      search_bottom = min(page_h, bottom + lookahead_px)
+
+      # Words inside the table corridor (slightly inset to avoid gutters)
+      inset = 1.0
+      corridor_words = [
+        w for w in words
+        if (w["x0"] >= x0 + inset and w["x1"] <= x1 - inset
+            and w["top"] >= top - inset and w["bottom"] <= search_bottom + inset)
+      ]
+      if not corridor_words:
+        continue
+
+      y_bottom_text = max(w["bottom"] for w in corridor_words)
+
+      # Only add a synthetic line if it is meaningfully below current bbox bottom,
+      # i.e., we would actually expand the table downward.
+      if y_bottom_text - bottom >= min_gain_px:
+        y_explicit = min(page_h - 1.0, y_bottom_text + epsilon_px)
+        y_candidates.append(y_explicit)
+
+    # De-duplicate & sort
+    y_candidates = sorted({round(y, 2) for y in y_candidates})
+    return y_candidates
+
   def pdf_to_dicts(self, pdf: pdfplumber.PDF):
     """
     Extract tables from a PDF and return a list of dictionaries for each record.
@@ -307,6 +384,21 @@ class PDFParser:
       tables = page.find_tables()  # returns Table objects for each detected table
       # Sort tables top-to-bottom by their bounding box (y0 is bottom, y1 is top in pdfplumber coordinates)
       tables.sort(key=lambda t: t.bbox[1] if t.bbox else 0)  # t.bbox = (x0, top, x1, bottom)
+
+      explicit_ys = self.maybe_detect_missing_horizontal_lines(
+        page=page,
+        tables=tables,
+      )
+
+      if explicit_ys:
+        tables = page.find_tables(
+          table_settings={
+            "explicit_horizontal_lines": explicit_ys,
+            "intersection_x_tolerance": 8
+          }
+        )
+        tables.sort(key=lambda t: t.bbox[1] if t.bbox else 0)
+      # endif explicit_ys
 
       for t_obj_index, table_obj in enumerate(tables):
         table_index, prev_headers, prev_headers_raw, prev_table_bbox, prev_page_number, table_records = self.__process_table(
@@ -397,11 +489,13 @@ class PDFParser:
 
 
 if __name__ == "__main__":
+  print(f"Running PDFParser test...")
   def pdf_path_to_base64(pdf_path: str) -> str:
     with open(pdf_path, "rb") as f:
       pdf_bytes = f.read()
     return base64.b64encode(pdf_bytes).decode("utf-8")
 
+  print(f"Creating PDFParser instance...")
   parser = PDFParser()
   pdf_path = "sample_tables.pdf"  # Replace with your PDF file path
 
@@ -433,7 +527,7 @@ if __name__ == "__main__":
       test['result'] = records
       print(f"{prefix}  Extracted {len(records)} records from {test['type']} input:")
       for rec in records:
-        print(f"{prefix}    {rec}")
+        print(f"{prefix}    {json.dumps(rec, indent=2)}")
     except Exception as e:
       print(f"{prefix}  Error processing test {test['type']} input: {e}")
       test['result'] = None
