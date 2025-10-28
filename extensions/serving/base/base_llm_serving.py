@@ -360,8 +360,8 @@ class BaseLlmServing(
       "DATA": [
         warmup_request,
         warmup_request,
-        warmup_request,
-        warmup_request
+        # warmup_request,
+        # warmup_request
       ]
     }
     self._predict(self._pre_process(warmup_inputs_four))
@@ -384,7 +384,11 @@ class BaseLlmServing(
     else:
       # try default device
       # TODO: review method
-      self.device = th.device(self.cfg_default_device)
+      configured_device = self.cfg_default_device
+      if configured_device in ["cuda", "gpu"]:
+        configured_device = "cuda:0"
+      # endif configured_device
+      self.device = th.device(configured_device)
       device_id = self.device.index
       gpu_name = self.log.get_gpu_name(device_id)
       total_mem = self.log.get_gpu_total_mem(device_id)
