@@ -717,3 +717,140 @@ class _ContainerUtilsMixin:
     return True
 
   ### END COMMON CONTAINER UTILITY METHODS ###
+
+  ### EXTRA TUNNELS METHODS ###
+
+  def _normalize_extra_tunnel_config(self, container_port, config):
+    """
+    Normalize extra tunnel config to standard format.
+
+    Currently supports simple string format: "token"
+    Named "tunnel config" for future extensibility (e.g., dict with engine, enabled, etc.)
+
+    Args:
+      container_port: Container port (int)
+      config: Token string (future: could be dict with {"token": str, "engine": str, "enabled": bool})
+
+    Returns:
+      str: Normalized token string (future: could return dict)
+
+    Note:
+      This method is designed to be extended in the future to support more complex
+      tunnel configurations beyond simple token strings, such as:
+      - Different tunnel engines (cloudflare, ngrok, custom)
+      - Per-tunnel enabled/disabled flags
+      - Custom tunnel parameters
+      For now, it only handles string tokens for simplicity.
+    """
+    if isinstance(config, str):
+      return config.strip()
+    else:
+      raise ValueError(
+        f"EXTRA_TUNNELS[{container_port}] must be a string token, got {type(config)}"
+      )
+
+  def _allocate_extra_tunnel_ports(self, container_ports):
+    """
+    Allocate host ports for container ports defined only in EXTRA_TUNNELS.
+
+    This handles the case where CONTAINER_RESOURCES["ports"] is empty but
+    EXTRA_TUNNELS defines ports that need to be exposed.
+
+    Args:
+      container_ports: List of container ports to allocate
+    """
+    self.P(f"Allocating host ports for {len(container_ports)} EXTRA_TUNNELS ports...", color='b')
+
+    for container_port in container_ports:
+      # Check if already allocated (shouldn't be, but safety check)
+      if container_port in self.extra_ports_mapping.values():
+        self.Pd(f"Port {container_port} already allocated, skipping")
+        continue
+
+      # Allocate dynamic host port
+      host_port = self._allocate_port(allow_dynamic=True)
+      self.extra_ports_mapping[host_port] = container_port
+
+      self.P(f"  Allocated host port {host_port} -> container port {container_port}", color='g')
+
+      # Special handling if this is the main PORT
+      if self.cfg_port == container_port and not self.port:
+        self.port = host_port
+        self.P(f"  Main PORT {container_port} mapped to host port {host_port}", color='g')
+
+    # Rebuild inverted_ports_mapping for Docker
+    self.inverted_ports_mapping = {
+      f"{container_port}/tcp": str(host_port)
+      for host_port, container_port in self.extra_ports_mapping.items()
+    }
+
+    self.P(f"Port allocation complete. Total ports: {len(self.extra_ports_mapping)}", color='g')
+    return
+
+  def _validate_extra_tunnels_config(self):
+    """
+    Validate EXTRA_TUNNELS configuration.
+
+    Key behaviors:
+    1. If TUNNEL_ENGINE_ENABLED=False, EXTRA_TUNNELS are IGNORED
+    2. Container ports can be defined only in EXTRA_TUNNELS (not in CONTAINER_RESOURCES)
+    3. Ports from EXTRA_TUNNELS will be allocated dynamically if needed
+    4. Dict keys can be strings or integers
+
+    Returns:
+      bool: True if valid
+    """
+    # Master switch check
+    if not self.cfg_tunnel_engine_enabled:
+      if self.cfg_extra_tunnels:
+        self.P(
+          f"TUNNEL_ENGINE_ENABLED=False: Ignoring {len(self.cfg_extra_tunnels)} EXTRA_TUNNELS",
+          color='y'
+        )
+      return True
+
+    if not self.cfg_extra_tunnels:
+      self.Pd("No EXTRA_TUNNELS configured")
+      return True
+
+    if not isinstance(self.cfg_extra_tunnels, dict):
+      raise ValueError("EXTRA_TUNNELS must be a dictionary {container_port: token}")
+
+    # Track which ports need to be allocated
+    ports_to_allocate = []
+
+    for port_key, tunnel_config in self.cfg_extra_tunnels.items():
+      # Convert port key to integer (handle both string and int keys)
+      try:
+        container_port = int(port_key)
+      except (ValueError, TypeError):
+        raise ValueError(f"EXTRA_TUNNELS key must be integer port, got: {port_key}")
+
+      # Check if port is already allocated
+      is_already_mapped = container_port in self.extra_ports_mapping.values()
+
+      if not is_already_mapped:
+        # Port not in CONTAINER_RESOURCES["ports"], will need to allocate
+        self.Pd(
+          f"EXTRA_TUNNELS port {container_port} not in CONTAINER_RESOURCES['ports'], "
+          f"will allocate dynamically"
+        )
+        ports_to_allocate.append(container_port)
+
+      # Normalize and validate tunnel config
+      try:
+        normalized = self._normalize_extra_tunnel_config(container_port, tunnel_config)
+        if not normalized:
+          raise ValueError(f"EXTRA_TUNNELS[{container_port}] token is empty")
+        self.extra_tunnel_configs[container_port] = normalized
+      except Exception as e:
+        raise ValueError(f"EXTRA_TUNNELS[{container_port}] validation failed: {e}")
+
+    # Allocate ports for EXTRA_TUNNELS not in CONTAINER_RESOURCES
+    if ports_to_allocate:
+      self._allocate_extra_tunnel_ports(ports_to_allocate)
+
+    self.P(f"EXTRA_TUNNELS validated: {len(self.extra_tunnel_configs)} tunnel(s) configured", color='g')
+    return True
+
+  ### END EXTRA TUNNELS METHODS ###

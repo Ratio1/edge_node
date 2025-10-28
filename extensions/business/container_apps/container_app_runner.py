@@ -8,20 +8,22 @@ On-init:
   - Volume configuration (including FILE_VOLUMES)
   - Container run
   - tunnel (optional)
- 
+  - extra tunnels (optional)
+
 Loop:
   - check and maybe reload container
   - retrieve logs and maybe show them
-  
+
 On-close:
   - stop container
   - stop tunnel (if needed)
+  - stop extra tunnels (if configured)
   - stop logs process
   - save logs to disk
 
 FILE_VOLUMES Feature:
   Allows dynamic creation and mounting of files with specified content into containers.
-  
+
   Example configuration:
     FILE_VOLUMES = {
       "app_config": {
@@ -33,12 +35,29 @@ FILE_VOLUMES Feature:
         "mounting_point": "/etc/secrets/api.key"
       }
     }
-  
+
   The plugin will:
     1. Extract filename from mounting_point (e.g., "settings.conf", "api.key")
     2. Create a directory under /edge_node/_local_cache/_data/container_volumes/
     3. Write the content to the file
     4. Mount the file into the container at the specified mounting_point
+
+EXTRA_TUNNELS Feature:
+  Allows exposing multiple container ports via Cloudflare tunnels.
+
+  Example configuration:
+    EXTRA_TUNNELS = {
+      9000: "eyJhIjoiY2xvdWRmbGFyZV90b2tlbl8xIn0=",
+      9090: "eyJhIjoiY2xvdWRmbGFyZV90b2tlbl8yIn0=",
+    }
+
+  Notes:
+    - Dict keys can be strings or integers (container ports)
+    - Values are Cloudflare tunnel tokens
+    - Ports can be defined only in EXTRA_TUNNELS (not in CONTAINER_RESOURCES)
+    - If TUNNEL_ENGINE_ENABLED=False, all tunnels (main + extra) are disabled
+    - Each extra tunnel runs independently and auto-restarts on failure
+    - URLs are extracted from logs and included in payloads
 
 
 """
@@ -48,12 +67,13 @@ import requests
 import threading
 import time
 import socket
+import subprocess
 
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
-__VER__ = "0.3.1"
+__VER__ = "0.4.0"
 
 
 _CONFIG = {
@@ -76,6 +96,13 @@ _CONFIG = {
   "TUNNEL_ENGINE_PING_INTERVAL": 30,  # seconds
   "TUNNEL_ENGINE_PARAMETERS": {
   },
+
+  # Cloudflare token for main tunnel (backward compatibility)
+  "CLOUDFLARE_TOKEN": None,
+
+  # Extra tunnels for additional ports: {container_port: "cloudflare_token"}
+  "EXTRA_TUNNELS": {},
+  "EXTRA_TUNNELS_PING_INTERVAL": 30,  # seconds to ping extra tunnel URLs
 
 
   # TODO: this flag needs to be renamed both here and in the ngrok mixin
@@ -183,6 +210,13 @@ class ContainerAppRunnerPlugin(
     # Initialize tunnel process
     self.tunnel_process = None
 
+    # Extra tunnels management
+    self.extra_tunnel_processes = {}  # Dict: {container_port: process_handle}
+    self.extra_tunnel_urls = {}       # Dict: {container_port: public_url}
+    self.extra_tunnel_log_readers = {}  # Dict: {container_port: {"stdout": reader, "stderr": reader}}
+    self.extra_tunnel_configs = {}    # Dict: {container_port: token}
+    self.extra_tunnel_start_times = {}  # Dict: {container_port: timestamp}
+
     # Log streaming
     self.log_thread = None
     self.exec_threads = []
@@ -194,7 +228,8 @@ class ContainerAppRunnerPlugin(
     # Periodic intervals
     self._last_endpoint_check = 0
     self._last_image_check = 0
-    
+    self._last_extra_tunnels_ping = 0
+
     # Image update tracking
     self.current_image_hash = None
 
@@ -288,6 +323,9 @@ class ContainerAppRunnerPlugin(
     self._configure_file_volumes() # setup file volumes with dynamic content
 
     self._setup_env_and_ports()
+
+    # Validate extra tunnels configuration
+    self._validate_extra_tunnels_config()
 
     self._validate_runner_config()
 
@@ -401,6 +439,361 @@ class ContainerAppRunnerPlugin(
       self.tunnel_process = None
       self.P(f"{engine_name} tunnel stopped", color='g')
     return
+
+  def get_tunnel_engine_ping_data(self):
+    """
+    Override to include extra tunnel URLs in payloads.
+
+    Returns:
+      dict: Tunnel data including main app_url and extra tunnel URLs
+    """
+    result = {}
+
+    # Main tunnel URL (backward compatible)
+    if self.app_url is not None:
+      result['app_url'] = self.app_url
+
+    # Extra tunnel URLs
+    if self.extra_tunnel_urls:
+      result['extra_tunnel_urls'] = self.deepcopy(self.extra_tunnel_urls)
+      # Format: {8080: "https://xxx.trycloudflare.com", 9000: "https://yyy.trycloudflare.com"}
+
+    # Extra tunnel status
+    if self.extra_tunnel_processes:
+      tunnel_status = {}
+      for container_port, process in self.extra_tunnel_processes.items():
+        tunnel_status[container_port] = {
+          "running": process.poll() is None,
+          "url": self.extra_tunnel_urls.get(container_port),
+          "start_time": self.time_to_str(self.extra_tunnel_start_times.get(container_port)),
+          "uptime_seconds": int(self.time() - self.extra_tunnel_start_times.get(container_port, self.time())),
+        }
+      result['extra_tunnel_status'] = tunnel_status
+
+    return result
+
+  def maybe_extra_tunnels_ping(self):
+    """
+    Emit periodic pings with extra tunnel URLs and status.
+    Similar to maybe_tunnel_engine_ping but for extra tunnels.
+    """
+    if not self.extra_tunnel_urls:
+      return
+
+    ping_interval = self.cfg_extra_tunnels_ping_interval
+    if ping_interval is None or not isinstance(ping_interval, (int, float)):
+      return
+
+    ping_interval = max(ping_interval, 0)
+    current_time = self.time()
+
+    if current_time - self._last_extra_tunnels_ping >= ping_interval:
+      ping_data = {}
+
+      # Add extra tunnel URLs
+      if self.extra_tunnel_urls:
+        ping_data['extra_tunnel_urls'] = self.deepcopy(self.extra_tunnel_urls)
+
+      # Add status for each tunnel
+      if self.extra_tunnel_processes:
+        tunnel_status = {}
+        for container_port, process in self.extra_tunnel_processes.items():
+          tunnel_status[container_port] = {
+            "running": process.poll() is None,
+            "url": self.extra_tunnel_urls.get(container_port),
+            "uptime_seconds": int(current_time - self.extra_tunnel_start_times.get(container_port, current_time)),
+          }
+        ping_data['extra_tunnel_status'] = tunnel_status
+
+      if ping_data:
+        self.add_payload_by_fields(**ping_data)
+        self._last_extra_tunnels_ping = current_time
+        self.Pd(f"Extra tunnels ping sent: {len(self.extra_tunnel_urls)} tunnel(s)")
+
+    return
+
+  def _get_host_port_for_container_port(self, container_port):
+    """
+    Get the host port mapped to a container port.
+
+    Args:
+      container_port: Container port (int)
+
+    Returns:
+      int or None: Host port if found, None otherwise
+    """
+    for host_port, c_port in self.extra_ports_mapping.items():
+      if c_port == container_port:
+        return host_port
+    return None
+
+  def _build_tunnel_command(self, container_port, token):
+    """
+    Build Cloudflare tunnel command for a specific port.
+
+    Args:
+      container_port: Container port to tunnel
+      token: Cloudflare tunnel token
+
+    Returns:
+      str or None: Command string to execute, or None if error
+    """
+    host_port = self._get_host_port_for_container_port(container_port)
+    if not host_port:
+      self.P(f"No host port found for container port {container_port}", color='r')
+      return None
+
+    return f"cloudflared tunnel --no-autoupdate run --token {token} --url http://127.0.0.1:{host_port}"
+
+  def _should_start_main_tunnel(self):
+    """
+    Determine if the main tunnel should be started.
+
+    Main tunnel starts if:
+    1. TUNNEL_ENGINE_ENABLED=True (checked by caller)
+    2. PORT is defined OR CLOUDFLARE_TOKEN is defined
+    3. Main PORT is not handled by EXTRA_TUNNELS
+
+    Returns:
+      bool: True if main tunnel should start
+    """
+    # Check if we have a token (backward compatibility)
+    has_cloudflare_token = bool(getattr(self, 'cfg_cloudflare_token', None))
+    has_params_token = bool(
+      self.cfg_tunnel_engine_parameters and
+      self.cfg_tunnel_engine_parameters.get("CLOUDFLARE_TOKEN")
+    )
+
+    has_main_token = has_cloudflare_token or has_params_token
+
+    # If no token at all, no main tunnel
+    if not has_main_token:
+      # self.Pd("No main tunnel token configured, skipping main tunnel")
+      return False
+
+    # If PORT is defined and in EXTRA_TUNNELS, skip main tunnel
+    if self.cfg_port and self.cfg_port in self.extra_tunnel_configs:
+      self.P(
+        f"Main PORT {self.cfg_port} is defined in EXTRA_TUNNELS, using extra tunnel instead",
+        color='y'
+      )
+      return False
+
+    return True
+
+  def _start_extra_tunnel(self, container_port, token):
+    """
+    Start a single extra tunnel for a specific container port.
+
+    Args:
+      container_port: Container port to expose
+      token: Cloudflare tunnel token
+
+    Returns:
+      bool: True if tunnel started successfully, False otherwise
+    """
+    if not token:
+      self.P(f"No token provided for extra tunnel on port {container_port}", color='r')
+      return False
+
+    # Build tunnel command
+    command = self._build_tunnel_command(container_port, token)
+    if not command:
+      return False
+
+    # Start tunnel process
+    try:
+      host_port = self._get_host_port_for_container_port(container_port)
+      self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...", color='b')
+      self.Pd(f"  Command: {command}")
+
+      process = subprocess.Popen(
+        command,
+        shell=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=0
+      )
+
+      # Create log readers for this tunnel
+      logs_reader = self.LogReader(process.stdout, size=100, daemon=None)
+      err_logs_reader = self.LogReader(process.stderr, size=100, daemon=None)
+
+      # Store process and log readers
+      self.extra_tunnel_processes[container_port] = process
+      self.extra_tunnel_log_readers[container_port] = {
+        "stdout": logs_reader,
+        "stderr": err_logs_reader,
+      }
+      self.extra_tunnel_start_times[container_port] = self.time()
+
+      self.P(f"Extra tunnel for port {container_port} started (PID: {process.pid})", color='g')
+      return True
+
+    except Exception as e:
+      self.P(f"Failed to start extra tunnel for port {container_port}: {e}", color='r')
+      return False
+
+  def start_extra_tunnels(self):
+    """Start all configured extra tunnels."""
+    if not self.extra_tunnel_configs:
+      self.Pd("No extra tunnels configured")
+      return
+
+    self.P(f"Starting {len(self.extra_tunnel_configs)} extra tunnel(s)...", color='b')
+
+    started_count = 0
+    for container_port, token in self.extra_tunnel_configs.items():
+      if self._start_extra_tunnel(container_port, token):
+        started_count += 1
+
+    self.P(
+      f"Started {started_count}/{len(self.extra_tunnel_configs)} extra tunnels",
+      color='g' if started_count == len(self.extra_tunnel_configs) else 'y'
+    )
+    return
+
+  def _stop_extra_tunnel(self, container_port):
+    """
+    Stop a single extra tunnel.
+
+    Args:
+      container_port: Container port whose tunnel should be stopped
+    """
+    process = self.extra_tunnel_processes.get(container_port)
+    if not process:
+      return
+
+    try:
+      self.P(f"Stopping extra tunnel for port {container_port}...", color='b')
+
+      # Read remaining logs before stopping
+      self._read_extra_tunnel_logs(container_port)
+
+      # Stop process
+      if process.poll() is None:  # Still running
+        process.terminate()
+        try:
+          process.wait(timeout=5)
+        except Exception:
+          process.kill()
+          process.wait()
+
+      # Clean up log readers (following base class pattern)
+      log_readers = self.extra_tunnel_log_readers.get(container_port, {})
+
+      # Stop stdout reader and read remaining logs
+      stdout_reader = log_readers.get("stdout")
+      if stdout_reader:
+        try:
+          stdout_reader.stop()
+          # Read any remaining logs before cleanup
+          remaining_logs = stdout_reader.get_next_characters()
+          if remaining_logs:
+            self._process_extra_tunnel_log(container_port, remaining_logs, is_error=False)
+        except Exception as e:
+          self.Pd(f"Error stopping stdout reader: {e}")
+
+      # Stop stderr reader and read remaining logs
+      stderr_reader = log_readers.get("stderr")
+      if stderr_reader:
+        try:
+          stderr_reader.stop()
+          # Read any remaining error logs before cleanup
+          remaining_err_logs = stderr_reader.get_next_characters()
+          if remaining_err_logs:
+            self._process_extra_tunnel_log(container_port, remaining_err_logs, is_error=True)
+        except Exception as e:
+          self.Pd(f"Error stopping stderr reader: {e}")
+
+      # Clean up references
+      self.extra_tunnel_processes.pop(container_port, None)
+      self.extra_tunnel_log_readers.pop(container_port, None)
+      self.extra_tunnel_urls.pop(container_port, None)
+      self.extra_tunnel_start_times.pop(container_port, None)
+
+      self.P(f"Extra tunnel for port {container_port} stopped", color='g')
+
+    except Exception as e:
+      self.P(f"Error stopping extra tunnel for port {container_port}: {e}", color='r')
+
+  def stop_extra_tunnels(self):
+    """Stop all extra tunnels."""
+    if not self.extra_tunnel_processes:
+      return
+
+    self.P(f"Stopping {len(self.extra_tunnel_processes)} extra tunnel(s)...", color='b')
+
+    for container_port in list(self.extra_tunnel_processes.keys()):
+      self._stop_extra_tunnel(container_port)
+
+    self.P("All extra tunnels stopped", color='g')
+
+  def _read_extra_tunnel_logs(self, container_port):
+    """
+    Read and process logs from an extra tunnel.
+
+    Args:
+      container_port: Container port whose tunnel logs to read
+    """
+    log_readers = self.extra_tunnel_log_readers.get(container_port, {})
+
+    # Read stdout
+    stdout_reader = log_readers.get("stdout")
+    if stdout_reader:
+      try:
+        logs = stdout_reader.get_next_characters()
+        if logs:
+          self._process_extra_tunnel_log(container_port, logs, is_error=False)
+      except Exception as e:
+        self.Pd(f"Error reading stdout for tunnel {container_port}: {e}")
+
+    # Read stderr
+    stderr_reader = log_readers.get("stderr")
+    if stderr_reader:
+      try:
+        err_logs = stderr_reader.get_next_characters()
+        if err_logs:
+          self._process_extra_tunnel_log(container_port, err_logs, is_error=True)
+      except Exception as e:
+        self.Pd(f"Error reading stderr for tunnel {container_port}: {e}")
+
+  def _process_extra_tunnel_log(self, container_port, text, is_error=False):
+    """
+    Process tunnel logs and extract URL.
+
+    For Cloudflare: Extract URL from pattern https://*.trycloudflare.com
+
+    Args:
+      container_port: Container port
+      text: Log text
+      is_error: Whether this is error output
+    """
+    log_prefix = f"[TUNNEL:{container_port}]"
+    color = 'r' if is_error else 'd'
+
+    # Log the output
+    for line in text.split('\n'):
+      if line.strip():
+        self.Pd(f"{log_prefix} {line}", score=0)
+
+    # Extract URL if not already found
+    if container_port not in self.extra_tunnel_urls:
+      # Extract Cloudflare URL: https://xxx.trycloudflare.com
+      url_pattern = r'https://[a-z0-9-]+\.trycloudflare\.com'
+      match = self.re.search(url_pattern, text)
+      if match:
+        url = match.group(0)
+        self.extra_tunnel_urls[container_port] = url
+        self.P(f"Extra tunnel URL for port {container_port}: {url}", color='g')
+
+  def read_all_extra_tunnel_logs(self):
+    """Read logs from all extra tunnels."""
+    for container_port in list(self.extra_tunnel_processes.keys()):
+      try:
+        self._read_extra_tunnel_logs(container_port)
+      except Exception as e:
+        self.Pd(f"Error reading logs for tunnel {container_port}: {e}")
 
   def start_container(self):
     """Start the Docker container."""
@@ -630,6 +1023,24 @@ class ContainerAppRunnerPlugin(
     # end try
     return False
 
+  def _check_extra_tunnel_health(self):
+    """
+    Check health of extra tunnels and restart if needed.
+    """
+    for container_port, process in list(self.extra_tunnel_processes.items()):
+      if process.poll() is not None:  # Process exited
+        exit_code = process.returncode
+        self.P(f"Extra tunnel for port {container_port} exited (code {exit_code})", color='r')
+
+        # Clean up dead tunnel
+        self._stop_extra_tunnel(container_port)
+
+        # Restart tunnel
+        token = self.extra_tunnel_configs.get(container_port)
+        if token:
+          self.P(f"Restarting extra tunnel for port {container_port}...", color='y')
+          self._start_extra_tunnel(container_port, token)
+
 
 
 
@@ -658,6 +1069,9 @@ class ContainerAppRunnerPlugin(
     # Stop tunnel engine if needed
     self.stop_tunnel_engine()
 
+    # Stop extra tunnels
+    self.stop_extra_tunnels()
+
     # Stop the container if it's running
     self.stop_container()
 
@@ -684,15 +1098,126 @@ class ContainerAppRunnerPlugin(
     super(ContainerAppRunnerPlugin, self).on_close()
 
 
+  def _get_local_image(self):
+    """
+    Get the local Docker image if it exists.
+
+    Returns:
+      Image object or None if image doesn't exist locally
+    """
+    if not self.cfg_image:
+      return None
+
+    try:
+      img = self.docker_client.images.get(self.cfg_image)
+      return img
+    except Exception:
+      return None
+
+  def _pull_image_from_registry(self):
+    """
+    Pull image from registry (assumes authentication already done).
+
+    Returns:
+      Image object or None if pull failed
+
+    Raises:
+      RuntimeError: If authentication hasn't been performed
+    """
+    if not self.cfg_image:
+      self.P("No Docker image configured", color='r')
+      return None
+
+    try:
+      self.P(f"Pulling image '{self.cfg_image}'...", color='b')
+      img = self.docker_client.images.pull(self.cfg_image)
+
+      # docker-py may return Image or list[Image]
+      if isinstance(img, list) and img:
+        img = img[-1]
+
+      self.P(f"Successfully pulled image '{self.cfg_image}'", color='g')
+      return img
+
+    except Exception as e:
+      self.P(f"Image pull failed: {e}", color='r')
+      return None
+
+  def _pull_image_with_fallback(self):
+    """
+    Pull image from registry with fallback to local image.
+
+    This is the main image acquisition method that:
+    1. Authenticates with registry
+    2. Attempts to pull from registry
+    3. Falls back to local image if pull fails
+    4. Returns None only if both pull and local check fail
+
+    Returns:
+      Image object or None if no image is available
+
+    Raises:
+      RuntimeError: If authentication fails and no local image exists
+    """
+    # Step 1: Authenticate with registry
+    if not self._login_to_registry():
+      self.P("Registry authentication failed", color='y')
+      # Try to use local image if authentication fails
+      local_img = self._get_local_image()
+      if local_img:
+        self.P(f"Using local image (registry login failed): {self.cfg_image}", color='y')
+        return local_img
+      raise RuntimeError("Failed to authenticate with registry and no local image available.")
+
+    # Step 2: Attempt to pull from registry
+    img = self._pull_image_from_registry()
+    if img:
+      return img
+
+    # Step 3: Fallback to local image
+    self.P(f"Pull failed, checking for local image: {self.cfg_image}", color='b')
+    local_img = self._get_local_image()
+    if local_img:
+      self.P(f"Using local image as fallback: {self.cfg_image}", color='y')
+      return local_img
+
+    # Step 4: No image available
+    self.P(f"No image available (pull failed and no local image): {self.cfg_image}", color='r')
+    return None
+
+  def _get_image_digest(self, img):
+    """
+    Extract digest hash from image object.
+
+    Args:
+      img: Docker image object
+
+    Returns:
+      str or None: Digest hash (sha256:...) or None
+    """
+    if not img:
+      return None
+
+    try:
+      img.reload()
+    except Exception as e:
+      self.Pd(f"Warning: Could not reload image attributes: {e}")
+
+    attrs = getattr(img, "attrs", {}) or {}
+    repo_digests = attrs.get("RepoDigests") or []
+    if repo_digests:
+      # 'repo@sha256:...'
+      digest = repo_digests[0].split("@")[-1]
+      return digest
+    # Fallback to image id (sha256:...)
+    return getattr(img, "id", None)
+
   def _get_latest_image_hash(self):
     """
     Get the latest identifier for the configured Docker image tag.
 
-    This method tries to resolve the remote content digest for ``self.cfg_image`` by
-    asking the Docker daemon to perform a metadata-only pull (if the image is
-    already up to date, no layers are re-downloaded). It returns the repo digest
-    (e.g., ``sha256:...``) when available; if not available, it falls back to the
-    local image ID.
+    This method pulls the image and extracts its digest for version tracking.
+    Used by AUTOUPDATE feature to detect image changes.
 
     Returns
     -------
@@ -706,78 +1231,87 @@ class ContainerAppRunnerPlugin(
       credentials configured.
     - This call contacts the registry; tune ``poll_interval`` appropriately.
     """
-    if not self.cfg_image:
-      self.P("No Docker image configured", color='r')
-      return None
+    img = self._pull_image_with_fallback()
+    return self._get_image_digest(img)
 
-    # Ensure we're logged in to the registry before pulling
-    if not self._login_to_registry():
-      raise RuntimeError("Failed to login to container registry. Cannot proceed without authentication.")
+  def _has_image_hash_changed(self, latest_hash):
+    """
+    Check if image hash has changed from current version.
+
+    Args:
+      latest_hash: Latest image hash from registry
+
+    Returns:
+      bool: True if hash changed and update needed, False otherwise
+    """
+    if not latest_hash:
+      # Pull failed, can't determine if update needed
+      return False
+
+    if not self.current_image_hash:
+      # First time - establish baseline
+      self.P(f"Establishing baseline image hash: {latest_hash}", color='b')
+      self.current_image_hash = latest_hash
+      return False
+
+    # Compare hashes
+    return latest_hash != self.current_image_hash
+
+  def _handle_image_update(self, new_hash):
+    """
+    Handle detected image update by updating hash and restarting container.
+
+    Args:
+      new_hash: New image hash detected
+    """
+    self.P(f"New image version detected ({new_hash} != {self.current_image_hash}). Restarting container...", color='y')
+
+    # Update current_image_hash BEFORE restart
+    # This prevents infinite retry loops if restart fails
+    old_hash = self.current_image_hash
+    self.current_image_hash = new_hash
 
     try:
-      self.P(f"Image check: pulling '{self.cfg_image}' for metadata...", color='b')
-      img = self.docker_client.images.pull(self.cfg_image)
-      # docker-py may return Image or list[Image]
-      if isinstance(img, list) and img:
-        img = img[-1]
-      # Ensure attributes loaded
-      try:
-        img.reload()
-      except Exception as e:
-        self.P(f"Warning: Could not reload image attributes: {e}", color='y')
-      # end try
-
-      attrs = getattr(img, "attrs", {}) or {}
-      repo_digests = attrs.get("RepoDigests") or []
-      if repo_digests:
-        # 'repo@sha256:...'
-        digest = repo_digests[0].split("@")[-1]
-        return digest
-      # Fallback to image id (sha256:...)
-      return getattr(img, "id", None)
-      
+      self._restart_container()
     except Exception as e:
-      self.P(f"Image pull failed: {e}", color='r')
-      # Fallback: check local image only
-      try:
-        self.P(f"Checking local image: {self.cfg_image}", color='b')
-        img = self.docker_client.images.get(self.cfg_image)
-        try:
-          img.reload()
-        except Exception as e:
-          self.P(f"Warning: Could not reload local image attributes: {e}", color='y')
-        # end try reload
-        attrs = getattr(img, "attrs", {}) or {}
-        repo_digests = attrs.get("RepoDigests") or []
-        if repo_digests:
-          digest = repo_digests[0].split("@")[-1]
-          return digest
-        return getattr(img, "id", None)
-        
-      except Exception as e2:
-        self.P(f"Could not get local image: {e2}", color='r')
-      # end try check for local image
-    # end try
-    return None
+      self.P(f"Container restart failed after image update: {e}", color='r')
+      # Hash already updated, won't retry this version
+      self.P(f"Image hash updated from {old_hash} to {new_hash}, but container restart failed", color='y')
 
   def _check_image_updates(self, current_time=None):
-    """Check for a new version of the Docker image and restart container if found."""
+    """
+    Periodic check for image updates when AUTOUPDATE is enabled.
+
+    This method:
+    1. Checks if update check is due (based on interval)
+    2. Pulls latest image and gets its hash
+    3. Compares with current hash
+    4. Triggers restart if changed
+
+    Args:
+      current_time: Current timestamp (for interval checking)
+    """
     if not self.cfg_autoupdate:
       return
-      
-    if current_time - self._last_image_check >= self.cfg_autoupdate_interval:
-      self._last_image_check = current_time
-      latest_image_hash = self._get_latest_image_hash()
-      if latest_image_hash and self.current_image_hash and latest_image_hash != self.current_image_hash:
-        self.P(f"New image version detected ({latest_image_hash} != {self.current_image_hash}). Restarting container...", color='y')
-        # Update current_image_hash to the new one
-        self.current_image_hash = latest_image_hash
-        # Restart container from scratch
-        self._restart_container()
-      elif latest_image_hash:
-        self.P(f"Current image hash: {self.current_image_hash} vs latest: {latest_image_hash}")
-      # end if new image hash
-    # end if time elapsed
+
+    # Check if update check is due
+    if current_time - self._last_image_check < self.cfg_autoupdate_interval:
+      return
+
+    self._last_image_check = current_time
+
+    # Get latest image hash
+    latest_hash = self._get_latest_image_hash()
+    if not latest_hash:
+      self.P("Failed to check for image updates (pull failed). Container continues running.", color='y')
+      return
+
+    # Check if update is needed
+    if self._has_image_hash_changed(latest_hash):
+      self._handle_image_update(latest_hash)
+    else:
+      self.Pd(f"Image up to date: {self.current_image_hash}")
+
     return
 
   def _restart_container(self):
@@ -791,7 +1325,15 @@ class ContainerAppRunnerPlugin(
     self._configure_file_volumes()
     self._setup_env_and_ports()
 
+    # Revalidate extra tunnels
+    self._validate_extra_tunnels_config()
+
     self._validate_runner_config()
+
+    # Ensure image is available (respecting AUTOUPDATE and IMAGE_PULL_POLICY)
+    if not self._ensure_image_available():
+      self.P("Failed to ensure image availability during restart, cannot start container", color='r')
+      return
 
     self.container = self.start_container()
     if not self.container:
@@ -802,12 +1344,82 @@ class ContainerAppRunnerPlugin(
     self._maybe_execute_build_and_run()
     return
 
+  def _ensure_image_with_autoupdate(self):
+    """
+    Ensure image is available with autoupdate enabled.
+    Always pulls and tracks hash for version comparison.
+
+    Returns:
+      bool: True if image available and hash tracked, False otherwise
+    """
+    self.Pd("AUTOUPDATE enabled, pulling image and tracking hash")
+    self.current_image_hash = self._get_latest_image_hash()
+    return self.current_image_hash is not None
+
+  def _ensure_image_always_pull(self):
+    """
+    Ensure image is available with 'always' pull policy.
+    Pulls image without tracking hash.
+
+    Returns:
+      bool: True if image pulled successfully, False otherwise
+    """
+    self.Pd("IMAGE_PULL_POLICY is 'always', pulling image")
+    img = self._pull_image_with_fallback()
+    return img is not None
+
+  def _ensure_image_if_not_present(self):
+    """
+    Ensure image is available with 'if-not-present' policy.
+    Only pulls if image doesn't exist locally.
+
+    Returns:
+      bool: True if image is available (locally or after pull), False otherwise
+    """
+    # Check if image exists locally
+    local_img = self._get_local_image()
+    if local_img:
+      self.P(f"Image '{self.cfg_image}' found locally", color='g')
+      return True
+
+    # Image not found locally, pull it
+    self.P(f"Image not found locally, pulling '{self.cfg_image}'...", color='b')
+    img = self._pull_image_with_fallback()
+    return img is not None
+
+  def _ensure_image_available(self):
+    """
+    Ensure the container image is available before starting container.
+
+    This method uses a strategy pattern based on configuration:
+    - AUTOUPDATE enabled: Always pull + track hash (update detection)
+    - IMAGE_PULL_POLICY='always': Always pull (no tracking)
+    - IMAGE_PULL_POLICY='if-not-present' or default: Pull only if missing locally
+
+    Returns:
+      bool: True if image is available, False otherwise
+    """
+    # Strategy 1: AUTOUPDATE (takes precedence)
+    if self.cfg_autoupdate:
+      return self._ensure_image_with_autoupdate()
+
+    # Strategy 2: Always pull policy
+    if self.cfg_image_pull_policy == "always":
+      return self._ensure_image_always_pull()
+
+    # Strategy 3: If-not-present policy (default)
+    return self._ensure_image_if_not_present()
+
   def _handle_initial_launch(self):
     """Handle the initial container launch."""
     try:
       self.P("Initial container launch...", color='b')
-      if self.cfg_autoupdate:
-        self.current_image_hash = self._get_latest_image_hash()
+
+      # Ensure image is available before starting container
+      if not self._ensure_image_available():
+        self.P("Failed to ensure image availability, cannot start container", color='r')
+        return
+
       self.container = self.start_container()
       if not self.container:
         return
@@ -831,8 +1443,13 @@ class ContainerAppRunnerPlugin(
     self._check_health_endpoint(current_time)
     if self.cfg_autoupdate:
       self._check_image_updates(current_time)
+
+    # Check extra tunnel health
+    if self.extra_tunnel_processes:
+      self._check_extra_tunnel_health()
+
     restart_required = self._perform_additional_checks(current_time)
-    
+
     if restart_required:
       self._restart_container()
     return
@@ -866,13 +1483,22 @@ class ContainerAppRunnerPlugin(
     if not self.container:
       self._handle_initial_launch()
 
-    self.maybe_init_tunnel_engine()
+    # Tunnel management (only if TUNNEL_ENGINE_ENABLED=True)
+    if self.cfg_tunnel_engine_enabled:
+      self.maybe_init_tunnel_engine()
+      self.maybe_start_tunnel_engine()
 
-    self.maybe_start_tunnel_engine()
+      # Start main tunnel if configured and not already running
+      if not self.tunnel_process and self._should_start_main_tunnel():
+        self.start_tunnel_engine()
 
-    # Start tunnel engine if not already running
-    if self.cfg_tunnel_engine_enabled and not self.tunnel_process:
-      self.start_tunnel_engine()
+      # Start extra tunnels if configured and not already running
+      if self.extra_tunnel_configs and not self.extra_tunnel_processes:
+        self.start_extra_tunnels()
+
+      # Read logs from all extra tunnels
+      if self.extra_tunnel_processes:
+        self.read_all_extra_tunnel_logs()
 
     if not self._check_container_status():
       return
@@ -881,6 +1507,10 @@ class ContainerAppRunnerPlugin(
     self._maybe_execute_build_and_run()
 
     self._perform_periodic_monitoring()
-    self.maybe_tunnel_engine_ping()
+
+    # Only ping if tunneling is enabled
+    if self.cfg_tunnel_engine_enabled:
+      self.maybe_tunnel_engine_ping()
+      self.maybe_extra_tunnels_ping()
 
     return

@@ -4,7 +4,8 @@ from naeural_core import constants as ct
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
-  DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL
+  DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL, \
+  CONTAINERIZED_APPS_SIGNATURES
 
 DEEPLOY_DEBUG = True
 
@@ -109,7 +110,7 @@ class _DeeployMixin:
       raise ValueError("Sender {} is not an oracle".format(sender))
     return True
 
-  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=None):
+  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=None, dct_deeploy_specs=None):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
@@ -123,18 +124,34 @@ class _DeeployMixin:
     response_keys = self.defaultdict(list)
 
     ts = self.time()
-    dct_deeploy_specs = {
-      DEEPLOY_KEYS.JOB_ID: job_id,
-      DEEPLOY_KEYS.PROJECT_ID: project_id,
-      DEEPLOY_KEYS.PROJECT_NAME: project_name,
-      DEEPLOY_KEYS.NR_TARGET_NODES: len(nodes),
-      DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
-      DEEPLOY_KEYS.JOB_TAGS: job_tags,
-      DEEPLOY_KEYS.DATE_CREATED: ts,
-      DEEPLOY_KEYS.DATE_UPDATED: ts,
-      DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
-      DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
-    }
+    if dct_deeploy_specs:
+      dct_deeploy_specs = self.deepcopy(dct_deeploy_specs)
+      dct_deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = ts
+      if DEEPLOY_KEYS.DATE_CREATED not in dct_deeploy_specs:
+        dct_deeploy_specs[DEEPLOY_KEYS.DATE_CREATED] = ts
+    else:
+      dct_deeploy_specs = {
+        DEEPLOY_KEYS.NR_TARGET_NODES: len(nodes),
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: nodes,
+        DEEPLOY_KEYS.JOB_TAGS: job_tags,
+        DEEPLOY_KEYS.DATE_CREATED: ts,
+        DEEPLOY_KEYS.DATE_UPDATED: ts,
+        DEEPLOY_KEYS.SPARE_NODES: spare_nodes,
+        DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: allow_replication_in_the_wild,
+      }
+
+    if job_id is not None or DEEPLOY_KEYS.JOB_ID not in dct_deeploy_specs:
+      dct_deeploy_specs[DEEPLOY_KEYS.JOB_ID] = job_id
+    if project_id is not None or DEEPLOY_KEYS.PROJECT_ID not in dct_deeploy_specs:
+      dct_deeploy_specs[DEEPLOY_KEYS.PROJECT_ID] = project_id
+    if project_name is not None or DEEPLOY_KEYS.PROJECT_NAME not in dct_deeploy_specs:
+      dct_deeploy_specs[DEEPLOY_KEYS.PROJECT_NAME] = project_name
+    dct_deeploy_specs[DEEPLOY_KEYS.NR_TARGET_NODES] = len(nodes)
+    dct_deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = nodes
+    dct_deeploy_specs[DEEPLOY_KEYS.JOB_TAGS] = job_tags
+    dct_deeploy_specs[DEEPLOY_KEYS.SPARE_NODES] = spare_nodes
+    dct_deeploy_specs[DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD] = allow_replication_in_the_wild
+
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
@@ -417,6 +434,46 @@ class _DeeployMixin:
     refreshed_specs = self.deepcopy(specs)
     refreshed_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     return refreshed_specs
+
+  def _gather_running_pipeline_context(self, owner, app_id=None, job_id=None):
+    """
+    Collect information about currently running pipeline instances for a job/app.
+
+    Ensures follow-up operations keep parity with the active deployment state.
+
+    Returns
+    -------
+    dict
+      {
+        'discovered_instances': list,
+        'nodes': list[str],
+        'deeploy_specs': dict | None,
+      }
+    """
+    discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+    nodes = []
+    for instance in discovered_instances:
+      node_addr = instance.get(DEEPLOY_PLUGIN_DATA.NODE)
+      if node_addr and node_addr not in nodes:
+        nodes.append(node_addr)
+
+    if not nodes:
+      msg = f"{DEEPLOY_ERRORS.NODES3}: No running workers found for provided "
+      msg += f"{f'app_id {app_id}' if app_id else f'job_id {job_id}'} and owner '{owner}'."
+      raise ValueError(msg)
+
+    deeploy_specs = self._prepare_updated_deeploy_specs(
+      owner=owner,
+      app_id=app_id,
+      job_id=job_id,
+      discovered_plugin_instances=discovered_instances,
+    )
+
+    return {
+      "discovered_instances": discovered_instances,
+      "nodes": nodes,
+      "deeploy_specs": deeploy_specs,
+    }
 
   def __prepare_plugins_for_update(self, inputs, discovered_plugin_instances):
     """
@@ -834,34 +891,48 @@ class _DeeployMixin:
             "memory": "<total_memory_mb>m"
           }
     """
+    self.Pd("Aggregating container resources...")
     plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
 
     # For legacy format, use existing app_params
     if not plugins_array:
+      self.Pd("Using legacy format (app_params) for resource aggregation")
       app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
-      return app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+      legacy_resources = app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+      self.Pd(f"Legacy resources: {legacy_resources}")
+      return legacy_resources
 
+    self.Pd(f"Processing {len(plugins_array)} plugin instances from plugins array")
     total_cpu = 0
     total_memory_mb = 0
 
     # Iterate through plugins array (simplified format - each object is an instance)
-    for plugin_instance in plugins_array:
+    for idx, plugin_instance in enumerate(plugins_array):
       signature = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, "").upper()
+      self.Pd(f"Plugin {idx}: signature={signature}")
 
-      # Only aggregate for CONTAINER_APP_RUNNER plugins
-      if signature == CONTAINER_APP_RUNNER_SIGNATURE:
+      # Only aggregate for CONTAINER_APP_RUNNER and WORKER_APP_RUNNER plugins
+      if signature in CONTAINERIZED_APPS_SIGNATURES:
         resources = plugin_instance.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
         cpu = resources.get(DEEPLOY_RESOURCES.CPU, 0)
         memory = resources.get(DEEPLOY_RESOURCES.MEMORY, "0m")
 
+        self.Pd(f"  Container resources: cpu={cpu}, memory={memory}")
+
         total_cpu += cpu
-        total_memory_mb += self._parse_memory_to_mb(memory)
+        memory_mb = self._parse_memory_to_mb(memory)
+        self.Pd(f"  Parsed memory: {memory_mb}MB")
+        total_memory_mb += memory_mb
+      else:
+        self.Pd(f"  Skipping non-container plugin: {signature}")
 
     # Return aggregated resources in standard format
-    return {
+    aggregated = {
       DEEPLOY_RESOURCES.CPU: total_cpu,
       DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m"
     }
+    self.Pd(f"Aggregated resources: {aggregated}")
+    return aggregated
 
   def _organize_requested_plugins(self, inputs):
     """
@@ -916,99 +987,149 @@ class _DeeployMixin:
     """
     Check if the payment is valid for the given job.
     """
+    self.Pd(f"=== deeploy_check_payment_and_job_owner ===")
+    self.Pd(f"  sender: {sender}")
+    self.Pd(f"  is_create: {is_create}")
+    self.Pd(f"  debug: {debug}")
+
     allow_unpaid = inputs.get("allow_unpaid_job", False)
-    if allow_unpaid and self.bc.get_evm_network() == 'devnet':
+    network = self.bc.get_evm_network()
+    self.Pd(f"  allow_unpaid: {allow_unpaid}, network: {network}")
+
+    if allow_unpaid and network == 'devnet':
+      self.Pd("  Bypassing payment check: unpaid job allowed on devnet")
       return True
+
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
     self.Pd(f"Checking payment for job {job_id} by sender {sender}{' (debug mode)' if debug else ''}")
+
     if not job_id:
+      self.Pd("  No job_id provided - validation failed")
       return False
+
     # Check if the job is paid
-    is_valid = False
-    try:
-      job = self.bc.get_job_details(job_id=job_id)
-      self.Pd(f"Job details: {self.json_dumps(job, indent=2)}")
-      if job:
-        job_owner = job.get('escrowOwner', None)
-        start_timestamp = job.get('startTimestamp', None)
-        is_valid = (sender == job_owner) if sender and job_owner else False
-        if is_create and start_timestamp:
-          is_valid = False
-        if is_valid:
-          job_type = job.get('jobType')
-          if job_type is None:
-            self.P(f"Job type missing or invalid for job {job_id}. Cannot validate resources.")
-            msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES1}: Job type missing or invalid for job {job_id}.")
-            raise ValueError(msg)
-          #endif
-          expected_resources = JOB_TYPE_RESOURCE_SPECS.get(job_type)
-          if expected_resources is None:
-            self.P(f"No resource specs configured for job type {job_type}. Cannot validate resources.")
-            msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES2}: No resource specs configured for job type {job_type}.")
-            raise ValueError(msg)
-          #endif
-          if expected_resources:
-            job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
-            if isinstance(job_app_type, str):
-              job_app_type = job_app_type.lower()
-            if not job_app_type:
-              try:
-                job_app_type = self.deeploy_detect_job_app_type(self.deeploy_prepare_plugins(inputs))
-              except Exception:
-                job_app_type = None
-            if job_app_type == JOB_APP_TYPES.NATIVE:
-              # TODO: Re-enable resource validation for native apps once specs are defined.
-              self.Pd(f"Skipping resource validation for native job {job_id}.")
-            else:
-              # Aggregate container resources across all plugins (for multi-plugin support)
-              aggregated_resources = self._aggregate_container_resources(inputs)
-              requested_cpu = aggregated_resources.get(DEEPLOY_RESOURCES.CPU)
-              requested_memory = aggregated_resources.get(DEEPLOY_RESOURCES.MEMORY)
-              expected_cpu = expected_resources.get(DEEPLOY_RESOURCES.CPU)
-              expected_memory = expected_resources.get(DEEPLOY_RESOURCES.MEMORY)
-              #TODO should also check disk and gpu as soon as they are supported and sent in the request
-              # Normalize numeric values before comparison
-              try:
-                requested_cpu_val = None if requested_cpu is None else float(requested_cpu)
-              except (TypeError, ValueError):
-                requested_cpu_val = None
-              try:
-                expected_cpu_val = None if expected_cpu is None else float(expected_cpu)
-              except (TypeError, ValueError):
-                expected_cpu_val = None
-              requested_memory_mb = (
-                None if requested_memory is None else self._parse_memory_to_mb(requested_memory)
-              )
-              expected_memory_mb = (
-                None if expected_memory is None else self._parse_memory_to_mb(expected_memory)
-              )
-              resources_match = (
-                requested_cpu_val is not None and
-                expected_cpu_val is not None and
-                requested_memory_mb is not None and
-                expected_memory_mb is not None and
-                requested_cpu_val == expected_cpu_val and
-                requested_memory_mb == expected_memory_mb
-              )
-              if not resources_match:
-                self.P(
-                  f"Requested resources {aggregated_resources} do not match paid resources "
-                  f"{expected_resources} for job type {job_type}."
-                )
-                msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Requested resources {aggregated_resources} " +
-                       f"do not match paid resources {expected_resources} for job type {job_type}.")
-                raise ValueError(msg)
-              # endif resources match
-          # endif expected resources
-        # endif is valid
-      else: # job not found
-        self.P(f"Job {job_id} not found.")
-        is_valid = False
-      # endif job found
-    except Exception as e:
-      self.P(f"Error checking payment for job {job_id}: {e}")
+    self.Pd(f"  Fetching job details for job_id={job_id}...")
+    job = self.bc.get_job_details(job_id=job_id)
+    self.Pd(f"Job details: {self.json_dumps(job, indent=2)}")
+
+    if not job:
+      self.P(f"Job {job_id} not found.")
+      self.Pd(f"=== Payment validation result: False ===")
+      return False
+
+    job_owner = job.get('escrowOwner', None)
+    start_timestamp = job.get('startTimestamp', None)
+
+    self.Pd(f"  Job owner: {job_owner}")
+    self.Pd(f"  Start timestamp: {start_timestamp}")
+
+    is_valid = (sender == job_owner) if sender and job_owner else False
+    self.Pd(f"  Owner match: {is_valid} (sender={sender}, owner={job_owner})")
+
+    if is_create and start_timestamp:
+      self.Pd(f"  Job already started (timestamp={start_timestamp}) but is_create=True - invalidating")
       is_valid = False
 
+    if not is_valid:
+      self.Pd(f"=== Payment validation result: {is_valid} ===")
+      return is_valid
+
+    # At this point, owner is valid, now validate resources
+    job_type = job.get('jobType')
+    self.Pd(f"  Job type: {job_type}")
+
+    if job_type is None:
+      self.P(f"Job type missing or invalid for job {job_id}. Cannot validate resources.")
+      msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES1}: Job type missing or invalid for job {job_id}.")
+      raise ValueError(msg)
+
+    expected_resources = JOB_TYPE_RESOURCE_SPECS.get(job_type)
+    self.Pd(f"  Expected resources for job type {job_type}: {expected_resources}")
+
+    if expected_resources is None:
+      self.P(f"No resource specs configured for job type {job_type}. Cannot validate resources.")
+      msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES2}: No resource specs configured for job type {job_type}.")
+      raise ValueError(msg)
+
+    if expected_resources:
+      job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+      if isinstance(job_app_type, str):
+        job_app_type = job_app_type.lower()
+
+      self.Pd(f"  Job app type from inputs: {job_app_type}")
+
+      if not job_app_type:
+        try:
+          self.Pd("  Detecting job app type from plugins...")
+          job_app_type = self.deeploy_detect_job_app_type(self.deeploy_prepare_plugins(inputs))
+          self.Pd(f"  Detected job app type: {job_app_type}")
+        except Exception as exc:
+          self.Pd(f"  Failed to detect job app type: {exc}")
+          job_app_type = None
+
+      if job_app_type == JOB_APP_TYPES.NATIVE:
+        # TODO: Re-enable resource validation for native apps once specs are defined.
+        self.Pd(f"Skipping resource validation for native job {job_id}.")
+      else:
+        self.Pd(f"  Validating resources for non-native job (type={job_app_type})...")
+
+        # Aggregate container resources across all plugins (for multi-plugin support)
+        aggregated_resources = self._aggregate_container_resources(inputs)
+        requested_cpu = aggregated_resources.get(DEEPLOY_RESOURCES.CPU)
+        requested_memory = aggregated_resources.get(DEEPLOY_RESOURCES.MEMORY)
+        expected_cpu = expected_resources.get(DEEPLOY_RESOURCES.CPU)
+        expected_memory = expected_resources.get(DEEPLOY_RESOURCES.MEMORY)
+
+        self.Pd(f"  Requested: cpu={requested_cpu}, memory={requested_memory}")
+        self.Pd(f"  Expected: cpu={expected_cpu}, memory={expected_memory}")
+
+        #TODO should also check disk and gpu as soon as they are supported and sent in the request
+        # Normalize numeric values before comparison
+        try:
+          requested_cpu_val = None if requested_cpu is None else float(requested_cpu)
+        except (TypeError, ValueError) as e:
+          self.Pd(f"  Failed to parse requested CPU: {e}")
+          requested_cpu_val = None
+
+        try:
+          expected_cpu_val = None if expected_cpu is None else float(expected_cpu)
+        except (TypeError, ValueError) as e:
+          self.Pd(f"  Failed to parse expected CPU: {e}")
+          expected_cpu_val = None
+
+        requested_memory_mb = (
+          None if requested_memory is None else self._parse_memory_to_mb(requested_memory)
+        )
+        expected_memory_mb = (
+          None if expected_memory is None else self._parse_memory_to_mb(expected_memory)
+        )
+
+        self.Pd(f"  Normalized: requested_cpu={requested_cpu_val}, expected_cpu={expected_cpu_val}")
+        self.Pd(f"  Normalized: requested_memory={requested_memory_mb}MB, expected_memory={expected_memory_mb}MB")
+
+        resources_match = (
+          requested_cpu_val is not None and
+          expected_cpu_val is not None and
+          requested_memory_mb is not None and
+          expected_memory_mb is not None and
+          requested_cpu_val == expected_cpu_val and
+          requested_memory_mb == expected_memory_mb
+        )
+
+        self.Pd(f"  Resources match: {resources_match}")
+
+        if not resources_match:
+          self.P(
+            f"Requested resources {aggregated_resources} do not match paid resources "
+            f"{expected_resources} for job type {job_type}."
+          )
+          msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Requested resources {aggregated_resources} " +
+                 f"do not match paid resources {expected_resources} for job type {job_type}.")
+          raise ValueError(msg)
+        else:
+          self.Pd(f"  Resource validation passed!")
+
+    self.Pd(f"=== Payment validation result: {is_valid} ===")
     return is_valid
 
   def deeploy_detect_job_app_type(self, pipeline_plugins):
@@ -1268,7 +1389,7 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None):
+  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None, dct_deeploy_specs_create=None):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
@@ -1284,7 +1405,7 @@ class _DeeployMixin:
       update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs, job_app_type=job_app_type)
       response_keys.update(update_response_keys)
     if len(new_nodes) > 0:
-      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=job_app_type)
+      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=job_app_type, dct_deeploy_specs=dct_deeploy_specs_create)
       response_keys.update(new_response_keys)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
@@ -1808,8 +1929,9 @@ class _DeeployMixin:
     
     return netmon_job_ids
   
-  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, allow_missing=False):
-    discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, allow_missing=False, discovered_instances=None):
+    if discovered_instances is None:
+      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
 
     if len(discovered_instances) == 0:
       if allow_missing:

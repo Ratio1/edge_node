@@ -1,7 +1,7 @@
 from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_CONTAINER_RESOURCES,  CONTAINER_APP_RUNNER_SIGNATURE
+  DEFAULT_CONTAINER_RESOURCES, CONTAINER_APP_RUNNER_SIGNATURE, CONTAINERIZED_APPS_SIGNATURES
 from naeural_core import constants as ct
 
 DEEPLOY_DEBUG = True
@@ -45,6 +45,31 @@ class _DeeployTargetNodesMixin:
       return int(float(mem[:-2]) * 1024 * 1024 * 1024)  # GB to bytes
     else:
       return int(float(mem))  # assume bytes
+
+  def _get_request_plugin_signatures(self, inputs):
+    """
+    Extract plugin signatures from normalized request payload.
+    Returns a set of upper-cased signatures covering both legacy and plugins-array formats.
+    """
+    plugin_signatures = set()
+
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if plugins_array and isinstance(plugins_array, list):
+      for plugin_instance in plugins_array:
+        if not isinstance(plugin_instance, dict):
+          continue
+        signature = (
+          plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+          or plugin_instance.get("signature")
+        )
+        if signature:
+          plugin_signatures.add(str(signature).upper())
+
+    legacy_signature = inputs.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
+    if legacy_signature:
+      plugin_signatures.add(str(legacy_signature).upper())
+
+    return plugin_signatures
 
   def _check_and_maybe_convert_address(self, node_addr, raise_if_error=True):
     result = None
@@ -129,46 +154,56 @@ class _DeeployTargetNodesMixin:
     Returns:
         dict: Dictionary with node addresses (without 0xai_ part) as keys and their last deployment timestamp as values
     """
+    self.Pd(f"Starting __find_suitable_nodes_for_container_app with {len(nodes_with_resources)} candidate nodes")
     suitable_nodes = {}
 
     required_cpu = container_requested_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
     required_mem = container_requested_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
     required_mem_bytes = self._parse_memory(required_mem)
 
+    self.Pd(f"Required resources: CPU={required_cpu} cores, Memory={required_mem} ({required_mem_bytes} bytes)")
+
     for addr, node_resources in nodes_with_resources.items():
+      self.Pd(f"Evaluating node {addr}")
       ai_addr = self.bc.maybe_add_prefix(addr)
 
       used_container_resources = []
       last_deeployment_ts = 0
 
       node_pipelines = apps.get(ai_addr, {})
+      self.Pd(f"Node {addr} has {len(node_pipelines)} pipelines")
 
       skip_node = False
       for pipeline_name, pipeline_data in node_pipelines.items():
+        self.Pd(f"  Checking pipeline '{pipeline_name}' on node {addr}")
 
         is_deeployed = pipeline_data.get(NetMonCt.IS_DEEPLOYED)
         if not is_deeployed or pipeline_name == 'admin_pipeline':
           # skip it if app was deeployed through SDK or if it's the admin pipeline
+          self.Pd(f"    Skipping pipeline '{pipeline_name}': is_deeployed={is_deeployed}, is_admin={pipeline_name == 'admin_pipeline'}")
           continue
 
         pipeline_plugins = pipeline_data.get(NetMonCt.PLUGINS, [])
         has_different_signatures = not all(sign == CONTAINER_APP_RUNNER_SIGNATURE for sign in pipeline_plugins.keys()) #FIX CAR OR WORKER APP RUNNER
 
         if has_different_signatures:
-          self.Pd(f"Node {addr} has pipeline '{pipeline_name}' with Native Apps signature. Skipping...")
+          self.Pd(f"Node {addr} has pipeline '{pipeline_name}' with Native Apps signature. Plugin signatures: {list(pipeline_plugins.keys())}. Skipping node...")
           skip_node = True
           break
 
         for plugin_signature, plugin_instances in pipeline_plugins.items():
+          self.Pd(f"    Processing plugin '{plugin_signature}' with {len(plugin_instances)} instances")
           # Sum up resources here and check them
           for plugin_instance in plugin_instances:
             instance_id = plugin_instance.get(NetMonCt.PLUGIN_INSTANCE)
+            self.Pd(f"      Getting resources for instance '{instance_id}'")
             plugin_instance_resources = self.__get_plugin_instance_resources(node_addr=addr,
                                                                              pipeline_name=pipeline_name,
                                                                              plugin_signature=plugin_signature,
                                                                              instance_id=instance_id)
 
             used_container_resources.append(plugin_instance_resources)
+            self.Pd(f"      Instance '{instance_id}' resources: {self.json_dumps(plugin_instance_resources)}")
 
           # Get the last deployment timestamp
           last_config = pipeline_data.get('last_config')
@@ -176,8 +211,10 @@ class _DeeployTargetNodesMixin:
             ts = self.datetime.fromisoformat(last_config).timestamp()
             if ts > last_deeployment_ts:
               last_deeployment_ts = ts
+            self.Pd(f"    Pipeline '{pipeline_name}' last_config: {last_config} (ts: {ts})")
 
       if skip_node:
+        self.Pd(f"Node {addr} skipped due to incompatible pipeline signatures")
         continue
       self.Pd(f"Node {addr} has {self.json_dumps(used_container_resources)} used container resources.")
       # Sum up resources used by node.
@@ -189,11 +226,16 @@ class _DeeployTargetNodesMixin:
         used_cpu += cpu
         used_memory += self._parse_memory(memory)
 
+      self.Pd(f"Node {addr} current usage: CPU={used_cpu} cores, Memory={used_memory} bytes")
+
       # Add the required resources for the new container app.
       used_cpu += required_cpu
       used_memory += required_mem_bytes
 
+      self.Pd(f"Node {addr} projected usage (with new app): CPU={used_cpu} cores, Memory={used_memory} bytes")
+
       # Check if the node has enough resources
+      self.Pd(f"Node {addr} total resources: CPU={node_resources['cpu']} cores, Memory={node_resources['memory']} bytes")
       has_failed = False
       if used_cpu > node_resources['cpu']:
         self.Pd(f"Node {addr} has not enough CPU cores. used_cpu ({used_cpu}) > node_cpu ({node_resources['cpu']})")
@@ -207,7 +249,10 @@ class _DeeployTargetNodesMixin:
         self.Pd(f"Node {addr} has not enough available resources for the container app. Skipping...", color='y')
         continue
 
+      self.Pd(f"Node {addr} is suitable! Adding to candidate list with last_deeployment_ts={last_deeployment_ts}")
       suitable_nodes[addr] = last_deeployment_ts
+
+    self.Pd(f"Completed evaluation. Found {len(suitable_nodes)} suitable nodes: {list(suitable_nodes.keys())}")
     return suitable_nodes
 
 
@@ -286,14 +331,16 @@ class _DeeployTargetNodesMixin:
     node_req_memory = node_res_req.get(DEEPLOY_RESOURCES.MEMORY)
     node_req_memory_bytes = self._parse_memory(node_req_memory)
     job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
+    plugin_signatures = self._get_request_plugin_signatures(inputs)
+    requires_container_capabilities = CONTAINER_APP_RUNNER_SIGNATURE in plugin_signatures
 
     suitable_nodes_with_resources = {}
     for addr in nodes:
       # Check if the node supports the requested plugin
-      if inputs.plugin_signature in [CONTAINER_APP_RUNNER_SIGNATURE]:
+      if requires_container_capabilities:
         is_did_supported = self.netmon.network_node_has_did(addr=addr)
         if not is_did_supported:
-          self.Pd(f"Node {addr} does not support the requested plugin {inputs.plugin_signature}. Skipping...")
+          self.Pd(f"Node {addr} does not support container deployments. Skipping...")
           continue
 
       if len(job_tags) > 0:
@@ -330,7 +377,9 @@ class _DeeployTargetNodesMixin:
 
   def _find_nodes_for_deeployment(self, inputs):
     # Get required resources from the request
-    required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+    required_resources = self._aggregate_container_resources(inputs) or {}
+    plugin_signatures = self._get_request_plugin_signatures(inputs)
+    has_container_plugins = any(signature in plugin_signatures for signature in CONTAINERIZED_APPS_SIGNATURES)
     target_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, None)
 
     if not target_nodes_count:
@@ -360,7 +409,7 @@ class _DeeployTargetNodesMixin:
     apps = self._get_online_apps()
     nodes_that_fit = {}
 
-    if inputs.plugin_signature == CONTAINER_APP_RUNNER_SIGNATURE: # if plugin in ['CONTAINER APP RUNNER' || WORKER APP RUNNER].
+    if has_container_plugins: # if plugin in ['CONTAINER APP RUNNER' || WORKER APP RUNNER].
       nodes_that_fit = self.__find_suitable_nodes_for_container_app(nodes_with_resources=suitable_nodes_with_resources,
                                                                     container_requested_resources=required_resources,
                                                                     apps=apps)
@@ -481,6 +530,11 @@ class _DeeployTargetNodesMixin:
         DEEPLOY_RESOURCES.REQUIRED: {}
     }
     
+    plugin_signatures = self._get_request_plugin_signatures(inputs)
+    has_container_plugins = CONTAINER_APP_RUNNER_SIGNATURE in plugin_signatures
+    if not has_container_plugins:
+      return result
+
     # Get available resources
     avail_cpu = self.netmon.network_node_get_cpu_avail_cores(addr)
     avail_mem = self.netmon.network_node_available_memory(addr)  # in GB
@@ -488,7 +542,7 @@ class _DeeployTargetNodesMixin:
     avail_disk = self.netmon.network_node_available_disk(addr)  # in bytes
 
     # Get required resources from the request
-    required_resources = inputs.app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+    required_resources = self._aggregate_container_resources(inputs) or {}
     required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
     required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
 
