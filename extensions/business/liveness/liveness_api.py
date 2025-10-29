@@ -5,7 +5,7 @@ from urllib.parse import urlsplit, urlunsplit
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 from ratio1.const.evm_net import EvmNetData
 
-__VER__ = '0.1.0'
+__VER__ = '0.2.0'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -13,9 +13,33 @@ _CONFIG = {
   "RESPONSE_FORMAT" : "RAW",
 
   "MONITORED_SERVICES" : {
-      "DAUTH-API": EvmNetData.DAUTH_URL_KEY,
-      "ORACLE-API": EvmNetData.EE_ORACLE_API_URL_KEY,
-      "DEEPLOY-API": EvmNetData.EE_DEEPLOY_API_URL_KEY
+      "DAUTH-API": {
+        "url_key": EvmNetData.DAUTH_URL_KEY,
+        "type": "api",
+      },
+      "ORACLE-API": {
+        "url_key": EvmNetData.EE_ORACLE_API_URL_KEY,
+        "type": "api",
+      },
+      "DEEPLOY-API": {
+        "url_key": EvmNetData.EE_DEEPLOY_API_URL_KEY,
+        "type": "api",
+      },
+      "DAPP-APP": {
+        "url_key": EvmNetData.EE_DAPP_APP_URL_KEY,
+        "type": "app",
+        "expected_substring": "<title>Ratio1 App</title>",
+      },
+      "EXPLORER-APP": {
+        "url_key": EvmNetData.EE_EXPLORER_APP_URL_KEY,
+        "type": "app",
+        "expected_substring": "<title>Ratio1 Explorer</title>",
+      },
+      "DEEPLOY-APP": {
+        "url_key": EvmNetData.EE_DEEPLOY_APP_URL_KEY,
+        "type": "app",
+        "expected_substring": "<title>Ratio1 Deeploy</title>",
+      },
     },
   'PORT': None,
   # 'ASSETS': 'plugins/business/fastapi/epoch_manager',
@@ -25,6 +49,17 @@ _CONFIG = {
 }
 
 
+def build_service_url(service_cfg):
+  url = service_cfg.get("url", None)
+  if url is None:
+    return None
+  svc_type = service_cfg.get("type", "api")
+  if svc_type == "api":
+    full_url = to_docs_url(url)
+  else:
+    full_url = url
+  return full_url
+  
 
 
 def to_docs_url(raw: str, default_scheme: str = "https") -> str:
@@ -121,31 +156,39 @@ class LivenessApiPlugin(BasePlugin):
     return
   
 
-  def __get_service_url_mapping(self, service_key=''):
+  def __get_service_config(self, service_key):
     dct_mapping = self.cfg_monitored_services
-    url_key = dct_mapping.get(service_key.upper())
+    service_config = dct_mapping.get(service_key.upper())
+    if service_config is None:
+      return None
+    url_key = service_config.get("url_key", None)
     url = self.evm_net_data.get(url_key, None)
     if url is None:
       url = url_key  # fallback to the key itself if not found
-    return url
+    service_config["url"] = url
+    return service_config
 
 
-  def __get_service_status(self, url=''):
+  def __get_service_status(self, service_config):
     """
-    Uses self.requests to test if the url is a live swagger-based api
+    Uses self.requests to test if the url is a live swagger-based api or frontend app.
     """
     result = {}
+    url = build_service_url(service_config)
     if url is None:
       return {"error": "Service URL is not available."}
-    # now check that the url is in the format https://url/ and if it has any appended endpoints such as 
-    # https://url/endpoint then delete "endpoint" and replace with /docs
-    url = to_docs_url(url)
+    expected_marker = service_config.get("expected_substring")
 
     self.P("Checking service status for URL: {}".format(url))
     response = self.requests.get(url, timeout=5)
     self.P("Received response {} for {}".format(response.status_code, url))
     result['status_code'] = response.status_code
+    service_is_ok = False
     if response.status_code == 200:
+      service_is_ok = True
+      if expected_marker:
+        service_is_ok = expected_marker.lower() in response.text.lower()
+    if service_is_ok:
       result["status"] = "live"
       result["message"] = "Service is running smoothly."
       result["color"] = "#1B47F7"
@@ -159,8 +202,8 @@ class LivenessApiPlugin(BasePlugin):
   def __get_all_services_statuses(self):
     statuses = {}
     for service in self.cfg_monitored_services.keys():
-      url = self.__get_service_url_mapping(service)
-      statuses[service] = self.__get_service_status(url)
+      cfg = self.__get_service_config(service)
+      statuses[service] = self.__get_service_status(cfg)
     return statuses
 
   @BasePlugin.endpoint
@@ -176,6 +219,9 @@ class LivenessApiPlugin(BasePlugin):
           "DAUTH-API"
           "ORACLE-API"
           "DEEPLOY-API"
+          "DAPP-APP"
+          "EXPLORER-APP"
+          "DEEPLOY-APP"
 
     """
     try:
@@ -183,11 +229,11 @@ class LivenessApiPlugin(BasePlugin):
         data = self.__get_all_services_statuses()
       else:
         data = {}
-        url = self.__get_service_url_mapping(service)
-        if url is None:
+        cfg = self.__get_service_config(service)
+        if cfg is None:
           data['error'] = f"Service '{service}' is not recognized or not available."
         else:
-          data[service.upper()] = self.__get_service_status(url)
+          data[service.upper()] = self.__get_service_status(cfg)
         #endif
     except Exception as e:
       data = {'error' : str(e)}
@@ -212,17 +258,20 @@ class LivenessApiPlugin(BasePlugin):
         "DAUTH-API"
         "ORACLE-API"
         "DEEPLOY-API"
+        "DAPP-APP"
+        "EXPLORER-APP"
+        "DEEPLOY-APP"
 
     """
     try:
       if service is None:
         response = "please provide data"
       else:
-        url = self.__get_service_url_mapping(service)
-        if url is None:
+        cfg = self.__get_service_config(service)
+        if cfg is None:
           response = "please provide a valid service"
         else:
-          data = self.__get_service_status(url)
+          data = self.__get_service_status(cfg)
           if extended_message == 1:
             response = data["message"]
           elif extended_message == 2:
