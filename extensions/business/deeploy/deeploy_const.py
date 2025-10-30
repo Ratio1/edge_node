@@ -40,6 +40,7 @@ class DEEPLOY_KEYS:
   PIPELINE_INPUT_TYPE = "pipeline_input_type"
   PIPELINE_INPUT_URI = "pipeline_input_uri"
   PIPELINE_PARAMS = "pipeline_params"
+  JOB_CONFIG = "job_config"
   # App params keys
   APP_PARAMS = "app_params"
   APP_PARAMS_IMAGE = "IMAGE"

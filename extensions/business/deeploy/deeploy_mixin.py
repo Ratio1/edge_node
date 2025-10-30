@@ -155,7 +155,10 @@ class _DeeployMixin:
     dct_deeploy_specs[DEEPLOY_KEYS.JOB_TAGS] = job_tags
     dct_deeploy_specs[DEEPLOY_KEYS.SPARE_NODES] = spare_nodes
     dct_deeploy_specs[DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD] = allow_replication_in_the_wild
-    dct_deeploy_specs[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
+    dct_deeploy_specs = self._ensure_deeploy_specs_job_config(
+      dct_deeploy_specs,
+      pipeline_params=pipeline_params,
+    )
 
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
     if detected_job_app_type in JOB_APP_TYPES_ALL:
@@ -257,6 +260,10 @@ class _DeeployMixin:
         dct_deeploy_specs[DEEPLOY_KEYS.DATE_CREATED] = ts
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
+    dct_deeploy_specs = self._ensure_deeploy_specs_job_config(
+      dct_deeploy_specs,
+      pipeline_params=pipeline_params,
+    )
 
     requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
 
@@ -445,6 +452,7 @@ class _DeeployMixin:
 
     refreshed_specs = self.deepcopy(specs)
     refreshed_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+    refreshed_specs = self._ensure_deeploy_specs_job_config(refreshed_specs)
     return refreshed_specs
 
   def _gather_running_pipeline_context(self, owner, app_id=None, job_id=None):
@@ -764,6 +772,73 @@ class _DeeployMixin:
     raise ValueError(
       f"{DEEPLOY_ERRORS.REQUEST3}. Neither 'plugins' array nor 'plugin_signature' provided."
     )
+
+  def _ensure_deeploy_specs_job_config(self, deeploy_specs, pipeline_params=None):
+    """
+    Ensure deeploy_specs contains a job_config section holding pipeline_params.
+    Keeps the legacy top-level pipeline_params alias in sync for backward compatibility.
+    """
+    if not isinstance(deeploy_specs, dict):
+      return deeploy_specs
+
+    specs = self.deepcopy(deeploy_specs)
+
+    job_config = specs.get(DEEPLOY_KEYS.JOB_CONFIG)
+    if not isinstance(job_config, dict):
+      job_config = {}
+
+    resolved_params = pipeline_params
+    if resolved_params is None:
+      existing_params = job_config.get(DEEPLOY_KEYS.PIPELINE_PARAMS)
+      if existing_params is not None:
+        resolved_params = existing_params
+      else:
+        resolved_params = specs.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
+
+    if resolved_params is None:
+      resolved_params = {}
+
+    if not isinstance(resolved_params, dict):
+      self.Pd(
+        "Invalid pipeline_params detected while normalizing deeploy_specs; expected a dictionary.",
+        color='y'
+      )
+      resolved_params = {}
+
+    job_config[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(resolved_params)
+    specs[DEEPLOY_KEYS.JOB_CONFIG] = job_config
+    specs[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(resolved_params)
+    return specs
+
+  def _get_pipeline_params_from_deeploy_specs(self, deeploy_specs):
+    """
+    Retrieve pipeline_params from deeploy_specs, preferring the job_config payload.
+    """
+    if not isinstance(deeploy_specs, dict):
+      return {}
+
+    job_config = deeploy_specs.get(DEEPLOY_KEYS.JOB_CONFIG, {})
+    if isinstance(job_config, dict):
+      job_config_params = job_config.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
+      if job_config_params is None:
+        job_config_params = {}
+      if isinstance(job_config_params, dict):
+        return self.deepcopy(job_config_params)
+      self.Pd(
+        "Invalid pipeline_params found under deeploy_specs.job_config; expected a dictionary.",
+        color='y'
+      )
+
+    legacy_params = deeploy_specs.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
+    if legacy_params is None:
+      legacy_params = {}
+    if not isinstance(legacy_params, dict):
+      self.Pd(
+        "Invalid legacy pipeline_params found in deeploy_specs; expected a dictionary.",
+        color='y'
+      )
+      legacy_params = {}
+    return self.deepcopy(legacy_params)
 
   def _extract_pipeline_params(self, inputs):
     """
@@ -1827,9 +1902,9 @@ class _DeeployMixin:
 
     pipeline_params = {}
     if isinstance(deeploy_specs, dict):
-      extracted_params = deeploy_specs.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
-      if isinstance(extracted_params, dict):
-        pipeline_params = self.deepcopy(extracted_params)
+      normalized_specs = self._ensure_deeploy_specs_job_config(deeploy_specs)
+      pipeline_params = self._get_pipeline_params_from_deeploy_specs(normalized_specs)
+      deeploy_specs = normalized_specs
 
     # todo: use constants
     return {
@@ -1855,17 +1930,19 @@ class _DeeployMixin:
 
     pipeline_params = base_pipeline.get("pipeline_params")
     if not isinstance(pipeline_params, dict):
-      deeploy_specs_section = base_pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
-      if isinstance(deeploy_specs_section, dict):
-        pipeline_params = deeploy_specs_section.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
-      else:
-        pipeline_params = {}
+      pipeline_params = self._get_pipeline_params_from_deeploy_specs(
+        base_pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
+      )
     if pipeline_params is None:
+      pipeline_params = {}
+    if not isinstance(pipeline_params, dict):
+      self.Pd("Invalid pipeline_params detected in base pipeline; defaulting to empty dict.", color='y')
       pipeline_params = {}
     base_pipeline["pipeline_params"] = self.deepcopy(pipeline_params)
 
     chainstore_peers = list(set(new_nodes + update_nodes))
-    deeploy_specs = self.deepcopy(base_pipeline[NetMonCt.DEEPLOY_SPECS])
+    raw_deeploy_specs = base_pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
+    deeploy_specs = self.deepcopy(raw_deeploy_specs) if isinstance(raw_deeploy_specs, dict) else {}
     job_app_type = None
     if isinstance(deeploy_specs, dict):
       job_app_type = deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
@@ -1873,9 +1950,13 @@ class _DeeployMixin:
         job_app_type = self.deeploy_detect_job_app_type(base_pipeline.get(NetMonCt.PLUGINS, []))
         if job_app_type in JOB_APP_TYPES_ALL:
           deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
-      deeploy_specs[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
-    deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
-    deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+    deeploy_specs = self._ensure_deeploy_specs_job_config(
+      deeploy_specs,
+      pipeline_params=pipeline_params,
+    )
+    if isinstance(deeploy_specs, dict):
+      deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
+      deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
 
     chainstore_response_keys = self.defaultdict(list)

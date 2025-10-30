@@ -290,7 +290,10 @@ class DeeployManagerApiPlugin(
         if isinstance(deeploy_specs_for_update, dict)
         else {}
       )
-      deeploy_specs_payload[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
+      deeploy_specs_payload = self._ensure_deeploy_specs_job_config(
+        deeploy_specs_payload,
+        pipeline_params=pipeline_params,
+      )
 
       dct_status, str_status = self.check_and_deploy_pipelines(
         sender=sender,
