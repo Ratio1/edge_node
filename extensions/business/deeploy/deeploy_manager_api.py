@@ -169,6 +169,9 @@ class DeeployManagerApiPlugin(
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       is_confirmable_job = inputs.chainstore_response
 
+      pipeline_params = self._extract_pipeline_params(inputs)
+      inputs[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
+
       # Validate plugins array structure and required fields for each plugin
       plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
       if plugins_array:
@@ -276,6 +279,22 @@ class DeeployManagerApiPlugin(
       inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_nodes)
       inputs.target_nodes_count = len(deployment_nodes)
 
+      if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
+        msg = (
+          f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
+          f"{type(deeploy_specs_for_update).__name__}."
+        )
+        raise ValueError(msg)
+      deeploy_specs_payload = (
+        self.deepcopy(deeploy_specs_for_update)
+        if isinstance(deeploy_specs_for_update, dict)
+        else {}
+      )
+      deeploy_specs_payload = self._ensure_deeploy_specs_job_config(
+        deeploy_specs_payload,
+        pipeline_params=pipeline_params,
+      )
+
       dct_status, str_status = self.check_and_deploy_pipelines(
         sender=sender,
         inputs=inputs,
@@ -285,7 +304,7 @@ class DeeployManagerApiPlugin(
         new_nodes=deployment_nodes,
         update_nodes=[],
         discovered_plugin_instances=discovered_plugin_instances,
-        dct_deeploy_specs_create=deeploy_specs_for_update,
+        dct_deeploy_specs_create=deeploy_specs_payload,
         job_app_type=job_app_type,
       )
       
@@ -317,6 +336,8 @@ class DeeployManagerApiPlugin(
         plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
         if plugins_array:
           dct_request['plugins_count'] = len(plugins_array)
+        # if pipeline_params:
+        #   dct_request[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
 
       result = {
         DEEPLOY_KEYS.STATUS: str_status,
@@ -370,6 +391,9 @@ class DeeployManagerApiPlugin(
       job_tags : list
           Tags for filtering target nodes
           Example: ["KYB", "DC:HOSTINGER", "CT:FR|IT|RO", "REG:EU"]
+      pipeline_params : dict, optional
+          Additional pipeline-level parameters forwarded to the data capture thread. `null` falls back to `{}`.
+          The provided keys are merged into the pipeline configuration at the top level.
 
       nonce : str
           The nonce used for signing the request
@@ -485,6 +509,10 @@ class DeeployManagerApiPlugin(
 
       job_id : int
           The job ID from blockchain
+
+      pipeline_params : dict, optional
+          Additional pipeline-level parameters forwarded to the data capture thread. `null` falls back to `{}`.
+          The provided keys are merged into the pipeline configuration at the top level.
 
       nonce : str
           The nonce used for signing the request

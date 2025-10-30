@@ -67,6 +67,11 @@ class _DeeployJobMixin:
     }
     """
 
+    if pipeline is None:
+      return None
+    if not isinstance(pipeline, dict):
+      return None
+
     # Create a copy of the pipeline and remove the TIME field
     extracted_data = pipeline.copy()
     extracted_data.pop("TIME", None)
@@ -88,9 +93,20 @@ class _DeeployJobMixin:
     """
     result = False
     try: 
+      if pipeline is None:
+        self.P(f"Skipping CSTORE save for job {job_id}: pipeline is None", color='y')
+        return False
+      if not isinstance(pipeline, dict):
+        self.P(f"Skipping CSTORE save for job {job_id}: pipeline is of type {type(pipeline).__name__}", color='y')
+        return False
+
       self.P("Saving pipeline to CSTORE...")
 
       sanitized_pipeline = self.extract_invariable_data_from_pipeline(pipeline)
+      if sanitized_pipeline is None:
+        self.P(f"Skipping CSTORE save for job {job_id}: unable to sanitize pipeline payload", color='y')
+        return False
+
       sorted_pipeline = self._recursively_sort_pipeline_data(sanitized_pipeline)
       cid = self._save_pipeline_to_r1fs(sorted_pipeline)
 
