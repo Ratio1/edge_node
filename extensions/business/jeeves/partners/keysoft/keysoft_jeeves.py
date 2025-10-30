@@ -43,6 +43,7 @@ class KeysoftJeevesPlugin(BasePlugin):
       message: str,
       db_schema: str = None,
       domain: str = None,
+      conversation_id: str = None,
       request_type: str = "query",
       **kwargs
   ):
@@ -92,6 +93,14 @@ class KeysoftJeevesPlugin(BasePlugin):
       return self.parse_pdf(
         user_token=user_token,
         pdf_base64=message,
+      )
+    elif request_type == "conversation":
+      return super(KeysoftJeevesPlugin, self).conversation(
+        user_token=user_token,
+        message=message,
+        domain=domain,
+        conversation_id=conversation_id,
+        **kwargs
       )
     # endif request_type is not query, nlsql_query or chat
     return {
