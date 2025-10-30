@@ -39,12 +39,61 @@ class R1fsManagerApiPlugin(BasePlugin):
   def _log_request_response(self, endpoint_name: str, request_data: dict = None, response_data: dict = None):
     """Helper method to log requests and responses when verbose mode is enabled"""
     if hasattr(self, 'cfg_r1fs_verbose') and self.cfg_r1fs_verbose > 10:
-      if request_data:
-        self.P(f"=== {endpoint_name} ENDPOINT ===", color='y')
-        self.P(f"REQUEST: {self.json.dumps(request_data, indent=2)}", color='c')
-      if response_data:
-        self.P(f"RESPONSE: {self.json.dumps(response_data, indent=2)}", color='g')
-        self.P(f"=== END {endpoint_name} ===", color='y')
+      if request_data is not None:
+        sanitized_request = self._sanitize_payload(request_data)
+        self.P(f"[{endpoint_name}] request: {self.json.dumps(sanitized_request)}", color='c')
+      if response_data is not None:
+        sanitized_response = self._sanitize_payload(response_data)
+        self.P(f"[{endpoint_name}] response: {self.json.dumps(sanitized_response)}", color='g')
+
+  def _sanitize_payload(self, payload, max_length: int = 64, depth: int = 0, key_path: str = ""):
+    """
+    Sanitize payloads before logging to avoid leaking secrets or large contents.
+    """
+    sensitive_tokens = (
+      "secret", "key", "token", "pass", "pwd", "credential", "auth",
+      "signature", "base64", "content", "body", "payload", "data", "yaml",
+      "json", "pickle"
+    )
+
+    if payload is None:
+      return None
+
+    if depth >= 3:
+      return "[truncated]"
+
+    if isinstance(payload, dict):
+      sanitized = {}
+      for key, value in payload.items():
+        child_path = f"{key_path}.{key}" if key_path else str(key)
+        sanitized[key] = self._sanitize_payload(value, max_length, depth + 1, child_path)
+      return sanitized
+
+    if isinstance(payload, (list, tuple, set)):
+      sanitized_iterable = [
+        self._sanitize_payload(value, max_length, depth + 1, f"{key_path}.{idx}")
+        for idx, value in enumerate(payload)
+      ]
+      return sanitized_iterable
+
+    if isinstance(payload, bytes):
+      return f"[bytes len={len(payload)}]"
+
+    if isinstance(payload, str):
+      lower_path = key_path.lower()
+      if any(token in lower_path for token in sensitive_tokens):
+        return "***"
+      if len(payload) > max_length:
+        return f"{payload[:max_length]}... (len={len(payload)})"
+      return payload
+
+    if isinstance(payload, (int, float, bool)):
+      return payload
+
+    if any(token in key_path.lower() for token in sensitive_tokens):
+      return "***"
+
+    return f"[{payload.__class__.__name__}]"
 
 
   @BasePlugin.endpoint(method="get", require_token=False)
@@ -93,11 +142,12 @@ class R1fsManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("ADD_FILE", request_data=request_data)
 
-    self.P(f"Starting add_file with uploaded file at: {file_path}")
-    self.P(f"Body: {self.json.dumps(body_json, indent=2)}")
-
+    self.P(f"Starting add_file for {file_path}")
+    body_json = body_json or {}
+    if not isinstance(body_json, dict):
+      body_json = {}
     secret = body_json.get('secret', None)
-    self.P(f"Extracted secret: {secret}")
+    self.P(f"Secret provided: {'yes' if secret else 'no'}")
 
     cid = self.r1fs.add_file(file_path=file_path, secret=secret, nonce=nonce)
 
@@ -139,7 +189,7 @@ class R1fsManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("GET_FILE", request_data=request_data)
 
-    self.P(f"Retrieving file with CID='{cid}', secret='{secret}'...")
+    self.P(f"Retrieving file with CID='{cid}', secret_provided={'yes' if secret else 'no'}")
 
     fn = self.r1fs.get_file(cid=cid, secret=secret)
 
@@ -161,7 +211,7 @@ class R1fsManagerApiPlugin(BasePlugin):
       'meta': meta
     }
 
-    self.P(f"response: {self.json.dumps(response, indent=2)}")
+    self.P(f"GET_FILE completed, file_path set: {bool(fn)}")
 
     # Log response
     self._log_request_response("GET_FILE", response_data=response)
@@ -196,7 +246,7 @@ class R1fsManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("ADD_FILE_BASE64", request_data=request_data)
 
-    self.P(f"New base64 File={file_base64_str}")
+    self.P(f"Received base64 payload length={len(file_base64_str) if file_base64_str else 0}")
     if not filename:
       filename = self.r1fs._get_unique_or_complete_upload_name()
 
@@ -254,7 +304,7 @@ class R1fsManagerApiPlugin(BasePlugin):
     filename = file.split('/')[-1] if file else None
     self.P(f"File retrieved: {file}")
     file_base64 = self.diskapi_load_r1fs_file(file, verbose=True, to_base64=True)
-    self.P("file retrieved: {}".format(file_base64))
+    self.P(f"Encoded payload length={len(file_base64) if file_base64 else 0}")
 
     data = {
       "file_base64_str": file_base64,
@@ -299,7 +349,8 @@ class R1fsManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("ADD_YAML", request_data=request_data)
 
-    self.P(f"Adding data={data} to yaml, secret='{secret}'", color='g')
+    yaml_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+    self.P(f"Adding YAML payload with keys={yaml_keys}, secret_provided={'yes' if secret else 'no'}", color='g')
 
     cid = self.r1fs.add_yaml(data=data, fn=fn, secret=secret)
     self.P(f"Cid='{cid}'")
@@ -335,14 +386,14 @@ class R1fsManagerApiPlugin(BasePlugin):
     # Log request
     request_data = {
       'cid': cid,
-      'secret': secret
+      'secret': "***" if secret else None,
     }
     self._log_request_response("GET_YAML", request_data=request_data)
 
-    self.P(f"Retrieving file with CID='{cid}', secret='{secret}'...")
+    self.P(f"Retrieving YAML with CID='{cid}', secret_provided={'yes' if secret else 'no'}")
 
     fn = self.r1fs.get_file(cid=cid, secret=secret)
-    self.P(f"fn: {fn}")
+    self.P(f"Retrieved file path: {fn}")
     
     if fn is None:
       error_msg = f"Failed to retrieve file with CID '{cid}'. The file may not exist or the IPFS download failed."
@@ -352,7 +403,8 @@ class R1fsManagerApiPlugin(BasePlugin):
     
     if fn.endswith('.yaml') or fn.endswith('.yml'):
       file_data = self.diskapi_load_yaml(fn, verbose=False)
-      self.P(f"File found: {file_data}")
+      summary = list(file_data.keys()) if isinstance(file_data, dict) else type(file_data).__name__
+      self.P(f"Parsed YAML payload summary: {summary}")
 
     else:
       self.P(f"Error retrieving file: {fn}")
@@ -365,7 +417,11 @@ class R1fsManagerApiPlugin(BasePlugin):
     }
     
     # Log response
-    self._log_request_response("GET_YAML", response_data=data)
+    response_summary = {
+      'file_data_type': type(file_data).__name__,
+      'file_data_keys': list(file_data.keys()) if isinstance(file_data, dict) else None
+    }
+    self._log_request_response("GET_YAML", response_data=response_summary)
     
     return data
 
