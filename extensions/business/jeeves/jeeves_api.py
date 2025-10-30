@@ -180,7 +180,8 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       'last_access_time': self.time(),
       'n_requests': 0,
       'messages': [],
-      'long_term_memory_is_empty': True
+      'long_term_memory_is_empty': True,
+      'conversations': {},
     }
     self.__user_data[user_token] = new_user_data
     self.maybe_persistence_save(force=True)
@@ -222,12 +223,23 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         return a
       return a + b
 
+    def choose_merge(a, b):
+      if a is None:
+        return b
+      if b is None:
+        return a
+      return {
+        **a,
+        **b,
+      }
+
     merging_methods = {
       'creation_time': choose_min,
       'last_access_time': choose_max,
       'messages': choose_sum,
       'n_requests': choose_sum,
       'long_term_memory_is_empty': choose_min,
+      'conversations': choose_merge,
     }
     in_memory_user_data = in_memory_user_data or {}
     return {
@@ -910,6 +922,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         preprocess_request_method: callable = None,
         compute_request_result_method: callable = None,
         extracted_param_names: list = None,
+        conversation_id: str = None,
         **kwargs
     ):
       extracted_param_names = extracted_param_names or []
@@ -932,6 +945,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           ('messages', messages or []),
           ('keep_conversation_history', keep_conversation_history),
           ('use_long_term_memory', use_long_term_memory),
+          ('conversation_id', conversation_id),
           *domain_additional_tuples,
           *[
             (k, v) for k, v in kwargs.items()
@@ -1241,6 +1255,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         domain: str = None,
         short_term_memory_only: bool = False,
         is_chat_request: bool = False,
+        conversation_id: str = None,
         **kwargs,
     ):
       """
@@ -1296,6 +1311,20 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
         }
         return result
       # endif message is None
+
+      if isinstance(conversation_id, str) and self.__user_data[user_token].get(conversation_id) is not None:
+        # Detected existing conversation.
+        conversation_kwargs = self.__user_data[user_token][conversation_id].get('conversation_kwargs', {})
+        domain = domain or conversation_kwargs.get('domain')
+        remaining_kwargs = {
+          k: v for k, v in conversation_kwargs.items()
+          if k != 'domain'
+        }
+        kwargs = {
+          **remaining_kwargs,
+          **kwargs,
+        }
+      # endif existing conversation detected
 
       domain_prompt, additional_kwargs = self.get_domain_prompt(
         user_token=user_token,
@@ -1577,7 +1606,32 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
           color="green"
         )
 
-        if keep_conversation_history:
+        conversation_id = request_data.get('conversation_id')
+        self.P(f"Extracted conversation ID: `{conversation_id}`")
+        message_saved = False
+        if isinstance(conversation_id, str):
+          conversation_data = self.__user_data[user_token].get("conversations", {}).get(conversation_id)
+          if conversation_data:
+            self.Pd(f"Adding messages to conversation '{conversation_id}' for user '{user_token}'")
+            current_messages = conversation_data.get('messages', [])
+            last_user_message = self.get_last_user_message(user_messages)
+            if last_user_message is not None:
+              current_messages.append(last_user_message)
+            # endif last user message
+            current_messages.append({
+              'role': 'assistant',
+              'content': reply_text,
+            })
+            conversation_data['messages'] = current_messages
+            conversation_data['last_access_time'] = self.time()
+            conversation_data['n_requests'] += 1
+            message_saved = True
+            self.__user_data[user_token][conversation_id] = conversation_data
+            result['conversation_id'] = conversation_id
+          # endif conversation_data exists
+        # endif
+
+        if not message_saved and keep_conversation_history:
           self.P(f"User messages: {user_messages}")
           last_user_message = self.get_last_user_message(user_messages)
           if last_user_message is not None:
@@ -1684,6 +1738,204 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
       request_steps = [step for step in request_steps if step is not None]
       postponed_request = self.start_request_steps(
         request_steps=request_steps,
+      )
+      return postponed_request
+
+    def create_conversation_data(self, conversation_kwargs: dict = None):
+      conversation_kwargs = conversation_kwargs or {}
+      return {
+        'creation_time': self.time(),
+        'last_access_time': self.time(),
+        'messages': [],
+        'n_requests': 0,
+        "conversation_kwargs": conversation_kwargs,
+      }
+
+    def process_conversation_messages(
+        self, conversation_messages: list[dict],
+        **kwargs
+    ):
+      """
+      Process the conversation messages if needed.
+      By default, this is the identity function.
+      Parameters
+      ----------
+      conversation_messages: list[dict]
+
+      kwargs
+
+      Returns
+      -------
+
+      """
+      user_replies = []
+      last_assistant_message = None
+      for msg in conversation_messages:
+        msg_content = msg.get("content")
+        if not msg_content:
+          continue
+        if msg.get("role") == "user":
+          user_replies.append(msg_content)
+        elif msg.get("role") == "assistant":
+          # Here, the entire dictionary is used, since it will be wrapped in the same way.
+          last_assistant_message = msg
+      # endfor conversation messages
+      res = []
+      if user_replies:
+        agg_label = "User messages:"
+        res.append({
+          "role": "user",
+          "content": f"{agg_label}\n\n" + "\n\n---\n\n".join(user_replies)
+        })
+      # endif existing user replies
+      if last_assistant_message:
+        res.append(last_assistant_message)
+      # endif existing assistant message
+      return res
+
+    def maybe_add_conversation_messages(
+        self,
+        conversation_data: dict,
+        messages: list[dict],
+        **kwargs
+    ):
+      """
+      Handle the conversation history for the Jeeves API.
+      This will merge the registered messages from conversation_data,
+      the message(s) from the user, and the system prompt if present.
+      Parameters
+      ----------
+      conversation_data : dict
+          The conversation data from a specific conversation of a specific user.
+      messages : list[dict]
+          The messages to send to the API. This will contain the current user message
+          and optionally the system prompt as the last message.
+
+
+      Returns
+      -------
+      res : list[dict]
+          The messages to send to the API.
+      """
+      last_message = messages[-1]
+      if last_message.get('role') == 'system':
+        current_messages = messages[-2:]
+      else:
+        current_messages = messages[-1:]
+      # endif last message is system
+      # Here, the conversation messages are already stored in a raw manner.
+      conversation_messages = self.deepcopy(conversation_data.get('messages', []))
+      self.Pd(f"Extracted conversation messages: {conversation_messages}")
+      conversation_messages = self.process_conversation_messages(conversation_messages, **kwargs)
+      self.Pd(f"Processed conversation messages: {conversation_messages}")
+      conversation_messages += current_messages
+
+      return conversation_messages
+
+    @BasePlugin.endpoint(method="post")
+    def conversation(
+        self,
+        user_token: str = None,
+        conversation_id: str = None,
+        message: str = None,
+        domain: str = None,
+        **kwargs
+    ):
+      """
+      Start or continue a conversation with the Jeeves API.
+      In case this is a new conversation, the kwargs will be stored for future reference.
+      In case this is a continuation of a conversation, if any kwargs are provided,
+      they will be used instead of the stored ones, but they will not be stored for future reference.
+      Parameters
+      ----------
+      user_token : str
+          The user token to use for the API. Default is None.
+      conversation_id : str
+          The conversation ID to use for the API. Default is None.
+          If None, a new conversation will be started.
+      message : str
+          The message to send to the API. Default is None.
+      domain : str
+          The domain to use for the API. Default is None.
+      kwargs : dict
+          Additional parameters to send to the API. Default is None.
+
+      Returns
+      -------
+
+      """
+      processed_request = self.pre_process_chat_request(
+        user_token=user_token,
+        message=message,
+        domain=domain,
+        conversation_id=conversation_id,
+        **kwargs,
+      )
+      if processed_request['err_response'] is not None:
+        return processed_request['err_response']
+      # endif error in processing request
+
+      additional_kwargs = processed_request['additional_kwargs']
+      messages = processed_request['messages']
+      # Handling conversation history
+      current_user_conversations_data = self.__user_data[user_token].get('conversations', {})
+      if conversation_id is None:
+        conversation_id = self.uuid()
+        while conversation_id in current_user_conversations_data:
+          conversation_id = self.uuid()
+        # endwhile conversation_id already existent
+      # endif conversation_id not provided
+      conversation_data = self.__user_data[user_token].get('conversations', {}).get(conversation_id, {})
+      if not conversation_data:
+        self.Pd(f"Creating new conversation '{conversation_id}' for user '{user_token}'")
+        conversation_kwargs = {
+          'domain': domain,
+          **additional_kwargs
+        }
+        self.__user_data[user_token]['conversations'][conversation_id] = self.create_conversation_data(
+          conversation_kwargs=conversation_kwargs
+        )
+        conversation_data = self.__user_data[user_token]['conversations'][conversation_id]
+      # endif new conversation
+      messages = self.maybe_add_conversation_messages(
+        conversation_data=conversation_data,
+        messages=messages
+      )
+
+      domain_additional_data_step_description = self.get_description_of_retrieval_step(
+        domain=domain,
+        query=message,
+        user_token=user_token,
+        short_term_memory_only=False,
+        # optional, since no preprocessing is needed
+        preprocess_request_method=None,
+        compute_request_result_method=self.compute_request_result_retrieval_domain_additional_data,
+      )
+      chat_step_description = self.get_description_of_chat_step(
+        domain=domain,
+        user_token=user_token,
+        messages=messages,
+        keep_conversation_history=False,
+        use_long_term_memory=False,
+        preprocess_request_method=self.preprocess_request_method_query,
+        compute_request_result_method=self.compute_request_result_chat,
+        extracted_param_names=[
+          self.ct.JeevesCt.CONTEXT
+        ],
+        conversation_id=conversation_id,
+        **additional_kwargs
+      )
+
+      request_steps = [
+        domain_additional_data_step_description,
+        chat_step_description
+      ]
+      request_steps = [
+        step for step in request_steps
+        if step is not None
+      ]
+      postponed_request = self.start_request_steps(
+        request_steps=request_steps
       )
       return postponed_request
   """END LLM SECTION"""
