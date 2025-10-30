@@ -39,6 +39,7 @@ class DEEPLOY_KEYS:
   CHAINSTORE_RESPONSE = "chainstore_response"
   PIPELINE_INPUT_TYPE = "pipeline_input_type"
   PIPELINE_INPUT_URI = "pipeline_input_uri"
+  PIPELINE_PARAMS = "pipeline_params"
   # App params keys
   APP_PARAMS = "app_params"
   APP_PARAMS_IMAGE = "IMAGE"
@@ -543,6 +544,7 @@ DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN = {
   # Pipeline data source
   "pipeline_input_type"  : "void",  # Pipeline TYPE
   "pipeline_input_uri" : None,
+  "pipeline_params": {},
   "chainstore_response" : True,
 
   # Plugins array (NEW FORMAT - each object is a plugin instance)

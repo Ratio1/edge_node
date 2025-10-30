@@ -122,7 +122,11 @@ class _DeeployMixin:
     spare_nodes = inputs.get(DEEPLOY_KEYS.SPARE_NODES, [])
     allow_replication_in_the_wild = inputs.get(DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD, False)
     response_keys = self.defaultdict(list)
-
+    pipeline_params = self._extract_pipeline_params(inputs)
+    pipeline_kwargs = self._prepare_pipeline_param_kwargs(
+      pipeline_params,
+      reserved_keys={"app_alias", "owner", "is_deeployed", "deeploy_specs"},
+    )
     ts = self.time()
     if dct_deeploy_specs:
       dct_deeploy_specs = self.deepcopy(dct_deeploy_specs)
@@ -151,6 +155,7 @@ class _DeeployMixin:
     dct_deeploy_specs[DEEPLOY_KEYS.JOB_TAGS] = job_tags
     dct_deeploy_specs[DEEPLOY_KEYS.SPARE_NODES] = spare_nodes
     dct_deeploy_specs[DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD] = allow_replication_in_the_wild
+    dct_deeploy_specs[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
 
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
     if detected_job_app_type in JOB_APP_TYPES_ALL:
@@ -195,6 +200,7 @@ class _DeeployMixin:
           plugins=node_plugins,
           is_deeployed=True,
           deeploy_specs=dct_deeploy_specs,
+          **pipeline_kwargs,
         )
 
         self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
@@ -220,7 +226,11 @@ class _DeeployMixin:
     spare_nodes = inputs.get(DEEPLOY_KEYS.SPARE_NODES, [])
     allow_replication_in_the_wild = inputs.get(DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD, False)
     response_keys = self.defaultdict(list)
-
+    pipeline_params = self._extract_pipeline_params(inputs)
+    pipeline_kwargs = self._prepare_pipeline_param_kwargs(
+      pipeline_params,
+      reserved_keys={"app_alias", "owner", "is_deeployed", "deeploy_specs"},
+    )
     ts = self.time()
     detected_job_app_type = job_app_type
     if not detected_job_app_type:
@@ -381,9 +391,11 @@ class _DeeployMixin:
           plugins=node_plugins,
           is_deeployed=True,
           deeploy_specs=dct_deeploy_specs,
+          **pipeline_kwargs,
         )
 
         self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
+        pipeline[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
         pipelin_to_save = pipeline
       # endif addr is valid
     # endfor each target node
@@ -596,6 +608,7 @@ class _DeeployMixin:
       DEEPLOY_KEYS.TARGET_NODES: 0,
       DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: 'void',
       DEEPLOY_KEYS.PIPELINE_INPUT_URI: None,
+      DEEPLOY_KEYS.PIPELINE_PARAMS: {},
       DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
       DEEPLOY_KEYS.APP_PARAMS: {},
       DEEPLOY_KEYS.JOB_APP_TYPE: None,
@@ -751,6 +764,67 @@ class _DeeployMixin:
     raise ValueError(
       f"{DEEPLOY_ERRORS.REQUEST3}. Neither 'plugins' array nor 'plugin_signature' provided."
     )
+
+  def _extract_pipeline_params(self, inputs):
+    """
+    Return pipeline-level parameters ensuring a dictionary payload.
+
+    Args:
+        inputs: The request payload with potential pipeline_params entry.
+
+    Returns:
+        dict: Normalized pipeline params dictionary.
+    """
+    pipeline_params = {}
+    try:
+      pipeline_params = inputs.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
+    except Exception:
+      if hasattr(inputs, DEEPLOY_KEYS.PIPELINE_PARAMS):
+        pipeline_params = getattr(inputs, DEEPLOY_KEYS.PIPELINE_PARAMS)
+
+    if pipeline_params is None:
+      pipeline_params = {}
+
+    if not isinstance(pipeline_params, dict):
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.REQUEST3}. 'pipeline_params' must be a dictionary."
+      )
+
+    return pipeline_params
+
+  def _prepare_pipeline_param_kwargs(self, pipeline_params, reserved_keys=None):
+    """
+    Prepare keyword arguments for pipeline creation based on pipeline_params.
+
+    Args:
+        pipeline_params (dict): Raw pipeline params from the request.
+        reserved_keys (set[str] | None): Keys that should not be forwarded.
+
+    Returns:
+        dict: Filtered kwargs safe to pass into cmdapi_start_pipeline_by_params.
+    """
+    if not pipeline_params:
+      return {}
+
+    if not isinstance(pipeline_params, dict):
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.REQUEST3}. 'pipeline_params' must be a dictionary."
+      )
+
+    reserved = {
+      "name",
+      "pipeline_type",
+      "url",
+      "plugins",
+    }
+    if reserved_keys:
+      reserved.update(reserved_keys)
+
+    return {
+      key: value
+      for key, value in pipeline_params.items()
+      if key not in reserved
+    }
 
   def _validate_plugins_array(self, plugins: list):
     """
@@ -1751,6 +1825,12 @@ class _DeeployMixin:
       }
       transformed_plugins.append(transformed_plugin)
 
+    pipeline_params = {}
+    if isinstance(deeploy_specs, dict):
+      extracted_params = deeploy_specs.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
+      if isinstance(extracted_params, dict):
+        pipeline_params = self.deepcopy(extracted_params)
+
     # todo: use constants
     return {
       "base_pipeline": base_pipeline,
@@ -1758,7 +1838,8 @@ class _DeeployMixin:
       "deeploy_specs": deeploy_specs,
       "plugins": transformed_plugins,
       "pipeline_type": base_pipeline.get("TYPE", "void"),
-      "url": base_pipeline.get("URL", None)
+      "url": base_pipeline.get("URL", None),
+      "pipeline_params": pipeline_params,
     }
 
   def prepare_create_update_pipelines(self, base_pipeline, new_nodes, update_nodes, running_apps_for_job):
@@ -1772,6 +1853,17 @@ class _DeeployMixin:
     self.Pd(f"New nodes {type(new_nodes)}: {self.json_dumps(new_nodes)}")
     self.Pd(f"Update nodes{type(update_nodes)}: {self.json_dumps(update_nodes)}")
 
+    pipeline_params = base_pipeline.get("pipeline_params")
+    if not isinstance(pipeline_params, dict):
+      deeploy_specs_section = base_pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
+      if isinstance(deeploy_specs_section, dict):
+        pipeline_params = deeploy_specs_section.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
+      else:
+        pipeline_params = {}
+    if pipeline_params is None:
+      pipeline_params = {}
+    base_pipeline["pipeline_params"] = self.deepcopy(pipeline_params)
+
     chainstore_peers = list(set(new_nodes + update_nodes))
     deeploy_specs = self.deepcopy(base_pipeline[NetMonCt.DEEPLOY_SPECS])
     job_app_type = None
@@ -1781,8 +1873,10 @@ class _DeeployMixin:
         job_app_type = self.deeploy_detect_job_app_type(base_pipeline.get(NetMonCt.PLUGINS, []))
         if job_app_type in JOB_APP_TYPES_ALL:
           deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
+      deeploy_specs[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
     deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
     deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+    base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
 
     chainstore_response_keys = self.defaultdict(list)
 
@@ -1854,15 +1948,23 @@ class _DeeployMixin:
     Start the create and update pipelines.
     """
     for node, pipeline in create_pipelines.items():
+      pipeline_params = pipeline.get('pipeline_params', {})
+      if not isinstance(pipeline_params, dict):
+        pipeline_params = {}
+      pipeline_kwargs = self._prepare_pipeline_param_kwargs(
+        pipeline_params,
+        reserved_keys={"app_alias", "owner", "is_deeployed", "deeploy_specs"},
+      )
       self.cmdapi_start_pipeline_by_params(
         name=pipeline['app_id'],
         pipeline_type=pipeline['pipeline_type'],
         node_address=node,
         owner=sender, 
-        url=pipeline['url'],
+        url=pipeline.get('url'),
         plugins=pipeline['plugins'],
         is_deeployed=True,
         deeploy_specs=pipeline['deeploy_specs'],
+        **pipeline_kwargs,
       )    
     for node, pipeline in update_pipelines.items():
       # For update pipelines, we need to iterate through the plugins and instances
