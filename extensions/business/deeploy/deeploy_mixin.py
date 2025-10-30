@@ -776,7 +776,6 @@ class _DeeployMixin:
   def _ensure_deeploy_specs_job_config(self, deeploy_specs, pipeline_params=None):
     """
     Ensure deeploy_specs contains a job_config section holding pipeline_params.
-    Keeps the legacy top-level pipeline_params alias in sync for backward compatibility.
     """
     if not isinstance(deeploy_specs, dict):
       return deeploy_specs
@@ -789,11 +788,7 @@ class _DeeployMixin:
 
     resolved_params = pipeline_params
     if resolved_params is None:
-      existing_params = job_config.get(DEEPLOY_KEYS.PIPELINE_PARAMS)
-      if existing_params is not None:
-        resolved_params = existing_params
-      else:
-        resolved_params = specs.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
+      resolved_params = job_config.get(DEEPLOY_KEYS.PIPELINE_PARAMS)
 
     if resolved_params is None:
       resolved_params = {}
@@ -807,7 +802,6 @@ class _DeeployMixin:
 
     job_config[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(resolved_params)
     specs[DEEPLOY_KEYS.JOB_CONFIG] = job_config
-    specs[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(resolved_params)
     return specs
 
   def _get_pipeline_params_from_deeploy_specs(self, deeploy_specs):
@@ -828,17 +822,7 @@ class _DeeployMixin:
         "Invalid pipeline_params found under deeploy_specs.job_config; expected a dictionary.",
         color='y'
       )
-
-    legacy_params = deeploy_specs.get(DEEPLOY_KEYS.PIPELINE_PARAMS, {})
-    if legacy_params is None:
-      legacy_params = {}
-    if not isinstance(legacy_params, dict):
-      self.Pd(
-        "Invalid legacy pipeline_params found in deeploy_specs; expected a dictionary.",
-        color='y'
-      )
-      legacy_params = {}
-    return self.deepcopy(legacy_params)
+    return {}
 
   def _extract_pipeline_params(self, inputs):
     """
