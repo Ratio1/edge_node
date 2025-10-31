@@ -164,6 +164,7 @@ class _DeeployMixin:
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
+    node_plugins_by_addr = {}
     for addr in nodes:
       # Nodes to peer with for CHAINSTORE
       nodes_to_peer = nodes
@@ -186,11 +187,33 @@ class _DeeployMixin:
         # endfor each plugin instance
       # endfor each plugin
   
+      node_plugins_by_addr[addr] = node_plugins
+
+    prepared_response_keys = self._normalize_chainstore_response_mapping(response_keys)
+    merged_chainstore_map = self._normalize_chainstore_response_mapping(
+      dct_deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, {})
+    )
+    if inputs.chainstore_response:
+      merged_chainstore_map = self._merge_chainstore_response_keys(
+        merged_chainstore_map,
+        prepared_response_keys,
+      )
+      if merged_chainstore_map:
+        dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_chainstore_map)
+      else:
+        dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+    else:
+      merged_chainstore_map = {}
+      dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+
+    shared_specs_payload = self.deepcopy(dct_deeploy_specs)
+
+    for addr, node_plugins in node_plugins_by_addr.items():
       msg = ''
       if self.cfg_deeploy_verbose > 1:
         msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
       self.P(f"Creating pipeline '{app_alias}' on {addr}{msg}")
-      
+
       if addr is not None:
 
         pipeline = self.cmdapi_start_pipeline_by_params(
@@ -202,7 +225,7 @@ class _DeeployMixin:
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
           is_deeployed=True,
-          deeploy_specs=dct_deeploy_specs,
+          deeploy_specs=self.deepcopy(shared_specs_payload),
           **pipeline_kwargs,
         )
 
@@ -214,7 +237,9 @@ class _DeeployMixin:
           self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
       # endif addr is valid
     # endfor each target node
-    return response_keys
+
+    cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
+    return cleaned_response_keys
 
   def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
     """
@@ -360,6 +385,7 @@ class _DeeployMixin:
           plugins_by_node[addr].append(prepared_plugin)
 
     pipeline_to_save = None
+    node_plugins_ready = {}
     for addr, plugins in plugins_by_node.items():
       nodes_to_peer = unique_nodes
       node_plugins = self.deepcopy(plugins)
@@ -381,6 +407,28 @@ class _DeeployMixin:
         # endfor each plugin instance
       # endfor each plugin
 
+      node_plugins_ready[addr] = node_plugins
+
+    prepared_response_keys = self._normalize_chainstore_response_mapping(response_keys)
+    merged_chainstore_map = self._normalize_chainstore_response_mapping(
+      dct_deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, {})
+    )
+    if inputs.chainstore_response:
+      merged_chainstore_map = self._merge_chainstore_response_keys(
+        merged_chainstore_map,
+        prepared_response_keys,
+      )
+      if merged_chainstore_map:
+        dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_chainstore_map)
+      else:
+        dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+    else:
+      merged_chainstore_map = {}
+      dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+
+    shared_specs_payload = self.deepcopy(dct_deeploy_specs)
+
+    for addr, node_plugins in node_plugins_ready.items():
       msg = ''
       if self.cfg_deeploy_verbose > 1:
         msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
@@ -397,7 +445,7 @@ class _DeeployMixin:
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
           is_deeployed=True,
-          deeploy_specs=dct_deeploy_specs,
+          deeploy_specs=self.deepcopy(shared_specs_payload),
           **pipeline_kwargs,
         )
 
@@ -411,7 +459,16 @@ class _DeeployMixin:
       self.P(f"Pipeline saved in CSTORE: {save_result}")
     except Exception as e:
       self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
-    return response_keys
+    if inputs.chainstore_response:
+      if merged_chainstore_map:
+        dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_chainstore_map)
+      else:
+        dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+    else:
+      dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+
+    cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
+    return cleaned_response_keys
 
   def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
     """
@@ -803,6 +860,45 @@ class _DeeployMixin:
     job_config[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(resolved_params)
     specs[DEEPLOY_KEYS.JOB_CONFIG] = job_config
     return specs
+
+  def _normalize_chainstore_response_mapping(self, mapping):
+    """
+    Return a sanitized node -> [chainstore_key] dictionary.
+    """
+    normalized = {}
+    if not isinstance(mapping, dict):
+      return normalized
+
+    for node_addr, raw_value in mapping.items():
+      keys = []
+      if isinstance(raw_value, (list, tuple, set)):
+        keys = [key for key in raw_value if isinstance(key, str) and key]
+      elif isinstance(raw_value, str) and raw_value:
+        keys = [raw_value]
+
+      if not keys:
+        continue
+
+      deduped = list(dict.fromkeys(keys))
+      if deduped:
+        normalized[node_addr] = deduped
+
+    return normalized
+
+  def _merge_chainstore_response_keys(self, base_mapping, additions):
+    """
+    Merge node -> [chainstore_key] mappings, returning a new normalized dictionary.
+    """
+    merged = self._normalize_chainstore_response_mapping(base_mapping)
+    extra = self._normalize_chainstore_response_mapping(additions)
+
+    for node_addr, keys in extra.items():
+      target = merged.setdefault(node_addr, [])
+      for key in keys:
+        if key not in target:
+          target.append(key)
+
+    return merged
 
   def _get_pipeline_params_from_deeploy_specs(self, deeploy_specs):
     """
@@ -2006,7 +2102,47 @@ class _DeeployMixin:
             
             chainstore_response_keys[node].append(chainstore_response_key)
 
-    return create_pipelines, update_pipelines, chainstore_response_keys
+    normalized_existing_map = self._normalize_chainstore_response_mapping(
+      deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, {})
+    )
+    prepared_response_keys = {
+      node: [key for key in keys if key]
+      for node, keys in chainstore_response_keys.items()
+      if any(key for key in keys if key)
+    }
+    merged_mapping = self._merge_chainstore_response_keys(
+      normalized_existing_map,
+      prepared_response_keys
+    )
+
+    if isinstance(deeploy_specs, dict):
+      if merged_mapping:
+        deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_mapping)
+      else:
+        deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+      base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
+
+    for pipeline in create_pipelines.values():
+      specs = pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
+      if not isinstance(specs, dict):
+        continue
+      if merged_mapping:
+        specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_mapping)
+      else:
+        specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+      pipeline[NetMonCt.DEEPLOY_SPECS] = specs
+
+    for pipeline in update_pipelines.values():
+      specs = pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
+      if not isinstance(specs, dict):
+        continue
+      if merged_mapping:
+        specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_mapping)
+      else:
+        specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+      pipeline[NetMonCt.DEEPLOY_SPECS] = specs
+
+    return create_pipelines, update_pipelines, prepared_response_keys
 
   def _start_create_update_pipelines(self, create_pipelines, update_pipelines, sender):
     """
