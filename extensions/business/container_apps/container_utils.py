@@ -91,27 +91,93 @@ class _ContainerUtilsMixin:
 
     return dct_env
 
+  def _get_chainstore_response_data(self):
+    """
+    Build container-specific response data for chainstore.
+
+    This method overrides the base mixin implementation to provide
+    container-specific information in the response.
+
+    Returns:
+        dict: Response data including container details, ports, and timing info.
+    """
+    # Start with base plugin data (from _ChainstoreResponseMixin)
+    # Note: Since this mixin is used alongside _ChainstoreResponseMixin,
+    # we should check if super() provides base data
+    try:
+      # Try to get base data if _ChainstoreResponseMixin is in the MRO
+      data = super()._get_chainstore_response_data()
+    except (AttributeError, TypeError):
+      # Fallback if _ChainstoreResponseMixin is not in the inheritance chain
+      data = {
+        'plugin_signature': self.__class__.__name__,
+        'instance_id': getattr(self, 'cfg_instance_id', None),
+        'timestamp': self.time_to_str(self.time()) if hasattr(self, 'time_to_str') else None,
+      }
+
+    # Add container-specific information
+    data.update({
+      'container_id': getattr(self, 'container_id', None),
+      'container_name': getattr(self, 'container_name', None),
+      'start_time': self.time_to_str(self.container_start_time) if hasattr(self, 'container_start_time') else None,
+      'ports_mapping': getattr(self, 'extra_ports_mapping', {}),
+      'main_port': getattr(self, 'port', None),
+      'image': getattr(self, 'cfg_image', None),
+    })
+
+    return data
+
   def _maybe_send_plugin_start_confirmation(self):
     """
-    Sets up confirmation data about plugin start in CHAINSTORE.
-    TODO: Generalize this function and move it to the base class.
+    Send container startup confirmation to chainstore.
+
+    This method now delegates to the generalized _ChainstoreResponseMixin
+    for consistent behavior across all plugins that support chainstore responses.
+
+    The container-specific response data is provided via the
+    _get_chainstore_response_data() override above.
+
+    Migration Note:
+    --------------
+    This replaces the old inline implementation with the mixin-based approach.
+    The new behavior is simpler:
+    - Single write (no retries, no confirmations)
+    - Consistent error handling
+    - Validation logic
+    - Reusability across plugin types
+
+    Usage:
+    ------
+    Call this method after container startup is complete and all relevant
+    attributes (container_id, container_start_time, extra_ports_mapping, etc.)
+    have been set.
+
+    Note: _reset_chainstore_response() should have been called at the START
+    of initialization.
     """
-    response_key = getattr(self, 'cfg_chainstore_response_key', None)
-    if response_key is not None:
-      N_CONFIRMATIONS = 3
-      self.P(f"Responding to key {response_key} in {N_CONFIRMATIONS} confirmations")
-      response_info = {
-        'container_id': self.container_id,
-        'start_time': self.time_to_str(self.container_start_time),
-        'ports_mapping': self.extra_ports_mapping,
-      }
-      for confirmation in range(N_CONFIRMATIONS):
-        self.P(f"Sending confirmation {confirmation + 1} to {response_key}: {self.json_dumps(response_info)}")
-        response_info['confirmation'] = confirmation + 1
-        to_save = self.deepcopy(response_info)
-        self.chainstore_set(response_key, to_save)
-        self.sleep(0.100) # wait 100 ms
-    return
+    # Delegate to the mixin's implementation
+    # This assumes the plugin class inherits from _ChainstoreResponseMixin
+    if hasattr(self, '_send_chainstore_response'):
+      return self._send_chainstore_response()
+    else:
+      # Fallback for backward compatibility if mixin is not available
+      # This preserves the old behavior (simplified - single write)
+      self.P(
+        "WARNING: _ChainstoreResponseMixin not available, using legacy implementation. "
+        "Consider adding _ChainstoreResponseMixin to the plugin inheritance chain.",
+        color='y'
+      )
+      response_key = getattr(self, 'cfg_chainstore_response_key', None)
+      if response_key is not None:
+        self.P(f"Responding to key {response_key}")
+        response_info = {
+          'container_id': self.container_id,
+          'start_time': self.time_to_str(self.container_start_time),
+          'ports_mapping': self.extra_ports_mapping,
+        }
+        self.P(f"Sending response to {response_key}: {self.json_dumps(response_info)}")
+        self.chainstore_set(response_key, response_info)
+      return
 
 
   def _setup_dynamic_env_var_host_ip(self):
