@@ -1,5 +1,6 @@
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 from naeural_core.business.mixins_libs.network_processor_mixin import _NetworkProcessorMixin
+from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResponseMixin
 from constants import JeevesCt
 
 import os
@@ -8,6 +9,9 @@ import base64
 
 _CONFIG = {
   **BasePlugin.CONFIG,
+
+  # Optional key for sending plugin lifecycle confirmations to chainstore (set once after init)
+  'CHAINSTORE_RESPONSE_KEY': None,
 
   "MAX_INPUTS_QUEUE_SIZE": 100,
 
@@ -57,7 +61,7 @@ _CONFIG = {
 }
 
 
-class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
+class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin, _ChainstoreResponseMixin):
   CONFIG = _CONFIG
 
   def maybe_wait_for_r1fs(self):
@@ -81,8 +85,31 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
   def get_supported_file_extensions(self):
     return JeevesCt.SUPPORTED_FILE_TYPES
 
+  def _get_chainstore_response_data(self):
+    """
+    Build Jeeves API-specific response data for chainstore.
+
+    Includes API endpoint information and initialization status.
+    """
+    # Get base data from mixin
+    data = super()._get_chainstore_response_data()
+
+    # Add Jeeves API-specific information
+    data.update({
+      'api_port': getattr(self, 'cfg_port', None),
+      'api_endpoint': f"http://{self.log.get_localhost_ip()}:{self.cfg_port}" if hasattr(self, 'cfg_port') else None,
+      'predefined_domains': list(self.cfg_predefined_domains.keys()) if hasattr(self, 'cfg_predefined_domains') and self.cfg_predefined_domains else [],
+      'status': 'ready',
+    })
+
+    return data
+
   def on_init(self):
     super(JeevesApiPlugin, self).on_init()
+
+    # Reset chainstore response key at start (signals "initializing")
+    self._reset_chainstore_response()
+
     self.network_processor_init()
     self.__command_payloads = []
     self.__requests = {}
@@ -120,6 +147,10 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     # endfor predefined additional context domains
     self.maybe_load_persistence_data()
     self.maybe_wait_for_r1fs()
+
+    # Send chainstore response at end (signals "ready")
+    self._send_chainstore_response()
+
     return
 
   def get_requests_persistence_data(self):
@@ -2698,4 +2729,3 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     self.__maybe_send_command_payloads()
     self.maybe_persistence_save()
     return
-
