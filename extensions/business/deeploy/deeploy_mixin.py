@@ -424,8 +424,6 @@ class _DeeployMixin:
       merged_chainstore_map = {}
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
-    shared_specs_payload = self.deepcopy(dct_deeploy_specs)
-
     for addr, node_plugins in node_plugins_ready.items():
       msg = ''
       if self.cfg_deeploy_verbose > 1:
@@ -443,7 +441,7 @@ class _DeeployMixin:
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
           is_deeployed=True,
-          deeploy_specs=self.deepcopy(shared_specs_payload),
+          deeploy_specs=self.deepcopy(dct_deeploy_specs),
           **pipeline_kwargs,
         )
 
