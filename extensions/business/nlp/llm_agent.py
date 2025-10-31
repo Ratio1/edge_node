@@ -24,13 +24,7 @@ class LlmAgentPlugin(BasePlugin, _NlpAgentMixin):
   def _process(self):
     # we always receive input from the upstream due to the fact that _process
     # is called only when we have input based on ALLOW_EMPTY_INPUTS=False (from NLP_AGENT_MIXIN_CONFIG)
-    data = self.dataapi_struct_data()
+    data = self.dataapi_struct_datas()
     inferences = self.dataapi_struct_data_inferences()
-    if len(inferences) == 0:
-      return
-    if isinstance(inferences[0], list):
-      return
-    self.P(f"Received request:\n{self.json_dumps(self.shorten_str(data), indent=2)}")
-    self.P(f"Received inferences:\n{inferences}")
-    self.compute_and_send_responses(inferences)
+    self.handle_inferences(inferences=inferences, data=data)
     return

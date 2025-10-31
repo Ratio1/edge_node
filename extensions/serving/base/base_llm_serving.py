@@ -79,6 +79,7 @@ from sqlfluff.core import Linter # TODO: move sql linter to a child serving proc
 
 from extensions.serving.mixins_llm import LlmTokenizerMixin, LlmModelMixin
 from extensions.serving.mixins_llm.llm_utils import LlmCT
+from extensions.utils.jeeves.jeeves_utils import _JeevesUtilsMixin
 
 from naeural_core.serving.base import ModelServingProcess as BaseServingProcess
 
@@ -167,6 +168,7 @@ class BaseLlmServing(
   BaseServingProcess,
   LlmTokenizerMixin,
   LlmModelMixin,
+  _JeevesUtilsMixin
 ):
   CONFIG = _CONFIG
 
@@ -222,6 +224,14 @@ class BaseLlmServing(
       else:
         raise ValueError(msg)
     return
+
+  def get_relevant_signatures(self):
+    configured_relevant = self.cfg_relevant_signatures
+    if configured_relevant is None:
+      configured_relevant = []
+    # endif configured_relevant is None
+    res = configured_relevant + self.ct.JeevesCt.JEEVES_API_SIGNATURES
+    return list(set(res))
 
   def get_local_path(self):
     models_cache = self.log.get_models_folder()
@@ -320,9 +330,9 @@ class BaseLlmServing(
 
     return
 
-
   def _warmup(self):
-    relevant_signature = self.cfg_relevant_signatures[0] if self.cfg_relevant_signatures else None
+    all_relevant_signatures = self.get_relevant_signatures()
+    relevant_signature = all_relevant_signatures[0]
     payload_path = [
       None,
       None,
@@ -414,6 +424,19 @@ class BaseLlmServing(
     device_map = "auto"
     return device_map
 
+  def check_relevant_input(self, input_dict: dict):
+    inp_payload_path = input_dict.get(self.ct.PAYLOAD_DATA.EE_PAYLOAD_PATH, [None, None, None, None])
+    inp_signature = inp_payload_path[2]
+    normalized_signature = str(inp_signature).upper() if inp_signature is not None else None
+
+    if normalized_signature not in self.get_relevant_signatures():
+      # self.P(f"[DEBUG]Skipping irrelevant signature: {normalized_signature}. Relevant signatures: {self.get_relevant_signatures()}", color='y')
+      return False
+
+    jeeves_content = input_dict.get(self.ct.JeevesCt.JEEVES_CONTENT, {})
+    # self.P(f"[DEBUG]Extracted jeeves content for relevance check: {self.shorten_str(jeeves_content)}", color='g')
+    return self.check_supported_request_type(message_data=jeeves_content)
+
   def _pre_process(self, inputs):
     """
     Pre-process the inputs for the model.
@@ -485,8 +508,15 @@ class BaseLlmServing(
     additional_lst = []
     valid_conditions = []
     process_methods = []
+    relevant_input_ids = []
+    cnt_total_inputs = len(lst_inputs)
 
     for i, inp in enumerate(lst_inputs):
+      if self.check_relevant_input(inp):
+        relevant_input_ids.append(i)
+      else:
+        continue
+
       jeeves_content = inp.get("JEEVES_CONTENT")
       jeeves_content = {
         (k.upper() if isinstance(k, str) else k): v
@@ -539,16 +569,25 @@ class BaseLlmServing(
     # Build the batch tensor. Ideally we should be calling encode on the
     # list of strings directly, however that seems to failing. Additionally
     # __call__ doesn't actually do the infilling.
-    max_tok_len = max([toks.shape[1] for toks in tokens_lst])
-    batch_tokens = th.ones((len(tokens_lst), max_tok_len), dtype=th.int64, device=self.device) * self.padding_id
-    attn_mask = th.zeros((len(tokens_lst), max_tok_len), dtype=th.int64, device=self.device)
+    if len(tokens_lst) > 0:
+      max_tok_len = max([toks.shape[1] for toks in tokens_lst])
+      batch_tokens = th.ones((len(tokens_lst), max_tok_len), dtype=th.int64, device=self.device) * self.padding_id
+      attn_mask = th.zeros((len(tokens_lst), max_tok_len), dtype=th.int64, device=self.device)
+    else:
+      batch_tokens = th.empty((0, 0), dtype=th.int64, device=self.device)
+      attn_mask = th.empty((0, 0), dtype=th.int64, device=self.device)
     for i, toks in enumerate(tokens_lst):
       batch_tokens[i,:toks.shape[1]] = toks
       attn_mask[i,:toks.shape[1]] = 1
+    if len(tokens_lst) > 0:
+      self.P(f"Generated tokens batch of shape {batch_tokens.shape}")
+      self.P(f"Found attention mask of shape {attn_mask.shape}")
 
-    self.P(f"Generated tokens batch of shape {batch_tokens.shape}")
-    self.P(f"Found attention mask of shape {attn_mask.shape}")
-    return [batch_tokens, attn_mask, predict_kwargs_lst, prompt_lst, additional_lst, valid_conditions, process_methods]
+    return [
+      batch_tokens, attn_mask, predict_kwargs_lst,
+      prompt_lst, additional_lst, valid_conditions, process_methods,
+      relevant_input_ids, cnt_total_inputs
+    ]
 
   def aggregate_mean(self, values: list):
     """
@@ -734,7 +773,11 @@ class BaseLlmServing(
 
   def _predict(self, preprocessed_batch):
     self._counter += 1
-    batch_tokens, attn_mask, predict_kwargs_lst, prompt_lst, additional_lst, valid_conditions, process_methods = preprocessed_batch
+    [
+      batch_tokens, attn_mask, predict_kwargs_lst, prompt_lst,
+      additional_lst, valid_conditions, process_methods,
+      relevant_input_ids, cnt_total_inputs
+    ] = preprocessed_batch
     # Perform generation using tokens and parameters.
     # Note that it's not appropriate to call the forward function
     # here unless we want to re-implement the wheel (various searching
@@ -755,7 +798,8 @@ class BaseLlmServing(
       f"{k}={v},"
       for k, v in generate_kwargs.items()
     )
-    self.P(f"Running with following model args:\n{generate_str}")
+    if generate_kwargs:
+      self.P(f"Running with following model args:\n{generate_str}")
 
     # TODO: test if some gpu mem can be freed after this
     results = [
@@ -767,7 +811,7 @@ class BaseLlmServing(
       # original index, current index
       (idx, idx) for idx in range(batch_tokens.shape[0])
     ]
-    conditions_satisfied = False
+    conditions_satisfied = False if len(valid_conditions) > 0 else True
     max_tries = 10
     tries = 0
     while not conditions_satisfied:
@@ -854,6 +898,8 @@ class BaseLlmServing(
       # LlmCT.TPS: num_tps,
       LlmCT.ADDITIONAL: additional_lst,
       LlmCT.TEXT: text_lst,
+      "RELEVANT_IDS": relevant_input_ids,
+      "TOTAL_INPUTS": cnt_total_inputs
     }
     return dct_result
 
@@ -868,13 +914,17 @@ class BaseLlmServing(
     # tps = preds_batch[LlmCT.TPS]
     additionals = preds_batch[LlmCT.ADDITIONAL]
     text_lst = preds_batch[LlmCT.TEXT]
+    relevant_input_ids = preds_batch["RELEVANT_IDS"]
+    cnt_total_inputs = preds_batch["TOTAL_INPUTS"]
 
     for i, additional in enumerate(additionals):
       self.processed_requests.add(additional[LlmCT.REQUEST_ID])
 
-    self.P(f"Found batch text prediction for {len(text_lst)} texts:\n{self.shorten_str(text_lst)}")
+    if len(text_lst) > 0:
+      self.P(f"Found batch text prediction for {len(text_lst)} texts:\n{self.shorten_str(text_lst)}")
     for i, decoded in enumerate(text_lst):
       dct_result = {
+        "IS_VALID": True,
         # LlmCT.PRED : yhat[i].tolist(),
         LlmCT.PRMP : prompts[i],
         LlmCT.TEXT : decoded,
@@ -885,5 +935,20 @@ class BaseLlmServing(
         'MODEL_NAME': self.cfg_model_name
       }
       result.append(dct_result)
-    return result
+    # endfor each text
+    current_text_idx = 0
+    final_result = []
+    for i in range(cnt_total_inputs):
+      if i in relevant_input_ids:
+        final_result.append(result[current_text_idx])
+        current_text_idx += 1
+      else:
+        final_result.append({
+          "IS_VALID": False,
+          LlmCT.TEXT: "",
+          LlmCT.PRMP: "",
+          'MODEL_NAME': self.cfg_model_name
+        })
+    # endfor total inputs
+    return final_result
 

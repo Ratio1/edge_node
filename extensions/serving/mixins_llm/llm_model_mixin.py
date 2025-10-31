@@ -194,6 +194,8 @@ class LlmModelMixin(object):
       batch_tokens,
       **kwargs
   ):
+    if len(predict_kwargs_lst) == 0:
+      return {}
     res = {
       "attention_mask": attention_mask,
       "do_sample": True,

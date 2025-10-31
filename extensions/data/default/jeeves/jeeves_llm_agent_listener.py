@@ -1,4 +1,4 @@
-from extensions.data.default.iot.jeeves_agent_listener import JeevesAgentListenerDataCapture as BaseClass
+from extensions.data.default.jeeves.jeeves_agent_listener import JeevesAgentListenerDataCapture as BaseClass
 from constants import JeevesCt
 
 
