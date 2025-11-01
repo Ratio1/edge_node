@@ -183,13 +183,13 @@ class _ChainstoreResponseMixin:
       return False
 
     response_key = self._get_chainstore_response_key()
-    self.Pd(f"Resetting chainstore response key '{response_key}'")
+    self.P(f"Resetting chainstore response key '{response_key}'")
 
     try:
       # Set to None to signal "initializing" state
       result = self.chainstore_set(response_key, None)
       if result:
-        self.Pd(f"Successfully reset chainstore key '{response_key}'")
+        self.P(f"Successfully reset chainstore key '{response_key}'")
         return True
       else:
         self.P(f"Failed to reset chainstore key '{response_key}'", color='y')
@@ -267,7 +267,7 @@ class _ChainstoreResponseMixin:
 
     # Send single write to chainstore
     try:
-      self.Pd(f"Setting '{response_key}' to: {self.json_dumps(response_data)}")
+      self.P(f"Setting '{response_key}' to: {self.json_dumps(response_data)}")
 
       # Single write - no retries, no confirmations
       result = self.chainstore_set(response_key, response_data)
