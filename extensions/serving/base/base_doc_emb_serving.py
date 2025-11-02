@@ -300,11 +300,12 @@ class BaseDocEmbServing(BaseServingProcess):
       "plastic pentru ca nu se vor curata la fel de bine."
     ]
     warmup1 = warmup_context[:1]
+    warmup2 = warmup_context
     warmup4 = warmup_context + warmup_context
     self.P(f'Model warming up with {len(warmup1)} texts')
     self.embed_texts(warmup_context[:1])
-    self.P(f'Model warming up with {len(warmup4)} texts')
-    self.embed_texts(warmup_context + warmup_context)
+    self.P(f'Model warming up with {len(warmup2)} texts')
+    self.embed_texts(warmup2)
     self.P(f'Model warmup done')
 
     return
@@ -623,9 +624,15 @@ class BaseDocEmbServing(BaseServingProcess):
       """
       lst_inputs = inputs.get('DATA', [])
       self.P(f"Pre-processing {len(lst_inputs)} requests.")
+      relevant_input_ids = []
+      cnt_total_inputs = len(inputs)
 
       processed_requests = []
       for i, inp in enumerate(lst_inputs):
+        if self.check_relevant_input(inp):
+          relevant_input_ids.append(i)
+        else:
+          continue
         is_bad_request = False
         msg = ""
         jeeves_content = inp.get('JEEVES_CONTENT')
@@ -670,7 +677,7 @@ class BaseDocEmbServing(BaseServingProcess):
           'PREDICT_KWARGS': predict_kwargs
         })
       # endfor each input
-      return processed_requests
+      return processed_requests, relevant_input_ids, cnt_total_inputs
   """END PREPROCESS OF REQUESTS"""
 
   """PROCESSING OF REQUESTS"""
@@ -781,20 +788,24 @@ class BaseDocEmbServing(BaseServingProcess):
         **uppercase_kwargs
       }
 
-    def _predict(self, preprocessed_requests):
+    def _predict(self, processed_batch):
       """
       Perform the prediction using the preprocessed requests.
       For details about the requests see the `_pre_process` method.
       Parameters
       ----------
-      preprocessed_requests : list[dict] - the preprocessed requests
-        - each dict must have the following keys:
-          - REQUEST_ID : str - the request id
-          - REQUEST_TYPE : str - the request type: QUERY, ADD_DOC, LIST_CONTEXT
-          - REQUEST_PARAMS : dict - the request parameters - can vary depending on the request type
-        - each dict can have the following keys(they are optional):
-          - PREDICT_KWARGS(not used for the moment) : dict - the prediction kwargs,
-          additional parameters for the prediction
+      processed_batch: list of 3 elements:
+        preprocessed_requests : list[dict] - the preprocessed requests
+          - each dict must have the following keys:
+            - REQUEST_ID : str - the request id
+            - REQUEST_TYPE : str - the request type: QUERY, ADD_DOC, LIST_CONTEXT
+            - REQUEST_PARAMS : dict - the request parameters - can vary depending on the request type
+          - each dict can have the following keys(they are optional):
+            - PREDICT_KWARGS(not used for the moment) : dict - the prediction kwargs,
+            additional parameters for the prediction
+
+        relevant_input_ids : list[int] - the list of relevant input ids
+        cnt_total_inputs : int - the total number of inputs received
 
       Returns
       -------
@@ -808,6 +819,7 @@ class BaseDocEmbServing(BaseServingProcess):
           - ERROR_MESSAGE : str - the error message, if any
           - additional keys can be added
       """
+      preprocessed_requests, relevant_input_ids, cnt_total_inputs = processed_batch
       results = []
       request_ids = [req[DocEmbCt.REQUEST_ID] for req in preprocessed_requests]
       self.D(f'Processing {len(preprocessed_requests)} requests: {[request_ids]}')
@@ -876,10 +888,24 @@ class BaseDocEmbServing(BaseServingProcess):
         self.D(f'Processed request {i + 1}/{len(preprocessed_requests)}: {results[-1]}')
         # endif request type
       # endfor each preprocessed request
-      return results
+      return results, relevant_input_ids, cnt_total_inputs
   """END PROCESSING OF REQUESTS"""
 
   def _post_process(self, preds_batch):
-    return preds_batch
+    preds_batch, relevant_input_ids, cnt_total_inputs = preds_batch
+    self.P(f"Post-processing {len(preds_batch)} results out of {cnt_total_inputs} total inputs.")
+    final_result = []
+    current_text_idx = 0
+    for i in range(cnt_total_inputs):
+      if i in relevant_input_ids:
+        final_result.append(preds_batch[current_text_idx])
+        current_text_idx += 1
+      else:
+        final_result.append({
+          "IS_VALID": False,
+          "MODEL_NAME": self.cfg_model_name,
+        })
+    # endfor each total input
+    return final_result
 # endclass BaseDocEmbServing
 

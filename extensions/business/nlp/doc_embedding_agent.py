@@ -1,10 +1,12 @@
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
+from extensions.business.mixins.nlp_agent_mixin import _NlpAgentMixin, NLP_AGENT_MIXIN_CONFIG
 
 __VER__ = '0.1.0.0'
 
 _CONFIG = {
   # mandatory area
   **BasePlugin.CONFIG,
+  **NLP_AGENT_MIXIN_CONFIG,
 
   'MAX_INPUTS_QUEUE_SIZE': 64,
 
@@ -21,13 +23,8 @@ _CONFIG = {
 }
 
 
-class DocEmbeddingAgentPlugin(BasePlugin):
+class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin):
   CONFIG = _CONFIG
-
-  def D(self, msg, **kwargs):
-    if self.cfg_debug_mode:
-      self.P(msg, **kwargs)
-    return
 
   def on_init(self):
     self.__last_status_time = None
@@ -80,22 +77,13 @@ class DocEmbeddingAgentPlugin(BasePlugin):
     # endif time to send status
     return
 
+  def inference_to_response(self, inference, model_name):
+    return inference
+
   def _process(self):
     inf_meta = self.dataapi_inferences_meta().get(self.cfg_ai_engine)
     self.maybe_send_status(inf_meta)
+    data = self.dataapi_struct_datas()
     inferences = self.dataapi_struct_data_inferences()
-    if inferences is None or len(inferences) == 0 or isinstance(inferences[0], list):
-      return
-    self.D(f'[Agent]Processing inferences: {str(inferences)[:50]}')
-    for inf in inferences:
-      self.D(f'[Agent]Processing inference: {inf["REQUEST_ID"]}')
-      # For each inference a response payload will be created
-      request_id = inf.get('REQUEST_ID')
-      request_result = inf
-      self.D(f'[Agent]Processing inference: {request_result}')
-      self.add_payload_by_fields(
-        result=request_result,
-        request_id=request_id,
-      )
-    # endfor inferences
+    self.handle_inferences(inferences, data=data)
     return

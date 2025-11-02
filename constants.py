@@ -157,6 +157,19 @@ class JeevesCt:
     "KEYSOFT_JEEVES",
   ]
 
+  JEEVES_AGENT_SIGNATURES = [
+    "DOC_EMBEDDING_AGENT",
+    "LLM_AGENT",
+  ]
+
+  JEEVES_PLUGIN_SIGNATURES = JEEVES_API_SIGNATURES + JEEVES_AGENT_SIGNATURES
+
+  UNIFIED_PATH_FILTER = [
+    None,
+    None,
+    JEEVES_PLUGIN_SIGNATURES,
+    None
+  ]
   AGENT_PATH_FILTER = [
     None,
     None,
@@ -166,10 +179,7 @@ class JeevesCt:
   API_PATH_FILTER = [
     None,
     None,
-    [
-      "DOC_EMBEDDING_AGENT",
-      "LLM_AGENT"
-    ],
+    JEEVES_AGENT_SIGNATURES,
     None
   ]
 

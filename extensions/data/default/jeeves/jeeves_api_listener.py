@@ -1,4 +1,4 @@
-from naeural_core.data.default.iot.network_listener import NetworkListenerDataCapture as BaseClass
+from extensions.data.default.jeeves.jeeves_listener import JeevesListenerDataCapture as BaseClass
 from constants import JeevesCt
 
 

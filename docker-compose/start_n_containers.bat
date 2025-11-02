@@ -6,18 +6,21 @@ set DEPLOY_DEBUG=false
 set USE_LOCAL_IMAGE=true
 set USE_GPU=true
 set USE_IPC_HOST=true
-set EXPOSED_PORT=15033
+set EXPOSED_PORT=15034
+set USE_CACHED_DOCKER_COMPOSE=true
 
 
 REM Hardcoded number of containers
-set NUM_CONTAINERS=1
+set NUM_CONTAINERS=2
 set NUM_SUPERVISORS=0
+set START_CONTAINER_INDEX=1
+set END_CONTAINER_INDEX=%NUM_CONTAINERS% + %START_CONTAINER_INDEX% - 1
 
 
 if !USE_LOCAL_IMAGE! == true (
     set CONTAINER_IMAGE=local_edge_node
 ) else (
-    set CONTAINER_IMAGE=ratio1/edge_node:develop
+    set CONTAINER_IMAGE=ratio1/edge_node:devnet
 )
 
 if !DEPLOY_DEBUG! == true (
@@ -63,9 +66,11 @@ set WATCHTOWER_LABEL=com.centurylinklabs.watchtower.enable=true
 REM Generate the list of container IDs dynamically
 for /l %%i in (1,1,%NUM_CONTAINERS%) do (
     REM Generic container ID and edge node ID
-    set CONTAINER_IDS[%%i]=!GENERIC_CONTAINER_ID!%%i
-    set EDGE_NODE_IDS[%%i]=!GENERIC_EDGE_NODE_ID!%%i
-    set CONTAINER_VOLUMES[%%i]=!GENERIC_CONTAINER_VOLUME!%%i
+    set /a CURRENT_CONTAINER_IDX = %%i + !START_CONTAINER_INDEX! - 1
+    echo Current container index: !CURRENT_CONTAINER_IDX!
+    set CONTAINER_IDS[%%i]=!GENERIC_CONTAINER_ID!!CURRENT_CONTAINER_IDX!
+    set EDGE_NODE_IDS[%%i]=!GENERIC_EDGE_NODE_ID!!CURRENT_CONTAINER_IDX!
+    set CONTAINER_VOLUMES[%%i]=!GENERIC_CONTAINER_VOLUME!!CURRENT_CONTAINER_IDX!
 
     REM Check if the container is a supervisor
     if %%i leq %NUM_SUPERVISORS% (
@@ -75,6 +80,14 @@ for /l %%i in (1,1,%NUM_CONTAINERS%) do (
     )
 )
 
+
+REM Check if we should use cached docker-compose.yaml
+if !USE_CACHED_DOCKER_COMPOSE! == true (
+    if exist docker-compose.yaml (
+        echo Using cached docker-compose.yaml
+        goto :START_CONTAINERS
+    )
+)
 
 REM Generate docker-compose.yaml dynamically
 echo services: > docker-compose.yaml
@@ -153,6 +166,7 @@ REM Maybe unnecessary
 @REM     echo   !CONTAINER_VOLUMES[%%i]!: >> docker-compose.yaml
 @REM )
 
+:START_CONTAINERS
 REM Pull the containers
 docker-compose pull
 
