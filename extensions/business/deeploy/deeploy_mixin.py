@@ -1577,15 +1577,33 @@ class _DeeployMixin:
       # Group plugin instances by signature
       plugins_by_signature = {}
 
+      used_instance_ids = set()
+
       for plugin_instance in plugins_array:
         signature = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
 
-        # Extract instance config (everything except 'signature')
-        instance_config = {k: v for k, v in plugin_instance.items()
-                          if k != DEEPLOY_KEYS.PLUGIN_SIGNATURE}
+        # Extract instance config (everything except metadata keys)
+        instance_config = {
+          k: v for k, v in plugin_instance.items()
+          if k not in {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE,
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
+            self.ct.CONFIG_INSTANCE.K_INSTANCE_ID,
+            "signature",
+            "instance_id",
+          }
+        }
 
-        # Generate unique instance_id
-        instance_id = self._generate_plugin_instance_id(signature=signature)
+        instance_id = (
+          plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+          or plugin_instance.get("instance_id")
+          or plugin_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+        )
+        if instance_id:
+          instance_id = str(instance_id)
+        if not instance_id or instance_id in used_instance_ids:
+          instance_id = self._generate_plugin_instance_id(signature=signature)
+        used_instance_ids.add(instance_id)
 
         # Prepare instance with INSTANCE_ID
         prepared_instance = {

@@ -259,7 +259,27 @@ class DeeployManagerApiPlugin(
         inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(current_nodes)
         inputs.target_nodes_count = len(current_nodes)
 
-        # TODO: Assess whether removing the running pipeline before redeploying is safe when the new launch fails.
+        # Ensure plugin IDs are preserved for existing instances before any destructive action.
+        self._ensure_plugin_instance_ids(
+          inputs,
+          discovered_plugin_instances=discovered_plugin_instances,
+          owner=sender,
+          app_id=app_id,
+          job_id=job_id,
+        )
+
+        validated_nodes = self._check_nodes_availability(
+          inputs,
+          skip_resource_check=True,
+        )
+        if set(validated_nodes) != set(current_nodes):
+          msg = (
+            f"{DEEPLOY_ERRORS.NODES2}: Failed to validate that update runs on existing nodes. "
+            f"Expected {current_nodes}, validated {validated_nodes}."
+          )
+          raise ValueError(msg)
+
+        # All validations passed; remove the running job and immediately redeploy.
         self.delete_pipeline_from_nodes(
           app_id=app_id,
           job_id=job_id,
@@ -267,14 +287,8 @@ class DeeployManagerApiPlugin(
           discovered_instances=discovered_plugin_instances,
         )
 
-        deployment_nodes = self._check_nodes_availability(inputs)
-        if set(deployment_nodes) != set(current_nodes):
-          msg = (
-            f"{DEEPLOY_ERRORS.NODES2}: Failed to validate that update runs on existing nodes. "
-            f"Expected {current_nodes}, validated {deployment_nodes}."
-          )
-          raise ValueError(msg)
-        confirmation_nodes = list(deployment_nodes)
+        deployment_nodes = list(validated_nodes)
+        confirmation_nodes = list(validated_nodes)
         discovered_plugin_instances = []
 
       inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_nodes

@@ -444,7 +444,7 @@ class _DeeployTargetNodesMixin:
     return nodes_to_run
 
 
-  def _check_nodes_availability(self, inputs):
+  def _check_nodes_availability(self, inputs, skip_resource_check=False):
     """
     Check if the target nodes are online and have sufficient resources.
     
@@ -486,6 +486,15 @@ class _DeeployTargetNodesMixin:
         - Use oracle network for whole series
         - Penalize nodes that have history less than 50 epochs (1 epoch = 24 hours)
     
+    Parameters
+    ----------
+    inputs : dict-like
+        Deployment request inputs containing target nodes information.
+    skip_resource_check : bool, optional
+        When True, verify only address validity and node liveness without enforcing
+        available resource thresholds. Used for dry-run validations before tearing
+        down existing pipelines.
+
     """
     nodes = []
 
@@ -494,10 +503,11 @@ class _DeeployTargetNodesMixin:
       return nodes_to_run
 
     job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
-    skip_resource_check = (
+    skip_check_for_native = (
       job_app_type is not None
       and str(job_app_type).lower() == JOB_APP_TYPES.NATIVE
     )
+    skip_resources = skip_resource_check or skip_check_for_native
 
     for node in inputs.target_nodes:
       addr = self._check_and_maybe_convert_address(node)
@@ -507,8 +517,8 @@ class _DeeployTargetNodesMixin:
         raise ValueError(msg)
       is_online = self.netmon.network_node_is_online(addr)
       if is_online:
-        if skip_resource_check:
-          self.Pd(f"Skipping native app resource validation for node {addr}")
+        if skip_resources:
+          self.Pd(f"Skipping resource validation for node {addr}")
         else:
           node_resources = self.check_node_available_resources(addr, inputs)
           if not node_resources[DEEPLOY_RESOURCES.STATUS]:
