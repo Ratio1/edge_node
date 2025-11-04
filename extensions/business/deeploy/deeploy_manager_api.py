@@ -288,6 +288,12 @@ class DeeployManagerApiPlugin(
           )
           raise ValueError(msg)
 
+        if job_id is not None:
+          try:
+            self.delete_job_pipeline_from_r1fs(job_id, remove_chainstore_entry=True)
+          except Exception as exc:
+            self.Pd(f"Non-blocking R1FS cleanup error for job {job_id}: {exc}", color='y')
+
         # All validations passed; remove the running job and immediately redeploy.
         self.delete_pipeline_from_nodes(
           app_id=app_id,

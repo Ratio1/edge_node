@@ -166,6 +166,50 @@ class _DeeployJobMixin:
     
     return cid
 
+  def delete_job_pipeline_from_r1fs(self, job_id: int, remove_chainstore_entry: bool = False):
+    """
+    Remove a stored pipeline definition from R1FS (and optionally CSTORE) for the given job.
+
+    Parameters
+    ----------
+    job_id: int
+        The job identifier whose pipeline should be deleted.
+    remove_chainstore_entry: bool
+        When True, the associated CSTORE hash entry is removed after deleting the CID.
+
+    Notes
+    -----
+    This helper is best-effort; failures are logged and reported via a boolean result.
+    """
+    if job_id is None:
+      return False
+
+    pipeline_key = str(job_id)
+    try:
+      cid = self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=pipeline_key)
+    except Exception as exc:
+      self.Pd(f"Unable to read pipeline CID for job {job_id} from CSTORE: {exc}", color='y')
+      return False
+
+    if not cid or not isinstance(cid, str):
+      return False
+
+    try:
+      verbose_logs = getattr(self, "cfg_deeploy_verbose", 0) > 1
+      self.Pd(f"Deleting R1FS pipeline for job {job_id} (CID {cid})", color='y')
+      self.r1fs.delete_file(cid, show_logs=verbose_logs, raise_on_error=False)
+    except Exception as exc:
+      self.Pd(f"Unable to delete R1FS pipeline for job {job_id}: {exc}", color='y')
+      return False
+
+    if remove_chainstore_entry:
+      try:
+        self.chainstore_hset(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=pipeline_key, value=None)
+      except Exception as exc:
+        self.Pd(f"Failed to remove CSTORE entry for job {job_id}: {exc}", color='y')
+
+    return True
+
   def _recursively_sort_pipeline_data(self, data):
     """
     Recursively sort pipeline data including items within arrays.
