@@ -1,7 +1,14 @@
 from naeural_core.main.net_mon import NetMonCt
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_CONTAINER_RESOURCES, CONTAINER_APP_RUNNER_SIGNATURE, CONTAINERIZED_APPS_SIGNATURES
+from extensions.business.deeploy.deeploy_const import (
+  DEEPLOY_ERRORS,
+  DEEPLOY_KEYS,
+  DEEPLOY_RESOURCES,
+  DEFAULT_CONTAINER_RESOURCES,
+  CONTAINER_APP_RUNNER_SIGNATURE,
+  CONTAINERIZED_APPS_SIGNATURES,
+  JOB_APP_TYPES,
+)
 from naeural_core import constants as ct
 
 DEEPLOY_DEBUG = True
@@ -486,6 +493,12 @@ class _DeeployTargetNodesMixin:
       nodes_to_run = self._find_nodes_for_deeployment(inputs=inputs)
       return nodes_to_run
 
+    job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+    skip_resource_check = (
+      job_app_type is not None
+      and str(job_app_type).lower() == JOB_APP_TYPES.NATIVE
+    )
+
     for node in inputs.target_nodes:
       addr = self._check_and_maybe_convert_address(node)
       is_supervisor = self.netmon.network_node_is_supervisor(addr=addr)
@@ -494,14 +507,17 @@ class _DeeployTargetNodesMixin:
         raise ValueError(msg)
       is_online = self.netmon.network_node_is_online(addr)
       if is_online:
-        node_resources = self.check_node_available_resources(addr, inputs)
-        if not node_resources[DEEPLOY_RESOURCES.STATUS]:
-          error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
-          for detail in node_resources[DEEPLOY_RESOURCES.DETAILS]:
-            error_msg += (
-                  f"- {detail[DEEPLOY_RESOURCES.RESOURCE]}: available {detail[DEEPLOY_RESOURCES.AVAILABLE]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]} < " +
-                  f"required {detail[DEEPLOY_RESOURCES.REQUIRED]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]}\n")
-          raise ValueError(error_msg)
+        if skip_resource_check:
+          self.Pd(f"Skipping native app resource validation for node {addr}")
+        else:
+          node_resources = self.check_node_available_resources(addr, inputs)
+          if not node_resources[DEEPLOY_RESOURCES.STATUS]:
+            error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
+            for detail in node_resources[DEEPLOY_RESOURCES.DETAILS]:
+              error_msg += (
+                    f"- {detail[DEEPLOY_RESOURCES.RESOURCE]}: available {detail[DEEPLOY_RESOURCES.AVAILABLE]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]} < " +
+                    f"required {detail[DEEPLOY_RESOURCES.REQUIRED]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]}\n")
+            raise ValueError(error_msg)
         # endif not node_resources
         nodes.append(addr)
       else:

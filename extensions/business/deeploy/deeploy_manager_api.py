@@ -192,6 +192,9 @@ class DeeployManagerApiPlugin(
         if job_app_type not in JOB_APP_TYPES_ALL:
           job_app_type = JOB_APP_TYPES.NATIVE
       self.P(f"Detected job app type: {job_app_type}")
+      # persist job type so downstream mixins can adjust validations (e.g. native app resource checks)
+      inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
+      inputs.job_app_type = job_app_type
       
       # Generate or get app_id based on operation type
       if is_create:
