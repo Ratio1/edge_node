@@ -232,32 +232,44 @@ class DeeployManagerApiPlugin(
         deeploy_specs_for_update = pipeline_context["deeploy_specs"]
         self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
 
-        requested_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None) or []
+        requested_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None)
         normalized_requested_nodes = [
-          self._check_and_maybe_convert_address(node) for node in requested_nodes
+          self._check_and_maybe_convert_address(node) for node in requested_nodes or []
         ] if requested_nodes else []
-
         if normalized_requested_nodes:
-          # Reject updates that request a different node set than the one currently running.
-          if set(normalized_requested_nodes) != set(current_nodes):
+          # preserve order while removing duplicates
+          seen = set()
+          deployment_targets = []
+          for node in normalized_requested_nodes:
+            if node not in seen:
+              seen.add(node)
+              deployment_targets.append(node)
+        else:
+          deployment_targets = list(current_nodes)
+
+        requested_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, 0)
+        if requested_nodes_count:
+          if normalized_requested_nodes and requested_nodes_count != len(deployment_targets):
             msg = (
-              f"{DEEPLOY_ERRORS.NODES2}: Update request must target existing nodes {current_nodes}. "
-              f"Received {normalized_requested_nodes}."
+              f"{DEEPLOY_ERRORS.NODES2}: Update request specifies {requested_nodes_count} nodes "
+              f"but {len(deployment_targets)} were provided."
+            )
+            raise ValueError(msg)
+          if not normalized_requested_nodes and requested_nodes_count != len(current_nodes):
+            msg = (
+              f"{DEEPLOY_ERRORS.NODES2}: Update request must keep the original number of nodes "
+              f"({len(current_nodes)}) when no explicit target node list is provided. Received {requested_nodes_count}."
             )
             raise ValueError(msg)
 
-        requested_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, 0)
-        if requested_nodes_count and requested_nodes_count != len(current_nodes):
-          msg = (
-            f"{DEEPLOY_ERRORS.NODES2}: Update request must keep the original number of nodes "
-            f"({len(current_nodes)}). Received {requested_nodes_count}."
-          )
+        if not deployment_targets:
+          msg = f"{DEEPLOY_ERRORS.NODES2}: Update request must include at least one target node."
           raise ValueError(msg)
 
-        inputs[DEEPLOY_KEYS.TARGET_NODES] = current_nodes
-        inputs.target_nodes = current_nodes
-        inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(current_nodes)
-        inputs.target_nodes_count = len(current_nodes)
+        inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_targets
+        inputs.target_nodes = deployment_targets
+        inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
+        inputs.target_nodes_count = len(deployment_targets)
 
         # Ensure plugin IDs are preserved for existing instances before any destructive action.
         self._ensure_plugin_instance_ids(
@@ -268,14 +280,11 @@ class DeeployManagerApiPlugin(
           job_id=job_id,
         )
 
-        validated_nodes = self._check_nodes_availability(
-          inputs,
-          skip_resource_check=True,
-        )
-        if set(validated_nodes) != set(current_nodes):
+        validated_nodes = self._check_nodes_availability(inputs)
+        if set(validated_nodes) != set(deployment_targets):
           msg = (
-            f"{DEEPLOY_ERRORS.NODES2}: Failed to validate that update runs on existing nodes. "
-            f"Expected {current_nodes}, validated {validated_nodes}."
+            f"{DEEPLOY_ERRORS.NODES2}: Failed to validate requested target nodes. "
+            f"Expected {deployment_targets}, validated {validated_nodes}."
           )
           raise ValueError(msg)
 
