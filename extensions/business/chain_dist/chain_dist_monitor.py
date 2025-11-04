@@ -101,13 +101,18 @@ class ChainDistMonitorPlugin(BasePlugin, _DeeployMixin):
     else:
       known_apps = self.netmon.network_known_apps()
       first_closable_job_id = self.bc.get_first_closable_job_id()
+      jobs_preview = ", ".join(str(job) for job in unvalidated_job_ids)
+      self.Pd(
+        f"Evaluating {len(unvalidated_job_ids)} unvalidated job(s): {jobs_preview}",
+        verbosity=3,
+      )
       for job_id in unvalidated_job_ids:
         if not job_id:
           continue
         
         # find all running apps with the same job_id
         running_nodes = []
-        self.Pd(f"Checking for running nodes for job {job_id}...", verbosity=3)
+        self.Pd(f"Checking for running nodes for job {job_id}...", verbosity=6)
 
         for node, apps in known_apps.items():
           for pipeline_name, pipeline in apps.items():
