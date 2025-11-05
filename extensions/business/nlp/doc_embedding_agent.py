@@ -1,5 +1,6 @@
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
 from extensions.business.mixins.nlp_agent_mixin import _NlpAgentMixin, NLP_AGENT_MIXIN_CONFIG
+from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResponseMixin
 
 __VER__ = '0.1.0.0'
 
@@ -17,13 +18,15 @@ _CONFIG = {
 
   "DEBUG_MODE": True,
 
+  'CHAINSTORE_RESPONSE_KEY': None,
+
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
 }
 
 
-class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin):
+class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin, _ChainstoreResponseMixin):
   CONFIG = _CONFIG
 
   def on_init(self):
@@ -31,7 +34,20 @@ class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin):
     self.__last_inference_meta = None
     self.__last_contexts = None
     super(DocEmbeddingAgentPlugin, self).on_init()
+    self._reset_chainstore_response()
+    self._send_chainstore_response()
     return
+
+  def _get_chainstore_response_data(self):
+    data = super()._get_chainstore_response_data()
+    data.update({
+      'ai_engine': self.cfg_ai_engine,
+      'doc_embed_status_period': self.cfg_doc_embed_status_period,
+      'cached_contexts_count': len(self.__last_contexts or []),
+      'has_cached_inference': self.__last_inference_meta is not None,
+      'status': 'ready',
+    })
+    return data
 
   def send_status(self, inf_meta):
     self.add_payload_by_fields(
@@ -43,9 +59,16 @@ class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin):
 
   def load_cache(self):
     cached_data = self.cacheapi_load_json()
-    if cached_data is not None and len(cached_data.keys()) > 0:
-      self.__last_inference_meta = cached_data.get('inference_meta', None)
-      self.__last_contexts = self.__last_inference_meta.get('contexts', [])
+    if not cached_data:
+      return
+
+    inference_meta = cached_data.get('inference_meta', None)
+    if isinstance(inference_meta, dict):
+      self.__last_inference_meta = inference_meta
+      self.__last_contexts = inference_meta.get('contexts', []) or []
+    else:
+      self.__last_inference_meta = None
+      self.__last_contexts = []
     return
 
   def get_cache_object(self):
