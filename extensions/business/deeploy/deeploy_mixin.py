@@ -190,20 +190,12 @@ class _DeeployMixin:
       node_plugins_by_addr[addr] = node_plugins
 
     prepared_response_keys = self._normalize_chainstore_response_mapping(response_keys)
-    merged_chainstore_map = self._normalize_chainstore_response_mapping(
-      dct_deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, {})
-    )
     if inputs.chainstore_response:
-      merged_chainstore_map = self._merge_chainstore_response_keys(
-        merged_chainstore_map,
-        prepared_response_keys,
-      )
-      if merged_chainstore_map:
-        dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_chainstore_map)
+      if prepared_response_keys:
+        dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
       else:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
-      merged_chainstore_map = {}
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
     for addr, node_plugins in node_plugins_by_addr.items():
@@ -398,30 +390,29 @@ class _DeeployMixin:
 
           # Configure response keys if needed
           if inputs.chainstore_response:
-            response_key = plugin.get(DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, self._generate_chainstore_response_key(plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]))
-            plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
-            response_keys[addr].append(response_key)
+            instance_id = plugin_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+            if not instance_id:
+              continue
+            instance_id = str(instance_id)
+            plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] = instance_id
+            response_key = plugin_instance.get(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY)
+            if not isinstance(response_key, str) or not response_key:
+              response_key = self._generate_chainstore_response_key(instance_id)
+              plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
+            if isinstance(response_key, str) and response_key:
+              response_keys[addr].append(response_key)
           # endif
         # endfor each plugin instance
       # endfor each plugin
 
       node_plugins_ready[addr] = node_plugins
-
     prepared_response_keys = self._normalize_chainstore_response_mapping(response_keys)
-    merged_chainstore_map = self._normalize_chainstore_response_mapping(
-      dct_deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, {})
-    )
     if inputs.chainstore_response:
-      merged_chainstore_map = self._merge_chainstore_response_keys(
-        merged_chainstore_map,
-        prepared_response_keys,
-      )
-      if merged_chainstore_map:
-        dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_chainstore_map)
+      if prepared_response_keys:
+        dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
       else:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
-      merged_chainstore_map = {}
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
     for addr, node_plugins in node_plugins_ready.items():
@@ -456,8 +447,8 @@ class _DeeployMixin:
     except Exception as e:
       self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
     if inputs.chainstore_response:
-      if merged_chainstore_map:
-        dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_chainstore_map)
+      if prepared_response_keys:
+        dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
       else:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
@@ -1577,15 +1568,33 @@ class _DeeployMixin:
       # Group plugin instances by signature
       plugins_by_signature = {}
 
+      used_instance_ids = set()
+
       for plugin_instance in plugins_array:
         signature = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
 
-        # Extract instance config (everything except 'signature')
-        instance_config = {k: v for k, v in plugin_instance.items()
-                          if k != DEEPLOY_KEYS.PLUGIN_SIGNATURE}
+        # Extract instance config (everything except metadata keys)
+        instance_config = {
+          k: v for k, v in plugin_instance.items()
+          if k not in {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE,
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
+            self.ct.CONFIG_INSTANCE.K_INSTANCE_ID,
+            "signature",
+            "instance_id",
+          }
+        }
 
-        # Generate unique instance_id
-        instance_id = self._generate_plugin_instance_id(signature=signature)
+        instance_id = (
+          plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+          or plugin_instance.get("instance_id")
+          or plugin_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+        )
+        if instance_id:
+          instance_id = str(instance_id)
+        if not instance_id or instance_id in used_instance_ids:
+          instance_id = self._generate_plugin_instance_id(signature=signature)
+        used_instance_ids.add(instance_id)
 
         # Prepare instance with INSTANCE_ID
         prepared_instance = {

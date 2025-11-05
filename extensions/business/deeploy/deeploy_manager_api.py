@@ -192,6 +192,9 @@ class DeeployManagerApiPlugin(
         if job_app_type not in JOB_APP_TYPES_ALL:
           job_app_type = JOB_APP_TYPES.NATIVE
       self.P(f"Detected job app type: {job_app_type}")
+      # persist job type so downstream mixins can adjust validations (e.g. native app resource checks)
+      inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
+      inputs.job_app_type = job_app_type
       
       # Generate or get app_id based on operation type
       if is_create:
@@ -229,34 +232,69 @@ class DeeployManagerApiPlugin(
         deeploy_specs_for_update = pipeline_context["deeploy_specs"]
         self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
 
-        requested_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None) or []
+        requested_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None)
         normalized_requested_nodes = [
-          self._check_and_maybe_convert_address(node) for node in requested_nodes
+          self._check_and_maybe_convert_address(node) for node in requested_nodes or []
         ] if requested_nodes else []
-
         if normalized_requested_nodes:
-          # Reject updates that request a different node set than the one currently running.
-          if set(normalized_requested_nodes) != set(current_nodes):
+          # preserve order while removing duplicates
+          seen = set()
+          deployment_targets = []
+          for node in normalized_requested_nodes:
+            if node not in seen:
+              seen.add(node)
+              deployment_targets.append(node)
+        else:
+          deployment_targets = list(current_nodes)
+
+        requested_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, 0)
+        if requested_nodes_count:
+          if normalized_requested_nodes and requested_nodes_count != len(deployment_targets):
             msg = (
-              f"{DEEPLOY_ERRORS.NODES2}: Update request must target existing nodes {current_nodes}. "
-              f"Received {normalized_requested_nodes}."
+              f"{DEEPLOY_ERRORS.NODES2}: Update request specifies {requested_nodes_count} nodes "
+              f"but {len(deployment_targets)} were provided."
+            )
+            raise ValueError(msg)
+          if not normalized_requested_nodes and requested_nodes_count != len(current_nodes):
+            msg = (
+              f"{DEEPLOY_ERRORS.NODES2}: Update request must keep the original number of nodes "
+              f"({len(current_nodes)}) when no explicit target node list is provided. Received {requested_nodes_count}."
             )
             raise ValueError(msg)
 
-        requested_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, 0)
-        if requested_nodes_count and requested_nodes_count != len(current_nodes):
+        if not deployment_targets:
+          msg = f"{DEEPLOY_ERRORS.NODES2}: Update request must include at least one target node."
+          raise ValueError(msg)
+
+        inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_targets
+        inputs.target_nodes = deployment_targets
+        inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
+        inputs.target_nodes_count = len(deployment_targets)
+
+        # Ensure plugin IDs are preserved for existing instances before any destructive action.
+        self._ensure_plugin_instance_ids(
+          inputs,
+          discovered_plugin_instances=discovered_plugin_instances,
+          owner=sender,
+          app_id=app_id,
+          job_id=job_id,
+        )
+
+        validated_nodes = self._check_nodes_availability(inputs)
+        if set(validated_nodes) != set(deployment_targets):
           msg = (
-            f"{DEEPLOY_ERRORS.NODES2}: Update request must keep the original number of nodes "
-            f"({len(current_nodes)}). Received {requested_nodes_count}."
+            f"{DEEPLOY_ERRORS.NODES2}: Failed to validate requested target nodes. "
+            f"Expected {deployment_targets}, validated {validated_nodes}."
           )
           raise ValueError(msg)
 
-        inputs[DEEPLOY_KEYS.TARGET_NODES] = current_nodes
-        inputs.target_nodes = current_nodes
-        inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(current_nodes)
-        inputs.target_nodes_count = len(current_nodes)
+        if job_id is not None:
+          try:
+            self.delete_job_pipeline_from_r1fs(job_id, remove_chainstore_entry=True)
+          except Exception as exc:
+            self.Pd(f"Non-blocking R1FS cleanup error for job {job_id}: {exc}", color='y')
 
-        # TODO: Assess whether removing the running pipeline before redeploying is safe when the new launch fails.
+        # All validations passed; remove the running job and immediately redeploy.
         self.delete_pipeline_from_nodes(
           app_id=app_id,
           job_id=job_id,
@@ -264,14 +302,8 @@ class DeeployManagerApiPlugin(
           discovered_instances=discovered_plugin_instances,
         )
 
-        deployment_nodes = self._check_nodes_availability(inputs)
-        if set(deployment_nodes) != set(current_nodes):
-          msg = (
-            f"{DEEPLOY_ERRORS.NODES2}: Failed to validate that update runs on existing nodes. "
-            f"Expected {current_nodes}, validated {deployment_nodes}."
-          )
-          raise ValueError(msg)
-        confirmation_nodes = list(deployment_nodes)
+        deployment_nodes = list(validated_nodes)
+        confirmation_nodes = list(validated_nodes)
         discovered_plugin_instances = []
 
       inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_nodes

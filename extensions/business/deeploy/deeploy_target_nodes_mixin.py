@@ -1,7 +1,14 @@
 from naeural_core.main.net_mon import NetMonCt
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_RESOURCES, \
-  DEFAULT_CONTAINER_RESOURCES, CONTAINER_APP_RUNNER_SIGNATURE, CONTAINERIZED_APPS_SIGNATURES
+from extensions.business.deeploy.deeploy_const import (
+  DEEPLOY_ERRORS,
+  DEEPLOY_KEYS,
+  DEEPLOY_RESOURCES,
+  DEFAULT_CONTAINER_RESOURCES,
+  CONTAINER_APP_RUNNER_SIGNATURE,
+  CONTAINERIZED_APPS_SIGNATURES,
+  JOB_APP_TYPES,
+)
 from naeural_core import constants as ct
 
 DEEPLOY_DEBUG = True
@@ -437,7 +444,7 @@ class _DeeployTargetNodesMixin:
     return nodes_to_run
 
 
-  def _check_nodes_availability(self, inputs):
+  def _check_nodes_availability(self, inputs, skip_resource_check=False):
     """
     Check if the target nodes are online and have sufficient resources.
     
@@ -479,12 +486,28 @@ class _DeeployTargetNodesMixin:
         - Use oracle network for whole series
         - Penalize nodes that have history less than 50 epochs (1 epoch = 24 hours)
     
+    Parameters
+    ----------
+    inputs : dict-like
+        Deployment request inputs containing target nodes information.
+    skip_resource_check : bool, optional
+        When True, verify only address validity and node liveness without enforcing
+        available resource thresholds. Used for dry-run validations before tearing
+        down existing pipelines.
+
     """
     nodes = []
 
     if not inputs.target_nodes:
       nodes_to_run = self._find_nodes_for_deeployment(inputs=inputs)
       return nodes_to_run
+
+    job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+    skip_check_for_native = (
+      job_app_type is not None
+      and str(job_app_type).lower() == JOB_APP_TYPES.NATIVE
+    )
+    skip_resources = skip_resource_check or skip_check_for_native
 
     for node in inputs.target_nodes:
       addr = self._check_and_maybe_convert_address(node)
@@ -494,14 +517,17 @@ class _DeeployTargetNodesMixin:
         raise ValueError(msg)
       is_online = self.netmon.network_node_is_online(addr)
       if is_online:
-        node_resources = self.check_node_available_resources(addr, inputs)
-        if not node_resources[DEEPLOY_RESOURCES.STATUS]:
-          error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
-          for detail in node_resources[DEEPLOY_RESOURCES.DETAILS]:
-            error_msg += (
-                  f"- {detail[DEEPLOY_RESOURCES.RESOURCE]}: available {detail[DEEPLOY_RESOURCES.AVAILABLE]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]} < " +
-                  f"required {detail[DEEPLOY_RESOURCES.REQUIRED]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]}\n")
-          raise ValueError(error_msg)
+        if skip_resources:
+          self.Pd(f"Skipping resource validation for node {addr}")
+        else:
+          node_resources = self.check_node_available_resources(addr, inputs)
+          if not node_resources[DEEPLOY_RESOURCES.STATUS]:
+            error_msg = f"{DEEPLOY_ERRORS.NODERES1}: Node {addr} has insufficient resources:\n"
+            for detail in node_resources[DEEPLOY_RESOURCES.DETAILS]:
+              error_msg += (
+                    f"- {detail[DEEPLOY_RESOURCES.RESOURCE]}: available {detail[DEEPLOY_RESOURCES.AVAILABLE]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]} < " +
+                    f"required {detail[DEEPLOY_RESOURCES.REQUIRED]:.2f}{detail[DEEPLOY_RESOURCES.UNIT]}\n")
+            raise ValueError(error_msg)
         # endif not node_resources
         nodes.append(addr)
       else:
