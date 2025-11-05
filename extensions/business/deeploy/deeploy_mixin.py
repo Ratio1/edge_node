@@ -122,7 +122,6 @@ class _DeeployMixin:
     spare_nodes = inputs.get(DEEPLOY_KEYS.SPARE_NODES, [])
     allow_replication_in_the_wild = inputs.get(DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD, False)
     response_keys = self.defaultdict(list)
-    instance_response_keys = {}
     pipeline_params = self._extract_pipeline_params(inputs)
     pipeline_kwargs = self._prepare_pipeline_param_kwargs(
       pipeline_params,
@@ -180,31 +179,24 @@ class _DeeployMixin:
           # endif
           
           # Configure response keys if needed
-          instance_id = plugin_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-          if not instance_id:
-            continue
-          instance_id = str(instance_id)
-          plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] = instance_id
           if inputs.chainstore_response:
-            response_key = self._generate_chainstore_response_key(instance_id)
+            response_key = self._generate_chainstore_response_key(plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID])
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
-            if isinstance(response_key, str) and response_key:
-              response_keys[addr].append(response_key)
-              instance_response_keys[instance_id] = response_key
+            response_keys[addr].append(response_key)
           # endif
         # endfor each plugin instance
       # endfor each plugin
   
       node_plugins_by_addr[addr] = node_plugins
 
-    prepared_instance_response_keys = self._normalize_chainstore_response_mapping(instance_response_keys)
+    prepared_response_keys = self._normalize_chainstore_response_mapping(response_keys)
     merged_chainstore_map = self._normalize_chainstore_response_mapping(
       dct_deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, {})
     )
     if inputs.chainstore_response:
       merged_chainstore_map = self._merge_chainstore_response_keys(
         merged_chainstore_map,
-        prepared_instance_response_keys,
+        prepared_response_keys,
       )
       if merged_chainstore_map:
         dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_chainstore_map)
@@ -244,13 +236,8 @@ class _DeeployMixin:
       # endif addr is valid
     # endfor each target node
 
-    cleaned_polling_keys = {}
-    if inputs.chainstore_response:
-      for addr, keys in response_keys.items():
-        filtered_keys = [key for key in keys if isinstance(key, str) and key]
-        if filtered_keys:
-          cleaned_polling_keys[addr] = filtered_keys
-    return cleaned_polling_keys if inputs.chainstore_response else {}
+    cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
+    return cleaned_response_keys
 
   def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
     """
@@ -411,32 +398,23 @@ class _DeeployMixin:
 
           # Configure response keys if needed
           if inputs.chainstore_response:
-            instance_id = plugin_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-            if not instance_id:
-              continue
-            instance_id = str(instance_id)
-            plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID] = instance_id
-            response_key = plugin_instance.get(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY)
-            if not isinstance(response_key, str) or not response_key:
-              response_key = self._generate_chainstore_response_key(instance_id)
-              plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
-            if isinstance(response_key, str) and response_key:
-              response_keys[addr].append(response_key)
-              instance_response_keys[instance_id] = response_key
+            response_key = plugin.get(DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, self._generate_chainstore_response_key(plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]))
+            plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
+            response_keys[addr].append(response_key)
           # endif
         # endfor each plugin instance
       # endfor each plugin
 
       node_plugins_ready[addr] = node_plugins
 
-    prepared_instance_response_keys = self._normalize_chainstore_response_mapping(instance_response_keys)
+    prepared_response_keys = self._normalize_chainstore_response_mapping(response_keys)
     merged_chainstore_map = self._normalize_chainstore_response_mapping(
       dct_deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, {})
     )
     if inputs.chainstore_response:
       merged_chainstore_map = self._merge_chainstore_response_keys(
         merged_chainstore_map,
-        prepared_instance_response_keys,
+        prepared_response_keys,
       )
       if merged_chainstore_map:
         dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(merged_chainstore_map)
@@ -485,12 +463,8 @@ class _DeeployMixin:
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
-    cleaned_polling_keys = {
-      addr: [key for key in keys if key]
-      for addr, keys in response_keys.items()
-      if any(key for key in keys if key)
-    }
-    return cleaned_polling_keys if inputs.chainstore_response else {}
+    cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
+    return cleaned_response_keys
 
   def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
     """
@@ -885,62 +859,40 @@ class _DeeployMixin:
 
   def _normalize_chainstore_response_mapping(self, mapping):
     """
-    Return a sanitized instance_id -> chainstore_response_key dictionary.
+    Return a sanitized node -> [chainstore_key] dictionary.
     """
     normalized = {}
     if not isinstance(mapping, dict):
       return normalized
 
-    for raw_key, raw_value in mapping.items():
-      if not isinstance(raw_key, str) or not raw_key:
+    for node_addr, raw_value in mapping.items():
+      keys = []
+      if isinstance(raw_value, (list, tuple, set)):
+        keys = [key for key in raw_value if isinstance(key, str) and key]
+      elif isinstance(raw_value, str) and raw_value:
+        keys = [raw_value]
+
+      if not keys:
         continue
 
-      try:
-        if hasattr(self, "bc"):
-          if self.bc.is_valid_eth_address(raw_key) or self.bc.is_valid_internal_address(raw_key):
-            continue
-      except Exception:
-        pass
-
-      resolved_value = None
-      if isinstance(raw_value, str) and raw_value:
-        resolved_value = raw_value
-      elif isinstance(raw_value, (list, tuple, set)):
-        for candidate in raw_value:
-          if isinstance(candidate, str) and candidate:
-            resolved_value = candidate
-            break
-      elif isinstance(raw_value, dict):
-        primary_key = getattr(self.ct.BIZ_PLUGIN_DATA, 'CHAINSTORE_RESPONSE_KEY', 'chainstore_response_key')
-        candidate_keys = (
-          primary_key,
-          primary_key.lower() if isinstance(primary_key, str) else 'chainstore_response_key',
-          "response_key",
-          "key",
-        )
-        for candidate_key in candidate_keys:
-          candidate_value = raw_value.get(candidate_key)
-          if isinstance(candidate_value, str) and candidate_value:
-            resolved_value = candidate_value
-            break
-
-      if not resolved_value:
-        continue
-
-      normalized[raw_key] = resolved_value
+      deduped = list(dict.fromkeys(keys))
+      if deduped:
+        normalized[node_addr] = deduped
 
     return normalized
 
   def _merge_chainstore_response_keys(self, base_mapping, additions):
     """
-    Merge instance_id -> chainstore_response_key mappings, returning a normalized dictionary.
-    Latest additions take precedence and fully replace previous values.
+    Merge node -> [chainstore_key] mappings, returning a new normalized dictionary.
     """
     merged = self._normalize_chainstore_response_mapping(base_mapping)
     extra = self._normalize_chainstore_response_mapping(additions)
 
-    if extra:
-      merged = self.deepcopy(extra)
+    for node_addr, keys in extra.items():
+      target = merged.setdefault(node_addr, [])
+      for key in keys:
+        if key not in target:
+          target.append(key)
 
     return merged
 
@@ -2082,10 +2034,7 @@ class _DeeployMixin:
       pipeline_params = {}
     base_pipeline["pipeline_params"] = self.deepcopy(pipeline_params)
 
-    chainstore_peers = []
-    for node_addr in list(new_nodes) + list(update_nodes):
-      if node_addr not in chainstore_peers:
-        chainstore_peers.append(node_addr)
+    chainstore_peers = list(set(new_nodes + update_nodes))
     raw_deeploy_specs = base_pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
     deeploy_specs = self.deepcopy(raw_deeploy_specs) if isinstance(raw_deeploy_specs, dict) else {}
     job_app_type = None
@@ -2105,7 +2054,6 @@ class _DeeployMixin:
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
 
     chainstore_response_keys = self.defaultdict(list)
-    instance_response_keys = {}
 
     # prepare create pipelines:
     create_pipelines = {}
@@ -2121,9 +2069,7 @@ class _DeeployMixin:
             instance_id=instance_id)
           instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = instance_id
           instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_response_key
-          if isinstance(chainstore_response_key, str) and chainstore_response_key:
-            chainstore_response_keys[node].append(chainstore_response_key)
-            instance_response_keys[instance_id] = chainstore_response_key
+          chainstore_response_keys[node].append(chainstore_response_key)
 
     # prepare update pipelines:
     update_pipelines = {}
@@ -2153,9 +2099,6 @@ class _DeeployMixin:
               instance_conf = running_instance.get("instance_conf", {})
               
               # Use existing instance_id and chainstore_response_key from running app
-              if not instance_id:
-                instance_id = self._generate_plugin_instance_id(signature=plugin_signature)
-              instance_id = str(instance_id)
               instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = instance_id
               chainstore_response_key = instance_conf.get(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, "")
               
@@ -2171,17 +2114,19 @@ class _DeeployMixin:
               instance[self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID] = instance_id
               instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_response_key
             
-            if isinstance(chainstore_response_key, str) and chainstore_response_key:
-              chainstore_response_keys[node].append(chainstore_response_key)
-              instance_response_keys[instance_id] = chainstore_response_key
+            chainstore_response_keys[node].append(chainstore_response_key)
 
     normalized_existing_map = self._normalize_chainstore_response_mapping(
       deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, {})
     )
-    prepared_instance_map = self._normalize_chainstore_response_mapping(instance_response_keys)
+    prepared_response_keys = {
+      node: [key for key in keys if key]
+      for node, keys in chainstore_response_keys.items()
+      if any(key for key in keys if key)
+    }
     merged_mapping = self._merge_chainstore_response_keys(
       normalized_existing_map,
-      prepared_instance_map
+      prepared_response_keys
     )
 
     if isinstance(deeploy_specs, dict):
@@ -2211,12 +2156,7 @@ class _DeeployMixin:
         specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
       pipeline[NetMonCt.DEEPLOY_SPECS] = specs
 
-    cleaned_polling_keys = {
-      node: [key for key in keys if key]
-      for node, keys in chainstore_response_keys.items()
-      if any(key for key in keys if key)
-    }
-    return create_pipelines, update_pipelines, cleaned_polling_keys
+    return create_pipelines, update_pipelines, prepared_response_keys
 
   def _start_create_update_pipelines(self, create_pipelines, update_pipelines, sender):
     """
