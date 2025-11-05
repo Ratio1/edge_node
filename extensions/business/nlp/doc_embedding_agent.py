@@ -59,9 +59,16 @@ class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin, _ChainstoreResponseMix
 
   def load_cache(self):
     cached_data = self.cacheapi_load_json()
-    if cached_data is not None and len(cached_data.keys()) > 0:
-      self.__last_inference_meta = cached_data.get('inference_meta', None)
-      self.__last_contexts = self.__last_inference_meta.get('contexts', [])
+    if not cached_data:
+      return
+
+    inference_meta = cached_data.get('inference_meta', None)
+    if isinstance(inference_meta, dict):
+      self.__last_inference_meta = inference_meta
+      self.__last_contexts = inference_meta.get('contexts', []) or []
+    else:
+      self.__last_inference_meta = None
+      self.__last_contexts = []
     return
 
   def get_cache_object(self):
