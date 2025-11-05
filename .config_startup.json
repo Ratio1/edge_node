@@ -84,6 +84,7 @@
     },
     
     "UPDATE_MONITOR_01" : {
+      "DELAY_RESTART_ON_ORACLE": true,
       "PROCESS_DELAY"   : 300,
       "VERSION_TOKEN"   : "$EE_GITVER",
       "RESTART_ON_BEHIND": true,
