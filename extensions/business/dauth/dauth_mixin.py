@@ -187,7 +187,13 @@ class _DauthMixin(object):
     if not hasattr(self, "mqtt_seed_index"):
       self.mqtt_seed_index = -1
     return_value = None
-    comms_seed = self.os_environ.get(seed_key, "").split(" ")
+
+    raw_comms_seed = self.os_environ.get(seed_key, "")
+    comms_seed = raw_comms_seed.split(" ")
+
+    if self.cfg_dauth_log_response:
+      self.P(f"Comms seed for {seed_key}: {comms_seed} | Raw: '{raw_comms_seed}'")
+
     if not comms_seed:
       return_value = self.os_environ.get(key, None)
       self.P(f"No {seed_key} found, returning env {key}: {return_value}", color='r')
