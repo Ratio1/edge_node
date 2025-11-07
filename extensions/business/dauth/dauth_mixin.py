@@ -257,7 +257,9 @@ class _DauthMixin(object):
     #####  finally prepare the env auth data #####
     
     comm_key, comm_value = self.get_comms_host_pair()
+    str_allocation_log = None
     if comm_key is not None and comm_value is not None:
+      str_allocation_log = f"{comm_key}={comm_value}"
       dauth_data[comm_key] = comm_value
     else:
       self.P("No comms host pair found!", color='r')
@@ -299,7 +301,8 @@ class _DauthMixin(object):
     else:
       dauth_data["EE_SUPERVISOR"] = False
     # end set supervisor flag
-
+    if self.cfg_dauth_log_response:
+      self.P(f"DAuth returning comm server {dauth_data[comm_key]}, {str_allocation_log}")
     return dauth_data
 
 

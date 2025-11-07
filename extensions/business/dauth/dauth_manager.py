@@ -34,6 +34,7 @@ _CONFIG = {
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
   'DAUTH_VERBOSE' : False,
+  'DAUTH_LOG_RESPONSE' : True,
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   
