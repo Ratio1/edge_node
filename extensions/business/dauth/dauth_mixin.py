@@ -182,19 +182,21 @@ class _DauthMixin(object):
     """
     Returns a round-robin key value from the seed_key list.
     """
-    comms_seed = self.os_environ.get(seed_key, "").split(" ")
-    if not comms_seed:
-      self.P(f"No {seed_key} found", color='r')
-      return None
-    
     if not hasattr(self, "mqtt_seed_index"):
       self.mqtt_seed_index = -1
+    return_value = None
+    comms_seed = self.os_environ.get(seed_key, "").split(" ")
+    if not comms_seed:
+      return_value = self.os_environ.get(key, None)
+      self.P(f"No {seed_key} found, returning env {key}: {return_value}", color='r')
+    else:
+      # round-robin selection
+      self.mqtt_seed_index = (self.mqtt_seed_index + 1) % len(comms_seed)
+      return_value = comms_seed[self.mqtt_seed_index]
+    # end if
+    return key, return_value
 
-    # round-robin selection
-    self.mqtt_seed_index = (self.mqtt_seed_index + 1) % len(comms_seed)
-    return key, comms_seed[self.mqtt_seed_index]  
-  
-  
+
   def fill_dauth_data(self,
                       dauth_data,
                       requester_node_address,
