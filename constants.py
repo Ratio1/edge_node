@@ -51,10 +51,10 @@ ADMIN_PIPELINE = {
     "PROCESS_DELAY": 0,
     
     "AUTH_ENV_KEYS" : [
-      "EE_MQTT_HOST",
+      # "EE_MQTT_HOST", # this is not used anymore as it is generated dynamically
       "EE_MQTT_PORT",
       "EE_MQTT_USER",
-      "EE_MQTT",
+      "EE_MQTT", 
       "EE_MQTT_SUBTOPIC",
       "EE_MQTT_CERT",
       

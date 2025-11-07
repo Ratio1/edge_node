@@ -50,7 +50,9 @@ _CONFIG = {
   "AUTH_PREDEFINED_KEYS" : {
   },
   
-  
+  "COMMS_HOST_KEY" : "EE_MQTT_HOST",          # key to use for the comms host
+  "COMMS_HOST_SEED_KEY" : "EE_MQTT_HOST_SEED", # key to use for the comms host seed
+
   "SUPERVISOR_KEYS" : [
     "EE_NGROK_EDGE_LABEL_EPOCH_MANAGER",
     "EE_NGROK_EDGE_LABEL_RELEASE_APP",
@@ -66,6 +68,8 @@ _CONFIG = {
     "EE_CLOUDFLARE_TOKEN_DEEPLOY_MANAGER",
     "EE_CLOUDFLARE_TOKEN_TUNNELS_MANAGER",
     "EE_CLOUDFLARE_TOKEN_LIVENESS_API",
+    
+    "EE_MQTT_HOST_SEED" # this generates dynamically the EE_MQTT_HOST
 ],
   
   'VALIDATION_RULES': {
