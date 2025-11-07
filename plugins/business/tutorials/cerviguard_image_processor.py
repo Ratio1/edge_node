@@ -7,8 +7,6 @@ can then pick up the results via the standard Data API, so no shared-memory
 access is required between plugins.
 """
 
-from typing import Any
-
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
 from extensions.business.tutorials.cerviguard_constants import (
   REQUEST_PAYLOAD_TYPE,
@@ -64,7 +62,7 @@ class CerviguardImageProcessorPlugin(BasePlugin):
       self.P(f"Error decoding image: {e}", color='r')
       return None
 
-  def _process_image_dimensions(self, img_array: Any, request_id: str, metadata: dict) -> dict:
+  def _process_image_dimensions(self, img_array, request_id: str, metadata: dict) -> dict:
     """
     Process image to extract dimensions (current implementation)
 
@@ -158,7 +156,7 @@ class CerviguardImageProcessorPlugin(BasePlugin):
     """
     payload_type = self._get_payload_field(data, 'payload_type')
     if payload_type != REQUEST_PAYLOAD_TYPE:
-      # Ignore other payload types so we don't re-process our own results
+      self.P(f"Ignoring payload type '{payload_type}'", color='c')
       return
 
     # Extract request info
@@ -174,7 +172,7 @@ class CerviguardImageProcessorPlugin(BasePlugin):
       self._emit_error(request_id, 'Missing image data')
       return
 
-    self.P(f"Processing request {request_id}", color='b')
+    self.P(f"Processing request {request_id} (keys={list(data.keys())})", color='b')
 
     # Decode image
     img_array = self._decode_base64_image(image_data)
