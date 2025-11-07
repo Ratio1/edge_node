@@ -178,10 +178,12 @@ class _DauthMixin(object):
     )
     return
   
-  def get_comms_host_pair(self, key="EE_MQTT_HOST", seed_key="EE_MQTT_HOST_SEED"):
+  def get_comms_host_pair(self):
     """
     Returns a round-robin key value from the seed_key list.
     """
+    key = self.cfg_comms_host_key
+    seed_key = self.cfg_comms_host_seed_key
     if not hasattr(self, "mqtt_seed_index"):
       self.mqtt_seed_index = -1
     return_value = None
