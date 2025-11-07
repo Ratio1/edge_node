@@ -178,6 +178,22 @@ class _DauthMixin(object):
     )
     return
   
+  def get_comms_host_pair(self, key="EE_MQTT_HOST", seed_key="EE_MQTT_HOST_SEED"):
+    """
+    Returns a round-robin key value from the seed_key list.
+    """
+    comms_seed = self.os_environ.get(seed_key, "").split(" ")
+    if not comms_seed:
+      self.P(f"No {seed_key} found", color='r')
+      return None
+    
+    if not hasattr(self, "mqtt_seed_index"):
+      self.mqtt_seed_index = -1
+
+    # round-robin selection
+    self.mqtt_seed_index = (self.mqtt_seed_index + 1) % len(comms_seed)
+    return key, comms_seed[self.mqtt_seed_index]  
+  
   
   def fill_dauth_data(self,
                       dauth_data,
@@ -235,6 +251,12 @@ class _DauthMixin(object):
     dauth_data[dAuthCt.DAUTH_WHITELIST] = full_whitelist
 
     #####  finally prepare the env auth data #####
+    
+    comm_key, comm_value = self.get_comms_host_pair()
+    if comm_key is not None and comm_value is not None:
+      dauth_data[comm_key] = comm_value
+    else:
+      self.P("No comms host pair found!", color='r')
     
     # first set is the universal (node, sdk, core) keys
     for key in lst_auth_env_keys:
@@ -302,7 +324,6 @@ class _DauthMixin(object):
       data[dAuthConst.DAUTH_REQUEST] = body
 
     return data
-  
   
   
   def process_dauth_request(self, body):
