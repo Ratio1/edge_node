@@ -23,7 +23,7 @@ Example pipeline configuration:
 """
 
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin
-from extensions.business.tutorials.cerviguard_constants import (
+from extensions.business.cerviguard.cerviguard_constants import (
   REQUEST_PAYLOAD_TYPE,
   RESULT_PAYLOAD_TYPE,
 )

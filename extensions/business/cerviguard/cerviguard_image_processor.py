@@ -8,7 +8,7 @@ access is required between plugins.
 """
 
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
-from extensions.business.tutorials.cerviguard_constants import (
+from extensions.business.cerviguard.cerviguard_constants import (
   REQUEST_PAYLOAD_TYPE,
   RESULT_PAYLOAD_TYPE,
 )
