@@ -23,10 +23,6 @@ Example pipeline configuration:
 """
 
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin
-from extensions.business.cerviguard.cerviguard_constants import (
-  REQUEST_PAYLOAD_TYPE,
-  RESULT_PAYLOAD_TYPE,
-)
 
 __VER__ = '0.1.0'
 
@@ -271,7 +267,6 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     # STEP 3: Send to loopback queue via add_payload_by_fields
     # Because IS_LOOPBACK_PLUGIN=True, this writes to loopback_dct_{stream_id} queue
     self.add_payload_by_fields(
-      payload_type=REQUEST_PAYLOAD_TYPE,
       request_id=request_id,
       image_data=image_data,
       metadata=metadata or {},
@@ -375,9 +370,7 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     })
 
     # Send to loopback queue
-    # This will be picked up by CerviguardImageProcessorPlugin
     self.add_payload_by_fields(
-      payload_type=REQUEST_PAYLOAD_TYPE,
       request_id=request_id,
       image_data=image_data,
       metadata=metadata or {},
@@ -573,7 +566,7 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
   def _process_loopback_payload(self, payload, inference):
     """
     Process a single payload from loopback queue with its corresponding inference:
-    1. Check if it's a REQUEST_PAYLOAD_TYPE
+    1. Extract request info from payload
     2. Extract inference result from serving plugin
     3. Cache result for API retrieval
 
@@ -585,11 +578,6 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
         The inference result from the serving plugin (already processed)
     """
     if not isinstance(payload, dict):
-      return
-
-    payload_type = self._get_payload_field(payload, 'payload_type')
-    if payload_type != REQUEST_PAYLOAD_TYPE:
-      # Not a request we should process
       return
 
     # Extract request info from payload
