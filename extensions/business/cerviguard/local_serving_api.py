@@ -23,10 +23,6 @@ Example pipeline configuration:
 """
 
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin
-from extensions.business.cerviguard.cerviguard_constants import (
-  REQUEST_PAYLOAD_TYPE,
-  RESULT_PAYLOAD_TYPE,
-)
 
 __VER__ = '0.1.0'
 
@@ -54,6 +50,9 @@ _CONFIG = {
   # Process delay
   'PROCESS_DELAY': 0,
   'RESULT_CACHE_TTL': 300,
+
+  # AI Engine configuration for image analysis
+  'AI_ENGINE': 'CERVIGUARD_IMAGE_ANALYZER',  # Serving plugin to use
 
   'VALIDATION_RULES': {
     **FastApiWebAppPlugin.CONFIG['VALIDATION_RULES'],
@@ -88,9 +87,10 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     self._data_buffer = []
     self._results_cache = {}
     self._last_result_cleanup = self.time()
-    self.P("Local Serving API initialized - Loopback mode enabled")
-    self.P(f"Server will be accessible only on localhost (no tunnel)")
-    self.P(f"Loopback key: loopback_dct_{self._stream_id}")
+    self.P("Local Serving API initialized - Loopback mode enabled", color='g')
+    self.P(f"  Server accessible only on localhost (no tunnel)", color='g')
+    self.P(f"  AI Engine: {self.cfg_ai_engine}", color='g')
+    self.P(f"  Loopback key: loopback_dct_{self._stream_id}", color='g')
     return
 
   def _get_payload_field(self, data: dict, key: str, default=None):
@@ -220,6 +220,114 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
   # ========== CERVIGUARD WAR ENDPOINTS ==========
 
   @FastApiWebAppPlugin.endpoint(method="post")
+  def predict(self, image_data: str, metadata: dict = None):
+    """
+    Simple /predict endpoint for image analysis
+
+    Simplified endpoint that accepts an image and returns a request ID.
+    This is the main endpoint for the cerviguard flow:
+    1. Receives base64 image
+    2. Adds to loopback queue via add_payload_by_fields
+    3. Serving plugin processes the image
+    4. Results cached for polling
+
+    Parameters
+    ----------
+    image_data : str
+        Base64 encoded image (supports data URLs)
+    metadata : dict, optional
+        Additional metadata
+
+    Returns
+    -------
+    dict
+        Request ID and status for polling
+    """
+    # Generate unique request ID
+    request_id = self.uuid()
+
+    self.P(f"[Predict] Received image, request_id: {request_id}", color='b')
+
+    # Validate image data
+    if not image_data or len(image_data) < 100:
+      return {
+        "status": "error",
+        "error": "Invalid or missing image data",
+        "message": "Image data must be base64 encoded"
+      }
+
+    # Track request
+    self._data_buffer.append({
+      "request_id": request_id,
+      "type": "prediction",
+      "submitted_at": self.time(),
+      "metadata": metadata or {}
+    })
+
+    # STEP 3: Send to loopback queue via add_payload_by_fields
+    # Because IS_LOOPBACK_PLUGIN=True, this writes to loopback_dct_{stream_id} queue
+    self.add_payload_by_fields(
+      request_id=request_id,
+      image_data=image_data,
+      metadata=metadata or {},
+      type="prediction",
+      submitted_at=self.time()
+    )
+
+    self.P(f"[Predict] Image added to loopback queue: {request_id}", color='g')
+
+    return {
+      "status": "submitted",
+      "request_id": request_id,
+      "message": "Image queued for analysis",
+      "poll_endpoint": f"/get_result?request_id={request_id}"
+    }
+
+  @FastApiWebAppPlugin.endpoint(method="get")
+  def get_result(self, request_id: str):
+    """
+    Get prediction result for /predict endpoint
+
+    Poll this endpoint to retrieve the processing result.
+    """
+    if not request_id:
+      return {
+        "status": "error",
+        "error": "Missing request_id parameter"
+      }
+
+    self.P(f"[Predict] Result requested for: {request_id}", color='b')
+
+    result = self._results_cache.get(request_id)
+
+    if result is None:
+      submitted = any(
+        item.get('request_id') == request_id
+        for item in self._data_buffer
+      )
+
+      if submitted:
+        return {
+          "status": "processing",
+          "request_id": request_id,
+          "message": "Image is still being processed, please poll again"
+        }
+      else:
+        return {
+          "status": "not_found",
+          "request_id": request_id,
+          "error": "Request ID not found"
+        }
+
+    self.P(f"[Predict] Returning result for: {request_id}", color='g')
+
+    return {
+      "status": "completed",
+      "request_id": request_id,
+      "result": result['result']
+    }
+
+  @FastApiWebAppPlugin.endpoint(method="post")
   def cerviguard_submit_image(self, image_data: str, metadata: dict = None):
     """
     CerviGuard WAR: Submit cervical image for analysis
@@ -262,9 +370,7 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     })
 
     # Send to loopback queue
-    # This will be picked up by CerviguardImageProcessorPlugin
     self.add_payload_by_fields(
-      payload_type=REQUEST_PAYLOAD_TYPE,
       request_id=request_id,
       image_data=image_data,
       metadata=metadata or {},
@@ -426,38 +532,133 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
 
   def process(self):
     """
-    Main process loop - can be used for periodic tasks
+    Main process loop:
+    1. Read struct_data from pipeline (contains image requests from loopback)
+    2. Read inferences from serving plugin (which has already processed them)
+    3. Match inferences to requests by index
+    4. Cache results for retrieval via API
     """
     self._cleanup_result_cache()
     self._maybe_trim_buffer()
 
+    # Read struct_data from pipeline (raw payloads)
     payloads = self.dataapi_struct_datas(full=False, as_list=True)
     if not payloads:
       return None
 
-    for payload in payloads:
-      self._handle_loopback_payload(payload)
+    # Read inferences that serving plugin already produced
+    # The serving plugin processes the data automatically via the pipeline
+    inferences = self.dataapi_struct_data_inferences(how='list')
+
+    if not inferences:
+      self.P(f"No inferences available for {len(payloads)} payload(s)", color='y')
+      return None
+
+    self.P(f"Processing {len(payloads)} payload(s) with {len(inferences)} inference(s)", color='b')
+
+    # Match payloads with inferences (they should be in same order)
+    for idx, payload in enumerate(payloads):
+      inference = inferences[idx] if idx < len(inferences) else None
+      self._process_loopback_payload(payload, inference)
 
     return None
 
-  def _handle_loopback_payload(self, payload):
+  def _process_loopback_payload(self, payload, inference):
+    """
+    Process a single payload from loopback queue with its corresponding inference:
+    1. Extract request info from payload
+    2. Extract inference result from serving plugin
+    3. Cache result for API retrieval
+
+    Parameters
+    ----------
+    payload : dict
+        The original payload with request_id, image_data, metadata
+    inference : dict
+        The inference result from the serving plugin (already processed)
+    """
     if not isinstance(payload, dict):
       return
 
-    payload_type = self._get_payload_field(payload, 'payload_type')
-    if payload_type != RESULT_PAYLOAD_TYPE:
+    # Extract request info from payload
+    request_id = self._get_payload_field(payload, 'request_id')
+    metadata = self._get_payload_field(payload, 'metadata', {}) or {}
+
+    if not request_id:
+      self.P("Received payload without request_id, ignoring", color='y')
       return
 
-    request_id = self._get_payload_field(payload, 'request_id')
-    result = self._get_payload_field(payload, 'result')
-    if not request_id or result is None:
+    if inference is None:
+      self.P(f"No inference available for request {request_id}", color='y')
+      self._cache_error_result(request_id, 'No inference result available')
       return
+
+    self.P(f"[CerviGuard] Processing inference for request {request_id}", color='b')
+
+    try:
+      # The serving plugin returns inferences in a specific format
+      # For CERVIGUARD_IMAGE_ANALYZER, it returns: {'status': 'completed', 'data': {...}}
+
+      if not isinstance(inference, dict):
+        self.P(f"Unexpected inference format: {type(inference)}", color='r')
+        self._cache_error_result(request_id, 'Invalid inference result format')
+        return
+
+      # Extract the inference data
+      # Inference can be the result dict directly or wrapped
+      inference_data = inference.get('data', inference) if 'data' in inference else inference
+
+      # Check status
+      status = inference_data.get('status', 'unknown')
+
+      if status == 'error':
+        error_msg = inference_data.get('error', 'Unknown error')
+        self._cache_error_result(request_id, error_msg)
+        return
+
+      # Success - extract image info
+      image_info = inference_data.get('image_info', {})
+
+      final_result = {
+        'status': 'completed',
+        'request_id': request_id,
+        'image_info': image_info,
+        'processed_at': inference_data.get('processed_at', self.time()),
+        'processor_version': inference_data.get('processor_version', 'unknown'),
+        'metadata': metadata,
+      }
+
+      # Cache the result
+      self._results_cache[request_id] = {
+        'result': final_result,
+        'stored_at': self.time(),
+      }
+
+      self.P(f"[CerviGuard] Cached result for request {request_id}", color='g')
+
+    except Exception as e:
+      self.P(f"Error processing request {request_id}: {e}", color='r')
+      import traceback
+      self.P(traceback.format_exc(), color='r')
+      self._cache_error_result(request_id, f'Processing error: {str(e)}')
+
+    return
+
+  def _cache_error_result(self, request_id: str, error_message: str):
+    """Cache an error result for a request"""
+    self.P(f"[CerviGuard] Caching error for request {request_id}: {error_message}", color='r')
+
+    error_result = {
+      'status': 'error',
+      'error': error_message,
+      'request_id': request_id,
+      'processed_at': self.time(),
+    }
 
     self._results_cache[request_id] = {
-      'result': result,
+      'result': error_result,
       'stored_at': self.time(),
     }
-    self.P(f"[CerviGuard] Cached result for request {request_id}", color='g')
     return
 
   def _cleanup_result_cache(self):
