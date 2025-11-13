@@ -10,7 +10,9 @@ RUN set -eux; \
     # disable NodeSource (if present) so apt won't read it
     rm -f /etc/apt/sources.list.d/nodesource*.list /etc/apt/sources.list.d/nodesource*.sources || true; \
     apt-get update -o Acquire::Retries=3; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends wget tar ca-certificates; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    wget tar ca-certificates \
+    ninja-build; \
     rm -rf /var/lib/apt/lists/*
          
 RUN wget https://dist.ipfs.tech/kubo/v0.35.0/kubo_v0.35.0_linux-amd64.tar.gz && \

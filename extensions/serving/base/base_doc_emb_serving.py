@@ -213,7 +213,7 @@ class BaseDocEmbServing(BaseServingProcess):
     return 'default' if context is None else f'context_{context}'
 
   def __db_cache_workspace(self, context):
-    return self.os_path.join(self.get_models_folder(), 'vectordb', self.cfg_model_name, context)
+    return self.os_path.join(self.get_models_folder(), 'vectordb', self.get_model_name(), context)
 
   def get_embedding_size(self):
     return DOC_EMBEDDING_SIZE
@@ -541,7 +541,7 @@ class BaseDocEmbServing(BaseServingProcess):
 
     def get_additional_metadata(self):
       return {
-        'MODEL_NAME': self.cfg_model_name,
+        'MODEL_NAME': self.get_model_name(),
         'EMBEDDING_SIZE': self.get_embedding_size(),
         'MAX_SEGMENT_SIZE': MAX_SEGMENT_SIZE,
         'CONTEXTS': [
@@ -783,7 +783,7 @@ class BaseDocEmbServing(BaseServingProcess):
         'DOCS': docs,
         DocEmbCt.QUERY: query,
         'CONTEXT_LIST': context_list,
-        'MODEL_NAME': self.cfg_model_name,
+        'MODEL_NAME': self.get_model_name(),
         DocEmbCt.ERROR_MESSAGE: error_message,
         **uppercase_kwargs
       }
@@ -903,7 +903,7 @@ class BaseDocEmbServing(BaseServingProcess):
       else:
         final_result.append({
           "IS_VALID": False,
-          "MODEL_NAME": self.cfg_model_name,
+          "MODEL_NAME": self.get_model_name(),
         })
     # endfor each total input
     return final_result

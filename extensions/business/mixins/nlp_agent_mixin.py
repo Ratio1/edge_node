@@ -34,6 +34,8 @@ class _NlpAgentMixin(object):
   def handle_inferences(self, inferences, data=None):
     if not isinstance(inferences, list):
       return
+    if len(inferences) > 0 and not isinstance(inferences[0], dict):
+      return
     model_name = inferences[0].get('MODEL_NAME', None) if len(inferences) > 0 else None
     cnt_initial_inferences = len(inferences)
     inferences, valid_idxs = self.filter_valid_inferences(inferences, return_idxs=True)
