@@ -2,19 +2,30 @@
 LOCAL_SERVING_API Plugin
 
 This plugin creates a FastAPI server for local-only access (localhost) that works with
-a loopback data capture pipeline. It provides a simple API interface without token authentication,
-suitable for internal/localhost-only services.
+a loopback data capture pipeline. It uses the PostponedRequest pattern for async processing.
+
+Key Features:
+- Loopback mode: Outputs return to DCT queue for processing
+- PostponedRequest pattern: Server-side polling, no manual client polling
+- No token authentication (localhost only)
+- Designed for CerviGuard image analysis
+
+Available Endpoints:
+- POST /predict - Submit image for analysis (returns result via PostponedRequest)
+- GET /list_results - Get all processed image results
+- GET /status - Get system status and statistics
+- GET /health - Health check
 
 Example pipeline configuration:
 {
-  "NAME": "local_api_demo",
+  "NAME": "cerviguard_loopback",
   "TYPE": "Loopback",
   "PLUGINS": [
     {
       "SIGNATURE": "LOCAL_SERVING_API",
       "INSTANCES": [
         {
-          "INSTANCE_ID": "local_api_01"
+          "INSTANCE_ID": "cerviguard_api_01"
         }
       ]
     }
@@ -30,39 +41,36 @@ __VER__ = '0.1.0'
 _CONFIG = {
   **FastApiWebAppPlugin.CONFIG,
 
-  # Mark this as a loopback plugin - outputs go back to the DCT queue instead of downstream
+  # Loopback mode - outputs go back to the DCT queue instead of downstream
   'IS_LOOPBACK_PLUGIN': True,
 
+  # Server configuration
   'PORT': 5082,
-  # Disable tunnel/ngrok since this is localhost only
-  'TUNNEL_ENGINE_ENABLED': False,
+  'TUNNEL_ENGINE_ENABLED': False,  # Localhost only
 
   # API metadata
-  'API_TITLE': 'Local Serving API',
-  'API_SUMMARY': 'Local-only FastAPI server for internal services',
-  'API_DESCRIPTION': 'A FastAPI server accessible only via localhost without token authentication',
+  'API_TITLE': 'CerviGuard Local Serving API',
+  'API_SUMMARY': 'Local image analysis API with PostponedRequest pattern',
+  'API_DESCRIPTION': 'FastAPI server for cervical image analysis using loopback pipeline and PostponedRequest pattern',
 
-  # Response format - can be WRAPPED or RAW
+  # Response format
   'RESPONSE_FORMAT': 'WRAPPED',
-
-  # Enable request logging for debugging
   'LOG_REQUESTS': True,
 
-  # Process delay
+  # Processing configuration
   'PROCESS_DELAY': 0,
-  'RESULT_CACHE_TTL': 300,
-  'REQUEST_TIMEOUT': 240,  # seconds - timeout for postponed requests
+  'REQUEST_TIMEOUT': 240,  # seconds - timeout for PostponedRequest polling
 
-  # AI Engine configuration for image analysis
-  'AI_ENGINE': 'CERVIGUARD_IMAGE_ANALYZER',  # Serving plugin to use
+  # AI Engine for image processing
+  'AI_ENGINE': 'CERVIGUARD_IMAGE_ANALYZER',
 
   'VALIDATION_RULES': {
     **FastApiWebAppPlugin.CONFIG['VALIDATION_RULES'],
-    'RESULT_CACHE_TTL': {
-      'DESCRIPTION': 'How long to keep results in cache (seconds)',
+    'REQUEST_TIMEOUT': {
+      'DESCRIPTION': 'Timeout for PostponedRequest polling (seconds)',
       'TYPE': 'int',
-      'MIN_VAL': 60,
-      'MAX_VAL': 3600,
+      'MIN_VAL': 30,
+      'MAX_VAL': 600,
     },
   },
 }
@@ -84,12 +92,12 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
 
   def on_init(self):
     super(LocalServingApiPlugin, self).on_init()
-    # Initialize instance variables
-    self._request_counter = 0
-    self._data_buffer = []
+    # Initialize request tracking
     self.__requests = {}  # Track active requests (PostponedRequest pattern)
-    self.P("Local Serving API initialized - Loopback mode enabled", color='g')
-    self.P(f"  Server accessible only on localhost (no tunnel)", color='g')
+    self._data_buffer = []  # Simple activity log for monitoring
+
+    self.P("Local Serving API initialized - Loopback + PostponedRequest mode", color='g')
+    self.P(f"  Endpoints: /predict, /list_results, /status, /health", color='g')
     self.P(f"  AI Engine: {self.cfg_ai_engine}", color='g')
     self.P(f"  Loopback key: loopback_dct_{self._stream_id}", color='g')
     return
@@ -213,7 +221,7 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
       method_kwargs={'request_id': request_id}
     )
 
-  # ========== MOCKUP ENDPOINTS ==========
+  # ========== API ENDPOINTS ==========
 
   @FastApiWebAppPlugin.endpoint(method="get")
   def health(self):
@@ -234,100 +242,27 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
   @FastApiWebAppPlugin.endpoint(method="get")
   def status(self):
     """
-    Get current status and statistics
+    Get current system status and statistics
     """
+    pending = len([
+      req_id for req_id, req_data in self.__requests.items()
+      if not req_data.get('finished', False)
+    ])
+    completed = len([
+      req_id for req_id, req_data in self.__requests.items()
+      if req_data.get('finished', False)
+    ])
     return {
-      "request_count": self._request_counter,
-      "buffer_size": len(self._data_buffer),
+      "status": "online",
+      "service": "CerviGuard Image Analysis",
+      "version": __VER__,
       "stream_id": self._stream_id,
       "instance_id": self.get_instance_id(),
+      "total_requests": len(self.__requests),
+      "pending_requests": pending,
+      "completed_requests": completed,
+      "uptime_seconds": self.time() - self.start_time if hasattr(self, 'start_time') else 0,
     }
-
-  @FastApiWebAppPlugin.endpoint(method="post")
-  def process_data(self, data: dict):
-    """
-    Process arbitrary data and send it to the loopback queue
-
-    Parameters
-    ----------
-    data : dict
-        The data to process
-
-    Returns
-    -------
-    dict
-        Processing result
-    """
-    self._request_counter += 1
-    request_id = self._request_counter
-
-    self.P(f"Processing data request #{request_id}")
-
-    # Add to buffer
-    self._data_buffer.append({
-      "request_id": request_id,
-      "data": data,
-      "timestamp": self.time()
-    })
-
-    # Send to loopback queue via add_payload_by_fields
-    # This will automatically write to the loopback DCT queue because IS_LOOPBACK_PLUGIN=True
-    self.add_payload_by_fields(
-      request_id=request_id,
-      input_data=data,
-      processed_at=self.time(),
-      source="local_serving_api"
-    )
-
-    return {
-      "request_id": request_id,
-      "status": "processed",
-      "message": "Data sent to loopback queue"
-    }
-
-  @FastApiWebAppPlugin.endpoint(method="post")
-  def process_image(self, image_data: str, metadata: dict = None):
-    """
-    Process image data (base64 encoded) and send to loopback
-
-    Parameters
-    ----------
-    image_data : str
-        Base64 encoded image data
-    metadata : dict, optional
-        Additional metadata for the image
-
-    Returns
-    -------
-    dict
-        Processing result
-    """
-    self._request_counter += 1
-    request_id = self._request_counter
-
-    self.P(f"Processing image request #{request_id}")
-
-    # In a real implementation, you would decode the base64 image
-    # For this mockup, we just log it
-
-    payload = {
-      "request_id": request_id,
-      "image_size": len(image_data) if image_data else 0,
-      "metadata": metadata or {},
-      "processed_at": self.time(),
-      "source": "local_serving_api_image"
-    }
-
-    # Send to loopback queue
-    self.add_payload_by_fields(**payload)
-
-    return {
-      "request_id": request_id,
-      "status": "image_processed",
-      "message": "Image data sent to loopback queue"
-    }
-
-  # ========== CERVIGUARD WAR ENDPOINTS ==========
 
   @FastApiWebAppPlugin.endpoint(method="post")
   def predict(self, image_data: str, metadata: dict = None):
@@ -374,149 +309,59 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     return self.solve_postponed_predict_request(request_id=request_id)
 
 
-  @FastApiWebAppPlugin.endpoint(method="post")
-  def cerviguard_submit_image(self, image_data: str, metadata: dict = None):
-    """
-    CerviGuard WAR: Submit cervical image for analysis using PostponedRequest pattern
-
-    This endpoint is specifically designed for the CerviGuard WAR application.
-    It accepts a base64-encoded image and uses PostponedRequest for async processing.
-
-    Parameters
-    ----------
-    image_data : str
-        Base64 encoded cervical image (supports data URLs)
-    metadata : dict, optional
-        Additional metadata (patient_id, capture_date, etc.)
-
-    Returns
-    -------
-    dict or PostponedRequest
-        Either immediate error or PostponedRequest for async processing
-    """
-    self.P(f"[CerviGuard] Received cervical image submission", color='b')
-
-    # Validate image data
-    if not image_data or len(image_data) < 100:
-      return {
-        "status": "error",
-        "error": "Invalid or missing image data",
-        "message": "Image data must be base64 encoded"
-      }
-
-    # Register the request and add to loopback queue
-    request_id = self.register_predict_request(
-      image_data=image_data,
-      metadata=metadata,
-      request_type='cervical_analysis'
-    )
-
-    # Return PostponedRequest - framework will poll solve_postponed_predict_request()
-    return self.solve_postponed_predict_request(request_id=request_id)
-
-  #
   @FastApiWebAppPlugin.endpoint(method="get")
-  def cerviguard_status(self):
+  def list_results(self, limit: int = 50, include_pending: bool = False):
     """
-    CerviGuard WAR: Get system status
-    """
-    pending = len([
-      req_id for req_id, req_data in self.__requests.items()
-      if not req_data.get('finished', False)
-    ])
-    completed = len([
-      req_id for req_id, req_data in self.__requests.items()
-      if req_data.get('finished', False)
-    ])
-    return {
-      "status": "online",
-      "service": "CerviGuard Image Analysis",
-      "version": __VER__,
-      "total_requests": len(self.__requests),
-      "pending_requests": pending,
-      "completed_requests": completed,
-      "uptime_seconds": self.time() - self.start_time if hasattr(self, 'start_time') else 0,
-    }
-
-  @FastApiWebAppPlugin.endpoint(method="get")
-  def get_buffer(self, limit: int = 10):
-    """
-    Get recent data from the buffer
+    Get all processed image results
 
     Parameters
     ----------
     limit : int
-        Maximum number of items to return (default: 10)
+        Maximum number of results to return (default: 50, max: 100)
+    include_pending : bool
+        Whether to include pending requests (default: False)
 
     Returns
     -------
     dict
-        Buffer contents
+        List of all processed results with metadata
     """
-    return {
-      "buffer_size": len(self._data_buffer),
-      "limit": limit,
-      "items": self._data_buffer[-limit:] if self._data_buffer else []
-    }
+    # Limit validation
+    limit = min(max(1, limit), 100)
 
-  @FastApiWebAppPlugin.endpoint(method="post")
-  def clear_buffer(self):
-    """
-    Clear the internal data buffer
+    results_list = []
+    for req_id, req_data in self.__requests.items():
+      is_finished = req_data.get('finished', False)
 
-    Returns
-    -------
-    dict
-        Clear operation result
-    """
-    prev_size = len(self._data_buffer)
-    self._data_buffer = []
+      # Skip pending if not requested
+      if not include_pending and not is_finished:
+        continue
 
-    return {
-      "status": "cleared",
-      "previous_size": prev_size,
-      "message": f"Cleared {prev_size} items from buffer"
-    }
-
-  @FastApiWebAppPlugin.endpoint(method="post")
-  def batch_process(self, items: list):
-    """
-    Process a batch of items
-
-    Parameters
-    ----------
-    items : list
-        List of items to process
-
-    Returns
-    -------
-    dict
-        Batch processing result
-    """
-    if not isinstance(items, list):
-      return {
-        "error": "items must be a list",
-        "status": "failed"
+      result_item = {
+        'request_id': req_id,
+        'type': req_data.get('type', 'unknown'),
+        'status': 'completed' if is_finished else 'processing',
+        'submitted_at': req_data.get('start_time'),
+        'metadata': req_data.get('metadata', {}),
       }
 
-    batch_id = self.uuid()
-    self._request_counter += len(items)
+      # Add result if finished
+      if is_finished:
+        result_item['result'] = req_data.get('result', {})
 
-    # Process each item and send to loopback
-    for idx, item in enumerate(items):
-      self.add_payload_by_fields(
-        batch_id=batch_id,
-        item_index=idx,
-        item_data=item,
-        processed_at=self.time(),
-        source="local_serving_api_batch"
-      )
+      results_list.append(result_item)
+
+    # Sort by submission time (most recent first)
+    results_list.sort(key=lambda x: x.get('submitted_at', 0), reverse=True)
+
+    # Apply limit
+    results_list = results_list[:limit]
 
     return {
-      "batch_id": batch_id,
-      "items_processed": len(items),
-      "status": "batch_completed",
-      "message": f"Processed {len(items)} items and sent to loopback queue"
+      "total_results": len(results_list),
+      "limit": limit,
+      "include_pending": include_pending,
+      "results": results_list
     }
 
   def process(self):
