@@ -56,7 +56,7 @@ class LlmModelMixin(object):
 
   def _get_model_load_config(self):
     return self.log.get_model_load_config(
-      model_name=self.cfg_model_name,
+      model_name=self.get_model_name(),
       token=self.hf_token,
       has_gpu=self.has_gpu,
       weights_size=self.cfg_model_weights_size,
@@ -93,7 +93,7 @@ class LlmModelMixin(object):
     # Load the tokenizer and output to log.
     cache_dir = self.cache_dir
     token = self.hf_token
-    model_id = self.cfg_model_name
+    model_id = self.get_model_name()
     self.P("Loading tokenizer for {} in '{}'...".format(model_id, cache_dir))
     self.load_tokenizer(model_id, cache_dir, token)
 
@@ -142,7 +142,7 @@ class LlmModelMixin(object):
     Will first set up the model loading configuration and then load the model
 
     """
-    model_id = self.cfg_model_name
+    model_id = self.get_model_name()
     model_params, quantization_params = self._get_model_load_config()
     self.P("Loading {} with following parameters:\n{}\nQuantization params: {}".format(
       model_id,

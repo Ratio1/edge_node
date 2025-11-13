@@ -128,6 +128,7 @@ _CONFIG = {
     "memory": "512m",  # e.g. "512m" for 512MB,
     "ports": []        # dict of host_port: container_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
+  "USE_CUDA": False,        # If True, will use nvidia runtime for GPU support
   "RESTART_POLICY": "always",  # "always" will restart the container if it stops
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
@@ -799,17 +800,18 @@ class ContainerAppRunnerPlugin(
 
   def start_container(self):
     """Start the Docker container."""
-    self.P(f"Launching container with image '{self.cfg_image}'...")
+    log_str = f"Launching container with image '{self.cfg_image}'..."
 
-    self.P(f"Container data:")
-    self.P(f"  Image: {self.cfg_image}")
-    self.P(f"  Ports: {self.json_dumps(self.inverted_ports_mapping) if self.inverted_ports_mapping else 'None'}")
-    self.P(f"  Env: {self.json_dumps(self.env) if self.env else 'None'}")
-    self.P(f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}")
-    self.P(f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}")
-    self.P(f"  Restart policy: {self.cfg_restart_policy}")
-    self.P(f"  Pull policy: {self.cfg_image_pull_policy}")
-    self.P(f"  Start command: {self._start_command if self._start_command else 'Image default'}")
+    log_str += f"Container data:"
+    log_str += f"  Image: {self.cfg_image}"
+    log_str += f"  Ports: {self.json_dumps(self.inverted_ports_mapping) if self.inverted_ports_mapping else 'None'}"
+    log_str += f"  Env: {self.json_dumps(self.env) if self.env else 'None'}"
+    log_str += f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}"
+    log_str += f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}"
+    log_str += f"  Restart policy: {self.cfg_restart_policy}"
+    log_str += f"  Pull policy: {self.cfg_image_pull_policy}"
+    log_str += f"  Start command: {self._start_command if self._start_command else 'Image default'}"
+    self.P(log_str)
 
     try:
       run_kwargs = dict(
@@ -821,6 +823,18 @@ class ContainerAppRunnerPlugin(
       )
       if self._start_command:
         run_kwargs['command'] = self._start_command
+
+      if self.cfg_use_cuda:
+        gpus_info = self.log.gpu_info()
+        if len(gpus_info) > 0:
+          run_kwargs['runtime'] = 'nvidia'
+          self.P(f"USE_CUDA is True and NVIDIA GPUs found, starting container with GPU support")
+        else:
+          self.P("Warning! USE_CUDA is True but no NVIDIA GPUs found, starting container without GPU support")
+        # endif available GPUs
+      else:
+        self.P(f"Starting container without GPU support")
+      # endif cfg_use_cuda
 
       self.container = self.docker_client.containers.run(
         self.cfg_image,

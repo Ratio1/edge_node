@@ -2707,6 +2707,13 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin, _ChainstoreResponseMix
       # endfor
       return None
 
+    @_NetworkProcessorMixin.payload_handler(signature="VLLM_AGENT")
+    def handle_payload_vllm_agent(self, data):
+      return self.handle_payload_helper(
+        data=data,
+        agent_type="LLM",
+      )
+
     @_NetworkProcessorMixin.payload_handler(signature="LLM_AGENT")
     def handle_payload_llm_agent(self, data):
       return self.handle_payload_helper(

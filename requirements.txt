@@ -21,3 +21,4 @@ sqlfluff
 pypdf
 python-docx
 pdfplumber
+llama-cpp-python>=0.2.82

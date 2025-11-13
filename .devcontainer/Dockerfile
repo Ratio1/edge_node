@@ -1,7 +1,18 @@
-FROM ratio1/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-d
+#FROM ratio1/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-d
+FROM ratio1/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-dnctk
 
 # Install IPFS
-RUN apt-get update && apt-get install -y wget && apt-get install -y tar
+# The line below was creating issues due to flaky external repos
+# RUN apt-get update && apt-get install -y wget && apt-get install -y tar
+# Install tools needed for the next steps without hitting flaky external repos
+RUN set -eux; \
+    # disable NodeSource (if present) so apt won't read it
+    rm -f /etc/apt/sources.list.d/nodesource*.list /etc/apt/sources.list.d/nodesource*.sources || true; \
+    apt-get update -o Acquire::Retries=3; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    wget tar ca-certificates \
+    ninja-build; \
+    rm -rf /var/lib/apt/lists/*
          
 RUN wget https://dist.ipfs.tech/kubo/v0.32.1/kubo_v0.32.1_linux-amd64.tar.gz && \
   tar -xvzf kubo_v0.32.1_linux-amd64.tar.gz && \
@@ -32,9 +43,11 @@ RUN set -eux; \
 # COPY ./cmds /usr/local/bin/
 # RUN chmod +x /usr/local/bin/*
 
+RUN npm install -g npm@latest @openai/codex
 
 WORKDIR /edge_node
-COPY . .
+#COPY . .
+COPY requirements.txt .
 # RUN rm -rf /edge_node/cmds
 
 # set a generic env variable 
