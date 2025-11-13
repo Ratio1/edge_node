@@ -19,7 +19,7 @@ Usage in pipeline:
       "INSTANCES": [
         {
           "INSTANCE_ID": "cerviguard_01",
-          "AI_ENGINE": "CERVIGUARD_IMAGE_ANALYZER"
+          "AI_ENGINE": "cerviguard_analyze"
         }
       ]
     }

@@ -62,7 +62,7 @@ _CONFIG = {
   'REQUEST_TIMEOUT': 240,  # seconds - timeout for PostponedRequest polling
 
   # AI Engine for image processing
-  'AI_ENGINE': 'CERVIGUARD_IMAGE_ANALYZER',
+  'AI_ENGINE': 'cerviguard_analyze',
 
   'VALIDATION_RULES': {
     **FastApiWebAppPlugin.CONFIG['VALIDATION_RULES'],
@@ -436,7 +436,7 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
 
     try:
       # The serving plugin returns inferences in a specific format
-      # For CERVIGUARD_IMAGE_ANALYZER, it returns: {'status': 'completed', 'data': {...}}
+      # For cerviguard_analyze, it returns: {'status': 'completed', 'data': {...}}
 
       if not isinstance(inference, dict):
         self.P(f"Unexpected inference format: {type(inference)}", color='r')
