@@ -455,13 +455,20 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
         self._mark_request_error(request_id, error_msg)
         return
 
-      # Success - extract image info
+      # Success - extract image info and analysis
       image_info = inference_data.get('image_info', {})
+      analysis = inference_data.get('analysis', {})
+
+      # Validate and provide safe defaults for analysis fields
+      validated_analysis = self._validate_analysis(analysis)
+
+      # Include image_info in analysis
+      validated_analysis['image_info'] = image_info
 
       final_result = {
         'status': 'completed',
         'request_id': request_id,
-        'image_info': image_info,
+        'analysis': validated_analysis,
         'processed_at': inference_data.get('processed_at', self.time()),
         'processor_version': inference_data.get('processor_version', 'unknown'),
         'metadata': metadata,
@@ -480,6 +487,86 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
       self._mark_request_error(request_id, f'Processing error: {str(e)}')
 
     return
+
+  def _validate_analysis(self, analysis: dict) -> dict:
+    """
+    Validate and sanitize analysis data, providing safe defaults.
+
+    Parameters
+    ----------
+    analysis : dict
+        Analysis data from serving plugin
+
+    Returns
+    -------
+    dict
+        Validated analysis with all required fields
+    """
+    # Define safe defaults
+    safe_defaults = {
+      'tz_type': 'Type 1',
+      'lesion_assessment': 'none',
+      'lesion_summary': 'Analysis unavailable',
+      'risk_score': 0,
+      'image_quality': 'unknown',
+      'image_quality_sufficient': True
+    }
+
+    if not isinstance(analysis, dict):
+      self.P("Analysis data is not a dict, using defaults", color='y')
+      return safe_defaults
+
+    # Validate each field
+    validated = {}
+
+    # Validate tz_type (must be "Type 1", "Type 2", or "Type 3")
+    tz_type = analysis.get('tz_type', safe_defaults['tz_type'])
+    if tz_type not in ['Type 1', 'Type 2', 'Type 3']:
+      self.P(f"Invalid tz_type: {tz_type}, using default", color='y')
+      tz_type = safe_defaults['tz_type']
+    validated['tz_type'] = tz_type
+
+    # Validate lesion_assessment (must be "none", "low", "moderate", or "high")
+    lesion_assessment = analysis.get('lesion_assessment', safe_defaults['lesion_assessment'])
+    if lesion_assessment not in ['none', 'low', 'moderate', 'high']:
+      self.P(f"Invalid lesion_assessment: {lesion_assessment}, using default", color='y')
+      lesion_assessment = safe_defaults['lesion_assessment']
+    validated['lesion_assessment'] = lesion_assessment
+
+    # Validate lesion_summary (must be string)
+    lesion_summary = analysis.get('lesion_summary', safe_defaults['lesion_summary'])
+    if not isinstance(lesion_summary, str):
+      self.P(f"Invalid lesion_summary type: {type(lesion_summary)}, using default", color='y')
+      lesion_summary = safe_defaults['lesion_summary']
+    validated['lesion_summary'] = lesion_summary
+
+    # Validate risk_score (must be int 0-100)
+    risk_score = analysis.get('risk_score', safe_defaults['risk_score'])
+    try:
+      risk_score = int(risk_score)
+      if risk_score < 0 or risk_score > 100:
+        self.P(f"risk_score out of range: {risk_score}, clamping to 0-100", color='y')
+        risk_score = max(0, min(100, risk_score))
+    except (TypeError, ValueError):
+      self.P(f"Invalid risk_score: {risk_score}, using default", color='y')
+      risk_score = safe_defaults['risk_score']
+    validated['risk_score'] = risk_score
+
+    # Validate image_quality (must be string)
+    image_quality = analysis.get('image_quality', safe_defaults['image_quality'])
+    if not isinstance(image_quality, str):
+      self.P(f"Invalid image_quality type: {type(image_quality)}, using default", color='y')
+      image_quality = safe_defaults['image_quality']
+    validated['image_quality'] = image_quality
+
+    # Validate image_quality_sufficient (must be boolean)
+    image_quality_sufficient = analysis.get('image_quality_sufficient', safe_defaults['image_quality_sufficient'])
+    if not isinstance(image_quality_sufficient, bool):
+      self.P(f"Invalid image_quality_sufficient type: {type(image_quality_sufficient)}, using default", color='y')
+      image_quality_sufficient = safe_defaults['image_quality_sufficient']
+    validated['image_quality_sufficient'] = image_quality_sufficient
+
+    return validated
 
   def _mark_request_error(self, request_id: str, error_message: str):
     """Mark a request as finished with an error"""
