@@ -49,3 +49,7 @@ AI_ENGINES['doc_embed'] = {
   'SERVING_PROCESS': 'mxbai_embed'
 }
 
+AI_ENGINES['cerviguard_analyze'] = {
+  'SERVING_PROCESS': 'cerviguard_image_analyzer'
+}
+
