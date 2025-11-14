@@ -62,7 +62,7 @@ _CONFIG = {
   'REQUEST_TIMEOUT': 240,  # seconds - timeout for PostponedRequest polling
 
   # AI Engine for image processing
-  'AI_ENGINE': 'cerviguard_analyzer',
+  'AI_ENGINE': 'CERVIGUARD_IMAGE_ANALYZER',
 
   'VALIDATION_RULES': {
     **FastApiWebAppPlugin.CONFIG['VALIDATION_RULES'],
