@@ -1870,7 +1870,7 @@ class ContainerAppRunnerPlugin(
     # Preserve state before reset (prevents redundant operations after restart)
     preserved_failures = self._consecutive_failures
     preserved_last_success = self._last_successful_start
-    preserved_last_image_check = self._last_image_check  # Prevent redundant image pull
+    preserved_last_image_check = self._last_image_check
     preserved_current_hash = self.current_image_hash
 
     self._stop_container_and_save_logs_to_disk()
@@ -1913,32 +1913,6 @@ class ContainerAppRunnerPlugin(
     self._maybe_execute_build_and_run()
     return
 
-  def _ensure_image_with_autoupdate(self):
-    """
-    Ensure image is available with autoupdate enabled.
-    Always pulls and tracks hash for version comparison.
-
-    Returns:
-      bool: True if image available and hash tracked, False otherwise
-    """
-    current_time = self.time()
-
-    # If we pulled very recently (< 10s), skip redundant pull
-    # This handles the case where image update detection just pulled the image
-    if (self.current_image_hash and
-        self._last_image_check > 0 and
-        current_time - self._last_image_check < 10):
-      self.Pd(f"Image recently pulled ({current_time - self._last_image_check:.1f}s ago), skipping redundant pull")
-      return True
-
-    self.Pd("AUTOUPDATE enabled, pulling image and tracking hash")
-    self.current_image_hash = self._get_latest_image_hash()
-
-    # Initialize last check time to prevent immediate re-check in same process() cycle
-    self._last_image_check = current_time
-
-    return self.current_image_hash is not None
-
   def _ensure_image_always_pull(self):
     """
     Ensure image is available with 'always' pull policy.
@@ -1975,7 +1949,7 @@ class ContainerAppRunnerPlugin(
     Ensure the container image is available before starting container.
 
     This method uses a strategy pattern based on configuration:
-    - AUTOUPDATE enabled: Always pull + track hash (update detection)
+    - AUTOUPDATE enabled: Ensure image exists locally (update detection handled separately)
     - IMAGE_PULL_POLICY='always': Always pull (no tracking)
     - IMAGE_PULL_POLICY='if-not-present' or default: Pull only if missing locally
 
@@ -1983,8 +1957,10 @@ class ContainerAppRunnerPlugin(
       bool: True if image is available, False otherwise
     """
     # Strategy 1: AUTOUPDATE (takes precedence)
+    # When AUTOUPDATE is enabled, just ensure image exists locally
+    # Update checking and pulling happens in _check_image_updates()
     if self.cfg_autoupdate:
-      return self._ensure_image_with_autoupdate()
+      return self._ensure_image_if_not_present()
 
     # Strategy 2: Always pull policy
     if self.cfg_image_pull_policy == "always":
