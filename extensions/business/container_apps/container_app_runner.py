@@ -77,6 +77,9 @@ from .container_utils import _ContainerUtilsMixin # provides container managemen
 
 __VER__ = "0.6.0"
 
+# Persistent state filename (general purpose)
+_PERSISTENT_STATE_FILE = "container_persistent_state.pkl"
+
 
 class ContainerState(Enum):
   """Container lifecycle states for proper state machine management."""
@@ -352,6 +355,57 @@ class ContainerAppRunnerPlugin(
   def _after_reset(self):
     """Hook for subclasses to reset additional state."""
     return
+
+  # ============================================================================
+  # Persistent State Management (General Purpose)
+  # ============================================================================
+
+  def _load_persistent_state(self):
+    """
+    Load persistent state from disk.
+
+    Returns:
+      dict: Persistent state dictionary (empty dict if no state exists)
+    """
+    state = self.diskapi_load_pickle_from_data(_PERSISTENT_STATE_FILE)
+    return state if state is not None else {}
+
+  def _save_persistent_state(self, **kwargs):
+    """
+    Save or update persistent state fields.
+
+    Args:
+      **kwargs: State fields to save/update (e.g., manually_stopped=True)
+
+    Example:
+      self._save_persistent_state(manually_stopped=True, last_config_hash="abc123")
+    """
+    # Load existing state
+    state = self._load_persistent_state()
+    # Update with new values
+    state.update(kwargs)
+    # Save back to disk
+    self.diskapi_save_pickle_to_data(state, _PERSISTENT_STATE_FILE)
+    return
+
+  def _load_manual_stop_state(self):
+    """
+    Load manual stop state from persistent storage.
+
+    Returns:
+      bool: True if container was manually stopped, False otherwise
+    """
+    state = self._load_persistent_state()
+    return state.get("manually_stopped", False)
+
+  def _clear_manual_stop_state(self):
+    """Clear manual stop state (called on RESTART command)."""
+    self._save_persistent_state(manually_stopped=False)
+    return
+
+  # ============================================================================
+  # End of Persistent State Management
+  # ============================================================================
 
   # ============================================================================
   # Restart Policy and Retry Logic
@@ -775,6 +829,11 @@ class ContainerAppRunnerPlugin(
 
     self._validate_runner_config()
 
+    # Check if container was manually stopped in a previous session
+    if self._load_manual_stop_state():
+      self.P("Container was manually stopped in previous session. Keeping container paused.", color='y')
+      self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
+
     self._extra_on_init()
     self.P(f"{self.__class__.__name__} initialized (version {__VER__})", color='g')
     return
@@ -828,6 +887,7 @@ class ContainerAppRunnerPlugin(
 
     if data == "RESTART":
       self.P("Restarting container...")
+      self._clear_manual_stop_state()  # Clear persistent stop state
       self._set_container_state(ContainerState.RESTARTING, StopReason.CONFIG_UPDATE)
       self._stop_container_and_save_logs_to_disk()
       self._restart_container(StopReason.CONFIG_UPDATE)
@@ -835,6 +895,7 @@ class ContainerAppRunnerPlugin(
 
     elif data == "STOP":
       self.P("Stopping container (manual stop - restart policy will not trigger)...")
+      self._save_persistent_state(manually_stopped=True)  # Save persistent stop state
       self._stop_container_and_save_logs_to_disk()
       self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
       return
