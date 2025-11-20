@@ -200,6 +200,13 @@ _CONFIG = {
   "RESTART_BACKOFF_MULTIPLIER": 2,  # Backoff multiplier for exponential backoff
   "RESTART_RESET_INTERVAL": 300,  # Reset retry count after this many seconds of successful run
 
+  # Tunnel restart retry configuration (exponential backoff)
+  "TUNNEL_RESTART_MAX_RETRIES": 5,     # Max consecutive tunnel restart attempts (0 = unlimited)
+  "TUNNEL_RESTART_BACKOFF_INITIAL": 2,  # Initial tunnel backoff delay in seconds
+  "TUNNEL_RESTART_BACKOFF_MAX": 60,     # Maximum tunnel backoff delay in seconds (1 minute)
+  "TUNNEL_RESTART_BACKOFF_MULTIPLIER": 2,  # Tunnel backoff multiplier
+  "TUNNEL_RESTART_RESET_INTERVAL": 300,  # Reset tunnel retry count after successful run
+
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   "FILE_VOLUMES": {},           # dict mapping host paths to file configs: {"host_path": {"content": "...", "mounting_point": "..."}}
 
@@ -262,7 +269,25 @@ class ContainerAppRunnerPlugin(
     self.container = None
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
-    self.docker_client = docker.from_env()
+
+    # Initialize Docker client with proper error handling
+    try:
+      self.docker_client = docker.from_env()
+      # Verify Docker daemon is accessible by pinging it
+      self.docker_client.ping()
+    except docker.errors.DockerException as e:
+      raise RuntimeError(
+        f"Failed to connect to Docker daemon: {e}\n"
+        "Please ensure Docker is installed and running:\n"
+        "  - Check: systemctl status docker (Linux) or Docker Desktop (Windows/Mac)\n"
+        "  - Start: systemctl start docker (Linux) or start Docker Desktop\n"
+        "  - Verify: docker ps"
+      ) from e
+    except Exception as e:
+      raise RuntimeError(
+        f"Unexpected error initializing Docker client: {e}\n"
+        "Please verify Docker installation and permissions."
+      ) from e
 
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
 
@@ -294,6 +319,12 @@ class ContainerAppRunnerPlugin(
     self.extra_tunnel_log_readers = {}  # Dict: {container_port: {"stdout": reader, "stderr": reader}}
     self.extra_tunnel_configs = {}    # Dict: {container_port: token}
     self.extra_tunnel_start_times = {}  # Dict: {container_port: timestamp}
+
+    # Tunnel restart backoff tracking (per port)
+    self._tunnel_consecutive_failures = {}  # Dict: {container_port: failure_count}
+    self._tunnel_last_failure_time = {}     # Dict: {container_port: timestamp}
+    self._tunnel_next_restart_time = {}     # Dict: {container_port: timestamp}
+    self._tunnel_last_successful_start = {} # Dict: {container_port: timestamp}
 
     # Log streaming
     self.log_thread = None
@@ -536,6 +567,127 @@ class ContainerAppRunnerPlugin(
 
   # ============================================================================
   # End of Restart Policy Logic
+  # ============================================================================
+
+  # ============================================================================
+  # Tunnel Restart Backoff Logic
+  # ============================================================================
+
+  def _calculate_tunnel_backoff(self, container_port):
+    """
+    Calculate exponential backoff delay for tunnel restart attempts.
+
+    Args:
+      container_port: Container port for the tunnel
+
+    Returns:
+      float: Seconds to wait before next tunnel restart attempt
+    """
+    failures = self._tunnel_consecutive_failures.get(container_port, 0)
+    if failures == 0:
+      return 0
+
+    # Exponential backoff: initial * (multiplier ^ (failures - 1))
+    backoff = self.cfg_tunnel_restart_backoff_initial * (
+      self.cfg_tunnel_restart_backoff_multiplier ** (failures - 1)
+    )
+
+    # Cap at maximum backoff
+    backoff = min(backoff, self.cfg_tunnel_restart_backoff_max)
+
+    return backoff
+
+  def _record_tunnel_restart_failure(self, container_port):
+    """Record a tunnel restart failure and update backoff state."""
+    self._tunnel_consecutive_failures[container_port] = \
+      self._tunnel_consecutive_failures.get(container_port, 0) + 1
+    self._tunnel_last_failure_time[container_port] = self.time()
+
+    backoff = self._calculate_tunnel_backoff(container_port)
+    self._tunnel_next_restart_time[container_port] = self.time() + backoff
+
+    failures = self._tunnel_consecutive_failures[container_port]
+    self.P(
+      f"Tunnel restart failure for port {container_port} (#{failures}). "
+      f"Next retry in {backoff:.1f}s",
+      color='y'
+    )
+    return
+
+  def _record_tunnel_restart_success(self, container_port):
+    """Record a successful tunnel restart."""
+    self._tunnel_last_successful_start[container_port] = self.time()
+
+    # Note success if there were previous failures
+    failures = self._tunnel_consecutive_failures.get(container_port, 0)
+    if failures > 0:
+      self.P(
+        f"Tunnel for port {container_port} started successfully after {failures} failure(s).",
+        color='g'
+      )
+    return
+
+  def _is_tunnel_backoff_active(self, container_port):
+    """
+    Check if tunnel is currently in backoff period.
+
+    Args:
+      container_port: Container port for the tunnel
+
+    Returns:
+      bool: True if we should wait before restarting tunnel
+    """
+    next_restart = self._tunnel_next_restart_time.get(container_port, 0)
+    if next_restart == 0:
+      return False
+
+    current_time = self.time()
+    if current_time < next_restart:
+      remaining = next_restart - current_time
+      self.Pd(f"Tunnel {container_port} backoff active: {remaining:.1f}s remaining")
+      return True
+
+    return False
+
+  def _has_tunnel_exceeded_max_retries(self, container_port):
+    """
+    Check if tunnel has exceeded max retry attempts.
+
+    Args:
+      container_port: Container port for the tunnel
+
+    Returns:
+      bool: True if max retries exceeded (and max_retries > 0)
+    """
+    if self.cfg_tunnel_restart_max_retries <= 0:
+      return False  # Unlimited retries
+
+    failures = self._tunnel_consecutive_failures.get(container_port, 0)
+    return failures >= self.cfg_tunnel_restart_max_retries
+
+  def _maybe_reset_tunnel_retry_counter(self, container_port):
+    """Reset tunnel retry counter if it has been running successfully."""
+    failures = self._tunnel_consecutive_failures.get(container_port, 0)
+    if failures == 0:
+      return
+
+    last_start = self._tunnel_last_successful_start.get(container_port, 0)
+    if not last_start:
+      return
+
+    uptime = self.time() - last_start
+    if uptime >= self.cfg_tunnel_restart_reset_interval:
+      self.P(
+        f"Tunnel {container_port} running successfully for {self.cfg_tunnel_restart_reset_interval}s. "
+        f"Reset failure counter (was {failures})",
+        color='g'
+      )
+      self._tunnel_consecutive_failures[container_port] = 0
+
+    return
+
+  # ============================================================================
+  # End of Tunnel Restart Backoff Logic
   # ============================================================================
 
   def _normalize_container_command(self, value, *, field_name):
@@ -934,11 +1086,16 @@ class ContainerAppRunnerPlugin(
       }
       self.extra_tunnel_start_times[container_port] = self.time()
 
+      # Record successful start for backoff tracking
+      self._record_tunnel_restart_success(container_port)
+
       self.P(f"Extra tunnel for port {container_port} started (PID: {process.pid})", color='g')
       return True
 
     except Exception as e:
       self.P(f"Failed to start extra tunnel for port {container_port}: {e}", color='r')
+      # Record failure for backoff tracking
+      self._record_tunnel_restart_failure(container_port)
       return False
 
   def start_extra_tunnels(self):
@@ -1385,9 +1542,10 @@ class ContainerAppRunnerPlugin(
 
   def _check_extra_tunnel_health(self):
     """
-    Check health of extra tunnels and restart if needed.
+    Check health of extra tunnels and restart if needed with exponential backoff.
     """
     for container_port, process in list(self.extra_tunnel_processes.items()):
+      # Check if tunnel is still running
       if process.poll() is not None:  # Process exited
         exit_code = process.returncode
         self.P(f"Extra tunnel for port {container_port} exited (code {exit_code})", color='r')
@@ -1395,11 +1553,37 @@ class ContainerAppRunnerPlugin(
         # Clean up dead tunnel
         self._stop_extra_tunnel(container_port)
 
-        # Restart tunnel
+        # Record failure for backoff tracking
+        self._record_tunnel_restart_failure(container_port)
+
+        # Check if we've exceeded max retries
+        if self._has_tunnel_exceeded_max_retries(container_port):
+          failures = self._tunnel_consecutive_failures.get(container_port, 0)
+          max_retries = self.cfg_tunnel_restart_max_retries
+          self.P(
+            f"Tunnel for port {container_port} restart abandoned after {failures} "
+            f"consecutive failures (max: {max_retries})",
+            color='r'
+          )
+          continue
+
+        # Check if we're in backoff period
+        if self._is_tunnel_backoff_active(container_port):
+          self.Pd(f"Tunnel {container_port} restart delayed due to active backoff period")
+          continue
+
+        # All checks passed - attempt restart
         token = self.extra_tunnel_configs.get(container_port)
         if token:
-          self.P(f"Restarting extra tunnel for port {container_port}...", color='y')
+          failures = self._tunnel_consecutive_failures.get(container_port, 0)
+          self.P(
+            f"Restarting extra tunnel for port {container_port} (attempt {failures})...",
+            color='y'
+          )
           self._start_extra_tunnel(container_port, token)
+      else:
+        # Tunnel is running - maybe reset retry counter
+        self._maybe_reset_tunnel_retry_counter(container_port)
 
 
 
