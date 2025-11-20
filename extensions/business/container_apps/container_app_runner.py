@@ -277,7 +277,6 @@ class ContainerAppRunnerPlugin(
     # Container state machine
     self.container_state = ContainerState.UNINITIALIZED
     self.stop_reason = StopReason.UNKNOWN
-    self._is_manually_stopped = False # Flag to indicate if the container was manually stopped (deprecated, use state instead)
 
     # Restart policy and retry logic
     self._consecutive_failures = 0
@@ -677,7 +676,6 @@ class ContainerAppRunnerPlugin(
 
     if data == "RESTART":
       self.P("Restarting container...")
-      self._is_manually_stopped = False  # Deprecated flag
       self._set_container_state(ContainerState.RESTARTING, StopReason.CONFIG_UPDATE)
       self._stop_container_and_save_logs_to_disk()
       self._restart_container(StopReason.CONFIG_UPDATE)
@@ -686,7 +684,6 @@ class ContainerAppRunnerPlugin(
     elif data == "STOP":
       self.P("Stopping container (manual stop - restart policy will not trigger)...")
       self._stop_container_and_save_logs_to_disk()
-      self._is_manually_stopped = True  # Deprecated flag
       self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
       return
     else:
@@ -836,14 +833,24 @@ class ContainerAppRunnerPlugin(
       token: Cloudflare tunnel token
 
     Returns:
-      str or None: Command string to execute, or None if error
+      list or None: Command list to execute, or None if error
     """
     host_port = self._get_host_port_for_container_port(container_port)
     if not host_port:
       self.P(f"No host port found for container port {container_port}", color='r')
       return None
 
-    return f"cloudflared tunnel --no-autoupdate run --token {token} --url http://127.0.0.1:{host_port}"
+    # Return list to avoid shell injection - use list-based subprocess
+    return [
+      "cloudflared",
+      "tunnel",
+      "--no-autoupdate",
+      "run",
+      "--token",
+      str(token),
+      "--url",
+      f"http://127.0.0.1:{host_port}"
+    ]
 
   def _should_start_main_tunnel(self):
     """
@@ -905,11 +912,11 @@ class ContainerAppRunnerPlugin(
     try:
       host_port = self._get_host_port_for_container_port(container_port)
       self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...", color='b')
-      self.Pd(f"  Command: {command}")
+      self.Pd(f"  Command: {' '.join(command)}")
 
+      # Use list-based subprocess to prevent shell injection
       process = subprocess.Popen(
         command,
-        shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0
@@ -1895,8 +1902,9 @@ class ContainerAppRunnerPlugin(
       4. Tunnel engine ping and maintenance
 
     """
-    if self._is_manually_stopped:
-      self.Pd("Manually stopped app. Skipping launch...", color='y')
+    # Use state machine instead of deprecated _is_manually_stopped flag
+    if self.container_state == ContainerState.PAUSED:
+      self.Pd("Container is paused (manual stop). Skipping launch...", color='y')
       return
 
     if not self.container:
