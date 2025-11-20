@@ -6,16 +6,21 @@ This plugin:
   - Runs build and run commands inside a container using ContainerAppRunner defaults
   - Clones a Git repository into the container before executing those commands
   - Monitors GitHub for new commits and restarts the container when changes land
+  - Uses StopReason.EXTERNAL_UPDATE for Git-triggered restarts (planned restarts)
   - Streams logs and manages tunnel lifecycle through the base runner
 """
 
 import requests
 from urllib.parse import urlsplit
 
-from extensions.business.container_apps.container_app_runner import ContainerAppRunnerPlugin
+from extensions.business.container_apps.container_app_runner import (
+  ContainerAppRunnerPlugin,
+  StopReason,
+  RestartPolicy,
+)
 
 
-__VER__ = "1.0.0"
+__VER__ = "1.1.0"
 
 REPO_CLONE_PATH = "/app"
 
@@ -155,30 +160,31 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
   # --- Monitoring ------------------------------------------------------------
 
   def _perform_additional_checks(self, current_time):
-    """Check for git updates and return whether restart is required."""
+    """Check for git updates and return StopReason if restart is required."""
     return self._check_git_updates(current_time)
 
   def _check_git_updates(self, current_time=None):
     """
     Check for new commits in the repository.
-    
+
     Returns
     -------
-    bool
-      True if a new commit was detected and restart is required, False otherwise.
+    StopReason or None
+      StopReason.EXTERNAL_UPDATE if a new commit was detected and restart is required,
+      None otherwise.
     """
     if not current_time:
       current_time = self.time()
 
     poll_interval = self._git_poll_interval
     if current_time - self._last_git_check < poll_interval:
-      return False
+      return None
 
     self._last_git_check = current_time
     latest_commit = self._get_latest_commit()
 
     if not latest_commit:
-      return False
+      return None
 
     if self.current_commit and latest_commit != self.current_commit:
       self.P(
@@ -186,12 +192,12 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
         color='y',
       )
       self.current_commit = latest_commit
-      return True
+      return StopReason.EXTERNAL_UPDATE  # Git update triggers external update restart
     else:
       if not self.current_commit:
         self.current_commit = latest_commit
       self.P(f"Commit check ({self.branch}): {latest_commit}", color='d')
-    return False
+    return None
 
   # --- Git helpers -----------------------------------------------------------
 
