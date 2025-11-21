@@ -1715,20 +1715,18 @@ class ContainerAppRunnerPlugin(
     """
     self._set_container_state(ContainerState.STARTING)
 
-    log_arr = []
-    log_arr += f"Launching container with image '{self.cfg_image}'..."
+    log_str = f"Launching container with image '{self.cfg_image}'...\n"
 
-    log_arr += f"Container data:"
-    log_arr += f"  Image: {self.cfg_image}"
-    log_arr += f"  Ports: {self.json_dumps(self.inverted_ports_mapping) if self.inverted_ports_mapping else 'None'}"
-    log_arr += f"  Env: {self.json_dumps(self.env) if self.env else 'None'}"
-    log_arr += f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}"
-    log_arr += f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}"
-    log_arr += f"  Restart policy: {self.cfg_restart_policy}"
-    log_arr += f"  Pull policy: {self.cfg_image_pull_policy}"
-    log_arr += f"  Start command: {self._start_command if self._start_command else 'Image default'}"
+    log_str += f"Container data:\n"
+    log_str += f"  Image: {self.cfg_image}\n"
+    log_str += f"  Ports: {self.json_dumps(self.inverted_ports_mapping) if self.inverted_ports_mapping else 'None'}\n"
+    log_str += f"  Env: {self.json_dumps(self.env) if self.env else 'None'}\n"
+    log_str += f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}\n"
+    log_str += f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}\n"
+    log_str += f"  Restart policy: {self.cfg_restart_policy}\n"
+    log_str += f"  Pull policy: {self.cfg_image_pull_policy}\n"
+    log_str += f"  Start command: {self._start_command if self._start_command else 'Image default'}\n"
 
-    log_str = "\n".join(log_arr)
     self.P(log_str)
 
     nano_cpu_limit = self._cpu_limit * 1_000_000_000
