@@ -257,9 +257,11 @@ class ContainerAppRunnerPlugin(
   def port(self):
       return getattr(self, '_port', None)
 
+
   @port.setter
   def port(self, value):
       self._port = value
+
 
   def Pd(self, s, *args, score=-1, **kwargs):
     """
@@ -371,6 +373,7 @@ class ContainerAppRunnerPlugin(
 
     return
 
+
   def _after_reset(self):
     """
     Hook for subclasses to reset additional state.
@@ -388,6 +391,7 @@ class ContainerAppRunnerPlugin(
   # Persistent State Management (General Purpose)
   # ============================================================================
 
+
   def _load_persistent_state(self):
     """
     Load persistent state from disk.
@@ -399,6 +403,7 @@ class ContainerAppRunnerPlugin(
     """
     state = self.diskapi_load_pickle_from_data(_PERSISTENT_STATE_FILE)
     return state if state is not None else {}
+
 
   def _save_persistent_state(self, **kwargs):
     """
@@ -425,6 +430,7 @@ class ContainerAppRunnerPlugin(
     self.diskapi_save_pickle_to_data(state, _PERSISTENT_STATE_FILE)
     return
 
+
   def _load_manual_stop_state(self):
     """
     Load manual stop state from persistent storage.
@@ -436,6 +442,7 @@ class ContainerAppRunnerPlugin(
     """
     state = self._load_persistent_state()
     return state.get("manually_stopped", False)
+
 
   def _clear_manual_stop_state(self):
     """
@@ -455,6 +462,7 @@ class ContainerAppRunnerPlugin(
   # ============================================================================
   # Restart Policy and Retry Logic
   # ============================================================================
+
 
   def _normalize_restart_policy(self, policy):
     """
@@ -489,6 +497,7 @@ class ContainerAppRunnerPlugin(
     # Unknown type
     self.P(f"Invalid restart policy type {type(policy)}, defaulting to 'no'", color='y')
     return RestartPolicy.NO
+
 
   def _should_restart_container(self, stop_reason=None):
     """
@@ -547,6 +556,7 @@ class ContainerAppRunnerPlugin(
     self.P(f"Unhandled restart policy '{policy}', defaulting to no restart", color='y')
     return False
 
+
   def _calculate_restart_backoff(self):
     """
     Calculate exponential backoff delay for restart attempts.
@@ -569,6 +579,7 @@ class ContainerAppRunnerPlugin(
 
     return backoff
 
+
   def _should_reset_retry_counter(self):
     """
     Check if container has been running long enough to reset retry counter.
@@ -583,6 +594,7 @@ class ContainerAppRunnerPlugin(
 
     uptime = self.time() - self._last_successful_start
     return uptime >= self.cfg_restart_reset_interval
+
 
   def _record_restart_failure(self):
     """
@@ -603,6 +615,7 @@ class ContainerAppRunnerPlugin(
       color='r'
     )
     return
+
 
   def _record_restart_success(self):
     """
@@ -626,6 +639,7 @@ class ContainerAppRunnerPlugin(
     # end if
     return
 
+
   def _maybe_reset_retry_counter(self):
     """
     Reset retry counter if container has been running successfully.
@@ -645,6 +659,7 @@ class ContainerAppRunnerPlugin(
       )
     # end if
     return
+
 
   def _is_restart_backoff_active(self):
     """
@@ -666,6 +681,7 @@ class ContainerAppRunnerPlugin(
 
     return False
 
+
   def _has_exceeded_max_retries(self):
     """
     Check if max retry attempts exceeded.
@@ -679,6 +695,7 @@ class ContainerAppRunnerPlugin(
       return False  # Unlimited retries
 
     return self._consecutive_failures >= self.cfg_restart_max_retries
+
 
   def _set_container_state(self, new_state, stop_reason=None):
     """
@@ -713,6 +730,7 @@ class ContainerAppRunnerPlugin(
   # Tunnel Restart Backoff Logic
   # ============================================================================
 
+
   def _calculate_tunnel_backoff(self, container_port):
     """
     Calculate exponential backoff delay for tunnel restart attempts.
@@ -740,6 +758,7 @@ class ContainerAppRunnerPlugin(
     backoff = min(backoff, self.cfg_tunnel_restart_backoff_max)
 
     return backoff
+
 
   def _record_tunnel_restart_failure(self, container_port):
     """
@@ -769,6 +788,7 @@ class ContainerAppRunnerPlugin(
     )
     return
 
+
   def _record_tunnel_restart_success(self, container_port):
     """
     Record a successful tunnel restart.
@@ -792,6 +812,7 @@ class ContainerAppRunnerPlugin(
         color='g'
       )
     return
+
 
   def _is_tunnel_backoff_active(self, container_port):
     """
@@ -819,6 +840,7 @@ class ContainerAppRunnerPlugin(
 
     return False
 
+
   def _has_tunnel_exceeded_max_retries(self, container_port):
     """
     Check if tunnel has exceeded max retry attempts.
@@ -838,6 +860,7 @@ class ContainerAppRunnerPlugin(
 
     failures = self._tunnel_consecutive_failures.get(container_port, 0)
     return failures >= self.cfg_tunnel_restart_max_retries
+
 
   def _maybe_reset_tunnel_retry_counter(self, container_port):
     """
@@ -875,6 +898,7 @@ class ContainerAppRunnerPlugin(
   # End of Tunnel Restart Backoff Logic
   # ============================================================================
 
+
   def _normalize_container_command(self, value, *, field_name):
     """
     Normalize a container command into a Docker-compatible representation.
@@ -910,6 +934,7 @@ class ContainerAppRunnerPlugin(
       return command
 
     raise ValueError(f"{field_name} must be None, a string, or a list/tuple of strings")
+
 
   def _normalize_command_sequence(self, value, *, field_name):
     """
@@ -947,6 +972,7 @@ class ContainerAppRunnerPlugin(
 
     raise ValueError(f"{field_name} must be a string or an iterable of strings")
 
+
   def _validate_runner_config(self):
     """
     Validate configuration and prepare normalized command data.
@@ -973,6 +999,7 @@ class ContainerAppRunnerPlugin(
     self._validate_subclass_config()
     return
 
+
   def _validate_subclass_config(self):
     """
     Hook for subclasses to enforce additional validation.
@@ -990,6 +1017,7 @@ class ContainerAppRunnerPlugin(
         If subclass-specific validation fails
     """
     return
+
 
   def on_init(self):
     """
@@ -1046,6 +1074,7 @@ class ContainerAppRunnerPlugin(
     self._extra_on_init()
     self.P(f"{self.__class__.__name__} initialized (version {__VER__})", color='g')
     return
+
   
   def _extra_on_init(self):
     """
@@ -1059,6 +1088,7 @@ class ContainerAppRunnerPlugin(
     None
     """
     return
+
 
   def on_command(self, data, **kwargs):
     """
@@ -1112,6 +1142,7 @@ class ContainerAppRunnerPlugin(
       self.P(f"Unknown plugin command: {data}")
     return
 
+
   def on_config(self, *args, **kwargs):
     """
     Lifecycle hook called when configuration changes.
@@ -1152,8 +1183,6 @@ class ContainerAppRunnerPlugin(
     return
 
 
-
-
   def start_tunnel_engine(self):
     """
     Start the main tunnel engine (Cloudflare or ngrok).
@@ -1182,6 +1211,7 @@ class ContainerAppRunnerPlugin(
     # end if
     return
 
+
   def stop_tunnel_engine(self):
     """
     Stop the main tunnel engine.
@@ -1200,6 +1230,7 @@ class ContainerAppRunnerPlugin(
       self.P(f"{engine_name} tunnel stopped", color='g')
     # end if
     return
+
 
   def get_tunnel_engine_ping_data(self):
     """
@@ -1237,6 +1268,7 @@ class ContainerAppRunnerPlugin(
       result['extra_tunnel_status'] = tunnel_status
 
     return result
+
 
   def maybe_extra_tunnels_ping(self):
     """
@@ -1284,6 +1316,7 @@ class ContainerAppRunnerPlugin(
 
     return
 
+
   def _get_host_port_for_container_port(self, container_port):
     """
     Get the host port mapped to a container port.
@@ -1302,6 +1335,7 @@ class ContainerAppRunnerPlugin(
       if c_port == container_port:
         return host_port
     return None
+
 
   def _build_tunnel_command(self, container_port, token):
     """
@@ -1335,6 +1369,7 @@ class ContainerAppRunnerPlugin(
       "--url",
       f"http://127.0.0.1:{host_port}"
     ]
+
 
   def _should_start_main_tunnel(self):
     """
@@ -1373,6 +1408,7 @@ class ContainerAppRunnerPlugin(
       return False
 
     return True
+
 
   def _start_extra_tunnel(self, container_port, token):
     """
@@ -1437,6 +1473,7 @@ class ContainerAppRunnerPlugin(
       self._record_tunnel_restart_failure(container_port)
       return False
 
+
   def start_extra_tunnels(self):
     """
     Start all configured extra Cloudflare tunnels.
@@ -1469,6 +1506,7 @@ class ContainerAppRunnerPlugin(
       color='g' if started_count == len(self.extra_tunnel_configs) else 'y'
     )
     return
+
 
   def _stop_extra_tunnel(self, container_port):
     """
@@ -1540,6 +1578,7 @@ class ContainerAppRunnerPlugin(
     except Exception as e:
       self.P(f"Error stopping extra tunnel for port {container_port}: {e}", color='r')
 
+
   def stop_extra_tunnels(self):
     """
     Stop all running extra tunnels.
@@ -1560,6 +1599,7 @@ class ContainerAppRunnerPlugin(
       self._stop_extra_tunnel(container_port)
 
     self.P("All extra tunnels stopped", color='g')
+
 
   def _read_extra_tunnel_logs(self, container_port):
     """
@@ -1595,6 +1635,7 @@ class ContainerAppRunnerPlugin(
           self._process_extra_tunnel_log(container_port, err_logs, is_error=True)
       except Exception as e:
         self.Pd(f"Error reading stderr for tunnel {container_port}: {e}")
+
 
   def _process_extra_tunnel_log(self, container_port, text, is_error=False):
     """
@@ -1634,6 +1675,7 @@ class ContainerAppRunnerPlugin(
         self.extra_tunnel_urls[container_port] = url
         self.P(f"Extra tunnel URL for port {container_port}: {url}", color='g')
 
+
   def read_all_extra_tunnel_logs(self):
     """
     Read and process logs from all running extra tunnels.
@@ -1650,6 +1692,7 @@ class ContainerAppRunnerPlugin(
         self._read_extra_tunnel_logs(container_port)
       except Exception as e:
         self.Pd(f"Error reading logs for tunnel {container_port}: {e}")
+
 
   def start_container(self):
     """
@@ -1738,6 +1781,7 @@ class ContainerAppRunnerPlugin(
       self._record_restart_failure()
     return None
 
+
   def stop_container(self):
     """
     Stop and remove the Docker container.
@@ -1779,6 +1823,7 @@ class ContainerAppRunnerPlugin(
     # end try
     return
 
+
   def _stream_logs(self, log_stream):
     """
     Consume a log iterator from container logs and print its output.
@@ -1817,6 +1862,7 @@ class ContainerAppRunnerPlugin(
     # end try
     return
 
+
   def _start_container_log_stream(self):
     """
     Start following container logs if not already streaming.
@@ -1843,6 +1889,7 @@ class ContainerAppRunnerPlugin(
       self.P(f"Could not start container log stream: {exc}", color='r')
     return
 
+
   def _collect_exec_commands(self):
     """
     Return the list of commands to execute inside the container.
@@ -1853,6 +1900,7 @@ class ContainerAppRunnerPlugin(
         Commands to execute, or empty list if none configured
     """
     return list(self._build_commands) if getattr(self, '_build_commands', None) else []
+
 
   def _compose_exec_shell(self, commands):
     """
@@ -1871,6 +1919,7 @@ class ContainerAppRunnerPlugin(
     if not commands:
       return None
     return " && ".join(commands)
+
 
   def _run_container_exec(self, shell_cmd):
     """
@@ -1907,6 +1956,7 @@ class ContainerAppRunnerPlugin(
       self._commands_started = False
     return
 
+
   def _maybe_execute_build_and_run(self):
     """
     Execute configured build/run commands if necessary.
@@ -1933,6 +1983,7 @@ class ContainerAppRunnerPlugin(
     self._run_container_exec(shell_cmd)
     return
 
+
   def _check_health_endpoint(self, current_time=None):
     """
     Check health endpoint periodically if configured.
@@ -1954,6 +2005,7 @@ class ContainerAppRunnerPlugin(
       self._poll_endpoint()
     # end if time elapsed
     return
+
 
   def _poll_endpoint(self):
     """
@@ -1987,6 +2039,7 @@ class ContainerAppRunnerPlugin(
       self.P(f"Unexpected error during health check: {e}", color='r')
     # end try
     return
+
 
   def _check_container_status(self):
     """
@@ -2045,6 +2098,7 @@ class ContainerAppRunnerPlugin(
       self._set_container_state(ContainerState.FAILED, StopReason.UNKNOWN)
       return False
 
+
   def _check_extra_tunnel_health(self):
     """
     Check health of extra tunnels and restart if needed with exponential backoff.
@@ -2093,8 +2147,6 @@ class ContainerAppRunnerPlugin(
       else:
         # Tunnel is running - maybe reset retry counter
         self._maybe_reset_tunnel_retry_counter(container_port)
-
-
 
 
   def _stop_container_and_save_logs_to_disk(self):
@@ -2149,6 +2201,7 @@ class ContainerAppRunnerPlugin(
       self.P(f"Failed to save logs: {exc}", color='r')
     return
 
+
   def on_close(self):
     """
     Lifecycle hook called when plugin is stopping.
@@ -2186,6 +2239,7 @@ class ContainerAppRunnerPlugin(
     except Exception:
       return None
 
+
   def _pull_image_from_registry(self):
     """
     Pull image from registry (assumes authentication already done).
@@ -2218,6 +2272,7 @@ class ContainerAppRunnerPlugin(
     except Exception as e:
       self.P(f"Image pull failed: {e}", color='r')
       return None
+
 
   def _pull_image_with_fallback(self):
     """
@@ -2265,6 +2320,7 @@ class ContainerAppRunnerPlugin(
     self.P(f"No image available (pull failed and no local image): {self.cfg_image}", color='r')
     return None
 
+
   def _get_image_digest(self, img):
     """
     Extract digest hash from image object.
@@ -2296,6 +2352,7 @@ class ContainerAppRunnerPlugin(
     # Fallback to image id (sha256:...)
     return getattr(img, "id", None)
 
+
   def _get_latest_image_hash(self):
     """
     Get the latest identifier for the configured Docker image tag.
@@ -2317,6 +2374,7 @@ class ContainerAppRunnerPlugin(
     """
     img = self._pull_image_with_fallback()
     return self._get_image_digest(img)
+
 
   def _has_image_hash_changed(self, latest_hash):
     """
@@ -2345,6 +2403,7 @@ class ContainerAppRunnerPlugin(
     # Compare hashes
     return latest_hash != self.current_image_hash
 
+
   def _handle_image_update(self, new_hash):
     """
     Handle detected image update by updating hash and restarting container.
@@ -2371,6 +2430,7 @@ class ContainerAppRunnerPlugin(
       self.P(f"Container restart failed after image update: {e}", color='r')
       # Hash already updated, won't retry this version
       self.P(f"Image hash updated from {old_hash} to {new_hash}, but container restart failed", color='y')
+
 
   def _check_image_updates(self, current_time=None):
     """
@@ -2413,6 +2473,7 @@ class ContainerAppRunnerPlugin(
       self.Pd(f"Image up to date: {self.current_image_hash}")
 
     return
+
 
   def _restart_container(self, stop_reason=None):
     """
@@ -2475,6 +2536,7 @@ class ContainerAppRunnerPlugin(
     self._maybe_execute_build_and_run()
     return
 
+
   def _ensure_image_always_pull(self):
     """
     Ensure image is available with 'always' pull policy.
@@ -2489,6 +2551,7 @@ class ContainerAppRunnerPlugin(
     self.Pd("IMAGE_PULL_POLICY is 'always', pulling image")
     img = self._pull_image_with_fallback()
     return img is not None
+
 
   def _ensure_image_if_not_present(self):
     """
@@ -2511,6 +2574,7 @@ class ContainerAppRunnerPlugin(
     self.P(f"Image not found locally, pulling '{self.cfg_image}'...", color='b')
     img = self._pull_image_with_fallback()
     return img is not None
+
 
   def _ensure_image_available(self):
     """
@@ -2538,6 +2602,7 @@ class ContainerAppRunnerPlugin(
 
     # Strategy 3: If-not-present policy (default)
     return self._ensure_image_if_not_present()
+
 
   def _handle_initial_launch(self):
     """
@@ -2572,6 +2637,7 @@ class ContainerAppRunnerPlugin(
     # end try
     return
 
+
   def _perform_periodic_monitoring(self):
     """
     Perform periodic monitoring tasks.
@@ -2597,6 +2663,7 @@ class ContainerAppRunnerPlugin(
     if restart_stop_reason:
       self._restart_container(restart_stop_reason)
     return
+
 
   def _perform_additional_checks(self, current_time):
     """
@@ -2635,6 +2702,7 @@ class ContainerAppRunnerPlugin(
       return None
     """
     return None
+
 
   def process(self):
     """
