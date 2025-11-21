@@ -77,6 +77,8 @@ from .container_utils import _ContainerUtilsMixin # provides container managemen
 
 __VER__ = "0.6.0"
 
+from extensions.utils.memory_formatter import parse_memory_to_mb
+
 # Persistent state filename (general purpose)
 _PERSISTENT_STATE_FILE = "container_persistent_state.pkl"
 
@@ -1681,6 +1683,9 @@ class ContainerAppRunnerPlugin(
     log_str += f"  Start command: {self._start_command if self._start_command else 'Image default'}"
     self.P(log_str)
 
+    nano_cpu_limit = self._cpu_limit * 1_000_000_000
+    mem_reservation = f"{parse_memory_to_mb(self._mem_limit)}m"
+
     try:
       run_kwargs = dict(
         detach=True,
@@ -1688,6 +1693,9 @@ class ContainerAppRunnerPlugin(
         environment=self.env,
         volumes=self.volumes,
         name=self.container_name,
+        nano_cpus=nano_cpu_limit,
+        mem_limit=self._mem_limit,
+        mem_reservation=mem_reservation
       )
       if self._start_command:
         run_kwargs['command'] = self._start_command
