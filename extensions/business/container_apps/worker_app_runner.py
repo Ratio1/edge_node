@@ -62,12 +62,40 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
   CONFIG = _CONFIG
 
   def Pd(self, s, *args, score=-1, **kwargs):
+    """
+    Print debug message if verbosity level allows.
+
+    Parameters
+    ----------
+    s : str
+        Message to print
+    score : int, optional
+        Verbosity threshold (default: -1). Message prints if cfg_car_verbose > score
+    *args
+        Additional positional arguments passed to P()
+    **kwargs
+        Additional keyword arguments passed to P()
+
+    Returns
+    -------
+    None
+    """
     if self.cfg_car_verbose > score:
       s = "[DEBUG] " + s
       self.P(s, *args, **kwargs)
     return
 
   def _after_reset(self):
+    """
+    Reset worker-specific state variables.
+
+    Called after parent reset to initialize Git-related state variables
+    for repository monitoring.
+
+    Returns
+    -------
+    None
+    """
     super()._after_reset()
     self.current_commit = None
     self.branch = None
@@ -79,6 +107,22 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     return
 
   def _validate_subclass_config(self):
+    """
+    Validate WorkerAppRunner-specific configuration.
+
+    Ensures BUILD_AND_RUN_COMMANDS and VCS_DATA are properly configured
+    for Git-based container deployment.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If BUILD_AND_RUN_COMMANDS is empty, repository identification fails,
+        or POLL_INTERVAL is invalid
+    """
     super()._validate_subclass_config()
 
     if not self._build_commands:
@@ -104,6 +148,15 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     return
 
   def _extra_on_init(self):
+    """
+    Perform worker-specific initialization.
+
+    Ensures repository state is configured before container starts.
+
+    Returns
+    -------
+    None
+    """
     super()._extra_on_init()
     self._ensure_repo_state(initial=True)
     return
@@ -111,7 +164,22 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
   # --- Command orchestration -------------------------------------------------
 
   def _build_git_bootstrap_command(self):
-    """Return a shell snippet that installs git if it is missing in the container."""
+    """
+    Build shell command to install Git if missing in container.
+
+    Creates a shell script that detects the container's package manager
+    and installs Git using the appropriate command.
+
+    Returns
+    -------
+    str
+        Shell command that checks for git and installs it if needed
+
+    Notes
+    -----
+    Supports package managers: apk, apt-get, apt, yum, dnf, microdnf,
+    pacman, and zypper.
+    """
     installers = [
       ("apk", "apk add --no-cache git openssh-client"),
       ("apt-get", "apt-get update && apt-get install -y git openssh-client"),
@@ -135,6 +203,19 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     return f"if ! command -v git >/dev/null 2>&1; then {inner_block} fi"
 
   def _collect_exec_commands(self):
+    """
+    Collect commands to execute inside container.
+
+    Builds command sequence that:
+    1. Installs git if needed
+    2. Clones repository
+    3. Executes build/run commands
+
+    Returns
+    -------
+    list of str
+        Shell commands to execute, or empty list if repo not configured
+    """
     base_commands = super()._collect_exec_commands()
     if not base_commands:
       return []
@@ -160,7 +241,19 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
   # --- Monitoring ------------------------------------------------------------
 
   def _perform_additional_checks(self, current_time):
-    """Check for git updates and return StopReason if restart is required."""
+    """
+    Check for git updates and trigger restart if needed.
+
+    Parameters
+    ----------
+    current_time : float
+        Current timestamp for interval checking
+
+    Returns
+    -------
+    StopReason or None
+        StopReason.EXTERNAL_UPDATE if new commit detected, None otherwise
+    """
     return self._check_git_updates(current_time)
 
   def _check_git_updates(self, current_time=None):
@@ -203,6 +296,14 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
   @property
   def _git_poll_interval(self):
+    """
+    Get Git polling interval from configuration.
+
+    Returns
+    -------
+    int
+        Polling interval in seconds (minimum 15, default 60)
+    """
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
     try:
       interval = int(vcs_data.get('POLL_INTERVAL', 60))
@@ -211,6 +312,20 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     return max(interval, 15)
 
   def _ensure_repo_state(self, initial=False):
+    """
+    Ensure repository state is configured.
+
+    Configures branch, repository URL, and fetches latest commit.
+
+    Parameters
+    ----------
+    initial : bool, optional
+        If True, forces reconfiguration even if already configured (default: False)
+
+    Returns
+    -------
+    None
+    """
     if self._repo_configured and not initial:
       return
 
@@ -228,6 +343,22 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     return
 
   def _configure_repo_url(self):
+    """
+    Configure repository URL with authentication if provided.
+
+    Builds GitHub repository URL with optional username/token credentials.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Sets self.repo_url with one of these formats:
+    - Public: https://github.com/owner/repo.git
+    - Token only: https://token@github.com/owner/repo.git
+    - User+token: https://user:token@github.com/owner/repo.git
+    """
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
     username = vcs_data.get('USERNAME')
     token = vcs_data.get('TOKEN')
@@ -252,6 +383,23 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     return
 
   def _set_default_branch(self):
+    """
+    Determine and set the default repository branch.
+
+    Attempts to fetch the default branch from GitHub API if not
+    configured, falling back to 'main' if detection fails.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Branch selection priority:
+    1. cfg_vcs_data['BRANCH'] if specified
+    2. GitHub API default_branch if accessible
+    3. 'main' as final fallback
+    """
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
     repo_branch = vcs_data.get('BRANCH')
     repo_owner = self._repo_owner or vcs_data.get('REPO_OWNER')
@@ -317,7 +465,28 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
   # --- Helpers ---------------------------------------------------------------
 
   def _extract_repo_identifier(self, vcs_data):
-    """Derive repository owner and name from VCS configuration."""
+    """
+    Extract repository owner and name from VCS configuration.
+
+    Parses REPO_OWNER/REPO_NAME or extracts from REPO_URL.
+
+    Parameters
+    ----------
+    vcs_data : dict
+        VCS configuration dictionary
+
+    Returns
+    -------
+    tuple of (str, str)
+        Repository owner and name, or (None, None) if extraction fails
+
+    Examples
+    --------
+    >>> _extract_repo_identifier({'REPO_OWNER': 'user', 'REPO_NAME': 'repo'})
+    ('user', 'repo')
+    >>> _extract_repo_identifier({'REPO_URL': 'https://github.com/user/repo.git'})
+    ('user', 'repo')
+    """
     repo_url = vcs_data.get('REPO_URL')
     owner = vcs_data.get('REPO_OWNER')
     name = vcs_data.get('REPO_NAME')

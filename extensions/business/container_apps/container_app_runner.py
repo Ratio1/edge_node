@@ -261,7 +261,22 @@ class ContainerAppRunnerPlugin(
 
   def Pd(self, s, *args, score=-1, **kwargs):
     """
-    Print a message to the console.
+    Print debug message if verbosity level allows.
+
+    Parameters
+    ----------
+    s : str
+        Message to print
+    score : int, optional
+        Verbosity threshold (default: -1). Message prints if cfg_car_verbose > score
+    *args
+        Additional positional arguments passed to P()
+    **kwargs
+        Additional keyword arguments passed to P()
+
+    Returns
+    -------
+    None
     """
     if self.cfg_car_verbose > score:
       s = "[DEBUG] " + s
@@ -355,7 +370,16 @@ class ContainerAppRunnerPlugin(
     return
 
   def _after_reset(self):
-    """Hook for subclasses to reset additional state."""
+    """
+    Hook for subclasses to reset additional state.
+
+    Called after parent reset to allow subclasses to initialize
+    their own state variables.
+
+    Returns
+    -------
+    None
+    """
     return
 
   # ============================================================================
@@ -796,7 +820,21 @@ class ContainerAppRunnerPlugin(
     return
 
   def _validate_subclass_config(self):
-    """Hook for subclasses to enforce additional validation."""
+    """
+    Hook for subclasses to enforce additional validation.
+
+    Allows subclasses to add their own configuration validation
+    beyond the base container configuration checks.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If subclass-specific validation fails
+    """
     return
 
   def on_init(self):
@@ -841,7 +879,16 @@ class ContainerAppRunnerPlugin(
     return
   
   def _extra_on_init(self):
-    """Hook for subclasses to perform additional initialization."""
+    """
+    Hook for subclasses to perform additional initialization.
+
+    Called at the end of on_init() to allow subclasses to add
+    their own initialization logic.
+
+    Returns
+    -------
+    None
+    """
     return
 
   def on_command(self, data, **kwargs):
@@ -911,11 +958,19 @@ class ContainerAppRunnerPlugin(
 
   def on_post_container_start(self):
     """
-    Lifecycle hook called after the container is started.
-    Runs commands in the container if specified in the config.
+    Lifecycle hook called after container starts.
 
-      - after the container first start
-      - after the container is restarted
+    Runs commands in the container if specified in the config.
+    Called both after initial start and after restarts.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    This is a hook method that subclasses can override to add
+    custom post-start behavior.
     """
     self.P("Container started, running post-start commands...")
     return
@@ -925,7 +980,19 @@ class ContainerAppRunnerPlugin(
 
   def start_tunnel_engine(self):
     """
-    Start the tunnel engine using the base tunnel engine functionality.
+    Start the main tunnel engine (Cloudflare or ngrok).
+
+    Initiates tunnel process using base tunnel engine functionality
+    to expose container ports via public URL.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Only starts if TUNNEL_ENGINE_ENABLED is True. Tunnel type
+    is determined by use_cloudflare() method.
     """
     if self.cfg_tunnel_engine_enabled:
       engine_name = "Cloudflare" if self.use_cloudflare() else "ngrok"
@@ -941,7 +1008,13 @@ class ContainerAppRunnerPlugin(
 
   def stop_tunnel_engine(self):
     """
-    Stop the tunnel engine.
+    Stop the main tunnel engine.
+
+    Terminates the running tunnel process and cleans up resources.
+
+    Returns
+    -------
+    None
     """
     if self.tunnel_process:
       engine_name = "Cloudflare" if self.use_cloudflare() else "ngrok"
@@ -1162,7 +1235,21 @@ class ContainerAppRunnerPlugin(
       return False
 
   def start_extra_tunnels(self):
-    """Start all configured extra tunnels."""
+    """
+    Start all configured extra Cloudflare tunnels.
+
+    Iterates through extra_tunnel_configs and starts a tunnel
+    process for each configured port.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Logs the number of successfully started tunnels.
+    Failed tunnels are tracked for exponential backoff retry.
+    """
     if not self.extra_tunnel_configs:
       self.Pd("No extra tunnels configured")
       return
@@ -1245,7 +1332,16 @@ class ContainerAppRunnerPlugin(
       self.P(f"Error stopping extra tunnel for port {container_port}: {e}", color='r')
 
   def stop_extra_tunnels(self):
-    """Stop all extra tunnels."""
+    """
+    Stop all running extra tunnels.
+
+    Iterates through all extra tunnel processes and stops each one,
+    reading remaining logs before termination.
+
+    Returns
+    -------
+    None
+    """
     if not self.extra_tunnel_processes:
       return
 
@@ -1315,7 +1411,16 @@ class ContainerAppRunnerPlugin(
         self.P(f"Extra tunnel URL for port {container_port}: {url}", color='g')
 
   def read_all_extra_tunnel_logs(self):
-    """Read logs from all extra tunnels."""
+    """
+    Read and process logs from all running extra tunnels.
+
+    Iterates through all extra tunnel processes and reads their
+    stdout/stderr logs, extracting public URLs when found.
+
+    Returns
+    -------
+    None
+    """
     for container_port in list(self.extra_tunnel_processes.keys()):
       try:
         self._read_extra_tunnel_logs(container_port)
@@ -1323,7 +1428,22 @@ class ContainerAppRunnerPlugin(
         self.Pd(f"Error reading logs for tunnel {container_port}: {e}")
 
   def start_container(self):
-    """Start the Docker container."""
+    """
+    Start the Docker container with configured settings.
+
+    Creates and starts a Docker container with the configured image,
+    ports, volumes, environment variables, and resource limits.
+
+    Returns
+    -------
+    docker.models.containers.Container or None
+        Container object if started successfully, None otherwise
+
+    Notes
+    -----
+    Updates container state to RUNNING on success or FAILED on error.
+    Records restart success/failure for backoff tracking.
+    """
     self._set_container_state(ContainerState.STARTING)
 
     log_str = f"Launching container with image '{self.cfg_image}'..."
@@ -1386,7 +1506,21 @@ class ContainerAppRunnerPlugin(
     return None
 
   def stop_container(self):
-    """Stop and remove the Docker container if it is running."""
+    """
+    Stop and remove the Docker container.
+
+    Gracefully stops the container with a 5-second timeout,
+    then removes it from the Docker daemon.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    If no container exists, logs a warning and returns.
+    Clears container and container_id attributes after removal.
+    """
     if not self.container:
       self.P("No container to stop", color='y')
       return
