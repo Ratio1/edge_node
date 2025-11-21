@@ -40,6 +40,15 @@ class AdminContainerAppRunnerPlugin(
 
 
   def on_init(self):
+    """
+    Initialize the admin container app runner plugin.
+
+    Calls parent initialization and ensures volumes dict is initialized.
+
+    Returns
+    -------
+    None
+    """
     super(AdminContainerAppRunnerPlugin, self).on_init()
     if not self.volumes:
       self.volumes = {}
@@ -49,7 +58,21 @@ class AdminContainerAppRunnerPlugin(
 
   def _configure_volumes(self):
     """
-    Processes the volumes specified in the configuration.
+    Process volume configuration for admin container.
+
+    Configures volume mappings for the container, including optional edge node
+    data volume and user-specified volumes. Unlike the base class, this method
+    allows direct host path mapping without sandboxing.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    - If MOUNT_EDGE_NODE_DATA_VOLUME is True, mounts /edge_node/_local_cache/_data
+    - All volumes are mounted with 'rw' (read-write) permissions
+    - Host paths are used directly without sanitization (admin-only feature)
     """
     default_volume_rights = "rw"
 
@@ -66,12 +89,29 @@ class AdminContainerAppRunnerPlugin(
   def on_close(self):
     """
     Lifecycle hook called when plugin is stopping.
-    Ensures container is shut down and logs are saved.
-    Ensures the log process is killed.
-    Stops tunnel if started.
+
+    Ensures proper cleanup of container resources including:
+    - Container shutdown
+    - Log saving to disk
+    - Log process termination
+    - Tunnel termination if active
+
+    Returns
+    -------
+    None
     """
     super(AdminContainerAppRunnerPlugin, self).on_close()
 
   def process(self):
+    """
+    Main process loop for the admin container app runner.
+
+    Delegates to parent class process method for container management,
+    health checks, and tunnel maintenance.
+
+    Returns
+    -------
+    None
+    """
     super(AdminContainerAppRunnerPlugin, self).process()
     return
