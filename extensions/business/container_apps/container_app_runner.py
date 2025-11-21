@@ -70,6 +70,8 @@ import socket
 import subprocess
 from enum import Enum
 
+from docker.types import DeviceRequest
+
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResponseMixin
 
@@ -188,7 +190,7 @@ _CONFIG = {
   "PORT": None,             # internal container port if it's a web app (int)
   "CONTAINER_RESOURCES" : {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
-    "gpu": 0,
+    "gpu": 0,          # 0 - no GPU, 1 - use GPU
     "memory": "512m",  # e.g. "512m" for 512MB,
     "ports": []        # dict of host_port: container_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
@@ -1732,31 +1734,43 @@ class ContainerAppRunnerPlugin(
     nano_cpu_limit = self._cpu_limit * 1_000_000_000
     mem_reservation = f"{parse_memory_to_mb(self._mem_limit)}m"
 
+    run_kwargs = dict(
+      detach=True,
+      ports=self.inverted_ports_mapping,
+      environment=self.env,
+      volumes=self.volumes,
+      name=self.container_name,
+      nano_cpus=nano_cpu_limit,
+      mem_limit=self._mem_limit,
+      mem_reservation=mem_reservation,
+      # pids_limit=
+    )
+
+    device_requests = []
+    if self._gpu_limit:
+      gpus_info = self.log.gpu_info()
+      if len(gpus_info) > 0:
+        run_kwargs['runtime'] = 'nvidia'
+        self.P(f"USE_CUDA is True and NVIDIA GPUs found, starting container with GPU support")
+      else:
+        self.P("Warning! USE_CUDA is True but no NVIDIA GPUs found, starting container without GPU support")
+      # endif available GPUs
+      device_requests = [
+        DeviceRequest(
+          count=1,  # -1 = "all" devices
+          capabilities=[['gpu']],  # what kind of device we want
+          # optionally:
+          # device_ids=['0', '1'],
+          # options={'compute': 'all'}
+        )
+      ]
+      run_kwargs["device_requests"] = device_requests
+    else:
+      self.P(f"Starting container without GPU support")
+
     try:
-      run_kwargs = dict(
-        detach=True,
-        ports=self.inverted_ports_mapping,
-        environment=self.env,
-        volumes=self.volumes,
-        name=self.container_name,
-        nano_cpus=nano_cpu_limit,
-        mem_limit=self._mem_limit,
-        mem_reservation=mem_reservation
-      )
       if self._start_command:
         run_kwargs['command'] = self._start_command
-
-      if self.cfg_use_cuda:
-        gpus_info = self.log.gpu_info()
-        if len(gpus_info) > 0:
-          run_kwargs['runtime'] = 'nvidia'
-          self.P(f"USE_CUDA is True and NVIDIA GPUs found, starting container with GPU support")
-        else:
-          self.P("Warning! USE_CUDA is True but no NVIDIA GPUs found, starting container without GPU support")
-        # endif available GPUs
-      else:
-        self.P(f"Starting container without GPU support")
-      # endif cfg_use_cuda
 
       self.container = self.docker_client.containers.run(
         self.cfg_image,
