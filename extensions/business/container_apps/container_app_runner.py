@@ -77,7 +77,7 @@ from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResp
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
-__VER__ = "0.6.0"
+__VER__ = "0.6.1"
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
