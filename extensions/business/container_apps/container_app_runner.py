@@ -493,11 +493,11 @@ class ContainerAppRunnerPlugin(
       try:
         return RestartPolicy(policy_str)
       except ValueError:
-        self.P(f"Unknown restart policy '{policy}', defaulting to 'no'", color='y')
+        self.P(f"Unknown restart policy '{policy}', defaulting to 'no'", color='r')
         return RestartPolicy.NO
 
     # Unknown type
-    self.P(f"Invalid restart policy type {type(policy)}, defaulting to 'no'", color='y')
+    self.P(f"Invalid restart policy type {type(policy)}, defaulting to 'no'", color='r')
     return RestartPolicy.NO
 
 
@@ -555,7 +555,7 @@ class ContainerAppRunnerPlugin(
       ]
 
     # Fallback (should never reach here due to normalization)
-    self.P(f"Unhandled restart policy '{policy}', defaulting to no restart", color='y')
+    self.P(f"Unhandled restart policy '{policy}', defaulting to no restart", color='r')
     return False
 
 
@@ -634,7 +634,6 @@ class ContainerAppRunnerPlugin(
       self.P(
         f"Container started successfully after {self._consecutive_failures} failure(s). "
         f"Retry counter will reset after {self.cfg_restart_reset_interval}s of uptime.",
-        color='b'
       )
       # Don't reset immediately - wait for reset interval
       # self._consecutive_failures = 0  # This happens in _maybe_reset_retry_counter
@@ -656,8 +655,7 @@ class ContainerAppRunnerPlugin(
       self._restart_backoff_seconds = 0
       self.P(
         f"Container running successfully for {self.cfg_restart_reset_interval}s. "
-        f"Reset failure counter (was {old_failures})",
-        color='g'
+        f"Reset failure counter (was {old_failures})"
       )
     # end if
     return
@@ -786,7 +784,7 @@ class ContainerAppRunnerPlugin(
     self.P(
       f"Tunnel restart failure for port {container_port} (#{failures}). "
       f"Next retry in {backoff:.1f}s",
-      color='y'
+      color='r'
     )
     return
 
@@ -810,8 +808,7 @@ class ContainerAppRunnerPlugin(
     failures = self._tunnel_consecutive_failures.get(container_port, 0)
     if failures > 0:
       self.P(
-        f"Tunnel for port {container_port} started successfully after {failures} failure(s).",
-        color='g'
+        f"Tunnel for port {container_port} started successfully after {failures} failure(s)."
       )
     return
 
@@ -890,7 +887,6 @@ class ContainerAppRunnerPlugin(
       self.P(
         f"Tunnel {container_port} running successfully for {self.cfg_tunnel_restart_reset_interval}s. "
         f"Reset failure counter (was {failures})",
-        color='g'
       )
       self._tunnel_consecutive_failures[container_port] = 0
 
@@ -1070,11 +1066,11 @@ class ContainerAppRunnerPlugin(
 
     # Check if container was manually stopped in a previous session
     if self._load_manual_stop_state():
-      self.P("Container was manually stopped in previous session. Keeping container paused.", color='y')
+      self.P("Container was manually stopped in previous session. Keeping container paused.")
       self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
 
     self._extra_on_init()
-    self.P(f"{self.__class__.__name__} initialized (version {__VER__})", color='g')
+    self.P(f"{self.__class__.__name__} initialized (version {__VER__})")
     return
 
   
@@ -1203,10 +1199,10 @@ class ContainerAppRunnerPlugin(
     """
     if self.cfg_tunnel_engine_enabled:
       engine_name = "Cloudflare" if self.use_cloudflare() else "ngrok"
-      self.P(f"Starting {engine_name} tunnel...", color='b')
+      self.P(f"Starting {engine_name} tunnel...")
       self.tunnel_process = self.run_tunnel_engine()
       if self.tunnel_process:
-        self.P(f"{engine_name} tunnel started successfully", color='g')
+        self.P(f"{engine_name} tunnel started successfully")
       else:
         self.P(f"Failed to start {engine_name} tunnel", color='r')
       # end if
@@ -1226,10 +1222,10 @@ class ContainerAppRunnerPlugin(
     """
     if self.tunnel_process:
       engine_name = "Cloudflare" if self.use_cloudflare() else "ngrok"
-      self.P(f"Stopping {engine_name} tunnel...", color='b')
+      self.P(f"Stopping {engine_name} tunnel...")
       self.stop_tunnel_command(self.tunnel_process)
       self.tunnel_process = None
-      self.P(f"{engine_name} tunnel stopped", color='g')
+      self.P(f"{engine_name} tunnel stopped")
     # end if
     return
 
@@ -1403,10 +1399,7 @@ class ContainerAppRunnerPlugin(
 
     # If PORT is defined and in EXTRA_TUNNELS, skip main tunnel
     if self.cfg_port and self.cfg_port in self.extra_tunnel_configs:
-      self.P(
-        f"Main PORT {self.cfg_port} is defined in EXTRA_TUNNELS, using extra tunnel instead",
-        color='y'
-      )
+      self.P(f"Main PORT {self.cfg_port} is defined in EXTRA_TUNNELS, using extra tunnel instead")
       return False
 
     return True
@@ -1440,7 +1433,7 @@ class ContainerAppRunnerPlugin(
     # Start tunnel process
     try:
       host_port = self._get_host_port_for_container_port(container_port)
-      self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...", color='b')
+      self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...")
       self.Pd(f"  Command: {' '.join(command)}")
 
       # Use list-based subprocess to prevent shell injection
@@ -1466,7 +1459,7 @@ class ContainerAppRunnerPlugin(
       # Record successful start for backoff tracking
       self._record_tunnel_restart_success(container_port)
 
-      self.P(f"Extra tunnel for port {container_port} started (PID: {process.pid})", color='g')
+      self.P(f"Extra tunnel for port {container_port} started (PID: {process.pid})")
       return True
 
     except Exception as e:
@@ -1496,17 +1489,14 @@ class ContainerAppRunnerPlugin(
       self.Pd("No extra tunnels configured")
       return
 
-    self.P(f"Starting {len(self.extra_tunnel_configs)} extra tunnel(s)...", color='b')
+    self.P(f"Starting {len(self.extra_tunnel_configs)} extra tunnel(s)...")
 
     started_count = 0
     for container_port, token in self.extra_tunnel_configs.items():
       if self._start_extra_tunnel(container_port, token):
         started_count += 1
 
-    self.P(
-      f"Started {started_count}/{len(self.extra_tunnel_configs)} extra tunnels",
-      color='g' if started_count == len(self.extra_tunnel_configs) else 'y'
-    )
+    self.P(f"Started {started_count}/{len(self.extra_tunnel_configs)} extra tunnels")
     return
 
 
@@ -1528,7 +1518,7 @@ class ContainerAppRunnerPlugin(
       return
 
     try:
-      self.P(f"Stopping extra tunnel for port {container_port}...", color='b')
+      self.P(f"Stopping extra tunnel for port {container_port}...")
 
       # Read remaining logs before stopping
       self._read_extra_tunnel_logs(container_port)
@@ -1575,7 +1565,7 @@ class ContainerAppRunnerPlugin(
       self.extra_tunnel_urls.pop(container_port, None)
       self.extra_tunnel_start_times.pop(container_port, None)
 
-      self.P(f"Extra tunnel for port {container_port} stopped", color='g')
+      self.P(f"Extra tunnel for port {container_port} stopped")
 
     except Exception as e:
       self.P(f"Error stopping extra tunnel for port {container_port}: {e}", color='r')
@@ -1595,12 +1585,12 @@ class ContainerAppRunnerPlugin(
     if not self.extra_tunnel_processes:
       return
 
-    self.P(f"Stopping {len(self.extra_tunnel_processes)} extra tunnel(s)...", color='b')
+    self.P(f"Stopping {len(self.extra_tunnel_processes)} extra tunnel(s)...")
 
     for container_port in list(self.extra_tunnel_processes.keys()):
       self._stop_extra_tunnel(container_port)
 
-    self.P("All extra tunnels stopped", color='g')
+    self.P("All extra tunnels stopped")
 
 
   def _read_extra_tunnel_logs(self, container_port):
@@ -1660,12 +1650,13 @@ class ContainerAppRunnerPlugin(
     None
     """
     log_prefix = f"[TUNNEL:{container_port}]"
-    color = 'r' if is_error else 'd'
 
     # Log the output
     for line in text.split('\n'):
       if line.strip():
         self.Pd(f"{log_prefix} {line}", score=0)
+      # endif
+    # endfor line in text
 
     # Extract URL if not already found
     if container_port not in self.extra_tunnel_urls:
@@ -1675,8 +1666,10 @@ class ContainerAppRunnerPlugin(
       if match:
         url = match.group(0)
         self.extra_tunnel_urls[container_port] = url
-        self.P(f"Extra tunnel URL for port {container_port}: {url}", color='g')
-
+        self.P(f"Extra tunnel URL for port {container_port}: {url}")
+      # endif
+    # endif container_port
+    return
 
   def read_all_extra_tunnel_logs(self):
     """
@@ -1772,7 +1765,7 @@ class ContainerAppRunnerPlugin(
       )
 
       self.container_id = self.container.short_id
-      self.P(f"Container started (ID: {self.container.short_id})", color='g')
+      self.P(f"Container started (ID: {self.container.short_id})")
 
       # Container started successfully
       self._set_container_state(ContainerState.RUNNING)
@@ -1807,22 +1800,22 @@ class ContainerAppRunnerPlugin(
     Clears container and container_id attributes after removal.
     """
     if not self.container:
-      self.P("No container to stop", color='y')
+      self.P("No container to stop", color='r')
       return
 
     try:
       # Stop the container (gracefully)
-      self.P(f"Stopping container {self.container.short_id}...", color='b')
+      self.P(f"Stopping container {self.container.short_id}...")
       self.container.stop(timeout=5)
-      self.P(f"Container {self.container.short_id} stopped successfully", color='g')
+      self.P(f"Container {self.container.short_id} stopped successfully")
     except Exception as e:
       self.P(f"Error stopping container: {e}", color='r')
     # end try
 
     try:
-      self.P(f"Removing container {self.container.short_id}...", color='b')
+      self.P(f"Removing container {self.container.short_id}...")
       self.container.remove()
-      self.P(f"Container {self.container.short_id} removed successfully", color='g')
+      self.P(f"Container {self.container.short_id} removed successfully")
     except Exception as e:
       self.P(f"Error removing container: {e}", color='r')
     finally:
@@ -1846,7 +1839,7 @@ class ContainerAppRunnerPlugin(
     None
     """
     if not log_stream:
-      self.P("No log stream provided", color='y')
+      self.P("No log stream provided", color='r')
       return
 
     try:
@@ -1856,14 +1849,14 @@ class ContainerAppRunnerPlugin(
         try:
           log_str = log_bytes.decode("utf-8", errors="replace")
         except Exception as e:
-          self.P(f"Warning: Could not decode log bytes: {e}", color='y')
+          self.P(f"Warning: Could not decode log bytes: {e}", color='r')
           log_str = str(log_bytes)
 
-        self.P(f"[CONTAINER] {log_str}", color='d', end='')
+        self.P(f"[CONTAINER] {log_str}", end='')
         self.container_logs.append(log_str)
 
         if self._stop_event.is_set():
-          self.P("Log streaming stopped by stop event", color='y')
+          self.P("Log streaming stopped by stop event")
           break
     except Exception as e:
       self.P(f"Exception while streaming logs: {e}", color='r')
@@ -1946,7 +1939,7 @@ class ContainerAppRunnerPlugin(
       return
 
     try:
-      self.P(f"Running container exec command: {shell_cmd}", color='b')
+      self.P(f"Running container exec command: {shell_cmd}")
       exec_result = self.container.exec_run(
         ["sh", "-c", shell_cmd],
         stream=True,
@@ -2028,7 +2021,7 @@ class ContainerAppRunnerPlugin(
       return
 
     if not self.cfg_endpoint_url:
-      self.P("No endpoint URL configured, skipping health check", color='y')
+      self.P("No endpoint URL configured, skipping health check")
       return
 
     url = f"http://localhost:{self.port}{self.cfg_endpoint_url}"
@@ -2038,7 +2031,7 @@ class ContainerAppRunnerPlugin(
       status = resp.status_code
 
       if status == 200:
-        self.P(f"Health check: {url} -> {status} OK", color='g')
+        self.P(f"Health check: {url} -> {status} OK")
       else:
         self.P(f"Health check: {url} -> {status} Error", color='r')
     except requests.RequestException as e:
@@ -2093,7 +2086,7 @@ class ContainerAppRunnerPlugin(
 
       self.P(
         f"Container stopped (exit code: {exit_code}, reason: {stop_reason.value})",
-        color='y' if exit_code == 0 else 'r'
+        color='r' if exit_code != 0 else 'b'
       )
 
       self._commands_started = False
@@ -2149,7 +2142,7 @@ class ContainerAppRunnerPlugin(
           failures = self._tunnel_consecutive_failures.get(container_port, 0)
           self.P(
             f"Restarting extra tunnel for port {container_port} (attempt {failures})...",
-            color='y'
+            color='r'
           )
           self._start_extra_tunnel(container_port, token)
       else:
@@ -2267,14 +2260,14 @@ class ContainerAppRunnerPlugin(
       return None
 
     try:
-      self.P(f"Pulling image '{self.cfg_image}'...", color='b')
+      self.P(f"Pulling image '{self.cfg_image}'...")
       img = self.docker_client.images.pull(self.cfg_image)
 
       # docker-py may return Image or list[Image]
       if isinstance(img, list) and img:
         img = img[-1]
 
-      self.P(f"Successfully pulled image '{self.cfg_image}'", color='g')
+      self.P(f"Successfully pulled image '{self.cfg_image}'")
       return img
 
     except Exception as e:
@@ -2304,11 +2297,11 @@ class ContainerAppRunnerPlugin(
     """
     # Step 1: Authenticate with registry
     if not self._login_to_registry():
-      self.P("Registry authentication failed", color='y')
+      self.P("Registry authentication failed", color='r')
       # Try to use local image if authentication fails
       local_img = self._get_local_image()
       if local_img:
-        self.P(f"Using local image (registry login failed): {self.cfg_image}", color='y')
+        self.P(f"Using local image (registry login failed): {self.cfg_image}", color='r')
         return local_img
       raise RuntimeError("Failed to authenticate with registry and no local image available.")
 
@@ -2318,10 +2311,10 @@ class ContainerAppRunnerPlugin(
       return img
 
     # Step 3: Fallback to local image
-    self.P(f"Pull failed, checking for local image: {self.cfg_image}", color='b')
+    self.P(f"Pull failed, checking for local image: {self.cfg_image}", color='r')
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Using local image as fallback: {self.cfg_image}", color='y')
+      self.P(f"Using local image as fallback: {self.cfg_image}", color='r')
       return local_img
 
     # Step 4: No image available
@@ -2404,7 +2397,7 @@ class ContainerAppRunnerPlugin(
 
     if not self.current_image_hash:
       # First time - establish baseline
-      self.P(f"Establishing baseline image hash: {latest_hash}", color='b')
+      self.P(f"Establishing baseline image hash: {latest_hash}")
       self.current_image_hash = latest_hash
       return False
 
@@ -2425,7 +2418,7 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    self.P(f"New image version detected ({new_hash} != {self.current_image_hash}). Restarting container...", color='y')
+    self.P(f"New image version detected ({new_hash} != {self.current_image_hash}). Restarting container...")
 
     # Update current_image_hash BEFORE restart
     # This prevents infinite retry loops if restart fails
@@ -2437,7 +2430,7 @@ class ContainerAppRunnerPlugin(
     except Exception as e:
       self.P(f"Container restart failed after image update: {e}", color='r')
       # Hash already updated, won't retry this version
-      self.P(f"Image hash updated from {old_hash} to {new_hash}, but container restart failed", color='y')
+      self.P(f"Image hash updated from {old_hash} to {new_hash}, but container restart failed", color='r')
 
 
   def _check_image_updates(self, current_time=None):
@@ -2471,7 +2464,7 @@ class ContainerAppRunnerPlugin(
     # Get latest image hash
     latest_hash = self._get_latest_image_hash()
     if not latest_hash:
-      self.P("Failed to check for image updates (pull failed). Container continues running.", color='y')
+      self.P("Failed to check for image updates (pull failed). Container continues running.")
       return
 
     # Check if update is needed
@@ -2496,7 +2489,7 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    self.P("Restarting container from scratch...", color='b')
+    self.P("Restarting container from scratch...")
 
     # Preserve state before reset (prevents redundant operations after restart)
     preserved_failures = self._consecutive_failures
@@ -2575,11 +2568,11 @@ class ContainerAppRunnerPlugin(
     # Check if image exists locally
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Image '{self.cfg_image}' found locally", color='g')
+      self.P(f"Image '{self.cfg_image}' found locally")
       return True
 
     # Image not found locally, pull it
-    self.P(f"Image not found locally, pulling '{self.cfg_image}'...", color='b')
+    self.P(f"Image not found locally, pulling '{self.cfg_image}'...")
     img = self._pull_image_with_fallback()
     return img is not None
 
@@ -2621,7 +2614,7 @@ class ContainerAppRunnerPlugin(
     None
     """
     try:
-      self.P("Initial container launch...", color='b')
+      self.P("Initial container launch...")
 
       # Ensure image is available before starting container
       if not self._ensure_image_available():
@@ -2636,10 +2629,10 @@ class ContainerAppRunnerPlugin(
       self._start_container_log_stream()
       self._maybe_execute_build_and_run()
 
-      self.P("Container launched successfully", color='g')
+      self.P("Container launched successfully")
       self.P(self.container)
       if self.current_image_hash:
-        self.P(f"Current image hash: {self.current_image_hash}", color='d')
+        self.P(f"Current image hash: {self.current_image_hash}")
     except Exception as e:
       self.P(f"Could not start container: {e}", color='r')
     # end try
@@ -2739,7 +2732,7 @@ class ContainerAppRunnerPlugin(
       # Log paused message periodically instead of every process cycle
       current_time = self.time()
       if current_time - self._last_paused_log >= self.cfg_paused_state_log_interval:
-        self.P("Container is paused (manual stop). Send RESTART command to resume.", color='y')
+        self.P("Container is paused (manual stop). Send RESTART command to resume.")
         self._last_paused_log = current_time
       return
 
@@ -2795,7 +2788,7 @@ class ContainerAppRunnerPlugin(
       self.P(
         f"Container stopped. Restarting per policy '{policy.value}' "
         f"(attempt {self._consecutive_failures + 1})",
-        color='y'
+        color='r'
       )
       self._restart_container(self.stop_reason)
       return
