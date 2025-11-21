@@ -224,7 +224,8 @@ _CONFIG = {
   "SHOW_LOG_EACH" : 60,       # seconds to show logs
   "SHOW_LOG_LAST_LINES" : 5,  # last lines to show
   "MAX_LOG_LINES" : 10_000,   # max lines to keep in memory
-  "PAUSED_STATE_LOG_INTERVAL": 60,  # seconds between paused state log messages
+  # When container is STOPPED_MANUALLY (PAUSED state), this will define how often we log its existance
+  "PAUSED_STATE_LOG_INTERVAL": 60,
 
   # end of container-specific config options
 
