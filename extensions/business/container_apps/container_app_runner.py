@@ -194,7 +194,6 @@ _CONFIG = {
     "memory": "512m",  # e.g. "512m" for 512MB,
     "ports": []        # dict of host_port: container_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
-  "USE_CUDA": False,        # If True, will use nvidia runtime for GPU support
   "RESTART_POLICY": "always",  # "always", "on-failure", "unless-stopped", "no"
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
@@ -1744,27 +1743,23 @@ class ContainerAppRunnerPlugin(
       # pids_limit=
     )
 
-    device_requests = []
     if self._gpu_limit:
       gpus_info = self.log.gpu_info()
       if len(gpus_info) > 0:
-        run_kwargs['runtime'] = 'nvidia'
-        self.P(f"USE_CUDA is True and NVIDIA GPUs found, starting container with GPU support")
-      else:
-        self.P("Warning! USE_CUDA is True but no NVIDIA GPUs found, starting container without GPU support")
-      # endif available GPUs
-      device_requests = [
-        DeviceRequest(
+        self.P(f"GPU is requested and NVIDIA GPUs found, starting container with 1 GPU.")
+        run_kwargs["device_requests"] = [DeviceRequest(
           count=1,  # -1 = "all" devices
           capabilities=[['gpu']],  # what kind of device we want
           # optionally:
           # device_ids=['0', '1'],
           # options={'compute': 'all'}
-        )
-      ]
-      run_kwargs["device_requests"] = device_requests
+        )]
+      else:
+        self.P("Warning! GPU is requested but no NVIDIA GPUs found, starting container without GPU")
+      # endif available GPUs
     else:
-      self.P(f"Starting container without GPU support")
+      self.P(f"Starting container without GPU")
+    # endif
 
     try:
       if self._start_command:
