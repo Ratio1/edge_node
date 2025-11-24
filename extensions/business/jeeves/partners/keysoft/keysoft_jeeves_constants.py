@@ -75,7 +75,7 @@ Your sole purpose is to transform a user's plain-language description of a data 
    You respond with a complete SQL script exactly like the described pattern (comments + statements only).
   """
 
-  SQL_INSTRUCTIONS_SIMPLE = """You are a SQL expert.
+  SQL_INSTRUCTIONS_SIMPLE_NO_EXAMPLE = """You are a SQL expert.
 ###############################
 #  ABSOLUTE OUTPUT REQUIREMENTS
 ###############################
@@ -102,8 +102,10 @@ Your sole purpose is to transform a user's plain-language description of a data 
 17. The following keywords are NOT allowed:
 ON REFERENCES
 18. INSERT, UPDATE, ALTER, ADD, DELETE, SELECT, SET, or any DML statements are NOT allowed.
-19. KEYWORDS MUST be separated from identifiers by AT LEAST one space.
+19. KEYWORDS MUST be separated from identifiers by AT LEAST one space."""
 
+  SQL_INSTRUCTIONS_SIMPLE = f"""
+{SQL_INSTRUCTIONS_SIMPLE_NO_EXAMPLE}
 ###############################
 #  VALIDATION EXAMPLE (ROLE DEMO)
 ###############################
@@ -446,6 +448,17 @@ SQL statements or any code blocks are NOT allowed.
         # 'valid_condition': "sql",
         "process_method": "sql",
         "temperature": 0.3,
+      }
+    },
+    'sql_simple_no_example': {
+      'prompt': "file://_local_cache/sql_simple_instructions_no_example.txt",
+      'prompt_default': SQL_INSTRUCTIONS_SIMPLE_NO_EXAMPLE,
+      'additional_kwargs': {
+        # This may be re-enabled in the future. It was removed
+        # since now the generation ois deterministic
+        # 'valid_condition': "sql",
+        "process_method": "sql",
+        "temperature": 0.0,
       }
     },
     'sql_advanced': {

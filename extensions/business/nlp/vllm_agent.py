@@ -28,6 +28,10 @@ _CONFIG = {
 
   "USE_GPU": None,
 
+  "GPU_MEMORY_UTILIZATION": 0.75,  # 75%
+  "ALLOCATED_MEMORY": 12,  # in GB
+  "CPU_CORES": 2,
+
   "THREAD_MAX_WORKERS": 4,
   "DEFAULT_TEMPERATURE": 0.7,
   "DEFAULT_TOP_P": 0.9,
@@ -53,6 +57,11 @@ class _ReqEntry:
 
 REQUESTS_MUTEX = "vllm_requests_mutex"
 DEFAULT_REQUEST_TIMEOUT = 60  # seconds
+DEFAULT_GPU_MEMORY_UTILIZATION = 0.75  # 75%
+GPU_MEMORY_UTILIZATION_MIN_VALUE = 0.6  # 60%
+GPU_MEMORY_UTILIZATION_MAX_VALUE = 0.98  # 98%
+DEFAULT_ALLOCATED_MEMORY = 12  # in GB
+DEFAULT_NUM_CORES = 2
 
 
 class VllmAgentPlugin(BasePlugin, _NlpAgentMixin):
@@ -131,6 +140,32 @@ class VllmAgentPlugin(BasePlugin, _NlpAgentMixin):
     env_token = self.os_environ.get("EE_HF_TOKEN", None)
     return configured_token or env_token or ""
 
+  def get_gpu_memory_utilization(self, show_logs: bool = False):
+    configured_utilization = self.cfg_gpu_memory_utilization
+    if isinstance(configured_utilization, (int, float)):
+      if GPU_MEMORY_UTILIZATION_MIN_VALUE <= configured_utilization <= GPU_MEMORY_UTILIZATION_MAX_VALUE:
+        return configured_utilization
+      else:
+        log_str = f"Invalid GPU_MEMORY_UTILIZATION value: {configured_utilization}. "
+        log_str += f"Must be between {GPU_MEMORY_UTILIZATION_MIN_VALUE} and {GPU_MEMORY_UTILIZATION_MAX_VALUE}."
+        if show_logs:
+          self.P(log_str)
+      # endif valid range
+    # endif valid type
+    return DEFAULT_GPU_MEMORY_UTILIZATION
+
+  def get_allocated_memory(self):
+    configured_memory = self.cfg_allocated_memory
+    if isinstance(configured_memory, (int, float)) and configured_memory > 0:
+      return configured_memory
+    return DEFAULT_ALLOCATED_MEMORY  # in GB
+
+  def get_num_cpu_cores(self):
+    configured_cores = self.cfg_cpu_cores
+    if isinstance(configured_cores, int) and configured_cores > 0:
+      return configured_cores
+    return DEFAULT_NUM_CORES
+
   """VLLM CONTAINER MANAGEMENT METHODS"""
   if True:
     def __get_all_used_ports(self):
@@ -160,7 +195,8 @@ class VllmAgentPlugin(BasePlugin, _NlpAgentMixin):
       """
       base_command = f"--host 0.0.0.0 --port {port} --model {model_name}"
       cpu_cmd_suffix = f"--dtype float16 --disable-frontend-multiprocessing --disable-async-output-proc"
-      gpu_cmd_suffix = f"--kv-cache-dtype fp8 --gpu-memory-utilization 0.75 --quantization bitsandbytes"
+      gpu_mem_util = self.get_gpu_memory_utilization(show_logs=False)
+      gpu_cmd_suffix = f"--kv-cache-dtype fp8 --gpu-memory-utilization {gpu_mem_util} --quantization bitsandbytes"
       cmd_suffix = gpu_cmd_suffix if use_gpu else cpu_cmd_suffix
       return f"{base_command} {cmd_suffix}"
 
@@ -195,15 +231,15 @@ class VllmAgentPlugin(BasePlugin, _NlpAgentMixin):
 
       res["PORT"] = self.container_port
       # TODO: review this
+      allocated_memory = self.get_allocated_memory()
       res["CONTAINER_RESOURCES"] = {
-        "cpu": 2,
+        "cpu": self.get_num_cpu_cores(),
         "gpu": 1 if use_gpu else 0,
-        "memory": "10g",
+        "memory": f"{allocated_memory}g",
         "ports": {
           str(self.container_port): str(self.container_port),
         }
       }
-      res["USE_CUDA"] = use_gpu
       res["IMAGE"] = "vllm/vllm-openai:latest" if use_gpu else "substratusai/vllm:main-cpu"
       res["ENV"] = {
         "HUGGING_FACE_HUB_TOKEN": self.get_hugging_face_api_token(),
@@ -310,6 +346,13 @@ class VllmAgentPlugin(BasePlugin, _NlpAgentMixin):
       self.persistence_save()
       return
 
+    def reset_container_state(self):
+      self.container_port = None
+      self.launched_container_config = None
+      self.launched_container_pipeline_name = None
+      self.persistence_save()
+      return
+
     def maybe_clean_old_container_pipeline(self, pipeline_name: str = None):
       deletion_started = False
       pipeline_name = pipeline_name or self.pipeline_name_to_cleanup
@@ -321,6 +364,7 @@ class VllmAgentPlugin(BasePlugin, _NlpAgentMixin):
       current_pipeline_names = [p["NAME"] for p in current_node_pipeline]
       if pipeline_name not in current_pipeline_names:
         self.P(f"vLLM container pipeline: {pipeline_name} not found among current pipelines, assuming already deleted.")
+        self.reset_container_state()
         return deletion_started
       self.P(f"Stopping vLLM container pipeline: {pipeline_name}")
       self.cmdapi_stop_pipeline(
@@ -332,10 +376,7 @@ class VllmAgentPlugin(BasePlugin, _NlpAgentMixin):
       extracted_pipeline_name = (self.launched_container_config or {}).get("NAME", None)
       launched_pipeline_name = launched_pipeline_name or extracted_pipeline_name
       if pipeline_name == launched_pipeline_name:
-        self.launched_container_config = None
-        self.launched_container_pipeline_name = None
-        self.container_port = None
-        self.persistence_save()
+        self.reset_container_state()
       # endif launched container
       deletion_started = True
       return deletion_started
@@ -587,10 +628,7 @@ class VllmAgentPlugin(BasePlugin, _NlpAgentMixin):
         node_address=None,
         name=self.launched_container_pipeline_name
       )
-      self.launched_container_pipeline_name = None
-      self.launched_container_config = None
-      self.container_port = None
-      self.persistence_save()
+      self.reset_container_state()
     # endif launched container pipeline
     super(VllmAgentPlugin, self).on_close()
     return
