@@ -139,6 +139,6 @@ class LlmTokenizerMixin(object):
     from_template = self.tokenizer.apply_chat_template(
       chat, tokenize=False,
       add_generation_prompt=self.cfg_add_generation_prompt,
-      date_string=date_string
+      # date_string=date_string
     )
     return from_template

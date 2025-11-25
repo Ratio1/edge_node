@@ -60,7 +60,7 @@ The following SQL DDL statement best answers the request `{user_request}`:
       prompt = self.tokenizer.apply_chat_template(
         chat, tokenize=False,
         add_generation_prompt=self.cfg_add_generation_prompt,
-        date_string=date_string,
+        # date_string=date_string,
       )
     # endif prompt is None
     self.P(f"Generated prompt:\n{prompt}")
