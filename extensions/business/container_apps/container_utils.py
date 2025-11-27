@@ -16,7 +16,21 @@ class _ContainerUtilsMixin:
   ### START CONTAINER MIXIN METHODS ###
   
   def _handle_config_restart(self, restart_callable):
-    """Common handler to restart container instances when configuration changes."""
+    """
+    Handle container restart when configuration changes.
+
+    Stops the current container and invokes the provided restart callable
+    to reinitialize with new configuration.
+
+    Parameters
+    ----------
+    restart_callable : callable
+        Function to call after stopping container to perform restart
+
+    Returns
+    -------
+    None
+    """
     self.P(f"Received an updated config for {self.__class__.__name__}")
     self._stop_container_and_save_logs_to_disk()
     restart_callable()
@@ -79,14 +93,27 @@ class _ContainerUtilsMixin:
     dct_env = {
       "CONTAINER_NAME": self.container_name,
       "EE_CONTAINER_NAME": self.container_name,
+      "R1EN_CONTAINER_NAME": self.container_name,
       "EE_HOST_IP": localhost_ip,
+      "R1EN_HOST_IP": localhost_ip,
       "EE_HOST_ID": self.ee_id,
+      "R1EN_HOST_ID": self.ee_id,
       "EE_HOST_ADDR": self.ee_addr,
+      "R1EN_HOST_ADDR": self.ee_addr,
       "EE_HOST_ETH_ADDR": self.bc.eth_address,
+      "R1EN_HOST_ETH_ADDR": self.bc.eth_address,
       "EE_EVM_NET": self.bc.get_evm_network(),
+      "R1EN_EVM_NET": self.bc.get_evm_network(),
       "EE_CHAINSTORE_API_URL": f"http://{localhost_ip}:31234",
+      "R1EN_CHAINSTORE_API_URL": f"http://{localhost_ip}:31234",
       "EE_R1FS_API_URL": f"http://{localhost_ip}:31235",
+      "R1EN_R1FS_API_URL": f"http://{localhost_ip}:31235",
       "EE_CHAINSTORE_PEERS": str_chainstore_peers,
+      "R1EN_CHAINSTORE_PEERS": str_chainstore_peers,
+      
+      # OBSERVATION: From now on only add new env vars with R1EN_ prefix
+      #              to avoid missunderstandings with EE_ prefixed vars that
+      #              are legacy from the Edge Node environment itself.
     }
 
     return dct_env
@@ -181,23 +208,58 @@ class _ContainerUtilsMixin:
 
 
   def _setup_dynamic_env_var_host_ip(self):
-    """ Definition for `host_ip` dynamic env var type. """
+    """
+    Get host IP address for dynamic environment variable.
+
+    Returns
+    -------
+    str
+        The localhost IP address
+    """
     return self.log.get_localhost_ip()
 
   def _setup_dynamic_env_var_some_other_calc_type(self):
-    """ Example definition for `some_other_calc_type` dynamic env var type. """
+    """
+    Example dynamic environment variable calculator.
+
+    This is an example method showing how to implement custom dynamic
+    environment variable types.
+
+    Returns
+    -------
+    str
+        Example static value
+    """
     return "some_other_value"
 
 
   def _configure_dynamic_env(self):
     """
-    Set up dynamic environment variables based on the configuration.
+    Set up dynamic environment variables based on configuration.
 
-    This method iterates over the `cfg_dynamic_env` dictionary, which contains
-    environment variable names as keys and a list of value parts as values. Each
-    value part specifies its type (e.g., "static" or "host_ip") and its value.
-    The method constructs the final value for each environment variable by
-    concatenating its parts.
+    This method processes the cfg_dynamic_env dictionary, constructing
+    environment variable values by concatenating parts that can be either
+    static strings or dynamically computed values.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Dynamic parts are computed by calling methods named _setup_dynamic_env_var_{type}.
+    For example, a part with type "host_ip" calls _setup_dynamic_env_var_host_ip().
+
+    Examples
+    --------
+    cfg_dynamic_env format:
+        {
+          "MY_VAR": [
+            {"type": "static", "value": "prefix_"},
+            {"type": "host_ip"},
+            {"type": "static", "value": "_suffix"}
+          ]
+        }
     """
     if len(self.cfg_dynamic_env):
       for variable_name, variable_value_list  in self.cfg_dynamic_env.items():
@@ -314,7 +376,7 @@ class _ContainerUtilsMixin:
 
     container_resources = self.cfg_container_resources
     if isinstance(container_resources, dict) and len(container_resources) > 0:
-      self._cpu_limit = container_resources.get("cpu", DEFAULT_CPU_LIMIT)
+      self._cpu_limit = int(container_resources.get("cpu", DEFAULT_CPU_LIMIT))
       self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
       self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
 
@@ -439,7 +501,25 @@ class _ContainerUtilsMixin:
     return
 
   def _set_directory_permissions(self, path, mode=0o777):
-    """Ensure directory permissions allow non-root container access."""
+    """
+    Set directory permissions to allow non-root container access.
+
+    Parameters
+    ----------
+    path : str
+        Directory path to modify
+    mode : int, optional
+        Permission mode in octal notation (default: 0o777)
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Failures are logged but do not raise exceptions. This is by design
+    to allow containers to attempt access even if permission changes fail.
+    """
     try:
       os.chmod(path, mode)
     except PermissionError:
@@ -649,7 +729,23 @@ class _ContainerUtilsMixin:
     return
 
   def _validate_container_config(self):
-    """Validate container configuration before starting."""
+    """
+    Validate container configuration before starting container.
+
+    Checks that required configuration fields are present and properly
+    formatted, including IMAGE, CONTAINER_RESOURCES, and ENV.
+
+    Returns
+    -------
+    bool
+        Always returns True if validation passes
+
+    Raises
+    ------
+    ValueError
+        If IMAGE is missing, not a string, or if CONTAINER_RESOURCES
+        or ENV have invalid types
+    """
     if not self.cfg_image:
       raise ValueError("IMAGE is required")
 
@@ -669,7 +765,19 @@ class _ContainerUtilsMixin:
     return True
 
   def _get_container_health_status(self, container=None):
-    """Get container health status using Docker client."""
+    """
+    Get container health status using Docker client.
+
+    Parameters
+    ----------
+    container : docker.models.containers.Container, optional
+        Container object to check. If None, uses self.container
+
+    Returns
+    -------
+    str
+        Container status: 'running', 'stopped', 'not_started', or 'error'
+    """
     if container is None:
       container = getattr(self, 'container', None)
 
@@ -685,7 +793,24 @@ class _ContainerUtilsMixin:
 
 
   def _validate_endpoint_config(self):
-    """Validate endpoint configuration for health checks."""
+    """
+    Validate endpoint configuration for health checks.
+
+    Performs security and format validation on the configured
+    endpoint URL.
+
+    Returns
+    -------
+    bool
+        True if endpoint configuration is valid, False otherwise
+
+    Notes
+    -----
+    Validation checks include:
+    - URL is a string
+    - URL starts with '/'
+    - URL does not contain path traversal sequences (..)
+    """
     if not hasattr(self, 'cfg_endpoint_url') or not self.cfg_endpoint_url:
       return False
 
@@ -705,7 +830,19 @@ class _ContainerUtilsMixin:
     return True
 
   def _get_container_info(self):
-    """Get comprehensive container information."""
+    """
+    Get comprehensive container information.
+
+    Collects container metadata including ID, status, ports, and volumes
+    into a single dictionary.
+
+    Returns
+    -------
+    dict
+        Container information with keys: container_id, container_name,
+        image, status, port, start_time, and optionally extra_ports
+        and volumes
+    """
     container = getattr(self, 'container', None)
     info = {
       'container_id': container.short_id if container else None,
@@ -725,7 +862,16 @@ class _ContainerUtilsMixin:
     return info
 
   def _log_container_info(self):
-    """Log comprehensive container information."""
+    """
+    Log comprehensive container information to console.
+
+    Formats and prints container metadata obtained from
+    _get_container_info() in a readable format.
+
+    Returns
+    -------
+    None
+    """
     info = self._get_container_info()
     self.P("Container Information:", color='b')
     for key, value in info.items():
@@ -733,7 +879,19 @@ class _ContainerUtilsMixin:
         self.P(f"  {key}: {value}", color='d')
 
   def _validate_port_allocation(self, port):
-    """Validate that a port is properly allocated."""
+    """
+    Validate that a port number is properly allocated.
+
+    Parameters
+    ----------
+    port : int
+        Port number to validate
+
+    Returns
+    -------
+    bool
+        True if port is valid (1-65535), False otherwise
+    """
     if not port:
       return False
 
@@ -746,7 +904,15 @@ class _ContainerUtilsMixin:
     return True
 
   def _safe_get_container_stats(self):
-    """Safely get container statistics without raising exceptions."""
+    """
+    Safely get container statistics without raising exceptions.
+
+    Returns
+    -------
+    dict or None
+        Dictionary containing container stats (id, status, running, image,
+        created, ports) or None if container doesn't exist or error occurs
+    """
     container = getattr(self, 'container', None)
     if not container:
       return None
@@ -766,20 +932,39 @@ class _ContainerUtilsMixin:
       return None
 
   def _validate_docker_image_format(self, image_name):
-    """Validate Docker image name format."""
+    """
+    Validate Docker image name format.
+
+    Parameters
+    ----------
+    image_name : str
+        Docker image name to validate
+
+    Returns
+    -------
+    bool
+        True if image name format is valid, False otherwise
+
+    Notes
+    -----
+    Validation checks:
+    - Must be a string
+    - Must contain at least one ':' (tag) or '/' (repository)
+    - Must not contain whitespace characters
+    """
     if not isinstance(image_name, str):
       return False
-    
+
     # Basic validation - should contain at least one colon or slash
     if ':' not in image_name and '/' not in image_name:
       return False
-    
+
     # Check for invalid characters
     invalid_chars = [' ', '\t', '\n', '\r']
     for char in invalid_chars:
       if char in image_name:
         return False
-    
+
     return True
 
   ### END COMMON CONTAINER UTILITY METHODS ###
@@ -822,8 +1007,14 @@ class _ContainerUtilsMixin:
     This handles the case where CONTAINER_RESOURCES["ports"] is empty but
     EXTRA_TUNNELS defines ports that need to be exposed.
 
-    Args:
-      container_ports: List of container ports to allocate
+    Parameters
+    ----------
+    container_ports : list of int
+        List of container ports to allocate
+
+    Returns
+    -------
+    None
     """
     self.P(f"Allocating host ports for {len(container_ports)} EXTRA_TUNNELS ports...", color='b')
 

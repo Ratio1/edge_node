@@ -9,6 +9,18 @@ AI_ENGINES['llm'] = {
   'SERVING_PROCESS': 'llama_v31'
 }
 
+AI_ENGINES['llama_cpp_small'] = {
+  'SERVING_PROCESS': 'llama_cpp_llama_1b'
+}
+
+AI_ENGINES['llama_cpp_medium'] = {
+  'SERVING_PROCESS': 'llama_cpp_llama_3b'
+}
+
+AI_ENGINES['llama_cpp_large'] = {
+  'SERVING_PROCESS': 'llama_cpp_llama_8b'
+}
+
 AI_ENGINES['llm_reason'] = {
   'SERVING_PROCESS': 'deepseek_r1_qwen_7b'
 }
@@ -36,4 +48,8 @@ AI_ENGINES['llm_ext'] = {
 AI_ENGINES['doc_embed'] = {
   'SERVING_PROCESS': 'mxbai_embed'
 }
+
+# AI_ENGINES['cerviguard_analyzer'] = {
+#   'SERVING_PROCESS': 'cerviguard_image_analyzer'
+# }
 

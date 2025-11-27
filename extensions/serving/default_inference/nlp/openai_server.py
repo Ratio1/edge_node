@@ -118,7 +118,7 @@ class OpenaiServing(BaseServingProcess):
       )
 
       response = self.model.chat.completions.create(
-        model=self.cfg_model_name,
+        model=self.get_model_name(),
         messages=messages,
         **predict_kwargs
       )
@@ -127,7 +127,7 @@ class OpenaiServing(BaseServingProcess):
       dct_result = {
         LlmCT.TEXT: response,
         **additional,
-        'MODEL_NAME': self.cfg_model_name,
+        'MODEL_NAME': self.get_model_name(),
       }
       results.append(dct_result)
     # endfor preprocessed_batch

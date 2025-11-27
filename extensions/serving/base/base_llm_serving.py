@@ -124,6 +124,7 @@ _CONFIG = {
   "DEFAULT_TEMPERATURE" : 0.7,
   "DEFAULT_TOP_P"      : 1,
   "DEFAULT_MAX_TOKENS" : 2048,
+  "DEFAULT_NUM_BEAMS" : 1,
   "SKIP_ERRORS"           : True,
   "RELEVANT_SIGNATURES": None,
   "GENERATION_SEED": 42,  # Seed for generation, can be set to None for random seed
@@ -178,7 +179,7 @@ class BaseLlmServing(
     self.model = None
     self.tokenizer = None
     self.device = None
-    self.__tps = self.deque(maxlen=128)
+    self._tps = self.deque(maxlen=128)
     self.padding_id = None
     self.processed_requests = set()
     super(BaseLlmServing, self).__init__(**kwargs)
@@ -200,10 +201,12 @@ class BaseLlmServing(
     cfg_hf_token = self.cfg_hf_token
     return cfg_hf_token or env_hf_token
 
+  def get_model_name(self):
+    return self.cfg_model_name
 
   @property
   def hf_model(self):
-    return self.cfg_model_name
+    return self.get_model_name()
 
 
   @property
@@ -235,7 +238,7 @@ class BaseLlmServing(
 
   def get_local_path(self):
     models_cache = self.log.get_models_folder()
-    model_name = 'models/{}'.format(self.cfg_model_name)
+    model_name = 'models/{}'.format(self.get_model_name())
     model_subfolder = model_name.replace('/', '--')
     path = self.os_path.join(models_cache, model_subfolder)
     if self.os_path.isdir(path):
@@ -301,7 +304,7 @@ class BaseLlmServing(
       self.P("  Found HuggingFace token '{}'".format(obfuscated))
     #endif no token
 
-    if self.cfg_model_name is None:
+    if self.get_model_name() is None:
       msg = "No model name found. Please set it in config `MODEL_NAME`"
       raise ValueError(msg)
     #endif no model name
@@ -385,16 +388,20 @@ class BaseLlmServing(
   def _setup_llm(self):
     return
 
+  def get_configured_device(self):
+    configured_device = self.cfg_default_device
+    configured_device = (configured_device or 'cpu').lower()
+    return configured_device
 
   def _setup_device(self):
     # check if GPU is available & log
     gpu_info = self.log.gpu_info()
-    if len(gpu_info) == 0:
+    configured_device = self.get_configured_device()
+    if len(gpu_info) == 0 or configured_device == 'cpu':
       self.device = th.device('cpu')
     else:
       # try default device
       # TODO: review method
-      configured_device = self.cfg_default_device
       if configured_device in ["cuda", "gpu"]:
         configured_device = "cuda:0"
       # endif configured_device
@@ -422,11 +429,16 @@ class BaseLlmServing(
   def _get_device_map(self):
     # TODO: Rewrite to fix for multiple GPUs
     device_map = "auto"
+    configured_device = self.get_configured_device()
+    if configured_device == 'cpu':
+      device_map = 'cpu'
     return device_map
 
   def check_relevant_input(self, input_dict: dict):
     inp_payload_path = input_dict.get(self.ct.PAYLOAD_DATA.EE_PAYLOAD_PATH, [None, None, None, None])
     inp_signature = inp_payload_path[2]
+    explicit_signature = input_dict.get(self.ct.SIGNATURE, None)
+    inp_signature = inp_signature or explicit_signature
     normalized_signature = str(inp_signature).upper() if inp_signature is not None else None
 
     if normalized_signature not in self.get_relevant_signatures():
@@ -524,10 +536,10 @@ class BaseLlmServing(
       }
       request_id = jeeves_content.get(LlmCT.REQUEST_ID, None)
       messages = jeeves_content.get(LlmCT.MESSAGES, [])
-      temperature = jeeves_content.get(LlmCT.TEMPERATURE) or self.cfg_default_temperature
-      top_p = jeeves_content.get(LlmCT.TOP_P) or self.cfg_default_top_p
-      max_tokens = jeeves_content.get(LlmCT.MAX_TOKENS) or self.cfg_default_max_tokens
-      repetition_penalty = jeeves_content.get("REPETITION_PENALTY", self.cfg_repetition_penalty)
+      temperature = jeeves_content.setdefault(LlmCT.TEMPERATURE, self.cfg_default_temperature)
+      top_p = jeeves_content.setdefault(LlmCT.TOP_P, self.cfg_default_top_p)
+      max_tokens = jeeves_content.setdefault(LlmCT.MAX_TOKENS, self.cfg_default_max_tokens)
+      repetition_penalty = jeeves_content.setdefault("REPETITION_PENALTY", self.cfg_repetition_penalty)
       request_context = jeeves_content.get(LlmCT.CONTEXT, None)
       valid_condition = jeeves_content.get(LlmCT.VALID_CONDITION, None)
       process_method = jeeves_content.get(LlmCT.PROCESS_METHOD, None)
@@ -737,7 +749,10 @@ class BaseLlmServing(
     if fence_match:
       return fence_match.group(1).strip()  # exclude the back-ticks
 
-    # ── 3. Nothing found → give back the original string
+    # ── 3. Nothing found → give back the original string and maybe remove ```
+    if text.strip().endswith("```"):
+      text = text.strip().strip("```").strip()
+    # endif text endswith ```
     return text
 
   def remove_sql_comments(self, text: str):
@@ -834,13 +849,13 @@ class BaseLlmServing(
       np_batch_tokens = batch_tokens.cpu().numpy()
       self.th_utils.clear_cache()
 
-      # Calculate number of generated token per seconds and add it to __tps
+      # Calculate number of generated token per seconds and add it to _tps
       # in order to track inference performance. Generated padding is not
       # counted since it is an artefact of the batching strategy.
       batch_y_size = np_batch_tokens.shape[1]
       num_generated_toks = (yhat[:, batch_y_size:] != self.padding_id).astype(self.np.int32).sum().item()
       num_tps = num_generated_toks / elapsed
-      self.__tps.append(num_tps)
+      self._tps.append(num_tps)
       self.P("Model ran at {} tokens per second".format(num_tps))
 
       # Decode each output in the batch, omitting the input tokens.
@@ -932,7 +947,7 @@ class BaseLlmServing(
         # LlmCT.TPS  : tps,
         **preds_batch[LlmCT.ADDITIONAL][i],
         # TODO: find a way to send the model metadata to the plugin, other than through the inferences.
-        'MODEL_NAME': self.cfg_model_name
+        'MODEL_NAME': self.get_model_name()
       }
       result.append(dct_result)
     # endfor each text
@@ -947,7 +962,7 @@ class BaseLlmServing(
           "IS_VALID": False,
           LlmCT.TEXT: "",
           LlmCT.PRMP: "",
-          'MODEL_NAME': self.cfg_model_name
+          'MODEL_NAME': self.get_model_name()
         })
     # endfor total inputs
     return final_result

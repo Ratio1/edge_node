@@ -68,13 +68,79 @@ import threading
 import time
 import socket
 import subprocess
+from enum import Enum
+
+from docker.types import DeviceRequest
 
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResponseMixin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
-__VER__ = "0.4.0"
+__VER__ = "0.6.1"
+
+from extensions.utils.memory_formatter import parse_memory_to_mb
+
+# Persistent state filename (general purpose)
+_PERSISTENT_STATE_FILE = "container_persistent_state.pkl"
+
+
+class ContainerState(Enum):
+  """Container lifecycle states for proper state machine management."""
+  UNINITIALIZED = "uninitialized"  # Container not yet created
+  STARTING = "starting"             # Container is being launched
+  RUNNING = "running"               # Container is running normally
+  STOPPING = "stopping"             # Container is being stopped
+  STOPPED = "stopped"               # Container stopped gracefully
+  FAILED = "failed"                 # Container crashed or exited with error
+  RESTARTING = "restarting"         # Container is being restarted
+  PAUSED = "paused"                 # Manual pause requested
+
+
+class StopReason(Enum):
+  """
+  Reasons why a container stopped - used for restart policy decisions.
+
+  Two categories of stop reasons:
+  1. **Unplanned stops** (subject to RESTART_POLICY):
+     - CRASH, NORMAL_EXIT, HEALTH_CHECK_FAILED, UNKNOWN
+     - Policy determines if restart happens
+
+  2. **Planned restarts** (bypass RESTART_POLICY):
+     - IMAGE_UPDATE, CONFIG_UPDATE, EXTERNAL_UPDATE, MANUAL_STOP
+     - These trigger restarts via _perform_periodic_monitoring()
+     - Always executed regardless of policy (except MANUAL_STOP which pauses)
+
+  Note: Subclasses can use EXTERNAL_UPDATE for domain-specific triggers
+        (e.g., Git updates, database migrations, file changes)
+  """
+  # Unplanned stops
+  UNKNOWN = "unknown"
+  CRASH = "crash"                   # Container exited with non-zero code
+  NORMAL_EXIT = "normal_exit"       # Container exited with code 0
+  HEALTH_CHECK_FAILED = "health_check_failed"  # Health check failures
+
+  # Planned restarts
+  MANUAL_STOP = "manual_stop"       # User requested stop via command
+  IMAGE_UPDATE = "image_update"     # Restarting for image update
+  CONFIG_UPDATE = "config_update"   # Restarting for config change
+  EXTERNAL_UPDATE = "external_update"  # Generic external trigger (VCS, DB, file watch, etc.)
+
+
+class RestartPolicy(Enum):
+  """
+  Container restart policies (Docker-compatible).
+
+  Policies:
+    NO: Never restart the container
+    ALWAYS: Always restart unless manually stopped
+    ON_FAILURE: Only restart on non-zero exit codes
+    UNLESS_STOPPED: Always restart unless explicitly stopped by user
+  """
+  NO = "no"
+  ALWAYS = "always"
+  ON_FAILURE = "on-failure"
+  UNLESS_STOPPED = "unless-stopped"
 
 
 _CONFIG = {
@@ -124,14 +190,28 @@ _CONFIG = {
   "PORT": None,             # internal container port if it's a web app (int)
   "CONTAINER_RESOURCES" : {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
-    "gpu": 0,
+    "gpu": 0,          # 0 - no GPU, 1 - use GPU
     "memory": "512m",  # e.g. "512m" for 512MB,
     "ports": []        # dict of host_port: container_port mappings (e.g. {8080: 8081}) or list of container ports (e.g. [8080, 9000])
   },
-  "RESTART_POLICY": "always",  # "always" will restart the container if it stops
+  "RESTART_POLICY": "always",  # "always", "on-failure", "unless-stopped", "no"
   "IMAGE_PULL_POLICY": "always",  # "always" will always pull the image
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
   "AUTOUPDATE_INTERVAL": 100,
+
+  # Restart retry configuration (exponential backoff)
+  "RESTART_MAX_RETRIES": 5,     # Max consecutive restart attempts before giving up (0 = unlimited)
+  "RESTART_BACKOFF_INITIAL": 2,  # Initial backoff delay in seconds
+  "RESTART_BACKOFF_MAX": 300,    # Maximum backoff delay in seconds (5 minutes)
+  "RESTART_BACKOFF_MULTIPLIER": 2,  # Backoff multiplier for exponential backoff
+  "RESTART_RESET_INTERVAL": 300,  # Reset retry count after this many seconds of successful run
+
+  # Tunnel restart retry configuration (exponential backoff)
+  "TUNNEL_RESTART_MAX_RETRIES": 5,     # Max consecutive tunnel restart attempts (0 = unlimited)
+  "TUNNEL_RESTART_BACKOFF_INITIAL": 2,  # Initial tunnel backoff delay in seconds
+  "TUNNEL_RESTART_BACKOFF_MAX": 60,     # Maximum tunnel backoff delay in seconds (1 minute)
+  "TUNNEL_RESTART_BACKOFF_MULTIPLIER": 2,  # Tunnel backoff multiplier
+  "TUNNEL_RESTART_RESET_INTERVAL": 300,  # Reset tunnel retry count after successful run
 
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   "FILE_VOLUMES": {},           # dict mapping host paths to file configs: {"host_path": {"content": "...", "mounting_point": "..."}}
@@ -144,6 +224,8 @@ _CONFIG = {
   "SHOW_LOG_EACH" : 60,       # seconds to show logs
   "SHOW_LOG_LAST_LINES" : 5,  # last lines to show
   "MAX_LOG_LINES" : 10_000,   # max lines to keep in memory
+  # When container is STOPPED_MANUALLY (PAUSED state), this will define how often we log its existance
+  "PAUSED_STATE_LOG_INTERVAL": 60,
 
   # end of container-specific config options
 
@@ -177,16 +259,33 @@ class ContainerAppRunnerPlugin(
   def port(self):
       return getattr(self, '_port', None)
 
+
   @port.setter
   def port(self, value):
       self._port = value
 
+
   def Pd(self, s, *args, score=-1, **kwargs):
     """
-    Print a message to the console.
+    Print debug message if verbosity level allows.
+
+    Parameters
+    ----------
+    s : str
+        Message to print
+    score : int, optional
+        Verbosity threshold (default: -1). Message prints if cfg_car_verbose > score
+    *args
+        Additional positional arguments passed to P()
+    **kwargs
+        Additional keyword arguments passed to P()
+
+    Returns
+    -------
+    None
     """
     if self.cfg_car_verbose > score:
-      s = "[DEPDBG] " + s
+      s = "[DEBUG] " + s
       self.P(s, *args, **kwargs)
     return
 
@@ -195,7 +294,25 @@ class ContainerAppRunnerPlugin(
     self.container = None
     self.container_id = None
     self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
-    self.docker_client = docker.from_env()
+
+    # Initialize Docker client with proper error handling
+    try:
+      self.docker_client = docker.from_env()
+      # Verify Docker daemon is accessible by pinging it
+      self.docker_client.ping()
+    except docker.errors.DockerException as e:
+      raise RuntimeError(
+        f"Failed to connect to Docker daemon: {e}\n"
+        "Please ensure Docker is installed and running:\n"
+        "  - Check: systemctl status docker (Linux) or Docker Desktop (Windows/Mac)\n"
+        "  - Start: systemctl start docker (Linux) or start Docker Desktop\n"
+        "  - Verify: docker ps"
+      ) from e
+    except Exception as e:
+      raise RuntimeError(
+        f"Unexpected error initializing Docker client: {e}\n"
+        "Please verify Docker installation and permissions."
+      ) from e
 
     self.container_logs = self.deque(maxlen=self.cfg_max_log_lines)
 
@@ -207,7 +324,16 @@ class ContainerAppRunnerPlugin(
     self.env = {}
     self.dynamic_env = {}
 
-    self._is_manually_stopped = False # Flag to indicate if the container was manually stopped
+    # Container state machine
+    self.container_state = ContainerState.UNINITIALIZED
+    self.stop_reason = StopReason.UNKNOWN
+
+    # Restart policy and retry logic
+    self._consecutive_failures = 0
+    self._last_failure_time = 0
+    self._next_restart_time = 0
+    self._restart_backoff_seconds = 0
+    self._last_successful_start = None
 
     # Initialize tunnel process
     self.tunnel_process = None
@@ -218,6 +344,12 @@ class ContainerAppRunnerPlugin(
     self.extra_tunnel_log_readers = {}  # Dict: {container_port: {"stdout": reader, "stderr": reader}}
     self.extra_tunnel_configs = {}    # Dict: {container_port: token}
     self.extra_tunnel_start_times = {}  # Dict: {container_port: timestamp}
+
+    # Tunnel restart backoff tracking (per port)
+    self._tunnel_consecutive_failures = {}  # Dict: {container_port: failure_count}
+    self._tunnel_last_failure_time = {}     # Dict: {container_port: timestamp}
+    self._tunnel_next_restart_time = {}     # Dict: {container_port: timestamp}
+    self._tunnel_last_successful_start = {} # Dict: {container_port: timestamp}
 
     # Log streaming
     self.log_thread = None
@@ -231,6 +363,7 @@ class ContainerAppRunnerPlugin(
     self._last_endpoint_check = 0
     self._last_image_check = 0
     self._last_extra_tunnels_ping = 0
+    self._last_paused_log = 0  # Track when we last logged the paused message
 
     # Image update tracking
     self.current_image_hash = None
@@ -242,12 +375,549 @@ class ContainerAppRunnerPlugin(
 
     return
 
+
   def _after_reset(self):
-    """Hook for subclasses to reset additional state."""
+    """
+    Hook for subclasses to reset additional state.
+
+    Called after parent reset to allow subclasses to initialize
+    their own state variables.
+
+    Returns
+    -------
+    None
+    """
     return
 
+  # ============================================================================
+  # Persistent State Management (General Purpose)
+  # ============================================================================
+
+
+  def _load_persistent_state(self):
+    """
+    Load persistent state from disk.
+
+    Returns
+    -------
+    dict
+        Persistent state dictionary (empty dict if no state exists)
+    """
+    state = self.diskapi_load_pickle_from_data(_PERSISTENT_STATE_FILE)
+    return state if state is not None else {}
+
+
+  def _save_persistent_state(self, **kwargs):
+    """
+    Save or update persistent state fields.
+
+    Parameters
+    ----------
+    **kwargs
+        State fields to save/update (e.g., manually_stopped=True)
+
+    Returns
+    -------
+    None
+
+    Examples
+    --------
+    >>> self._save_persistent_state(manually_stopped=True, last_config_hash="abc123")
+    """
+    # Load existing state
+    state = self._load_persistent_state()
+    # Update with new values
+    state.update(kwargs)
+    # Save back to disk
+    self.diskapi_save_pickle_to_data(state, _PERSISTENT_STATE_FILE)
+    return
+
+
+  def _load_manual_stop_state(self):
+    """
+    Load manual stop state from persistent storage.
+
+    Returns
+    -------
+    bool
+        True if container was manually stopped, False otherwise
+    """
+    state = self._load_persistent_state()
+    return state.get("manually_stopped", False)
+
+
+  def _clear_manual_stop_state(self):
+    """
+    Clear manual stop state (called on RESTART command).
+
+    Returns
+    -------
+    None
+    """
+    self._save_persistent_state(manually_stopped=False)
+    return
+
+  # ============================================================================
+  # End of Persistent State Management
+  # ============================================================================
+
+  # ============================================================================
+  # Restart Policy and Retry Logic
+  # ============================================================================
+
+
+  def _normalize_restart_policy(self, policy):
+    """
+    Normalize restart policy to RestartPolicy enum.
+
+    Parameters
+    ----------
+    policy : str, RestartPolicy, or None
+        Policy string, enum, or None
+
+    Returns
+    -------
+    RestartPolicy
+        Normalized RestartPolicy enum value
+    """
+    if policy is None:
+      return RestartPolicy.NO
+
+    # Already an enum
+    if isinstance(policy, RestartPolicy):
+      return policy
+
+    # Convert string to enum (case-insensitive)
+    if isinstance(policy, str):
+      policy_str = policy.lower().strip()
+      try:
+        return RestartPolicy(policy_str)
+      except ValueError:
+        self.P(f"Unknown restart policy '{policy}', defaulting to 'no'", color='r')
+        return RestartPolicy.NO
+
+    # Unknown type
+    self.P(f"Invalid restart policy type {type(policy)}, defaulting to 'no'", color='r')
+    return RestartPolicy.NO
+
+
+  def _should_restart_container(self, stop_reason=None):
+    """
+    Determine if container should be restarted based on RESTART_POLICY and stop reason.
+
+    Implements Docker-style restart policies:
+    - NO: Never restart
+    - ALWAYS: Always restart (unless manually stopped)
+    - ON_FAILURE: Restart only on non-zero exit code
+    - UNLESS_STOPPED: Always restart unless explicitly stopped by user
+
+    Parameters
+    ----------
+    stop_reason : StopReason, optional
+        StopReason enum value indicating why container stopped
+
+    Returns
+    -------
+    bool
+        True if container should be restarted
+    """
+    policy = self._normalize_restart_policy(self.cfg_restart_policy)
+    stop_reason = stop_reason or self.stop_reason
+
+    # Never restart if manually stopped (user sent STOP command)
+    if stop_reason == StopReason.MANUAL_STOP:
+      self.Pd(f"Container manually stopped, restart policy '{policy.value}' will not trigger restart")
+      return False
+
+    # Check if we're in PAUSED state
+    if self.container_state == ContainerState.PAUSED:
+      self.Pd("Container is paused, restart policy will not trigger restart")
+      return False
+
+    # Policy: NO - never restart
+    if policy == RestartPolicy.NO:
+      return False
+
+    # Policy: ALWAYS - restart unless manually stopped
+    if policy == RestartPolicy.ALWAYS:
+      return True
+
+    # Policy: UNLESS_STOPPED - same as always in this implementation
+    if policy == RestartPolicy.UNLESS_STOPPED:
+      return True
+
+    # Policy: ON_FAILURE - only restart on crashes
+    if policy == RestartPolicy.ON_FAILURE:
+      return stop_reason in [
+        StopReason.CRASH,
+        StopReason.HEALTH_CHECK_FAILED,
+        StopReason.UNKNOWN,
+      ]
+
+    # Fallback (should never reach here due to normalization)
+    self.P(f"Unhandled restart policy '{policy}', defaulting to no restart", color='r')
+    return False
+
+
+  def _calculate_restart_backoff(self):
+    """
+    Calculate exponential backoff delay for restart attempts.
+
+    Returns
+    -------
+    float
+        Seconds to wait before next restart attempt
+    """
+    if self._consecutive_failures == 0:
+      return 0
+
+    # Exponential backoff: initial * (multiplier ^ (failures - 1))
+    backoff = self.cfg_restart_backoff_initial * (
+      self.cfg_restart_backoff_multiplier ** (self._consecutive_failures - 1)
+    )
+
+    # Cap at maximum backoff
+    backoff = min(backoff, self.cfg_restart_backoff_max)
+
+    return backoff
+
+
+  def _should_reset_retry_counter(self):
+    """
+    Check if container has been running long enough to reset retry counter.
+
+    Returns
+    -------
+    bool
+        True if retry counter should be reset
+    """
+    if not self._last_successful_start:
+      return False
+
+    uptime = self.time() - self._last_successful_start
+    return uptime >= self.cfg_restart_reset_interval
+
+
+  def _record_restart_failure(self):
+    """
+    Record a restart failure and update backoff state.
+
+    Returns
+    -------
+    None
+    """
+    self._consecutive_failures += 1
+    self._last_failure_time = self.time()
+    self._restart_backoff_seconds = self._calculate_restart_backoff()
+    self._next_restart_time = self.time() + self._restart_backoff_seconds
+
+    self.P(
+      f"Container restart failure #{self._consecutive_failures}. "
+      f"Next retry in {self._restart_backoff_seconds:.1f}s",
+      color='r'
+    )
+    return
+
+
+  def _record_restart_success(self):
+    """
+    Record a successful restart and reset failure counters if appropriate.
+
+    Returns
+    -------
+    None
+    """
+    self._last_successful_start = self.time()
+
+    # Reset failure counter after first successful start
+    if self._consecutive_failures > 0:
+      self.P(
+        f"Container started successfully after {self._consecutive_failures} failure(s). "
+        f"Retry counter will reset after {self.cfg_restart_reset_interval}s of uptime.",
+      )
+      # Don't reset immediately - wait for reset interval
+      # self._consecutive_failures = 0  # This happens in _maybe_reset_retry_counter
+    # end if
+    return
+
+
+  def _maybe_reset_retry_counter(self):
+    """
+    Reset retry counter if container has been running successfully.
+
+    Returns
+    -------
+    None
+    """
+    if self._consecutive_failures > 0 and self._should_reset_retry_counter():
+      old_failures = self._consecutive_failures
+      self._consecutive_failures = 0
+      self._restart_backoff_seconds = 0
+      self.P(
+        f"Container running successfully for {self.cfg_restart_reset_interval}s. "
+        f"Reset failure counter (was {old_failures})"
+      )
+    # end if
+    return
+
+
+  def _is_restart_backoff_active(self):
+    """
+    Check if we're currently in backoff period.
+
+    Returns
+    -------
+    bool
+        True if we should wait before restarting
+    """
+    if self._next_restart_time == 0:
+      return False
+
+    current_time = self.time()
+    if current_time < self._next_restart_time:
+      remaining = self._next_restart_time - current_time
+      self.Pd(f"Restart backoff active: {remaining:.1f}s remaining")
+      return True
+
+    return False
+
+
+  def _has_exceeded_max_retries(self):
+    """
+    Check if max retry attempts exceeded.
+
+    Returns
+    -------
+    bool
+        True if max retries exceeded (and max_retries > 0)
+    """
+    if self.cfg_restart_max_retries <= 0:
+      return False  # Unlimited retries
+
+    return self._consecutive_failures >= self.cfg_restart_max_retries
+
+
+  def _set_container_state(self, new_state, stop_reason=None):
+    """
+    Update container state and optionally stop reason.
+
+    Parameters
+    ----------
+    new_state : ContainerState
+        ContainerState enum value
+    stop_reason : StopReason, optional
+        Optional StopReason enum value
+
+    Returns
+    -------
+    None
+    """
+    old_state = self.container_state
+    self.container_state = new_state
+
+    if stop_reason:
+      self.stop_reason = stop_reason
+    # end if
+
+    self.Pd(f"Container state: {old_state.value} -> {new_state.value}", score=0)
+    return
+
+  # ============================================================================
+  # End of Restart Policy Logic
+  # ============================================================================
+
+  # ============================================================================
+  # Tunnel Restart Backoff Logic
+  # ============================================================================
+
+
+  def _calculate_tunnel_backoff(self, container_port):
+    """
+    Calculate exponential backoff delay for tunnel restart attempts.
+
+    Parameters
+    ----------
+    container_port : int
+        Container port for the tunnel
+
+    Returns
+    -------
+    float
+        Seconds to wait before next tunnel restart attempt
+    """
+    failures = self._tunnel_consecutive_failures.get(container_port, 0)
+    if failures == 0:
+      return 0
+
+    # Exponential backoff: initial * (multiplier ^ (failures - 1))
+    backoff = self.cfg_tunnel_restart_backoff_initial * (
+      self.cfg_tunnel_restart_backoff_multiplier ** (failures - 1)
+    )
+
+    # Cap at maximum backoff
+    backoff = min(backoff, self.cfg_tunnel_restart_backoff_max)
+
+    return backoff
+
+
+  def _record_tunnel_restart_failure(self, container_port):
+    """
+    Record a tunnel restart failure and update backoff state.
+
+    Parameters
+    ----------
+    container_port : int
+        Container port for the tunnel
+
+    Returns
+    -------
+    None
+    """
+    self._tunnel_consecutive_failures[container_port] = \
+      self._tunnel_consecutive_failures.get(container_port, 0) + 1
+    self._tunnel_last_failure_time[container_port] = self.time()
+
+    backoff = self._calculate_tunnel_backoff(container_port)
+    self._tunnel_next_restart_time[container_port] = self.time() + backoff
+
+    failures = self._tunnel_consecutive_failures[container_port]
+    self.P(
+      f"Tunnel restart failure for port {container_port} (#{failures}). "
+      f"Next retry in {backoff:.1f}s",
+      color='r'
+    )
+    return
+
+
+  def _record_tunnel_restart_success(self, container_port):
+    """
+    Record a successful tunnel restart.
+
+    Parameters
+    ----------
+    container_port : int
+        Container port for the tunnel
+
+    Returns
+    -------
+    None
+    """
+    self._tunnel_last_successful_start[container_port] = self.time()
+
+    # Note success if there were previous failures
+    failures = self._tunnel_consecutive_failures.get(container_port, 0)
+    if failures > 0:
+      self.P(
+        f"Tunnel for port {container_port} started successfully after {failures} failure(s)."
+      )
+    return
+
+
+  def _is_tunnel_backoff_active(self, container_port):
+    """
+    Check if tunnel is currently in backoff period.
+
+    Parameters
+    ----------
+    container_port : int
+        Container port for the tunnel
+
+    Returns
+    -------
+    bool
+        True if we should wait before restarting tunnel
+    """
+    next_restart = self._tunnel_next_restart_time.get(container_port, 0)
+    if next_restart == 0:
+      return False
+
+    current_time = self.time()
+    if current_time < next_restart:
+      remaining = next_restart - current_time
+      self.Pd(f"Tunnel {container_port} backoff active: {remaining:.1f}s remaining")
+      return True
+
+    return False
+
+
+  def _has_tunnel_exceeded_max_retries(self, container_port):
+    """
+    Check if tunnel has exceeded max retry attempts.
+
+    Parameters
+    ----------
+    container_port : int
+        Container port for the tunnel
+
+    Returns
+    -------
+    bool
+        True if max retries exceeded (and max_retries > 0)
+    """
+    if self.cfg_tunnel_restart_max_retries <= 0:
+      return False  # Unlimited retries
+
+    failures = self._tunnel_consecutive_failures.get(container_port, 0)
+    return failures >= self.cfg_tunnel_restart_max_retries
+
+
+  def _maybe_reset_tunnel_retry_counter(self, container_port):
+    """
+    Reset tunnel retry counter if it has been running successfully.
+
+    Parameters
+    ----------
+    container_port : int
+        Container port for the tunnel
+
+    Returns
+    -------
+    None
+    """
+    failures = self._tunnel_consecutive_failures.get(container_port, 0)
+    if failures == 0:
+      return
+
+    last_start = self._tunnel_last_successful_start.get(container_port, 0)
+    if not last_start:
+      return
+
+    uptime = self.time() - last_start
+    if uptime >= self.cfg_tunnel_restart_reset_interval:
+      self.P(
+        f"Tunnel {container_port} running successfully for {self.cfg_tunnel_restart_reset_interval}s. "
+        f"Reset failure counter (was {failures})",
+      )
+      self._tunnel_consecutive_failures[container_port] = 0
+
+    return
+
+  # ============================================================================
+  # End of Tunnel Restart Backoff Logic
+  # ============================================================================
+
+
   def _normalize_container_command(self, value, *, field_name):
-    """Normalize a container command into a Docker-compatible representation."""
+    """
+    Normalize a container command into a Docker-compatible representation.
+
+    Parameters
+    ----------
+    value : str, list, tuple, or None
+        Command to normalize
+    field_name : str
+        Name of the configuration field (for error messages)
+
+    Returns
+    -------
+    str, list, or None
+        Normalized command ready for Docker
+
+    Raises
+    ------
+    ValueError
+        If command format is invalid
+    """
     if value is None:
       return None
 
@@ -263,8 +933,28 @@ class ContainerAppRunnerPlugin(
 
     raise ValueError(f"{field_name} must be None, a string, or a list/tuple of strings")
 
+
   def _normalize_command_sequence(self, value, *, field_name):
-    """Normalize build/run command sequences into a list of shell fragments."""
+    """
+    Normalize build/run command sequences into a list of shell fragments.
+
+    Parameters
+    ----------
+    value : str, list, tuple, or None
+        Command sequence to normalize
+    field_name : str
+        Name of the configuration field (for error messages)
+
+    Returns
+    -------
+    list of str
+        Normalized command list
+
+    Raises
+    ------
+    ValueError
+        If command sequence format is invalid
+    """
     if value is None:
       return []
 
@@ -280,8 +970,20 @@ class ContainerAppRunnerPlugin(
 
     raise ValueError(f"{field_name} must be a string or an iterable of strings")
 
+
   def _validate_runner_config(self):
-    """Validate configuration and prepare normalized command data."""
+    """
+    Validate configuration and prepare normalized command data.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If configuration is invalid
+    """
     self._start_command = self._normalize_container_command(
       getattr(self, 'cfg_container_start_command', None),
       field_name='CONTAINER_START_COMMAND',
@@ -295,16 +997,47 @@ class ContainerAppRunnerPlugin(
     self._validate_subclass_config()
     return
 
+
   def _validate_subclass_config(self):
-    """Hook for subclasses to enforce additional validation."""
+    """
+    Hook for subclasses to enforce additional validation.
+
+    Allows subclasses to add their own configuration validation
+    beyond the base container configuration checks.
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    ValueError
+        If subclass-specific validation fails
+    """
     return
+
 
   def on_init(self):
     """
     Lifecycle hook called once the plugin is initialized.
-    Authenticates with the container registry (if config is provided).
-    Determines whether Docker or Podman is available, sets up port (if needed),
-    and prepares for container run.
+
+    Performs initial setup including:
+    - Container registry authentication
+    - Docker client initialization
+    - Dynamic environment variable configuration
+    - Resource limits and port allocation
+    - Volume and file volume configuration
+    - Extra tunnels validation
+    - Manual stop state checking
+
+    Returns
+    -------
+    None
+
+    Raises
+    ------
+    RuntimeError
+        If Docker daemon is not accessible or registry authentication fails
     """
     self._reset_chainstore_response()
     self.__reset_vars()
@@ -331,123 +1064,183 @@ class ContainerAppRunnerPlugin(
 
     self._validate_runner_config()
 
+    # Check if container was manually stopped in a previous session
+    if self._load_manual_stop_state():
+      self.P("Container was manually stopped in previous session. Keeping container paused.")
+      self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
+
     self._extra_on_init()
-    self.P(f"{self.__class__.__name__} initialized (version {__VER__})", color='g')
+    self.P(f"{self.__class__.__name__} initialized (version {__VER__})")
     return
+
   
   def _extra_on_init(self):
-    """Hook for subclasses to perform additional initialization."""
+    """
+    Hook for subclasses to perform additional initialization.
+
+    Called at the end of on_init() to allow subclasses to add
+    their own initialization logic.
+
+    Returns
+    -------
+    None
+    """
     return
+
 
   def on_command(self, data, **kwargs):
     """
-    Called when a INSTANCE_COMMAND is received by the plugin instance.
+    Handle instance commands sent to the plugin.
 
-    The command is sent via `cmdapi_send_instance_command` from a commanding node (Deeploy plugin)
-    as in below simplified example:
+    Processes commands sent via cmdapi_send_instance_command from
+    commanding nodes. Supported commands:
+    - RESTART: Restart the container
+    - STOP: Stop container and enter paused state
 
-    ```python
-      pipeline = "some_app_pipeline"
-      signature = "CONTAINER_APP_RUNNER"
-      instance_id = "CONTAINER_APP_1e8dac"
-      node_address = "0xai_1asdfG11sammamssdjjaggxffaffaheASSsa"
+    Parameters
+    ----------
+    data : str
+        Command string to execute
+    **kwargs
+        Additional command parameters
 
-      instance_command = "RESTART"
+    Returns
+    -------
+    None
 
-      plugin.cmdapi_send_instance_command(
-        pipeline=pipeline,
-        signature=signature,
-        instance_id=instance_id,
-        instance_command=instance_command,
-        node_address=node_address,
-      )
-    ```
-
-    while the `on_command` method should look like this:
-
-    ```python
-      def on_command(self, data, **kwargs):
-        if data == "RESTART":
-          self.P("Restarting container...")
-          ...
-        elif data == "STOP":
-          self.P("Stopping container (restart policy still applies)...")
-          ...
-        else:
-          self.P(f"Unknown command: {data}")
-        return
-    ```
-
+    Examples
+    --------
+    Sending a command from another plugin:
+        >>> plugin.cmdapi_send_instance_command(
+        ...     pipeline="app_pipeline",
+        ...     signature="CONTAINER_APP_RUNNER",
+        ...     instance_id="CONTAINER_APP_1e8dac",
+        ...     instance_command="RESTART",
+        ...     node_address="0xai_..."
+        ... )
     """
     self.P(f"Received a command: {data}")
     self.P(f"Command kwargs: {kwargs}")
 
     if data == "RESTART":
       self.P("Restarting container...")
-      self._is_manually_stopped = False
+      self._clear_manual_stop_state()  # Clear persistent stop state
+      self._set_container_state(ContainerState.RESTARTING, StopReason.CONFIG_UPDATE)
       self._stop_container_and_save_logs_to_disk()
-      self._restart_container()
+      self._restart_container(StopReason.CONFIG_UPDATE)
       return
 
     elif data == "STOP":
-      self.P("Stopping container (restart policy still applies)...")
+      self.P("Stopping container (manual stop - restart policy will not trigger)...")
+      self._save_persistent_state(manually_stopped=True)  # Save persistent stop state
       self._stop_container_and_save_logs_to_disk()
-      self._is_manually_stopped = True
+      self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
       return
     else:
       self.P(f"Unknown plugin command: {data}")
     return
 
+
   def on_config(self, *args, **kwargs):
-    return self._handle_config_restart(self._restart_container)
+    """
+    Lifecycle hook called when configuration changes.
+
+    Stops current container and restarts with new configuration.
+
+    Parameters
+    ----------
+    *args
+        Positional arguments (unused)
+    **kwargs
+        Keyword arguments (unused)
+
+    Returns
+    -------
+    None
+    """
+    return self._handle_config_restart(lambda: self._restart_container(StopReason.CONFIG_UPDATE))
 
 
   def on_post_container_start(self):
     """
-    Lifecycle hook called after the container is started.
-    Runs commands in the container if specified in the config.
+    Lifecycle hook called after container starts.
 
-      - after the container first start
-      - after the container is restarted
+    Runs commands in the container if specified in the config.
+    Called both after initial start and after restarts.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    This is a hook method that subclasses can override to add
+    custom post-start behavior.
     """
     self.P("Container started, running post-start commands...")
     return
 
 
-
-
   def start_tunnel_engine(self):
     """
-    Start the tunnel engine using the base tunnel engine functionality.
+    Start the main tunnel engine (Cloudflare or ngrok).
+
+    Initiates tunnel process using base tunnel engine functionality
+    to expose container ports via public URL.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Only starts if TUNNEL_ENGINE_ENABLED is True. Tunnel type
+    is determined by use_cloudflare() method.
     """
     if self.cfg_tunnel_engine_enabled:
       engine_name = "Cloudflare" if self.use_cloudflare() else "ngrok"
-      self.P(f"Starting {engine_name} tunnel...", color='b')
+      self.P(f"Starting {engine_name} tunnel...")
       self.tunnel_process = self.run_tunnel_engine()
       if self.tunnel_process:
-        self.P(f"{engine_name} tunnel started successfully", color='g')
+        self.P(f"{engine_name} tunnel started successfully")
       else:
         self.P(f"Failed to start {engine_name} tunnel", color='r')
+      # end if
+    # end if
     return
+
 
   def stop_tunnel_engine(self):
     """
-    Stop the tunnel engine.
+    Stop the main tunnel engine.
+
+    Terminates the running tunnel process and cleans up resources.
+
+    Returns
+    -------
+    None
     """
     if self.tunnel_process:
       engine_name = "Cloudflare" if self.use_cloudflare() else "ngrok"
-      self.P(f"Stopping {engine_name} tunnel...", color='b')
+      self.P(f"Stopping {engine_name} tunnel...")
       self.stop_tunnel_command(self.tunnel_process)
       self.tunnel_process = None
-      self.P(f"{engine_name} tunnel stopped", color='g')
+      self.P(f"{engine_name} tunnel stopped")
+    # end if
     return
+
 
   def get_tunnel_engine_ping_data(self):
     """
-    Override to include extra tunnel URLs in payloads.
+    Get tunnel data including main app_url and extra tunnel URLs.
 
-    Returns:
-      dict: Tunnel data including main app_url and extra tunnel URLs
+    Returns
+    -------
+    dict
+        Tunnel data including:
+        - app_url: Main tunnel URL (if available)
+        - extra_tunnel_urls: Dict mapping container ports to URLs
+        - extra_tunnel_status: Status of each extra tunnel
     """
     result = {}
 
@@ -474,10 +1267,17 @@ class ContainerAppRunnerPlugin(
 
     return result
 
+
   def maybe_extra_tunnels_ping(self):
     """
     Emit periodic pings with extra tunnel URLs and status.
-    Similar to maybe_tunnel_engine_ping but for extra tunnels.
+
+    Sends heartbeat payloads containing extra tunnel URLs and
+    their operational status at configured intervals.
+
+    Returns
+    -------
+    None
     """
     if not self.extra_tunnel_urls:
       return
@@ -514,38 +1314,60 @@ class ContainerAppRunnerPlugin(
 
     return
 
+
   def _get_host_port_for_container_port(self, container_port):
     """
     Get the host port mapped to a container port.
 
-    Args:
-      container_port: Container port (int)
+    Parameters
+    ----------
+    container_port : int
+        Container port to look up
 
-    Returns:
-      int or None: Host port if found, None otherwise
+    Returns
+    -------
+    int or None
+        Host port if found, None otherwise
     """
     for host_port, c_port in self.extra_ports_mapping.items():
       if c_port == container_port:
         return host_port
     return None
 
+
   def _build_tunnel_command(self, container_port, token):
     """
     Build Cloudflare tunnel command for a specific port.
 
-    Args:
-      container_port: Container port to tunnel
-      token: Cloudflare tunnel token
+    Parameters
+    ----------
+    container_port : int
+        Container port to tunnel
+    token : str
+        Cloudflare tunnel token
 
-    Returns:
-      str or None: Command string to execute, or None if error
+    Returns
+    -------
+    list or None
+        Command list to execute, or None if error
     """
     host_port = self._get_host_port_for_container_port(container_port)
     if not host_port:
       self.P(f"No host port found for container port {container_port}", color='r')
       return None
 
-    return f"cloudflared tunnel --no-autoupdate run --token {token} --url http://127.0.0.1:{host_port}"
+    # Return list to avoid shell injection - use list-based subprocess
+    return [
+      "cloudflared",
+      "tunnel",
+      "--no-autoupdate",
+      "run",
+      "--token",
+      str(token),
+      "--url",
+      f"http://127.0.0.1:{host_port}"
+    ]
+
 
   def _should_start_main_tunnel(self):
     """
@@ -556,8 +1378,10 @@ class ContainerAppRunnerPlugin(
     2. PORT is defined OR CLOUDFLARE_TOKEN is defined
     3. Main PORT is not handled by EXTRA_TUNNELS
 
-    Returns:
-      bool: True if main tunnel should start
+    Returns
+    -------
+    bool
+        True if main tunnel should start
     """
     # Check if we have a token (backward compatibility)
     has_cloudflare_token = bool(getattr(self, 'cfg_cloudflare_token', None))
@@ -575,24 +1399,27 @@ class ContainerAppRunnerPlugin(
 
     # If PORT is defined and in EXTRA_TUNNELS, skip main tunnel
     if self.cfg_port and self.cfg_port in self.extra_tunnel_configs:
-      self.P(
-        f"Main PORT {self.cfg_port} is defined in EXTRA_TUNNELS, using extra tunnel instead",
-        color='y'
-      )
+      self.P(f"Main PORT {self.cfg_port} is defined in EXTRA_TUNNELS, using extra tunnel instead")
       return False
 
     return True
+
 
   def _start_extra_tunnel(self, container_port, token):
     """
     Start a single extra tunnel for a specific container port.
 
-    Args:
-      container_port: Container port to expose
-      token: Cloudflare tunnel token
+    Parameters
+    ----------
+    container_port : int
+        Container port to expose
+    token : str
+        Cloudflare tunnel token
 
-    Returns:
-      bool: True if tunnel started successfully, False otherwise
+    Returns
+    -------
+    bool
+        True if tunnel started successfully, False otherwise
     """
     if not token:
       self.P(f"No token provided for extra tunnel on port {container_port}", color='r')
@@ -606,12 +1433,12 @@ class ContainerAppRunnerPlugin(
     # Start tunnel process
     try:
       host_port = self._get_host_port_for_container_port(container_port)
-      self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...", color='b')
-      self.Pd(f"  Command: {command}")
+      self.P(f"Starting Cloudflare tunnel for container port {container_port} (host port {host_port})...")
+      self.Pd(f"  Command: {' '.join(command)}")
 
+      # Use list-based subprocess to prevent shell injection
       process = subprocess.Popen(
         command,
-        shell=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         bufsize=0
@@ -629,45 +1456,69 @@ class ContainerAppRunnerPlugin(
       }
       self.extra_tunnel_start_times[container_port] = self.time()
 
-      self.P(f"Extra tunnel for port {container_port} started (PID: {process.pid})", color='g')
+      # Record successful start for backoff tracking
+      self._record_tunnel_restart_success(container_port)
+
+      self.P(f"Extra tunnel for port {container_port} started (PID: {process.pid})")
       return True
 
     except Exception as e:
       self.P(f"Failed to start extra tunnel for port {container_port}: {e}", color='r')
+      # Record failure for backoff tracking
+      self._record_tunnel_restart_failure(container_port)
       return False
 
+
   def start_extra_tunnels(self):
-    """Start all configured extra tunnels."""
+    """
+    Start all configured extra Cloudflare tunnels.
+
+    Iterates through extra_tunnel_configs and starts a tunnel
+    process for each configured port.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    Logs the number of successfully started tunnels.
+    Failed tunnels are tracked for exponential backoff retry.
+    """
     if not self.extra_tunnel_configs:
       self.Pd("No extra tunnels configured")
       return
 
-    self.P(f"Starting {len(self.extra_tunnel_configs)} extra tunnel(s)...", color='b')
+    self.P(f"Starting {len(self.extra_tunnel_configs)} extra tunnel(s)...")
 
     started_count = 0
     for container_port, token in self.extra_tunnel_configs.items():
       if self._start_extra_tunnel(container_port, token):
         started_count += 1
 
-    self.P(
-      f"Started {started_count}/{len(self.extra_tunnel_configs)} extra tunnels",
-      color='g' if started_count == len(self.extra_tunnel_configs) else 'y'
-    )
+    self.P(f"Started {started_count}/{len(self.extra_tunnel_configs)} extra tunnels")
     return
+
 
   def _stop_extra_tunnel(self, container_port):
     """
     Stop a single extra tunnel.
 
-    Args:
-      container_port: Container port whose tunnel should be stopped
+    Parameters
+    ----------
+    container_port : int
+        Container port whose tunnel should be stopped
+
+    Returns
+    -------
+    None
     """
     process = self.extra_tunnel_processes.get(container_port)
     if not process:
       return
 
     try:
-      self.P(f"Stopping extra tunnel for port {container_port}...", color='b')
+      self.P(f"Stopping extra tunnel for port {container_port}...")
 
       # Read remaining logs before stopping
       self._read_extra_tunnel_logs(container_port)
@@ -714,29 +1565,46 @@ class ContainerAppRunnerPlugin(
       self.extra_tunnel_urls.pop(container_port, None)
       self.extra_tunnel_start_times.pop(container_port, None)
 
-      self.P(f"Extra tunnel for port {container_port} stopped", color='g')
+      self.P(f"Extra tunnel for port {container_port} stopped")
 
     except Exception as e:
       self.P(f"Error stopping extra tunnel for port {container_port}: {e}", color='r')
 
+
   def stop_extra_tunnels(self):
-    """Stop all extra tunnels."""
+    """
+    Stop all running extra tunnels.
+
+    Iterates through all extra tunnel processes and stops each one,
+    reading remaining logs before termination.
+
+    Returns
+    -------
+    None
+    """
     if not self.extra_tunnel_processes:
       return
 
-    self.P(f"Stopping {len(self.extra_tunnel_processes)} extra tunnel(s)...", color='b')
+    self.P(f"Stopping {len(self.extra_tunnel_processes)} extra tunnel(s)...")
 
     for container_port in list(self.extra_tunnel_processes.keys()):
       self._stop_extra_tunnel(container_port)
 
-    self.P("All extra tunnels stopped", color='g')
+    self.P("All extra tunnels stopped")
+
 
   def _read_extra_tunnel_logs(self, container_port):
     """
     Read and process logs from an extra tunnel.
 
-    Args:
-      container_port: Container port whose tunnel logs to read
+    Parameters
+    ----------
+    container_port : int
+        Container port whose tunnel logs to read
+
+    Returns
+    -------
+    None
     """
     log_readers = self.extra_tunnel_log_readers.get(container_port, {})
 
@@ -760,24 +1628,35 @@ class ContainerAppRunnerPlugin(
       except Exception as e:
         self.Pd(f"Error reading stderr for tunnel {container_port}: {e}")
 
+
   def _process_extra_tunnel_log(self, container_port, text, is_error=False):
     """
     Process tunnel logs and extract URL.
 
-    For Cloudflare: Extract URL from pattern https://*.trycloudflare.com
+    For Cloudflare tunnels, extracts URL matching pattern
+    https://*.trycloudflare.com from the log output.
 
-    Args:
-      container_port: Container port
-      text: Log text
-      is_error: Whether this is error output
+    Parameters
+    ----------
+    container_port : int
+        Container port for this tunnel
+    text : str
+        Log text to process
+    is_error : bool, optional
+        Whether this is error output (default: False)
+
+    Returns
+    -------
+    None
     """
     log_prefix = f"[TUNNEL:{container_port}]"
-    color = 'r' if is_error else 'd'
 
     # Log the output
     for line in text.split('\n'):
       if line.strip():
         self.Pd(f"{log_prefix} {line}", score=0)
+      # endif
+    # endfor line in text
 
     # Extract URL if not already found
     if container_port not in self.extra_tunnel_urls:
@@ -787,38 +1666,96 @@ class ContainerAppRunnerPlugin(
       if match:
         url = match.group(0)
         self.extra_tunnel_urls[container_port] = url
-        self.P(f"Extra tunnel URL for port {container_port}: {url}", color='g')
+        self.P(f"Extra tunnel URL for port {container_port}: {url}")
+      # endif
+    # endif container_port
+    return
 
   def read_all_extra_tunnel_logs(self):
-    """Read logs from all extra tunnels."""
+    """
+    Read and process logs from all running extra tunnels.
+
+    Iterates through all extra tunnel processes and reads their
+    stdout/stderr logs, extracting public URLs when found.
+
+    Returns
+    -------
+    None
+    """
     for container_port in list(self.extra_tunnel_processes.keys()):
       try:
         self._read_extra_tunnel_logs(container_port)
       except Exception as e:
         self.Pd(f"Error reading logs for tunnel {container_port}: {e}")
 
-  def start_container(self):
-    """Start the Docker container."""
-    self.P(f"Launching container with image '{self.cfg_image}'...")
 
-    self.P(f"Container data:")
-    self.P(f"  Image: {self.cfg_image}")
-    self.P(f"  Ports: {self.json_dumps(self.inverted_ports_mapping) if self.inverted_ports_mapping else 'None'}")
-    self.P(f"  Env: {self.json_dumps(self.env) if self.env else 'None'}")
-    self.P(f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}")
-    self.P(f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}")
-    self.P(f"  Restart policy: {self.cfg_restart_policy}")
-    self.P(f"  Pull policy: {self.cfg_image_pull_policy}")
-    self.P(f"  Start command: {self._start_command if self._start_command else 'Image default'}")
+  def start_container(self):
+    """
+    Start the Docker container with configured settings.
+
+    Creates and starts a Docker container with the configured image,
+    ports, volumes, environment variables, and resource limits.
+
+    Returns
+    -------
+    docker.models.containers.Container or None
+        Container object if started successfully, None otherwise
+
+    Notes
+    -----
+    Updates container state to RUNNING on success or FAILED on error.
+    Records restart success/failure for backoff tracking.
+    """
+    self._set_container_state(ContainerState.STARTING)
+
+    log_str = f"Launching container with image '{self.cfg_image}'...\n"
+
+    log_str += f"Container data:\n"
+    log_str += f"  Image: {self.cfg_image}\n"
+    log_str += f"  Ports: {self.json_dumps(self.inverted_ports_mapping) if self.inverted_ports_mapping else 'None'}\n"
+    log_str += f"  Env: {self.json_dumps(self.env) if self.env else 'None'}\n"
+    log_str += f"  Volumes: {self.json_dumps(self.volumes) if self.volumes else 'None'}\n"
+    log_str += f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}\n"
+    log_str += f"  Restart policy: {self.cfg_restart_policy}\n"
+    log_str += f"  Pull policy: {self.cfg_image_pull_policy}\n"
+    log_str += f"  Start command: {self._start_command if self._start_command else 'Image default'}\n"
+
+    self.P(log_str)
+
+    nano_cpu_limit = self._cpu_limit * 1_000_000_000
+    mem_reservation = f"{parse_memory_to_mb(self._mem_limit, 0.9)}m"
+
+    run_kwargs = dict(
+      detach=True,
+      ports=self.inverted_ports_mapping,
+      environment=self.env,
+      volumes=self.volumes,
+      name=self.container_name,
+      nano_cpus=nano_cpu_limit,
+      mem_limit=self._mem_limit,
+      mem_reservation=mem_reservation,
+      # pids_limit=
+    )
+
+    if self._gpu_limit:
+      gpus_info = self.log.gpu_info()
+      if len(gpus_info) > 0:
+        self.P(f"GPU is requested and NVIDIA GPUs found, starting container with 1 GPU.")
+        run_kwargs["device_requests"] = [DeviceRequest(
+          count=1,  # -1 = "all" devices
+          capabilities=[['gpu']],  # what kind of device we want
+          # optionally:
+          # device_ids=['0', '1'],
+          # options={'compute': 'all'}
+        )]
+      else:
+        self.P("Warning! GPU is requested but no NVIDIA GPUs found, starting container without GPU")
+      # endif available GPUs
+    else:
+      self.P(f"Starting container without GPU")
+    # endif
 
     try:
-      run_kwargs = dict(
-        detach=True,
-        ports=self.inverted_ports_mapping,
-        environment=self.env,
-        volumes=self.volumes,
-        name=self.container_name,
-      )
       if self._start_command:
         run_kwargs['command'] = self._start_command
 
@@ -826,37 +1763,59 @@ class ContainerAppRunnerPlugin(
         self.cfg_image,
         **run_kwargs,
       )
+
+      self.container_id = self.container.short_id
+      self.P(f"Container started (ID: {self.container.short_id})")
+
+      # Container started successfully
+      self._set_container_state(ContainerState.RUNNING)
+      self._record_restart_success()
+
+      self._maybe_send_plugin_start_confirmation()
+
+      return self.container
+
     except Exception as e:
       self.P(f"Could not start container: {e}", color='r')
       self.container = None
-      return None
+      self._set_container_state(ContainerState.FAILED, StopReason.CRASH)
+      self._record_restart_failure()
+    return None
 
-    self.container_id = self.container.short_id
-    self.P(f"Container started (ID: {self.container.short_id})", color='g')
-
-    self._maybe_send_plugin_start_confirmation()
-
-    return self.container
 
   def stop_container(self):
-    """Stop and remove the Docker container if it is running."""
+    """
+    Stop and remove the Docker container.
+
+    Gracefully stops the container with a 5-second timeout,
+    then removes it from the Docker daemon.
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    If no container exists, logs a warning and returns.
+    Clears container and container_id attributes after removal.
+    """
     if not self.container:
-      self.P("No container to stop", color='y')
+      self.P("No container to stop", color='r')
       return
 
     try:
       # Stop the container (gracefully)
-      self.P(f"Stopping container {self.container.short_id}...", color='b')
+      self.P(f"Stopping container {self.container.short_id}...")
       self.container.stop(timeout=5)
-      self.P(f"Container {self.container.short_id} stopped successfully", color='g')
+      self.P(f"Container {self.container.short_id} stopped successfully")
     except Exception as e:
       self.P(f"Error stopping container: {e}", color='r')
     # end try
 
     try:
-      self.P(f"Removing container {self.container.short_id}...", color='b')
+      self.P(f"Removing container {self.container.short_id}...")
       self.container.remove()
-      self.P(f"Container {self.container.short_id} removed successfully", color='g')
+      self.P(f"Container {self.container.short_id} removed successfully")
     except Exception as e:
       self.P(f"Error removing container: {e}", color='r')
     finally:
@@ -865,10 +1824,22 @@ class ContainerAppRunnerPlugin(
     # end try
     return
 
+
   def _stream_logs(self, log_stream):
-    """Consume a log iterator from container logs and print its output."""
+    """
+    Consume a log iterator from container logs and print its output.
+
+    Parameters
+    ----------
+    log_stream : iterator
+        Log stream iterator from container.logs()
+
+    Returns
+    -------
+    None
+    """
     if not log_stream:
-      self.P("No log stream provided", color='y')
+      self.P("No log stream provided", color='r')
       return
 
     try:
@@ -878,22 +1849,29 @@ class ContainerAppRunnerPlugin(
         try:
           log_str = log_bytes.decode("utf-8", errors="replace")
         except Exception as e:
-          self.P(f"Warning: Could not decode log bytes: {e}", color='y')
+          self.P(f"Warning: Could not decode log bytes: {e}", color='r')
           log_str = str(log_bytes)
 
-        self.P(f"[CONTAINER] {log_str}", color='d', end='')
+        self.P(f"[CONTAINER] {log_str}", end='')
         self.container_logs.append(log_str)
 
         if self._stop_event.is_set():
-          self.P("Log streaming stopped by stop event", color='y')
+          self.P("Log streaming stopped by stop event")
           break
     except Exception as e:
       self.P(f"Exception while streaming logs: {e}", color='r')
     # end try
     return
 
+
   def _start_container_log_stream(self):
-    """Start following container logs if not already streaming."""
+    """
+    Start following container logs if not already streaming.
+
+    Returns
+    -------
+    None
+    """
     if not self.container:
       return
 
@@ -912,23 +1890,56 @@ class ContainerAppRunnerPlugin(
       self.P(f"Could not start container log stream: {exc}", color='r')
     return
 
+
   def _collect_exec_commands(self):
-    """Return the list of commands to execute inside the container."""
+    """
+    Return the list of commands to execute inside the container.
+
+    Returns
+    -------
+    list of str
+        Commands to execute, or empty list if none configured
+    """
     return list(self._build_commands) if getattr(self, '_build_commands', None) else []
 
+
   def _compose_exec_shell(self, commands):
-    """Compose a shell command string out of the command fragments."""
+    """
+    Compose a shell command string out of the command fragments.
+
+    Parameters
+    ----------
+    commands : list of str
+        Command fragments to chain together
+
+    Returns
+    -------
+    str or None
+        Shell command string with commands chained by &&, or None if empty
+    """
     if not commands:
       return None
     return " && ".join(commands)
 
+
   def _run_container_exec(self, shell_cmd):
-    """Run a shell command inside the container and stream its output."""
+    """
+    Run a shell command inside the container and stream its output.
+
+    Parameters
+    ----------
+    shell_cmd : str
+        Shell command to execute inside container
+
+    Returns
+    -------
+    None
+    """
     if not self.container or not shell_cmd:
       return
 
     try:
-      self.P(f"Running container exec command: {shell_cmd}", color='b')
+      self.P(f"Running container exec command: {shell_cmd}")
       exec_result = self.container.exec_run(
         ["sh", "-c", shell_cmd],
         stream=True,
@@ -946,8 +1957,15 @@ class ContainerAppRunnerPlugin(
       self._commands_started = False
     return
 
+
   def _maybe_execute_build_and_run(self):
-    """Execute configured build/run commands if necessary."""
+    """
+    Execute configured build/run commands if necessary.
+
+    Returns
+    -------
+    None
+    """
     if self._commands_started:
       return
 
@@ -966,7 +1984,20 @@ class ContainerAppRunnerPlugin(
     self._run_container_exec(shell_cmd)
     return
 
+
   def _check_health_endpoint(self, current_time=None):
+    """
+    Check health endpoint periodically if configured.
+
+    Parameters
+    ----------
+    current_time : float, optional
+        Current timestamp for interval checking
+
+    Returns
+    -------
+    None
+    """
     if not self.container or not self.cfg_endpoint_url or self.cfg_endpoint_poll_interval <= 0:
       return
 
@@ -976,14 +2007,21 @@ class ContainerAppRunnerPlugin(
     # end if time elapsed
     return
 
+
   def _poll_endpoint(self):
-    """Poll the container's health endpoint and log the response."""
+    """
+    Poll the container's health endpoint and log the response.
+
+    Returns
+    -------
+    None
+    """
     if not self.port:
       self.P("No port allocated, cannot poll endpoint", color='r')
       return
 
     if not self.cfg_endpoint_url:
-      self.P("No endpoint URL configured, skipping health check", color='y')
+      self.P("No endpoint URL configured, skipping health check")
       return
 
     url = f"http://localhost:{self.port}{self.cfg_endpoint_url}"
@@ -993,7 +2031,7 @@ class ContainerAppRunnerPlugin(
       status = resp.status_code
 
       if status == 200:
-        self.P(f"Health check: {url} -> {status} OK", color='g')
+        self.P(f"Health check: {url} -> {status} OK")
       else:
         self.P(f"Health check: {url} -> {status} Error", color='r')
     except requests.RequestException as e:
@@ -1003,33 +2041,75 @@ class ContainerAppRunnerPlugin(
     # end try
     return
 
+
   def _check_container_status(self):
+    """
+    Check container status and update state machine.
+
+    Returns
+    -------
+    bool
+        True if container is running normally, False if stopped/failed
+
+    Notes
+    -----
+    Side effects:
+    - Updates container_state based on container status
+    - Sets stop_reason based on exit code
+    - Does NOT trigger restart - that's handled by process()
+    """
     try:
-      if self.container:
-        # Refresh container status
-        self.container.reload()
-        if self.container.status != "running":
-          self.P(
-            f"Container stopped unexpectedly (exit code {self.container.attrs.get('State', {}).get('ExitCode')})",
-            color='r'
-          )
-          self._commands_started = False
-          return False
-        # end if container not running
-      # end if self.container
-      return True
+      if not self.container:
+        return False
+
+      # Refresh container status from Docker
+      # @see https://docker-py.readthedocs.io/en/stable/containers.html#docker.models.containers.Container.reload
+      self.container.reload()
+
+      if self.container.status == "running":
+        # Container running normally
+        if self.container_state != ContainerState.RUNNING:
+          self._set_container_state(ContainerState.RUNNING)
+        return True
+
+      # Container is not running - determine why
+      exit_code = self.container.attrs.get('State', {}).get('ExitCode', -1)
+
+      # Determine stop reason based on exit code
+      if exit_code == 0:
+        stop_reason = StopReason.NORMAL_EXIT
+      else:
+        stop_reason = StopReason.CRASH
+
+      # Update state
+      self._set_container_state(ContainerState.FAILED, stop_reason)
+
+      self.P(
+        f"Container stopped (exit code: {exit_code}, reason: {stop_reason.value})",
+        color='r' if exit_code != 0 else 'b'
+      )
+
+      self._commands_started = False
+      return False
+
     except Exception as e:
       self.P(f"Could not check container status: {e}", color='r')
       self.container = None
       self._commands_started = False
-    # end try
-    return False
+      self._set_container_state(ContainerState.FAILED, StopReason.UNKNOWN)
+      return False
+
 
   def _check_extra_tunnel_health(self):
     """
-    Check health of extra tunnels and restart if needed.
+    Check health of extra tunnels and restart if needed with exponential backoff.
+
+    Returns
+    -------
+    None
     """
     for container_port, process in list(self.extra_tunnel_processes.items()):
+      # Check if tunnel is still running
       if process.poll() is not None:  # Process exited
         exit_code = process.returncode
         self.P(f"Extra tunnel for port {container_port} exited (code {exit_code})", color='r')
@@ -1037,19 +2117,53 @@ class ContainerAppRunnerPlugin(
         # Clean up dead tunnel
         self._stop_extra_tunnel(container_port)
 
-        # Restart tunnel
+        # Record failure for backoff tracking
+        self._record_tunnel_restart_failure(container_port)
+
+        # Check if we've exceeded max retries
+        if self._has_tunnel_exceeded_max_retries(container_port):
+          failures = self._tunnel_consecutive_failures.get(container_port, 0)
+          max_retries = self.cfg_tunnel_restart_max_retries
+          self.P(
+            f"Tunnel for port {container_port} restart abandoned after {failures} "
+            f"consecutive failures (max: {max_retries})",
+            color='r'
+          )
+          continue
+
+        # Check if we're in backoff period
+        if self._is_tunnel_backoff_active(container_port):
+          self.Pd(f"Tunnel {container_port} restart delayed due to active backoff period")
+          continue
+
+        # All checks passed - attempt restart
         token = self.extra_tunnel_configs.get(container_port)
         if token:
-          self.P(f"Restarting extra tunnel for port {container_port}...", color='y')
+          failures = self._tunnel_consecutive_failures.get(container_port, 0)
+          self.P(
+            f"Restarting extra tunnel for port {container_port} (attempt {failures})...",
+            color='r'
+          )
           self._start_extra_tunnel(container_port, token)
-
-
+      else:
+        # Tunnel is running - maybe reset retry counter
+        self._maybe_reset_tunnel_retry_counter(container_port)
 
 
   def _stop_container_and_save_logs_to_disk(self):
     """
-    Stops the container and cloudflare tunnel.
-    Then logs are saved to disk.
+    Stop the container and all tunnels, then save logs to disk.
+
+    Performs full shutdown sequence:
+    - Stops log streaming threads
+    - Stops main tunnel engine
+    - Stops all extra tunnels
+    - Stops and removes container
+    - Saves logs to disk
+
+    Returns
+    -------
+    None
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
 
@@ -1088,12 +2202,20 @@ class ContainerAppRunnerPlugin(
       self.P(f"Failed to save logs: {exc}", color='r')
     return
 
+
   def on_close(self):
     """
     Lifecycle hook called when plugin is stopping.
-    Ensures container is shut down and logs are saved.
-    Ensures the log process is killed.
-    Stops tunnel if started.
+
+    Performs cleanup including:
+    - Stopping container
+    - Stopping all tunnels (main and extra)
+    - Terminating log processes
+    - Saving container logs to disk
+
+    Returns
+    -------
+    None
     """
     self._stop_container_and_save_logs_to_disk()
 
@@ -1104,8 +2226,10 @@ class ContainerAppRunnerPlugin(
     """
     Get the local Docker image if it exists.
 
-    Returns:
-      Image object or None if image doesn't exist locally
+    Returns
+    -------
+    Image or None
+        Image object or None if image doesn't exist locally
     """
     if not self.cfg_image:
       return None
@@ -1116,34 +2240,40 @@ class ContainerAppRunnerPlugin(
     except Exception:
       return None
 
+
   def _pull_image_from_registry(self):
     """
     Pull image from registry (assumes authentication already done).
 
-    Returns:
-      Image object or None if pull failed
+    Returns
+    -------
+    Image or None
+        Image object or None if pull failed
 
-    Raises:
-      RuntimeError: If authentication hasn't been performed
+    Raises
+    ------
+    RuntimeError
+        If authentication hasn't been performed
     """
     if not self.cfg_image:
       self.P("No Docker image configured", color='r')
       return None
 
     try:
-      self.P(f"Pulling image '{self.cfg_image}'...", color='b')
+      self.P(f"Pulling image '{self.cfg_image}'...")
       img = self.docker_client.images.pull(self.cfg_image)
 
       # docker-py may return Image or list[Image]
       if isinstance(img, list) and img:
         img = img[-1]
 
-      self.P(f"Successfully pulled image '{self.cfg_image}'", color='g')
+      self.P(f"Successfully pulled image '{self.cfg_image}'")
       return img
 
     except Exception as e:
       self.P(f"Image pull failed: {e}", color='r')
       return None
+
 
   def _pull_image_with_fallback(self):
     """
@@ -1155,19 +2285,23 @@ class ContainerAppRunnerPlugin(
     3. Falls back to local image if pull fails
     4. Returns None only if both pull and local check fail
 
-    Returns:
-      Image object or None if no image is available
+    Returns
+    -------
+    Image or None
+        Image object or None if no image is available
 
-    Raises:
-      RuntimeError: If authentication fails and no local image exists
+    Raises
+    ------
+    RuntimeError
+        If authentication fails and no local image exists
     """
     # Step 1: Authenticate with registry
     if not self._login_to_registry():
-      self.P("Registry authentication failed", color='y')
+      self.P("Registry authentication failed", color='r')
       # Try to use local image if authentication fails
       local_img = self._get_local_image()
       if local_img:
-        self.P(f"Using local image (registry login failed): {self.cfg_image}", color='y')
+        self.P(f"Using local image (registry login failed): {self.cfg_image}", color='r')
         return local_img
       raise RuntimeError("Failed to authenticate with registry and no local image available.")
 
@@ -1177,25 +2311,30 @@ class ContainerAppRunnerPlugin(
       return img
 
     # Step 3: Fallback to local image
-    self.P(f"Pull failed, checking for local image: {self.cfg_image}", color='b')
+    self.P(f"Pull failed, checking for local image: {self.cfg_image}", color='r')
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Using local image as fallback: {self.cfg_image}", color='y')
+      self.P(f"Using local image as fallback: {self.cfg_image}", color='r')
       return local_img
 
     # Step 4: No image available
     self.P(f"No image available (pull failed and no local image): {self.cfg_image}", color='r')
     return None
 
+
   def _get_image_digest(self, img):
     """
     Extract digest hash from image object.
 
-    Args:
-      img: Docker image object
+    Parameters
+    ----------
+    img : Image
+        Docker image object
 
-    Returns:
-      str or None: Digest hash (sha256:...) or None
+    Returns
+    -------
+    str or None
+        Digest hash (sha256:...) or None
     """
     if not img:
       return None
@@ -1213,6 +2352,7 @@ class ContainerAppRunnerPlugin(
       return digest
     # Fallback to image id (sha256:...)
     return getattr(img, "id", None)
+
 
   def _get_latest_image_hash(self):
     """
@@ -1236,15 +2376,20 @@ class ContainerAppRunnerPlugin(
     img = self._pull_image_with_fallback()
     return self._get_image_digest(img)
 
+
   def _has_image_hash_changed(self, latest_hash):
     """
     Check if image hash has changed from current version.
 
-    Args:
-      latest_hash: Latest image hash from registry
+    Parameters
+    ----------
+    latest_hash : str
+        Latest image hash from registry
 
-    Returns:
-      bool: True if hash changed and update needed, False otherwise
+    Returns
+    -------
+    bool
+        True if hash changed and update needed, False otherwise
     """
     if not latest_hash:
       # Pull failed, can't determine if update needed
@@ -1252,21 +2397,28 @@ class ContainerAppRunnerPlugin(
 
     if not self.current_image_hash:
       # First time - establish baseline
-      self.P(f"Establishing baseline image hash: {latest_hash}", color='b')
+      self.P(f"Establishing baseline image hash: {latest_hash}")
       self.current_image_hash = latest_hash
       return False
 
     # Compare hashes
     return latest_hash != self.current_image_hash
 
+
   def _handle_image_update(self, new_hash):
     """
     Handle detected image update by updating hash and restarting container.
 
-    Args:
-      new_hash: New image hash detected
+    Parameters
+    ----------
+    new_hash : str
+        New image hash detected
+
+    Returns
+    -------
+    None
     """
-    self.P(f"New image version detected ({new_hash} != {self.current_image_hash}). Restarting container...", color='y')
+    self.P(f"New image version detected ({new_hash} != {self.current_image_hash}). Restarting container...")
 
     # Update current_image_hash BEFORE restart
     # This prevents infinite retry loops if restart fails
@@ -1274,11 +2426,12 @@ class ContainerAppRunnerPlugin(
     self.current_image_hash = new_hash
 
     try:
-      self._restart_container()
+      self._restart_container(StopReason.IMAGE_UPDATE)
     except Exception as e:
       self.P(f"Container restart failed after image update: {e}", color='r')
       # Hash already updated, won't retry this version
-      self.P(f"Image hash updated from {old_hash} to {new_hash}, but container restart failed", color='y')
+      self.P(f"Image hash updated from {old_hash} to {new_hash}, but container restart failed", color='r')
+
 
   def _check_image_updates(self, current_time=None):
     """
@@ -1290,8 +2443,14 @@ class ContainerAppRunnerPlugin(
     3. Compares with current hash
     4. Triggers restart if changed
 
-    Args:
-      current_time: Current timestamp (for interval checking)
+    Parameters
+    ----------
+    current_time : float, optional
+        Current timestamp (for interval checking)
+
+    Returns
+    -------
+    None
     """
     if not self.cfg_autoupdate:
       return
@@ -1305,7 +2464,7 @@ class ContainerAppRunnerPlugin(
     # Get latest image hash
     latest_hash = self._get_latest_image_hash()
     if not latest_hash:
-      self.P("Failed to check for image updates (pull failed). Container continues running.", color='y')
+      self.P("Failed to check for image updates (pull failed). Container continues running.")
       return
 
     # Check if update is needed
@@ -1316,11 +2475,40 @@ class ContainerAppRunnerPlugin(
 
     return
 
-  def _restart_container(self):
-    """Restart the container from scratch."""
-    self.P("Restarting container from scratch...", color='b')
+
+  def _restart_container(self, stop_reason=None):
+    """
+    Restart the container from scratch.
+
+    Parameters
+    ----------
+    stop_reason : StopReason, optional
+        Optional StopReason enum indicating why restart was triggered
+
+    Returns
+    -------
+    None
+    """
+    self.P("Restarting container from scratch...")
+
+    # Preserve state before reset (prevents redundant operations after restart)
+    preserved_failures = self._consecutive_failures
+    preserved_last_success = self._last_successful_start
+    preserved_last_image_check = self._last_image_check
+    preserved_current_hash = self.current_image_hash
+
     self._stop_container_and_save_logs_to_disk()
     self.__reset_vars()
+
+    # Restore preserved state (reset_vars clears it)
+    self._consecutive_failures = preserved_failures
+    self._last_successful_start = preserved_last_success
+    self._last_image_check = preserved_last_image_check
+    self.current_image_hash = preserved_current_hash
+
+    # Set state after reset
+    self._set_container_state(ContainerState.RESTARTING, stop_reason or StopReason.UNKNOWN)
+
     self._configure_dynamic_env()
     self._setup_resource_limits_and_ports()
     self._configure_volumes()
@@ -1335,10 +2523,13 @@ class ContainerAppRunnerPlugin(
     # Ensure image is available (respecting AUTOUPDATE and IMAGE_PULL_POLICY)
     if not self._ensure_image_available():
       self.P("Failed to ensure image availability during restart, cannot start container", color='r')
+      self._set_container_state(ContainerState.FAILED, StopReason.CRASH)
+      self._record_restart_failure()
       return
 
     self.container = self.start_container()
     if not self.container:
+      # start_container already recorded the failure
       return
 
     self.container_start_time = self.time()
@@ -1346,64 +2537,65 @@ class ContainerAppRunnerPlugin(
     self._maybe_execute_build_and_run()
     return
 
-  def _ensure_image_with_autoupdate(self):
-    """
-    Ensure image is available with autoupdate enabled.
-    Always pulls and tracks hash for version comparison.
-
-    Returns:
-      bool: True if image available and hash tracked, False otherwise
-    """
-    self.Pd("AUTOUPDATE enabled, pulling image and tracking hash")
-    self.current_image_hash = self._get_latest_image_hash()
-    return self.current_image_hash is not None
 
   def _ensure_image_always_pull(self):
     """
     Ensure image is available with 'always' pull policy.
+
     Pulls image without tracking hash.
 
-    Returns:
-      bool: True if image pulled successfully, False otherwise
+    Returns
+    -------
+    bool
+        True if image pulled successfully, False otherwise
     """
     self.Pd("IMAGE_PULL_POLICY is 'always', pulling image")
     img = self._pull_image_with_fallback()
     return img is not None
 
+
   def _ensure_image_if_not_present(self):
     """
     Ensure image is available with 'if-not-present' policy.
+
     Only pulls if image doesn't exist locally.
 
-    Returns:
-      bool: True if image is available (locally or after pull), False otherwise
+    Returns
+    -------
+    bool
+        True if image is available (locally or after pull), False otherwise
     """
     # Check if image exists locally
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Image '{self.cfg_image}' found locally", color='g')
+      self.P(f"Image '{self.cfg_image}' found locally")
       return True
 
     # Image not found locally, pull it
-    self.P(f"Image not found locally, pulling '{self.cfg_image}'...", color='b')
+    self.P(f"Image not found locally, pulling '{self.cfg_image}'...")
     img = self._pull_image_with_fallback()
     return img is not None
+
 
   def _ensure_image_available(self):
     """
     Ensure the container image is available before starting container.
 
     This method uses a strategy pattern based on configuration:
-    - AUTOUPDATE enabled: Always pull + track hash (update detection)
+    - AUTOUPDATE enabled: Ensure image exists locally (update detection handled separately)
     - IMAGE_PULL_POLICY='always': Always pull (no tracking)
     - IMAGE_PULL_POLICY='if-not-present' or default: Pull only if missing locally
 
-    Returns:
-      bool: True if image is available, False otherwise
+    Returns
+    -------
+    bool
+        True if image is available, False otherwise
     """
     # Strategy 1: AUTOUPDATE (takes precedence)
+    # When AUTOUPDATE is enabled, just ensure image exists locally
+    # Update checking and pulling happens in _check_image_updates()
     if self.cfg_autoupdate:
-      return self._ensure_image_with_autoupdate()
+      return self._ensure_image_if_not_present()
 
     # Strategy 2: Always pull policy
     if self.cfg_image_pull_policy == "always":
@@ -1412,10 +2604,17 @@ class ContainerAppRunnerPlugin(
     # Strategy 3: If-not-present policy (default)
     return self._ensure_image_if_not_present()
 
+
   def _handle_initial_launch(self):
-    """Handle the initial container launch."""
+    """
+    Handle the initial container launch.
+
+    Returns
+    -------
+    None
+    """
     try:
-      self.P("Initial container launch...", color='b')
+      self.P("Initial container launch...")
 
       # Ensure image is available before starting container
       if not self._ensure_image_available():
@@ -1430,17 +2629,27 @@ class ContainerAppRunnerPlugin(
       self._start_container_log_stream()
       self._maybe_execute_build_and_run()
 
-      self.P("Container launched successfully", color='g')
+      self.P("Container launched successfully")
       self.P(self.container)
       if self.current_image_hash:
-        self.P(f"Current image hash: {self.current_image_hash}", color='d')
+        self.P(f"Current image hash: {self.current_image_hash}")
     except Exception as e:
       self.P(f"Could not start container: {e}", color='r')
     # end try
     return
 
+
   def _perform_periodic_monitoring(self):
-    """Perform periodic monitoring tasks."""
+    """
+    Perform periodic monitoring tasks.
+
+    Executes health checks, image update checks, tunnel health checks,
+    and any subclass-defined additional checks.
+
+    Returns
+    -------
+    None
+    """
     current_time = self.time()
     self._check_health_endpoint(current_time)
     if self.cfg_autoupdate:
@@ -1450,36 +2659,81 @@ class ContainerAppRunnerPlugin(
     if self.extra_tunnel_processes:
       self._check_extra_tunnel_health()
 
-    restart_required = self._perform_additional_checks(current_time)
+    restart_stop_reason = self._perform_additional_checks(current_time)
 
-    if restart_required:
-      self._restart_container()
+    if restart_stop_reason:
+      self._restart_container(restart_stop_reason)
     return
+
 
   def _perform_additional_checks(self, current_time):
     """
     Hook for subclasses to implement additional monitoring checks.
-    
+
+    This hook is called during periodic monitoring to check for conditions
+    that require container restart. Use StopReason.EXTERNAL_UPDATE for
+    domain-specific triggers (Git updates, database changes, file watches, etc.)
+
+    Note: Restarts triggered here BYPASS restart policy - they always execute.
+    This is intentional for planned updates vs unplanned crashes.
+
     Returns
     -------
-    bool
-      True if container restart is required, False otherwise.
+    StopReason or None
+      StopReason if container restart is required, None otherwise.
+
+    Examples
+    --------
+    # Git-based updates (WorkerAppRunner)
+    def _perform_additional_checks(self, current_time):
+      if self._check_git_updates():
+        return StopReason.EXTERNAL_UPDATE
+      return None
+
+    # File watch updates
+    def _perform_additional_checks(self, current_time):
+      if self._config_file_changed():
+        return StopReason.EXTERNAL_UPDATE
+      return None
+
+    # Database schema updates
+    def _perform_additional_checks(self, current_time):
+      if self._schema_version_changed():
+        return StopReason.EXTERNAL_UPDATE
+      return None
     """
-    return False
+    return None
+
 
   def process(self):
     """
-    This is the main process loop for the plugin that gets called each PROCESS_DELAY seconds and
-    it performs the following:
+    Main process loop for the plugin.
 
-      1. Initialize and start tunnel engine if needed
-      2. Check if container is running and restart if needed
-      3. Perform periodic monitoring (health checks, etc.)
-      4. Tunnel engine ping and maintenance
+    Called every PROCESS_DELAY seconds. Performs:
+    1. Check for paused state (manual stop)
+    2. Handle initial launch if container not started
+    3. Initialize and start tunnel engine if needed
+    4. Start main and extra tunnels
+    5. Check container status and restart if needed
+    6. Perform periodic monitoring (health checks, image updates)
+    7. Send tunnel engine pings
 
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    The process loop implements a state machine for container lifecycle
+    management with automatic restart based on configured policies.
     """
-    if self._is_manually_stopped:
-      self.Pd("Manually stopped app. Skipping launch...", color='y')
+    # Use state machine instead of deprecated _is_manually_stopped flag
+    if self.container_state == ContainerState.PAUSED:
+      # Log paused message periodically instead of every process cycle
+      current_time = self.time()
+      if current_time - self._last_paused_log >= self.cfg_paused_state_log_interval:
+        self.P("Container is paused (manual stop). Send RESTART command to resume.")
+        self._last_paused_log = current_time
       return
 
     if not self.container:
@@ -1502,8 +2756,49 @@ class ContainerAppRunnerPlugin(
       if self.extra_tunnel_processes:
         self.read_all_extra_tunnel_logs()
 
-    if not self._check_container_status():
+    # ============================================================================
+    # Container Status Check and Restart Logic
+    # ============================================================================
+    container_is_running = self._check_container_status()
+
+    if not container_is_running:
+      # Container has stopped - decide if we should restart based on policy
+      policy = self._normalize_restart_policy(self.cfg_restart_policy)
+
+      # Check if restart policy allows restart
+      if not self._should_restart_container():
+        self.Pd(f"Container stopped. Restart policy '{policy.value}' does not allow restart.")
+        return
+
+      # Check if we've exceeded max retry attempts
+      if self._has_exceeded_max_retries():
+        self.P(
+          f"Container restart abandoned after {self._consecutive_failures} consecutive failures "
+          f"(max: {self.cfg_restart_max_retries})",
+          color='r'
+        )
+        return
+
+      # Check if we're in backoff period
+      if self._is_restart_backoff_active():
+        self.Pd("Container restart delayed due to active backoff period")
+        return
+
+      # All checks passed - attempt restart
+      self.P(
+        f"Container stopped. Restarting per policy '{policy.value}' "
+        f"(attempt {self._consecutive_failures + 1})",
+        color='r'
+      )
+      self._restart_container(self.stop_reason)
       return
+
+    # Container is running normally - reset retry counter if appropriate
+    self._maybe_reset_retry_counter()
+
+    # ============================================================================
+    # End of Restart Logic
+    # ============================================================================
 
     self._start_container_log_stream()
     self._maybe_execute_build_and_run()

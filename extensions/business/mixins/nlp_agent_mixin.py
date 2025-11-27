@@ -14,11 +14,14 @@ class _NlpAgentMixin(object):
       self.P(msg, **kwargs)
     return
 
+  def filter_valid_inference(self, inference):
+    return isinstance(inference, dict) and inference.get("IS_VALID", True)
+
   def filter_valid_inferences(self, inferences, return_idxs=False):
     res = []
     idxs = []
     for idx, inf in enumerate(inferences):
-      if isinstance(inf, dict) and inf.get("IS_VALID", True):
+      if self.filter_valid_inference(inference=inf):
         res.append(inf)
         idxs.append(idx)
     # endfor inferences
@@ -31,8 +34,21 @@ class _NlpAgentMixin(object):
       'TEXT_RESPONSE': inference.get('text'),
     }
 
+  def handle_single_inference(self, inference, model_name=None):
+    request_id = inference.get('REQUEST_ID', None)
+    self.Pd(f"Processing inference for request ID: {request_id}, model: {model_name}")
+    request_result = self.inference_to_response(inference, model_name)
+    current_payload_kwargs = {
+      'result': request_result,
+      'request_id': request_id,
+    }
+    self.add_payload_by_fields(**current_payload_kwargs)
+    return
+
   def handle_inferences(self, inferences, data=None):
     if not isinstance(inferences, list):
+      return
+    if len(inferences) > 0 and not isinstance(inferences[0], dict):
       return
     model_name = inferences[0].get('MODEL_NAME', None) if len(inferences) > 0 else None
     cnt_initial_inferences = len(inferences)
@@ -47,14 +63,7 @@ class _NlpAgentMixin(object):
     # endif data is not None
 
     for inf in inferences:
-      request_id = inf.get('REQUEST_ID', None)
-      self.Pd(f"Processing inference for request ID: {request_id}, model: {model_name}")
-      request_result = self.inference_to_response(inf, model_name)
-      current_payload_kwargs = {
-        'result': request_result,
-        'request_id': request_id,
-      }
-      self.add_payload_by_fields(**current_payload_kwargs)
+      self.handle_single_inference(inference=inf, model_name=model_name)
     # endfor inferences
     return
 

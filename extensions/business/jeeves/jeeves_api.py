@@ -476,7 +476,7 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin, _ChainstoreResponseMix
       If the request is not ready, it is further postponed.
       """
       if request_id in self.__requests:
-        self.Pd(f"Checking request '{request_id}'...", color="yellow")
+        self.Pd(f"Checking request '{request_id}'...")
         request = self.__requests[request_id]
         start_time = request['start_time']
         timeout = request['timeout']
@@ -492,6 +492,9 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin, _ChainstoreResponseMix
         # endif
       else:
         self.P(f"Request {request_id} not found in __requests.", color="red")
+        return {
+          'error': f'Request ID {request_id} not found',
+        }
       # endif
       # Maybe handle case where request_id is not in __requests?
       return self.create_postponed_request(
@@ -2706,6 +2709,13 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin, _ChainstoreResponseMix
           return message
       # endfor
       return None
+
+    @_NetworkProcessorMixin.payload_handler(signature="VLLM_AGENT")
+    def handle_payload_vllm_agent(self, data):
+      return self.handle_payload_helper(
+        data=data,
+        agent_type="LLM",
+      )
 
     @_NetworkProcessorMixin.payload_handler(signature="LLM_AGENT")
     def handle_payload_llm_agent(self, data):

@@ -107,8 +107,48 @@ class LlmCT:
 
 """LOGITS PROCESSOR SECTION"""
 if True:
+  # 0. Base class for per-sample logits processors
+  class BasePerSampleLogitsProcessor(LogitsProcessor):
+    """
+    Helper base class for per-sample logits processors that must also work
+    when beam search is enabled (num_beams > 1).
+
+    It expands a per-sample vector of shape (B,) to match the *effective*
+    batch dimension during generation, which is batch_beam_size = B * num_beams.
+    """
+
+    @staticmethod
+    def _expand_vector(
+        vec: th.Tensor,
+        batch_beam_size: int,
+        device: th.device,
+        name: str,
+    ) -> th.Tensor:
+      """
+      Expand a (B,) tensor `vec` to (batch_beam_size,) by repeating across beams
+      when batch_beam_size != B.
+
+      If batch_beam_size == B, the vector is returned as-is.
+      """
+      vec = vec.to(device)
+      base_B = vec.size(0)
+
+      if batch_beam_size == base_B:
+        # No beams or already expanded.
+        return vec
+
+      if batch_beam_size % base_B != 0:
+        raise ValueError(
+          f"{name}: batch_beam_size={batch_beam_size} is not divisible "
+          f"by per-sample size {base_B}."
+        )
+
+      num_beams = batch_beam_size // base_B
+      # (B,) -> (B, num_beams) -> (B * num_beams,)
+      return vec.unsqueeze(1).expand(-1, num_beams).reshape(-1)
+
   # 1. Per-row Temperature with greedy fallback
-  class PerSampleTemperature(LogitsProcessor):
+  class PerSampleTemperature(BasePerSampleLogitsProcessor):
     """
     Vectorised temperature scaling that *also* supports T == 0 -> greedy.
     - temps : list / 1-D tensor with length == batch_size.
@@ -134,20 +174,43 @@ if True:
       safe_t[self.greedy_mask] = 1.0  # avoid divide-by-zero
       self.inv_t = 1.0 / safe_t  # store reciprocal for faster mul
       self.has_greedy = self.greedy_mask.any()
+      return
 
     def __call__(self, input_ids: th.Tensor, scores: th.Tensor) -> th.Tensor:
+      device = scores.device
+      batch_beam_size, _ = scores.shape
+
+      # Expand per-sample 1/T to per-(sample,beam)
+      eff_inv_t = self._expand_vector(self.inv_t, batch_beam_size, device,
+                                      "PerSampleTemperature.inv_t")
+
       # --- 1  Scale logits (scores *= 1/T)  ---------------------------
-      scores.mul_(self.inv_t.to(scores.device).unsqueeze(-1))
+      scores.mul_(eff_inv_t.unsqueeze(-1))
 
       # --- 2  Force arg-max for rows with T == 0  ---------------------
       if self.has_greedy:  # host flag -> no GPU sync cost
-        gmask = self.greedy_mask.to(scores.device)  # (B,)
-        row_idx = th.nonzero(gmask, as_tuple=True)[0]  # rows that are greedy
-        col_idx = scores[gmask].argmax(dim=-1)  # winning token per row
+        eff_gmask = self._expand_vector(
+          self.greedy_mask, batch_beam_size, device, "PerSampleTemperature.greedy_mask"
+        )  # (B * num_beams,)
 
-        # ❶ Set full row to −inf in bulk, ❷ restore the winner to 0
-        scores[gmask] = -float("inf")  # boolean-mask assignment is fused.
-        scores[row_idx, col_idx] = 0.0
+        row_idx = th.nonzero(eff_gmask, as_tuple=True)[0]  # rows that are greedy
+        col_idx = scores[eff_gmask].argmax(dim=-1)  # winning token per row
+
+        scores[eff_gmask] = -float("inf")  # bulk-mask rows
+        scores[row_idx, col_idx] = 0.0  # restore winners
+
+      # # --- 1  Scale logits (scores *= 1/T)  ---------------------------
+      # scores.mul_(self.inv_t.to(scores.device).unsqueeze(-1))
+      #
+      # # --- 2  Force arg-max for rows with T == 0  ---------------------
+      # if self.has_greedy:  # host flag -> no GPU sync cost
+      #   gmask = self.greedy_mask.to(scores.device)  # (B,)
+      #   row_idx = th.nonzero(gmask, as_tuple=True)[0]  # rows that are greedy
+      #   col_idx = scores[gmask].argmax(dim=-1)  # winning token per row
+      #
+      #   # ❶ Set full row to −inf in bulk, ❷ restore the winner to 0
+      #   scores[gmask] = -float("inf")  # boolean-mask assignment is fused.
+      #   scores[row_idx, col_idx] = 0.0
 
       return scores
 
@@ -155,7 +218,7 @@ if True:
       return f"{self.__class__.__name__}(temps={self.inv_t.tolist()})"
 
   # 2. Per-row Top-p (nucleus) sampling
-  class PerSampleTopP(LogitsProcessor):
+  class PerSampleTopP(BasePerSampleLogitsProcessor):
     """
     Vectorised nucleus-filtering with a *different* p for every row.
     For each sequence we keep the smallest set of tokens whose cum-prob >= p,
@@ -168,14 +231,23 @@ if True:
         raise ValueError("top_p must be in (0, 1].")
       self.ps = ps
       self.min_keep = min_tokens_to_keep
+      return
 
     def __call__(self, input_ids: th.Tensor, logits: th.Tensor) -> th.Tensor:
+      device = logits.device
+      batch_beam_size, _ = logits.shape
+
+      # Expand per-sample top_p to per-(sample,beam)
+      eff_ps = self._expand_vector(
+        self.ps, batch_beam_size, device, "PerSampleTopP.ps"
+      )
+
       # 1  Convert logits->probs; sort descending to get cumsum easily
       probs, idx = logits.softmax(dim=-1).sort(dim=-1, descending=True)
       cumprobs = probs.cumsum(dim=-1)
 
       # 2  For each row, mask tokens once cum prob exceeds its own p
-      cut_mask = cumprobs > self.ps.to(logits.device).unsqueeze(-1)
+      cut_mask = cumprobs > eff_ps.unsqueeze(-1)
       cut_mask[..., : self.min_keep] = False  # guarantee >=min_keep tokens
 
       # 3  Translate mask back to original vocab order in-place
@@ -189,7 +261,7 @@ if True:
       return f"{self.__class__.__name__}(top_ps={self.ps.tolist()}, min_tokens_to_keep={self.min_keep})"
 
   # 3. Per-row Repetition Penalty
-  class PerSampleRepetitionPenalty(LogitsProcessor):
+  class PerSampleRepetitionPenalty(BasePerSampleLogitsProcessor):
     """
     Implements the algorithm from HF's RepetitionPenaltyLogitsProcessor
     but with a vector of penalties, one per sequence, and **no Python loop**.
@@ -207,17 +279,23 @@ if True:
       if (p <= 0).any():
         raise ValueError("repetition_penalty must be > 0.")
       self.pen = p
+      return
 
     def __call__(self, input_ids: th.Tensor, logits: th.Tensor) -> th.Tensor:
-      B, V = logits.shape
+      B_eff, V = logits.shape
       device = logits.device
 
+      # Expand per-sample penalty to per-(sample,beam)
+      eff_pen = self._expand_vector(
+        self.pen, B_eff, device, "PerSampleRepetitionPenalty.pen"
+      )
+
       # 1  Build (B,V) mask of tokens present in each prefix
-      seen_tok = th.zeros((B, V), dtype=th.bool, device=device)
+      seen_tok = th.zeros((B_eff, V), dtype=th.bool, device=device)
       seen_tok.scatter_(1, input_ids, True)  # O(B·seq_len) write
 
       # 2  Broadcast row-wise penalty factors
-      pen = self.pen.to(device).unsqueeze(-1)  # (B,1) -> (B,V) via broadcast
+      pen = eff_pen.unsqueeze(-1)  # (B,1) -> (B,V) via broadcast
 
       # 3  Apply formula in one fused where
       #     > if l > 0: l = l / p
@@ -234,7 +312,7 @@ if True:
       return f"{self.__class__.__name__}(penalties={self.pen.tolist()})"
 
   # 4. Per-row Max-new-tokens gate
-  class PerSampleMaxLength(LogitsProcessor):
+  class PerSampleMaxLength(BasePerSampleLogitsProcessor):
     """
     Soft EOS gate used instead of the global `max_new_tokens` arg.
     As soon as *any* row reaches its personal length budget, we force
@@ -253,14 +331,25 @@ if True:
       self.target_len = (th.as_tensor(prompt_lens) +
                          th.as_tensor(max_new_tokens))
       self.eos_id = eos_token_id
+      return
 
     def __call__(self, input_ids: th.Tensor, logits: th.Tensor) -> th.Tensor:
+      device = input_ids.device
+      batch_beam_size = input_ids.size(0)
       cur_len = input_ids.size(1)
-      done_mask = cur_len >= self.target_len.to(input_ids.device)  # (B,)
+
+      # Expand per-sample target_len to per-(sample,beam)
+      eff_target_len = self._expand_vector(
+        self.target_len, batch_beam_size, device, "PerSampleMaxLength.target_len"
+      )
+
+      # Now eff_target_len shape matches batch_beam_size
+      done_mask = cur_len >= eff_target_len  # (batch_beam_size,)
 
       # Bulk-mask done rows; boolean index is cheap/no-op when all-False.
       logits[done_mask] = -float("inf")
       logits[done_mask, self.eos_id] = 0.0
+
       return logits
 
     def __repr__(self):

@@ -86,6 +86,18 @@ from extensions.business.container_apps.container_app_runner import ContainerApp
 class WorkerAppRunnerConfigTests(unittest.TestCase):
 
   def _make_plugin(self):
+    """
+    Create a mock WorkerAppRunnerPlugin instance for testing.
+
+    Creates a plugin instance with mock attributes and methods
+    to facilitate unit testing without requiring actual Docker
+    infrastructure or network connections.
+
+    Returns
+    -------
+    WorkerAppRunnerPlugin
+        A mock plugin instance with test configuration
+    """
     plugin = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)
     plugin.P = lambda *args, **kwargs: None
     from collections import deque
@@ -115,6 +127,7 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     return plugin
 
   def test_configure_repo_url_public(self):
+    """Test repository URL configuration for public repositories."""
     plugin = self._make_plugin()
     plugin.cfg_vcs_data = {
       "REPO_OWNER": "ratio1",
@@ -124,6 +137,7 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     self.assertEqual(plugin.repo_url, "https://github.com/ratio1/demo.git")
 
   def test_configure_repo_url_with_credentials(self):
+    """Test repository URL configuration with username and token credentials."""
     plugin = self._make_plugin()
     plugin.cfg_vcs_data = {
       "REPO_OWNER": "ratio1",
@@ -135,6 +149,7 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     self.assertEqual(plugin.repo_url, "https://user:token@github.com/ratio1/demo.git")
 
   def test_configure_repo_url_token_only(self):
+    """Test repository URL configuration with token-only authentication."""
     plugin = self._make_plugin()
     plugin.cfg_vcs_data = {
       "REPO_OWNER": "ratio1",
@@ -145,6 +160,7 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     self.assertEqual(plugin.repo_url, "https://token@github.com/ratio1/demo.git")
 
   def test_check_image_updates_respects_autoupdate_flag(self):
+    """Test that image update checks respect the AUTOUPDATE flag."""
     plugin = self._make_plugin()
     plugin.cfg_autoupdate = False
     plugin._last_image_check = 0
@@ -156,6 +172,7 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     plugin._check_image_updates(current_time=100)
 
   def test_check_image_updates_triggers_restart_on_new_digest(self):
+    """Test that new image digest triggers container restart."""
     plugin = self._make_plugin()
     plugin.cfg_autoupdate = True
     plugin.cfg_autoupdate_interval = 10
@@ -171,6 +188,7 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     self.assertEqual(restart_calls, ["called"])
 
   def test_configure_volumes_primary_path(self):
+    """Test volume configuration creates directories with correct permissions."""
     plugin = self._make_plugin()
     plugin.cfg_volumes = {"/data": "/app/data"}
 
@@ -188,6 +206,7 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     self.assertEqual(stat.S_IMODE(os.stat(host_path).st_mode), 0o777)
 
   def test_on_config_triggers_restart(self):
+    """Test that configuration changes trigger container restart."""
     plugin = self._make_plugin()
     with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
          mock.patch.object(plugin, "_restart_from_scratch") as restart_mock:
@@ -197,6 +216,7 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     restart_mock.assert_called_once()
 
   def test__on_config_aliases_to_on_config(self):
+    """Test that _on_config is an alias for on_config method."""
     plugin = self._make_plugin()
     with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
          mock.patch.object(plugin, "_restart_from_scratch") as restart_mock:
@@ -209,6 +229,18 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
 class ContainerAppRunnerConfigTests(unittest.TestCase):
 
   def _make_plugin(self):
+    """
+    Create a mock ContainerAppRunnerPlugin instance for testing.
+
+    Creates a plugin instance with mock attributes and methods
+    to facilitate unit testing without requiring actual Docker
+    infrastructure or network connections.
+
+    Returns
+    -------
+    ContainerAppRunnerPlugin
+        A mock plugin instance with test configuration
+    """
     plugin = ContainerAppRunnerPlugin.__new__(ContainerAppRunnerPlugin)
     plugin.P = lambda *args, **kwargs: None
     from collections import deque
@@ -238,6 +270,7 @@ class ContainerAppRunnerConfigTests(unittest.TestCase):
     return plugin
 
   def test_on_config_triggers_restart(self):
+    """Test that configuration changes trigger container restart."""
     plugin = self._make_plugin()
     with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
          mock.patch.object(plugin, "_restart_container") as restart_mock:
@@ -247,6 +280,7 @@ class ContainerAppRunnerConfigTests(unittest.TestCase):
     restart_mock.assert_called_once()
 
   def test__on_config_aliases_to_on_config(self):
+    """Test that _on_config is an alias for on_config method."""
     plugin = self._make_plugin()
     with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
          mock.patch.object(plugin, "_restart_container") as restart_mock:

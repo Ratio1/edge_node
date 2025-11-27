@@ -95,6 +95,8 @@ class JeevesListenerDataCapture(BaseClass, _JeevesUtilsMixin):
     """
     payload_path = message.get(self.ct.PAYLOAD_DATA.EE_PAYLOAD_PATH, [None, None, None, None])
     payload_signature = payload_path[2] if len(payload_path) >= 3 else None
+    explicit_signature = message.get(self.ct.SIGNATURE, None)
+    payload_signature = payload_signature or explicit_signature
 
     return payload_signature in JeevesCt.JEEVES_API_SIGNATURES
 

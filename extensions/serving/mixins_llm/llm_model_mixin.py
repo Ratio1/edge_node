@@ -56,7 +56,7 @@ class LlmModelMixin(object):
 
   def _get_model_load_config(self):
     return self.log.get_model_load_config(
-      model_name=self.cfg_model_name,
+      model_name=self.get_model_name(),
       token=self.hf_token,
       has_gpu=self.has_gpu,
       weights_size=self.cfg_model_weights_size,
@@ -93,7 +93,7 @@ class LlmModelMixin(object):
     # Load the tokenizer and output to log.
     cache_dir = self.cache_dir
     token = self.hf_token
-    model_id = self.cfg_model_name
+    model_id = self.get_model_name()
     self.P("Loading tokenizer for {} in '{}'...".format(model_id, cache_dir))
     self.load_tokenizer(model_id, cache_dir, token)
 
@@ -142,7 +142,7 @@ class LlmModelMixin(object):
     Will first set up the model loading configuration and then load the model
 
     """
-    model_id = self.cfg_model_name
+    model_id = self.get_model_name()
     model_params, quantization_params = self._get_model_load_config()
     self.P("Loading {} with following parameters:\n{}\nQuantization params: {}".format(
       model_id,
@@ -202,6 +202,11 @@ class LlmModelMixin(object):
       **kwargs
     }
 
+    # This is done to avoid issues in case the default temperature of a model is 0.0
+    # which could lead to issues when generating with sampling enabled.
+    res.setdefault("temperature", 1.0)
+    res.setdefault("num_beams", self.cfg_default_num_beams)
+
     prompt_lens = attention_mask.sum(dim=1).tolist()
     temperatures = [pkwargs.get("temperature", self.cfg_default_temperature) for pkwargs in predict_kwargs_lst]
     top_ps = [pkwargs.get("top_p", self.cfg_default_top_p) for pkwargs in predict_kwargs_lst]
@@ -210,13 +215,22 @@ class LlmModelMixin(object):
     max_new_tokens = [pkwargs.get("max_new_tokens", self.cfg_default_max_tokens) for pkwargs in predict_kwargs_lst]
 
     eos_token_id = self.tokenizer.eos_token_id
-
-    logits_processors = LogitsProcessorList([
-      PerSampleTemperature(temperatures),
+    max_temperature = max(temperatures)
+    lst_logits_processors = [
       PerSampleTopP(top_ps),
       PerSampleRepetitionPenalty(penalties),
       PerSampleMaxLength(prompt_lens, max_new_tokens, eos_token_id),
-    ])
+    ]
+    if max_temperature > 0.0:
+      lst_logits_processors.append(
+        PerSampleTemperature(temperatures)
+      )
+    else:
+      res["temperature"] = 0.0
+      res["do_sample"] = False
+    # endif max_temperature > 0.0
+
+    logits_processors = LogitsProcessorList(lst_logits_processors)
 
     max_ceiling = max(pl + mnt for pl, mnt in zip(prompt_lens, max_new_tokens))
     res["max_length"] = max_ceiling

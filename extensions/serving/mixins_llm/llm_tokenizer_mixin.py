@@ -37,7 +37,7 @@ class LlmTokenizerMixin(object):
         f"---"
     )
 
-  def _get_prompt_from_template(self, messages, context=None):
+  def preprocess_messages(self, messages, context=None):
     """
     Uses Jinja template to generate a prompt.
 
@@ -107,13 +107,38 @@ class LlmTokenizerMixin(object):
         # endif non-empty chat
       # endif context provided
     # The context feature is disabled until further improvements are made.
+    return chat
 
+  def _get_prompt_from_template(self, messages, context=None):
+    """
+    Uses Jinja template to generate a prompt.
+
+    Parameters
+    ----------
+    messages : list[dict]
+        List of dictionaries, where each dictionary represents a message in the conversation.
+        Each dictionary should have the keys 'role' and 'content'.
+        The 'role' key should be one of 'user', 'assistant', or 'system'.
+    context : list or str, optional
+        the context for the prompt - CURRENTLY DISABLED
+
+    Returns
+    -------
+    str
+        full prompt
+
+    Raises
+    ------
+    ValueError
+        _description_
+    """
+    chat = self.preprocess_messages(messages, context)
     self.P(f"Processing chat:\n{chat}")
 
     date_string = self.datetime.now(self.timezone.utc).date().isoformat()
     from_template = self.tokenizer.apply_chat_template(
       chat, tokenize=False,
       add_generation_prompt=self.cfg_add_generation_prompt,
-      date_string=date_string
+      # date_string=date_string
     )
     return from_template
