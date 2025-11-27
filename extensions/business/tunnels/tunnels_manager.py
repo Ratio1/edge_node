@@ -1,8 +1,9 @@
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.0.2'
+__VER__ = '0.1.0'
 
 MESSAGE_PREFIX = "Please sign this message to manage your tunnels: "
+MESSAGE_PREFIX_DEEPLOY = "Please sign this message for Deeploy: "
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -65,12 +66,21 @@ class TunnelsManagerPlugin(BasePlugin):
     Get Cloudflare secrets for the sender address.
     """
     self._verify_nonce(payload['nonce'])
-    sender = self.bc.eth_verify_payload_signature(
-      payload=payload,
-      message_prefix=MESSAGE_PREFIX,
-      no_hash=True,
-      indent=1,
-    )
+    sender = None
+    signature_errors = []
+    for prefix in (MESSAGE_PREFIX, MESSAGE_PREFIX_DEEPLOY):
+      try:
+        sender = self.bc.eth_verify_payload_signature(
+          payload=payload,
+          message_prefix=prefix,
+          no_hash=True,
+          indent=1,
+        )
+        break
+      except Exception as exc:
+        signature_errors.append(str(exc))
+    if sender is None:
+      raise Exception(f"Signature verification failed for provided payload: {signature_errors}")
     secrets = self.chainstore_hget(hkey="tunnels_manager_secrets", key=sender)
     # TODO we should add a CSP password to be used as token in cstore
     if secrets is None:
@@ -110,11 +120,12 @@ class TunnelsManagerPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="post")
-  def new_tunnel(self, alias: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str, cloudflare_domain: str):
+  def new_tunnel(self, alias: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str, cloudflare_domain: str, service_name: str | None = None,):
     """
     Create a new Cloudflare tunnel.
     """
-    new_id = self.uuid()
+    new_uuid = self.uuid()
+    new_id = f"{service_name}-{new_uuid}" if service_name is not None else new_uuid
     url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel"
     headers = {
       "Authorization": f"Bearer {cloudflare_api_key}"
@@ -181,6 +192,18 @@ class TunnelsManagerPlugin(BasePlugin):
     if response["success"] is False:
       raise Exception("Error fetching tunnel: " + str(response['errors']))
     return response['result']
+
+  @BasePlugin.endpoint(method="get")
+  def get_tunnel_by_token(self, tunnel_token: str, cloudflare_account_id: str, cloudflare_api_key: str):
+    """
+    Get tunnel details using its tunnel token.
+    """
+    tunnels = self.get_tunnels(cloudflare_account_id, cloudflare_api_key)
+    for tunnel in tunnels:
+      metadata = tunnel.get('metadata', {})
+      if metadata.get('tunnel_token') == tunnel_token:
+        return tunnel
+    raise Exception("Tunnel not found for provided token.")
 
   @BasePlugin.endpoint(method="delete")
   def delete_tunnel(self, tunnel_id: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str):
