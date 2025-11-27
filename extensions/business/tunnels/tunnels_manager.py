@@ -81,7 +81,8 @@ class TunnelsManagerPlugin(BasePlugin):
       except Exception as exc:
         signature_errors.append(str(exc))
     if sender is None:
-      raise Exception(f"Signature verification failed for provided payload: {'\n'.join(signature_errors)}")
+      signature_errors_msg = "\n".join(signature_errors)
+      raise Exception(f"Signature verification failed for provided payload: {signature_errors_msg}")
     secrets = self.chainstore_hget(hkey="tunnels_manager_secrets", key=sender)
     # TODO we should add a CSP password to be used as token in cstore
     if secrets is None:
