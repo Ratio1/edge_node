@@ -1,6 +1,6 @@
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.1.0'
+__VER__ = '0.1.1'
 
 MESSAGE_PREFIX = "Please sign this message to manage your tunnels: "
 MESSAGE_PREFIX_DEEPLOY = "Please sign this message for Deeploy: "
@@ -75,12 +75,13 @@ class TunnelsManagerPlugin(BasePlugin):
           message_prefix=prefix,
           no_hash=True,
           indent=1,
+          raise_if_error=True,
         )
         break
       except Exception as exc:
         signature_errors.append(str(exc))
     if sender is None:
-      raise Exception(f"Signature verification failed for provided payload: {signature_errors}")
+      raise Exception(f"Signature verification failed for provided payload: {'\n'.join(signature_errors)}")
     secrets = self.chainstore_hget(hkey="tunnels_manager_secrets", key=sender)
     # TODO we should add a CSP password to be used as token in cstore
     if secrets is None:
