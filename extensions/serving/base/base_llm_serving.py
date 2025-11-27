@@ -124,6 +124,7 @@ _CONFIG = {
   "DEFAULT_TEMPERATURE" : 0.7,
   "DEFAULT_TOP_P"      : 1,
   "DEFAULT_MAX_TOKENS" : 2048,
+  "DEFAULT_NUM_BEAMS" : 1,
   "SKIP_ERRORS"           : True,
   "RELEVANT_SIGNATURES": None,
   "GENERATION_SEED": 42,  # Seed for generation, can be set to None for random seed
@@ -436,6 +437,8 @@ class BaseLlmServing(
   def check_relevant_input(self, input_dict: dict):
     inp_payload_path = input_dict.get(self.ct.PAYLOAD_DATA.EE_PAYLOAD_PATH, [None, None, None, None])
     inp_signature = inp_payload_path[2]
+    explicit_signature = input_dict.get(self.ct.SIGNATURE, None)
+    inp_signature = inp_signature or explicit_signature
     normalized_signature = str(inp_signature).upper() if inp_signature is not None else None
 
     if normalized_signature not in self.get_relevant_signatures():
@@ -533,10 +536,10 @@ class BaseLlmServing(
       }
       request_id = jeeves_content.get(LlmCT.REQUEST_ID, None)
       messages = jeeves_content.get(LlmCT.MESSAGES, [])
-      temperature = jeeves_content.get(LlmCT.TEMPERATURE) or self.cfg_default_temperature
-      top_p = jeeves_content.get(LlmCT.TOP_P) or self.cfg_default_top_p
-      max_tokens = jeeves_content.get(LlmCT.MAX_TOKENS) or self.cfg_default_max_tokens
-      repetition_penalty = jeeves_content.get("REPETITION_PENALTY", self.cfg_repetition_penalty)
+      temperature = jeeves_content.setdefault(LlmCT.TEMPERATURE, self.cfg_default_temperature)
+      top_p = jeeves_content.setdefault(LlmCT.TOP_P, self.cfg_default_top_p)
+      max_tokens = jeeves_content.setdefault(LlmCT.MAX_TOKENS, self.cfg_default_max_tokens)
+      repetition_penalty = jeeves_content.setdefault("REPETITION_PENALTY", self.cfg_repetition_penalty)
       request_context = jeeves_content.get(LlmCT.CONTEXT, None)
       valid_condition = jeeves_content.get(LlmCT.VALID_CONDITION, None)
       process_method = jeeves_content.get(LlmCT.PROCESS_METHOD, None)
@@ -746,7 +749,10 @@ class BaseLlmServing(
     if fence_match:
       return fence_match.group(1).strip()  # exclude the back-ticks
 
-    # ── 3. Nothing found → give back the original string
+    # ── 3. Nothing found → give back the original string and maybe remove ```
+    if text.strip().endswith("```"):
+      text = text.strip().strip("```").strip()
+    # endif text endswith ```
     return text
 
   def remove_sql_comments(self, text: str):
