@@ -1,22 +1,21 @@
 """
 LOCAL_SERVING_API Plugin
 
-This plugin creates a FastAPI server for local-only access (localhost) that works with
-a loopback data capture pipeline.
+This plugin creates a FastAPI server for both local-only access (localhost) and through tunneling
+that works with a loopback data capture pipeline.
 It can work with both async and sync requests.
 In case of sync requests, they will be processed using PostponedRequest objects.
 Otherwise, the request_id will be returned immediately, and the client can poll for results.
 
 Key Features:
 - Loopback mode: Outputs return to DCT queue for processing
-- No token authentication (localhost only)
-- Designed for general inference tasks(e.g. image analysis or text processing)
+- Designed for LLM chat completions
 
 Available Endpoints:
-- POST /predict - Submit image for analysis (returns result via PostponedRequest)
-- GET /list_results - Get all processed image results
-- GET /status - Get system status and statistics
+- POST /create_chat_completion - Create chat completion (sync)
+- POST /create_chat_completion_async - Create chat completion (async)
 - GET /health - Health check
+- GET /status_request - Check for current status of async request results
 
 Example pipeline configuration:
 {
@@ -51,8 +50,10 @@ _CONFIG = {
   **BasePlugin.CONFIG,
   **NLP_AGENT_MIXIN_CONFIG,
 
+  # MANDATORY SETTING IN ORDER TO RECEIVE REQUESTS
   "ALLOW_EMPTY_INPUTS": True,  # allow processing even when no input data is present
 
+  # MANDATORY LOOPBACK SETTINGS
   "IS_LOOPBACK_PLUGIN": True,
   "TUNNEL_ENGINE_ENABLED": False,
   "API_TITLE": "Local Inference API",
@@ -186,7 +187,7 @@ class BaseInferenceApiPlugin(
       }
 
     @BasePlugin.endpoint(method="GET")
-    def poll_request(self, request_id: str):
+    def check_request(self, request_id: str):
       res = {
         "error": f"Request ID {request_id} not found."
       }
@@ -282,7 +283,7 @@ class BaseInferenceApiPlugin(
       if async_request:
         return {
           "request_id": request_id,
-          "poll_url": f"/poll_request?request_id={request_id}"
+          "poll_url": f"/status_request?request_id={request_id}"
         }
       return self.solve_postponed_request(request_id=request_id)
 
