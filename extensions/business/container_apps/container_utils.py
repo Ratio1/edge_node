@@ -93,14 +93,27 @@ class _ContainerUtilsMixin:
     dct_env = {
       "CONTAINER_NAME": self.container_name,
       "EE_CONTAINER_NAME": self.container_name,
+      "R1EN_CONTAINER_NAME": self.container_name,
       "EE_HOST_IP": localhost_ip,
+      "R1EN_HOST_IP": localhost_ip,
       "EE_HOST_ID": self.ee_id,
+      "R1EN_HOST_ID": self.ee_id,
       "EE_HOST_ADDR": self.ee_addr,
+      "R1EN_HOST_ADDR": self.ee_addr,
       "EE_HOST_ETH_ADDR": self.bc.eth_address,
+      "R1EN_HOST_ETH_ADDR": self.bc.eth_address,
       "EE_EVM_NET": self.bc.get_evm_network(),
+      "R1EN_EVM_NET": self.bc.get_evm_network(),
       "EE_CHAINSTORE_API_URL": f"http://{localhost_ip}:31234",
+      "R1EN_CHAINSTORE_API_URL": f"http://{localhost_ip}:31234",
       "EE_R1FS_API_URL": f"http://{localhost_ip}:31235",
+      "R1EN_R1FS_API_URL": f"http://{localhost_ip}:31235",
       "EE_CHAINSTORE_PEERS": str_chainstore_peers,
+      "R1EN_CHAINSTORE_PEERS": str_chainstore_peers,
+      
+      # OBSERVATION: From now on only add new env vars with R1EN_ prefix
+      #              to avoid missunderstandings with EE_ prefixed vars that
+      #              are legacy from the Edge Node environment itself.
     }
 
     return dct_env
