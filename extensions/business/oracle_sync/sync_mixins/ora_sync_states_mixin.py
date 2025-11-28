@@ -125,6 +125,7 @@ class _OraSyncStatesCallbacksMixin:
         # Here, the epoch manager cache data does not need to also be forcefully update.
         # The only updates done are for the epochs CIDs
         self.netmon.epoch_manager.save_status()
+        self.netmon.epoch_manager.maybe_update_cached_data(force=True)
         self.P(f"Epoch manager status saved.")
       # endif newly uploaded epochs
 

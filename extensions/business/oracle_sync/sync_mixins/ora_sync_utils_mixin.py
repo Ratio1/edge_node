@@ -175,7 +175,9 @@ class _OraSyncUtilsMixin:
           If empty list, no keys will be processed.
           By default, None, which means all keys will be processed.
       debug : bool, optional
-          Whether to print debug messages, by default True
+          Whether to print debug messages, by default True.
+          To avoid spamming, the verbose mode for each individual CID retrieval
+          will be controlled by the `cfg_debug_sync_full` configuration parameter.
 
       Returns
       -------
@@ -213,6 +215,9 @@ class _OraSyncUtilsMixin:
 
       updated_values = {}
       cids = {}
+      t0 = self.time()
+      max_elapsed = 0
+      n_processed = 0
       for key, msg_data in nested_message_dict.items():
         # 1. Check if process_only_keys is provided and if the current key is in it.
         if process_only_keys is not None and key not in process_only_keys:
@@ -222,20 +227,31 @@ class _OraSyncUtilsMixin:
           continue
         # 3. Check if the data is a CID or data.
         if isinstance(msg_data, str):
-          if debug:
+          if self.cfg_debug_sync_full:
             self.P(f"Attempting to get data from R1FS using CID {msg_data}.")
+          n_processed += 1
+          t1 = self.time()
           # 4. Attempt to get the data from R1FS.
-          res = self.r1fs_get_pickle(cid=msg_data, debug=debug)
-          if res is not None and debug:
+          res = self.r1fs_get_pickle(cid=msg_data, debug=self.cfg_debug_sync_full)
+          max_elapsed = max(max_elapsed, self.time() - t1)
+          if res is not None:
             # 5. If the retrieval was successful, store the result.
             updated_values[key] = res
             cids[key] = msg_data
-            self.P(f"Successfully retrieved data from R1FS using CID {msg_data}.")
+            if self.cfg_debug_sync_full:
+              self.P(f"Successfully retrieved data from R1FS using CID {msg_data}.")
+            # endif debug
           else:
             success = False
             break
         # endif
       # endfor key, data
+      if debug:
+        elapsed = self.time() - t0
+        mean_time = elapsed / n_processed if n_processed > 0 else 0
+        stats_str = f"[{mean_time:.2f}s/key|mx: {max_elapsed:.2f}s]"
+        self.P(f"Processed {n_processed} keys from nested message in {elapsed:.2f}s[{stats_str}].")
+      # endif debug
       # 6. Update the nested message dictionary with the retrieved values.
       nested_message_dict.update(updated_values)
       return (success, nested_message_dict, cids) if return_cids else (success, nested_message_dict)
