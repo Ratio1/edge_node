@@ -81,8 +81,11 @@ __VER__ = "0.6.1"
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
-# Persistent state filename (general purpose)
-_PERSISTENT_STATE_FILE = "container_persistent_state.pkl"
+# Persistent state filename (stored in instance-specific subfolder)
+_PERSISTENT_STATE_FILE = "persistent_state.pkl"
+
+# Subfolder prefix for container app data
+_CONTAINER_APPS_SUBFOLDER = "container_apps"
 
 
 class ContainerState(Enum):
@@ -418,6 +421,25 @@ class ContainerAppRunnerPlugin(
   # ============================================================================
 
 
+  def _get_instance_data_subfolder(self):
+    """
+    Get instance-specific subfolder for persistent data.
+
+    Uses plugin_id to ensure each plugin instance has its own data folder,
+    preventing collisions when multiple containers run on the same node.
+
+    Structure: container_apps/{plugin_id}/
+      - persistent_state.pkl
+      - (future: logs, etc.)
+
+    Returns
+    -------
+    str
+        Subfolder path: container_apps/{plugin_id}
+    """
+    return f"{_CONTAINER_APPS_SUBFOLDER}/{self.plugin_id}"
+
+
   def _load_persistent_state(self):
     """
     Load persistent state from disk.
@@ -427,7 +449,10 @@ class ContainerAppRunnerPlugin(
     dict
         Persistent state dictionary (empty dict if no state exists)
     """
-    state = self.diskapi_load_pickle_from_data(_PERSISTENT_STATE_FILE)
+    state = self.diskapi_load_pickle_from_data(
+      _PERSISTENT_STATE_FILE,
+      subfolder=self._get_instance_data_subfolder()
+    )
     return state if state is not None else {}
 
 
@@ -453,7 +478,11 @@ class ContainerAppRunnerPlugin(
     # Update with new values
     state.update(kwargs)
     # Save back to disk
-    self.diskapi_save_pickle_to_data(state, _PERSISTENT_STATE_FILE)
+    self.diskapi_save_pickle_to_data(
+      state,
+      _PERSISTENT_STATE_FILE,
+      subfolder=self._get_instance_data_subfolder()
+    )
     return
 
 
