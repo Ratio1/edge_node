@@ -218,7 +218,22 @@ _CONFIG = {
 
   # Application endpoint polling
   "ENDPOINT_POLL_INTERVAL": 0,  # seconds between endpoint health checks
-  "ENDPOINT_URL": None,  # endpoint to poll for health checks
+  "ENDPOINT_URL": None,  # endpoint to poll for health checks (deprecated, use HEALTH_ENDPOINT_PATH)
+
+  # Secure health endpoint configuration
+  # Path-only, always localhost - prevents SSRF attacks
+  "HEALTH_ENDPOINT_PATH": None,      # Path like "/health", "/api/ready" (no full URLs)
+  "HEALTH_ENDPOINT_PORT": None,      # Container port for health check (validated against ports_mapping)
+                                     # None = use main PORT
+
+  # Startup health probing
+  "HEALTH_PROBE_DELAY": 10,          # Seconds to wait before first probe (build time)
+  "HEALTH_PROBE_INTERVAL": 2,        # Seconds between probe attempts
+  "HEALTH_PROBE_TIMEOUT": 300,       # Max seconds to wait for app ready (5 min)
+
+  # Tunnel startup gating
+  "TUNNEL_START_DELAY": 300,          # Simple delay when no health URL (backward compat)
+  "TUNNEL_ON_HEALTH_FAILURE": "skip", # "skip" | "start" - tunnel behavior on timeout
 
   #### Logging
   "SHOW_LOG_EACH" : 60,       # seconds to show logs
@@ -370,6 +385,15 @@ class ContainerAppRunnerPlugin(
 
     # Command execution state
     self._commands_started = False
+
+    # App readiness tracking (for tunnel startup gating)
+    self._app_ready = False
+    self._health_probe_start = None
+    self._last_health_probe = 0
+    self._health_probing_disabled = False  # Set True if health config is invalid
+
+    # Tunnel startup gating
+    self._tunnel_start_allowed = False
 
     self._after_reset()
 
@@ -994,6 +1018,9 @@ class ContainerAppRunnerPlugin(
       field_name='BUILD_AND_RUN_COMMANDS',
     )
 
+    # Validate health endpoint port (soft error - disables health probing if invalid)
+    self._validate_health_endpoint_port()
+
     self._validate_subclass_config()
     return
 
@@ -1329,10 +1356,72 @@ class ContainerAppRunnerPlugin(
     int or None
         Host port if found, None otherwise
     """
+    # Check main port first
+    if container_port == self.cfg_port:
+      return self.port
+
+    # Check extra ports mapping
     for host_port, c_port in self.extra_ports_mapping.items():
       if c_port == container_port:
         return host_port
     return None
+
+
+  def _get_valid_container_ports(self):
+    """
+    Get set of valid container ports for health checking.
+
+    Valid ports are:
+    1. Main port (cfg_port)
+    2. Extra ports from ports_mapping (container ports)
+
+    Returns
+    -------
+    set of int
+        Set of valid container ports
+    """
+    valid_ports = set()
+
+    # Main port
+    if self.cfg_port:
+      valid_ports.add(self.cfg_port)
+
+    # Extra ports (container ports from mapping)
+    for container_port in self.extra_ports_mapping.values():
+      valid_ports.add(container_port)
+
+    return valid_ports
+
+
+  def _validate_health_endpoint_port(self):
+    """
+    Validate HEALTH_ENDPOINT_PORT is a configured container port.
+
+    Soft error handling: If port is invalid, logs error and disables
+    health probing (falls back to TUNNEL_START_DELAY behavior).
+
+    Returns
+    -------
+    bool
+        True if valid or not configured, False if invalid (probing disabled)
+    """
+    port = self.cfg_health_endpoint_port
+    if port is None:
+      return True  # Will use main port
+
+    valid_ports = self._get_valid_container_ports()
+
+    if port not in valid_ports:
+      self.P(
+        f"HEALTH_ENDPOINT_PORT {port} is not a configured container port. "
+        f"Valid ports: {sorted(valid_ports)}. "
+        f"Health probing DISABLED - tunnel will use TUNNEL_START_DELAY instead.",
+        color='r'
+      )
+      self._health_probing_disabled = True
+      return False
+
+    return True
 
 
   def _build_tunnel_command(self, container_port, token):
@@ -2016,21 +2105,16 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    if not self.port:
-      self.P("No port allocated, cannot poll endpoint", color='r')
+    url = self._get_health_check_url()
+    if not url:
+      self.P("No health endpoint URL configured, skipping health check")
       return
-
-    if not self.cfg_endpoint_url:
-      self.P("No endpoint URL configured, skipping health check")
-      return
-
-    url = f"http://localhost:{self.port}{self.cfg_endpoint_url}"
 
     try:
       resp = requests.get(url, timeout=5)
       status = resp.status_code
 
-      if status == 200:
+      if 200 <= status < 300:
         self.P(f"Health check: {url} -> {status} OK")
       else:
         self.P(f"Health check: {url} -> {status} Error", color='r')
@@ -2040,6 +2124,146 @@ class ContainerAppRunnerPlugin(
       self.P(f"Unexpected error during health check: {e}", color='r')
     # end try
     return
+
+
+  def _get_health_check_url(self):
+    """
+    Get the full URL for health checking.
+
+    Always constructs: http://{localhost_ip}:{host_port}{path}
+    - Path from HEALTH_ENDPOINT_PATH or ENDPOINT_URL (backward compat)
+    - Port from HEALTH_ENDPOINT_PORT or main PORT
+    - Port is validated and mapped to host port
+    - IP from self.log.get_localhost_ip() for consistency with other host URLs
+
+    Security: No external URLs, no arbitrary ports (SSRF prevention).
+
+    Returns
+    -------
+    str or None
+        Full URL for health check, or None if not configured
+    """
+    # Get path (prefer new config, fall back to old for backward compat)
+    path = self.cfg_health_endpoint_path or self.cfg_endpoint_url
+    if not path:
+      return None
+
+    # Ensure path starts with /
+    if not path.startswith('/'):
+      path = '/' + path
+
+    # Get container port (default to main port)
+    container_port = self.cfg_health_endpoint_port or self.cfg_port
+    if not container_port:
+      return None
+
+    # Look up host port from container port mapping
+    host_port = self._get_host_port_for_container_port(container_port)
+    if not host_port:
+      return None
+
+    # Use localhost IP for consistency with other host URLs in the codebase
+    localhost_ip = self.log.get_localhost_ip()
+    return f"http://{localhost_ip}:{host_port}{path}"
+
+
+  def _probe_health_endpoint(self):
+    """
+    Probe health endpoint for app readiness.
+
+    Returns
+    -------
+    bool
+        True if health check passed (2xx response), False otherwise
+    """
+    url = self._get_health_check_url()
+    if not url:
+      return False
+
+    try:
+      resp = requests.get(url, timeout=5)
+      if 200 <= resp.status_code < 300:
+        self.Pd(f"Health probe: {url} -> {resp.status_code} OK", score=5)
+        return True
+      self.Pd(f"Health probe: {url} -> {resp.status_code}", score=5)
+    except requests.RequestException as e:
+      self.Pd(f"Health probe: {url} -> {e}", score=5)
+    return False
+
+
+  def _is_app_ready(self):
+    """
+    Check if app is ready for tunnel startup.
+
+    Determines readiness based on:
+    1. Health endpoint probing (if HEALTH_ENDPOINT_PATH or ENDPOINT_URL configured)
+    2. Simple delay (TUNNEL_START_DELAY) otherwise
+    3. Falls back to simple delay if health probing is disabled (invalid config)
+
+    Returns
+    -------
+    bool
+        True if app is ready, False otherwise
+    """
+    if self._app_ready:
+      return True
+
+    # Container must be running
+    if not self.container or self.container_state != ContainerState.RUNNING:
+      return False
+
+    if not self.container_start_time:
+      return False
+
+    current_time = self.time()
+
+    # Get health path (prefer new config, fall back to old)
+    health_path = self.cfg_health_endpoint_path or self.cfg_endpoint_url
+
+    # No health path configured OR health probing disabled - use simple delay
+    if not health_path or self._health_probing_disabled:
+      elapsed = current_time - self.container_start_time
+      if elapsed >= self.cfg_tunnel_start_delay:
+        if self.cfg_tunnel_start_delay > 0:
+          self.P(f"Tunnel start delay ({self.cfg_tunnel_start_delay}s) elapsed - app assumed ready")
+        self._app_ready = True
+      return self._app_ready
+
+    # Health probing configured
+    # Initialize probe timing on first call
+    if self._health_probe_start is None:
+      self._health_probe_start = current_time
+      self.P(f"Starting health probing (delay={self.cfg_health_probe_delay}s, timeout={self.cfg_health_probe_timeout}s)")
+
+    probe_elapsed = current_time - self._health_probe_start
+
+    # Wait for initial delay before probing
+    if probe_elapsed < self.cfg_health_probe_delay:
+      return False
+
+    # Check timeout
+    if probe_elapsed > self.cfg_health_probe_timeout:
+      self.P(f"Health probe timeout ({self.cfg_health_probe_timeout}s) exceeded", color='r')
+      if self.cfg_tunnel_on_health_failure == "start":
+        self.P("Starting tunnel anyway per TUNNEL_ON_HEALTH_FAILURE=start", color='y')
+        self._app_ready = True
+      else:
+        self.P("Tunnel startup skipped per TUNNEL_ON_HEALTH_FAILURE=skip", color='y')
+        self._app_ready = False  # Stay false, but stop probing
+        self._health_probe_start = float('inf')  # Prevent further probing
+      return self._app_ready
+
+    # Rate-limit probing
+    if current_time - self._last_health_probe < self.cfg_health_probe_interval:
+      return False
+    self._last_health_probe = current_time
+
+    # Probe health endpoint
+    if self._probe_health_endpoint():
+      self.P("Health check passed - app is ready!", color='g')
+      self._app_ready = True
+
+    return self._app_ready
 
 
   def _check_container_status(self):
@@ -2090,6 +2314,11 @@ class ContainerAppRunnerPlugin(
       )
 
       self._commands_started = False
+      # Reset app readiness state for fresh probing on restart
+      self._app_ready = False
+      self._health_probe_start = None
+      self._last_health_probe = 0
+      self._tunnel_start_allowed = False
       return False
 
     except Exception as e:
@@ -2744,15 +2973,21 @@ class ContainerAppRunnerPlugin(
       self.maybe_init_tunnel_engine()
       self.maybe_start_tunnel_engine()
 
-      # Start main tunnel if configured and not already running
-      if not self.tunnel_process and self._should_start_main_tunnel():
-        self.start_tunnel_engine()
+      # Gate tunnel startup on app readiness
+      if self._is_app_ready():
+        if not self._tunnel_start_allowed:
+          self.P("App is ready, enabling tunnel startup", color='g')
+          self._tunnel_start_allowed = True
 
-      # Start extra tunnels if configured and not already running
-      if self.extra_tunnel_configs and not self.extra_tunnel_processes:
-        self.start_extra_tunnels()
+        # Start main tunnel if configured and not already running
+        if not self.tunnel_process and self._should_start_main_tunnel():
+          self.start_tunnel_engine()
 
-      # Read logs from all extra tunnels
+        # Start extra tunnels if configured and not already running
+        if self.extra_tunnel_configs and not self.extra_tunnel_processes:
+          self.start_extra_tunnels()
+
+      # Read logs from all extra tunnels (always, for monitoring)
       if self.extra_tunnel_processes:
         self.read_all_extra_tunnel_logs()
 
