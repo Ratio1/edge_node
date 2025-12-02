@@ -2057,6 +2057,23 @@ class ContainerAppRunnerPlugin(
       return
 
     try:
+      # Refresh container status and verify it's running before exec
+      # This prevents race condition where container exits before exec can run
+      self.container.reload()
+      if self.container.status != "running":
+        self.P(
+          f"Cannot execute command: container is not running (status: {self.container.status})",
+          color='r'
+        )
+        self._commands_started = False
+        # Update state machine to reflect actual container status
+        if self.container_state == ContainerState.RUNNING:
+          exit_code = self.container.attrs.get('State', {}).get('ExitCode', -1)
+          stop_reason = StopReason.NORMAL_EXIT if exit_code == 0 else StopReason.CRASH
+          self._set_container_state(ContainerState.FAILED, stop_reason)
+          self._record_restart_failure()
+        return
+
       self.P(f"Running container exec command: {shell_cmd}")
       exec_result = self.container.exec_run(
         ["sh", "-c", shell_cmd],
