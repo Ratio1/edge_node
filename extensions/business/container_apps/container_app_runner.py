@@ -2475,11 +2475,12 @@ class ContainerAppRunnerPlugin(
     # Stop the container if it's running
     self.stop_container()
 
-    # Save logs to disk
+    # Save logs to disk (in instance-specific subfolder alongside persistent state)
     try:
-      # using parent class method to save logs
-      self.diskapi_save_pickle_to_output(
-        obj=list(self.container_logs), filename="container_logs.pkl"
+      self.diskapi_save_pickle_to_data(
+        obj=list(self.container_logs),
+        filename="container_logs.pkl",
+        subfolder=self._get_instance_data_subfolder()
       )
       self.P("Container logs saved to disk.")
     except Exception as exc:
