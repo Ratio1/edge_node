@@ -3,7 +3,8 @@
   "dockerFile" : "Dockerfile",
   // "image": "aidamian/ds101_2024",
 
-
+  "workspaceMount": "source=${localWorkspaceFolder},target=/edge_node,type=bind",
+  "workspaceFolder": "/edge_node",
   
   "runArgs": [
     //"--gpus=all", // Use this option if you have a GPU

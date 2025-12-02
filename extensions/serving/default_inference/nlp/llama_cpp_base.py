@@ -167,6 +167,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         'max_tokens': max_tokens,
         'repeat_penalty': repetition_penalty,
       }
+      predict_kwargs = self.process_predict_kwargs(predict_kwargs)
       if not isinstance(messages, list):
         msg = f"Each input must have a list of messages. Received {type(messages)}: {self.shorten_str(inp)}"
         self.maybe_exception(msg)
