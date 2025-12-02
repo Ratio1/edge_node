@@ -48,10 +48,6 @@ _CONFIG = {
   # Disable image auto-update; Git monitoring drives restarts
   "AUTOUPDATE": False,
 
-  # Application endpoint polling defaults
-  "ENDPOINT_POLL_INTERVAL": 30,
-  "ENDPOINT_URL": None,
-
   # Chainstore response configuration (optional)
   "CHAINSTORE_RESPONSE_KEY": None,
 }

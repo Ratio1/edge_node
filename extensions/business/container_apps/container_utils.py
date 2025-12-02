@@ -792,39 +792,41 @@ class _ContainerUtilsMixin:
       return "error"
 
 
-  def _validate_endpoint_config(self):
+  def _validate_health_endpoint_config(self):
     """
-    Validate endpoint configuration for health checks.
+    Validate health endpoint configuration.
 
     Performs security and format validation on the configured
-    endpoint URL.
+    health endpoint path.
 
     Returns
     -------
     bool
-        True if endpoint configuration is valid, False otherwise
+        True if health endpoint configuration is valid, False otherwise
 
     Notes
     -----
     Validation checks include:
-    - URL is a string
-    - URL starts with '/'
-    - URL does not contain path traversal sequences (..)
+    - Path is a string
+    - Path starts with '/'
+    - Path does not contain path traversal sequences (..)
     """
-    if not hasattr(self, 'cfg_endpoint_url') or not self.cfg_endpoint_url:
+    if not hasattr(self, 'cfg_health_endpoint_path') or not self.cfg_health_endpoint_path:
       return False
 
-    # Basic URL validation
-    if not isinstance(self.cfg_endpoint_url, str):
-      self.P("Endpoint URL must be a string", color='r')
+    path = self.cfg_health_endpoint_path
+
+    # Basic path validation
+    if not isinstance(path, str):
+      self.P("Health endpoint path must be a string", color='r')
       return False
 
-    if not self.cfg_endpoint_url.startswith('/'):
-      self.P("Endpoint URL must start with '/'", color='r')
+    if not path.startswith('/'):
+      self.P("Health endpoint path must start with '/'", color='r')
       return False
 
-    if '..' in self.cfg_endpoint_url:
-      self.P("Endpoint URL contains invalid path traversal", color='r')
+    if '..' in path:
+      self.P("Health endpoint path contains invalid path traversal", color='r')
       return False
 
     return True

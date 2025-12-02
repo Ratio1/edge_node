@@ -219,10 +219,6 @@ _CONFIG = {
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   "FILE_VOLUMES": {},           # dict mapping host paths to file configs: {"host_path": {"content": "...", "mounting_point": "..."}}
 
-  # Application endpoint polling
-  "ENDPOINT_POLL_INTERVAL": 0,  # seconds between endpoint health checks
-  "ENDPOINT_URL": None,  # endpoint to poll for health checks (deprecated, use HEALTH_ENDPOINT_PATH)
-
   # Secure health endpoint configuration
   # Path-only, always localhost - prevents SSRF attacks
   "HEALTH_ENDPOINT_PATH": None,      # Path like "/health", "/api/ready" (no full URLs)
@@ -378,7 +374,6 @@ class ContainerAppRunnerPlugin(
     self.container_start_time = None
 
     # Periodic intervals
-    self._last_endpoint_check = 0
     self._last_image_check = 0
     self._last_extra_tunnels_ping = 0
     self._last_paused_log = 0  # Track when we last logged the paused message
@@ -2120,64 +2115,12 @@ class ContainerAppRunnerPlugin(
     return
 
 
-  def _check_health_endpoint(self, current_time=None):
-    """
-    Check health endpoint periodically if configured.
-
-    Parameters
-    ----------
-    current_time : float, optional
-        Current timestamp for interval checking
-
-    Returns
-    -------
-    None
-    """
-    if not self.container or not self.cfg_endpoint_url or self.cfg_endpoint_poll_interval <= 0:
-      return
-
-    if current_time - self._last_endpoint_check >= self.cfg_endpoint_poll_interval:
-      self._last_endpoint_check = current_time
-      self._poll_endpoint()
-    # end if time elapsed
-    return
-
-
-  def _poll_endpoint(self):
-    """
-    Poll the container's health endpoint and log the response.
-
-    Returns
-    -------
-    None
-    """
-    url = self._get_health_check_url()
-    if not url:
-      self.P("No health endpoint URL configured, skipping health check")
-      return
-
-    try:
-      resp = requests.get(url, timeout=5)
-      status = resp.status_code
-
-      if 200 <= status < 300:
-        self.P(f"Health check: {url} -> {status} OK")
-      else:
-        self.P(f"Health check: {url} -> {status} Error", color='r')
-    except requests.RequestException as e:
-      self.P(f"Health check failed: {url} - {e}", color='r')
-    except Exception as e:
-      self.P(f"Unexpected error during health check: {e}", color='r')
-    # end try
-    return
-
-
   def _get_health_check_url(self):
     """
     Get the full URL for health checking.
 
     Always constructs: http://{localhost_ip}:{host_port}{path}
-    - Path from HEALTH_ENDPOINT_PATH or ENDPOINT_URL (backward compat)
+    - Path from HEALTH_ENDPOINT_PATH
     - Port from HEALTH_ENDPOINT_PORT or main PORT
     - Port is validated and mapped to host port
     - IP from self.log.get_localhost_ip() for consistency with other host URLs
@@ -2189,8 +2132,7 @@ class ContainerAppRunnerPlugin(
     str or None
         Full URL for health check, or None if not configured
     """
-    # Get path (prefer new config, fall back to old for backward compat)
-    path = self.cfg_health_endpoint_path or self.cfg_endpoint_url
+    path = self.cfg_health_endpoint_path
     if not path:
       return None
 
@@ -2242,7 +2184,7 @@ class ContainerAppRunnerPlugin(
     Check if app is ready for tunnel startup.
 
     Determines readiness based on:
-    1. Health endpoint probing (if HEALTH_ENDPOINT_PATH or ENDPOINT_URL configured)
+    1. Health endpoint probing (if HEALTH_ENDPOINT_PATH configured)
     2. Simple delay (TUNNEL_START_DELAY) otherwise
     3. Falls back to simple delay if health probing is disabled (invalid config)
 
@@ -2263,11 +2205,8 @@ class ContainerAppRunnerPlugin(
 
     current_time = self.time()
 
-    # Get health path (prefer new config, fall back to old)
-    health_path = self.cfg_health_endpoint_path or self.cfg_endpoint_url
-
     # No health path configured OR health probing disabled - use simple delay
-    if not health_path or self._health_probing_disabled:
+    if not self.cfg_health_endpoint_path or self._health_probing_disabled:
       elapsed = current_time - self.container_start_time
       if elapsed >= self.cfg_tunnel_start_delay:
         if self.cfg_tunnel_start_delay > 0:
@@ -2928,7 +2867,7 @@ class ContainerAppRunnerPlugin(
     """
     Perform periodic monitoring tasks.
 
-    Executes health checks, image update checks, tunnel health checks,
+    Executes image update checks, tunnel health checks,
     and any subclass-defined additional checks.
 
     Returns
@@ -2936,7 +2875,7 @@ class ContainerAppRunnerPlugin(
     None
     """
     current_time = self.time()
-    self._check_health_endpoint(current_time)
+
     if self.cfg_autoupdate:
       self._check_image_updates(current_time)
 
