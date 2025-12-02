@@ -2334,6 +2334,10 @@ class ContainerAppRunnerPlugin(
       else:
         stop_reason = StopReason.CRASH
 
+      # Only record failure if transitioning from RUNNING to FAILED (not already failed)
+      # This ensures we count each crash/exit only once
+      was_running = self.container_state == ContainerState.RUNNING
+
       # Update state
       self._set_container_state(ContainerState.FAILED, stop_reason)
 
@@ -2341,6 +2345,11 @@ class ContainerAppRunnerPlugin(
         f"Container stopped (exit code: {exit_code}, reason: {stop_reason.value})",
         color='r' if exit_code != 0 else 'b'
       )
+
+      # Record restart failure for unplanned stops (affects backoff and retry limits)
+      # Only record if we were previously running to avoid double-counting
+      if was_running:
+        self._record_restart_failure()
 
       self._commands_started = False
       # Reset app readiness state for fresh probing on restart
