@@ -59,12 +59,20 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       'n_batch': MODEL_N_BATCH_DEFAULT_VALUE,
     }
 
-    self.model = Llama.from_pretrained(
-      repo_id=model_id,
-      filename=model_filename,
-      cache_dir=self.cache_dir,
-      **model_params
+    def _llama_from_pretrained():
+      return Llama.from_pretrained(
+        repo_id=model_id,
+        filename=model_filename,
+        cache_dir=self.cache_dir,
+        **model_params,
+      )
+
+    self.model = self.safe_load_model(
+      load_model_method=_llama_from_pretrained,
+      model_id=model_id,
+      model_str_id=f"{model_id}/{model_filename}",
     )
+    self.model.eval()
     self.P("Model loaded successfully.")
     return
 
