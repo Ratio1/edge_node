@@ -81,4 +81,8 @@ ENV EE_EVM_NET=devnet
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir --no-deps --upgrade naeural_core
 
+RUN pip install --no-cache-dir --force-reinstall \
+    llama-cpp-python \
+    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+
 CMD ["python3","device.py"]
