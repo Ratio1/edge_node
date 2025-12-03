@@ -72,7 +72,6 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       model_id=model_id,
       model_str_id=f"{model_id}/{model_filename}",
     )
-    self.model.eval()
     self.P("Model loaded successfully.")
     return
 
