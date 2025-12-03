@@ -228,7 +228,7 @@ _CONFIG = {
   # Startup health probing
   "HEALTH_PROBE_DELAY": 10,          # Seconds to wait before first probe (build time)
   "HEALTH_PROBE_INTERVAL": 2,        # Seconds between probe attempts
-  "HEALTH_PROBE_TIMEOUT": 300,       # Max seconds to wait for app ready (5 min)
+  "HEALTH_PROBE_TIMEOUT": 30,       # Max seconds to wait for app ready (30 sec)
 
   # Tunnel startup gating
   "TUNNEL_START_DELAY": 300,          # Simple delay when no health URL (backward compat)
