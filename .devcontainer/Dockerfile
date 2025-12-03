@@ -81,8 +81,21 @@ ENV EE_EVM_NET=devnet
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir --no-deps --upgrade naeural_core
 
-RUN pip install --no-cache-dir --no-deps --force-reinstall \
-    llama-cpp-python \
-    --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+# Freeze current environment to pin existing packages
+RUN python3 -m pip freeze > /tmp/pinned-requirements.txt
+
+# Build llama-cpp-python from source against glibc with a safe CPU baseline.
+# Here we target AVX-only (no AVX2/AVX512) so the binary works on any AVX-capable edge node.
+# If you're sure all nodes have AVX2, you can flip GGML_AVX2=ON below.
+ENV CMAKE_ARGS="-DGGML_NATIVE=OFF -DGGML_AVX=ON -DGGML_AVX2=OFF -DGGML_AVX512=OFF -DGGML_AVX_VNNI=OFF"
+ENV FORCE_CMAKE=1
+
+RUN pip install --no-cache-dir --force-reinstall \
+    -c /tmp/pinned-requirements.txt \
+    --no-binary=llama-cpp-python \
+    llama-cpp-python
+
+# Remove the temporary pinned requirements file
+RUN rm /tmp/pinned-requirements.txt
 
 CMD ["python3","device.py"]
