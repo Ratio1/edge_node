@@ -69,6 +69,8 @@ import time
 import socket
 import subprocess
 from enum import Enum
+from dataclasses import dataclass
+from typing import Optional
 
 from docker.types import DeviceRequest
 
@@ -77,7 +79,7 @@ from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResp
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
-__VER__ = "0.6.1"
+__VER__ = "0.7.1"
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
@@ -144,6 +146,83 @@ class RestartPolicy(Enum):
   ALWAYS = "always"
   ON_FAILURE = "on-failure"
   UNLESS_STOPPED = "unless-stopped"
+
+
+class HealthCheckMode(Enum):
+  """
+  Health check modes for determining app readiness before starting tunnels.
+
+  Modes:
+    AUTO: Smart detection - uses ENDPOINT if path set, else TCP if port configured, else DELAY
+    TCP: TCP port check - works for any protocol (HTTP, WebSocket, gRPC, raw TCP)
+    ENDPOINT: HTTP probe to HEALTH_ENDPOINT_PATH - expects 2xx response
+    DELAY: Simple time-based delay using TUNNEL_START_DELAY
+  """
+  AUTO = "auto"
+  TCP = "tcp"
+  ENDPOINT = "endpoint"
+  DELAY = "delay"
+
+
+@dataclass
+class HealthCheckConfig:
+  """
+  Configuration for health check probing.
+
+  Provides type-safe attribute access instead of dict key access.
+
+  Attributes
+  ----------
+  mode : str
+      Health check mode: "auto", "tcp", "endpoint", or "delay"
+  path : str or None
+      HTTP endpoint path for "endpoint" mode (e.g., "/health")
+  port : int or None
+      Container port for health check (None = use main PORT)
+  delay : int
+      Seconds before first probe / full delay for "delay" mode
+  interval : int
+      Seconds between probe attempts (tcp/endpoint modes)
+  timeout : int
+      Max wait time in seconds (0 = unlimited, probe forever)
+  on_failure : str
+      Behavior when timeout reached: "start" or "skip"
+  """
+  mode: str = "auto"
+  path: Optional[str] = None
+  port: Optional[int] = None
+  delay: int = 30
+  interval: int = 5
+  timeout: int = 300
+  on_failure: str = "start"
+
+  @classmethod
+  def from_dict(cls, config_dict: dict) -> "HealthCheckConfig":
+    """
+    Create HealthCheckConfig from a configuration dict.
+
+    Parameters
+    ----------
+    config_dict : dict
+        Configuration dict with keys matching attribute names (case-insensitive)
+
+    Returns
+    -------
+    HealthCheckConfig
+        New instance with values from dict (defaults for missing keys)
+    """
+    # Normalize keys to lowercase
+    normalized = {k.lower(): v for k, v in config_dict.items() if v is not None}
+
+    return cls(
+      mode=str(normalized.get("mode", "auto")).lower().strip(),
+      path=normalized.get("path"),
+      port=normalized.get("port"),
+      delay=normalized.get("delay", 30),
+      interval=normalized.get("interval", 5),
+      timeout=normalized.get("timeout", 300),
+      on_failure=str(normalized.get("on_failure", "start")).lower().strip(),
+    )
 
 
 _CONFIG = {
@@ -219,20 +298,31 @@ _CONFIG = {
   "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
   "FILE_VOLUMES": {},           # dict mapping host paths to file configs: {"host_path": {"content": "...", "mounting_point": "..."}}
 
-  # Secure health endpoint configuration
-  # Path-only, always localhost - prevents SSRF attacks
-  "HEALTH_ENDPOINT_PATH": None,      # Path like "/health", "/api/ready" (no full URLs)
-  "HEALTH_ENDPOINT_PORT": None,      # Container port for health check (validated against ports_mapping)
-                                     # None = use main PORT
-
-  # Startup health probing
-  "HEALTH_PROBE_DELAY": 30,          # Seconds to wait before first probe (build time)
-  "HEALTH_PROBE_INTERVAL": 5,        # Seconds between probe attempts
-  "HEALTH_PROBE_TIMEOUT": 120,       # Max seconds to wait for app ready (30 sec)
-
-  # Tunnel startup gating
-  "TUNNEL_START_DELAY": 300,          # Simple delay when no health URL (backward compat)
-  "TUNNEL_ON_HEALTH_FAILURE": "start",# "skip" | "start" - tunnel behavior on timeout
+  # Health check configuration (consolidated)
+  # Controls how app readiness is determined before starting tunnels
+  #
+  # Usage examples:
+  #   "HEALTH_CHECK": {}                           # TCP check with all defaults
+  #   "HEALTH_CHECK": {"PATH": "/health"}          # HTTP endpoint check
+  #   "HEALTH_CHECK": {"MODE": "delay", "DELAY": 60}  # Simple delay, no probing
+  #   "HEALTH_CHECK": {"PATH": "/health", "TIMEOUT": 0}  # Probe forever until success
+  #
+  "HEALTH_CHECK": {
+    "MODE": "auto",        # "auto" | "tcp" | "endpoint" | "delay"
+                           #   "auto": Smart detection (default)
+                           #     - If PATH set -> HTTP probe to that path
+                           #     - Else if PORT configured -> TCP port check
+                           #     - Else -> no delay (immediate ready)
+                           #   "tcp": TCP port check (works for any protocol)
+                           #   "endpoint": HTTP probe to PATH (requires PATH)
+                           #   "delay": Simple wait, no probing
+    "PATH": None,          # HTTP endpoint path (e.g., "/health", "/api/ready")
+    "PORT": None,          # Container port for health check (None = use main PORT)
+    "DELAY": 30,           # Seconds before first probe / full delay for "delay" mode
+    "INTERVAL": 5,         # Seconds between probe attempts (tcp/endpoint modes)
+    "TIMEOUT": 300,        # Max wait time in seconds (0 = unlimited, probe forever)
+    "ON_FAILURE": "start", # "start" | "skip" - behavior when timeout reached
+  },
 
   #### Logging
   "SHOW_LOG_EACH" : 60,       # seconds to show logs
@@ -772,6 +862,88 @@ class ContainerAppRunnerPlugin(
 
   # ============================================================================
   # End of Restart Policy Logic
+  # ============================================================================
+
+  # ============================================================================
+  # Health Check Configuration
+  # ============================================================================
+
+
+  def _get_health_config(self) -> HealthCheckConfig:
+    """
+    Get effective health check configuration with defaults.
+
+    Merges HEALTH_CHECK dict values with defaults.
+
+    Returns
+    -------
+    HealthCheckConfig
+        Complete health check configuration with attributes:
+        - mode: "auto" | "tcp" | "endpoint" | "delay"
+        - path: HTTP endpoint path or None
+        - port: Container port or None (uses main PORT)
+        - delay: Seconds before first probe
+        - interval: Seconds between probes
+        - timeout: Max wait time (0 = unlimited)
+        - on_failure: "start" | "skip"
+    """
+    health_check_dict = getattr(self, 'cfg_health_check', None) or {}
+    return HealthCheckConfig.from_dict(health_check_dict)
+
+
+  def _get_effective_health_mode(self, health_config: HealthCheckConfig = None) -> HealthCheckMode:
+    """
+    Determine the effective health check mode based on configuration.
+
+    For "auto" mode, determines the best check method:
+    - If PATH set -> ENDPOINT
+    - Else if PORT configured -> TCP
+    - Else -> DELAY (no ports to check)
+
+    Parameters
+    ----------
+    health_config : HealthCheckConfig, optional
+        Health config (from _get_health_config). If None, fetches it.
+
+    Returns
+    -------
+    HealthCheckMode
+        Effective health check mode enum value
+    """
+    if health_config is None:
+      health_config = self._get_health_config()
+
+    # Try to convert string to enum
+    try:
+      mode_enum = HealthCheckMode(health_config.mode)
+    except ValueError:
+      self.P(f"Unknown HEALTH_CHECK MODE '{health_config.mode}', using 'auto'", color='y')
+      mode_enum = HealthCheckMode.AUTO
+
+    # Validate endpoint mode has required path
+    if mode_enum == HealthCheckMode.ENDPOINT:
+      if not health_config.path:
+        self.P(
+          "HEALTH_CHECK MODE='endpoint' requires PATH to be set. "
+          "Falling back to 'tcp' mode.",
+          color='y'
+        )
+        return HealthCheckMode.TCP if self.cfg_port else HealthCheckMode.DELAY
+      return HealthCheckMode.ENDPOINT
+
+    # Direct modes pass through
+    if mode_enum in (HealthCheckMode.TCP, HealthCheckMode.DELAY):
+      return mode_enum
+
+    # Auto mode: smart detection
+    if health_config.path:
+      return HealthCheckMode.ENDPOINT
+    elif self.cfg_port:
+      return HealthCheckMode.TCP
+    return HealthCheckMode.DELAY
+
+  # ============================================================================
+  # End of Health Check Configuration
   # ============================================================================
 
   # ============================================================================
@@ -1419,27 +1591,27 @@ class ContainerAppRunnerPlugin(
 
   def _validate_health_endpoint_port(self):
     """
-    Validate HEALTH_ENDPOINT_PORT is a configured container port.
+    Validate HEALTH_CHECK.PORT is a configured container port.
 
     Soft error handling: If port is invalid, logs error and disables
-    health probing (falls back to TUNNEL_START_DELAY behavior).
+    health probing (falls back to DELAY mode).
 
     Returns
     -------
     bool
         True if valid or not configured, False if invalid (probing disabled)
     """
-    port = self.cfg_health_endpoint_port
-    if port is None:
+    health = self._get_health_config()
+    if health.port is None:
       return True  # Will use main port
 
     valid_ports = self._get_valid_container_ports()
 
-    if port not in valid_ports:
+    if health.port not in valid_ports:
       self.P(
-        f"HEALTH_ENDPOINT_PORT {port} is not a configured container port. "
+        f"HEALTH_CHECK.PORT {health.port} is not a configured container port. "
         f"Valid ports: {sorted(valid_ports)}. "
-        f"Health probing DISABLED - tunnel will use TUNNEL_START_DELAY instead.",
+        f"Health probing DISABLED - using DELAY mode instead.",
         color='r'
       )
       self._health_probing_disabled = True
@@ -2120,8 +2292,8 @@ class ContainerAppRunnerPlugin(
     Get the full URL for health checking.
 
     Always constructs: http://{localhost_ip}:{host_port}{path}
-    - Path from HEALTH_ENDPOINT_PATH
-    - Port from HEALTH_ENDPOINT_PORT or main PORT
+    - Path from HEALTH_CHECK.PATH
+    - Port from HEALTH_CHECK.PORT or main PORT
     - Port is validated and mapped to host port
     - IP from self.log.get_localhost_ip() for consistency with other host URLs
 
@@ -2132,19 +2304,18 @@ class ContainerAppRunnerPlugin(
     str or None
         Full URL for health check, or None if not configured
     """
-    path = self.cfg_health_endpoint_path
-    if not path:
-      self.Pd("Health URL: no HEALTH_ENDPOINT_PATH configured")
+    health = self._get_health_config()
+    if not health.path:
+      self.Pd("Health URL: no HEALTH_CHECK.PATH configured")
       return None
 
     # Ensure path starts with /
-    if not path.startswith('/'):
-      path = '/' + path
+    path = health.path if health.path.startswith('/') else '/' + health.path
 
     # Get container port (default to main port)
-    container_port = self.cfg_health_endpoint_port or self.cfg_port
+    container_port = health.port or self.cfg_port
     if not container_port:
-      self.Pd("Health URL: no container port (HEALTH_ENDPOINT_PORT or PORT not set)")
+      self.Pd("Health URL: no container port (HEALTH_CHECK.PORT or PORT not set)")
       return None
 
     # Look up host port from container port mapping
@@ -2169,7 +2340,7 @@ class ContainerAppRunnerPlugin(
     """
     url = self._get_health_check_url()
     if not url:
-      self.Pd("Health probe skipped: no URL (check HEALTH_ENDPOINT_PATH and PORT config)")
+      self.Pd("Health probe skipped: no URL (check HEALTH_CHECK.PATH and PORT config)")
       return False
 
     try:
@@ -2187,14 +2358,79 @@ class ContainerAppRunnerPlugin(
     return False
 
 
+  def _get_health_check_port(self):
+    """
+    Get the host port for health checking.
+
+    Determines the appropriate port based on configuration:
+    - Uses HEALTH_CHECK.PORT if specified
+    - Otherwise uses main PORT
+
+    Returns
+    -------
+    int or None
+        Host port for health checking, or None if not configured
+    """
+    health = self._get_health_config()
+    container_port = health.port or self.cfg_port
+    if not container_port:
+      self.Pd("Health check port: no container port configured (HEALTH_CHECK.PORT or PORT)")
+      return None
+
+    host_port = self._get_host_port_for_container_port(container_port)
+    if not host_port:
+      self.Pd(f"Health check port: no host port mapping for container port {container_port}")
+      return None
+
+    return host_port
+
+
+  def _probe_tcp_port(self):
+    """
+    Probe TCP port to check if app is accepting connections.
+
+    This is a universal health check that works for any protocol
+    (HTTP, WebSocket, gRPC, raw TCP, etc.) - it simply checks if
+    the port is accepting TCP connections.
+
+    Returns
+    -------
+    bool
+        True if port is accepting connections, False otherwise
+    """
+    host_port = self._get_health_check_port()
+    if not host_port:
+      self.Pd("TCP probe skipped: no port configured")
+      return False
+
+    try:
+      with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(2)
+        result = sock.connect_ex(('127.0.0.1', host_port))
+        if result == 0:
+          self.Pd(f"TCP probe OK: port {host_port} is accepting connections")
+          return True
+        self.Pd(f"TCP probe failed: port {host_port} refused connection (error code: {result})")
+    except socket.timeout:
+      self.Pd(f"TCP probe timeout: port {host_port}")
+    except socket.error as e:
+      self.Pd(f"TCP probe error: port {host_port} -> {e}")
+    except Exception as e:
+      self.Pd(f"TCP probe unexpected error: port {host_port} -> {e}")
+    return False
+
+
   def _is_app_ready(self):
     """
     Check if app is ready for tunnel startup.
 
-    Determines readiness based on:
-    1. Health endpoint probing (if HEALTH_ENDPOINT_PATH configured)
-    2. Simple delay (TUNNEL_START_DELAY) otherwise
-    3. Falls back to simple delay if health probing is disabled (invalid config)
+    Uses consolidated HEALTH_CHECK configuration:
+    - AUTO: Smart detection (endpoint if path set, else tcp if port, else delay)
+    - TCP: TCP port check (works for any protocol)
+    - ENDPOINT: HTTP probe to HEALTH_CHECK.PATH
+    - DELAY: Simple delay using HEALTH_CHECK.DELAY
+
+    Supports TIMEOUT=0 for unlimited probing (probe forever until success).
 
     Returns
     -------
@@ -2213,64 +2449,85 @@ class ContainerAppRunnerPlugin(
 
     current_time = self.time()
 
-    # No health path configured OR health probing disabled - use simple delay
-    if not self.cfg_health_endpoint_path or self._health_probing_disabled:
+    # Get consolidated health config
+    health = self._get_health_config()
+    mode = self._get_effective_health_mode(health)
+
+    # Mode: DELAY - simple time-based waiting
+    if mode == HealthCheckMode.DELAY or self._health_probing_disabled:
       elapsed = current_time - self.container_start_time
-      if elapsed >= self.cfg_tunnel_start_delay:
-        if self.cfg_tunnel_start_delay > 0:
-          self.P(f"Tunnel start delay ({self.cfg_tunnel_start_delay}s) elapsed - app assumed ready")
+      if elapsed >= health.delay:
+        if health.delay > 0:
+          self.P(f"Health check delay ({health.delay}s) elapsed - app assumed ready")
         self._app_ready = True
       return self._app_ready
 
-    # Health probing configured
+    # Mode: TCP or ENDPOINT - active probing with delay/interval/timeout
     # Initialize probe timing on first call
     if self._health_probe_start is None:
       self._health_probe_start = current_time
-      self.P(f"Starting health probing (delay={self.cfg_health_probe_delay}s, timeout={self.cfg_health_probe_timeout}s)")
+      mode_desc = "TCP port" if mode == HealthCheckMode.TCP else "HTTP endpoint"
+      timeout_desc = "unlimited" if health.timeout == 0 else f"{health.timeout}s"
+      self.P(
+        f"Starting {mode_desc} probing "
+        f"(delay={health.delay}s, interval={health.interval}s, timeout={timeout_desc})"
+      )
 
     probe_elapsed = current_time - self._health_probe_start
 
     # Wait for initial delay before probing
-    if probe_elapsed < self.cfg_health_probe_delay:
+    if probe_elapsed < health.delay:
       self.Pd(
-        f"Health probe waiting for delay: elapsed={probe_elapsed:.1f}s < delay={self.cfg_health_probe_delay}s"
+        f"Health probe waiting for delay: elapsed={probe_elapsed:.1f}s < delay={health.delay}s"
       )
       return False
 
-    # Check timeout
-    if probe_elapsed > self.cfg_health_probe_timeout:
-      self.P(f"Health probe timeout ({self.cfg_health_probe_timeout}s) exceeded", color='r')
-      if self.cfg_tunnel_on_health_failure == "start":
-        self.P("Starting tunnel anyway per TUNNEL_ON_HEALTH_FAILURE=start", color='y')
+    # Check timeout (0 = unlimited, probe forever)
+    if health.timeout > 0 and probe_elapsed > health.timeout:
+      self.P(f"Health probe timeout ({health.timeout}s) exceeded", color='r')
+      if health.on_failure == "start":
+        self.P("Starting tunnel anyway per HEALTH_CHECK.ON_FAILURE='start'", color='y')
         self._app_ready = True
       else:
-        self.P("Tunnel startup skipped per TUNNEL_ON_HEALTH_FAILURE=skip", color='y')
+        self.P("Tunnel startup skipped per HEALTH_CHECK.ON_FAILURE='skip'", color='y')
         self._app_ready = False  # Stay false, but stop probing
         self._health_probe_start = float('inf')  # Prevent further probing
       return self._app_ready
 
     # Rate-limit probing
     time_since_last_probe = current_time - self._last_health_probe
-    if time_since_last_probe < self.cfg_health_probe_interval:
+    if time_since_last_probe < health.interval:
       self.Pd(
         f"Health probe rate-limited: {time_since_last_probe:.1f}s since last probe "
-        f"(interval={self.cfg_health_probe_interval}s)"
+        f"(interval={health.interval}s)"
       )
       return False
     self._last_health_probe = current_time
 
-    # Probe health endpoint
-    health_url = self._get_health_check_url()
-    self.Pd(
-      f"Probing health endpoint: {health_url} "
-      f"(elapsed={probe_elapsed:.1f}s, timeout={self.cfg_health_probe_timeout}s)"
-    )
-    probe_result = self._probe_health_endpoint()
+    # Execute probe based on mode
+    timeout_desc = "unlimited" if health.timeout == 0 else f"{health.timeout}s"
+    if mode == HealthCheckMode.TCP:
+      host_port = self._get_health_check_port()
+      self.Pd(
+        f"Probing TCP port: {host_port} "
+        f"(elapsed={probe_elapsed:.1f}s, timeout={timeout_desc})"
+      )
+      probe_result = self._probe_tcp_port()
+      success_msg = "TCP port check passed - app is ready!"
+    else:  # mode == HealthCheckMode.ENDPOINT
+      health_url = self._get_health_check_url()
+      self.Pd(
+        f"Probing health endpoint: {health_url} "
+        f"(elapsed={probe_elapsed:.1f}s, timeout={timeout_desc})"
+      )
+      probe_result = self._probe_health_endpoint()
+      success_msg = "Health check passed - app is ready!"
+
     if probe_result:
-      self.P("Health check passed - app is ready!", color='g')
+      self.P(success_msg, color='g')
       self._app_ready = True
     else:
-      self.Pd(f"Health probe returned False, will retry in {self.cfg_health_probe_interval}s")
+      self.Pd(f"Health probe returned False, will retry in {interval}s")
 
     return self._app_ready
 
