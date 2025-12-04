@@ -1,6 +1,6 @@
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
-__VER__ = '0.2.2'
+__VER__ = '0.2.3'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -400,7 +400,10 @@ class R1fsManagerApiPlugin(BasePlugin):
       self.P(error_msg, color='r')
       self._log_request_response("GET_YAML", response_data={'error': error_msg})
       return {'error': error_msg}
-    
+
+    # Transform absolute path to relative path for diskapi functions
+    fn = fn.replace("/edge_node", ".") if fn else fn
+
     if fn.endswith('.yaml') or fn.endswith('.yml'):
       file_data = self.diskapi_load_yaml(fn, verbose=False)
       summary = list(file_data.keys()) if isinstance(file_data, dict) else type(file_data).__name__

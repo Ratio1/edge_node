@@ -1,3 +1,5 @@
+from typing import Any
+
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
 __VER__ = '0.2.2'
@@ -79,13 +81,13 @@ class CstoreManagerApiPlugin(BasePlugin):
     return data
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def set(self, key: str, value: str, chainstore_peers: list = None):
+  def set(self, key: str, value: Any, chainstore_peers: list = None):
     """
-    Set a key-value pair in the chainstore.
-    
+    Set a key-value pair in the chainstore with any value type.
+
     Args:
         key (str): The key to store the value under
-        value (str): The value to store
+        value: The value to store (any type supported by chainstore)
         chainstore_peers (list): Extra chainstore peers
 
     Returns:
@@ -99,7 +101,7 @@ class CstoreManagerApiPlugin(BasePlugin):
       'value': value,
       'chainstore_peers': chainstore_peers
     }
-    self._log_request_response("SET", request_data=request_data)
+    self._log_request_response("SET_ANY", request_data=request_data)
 
     write_result = self.chainstore_set(
       key=key,
@@ -107,22 +109,22 @@ class CstoreManagerApiPlugin(BasePlugin):
       debug=self.cfg_debug,
       extra_peers=chainstore_peers,
     )
-    
+
     # Log response
     self._log_request_response("SET", response_data=write_result)
-    
+
     return write_result
 
   @BasePlugin.endpoint(method="get", require_token=False)
   def get(self, key: str):
     """
     Retrieve a value from the chainstore by key.
-    
+
     Args:
         key (str): The key to retrieve the value for
-        
+
     Returns:
-        str: The value associated with the given key, or None if not found
+        Any: The value associated with the given key, or None if not found
     """
     # Log request
     request_data = {
@@ -139,14 +141,14 @@ class CstoreManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="post", require_token=False)
-  def hset(self, hkey: str, key: str, value: str, chainstore_peers: list = None):
+  def hset(self, hkey: str, key: str, value: Any, chainstore_peers: list = None):
     """
     Set a field-value pair within a hash in the chainstore.
-    
+
     Args:
         hkey (str): The hash key (outer key)
         key (str): The field key within the hash
-        value (str): The value to store for the field
+        value (Any): The value to store for the field (any type supported by chainstore)
         chainstore_peers (list): Extra chainstore peers
 
     Returns:
@@ -182,13 +184,13 @@ class CstoreManagerApiPlugin(BasePlugin):
   def hget(self, hkey: str, key: str):
     """
     Retrieve a field value from a hset in the chainstore.
-    
+
     Args:
         hkey (str): The hash key (outer key)
         key (str): The field key within the hset
-        
+
     Returns:
-        str: The value associated with the given field in the hset, or None if not found
+        Any: The value associated with the given field in the hset, or None if not found
     """
     # Log request
     request_data = {
@@ -206,15 +208,15 @@ class CstoreManagerApiPlugin(BasePlugin):
 
 
   @BasePlugin.endpoint(method="get", require_token=False)
-  def hgetall(self, hkey: str):  
+  def hgetall(self, hkey: str):
     """
     Retrieve all field-value pairs from a hset in the chainstore.
-    
+
     Args:
         hkey (str): The hash key to retrieve all fields for
-        
+
     Returns:
-        list: A list containing all hset keys
+        dict: A dictionary containing all field-value pairs in the hset, with Any type values
     """
     # Log request
     request_data = {
