@@ -193,7 +193,7 @@ class HealthCheckConfig:
   port: Optional[int] = None
   delay: int = 30
   interval: int = 5
-  timeout: int = 120
+  timeout: int = 300
   on_failure: str = "start"
 
   @classmethod
@@ -220,7 +220,7 @@ class HealthCheckConfig:
       port=normalized.get("port"),
       delay=normalized.get("delay", 30),
       interval=normalized.get("interval", 5),
-      timeout=normalized.get("timeout", 120),
+      timeout=normalized.get("timeout", 300),
       on_failure=str(normalized.get("on_failure", "start")).lower().strip(),
     )
 
@@ -320,7 +320,7 @@ _CONFIG = {
     "PORT": None,          # Container port for health check (None = use main PORT)
     "DELAY": 30,           # Seconds before first probe / full delay for "delay" mode
     "INTERVAL": 5,         # Seconds between probe attempts (tcp/endpoint modes)
-    "TIMEOUT": 120,        # Max wait time in seconds (0 = unlimited, probe forever)
+    "TIMEOUT": 300,        # Max wait time in seconds (0 = unlimited, probe forever)
     "ON_FAILURE": "start", # "start" | "skip" - behavior when timeout reached
   },
 

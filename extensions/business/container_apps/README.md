@@ -48,7 +48,7 @@ The plugin uses a consolidated `HEALTH_CHECK` configuration dict to determine wh
     "PORT": None,          # Container port for health check (None = use main PORT)
     "DELAY": 30,           # Seconds before first probe / full delay for "delay" mode
     "INTERVAL": 5,         # Seconds between probe attempts (tcp/endpoint modes)
-    "TIMEOUT": 120,        # Max wait time in seconds (0 = unlimited)
+    "TIMEOUT": 300,        # Max wait time in seconds (0 = unlimited)
     "ON_FAILURE": "start", # "start" | "skip" - behavior when timeout reached
 }
 ```
@@ -71,7 +71,7 @@ The plugin uses a consolidated `HEALTH_CHECK` configuration dict to determine wh
 | `PORT` | None | Container port (None = use main PORT) |
 | `DELAY` | 30 | Initial delay before probing / full delay for "delay" mode |
 | `INTERVAL` | 5 | Seconds between probe attempts |
-| `TIMEOUT` | 120 | Max wait time (0 = unlimited, probe forever) |
+| `TIMEOUT` | 300 | Max wait time (0 = unlimited, probe forever) |
 | `ON_FAILURE` | "start" | Behavior on timeout: "start" (tunnel anyway) or "skip" (no tunnel) |
 
 **Examples:**
