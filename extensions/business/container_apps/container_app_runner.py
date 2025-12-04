@@ -226,8 +226,8 @@ _CONFIG = {
                                      # None = use main PORT
 
   # Startup health probing
-  "HEALTH_PROBE_DELAY": 10,          # Seconds to wait before first probe (build time)
-  "HEALTH_PROBE_INTERVAL": 2,        # Seconds between probe attempts
+  "HEALTH_PROBE_DELAY": 30,          # Seconds to wait before first probe (build time)
+  "HEALTH_PROBE_INTERVAL": 5,        # Seconds between probe attempts
   "HEALTH_PROBE_TIMEOUT": 120,       # Max seconds to wait for app ready (30 sec)
 
   # Tunnel startup gating
@@ -2134,6 +2134,7 @@ class ContainerAppRunnerPlugin(
     """
     path = self.cfg_health_endpoint_path
     if not path:
+      self.Pd("Health URL: no HEALTH_ENDPOINT_PATH configured")
       return None
 
     # Ensure path starts with /
@@ -2143,11 +2144,13 @@ class ContainerAppRunnerPlugin(
     # Get container port (default to main port)
     container_port = self.cfg_health_endpoint_port or self.cfg_port
     if not container_port:
+      self.Pd("Health URL: no container port (HEALTH_ENDPOINT_PORT or PORT not set)")
       return None
 
     # Look up host port from container port mapping
     host_port = self._get_host_port_for_container_port(container_port)
     if not host_port:
+      self.Pd(f"Health URL: no host port mapping for container port {container_port}")
       return None
 
     # Use localhost IP for consistency with other host URLs in the codebase
@@ -2166,16 +2169,21 @@ class ContainerAppRunnerPlugin(
     """
     url = self._get_health_check_url()
     if not url:
+      self.Pd("Health probe skipped: no URL (check HEALTH_ENDPOINT_PATH and PORT config)")
       return False
 
     try:
       resp = requests.get(url, timeout=5)
       if 200 <= resp.status_code < 300:
-        self.Pd(f"Health probe: {url} -> {resp.status_code} OK", score=5)
+        self.Pd(f"Health probe OK: {url} -> {resp.status_code}")
         return True
-      self.Pd(f"Health probe: {url} -> {resp.status_code}", score=5)
+      self.Pd(f"Health probe failed: {url} -> HTTP {resp.status_code}")
+    except requests.exceptions.ConnectionError as e:
+      self.Pd(f"Health probe connection error: {url} -> {e}")
+    except requests.exceptions.Timeout as e:
+      self.Pd(f"Health probe timeout: {url} -> {e}")
     except requests.RequestException as e:
-      self.Pd(f"Health probe: {url} -> {e}", score=5)
+      self.Pd(f"Health probe error: {url} -> {e}")
     return False
 
 
@@ -2224,6 +2232,9 @@ class ContainerAppRunnerPlugin(
 
     # Wait for initial delay before probing
     if probe_elapsed < self.cfg_health_probe_delay:
+      self.Pd(
+        f"Health probe waiting for delay: elapsed={probe_elapsed:.1f}s < delay={self.cfg_health_probe_delay}s"
+      )
       return False
 
     # Check timeout
@@ -2239,14 +2250,27 @@ class ContainerAppRunnerPlugin(
       return self._app_ready
 
     # Rate-limit probing
-    if current_time - self._last_health_probe < self.cfg_health_probe_interval:
+    time_since_last_probe = current_time - self._last_health_probe
+    if time_since_last_probe < self.cfg_health_probe_interval:
+      self.Pd(
+        f"Health probe rate-limited: {time_since_last_probe:.1f}s since last probe "
+        f"(interval={self.cfg_health_probe_interval}s)"
+      )
       return False
     self._last_health_probe = current_time
 
     # Probe health endpoint
-    if self._probe_health_endpoint():
+    health_url = self._get_health_check_url()
+    self.Pd(
+      f"Probing health endpoint: {health_url} "
+      f"(elapsed={probe_elapsed:.1f}s, timeout={self.cfg_health_probe_timeout}s)"
+    )
+    probe_result = self._probe_health_endpoint()
+    if probe_result:
       self.P("Health check passed - app is ready!", color='g')
       self._app_ready = True
+    else:
+      self.Pd(f"Health probe returned False, will retry in {self.cfg_health_probe_interval}s")
 
     return self._app_ready
 
