@@ -15,27 +15,6 @@ class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
   
-  def _handle_config_restart(self, restart_callable):
-    """
-    Handle container restart when configuration changes.
-
-    Stops the current container and invokes the provided restart callable
-    to reinitialize with new configuration.
-
-    Parameters
-    ----------
-    restart_callable : callable
-        Function to call after stopping container to perform restart
-
-    Returns
-    -------
-    None
-    """
-    self.P(f"Received an updated config for {self.__class__.__name__}")
-    self._stop_container_and_save_logs_to_disk()
-    restart_callable()
-    return
-  
   def _get_cr_data(self):
     """
     Helper method to extract container registry data from configuration.

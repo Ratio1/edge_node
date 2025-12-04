@@ -1364,6 +1364,52 @@ class ContainerAppRunnerPlugin(
     return
 
 
+  def _handle_config_restart(self, restart_callable):
+    """
+    Handle container restart when configuration changes.
+
+    Stops the current container and invokes the provided restart callable
+    to reinitialize with new configuration.
+
+    Parameters
+    ----------
+    restart_callable : callable
+        Function to call after stopping container to perform restart
+
+    Returns
+    -------
+    None
+
+    Notes
+    -----
+    If the container is in PAUSED state (manual stop), this method will NOT
+    restart the container. The user must send a RESTART command to resume.
+    """
+    self.P(f"Received an updated config for {self.__class__.__name__}")
+
+    # Check if container is paused (manual stop) - do NOT restart
+    if self.container_state == ContainerState.PAUSED:
+      self.P(
+        "Container is in PAUSED state (manual stop). "
+        "Ignoring config restart. Send RESTART command to resume.",
+        color='y'
+      )
+      return
+
+    # Check persistent state as fallback (in case container_state not yet set)
+    if self._load_manual_stop_state():
+      self.P(
+        "Container was manually stopped (persistent state). "
+        "Ignoring config restart. Send RESTART command to resume.",
+        color='y'
+      )
+      return
+
+    self._stop_container_and_save_logs_to_disk()
+    restart_callable()
+    return
+
+
   def on_config(self, *args, **kwargs):
     """
     Lifecycle hook called when configuration changes.
