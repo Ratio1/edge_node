@@ -27,19 +27,23 @@ class PentestLocalWorker(
   _WebTestsMixin
 ):
   """
-  PentestJob handles the execution of a pentest scanning job for a given target.
-  It performs port scanning, service banner gathering, and basic web vulnerability tests.
-  
-  Parameters
+  Execute a pentest workflow against a target on a dedicated thread.
+
+  The worker scans ports, gathers service banners, and performs lightweight web
+  security probes. It maintains local state and exposes status for aggregation.
+
+  Attributes
   ----------
   target : str
-      The network address (IP or hostname) to scan.
-  logger : callable, optional
-      Function for logging messages (e.g., plugin.P); if None, prints to stdout.
-      
-      
-  TODO:
-    - target ports must be configurable per worker from PENTESTER_API and each worker must receive a slice
+    Hostname or IP being scanned.
+  job_id : str
+    Identifier tying the worker to a network job.
+  initiator : str
+    Address that announced the job.
+  local_worker_id : str
+    Unique identifier per worker instance.
+  state : dict
+    Mutable status including ports scanned, open ports, and findings.
   """
 
   def __init__(
@@ -52,6 +56,31 @@ class PentestLocalWorker(
     worker_target_ports=COMMON_PORTS,
     exceptions=None,
   ):
+    """
+    Initialize a pentest worker with target ports and exclusions.
+
+    Parameters
+    ----------
+    owner : object
+      Parent object providing logger `P`.
+    target : str
+      Hostname or IP to scan.
+    job_id : str
+      Identifier of the job.
+    initiator : str
+      Address that announced the job.
+    local_id_prefix : str
+      Prefix used to derive a human-friendly worker id.
+    worker_target_ports : list[int], optional
+      Ports assigned to this worker; defaults to common ports.
+    exceptions : list[int], optional
+      Ports to exclude from scanning.
+
+    Raises
+    ------
+    ValueError
+      If no ports remain after applying exceptions.
+    """
     if exceptions is None:
       exceptions = []
     self.target = target
@@ -107,6 +136,19 @@ class PentestLocalWorker(
     return
 
   def _get_all_features(self, categs=False):
+    """
+    Discover available probe methods on this worker.
+
+    Parameters
+    ----------
+    categs : bool, optional
+      If True, return dict by category; otherwise flat list.
+
+    Returns
+    -------
+    dict | list
+      Service and web test method names.
+    """
     features = {} if categs else []
     PREFIXES = ["_service_info_", "_web_test_"]
     for prefix in PREFIXES:
@@ -119,6 +161,14 @@ class PentestLocalWorker(
   
   @staticmethod
   def get_worker_specific_result_fields():
+    """
+    Define fields that require aggregation functions across workers.
+
+    Returns
+    -------
+    dict
+      Mapping of field name to aggregation callable/type.
+    """
     return {
       "start_port" : min,
       "end_port" : max,
@@ -132,6 +182,19 @@ class PentestLocalWorker(
   
   
   def get_status(self, for_aggregations=False):    
+    """
+    Produce a status snapshot for this worker.
+
+    Parameters
+    ----------
+    for_aggregations : bool, optional
+      If True, omit volatile fields to simplify merges.
+
+    Returns
+    -------
+    dict
+      Worker status including progress and findings.
+    """
     completed_tests = self.state.get("completed_tests", [])
     max_features = len(self.__features) + 1 # +1 from port scanning
     progress = f"{(len(completed_tests) / max_features) * 100 if self.__features else 0:.1f}%"
@@ -167,6 +230,21 @@ class PentestLocalWorker(
 
 
   def P(self, s, **kwargs):
+    """
+    Log a message with worker context prefix.
+
+    Parameters
+    ----------
+    s : str
+      Message to emit.
+    **kwargs
+      Additional logging keyword arguments.
+
+    Returns
+    -------
+    Any
+      Result of owner logger.
+    """
     s = f"[{self.local_worker_id}:{self.target}] {s}"
     self.owner.P(s, **kwargs)
     return
@@ -175,6 +253,10 @@ class PentestLocalWorker(
   def start(self):
     """
     Start the pentest job in a new thread.
+
+    Returns
+    -------
+    None
     """
     # Event to signal early stopping
     self.stop_event = threading.Event()
@@ -187,6 +269,10 @@ class PentestLocalWorker(
   def stop(self):
     """
     Signal the job to stop early.
+
+    Returns
+    -------
+    None
     """
     self.P(f"Stop requested for job {self.job_id} on worker {self.local_worker_id}")
     self.stop_event.set()
@@ -194,6 +280,14 @@ class PentestLocalWorker(
   
   
   def _check_stopped(self):
+    """
+    Determine whether the worker should cease execution.
+
+    Returns
+    -------
+    bool
+      True if done or stop event set.
+    """
     return self.state["done"] or self.stop_event.is_set()
 
 
@@ -201,6 +295,10 @@ class PentestLocalWorker(
     """
     Run the full pentesting workflow: port scanning, service info gathering,
     and web vulnerability tests, until the job is complete or stopped.
+
+    Returns
+    -------
+    None
     """
     try:
       self.P(f"Starting pentest job.")
@@ -234,6 +332,17 @@ class PentestLocalWorker(
   def _scan_ports_step(self, batch_size=None, batch_nr=1):
     """
     Scan a batch of ports from the remaining list to identify open ports.
+
+    Parameters
+    ----------
+    batch_size : int, optional
+      Number of ports per batch; scans all remaining when None.
+    batch_nr : int, optional
+      Batch index (used for logging).
+
+    Returns
+    -------
+    None
     """
     REGISTER_PROGRESS_EACH = 500
 
@@ -254,6 +363,7 @@ class PentestLocalWorker(
     self.P(f"Scanning {nr_ports} ports in batch {batch_nr}.")
     show_progress = False
     if len(ports_batch) > 1000:
+      # Avoid noisy progress logs on tiny batches.
       show_progress = True
     for i, port in enumerate(ports_batch):
       if self.stop_event.is_set():
@@ -293,6 +403,11 @@ class PentestLocalWorker(
   def _gather_service_info(self):
     """
     Gather banner or basic information from each newly open port.
+
+    Returns
+    -------
+    list
+      Aggregated string findings per method (may be empty).
     """
     open_ports = self.state["open_ports"]
     if len(open_ports) == 0:
@@ -326,6 +441,11 @@ class PentestLocalWorker(
   def _run_web_tests(self):
     """
     Perform basic web vulnerability tests if a web service is open.
+
+    Returns
+    -------
+    list
+      Collected findings per test method (may be empty).
     """
     open_ports = self.state["open_ports"]
     if len(open_ports) == 0:
