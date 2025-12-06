@@ -67,14 +67,12 @@ class KeysoftJeevesPlugin(BasePlugin):
     port = getattr(self, 'cfg_port', 15033)
     localhost_ip = self.log.get_localhost_ip()
 
-    self.semaphore_set_env('PORT', str(port), use_prefix=False)
+    self.semaphore_set_env('PORT', str(port))
     self.semaphore_set_env('RATIO1_AGENT_ENDPOINT',
-      'http://{}:{}/query'.format(localhost_ip, port),
-      use_prefix=False
+      'http://{}:{}/query'.format(localhost_ip, port)
     )
     self.semaphore_set_env('RATIO1_AGENT_UPLOAD_ENDPOINT',
-      'http://{}:{}/upload_document_for_domain_base64'.format(localhost_ip, port),
-      use_prefix=False
+      'http://{}:{}/upload_document_for_domain_base64'.format(localhost_ip, port)
     )
 
     # Signal that this plugin is ready
@@ -521,4 +519,3 @@ class KeysoftJeevesPlugin(BasePlugin):
       domain=domain,
       **kwargs
     )
-

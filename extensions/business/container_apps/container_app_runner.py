@@ -2635,7 +2635,7 @@ class ContainerAppRunnerPlugin(
       f"  Semaphore key: {self.cfg_semaphore}",
     ]
     for env_var in env_vars_set:
-      log_lines.append(f"  Env var set: {env_var} (use_prefix=False)")
+      log_lines.append(f"  Env var set: {env_var} (prefixed and raw)")
     log_lines.extend([
       f"  Semaphore data:",
       f"    env vars: {semaphore_data.get('env', {})}",
@@ -3306,8 +3306,7 @@ class ContainerAppRunnerPlugin(
       log_lines = [f"Waiting for semaphores ({elapsed:.0f}s elapsed): {missing}"]
       # Log current status of each semaphore
       for key in self._semaphore_get_keys():
-        shmem_data = self.plugins_shmem.get(key, {})
-        is_ready = shmem_data.get('start', False)
+        is_ready = self.semaphore_is_ready(key)
         log_lines.append(f"  - {key}: {'READY' if is_ready else 'NOT READY'}")
       self.Pd("\n".join(log_lines))
 

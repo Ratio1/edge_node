@@ -155,7 +155,7 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
 
     # Expose API connection details to paired plugins
     port = self.cfg_port
-    self.semaphore_set_env('API_PORT', str(port), use_prefix=False)
+    self.semaphore_set_env('API_PORT', str(port))
 
     # Signal that this plugin is ready
     self.semaphore_set_ready()
@@ -167,7 +167,7 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
       "SEMAPHORE SETUP - Provider Mode",
       "=" * 60,
       f"  Semaphore key: {self.cfg_semaphore}",
-      f"  Env var set: API_PORT = {port} (use_prefix=False)",
+      f"  Env var set: API_PORT = {port} (prefixed and raw)",
       f"  Semaphore data:",
       f"    env vars: {semaphore_data.get('env', {})}",
       f"    metadata: {semaphore_data.get('metadata', {})}",
