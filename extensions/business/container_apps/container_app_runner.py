@@ -331,6 +331,12 @@ _CONFIG = {
   # When container is STOPPED_MANUALLY (PAUSED state), this will define how often we log its existance
   "PAUSED_STATE_LOG_INTERVAL": 60,
 
+  # Semaphore synchronization for paired plugins
+  # List of semaphore keys to wait for before starting container
+  "SEMAPHORED_KEYS": [],
+  # How often to log waiting status (seconds)
+  "SEMAPHORE_LOG_INTERVAL": 10,
+
   # end of container-specific config options
 
   'VALIDATION_RULES': {
@@ -2506,6 +2512,7 @@ class ContainerAppRunnerPlugin(
         if health.delay > 0:
           self.P(f"Health check delay ({health.delay}s) elapsed - app assumed ready")
         self._app_ready = True
+        self._signal_semaphore_ready()
       return self._app_ready
 
     # Mode: TCP or ENDPOINT - active probing with delay/interval/timeout
@@ -2534,6 +2541,7 @@ class ContainerAppRunnerPlugin(
       if health.on_failure == "start":
         self.P("Starting tunnel anyway per HEALTH_CHECK.ON_FAILURE='start'", color='y')
         self._app_ready = True
+        self._signal_semaphore_ready()
       else:
         self.P("Tunnel startup skipped per HEALTH_CHECK.ON_FAILURE='skip'", color='y')
         self._app_ready = False  # Stay false, but stop probing
@@ -2572,10 +2580,39 @@ class ContainerAppRunnerPlugin(
     if probe_result:
       self.P(success_msg, color='g')
       self._app_ready = True
+      self._signal_semaphore_ready()
     else:
-      self.Pd(f"Health probe returned False, will retry in {interval}s")
+      self.Pd(f"Health probe returned False, will retry in {health.interval}s")
 
     return self._app_ready
+
+  def _signal_semaphore_ready(self):
+    """
+    Signal semaphore readiness when container is ready.
+
+    Called when the container passes health checks and is ready to serve.
+    Exposes container port and URL as environment variables to dependent plugins.
+    """
+    if not self.cfg_semaphore:
+      return
+
+    # Only signal once
+    if getattr(self, '_semaphore_signaled', False):
+      return
+    self._semaphore_signaled = True
+
+    # Expose container connection details
+    if self._container_port:
+      self.semaphore_set_env('PORT', str(self._container_port))
+
+    # If we have a tunnel URL, expose it
+    tunnel_url = getattr(self, 'tunnel_url', None)
+    if tunnel_url:
+      self.semaphore_set_env('URL', tunnel_url)
+
+    # Signal that this container is ready
+    self.semaphore_set_ready()
+    return
 
 
   def _check_container_status(self):
@@ -2759,6 +2796,7 @@ class ContainerAppRunnerPlugin(
     Lifecycle hook called when plugin is stopping.
 
     Performs cleanup including:
+    - Clearing semaphore (if configured)
     - Stopping container
     - Stopping all tunnels (main and extra)
     - Terminating log processes
@@ -2768,6 +2806,9 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
+    # Clear semaphore to signal dependent plugins
+    self.semaphore_clear()
+
     self._stop_container_and_save_logs_to_disk()
 
     super(ContainerAppRunnerPlugin, self).on_close()
@@ -3156,14 +3197,55 @@ class ContainerAppRunnerPlugin(
     return self._ensure_image_if_not_present()
 
 
+  def _wait_for_semaphores(self):
+    """
+    Wait for all configured semaphores to be ready.
+
+    This method implements a non-blocking wait that integrates with the
+    plugin's process() loop. It starts a wait timer on first call and
+    returns False while waiting. Once all semaphores are ready, it returns True.
+    Waits indefinitely until all semaphores are ready.
+
+    Returns
+    -------
+    bool
+      True if all semaphores are ready, False if still waiting
+    """
+    # Start waiting timer on first call
+    self.semaphore_start_wait()
+
+    # Check if all semaphores are ready
+    if self.semaphore_check_with_logging():
+      # All ready - log and proceed
+      self.P("All semaphores ready, proceeding with container launch", color='g')
+      return True
+
+    # Still waiting - log periodically
+    elapsed = self.semaphore_get_wait_elapsed()
+    if int(elapsed) % self.cfg_semaphore_log_interval == 0 and elapsed > 0:
+      missing = self.semaphore_get_missing()
+      self.Pd("Waiting for semaphores ({:.0f}s): {}".format(elapsed, missing))
+
+    return False
+
+
   def _handle_initial_launch(self):
     """
     Handle the initial container launch.
+
+    If SEMAPHORED_KEYS is configured, waits for all semaphores to be ready
+    before starting the container. Environment variables from provider plugins
+    are automatically merged into the container's environment.
 
     Returns
     -------
     None
     """
+    # Check if we need to wait for semaphores
+    if self._semaphore_get_keys():
+      if not self._wait_for_semaphores():
+        return  # Still waiting
+
     try:
       self.P("Initial container launch...")
 
@@ -3352,6 +3434,10 @@ class ContainerAppRunnerPlugin(
 
     # Container is running normally - reset retry counter if appropriate
     self._maybe_reset_retry_counter()
+
+    # Signal semaphore readiness when container is running
+    # (for tunneled apps, this is also called after health check passes)
+    self._signal_semaphore_ready()
 
     # ============================================================================
     # End of Restart Logic

@@ -64,6 +64,10 @@ _CONFIG = {
   # AI Engine for image processing
   'AI_ENGINE': 'CERVIGUARD_IMAGE_ANALYZER',
 
+  # Semaphore key for paired plugin synchronization (e.g., with WAR containers)
+  # When set, this plugin will signal readiness and expose env vars to paired plugins
+  "SEMAPHORE": None,
+
   'VALIDATION_RULES': {
     **FastApiWebAppPlugin.CONFIG['VALIDATION_RULES'],
     'REQUEST_TIMEOUT': {
@@ -100,6 +104,29 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     self.P(f"  Endpoints: /predict, /list_results, /status, /health", color='g')
     self.P(f"  AI Engine: {self.cfg_ai_engine}", color='g')
     self.P(f"  Loopback key: loopback_dct_{self._stream_id}", color='g')
+
+    # Set up semaphore for paired plugins (e.g., WAR containers)
+    self._setup_semaphore()
+    return
+
+  def _setup_semaphore(self):
+    """Configure semaphore environment variables and signal readiness."""
+    if not self.cfg_semaphore:
+      return
+
+    # Expose API connection details to paired plugins
+    port = self.cfg_port
+
+    self.semaphore_set_env('API_PORT', str(port), use_prefix=False)
+
+    # Signal that this plugin is ready
+    self.semaphore_set_ready()
+    return
+
+  def on_close(self):
+    """Clean up semaphore on plugin shutdown."""
+    self.semaphore_clear()
+    super(LocalServingApiPlugin, self).on_close()
     return
 
   def _get_payload_field(self, data: dict, key: str, default=None):

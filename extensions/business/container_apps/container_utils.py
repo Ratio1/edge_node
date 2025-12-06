@@ -678,11 +678,26 @@ class _ContainerUtilsMixin:
 
     This method should NOT allocate ports - only format already-allocated ports.
     All port allocations happen in _setup_resource_limits_and_ports.
+
+    Environment variable precedence (later overrides earlier):
+      1. Default env vars (system-provided)
+      2. Dynamic env vars (computed at runtime)
+      3. Semaphore env vars (from paired provider plugins)
+      4. cfg_env (user-configured)
     """
     # Environment variables
     # allow cfg_env to override default env vars
     self.env = self._get_default_env_vars()
     self.env.update(self.dynamic_env)
+
+    # Add environment variables from semaphored paired plugins
+    if hasattr(self, 'semaphore_get_env'):
+      semaphore_env = self.semaphore_get_env()
+      if semaphore_env:
+        self.P("Adding {} env vars from semaphored plugins".format(len(semaphore_env)), color='b')
+        self.env.update(semaphore_env)
+    # endif semaphore env
+
     if self.cfg_env:
       self.env.update(self.cfg_env)
     if self.dynamic_env:
