@@ -125,15 +125,28 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     # Initialize request tracking
     self.__requests = {}  # Track active requests (PostponedRequest pattern)
     self._data_buffer = []  # Simple activity log for monitoring
+    self.__semaphore_signaled = False  # Track if semaphore was signaled
 
     self.P("Local Serving API initialized - Loopback + PostponedRequest mode", color='g')
     self.P(f"  Endpoints: /predict, /list_results, /status, /health", color='g')
     self.P(f"  AI Engine: {self.cfg_ai_engine}", color='g')
     self.P(f"  Loopback key: loopback_dct_{self._stream_id}", color='g')
+    return
 
-    # Set up semaphore for paired plugins (e.g., WAR containers)
+
+  def _maybe_signal_semaphore(self):
+    """
+    Signal semaphore when server is ready.
+    Uses the parent class's uvicorn_server_started property.
+    """
+    if self.__semaphore_signaled:
+      return
+    if not self.uvicorn_server_started:
+      return
+    self.__semaphore_signaled = True
     self._setup_semaphore()
     return
+
 
   def _setup_semaphore(self):
     """Configure semaphore environment variables and signal readiness."""
@@ -440,6 +453,9 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     3. Match inferences to requests by index
     4. Mark requests as finished for PostponedRequest polling
     """
+    # Signal semaphore once server is ready (checked via parent's uvicorn_server_started)
+    self._maybe_signal_semaphore()
+
     self._cleanup_old_requests()
     self._maybe_trim_buffer()
 

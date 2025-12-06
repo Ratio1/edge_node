@@ -1286,7 +1286,12 @@ class ContainerAppRunnerPlugin(
     self._configure_volumes() # setup container volumes
     self._configure_file_volumes() # setup file volumes with dynamic content
 
-    self._setup_env_and_ports()
+    # If we have semaphored keys, defer _setup_env_and_ports() until semaphores are ready
+    # This ensures we get the env vars from provider plugins before starting the container
+    if not self._semaphore_get_keys():
+      self._setup_env_and_ports()
+    else:
+      self.Pd("Deferring _setup_env_and_ports() until semaphores are ready")
 
     # Validate extra tunnels configuration
     self._validate_extra_tunnels_config()
@@ -3315,7 +3320,11 @@ class ContainerAppRunnerPlugin(
     # Check if we need to wait for semaphores
     if self._semaphore_get_keys():
       if not self._wait_for_semaphores():
-        return  # Still waiting
+        return  # Still
+      # end if
+      # Semaphores ready - now setup env vars with semaphore values
+      self._setup_env_and_ports()
+    # end if
 
     try:
       self.P("Initial container launch...")
@@ -3442,6 +3451,10 @@ class ContainerAppRunnerPlugin(
 
     if not self.container:
       self._handle_initial_launch()
+      # If still no container (e.g., waiting for semaphores), return early
+      # to avoid triggering restart logic
+      if not self.container:
+        return
 
     # Tunnel management (only if TUNNEL_ENGINE_ENABLED=True)
     if self.cfg_tunnel_engine_enabled:
