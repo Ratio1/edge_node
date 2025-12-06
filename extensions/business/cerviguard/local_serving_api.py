@@ -116,11 +116,26 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
 
     # Expose API connection details to paired plugins
     port = self.cfg_port
-
     self.semaphore_set_env('API_PORT', str(port), use_prefix=False)
 
     # Signal that this plugin is ready
     self.semaphore_set_ready()
+
+    # Log the full semaphore data structure
+    semaphore_data = self.plugins_shmem.get(self.cfg_semaphore, {})
+    log_msg = "\n".join([
+      "=" * 60,
+      "SEMAPHORE SETUP - Provider Mode",
+      "=" * 60,
+      f"  Semaphore key: {self.cfg_semaphore}",
+      f"  Env var set: API_PORT = {port} (use_prefix=False)",
+      f"  Semaphore data:",
+      f"    env vars: {semaphore_data.get('env', {})}",
+      f"    metadata: {semaphore_data.get('metadata', {})}",
+      f"  Status: READY",
+      "=" * 60,
+    ])
+    self.Pd(log_msg)
     return
 
   def on_close(self):

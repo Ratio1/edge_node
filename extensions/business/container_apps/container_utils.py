@@ -694,7 +694,16 @@ class _ContainerUtilsMixin:
     if hasattr(self, 'semaphore_get_env'):
       semaphore_env = self.semaphore_get_env()
       if semaphore_env:
-        self.P("Adding {} env vars from semaphored plugins".format(len(semaphore_env)), color='b')
+        log_lines = [
+          "=" * 60,
+          "SEMAPHORE ENV INJECTION",
+          "=" * 60,
+          f"  Adding {len(semaphore_env)} env vars from semaphored plugins:",
+        ]
+        for key, value in semaphore_env.items():
+          log_lines.append(f"    {key} = {value}")
+        log_lines.append("=" * 60)
+        self.Pd("\n".join(log_lines))
         self.env.update(semaphore_env)
     # endif semaphore env
 

@@ -2602,16 +2602,38 @@ class ContainerAppRunnerPlugin(
     self._semaphore_signaled = True
 
     # Expose container connection details
+    env_vars_set = []
     if self._container_port:
       self.semaphore_set_env('PORT', str(self._container_port))
+      env_vars_set.append(f"{self.cfg_semaphore}_PORT = {self._container_port}")
 
     # If we have a tunnel URL, expose it
     tunnel_url = getattr(self, 'tunnel_url', None)
     if tunnel_url:
       self.semaphore_set_env('URL', tunnel_url)
+      env_vars_set.append(f"{self.cfg_semaphore}_URL = {tunnel_url}")
 
     # Signal that this container is ready
     self.semaphore_set_ready()
+
+    # Log the full semaphore data structure
+    semaphore_data = self.plugins_shmem.get(self.cfg_semaphore, {})
+    log_lines = [
+      "=" * 60,
+      "SEMAPHORE SIGNAL - CAR Provider Mode",
+      "=" * 60,
+      f"  Semaphore key: {self.cfg_semaphore}",
+    ]
+    for env_var in env_vars_set:
+      log_lines.append(f"  Env var set: {env_var}")
+    log_lines.extend([
+      f"  Semaphore data:",
+      f"    env vars: {semaphore_data.get('env', {})}",
+      f"    metadata: {semaphore_data.get('metadata', {})}",
+      f"  Status: READY",
+      "=" * 60,
+    ])
+    self.Pd("\n".join(log_lines))
     return
 
 
@@ -3211,20 +3233,69 @@ class ContainerAppRunnerPlugin(
     bool
       True if all semaphores are ready, False if still waiting
     """
+    # Log initial wait state on first call
+    if not hasattr(self, '_semaphore_wait_logged'):
+      self._semaphore_wait_logged = True
+      required_keys = self._semaphore_get_keys()
+      log_msg = "\n".join([
+        "=" * 60,
+        "SEMAPHORE WAIT - Consumer Mode",
+        "=" * 60,
+        f"  Waiting for semaphores: {required_keys}",
+        f"  Container will NOT start until all semaphores are ready",
+        "=" * 60,
+      ])
+      self.Pd(log_msg)
+
     # Start waiting timer on first call
     self.semaphore_start_wait()
 
     # Check if all semaphores are ready
     if self.semaphore_check_with_logging():
-      # All ready - log and proceed
-      self.P("All semaphores ready, proceeding with container launch", color='g')
+      # All ready - log detailed info and proceed
+      log_lines = [
+        "=" * 60,
+        "ALL SEMAPHORES READY!",
+        "=" * 60,
+      ]
+
+      # Log semaphore status details
+      status = self.semaphore_get_status()
+      for key, info in status.items():
+        log_lines.extend([
+          f"  Semaphore '{key}':",
+          f"    Ready: {info['ready']}",
+          f"    Provider: {info['provider']}",
+          f"    Env vars count: {info['env_count']}",
+        ])
+
+      # Log env vars that will be injected
+      env_vars = self.semaphore_get_env()
+      if env_vars:
+        log_lines.append(f"  Environment variables to inject into container:")
+        for k, v in env_vars.items():
+          log_lines.append(f"    {k} = {v}")
+      else:
+        log_lines.append(f"  No environment variables from semaphores")
+
+      log_lines.extend([
+        "=" * 60,
+        "Proceeding with container launch...",
+      ])
+      self.Pd("\n".join(log_lines))
       return True
 
     # Still waiting - log periodically
     elapsed = self.semaphore_get_wait_elapsed()
     if int(elapsed) % self.cfg_semaphore_log_interval == 0 and elapsed > 0:
       missing = self.semaphore_get_missing()
-      self.Pd("Waiting for semaphores ({:.0f}s): {}".format(elapsed, missing))
+      log_lines = [f"Waiting for semaphores ({elapsed:.0f}s elapsed): {missing}"]
+      # Log current status of each semaphore
+      for key in self._semaphore_get_keys():
+        shmem_data = self.plugins_shmem.get(key, {})
+        is_ready = shmem_data.get('start', False)
+        log_lines.append(f"  - {key}: {'READY' if is_ready else 'NOT READY'}")
+      self.Pd("\n".join(log_lines))
 
     return False
 
