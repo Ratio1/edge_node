@@ -2610,16 +2610,18 @@ class ContainerAppRunnerPlugin(
     self._semaphore_signaled = True
 
     # Expose container connection details
+    # self.port is the host port (dynamically allocated), which consumers need to connect to
     env_vars_set = []
-    if self._container_port:
-      self.semaphore_set_env('PORT', str(self._container_port))
-      env_vars_set.append(f"{self.cfg_semaphore}_PORT = {self._container_port}")
+    localhost_ip = self.log.get_localhost_ip()
 
-    # If we have a tunnel URL, expose it
-    tunnel_url = getattr(self, 'tunnel_url', None)
-    if tunnel_url:
-      self.semaphore_set_env('URL', tunnel_url)
-      env_vars_set.append(f"{self.cfg_semaphore}_URL = {tunnel_url}")
+    if self.port:
+      self.semaphore_set_env('API_PORT', str(self.port))
+      env_vars_set.append(f"API_PORT = {self.port}")
+
+      # Construct local URL for internal communication
+      local_url = f"http://{localhost_ip}:{self.port}"
+      self.semaphore_set_env('URL', local_url)
+      env_vars_set.append(f"URL = {local_url}")
 
     # Signal that this container is ready
     self.semaphore_set_ready()
@@ -2633,7 +2635,7 @@ class ContainerAppRunnerPlugin(
       f"  Semaphore key: {self.cfg_semaphore}",
     ]
     for env_var in env_vars_set:
-      log_lines.append(f"  Env var set: {env_var}")
+      log_lines.append(f"  Env var set: {env_var} (use_prefix=False)")
     log_lines.extend([
       f"  Semaphore data:",
       f"    env vars: {semaphore_data.get('env', {})}",
