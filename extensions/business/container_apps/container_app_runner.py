@@ -489,6 +489,9 @@ class ContainerAppRunnerPlugin(
     # Tunnel startup gating
     self._tunnel_start_allowed = False
 
+    # Semaphore signaling state (for provider mode)
+    self._semaphore_signaled = False
+
     self._after_reset()
 
     return
@@ -2601,8 +2604,8 @@ class ContainerAppRunnerPlugin(
     if not self.cfg_semaphore:
       return
 
-    # Only signal once
-    if getattr(self, '_semaphore_signaled', False):
+    # Only signal once per container start
+    if self._semaphore_signaled:
       return
     self._semaphore_signaled = True
 
@@ -2769,6 +2772,7 @@ class ContainerAppRunnerPlugin(
     Stop the container and all tunnels, then save logs to disk.
 
     Performs full shutdown sequence:
+    - Clears semaphore (signals dependent plugins container is stopping)
     - Stops log streaming threads
     - Stops main tunnel engine
     - Stops all extra tunnels
@@ -2780,6 +2784,9 @@ class ContainerAppRunnerPlugin(
     None
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
+
+    # Clear semaphore immediately to signal dependent plugins
+    self.semaphore_clear()
 
     # Stop log streaming
     self._stop_event.set()
