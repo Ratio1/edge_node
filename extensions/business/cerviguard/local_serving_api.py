@@ -68,6 +68,8 @@ _CONFIG = {
   # When set, this plugin will signal readiness and expose env vars to paired plugins
   "SEMAPHORE": None,
 
+  "VERBOSE": 10,
+
   'VALIDATION_RULES': {
     **FastApiWebAppPlugin.CONFIG['VALIDATION_RULES'],
     'REQUEST_TIMEOUT': {
@@ -93,6 +95,30 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
   """
 
   CONFIG = _CONFIG
+
+  def Pd(self, s, *args, score=-1, **kwargs):
+    """
+    Print debug message if verbosity level allows.
+
+    Parameters
+    ----------
+    s : str
+        Message to print
+    score : int, optional
+        Verbosity threshold (default: -1). Message prints if cfg_verbose > score
+    *args
+        Additional positional arguments passed to P()
+    **kwargs
+        Additional keyword arguments passed to P()
+
+    Returns
+    -------
+    None
+    """
+    if self.cfg_verbose > score:
+      s = "[DEBUG] " + s
+      self.P(s, *args, **kwargs)
+    return
 
   def on_init(self):
     super(LocalServingApiPlugin, self).on_init()
