@@ -15,27 +15,6 @@ class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
   
-  def _handle_config_restart(self, restart_callable):
-    """
-    Handle container restart when configuration changes.
-
-    Stops the current container and invokes the provided restart callable
-    to reinitialize with new configuration.
-
-    Parameters
-    ----------
-    restart_callable : callable
-        Function to call after stopping container to perform restart
-
-    Returns
-    -------
-    None
-    """
-    self.P(f"Received an updated config for {self.__class__.__name__}")
-    self._stop_container_and_save_logs_to_disk()
-    restart_callable()
-    return
-  
   def _get_cr_data(self):
     """
     Helper method to extract container registry data from configuration.
@@ -699,11 +678,35 @@ class _ContainerUtilsMixin:
 
     This method should NOT allocate ports - only format already-allocated ports.
     All port allocations happen in _setup_resource_limits_and_ports.
+
+    Environment variable precedence (later overrides earlier):
+      1. Default env vars (system-provided)
+      2. Dynamic env vars (computed at runtime)
+      3. Semaphore env vars (from paired provider plugins)
+      4. cfg_env (user-configured)
     """
     # Environment variables
     # allow cfg_env to override default env vars
     self.env = self._get_default_env_vars()
     self.env.update(self.dynamic_env)
+
+    # Add environment variables from semaphored paired plugins
+    if hasattr(self, 'semaphore_get_env'):
+      semaphore_env = self.semaphore_get_env()
+      if semaphore_env:
+        log_lines = [
+          "=" * 60,
+          "SEMAPHORE ENV INJECTION",
+          "=" * 60,
+          f"  Adding {len(semaphore_env)} env vars from semaphored plugins:",
+        ]
+        for key, value in semaphore_env.items():
+          log_lines.append(f"    {key} = {value}")
+        log_lines.append("=" * 60)
+        self.Pd("\n".join(log_lines))
+        self.env.update(semaphore_env)
+    # endif semaphore env
+
     if self.cfg_env:
       self.env.update(self.cfg_env)
     if self.dynamic_env:
