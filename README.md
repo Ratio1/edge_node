@@ -1,5 +1,6 @@
 # Ratio1 Edge Node 
 
+
 Welcome to the **Ratio1 Edge Node** repository, formerly known as the **Naeural Edge Protocol Edge Node**. As a pivotal component of the Ratio1 ecosystem, this Edge Node software empowers a decentralized, privacy-preserving, and secure edge computing network. By enabling a collaborative network of edge nodes, Ratio1 facilitates the secure sharing of resources and the seamless execution of computation tasks across diverse devices.
 
 Documentation sections:
@@ -16,12 +17,12 @@ Documentation sections:
 
 ## Introduction
 
-The Ratio1 Edge Node is a meta Operating System designed to operate on edge devices, providing them the essential functionality required to join and thrive within the Ratio1 network. Each Edge Node manages the device’s resources, executes computation tasks efficiently, and communicates securely with other nodes in the network. Leveraging the powerful Ratio1 core libraries (formely known as Naeural Edge Protocol libraries) `naeural_core` and `ratio1`— the Ratio1 Edge Node offers out-of-the-box usability starting in 2025. Users can deploy the Edge Node and SDK (`ratio1`) effortlessly without the need for intricate configurations, local subscriptions, tenants, user accounts, passwords, or broker setups.
+The Ratio1 Edge Node is a meta Operating System designed to operate on edge devices, providing them the essential functionality required to join and thrive within the Ratio1 network. Each Edge Node manages the device’s resources, executes computation tasks efficiently, and communicates securely with other nodes in the network. Leveraging the powerful Ratio1 core libraries (formerly known as Naeural Edge Protocol libraries) `naeural_core` and the Ratio1 SDK (`ratio1_sdk`, published on PyPI as `ratio1`), the Ratio1 Edge Node offers out-of-the-box usability starting in 2025 without intricate configurations, local subscriptions, tenants, user accounts, passwords, or broker setups.
 
 ## Related Repositories
 
 - [ratio1/naeural_core](https://github.com/ratio1/naeural_core) provides the modular pipeline engine that powers data ingestion, processing, and serving inside this node. Extend or troubleshoot runtime behavior by mirroring the folder layout in `extensions/` against the upstream modules.
-- [Ratio1/ratio1_sdk](https://github.com/Ratio1/ratio1_sdk) is the client toolkit for building and dispatching jobs to Ratio1 nodes. Its tutorials pair with the workflows in `plugins/business/tutorials/` and are the best place to validate end-to-end scenarios.
+- [Ratio1/ratio1_sdk](https://github.com/Ratio1/ratio1_sdk) is the client toolkit for building and dispatching jobs to Ratio1 nodes (published on PyPI as `ratio1`). Its tutorials pair with the workflows in `plugins/business/tutorials/` and are the best place to validate end-to-end scenarios.
 
 When developing custom logic, install the three repositories in the same virtual environment (`pip install -e . ../naeural_core ../ratio1_sdk`) so interface changes remain consistent across the stack.
 
@@ -33,15 +34,17 @@ When developing custom logic, install the three repositories in the same virtual
 Deploying a Ratio1 Edge Node within a development network is straightforward. Execute the following Docker command to launch the node making sure you mount a persistent volume to the container to preserve the node data between restarts:
 
 ```bash
-docker run -d --rm --name r1node --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:develop
+docker run -d --rm --name r1node --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:devnet
 ```
 
 - `-d`: Runs the container in the background.
 - `--rm`: Removes the container upon stopping.
 - `--name r1node`: Assigns the name `r1node` to the container.
 - `--pull=always`: Ensures the latest image version is always pulled.
-- `ratio1/edge_node:develop`: Specifies the Docker image to run.
+- `ratio1/edge_node:devnet`: Specifies the devnet image; use `:mainnet` or `:testnet` for those networks.
 - `-v r1vol:/edge_node/_local_cache/`: Mounts the `r1vol` volume to the `/edge_node/_local_cache/` directory within the container.
+
+Architecture-specific variants (for example `:devnet-arm64`, `:devnet-tegra`, `:devnet-amd64-cpu`) will follow; pick the tag that matches your hardware once available.
 
 This command initializes the Ratio1 Edge Node in development mode, automatically connecting it to the Ratio1 development network and preparing it to receive computation tasks while ensuring that all node data is stored in `r1vol`, preserving it between container restarts.
 
@@ -49,12 +52,12 @@ This command initializes the Ratio1 Edge Node in development mode, automatically
 If for some reason you encounter issues when running the Edge Node, you can try to run the container with the `--platform linux/amd64` flag to ensure that the container runs on the correct platform.
 
 ```bash
-docker run -d --rm --name r1node --platform linux/amd64 --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:develop
+docker run -d --rm --name r1node --platform linux/amd64 --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:devnet
 ```
 Also, if you have GPU(s) on your machine, you can enable GPU support by adding the `--gpus all` flag to the Docker command. This flag allows the Edge Node to utilize the GPU(s) for computation tasks.
 
 ```bash
-docker run -d --rm --name r1node --gpus all --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:develop
+docker run -d --rm --name r1node --gpus all --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:devnet
 ```
 
 This will ensure that your node will be able to utilize the GPU(s) for computation tasks and will accept training and inference jobs that require GPU acceleration.
@@ -64,12 +67,12 @@ This will ensure that your node will be able to utilize the GPU(s) for computati
 If you want to run multiple Edge Nodes on the same machine, you can do so by specifying different names for each container but more importantly, you need to specify different volumes for each container to avoid conflicts between the nodes. You can do this by creating a new volume for each node and mounting it to the container as follows:
 
 ```bash
-docker run -d --rm --name r1node1 --pull=always -v r1vol1:/edge_node/_local_cache/ ratio1/edge_node:develop
-docker run -d --rm --name r1node2 --pull=always -v r1vol2:/edge_node/_local_cache/ ratio1/edge_node:develop
+docker run -d --rm --name r1node1 --pull=always -v r1vol1:/edge_node/_local_cache/ ratio1/edge_node:devnet
+docker run -d --rm --name r1node2 --pull=always -v r1vol2:/edge_node/_local_cache/ ratio1/edge_node:devnet
 ```
 
 Now you can run multiple Edge Nodes on the same machine without any conflicts between them.
->NOTE: If you are running multiple nodes on the same machine it is recommended to use docker-compose to manage the nodes. You can find an example of how to run multiple nodes on the same machine using docker-compose in the [Running multiple nodes on the same machine](#running-multiple-nodes-on-the-same-machine) section.
+>NOTE: If you are running multiple nodes on the same machine it is recommended to use docker-compose to manage the nodes. You can find a docker-compose example in the section below.
 
 
 ## Inspecting the Edge Node
@@ -144,6 +147,8 @@ The [Ratio1 SDK](https://github.com/Ratio1/ratio1_sdk) is the recommended way to
 ```bash
 pip install -e ../ratio1_sdk
 ```
+
+If you prefer the published package, install from PyPI via `pip install ratio1`.
 
 - Use the `nepctl` (formerly `r1ctl`) CLI that ships with the SDK to inspect the network, configure clients, and dispatch jobs.
 - Explore `ratio1_sdk/tutorials/` for end-to-end examples; most have matching runtime counterparts in `plugins/business/tutorials/` inside this repository.
@@ -226,6 +231,7 @@ Lets suppose you have the following node data:
     "whitelist": [
       "0xai_AthDPWc_k3BKJLLYTQMw--Rjhe3B6_7w76jlRpT6nDeX"
     ]
+  }
 }
 ```
 
@@ -250,6 +256,7 @@ docker exec r1node get_node_info
     "whitelist": [
       "0xai_AthDPWc_k3BKJLLYTQMw--Rjhe3B6_7w76jlRpT6nDeX"
     ]
+  }
 }
 ```
 
@@ -286,7 +293,7 @@ If you want to run multiple nodes on the same machine the best option is to use 
 ```yaml
 services:
   r1node1:
-    image: ratio1/edge_node:testnet
+    image: ratio1/edge_node:devnet
     container_name: r1node1
     platform: linux/amd64
     restart: always
@@ -297,7 +304,7 @@ services:
       - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
 
   r1node2:
-    image: ratio1/edge_node:testnet
+    image: ratio1/edge_node:devnet
     container_name: r1node2
     platform: linux/amd64
     restart: always
@@ -350,7 +357,7 @@ docker-compose down
 
 Now, lets dissect the `docker-compose.yml` file:
   - we have a variable number of nodes - in our case 2 nodes - `r1node1` and `r1node2` as services (we commented out the third node for simplicity)
-  - each node is using the `ratio1/edge_node:testnet` image
+  - each node is using the `ratio1/edge_node:devnet` image (swap the tag for `:mainnet` or `:testnet` as needed; architecture-specific variants such as `-arm64`, `-tegra`, `-amd64-cpu` will follow)
   - each node has own unique volume mounted to it
   - we have a watchtower service that will check for new images every 1 minute and will update the nodes if a new image is available
 
@@ -375,6 +382,7 @@ For inquiries regarding the funding and its impact on this project, please conta
 
 ## Citation
 
+
 If you use the Ratio1 Edge Node in your research or projects, please cite it as follows:
 
 ```bibtex
@@ -383,5 +391,38 @@ If you use the Ratio1 Edge Node in your research or projects, please cite it as 
   title = {Ratio1: Edge Node},
   year = {2024-2025},
   howpublished = {\url{https://github.com/Ratio1/edge_node}},
+}
+```
+
+
+Additional publications and references:
+
+```bibtex
+@inproceedings{Damian2025CSCS,
+  author    = {Damian, Andrei Ionut and Bleotiu, Cristian and Grigoras, Marius and
+               Butusina, Petrica and De Franceschi, Alessandro and Toderian, Vitalii and
+               Tapus, Nicolae},
+  title     = {Ratio1 meta-{OS} -- decentralized {MLOps} and beyond},
+  booktitle = {2025 25th International Conference on Control Systems and Computer Science (CSCS)},
+  year      = {2025},
+  pages     = {258--265},
+  address   = {Bucharest, Romania},
+  month     = {May 27--30},
+  doi       = {10.1109/CSCS66924.2025.00046},
+  isbn      = {979-8-3315-7343-0},
+  issn      = {2379-0482},
+  publisher = {IEEE}
+}
+
+@misc{Damian2025arXiv,
+  title         = {Ratio1 -- AI meta-OS},
+  author        = {Damian, Andrei and Butusina, Petrica and De Franceschi, Alessandro and
+                   Toderian, Vitalii and Grigoras, Marius and Bleotiu, Cristian},
+  year          = {2025},
+  month         = {September},
+  eprint        = {2509.12223},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.OS},
+  doi           = {10.48550/arXiv.2509.12223}
 }
 ```
