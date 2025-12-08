@@ -15,9 +15,21 @@
     "r1edge",
 
     "--privileged"
-  ],  
-  
+  ],
+
+
+  "build": {
+    "context": "../",
+  },
+
+
   "customizations": {
+    "jetbrains": {
+      "settings": {
+        "org.jetbrains.plugins.github:app:GithubSettings.clone_git_using_ssh": true,
+        "org.jetbrains.plugins.terminal:app:TerminalOptionsProvider.myShellPath": "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+      }
+    },
     "vscode" : {
       "extensions": [
         "ms-python.python",
