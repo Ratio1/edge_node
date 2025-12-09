@@ -3230,17 +3230,8 @@ class ContainerAppRunnerPlugin(
           f"  Semaphore '{key}':",
           f"    Ready: {info['ready']}",
           f"    Provider: {info['provider']}",
-          f"    Env vars count: {info['env_count']}",
+          f"    Env vars: {info['env_count']} variables",
         ])
-
-      # Log env vars that will be injected
-      env_vars = self.semaphore_get_env()
-      if env_vars:
-        log_lines.append(f"  Environment variables to inject into container:")
-        for k, v in env_vars.items():
-          log_lines.append(f"    {k} = {v}")
-      else:
-        log_lines.append(f"  No environment variables from semaphores")
 
       log_lines.extend([
         "=" * 60,
