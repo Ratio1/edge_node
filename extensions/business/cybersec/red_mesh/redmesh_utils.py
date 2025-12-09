@@ -199,11 +199,15 @@ class PentestLocalWorker(
     Pause execution based on pacing settings with jitter and stop awareness.
 
     Jitter ranges:
-    - pause_interval: 0.8-1.2x
-    - pause_duration: 0.5-1.5x
+    - pause_interval: 0.8-1.2x → actual pause frequency is varied around the configured interval to break patterns
+      e.g. pause_interval=10 means next pause after ~8-12 actions.
+    - pause_duration: 0.5-1.5x → actual sleep time is varied around the configured duration to avoid fixed timing
+      e.g. pause_duration=2.0 means sleep ~1.0-3.0 seconds.
 
     pause_interval controls how often we pause (every ~N actions); pause_duration
     controls how long each pause lasts.
+    This is the “Dune sand walking” pacing: irregular, human-like delays to avoid
+    predictable scan patterns.
     """
     if not self.pacing:
       return
