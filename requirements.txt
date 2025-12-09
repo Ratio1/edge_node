@@ -21,5 +21,5 @@ sqlfluff
 pypdf
 python-docx
 pdfplumber
-# This has been moved to the dockerfile for better control over the version used
+# This has been moved to device.py additional_packages list for better compatibility with different devices.
 # llama-cpp-python>=0.2.82
