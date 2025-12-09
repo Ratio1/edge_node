@@ -489,9 +489,6 @@ class ContainerAppRunnerPlugin(
     # Tunnel startup gating
     self._tunnel_start_allowed = False
 
-    # Semaphore signaling state (for provider mode)
-    self._semaphore_signaled = False
-
     self._after_reset()
 
     return
@@ -2520,7 +2517,7 @@ class ContainerAppRunnerPlugin(
         if health.delay > 0:
           self.P(f"Health check delay ({health.delay}s) elapsed - app assumed ready")
         self._app_ready = True
-        self._signal_semaphore_ready()
+        self._semaphore_set_ready_flag()
       return self._app_ready
 
     # Mode: TCP or ENDPOINT - active probing with delay/interval/timeout
@@ -2549,7 +2546,7 @@ class ContainerAppRunnerPlugin(
       if health.on_failure == "start":
         self.P("Starting tunnel anyway per HEALTH_CHECK.ON_FAILURE='start'", color='y')
         self._app_ready = True
-        self._signal_semaphore_ready()
+        self._semaphore_set_ready_flag()
       else:
         self.P("Tunnel startup skipped per HEALTH_CHECK.ON_FAILURE='skip'", color='y')
         self._app_ready = False  # Stay false, but stop probing
@@ -2588,62 +2585,19 @@ class ContainerAppRunnerPlugin(
     if probe_result:
       self.P(success_msg, color='g')
       self._app_ready = True
-      self._signal_semaphore_ready()
+      self._semaphore_set_ready_flag()
     else:
       self.Pd(f"Health probe returned False, will retry in {health.interval}s")
 
     return self._app_ready
 
-  def _signal_semaphore_ready(self):
-    """
-    Signal semaphore readiness when container is ready.
-
-    Called when the container passes health checks and is ready to serve.
-    Exposes container port and URL as environment variables to dependent plugins.
-    """
-    if not self.cfg_semaphore:
-      return
-
-    # Only signal once per container start
-    if self._semaphore_signaled:
-      return
-    self._semaphore_signaled = True
-
-    # Expose container connection details
-    # self.port is the host port (dynamically allocated), which consumers need to connect to
-    env_vars_set = []
+  def _setup_semaphore_env(self):
+    """Set semaphore environment variables for bundled plugins."""
     localhost_ip = self.log.get_localhost_ip()
-
     if self.port:
       self.semaphore_set_env('API_PORT', str(self.port))
-      env_vars_set.append(f"API_PORT = {self.port}")
-
-      # Construct local URL for internal communication
       local_url = f"http://{localhost_ip}:{self.port}"
       self.semaphore_set_env('URL', local_url)
-      env_vars_set.append(f"URL = {local_url}")
-
-    # Signal that this container is ready
-    self.semaphore_set_ready()
-
-    # Log the full semaphore data structure
-    semaphore_data = self.plugins_shmem.get(self.cfg_semaphore, {})
-    log_lines = [
-      "=" * 60,
-      "SEMAPHORE SIGNAL - CAR Provider Mode",
-      "=" * 60,
-      f"  Semaphore key: {self.cfg_semaphore}",
-    ]
-    for env_var in env_vars_set:
-      log_lines.append(f"  Env var set: {env_var} (prefixed and raw)")
-    log_lines.extend([
-      f"  Semaphore data:",
-      f"    env vars: {semaphore_data.get('env', {})}",
-      f"    metadata: {semaphore_data.get('metadata', {})}",
-      f"  Status: READY",
-      "=" * 60,
-    ])
-    self.Pd("\n".join(log_lines))
     return
 
 
@@ -2787,8 +2741,8 @@ class ContainerAppRunnerPlugin(
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
 
-    # Clear semaphore immediately to signal dependent plugins
-    self.semaphore_clear()
+    # Clear semaphore and reset signaling state for potential restart
+    self._semaphore_reset_signal()
 
     # Stop log streaming
     self._stop_event.set()
@@ -2832,7 +2786,6 @@ class ContainerAppRunnerPlugin(
     Lifecycle hook called when plugin is stopping.
 
     Performs cleanup including:
-    - Clearing semaphore (if configured)
     - Stopping container
     - Stopping all tunnels (main and extra)
     - Terminating log processes
@@ -2842,9 +2795,6 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    # Clear semaphore to signal dependent plugins
-    self.semaphore_clear()
-
     self._stop_container_and_save_logs_to_disk()
 
     super(ContainerAppRunnerPlugin, self).on_close()
@@ -3280,17 +3230,8 @@ class ContainerAppRunnerPlugin(
           f"  Semaphore '{key}':",
           f"    Ready: {info['ready']}",
           f"    Provider: {info['provider']}",
-          f"    Env vars count: {info['env_count']}",
+          f"    Env vars: {info['env_count']} variables",
         ])
-
-      # Log env vars that will be injected
-      env_vars = self.semaphore_get_env()
-      if env_vars:
-        log_lines.append(f"  Environment variables to inject into container:")
-        for k, v in env_vars.items():
-          log_lines.append(f"    {k} = {v}")
-      else:
-        log_lines.append(f"  No environment variables from semaphores")
 
       log_lines.extend([
         "=" * 60,
@@ -3528,8 +3469,8 @@ class ContainerAppRunnerPlugin(
     self._maybe_reset_retry_counter()
 
     # Signal semaphore readiness when container is running
-    # (for tunneled apps, this is also called after health check passes)
-    self._signal_semaphore_ready()
+    # (for tunneled apps, readiness is signaled after health check passes)
+    self._semaphore_set_ready_flag()
 
     # ============================================================================
     # End of Restart Logic
