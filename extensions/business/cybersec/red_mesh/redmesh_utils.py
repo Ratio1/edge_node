@@ -5,6 +5,7 @@ import json
 import ftplib
 import requests
 import traceback
+import random
 
 from copy import deepcopy
 
@@ -81,6 +82,10 @@ class PentestLocalWorker(
     ValueError
       If no ports remain after applying exceptions.
     """
+    self.included_tests = getattr(owner, "cfg_included_tests", None)
+    self.excluded_tests = getattr(owner, "cfg_excluded_tests", [])
+    self.port_order = getattr(owner, "cfg_port_order", "SHUFFLE")
+    self.pacing = getattr(owner, "cfg_pacing", None)
     if exceptions is None:
       exceptions = []
     self.target = target
@@ -125,7 +130,15 @@ class PentestLocalWorker(
       "completed_tests": [],
       "done": False,
       "canceled": False,
+      "current_stage": "INITIALIZED",
     }
+    # pacing state
+    self.action_counter = 0
+    self.next_pause_at = None
+    if self.pacing:
+      base_interval = float(self.pacing.get("pause_interval", 0) or 0)
+      if base_interval > 0:
+        self.next_pause_at = int(base_interval * random.uniform(0.8, 1.2))
     self.__features = self._get_all_features()
     self.P("Initialized worker {} on {} ports [{}-{}]...".format(
       self.local_worker_id,
@@ -158,6 +171,48 @@ class PentestLocalWorker(
       else:
         features.extend(methods)
     return features  
+
+  def _should_run(self, test_name):
+    """
+    Check if a test should run based on include/exclude filters.
+    """
+    if self.included_tests is not None and test_name not in self.included_tests:
+      return False
+    if test_name in (self.excluded_tests or []):
+      return False
+    return True
+
+  def _maybe_pause(self):
+    """
+    Pause execution based on pacing settings with jitter and stop awareness.
+    """
+    if not self.pacing:
+      return
+    if self.next_pause_at is None:
+      base_interval = float(self.pacing.get("pause_interval", 0) or 0)
+      if base_interval <= 0:
+        return
+      self.next_pause_at = int(base_interval * random.uniform(0.8, 1.2))
+    self.action_counter += 1
+    if self.action_counter < self.next_pause_at:
+      return
+
+    previous_stage = self.state.get("current_stage", "SCANNING")
+    base_duration = float(self.pacing.get("pause_duration", 0) or 0)
+    if base_duration < 0:
+      base_duration = 0
+    duration = base_duration * random.uniform(0.5, 1.5)
+    self.state["current_stage"] = "PAUSED"
+    interrupted = self.stop_event.wait(timeout=duration)
+    if interrupted:
+      self.state["current_stage"] = "STOPPING"
+    else:
+      self.state["current_stage"] = previous_stage
+
+    self.action_counter = 0
+    base_interval = float(self.pacing.get("pause_interval", 0) or 0)
+    if base_interval > 0:
+      self.next_pause_at = int(base_interval * random.uniform(0.8, 1.2))
   
   @staticmethod
   def get_worker_specific_result_fields():
@@ -225,6 +280,7 @@ class PentestLocalWorker(
     dct_status["web_tests_info"] = self.state["web_tests_info"]
 
     dct_status["completed_tests"] = self.state["completed_tests"]
+    dct_status["current_stage"] = self.state.get("current_stage")
 
     return dct_status
 
@@ -301,20 +357,24 @@ class PentestLocalWorker(
     None
     """
     try:
+      self.state["current_stage"] = "SCANNING"
       self.P(f"Starting pentest job.")
 
       if not self._check_stopped():
         self._scan_ports_step()
 
       if not self._check_stopped():
+        self.state["current_stage"] = "PROBING"
         self._gather_service_info()
         self.state["completed_tests"].append("service_info_completed")
 
       if not self._check_stopped():
+        self.state["current_stage"] = "TESTING"
         self._run_web_tests()
         self.state["completed_tests"].append("web_tests_completed")
 
       self.state['done'] = True
+      self.state["current_stage"] = "COMPLETED"
       self.P(f"Job completed. Ports open and checked: {self.state['open_ports']}")
 
       # If stopped before completion
@@ -324,6 +384,7 @@ class PentestLocalWorker(
     except Exception as e:
       self.P(f"Exception in job execution: {e}:\n{traceback.format_exc()}", color='r')
       self.state['done'] = True
+      self.state["current_stage"] = "COMPLETED"
       
     
     return
@@ -352,6 +413,8 @@ class PentestLocalWorker(
 
     target = self.target
     ports = deepcopy(self.state["ports_to_scan"])
+    if self.port_order == "SHUFFLE":
+      random.shuffle(ports)
     if not ports:
       return
     if batch_size is None:
@@ -382,6 +445,7 @@ class PentestLocalWorker(
       # endtry
       self.state["ports_scanned"].append(port)    
       self.state["ports_to_scan"].remove(port)  
+      self._maybe_pause()
       if ((i + 1) % REGISTER_PROGRESS_EACH) == 0:
         scan_ports_step_progress = (i + 1) / nr_ports * 100
         str_progress = f"{scan_ports_step_progress:.0f}%"
@@ -390,7 +454,7 @@ class PentestLocalWorker(
         self.state["completed_tests"] = [f"scan_ports_step_{str_progress}"]
         if show_progress:
           self.P(f"Port scanning progress on {target}: {str_progress}")
-
+    # end for each port in batch
     left_ports = self.state["ports_to_scan"]
     if not left_ports:
       self.P(f"[{target}] Port scanning completed. {len(self.state['open_ports'])} open ports.")
@@ -414,8 +478,12 @@ class PentestLocalWorker(
       self.P("No open ports to gather service info from.")
       return
     self.P(f"Gathering service info for {len(open_ports)} open ports.")
+    self.state["current_stage"] = "PROBING"
     target = self.target
-    service_info_methods = [method for method in dir(self) if method.startswith("_service_info_")]
+    service_info_methods = [
+      method for method in dir(self)
+      if method.startswith("_service_info_") and self._should_run(method)
+    ]
     aggregated_info = []
     for method in service_info_methods:
       func = getattr(self, method)
@@ -429,12 +497,14 @@ class PentestLocalWorker(
         self.state["service_info"][port][method] = info
         if info is not None:
           method_info.append(f"{method}: {port}: {info}")
+        self._maybe_pause()
       if method_info:
         aggregated_info.extend(method_info)
         self.P(
           f"Method {method} findings:\n{json.dumps(method_info, indent=2)}"
         )
       self.state["completed_tests"].append(method)
+    # end for each service info method
     return aggregated_info
 
 
@@ -451,6 +521,7 @@ class PentestLocalWorker(
     if len(open_ports) == 0:
       self.P("No open ports to run web tests on.")
       return
+    self.state["current_stage"] = "TESTING"
     
     ports_to_test = list(open_ports)
     self.P(
@@ -462,7 +533,10 @@ class PentestLocalWorker(
       self.state["web_tested"] = True
       return
     result = []
-    web_tests_methods = [method for method in dir(self) if method.startswith("_web_test_")]
+    web_tests_methods = [
+      method for method in dir(self)
+      if method.startswith("_web_test_") and self._should_run(method)
+    ]
     for method in web_tests_methods:
       func = getattr(self, method)
       for port in ports_to_test:
@@ -474,8 +548,9 @@ class PentestLocalWorker(
         if port not in self.state["web_tests_info"]:
           self.state["web_tests_info"][port] = {}
         self.state["web_tests_info"][port][method] = iter_result
+        self._maybe_pause()
       # end for each port of current method
       self.state["completed_tests"].append(method) # register completed method for port    
-    # end for each method
+    # end for each web test method
     self.state["web_tested"] = True
     return result
