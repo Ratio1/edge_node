@@ -204,7 +204,6 @@ MODEL_CONFIGS: List[ModelConfig] = [
 ONLY_ON = ["ON"]
 ONLY_OFF = ["OFF"]
 BOTH = ["OFF", "ON"]
-BOTH = ONLY_ON
 # See also FLAG_DEPENDENCIES above for inter-flag rules.
 BUILD_FLAG_DEFS: List[BuildFlagDef] = [
   BuildFlagDef("GGML_NATIVE", BOTH),
