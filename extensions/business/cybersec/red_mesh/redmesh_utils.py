@@ -56,6 +56,10 @@ class PentestLocalWorker(
     local_id_prefix : str,
     worker_target_ports=COMMON_PORTS,
     exceptions=None,
+    included_tests=None,
+    excluded_tests=None,
+    port_order=None,
+    pacing=None,
   ):
     """
     Initialize a pentest worker with target ports and exclusions.
@@ -76,16 +80,24 @@ class PentestLocalWorker(
       Ports assigned to this worker; defaults to common ports.
     exceptions : list[int], optional
       Ports to exclude from scanning.
+    included_tests : list[str] | None, optional
+      Whitelist of tests to run; None runs all.
+    excluded_tests : list[str] | None, optional
+      Blacklist of tests to skip.
+    port_order : str, optional
+      SEQUENTIAL or SHUFFLE for port iteration.
+    pacing : dict | None, optional
+      Stealth pauses: {"pause_interval": int, "pause_duration": float}; None disables pacing.
 
     Raises
     ------
     ValueError
       If no ports remain after applying exceptions.
     """
-    self.included_tests = getattr(owner, "cfg_included_tests", None)
-    self.excluded_tests = getattr(owner, "cfg_excluded_tests", [])
-    self.port_order = getattr(owner, "cfg_port_order", "SHUFFLE")
-    self.pacing = getattr(owner, "cfg_pacing", None)
+    self.included_tests = included_tests if included_tests is not None else getattr(owner, "cfg_included_tests", None)
+    self.excluded_tests = excluded_tests if excluded_tests is not None else getattr(owner, "cfg_excluded_tests", [])
+    self.port_order = port_order if port_order is not None else getattr(owner, "cfg_port_order", "SHUFFLE")
+    self.pacing = pacing if pacing is not None else getattr(owner, "cfg_pacing", None)
     if exceptions is None:
       exceptions = []
     self.target = target
@@ -185,6 +197,13 @@ class PentestLocalWorker(
   def _maybe_pause(self):
     """
     Pause execution based on pacing settings with jitter and stop awareness.
+
+    Jitter ranges:
+    - pause_interval: 0.8-1.2x
+    - pause_duration: 0.5-1.5x
+
+    pause_interval controls how often we pause (every ~N actions); pause_duration
+    controls how long each pause lasts.
     """
     if not self.pacing:
       return
