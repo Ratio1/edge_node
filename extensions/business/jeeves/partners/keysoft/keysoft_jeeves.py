@@ -33,56 +33,22 @@ class KeysoftJeevesPlugin(BasePlugin):
   def on_init(self):
     super(KeysoftJeevesPlugin, self).on_init()
     self.pdf_parser = PDFParser()
-    self.__semaphore_signaled = False  # Track if semaphore was signaled
     return
 
 
-  def _maybe_signal_semaphore(self):
-    """
-    Signal semaphore when server is ready.
-    Uses the parent class's uvicorn_server_started property.
-    """
-    if self.__semaphore_signaled:
-      return
-    if not self.uvicorn_server_started:
-      return
-    self.__semaphore_signaled = True
-    self._setup_semaphore()
-    return
-
-
-  def process(self):
-    """Process loop - signals semaphore when server is ready."""
-    super(KeysoftJeevesPlugin, self).process()
-    self._maybe_signal_semaphore()
-    return
-
-
-  def _setup_semaphore(self):
-    """Configure semaphore environment variables and signal readiness."""
-    if not self.cfg_semaphore:
-      return
-
-    # Expose API connection details to paired plugins
+  def _setup_semaphore_env(self):
+    """Set semaphore environment variables for paired plugins."""
     port = getattr(self, 'cfg_port', 15033)
     localhost_ip = self.log.get_localhost_ip()
-
     self.semaphore_set_env('PORT', str(port))
     self.semaphore_set_env('RATIO1_AGENT_ENDPOINT',
-      'http://{}:{}/query'.format(localhost_ip, port)
-    )
+      'http://{}:{}/query'.format(localhost_ip, port))
     self.semaphore_set_env('RATIO1_AGENT_UPLOAD_ENDPOINT',
-      'http://{}:{}/upload_document_for_domain_base64'.format(localhost_ip, port)
-    )
-
-    # Signal that this plugin is ready
-    self.semaphore_set_ready()
+      'http://{}:{}/upload_document_for_domain_base64'.format(localhost_ip, port))
     return
 
 
   def on_close(self):
-    """Clean up semaphore on plugin shutdown."""
-    self.semaphore_clear()
     super(KeysoftJeevesPlugin, self).on_close()
     return
 

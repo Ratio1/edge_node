@@ -125,7 +125,6 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     # Initialize request tracking
     self.__requests = {}  # Track active requests (PostponedRequest pattern)
     self._data_buffer = []  # Simple activity log for monitoring
-    self.__semaphore_signaled = False  # Track if semaphore was signaled
 
     self.P("Local Serving API initialized - Loopback + PostponedRequest mode", color='g')
     self.P(f"  Endpoints: /predict, /list_results, /status, /health", color='g')
@@ -134,54 +133,17 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     return
 
 
-  def _maybe_signal_semaphore(self):
-    """
-    Signal semaphore when server is ready.
-    Uses the parent class's uvicorn_server_started property.
-    """
-    if self.__semaphore_signaled:
-      return
-    if not self.uvicorn_server_started:
-      return
-    self.__semaphore_signaled = True
-    self._setup_semaphore()
-    return
-
-
-  def _setup_semaphore(self):
-    """Configure semaphore environment variables and signal readiness."""
-    if not self.cfg_semaphore:
-      return
-
-    # Expose API connection details to paired plugins
+  def _setup_semaphore_env(self):
+    """Set semaphore environment variables for bundled plugins."""
     port = self.cfg_port
     self.semaphore_set_env('API_PORT', str(port))
-
-    # Signal that this plugin is ready
-    self.semaphore_set_ready()
-
-    # Log the full semaphore data structure
-    semaphore_data = self.plugins_shmem.get(self.cfg_semaphore, {})
-    log_msg = "\n".join([
-      "=" * 60,
-      "SEMAPHORE SETUP - Provider Mode",
-      "=" * 60,
-      f"  Semaphore key: {self.cfg_semaphore}",
-      f"  Env var set: API_PORT = {port} (prefixed and raw)",
-      f"  Semaphore data:",
-      f"    env vars: {semaphore_data.get('env', {})}",
-      f"    metadata: {semaphore_data.get('metadata', {})}",
-      f"  Status: READY",
-      "=" * 60,
-    ])
-    self.Pd(log_msg)
     return
+
 
   def on_close(self):
-    """Clean up semaphore on plugin shutdown."""
-    self.semaphore_clear()
     super(LocalServingApiPlugin, self).on_close()
     return
+
 
   def _get_payload_field(self, data: dict, key: str, default=None):
     if not isinstance(data, dict):
@@ -453,9 +415,6 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     3. Match inferences to requests by index
     4. Mark requests as finished for PostponedRequest polling
     """
-    # Signal semaphore once server is ready (checked via parent's uvicorn_server_started)
-    self._maybe_signal_semaphore()
-
     self._cleanup_old_requests()
     self._maybe_trim_buffer()
 
