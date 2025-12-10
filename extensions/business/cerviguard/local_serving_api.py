@@ -135,8 +135,12 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
 
   def _setup_semaphore_env(self):
     """Set semaphore environment variables for bundled plugins."""
+    localhost_ip = self.log.get_localhost_ip()
     port = self.cfg_port
-    self.semaphore_set_env('API_PORT', str(port))
+    self.semaphore_set_env('API_HOST', localhost_ip)
+    if port:
+      self.semaphore_set_env('API_PORT', str(port))
+      self.semaphore_set_env('API_URL', 'http://{}:{}'.format(localhost_ip, port))
     return
 
 
