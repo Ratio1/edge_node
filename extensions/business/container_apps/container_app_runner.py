@@ -2594,10 +2594,11 @@ class ContainerAppRunnerPlugin(
   def _setup_semaphore_env(self):
     """Set semaphore environment variables for bundled plugins."""
     localhost_ip = self.log.get_localhost_ip()
-    if self.port:
-      self.semaphore_set_env('API_PORT', str(self.port))
-      local_url = f"http://{localhost_ip}:{self.port}"
-      self.semaphore_set_env('URL', local_url)
+    port = self.cfg_port
+    self.semaphore_set_env('HOST', localhost_ip)
+    if port:
+      self.semaphore_set_env('PORT', str(port))
+      self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, port))
     return
 
 
