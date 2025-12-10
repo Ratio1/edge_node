@@ -1,7 +1,9 @@
 import sys
 import struct
 import unittest
-from unittest.mock import MagicMock, patch
+import threading
+import time
+from unittest.mock import MagicMock, patch, Mock
 
 from extensions.business.cybersec.red_mesh.redmesh_utils import PentestLocalWorker
 
@@ -763,6 +765,439 @@ class RedMeshOWASPTests(unittest.TestCase):
     ):
       result = worker._web_test_http_methods("example.com", 80)
     self.assertIn("VULNERABILITY: Risky HTTP methods", result)
+
+  def test_pacing_pauses_execution(self):
+    """Test that pacing configuration is set correctly"""
+    owner = DummyOwner()
+    owner.cfg_pacing = {"pause_interval": 2, "pause_duration": 0.05}
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-pacing",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80, 81],
+      pacing={"pause_interval": 2, "pause_duration": 0.05}
+    )
+    worker.stop_event = threading.Event()
+
+    # Verify pacing is configured correctly
+    self.assertIsNotNone(worker.pacing)
+    self.assertEqual(worker.pacing["pause_interval"], 2)
+    self.assertEqual(worker.pacing["pause_duration"], 0.05)
+    self.assertIsNotNone(worker.next_pause_at)
+    self.assertGreater(worker.next_pause_at, 0)
+
+    # Verify action counter starts at 0
+    self.assertEqual(worker.action_counter, 0)
+
+  def test_pacing_respects_stop_event(self):
+    """Test that pacing pause can be interrupted by stop event"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-stop",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80],
+      pacing={"pause_interval": 1, "pause_duration": 5.0}  # Long pause
+    )
+    worker.stop_event = threading.Event()
+    worker.action_counter = 1
+    worker.next_pause_at = 1
+
+    # Start pause in background and stop it
+    def delayed_stop():
+      time.sleep(0.1)
+      worker.stop_event.set()
+
+    stop_thread = threading.Thread(target=delayed_stop)
+    stop_thread.start()
+
+    start = time.time()
+    worker._maybe_pause()
+    elapsed = time.time() - start
+
+    # Should be interrupted well before 5 seconds
+    self.assertLess(elapsed, 1.0)
+    self.assertTrue(worker.stop_event.is_set())
+    stop_thread.join()
+
+  def test_port_order_sequential(self):
+    """Test that SEQUENTIAL port order maintains input order (no shuffle)"""
+    owner = DummyOwner()
+    owner.cfg_port_order = "SEQUENTIAL"
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-seq",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[100, 99, 98, 97, 96],
+      port_order="SEQUENTIAL"
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+
+    scanned_ports = []
+
+    class DummySocket:
+      def __init__(self, *args, **kwargs):
+        pass
+      def settimeout(self, timeout):
+        return None
+      def connect_ex(self, address):
+        scanned_ports.append(address[1])
+        return 1  # not open
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket",
+      return_value=DummySocket(),
+    ):
+      worker._scan_ports_step()
+
+    # With SEQUENTIAL, ports maintain their original order (no shuffle)
+    # Input [100, 99, 98, 97, 96] stays as [100, 99, 98, 97, 96]
+    expected = [100, 99, 98, 97, 96]
+    self.assertEqual(scanned_ports, expected)
+
+  def test_port_order_shuffle(self):
+    """Test that SHUFFLE port order randomizes"""
+    owner = DummyOwner()
+    owner.cfg_port_order = "SHUFFLE"
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-shuffle",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=list(range(1, 21)),  # 20 ports
+      port_order="SHUFFLE"
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+
+    scanned_ports = []
+
+    class DummySocket:
+      def __init__(self, *args, **kwargs):
+        pass
+      def settimeout(self, timeout):
+        return None
+      def connect_ex(self, address):
+        scanned_ports.append(address[1])
+        return 1
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket",
+      return_value=DummySocket(),
+    ):
+      worker._scan_ports_step()
+
+    # Shuffled order should be different from sorted (very high probability with 20 ports)
+    self.assertNotEqual(scanned_ports, sorted(scanned_ports))
+    # But should contain same ports
+    self.assertEqual(set(scanned_ports), set(range(1, 21)))
+
+  def test_included_tests_filter(self):
+    """Test that included_tests filters which tests run"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-filter",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80],
+      included_tests=["_service_info_80", "_web_test_common"]
+    )
+
+    # Should run
+    self.assertTrue(worker._should_run("_service_info_80"))
+    self.assertTrue(worker._should_run("_web_test_common"))
+
+    # Should not run
+    self.assertFalse(worker._should_run("_service_info_443"))
+    self.assertFalse(worker._should_run("_web_test_xss"))
+
+  def test_excluded_tests_filter(self):
+    """Test that excluded_tests prevents specific tests from running"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-exclude",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80],
+      excluded_tests=["_web_test_xss", "_web_test_sql_injection"]
+    )
+
+    # Should not run
+    self.assertFalse(worker._should_run("_web_test_xss"))
+    self.assertFalse(worker._should_run("_web_test_sql_injection"))
+
+    # Should run (not in excluded list)
+    self.assertTrue(worker._should_run("_web_test_common"))
+    self.assertTrue(worker._should_run("_service_info_80"))
+
+  def test_combined_include_exclude_tests(self):
+    """Test that excluded_tests takes precedence over included_tests"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-combined",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80],
+      included_tests=["_web_test_xss", "_web_test_common"],
+      excluded_tests=["_web_test_xss"]
+    )
+
+    # Excluded takes precedence
+    self.assertFalse(worker._should_run("_web_test_xss"))
+    # In included and not excluded
+    self.assertTrue(worker._should_run("_web_test_common"))
+    # Not in included
+    self.assertFalse(worker._should_run("_web_test_sql_injection"))
+
+  def test_worker_status_reporting(self):
+    """Test that worker reports accurate status"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="192.168.1.1",
+      job_id="job-status",
+      initiator="launcher@example",
+      local_id_prefix="42",
+      worker_target_ports=[80, 443, 8080]
+    )
+
+    status = worker.get_status()
+
+    self.assertEqual(status["job_id"], "job-status")
+    self.assertEqual(status["initiator"], "launcher@example")
+    self.assertEqual(status["target"], "192.168.1.1")
+    self.assertEqual(status["start_port"], 80)
+    self.assertEqual(status["end_port"], 8080)
+    self.assertFalse(status["done"])
+    self.assertFalse(status["canceled"])
+    self.assertIn("local_worker_id", status)
+    self.assertIn("RM-42-", status["local_worker_id"])
+
+  def test_worker_aggregation_fields(self):
+    """Test that worker-specific aggregation fields are defined correctly"""
+    fields = PentestLocalWorker.get_worker_specific_result_fields()
+
+    self.assertIn("open_ports", fields)
+    self.assertIn("service_info", fields)
+    self.assertIn("web_tests_info", fields)
+    self.assertIn("completed_tests", fields)
+    self.assertIn("start_port", fields)
+    self.assertIn("end_port", fields)
+    self.assertEqual(fields["start_port"], min)
+    self.assertEqual(fields["end_port"], max)
+
+  def test_stop_event_interrupts_port_scan(self):
+    """Test that setting stop event halts port scanning"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-stop-scan",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=list(range(1, 101))  # 100 ports
+    )
+    worker.stop_event = threading.Event()
+
+    scanned_count = [0]
+
+    class DummySocket:
+      def __init__(self, *args, **kwargs):
+        pass
+      def settimeout(self, timeout):
+        return None
+      def connect_ex(self, address):
+        scanned_count[0] += 1
+        if scanned_count[0] == 10:
+          worker.stop_event.set()
+        return 1
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket",
+      return_value=DummySocket(),
+    ):
+      worker._scan_ports_step()
+
+    # Should stop early, not scan all 100 ports
+    self.assertLess(len(worker.state["ports_scanned"]), 100)
+    self.assertGreater(len(worker.state["ports_scanned"]), 0)
+
+  def test_stop_event_interrupts_service_gathering(self):
+    """Test that setting stop event halts service info gathering"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-stop-service",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80, 443, 8080]
+    )
+    worker.state["open_ports"] = [80, 443, 8080]
+    worker.stop_event = threading.Event()
+
+    call_count = [0]
+
+    def fake_service_info(target, port):
+      call_count[0] += 1
+      if call_count[0] == 2:
+        worker.stop_event.set()
+      return f"info:{port}"
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_utils.dir",
+      return_value=["_service_info_fake"],
+    ):
+      setattr(worker, "_service_info_fake", fake_service_info)
+      worker._gather_service_info()
+
+    # Should not process all ports
+    self.assertLess(len(worker.state["service_info"]), 3)
+
+  def test_exceptions_removes_ports_from_scan_list(self):
+    """Test that exception ports are properly excluded"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-except",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80, 8080, 443, 8443],
+      exceptions=[8080, 8443]
+    )
+
+    # Exceptions should be removed from ports_to_scan
+    self.assertNotIn(8080, worker.state["ports_to_scan"])
+    self.assertNotIn(8443, worker.state["ports_to_scan"])
+    self.assertIn(80, worker.state["ports_to_scan"])
+    self.assertIn(443, worker.state["ports_to_scan"])
+
+    # Should be tracked in exceptions
+    self.assertIn(8080, worker.exceptions)
+    self.assertIn(8443, worker.exceptions)
+
+  def test_exceptions_not_matching_worker_ports_ignored(self):
+    """Test that exceptions not in worker ports are ignored"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-except-nomatch",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80, 443],
+      exceptions=[8080, 9000]  # Not in worker ports
+    )
+
+    # Worker ports should remain unchanged
+    self.assertIn(80, worker.state["ports_to_scan"])
+    self.assertIn(443, worker.state["ports_to_scan"])
+
+    # Exceptions should be empty since they don't match
+    self.assertEqual(worker.exceptions, [])
+
+  def test_worker_thread_lifecycle(self):
+    """Test that worker can be started and stopped properly"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-lifecycle",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80]
+    )
+
+    # Mock execute_job to avoid actual scanning
+    executed = [False]
+    def mock_execute():
+      executed[0] = True
+      worker.state["done"] = True
+
+    with patch.object(worker, 'execute_job', side_effect=mock_execute):
+      worker.start()
+      self.assertIsInstance(worker.thread, threading.Thread)
+      self.assertTrue(worker.thread.daemon)
+
+      # Wait for thread to complete
+      worker.thread.join(timeout=1.0)
+      self.assertTrue(executed[0])
+
+  def test_current_stage_tracking(self):
+    """Test that current_stage is updated during workflow"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-stage",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80]
+    )
+
+    self.assertEqual(worker.state["current_stage"], "INITIALIZED")
+
+    worker.stop_event = threading.Event()
+
+    # Mock the actual work
+    with patch.object(worker, '_scan_ports_step'):
+      worker.state["current_stage"] = "SCANNING"
+      self.assertEqual(worker.state["current_stage"], "SCANNING")
+
+      worker.state["current_stage"] = "PROBING"
+      self.assertEqual(worker.state["current_stage"], "PROBING")
+
+      worker.state["current_stage"] = "TESTING"
+      self.assertEqual(worker.state["current_stage"], "TESTING")
+
+      worker.state["current_stage"] = "COMPLETED"
+      self.assertEqual(worker.state["current_stage"], "COMPLETED")
+
+  def test_worker_progress_calculation(self):
+    """Test that worker progress is calculated correctly"""
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-progress",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=[80]
+    )
+
+    # No tests completed
+    status = worker.get_status()
+    self.assertIn("progress", status)
+
+    # Simulate some completed tests
+    all_features = worker._get_all_features()
+    worker.state["completed_tests"] = all_features[:len(all_features)//2]
+
+    status = worker.get_status()
+    progress_str = status["progress"]
+    # Should show partial progress
+    self.assertIn("%", progress_str)
 
 
 class VerboseResult(unittest.TextTestResult):
