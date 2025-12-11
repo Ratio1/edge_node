@@ -247,6 +247,7 @@ _CONFIG = {
 
   # Cloudflare token for main tunnel (backward compatibility)
   "CLOUDFLARE_TOKEN": None,
+  "CLOUDFLARE_PROTOCOL": "http", # protocol to use for cloudflare tunnel (http or tcp)
 
   # Extra tunnels for additional ports: {container_port: "cloudflare_token"}
   "EXTRA_TUNNELS": {},
