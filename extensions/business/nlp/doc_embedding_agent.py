@@ -1,6 +1,5 @@
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
 from extensions.business.mixins.nlp_agent_mixin import _NlpAgentMixin, NLP_AGENT_MIXIN_CONFIG
-from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResponseMixin
 
 __VER__ = '0.1.0.0'
 
@@ -26,7 +25,7 @@ _CONFIG = {
 }
 
 
-class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin, _ChainstoreResponseMixin):
+class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin):
   CONFIG = _CONFIG
 
   def on_init(self):
@@ -34,8 +33,6 @@ class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin, _ChainstoreResponseMix
     self.__last_inference_meta = None
     self.__last_contexts = None
     super(DocEmbeddingAgentPlugin, self).on_init()
-    self._reset_chainstore_response()
-    self._send_chainstore_response()
     return
 
   def _get_chainstore_response_data(self):

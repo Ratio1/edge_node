@@ -75,7 +75,6 @@ from typing import Optional
 from docker.types import DeviceRequest
 
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
-from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResponseMixin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
 
@@ -346,9 +345,8 @@ _CONFIG = {
 
 
 class ContainerAppRunnerPlugin(
-  BasePlugin,
   _ContainerUtilsMixin,
-  _ChainstoreResponseMixin,
+  BasePlugin,
 ):
   """
   A Ratio1 plugin to run a single Docker/Podman container.
@@ -1268,10 +1266,12 @@ class ContainerAppRunnerPlugin(
     RuntimeError
         If Docker daemon is not accessible or registry authentication fails
     """
-    self._reset_chainstore_response()
     self.__reset_vars()
 
     super(ContainerAppRunnerPlugin, self).on_init()
+
+    # Defer chainstore response until container is healthy
+    self.set_plugin_ready(False)
 
     self.container_start_time = self.time()
 
@@ -2113,7 +2113,8 @@ class ContainerAppRunnerPlugin(
       self._set_container_state(ContainerState.RUNNING)
       self._record_restart_success()
 
-      self._maybe_send_plugin_start_confirmation()
+      # Signal plugin ready for chainstore response (auto-sent by _process loop)
+      self.set_plugin_ready(True)
 
       return self.container
 
@@ -2594,10 +2595,11 @@ class ContainerAppRunnerPlugin(
   def _setup_semaphore_env(self):
     """Set semaphore environment variables for bundled plugins."""
     localhost_ip = self.log.get_localhost_ip()
-    if self.port:
-      self.semaphore_set_env('API_PORT', str(self.port))
-      local_url = f"http://{localhost_ip}:{self.port}"
-      self.semaphore_set_env('URL', local_url)
+    port = self.cfg_port
+    self.semaphore_set_env('HOST', localhost_ip)
+    if port:
+      self.semaphore_set_env('PORT', str(port))
+      self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, port))
     return
 
 

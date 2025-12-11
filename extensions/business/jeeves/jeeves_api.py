@@ -1,6 +1,5 @@
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 from naeural_core.business.mixins_libs.network_processor_mixin import _NetworkProcessorMixin
-from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResponseMixin
 from constants import JeevesCt
 
 import os
@@ -61,7 +60,7 @@ _CONFIG = {
 }
 
 
-class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin, _ChainstoreResponseMixin):
+class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
   CONFIG = _CONFIG
 
   def maybe_wait_for_r1fs(self):
@@ -107,9 +106,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin, _ChainstoreResponseMix
   def on_init(self):
     super(JeevesApiPlugin, self).on_init()
 
-    # Reset chainstore response key at start (signals "initializing")
-    self._reset_chainstore_response()
-
     self.network_processor_init()
     self.__command_payloads = []
     self.__requests = {}
@@ -147,10 +143,6 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin, _ChainstoreResponseMix
     # endfor predefined additional context domains
     self.maybe_load_persistence_data()
     self.maybe_wait_for_r1fs()
-
-    # Send chainstore response at end (signals "ready")
-    self._send_chainstore_response()
-
     return
 
   def get_requests_persistence_data(self):
