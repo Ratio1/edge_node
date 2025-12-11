@@ -133,59 +133,6 @@ class _ContainerUtilsMixin:
 
     return data
 
-  def _maybe_send_plugin_start_confirmation(self):
-    """
-    Send container startup confirmation to chainstore.
-
-    This method now delegates to the generalized _ChainstoreResponseMixin
-    for consistent behavior across all plugins that support chainstore responses.
-
-    The container-specific response data is provided via the
-    _get_chainstore_response_data() override above.
-
-    Migration Note:
-    --------------
-    This replaces the old inline implementation with the mixin-based approach.
-    The new behavior is simpler:
-    - Single write (no retries, no confirmations)
-    - Consistent error handling
-    - Validation logic
-    - Reusability across plugin types
-
-    Usage:
-    ------
-    Call this method after container startup is complete and all relevant
-    attributes (container_id, container_start_time, extra_ports_mapping, etc.)
-    have been set.
-
-    Note: _reset_chainstore_response() should have been called at the START
-    of initialization.
-    """
-    # Delegate to the mixin's implementation
-    # This assumes the plugin class inherits from _ChainstoreResponseMixin
-    if hasattr(self, '_send_chainstore_response'):
-      return self._send_chainstore_response()
-    else:
-      # Fallback for backward compatibility if mixin is not available
-      # This preserves the old behavior (simplified - single write)
-      self.P(
-        "WARNING: _ChainstoreResponseMixin not available, using legacy implementation. "
-        "Consider adding _ChainstoreResponseMixin to the plugin inheritance chain.",
-        color='y'
-      )
-      response_key = getattr(self, 'cfg_chainstore_response_key', None)
-      if response_key is not None:
-        self.P(f"Responding to key {response_key}")
-        response_info = {
-          'container_id': self.container_id,
-          'start_time': self.time_to_str(self.container_start_time),
-          'ports_mapping': self.extra_ports_mapping,
-        }
-        self.P(f"Sending response to {response_key}: {self.json_dumps(response_info)}")
-        self.chainstore_set(response_key, response_info)
-      return
-
-
   def _setup_dynamic_env_var_host_ip(self):
     """
     Get host IP address for dynamic environment variable.
