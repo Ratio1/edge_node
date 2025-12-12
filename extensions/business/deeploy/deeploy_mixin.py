@@ -1474,14 +1474,8 @@ class _DeeployMixin:
         if not instance_id:
           continue
         # endif instance id
-        native_signature = (
-          native_plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
-          or native_plugin.get("SIGNATURE")
-          or native_plugin.get("signature")
-          or ""
-        )
         semaphore_key = self.sanitize_name(
-          "{}__{}__{}".format(app_id, native_signature, instance_id)
+          "{}__{}".format(app_id, instance_id)
         )
         instance.setdefault("SEMAPHORE", semaphore_key)
         semaphore_keys.append(semaphore_key)
