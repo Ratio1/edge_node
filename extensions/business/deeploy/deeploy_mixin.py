@@ -942,12 +942,6 @@ class _DeeployMixin:
           instance["ENV"] = env_cfg
         # endfor each instance
       # endfor each plugin
-      
-      self.Pd("====================================")
-      self.Pd("====================================")
-      self.Pd("====================================")
-
-      self.Pd(prepared_plugins)
 
       return prepared_plugins
     except Exception as exc:
