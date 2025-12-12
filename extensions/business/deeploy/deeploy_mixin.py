@@ -920,7 +920,7 @@ class _DeeployMixin:
         # endif instance id
 
         plugin_id = self.sanitize_name(str(instance_id))
-        auth_hkey = existing_hkey or f"{app_id}_{plugin_id}"
+        auth_hkey = existing_hkey or f"{app_id}_{plugin_id}:auth"
         auth_secret = existing_secret or self.uuid(8)
 
         for instance in instances:
