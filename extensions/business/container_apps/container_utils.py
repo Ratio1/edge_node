@@ -95,6 +95,11 @@ class _ContainerUtilsMixin:
       #              are legacy from the Edge Node environment itself.
     }
 
+    # Add semaphore keys if present
+    semaphored_keys = getattr(self, 'cfg_semaphored_keys', None)
+    if semaphored_keys:
+      dct_env["R1EN_SEMAPHORED_KEYS"] = self.json_dumps(semaphored_keys)
+
     return dct_env
 
   def _get_chainstore_response_data(self):
