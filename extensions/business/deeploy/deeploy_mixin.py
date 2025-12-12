@@ -845,12 +845,10 @@ class _DeeployMixin:
       if not app_id or not isinstance(prepared_plugins, list):
         return prepared_plugins
 
-      target_signatures = {
-        CONTAINER_APP_RUNNER_SIGNATURE,
-        WORKER_APP_RUNNER_SIGNATURE,
-      }
+      target_signatures = set(CONTAINERIZED_APPS_SIGNATURES)
       hkey_name = "R1EN_CSTORE_AUTH_HKEY"
       secret_name = "R1EN_CSTORE_AUTH_SECRET"
+      admin_pwd_name = "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD"
 
       for plugin in prepared_plugins:
         signature = (
@@ -872,40 +870,7 @@ class _DeeployMixin:
           continue
         # endif instances list
 
-        existing_hkey = None
-        existing_secret = None
-
-        for instance in instances:
-          if not isinstance(instance, dict):
-            continue
-          # endif instance is dict
-          env_cfg = instance.get("ENV") if isinstance(instance.get("ENV"), dict) else None
-          dyn_env_cfg = instance.get("DYNAMIC_ENV") if isinstance(instance.get("DYNAMIC_ENV"), dict) else None
-
-          if existing_hkey is None:
-            existing_hkey = (
-              (env_cfg.get(hkey_name) if env_cfg else None)
-              or (dyn_env_cfg.get(hkey_name) if dyn_env_cfg else None)
-            )
-          # endif pull existing hkey
-
-          if existing_secret is None:
-            existing_secret = (
-              (env_cfg.get(secret_name) if env_cfg else None)
-              or (dyn_env_cfg.get(secret_name) if dyn_env_cfg else None)
-            )
-          # endif pull existing secret
-
-          if existing_hkey and existing_secret:
-            break
-        # endfor discover existing values
-
-        primary_instance = None
-        for instance in instances:
-          if isinstance(instance, dict):
-            primary_instance = instance
-            break
-        # endfor pick first dict instance
+        primary_instance = next((inst for inst in instances if isinstance(inst, dict)), None)
         if not primary_instance:
           continue
         # endif primary instance
@@ -919,9 +884,30 @@ class _DeeployMixin:
           continue
         # endif instance id
 
+        existing_hkey = None
+        existing_secret = None
+        existing_admin_pwd = None
+        for instance in instances:
+          if not isinstance(instance, dict):
+            continue
+          # endif instance is dict
+          env_cfg = instance.get("ENV") if isinstance(instance.get("ENV"), dict) else None
+          if env_cfg:
+            if existing_hkey is None:
+              existing_hkey = env_cfg.get(hkey_name)
+            if existing_secret is None:
+              existing_secret = env_cfg.get(secret_name)
+            if existing_admin_pwd is None:
+              existing_admin_pwd = env_cfg.get(admin_pwd_name)
+          # endif env config
+          if existing_hkey and existing_secret and existing_admin_pwd:
+            break
+        # endfor discover existing values
+
         plugin_id = self.sanitize_name(str(instance_id))
         auth_hkey = existing_hkey or f"{app_id}_{plugin_id}:auth"
         auth_secret = existing_secret or self.uuid(8)
+        admin_pwd = existing_admin_pwd or self.uuid(8)
 
         for instance in instances:
           if not isinstance(instance, dict):
@@ -929,16 +915,15 @@ class _DeeployMixin:
           # endif instance is dict
           env_cfg = instance.get("ENV")
           env_cfg = env_cfg if isinstance(env_cfg, dict) else {}
-          dyn_env_cfg = instance.get("DYNAMIC_ENV") if isinstance(instance.get("DYNAMIC_ENV"), dict) else {}
-
-          if hkey_name not in env_cfg and hkey_name not in dyn_env_cfg:
-            env_cfg.setdefault(hkey_name, auth_hkey)
+          if hkey_name not in env_cfg:
+            env_cfg[hkey_name] = auth_hkey
           # endif set hkey
-
-          if secret_name not in env_cfg and secret_name not in dyn_env_cfg:
-            env_cfg.setdefault(secret_name, auth_secret)
+          if secret_name not in env_cfg:
+            env_cfg[secret_name] = auth_secret
           # endif set secret
-
+          if admin_pwd_name not in env_cfg:
+            env_cfg[admin_pwd_name] = admin_pwd
+          # endif set admin pwd
           instance["ENV"] = env_cfg
         # endfor each instance
       # endfor each plugin
