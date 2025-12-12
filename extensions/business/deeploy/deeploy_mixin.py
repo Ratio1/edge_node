@@ -166,6 +166,12 @@ class _DeeployMixin:
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
+    plugins = self._autowire_native_container_semaphore(
+      app_id=app_id,
+      plugins=plugins,
+      job_app_type=detected_job_app_type,
+    )
+
     node_plugins_by_addr = {}
     for addr in nodes:
       # Nodes to peer with for CHAINSTORE
@@ -375,6 +381,13 @@ class _DeeployMixin:
             fallback_instance=None,
           )
           plugins_by_node[addr].append(prepared_plugin)
+
+    for addr, node_plugins in plugins_by_node.items():
+      plugins_by_node[addr] = self._autowire_native_container_semaphore(
+        app_id=app_id,
+        plugins=node_plugins,
+        job_app_type=detected_job_app_type,
+      )
 
     pipeline_to_save = None
     node_plugins_ready = {}
@@ -1350,6 +1363,155 @@ class _DeeployMixin:
       return JOB_APP_TYPES.GENERIC
 
     return JOB_APP_TYPES.NATIVE
+
+  def _autowire_native_container_semaphore(self, app_id, plugins, job_app_type):
+    """
+    Auto-configure semaphore settings for native + container pairs.
+
+    Parameters
+    ----------
+    app_id : str
+      Application identifier used to build deterministic semaphore keys.
+    plugins : list
+      Prepared plugins payload (expected to be a two-item native/container pair).
+    job_app_type : str
+      Detected job application type.
+
+    Returns
+    -------
+    list
+      Original plugins list, augmented with semaphore wiring when applicable.
+    """
+    try:
+      if job_app_type != JOB_APP_TYPES.NATIVE:
+        return plugins
+      # endif native job app type
+
+      if not isinstance(plugins, list) or len(plugins) != 2:
+        return plugins
+      # endif plugin pair check
+
+      def has_semaphore_config(plugin_list):
+        for plugin in plugin_list:
+          instances = (
+            plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES)
+            or plugin.get("INSTANCES")
+            or []
+          )
+          if not isinstance(instances, list):
+            continue
+          # endif instances is list
+          for instance in instances:
+            if not isinstance(instance, dict):
+              continue
+            # endif instance is dict
+            if "SEMAPHORE" in instance or "SEMAPHORED_KEYS" in instance:
+              return True
+            # endif instance has semaphore config
+          # endfor each instance
+        # endfor each plugin
+        return False
+
+      if has_semaphore_config(plugins):
+        self.Pd("Skipping semaphore autowire; semaphore config already provided.")
+        return plugins
+      # endif skip when provided
+
+      container_plugin = None
+      native_plugin = None
+
+      for plugin in plugins:
+        signature = (
+          plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+          or plugin.get("SIGNATURE")
+          or plugin.get("signature")
+        )
+        if not signature:
+          continue
+        # endif signature check
+        normalized_signature = str(signature).upper()
+        if normalized_signature in CONTAINERIZED_APPS_SIGNATURES:
+          if container_plugin is None:
+            container_plugin = plugin
+        else:
+          if native_plugin is None:
+            native_plugin = plugin
+      # endfor each plugin
+
+      if not container_plugin or not native_plugin:
+        return plugins
+      # endif both plugin types found
+
+      native_instances = (
+        native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES)
+        or native_plugin.get("INSTANCES")
+        or []
+      )
+      container_instances = (
+        container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES)
+        or container_plugin.get("INSTANCES")
+        or []
+      )
+
+      if not isinstance(native_instances, list) or not isinstance(container_instances, list):
+        return plugins
+      # endif instance lists
+
+      semaphore_keys = []
+      for instance in native_instances:
+        if not isinstance(instance, dict):
+          continue
+        # endif instance is dict
+        if instance.get("SEMAPHORE"):
+          semaphore_keys.append(instance.get("SEMAPHORE"))
+          continue
+        # endif existing semaphore
+        instance_id = (
+          instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+          or instance.get("instance_id")
+          or instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        )
+        if not instance_id:
+          continue
+        # endif instance id
+        native_signature = (
+          native_plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+          or native_plugin.get("SIGNATURE")
+          or native_plugin.get("signature")
+          or ""
+        )
+        semaphore_key = self.sanitize_name(
+          "{}__{}__{}".format(app_id, native_signature, instance_id)
+        )
+        instance.setdefault("SEMAPHORE", semaphore_key)
+        semaphore_keys.append(semaphore_key)
+      # endfor each native instance
+
+      if not semaphore_keys:
+        return plugins
+      # endif semaphore keys found
+
+      for instance in container_instances:
+        if not isinstance(instance, dict):
+          continue
+        # endif container instance is dict
+        current_keys = instance.get("SEMAPHORED_KEYS")
+        if isinstance(current_keys, list):
+          updated_keys = [key for key in current_keys if key]
+        elif isinstance(current_keys, str) and current_keys:
+          updated_keys = [current_keys]
+        else:
+          updated_keys = []
+        for key in semaphore_keys:
+          if key not in updated_keys:
+            updated_keys.append(key)
+        instance["SEMAPHORED_KEYS"] = updated_keys
+      # endfor each container instance
+
+      return plugins
+    except Exception as exc:
+      self.Pd(f"Failed to autowire semaphore for native/container pair: {exc}", color='y')
+      return plugins
 
   def deeploy_prepare_single_plugin_instance(self, inputs):
     """
