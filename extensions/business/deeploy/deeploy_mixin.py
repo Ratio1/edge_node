@@ -117,6 +117,10 @@ class _DeeployMixin:
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
     plugins = self.deeploy_prepare_plugins(inputs)
+    plugins = self._ensure_runner_cstore_auth_env(
+      app_id=app_id,
+      prepared_plugins=plugins,
+    )
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
     project_id = inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
     job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
@@ -831,6 +835,125 @@ class _DeeployMixin:
     raise ValueError(
       f"{DEEPLOY_ERRORS.REQUEST3}. Neither 'plugins' array nor 'plugin_signature' provided."
     )
+
+
+  def _ensure_runner_cstore_auth_env(self, app_id, prepared_plugins):
+    """
+    Ensure container/worker runners get default CSTORE auth env vars when missing.
+    """
+    try:
+      if not app_id or not isinstance(prepared_plugins, list):
+        return prepared_plugins
+
+      target_signatures = {
+        CONTAINER_APP_RUNNER_SIGNATURE,
+        WORKER_APP_RUNNER_SIGNATURE,
+      }
+      hkey_name = "R1EN_CSTORE_AUTH_HKEY"
+      secret_name = "R1EN_CSTORE_AUTH_SECRET"
+
+      for plugin in prepared_plugins:
+        signature = (
+          plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+          or plugin.get("SIGNATURE")
+          or plugin.get("signature")
+        )
+        normalized_signature = str(signature).upper() if signature else None
+        if normalized_signature not in target_signatures:
+          continue
+        # endif signature check
+
+        instances = (
+          plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES)
+          or plugin.get("INSTANCES")
+          or []
+        )
+        if not isinstance(instances, list) or not instances:
+          continue
+        # endif instances list
+
+        existing_hkey = None
+        existing_secret = None
+
+        for instance in instances:
+          if not isinstance(instance, dict):
+            continue
+          # endif instance is dict
+          env_cfg = instance.get("ENV") if isinstance(instance.get("ENV"), dict) else None
+          dyn_env_cfg = instance.get("DYNAMIC_ENV") if isinstance(instance.get("DYNAMIC_ENV"), dict) else None
+
+          if existing_hkey is None:
+            existing_hkey = (
+              (env_cfg.get(hkey_name) if env_cfg else None)
+              or (dyn_env_cfg.get(hkey_name) if dyn_env_cfg else None)
+            )
+          # endif pull existing hkey
+
+          if existing_secret is None:
+            existing_secret = (
+              (env_cfg.get(secret_name) if env_cfg else None)
+              or (dyn_env_cfg.get(secret_name) if dyn_env_cfg else None)
+            )
+          # endif pull existing secret
+
+          if existing_hkey and existing_secret:
+            break
+        # endfor discover existing values
+
+        primary_instance = None
+        for instance in instances:
+          if isinstance(instance, dict):
+            primary_instance = instance
+            break
+        # endfor pick first dict instance
+        if not primary_instance:
+          continue
+        # endif primary instance
+
+        instance_id = (
+          primary_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+          or primary_instance.get("instance_id")
+          or primary_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        )
+        if not instance_id:
+          continue
+        # endif instance id
+
+        plugin_id = self.sanitize_name(str(instance_id))
+        auth_hkey = existing_hkey or f"{app_id}_{plugin_id}"
+        auth_secret = existing_secret or self.uuid(8)
+
+        for instance in instances:
+          if not isinstance(instance, dict):
+            continue
+          # endif instance is dict
+          env_cfg = instance.get("ENV")
+          env_cfg = env_cfg if isinstance(env_cfg, dict) else {}
+          dyn_env_cfg = instance.get("DYNAMIC_ENV") if isinstance(instance.get("DYNAMIC_ENV"), dict) else {}
+
+          if hkey_name not in env_cfg and hkey_name not in dyn_env_cfg:
+            env_cfg.setdefault(hkey_name, auth_hkey)
+          # endif set hkey
+
+          if secret_name not in env_cfg and secret_name not in dyn_env_cfg:
+            env_cfg.setdefault(secret_name, auth_secret)
+          # endif set secret
+
+          instance["ENV"] = env_cfg
+        # endfor each instance
+      # endfor each plugin
+      
+      self.Pd("====================================")
+      self.Pd("====================================")
+      self.Pd("====================================")
+
+      self.Pd(prepared_plugins)
+
+      return prepared_plugins
+    except Exception as exc:
+      self.Pd(f"Failed to inject CSTORE auth env vars: {exc}", color='y')
+      return prepared_plugins
+
 
   def _ensure_deeploy_specs_job_config(self, deeploy_specs, pipeline_params=None):
     """
