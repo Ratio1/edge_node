@@ -840,6 +840,18 @@ class _DeeployMixin:
   def _ensure_runner_cstore_auth_env(self, app_id, prepared_plugins):
     """
     Ensure container/worker runners get default CSTORE auth env vars when missing.
+
+    Parameters
+    ----------
+    app_id : str
+      Pipeline identifier used to build deterministic auth keys.
+    prepared_plugins : list
+      Prepared plugins payload (list of plugin dicts).
+
+    Returns
+    -------
+    list | None
+      Plugins list with injected defaults when applicable.
     """
     try:
       if not app_id or not isinstance(prepared_plugins, list):
@@ -870,60 +882,25 @@ class _DeeployMixin:
           continue
         # endif instances list
 
-        primary_instance = next((inst for inst in instances if isinstance(inst, dict)), None)
-        if not primary_instance:
-          continue
-        # endif primary instance
-
-        instance_id = (
-          primary_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-          or primary_instance.get("instance_id")
-          or primary_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-        )
-        if not instance_id:
-          continue
-        # endif instance id
-
-        existing_hkey = None
-        existing_secret = None
-        existing_admin_pwd = None
-        for instance in instances:
-          if not isinstance(instance, dict):
-            continue
-          # endif instance is dict
-          env_cfg = instance.get("ENV") if isinstance(instance.get("ENV"), dict) else None
-          if env_cfg:
-            if existing_hkey is None:
-              existing_hkey = env_cfg.get(hkey_name)
-            if existing_secret is None:
-              existing_secret = env_cfg.get(secret_name)
-            if existing_admin_pwd is None:
-              existing_admin_pwd = env_cfg.get(admin_pwd_name)
-          # endif env config
-          if existing_hkey and existing_secret and existing_admin_pwd:
-            break
-        # endfor discover existing values
-
-        plugin_id = self.sanitize_name(str(instance_id))
-        auth_hkey = existing_hkey or f"{app_id}_{plugin_id}:auth"
-        auth_secret = existing_secret or self.uuid(8)
-        admin_pwd = existing_admin_pwd or self.uuid(8)
-
         for instance in instances:
           if not isinstance(instance, dict):
             continue
           # endif instance is dict
           env_cfg = instance.get("ENV")
           env_cfg = env_cfg if isinstance(env_cfg, dict) else {}
-          if hkey_name not in env_cfg:
-            env_cfg[hkey_name] = auth_hkey
-          # endif set hkey
-          if secret_name not in env_cfg:
-            env_cfg[secret_name] = auth_secret
-          # endif set secret
-          if admin_pwd_name not in env_cfg:
-            env_cfg[admin_pwd_name] = admin_pwd
-          # endif set admin pwd
+          instance_id = (
+            instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+            or instance.get("instance_id")
+            or instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+          )
+          if not instance_id:
+            continue
+          # endif instance id
+          plugin_id = self.sanitize_name(str(instance_id))
+          env_cfg.setdefault(hkey_name, f"{app_id}_{plugin_id}:auth")
+          env_cfg.setdefault(secret_name, self.uuid(8))
+          env_cfg.setdefault(admin_pwd_name, self.uuid(16))
+          # endif set missing creds
           instance["ENV"] = env_cfg
         # endfor each instance
       # endfor each plugin
