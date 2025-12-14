@@ -1533,11 +1533,10 @@ class _DeeployMixin:
         # endif signature check
         normalized_signature = str(signature).upper()
         if normalized_signature in CONTAINERIZED_APPS_SIGNATURES:
-          if container_plugin is None:
-            container_plugin = plugin
+          container_plugin = container_plugin or plugin
         else:
-          if native_plugin is None:
-            native_plugin = plugin
+          native_plugin = native_plugin or plugin
+        # endif signature type
       # endfor each plugin
 
       if not container_plugin or not native_plugin:
@@ -1564,10 +1563,6 @@ class _DeeployMixin:
         if not isinstance(instance, dict):
           continue
         # endif instance is dict
-        if instance.get("SEMAPHORE"):
-          semaphore_keys.append(instance.get("SEMAPHORE"))
-          continue
-        # endif existing semaphore
         instance_id = (
           instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
           or instance.get("instance_id")
@@ -1576,10 +1571,8 @@ class _DeeployMixin:
         if not instance_id:
           continue
         # endif instance id
-        semaphore_key = self.sanitize_name(
-          "{}__{}".format(app_id, instance_id)
-        )
-        instance.setdefault("SEMAPHORE", semaphore_key)
+        semaphore_key = self.sanitize_name("{}__{}".format(app_id, instance_id))
+        instance["SEMAPHORE"] = semaphore_key
         semaphore_keys.append(semaphore_key)
       # endfor each native instance
 
@@ -1590,18 +1583,8 @@ class _DeeployMixin:
       for instance in container_instances:
         if not isinstance(instance, dict):
           continue
-        # endif container instance is dict
-        current_keys = instance.get("SEMAPHORED_KEYS")
-        if isinstance(current_keys, list):
-          updated_keys = [key for key in current_keys if key]
-        elif isinstance(current_keys, str) and current_keys:
-          updated_keys = [current_keys]
-        else:
-          updated_keys = []
-        for key in semaphore_keys:
-          if key not in updated_keys:
-            updated_keys.append(key)
-        instance["SEMAPHORED_KEYS"] = updated_keys
+        # endif container instance dict
+        instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
       # endfor each container instance
 
       return plugins
