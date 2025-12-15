@@ -31,6 +31,18 @@ class CstoreManagerApiPlugin(BasePlugin):
   def __init__(self, **kwargs):
     super(CstoreManagerApiPlugin, self).__init__(**kwargs)
     return
+  
+  
+  def Pd(self, s, *args,  **kwargs):
+    """
+    Print a message to the console.
+    """
+    if self.cfg_debug:
+      s = "[DEBUG] " + s
+      self.P(s, *args, **kwargs)
+    return
+  
+
 
   def on_init(self):
     super(CstoreManagerApiPlugin, self).on_init()
@@ -41,44 +53,27 @@ class CstoreManagerApiPlugin(BasePlugin):
     ))
     return
 
-  def _log_request_response(self, endpoint_name: str, request_data: dict = None, response_data: dict = None):
-    """Helper method to log requests and responses when verbose mode is enabled"""
-    if hasattr(self, 'cfg_cstore_verbose') and self.cfg_cstore_verbose > 10:
-      self.P(f"=== {endpoint_name} ENDPOINT ===", color='y')
-      if request_data:
-        self.P(f"REQUEST: {self.json.dumps(request_data, indent=2)}", color='c')
-      if response_data:
-        self.P(f"RESPONSE: {self.json.dumps(response_data, indent=2)}", color='g')
-      self.P(f"=== END {endpoint_name} ===", color='y')
 
-   
-  def __get_keys(self):
-    result = []
-    _data = self.plugins_shmem.get('__chain_storage', {})
-    if isinstance(_data, dict):
-      result = list(_data.keys())
-    return result
+  ### DANGER ZONE: Disabled endpoints that expose all keys in chainstore ###
+  # def __get_keys(self):
+  #   result = []
+  #   _data = self.plugins_shmem.get('__chain_storage', {})
+  #   if isinstance(_data, dict):
+  #     result = list(_data.keys())
+  #   return result
 
+  ### END DANGER ZONE ###
 
-  @BasePlugin.endpoint(method="get", require_token=False) 
+  @BasePlugin.endpoint(method="get", require_token=False)
   def get_status(self):   # /get_status
     """
-    Get the current status of the chainstore.
+    Get the current status of the chainstore API.
     
     Returns:
-        dict: A dictionary containing the list of all keys currently stored in the chainstore.
+        dict: A dictionary containing the status information
     """
-    # Log request
-    self._log_request_response("GET_STATUS", request_data={})
-    
-    data = {
-      'keys' : self.__get_keys()
-    }
-    
-    # Log response
-    self._log_request_response("GET_STATUS", response_data=data)
-    
-    return data
+    return {"ok": True, "message": "CStore Manager API is running."}
+  
 
   @BasePlugin.endpoint(method="post", require_token=False)
   def set(self, key: str, value: Any, chainstore_peers: list = None):
@@ -93,25 +88,18 @@ class CstoreManagerApiPlugin(BasePlugin):
     Returns:
         boolean: The result of the write operation
     """
-    # Log request
     if chainstore_peers is None:
       chainstore_peers = []
-    request_data = {
-      'key': key,
-      'value': value,
-      'chainstore_peers': chainstore_peers
-    }
-    self._log_request_response("SET_ANY", request_data=request_data)
 
+    start_timer = self.time()
     write_result = self.chainstore_set(
       key=key,
       value=value,
       debug=self.cfg_debug,
       extra_peers=chainstore_peers,
     )
-
-    # Log response
-    self._log_request_response("SET", response_data=write_result)
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore set took {elapsed_time:.4f} seconds")
 
     return write_result
 
@@ -126,17 +114,12 @@ class CstoreManagerApiPlugin(BasePlugin):
     Returns:
         Any: The value associated with the given key, or None if not found
     """
-    # Log request
-    request_data = {
-      'key': key
-    }
-    self._log_request_response("GET", request_data=request_data)
 
+    start_timer = self.time()
     value = self.chainstore_get(key=key, debug=self.cfg_debug)
-    
-    # Log response
-    self._log_request_response("GET", response_data=value)
-    
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore get took {elapsed_time:.4f} seconds")
+
     return value
 
 
@@ -158,14 +141,7 @@ class CstoreManagerApiPlugin(BasePlugin):
     if chainstore_peers is None:
       chainstore_peers = []
 
-    request_data = {
-      'hkey': hkey,
-      'key': key,
-      'value': value,
-      'chainstore_peers': chainstore_peers
-    }
-    self._log_request_response("HSET", request_data=request_data)
-
+    start_timer = self.time()
     write_result = self.chainstore_hset(
       hkey=hkey,
       key=key,
@@ -173,10 +149,9 @@ class CstoreManagerApiPlugin(BasePlugin):
       debug=self.cfg_debug,
       extra_peers=chainstore_peers,
     )
-    
-    # Log response
-    self._log_request_response("HSET", response_data=write_result)
-    
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore hset took {elapsed_time:.4f} seconds")
+
     return write_result
 
 
@@ -192,18 +167,11 @@ class CstoreManagerApiPlugin(BasePlugin):
     Returns:
         Any: The value associated with the given field in the hset, or None if not found
     """
-    # Log request
-    request_data = {
-      'hkey': hkey,
-      'key': key
-    }
-    self._log_request_response("HGET", request_data=request_data)
-
+    start_timer = self.time()
     value = self.chainstore_hget(hkey=hkey, key=key, debug=self.cfg_debug)
-    
-    # Log response
-    self._log_request_response("HGET", response_data=value)
-    
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore hget took {elapsed_time:.4f} seconds")
+
     return value
 
 
@@ -218,16 +186,11 @@ class CstoreManagerApiPlugin(BasePlugin):
     Returns:
         dict: A dictionary containing all field-value pairs in the hset, with Any type values
     """
-    # Log request
-    request_data = {
-      'hkey': hkey
-    }
-    self._log_request_response("HGETALL", request_data=request_data)
 
+    start_timer = self.time()
     value = self.chainstore_hgetall(hkey=hkey, debug=self.cfg_debug)
-    
-    # Log response
-    self._log_request_response("HGETALL", response_data=value)
-    
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore hgetall took {elapsed_time:.4f} seconds")
+
     return value
 
