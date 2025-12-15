@@ -31,6 +31,18 @@ class CstoreManagerApiPlugin(BasePlugin):
   def __init__(self, **kwargs):
     super(CstoreManagerApiPlugin, self).__init__(**kwargs)
     return
+  
+  
+  def Pd(self, s, *args,  **kwargs):
+    """
+    Print a message to the console.
+    """
+    if self.cfg_debug:
+      s = "[DEBUG] " + s
+      self.P(s, *args, **kwargs)
+    return
+  
+
 
   def on_init(self):
     super(CstoreManagerApiPlugin, self).on_init()
@@ -41,6 +53,7 @@ class CstoreManagerApiPlugin(BasePlugin):
     ))
     return
 
+
   def _log_request_response(self, endpoint_name: str, request_data: dict = None, response_data: dict = None):
     """Helper method to log requests and responses when verbose mode is enabled"""
     if hasattr(self, 'cfg_cstore_verbose') and self.cfg_cstore_verbose > 10:
@@ -50,35 +63,38 @@ class CstoreManagerApiPlugin(BasePlugin):
       if response_data:
         self.P(f"RESPONSE: {self.json.dumps(response_data, indent=2)}", color='g')
       self.P(f"=== END {endpoint_name} ===", color='y')
+    return
 
-   
-  def __get_keys(self):
-    result = []
-    _data = self.plugins_shmem.get('__chain_storage', {})
-    if isinstance(_data, dict):
-      result = list(_data.keys())
-    return result
+  ### DANGER ZONE: Disabled endpoints that expose all keys in chainstore ###
+  # def __get_keys(self):
+  #   result = []
+  #   _data = self.plugins_shmem.get('__chain_storage', {})
+  #   if isinstance(_data, dict):
+  #     result = list(_data.keys())
+  #   return result
 
 
-  @BasePlugin.endpoint(method="get", require_token=False) 
-  def get_status(self):   # /get_status
-    """
-    Get the current status of the chainstore.
+  # @BasePlugin.endpoint(method="get", require_token=False) 
+  # def get_status(self):   # /get_status
+  #   """
+  #   Get the current status of the chainstore.
     
-    Returns:
-        dict: A dictionary containing the list of all keys currently stored in the chainstore.
-    """
-    # Log request
-    self._log_request_response("GET_STATUS", request_data={})
+  #   Returns:
+  #       dict: A dictionary containing the list of all keys currently stored in the chainstore.
+  #   """
+  #   # Log request
+  #   self._log_request_response("GET_STATUS", request_data={})
     
-    data = {
-      'keys' : self.__get_keys()
-    }
+  #   data = {
+  #     'keys' : self.__get_keys()
+  #   }
     
-    # Log response
-    self._log_request_response("GET_STATUS", response_data=data)
+  #   # Log response
+  #   self._log_request_response("GET_STATUS", response_data=data)
     
-    return data
+  #   return data
+  
+  ### END DANGER ZONE ###
 
   @BasePlugin.endpoint(method="post", require_token=False)
   def set(self, key: str, value: Any, chainstore_peers: list = None):
@@ -103,13 +119,15 @@ class CstoreManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("SET_ANY", request_data=request_data)
 
+    start_timer = self.time()
     write_result = self.chainstore_set(
       key=key,
       value=value,
       debug=self.cfg_debug,
       extra_peers=chainstore_peers,
     )
-
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore set took {elapsed_time:.4f} seconds")
     # Log response
     self._log_request_response("SET", response_data=write_result)
 
