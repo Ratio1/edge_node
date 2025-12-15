@@ -143,8 +143,11 @@ class CstoreManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("GET", request_data=request_data)
 
+    start_timer = self.time()
     value = self.chainstore_get(key=key, debug=self.cfg_debug)
-    
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore get took {elapsed_time:.4f} seconds")
+
     # Log response
     self._log_request_response("GET", response_data=value)
     
@@ -177,6 +180,7 @@ class CstoreManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("HSET", request_data=request_data)
 
+    start_timer = self.time()
     write_result = self.chainstore_hset(
       hkey=hkey,
       key=key,
@@ -184,7 +188,9 @@ class CstoreManagerApiPlugin(BasePlugin):
       debug=self.cfg_debug,
       extra_peers=chainstore_peers,
     )
-    
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore hset took {elapsed_time:.4f} seconds")
+
     # Log response
     self._log_request_response("HSET", response_data=write_result)
     
@@ -210,8 +216,11 @@ class CstoreManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("HGET", request_data=request_data)
 
+    start_timer = self.time()
     value = self.chainstore_hget(hkey=hkey, key=key, debug=self.cfg_debug)
-    
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore hget took {elapsed_time:.4f} seconds")
+
     # Log response
     self._log_request_response("HGET", response_data=value)
     
@@ -235,8 +244,11 @@ class CstoreManagerApiPlugin(BasePlugin):
     }
     self._log_request_response("HGETALL", request_data=request_data)
 
+    start_timer = self.time()
     value = self.chainstore_hgetall(hkey=hkey, debug=self.cfg_debug)
-    
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore hgetall took {elapsed_time:.4f} seconds")
+
     # Log response
     self._log_request_response("HGETALL", response_data=value)
     
