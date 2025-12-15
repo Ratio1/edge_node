@@ -117,6 +117,10 @@ class _DeeployMixin:
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
     plugins = self.deeploy_prepare_plugins(inputs)
+    plugins = self._ensure_runner_cstore_auth_env(
+      app_id=app_id,
+      prepared_plugins=plugins,
+    )
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
     project_id = inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
     job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
@@ -165,6 +169,12 @@ class _DeeployMixin:
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
+
+    plugins = self._autowire_native_container_semaphore(
+      app_id=app_id,
+      plugins=plugins,
+      job_app_type=detected_job_app_type,
+    )
 
     node_plugins_by_addr = {}
     for addr in nodes:
@@ -375,6 +385,13 @@ class _DeeployMixin:
             fallback_instance=None,
           )
           plugins_by_node[addr].append(prepared_plugin)
+
+    for addr, node_plugins in plugins_by_node.items():
+      plugins_by_node[addr] = self._autowire_native_container_semaphore(
+        app_id=app_id,
+        plugins=node_plugins,
+        job_app_type=detected_job_app_type,
+      )
 
     pipeline_to_save = None
     node_plugins_ready = {}
@@ -818,6 +835,69 @@ class _DeeployMixin:
     raise ValueError(
       f"{DEEPLOY_ERRORS.REQUEST3}. Neither 'plugins' array nor 'plugin_signature' provided."
     )
+
+
+  def _ensure_runner_cstore_auth_env(self, app_id, prepared_plugins):
+    """
+    Ensure container/worker runners get default CSTORE auth env vars when missing.
+
+    Parameters
+    ----------
+    app_id : str
+      Pipeline identifier used to build deterministic auth keys.
+    prepared_plugins : list
+      Prepared plugins payload (list of plugin dicts).
+
+    Returns
+    -------
+    list | None
+      Plugins list with injected defaults when applicable.
+    """
+    try:
+      if not app_id or not isinstance(prepared_plugins, list):
+        return prepared_plugins
+
+      target_signatures = set(CONTAINERIZED_APPS_SIGNATURES)
+      hkey_name = "R1EN_CSTORE_AUTH_HKEY"
+      secret_name = "R1EN_CSTORE_AUTH_SECRET"
+      admin_pwd_name = "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD"
+
+      for plugin in prepared_plugins:
+        signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+        normalized_signature = str(signature).upper() if signature else None
+        if normalized_signature not in target_signatures:
+          continue
+        # endif signature check
+
+        instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+        if not isinstance(instances, list) or not instances:
+          continue
+        # endif instances list
+
+        for instance in instances:
+          if not isinstance(instance, dict):
+            continue
+          # endif instance is dict
+          env_cfg = instance.get("ENV")
+          env_cfg = env_cfg if isinstance(env_cfg, dict) else {}
+          instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+          if not instance_id:
+            continue
+          # endif instance id
+          plugin_id = self.sanitize_name(str(instance_id))
+          env_cfg.setdefault(hkey_name, f"{app_id}_{plugin_id}:auth")
+          env_cfg.setdefault(secret_name, self.uuid(8))
+          env_cfg.setdefault(admin_pwd_name, self.uuid(16))
+          # endif set missing creds
+          instance["ENV"] = env_cfg
+        # endfor each instance
+      # endfor each plugin
+
+      return prepared_plugins
+    except Exception as exc:
+      self.Pd(f"Failed to inject CSTORE auth env vars: {exc}", color='y')
+      return prepared_plugins
+
 
   def _ensure_deeploy_specs_job_config(self, deeploy_specs, pipeline_params=None):
     """
@@ -1350,6 +1430,112 @@ class _DeeployMixin:
       return JOB_APP_TYPES.GENERIC
 
     return JOB_APP_TYPES.NATIVE
+
+  def _autowire_native_container_semaphore(self, app_id, plugins, job_app_type):
+    """
+    Auto-configure semaphore settings for native + container pairs.
+
+    Parameters
+    ----------
+    app_id : str
+      Application identifier used to build deterministic semaphore keys.
+    plugins : list
+      Prepared plugins payload (expected to be a two-item native/container pair).
+    job_app_type : str
+      Detected job application type.
+
+    Returns
+    -------
+    list
+      Original plugins list, augmented with semaphore wiring when applicable.
+    """
+    try:
+      if job_app_type != JOB_APP_TYPES.NATIVE:
+        return plugins
+      # endif native job app type
+
+      if not isinstance(plugins, list) or len(plugins) != 2:
+        return plugins
+      # endif plugin pair check
+
+      def has_semaphore_config(plugin_list):
+        for plugin in plugin_list:
+          instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+          if not isinstance(instances, list):
+            continue
+          # endif instances is list
+          for instance in instances:
+            if not isinstance(instance, dict):
+              continue
+            # endif instance is dict
+            if "SEMAPHORE" in instance or "SEMAPHORED_KEYS" in instance:
+              return True
+            # endif instance has semaphore config
+          # endfor each instance
+        # endfor each plugin
+        return False
+
+      if has_semaphore_config(plugins):
+        self.Pd("Skipping semaphore autowire; semaphore config already provided.")
+        return plugins
+      # endif skip when provided
+
+      container_plugin = None
+      native_plugin = None
+
+      for plugin in plugins:
+        signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+        if not signature:
+          continue
+        # endif signature check
+        normalized_signature = str(signature).upper()
+        if normalized_signature in CONTAINERIZED_APPS_SIGNATURES:
+          container_plugin = container_plugin or plugin
+        else:
+          native_plugin = native_plugin or plugin
+        # endif signature type
+      # endfor each plugin
+
+      if not container_plugin or not native_plugin:
+        return plugins
+      # endif both plugin types found
+
+      native_instances = native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      container_instances = container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+
+      if not isinstance(native_instances, list) or not isinstance(container_instances, list):
+        return plugins
+      # endif instance lists
+
+      semaphore_keys = []
+      for instance in native_instances:
+        if not isinstance(instance, dict):
+          continue
+        # endif instance is dict
+        instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+        if not instance_id:
+          continue
+        # endif instance id
+        semaphore_key = self.sanitize_name("{}__{}".format(app_id, instance_id))
+        instance["SEMAPHORE"] = semaphore_key
+        semaphore_keys.append(semaphore_key)
+      # endfor each native instance
+
+      if not semaphore_keys:
+        return plugins
+      # endif semaphore keys found
+
+      for instance in container_instances:
+        if not isinstance(instance, dict):
+          continue
+        # endif container instance dict
+        instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
+      # endfor each container instance
+
+      return plugins
+    except Exception as exc:
+      self.Pd(f"Failed to autowire semaphore for native/container pair: {exc}", color='y')
+      return plugins
 
   def deeploy_prepare_single_plugin_instance(self, inputs):
     """

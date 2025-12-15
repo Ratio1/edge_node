@@ -27,13 +27,13 @@ Usage in pipeline:
 }
 """
 
+import base64
+from io import BytesIO
+from PIL import Image
+
 from naeural_core.serving.base import ModelServingProcess as BaseServingProcess
 
-import base64
-from PIL import Image
-from io import BytesIO
-
-__VER__ = '0.1.0'
+__VER__ = '0.1.2'
 
 _CONFIG = {
   **BaseServingProcess.CONFIG,
@@ -68,10 +68,43 @@ class CerviguardImageAnalyzer(BaseServingProcess):
     """
     super(CerviguardImageAnalyzer, self).on_init()
     self._processed_count = 0
+    self.rng = self.np.random.default_rng()
+    self.base_risks = {'none': 10, 'low': 30, 'moderate': 55, 'high': 75}
+    self.tz_descriptions = {
+      'Type 0': 'Type 0 transformation zone (normal-appearing cervix, no visible lesions).',
+      'Type 1': 'Type 1 transformation zone (fully ectocervical and fully visible).',
+      'Type 2': 'Type 2 transformation zone (partly endocervical but fully visible).',
+      'Type 3': 'Type 3 transformation zone (endocervical and not fully visible).'
+    }
+    self.lesion_text = {
+      'none': 'No significant acetowhite or vascular changes seen.',
+      'low': 'Minor acetowhite changes with regular vascular patterns; low-grade lesion possible.',
+      'moderate': 'Acetowhite epithelium with irregular vessels; moderate-grade lesion suspected.',
+      'high': 'Dense acetowhite areas with atypical vessels; high-grade lesion suspected.'
+    }
+    self.lesion_templates = {
+      'Type 3': {
+        'none': 'No obvious ectocervical lesions, but assessment is limited because the transformation zone is not fully visible; colposcopy with endocervical evaluation is recommended.',
+        'low': 'Subtle acetowhite change seen on the ectocervix; Type 3 zone limits visualization—colposcopy/endocervical sampling advised.',
+        'moderate': 'Suspicious acetowhite and vascular changes with a Type 3 zone; colposcopy and endocervical assessment recommended.',
+        'high': 'Marked high-grade features with a Type 3 zone; urgent colposcopy with endocervical evaluation recommended.'
+      },
+      'Type 0': {
+        'none': 'No lesions detected; cervix appears normal.',
+        'low': 'Minor findings noted, but overall appearance is normal; routine screening advised.',
+        'moderate': 'Patchy findings with otherwise normal cervix; consider follow-up colposcopy.',
+        'high': 'Focal concerning area despite overall normal appearance; colposcopy recommended.'
+      },
+      'default': {
+        'none': f"{self.lesion_text['none']} Routine screening appropriate.",
+        'low': f"{self.lesion_text['low']} Follow-up in 6-12 months recommended.",
+        'moderate': f"{self.lesion_text['moderate']} Colposcopy and biopsy recommended.",
+        'high': f"{self.lesion_text['high']} Immediate colposcopy and biopsy strongly recommended."
+      }
+    }
     self.P("CerviGuard Image Analyzer initialized", color='g')
     self.P(f"  Version: {__VER__}", color='g')
     self.P(f"  Accepts STRUCT_DATA input (base64 images)", color='g')
-    return
 
   def _decode_base64_image(self, image_data):
     """
@@ -224,9 +257,6 @@ class CerviguardImageAnalyzer(BaseServingProcess):
     dict
         Analysis results with tz_type, lesion_assessment, lesion_summary, and risk_score
     """
-    # Mock implementation - generates deterministic results based on image characteristics
-    # In production, this would call an actual ML model
-
     if img_array is None or not image_info.get('valid', False):
       return {
         'tz_type': 'Type 1',
@@ -235,78 +265,60 @@ class CerviguardImageAnalyzer(BaseServingProcess):
         'risk_score': 0
       }
 
-    # Use image characteristics to generate mock analysis
-    # In production, this would be replaced with actual model predictions
-    width = image_info.get('width', 0)
-    height = image_info.get('height', 0)
-    channels = image_info.get('channels', 3)
+    quality_info = image_info.get('quality_info', {})
+    resolution_category = quality_info.get('resolution_category', 'unknown')
+    image_quality_sufficient = resolution_category not in ['very_low', 'low']
 
-    # Generate mock TZ type (Type 1, Type 2, Type 3)
-    # Using image dimensions as seed for deterministic results
-    tz_seed = (width + height) % 3
-    tz_types = ['Type 1', 'Type 2', 'Type 3']
-    tz_type = tz_types[tz_seed]
+    # Purely random (but internally consistent) lesion and TZ selection
+    rng = self.rng
 
-    # Generate mock lesion assessment (none, low, moderate, high)
-    # Using color information if available
-    if 'color_info' in image_info:
-      mean_intensity = (
-        image_info['color_info']['mean_r'] +
-        image_info['color_info']['mean_g'] +
-        image_info['color_info']['mean_b']
-      ) / 3.0
+    tz_type = rng.choice(
+      ['Type 0', 'Type 1', 'Type 2', 'Type 3'],
+      p=[0.2, 0.3, 0.25, 0.25]
+    )
 
-      if mean_intensity < 60:
-        lesion_assessment = 'high'
-        risk_score = 75
-      elif mean_intensity < 100:
-        lesion_assessment = 'moderate'
-        risk_score = 50
-      elif mean_intensity < 150:
-        lesion_assessment = 'low'
-        risk_score = 25
-      else:
-        lesion_assessment = 'none'
-        risk_score = 10
-    else:
-      lesion_assessment = 'none'
-      risk_score = 5
+    lesion_assessment = rng.choice(
+      ['none', 'low', 'moderate', 'high'],
+      p=[0.35, 0.3, 0.2, 0.15]
+    )
 
-    # Extract image dimensions for quality notes
+    risk_score = self.base_risks[lesion_assessment]
+
     img_width = image_info.get('width', 0)
     img_height = image_info.get('height', 0)
-    resolution_category = image_info.get('quality_info', {}).get('resolution_category', 'unknown')
 
-    # Assess image quality based on resolution
-    image_quality_sufficient = True
-    quality_note = ""
+    visualization_limited = tz_type == 'Type 3'
+    if tz_type == 'Type 3':
+      risk_score = max(risk_score, 40)
 
     if resolution_category in ['very_low', 'low']:
-      image_quality_sufficient = False
-      quality_note = f" Note: Image resolution ({img_width}x{img_height}) is below optimal for detailed analysis."
+      quality_note = f"Image resolution ({img_width}x{img_height}) limits detailed assessment."
     elif resolution_category == 'medium':
-      quality_note = f" Image resolution ({img_width}x{img_height}) is adequate for analysis."
+      quality_note = f"Image resolution ({img_width}x{img_height}) is adequate for analysis."
     else:
-      quality_note = f" Image resolution ({img_width}x{img_height}) is optimal for analysis."
+      quality_note = f"Image resolution ({img_width}x{img_height}) is optimal for analysis."
 
-    # Generate human-readable summary
-    summaries = {
-      'none': f'{tz_type} transformation zone identified. No significant lesions detected. Routine screening recommended.{quality_note}',
-      'low': f'{tz_type} transformation zone with minor acetowhite changes observed. Low-grade lesion suspected. Follow-up in 6 months recommended.{quality_note}',
-      'moderate': f'{tz_type} transformation zone with acetowhite epithelium and irregular vascular patterns. Moderate-grade lesion suspected. Colposcopy and biopsy recommended.{quality_note}',
-      'high': f'{tz_type} transformation zone with dense acetowhite areas and atypical vessels. High-grade lesion suspected. Immediate colposcopy and biopsy strongly recommended.{quality_note}'
-    }
+    if tz_type == 'Type 3':
+      lesion_templates = self.lesion_templates['Type 3']
+    elif tz_type == 'Type 0':
+      lesion_templates = self.lesion_templates['Type 0']
+    else:
+      lesion_templates = self.lesion_templates['default']
 
-    lesion_summary = summaries.get(lesion_assessment, 'Analysis inconclusive')
+    lesion_summary = " ".join([
+      self.tz_descriptions.get(tz_type, tz_type),
+      lesion_templates.get(lesion_assessment, self.lesion_text['none']),
+      quality_note
+    ])
 
-    # Return analysis results (width/height already in image_info, no need to duplicate)
     return {
       'tz_type': tz_type,
       'lesion_assessment': lesion_assessment,
       'lesion_summary': lesion_summary,
       'risk_score': risk_score,
       'image_quality': resolution_category,
-      'image_quality_sufficient': image_quality_sufficient
+      'image_quality_sufficient': image_quality_sufficient,
+      'assessment_confidence': 'reduced' if visualization_limited else 'normal'
     }
 
   def _pre_process(self, inputs):
@@ -324,7 +336,6 @@ class CerviguardImageAnalyzer(BaseServingProcess):
         List of decoded image arrays
     """
     lst_inputs = inputs.get('DATA', [])
-    serving_params = inputs.get('SERVING_PARAMS', [])
 
     self.P(f"Pre-processing {len(lst_inputs)} input(s)", color='b')
 
@@ -337,15 +348,11 @@ class CerviguardImageAnalyzer(BaseServingProcess):
 
     preprocessed = []
     for i, inp in enumerate(lst_inputs):
-      # Get serving params for this specific input
-      params = serving_params[i] if i < len(serving_params) else {}
-
       # Decode the base64 image
       img_array = self._decode_base64_image(inp)
 
       preprocessed.append({
         'image': img_array,
-        'params': params,
         'index': i,
       })
 
@@ -373,7 +380,6 @@ class CerviguardImageAnalyzer(BaseServingProcess):
     results = []
     for inp_data in inputs:
       img_array = inp_data['image']
-      params = inp_data['params']
       idx = inp_data['index']
 
       if img_array is None:
