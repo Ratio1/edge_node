@@ -54,17 +54,6 @@ class CstoreManagerApiPlugin(BasePlugin):
     return
 
 
-  def _log_request_response(self, endpoint_name: str, request_data: dict = None, response_data: dict = None):
-    """Helper method to log requests and responses when verbose mode is enabled"""
-    if hasattr(self, 'cfg_cstore_verbose') and self.cfg_cstore_verbose > 10:
-      self.P(f"=== {endpoint_name} ENDPOINT ===", color='y')
-      if request_data:
-        self.P(f"REQUEST: {self.json.dumps(request_data, indent=2)}", color='c')
-      if response_data:
-        self.P(f"RESPONSE: {self.json.dumps(response_data, indent=2)}", color='g')
-      self.P(f"=== END {endpoint_name} ===", color='y')
-    return
-
   ### DANGER ZONE: Disabled endpoints that expose all keys in chainstore ###
   # def __get_keys(self):
   #   result = []
@@ -83,9 +72,6 @@ class CstoreManagerApiPlugin(BasePlugin):
     Returns:
         dict: A dictionary containing the status information
     """
-    # Log request
-    self._log_request_response("GET_STATUS", request_data={})
-
     return {"ok": True, "message": "CStore Manager API is running."}
   
 
@@ -102,15 +88,8 @@ class CstoreManagerApiPlugin(BasePlugin):
     Returns:
         boolean: The result of the write operation
     """
-    # Log request
     if chainstore_peers is None:
       chainstore_peers = []
-    request_data = {
-      'key': key,
-      'value': value,
-      'chainstore_peers': chainstore_peers
-    }
-    self._log_request_response("SET_ANY", request_data=request_data)
 
     start_timer = self.time()
     write_result = self.chainstore_set(
@@ -121,8 +100,6 @@ class CstoreManagerApiPlugin(BasePlugin):
     )
     elapsed_time = self.time() - start_timer
     self.Pd(f"CStore set took {elapsed_time:.4f} seconds")
-    # Log response
-    self._log_request_response("SET", response_data=write_result)
 
     return write_result
 
@@ -137,20 +114,12 @@ class CstoreManagerApiPlugin(BasePlugin):
     Returns:
         Any: The value associated with the given key, or None if not found
     """
-    # Log request
-    request_data = {
-      'key': key
-    }
-    self._log_request_response("GET", request_data=request_data)
 
     start_timer = self.time()
     value = self.chainstore_get(key=key, debug=self.cfg_debug)
     elapsed_time = self.time() - start_timer
     self.Pd(f"CStore get took {elapsed_time:.4f} seconds")
 
-    # Log response
-    self._log_request_response("GET", response_data=value)
-    
     return value
 
 
@@ -172,14 +141,6 @@ class CstoreManagerApiPlugin(BasePlugin):
     if chainstore_peers is None:
       chainstore_peers = []
 
-    request_data = {
-      'hkey': hkey,
-      'key': key,
-      'value': value,
-      'chainstore_peers': chainstore_peers
-    }
-    self._log_request_response("HSET", request_data=request_data)
-
     start_timer = self.time()
     write_result = self.chainstore_hset(
       hkey=hkey,
@@ -191,9 +152,6 @@ class CstoreManagerApiPlugin(BasePlugin):
     elapsed_time = self.time() - start_timer
     self.Pd(f"CStore hset took {elapsed_time:.4f} seconds")
 
-    # Log response
-    self._log_request_response("HSET", response_data=write_result)
-    
     return write_result
 
 
@@ -209,21 +167,11 @@ class CstoreManagerApiPlugin(BasePlugin):
     Returns:
         Any: The value associated with the given field in the hset, or None if not found
     """
-    # Log request
-    request_data = {
-      'hkey': hkey,
-      'key': key
-    }
-    self._log_request_response("HGET", request_data=request_data)
-
     start_timer = self.time()
     value = self.chainstore_hget(hkey=hkey, key=key, debug=self.cfg_debug)
     elapsed_time = self.time() - start_timer
     self.Pd(f"CStore hget took {elapsed_time:.4f} seconds")
 
-    # Log response
-    self._log_request_response("HGET", response_data=value)
-    
     return value
 
 
@@ -238,19 +186,11 @@ class CstoreManagerApiPlugin(BasePlugin):
     Returns:
         dict: A dictionary containing all field-value pairs in the hset, with Any type values
     """
-    # Log request
-    request_data = {
-      'hkey': hkey
-    }
-    self._log_request_response("HGETALL", request_data=request_data)
 
     start_timer = self.time()
     value = self.chainstore_hgetall(hkey=hkey, debug=self.cfg_debug)
     elapsed_time = self.time() - start_timer
     self.Pd(f"CStore hgetall took {elapsed_time:.4f} seconds")
 
-    # Log response
-    self._log_request_response("HGETALL", response_data=value)
-    
     return value
 
