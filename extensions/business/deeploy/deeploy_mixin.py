@@ -1460,11 +1460,7 @@ class _DeeployMixin:
 
       def has_semaphore_config(plugin_list):
         for plugin in plugin_list:
-          instances = (
-            plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES)
-            or plugin.get("INSTANCES")
-            or []
-          )
+          instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
           if not isinstance(instances, list):
             continue
           # endif instances is list
