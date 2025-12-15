@@ -33,7 +33,7 @@ from PIL import Image
 
 from naeural_core.serving.base import ModelServingProcess as BaseServingProcess
 
-__VER__ = '0.1.1'
+__VER__ = '0.1.2'
 
 _CONFIG = {
   **BaseServingProcess.CONFIG,
@@ -68,10 +68,43 @@ class CerviguardImageAnalyzer(BaseServingProcess):
     """
     super(CerviguardImageAnalyzer, self).on_init()
     self._processed_count = 0
+    self.rng = self.np.random.default_rng()
+    self.base_risks = {'none': 10, 'low': 30, 'moderate': 55, 'high': 75}
+    self.tz_descriptions = {
+      'Type 0': 'Type 0 transformation zone (normal-appearing cervix, no visible lesions).',
+      'Type 1': 'Type 1 transformation zone (fully ectocervical and fully visible).',
+      'Type 2': 'Type 2 transformation zone (partly endocervical but fully visible).',
+      'Type 3': 'Type 3 transformation zone (endocervical and not fully visible).'
+    }
+    self.lesion_text = {
+      'none': 'No significant acetowhite or vascular changes seen.',
+      'low': 'Minor acetowhite changes with regular vascular patterns; low-grade lesion possible.',
+      'moderate': 'Acetowhite epithelium with irregular vessels; moderate-grade lesion suspected.',
+      'high': 'Dense acetowhite areas with atypical vessels; high-grade lesion suspected.'
+    }
+    self.lesion_templates = {
+      'Type 3': {
+        'none': 'No obvious ectocervical lesions, but assessment is limited because the transformation zone is not fully visible; colposcopy with endocervical evaluation is recommended.',
+        'low': 'Subtle acetowhite change seen on the ectocervix; Type 3 zone limits visualization—colposcopy/endocervical sampling advised.',
+        'moderate': 'Suspicious acetowhite and vascular changes with a Type 3 zone; colposcopy and endocervical assessment recommended.',
+        'high': 'Marked high-grade features with a Type 3 zone; urgent colposcopy with endocervical evaluation recommended.'
+      },
+      'Type 0': {
+        'none': 'No lesions detected; cervix appears normal.',
+        'low': 'Minor findings noted, but overall appearance is normal; routine screening advised.',
+        'moderate': 'Patchy findings with otherwise normal cervix; consider follow-up colposcopy.',
+        'high': 'Focal concerning area despite overall normal appearance; colposcopy recommended.'
+      },
+      'default': {
+        'none': f"{self.lesion_text['none']} Routine screening appropriate.",
+        'low': f"{self.lesion_text['low']} Follow-up in 6-12 months recommended.",
+        'moderate': f"{self.lesion_text['moderate']} Colposcopy and biopsy recommended.",
+        'high': f"{self.lesion_text['high']} Immediate colposcopy and biopsy strongly recommended."
+      }
+    }
     self.P("CerviGuard Image Analyzer initialized", color='g')
     self.P(f"  Version: {__VER__}", color='g')
     self.P(f"  Accepts STRUCT_DATA input (base64 images)", color='g')
-    return
 
   def _decode_base64_image(self, image_data):
     """
@@ -232,23 +265,12 @@ class CerviguardImageAnalyzer(BaseServingProcess):
         'risk_score': 0
       }
 
-    width = image_info.get('width', 0)
-    height = image_info.get('height', 0)
-    channels = image_info.get('channels', 3)
     quality_info = image_info.get('quality_info', {})
     resolution_category = quality_info.get('resolution_category', 'unknown')
-    quality_score_map = {
-      'very_low': 0,
-      'low': 1,
-      'medium': 2,
-      'high': 3,
-      'very_high': 4,
-    }
-    quality_score = quality_score_map.get(resolution_category, 2)
     image_quality_sufficient = resolution_category not in ['very_low', 'low']
 
     # Purely random (but internally consistent) lesion and TZ selection
-    rng = self.np.random.default_rng()
+    rng = self.rng
 
     tz_type = rng.choice(
       ['Type 0', 'Type 1', 'Type 2', 'Type 3'],
@@ -260,8 +282,7 @@ class CerviguardImageAnalyzer(BaseServingProcess):
       p=[0.35, 0.3, 0.2, 0.15]
     )
 
-    base_risks = {'none': 10, 'low': 30, 'moderate': 55, 'high': 75}
-    risk_score = base_risks[lesion_assessment]
+    risk_score = self.base_risks[lesion_assessment]
 
     img_width = image_info.get('width', 0)
     img_height = image_info.get('height', 0)
@@ -269,20 +290,6 @@ class CerviguardImageAnalyzer(BaseServingProcess):
     visualization_limited = tz_type == 'Type 3'
     if tz_type == 'Type 3':
       risk_score = max(risk_score, 40)
-
-    tz_descriptions = {
-      'Type 0': 'Type 0 transformation zone (normal-appearing cervix, no visible lesions).',
-      'Type 1': 'Type 1 transformation zone (fully ectocervical and fully visible).',
-      'Type 2': 'Type 2 transformation zone (partly endocervical but fully visible).',
-      'Type 3': 'Type 3 transformation zone (endocervical and not fully visible).'
-    }
-
-    lesion_text = {
-      'none': 'No significant acetowhite or vascular changes seen.',
-      'low': 'Minor acetowhite changes with regular vascular patterns; low-grade lesion possible.',
-      'moderate': 'Acetowhite epithelium with irregular vessels; moderate-grade lesion suspected.',
-      'high': 'Dense acetowhite areas with atypical vessels; high-grade lesion suspected.'
-    }
 
     if resolution_category in ['very_low', 'low']:
       quality_note = f"Image resolution ({img_width}x{img_height}) limits detailed assessment."
@@ -292,30 +299,15 @@ class CerviguardImageAnalyzer(BaseServingProcess):
       quality_note = f"Image resolution ({img_width}x{img_height}) is optimal for analysis."
 
     if tz_type == 'Type 3':
-      lesion_templates = {
-        'none': 'No obvious ectocervical lesions, but assessment is limited because the transformation zone is not fully visible; colposcopy with endocervical evaluation is recommended.',
-        'low': 'Subtle acetowhite change seen on the ectocervix; Type 3 zone limits visualization—colposcopy/endocervical sampling advised.',
-        'moderate': 'Suspicious acetowhite and vascular changes with a Type 3 zone; colposcopy and endocervical assessment recommended.',
-        'high': 'Marked high-grade features with a Type 3 zone; urgent colposcopy with endocervical evaluation recommended.'
-      }
+      lesion_templates = self.lesion_templates['Type 3']
     elif tz_type == 'Type 0':
-      lesion_templates = {
-        'none': 'No lesions detected; cervix appears normal.',
-        'low': 'Minor findings noted, but overall appearance is normal; routine screening advised.',
-        'moderate': 'Patchy findings with otherwise normal cervix; consider follow-up colposcopy.',
-        'high': 'Focal concerning area despite overall normal appearance; colposcopy recommended.'
-      }
+      lesion_templates = self.lesion_templates['Type 0']
     else:
-      lesion_templates = {
-        'none': f"{lesion_text['none']} Routine screening appropriate.",
-        'low': f"{lesion_text['low']} Follow-up in 6-12 months recommended.",
-        'moderate': f"{lesion_text['moderate']} Colposcopy and biopsy recommended.",
-        'high': f"{lesion_text['high']} Immediate colposcopy and biopsy strongly recommended."
-      }
+      lesion_templates = self.lesion_templates['default']
 
     lesion_summary = " ".join([
-      tz_descriptions.get(tz_type, tz_type),
-      lesion_templates.get(lesion_assessment, lesion_text['none']),
+      self.tz_descriptions.get(tz_type, tz_type),
+      lesion_templates.get(lesion_assessment, self.lesion_text['none']),
       quality_note
     ])
 
@@ -344,7 +336,6 @@ class CerviguardImageAnalyzer(BaseServingProcess):
         List of decoded image arrays
     """
     lst_inputs = inputs.get('DATA', [])
-    serving_params = inputs.get('SERVING_PARAMS', [])
 
     self.P(f"Pre-processing {len(lst_inputs)} input(s)", color='b')
 
@@ -357,15 +348,11 @@ class CerviguardImageAnalyzer(BaseServingProcess):
 
     preprocessed = []
     for i, inp in enumerate(lst_inputs):
-      # Get serving params for this specific input
-      params = serving_params[i] if i < len(serving_params) else {}
-
       # Decode the base64 image
       img_array = self._decode_base64_image(inp)
 
       preprocessed.append({
         'image': img_array,
-        'params': params,
         'index': i,
       })
 
@@ -393,7 +380,6 @@ class CerviguardImageAnalyzer(BaseServingProcess):
     results = []
     for inp_data in inputs:
       img_array = inp_data['image']
-      params = inp_data['params']
       idx = inp_data['index']
 
       if img_array is None:
