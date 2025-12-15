@@ -863,21 +863,13 @@ class _DeeployMixin:
       admin_pwd_name = "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD"
 
       for plugin in prepared_plugins:
-        signature = (
-          plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
-          or plugin.get("SIGNATURE")
-          or plugin.get("signature")
-        )
+        signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
         normalized_signature = str(signature).upper() if signature else None
         if normalized_signature not in target_signatures:
           continue
         # endif signature check
 
-        instances = (
-          plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES)
-          or plugin.get("INSTANCES")
-          or []
-        )
+        instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
         if not isinstance(instances, list) or not instances:
           continue
         # endif instances list
@@ -888,11 +880,7 @@ class _DeeployMixin:
           # endif instance is dict
           env_cfg = instance.get("ENV")
           env_cfg = env_cfg if isinstance(env_cfg, dict) else {}
-          instance_id = (
-            instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-            or instance.get("instance_id")
-            or instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-          )
+          instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
           if not instance_id:
             continue
           # endif instance id
@@ -1500,11 +1488,7 @@ class _DeeployMixin:
       native_plugin = None
 
       for plugin in plugins:
-        signature = (
-          plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
-          or plugin.get("SIGNATURE")
-          or plugin.get("signature")
-        )
+        signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
         if not signature:
           continue
         # endif signature check
@@ -1520,16 +1504,8 @@ class _DeeployMixin:
         return plugins
       # endif both plugin types found
 
-      native_instances = (
-        native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES)
-        or native_plugin.get("INSTANCES")
-        or []
-      )
-      container_instances = (
-        container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES)
-        or container_plugin.get("INSTANCES")
-        or []
-      )
+      native_instances = native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      container_instances = container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
 
       if not isinstance(native_instances, list) or not isinstance(container_instances, list):
         return plugins
@@ -1540,11 +1516,7 @@ class _DeeployMixin:
         if not isinstance(instance, dict):
           continue
         # endif instance is dict
-        instance_id = (
-          instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-          or instance.get("instance_id")
-          or instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-        )
+        instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
         if not instance_id:
           continue
         # endif instance id
