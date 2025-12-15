@@ -73,28 +73,21 @@ class CstoreManagerApiPlugin(BasePlugin):
   #     result = list(_data.keys())
   #   return result
 
-
-  # @BasePlugin.endpoint(method="get", require_token=False) 
-  # def get_status(self):   # /get_status
-  #   """
-  #   Get the current status of the chainstore.
-    
-  #   Returns:
-  #       dict: A dictionary containing the list of all keys currently stored in the chainstore.
-  #   """
-  #   # Log request
-  #   self._log_request_response("GET_STATUS", request_data={})
-    
-  #   data = {
-  #     'keys' : self.__get_keys()
-  #   }
-    
-  #   # Log response
-  #   self._log_request_response("GET_STATUS", response_data=data)
-    
-  #   return data
-  
   ### END DANGER ZONE ###
+
+  @BasePlugin.endpoint(method="get", require_token=False)
+  def get_status(self):   # /get_status
+    """
+    Get the current status of the chainstore API.
+    
+    Returns:
+        dict: A dictionary containing the status information
+    """
+    # Log request
+    self._log_request_response("GET_STATUS", request_data={})
+
+    return {"ok": True, "message": "CStore Manager API is running."}
+  
 
   @BasePlugin.endpoint(method="post", require_token=False)
   def set(self, key: str, value: Any, chainstore_peers: list = None):
