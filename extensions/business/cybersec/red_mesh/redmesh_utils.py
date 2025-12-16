@@ -106,6 +106,7 @@ class PentestLocalWorker(
     worker_target_ports = [p for p in worker_target_ports if p not in exceptions]
     if not worker_target_ports:
       raise ValueError("No ports available for worker after applying exceptions.")
+
     self.initial_ports = list(worker_target_ports)
     # end port handling
 
