@@ -27,7 +27,6 @@ Pipeline config with no serving:
 
 
 from naeural_core.business.base import BasePluginExecutor as BaseClass
-from extensions.business.mixins.chainstore_response_mixin import _ChainstoreResponseMixin
 
 _CONFIG = {
   **BaseClass.CONFIG,
@@ -44,12 +43,10 @@ _CONFIG = {
 
 __VER__ = '0.1.0'
 
-class ASimplePluginPlugin(BaseClass, _ChainstoreResponseMixin):
+class ASimplePluginPlugin(BaseClass):
 
   def on_init(self):
     super().on_init()
-    self._reset_chainstore_response()
-    self._send_chainstore_response()
     return
 
   def process(self):

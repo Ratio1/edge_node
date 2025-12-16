@@ -15,27 +15,6 @@ class _ContainerUtilsMixin:
 
   ### START CONTAINER MIXIN METHODS ###
   
-  def _handle_config_restart(self, restart_callable):
-    """
-    Handle container restart when configuration changes.
-
-    Stops the current container and invokes the provided restart callable
-    to reinitialize with new configuration.
-
-    Parameters
-    ----------
-    restart_callable : callable
-        Function to call after stopping container to perform restart
-
-    Returns
-    -------
-    None
-    """
-    self.P(f"Received an updated config for {self.__class__.__name__}")
-    self._stop_container_and_save_logs_to_disk()
-    restart_callable()
-    return
-  
   def _get_cr_data(self):
     """
     Helper method to extract container registry data from configuration.
@@ -116,6 +95,11 @@ class _ContainerUtilsMixin:
       #              are legacy from the Edge Node environment itself.
     }
 
+    # Add semaphore keys if present
+    semaphored_keys = getattr(self, 'cfg_semaphored_keys', None)
+    if semaphored_keys:
+      dct_env["R1EN_SEMAPHORED_KEYS"] = self.json_dumps(semaphored_keys)
+
     return dct_env
 
   def _get_chainstore_response_data(self):
@@ -153,59 +137,6 @@ class _ContainerUtilsMixin:
     })
 
     return data
-
-  def _maybe_send_plugin_start_confirmation(self):
-    """
-    Send container startup confirmation to chainstore.
-
-    This method now delegates to the generalized _ChainstoreResponseMixin
-    for consistent behavior across all plugins that support chainstore responses.
-
-    The container-specific response data is provided via the
-    _get_chainstore_response_data() override above.
-
-    Migration Note:
-    --------------
-    This replaces the old inline implementation with the mixin-based approach.
-    The new behavior is simpler:
-    - Single write (no retries, no confirmations)
-    - Consistent error handling
-    - Validation logic
-    - Reusability across plugin types
-
-    Usage:
-    ------
-    Call this method after container startup is complete and all relevant
-    attributes (container_id, container_start_time, extra_ports_mapping, etc.)
-    have been set.
-
-    Note: _reset_chainstore_response() should have been called at the START
-    of initialization.
-    """
-    # Delegate to the mixin's implementation
-    # This assumes the plugin class inherits from _ChainstoreResponseMixin
-    if hasattr(self, '_send_chainstore_response'):
-      return self._send_chainstore_response()
-    else:
-      # Fallback for backward compatibility if mixin is not available
-      # This preserves the old behavior (simplified - single write)
-      self.P(
-        "WARNING: _ChainstoreResponseMixin not available, using legacy implementation. "
-        "Consider adding _ChainstoreResponseMixin to the plugin inheritance chain.",
-        color='y'
-      )
-      response_key = getattr(self, 'cfg_chainstore_response_key', None)
-      if response_key is not None:
-        self.P(f"Responding to key {response_key}")
-        response_info = {
-          'container_id': self.container_id,
-          'start_time': self.time_to_str(self.container_start_time),
-          'ports_mapping': self.extra_ports_mapping,
-        }
-        self.P(f"Sending response to {response_key}: {self.json_dumps(response_info)}")
-        self.chainstore_set(response_key, response_info)
-      return
-
 
   def _setup_dynamic_env_var_host_ip(self):
     """
@@ -699,11 +630,35 @@ class _ContainerUtilsMixin:
 
     This method should NOT allocate ports - only format already-allocated ports.
     All port allocations happen in _setup_resource_limits_and_ports.
+
+    Environment variable precedence (later overrides earlier):
+      1. Default env vars (system-provided)
+      2. Dynamic env vars (computed at runtime)
+      3. Semaphore env vars (from paired provider plugins)
+      4. cfg_env (user-configured)
     """
     # Environment variables
     # allow cfg_env to override default env vars
     self.env = self._get_default_env_vars()
     self.env.update(self.dynamic_env)
+
+    # Add environment variables from semaphored paired plugins
+    if hasattr(self, 'semaphore_get_env'):
+      semaphore_env = self.semaphore_get_env()
+      if semaphore_env:
+        log_lines = [
+          "=" * 60,
+          "SEMAPHORE ENV INJECTION",
+          "=" * 60,
+          f"  Adding {len(semaphore_env)} env vars from semaphored plugins:",
+        ]
+        for key, value in semaphore_env.items():
+          log_lines.append(f"    {key} = {value}")
+        log_lines.append("=" * 60)
+        self.Pd("\n".join(log_lines))
+        self.env.update(semaphore_env)
+    # endif semaphore env
+
     if self.cfg_env:
       self.env.update(self.cfg_env)
     if self.dynamic_env:
@@ -792,39 +747,41 @@ class _ContainerUtilsMixin:
       return "error"
 
 
-  def _validate_endpoint_config(self):
+  def _validate_health_endpoint_config(self):
     """
-    Validate endpoint configuration for health checks.
+    Validate health endpoint configuration.
 
     Performs security and format validation on the configured
-    endpoint URL.
+    health endpoint path.
 
     Returns
     -------
     bool
-        True if endpoint configuration is valid, False otherwise
+        True if health endpoint configuration is valid, False otherwise
 
     Notes
     -----
     Validation checks include:
-    - URL is a string
-    - URL starts with '/'
-    - URL does not contain path traversal sequences (..)
+    - Path is a string
+    - Path starts with '/'
+    - Path does not contain path traversal sequences (..)
     """
-    if not hasattr(self, 'cfg_endpoint_url') or not self.cfg_endpoint_url:
+    if not hasattr(self, 'cfg_health_endpoint_path') or not self.cfg_health_endpoint_path:
       return False
 
-    # Basic URL validation
-    if not isinstance(self.cfg_endpoint_url, str):
-      self.P("Endpoint URL must be a string", color='r')
+    path = self.cfg_health_endpoint_path
+
+    # Basic path validation
+    if not isinstance(path, str):
+      self.P("Health endpoint path must be a string", color='r')
       return False
 
-    if not self.cfg_endpoint_url.startswith('/'):
-      self.P("Endpoint URL must start with '/'", color='r')
+    if not path.startswith('/'):
+      self.P("Health endpoint path must start with '/'", color='r')
       return False
 
-    if '..' in self.cfg_endpoint_url:
-      self.P("Endpoint URL contains invalid path traversal", color='r')
+    if '..' in path:
+      self.P("Health endpoint path contains invalid path traversal", color='r')
       return False
 
     return True

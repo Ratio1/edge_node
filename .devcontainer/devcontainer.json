@@ -3,7 +3,8 @@
   "dockerFile" : "Dockerfile",
   // "image": "aidamian/ds101_2024",
 
-
+  "workspaceMount": "source=${localWorkspaceFolder},target=/edge_node,type=bind",
+  "workspaceFolder": "/edge_node",
   
   "runArgs": [
     //"--gpus=all", // Use this option if you have a GPU
@@ -14,9 +15,21 @@
     "r1edge",
 
     "--privileged"
-  ],  
-  
+  ],
+
+
+  "build": {
+    "context": "../",
+  },
+
+
   "customizations": {
+    "jetbrains": {
+      "settings": {
+        "org.jetbrains.plugins.github:app:GithubSettings.clone_git_using_ssh": true,
+        "org.jetbrains.plugins.terminal:app:TerminalOptionsProvider.myShellPath": "C:\\WINDOWS\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"
+      }
+    },
     "vscode" : {
       "extensions": [
         "ms-python.python",

@@ -1,6 +1,6 @@
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.1.0'
+__VER__ = '0.2.0'
 
 MESSAGE_PREFIX = "Please sign this message to manage your tunnels: "
 MESSAGE_PREFIX_DEEPLOY = "Please sign this message for Deeploy: "
@@ -15,6 +15,8 @@ _CONFIG = {
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
 
   'BASE_CLOUDFLARE_URL': 'https://api.cloudflare.com',
+  'TCP_PROXY_URL': 'tcp.ratio1.link',
+  'TCP_PREFIX': 'cft',
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -75,12 +77,14 @@ class TunnelsManagerPlugin(BasePlugin):
           message_prefix=prefix,
           no_hash=True,
           indent=1,
+          raise_if_error=True,
         )
         break
       except Exception as exc:
         signature_errors.append(str(exc))
     if sender is None:
-      raise Exception(f"Signature verification failed for provided payload: {signature_errors}")
+      signature_errors_msg = "\n".join(signature_errors)
+      raise Exception(f"Signature verification failed for provided payload: {signature_errors_msg}")
     secrets = self.chainstore_hget(hkey="tunnels_manager_secrets", key=sender)
     # TODO we should add a CSP password to be used as token in cstore
     if secrets is None:
@@ -120,12 +124,29 @@ class TunnelsManagerPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="post")
-  def new_tunnel(self, alias: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str, cloudflare_domain: str, service_name: str | None = None,):
+  def new_tunnel(self, alias: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str, cloudflare_domain: str, tunnel_type: str = "http", service_name: str | None = None,):
     """
     Create a new Cloudflare tunnel.
+
+    Parameters:
+    - alias: A user-friendly name for the tunnel.
+    - cloudflare_account_id: The Cloudflare account ID.
+    - cloudflare_zone_id: The Cloudflare zone ID.
+    - cloudflare_api_key: The API key for Cloudflare authentication.
+    - cloudflare_domain: The main domain associated with the Cloudflare account.
+    - type: The type of tunnel ("http" or "tcp"). Default is "http".
+    - service_name: Optional service name to prefix the tunnel ID.
     """
+    if tunnel_type not in ["http", "tcp"]:
+      raise Exception("Invalid tunnel type. Must be 'http' or 'tcp'.")
+
     new_uuid = self.uuid()
-    new_id = f"{service_name}-{new_uuid}" if service_name is not None else new_uuid
+    prefixes = []
+    if tunnel_type == "tcp":
+      prefixes.append(self.cfg_tcp_prefix)
+    if service_name is not None:
+      prefixes.append(service_name)
+    new_id = f"{'-'.join(prefixes)}-{new_uuid}" if prefixes else new_uuid
     url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel"
     headers = {
       "Authorization": f"Bearer {cloudflare_api_key}"
@@ -150,6 +171,17 @@ class TunnelsManagerPlugin(BasePlugin):
     }
     dns_record = self.requests.post(url, headers=headers, json=data).json()
 
+    if tunnel_type == "tcp":
+      # For TCP tunnels, we also need to create a CNAME for the public URL
+      public_name = new_id.removeprefix(f"{self.cfg_tcp_prefix}-")
+      data_public = {
+        "type": "CNAME",
+        "proxied": True,
+        "name": public_name,
+        "content": self.cfg_tcp_proxy_url,
+      }
+      dns_record_public = self.requests.post(url, headers=headers, json=data_public).json()
+
     res = self._cloudflare_update_metadata(
       tunnel_id=tunnel_info['result']['id'],
       metadata={
@@ -157,7 +189,10 @@ class TunnelsManagerPlugin(BasePlugin):
         "tunnel_token": tunnel_info['result']['token'],
         "dns_record_id": dns_record['result']['id'],
         "dns_name": f"{new_id}.{cloudflare_domain}",
+        "dns_record_public_id": dns_record_public['result']['id'] if tunnel_type == "tcp" else None,
+        "dns_public_name": f"{public_name}.{cloudflare_domain}",
         "custom_hostnames": [],
+        "type": tunnel_type,
         "creator": "ratio1"
       },
       cloudflare_account_id=cloudflare_account_id,
@@ -225,6 +260,16 @@ class TunnelsManagerPlugin(BasePlugin):
     if response["success"] is False:
       raise Exception("Error deleting DNS record: " + str(response['errors']))
 
+    # Also delete the public DNS record for TCP tunnels
+    if value['metadata'].get('type', 'http') == "tcp":
+      url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records/{value['metadata']['dns_record_public_id']}"
+      headers = {
+        "Authorization": f"Bearer {cloudflare_api_key}"
+      }
+      response = self.requests.delete(url, headers=headers).json()
+      if response["success"] is False:
+        raise Exception("Error deleting public DNS record: " + str(response['errors']))
+
     # Then delete the tunnel
     url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel/{value['id']}"
     headers = {
@@ -250,6 +295,8 @@ class TunnelsManagerPlugin(BasePlugin):
       raise Exception(f"Tunnel {tunnel_id} not found.")
     if hostname in value['metadata']['custom_hostnames']:
       raise Exception(f"Hostname {hostname} already exists for tunnel {tunnel_id}.")
+    if value['metadata'].get('type', 'http') == "tcp":
+      raise Exception("Custom hostnames are not supported for TCP tunnels.")
 
     url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/custom_hostnames"
     headers = {
@@ -330,21 +377,35 @@ class TunnelsManagerPlugin(BasePlugin):
     headers = {
       "Authorization": f"Bearer {cloudflare_api_key}"
     }
+    tunnel_type = value['metadata'].get('type', 'http')
+    prefix = f"{self.cfg_tcp_prefix}-" if tunnel_type == "tcp" else ""
     data = {
       "type": "CNAME",
       "proxied": True,
-      "name": alias,
+      "name": f"{prefix}{alias}",
       "content": f"{value['id']}.cfargotunnel.com",
     }
     dns_record = self.requests.post(url, headers=headers, json=data).json()
     if dns_record["success"] is False:
       raise Exception("Error creating alias: " + str(dns_record['errors']))
 
+    if tunnel_type == "tcp":
+      data_public = {
+        "type": "CNAME",
+        "proxied": True,
+        "name": alias,
+        "content": self.cfg_tcp_proxy_url,
+      }
+      dns_record_public = self.requests.post(url, headers=headers, json=data_public).json()
+      if dns_record_public["success"] is False:
+        raise Exception("Error creating public alias: " + str(dns_record_public['errors']))
+
     if 'aliases' not in value['metadata']:
       value['metadata']['aliases'] = []
     value['metadata']['aliases'].append({
       "id": dns_record['result']['id'],
-      "name": alias
+      "name": alias,
+      "public_id": dns_record_public['result']['id'] if tunnel_type == "tcp" else None,
     })
     self._cloudflare_update_metadata(
       tunnel_id=tunnel_id,
@@ -379,6 +440,15 @@ class TunnelsManagerPlugin(BasePlugin):
     response = self.requests.delete(url, headers=headers).json()
     if response["success"] is False:
       raise Exception("Error deleting alias: " + str(response['errors']))
+    
+    if alias.get('public_id') is not None:
+      url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records/{alias['public_id']}"
+      headers = {
+        "Authorization": f"Bearer {cloudflare_api_key}"
+      }
+      response = self.requests.delete(url, headers=headers).json()
+      if response["success"] is False:
+        raise Exception("Error deleting public alias: " + str(response['errors']))
 
     value['metadata']['aliases'].remove(alias)
     self._cloudflare_update_metadata(

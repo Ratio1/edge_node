@@ -216,10 +216,12 @@ class DeeployManagerApiPlugin(
       discovered_plugin_instances = []
       deployment_nodes = []
       confirmation_nodes = []
+      nodes_changed = False
       deeploy_specs_for_update = None
       if is_create:
         deployment_nodes = self._check_nodes_availability(inputs)
         confirmation_nodes = list(deployment_nodes)
+        nodes_changed = True
       else:
         # Discover the live deployment so we can validate node affinity and reuse existing specs.
         pipeline_context = self._gather_running_pipeline_context(
@@ -304,6 +306,7 @@ class DeeployManagerApiPlugin(
 
         deployment_nodes = list(validated_nodes)
         confirmation_nodes = list(validated_nodes)
+        nodes_changed = set(current_nodes) != set(deployment_nodes)
         discovered_plugin_instances = []
 
       inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_nodes
@@ -340,7 +343,7 @@ class DeeployManagerApiPlugin(
         job_app_type=job_app_type,
       )
       
-      if is_create and str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+      if nodes_changed and str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
         if (dct_status is not None and is_confirmable_job and len(confirmation_nodes) == len(dct_status)) or not is_confirmable_job:
           eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in confirmation_nodes]
           eth_nodes = sorted(eth_nodes)

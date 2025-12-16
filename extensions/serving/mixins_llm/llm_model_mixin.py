@@ -1,4 +1,5 @@
 import torch as th
+import shutil
 
 from transformers import AutoTokenizer as LlmTokenizer
 from transformers import AutoModelForCausalLM as LlmForCausalLM
@@ -136,6 +137,51 @@ class LlmModelMixin(object):
     """
     return LlmForCausalLM.from_pretrained(model_id, **kwargs)
 
+  def safe_load_model(self, load_model_method: callable, model_id: str, model_str_id: str = None):
+    """
+    Safely load the model using the provided loading method.
+    Parameters
+    ----------
+    load_model_method : callable
+        The method to load the model.
+    model_id : str
+        The model identifier
+    model_str_id : str
+        The model identifier for logging
+
+    Returns
+    -------
+    model : _BaseAutoModelClass - the loaded model or raises an exception
+    """
+    res = None
+    if model_str_id is None:
+      model_str_id = model_id
+    # endif model_str_id is None
+    try:
+      res = load_model_method()
+    except OSError as e:
+      msg = str(e)
+      if "Consistency check failed" not in msg:
+        raise e
+      warn_msg = f"[WARN] HF cache seems corrupted for {model_str_id}: {msg}"
+      warn_msg += "\n[WARN] Clearing cached files for this model and retrying download..."
+      self.P(warn_msg)
+      # Hugging Face cache layout: <cache_dir>/models--{org--repo}/...
+      try:
+        if self.cache_dir:
+          current_model_cache_dir = self.os_path.join(
+            self.cache_dir,
+            f"models--{model_id.replace('/', '--')}"
+          )
+          if self.os_path.exists(current_model_cache_dir):
+            shutil.rmtree(current_model_cache_dir, ignore_errors=True)
+          # endif current model cache dir exists)
+      except Exception as cleanup_err:
+        self.P(f"[WARN] Failed to clean model cache: {cleanup_err}")
+      res = load_model_method()
+    # endtry except OSError
+    return res
+
   def _load_model(self):
     """
     Load the model from the given configured model name and set up padding.
@@ -158,7 +204,13 @@ class LlmModelMixin(object):
 
     self.P(f'Trying to load pretrained for {model_id} with the following params:\n {model_params}')
 
-    self.model = self.load_pretrained_model(model_id, **model_params)
+    def load_pretrained_model_alias():
+      return self.load_pretrained_model(model_id, **model_params)
+
+    self.model = self.safe_load_model(
+      load_model_method=load_pretrained_model_alias,
+      model_id=model_id
+    )
     self.model.eval()
 
     compiled = self.cfg_th_compile

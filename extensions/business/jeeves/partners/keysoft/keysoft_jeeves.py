@@ -9,6 +9,10 @@ _CONFIG = {
   "PREDEFINED_DOMAINS": KeysoftJeevesConstants.PREDEFINED_DOMAINS,
   'SHORT_TERM_MEMORY_SIZE': 60,  # in replies (both user and assistant replies are counted)
 
+  # Semaphore key for paired plugin synchronization (e.g., with CAR containers)
+  # When set, this plugin will signal readiness and expose env vars to paired plugins
+  "SEMAPHORE": None,
+
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -18,13 +22,36 @@ _CONFIG = {
 class KeysoftJeevesPlugin(BasePlugin):
   """
   A plugin which handles a Jeeves API web app hosted through FastAPI.
+
+  Supports semaphore-based pairing with Container App Runner plugins via
+  the SEMAPHORE configuration key. When configured, exposes API host/port
+  as environment variables to paired containers.
   """
   CONFIG = _CONFIG
+
 
   def on_init(self):
     super(KeysoftJeevesPlugin, self).on_init()
     self.pdf_parser = PDFParser()
     return
+
+
+  def _setup_semaphore_env(self):
+    """Set semaphore environment variables for paired plugins."""
+    port = getattr(self, 'cfg_port', 15033)
+    localhost_ip = self.log.get_localhost_ip()
+    self.semaphore_set_env('PORT', str(port))
+    self.semaphore_set_env('RATIO1_AGENT_ENDPOINT',
+      'http://{}:{}/query'.format(localhost_ip, port))
+    self.semaphore_set_env('RATIO1_AGENT_UPLOAD_ENDPOINT',
+      'http://{}:{}/upload_document_for_domain_base64'.format(localhost_ip, port))
+    return
+
+
+  def on_close(self):
+    super(KeysoftJeevesPlugin, self).on_close()
+    return
+
 
   def get_predefined_user_tokens(self):
     env_predefined_tokens_str = self.os_environ.get("EE_KEYSOFT_JEEVES_TOKENS") or ""
@@ -458,4 +485,3 @@ class KeysoftJeevesPlugin(BasePlugin):
       domain=domain,
       **kwargs
     )
-

@@ -14,7 +14,9 @@ from naeural_core.main.entrypoint import main
   
 if __name__ == '__main__':  
   mp.set_start_method('spawn') # if moved at import will generate errors in subprocs
-  exit_code, eng = main()
+  exit_code, eng = main(
+    additional_packages=['llama-cpp-python'],
+  )
   
   # TODO: configured with flag in startup
   SYS_EXIT = False 
