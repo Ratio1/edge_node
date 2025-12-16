@@ -122,9 +122,7 @@ class DeeployManagerApiPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
-      apps = self._get_online_apps(owner=sender)
-      
-      # TODO: (Vitalii) filter apps by the sender address (OWNER)
+      apps = self._get_online_apps(owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
       
       result = {
         DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
@@ -206,7 +204,7 @@ class DeeployManagerApiPlugin(
           raise ValueError(msg)
 
       # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
+      is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
       if not is_valid:
         msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
         raise ValueError(msg)
@@ -225,7 +223,7 @@ class DeeployManagerApiPlugin(
       else:
         # Discover the live deployment so we can validate node affinity and reuse existing specs.
         pipeline_context = self._gather_running_pipeline_context(
-          owner=sender,
+          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
           app_id=app_id,
           job_id=job_id,
         )
@@ -277,7 +275,7 @@ class DeeployManagerApiPlugin(
         self._ensure_plugin_instance_ids(
           inputs,
           discovered_plugin_instances=discovered_plugin_instances,
-          owner=sender,
+          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
           app_id=app_id,
           job_id=job_id,
         )
@@ -300,7 +298,7 @@ class DeeployManagerApiPlugin(
         self.delete_pipeline_from_nodes(
           app_id=app_id,
           job_id=job_id,
-          owner=sender,
+          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
           discovered_instances=discovered_plugin_instances,
         )
 
@@ -331,7 +329,7 @@ class DeeployManagerApiPlugin(
       )
 
       dct_status, str_status = self.check_and_deploy_pipelines(
-        sender=sender,
+        owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         inputs=inputs,
         app_id=app_id,
         app_alias=app_alias,
@@ -629,19 +627,19 @@ class DeeployManagerApiPlugin(
       is_confirmable_job = inputs.chainstore_response
 
       # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, sender, is_create=False, debug=self.cfg_deeploy_verbose > 1)
+      is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=False, debug=self.cfg_deeploy_verbose > 1)
       if not is_valid:
         msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
         raise ValueError(msg)
       
-      running_apps_for_job = self._get_online_apps(job_id=job_id, owner=sender)
+      running_apps_for_job = self._get_online_apps(job_id=job_id, owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
 
       # todo: check the count of running workers and compare with the amount of allowed workers count from blockchain.
       
       self.P(f"Discovered running apps for job: {self.json_dumps(running_apps_for_job)}")
 
       if not running_apps_for_job or not len(running_apps_for_job):
-        msg = f"{DEEPLOY_ERRORS.NODES3}: No running workers found for provided job_id and owner '{sender}'."
+        msg = f"{DEEPLOY_ERRORS.NODES3}: No running workers found for provided job_id and owner '{auth_result[DEEPLOY_KEYS.ESCROW_OWNER]}'."
         raise ValueError(msg)
       
       update_nodes = list(running_apps_for_job.keys())
@@ -649,7 +647,7 @@ class DeeployManagerApiPlugin(
       
       dct_status, str_status = self.scale_up_job(new_nodes=new_nodes, 
                                                  update_nodes=update_nodes, 
-                                                 sender=sender, 
+                                                 owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER], 
                                                  job_id=job_id,
                                                  running_apps_for_job=running_apps_for_job)
       
@@ -718,7 +716,7 @@ class DeeployManagerApiPlugin(
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
 
-      discovered_instances = self.delete_pipeline_from_nodes(app_id=app_id, job_id=job_id, owner=sender)
+      discovered_instances = self.delete_pipeline_from_nodes(app_id=app_id, job_id=job_id, owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
       request_payload = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
         DEEPLOY_KEYS.TARGETS: discovered_instances,
@@ -778,7 +776,7 @@ class DeeployManagerApiPlugin(
       # Validate the request fields.
       self._validate_send_instance_command_request(inputs)
 
-      self.send_instance_command_to_nodes(inputs, owner=sender)
+      self.send_instance_command_to_nodes(inputs, owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
 
       result = {
         DEEPLOY_KEYS.REQUEST : {
@@ -831,7 +829,7 @@ class DeeployManagerApiPlugin(
       # Validate the request fields.
       self._validate_send_app_command_request(inputs)
 
-      discovered_pipelines = self.discover_and_send_instance_command(inputs, owner=sender)
+      discovered_pipelines = self.discover_and_send_instance_command(inputs, owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
       targets = []
       for discovered_pipeline in discovered_pipelines:
         targets.append([discovered_pipeline[DEEPLOY_PLUGIN_DATA.NODE],

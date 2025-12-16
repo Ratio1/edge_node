@@ -80,27 +80,11 @@ class _DeeployMixin:
 
   def __check_allowed_wallet(self, inputs):
     sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
-    eth_nodes = self.bc.get_wallet_nodes(sender)
-    if len(eth_nodes) == 0:
-      raise ValueError("No nodes found for wallet {}".format(sender))
-    eth_oracles = self.bc.get_eth_oracles()
-    if len(eth_oracles) == 0:
-      raise ValueError("No oracles found - this is a critical issue!")
-    oracle_found = False
-    wallet_oracles = []
-    wallet_nodes = []
-    for node in eth_nodes:
-      if node in eth_oracles:
-        oracle_found = True
-        wallet_oracles.append(node)
-      else:
-        wallet_nodes.append(node)
-      #endif 
-    #endfor each node
-    if not oracle_found:
-      raise ValueError("No oracles found for wallet {}".format(sender))
-    inputs.wallet_nodes = wallet_nodes
-    inputs.wallet_oracles = wallet_oracles
+    escrow_details = self.bc.get_user_escrow_details(sender)
+    if not escrow_details.get('isActive', False):
+      raise ValueError("Wallet {} has no active escrow".format(sender))
+    inputs.wallet_escrow = escrow_details['escrowAddress']
+    inputs.wallet_escrow_owner = escrow_details['escrowOwner']
     return inputs
 
   def __check_is_oracle(self, inputs):
@@ -112,7 +96,7 @@ class _DeeployMixin:
       raise ValueError("Sender {} is not an oracle".format(sender))
     return True
 
-  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=None, dct_deeploy_specs=None):
+  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, job_app_type=None, dct_deeploy_specs=None):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
@@ -223,7 +207,7 @@ class _DeeployMixin:
           app_alias=app_alias,
           pipeline_type=app_type,
           node_address=addr,
-          owner=sender, 
+          owner=owner, 
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
           is_deeployed=True,
@@ -243,7 +227,7 @@ class _DeeployMixin:
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
     return cleaned_response_keys
 
-  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
+  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
@@ -447,7 +431,7 @@ class _DeeployMixin:
           app_alias=app_alias,
           pipeline_type=app_type,
           node_address=addr,
-          owner=sender,
+          owner=owner,
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
           is_deeployed=True,
@@ -694,7 +678,7 @@ class _DeeployMixin:
     if addr.lower() != sender.lower():
       raise ValueError("Invalid signature: recovered {} != {}".format(addr, sender))
 
-    # Check if the sender is allowed to create pipelines
+    # Check if the sender is allowed to make the request
     if require_sender_is_oracle:
       self.__check_is_oracle(inputs)
     else:
@@ -1098,9 +1082,8 @@ class _DeeployMixin:
     result = {
       DEEPLOY_KEYS.SENDER: sender,
       DEEPLOY_KEYS.NONCE: self.deeploy_get_nonce(inputs.nonce),
-      DEEPLOY_KEYS.SENDER_ORACLES: inputs.wallet_oracles,
-      DEEPLOY_KEYS.SENDER_NODES_COUNT: len(inputs.wallet_nodes),
-      DEEPLOY_KEYS.SENDER_TOTAL_COUNT: len(inputs.wallet_nodes) + len(inputs.wallet_oracles),
+      DEEPLOY_KEYS.SENDER_ESCROW: inputs.wallet_escrow,
+      DEEPLOY_KEYS.ESCROW_OWNER: inputs.wallet_escrow_owner,
     }
     return result
 
@@ -1211,12 +1194,12 @@ class _DeeployMixin:
     return plugins_by_instance_id, plugins_by_signature, new_plugin_configs
   # TODO: END FIXME
 
-  def deeploy_check_payment_and_job_owner(self, inputs, sender, is_create, debug=False):
+  def deeploy_check_payment_and_job_owner(self, inputs, owner, is_create, debug=False):
     """
     Check if the payment is valid for the given job.
     """
     self.Pd(f"=== deeploy_check_payment_and_job_owner ===")
-    self.Pd(f"  sender: {sender}")
+    self.Pd(f"  owner: {owner}")
     self.Pd(f"  is_create: {is_create}")
     self.Pd(f"  debug: {debug}")
 
@@ -1229,7 +1212,7 @@ class _DeeployMixin:
       return True
 
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
-    self.Pd(f"Checking payment for job {job_id} by sender {sender}{' (debug mode)' if debug else ''}")
+    self.Pd(f"Checking payment for job {job_id} by owner {owner}{' (debug mode)' if debug else ''}")
 
     if not job_id:
       self.Pd("  No job_id provided - validation failed")
@@ -1251,8 +1234,8 @@ class _DeeployMixin:
     self.Pd(f"  Job owner: {job_owner}")
     self.Pd(f"  Start timestamp: {start_timestamp}")
 
-    is_valid = (sender == job_owner) if sender and job_owner else False
-    self.Pd(f"  Owner match: {is_valid} (sender={sender}, owner={job_owner})")
+    is_valid = (owner == job_owner) if owner and job_owner else False
+    self.Pd(f"  Owner match: {is_valid} (owner={owner}, job_owner={job_owner})")
 
     if is_create and start_timestamp:
       self.Pd(f"  Job already started (timestamp={start_timestamp}) but is_create=True - invalidating")
@@ -1741,7 +1724,7 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None, dct_deeploy_specs_create=None):
+  def check_and_deploy_pipelines(self, owner, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None, dct_deeploy_specs_create=None):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
@@ -1754,10 +1737,10 @@ class _DeeployMixin:
     # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
     response_keys = {}
     if len(update_nodes) > 0:
-      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs, job_app_type=job_app_type)
+      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, owner, discovered_plugin_instances, dct_deeploy_specs, job_app_type=job_app_type)
       response_keys.update(update_response_keys)
     if len(new_nodes) > 0:
-      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=job_app_type, dct_deeploy_specs=dct_deeploy_specs_create)
+      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, owner, job_app_type=job_app_type, dct_deeploy_specs=dct_deeploy_specs_create)
       response_keys.update(new_response_keys)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
@@ -1770,7 +1753,7 @@ class _DeeployMixin:
 
     return dct_status, str_status
 
-  def scale_up_job(self, new_nodes, update_nodes, job_id, sender, running_apps_for_job):
+  def scale_up_job(self, new_nodes, update_nodes, job_id, owner, running_apps_for_job):
     """
     Scale up the job workers.
     """
@@ -1800,7 +1783,7 @@ class _DeeployMixin:
     # Start pipelines on nodes.
     self._start_create_update_pipelines(create_pipelines=create_pipelines,
                                         update_pipelines=update_pipelines,
-                                        sender=sender)
+                                        owner=owner)
 
     dct_status, str_status = self._get_pipeline_responses(chainstore_response_keys, 300)
 
@@ -2267,7 +2250,7 @@ class _DeeployMixin:
 
     return create_pipelines, update_pipelines, prepared_response_keys
 
-  def _start_create_update_pipelines(self, create_pipelines, update_pipelines, sender):
+  def _start_create_update_pipelines(self, create_pipelines, update_pipelines, owner):
     """
     Start the create and update pipelines.
     """
@@ -2283,7 +2266,7 @@ class _DeeployMixin:
         name=pipeline['app_id'],
         pipeline_type=pipeline['pipeline_type'],
         node_address=node,
-        owner=sender, 
+        owner=owner, 
         url=pipeline.get('url'),
         plugins=pipeline['plugins'],
         is_deeployed=True,
