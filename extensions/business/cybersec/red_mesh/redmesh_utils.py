@@ -196,7 +196,7 @@ class PentestLocalWorker(
       Worker status including progress and findings.
     """
     completed_tests = self.state.get("completed_tests", [])
-    max_features = len(self.__features) + 1 # +1 from port scanning
+    max_features = len(self.__features) + 3  # +1 port scan, +1 service_info_completed, +1 web_tests_completed
     progress = f"{(len(completed_tests) / max_features) * 100 if self.__features else 0:.1f}%"
     
     dct_status = {
