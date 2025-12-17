@@ -55,6 +55,7 @@ class PentestLocalWorker(
     local_id_prefix : str,
     worker_target_ports=COMMON_PORTS,
     exceptions=None,
+    excluded_features=None,
   ):
     """
     Initialize a pentest worker with target ports and exclusions.
@@ -75,12 +76,16 @@ class PentestLocalWorker(
       Ports assigned to this worker; defaults to common ports.
     exceptions : list[int], optional
       Ports to exclude from scanning.
+    excluded_features: list[str], optional
+      List of feature method names to exclude.
 
     Raises
     ------
     ValueError
       If no ports remain after applying exceptions.
     """
+    if excluded_features is None:
+      excluded_features = []
     if exceptions is None:
       exceptions = []
     self.target = target
@@ -127,7 +132,9 @@ class PentestLocalWorker(
       "done": False,
       "canceled": False,
     }
-    self.__features = self._get_all_features()
+    self.excluded_features = excluded_features or []
+    self.__all_features = self._get_all_features()
+    self.__enabled_features = [f for f in self.__all_features if f not in self.excluded_features]
     self.P("Initialized worker {} on {} ports [{}-{}]...".format(
       self.local_worker_id,
       len(worker_target_ports),
@@ -197,8 +204,8 @@ class PentestLocalWorker(
       Worker status including progress and findings.
     """
     completed_tests = self.state.get("completed_tests", [])
-    max_features = len(self.__features) + 3  # +1 port scan, +1 service_info_completed, +1 web_tests_completed
-    progress = f"{(len(completed_tests) / max_features) * 100 if self.__features else 0:.1f}%"
+    max_features = len(self.__enabled_features) + 3  # +1 port scan, +1 service_info_completed, +1 web_tests_completed
+    progress = f"{(len(completed_tests) / max_features) * 100 if self.__enabled_features else 0:.1f}%"
     
     dct_status = {
       # same data for all workers below
@@ -416,7 +423,7 @@ class PentestLocalWorker(
       return
     self.P(f"Gathering service info for {len(open_ports)} open ports.")
     target = self.target
-    service_info_methods = [method for method in dir(self) if method.startswith("_service_info_")]
+    service_info_methods = [m for m in self.__enabled_features if m.startswith("_service_info_")]
     aggregated_info = []
     for method in service_info_methods:
       func = getattr(self, method)
@@ -463,7 +470,7 @@ class PentestLocalWorker(
       self.state["web_tested"] = True
       return
     result = []
-    web_tests_methods = [method for method in dir(self) if method.startswith("_web_test_")]
+    web_tests_methods = [m for m in self.__enabled_features if m.startswith("_web_test_")]
     for method in web_tests_methods:
       func = getattr(self, method)
       for port in ports_to_test:
