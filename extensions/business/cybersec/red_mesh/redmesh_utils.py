@@ -1,4 +1,5 @@
 import uuid
+import random
 import threading
 import socket
 import json
@@ -47,15 +48,17 @@ class PentestLocalWorker(
   """
 
   def __init__(
-    self, 
-    owner, 
-    target, 
+    self,
+    owner,
+    target,
     job_id : str,
-    initiator : str, 
+    initiator : str,
     local_id_prefix : str,
     worker_target_ports=COMMON_PORTS,
     exceptions=None,
     excluded_features=None,
+    scan_min_delay: float = 0.0,
+    scan_max_delay: float = 0.0,
   ):
     """
     Initialize a pentest worker with target ports and exclusions.
@@ -78,6 +81,10 @@ class PentestLocalWorker(
       Ports to exclude from scanning.
     excluded_features: list[str], optional
       List of feature method names to exclude.
+    scan_min_delay : float, optional
+      Minimum random delay (seconds) between operations (Dune sand walking).
+    scan_max_delay : float, optional
+      Maximum random delay (seconds) between operations (Dune sand walking).
 
     Raises
     ------
@@ -89,6 +96,8 @@ class PentestLocalWorker(
     if exceptions is None:
       exceptions = []
     self.target = target
+    self.scan_min_delay = scan_min_delay
+    self.scan_max_delay = scan_max_delay
     self.job_id = job_id
     self.initiator = initiator
     self.local_worker_id = "RM-{}-{}".format(
@@ -305,6 +314,25 @@ class PentestLocalWorker(
     return self.state["done"] or self.stop_event.is_set()
 
 
+  def _interruptible_sleep(self):
+    """
+    Sleep for a random interval (Dune sand walking), interruptible by stop_event.
+
+    Uses stop_event.wait(timeout) instead of time.sleep() so that stop requests
+    are handled immediately rather than waiting for the sleep to complete.
+
+    Returns
+    -------
+    bool
+      True if stop was requested during sleep (should exit), False otherwise.
+    """
+    if self.scan_max_delay <= 0:
+      return False  # Delays disabled
+    delay = random.uniform(self.scan_min_delay, self.scan_max_delay)
+    # wait() returns True if event is set (stop requested), False on timeout
+    return self.stop_event.wait(timeout=delay)
+
+
   def execute_job(self):
     """
     Run the full pentesting workflow: port scanning, service info gathering,
@@ -382,6 +410,9 @@ class PentestLocalWorker(
     for i, port in enumerate(ports_batch):
       if self.stop_event.is_set():
         return
+      # Dune sand walking - random delay before each port scan
+      if self._interruptible_sleep():
+        return  # Stop was requested during sleep
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(0.3)
       try:
@@ -436,7 +467,10 @@ class PentestLocalWorker(
       method_info = []
       for port in open_ports:
         if self.stop_event.is_set():
-          continue
+          return
+        # Dune sand walking - random delay before each service probe
+        if self._interruptible_sleep():
+          return  # Stop was requested during sleep
         info = func(target, port)
         if port not in self.state["service_info"]:
           self.state["service_info"][port] = {}
@@ -481,7 +515,10 @@ class PentestLocalWorker(
       func = getattr(self, method)
       for port in ports_to_test:
         if self.stop_event.is_set():
-          return      
+          return
+        # Dune sand walking - random delay before each web test
+        if self._interruptible_sleep():
+          return  # Stop was requested during sleep
         iter_result = func(target, port)
         if iter_result:
           result.append(f"{method}:{port} {iter_result}")
