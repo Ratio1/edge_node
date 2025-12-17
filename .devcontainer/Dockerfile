@@ -43,7 +43,7 @@ RUN set -eux; \
 # COPY ./cmds /usr/local/bin/
 # RUN chmod +x /usr/local/bin/*
 
-RUN npm install -g npm@latest @openai/codex
+RUN npm install -g @openai/codex
 
 WORKDIR /edge_node
 #COPY . .

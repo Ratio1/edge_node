@@ -64,6 +64,12 @@ _CONFIG = {
   # AI Engine for image processing
   'AI_ENGINE': 'CERVIGUARD_IMAGE_ANALYZER',
 
+  # Semaphore key for paired plugin synchronization (e.g., with WAR containers)
+  # When set, this plugin will signal readiness and expose env vars to paired plugins
+  "SEMAPHORE": None,
+
+  "VERBOSE": 10,
+
   'VALIDATION_RULES': {
     **FastApiWebAppPlugin.CONFIG['VALIDATION_RULES'],
     'REQUEST_TIMEOUT': {
@@ -90,6 +96,30 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
 
   CONFIG = _CONFIG
 
+  def Pd(self, s, *args, score=-1, **kwargs):
+    """
+    Print debug message if verbosity level allows.
+
+    Parameters
+    ----------
+    s : str
+        Message to print
+    score : int, optional
+        Verbosity threshold (default: -1). Message prints if cfg_verbose > score
+    *args
+        Additional positional arguments passed to P()
+    **kwargs
+        Additional keyword arguments passed to P()
+
+    Returns
+    -------
+    None
+    """
+    if self.cfg_verbose > score:
+      s = "[DEBUG] " + s
+      self.P(s, *args, **kwargs)
+    return
+
   def on_init(self):
     super(LocalServingApiPlugin, self).on_init()
     # Initialize request tracking
@@ -101,6 +131,23 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     self.P(f"  AI Engine: {self.cfg_ai_engine}", color='g')
     self.P(f"  Loopback key: loopback_dct_{self._stream_id}", color='g')
     return
+
+
+  def _setup_semaphore_env(self):
+    """Set semaphore environment variables for bundled plugins."""
+    localhost_ip = self.log.get_localhost_ip()
+    port = self.cfg_port
+    self.semaphore_set_env('API_HOST', localhost_ip)
+    if port:
+      self.semaphore_set_env('API_PORT', str(port))
+      self.semaphore_set_env('API_URL', 'http://{}:{}'.format(localhost_ip, port))
+    return
+
+
+  def on_close(self):
+    super(LocalServingApiPlugin, self).on_close()
+    return
+
 
   def _get_payload_field(self, data: dict, key: str, default=None):
     if not isinstance(data, dict):

@@ -80,27 +80,11 @@ class _DeeployMixin:
 
   def __check_allowed_wallet(self, inputs):
     sender = inputs.get(BASE_CT.BCctbase.ETH_SENDER)
-    eth_nodes = self.bc.get_wallet_nodes(sender)
-    if len(eth_nodes) == 0:
-      raise ValueError("No nodes found for wallet {}".format(sender))
-    eth_oracles = self.bc.get_eth_oracles()
-    if len(eth_oracles) == 0:
-      raise ValueError("No oracles found - this is a critical issue!")
-    oracle_found = False
-    wallet_oracles = []
-    wallet_nodes = []
-    for node in eth_nodes:
-      if node in eth_oracles:
-        oracle_found = True
-        wallet_oracles.append(node)
-      else:
-        wallet_nodes.append(node)
-      #endif 
-    #endfor each node
-    if not oracle_found:
-      raise ValueError("No oracles found for wallet {}".format(sender))
-    inputs.wallet_nodes = wallet_nodes
-    inputs.wallet_oracles = wallet_oracles
+    escrow_details = self.bc.get_user_escrow_details(sender)
+    if not escrow_details.get('isActive', False):
+      raise ValueError("Wallet {} has no active escrow".format(sender))
+    inputs.wallet_escrow = escrow_details['escrowAddress']
+    inputs.wallet_escrow_owner = escrow_details['escrowOwner']
     return inputs
 
   def __check_is_oracle(self, inputs):
@@ -112,11 +96,15 @@ class _DeeployMixin:
       raise ValueError("Sender {} is not an oracle".format(sender))
     return True
 
-  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=None, dct_deeploy_specs=None):
+  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, job_app_type=None, dct_deeploy_specs=None):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
     plugins = self.deeploy_prepare_plugins(inputs)
+    plugins = self._ensure_runner_cstore_auth_env(
+      app_id=app_id,
+      prepared_plugins=plugins,
+    )
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
     project_id = inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
     job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
@@ -166,6 +154,12 @@ class _DeeployMixin:
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
+    plugins = self._autowire_native_container_semaphore(
+      app_id=app_id,
+      plugins=plugins,
+      job_app_type=detected_job_app_type,
+    )
+
     node_plugins_by_addr = {}
     for addr in nodes:
       # Nodes to peer with for CHAINSTORE
@@ -213,7 +207,7 @@ class _DeeployMixin:
           app_alias=app_alias,
           pipeline_type=app_type,
           node_address=addr,
-          owner=sender, 
+          owner=owner, 
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
           is_deeployed=True,
@@ -233,7 +227,7 @@ class _DeeployMixin:
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
     return cleaned_response_keys
 
-  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
+  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
@@ -376,6 +370,13 @@ class _DeeployMixin:
           )
           plugins_by_node[addr].append(prepared_plugin)
 
+    for addr, node_plugins in plugins_by_node.items():
+      plugins_by_node[addr] = self._autowire_native_container_semaphore(
+        app_id=app_id,
+        plugins=node_plugins,
+        job_app_type=detected_job_app_type,
+      )
+
     pipeline_to_save = None
     node_plugins_ready = {}
     for addr, plugins in plugins_by_node.items():
@@ -430,7 +431,7 @@ class _DeeployMixin:
           app_alias=app_alias,
           pipeline_type=app_type,
           node_address=addr,
-          owner=sender,
+          owner=owner,
           url=inputs.pipeline_input_uri,
           plugins=node_plugins,
           is_deeployed=True,
@@ -677,7 +678,7 @@ class _DeeployMixin:
     if addr.lower() != sender.lower():
       raise ValueError("Invalid signature: recovered {} != {}".format(addr, sender))
 
-    # Check if the sender is allowed to create pipelines
+    # Check if the sender is allowed to make the request
     if require_sender_is_oracle:
       self.__check_is_oracle(inputs)
     else:
@@ -818,6 +819,69 @@ class _DeeployMixin:
     raise ValueError(
       f"{DEEPLOY_ERRORS.REQUEST3}. Neither 'plugins' array nor 'plugin_signature' provided."
     )
+
+
+  def _ensure_runner_cstore_auth_env(self, app_id, prepared_plugins):
+    """
+    Ensure container/worker runners get default CSTORE auth env vars when missing.
+
+    Parameters
+    ----------
+    app_id : str
+      Pipeline identifier used to build deterministic auth keys.
+    prepared_plugins : list
+      Prepared plugins payload (list of plugin dicts).
+
+    Returns
+    -------
+    list | None
+      Plugins list with injected defaults when applicable.
+    """
+    try:
+      if not app_id or not isinstance(prepared_plugins, list):
+        return prepared_plugins
+
+      target_signatures = set(CONTAINERIZED_APPS_SIGNATURES)
+      hkey_name = "R1EN_CSTORE_AUTH_HKEY"
+      secret_name = "R1EN_CSTORE_AUTH_SECRET"
+      admin_pwd_name = "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD"
+
+      for plugin in prepared_plugins:
+        signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+        normalized_signature = str(signature).upper() if signature else None
+        if normalized_signature not in target_signatures:
+          continue
+        # endif signature check
+
+        instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+        if not isinstance(instances, list) or not instances:
+          continue
+        # endif instances list
+
+        for instance in instances:
+          if not isinstance(instance, dict):
+            continue
+          # endif instance is dict
+          env_cfg = instance.get("ENV")
+          env_cfg = env_cfg if isinstance(env_cfg, dict) else {}
+          instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+          if not instance_id:
+            continue
+          # endif instance id
+          plugin_id = self.sanitize_name(str(instance_id))
+          env_cfg.setdefault(hkey_name, f"{app_id}_{plugin_id}:auth")
+          env_cfg.setdefault(secret_name, self.uuid(8))
+          env_cfg.setdefault(admin_pwd_name, self.uuid(16))
+          # endif set missing creds
+          instance["ENV"] = env_cfg
+        # endfor each instance
+      # endfor each plugin
+
+      return prepared_plugins
+    except Exception as exc:
+      self.Pd(f"Failed to inject CSTORE auth env vars: {exc}", color='y')
+      return prepared_plugins
+
 
   def _ensure_deeploy_specs_job_config(self, deeploy_specs, pipeline_params=None):
     """
@@ -1018,9 +1082,8 @@ class _DeeployMixin:
     result = {
       DEEPLOY_KEYS.SENDER: sender,
       DEEPLOY_KEYS.NONCE: self.deeploy_get_nonce(inputs.nonce),
-      DEEPLOY_KEYS.SENDER_ORACLES: inputs.wallet_oracles,
-      DEEPLOY_KEYS.SENDER_NODES_COUNT: len(inputs.wallet_nodes),
-      DEEPLOY_KEYS.SENDER_TOTAL_COUNT: len(inputs.wallet_nodes) + len(inputs.wallet_oracles),
+      DEEPLOY_KEYS.SENDER_ESCROW: inputs.wallet_escrow,
+      DEEPLOY_KEYS.ESCROW_OWNER: inputs.wallet_escrow_owner,
     }
     return result
 
@@ -1131,12 +1194,12 @@ class _DeeployMixin:
     return plugins_by_instance_id, plugins_by_signature, new_plugin_configs
   # TODO: END FIXME
 
-  def deeploy_check_payment_and_job_owner(self, inputs, sender, is_create, debug=False):
+  def deeploy_check_payment_and_job_owner(self, inputs, owner, is_create, debug=False):
     """
     Check if the payment is valid for the given job.
     """
     self.Pd(f"=== deeploy_check_payment_and_job_owner ===")
-    self.Pd(f"  sender: {sender}")
+    self.Pd(f"  owner: {owner}")
     self.Pd(f"  is_create: {is_create}")
     self.Pd(f"  debug: {debug}")
 
@@ -1149,7 +1212,7 @@ class _DeeployMixin:
       return True
 
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
-    self.Pd(f"Checking payment for job {job_id} by sender {sender}{' (debug mode)' if debug else ''}")
+    self.Pd(f"Checking payment for job {job_id} by owner {owner}{' (debug mode)' if debug else ''}")
 
     if not job_id:
       self.Pd("  No job_id provided - validation failed")
@@ -1171,8 +1234,8 @@ class _DeeployMixin:
     self.Pd(f"  Job owner: {job_owner}")
     self.Pd(f"  Start timestamp: {start_timestamp}")
 
-    is_valid = (sender == job_owner) if sender and job_owner else False
-    self.Pd(f"  Owner match: {is_valid} (sender={sender}, owner={job_owner})")
+    is_valid = (owner == job_owner) if owner and job_owner else False
+    self.Pd(f"  Owner match: {is_valid} (owner={owner}, job_owner={job_owner})")
 
     if is_create and start_timestamp:
       self.Pd(f"  Job already started (timestamp={start_timestamp}) but is_create=True - invalidating")
@@ -1350,6 +1413,112 @@ class _DeeployMixin:
       return JOB_APP_TYPES.GENERIC
 
     return JOB_APP_TYPES.NATIVE
+
+  def _autowire_native_container_semaphore(self, app_id, plugins, job_app_type):
+    """
+    Auto-configure semaphore settings for native + container pairs.
+
+    Parameters
+    ----------
+    app_id : str
+      Application identifier used to build deterministic semaphore keys.
+    plugins : list
+      Prepared plugins payload (expected to be a two-item native/container pair).
+    job_app_type : str
+      Detected job application type.
+
+    Returns
+    -------
+    list
+      Original plugins list, augmented with semaphore wiring when applicable.
+    """
+    try:
+      if job_app_type != JOB_APP_TYPES.NATIVE:
+        return plugins
+      # endif native job app type
+
+      if not isinstance(plugins, list) or len(plugins) != 2:
+        return plugins
+      # endif plugin pair check
+
+      def has_semaphore_config(plugin_list):
+        for plugin in plugin_list:
+          instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+          if not isinstance(instances, list):
+            continue
+          # endif instances is list
+          for instance in instances:
+            if not isinstance(instance, dict):
+              continue
+            # endif instance is dict
+            if "SEMAPHORE" in instance or "SEMAPHORED_KEYS" in instance:
+              return True
+            # endif instance has semaphore config
+          # endfor each instance
+        # endfor each plugin
+        return False
+
+      if has_semaphore_config(plugins):
+        self.Pd("Skipping semaphore autowire; semaphore config already provided.")
+        return plugins
+      # endif skip when provided
+
+      container_plugin = None
+      native_plugin = None
+
+      for plugin in plugins:
+        signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+        if not signature:
+          continue
+        # endif signature check
+        normalized_signature = str(signature).upper()
+        if normalized_signature in CONTAINERIZED_APPS_SIGNATURES:
+          container_plugin = container_plugin or plugin
+        else:
+          native_plugin = native_plugin or plugin
+        # endif signature type
+      # endfor each plugin
+
+      if not container_plugin or not native_plugin:
+        return plugins
+      # endif both plugin types found
+
+      native_instances = native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      container_instances = container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+
+      if not isinstance(native_instances, list) or not isinstance(container_instances, list):
+        return plugins
+      # endif instance lists
+
+      semaphore_keys = []
+      for instance in native_instances:
+        if not isinstance(instance, dict):
+          continue
+        # endif instance is dict
+        instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+        if not instance_id:
+          continue
+        # endif instance id
+        semaphore_key = self.sanitize_name("{}__{}".format(app_id, instance_id))
+        instance["SEMAPHORE"] = semaphore_key
+        semaphore_keys.append(semaphore_key)
+      # endfor each native instance
+
+      if not semaphore_keys:
+        return plugins
+      # endif semaphore keys found
+
+      for instance in container_instances:
+        if not isinstance(instance, dict):
+          continue
+        # endif container instance dict
+        instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
+      # endfor each container instance
+
+      return plugins
+    except Exception as exc:
+      self.Pd(f"Failed to autowire semaphore for native/container pair: {exc}", color='y')
+      return plugins
 
   def deeploy_prepare_single_plugin_instance(self, inputs):
     """
@@ -1555,7 +1724,7 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, sender, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None, dct_deeploy_specs_create=None):
+  def check_and_deploy_pipelines(self, owner, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None, dct_deeploy_specs_create=None):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
     """
@@ -1568,10 +1737,10 @@ class _DeeployMixin:
     # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
     response_keys = {}
     if len(update_nodes) > 0:
-      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, sender, discovered_plugin_instances, dct_deeploy_specs, job_app_type=job_app_type)
+      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, owner, discovered_plugin_instances, dct_deeploy_specs, job_app_type=job_app_type)
       response_keys.update(update_response_keys)
     if len(new_nodes) > 0:
-      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, sender, job_app_type=job_app_type, dct_deeploy_specs=dct_deeploy_specs_create)
+      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, owner, job_app_type=job_app_type, dct_deeploy_specs=dct_deeploy_specs_create)
       response_keys.update(new_response_keys)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
@@ -1584,7 +1753,7 @@ class _DeeployMixin:
 
     return dct_status, str_status
 
-  def scale_up_job(self, new_nodes, update_nodes, job_id, sender, running_apps_for_job):
+  def scale_up_job(self, new_nodes, update_nodes, job_id, owner, running_apps_for_job):
     """
     Scale up the job workers.
     """
@@ -1614,7 +1783,7 @@ class _DeeployMixin:
     # Start pipelines on nodes.
     self._start_create_update_pipelines(create_pipelines=create_pipelines,
                                         update_pipelines=update_pipelines,
-                                        sender=sender)
+                                        owner=owner)
 
     dct_status, str_status = self._get_pipeline_responses(chainstore_response_keys, 300)
 
@@ -2081,7 +2250,7 @@ class _DeeployMixin:
 
     return create_pipelines, update_pipelines, prepared_response_keys
 
-  def _start_create_update_pipelines(self, create_pipelines, update_pipelines, sender):
+  def _start_create_update_pipelines(self, create_pipelines, update_pipelines, owner):
     """
     Start the create and update pipelines.
     """
@@ -2097,7 +2266,7 @@ class _DeeployMixin:
         name=pipeline['app_id'],
         pipeline_type=pipeline['pipeline_type'],
         node_address=node,
-        owner=sender, 
+        owner=owner, 
         url=pipeline.get('url'),
         plugins=pipeline['plugins'],
         is_deeployed=True,

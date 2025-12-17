@@ -52,9 +52,8 @@ class DEEPLOY_KEYS:
   PLUGIN_INSTANCE_ID = "instance_id"
   # Auth result keys
   SENDER = "sender"
-  SENDER_ORACLES = "sender_oracles"
-  SENDER_NODES_COUNT = "sender_nodes_count"
-  SENDER_TOTAL_COUNT = "sender_total_count"
+  SENDER_ESCROW = "sender_escrow"
+  ESCROW_OWNER = "escrow_owner"
 
   # Config keys
   DATE_UPDATED = "date_updated"

@@ -48,10 +48,6 @@ _CONFIG = {
   # Disable image auto-update; Git monitoring drives restarts
   "AUTOUPDATE": False,
 
-  # Application endpoint polling defaults
-  "ENDPOINT_POLL_INTERVAL": 30,
-  "ENDPOINT_URL": None,
-
   # Chainstore response configuration (optional)
   "CHAINSTORE_RESPONSE_KEY": None,
 }
@@ -152,12 +148,21 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     Perform worker-specific initialization.
 
     Ensures repository state is configured before container starts.
+    If SEMAPHORED_KEYS is configured, defers repo state setup until
+    semaphores are ready (called in _collect_exec_commands).
 
     Returns
     -------
     None
     """
     super()._extra_on_init()
+
+    # If we have semaphored keys, defer repo state setup until container launch
+    # (after semaphores are ready). _collect_exec_commands will call _ensure_repo_state().
+    if self._semaphore_get_keys():
+      self.Pd("Deferring _ensure_repo_state() until semaphores are ready")
+      return
+
     self._ensure_repo_state(initial=True)
     return
 

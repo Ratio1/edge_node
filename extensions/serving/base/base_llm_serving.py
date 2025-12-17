@@ -449,6 +449,23 @@ class BaseLlmServing(
     # self.P(f"[DEBUG]Extracted jeeves content for relevance check: {self.shorten_str(jeeves_content)}", color='g')
     return self.check_supported_request_type(message_data=jeeves_content)
 
+  def process_predict_kwargs(self, predict_kwargs: dict):
+    """
+    Utility method for processing predict kwargs.
+    By default, this returns the original predict kwargs, but
+    it can be used in child classes if needed.
+    Parameters
+    ----------
+    predict_kwargs : dict
+      The prediction kwargs
+
+    Returns
+    -------
+    res - dict
+    The processed predict kwargs
+    """
+    return predict_kwargs
+
   def _pre_process(self, inputs):
     """
     Pre-process the inputs for the model.
@@ -549,6 +566,7 @@ class BaseLlmServing(
         'max_new_tokens': max_tokens,
         'repetition_penalty': repetition_penalty,
       }
+      predict_kwargs = self.process_predict_kwargs(predict_kwargs)
 
       if not isinstance(messages, list):
         msg = f"Each input must have a list of messages. Received {type(messages)}: {self.shorten_str(inp)}"

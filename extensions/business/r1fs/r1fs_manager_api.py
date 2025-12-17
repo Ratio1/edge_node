@@ -1,6 +1,8 @@
+from shapely import total_bounds
+
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
-__VER__ = '0.2.2'
+__VER__ = '0.2.3'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -36,65 +38,40 @@ class R1fsManagerApiPlugin(BasePlugin):
     ))
     return
 
+  def Pd(self, s, *args, score=-1, **kwargs):
+    """
+    Print debug message if verbosity level allows.
+
+    Parameters
+    ----------
+    s : str
+        Message to print
+    score : int, optional
+        Verbosity threshold (default: -1). Message prints if cfg_r1fs_verbose > score
+    *args
+        Additional positional arguments passed to P()
+    **kwargs
+        Additional keyword arguments passed to P()
+
+    Returns
+    -------
+    None
+    """
+    if hasattr(self, 'cfg_r1fs_verbose') and self.cfg_r1fs_verbose > score:
+      s = "[DEBUG] " + s
+      self.P(s, *args, **kwargs)
+    return
+
+
   def _log_request_response(self, endpoint_name: str, request_data: dict = None, response_data: dict = None):
     """Helper method to log requests and responses when verbose mode is enabled"""
     if hasattr(self, 'cfg_r1fs_verbose') and self.cfg_r1fs_verbose > 10:
       if request_data is not None:
-        sanitized_request = self._sanitize_payload(request_data)
-        self.P(f"[{endpoint_name}] request: {self.json.dumps(sanitized_request)}", color='c')
+        self.P(f"[{endpoint_name}] request: {self.json.dumps(request_data)}", color='c')
       if response_data is not None:
-        sanitized_response = self._sanitize_payload(response_data)
-        self.P(f"[{endpoint_name}] response: {self.json.dumps(sanitized_response)}", color='g')
-
-  def _sanitize_payload(self, payload, max_length: int = 64, depth: int = 0, key_path: str = ""):
-    """
-    Sanitize payloads before logging to avoid leaking secrets or large contents.
-    """
-    sensitive_tokens = (
-      "secret", "key", "token", "pass", "pwd", "credential", "auth",
-      "signature", "base64", "content", "body", "payload", "data", "yaml",
-      "json", "pickle"
-    )
-
-    if payload is None:
-      return None
-
-    if depth >= 3:
-      return "[truncated]"
-
-    if isinstance(payload, dict):
-      sanitized = {}
-      for key, value in payload.items():
-        child_path = f"{key_path}.{key}" if key_path else str(key)
-        sanitized[key] = self._sanitize_payload(value, max_length, depth + 1, child_path)
-      return sanitized
-
-    if isinstance(payload, (list, tuple, set)):
-      sanitized_iterable = [
-        self._sanitize_payload(value, max_length, depth + 1, f"{key_path}.{idx}")
-        for idx, value in enumerate(payload)
-      ]
-      return sanitized_iterable
-
-    if isinstance(payload, bytes):
-      return f"[bytes len={len(payload)}]"
-
-    if isinstance(payload, str):
-      lower_path = key_path.lower()
-      if any(token in lower_path for token in sensitive_tokens):
-        return "***"
-      if len(payload) > max_length:
-        return f"{payload[:max_length]}... (len={len(payload)})"
-      return payload
-
-    if isinstance(payload, (int, float, bool)):
-      return payload
-
-    if any(token in key_path.lower() for token in sensitive_tokens):
-      return "***"
-
-    return f"[{payload.__class__.__name__}]"
-
+        self.P(f"[{endpoint_name}] response: {self.json.dumps(response_data)}", color='g')
+    # end if
+    return
 
   @BasePlugin.endpoint(method="get", require_token=False)
   def get_status(self):   # /get_status
@@ -104,13 +81,10 @@ class R1fsManagerApiPlugin(BasePlugin):
     Returns:
         dict: IPFS node information including node ID and connection status
     """
-    # Log request
-    self._log_request_response("GET_STATUS", request_data={})
-    
+    start_time = self.time()
     status = self.r1fs.get_ipfs_id_data()
-
-    # Log response
-    self._log_request_response("GET_STATUS", response_data=status)
+    elapsed_time = self.time() - start_time
+    self.Pd(f"R1FS get_status took {elapsed_time:.2f}s")
 
     return status
 
@@ -129,25 +103,16 @@ class R1fsManagerApiPlugin(BasePlugin):
             - secret (str, optional): Encryption key for the file
         secret (str): Encryption key for the file (passed as parameter)
         nonce (int, optional): Nonce value for encryption
-    
+
     Returns:
         dict: Response containing success message and the Content Identifier (CID)
     """
-    # Log request
-    request_data = {
-      'file_path': file_path,
-      'body_json': body_json,
-      'nonce': nonce,
-      'secret': "***" if secret else None,
-    }
-    self._log_request_response("ADD_FILE", request_data=request_data)
-
-    self.P(f"Starting add_file for {file_path}")
+    start_time = self.time()
+    self.Pd(f"Starting add_file for {file_path}")
     body_json = body_json or {}
     if not isinstance(body_json, dict):
       body_json = {}
     secret = body_json.get('secret', None)
-    self.P(f"Secret provided: {'yes' if secret else 'no'}")
 
     cid = self.r1fs.add_file(file_path=file_path, secret=secret, nonce=nonce)
 
@@ -156,9 +121,8 @@ class R1fsManagerApiPlugin(BasePlugin):
       "cid": cid
     }
 
-    # Log response
-    self._log_request_response("ADD_FILE", response_data=data)
-
+    elapsed_time = self.time() - start_time
+    self.Pd(f"R1FS add_file took {elapsed_time:.2f}s")
     return data
 
 
@@ -183,13 +147,8 @@ class R1fsManagerApiPlugin(BasePlugin):
                 - filename: Original filename
     """
     # Log request
-    request_data = {
-      'cid': cid,
-      'secret': "***" if secret else None,
-    }
-    self._log_request_response("GET_FILE", request_data=request_data)
-
-    self.P(f"Retrieving file with CID='{cid}', secret_provided={'yes' if secret else 'no'}")
+    start_time = self.time()
+    self.Pd(f"Retrieving file with CID='{cid}', secret_provided={'yes' if secret else 'no'}")
 
     fn = self.r1fs.get_file(cid=cid, secret=secret)
 
@@ -211,11 +170,8 @@ class R1fsManagerApiPlugin(BasePlugin):
       'meta': meta
     }
 
-    self.P(f"GET_FILE completed, file_path set: {bool(fn)}")
-
-    # Log response
-    self._log_request_response("GET_FILE", response_data=response)
-
+    total_elapsed = self.time() - start_time
+    self.Pd(f"R1FS get_file took {total_elapsed:.2f}s")
     return response
 
 
@@ -237,29 +193,31 @@ class R1fsManagerApiPlugin(BasePlugin):
     Returns:
         dict: Response containing the Content Identifier (CID) of the uploaded file
     """
-    # Log request (truncate base64 string for readability)
-    request_data = {
-      'file_base64_str': file_base64_str[:100] + "..." if len(file_base64_str) > 100 else file_base64_str,
-      'filename': filename,
-      'nonce': nonce,
-      'secret': "***" if secret else None,
-    }
-    self._log_request_response("ADD_FILE_BASE64", request_data=request_data)
+    start_timer = self.time()
 
-    self.P(f"Received base64 payload length={len(file_base64_str) if file_base64_str else 0}")
+    payload_len = (len(file_base64_str) if file_base64_str else 0) / 1024**2
+
+    self.Pd(f"R1FS add_file_base64 payload length={payload_len:.2f} MB.")
     if not filename:
       filename = self.r1fs._get_unique_or_complete_upload_name()
 
+    disk_start = self.time()
     fn = self.diskapi_save_bytes_to_output(data=file_base64_str, filename=filename, from_base64=True)
+    disk_elapsed = self.time() - disk_start
+
+    r1add_start = self.time()
     cid = self.r1fs.add_file(file_path=fn, secret=secret, nonce=nonce)
+    r1add_elapsed = self.time() - r1add_start
+
+    total_elapsed = self.time() - start_timer
+    self.Pd("R1FS add_file_base64 in {:.4f}s (disk_save: {:.4f}s, r1fs add: {:.4f}s)".format(
+      total_elapsed, disk_elapsed, r1add_elapsed
+    ))
 
     data = {
       "cid" : cid
     }
-    
-    # Log response
-    self._log_request_response("ADD_FILE_BASE64", response_data=data)
-    
+
     return data
 
 
@@ -281,16 +239,12 @@ class R1fsManagerApiPlugin(BasePlugin):
             - file_base64_str: Base64-encoded file content
             - filename: Original filename
     """
-    # Log request
-    request_data = {
-      'cid': cid,
-      'secret': "***" if secret else None,
-    }
-    self._log_request_response("GET_FILE_BASE64", request_data=request_data)
+    start_timer = self.time()
 
-    self.P(f"Trying to download file -> {cid}")
+    self.Pd(f"Trying to download file -> {cid}")
     file = self.r1fs.get_file(cid=cid, secret=secret)
-    
+    get_file_elapsed = self.time() - start_timer
+
     if file is None:
       error_msg = f"Failed to retrieve file with CID '{cid}'. The file may not exist or the IPFS download failed."
       self.P(error_msg, color='r')
@@ -299,25 +253,27 @@ class R1fsManagerApiPlugin(BasePlugin):
         'file_base64_str': None,
         'filename': None
       }
-    
+
+
     file = file.replace("/edge_node", ".") if file else file
     filename = file.split('/')[-1] if file else None
-    self.P(f"File retrieved: {file}")
+    self.Pd(f"File retrieved: {file}")
+
+    disk_read_start = self.time()
     file_base64 = self.diskapi_load_r1fs_file(file, verbose=True, to_base64=True)
-    self.P(f"Encoded payload length={len(file_base64) if file_base64 else 0}")
+    disk_read_elapsed = self.time() - disk_read_start
+
+    self.Pd(f"Encoded payload length={len(file_base64) if file_base64 else 0}")
 
     data = {
       "file_base64_str": file_base64,
       "filename": filename
     }
-    
-    # Log response (truncate base64 string for readability)
-    response_data = {
-      "file_base64_str": file_base64[:100] + "..." if len(file_base64) > 100 else file_base64,
-      "filename": filename
-    }
-    self._log_request_response("GET_FILE_BASE64", response_data=response_data)
-    
+
+    total_elapsed = self.time() - start_timer
+    self.Pd("R1FS get_file_base64 in {:.4f}s (r1fs get: {:.4f}s, disk read: {:.4f}s)".format(
+      total_elapsed, get_file_elapsed, disk_read_elapsed
+    ))
     return data
 
 
@@ -340,28 +296,18 @@ class R1fsManagerApiPlugin(BasePlugin):
         dict: Response containing the Content Identifier (CID) of the stored YAML:
             - cid: Content Identifier of the uploaded YAML file
     """
-    # Log request
-    request_data = {
-      'data': data,
-      'fn': fn,
-      'nonce': nonce,
-      'secret': "***" if secret else None,
-    }
-    self._log_request_response("ADD_YAML", request_data=request_data)
-
-    yaml_keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
-    self.P(f"Adding YAML payload with keys={yaml_keys}, secret_provided={'yes' if secret else 'no'}", color='g')
+    start_time = self.time()
 
     cid = self.r1fs.add_yaml(data=data, fn=fn, secret=secret)
-    self.P(f"Cid='{cid}'")
+    self.Pd(f"Cid='{cid}'")
 
     data = {
       "cid" : cid
     }
-    
-    # Log response
-    self._log_request_response("ADD_YAML", response_data=data)
-    
+
+    elapsed_time = self.time() - start_time
+    self.Pd(f"R1FS add_yaml took {elapsed_time:.4f} seconds")
+
     return data
 
 
@@ -383,28 +329,27 @@ class R1fsManagerApiPlugin(BasePlugin):
             - file_data: Parsed YAML content as a Python dictionary
         str: Error message if the file is not a valid YAML file
     """
-    # Log request
-    request_data = {
-      'cid': cid,
-      'secret': "***" if secret else None,
-    }
-    self._log_request_response("GET_YAML", request_data=request_data)
-
-    self.P(f"Retrieving YAML with CID='{cid}', secret_provided={'yes' if secret else 'no'}")
+    total_elapsed, get_file_elapsed, disk_read_elapsed = 0.0, 0.0, 0.0
+    start_time = self.time()
+    self.Pd(f"Retrieving YAML with CID='{cid}', secret_provided={'yes' if secret else 'no'}")
 
     fn = self.r1fs.get_file(cid=cid, secret=secret)
-    self.P(f"Retrieved file path: {fn}")
-    
+    self.Pd(f"Retrieved file path: {fn}")
+    get_file_elapsed = self.time() - start_time
+
     if fn is None:
       error_msg = f"Failed to retrieve file with CID '{cid}'. The file may not exist or the IPFS download failed."
       self.P(error_msg, color='r')
       self._log_request_response("GET_YAML", response_data={'error': error_msg})
       return {'error': error_msg}
-    
+
+    # Transform absolute path to relative path for diskapi functions
+    fn = fn.replace("/edge_node", ".") if fn else fn
+
     if fn.endswith('.yaml') or fn.endswith('.yml'):
+      disk_read_start = self.time()
       file_data = self.diskapi_load_yaml(fn, verbose=False)
-      summary = list(file_data.keys()) if isinstance(file_data, dict) else type(file_data).__name__
-      self.P(f"Parsed YAML payload summary: {summary}")
+      disk_read_elapsed = self.time() - disk_read_start
 
     else:
       self.P(f"Error retrieving file: {fn}")
@@ -415,14 +360,12 @@ class R1fsManagerApiPlugin(BasePlugin):
     data = {
       "file_data" : file_data
     }
-    
-    # Log response
-    response_summary = {
-      'file_data_type': type(file_data).__name__,
-      'file_data_keys': list(file_data.keys()) if isinstance(file_data, dict) else None
-    }
-    self._log_request_response("GET_YAML", response_data=response_summary)
-    
+
+    total_elapsed = self.time() - start_time
+
+    self.Pd("R1FS get_yaml in {:.2f}s (r1fs get: {:.2f}s, disk read: {:.2f}s)".format(
+      total_elapsed, get_file_elapsed, disk_read_elapsed
+    ))
     return data
 
 
@@ -445,26 +388,15 @@ class R1fsManagerApiPlugin(BasePlugin):
         dict: Response containing the Content Identifier (CID) of the stored JSON:
             - cid: Content Identifier of the uploaded JSON file
     """
-    # Log request
-
-    request_data = {
-      'data': data,
-      'fn': fn,
-      'nonce': nonce,
-      'secret': "***" if secret else None,
-    }
-    self._log_request_response("ADD_JSON", request_data=request_data)
-
+    start_time = self.time()
     cid = self.r1fs.add_json(data=data, fn=fn, secret=secret, nonce=nonce)
     self.P(f"Cid='{cid}'")
 
     data = {
       "cid" : cid
     }
-    
-    # Log response
-    self._log_request_response("ADD_JSON", response_data=data)
-    
+    elapsed_time = self.time() - start_time
+    self.Pd(f"R1FS add_json took {elapsed_time:.2f} s")
     return data
 
 
@@ -487,25 +419,16 @@ class R1fsManagerApiPlugin(BasePlugin):
         dict: Response containing the Content Identifier (CID) of the stored pickle:
             - cid: Content Identifier of the uploaded pickle file
     """
-    # Log request
-    request_data = {
-      'data': data,
-      'fn': fn,
-      'nonce': nonce,
-      'secret': "***" if secret else None,
-    }
-    self._log_request_response("ADD_PICKLE", request_data=request_data)
-
+    start_time = self.time()
     cid = self.r1fs.add_pickle(data=data, fn=fn, secret=secret, nonce=nonce)
-    self.P(f"Cid='{cid}'")
+    self.Pd(f"Cid='{cid}'")
 
     data = {
       "cid" : cid
     }
-    
-    # Log response
-    self._log_request_response("ADD_PICKLE", response_data=data)
-    
+
+    elapsed_time = self.time() - start_time
+    self.Pd(f"R1FS add_pickle took {elapsed_time:.4f}")
     return data
 
 
@@ -528,6 +451,7 @@ class R1fsManagerApiPlugin(BasePlugin):
         dict: Response containing the calculated Content Identifier (CID):
             - cid: Content Identifier that would be generated for this JSON data
     """
+    start_time = self.time()
     # Log request
     request_data = {
       'data': data,
@@ -538,7 +462,7 @@ class R1fsManagerApiPlugin(BasePlugin):
     self._log_request_response("CALCULATE_JSON_CID", request_data=request_data)
 
     cid = self.r1fs.calculate_json_cid(data=data, nonce=nonce, fn=fn, secret=secret)
-    self.P(f"Calculated Cid='{cid}'")
+    self.Pd(f"Calculated Cid='{cid}'")
 
     data = {
       "cid" : cid
@@ -546,7 +470,8 @@ class R1fsManagerApiPlugin(BasePlugin):
     
     # Log response
     self._log_request_response("CALCULATE_JSON_CID", response_data=data)
-    
+    elapsed_time = self.time() - start_time
+    self.Pd(f"R1FS calculate_json_cid took {elapsed_time:.2f}s")
     return data
 
 
@@ -569,6 +494,7 @@ class R1fsManagerApiPlugin(BasePlugin):
         dict: Response containing the calculated Content Identifier (CID):
             - cid: Content Identifier that would be generated for this pickle data
     """
+    start_time = self.time()
     # Log request
     request_data = {
       'data': data,
@@ -579,7 +505,7 @@ class R1fsManagerApiPlugin(BasePlugin):
     self._log_request_response("CALCULATE_PICKLE_CID", request_data=request_data)
 
     cid = self.r1fs.calculate_pickle_cid(data=data, nonce=nonce, fn=fn, secret=secret)
-    self.P(f"Calculated Cid='{cid}'")
+    self.Pd(f"Calculated Cid='{cid}'")
 
     data = {
       "cid" : cid
@@ -587,7 +513,8 @@ class R1fsManagerApiPlugin(BasePlugin):
     
     # Log response
     self._log_request_response("CALCULATE_PICKLE_CID", response_data=data)
-    
+    elapsed = self.time() - start_time
+    self.Pd(f"R1FS calculate_pickle_cid took {elapsed:.2f}s")
     return data
 
 
@@ -617,16 +544,8 @@ class R1fsManagerApiPlugin(BasePlugin):
             - message: Status message
             - cid: The CID that was deleted
     """
-    # Log request
-    request_data = {
-      'cid': cid,
-      'unpin_remote': unpin_remote,
-      'run_gc': run_gc,
-      'cleanup_local_files': cleanup_local_files
-    }
-    self._log_request_response("DELETE_FILE", request_data=request_data)
-
-    self.P(f"Deleting file with CID='{cid}', unpin_remote={unpin_remote}, run_gc={run_gc}")
+    start_time = self.time()
+    self.Pd(f"Deleting file with CID='{cid}', unpin_remote={unpin_remote}, run_gc={run_gc}")
 
     success = self.r1fs.delete_file(
       cid=cid,
@@ -639,7 +558,7 @@ class R1fsManagerApiPlugin(BasePlugin):
 
     if success:
       message = f"File {cid} deleted successfully"
-      self.P(message, color='g')
+      self.Pd(message)
     else:
       message = f"Failed to delete file {cid}"
       self.P(message, color='r')
@@ -650,8 +569,9 @@ class R1fsManagerApiPlugin(BasePlugin):
       "cid": cid
     }
 
-    # Log response
-    self._log_request_response("DELETE_FILE", response_data=response)
+    elapsed_time = self.time() - start_time
+
+    self.Pd(f"R1FS delete_file took {elapsed_time:.4f} seconds")
 
     return response
 
@@ -685,16 +605,8 @@ class R1fsManagerApiPlugin(BasePlugin):
             - success_count: Number of successful deletions
             - failed_count: Number of failed deletions
     """
-    # Log request
-    request_data = {
-      'cids': cids,
-      'unpin_remote': unpin_remote,
-      'run_gc_after_all': run_gc_after_all,
-      'cleanup_local_files': cleanup_local_files
-    }
-    self._log_request_response("DELETE_FILES", request_data=request_data)
-
-    self.P(f"Bulk deleting {len(cids)} files, unpin_remote={unpin_remote}, run_gc_after_all={run_gc_after_all}")
+    start_time = self.time()
+    self.Pd(f"Bulk deleting {len(cids)} files, unpin_remote={unpin_remote}, run_gc_after_all={run_gc_after_all}")
 
     result = self.r1fs.delete_files(
       cids=cids,
@@ -704,9 +616,9 @@ class R1fsManagerApiPlugin(BasePlugin):
       show_logs=True,
       raise_on_error=False
     )
+    elapsed_time = self.time() - start_time
 
-    # Log response
-    self._log_request_response("DELETE_FILES", response_data=result)
+    self.Pd(f"R1FS delete_files took {elapsed_time:.4f} seconds")
 
     return result
 
