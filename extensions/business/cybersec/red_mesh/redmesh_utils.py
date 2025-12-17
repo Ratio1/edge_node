@@ -6,6 +6,7 @@ import json
 import ftplib
 import requests
 import traceback
+import time
 
 from copy import deepcopy
 
@@ -316,21 +317,20 @@ class PentestLocalWorker(
 
   def _interruptible_sleep(self):
     """
-    Sleep for a random interval (Dune sand walking), interruptible by stop_event.
-
-    Uses stop_event.wait(timeout) instead of time.sleep() so that stop requests
-    are handled immediately rather than waiting for the sleep to complete.
+    Sleep for a random interval (Dune sand walking).
 
     Returns
     -------
     bool
-      True if stop was requested during sleep (should exit), False otherwise.
+      True if stop was requested (should exit), False otherwise.
     """
     if self.scan_max_delay <= 0:
       return False  # Delays disabled
     delay = random.uniform(self.scan_min_delay, self.scan_max_delay)
-    # wait() returns True if event is set (stop requested), False on timeout
-    return self.stop_event.wait(timeout=delay)
+    self.P(f"[DUNE] Sleeping {delay:.2f}s (min={self.scan_min_delay}, max={self.scan_max_delay})")
+    time.sleep(delay)
+    # Check if stop was requested during sleep
+    return self.stop_event.is_set()
 
 
   def execute_job(self):
