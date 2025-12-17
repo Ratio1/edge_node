@@ -57,7 +57,7 @@ class R1fsManagerApiPlugin(BasePlugin):
     -------
     None
     """
-    if self.cfg_car_verbose > score:
+    if hasattr(self, 'cfg_r1fs_verbose') and self.cfg_r1fs_verbose > score:
       s = "[DEBUG] " + s
       self.P(s, *args, **kwargs)
     return
@@ -103,7 +103,7 @@ class R1fsManagerApiPlugin(BasePlugin):
             - secret (str, optional): Encryption key for the file
         secret (str): Encryption key for the file (passed as parameter)
         nonce (int, optional): Nonce value for encryption
-    
+
     Returns:
         dict: Response containing success message and the Content Identifier (CID)
     """
