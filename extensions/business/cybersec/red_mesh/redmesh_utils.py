@@ -55,9 +55,10 @@ class PentestLocalWorker(
     job_id : str,
     initiator : str,
     local_id_prefix : str,
-    worker_target_ports=COMMON_PORTS,
+    worker_target_ports=None,
     exceptions=None,
     excluded_features=None,
+    enabled_features=None,
     scan_min_delay: float = 0.0,
     scan_max_delay: float = 0.0,
   ):
@@ -82,6 +83,8 @@ class PentestLocalWorker(
       Ports to exclude from scanning.
     excluded_features: list[str], optional
       List of feature method names to exclude.
+    enabled_features: list[str], optional
+      List of feature method names to enable (overrides exclusions).
     scan_min_delay : float, optional
       Minimum random delay (seconds) between operations (Dune sand walking).
     scan_max_delay : float, optional
@@ -92,20 +95,28 @@ class PentestLocalWorker(
     ValueError
       If no ports remain after applying exceptions.
     """
+    if worker_target_ports is None:
+      worker_target_ports = COMMON_PORTS
     if excluded_features is None:
       excluded_features = []
+    if enabled_features is None:
+      enabled_features = []
     if exceptions is None:
       exceptions = []
+
     self.target = target
-    self.scan_min_delay = scan_min_delay
-    self.scan_max_delay = scan_max_delay
     self.job_id = job_id
     self.initiator = initiator
     self.local_worker_id = "RM-{}-{}".format(
       local_id_prefix, str(uuid.uuid4())[:4]
     )
     self.owner = owner
+    self.scan_min_delay = scan_min_delay
+    self.scan_max_delay = scan_max_delay
 
+    self.P(f"Initializing pentest worker {self.local_worker_id} for target {self.target}...")
+    self.P(f"Ports to scan before exceptions: {worker_target_ports}")
+    # self.P(f"Exceptions}")
     # port handling
     if exceptions:
       self.P("Given exceptions: {}".format(exceptions))
@@ -142,9 +153,10 @@ class PentestLocalWorker(
       "done": False,
       "canceled": False,
     }
-    self.excluded_features = excluded_features or []
     self.__all_features = self._get_all_features()
-    self.__enabled_features = [f for f in self.__all_features if f not in self.excluded_features]
+
+    self.__excluded_features = excluded_features
+    self.__enabled_features = enabled_features
     self.P("Initialized worker {} on {} ports [{}-{}]...".format(
       self.local_worker_id,
       len(worker_target_ports),
@@ -329,6 +341,7 @@ class PentestLocalWorker(
     delay = random.uniform(self.scan_min_delay, self.scan_max_delay)
     self.P(f"[DUNE] Sleeping {delay:.2f}s (min={self.scan_min_delay}, max={self.scan_max_delay})")
     time.sleep(delay)
+    # TODO: while elapsed < delay with sleep(0.1) could be used for more granular interruptible sleep
     # Check if stop was requested during sleep
     return self.stop_event.is_set()
 
@@ -410,9 +423,6 @@ class PentestLocalWorker(
     for i, port in enumerate(ports_batch):
       if self.stop_event.is_set():
         return
-      # Dune sand walking - random delay before each port scan
-      if self._interruptible_sleep():
-        return  # Stop was requested during sleep
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(0.3)
       try:
@@ -425,8 +435,9 @@ class PentestLocalWorker(
       finally:
         sock.close()
       # endtry
-      self.state["ports_scanned"].append(port)    
-      self.state["ports_to_scan"].remove(port)  
+      self.state["ports_scanned"].append(port)
+      self.state["ports_to_scan"].remove(port)
+
       if ((i + 1) % REGISTER_PROGRESS_EACH) == 0:
         scan_ports_step_progress = (i + 1) / nr_ports * 100
         str_progress = f"{scan_ports_step_progress:.0f}%"
@@ -435,6 +446,12 @@ class PentestLocalWorker(
         self.state["completed_tests"] = [f"scan_ports_step_{str_progress}"]
         if show_progress:
           self.P(f"Port scanning progress on {target}: {str_progress}")
+
+      # Dune sand walking - random delay after each port scan
+      if self._interruptible_sleep():
+        # TODO: LOGGING "returning early from loop 5/300 iteration"
+        return  # Stop was requested during sleep
+    #end for each port
 
     left_ports = self.state["ports_to_scan"]
     if not left_ports:
@@ -468,21 +485,25 @@ class PentestLocalWorker(
       for port in open_ports:
         if self.stop_event.is_set():
           return
-        # Dune sand walking - random delay before each service probe
-        if self._interruptible_sleep():
-          return  # Stop was requested during sleep
         info = func(target, port)
         if port not in self.state["service_info"]:
           self.state["service_info"][port] = {}
         self.state["service_info"][port][method] = info
         if info is not None:
           method_info.append(f"{method}: {port}: {info}")
+
+        # Dune sand walking - random delay before each service probe
+        if self._interruptible_sleep():
+          return  # Stop was requested during sleep
+      #end for each port of current method
+
       if method_info:
         aggregated_info.extend(method_info)
         self.P(
           f"Method {method} findings:\n{json.dumps(method_info, indent=2)}"
         )
       self.state["completed_tests"].append(method)
+    # end for each method
     return aggregated_info
 
 
@@ -516,15 +537,16 @@ class PentestLocalWorker(
       for port in ports_to_test:
         if self.stop_event.is_set():
           return
-        # Dune sand walking - random delay before each web test
-        if self._interruptible_sleep():
-          return  # Stop was requested during sleep
         iter_result = func(target, port)
         if iter_result:
           result.append(f"{method}:{port} {iter_result}")
         if port not in self.state["web_tests_info"]:
           self.state["web_tests_info"][port] = {}
         self.state["web_tests_info"][port][method] = iter_result
+
+        # Dune sand walking - random delay before each web test
+        if self._interruptible_sleep():
+          return  # Stop was requested during sleep
       # end for each port of current method
       self.state["completed_tests"].append(method) # register completed method for port    
     # end for each method
