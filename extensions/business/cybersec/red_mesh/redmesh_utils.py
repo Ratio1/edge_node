@@ -337,7 +337,6 @@ class PentestLocalWorker(
     if self.scan_max_delay <= 0:
       return False  # Delays disabled
     delay = random.uniform(self.scan_min_delay, self.scan_max_delay)
-    self.P(f"[DUNE] Sleeping {delay:.2f}s (min={self.scan_min_delay}, max={self.scan_max_delay})")
     time.sleep(delay)
     # TODO: while elapsed < delay with sleep(0.1) could be used for more granular interruptible sleep
     # Check if stop was requested during sleep
