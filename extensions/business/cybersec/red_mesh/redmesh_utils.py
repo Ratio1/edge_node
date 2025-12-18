@@ -115,8 +115,6 @@ class PentestLocalWorker(
     self.scan_max_delay = scan_max_delay
 
     self.P(f"Initializing pentest worker {self.local_worker_id} for target {self.target}...")
-    self.P(f"Ports to scan before exceptions: {worker_target_ports}")
-    # self.P(f"Exceptions}")
     # port handling
     if exceptions:
       self.P("Given exceptions: {}".format(exceptions))
