@@ -2065,7 +2065,7 @@ class ContainerAppRunnerPlugin(
 
     self.P(log_str)
 
-    nano_cpu_limit = self._cpu_limit * 1_000_000_000
+    nano_cpu_limit = int(self._cpu_limit * 1_000_000_000)
     mem_reservation = f"{parse_memory_to_mb(self._mem_limit, 0.9)}m"
 
     run_kwargs = dict(

@@ -307,7 +307,7 @@ class _ContainerUtilsMixin:
 
     container_resources = self.cfg_container_resources
     if isinstance(container_resources, dict) and len(container_resources) > 0:
-      self._cpu_limit = int(container_resources.get("cpu", DEFAULT_CPU_LIMIT))
+      self._cpu_limit = float(container_resources.get("cpu", DEFAULT_CPU_LIMIT))
       self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
       self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
 
@@ -417,7 +417,7 @@ class _ContainerUtilsMixin:
       # endif main_port_mapped
     else:
       # No container resources specified, use defaults
-      self._cpu_limit = DEFAULT_CPU_LIMIT
+      self._cpu_limit = float(DEFAULT_CPU_LIMIT)
       self._gpu_limit = DEFAULT_GPU_LIMIT
       self._mem_limit = DEFAULT_MEM_LIMIT
 
