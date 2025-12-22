@@ -191,8 +191,6 @@ class _DauthMixin(object):
     raw_comms_seed = self.os_environ.get(seed_key, "")
     comms_seed = raw_comms_seed.split(" ")
 
-    if self.cfg_dauth_log_response:
-      self.P(f"Comms seed for {seed_key}: {comms_seed} | Raw: '{raw_comms_seed}'")
 
     if not comms_seed:
       return_value = self.os_environ.get(key, None)
@@ -201,15 +199,19 @@ class _DauthMixin(object):
       # round-robin selection
       self.mqtt_seed_index = (self.mqtt_seed_index + 1) % len(comms_seed)
       return_value = comms_seed[self.mqtt_seed_index]
+      if self.cfg_dauth_log_response:
+        self.P(f"Comms seed for {seed_key}: {comms_seed} | Raw: '{raw_comms_seed}'. Selected '{return_value}' ({self.mqtt_seed_index})")
     # end if
     return key, return_value
 
 
-  def fill_dauth_data(self,
-                      dauth_data,
-                      requester_node_address,
-                      is_node=False,
-                      sender_eth_address=None):
+  def fill_dauth_data(
+    self,
+    dauth_data,
+    requester_node_address,
+    is_node=False,
+    sender_eth_address=None
+  ):
     """
     Fill the data with the authentication data.
     """

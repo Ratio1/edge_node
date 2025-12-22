@@ -13,6 +13,8 @@ _CONFIG = {
   
   'R1FS_VERBOSE' : 11,
   
+  'REQUEST_TIMEOUT' : None, # in seconds, None means no timeout
+  
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
