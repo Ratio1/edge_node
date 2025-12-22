@@ -45,10 +45,9 @@ class _DeeployTargetNodesMixin:
         for sig in plugin_signatures
       )
     return any(
-      str(sig).upper() in plugin_signatures
-      for sig in CONTAINERIZED_APPS_SIGNATURES
+      str(sig).upper() in CONTAINERIZED_APPS_SIGNATURES
+      for sig in plugin_signatures
     )
-
 
   def _parse_memory(self, mem):
     """
