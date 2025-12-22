@@ -29,7 +29,8 @@ _CONFIG = {
   'PORT': None,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
-  
+  'REQUEST_TIMEOUT': 300,
+
   'DEEPLOY_VERBOSE' : 10,
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
