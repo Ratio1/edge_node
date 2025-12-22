@@ -5,7 +5,6 @@ from extensions.business.deeploy.deeploy_const import (
   DEEPLOY_KEYS,
   DEEPLOY_RESOURCES,
   DEFAULT_CONTAINER_RESOURCES,
-  CONTAINER_APP_RUNNER_SIGNATURE,
   CONTAINERIZED_APPS_SIGNATURES,
   JOB_APP_TYPES,
 )
@@ -28,6 +27,27 @@ class _DeeployTargetNodesMixin:
       self.P(s, *args, **kwargs)
     return
 
+
+  def _has_containerized_plugins(self, plugin_signatures, all_must_match=False):
+    """
+    Check plugin signatures for containerized app types.
+
+    Args:
+        plugin_signatures: Collection of plugin signatures to check
+        all_must_match: If True, all signatures must be containerized.
+                        If False (default), at least one must be containerized.
+    Returns:
+        bool: True if the check passes
+    """
+    if all_must_match:
+      return all(
+        str(sig).upper() in CONTAINERIZED_APPS_SIGNATURES
+        for sig in plugin_signatures
+      )
+    return any(
+      str(sig).upper() in CONTAINERIZED_APPS_SIGNATURES
+      for sig in plugin_signatures
+    )
 
   def _parse_memory(self, mem):
     """
@@ -53,7 +73,7 @@ class _DeeployTargetNodesMixin:
     else:
       return int(float(mem))  # assume bytes
 
-  def _get_request_plugin_signatures(self, inputs):
+  def _get_request_plugin_signatures_from_pipeline(self, inputs):
     """
     Extract plugin signatures from normalized request payload.
     Returns a set of upper-cased signatures covering both legacy and plugins-array formats.
@@ -194,7 +214,7 @@ class _DeeployTargetNodesMixin:
           continue
 
         pipeline_plugins = pipeline_data.get(NetMonCt.PLUGINS, [])
-        has_different_signatures = not all(str(sign).upper() in CONTAINERIZED_APPS_SIGNATURES for sign in pipeline_plugins.keys())
+        has_different_signatures = not self._has_containerized_plugins(pipeline_plugins.keys(), all_must_match=True)
 
         if has_different_signatures:
           self.Pd(f"Node {addr} has pipeline '{pipeline_name}' with Native Apps signature. Plugin signatures: {list(pipeline_plugins.keys())}. Skipping node...")
@@ -344,8 +364,8 @@ class _DeeployTargetNodesMixin:
     node_req_memory = node_res_req.get(DEEPLOY_RESOURCES.MEMORY)
     node_req_memory_bytes = self._parse_memory(node_req_memory)
     job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
-    plugin_signatures = self._get_request_plugin_signatures(inputs)
-    requires_container_capabilities = CONTAINER_APP_RUNNER_SIGNATURE in plugin_signatures
+    plugin_signatures = self._get_request_plugin_signatures_from_pipeline(inputs)
+    requires_container_capabilities = self._has_containerized_plugins(plugin_signatures)
 
     suitable_nodes_with_resources = {}
     for addr in nodes:
@@ -391,8 +411,8 @@ class _DeeployTargetNodesMixin:
   def _find_nodes_for_deeployment(self, inputs):
     # Get required resources from the request
     required_resources = self._aggregate_container_resources(inputs) or {}
-    plugin_signatures = self._get_request_plugin_signatures(inputs)
-    has_container_plugins = any(signature in plugin_signatures for signature in CONTAINERIZED_APPS_SIGNATURES)
+    plugin_signatures = self._get_request_plugin_signatures_from_pipeline(inputs)
+    has_container_plugins = self._has_containerized_plugins(plugin_signatures)
     target_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, None)
 
     if not target_nodes_count:
@@ -562,8 +582,8 @@ class _DeeployTargetNodesMixin:
         DEEPLOY_RESOURCES.REQUIRED: {}
     }
     
-    plugin_signatures = self._get_request_plugin_signatures(inputs)
-    has_container_plugins = CONTAINER_APP_RUNNER_SIGNATURE in plugin_signatures
+    plugin_signatures = self._get_request_plugin_signatures_from_pipeline(inputs)
+    has_container_plugins = self._has_containerized_plugins(plugin_signatures)
     if not has_container_plugins:
       return result
 
