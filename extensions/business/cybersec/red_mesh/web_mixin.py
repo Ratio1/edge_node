@@ -2,10 +2,29 @@ import requests
 from urllib.parse import quote
 
 class _WebTestsMixin:
-  """HTTP-centric probes that emulate manual red-team playbooks."""
+  """
+  HTTP-centric probes that emulate manual red-team playbooks.
+
+  Methods perform lightweight checks for common web vulnerabilities across
+  discovered web services.
+  """
 
   def _web_test_common(self, target, port):
-    """Look for exposed common endpoints and weak access controls."""
+    """
+    Look for exposed common endpoints and weak access controls.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings from endpoint checks.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -35,7 +54,21 @@ class _WebTestsMixin:
 
   
   def _web_test_homepage(self, target, port):
-    """Scan landing pages for clear-text secrets or database dumps."""
+    """
+    Scan landing pages for clear-text secrets or database dumps.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings from homepage inspection.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -67,7 +100,21 @@ class _WebTestsMixin:
 
 
   def _web_test_security_headers(self, target, port):
-    """Flag missing HTTP security headers (OWASP A05/A06)."""
+    """
+    Flag missing HTTP security headers.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings about security headers presence.
+    """
     findings = []
     try:
       scheme = "https" if port in (443, 8443) else "http"
@@ -100,7 +147,21 @@ class _WebTestsMixin:
 
 
   def _web_test_flags(self, target, port):
-    """Check cookies for Secure/HttpOnly/SameSite and directory listing."""
+    """
+    Check cookies for Secure/HttpOnly/SameSite and directory listing.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings on cookie flags and directory listing.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -140,7 +201,21 @@ class _WebTestsMixin:
 
 
   def _web_test_xss(self, target, port):
-    """Probe reflected XSS by injecting a harmless script tag."""
+    """
+    Probe reflected XSS by injecting a harmless script tag.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings related to reflected XSS.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -165,7 +240,21 @@ class _WebTestsMixin:
 
 
   def _web_test_path_traversal(self, target, port):
-    """Attempt basic path traversal payload against the target."""
+    """
+    Attempt basic path traversal payload against the target.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings about traversal attempts.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -189,7 +278,21 @@ class _WebTestsMixin:
   
   
   def _web_test_sql_injection(self, target, port):
-    """Send boolean SQLi payload and look for database error leakage."""
+    """
+    Send boolean SQLi payload and look for database error leakage.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings related to SQL injection.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -216,7 +319,21 @@ class _WebTestsMixin:
 
 
   def _web_test_cors_misconfiguration(self, target, port):
-    """Detect overly permissive CORS policies (OWASP A01/A05)."""
+    """
+    Detect overly permissive CORS policies.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings related to CORS policy.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -256,7 +373,21 @@ class _WebTestsMixin:
 
 
   def _web_test_open_redirect(self, target, port):
-    """Check common redirect parameters for open redirect abuse."""
+    """
+    Check common redirect parameters for open redirect abuse.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings about open redirects.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -291,7 +422,21 @@ class _WebTestsMixin:
 
 
   def _web_test_http_methods(self, target, port):
-    """Surface risky HTTP verbs enabled on the root resource."""
+    """
+    Surface risky HTTP verbs enabled on the root resource.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings related to allowed HTTP methods.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -320,7 +465,21 @@ class _WebTestsMixin:
 
 
   def _web_test_graphql_introspection(self, target, port):
-    """Check if GraphQL introspection is exposed in production endpoints."""
+    """
+    Check if GraphQL introspection is exposed in production endpoints.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings on GraphQL introspection exposure.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -346,7 +505,21 @@ class _WebTestsMixin:
 
 
   def _web_test_metadata_endpoints(self, target, port):
-    """Probe cloud metadata paths to detect SSRF-style exposure."""
+    """
+    Probe cloud metadata paths to detect SSRF-style exposure.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings on metadata endpoint exposure.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
@@ -375,7 +548,21 @@ class _WebTestsMixin:
 
 
   def _web_test_api_auth_bypass(self, target, port):
-    """Detect APIs that succeed despite invalid Authorization headers."""
+    """
+    Detect APIs that succeed despite invalid Authorization headers.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    str
+      Joined findings related to auth bypass behavior.
+    """
     findings = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"

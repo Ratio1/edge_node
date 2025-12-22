@@ -171,6 +171,8 @@ class TunnelsManagerPlugin(BasePlugin):
     }
     dns_record = self.requests.post(url, headers=headers, json=data).json()
 
+    public_name = None
+    dns_record_public = None
     if tunnel_type == "tcp":
       # For TCP tunnels, we also need to create a CNAME for the public URL
       public_name = new_id.removeprefix(f"{self.cfg_tcp_prefix}-")
@@ -189,8 +191,8 @@ class TunnelsManagerPlugin(BasePlugin):
         "tunnel_token": tunnel_info['result']['token'],
         "dns_record_id": dns_record['result']['id'],
         "dns_name": f"{new_id}.{cloudflare_domain}",
-        "dns_record_public_id": dns_record_public['result']['id'] if tunnel_type == "tcp" else None,
-        "dns_public_name": f"{public_name}.{cloudflare_domain}",
+        "dns_record_public_id": dns_record_public['result']['id'] if dns_record_public else None,
+        "dns_public_name": f"{public_name}.{cloudflare_domain}" if public_name else None,
         "custom_hostnames": [],
         "type": tunnel_type,
         "creator": "ratio1"

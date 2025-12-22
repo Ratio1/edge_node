@@ -11,15 +11,27 @@ class _ServiceInfoMixin:
   Network service banner probes feeding RedMesh reports.
 
   Each helper focuses on a specific protocol and maps findings to
-  OWASP vulnerability families such as A06:2021 (Security
-  Misconfiguration) or A09:2021 (Security Logging and Monitoring).
-  The mixin is intentionally light-weight so that PentestLocalWorker
-  threads can run without external dependencies while still surfacing
-  high-signal security clues.
+  OWASP vulnerability families. The mixin is intentionally light-weight so
+  that `PentestLocalWorker` threads can run without heavy dependencies while
+  still surfacing high-signal clues.
   """
   
   def _service_info_80(self, target, port):
-    """Collect HTTP banner and server metadata for common web ports."""
+    """
+    Collect HTTP banner and server metadata for common web ports.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      Banner summary or error message.
+    """
     info = None
     try:
       scheme = "https" if port in (443, 8443) else "http"
@@ -36,7 +48,21 @@ class _ServiceInfoMixin:
   
 
   def _service_info_8080(self, target, port):
-    """Probe alternate HTTP port 8080 for verbose banners."""
+    """
+    Probe alternate HTTP port 8080 for verbose banners.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      Banner text or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -58,7 +84,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_443(self, target, port):
-    """Collect HTTPS response banner data for TLS services."""
+    """
+    Collect HTTPS response banner data for TLS services.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      Banner summary or error message.
+    """
     info = None
     try:
       url = f"https://{target}"
@@ -74,7 +114,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_tls(self, target, port):
-    """Inspect TLS handshake details and certificate lifetime."""
+    """
+    Inspect TLS handshake details and certificate lifetime.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      TLS version/cipher summary or error message.
+    """
     info = None
     try:
       context = ssl.create_default_context()
@@ -104,7 +158,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_21(self, target, port):
-    """Identify FTP banners and anonymous login exposure."""
+    """
+    Identify FTP banners and anonymous login exposure.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      FTP banner info or vulnerability message.
+    """
     info = None
     try:
       ftp = ftplib.FTP(timeout=3)
@@ -123,7 +191,21 @@ class _ServiceInfoMixin:
     return info
 
   def _service_info_22(self, target, port):
-    """Retrieve the SSH banner to fingerprint implementations."""
+    """
+    Retrieve the SSH banner to fingerprint implementations.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      SSH banner text or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -138,7 +220,21 @@ class _ServiceInfoMixin:
     return info
 
   def _service_info_25(self, target, port):
-    """Capture SMTP banner data for mail infrastructure mapping."""
+    """
+    Capture SMTP banner data for mail infrastructure mapping.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      SMTP banner text or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -153,7 +249,21 @@ class _ServiceInfoMixin:
     return info
 
   def _service_info_3306(self, target, port):
-    """Perform a lightweight MySQL handshake to expose server version."""
+    """
+    Perform a lightweight MySQL handshake to expose server version.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      MySQL version info or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -172,7 +282,21 @@ class _ServiceInfoMixin:
     return info
 
   def _service_info_3389(self, target, port):
-    """Verify reachability of RDP services without full negotiation."""
+    """
+    Verify reachability of RDP services without full negotiation.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      RDP reachability summary or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -186,7 +310,21 @@ class _ServiceInfoMixin:
     return info
 
   def _service_info_6379(self, target, port):
-    """Test Redis exposure by issuing a PING command."""
+    """
+    Test Redis exposure by issuing a PING command.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      Redis response summary or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -208,7 +346,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_23(self, target, port):
-    """Fetch Telnet negotiation banner (OWASP A05: insecure protocols)."""
+    """
+    Fetch Telnet negotiation banner.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      Telnet banner or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -227,7 +379,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_445(self, target, port):
-    """Probe SMB services for negotiation responses (OWASP A06)."""
+    """
+    Probe SMB services for negotiation responses.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      SMB response summary or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -248,7 +414,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_5900(self, target, port):
-    """Read VNC handshake string to assess remote desktop exposure."""
+    """
+    Read VNC handshake string to assess remote desktop exposure.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      VNC banner summary or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -267,7 +447,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_161(self, target, port):
-    """Attempt SNMP community string disclosure using 'public'."""
+    """
+    Attempt SNMP community string disclosure using 'public'.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      SNMP response summary or error message.
+    """
     info = None
     sock = None
     try:
@@ -299,7 +493,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_53(self, target, port):
-    """Query CHAOS TXT version.bind to detect DNS version disclosure."""
+    """
+    Query CHAOS TXT version.bind to detect DNS version disclosure.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      DNS disclosure summary or error message.
+    """
     info = None
     sock = None
     try:
@@ -362,7 +570,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_1433(self, target, port):
-    """Send a TDS prelogin probe to expose SQL Server version data."""
+    """
+    Send a TDS prelogin probe to expose SQL Server version data.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      MSSQL response summary or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -387,7 +609,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_5432(self, target, port):
-    """Probe PostgreSQL for weak authentication methods."""
+    """
+    Probe PostgreSQL for weak authentication methods.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      PostgreSQL response summary or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -411,7 +647,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_11211(self, target, port):
-    """Issue Memcached stats command to detect unauthenticated access."""
+    """
+    Issue Memcached stats command to detect unauthenticated access.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      Memcached response summary or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -431,7 +681,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_9200(self, target, port):
-    """Detect Elasticsearch/OpenSearch nodes leaking cluster metadata."""
+    """
+    Detect Elasticsearch/OpenSearch nodes leaking cluster metadata.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      Elasticsearch exposure summary or error message.
+    """
     info = None
     try:
       scheme = "http"
@@ -450,7 +714,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_502(self, target, port):
-    """Send Modbus device identification request to detect exposed PLCs."""
+    """
+    Send Modbus device identification request to detect exposed PLCs.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      Modbus exposure summary or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -473,7 +751,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_27017(self, target, port):
-    """Attempt MongoDB isMaster handshake to detect unauthenticated access."""
+    """
+    Attempt MongoDB isMaster handshake to detect unauthenticated access.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      MongoDB exposure summary or error message.
+    """
     info = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -508,7 +800,21 @@ class _ServiceInfoMixin:
 
 
   def _service_info_generic(self, target, port):
-    """Attempt a generic TCP banner grab for uncovered ports."""
+    """
+    Attempt a generic TCP banner grab for uncovered ports.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    str | None
+      Generic banner text or error message.
+    """
     info = None
     try:
       # Generic service: attempt to connect and read a short banner if any

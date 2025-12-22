@@ -29,7 +29,8 @@ _CONFIG = {
   'PORT': None,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
-  
+  'REQUEST_TIMEOUT': 300,
+
   'DEEPLOY_VERBOSE' : 10,
   
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
@@ -446,7 +447,7 @@ class DeeployManagerApiPlugin(
                 For CONTAINER_APP_RUNNER:
                   - IMAGE : str (required)
                   - CONTAINER_RESOURCES : dict (required)
-                      - cpu : int
+                      - cpu : int | float
                       - memory : str (e.g., "4096m", "4g")
                   - CR, PORT, ENV, VOLUMES, TUNNEL_ENGINE_ENABLED, etc.
                 For native plugins:

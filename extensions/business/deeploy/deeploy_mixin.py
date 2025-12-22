@@ -728,6 +728,13 @@ class _DeeployMixin:
           f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'CONTAINER_RESOURCES.cpu' is required."
         )
 
+      try:
+        self._parse_cpu_value(resources.get(DEEPLOY_RESOURCES.CPU), default=None)
+      except ValueError:
+        raise ValueError(
+          f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'CONTAINER_RESOURCES.cpu' must be a number."
+        )
+
       if DEEPLOY_RESOURCES.MEMORY not in resources:
         raise ValueError(
           f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'CONTAINER_RESOURCES.memory' is required."
@@ -1087,6 +1094,17 @@ class _DeeployMixin:
     }
     return result
 
+  def _parse_cpu_value(self, value, default=None):
+    """
+    Parse CPU value as float, allowing numeric strings.
+    """
+    if value is None:
+      return default
+    try:
+      return float(value)
+    except (TypeError, ValueError):
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST6}. 'CONTAINER_RESOURCES.cpu' must be a number.")
+
   def _aggregate_container_resources(self, inputs):
     """
     Aggregate container resources across all CONTAINER_APP_RUNNER plugin instances.
@@ -1110,11 +1128,17 @@ class _DeeployMixin:
       self.Pd("Using legacy format (app_params) for resource aggregation")
       app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
       legacy_resources = app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+      if isinstance(legacy_resources, dict):
+        legacy_resources = self.deepcopy(legacy_resources)
+        if DEEPLOY_RESOURCES.CPU in legacy_resources:
+          legacy_resources[DEEPLOY_RESOURCES.CPU] = self._parse_cpu_value(
+            legacy_resources.get(DEEPLOY_RESOURCES.CPU)
+          )
       self.Pd(f"Legacy resources: {legacy_resources}")
       return legacy_resources
 
     self.Pd(f"Processing {len(plugins_array)} plugin instances from plugins array")
-    total_cpu = 0
+    total_cpu = 0.0
     total_memory_mb = 0
 
     # Iterate through plugins array (simplified format - each object is an instance)
@@ -1125,7 +1149,7 @@ class _DeeployMixin:
       # Only aggregate for CONTAINER_APP_RUNNER and WORKER_APP_RUNNER plugins
       if signature in CONTAINERIZED_APPS_SIGNATURES:
         resources = plugin_instance.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
-        cpu = resources.get(DEEPLOY_RESOURCES.CPU, 0)
+        cpu = self._parse_cpu_value(resources.get(DEEPLOY_RESOURCES.CPU, 0))
         memory = resources.get(DEEPLOY_RESOURCES.MEMORY, "0m")
 
         self.Pd(f"  Container resources: cpu={cpu}, memory={memory}")
