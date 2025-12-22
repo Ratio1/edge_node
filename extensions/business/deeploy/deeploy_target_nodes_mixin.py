@@ -194,7 +194,7 @@ class _DeeployTargetNodesMixin:
           continue
 
         pipeline_plugins = pipeline_data.get(NetMonCt.PLUGINS, [])
-        has_different_signatures = not all(sign == CONTAINER_APP_RUNNER_SIGNATURE for sign in pipeline_plugins.keys()) #FIX CAR OR WORKER APP RUNNER
+        has_different_signatures = not all(str(sign).upper() in CONTAINERIZED_APPS_SIGNATURES for sign in pipeline_plugins.keys())
 
         if has_different_signatures:
           self.Pd(f"Node {addr} has pipeline '{pipeline_name}' with Native Apps signature. Plugin signatures: {list(pipeline_plugins.keys())}. Skipping node...")
@@ -224,7 +224,7 @@ class _DeeployTargetNodesMixin:
             self.Pd(f"    Pipeline '{pipeline_name}' last_config: {last_config} (ts: {ts})")
 
       if skip_node:
-        self.Pd(f"Node {addr} skipped due to incompatible pipeline signatures")
+        self.Pd(f"Node {addr} skipped, as it's running a pipeline with a native app.")
         continue
       self.Pd(f"Node {addr} has {self.json_dumps(used_container_resources)} used container resources.")
       # Sum up resources used by node.
