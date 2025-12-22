@@ -164,7 +164,10 @@ class _DeeployTargetNodesMixin:
     self.Pd(f"Starting __find_suitable_nodes_for_container_app with {len(nodes_with_resources)} candidate nodes")
     suitable_nodes = {}
 
-    required_cpu = container_requested_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
+    required_cpu = self._parse_cpu_value(
+      container_requested_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU),
+      default=DEFAULT_CONTAINER_RESOURCES.CPU,
+    )
     required_mem = container_requested_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
     required_mem_bytes = self._parse_memory(required_mem)
 
@@ -225,10 +228,13 @@ class _DeeployTargetNodesMixin:
         continue
       self.Pd(f"Node {addr} has {self.json_dumps(used_container_resources)} used container resources.")
       # Sum up resources used by node.
-      used_cpu = 0
+      used_cpu = 0.0
       used_memory = 0
       for res in used_container_resources:
-        cpu = int(res.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU))
+        cpu = self._parse_cpu_value(
+          res.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU),
+          default=DEFAULT_CONTAINER_RESOURCES.CPU,
+        )
         memory = res.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
         used_cpu += cpu
         used_memory += self._parse_memory(memory)
