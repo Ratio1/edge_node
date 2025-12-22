@@ -53,7 +53,7 @@ class _DeeployTargetNodesMixin:
     else:
       return int(float(mem))  # assume bytes
 
-  def _get_request_plugin_signatures(self, inputs):
+  def _get_request_plugin_signatures_from_pipeline(self, inputs):
     """
     Extract plugin signatures from normalized request payload.
     Returns a set of upper-cased signatures covering both legacy and plugins-array formats.
@@ -344,8 +344,9 @@ class _DeeployTargetNodesMixin:
     node_req_memory = node_res_req.get(DEEPLOY_RESOURCES.MEMORY)
     node_req_memory_bytes = self._parse_memory(node_req_memory)
     job_tags = inputs.get(DEEPLOY_KEYS.JOB_TAGS, [])
-    plugin_signatures = self._get_request_plugin_signatures(inputs)
-    requires_container_capabilities = CONTAINER_APP_RUNNER_SIGNATURE in plugin_signatures
+    plugin_signatures = self._get_request_plugin_signatures_from_pipeline(inputs)
+    requires_container_capabilities = any(
+      str(sig).upper() in plugin_signatures for sig in CONTAINERIZED_APPS_SIGNATURES)
 
     suitable_nodes_with_resources = {}
     for addr in nodes:
@@ -391,7 +392,7 @@ class _DeeployTargetNodesMixin:
   def _find_nodes_for_deeployment(self, inputs):
     # Get required resources from the request
     required_resources = self._aggregate_container_resources(inputs) or {}
-    plugin_signatures = self._get_request_plugin_signatures(inputs)
+    plugin_signatures = self._get_request_plugin_signatures_from_pipeline(inputs)
     has_container_plugins = any(signature in plugin_signatures for signature in CONTAINERIZED_APPS_SIGNATURES)
     target_nodes_count = inputs.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, None)
 
@@ -562,7 +563,7 @@ class _DeeployTargetNodesMixin:
         DEEPLOY_RESOURCES.REQUIRED: {}
     }
     
-    plugin_signatures = self._get_request_plugin_signatures(inputs)
+    plugin_signatures = self._get_request_plugin_signatures_from_pipeline(inputs)
     has_container_plugins = CONTAINER_APP_RUNNER_SIGNATURE in plugin_signatures
     if not has_container_plugins:
       return result
