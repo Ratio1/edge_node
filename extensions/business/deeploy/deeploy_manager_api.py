@@ -123,7 +123,10 @@ class DeeployManagerApiPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
-      apps = self._get_online_apps(owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
+      apps = self._get_online_apps(
+        owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+        project_id=inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
+      )
       
       result = {
         DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
