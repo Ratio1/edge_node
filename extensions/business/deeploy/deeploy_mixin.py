@@ -1822,6 +1822,8 @@ class _DeeployMixin:
     plugin_signature: str = None,
     instance_id: str = None
   ):
+    # TODO: maybe check if both app_id and job_id are provided, and raise an error if they are different?
+    #
     """
     Discover the plugin instances for the given app_id and target nodes.
     Returns a list of dictionaries containing infomration about plugin instances.

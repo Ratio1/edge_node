@@ -1,22 +1,41 @@
 """
-LOCAL_SERVING_API Plugin
+BASE_INFERENCE_API Plugin
 
-This plugin creates a FastAPI server for both local-only access (localhost) and through tunneling
-that works with a loopback data capture pipeline.
+Production-Grade Inference API
+
+This plugin exposes a hardened, FastAPI-powered interface for generic inference.
+It keeps the lightweight loopback data flow used by the
+Ratio1 node while adding security, observability, and request lifecycle
+management.
+
 It can work with both async and sync requests.
 In case of sync requests, they will be processed using PostponedRequest objects.
 Otherwise, the request_id will be returned immediately, and the client can poll for results.
 
-Key Features:
-- Loopback mode: Outputs return to DCT queue for processing
-- Designed for LLM chat completions
+Highlights
+- Can be exposed through tunneling for remote access or kept local-only for third-party apps hosted through Ratio1.
+- We recommend using it locally paired with a third-party app that manages the rate limiting, authentication, and
+  request tracking (e.g., a web app built with Streamlit, Gradio, or Flask).
+- In case of need for remote access, it can be exposed through tunneling with bearer-token authentication and a
+built-in rate limiting mechanism.
+- Supports any AI engine supported by Ratio1 through the Loopback plugin type.
+- Durable, restart-safe request tracking with health/metrics/list endpoints
+- Async + sync inference payload layout
+- Automatic timeout handling, TTL-based eviction, and persistence to cacheapi
+
+In case of no tunneling and local-only access, authentication will be disabled by default.
+For tunneling export `INFERENCE_API_TOKEN` (comma-separated values for multiple clients) to enforce token
+checks or provide the tokens through the `PREDEFINED_AUTH_TOKENS` config parameter.
 
 Available Endpoints:
-- POST /create_chat_completion - Create chat completion (sync)
-- POST /create_chat_completion_async - Create chat completion (async)
+- POST /predict - Compute prediction (sync)
+- POST /predict_async - Compute prediction (async)
 - GET /health - Health check
-- GET /status_request - Check for current status of async request results
+- GET /metrics - Retrieve API metrics
+- GET /request_status - Check for current status of async request results
 
+# TODO: find a legit example for generic inference API configuration
+#  or keep class as abstract only?
 Example pipeline configuration:
 {
   "NAME": "local_inference_api",
@@ -41,14 +60,16 @@ Example pipeline configuration:
 }
 """
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
-from extensions.business.mixins.nlp_agent_mixin import _NlpAgentMixin, NLP_AGENT_MIXIN_CONFIG
+from extensions.business.mixins.base_agent_mixin import _BaseAgentMixin, BASE_AGENT_MIXIN_CONFIG
+
+from typing import Any, Dict, List, Optional
 
 
 __VER__ = '0.1.0'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
-  **NLP_AGENT_MIXIN_CONFIG,
+  **BASE_AGENT_MIXIN_CONFIG,
 
   # MANDATORY SETTING IN ORDER TO RECEIVE REQUESTS
   "ALLOW_EMPTY_INPUTS": True,  # allow processing even when no input data is present
@@ -63,6 +84,18 @@ _CONFIG = {
   "REQUEST_TIMEOUT": 600,  # 10 minutes
   "SAVE_PERIOD": 300,  # 5 minutes
 
+  "REQUEST_TTL_SECONDS": 60 * 60 * 2,  # keep historical results for 2 hours
+  "RATE_LIMIT_PER_MINUTE": 5,
+  "AUTH_TOKEN_ENV": "INFERENCE_API_TOKEN",
+  "PREDEFINED_AUTH_TOKENS": [],  # e.g. ["token1", "token2"]
+  "ALLOW_ANONYMOUS_ACCESS": True,
+
+  "METRICS_REFRESH_SECONDS": 5 * 60,  # 5 minutes
+
+  # Semaphore key for paired plugin synchronization (e.g., with WAR containers)
+  # When set, this plugin will signal readiness and expose env vars to paired plugins
+  "SEMAPHORE": None,
+
   "VALIDATION_RULES": {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   }
@@ -71,23 +104,61 @@ _CONFIG = {
 
 class BaseInferenceApiPlugin(
   BasePlugin,
-  _NlpAgentMixin
+  _BaseAgentMixin
 ):
   CONFIG = _CONFIG
 
+  STATUS_PENDING = "pending"
+  STATUS_COMPLETED = "completed"
+  STATUS_FAILED = "failed"
+  STATUS_TIMEOUT = "timeout"
+
   def on_init(self):
     super(BaseInferenceApiPlugin, self).on_init()
-    self._requests = {}
-    self._api_errors = {}
+    if not self.cfg_ai_engine:
+      err_msg = f"AI_ENGINE must be specified for {self.get_signature()} plugin."
+      self.P(err_msg)
+      raise ValueError(err_msg)
+    # endif AI_ENGINE not specified
+    self._requests: Dict[str, Dict[str, Any]] = {}
+    self._api_errors: Dict[str, Dict[str, Any]] = {}
+    # TODO: add inference metrics tracking (latency, tokens, etc)
+    self._metrics = {
+      'requests_total': 0,
+      'requests_completed': 0,
+      'requests_failed': 0,
+      'requests_timeout': 0,
+      'requests_active': 0,
+    }
+    self._rate_limit_state: Dict[str, Dict[str, Any]] = {}
     # This is different from self.last_error_time in BasePlugin
     # self.last_error_time tracks unhandled errors that occur in the plugin loop
     # This one tracks all errors that occur during API request handling
     self.last_handled_error_time = None
+    self.last_metrics_refresh = 0
     self.last_persistence_save = 0
     self.load_persistence_data()
+    tunneling_str = f"(with tunneling enabled)" if self.cfg_tunnel_engine_enabled else ""
+    start_msg = f"{self.get_signature()} initialized{tunneling_str}.\n"
+    lst_endpoint_names = list(self._endpoints.keys())
+    endpoints_str = ", ".join([f"/{endpoint_name}" for endpoint_name in lst_endpoint_names])
+    start_msg += f"\t\tEndpoints: {endpoints_str}\n"
+    start_msg += f"\t\tAI Engine: {self.cfg_ai_engine}\n"
+    start_msg += f"\t\tLoopback key: loopback_dct_{self._stream_id}"
+    self.P(start_msg)
     return
 
-  """UTIL METHODS"""
+  def _setup_semaphore_env(self):
+    """Set semaphore environment variables for bundled plugins."""
+    localhost_ip = self.log.get_localhost_ip()
+    port = self.cfg_port
+    self.semaphore_set_env('API_HOST', localhost_ip)
+    if port:
+      self.semaphore_set_env('API_PORT', str(port))
+      self.semaphore_set_env('API_URL', f'http://{localhost_ip}:{port}')
+    return
+
+  """PERSISTENCE + STATUS"""
   if True:
     def load_persistence_data(self):
       cached_data = self.cacheapi_load_pickle()
@@ -95,6 +166,7 @@ class BaseInferenceApiPlugin(
         # Useful only for debugging purposes
         self._requests = cached_data.get('_requests', {})
         self._api_errors = cached_data.get('_api_errors', {})
+        self._metrics = cached_data.get('_metrics', {})
         self.last_handled_error_time = cached_data.get('last_handled_error_time', None)
       # endif cached_data is not None
       return
@@ -104,11 +176,41 @@ class BaseInferenceApiPlugin(
         data_to_save = {
           '_requests': self._requests,
           '_api_errors': self._api_errors,
+          '_metrics': self._metrics,
           'last_handled_error_time': self.last_handled_error_time,
         }
         self.cacheapi_save_pickle(data_to_save)
         self.last_persistence_save = self.time()
       # endif needs saving
+      return
+
+    def cleanup_expired_requests(self):
+      ttl_seconds = self.cfg_request_ttl_seconds
+      if ttl_seconds <= 0:
+        return
+      now_ts = self.time()
+      expired_ids = []
+      for request_id, request_data in self._requests.items():
+        finished_at = request_data.get('finished_at')
+        if finished_at is None:
+          continue
+        if (now_ts - finished_at) > ttl_seconds:
+          expired_ids.append(request_id)
+      for request_id in expired_ids:
+        self._requests.pop(request_id, None)
+      if expired_ids:
+        self.Pd(f"Evicted {len(expired_ids)} completed requests due to TTL policy.")
+      return
+
+    def record_api_error(self, request_id: Optional[str], error_message: str):
+      self.last_handled_error_time = self.time()
+      key = request_id or f"error_{self.last_handled_error_time}"
+      self._api_errors[key] = {
+        'request_id': request_id,
+        'message': error_message,
+        'ts': self.last_handled_error_time,
+      }
+      self._metrics['requests_failed'] += 1
       return
 
     def get_status(self):
@@ -121,30 +223,161 @@ class BaseInferenceApiPlugin(
         # endif enough time has passed since last error
       # endif last_error_time is not None
       return status
+  """END PERSISTENCE + STATUS"""
+
+  """SECURITY + RATE LIMITING"""
+  if True:
+    def check_allow_all_requests(self):
+      """
+      In case the API is not using tunneling and is only accessible locally,
+      we can allow all requests without token checks.
+
+      Returns
+      -------
+      bool
+        True if all requests are allowed without authentication.
+      """
+      if self.cfg_is_loopback_plugin and not self.cfg_tunnel_engine_enabled:
+        return True
+      return False
+
+    def env_allowed_tokens(self):
+      env_name = self.cfg_auth_token_env
+      if not env_name:
+        return []
+      raw_value = self.os_environ.get(env_name, '').strip()
+      if not raw_value:
+        return []
+      return [token.strip() for token in raw_value.split(',') if token.strip()]
+
+    def _configured_tokens(self) -> List[str]:
+      env_tokens = self.env_allowed_tokens()
+      predefined_tokens = self.cfg_predefined_auth_tokens or []
+      all_tokens = set(env_tokens + predefined_tokens)
+      return list(all_tokens)
+
+    def authorize_request(self, authorization: Optional[str]) -> str:
+      if self.check_allow_all_requests():
+        # TODO: should the apps using this API also have identification tokens for usage analytics?
+        return "anonymous"
+      tokens = self._configured_tokens()
+      if not tokens:
+        if not self.cfg_allow_anonymous_access:
+          raise PermissionError(
+            "Authorization required but no tokens were configured. Provide tokens via INFERENCE_API_TOKEN."
+          )
+        return "anonymous"
+      if authorization is None:
+        raise PermissionError("Missing Authorization header.")
+      token = authorization
+      if token.startswith('Bearer '):
+        token = token[7:]
+      token = token.strip()
+      if token not in tokens:
+        raise PermissionError("Invalid Authorization token.")
+      return token
+
+    def enforce_rate_limit(self, subject: str):
+      # TODO: maybe make the rate limit window configurable
+      if self.check_allow_all_requests():
+        return
+      limit = self.cfg_rate_limit_per_minute
+      if limit <= 0:
+        return
+      bucket_key = subject or 'anonymous'
+      now_minute = int(self.time() // 60)
+      bucket = self._rate_limit_state.get(bucket_key)
+      if bucket is None or bucket['minute'] != now_minute:
+        bucket = {'minute': now_minute, 'count': 0}
+        self._rate_limit_state[bucket_key] = bucket
+      if bucket['count'] >= limit:
+        raise RuntimeError(
+          f"Rate limit exceeded for subject '{bucket_key}'. Max {limit} requests per minute."
+        )
+      bucket['count'] += 1
+      return
+  """END SECURITY + RATE LIMITING"""
+
+
+  """REQUEST TRACKING"""
+  if True:
+    def refresh_metrics(self):
+      self._metrics['requests_active'] = sum(
+        1 for req in self._requests.values() if req['status'] == self.STATUS_PENDING
+      )
+      # Maybe update other metrics here if needed
+      # Need to consider if expired requests should be counted in total metrics.
+      return
+
+    def maybe_refresh_metrics(self):
+      # For performance, we only refresh metrics every cfg_metrics_refresh_seconds
+      now_ts = self.time()
+      if (now_ts - self.last_metrics_refresh) > self.cfg_metrics_refresh_seconds:
+        self.refresh_metrics()
+        self.last_metrics_refresh = now_ts
+      return
+
+    def maybe_mark_request_failed(self, request_id: str, request_data: Dict[str, Any]):
+      if request_data['status'] == self.STATUS_FAILED:
+        return True
+      if request_data['status'] != self.STATUS_PENDING:
+        return False
+      error = request_data.get('error', None)
+      if error is None:
+        return False
+      self.P(f"Request {request_id} failed: {error}")
+      request_data['status'] = self.STATUS_FAILED
+      request_data['updated_at'] = self.time()
+      request_data['result'] = {
+        'error': error,
+        'status': self.STATUS_FAILED,
+        'request_id': request_id,
+      }
+      self._metrics['requests_failed'] += 1
+      self._metrics['requests_active'] -= 1
+      return True
+
+    def maybe_mark_request_timeout(self, request_id: str, request_data: Dict[str, Any]):
+      if request_data['status'] == self.STATUS_TIMEOUT:
+        return True
+      if request_data['status'] != self.STATUS_PENDING:
+        return False
+      timeout = request_data.get('timeout', self.cfg_request_timeout)
+      # No timeout configured
+      if timeout is None or timeout <= 0:
+        return False
+      if (self.time() - request_data['created_at']) <= timeout:
+        return False
+      self.P(f"Request {request_id} timed out after {timeout} seconds.")
+      request_data['status'] = self.STATUS_TIMEOUT
+      request_data['updated_at'] = self.time()
+      request_data['error'] = f"Request timed out after {timeout} seconds."
+      request_data['result'] = {
+        'error': request_data['error'],
+        'status': self.STATUS_TIMEOUT,
+        'request_id': request_id,
+        'timeout': timeout,
+      }
+      self._metrics['requests_timeout'] += 1
+      self._metrics['requests_active'] -= 1
+      return True
 
     def solve_postponed_request(self, request_id: str):
       if request_id in self._requests:
         self.Pd(f"Checking status of request ID {request_id}...")
         request_data = self._requests[request_id]
-        start_time = request_data.get("start_time", None)
-        timeout = request_data.get("timeout", self.cfg_request_timeout)
-        is_finished = request_data.get("finished", False)
-        if is_finished:
-          return request_data["result"]
-        elif start_time is not None and (self.time() - start_time) > timeout:
-          self.Pd(f"Request ID {request_id} has timed out after {timeout} seconds.")
-          error_response = f"Request ID {request_id} has timed out after {timeout} seconds."
-          request_data['result'] = {
-            "error": error_response,
-            "request_id": request_id,
-          }
-          request_data["finished"] = True
+
+        self.maybe_mark_request_timeout(request_id=request_id, request_data=request_data)
+        self.maybe_mark_request_failed(request_id=request_id, request_data=request_data)
+        if request_data['status'] != self.STATUS_PENDING:
           return request_data['result']
-        # endif check finished or timeout
+        # endif request not pending
       else:
         self.Pd(f"Request ID {request_id} not found in requests.")
         return {
-          "error": f"Request ID {request_id} not found."
+          'status': 'error',
+          "error": f"Request ID {request_id} not found.",
+          'request_id': request_id,
         }
       # endif request exists
       return self.create_postponed_request(
@@ -156,22 +389,50 @@ class BaseInferenceApiPlugin(
 
     def register_request(
         self,
-        **kwargs
+        subject: str,
+        parameters: Dict[str, Any],
+        metadata: Optional[Dict[str, Any]] = None,
+        timeout: Optional[int] = None
     ):
       request_id = self.uuid()
       start_time = self.time()
       request_data = {
-        **kwargs,
         "request_id": request_id,
-        "start_time": start_time,
-        "finished": None,
-        "error": None,
+        'subject': subject,
+        'parameters': parameters,
+        'metadata': metadata or {},
+        'status': self.STATUS_PENDING,
+        'created_at': start_time,
+        'updated_at': start_time,
+        'timeout': timeout or self.cfg_request_timeout,
+        'result': None,
+        'error': None,
       }
       self._requests[request_id] = request_data
+      self._metrics['requests_total'] += 1
+      self._metrics['requests_active'] += 1
       return request_id, request_data
-  """END UTIL METHODS"""
 
-  """GENERIC API ENDPOINTS"""
+    def serialize_request(self, request_id: str):
+      request_data = self._requests.get(request_id)
+      if request_data is None:
+        return None
+      serialized = {
+        'request_id': request_id,
+        'status': request_data['status'],
+        'created_at': request_data['created_at'],
+        'updated_at': request_data['updated_at'],
+        'metadata': request_data.get('metadata') or {},
+        'subject': request_data.get('subject'),
+      }
+      if request_data['status'] != self.STATUS_PENDING:
+        serialized['result'] = request_data['result']
+      if request_data.get('error') is not None:
+        serialized['error'] = request_data['error']
+      return serialized
+  """END REQUEST TRACKING"""
+
+  """API ENDPOINTS"""
   if True:
     @BasePlugin.endpoint(method="GET")
     def health(self):
@@ -184,174 +445,292 @@ class BaseInferenceApiPlugin(
         "uptime": self.get_alive_time(),
         "last_error_time": self.last_handled_error_time,
         "total_errors": len(self._api_errors),
+        "metrics": self._metrics,
       }
 
     @BasePlugin.endpoint(method="GET")
-    def check_request(self, request_id: str):
-      res = {
-        "error": f"Request ID {request_id} not found."
+    def metrics(self):
+      self.maybe_refresh_metrics()
+      return {
+        "metrics": self._metrics,
+        "active_requests": [
+          rid for rid, data in self._requests.items()
+          if data['status'] == self.STATUS_PENDING
+        ],
+        'errors_tracked': len(self._api_errors),
       }
-      if request_id in self._requests:
-        request_data = self._requests[request_id]
-        is_finished = request_data.get("finished", False)
-        if is_finished:
-          res = request_data["result"]
-        else:
-          res = {
-            "status": "pending",
-            "request_id": request_id,
-          }
-      # endif request exists
-      return res
-  """END GENERIC API ENDPOINTS"""
+
+    @BasePlugin.endpoint(method="GET")
+    def request_status(self, request_id: str, return_full: bool = False):
+      """
+      Retrieve the status and result of a previously submitted request.
+
+      Parameters
+      ----------
+      request_id : str
+        The unique identifier of the request to retrieve.
+      return_full : bool, optional
+        If True, return the full serialized request data including status and result.
+
+      Returns
+      -------
+      dict
+        If return_full is True, returns the full serialized request data.
+        If the request is still pending, returns only the request_id and status.
+        If the request is completed, returns the result of the request.
+        If the request_id is not found, returns an error message.
+      """
+      serialized = self.serialize_request(request_id=request_id)
+      if serialized is None:
+        return {
+          "error": f"Request ID {request_id} not found.",
+          'request_id': request_id,
+        }
+      if return_full:
+        return serialized
+      if serialized['status'] == self.STATUS_PENDING:
+        return {
+          'request_id': request_id,
+          'status': serialized['status'],
+        }
+      return serialized['result']
+
+    @BasePlugin.endpoint(method="POST")
+    def predict(
+        self,
+        authorization: Optional[str] = None,
+        **kwargs
+    ):
+      return self._predict_entrypoint(
+        authorization=authorization,
+        async_request=False,
+        **kwargs
+      )
+
+    @BasePlugin.endpoint(method="POST")
+    def predict_async(
+        self,
+        authorization: Optional[str] = None,
+        **kwargs
+    ):
+      return self._predict_entrypoint(
+        authorization=authorization,
+        async_request=True,
+        **kwargs
+      )
+  """END API ENDPOINTS"""
 
   """CHAT COMPLETION SECTION"""
   if True:
-    """VALIDATION SECTION"""
-    if True:
-      def check_messages(self, messages: list[dict]):
-        err_msg = None
-        if not isinstance(messages, list) or len(messages) == 0:
-          err_msg = "`messages` must be a non-empty list of message dicts."
-        if err_msg is None and not all(isinstance(m, dict) for m in messages):
-          err_msg = "Each message in `messages` must be a dict."
-        if err_msg is not None:
-          all_messages_valid = all(
-            isinstance(m, dict) and
-            'role' in m and isinstance(m['role'], str) and
-            'content' in m and isinstance(m['content'], str)
-            for m in messages
-          )
-          if err_msg is None and not all_messages_valid:
-            err_msg = "Each message dict must contain 'role' (str) and 'content' (str) keys."
-        # endif err_msg is not None
-        return err_msg
-
-      def check_chat_completion_params(
-          self,
-          messages: list[dict],
-          temperature: float = 0.7,
-          max_tokens: int = 512,
-          repeat_penalty: float = 1.0,
-          **kwargs
-      ):
-        err_msg = None
-        err_msg = self.check_messages(messages)
-
-        return err_msg
-    """END VALIDATION SECTION"""
-
-    def create_chat_completion_helper(
+    def build_chat_payload(
         self,
-        messages: list[dict],
-        temperature: float = 0.7,
-        max_tokens: int = 512,
-        repeat_penalty: float = 1.0,
-        async_request=False,
-        **kwargs
+        request_id: str,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        repeat_penalty: float,
+        metadata: Dict[str, Any],
+        async_request: bool
     ):
-      err_msg = self.check_chat_completion_params(
-        messages=messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        repeat_penalty=repeat_penalty,
-        **kwargs
-      )
-      if err_msg is not None:
-        return {
-          "error": err_msg
-        }
-      # endif invalid params
-      request_id, request_data = self.register_request(
-        async_request=async_request,
-        **kwargs
-      )
-      jeeves_content = {
+      return {
         'REQUEST_ID': request_id,
-        **kwargs,
+        'request_type': 'LLM',
         'messages': messages,
         'temperature': temperature,
         'max_tokens': max_tokens,
+        'top_p': top_p,
         'repeat_penalty': repeat_penalty,
-        'request_type': 'LLM',
+        'metadata': metadata,
+        'async_request': async_request,
       }
-      self.Pd(f"Creating chat completion request {request_id} with data:\n{self.json_dumps(jeeves_content, indent=2)}")
-      self.add_payload_by_fields(
-        jeeves_content=jeeves_content,
-        signature=self.get_signature(),
+
+    def check_predict_params(self, **kwargs):
+      """
+      Hook for checking generic predict parameters.
+      Will have all the parameters passed to the /predict endpoint.
+      Parameters
+      ----------
+      kwargs : dict
+        The parameters to check.
+
+      Returns
+      -------
+      str or None
+        An error message if parameters are invalid, otherwise None.
+      """
+      return None
+
+    def process_predict_params(self, **kwargs):
+      """
+      Hook for processing generic predict parameters.
+      Will have all the parameters passed to the /predict endpoint.
+      Parameters
+      ----------
+      kwargs : dict
+        The parameters to process.
+
+      Returns
+      -------
+      dict
+        The processed parameters.
+      """
+      return kwargs
+
+    def compute_payload_kwargs_from_predict_params(
+        self,
+        request_id: str,
+        request_data: Dict[str, Any],
+    ):
+      return {
+        'REQUEST_ID': request_id,
+        **request_data,
+      }
+
+    def _predict_entrypoint(
+        self,
+        authorization: Optional[str],
+        async_request: bool,
+        **kwargs
+    ):
+      try:
+        subject = self.authorize_request(authorization)
+        self.enforce_rate_limit(subject)
+      except PermissionError as exc:
+        return {'error': str(exc), 'status': 'unauthorized'}
+      except RuntimeError as exc:
+        return {'error': str(exc), 'status': 'rate_limited'}
+      except Exception as exc:
+        return {'error': f"Unexpected error: {str(exc)}", 'status': 'error'}
+      # endtry
+
+      err = self.check_predict_params(**kwargs)
+      if err is not None:
+        return {'error': err}
+      parameters = self.process_predict_params(**kwargs)
+      metadata = {}
+      if 'metadata' in parameters:
+        metadata = parameters.pop('metadata') or {}
+      # endif 'metadata' in parameters
+      request_id, request_data = self.register_request(
+        subject=subject,
+        parameters=parameters,
+        metadata=metadata,
+        timeout=parameters.get('timeout')
       )
+      payload_kwargs = self.compute_payload_kwargs_from_predict_params(
+        request_id=request_id,
+        request_data=request_data,
+      )
+      self.Pd(
+        f"Dispatching request {request_id} :: {self.json_dumps(payload_kwargs, indent=2)[:500]}"
+      )
+      self.add_payload_by_fields(
+        **payload_kwargs,
+        signature=self.get_signature()
+      )
+
       if async_request:
         return {
-          "request_id": request_id,
-          "poll_url": f"/status_request?request_id={request_id}"
+          'request_id': request_id,
+          'poll_url': f"/request_status?request_id={request_id}",
+          'status': self.STATUS_PENDING,
         }
       return self.solve_postponed_request(request_id=request_id)
 
-    @BasePlugin.endpoint(method="POST")
-    def create_chat_completion(
+    def _chat_completion_entrypoint(
         self,
-        messages: list[dict],
-        temperature: float = 0.7,
-        max_tokens: int = 512,
-        repeat_penalty: float = 1.0,
+        messages: List[Dict[str, Any]],
+        temperature: float,
+        max_tokens: int,
+        top_p: float,
+        repeat_penalty: float,
+        metadata: Optional[Dict[str, Any]],
+        authorization: Optional[str],
+        async_request: bool,
         **kwargs
     ):
-      return self.create_chat_completion_helper(
-        async_request=False,
-        messages=messages,
+      try:
+        subject = self.authorize_request(authorization)
+        self.enforce_rate_limit(subject)
+      except PermissionError as exc:
+        return {'error': str(exc), 'status': 'unauthorized'}
+      except RuntimeError as exc:
+        return {'error': str(exc), 'status': 'rate_limited'}
+
+      err = self.check_messages(messages)
+      if err is not None:
+        return {'error': err}
+      err = self.check_generation_params(
         temperature=temperature,
         max_tokens=max_tokens,
-        repeat_penalty=repeat_penalty,
+        top_p=top_p,
         **kwargs
+      )
+      if err is not None:
+        return {'error': err}
+
+      normalized_messages = self.normalize_messages(messages)
+      metadata = metadata or {}
+      parameters = {
+        'temperature': temperature,
+        'max_tokens': max_tokens,
+        'top_p': top_p,
+        'repeat_penalty': repeat_penalty,
+      }
+      request_id, request_data = self.register_request(
+        subject=subject,
+        parameters=parameters,
+        metadata=metadata,
+        timeout=kwargs.get('timeout')
       )
 
-    @BasePlugin.endpoint(method="POST")
-    def create_chat_completion_async(
-        self,
-        messages: list[dict],
-        temperature: float = 0.7,
-        max_tokens: int = 512,
-        repeat_penalty: float = 1.0,
-        **kwargs
-    ):
-      return self.create_chat_completion_helper(
-        async_request=True,
-        messages=messages,
+      payload = self.build_chat_payload(
+        request_id=request_id,
+        messages=normalized_messages,
         temperature=temperature,
         max_tokens=max_tokens,
+        top_p=top_p,
         repeat_penalty=repeat_penalty,
-        **kwargs
+        metadata=metadata,
+        async_request=async_request
       )
+      self.Pd(
+        f"Dispatching request {request_id} :: {self.json_dumps(payload, indent=2)[:500]}"
+      )
+      self.add_payload_by_fields(
+        jeeves_content=payload,
+        signature=self.get_signature()
+      )
+
+      if async_request:
+        return {
+          'request_id': request_id,
+          'poll_url': f"/request_status?request_id={request_id}",
+          'status': self.STATUS_PENDING,
+        }
+      return self.solve_postponed_request(request_id=request_id)
   """END CHAT COMPLETION SECTION"""
 
-  def filter_valid_inference(self, inference):
-    is_valid = super(BaseInferenceApiPlugin, self).filter_valid_inference(inference=inference)
-    if is_valid:
-      request_id = inference.get('REQUEST_ID', None)
-      if request_id is None or request_id not in self._requests:
-        is_valid = False
-    # endif not is_valid
-    return is_valid
-
-  def handle_single_inference(self, inference, model_name=None):
-    request_id = inference.get('REQUEST_ID', None)
-    self.Pd(f"Processing inference for request ID: {request_id}, model: {model_name}")
-    if request_id is None:
-      self.Pd("No REQUEST_ID found in inference; skipping.")
-      return
-    text_response = inference.get('text', None)
-    self._requests[request_id]['result'] = {
-      'REQUEST_ID': request_id,
-      'MODEL_NAME': model_name,
-      'TEXT_RESPONSE': text_response,
-    }
-    self._requests[request_id]['finished'] = True
-    return
+  """INFERENCE HANDLING"""
+  if True:
+    def filter_valid_inference(self, inference):
+      is_valid = super(BaseInferenceApiPlugin, self).filter_valid_inference(inference=inference)
+      if is_valid:
+        request_id = inference.get('REQUEST_ID', None)
+        if request_id is None or request_id not in self._requests:
+          is_valid = False
+      # endif not is_valid
+      return is_valid
+  """END INFERENCE HANDLING"""
 
   def process(self):
+    self.maybe_refresh_metrics()
+    self.cleanup_expired_requests()
     self.maybe_save_persistence_data()
+    data = self.dataapi_struct_datas()
     inferences = self.dataapi_struct_data_inferences()
-    self.handle_inferences(inferences=inferences)
+    self.handle_inferences(inferences=inferences, data=data)
     return
 
 
