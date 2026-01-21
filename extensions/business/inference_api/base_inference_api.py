@@ -114,6 +114,14 @@ class BaseInferenceApiPlugin(
   STATUS_TIMEOUT = "timeout"
 
   def on_init(self):
+    """
+    Initialize plugin state and restore persisted request metadata.
+
+    Returns
+    -------
+    None
+      Method has no return value; it prepares in-memory stores, metrics, and persistence.
+    """
     super(BaseInferenceApiPlugin, self).on_init()
     if not self.cfg_ai_engine:
       err_msg = f"AI_ENGINE must be specified for {self.get_signature()} plugin."
@@ -161,6 +169,14 @@ class BaseInferenceApiPlugin(
   """PERSISTENCE + STATUS"""
   if True:
     def load_persistence_data(self):
+      """
+      Restore cached request data, errors, and metrics from persistence.
+
+      Returns
+      -------
+      None
+        Updates in-memory state if cached data is available.
+      """
       cached_data = self.cacheapi_load_pickle()
       if cached_data is not None:
         # Useful only for debugging purposes
@@ -172,6 +188,19 @@ class BaseInferenceApiPlugin(
       return
 
     def maybe_save_persistence_data(self, force=False):
+      """
+      Persist current request tracking state when needed.
+
+      Parameters
+      ----------
+      force : bool, optional
+        If True, persistence is forced regardless of elapsed time.
+
+      Returns
+      -------
+      None
+        Saves request, error, and metric data when the save interval has elapsed or force is True.
+      """
       if force or (self.time() - self.last_persistence_save) > self.cfg_save_period:
         data_to_save = {
           '_requests': self._requests,
@@ -185,6 +214,14 @@ class BaseInferenceApiPlugin(
       return
 
     def cleanup_expired_requests(self):
+      """
+      Remove completed requests that exceeded the TTL window.
+
+      Returns
+      -------
+      None
+        Evicts expired request entries and logs eviction counts when applicable.
+      """
       ttl_seconds = self.cfg_request_ttl_seconds
       if ttl_seconds <= 0:
         return
@@ -203,6 +240,21 @@ class BaseInferenceApiPlugin(
       return
 
     def record_api_error(self, request_id: Optional[str], error_message: str):
+      """
+      Record an API handling error and update metrics.
+
+      Parameters
+      ----------
+      request_id : str or None
+        Identifier of the request that failed, if available.
+      error_message : str
+        Description of the error encountered.
+
+      Returns
+      -------
+      None
+        Stores the error entry and increments failure metrics.
+      """
       self.last_handled_error_time = self.time()
       key = request_id or f"error_{self.last_handled_error_time}"
       self._api_errors[key] = {
@@ -214,6 +266,14 @@ class BaseInferenceApiPlugin(
       return
 
     def get_status(self):
+      """
+      Compute the current status of the API based on recent errors.
+
+      Returns
+      -------
+      str
+        'ok' when healthy, otherwise a degraded status annotated with time since last error.
+      """
       last_error_time = self.last_handled_error_time
       status = "ok"
       if last_error_time is not None:
@@ -242,6 +302,14 @@ class BaseInferenceApiPlugin(
       return False
 
     def env_allowed_tokens(self):
+      """
+      Retrieve allowed tokens from the configured environment variable.
+
+      Returns
+      -------
+      list of str
+        Token strings parsed from the configured auth environment variable.
+      """
       env_name = self.cfg_auth_token_env
       if not env_name:
         return []
@@ -251,12 +319,38 @@ class BaseInferenceApiPlugin(
       return [token.strip() for token in raw_value.split(',') if token.strip()]
 
     def _configured_tokens(self) -> List[str]:
+      """
+      Aggregate authentication tokens from environment and configuration.
+
+      Returns
+      -------
+      list of str
+        Unique list of tokens allowed for request authorization.
+      """
       env_tokens = self.env_allowed_tokens()
       predefined_tokens = self.cfg_predefined_auth_tokens or []
       all_tokens = set(env_tokens + predefined_tokens)
       return list(all_tokens)
 
     def authorize_request(self, authorization: Optional[str]) -> str:
+      """
+      Validate the authorization header and return the associated subject.
+
+      Parameters
+      ----------
+      authorization : str or None
+        Value of the Authorization header, expected to contain a bearer token.
+
+      Returns
+      -------
+      str
+        Identified subject token or 'anonymous' when anonymous access is permitted.
+
+      Raises
+      ------
+      PermissionError
+        If authorization is required and the provided token is missing or invalid.
+      """
       if self.check_allow_all_requests():
         # TODO: should the apps using this API also have identification tokens for usage analytics?
         return "anonymous"
@@ -278,6 +372,24 @@ class BaseInferenceApiPlugin(
       return token
 
     def enforce_rate_limit(self, subject: str):
+      """
+      Enforce per-subject rate limiting when configured.
+
+      Parameters
+      ----------
+      subject : str
+        Identifier for the client or token being rate limited.
+
+      Returns
+      -------
+      None
+        Increments rate limit counters or raises if the limit is exceeded.
+
+      Raises
+      ------
+      RuntimeError
+        When the subject exceeds the configured requests-per-minute threshold.
+      """
       # TODO: maybe make the rate limit window configurable
       if self.check_allow_all_requests():
         return
@@ -302,6 +414,14 @@ class BaseInferenceApiPlugin(
   """REQUEST TRACKING"""
   if True:
     def refresh_metrics(self):
+      """
+      Update the active request count based on current request statuses.
+
+      Returns
+      -------
+      None
+        Recomputes in-memory metrics for active requests.
+      """
       self._metrics['requests_active'] = sum(
         1 for req in self._requests.values() if req['status'] == self.STATUS_PENDING
       )
@@ -310,6 +430,14 @@ class BaseInferenceApiPlugin(
       return
 
     def maybe_refresh_metrics(self):
+      """
+      Refresh metrics when the refresh interval has elapsed.
+
+      Returns
+      -------
+      None
+        Triggers metric recomputation based on cfg_metrics_refresh_seconds.
+      """
       # For performance, we only refresh metrics every cfg_metrics_refresh_seconds
       now_ts = self.time()
       if (now_ts - self.last_metrics_refresh) > self.cfg_metrics_refresh_seconds:
@@ -318,6 +446,21 @@ class BaseInferenceApiPlugin(
       return
 
     def maybe_mark_request_failed(self, request_id: str, request_data: Dict[str, Any]):
+      """
+      Mark a pending request as failed when an error is attached.
+
+      Parameters
+      ----------
+      request_id : str
+        Identifier of the tracked request.
+      request_data : dict
+        Stored request record containing status and error information.
+
+      Returns
+      -------
+      bool
+        True when the request transitions to failed, False otherwise.
+      """
       if request_data['status'] == self.STATUS_FAILED:
         return True
       if request_data['status'] != self.STATUS_PENDING:
@@ -338,6 +481,21 @@ class BaseInferenceApiPlugin(
       return True
 
     def maybe_mark_request_timeout(self, request_id: str, request_data: Dict[str, Any]):
+      """
+      Mark a pending request as timed out when exceeding the configured timeout.
+
+      Parameters
+      ----------
+      request_id : str
+        Identifier of the tracked request.
+      request_data : dict
+        Stored request record containing timestamps and timeout settings.
+
+      Returns
+      -------
+      bool
+        True when the request transitions to timeout, False otherwise.
+      """
       if request_data['status'] == self.STATUS_TIMEOUT:
         return True
       if request_data['status'] != self.STATUS_PENDING:
@@ -363,6 +521,19 @@ class BaseInferenceApiPlugin(
       return True
 
     def solve_postponed_request(self, request_id: str):
+      """
+      Resolve or requeue a postponed request by checking its current status.
+
+      Parameters
+      ----------
+      request_id : str
+        Identifier of the request to resolve.
+
+      Returns
+      -------
+      dict
+        Request result when completed or failed, or a PostponedRequest for pending work.
+      """
       if request_id in self._requests:
         self.Pd(f"Checking status of request ID {request_id}...")
         request_data = self._requests[request_id]
@@ -394,6 +565,25 @@ class BaseInferenceApiPlugin(
         metadata: Optional[Dict[str, Any]] = None,
         timeout: Optional[int] = None
     ):
+      """
+      Register a new inference request and initialize tracking metadata.
+
+      Parameters
+      ----------
+      subject : str
+        Identifier representing the caller (token or user).
+      parameters : dict
+        Request parameters to forward to the inference engine.
+      metadata : dict, optional
+        Additional metadata to store with the request.
+      timeout : int or None, optional
+        Override for request timeout in seconds.
+
+      Returns
+      -------
+      tuple
+        Generated request_id and the stored request data dictionary.
+      """
       request_id = self.uuid()
       start_time = self.time()
       request_data = {
@@ -414,6 +604,19 @@ class BaseInferenceApiPlugin(
       return request_id, request_data
 
     def serialize_request(self, request_id: str):
+      """
+      Produce a client-friendly view of a tracked request.
+
+      Parameters
+      ----------
+      request_id : str
+        Identifier of the request to serialize.
+
+      Returns
+      -------
+      dict or None
+        Serialized request data including status and metadata, or None if not found.
+      """
       request_data = self._requests.get(request_id)
       if request_data is None:
         return None
@@ -436,6 +639,14 @@ class BaseInferenceApiPlugin(
   if True:
     @BasePlugin.endpoint(method="GET")
     def health(self):
+      """
+      Health check endpoint exposing plugin status and metrics.
+
+      Returns
+      -------
+      dict
+        Status information including uptime, last error time, and request metrics.
+      """
       return {
         "status": self.get_status(),
         "pipeline": self.get_stream_id(),
@@ -450,6 +661,14 @@ class BaseInferenceApiPlugin(
 
     @BasePlugin.endpoint(method="GET")
     def metrics(self):
+      """
+      Metrics endpoint summarizing request counts and active requests.
+
+      Returns
+      -------
+      dict
+        Metric counters and identifiers of currently pending requests.
+      """
       self.maybe_refresh_metrics()
       return {
         "metrics": self._metrics,
@@ -501,6 +720,21 @@ class BaseInferenceApiPlugin(
         authorization: Optional[str] = None,
         **kwargs
     ):
+      """
+      Synchronous prediction entrypoint.
+
+      Parameters
+      ----------
+      authorization : str or None, optional
+        Authorization token supplied by the caller.
+      **kwargs
+        Additional parameters forwarded to request handling.
+
+      Returns
+      -------
+      dict
+        Request result or error payload for synchronous processing.
+      """
       return self._predict_entrypoint(
         authorization=authorization,
         async_request=False,
@@ -513,6 +747,21 @@ class BaseInferenceApiPlugin(
         authorization: Optional[str] = None,
         **kwargs
     ):
+      """
+      Asynchronous prediction entrypoint.
+
+      Parameters
+      ----------
+      authorization : str or None, optional
+        Authorization token supplied by the caller.
+      **kwargs
+        Additional parameters forwarded to request handling.
+
+      Returns
+      -------
+      dict
+        Tracking information for the pending request or error payload.
+      """
       return self._predict_entrypoint(
         authorization=authorization,
         async_request=True,
@@ -522,29 +771,6 @@ class BaseInferenceApiPlugin(
 
   """CHAT COMPLETION SECTION"""
   if True:
-    def build_chat_payload(
-        self,
-        request_id: str,
-        messages: List[Dict[str, Any]],
-        temperature: float,
-        max_tokens: int,
-        top_p: float,
-        repeat_penalty: float,
-        metadata: Dict[str, Any],
-        async_request: bool
-    ):
-      return {
-        'REQUEST_ID': request_id,
-        'request_type': 'LLM',
-        'messages': messages,
-        'temperature': temperature,
-        'max_tokens': max_tokens,
-        'top_p': top_p,
-        'repeat_penalty': repeat_penalty,
-        'metadata': metadata,
-        'async_request': async_request,
-      }
-
     def check_predict_params(self, **kwargs):
       """
       Hook for checking generic predict parameters.
@@ -582,6 +808,21 @@ class BaseInferenceApiPlugin(
         request_id: str,
         request_data: Dict[str, Any],
     ):
+      """
+      Build payload fields from request parameters for downstream processing.
+
+      Parameters
+      ----------
+      request_id : str
+        Identifier of the request being processed.
+      request_data : dict
+        Stored request record containing parameters and metadata.
+
+      Returns
+      -------
+      dict
+        Payload keyword arguments to dispatch to the inference engine.
+      """
       return {
         'REQUEST_ID': request_id,
         **request_data,
@@ -593,6 +834,23 @@ class BaseInferenceApiPlugin(
         async_request: bool,
         **kwargs
     ):
+      """
+      Shared prediction handler performing auth, validation, and dispatch.
+
+      Parameters
+      ----------
+      authorization : str or None
+        Authorization token provided by the client.
+      async_request : bool
+        Whether the request should be processed asynchronously.
+      **kwargs
+        Arbitrary parameters passed to validation and request processing.
+
+      Returns
+      -------
+      dict
+        Response payload containing request status, errors, or results.
+      """
       try:
         subject = self.authorize_request(authorization)
         self.enforce_rate_limit(subject)
@@ -637,84 +895,24 @@ class BaseInferenceApiPlugin(
           'status': self.STATUS_PENDING,
         }
       return self.solve_postponed_request(request_id=request_id)
-
-    def _chat_completion_entrypoint(
-        self,
-        messages: List[Dict[str, Any]],
-        temperature: float,
-        max_tokens: int,
-        top_p: float,
-        repeat_penalty: float,
-        metadata: Optional[Dict[str, Any]],
-        authorization: Optional[str],
-        async_request: bool,
-        **kwargs
-    ):
-      try:
-        subject = self.authorize_request(authorization)
-        self.enforce_rate_limit(subject)
-      except PermissionError as exc:
-        return {'error': str(exc), 'status': 'unauthorized'}
-      except RuntimeError as exc:
-        return {'error': str(exc), 'status': 'rate_limited'}
-
-      err = self.check_messages(messages)
-      if err is not None:
-        return {'error': err}
-      err = self.check_generation_params(
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        **kwargs
-      )
-      if err is not None:
-        return {'error': err}
-
-      normalized_messages = self.normalize_messages(messages)
-      metadata = metadata or {}
-      parameters = {
-        'temperature': temperature,
-        'max_tokens': max_tokens,
-        'top_p': top_p,
-        'repeat_penalty': repeat_penalty,
-      }
-      request_id, request_data = self.register_request(
-        subject=subject,
-        parameters=parameters,
-        metadata=metadata,
-        timeout=kwargs.get('timeout')
-      )
-
-      payload = self.build_chat_payload(
-        request_id=request_id,
-        messages=normalized_messages,
-        temperature=temperature,
-        max_tokens=max_tokens,
-        top_p=top_p,
-        repeat_penalty=repeat_penalty,
-        metadata=metadata,
-        async_request=async_request
-      )
-      self.Pd(
-        f"Dispatching request {request_id} :: {self.json_dumps(payload, indent=2)[:500]}"
-      )
-      self.add_payload_by_fields(
-        jeeves_content=payload,
-        signature=self.get_signature()
-      )
-
-      if async_request:
-        return {
-          'request_id': request_id,
-          'poll_url': f"/request_status?request_id={request_id}",
-          'status': self.STATUS_PENDING,
-        }
-      return self.solve_postponed_request(request_id=request_id)
   """END CHAT COMPLETION SECTION"""
 
   """INFERENCE HANDLING"""
   if True:
     def filter_valid_inference(self, inference):
+      """
+      Validate that an inference payload corresponds to a tracked request.
+
+      Parameters
+      ----------
+      inference : dict
+        Inference payload produced by the downstream engine.
+
+      Returns
+      -------
+      bool
+        True when the inference is accepted for processing, False otherwise.
+      """
       is_valid = super(BaseInferenceApiPlugin, self).filter_valid_inference(inference=inference)
       if is_valid:
         request_id = inference.get('REQUEST_ID', None)
@@ -725,6 +923,14 @@ class BaseInferenceApiPlugin(
   """END INFERENCE HANDLING"""
 
   def process(self):
+    """
+    Main plugin loop handler to refresh metrics, prune requests, and process inferences.
+
+    Returns
+    -------
+    None
+      Drives inference handling for the current iteration.
+    """
     self.maybe_refresh_metrics()
     self.cleanup_expired_requests()
     self.maybe_save_persistence_data()
@@ -732,5 +938,3 @@ class BaseInferenceApiPlugin(
     inferences = self.dataapi_struct_data_inferences()
     self.handle_inferences(inferences=inferences, data=data)
     return
-
-

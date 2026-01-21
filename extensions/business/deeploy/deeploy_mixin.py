@@ -1822,11 +1822,30 @@ class _DeeployMixin:
     plugin_signature: str = None,
     instance_id: str = None
   ):
-    # TODO: maybe check if both app_id and job_id are provided, and raise an error if they are different?
-    #
     """
     Discover the plugin instances for the given app_id and target nodes.
-    Returns a list of dictionaries containing infomration about plugin instances.
+
+    Returns a list of dictionaries containing information about plugin instances.
+
+    Parameters
+    ----------
+    app_id : str
+      Generated application identifier in the form of {app_name}-{uuid4}.
+    job_id : str
+      Incremental job identifier. Interchangeable with app_id for discovery, but they are never the same.
+    target_nodes : list[str]
+      List of target node addresses to filter the search.
+    owner : str
+      Owner address to filter the search.
+    plugin_signature : str
+      Plugin signature to filter the search.
+    instance_id : str
+      Plugin instance ID to filter the search.
+
+    Returns
+    -------
+    list[dict]
+      List of discovered plugin instances with details.
     """
     apps = self._get_online_apps(owner=owner, target_nodes=target_nodes)
     self.P(f"online apps for owner {owner} and target_nodes {target_nodes}: {self.json_dumps(apps)}")
