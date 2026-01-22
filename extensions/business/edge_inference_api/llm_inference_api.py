@@ -87,7 +87,7 @@ Example pipeline configuration:
 }
 """
 
-from extensions.business.inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin
+from extensions.business.edge_inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin
 from extensions.serving.mixins_llm.llm_utils import LlmCT
 
 from typing import Any, Dict, List, Optional
