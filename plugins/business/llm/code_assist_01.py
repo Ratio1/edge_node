@@ -26,11 +26,10 @@ class CodeAssist01Plugin(BasePlugin, _NlpAgentMixin):
   def _process(self):
     # we always receive input from the upstream due to the fact that _process
     # is called only when we have input based on ALLOW_EMPTY_INPUTS=False (from NLP_AGENT_MIXIN_CONFIG)
-    if self.is_debug_mode:
-      full_input = self.dataapi_full_input()
-      self.P("Processing received input: {}".format(full_input))
-      str_dump = self.json_dumps(full_input, indent=2)
-      self.P("Received input from pipeline:\n{}".format(str_dump))
+    full_input = self.dataapi_full_input()
+    self.Pd("Processing received input: {}".format(full_input))
+    str_dump = self.json_dumps(full_input, indent=2)
+    self.Pd("Received input from pipeline:\n{}".format(str_dump))
     # endif debug string
     data = self.dataapi_struct_data()
     inferences = self.dataapi_struct_data_inferences()

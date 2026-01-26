@@ -17,9 +17,70 @@
     "--privileged"
   ],
 
+  // mount your Windows ~/.ssh read-only into the container
+  "mounts": [
+    "source=${localEnv:USERPROFILE}/.ssh,target=/host-ssh,type=bind,consistency=cached,readonly"
+  ],
+
+  // Wait for the clone+sparse step to finish before the IDE connects
+  "waitFor": "onCreateCommand",
+
+  // Set your repo URL once here (or pass it via env)
+  "containerEnv": {
+    "REPO_URL1": "git@github.com-cristibleotiu:Ratio1/edge_node",
+    "REPO_URL": "https://github.com/Ratio1/edge_node",
+    "R1_SSH_HOST": "github.com",
+
+    "R1_SSH_ALIAS": "github.com-cristibleotiu",
+
+    // where the mounted keys live in the container
+    "R1_SSH_KEY_SOURCE_DIR": "${localEnv:USERPROFILE}/.ssh",
+    // filename of your private key on Windows (e.g. id_ed25519 or my_github_key)
+    "R1_SSH_KEY_FILENAME": "github-cristibleotiu",
+
+    // where to place the key inside the container
+    "R1_SSH_DIR": "/root/.ssh",
+    "R1_SSH_KEY_DEST": "github-cristibleotiu",
+
+    // sparse rule files inside the repo (adjust if you keep them elsewhere)
+    "R1_SPARSE_EXCLUDE_FILE": ".devcontainer/sparse-exclude.txt",
+    "R1_SPARSE_INCLUDE_FILE": ".devcontainer/sparse-include.txt"
+  },
+
+//  "onCreateCommand": [
+//    "bash ls -all",
+//    // strict shell + ensure ~/.ssh with safe perms
+//    "bash -lc \"set -euo pipefail; mkdir -p \\\"$R1_SSH_DIR\\\"; chmod 700 \\\"$R1_SSH_DIR\\\"\"",
+//
+//    // copy the Windows key into place with correct perms (public key optional)
+//    "bash -lc \"cp \\\"$R1_SSH_KEY_SOURCE_DIR/$R1_SSH_KEY_FILENAME\\\" \\\"$R1_SSH_DIR/$R1_SSH_KEY_DEST\\\"; chmod 600 \\\"$R1_SSH_DIR/$R1_SSH_KEY_DEST\\\"; if [ -f \\\"$R1_SSH_KEY_SOURCE_DIR/$R1_SSH_KEY_FILENAME.pub\\\" ]; then cp \\\"$R1_SSH_KEY_SOURCE_DIR/$R1_SSH_KEY_FILENAME.pub\\\" \\\"$R1_SSH_DIR/$R1_SSH_KEY_DEST.pub\\\"; fi\"",
+//
+//    // write SSH config for the alias host (e.g., github.com-<user>) → real host + key
+//    "bash -lc \"cat > \\\"$R1_SSH_DIR/config\\\" <<EOF\nHost $R1_SSH_ALIAS\n  HostName $R1_SSH_HOST\n  User git\n  IdentityFile $R1_SSH_DIR/$R1_SSH_KEY_DEST\n  IdentitiesOnly yes\n  HostKeyAlias $R1_SSH_HOST\nEOF\nchmod 600 \\\"$R1_SSH_DIR/config\\\"\"",
+//
+//    // trust the host key non-interactively
+//    "bash -lc \"ssh-keyscan -H \\\"$R1_SSH_HOST\\\" >> \\\"$R1_SSH_DIR/known_hosts\\\" || true\"",
+//
+//    // blobless (partial) clone via the alias URL (e.g., git@github.com-<user>:org/repo)
+//    "bash -lc \"cd ${containerWorkspaceFolder} && git clone --filter=blob:none --sparse \\\"$R1_REPO_SSH_URL\\\" .\"",
+//
+//    // non-cone sparse mode so we can use excludes and fine-grained files
+//    "bash -lc \"git -C ${containerWorkspaceFolder} sparse-checkout init --no-cone\"",
+//
+//    // include everything, then apply excludes from file, then optional re-includes
+//    "bash -lc \"git -C ${containerWorkspaceFolder} sparse-checkout set --no-cone '/*' $(sed -E '/^\\s*(#|$)/d; s/^/!/' \\\"${containerWorkspaceFolder}/$R1_SPARSE_EXCLUDE_FILE\\\" 2>/dev/null || true) $(sed -E '/^\\s*(#|$)/d' \\\"${containerWorkspaceFolder}/$R1_SPARSE_INCLUDE_FILE\\\" 2>/dev/null || true)\"",
+//
+//    // drop now-excluded files from the working tree
+//    "bash -lc \"git -C ${containerWorkspaceFolder} clean -ffdqx || true\""
+//  ],
+
 
   "build": {
+//    "dockerfile": "Dockerfile",
     "context": "../",
+//    "options": [
+//      "--progress=plain"
+//    ]
   },
 
 

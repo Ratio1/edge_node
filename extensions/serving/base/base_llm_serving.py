@@ -238,7 +238,7 @@ class BaseLlmServing(
 
   def get_local_path(self):
     models_cache = self.log.get_models_folder()
-    model_name = 'models/{}'.format(self.get_model_name())
+    model_name = 'models/{}'.format(self.cfg_model_name)
     model_subfolder = model_name.replace('/', '--')
     path = self.os_path.join(models_cache, model_subfolder)
     if self.os_path.isdir(path):
@@ -442,11 +442,14 @@ class BaseLlmServing(
     normalized_signature = str(inp_signature).upper() if inp_signature is not None else None
 
     if normalized_signature not in self.get_relevant_signatures():
-      # self.P(f"[DEBUG]Skipping irrelevant signature: {normalized_signature}. Relevant signatures: {self.get_relevant_signatures()}", color='y')
+      self.P(f"[DEBUG]Skipping irrelevant signature: {normalized_signature}. Relevant signatures: {self.get_relevant_signatures()}", color='y')
       return False
 
     jeeves_content = input_dict.get(self.ct.JeevesCt.JEEVES_CONTENT, {})
-    # self.P(f"[DEBUG]Extracted jeeves content for relevance check: {self.shorten_str(jeeves_content)}", color='g')
+    if not jeeves_content:
+      self.P(f"[DEBUG]No jeeves content found in input: {self.shorten_str(input_dict)}", color='y')
+      return False
+    self.P(f"[DEBUG]Extracted jeeves content for relevance check: {self.shorten_str(jeeves_content)}", color='g')
     return self.check_supported_request_type(message_data=jeeves_content)
 
   def process_predict_kwargs(self, predict_kwargs: dict):
@@ -928,11 +931,16 @@ class BaseLlmServing(
       # LlmCT.PRED: yhat,
       LlmCT.PRMP: prompt_lst,
       # LlmCT.TKNS: batch_tokens,
+      # TODO: add back the tps and maybe additional metrics to mimic the openai API structure
       # LlmCT.TPS: num_tps,
       LlmCT.ADDITIONAL: additional_lst,
       LlmCT.TEXT: text_lst,
       "RELEVANT_IDS": relevant_input_ids,
-      "TOTAL_INPUTS": cnt_total_inputs
+      "TOTAL_INPUTS": cnt_total_inputs,
+      # Placeholder for full output if needed in post-processing.
+      # In the future, this can be populated with more detailed
+      # generation information.
+      LlmCT.FULL_OUTPUT: text_lst,
     }
     return dct_result
 
@@ -949,6 +957,7 @@ class BaseLlmServing(
     text_lst = preds_batch[LlmCT.TEXT]
     relevant_input_ids = preds_batch["RELEVANT_IDS"]
     cnt_total_inputs = preds_batch["TOTAL_INPUTS"]
+    full_output_lst = preds_batch[LlmCT.FULL_OUTPUT]
 
     for i, additional in enumerate(additionals):
       self.processed_requests.add(additional[LlmCT.REQUEST_ID])
@@ -961,12 +970,14 @@ class BaseLlmServing(
         # LlmCT.PRED : yhat[i].tolist(),
         LlmCT.PRMP : prompts[i],
         LlmCT.TEXT : decoded,
+        LlmCT.FULL_OUTPUT: full_output_lst[i],
         # LlmCT.TKNS : tokens[i].tolist(),
         # LlmCT.TPS  : tps,
         **preds_batch[LlmCT.ADDITIONAL][i],
         # TODO: find a way to send the model metadata to the plugin, other than through the inferences.
-        'MODEL_NAME': self.get_model_name()
+        'MODEL_NAME': self.get_model_name(),
       }
+      # endif full_output_lst is not None
       result.append(dct_result)
     # endfor each text
     current_text_idx = 0
