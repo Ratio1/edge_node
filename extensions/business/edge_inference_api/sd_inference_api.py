@@ -1,17 +1,17 @@
 """
-CV_INFERENCE_API Plugin
+SD_INFERENCE_API Plugin
 
-Production-Grade Computer Vision Inference API
+Production-Grade Structured Data Inference API
 
-This plugin exposes a hardened, FastAPI-powered interface for
-computer-vision workloads. It reuses the BaseInferenceApi request lifecycle
-while tailoring validation and response shaping for image analysis.
+This plugin exposes a hardened, FastAPI-powered interface for structured-data
+workloads. It reuses the BaseInferenceApi request lifecycle while tailoring
+validation and response shaping for general-purpose tabular/JSON inference.
 
 Highlights
-- Loopback-only surface paired with local third-party applications that use it
+- Loopback-only surface paired with local clients
 - Request tracking, persistence, auth, and rate limiting from BaseInferenceApi
-- Base64 payload validation and metadata normalization for serving plugins
-- Structured mapping of struct_data payloads and inferences back to requests
+- Structured payload validation and metadata normalization
+- Mapping of struct_data payloads and inferences back to requests
 """
 
 from typing import Any, Dict, Optional
@@ -23,18 +23,18 @@ __VER__ = '0.1.0'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
-  "API_TITLE": "CV Inference API",
-  "API_SUMMARY": "Local image analysis API",
+  "API_TITLE": "Structured Data Inference API",
+  "API_SUMMARY": "Local structured-data analysis API for paired clients.",
   "REQUEST_TIMEOUT": 240,
-  "MIN_IMAGE_DATA_LENGTH": 100,
+  "MIN_STRUCT_DATA_FIELDS": 1,
 
   "VALIDATION_RULES": {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
-    "MIN_IMAGE_DATA_LENGTH": {
-      "DESCRIPTION": "Minimum base64 payload length used for coarse validation.",
+    "MIN_STRUCT_DATA_FIELDS": {
+      "DESCRIPTION": "Minimum number of top-level fields required in struct_data.",
       "TYPE": "int",
-      "MIN_VAL": 10,
-      "MAX_VAL": 1_000_000,
+      "MIN_VAL": 1,
+      "MAX_VAL": 10000,
     },
     'REQUEST_TIMEOUT': {
       'DESCRIPTION': 'Timeout for PostponedRequest polling (seconds)',
@@ -46,24 +46,52 @@ _CONFIG = {
 }
 
 
-class CvInferenceApiPlugin(BasePlugin):
+class SdInferenceApiPlugin(BasePlugin):
   CONFIG = _CONFIG
+
+  def _normalize_struct_data(self, struct_data: Any):
+    """
+    Normalize and validate struct_data input shape.
+
+    Parameters
+    ----------
+    struct_data : Any
+      Incoming structured data payload.
+
+    Returns
+    -------
+    tuple
+      (normalized_struct_data, error_message). error_message is None when valid.
+    """
+    if isinstance(struct_data, dict):
+      if len(struct_data) < self.cfg_min_struct_data_fields:
+        return None, (
+          f"`struct_data` must contain at least {self.cfg_min_struct_data_fields} fields."
+        )
+      return struct_data, None
+    if isinstance(struct_data, list):
+      if not struct_data:
+        return None, "`struct_data` list must not be empty."
+      if not all(isinstance(item, dict) for item in struct_data):
+        return None, "`struct_data` list items must all be dictionaries."
+      return struct_data, None
+    return None, "`struct_data` must be a dictionary or list of dictionaries."
 
   """VALIDATION"""
   if True:
     def check_predict_params(
       self,
-      image_data: str,
+      struct_data: Any,
       metadata: Optional[Dict[str, Any]] = None,
       **kwargs
     ):
       """
-      Validate input parameters for image prediction requests.
+      Validate input parameters for structured-data prediction requests.
 
       Parameters
       ----------
-      image_data : str
-        Base64-encoded image string.
+      struct_data : Any
+        Structured payload (dict or list of dicts).
       metadata : dict or None, optional
         Optional metadata accompanying the request.
       **kwargs
@@ -74,18 +102,16 @@ class CvInferenceApiPlugin(BasePlugin):
       str or None
         Error message when validation fails, otherwise None.
       """
-      if not isinstance(image_data, str) or len(image_data) < self.cfg_min_image_data_length:
-        return (
-          "Invalid or missing image data. "
-          f"Expecting base64 content with at least {self.cfg_min_image_data_length} characters."
-        )
+      _, err = self._normalize_struct_data(struct_data)
+      if err:
+        return err
       if metadata is not None and not isinstance(metadata, dict):
         return "`metadata` must be a dictionary when provided."
       return None
 
     def process_predict_params(
       self,
-      image_data: str,
+      struct_data: Any,
       metadata: Optional[Dict[str, Any]] = None,
       **kwargs
     ):
@@ -94,8 +120,8 @@ class CvInferenceApiPlugin(BasePlugin):
 
       Parameters
       ----------
-      image_data : str
-        Base64-encoded image string.
+      struct_data : Any
+        Structured payload (dict or list of dicts).
       metadata : dict or None, optional
         Optional metadata accompanying the request.
       **kwargs
@@ -106,9 +132,10 @@ class CvInferenceApiPlugin(BasePlugin):
       dict
         Processed parameters ready for dispatch to the inference engine.
       """
+      normalized_struct, _ = self._normalize_struct_data(struct_data)
       cleaned_metadata = metadata or {}
       return {
-        'image_data': image_data,
+        'struct_data': normalized_struct,
         'metadata': cleaned_metadata,
         'request_type': 'prediction',
         **{k: v for k, v in kwargs.items() if k not in {'metadata'}},
@@ -120,7 +147,7 @@ class CvInferenceApiPlugin(BasePlugin):
       request_data: Dict[str, Any],
     ):
       """
-      Build payload keyword arguments for Computer Vision inference.
+      Build payload keyword arguments for structured-data inference.
 
       Parameters
       ----------
@@ -132,14 +159,14 @@ class CvInferenceApiPlugin(BasePlugin):
       Returns
       -------
       dict
-        Payload fields including image data, metadata, and submission info.
+        Payload fields including struct_data, metadata, and submission info.
       """
       params = request_data['parameters']
       submitted_at = request_data['created_at']
       metadata = params.get('metadata') or request_data.get('metadata') or {}
       return {
         'request_id': request_id,
-        'image_data': params['image_data'],
+        'struct_data': params['struct_data'],
         'metadata': metadata,
         'type': params.get('request_type', 'prediction'),
         'submitted_at': submitted_at,
@@ -195,18 +222,18 @@ class CvInferenceApiPlugin(BasePlugin):
     @BasePlugin.endpoint(method="POST")
     def predict(
         self,
-        image_data: str = '',
+        struct_data: Any = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         **kwargs
     ):
       """
-      Synchronous Computer Vision prediction endpoint.
+      Synchronous structured-data prediction endpoint.
 
       Parameters
       ----------
-      image_data : str, optional
-        Base64-encoded image string to analyze.
+      struct_data : Any, optional
+        Structured payload (dict or list of dicts) to analyze.
       metadata : dict or None, optional
         Optional metadata accompanying the request.
       authorization : str or None, optional
@@ -219,8 +246,8 @@ class CvInferenceApiPlugin(BasePlugin):
       dict
         Result payload for synchronous processing or an error message.
       """
-      return super(CvInferenceApiPlugin, self).predict(
-        image_data=image_data,
+      return super(SdInferenceApiPlugin, self).predict(
+        struct_data=struct_data,
         metadata=metadata,
         authorization=authorization,
         **kwargs
@@ -229,18 +256,18 @@ class CvInferenceApiPlugin(BasePlugin):
     @BasePlugin.endpoint(method="POST")
     def predict_async(
         self,
-        image_data: str = '',
+        struct_data: Any = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         **kwargs
     ):
       """
-      Asynchronous Computer Vision prediction endpoint.
+      Asynchronous structured-data prediction endpoint.
 
       Parameters
       ----------
-      image_data : str, optional
-        Base64-encoded image string to analyze.
+      struct_data : Any, optional
+        Structured payload (dict or list of dicts) to analyze.
       metadata : dict or None, optional
         Optional metadata accompanying the request.
       authorization : str or None, optional
@@ -253,8 +280,8 @@ class CvInferenceApiPlugin(BasePlugin):
       dict
         Tracking payload for asynchronous processing or an error message.
       """
-      return super(CvInferenceApiPlugin, self).predict_async(
-        image_data=image_data,
+      return super(SdInferenceApiPlugin, self).predict_async(
+        struct_data=struct_data,
         metadata=metadata,
         authorization=authorization,
         **kwargs
@@ -381,7 +408,7 @@ class CvInferenceApiPlugin(BasePlugin):
       Returns
       -------
       dict
-        Structured result payload including analysis and image details.
+        Structured result payload including prediction and auxiliary details.
 
       Raises
       ------
@@ -390,11 +417,30 @@ class CvInferenceApiPlugin(BasePlugin):
       RuntimeError
         When the inference indicates an error status.
       """
-      return {
+      if not isinstance(inference, dict):
+        raise ValueError("Invalid inference result format.")
+      inference_data = inference.get('data', inference)
+      status = inference_data.get('status', inference.get('status', 'completed'))
+      if status == 'error':
+        err_msg = inference_data.get('error', 'Unknown error')
+        raise RuntimeError(err_msg)
+
+      prediction = inference_data.get('prediction', inference_data.get('result'))
+      result_payload = {
+        'status': 'completed',
         'request_id': request_id,
-        'inference': inference,
+        'prediction': prediction,
         'metadata': metadata or request_data.get('metadata') or {},
+        'processed_at': inference_data.get('processed_at', self.time()),
+        'processor_version': inference_data.get('processor_version', 'unknown'),
       }
+      if 'model_name' in inference_data:
+        result_payload['model_name'] = inference_data['model_name']
+      if 'scores' in inference_data:
+        result_payload['scores'] = inference_data['scores']
+      if 'probabilities' in inference_data:
+        result_payload['probabilities'] = inference_data['probabilities']
+      return result_payload
 
     def handle_inference_for_request(
       self,

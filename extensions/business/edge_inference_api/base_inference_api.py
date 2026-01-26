@@ -31,6 +31,7 @@ Available Endpoints:
 - POST /predict - Compute prediction (sync)
 - POST /predict_async - Compute prediction (async)
 - GET /health - Health check
+- GET /status - Status of API
 - GET /metrics - Retrieve API metrics
 - GET /request_status - Check for current status of async request results
 
@@ -155,6 +156,33 @@ class BaseInferenceApiPlugin(
     start_msg += f"\t\tLoopback key: loopback_dct_{self._stream_id}"
     self.P(start_msg)
     return
+
+  def _get_payload_field(self, data: dict, key: str, default=None):
+    """
+    Retrieve a value from payload data using case-insensitive lookup.
+
+    Parameters
+    ----------
+    data : dict
+      Payload dictionary to search.
+    key : str
+      Target key to retrieve (case-insensitive).
+    default : Any, optional
+      Fallback value when the key is not present.
+
+    Returns
+    -------
+    Any
+      Matched value from the payload or the provided default.
+    """
+    if not isinstance(data, dict):
+      return default
+    if key in data:
+      return data[key]
+    key_upper = key.upper()
+    if key_upper in data:
+      return data[key_upper]
+    return default
 
   def _setup_semaphore_env(self):
     """Set semaphore environment variables for bundled plugins."""
@@ -657,6 +685,37 @@ class BaseInferenceApiPlugin(
         "last_error_time": self.last_handled_error_time,
         "total_errors": len(self._api_errors),
         "metrics": self._metrics,
+      }
+
+    @BasePlugin.endpoint(method="GET")
+    def status(self):
+      """
+      Status endpoint summarizing API state.
+
+      Returns
+      -------
+      dict
+        Basic service info plus counts of pending and completed requests.
+      """
+      pending = len([
+        rid for rid, data in self._requests.items()
+        if data.get('status') == self.STATUS_PENDING
+      ])
+      completed = len([
+        rid for rid, data in self._requests.items()
+        if data.get('status') == self.STATUS_COMPLETED
+      ])
+      return {
+        "status": self.get_status(),
+        "service": self.cfg_api_summary,
+        "version": __VER__,
+        "stream_id": self.get_stream_id(),
+        "plugin": self.get_signature(),
+        "instance_id": self.get_instance_id(),
+        "total_requests": len(self._requests),
+        "pending_requests": pending,
+        "completed_requests": completed,
+        "uptime_seconds": self.get_alive_time(),
       }
 
     @BasePlugin.endpoint(method="GET")

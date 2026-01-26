@@ -1010,7 +1010,21 @@ class _OraSyncStatesCallbacksMixin:
         if not self._check_received_agreement_signature_ok(sender, oracle_data):
           continue
 
-        signature_dict = oracle_data[OracleSyncCt.AGREEMENT_SIGNATURE]
+        # Attempting to extract both in case of multiple signature message from S10
+        signature_dict = oracle_data.get(OracleSyncCt.AGREEMENT_SIGNATURE)
+        signatures_dict = oracle_data.get(OracleSyncCt.AGREEMENT_SIGNATURES)
+        is_single_signature = False
+        if signature_dict is not None:
+          is_single_signature = True
+          signatures_dict = {sender: signature_dict}
+        # endif single signature message
+
+        temp_agreement_signatures = {
+          **signatures_dict,
+          **self.compiled_agreed_median_table_signatures,
+        }
+        is_duplicated = len(temp_agreement_signatures) == len(self.compiled_agreed_median_table_signatures)
+        current_count = len(temp_agreement_signatures)
 
         if self.cfg_debug_sync:
           stage = oracle_data[OracleSyncCt.STAGE]
@@ -1018,14 +1032,20 @@ class _OraSyncStatesCallbacksMixin:
             sender=sender,
             stage=stage,
             data=self.compiled_agreed_median_table_signatures,
-            return_str=True
+            return_str=True,
+            is_duplicated=is_duplicated,
+            current_count=current_count,
           )
           if self.cfg_debug_sync_full:
-            log_str += f", {signature_dict = }"
+            added_log_str = f", {signature_dict = }"
+            if not is_single_signature:
+              added_log_str = f", signatures_dict = {self.json_dumps(signatures_dict, indent=2)}"
+            # endif multi signature
+            log_str += added_log_str
           # endif debug_sync_full
           self.P(log_str)
         # endif debug_sync
-        self.compiled_agreed_median_table_signatures[sender] = signature_dict
+        self.compiled_agreed_median_table_signatures = temp_agreement_signatures
       # endfor received messages
       return
 
@@ -1123,6 +1143,14 @@ class _OraSyncStatesCallbacksMixin:
 
   """S7_UPDATE_EPOCH_MANAGER CALLBACKS"""
   if True:
+    def _check_enough_signatures_collected(self):
+      return self.enough_signatures_collected
+
+    def _check_not_enough_signatures_collected(self):
+      # This check is written in this way in order to be able to differentiate between
+      # the consensus being in progress and it being failed at the final state.
+      return self.enough_signatures_collected is False
+
     def _update_epoch_manager_with_agreed_median_table(
         self, epoch=None, compiled_agreed_median_table=None, agreement_signatures=None,
         epoch_is_valid=None, agreement_cid=None, signatures_cid=None, debug=True
@@ -1177,6 +1205,12 @@ class _OraSyncStatesCallbacksMixin:
         oracle_list = self.get_oracle_list()
         oracle_signers = [oracle for oracle in oracle_list if oracle in signers]
         epoch_is_valid = len(oracle_signers) > 0
+        if is_single_call and epoch_is_valid:
+          self.enough_signatures_collected = self._check_enough_oracles(
+            participating_oracles=signers
+          )
+          epoch_is_valid = self.enough_signatures_collected
+        # endif is_single_call
       # endif epoch_is_valid
 
       if epoch <= self._last_epoch_synced:
@@ -1223,8 +1257,11 @@ class _OraSyncStatesCallbacksMixin:
         if debug:
           valid_str = "VALID" if epoch_is_valid else "INVALID"
           announced_cnt = len(self._announced_participating)
-          log_str = f'Successfully synced epoch {epoch} with {valid_str} agreed median table '
-          log_str += f'and {len(agreement_signatures)} agreement signatures from '
+          log_str = f'Successfully synced epoch {epoch} with {valid_str} agreed median table and'
+          if is_single_call and not epoch_is_valid:
+            log_str = f"Failed to reach consensus for epoch {epoch} with"
+          # endif check if failed consensus
+          log_str += f' {len(agreement_signatures)} agreement signatures from '
           log_str += f'{announced_cnt} announced participants at the start.\n'
           log_str += f"Initially announced participants:"
           log_str += "".join([
@@ -1250,9 +1287,13 @@ class _OraSyncStatesCallbacksMixin:
 
           if self.cfg_debug_sync_full:
             self.P(f'DEBUG EM data after update:\n{self.netmon.epoch_manager.data}')
-        self._last_epoch_synced = epoch
-        # In case of multiple updates, the save is only needed after the last update.
         if is_single_call:
+          if epoch_is_valid:
+            self._last_epoch_synced = epoch
+        else:
+          self._last_epoch_synced = epoch
+        # In case of multiple updates, the save is only needed after the last update.
+        if is_single_call and epoch_is_valid:
           self.netmon.epoch_manager.maybe_update_cached_data(force=True)
           self.netmon.epoch_manager.save_status()
         # endif part of consensus process
