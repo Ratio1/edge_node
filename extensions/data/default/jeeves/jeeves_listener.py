@@ -9,6 +9,7 @@ _CONFIG = {
   "PATH_FILTER": JeevesCt.UNIFIED_PATH_FILTER,
   "SUPPORTED_REQUEST_TYPES": None,  # supported request types, None means all are supported
 
+  "ALLOW_UNVERIFIED_MESSAGES": False,  # if set to True, messages that fail verification will still be processed
 
   'VALIDATION_RULES': {
     **BaseClass.CONFIG['VALIDATION_RULES'],
@@ -18,14 +19,6 @@ _CONFIG = {
 
 class JeevesListenerDataCapture(BaseClass, _JeevesUtilsMixin):
   CONFIG = _CONFIG
-
-  def Pd(self, s, color=None, **kwargs):
-    """
-    Print debug message with Jeeves agent prefix.
-    """
-    if self.cfg_debug_iot_payloads:
-      self.P(s, color=color, **kwargs)
-    return
 
   def filter_message_for_agent(self, normalized_message: dict):
     """
@@ -100,6 +93,28 @@ class JeevesListenerDataCapture(BaseClass, _JeevesUtilsMixin):
 
     return payload_signature in JeevesCt.JEEVES_API_SIGNATURES
 
+  def maybe_verify_message(self, message: dict):
+    if self.cfg_allow_unverified_messages:
+      return message
+    verified = False
+    verify_msg = None
+    try:
+      verify_results = self.bc.verify(
+        dct_data=message,
+        str_signature=None, sender_address=None,
+        return_full_info=True
+      )
+      verified = verify_results.valid
+      verify_msg = verify_results.message
+    except Exception as e:
+      verify_msg = f"Error during message signature verification: {e}"
+    if not verified:
+      self.P(
+        f"Message signature verification failed: {verify_msg}. Message: {message}",
+        color='r'
+      )
+    return message if verified else None
+
   def _filter_message(self, unfiltered_message: dict):
     """
     Method for checking if the message should be kept or not during the filtering process.
@@ -129,13 +144,28 @@ class JeevesListenerDataCapture(BaseClass, _JeevesUtilsMixin):
       self.Pd(f"Invalid message format: {self.shorten_str(prefiltered_message)}", color='r')
       return None
 
+    self.Pd(f"Initial prefiltered message: {prefiltered_message}")
+
+    prefiltered_message = self.maybe_verify_message(prefiltered_message)
+    if prefiltered_message is None:
+      self.P(f"Message verification failed, dropping message.", color='r')
+      return None
+    self.Pd(f"Verified prefiltered message: {prefiltered_message}")
+    prefiltered_message = self.receive_and_decrypt_payload(prefiltered_message)
+    self.Pd(f"Decrypted prefiltered message: {self.shorten_str(prefiltered_message)}")
+    if not prefiltered_message:
+      self.P(f"Message decryption failed, dropping message.", color='r')
+      return None
+
     normalized_message = {
       (k.upper() if isinstance(k, str) else k): v
       for k, v in prefiltered_message.items()
     }
 
     if self.check_message_for_agent(normalized_message):
+      self.P(f"Message intended for Jeeves agent processing.")
       prefiltered_message = self.filter_message_for_agent(normalized_message)
     # endif message for agent
+    self.Pd(f"Final prefiltered message: {self.shorten_str(prefiltered_message)}")
     return prefiltered_message
 

@@ -13,6 +13,8 @@ _CONFIG = {
   'CHAINSTORE_RESPONSE_KEY': None,
 
   "MAX_INPUTS_QUEUE_SIZE": 100,
+  # The verifying is not required since it is done in the DCT.
+  "SKIP_MESSAGE_VERIFY": True,
 
   'PORT': 15033,
   'ASSETS': 'extensions/business/fastapi/jeeves_api',

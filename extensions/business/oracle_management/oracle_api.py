@@ -1,10 +1,10 @@
 """
 
 The OracleApiPlugin is a FastAPI web app that provides endpoints to interact with the
-oracle network of the Naeural Edge Protocol
+oracle network of the Ratio1 Edge Protocol
 
 Each request will generate data as follows:
-- availablity data is requested from the oracle API
+- availability data is requested from the oracle API
 - the data is signed with EVM signature and signature/address is added
 - other oracle peers signatures are added - all must be on same agreed availability
 - package is node-signed and returned to the client
