@@ -66,7 +66,7 @@ from extensions.business.oracle_sync.sync_mixins.ora_sync_constants import (
   POTENTIALLY_FULL_AVAILABILITY_THRESHOLD,
 
   SUPERVISOR_MIN_AVAIL_PRC,
-  MAX_RECEIVED_MESSAGES_SIZE,
+  MAX_RECEIVED_MESSAGES_PER_ORACLE,
   ORACLE_SYNC_USE_R1FS,
 )
 
@@ -320,9 +320,15 @@ class OracleSync01Plugin(
           'TRANSITIONS': [
             {
               'NEXT_STATE': self.STATES.S0_WAIT_FOR_EPOCH_CHANGE,
-              'TRANSITION_CONDITION': self.state_machine_api_callback_always_true,
+              'TRANSITION_CONDITION': self._check_enough_signatures_collected,
               'ON_TRANSITION_CALLBACK': self._reset_to_initial_state,
-              'DESCRIPTION': "Wait for the epoch to change to start a new sync process",
+              'DESCRIPTION': "Consensus reached. Wait for the epoch to change to start a new sync process",
+            },
+            {
+              'NEXT_STATE': self.STATES.S8_SEND_REQUEST_AGREED_MEDIAN_TABLE,
+              'TRANSITION_CONDITION': self._check_not_enough_signatures_collected,
+              'ON_TRANSITION_CALLBACK': self.state_machine_api_callback_do_nothing,
+              'DESCRIPTION': 'If not enough signatures were collected, request the agreement from the other oracles.'
             }
           ],
         },
@@ -417,7 +423,7 @@ class OracleSync01Plugin(
     # because they have to request the agreed median table and wait to receive
     # the agreed median table from the previous epochs.
     self.state_machine_name = 'OracleSyncPlugin'
-    self._received_messages_from_oracles = self.deque(maxlen=MAX_RECEIVED_MESSAGES_SIZE)
+    self._oracle_received_messages = self.defaultdict(lambda: self.deque(maxlen=MAX_RECEIVED_MESSAGES_PER_ORACLE))
     self.state_machine_api_init(
       name=self.state_machine_name,
       state_machine_transitions=self._prepare_job_state_transition_map(),
@@ -469,6 +475,8 @@ class OracleSync01Plugin(
     self.dct_agreed_availability_cid = {}
     self.dct_agreement_signatures_cid = {}
 
+    self.enough_signatures_collected = None
+
     # This will store the number of iterations the oracle has performed after the early stopping condition
     # is met.
     self.early_stopping_iterations = {}
@@ -478,16 +486,6 @@ class OracleSync01Plugin(
     self.last_time_request_agreed_median_table_sent = None
     self.P(f'Current epoch: {self._current_epoch}, Last epoch synced: {self._last_epoch_synced}.')
     return
-
-  # """STATE MACHINE CALLBACKS SECTION"""
-  # if True:
-  #   
-  # """END STATE MACHINE SECTION"""
-
-  # """UTILS SECTION"""
-  # if True:
-  # 
-  # """END UTILS SECTION"""
 
   """MESSAGE HANDLING UTILS SUBSECTION"""
   if True:
@@ -504,25 +502,24 @@ class OracleSync01Plugin(
       sender = payload.get(self.ct.PAYLOAD_DATA.EE_SENDER)
       if not self._is_oracle(sender):
         return
-      self._received_messages_from_oracles.append(payload)
+      self._oracle_received_messages[sender].append(payload)
       return
 
     def get_received_messages_from_oracles(self):
       """
-      Get the messages received from the oracles.
-      This method returns a generator for memory efficiency.
+      Get the messages received from all the oracles.
+      This method will gather the last received message from each oracle and return them
 
       Returns
       -------
-      generator : The messages received from the oracles
+      received_messages : list of dict
+        The received messages
       """
-      # retrieve messages from self._received_messages_from_oracles
-      dct_messages = list(self._received_messages_from_oracles)
-      self._received_messages_from_oracles.clear()
-      # This will return a generator that will be used in the next steps.
-      received_messages = (dct_messages[i] for i in range(len(dct_messages)))
-
-      return received_messages
+      return [
+        message_deque.popleft()
+        for message_deque in self._oracle_received_messages.values()
+        if message_deque
+      ]
   """END MESSAGE HANDLING UTILS SUBSECTION"""
 
   def maybe_self_assessment(self):

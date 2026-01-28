@@ -642,9 +642,13 @@ class _OraSyncUtilsMixin:
         stage: str,
         data: dict,
         return_str: bool = False,
+        is_duplicated: bool = None,
+        current_count: int = None,
     ):
-      is_duplicated = sender in data.keys()
-      current_count = len(data) + (1 - is_duplicated)
+      if is_duplicated is None:
+        is_duplicated = sender in data.keys()
+      if current_count is None:
+        current_count = len(data) + (1 - is_duplicated)
       duplicated_str = "(duplicated)" if is_duplicated else ""
       progress_str = f"[{current_count}/{self.total_participating_oracles()}]"
       sender_str = self.get_sender_str(sender)
@@ -956,8 +960,9 @@ class _OraSyncUtilsMixin:
       expected_variable_names : list[str]
           The list of expected variable names in `oracle_data`
           Will be used to retrieve the standards from `VALUE_STANDARDS`
-      expected_stage : str, optional
+      expected_stage : str or list, optional
           The expected stage of the message. If None, this will be skipped.
+          If list[str] is provided all the states will be valid.
       verify : bool, optional
           If True, oracle_data has to contain `EE_SIGN` key with the signature of the data in it.
 
@@ -1452,6 +1457,43 @@ class _OraSyncUtilsMixin:
         return False
       return True
 
+    def _check_multiple_signatures(self, agreement_signatures_dict, sender_str: str):
+      """
+      Check if signatures from multiple senders are valid.
+
+      Parameters
+      ----------
+      agreement_signatures_dict : dict
+        A dictionary of {sender: agreement_signature} with the signatures of each sender.
+
+      sender_str : str
+        String from sender of the entire message
+
+      Returns
+      -------
+      bool : True if the signatures are valid, False otherwise
+      """
+      for sig_sender, signature_dict in agreement_signatures_dict.items():
+        sig_sender_str = self.get_sender_str(sender=sig_sender)
+        if not self.is_participating.get(sig_sender, False):
+          self.P(f"Oracle {sig_sender_str} should not have sent signature for agreement[Received from {sender_str}]. ignoring...", color='r')
+          # TODO: review if this should make the entire message invalid
+          # One node can be seen as potentially full online by some oracles and not by others.
+          # But for the node to actually participate in the agreement, it has to see itself as full online.
+          # That can not happen if the node is not seen as potentially full online by at least another
+          # participating oracle.
+          return False
+        # endif not expected to participate
+        if not self._check_agreement_signature(
+          sender=sig_sender,
+          signature_dict=signature_dict,
+        ):
+          self.P(f"Invalid agreement signature from oracle {sig_sender_str}!", color='r')
+          return False
+        # endif valid agreement signature
+      # endfor agreement signatures
+      return True
+
     def _check_received_agreement_signature_ok(self, sender, oracle_data):
       """
       Check if the received signature for agreement is ok. Print the error message if not.
@@ -1467,7 +1509,7 @@ class _OraSyncUtilsMixin:
       -------
       bool : True if the received agreed value is ok, False otherwise
       """
-      if not self._check_received_oracle_data_for_values(
+      valid_single_signature_message = self._check_received_oracle_data_for_values(
           sender=sender,
           oracle_data=oracle_data,
           expected_variable_names=[
@@ -1477,11 +1519,29 @@ class _OraSyncUtilsMixin:
           # No need to verify here, since the agreement signature itself is signed and verified
           # in the self._check_agreement_signature method
           verify=False,
-      ):
+      )
+      valid_multi_signature_message = self._check_received_oracle_data_for_values(
+        sender=sender,
+        oracle_data=oracle_data,
+        expected_variable_names=[
+          OracleSyncCt.STAGE, OracleSyncCt.AGREEMENT_SIGNATURES
+        ],
+        expected_stage=self.STATES.S10_EXCHANGE_AGREEMENT_SIGNATURES,
+        # No need to verify here, since the agreement signature itself is signed and verified
+        # in the self._check_agreement_signature method
+        verify=False,
+      )
+      if not valid_single_signature_message and not valid_multi_signature_message:
         return False
 
-      signature_dict = oracle_data[OracleSyncCt.AGREEMENT_SIGNATURE]
       sender_str = self.get_sender_str(sender=sender)
+      signatures_dict = {}
+      if valid_single_signature_message:
+        signature_dict = oracle_data[OracleSyncCt.AGREEMENT_SIGNATURE]
+        signatures_dict[sender] = signature_dict
+      else:
+        signatures_dict = oracle_data[OracleSyncCt.AGREEMENT_SIGNATURES]
+      # endif single signature or multi signature
 
       # In the is_participating dictionary, only oracles that were seen
       # as full online are marked as True
@@ -1490,20 +1550,14 @@ class _OraSyncUtilsMixin:
         self.P(f"Oracle {sender_str} should not have sent signature for agreement. ignoring...", color='r')
         return False
 
-      if not self._check_agreement_signature(
-          sender=sender,
-          signature_dict=signature_dict
-      ):
+      if sender not in signatures_dict:
+        self.P(f"Oracle {sender_str} sent agreement signatures, but without their own! Possible impersonation!", color='r')
         return False
-
-      if sender != signature_dict.get('EE_SENDER'):
-        self.P(
-          f"Agreement signature from oracle {sender_str} does not match the sender! Possible impersonation attack!",
-          color='r'
-        )
-        return False
-      # endif identity check
-      return True
+      # endif sender has own signature in message
+      return self._check_multiple_signatures(
+        agreement_signatures_dict=signatures_dict,
+        sender_str=sender_str,
+      )
 
     def _check_received_agreement_signatures_ok(self, sender: str, oracle_data: dict):
       """
@@ -1542,26 +1596,10 @@ class _OraSyncUtilsMixin:
 
       agreement_signatures = oracle_data[OracleSyncCt.AGREEMENT_SIGNATURES]
 
-      for sig_sender, signature_dict in agreement_signatures.items():
-        sig_sender_str = self.get_sender_str(sender=sig_sender)
-        if not self.is_participating.get(sig_sender, False):
-          self.P(f"Oracle {sig_sender_str} should not have sent signature for agreement. ignoring...", color='r')
-          # TODO: review if this should make the entire message invalid
-          # One node can be seen as potentially full online by some oracles and not by others.
-          # But for the node to actually participate in the agreement, it has to see itself as full online.
-          # That can not happen if the node is not seen as potentially full online by at least another
-          # participating oracle.
-          return False
-        # endif not expected to participate
-        if not self._check_agreement_signature(
-            sender=sig_sender,
-            signature_dict=signature_dict
-        ):
-          self.P(f"Invalid agreement signature from oracle {sig_sender_str}!", color='r')
-          return False
-        # endif agreement signature
-      # endfor agreement signatures
-      return True
+      return self._check_multiple_signatures(
+        agreement_signatures_dict=agreement_signatures,
+        sender_str=sender_str
+      )
 
     def _check_received_epoch__agreed_median_table_ok(self, sender, oracle_data):
       """

@@ -136,17 +136,32 @@ dmypy.json
 # local python files
 *__local__.py
 
+*/_local_cache/*
+*/ratio1_0*
 */_data/*
 */_logs/*
 */_output/*
 */_models/*
+**/_local_cache/**
+**/_data/**
+**/_logs/**
+**/_models/**
+**/_output/**
+**/vectordb/**
+**/_vector_db**/
+**/ratio1_*
+**/db_cache/**
+
 config_startup*.txt
 config_startup*.json
 config_startup*.yaml
 config_startup*.yml
 inference/model_testing/_local_cache/_logs/MPTF.txt
 inference/model_testing/_local_cache/_logs/20211224_102325_MPTF_001_log.txt
-
+vectordb
+_vector_db_cache
+_vector_db_cache_HNSWVectorDB
+db_cache
 
 plugins/libs/_cache/
 core/utils/_cache/

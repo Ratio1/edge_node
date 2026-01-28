@@ -1,3 +1,6 @@
+"""
+TODO: example pipeline with additional explanations
+"""
 from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess
 from llama_cpp import Llama
 from extensions.serving.mixins_llm.llm_utils import LlmCT
@@ -41,8 +44,16 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     # llama.cpp uses built-in tokenizer
     return
 
+  def get_model_name(self):
+    model_id = self.cfg_model_name
+    model_filename = self.cfg_model_filename
+    if model_id is None or model_filename is None:
+      raise ValueError("Both MODEL_NAME and MODEL_FILENAME must be specified for Llama_cpp models.")
+    # endif model id/filename check
+    return f"{model_id}/{model_filename}"
+
   def _load_model(self):
-    model_id = self.get_model_name()
+    model_id = self.cfg_model_name
     model_filename = self.cfg_model_filename
 
     n_ctx = self.cfg_model_n_ctx
@@ -214,8 +225,8 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     ] = preprocessed_batch
 
     results = [
-      # (idx, valid, process_method, reply)
-      (idx, valid_condition, process_methods[idx], None)
+      # (idx, valid, process_method, reply, full_output)
+      (idx, valid_condition, process_methods[idx], None, None)
       for idx, valid_condition in enumerate(valid_conditions)
     ]
     obj_for_inference = [
@@ -227,6 +238,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     tries = 0
     while not conditions_satisfied:
       reply_lst = []
+      full_output_lst = []
       t0 = self.time()
       timings = []
       total_generated_tokens = 0
@@ -244,6 +256,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         num_tokens_generated = out["usage"]["completion_tokens"]
         total_generated_tokens += num_tokens_generated
         reply_lst.append(reply)
+        full_output_lst.append(out)
       # endfor obj_for_inference
       t_total = self.time() - t0
       curr_tps = total_generated_tokens / t_total if t_total > 0 else 0
@@ -256,6 +269,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         valid_condition = results[idx_orig][1]
         process_method = results[idx_orig][2]
         current_text = reply_lst[idx_curr]
+        full_output = full_output_lst[idx_curr]
         self.P(f"Checking condition for object {idx_orig}:\nvalid:`{valid_condition}`|process:`{process_method}`|text:\n{current_text}")
         current_text = self.maybe_process_text(current_text, process_method)
         self.P(f"Processed text:\n{current_text}")
@@ -269,7 +283,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         current_condition_satisfied = valid_text or (tries >= max_tries)
         if current_condition_satisfied:
           # If the condition is satisfied, we can save the result
-          results[idx_orig] = (idx_orig, valid_condition, process_method, current_text)
+          results[idx_orig] = (idx_orig, valid_condition, process_method, current_text, full_output)
         else:
           invalid_objects.append((idx_orig, len(invalid_objects)))
         # endif current condition satisfied
@@ -281,13 +295,15 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         conditions_satisfied = True
     # endwhile conditions_satisfied
 
-    text_lst = [text for _, _, _, text in results]
+    text_lst = [text for _, _, _, text, _ in results]
+    full_output_lst = [full_output for _, _, _, _, full_output in results]
     dct_result = {
       LlmCT.PRMP: messages_lst,
       LlmCT.TEXT: text_lst,
       LlmCT.ADDITIONAL: additional_lst,
       "RELEVANT_IDS": relevant_input_ids,
-      "TOTAL_INPUTS": cnt_total_inputs
+      "TOTAL_INPUTS": cnt_total_inputs,
+      LlmCT.FULL_OUTPUT: full_output_lst,
     }
     return dct_result
 

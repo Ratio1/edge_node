@@ -1,6 +1,6 @@
-# from naeural_core.business.base.network_processor import NetworkProcessorPlugin as BasePlugin
 from naeural_core.business.base import BasePluginExecutor as BasePlugin
 from extensions.business.mixins.nlp_agent_mixin import _NlpAgentMixin, NLP_AGENT_MIXIN_CONFIG
+from extensions.serving.mixins_llm.llm_utils import LlmCT
 
 from concurrent.futures.thread import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -569,8 +569,8 @@ class VllmAgentPlugin(BasePlugin, _NlpAgentMixin):
           "MODEL_NAME": self.cfg_model_name,
           "REQUEST_ID": request_id,
           "IS_VALID": True,
-          "text": res.get("content", None),
-          "RAW": res.get("raw", None),
+          LlmCT.TEXT: res.get("content", None),
+          LlmCT.FULL_OUTPUT: res.get("raw", None),
           "ELAPSED_TIME": req_entry.elapsed_time,
         }
       except Exception as e:

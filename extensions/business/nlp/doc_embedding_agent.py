@@ -15,7 +15,7 @@ _CONFIG = {
   "DOC_EMBED_STATUS_PERIOD": 20,
   'ALLOW_EMPTY_INPUTS': True,  # if this is set to true the on-idle will continuously trigger the process
 
-  "DEBUG_MODE": True,
+  "DEBUG_LOGGING_ENABLED": True,
 
   'CHAINSTORE_RESPONSE_KEY': None,
 
@@ -97,7 +97,7 @@ class DocEmbeddingAgentPlugin(BasePlugin, _NlpAgentMixin):
     # endif time to send status
     return
 
-  def inference_to_response(self, inference, model_name):
+  def inference_to_response(self, inference, model_name, input_data=None):
     return inference
 
   def _process(self):
