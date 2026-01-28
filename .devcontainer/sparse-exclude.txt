@@ -1,4 +1,0 @@
-/data/
-/logs/
-/third_party/huge_lib/
-/weights/

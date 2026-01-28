@@ -1,2 +1,0 @@
-/data/private/secret.json        # keep this file even though /data/ is excluded
-/weights/README.md               # another example file inside an excluded dir
