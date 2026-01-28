@@ -15,7 +15,6 @@ Highlights
 """
 
 from extensions.business.edge_inference_api.cv_inference_api import CvInferenceApiPlugin as BasePlugin
-from naeural_core.utils.fastapi_utils import PostponedRequest
 
 __VER__ = '0.1.0'
 
@@ -53,126 +52,74 @@ class CerviguardApiPlugin(BasePlugin):
 
   CONFIG = _CONFIG
 
-  """INFERENCE HANDLING"""
-  if True:
-    def _validate_analysis(self, analysis: dict) -> dict:
-      """
-      Validate and sanitize analysis fields returned by inference.
+  def _build_result_from_inference(
+    self,
+    request_id: str,
+    inference: dict,
+    metadata: dict,
+    request_data: dict
+  ):
+    """
+    Construct a result payload from inference output and metadata.
 
-      Parameters
-      ----------
-      analysis : dict
-        Raw analysis data from the inference engine.
+    Parameters
+    ----------
+    request_id : str
+      Identifier of the tracked request.
+    inference : dict
+      Inference result data from cerviguard_image_analyzer.
+    metadata : dict
+      Metadata to include in the response.
+    request_data : dict
+      Stored request record for reference.
 
-      Returns
-      -------
-      dict
-        Analysis payload with validated and defaulted fields.
-      """
-      safe_defaults = {
-        'tz_type': 'Type 1',
-        'lesion_assessment': 'none',
-        'lesion_summary': 'Analysis unavailable',
-        'risk_score': 0,
-        'image_quality': 'unknown',
-        'image_quality_sufficient': True
-      }
-      if not isinstance(analysis, dict):
-        return safe_defaults
+    Returns
+    -------
+    dict
+      Structured result payload with lesion and transformation zone predictions.
 
-      validated = {}
+    Raises
+    ------
+    ValueError
+      If the inference result format is invalid.
+    RuntimeError
+      When the inference indicates an error status.
+    """
+    if not isinstance(inference, dict):
+      raise ValueError("Invalid inference result format.")
 
-      tz_type = analysis.get('tz_type', safe_defaults['tz_type'])
-      if tz_type not in ['Type 0', 'Type 1', 'Type 2', 'Type 3']:
-        tz_type = safe_defaults['tz_type']
-      validated['tz_type'] = tz_type
+    inference_data = inference.get('data', inference)
+    status = inference_data.get('status', inference.get('status', 'completed'))
 
-      lesion_assessment = analysis.get('lesion_assessment', safe_defaults['lesion_assessment'])
-      if lesion_assessment not in ['none', 'low', 'moderate', 'high']:
-        lesion_assessment = safe_defaults['lesion_assessment']
-      validated['lesion_assessment'] = lesion_assessment
-
-      lesion_summary = analysis.get('lesion_summary', safe_defaults['lesion_summary'])
-      if not isinstance(lesion_summary, str):
-        lesion_summary = safe_defaults['lesion_summary']
-      validated['lesion_summary'] = lesion_summary
-
-      risk_score = analysis.get('risk_score', safe_defaults['risk_score'])
-      try:
-        risk_score = int(risk_score)
-        if risk_score < 0 or risk_score > 100:
-          risk_score = max(0, min(100, risk_score))
-      except (TypeError, ValueError):
-        risk_score = safe_defaults['risk_score']
-      validated['risk_score'] = risk_score
-
-      image_quality = analysis.get('image_quality', safe_defaults['image_quality'])
-      if not isinstance(image_quality, str):
-        image_quality = safe_defaults['image_quality']
-      validated['image_quality'] = image_quality
-
-      image_quality_sufficient = analysis.get(
-        'image_quality_sufficient',
-        safe_defaults['image_quality_sufficient']
-      )
-      if not isinstance(image_quality_sufficient, bool):
-        image_quality_sufficient = safe_defaults['image_quality_sufficient']
-      validated['image_quality_sufficient'] = image_quality_sufficient
-      return validated
-
-    def _build_result_from_inference(
-      self,
-      request_id: str,
-      inference: Dict[str, Any],
-      metadata: Dict[str, Any],
-      request_data: Dict[str, Any]
-    ):
-      """
-      Construct a result payload from inference output and metadata.
-
-      Parameters
-      ----------
-      request_id : str
-        Identifier of the tracked request.
-      inference : dict
-        Inference result data.
-      metadata : dict
-        Metadata to include in the response.
-      request_data : dict
-        Stored request record for reference.
-
-      Returns
-      -------
-      dict
-        Structured result payload including analysis and image details.
-
-      Raises
-      ------
-      ValueError
-        If the inference result format is invalid.
-      RuntimeError
-        When the inference indicates an error status.
-      """
-      if not isinstance(inference, dict):
-        raise ValueError("Invalid inference result format.")
-      inference_data = inference.get('data', inference)
-      status = inference_data.get('status', inference.get('status', 'completed'))
-      if status == 'error':
-        err_msg = inference_data.get('error', 'Unknown error')
-        raise RuntimeError(err_msg)
-
-      analysis = self._validate_analysis(inference_data.get('analysis', {}))
-      image_info = inference_data.get('image_info', {})
-      result_payload = {
-        'status': 'completed',
+    if status == 'error':
+      # Return structured error response instead of raising exception
+      # This allows the UI to display meaningful error information
+      error_payload = {
+        'status': 'error',
         'request_id': request_id,
-        'analysis': analysis,
-        'image_info': image_info,
+        'error': inference_data.get('error', inference.get('error', 'Unknown error')),
+        'error_code': inference_data.get('error_code', inference.get('error_code', 'PROCESSING_ERROR')),
+        'error_type': inference_data.get('error_type', inference.get('error_type', 'processing')),
+        'error_message': inference_data.get('error_message', inference.get('error_message', 'An error occurred during processing.')),
+        'image_info': inference_data.get('image_info', {}),
         'processed_at': inference_data.get('processed_at', self.time()),
         'processor_version': inference_data.get('processor_version', 'unknown'),
         'metadata': metadata or request_data.get('metadata') or {},
       }
-      if 'model_name' in inference_data:
-        result_payload['model_name'] = inference_data['model_name']
-      return result_payload
-  """END INFERENCE HANDLING"""
+      return error_payload
+
+    # Extract analysis from serving plugin (contains lesion and transformation_zone)
+    analysis = inference_data.get('analysis', {})
+    image_info = inference_data.get('image_info', {})
+
+    result_payload = {
+      'status': 'completed',
+      'request_id': request_id,
+      'analysis': analysis,
+      'image_info': image_info,
+      'processed_at': inference_data.get('processed_at', self.time()),
+      'processor_version': inference_data.get('processor_version', 'unknown'),
+      'metadata': metadata or request_data.get('metadata') or {},
+    }
+
+    return result_payload
