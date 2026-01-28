@@ -35,7 +35,7 @@ import torch
 
 from naeural_core.serving.base import ModelServingProcess as BaseServingProcess
 
-__VER__ = '0.3.0'
+__VER__ = '0.2.0'
 
 
 class SimpleImageProcessor:
