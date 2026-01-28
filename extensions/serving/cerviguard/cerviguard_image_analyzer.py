@@ -80,8 +80,25 @@ _CONFIG = {
 
   # Image validation settings (uses model_1/ImageNet to detect non-medical images)
   # If ImageNet confidently recognizes an object, it's not a cervical image
+  # Note: Medical images can trigger moderate confidence on various classes (e.g., tissue
+  # colors triggering "lipstick"), so threshold should be high to avoid false positives
   "IMAGE_VALIDATION_ENABLED": True,
-  "IMAGE_VALIDATION_CONFIDENCE_THRESHOLD": 0.30,  # 30% - reject if ImageNet is this confident
+  "IMAGE_VALIDATION_CONFIDENCE_THRESHOLD": 0.85,  # 85% - reject only when ImageNet is very confident
+
+  # ImageNet classes to skip during validation (these commonly trigger false positives on medical images)
+  # Add class names exactly as they appear in ImageNet labels
+  "IMAGE_VALIDATION_SKIP_CLASSES": [
+    "lipstick, lip rouge",
+    "Band Aid",
+    "shower curtain",
+    "velvet",
+    "wool, woolen, woollen",
+    "theater curtain, theatre curtain",
+    "window shade",
+    "pill bottle",
+    "rubber eraser, rubber, eraser",
+    "handkerchief, hankie, hanky, hankey",
+  ],
 
   # HuggingFace model configurations
   # Model 1: Lightweight ImageNet classifier (MobileNetV2) - used for image validation
@@ -181,6 +198,19 @@ class CerviguardImageAnalyzer(BaseServingProcess):
     top_confidence = model_1_result.get('top_confidence', 0)
     top_label = model_1_result.get('top_label', 'unknown')
     threshold = self.cfg_image_validation_confidence_threshold
+    skip_classes = self.cfg_image_validation_skip_classes or []
+
+    # Check if detected class is in skip list (case-insensitive comparison)
+    top_label_lower = top_label.lower()
+    for skip_class in skip_classes:
+      if skip_class.lower() == top_label_lower:
+        return {
+          'valid': True,
+          'reason': f"Image passed validation ('{top_label}' is in skip list)",
+          'top_label': top_label,
+          'confidence': top_confidence,
+          'skipped': True
+        }
 
     if top_confidence >= threshold:
       return {
