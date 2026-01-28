@@ -92,8 +92,21 @@ class CerviguardApiPlugin(BasePlugin):
     status = inference_data.get('status', inference.get('status', 'completed'))
 
     if status == 'error':
-      err_msg = inference_data.get('error', 'Unknown error')
-      raise RuntimeError(err_msg)
+      # Return structured error response instead of raising exception
+      # This allows the UI to display meaningful error information
+      error_payload = {
+        'status': 'error',
+        'request_id': request_id,
+        'error': inference_data.get('error', inference.get('error', 'Unknown error')),
+        'error_code': inference_data.get('error_code', inference.get('error_code', 'PROCESSING_ERROR')),
+        'error_type': inference_data.get('error_type', inference.get('error_type', 'processing')),
+        'error_message': inference_data.get('error_message', inference.get('error_message', 'An error occurred during processing.')),
+        'image_info': inference_data.get('image_info', {}),
+        'processed_at': inference_data.get('processed_at', self.time()),
+        'processor_version': inference_data.get('processor_version', 'unknown'),
+        'metadata': metadata or request_data.get('metadata') or {},
+      }
+      return error_payload
 
     # Extract analysis from serving plugin (contains lesion and transformation_zone)
     analysis = inference_data.get('analysis', {})

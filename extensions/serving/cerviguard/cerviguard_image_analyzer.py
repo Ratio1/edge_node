@@ -703,6 +703,7 @@ class CerviguardImageAnalyzer(BaseServingProcess):
       # Step 2: Validate image content using ImageNet results
       # If ImageNet confidently recognizes an object, this is not a medical image
       validation = self._validate_image_content(imagenet_result)
+      self.P(f"validation result: {self.json_dumps(validation)}")
 
       if not validation['valid']:
         self.P(f"Image validation failed: {validation['reason']}", color='r')
@@ -779,15 +780,41 @@ class CerviguardImageAnalyzer(BaseServingProcess):
 
     formatted_results = []
     for pred in preds:
+      # Determine status: check both image decoding and content validation
+      has_error = 'error' in pred
+      image_decoded = pred.get('image_info', {}).get('valid', False)
+
+      if has_error:
+        status = 'error'
+      elif image_decoded:
+        status = 'completed'
+      else:
+        status = 'error'
+
       # Format the result for output
       formatted = {
-        'status': 'completed' if pred.get('image_info', {}).get('valid', False) else 'error',
+        'status': status,
         'data': pred,
       }
 
-      # Add error message if present
-      if 'error' in pred:
-        formatted['error'] = pred['error']
+      # Add explicit error fields for UI consumption
+      if has_error:
+        error_msg = pred['error']
+        formatted['error'] = error_msg
+
+        # Determine error type for UI handling
+        if 'ImageNet detected' in error_msg:
+          formatted['error_code'] = 'INVALID_IMAGE_CONTENT'
+          formatted['error_type'] = 'validation'
+          formatted['error_message'] = 'The uploaded image does not appear to be a valid cervical image.'
+        elif 'Failed to decode' in error_msg:
+          formatted['error_code'] = 'DECODE_ERROR'
+          formatted['error_type'] = 'decoding'
+          formatted['error_message'] = 'Failed to decode the image. Please ensure the image is valid.'
+        else:
+          formatted['error_code'] = 'PROCESSING_ERROR'
+          formatted['error_type'] = 'processing'
+          formatted['error_message'] = error_msg
 
       formatted_results.append(formatted)
 
