@@ -6,7 +6,7 @@ disorder (ASD) risk assessment using the toderian/autism-detector model.
 
 This serving plugin runs in an isolated process and provides:
 - Structured data validation for 8 clinical input fields
-- Feature preprocessing using joblib preprocessor
+- Feature preprocessing using JSON config (preprocessor_config.json)
 - Neural network inference for ASD probability prediction
 - Risk level classification based on prediction confidence
 
@@ -102,7 +102,7 @@ class AspireAnalyzer(BaseServingProcess):
 
     # Initialize model containers
     self.model = None
-    self.preprocessor = None
+    self.preprocessor_config = None
     self.config = None
     self.id2label = {0: 'Healthy', 1: 'ASD'}
 
@@ -135,7 +135,7 @@ class AspireAnalyzer(BaseServingProcess):
 
     Downloads and loads:
     - TorchScript model (autism_detector_traced.pt)
-    - Preprocessor (preprocessor.joblib)
+    - Preprocessor config (preprocessor_config.json)
     - Configuration (config.json)
     """
     if not self.cfg_model_enabled or not self.cfg_model_name:
@@ -143,7 +143,6 @@ class AspireAnalyzer(BaseServingProcess):
       return
 
     try:
-      import joblib
       from huggingface_hub import snapshot_download
 
       cache_dir = self._get_cache_dir()
@@ -174,13 +173,14 @@ class AspireAnalyzer(BaseServingProcess):
         if 'id2label' in self.config:
           self.id2label = {int(k): v for k, v in self.config['id2label'].items()}
 
-      # Load preprocessor
-      preprocessor_path = model_path / "preprocessor.joblib"
-      if preprocessor_path.exists():
-        self.preprocessor = joblib.load(preprocessor_path)
-        self.P(f"  Preprocessor loaded", color='g')
+      # Load preprocessor config (JSON-based, no pickle/joblib)
+      preprocessor_config_path = model_path / "preprocessor_config.json"
+      if preprocessor_config_path.exists():
+        with open(preprocessor_config_path, 'r') as f:
+          self.preprocessor_config = json.load(f)
+        self.P(f"  Preprocessor config loaded (version: {self.preprocessor_config.get('version', 'unknown')})", color='g')
       else:
-        self.P(f"  WARNING: preprocessor.joblib not found", color='r')
+        self.P(f"  WARNING: preprocessor_config.json not found, using fallback encoding", color='y')
 
       # Load model - prefer TorchScript
       device = self._get_device()
@@ -207,9 +207,57 @@ class AspireAnalyzer(BaseServingProcess):
       import traceback
       self.P(traceback.format_exc(), color='r')
       self.model = None
-      self.preprocessor = None
+      self.preprocessor_config = None
 
     return
+
+  def _preprocess_from_config(self, data):
+    """
+    Preprocess input data using the JSON preprocessor config.
+
+    Converts raw input features to a normalized tensor using the
+    mappings and normalization rules from preprocessor_config.json.
+
+    Parameters
+    ----------
+    data : dict
+        Raw input data with 8 clinical features
+
+    Returns
+    -------
+    torch.Tensor
+        Preprocessed tensor of shape (1, 8)
+    """
+    config = self.preprocessor_config
+    features = []
+
+    for feat_name in config["feature_order"]:
+      if feat_name in config.get("categorical_features", {}):
+        feat_cfg = config["categorical_features"][feat_name]
+        if feat_cfg["type"] == "text_binary":
+          # Text binary: compare against normal value
+          raw_val = str(data[feat_name]).strip().upper()
+          normal_val = feat_cfg["normal_value"]
+          value = 0 if raw_val == normal_val else 1
+        else:
+          # Categorical or binary: use mapping
+          mapping = feat_cfg["mapping"]
+          value = mapping.get(data[feat_name], 0)
+      elif feat_name in config.get("numeric_features", {}):
+        feat_cfg = config["numeric_features"][feat_name]
+        raw = float(data[feat_name])
+        min_val = feat_cfg["min"]
+        max_val = feat_cfg["max"]
+        # Min-max normalization, clamped to [0, 1]
+        value = (raw - min_val) / (max_val - min_val)
+        value = max(0.0, min(1.0, value))
+      else:
+        # Unknown feature, default to 0
+        value = 0
+
+      features.append(value)
+
+    return torch.tensor([features], dtype=torch.float32)
 
   def _load_model_from_weights(self, model_path, device):
     """
@@ -408,27 +456,21 @@ class AspireAnalyzer(BaseServingProcess):
       return {'error': 'Model not loaded'}
 
     try:
-      # Prepare input features in correct order
-      features = {
-        'developmental_milestones': struct_data['developmental_milestones'],
-        'iq_dq': float(struct_data['iq_dq']),
-        'intellectual_disability': struct_data['intellectual_disability'],
-        'language_disorder': struct_data['language_disorder'],
-        'language_development': struct_data['language_development'],
-        'dysmorphism': struct_data['dysmorphism'],
-        'behaviour_disorder': struct_data['behaviour_disorder'],
-        'neurological_exam': struct_data['neurological_exam'],
-      }
-
-      # Apply preprocessor if available
-      if self.preprocessor is not None:
-        # Convert to DataFrame-like format for preprocessor
-        import pandas as pd
-        df = pd.DataFrame([features])
-        processed = self.preprocessor.transform(df)
-        input_tensor = torch.tensor(processed, dtype=torch.float32)
+      # Apply preprocessing using JSON config or fallback to manual encoding
+      if self.preprocessor_config is not None:
+        input_tensor = self._preprocess_from_config(struct_data)
       else:
-        # Manual encoding if no preprocessor
+        # Fallback to manual encoding if no config available
+        features = {
+          'developmental_milestones': struct_data['developmental_milestones'],
+          'iq_dq': float(struct_data['iq_dq']),
+          'intellectual_disability': struct_data['intellectual_disability'],
+          'language_disorder': struct_data['language_disorder'],
+          'language_development': struct_data['language_development'],
+          'dysmorphism': struct_data['dysmorphism'],
+          'behaviour_disorder': struct_data['behaviour_disorder'],
+          'neurological_exam': struct_data['neurological_exam'],
+        }
         input_tensor = self._manual_encode(features)
 
       # Move to device
@@ -471,8 +513,8 @@ class AspireAnalyzer(BaseServingProcess):
 
   def _manual_encode(self, features):
     """
-    Manually encode features if preprocessor is not available.
-    This is a fallback and may not match the trained preprocessor exactly.
+    Fallback encoding when preprocessor_config.json is not available.
+    Uses hardcoded mappings that should match the model's expected encoding.
 
     Parameters
     ----------
@@ -528,7 +570,8 @@ class AspireAnalyzer(BaseServingProcess):
     Parameters
     ----------
     inputs : dict
-        Input dictionary with 'DATA' key containing list of struct_data
+        Input dictionary with 'DATA' key containing list of payloads.
+        Each payload contains 'STRUCT_DATA' with the clinical features.
 
     Returns
     -------
@@ -541,13 +584,20 @@ class AspireAnalyzer(BaseServingProcess):
 
     preprocessed = []
     for i, inp in enumerate(lst_inputs):
-      if isinstance(inp, dict):
-        self.P(f"  Input #{i} keys: {list(inp.keys())}", color='y')
+      # Extract STRUCT_DATA from payload (pipeline wraps data in STRUCT_DATA key)
+      if isinstance(inp, dict) and 'STRUCT_DATA' in inp:
+        struct_data = inp['STRUCT_DATA']
+        self.P(f"  Input #{i}: extracted STRUCT_DATA with keys: {list(struct_data.keys()) if isinstance(struct_data, dict) else type(struct_data)}", color='y')
       else:
-        self.P(f"  Input #{i} type: {type(inp)}", color='y')
+        # Fallback: assume inp is already the struct_data
+        struct_data = inp
+        if isinstance(inp, dict):
+          self.P(f"  Input #{i}: using direct input with keys: {list(inp.keys())}", color='y')
+        else:
+          self.P(f"  Input #{i}: unexpected type {type(inp)}", color='r')
 
       preprocessed.append({
-        'struct_data': inp,
+        'struct_data': struct_data,
         'index': i,
       })
 
