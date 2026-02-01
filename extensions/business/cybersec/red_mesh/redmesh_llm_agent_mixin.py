@@ -13,7 +13,7 @@ import requests
 from typing import Optional
 
 
-class _LlmAgentMixin(object):
+class _RedMeshLlmAgentMixin(object):
   """
   Mixin providing LLM Agent API integration for RedMesh plugins.
 
@@ -31,8 +31,8 @@ class _LlmAgentMixin(object):
   - self._get_aggregated_report(): report aggregation method
   """
 
-  def __init__(self):
-    super(_LlmAgentMixin, self).__init__()
+  def __init__(self, **kwargs):
+    super(_RedMeshLlmAgentMixin, self).__init__(**kwargs)
     return
 
   def _get_llm_agent_api_url(self, endpoint: str) -> str:
