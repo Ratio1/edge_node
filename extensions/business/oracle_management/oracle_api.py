@@ -253,6 +253,9 @@ class OracleApiPlugin(BasePlugin):
     end_epoch : int
         The last epoch to get the availability for.
 
+    exclude_bc_info : bool
+        If True, the blockchain license info will not be included in the response.
+
     Returns
     -------
       dict
@@ -358,7 +361,7 @@ class OracleApiPlugin(BasePlugin):
         data['node_version'] = self.netmon.network_node_version(node_addr)
         data['node_is_oracle'] = self.netmon.network_node_is_supervisor(node_addr)
         if not exclude_bc_info:
-          data['node_licese_info'] = self.bc.get_node_license_info(node_addr)
+          data['node_license_info'] = self.bc.get_node_license_info(node_addr)
       except:
         data['node_is_online'] = False
         data['node_version'] = "unknown"
@@ -574,6 +577,9 @@ class OracleApiPlugin(BasePlugin):
     end_epoch : int
         The last epoch of the range.
 
+    exclude_bc_info : bool
+        If True, the blockchain license info will not be included in the response.
+
     Returns
     -------
     dict
@@ -618,8 +624,11 @@ class OracleApiPlugin(BasePlugin):
     Parameters
     ----------
     
-    dct_node_request : dict
+    dct_eth_nodes_request : dict
         A dictionary where each key is the eth address of a node and the value is a list with start and end epochs.
+
+    exclude_bc_info : bool
+        If True, the blockchain license info will not be included in the response.
 
     Returns
     -------
@@ -689,6 +698,9 @@ class OracleApiPlugin(BasePlugin):
     node_addr : str
         The internal address of a node.
 
+    exclude_bc_info : bool
+        If True, the blockchain license info will not be included in the response.
+
     Returns
     -------
     dict
@@ -724,6 +736,9 @@ class OracleApiPlugin(BasePlugin):
         
     epoch : int
         The target epoch.
+
+    exclude_bc_info : bool
+        If True, the blockchain license info will not be included in the response.
 
     Returns
     -------
@@ -776,6 +791,9 @@ class OracleApiPlugin(BasePlugin):
         
     node_addr : str
         The internal address of a node.
+
+    exclude_bc_info : bool
+        If True, the blockchain license info will not be included in the response.
         
     Note: Please provide either `eth_node_addr` or `node_addr`.
 
