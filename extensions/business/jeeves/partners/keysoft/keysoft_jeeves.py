@@ -139,6 +139,7 @@ class KeysoftJeevesPlugin(BasePlugin):
       self,
       user_token: str,
       pdf_base64: str,
+      use_header_template_fallback: bool = False,
   ):
     """
     Parse a PDF file and return its text content.
@@ -149,6 +150,8 @@ class KeysoftJeevesPlugin(BasePlugin):
         The user token to use for the API.
     pdf_base64 : str
         The base64-encoded PDF file content.
+    use_header_template_fallback : bool, optional
+        Whether to use header template fallback when parsing the PDF. Default is False.
 
     Returns
     -------
@@ -164,7 +167,10 @@ class KeysoftJeevesPlugin(BasePlugin):
     # endif pdf_base64 is not a valid string
 
     try:
-      records = self.pdf_parser.pdf_base64_to_dicts(pdf_base64)
+      records = self.pdf_parser.pdf_base64_to_dicts(
+        pdf_base64=pdf_base64,
+        use_header_template_fallback=use_header_template_fallback
+      )
       # endif empty content
       return {
         "records": records

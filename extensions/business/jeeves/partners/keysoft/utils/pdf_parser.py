@@ -1,3 +1,4 @@
+import traceback
 from typing import List, Optional, Tuple
 from copy import deepcopy
 from io import BytesIO
@@ -12,15 +13,7 @@ DEFAULT_Y_TOLERANCE = 3
 DEFAULT_LOOKAHEAD_PX = "auto"
 DEFAULT_LOOKAHEAD_PX_VALUE = 12.0
 
-# DEFAULT_TABLE_SETTINGS = {
-#   "vertical_strategy": "lines",
-#   "horizontal_strategy": "text",
-#   "snap_tolerance": 3,
-#   "join_tolerance": 3,
-#   "edge_min_length": 3,
-#   'min_words_horizontal': 2,
-#   'intersection_x_tolerance': 8,
-# }
+USE_HEADER_TEMPLATE_FALLBACK = False
 
 
 class PDFParser:
@@ -31,35 +24,231 @@ class PDFParser:
       self,
       raw_table: List[List[str]],
   ):
+    """
+    Split a raw table into header rows and data rows.
+
+    Parameters
+    ----------
+    raw_table : list[list[str]]
+      Table rows as returned by `pdfplumber.Table.extract`.
+
+    Returns
+    -------
+    tuple[list[list[str]], list[list[str]]]
+      Header rows (may be empty) and the remaining data rows.
+    """
     header_rows = []
     # Identify header rows: continue until a row with no None (or until data likely starts)
-    is_header_empty = True
-    for row in raw_table:
+    for row_idx, row in enumerate(raw_table):
       is_row_full = all(cell is not None and str(cell).strip() != "" for cell in row)
-      if is_header_empty or not is_row_full:
-        header_rows.append(row)
-        is_header_empty = False
+      # If we have no header rows yet and the first row is already "full",
+      # treat the table as headerless and keep all rows as data.
+      if not header_rows and is_row_full:
+        return [], raw_table[row_idx:]
       if is_row_full:
-        break
+        # First complete row after header scaffold marks the start of data.
+        raw_data_rows = raw_table[row_idx:]
+        return header_rows, raw_data_rows
+      header_rows.append(row)
       # endif row eligible for header
     # endfor rows
     raw_data_rows = raw_table[len(header_rows):]
     return header_rows, raw_data_rows
 
-  def compute_header(self, header_rows: List[List[str]]):
+  def _recover_header_words(
+      self,
+      header_rows: List[List[str]],
+      table_obj: pdfplumber.table.Table,
+      page_obj: pdfplumber.page.Page,
+  ) -> List[List[str]]:
+    """
+    Fill blank header cells by re-reading words from the PDF within the cell bbox.
+
+    Parameters
+    ----------
+    header_rows : list[list[str]]
+      Current header rows extracted from the table.
+    table_obj : pdfplumber.table.Table
+      Table object containing bbox metadata.
+    page_obj : pdfplumber.page.Page
+      Page object to extract words from.
+
+    Returns
+    -------
+    list[list[str]]
+      Header rows with blanks filled when possible.
+    """
+    words = page_obj.extract_words(keep_blank_chars=False) or []
+    columns = list(getattr(table_obj, "columns", []))
+    rows = list(getattr(table_obj, "rows", []))
+    if not words or not columns or not rows:
+      return header_rows
+
+    def _overlap(a0, a1, b0, b1):
+      return max(0.0, min(a1, b1) - max(a0, b0))
+
+    header_count = min(len(header_rows), len(rows))
+    enriched = [list(r) for r in header_rows]
+
+    # Tighten row bands to reduce overlap: cap each row (except last) at the next row's top.
+    row_spans = []
+    for i in range(header_count):
+      r_bbox = getattr(rows[i], "bbox", None)
+      if r_bbox is None:
+        row_spans.append(None)
+        continue
+      rx0, rtop, rx1, rbottom = r_bbox
+      if i < header_count - 1:
+        next_bbox = getattr(rows[i + 1], "bbox", None)
+        if next_bbox:
+          rbottom = min(rbottom, next_bbox[1] - 0.5)
+      row_spans.append((rx0, rtop, rx1, rbottom))
+
+    for r_idx in range(header_count):
+      row_bbox = row_spans[r_idx]
+      if row_bbox is None:
+        continue
+      rx0, rtop, rx1, rbottom = row_bbox
+      for c_idx in range(min(len(columns), len(enriched[r_idx]))):
+        current_val = enriched[r_idx][c_idx]
+        if current_val is not None and str(current_val).strip() != "":
+          continue
+        col_bbox = getattr(columns[c_idx], "bbox", None)
+        if col_bbox is None:
+          continue
+        cx0, ctop, cx1, cbottom = col_bbox
+        cell_bbox = (cx0, rtop, cx1, rbottom)
+
+        cell_words = [
+          w for w in words
+          if _overlap(w["x0"], w["x1"], cell_bbox[0], cell_bbox[2]) > 0
+          and _overlap(w["top"], w["bottom"], cell_bbox[1], cell_bbox[3]) > 0
+        ]
+        if not cell_words:
+          continue
+        cell_words.sort(key=lambda w: (w["x0"], w["top"]))
+        text = " ".join(w["text"] for w in cell_words).strip()
+        if text:
+          enriched[r_idx][c_idx] = text
+
+    return enriched
+
+
+  def compute_header(
+      self,
+      header_rows: List[List[str]],
+      table_obj: Optional[pdfplumber.table.Table] = None,
+      page_obj: Optional[pdfplumber.page.Page] = None,
+      use_header_template_fallback: bool = USE_HEADER_TEMPLATE_FALLBACK,
+  ):
+    """
+    Build normalized column names from header rows.
+
+    Parameters
+    ----------
+    header_rows : list[list[str]]
+      Rows identified as header content.
+    table_obj : pdfplumber.table.Table, optional
+      Source table (used to recover header text from bboxes when cells are blank).
+    page_obj : pdfplumber.page.Page, optional
+      Page object (used alongside `table_obj` to look up words).
+    use_header_template_fallback : bool, optional
+      Whether to apply the header template fallback logic for common patterns.
+
+    Returns
+    -------
+    list[str]
+      Normalized, unique column names.
+    """
     if not header_rows:
       return []
+    def _is_blank(cell) -> bool:
+      return cell is None or str(cell).strip() == ""
+
+    # Try to recover missing header text directly from the PDF using word bboxes.
+    if table_obj is not None and page_obj is not None:
+      header_rows = self._recover_header_words(
+        header_rows=header_rows,
+        table_obj=table_obj,
+        page_obj=page_obj,
+      )
+
+    # Optional template fallback: fill missing group labels in the classic balance-sheet pattern.
+    if use_header_template_fallback and len(header_rows) >= 2:
+      first_row = header_rows[0]
+      second_row = header_rows[1]
+      # Remove the first two columns which often contain row labels and are not part
+      # of the repeating group pattern(e.g., account names), then check if the rest
+      # of the first 2 rows follows a debit/credit pattern.
+      tail_first = first_row[2:] if len(first_row) > 2 else []
+      tail_second = second_row[2:] if len(second_row) > 2 else []
+      non_empty_tail_first = [c for c in tail_first if not _is_blank(c)]
+      second_tokens = [str(c).strip().lower() if not _is_blank(c) else "" for c in tail_second]
+      # If group labels are blank but we see debit/credit pairs, inject known labels.
+      # This is scoped to the classic balance-sheet layout so non-blank headers stay untouched.
+      has_deb_cred_pattern = (
+        len(tail_second) >= 2 and len(tail_second) % 2 == 0 and
+        all(tok in {"debitoare", "creditoare", ""} for tok in second_tokens)
+      )
+      if not non_empty_tail_first and has_deb_cred_pattern:
+        num_pairs = len(tail_second) // 2
+        base_labels = [
+          "Solduri initiale an",
+          "Rulaje Perioada",
+          "Total Rulaje",
+          "Sume totale",
+          "Solduri finale",
+        ]
+        if num_pairs > len(base_labels):
+          extra = [f"Group{i + 1}" for i in range(num_pairs - len(base_labels))]
+          base_labels.extend(extra)
+        first_row_filled = list(first_row)
+        if len(first_row_filled) < 2:
+          first_row_filled.extend([""] * (2 - len(first_row_filled)))
+        for i in range(num_pairs):
+          label = base_labels[i]
+          # each group occupies two columns
+          col_idx = 2 + i * 2
+          # expand row if necessary
+          while len(first_row_filled) <= col_idx:
+            first_row_filled.append("")
+          first_row_filled[col_idx] = label
+          if len(first_row_filled) <= col_idx + 1:
+            first_row_filled.append("")
+          first_row_filled[col_idx + 1] = label
+        header_rows = [first_row_filled] + header_rows[1:]
+      # endif
+    # endif template fallback logic
+
+    # Propagate labels horizontally within each header row when cells are blank.
+    propagated_rows = []
+    for row in header_rows:
+      new_row = []
+      last_val = ""
+      for col_idx, cell in enumerate(row):
+        if _is_blank(cell):
+          # only propagate within header blocks beyond the first two columns
+          if col_idx >= 2 and last_val:
+            new_row.append(last_val)
+          else:
+            new_row.append("")
+        else:
+          text = str(cell).strip().replace("\n", " ")
+          # If the current token is a substring of the previous non-empty header,
+          # prefer the fuller previous header to keep group labels aligned.
+          if last_val and text in last_val and len(text) < len(last_val):
+            text = last_val
+          new_row.append(text)
+          last_val = text
+      propagated_rows.append(new_row)
+    header_rows = propagated_rows
+
     filled_header = []
     for row in header_rows:
       filled_row = []
-      last_val = ""
       for cell in row:
         stripped_cell = str(cell).strip().replace('\n', ' ') if cell is not None else ""
-        if cell is None or stripped_cell == "":
-          filled_row.append(last_val)
-        else:
-          filled_row.append(stripped_cell)
-          last_val = stripped_cell
+        filled_row.append(stripped_cell)
       # endfor cells
       filled_header.append(filled_row)
     # endfor rows
@@ -73,7 +262,9 @@ class PDFParser:
         for hr in filled_header:
           # Use the header part if it exists and not empty
           if col_idx < len(hr) and hr[col_idx] is not None and str(hr[col_idx]).strip() != "":
-            parts.append(hr[col_idx])
+            text = hr[col_idx]
+            if not parts or text.lower() != parts[-1].lower():
+              parts.append(text)
         # Join parts with '|' to form multi-level name
         header_name = "|".join(parts) if parts else f"Column{col_idx + 1}"
         headers.append(header_name)
@@ -97,26 +288,166 @@ class PDFParser:
 
     return headers
 
+  def _table_score(
+      self,
+      table_obj: pdfplumber.table.Table,
+      x_tolerance: int = DEFAULT_X_TOLERANCE,
+      y_tolerance: int = DEFAULT_Y_TOLERANCE,
+  ):
+    """
+    Compute a simple quality score for a detected table.
+
+    Parameters
+    ----------
+    table_obj : pdfplumber.table.Table
+      Table object to score.
+    x_tolerance : int, optional
+      Horizontal tolerance used when extracting the table.
+    y_tolerance : int, optional
+      Vertical tolerance used when extracting the table.
+
+    Returns
+    -------
+    tuple[int, int]
+      (data_row_count, header_character_count). Higher is better.
+    """
+    try:
+      raw_table = table_obj.extract(
+        x_tolerance=x_tolerance,
+        y_tolerance=y_tolerance
+      )
+    except Exception:
+      return (0, 0)
+    if not raw_table:
+      return (0, 0)
+    header_rows, _ = self.split_header_rows(raw_table)
+    data_rows = raw_table[len(header_rows):]
+    header_chars = sum(
+      len(str(c).strip())
+      for row in header_rows
+      for c in row
+      if c is not None and str(c).strip() != ""
+    )
+    return (len(data_rows), header_chars)
+
+  def total_score(
+      self,
+      tables_list: list[pdfplumber.table.Table],
+      x_tolerance: int = DEFAULT_X_TOLERANCE,
+      y_tolerance: int = DEFAULT_Y_TOLERANCE,
+  ):
+    """
+    Aggregate score across multiple tables.
+
+    Parameters
+    ----------
+    tables_list : list of pdfplumber.table.Table
+      Tables to evaluate.
+    x_tolerance : int, optional
+      Horizontal tolerance used when extracting the table.
+    y_tolerance : int, optional
+      Vertical tolerance used when extracting the table.
+
+    Returns
+    -------
+    tuple[int, int]
+      Sum of per-table data rows and header characters.
+    """
+    scores = [self._table_score(tb, x_tolerance=x_tolerance, y_tolerance=y_tolerance) for tb in tables_list]
+    return (sum(s[0] for s in scores), sum(s[1] for s in scores))
+
   def check_nested_structure(self, raw_table: List[List[str]]) -> bool:
     """
-    Check for hierarchical nested rows (multiple levels of indentation indicated by blanks)
-    Detect if any row has more than one leading blank columns, which suggests nested grouping
+    Detect likely hierarchical/nested rows (multiple leading empty cells).
+    Ignores one trailing summary-like row (structural, not lexical) and
+    strips trailing fully blank rows to reduce false positives.
+
+    Parameters
+    ----------
+    raw_table : list[list[str]]
+      Extracted table rows.
+
+    Returns
+    -------
+    bool
+      True if the table appears hierarchical and should be skipped.
+
+    Notes
+    -----
+    Flags rows with multiple leading blanks while ignoring a trailing
+    structural summary row and trailing blank rows to reduce false positives.
     """
-    for row in raw_table:
-      # Count leading blanks
-      blank_prefix = 0
-      for cell in row:
-        if cell is None or cell == "":
-          blank_prefix += 1
+
+    def _is_blank_row(row):
+      return all(c is None or str(c).strip() == "" for c in row)
+
+    def _is_structural_summary_row(row: List[str]) -> bool:
+      # Token-agnostic: (1) many leading blanks, (2) numeric-heavy on right-half
+      if not row:
+        return False
+      n = len(row)
+
+      # leading blanks
+      i = 0
+      while i < n and (row[i] is None or str(row[i]).strip() == ""):
+        i += 1
+      leading_blanks = i
+
+      # numeric flags
+      def _numish(s):
+        v = self.maybe_convert_numeric(s)
+        return isinstance(v, (int, float))
+
+      right_half = row[n // 2:] if n >= 2 else row
+      numeric_right = sum(1 for c in right_half if _numish(c))
+      numeric_total = sum(1 for c in row if _numish(c))
+      non_empty = sum(1 for c in row if c is not None and str(c).strip() != "")
+
+      # thresholds: at least one leading blank, ≥60% of right-half numeric,
+      # and overall numeric density reasonably high, but row not “full” of text
+      right_ratio = (numeric_right / max(1, len(right_half)))
+      total_ratio = (numeric_total / max(1, n))
+
+      return (leading_blanks >= 1) and (right_ratio >= 0.6) and (total_ratio >= 0.5) and (non_empty <= int(0.75 * n))
+
+    rows = list(raw_table)
+
+    # Trim trailing fully blank rows
+    while rows and _is_blank_row(rows[-1]):
+      rows.pop()
+
+    # Ignore a *single* trailing structural summary row
+    if rows and _is_structural_summary_row(rows[-1]):
+      rows = rows[:-1]
+
+    # Count rows with >1 leading blanks (true hierarchy) among the rest
+    offences = 0
+    for r in rows:
+      blanks = 0
+      for c in r:
+        if c is None or str(c).strip() == "":
+          blanks += 1
         else:
           break
-      # endfor cells
-      if blank_prefix > 1:  # more than one leading blank implies multi-level grouping
-        return True
-    # endfor rows
-    return False
+      if blanks > 1:
+        offences += 1
+
+    return offences >= 2
 
   def maybe_convert_numeric(self, s):
+    """
+    Attempt to coerce a cell value to an int or float.
+
+    Parameters
+    ----------
+    s : Any
+      Cell value.
+
+    Returns
+    -------
+    int or float or Any
+      Parsed numeric value when possible; otherwise the original input.
+    """
     if s is None:
       return None
     orig_s = deepcopy(s)
@@ -150,7 +481,41 @@ class PDFParser:
       prev_page_number: Optional[int] = None,
       x_tolerance: int = DEFAULT_X_TOLERANCE,
       y_tolerance: int = DEFAULT_Y_TOLERANCE,
+      use_header_template_fallback: bool = USE_HEADER_TEMPLATE_FALLBACK,
   ):
+    """
+    Process a single table and return updated parser state plus records.
+
+    Parameters
+    ----------
+    table_obj : pdfplumber.table.Table
+      Table to process.
+    page_obj : pdfplumber.page.Page
+      Page containing the table.
+    page_number : int
+      Zero-based page index.
+    table_index : int, optional
+      Current table index accumulator.
+    prev_headers : list[str], optional
+      Headers from the previous table (for continuation detection).
+    prev_headers_raw : list[list[str]], optional
+      Raw header rows from the previous table.
+    prev_table_bbox : tuple[float, float, float, float], optional
+      Bounding box of the previous table.
+    prev_page_number : int, optional
+      Page number of the previous table.
+    x_tolerance : int, optional
+      Extraction horizontal tolerance.
+    y_tolerance : int, optional
+      Extraction vertical tolerance.
+    use_header_template_fallback : bool, optional
+      Whether to apply the header template fallback logic.
+
+    Returns
+    -------
+    list
+      Updated (table_index, headers, headers_raw, bbox, page_number, records).
+    """
     current_table_index = table_index
     current_headers = deepcopy(prev_headers)
     current_headers_raw = deepcopy(prev_headers_raw)
@@ -221,7 +586,9 @@ class PDFParser:
       # This is a new table
       current_table_index += 1
       current_headers_raw, raw_table = self.split_header_rows(raw_table)
-      current_headers = self.compute_header(current_headers_raw)
+      current_headers = self.compute_header(
+        current_headers_raw, use_header_template_fallback=use_header_template_fallback
+      )
       current_page_number = page_number
     # endif continuing_table
     current_table_bbox = table_obj.bbox
@@ -237,6 +604,9 @@ class PDFParser:
 
     if not raw_table or len(raw_table) == 0:
       return res
+
+    while raw_table and all((c is None or str(c).strip() == "") for c in raw_table[-1]):
+      raw_table.pop()
 
     is_nested_structure = self.check_nested_structure(raw_table)
     if is_nested_structure:
@@ -306,7 +676,24 @@ class PDFParser:
     """
     For each detected table bbox, peek slightly below its bottom for words aligned within its x-span.
     If such words exist (likely the "missing" last row), place a synthetic bottom rule just below them.
-    Returns a sorted list of y positions for explicit_horizontal_lines (page-level).
+
+    Parameters
+    ----------
+    page : pdfplumber.page.Page
+      Page containing the tables.
+    tables : list
+      Tables detected on the page.
+    lookahead_px : float, optional
+      Pixels to search below the table bottom (auto by default).
+    epsilon_px : float, optional
+      Offset to place the synthetic line below detected text.
+    min_gain_px : float, optional
+      Minimum extension below the existing bbox to consider a line.
+
+    Returns
+    -------
+    list[float]
+      Sorted y-positions for `explicit_horizontal_lines`.
     """
     words = page.extract_words(keep_blank_chars=False) or []
     if not tables or not words:
@@ -362,15 +749,29 @@ class PDFParser:
     y_candidates = sorted({round(y, 2) for y in y_candidates})
     return y_candidates
 
-  def pdf_to_dicts(self, pdf: pdfplumber.PDF):
+  def pdf_to_dicts(self, pdf: pdfplumber.PDF, use_header_template_fallback: bool = USE_HEADER_TEMPLATE_FALLBACK):
     """
     Extract tables from a PDF and return a list of dictionaries for each record.
 
     Each dictionary represents a row of any table, with column names as keys and cell text as values.
     Adds 'table_index' to indicate which table (in order of appearance) the row came from.
 
-    Raises:
-        ValueError: If no tables are found in the PDF.
+    Parameters
+    ----------
+    pdf : pdfplumber.PDF
+      Open pdfplumber document.
+    use_header_template_fallback : bool, optional
+      Whether to apply the header template fallback logic for common patterns.
+
+    Returns
+    -------
+    list[dict]
+      One dict per extracted row, including `table_index`.
+
+    Raises
+    ------
+    ValueError
+      If no tables are found in the PDF.
     """
     results = []  # List of output record dictionaries
     table_index = -1  # Will increment when a new table is started
@@ -381,25 +782,28 @@ class PDFParser:
 
     for page_number, page in enumerate(pdf.pages):
       # Use pdfplumber to find tables on the page
-      tables = page.find_tables()  # returns Table objects for each detected table
+      tables_base = page.find_tables()  # returns Table objects for each detected table
       # Sort tables top-to-bottom by their bounding box (y0 is bottom, y1 is top in pdfplumber coordinates)
-      tables.sort(key=lambda t: t.bbox[1] if t.bbox else 0)  # t.bbox = (x0, top, x1, bottom)
+      tables_base.sort(key=lambda t: t.bbox[1] if t.bbox else 0)  # t.bbox = (x0, top, x1, bottom)
+      tables = list(tables_base)
 
       explicit_ys = self.maybe_detect_missing_horizontal_lines(
         page=page,
-        tables=tables,
+        tables=tables_base,
       )
 
       if explicit_ys:
-        tables = page.find_tables(
+        tables_with_lines = page.find_tables(
           table_settings={
             "explicit_horizontal_lines": explicit_ys,
             "intersection_x_tolerance": 8
           }
         )
-        tables.sort(key=lambda t: t.bbox[1] if t.bbox else 0)
+        tables_with_lines.sort(key=lambda t: t.bbox[1] if t.bbox else 0)
+        if self.total_score(tables_with_lines) > self.total_score(tables):
+          tables = tables_with_lines
+        # endif better score with explicit lines
       # endif explicit_ys
-
       for t_obj_index, table_obj in enumerate(tables):
         table_index, prev_headers, prev_headers_raw, prev_table_bbox, prev_page_number, table_records = self.__process_table(
           table_obj=table_obj,
@@ -410,6 +814,7 @@ class PDFParser:
           prev_headers_raw=prev_headers_raw,
           prev_table_bbox=prev_table_bbox,
           prev_page_number=prev_page_number,
+          use_header_template_fallback=use_header_template_fallback,
         )
         results.extend(table_records)
       # endfor tables
@@ -440,15 +845,33 @@ class PDFParser:
       raise FileNotFoundError(f"Cannot open PDF file: {e}")
     return self.pdf_to_dicts(pdf)
 
-  def pdf_base64_to_dicts(self, pdf_base64: str):
+  def pdf_base64_to_dicts(self, pdf_base64: str, use_header_template_fallback: bool = USE_HEADER_TEMPLATE_FALLBACK):
     """
     Extract tables from a base64-encoded PDF and return a list of dictionaries for each record.
 
     Each dictionary represents a row of any table, with column names as keys and cell text as values.
     Adds 'table_index' to indicate which table (in order of appearance) the row came from.
 
-    Raises:
-        ValueError: If the base64 string is invalid or cannot be decoded.
+    Parameters
+    ----------
+    pdf_base64 : str
+      Base64 string (optionally prefixed with a data URI) representing a PDF.
+    use_header_template_fallback : bool, optional
+      Whether to apply the header template fallback logic for common patterns.
+
+    Returns
+    -------
+    list[dict]
+      One dict per extracted row, including `table_index`.
+
+    Raises
+    ------
+    TypeError
+      If the input is not str or bytes.
+    ValueError
+      If base64 decoding fails.
+    FileNotFoundError
+      If the decoded PDF cannot be opened.
     """
 
     if not isinstance(pdf_base64, (str, bytes)):
@@ -485,7 +908,7 @@ class PDFParser:
       raise FileNotFoundError(f"Cannot open PDF from base64: {e}")
     # endtry open
 
-    return self.pdf_to_dicts(pdf)
+    return self.pdf_to_dicts(pdf, use_header_template_fallback=use_header_template_fallback)
 
 
 if __name__ == "__main__":
@@ -529,7 +952,7 @@ if __name__ == "__main__":
       for rec in records:
         print(f"{prefix}    {json.dumps(rec, indent=2)}")
     except Exception as e:
-      print(f"{prefix}  Error processing test {test['type']} input: {e}")
+      print(f"{prefix}  Error processing test {test['type']} input: {e}\n{traceback.format_exc()}")
       test['result'] = None
   # endfor tests
 
