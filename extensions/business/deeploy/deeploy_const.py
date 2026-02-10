@@ -41,6 +41,8 @@ class DEEPLOY_KEYS:
   PIPELINE_INPUT_TYPE = "pipeline_input_type"
   PIPELINE_INPUT_URI = "pipeline_input_uri"
   PIPELINE_PARAMS = "pipeline_params"
+  PIPELINE = "pipeline"
+  PIPELINE_CID = "pipeline_cid"
   JOB_CONFIG = "job_config"
   # App params keys
   APP_PARAMS = "app_params"
@@ -641,5 +643,10 @@ DEEPLOY_APP_COMMAND_REQUEST = {
 
 DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST = {
   "job_id" : 1, # The job ID to retrieve details for
+  "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
+}
+
+DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST = {
+  "job_id" : 1, # The job ID to retrieve the pipeline payload for
   "nonce" : hex(int(time() * 1000)), # recoverable via int(nonce, 16)
 }
