@@ -958,21 +958,16 @@ class DeeployManagerApiPlugin(
         msg = f"{DEEPLOY_ERRORS.REQUEST11}: Job ID is required."
         raise ValueError(msg)
 
-      pipeline_cid = self._get_pipeline_from_cstore(job_id)
-      if not pipeline_cid:
-        msg = f"{DEEPLOY_ERRORS.REQUEST12}: Pipeline for job {job_id} was not found."
-        raise ValueError(msg)
-
-      pipeline = self.get_pipeline_from_r1fs(pipeline_cid)
-      if not isinstance(pipeline, dict):
+      pipeline = self.get_job_pipeline_from_cstore(job_id)
+      if pipeline is None:
         msg = f"{DEEPLOY_ERRORS.REQUEST12}: Pipeline payload for job {job_id} could not be loaded."
         raise ValueError(msg)
 
-      pipeline_owner = pipeline.get(NetMonCt.OWNER)
+      pipeline_owner = pipeline.get("OWNER", None)
       request_owner = auth_result.get(DEEPLOY_KEYS.ESCROW_OWNER)
       if pipeline_owner != request_owner:
         msg = (
-          f"{DEEPLOY_ERRORS.PAYMENT1}: Job {job_id} does not belong to requesting owner "
+          f"{DEEPLOY_ERRORS.REQUEST13}: Job {job_id} does not belong to requesting owner "
           f"'{request_owner}'."
         )
         raise ValueError(msg)
