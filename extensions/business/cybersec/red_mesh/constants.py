@@ -97,3 +97,13 @@ DISTRIBUTION_MIRROR = "MIRROR"
 # Port order constants
 PORT_ORDER_SHUFFLE = "SHUFFLE"
 PORT_ORDER_SEQUENTIAL = "SEQUENTIAL"
+
+# LLM Agent API status constants
+LLM_API_STATUS_OK = "ok"
+LLM_API_STATUS_ERROR = "error"
+LLM_API_STATUS_TIMEOUT = "timeout"
+
+# LLM Analysis types
+LLM_ANALYSIS_SECURITY_ASSESSMENT = "security_assessment"
+LLM_ANALYSIS_VULNERABILITY_SUMMARY = "vulnerability_summary"
+LLM_ANALYSIS_REMEDIATION_PLAN = "remediation_plan"
