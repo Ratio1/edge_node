@@ -172,5 +172,50 @@ python3 -m unittest extensions.business.cybersec.red_mesh.test_redmesh
 - `ratio1/naeural_core`: upstream runtime engine and plugin contracts.
 - `ratio1/ratio1_sdk`: SDK and client workflows used to submit workloads.
 
+## Citation
+
+If you use the Ratio1 Edge Node in your research or projects, please cite it as follows:
+
+```bibtex
+@misc{Ratio1EdgeNode,
+  author = {Ratio1.AI},
+  title = {Ratio1: Edge Node},
+  year = {2024-2025},
+  howpublished = {\url{https://github.com/Ratio1/edge_node}},
+}
+```
+
+Additional publications and references:
+
+```bibtex
+@inproceedings{Damian2025CSCS,
+  author    = {Damian, Andrei Ionut and Bleotiu, Cristian and Grigoras, Marius and
+               Butusina, Petrica and De Franceschi, Alessandro and Toderian, Vitalii and
+               Tapus, Nicolae},
+  title     = {Ratio1 meta-{OS} -- decentralized {MLOps} and beyond},
+  booktitle = {2025 25th International Conference on Control Systems and Computer Science (CSCS)},
+  year      = {2025},
+  pages     = {258--265},
+  address   = {Bucharest, Romania},
+  month     = {May 27--30},
+  doi       = {10.1109/CSCS66924.2025.00046},
+  isbn      = {979-8-3315-7343-0},
+  issn      = {2379-0482},
+  publisher = {IEEE}
+}
+
+@misc{Damian2025arXiv,
+  title         = {Ratio1 -- AI meta-OS},
+  author        = {Damian, Andrei and Butusina, Petrica and De Franceschi, Alessandro and
+                   Toderian, Vitalii and Grigoras, Marius and Bleotiu, Cristian},
+  year          = {2025},
+  month         = {September},
+  eprint        = {2509.12223},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.OS},
+  doi           = {10.48550/arXiv.2509.12223}
+}
+```
+
 ## License
 Apache 2.0. See `LICENSE`.
