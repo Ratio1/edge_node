@@ -53,3 +53,7 @@ AI_ENGINES['doc_embed'] = {
 #   'SERVING_PROCESS': 'cerviguard_image_analyzer'
 # }
 
+AI_ENGINES['aspire_analyzer'] = {
+  'SERVING_PROCESS': 'aspire_analyzer'
+}
+

@@ -1,4 +1,5 @@
 """
+THIS PLUGIN IS OBSOLETE - REPLACED BY CERVIGUARD_API
 LOCAL_SERVING_API Plugin
 
 This plugin creates a FastAPI server for local-only access (localhost) that works with
@@ -126,6 +127,7 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
     self.__requests = {}  # Track active requests (PostponedRequest pattern)
     self._data_buffer = []  # Simple activity log for monitoring
 
+    self.P(f"WARNING!!! THIS PLUGIN IS OBSOLETE - REPLACED BY CERVIGUARD_API", color='r', boxed=True)
     self.P("Local Serving API initialized - Loopback + PostponedRequest mode", color='g')
     self.P(f"  Endpoints: /predict, /list_results, /status, /health", color='g')
     self.P(f"  AI Engine: {self.cfg_ai_engine}", color='g')

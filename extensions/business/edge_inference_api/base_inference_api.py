@@ -185,9 +185,15 @@ class BaseInferenceApiPlugin(
     return default
 
   def _setup_semaphore_env(self):
-    """Set semaphore environment variables for bundled plugins."""
+    """
+    Set semaphore environment variables for bundled plugins.
+    This method is called by _semaphore_maybe_auto_signal(),
+    which is called by the process_wrapper() method, thus
+    it's executed after the on_init() method => self.port will
+    already be allocated automatically if not already explicit.
+    """
     localhost_ip = self.log.get_localhost_ip()
-    port = self.cfg_port
+    port = self.port
     self.semaphore_set_env('API_HOST', localhost_ip)
     if port:
       self.semaphore_set_env('API_PORT', str(port))

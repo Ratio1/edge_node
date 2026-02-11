@@ -238,7 +238,7 @@ class OracleApiPlugin(BasePlugin):
     return data
   
   
-  def __get_node_epochs(self, node_addr: str, start_epoch: int = 1, end_epoch: int = None):
+  def __get_node_epochs(self, node_addr: str, start_epoch: int = 1, end_epoch: int = None, include_bc_info: bool = False):
     """
     Get the epochs availabilities for a given node.
 
@@ -252,6 +252,9 @@ class OracleApiPlugin(BasePlugin):
         
     end_epoch : int
         The last epoch to get the availability for.
+
+    include_bc_info : bool
+        If True, the blockchain license info will be included in the response.
 
     Returns
     -------
@@ -357,7 +360,10 @@ class OracleApiPlugin(BasePlugin):
         data['node_is_online'] = self.netmon.network_node_is_online(node_addr)
         data['node_version'] = self.netmon.network_node_version(node_addr)
         data['node_is_oracle'] = self.netmon.network_node_is_supervisor(node_addr)
-        data['node_licese_info'] = self.bc.get_node_license_info(node_addr)
+        node_license_info = self.bc.get_node_license_info(node_addr) if include_bc_info else None
+        data['node_license_info'] = node_license_info
+        # Typo key kept for backward compatibility
+        data['node_licese_info'] = node_license_info
       except:
         data['node_is_online'] = False
         data['node_version'] = "unknown"
@@ -553,7 +559,8 @@ class OracleApiPlugin(BasePlugin):
     start_epoch : int, 
     end_epoch : int, 
     eth_node_addr : str = None, 
-    node_addr: str = None
+    node_addr: str = None,
+    include_bc_info: bool = False,
   ):
     """
     Returns the list of epochs availabilities for a given node in a given range of epochs.
@@ -571,6 +578,9 @@ class OracleApiPlugin(BasePlugin):
         
     end_epoch : int
         The last epoch of the range.
+
+    include_bc_info : bool
+        If True, the blockchain license info will be included in the response.
 
     Returns
     -------
@@ -600,7 +610,7 @@ class OracleApiPlugin(BasePlugin):
       raise ValueError("Please provide either `eth_node_addr` or `node_addr`")
     
     response = self.__get_response(self.__get_node_epochs(
-      node_addr, start_epoch=start_epoch, end_epoch=end_epoch
+      node_addr, start_epoch=start_epoch, end_epoch=end_epoch, include_bc_info=include_bc_info
     ))
     return response
   
@@ -608,6 +618,7 @@ class OracleApiPlugin(BasePlugin):
   def multi_node_epochs_range(
     self, 
     dct_eth_nodes_request: dict, # {node_addr: [start_epoch, end_epoch]}
+    include_bc_info: bool = False,
   ):
     """
     Returns the list of epochs availabilities for a list of given nodes each with start-end epochs.
@@ -615,8 +626,11 @@ class OracleApiPlugin(BasePlugin):
     Parameters
     ----------
     
-    dct_node_request : dict
+    dct_eth_nodes_request : dict
         A dictionary where each key is the eth address of a node and the value is a list with start and end epochs.
+
+    include_bc_info : bool
+        If True, the blockchain license info will be included in the response.
 
     Returns
     -------
@@ -662,7 +676,8 @@ class OracleApiPlugin(BasePlugin):
       node_data = self.__get_node_epochs(
         node_addr_internal, 
         start_epoch=epochs[0], 
-        end_epoch=epochs[1]
+        end_epoch=epochs[1],
+        include_bc_info=include_bc_info
       )
       all_nodes[eth_node_addr] = node_data
     # endfor eth_node_addr, epochs in dct_eth_nodes_request.items()
@@ -673,7 +688,7 @@ class OracleApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint
   # /node_epochs
-  def node_epochs(self, eth_node_addr: str = None, node_addr: str = None):
+  def node_epochs(self, eth_node_addr: str = None, node_addr: str = None, include_bc_info: bool = False):
     """
     Returns the list of epochs availabilities for a given node.
 
@@ -684,6 +699,9 @@ class OracleApiPlugin(BasePlugin):
         
     node_addr : str
         The internal address of a node.
+
+    include_bc_info : bool
+        If True, the blockchain license info will be included in the response.
 
     Returns
     -------
@@ -701,12 +719,12 @@ class OracleApiPlugin(BasePlugin):
     if not isinstance(node_addr, str):
       return None
 
-    response = self.__get_response(self.__get_node_epochs(node_addr))
+    response = self.__get_response(self.__get_node_epochs(node_addr, include_bc_info=include_bc_info))
     return response
 
   @BasePlugin.endpoint
   # /node_epoch
-  def node_epoch(self, epoch: int, eth_node_addr: str = None, node_addr: str = None):
+  def node_epoch(self, epoch: int, eth_node_addr: str = None, node_addr: str = None, include_bc_info: bool = False):
     """
     Returns the availability of a given node in a given epoch.
 
@@ -720,6 +738,9 @@ class OracleApiPlugin(BasePlugin):
         
     epoch : int
         The target epoch.
+
+    include_bc_info : bool
+        If True, the blockchain license info will be included in the response.
 
     Returns
     -------
@@ -742,7 +763,7 @@ class OracleApiPlugin(BasePlugin):
     elif node_addr is None:
       raise ValueError("Please provide either `eth_node_addr` or `node_addr`")
 
-    data = self.__get_node_epochs(node_addr, start_epoch=epoch, end_epoch=epoch)
+    data = self.__get_node_epochs(node_addr, start_epoch=epoch, end_epoch=epoch, include_bc_info=include_bc_info)
     if isinstance(data.get('epochs_vals'), list) and len(data['epochs_vals']) > 0:
       epoch_val = data['epochs_vals'][0]
       epoch_val_direct = self.netmon.epoch_manager.get_node_epoch(node_addr, epoch)
@@ -761,7 +782,7 @@ class OracleApiPlugin(BasePlugin):
 
   @BasePlugin.endpoint
   # /node_last_epoch
-  def node_last_epoch(self, eth_node_addr: str = None, node_addr: str = None):
+  def node_last_epoch(self, eth_node_addr: str = None, node_addr: str = None, include_bc_info: bool = False):
     """
     Returns the availability of a given node in the last epoch.
 
@@ -772,6 +793,9 @@ class OracleApiPlugin(BasePlugin):
         
     node_addr : str
         The internal address of a node.
+
+    include_bc_info : bool
+        If True, the blockchain license info will be included in the response.
         
     Note: Please provide either `eth_node_addr` or `node_addr`.
 
@@ -798,7 +822,7 @@ class OracleApiPlugin(BasePlugin):
       raise ValueError("Please provide either `eth_node_addr` or `node_addr`")
     
     epoch = self.__get_synced_epoch()
-    data = self.__get_node_epochs(node_addr, start_epoch=epoch, end_epoch=epoch)
+    data = self.__get_node_epochs(node_addr, start_epoch=epoch, end_epoch=epoch, include_bc_info=include_bc_info)
     if isinstance(data.get('epochs_vals'), list) and len(data['epochs_vals']) > 0:
       epoch_val = data['epochs_vals'][0]
       epoch_val_direct = self.netmon.epoch_manager.get_node_epoch(node_addr, epoch)
