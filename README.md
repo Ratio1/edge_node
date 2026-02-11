@@ -217,5 +217,17 @@ Additional publications and references:
 }
 ```
 
+## Contact
+
+For further information, visit our website at [https://ratio1.ai](https://ratio1.ai) or reach out to us via email at [support@ratio1.ai](mailto:support@ratio1.ai).
+
+## Project Financing Disclaimer
+
+This project incorporates open-source components developed with the support of financing grants **SMIS 143488** and **SMIS 156084**, provided by the Romanian Competitiveness Operational Programme. We extend our gratitude for this support, which has been instrumental in advancing our work and enabling us to share these resources with the community.
+
+The content and information within this repository reflect the authors' views and do not necessarily represent those of the funding agencies. The grants have specifically supported certain aspects of this open-source project, facilitating broader dissemination and collaborative development.
+
+For inquiries regarding the funding and its impact on this project, please contact the authors directly.
+
 ## License
 Apache 2.0. See `LICENSE`.
