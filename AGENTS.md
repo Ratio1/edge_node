@@ -178,3 +178,19 @@ Entry format:
 - Details: Kept primary examples aligned to repo scripts (`docker-compose`) while explicitly documenting the Compose v2 equivalent to reduce operator ambiguity.
 - Verification: `rg -n "docker-compose|docker compose" AGENTS.md README.md`
 - Links: `AGENTS.md`, `README.md`
+
+- ID: `ML-20260211-007`
+- Timestamp: `2026-02-11T12:27:43Z`
+- Type: `change`
+- Summary: Restored README citation section with the original BibTeX entries and improved end-of-doc discoverability.
+- Details: BUILDER Intent: restore dropped `## Citation` content exactly and place it before `## License` so researchers can find it quickly. Change scope: `README.md`, `AGENTS.md`. Assumptions: prior citations were correct and should be preserved verbatim. CRITIC findings: risk of accidental BibTeX drift or malformed markdown fence during reinsertion. BUILDER response: copied entries verbatim from provided/previous content, used explicit `bibtex` fenced blocks, and validated marker strings and line placement.
+- Verification: `rg -n "^## Citation|@misc\\{Ratio1EdgeNode|@inproceedings\\{Damian2025CSCS|@misc\\{Damian2025arXiv" README.md` (pass: section + all three entries found); `nl -ba README.md | sed -n '165,260p'` (pass: citation block rendered between Related Repositories and License)
+- Links: `README.md`, `AGENTS.md`
+
+- ID: `ML-20260211-008`
+- Timestamp: `2026-02-11T12:30:01Z`
+- Type: `change`
+- Summary: Restored the previously removed `Contact` and `Project Financing Disclaimer` sections in README.
+- Details: BUILDER Intent: reinsert the exact prior sections requested by user while keeping the recently restored citation block intact. Change scope: `README.md`, `AGENTS.md`. Assumptions: old section wording remained authoritative and should be restored verbatim. CRITIC findings: risk of introducing wording drift or placing sections in a confusing position near document end. BUILDER response: copied text directly from pre-rewrite README snapshot and inserted it immediately before `## License` to keep end-of-doc informational/legal sections grouped.
+- Verification: `rg -n "^## Contact|^## Project Financing Disclaimer|support@ratio1.ai|SMIS 143488|SMIS 156084" README.md` (pass: both headings and key markers found); `nl -ba README.md | sed -n '210,280p'` (pass: sections rendered with expected paragraphs and order)
+- Links: `README.md`, `AGENTS.md`

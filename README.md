@@ -172,5 +172,62 @@ python3 -m unittest extensions.business.cybersec.red_mesh.test_redmesh
 - `ratio1/naeural_core`: upstream runtime engine and plugin contracts.
 - `ratio1/ratio1_sdk`: SDK and client workflows used to submit workloads.
 
+## Citation
+
+If you use the Ratio1 Edge Node in your research or projects, please cite it as follows:
+
+```bibtex
+@misc{Ratio1EdgeNode,
+  author = {Ratio1.AI},
+  title = {Ratio1: Edge Node},
+  year = {2024-2025},
+  howpublished = {\url{https://github.com/Ratio1/edge_node}},
+}
+```
+
+Additional publications and references:
+
+```bibtex
+@inproceedings{Damian2025CSCS,
+  author    = {Damian, Andrei Ionut and Bleotiu, Cristian and Grigoras, Marius and
+               Butusina, Petrica and De Franceschi, Alessandro and Toderian, Vitalii and
+               Tapus, Nicolae},
+  title     = {Ratio1 meta-{OS} -- decentralized {MLOps} and beyond},
+  booktitle = {2025 25th International Conference on Control Systems and Computer Science (CSCS)},
+  year      = {2025},
+  pages     = {258--265},
+  address   = {Bucharest, Romania},
+  month     = {May 27--30},
+  doi       = {10.1109/CSCS66924.2025.00046},
+  isbn      = {979-8-3315-7343-0},
+  issn      = {2379-0482},
+  publisher = {IEEE}
+}
+
+@misc{Damian2025arXiv,
+  title         = {Ratio1 -- AI meta-OS},
+  author        = {Damian, Andrei and Butusina, Petrica and De Franceschi, Alessandro and
+                   Toderian, Vitalii and Grigoras, Marius and Bleotiu, Cristian},
+  year          = {2025},
+  month         = {September},
+  eprint        = {2509.12223},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.OS},
+  doi           = {10.48550/arXiv.2509.12223}
+}
+```
+
+## Contact
+
+For further information, visit our website at [https://ratio1.ai](https://ratio1.ai) or reach out to us via email at [support@ratio1.ai](mailto:support@ratio1.ai).
+
+## Project Financing Disclaimer
+
+This project incorporates open-source components developed with the support of financing grants **SMIS 143488** and **SMIS 156084**, provided by the Romanian Competitiveness Operational Programme. We extend our gratitude for this support, which has been instrumental in advancing our work and enabling us to share these resources with the community.
+
+The content and information within this repository reflect the authors' views and do not necessarily represent those of the funding agencies. The grants have specifically supported certain aspects of this open-source project, facilitating broader dissemination and collaborative development.
+
+For inquiries regarding the funding and its impact on this project, please contact the authors directly.
+
 ## License
 Apache 2.0. See `LICENSE`.
