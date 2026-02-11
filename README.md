@@ -1,428 +1,176 @@
-# Ratio1 Edge Node 
+# Ratio1 Edge Node
 
+## Need, Objective, Purpose
+- **Need**: Edge devices need a secure runtime that can join the Ratio1 network, execute pipelines, and expose operational APIs without manual broker/infrastructure assembly.
+- **Objective**: Package a runnable node image plus extension/plugin surfaces so operators can run nodes and developers can add domain logic.
+- **Purpose**: This repository is the edge-node layer that wires runtime entrypoints (`device.py`, `constants.py`) to upstream `naeural_core` and extends behavior through `extensions/` and `plugins/`.
 
-Welcome to the **Ratio1 Edge Node** repository, formerly known as the **Naeural Edge Protocol Edge Node**. As a pivotal component of the Ratio1 ecosystem, this Edge Node software empowers a decentralized, privacy-preserving, and secure edge computing network. By enabling a collaborative network of edge nodes, Ratio1 facilitates the secure sharing of resources and the seamless execution of computation tasks across diverse devices.
+## Usability & Features
 
-Documentation sections:
-- [Introduction](#introduction)
-- [Running the Edge Node](#running-the-edge-node)
-- [Inspecting the Edge Node](#inspecting-the-edge-node)
-- [Adding an Allowed Address](#adding-an-allowed-address)
-- [Inspecting the node performance](#inspecting-the-node-performance)
-- [Reset the Edge Node address](#reset-the-edge-node-address)
-- [Changing the alias of the node](#changing-the-alias-of-the-node)
-- [Stopping the Edge Node](#stopping-the-edge-node)
-- [Running multiple nodes on the same machine](#running-multiple-nodes-on-the-same-machine)
+### Quickstart
 
+#### Prerequisites
+- Docker (or Docker Desktop on Windows/macOS).
+- A persistent Docker volume for `_local_cache`.
+- A populated `.env` when running local source-based images (`debug.sh`).
 
-## Introduction
-
-The Ratio1 Edge Node is a meta Operating System designed to operate on edge devices, providing them the essential functionality required to join and thrive within the Ratio1 network. Each Edge Node manages the device’s resources, executes computation tasks efficiently, and communicates securely with other nodes in the network. Leveraging the powerful Ratio1 core libraries (formerly known as Naeural Edge Protocol libraries) `naeural_core` and the Ratio1 SDK (`ratio1_sdk`, published on PyPI as `ratio1`), the Ratio1 Edge Node offers out-of-the-box usability starting in 2025 without intricate configurations, local subscriptions, tenants, user accounts, passwords, or broker setups.
-
-## Related Repositories
-
-- [ratio1/naeural_core](https://github.com/ratio1/naeural_core) provides the modular pipeline engine that powers data ingestion, processing, and serving inside this node. Extend or troubleshoot runtime behavior by mirroring the folder layout in `extensions/` against the upstream modules.
-- [Ratio1/ratio1_sdk](https://github.com/Ratio1/ratio1_sdk) is the client toolkit for building and dispatching jobs to Ratio1 nodes (published on PyPI as `ratio1`). Its tutorials pair with the workflows in `plugins/business/tutorials/` and are the best place to validate end-to-end scenarios.
-
-When developing custom logic, install the three repositories in the same virtual environment (`pip install -e . ../naeural_core ../ratio1_sdk`) so interface changes remain consistent across the stack.
-
-## Running the Edge Node
-
-> Note on requirements: the minimal hardware requirements to run a Ratio1 Edge Node are a 64-bit CPU, 6GB of RAM, 2 cores (vCores just fine) and 10GB of storage. The Edge Node is compatible with Linux, Windows, and macOS operating systems. Make sure you have Docker installed on your machine before proceeding so for Windows and Mac probably you will need to install Docker Desktop.
-
-
-Deploying a Ratio1 Edge Node within a development network is straightforward. Execute the following Docker command to launch the node making sure you mount a persistent volume to the container to preserve the node data between restarts:
-
+#### Option A: Run official image (single node)
 ```bash
 docker run -d --rm --name r1node --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:devnet
 ```
 
-- `-d`: Runs the container in the background.
-- `--rm`: Removes the container upon stopping.
-- `--name r1node`: Assigns the name `r1node` to the container.
-- `--pull=always`: Ensures the latest image version is always pulled.
-- `ratio1/edge_node:devnet`: Specifies the devnet image; use `:mainnet` or `:testnet` for those networks.
-- `-v r1vol:/edge_node/_local_cache/`: Mounts the `r1vol` volume to the `/edge_node/_local_cache/` directory within the container.
-
-Architecture-specific variants (for example `:devnet-arm64`, `:devnet-tegra`, `:devnet-amd64-cpu`) will follow; pick the tag that matches your hardware once available.
-
-This command initializes the Ratio1 Edge Node in development mode, automatically connecting it to the Ratio1 development network and preparing it to receive computation tasks while ensuring that all node data is stored in `r1vol`, preserving it between container restarts.
-
-
-If for some reason you encounter issues when running the Edge Node, you can try to run the container with the `--platform linux/amd64` flag to ensure that the container runs on the correct platform.
-
-```bash
-docker run -d --rm --name r1node --platform linux/amd64 --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:devnet
-```
-Also, if you have GPU(s) on your machine, you can enable GPU support by adding the `--gpus all` flag to the Docker command. This flag allows the Edge Node to utilize the GPU(s) for computation tasks.
-
+GPU host variant:
 ```bash
 docker run -d --rm --name r1node --gpus all --pull=always -v r1vol:/edge_node/_local_cache/ ratio1/edge_node:devnet
 ```
 
-This will ensure that your node will be able to utilize the GPU(s) for computation tasks and will accept training and inference jobs that require GPU acceleration.
-
-### Running multiple Edge Nodes on the same machine
-
-If you want to run multiple Edge Nodes on the same machine, you can do so by specifying different names for each container but more importantly, you need to specify different volumes for each container to avoid conflicts between the nodes. You can do this by creating a new volume for each node and mounting it to the container as follows:
-
-```bash
-docker run -d --rm --name r1node1 --pull=always -v r1vol1:/edge_node/_local_cache/ ratio1/edge_node:devnet
-docker run -d --rm --name r1node2 --pull=always -v r1vol2:/edge_node/_local_cache/ ratio1/edge_node:devnet
-```
-
-Now you can run multiple Edge Nodes on the same machine without any conflicts between them.
->NOTE: If you are running multiple nodes on the same machine it is recommended to use docker-compose to manage the nodes. You can find a docker-compose example in the section below.
-
-
-## Inspecting the Edge Node
-
-After launching the Ratio1 Edge Node, you can inspect its status and view its self-generated identity by executing:
-
+Inspect and stop:
 ```bash
 docker exec r1node get_node_info
-```
-
-This command retrieves comprehensive information about the node, including its current status and unique identity within the network such as below
-```json
-{
-  "address": "0xai_A2pPf0lxZSZkGONzLOmhzndncc1VvDBHfF-YLWlsrG9m",
-  "alias": "5ac5438a2775",
-  "eth_address": "0xc440cdD0BBdDb5a271de07d3378E31Cb8D9727A5",
-  "version_long": "v2.5.36 | core v7.4.23 | SDK 2.6.15",
-  "version_short": "v2.5.36",
-  "info": {
-    "whitelist": []
-  }
-}
-```
-
-If you have multiple nodes running on the same machine, you can inspect the status of each node by specifying the node name in the command:
-
-```bash
-docker exec r1node1 get_node_info
-docker exec r1node2 get_node_info
-```
-
-
-## Adding an Allowed Address
-
-To authorize a specific address—such as an SDK address—to send computation tasks to your node, add it to the node’s whitelist with the following command:
-
-```bash
-docker exec r1node add_allowed <address> [<alias>]
-```
-
-- `<address>`: The address of the SDK permitted to send computation tasks to the node.
-- `<alias>`: (Optional) A friendly alias for the address.
-
-Upon execution, the node’s status will update, indicating that it is now ready to accept computation tasks from the specified SDK or Edge Node address.
-
-Running the command with valid node address and alias:
-
-```bash
-docker exec r1node add_allowed 0xai_AthDPWc_k3BKJLLYTQMw--Rjhe3B6_7w76jlRpT6nDeX some-node-alias
-```
-will result in a result such as:
-
-```json
-{
-  "address": "0xai_A2pPf0lxZSZkGONzLOmhzndncc1VvDBHfF-YLWlsrG9m",
-  "alias": "5ac5438a2775",
-  "eth_address": "0xc440cdD0BBdDb5a271de07d3378E31Cb8D9727A5",
-  "version_long": "v2.5.36 | core v7.4.23 | SDK 2.6.15",
-  "version_short": "v2.5.36",
-  "info": {
-    "whitelist": [
-      "0xai_AthDPWc_k3BKJLLYTQMw--Rjhe3B6_7w76jlRpT6nDeX"
-    ]
-  }
-}
-```
-
-## Developing With the Ratio1 SDK
-
-The [Ratio1 SDK](https://github.com/Ratio1/ratio1_sdk) is the recommended way to build, test, and ship workloads to your node. Install it alongside the edge node source:
-
-```bash
-pip install -e ../ratio1_sdk
-```
-
-If you prefer the published package, install from PyPI via `pip install ratio1`.
-
-- Use the `nepctl` (formerly `r1ctl`) CLI that ships with the SDK to inspect the network, configure clients, and dispatch jobs.
-- Explore `ratio1_sdk/tutorials/` for end-to-end examples; most have matching runtime counterparts in `plugins/business/tutorials/` inside this repository.
-- SDK releases 2.6+ perform automatic dAuth configuration. After whitelisting your client, you can submit jobs without additional secrets.
-
-## Extending Pipelines With naeural_core
-
-Edge node execution relies on the [ratio1/naeural_core](https://github.com/ratio1/naeural_core) package. When building custom data sources or business logic:
-
-- Mirror the structure of `naeural_core` modules (`data`, `serving`, `business`, etc.) under `extensions/` so plugin discovery stays consistent.
-- Develop and run unit tests in the cloned `naeural_core` repository before importing the new module here; its abstractions (`manager.Manager`, `CustomPluginTemplate`, etc.) define the contracts used by `device.py`.
-- Keep configuration defaults in sync by reusing `naeural_core/constants.py` values or extending them via local `CONFIG` dictionaries.
-
-## Inspecting the node performance
-
-To inspect the node's performance and load history, execute the following command:
-
-```bash
-docker exec r1node get_node_history
-```
-
-This command will output a raw JSON that can be parsed for detailed information about the node's performance and load history.
-```json
-{
-    "cpu_load": [
-        15.9,
-        15.8
-    ],
-    "cpu_temp": [
-        null,
-        null
-    ],
-    "epoch": 21,
-    "epoch_avail": 0.0024,
-    "gpu_load": [
-        null,
-        null
-    ],
-    "gpu_occupied_memory": [
-        null,
-        null
-    ],
-    "gpu_total_memory": [
-        null,
-        null
-    ],
-    "occupied_memory": [
-        12.1,
-        12.1
-    ],
-    "timestamps": [
-        "2025-01-24 22:03:29.809281",
-        "2025-01-24 22:03:49.890208"
-    ],
-    "total_memory": [
-        15.6,
-        15.6
-    ],
-    "uptime": "06:18:03",
-    "version": "2.6.1"
-}
-```
-
-In the above example we expanded the JSON into a human readable format for better understanding. 
-
-## Reset the Edge Node address
-
-Lets suppose you have the following node data:
-
-```bash
->docker exec r1node get_node_info
-
-{
-  "address": "0xai_A6sQdZKb_kqpE4yfFEpLrOwK3dRh-NL6qaWHUUY45LAp",
-  "alias": "sold-mile-70",
-  "eth_address": "0x2Be13d18ab1Dcdaf48bBC3477881E3695AEb95F3",
-  "version_long": "v2.6.19 | core v7.6.0 | SDK 2.6.23",
-  "version_short": "v2.6.19",
-  "info": {
-    "whitelist": [
-      "0xai_AthDPWc_k3BKJLLYTQMw--Rjhe3B6_7w76jlRpT6nDeX"
-    ]
-  }
-}
-```
-
-If for any reason you need to reset the node address, you can do so by executing the following command:
-
-```bash
-docker exec r1node reset_node_keys
-docker restart r1node
-```
-
-following this you can check the node info again and you will see that the address has been reset.
-
-```bash
-docker exec r1node get_node_info
-{
-  "address": "0xai_ApM1AbzLq1VtsLIidmvzt1Nv4Cyl5Wed0fHNMoZv9u4X",
-  "alias": "sold-mile-70",
-  "eth_address": "0x417a73B7E4971BcefaAe46981ad177C417928371",
-  "version_long": "v2.6.19 | core v7.6.0 | SDK 2.6.23",
-  "version_short": "v2.6.19",
-  "info": {
-    "whitelist": [
-      "0xai_AthDPWc_k3BKJLLYTQMw--Rjhe3B6_7w76jlRpT6nDeX"
-    ]
-  }
-}
-```
-
-## Changing the alias of the node
-
-Although the alias is not really used most of the time some users might want to change it. To do so you can run the following command:
-
-```bash
-docker exec r1node change_alias <new_alias>
-```
-
-Then you have to restart your node for the changes to take effect:
-
-```bash
-docker restart r1node
-```
-
-
-## Stopping the Edge Node
-
-To gracefully stop and remove the Ratio1 Edge Node container, use:
-
-```bash
 docker stop r1node
 ```
 
-This command halts the container and ensures it is removed from the system.
-
-
-## Running multiple nodes on the same machine
-
-If you want to run multiple nodes on the same machine the best option is to use docker-compose. You can create a `docker-compose.yml` file with the following content:
-
-```yaml
-services:
-  r1node1:
-    image: ratio1/edge_node:devnet
-    container_name: r1node1
-    platform: linux/amd64
-    restart: always
-    volumes:
-      - r1vol1:/edge_node/_local_cache
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"         
-      - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
-
-  r1node2:
-    image: ratio1/edge_node:devnet
-    container_name: r1node2
-    platform: linux/amd64
-    restart: always
-    volumes:
-      - r1vol2:/edge_node/_local_cache
-    labels:
-      - "com.centurylinklabs.watchtower.enable=true"         
-      - "com.centurylinklabs.watchtower.stop-signal=SIGINT"          
-
-  #  you can add other nodes here ...
-
-  watchtower:
-    image: containrrr/watchtower
-    platform: linux/amd64
-    restart: always
-    volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    environment:
-      - WATCHTOWER_CLEANUP=true
-      - WATCHTOWER_POLL_INTERVAL=60 # Check every 1 minute
-      - WATCHTOWER_CHECK_NEW_IMAGES=true      
-      - WATCHTOWER_LABEL_ENABLE=true  
-
-volumes:
-  r1vol1:
-  r1vol2:
-  # you can add other volumes here ...      
-```
-
-If you are using MacOS (M1 or better) we recommend to use the arm64 image for the watchtower service. You can do so by changing the image to `containrrr/watchtower:arm64v8-latest` in the `docker-compose.yml` file.
-
-Then you can run the following command to start the nodes in the folder where the `docker-compose.yml` file is located:
-
+#### Option B: Local source image (single node)
+1. Copy `.env.template` to `.env` and fill required values.
+2. Run:
 ```bash
-docker-compose up -d
+./debug.sh
 ```
 
-If you want to always pull the latest image you can add the `--pull=always` flag to the `docker-compose up` command.
-
+#### Option C: Local debug compose (3 nodes)
+`docker-compose/debug-docker-compose.yaml` uses image `local_edge_node`, so build that tag first:
 ```bash
-docker-compose up -d --pull=always
+docker build -t local_edge_node -f Dockerfile_devnet .
+docker-compose -f docker-compose/debug-docker-compose.yaml up -d
+docker-compose -f docker-compose/debug-docker-compose.yaml down
 ```
+If your Docker installation uses Compose v2 plugin syntax, use `docker compose` instead of `docker-compose`.
 
-and you can stop the nodes by running in the same folder:
+### Examples
 
+#### Node operations
 ```bash
-docker-compose down
+# Read node identity/status
+docker exec r1node get_node_info
+
+# Read node performance history
+docker exec r1node get_node_history
+
+# Authorize a client/node address to send work
+docker exec r1node add_allowed <address> [alias]
+
+# Update alias (restart required)
+docker exec r1node change_alias <new_alias>
+docker restart r1node
 ```
 
+#### Multi-node orchestration
+```bash
+# Mainnet-oriented multi-node compose
+docker-compose -f docker-compose/prod-docker-compose.yaml up -d
+docker-compose -f docker-compose/prod-docker-compose.yaml down
+```
 
-Now, lets dissect the `docker-compose.yml` file:
-  - we have a variable number of nodes - in our case 2 nodes - `r1node1` and `r1node2` as services (we commented out the third node for simplicity)
-  - each node is using the `ratio1/edge_node:devnet` image (swap the tag for `:mainnet` or `:testnet` as needed; architecture-specific variants such as `-arm64`, `-tegra`, `-amd64-cpu` will follow)
-  - each node has own unique volume mounted to it
-  - we have a watchtower service that will check for new images every 1 minute and will update the nodes if a new image is available
+#### Plugin/tutorial entry points
+- Business tutorial plugins: `plugins/business/tutorials/`
+- Data tutorial plugins: `plugins/data/tutorials/`
+- Serving/model test scaffolding: `plugins/serving/model_testing/`
 
->NOTE: Please note that running multiple nodes on same box is not advised for machine that do not have multiple GPUs and plenty of RAM. 
+### Configuration
 
+#### Environment template
+Use `.env.template` as base for local/dev runs.
+
+Key groups in `.env.template`:
+- Node/runtime: `EE_ID`, `EE_SUPERVISOR`, `EE_DEVICE`
+- MinIO/S3: `EE_MINIO_*`
+- MQTT: `EE_MQTT_*`
+- Tunnel/auth/token settings: `EE_NGROK_*`, `EE_GITVER`, `EE_OPENAI`, `EE_HF_TOKEN`
+
+#### Startup and app config files
+- `.config_startup.json`: default startup behavior.
+- `.config_app.json`: communication/upload configuration.
+- `.config_startup_cluster.json` + `.config_app_cluster.json`: cluster-oriented variants.
+
+#### Network tags and Dockerfiles
+- `Dockerfile_devnet` sets `EE_EVM_NET=devnet`
+- `Dockerfile_testnet` sets `EE_EVM_NET=testnet`
+- `Dockerfile_mainnet` sets `EE_EVM_NET=mainnet`
+
+### Outputs
+
+Most runtime artifacts are written under `_local_cache/` (mounted volume):
+- Node identity/status JSON: `_local_cache/_data/local_info.json`
+- Node history JSON: `_local_cache/_data/local_history.json`
+- Allowed senders list: `_local_cache/authorized_addrs`
+- Logs: `_local_cache/_logs/`
+- Produced/downloaded files: `_local_cache/_output/`
+- Model/cache data: `_local_cache/_models/`, `_local_cache/_data/`
+
+### Troubleshooting
+
+- `docker-compose` debug stack fails with image not found:
+  - Cause: compose expects `local_edge_node`.
+  - Fix: `docker build -t local_edge_node -f Dockerfile_devnet .`
+
+- `debug.sh` and compose behave differently:
+  - `debug.sh` builds/runs `local_node` directly.
+  - debug compose files use `local_edge_node`.
+
+- Windows helper `docker-compose/debug_start.bat` fails on Dockerfile:
+  - It references `Dockerfile_dev` (not present in repo).
+  - Use `Dockerfile_devnet` instead.
+
+- `get_node_info`/`get_node_history` reports missing files:
+  - Ensure container has started fully and `_local_cache` volume is mounted.
+
+- Kubernetes manifests require manual validation before production use:
+  - `k8s/README.md`, `k8s/edgenode-deploy.yaml`, `k8s/edgenode-sa.yaml`, and `k8s/edgenode-storage.yaml` contain naming/path mismatches that should be reconciled first.
+
+## Technical Details
+
+### Architecture
+- `device.py` is the runtime entrypoint and calls `naeural_core.main.entrypoint.main(...)`.
+- `constants.py` extends upstream admin pipeline constants and environment-driven app behavior.
+- Core runtime execution contracts come from `naeural_core`; this repository is mainly extension/config packaging.
+
+### Modules
+- `extensions/business/`: web APIs and operational plugins (deeploy, dauth, oracle sync, tunnels, r1fs, container apps, cybersec, etc.).
+- `extensions/data/`: listener/capture integrations.
+- `extensions/serving/`: serving base classes and default inference adapters.
+- `plugins/`: tutorial/sample business/data/serving modules.
+- `cmds/`: in-container operational commands exposed as executables.
+- `docker/`, `docker-compose/`, `k8s/`: deployment variants.
+
+### Dependencies
+- Python deps in `requirements.txt` (examples: `ratio1`, `kmonitor`, `decentra-vision`, OpenVINO/ONNX runtime packages, `sqlfluff`, `openai`, `ngrok`).
+- Docker builds also install `naeural-core` (`pip install --no-deps naeural-core`).
+- Typical cross-repo dev setup:
+```bash
+pip install -r requirements.txt
+pip install -e ../naeural_core ../ratio1_sdk
+```
+
+### Testing
+- Broad tutorial test discovery:
+```bash
+python3 -m unittest discover -s plugins -p "*test*.py"
+```
+- Focused suite example:
+```bash
+python3 -m unittest extensions.business.cybersec.red_mesh.test_redmesh
+```
+- For integration-sensitive changes, also run targeted tests in sibling repos (`naeural_core`, `ratio1_sdk`).
+
+### Security
+- Do not commit populated `.env` files.
+- Keep credentials injected through env vars (`$EE_*`) instead of hardcoded values.
+- Treat `cmds/reset_node_keys` and related key-reset commands as sensitive operations.
+- Review `k8s/` secrets/config manifests before applying to any shared cluster.
+
+## Related Repositories
+- `ratio1/naeural_core`: upstream runtime engine and plugin contracts.
+- `ratio1/ratio1_sdk`: SDK and client workflows used to submit workloads.
 
 ## License
-
-This project is licensed under the **Apache 2.0 License**. For detailed information, please refer to the [LICENSE](LICENSE) file.
-
-## Contact
-
-For further information, visit our website at [https://ratio1.ai](https://ratio1.ai) or reach out to us via email at [support@ratio1.ai](mailto:support@ratio1.ai).
-
-## Project Financing Disclaimer
-
-This project incorporates open-source components developed with the support of financing grants **SMIS 143488** and **SMIS 156084**, provided by the Romanian Competitiveness Operational Programme. We extend our gratitude for this support, which has been instrumental in advancing our work and enabling us to share these resources with the community.
-
-The content and information within this repository reflect the authors' views and do not necessarily represent those of the funding agencies. The grants have specifically supported certain aspects of this open-source project, facilitating broader dissemination and collaborative development.
-
-For inquiries regarding the funding and its impact on this project, please contact the authors directly.
-
-## Citation
-
-
-If you use the Ratio1 Edge Node in your research or projects, please cite it as follows:
-
-```bibtex
-@misc{Ratio1EdgeNode,
-  author = {Ratio1.AI},
-  title = {Ratio1: Edge Node},
-  year = {2024-2025},
-  howpublished = {\url{https://github.com/Ratio1/edge_node}},
-}
-```
-
-
-Additional publications and references:
-
-```bibtex
-@inproceedings{Damian2025CSCS,
-  author    = {Damian, Andrei Ionut and Bleotiu, Cristian and Grigoras, Marius and
-               Butusina, Petrica and De Franceschi, Alessandro and Toderian, Vitalii and
-               Tapus, Nicolae},
-  title     = {Ratio1 meta-{OS} -- decentralized {MLOps} and beyond},
-  booktitle = {2025 25th International Conference on Control Systems and Computer Science (CSCS)},
-  year      = {2025},
-  pages     = {258--265},
-  address   = {Bucharest, Romania},
-  month     = {May 27--30},
-  doi       = {10.1109/CSCS66924.2025.00046},
-  isbn      = {979-8-3315-7343-0},
-  issn      = {2379-0482},
-  publisher = {IEEE}
-}
-
-@misc{Damian2025arXiv,
-  title         = {Ratio1 -- AI meta-OS},
-  author        = {Damian, Andrei and Butusina, Petrica and De Franceschi, Alessandro and
-                   Toderian, Vitalii and Grigoras, Marius and Bleotiu, Cristian},
-  year          = {2025},
-  month         = {September},
-  eprint        = {2509.12223},
-  archivePrefix = {arXiv},
-  primaryClass  = {cs.OS},
-  doi           = {10.48550/arXiv.2509.12223}
-}
-```
+Apache 2.0. See `LICENSE`.

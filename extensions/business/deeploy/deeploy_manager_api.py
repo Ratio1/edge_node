@@ -13,7 +13,8 @@ from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
-  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
+  DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST,
+  DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
 )
   
 
@@ -141,7 +142,7 @@ class DeeployManagerApiPlugin(
     })
     return response
   
-  
+
   def _process_pipeline_request(
     self,
     request: dict,
@@ -921,6 +922,66 @@ class DeeployManagerApiPlugin(
     except Exception as e:
       result = self.__handle_error(e, request)
     #endtry
+    response = self._get_response({
+      **result
+    })
+    return response
+
+  @BasePlugin.endpoint(method="post")
+  # /get_r1fs_job_pipeline
+  def get_r1fs_job_pipeline(
+    self,
+    request: dict = DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST
+  ):
+    """
+    Get the stored pipeline payload for a single job ID directly from R1FS/CSTORE.
+
+    Parameters
+    ----------
+    request: dict containing next fields:
+      job_id : int
+      nonce : str
+      EE_ETH_SIGN : str
+      EE_ETH_SENDER : str
+
+    Returns
+    -------
+    dict
+        A dictionary with the stored pipeline payload from R1FS.
+    """
+    try:
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      auth_result = self.deeploy_get_auth_result(inputs)
+      job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
+
+      if not job_id:
+        msg = f"{DEEPLOY_ERRORS.REQUEST11}: Job ID is required."
+        raise ValueError(msg)
+
+      pipeline = self.get_job_pipeline_from_cstore(job_id)
+      if pipeline is None:
+        msg = f"{DEEPLOY_ERRORS.REQUEST12}: Pipeline payload for job {job_id} could not be loaded."
+        raise ValueError(msg)
+
+      pipeline_owner = pipeline.get("OWNER", None)
+      request_owner = auth_result.get(DEEPLOY_KEYS.ESCROW_OWNER)
+      if pipeline_owner != request_owner:
+        msg = (
+          f"{DEEPLOY_ERRORS.REQUEST13}: Job {job_id} does not belong to requesting owner "
+          f"'{request_owner}'."
+        )
+        raise ValueError(msg)
+
+      result = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.PIPELINE: pipeline,
+        DEEPLOY_KEYS.AUTH: auth_result,
+      }
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+
     response = self._get_response({
       **result
     })
