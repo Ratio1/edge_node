@@ -2454,6 +2454,11 @@ class _DeeployMixin:
             continue
           filtered_result[node][app_name] = app_data
       result = filtered_result
+
+    for node, apps in result.items():
+      node_alias = self.netmon.network_node_eeid(node)
+      for _, app_data in apps.items():
+        app_data["node_alias"] = node_alias
     return result
 
   # TODO: REMOVE THIS, once instance_id is coming from ui for instances that have to be updated
