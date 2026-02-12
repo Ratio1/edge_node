@@ -3,11 +3,18 @@
 This file is the durable operating manual for future agents working in `/edge_node`.
 It has two goals:
 1. Stable reference information that should remain useful across sessions.
-2. Append-only memory of important discoveries, decisions, and changes.
+2. Curated high-signal memory of critical/fundamental changes and horizontal project insights.
 
 ## Hard Rules
-- Treat this file as append-only memory for the `Memory Log` section.
-- Never delete or rewrite prior memory entries.
+- Treat the `Memory Log` as a high-signal ledger, not a full activity history.
+- Log only:
+  - Critical/fundamental changes with architectural, security, operational, or reliability impact.
+  - Horizontal insights that affect multiple subsystems, onboarding, deployment, or runbook safety.
+- Do not log:
+  - Minor docs edits, section reordering, wording tweaks, formatting, or cosmetic refactors.
+  - Narrow/local changes without material behavioral or operational impact.
+- Keep the `Memory Log` append-only for qualifying entries.
+- Cleanup/removal of ballast entries is allowed only during explicit curation requested by project owners.
 - If an older entry is wrong, add a new correction entry that references the old entry ID.
 - Use UTC timestamps in ISO-8601 format: `YYYY-MM-DDTHH:MM:SSZ`.
 - Keep shell examples copy-pasteable.
@@ -110,39 +117,35 @@ BUILDER must:
 - Refine the change if needed.
 - List verification commands run and observed results (pass/fail + short evidence).
 
-### Step 4: Log It
-Append a `Memory Log` entry with:
+### Step 4: Log It (Critical-Only)
+Append a `Memory Log` entry only when the change/insight is critical or fundamental.
+Each entry must include:
 - Timestamp and entry ID.
 - Summary of change and decision.
+- Why this is critical/horizontal.
 - CRITIC findings summary.
 - Verification commands and outcomes.
 - If correction: `Correction of: <entry_id>`.
 
-## Memory Log (append-only)
+## Memory Log (critical-only; append-only for qualifying entries)
 
 Entry format:
 - `ID`: `ML-YYYYMMDD-###`
 - `Timestamp`: UTC ISO-8601
 - `Type`: discovery | decision | change | correction
 - `Summary`:
+- `Criticality`:
 - `Details`:
 - `Verification`:
 - `Links`:
 
 ---
 
-- ID: `ML-20260211-001`
-- Timestamp: `2026-02-11T09:13:34Z`
-- Type: `discovery`
-- Summary: Repo-wide docs/ops audit performed to ground AGENTS/README rewrite.
-- Details: Confirmed runtime entrypoints (`device.py`, `constants.py`), operational scripts (`cmds/`), compose variants (`docker-compose/`), and deployment artifacts (`docker/`, `k8s/`).
-- Verification: `pwd && ls -la`; `find . -maxdepth 2 -type d | sort`; `find extensions -type f`; `find plugins -type f`
-- Links: `device.py`, `constants.py`, `docker-compose/debug-docker-compose.yaml`, `cmds/get_node_info`
-
 - ID: `ML-20260211-002`
 - Timestamp: `2026-02-11T09:13:34Z`
 - Type: `discovery`
 - Summary: Found operational mismatches that can break onboarding.
+- Criticality: Cross-cutting operations/onboarding risk across local dev, compose, and k8s paths.
 - Details: `debug.sh` builds `local_node` while debug compose expects `local_edge_node`; `docker-compose/debug_start.bat` references missing `Dockerfile_dev`; multiple `k8s/` naming/namespace/PVC path mismatches exist.
 - Verification: `rg -n "local_edge_node|local_node" -S`; `sed -n '1,120p' debug.sh`; `sed -n '1,160p' docker-compose/debug_start.bat`; `sed -n '1,220p' k8s/README.md`; `sed -n '1,220p' k8s/edgenode-deploy.yaml`; `sed -n '1,220p' k8s/edgenode-sa.yaml`; `sed -n '1,220p' k8s/edgenode-storage.yaml`
 - Links: `debug.sh`, `docker-compose/debug-docker-compose.yaml`, `docker-compose/debug_start.bat`, `k8s/README.md`, `k8s/edgenode-deploy.yaml`
@@ -151,46 +154,16 @@ Entry format:
 - Timestamp: `2026-02-11T09:13:34Z`
 - Type: `change`
 - Summary: Replaced prior short AGENTS guidance with durable long-term memory structure and mandatory BUILDER-CRITIC loop.
+- Criticality: Foundation process change governing agent behavior and decision quality.
 - Details: Added stable sections for run/test, repo map, conventions, pitfalls; established append-only log protocol with correction semantics.
 - Verification: `sed -n '1,260p' AGENTS.md`
 - Links: `AGENTS.md`
 
-- ID: `ML-20260211-004`
-- Timestamp: `2026-02-11T09:19:14Z`
+- ID: `ML-20260212-009`
+- Timestamp: `2026-02-12T14:32:58Z`
 - Type: `change`
-- Summary: Rewrote `README.md` to prioritize operator usability and ordered sections as requested.
-- Details: Added explicit Need/Objective/Purpose, moved all practical usage content under `Usability & Features` (quickstart/examples/config/outputs/troubleshooting), and placed architecture/modules/deps/testing/security under `Technical Details`.
-- Verification: `git diff -- README.md`; `sed -n '1,320p' README.md`
-- Links: `README.md`
-
-- ID: `ML-20260211-005`
-- Timestamp: `2026-02-11T09:19:14Z`
-- Type: `discovery`
-- Summary: Verification run identified environment/tooling limits and current test signal.
-- Details: In this workspace, `docker` exists but neither `docker compose` plugin nor `docker-compose` binary is available; compose syntax could not be validated by execution. `python3 -m unittest discover -s plugins -p "*test*.py"` returns `Ran 0 tests`. Focused RedMesh suite runs but currently fails (`34` tests run, `1` failure, `3` errors with missing `service_info`/`web_tests_info` keys).
-- Verification: `command -v docker || true; command -v python3 || true`; `docker compose -f docker-compose/debug-docker-compose.yaml config`; `docker-compose -f docker-compose/debug-docker-compose.yaml config`; `python3 -m unittest discover -s plugins -p "*test*.py"`; `python3 -m unittest extensions.business.cybersec.red_mesh.test_redmesh`
-- Links: `README.md`, `AGENTS.md`, `extensions/business/cybersec/red_mesh/test_redmesh.py`
-
-- ID: `ML-20260211-006`
-- Timestamp: `2026-02-11T09:20:06Z`
-- Type: `change`
-- Summary: Added Compose command compatibility note (`docker-compose` and Compose v2 `docker compose`) in stable docs.
-- Details: Kept primary examples aligned to repo scripts (`docker-compose`) while explicitly documenting the Compose v2 equivalent to reduce operator ambiguity.
-- Verification: `rg -n "docker-compose|docker compose" AGENTS.md README.md`
-- Links: `AGENTS.md`, `README.md`
-
-- ID: `ML-20260211-007`
-- Timestamp: `2026-02-11T12:27:43Z`
-- Type: `change`
-- Summary: Restored README citation section with the original BibTeX entries and improved end-of-doc discoverability.
-- Details: BUILDER Intent: restore dropped `## Citation` content exactly and place it before `## License` so researchers can find it quickly. Change scope: `README.md`, `AGENTS.md`. Assumptions: prior citations were correct and should be preserved verbatim. CRITIC findings: risk of accidental BibTeX drift or malformed markdown fence during reinsertion. BUILDER response: copied entries verbatim from provided/previous content, used explicit `bibtex` fenced blocks, and validated marker strings and line placement.
-- Verification: `rg -n "^## Citation|@misc\\{Ratio1EdgeNode|@inproceedings\\{Damian2025CSCS|@misc\\{Damian2025arXiv" README.md` (pass: section + all three entries found); `nl -ba README.md | sed -n '165,260p'` (pass: citation block rendered between Related Repositories and License)
-- Links: `README.md`, `AGENTS.md`
-
-- ID: `ML-20260211-008`
-- Timestamp: `2026-02-11T12:30:01Z`
-- Type: `change`
-- Summary: Restored the previously removed `Contact` and `Project Financing Disclaimer` sections in README.
-- Details: BUILDER Intent: reinsert the exact prior sections requested by user while keeping the recently restored citation block intact. Change scope: `README.md`, `AGENTS.md`. Assumptions: old section wording remained authoritative and should be restored verbatim. CRITIC findings: risk of introducing wording drift or placing sections in a confusing position near document end. BUILDER response: copied text directly from pre-rewrite README snapshot and inserted it immediately before `## License` to keep end-of-doc informational/legal sections grouped.
-- Verification: `rg -n "^## Contact|^## Project Financing Disclaimer|support@ratio1.ai|SMIS 143488|SMIS 156084" README.md` (pass: both headings and key markers found); `nl -ba README.md | sed -n '210,280p'` (pass: sections rendered with expected paragraphs and order)
-- Links: `README.md`, `AGENTS.md`
+- Summary: Re-scoped AGENTS memory policy to critical-only logging and pruned prior ballast entries.
+- Criticality: Fundamental governance change for long-term agent memory quality and signal-to-noise control.
+- Details: Updated Hard Rules and BUILDER-CRITIC Step 4 to enforce critical/horizontal-only logging; removed non-critical historical entries (`ML-20260211-001`, `ML-20260211-004`, `ML-20260211-005`, `ML-20260211-006`, `ML-20260211-007`, `ML-20260211-008`) per owner request.
+- Verification: `rg -n "critical-only|ballast|Criticality|ML-20260211-00[1245678]|ML-20260212-009" AGENTS.md`; `sed -n '1,260p' AGENTS.md`
+- Links: `AGENTS.md`
