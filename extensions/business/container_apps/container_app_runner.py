@@ -3081,6 +3081,10 @@ class ContainerAppRunnerPlugin(
     self._stop_container_and_save_logs_to_disk()
     self.__reset_vars()
 
+    # Reset chainstore response for restart cycle
+    self.reset_chainstore_response()
+    self.set_plugin_ready(False)
+
     # Restore preserved state (reset_vars clears it)
     self._consecutive_failures = preserved_failures
     self._last_successful_start = preserved_last_success
