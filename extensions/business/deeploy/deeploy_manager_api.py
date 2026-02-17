@@ -73,45 +73,44 @@ class DeeployManagerApiPlugin(
         self.__class__.__name__, my_address, my_eth_address,
       )
     )
-    self.__has_enough_eth = False
-    self.__check_eth_balance()
+    self.__warmup_start_time = self.time()
+    self.__last_pipelines_check_time = 0
+    if not self.__check_eth_balance():
+      self.P(
+        f"Shutting down tunnel engine for {self.__class__.__name__} due to insufficient ETH balance "
+        f"on {my_eth_address}. Please top up and restart the node.",
+        color='r', boxed=True
+      )
+      self.maybe_stop_tunnel_engine()
     return
   
   def __check_eth_balance(self):
     """
     Check if the oracle has enough ETH to cover gas fees for web3 transactions.
-    Updates the internal flag and logs warnings if balance is insufficient.
+    Returns True if balance is sufficient, False otherwise.
     """
     try:
       eth_address = self.bc.eth_address
       balances = self.bc.get_addresses_balances([eth_address])
       eth_balance = balances.get(eth_address, {}).get("ethBalance", 0)
-      was_enough = self.__has_enough_eth
-      self.__has_enough_eth = eth_balance >= self.cfg_min_eth_balance
-      if not self.__has_enough_eth:
+      if eth_balance < self.cfg_min_eth_balance:
         self.P(
           f"Insufficient ETH balance for oracle {eth_address}: "
-          f"{eth_balance:.6f} ETH < {self.cfg_min_eth_balance} ETH minimum. "
-          f"Deeploy endpoints that require web3 transactions are disabled until the balance is topped up.",
+          f"{eth_balance:.6f} ETH < {self.cfg_min_eth_balance} ETH minimum.",
           color='r'
         )
-      elif not was_enough and self.__has_enough_eth:
-        self.P(
-          f"ETH balance recovered for oracle {eth_address}: {eth_balance:.6f} ETH. "
-          f"Deeploy endpoints re-enabled.",
-          color='g'
-        )
+        return False
+      return True
     except Exception as e:
       self.P(f"Failed to check ETH balance: {e}", color='r')
-    return self.__has_enough_eth
+      return False
 
   def __ensure_eth_balance(self):
     """
     Check ETH balance and raise ValueError if insufficient for web3 transactions.
     Called at the top of mutating endpoints.
     """
-    self.__check_eth_balance()
-    if not self.__has_enough_eth:
+    if not self.__check_eth_balance():
       raise ValueError(
         f"{DEEPLOY_ERRORS.GENERIC}: Oracle {self.bc.eth_address} does not have enough ETH "
         f"to cover gas fees. Please top up the address and retry."
