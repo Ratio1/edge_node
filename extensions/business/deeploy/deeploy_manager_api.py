@@ -37,6 +37,8 @@ _CONFIG = {
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   'WARMUP_DELAY' : 300,
   'PIPELINES_CHECK_DELAY' : 300,
+  'ETH_BALANCE_CHECK_INTERVAL' : 1800,
+  'MIN_ETH_BALANCE' : 0.00005,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -72,10 +74,51 @@ class DeeployManagerApiPlugin(
         self.__class__.__name__, my_address, my_eth_address,
       )
     )
-    self.__warmup_start_time = self.time()
-    self.__last_pipelines_check_time = 0
+    self.__last_eth_balance_check_time = 0
+    self.__has_enough_eth = False
+    self.__check_eth_balance()
     return
   
+  def __check_eth_balance(self):
+    """
+    Check if the oracle has enough ETH to cover gas fees for web3 transactions.
+    Updates the internal flag and logs warnings if balance is insufficient.
+    """
+    self.__last_eth_balance_check_time = self.time()
+    try:
+      eth_address = self.bc.eth_address
+      balances = self.bc.get_addresses_balances([eth_address])
+      eth_balance = balances.get(eth_address, {}).get("ethBalance", 0)
+      was_enough = self.__has_enough_eth
+      self.__has_enough_eth = eth_balance >= self.cfg_min_eth_balance
+      if not self.__has_enough_eth:
+        self.P(
+          f"Insufficient ETH balance for oracle {eth_address}: "
+          f"{eth_balance:.6f} ETH < {self.cfg_min_eth_balance} ETH minimum. "
+          f"Deeploy endpoints that require web3 transactions are disabled until the balance is topped up.",
+          color='r'
+        )
+      elif not was_enough and self.__has_enough_eth:
+        self.P(
+          f"ETH balance recovered for oracle {eth_address}: {eth_balance:.6f} ETH. "
+          f"Deeploy endpoints re-enabled.",
+          color='g'
+        )
+    except Exception as e:
+      self.P(f"Failed to check ETH balance: {e}", color='r')
+    return self.__has_enough_eth
+
+  def __ensure_eth_balance(self):
+    """
+    Raise ValueError if the oracle does not have enough ETH for web3 transactions.
+    Called at the top of mutating endpoints.
+    """
+    if not self.__has_enough_eth:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.GENERIC}: Oracle {self.bc.eth_address} does not have enough ETH "
+        f"to cover gas fees. Please top up the address and retry."
+      )
+
   def __handle_error(self, exc, request, extra_error_code=DEEPLOY_ERRORS.GENERIC):
     """
     Handle the error and return a response.
@@ -164,6 +207,7 @@ class DeeployManagerApiPlugin(
         The response dictionary
     """
     try:
+      self.__ensure_eth_balance()
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       normalized_request = self._normalize_plugins_input(self.deepcopy(request))
       if DEEPLOY_KEYS.PLUGINS in normalized_request:
@@ -354,6 +398,7 @@ class DeeployManagerApiPlugin(
             job_id=job_id,
             nodes=eth_nodes,
           )
+          self.__check_eth_balance()
         #endif
       #endif
 
@@ -622,13 +667,14 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)   
+      self.__ensure_eth_balance()
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       if not job_id:
         msg = f"{DEEPLOY_ERRORS.REQUEST13}: Job ID is required."
         raise ValueError(msg)
-      
+
       is_confirmable_job = inputs.chainstore_response
 
       # check payment
@@ -659,12 +705,12 @@ class DeeployManagerApiPlugin(
       nodes = list(cstore_response["node"] for cstore_response in dct_status.values())
       self.Pd(f"Nodes to confirm: {self.json_dumps(nodes, indent=2)}")
       
-      self._submit_bc_job_confirmation(str_status=str_status, 
-                                       dct_status=dct_status, 
-                                       nodes=nodes, 
-                                       job_id=job_id, 
+      self._submit_bc_job_confirmation(str_status=str_status,
+                                       dct_status=dct_status,
+                                       nodes=nodes,
+                                       job_id=job_id,
                                        is_confirmable_job=is_confirmable_job)
-
+      self.__check_eth_balance()
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
@@ -715,6 +761,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
+      self.__ensure_eth_balance()
       self.Pd(f"Called Deeploy delete_pipeline endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
@@ -774,6 +821,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
+      self.__ensure_eth_balance()
       self.Pd(f"Called Deeploy send_instance_command endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
@@ -827,6 +875,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the result of the operation
     """
     try:
+      self.__ensure_eth_balance()
       self.Pd(f"Called Deeploy send_app_command endpoint")
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
@@ -993,6 +1042,9 @@ class DeeployManagerApiPlugin(
   def process(self):
     if not self.is_deeploy_warmed_up():
       return
+
+    if (self.time() - self.__last_eth_balance_check_time) > self.cfg_eth_balance_check_interval:
+      self.__check_eth_balance()
 
     if (self.time() - self.__last_pipelines_check_time) > self.cfg_pipelines_check_delay:
       try:
