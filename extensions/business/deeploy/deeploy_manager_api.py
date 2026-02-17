@@ -37,7 +37,6 @@ _CONFIG = {
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   'WARMUP_DELAY' : 300,
   'PIPELINES_CHECK_DELAY' : 300,
-  'ETH_BALANCE_CHECK_INTERVAL' : 1800,
   'MIN_ETH_BALANCE' : 0.00005,
 
   'VALIDATION_RULES': {
@@ -74,7 +73,6 @@ class DeeployManagerApiPlugin(
         self.__class__.__name__, my_address, my_eth_address,
       )
     )
-    self.__last_eth_balance_check_time = 0
     self.__has_enough_eth = False
     self.__check_eth_balance()
     return
@@ -84,7 +82,6 @@ class DeeployManagerApiPlugin(
     Check if the oracle has enough ETH to cover gas fees for web3 transactions.
     Updates the internal flag and logs warnings if balance is insufficient.
     """
-    self.__last_eth_balance_check_time = self.time()
     try:
       eth_address = self.bc.eth_address
       balances = self.bc.get_addresses_balances([eth_address])
@@ -110,9 +107,10 @@ class DeeployManagerApiPlugin(
 
   def __ensure_eth_balance(self):
     """
-    Raise ValueError if the oracle does not have enough ETH for web3 transactions.
+    Check ETH balance and raise ValueError if insufficient for web3 transactions.
     Called at the top of mutating endpoints.
     """
+    self.__check_eth_balance()
     if not self.__has_enough_eth:
       raise ValueError(
         f"{DEEPLOY_ERRORS.GENERIC}: Oracle {self.bc.eth_address} does not have enough ETH "
@@ -398,7 +396,6 @@ class DeeployManagerApiPlugin(
             job_id=job_id,
             nodes=eth_nodes,
           )
-          self.__check_eth_balance()
         #endif
       #endif
 
@@ -710,7 +707,6 @@ class DeeployManagerApiPlugin(
                                        nodes=nodes,
                                        job_id=job_id,
                                        is_confirmable_job=is_confirmable_job)
-      self.__check_eth_balance()
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
@@ -1042,9 +1038,6 @@ class DeeployManagerApiPlugin(
   def process(self):
     if not self.is_deeploy_warmed_up():
       return
-
-    if (self.time() - self.__last_eth_balance_check_time) > self.cfg_eth_balance_check_interval:
-      self.__check_eth_balance()
 
     if (self.time() - self.__last_pipelines_check_time) > self.cfg_pipelines_check_delay:
       try:
