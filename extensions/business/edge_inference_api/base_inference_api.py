@@ -85,6 +85,8 @@ _CONFIG = {
   "REQUEST_TIMEOUT": 600,  # 10 minutes
   "SAVE_PERIOD": 300,  # 5 minutes
 
+  "LOG_REQUESTS_STATUS_EVERY_SECONDS": 5,  # log pending request status every 5 seconds
+
   "REQUEST_TTL_SECONDS": 60 * 60 * 2,  # keep historical results for 2 hours
   "RATE_LIMIT_PER_MINUTE": 5,
   "AUTH_TOKEN_ENV": "INFERENCE_API_TOKEN",
@@ -129,6 +131,7 @@ class BaseInferenceApiPlugin(
       self.P(err_msg)
       raise ValueError(err_msg)
     # endif AI_ENGINE not specified
+    self._request_last_log_time: Dict[str, float] = {}
     self._requests: Dict[str, Dict[str, Any]] = {}
     self._api_errors: Dict[str, Dict[str, Any]] = {}
     # TODO: add inference metrics tracking (latency, tokens, etc)
@@ -569,7 +572,11 @@ class BaseInferenceApiPlugin(
         Request result when completed or failed, or a PostponedRequest for pending work.
       """
       if request_id in self._requests:
-        self.Pd(f"Checking status of request ID {request_id}...")
+        last_logged_status = self._request_last_log_time.get(request_id, 0)
+        if (self.time() - last_logged_status) > self.cfg_log_requests_status_every_seconds:
+          self.Pd(f"Checking status of request ID {request_id}...")
+          self._request_last_log_time[request_id] = self.time()
+        # endif logging status
         request_data = self._requests[request_id]
 
         self.maybe_mark_request_timeout(request_id=request_id, request_data=request_data)

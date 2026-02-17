@@ -30,6 +30,19 @@ _CONFIG = {
   "MODEL_NAME": None,
   "MODEL_FILENAME": None,
 
+  # Format used to compute the prompt for the model
+  "CHAT_FORMAT": None,
+  # This can cause massive memory overhead.
+  # Better used only for strong machines.
+  "DRAFT_MODEL": None,
+  # None means it will be 0 if no gpu is available and -1 if gpu available
+  # TODO: have method for partial moving of the layers depending on the
+  #  available VRAM
+  "N_GPU_LAYERS": None,
+
+  # Format used by the model when answering requests
+  "DEFAULT_RESPONSE_FORMAT": None,
+
   'VALIDATION_RULES': {
     **BaseServingProcess.CONFIG['VALIDATION_RULES'],
   },
@@ -52,6 +65,35 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     # endif model id/filename check
     return f"{model_id}/{model_filename}"
 
+  def get_chat_format(self):
+    return self.cfg_chat_format
+
+  def get_draft_model(self):
+    return self.cfg_draft_model
+
+  def get_n_gpu_layers(self):
+    configured_n_gpu_layers = self.cfg_n_gpu_layers
+    gpu_info = self.log.gpu_info()
+    gpu_available = len(gpu_info) > 0
+    # Initially, only CPU is used.
+    n_gpu_layers = 0
+    if configured_n_gpu_layers is None:
+      # AUTO: If gpu is available attempt to move all layers on GPU
+      n_gpu_layers = -1 if gpu_available else 0
+    else:
+      # CONFIGURED: n_gpu_layers provided => check if valid
+      if n_gpu_layers != 0:
+        if gpu_available:
+          n_gpu_layers = configured_n_gpu_layers
+        else:
+          self.P(f"WARN: N_GPU_LAYERS={configured_n_gpu_layers}, but GPU not available. Switching to N_GPU_LAYERS=0.")
+      # endif n_gpu_layers provided and not 0
+    # endif n_gpu_layers auto
+    return n_gpu_layers
+
+  def get_default_response_format(self):
+    return self.cfg_default_response_format
+
   def _load_model(self):
     model_id = self.cfg_model_name
     model_filename = self.cfg_model_filename
@@ -62,15 +104,36 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     # endif not int/float
     n_ctx = max(MODEL_N_CTX_MIN_VALUE, int(n_ctx))
 
-    self.P(f"Loading Llama_cpp model '{model_id}' from file '{model_filename}'")
-
     model_params = {
       'n_ctx': n_ctx,
       'seed': self.cfg_generation_seed,
       'n_batch': MODEL_N_BATCH_DEFAULT_VALUE,
+      'chat_format': self.get_chat_format(),
+      'draft_model': self.get_draft_model(),
+      'n_gpu_layers': self.get_n_gpu_layers(),
+      'verbose': True,
     }
 
+    self.P(f"Loading Llama_cpp model '{model_id}' from file '{model_filename}' with parameters: {self.json_dumps(model_params, indent=2)}")
+
+    # This is safe because the _llama_from_pretrained() method will be called
+    # synchronously by safe_load_model() and if the first time it fails it will be
+    # called a second time.
+    # Maybe future TODO: switch to counting the attempts instead of just checking
+    # if this is the second call
+    first_attempt_done = False
+
     def _llama_from_pretrained():
+      nonlocal first_attempt_done
+      if first_attempt_done:
+        # This means, this is the second attempt to load the model.
+        # => The first attempt failed, so n_gpu_layers is switched to 0
+        if model_params['n_gpu_layers'] != 0:
+          self.P(f"Initial model loading attempt failed. Changing n_gpu_layers to 0 for safety.")
+          model_params['n_gpu_layers'] = 0
+        # endif layers offloaded to GPU
+      first_attempt_done = True
+      # endif not the first attempt
       return Llama.from_pretrained(
         repo_id=model_id,
         filename=model_filename,
@@ -179,11 +242,13 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       request_context = jeeves_content.get(LlmCT.CONTEXT, None)
       valid_condition = jeeves_content.get(LlmCT.VALID_CONDITION, None)
       process_method = jeeves_content.get(LlmCT.PROCESS_METHOD, None)
+      response_format = jeeves_content.get(LlmCT.RESPONSE_FORMAT, self.get_default_response_format())
       predict_kwargs = {
         'temperature': temperature,
         'top_p': top_p,
         'max_tokens': max_tokens,
         'repeat_penalty': repetition_penalty,
+        'response_format': response_format,
       }
       predict_kwargs = self.process_predict_kwargs(predict_kwargs)
       if not isinstance(messages, list):

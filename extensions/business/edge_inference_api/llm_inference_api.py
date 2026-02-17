@@ -90,7 +90,7 @@ Example pipeline configuration:
 from extensions.business.edge_inference_api.base_inference_api import BaseInferenceApiPlugin as BasePlugin
 from extensions.serving.mixins_llm.llm_utils import LlmCT
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 _CONFIG = {
@@ -142,11 +142,117 @@ class LLMInferenceApiPlugin(BasePlugin):
           return f"Message {idx} content must be a non-empty string."
       return None
 
+    def check_and_normalize_response_format(self, response_format) -> Tuple[Optional[Dict[str, Any]], str]:
+      """
+      Validate and normalize the value received for response_format in an inference request.
+
+      Supported inputs:
+      - None  -> returns None
+      - dict  -> validates and normalizes
+      - str   -> if it looks like JSON, parses to dict then validates
+
+      Accepted forms:
+        A) llama-cpp-python documented forms:
+          - {"type": "json_object"}
+          - {"type": "json_object", "schema": {<json-schema>}}
+
+        B) llama.cpp server alternative form:
+          - {"type": "json_schema", "json_schema": {"schema": {<json-schema>}, ...}}
+
+      Parameters
+      ----------
+      response_format : dict or str, optional
+        Controls structured output constraints for the model response.
+
+      Returns
+      -------
+      (result, err_msg), where
+      result: dict or None
+        The normalized value of response_format
+      err_msg: str or None
+        Error message when validation fails, otherwise None.
+      """
+      result = None
+      err_msg = ""
+      if not response_format:
+        return result, err_msg
+      # endif response_format not provided
+
+      # Accept JSON string input (common in REST APIs).
+      if isinstance(response_format, str):
+        s = response_format.strip()
+        if not s:
+          # Treat empty string as "no response_format"
+          return result, err_msg
+        try:
+          response_format = self.json.loads(s)
+        except Exception as e:
+          err_msg = f"response_format is a string but not valid JSON: {e}"
+          return result, err_msg
+      # endif response_format received as string
+
+      if not isinstance(response_format, dict):
+        err_msg = f"response_format expected as a dict, but received {type(response_format)} instead."
+        return result, err_msg
+      # endif invalid type
+
+      if "type" not in response_format:
+        err_msg = f"response_format missing required key 'type'."
+        return result, err_msg
+      fmt_type = response_format['type']
+      if not isinstance(fmt_type, str):
+        err_msg = f"Key 'type' from response_format should be a string, but received {type(fmt_type)} instead."
+        return result, err_msg
+      # endif type checking
+
+      def _check_schema(_schema: Any, where: str):
+        if _schema is None:
+          return None, ""
+        if not isinstance(_schema, dict):
+          return None, f"{where} from response_format must be an object/dict (JSON Schema) if provided, but received{type(_schema)} instead."
+        try:
+          # Check if schema is JSON-serializable
+          self.json.dumps(_schema)
+        except Exception as e:
+          return None, f"{where} from response_format must be JSON-serializable if provided: {e}"
+        return _schema, ""
+      # enddef _check_schema
+
+      fmt_type = fmt_type.strip()
+      if fmt_type == 'json_object':
+        schema = response_format.get('schema')
+        schema, err_msg = _check_schema(_schema=schema, where="'schema'")
+        result = {"type": "json_object"}
+        if schema is not None:
+          result["schema"] = schema
+      elif fmt_type == 'json_schema':
+        # Check for both 'json_schema' and 'schema'
+        schema = response_format.get('json_schema')
+        if schema is not None:
+          if not isinstance(schema, dict):
+            err_msg = f"'json_schema' from response_format must be an object/dict."
+            return result, err_msg
+          schema = schema.get('schema')
+          schema, err_msg = _check_schema(_schema=schema, where="'json_schema.schema'")
+        else:
+          schema = response_format.get('schema')
+          schema, err_msg = _check_schema(_schema=schema, where="'schema'")
+        # endif json_schema specified
+        if schema is None:
+          err_msg = "json_schema response_format requires a schema (missing 'schema'/'json_schema.schema')"
+        # Here, "json_object" is put as type, since it is the more reliable one according to llama.cpp documentation.
+        result = {"type": "json_object", "schema": schema}
+      # endif response_format type
+      if result is None and not err_msg:
+        err_msg = f"Unsupported response_format type '{fmt_type}'. Supported: 'json_object', 'json_schema'."
+      return result, err_msg
+
     def check_generation_params(
         self,
         temperature: float,
         max_tokens: int,
         top_p: float = 1.0,
+        response_format: Any = None,
         **kwargs
     ):
       """
@@ -160,6 +266,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Maximum number of tokens to generate.
       top_p : float, optional
         Nucleus sampling cutoff between 0 and 1.
+      response_format : dict or None, optional
+        Controls structured output constraints for the model response.
       **kwargs
         Additional unused parameters.
 
@@ -180,7 +288,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         )
       if not 0 < top_p <= 1:
         return "top_p must be between 0 and 1."
-      return None
+      _, err_msg = self.check_and_normalize_response_format(response_format=response_format)
+      return err_msg
 
     def normalize_messages(self, messages: List[Dict[str, Any]]):
       """
@@ -215,6 +324,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens: int = 512,
         top_p: float = 1.0,
         repeat_penalty: Optional[float] = 1.0,
+        response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         **kwargs
@@ -234,6 +344,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Nucleus sampling probability threshold.
       repeat_penalty : float or None, optional
         Penalty for repeated tokens if supported by the backend.
+      response_format : dict or None, optional
+        Controls structured output constraints for the model response.
       metadata : dict or None, optional
         Additional metadata to store with the request.
       authorization : str or None, optional
@@ -252,6 +364,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens=max_tokens,
         top_p=top_p,
         repeat_penalty=repeat_penalty,
+        response_format=response_format,
         metadata=metadata,
         authorization=authorization,
         **kwargs
@@ -265,6 +378,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens: int = 512,
         top_p: float = 1.0,
         repeat_penalty: float = 1.0,
+        response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         **kwargs
@@ -284,6 +398,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Nucleus sampling probability threshold.
       repeat_penalty : float, optional
         Penalty for repeated tokens if supported by the backend.
+      response_format : dict or None, optional
+        Controls structured output constraints for the model response.
       metadata : dict or None, optional
         Additional metadata to store with the request.
       authorization : str or None, optional
@@ -302,6 +418,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens=max_tokens,
         top_p=top_p,
         repeat_penalty=repeat_penalty,
+        response_format=response_format,
         metadata=metadata,
         authorization=authorization,
         **kwargs
@@ -315,6 +432,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens: int = 512,
         top_p: float = 1.0,
         repeat_penalty: Optional[float] = 1.0,
+        response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         **kwargs
@@ -334,6 +452,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Nucleus sampling probability threshold.
       repeat_penalty : float or None, optional
         Penalty for repeated tokens if supported by the backend.
+      response_format : dict or None, optional
+        Controls structured output constraints for the model response.
       metadata : dict or None, optional
         Additional metadata to store with the request.
       authorization : str or None, optional
@@ -352,6 +472,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens=max_tokens,
         top_p=top_p,
         repeat_penalty=repeat_penalty,
+        response_format=response_format,
         metadata=metadata,
         authorization=authorization,
         **kwargs
@@ -365,6 +486,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens: int = 512,
         top_p: float = 1.0,
         repeat_penalty: float = 1.0,
+        response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
         **kwargs
@@ -384,6 +506,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Nucleus sampling probability threshold.
       repeat_penalty : float, optional
         Penalty for repeated tokens if supported by the backend.
+      response_format : dict or None, optional
+        Controls structured output constraints for the model response.
       metadata : dict or None, optional
         Additional metadata to store with the request.
       authorization : str or None, optional
@@ -402,6 +526,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens=max_tokens,
         top_p=top_p,
         repeat_penalty=repeat_penalty,
+        response_format=response_format,
         metadata=metadata,
         authorization=authorization,
         **kwargs
@@ -417,6 +542,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens: int,
         top_p: float = 1.0,
         repeat_penalty: float = 1.0,
+        response_format: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
       """
@@ -434,6 +560,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Nucleus sampling probability threshold.
       repeat_penalty : float, optional
         Penalty for repeated tokens if supported by the backend.
+      response_format : dict or None, optional
+        Controls structured output constraints for the model response.
       **kwargs
         Additional parameters not validated here.
 
@@ -449,9 +577,10 @@ class LLMInferenceApiPlugin(BasePlugin):
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
+        response_format=response_format,
         **kwargs
       )
-      if err is not None:
+      if err:
         return err
       return None
 
@@ -462,6 +591,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         max_tokens: int,
         top_p: float = 1.0,
         repeat_penalty: float = 1.0,
+        response_format: Optional[Dict[str, Any]] = None,
         **kwargs
     ):
       """
@@ -479,6 +609,8 @@ class LLMInferenceApiPlugin(BasePlugin):
         Nucleus sampling probability threshold.
       repeat_penalty : float, optional
         Penalty for repeated tokens if supported by the backend.
+      response_format : dict or None, optional
+        Controls structured output constraints for the model response.
       **kwargs
         Additional parameters to include as-is.
 
@@ -488,12 +620,15 @@ class LLMInferenceApiPlugin(BasePlugin):
         Processed parameters ready for dispatch.
       """
       normalized_messages = self.normalize_messages(messages)
+      # No need to capture err_msg here, already validated in check_predict_params
+      response_format, _ = self.check_and_normalize_response_format(response_format=response_format)
       return {
         'messages': normalized_messages,
         'temperature': temperature,
         'max_tokens': max_tokens,
         'top_p': top_p,
         'repeat_penalty': repeat_penalty,
+        'response_format': response_format,
         **kwargs
       }
 
