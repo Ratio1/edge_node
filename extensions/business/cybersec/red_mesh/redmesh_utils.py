@@ -12,6 +12,12 @@ from copy import deepcopy
 
 from .service_mixin import _ServiceInfoMixin
 from .web_mixin import _WebTestsMixin
+from .constants import (
+  PROBE_PROTOCOL_MAP, WEB_PROTOCOLS,
+  WELL_KNOWN_PORTS as _WELL_KNOWN_PORTS,
+  FINGERPRINT_TIMEOUT, FINGERPRINT_MAX_BANNER, FINGERPRINT_HTTP_TIMEOUT,
+  FINGERPRINT_NUDGE_TIMEOUT,
+)
 
 
 COMMON_PORTS = [
@@ -147,6 +153,9 @@ class PentestLocalWorker(
       "web_tested": False,
       "web_tests_info": {},
       
+      "port_protocols": {},
+      "port_banners": {},
+
       "completed_tests": [],
       "done": False,
       "canceled": False,
@@ -200,12 +209,14 @@ class PentestLocalWorker(
     return {
       "start_port" : min,
       "end_port" : max,
-      "ports_scanned" : sum,      
-      
+      "ports_scanned" : sum,
+
       "open_ports" : list,
       "service_info" : dict,
       "web_tests_info" : dict,
       "completed_tests" : list,
+      "port_protocols" : dict,
+      "port_banners" : dict,
     }
   
   
@@ -226,11 +237,11 @@ class PentestLocalWorker(
     completed_tests = self.state.get("completed_tests", [])
     open_ports = self.state.get("open_ports", [])
     if open_ports:
-      # Full work: port scan + all enabled features + 2 completion markers
-      max_features = len(self.__enabled_features) + 3
+      # Full work: port scan + fingerprint + all enabled features + 2 completion markers
+      max_features = len(self.__enabled_features) + 4
     else:
-      # No open ports: just port scan + 2 completion markers
-      max_features = 3
+      # No open ports: port scan + fingerprint + service_info_completed + web_tests_completed
+      max_features = 4
     progress = f"{(len(completed_tests) / max_features) * 100:.1f}%"
     
     dct_status = {
@@ -259,6 +270,9 @@ class PentestLocalWorker(
     dct_status["web_tests_info"] = self.state["web_tests_info"]
 
     dct_status["completed_tests"] = self.state["completed_tests"]
+
+    dct_status["port_protocols"] = self.state.get("port_protocols", {})
+    dct_status["port_banners"] = self.state.get("port_banners", {})
 
     return dct_status
 
@@ -357,6 +371,10 @@ class PentestLocalWorker(
 
       if not self._check_stopped():
         self._scan_ports_step()
+
+      if not self._check_stopped():
+        self._fingerprint_ports()
+        self.state["completed_tests"].append("fingerprint_completed")
 
       if not self._check_stopped():
         self._gather_service_info()
@@ -459,6 +477,175 @@ class PentestLocalWorker(
     return
 
 
+  def _fingerprint_ports(self):
+    """
+    Classify each open port by protocol using passive banner grabbing.
+
+    For each open port the method attempts, in order:
+
+    1. **Passive banner grab** — connect and recv without sending data.
+    2. **Banner-based classification** — pattern-match known protocol greetings.
+    3. **Well-known port lookup** — fall back to ``WELL_KNOWN_PORTS``.
+    4. **Generic nudge probe** — send ``\\r\\n`` to elicit a response from
+       services that wait for client input (honeypots, RPC, custom daemons).
+    5. **Active HTTP probe** — minimal ``HEAD /`` request for silent HTTP servers.
+    6. **Default** — mark the port as ``"unknown"``.
+
+    Results are stored in ``state["port_protocols"]`` and
+    ``state["port_banners"]``.
+
+    Returns
+    -------
+    None
+    """
+    open_ports = self.state["open_ports"]
+    if not open_ports:
+      self.P("No open ports to fingerprint.")
+      return
+
+    target = self.target
+    port_protocols = {}
+    port_banners = {}
+
+    self.P(f"Fingerprinting {len(open_ports)} open ports.")
+
+    for port in open_ports:
+      if self.stop_event.is_set():
+        return
+
+      protocol = None
+      banner_text = ""
+
+      # --- 1. Passive banner grab ---
+      try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(FINGERPRINT_TIMEOUT)
+        sock.connect((target, port))
+        try:
+          raw = sock.recv(FINGERPRINT_MAX_BANNER)
+        except (socket.timeout, OSError):
+          raw = b""
+        sock.close()
+      except Exception:
+        raw = b""
+
+      # --- Sanitize banner ---
+      if raw:
+        banner_text = ''.join(
+          ch if 32 <= ord(ch) < 127 else '.' for ch in raw[:FINGERPRINT_MAX_BANNER].decode("utf-8", errors="replace")
+        )
+
+      # --- 2. Classify banner by content ---
+      if raw:
+        text = raw.decode("utf-8", errors="replace")
+        text_upper = text.upper()
+
+        if text.startswith("SSH-"):
+          protocol = "ssh"
+        elif text.startswith("220"):
+          if "FTP" in text_upper:
+            protocol = "ftp"
+          elif "SMTP" in text_upper or "ESMTP" in text_upper:
+            protocol = "smtp"
+          else:
+            protocol = _WELL_KNOWN_PORTS.get(port, "ftp")
+        elif text.startswith("RFB "):
+          protocol = "vnc"
+        elif raw[0:1] == b'\x0a':
+          protocol = "mysql"
+        elif "login:" in text.lower() or raw[0:1] == b'\xff':
+          protocol = "telnet"
+        elif text.startswith("HTTP/"):
+          protocol = "http"
+        elif text.startswith("+OK"):
+          protocol = "pop3"
+        elif text.startswith("* OK"):
+          protocol = "imap"
+
+      # --- 3. Well-known port lookup ---
+      if protocol is None:
+        protocol = _WELL_KNOWN_PORTS.get(port)
+
+      # --- 4. Generic nudge probe ---
+      # Some services (honeypots, RPC, custom daemons) don't speak first
+      # but will respond to any input.  Send a minimal \r\n nudge.
+      if protocol is None:
+        try:
+          nudge_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          nudge_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
+          nudge_sock.connect((target, port))
+          nudge_sock.sendall(b"\r\n")
+          try:
+            nudge_resp = nudge_sock.recv(FINGERPRINT_MAX_BANNER)
+          except (socket.timeout, OSError):
+            nudge_resp = b""
+          nudge_sock.close()
+        except Exception:
+          nudge_resp = b""
+
+        if nudge_resp:
+          nudge_text = nudge_resp.decode("utf-8", errors="replace")
+          if not banner_text:
+            banner_text = ''.join(
+              ch if 32 <= ord(ch) < 127 else '.'
+              for ch in nudge_text[:FINGERPRINT_MAX_BANNER]
+            )
+          if nudge_text.startswith("HTTP/"):
+            protocol = "http"
+          elif "<html" in nudge_text.lower() or "<HTML" in nudge_text:
+            protocol = "http"
+          elif nudge_text.startswith("SSH-"):
+            protocol = "ssh"
+          elif nudge_text.startswith("+OK"):
+            protocol = "pop3"
+          elif nudge_text.startswith("* OK"):
+            protocol = "imap"
+          elif "login:" in nudge_text.lower() or nudge_resp[0:1] == b'\xff':
+            protocol = "telnet"
+
+      # --- 5. Active HTTP probe ---
+      if protocol is None:
+        try:
+          http_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          http_sock.settimeout(FINGERPRINT_HTTP_TIMEOUT)
+          http_sock.connect((target, port))
+          http_sock.sendall(f"HEAD / HTTP/1.0\r\nHost: {target}\r\n\r\n".encode())
+          try:
+            http_resp = http_sock.recv(FINGERPRINT_MAX_BANNER)
+          except (socket.timeout, OSError):
+            http_resp = b""
+          http_sock.close()
+          if http_resp:
+            http_text = http_resp.decode("utf-8", errors="replace")
+            if http_text.startswith("HTTP/"):
+              protocol = "http"
+            elif "<html" in http_text.lower() or "<HTML" in http_text:
+              protocol = "http"
+            if not banner_text:
+              banner_text = ''.join(
+                ch if 32 <= ord(ch) < 127 else '.'
+                for ch in http_text[:FINGERPRINT_MAX_BANNER]
+              )
+        except Exception:
+          pass
+
+      # --- 6. Default ---
+      if protocol is None:
+        protocol = "unknown"
+
+      port_protocols[port] = protocol
+      port_banners[port] = banner_text
+      self.P(f"Port {port} fingerprinted as '{protocol}'.")
+
+      # Dune sand walking - random delay between fingerprint probes
+      if self._interruptible_sleep():
+        return  # Stop was requested during sleep
+
+    self.state["port_protocols"] = port_protocols
+    self.state["port_banners"] = port_banners
+    self.P(f"Fingerprinting complete: {port_protocols}")
+
+
   def _gather_service_info(self):
     """
     Gather banner or basic information from each newly open port.
@@ -475,13 +662,21 @@ class PentestLocalWorker(
     self.P(f"Gathering service info for {len(open_ports)} open ports.")
     target = self.target
     service_info_methods = [m for m in self.__enabled_features if m.startswith("_service_info_")]
+    port_protocols = self.state.get("port_protocols", {})
     aggregated_info = []
     for method in service_info_methods:
       func = getattr(self, method)
+      target_protocols = PROBE_PROTOCOL_MAP.get(method)  # None → run unconditionally
       method_info = []
       for port in open_ports:
         if self.stop_event.is_set():
           return
+        # Route probe only to ports matching its target protocol
+        # When port_protocols is empty (fingerprinting didn't run), skip filtering
+        if target_protocols is not None and port_protocols:
+          port_proto = port_protocols.get(port, "unknown")
+          if port_proto not in target_protocols:
+            continue
         info = func(target, port)
         if port not in self.state["service_info"]:
           self.state["service_info"][port] = {}
@@ -518,15 +713,20 @@ class PentestLocalWorker(
       self.P("No open ports to run web tests on.")
       return
     
-    ports_to_test = list(open_ports)
+    port_protocols = self.state.get("port_protocols", {})
+    if port_protocols:
+      ports_to_test = [p for p in open_ports if port_protocols.get(p, "unknown") in WEB_PROTOCOLS]
+    else:
+      # Fingerprinting didn't run (e.g., direct test call) — fall back to all ports
+      ports_to_test = list(open_ports)
+    if not ports_to_test:
+      self.P("No HTTP/HTTPS ports detected, skipping web tests.")
+      self.state["web_tested"] = True
+      return
     self.P(
       f"Running web tests on {len(ports_to_test)} ports."
     )
     target = self.target
-    
-    if not ports_to_test:
-      self.state["web_tested"] = True
-      return
     result = []
     web_tests_methods = [m for m in self.__enabled_features if m.startswith("_web_test_")]
     for method in web_tests_methods:

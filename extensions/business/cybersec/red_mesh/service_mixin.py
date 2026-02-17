@@ -6,6 +6,20 @@ import requests
 import ssl
 from datetime import datetime
 
+import paramiko
+
+# Default credentials commonly found on exposed SSH services.
+# Kept intentionally small — this is a quick check, not a brute-force.
+_SSH_DEFAULT_CREDS = [
+    ("root", "root"),
+    ("root", "toor"),
+    ("root", "password"),
+    ("admin", "admin"),
+    ("admin", "password"),
+    ("user", "user"),
+    ("test", "test"),
+]
+
 class _ServiceInfoMixin:
   """
   Network service banner probes feeding RedMesh reports.
@@ -192,7 +206,15 @@ class _ServiceInfoMixin:
 
   def _service_info_22(self, target, port):
     """
-    Retrieve the SSH banner to fingerprint implementations.
+    Assess SSH service security: banner, auth methods, and default credentials.
+
+    Checks performed (in order):
+
+    1. Banner grab — fingerprint server version.
+    2. Auth method enumeration — identify if password auth is enabled.
+    3. Default credential check — try a small list of common creds.
+    4. Weak credential acceptance — flag if *any* password is accepted
+       (strong honeypot indicator).
 
     Parameters
     ----------
@@ -203,21 +225,96 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      SSH banner text or error message.
+    dict
+      Structured findings with banner, auth_methods, and vulnerabilities.
     """
-    info = None
+    result = {
+      "banner": None,
+      "auth_methods": [],
+      "vulnerabilities": [],
+    }
+
+    # --- 1. Banner grab (raw socket) ---
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(2)
+      sock.settimeout(3)
       sock.connect((target, port))
-      banner = sock.recv(1024).decode('utf-8', errors='ignore')
-      info = f"SSH banner: {banner.strip()}"
+      banner = sock.recv(1024).decode("utf-8", errors="ignore").strip()
       sock.close()
+      result["banner"] = banner
     except Exception as e:
-      info = f"SSH probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return {"error": f"SSH probe failed on {target}:{port}: {e}"}
+
+    # --- 2. Auth method enumeration via paramiko Transport ---
+    try:
+      transport = paramiko.Transport((target, port))
+      transport.connect()
+      try:
+        transport.auth_none("")
+      except paramiko.BadAuthenticationType as e:
+        result["auth_methods"] = list(e.allowed_types)
+      except paramiko.AuthenticationException:
+        result["auth_methods"] = ["unknown"]
+      finally:
+        transport.close()
+    except Exception as e:
+      self.P(f"SSH auth enumeration failed on {target}:{port}: {e}", color='y')
+
+    if "password" in result["auth_methods"]:
+      result["vulnerabilities"].append(
+        "SSH password authentication is enabled (prefer key-based auth)."
+      )
+
+    # --- 3. Default credential check ---
+    accepted_creds = []
+
+    for username, password in _SSH_DEFAULT_CREDS:
+      try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(
+          target, port=port,
+          username=username, password=password,
+          timeout=3, auth_timeout=3,
+          look_for_keys=False, allow_agent=False,
+        )
+        accepted_creds.append(f"{username}:{password}")
+        client.close()
+      except paramiko.AuthenticationException:
+        continue
+      except Exception:
+        break  # connection issue, stop trying
+
+    # --- 4. Honeypot / any-password detection ---
+    random_user = f"probe_{random.randint(10000, 99999)}"
+    random_pass = f"rnd_{random.randint(10000, 99999)}"
+    try:
+      client = paramiko.SSHClient()
+      client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+      client.connect(
+        target, port=port,
+        username=random_user, password=random_pass,
+        timeout=3, auth_timeout=3,
+        look_for_keys=False, allow_agent=False,
+      )
+      result["vulnerabilities"].append(
+        "SSH accepts ANY credentials — possible honeypot or "
+        "severely misconfigured service."
+      )
+      client.close()
+    except paramiko.AuthenticationException:
+      pass
+    except Exception:
+      pass
+
+    if accepted_creds:
+      result["accepted_credentials"] = accepted_creds
+      for cred in accepted_creds:
+        result["vulnerabilities"].append(
+          f"SSH default credential accepted: {cred}"
+        )
+
+    return result
 
   def _service_info_25(self, target, port):
     """
