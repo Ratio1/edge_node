@@ -20,6 +20,16 @@ _SSH_DEFAULT_CREDS = [
     ("test", "test"),
 ]
 
+# Default credentials for FTP services.
+_FTP_DEFAULT_CREDS = [
+    ("root", "root"),
+    ("admin", "admin"),
+    ("admin", "password"),
+    ("ftp", "ftp"),
+    ("user", "user"),
+    ("test", "test"),
+]
+
 class _ServiceInfoMixin:
   """
   Network service banner probes feeding RedMesh reports.
@@ -173,7 +183,18 @@ class _ServiceInfoMixin:
 
   def _service_info_21(self, target, port):
     """
-    Identify FTP banners and anonymous login exposure.
+    Assess FTP service security: banner, anonymous access, default creds,
+    server fingerprint, TLS support, write access, and honeypot detection.
+
+    Checks performed (in order):
+
+    1. Banner grab and SYST/FEAT fingerprint.
+    2. Anonymous login attempt.
+    3. Write access test (STOR) after anonymous login.
+    4. Directory listing and traversal.
+    5. TLS support check (AUTH TLS).
+    6. Default credential check.
+    7. Honeypot detection — random credentials accepted.
 
     Parameters
     ----------
@@ -184,25 +205,176 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      FTP banner info or vulnerability message.
+    dict
+      Structured findings with banner, vulnerabilities, server_info, etc.
     """
-    info = None
+    result = {
+      "banner": None,
+      "server_type": None,
+      "features": [],
+      "anonymous_access": False,
+      "write_access": False,
+      "tls_supported": False,
+      "vulnerabilities": [],
+      "accepted_credentials": [],
+      "directory_listing": None,
+    }
+
+    def _ftp_connect(user=None, passwd=None):
+      """Open a fresh FTP connection and optionally login."""
+      ftp = ftplib.FTP(timeout=5)
+      ftp.connect(target, port, timeout=5)
+      if user is not None:
+        ftp.login(user, passwd or "")
+      return ftp
+
+    # --- 1. Banner grab ---
     try:
-      ftp = ftplib.FTP(timeout=3)
-      ftp.connect(target, port, timeout=3)
-      banner = ftp.getwelcome()
-      info = f"FTP banner: {banner}"
-      try:
-        ftp.login()  # attempt anonymous login
-        info = f"VULNERABILITY: FTP allows anonymous login (banner: {banner})"
-      except Exception:
-        info = f"FTP banner: {banner} | Anonymous login not allowed"
-      ftp.quit()
+      ftp = _ftp_connect()
+      result["banner"] = ftp.getwelcome()
     except Exception as e:
-      info = f"FTP probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return {"error": f"FTP probe failed on {target}:{port}: {e}"}
+
+    # --- 2. Anonymous login ---
+    try:
+      resp = ftp.login()
+      result["anonymous_access"] = True
+      result["vulnerabilities"].append(
+        "FTP allows anonymous login."
+      )
+    except Exception:
+      # Anonymous failed — close and move on to credential tests
+      try:
+        ftp.quit()
+      except Exception:
+        pass
+      ftp = None
+
+    # --- 2b. SYST / FEAT (after login — some servers require auth first) ---
+    if ftp:
+      try:
+        syst = ftp.sendcmd("SYST")
+        result["server_type"] = syst
+      except Exception:
+        pass
+
+      try:
+        feat_resp = ftp.sendcmd("FEAT")
+        feats = [
+          line.strip() for line in feat_resp.split("\n")
+          if line.strip() and not line.startswith("211")
+        ]
+        result["features"] = feats
+      except Exception:
+        pass
+
+    # --- 3. Write access test (only if anonymous login succeeded) ---
+    if ftp and result["anonymous_access"]:
+      import io
+      try:
+        ftp.set_pasv(True)
+        test_data = io.BytesIO(b"RedMesh write access probe")
+        resp = ftp.storbinary("STOR __redmesh_probe.txt", test_data)
+        if resp and resp.startswith("226"):
+          result["write_access"] = True
+          result["vulnerabilities"].append(
+            "FTP anonymous write access enabled (file upload possible)."
+          )
+          try:
+            ftp.delete("__redmesh_probe.txt")
+          except Exception:
+            pass
+      except Exception:
+        pass
+
+    # --- 4. Directory listing and traversal ---
+    if ftp:
+      try:
+        pwd = ftp.pwd()
+        files = []
+        try:
+          ftp.retrlines("LIST", files.append)
+        except Exception:
+          pass
+        if files:
+          result["directory_listing"] = files[:20]
+      except Exception:
+        pass
+
+      # Check if CWD allows directory traversal
+      for test_dir in ["/etc", "/var", ".."]:
+        try:
+          resp = ftp.cwd(test_dir)
+          if resp and (resp.startswith("250") or resp.startswith("200")):
+            result["vulnerabilities"].append(
+              f"FTP directory traversal: CWD to '{test_dir}' succeeded."
+            )
+            break
+        except Exception:
+          pass
+      try:
+        ftp.cwd("/")
+      except Exception:
+        pass
+
+    if ftp:
+      try:
+        ftp.quit()
+      except Exception:
+        pass
+
+    # --- 5. TLS support check ---
+    try:
+      ftp_tls = _ftp_connect()
+      resp = ftp_tls.sendcmd("AUTH TLS")
+      if resp.startswith("234"):
+        result["tls_supported"] = True
+      try:
+        ftp_tls.quit()
+      except Exception:
+        pass
+    except Exception:
+      if not result["tls_supported"]:
+        result["vulnerabilities"].append(
+          "FTP does not support TLS encryption (cleartext credentials)."
+        )
+
+    # --- 6. Default credential check ---
+    for user, passwd in _FTP_DEFAULT_CREDS:
+      try:
+        ftp_cred = _ftp_connect(user, passwd)
+        result["accepted_credentials"].append(f"{user}:{passwd}")
+        result["vulnerabilities"].append(
+          f"FTP default credential accepted: {user}:{passwd}"
+        )
+        try:
+          ftp_cred.quit()
+        except Exception:
+          pass
+      except (ftplib.error_perm, ftplib.error_reply):
+        pass
+      except Exception:
+        pass
+
+    # --- 7. Honeypot detection — try random credentials ---
+    import string as _string
+    ruser = "".join(random.choices(_string.ascii_lowercase, k=8))
+    rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
+    try:
+      ftp_rand = _ftp_connect(ruser, rpass)
+      result["vulnerabilities"].append(
+        "FTP accepts arbitrary credentials (possible honeypot)."
+      )
+      try:
+        ftp_rand.quit()
+      except Exception:
+        pass
+    except (ftplib.error_perm, ftplib.error_reply):
+      pass
+    except Exception:
+      pass
+
+    return result
 
   def _service_info_22(self, target, port):
     """
