@@ -30,6 +30,17 @@ _FTP_DEFAULT_CREDS = [
     ("test", "test"),
 ]
 
+# Default credentials for Telnet services.
+_TELNET_DEFAULT_CREDS = [
+    ("root", "root"),
+    ("root", "toor"),
+    ("root", "password"),
+    ("admin", "admin"),
+    ("admin", "password"),
+    ("user", "user"),
+    ("test", "test"),
+]
+
 class _ServiceInfoMixin:
   """
   Network service banner probes feeding RedMesh reports.
@@ -42,7 +53,8 @@ class _ServiceInfoMixin:
   
   def _service_info_80(self, target, port):
     """
-    Collect HTTP banner and server metadata for common web ports.
+    Assess HTTP service: server fingerprint, technology detection,
+    dangerous HTTP methods, and page title extraction.
 
     Parameters
     ----------
@@ -53,22 +65,88 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      Banner summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    import re as _re
+
+    scheme = "https" if port in (443, 8443) else "http"
+    url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    result = {
+      "banner": None,
+      "server": None,
+      "title": None,
+      "technologies": [],
+      "dangerous_methods": [],
+      "vulnerabilities": [],
+    }
+
+    # --- 1. GET request — banner, server, title, tech fingerprint ---
     try:
-      scheme = "https" if port in (443, 8443) else "http"
-      url = f"{scheme}://{target}"
-      if port not in (80, 443):
-        url = f"{scheme}://{target}:{port}"
       self.P(f"Fetching {url} for banner...")
-      resp = requests.get(url, timeout=3, verify=False)
-      info = (f"HTTP {resp.status_code} {resp.reason}; Server: {resp.headers.get('Server')}")
+      resp = requests.get(url, timeout=5, verify=False, allow_redirects=True)
+
+      result["banner"] = f"HTTP {resp.status_code} {resp.reason}"
+      result["server"] = resp.headers.get("Server")
+      powered_by = resp.headers.get("X-Powered-By")
+
+      # Page title
+      title_match = _re.search(
+        r"<title>(.*?)</title>", resp.text[:5000], _re.IGNORECASE | _re.DOTALL
+      )
+      if title_match:
+        result["title"] = title_match.group(1).strip()[:100]
+
+      # Technology fingerprinting
+      body_lower = resp.text[:8000].lower()
+      tech_signatures = {
+        "WordPress": ["wp-content", "wp-includes"],
+        "Joomla": ["com_content", "/media/jui/"],
+        "Drupal": ["drupal.js", "sites/default/files"],
+        "Django": ["csrfmiddlewaretoken"],
+        "PHP": [".php", "phpsessid"],
+        "ASP.NET": ["__viewstate", ".aspx"],
+        "React": ["_next/", "__next_data__", "react"],
+      }
+      techs = []
+      if result["server"]:
+        techs.append(result["server"])
+      if powered_by:
+        techs.append(powered_by)
+      for tech, markers in tech_signatures.items():
+        if any(m in body_lower for m in markers):
+          techs.append(tech)
+      result["technologies"] = techs
+
     except Exception as e:
-      info = f"HTTP probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return {"error": f"HTTP probe failed on {target}:{port}: {e}"}
+
+    # --- 2. Dangerous HTTP methods ---
+    dangerous = []
+    for method in ("TRACE", "PUT", "DELETE"):
+      try:
+        r = requests.request(method, url, timeout=3, verify=False)
+        if r.status_code < 400:
+          dangerous.append(method)
+      except Exception:
+        pass
+
+    result["dangerous_methods"] = dangerous
+    if "TRACE" in dangerous:
+      result["vulnerabilities"].append(
+        "HTTP TRACE method enabled (cross-site tracing / XST attack vector)."
+      )
+    if "PUT" in dangerous:
+      result["vulnerabilities"].append(
+        "HTTP PUT method enabled (potential unauthorized file upload)."
+      )
+    if "DELETE" in dangerous:
+      result["vulnerabilities"].append(
+        "HTTP DELETE method enabled (potential unauthorized file deletion)."
+      )
+
+    return result
   
 
   def _service_info_8080(self, target, port):
@@ -490,7 +568,17 @@ class _ServiceInfoMixin:
 
   def _service_info_25(self, target, port):
     """
-    Capture SMTP banner data for mail infrastructure mapping.
+    Assess SMTP service security: banner, EHLO features, STARTTLS,
+    authentication methods, open relay, and user enumeration.
+
+    Checks performed (in order):
+
+    1. Banner grab — fingerprint MTA software and version.
+    2. EHLO — enumerate server capabilities (SIZE, AUTH, STARTTLS, etc.).
+    3. STARTTLS support — check for encryption.
+    4. AUTH methods — detect available authentication mechanisms.
+    5. Open relay test — attempt MAIL FROM / RCPT TO without auth.
+    6. VRFY / EXPN — test user enumeration commands.
 
     Parameters
     ----------
@@ -501,21 +589,153 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      SMTP banner text or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    import smtplib
+
+    result = {
+      "banner": None,
+      "server_hostname": None,
+      "max_message_size": None,
+      "auth_methods": [],
+      "vulnerabilities": [],
+    }
+
+    # --- 1. Connect and grab banner ---
     try:
-      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
-      sock.connect((target, port))
-      banner = sock.recv(1024).decode('utf-8', errors='ignore')
-      info = f"SMTP banner: {banner.strip()}"
-      sock.close()
+      smtp = smtplib.SMTP(timeout=5)
+      code, msg = smtp.connect(target, port)
+      result["banner"] = f"{code} {msg.decode(errors='replace')}"
     except Exception as e:
-      info = f"SMTP probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return {"error": f"SMTP probe failed on {target}:{port}: {e}"}
+
+    # --- 2. EHLO — server capabilities ---
+    ehlo_features = []
+    try:
+      code, msg = smtp.ehlo("probe.redmesh.local")
+      if code == 250:
+        for line in msg.decode(errors="replace").split("\n"):
+          feat = line.strip()
+          if feat:
+            ehlo_features.append(feat)
+    except Exception:
+      # Fallback to HELO
+      try:
+        smtp.helo("probe.redmesh.local")
+      except Exception:
+        pass
+
+    # Parse meaningful fields from EHLO response
+    for idx, feat in enumerate(ehlo_features):
+      upper = feat.upper()
+      if idx == 0 and " Hello " in feat:
+        # First line is the server greeting: "hostname Hello client [ip]"
+        result["server_hostname"] = feat.split()[0]
+      if upper.startswith("SIZE "):
+        try:
+          size_bytes = int(feat.split()[1])
+          result["max_message_size"] = f"{size_bytes // (1024*1024)}MB"
+        except (ValueError, IndexError):
+          pass
+      if upper.startswith("AUTH "):
+        result["auth_methods"] = feat.split()[1:]
+
+    # --- 2b. Banner / hostname information disclosure ---
+    import re as _re
+    banner_text = result["banner"] or ""
+    # Extract MTA version from banner (e.g. "Exim 4.97", "Postfix", "Sendmail 8.x")
+    version_match = _re.search(
+      r"(Exim|Postfix|Sendmail|Microsoft ESMTP|hMailServer|Haraka|OpenSMTPD)"
+      r"[\s/]*([0-9][0-9.]*)?",
+      banner_text, _re.IGNORECASE,
+    )
+    if version_match:
+      mta = version_match.group(0).strip()
+      result["vulnerabilities"].append(
+        f"SMTP banner discloses MTA software: {mta} (aids CVE lookup)."
+      )
+
+    if result["server_hostname"]:
+      # Check if hostname reveals container/internal info
+      hostname = result["server_hostname"]
+      if _re.search(r"[0-9a-f]{12}", hostname):
+        result["vulnerabilities"].append(
+          f"SMTP hostname leaks container ID: {hostname} (infrastructure disclosure)."
+        )
+
+    # --- 3. STARTTLS ---
+    starttls_supported = any("STARTTLS" in f.upper() for f in ehlo_features)
+    if not starttls_supported:
+      try:
+        code, msg = smtp.docmd("STARTTLS")
+        if code == 220:
+          starttls_supported = True
+      except Exception:
+        pass
+
+    if not starttls_supported:
+      result["vulnerabilities"].append(
+        "SMTP does not support STARTTLS (credentials sent in cleartext)."
+      )
+
+    # --- 4. AUTH without credentials ---
+    if result["auth_methods"]:
+      try:
+        code, msg = smtp.docmd("AUTH LOGIN")
+        if code == 235:
+          result["vulnerabilities"].append(
+            "SMTP AUTH LOGIN accepted without credentials."
+          )
+      except Exception:
+        pass
+
+    # --- 5. Open relay test ---
+    try:
+      smtp.rset()
+    except Exception:
+      try:
+        smtp.quit()
+      except Exception:
+        pass
+      try:
+        smtp = smtplib.SMTP(target, port, timeout=5)
+        smtp.ehlo("probe.redmesh.local")
+      except Exception:
+        smtp = None
+
+    if smtp:
+      try:
+        code_from, _ = smtp.docmd("MAIL FROM:<probe@redmesh.local>")
+        if code_from == 250:
+          code_rcpt, _ = smtp.docmd("RCPT TO:<probe@external-domain.test>")
+          if code_rcpt == 250:
+            result["vulnerabilities"].append(
+              "SMTP open relay detected (accepts mail to external domains without auth)."
+            )
+          smtp.docmd("RSET")
+      except Exception:
+        pass
+
+    # --- 6. VRFY / EXPN ---
+    if smtp:
+      for cmd_name in ("VRFY", "EXPN"):
+        try:
+          code, msg = smtp.docmd(cmd_name, "root")
+          if code in (250, 251, 252):
+            result["vulnerabilities"].append(
+              f"SMTP {cmd_name} command enabled (user enumeration possible)."
+            )
+        except Exception:
+          pass
+
+    if smtp:
+      try:
+        smtp.quit()
+      except Exception:
+        pass
+
+    return result
 
   def _service_info_3306(self, target, port):
     """
@@ -616,7 +836,16 @@ class _ServiceInfoMixin:
 
   def _service_info_23(self, target, port):
     """
-    Fetch Telnet negotiation banner.
+    Assess Telnet service security: banner, negotiation options, default
+    credentials, privilege level, system fingerprint, and honeypot detection.
+
+    Checks performed (in order):
+
+    1. Banner grab and IAC option parsing.
+    2. Default credential check — try common user:pass combos.
+    3. Privilege escalation check — report if root shell is obtained.
+    4. System fingerprint — run ``id`` and ``uname -a`` on successful login.
+    5. Honeypot detection — random credentials should be rejected.
 
     Parameters
     ----------
@@ -627,24 +856,202 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      Telnet banner or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    import time as _time
+
+    result = {
+      "banner": None,
+      "negotiation_options": [],
+      "vulnerabilities": [
+        "Telnet service is running (unencrypted remote access)."
+      ],
+      "accepted_credentials": [],
+      "system_info": None,
+    }
+
+    # --- 1. Banner grab + IAC negotiation parsing ---
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(2)
+      sock.settimeout(5)
       sock.connect((target, port))
-      banner = sock.recv(1024).decode('utf-8', errors='ignore')
-      if banner:
-        info = f"VULNERABILITY: Telnet banner: {banner.strip()}"
-      else:
-        info = "VULNERABILITY: Telnet open with no banner"
+      raw = sock.recv(2048)
       sock.close()
     except Exception as e:
-      info = f"Telnet probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return {"error": f"Telnet probe failed on {target}:{port}: {e}"}
+
+    # Parse IAC sequences
+    iac_options = []
+    cmd_names = {251: "WILL", 252: "WONT", 253: "DO", 254: "DONT"}
+    opt_names = {
+      0: "BINARY", 1: "ECHO", 3: "SGA", 5: "STATUS",
+      24: "TERMINAL_TYPE", 31: "WINDOW_SIZE", 32: "TERMINAL_SPEED",
+      33: "REMOTE_FLOW", 34: "LINEMODE", 36: "ENVIRON", 39: "NEW_ENVIRON",
+    }
+    i = 0
+    text_parts = []
+    while i < len(raw):
+      if raw[i] == 0xFF and i + 2 < len(raw):
+        cmd = cmd_names.get(raw[i + 1], f"CMD_{raw[i+1]}")
+        opt = opt_names.get(raw[i + 2], f"OPT_{raw[i+2]}")
+        iac_options.append(f"{cmd} {opt}")
+        i += 3
+      else:
+        if 32 <= raw[i] < 127:
+          text_parts.append(chr(raw[i]))
+        i += 1
+
+    banner_text = "".join(text_parts).strip()
+    if banner_text:
+      result["banner"] = banner_text
+    elif iac_options:
+      result["banner"] = "(IAC negotiation only, no text banner)"
+    else:
+      result["banner"] = "(no banner)"
+    result["negotiation_options"] = iac_options
+
+    # --- 2–4. Default credential check with system fingerprint ---
+    def _try_telnet_login(user, passwd):
+      """Attempt Telnet login, return (success, uid_line, uname_line)."""
+      try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5)
+        s.connect((target, port))
+
+        # Read until login prompt
+        buf = b""
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+          try:
+            chunk = s.recv(1024)
+            if not chunk:
+              break
+            buf += chunk
+            if b"login:" in buf.lower() or b"username:" in buf.lower():
+              break
+          except socket.timeout:
+            break
+
+        if b"login:" not in buf.lower() and b"username:" not in buf.lower():
+          s.close()
+          return False, None, None
+
+        s.sendall(user.encode() + b"\n")
+
+        # Read until password prompt
+        buf = b""
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+          try:
+            chunk = s.recv(1024)
+            if not chunk:
+              break
+            buf += chunk
+            if b"assword:" in buf:
+              break
+          except socket.timeout:
+            break
+
+        if b"assword:" not in buf:
+          s.close()
+          return False, None, None
+
+        s.sendall(passwd.encode() + b"\n")
+        _time.sleep(1.5)
+
+        # Read response
+        resp = b""
+        try:
+          while True:
+            chunk = s.recv(4096)
+            if not chunk:
+              break
+            resp += chunk
+        except socket.timeout:
+          pass
+
+        resp_text = resp.decode("utf-8", errors="replace")
+
+        # Check for login failure indicators
+        fail_indicators = ["incorrect", "failed", "denied", "invalid", "login:"]
+        if any(ind in resp_text.lower() for ind in fail_indicators):
+          s.close()
+          return False, None, None
+
+        # Login succeeded — try to get system info
+        uid_line = None
+        uname_line = None
+        try:
+          s.sendall(b"id\n")
+          _time.sleep(0.5)
+          id_resp = s.recv(2048).decode("utf-8", errors="replace")
+          for line in id_resp.replace("\r\n", "\n").split("\n"):
+            cleaned = line.strip()
+            # Remove ANSI/control sequences
+            import re
+            cleaned = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", cleaned)
+            if "uid=" in cleaned:
+              uid_line = cleaned
+              break
+        except Exception:
+          pass
+
+        try:
+          s.sendall(b"uname -a\n")
+          _time.sleep(0.5)
+          uname_resp = s.recv(2048).decode("utf-8", errors="replace")
+          for line in uname_resp.replace("\r\n", "\n").split("\n"):
+            cleaned = line.strip()
+            import re
+            cleaned = re.sub(r"\x1b\[[0-9;]*[a-zA-Z]", "", cleaned)
+            if "linux" in cleaned.lower() or "unix" in cleaned.lower() or "darwin" in cleaned.lower():
+              uname_line = cleaned
+              break
+        except Exception:
+          pass
+
+        s.close()
+        return True, uid_line, uname_line
+
+      except Exception:
+        return False, None, None
+
+    system_info_captured = False
+    for user, passwd in _TELNET_DEFAULT_CREDS:
+      success, uid_line, uname_line = _try_telnet_login(user, passwd)
+      if success:
+        result["accepted_credentials"].append(f"{user}:{passwd}")
+        result["vulnerabilities"].append(
+          f"Telnet default credential accepted: {user}:{passwd}"
+        )
+        # Check for root access
+        if uid_line and "uid=0" in uid_line:
+          result["vulnerabilities"].append(
+            f"Root shell access via Telnet with {user}:{passwd}."
+          )
+
+        # Capture system info once
+        if not system_info_captured and (uid_line or uname_line):
+          parts = []
+          if uid_line:
+            parts.append(uid_line)
+          if uname_line:
+            parts.append(uname_line)
+          result["system_info"] = " | ".join(parts)
+          system_info_captured = True
+
+    # --- 5. Honeypot detection — random credentials ---
+    import string as _string
+    ruser = "".join(random.choices(_string.ascii_lowercase, k=8))
+    rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
+    success, _, _ = _try_telnet_login(ruser, rpass)
+    if success:
+      result["vulnerabilities"].append(
+        "Telnet accepts arbitrary credentials (possible honeypot)."
+      )
+
+    return result
 
 
   def _service_info_445(self, target, port):
