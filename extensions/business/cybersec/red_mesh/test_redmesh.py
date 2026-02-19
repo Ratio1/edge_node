@@ -75,7 +75,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_common("example.com", 80)
@@ -87,7 +87,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.headers = {"Set-Cookie": "sessionid=abc; Path=/"}
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_flags("example.com", 443)
@@ -101,7 +101,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.text = "sql syntax error near line"
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_sql_injection("example.com", 80)
@@ -113,7 +113,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.text = "root:x:0:0:root:/root:/bin/bash"
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_path_traversal("example.com", 80)
@@ -125,7 +125,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.headers = {"Server": "Test"}
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_security_headers("example.com", 80)
@@ -231,7 +231,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.text = "BEGIN RSA PRIVATE KEY"
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_homepage("example.com", 80)
@@ -270,7 +270,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.redmesh_utils.dir",
       return_value=["_web_test_common"],
     ), patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
       side_effect=fake_get,
     ):
       worker._run_web_tests()
@@ -314,7 +314,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.text = f"Response with {payload} inside"
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_xss("example.com", 80)
@@ -693,7 +693,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.status_code = 200
     resp.text = "{\"data\":{\"__schema\":{}}}"
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.post",
+      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.post",
       return_value=resp,
     ):
       result = worker._web_test_graphql_introspection("example.com", 80)
@@ -708,7 +708,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_metadata_endpoints("example.com", 80)
@@ -719,7 +719,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp = MagicMock()
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_api_auth_bypass("example.com", 80)
@@ -734,7 +734,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     }
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_cors_misconfiguration("example.com", 80)
@@ -746,7 +746,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.status_code = 302
     resp.headers = {"Location": "https://attacker.example"}
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_open_redirect("example.com", 80)
@@ -758,7 +758,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.headers = {"Allow": "GET, POST, PUT"}
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_mixin.requests.options",
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.options",
       return_value=resp,
     ):
       result = worker._web_test_http_methods("example.com", 80)
