@@ -74,6 +74,7 @@ class _ServiceInfoMixin:
     """
     import re as _re
 
+    findings = []
     scheme = "https" if port in (443, 8443) else "http"
     url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
 
@@ -83,7 +84,6 @@ class _ServiceInfoMixin:
       "title": None,
       "technologies": [],
       "dangerous_methods": [],
-      "vulnerabilities": [],
     }
 
     # --- 1. GET request — banner, server, title, tech fingerprint ---
@@ -124,7 +124,7 @@ class _ServiceInfoMixin:
       result["technologies"] = techs
 
     except Exception as e:
-      return {"error": f"HTTP probe failed on {target}:{port}: {e}"}
+      return probe_error(target, port, "HTTP", e)
 
     # --- 2. Dangerous HTTP methods ---
     dangerous = []
@@ -138,19 +138,40 @@ class _ServiceInfoMixin:
 
     result["dangerous_methods"] = dangerous
     if "TRACE" in dangerous:
-      result["vulnerabilities"].append(
-        "HTTP TRACE method enabled (cross-site tracing / XST attack vector)."
-      )
+      findings.append(Finding(
+        severity=Severity.MEDIUM,
+        title="HTTP TRACE method enabled (cross-site tracing / XST attack vector).",
+        description="TRACE echoes request bodies back, enabling cross-site tracing attacks.",
+        evidence=f"TRACE {url} returned status < 400.",
+        remediation="Disable the TRACE method in the web server configuration.",
+        owasp_id="A05:2021",
+        cwe_id="CWE-693",
+        confidence="certain",
+      ))
     if "PUT" in dangerous:
-      result["vulnerabilities"].append(
-        "HTTP PUT method enabled (potential unauthorized file upload)."
-      )
+      findings.append(Finding(
+        severity=Severity.HIGH,
+        title="HTTP PUT method enabled (potential unauthorized file upload).",
+        description="The PUT method allows uploading files to the server.",
+        evidence=f"PUT {url} returned status < 400.",
+        remediation="Disable the PUT method or restrict it to authenticated users.",
+        owasp_id="A01:2021",
+        cwe_id="CWE-749",
+        confidence="certain",
+      ))
     if "DELETE" in dangerous:
-      result["vulnerabilities"].append(
-        "HTTP DELETE method enabled (potential unauthorized file deletion)."
-      )
+      findings.append(Finding(
+        severity=Severity.HIGH,
+        title="HTTP DELETE method enabled (potential unauthorized file deletion).",
+        description="The DELETE method allows removing resources from the server.",
+        evidence=f"DELETE {url} returned status < 400.",
+        remediation="Disable the DELETE method or restrict it to authenticated users.",
+        owasp_id="A01:2021",
+        cwe_id="CWE-749",
+        confidence="certain",
+      ))
 
-    return result
+    return probe_result(raw_data=result, findings=findings)
   
 
   def _service_info_8080(self, target, port):
@@ -166,10 +187,11 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      Banner text or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None, "server": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(2)
@@ -177,16 +199,36 @@ class _ServiceInfoMixin:
       msg = "HEAD / HTTP/1.1\r\nHost: {}\r\n\r\n".format(target).encode('utf-8')
       sock.send(bytes(msg))
       data = sock.recv(1024).decode('utf-8', errors='ignore')
-      if data:
-        banner = ''.join(ch if 32 <= ord(ch) < 127 else '.' for ch in data)
-        info = f"Banner on port {port}: \"{banner.strip()}\""
-      else:
-        info = "No banner (possibly protocol handshake needed)."
       sock.close()
+
+      if data:
+        # Extract status line and Server header instead of dumping raw bytes
+        lines = data.split("\r\n")
+        status_line = lines[0].strip() if lines else "unknown"
+        raw["banner"] = status_line
+        for line in lines[1:]:
+          if line.lower().startswith("server:"):
+            raw["server"] = line.split(":", 1)[1].strip()
+            break
+
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title=f"HTTP service on alternate port {port}",
+          description=f"HTTP service responding on {target}:{port}.",
+          evidence=f"Status: {status_line}, Server: {raw['server'] or 'not disclosed'}",
+          confidence="certain",
+        ))
+      else:
+        raw["banner"] = "(no response)"
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title=f"Port {port} open (no HTTP banner)",
+          description="Connection succeeded but no HTTP response received.",
+          confidence="tentative",
+        ))
     except Exception as e:
-      info = f"HTTP-ALT probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info  
+      return probe_error(target, port, "HTTP-ALT", e)
+    return probe_result(raw_data=raw, findings=findings)  
 
 
   def _service_info_443(self, target, port):
@@ -202,21 +244,29 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      Banner summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None, "server": None}
     try:
       url = f"https://{target}"
       if port != 443:
         url = f"https://{target}:{port}"
       self.P(f"Fetching {url} for banner...")
       resp = requests.get(url, timeout=3, verify=False)
-      info = (f"HTTPS {resp.status_code} {resp.reason}; Server: {resp.headers.get('Server')}")
+      raw["banner"] = f"HTTPS {resp.status_code} {resp.reason}"
+      raw["server"] = resp.headers.get("Server")
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title=f"HTTPS service detected ({resp.status_code} {resp.reason})",
+        description=f"HTTPS service on {target}:{port}.",
+        evidence=f"Server: {raw['server'] or 'not disclosed'}",
+        confidence="certain",
+      ))
     except Exception as e:
-      info = f"HTTPS probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return probe_error(target, port, "HTTPS", e)
+    return probe_result(raw_data=raw, findings=findings)
 
 
   def _service_info_tls(self, target, port):
@@ -1736,10 +1786,11 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      SMB response summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(3)
@@ -1748,14 +1799,30 @@ class _ServiceInfoMixin:
       sock.sendall(probe)
       data = sock.recv(4)
       if data:
-        info = "VULNERABILITY: SMB service responded to negotiation probe."
+        raw["banner"] = "SMB negotiation response received"
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="SMB service responded to negotiation probe",
+          description=f"SMB on {target}:{port} accepts negotiation requests, "
+                      "exposing the host to SMB relay and enumeration attacks.",
+          evidence=f"SMB negotiate response: {data.hex()[:24]}",
+          remediation="Restrict SMB access to trusted networks; disable SMBv1.",
+          owasp_id="A01:2021",
+          cwe_id="CWE-284",
+          confidence="certain",
+        ))
       else:
-        info = "SMB port open but no negotiation response."
+        raw["banner"] = "SMB port open (no response)"
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title="SMB port open but no negotiation response",
+          description=f"Port {port} is open but SMB did not respond to negotiation.",
+          confidence="tentative",
+        ))
       sock.close()
     except Exception as e:
-      info = f"SMB probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return probe_error(target, port, "SMB", e)
+    return probe_result(raw_data=raw, findings=findings)
 
 
   def _service_info_5900(self, target, port):
@@ -1880,10 +1947,11 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      SNMP response summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None}
     sock = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1895,22 +1963,35 @@ class _ServiceInfoMixin:
       data, _ = sock.recvfrom(512)
       readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
       if 'public' in readable.lower():
-        info = (
-          f"VULNERABILITY: SNMP responds to community 'public' on {target}:{port}"
-          f" (response: {readable.strip()[:120]})"
-        )
+        raw["banner"] = readable.strip()[:120]
+        findings.append(Finding(
+          severity=Severity.HIGH,
+          title="SNMP default community string 'public' accepted",
+          description="SNMP agent responds to the default 'public' community string, "
+                      "allowing unauthenticated read access to device configuration and network data.",
+          evidence=f"Response: {readable.strip()[:80]}",
+          remediation="Change the community string from 'public' to a strong value; migrate to SNMPv3.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-798",
+          confidence="certain",
+        ))
       else:
-        info = f"SNMP response: {readable.strip()[:120]}"
+        raw["banner"] = readable.strip()[:120]
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title="SNMP service responded",
+          description=f"SNMP agent on {target}:{port} responded but did not accept 'public' community.",
+          evidence=f"Response: {readable.strip()[:80]}",
+          confidence="firm",
+        ))
     except socket.timeout:
-      info = f"SNMP probe timed out on {target}:{port}"
-      self.P(info, color='y')
+      return probe_error(target, port, "SNMP", Exception("timed out"))
     except Exception as e:
-      info = f"SNMP probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
+      return probe_error(target, port, "SNMP", e)
     finally:
       if sock is not None:
         sock.close()
-    return info
+    return probe_result(raw_data=raw, findings=findings)
 
 
   def _service_info_53(self, target, port):
@@ -1926,10 +2007,11 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      DNS disclosure summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None, "dns_version": None}
     sock = None
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -1941,53 +2023,73 @@ class _ServiceInfoMixin:
       packet = header + qname + question
       sock.sendto(packet, (target, port))
       data, _ = sock.recvfrom(512)
-      if len(data) < 12:
-        return f"DNS CHAOS response too short on {target}:{port}"
-      if struct.unpack('>H', data[:2])[0] != tid:
-        return f"DNS CHAOS response transaction mismatch on {target}:{port}"
-      ancount = struct.unpack('>H', data[6:8])[0]
-      if not ancount:
-        return f"DNS CHAOS response missing answers on {target}:{port}"
-      idx = 12 + len(qname) + 4
-      if idx >= len(data):
-        return f"DNS CHAOS response truncated after question on {target}:{port}"
-      if data[idx] & 0xc0 == 0xc0:
-        idx += 2
-      else:
-        while idx < len(data) and data[idx] != 0:
-          idx += data[idx] + 1
-        idx += 1
-      idx += 8
-      if idx + 2 > len(data):
-        return f"DNS CHAOS response missing TXT length on {target}:{port}"
-      rdlength = struct.unpack('>H', data[idx:idx+2])[0]
-      idx += 2
-      if idx >= len(data):
-        return f"DNS CHAOS response missing TXT payload on {target}:{port}"
-      txt_length = data[idx]
-      txt = data[idx+1:idx+1+txt_length].decode('utf-8', errors='ignore')
-      if txt:
-        info = (
-          f"VULNERABILITY: DNS version disclosure '{txt}' via CHAOS TXT on {target}:{port}"
-        )
-      if info is None:
+
+      # Parse CHAOS TXT response
+      parsed = False
+      if len(data) >= 12 and struct.unpack('>H', data[:2])[0] == tid:
+        ancount = struct.unpack('>H', data[6:8])[0]
+        if ancount:
+          idx = 12 + len(qname) + 4
+          if idx < len(data):
+            if data[idx] & 0xc0 == 0xc0:
+              idx += 2
+            else:
+              while idx < len(data) and data[idx] != 0:
+                idx += data[idx] + 1
+              idx += 1
+            idx += 8
+            if idx + 2 <= len(data):
+              rdlength = struct.unpack('>H', data[idx:idx+2])[0]
+              idx += 2
+              if idx < len(data):
+                txt_length = data[idx]
+                txt = data[idx+1:idx+1+txt_length].decode('utf-8', errors='ignore')
+                if txt:
+                  raw["dns_version"] = txt
+                  raw["banner"] = f"DNS version: {txt}"
+                  findings.append(Finding(
+                    severity=Severity.LOW,
+                    title=f"DNS version disclosure: {txt}",
+                    description=f"CHAOS TXT version.bind query reveals DNS software version.",
+                    evidence=f"version.bind TXT: {txt}",
+                    remediation="Disable version.bind responses in the DNS server configuration.",
+                    owasp_id="A05:2021",
+                    cwe_id="CWE-200",
+                    confidence="certain",
+                  ))
+                  parsed = True
+
+      # Fallback: check raw data for version keywords
+      if not parsed:
         readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
         if 'bind' in readable.lower() or 'version' in readable.lower():
-          info = (
-            f"VULNERABILITY: DNS version disclosure via CHAOS TXT on {target}:{port}"
-          )
-      if info is None:
-        info = f"DNS CHAOS TXT query did not disclose version on {target}:{port}"
+          raw["banner"] = readable.strip()[:80]
+          findings.append(Finding(
+            severity=Severity.LOW,
+            title="DNS version disclosure via CHAOS TXT",
+            description=f"CHAOS TXT response on {target}:{port} contains version keywords.",
+            evidence=f"Response contains: {readable.strip()[:80]}",
+            remediation="Disable version.bind responses in the DNS server configuration.",
+            owasp_id="A05:2021",
+            cwe_id="CWE-200",
+            confidence="firm",
+          ))
+        else:
+          raw["banner"] = "DNS service responding"
+          findings.append(Finding(
+            severity=Severity.INFO,
+            title="DNS CHAOS TXT query did not disclose version",
+            description=f"DNS on {target}:{port} responded but did not reveal version.",
+            confidence="firm",
+          ))
     except socket.timeout:
-      info = f"DNS CHAOS query timed out on {target}:{port}"
-      self.P(info, color='y')
+      return probe_error(target, port, "DNS", Exception("CHAOS query timed out"))
     except Exception as e:
-      info = f"DNS CHAOS query failed on {target}:{port}: {e}"
-      self.P(info, color='y')
+      return probe_error(target, port, "DNS", e)
     finally:
       if sock is not None:
         sock.close()
-    return info
+    return probe_result(raw_data=raw, findings=findings)
 
 
   def _service_info_1433(self, target, port):
@@ -2003,10 +2105,11 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      MSSQL response summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(3)
@@ -2018,15 +2121,22 @@ class _ServiceInfoMixin:
       data = sock.recv(256)
       if data:
         readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
-        info = (
-          f"VULNERABILITY: MSSQL prelogin succeeded on {target}:{port}"
-          f" (response: {readable.strip()[:120]})"
-        )
+        raw["banner"] = f"MSSQL prelogin response: {readable.strip()[:80]}"
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="MSSQL prelogin handshake succeeded",
+          description=f"SQL Server on {target}:{port} responds to TDS prelogin, "
+                      "exposing version metadata and confirming the service is reachable.",
+          evidence=f"Prelogin response: {readable.strip()[:80]}",
+          remediation="Restrict SQL Server access to trusted networks; use firewall rules.",
+          owasp_id="A05:2021",
+          cwe_id="CWE-200",
+          confidence="certain",
+        ))
       sock.close()
     except Exception as e:
-      info = f"MSSQL probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return probe_error(target, port, "MSSQL", e)
+    return probe_result(raw_data=raw, findings=findings)
 
 
   def _service_info_5432(self, target, port):
@@ -2293,7 +2403,12 @@ class _ServiceInfoMixin:
     findings, raw = [], {"cluster_name": None, "version": None}
     base_url = f"http://{target}" if port == 80 else f"http://{target}:{port}"
 
+    # First check if this is actually Elasticsearch (GET / must return JSON with cluster_name or tagline)
     findings += self._es_check_root(base_url, raw)
+    if not raw["cluster_name"] and not raw.get("tagline"):
+      # Not Elasticsearch — skip further probing to avoid noise on regular HTTP ports
+      return None
+
     findings += self._es_check_indices(base_url, raw)
     findings += self._es_check_nodes(base_url, raw)
 
@@ -2421,10 +2536,11 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      Modbus exposure summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(3)
@@ -2434,15 +2550,22 @@ class _ServiceInfoMixin:
       data = sock.recv(256)
       if data:
         readable = ''.join(chr(b) if 32 <= b < 127 else '.' for b in data)
-        info = (
-          f"VULNERABILITY: Modbus device responded to identification request on {target}:{port}"
-          f" (response: {readable.strip()[:120]})"
-        )
+        raw["banner"] = readable.strip()[:120]
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          title="Modbus device responded to identification request",
+          description=f"Industrial control system on {target}:{port} is accessible without authentication. "
+                      "Modbus has no built-in security — any network access means full device control.",
+          evidence=f"Device ID response: {readable.strip()[:80]}",
+          remediation="Isolate Modbus devices on a dedicated OT network; deploy a Modbus-aware firewall.",
+          owasp_id="A01:2021",
+          cwe_id="CWE-284",
+          confidence="certain",
+        ))
       sock.close()
     except Exception as e:
-      info = f"Modbus probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return probe_error(target, port, "Modbus", e)
+    return probe_result(raw_data=raw, findings=findings)
 
 
   def _service_info_27017(self, target, port):
@@ -2458,10 +2581,11 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      MongoDB exposure summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(3)
@@ -2483,14 +2607,22 @@ class _ServiceInfoMixin:
       sock.sendall(header + message)
       data = sock.recv(256)
       if b'isMaster' in data or b'ismaster' in data:
-        info = (
-          f"VULNERABILITY: MongoDB isMaster responded without auth on {target}:{port}"
-        )
+        raw["banner"] = "MongoDB isMaster response"
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          title="MongoDB unauthenticated access (isMaster responded)",
+          description=f"MongoDB on {target}:{port} accepts commands without authentication, "
+                      "allowing full database read/write access.",
+          evidence="isMaster command succeeded without credentials.",
+          remediation="Enable MongoDB authentication (--auth) and bind to localhost or trusted networks.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-287",
+          confidence="certain",
+        ))
       sock.close()
     except Exception as e:
-      info = f"MongoDB probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return probe_error(target, port, "MongoDB", e)
+    return probe_result(raw_data=raw, findings=findings)
 
 
 
@@ -2507,23 +2639,35 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      Generic banner text or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None}
     try:
-      # Generic service: attempt to connect and read a short banner if any
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(2)
       sock.connect((target, port))
       data = sock.recv(100).decode('utf-8', errors='ignore')
       if data:
-        # Filter non-printable chars for readability
         banner = ''.join(ch if 32 <= ord(ch) < 127 else '.' for ch in data)
-        info = f"Service banner on port {port}: \"{banner.strip()}\""
+        raw["banner"] = banner.strip()
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title=f"Service banner on port {port}",
+          description=f"TCP banner received on {target}:{port}.",
+          evidence=f"Banner: {banner.strip()[:80]}",
+          confidence="certain",
+        ))
       else:
-        info = "No banner received (service may require protocol handshake)."
+        raw["banner"] = "(no banner)"
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title=f"Port {port} open (no banner)",
+          description="Connection succeeded but no banner received; service may require protocol handshake.",
+          confidence="tentative",
+        ))
       sock.close()
     except Exception as e:
-      info = f"Generic banner grab failed on port {port}: {e}"
-    return info
+      return probe_error(target, port, "generic", e)
+    return probe_result(raw_data=raw, findings=findings)

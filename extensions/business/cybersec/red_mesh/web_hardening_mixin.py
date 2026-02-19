@@ -1,6 +1,8 @@
 import requests
 from urllib.parse import quote
 
+from .findings import Finding, Severity, probe_result, probe_error
+
 
 class _WebHardeningMixin:
   """
@@ -21,10 +23,10 @@ class _WebHardeningMixin:
 
     Returns
     -------
-    str
-      Joined findings on cookie flags and directory listing.
+    dict
+      Structured findings on cookie flags and directory listing.
     """
-    findings = []
+    findings_list = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -36,30 +38,64 @@ class _WebHardeningMixin:
       cookies_hdr = resp_main.headers.get("Set-Cookie", "")
       if cookies_hdr:
         for cookie in cookies_hdr.split(","):
+          cookie_name = cookie.strip().split("=")[0] if "=" in cookie else cookie.strip()[:30]
           if "Secure" not in cookie:
-            finding = f"VULNERABILITY: Cookie missing Secure flag: {cookie.strip()} on {base_url}."
-            findings.append(finding)
-            self.P(finding)
+            findings_list.append(Finding(
+              severity=Severity.MEDIUM,
+              title=f"Cookie missing Secure flag: {cookie_name}",
+              description=f"Cookie will be sent over unencrypted HTTP connections.",
+              evidence=f"Set-Cookie: {cookie.strip()[:80]} on {base_url}",
+              remediation="Add the Secure attribute to this cookie.",
+              owasp_id="A05:2021",
+              cwe_id="CWE-614",
+              confidence="certain",
+            ))
           if "HttpOnly" not in cookie:
-            finding = f"VULNERABILITY: Cookie missing HttpOnly flag: {cookie.strip()} on {base_url}."
-            findings.append(finding)
-            self.P(finding)
+            findings_list.append(Finding(
+              severity=Severity.MEDIUM,
+              title=f"Cookie missing HttpOnly flag: {cookie_name}",
+              description=f"Cookie is accessible to JavaScript, enabling theft via XSS.",
+              evidence=f"Set-Cookie: {cookie.strip()[:80]} on {base_url}",
+              remediation="Add the HttpOnly attribute to this cookie.",
+              owasp_id="A05:2021",
+              cwe_id="CWE-1004",
+              confidence="certain",
+            ))
           if "SameSite" not in cookie:
-            finding = f"VULNERABILITY: Cookie missing SameSite flag: {cookie.strip()} on {base_url}."
-            findings.append(finding)
-            self.P(finding)
+            findings_list.append(Finding(
+              severity=Severity.MEDIUM,
+              title=f"Cookie missing SameSite flag: {cookie_name}",
+              description=f"Cookie may be sent with cross-site requests, enabling CSRF.",
+              evidence=f"Set-Cookie: {cookie.strip()[:80]} on {base_url}",
+              remediation="Add SameSite=Lax or SameSite=Strict to this cookie.",
+              owasp_id="A01:2021",
+              cwe_id="CWE-1275",
+              confidence="certain",
+            ))
       # Detect directory listing
       if "Index of /" in resp_main.text:
-        finding = f"VULNERABILITY: Directory listing exposed at {base_url}."
-        findings.append(finding)
-        self.P(finding)
+        findings_list.append(Finding(
+          severity=Severity.MEDIUM,
+          title="Directory listing exposed",
+          description=f"Directory listing is enabled at {base_url}, revealing file structure.",
+          evidence=f"'Index of /' found in response body.",
+          remediation="Disable directory listing in the web server configuration.",
+          owasp_id="A01:2021",
+          cwe_id="CWE-548",
+          confidence="certain",
+        ))
     except Exception as e:
-      message = f"ERROR: Cookie/flags probe failed on {base_url}: {e}"
-      self.P(message, color='y')
-      findings.append(message)
-    if not findings:
-      findings.append(f"OK: Cookie flags and directory listing checks passed for {base_url}.")
-    return "\n".join(findings)
+      self.P(f"Cookie/flags probe failed on {base_url}: {e}", color='y')
+      return probe_error(target, port, "flags", e)
+
+    if not findings_list:
+      findings_list.append(Finding(
+        severity=Severity.INFO,
+        title="Cookie flags and directory listing checks passed",
+        description=f"No cookie flag or directory listing issues detected on {base_url}.",
+        confidence="firm",
+      ))
+    return probe_result(findings=findings_list)
 
 
   def _web_test_security_headers(self, target, port):
@@ -75,38 +111,54 @@ class _WebHardeningMixin:
 
     Returns
     -------
-    str
-      Joined findings about security headers presence.
+    dict
+      Structured findings about security headers presence.
     """
-    findings = []
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}"
+    if port not in (80, 443):
+      base_url = f"{scheme}://{target}:{port}"
+
+    _HEADER_META = {
+      "Content-Security-Policy": (Severity.MEDIUM, "CWE-693", "A05:2021",
+        "Prevents XSS and data injection by controlling resource loading."),
+      "X-Frame-Options": (Severity.MEDIUM, "CWE-1021", "A05:2021",
+        "Prevents clickjacking by controlling iframe embedding."),
+      "X-Content-Type-Options": (Severity.LOW, "CWE-693", "A05:2021",
+        "Prevents MIME-type sniffing attacks."),
+      "Strict-Transport-Security": (Severity.MEDIUM, "CWE-319", "A02:2021",
+        "Enforces HTTPS and prevents protocol downgrade attacks."),
+      "Referrer-Policy": (Severity.LOW, "CWE-200", "A05:2021",
+        "Controls how much referrer information is included with requests."),
+    }
+
     try:
-      scheme = "https" if port in (443, 8443) else "http"
-      base_url = f"{scheme}://{target}"
-      if port not in (80, 443):
-        base_url = f"{scheme}://{target}:{port}"
       resp_main = requests.get(base_url, timeout=3, verify=False)
-      # Check for missing security headers
-      security_headers = [
-        "Content-Security-Policy",
-        "X-Frame-Options",
-        "X-Content-Type-Options",
-        "Strict-Transport-Security",
-        "Referrer-Policy",
-      ]
-      for header in security_headers:
+      for header, (severity, cwe, owasp, desc) in _HEADER_META.items():
         if header not in resp_main.headers:
-          finding = f"VULNERABILITY: Missing security header {header} on {base_url}."
-          self.P(finding)
-          findings.append(finding)
-        else:
-          findings.append(f"OK: Security header {header} present on {base_url}.")
+          findings_list.append(Finding(
+            severity=severity,
+            title=f"Missing security header: {header}",
+            description=desc,
+            evidence=f"Header {header} absent from {base_url} response.",
+            remediation=f"Add the {header} header to server responses.",
+            owasp_id=owasp,
+            cwe_id=cwe,
+            confidence="certain",
+          ))
     except Exception as e:
-      message = f"ERROR: Security header probe failed on {base_url}: {e}"
-      self.P(message, color='y')
-      findings.append(message)
-    if not findings:
-      findings.append(f"OK: Security header check found no issues on {base_url}.")
-    return "\n".join(findings)
+      self.P(f"Security header probe failed on {base_url}: {e}", color='y')
+      return probe_error(target, port, "security_headers", e)
+
+    if not findings_list:
+      findings_list.append(Finding(
+        severity=Severity.INFO,
+        title="All security headers present",
+        description=f"All checked security headers are present on {base_url}.",
+        confidence="firm",
+      ))
+    return probe_result(findings=findings_list)
 
 
   def _web_test_cors_misconfiguration(self, target, port):
@@ -122,10 +174,10 @@ class _WebHardeningMixin:
 
     Returns
     -------
-    str
-      Joined findings related to CORS policy.
+    dict
+      Structured findings related to CORS policy.
     """
-    findings = []
+    findings_list = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -140,27 +192,40 @@ class _WebHardeningMixin:
       )
       acao = resp.headers.get("Access-Control-Allow-Origin", "")
       acac = resp.headers.get("Access-Control-Allow-Credentials", "")
-      if acao in ("*", malicious_origin):
-        finding = f"VULNERABILITY: CORS misconfiguration: {acao} allowed on {base_url}."
-        self.P(finding)
-        findings.append(finding)
-        if acao == "*" and acac.lower() == "true":
-          finding = f"VULNERABILITY: CORS allows credentials for wildcard origin on {base_url}."
-          self.P(finding, color='r')
-          findings.append(finding)
-      elif acao:
-        info = f"OK: CORS allow origin {acao} on {base_url}."
-        self.P(info)
-        findings.append(info)
-      else:
-        findings.append(f"OK: No permissive CORS headers detected on {base_url}.")
+      if acao == "*" and acac.lower() == "true":
+        findings_list.append(Finding(
+          severity=Severity.CRITICAL,
+          title="CORS allows credentials with wildcard origin",
+          description="Any origin can make credentialed cross-site requests, enabling full account takeover.",
+          evidence=f"Access-Control-Allow-Origin: *, Allow-Credentials: true on {base_url}",
+          remediation="Never combine Access-Control-Allow-Origin: * with Allow-Credentials: true.",
+          owasp_id="A05:2021",
+          cwe_id="CWE-942",
+          confidence="certain",
+        ))
+      elif acao in ("*", malicious_origin):
+        findings_list.append(Finding(
+          severity=Severity.HIGH,
+          title=f"CORS misconfiguration: {acao} allowed",
+          description=f"CORS policy reflects attacker-controlled origins, enabling cross-site data theft.",
+          evidence=f"Access-Control-Allow-Origin: {acao} on {base_url}",
+          remediation="Restrict Access-Control-Allow-Origin to trusted domains only.",
+          owasp_id="A05:2021",
+          cwe_id="CWE-942",
+          confidence="certain",
+        ))
     except Exception as e:
-      message = f"ERROR: CORS probe failed on {base_url}: {e}"
-      self.P(message, color='y')
-      findings.append(message)
-    if not findings:
-      findings.append(f"OK: CORS probe did not detect misconfiguration on {base_url}.")
-    return "\n".join(findings)
+      self.P(f"CORS probe failed on {base_url}: {e}", color='y')
+      return probe_error(target, port, "cors", e)
+
+    if not findings_list:
+      findings_list.append(Finding(
+        severity=Severity.INFO,
+        title="No permissive CORS headers detected",
+        description=f"CORS policy on {base_url} does not reflect arbitrary origins.",
+        confidence="firm",
+      ))
+    return probe_result(findings=findings_list)
 
 
   def _web_test_open_redirect(self, target, port):
@@ -176,10 +241,10 @@ class _WebHardeningMixin:
 
     Returns
     -------
-    str
-      Joined findings about open redirects.
+    dict
+      Structured findings about open redirects.
     """
-    findings = []
+    findings_list = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -196,20 +261,28 @@ class _WebHardeningMixin:
       if 300 <= resp.status_code < 400:
         location = resp.headers.get("Location", "")
         if payload in location:
-          finding = f"VULNERABILITY: Open redirect via next parameter at {redirect_url}."
-          self.P(finding)
-          findings.append(finding)
-      else:
-        findings.append(
-          f"OK: Redirect endpoint at {redirect_url} did not expose open redirect behavior."
-        )
+          findings_list.append(Finding(
+            severity=Severity.MEDIUM,
+            title="Open redirect via next parameter",
+            description="The login endpoint redirects to attacker-controlled URLs via the next parameter.",
+            evidence=f"Location: {location} at {redirect_url}",
+            remediation="Validate redirect targets against an allowlist of trusted domains.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-601",
+            confidence="certain",
+          ))
     except Exception as e:
-      message = f"ERROR: Open redirect probe failed on {base_url}: {e}"
-      self.P(message, color='y')
-      findings.append(message)
-    if not findings:
-      findings.append(f"OK: Open redirect not detected at {base_url}.")
-    return "\n".join(findings)
+      self.P(f"Open redirect probe failed on {base_url}: {e}", color='y')
+      return probe_error(target, port, "open_redirect", e)
+
+    if not findings_list:
+      findings_list.append(Finding(
+        severity=Severity.INFO,
+        title="No open redirect detected",
+        description=f"Redirect endpoint at {base_url}/login did not expose open redirect behavior.",
+        confidence="firm",
+      ))
+    return probe_result(findings=findings_list)
 
 
   def _web_test_http_methods(self, target, port):
@@ -225,10 +298,10 @@ class _WebHardeningMixin:
 
     Returns
     -------
-    str
-      Joined findings related to allowed HTTP methods.
+    dict
+      Structured findings related to allowed HTTP methods.
     """
-    findings = []
+    findings_list = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
@@ -239,17 +312,26 @@ class _WebHardeningMixin:
       if allow:
         risky = [method for method in ("PUT", "DELETE", "TRACE", "CONNECT") if method in allow.upper()]
         if risky:
-          finding = f"VULNERABILITY: Risky HTTP methods {', '.join(risky)} enabled on {base_url}."
-          self.P(finding)
-          findings.append(finding)
-        else:
-          findings.append(f"OK: Only safe HTTP methods exposed on {base_url} ({allow}).")
-      else:
-        findings.append(f"OK: OPTIONS response missing Allow header on {base_url}.")
+          risky_str = ", ".join(risky)
+          findings_list.append(Finding(
+            severity=Severity.MEDIUM,
+            title=f"Risky HTTP methods enabled: {risky_str}",
+            description=f"OPTIONS response lists dangerous methods on {base_url}.",
+            evidence=f"Allow: {allow}",
+            remediation="Disable risky HTTP methods in the web server configuration.",
+            owasp_id="A05:2021",
+            cwe_id="CWE-749",
+            confidence="certain",
+          ))
     except Exception as e:
-      message = f"ERROR: HTTP methods probe failed on {base_url}: {e}"
-      self.P(message, color='y')
-      findings.append(message)
-    if not findings:
-      findings.append(f"OK: HTTP methods probe did not detect risky verbs on {base_url}.")
-    return "\n".join(findings)
+      self.P(f"HTTP methods probe failed on {base_url}: {e}", color='y')
+      return probe_error(target, port, "http_methods", e)
+
+    if not findings_list:
+      findings_list.append(Finding(
+        severity=Severity.INFO,
+        title="No risky HTTP methods detected",
+        description=f"OPTIONS response on {base_url} does not list dangerous methods.",
+        confidence="firm",
+      ))
+    return probe_result(findings=findings_list)
