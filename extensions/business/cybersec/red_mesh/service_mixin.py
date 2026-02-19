@@ -1,4 +1,5 @@
 import random
+import re as _re
 import socket
 import struct
 import ftplib
@@ -7,6 +8,9 @@ import ssl
 from datetime import datetime
 
 import paramiko
+
+from .findings import Finding, Severity, probe_result, probe_error
+from .cve_db import check_cves
 
 # Default credentials commonly found on exposed SSH services.
 # Kept intentionally small — this is a quick check, not a brute-force.
@@ -217,7 +221,10 @@ class _ServiceInfoMixin:
 
   def _service_info_tls(self, target, port):
     """
-    Inspect TLS handshake details and certificate lifetime.
+    Inspect TLS handshake, certificate chain, and cipher strength.
+
+    Uses a two-pass approach: unverified connect (always gets protocol/cipher),
+    then verified connect (detects self-signed / chain issues).
 
     Parameters
     ----------
@@ -228,35 +235,185 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      TLS version/cipher summary or error message.
+    dict
+      Structured findings with protocol, cipher, cert details.
     """
-    info = None
+    findings = []
+    raw = {"protocol": None, "cipher": None, "cert_subject": None, "cert_issuer": None}
+
+    # Pass 1: Unverified — always get protocol/cipher
+    proto, cipher, cert_der = self._tls_unverified_connect(target, port)
+    if proto is None:
+      return probe_error(target, port, "TLS", Exception("unverified connect failed"))
+
+    raw["protocol"], raw["cipher"] = proto, cipher
+    findings += self._tls_check_protocol(proto, cipher)
+
+    # Pass 2: Verified — detect self-signed / chain issues
+    findings += self._tls_check_certificate(target, port, raw)
+
+    # Pass 3: Cert content checks (expiry, default CN)
+    findings += self._tls_check_expiry(raw)
+    findings += self._tls_check_default_cn(raw)
+
+    if not findings:
+      findings.append(Finding(Severity.INFO, f"TLS {proto} {cipher}", "TLS configuration adequate."))
+
+    return probe_result(raw_data=raw, findings=findings)
+
+  def _tls_unverified_connect(self, target, port):
+    """Unverified TLS connect to get protocol, cipher, and DER cert."""
     try:
-      context = ssl.create_default_context()
+      ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+      ctx.check_hostname = False
+      ctx.verify_mode = ssl.CERT_NONE
       with socket.create_connection((target, port), timeout=3) as sock:
-        with context.wrap_socket(sock, server_hostname=target) as ssock:
-          cert = ssock.getpeercert()
+        with ctx.wrap_socket(sock, server_hostname=target) as ssock:
           proto = ssock.version()
-          cipher = ssock.cipher()
-          expires = cert.get("notAfter")
-          info = f"TLS {proto} {cipher[0]}"
-          if proto and proto.upper() in ("SSLV3", "SSLV2", "TLSV1", "TLSV1.1"):
-            info = f"VULNERABILITY: Obsolete TLS protocol negotiated ({proto}) using {cipher[0]}"
-          if expires:
-            try:
-              exp = datetime.strptime(expires, "%b %d %H:%M:%S %Y %Z")
-              days = (exp - datetime.utcnow()).days
-              if days <= 30:
-                info = f"VULNERABILITY: TLS {proto} {cipher[0]}; certificate expires in {days} days"
-              else:
-                info = f"TLS {proto} {cipher[0]}; cert exp in {days} days"
-            except Exception:
-              info = f"TLS {proto} {cipher[0]}; cert expires {expires}"
+          cipher_info = ssock.cipher()
+          cipher_name = cipher_info[0] if cipher_info else "unknown"
+          cert_der = ssock.getpeercert(binary_form=True)
+          return proto, cipher_name, cert_der
     except Exception as e:
-      info = f"TLS probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      self.P(f"TLS unverified connect failed on {target}:{port}: {e}", color='y')
+      return None, None, None
+
+  def _tls_check_protocol(self, proto, cipher):
+    """Flag obsolete TLS/SSL protocols and weak ciphers."""
+    findings = []
+    if proto and proto.upper() in ("SSLV2", "SSLV3", "TLSV1", "TLSV1.1"):
+      findings.append(Finding(
+        severity=Severity.HIGH,
+        title=f"Obsolete TLS protocol: {proto}",
+        description=f"Server negotiated {proto} with cipher {cipher}. "
+                    f"SSLv2/v3 and TLS 1.0/1.1 are deprecated and vulnerable.",
+        evidence=f"protocol={proto}, cipher={cipher}",
+        remediation="Disable SSLv2/v3/TLS 1.0/1.1 and require TLS 1.2+.",
+        owasp_id="A02:2021",
+        cwe_id="CWE-326",
+        confidence="certain",
+      ))
+    if cipher and any(w in cipher.lower() for w in ("rc4", "des", "null", "export")):
+      findings.append(Finding(
+        severity=Severity.HIGH,
+        title=f"Weak TLS cipher: {cipher}",
+        description=f"Cipher {cipher} is considered cryptographically weak.",
+        evidence=f"cipher={cipher}",
+        remediation="Disable weak ciphers (RC4, DES, NULL, EXPORT).",
+        owasp_id="A02:2021",
+        cwe_id="CWE-327",
+        confidence="certain",
+      ))
+    return findings
+
+  def _tls_check_certificate(self, target, port, raw):
+    """Verified TLS pass — detect self-signed, untrusted issuer, hostname mismatch."""
+    findings = []
+    try:
+      ctx = ssl.create_default_context()
+      with socket.create_connection((target, port), timeout=3) as sock:
+        with ctx.wrap_socket(sock, server_hostname=target) as ssock:
+          cert = ssock.getpeercert()
+          subj = dict(x[0] for x in cert.get("subject", ()))
+          issuer = dict(x[0] for x in cert.get("issuer", ()))
+          raw["cert_subject"] = subj.get("commonName")
+          raw["cert_issuer"] = issuer.get("organizationName") or issuer.get("commonName")
+          raw["cert_not_after"] = cert.get("notAfter")
+    except ssl.SSLCertVerificationError as e:
+      err_msg = str(e).lower()
+      if "self-signed" in err_msg or "self signed" in err_msg:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="Self-signed TLS certificate",
+          description="The server presents a self-signed certificate that browsers will reject.",
+          evidence=str(e),
+          remediation="Replace with a certificate from a trusted CA.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-295",
+          confidence="certain",
+        ))
+      elif "hostname mismatch" in err_msg:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="TLS certificate hostname mismatch",
+          description=f"Certificate CN/SAN does not match {target}.",
+          evidence=str(e),
+          remediation="Ensure the certificate covers the served hostname.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-295",
+          confidence="certain",
+        ))
+      else:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="TLS certificate validation failed",
+          description="Certificate chain could not be verified.",
+          evidence=str(e),
+          remediation="Use a certificate from a trusted CA with a valid chain.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-295",
+          confidence="firm",
+        ))
+    except Exception:
+      pass  # Non-cert errors (connection reset, etc.) — skip
+    return findings
+
+  def _tls_check_expiry(self, raw):
+    """Check certificate expiry from raw dict."""
+    findings = []
+    expires = raw.get("cert_not_after")
+    if not expires:
+      return findings
+    try:
+      exp = datetime.strptime(expires, "%b %d %H:%M:%S %Y %Z")
+      days = (exp - datetime.utcnow()).days
+      raw["cert_days_remaining"] = days
+      if days < 0:
+        findings.append(Finding(
+          severity=Severity.HIGH,
+          title=f"TLS certificate expired ({-days} days ago)",
+          description="The certificate has already expired.",
+          evidence=f"notAfter={expires}",
+          remediation="Renew the certificate immediately.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-298",
+          confidence="certain",
+        ))
+      elif days <= 30:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title=f"TLS certificate expiring soon ({days} days)",
+          description=f"Certificate expires in {days} days.",
+          evidence=f"notAfter={expires}",
+          remediation="Renew the certificate before expiry.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-298",
+          confidence="certain",
+        ))
+    except Exception:
+      pass
+    return findings
+
+  def _tls_check_default_cn(self, raw):
+    """Flag placeholder common names."""
+    findings = []
+    cn = raw.get("cert_subject")
+    if not cn:
+      return findings
+    cn_lower = cn.lower()
+    placeholders = ("example.com", "localhost", "internet widgits", "test", "changeme")
+    if any(p in cn_lower for p in placeholders):
+      findings.append(Finding(
+        severity=Severity.LOW,
+        title=f"TLS certificate placeholder CN: {cn}",
+        description="Certificate uses a default/placeholder common name.",
+        evidence=f"CN={cn}",
+        remediation="Replace with a certificate bearing the correct hostname.",
+        owasp_id="A02:2021",
+        cwe_id="CWE-295",
+        confidence="firm",
+      ))
+    return findings
 
 
   def _service_info_21(self, target, port):
@@ -564,7 +721,65 @@ class _ServiceInfoMixin:
           f"SSH default credential accepted: {cred}"
         )
 
+    # --- 5. Cipher/KEX audit ---
+    result["weak_algorithms"] = self._ssh_check_ciphers(target, port, result)
+
+    # --- 6. CVE check on banner version ---
+    if result["banner"]:
+      ssh_version = self._ssh_extract_version(result["banner"])
+      if ssh_version:
+        result["ssh_version"] = ssh_version
+        cve_findings = check_cves("openssh", ssh_version)
+        for f in cve_findings:
+          result["vulnerabilities"].append(f.title)
+
     return result
+
+  def _ssh_extract_version(self, banner):
+    """Extract OpenSSH version from banner like 'SSH-2.0-OpenSSH_8.9p1'."""
+    m = _re.search(r'OpenSSH[_\s](\d+\.\d+(?:\.\d+)?)', banner, _re.IGNORECASE)
+    return m.group(1) if m else None
+
+  def _ssh_check_ciphers(self, target, port, result):
+    """Audit SSH ciphers, KEX, and MACs via paramiko Transport."""
+    weak_findings = []
+    _WEAK_CIPHERS = {"3des-cbc", "blowfish-cbc", "arcfour", "arcfour128", "arcfour256",
+                     "aes128-cbc", "aes192-cbc", "aes256-cbc", "cast128-cbc"}
+    _WEAK_KEX = {"diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1",
+                 "diffie-hellman-group-exchange-sha1"}
+    _WEAK_MACS = {"hmac-md5", "hmac-md5-96", "hmac-sha1", "hmac-sha1-96"}
+
+    try:
+      transport = paramiko.Transport((target, port))
+      transport.connect()
+      # Get negotiated algorithms from transport security options
+      sec_opts = transport.get_security_options()
+
+      ciphers = set(sec_opts.ciphers) if sec_opts.ciphers else set()
+      kex = set(sec_opts.kex) if sec_opts.kex else set()
+      # key_types = set(sec_opts.keys) if sec_opts.keys else set()
+
+      transport.close()
+
+      weak_ciphers = ciphers & _WEAK_CIPHERS
+      weak_kex = kex & _WEAK_KEX
+      # Note: paramiko may not expose server-offered MACs directly,
+      # so we check against what the transport offers
+
+      if weak_ciphers:
+        msg = f"SSH weak ciphers: {', '.join(sorted(weak_ciphers))}"
+        result["vulnerabilities"].append(msg)
+        weak_findings.append(msg)
+
+      if weak_kex:
+        msg = f"SSH weak key exchange: {', '.join(sorted(weak_kex))}"
+        result["vulnerabilities"].append(msg)
+        weak_findings.append(msg)
+
+    except Exception as e:
+      self.P(f"SSH cipher audit failed on {target}:{port}: {e}", color='y')
+
+    return weak_findings
 
   def _service_info_25(self, target, port):
     """
@@ -739,7 +954,7 @@ class _ServiceInfoMixin:
 
   def _service_info_3306(self, target, port):
     """
-    Perform a lightweight MySQL handshake to expose server version.
+    MySQL handshake probe: extract version, auth plugin, and check CVEs.
 
     Parameters
     ----------
@@ -750,25 +965,175 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      MySQL version info or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"version": None, "auth_plugin": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(3)
       sock.connect((target, port))
-      data = sock.recv(128)
-      if data and data[0] == 0x0a:
-        version = data[1:].split(b'\x00')[0].decode('utf-8', errors='ignore')
-        info = f"MySQL handshake version: {version}"
-      else:
-        info = "MySQL port open (no banner)"
+      data = sock.recv(256)
       sock.close()
+
+      if data and len(data) > 4:
+        # MySQL protocol: first byte of payload is protocol version (0x0a = v10)
+        pkt_payload = data[4:]  # skip 3-byte length + 1-byte seq
+        if pkt_payload and pkt_payload[0] == 0x0a:
+          version = pkt_payload[1:].split(b'\x00')[0].decode('utf-8', errors='ignore')
+          raw["version"] = version
+
+          # Extract auth plugin name (at end of handshake after capabilities/salt)
+          try:
+            parts = pkt_payload.split(b'\x00')
+            if len(parts) >= 2:
+              last = parts[-2].decode('utf-8', errors='ignore') if parts[-1] == b'' else parts[-1].decode('utf-8', errors='ignore')
+              if 'mysql_native' in last or 'caching_sha2' in last or 'sha256' in last:
+                raw["auth_plugin"] = last
+          except Exception:
+            pass
+
+          findings.append(Finding(
+            severity=Severity.LOW,
+            title=f"MySQL version disclosed: {version}",
+            description=f"MySQL {version} handshake received on {target}:{port}.",
+            evidence=f"version={version}, auth_plugin={raw['auth_plugin']}",
+            remediation="Restrict MySQL to trusted networks; consider disabling version disclosure.",
+            confidence="certain",
+          ))
+
+          # CVE check
+          findings += check_cves("mysql", version)
+        else:
+          raw["protocol_byte"] = pkt_payload[0] if pkt_payload else None
+          findings.append(Finding(
+            severity=Severity.INFO,
+            title="MySQL port open (non-standard handshake)",
+            description=f"Port {port} responded but protocol byte is not 0x0a.",
+            confidence="tentative",
+          ))
+      else:
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title="MySQL port open (no banner)",
+          description=f"No handshake data received on {target}:{port}.",
+          confidence="tentative",
+        ))
     except Exception as e:
-      info = f"MySQL probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return probe_error(target, port, "MySQL", e)
+
+    return probe_result(raw_data=raw, findings=findings)
+
+  def _service_info_3306_creds(self, target, port):
+    """
+    MySQL default credential testing (opt-in via active_auth feature group).
+
+    Attempts mysql_native_password auth with a small list of default credentials.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    dict
+      Structured findings.
+    """
+    import hashlib
+
+    findings = []
+    raw = {"tested_credentials": 0, "accepted_credentials": []}
+    creds = [("root", ""), ("root", "root"), ("root", "password")]
+
+    for username, password in creds:
+      try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((target, port))
+        data = sock.recv(256)
+
+        if not data or len(data) < 4:
+          sock.close()
+          continue
+
+        pkt_payload = data[4:]
+        if not pkt_payload or pkt_payload[0] != 0x0a:
+          sock.close()
+          continue
+
+        # Extract salt (scramble) from handshake
+        parts = pkt_payload[1:].split(b'\x00', 1)
+        rest = parts[1] if len(parts) > 1 else b''
+        # Salt part 1: bytes 4..11 after capabilities (skip 4 bytes capabilities + 1 byte filler)
+        if len(rest) >= 13:
+          salt1 = rest[5:13]
+        else:
+          sock.close()
+          continue
+        # Salt part 2: after reserved bytes (skip 2+2+1+10 reserved = 15)
+        salt2 = b''
+        if len(rest) >= 28:
+          salt2 = rest[28:40].rstrip(b'\x00')
+        salt = salt1 + salt2
+
+        # mysql_native_password auth response
+        if password:
+          sha1_pass = hashlib.sha1(password.encode()).digest()
+          sha1_sha1 = hashlib.sha1(sha1_pass).digest()
+          sha1_salt_sha1sha1 = hashlib.sha1(salt + sha1_sha1).digest()
+          auth_data = bytes(a ^ b for a, b in zip(sha1_pass, sha1_salt_sha1sha1))
+        else:
+          auth_data = b''
+
+        # Build auth response packet
+        client_flags = struct.pack('<I', 0x0003a685)  # basic capabilities
+        max_pkt = struct.pack('<I', 16777216)
+        charset = b'\x21'  # utf8
+        reserved = b'\x00' * 23
+        user_bytes = username.encode() + b'\x00'
+        auth_len = bytes([len(auth_data)])
+        auth_plugin = b'mysql_native_password\x00'
+
+        payload = client_flags + max_pkt + charset + reserved + user_bytes + auth_len + auth_data + auth_plugin
+        pkt_len = struct.pack('<I', len(payload))[:3]
+        seq = b'\x01'
+        sock.sendall(pkt_len + seq + payload)
+
+        resp = sock.recv(256)
+        sock.close()
+        raw["tested_credentials"] += 1
+
+        if resp and len(resp) >= 5:
+          resp_type = resp[4]
+          if resp_type == 0x00:  # OK packet
+            cred_str = f"{username}:{password}" if password else f"{username}:(empty)"
+            raw["accepted_credentials"].append(cred_str)
+            findings.append(Finding(
+              severity=Severity.CRITICAL,
+              title=f"MySQL default credential accepted: {cred_str}",
+              description=f"MySQL on {target}:{port} accepts {cred_str}.",
+              evidence=f"Auth response OK for {cred_str}",
+              remediation="Change default passwords and restrict access.",
+              owasp_id="A07:2021",
+              cwe_id="CWE-798",
+              confidence="certain",
+            ))
+      except Exception:
+        continue
+
+    if not findings:
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title="MySQL default credentials rejected",
+        description=f"Tested {raw['tested_credentials']} credential pairs, all rejected.",
+        confidence="certain",
+      ))
+
+    return probe_result(raw_data=raw, findings=findings)
 
   def _service_info_3389(self, target, port):
     """
@@ -798,9 +1163,10 @@ class _ServiceInfoMixin:
       self.P(info, color='y')
     return info
 
+  # SAFETY: Read-only commands only. NEVER add CONFIG SET, SLAVEOF, MODULE LOAD, EVAL, DEBUG.
   def _service_info_6379(self, target, port):
     """
-    Test Redis exposure by issuing a PING command.
+    Deep Redis probe: auth check, version, config readability, data size, client list.
 
     Parameters
     ----------
@@ -811,27 +1177,168 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      Redis response summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings, raw = [], {"version": None, "os": None, "config_writable": False}
+    sock = self._redis_connect(target, port)
+    if not sock:
+      return probe_error(target, port, "Redis", Exception("connection failed"))
+
+    auth_findings = self._redis_check_auth(sock, raw)
+    if not auth_findings:
+      # NOAUTH response — requires auth, stop here
+      sock.close()
+      return probe_result(
+        raw_data=raw,
+        findings=[Finding(Severity.INFO, "Redis requires authentication", "PING returned NOAUTH.")],
+      )
+
+    findings += auth_findings
+    findings += self._redis_check_info(sock, raw)
+    findings += self._redis_check_config(sock, raw)
+    findings += self._redis_check_data(sock, raw)
+    findings += self._redis_check_clients(sock, raw)
+
+    # CVE check
+    if raw["version"]:
+      findings += check_cves("redis", raw["version"])
+
+    sock.close()
+    return probe_result(raw_data=raw, findings=findings)
+
+  def _redis_connect(self, target, port):
+    """Open a TCP socket to Redis."""
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(2)
+      sock.settimeout(3)
       sock.connect((target, port))
-      sock.send(b"PING\r\n")
-      data = sock.recv(64).decode('utf-8', errors='ignore')
-      if data.startswith("+PONG"):
-        info = "VULNERABILITY: Redis responded to PING (no authentication)."
-      elif data.upper().startswith("-NOAUTH"):
-        info = "Redis requires authentication (NOAUTH)."
-      else:
-        info = f"Redis response: {data.strip()}"
-      sock.close()
+      return sock
     except Exception as e:
-      info = f"Redis probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      self.P(f"Redis connect failed on {target}:{port}: {e}", color='y')
+      return None
+
+  def _redis_cmd(self, sock, cmd):
+    """Send an inline Redis command and return the response string."""
+    try:
+      sock.sendall(f"{cmd}\r\n".encode())
+      data = sock.recv(4096).decode('utf-8', errors='ignore')
+      return data
+    except Exception:
+      return ""
+
+  def _redis_check_auth(self, sock, raw):
+    """PING to check if auth is required. Returns findings if no auth, empty list if NOAUTH."""
+    resp = self._redis_cmd(sock, "PING")
+    if resp.startswith("+PONG"):
+      return [Finding(
+        severity=Severity.CRITICAL,
+        title="Redis unauthenticated access",
+        description="Redis responded to PING without authentication.",
+        evidence=f"Response: {resp.strip()[:80]}",
+        remediation="Set a strong password via requirepass in redis.conf.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-287",
+        confidence="certain",
+      )]
+    if "-NOAUTH" in resp.upper():
+      return []  # signal: auth required
+    return [Finding(
+      severity=Severity.LOW,
+      title="Redis unusual PING response",
+      description=f"Unexpected response: {resp.strip()[:80]}",
+      confidence="tentative",
+    )]
+
+  def _redis_check_info(self, sock, raw):
+    """Extract version and OS from INFO server."""
+    findings = []
+    resp = self._redis_cmd(sock, "INFO server")
+    if resp.startswith("-"):
+      return findings
+    for line in resp.split("\r\n"):
+      if line.startswith("redis_version:"):
+        raw["version"] = line.split(":", 1)[1].strip()
+      elif line.startswith("os:"):
+        raw["os"] = line.split(":", 1)[1].strip()
+    if raw["version"]:
+      findings.append(Finding(
+        severity=Severity.LOW,
+        title=f"Redis version disclosed: {raw['version']}",
+        description=f"Redis {raw['version']} on {raw['os'] or 'unknown OS'}.",
+        evidence=f"version={raw['version']}, os={raw['os']}",
+        remediation="Restrict INFO command access or rename it.",
+        confidence="certain",
+      ))
+    return findings
+
+  def _redis_check_config(self, sock, raw):
+    """CONFIG GET dir — if accessible, it's an RCE vector."""
+    findings = []
+    resp = self._redis_cmd(sock, "CONFIG GET dir")
+    if resp.startswith("-"):
+      return findings  # blocked, good
+    raw["config_writable"] = True
+    findings.append(Finding(
+      severity=Severity.CRITICAL,
+      title="Redis CONFIG command accessible (RCE vector)",
+      description="CONFIG GET is accessible, allowing attackers to write arbitrary files "
+                  "via CONFIG SET dir / CONFIG SET dbfilename + SAVE.",
+      evidence=f"CONFIG GET dir response: {resp.strip()[:120]}",
+      remediation="Rename or disable CONFIG via rename-command in redis.conf.",
+      owasp_id="A05:2021",
+      cwe_id="CWE-94",
+      confidence="certain",
+    ))
+    return findings
+
+  def _redis_check_data(self, sock, raw):
+    """DBSIZE — report if data is present."""
+    findings = []
+    resp = self._redis_cmd(sock, "DBSIZE")
+    if resp.startswith(":"):
+      try:
+        count = int(resp.strip().lstrip(":"))
+        raw["db_size"] = count
+        if count > 0:
+          findings.append(Finding(
+            severity=Severity.MEDIUM,
+            title=f"Redis database contains {count} keys",
+            description="Unauthenticated access to a Redis instance with live data.",
+            evidence=f"DBSIZE={count}",
+            remediation="Enable authentication and restrict network access.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-284",
+            confidence="certain",
+          ))
+      except ValueError:
+        pass
+    return findings
+
+  def _redis_check_clients(self, sock, raw):
+    """CLIENT LIST — extract connected client IPs."""
+    findings = []
+    resp = self._redis_cmd(sock, "CLIENT LIST")
+    if resp.startswith("-"):
+      return findings
+    ips = set()
+    for line in resp.split("\n"):
+      for part in line.split():
+        if part.startswith("addr="):
+          ip_port = part.split("=", 1)[1]
+          ip = ip_port.rsplit(":", 1)[0]
+          ips.add(ip)
+    if ips:
+      raw["connected_clients"] = list(ips)
+      findings.append(Finding(
+        severity=Severity.LOW,
+        title=f"Redis client IPs disclosed ({len(ips)} clients)",
+        description=f"CLIENT LIST reveals connected IPs: {', '.join(sorted(ips)[:5])}",
+        evidence=f"IPs: {', '.join(sorted(ips)[:10])}",
+        remediation="Rename or disable CLIENT command.",
+        confidence="certain",
+      ))
+    return findings
 
 
   def _service_info_23(self, target, port):
@@ -1091,7 +1598,13 @@ class _ServiceInfoMixin:
 
   def _service_info_5900(self, target, port):
     """
-    Read VNC handshake string to assess remote desktop exposure.
+    VNC handshake: read version banner, negotiate security types.
+
+    Security types:
+      1 (None)       → CRITICAL: unauthenticated desktop access
+      2 (VNC Auth)   → MEDIUM: DES-based, max 8-char password
+      19 (VeNCrypt)  → INFO: TLS-secured
+      Other          → LOW: unknown auth type
 
     Parameters
     ----------
@@ -1102,24 +1615,94 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      VNC banner summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None, "security_types": []}
+
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(3)
       sock.connect((target, port))
-      banner = sock.recv(12).decode('ascii', errors='ignore')
-      if banner:
-        info = f"VULNERABILITY: VNC protocol banner: {banner.strip()}"
-      else:
-        info = "VULNERABILITY: VNC open with no banner"
+
+      # Read server banner (e.g. "RFB 003.008\n")
+      banner = sock.recv(12).decode('ascii', errors='ignore').strip()
+      raw["banner"] = banner
+
+      if not banner.startswith("RFB"):
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title=f"VNC service detected (non-standard banner: {banner[:30]})",
+          description="VNC port open but banner is non-standard.",
+          evidence=f"Banner: {banner}",
+          remediation="Restrict VNC access to trusted networks or use SSH tunneling.",
+          confidence="tentative",
+        ))
+        sock.close()
+        return probe_result(raw_data=raw, findings=findings)
+
+      # Echo version back to negotiate
+      sock.sendall(banner.encode('ascii') + b"\n")
+
+      # Read security type list
+      sec_data = sock.recv(64)
+      sec_types = []
+      if len(sec_data) >= 1:
+        num_types = sec_data[0]
+        if num_types > 0 and len(sec_data) >= 1 + num_types:
+          sec_types = list(sec_data[1:1 + num_types])
+      raw["security_types"] = sec_types
       sock.close()
+
+      _VNC_TYPE_NAMES = {1: "None", 2: "VNC Auth", 19: "VeNCrypt", 16: "Tight"}
+      type_labels = [f"{t}({_VNC_TYPE_NAMES.get(t, 'unknown')})" for t in sec_types]
+      raw["security_type_labels"] = type_labels
+
+      if 1 in sec_types:
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          title="VNC unauthenticated access (security type None)",
+          description=f"VNC on {target}:{port} allows connections without authentication.",
+          evidence=f"Banner: {banner}, security types: {type_labels}",
+          remediation="Disable security type None and require VNC Auth or VeNCrypt.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-287",
+          confidence="certain",
+        ))
+      if 2 in sec_types:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="VNC password auth (DES-based, max 8 chars)",
+          description=f"VNC Auth uses DES encryption with a maximum 8-character password.",
+          evidence=f"Banner: {banner}, security types: {type_labels}",
+          remediation="Use VeNCrypt (TLS) or SSH tunneling instead of plain VNC Auth.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-326",
+          confidence="certain",
+        ))
+      if 19 in sec_types:
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title="VNC VeNCrypt (TLS-secured)",
+          description="VeNCrypt provides TLS-secured VNC connections.",
+          evidence=f"Banner: {banner}, security types: {type_labels}",
+          confidence="certain",
+        ))
+      if not sec_types:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title=f"VNC service exposed: {banner}",
+          description="VNC protocol banner detected but security types could not be parsed.",
+          evidence=f"Banner: {banner}",
+          remediation="Restrict VNC access to trusted networks.",
+          confidence="firm",
+        ))
+
     except Exception as e:
-      info = f"VNC probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return probe_error(target, port, "VNC", e)
+
+    return probe_result(raw_data=raw, findings=findings)
 
 
   def _service_info_161(self, target, port):
@@ -1286,7 +1869,13 @@ class _ServiceInfoMixin:
 
   def _service_info_5432(self, target, port):
     """
-    Probe PostgreSQL for weak authentication methods.
+    Probe PostgreSQL authentication method by parsing the auth response byte.
+
+    Auth codes:
+      0  = AuthenticationOk (trust auth) → CRITICAL
+      3  = CleartextPassword             → MEDIUM
+      5  = MD5Password                   → INFO (adequate, prefer SCRAM)
+      10 = SASL (SCRAM-SHA-256)          → INFO (strong)
 
     Parameters
     ----------
@@ -1297,10 +1886,11 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      PostgreSQL response summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"auth_type": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(3)
@@ -1309,18 +1899,166 @@ class _ServiceInfoMixin:
       startup = struct.pack('!I', len(payload) + 8) + struct.pack('!I', 196608) + payload
       sock.sendall(startup)
       data = sock.recv(128)
-      if b'AuthenticationCleartextPassword' in data:
-        info = (
-          f"VULNERABILITY: PostgreSQL requests cleartext passwords on {target}:{port}"
-        )
-      elif b'AuthenticationOk' in data:
-        info = f"PostgreSQL responded with AuthenticationOk on {target}:{port}"
       sock.close()
-    except Exception as e:
-      info = f"PostgreSQL probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
 
+      # Parse auth response: type byte 'R' (0x52), then int32 length, then int32 auth code
+      if len(data) >= 9 and data[0:1] == b'R':
+        auth_code = struct.unpack('!I', data[5:9])[0]
+        raw["auth_type"] = auth_code
+        if auth_code == 0:
+          findings.append(Finding(
+            severity=Severity.CRITICAL,
+            title="PostgreSQL trust authentication (no password)",
+            description=f"PostgreSQL on {target}:{port} accepts connections without any password (auth code 0).",
+            evidence=f"Auth response code: {auth_code}",
+            remediation="Configure pg_hba.conf to require password or SCRAM authentication.",
+            owasp_id="A07:2021",
+            cwe_id="CWE-287",
+            confidence="certain",
+          ))
+        elif auth_code == 3:
+          findings.append(Finding(
+            severity=Severity.MEDIUM,
+            title="PostgreSQL cleartext password authentication",
+            description=f"PostgreSQL on {target}:{port} requests cleartext passwords.",
+            evidence=f"Auth response code: {auth_code}",
+            remediation="Switch to SCRAM-SHA-256 authentication in pg_hba.conf.",
+            owasp_id="A02:2021",
+            cwe_id="CWE-319",
+            confidence="certain",
+          ))
+        elif auth_code == 5:
+          findings.append(Finding(
+            severity=Severity.INFO,
+            title="PostgreSQL MD5 authentication",
+            description="MD5 password auth is adequate but SCRAM-SHA-256 is preferred.",
+            evidence=f"Auth response code: {auth_code}",
+            remediation="Consider upgrading to SCRAM-SHA-256.",
+            confidence="certain",
+          ))
+        elif auth_code == 10:
+          findings.append(Finding(
+            severity=Severity.INFO,
+            title="PostgreSQL SASL/SCRAM authentication",
+            description="Strong authentication (SCRAM-SHA-256) is in use.",
+            evidence=f"Auth response code: {auth_code}",
+            confidence="certain",
+          ))
+      elif b'AuthenticationCleartextPassword' in data:
+        # Fallback: text-based detection for older/non-standard servers
+        raw["auth_type"] = "cleartext_text"
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="PostgreSQL cleartext password authentication",
+          description=f"PostgreSQL on {target}:{port} requests cleartext passwords.",
+          evidence="Text response contained AuthenticationCleartextPassword",
+          remediation="Switch to SCRAM-SHA-256 authentication.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-319",
+          confidence="firm",
+        ))
+      elif b'AuthenticationOk' in data:
+        raw["auth_type"] = "ok_text"
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          title="PostgreSQL trust authentication (no password)",
+          description=f"PostgreSQL on {target}:{port} accepted connection without authentication.",
+          evidence="Text response contained AuthenticationOk",
+          remediation="Configure pg_hba.conf to require password authentication.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-287",
+          confidence="firm",
+        ))
+
+      if not findings:
+        findings.append(Finding(Severity.INFO, "PostgreSQL probe completed", "No auth weakness detected."))
+    except Exception as e:
+      return probe_error(target, port, "PostgreSQL", e)
+
+    return probe_result(raw_data=raw, findings=findings)
+
+  def _service_info_5432_creds(self, target, port):
+    """
+    PostgreSQL default credential testing (opt-in via active_auth feature group).
+
+    Attempts cleartext password auth with common defaults.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    dict
+      Structured findings.
+    """
+    findings = []
+    raw = {"tested_credentials": 0, "accepted_credentials": []}
+    creds = [("postgres", ""), ("postgres", "postgres"), ("postgres", "password")]
+
+    for username, password in creds:
+      try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((target, port))
+        payload = f'user\x00{username}\x00database\x00postgres\x00\x00'.encode()
+        startup = struct.pack('!I', len(payload) + 8) + struct.pack('!I', 196608) + payload
+        sock.sendall(startup)
+        data = sock.recv(128)
+
+        if len(data) >= 9 and data[0:1] == b'R':
+          auth_code = struct.unpack('!I', data[5:9])[0]
+          if auth_code == 0:
+            cred_str = f"{username}:(empty)" if not password else f"{username}:{password}"
+            raw["accepted_credentials"].append(cred_str)
+            findings.append(Finding(
+              severity=Severity.CRITICAL,
+              title=f"PostgreSQL trust auth for {username}",
+              description=f"No password required for user {username}.",
+              evidence=f"Auth code 0 for {cred_str}",
+              remediation="Configure pg_hba.conf to require authentication.",
+              owasp_id="A07:2021",
+              cwe_id="CWE-287",
+              confidence="certain",
+            ))
+          elif auth_code == 3:
+            # Send cleartext password
+            pwd_bytes = password.encode() + b'\x00'
+            pwd_msg = b'p' + struct.pack('!I', len(pwd_bytes) + 4) + pwd_bytes
+            sock.sendall(pwd_msg)
+            resp = sock.recv(128)
+            if resp and resp[0:1] == b'R' and len(resp) >= 9:
+              result_code = struct.unpack('!I', resp[5:9])[0]
+              if result_code == 0:
+                cred_str = f"{username}:{password}" if password else f"{username}:(empty)"
+                raw["accepted_credentials"].append(cred_str)
+                findings.append(Finding(
+                  severity=Severity.CRITICAL,
+                  title=f"PostgreSQL default credential accepted: {cred_str}",
+                  description=f"Cleartext password auth accepted for {cred_str}.",
+                  evidence=f"Auth OK for {cred_str}",
+                  remediation="Change default passwords.",
+                  owasp_id="A07:2021",
+                  cwe_id="CWE-798",
+                  confidence="certain",
+                ))
+        raw["tested_credentials"] += 1
+        sock.close()
+      except Exception:
+        continue
+
+    if not findings:
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title="PostgreSQL default credentials rejected",
+        description=f"Tested {raw['tested_credentials']} credential pairs.",
+        confidence="certain",
+      ))
+
+    return probe_result(raw_data=raw, findings=findings)
 
   def _service_info_11211(self, target, port):
     """
@@ -1358,7 +2096,7 @@ class _ServiceInfoMixin:
 
   def _service_info_9200(self, target, port):
     """
-    Detect Elasticsearch/OpenSearch nodes leaking cluster metadata.
+    Deep Elasticsearch probe: cluster info, index listing, node IPs, CVE matching.
 
     Parameters
     ----------
@@ -1369,24 +2107,125 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      Elasticsearch exposure summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings, raw = [], {"cluster_name": None, "version": None}
+    base_url = f"http://{target}" if port == 80 else f"http://{target}:{port}"
+
+    findings += self._es_check_root(base_url, raw)
+    findings += self._es_check_indices(base_url, raw)
+    findings += self._es_check_nodes(base_url, raw)
+
+    if raw["version"]:
+      findings += check_cves("elasticsearch", raw["version"])
+
+    if not findings:
+      findings.append(Finding(Severity.INFO, "Elasticsearch probe clean", "No issues detected."))
+
+    return probe_result(raw_data=raw, findings=findings)
+
+  def _es_check_root(self, base_url, raw):
+    """GET / — extract version, cluster name."""
+    findings = []
     try:
-      scheme = "http"
-      base_url = f"{scheme}://{target}"
-      if port != 80:
-        base_url = f"{scheme}://{target}:{port}"
       resp = requests.get(base_url, timeout=3)
-      if resp.ok and 'cluster_name' in resp.text:
-        info = (
-          f"VULNERABILITY: Elasticsearch cluster metadata exposed at {base_url}"
-        )
-    except Exception as e:
-      info = f"Elasticsearch probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      if resp.ok:
+        try:
+          data = resp.json()
+          raw["cluster_name"] = data.get("cluster_name")
+          ver_info = data.get("version", {})
+          raw["version"] = ver_info.get("number") if isinstance(ver_info, dict) else None
+          raw["tagline"] = data.get("tagline")
+          findings.append(Finding(
+            severity=Severity.HIGH,
+            title=f"Elasticsearch cluster metadata exposed",
+            description=f"Cluster '{raw['cluster_name']}' version {raw['version']} accessible without auth.",
+            evidence=f"cluster={raw['cluster_name']}, version={raw['version']}",
+            remediation="Enable X-Pack security or restrict network access.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-284",
+            confidence="certain",
+          ))
+        except Exception:
+          if 'cluster_name' in resp.text:
+            findings.append(Finding(
+              severity=Severity.HIGH,
+              title="Elasticsearch cluster metadata exposed",
+              description=f"Cluster metadata accessible at {base_url}.",
+              evidence=resp.text[:200],
+              remediation="Enable authentication.",
+              owasp_id="A01:2021",
+              cwe_id="CWE-284",
+              confidence="firm",
+            ))
+    except Exception:
+      pass
+    return findings
+
+  def _es_check_indices(self, base_url, raw):
+    """GET /_cat/indices — list accessible indices."""
+    findings = []
+    try:
+      resp = requests.get(f"{base_url}/_cat/indices?v", timeout=3)
+      if resp.ok and resp.text.strip():
+        lines = resp.text.strip().split("\n")
+        index_count = max(0, len(lines) - 1)  # subtract header
+        raw["index_count"] = index_count
+        if index_count > 0:
+          findings.append(Finding(
+            severity=Severity.HIGH,
+            title=f"Elasticsearch {index_count} indices accessible",
+            description=f"{index_count} indices listed without authentication.",
+            evidence="\n".join(lines[:6]),
+            remediation="Enable authentication and restrict index access.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-284",
+            confidence="certain",
+          ))
+    except Exception:
+      pass
+    return findings
+
+  def _es_check_nodes(self, base_url, raw):
+    """GET /_nodes — extract transport/publish addresses (IP leak)."""
+    findings = []
+    try:
+      resp = requests.get(f"{base_url}/_nodes", timeout=3)
+      if resp.ok:
+        data = resp.json()
+        nodes = data.get("nodes", {})
+        ips = set()
+        for node in nodes.values():
+          for key in ("transport_address", "publish_address", "host"):
+            val = node.get(key) or ""
+            # Extract IP from "1.2.3.4:9300" style
+            ip = val.rsplit(":", 1)[0] if ":" in val else val
+            if ip and ip not in ("127.0.0.1", "localhost", "0.0.0.0"):
+              ips.add(ip)
+          settings = node.get("settings", {})
+          if isinstance(settings, dict):
+            net = settings.get("network", {})
+            if isinstance(net, dict):
+              for k in ("host", "publish_host"):
+                v = net.get(k)
+                if v and v not in ("127.0.0.1", "localhost", "0.0.0.0"):
+                  ips.add(v)
+        if ips:
+          raw["node_ips"] = list(ips)
+          findings.append(Finding(
+            severity=Severity.MEDIUM,
+            title=f"Elasticsearch node IPs disclosed ({len(ips)})",
+            description=f"Node API exposes internal IPs: {', '.join(sorted(ips)[:5])}",
+            evidence=f"IPs: {', '.join(sorted(ips)[:10])}",
+            remediation="Restrict /_nodes endpoint access.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-200",
+            confidence="certain",
+          ))
+    except Exception:
+      pass
+    return findings
 
 
   def _service_info_502(self, target, port):
