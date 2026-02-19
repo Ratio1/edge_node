@@ -1,7 +1,7 @@
 import re as _re
 import requests
 
-from .findings import Finding, Severity, probe_result
+from .findings import Finding, Severity, probe_result, probe_error
 
 
 class _WebDiscoveryMixin:
@@ -22,35 +22,56 @@ class _WebDiscoveryMixin:
 
     Returns
     -------
-    str
-      Joined findings from endpoint checks.
+    dict
+      Structured findings from endpoint checks.
     """
-    findings = []
+    findings_list = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
       base_url = f"{scheme}://{target}:{port}"
+
+    # Severity depends on what the path exposes
+    _PATH_META = {
+      "/.env": (Severity.HIGH, "CWE-538", "A05:2021",
+        "Environment file may contain database passwords, API keys, and secrets."),
+      "/.git/": (Severity.HIGH, "CWE-538", "A01:2021",
+        "Git repository exposed — source code, credentials, and history downloadable."),
+      "/admin": (Severity.MEDIUM, "CWE-200", "A01:2021",
+        "Admin panel accessible — verify authentication is enforced."),
+      "/robots.txt": (Severity.INFO, "", "",
+        "Robots.txt present — may reveal hidden paths."),
+      "/login": (Severity.INFO, "", "",
+        "Login page accessible."),
+    }
+
     try:
-      # Check common sensitive endpoints
-      for path in ["/robots.txt", "/.env", "/.git/", "/admin", "/login"]:
+      for path, (severity, cwe, owasp, desc) in _PATH_META.items():
         url = base_url + path
         resp = requests.get(url, timeout=2, verify=False)
         if resp.status_code == 200:
-          finding = f"VULNERABILITY: Accessible resource at {url} (200 OK)."
-          self.P(finding)
-          findings.append(finding)
-        elif resp.status_code in (401, 403):
-          self.P(f"Protected resource {url} (status {resp.status_code}).")
-          findings.append(
-            f"INFO: Access control enforced at {url} (status {resp.status_code})."
-          )
+          findings_list.append(Finding(
+            severity=severity,
+            title=f"Accessible resource: {path}",
+            description=desc,
+            evidence=f"GET {url} returned 200 OK.",
+            remediation=f"Restrict access to {path} or remove it from production." if severity != Severity.INFO else "",
+            owasp_id=owasp,
+            cwe_id=cwe,
+            confidence="certain",
+          ))
     except Exception as e:
-      message = f"ERROR: Common endpoint probe failed on {base_url}: {e}"
-      self.P(message, color='y')
-      findings.append(message)
-    if not findings:
-      findings.append(f"OK: No common endpoint exposures detected on {base_url}.")
-    return "\n".join(findings)
+      self.P(f"Common endpoint probe failed on {base_url}: {e}", color='y')
+      return probe_error(target, port, "common", e)
+
+    if not findings_list:
+      findings_list.append(Finding(
+        severity=Severity.INFO,
+        title="No common endpoint exposures detected",
+        description=f"Checked /.env, /.git/, /admin, /robots.txt, /login on {base_url}.",
+        confidence="firm",
+      ))
+    return probe_result(findings=findings_list)
 
 
   def _web_test_homepage(self, target, port):
@@ -66,37 +87,49 @@ class _WebDiscoveryMixin:
 
     Returns
     -------
-    str
-      Joined findings from homepage inspection.
+    dict
+      Structured findings from homepage inspection.
     """
-    findings = []
+    findings_list = []
     scheme = "https" if port in (443, 8443) else "http"
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
       base_url = f"{scheme}://{target}:{port}"
+
+    _MARKER_META = {
+      "API_KEY": (Severity.CRITICAL, "API key found in page source"),
+      "PASSWORD": (Severity.CRITICAL, "Password string found in page source"),
+      "SECRET": (Severity.HIGH, "Secret string found in page source"),
+      "BEGIN RSA PRIVATE KEY": (Severity.CRITICAL, "RSA private key found in page source"),
+    }
+
     try:
-      # Check homepage for leaked info
       resp_main = requests.get(base_url, timeout=3, verify=False)
       text = resp_main.text[:10000]
-      for marker in ["API_KEY", "PASSWORD", "SECRET", "BEGIN RSA PRIVATE KEY"]:
+      for marker, (severity, title) in _MARKER_META.items():
         if marker in text:
-          finding = (
-            f"VULNERABILITY: sensitive '{marker}' found on {base_url}."
-          )
-          findings.append(finding)
-          self.P(finding)
-      # Check for other potential leaks
-      if "database" in text.lower():
-        finding = f"VULNERABILITY: potential database leak at {base_url}."
-        findings.append(finding)
-        self.P(finding)
+          findings_list.append(Finding(
+            severity=severity,
+            title=title,
+            description=f"The string '{marker}' was found in the HTML source of {base_url}.",
+            evidence=f"Marker '{marker}' present in first 10KB of response.",
+            remediation="Remove sensitive data from client-facing HTML; use server-side environment variables.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-540",
+            confidence="firm",
+          ))
     except Exception as e:
-      message = f"ERROR: Homepage probe failed on {base_url}: {e}"
-      self.P(message, color='y')
-      findings.append(message)
-    if not findings:
-      findings.append(f"OK: No sensitive markers detected on {base_url} homepage.")
-    return "\n".join(findings)
+      self.P(f"Homepage probe failed on {base_url}: {e}", color='y')
+      return probe_error(target, port, "homepage", e)
+
+    if not findings_list:
+      findings_list.append(Finding(
+        severity=Severity.INFO,
+        title="No sensitive markers detected on homepage",
+        description=f"Checked for API_KEY, PASSWORD, SECRET, RSA keys on {base_url}.",
+        confidence="firm",
+      ))
+    return probe_result(findings=findings_list)
 
   def _web_test_tech_fingerprint(self, target, port):
     """

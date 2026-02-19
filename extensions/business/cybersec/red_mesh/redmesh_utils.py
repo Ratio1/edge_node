@@ -684,10 +684,10 @@ class PentestLocalWorker(
           if port_proto not in target_protocols:
             continue
         info = func(target, port)
-        if port not in self.state["service_info"]:
-          self.state["service_info"][port] = {}
-        self.state["service_info"][port][method] = info
         if info is not None:
+          if port not in self.state["service_info"]:
+            self.state["service_info"][port] = {}
+          self.state["service_info"][port][method] = info
           method_info.append(f"{method}: {port}: {info}")
 
         # Dune sand walking - random delay before each service probe
