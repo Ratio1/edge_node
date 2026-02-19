@@ -44,9 +44,9 @@ FEATURE_CATALOG = [
   {
     "id": "web_discovery",
     "label": "Discovery",
-    "description": "Enumerate exposed files, admin panels, and homepage secrets (OWASP WSTG-INFO).",
+    "description": "Enumerate exposed files, admin panels, homepage secrets, tech fingerprinting, and VPN endpoints (OWASP WSTG-INFO).",
     "category": "web",
-    "methods": ["_web_test_common", "_web_test_homepage"]
+    "methods": ["_web_test_common", "_web_test_homepage", "_web_test_tech_fingerprint", "_web_test_vpn_endpoints"]
   },
   {
     "id": "web_hardening",
@@ -68,6 +68,13 @@ FEATURE_CATALOG = [
     "description": "Non-destructive probes for path traversal, reflected XSS, and SQL injection (OWASP WSTG-INPV).",
     "category": "web",
     "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection"]
+  },
+  {
+    "id": "active_auth",
+    "label": "Credential testing",
+    "description": "Test default/weak credentials on database and remote access services. May trigger account lockout.",
+    "category": "service",
+    "methods": ["_service_info_3306_creds", "_service_info_5432_creds"]
   }
 ]
 
@@ -148,4 +155,6 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_445":     frozenset({"smb"}),
     "_service_info_502":     frozenset({"modbus"}),
     "_service_info_generic": frozenset({"unknown", "wins"}),
+    "_service_info_3306_creds": frozenset({"mysql"}),
+    "_service_info_5432_creds": frozenset({"postgresql"}),
 }
