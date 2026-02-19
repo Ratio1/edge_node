@@ -11,7 +11,10 @@ import time
 from copy import deepcopy
 
 from .service_mixin import _ServiceInfoMixin
-from .web_mixin import _WebTestsMixin
+from .web_discovery_mixin import _WebDiscoveryMixin
+from .web_hardening_mixin import _WebHardeningMixin
+from .web_api_mixin import _WebApiExposureMixin
+from .web_injection_mixin import _WebInjectionMixin
 from .constants import (
   PROBE_PROTOCOL_MAP, WEB_PROTOCOLS,
   WELL_KNOWN_PORTS as _WELL_KNOWN_PORTS,
@@ -32,7 +35,10 @@ ALL_PORTS = [port for port in range(1, 65536)]
 
 class PentestLocalWorker(
   _ServiceInfoMixin,
-  _WebTestsMixin
+  _WebDiscoveryMixin,
+  _WebHardeningMixin,
+  _WebApiExposureMixin,
+  _WebInjectionMixin,
 ):
   """
   Execute a pentest workflow against a target on a dedicated thread.

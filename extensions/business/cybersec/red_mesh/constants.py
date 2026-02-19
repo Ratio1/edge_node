@@ -42,41 +42,32 @@ FEATURE_CATALOG = [
     ]
   },
   {
-    "id": "web_test_common",
-    "label": "Common exposure scan",
-    "description": "Probe default admin panels, disclosed files, and common misconfigurations.",
+    "id": "web_discovery",
+    "label": "Discovery",
+    "description": "Enumerate exposed files, admin panels, and homepage secrets (OWASP WSTG-INFO).",
     "category": "web",
-    "methods": [
-      "_web_test_common",
-      "_web_test_homepage",
-      "_web_test_flags",
-      "_web_test_graphql_introspection",
-      "_web_test_metadata_endpoints"
-    ]
+    "methods": ["_web_test_common", "_web_test_homepage"]
   },
   {
-    "id": "web_test_security_headers",
-    "label": "Security headers audit",
-    "description": "Check HSTS, CSP, X-Frame-Options, and other critical response headers.",
+    "id": "web_hardening",
+    "label": "Hardening audit",
+    "description": "Audit cookie flags, security headers, CORS policy, redirect handling, and HTTP methods (OWASP WSTG-CONF).",
     "category": "web",
-    "methods": [
-      "_web_test_security_headers",
-      "_web_test_cors_misconfiguration",
-      "_web_test_open_redirect",
-      "_web_test_http_methods"
-    ]
+    "methods": ["_web_test_flags", "_web_test_security_headers", "_web_test_cors_misconfiguration", "_web_test_open_redirect", "_web_test_http_methods"]
   },
   {
-    "id": "web_test_vulnerability",
-    "label": "Vulnerability probes",
-    "description": "Non-destructive probes for common web vulnerabilities.",
+    "id": "web_api_exposure",
+    "label": "API exposure",
+    "description": "Detect GraphQL introspection leaks, cloud metadata endpoints, and API auth bypass (OWASP WSTG-APIT).",
     "category": "web",
-    "methods": [
-      "_web_test_path_traversal",
-      "_web_test_xss",
-      "_web_test_sql_injection",
-      "_web_test_api_auth_bypass"
-    ]
+    "methods": ["_web_test_graphql_introspection", "_web_test_metadata_endpoints", "_web_test_api_auth_bypass"]
+  },
+  {
+    "id": "web_injection",
+    "label": "Injection probes",
+    "description": "Non-destructive probes for path traversal, reflected XSS, and SQL injection (OWASP WSTG-INPV).",
+    "category": "web",
+    "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection"]
   }
 ]
 
