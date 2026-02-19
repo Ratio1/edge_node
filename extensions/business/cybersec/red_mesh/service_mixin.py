@@ -443,6 +443,7 @@ class _ServiceInfoMixin:
     dict
       Structured findings with banner, vulnerabilities, server_info, etc.
     """
+    findings = []
     result = {
       "banner": None,
       "server_type": None,
@@ -450,7 +451,6 @@ class _ServiceInfoMixin:
       "anonymous_access": False,
       "write_access": False,
       "tls_supported": False,
-      "vulnerabilities": [],
       "accepted_credentials": [],
       "directory_listing": None,
     }
@@ -468,15 +468,22 @@ class _ServiceInfoMixin:
       ftp = _ftp_connect()
       result["banner"] = ftp.getwelcome()
     except Exception as e:
-      return {"error": f"FTP probe failed on {target}:{port}: {e}"}
+      return probe_error(target, port, "FTP", e)
 
     # --- 2. Anonymous login ---
     try:
       resp = ftp.login()
       result["anonymous_access"] = True
-      result["vulnerabilities"].append(
-        "FTP allows anonymous login."
-      )
+      findings.append(Finding(
+        severity=Severity.HIGH,
+        title="FTP allows anonymous login.",
+        description="The FTP server permits unauthenticated access via anonymous login.",
+        evidence="Anonymous login succeeded.",
+        remediation="Disable anonymous FTP access unless explicitly required.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-287",
+        confidence="certain",
+      ))
     except Exception:
       # Anonymous failed — close and move on to credential tests
       try:
@@ -512,9 +519,16 @@ class _ServiceInfoMixin:
         resp = ftp.storbinary("STOR __redmesh_probe.txt", test_data)
         if resp and resp.startswith("226"):
           result["write_access"] = True
-          result["vulnerabilities"].append(
-            "FTP anonymous write access enabled (file upload possible)."
-          )
+          findings.append(Finding(
+            severity=Severity.CRITICAL,
+            title="FTP anonymous write access enabled (file upload possible).",
+            description="Anonymous users can upload files to the FTP server.",
+            evidence="STOR command succeeded with anonymous session.",
+            remediation="Remove write permissions for anonymous FTP users.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-434",
+            confidence="certain",
+          ))
           try:
             ftp.delete("__redmesh_probe.txt")
           except Exception:
@@ -541,9 +555,16 @@ class _ServiceInfoMixin:
         try:
           resp = ftp.cwd(test_dir)
           if resp and (resp.startswith("250") or resp.startswith("200")):
-            result["vulnerabilities"].append(
-              f"FTP directory traversal: CWD to '{test_dir}' succeeded."
-            )
+            findings.append(Finding(
+              severity=Severity.HIGH,
+              title=f"FTP directory traversal: CWD to '{test_dir}' succeeded.",
+              description="The FTP server allows changing to directories outside the intended root.",
+              evidence=f"CWD '{test_dir}' returned: {resp}",
+              remediation="Restrict FTP users to their home directory (chroot).",
+              owasp_id="A01:2021",
+              cwe_id="CWE-22",
+              confidence="certain",
+            ))
             break
         except Exception:
           pass
@@ -570,18 +591,32 @@ class _ServiceInfoMixin:
         pass
     except Exception:
       if not result["tls_supported"]:
-        result["vulnerabilities"].append(
-          "FTP does not support TLS encryption (cleartext credentials)."
-        )
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="FTP does not support TLS encryption (cleartext credentials).",
+          description="Credentials and data are transmitted in cleartext over the network.",
+          evidence="AUTH TLS command rejected or not supported.",
+          remediation="Enable FTPS (AUTH TLS) or migrate to SFTP.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-319",
+          confidence="certain",
+        ))
 
     # --- 6. Default credential check ---
     for user, passwd in _FTP_DEFAULT_CREDS:
       try:
         ftp_cred = _ftp_connect(user, passwd)
         result["accepted_credentials"].append(f"{user}:{passwd}")
-        result["vulnerabilities"].append(
-          f"FTP default credential accepted: {user}:{passwd}"
-        )
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          title=f"FTP default credential accepted: {user}:{passwd}",
+          description="The FTP server accepted a well-known default credential.",
+          evidence=f"Accepted credential: {user}:{passwd}",
+          remediation="Change default passwords and enforce strong credential policies.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-798",
+          confidence="certain",
+        ))
         try:
           ftp_cred.quit()
         except Exception:
@@ -597,9 +632,16 @@ class _ServiceInfoMixin:
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
     try:
       ftp_rand = _ftp_connect(ruser, rpass)
-      result["vulnerabilities"].append(
-        "FTP accepts arbitrary credentials (possible honeypot)."
-      )
+      findings.append(Finding(
+        severity=Severity.CRITICAL,
+        title="FTP accepts arbitrary credentials (possible honeypot).",
+        description="Random credentials were accepted, indicating a honeypot or dangerous misconfiguration.",
+        evidence=f"Accepted random creds {ruser}:{rpass}",
+        remediation="Investigate immediately — this host may be a honeypot or compromised.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-287",
+        confidence="certain",
+      ))
       try:
         ftp_rand.quit()
       except Exception:
@@ -609,7 +651,7 @@ class _ServiceInfoMixin:
     except Exception:
       pass
 
-    return result
+    return probe_result(raw_data=result, findings=findings)
 
   def _service_info_22(self, target, port):
     """
@@ -635,10 +677,10 @@ class _ServiceInfoMixin:
     dict
       Structured findings with banner, auth_methods, and vulnerabilities.
     """
+    findings = []
     result = {
       "banner": None,
       "auth_methods": [],
-      "vulnerabilities": [],
     }
 
     # --- 1. Banner grab (raw socket) ---
@@ -650,7 +692,7 @@ class _ServiceInfoMixin:
       sock.close()
       result["banner"] = banner
     except Exception as e:
-      return {"error": f"SSH probe failed on {target}:{port}: {e}"}
+      return probe_error(target, port, "SSH", e)
 
     # --- 2. Auth method enumeration via paramiko Transport ---
     try:
@@ -668,9 +710,16 @@ class _ServiceInfoMixin:
       self.P(f"SSH auth enumeration failed on {target}:{port}: {e}", color='y')
 
     if "password" in result["auth_methods"]:
-      result["vulnerabilities"].append(
-        "SSH password authentication is enabled (prefer key-based auth)."
-      )
+      findings.append(Finding(
+        severity=Severity.MEDIUM,
+        title="SSH password authentication is enabled (prefer key-based auth).",
+        description="The SSH server allows password-based login, which is susceptible to brute-force attacks.",
+        evidence=f"Auth methods: {', '.join(result['auth_methods'])}",
+        remediation="Disable PasswordAuthentication in sshd_config and use key-based auth.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-287",
+        confidence="certain",
+      ))
 
     # --- 3. Default credential check ---
     accepted_creds = []
@@ -704,10 +753,16 @@ class _ServiceInfoMixin:
         timeout=3, auth_timeout=3,
         look_for_keys=False, allow_agent=False,
       )
-      result["vulnerabilities"].append(
-        "SSH accepts ANY credentials — possible honeypot or "
-        "severely misconfigured service."
-      )
+      findings.append(Finding(
+        severity=Severity.CRITICAL,
+        title="SSH accepts ANY credentials — possible honeypot or severely misconfigured service.",
+        description="Random credentials were accepted, indicating a honeypot or dangerous misconfiguration.",
+        evidence=f"Accepted random creds {random_user}:{random_pass}",
+        remediation="Investigate immediately — this host may be a honeypot or compromised.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-287",
+        confidence="certain",
+      ))
       client.close()
     except paramiko.AuthenticationException:
       pass
@@ -717,69 +772,97 @@ class _ServiceInfoMixin:
     if accepted_creds:
       result["accepted_credentials"] = accepted_creds
       for cred in accepted_creds:
-        result["vulnerabilities"].append(
-          f"SSH default credential accepted: {cred}"
-        )
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          title=f"SSH default credential accepted: {cred}",
+          description=f"The SSH server accepted a well-known default credential.",
+          evidence=f"Accepted credential: {cred}",
+          remediation="Change default passwords immediately and enforce strong credential policies.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-798",
+          confidence="certain",
+        ))
 
     # --- 5. Cipher/KEX audit ---
-    result["weak_algorithms"] = self._ssh_check_ciphers(target, port, result)
+    cipher_findings, weak_labels = self._ssh_check_ciphers(target, port)
+    findings += cipher_findings
+    result["weak_algorithms"] = weak_labels
 
     # --- 6. CVE check on banner version ---
     if result["banner"]:
       ssh_version = self._ssh_extract_version(result["banner"])
       if ssh_version:
         result["ssh_version"] = ssh_version
-        cve_findings = check_cves("openssh", ssh_version)
-        for f in cve_findings:
-          result["vulnerabilities"].append(f.title)
+        findings += check_cves("openssh", ssh_version)
 
-    return result
+    return probe_result(raw_data=result, findings=findings)
 
   def _ssh_extract_version(self, banner):
     """Extract OpenSSH version from banner like 'SSH-2.0-OpenSSH_8.9p1'."""
     m = _re.search(r'OpenSSH[_\s](\d+\.\d+(?:\.\d+)?)', banner, _re.IGNORECASE)
     return m.group(1) if m else None
 
-  def _ssh_check_ciphers(self, target, port, result):
-    """Audit SSH ciphers, KEX, and MACs via paramiko Transport."""
-    weak_findings = []
+  def _ssh_check_ciphers(self, target, port):
+    """Audit SSH ciphers, KEX, and MACs via paramiko Transport.
+
+    Returns
+    -------
+    tuple[list[Finding], list[str]]
+      (findings, weak_algorithm_labels) — findings for probe_result,
+      labels for the raw-data ``weak_algorithms`` field.
+    """
+    findings = []
+    weak_labels = []
     _WEAK_CIPHERS = {"3des-cbc", "blowfish-cbc", "arcfour", "arcfour128", "arcfour256",
                      "aes128-cbc", "aes192-cbc", "aes256-cbc", "cast128-cbc"}
     _WEAK_KEX = {"diffie-hellman-group1-sha1", "diffie-hellman-group14-sha1",
                  "diffie-hellman-group-exchange-sha1"}
-    _WEAK_MACS = {"hmac-md5", "hmac-md5-96", "hmac-sha1", "hmac-sha1-96"}
 
     try:
       transport = paramiko.Transport((target, port))
       transport.connect()
-      # Get negotiated algorithms from transport security options
       sec_opts = transport.get_security_options()
 
       ciphers = set(sec_opts.ciphers) if sec_opts.ciphers else set()
       kex = set(sec_opts.kex) if sec_opts.kex else set()
-      # key_types = set(sec_opts.keys) if sec_opts.keys else set()
 
       transport.close()
 
       weak_ciphers = ciphers & _WEAK_CIPHERS
       weak_kex = kex & _WEAK_KEX
-      # Note: paramiko may not expose server-offered MACs directly,
-      # so we check against what the transport offers
 
       if weak_ciphers:
-        msg = f"SSH weak ciphers: {', '.join(sorted(weak_ciphers))}"
-        result["vulnerabilities"].append(msg)
-        weak_findings.append(msg)
+        cipher_list = ", ".join(sorted(weak_ciphers))
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title=f"SSH weak ciphers: {cipher_list}",
+          description="The SSH server offers ciphers considered cryptographically weak.",
+          evidence=f"Weak ciphers offered: {cipher_list}",
+          remediation="Disable CBC-mode and RC4 ciphers in sshd_config.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-326",
+          confidence="certain",
+        ))
+        weak_labels.append(f"ciphers: {cipher_list}")
 
       if weak_kex:
-        msg = f"SSH weak key exchange: {', '.join(sorted(weak_kex))}"
-        result["vulnerabilities"].append(msg)
-        weak_findings.append(msg)
+        kex_list = ", ".join(sorted(weak_kex))
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title=f"SSH weak key exchange: {kex_list}",
+          description="The SSH server offers key-exchange algorithms with known weaknesses.",
+          evidence=f"Weak KEX offered: {kex_list}",
+          remediation="Disable SHA-1 based key exchange algorithms in sshd_config.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-326",
+          confidence="certain",
+        ))
+        weak_labels.append(f"kex: {kex_list}")
 
     except Exception as e:
       self.P(f"SSH cipher audit failed on {target}:{port}: {e}", color='y')
 
-    return weak_findings
+    return findings, weak_labels
 
   def _service_info_25(self, target, port):
     """
@@ -809,12 +892,12 @@ class _ServiceInfoMixin:
     """
     import smtplib
 
+    findings = []
     result = {
       "banner": None,
       "server_hostname": None,
       "max_message_size": None,
       "auth_methods": [],
-      "vulnerabilities": [],
     }
 
     # --- 1. Connect and grab banner ---
@@ -823,7 +906,7 @@ class _ServiceInfoMixin:
       code, msg = smtp.connect(target, port)
       result["banner"] = f"{code} {msg.decode(errors='replace')}"
     except Exception as e:
-      return {"error": f"SMTP probe failed on {target}:{port}: {e}"}
+      return probe_error(target, port, "SMTP", e)
 
     # --- 2. EHLO — server capabilities ---
     ehlo_features = []
@@ -867,17 +950,31 @@ class _ServiceInfoMixin:
     )
     if version_match:
       mta = version_match.group(0).strip()
-      result["vulnerabilities"].append(
-        f"SMTP banner discloses MTA software: {mta} (aids CVE lookup)."
-      )
+      findings.append(Finding(
+        severity=Severity.LOW,
+        title=f"SMTP banner discloses MTA software: {mta} (aids CVE lookup).",
+        description="The SMTP banner reveals the mail transfer agent software and version.",
+        evidence=f"Banner: {banner_text[:120]}",
+        remediation="Remove or genericize the SMTP banner to hide MTA version details.",
+        owasp_id="A05:2021",
+        cwe_id="CWE-200",
+        confidence="certain",
+      ))
 
     if result["server_hostname"]:
       # Check if hostname reveals container/internal info
       hostname = result["server_hostname"]
       if _re.search(r"[0-9a-f]{12}", hostname):
-        result["vulnerabilities"].append(
-          f"SMTP hostname leaks container ID: {hostname} (infrastructure disclosure)."
-        )
+        findings.append(Finding(
+          severity=Severity.LOW,
+          title=f"SMTP hostname leaks container ID: {hostname} (infrastructure disclosure).",
+          description="The EHLO response reveals a container ID or internal hostname.",
+          evidence=f"Hostname: {hostname}",
+          remediation="Configure the SMTP server to use a proper FQDN instead of the container ID.",
+          owasp_id="A05:2021",
+          cwe_id="CWE-200",
+          confidence="firm",
+        ))
 
     # --- 3. STARTTLS ---
     starttls_supported = any("STARTTLS" in f.upper() for f in ehlo_features)
@@ -890,18 +987,32 @@ class _ServiceInfoMixin:
         pass
 
     if not starttls_supported:
-      result["vulnerabilities"].append(
-        "SMTP does not support STARTTLS (credentials sent in cleartext)."
-      )
+      findings.append(Finding(
+        severity=Severity.MEDIUM,
+        title="SMTP does not support STARTTLS (credentials sent in cleartext).",
+        description="The SMTP server does not offer STARTTLS, leaving credentials and mail unencrypted.",
+        evidence="STARTTLS not listed in EHLO features and STARTTLS command rejected.",
+        remediation="Enable STARTTLS support on the SMTP server.",
+        owasp_id="A02:2021",
+        cwe_id="CWE-319",
+        confidence="certain",
+      ))
 
     # --- 4. AUTH without credentials ---
     if result["auth_methods"]:
       try:
         code, msg = smtp.docmd("AUTH LOGIN")
         if code == 235:
-          result["vulnerabilities"].append(
-            "SMTP AUTH LOGIN accepted without credentials."
-          )
+          findings.append(Finding(
+            severity=Severity.HIGH,
+            title="SMTP AUTH LOGIN accepted without credentials.",
+            description="The SMTP server accepted AUTH LOGIN without providing actual credentials.",
+            evidence=f"AUTH LOGIN returned code {code}.",
+            remediation="Fix AUTH configuration to require valid credentials.",
+            owasp_id="A07:2021",
+            cwe_id="CWE-287",
+            confidence="certain",
+          ))
       except Exception:
         pass
 
@@ -925,9 +1036,16 @@ class _ServiceInfoMixin:
         if code_from == 250:
           code_rcpt, _ = smtp.docmd("RCPT TO:<probe@external-domain.test>")
           if code_rcpt == 250:
-            result["vulnerabilities"].append(
-              "SMTP open relay detected (accepts mail to external domains without auth)."
-            )
+            findings.append(Finding(
+              severity=Severity.HIGH,
+              title="SMTP open relay detected (accepts mail to external domains without auth).",
+              description="The SMTP server relays mail to external domains without authentication.",
+              evidence="RCPT TO:<probe@external-domain.test> accepted (code 250).",
+              remediation="Configure SMTP relay restrictions to require authentication.",
+              owasp_id="A01:2021",
+              cwe_id="CWE-284",
+              confidence="certain",
+            ))
           smtp.docmd("RSET")
       except Exception:
         pass
@@ -938,9 +1056,16 @@ class _ServiceInfoMixin:
         try:
           code, msg = smtp.docmd(cmd_name, "root")
           if code in (250, 251, 252):
-            result["vulnerabilities"].append(
-              f"SMTP {cmd_name} command enabled (user enumeration possible)."
-            )
+            findings.append(Finding(
+              severity=Severity.MEDIUM,
+              title=f"SMTP {cmd_name} command enabled (user enumeration possible).",
+              description=f"The {cmd_name} command can be used to enumerate valid users on the system.",
+              evidence=f"{cmd_name} root returned code {code}.",
+              remediation=f"Disable the {cmd_name} command in the SMTP server configuration.",
+              owasp_id="A01:2021",
+              cwe_id="CWE-203",
+              confidence="certain",
+            ))
         except Exception:
           pass
 
@@ -950,7 +1075,7 @@ class _ServiceInfoMixin:
       except Exception:
         pass
 
-    return result
+    return probe_result(raw_data=result, findings=findings)
 
   def _service_info_3306(self, target, port):
     """
@@ -1148,20 +1273,27 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      RDP reachability summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(2)
       sock.connect((target, port))
-      info = "RDP service open (no easy banner)."
+      raw["banner"] = "RDP service open"
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title="RDP service detected",
+        description=f"RDP port {port} is open on {target}, no further enumeration performed.",
+        evidence=f"TCP connect to {target}:{port} succeeded.",
+        confidence="certain",
+      ))
       sock.close()
     except Exception as e:
-      info = f"RDP probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return probe_error(target, port, "RDP", e)
+    return probe_result(raw_data=raw, findings=findings)
 
   # SAFETY: Read-only commands only. NEVER add CONFIG SET, SLAVEOF, MODULE LOAD, EVAL, DEBUG.
   def _service_info_6379(self, target, port):
@@ -1368,15 +1500,24 @@ class _ServiceInfoMixin:
     """
     import time as _time
 
+    findings = []
     result = {
       "banner": None,
       "negotiation_options": [],
-      "vulnerabilities": [
-        "Telnet service is running (unencrypted remote access)."
-      ],
       "accepted_credentials": [],
       "system_info": None,
     }
+
+    findings.append(Finding(
+      severity=Severity.MEDIUM,
+      title="Telnet service is running (unencrypted remote access).",
+      description="Telnet transmits all data including credentials in cleartext.",
+      evidence=f"Telnet port {port} is open on {target}.",
+      remediation="Replace Telnet with SSH for encrypted remote access.",
+      owasp_id="A02:2021",
+      cwe_id="CWE-319",
+      confidence="certain",
+    ))
 
     # --- 1. Banner grab + IAC negotiation parsing ---
     try:
@@ -1386,7 +1527,7 @@ class _ServiceInfoMixin:
       raw = sock.recv(2048)
       sock.close()
     except Exception as e:
-      return {"error": f"Telnet probe failed on {target}:{port}: {e}"}
+      return probe_error(target, port, "Telnet", e)
 
     # Parse IAC sequences
     iac_options = []
@@ -1529,14 +1670,28 @@ class _ServiceInfoMixin:
       success, uid_line, uname_line = _try_telnet_login(user, passwd)
       if success:
         result["accepted_credentials"].append(f"{user}:{passwd}")
-        result["vulnerabilities"].append(
-          f"Telnet default credential accepted: {user}:{passwd}"
-        )
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          title=f"Telnet default credential accepted: {user}:{passwd}",
+          description="The Telnet server accepted a well-known default credential.",
+          evidence=f"Accepted credential: {user}:{passwd}",
+          remediation="Change default passwords immediately and enforce strong credential policies.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-798",
+          confidence="certain",
+        ))
         # Check for root access
         if uid_line and "uid=0" in uid_line:
-          result["vulnerabilities"].append(
-            f"Root shell access via Telnet with {user}:{passwd}."
-          )
+          findings.append(Finding(
+            severity=Severity.CRITICAL,
+            title=f"Root shell access via Telnet with {user}:{passwd}.",
+            description="Root-level shell access was obtained over an unencrypted Telnet session.",
+            evidence=f"uid=0 in id output: {uid_line}",
+            remediation="Disable root login via Telnet; use SSH with key-based auth instead.",
+            owasp_id="A04:2021",
+            cwe_id="CWE-250",
+            confidence="certain",
+          ))
 
         # Capture system info once
         if not system_info_captured and (uid_line or uname_line):
@@ -1554,11 +1709,18 @@ class _ServiceInfoMixin:
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
     success, _, _ = _try_telnet_login(ruser, rpass)
     if success:
-      result["vulnerabilities"].append(
-        "Telnet accepts arbitrary credentials (possible honeypot)."
-      )
+      findings.append(Finding(
+        severity=Severity.CRITICAL,
+        title="Telnet accepts arbitrary credentials (possible honeypot).",
+        description="Random credentials were accepted, indicating a honeypot or dangerous misconfiguration.",
+        evidence=f"Accepted random creds {ruser}:{rpass}",
+        remediation="Investigate immediately — this host may be a honeypot or compromised.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-287",
+        confidence="certain",
+      ))
 
-    return result
+    return probe_result(raw_data=result, findings=findings)
 
 
   def _service_info_445(self, target, port):
@@ -2073,10 +2235,11 @@ class _ServiceInfoMixin:
 
     Returns
     -------
-    str | None
-      Memcached response summary or error message.
+    dict
+      Structured findings.
     """
-    info = None
+    findings = []
+    raw = {"banner": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(2)
@@ -2084,14 +2247,31 @@ class _ServiceInfoMixin:
       sock.sendall(b'stats\r\n')
       data = sock.recv(128)
       if data.startswith(b'STAT'):
-        info = (
-          f"VULNERABILITY: Memcached stats accessible without auth on {target}:{port}"
-        )
+        raw["banner"] = data.decode("utf-8", errors="replace").strip()[:120]
+        findings.append(Finding(
+          severity=Severity.HIGH,
+          title="Memcached stats accessible without authentication",
+          description=f"Memcached on {target}:{port} responds to stats without authentication, "
+                      "exposing cache metadata and enabling cache poisoning or data exfiltration.",
+          evidence=f"stats command returned: {raw['banner'][:80]}",
+          remediation="Bind Memcached to localhost or use SASL authentication; restrict network access.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-287",
+          confidence="certain",
+        ))
+      else:
+        raw["banner"] = "Memcached port open"
+        findings.append(Finding(
+          severity=Severity.INFO,
+          title="Memcached port open",
+          description=f"Memcached port {port} is open on {target} but stats command was not accepted.",
+          evidence=f"Response: {data[:60].decode('utf-8', errors='replace')}",
+          confidence="firm",
+        ))
       sock.close()
     except Exception as e:
-      info = f"Memcached probe failed on {target}:{port}: {e}"
-      self.P(info, color='y')
-    return info
+      return probe_error(target, port, "Memcached", e)
+    return probe_result(raw_data=raw, findings=findings)
 
 
   def _service_info_9200(self, target, port):
