@@ -89,7 +89,9 @@ class _ServiceInfoMixin:
     # --- 1. GET request — banner, server, title, tech fingerprint ---
     try:
       self.P(f"Fetching {url} for banner...")
-      resp = requests.get(url, timeout=5, verify=False, allow_redirects=True)
+      ua = getattr(self, 'scanner_user_agent', '')
+      headers = {'User-Agent': ua} if ua else {}
+      resp = requests.get(url, timeout=5, verify=False, allow_redirects=True, headers=headers)
 
       result["banner"] = f"HTTP {resp.status_code} {resp.reason}"
       result["server"] = resp.headers.get("Server")
@@ -196,7 +198,9 @@ class _ServiceInfoMixin:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(2)
       sock.connect((target, port))
-      msg = "HEAD / HTTP/1.1\r\nHost: {}\r\n\r\n".format(target).encode('utf-8')
+      ua = getattr(self, 'scanner_user_agent', '')
+      ua_header = f"\r\nUser-Agent: {ua}" if ua else ""
+      msg = "HEAD / HTTP/1.1\r\nHost: {}{}\r\n\r\n".format(target, ua_header).encode('utf-8')
       sock.send(bytes(msg))
       data = sock.recv(1024).decode('utf-8', errors='ignore')
       sock.close()
@@ -254,7 +258,9 @@ class _ServiceInfoMixin:
       if port != 443:
         url = f"https://{target}:{port}"
       self.P(f"Fetching {url} for banner...")
-      resp = requests.get(url, timeout=3, verify=False)
+      ua = getattr(self, 'scanner_user_agent', '')
+      headers = {'User-Agent': ua} if ua else {}
+      resp = requests.get(url, timeout=3, verify=False, headers=headers)
       raw["banner"] = f"HTTPS {resp.status_code} {resp.reason}"
       raw["server"] = resp.headers.get("Server")
       findings.append(Finding(
@@ -959,9 +965,10 @@ class _ServiceInfoMixin:
       return probe_error(target, port, "SMTP", e)
 
     # --- 2. EHLO — server capabilities ---
+    identity = getattr(self, 'scanner_identity', 'probe.redmesh.local')
     ehlo_features = []
     try:
-      code, msg = smtp.ehlo("probe.redmesh.local")
+      code, msg = smtp.ehlo(identity)
       if code == 250:
         for line in msg.decode(errors="replace").split("\n"):
           feat = line.strip()
@@ -970,7 +977,7 @@ class _ServiceInfoMixin:
     except Exception:
       # Fallback to HELO
       try:
-        smtp.helo("probe.redmesh.local")
+        smtp.helo(identity)
       except Exception:
         pass
 
@@ -1076,13 +1083,13 @@ class _ServiceInfoMixin:
         pass
       try:
         smtp = smtplib.SMTP(target, port, timeout=5)
-        smtp.ehlo("probe.redmesh.local")
+        smtp.ehlo(identity)
       except Exception:
         smtp = None
 
     if smtp:
       try:
-        code_from, _ = smtp.docmd("MAIL FROM:<probe@redmesh.local>")
+        code_from, _ = smtp.docmd(f"MAIL FROM:<probe@{identity}>")
         if code_from == 250:
           code_rcpt, _ = smtp.docmd("RCPT TO:<probe@external-domain.test>")
           if code_rcpt == 250:
