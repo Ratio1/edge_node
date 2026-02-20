@@ -218,7 +218,7 @@ class _DeeployMixin:
         self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
         try:
           save_result = self.save_job_pipeline_in_cstore(pipeline, job_id)
-          self.P(f"Pipeline saved in CSTORE: {save_result}")
+          self.P(f"Pipeline CID saved in CSTORE: {save_result}", color='r' if not save_result else None)
         except Exception as e:
           self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
       # endif addr is valid
@@ -600,8 +600,8 @@ class _DeeployMixin:
     done = False if len(response_keys) > 0 else True
     start_time = self.time()
 
-    self.Pd("Waiting for responses from nodes...")
-    self.Pd(f"Response keys to wait for: {self.json_dumps(response_keys, indent=2)}")
+    self.P(f"Waiting for responses from {len(response_keys)} plugin instances...")
+    self.P(f"Response keys to wait for: {self.json_dumps(response_keys, indent=2)}")
 
     if len(response_keys) == 0:
       str_status = DEEPLOY_STATUS.COMMAND_DELIVERED
@@ -611,8 +611,8 @@ class _DeeployMixin:
       current_time = self.time()
       if current_time - start_time > timeout_seconds:
         str_status = DEEPLOY_STATUS.TIMEOUT
-        self.P(f"Timeout reached ({timeout_seconds} seconds) while waiting for responses. Current status: {self.json_dumps(dct_status, indent=2)}")
-        self.P(f"Response keys: {self.json_dumps(response_keys, indent=2)}")
+        self.P(f"Timeout reached ({timeout_seconds} seconds) while waiting for responses. Current status: {self.json_dumps(dct_status, indent=2)}", color='r')
+        self.P(f"Response keys: {self.json_dumps(response_keys, indent=2)}", color='r')
         break
         
       for node_addr, response_keys_list in response_keys.items():

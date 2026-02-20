@@ -21,7 +21,6 @@ from .deeploy_const import (
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
 DEEPLOY_REQUESTS_CSTORE_HKEY = "DEEPLOY_REQUESTS"
-DEEPLOY_REQUESTS_MAX_RECORDS = 1
 
 __VER__ = '0.6.0'
 
@@ -41,6 +40,7 @@ _CONFIG = {
   'PIPELINES_CHECK_DELAY' : 300,
   'MIN_ETH_BALANCE' : 0.00005,
   'REQUESTS_LOG_INTERVAL' : 5 * 60,
+  'REQUESTS_MAX_RECORDS' : 2,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -86,7 +86,7 @@ class DeeployManagerApiPlugin(
       )
       self.maybe_stop_tunnel_engine()
     # Request tracking state
-    self.__recent_requests = self.deque(maxlen=DEEPLOY_REQUESTS_MAX_RECORDS)
+    self.__recent_requests = self.deque(maxlen=self.cfg_requests_max_records)
     self.__last_requests_log_time = 0
     return
 
@@ -132,8 +132,6 @@ class DeeployManagerApiPlugin(
     """
     try:
       request_id = response.get('id')
-      self.Pd(f"[on_response]: method={method} | response={self.json_dumps(response)}")
-      self.Pd(f"Recent requests: {self.json_dumps(list(self.__recent_requests))}")
       for record in self.__recent_requests:
         if record.get('id') == request_id:
           record['date_complete'] = self.datetime.now(self.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
@@ -459,10 +457,15 @@ class DeeployManagerApiPlugin(
         if (dct_status is not None and is_confirmable_job and len(confirmation_nodes) == len(dct_status)) or not is_confirmable_job:
           eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in confirmation_nodes]
           eth_nodes = sorted(eth_nodes)
-          self.bc.submit_node_update(
-            job_id=job_id,
-            nodes=eth_nodes,
-          )
+          try:
+            self.P("Submitting blockchain update for job {} with nodes: {}".format(job_id, eth_nodes))
+            self.bc.submit_node_update(
+              job_id=job_id,
+              nodes=eth_nodes,
+            )
+          except Exception as e:
+            self.P(f"An error occurred while submitting node update for job {job_id}: {e}", color='r')
+            raise e
         #endif
       #endif
 
