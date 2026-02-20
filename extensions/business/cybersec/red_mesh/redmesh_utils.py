@@ -73,6 +73,10 @@ class PentestLocalWorker(
     enabled_features=None,
     scan_min_delay: float = 0.0,
     scan_max_delay: float = 0.0,
+    ics_safe_mode: bool = True,
+    rate_limit_enabled: bool = True,
+    scanner_identity: str = "probe.redmesh.local",
+    scanner_user_agent: str = "",
   ):
     """
     Initialize a pentest worker with target ports and exclusions.
@@ -101,6 +105,14 @@ class PentestLocalWorker(
       Minimum random delay (seconds) between operations (Dune sand walking).
     scan_max_delay : float, optional
       Maximum random delay (seconds) between operations (Dune sand walking).
+    ics_safe_mode : bool, optional
+      Halt probing when ICS/SCADA indicators are detected.
+    rate_limit_enabled : bool, optional
+      Enforce minimum 100ms delay between probes when sand walking is disabled.
+    scanner_identity : str, optional
+      EHLO domain for SMTP probes.
+    scanner_user_agent : str, optional
+      HTTP User-Agent header for web probes.
 
     Raises
     ------
@@ -125,6 +137,11 @@ class PentestLocalWorker(
     self.owner = owner
     self.scan_min_delay = scan_min_delay
     self.scan_max_delay = scan_max_delay
+    self.ics_safe_mode = ics_safe_mode
+    self._ics_detected = False
+    self.rate_limit_enabled = rate_limit_enabled
+    self.scanner_identity = scanner_identity
+    self.scanner_user_agent = scanner_user_agent
 
     self.P(f"Initializing pentest worker {self.local_worker_id} for target {self.target}...")
     # port handling
@@ -355,7 +372,10 @@ class PentestLocalWorker(
       True if stop was requested (should exit), False otherwise.
     """
     if self.scan_max_delay <= 0:
-      return False  # Delays disabled
+      if self.rate_limit_enabled:
+        time.sleep(0.1)  # Minimum 100ms between probes
+        return self.stop_event.is_set()
+      return False  # Delays disabled, no rate limit
     delay = random.uniform(self.scan_min_delay, self.scan_max_delay)
     time.sleep(delay)
     # TODO: while elapsed < delay with sleep(0.1) could be used for more granular interruptible sleep
@@ -652,6 +672,36 @@ class PentestLocalWorker(
     self.P(f"Fingerprinting complete: {port_protocols}")
 
 
+  def _is_ics_finding(self, probe_result):
+    """
+    Check if a probe result contains ICS/SCADA indicators.
+
+    Parameters
+    ----------
+    probe_result : dict
+      Structured result from a service probe.
+
+    Returns
+    -------
+    bool
+      True if ICS keywords are found in any finding.
+    """
+    if not isinstance(probe_result, dict):
+      return False
+    for finding in probe_result.get("findings", []):
+      title = (finding.get("title") or "").lower()
+      evidence = (finding.get("evidence") or "").lower()
+      combined = title + " " + evidence
+      ics_keywords = [
+        "modbus", "siemens", "simatic", "plc", "scada",
+        "schneider", "allen-bradley", "bacnet", "dnp3",
+        "iec 61850", "iec61850", "profinet", "s7comm",
+      ]
+      if any(kw in combined for kw in ics_keywords):
+        return True
+    return False
+
+
   def _gather_service_info(self):
     """
     Gather banner or basic information from each newly open port.
@@ -690,6 +740,24 @@ class PentestLocalWorker(
           self.state["service_info"][port][method] = info
           method_info.append(f"{method}: {port}: {info}")
 
+          # ICS Safe Mode: halt further probes if ICS detected
+          if self.ics_safe_mode and not self._ics_detected and self._is_ics_finding(info):
+            self._ics_detected = True
+            self.P(f"ICS device detected on {target}:{port} — halting aggressive probes (ICS Safe Mode)")
+            from .findings import Finding, Severity, probe_result as _pr
+            ics_halt = _pr(findings=[Finding(
+              severity=Severity.HIGH,
+              title="ICS device detected — scan halted (ICS Safe Mode)",
+              description=f"Industrial control system indicators found on {target}:{port}. "
+                          "Further probing halted to prevent potential disruption.",
+              evidence=f"Triggered by probe {method} on port {port}",
+              remediation="Isolate ICS devices on dedicated OT networks.",
+              cwe_id="CWE-284",
+              confidence="firm",
+            )])
+            self.state["service_info"][port]["_ics_safe_halt"] = ics_halt
+            break  # Stop the method loop — no more probes on this target
+
         # Dune sand walking - random delay before each service probe
         if self._interruptible_sleep():
           return  # Stop was requested during sleep
@@ -701,6 +769,10 @@ class PentestLocalWorker(
           f"Method {method} findings:\n{json.dumps(method_info, indent=2)}"
         )
       self.state["completed_tests"].append(method)
+
+      # ICS Safe Mode: break outer loop if ICS was detected
+      if self._ics_detected:
+        break
     # end for each method
     return aggregated_info
 
