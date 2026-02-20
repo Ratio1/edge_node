@@ -21,7 +21,7 @@ from .deeploy_const import (
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
 DEEPLOY_REQUESTS_CSTORE_HKEY = "DEEPLOY_REQUESTS"
-DEEPLOY_REQUESTS_MAX_RECORDS = 5
+DEEPLOY_REQUESTS_MAX_RECORDS = 1
 
 __VER__ = '0.6.0'
 
@@ -93,7 +93,7 @@ class DeeployManagerApiPlugin(
 
   def on_request(self, request):
     """
-    Hook called when a new request arrives from the FastAPI side.
+    Hook called when a new request arrives from the FastAPI side (monitor thread).
     Captures minimal request metadata and writes the last N records to cstore.
 
     Parameters
@@ -104,19 +104,49 @@ class DeeployManagerApiPlugin(
     """
     try:
       value = request.get('value')
+      request_id = request.get('id')
       endpoint = value[0] if isinstance(value, (list, tuple)) and len(value) > 0 else 'unknown'
       record = {
-        'ts': self.datetime.now(self.timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        'id': request_id,
         'endpoint': endpoint,
+        'date_start': self.datetime.now(self.timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
+        'date_complete': None,
       }
       self.__recent_requests.append(record)
-      self.chainstore_hset(
-        hkey=DEEPLOY_REQUESTS_CSTORE_HKEY,
-        key=self.ee_id,
-        value=list(self.__recent_requests),
-      )
+      self._save_requests_to_cstore()
     except Exception as e:
       self.P(f"Error tracking request in cstore: {e}", color='r')
+    return
+
+
+  def on_response(self, method, response):
+    """
+    Hook called before the response is sent back to the FastAPI side (main thread).
+
+    Parameters
+    ----------
+    method : str
+        The endpoint name that was called.
+    response : dict
+        Response dict with 'id' and 'value' keys.
+    """
+    try:
+      request_id = response.get('id')
+      for record in self.__recent_requests:
+        if record.get('id') == request_id:
+          record['date_complete'] = self.datetime.now(self.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
+          self._save_requests_to_cstore()
+          break
+    except Exception as e:
+      self.P(f"Error tracking response in cstore: {e}", color='r')
+    return
+
+  def _save_requests_to_cstore(self):
+    self.chainstore_hset(
+      hkey=DEEPLOY_REQUESTS_CSTORE_HKEY,
+      key=self.ee_id,
+      value=list(self.__recent_requests),
+    )
     return
 
 
