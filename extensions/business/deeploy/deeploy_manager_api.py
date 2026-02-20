@@ -132,6 +132,8 @@ class DeeployManagerApiPlugin(
     """
     try:
       request_id = response.get('id')
+      self.Pd(f"[on_response]: method={method} | response={self.json_dumps(response)}")
+      self.Pd(f"Recent requests: {self.json_dumps(list(self.__recent_requests))}")
       for record in self.__recent_requests:
         if record.get('id') == request_id:
           record['date_complete'] = self.datetime.now(self.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
