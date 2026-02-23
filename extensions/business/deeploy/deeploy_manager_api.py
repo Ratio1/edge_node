@@ -60,12 +60,13 @@ class DeeployManagerApiPlugin(
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
   """
   CONFIG = _CONFIG
-  
 
   def __init__(self, **kwargs):
     super(DeeployManagerApiPlugin, self).__init__(**kwargs)
     return
 
+  def check_debug_logging_enabled(self):
+    return self.cfg_deeploy_verbose or super(DeeployManagerApiPlugin, self).check_debug_logging_enabled()
 
   def on_init(self):
     super(DeeployManagerApiPlugin, self).on_init()
