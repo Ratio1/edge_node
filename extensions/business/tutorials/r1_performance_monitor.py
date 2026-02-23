@@ -40,6 +40,7 @@ _CONFIG = {
   'PERF_HKEY': 'r1_perf_monitor',
   'PAYLOAD_SIZES': [10, 100, 1024, 10240, 102400],
   'BURST_COUNT': 20,
+  'DEBUG': True,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -79,7 +80,7 @@ class R1PerformanceMonitorPlugin(BasePlugin):
     start = self.time()
     success = False
     try:
-      result = self.chainstore_set(key=key, value=value)
+      result = self.chainstore_set(key=key, value=value, debug=self.cfg_debug)
       success = bool(result)
     except Exception as e:
       self.P(f"chainstore_set error: {e}", color='r')
@@ -97,7 +98,7 @@ class R1PerformanceMonitorPlugin(BasePlugin):
     success = False
     value = None
     try:
-      value = self.chainstore_get(key=key)
+      value = self.chainstore_get(key=key, debug=self.cfg_debug)
       success = value is not None
     except Exception as e:
       self.P(f"chainstore_get error: {e}", color='r')
@@ -114,7 +115,7 @@ class R1PerformanceMonitorPlugin(BasePlugin):
     start = self.time()
     success = False
     try:
-      result = self.chainstore_hset(hkey=hkey, key=key, value=value)
+      result = self.chainstore_hset(hkey=hkey, key=key, value=value, debug=self.cfg_debug)
       success = bool(result)
     except Exception as e:
       self.P(f"chainstore_hset error: {e}", color='r')
@@ -131,7 +132,7 @@ class R1PerformanceMonitorPlugin(BasePlugin):
     start = self.time()
     success = False
     try:
-      value = self.chainstore_hget(hkey=hkey, key=key)
+      value = self.chainstore_hget(hkey=hkey, key=key, debug=self.cfg_debug)
       success = value is not None
     except Exception as e:
       self.P(f"chainstore_hget error: {e}", color='r')
@@ -148,7 +149,7 @@ class R1PerformanceMonitorPlugin(BasePlugin):
     success = False
     result_data = None
     try:
-      result_data = self.chainstore_hgetall(hkey=hkey)
+      result_data = self.chainstore_hgetall(hkey=hkey, debug=self.cfg_debug)
       success = result_data is not None
     except Exception as e:
       self.P(f"chainstore_hgetall error: {e}", color='r')
@@ -221,7 +222,7 @@ class R1PerformanceMonitorPlugin(BasePlugin):
     key = f"perf_r_{self.uuid(8)}"
     value = f"test_value_{self.uuid(8)}"
     # Write first (untimed for this experiment)
-    self.chainstore_set(key=key, value=value)
+    self.chainstore_set(key=key, value=value, debug=self.cfg_debug)
     # Timed read
     op = self._timed_chainstore_get(key)
     return self._make_result_envelope('read_latency', [op])
@@ -471,7 +472,7 @@ class R1PerformanceMonitorPlugin(BasePlugin):
       'node_id': self.node_id,
       'node_addr': self.node_addr,
     }
-    self.chainstore_hset(hkey=hkey, key=beacon_key, value=beacon_value)
+    self.chainstore_hset(hkey=hkey, key=beacon_key, value=beacon_value, debug=self.cfg_debug)
 
     # Run background experiment if enabled
     if self.__background_enabled and self.__auto_experiment_types:
