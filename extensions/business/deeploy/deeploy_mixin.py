@@ -2570,6 +2570,133 @@ class _DeeployMixin:
         app_data["node_alias"] = node_alias
     return result
 
+  def _pipeline_matches_project_id(self, pipeline, project_id):
+    """
+    Validate whether a raw pipeline payload belongs to a given project.
+    """
+    if project_id is None:
+      return True
+    if not isinstance(pipeline, dict):
+      return False
+
+    deeploy_specs = (
+      pipeline.get(ct.CONFIG_STREAM.DEEPLOY_SPECS, None) or
+      pipeline.get(NetMonCt.DEEPLOY_SPECS, None) or
+      pipeline.get("DEEPLOY_SPECS", None) or
+      pipeline.get("deeploy_specs", None)
+    )
+    if not isinstance(deeploy_specs, dict):
+      return False
+    return deeploy_specs.get(DEEPLOY_KEYS.PROJECT_ID, None) == project_id
+
+  def _normalize_active_job_ids(self, active_job_ids):
+    """
+    Normalize and deduplicate active job IDs returned by blockchain calls.
+    """
+    normalized_job_ids = []
+    seen = set()
+
+    if not isinstance(active_job_ids, list):
+      return normalized_job_ids
+
+    for raw_job_id in active_job_ids:
+      try:
+        parsed_job_id = int(raw_job_id)
+      except Exception:
+        self.Pd(f"Skipping invalid active job id '{raw_job_id}' returned by blockchain.", color='y')
+        continue
+
+      if parsed_job_id in seen:
+        continue
+      seen.add(parsed_job_id)
+      normalized_job_ids.append(parsed_job_id)
+
+    return normalized_job_ids
+
+  def _get_apps_by_escrow_active_jobs(self, sender_escrow=None, owner=None, project_id=None):
+    """
+    Build get_apps payload using active SC job IDs as source of truth, with optional online snapshots.
+
+    Response shape:
+      {
+        "<job_id>": {
+          "job_id": <int>,
+          "pipeline_cid": <str|None>,
+          "pipeline": <dict|None>,   # raw R1FS payload
+          "online": <dict>,          # online apps snapshot keyed by node
+        }
+      }
+    """
+    result = {}
+    if not sender_escrow:
+      return result
+
+    raw_active_job_ids = self.bc.get_escrow_active_job_ids(sender_escrow)
+    active_job_ids = self._normalize_active_job_ids(raw_active_job_ids)
+    self.Pd(f"Escrow {sender_escrow} active job ids: {active_job_ids}")
+
+    for job_id in active_job_ids:
+      online_apps = self._get_online_apps(
+        owner=owner,
+        job_id=job_id,
+        project_id=project_id
+      )
+      if not isinstance(online_apps, dict):
+        online_apps = {}
+      else:
+        normalized_online_apps = {}
+        for node, apps in online_apps.items():
+          if not isinstance(apps, dict):
+            self.Pd(f"Skipping malformed online apps payload for node {node}.", color='y')
+            continue
+          normalized_online_apps[node] = dict(apps)
+        online_apps = normalized_online_apps
+
+      pipeline_cid = None
+      pipeline = None
+      try:
+        pipeline_cid = self._get_pipeline_from_cstore(job_id)
+        if pipeline_cid:
+          pipeline = self.get_pipeline_from_r1fs(pipeline_cid)
+      except Exception as exc:
+        self.Pd(f"Failed to load R1FS payload for job {job_id}: {exc}", color='y')
+        pipeline = None
+        pipeline_cid = None
+
+      if pipeline is not None and owner is not None:
+        pipeline_owner = (
+          pipeline.get(ct.CONFIG_STREAM.K_OWNER, None) or
+          pipeline.get(NetMonCt.OWNER, None) or
+          pipeline.get("OWNER", None) or
+          pipeline.get("owner", None)
+        )
+        if pipeline_owner is not None and pipeline_owner != owner:
+          self.Pd(
+            f"Skipping R1FS payload for job {job_id}: owner mismatch "
+            f"(expected {owner}, got {pipeline_owner}).",
+            color='y'
+          )
+          pipeline = None
+          pipeline_cid = None
+
+      if pipeline is not None and project_id is not None and not self._pipeline_matches_project_id(pipeline, project_id):
+        self.Pd(f"Skipping R1FS payload for job {job_id}: project_id mismatch.", color='y')
+        pipeline = None
+        pipeline_cid = None
+
+      if pipeline is None and len(online_apps) == 0 and project_id is not None:
+        # If a project filter is requested and neither source matches, skip this job.
+        continue
+
+      result[str(job_id)] = {
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.PIPELINE_CID: pipeline_cid if pipeline is not None else None,
+        DEEPLOY_KEYS.PIPELINE: pipeline if pipeline is not None else None,
+        DEEPLOY_KEYS.ONLINE: online_apps,
+      }
+
+    return result
+
   # TODO: REMOVE THIS, once instance_id is coming from ui for instances that have to be updated
   # Maybe add is_new_instance:bool for native apps, that want to add an extra plugin
   def _ensure_plugin_instance_ids(self, inputs, discovered_plugin_instances, owner=None, app_id=None, job_id=None):
