@@ -10,6 +10,7 @@ from .deeploy_job_mixin import _DeeployJobMixin
 from .deeploy_mixin import _DeeployMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
+from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
 from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
@@ -19,8 +20,6 @@ from .deeploy_const import (
   
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
-
-DEEPLOY_REQUESTS_CSTORE_HKEY = "DEEPLOY_REQUESTS"
 
 __VER__ = '0.6.0'
 
@@ -39,6 +38,8 @@ _CONFIG = {
   'WARMUP_DELAY' : 300,
   'PIPELINES_CHECK_DELAY' : 300,
   'MIN_ETH_BALANCE' : 0.00005,
+
+  'REQUESTS_CSTORE_HKEY': 'DEEPLOY_REQUESTS',
   'REQUESTS_LOG_INTERVAL' : 5 * 60,
   'REQUESTS_MAX_RECORDS' : 2,
 
@@ -55,6 +56,7 @@ class DeeployManagerApiPlugin(
   _DeeployTargetNodesMixin,
   _NodeTagsMixin,
   _DeeployJobMixin,
+  _RequestTrackingMixin,
   ):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
@@ -86,68 +88,16 @@ class DeeployManagerApiPlugin(
         color='r', boxed=True
       )
       self.maybe_stop_tunnel_engine()
-    # Request tracking state
-    self.__recent_requests = self.deque(maxlen=self.cfg_requests_max_records)
-    self.__last_requests_log_time = 0
+    self._init_request_tracking()
     return
 
 
   def on_request(self, request):
-    """
-    Hook called when a new request arrives from the FastAPI side (monitor thread).
-    Captures minimal request metadata and writes the last N records to cstore.
-
-    Parameters
-    ----------
-    request : dict
-        Raw request payload pulled from the server queue.
-        Structure: {'id': str, 'value': tuple, 'profile': dict|None}
-    """
-    try:
-      value = request.get('value')
-      request_id = request.get('id')
-      endpoint = value[0] if isinstance(value, (list, tuple)) and len(value) > 0 else 'unknown'
-      record = {
-        'id': request_id,
-        'endpoint': endpoint,
-        'date_start': self.datetime.now(self.timezone.utc).strftime('%Y-%m-%d %H:%M:%S'),
-        'date_complete': None,
-      }
-      self.__recent_requests.append(record)
-      self._save_requests_to_cstore()
-    except Exception as e:
-      self.P(f"Error tracking request in cstore: {e}", color='r')
+    self._track_request(request)
     return
-
 
   def on_response(self, method, response):
-    """
-    Hook called before the response is sent back to the FastAPI side (main thread).
-
-    Parameters
-    ----------
-    method : str
-        The endpoint name that was called.
-    response : dict
-        Response dict with 'id' and 'value' keys.
-    """
-    try:
-      request_id = response.get('id')
-      for record in self.__recent_requests:
-        if record.get('id') == request_id:
-          record['date_complete'] = self.datetime.now(self.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-          self._save_requests_to_cstore()
-          break
-    except Exception as e:
-      self.P(f"Error tracking response in cstore: {e}", color='r')
-    return
-
-  def _save_requests_to_cstore(self):
-    self.chainstore_hset(
-      hkey=DEEPLOY_REQUESTS_CSTORE_HKEY,
-      key=self.ee_id,
-      value=list(self.__recent_requests),
-    )
+    self._track_response(method, response)
     return
 
 
@@ -1117,17 +1067,5 @@ class DeeployManagerApiPlugin(
         self.P(f"Error checking running pipelines: {e}", color='r')
       self.__last_pipelines_check_time = self.time()
 
-    # Periodic dump of all nodes' recent requests from cstore
-    if (self.time() - self.__last_requests_log_time) > self.cfg_requests_log_interval:
-      try:
-        all_requests = self.chainstore_hgetall(hkey=DEEPLOY_REQUESTS_CSTORE_HKEY)
-        if all_requests:
-          self.P(f"Deeploy requests across all nodes:\n{self.json_dumps(all_requests, indent=2)}")
-        else:
-          self.P("Deeploy requests across all nodes: no data")
-      except Exception as e:
-        self.P(f"Error dumping deeploy requests from cstore: {e}", color='r')
-      # end try
-      self.__last_requests_log_time = self.time()
-    # end if
+    self._maybe_log_tracked_requests()
     return
