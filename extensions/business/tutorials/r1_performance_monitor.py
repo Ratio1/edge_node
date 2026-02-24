@@ -34,7 +34,7 @@ _CONFIG = {
   'ALLOW_EMPTY_INPUTS': True,
   'PROCESS_DELAY': 30,
 
-  'BACKGROUND_EXPERIMENTS_ENABLED': True,
+  'BACKGROUND_EXPERIMENTS_ENABLED': False,
   'AUTO_EXPERIMENT_TYPES': ['write_latency', 'read_latency', 'round_trip', 'hash_ops'],
   'MAX_RESULTS': 1000,
   'PERF_HKEY': 'r1_perf_monitor',
@@ -324,8 +324,11 @@ class R1PerformanceMonitorPlugin(BasePlugin):
       whitelist_peers = list(self.bc.get_whitelist(with_prefix=True))
     except Exception:
       whitelist_peers = []
+    # Check online status for all candidate peers (configured + whitelist)
+    all_candidates = set(configured_peers) | set(whitelist_peers)
+    all_candidates.discard(self_addr)
     online_peers = []
-    for peer in whitelist_peers:
+    for peer in all_candidates:
       try:
         if self.netmon.network_node_is_online(peer):
           online_peers.append(peer)
@@ -341,7 +344,7 @@ class R1PerformanceMonitorPlugin(BasePlugin):
       'self_alias': self.node_id,
       'configured_peers': configured_peers,
       'whitelist_peers': whitelist_peers,
-      'online_peers': online_peers,
+      'online_peers': sorted(online_peers),
       'effective_peers': effective_peers,
       'total_effective': total_effective,
       'min_confirmations': total_effective // 2 + 1,
@@ -464,7 +467,10 @@ class R1PerformanceMonitorPlugin(BasePlugin):
   # ---- Background loop ----
 
   def process(self):
-    # Always write cross-node beacon
+    if not self.__background_enabled:
+      return
+
+    # Write cross-node beacon
     hkey = self.cfg_perf_hkey
     beacon_key = f"beacon_{self.node_addr}"
     beacon_value = {
@@ -475,7 +481,7 @@ class R1PerformanceMonitorPlugin(BasePlugin):
     self.chainstore_hset(hkey=hkey, key=beacon_key, value=beacon_value, debug=self.cfg_debug)
 
     # Run background experiment if enabled
-    if self.__background_enabled and self.__auto_experiment_types:
+    if self.__auto_experiment_types:
       exp_type = self.__auto_experiment_types[self.__experiment_index % len(self.__auto_experiment_types)]
       self.__experiment_index += 1
       method_name = EXPERIMENT_DISPATCH.get(exp_type)
