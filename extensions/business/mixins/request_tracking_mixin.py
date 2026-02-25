@@ -1,6 +1,5 @@
 DEFAULT_REQUESTS_MAX_RECORDS = 2
 DEFAULT_REQUESTS_LOG_INTERVAL = 5 * 60  # 300 seconds
-DEFAULT_QUEUE_LOG_INTERVAL = 30  # seconds
 
 
 class _RequestTrackingMixin(object):
@@ -14,7 +13,6 @@ class _RequestTrackingMixin(object):
     REQUESTS_CSTORE_HKEY : str or None  -- chainstore hash key (None = disabled)
     REQUESTS_MAX_RECORDS : int          -- max recent requests in deque (default 2)
     REQUESTS_LOG_INTERVAL : int         -- seconds between cross-node log dumps (default 300)
-    QUEUE_LOG_INTERVAL : int            -- seconds between queue status logs (default 30)
   """
 
   @property
@@ -32,13 +30,6 @@ class _RequestTrackingMixin(object):
     return val
 
   @property
-  def __rt_queue_log_interval(self):
-    val = getattr(self, 'cfg_queue_log_interval', None)
-    if not isinstance(val, (int, float)) or val <= 0:
-      return DEFAULT_QUEUE_LOG_INTERVAL
-    return val
-
-  @property
   def __rt_cstore_hkey(self):
     return getattr(self, 'cfg_requests_cstore_hkey', None)
 
@@ -46,7 +37,6 @@ class _RequestTrackingMixin(object):
     """Call from on_init(). Initializes tracking state if enabled."""
     self.__rt_recent_requests = None
     self.__rt_last_log_time = 0
-    self.__rt_last_queue_log_time = 0
     self.__rt_dirty = False
     if self.__rt_cstore_hkey:
       self.__rt_recent_requests = self.deque(maxlen=self.__rt_max_records)
@@ -54,9 +44,7 @@ class _RequestTrackingMixin(object):
 
   def _track_request(self, request):
     """
-    Called from on_request (monitor thread). Records request start and
-    periodically logs queue status. Since this runs on the monitor thread
-    it fires even when process() is starved by a backed-up queue.
+    Called from on_request (monitor thread). Records request start.
 
     NOTE: does NOT write to chainstore — only appends to the in-memory deque
     and marks it dirty. The actual chainstore write is deferred to
@@ -79,7 +67,6 @@ class _RequestTrackingMixin(object):
       self.__rt_dirty = True
     except Exception as e:
       self.P(f"Error tracking request in cstore: {e}", color='r')
-    self.__rt_maybe_log_queue_status()
     return
 
   def _track_response(self, method, response):
@@ -105,33 +92,12 @@ class _RequestTrackingMixin(object):
       hkey=self.__rt_cstore_hkey,
       key=self.ee_id,
       value=list(self.__rt_recent_requests),
+      debug=True
     )
     self.__rt_dirty = False
     return
 
-  def __rt_maybe_log_queue_status(self):
-    """
-    Periodically log incoming queue depth. Runs from the monitor thread
-    (inside _track_request) so it fires even when process() is starved.
-    """
-    now = self.time()
-    if (now - self.__rt_last_queue_log_time) < self.__rt_queue_log_interval:
-      return
-    self.__rt_last_queue_log_time = now
-    try:
-      incoming = getattr(self, '_incoming_requests', None)
-      queue_depth = len(incoming) if incoming is not None else '?'
-      postponed = getattr(self, 'postponed_requests', None)
-      postponed_depth = len(postponed) if postponed is not None else '?'
-      self.P(
-        f"[QueueStatus] incoming={queue_depth} | postponed={postponed_depth} | "
-        f"tracked={len(self.__rt_recent_requests)}"
-      )
-    except Exception as e:
-      self.P(f"Error logging queue status: {e}", color='r')
-    return
-
-  def _maybe_log_tracked_requests(self):
+  def _maybe_log_and_save_tracked_requests(self):
     """Call from process() (main thread). Flushes dirty data and periodically logs cross-node request data."""
     if self.__rt_recent_requests is None:
       return
