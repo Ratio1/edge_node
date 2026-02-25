@@ -1399,5 +1399,5 @@ class DeeployManagerApiPlugin(
         self.P(f"Error checking running pipelines: {e}", color='r')
       self.__last_pipelines_check_time = self.time()
 
-    self._maybe_log_tracked_requests()
+    self._maybe_log_and_save_tracked_requests()
     return
