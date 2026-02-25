@@ -458,7 +458,7 @@ class DeeployManagerApiPlugin(
         pending_state = {
           'kind': 'pipeline',
           'response_keys': response_keys,
-          'dct_status': {},
+          'dct_status': dct_status,
           'start_time': self.time(),
           'timeout': self.cfg_request_timeout,
           'next_check_ts': self.time() + self.cfg_postponed_poll_interval,
