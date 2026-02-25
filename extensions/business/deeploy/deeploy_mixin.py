@@ -194,6 +194,7 @@ class _DeeployMixin:
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
+    saved_pipeline = None
     for addr, node_plugins in node_plugins_by_addr.items():
       msg = ''
       if self.cfg_deeploy_verbose > 1:
@@ -202,7 +203,7 @@ class _DeeployMixin:
 
       if addr is not None:
 
-        pipeline = self.cmdapi_start_pipeline_by_params(
+        saved_pipeline = self.cmdapi_start_pipeline_by_params(
           name=app_id,
           app_alias=app_alias,
           pipeline_type=app_type,
@@ -215,14 +216,15 @@ class _DeeployMixin:
           **pipeline_kwargs,
         )
 
-        self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
-        try:
-          save_result = self.save_job_pipeline_in_cstore(pipeline, job_id)
-          self.P(f"Pipeline CID saved in CSTORE: {save_result}", color='r' if not save_result else None)
-        except Exception as e:
-          self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
       # endif addr is valid
     # endfor each target node
+
+    self.Pd(f"Pipeline started: {self.json_dumps(saved_pipeline)}")
+    try:
+      save_result = self.save_job_pipeline_in_cstore(saved_pipeline, job_id)
+      self.P(f"Pipeline CID saved in CSTORE: {save_result}", color='r' if not save_result else None)
+    except Exception as e:
+      self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
 
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
     return cleaned_response_keys
@@ -644,12 +646,25 @@ class _DeeployMixin:
     done = False if len(response_keys) > 0 else True
     start_time = self.time()
 
-    self.P(f"Waiting for responses from {len(response_keys)} plugin instances...")
     self.P(f"Response keys to wait for: {self.json_dumps(response_keys, indent=2)}")
 
     if len(response_keys) == 0:
       str_status = DEEPLOY_STATUS.COMMAND_DELIVERED
       return dct_status, str_status
+
+    # Reset Response Keys
+    self.P("Resetting response keys in chainstore before waiting for new responses...")
+    for _, node_response_keys in response_keys.items():
+      for response_key in node_response_keys:
+        try:
+          self.chainstore_set(response_key, None)
+        except Exception as e:
+          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
+        # end try
+      # end for
+    # end for
+
+    self.P(f"Waiting for responses from {len(response_keys)} plugin instances...")
 
     while not done:
       current_time = self.time()
