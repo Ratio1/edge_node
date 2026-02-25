@@ -167,3 +167,30 @@ Entry format:
 - Details: Updated Hard Rules and BUILDER-CRITIC Step 4 to enforce critical/horizontal-only logging; removed non-critical historical entries (`ML-20260211-001`, `ML-20260211-004`, `ML-20260211-005`, `ML-20260211-006`, `ML-20260211-007`, `ML-20260211-008`) per owner request.
 - Verification: `rg -n "critical-only|ballast|Criticality|ML-20260211-00[1245678]|ML-20260212-009" AGENTS.md`; `sed -n '1,260p' AGENTS.md`
 - Links: `AGENTS.md`
+
+- ID: `ML-20260224-001`
+- Timestamp: `2026-02-24T00:50:16Z`
+- Type: `change`
+- Summary: Refactored Deeploy manager endpoints to use PostponedRequest polling instead of blocking waits.
+- Criticality: Operational/runtime behavior change; long-running deploy endpoints no longer block the main plugin loop.
+- Details: Added non-blocking response checks in deeploy mixin, deferred blockchain confirmations to postponed solver, and converted create/update/scale-up endpoints to return PostponedRequest while tracking pending state and timeouts.
+- Verification: Not run (not requested).
+- Links: `extensions/business/deeploy/deeploy_manager_api.py`, `extensions/business/deeploy/deeploy_mixin.py`
+
+- ID: `ML-20260224-002`
+- Timestamp: `2026-02-24T13:22:52Z`
+- Type: `change`
+- Summary: Restored blockchain update submissions for non-confirmable deeploy operations in async path.
+- Criticality: Operational correctness for blockchain state updates when chainstore confirmations are disabled.
+- Details: When response keys are absent, async create/update now submits node updates for non-confirmable jobs; scale-up submits confirmations using combined new/update nodes. Tests adjusted to override the mangled balance-check method without touching production behavior.
+- Verification: Not run (not requested).
+- Links: `extensions/business/deeploy/deeploy_manager_api.py`, `extensions/business/deeploy/test_deeploy.py`
+
+- ID: `ML-20260224-003`
+- Timestamp: `2026-02-24T14:01:46Z`
+- Type: `change`
+- Summary: Fixed pending deeploy timeout cleanup and scale-up confirmation node extraction.
+- Criticality: Correctness in deferred deploy processing and confirmation logic.
+- Details: Timeout handler now uses pending_id from state and handles missing `now`; scale-up finalization extracts nodes from status entries safely.
+- Verification: Not run (not requested).
+- Links: `extensions/business/deeploy/deeploy_manager_api.py`
