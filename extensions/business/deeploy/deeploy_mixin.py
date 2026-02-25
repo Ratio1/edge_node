@@ -652,18 +652,6 @@ class _DeeployMixin:
       str_status = DEEPLOY_STATUS.COMMAND_DELIVERED
       return dct_status, str_status
 
-    # Reset Response Keys
-    self.P("Resetting response keys in chainstore before waiting for new responses...")
-    for _, node_response_keys in response_keys.items():
-      for response_key in node_response_keys:
-        try:
-          self.chainstore_set(response_key, None)
-        except Exception as e:
-          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
-        # end try
-      # end for
-    # end for
-
     self.P(f"Waiting for responses from {len(response_keys)} plugin instances...")
 
     while not done:
@@ -1863,6 +1851,18 @@ class _DeeployMixin:
       response_keys.update(new_response_keys)
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
+    # Reset Response Keys
+    self.P("Resetting response keys in chainstore before waiting for new responses...")
+    for _, node_response_keys in response_keys.items():
+      for response_key in node_response_keys:
+        try:
+          self.chainstore_set(response_key, None)
+        except Exception as e:
+          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
+        # end try
+      # end for
+    # end for
+
     if wait_for_responses:
       dct_status, str_status = self._get_pipeline_responses(response_keys, 300)
     else:
