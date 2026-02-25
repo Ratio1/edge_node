@@ -36,6 +36,7 @@ _CONFIG = {
   
   'DAUTH_VERBOSE' : False,
   'DAUTH_LOG_RESPONSE' : True,
+  'LOG_REQUESTS' : True,
   
   'REQUESTS_CSTORE_HKEY': 'DAUTH_REQUESTS',
   'REQUESTS_MAX_RECORDS': 2,
@@ -123,7 +124,7 @@ class DauthManagerPlugin(
     return
 
   def process(self):
-    self._maybe_log_tracked_requests()
+    self._maybe_log_and_save_tracked_requests()
     return
 
   def __get_current_epoch(self):

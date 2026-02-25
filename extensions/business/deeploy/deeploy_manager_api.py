@@ -34,7 +34,8 @@ _CONFIG = {
   'POSTPONED_POLL_INTERVAL': 0.5,
 
   'DEEPLOY_VERBOSE' : 10,
-  
+  'LOG_REQUESTS': True,
+
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   'WARMUP_DELAY' : 300,
   'PIPELINES_CHECK_DELAY' : 300,
@@ -1399,5 +1400,5 @@ class DeeployManagerApiPlugin(
         self.P(f"Error checking running pipelines: {e}", color='r')
       self.__last_pipelines_check_time = self.time()
 
-    self._maybe_log_tracked_requests()
+    self._maybe_log_and_save_tracked_requests()
     return

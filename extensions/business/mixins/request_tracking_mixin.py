@@ -37,13 +37,20 @@ class _RequestTrackingMixin(object):
     """Call from on_init(). Initializes tracking state if enabled."""
     self.__rt_recent_requests = None
     self.__rt_last_log_time = 0
+    self.__rt_dirty = False
     if self.__rt_cstore_hkey:
       self.__rt_recent_requests = self.deque(maxlen=self.__rt_max_records)
     return
 
-
   def _track_request(self, request):
-    """Called from the request processing flow. Records request start."""
+    """
+    Called from on_request (monitor thread). Records request start.
+
+    NOTE: does NOT write to chainstore — only appends to the in-memory deque
+    and marks it dirty. The actual chainstore write is deferred to
+    _track_response / _maybe_log_tracked_requests which run on the main thread,
+    avoiding timer corruption from concurrent thread access.
+    """
     if self.__rt_recent_requests is None:
       return
     try:
@@ -57,14 +64,13 @@ class _RequestTrackingMixin(object):
         'date_complete': None,
       }
       self.__rt_recent_requests.append(record)
-      self.__rt_save()
+      self.__rt_dirty = True
     except Exception as e:
       self.P(f"Error tracking request in cstore: {e}", color='r')
     return
 
-
   def _track_response(self, method, response):
-    """Called from the response processing flow. Stamps completion time."""
+    """Called from the response processing flow (main thread). Stamps completion time and flushes to chainstore."""
     if self.__rt_recent_requests is None:
       return
     try:
@@ -72,27 +78,31 @@ class _RequestTrackingMixin(object):
       for record in self.__rt_recent_requests:
         if record.get('id') == request_id:
           record['date_complete'] = self.datetime.now(self.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-          self.__rt_save()
+          self.__rt_dirty = True
           break
     except Exception as e:
       self.P(f"Error tracking response in cstore: {e}", color='r')
+    if self.__rt_dirty:
+      self.__rt_save()
     return
 
-
   def __rt_save(self):
-    """Write recent requests to chainstore."""
+    """Write recent requests to chainstore (main thread only)."""
     self.chainstore_hset(
       hkey=self.__rt_cstore_hkey,
       key=self.ee_id,
       value=list(self.__rt_recent_requests),
+      debug=True
     )
+    self.__rt_dirty = False
     return
 
-
-  def _maybe_log_tracked_requests(self):
-    """Call from process(). Periodically logs cross-node request data."""
+  def _maybe_log_and_save_tracked_requests(self):
+    """Call from process() (main thread). Flushes dirty data and periodically logs cross-node request data."""
     if self.__rt_recent_requests is None:
       return
+    if self.__rt_dirty:
+      self.__rt_save()
     if (self.time() - self.__rt_last_log_time) > self.__rt_log_interval:
       try:
         hkey = self.__rt_cstore_hkey
