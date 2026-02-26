@@ -2613,6 +2613,82 @@ class _DeeployMixin:
 
     return normalized_job_ids
 
+  def _normalize_active_jobs(self, active_jobs):
+    """
+    Normalize and deduplicate active job details returned by blockchain calls.
+    """
+    normalized_active_jobs = []
+    seen = set()
+
+    if not isinstance(active_jobs, list):
+      return normalized_active_jobs
+
+    for raw_job in active_jobs:
+      if not isinstance(raw_job, dict):
+        self.Pd(f"Skipping invalid active job payload '{raw_job}'.", color='y')
+        continue
+
+      raw_job_id = raw_job.get("jobId", raw_job.get("id", None))
+      try:
+        parsed_job_id = int(raw_job_id)
+      except Exception:
+        self.Pd(f"Skipping active job with invalid id '{raw_job_id}'.", color='y')
+        continue
+
+      if parsed_job_id in seen:
+        continue
+      seen.add(parsed_job_id)
+
+      normalized_active_jobs.append({
+        "job_id": parsed_job_id,
+        "raw": raw_job,
+      })
+
+    return normalized_active_jobs
+
+  def _serialize_chain_job(self, raw_job):
+    """
+    Serialize chain job details for JSON APIs, keeping bigint-like values as strings.
+    """
+    if not isinstance(raw_job, dict):
+      return None
+
+    active_nodes = raw_job.get("activeNodes", [])
+    if not isinstance(active_nodes, list):
+      active_nodes = []
+
+    serialized = {
+      "id": str(raw_job.get("jobId", raw_job.get("id", ""))),
+      "projectHash": raw_job.get("projectHash"),
+      "requestTimestamp": str(raw_job.get("requestTimestamp", 0)),
+      "startTimestamp": str(raw_job.get("startTimestamp", 0)),
+      "lastNodesChangeTimestamp": str(raw_job.get("lastNodesChangeTimestamp", 0)),
+      "jobType": str(raw_job.get("jobType", 0)),
+      "pricePerEpoch": str(raw_job.get("pricePerEpoch", 0)),
+      "lastExecutionEpoch": str(raw_job.get("lastExecutionEpoch", 0)),
+      "numberOfNodesRequested": str(raw_job.get("numberOfNodesRequested", 0)),
+      "balance": str(raw_job.get("balance", 0)),
+      "lastAllocatedEpoch": str(raw_job.get("lastAllocatedEpoch", 0)),
+      "activeNodes": [str(node) for node in active_nodes],
+      "network": raw_job.get("network"),
+      "escrowAddress": raw_job.get("escrowAddress"),
+    }
+    return serialized
+
+  def _chain_job_matches_project_id(self, chain_job, project_id):
+    """
+    Validate whether serialized chain job details belong to the provided project.
+    """
+    if project_id is None:
+      return True
+    if not isinstance(chain_job, dict):
+      return False
+
+    chain_project_id = chain_job.get("projectHash", None)
+    if chain_project_id is None:
+      return False
+    return str(chain_project_id).lower() == str(project_id).lower()
+
   def _get_apps_by_escrow_active_jobs(self, sender_escrow=None, owner=None, project_id=None):
     """
     Build get_apps payload using active SC job IDs as source of truth, with optional online snapshots.
@@ -2631,11 +2707,15 @@ class _DeeployMixin:
     if not sender_escrow:
       return result
 
-    raw_active_job_ids = self.bc.get_escrow_active_job_ids(sender_escrow)
-    active_job_ids = self._normalize_active_job_ids(raw_active_job_ids)
-    self.Pd(f"Escrow {sender_escrow} active job ids: {active_job_ids}")
+    raw_active_jobs = self.bc.get_escrow_active_jobs(sender_escrow)
+    active_jobs = self._normalize_active_jobs(raw_active_jobs)
+    self.Pd(f"Escrow {sender_escrow} active jobs: {[job['job_id'] for job in active_jobs]}")
 
-    for job_id in active_job_ids:
+    for active_job in active_jobs:
+      job_id = active_job["job_id"]
+      chain_job = self._serialize_chain_job(active_job.get("raw", {}))
+      chain_matches_project = self._chain_job_matches_project_id(chain_job, project_id)
+
       online_apps = self._get_online_apps(
         owner=owner,
         job_id=job_id,
@@ -2684,7 +2764,7 @@ class _DeeployMixin:
         pipeline = None
         pipeline_cid = None
 
-      if pipeline is None and len(online_apps) == 0 and project_id is not None:
+      if pipeline is None and len(online_apps) == 0 and project_id is not None and not chain_matches_project:
         # If a project filter is requested and neither source matches, skip this job.
         continue
 
@@ -2693,6 +2773,7 @@ class _DeeployMixin:
         DEEPLOY_KEYS.PIPELINE_CID: pipeline_cid if pipeline is not None else None,
         DEEPLOY_KEYS.PIPELINE: pipeline if pipeline is not None else None,
         DEEPLOY_KEYS.ONLINE: online_apps,
+        DEEPLOY_KEYS.CHAIN_JOB: chain_job,
       }
 
     return result
