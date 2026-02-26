@@ -1013,13 +1013,10 @@ class RedMeshOWASPTests(unittest.TestCase):
     self.assertEqual(result["vulnerabilities"], ["Crit vuln"])
 
   def test_probe_error_structure(self):
-    """probe_error returns correct structure."""
+    """probe_error returns None so failed probes are not stored."""
     from extensions.business.cybersec.red_mesh.findings import probe_error
     result = probe_error("host", 80, "TestProbe", Exception("oops"))
-    self.assertIn("error", result)
-    self.assertIn("TestProbe", result["error"])
-    self.assertIn("findings", result)
-    self.assertEqual(result["findings"], [])
+    self.assertIsNone(result)
 
   # ===== NEW TESTS — cve_db.py =====
 

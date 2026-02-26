@@ -577,7 +577,8 @@ class PentestLocalWorker(
             protocol = _WELL_KNOWN_PORTS.get(port, "ftp")
         elif text.startswith("RFB "):
           protocol = "vnc"
-        elif raw[0:1] == b'\x0a':
+        elif len(raw) >= 7 and raw[3:4] == b'\x00' and raw[4:5] == b'\x0a':
+          # MySQL greeting: 3-byte payload len + seq=0x00 + protocol version 0x0a + version string
           protocol = "mysql"
         elif "login:" in text.lower() or raw[0:1] == b'\xff':
           protocol = "telnet"
