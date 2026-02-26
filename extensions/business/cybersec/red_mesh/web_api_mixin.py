@@ -50,13 +50,6 @@ class _WebApiExposureMixin:
       self.P(f"GraphQL probe failed on {graphql_url}: {e}", color='y')
       return probe_error(target, port, "graphql", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="GraphQL introspection disabled or unreachable",
-        description=f"Introspection query at {graphql_url} did not return schema data.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)
 
 
@@ -107,13 +100,6 @@ class _WebApiExposureMixin:
       self.P(f"Metadata endpoint probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "metadata", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="No cloud metadata endpoints detected",
-        description=f"Checked AWS, GCP metadata paths on {base_url}.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)
 
 
@@ -164,11 +150,4 @@ class _WebApiExposureMixin:
       self.P(f"API auth bypass probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "api_auth", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="API endpoints rejected invalid authorization",
-        description=f"Checked {', '.join(candidate_paths)} on {base_url} — all rejected invalid tokens.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)

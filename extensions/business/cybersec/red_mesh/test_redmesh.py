@@ -1364,6 +1364,92 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     self.assertNotEqual(worker.state["port_protocols"][9999], "mysql")
 
+  # ===== NEW TESTS — Generic probe vulnerability detection =====
+
+  def test_generic_probe_version_disclosure(self):
+    """Generic probe should flag version disclosure from banner."""
+    owner, worker = self._build_worker(ports=[9999])
+
+    class DummySocket:
+      def __init__(self, *a, **kw): pass
+      def settimeout(self, t): pass
+      def connect(self, addr): pass
+      def recv(self, n): return b"220 mail.example.com ESMTP Exim 4.94.1 ready\r\n"
+      def close(self): pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      result = worker._service_info_generic("example.com", 9999)
+
+    self.assertIsInstance(result, dict)
+    self.assertEqual(result.get("product"), "exim")
+    self.assertEqual(result.get("version"), "4.94.1")
+    self._assert_has_finding(result, "version disclosed")
+
+  def test_generic_probe_cve_match(self):
+    """Generic probe should find CVEs from banner version."""
+    owner, worker = self._build_worker(ports=[9999])
+
+    class DummySocket:
+      def __init__(self, *a, **kw): pass
+      def settimeout(self, t): pass
+      def connect(self, addr): pass
+      def recv(self, n): return b"SSH-2.0-OpenSSH_7.4\r\n"
+      def close(self): pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      result = worker._service_info_generic("example.com", 9999)
+
+    self.assertIsInstance(result, dict)
+    self.assertEqual(result.get("product"), "openssh")
+    # OpenSSH 7.4 is vulnerable to CVE-2024-6387 (regreSSHion, <9.3)
+    self._assert_has_finding(result, "CVE-2024-6387")
+
+  def test_generic_probe_binary_returns_none(self):
+    """Generic probe should return None for pure binary banners."""
+    owner, worker = self._build_worker(ports=[9999])
+
+    class DummySocket:
+      def __init__(self, *a, **kw): pass
+      def settimeout(self, t): pass
+      def connect(self, addr): pass
+      def recv(self, n): return b'\x00\x01\x00\x00\x00\x05\x01\x03'
+      def close(self): pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      result = worker._service_info_generic("example.com", 9999)
+
+    self.assertIsNone(result)
+
+  def test_generic_probe_no_version_no_findings(self):
+    """Generic probe with readable banner but no product match should return no findings."""
+    owner, worker = self._build_worker(ports=[9999])
+
+    class DummySocket:
+      def __init__(self, *a, **kw): pass
+      def settimeout(self, t): pass
+      def connect(self, addr): pass
+      def recv(self, n): return b"Welcome to Custom Service\r\n"
+      def close(self): pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      result = worker._service_info_generic("example.com", 9999)
+
+    self.assertIsInstance(result, dict)
+    self.assertIn("Welcome to Custom Service", result.get("banner", ""))
+    self.assertEqual(result["findings"], [])
+
   # ===== NEW TESTS — VPN endpoint detection =====
 
   def test_vpn_endpoint_detection(self):
