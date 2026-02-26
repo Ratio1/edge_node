@@ -599,12 +599,16 @@ class PentestLocalWorker(
           protocol = "vnc"
         elif len(raw) >= 7 and raw[3:4] == b'\x00' and raw[4:5] == b'\x0a':
           # MySQL greeting: 3-byte payload len + seq=0x00 + protocol version 0x0a + version string
-          # Verify version string at byte 5 is printable ASCII (e.g. "8.0.28\x00")
-          # to avoid false positives on arbitrary binary data.
-          _ver_end = raw.find(b'\x00', 5)
-          if _ver_end > 5 and all(32 <= b < 127 for b in raw[5:_ver_end]):
-            protocol = "mysql"
-        elif "login:" in text.lower() or raw[0:1] == b'\xff':
+          # Validate payload length (bytes 0-2 LE) is sane and version string is printable ASCII.
+          _pkt_len = int.from_bytes(raw[0:3], 'little')
+          if 10 <= _pkt_len <= 512:
+            _ver_end = raw.find(b'\x00', 5)
+            if _ver_end > 5 and all(32 <= b < 127 for b in raw[5:_ver_end]):
+              protocol = "mysql"
+        elif "login:" in text.lower():
+          protocol = "telnet"
+        elif len(raw) >= 3 and raw[0:1] == b'\xff' and raw[1:2] in (b'\xfb', b'\xfc', b'\xfd', b'\xfe'):
+          # Telnet IAC negotiation: 0xFF (IAC) + WILL/WONT/DO/DONT + option byte (RFC 854)
           protocol = "telnet"
         elif text.startswith("HTTP/"):
           protocol = "http"
@@ -651,7 +655,10 @@ class PentestLocalWorker(
             protocol = "pop3"
           elif nudge_text.startswith("* OK"):
             protocol = "imap"
-          elif "login:" in nudge_text.lower() or nudge_resp[0:1] == b'\xff':
+          elif "login:" in nudge_text.lower():
+            protocol = "telnet"
+          elif len(nudge_resp) >= 3 and nudge_resp[0:1] == b'\xff' and nudge_resp[1:2] in (b'\xfb', b'\xfc', b'\xfd', b'\xfe'):
+            # Telnet IAC negotiation: 0xFF (IAC) + WILL/WONT/DO/DONT + option byte (RFC 854)
             protocol = "telnet"
 
       # --- 5. Active HTTP probe ---
@@ -695,8 +702,10 @@ class PentestLocalWorker(
           except (socket.timeout, OSError):
             mb_resp = b""
           mb_sock.close()
-          # Valid Modbus response: starts with transaction ID echoed back + protocol ID 0x0000
-          if mb_resp and len(mb_resp) >= 7 and mb_resp[2:4] == b'\x00\x00':
+          # Valid Modbus response: protocol ID 0x0000 + echoed function code 0x2B
+          if (mb_resp and len(mb_resp) >= 8
+              and mb_resp[2:4] == b'\x00\x00'
+              and mb_resp[7:8] == b'\x2b'):
             protocol = "modbus"
         except Exception:
           pass
