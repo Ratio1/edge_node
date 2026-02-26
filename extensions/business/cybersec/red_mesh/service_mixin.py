@@ -153,7 +153,82 @@ class _ServiceInfoMixin:
       result["technologies"] = techs
 
     except Exception as e:
-      return probe_error(target, port, "HTTP", e)
+      # HTTP library failed (e.g. empty reply, connection reset).
+      # Fall back to raw socket probe — try HTTP/1.0 without Host header
+      # (some servers like nginx drop requests with unrecognized Host values).
+      try:
+        _s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        _s.settimeout(3)
+        _s.connect((target, port))
+        # Use HTTP/1.0 without Host — matches nmap's GetRequest probe
+        _s.send(b"GET / HTTP/1.0\r\n\r\n")
+        _raw = b""
+        while True:
+          chunk = _s.recv(4096)
+          if not chunk:
+            break
+          _raw += chunk
+          if len(_raw) > 16384:
+            break
+        _s.close()
+        _raw_str = _raw.decode("utf-8", errors="ignore")
+        if _raw_str:
+          lines = _raw_str.split("\r\n")
+          result["banner"] = lines[0].strip() if lines else "unknown"
+          for line in lines[1:]:
+            low = line.lower()
+            if low.startswith("server:"):
+              result["server"] = line.split(":", 1)[1].strip()
+              break
+          # Report that the server drops Host-header requests
+          findings.append(Finding(
+            severity=Severity.INFO,
+            title="HTTP service drops requests with Host header",
+            description=f"TCP port {port} returns empty replies for standard HTTP/1.1 "
+                        "requests but responds to HTTP/1.0 without a Host header. "
+                        "This indicates a server_name mismatch or intentional filtering.",
+            evidence=f"HTTP/1.1 with Host:{target} → empty reply; "
+                     f"HTTP/1.0 without Host → {result['banner']}",
+            remediation="Configure a proper default server block or virtual host.",
+            cwe_id="CWE-200",
+            confidence="certain",
+          ))
+          # Check for directory listing in response body
+          body_start = _raw_str.find("\r\n\r\n")
+          if body_start > -1:
+            body = _raw_str[body_start + 4:]
+            if "directory listing" in body.lower() or "<li><a href=" in body.lower():
+              findings.append(Finding(
+                severity=Severity.MEDIUM,
+                title="Directory listing enabled",
+                description=f"Web server on port {port} has directory listing enabled, "
+                            "exposing file and folder names to any visitor.",
+                evidence=f"GET / returned HTML with directory listing content.",
+                remediation="Disable directory listing (autoindex off in nginx).",
+                owasp_id="A01:2021",
+                cwe_id="CWE-548",
+                confidence="certain",
+              ))
+            # Extract page title
+            title_m = _re.search(r"<title>(.*?)</title>", body[:5000], _re.IGNORECASE | _re.DOTALL)
+            if title_m:
+              result["title"] = title_m.group(1).strip()[:100]
+        else:
+          result["banner"] = "(empty reply)"
+          findings.append(Finding(
+            severity=Severity.INFO,
+            title="HTTP service returns empty reply",
+            description=f"TCP port {port} accepts connections but the server "
+                        "closes without sending any HTTP response data.",
+            evidence=f"Raw socket to {target}:{port} — connected OK, received 0 bytes.",
+            remediation="Investigate why the server sends empty replies; "
+                        "verify proxy/upstream configuration.",
+            cwe_id="CWE-200",
+            confidence="certain",
+          ))
+      except Exception:
+        return probe_error(target, port, "HTTP", e)
+      return probe_result(raw_data=result, findings=findings)
 
     # --- 2. Dangerous HTTP methods ---
     dangerous = []

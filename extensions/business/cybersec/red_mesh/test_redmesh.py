@@ -2227,6 +2227,107 @@ class TestScannerEnhancements(unittest.TestCase):
     self.assertTrue(found, f"Expected security.txt finding, got: {result.get('findings', [])}")
 
 
+  # --- Item 6: HTTP empty reply fallback ---
+
+  def test_http_empty_reply_fallback(self):
+    """HTTP probe should fall back to raw socket when requests.get fails with empty reply."""
+    _, worker = self._build_worker(ports=[81])
+
+    class DummySocket:
+      def __init__(self, chunks):
+        self._chunks = list(chunks)
+      def settimeout(self, t): pass
+      def connect(self, addr): pass
+      def send(self, data): pass
+      def recv(self, n):
+        return self._chunks.pop(0) if self._chunks else b""
+      def close(self): pass
+
+    from requests.exceptions import ConnectionError as ReqConnError
+
+    # Case 1: requests fails, raw socket also gets empty reply
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      side_effect=ReqConnError("RemoteDisconnected"),
+    ), patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket([b""]),
+    ):
+      result = worker._service_info_http("10.0.0.1", 81)
+    self.assertIsNotNone(result, "Should return a result, not None")
+    self.assertEqual(result.get("banner"), "(empty reply)")
+    titles = [f["title"] for f in result.get("findings", [])]
+    self.assertTrue(any("empty reply" in t.lower() for t in titles),
+                    f"Expected empty reply finding, got: {titles}")
+
+  def test_http_empty_reply_fallback_with_banner(self):
+    """HTTP probe raw socket fallback should capture server banner and detect Host-header drop."""
+    _, worker = self._build_worker(ports=[81])
+
+    class DummySocket:
+      def __init__(self, chunks):
+        self._chunks = list(chunks)
+      def settimeout(self, t): pass
+      def connect(self, addr): pass
+      def send(self, data): pass
+      def recv(self, n):
+        return self._chunks.pop(0) if self._chunks else b""
+      def close(self): pass
+
+    from requests.exceptions import ConnectionError as ReqConnError
+    raw_resp = b"HTTP/1.1 200 OK\r\nServer: nginx/1.24.0\r\n\r\n"
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      side_effect=ReqConnError("RemoteDisconnected"),
+    ), patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket([raw_resp, b""]),
+    ):
+      result = worker._service_info_http("10.0.0.1", 81)
+    self.assertIsNotNone(result, "Should return a result, not None")
+    self.assertEqual(result.get("banner"), "HTTP/1.1 200 OK")
+    self.assertEqual(result.get("server"), "nginx/1.24.0")
+    titles = [f["title"] for f in result.get("findings", [])]
+    self.assertTrue(any("host header" in t.lower() for t in titles),
+                    f"Expected Host-header-drop finding, got: {titles}")
+
+  def test_http_fallback_directory_listing(self):
+    """HTTP probe raw socket fallback should detect directory listing."""
+    _, worker = self._build_worker(ports=[81])
+
+    class DummySocket:
+      def __init__(self, chunks):
+        self._chunks = list(chunks)
+      def settimeout(self, t): pass
+      def connect(self, addr): pass
+      def send(self, data): pass
+      def recv(self, n):
+        return self._chunks.pop(0) if self._chunks else b""
+      def close(self): pass
+
+    from requests.exceptions import ConnectionError as ReqConnError
+    raw_resp = (
+      b"HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\n"
+      b"<html><title>Directory listing for /</title><body>"
+      b'<li><a href="../">../</a></body></html>'
+    )
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      side_effect=ReqConnError("RemoteDisconnected"),
+    ), patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket([raw_resp, b""]),
+    ):
+      result = worker._service_info_http("10.0.0.1", 81)
+    self.assertIsNotNone(result)
+    titles = [f["title"] for f in result.get("findings", [])]
+    self.assertTrue(any("directory listing" in t.lower() for t in titles),
+                    f"Expected directory listing finding, got: {titles}")
+    self.assertEqual(result.get("title"), "Directory listing for /")
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
