@@ -2548,10 +2548,16 @@ class _DeeployMixin:
           filtered_result[node][app_name] = app_data
       result = filtered_result
     if job_id is not None:
+      if isinstance(job_id, int):
+        job_id = [job_id]
+      unique_job_ids = set()
+      for raw_value in job_id:
+        unique_job_ids.add(raw_value)
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
         for app_name, app_data in apps.items():
-          if app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
+          app_job_id = app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None)
+          if app_job_id not in unique_job_ids:
             continue
           filtered_result[node][app_name] = app_data
       result = filtered_result
@@ -2711,26 +2717,36 @@ class _DeeployMixin:
     active_jobs = self._normalize_active_jobs(raw_active_jobs)
     self.Pd(f"Escrow {sender_escrow} active jobs: {[job['job_id'] for job in active_jobs]}")
 
+    active_job_ids = [job["job_id"] for job in active_jobs]
+
+    # Fetch online apps once, then reuse grouped entries per job_id.
+    all_online_apps = self._get_online_apps(
+      owner=owner,
+      job_id=active_job_ids,
+      project_id=project_id
+    )
+
+    online_apps_by_job_id = self.defaultdict(lambda: self.defaultdict(dict))
+    if isinstance(all_online_apps, dict):
+      for node, apps in all_online_apps.items():
+        if not isinstance(apps, dict):
+          self.Pd(f"Skipping malformed online apps payload for node {node}.", color='y')
+          continue
+        for app_name, app_data in apps.items():
+          app_job_id = self._extract_app_job_id(app_data)
+          if app_job_id is None:
+            continue
+          online_apps_by_job_id[app_job_id][node][app_name] = app_data
+
     for active_job in active_jobs:
       job_id = active_job["job_id"]
       chain_job = self._serialize_chain_job(active_job.get("raw", {}))
       chain_matches_project = self._chain_job_matches_project_id(chain_job, project_id)
 
-      online_apps = self._get_online_apps(
-        owner=owner,
-        job_id=job_id,
-        project_id=project_id
-      )
-      if not isinstance(online_apps, dict):
-        online_apps = {}
-      else:
-        normalized_online_apps = {}
-        for node, apps in online_apps.items():
-          if not isinstance(apps, dict):
-            self.Pd(f"Skipping malformed online apps payload for node {node}.", color='y')
-            continue
-          normalized_online_apps[node] = dict(apps)
-        online_apps = normalized_online_apps
+      online_apps = {}
+      grouped_online_apps = online_apps_by_job_id.get(job_id, {})
+      if isinstance(grouped_online_apps, dict):
+        online_apps = {node: dict(apps) for node, apps in grouped_online_apps.items() if isinstance(apps, dict)}
 
       pipeline_cid = None
       pipeline = None
