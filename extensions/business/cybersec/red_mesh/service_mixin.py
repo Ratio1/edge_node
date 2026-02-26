@@ -60,7 +60,20 @@ class _ServiceInfoMixin:
   that `PentestLocalWorker` threads can run without heavy dependencies while
   still surfacing high-signal clues.
   """
-  
+
+  def _emit_metadata(self, category, key_or_item, value=None):
+    """Safely append to scan_metadata sub-dicts without crashing if state is uninitialized."""
+    meta = self.state.get("scan_metadata")
+    if meta is None:
+      return
+    bucket = meta.get(category)
+    if bucket is None:
+      return
+    if isinstance(bucket, dict):
+      bucket[key_or_item] = value
+    elif isinstance(bucket, list):
+      bucket.append(key_or_item)
+
   def _service_info_http(self, target, port):  # default port: 80
     """
     Assess HTTP service: server fingerprint, technology detection,
@@ -101,6 +114,8 @@ class _ServiceInfoMixin:
 
       result["banner"] = f"HTTP {resp.status_code} {resp.reason}"
       result["server"] = resp.headers.get("Server")
+      if result["server"]:
+        self._emit_metadata("server_versions", port, result["server"])
       if result["server"]:
         _m = _HTTP_SERVER_RE.search(result["server"])
         if _m:
@@ -330,6 +345,20 @@ class _ServiceInfoMixin:
     raw["protocol"], raw["cipher"] = proto, cipher
     findings += self._tls_check_protocol(proto, cipher)
 
+    # Pass 1b: SAN parsing and signature check from DER cert
+    if cert_der:
+      san_dns, san_ips = self._tls_parse_san_from_der(cert_der)
+      raw["san_dns"] = san_dns
+      raw["san_ips"] = san_ips
+      for ip_str in san_ips:
+        try:
+          import ipaddress as _ipaddress
+          if _ipaddress.ip_address(ip_str).is_private:
+            self._emit_metadata("internal_ips", {"ip": ip_str, "source": f"tls_san:{port}"})
+        except (ValueError, TypeError):
+          pass
+      findings += self._tls_check_signature_algorithm(cert_der)
+
     # Pass 2: Verified — detect self-signed / chain issues
     findings += self._tls_check_certificate(target, port, raw)
 
@@ -482,8 +511,8 @@ class _ServiceInfoMixin:
     if not cn:
       return findings
     cn_lower = cn.lower()
-    placeholders = ("example.com", "localhost", "internet widgits", "test", "changeme")
-    if any(p in cn_lower for p in placeholders):
+    placeholders = ("example.com", "localhost", "internet widgits", "test", "changeme", "my company", "acme", "default")
+    if any(p in cn_lower for p in placeholders) or len(cn.strip()) <= 1:
       findings.append(Finding(
         severity=Severity.LOW,
         title=f"TLS certificate placeholder CN: {cn}",
@@ -494,6 +523,50 @@ class _ServiceInfoMixin:
         cwe_id="CWE-295",
         confidence="firm",
       ))
+    return findings
+
+  def _tls_parse_san_from_der(self, cert_der):
+    """Parse SAN DNS names and IP addresses from a DER-encoded certificate."""
+    dns_names, ip_addresses = [], []
+    if not cert_der:
+      return dns_names, ip_addresses
+    try:
+      from cryptography import x509
+      cert = x509.load_der_x509_certificate(cert_der)
+      try:
+        san_ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        dns_names = san_ext.value.get_values_for_type(x509.DNSName)
+        ip_addresses = [str(ip) for ip in san_ext.value.get_values_for_type(x509.IPAddress)]
+      except x509.ExtensionNotFound:
+        pass
+    except Exception:
+      pass
+    return dns_names, ip_addresses
+
+  def _tls_check_signature_algorithm(self, cert_der):
+    """Flag SHA-1 or MD5 signature algorithms."""
+    findings = []
+    if not cert_der:
+      return findings
+    try:
+      from cryptography import x509
+      from cryptography.hazmat.primitives import hashes
+      cert = x509.load_der_x509_certificate(cert_der)
+      algo = cert.signature_hash_algorithm
+      if algo and isinstance(algo, (hashes.SHA1, hashes.MD5)):
+        algo_name = algo.name.upper()
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title=f"TLS certificate signed with weak algorithm: {algo_name}",
+          description=f"The certificate uses {algo_name} for its signature, which is cryptographically weak.",
+          evidence=f"signature_algorithm={algo_name}",
+          remediation="Replace with a certificate using SHA-256 or stronger.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-327",
+          confidence="certain",
+        ))
+    except Exception:
+      pass
     return findings
 
 
@@ -598,6 +671,34 @@ class _ServiceInfoMixin:
           if line.strip() and not line.startswith("211")
         ]
         result["features"] = feats
+      except Exception:
+        pass
+
+    # --- 2c. PASV IP leak check ---
+    if ftp and result["anonymous_access"]:
+      try:
+        pasv_resp = ftp.sendcmd("PASV")
+        _pasv_match = _re.search(r'\((\d+),(\d+),(\d+),(\d+),(\d+),(\d+)\)', pasv_resp)
+        if _pasv_match:
+          pasv_ip = f"{_pasv_match.group(1)}.{_pasv_match.group(2)}.{_pasv_match.group(3)}.{_pasv_match.group(4)}"
+          if pasv_ip != target:
+            import ipaddress as _ipaddress
+            try:
+              if _ipaddress.ip_address(pasv_ip).is_private:
+                result["pasv_ip"] = pasv_ip
+                self._emit_metadata("internal_ips", {"ip": pasv_ip, "source": f"ftp_pasv:{port}"})
+                findings.append(Finding(
+                  severity=Severity.MEDIUM,
+                  title=f"FTP PASV leaks internal IP: {pasv_ip}",
+                  description=f"PASV response reveals RFC1918 address {pasv_ip}, different from target {target}.",
+                  evidence=f"PASV response: {pasv_resp}",
+                  remediation="Configure FTP passive address masquerading to use the public IP.",
+                  owasp_id="A05:2021",
+                  cwe_id="CWE-200",
+                  confidence="certain",
+                ))
+            except (ValueError, TypeError):
+              pass
       except Exception:
         pass
 
@@ -782,6 +883,10 @@ class _ServiceInfoMixin:
       banner = sock.recv(1024).decode("utf-8", errors="ignore").strip()
       sock.close()
       result["banner"] = banner
+      # Emit OS claim from SSH banner (e.g. "SSH-2.0-OpenSSH_8.9p1 Ubuntu")
+      _os_match = _re.search(r'(Ubuntu|Debian|Fedora|CentOS|Alpine|FreeBSD)', banner, _re.IGNORECASE)
+      if _os_match:
+        self._emit_metadata("os_claims", f"ssh:{port}", _os_match.group(1))
     except Exception as e:
       return probe_error(target, port, "SSH", e)
 
@@ -916,8 +1021,23 @@ class _ServiceInfoMixin:
 
       ciphers = set(sec_opts.ciphers) if sec_opts.ciphers else set()
       kex = set(sec_opts.kex) if sec_opts.kex else set()
+      key_types = set(sec_opts.key_types) if sec_opts.key_types else set()
 
       transport.close()
+
+      # DSA key detection
+      if "ssh-dss" in key_types:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="SSH DSA host key offered (ssh-dss)",
+          description="The SSH server offers DSA host keys, which are limited to 1024-bit and considered weak.",
+          evidence=f"Key types: {', '.join(sorted(key_types))}",
+          remediation="Remove DSA host keys and use Ed25519 or RSA (>=3072-bit) instead.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-326",
+          confidence="certain",
+        ))
+        weak_labels.append("key_types: ssh-dss")
 
       weak_ciphers = ciphers & _WEAK_CIPHERS
       weak_kex = kex & _WEAK_KEX
@@ -1031,9 +1151,13 @@ class _ServiceInfoMixin:
       if upper.startswith("AUTH "):
         result["auth_methods"] = feat.split()[1:]
 
-    # --- 2b. Banner / hostname information disclosure ---
-    import re as _re
+    # --- 2b. Banner timezone extraction ---
     banner_text = result["banner"] or ""
+    _tz_match = _re.search(r'([+-]\d{4})\s*$', banner_text)
+    if _tz_match:
+      self._emit_metadata("timezone_hints", {"offset": _tz_match.group(1), "source": f"smtp:{port}"})
+
+    # --- 2c. Banner / hostname information disclosure ---
     # Extract MTA version from banner (e.g. "Exim 4.97", "Postfix", "Sendmail 8.x")
     version_match = _re.search(
       r"(Exim|Postfix|Sendmail|Microsoft ESMTP|hMailServer|Haraka|OpenSMTPD)"
@@ -1064,6 +1188,7 @@ class _ServiceInfoMixin:
       # Check if hostname reveals container/internal info
       hostname = result["server_hostname"]
       if _re.search(r"[0-9a-f]{12}", hostname):
+        self._emit_metadata("container_ids", {"id": hostname, "source": f"smtp:{port}"})
         findings.append(Finding(
           severity=Severity.LOW,
           title=f"SMTP hostname leaks container ID: {hostname} (infrastructure disclosure).",
@@ -1226,6 +1351,44 @@ class _ServiceInfoMixin:
             remediation="Restrict MySQL to trusted networks; consider disabling version disclosure.",
             confidence="certain",
           ))
+
+          # Salt entropy check — extract 20-byte auth scramble from handshake
+          try:
+            import math
+            # After version null-terminated string: 4 bytes thread_id + 8 bytes salt1
+            after_version = pkt_payload[1:].split(b'\x00', 1)[1]
+            if len(after_version) >= 12:
+              salt1 = after_version[4:12]  # 8 bytes after thread_id
+              # Salt part 2: after capabilities(2)+charset(1)+status(2)+caps_upper(2)+auth_len(1)+reserved(10)
+              salt2 = b''
+              if len(after_version) >= 31:
+                salt2 = after_version[31:43].rstrip(b'\x00')
+              full_salt = salt1 + salt2
+              if len(full_salt) >= 8:
+                # Shannon entropy
+                byte_counts = {}
+                for b in full_salt:
+                  byte_counts[b] = byte_counts.get(b, 0) + 1
+                entropy = 0.0
+                n = len(full_salt)
+                for count in byte_counts.values():
+                  p = count / n
+                  if p > 0:
+                    entropy -= p * math.log2(p)
+                raw["salt_entropy"] = round(entropy, 2)
+                if entropy < 2.0:
+                  findings.append(Finding(
+                    severity=Severity.HIGH,
+                    title=f"MySQL salt entropy critically low ({entropy:.2f} bits) — possible honeypot",
+                    description="The authentication scramble has abnormally low entropy, "
+                                "suggesting a fake MySQL service or honeypot.",
+                    evidence=f"salt_entropy={entropy:.2f}, salt_hex={full_salt.hex()[:40]}",
+                    remediation="Investigate this host — it may be a honeypot.",
+                    cwe_id="CWE-330",
+                    confidence="firm",
+                  ))
+          except Exception:
+            pass
 
           # CVE check
           findings += check_cves("mysql", version)
@@ -1487,11 +1650,20 @@ class _ServiceInfoMixin:
     resp = self._redis_cmd(sock, "INFO server")
     if resp.startswith("-"):
       return findings
+    uptime_seconds = None
     for line in resp.split("\r\n"):
       if line.startswith("redis_version:"):
         raw["version"] = line.split(":", 1)[1].strip()
       elif line.startswith("os:"):
         raw["os"] = line.split(":", 1)[1].strip()
+      elif line.startswith("uptime_in_seconds:"):
+        try:
+          uptime_seconds = int(line.split(":", 1)[1].strip())
+          raw["uptime_seconds"] = uptime_seconds
+        except (ValueError, IndexError):
+          pass
+    if raw["os"]:
+      self._emit_metadata("os_claims", "redis", raw["os"])
     if raw["version"]:
       findings.append(Finding(
         severity=Severity.LOW,
@@ -1500,6 +1672,15 @@ class _ServiceInfoMixin:
         evidence=f"version={raw['version']}, os={raw['os']}",
         remediation="Restrict INFO command access or rename it.",
         confidence="certain",
+      ))
+    if uptime_seconds is not None and uptime_seconds < 60:
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title=f"Redis uptime <60s ({uptime_seconds}s) — possible container restart",
+        description="Very low uptime may indicate a recently restarted container or ephemeral honeypot.",
+        evidence=f"uptime_in_seconds={uptime_seconds}",
+        remediation="Investigate if the service is being automatically restarted.",
+        confidence="tentative",
       ))
     return findings
 
@@ -2575,6 +2756,8 @@ class _ServiceInfoMixin:
                   ips.add(v)
         if ips:
           raw["node_ips"] = list(ips)
+          for ip_str in ips:
+            self._emit_metadata("internal_ips", {"ip": ip_str, "source": f"es_nodes:{port}"})
           findings.append(Finding(
             severity=Severity.MEDIUM,
             title=f"Elasticsearch node IPs disclosed ({len(ips)})",

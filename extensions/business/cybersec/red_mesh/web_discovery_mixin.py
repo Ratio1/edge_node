@@ -1,4 +1,5 @@
 import re as _re
+import uuid as _uuid
 import requests
 
 from .findings import Finding, Severity, probe_result, probe_error
@@ -30,6 +31,24 @@ class _WebDiscoveryMixin:
     base_url = f"{scheme}://{target}"
     if port not in (80, 443):
       base_url = f"{scheme}://{target}:{port}"
+
+    # --- Honeypot detection: 200-for-all ---
+    try:
+      canary_path = f"/{_uuid.uuid4().hex}"
+      canary_resp = requests.get(base_url + canary_path, timeout=2, verify=False)
+      if canary_resp.status_code == 200:
+        findings_list.append(Finding(
+          severity=Severity.HIGH,
+          title="Web server returns 200 for random paths (possible honeypot)",
+          description="A request to a non-existent random UUID path returned HTTP 200, "
+                      "suggesting a catch-all honeypot or severely misconfigured server.",
+          evidence=f"GET {base_url}{canary_path} returned 200.",
+          remediation="Investigate — this host may be a honeypot.",
+          cwe_id="CWE-345",
+          confidence="firm",
+        ))
+    except Exception:
+      pass
 
     # Severity depends on what the path exposes
     _PATH_META = {

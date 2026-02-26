@@ -129,11 +129,13 @@ def check_cves(product: str, version: str) -> list:
       findings.append(Finding(
         severity=entry.severity,
         title=f"{entry.cve_id}: {entry.title} ({product} {version})",
-        description=f"{product} {version} is vulnerable to {entry.cve_id}.",
+        description=f"{product} {version} is vulnerable to {entry.cve_id}. "
+                    "NOTE: Linux distributions backport security fixes without changing "
+                    "the upstream version number — this may be a false positive.",
         evidence=f"Detected version: {version}, affected: {entry.constraint}",
-        remediation=f"Upgrade {product} to a patched version.",
+        remediation=f"Upgrade {product} to a patched version, or verify backport status with the OS vendor.",
         cwe_id=entry.cwe_id,
-        confidence="firm",
+        confidence="tentative",
       ))
   return findings
 

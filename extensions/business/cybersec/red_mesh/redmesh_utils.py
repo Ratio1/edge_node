@@ -15,6 +15,7 @@ from .web_discovery_mixin import _WebDiscoveryMixin
 from .web_hardening_mixin import _WebHardeningMixin
 from .web_api_mixin import _WebApiExposureMixin
 from .web_injection_mixin import _WebInjectionMixin
+from .correlation_mixin import _CorrelationMixin
 from .constants import (
   PROBE_PROTOCOL_MAP, WEB_PROTOCOLS,
   WELL_KNOWN_PORTS as _WELL_KNOWN_PORTS,
@@ -39,6 +40,7 @@ class PentestLocalWorker(
   _WebHardeningMixin,
   _WebApiExposureMixin,
   _WebInjectionMixin,
+  _CorrelationMixin,
 ):
   """
   Execute a pentest workflow against a target on a dedicated thread.
@@ -182,6 +184,15 @@ class PentestLocalWorker(
       "completed_tests": [],
       "done": False,
       "canceled": False,
+
+      "scan_metadata": {
+        "os_claims": {},
+        "internal_ips": [],
+        "container_ids": [],
+        "timezone_hints": [],
+        "server_versions": {},
+      },
+      "correlation_findings": [],
     }
     self.__all_features = self._get_all_features()
 
@@ -240,6 +251,8 @@ class PentestLocalWorker(
       "completed_tests" : list,
       "port_protocols" : dict,
       "port_banners" : dict,
+      "scan_metadata" : dict,
+      "correlation_findings" : list,
     }
   
   
@@ -296,6 +309,9 @@ class PentestLocalWorker(
 
     dct_status["port_protocols"] = self.state.get("port_protocols", {})
     dct_status["port_banners"] = self.state.get("port_banners", {})
+
+    dct_status["scan_metadata"] = self.state.get("scan_metadata", {})
+    dct_status["correlation_findings"] = self.state.get("correlation_findings", [])
 
     return dct_status
 
@@ -409,6 +425,10 @@ class PentestLocalWorker(
       if not self._check_stopped():
         self._run_web_tests()
         self.state["completed_tests"].append("web_tests_completed")
+
+      if not self._check_stopped():
+        self._post_scan_correlate()
+        self.state["completed_tests"].append("correlation_completed")
 
       self.state['done'] = True
       self.P(f"Job completed. Ports open and checked: {self.state['open_ports']}")
@@ -579,7 +599,11 @@ class PentestLocalWorker(
           protocol = "vnc"
         elif len(raw) >= 7 and raw[3:4] == b'\x00' and raw[4:5] == b'\x0a':
           # MySQL greeting: 3-byte payload len + seq=0x00 + protocol version 0x0a + version string
-          protocol = "mysql"
+          # Verify version string at byte 5 is printable ASCII (e.g. "8.0.28\x00")
+          # to avoid false positives on arbitrary binary data.
+          _ver_end = raw.find(b'\x00', 5)
+          if _ver_end > 5 and all(32 <= b < 127 for b in raw[5:_ver_end]):
+            protocol = "mysql"
         elif "login:" in text.lower() or raw[0:1] == b'\xff':
           protocol = "telnet"
         elif text.startswith("HTTP/"):
@@ -653,6 +677,27 @@ class PentestLocalWorker(
                 ch if 32 <= ord(ch) < 127 else '.'
                 for ch in http_text[:FINGERPRINT_MAX_BANNER]
               )
+        except Exception:
+          pass
+
+      # --- 5b. Modbus probe ---
+      # If still unknown, try a Modbus device ID request.
+      # Only runs after all text-based identification fails.
+      if protocol is None:
+        try:
+          mb_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          mb_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
+          mb_sock.connect((target, port))
+          # Modbus Read Device Identification: MBAP header + function code 0x2B
+          mb_sock.sendall(b'\x00\x01\x00\x00\x00\x05\x01\x2b\x0e\x01\x00')
+          try:
+            mb_resp = mb_sock.recv(256)
+          except (socket.timeout, OSError):
+            mb_resp = b""
+          mb_sock.close()
+          # Valid Modbus response: starts with transaction ID echoed back + protocol ID 0x0000
+          if mb_resp and len(mb_resp) >= 7 and mb_resp[2:4] == b'\x00\x00':
+            protocol = "modbus"
         except Exception:
           pass
 

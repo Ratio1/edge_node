@@ -1172,6 +1172,97 @@ class RedMeshOWASPTests(unittest.TestCase):
     self._assert_has_finding(result, "PHP/8.1")
     self._assert_has_finding(result, "WordPress")
 
+  # ===== NEW TESTS — Modbus fingerprint on non-standard port =====
+
+  def test_fingerprint_modbus_on_nonstandard_port(self):
+    """Port 1024 with Modbus response should be fingerprinted as modbus."""
+    owner, worker = self._build_worker(ports=[1024])
+    worker.state["open_ports"] = [1024]
+    worker.target = "10.0.0.1"
+
+    # Build a valid Modbus Read Device ID response:
+    # Transaction ID 0x0001, Protocol ID 0x0000, Length 0x0008, Unit 0x01,
+    # Function 0x2B, MEI type 0x0E, conformity 0x01, more 0x00, obj count 0x00
+    modbus_response = b'\x00\x01\x00\x00\x00\x08\x01\x2b\x0e\x01\x01\x00\x00'
+
+    call_index = [0]
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = b""
+      # First call: passive banner grab → empty (no banner)
+      # Second call: nudge probe → empty
+      # Third call: HTTP probe → empty
+      # Fourth call: modbus probe → valid response
+      idx = call_index[0]
+      call_index[0] += 1
+      if idx == 3:
+        mock_sock.recv.return_value = modbus_response
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+      worker._fingerprint_ports()
+
+    self.assertEqual(worker.state["port_protocols"][1024], "modbus")
+
+  def test_fingerprint_non_modbus_stays_unknown(self):
+    """Port with no recognizable response should remain unknown."""
+    owner, worker = self._build_worker(ports=[1024])
+    worker.state["open_ports"] = [1024]
+    worker.target = "10.0.0.1"
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = b""
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+      worker._fingerprint_ports()
+
+    self.assertEqual(worker.state["port_protocols"][1024], "unknown")
+
+  def test_fingerprint_mysql_false_positive_binary_data(self):
+    """Binary data that happens to have 0x00 at byte 3 and 0x0a at byte 4 must NOT be classified as mysql."""
+    owner, worker = self._build_worker(ports=[37364])
+    worker.state["open_ports"] = [37364]
+    worker.target = "10.0.0.1"
+
+    # Crafted binary blob: byte 3 = 0x00, byte 4 = 0x0a, but byte 5+ is not
+    # a printable version string — this is NOT a MySQL greeting.
+    fake_binary = b'\x07\x02\x03\x00\x0a\x80\xff\x00\x01\x02'
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = fake_binary
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+      worker._fingerprint_ports()
+
+    self.assertNotEqual(worker.state["port_protocols"][37364], "mysql")
+
+  def test_fingerprint_mysql_real_greeting(self):
+    """A genuine MySQL greeting packet should still be fingerprinted as mysql."""
+    owner, worker = self._build_worker(ports=[3306])
+    worker.state["open_ports"] = [3306]
+    worker.target = "10.0.0.1"
+
+    # Real MySQL handshake: 3-byte length + seq=0x00 + protocol=0x0a + "8.0.28\x00" + filler
+    version = b"8.0.28"
+    payload = bytes([0x0a]) + version + b'\x00' + b'\x00' * 50
+    pkt_len = len(payload).to_bytes(3, 'little')
+    mysql_greeting = pkt_len + b'\x00' + payload
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = mysql_greeting
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+      worker._fingerprint_ports()
+
+    self.assertEqual(worker.state["port_protocols"][3306], "mysql")
+
   # ===== NEW TESTS — VPN endpoint detection =====
 
   def test_vpn_endpoint_detection(self):
@@ -1246,6 +1337,325 @@ class TestCveDatabase(unittest.TestCase):
     self.assertTrue(any("CVE-2021-41773" in t for t in cve_ids))
 
 
+class TestCorrelationEngine(unittest.TestCase):
+  """Tests for the cross-service correlation engine."""
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [80]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-corr",
+      initiator="init@example",
+      local_id_prefix="C",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  def test_port_ratio_anomaly(self):
+    """600/1000 open ports should trigger honeypot finding."""
+    _, worker = self._build_worker(ports=list(range(1, 1001)))
+    worker.state["open_ports"] = list(range(1, 601))
+    worker.state["ports_scanned"] = list(range(1, 1001))
+    worker._post_scan_correlate()
+    findings = worker.state["correlation_findings"]
+    self.assertTrue(
+      any("honeypot" in f["title"].lower() and "port" in f["title"].lower() for f in findings),
+      f"Expected port ratio honeypot finding, got: {findings}"
+    )
+
+  def test_port_ratio_normal(self):
+    """5/1000 open ports should NOT trigger honeypot finding."""
+    _, worker = self._build_worker(ports=list(range(1, 1001)))
+    worker.state["open_ports"] = [22, 80, 443, 8080, 8443]
+    worker.state["ports_scanned"] = list(range(1, 1001))
+    worker._post_scan_correlate()
+    findings = worker.state["correlation_findings"]
+    self.assertFalse(
+      any("port" in f["title"].lower() and "honeypot" in f["title"].lower() for f in findings),
+      f"Unexpected port ratio finding: {findings}"
+    )
+
+  def test_os_mismatch(self):
+    """Ubuntu + Darwin should trigger OS mismatch finding."""
+    _, worker = self._build_worker()
+    worker.state["scan_metadata"]["os_claims"] = {
+      "ssh:22": "Ubuntu",
+      "redis:6379": "Darwin 21.6.0",
+    }
+    worker._post_scan_correlate()
+    findings = worker.state["correlation_findings"]
+    self.assertTrue(
+      any("os mismatch" in f["title"].lower() for f in findings),
+      f"Expected OS mismatch finding, got: {findings}"
+    )
+
+  def test_os_consistent(self):
+    """Ubuntu + Debian should NOT trigger OS mismatch (both Linux)."""
+    _, worker = self._build_worker()
+    worker.state["scan_metadata"]["os_claims"] = {
+      "ssh:22": "Ubuntu",
+      "redis:6379": "Linux 5.4.0",
+    }
+    worker._post_scan_correlate()
+    findings = worker.state["correlation_findings"]
+    self.assertFalse(
+      any("os mismatch" in f["title"].lower() for f in findings),
+      f"Unexpected OS mismatch finding: {findings}"
+    )
+
+  def test_infrastructure_leak_multi_subnet(self):
+    """Two /16 subnets should trigger infrastructure leak."""
+    _, worker = self._build_worker()
+    worker.state["scan_metadata"]["internal_ips"] = [
+      {"ip": "10.0.1.5", "source": "es_nodes:9200"},
+      {"ip": "172.17.0.2", "source": "ftp_pasv:21"},
+    ]
+    worker._post_scan_correlate()
+    findings = worker.state["correlation_findings"]
+    self.assertTrue(
+      any("infrastructure leak" in f["title"].lower() or "subnet" in f["title"].lower() for f in findings),
+      f"Expected infrastructure leak finding, got: {findings}"
+    )
+
+  def test_timezone_drift(self):
+    """Two different timezone offsets should trigger drift finding."""
+    _, worker = self._build_worker()
+    worker.state["scan_metadata"]["timezone_hints"] = [
+      {"offset": "+0000", "source": "smtp:25"},
+      {"offset": "-0500", "source": "smtp:587"},
+    ]
+    worker._post_scan_correlate()
+    findings = worker.state["correlation_findings"]
+    self.assertTrue(
+      any("timezone" in f["title"].lower() for f in findings),
+      f"Expected timezone drift finding, got: {findings}"
+    )
+
+  def test_emit_metadata_dict(self):
+    """_emit_metadata should populate os_claims dict correctly."""
+    _, worker = self._build_worker()
+    worker._emit_metadata("os_claims", "ssh:22", "Ubuntu")
+    self.assertEqual(worker.state["scan_metadata"]["os_claims"]["ssh:22"], "Ubuntu")
+
+  def test_emit_metadata_list(self):
+    """_emit_metadata should append to internal_ips list."""
+    _, worker = self._build_worker()
+    entry = {"ip": "10.0.0.1", "source": "test"}
+    worker._emit_metadata("internal_ips", entry)
+    self.assertIn(entry, worker.state["scan_metadata"]["internal_ips"])
+
+  def test_emit_metadata_missing_state(self):
+    """_emit_metadata should be a no-op when scan_metadata is absent."""
+    _, worker = self._build_worker()
+    del worker.state["scan_metadata"]
+    # Should not raise
+    worker._emit_metadata("os_claims", "ssh:22", "Ubuntu")
+
+  def test_mysql_salt_low_entropy(self):
+    """All-same-byte MySQL salt should trigger honeypot finding."""
+    _, worker = self._build_worker(ports=[3306])
+    # Build a MySQL handshake with all-zero salt bytes
+    version = b"5.7.99-fake"
+    # protocol_version(1) + version + null + thread_id(4) + salt1(8) + filler(1)
+    # + caps(2) + charset(1) + status(2) + caps_upper(2) + auth_len(1) + reserved(10) + salt2(12) + null
+    salt1 = b'\x00' * 8
+    salt2 = b'\x00' * 12
+    after_version = b'\x01\x00\x00\x00' + salt1 + b'\x00'  # thread_id + salt1 + filler
+    after_version += b'\x00\x00'  # caps
+    after_version += b'\x21'      # charset
+    after_version += b'\x00\x00'  # status
+    after_version += b'\x00\x00'  # caps_upper
+    after_version += b'\x15'      # auth_len
+    after_version += b'\x00' * 10  # reserved
+    after_version += salt2 + b'\x00'
+    after_version += b'mysql_native_password\x00'
+    payload = bytes([0x0a]) + version + b'\x00' + after_version
+    pkt_len = len(payload).to_bytes(3, 'little')
+    packet = pkt_len + b'\x00' + payload
+
+    class DummySocket:
+      def __init__(self, *args, **kwargs):
+        pass
+      def settimeout(self, timeout):
+        pass
+      def connect(self, addr):
+        pass
+      def recv(self, nbytes):
+        return packet
+      def close(self):
+        pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      info = worker._service_info_mysql("example.com", 3306)
+    self.assertIsInstance(info, dict)
+    # Should have a low entropy finding
+    found = any("entropy" in f.get("title", "").lower() for f in info.get("findings", []))
+    self.assertTrue(found, f"Expected low entropy finding, got: {info.get('findings', [])}")
+
+  def test_ftp_pasv_ip_leak(self):
+    """PASV with RFC1918 IP should trigger internal IP leak finding."""
+    _, worker = self._build_worker(ports=[21])
+
+    class DummyFTP:
+      def __init__(self, timeout=3):
+        pass
+      def connect(self, target, port, timeout=3):
+        return None
+      def getwelcome(self):
+        return "220 FTP Ready"
+      def login(self, *args, **kwargs):
+        return None
+      def sendcmd(self, cmd):
+        if cmd == "PASV":
+          return "227 Entering Passive Mode (192,168,1,100,4,1)"
+        if cmd == "SYST":
+          return "215 UNIX"
+        if cmd == "FEAT":
+          return "211 End"
+        if cmd == "AUTH TLS":
+          raise Exception("not supported")
+        return ""
+      def set_pasv(self, val):
+        pass
+      def pwd(self):
+        return "/"
+      def cwd(self, path):
+        raise Exception("denied")
+      def quit(self):
+        pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.ftplib.FTP",
+      return_value=DummyFTP(),
+    ):
+      info = worker._service_info_ftp("example.com", 21)
+    self.assertIsInstance(info, dict)
+    found = any("pasv" in f.get("title", "").lower() for f in info.get("findings", []))
+    self.assertTrue(found, f"Expected PASV IP leak finding, got: {info.get('findings', [])}")
+
+  def test_web_200_for_all(self):
+    """200 on random path should trigger honeypot finding."""
+    _, worker = self._build_worker()
+
+    def fake_get(url, timeout=2, verify=False):
+      resp = MagicMock()
+      resp.headers = {}
+      resp.text = ""
+      resp.status_code = 200
+      resp.reason = "OK"
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_common("example.com", 80)
+    self.assertIsInstance(result, dict)
+    found = any("random path" in f.get("title", "").lower() or "200 for" in f.get("title", "").lower()
+                for f in result.get("findings", []))
+    self.assertTrue(found, f"Expected 200-for-all finding, got: {result.get('findings', [])}")
+
+  def test_tls_san_parsing(self):
+    """DER cert with SAN IPs should be correctly extracted."""
+    _, worker = self._build_worker(ports=[443])
+    # Generate a test cert with SANs using cryptography
+    try:
+      from cryptography import x509
+      from cryptography.x509.oid import NameOID
+      from cryptography.hazmat.primitives import hashes, serialization
+      from cryptography.hazmat.primitives.asymmetric import rsa
+      import datetime
+      import ipaddress
+
+      key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+      subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test.example.com")])
+      cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime.utcnow())
+        .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=365))
+        .add_extension(
+          x509.SubjectAlternativeName([
+            x509.DNSName("test.example.com"),
+            x509.DNSName("www.example.com"),
+            x509.IPAddress(ipaddress.IPv4Address("10.0.0.1")),
+            x509.IPAddress(ipaddress.IPv4Address("192.168.1.1")),
+          ]),
+          critical=False,
+        )
+        .sign(key, hashes.SHA256())
+      )
+      cert_der = cert.public_bytes(serialization.Encoding.DER)
+
+      dns_names, ip_addresses = worker._tls_parse_san_from_der(cert_der)
+      self.assertIn("test.example.com", dns_names)
+      self.assertIn("www.example.com", dns_names)
+      self.assertIn("10.0.0.1", ip_addresses)
+      self.assertIn("192.168.1.1", ip_addresses)
+    except ImportError:
+      self.skipTest("cryptography library not available")
+
+  def test_cve_confidence_tentative(self):
+    """All CVE findings should have tentative confidence."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("openssh", "8.9")
+    self.assertTrue(len(findings) > 0, "Expected at least one CVE finding")
+    for f in findings:
+      self.assertEqual(f.confidence, "tentative", f"Expected tentative confidence, got {f.confidence} for {f.title}")
+
+  def test_ssh_dsa_key(self):
+    """ssh-dss in key_types should trigger DSA finding."""
+    _, worker = self._build_worker(ports=[22])
+
+    class DummySecOpts:
+      ciphers = ["aes256-ctr"]
+      kex = ["curve25519-sha256"]
+      key_types = ["ssh-rsa", "ssh-dss"]
+
+    class DummyTransport:
+      def __init__(self, *args, **kwargs):
+        pass
+      def connect(self):
+        pass
+      def get_security_options(self):
+        return DummySecOpts()
+      def close(self):
+        pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.paramiko.Transport",
+      return_value=DummyTransport(),
+    ):
+      findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
+    found = any("dsa" in f.title.lower() or "ssh-dss" in f.title.lower() for f in findings)
+    self.assertTrue(found, f"Expected DSA key finding, got: {[f.title for f in findings]}")
+
+  def test_execute_job_correlation(self):
+    """execute_job should include correlation_completed in completed_tests."""
+    _, worker = self._build_worker()
+
+    with patch.object(worker, "_scan_ports_step"), \
+         patch.object(worker, "_fingerprint_ports"), \
+         patch.object(worker, "_gather_service_info"), \
+         patch.object(worker, "_run_web_tests"), \
+         patch.object(worker, "_post_scan_correlate"):
+      worker.execute_job()
+
+    self.assertTrue(worker.state["done"])
+    self.assertIn("correlation_completed", worker.state["completed_tests"])
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -1257,4 +1667,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(RedMeshOWASPTests))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestFindingsModule))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestCveDatabase))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestCorrelationEngine))
   runner.run(suite)

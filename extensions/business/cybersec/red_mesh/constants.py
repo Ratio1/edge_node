@@ -75,6 +75,13 @@ FEATURE_CATALOG = [
     "description": "Test default/weak credentials on database and remote access services. May trigger account lockout.",
     "category": "service",
     "methods": ["_service_info_mysql_creds", "_service_info_postgresql_creds"]
+  },
+  {
+    "id": "post_scan_correlation",
+    "label": "Cross-service correlation",
+    "description": "Post-scan analysis: honeypot detection, OS consistency, infrastructure leak aggregation.",
+    "category": "correlation",
+    "methods": ["_post_scan_correlate"]
   }
 ]
 
