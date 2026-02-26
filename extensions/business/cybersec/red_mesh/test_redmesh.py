@@ -174,7 +174,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     owner, worker = self._build_worker(ports=[80])
     worker.state["open_ports"] = [80]
     # Set enabled features to include the probe
-    worker._PentestLocalWorker__enabled_features = ["_service_info_80"]
+    worker._PentestLocalWorker__enabled_features = ["_service_info_http"]
     resp = MagicMock()
     resp.status_code = 200
     resp.reason = "OK"
@@ -188,7 +188,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       side_effect=Exception("skip methods check"),
     ):
       worker._gather_service_info()
-    banner = worker.state["service_info"][80]["_service_info_80"]
+    banner = worker.state["service_info"][80]["_service_info_http"]
     self._assert_has_finding(banner, "Apache/2.2.0")
 
   def test_identification_auth_failure_anonymous_ftp(self):
@@ -214,7 +214,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.ftplib.FTP",
       return_value=DummyFTP(),
     ):
-      result = worker._service_info_21("example.com", 21)
+      result = worker._service_info_ftp("example.com", 21)
     self._assert_has_finding(result, "FTP allows anonymous login")
 
   def test_service_checks_cover_non_standard_ports(self):
@@ -240,7 +240,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.ftplib.FTP",
       return_value=DummyFTP(),
     ):
-      result = worker._service_info_21("example.com", 2121)
+      result = worker._service_info_ftp("example.com", 2121)
     self._assert_has_finding(result, "FTP allows anonymous login")
 
   def test_service_info_runs_all_methods_for_each_port(self):
@@ -530,7 +530,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_23("example.com", 23)
+      info = worker._service_info_telnet("example.com", 23)
     self._assert_has_finding(info, "Telnet")
 
   def test_service_smb_probe(self):
@@ -559,7 +559,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_445("example.com", 445)
+      info = worker._service_info_smb("example.com", 445)
     self._assert_has_finding(info, "SMB")
 
   def test_service_vnc_unauthenticated(self):
@@ -596,7 +596,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_5900("example.com", 5900)
+      info = worker._service_info_vnc("example.com", 5900)
     self._assert_has_finding(info, "unauthenticated")
 
   def test_service_vnc_password_auth(self):
@@ -632,7 +632,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_5900("example.com", 5900)
+      info = worker._service_info_vnc("example.com", 5900)
     self._assert_has_finding(info, "DES-based")
 
   def test_service_snmp_public(self):
@@ -659,7 +659,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummyUDPSocket(),
     ):
-      info = worker._service_info_161("example.com", 161)
+      info = worker._service_info_snmp("example.com", 161)
     self._assert_has_finding(info, "SNMP")
 
   def test_service_dns_version_disclosure(self):
@@ -695,7 +695,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummyUDPSocket(),
     ):
-      info = worker._service_info_53("example.com", 53)
+      info = worker._service_info_dns("example.com", 53)
     self._assert_has_finding(info, "DNS version disclosure")
 
   def test_service_memcached_stats(self):
@@ -724,7 +724,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_11211("example.com", 11211)
+      info = worker._service_info_memcached("example.com", 11211)
     self._assert_has_finding(info, "Memcached")
 
   def test_service_elasticsearch_metadata(self):
@@ -742,7 +742,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
       return_value=resp,
     ):
-      info = worker._service_info_9200("example.com", 9200)
+      info = worker._service_info_elasticsearch("example.com", 9200)
     self._assert_has_finding(info, "Elasticsearch")
 
   def test_service_modbus_identification(self):
@@ -771,7 +771,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_502("example.com", 502)
+      info = worker._service_info_modbus("example.com", 502)
     self._assert_has_finding(info, "Modbus")
 
   def test_service_postgres_trust_auth(self):
@@ -802,7 +802,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_5432("example.com", 5432)
+      info = worker._service_info_postgresql("example.com", 5432)
     self._assert_has_finding(info, "trust authentication")
     # Verify it's CRITICAL severity
     for f in info.get("findings", []):
@@ -837,7 +837,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_5432("example.com", 5432)
+      info = worker._service_info_postgresql("example.com", 5432)
     self._assert_has_finding(info, "cleartext")
     for f in info.get("findings", []):
       if "cleartext" in f.get("title", "").lower():
@@ -869,7 +869,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_1433("example.com", 1433)
+      info = worker._service_info_mssql("example.com", 1433)
     self._assert_has_finding(info, "MSSQL")
 
   def test_service_mongo_unauth(self):
@@ -898,7 +898,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_27017("example.com", 27017)
+      info = worker._service_info_mongodb("example.com", 27017)
     self._assert_has_finding(info, "MongoDB")
 
   def test_web_graphql_introspection(self):
@@ -1085,7 +1085,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_6379("example.com", 6379)
+      info = worker._service_info_redis("example.com", 6379)
 
     self._assert_has_finding(info, "unauthenticated")
     self._assert_has_finding(info, "CONFIG")
@@ -1118,7 +1118,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_6379("example.com", 6379)
+      info = worker._service_info_redis("example.com", 6379)
 
     self._assert_has_finding(info, "requires authentication")
 
@@ -1151,7 +1151,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
       return_value=DummySocket(),
     ):
-      info = worker._service_info_3306("example.com", 3306)
+      info = worker._service_info_mysql("example.com", 3306)
 
     self.assertIsInstance(info, dict)
     self.assertEqual(info.get("version"), "8.0.28")
