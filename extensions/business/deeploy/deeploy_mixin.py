@@ -2576,95 +2576,12 @@ class _DeeployMixin:
         app_data["node_alias"] = node_alias
     return result
 
-  def _pipeline_matches_project_id(self, pipeline, project_id):
-    """
-    Validate whether a raw pipeline payload belongs to a given project.
-    """
-    if project_id is None:
-      return True
-    if not isinstance(pipeline, dict):
-      return False
-
-    deeploy_specs = (
-      pipeline.get(ct.CONFIG_STREAM.DEEPLOY_SPECS, None) or
-      pipeline.get(NetMonCt.DEEPLOY_SPECS, None) or
-      pipeline.get("DEEPLOY_SPECS", None) or
-      pipeline.get("deeploy_specs", None)
-    )
-    if not isinstance(deeploy_specs, dict):
-      return False
-    return deeploy_specs.get(DEEPLOY_KEYS.PROJECT_ID, None) == project_id
-
-  def _normalize_active_job_ids(self, active_job_ids):
-    """
-    Normalize and deduplicate active job IDs returned by blockchain calls.
-    """
-    normalized_job_ids = []
-    seen = set()
-
-    if not isinstance(active_job_ids, list):
-      return normalized_job_ids
-
-    for raw_job_id in active_job_ids:
-      try:
-        parsed_job_id = int(raw_job_id)
-      except Exception:
-        self.Pd(f"Skipping invalid active job id '{raw_job_id}' returned by blockchain.", color='y')
-        continue
-
-      if parsed_job_id in seen:
-        continue
-      seen.add(parsed_job_id)
-      normalized_job_ids.append(parsed_job_id)
-
-    return normalized_job_ids
-
-  def _normalize_active_jobs(self, active_jobs):
-    """
-    Normalize and deduplicate active job details returned by blockchain calls.
-    """
-    normalized_active_jobs = []
-    seen = set()
-
-    if not isinstance(active_jobs, list):
-      return normalized_active_jobs
-
-    for raw_job in active_jobs:
-      if not isinstance(raw_job, dict):
-        self.Pd(f"Skipping invalid active job payload '{raw_job}'.", color='y')
-        continue
-
-      raw_job_id = raw_job.get("jobId", raw_job.get("id", None))
-      try:
-        parsed_job_id = int(raw_job_id)
-      except Exception:
-        self.Pd(f"Skipping active job with invalid id '{raw_job_id}'.", color='y')
-        continue
-
-      if parsed_job_id in seen:
-        continue
-      seen.add(parsed_job_id)
-
-      normalized_active_jobs.append({
-        "job_id": parsed_job_id,
-        "raw": raw_job,
-      })
-
-    return normalized_active_jobs
-
   def _serialize_chain_job(self, raw_job):
     """
     Serialize chain job details for JSON APIs, keeping bigint-like values as strings.
     """
-    if not isinstance(raw_job, dict):
-      return None
-
-    active_nodes = raw_job.get("activeNodes", [])
-    if not isinstance(active_nodes, list):
-      active_nodes = []
-
     serialized = {
-      "id": str(raw_job.get("jobId", raw_job.get("id", ""))),
+      "id": str(raw_job.get("jobId", "")),
       "projectHash": raw_job.get("projectHash"),
       "requestTimestamp": str(raw_job.get("requestTimestamp", 0)),
       "startTimestamp": str(raw_job.get("startTimestamp", 0)),
@@ -2675,7 +2592,7 @@ class _DeeployMixin:
       "numberOfNodesRequested": str(raw_job.get("numberOfNodesRequested", 0)),
       "balance": str(raw_job.get("balance", 0)),
       "lastAllocatedEpoch": str(raw_job.get("lastAllocatedEpoch", 0)),
-      "activeNodes": [str(node) for node in active_nodes],
+      "activeNodes": [str(node) for node in raw_job.get("activeNodes", [])],
       "network": raw_job.get("network"),
       "escrowAddress": raw_job.get("escrowAddress"),
     }
@@ -2687,15 +2604,9 @@ class _DeeployMixin:
     """
     if project_id is None:
       return True
-    if not isinstance(chain_job, dict):
-      return False
+    return str(chain_job["projectHash"]).lower() == str(project_id).lower()
 
-    chain_project_id = chain_job.get("projectHash", None)
-    if chain_project_id is None:
-      return False
-    return str(chain_project_id).lower() == str(project_id).lower()
-
-  def _get_apps_by_escrow_active_jobs(self, sender_escrow=None, owner=None, project_id=None):
+  def _get_apps_by_escrow_active_jobs(self, sender_escrow, owner, project_id=None):
     """
     Build get_apps payload using active SC job IDs as source of truth, with optional online snapshots.
 
@@ -2703,21 +2614,17 @@ class _DeeployMixin:
       {
         "<job_id>": {
           "job_id": <int>,
-          "pipeline_cid": <str|None>,
-          "pipeline": <dict|None>,   # raw R1FS payload
-          "online": <dict>,          # online apps snapshot keyed by node
+          "pipeline": <dict|None>,  # raw R1FS payload
+          "chain_job": <dict>,      # serialized chain job details
+          "online": <dict>,         # online apps snapshot keyed by node
         }
       }
     """
     result = {}
-    if not sender_escrow:
-      return result
 
-    raw_active_jobs = self.bc.get_escrow_active_jobs(sender_escrow)
-    active_jobs = self._normalize_active_jobs(raw_active_jobs)
-    self.Pd(f"Escrow {sender_escrow} active jobs: {[job['job_id'] for job in active_jobs]}")
-
-    active_job_ids = [job["job_id"] for job in active_jobs]
+    active_jobs = self.bc.get_escrow_active_jobs(sender_escrow)
+    active_job_ids = [int(job["jobId"]) for job in active_jobs]
+    self.Pd(f"Fetched {len(active_job_ids)} active jobs from escrow {sender_escrow}, fetching details")
 
     # Fetch online apps once, then reuse grouped entries per job_id.
     all_online_apps = self._get_online_apps(
@@ -2727,58 +2634,39 @@ class _DeeployMixin:
     )
 
     online_apps_by_job_id = self.defaultdict(lambda: self.defaultdict(dict))
-    if isinstance(all_online_apps, dict):
-      for node, apps in all_online_apps.items():
-        if not isinstance(apps, dict):
-          self.Pd(f"Skipping malformed online apps payload for node {node}.", color='y')
-          continue
-        for app_name, app_data in apps.items():
-          app_job_id = app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None)
-          if app_job_id is None:
-            continue
-          online_apps_by_job_id[app_job_id][node][app_name] = app_data
+    for node, apps in all_online_apps.items():
+      for app_name, app_data in apps.items():
+        app_job_id = int(app_data[NetMonCt.DEEPLOY_SPECS][DEEPLOY_KEYS.JOB_ID])
+        online_apps_by_job_id[app_job_id][node][app_name] = app_data
 
     for active_job in active_jobs:
-      job_id = active_job["job_id"]
-      chain_job = self._serialize_chain_job(active_job.get("raw", {}))
+      job_id = int(active_job["jobId"])
+      chain_job = self._serialize_chain_job(active_job)
       chain_matches_project = self._chain_job_matches_project_id(chain_job, project_id)
 
-      online_apps = {}
       grouped_online_apps = online_apps_by_job_id.get(job_id, {})
-      if isinstance(grouped_online_apps, dict):
-        online_apps = {node: dict(apps) for node, apps in grouped_online_apps.items() if isinstance(apps, dict)}
+      online_apps = {node: dict(apps) for node, apps in grouped_online_apps.items()}
 
-      pipeline_cid = None
       pipeline = None
       try:
-        pipeline_cid = self._get_pipeline_from_cstore(job_id)
-        if pipeline_cid:
-          pipeline = self.get_pipeline_from_r1fs(pipeline_cid)
+        pipeline = self.get_job_pipeline_from_cstore(job_id)
       except Exception as exc:
         self.Pd(f"Failed to load R1FS payload for job {job_id}: {exc}", color='y')
         pipeline = None
-        pipeline_cid = None
 
-      if pipeline is not None and owner is not None:
-        pipeline_owner = (
-          pipeline.get(ct.CONFIG_STREAM.K_OWNER, None) or
-          pipeline.get(NetMonCt.OWNER, None) or
-          pipeline.get("OWNER", None) or
-          pipeline.get("owner", None)
-        )
-        if pipeline_owner is not None and pipeline_owner != owner:
+      if pipeline is not None:
+        pipeline_owner = pipeline[NetMonCt.OWNER]
+        if pipeline_owner != owner:
           self.Pd(
             f"Skipping R1FS payload for job {job_id}: owner mismatch "
             f"(expected {owner}, got {pipeline_owner}).",
             color='y'
           )
           pipeline = None
-          pipeline_cid = None
 
-      if pipeline is not None and project_id is not None and not self._pipeline_matches_project_id(pipeline, project_id):
+      if pipeline.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.PROJECT_ID) != project_id:
         self.Pd(f"Skipping R1FS payload for job {job_id}: project_id mismatch.", color='y')
         pipeline = None
-        pipeline_cid = None
 
       if pipeline is None and len(online_apps) == 0 and project_id is not None and not chain_matches_project:
         # If a project filter is requested and neither source matches, skip this job.
@@ -2786,8 +2674,7 @@ class _DeeployMixin:
 
       result[str(job_id)] = {
         DEEPLOY_KEYS.JOB_ID: job_id,
-        DEEPLOY_KEYS.PIPELINE_CID: pipeline_cid if pipeline is not None else None,
-        DEEPLOY_KEYS.PIPELINE: pipeline if pipeline is not None else None,
+        DEEPLOY_KEYS.PIPELINE: pipeline,
         DEEPLOY_KEYS.ONLINE: online_apps,
         DEEPLOY_KEYS.CHAIN_JOB: chain_job,
       }
