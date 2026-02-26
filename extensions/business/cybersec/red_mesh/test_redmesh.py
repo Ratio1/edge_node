@@ -1263,6 +1263,107 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     self.assertEqual(worker.state["port_protocols"][3306], "mysql")
 
+  def test_fingerprint_telnet_real_iac(self):
+    """Banner starting with a valid IAC WILL sequence should be fingerprinted as telnet."""
+    owner, worker = self._build_worker(ports=[2323])
+    worker.state["open_ports"] = [2323]
+    worker.target = "10.0.0.1"
+
+    # IAC WILL ECHO (0xFF 0xFB 0x01) — valid telnet negotiation per RFC 854
+    telnet_banner = b'\xff\xfb\x01\xff\xfb\x03'
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = telnet_banner
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+      worker._fingerprint_ports()
+
+    self.assertEqual(worker.state["port_protocols"][2323], "telnet")
+
+  def test_fingerprint_telnet_false_positive_0xff(self):
+    """Binary data starting with 0xFF but no valid IAC command must NOT be classified as telnet."""
+    owner, worker = self._build_worker(ports=[8502])
+    worker.state["open_ports"] = [8502]
+    worker.target = "10.0.0.1"
+
+    # 0xFF followed by 0x01 — not a valid IAC command byte (WILL=0xFB, WONT=0xFC, DO=0xFD, DONT=0xFE)
+    fake_binary = b'\xff\x01\x03\x00\x00\x05\x01\x2b'
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = fake_binary
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+      worker._fingerprint_ports()
+
+    self.assertNotEqual(worker.state["port_protocols"][8502], "telnet")
+
+  def test_fingerprint_telnet_login_prompt(self):
+    """A text banner containing 'login:' should still be fingerprinted as telnet."""
+    owner, worker = self._build_worker(ports=[2323])
+    worker.state["open_ports"] = [2323]
+    worker.target = "10.0.0.1"
+
+    login_banner = b'Ubuntu 22.04 LTS\r\nlogin: '
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = login_banner
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+      worker._fingerprint_ports()
+
+    self.assertEqual(worker.state["port_protocols"][2323], "telnet")
+
+  def test_fingerprint_modbus_wrong_function_code(self):
+    """Response with protocol ID 0x0000 but wrong function code must NOT be classified as modbus."""
+    owner, worker = self._build_worker(ports=[1024])
+    worker.state["open_ports"] = [1024]
+    worker.target = "10.0.0.1"
+
+    # Protocol ID 0x0000 at bytes 2-3, but function code at byte 7 is 0x01 (not 0x2B)
+    bad_modbus = b'\x00\x01\x00\x00\x00\x05\x01\x01\x00\x00\x00'
+
+    call_index = [0]
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = b""
+      idx = call_index[0]
+      call_index[0] += 1
+      if idx == 3:  # modbus probe is the 4th socket
+        mock_sock.recv.return_value = bad_modbus
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+      worker._fingerprint_ports()
+
+    self.assertNotEqual(worker.state["port_protocols"][1024], "modbus")
+
+  def test_fingerprint_mysql_bad_payload_length(self):
+    """MySQL-like bytes but absurd payload length prefix must NOT be classified as mysql."""
+    owner, worker = self._build_worker(ports=[9999])
+    worker.state["open_ports"] = [9999]
+    worker.target = "10.0.0.1"
+
+    # Payload length = 0x000001 (1 byte) — too small for a real MySQL handshake
+    # seq=0x00, protocol=0x0a, then "5\x00" as a tiny version
+    fake_pkt = b'\x01\x00\x00\x00\x0a5\x00'
+
+    def fake_socket_factory(*args, **kwargs):
+      mock_sock = MagicMock()
+      mock_sock.recv.return_value = fake_pkt
+      return mock_sock
+
+    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+      worker._fingerprint_ports()
+
+    self.assertNotEqual(worker.state["port_protocols"][9999], "mysql")
+
   # ===== NEW TESTS — VPN endpoint detection =====
 
   def test_vpn_endpoint_detection(self):
