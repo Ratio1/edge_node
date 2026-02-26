@@ -1644,7 +1644,7 @@ class TestCorrelationEngine(unittest.TestCase):
     worker._emit_metadata("os_claims", "ssh:22", "Ubuntu")
 
   def test_mysql_salt_low_entropy(self):
-    """All-same-byte MySQL salt should trigger honeypot finding."""
+    """All-same-byte MySQL salt should trigger low entropy finding."""
     _, worker = self._build_worker(ports=[3306])
     # Build a MySQL handshake with all-zero salt bytes
     version = b"5.7.99-fake"
@@ -1729,7 +1729,7 @@ class TestCorrelationEngine(unittest.TestCase):
     self.assertTrue(found, f"Expected PASV IP leak finding, got: {info.get('findings', [])}")
 
   def test_web_200_for_all(self):
-    """200 on random path should trigger honeypot finding."""
+    """200 on random path should trigger catch-all finding."""
     _, worker = self._build_worker()
 
     def fake_get(url, timeout=2, verify=False):
@@ -1817,6 +1817,8 @@ class TestCorrelationEngine(unittest.TestCase):
         pass
       def get_security_options(self):
         return DummySecOpts()
+      def get_remote_server_key(self):
+        return None
       def close(self):
         pass
 
@@ -1843,6 +1845,388 @@ class TestCorrelationEngine(unittest.TestCase):
     self.assertIn("correlation_completed", worker.state["completed_tests"])
 
 
+class TestScannerEnhancements(unittest.TestCase):
+  """Tests for the 5 partial scanner enhancements (Tier 1)."""
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [80]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-enh",
+      initiator="init@example",
+      local_id_prefix="E",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  # --- Item 1: TLS validity period ---
+
+  def test_tls_validity_period_10yr(self):
+    """Certificate with 10-year validity should flag MEDIUM."""
+    _, worker = self._build_worker(ports=[443])
+    try:
+      from cryptography import x509
+      from cryptography.x509.oid import NameOID
+      from cryptography.hazmat.primitives import hashes, serialization
+      from cryptography.hazmat.primitives.asymmetric import rsa
+      import datetime
+
+      key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+      subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test.example.com")])
+      cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_after(datetime.datetime(2030, 1, 1, tzinfo=datetime.timezone.utc))
+        .sign(key, hashes.SHA256())
+      )
+      cert_der = cert.public_bytes(serialization.Encoding.DER)
+
+      findings = worker._tls_check_validity_period(cert_der)
+      self.assertEqual(len(findings), 1)
+      self.assertEqual(findings[0].severity, "MEDIUM")
+      self.assertIn("validity span", findings[0].title.lower())
+    except ImportError:
+      self.skipTest("cryptography library not available")
+
+  def test_tls_validity_period_1yr(self):
+    """Certificate with 1-year validity should produce no finding."""
+    _, worker = self._build_worker(ports=[443])
+    try:
+      from cryptography import x509
+      from cryptography.x509.oid import NameOID
+      from cryptography.hazmat.primitives import hashes, serialization
+      from cryptography.hazmat.primitives.asymmetric import rsa
+      import datetime
+
+      key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+      subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "test.example.com")])
+      cert = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(subject)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime(2024, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_after(datetime.datetime(2025, 1, 1, tzinfo=datetime.timezone.utc))
+        .sign(key, hashes.SHA256())
+      )
+      cert_der = cert.public_bytes(serialization.Encoding.DER)
+
+      findings = worker._tls_check_validity_period(cert_der)
+      self.assertEqual(len(findings), 0)
+    except ImportError:
+      self.skipTest("cryptography library not available")
+
+  # --- Item 2: Redis stale persistence ---
+
+  def test_redis_persistence_stale(self):
+    """rdb_last_bgsave_time 400 days old should flag LOW."""
+    _, worker = self._build_worker(ports=[6379])
+    import time
+
+    stale_ts = int(time.time()) - 400 * 86400
+
+    cmd_responses = {
+      "PING": "+PONG\r\n",
+      "INFO server": "$50\r\nredis_version:7.0.0\r\nos:Linux\r\n",
+      "CONFIG GET dir": "-ERR\r\n",
+      "DBSIZE": ":0\r\n",
+      "CLIENT LIST": "-ERR\r\n",
+      "INFO persistence": f"$50\r\nrdb_last_bgsave_time:{stale_ts}\r\n",
+    }
+
+    class DummySocket:
+      def __init__(self, *a, **kw):
+        self._buf = b""
+      def settimeout(self, t):
+        return None
+      def connect(self, addr):
+        return None
+      def sendall(self, data):
+        cmd = data.decode().strip()
+        self._buf = cmd_responses.get(cmd, "-ERR\r\n").encode()
+      def recv(self, nbytes):
+        data = self._buf
+        self._buf = b""
+        return data
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      info = worker._service_info_redis("example.com", 6379)
+
+    found = any("stale" in f.get("title", "").lower() for f in info.get("findings", []))
+    self.assertTrue(found, f"Expected stale persistence finding, got: {info.get('findings', [])}")
+
+  def test_redis_persistence_never_saved(self):
+    """rdb_last_bgsave_time=0 should flag LOW (never saved)."""
+    _, worker = self._build_worker(ports=[6379])
+
+    cmd_responses = {
+      "PING": "+PONG\r\n",
+      "INFO server": "$50\r\nredis_version:7.0.0\r\nos:Linux\r\n",
+      "CONFIG GET dir": "-ERR\r\n",
+      "DBSIZE": ":0\r\n",
+      "CLIENT LIST": "-ERR\r\n",
+      "INFO persistence": "$30\r\nrdb_last_bgsave_time:0\r\n",
+    }
+
+    class DummySocket:
+      def __init__(self, *a, **kw):
+        self._buf = b""
+      def settimeout(self, t):
+        return None
+      def connect(self, addr):
+        return None
+      def sendall(self, data):
+        cmd = data.decode().strip()
+        self._buf = cmd_responses.get(cmd, "-ERR\r\n").encode()
+      def recv(self, nbytes):
+        data = self._buf
+        self._buf = b""
+        return data
+      def close(self):
+        return None
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      return_value=DummySocket(),
+    ):
+      info = worker._service_info_redis("example.com", 6379)
+
+    found = any("never" in f.get("title", "").lower() for f in info.get("findings", []))
+    self.assertTrue(found, f"Expected never-saved finding, got: {info.get('findings', [])}")
+
+  # --- Item 3: SSH RSA key size ---
+
+  def test_ssh_rsa_1024_high(self):
+    """1024-bit RSA key should flag HIGH."""
+    _, worker = self._build_worker(ports=[22])
+
+    class DummyKey:
+      def get_name(self):
+        return "ssh-rsa"
+      def get_bits(self):
+        return 1024
+
+    class DummySecOpts:
+      ciphers = ["aes256-ctr"]
+      kex = ["curve25519-sha256"]
+      key_types = ["ssh-rsa"]
+
+    class DummyTransport:
+      def __init__(self, *a, **kw): pass
+      def connect(self): pass
+      def get_security_options(self): return DummySecOpts()
+      def get_remote_server_key(self): return DummyKey()
+      def close(self): pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.paramiko.Transport",
+      return_value=DummyTransport(),
+    ):
+      findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
+    found = any("critically weak" in f.title.lower() and "1024" in f.title for f in findings)
+    self.assertTrue(found, f"Expected HIGH RSA finding, got: {[f.title for f in findings]}")
+    sev = [f.severity for f in findings if "1024" in f.title]
+    self.assertTrue(any(s == "HIGH" or str(s) == "HIGH" or getattr(s, 'value', None) == "HIGH" for s in sev))
+
+  def test_ssh_rsa_2048_low(self):
+    """2048-bit RSA key should flag LOW (below NIST recommendation)."""
+    _, worker = self._build_worker(ports=[22])
+
+    class DummyKey:
+      def get_name(self):
+        return "ssh-rsa"
+      def get_bits(self):
+        return 2048
+
+    class DummySecOpts:
+      ciphers = ["aes256-ctr"]
+      kex = ["curve25519-sha256"]
+      key_types = ["ssh-rsa"]
+
+    class DummyTransport:
+      def __init__(self, *a, **kw): pass
+      def connect(self): pass
+      def get_security_options(self): return DummySecOpts()
+      def get_remote_server_key(self): return DummyKey()
+      def close(self): pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.paramiko.Transport",
+      return_value=DummyTransport(),
+    ):
+      findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
+    found = any("nist" in f.title.lower() and "2048" in f.title for f in findings)
+    self.assertTrue(found, f"Expected LOW RSA finding, got: {[f.title for f in findings]}")
+    sev = [f.severity for f in findings if "2048" in f.title]
+    self.assertTrue(any(s == "LOW" or str(s) == "LOW" or getattr(s, 'value', None) == "LOW" for s in sev))
+
+  def test_ssh_rsa_4096_no_finding(self):
+    """4096-bit RSA key should produce no RSA-related finding."""
+    _, worker = self._build_worker(ports=[22])
+
+    class DummyKey:
+      def get_name(self):
+        return "ssh-rsa"
+      def get_bits(self):
+        return 4096
+
+    class DummySecOpts:
+      ciphers = ["aes256-ctr"]
+      kex = ["curve25519-sha256"]
+      key_types = ["ssh-rsa"]
+
+    class DummyTransport:
+      def __init__(self, *a, **kw): pass
+      def connect(self): pass
+      def get_security_options(self): return DummySecOpts()
+      def get_remote_server_key(self): return DummyKey()
+      def close(self): pass
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.paramiko.Transport",
+      return_value=DummyTransport(),
+    ):
+      findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
+    rsa_findings = [f for f in findings if "rsa" in f.title.lower()]
+    self.assertEqual(len(rsa_findings), 0, f"Expected no RSA findings, got: {[f.title for f in rsa_findings]}")
+
+  # --- Item 4: SMTP K8s pod name + .internal ---
+
+  def test_smtp_k8s_pod_hostname(self):
+    """K8s-style pod hostname should flag LOW."""
+    _, worker = self._build_worker(ports=[25])
+
+    class DummySMTP:
+      def __init__(self, timeout=5): pass
+      def connect(self, target, port):
+        return (220, b"ESMTP ready")
+      def ehlo(self, identity):
+        return (250, b"nginx-7f4b5c9d-kx9wqmrt Hello client [1.2.3.4]")
+      def docmd(self, cmd):
+        return (500, b"unrecognized")
+      def quit(self): pass
+
+    with patch(
+      "smtplib.SMTP",
+      return_value=DummySMTP(),
+    ):
+      info = worker._service_info_smtp("example.com", 25)
+
+    self.assertIsInstance(info, dict)
+    found = any("kubernetes" in f.get("title", "").lower() or "pod name" in f.get("title", "").lower()
+                for f in info.get("findings", []))
+    self.assertTrue(found, f"Expected K8s pod finding, got: {info.get('findings', [])}")
+
+  def test_smtp_internal_hostname(self):
+    """Hostname ending in .internal should flag LOW."""
+    _, worker = self._build_worker(ports=[25])
+
+    class DummySMTP:
+      def __init__(self, timeout=5): pass
+      def connect(self, target, port):
+        return (220, b"ESMTP ready")
+      def ehlo(self, identity):
+        return (250, b"ip-10-0-1-5.ec2.internal Hello client [1.2.3.4]")
+      def docmd(self, cmd):
+        return (500, b"unrecognized")
+      def quit(self): pass
+
+    with patch(
+      "smtplib.SMTP",
+      return_value=DummySMTP(),
+    ):
+      info = worker._service_info_smtp("example.com", 25)
+
+    self.assertIsInstance(info, dict)
+    found = any(".internal" in f.get("title", "").lower() or "cloud-internal" in f.get("title", "").lower()
+                for f in info.get("findings", []))
+    self.assertTrue(found, f"Expected .internal finding, got: {info.get('findings', [])}")
+
+  # --- Item 5: Web endpoint probe extension ---
+
+  def test_web_xmlrpc_endpoint(self):
+    """xmlrpc.php returning 200 should flag MEDIUM."""
+    _, worker = self._build_worker()
+
+    def fake_get(url, timeout=2, verify=False):
+      resp = MagicMock()
+      resp.headers = {}
+      resp.text = ""
+      if url.endswith("/xmlrpc.php"):
+        resp.status_code = 200
+      else:
+        resp.status_code = 404
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_common("example.com", 80)
+    found = any("xmlrpc" in f.get("title", "").lower() for f in result.get("findings", []))
+    self.assertTrue(found, f"Expected xmlrpc finding, got: {result.get('findings', [])}")
+
+  def test_web_wp_login_endpoint(self):
+    """wp-login.php returning 200 should flag LOW."""
+    _, worker = self._build_worker()
+
+    def fake_get(url, timeout=2, verify=False):
+      resp = MagicMock()
+      resp.headers = {}
+      resp.text = ""
+      if url.endswith("/wp-login.php"):
+        resp.status_code = 200
+      else:
+        resp.status_code = 404
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_common("example.com", 80)
+    found = any("wp-login" in f.get("title", "").lower() for f in result.get("findings", []))
+    self.assertTrue(found, f"Expected wp-login finding, got: {result.get('findings', [])}")
+
+  def test_web_security_txt_endpoint(self):
+    """security.txt returning 200 should produce INFO finding."""
+    _, worker = self._build_worker()
+
+    def fake_get(url, timeout=2, verify=False):
+      resp = MagicMock()
+      resp.headers = {}
+      resp.text = ""
+      if url.endswith("/.well-known/security.txt"):
+        resp.status_code = 200
+      else:
+        resp.status_code = 404
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_common("example.com", 80)
+    found = any("security.txt" in f.get("title", "").lower() or "security policy" in f.get("description", "").lower()
+                for f in result.get("findings", []))
+    self.assertTrue(found, f"Expected security.txt finding, got: {result.get('findings', [])}")
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -1855,4 +2239,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestFindingsModule))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestCveDatabase))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestCorrelationEngine))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestScannerEnhancements))
   runner.run(suite)

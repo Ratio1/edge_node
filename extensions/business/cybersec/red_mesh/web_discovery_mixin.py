@@ -32,18 +32,18 @@ class _WebDiscoveryMixin:
     if port not in (80, 443):
       base_url = f"{scheme}://{target}:{port}"
 
-    # --- Honeypot detection: 200-for-all ---
+    # --- Catch-all detection: 200-for-all ---
     try:
       canary_path = f"/{_uuid.uuid4().hex}"
       canary_resp = requests.get(base_url + canary_path, timeout=2, verify=False)
       if canary_resp.status_code == 200:
         findings_list.append(Finding(
           severity=Severity.HIGH,
-          title="Web server returns 200 for random paths (possible honeypot)",
+          title="Web server returns 200 for random paths",
           description="A request to a non-existent random UUID path returned HTTP 200, "
-                      "suggesting a catch-all honeypot or severely misconfigured server.",
+                      "suggesting a catch-all rule or severely misconfigured server.",
           evidence=f"GET {base_url}{canary_path} returned 200.",
-          remediation="Investigate — this host may be a honeypot.",
+          remediation="Investigate the catch-all behavior; ensure proper 404 responses for unknown paths.",
           cwe_id="CWE-345",
           confidence="firm",
         ))
@@ -62,6 +62,12 @@ class _WebDiscoveryMixin:
         "Robots.txt present — may reveal hidden paths."),
       "/login": (Severity.INFO, "", "",
         "Login page accessible."),
+      "/xmlrpc.php": (Severity.MEDIUM, "CWE-288", "A01:2021",
+        "WordPress XML-RPC endpoint — brute-force amplification and DDoS vector."),
+      "/wp-login.php": (Severity.LOW, "CWE-200", "A01:2021",
+        "WordPress login page accessible — confirms WordPress deployment."),
+      "/.well-known/security.txt": (Severity.INFO, "", "",
+        "Security policy (RFC 9116) published."),
     }
 
     try:
@@ -227,7 +233,7 @@ class _WebDiscoveryMixin:
               severity=Severity.MEDIUM,
               title=f"Technology mismatch: {raw['generator']} on {raw['server']}",
               description=f"{raw['generator']} typically runs on {expected_tech}, "
-                          f"but server is {raw['server']}. Possible honeypot or proxy.",
+                          f"but server is {raw['server']}. Possible reverse proxy or misconfiguration.",
               evidence=f"Generator={raw['generator']}, Server={raw['server']}",
               remediation="Verify this is intentional.",
               confidence="tentative",

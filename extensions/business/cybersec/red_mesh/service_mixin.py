@@ -346,6 +346,7 @@ class _ServiceInfoMixin:
         except (ValueError, TypeError):
           pass
       findings += self._tls_check_signature_algorithm(cert_der)
+      findings += self._tls_check_validity_period(cert_der)
 
     # Pass 2: Verified — detect self-signed / chain issues
     findings += self._tls_check_certificate(target, port, raw)
@@ -557,11 +558,35 @@ class _ServiceInfoMixin:
       pass
     return findings
 
+  def _tls_check_validity_period(self, cert_der):
+    """Flag certificates with a total validity span >5 years (CA/Browser Forum violation)."""
+    findings = []
+    if not cert_der:
+      return findings
+    try:
+      from cryptography import x509
+      cert = x509.load_der_x509_certificate(cert_der)
+      span = cert.not_valid_after_utc - cert.not_valid_before_utc
+      if span.days > 5 * 365:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title=f"TLS certificate validity span exceeds 5 years ({span.days} days)",
+          description="Certificates valid for more than 5 years violate CA/Browser Forum baseline requirements.",
+          evidence=f"not_before={cert.not_valid_before_utc}, not_after={cert.not_valid_after_utc}, span={span.days}d",
+          remediation="Reissue with a validity period of 398 days or less.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-298",
+          confidence="certain",
+        ))
+    except Exception:
+      pass
+    return findings
+
 
   def _service_info_ftp(self, target, port):  # default port: 21
     """
     Assess FTP service security: banner, anonymous access, default creds,
-    server fingerprint, TLS support, write access, and honeypot detection.
+    server fingerprint, TLS support, write access, and credential validation.
 
     Checks performed (in order):
 
@@ -571,7 +596,7 @@ class _ServiceInfoMixin:
     4. Directory listing and traversal.
     5. TLS support check (AUTH TLS).
     6. Default credential check.
-    7. Honeypot detection — random credentials accepted.
+    7. Arbitrary credential acceptance test.
 
     Parameters
     ----------
@@ -806,7 +831,7 @@ class _ServiceInfoMixin:
       except Exception:
         pass
 
-    # --- 7. Honeypot detection — try random credentials ---
+    # --- 7. Arbitrary credential acceptance test ---
     import string as _string
     ruser = "".join(random.choices(_string.ascii_lowercase, k=8))
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
@@ -814,10 +839,10 @@ class _ServiceInfoMixin:
       ftp_rand = _ftp_connect(ruser, rpass)
       findings.append(Finding(
         severity=Severity.CRITICAL,
-        title="FTP accepts arbitrary credentials (possible honeypot).",
-        description="Random credentials were accepted, indicating a honeypot or dangerous misconfiguration.",
+        title="FTP accepts arbitrary credentials",
+        description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
         evidence=f"Accepted random creds {ruser}:{rpass}",
-        remediation="Investigate immediately — this host may be a honeypot or compromised.",
+        remediation="Investigate immediately — authentication is non-functional.",
         owasp_id="A07:2021",
         cwe_id="CWE-287",
         confidence="certain",
@@ -842,8 +867,7 @@ class _ServiceInfoMixin:
     1. Banner grab — fingerprint server version.
     2. Auth method enumeration — identify if password auth is enabled.
     3. Default credential check — try a small list of common creds.
-    4. Weak credential acceptance — flag if *any* password is accepted
-       (strong honeypot indicator).
+    4. Arbitrary credential acceptance test.
 
     Parameters
     ----------
@@ -925,7 +949,7 @@ class _ServiceInfoMixin:
       except Exception:
         break  # connection issue, stop trying
 
-    # --- 4. Honeypot / any-password detection ---
+    # --- 4. Arbitrary credential acceptance test ---
     random_user = f"probe_{random.randint(10000, 99999)}"
     random_pass = f"rnd_{random.randint(10000, 99999)}"
     try:
@@ -939,10 +963,10 @@ class _ServiceInfoMixin:
       )
       findings.append(Finding(
         severity=Severity.CRITICAL,
-        title="SSH accepts ANY credentials — possible honeypot or severely misconfigured service.",
-        description="Random credentials were accepted, indicating a honeypot or dangerous misconfiguration.",
+        title="SSH accepts arbitrary credentials",
+        description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
         evidence=f"Accepted random creds {random_user}:{random_pass}",
-        remediation="Investigate immediately — this host may be a honeypot or compromised.",
+        remediation="Investigate immediately — authentication is non-functional.",
         owasp_id="A07:2021",
         cwe_id="CWE-287",
         confidence="certain",
@@ -1010,6 +1034,38 @@ class _ServiceInfoMixin:
       ciphers = set(sec_opts.ciphers) if sec_opts.ciphers else set()
       kex = set(sec_opts.kex) if sec_opts.kex else set()
       key_types = set(sec_opts.key_types) if sec_opts.key_types else set()
+
+      # RSA key size check — must be done before transport.close()
+      try:
+        remote_key = transport.get_remote_server_key()
+        if remote_key is not None and remote_key.get_name() == "ssh-rsa":
+          key_bits = remote_key.get_bits()
+          if key_bits < 2048:
+            findings.append(Finding(
+              severity=Severity.HIGH,
+              title=f"SSH RSA key is critically weak ({key_bits}-bit)",
+              description=f"The server's RSA host key is only {key_bits}-bit, which is trivially factorable.",
+              evidence=f"RSA key size: {key_bits} bits",
+              remediation="Generate a new RSA key of at least 3072 bits, or switch to Ed25519.",
+              owasp_id="A02:2021",
+              cwe_id="CWE-326",
+              confidence="certain",
+            ))
+            weak_labels.append(f"rsa_key: {key_bits}-bit")
+          elif key_bits < 3072:
+            findings.append(Finding(
+              severity=Severity.LOW,
+              title=f"SSH RSA key below NIST recommendation ({key_bits}-bit)",
+              description=f"The server's RSA host key is {key_bits}-bit. NIST recommends >=3072-bit after 2023.",
+              evidence=f"RSA key size: {key_bits} bits",
+              remediation="Generate a new RSA key of at least 3072 bits, or switch to Ed25519.",
+              owasp_id="A02:2021",
+              cwe_id="CWE-326",
+              confidence="certain",
+            ))
+            weak_labels.append(f"rsa_key: {key_bits}-bit")
+      except Exception:
+        pass
 
       transport.close()
 
@@ -1183,6 +1239,30 @@ class _ServiceInfoMixin:
           description="The EHLO response reveals a container ID or internal hostname.",
           evidence=f"Hostname: {hostname}",
           remediation="Configure the SMTP server to use a proper FQDN instead of the container ID.",
+          owasp_id="A05:2021",
+          cwe_id="CWE-200",
+          confidence="firm",
+        ))
+      if _re.match(r'^[a-z0-9-]+-[a-z0-9]{8,10}$', hostname):
+        self._emit_metadata("container_ids", {"id": hostname, "source": f"smtp_k8s:{port}"})
+        findings.append(Finding(
+          severity=Severity.LOW,
+          title=f"SMTP hostname matches Kubernetes pod name pattern: {hostname}",
+          description="The EHLO hostname resembles a Kubernetes pod name (deployment-replicaset-podid).",
+          evidence=f"Hostname: {hostname}",
+          remediation="Configure the SMTP server to use a proper FQDN instead of the pod name.",
+          owasp_id="A05:2021",
+          cwe_id="CWE-200",
+          confidence="firm",
+        ))
+      if hostname.endswith('.internal'):
+        self._emit_metadata("container_ids", {"id": hostname, "source": f"smtp_internal:{port}"})
+        findings.append(Finding(
+          severity=Severity.LOW,
+          title=f"SMTP hostname uses cloud-internal DNS suffix: {hostname}",
+          description="The EHLO hostname ends with '.internal', indicating AWS/GCP internal DNS.",
+          evidence=f"Hostname: {hostname}",
+          remediation="Configure the SMTP server to use a public FQDN instead of internal DNS.",
           owasp_id="A05:2021",
           cwe_id="CWE-200",
           confidence="firm",
@@ -1367,11 +1447,11 @@ class _ServiceInfoMixin:
                 if entropy < 2.0:
                   findings.append(Finding(
                     severity=Severity.HIGH,
-                    title=f"MySQL salt entropy critically low ({entropy:.2f} bits) — possible honeypot",
+                    title=f"MySQL salt entropy critically low ({entropy:.2f} bits)",
                     description="The authentication scramble has abnormally low entropy, "
-                                "suggesting a fake MySQL service or honeypot.",
+                                "suggesting a non-standard or deceptive MySQL service.",
                     evidence=f"salt_entropy={entropy:.2f}, salt_hex={full_salt.hex()[:40]}",
-                    remediation="Investigate this host — it may be a honeypot.",
+                    remediation="Investigate this MySQL instance — authentication randomness is insufficient.",
                     cwe_id="CWE-330",
                     confidence="firm",
                   ))
@@ -1581,6 +1661,7 @@ class _ServiceInfoMixin:
     findings += self._redis_check_config(sock, raw)
     findings += self._redis_check_data(sock, raw)
     findings += self._redis_check_clients(sock, raw)
+    findings += self._redis_check_persistence(sock, raw)
 
     # CVE check
     if raw["version"]:
@@ -1665,7 +1746,7 @@ class _ServiceInfoMixin:
       findings.append(Finding(
         severity=Severity.INFO,
         title=f"Redis uptime <60s ({uptime_seconds}s) — possible container restart",
-        description="Very low uptime may indicate a recently restarted container or ephemeral honeypot.",
+        description="Very low uptime may indicate a recently restarted container or ephemeral instance.",
         evidence=f"uptime_in_seconds={uptime_seconds}",
         remediation="Investigate if the service is being automatically restarted.",
         confidence="tentative",
@@ -1740,11 +1821,50 @@ class _ServiceInfoMixin:
       ))
     return findings
 
+  def _redis_check_persistence(self, sock, raw):
+    """Check INFO persistence for missing or stale RDB saves."""
+    findings = []
+    resp = self._redis_cmd(sock, "INFO persistence")
+    if resp.startswith("-"):
+      return findings
+    import time as _time
+    for line in resp.split("\r\n"):
+      if line.startswith("rdb_last_bgsave_time:"):
+        try:
+          ts = int(line.split(":", 1)[1].strip())
+          if ts == 0:
+            findings.append(Finding(
+              severity=Severity.LOW,
+              title="Redis has never performed an RDB save",
+              description="rdb_last_bgsave_time is 0, meaning no background save has ever been performed. "
+                          "This may indicate a cache-only instance with persistence disabled, or an ephemeral deployment.",
+              evidence="rdb_last_bgsave_time=0",
+              remediation="Verify whether RDB persistence is intentionally disabled; if not, configure BGSAVE.",
+              cwe_id="CWE-345",
+              confidence="tentative",
+            ))
+          elif (_time.time() - ts) > 365 * 86400:
+            age_days = int((_time.time() - ts) / 86400)
+            findings.append(Finding(
+              severity=Severity.LOW,
+              title=f"Redis RDB save is stale ({age_days} days old)",
+              description="The last RDB background save timestamp is over 1 year old. "
+                          "This may indicate disabled persistence, a long-running cache-only instance, or stale data.",
+              evidence=f"rdb_last_bgsave_time={ts}, age={age_days}d",
+              remediation="Verify persistence configuration; stale saves may indicate data loss risk.",
+              cwe_id="CWE-345",
+              confidence="tentative",
+            ))
+        except (ValueError, IndexError):
+          pass
+        break
+    return findings
+
 
   def _service_info_telnet(self, target, port):  # default port: 23
     """
     Assess Telnet service security: banner, negotiation options, default
-    credentials, privilege level, system fingerprint, and honeypot detection.
+    credentials, privilege level, system fingerprint, and credential validation.
 
     Checks performed (in order):
 
@@ -1752,7 +1872,7 @@ class _ServiceInfoMixin:
     2. Default credential check — try common user:pass combos.
     3. Privilege escalation check — report if root shell is obtained.
     4. System fingerprint — run ``id`` and ``uname -a`` on successful login.
-    5. Honeypot detection — random credentials should be rejected.
+    5. Arbitrary credential acceptance test.
 
     Parameters
     ----------
@@ -1971,7 +2091,7 @@ class _ServiceInfoMixin:
           result["system_info"] = " | ".join(parts)
           system_info_captured = True
 
-    # --- 5. Honeypot detection — random credentials ---
+    # --- 5. Arbitrary credential acceptance test ---
     import string as _string
     ruser = "".join(random.choices(_string.ascii_lowercase, k=8))
     rpass = "".join(random.choices(_string.ascii_letters + _string.digits, k=12))
@@ -1979,10 +2099,10 @@ class _ServiceInfoMixin:
     if success:
       findings.append(Finding(
         severity=Severity.CRITICAL,
-        title="Telnet accepts arbitrary credentials (possible honeypot).",
-        description="Random credentials were accepted, indicating a honeypot or dangerous misconfiguration.",
+        title="Telnet accepts arbitrary credentials",
+        description="Random credentials were accepted, indicating a dangerous misconfiguration or deceptive service.",
         evidence=f"Accepted random creds {ruser}:{rpass}",
-        remediation="Investigate immediately — this host may be a honeypot or compromised.",
+        remediation="Investigate immediately — authentication is non-functional.",
         owasp_id="A07:2021",
         cwe_id="CWE-287",
         confidence="certain",
