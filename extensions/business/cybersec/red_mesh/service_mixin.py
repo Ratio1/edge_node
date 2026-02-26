@@ -45,6 +45,12 @@ _TELNET_DEFAULT_CREDS = [
     ("test", "test"),
 ]
 
+_HTTP_SERVER_RE = _re.compile(
+    r'(Apache|nginx)[/ ]+(\d+(?:\.\d+)+)', _re.IGNORECASE,
+)
+_HTTP_PRODUCT_MAP = {'apache': 'apache', 'nginx': 'nginx'}
+
+
 class _ServiceInfoMixin:
   """
   Network service banner probes feeding RedMesh reports.
@@ -95,6 +101,12 @@ class _ServiceInfoMixin:
 
       result["banner"] = f"HTTP {resp.status_code} {resp.reason}"
       result["server"] = resp.headers.get("Server")
+      if result["server"]:
+        _m = _HTTP_SERVER_RE.search(result["server"])
+        if _m:
+          _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
+          if _cve_product:
+            findings += check_cves(_cve_product, _m.group(2))
       powered_by = resp.headers.get("X-Powered-By")
 
       # Page title
@@ -215,6 +227,13 @@ class _ServiceInfoMixin:
             raw["server"] = line.split(":", 1)[1].strip()
             break
 
+        if raw["server"]:
+          _m = _HTTP_SERVER_RE.search(raw["server"])
+          if _m:
+            _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
+            if _cve_product:
+              findings += check_cves(_cve_product, _m.group(2))
+
         findings.append(Finding(
           severity=Severity.INFO,
           title=f"HTTP service on alternate port {port}",
@@ -263,6 +282,12 @@ class _ServiceInfoMixin:
       resp = requests.get(url, timeout=3, verify=False, headers=headers)
       raw["banner"] = f"HTTPS {resp.status_code} {resp.reason}"
       raw["server"] = resp.headers.get("Server")
+      if raw["server"]:
+        _m = _HTTP_SERVER_RE.search(raw["server"])
+        if _m:
+          _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
+          if _cve_product:
+            findings += check_cves(_cve_product, _m.group(2))
       findings.append(Finding(
         severity=Severity.INFO,
         title=f"HTTPS service detected ({resp.status_code} {resp.reason})",
@@ -525,6 +550,16 @@ class _ServiceInfoMixin:
       result["banner"] = ftp.getwelcome()
     except Exception as e:
       return probe_error(target, port, "FTP", e)
+
+    # FTP server version CVE check
+    _ftp_m = _re.search(
+      r'(ProFTPD|vsftpd)[/ ]+(\d+(?:\.\d+)+)',
+      result["banner"], _re.IGNORECASE,
+    )
+    if _ftp_m:
+      _cve_product = {'proftpd': 'proftpd', 'vsftpd': 'vsftpd'}.get(_ftp_m.group(1).lower())
+      if _cve_product:
+        findings += check_cves(_cve_product, _ftp_m.group(2))
 
     # --- 2. Anonymous login ---
     try:
@@ -1017,6 +1052,13 @@ class _ServiceInfoMixin:
         cwe_id="CWE-200",
         confidence="certain",
       ))
+
+    # CVE check on extracted MTA version
+    _smtp_product_map = {'exim': 'exim', 'postfix': 'postfix'}
+    if version_match and version_match.group(2):
+      _cve_product = _smtp_product_map.get(version_match.group(1).lower())
+      if _cve_product:
+        findings += check_cves(_cve_product, version_match.group(2))
 
     if result["server_hostname"]:
       # Check if hostname reveals container/internal info
@@ -2361,6 +2403,24 @@ class _ServiceInfoMixin:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(2)
       sock.connect((target, port))
+
+      # Extract version
+      sock.sendall(b'version\r\n')
+      ver_data = sock.recv(64).decode("utf-8", errors="replace").strip()
+      ver_match = _re.match(r'VERSION\s+(\d+(?:\.\d+)+)', ver_data)
+      if ver_match:
+        raw["version"] = ver_match.group(1)
+        findings.append(Finding(
+          severity=Severity.LOW,
+          title=f"Memcached version disclosed: {raw['version']}",
+          description=f"Memcached on {target}:{port} reveals version via VERSION command.",
+          evidence=f"VERSION {raw['version']}",
+          remediation="Restrict access to memcached to trusted networks.",
+          cwe_id="CWE-200",
+          confidence="certain",
+        ))
+        findings += check_cves("memcached", raw["version"])
+
       sock.sendall(b'stats\r\n')
       data = sock.recv(128)
       if data.startswith(b'STAT'):
