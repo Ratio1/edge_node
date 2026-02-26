@@ -83,13 +83,6 @@ class _WebDiscoveryMixin:
       self.P(f"Common endpoint probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "common", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="No common endpoint exposures detected",
-        description=f"Checked /.env, /.git/, /admin, /robots.txt, /login on {base_url}.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)
 
 
@@ -141,13 +134,6 @@ class _WebDiscoveryMixin:
       self.P(f"Homepage probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "homepage", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="No sensitive markers detected on homepage",
-        description=f"Checked for API_KEY, PASSWORD, SECRET, RSA keys on {base_url}.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)
 
   def _web_test_tech_fingerprint(self, target, port):
@@ -251,14 +237,6 @@ class _WebDiscoveryMixin:
     except Exception as e:
       self.P(f"Tech fingerprint failed on {base_url}: {e}", color='y')
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="No technology disclosed",
-        description=f"Server headers and HTML do not reveal technology stack.",
-        confidence="firm",
-      ))
-
     return probe_result(raw_data=raw, findings=findings_list)
 
   def _web_test_vpn_endpoints(self, target, port):
@@ -329,13 +307,5 @@ class _WebDiscoveryMixin:
           ))
       except Exception:
         pass
-
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="No VPN endpoints detected",
-        description=f"Checked Cisco ASA, FortiGate, Pulse Secure, Palo Alto GP on {base_url}.",
-        confidence="firm",
-      ))
 
     return probe_result(raw_data=raw, findings=findings_list)

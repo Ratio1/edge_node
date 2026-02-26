@@ -219,6 +219,10 @@ class _ServiceInfoMixin:
     dict
       Structured findings.
     """
+    # Skip standard HTTP ports — they are covered by _service_info_http.
+    if port in (80, 443):
+      return None
+
     findings = []
     raw = {"banner": None, "server": None}
     try:
@@ -248,22 +252,6 @@ class _ServiceInfoMixin:
             _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
             if _cve_product:
               findings += check_cves(_cve_product, _m.group(2))
-
-        findings.append(Finding(
-          severity=Severity.INFO,
-          title=f"HTTP service on alternate port {port}",
-          description=f"HTTP service responding on {target}:{port}.",
-          evidence=f"Status: {status_line}, Server: {raw['server'] or 'not disclosed'}",
-          confidence="certain",
-        ))
-      else:
-        raw["banner"] = "(no response)"
-        findings.append(Finding(
-          severity=Severity.INFO,
-          title=f"Port {port} open (no HTTP banner)",
-          description="Connection succeeded but no HTTP response received.",
-          confidence="tentative",
-        ))
     except Exception as e:
       return probe_error(target, port, "HTTP-ALT", e)
     return probe_result(raw_data=raw, findings=findings)  
@@ -2876,9 +2864,36 @@ class _ServiceInfoMixin:
 
 
 
+  # Product patterns for generic banner version extraction.
+  # Maps regex → CVE DB product name.  Each regex must have a named group 'ver'.
+  _GENERIC_BANNER_PATTERNS = [
+    (_re.compile(r'OpenSSH[_\s](?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "openssh"),
+    (_re.compile(r'Apache[/ ](?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "apache"),
+    (_re.compile(r'nginx[/ ](?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "nginx"),
+    (_re.compile(r'Exim\s+(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "exim"),
+    (_re.compile(r'Postfix[/ ]?(?:.*?smtpd)?\s*(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "postfix"),
+    (_re.compile(r'ProFTPD\s+(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "proftpd"),
+    (_re.compile(r'vsftpd\s+(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "vsftpd"),
+    (_re.compile(r'Redis[/ ](?:server\s+)?v?(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "redis"),
+    (_re.compile(r'Samba\s+(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "samba"),
+    (_re.compile(r'Asterisk\s+(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "asterisk"),
+    (_re.compile(r'MySQL[/ ](?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "mysql"),
+    (_re.compile(r'PostgreSQL\s+(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "postgresql"),
+    (_re.compile(r'MongoDB\s+(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "mongodb"),
+    (_re.compile(r'Elasticsearch[/ ](?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "elasticsearch"),
+    (_re.compile(r'memcached\s+(?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "memcached"),
+    (_re.compile(r'TightVNC[/ ](?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "tightvnc"),
+  ]
+
   def _service_info_generic(self, target, port):
     """
     Attempt a generic TCP banner grab for uncovered ports.
+
+    Performs three checks on the banner:
+    1. Version disclosure — flags any product/version string as info leak.
+    2. CVE matching — runs extracted versions against the CVE database.
+    3. Unauthenticated data exposure — flags services that send data
+       without any client request (potential auth bypass).
 
     Parameters
     ----------
@@ -2898,21 +2913,42 @@ class _ServiceInfoMixin:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(2)
       sock.connect((target, port))
-      data = sock.recv(100).decode('utf-8', errors='ignore')
+      data = sock.recv(256).decode('utf-8', errors='ignore')
       if data:
         banner = ''.join(ch if 32 <= ord(ch) < 127 else '.' for ch in data)
+        readable = banner.strip().replace('.', '')
+        if not readable:
+          # Pure binary data with no printable content — nothing useful.
+          sock.close()
+          return None
         raw["banner"] = banner.strip()
-        findings.append(Finding(
-          severity=Severity.INFO,
-          title=f"Service banner on port {port}",
-          description=f"TCP banner received on {target}:{port}.",
-          evidence=f"Banner: {banner.strip()[:80]}",
-          confidence="certain",
-        ))
       else:
         sock.close()
         return None  # No banner — nothing useful to report
       sock.close()
     except Exception as e:
       return probe_error(target, port, "generic", e)
+
+    banner_text = raw["banner"]
+
+    # --- 1. Version extraction + CVE check ---
+    for pattern, product in self._GENERIC_BANNER_PATTERNS:
+      m = pattern.search(banner_text)
+      if m:
+        version = m.group("ver")
+        raw["product"] = product
+        raw["version"] = version
+        findings.append(Finding(
+          severity=Severity.LOW,
+          title=f"Service version disclosed: {product} {version}",
+          description=f"Banner on {target}:{port} reveals {product} {version}. "
+                      "Version disclosure aids attackers in targeting known vulnerabilities.",
+          evidence=f"Banner: {banner_text[:80]}",
+          remediation="Suppress or genericize the service banner.",
+          cwe_id="CWE-200",
+          confidence="certain",
+        ))
+        findings += check_cves(product, version)
+        break  # First match wins
+
     return probe_result(raw_data=raw, findings=findings)

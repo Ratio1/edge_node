@@ -88,13 +88,6 @@ class _WebHardeningMixin:
       self.P(f"Cookie/flags probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "flags", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="Cookie flags and directory listing checks passed",
-        description=f"No cookie flag or directory listing issues detected on {base_url}.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)
 
 
@@ -151,13 +144,6 @@ class _WebHardeningMixin:
       self.P(f"Security header probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "security_headers", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="All security headers present",
-        description=f"All checked security headers are present on {base_url}.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)
 
 
@@ -218,13 +204,6 @@ class _WebHardeningMixin:
       self.P(f"CORS probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "cors", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="No permissive CORS headers detected",
-        description=f"CORS policy on {base_url} does not reflect arbitrary origins.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)
 
 
@@ -275,13 +254,6 @@ class _WebHardeningMixin:
       self.P(f"Open redirect probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "open_redirect", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="No open redirect detected",
-        description=f"Redirect endpoint at {base_url}/login did not expose open redirect behavior.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)
 
 
@@ -327,11 +299,4 @@ class _WebHardeningMixin:
       self.P(f"HTTP methods probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "http_methods", e)
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="No risky HTTP methods detected",
-        description=f"OPTIONS response on {base_url} does not list dangerous methods.",
-        confidence="firm",
-      ))
     return probe_result(findings=findings_list)

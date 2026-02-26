@@ -133,14 +133,6 @@ class _WebInjectionMixin(_InjectionTestBase):
         except Exception:
           pass
 
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="Path traversal not detected",
-        description=f"Tested path and query param traversal on {base_url}.",
-        confidence="firm",
-      ))
-
     return probe_result(findings=findings_list)
 
 
@@ -221,14 +213,6 @@ class _WebInjectionMixin(_InjectionTestBase):
       finding_factory=_xss_finding,
       max_findings=3 - len(findings_list),
     )
-
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="Reflected XSS not detected",
-        description=f"Tested path and query param XSS on {base_url}.",
-        confidence="firm",
-      ))
 
     return probe_result(findings=findings_list)
 
@@ -348,13 +332,5 @@ class _WebInjectionMixin(_InjectionTestBase):
             ))
         except Exception:
           pass
-
-    if not findings_list:
-      findings_list.append(Finding(
-        severity=Severity.INFO,
-        title="SQL injection not detected",
-        description=f"Tested error-based, boolean-blind, and time-based SQLi on {base_url}.",
-        confidence="firm",
-      ))
 
     return probe_result(findings=findings_list)
