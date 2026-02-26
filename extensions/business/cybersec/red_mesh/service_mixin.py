@@ -55,7 +55,7 @@ class _ServiceInfoMixin:
   still surfacing high-signal clues.
   """
   
-  def _service_info_80(self, target, port):
+  def _service_info_http(self, target, port):  # default port: 80
     """
     Assess HTTP service: server fingerprint, technology detection,
     dangerous HTTP methods, and page title extraction.
@@ -176,7 +176,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=result, findings=findings)
   
 
-  def _service_info_8080(self, target, port):
+  def _service_info_http_alt(self, target, port):  # default port: 8080
     """
     Probe alternate HTTP port 8080 for verbose banners.
 
@@ -235,7 +235,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)  
 
 
-  def _service_info_443(self, target, port):
+  def _service_info_https(self, target, port):  # default port: 443
     """
     Collect HTTPS response banner data for TLS services.
 
@@ -472,7 +472,7 @@ class _ServiceInfoMixin:
     return findings
 
 
-  def _service_info_21(self, target, port):
+  def _service_info_ftp(self, target, port):  # default port: 21
     """
     Assess FTP service security: banner, anonymous access, default creds,
     server fingerprint, TLS support, write access, and honeypot detection.
@@ -709,7 +709,7 @@ class _ServiceInfoMixin:
 
     return probe_result(raw_data=result, findings=findings)
 
-  def _service_info_22(self, target, port):
+  def _service_info_ssh(self, target, port):  # default port: 22
     """
     Assess SSH service security: banner, auth methods, and default credentials.
 
@@ -920,7 +920,7 @@ class _ServiceInfoMixin:
 
     return findings, weak_labels
 
-  def _service_info_25(self, target, port):
+  def _service_info_smtp(self, target, port):  # default port: 25
     """
     Assess SMTP service security: banner, EHLO features, STARTTLS,
     authentication methods, open relay, and user enumeration.
@@ -1134,7 +1134,7 @@ class _ServiceInfoMixin:
 
     return probe_result(raw_data=result, findings=findings)
 
-  def _service_info_3306(self, target, port):
+  def _service_info_mysql(self, target, port):  # default port: 3306
     """
     MySQL handshake probe: extract version, auth plugin, and check CVEs.
 
@@ -1207,7 +1207,7 @@ class _ServiceInfoMixin:
 
     return probe_result(raw_data=raw, findings=findings)
 
-  def _service_info_3306_creds(self, target, port):
+  def _service_info_mysql_creds(self, target, port):  # default port: 3306
     """
     MySQL default credential testing (opt-in via active_auth feature group).
 
@@ -1317,7 +1317,7 @@ class _ServiceInfoMixin:
 
     return probe_result(raw_data=raw, findings=findings)
 
-  def _service_info_3389(self, target, port):
+  def _service_info_rdp(self, target, port):  # default port: 3389
     """
     Verify reachability of RDP services without full negotiation.
 
@@ -1353,7 +1353,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
   # SAFETY: Read-only commands only. NEVER add CONFIG SET, SLAVEOF, MODULE LOAD, EVAL, DEBUG.
-  def _service_info_6379(self, target, port):
+  def _service_info_redis(self, target, port):  # default port: 6379
     """
     Deep Redis probe: auth check, version, config readability, data size, client list.
 
@@ -1530,7 +1530,7 @@ class _ServiceInfoMixin:
     return findings
 
 
-  def _service_info_23(self, target, port):
+  def _service_info_telnet(self, target, port):  # default port: 23
     """
     Assess Telnet service security: banner, negotiation options, default
     credentials, privilege level, system fingerprint, and honeypot detection.
@@ -1780,7 +1780,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=result, findings=findings)
 
 
-  def _service_info_445(self, target, port):
+  def _service_info_smb(self, target, port):  # default port: 445
     """
     Probe SMB services for negotiation responses.
 
@@ -1832,7 +1832,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
 
-  def _service_info_5900(self, target, port):
+  def _service_info_vnc(self, target, port):  # default port: 5900
     """
     VNC handshake: read version banner, negotiate security types.
 
@@ -1941,7 +1941,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
 
-  def _service_info_161(self, target, port):
+  def _service_info_snmp(self, target, port):  # default port: 161
     """
     Attempt SNMP community string disclosure using 'public'.
 
@@ -2001,7 +2001,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
 
-  def _service_info_53(self, target, port):
+  def _service_info_dns(self, target, port):  # default port: 53
     """
     Query CHAOS TXT version.bind to detect DNS version disclosure.
 
@@ -2099,7 +2099,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
 
-  def _service_info_1433(self, target, port):
+  def _service_info_mssql(self, target, port):  # default port: 1433
     """
     Send a TDS prelogin probe to expose SQL Server version data.
 
@@ -2146,7 +2146,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
 
-  def _service_info_5432(self, target, port):
+  def _service_info_postgresql(self, target, port):  # default port: 5432
     """
     Probe PostgreSQL authentication method by parsing the auth response byte.
 
@@ -2256,7 +2256,7 @@ class _ServiceInfoMixin:
 
     return probe_result(raw_data=raw, findings=findings)
 
-  def _service_info_5432_creds(self, target, port):
+  def _service_info_postgresql_creds(self, target, port):  # default port: 5432
     """
     PostgreSQL default credential testing (opt-in via active_auth feature group).
 
@@ -2339,7 +2339,7 @@ class _ServiceInfoMixin:
 
     return probe_result(raw_data=raw, findings=findings)
 
-  def _service_info_11211(self, target, port):
+  def _service_info_memcached(self, target, port):  # default port: 11211
     """
     Issue Memcached stats command to detect unauthenticated access.
 
@@ -2391,7 +2391,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
 
-  def _service_info_9200(self, target, port):
+  def _service_info_elasticsearch(self, target, port):  # default port: 9200
     """
     Deep Elasticsearch probe: cluster info, index listing, node IPs, CVE matching.
 
@@ -2530,7 +2530,7 @@ class _ServiceInfoMixin:
     return findings
 
 
-  def _service_info_502(self, target, port):
+  def _service_info_modbus(self, target, port):  # default port: 502
     """
     Send Modbus device identification request to detect exposed PLCs.
 
@@ -2575,7 +2575,7 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
 
-  def _service_info_27017(self, target, port):
+  def _service_info_mongodb(self, target, port):  # default port: 27017
     """
     Attempt MongoDB isMaster handshake to detect unauthenticated access.
 
