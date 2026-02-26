@@ -2667,13 +2667,8 @@ class _ServiceInfoMixin:
           confidence="certain",
         ))
       else:
-        raw["banner"] = "(no banner)"
-        findings.append(Finding(
-          severity=Severity.INFO,
-          title=f"Port {port} open (no banner)",
-          description="Connection succeeded but no banner received; service may require protocol handshake.",
-          confidence="tentative",
-        ))
+        sock.close()
+        return None  # No banner — nothing useful to report
       sock.close()
     except Exception as e:
       return probe_error(target, port, "generic", e)

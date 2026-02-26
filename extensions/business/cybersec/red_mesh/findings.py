@@ -43,6 +43,6 @@ def probe_result(*, raw_data: dict = None, findings: list = None) -> dict:
   return result
 
 
-def probe_error(target: str, port: int, probe_name: str, exc: Exception) -> dict:
-  """Standardized error return for all probes."""
-  return probe_result(raw_data={"error": f"{probe_name} failed on {target}:{port}: {exc}"})
+def probe_error(target: str, port: int, probe_name: str, exc: Exception) -> None:
+  """Log-level error — returns None so failed probes are not stored in results."""
+  return None

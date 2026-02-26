@@ -120,7 +120,8 @@ FINGERPRINT_NUDGE_TIMEOUT = 3  # seconds — generic \r\n nudge probe timeout
 WELL_KNOWN_PORTS = {
     21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 42: "wins",
     53: "dns", 80: "http", 81: "http", 110: "pop3", 143: "imap",
-    161: "snmp", 443: "https", 445: "smb", 502: "modbus",
+    161: "snmp", 443: "https", 445: "smb", 465: "smtp",  # SMTPS
+    502: "modbus", 587: "smtp", 993: "imap", 995: "pop3",  # TLS-wrapped mail
     1433: "mssql", 3306: "mysql", 3389: "rdp", 5432: "postgresql",
     5900: "vnc", 6379: "redis", 8000: "http", 8008: "http",
     8080: "http", 8081: "http", 8443: "https", 8888: "http",
