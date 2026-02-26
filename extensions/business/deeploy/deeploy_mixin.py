@@ -2733,7 +2733,7 @@ class _DeeployMixin:
           self.Pd(f"Skipping malformed online apps payload for node {node}.", color='y')
           continue
         for app_name, app_data in apps.items():
-          app_job_id = self._extract_app_job_id(app_data)
+          app_job_id = app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None)
           if app_job_id is None:
             continue
           online_apps_by_job_id[app_job_id][node][app_name] = app_data
