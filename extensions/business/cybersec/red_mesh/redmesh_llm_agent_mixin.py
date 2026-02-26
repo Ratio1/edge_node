@@ -282,6 +282,11 @@ class _RedMeshLlmAgentMixin(object):
           if entry.get("pass_nr") == pass_nr:
             entry["llm_analysis_cid"] = analysis_cid
             break
+        self._emit_timeline_event(
+          job_specs, "llm_analysis",
+          f"LLM analysis completed for pass {pass_nr}",
+          meta={"analysis_cid": analysis_cid, "pass_nr": pass_nr}
+        )
         self.P(f"LLM analysis for pass {pass_nr} saved, CID: {analysis_cid}")
         return analysis_cid
       else:
