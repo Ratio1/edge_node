@@ -3298,6 +3298,7 @@ class ContainerAppRunnerPlugin(
       self._start_container_log_stream()
       self._maybe_execute_build_and_run()
 
+      self._last_image_check = self.time()
       self.P("Container launched successfully")
       self.P(self.container)
       if self.current_image_hash:

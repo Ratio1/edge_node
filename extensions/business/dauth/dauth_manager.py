@@ -22,6 +22,7 @@ WHITELIST (oracles)
 """
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
+from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
 from extensions.business.dauth.dauth_mixin import _DauthMixin
 
 __VER__ = '0.2.2'
@@ -35,7 +36,12 @@ _CONFIG = {
   
   'DAUTH_VERBOSE' : False,
   'DAUTH_LOG_RESPONSE' : True,
+  'LOG_REQUESTS' : True,
   
+  'REQUESTS_CSTORE_HKEY': 'DAUTH_REQUESTS',
+  'REQUESTS_MAX_RECORDS': 2,
+  'REQUESTS_LOG_INTERVAL': 5 * 60,
+
   'SUPRESS_LOGS_AFTER_INTERVAL' : 300,
   
   # required ENV keys are defined in plugin template and should be added here  
@@ -83,7 +89,8 @@ _CONFIG = {
 class DauthManagerPlugin(
   BasePlugin,
   _DauthMixin,
-  _NodeTagsMixin
+  _NodeTagsMixin,
+  _RequestTrackingMixin,
   ):
   """
   This plugin is the dAuth FastAPI web app that provides an endpoints for decentralized authentication.
@@ -103,10 +110,23 @@ class DauthManagerPlugin(
     self.P("Started {} plugin on {} / {}\n - Auth keys: {}\n - Predefined keys: {}".format(
       self.__class__.__name__, my_address, my_eth_address,
       self.cfg_auth_env_keys, self.cfg_auth_predefined_keys)
-    )        
+    )
+    self._init_request_tracking()
     return
     
   
+  def on_request(self, request):
+    self._track_request(request)
+    return
+
+  def on_response(self, method, response):
+    self._track_response(method, response)
+    return
+
+  def process(self):
+    self._maybe_log_and_save_tracked_requests()
+    return
+
   def __get_current_epoch(self):
     """
     Get the current epoch of the node.

@@ -43,6 +43,7 @@ _CONFIG = {
     "REPO_URL": None,
     "BRANCH": "main",
     "POLL_INTERVAL": 60,
+    "RATE_LIMIT_BACKOFF": 5 * 60,
   },
 
   # Disable image auto-update; Git monitoring drives restarts
@@ -97,6 +98,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     self.branch = None
     self.repo_url = None
     self._last_git_check = 0
+    self._git_backoff_until = 0
     self._repo_configured = False
     self._repo_owner = None
     self._repo_name = None
@@ -279,21 +281,19 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       return None
 
     self._last_git_check = current_time
+    previous_commit = self.current_commit
     latest_commit = self._get_latest_commit()
 
     if not latest_commit:
       return None
 
-    if self.current_commit and latest_commit != self.current_commit:
+    if previous_commit and latest_commit != previous_commit:
       self.P(
-        f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restart required.",
+        f"New commit detected ({latest_commit[:7]} != {previous_commit[:7]}). Restart required.",
         color='y',
       )
-      self.current_commit = latest_commit
       return StopReason.EXTERNAL_UPDATE  # Git update triggers external update restart
     else:
-      if not self.current_commit:
-        self.current_commit = latest_commit
       self.P(f"Commit check ({self.branch}): {latest_commit}", color='d')
     return None
 
@@ -338,8 +338,9 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     self._configure_repo_url()
 
     latest_commit = self._get_latest_commit()
+    self._last_git_check = self.time()
+
     if latest_commit:
-      self.current_commit = latest_commit
       self.P(f"Latest commit on {self.branch}: {latest_commit}", color='d')
     else:
       self.P("Unable to determine latest commit during initialization", color='y')
@@ -444,6 +445,9 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
     headers = {"Authorization": f"token {token}"} if token else {}
 
+    if self.time() < self._git_backoff_until:
+      return (None, None) if return_data else None
+
     try:
       self.Pd(f"Commit check URL: {api_url}", score=5, color='b')
       resp = requests.get(api_url, headers=headers, timeout=10)
@@ -451,13 +455,17 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       if resp.status_code == 200:
         data = resp.json()
         latest_sha = data.get("commit", {}).get("sha", None)
+        if latest_sha:
+          self.current_commit = latest_sha
         if return_data:
           return latest_sha, data
         return latest_sha
       if resp.status_code == 404:
         self.P(f"Repository or branch not found: {api_url}", color='r')
       elif resp.status_code == 403:
-        self.P("GitHub API rate limit exceeded or access denied", color='r')
+        vcs_backoff = (getattr(self, 'cfg_vcs_data', {}) or {}).get('RATE_LIMIT_BACKOFF', 300)
+        self._git_backoff_until = self.time() + vcs_backoff
+        self.P(f"GitHub API rate limit exceeded or access denied. Backing off for {vcs_backoff}s.", color='r')
       else:
         self.P(f"Failed to fetch latest commit (HTTP {resp.status_code}): {resp.text}", color='r')
     except requests.RequestException as exc:
