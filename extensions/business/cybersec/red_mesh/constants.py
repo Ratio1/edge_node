@@ -167,3 +167,13 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_mysql_creds": frozenset({"mysql"}),
     "_service_info_postgresql_creds": frozenset({"postgresql"}),
 }
+
+# =====================================================================
+# Risk score computation
+# =====================================================================
+
+RISK_SEVERITY_WEIGHTS = {"CRITICAL": 40, "HIGH": 25, "MEDIUM": 10, "LOW": 2, "INFO": 0}
+RISK_CONFIDENCE_MULTIPLIERS = {"certain": 1.0, "firm": 0.8, "tentative": 0.5}
+RISK_SIGMOID_K = 0.02
+RISK_CRED_PENALTY_PER = 15
+RISK_CRED_PENALTY_CAP = 30
