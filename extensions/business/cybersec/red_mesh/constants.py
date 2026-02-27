@@ -112,6 +112,7 @@ LLM_API_STATUS_TIMEOUT = "timeout"
 LLM_ANALYSIS_SECURITY_ASSESSMENT = "security_assessment"
 LLM_ANALYSIS_VULNERABILITY_SUMMARY = "vulnerability_summary"
 LLM_ANALYSIS_REMEDIATION_PLAN = "remediation_plan"
+LLM_ANALYSIS_QUICK_SUMMARY = "quick_summary"
 
 # =====================================================================
 # Protocol fingerprinting and probe routing

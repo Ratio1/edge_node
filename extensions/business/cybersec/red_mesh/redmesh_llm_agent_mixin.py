@@ -296,6 +296,101 @@ class _RedMeshLlmAgentMixin(object):
       self.P(f"Error saving LLM analysis to R1FS: {e}", color='r')
       return None
 
+  def _run_quick_summary_analysis(
+      self,
+      job_id: str,
+      job_specs: dict,
+      workers: dict,
+      pass_nr: int = None
+  ) -> Optional[str]:
+    """
+    Run a short (2-4 sentence) AI quick summary on the aggregated report.
+
+    Same pattern as _run_aggregated_llm_analysis but uses the quick_summary
+    analysis type with a low token budget.
+
+    Parameters
+    ----------
+    job_id : str
+      Identifier of the job.
+    job_specs : dict
+      Job specification (will be updated with quick_summary_cid).
+    workers : dict
+      Worker entries containing report data.
+    pass_nr : int, optional
+      Pass number for continuous monitoring jobs.
+
+    Returns
+    -------
+    str or None
+      Quick summary CID if successful, None otherwise.
+    """
+    target = job_specs.get("target", "unknown")
+    pass_info = f" (pass {pass_nr})" if pass_nr else ""
+    self.P(f"Running quick summary analysis for job {job_id}{pass_info}, target {target}...")
+
+    # Collect and aggregate reports from all workers
+    aggregated_report = self._collect_aggregated_report(workers)
+
+    if not aggregated_report:
+      self.P(f"No data for quick summary for job {job_id}", color='y')
+      return None
+
+    # Add job metadata to report for context
+    aggregated_report["_job_metadata"] = {
+      "job_id": job_id,
+      "target": target,
+      "num_workers": len(workers),
+      "worker_addresses": list(workers.keys()),
+      "start_port": job_specs.get("start_port"),
+      "end_port": job_specs.get("end_port"),
+      "enabled_features": job_specs.get("enabled_features", []),
+      "run_mode": job_specs.get("run_mode", "SINGLEPASS"),
+      "pass_nr": pass_nr,
+    }
+
+    # Call LLM analysis with quick_summary type
+    analysis_result = self._call_llm_agent_api(
+      endpoint="/analyze_scan",
+      method="POST",
+      payload={
+        "scan_results": aggregated_report,
+        "analysis_type": "quick_summary",
+        "focus_areas": None,
+      }
+    )
+
+    if not analysis_result or "error" in analysis_result:
+      self.P(
+        f"Quick summary failed for job {job_id}: {analysis_result.get('error') if analysis_result else 'No response'}",
+        color='y'
+      )
+      return None
+
+    # Save to R1FS
+    try:
+      summary_cid = self.r1fs.add_json(analysis_result, show_logs=False)
+      if summary_cid:
+        # Store in pass_history
+        pass_history = job_specs.get("pass_history", [])
+        for entry in pass_history:
+          if entry.get("pass_nr") == pass_nr:
+            entry["quick_summary_cid"] = summary_cid
+            break
+        self._emit_timeline_event(
+          job_specs, "llm_analysis",
+          f"Quick summary completed for pass {pass_nr}",
+          meta={"quick_summary_cid": summary_cid, "pass_nr": pass_nr}
+        )
+        self.P(f"Quick summary for pass {pass_nr} saved, CID: {summary_cid}")
+        return summary_cid
+      else:
+        self.P(f"Failed to save quick summary to R1FS for job {job_id}", color='y')
+        return None
+    except Exception as e:
+      self.P(f"Error saving quick summary to R1FS: {e}", color='r')
+      return None
+
   def _get_llm_health_status(self) -> dict:
     """
     Check health of the LLM Agent API connection.
