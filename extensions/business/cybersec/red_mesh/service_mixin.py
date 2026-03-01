@@ -2238,6 +2238,289 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
 
+  # NetBIOS name suffix → human-readable type
+  _NBNS_SUFFIX_TYPES = {
+    0x00: "Workstation",
+    0x03: "Messenger (logged-in user)",
+    0x20: "File Server (SMB sharing)",
+    0x1C: "Domain Controller",
+    0x1B: "Domain Master Browser",
+    0x1E: "Browser Election Service",
+  }
+
+  def _service_info_wins(self, target, port):  # ports: 42 (WINS/TCP), 137 (NBNS/UDP)
+    """
+    Probe WINS / NetBIOS Name Service for name enumeration and service detection.
+
+    Port 42 (TCP): WINS replication — sends MS-WINSRA Association Start Request
+    to fingerprint the service and extract NBNS version.  Also fires a UDP
+    side-probe to port 137 for NetBIOS name enumeration.
+    Port 137 (UDP): NBNS — sends wildcard node-status query (RFC 1002) to
+    enumerate registered NetBIOS names.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    dict
+      Structured findings.
+    """
+    findings = []
+    raw = {"banner": None, "netbios_names": [], "wins_responded": False}
+
+    # -- Build NetBIOS wildcard node-status query (RFC 1002) --
+    tid = struct.pack('>H', random.randint(0, 0xFFFF))
+    #   Flags: 0x0010 (recursion desired)
+    #   Questions: 1, Answers/Auth/Additional: 0
+    header = tid + struct.pack('>HHHHH', 0x0010, 1, 0, 0, 0)
+    #   Encoded wildcard name "*" (first-level NetBIOS encoding)
+    #   '*' (0x2A) → half-bytes 0x02, 0x0A → chars 'C','K', padded with 'A' (0x00 half-bytes)
+    qname = b'\x20' + b'CKAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' + b'\x00'
+    #   Type: NBSTAT (0x0021), Class: IN (0x0001)
+    question = struct.pack('>HH', 0x0021, 0x0001)
+    nbns_query = header + qname + question
+
+    def _parse_nbns_response(data):
+      """Parse a NetBIOS node-status response and return list of (name, suffix, flags)."""
+      names = []
+      if len(data) < 14:
+        return names
+      # Verify transaction ID matches
+      if data[:2] != tid:
+        return names
+      ancount = struct.unpack('>H', data[6:8])[0]
+      if ancount == 0:
+        return names
+      # Skip past header (12 bytes) then answer name (compressed pointer or full)
+      idx = 12
+      if idx < len(data) and data[idx] & 0xC0 == 0xC0:
+        idx += 2
+      else:
+        while idx < len(data) and data[idx] != 0:
+          idx += data[idx] + 1
+        idx += 1
+      # Type (2) + Class (2) + TTL (4) + RDLength (2) = 10 bytes
+      if idx + 10 > len(data):
+        return names
+      idx += 10
+      if idx >= len(data):
+        return names
+      num_names = data[idx]
+      idx += 1
+      # Each name entry: 15 bytes name + 1 byte suffix + 2 bytes flags = 18 bytes
+      for _ in range(num_names):
+        if idx + 18 > len(data):
+          break
+        name_bytes = data[idx:idx + 15]
+        suffix = data[idx + 15]
+        flags = struct.unpack('>H', data[idx + 16:idx + 18])[0]
+        name = name_bytes.decode('ascii', errors='ignore').rstrip()
+        names.append((name, suffix, flags))
+        idx += 18
+      return names
+
+    def _udp_nbns_probe(udp_port):
+      """Send UDP NBNS wildcard query, return parsed names or empty list."""
+      sock = None
+      try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(3)
+        sock.sendto(nbns_query, (target, udp_port))
+        data, _ = sock.recvfrom(1024)
+        return _parse_nbns_response(data)
+      except Exception:
+        return []
+      finally:
+        if sock is not None:
+          sock.close()
+
+    def _add_nbns_findings(names, probe_label):
+      """Populate raw data and findings from enumerated NetBIOS names."""
+      raw["netbios_names"] = [
+        {"name": n, "suffix": f"0x{s:02X}", "type": self._NBNS_SUFFIX_TYPES.get(s, f"Unknown(0x{s:02X})")}
+        for n, s, _f in names
+      ]
+      name_list = "; ".join(
+        f"{n} <{s:02X}> ({self._NBNS_SUFFIX_TYPES.get(s, 'unknown')})"
+        for n, s, _f in names
+      )
+      findings.append(Finding(
+        severity=Severity.HIGH,
+        title="NetBIOS name enumeration successful",
+        description=(
+          f"{probe_label} responded to a wildcard node-status query, "
+          "leaking computer name, domain membership, and potentially logged-in users."
+        ),
+        evidence=f"Names: {name_list[:200]}",
+        remediation="Block UDP port 137 at the firewall; disable NetBIOS over TCP/IP in network adapter settings.",
+        owasp_id="A01:2021",
+        cwe_id="CWE-200",
+        confidence="certain",
+      ))
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title=f"NetBIOS names discovered ({len(names)} entries)",
+        description=f"Enumerated names: {name_list}",
+        evidence=f"Names: {name_list[:300]}",
+        confidence="certain",
+      ))
+
+    try:
+      if port == 137:
+        # -- Direct UDP NBNS probe --
+        names = _udp_nbns_probe(137)
+        if names:
+          raw["banner"] = f"NBNS: {len(names)} name(s) enumerated"
+          _add_nbns_findings(names, f"NBNS on {target}:{port}")
+        else:
+          raw["banner"] = "NBNS port open (no response to wildcard query)"
+          findings.append(Finding(
+            severity=Severity.INFO,
+            title="NBNS port open but no names returned",
+            description=f"UDP port {port} on {target} did not respond to NetBIOS wildcard query.",
+            confidence="tentative",
+          ))
+      else:
+        # -- TCP WINS replication probe (MS-WINSRA Association Start Request) --
+        # Also attempt UDP NBNS side-probe to port 137 for name enumeration
+        names = _udp_nbns_probe(137)
+        if names:
+          _add_nbns_findings(names, f"NBNS side-probe to {target}:137")
+
+        # Build MS-WINSRA Association Start Request per [MS-WINSRA] §2.2.3:
+        #   Common Header (16 bytes):
+        #     Packet Length:               41 (0x00000029) — excludes this field
+        #     Reserved:                    0x00007800 (opcode, ignored by spec)
+        #     Destination Assoc Handle:    0x00000000 (first message, unknown)
+        #     Message Type:                0x00000000 (Association Start Request)
+        #   Body (25 bytes):
+        #     Sender Assoc Handle:         random 4 bytes
+        #     NBNS Major Version:          2 (required)
+        #     NBNS Minor Version:          5 (Win2k+)
+        #     Reserved:                    21 zero bytes (pad to 41)
+        sender_ctx = random.randint(1, 0xFFFFFFFF)
+        wrepl_header = struct.pack('>I', 41)           # Packet Length
+        wrepl_header += struct.pack('>I', 0x00007800)  # Reserved / opcode
+        wrepl_header += struct.pack('>I', 0)           # Destination Assoc Handle
+        wrepl_header += struct.pack('>I', 0)           # Message Type: Start Request
+        wrepl_body = struct.pack('>I', sender_ctx)     # Sender Assoc Handle
+        wrepl_body += struct.pack('>HH', 2, 5)         # Major=2, Minor=5
+        wrepl_body += b'\x00' * 21                     # Reserved padding
+        wrepl_packet = wrepl_header + wrepl_body
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((target, port))
+        sock.sendall(wrepl_packet)
+
+        # Distinguish three recv outcomes:
+        #   data received  → parse as WREPL (confirmed WINS)
+        #   timeout        → connection held open, no reply (likely WINS, non-partner)
+        #   empty / closed → server sent FIN immediately (unconfirmed service)
+        data = None
+        recv_timed_out = False
+        try:
+          data = sock.recv(1024)
+        except socket.timeout:
+          recv_timed_out = True
+        finally:
+          sock.close()
+
+        if data and len(data) >= 20:
+          raw["wins_responded"] = True
+          # Parse response: first 4 bytes = Packet Length, next 16 = common header
+          resp_msg_type = struct.unpack('>I', data[12:16])[0] if len(data) >= 16 else None
+          version_info = ""
+          if resp_msg_type == 1 and len(data) >= 24:
+            # Association Start Response — extract version
+            resp_major = struct.unpack('>H', data[20:22])[0] if len(data) >= 22 else None
+            resp_minor = struct.unpack('>H', data[22:24])[0] if len(data) >= 24 else None
+            if resp_major is not None:
+              version_info = f" (NBNS version {resp_major}.{resp_minor})"
+              raw["nbns_version"] = {"major": resp_major, "minor": resp_minor}
+          raw["banner"] = f"WINS replication service{version_info}"
+          findings.append(Finding(
+            severity=Severity.MEDIUM,
+            title="WINS replication service exposed",
+            description=(
+              f"WINS on {target}:{port} responded to a WREPL Association Start Request{version_info}. "
+              "WINS is a legacy name-resolution service vulnerable to spoofing, enumeration, and "
+              "multiple remote code execution flaws (CVE-2004-1080, CVE-2009-1923, CVE-2009-1924). "
+              "It should not be accessible from untrusted networks."
+            ),
+            evidence=f"WREPL response ({len(data)} bytes): {data[:24].hex()}",
+            remediation=(
+              "Decommission WINS or restrict TCP port 42 to trusted replication partners. "
+              "If WINS is required, apply all patches (MS04-045, MS09-039) and set the registry key "
+              "RplOnlyWCnfPnrs=1 to accept replication only from configured partners."
+            ),
+            owasp_id="A01:2021",
+            cwe_id="CWE-284",
+            confidence="certain",
+          ))
+        elif data:
+          # Got some data but not enough for a valid WREPL response
+          raw["wins_responded"] = True
+          raw["banner"] = f"Port {port} responded ({len(data)} bytes, non-WREPL)"
+          findings.append(Finding(
+            severity=Severity.LOW,
+            title=f"Service on port {port} responded but is not standard WINS",
+            description=(
+              f"TCP port {port} on {target} returned data that does not match the "
+              "WINS replication protocol (MS-WINSRA). Another service may be listening."
+            ),
+            evidence=f"Response ({len(data)} bytes): {data[:32].hex()}",
+            confidence="tentative",
+          ))
+        elif recv_timed_out:
+          # Connection accepted AND held open after our WREPL packet, but no
+          # reply — consistent with WINS silently dropping a non-partner request
+          # (RplOnlyWCnfPnrs=1).  A non-WINS service would typically RST or FIN.
+          raw["banner"] = "WINS likely (connection held, no WREPL reply)"
+          findings.append(Finding(
+            severity=Severity.MEDIUM,
+            title="WINS replication port open (non-partner rejected)",
+            description=(
+              f"TCP port {port} on {target} accepted a WREPL Association Start Request "
+              "and held the connection open without responding, consistent with a WINS "
+              "server configured to reject non-partner replication (RplOnlyWCnfPnrs=1). "
+              "An exposed WINS port is a legacy attack surface subject to remote code "
+              "execution flaws (CVE-2004-1080, CVE-2009-1923, CVE-2009-1924)."
+            ),
+            evidence="TCP connection accepted and held open; WREPL handshake: no reply after 3 s",
+            remediation=(
+              "Block TCP port 42 at the firewall if WINS replication is not needed. "
+              "If required, restrict to trusted replication partners only."
+            ),
+            owasp_id="A01:2021",
+            cwe_id="CWE-284",
+            confidence="firm",
+          ))
+        else:
+          # recv returned empty — server immediately closed the connection.
+          # Cannot confirm WINS; don't produce a finding. The port scan
+          # already reports the open port; a "service unconfirmed" finding
+          # adds no actionable value to the report.
+          pass
+    except Exception as e:
+      return probe_error(target, port, "WINS/NBNS", e)
+
+    if not findings:
+      # Could not confirm WINS — downgrade the protocol label so the UI
+      # does not display an unverified "WINS" tag from WELL_KNOWN_PORTS.
+      port_protocols = self.state.get("port_protocols")
+      if port_protocols and port_protocols.get(port) in ("wins", "nbns"):
+        port_protocols[port] = "unknown"
+      return None
+
+    return probe_result(raw_data=raw, findings=findings)
+
+
   def _service_info_vnc(self, target, port):  # default port: 5900
     """
     VNC handshake: read version banner, negotiate security types.

@@ -19,6 +19,7 @@ FEATURE_CATALOG = [
       "_service_info_dns",
       "_service_info_snmp",
       "_service_info_smb",
+      "_service_info_wins",
       "_service_info_generic"
     ]
   },
@@ -127,7 +128,7 @@ FINGERPRINT_NUDGE_TIMEOUT = 3  # seconds — generic \r\n nudge probe timeout
 # Well-known TCP port → protocol (fallback when banner is unrecognized)
 WELL_KNOWN_PORTS = {
     21: "ftp", 22: "ssh", 23: "telnet", 25: "smtp", 42: "wins",
-    53: "dns", 80: "http", 81: "http", 110: "pop3", 143: "imap",
+    53: "dns", 80: "http", 81: "http", 110: "pop3", 137: "nbns", 143: "imap",
     161: "snmp", 443: "https", 445: "smb", 465: "smtp",  # SMTPS
     502: "modbus", 587: "smtp", 993: "imap", 995: "pop3",  # TLS-wrapped mail
     1433: "mssql", 3306: "mysql", 3389: "rdp", 5432: "postgresql",
@@ -150,7 +151,7 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_http":      frozenset({"http"}),
     "_service_info_https":     frozenset({"https"}),
     "_service_info_http_alt":    frozenset({"http"}),
-    "_service_info_tls":     frozenset({"https", "unknown", "wins"}),
+    "_service_info_tls":     frozenset({"https", "unknown"}),
     "_service_info_mssql":    frozenset({"mssql"}),
     "_service_info_mysql":    frozenset({"mysql"}),
     "_service_info_rdp":    frozenset({"rdp"}),
@@ -163,7 +164,8 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_snmp":     frozenset({"snmp"}),
     "_service_info_smb":     frozenset({"smb"}),
     "_service_info_modbus":     frozenset({"modbus"}),
-    "_service_info_generic": frozenset({"unknown", "wins"}),
+    "_service_info_wins":    frozenset({"wins", "nbns"}),
+    "_service_info_generic": frozenset({"unknown"}),
     "_service_info_mysql_creds": frozenset({"mysql"}),
     "_service_info_postgresql_creds": frozenset({"postgresql"}),
 }
