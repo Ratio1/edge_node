@@ -264,8 +264,11 @@ class _ContainerUtilsMixin:
                   candidate_value = func(**part_kwargs)
                   found = True
                 except Exception as e:
-                  self.P("Error calling dynamic env var function {}: {}".format(func_name, e), color='r')
-              #endif callable
+                  self.P(
+                    "Error calling dynamic env var function {} for variable {}: {}".format(
+                      func_name, variable_name, e),
+                    color='r')
+              # endif callable
             #endif hasattr
             if not found:
               self.P(f"Dynamic env var {variable_name} has invalid type: {part_type}", color='r')
