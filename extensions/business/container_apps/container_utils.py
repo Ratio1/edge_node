@@ -163,7 +163,7 @@ class _ContainerUtilsMixin:
       return None
 
 
-  def _setup_dynamic_env_var_host_ip(self):
+  def _setup_dynamic_env_var_host_ip(self, **kwargs):
     """
     Get host IP address for dynamic environment variable.
 
@@ -203,7 +203,7 @@ class _ContainerUtilsMixin:
     return str(value) if value else ""
 
 
-  def _setup_dynamic_env_var_some_other_calc_type(self):
+  def _setup_dynamic_env_var_some_other_calc_type(self, **kwargs):
     """
     Example dynamic environment variable calculator.
 
@@ -263,9 +263,8 @@ class _ContainerUtilsMixin:
                   part_kwargs = {k: v for k, v in variable_part.items() if k != 'type'}
                   candidate_value = func(**part_kwargs)
                   found = True
-                except TypeError:
-                  candidate_value = func()
-                  found = True
+                except Exception as e:
+                  self.P("Error calling dynamic env var function {}: {}".format(func_name, e), color='r')
               #endif callable
             #endif hasattr
             if not found:
