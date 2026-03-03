@@ -2600,15 +2600,10 @@ class ContainerAppRunnerPlugin(
     if port:
       self.semaphore_set_env('PORT', str(port))
       self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, port))
-    if self.container:
-      try:
-        self.container.reload()
-        container_ip = self.container.attrs['NetworkSettings']['IPAddress']
-        self.Pd(f"Container IP address: {container_ip}")
-        if container_ip:
-          self.semaphore_set_env('CONTAINER_IP', container_ip)
-      except Exception as e:
-        self.P(f"Could not get container IP: {e}", color='r')
+    container_ip = self._get_container_ip()
+    self.Pd(f"Container IP address: {container_ip}")
+    if container_ip:
+      self.semaphore_set_env('CONTAINER_IP', container_ip)
     return
 
 

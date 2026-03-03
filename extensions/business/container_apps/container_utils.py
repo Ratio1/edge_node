@@ -89,6 +89,8 @@ class _ContainerUtilsMixin:
       "R1EN_R1FS_API_URL": f"http://{localhost_ip}:31235",
       "EE_CHAINSTORE_PEERS": str_chainstore_peers,
       "R1EN_CHAINSTORE_PEERS": str_chainstore_peers,
+
+      "R1EN_CONTAINER_IP": self._get_container_ip()
       
       # OBSERVATION: From now on only add new env vars with R1EN_ prefix
       #              to avoid missunderstandings with EE_ prefixed vars that
@@ -137,6 +139,29 @@ class _ContainerUtilsMixin:
     })
 
     return data
+
+  def _get_container_ip(self):
+    """
+    Get the container's IP address from Docker network settings.
+
+    If a semaphore is configured, also sets the CONTAINER_IP env var
+    in shared memory for paired plugins.
+
+    Returns
+    -------
+    str or None
+        Container IP address, or None if unavailable
+    """
+    if not self.container:
+      return None
+    try:
+      self.container.reload()
+      container_ip = self.container.attrs['NetworkSettings']['IPAddress']
+      return container_ip
+    except Exception as e:
+      self.P(f"Could not get container IP: {e}", color='r')
+      return None
+
 
   def _setup_dynamic_env_var_host_ip(self):
     """
