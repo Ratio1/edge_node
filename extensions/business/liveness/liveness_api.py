@@ -200,11 +200,15 @@ class LivenessApiPlugin(BasePlugin):
     
     
   def __get_all_services_statuses(self):
-    statuses = {}
-    for service in self.cfg_monitored_services.keys():
-      cfg = self.__get_service_config(service)
-      statuses[service] = self.__get_service_status(cfg)
-    return statuses
+    try:
+      statuses = {}
+      for service in self.cfg_monitored_services.keys():
+        cfg = self.__get_service_config(service)
+        statuses[service] = self.__get_service_status(cfg)
+      return statuses
+    except Exception as e:
+      self.P("Error while getting services statuses: {}".format(str(e)))
+      return {}
 
   @BasePlugin.endpoint
   # /get_liveness_data
