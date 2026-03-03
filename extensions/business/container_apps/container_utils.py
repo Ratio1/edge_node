@@ -89,6 +89,8 @@ class _ContainerUtilsMixin:
       "R1EN_R1FS_API_URL": f"http://{localhost_ip}:31235",
       "EE_CHAINSTORE_PEERS": str_chainstore_peers,
       "R1EN_CHAINSTORE_PEERS": str_chainstore_peers,
+
+      "R1EN_CONTAINER_IP": self._get_container_ip()
       
       # OBSERVATION: From now on only add new env vars with R1EN_ prefix
       #              to avoid missunderstandings with EE_ prefixed vars that
@@ -138,7 +140,30 @@ class _ContainerUtilsMixin:
 
     return data
 
-  def _setup_dynamic_env_var_host_ip(self):
+  def _get_container_ip(self):
+    """
+    Get the container's IP address from Docker network settings.
+
+    If a semaphore is configured, also sets the CONTAINER_IP env var
+    in shared memory for paired plugins.
+
+    Returns
+    -------
+    str or None
+        Container IP address, or None if unavailable
+    """
+    if not self.container:
+      return None
+    try:
+      self.container.reload()
+      container_ip = self.container.attrs['NetworkSettings']['IPAddress']
+      return container_ip
+    except Exception as e:
+      self.P(f"Could not get container IP: {e}", color='r')
+      return None
+
+
+  def _setup_dynamic_env_var_host_ip(self, **kwargs):
     """
     Get host IP address for dynamic environment variable.
 
@@ -149,7 +174,36 @@ class _ContainerUtilsMixin:
     """
     return self.log.get_localhost_ip()
 
-  def _setup_dynamic_env_var_some_other_calc_type(self):
+
+  def _setup_dynamic_env_var_shmem(self, path, **kwargs):
+    """
+    Get a value from shared memory semaphore environment.
+
+    Parameters
+    ----------
+    path : list or str
+        If list: [semaphore_key, env_key] - joined with '_' to form full key
+        If str: the full prefixed key to look up directly
+
+    Returns
+    -------
+    str
+        The semaphore env value, or empty string if not found
+    """
+    if isinstance(path, list):
+      if len(path) != 2:
+        self.P(f"Invalid shmem path: {path}. Expected [semaphore_key, env_key]", color='r')
+        return ""
+      value = self.semaphore_get_env_value(path[0], path[1])
+    elif isinstance(path, str):
+      value = self.semaphore_get_env_value_by_path(path)
+    else:
+      self.P(f"Invalid shmem path type: {type(path)}. Expected list or str", color='r')
+      return ""
+    return str(value) if value else ""
+
+
+  def _setup_dynamic_env_var_some_other_calc_type(self, **kwargs):
     """
     Example dynamic environment variable calculator.
 
@@ -206,11 +260,15 @@ class _ContainerUtilsMixin:
               if callable(func):
                 # Call the function and append its result to the variable value
                 try:
-                  candidate_value = func()
+                  part_kwargs = {k: v for k, v in variable_part.items() if k != 'type'}
+                  candidate_value = func(**part_kwargs)
                   found = True
-                except:
-                  self.P(f"Error calling function {func_name} for dynamic env var {variable_name}", color='r')
-              #endif callable
+                except Exception as e:
+                  self.P(
+                    "Error calling dynamic env var function {} for variable {}: {}".format(
+                      func_name, variable_name, e),
+                    color='r')
+              # endif callable
             #endif hasattr
             if not found:
               self.P(f"Dynamic env var {variable_name} has invalid type: {part_type}", color='r')
