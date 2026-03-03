@@ -1282,7 +1282,6 @@ class ContainerAppRunnerPlugin(
 
     self.reset_tunnel_engine()
 
-    self._configure_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
     self._configure_volumes() # setup container volumes
     self._configure_file_volumes() # setup file volumes with dynamic content
@@ -2601,6 +2600,15 @@ class ContainerAppRunnerPlugin(
     if port:
       self.semaphore_set_env('PORT', str(port))
       self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, port))
+    if self.container:
+      try:
+        self.container.reload()
+        container_ip = self.container.attrs['NetworkSettings']['IPAddress']
+        self.Pd(f"Container IP address: {container_ip}")
+        if container_ip:
+          self.semaphore_set_env('CONTAINER_IP', container_ip)
+      except Exception as e:
+        self.P(f"Could not get container IP: {e}", color='r')
     return
 
 
@@ -3094,7 +3102,6 @@ class ContainerAppRunnerPlugin(
     # Set state after reset
     self._set_container_state(ContainerState.RESTARTING, stop_reason or StopReason.UNKNOWN)
 
-    self._configure_dynamic_env()
     self._setup_resource_limits_and_ports()
     self._configure_volumes()
     self._configure_file_volumes()
@@ -3278,7 +3285,8 @@ class ContainerAppRunnerPlugin(
       if not self._wait_for_semaphores():
         return  # Still
       # end if
-      # Semaphores ready - now setup env vars with semaphore values
+      # Semaphores ready - dynamic env to resolve shmem values, then setup env
+      self._configure_dynamic_env()
       self._setup_env_and_ports()
     # end if
 
