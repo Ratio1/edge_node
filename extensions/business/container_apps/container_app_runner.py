@@ -260,7 +260,9 @@ _CONFIG = {
 
   # Container-specific config options
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"
+  "CONTAINER_ENTRYPOINT": None,        # Optional entrypoint override for the container
   "CONTAINER_START_COMMAND": None,  # Optional command list executed when launching the container
+  "CONTAINER_USER": None,          # Optional user override for the container (e.g. "root", "0:0")
   "BUILD_AND_RUN_COMMANDS": [],     # Optional commands executed inside the running container
   "CR_DATA": {              # dict of container registry data
     "SERVER": 'docker.io',  # Optional container registry URL
@@ -1209,6 +1211,11 @@ class ContainerAppRunnerPlugin(
     ValueError
         If configuration is invalid
     """
+    self._entrypoint = self._normalize_container_command(
+      getattr(self, 'cfg_container_entrypoint', None),
+      field_name='CONTAINER_ENTRYPOINT',
+    )
+
     self._start_command = self._normalize_container_command(
       getattr(self, 'cfg_container_start_command', None),
       field_name='CONTAINER_START_COMMAND',
@@ -2060,7 +2067,9 @@ class ContainerAppRunnerPlugin(
     log_str += f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}\n"
     log_str += f"  Restart policy: {self.cfg_restart_policy}\n"
     log_str += f"  Pull policy: {self.cfg_image_pull_policy}\n"
+    log_str += f"  Entrypoint: {self._entrypoint if self._entrypoint else 'Image default'}\n"
     log_str += f"  Start command: {self._start_command if self._start_command else 'Image default'}\n"
+    log_str += f"  User: {self.cfg_container_user if self.cfg_container_user else 'Image default'}\n"
 
     self.P(log_str)
 
@@ -2098,8 +2107,14 @@ class ContainerAppRunnerPlugin(
     # endif
 
     try:
+      if self._entrypoint:
+        run_kwargs['entrypoint'] = self._entrypoint
+
       if self._start_command:
         run_kwargs['command'] = self._start_command
+
+      if self.cfg_container_user:
+        run_kwargs['user'] = self.cfg_container_user
 
       self.container = self.docker_client.containers.run(
         self.cfg_image,
@@ -2300,10 +2315,15 @@ class ContainerAppRunnerPlugin(
         return
 
       self.P(f"Running container exec command: {shell_cmd}")
-      exec_result = self.container.exec_run(
-        ["sh", "-c", shell_cmd],
+      exec_kwargs = dict(
         stream=True,
         detach=False,
+      )
+      if self.cfg_container_user:
+        exec_kwargs['user'] = self.cfg_container_user
+      exec_result = self.container.exec_run(
+        ["sh", "-c", shell_cmd],
+        **exec_kwargs,
       )
       thread = threading.Thread(
         target=self._stream_logs,
