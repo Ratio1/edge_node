@@ -1655,19 +1655,23 @@ class _DeeployMixin:
 
   def _autowire_native_container_semaphore(self, app_id, plugins, job_app_type):
     """
-    Auto-configure semaphore settings for native + containerized plugin pairs.
+    Auto-configure semaphore settings for a native job that has one native plugin
+    and one containerized plugin (CONTAINER_APP_RUNNER or WORKER_APP_RUNNER).
 
-    Requires at least two distinct signature groups: one or more native plugins
-    and one or more containerized plugins (CONTAINER_APP_RUNNER / WORKER_APP_RUNNER).
-    All native plugin instances receive a SEMAPHORE key; all containerized plugin
-    instances receive SEMAPHORED_KEYS pointing to every native semaphore key so
-    they wait for the native plugins to be ready before starting.
+    The native plugin acts as the orchestrator — it receives a SEMAPHORE key so that
+    containerized plugins can wait for it to be ready. Each containerized plugin
+    instance receives SEMAPHORED_KEYS containing all native semaphore keys.
+
+    This is only meant for the simple native + CAR/WAR pattern. When the user
+    provides explicit shmem DYNAMIC_ENV references or manual SEMAPHORE /
+    SEMAPHORED_KEYS config, this autowiring is skipped entirely and the user's
+    explicit dependency tree takes precedence.
 
     Skips autowiring when:
     - job_app_type is not NATIVE
-    - Fewer than 2 signature groups (need both native and containerized)
-    - SEMAPHORE / SEMAPHORED_KEYS already present (explicit shmem wiring)
-    - Explicit shmem DYNAMIC_ENV entries detected
+    - Fewer than 2 signature groups (need both a native and a containerized group)
+    - SEMAPHORE / SEMAPHORED_KEYS already present on any instance
+    - Explicit shmem DYNAMIC_ENV entries detected (user-defined dependency tree)
 
     Parameters
     ----------
@@ -1686,30 +1690,40 @@ class _DeeployMixin:
     try:
       if job_app_type != JOB_APP_TYPES.NATIVE:
         return plugins
+      # end if
 
       if not isinstance(plugins, list) or len(plugins) < 2:
         return plugins
+      # end if
 
       def has_semaphore_config(plugin_list):
         for plugin in plugin_list:
           instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
           if not isinstance(instances, list):
             continue
+          # end if
           for instance in instances:
             if not isinstance(instance, dict):
               continue
+            # end if
             if "SEMAPHORE" in instance or "SEMAPHORED_KEYS" in instance:
               return True
+            # end if
+          # end for instance
+        # end for plugin
         return False
+      # end has_semaphore_config
 
       if has_semaphore_config(plugins):
         self.Pd("Skipping semaphore autowire; semaphore config already provided.")
         return plugins
+      # end if
 
       # Skip autowiring if explicit shmem references are present
       if self._has_shmem_dynamic_env(plugins):
         self.Pd("Skipping semaphore autowire; explicit shmem references detected.")
         return plugins
+      # end if
 
       # Collect all native and container plugins
       native_plugins = []
@@ -1719,14 +1733,18 @@ class _DeeployMixin:
         signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
         if not signature:
           continue
+        # end if
         normalized_signature = str(signature).upper()
         if normalized_signature in CONTAINERIZED_APPS_SIGNATURES:
           container_plugins.append(plugin)
         else:
           native_plugins.append(plugin)
+        # end if
+      # end for plugin
 
       if not container_plugins or not native_plugins:
         return plugins
+      # end if
 
       # Set SEMAPHORE on all native instances
       semaphore_keys = []
@@ -1734,28 +1752,38 @@ class _DeeployMixin:
         native_instances = native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
         if not isinstance(native_instances, list):
           continue
+        # end if
         for instance in native_instances:
           if not isinstance(instance, dict):
             continue
+          # end if
           instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
           if not instance_id:
             continue
+          # end if
           semaphore_key = self.sanitize_name("{}__{}".format(app_id, instance_id))
           instance["SEMAPHORE"] = semaphore_key
           semaphore_keys.append(semaphore_key)
+        # end for instance
+      # end for native_plugin
 
       if not semaphore_keys:
         return plugins
+      # end if
 
       # Set SEMAPHORED_KEYS on all container instances
       for container_plugin in container_plugins:
         container_instances = container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
         if not isinstance(container_instances, list):
           continue
+        # end if
         for instance in container_instances:
           if not isinstance(instance, dict):
             continue
+          # end if
           instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
+        # end for instance
+      # end for container_plugin
 
       return plugins
     except Exception as exc:
