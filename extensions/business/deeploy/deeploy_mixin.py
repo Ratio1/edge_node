@@ -100,10 +100,7 @@ class _DeeployMixin:
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
-    plugins, name_to_instance = self.deeploy_prepare_plugins(inputs)
-    if name_to_instance:
-      plugins = self._resolve_shmem_references(plugins, name_to_instance, app_id)
-    self._validate_dependency_tree(inputs)
+    plugins = self.deeploy_prepare_plugins(inputs)
     plugins = self._ensure_runner_cstore_auth_env(
       app_id=app_id,
       prepared_plugins=plugins,
@@ -253,7 +250,7 @@ class _DeeployMixin:
     ts = self.time()
     detected_job_app_type = job_app_type
     if not detected_job_app_type:
-      plugins_for_detection, _ = self.deeploy_prepare_plugins(inputs)
+      plugins_for_detection = self.deeploy_prepare_plugins(inputs)
       detected_job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
 
     if not dct_deeploy_specs:
@@ -1334,7 +1331,7 @@ class _DeeployMixin:
       if not job_app_type:
         try:
           self.Pd("  Detecting job app type from plugins...")
-          job_app_type = self.deeploy_detect_job_app_type(self.deeploy_prepare_plugins(inputs)[0])
+          job_app_type = self.deeploy_detect_job_app_type(self.deeploy_prepare_plugins(inputs))
           self.Pd(f"  Detected job app type: {job_app_type}")
         except Exception as exc:
           self.Pd(f"  Failed to detect job app type: {exc}")
@@ -1457,209 +1454,35 @@ class _DeeployMixin:
     signature, instances = normalized_plugins[0]
     normalized_signature = signature.upper() if isinstance(signature, str) else ''
 
-    if normalized_signature in (CONTAINER_APP_RUNNER_SIGNATURE, WORKER_APP_RUNNER_SIGNATURE):
-      # Multiple instances under one containerized signature → native multi-container
-      if len(instances) > 1:
-        return JOB_APP_TYPES.NATIVE
+    if normalized_signature == CONTAINER_APP_RUNNER_SIGNATURE:
+      service_keywords = ('postgresql', 'postgres', 'mongo', 'mongodb', 'mysql', 'mssql')
+      for instance_conf in instances:
+        if not isinstance(instance_conf, dict):
+          continue
+        image_value = (
+          instance_conf.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE)
+          or instance_conf.get('IMAGE')
+          or instance_conf.get('image')
+        )
+        if image_value and any(keyword in str(image_value).lower() for keyword in service_keywords):
+          return JOB_APP_TYPES.SERVICE
+      return JOB_APP_TYPES.GENERIC
 
-      if normalized_signature == CONTAINER_APP_RUNNER_SIGNATURE:
-        service_keywords = ('postgresql', 'postgres', 'mongo', 'mongodb', 'mysql', 'mssql')
-        for instance_conf in instances:
-          if not isinstance(instance_conf, dict):
-            continue
-          image_value = (
-            instance_conf.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE)
-            or instance_conf.get('IMAGE')
-            or instance_conf.get('image')
-          )
-          if image_value and any(keyword in str(image_value).lower() for keyword in service_keywords):
-            return JOB_APP_TYPES.SERVICE
-
+    if normalized_signature == WORKER_APP_RUNNER_SIGNATURE:
       return JOB_APP_TYPES.GENERIC
 
     return JOB_APP_TYPES.NATIVE
 
-  def _has_shmem_dynamic_env(self, plugins):
-    """Check if any plugin instance has shmem-type DYNAMIC_ENV entries."""
-    for plugin in plugins:
-      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-      if not isinstance(instances, list):
-        continue
-      for instance in instances:
-        if not isinstance(instance, dict):
-          continue
-        dynamic_env = instance.get("DYNAMIC_ENV")
-        if not isinstance(dynamic_env, dict):
-          continue
-        for _key, entries in dynamic_env.items():
-          if not isinstance(entries, list):
-            continue
-          for entry in entries:
-            if isinstance(entry, dict) and entry.get("type") == "shmem":
-              return True
-    return False
-
-  def _resolve_shmem_references(self, plugins, name_to_instance, app_id):
-    """
-    Resolve shmem-type DYNAMIC_ENV entries by replacing plugin names with semaphore keys.
-    Sets SEMAPHORE on provider instances and SEMAPHORED_KEYS on consumer instances.
-
-    Parameters
-    ----------
-    plugins : list
-      Prepared plugins payload.
-    name_to_instance : dict
-      Mapping of plugin_name -> { instance_id, signature }.
-    app_id : str
-      Application identifier used to build semaphore keys.
-
-    Returns
-    -------
-    list
-      Modified plugins with shmem references resolved.
-    """
-    try:
-      # Build name -> semaphore_key map
-      name_to_semaphore = {}
-      for pname, info in name_to_instance.items():
-        iid = info.get("instance_id", "")
-        name_to_semaphore[pname] = self.sanitize_name("{}__{}".format(app_id, iid))
-
-      # Build instance_id -> instance reference for quick lookup
-      instance_id_to_ref = {}
-      for plugin in plugins:
-        instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-        for instance in instances:
-          if isinstance(instance, dict):
-            iid = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-            if iid:
-              instance_id_to_ref[iid] = instance
-
-      providers = set()  # instance_ids that are referenced as providers
-      consumers = {}     # instance_id -> set of semaphore keys they depend on
-
-      # Scan all instances for shmem DYNAMIC_ENV entries
-      for plugin in plugins:
-        instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-        for instance in instances:
-          if not isinstance(instance, dict):
-            continue
-          consumer_iid = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-          dynamic_env = instance.get("DYNAMIC_ENV")
-          if not isinstance(dynamic_env, dict):
-            continue
-
-          for _key, entries in dynamic_env.items():
-            if not isinstance(entries, list):
-              continue
-            for entry in entries:
-              if not isinstance(entry, dict) or entry.get("type") != "shmem":
-                continue
-              path = entry.get("path")
-              if not isinstance(path, (list, tuple)) or len(path) < 2:
-                continue
-              provider_name = path[0]
-              if provider_name not in name_to_semaphore:
-                self.Pd(f"Warning: shmem references unknown plugin '{provider_name}'", color='y')
-                continue
-
-              semaphore_key = name_to_semaphore[provider_name]
-              # Replace plugin name in path with the semaphore key
-              entry["path"] = [semaphore_key, path[1]]
-
-              # Track provider and consumer
-              provider_info = name_to_instance.get(provider_name, {})
-              provider_iid = provider_info.get("instance_id")
-              if provider_iid:
-                providers.add(provider_iid)
-              if consumer_iid:
-                if consumer_iid not in consumers:
-                  consumers[consumer_iid] = set()
-                consumers[consumer_iid].add(semaphore_key)
-
-      # Set SEMAPHORE on each provider instance
-      for provider_iid in providers:
-        ref = instance_id_to_ref.get(provider_iid)
-        if ref is not None:
-          sem_key = self.sanitize_name("{}__{}".format(app_id, provider_iid))
-          ref["SEMAPHORE"] = sem_key
-
-      # Set SEMAPHORED_KEYS on each consumer instance
-      for consumer_iid, sem_keys in consumers.items():
-        ref = instance_id_to_ref.get(consumer_iid)
-        if ref is not None:
-          ref["SEMAPHORED_KEYS"] = list(sem_keys)
-
-      return plugins
-    except Exception as exc:
-      self.Pd(f"Failed to resolve shmem references: {exc}", color='y')
-      return plugins
-
-  def _validate_dependency_tree(self, inputs):
-    """
-    Validate dependency_tree from inputs for circular dependencies.
-    Raises ValueError if a cycle is detected.
-    """
-    dep_tree = inputs.get(DEEPLOY_KEYS.DEPENDENCY_TREE)
-    if not dep_tree or not isinstance(dep_tree, list):
-      return
-
-    # Validate structure
-    for edge in dep_tree:
-      if not isinstance(edge, (list, tuple)) or len(edge) != 2:
-        raise ValueError(
-          f"{DEEPLOY_ERRORS.DEPENDENCY_TREE1}: Invalid dependency_tree entry: {edge}. Each entry must be a [from, to] pair."
-        )
-
-    # DFS cycle detection
-    graph = {}
-    for from_node, to_node in dep_tree:
-      if from_node not in graph:
-        graph[from_node] = []
-      graph[from_node].append(to_node)
-
-    WHITE, GRAY, BLACK = 0, 1, 2
-    color = {node: WHITE for node in graph}
-
-    def dfs(node):
-      color[node] = GRAY
-      for neighbor in graph.get(node, []):
-        if neighbor not in color:
-          color[neighbor] = WHITE
-        c = color[neighbor]
-        if c == GRAY:
-          return True
-        if c == WHITE and dfs(neighbor):
-          return True
-      color[node] = BLACK
-      return False
-
-    for node in list(graph.keys()):
-      if color.get(node, WHITE) == WHITE:
-        if dfs(node):
-          raise ValueError(
-            f"{DEEPLOY_ERRORS.DEPENDENCY_TREE2}: Circular dependency detected in dependency_tree."
-          )
-    return
-
   def _autowire_native_container_semaphore(self, app_id, plugins, job_app_type):
     """
-    Auto-configure semaphore settings for native + container plugin groups.
-    Supports N plugins: all native plugins get SEMAPHORE, all container plugins
-    get SEMAPHORED_KEYS pointing to all native semaphore keys.
-
-    Skips autowiring if:
-    - Not a native job app type
-    - Less than 2 plugins
-    - Semaphore config already exists (e.g., from explicit shmem wiring)
-    - Explicit shmem DYNAMIC_ENV entries detected
+    Auto-configure semaphore settings for native + container pairs.
 
     Parameters
     ----------
     app_id : str
       Application identifier used to build deterministic semaphore keys.
     plugins : list
-      Prepared plugins payload.
+      Prepared plugins payload (expected to be a two-item native/container pair).
     job_app_type : str
       Detected job application type.
 
@@ -1671,76 +1494,85 @@ class _DeeployMixin:
     try:
       if job_app_type != JOB_APP_TYPES.NATIVE:
         return plugins
+      # endif native job app type
 
-      if not isinstance(plugins, list) or len(plugins) < 2:
+      if not isinstance(plugins, list) or len(plugins) != 2:
         return plugins
+      # endif plugin pair check
 
       def has_semaphore_config(plugin_list):
         for plugin in plugin_list:
           instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
           if not isinstance(instances, list):
             continue
+          # endif instances is list
           for instance in instances:
             if not isinstance(instance, dict):
               continue
+            # endif instance is dict
             if "SEMAPHORE" in instance or "SEMAPHORED_KEYS" in instance:
               return True
+            # endif instance has semaphore config
+          # endfor each instance
+        # endfor each plugin
         return False
 
       if has_semaphore_config(plugins):
         self.Pd("Skipping semaphore autowire; semaphore config already provided.")
         return plugins
+      # endif skip when provided
 
-      # Skip autowiring if explicit shmem references are present
-      if self._has_shmem_dynamic_env(plugins):
-        self.Pd("Skipping semaphore autowire; explicit shmem references detected.")
-        return plugins
-
-      # Collect all native and container plugins
-      native_plugins = []
-      container_plugins = []
+      container_plugin = None
+      native_plugin = None
 
       for plugin in plugins:
         signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
         if not signature:
           continue
+        # endif signature check
         normalized_signature = str(signature).upper()
         if normalized_signature in CONTAINERIZED_APPS_SIGNATURES:
-          container_plugins.append(plugin)
+          container_plugin = container_plugin or plugin
         else:
-          native_plugins.append(plugin)
+          native_plugin = native_plugin or plugin
+        # endif signature type
+      # endfor each plugin
 
-      if not container_plugins or not native_plugins:
+      if not container_plugin or not native_plugin:
         return plugins
+      # endif both plugin types found
 
-      # Set SEMAPHORE on all native instances
+      native_instances = native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      container_instances = container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+
+      if not isinstance(native_instances, list) or not isinstance(container_instances, list):
+        return plugins
+      # endif instance lists
+
       semaphore_keys = []
-      for native_plugin in native_plugins:
-        native_instances = native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-        if not isinstance(native_instances, list):
+      for instance in native_instances:
+        if not isinstance(instance, dict):
           continue
-        for instance in native_instances:
-          if not isinstance(instance, dict):
-            continue
-          instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-          if not instance_id:
-            continue
-          semaphore_key = self.sanitize_name("{}__{}".format(app_id, instance_id))
-          instance["SEMAPHORE"] = semaphore_key
-          semaphore_keys.append(semaphore_key)
+        # endif instance is dict
+        instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+        if not instance_id:
+          continue
+        # endif instance id
+        semaphore_key = self.sanitize_name("{}__{}".format(app_id, instance_id))
+        instance["SEMAPHORE"] = semaphore_key
+        semaphore_keys.append(semaphore_key)
+      # endfor each native instance
 
       if not semaphore_keys:
         return plugins
+      # endif semaphore keys found
 
-      # Set SEMAPHORED_KEYS on all container instances
-      for container_plugin in container_plugins:
-        container_instances = container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-        if not isinstance(container_instances, list):
+      for instance in container_instances:
+        if not isinstance(instance, dict):
           continue
-        for instance in container_instances:
-          if not isinstance(instance, dict):
-            continue
-          instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
+        # endif container instance dict
+        instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
+      # endfor each container instance
 
       return plugins
     except Exception as exc:
@@ -1895,13 +1727,11 @@ class _DeeployMixin:
     if plugins_array and isinstance(plugins_array, list):
       # Group plugin instances by signature
       plugins_by_signature = {}
-      name_to_instance = {}
 
       used_instance_ids = set()
 
       for plugin_instance in plugins_array:
         signature = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
-        plugin_name = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
 
         # Extract instance config (everything except metadata keys)
         instance_config = {
@@ -1909,7 +1739,6 @@ class _DeeployMixin:
           if k not in {
             DEEPLOY_KEYS.PLUGIN_SIGNATURE,
             DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
-            DEEPLOY_KEYS.PLUGIN_NAME,
             self.ct.CONFIG_INSTANCE.K_INSTANCE_ID,
             "signature",
             "instance_id",
@@ -1933,13 +1762,6 @@ class _DeeployMixin:
           **instance_config
         }
 
-        # Build name-to-instance mapping if plugin_name was provided
-        if plugin_name:
-          name_to_instance[plugin_name] = {
-            "instance_id": instance_id,
-            "signature": signature,
-          }
-
         # Group by signature
         if signature not in plugins_by_signature:
           plugins_by_signature[signature] = []
@@ -1954,12 +1776,12 @@ class _DeeployMixin:
         }
         prepared_plugins.append(prepared_plugin)
 
-      return prepared_plugins, name_to_instance
+      return prepared_plugins
 
     # Legacy single-plugin format - use existing method
     plugin = self.deeploy_prepare_single_plugin_instance(inputs)
     plugins = [plugin]
-    return plugins, {}
+    return plugins
 
   def check_and_deploy_pipelines(
       self, owner, inputs, app_id,
