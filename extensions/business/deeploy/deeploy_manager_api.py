@@ -255,7 +255,8 @@ class DeeployManagerApiPlugin(
         if job_app_type not in JOB_APP_TYPES_ALL:
           raise ValueError(f"Invalid job_app_type '{job_app_type}'. Expected one of {JOB_APP_TYPES_ALL}.")
       else:
-        job_app_type = self.deeploy_detect_job_app_type(self.deeploy_prepare_plugins(inputs))
+        plugins_for_detection, _ = self.deeploy_prepare_plugins(inputs)
+        job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
         if job_app_type not in JOB_APP_TYPES_ALL:
           job_app_type = JOB_APP_TYPES.NATIVE
       self.P(f"Detected job app type: {job_app_type}")

@@ -52,6 +52,8 @@ class DEEPLOY_KEYS:
   PLUGINS = "plugins"
   PLUGIN_INSTANCES = "instances"
   PLUGIN_INSTANCE_ID = "instance_id"
+  PLUGIN_NAME = "plugin_name"
+  DEPENDENCY_TREE = "dependency_tree"
   # Auth result keys
   SENDER = "sender"
   SENDER_ESCROW = "sender_escrow"
@@ -104,6 +106,8 @@ class DEEPLOY_ERRORS:
   PLUGINS1 = "ERR25_DEEPLOY_PLUGINS1"  # Invalid plugins array structure
   PLUGINS2 = "ERR26_DEEPLOY_PLUGINS2"  # Plugin missing required field
   PLUGINS3 = "ERR27_DEEPLOY_PLUGINS3"  # Instance validation failed
+  DEPENDENCY_TREE1 = "ERR28_DEEPLOY_DEPENDENCY_TREE1"  # Invalid dependency_tree entry
+  DEPENDENCY_TREE2 = "ERR29_DEEPLOY_DEPENDENCY_TREE2"  # Circular dependency detected
 
 class DEEPLOY_RESOURCES:
   # Result dictionary keys
