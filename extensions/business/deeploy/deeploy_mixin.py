@@ -101,8 +101,16 @@ class _DeeployMixin:
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
     plugins, name_to_instance = self.deeploy_prepare_plugins(inputs)
+    plugin_semaphore_map = {}
     if name_to_instance:
       plugins = self._resolve_shmem_references(plugins, name_to_instance, app_id)
+      # Build plugin_name → semaphore_key mapping only for actual providers
+      for plugin in plugins:
+        for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES, []):
+          sem_key = instance.get("SEMAPHORE")
+          pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          if sem_key and pname:
+            plugin_semaphore_map[pname] = sem_key
     self._validate_dependency_tree(inputs)
     plugins = self._ensure_runner_cstore_auth_env(
       app_id=app_id,
@@ -156,6 +164,9 @@ class _DeeployMixin:
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
+
+    if plugin_semaphore_map:
+      dct_deeploy_specs[DEEPLOY_KEYS.JOB_CONFIG]["plugin_semaphore_map"] = plugin_semaphore_map
 
     plugins = self._autowire_native_container_semaphore(
       app_id=app_id,
@@ -1904,12 +1915,12 @@ class _DeeployMixin:
         plugin_name = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
 
         # Extract instance config (everything except metadata keys)
+        # Note: plugin_name is intentionally kept so it can be recovered during job editing
         instance_config = {
           k: v for k, v in plugin_instance.items()
           if k not in {
             DEEPLOY_KEYS.PLUGIN_SIGNATURE,
             DEEPLOY_KEYS.PLUGIN_INSTANCE_ID,
-            DEEPLOY_KEYS.PLUGIN_NAME,
             self.ct.CONFIG_INSTANCE.K_INSTANCE_ID,
             "signature",
             "instance_id",
