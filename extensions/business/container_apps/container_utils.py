@@ -28,6 +28,29 @@ class _ContainerUtilsMixin:
     cr_password = cr_data.get('PASSWORD')
     return cr_server, cr_username, cr_password
 
+  def _get_full_image_ref(self):
+    """
+    Get the full Docker image reference including the registry server prefix.
+
+    For non-Docker-Hub registries (e.g. ghcr.io), the server must be prepended
+    to the image name so Docker pulls from the correct registry.
+
+    Returns:
+        str: Full image reference (e.g. 'ghcr.io/misp/misp-docker/misp-core:latest')
+    """
+    image = self.cfg_image
+    if not image:
+      return image
+    cr_server, _, _ = self._get_cr_data()
+    if not cr_server or cr_server.lower() in ('docker.io', 'registry.hub.docker.com'):
+      return image
+    # end if
+    # Avoid double-prefixing if user already included the registry in image name
+    if image.lower().startswith(cr_server.lower() + '/'):
+      return image
+    # end if
+    return f"{cr_server}/{image}"
+
   def _login_to_registry(self):
     """
     Login to a private container registry using credentials from _get_cr_data.
