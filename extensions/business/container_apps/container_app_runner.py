@@ -2117,7 +2117,7 @@ class ContainerAppRunnerPlugin(
         run_kwargs['user'] = self.cfg_container_user
 
       self.container = self.docker_client.containers.run(
-        self.cfg_image,
+        self._get_full_image_ref(),
         **run_kwargs,
       )
 
@@ -2838,8 +2838,9 @@ class ContainerAppRunnerPlugin(
     if not self.cfg_image:
       return None
 
+    full_image = self._get_full_image_ref()
     try:
-      img = self.docker_client.images.get(self.cfg_image)
+      img = self.docker_client.images.get(full_image)
       return img
     except Exception:
       return None
@@ -2863,15 +2864,16 @@ class ContainerAppRunnerPlugin(
       self.P("No Docker image configured", color='r')
       return None
 
+    full_image = self._get_full_image_ref()
     try:
-      self.P(f"Pulling image '{self.cfg_image}'...")
-      img = self.docker_client.images.pull(self.cfg_image)
+      self.P(f"Pulling image '{full_image}'...")
+      img = self.docker_client.images.pull(full_image)
 
       # docker-py may return Image or list[Image]
       if isinstance(img, list) and img:
         img = img[-1]
 
-      self.P(f"Successfully pulled image '{self.cfg_image}'")
+      self.P(f"Successfully pulled image '{full_image}'")
       return img
 
     except Exception as e:
@@ -2899,13 +2901,15 @@ class ContainerAppRunnerPlugin(
     RuntimeError
         If authentication fails and no local image exists
     """
+    full_image = self._get_full_image_ref()
+
     # Step 1: Authenticate with registry
     if not self._login_to_registry():
       self.P("Registry authentication failed", color='r')
       # Try to use local image if authentication fails
       local_img = self._get_local_image()
       if local_img:
-        self.P(f"Using local image (registry login failed): {self.cfg_image}", color='r')
+        self.P(f"Using local image (registry login failed): {full_image}", color='r')
         return local_img
       raise RuntimeError("Failed to authenticate with registry and no local image available.")
 
@@ -2915,14 +2919,14 @@ class ContainerAppRunnerPlugin(
       return img
 
     # Step 3: Fallback to local image
-    self.P(f"Pull failed, checking for local image: {self.cfg_image}", color='r')
+    self.P(f"Pull failed, checking for local image: {full_image}", color='r')
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Using local image as fallback: {self.cfg_image}", color='r')
+      self.P(f"Using local image as fallback: {full_image}", color='r')
       return local_img
 
     # Step 4: No image available
-    self.P(f"No image available (pull failed and no local image): {self.cfg_image}", color='r')
+    self.P(f"No image available (pull failed and no local image): {full_image}", color='r')
     return None
 
 
@@ -3172,14 +3176,15 @@ class ContainerAppRunnerPlugin(
     bool
         True if image is available (locally or after pull), False otherwise
     """
+    full_image = self._get_full_image_ref()
     # Check if image exists locally
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Image '{self.cfg_image}' found locally")
+      self.P(f"Image '{full_image}' found locally")
       return True
 
     # Image not found locally, pull it
-    self.P(f"Image not found locally, pulling '{self.cfg_image}'...")
+    self.P(f"Image not found locally, pulling '{full_image}'...")
     img = self._pull_image_with_fallback()
     return img is not None
 
