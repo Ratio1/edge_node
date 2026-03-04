@@ -1655,14 +1655,18 @@ class _DeeployMixin:
 
   def _autowire_native_container_semaphore(self, app_id, plugins, job_app_type):
     """
-    Auto-configure semaphore settings for native + container plugin groups.
-    Supports N plugins: all native plugins get SEMAPHORE, all container plugins
-    get SEMAPHORED_KEYS pointing to all native semaphore keys.
+    Auto-configure semaphore settings for native + containerized plugin pairs.
 
-    Skips autowiring if:
-    - Not a native job app type
-    - Less than 2 plugins
-    - Semaphore config already exists (e.g., from explicit shmem wiring)
+    Requires at least two distinct signature groups: one or more native plugins
+    and one or more containerized plugins (CONTAINER_APP_RUNNER / WORKER_APP_RUNNER).
+    All native plugin instances receive a SEMAPHORE key; all containerized plugin
+    instances receive SEMAPHORED_KEYS pointing to every native semaphore key so
+    they wait for the native plugins to be ready before starting.
+
+    Skips autowiring when:
+    - job_app_type is not NATIVE
+    - Fewer than 2 signature groups (need both native and containerized)
+    - SEMAPHORE / SEMAPHORED_KEYS already present (explicit shmem wiring)
     - Explicit shmem DYNAMIC_ENV entries detected
 
     Parameters
@@ -1670,7 +1674,7 @@ class _DeeployMixin:
     app_id : str
       Application identifier used to build deterministic semaphore keys.
     plugins : list
-      Prepared plugins payload.
+      Prepared plugins payload (one entry per signature group, each with INSTANCES).
     job_app_type : str
       Detected job application type.
 
