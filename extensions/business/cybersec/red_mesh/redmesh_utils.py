@@ -792,6 +792,8 @@ class PentestLocalWorker(
       # --- 5e. PostgreSQL SSLRequest probe ---
       # PostgreSQL waits for a client startup message; it never sends a banner.
       # The SSLRequest message (8 bytes) elicits a single-byte 'S' or 'N' response.
+      # Guard: SSH banners start with 'S' (from "SSH-..."), so read extra bytes
+      # to disambiguate — a real PostgreSQL response is exactly 1 byte.
       if protocol is None or not banner_confirmed:
         try:
           pg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -800,11 +802,16 @@ class PentestLocalWorker(
           # SSLRequest: length=8, code=80877103
           pg_sock.sendall(b'\x00\x00\x00\x08\x04\xd2\x16\x2f')
           try:
-            pg_resp = pg_sock.recv(1)
+            pg_resp = pg_sock.recv(16)
           except (socket.timeout, OSError):
             pg_resp = b""
           pg_sock.close()
           if pg_resp in (b'S', b'N'):
+            protocol = "postgresql"
+            banner_confirmed = True
+          elif len(pg_resp) > 1 and pg_resp[0:1] in (b'S', b'N') and not pg_resp.startswith(b'SSH-'):
+            # Multi-byte response starting with S/N but not SSH — still PostgreSQL
+            # (e.g. server sent S then immediately started TLS handshake bytes)
             protocol = "postgresql"
             banner_confirmed = True
         except Exception:
