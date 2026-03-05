@@ -111,11 +111,23 @@ CVE_DATABASE: list = [
   # ── Samba (new — for SMB deep enumeration) ─────────────────────────
   CveEntry("samba", ">=4.16.0,<4.17.12", "CVE-2023-3961", Severity.CRITICAL, "Pipe name validation bypass — root socket access", "CWE-22"),
   CveEntry("samba", "<4.13.17", "CVE-2021-44142", Severity.CRITICAL, "vfs_fruit heap overflow RCE", "CWE-787"),
-  CveEntry("samba", "<4.6.1",   "CVE-2017-7494", Severity.CRITICAL, "SambaCry — writable share RCE via shared library upload", "CWE-94"),
+  CveEntry("samba", ">=3.5.0,<4.6.4", "CVE-2017-7494", Severity.CRITICAL, "SambaCry — writable share RCE via shared library upload", "CWE-94"),
 
   # ── Asterisk / FreePBX (new — for SIP probe) ──────────────────────
   CveEntry("asterisk", "<20.11.0", "CVE-2024-42365", Severity.HIGH, "AMI manager injection via caller ID", "CWE-94"),
   CveEntry("asterisk", "<18.24.0", "CVE-2023-49786", Severity.HIGH, "PJSIP request smuggling via multipart parser", "CWE-444"),
+
+  # ── OpenSMTPD ────────────────────────────────────────────────────
+  CveEntry("opensmtpd", "<6.6.2",  "CVE-2020-7247", Severity.CRITICAL, "RCE via crafted MAIL FROM command", "CWE-78"),
+  CveEntry("opensmtpd", "<6.6.4",  "CVE-2020-8794", Severity.HIGH, "Out-of-bounds read in MTA bounce handling", "CWE-125"),
+
+  # ── libssh ───────────────────────────────────────────────────────
+  CveEntry("libssh", "<0.7.6",  "CVE-2018-10933", Severity.CRITICAL, "Authentication bypass via MSG_USERAUTH_SUCCESS", "CWE-287"),
+  CveEntry("libssh", ">=0.8.0,<0.8.4", "CVE-2018-10933", Severity.CRITICAL, "Authentication bypass via MSG_USERAUTH_SUCCESS", "CWE-287"),
+
+  # ── Dropbear ─────────────────────────────────────────────────────
+  CveEntry("dropbear", "<2018.76", "CVE-2018-15599", Severity.MEDIUM, "Username enumeration via response size", "CWE-203"),
+  CveEntry("dropbear", "<2016.74", "CVE-2016-7406", Severity.HIGH, "Format string vulnerability in dbclient", "CWE-134"),
 ]
 
 

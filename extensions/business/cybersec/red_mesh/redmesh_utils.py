@@ -1,5 +1,6 @@
 import uuid
 import random
+import struct
 import threading
 import socket
 import json
@@ -616,15 +617,33 @@ class PentestLocalWorker(
           protocol = "pop3"
         elif text.startswith("* OK"):
           protocol = "imap"
+        # --- Redis: responds with +PONG, -ERR, -NOAUTH, or $ (bulk string) ---
+        elif text.startswith("+PONG") or text.startswith("-ERR") or text.startswith("-NOAUTH") or text.startswith("$"):
+          protocol = "redis"
+        # --- Rsync daemon ---
+        elif text.startswith("@RSYNCD:"):
+          protocol = "rsync"
+        # --- Memcached (stats response or error) ---
+        elif text.startswith("STAT ") or text.startswith("ERROR") or text.startswith("CLIENT_ERROR"):
+          protocol = "memcached"
+        # --- Elasticsearch / HTTP JSON (common on non-standard ports) ---
+        elif text.lstrip().startswith("{") and '"cluster_name"' in text:
+          protocol = "http"  # Elasticsearch over HTTP
 
       # --- 3. Well-known port lookup ---
+      # This is a fallback guess — the port number suggests a protocol, but
+      # the service may be something else entirely (e.g., Redis on port 993).
+      # Track whether protocol was confirmed by banner or only guessed by port.
+      banner_confirmed = protocol is not None
       if protocol is None:
         protocol = _WELL_KNOWN_PORTS.get(port)
 
       # --- 4. Generic nudge probe ---
       # Some services (honeypots, RPC, custom daemons) don't speak first
       # but will respond to any input.  Send a minimal \r\n nudge.
-      if protocol is None:
+      # Also runs when protocol was guessed by well-known port (not banner-confirmed)
+      # to verify or correct the guess.
+      if protocol is None or not banner_confirmed:
         try:
           nudge_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           nudge_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
@@ -645,10 +664,13 @@ class PentestLocalWorker(
               ch if 32 <= ord(ch) < 127 else '.'
               for ch in nudge_text[:FINGERPRINT_MAX_BANNER]
             )
-          if nudge_text.startswith("HTTP/"):
-            protocol = "http"
-          elif "<html" in nudge_text.lower() or "<HTML" in nudge_text:
-            protocol = "http"
+          if nudge_text.startswith("HTTP/") or "<html" in nudge_text.lower() or "<HTML" in nudge_text:
+            # If port was guessed as HTTPS, a plain-text HTTP error (400/497)
+            # confirms it's a TLS port — keep "https" instead of downgrading.
+            if protocol == "https":
+              banner_confirmed = True
+            else:
+              protocol = "http"
           elif nudge_text.startswith("SSH-"):
             protocol = "ssh"
           elif nudge_text.startswith("+OK"):
@@ -662,7 +684,7 @@ class PentestLocalWorker(
             protocol = "telnet"
 
       # --- 5. Active HTTP probe ---
-      if protocol is None:
+      if protocol is None or not banner_confirmed:
         try:
           http_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           http_sock.settimeout(FINGERPRINT_HTTP_TIMEOUT)
@@ -675,10 +697,12 @@ class PentestLocalWorker(
           http_sock.close()
           if http_resp:
             http_text = http_resp.decode("utf-8", errors="replace")
-            if http_text.startswith("HTTP/"):
-              protocol = "http"
-            elif "<html" in http_text.lower() or "<HTML" in http_text:
-              protocol = "http"
+            if http_text.startswith("HTTP/") or "<html" in http_text.lower() or "<HTML" in http_text:
+              # Preserve "https" when a TLS port responds to plain HTTP with an error.
+              if protocol == "https":
+                banner_confirmed = True
+              else:
+                protocol = "http"
             if not banner_text:
               banner_text = ''.join(
                 ch if 32 <= ord(ch) < 127 else '.'
@@ -688,9 +712,8 @@ class PentestLocalWorker(
           pass
 
       # --- 5b. Modbus probe ---
-      # If still unknown, try a Modbus device ID request.
-      # Only runs after all text-based identification fails.
-      if protocol is None:
+      # If still unknown or unconfirmed, try a Modbus device ID request.
+      if protocol is None or not banner_confirmed:
         try:
           mb_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           mb_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
@@ -707,6 +730,62 @@ class PentestLocalWorker(
               and mb_resp[2:4] == b'\x00\x00'
               and mb_resp[7:8] == b'\x2b'):
             protocol = "modbus"
+        except Exception:
+          pass
+
+      # --- 5c. DNS probe ---
+      # DNS doesn't send a banner; send a minimal A query for "version.bind"
+      # via TCP (2-byte length prefix + DNS query) to detect DNS services.
+      if protocol is None or not banner_confirmed:
+        try:
+          dns_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          dns_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
+          dns_sock.connect((target, port))
+          # DNS query: txid=0x1234, flags=0x0100 (RD), qdcount=1
+          # Query: version.bind, QTYPE=TXT(16), QCLASS=CH(3)
+          dns_query = (
+            b'\x12\x34'      # Transaction ID
+            b'\x01\x00'      # Flags: standard query, RD=1
+            b'\x00\x01'      # Questions: 1
+            b'\x00\x00'      # Answers: 0
+            b'\x00\x00'      # Authority: 0
+            b'\x00\x00'      # Additional: 0
+            b'\x07version\x04bind\x00'  # QNAME: version.bind
+            b'\x00\x10'      # QTYPE: TXT (16)
+            b'\x00\x03'      # QCLASS: CH (3)
+          )
+          # TCP DNS: 2-byte length prefix
+          dns_sock.sendall(struct.pack(">H", len(dns_query)) + dns_query)
+          try:
+            dns_resp = dns_sock.recv(512)
+          except (socket.timeout, OSError):
+            dns_resp = b""
+          dns_sock.close()
+          # Valid DNS response: starts with 2-byte length, then txid match, QR bit set
+          if len(dns_resp) >= 4:
+            # Skip TCP length prefix
+            dns_data = dns_resp[2:] if len(dns_resp) > 2 else dns_resp
+            if len(dns_data) >= 4 and dns_data[0:2] == b'\x12\x34' and (dns_data[2] & 0x80):
+              protocol = "dns"
+        except Exception:
+          pass
+
+      # --- 5d. Redis PING probe ---
+      # Redis doesn't send a banner on connect; send PING to detect it.
+      if protocol is None or not banner_confirmed:
+        try:
+          r_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          r_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
+          r_sock.connect((target, port))
+          r_sock.sendall(b"PING\r\n")
+          try:
+            r_resp = r_sock.recv(64)
+          except (socket.timeout, OSError):
+            r_resp = b""
+          r_sock.close()
+          r_text = r_resp.decode("utf-8", errors="ignore")
+          if r_text.startswith("+PONG") or r_text.startswith("-NOAUTH"):
+            protocol = "redis"
         except Exception:
           pass
 
