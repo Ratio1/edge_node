@@ -3121,9 +3121,29 @@ class ContainerAppRunnerPlugin(
     # Set state after reset
     self._set_container_state(ContainerState.RESTARTING, stop_reason or StopReason.UNKNOWN)
 
+    # Re-login to registry (reset_vars creates a new Docker client, losing the session)
+    self._login_to_registry()
+
     self._setup_resource_limits_and_ports()
     self._configure_volumes()
     self._configure_file_volumes()
+
+    # For semaphored containers (consumers), defer env setup and container start
+    # to _handle_initial_launch() which properly waits for provider semaphores.
+    # This is critical when all containers in a pipeline restart simultaneously
+    # (e.g., via RESTART command) — providers need time to publish shmem values.
+    if self._semaphore_get_keys():
+      # Reset semaphore wait state so _wait_for_semaphores logs fresh status
+      if hasattr(self, '_semaphore_wait_logged'):
+        del self._semaphore_wait_logged
+
+      self._validate_extra_tunnels_config()
+      self._validate_runner_config()
+      self.P("Consumer container with semaphore dependencies: deferring start until providers are ready")
+      return
+
+    # Non-semaphored containers (providers): configure env and start immediately
+    self._configure_dynamic_env()
     self._setup_env_and_ports()
 
     # Revalidate extra tunnels
