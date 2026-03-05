@@ -30,7 +30,9 @@ _CONFIG = {
 
   "CAR_VERBOSE": 10,
   "IMAGE": "node:22",
-  "CONTAINER_START_COMMAND": ["sh", "-c", "while true; do sleep 3600; done"],
+  "CONTAINER_ENTRYPOINT": "sh",
+  "CONTAINER_START_COMMAND": ["-c", "while true; do sleep 3600; done"],
+  "CONTAINER_USER": "root",
   "BUILD_AND_RUN_COMMANDS": ["npm install", "npm run build", "npm start"],
   "SETUP_REPO": True, # defines if we have to set up the repo (should add git clone commands or not)
 

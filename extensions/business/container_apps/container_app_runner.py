@@ -260,7 +260,9 @@ _CONFIG = {
 
   # Container-specific config options
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"
+  "CONTAINER_ENTRYPOINT": None,        # Optional entrypoint override for the container
   "CONTAINER_START_COMMAND": None,  # Optional command list executed when launching the container
+  "CONTAINER_USER": None,          # Optional user override for the container (e.g. "root", "0:0")
   "BUILD_AND_RUN_COMMANDS": [],     # Optional commands executed inside the running container
   "CR_DATA": {              # dict of container registry data
     "SERVER": 'docker.io',  # Optional container registry URL
@@ -1209,6 +1211,11 @@ class ContainerAppRunnerPlugin(
     ValueError
         If configuration is invalid
     """
+    self._entrypoint = self._normalize_container_command(
+      getattr(self, 'cfg_container_entrypoint', None),
+      field_name='CONTAINER_ENTRYPOINT',
+    )
+
     self._start_command = self._normalize_container_command(
       getattr(self, 'cfg_container_start_command', None),
       field_name='CONTAINER_START_COMMAND',
@@ -2060,7 +2067,9 @@ class ContainerAppRunnerPlugin(
     log_str += f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}\n"
     log_str += f"  Restart policy: {self.cfg_restart_policy}\n"
     log_str += f"  Pull policy: {self.cfg_image_pull_policy}\n"
+    log_str += f"  Entrypoint: {self._entrypoint if self._entrypoint else 'Image default'}\n"
     log_str += f"  Start command: {self._start_command if self._start_command else 'Image default'}\n"
+    log_str += f"  User: {self.cfg_container_user if self.cfg_container_user else 'Image default'}\n"
 
     self.P(log_str)
 
@@ -2098,11 +2107,17 @@ class ContainerAppRunnerPlugin(
     # endif
 
     try:
+      if self._entrypoint:
+        run_kwargs['entrypoint'] = self._entrypoint
+
       if self._start_command:
         run_kwargs['command'] = self._start_command
 
+      if self.cfg_container_user:
+        run_kwargs['user'] = self.cfg_container_user
+
       self.container = self.docker_client.containers.run(
-        self.cfg_image,
+        self._get_full_image_ref(),
         **run_kwargs,
       )
 
@@ -2300,10 +2315,15 @@ class ContainerAppRunnerPlugin(
         return
 
       self.P(f"Running container exec command: {shell_cmd}")
-      exec_result = self.container.exec_run(
-        ["sh", "-c", shell_cmd],
+      exec_kwargs = dict(
         stream=True,
         detach=False,
+      )
+      if self.cfg_container_user:
+        exec_kwargs['user'] = self.cfg_container_user
+      exec_result = self.container.exec_run(
+        ["sh", "-c", shell_cmd],
+        **exec_kwargs,
       )
       thread = threading.Thread(
         target=self._stream_logs,
@@ -2818,8 +2838,9 @@ class ContainerAppRunnerPlugin(
     if not self.cfg_image:
       return None
 
+    full_image = self._get_full_image_ref()
     try:
-      img = self.docker_client.images.get(self.cfg_image)
+      img = self.docker_client.images.get(full_image)
       return img
     except Exception:
       return None
@@ -2843,15 +2864,16 @@ class ContainerAppRunnerPlugin(
       self.P("No Docker image configured", color='r')
       return None
 
+    full_image = self._get_full_image_ref()
     try:
-      self.P(f"Pulling image '{self.cfg_image}'...")
-      img = self.docker_client.images.pull(self.cfg_image)
+      self.P(f"Pulling image '{full_image}'...")
+      img = self.docker_client.images.pull(full_image)
 
       # docker-py may return Image or list[Image]
       if isinstance(img, list) and img:
         img = img[-1]
 
-      self.P(f"Successfully pulled image '{self.cfg_image}'")
+      self.P(f"Successfully pulled image '{full_image}'")
       return img
 
     except Exception as e:
@@ -2879,13 +2901,15 @@ class ContainerAppRunnerPlugin(
     RuntimeError
         If authentication fails and no local image exists
     """
+    full_image = self._get_full_image_ref()
+
     # Step 1: Authenticate with registry
     if not self._login_to_registry():
       self.P("Registry authentication failed", color='r')
       # Try to use local image if authentication fails
       local_img = self._get_local_image()
       if local_img:
-        self.P(f"Using local image (registry login failed): {self.cfg_image}", color='r')
+        self.P(f"Using local image (registry login failed): {full_image}", color='r')
         return local_img
       raise RuntimeError("Failed to authenticate with registry and no local image available.")
 
@@ -2895,14 +2919,14 @@ class ContainerAppRunnerPlugin(
       return img
 
     # Step 3: Fallback to local image
-    self.P(f"Pull failed, checking for local image: {self.cfg_image}", color='r')
+    self.P(f"Pull failed, checking for local image: {full_image}", color='r')
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Using local image as fallback: {self.cfg_image}", color='r')
+      self.P(f"Using local image as fallback: {full_image}", color='r')
       return local_img
 
     # Step 4: No image available
-    self.P(f"No image available (pull failed and no local image): {self.cfg_image}", color='r')
+    self.P(f"No image available (pull failed and no local image): {full_image}", color='r')
     return None
 
 
@@ -3097,9 +3121,29 @@ class ContainerAppRunnerPlugin(
     # Set state after reset
     self._set_container_state(ContainerState.RESTARTING, stop_reason or StopReason.UNKNOWN)
 
+    # Re-login to registry (reset_vars creates a new Docker client, losing the session)
+    self._login_to_registry()
+
     self._setup_resource_limits_and_ports()
     self._configure_volumes()
     self._configure_file_volumes()
+
+    # For semaphored containers (consumers), defer env setup and container start
+    # to _handle_initial_launch() which properly waits for provider semaphores.
+    # This is critical when all containers in a pipeline restart simultaneously
+    # (e.g., via RESTART command) — providers need time to publish shmem values.
+    if self._semaphore_get_keys():
+      # Reset semaphore wait state so _wait_for_semaphores logs fresh status
+      if hasattr(self, '_semaphore_wait_logged'):
+        del self._semaphore_wait_logged
+
+      self._validate_extra_tunnels_config()
+      self._validate_runner_config()
+      self.P("Consumer container with semaphore dependencies: deferring start until providers are ready")
+      return
+
+    # Non-semaphored containers (providers): configure env and start immediately
+    self._configure_dynamic_env()
     self._setup_env_and_ports()
 
     # Revalidate extra tunnels
@@ -3152,14 +3196,15 @@ class ContainerAppRunnerPlugin(
     bool
         True if image is available (locally or after pull), False otherwise
     """
+    full_image = self._get_full_image_ref()
     # Check if image exists locally
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Image '{self.cfg_image}' found locally")
+      self.P(f"Image '{full_image}' found locally")
       return True
 
     # Image not found locally, pull it
-    self.P(f"Image not found locally, pulling '{self.cfg_image}'...")
+    self.P(f"Image not found locally, pulling '{full_image}'...")
     img = self._pull_image_with_fallback()
     return img is not None
 
