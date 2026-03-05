@@ -3797,28 +3797,20 @@ class _ServiceInfoMixin:
 
   def _service_info_postgresql(self, target, port):  # default port: 5432
     """
-    Probe PostgreSQL authentication method by parsing the auth response byte.
+    Probe PostgreSQL authentication method and extract server version.
+
+    Sends a v3 StartupMessage for user 'postgres'.  The server replies with
+    an authentication request (type 'R') optionally followed by ParameterStatus
+    messages (type 'S') that include ``server_version``.
 
     Auth codes:
       0  = AuthenticationOk (trust auth) → CRITICAL
       3  = CleartextPassword             → MEDIUM
       5  = MD5Password                   → INFO (adequate, prefer SCRAM)
       10 = SASL (SCRAM-SHA-256)          → INFO (strong)
-
-    Parameters
-    ----------
-    target : str
-      Hostname or IP address.
-    port : int
-      Port being probed.
-
-    Returns
-    -------
-    dict
-      Structured findings.
     """
     findings = []
-    raw = {"auth_type": None}
+    raw = {"auth_type": None, "version": None}
     try:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(3)
@@ -3826,10 +3818,48 @@ class _ServiceInfoMixin:
       payload = b'user\x00postgres\x00database\x00postgres\x00\x00'
       startup = struct.pack('!I', len(payload) + 8) + struct.pack('!I', 196608) + payload
       sock.sendall(startup)
-      data = sock.recv(128)
+      # Read enough to get auth response + parameter status messages
+      data = b""
+      try:
+        while len(data) < 4096:
+          chunk = sock.recv(4096)
+          if not chunk:
+            break
+          data += chunk
+          # Stop after we see auth request — parameters come after for trust auth
+          # but for password auth the server sends R then waits.
+          if len(data) >= 9 and data[0:1] == b'R':
+            auth_code = struct.unpack('!I', data[5:9])[0]
+            if auth_code != 0:
+              break  # Server wants a password — no more data coming
+      except (socket.timeout, OSError):
+        pass
       sock.close()
 
-      # Parse auth response: type byte 'R' (0x52), then int32 length, then int32 auth code
+      # --- Extract version from ParameterStatus ('S') messages ---
+      # Format: 'S' + int32 length + key\0 + value\0
+      pg_version = None
+      pos = 0
+      while pos < len(data) - 5:
+        msg_type = data[pos:pos+1]
+        if msg_type not in (b'R', b'S', b'K', b'Z', b'E', b'N'):
+          break
+        msg_len = struct.unpack('!I', data[pos+1:pos+5])[0]
+        msg_end = pos + 1 + msg_len
+        if msg_type == b'S' and msg_end <= len(data):
+          kv = data[pos+5:msg_end]
+          parts = kv.split(b'\x00')
+          if len(parts) >= 2:
+            key = parts[0].decode('utf-8', errors='ignore')
+            val = parts[1].decode('utf-8', errors='ignore')
+            if key == 'server_version':
+              pg_version = val
+              raw["version"] = pg_version
+        pos = msg_end
+        if pos >= len(data):
+          break
+
+      # --- Parse auth response ---
       if len(data) >= 9 and data[0:1] == b'R':
         auth_code = struct.unpack('!I', data[5:9])[0]
         raw["auth_type"] = auth_code
@@ -3873,7 +3903,6 @@ class _ServiceInfoMixin:
             confidence="certain",
           ))
       elif b'AuthenticationCleartextPassword' in data:
-        # Fallback: text-based detection for older/non-standard servers
         raw["auth_type"] = "cleartext_text"
         findings.append(Finding(
           severity=Severity.MEDIUM,
@@ -3897,6 +3926,23 @@ class _ServiceInfoMixin:
           cwe_id="CWE-287",
           confidence="firm",
         ))
+
+      # --- Version disclosure ---
+      if pg_version:
+        findings.append(Finding(
+          severity=Severity.LOW,
+          title=f"PostgreSQL version disclosed: {pg_version}",
+          description=f"PostgreSQL on {target}:{port} reports version {pg_version}.",
+          evidence=f"server_version parameter: {pg_version}",
+          remediation="Restrict network access to the PostgreSQL port.",
+          cwe_id="CWE-200",
+          confidence="certain",
+        ))
+        # Extract numeric version for CVE matching
+        ver_match = _re.match(r'(\d+\.\d+(?:\.\d+)?)', pg_version)
+        if ver_match:
+          for f in check_cves("postgresql", ver_match.group(1)):
+            findings.append(f)
 
       if not findings:
         findings.append(Finding(Severity.INFO, "PostgreSQL probe completed", "No auth weakness detected."))
@@ -4246,43 +4292,19 @@ class _ServiceInfoMixin:
 
   def _service_info_mongodb(self, target, port):  # default port: 27017
     """
-    Attempt MongoDB isMaster handshake to detect unauthenticated access.
-
-    Parameters
-    ----------
-    target : str
-      Hostname or IP address.
-    port : int
-      Port being probed.
-
-    Returns
-    -------
-    dict
-      Structured findings.
+    Attempt MongoDB isMaster + buildInfo to detect unauthenticated access
+    and extract the server version for CVE matching.
     """
     findings = []
-    raw = {"banner": None}
+    raw = {"banner": None, "version": None}
     try:
-      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(3)
-      sock.connect((target, port))
-      doc = bytearray(b"\x00\x00\x00\x00\x10isMaster\x00")
-      doc.extend(struct.pack('<i', 1))
-      doc.append(0x00)
-      struct.pack_into('<i', doc, 0, len(doc) + 4)
-      header_len = 16
-      collection = b'admin.$cmd\x00'
-      flags = struct.pack('<i', 0)
-      number_to_skip = struct.pack('<i', 0)
-      number_to_return = struct.pack('<i', -1)
-      message = (
-        flags + collection + number_to_skip + number_to_return + doc
-      )
-      total_length = header_len + len(message)
-      header = struct.pack('<iiii', total_length, 1, 0, 2004)
-      sock.sendall(header + message)
-      data = sock.recv(256)
-      if b'isMaster' in data or b'ismaster' in data:
+      # --- Pass 1: isMaster ---
+      is_master = False
+      data = self._mongodb_query(target, port, b'isMaster')
+      if data and (b'ismaster' in data or b'isMaster' in data):
+        is_master = True
+
+      if is_master:
         raw["banner"] = "MongoDB isMaster response"
         findings.append(Finding(
           severity=Severity.CRITICAL,
@@ -4295,10 +4317,72 @@ class _ServiceInfoMixin:
           cwe_id="CWE-287",
           confidence="certain",
         ))
-      sock.close()
+
+        # --- Pass 2: buildInfo (for version) ---
+        build_data = self._mongodb_query(target, port, b'buildInfo')
+        mongo_version = self._mongodb_extract_bson_string(build_data, b'version')
+        if mongo_version:
+          raw["version"] = mongo_version
+          findings.append(Finding(
+            severity=Severity.LOW,
+            title=f"MongoDB version disclosed: {mongo_version}",
+            description=f"MongoDB on {target}:{port} reports version {mongo_version}.",
+            evidence=f"buildInfo version: {mongo_version}",
+            remediation="Restrict network access to the MongoDB port.",
+            cwe_id="CWE-200",
+            confidence="certain",
+          ))
+          ver_match = _re.match(r'(\d+\.\d+(?:\.\d+)?)', mongo_version)
+          if ver_match:
+            for f in check_cves("mongodb", ver_match.group(1)):
+              findings.append(f)
+
     except Exception as e:
       return probe_error(target, port, "MongoDB", e)
     return probe_result(raw_data=raw, findings=findings)
+
+  @staticmethod
+  def _mongodb_query(target, port, command_name):
+    """Send a MongoDB OP_QUERY command and return the raw response bytes."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(3)
+    sock.connect((target, port))
+    # Build BSON: {<command_name>: 1}
+    field = b'\x10' + command_name + b'\x00' + struct.pack('<i', 1)
+    doc_body = field + b'\x00'
+    doc = struct.pack('<i', 4 + len(doc_body)) + doc_body
+    collection = b'admin.$cmd\x00'
+    msg = (struct.pack('<i', 0) + collection
+           + struct.pack('<i', 0) + struct.pack('<i', -1) + doc)
+    header = struct.pack('<iiii', 16 + len(msg), 1, 0, 2004)
+    sock.sendall(header + msg)
+    try:
+      data = sock.recv(4096)
+    except (socket.timeout, OSError):
+      data = b""
+    sock.close()
+    return data
+
+  @staticmethod
+  def _mongodb_extract_bson_string(data, field_name):
+    """Extract a UTF-8 string field from a MongoDB BSON response.
+
+    Looks for BSON type 0x02 (UTF-8 string) with the given field name.
+    Returns the string value or None.
+    """
+    if not data:
+      return None
+    marker = b'\x02' + field_name + b'\x00'
+    idx = data.find(marker)
+    if idx < 0:
+      return None
+    str_start = idx + len(marker)
+    if str_start + 4 > len(data):
+      return None
+    str_len = struct.unpack('<i', data[str_start:str_start+4])[0]
+    if str_len <= 0 or str_start + 4 + str_len > len(data):
+      return None
+    return data[str_start+4:str_start+4+str_len-1].decode('utf-8', errors='ignore')
 
 
 

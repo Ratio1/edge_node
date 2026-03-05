@@ -789,6 +789,59 @@ class PentestLocalWorker(
         except Exception:
           pass
 
+      # --- 5e. PostgreSQL SSLRequest probe ---
+      # PostgreSQL waits for a client startup message; it never sends a banner.
+      # The SSLRequest message (8 bytes) elicits a single-byte 'S' or 'N' response.
+      if protocol is None or not banner_confirmed:
+        try:
+          pg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          pg_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
+          pg_sock.connect((target, port))
+          # SSLRequest: length=8, code=80877103
+          pg_sock.sendall(b'\x00\x00\x00\x08\x04\xd2\x16\x2f')
+          try:
+            pg_resp = pg_sock.recv(1)
+          except (socket.timeout, OSError):
+            pg_resp = b""
+          pg_sock.close()
+          if pg_resp in (b'S', b'N'):
+            protocol = "postgresql"
+            banner_confirmed = True
+        except Exception:
+          pass
+
+      # --- 5f. MongoDB wire protocol probe ---
+      # MongoDB uses a binary wire protocol with no banner on connect.
+      # Send a minimal OP_QUERY for isMaster on admin.$cmd; a valid BSON
+      # reply (opcode 1 in header bytes 12-15) confirms it is MongoDB.
+      if protocol is None or not banner_confirmed:
+        try:
+          mg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+          mg_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
+          mg_sock.connect((target, port))
+          # Build BSON document: {isMaster: 1}
+          _mg_field = b'\x10isMaster\x00' + struct.pack('<i', 1)
+          _mg_body = _mg_field + b'\x00'
+          _mg_doc = struct.pack('<i', 4 + len(_mg_body)) + _mg_body
+          collection = b'admin.$cmd\x00'
+          _mg_msg = (struct.pack('<i', 0) + collection
+                     + struct.pack('<i', 0) + struct.pack('<i', -1)
+                     + _mg_doc)
+          _mg_hdr = struct.pack('<iiii', 16 + len(_mg_msg), 1, 0, 2004)
+          mg_sock.sendall(_mg_hdr + _mg_msg)
+          try:
+            mg_resp = mg_sock.recv(256)
+          except (socket.timeout, OSError):
+            mg_resp = b""
+          mg_sock.close()
+          # Valid MongoDB reply: at least 16 bytes, opcode OP_REPLY=1
+          if (len(mg_resp) >= 16
+              and struct.unpack('<i', mg_resp[12:16])[0] == 1):
+            protocol = "mongodb"
+            banner_confirmed = True
+        except Exception:
+          pass
+
       # --- 6. Default ---
       if protocol is None:
         protocol = "unknown"
