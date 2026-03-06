@@ -4,16 +4,10 @@ import struct
 import threading
 import socket
 import json
-import ftplib
-import requests
 import traceback
 import time
 
 from .service_mixin import _ServiceInfoMixin
-from .web_discovery_mixin import _WebDiscoveryMixin
-from .web_hardening_mixin import _WebHardeningMixin
-from .web_api_mixin import _WebApiExposureMixin
-from .web_injection_mixin import _WebInjectionMixin
 from .correlation_mixin import _CorrelationMixin
 from .constants import (
   PROBE_PROTOCOL_MAP, WEB_PROTOCOLS,
@@ -21,7 +15,7 @@ from .constants import (
   FINGERPRINT_TIMEOUT, FINGERPRINT_MAX_BANNER, FINGERPRINT_HTTP_TIMEOUT,
   FINGERPRINT_NUDGE_TIMEOUT, SCAN_PORT_TIMEOUT,
 )
-
+from .web_mixin import _WebTestsMixin
 
 COMMON_PORTS = [
   21, 22, 23, 25, 53, 80, 110, 143, 161, 443, 445,
@@ -35,10 +29,7 @@ ALL_PORTS = [port for port in range(1, 65536)]
 
 class PentestLocalWorker(
   _ServiceInfoMixin,
-  _WebDiscoveryMixin,
-  _WebHardeningMixin,
-  _WebApiExposureMixin,
-  _WebInjectionMixin,
+  _WebTestsMixin,
   _CorrelationMixin,
 ):
   """
