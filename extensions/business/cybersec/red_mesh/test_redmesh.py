@@ -1178,6 +1178,9 @@ class RedMeshOWASPTests(unittest.TestCase):
     """Port 1024 with Modbus response should be fingerprinted as modbus."""
     owner, worker = self._build_worker(ports=[1024])
     worker.state["open_ports"] = [1024]
+    worker.state["port_protocols"] = {1024: "unknown"}
+    worker.state["port_banners"] = {1024: ""}
+    worker.state["port_banner_confirmed"] = {1024: False}
     worker.target = "10.0.0.1"
 
     # Build a valid Modbus Read Device ID response:
@@ -1190,25 +1193,27 @@ class RedMeshOWASPTests(unittest.TestCase):
     def fake_socket_factory(*args, **kwargs):
       mock_sock = MagicMock()
       mock_sock.recv.return_value = b""
-      # First call: passive banner grab → empty (no banner)
-      # Second call: nudge probe → empty
-      # Third call: HTTP probe → empty
-      # Fourth call: modbus probe → valid response
+      # First call: nudge probe → empty
+      # Second call: HTTP probe → empty
+      # Third call: modbus probe → valid response
       idx = call_index[0]
       call_index[0] += 1
-      if idx == 3:
+      if idx == 2:
         mock_sock.recv.return_value = modbus_response
       return mock_sock
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
-      worker._fingerprint_ports()
+      worker._active_fingerprint_ports()
 
     self.assertEqual(worker.state["port_protocols"][1024], "modbus")
 
   def test_fingerprint_non_modbus_stays_unknown(self):
-    """Port with no recognizable response should remain unknown."""
+    """Port with no recognizable response should remain unknown after active probes."""
     owner, worker = self._build_worker(ports=[1024])
     worker.state["open_ports"] = [1024]
+    worker.state["port_protocols"] = {1024: "unknown"}
+    worker.state["port_banners"] = {1024: ""}
+    worker.state["port_banner_confirmed"] = {1024: False}
     worker.target = "10.0.0.1"
 
     def fake_socket_factory(*args, **kwargs):
@@ -1217,14 +1222,13 @@ class RedMeshOWASPTests(unittest.TestCase):
       return mock_sock
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
-      worker._fingerprint_ports()
+      worker._active_fingerprint_ports()
 
     self.assertEqual(worker.state["port_protocols"][1024], "unknown")
 
   def test_fingerprint_mysql_false_positive_binary_data(self):
     """Binary data that happens to have 0x00 at byte 3 and 0x0a at byte 4 must NOT be classified as mysql."""
     owner, worker = self._build_worker(ports=[37364])
-    worker.state["open_ports"] = [37364]
     worker.target = "10.0.0.1"
 
     # Crafted binary blob: byte 3 = 0x00, byte 4 = 0x0a, but byte 5+ is not
@@ -1233,18 +1237,18 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     def fake_socket_factory(*args, **kwargs):
       mock_sock = MagicMock()
+      mock_sock.connect_ex.return_value = 0
       mock_sock.recv.return_value = fake_binary
       return mock_sock
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
-      worker._fingerprint_ports()
+      worker._scan_ports_step()
 
     self.assertNotEqual(worker.state["port_protocols"][37364], "mysql")
 
   def test_fingerprint_mysql_real_greeting(self):
     """A genuine MySQL greeting packet should still be fingerprinted as mysql."""
     owner, worker = self._build_worker(ports=[3306])
-    worker.state["open_ports"] = [3306]
     worker.target = "10.0.0.1"
 
     # Real MySQL handshake: 3-byte length + seq=0x00 + protocol=0x0a + "8.0.28\x00" + filler
@@ -1255,18 +1259,18 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     def fake_socket_factory(*args, **kwargs):
       mock_sock = MagicMock()
+      mock_sock.connect_ex.return_value = 0
       mock_sock.recv.return_value = mysql_greeting
       return mock_sock
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
-      worker._fingerprint_ports()
+      worker._scan_ports_step()
 
     self.assertEqual(worker.state["port_protocols"][3306], "mysql")
 
   def test_fingerprint_telnet_real_iac(self):
     """Banner starting with a valid IAC WILL sequence should be fingerprinted as telnet."""
     owner, worker = self._build_worker(ports=[2323])
-    worker.state["open_ports"] = [2323]
     worker.target = "10.0.0.1"
 
     # IAC WILL ECHO (0xFF 0xFB 0x01) — valid telnet negotiation per RFC 854
@@ -1274,18 +1278,18 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     def fake_socket_factory(*args, **kwargs):
       mock_sock = MagicMock()
+      mock_sock.connect_ex.return_value = 0
       mock_sock.recv.return_value = telnet_banner
       return mock_sock
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
-      worker._fingerprint_ports()
+      worker._scan_ports_step()
 
     self.assertEqual(worker.state["port_protocols"][2323], "telnet")
 
   def test_fingerprint_telnet_false_positive_0xff(self):
     """Binary data starting with 0xFF but no valid IAC command must NOT be classified as telnet."""
     owner, worker = self._build_worker(ports=[8502])
-    worker.state["open_ports"] = [8502]
     worker.target = "10.0.0.1"
 
     # 0xFF followed by 0x01 — not a valid IAC command byte (WILL=0xFB, WONT=0xFC, DO=0xFD, DONT=0xFE)
@@ -1293,29 +1297,30 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     def fake_socket_factory(*args, **kwargs):
       mock_sock = MagicMock()
+      mock_sock.connect_ex.return_value = 0
       mock_sock.recv.return_value = fake_binary
       return mock_sock
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
-      worker._fingerprint_ports()
+      worker._scan_ports_step()
 
     self.assertNotEqual(worker.state["port_protocols"][8502], "telnet")
 
   def test_fingerprint_telnet_login_prompt(self):
     """A text banner containing 'login:' should still be fingerprinted as telnet."""
     owner, worker = self._build_worker(ports=[2323])
-    worker.state["open_ports"] = [2323]
     worker.target = "10.0.0.1"
 
     login_banner = b'Ubuntu 22.04 LTS\r\nlogin: '
 
     def fake_socket_factory(*args, **kwargs):
       mock_sock = MagicMock()
+      mock_sock.connect_ex.return_value = 0
       mock_sock.recv.return_value = login_banner
       return mock_sock
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
-      worker._fingerprint_ports()
+      worker._scan_ports_step()
 
     self.assertEqual(worker.state["port_protocols"][2323], "telnet")
 
@@ -1323,6 +1328,9 @@ class RedMeshOWASPTests(unittest.TestCase):
     """Response with protocol ID 0x0000 but wrong function code must NOT be classified as modbus."""
     owner, worker = self._build_worker(ports=[1024])
     worker.state["open_ports"] = [1024]
+    worker.state["port_protocols"] = {1024: "unknown"}
+    worker.state["port_banners"] = {1024: ""}
+    worker.state["port_banner_confirmed"] = {1024: False}
     worker.target = "10.0.0.1"
 
     # Protocol ID 0x0000 at bytes 2-3, but function code at byte 7 is 0x01 (not 0x2B)
@@ -1335,19 +1343,18 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = b""
       idx = call_index[0]
       call_index[0] += 1
-      if idx == 3:  # modbus probe is the 4th socket
+      if idx == 2:  # modbus probe is the 3rd socket (nudge, HTTP, modbus)
         mock_sock.recv.return_value = bad_modbus
       return mock_sock
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
-      worker._fingerprint_ports()
+      worker._active_fingerprint_ports()
 
     self.assertNotEqual(worker.state["port_protocols"][1024], "modbus")
 
   def test_fingerprint_mysql_bad_payload_length(self):
     """MySQL-like bytes but absurd payload length prefix must NOT be classified as mysql."""
     owner, worker = self._build_worker(ports=[9999])
-    worker.state["open_ports"] = [9999]
     worker.target = "10.0.0.1"
 
     # Payload length = 0x000001 (1 byte) — too small for a real MySQL handshake
@@ -1356,11 +1363,12 @@ class RedMeshOWASPTests(unittest.TestCase):
 
     def fake_socket_factory(*args, **kwargs):
       mock_sock = MagicMock()
+      mock_sock.connect_ex.return_value = 0
       mock_sock.recv.return_value = fake_pkt
       return mock_sock
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
-      worker._fingerprint_ports()
+      worker._scan_ports_step()
 
     self.assertNotEqual(worker.state["port_protocols"][9999], "mysql")
 
@@ -1835,7 +1843,7 @@ class TestCorrelationEngine(unittest.TestCase):
     _, worker = self._build_worker()
 
     with patch.object(worker, "_scan_ports_step"), \
-         patch.object(worker, "_fingerprint_ports"), \
+         patch.object(worker, "_active_fingerprint_ports"), \
          patch.object(worker, "_gather_service_info"), \
          patch.object(worker, "_run_web_tests"), \
          patch.object(worker, "_post_scan_correlate"):

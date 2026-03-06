@@ -9,8 +9,6 @@ import requests
 import traceback
 import time
 
-from copy import deepcopy
-
 from .service_mixin import _ServiceInfoMixin
 from .web_discovery_mixin import _WebDiscoveryMixin
 from .web_hardening_mixin import _WebHardeningMixin
@@ -21,7 +19,7 @@ from .constants import (
   PROBE_PROTOCOL_MAP, WEB_PROTOCOLS,
   WELL_KNOWN_PORTS as _WELL_KNOWN_PORTS,
   FINGERPRINT_TIMEOUT, FINGERPRINT_MAX_BANNER, FINGERPRINT_HTTP_TIMEOUT,
-  FINGERPRINT_NUDGE_TIMEOUT,
+  FINGERPRINT_NUDGE_TIMEOUT, SCAN_PORT_TIMEOUT,
 )
 
 
@@ -181,6 +179,7 @@ class PentestLocalWorker(
       
       "port_protocols": {},
       "port_banners": {},
+      "port_banner_confirmed": {},
 
       "completed_tests": [],
       "done": False,
@@ -416,14 +415,14 @@ class PentestLocalWorker(
         self._scan_ports_step()
 
       if not self._check_stopped():
-        self._fingerprint_ports()
+        self._active_fingerprint_ports()
         self.state["completed_tests"].append("fingerprint_completed")
 
       if not self._check_stopped():
         self._gather_service_info()
         self.state["completed_tests"].append("service_info_completed")
 
-      if not self._check_stopped():
+      if not self._check_stopped() and not self._ics_detected:
         self._run_web_tests()
         self.state["completed_tests"].append("web_tests_completed")
 
@@ -448,7 +447,13 @@ class PentestLocalWorker(
 
   def _scan_ports_step(self, batch_size=None, batch_nr=1):
     """
-    Scan a batch of ports from the remaining list to identify open ports.
+    Scan a batch of ports to identify open ones and perform passive banner
+    grabbing on each open port in the same TCP connection.
+
+    For every open port the method reuses the established socket to attempt a
+    passive ``recv``, classifies the banner, and stores protocol, banner, and
+    confirmation flag immediately in worker state.  This eliminates the second
+    TCP connection that was previously required by ``_fingerprint_ports``.
 
     Parameters
     ----------
@@ -468,78 +473,132 @@ class PentestLocalWorker(
       return
 
     target = self.target
-    ports = deepcopy(self.state["ports_to_scan"])
-    if not ports:
-      return
-    if batch_size is None:
-      ports_batch = ports
-    else:
+    ports_batch = self.state["ports_to_scan"]
+    if batch_size is not None:
       start_batch = (batch_nr - 1) * batch_size
-      ports_batch = ports[start_batch:start_batch + batch_size]
+      ports_batch = ports_batch[start_batch:start_batch + batch_size]
+    if not ports_batch:
+      return
     nr_ports = len(ports_batch)
     self.P(f"Scanning {nr_ports} ports in batch {batch_nr}.")
-    show_progress = False
-    if len(ports_batch) > 1000:
-      # Avoid noisy progress logs on tiny batches.
-      show_progress = True
+    show_progress = nr_ports > 1000
+
     for i, port in enumerate(ports_batch):
       if self.stop_event.is_set():
-        return
+        break
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-      sock.settimeout(0.3)
+      sock.settimeout(SCAN_PORT_TIMEOUT)
       try:
         result = sock.connect_ex((target, port))
         if result == 0:
           self.state["open_ports"].append(port)
           self.P(f"Port {port} is open on {target}.")
+
+          # --- Passive banner grab (merged from _fingerprint_ports) ---
+          protocol = None
+          banner_text = ""
+          try:
+            sock.settimeout(FINGERPRINT_TIMEOUT)
+            raw = sock.recv(FINGERPRINT_MAX_BANNER)
+          except (socket.timeout, OSError):
+            raw = b""
+
+          if raw:
+            banner_text = ''.join(
+              ch if 32 <= ord(ch) < 127 else '.'
+              for ch in raw[:FINGERPRINT_MAX_BANNER].decode("utf-8", errors="replace")
+            )
+
+          # --- Classify banner by content ---
+          if raw:
+            text = raw.decode("utf-8", errors="replace")
+            text_upper = text.upper()
+
+            if text.startswith("SSH-"):
+              protocol = "ssh"
+            elif text.startswith("220"):
+              if "FTP" in text_upper:
+                protocol = "ftp"
+              elif "SMTP" in text_upper or "ESMTP" in text_upper:
+                protocol = "smtp"
+              else:
+                protocol = _WELL_KNOWN_PORTS.get(port, "ftp")
+            elif text.startswith("RFB "):
+              protocol = "vnc"
+            elif len(raw) >= 7 and raw[3:4] == b'\x00' and raw[4:5] == b'\x0a':
+              _pkt_len = int.from_bytes(raw[0:3], 'little')
+              if 10 <= _pkt_len <= 512:
+                _ver_end = raw.find(b'\x00', 5)
+                if _ver_end > 5 and all(32 <= b < 127 for b in raw[5:_ver_end]):
+                  protocol = "mysql"
+            elif "login:" in text.lower():
+              protocol = "telnet"
+            elif len(raw) >= 3 and raw[0:1] == b'\xff' and raw[1:2] in (b'\xfb', b'\xfc', b'\xfd', b'\xfe'):
+              protocol = "telnet"
+            elif text.startswith("HTTP/"):
+              protocol = "http"
+            elif text.startswith("+OK"):
+              protocol = "pop3"
+            elif text.startswith("* OK"):
+              protocol = "imap"
+            elif text.startswith("+PONG") or text.startswith("-ERR") or text.startswith("-NOAUTH") or text.startswith("$"):
+              protocol = "redis"
+            elif text.startswith("@RSYNCD:"):
+              protocol = "rsync"
+            elif text.startswith("STAT ") or text.startswith("ERROR") or text.startswith("CLIENT_ERROR"):
+              protocol = "memcached"
+            elif text.lstrip().startswith("{") and '"cluster_name"' in text:
+              protocol = "http"
+
+          # --- Well-known port fallback ---
+          banner_confirmed = protocol is not None
+          if protocol is None:
+            protocol = _WELL_KNOWN_PORTS.get(port, "unknown")
+
+          # --- Store results immediately ---
+          self.state["port_protocols"][port] = protocol
+          self.state["port_banners"][port] = banner_text
+          self.state["port_banner_confirmed"][port] = banner_confirmed
       except Exception as e:
         self.P(f"Exception scanning port {port} on {target}: {e}")
       finally:
         sock.close()
-      # endtry
+
       self.state["ports_scanned"].append(port)
-      self.state["ports_to_scan"].remove(port)
 
       if ((i + 1) % REGISTER_PROGRESS_EACH) == 0:
         scan_ports_step_progress = (i + 1) / nr_ports * 100
         str_progress = f"{scan_ports_step_progress:.0f}%"
-        # now we assume that port scan is first step so we modify 1st stage continously 
-        # and we do not append
         self.state["completed_tests"] = [f"scan_ports_step_{str_progress}"]
         if show_progress:
           self.P(f"Port scanning progress on {target}: {str_progress}")
 
       # Dune sand walking - random delay after each port scan
       if self._interruptible_sleep():
-        # TODO: LOGGING "returning early from loop 5/300 iteration"
-        return  # Stop was requested during sleep
+        break
     #end for each port
 
-    left_ports = self.state["ports_to_scan"]
-    if not left_ports:
+    self.state["ports_to_scan"] = []
+    if not self.stop_event.is_set():
       self.P(f"[{target}] Port scanning completed. {len(self.state['open_ports'])} open ports.")
+      self.state["completed_tests"].append("scan_ports_step_completed")
     else:
-      self.P(f"[{target}] Port scanning not completed. Remaining ports: {left_ports}.")
-    self.state["completed_tests"].append("scan_ports_step_completed")
+      self.P(f"[{target}] Port scanning not completed (stopped).")
     return
 
 
-  def _fingerprint_ports(self):
+  def _active_fingerprint_ports(self):
     """
-    Classify each open port by protocol using passive banner grabbing.
+    Run active protocol probes on open ports not identified by passive
+    banner grabbing during the port scan step.
 
-    For each open port the method attempts, in order:
+    Active probes include: generic nudge, HTTP HEAD, Modbus device ID,
+    DNS query, Redis PING, PostgreSQL SSLRequest, and MongoDB isMaster.
 
-    1. **Passive banner grab** — connect and recv without sending data.
-    2. **Banner-based classification** — pattern-match known protocol greetings.
-    3. **Well-known port lookup** — fall back to ``WELL_KNOWN_PORTS``.
-    4. **Generic nudge probe** — send ``\\r\\n`` to elicit a response from
-       services that wait for client input (honeypots, RPC, custom daemons).
-    5. **Active HTTP probe** — minimal ``HEAD /`` request for silent HTTP servers.
-    6. **Default** — mark the port as ``"unknown"``.
-
-    Results are stored in ``state["port_protocols"]`` and
-    ``state["port_banners"]``.
+    Results are written incrementally to ``state["port_protocols"]`` and
+    ``state["port_banners"]`` after each port.  If a Modbus device is
+    confirmed while ICS safe mode is enabled, ``_ics_detected`` is set
+    and an ICS finding is recorded.
 
     Returns
     -------
@@ -551,137 +610,65 @@ class PentestLocalWorker(
       return
 
     target = self.target
-    port_protocols = {}
-    port_banners = {}
+    port_banner_confirmed = self.state.get("port_banner_confirmed", {})
 
-    self.P(f"Fingerprinting {len(open_ports)} open ports.")
+    # Only run active probes on ports not already confirmed by banner
+    ports_to_probe = [p for p in open_ports if not port_banner_confirmed.get(p, False)]
 
-    for port in open_ports:
+    if not ports_to_probe:
+      self.P("All open ports already identified by banner. Skipping active fingerprinting.")
+      return
+
+    self.P(f"Active fingerprinting {len(ports_to_probe)} ports (of {len(open_ports)} open).")
+
+    for port in ports_to_probe:
       if self.stop_event.is_set():
         return
 
-      protocol = None
-      banner_text = ""
-
-      # --- 1. Passive banner grab ---
-      try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(FINGERPRINT_TIMEOUT)
-        sock.connect((target, port))
-        try:
-          raw = sock.recv(FINGERPRINT_MAX_BANNER)
-        except (socket.timeout, OSError):
-          raw = b""
-        sock.close()
-      except Exception:
-        raw = b""
-
-      # --- Sanitize banner ---
-      if raw:
-        banner_text = ''.join(
-          ch if 32 <= ord(ch) < 127 else '.' for ch in raw[:FINGERPRINT_MAX_BANNER].decode("utf-8", errors="replace")
-        )
-
-      # --- 2. Classify banner by content ---
-      if raw:
-        text = raw.decode("utf-8", errors="replace")
-        text_upper = text.upper()
-
-        if text.startswith("SSH-"):
-          protocol = "ssh"
-        elif text.startswith("220"):
-          if "FTP" in text_upper:
-            protocol = "ftp"
-          elif "SMTP" in text_upper or "ESMTP" in text_upper:
-            protocol = "smtp"
-          else:
-            protocol = _WELL_KNOWN_PORTS.get(port, "ftp")
-        elif text.startswith("RFB "):
-          protocol = "vnc"
-        elif len(raw) >= 7 and raw[3:4] == b'\x00' and raw[4:5] == b'\x0a':
-          # MySQL greeting: 3-byte payload len + seq=0x00 + protocol version 0x0a + version string
-          # Validate payload length (bytes 0-2 LE) is sane and version string is printable ASCII.
-          _pkt_len = int.from_bytes(raw[0:3], 'little')
-          if 10 <= _pkt_len <= 512:
-            _ver_end = raw.find(b'\x00', 5)
-            if _ver_end > 5 and all(32 <= b < 127 for b in raw[5:_ver_end]):
-              protocol = "mysql"
-        elif "login:" in text.lower():
-          protocol = "telnet"
-        elif len(raw) >= 3 and raw[0:1] == b'\xff' and raw[1:2] in (b'\xfb', b'\xfc', b'\xfd', b'\xfe'):
-          # Telnet IAC negotiation: 0xFF (IAC) + WILL/WONT/DO/DONT + option byte (RFC 854)
-          protocol = "telnet"
-        elif text.startswith("HTTP/"):
-          protocol = "http"
-        elif text.startswith("+OK"):
-          protocol = "pop3"
-        elif text.startswith("* OK"):
-          protocol = "imap"
-        # --- Redis: responds with +PONG, -ERR, -NOAUTH, or $ (bulk string) ---
-        elif text.startswith("+PONG") or text.startswith("-ERR") or text.startswith("-NOAUTH") or text.startswith("$"):
-          protocol = "redis"
-        # --- Rsync daemon ---
-        elif text.startswith("@RSYNCD:"):
-          protocol = "rsync"
-        # --- Memcached (stats response or error) ---
-        elif text.startswith("STAT ") or text.startswith("ERROR") or text.startswith("CLIENT_ERROR"):
-          protocol = "memcached"
-        # --- Elasticsearch / HTTP JSON (common on non-standard ports) ---
-        elif text.lstrip().startswith("{") and '"cluster_name"' in text:
-          protocol = "http"  # Elasticsearch over HTTP
-
-      # --- 3. Well-known port lookup ---
-      # This is a fallback guess — the port number suggests a protocol, but
-      # the service may be something else entirely (e.g., Redis on port 993).
-      # Track whether protocol was confirmed by banner or only guessed by port.
-      banner_confirmed = protocol is not None
-      if protocol is None:
-        protocol = _WELL_KNOWN_PORTS.get(port)
+      protocol = self.state["port_protocols"].get(port)
+      banner_text = self.state["port_banners"].get(port, "")
+      banner_confirmed = False
 
       # --- 4. Generic nudge probe ---
       # Some services (honeypots, RPC, custom daemons) don't speak first
       # but will respond to any input.  Send a minimal \r\n nudge.
-      # Also runs when protocol was guessed by well-known port (not banner-confirmed)
-      # to verify or correct the guess.
-      if protocol is None or not banner_confirmed:
+      try:
+        nudge_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        nudge_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
+        nudge_sock.connect((target, port))
+        nudge_sock.sendall(b"\r\n")
         try:
-          nudge_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-          nudge_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
-          nudge_sock.connect((target, port))
-          nudge_sock.sendall(b"\r\n")
-          try:
-            nudge_resp = nudge_sock.recv(FINGERPRINT_MAX_BANNER)
-          except (socket.timeout, OSError):
-            nudge_resp = b""
-          nudge_sock.close()
-        except Exception:
+          nudge_resp = nudge_sock.recv(FINGERPRINT_MAX_BANNER)
+        except (socket.timeout, OSError):
           nudge_resp = b""
+        nudge_sock.close()
+      except Exception:
+        nudge_resp = b""
 
-        if nudge_resp:
-          nudge_text = nudge_resp.decode("utf-8", errors="replace")
-          if not banner_text:
-            banner_text = ''.join(
-              ch if 32 <= ord(ch) < 127 else '.'
-              for ch in nudge_text[:FINGERPRINT_MAX_BANNER]
-            )
-          if nudge_text.startswith("HTTP/") or "<html" in nudge_text.lower() or "<HTML" in nudge_text:
-            # If port was guessed as HTTPS, a plain-text HTTP error (400/497)
-            # confirms it's a TLS port — keep "https" instead of downgrading.
-            if protocol == "https":
-              banner_confirmed = True
-            else:
-              protocol = "http"
-          elif nudge_text.startswith("SSH-"):
-            protocol = "ssh"
-          elif nudge_text.startswith("+OK"):
-            protocol = "pop3"
-          elif nudge_text.startswith("* OK"):
-            protocol = "imap"
-          elif "login:" in nudge_text.lower():
-            protocol = "telnet"
-          elif len(nudge_resp) >= 3 and nudge_resp[0:1] == b'\xff' and nudge_resp[1:2] in (b'\xfb', b'\xfc', b'\xfd', b'\xfe'):
-            # Telnet IAC negotiation: 0xFF (IAC) + WILL/WONT/DO/DONT + option byte (RFC 854)
-            protocol = "telnet"
+      if nudge_resp:
+        nudge_text = nudge_resp.decode("utf-8", errors="replace")
+        if not banner_text:
+          banner_text = ''.join(
+            ch if 32 <= ord(ch) < 127 else '.'
+            for ch in nudge_text[:FINGERPRINT_MAX_BANNER]
+          )
+        if nudge_text.startswith("HTTP/") or "<html" in nudge_text.lower() or "<HTML" in nudge_text:
+          # If port was guessed as HTTPS, a plain-text HTTP error (400/497)
+          # confirms it's a TLS port — keep "https" instead of downgrading.
+          if protocol == "https":
+            banner_confirmed = True
+          else:
+            protocol = "http"
+        elif nudge_text.startswith("SSH-"):
+          protocol = "ssh"
+        elif nudge_text.startswith("+OK"):
+          protocol = "pop3"
+        elif nudge_text.startswith("* OK"):
+          protocol = "imap"
+        elif "login:" in nudge_text.lower():
+          protocol = "telnet"
+        elif len(nudge_resp) >= 3 and nudge_resp[0:1] == b'\xff' and nudge_resp[1:2] in (b'\xfb', b'\xfc', b'\xfd', b'\xfe'):
+          protocol = "telnet"
 
       # --- 5. Active HTTP probe ---
       if protocol is None or not banner_confirmed:
@@ -711,59 +698,66 @@ class PentestLocalWorker(
         except Exception:
           pass
 
-      # --- 5b. Modbus probe ---
-      # If still unknown or unconfirmed, try a Modbus device ID request.
-      if protocol is None or not banner_confirmed:
+      # --- 5b. Modbus probe (guarded by ICS safe mode) ---
+      if (protocol is None or not banner_confirmed) and not self._ics_detected:
         try:
           mb_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           mb_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
           mb_sock.connect((target, port))
-          # Modbus Read Device Identification: MBAP header + function code 0x2B
           mb_sock.sendall(b'\x00\x01\x00\x00\x00\x05\x01\x2b\x0e\x01\x00')
           try:
             mb_resp = mb_sock.recv(256)
           except (socket.timeout, OSError):
             mb_resp = b""
           mb_sock.close()
-          # Valid Modbus response: protocol ID 0x0000 + echoed function code 0x2B
           if (mb_resp and len(mb_resp) >= 8
               and mb_resp[2:4] == b'\x00\x00'
               and mb_resp[7:8] == b'\x2b'):
             protocol = "modbus"
+            if self.ics_safe_mode:
+              self._ics_detected = True
+              self.P(f"ICS device detected on {target}:{port} via Modbus probe — halting aggressive probes (ICS Safe Mode)")
+              from .findings import Finding, Severity, probe_result as _pr
+              ics_halt = _pr(findings=[Finding(
+                severity=Severity.HIGH,
+                title="ICS device detected — scan halted (ICS Safe Mode)",
+                description=f"Industrial control system indicators found on {target}:{port}. "
+                            "Further probing halted to prevent potential disruption.",
+                evidence=f"Modbus device identification confirmed on port {port}",
+                remediation="Isolate ICS devices on dedicated OT networks.",
+                cwe_id="CWE-284",
+                confidence="firm",
+              )])
+              if port not in self.state["service_info"]:
+                self.state["service_info"][port] = {}
+              self.state["service_info"][port]["_ics_safe_halt"] = ics_halt
         except Exception:
           pass
 
       # --- 5c. DNS probe ---
-      # DNS doesn't send a banner; send a minimal A query for "version.bind"
-      # via TCP (2-byte length prefix + DNS query) to detect DNS services.
       if protocol is None or not banner_confirmed:
         try:
           dns_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           dns_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
           dns_sock.connect((target, port))
-          # DNS query: txid=0x1234, flags=0x0100 (RD), qdcount=1
-          # Query: version.bind, QTYPE=TXT(16), QCLASS=CH(3)
           dns_query = (
-            b'\x12\x34'      # Transaction ID
-            b'\x01\x00'      # Flags: standard query, RD=1
-            b'\x00\x01'      # Questions: 1
-            b'\x00\x00'      # Answers: 0
-            b'\x00\x00'      # Authority: 0
-            b'\x00\x00'      # Additional: 0
-            b'\x07version\x04bind\x00'  # QNAME: version.bind
-            b'\x00\x10'      # QTYPE: TXT (16)
-            b'\x00\x03'      # QCLASS: CH (3)
+            b'\x12\x34'
+            b'\x01\x00'
+            b'\x00\x01'
+            b'\x00\x00'
+            b'\x00\x00'
+            b'\x00\x00'
+            b'\x07version\x04bind\x00'
+            b'\x00\x10'
+            b'\x00\x03'
           )
-          # TCP DNS: 2-byte length prefix
           dns_sock.sendall(struct.pack(">H", len(dns_query)) + dns_query)
           try:
             dns_resp = dns_sock.recv(512)
           except (socket.timeout, OSError):
             dns_resp = b""
           dns_sock.close()
-          # Valid DNS response: starts with 2-byte length, then txid match, QR bit set
           if len(dns_resp) >= 4:
-            # Skip TCP length prefix
             dns_data = dns_resp[2:] if len(dns_resp) > 2 else dns_resp
             if len(dns_data) >= 4 and dns_data[0:2] == b'\x12\x34' and (dns_data[2] & 0x80):
               protocol = "dns"
@@ -771,7 +765,6 @@ class PentestLocalWorker(
           pass
 
       # --- 5d. Redis PING probe ---
-      # Redis doesn't send a banner on connect; send PING to detect it.
       if protocol is None or not banner_confirmed:
         try:
           r_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -790,16 +783,11 @@ class PentestLocalWorker(
           pass
 
       # --- 5e. PostgreSQL SSLRequest probe ---
-      # PostgreSQL waits for a client startup message; it never sends a banner.
-      # The SSLRequest message (8 bytes) elicits a single-byte 'S' or 'N' response.
-      # Guard: SSH banners start with 'S' (from "SSH-..."), so read extra bytes
-      # to disambiguate — a real PostgreSQL response is exactly 1 byte.
       if protocol is None or not banner_confirmed:
         try:
           pg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           pg_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
           pg_sock.connect((target, port))
-          # SSLRequest: length=8, code=80877103
           pg_sock.sendall(b'\x00\x00\x00\x08\x04\xd2\x16\x2f')
           try:
             pg_resp = pg_sock.recv(16)
@@ -810,23 +798,17 @@ class PentestLocalWorker(
             protocol = "postgresql"
             banner_confirmed = True
           elif len(pg_resp) > 1 and pg_resp[0:1] in (b'S', b'N') and not pg_resp.startswith(b'SSH-'):
-            # Multi-byte response starting with S/N but not SSH — still PostgreSQL
-            # (e.g. server sent S then immediately started TLS handshake bytes)
             protocol = "postgresql"
             banner_confirmed = True
         except Exception:
           pass
 
       # --- 5f. MongoDB wire protocol probe ---
-      # MongoDB uses a binary wire protocol with no banner on connect.
-      # Send a minimal OP_QUERY for isMaster on admin.$cmd; a valid BSON
-      # reply (opcode 1 in header bytes 12-15) confirms it is MongoDB.
       if protocol is None or not banner_confirmed:
         try:
           mg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           mg_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
           mg_sock.connect((target, port))
-          # Build BSON document: {isMaster: 1}
           _mg_field = b'\x10isMaster\x00' + struct.pack('<i', 1)
           _mg_body = _mg_field + b'\x00'
           _mg_doc = struct.pack('<i', 4 + len(_mg_body)) + _mg_body
@@ -841,7 +823,6 @@ class PentestLocalWorker(
           except (socket.timeout, OSError):
             mg_resp = b""
           mg_sock.close()
-          # Valid MongoDB reply: at least 16 bytes, opcode OP_REPLY=1
           if (len(mg_resp) >= 16
               and struct.unpack('<i', mg_resp[12:16])[0] == 1):
             protocol = "mongodb"
@@ -853,17 +834,16 @@ class PentestLocalWorker(
       if protocol is None:
         protocol = "unknown"
 
-      port_protocols[port] = protocol
-      port_banners[port] = banner_text
+      # --- Incremental state update ---
+      self.state["port_protocols"][port] = protocol
+      self.state["port_banners"][port] = banner_text
       self.P(f"Port {port} fingerprinted as '{protocol}'.")
 
       # Dune sand walking - random delay between fingerprint probes
       if self._interruptible_sleep():
         return  # Stop was requested during sleep
 
-    self.state["port_protocols"] = port_protocols
-    self.state["port_banners"] = port_banners
-    self.P(f"Fingerprinting complete: {port_protocols}")
+    self.P(f"Active fingerprinting complete: {self.state['port_protocols']}")
 
 
   def _is_ics_finding(self, probe_result):
@@ -1007,11 +987,11 @@ class PentestLocalWorker(
         if self.stop_event.is_set():
           return
         iter_result = func(target, port)
-        if iter_result:
+        if iter_result is not None:
           result.append(f"{method}:{port} {iter_result}")
-        if port not in self.state["web_tests_info"]:
-          self.state["web_tests_info"][port] = {}
-        self.state["web_tests_info"][port][method] = iter_result
+          if port not in self.state["web_tests_info"]:
+            self.state["web_tests_info"][port] = {}
+          self.state["web_tests_info"][port][method] = iter_result
 
         # Dune sand walking - random delay before each web test
         if self._interruptible_sleep():

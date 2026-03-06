@@ -121,6 +121,7 @@ LLM_ANALYSIS_QUICK_SUMMARY = "quick_summary"
 # =====================================================================
 
 # Fingerprint configuration
+SCAN_PORT_TIMEOUT = 0.3        # seconds — connect timeout during port scanning
 FINGERPRINT_TIMEOUT = 2        # seconds — passive banner grab timeout
 FINGERPRINT_MAX_BANNER = 512   # bytes — max banner stored per port
 FINGERPRINT_HTTP_TIMEOUT = 4   # seconds — active HTTP probe timeout (honeypots may be slow)
