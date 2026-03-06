@@ -75,7 +75,6 @@ class PentestLocalWorker(
     scan_min_delay: float = 0.0,
     scan_max_delay: float = 0.0,
     ics_safe_mode: bool = True,
-    rate_limit_enabled: bool = True,
     scanner_identity: str = "probe.redmesh.local",
     scanner_user_agent: str = "",
   ):
@@ -108,8 +107,6 @@ class PentestLocalWorker(
       Maximum random delay (seconds) between operations (Dune sand walking).
     ics_safe_mode : bool, optional
       Halt probing when ICS/SCADA indicators are detected.
-    rate_limit_enabled : bool, optional
-      Enforce minimum 100ms delay between probes when sand walking is disabled.
     scanner_identity : str, optional
       EHLO domain for SMTP probes.
     scanner_user_agent : str, optional
@@ -140,7 +137,6 @@ class PentestLocalWorker(
     self.scan_max_delay = scan_max_delay
     self.ics_safe_mode = ics_safe_mode
     self._ics_detected = False
-    self.rate_limit_enabled = rate_limit_enabled
     self.scanner_identity = scanner_identity
     self.scanner_user_agent = scanner_user_agent
 
@@ -388,10 +384,7 @@ class PentestLocalWorker(
       True if stop was requested (should exit), False otherwise.
     """
     if self.scan_max_delay <= 0:
-      if self.rate_limit_enabled:
-        time.sleep(0.1)  # Minimum 100ms between probes
-        return self.stop_event.is_set()
-      return False  # Delays disabled, no rate limit
+      return self.stop_event.is_set()
     delay = random.uniform(self.scan_min_delay, self.scan_max_delay)
     time.sleep(delay)
     # TODO: while elapsed < delay with sleep(0.1) could be used for more granular interruptible sleep
