@@ -632,6 +632,7 @@ class PentestLocalWorker(
       # --- 4. Generic nudge probe ---
       # Some services (honeypots, RPC, custom daemons) don't speak first
       # but will respond to any input.  Send a minimal \r\n nudge.
+      nudge_sock = None
       try:
         nudge_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         nudge_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
@@ -641,9 +642,11 @@ class PentestLocalWorker(
           nudge_resp = nudge_sock.recv(FINGERPRINT_MAX_BANNER)
         except (socket.timeout, OSError):
           nudge_resp = b""
-        nudge_sock.close()
       except Exception:
         nudge_resp = b""
+      finally:
+        if nudge_sock:
+          nudge_sock.close()
 
       if nudge_resp:
         nudge_text = nudge_resp.decode("utf-8", errors="replace")
@@ -659,19 +662,26 @@ class PentestLocalWorker(
             banner_confirmed = True
           else:
             protocol = "http"
+            banner_confirmed = True
         elif nudge_text.startswith("SSH-"):
           protocol = "ssh"
+          banner_confirmed = True
         elif nudge_text.startswith("+OK"):
           protocol = "pop3"
+          banner_confirmed = True
         elif nudge_text.startswith("* OK"):
           protocol = "imap"
+          banner_confirmed = True
         elif "login:" in nudge_text.lower():
           protocol = "telnet"
+          banner_confirmed = True
         elif len(nudge_resp) >= 3 and nudge_resp[0:1] == b'\xff' and nudge_resp[1:2] in (b'\xfb', b'\xfc', b'\xfd', b'\xfe'):
           protocol = "telnet"
+          banner_confirmed = True
 
       # --- 5. Active HTTP probe ---
       if protocol is None or not banner_confirmed:
+        http_sock = None
         try:
           http_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           http_sock.settimeout(FINGERPRINT_HTTP_TIMEOUT)
@@ -681,7 +691,6 @@ class PentestLocalWorker(
             http_resp = http_sock.recv(FINGERPRINT_MAX_BANNER)
           except (socket.timeout, OSError):
             http_resp = b""
-          http_sock.close()
           if http_resp:
             http_text = http_resp.decode("utf-8", errors="replace")
             if http_text.startswith("HTTP/") or "<html" in http_text.lower() or "<HTML" in http_text:
@@ -690,6 +699,7 @@ class PentestLocalWorker(
                 banner_confirmed = True
               else:
                 protocol = "http"
+                banner_confirmed = True
             if not banner_text:
               banner_text = ''.join(
                 ch if 32 <= ord(ch) < 127 else '.'
@@ -697,9 +707,13 @@ class PentestLocalWorker(
               )
         except Exception:
           pass
+        finally:
+          if http_sock:
+            http_sock.close()
 
       # --- 5b. Modbus probe (guarded by ICS safe mode) ---
       if (protocol is None or not banner_confirmed) and not self._ics_detected:
+        mb_sock = None
         try:
           mb_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           mb_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
@@ -709,11 +723,11 @@ class PentestLocalWorker(
             mb_resp = mb_sock.recv(256)
           except (socket.timeout, OSError):
             mb_resp = b""
-          mb_sock.close()
           if (mb_resp and len(mb_resp) >= 8
               and mb_resp[2:4] == b'\x00\x00'
               and mb_resp[7:8] == b'\x2b'):
             protocol = "modbus"
+            banner_confirmed = True
             if self.ics_safe_mode:
               self._ics_detected = True
               self.P(f"ICS device detected on {target}:{port} via Modbus probe — halting aggressive probes (ICS Safe Mode)")
@@ -733,9 +747,13 @@ class PentestLocalWorker(
               self.state["service_info"][port]["_ics_safe_halt"] = ics_halt
         except Exception:
           pass
+        finally:
+          if mb_sock:
+            mb_sock.close()
 
       # --- 5c. DNS probe ---
       if protocol is None or not banner_confirmed:
+        dns_sock = None
         try:
           dns_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           dns_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
@@ -756,16 +774,20 @@ class PentestLocalWorker(
             dns_resp = dns_sock.recv(512)
           except (socket.timeout, OSError):
             dns_resp = b""
-          dns_sock.close()
           if len(dns_resp) >= 4:
             dns_data = dns_resp[2:] if len(dns_resp) > 2 else dns_resp
             if len(dns_data) >= 4 and dns_data[0:2] == b'\x12\x34' and (dns_data[2] & 0x80):
               protocol = "dns"
+              banner_confirmed = True
         except Exception:
           pass
+        finally:
+          if dns_sock:
+            dns_sock.close()
 
       # --- 5d. Redis PING probe ---
       if protocol is None or not banner_confirmed:
+        r_sock = None
         try:
           r_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           r_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
@@ -775,15 +797,19 @@ class PentestLocalWorker(
             r_resp = r_sock.recv(64)
           except (socket.timeout, OSError):
             r_resp = b""
-          r_sock.close()
           r_text = r_resp.decode("utf-8", errors="ignore")
           if r_text.startswith("+PONG") or r_text.startswith("-NOAUTH"):
             protocol = "redis"
+            banner_confirmed = True
         except Exception:
           pass
+        finally:
+          if r_sock:
+            r_sock.close()
 
       # --- 5e. PostgreSQL SSLRequest probe ---
       if protocol is None or not banner_confirmed:
+        pg_sock = None
         try:
           pg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           pg_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
@@ -793,7 +819,6 @@ class PentestLocalWorker(
             pg_resp = pg_sock.recv(16)
           except (socket.timeout, OSError):
             pg_resp = b""
-          pg_sock.close()
           if pg_resp in (b'S', b'N'):
             protocol = "postgresql"
             banner_confirmed = True
@@ -802,9 +827,13 @@ class PentestLocalWorker(
             banner_confirmed = True
         except Exception:
           pass
+        finally:
+          if pg_sock:
+            pg_sock.close()
 
       # --- 5f. MongoDB wire protocol probe ---
       if protocol is None or not banner_confirmed:
+        mg_sock = None
         try:
           mg_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
           mg_sock.settimeout(FINGERPRINT_NUDGE_TIMEOUT)
@@ -822,13 +851,15 @@ class PentestLocalWorker(
             mg_resp = mg_sock.recv(256)
           except (socket.timeout, OSError):
             mg_resp = b""
-          mg_sock.close()
           if (len(mg_resp) >= 16
               and struct.unpack('<i', mg_resp[12:16])[0] == 1):
             protocol = "mongodb"
             banner_confirmed = True
         except Exception:
           pass
+        finally:
+          if mg_sock:
+            mg_sock.close()
 
       # --- 6. Default ---
       if protocol is None:
@@ -895,6 +926,9 @@ class PentestLocalWorker(
     port_protocols = self.state.get("port_protocols", {})
     aggregated_info = []
     for method in service_info_methods:
+      # ICS Safe Mode: skip all remaining probes if ICS already detected
+      if self._ics_detected:
+        break
       func = getattr(self, method)
       target_protocols = PROBE_PROTOCOL_MAP.get(method)  # None → run unconditionally
       method_info = []
@@ -943,10 +977,6 @@ class PentestLocalWorker(
           f"Method {method} findings:\n{json.dumps(method_info, indent=2)}"
         )
       self.state["completed_tests"].append(method)
-
-      # ICS Safe Mode: break outer loop if ICS was detected
-      if self._ics_detected:
-        break
     # end for each method
     return aggregated_info
 
