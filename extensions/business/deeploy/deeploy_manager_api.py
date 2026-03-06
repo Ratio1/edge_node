@@ -184,7 +184,8 @@ class DeeployManagerApiPlugin(
       sender, inputs = self.deeploy_verify_and_get_inputs(request)
       auth_result = self.deeploy_get_auth_result(inputs)
       
-      apps = self._get_online_apps(
+      apps = self._get_apps_by_escrow_active_jobs(
+        sender_escrow=auth_result[DEEPLOY_KEYS.SENDER_ESCROW],
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         project_id=inputs.get(DEEPLOY_KEYS.PROJECT_ID, None)
       )
