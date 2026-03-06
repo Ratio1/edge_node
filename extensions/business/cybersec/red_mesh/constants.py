@@ -40,9 +40,7 @@ FEATURE_CATALOG = [
       "_service_info_elasticsearch",
       "_service_info_memcached",
       "_service_info_mongodb",
-      "_service_info_modbus",
-      "_service_info_couchdb",
-      "_service_info_influxdb"
+      "_service_info_modbus"
     ]
   },
   {
@@ -50,14 +48,14 @@ FEATURE_CATALOG = [
     "label": "Discovery",
     "description": "Enumerate exposed files, admin panels, homepage secrets, tech fingerprinting, and VPN endpoints (OWASP WSTG-INFO).",
     "category": "web",
-    "methods": ["_web_test_common", "_web_test_homepage", "_web_test_tech_fingerprint", "_web_test_vpn_endpoints", "_web_test_cms_fingerprint", "_web_test_verbose_errors", "_web_test_java_servers"]
+    "methods": ["_web_test_common", "_web_test_homepage", "_web_test_tech_fingerprint", "_web_test_vpn_endpoints"]
   },
   {
     "id": "web_hardening",
     "label": "Hardening audit",
-    "description": "Audit cookie flags, security headers, CORS policy, CSRF tokens, and HTTP methods (OWASP WSTG-CONF).",
+    "description": "Audit cookie flags, security headers, CORS policy, redirect handling, and HTTP methods (OWASP WSTG-CONF).",
     "category": "web",
-    "methods": ["_web_test_flags", "_web_test_security_headers", "_web_test_cors_misconfiguration", "_web_test_http_methods", "_web_test_csrf"]
+    "methods": ["_web_test_flags", "_web_test_security_headers", "_web_test_cors_misconfiguration", "_web_test_open_redirect", "_web_test_http_methods"]
   },
   {
     "id": "web_api_exposure",
@@ -69,30 +67,16 @@ FEATURE_CATALOG = [
   {
     "id": "web_injection",
     "label": "Injection probes",
-    "description": "Non-destructive probes for path traversal, reflected XSS, SQL injection, SSRF, and open redirect (OWASP WSTG-INPV).",
+    "description": "Non-destructive probes for path traversal, reflected XSS, and SQL injection (OWASP WSTG-INPV).",
     "category": "web",
-    "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection", "_web_test_ssti", "_web_test_shellshock", "_web_test_php_cgi", "_web_test_ognl_injection", "_web_test_java_deserialization", "_web_test_spring_actuator", "_web_test_open_redirect", "_web_test_ssrf_basic"]
-  },
-  {
-    "id": "web_auth_design",
-    "label": "Authentication & design flaws",
-    "description": "Detect account enumeration, missing rate limiting, and IDOR indicators (OWASP A04).",
-    "category": "web",
-    "methods": ["_web_test_account_enumeration", "_web_test_rate_limiting", "_web_test_idor_indicators"]
-  },
-  {
-    "id": "web_integrity",
-    "label": "Software integrity",
-    "description": "Check subresource integrity, mixed content, and client-side library versions (OWASP A08).",
-    "category": "web",
-    "methods": ["_web_test_subresource_integrity", "_web_test_mixed_content", "_web_test_js_library_versions"]
+    "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection"]
   },
   {
     "id": "active_auth",
     "label": "Credential testing",
     "description": "Test default/weak credentials on database and remote access services. May trigger account lockout.",
     "category": "service",
-    "methods": ["_service_info_mysql_creds", "_service_info_postgresql_creds", "_service_info_http_basic_auth"]
+    "methods": ["_service_info_mysql_creds", "_service_info_postgresql_creds"]
   },
   {
     "id": "post_scan_correlation",
@@ -105,9 +89,6 @@ FEATURE_CATALOG = [
 
 # Job status constants
 JOB_STATUS_RUNNING = "RUNNING"
-JOB_STATUS_COLLECTING = "COLLECTING"        # Launcher merging worker reports
-JOB_STATUS_ANALYZING = "ANALYZING"          # Running LLM analysis
-JOB_STATUS_FINALIZING = "FINALIZING"        # Computing risk, writing archive
 JOB_STATUS_SCHEDULED_FOR_STOP = "SCHEDULED_FOR_STOP"
 JOB_STATUS_STOPPED = "STOPPED"
 JOB_STATUS_FINALIZED = "FINALIZED"
@@ -188,25 +169,9 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_modbus":     frozenset({"modbus"}),
     "_service_info_wins":    frozenset({"wins", "nbns"}),
     "_service_info_rsync":   frozenset({"rsync"}),
-    "_service_info_couchdb":    frozenset({"http", "https"}),
-    "_service_info_influxdb":   frozenset({"http", "https"}),
     "_service_info_generic": frozenset({"unknown"}),
     "_service_info_mysql_creds": frozenset({"mysql"}),
     "_service_info_postgresql_creds": frozenset({"postgresql"}),
-    "_service_info_http_basic_auth": frozenset({"http", "https"}),
-    # OWASP full coverage probes
-    "_web_test_ssrf_basic":            frozenset({"http", "https"}),
-    "_web_test_account_enumeration":   frozenset({"http", "https"}),
-    "_web_test_rate_limiting":         frozenset({"http", "https"}),
-    "_web_test_idor_indicators":       frozenset({"http", "https"}),
-    "_web_test_subresource_integrity": frozenset({"http", "https"}),
-    "_web_test_mixed_content":         frozenset({"http", "https"}),
-    "_web_test_js_library_versions":   frozenset({"http", "https"}),
-    "_web_test_verbose_errors":        frozenset({"http", "https"}),
-    "_web_test_java_servers":          frozenset({"http", "https"}),
-    "_web_test_ognl_injection":        frozenset({"http", "https"}),
-    "_web_test_java_deserialization":  frozenset({"http", "https"}),
-    "_web_test_spring_actuator":       frozenset({"http", "https"}),
 }
 
 # =====================================================================
@@ -218,18 +183,6 @@ LOCAL_WORKERS_MAX = 16
 LOCAL_WORKERS_DEFAULT = 2
 
 # =====================================================================
-# Port lists
-# =====================================================================
-
-COMMON_PORTS = [
-  21, 22, 23, 25, 53, 80, 110, 143, 161, 443, 445,
-  502, 1433, 1521, 27017, 3306, 3389, 5432, 5900,
-  8080, 8443, 9200, 11211
-]
-
-ALL_PORTS = list(range(1, 65536))
-
-# =====================================================================
 # Risk score computation
 # =====================================================================
 
@@ -238,25 +191,3 @@ RISK_CONFIDENCE_MULTIPLIERS = {"certain": 1.0, "firm": 0.8, "tentative": 0.5}
 RISK_SIGMOID_K = 0.02
 RISK_CRED_PENALTY_PER = 15
 RISK_CRED_PENALTY_CAP = 30
-
-# =====================================================================
-# Job archive
-# =====================================================================
-
-JOB_ARCHIVE_VERSION = 1
-MAX_CONTINUOUS_PASSES = 100
-
-# =====================================================================
-# Live progress publishing
-# =====================================================================
-
-PROGRESS_PUBLISH_INTERVAL = 10  # seconds between progress updates to CStore
-
-# Scan phases in execution order (5 phases total)
-PHASE_ORDER = ["port_scan", "fingerprint", "service_probes", "web_tests", "correlation"]
-PHASE_MARKERS = {
-  "fingerprint": "fingerprint_completed",
-  "service_probes": "service_info_completed",
-  "web_tests": "web_tests_completed",
-  "correlation": "correlation_completed",
-}
