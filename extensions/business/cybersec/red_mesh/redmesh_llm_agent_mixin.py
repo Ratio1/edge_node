@@ -12,6 +12,8 @@ Usage:
 import requests
 from typing import Optional
 
+from .constants import RUN_MODE_SINGLEPASS
+
 
 class _RedMeshLlmAgentMixin(object):
   """
@@ -272,7 +274,7 @@ class _RedMeshLlmAgentMixin(object):
       "start_port": job_config.get("start_port"),
       "end_port": job_config.get("end_port"),
       "enabled_features": job_config.get("enabled_features", []),
-      "run_mode": job_config.get("run_mode", "SINGLEPASS"),
+      "run_mode": job_config.get("run_mode", RUN_MODE_SINGLEPASS),
     }
 
     # Call LLM analysis
@@ -331,7 +333,7 @@ class _RedMeshLlmAgentMixin(object):
       "start_port": job_config.get("start_port"),
       "end_port": job_config.get("end_port"),
       "enabled_features": job_config.get("enabled_features", []),
-      "run_mode": job_config.get("run_mode", "SINGLEPASS"),
+      "run_mode": job_config.get("run_mode", RUN_MODE_SINGLEPASS),
     }
 
     # Call LLM analysis with quick_summary type
