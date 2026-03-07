@@ -2336,6 +2336,238 @@ class TestScannerEnhancements(unittest.TestCase):
     self.assertEqual(result.get("title"), "Directory listing for /")
 
 
+class TestPhase1ConfigCID(unittest.TestCase):
+  """Phase 1: Job Config CID — extract static config from CStore to R1FS."""
+
+  def test_config_cid_roundtrip(self):
+    """JobConfig.from_dict(config.to_dict()) preserves all fields."""
+    from extensions.business.cybersec.red_mesh.models import JobConfig
+
+    original = JobConfig(
+      target="example.com",
+      start_port=1,
+      end_port=1024,
+      exceptions=[22, 80],
+      distribution_strategy="SLICE",
+      port_order="SHUFFLE",
+      nr_local_workers=4,
+      enabled_features=["http_headers", "sql_injection"],
+      excluded_features=["brute_force"],
+      run_mode="SINGLEPASS",
+      scan_min_delay=0.1,
+      scan_max_delay=0.5,
+      ics_safe_mode=True,
+      redact_credentials=False,
+      scanner_identity="test-scanner",
+      scanner_user_agent="RedMesh/1.0",
+      task_name="Test Scan",
+      task_description="A test scan",
+      monitor_interval=300,
+      selected_peers=["peer1", "peer2"],
+      created_by_name="tester",
+      created_by_id="user-123",
+      authorized=True,
+    )
+    d = original.to_dict()
+    restored = JobConfig.from_dict(d)
+    self.assertEqual(original, restored)
+
+  def test_config_to_dict_has_required_fields(self):
+    """to_dict() includes target, start_port, end_port, run_mode."""
+    from extensions.business.cybersec.red_mesh.models import JobConfig
+
+    config = JobConfig(
+      target="10.0.0.1",
+      start_port=1,
+      end_port=65535,
+      exceptions=[],
+      distribution_strategy="SLICE",
+      port_order="SEQUENTIAL",
+      nr_local_workers=2,
+      enabled_features=[],
+      excluded_features=[],
+      run_mode="CONTINUOUS_MONITORING",
+    )
+    d = config.to_dict()
+    self.assertEqual(d["target"], "10.0.0.1")
+    self.assertEqual(d["start_port"], 1)
+    self.assertEqual(d["end_port"], 65535)
+    self.assertEqual(d["run_mode"], "CONTINUOUS_MONITORING")
+
+  def test_config_strip_none(self):
+    """_strip_none removes None values from serialized config."""
+    from extensions.business.cybersec.red_mesh.models import JobConfig
+
+    config = JobConfig(
+      target="example.com",
+      start_port=1,
+      end_port=100,
+      exceptions=[],
+      distribution_strategy="SLICE",
+      port_order="SEQUENTIAL",
+      nr_local_workers=2,
+      enabled_features=[],
+      excluded_features=[],
+      run_mode="SINGLEPASS",
+      selected_peers=None,
+    )
+    d = config.to_dict()
+    self.assertNotIn("selected_peers", d)
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    """Install mock modules so pentester_api_01 can be imported without naeural_core."""
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return  # Already imported successfully
+
+    # Build a real class to avoid metaclass conflicts
+    def endpoint_decorator(*args, **kwargs):
+      if args and callable(args[0]):
+        return args[0]
+      def wrapper(fn):
+        return fn
+      return wrapper
+
+    class FakeBasePlugin:
+      CONFIG = {'VALIDATION_RULES': {}}
+      endpoint = staticmethod(endpoint_decorator)
+
+    mock_module = MagicMock()
+    mock_module.FastApiWebAppPlugin = FakeBasePlugin
+
+    modules_to_mock = {
+      'naeural_core': MagicMock(),
+      'naeural_core.business': MagicMock(),
+      'naeural_core.business.default': MagicMock(),
+      'naeural_core.business.default.web_app': MagicMock(),
+      'naeural_core.business.default.web_app.fast_api_web_app': mock_module,
+    }
+    for mod_name, mod in modules_to_mock.items():
+      sys.modules.setdefault(mod_name, mod)
+
+  @classmethod
+  def _build_mock_plugin(cls, job_id="test-job", time_val=1000000.0, r1fs_cid="QmFakeConfigCID"):
+    """Build a mock plugin instance for launch_test testing."""
+    plugin = MagicMock()
+    plugin.ee_addr = "node-1"
+    plugin.ee_id = "node-alias-1"
+    plugin.cfg_instance_id = "test-instance"
+    plugin.cfg_port_order = "SEQUENTIAL"
+    plugin.cfg_excluded_features = []
+    plugin.cfg_distribution_strategy = "SLICE"
+    plugin.cfg_run_mode = "SINGLEPASS"
+    plugin.cfg_monitor_interval = 60
+    plugin.cfg_scanner_identity = ""
+    plugin.cfg_scanner_user_agent = ""
+    plugin.cfg_nr_local_workers = 2
+    plugin.cfg_llm_agent_api_enabled = False
+    plugin.cfg_ics_safe_mode = False
+    plugin.cfg_scan_min_rnd_delay = 0
+    plugin.cfg_scan_max_rnd_delay = 0
+    plugin.uuid.return_value = job_id
+    plugin.time.return_value = time_val
+    plugin.json_dumps.return_value = "{}"
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.add_json.return_value = r1fs_cid
+    plugin.chainstore_hset = MagicMock()
+    plugin.chainstore_hgetall.return_value = {}
+    plugin.chainstore_peers = ["node-1"]
+    plugin.cfg_chainstore_peers = ["node-1"]
+    return plugin
+
+  @classmethod
+  def _extract_job_specs(cls, plugin, job_id):
+    """Extract the job_specs dict from chainstore_hset calls."""
+    for call in plugin.chainstore_hset.call_args_list:
+      kwargs = call[1] if call[1] else {}
+      if kwargs.get("key") == job_id:
+        return kwargs["value"]
+    return None
+
+  def _launch(self, plugin, **kwargs):
+    """Call launch_test with mocked base modules."""
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    defaults = dict(target="example.com", start_port=1, end_port=1024, exceptions="", authorized=True)
+    defaults.update(kwargs)
+    return PentesterApi01Plugin.launch_test(plugin, **defaults)
+
+  def test_launch_builds_job_config_and_stores_cid(self):
+    """launch_test() builds JobConfig, saves to R1FS, stores job_config_cid in CStore."""
+    plugin = self._build_mock_plugin(job_id="test-job-1", r1fs_cid="QmFakeConfigCID123")
+    self._launch(plugin)
+
+    # Verify r1fs.add_json was called with a JobConfig dict
+    self.assertTrue(plugin.r1fs.add_json.called)
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["target"], "example.com")
+    self.assertEqual(config_dict["start_port"], 1)
+    self.assertEqual(config_dict["end_port"], 1024)
+    self.assertIn("run_mode", config_dict)
+
+    # Verify CStore has job_config_cid
+    job_specs = self._extract_job_specs(plugin, "test-job-1")
+    self.assertIsNotNone(job_specs, "Expected chainstore_hset call for job_specs")
+    self.assertEqual(job_specs["job_config_cid"], "QmFakeConfigCID123")
+
+  def test_cstore_has_no_static_config(self):
+    """After launch, CStore object has no exceptions, distribution_strategy, etc."""
+    plugin = self._build_mock_plugin(job_id="test-job-2")
+    self._launch(plugin)
+
+    job_specs = self._extract_job_specs(plugin, "test-job-2")
+    self.assertIsNotNone(job_specs)
+
+    # These static config fields must NOT be in CStore
+    removed_fields = [
+      "exceptions", "distribution_strategy", "enabled_features",
+      "excluded_features", "scan_min_delay", "scan_max_delay",
+      "ics_safe_mode", "redact_credentials", "scanner_identity",
+      "scanner_user_agent", "nr_local_workers", "task_description",
+      "monitor_interval", "selected_peers", "created_by_name",
+      "created_by_id", "authorized", "port_order",
+    ]
+    for field in removed_fields:
+      self.assertNotIn(field, job_specs, f"CStore should not contain '{field}'")
+
+  def test_cstore_has_listing_fields(self):
+    """CStore has target, task_name, start_port, end_port, date_created."""
+    plugin = self._build_mock_plugin(job_id="test-job-3", time_val=1700000000.0)
+    self._launch(plugin, start_port=80, end_port=443, task_name="Web Scan")
+
+    job_specs = self._extract_job_specs(plugin, "test-job-3")
+    self.assertIsNotNone(job_specs)
+
+    self.assertEqual(job_specs["target"], "example.com")
+    self.assertEqual(job_specs["task_name"], "Web Scan")
+    self.assertEqual(job_specs["start_port"], 80)
+    self.assertEqual(job_specs["end_port"], 443)
+    self.assertEqual(job_specs["date_created"], 1700000000.0)
+    self.assertEqual(job_specs["risk_score"], 0)
+
+  def test_pass_reports_initialized_empty(self):
+    """CStore has pass_reports: [] (no pass_history)."""
+    plugin = self._build_mock_plugin(job_id="test-job-4")
+    self._launch(plugin, start_port=1, end_port=100)
+
+    job_specs = self._extract_job_specs(plugin, "test-job-4")
+    self.assertIsNotNone(job_specs)
+
+    self.assertIn("pass_reports", job_specs)
+    self.assertEqual(job_specs["pass_reports"], [])
+    self.assertNotIn("pass_history", job_specs)
+
+  def test_launch_fails_if_r1fs_unavailable(self):
+    """If R1FS fails to store config, launch aborts with error."""
+    plugin = self._build_mock_plugin(job_id="test-job-5", r1fs_cid=None)
+    result = self._launch(plugin, start_port=1, end_port=100)
+
+    self.assertIn("error", result)
+    # CStore should NOT have been written with the job
+    job_specs = self._extract_job_specs(plugin, "test-job-5")
+    self.assertIsNone(job_specs)
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -2349,4 +2581,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestCveDatabase))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestCorrelationEngine))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestScannerEnhancements))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase1ConfigCID))
   runner.run(suite)
