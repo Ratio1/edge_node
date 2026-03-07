@@ -13,6 +13,9 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
+from extensions.business.cybersec.red_mesh.constants import (
+  DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS,
+)
 
 
 @dataclass(frozen=True)
@@ -56,12 +59,12 @@ class JobConfig:
       start_port=d["start_port"],
       end_port=d["end_port"],
       exceptions=d.get("exceptions", []),
-      distribution_strategy=d.get("distribution_strategy", "SLICE"),
-      port_order=d.get("port_order", "SEQUENTIAL"),
+      distribution_strategy=d.get("distribution_strategy", DISTRIBUTION_SLICE),
+      port_order=d.get("port_order", PORT_ORDER_SEQUENTIAL),
       nr_local_workers=d.get("nr_local_workers", 2),
       enabled_features=d.get("enabled_features", []),
       excluded_features=d.get("excluded_features", []),
-      run_mode=d.get("run_mode", "SINGLEPASS"),
+      run_mode=d.get("run_mode", RUN_MODE_SINGLEPASS),
       scan_min_delay=d.get("scan_min_delay", 0),
       scan_max_delay=d.get("scan_max_delay", 0),
       ics_safe_mode=d.get("ics_safe_mode", False),

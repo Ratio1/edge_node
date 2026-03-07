@@ -191,3 +191,10 @@ RISK_CONFIDENCE_MULTIPLIERS = {"certain": 1.0, "firm": 0.8, "tentative": 0.5}
 RISK_SIGMOID_K = 0.02
 RISK_CRED_PENALTY_PER = 15
 RISK_CRED_PENALTY_CAP = 30
+
+# =====================================================================
+# Job archive
+# =====================================================================
+
+JOB_ARCHIVE_VERSION = 1
+MAX_CONTINUOUS_PASSES = 100
