@@ -13,9 +13,6 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
-from extensions.business.cybersec.red_mesh.constants import (
-  DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS,
-)
 
 
 @dataclass(frozen=True)
@@ -59,12 +56,12 @@ class JobConfig:
       start_port=d["start_port"],
       end_port=d["end_port"],
       exceptions=d.get("exceptions", []),
-      distribution_strategy=d.get("distribution_strategy", DISTRIBUTION_SLICE),
-      port_order=d.get("port_order", PORT_ORDER_SEQUENTIAL),
+      distribution_strategy=d.get("distribution_strategy", "SLICE"),
+      port_order=d.get("port_order", "SEQUENTIAL"),
       nr_local_workers=d.get("nr_local_workers", 2),
       enabled_features=d.get("enabled_features", []),
       excluded_features=d.get("excluded_features", []),
-      run_mode=d.get("run_mode", RUN_MODE_SINGLEPASS),
+      run_mode=d.get("run_mode", "SINGLEPASS"),
       scan_min_delay=d.get("scan_min_delay", 0),
       scan_max_delay=d.get("scan_max_delay", 0),
       ics_safe_mode=d.get("ics_safe_mode", False),
@@ -95,7 +92,6 @@ class WorkerReportMeta:
   ports_scanned: int = 0
   open_ports: list = None           # [int]
   nr_findings: int = 0
-  node_ip: str = ""                 # worker node's IP address
 
   def to_dict(self) -> dict:
     d = asdict(self)
@@ -112,7 +108,6 @@ class WorkerReportMeta:
       ports_scanned=d.get("ports_scanned", 0),
       open_ports=d.get("open_ports", []),
       nr_findings=d.get("nr_findings", 0),
-      node_ip=d.get("node_ip", ""),
     )
 
 
@@ -150,9 +145,6 @@ class PassReport:
   # Scan metrics (pass-level aggregate across all nodes)
   scan_metrics: dict = None         # ScanMetrics.to_dict()
 
-  # Per-node scan metrics (node_address -> ScanMetrics.to_dict())
-  worker_scan_metrics: dict = None
-
   # Attestation
   redmesh_test_attestation: dict = None
 
@@ -175,7 +167,6 @@ class PassReport:
       llm_failed=d.get("llm_failed"),
       findings=d.get("findings"),
       scan_metrics=d.get("scan_metrics"),
-      worker_scan_metrics=d.get("worker_scan_metrics"),
       redmesh_test_attestation=d.get("redmesh_test_attestation"),
     )
 
@@ -191,7 +182,7 @@ class UiAggregate:
   total_open_ports: list            # sorted unique [int]
   total_services: int
   total_findings: int
-  latest_risk_score: float = None     # None while scan is in progress
+  latest_risk_score: float
   latest_risk_breakdown: dict = None  # RiskBreakdown.to_dict()
   latest_quick_summary: str = None
   findings_count: dict = None       # { CRITICAL: int, HIGH: int, MEDIUM: int, LOW: int, INFO: int }
