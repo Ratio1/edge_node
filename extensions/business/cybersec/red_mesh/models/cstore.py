@@ -178,7 +178,7 @@ class WorkerProgress:
   job_id: str
   worker_addr: str
   pass_nr: int
-  progress: float                   # 0.0 - 100.0 (stage-based: completed_stages/total * 100)
+  progress: float                   # 0.0 - 100.0
   phase: str                        # port_scan | fingerprint | service_probes | web_tests | correlation
   ports_scanned: int
   ports_total: int
@@ -186,7 +186,6 @@ class WorkerProgress:
   completed_tests: list             # [str] — which probes finished
   updated_at: float                 # unix timestamp
   live_metrics: dict = None         # ScanMetrics.to_dict() — partial snapshot, progressively fills in
-  threads: dict = None              # {thread_id: {phase, ports_scanned, ports_total, open_ports_found}}
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -205,5 +204,4 @@ class WorkerProgress:
       completed_tests=d.get("completed_tests", []),
       updated_at=d.get("updated_at", 0),
       live_metrics=d.get("live_metrics"),
-      threads=d.get("threads"),
     )
