@@ -2568,6 +2568,466 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertIsNone(job_specs)
 
 
+class TestPhase2PassFinalization(unittest.TestCase):
+  """Phase 2: Single Aggregation + Consolidated Pass Reports."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    """Install mock modules so pentester_api_01 can be imported without naeural_core."""
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return
+    TestPhase1ConfigCID._mock_plugin_modules()
+
+  def _get_plugin_class(self):
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def _build_finalize_plugin(self, job_id="test-job", job_pass=1, run_mode="SINGLEPASS",
+                              llm_enabled=False, r1fs_returns=None):
+    """Build a mock plugin pre-configured for _maybe_finalize_pass testing."""
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "launcher-alias"
+    plugin.cfg_instance_id = "test-instance"
+    plugin.cfg_llm_agent_api_enabled = llm_enabled
+    plugin.cfg_llm_agent_api_host = "localhost"
+    plugin.cfg_llm_agent_api_port = 8080
+    plugin.cfg_llm_agent_api_timeout = 30
+    plugin.cfg_llm_auto_analysis_type = "security_assessment"
+    plugin.cfg_monitor_interval = 60
+    plugin.cfg_monitor_jitter = 0
+    plugin.cfg_attestation_min_seconds_between_submits = 300
+    plugin.time.return_value = 1000100.0
+    plugin.json_dumps.return_value = "{}"
+
+    # R1FS mock
+    plugin.r1fs = MagicMock()
+    cid_counter = {"n": 0}
+    def fake_add_json(data, show_logs=True):
+      cid_counter["n"] += 1
+      if r1fs_returns is not None:
+        return r1fs_returns.get(cid_counter["n"], f"QmCID{cid_counter['n']}")
+      return f"QmCID{cid_counter['n']}"
+    plugin.r1fs.add_json.side_effect = fake_add_json
+
+    # Job config in R1FS
+    plugin.r1fs.get_json.return_value = {
+      "target": "example.com", "start_port": 1, "end_port": 1024,
+      "run_mode": run_mode, "enabled_features": [], "monitor_interval": 60,
+    }
+
+    # Build job_specs with two finished workers
+    job_specs = {
+      "job_id": job_id,
+      "job_status": "RUNNING",
+      "job_pass": job_pass,
+      "run_mode": run_mode,
+      "launcher": "launcher-node",
+      "launcher_alias": "launcher-alias",
+      "target": "example.com",
+      "task_name": "Test",
+      "start_port": 1,
+      "end_port": 1024,
+      "date_created": 1000000.0,
+      "risk_score": 0,
+      "job_config_cid": "QmConfigCID",
+      "workers": {
+        "worker-A": {"start_port": 1, "end_port": 512, "finished": True, "report_cid": "QmReportA"},
+        "worker-B": {"start_port": 513, "end_port": 1024, "finished": True, "report_cid": "QmReportB"},
+      },
+      "timeline": [{"type": "created", "label": "Created", "date": 1000000.0, "actor": "launcher-alias", "actor_type": "system", "meta": {}}],
+      "pass_reports": [],
+    }
+
+    plugin.chainstore_hgetall.return_value = {job_id: job_specs}
+    plugin.chainstore_hset = MagicMock()
+
+    return plugin, job_specs
+
+  def _sample_node_report(self, start_port=1, end_port=512, open_ports=None, findings=None):
+    """Build a sample node report dict."""
+    report = {
+      "start_port": start_port,
+      "end_port": end_port,
+      "open_ports": open_ports or [80, 443],
+      "ports_scanned": end_port - start_port + 1,
+      "nr_open_ports": len(open_ports or [80, 443]),
+      "service_info": {},
+      "web_tests_info": {},
+      "completed_tests": ["port_scan"],
+      "port_protocols": {"80": "http", "443": "https"},
+      "port_banners": {},
+      "correlation_findings": [],
+    }
+    if findings:
+      # Add findings under service_info for port 80
+      report["service_info"] = {
+        "80": {
+          "_service_info_http": {
+            "findings": findings,
+          }
+        }
+      }
+    return report
+
+  def test_single_aggregation(self):
+    """_collect_node_reports called exactly once per pass finalization."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+
+    # Mock _collect_node_reports and _get_aggregated_report
+    report_a = self._sample_node_report(1, 512, [80])
+    report_b = self._sample_node_report(513, 1024, [443])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a, "worker-B": report_b})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80, 443], "service_info": {}, "web_tests_info": {},
+      "completed_tests": ["port_scan"], "ports_scanned": 1024,
+      "nr_open_ports": 2, "port_protocols": {"80": "http", "443": "https"},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com", "monitor_interval": 60})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 25, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    # _collect_node_reports called exactly once
+    plugin._collect_node_reports.assert_called_once()
+
+  def test_pass_report_cid_in_r1fs(self):
+    """PassReport stored in R1FS with correct fields."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {"80": "http"},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {"findings_score": 5}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    # r1fs.add_json called twice: once for aggregated data, once for PassReport
+    self.assertEqual(plugin.r1fs.add_json.call_count, 2)
+
+    # Second call is the PassReport
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(pass_report_dict["pass_nr"], 1)
+    self.assertIn("aggregated_report_cid", pass_report_dict)
+    self.assertIn("worker_reports", pass_report_dict)
+    self.assertEqual(pass_report_dict["risk_score"], 10)
+    self.assertIn("risk_breakdown", pass_report_dict)
+    self.assertIn("date_started", pass_report_dict)
+    self.assertIn("date_completed", pass_report_dict)
+
+  def test_aggregated_report_separate_cid(self):
+    """aggregated_report_cid is a separate R1FS write from the PassReport."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(r1fs_returns={1: "QmAggCID", 2: "QmPassCID"})
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    # First R1FS write = aggregated data, second = PassReport
+    agg_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    pass_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+
+    # The PassReport references the aggregated CID
+    self.assertEqual(pass_dict["aggregated_report_cid"], "QmAggCID")
+
+    # Aggregated data should have open_ports (from AggregatedScanData)
+    self.assertIn("open_ports", agg_dict)
+
+  def test_finding_id_deterministic(self):
+    """Same input produces same finding_id; different title produces different id."""
+    PentesterApi01Plugin = self._get_plugin_class()
+
+    aggregated = {
+      "open_ports": [80], "ports_scanned": 100, "nr_open_ports": 1,
+      "port_protocols": {"80": "http"},
+      "service_info": {
+        "80": {
+          "_service_info_http": {
+            "findings": [
+              {"title": "SQL Injection", "severity": "HIGH", "cwe_id": "CWE-89", "confidence": "firm"},
+            ]
+          }
+        }
+      },
+      "web_tests_info": {},
+      "correlation_findings": [],
+    }
+
+    risk1, findings1 = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
+    risk2, findings2 = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
+
+    self.assertEqual(findings1[0]["finding_id"], findings2[0]["finding_id"])
+
+    # Different title → different finding_id
+    aggregated2 = {
+      "open_ports": [80], "ports_scanned": 100, "nr_open_ports": 1,
+      "port_protocols": {"80": "http"},
+      "service_info": {
+        "80": {
+          "_service_info_http": {
+            "findings": [
+              {"title": "XSS Vulnerability", "severity": "HIGH", "cwe_id": "CWE-79", "confidence": "firm"},
+            ]
+          }
+        }
+      },
+      "web_tests_info": {},
+      "correlation_findings": [],
+    }
+    _, findings3 = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated2)
+    self.assertNotEqual(findings1[0]["finding_id"], findings3[0]["finding_id"])
+
+  def test_finding_id_cwe_collision(self):
+    """Same CWE, different title, same port+probe → different finding_ids."""
+    PentesterApi01Plugin = self._get_plugin_class()
+
+    aggregated = {
+      "open_ports": [80], "ports_scanned": 100, "nr_open_ports": 1,
+      "port_protocols": {"80": "http"},
+      "service_info": {
+        "80": {
+          "_web_test_xss": {
+            "findings": [
+              {"title": "Reflected XSS in search", "severity": "HIGH", "cwe_id": "CWE-79", "confidence": "certain"},
+              {"title": "Stored XSS in comment", "severity": "HIGH", "cwe_id": "CWE-79", "confidence": "certain"},
+            ]
+          }
+        }
+      },
+      "web_tests_info": {},
+      "correlation_findings": [],
+    }
+
+    _, findings = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
+    self.assertEqual(len(findings), 2)
+    self.assertNotEqual(findings[0]["finding_id"], findings[1]["finding_id"])
+
+  def test_finding_enrichment_fields(self):
+    """Each finding has finding_id, port, protocol, probe, category."""
+    PentesterApi01Plugin = self._get_plugin_class()
+
+    aggregated = {
+      "open_ports": [443], "ports_scanned": 100, "nr_open_ports": 1,
+      "port_protocols": {"443": "https"},
+      "service_info": {
+        "443": {
+          "_service_info_ssl": {
+            "findings": [
+              {"title": "Weak TLS", "severity": "MEDIUM", "cwe_id": "CWE-326", "confidence": "certain"},
+            ]
+          }
+        }
+      },
+      "web_tests_info": {},
+      "correlation_findings": [],
+    }
+
+    _, findings = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
+    self.assertEqual(len(findings), 1)
+    f = findings[0]
+    self.assertIn("finding_id", f)
+    self.assertEqual(len(f["finding_id"]), 16)  # 16-char hex
+    self.assertEqual(f["port"], 443)
+    self.assertEqual(f["protocol"], "https")
+    self.assertEqual(f["probe"], "_service_info_ssl")
+    self.assertEqual(f["category"], "service")
+
+  def test_port_protocols_none(self):
+    """port_protocols is None → protocol defaults to 'unknown' (no crash)."""
+    PentesterApi01Plugin = self._get_plugin_class()
+
+    aggregated = {
+      "open_ports": [22], "ports_scanned": 100, "nr_open_ports": 1,
+      "port_protocols": None,
+      "service_info": {
+        "22": {
+          "_service_info_ssh": {
+            "findings": [
+              {"title": "Weak SSH key", "severity": "LOW", "cwe_id": "CWE-320", "confidence": "firm"},
+            ]
+          }
+        }
+      },
+      "web_tests_info": {},
+      "correlation_findings": [],
+    }
+
+    _, findings = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
+    self.assertEqual(len(findings), 1)
+    self.assertEqual(findings[0]["protocol"], "unknown")
+
+  def test_llm_success_no_llm_failed(self):
+    """LLM succeeds → llm_failed absent from serialized PassReport."""
+    from extensions.business.cybersec.red_mesh.models import PassReport
+
+    pr = PassReport(
+      pass_nr=1, date_started=1000.0, date_completed=1100.0, duration=100.0,
+      aggregated_report_cid="QmAgg",
+      worker_reports={},
+      risk_score=50,
+      llm_analysis="# Analysis\nAll good.",
+      quick_summary="No critical issues found.",
+      llm_failed=None,  # success
+    )
+    d = pr.to_dict()
+    self.assertNotIn("llm_failed", d)
+    self.assertEqual(d["llm_analysis"], "# Analysis\nAll good.")
+
+  def test_llm_failure_flag_and_timeline(self):
+    """LLM fails → llm_failed: True, timeline event added."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    # LLM returns None (failure)
+    plugin._run_aggregated_llm_analysis = MagicMock(return_value=None)
+    plugin._run_quick_summary_analysis = MagicMock(return_value=None)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    # Check PassReport has llm_failed=True
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(pass_report_dict.get("llm_failed"))
+
+    # Check timeline event was emitted for llm_failed
+    llm_failed_calls = [
+      c for c in plugin._emit_timeline_event.call_args_list
+      if c[0][1] == "llm_failed"
+    ]
+    self.assertEqual(len(llm_failed_calls), 1)
+    # _emit_timeline_event(job_specs, "llm_failed", label, meta={"pass_nr": ...})
+    call_kwargs = llm_failed_calls[0][1]  # keyword args
+    meta = call_kwargs.get("meta", {})
+    self.assertIn("pass_nr", meta)
+
+  def test_aggregated_report_write_failure(self):
+    """R1FS fails for aggregated → pass finalization skipped, no partial state."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    # First R1FS write (aggregated) returns None = failure
+    plugin, job_specs = self._build_finalize_plugin(r1fs_returns={1: None, 2: "QmPassCID"})
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    # CStore should NOT have pass_reports appended
+    self.assertEqual(len(job_specs["pass_reports"]), 0)
+    # CStore hset should NOT have been called for finalization
+    plugin.chainstore_hset.assert_not_called()
+
+  def test_pass_report_write_failure(self):
+    """R1FS fails for pass report → CStore pass_reports not appended."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    # First R1FS write (aggregated) succeeds, second (pass report) fails
+    plugin, job_specs = self._build_finalize_plugin(r1fs_returns={1: "QmAggCID", 2: None})
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    # CStore should NOT have pass_reports appended
+    self.assertEqual(len(job_specs["pass_reports"]), 0)
+    # CStore hset should NOT have been called for finalization
+    plugin.chainstore_hset.assert_not_called()
+
+  def test_cstore_risk_score_updated(self):
+    """After pass, risk_score on CStore matches pass result."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 42, "breakdown": {"findings_score": 30}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    # CStore risk_score updated
+    self.assertEqual(job_specs["risk_score"], 42)
+
+    # PassReportRef in pass_reports has same risk_score
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    ref = job_specs["pass_reports"][0]
+    self.assertEqual(ref["risk_score"], 42)
+    self.assertIn("report_cid", ref)
+    self.assertEqual(ref["pass_nr"], 1)
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -2582,4 +3042,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestCorrelationEngine))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestScannerEnhancements))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase1ConfigCID))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase2PassFinalization))
   runner.run(suite)
