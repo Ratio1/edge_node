@@ -3499,6 +3499,203 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(stub["job_status"], "STOPPED")
 
 
+class TestPhase5Endpoints(unittest.TestCase):
+  """Phase 5: API Endpoints."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return
+    TestPhase1ConfigCID._mock_plugin_modules()
+
+  def _get_plugin_class(self):
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def _build_finalized_stub(self, job_id="test-job"):
+    """Build a CStoreJobFinalized-shaped dict."""
+    return {
+      "job_id": job_id,
+      "job_status": "FINALIZED",
+      "target": "example.com",
+      "task_name": "Test",
+      "risk_score": 42,
+      "run_mode": "SINGLEPASS",
+      "duration": 200.0,
+      "pass_count": 1,
+      "launcher": "launcher-node",
+      "launcher_alias": "launcher-alias",
+      "worker_count": 2,
+      "start_port": 1,
+      "end_port": 1024,
+      "date_created": 1000000.0,
+      "date_completed": 1000200.0,
+      "job_cid": "QmArchiveCID",
+      "job_config_cid": "QmConfigCID",
+    }
+
+  def _build_running_job(self, job_id="run-job", pass_count=8):
+    """Build a running job dict with N pass_reports."""
+    pass_reports = [
+      {"pass_nr": i, "report_cid": f"QmPass{i}", "risk_score": 10 + i}
+      for i in range(1, pass_count + 1)
+    ]
+    return {
+      "job_id": job_id,
+      "job_status": "RUNNING",
+      "job_pass": pass_count,
+      "run_mode": "CONTINUOUS_MONITORING",
+      "launcher": "launcher-node",
+      "launcher_alias": "launcher-alias",
+      "target": "example.com",
+      "task_name": "Continuous Test",
+      "start_port": 1,
+      "end_port": 1024,
+      "date_created": 1000000.0,
+      "risk_score": 18,
+      "job_config_cid": "QmConfigCID",
+      "workers": {
+        "worker-A": {"start_port": 1, "end_port": 512, "finished": False},
+        "worker-B": {"start_port": 513, "end_port": 1024, "finished": False},
+      },
+      "timeline": [
+        {"type": "created", "label": "Created", "date": 1000000.0, "actor": "launcher", "actor_type": "system", "meta": {}},
+        {"type": "started", "label": "Started", "date": 1000001.0, "actor": "launcher", "actor_type": "system", "meta": {}},
+      ],
+      "pass_reports": pass_reports,
+    }
+
+  def _build_plugin(self, jobs_dict):
+    """Build a mock plugin with given jobs in CStore."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "launcher-alias"
+    plugin.cfg_instance_id = "test-instance"
+    plugin.r1fs = MagicMock()
+
+    plugin.chainstore_hgetall.return_value = dict(jobs_dict)
+    plugin.chainstore_hget.side_effect = lambda hkey, key: jobs_dict.get(key)
+    plugin._normalize_job_record = MagicMock(
+      side_effect=lambda k, v: (k, v) if isinstance(v, dict) and v.get("job_id") else (None, None)
+    )
+
+    # Bind real methods so endpoint logic executes properly
+    plugin._get_all_network_jobs = lambda: Plugin._get_all_network_jobs(plugin)
+    plugin._get_job_from_cstore = lambda job_id: Plugin._get_job_from_cstore(plugin, job_id)
+    return plugin
+
+  def test_get_job_archive_finalized(self):
+    """get_job_archive for finalized job returns archive with matching job_id."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+
+    archive_data = {"job_id": "fin-job", "passes": [], "ui_aggregate": {}}
+    plugin.r1fs.get_json.return_value = archive_data
+
+    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    self.assertEqual(result["job_id"], "fin-job")
+    self.assertEqual(result["archive"]["job_id"], "fin-job")
+
+  def test_get_job_archive_running(self):
+    """get_job_archive for running job returns not_available error."""
+    Plugin = self._get_plugin_class()
+    running = self._build_running_job("run-job", pass_count=2)
+    plugin = self._build_plugin({"run-job": running})
+
+    result = Plugin.get_job_archive(plugin, job_id="run-job")
+    self.assertEqual(result["error"], "not_available")
+
+  def test_get_job_archive_integrity_mismatch(self):
+    """Corrupted job_cid pointing to wrong archive is rejected."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+
+    # Archive has a different job_id
+    plugin.r1fs.get_json.return_value = {"job_id": "other-job", "passes": []}
+
+    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    self.assertEqual(result["error"], "integrity_mismatch")
+
+  def test_get_job_data_running_last_5(self):
+    """Running job with 8 passes returns last 5 refs only."""
+    Plugin = self._get_plugin_class()
+    running = self._build_running_job("run-job", pass_count=8)
+    plugin = self._build_plugin({"run-job": running})
+
+    result = Plugin.get_job_data(plugin, job_id="run-job")
+    self.assertTrue(result["found"])
+    refs = result["job"]["pass_reports"]
+    self.assertEqual(len(refs), 5)
+    # Should be the last 5 (pass_nr 4-8)
+    self.assertEqual(refs[0]["pass_nr"], 4)
+    self.assertEqual(refs[-1]["pass_nr"], 8)
+
+  def test_get_job_data_finalized_returns_stub(self):
+    """Finalized job returns stub as-is with job_cid."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+
+    result = Plugin.get_job_data(plugin, job_id="fin-job")
+    self.assertTrue(result["found"])
+    self.assertEqual(result["job"]["job_cid"], "QmArchiveCID")
+    self.assertEqual(result["job"]["pass_count"], 1)
+
+  def test_list_jobs_finalized_as_is(self):
+    """Finalized stubs returned unmodified with all CStoreJobFinalized fields."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+
+    result = Plugin.list_network_jobs(plugin)
+    self.assertIn("fin-job", result)
+    job = result["fin-job"]
+    self.assertEqual(job["job_cid"], "QmArchiveCID")
+    self.assertEqual(job["pass_count"], 1)
+    self.assertEqual(job["worker_count"], 2)
+    self.assertEqual(job["risk_score"], 42)
+    self.assertEqual(job["duration"], 200.0)
+
+  def test_list_jobs_running_stripped(self):
+    """Running jobs have counts but no timeline, workers, or pass_reports."""
+    Plugin = self._get_plugin_class()
+    running = self._build_running_job("run-job", pass_count=3)
+    plugin = self._build_plugin({"run-job": running})
+
+    result = Plugin.list_network_jobs(plugin)
+    self.assertIn("run-job", result)
+    job = result["run-job"]
+    # Should have counts
+    self.assertEqual(job["pass_count"], 3)
+    self.assertEqual(job["worker_count"], 2)
+    # Should NOT have heavy fields
+    self.assertNotIn("timeline", job)
+    self.assertNotIn("workers", job)
+    self.assertNotIn("pass_reports", job)
+
+  def test_get_job_archive_not_found(self):
+    """get_job_archive for non-existent job returns not_found."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+
+    result = Plugin.get_job_archive(plugin, job_id="missing-job")
+    self.assertEqual(result["error"], "not_found")
+
+  def test_get_job_archive_r1fs_failure(self):
+    """get_job_archive when R1FS fails returns fetch_failed."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+    plugin.r1fs.get_json.return_value = None
+
+    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    self.assertEqual(result["error"], "fetch_failed")
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -3516,4 +3713,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase2PassFinalization))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase4UiAggregate))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase3Archive))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase5Endpoints))
   runner.run(suite)
