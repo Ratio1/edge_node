@@ -166,9 +166,9 @@ class _RedMeshLlmAgentMixin(object):
 
     return analysis_result
 
-  def _collect_aggregated_report(self, workers: dict) -> dict:
+  def _collect_node_reports(self, workers: dict) -> dict:
     """
-    Collect and aggregate reports from all workers.
+    Collect individual node reports from all workers.
 
     Parameters
     ----------
@@ -178,7 +178,7 @@ class _RedMeshLlmAgentMixin(object):
     Returns
     -------
     dict
-      Aggregated report combining all worker data.
+      Mapping {addr: report_dict} for each worker with data.
     """
     all_reports = {}
 
@@ -202,68 +202,56 @@ class _RedMeshLlmAgentMixin(object):
         all_reports[addr] = report
 
     if not all_reports:
-      self.P("No reports found to aggregate", color='y')
-      return {}
+      self.P("No reports found to collect", color='y')
 
-    # Aggregate all reports (method from host class)
-    aggregated = self._get_aggregated_report(all_reports)
-    return aggregated
+    return all_reports
 
   def _run_aggregated_llm_analysis(
       self,
       job_id: str,
-      job_specs: dict,
-      workers: dict,
-      pass_nr: int = None
-  ) -> Optional[str]:
+      aggregated_report: dict,
+      job_config: dict,
+  ) -> str | None:
     """
-    Run LLM analysis on aggregated report from all workers.
+    Run LLM analysis on a pre-aggregated report.
 
-    Called by the launcher node after all workers complete.
+    The caller aggregates once and passes the result. This method
+    no longer fetches node reports or saves to R1FS.
 
     Parameters
     ----------
     job_id : str
       Identifier of the job.
-    job_specs : dict
-      Job specification (will be updated with analysis CID).
-    workers : dict
-      Worker entries containing report data.
-    pass_nr : int, optional
-      Pass number for continuous monitoring jobs.
+    aggregated_report : dict
+      Pre-aggregated scan data from all workers.
+    job_config : dict
+      Job configuration (from R1FS).
 
     Returns
     -------
     str or None
-      Analysis CID if successful, None otherwise.
+      LLM analysis markdown text if successful, None otherwise.
     """
-    target = job_specs.get("target", "unknown")
-    run_mode = job_specs.get("run_mode", "SINGLEPASS")
-    pass_info = f" (pass {pass_nr})" if pass_nr else ""
-    self.P(f"Running aggregated LLM analysis for job {job_id}{pass_info}, target {target}...")
-
-    # Collect and aggregate reports from all workers
-    aggregated_report = self._collect_aggregated_report(workers)
+    target = job_config.get("target", "unknown")
+    self.P(f"Running aggregated LLM analysis for job {job_id}, target {target}...")
 
     if not aggregated_report:
       self.P(f"No data to analyze for job {job_id}", color='y')
       return None
 
     # Add job metadata to report for context
-    aggregated_report["_job_metadata"] = {
+    report_with_meta = dict(aggregated_report)
+    report_with_meta["_job_metadata"] = {
       "job_id": job_id,
       "target": target,
-      "num_workers": len(workers),
-      "worker_addresses": list(workers.keys()),
-      "start_port": job_specs.get("start_port"),
-      "end_port": job_specs.get("end_port"),
-      "enabled_features": job_specs.get("enabled_features", []),
-      "run_mode": run_mode,
-      "pass_nr": pass_nr,
+      "start_port": job_config.get("start_port"),
+      "end_port": job_config.get("end_port"),
+      "enabled_features": job_config.get("enabled_features", []),
+      "run_mode": job_config.get("run_mode", "SINGLEPASS"),
     }
 
     # Call LLM analysis
-    llm_analysis = self._auto_analyze_report(job_id, aggregated_report, target)
+    llm_analysis = self._auto_analyze_report(job_id, report_with_meta, target)
 
     if not llm_analysis or "error" in llm_analysis:
       self.P(
@@ -272,81 +260,53 @@ class _RedMeshLlmAgentMixin(object):
       )
       return None
 
-    # Save analysis to R1FS
-    try:
-      analysis_cid = self.r1fs.add_json(llm_analysis, show_logs=False)
-      if analysis_cid:
-        # Always store in pass_reports for consistency (both SINGLEPASS and CONTINUOUS)
-        pass_reports = job_specs.get("pass_reports", [])
-        for entry in pass_reports:
-          if entry.get("pass_nr") == pass_nr:
-            entry["llm_analysis_cid"] = analysis_cid
-            break
-        self._emit_timeline_event(
-          job_specs, "llm_analysis",
-          f"LLM analysis completed for pass {pass_nr}",
-          meta={"analysis_cid": analysis_cid, "pass_nr": pass_nr}
-        )
-        self.P(f"LLM analysis for pass {pass_nr} saved, CID: {analysis_cid}")
-        return analysis_cid
-      else:
-        self.P(f"Failed to save LLM analysis to R1FS for job {job_id}", color='y')
-        return None
-    except Exception as e:
-      self.P(f"Error saving LLM analysis to R1FS: {e}", color='r')
-      return None
+    # Extract the markdown text from the analysis result
+    if isinstance(llm_analysis, dict):
+      return llm_analysis.get("content", llm_analysis.get("analysis", llm_analysis.get("markdown", str(llm_analysis))))
+    return str(llm_analysis)
 
   def _run_quick_summary_analysis(
       self,
       job_id: str,
-      job_specs: dict,
-      workers: dict,
-      pass_nr: int = None
-  ) -> Optional[str]:
+      aggregated_report: dict,
+      job_config: dict,
+  ) -> str | None:
     """
-    Run a short (2-4 sentence) AI quick summary on the aggregated report.
+    Run a short (2-4 sentence) AI quick summary on a pre-aggregated report.
 
-    Same pattern as _run_aggregated_llm_analysis but uses the quick_summary
-    analysis type with a low token budget.
+    The caller aggregates once and passes the result. This method
+    no longer fetches node reports or saves to R1FS.
 
     Parameters
     ----------
     job_id : str
       Identifier of the job.
-    job_specs : dict
-      Job specification (will be updated with quick_summary_cid).
-    workers : dict
-      Worker entries containing report data.
-    pass_nr : int, optional
-      Pass number for continuous monitoring jobs.
+    aggregated_report : dict
+      Pre-aggregated scan data from all workers.
+    job_config : dict
+      Job configuration (from R1FS).
 
     Returns
     -------
     str or None
-      Quick summary CID if successful, None otherwise.
+      Quick summary text if successful, None otherwise.
     """
-    target = job_specs.get("target", "unknown")
-    pass_info = f" (pass {pass_nr})" if pass_nr else ""
-    self.P(f"Running quick summary analysis for job {job_id}{pass_info}, target {target}...")
-
-    # Collect and aggregate reports from all workers
-    aggregated_report = self._collect_aggregated_report(workers)
+    target = job_config.get("target", "unknown")
+    self.P(f"Running quick summary analysis for job {job_id}, target {target}...")
 
     if not aggregated_report:
       self.P(f"No data for quick summary for job {job_id}", color='y')
       return None
 
     # Add job metadata to report for context
-    aggregated_report["_job_metadata"] = {
+    report_with_meta = dict(aggregated_report)
+    report_with_meta["_job_metadata"] = {
       "job_id": job_id,
       "target": target,
-      "num_workers": len(workers),
-      "worker_addresses": list(workers.keys()),
-      "start_port": job_specs.get("start_port"),
-      "end_port": job_specs.get("end_port"),
-      "enabled_features": job_specs.get("enabled_features", []),
-      "run_mode": job_specs.get("run_mode", "SINGLEPASS"),
-      "pass_nr": pass_nr,
+      "start_port": job_config.get("start_port"),
+      "end_port": job_config.get("end_port"),
+      "enabled_features": job_config.get("enabled_features", []),
+      "run_mode": job_config.get("run_mode", "SINGLEPASS"),
     }
 
     # Call LLM analysis with quick_summary type
@@ -354,7 +314,7 @@ class _RedMeshLlmAgentMixin(object):
       endpoint="/analyze_scan",
       method="POST",
       payload={
-        "scan_results": aggregated_report,
+        "scan_results": report_with_meta,
         "analysis_type": "quick_summary",
         "focus_areas": None,
       }
@@ -367,29 +327,10 @@ class _RedMeshLlmAgentMixin(object):
       )
       return None
 
-    # Save to R1FS
-    try:
-      summary_cid = self.r1fs.add_json(analysis_result, show_logs=False)
-      if summary_cid:
-        # Store in pass_reports
-        pass_reports = job_specs.get("pass_reports", [])
-        for entry in pass_reports:
-          if entry.get("pass_nr") == pass_nr:
-            entry["quick_summary_cid"] = summary_cid
-            break
-        self._emit_timeline_event(
-          job_specs, "llm_analysis",
-          f"Quick summary completed for pass {pass_nr}",
-          meta={"quick_summary_cid": summary_cid, "pass_nr": pass_nr}
-        )
-        self.P(f"Quick summary for pass {pass_nr} saved, CID: {summary_cid}")
-        return summary_cid
-      else:
-        self.P(f"Failed to save quick summary to R1FS for job {job_id}", color='y')
-        return None
-    except Exception as e:
-      self.P(f"Error saving quick summary to R1FS: {e}", color='r')
-      return None
+    # Extract the summary text from the result
+    if isinstance(analysis_result, dict):
+      return analysis_result.get("content", analysis_result.get("summary", analysis_result.get("analysis", str(analysis_result))))
+    return str(analysis_result)
 
   def _get_llm_health_status(self) -> dict:
     """
