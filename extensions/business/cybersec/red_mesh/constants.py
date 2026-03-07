@@ -198,3 +198,9 @@ RISK_CRED_PENALTY_CAP = 30
 
 JOB_ARCHIVE_VERSION = 1
 MAX_CONTINUOUS_PASSES = 100
+
+# =====================================================================
+# Live progress publishing
+# =====================================================================
+
+PROGRESS_PUBLISH_INTERVAL = 20  # seconds between progress updates to CStore

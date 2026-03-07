@@ -3696,6 +3696,139 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["error"], "fetch_failed")
 
 
+class TestPhase12LiveProgress(unittest.TestCase):
+  """Phase 12: Live Worker Progress."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return
+    TestPhase1ConfigCID._mock_plugin_modules()
+
+  def _get_plugin_class(self):
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def test_worker_progress_model_roundtrip(self):
+    """WorkerProgress.from_dict(wp.to_dict()) preserves all fields."""
+    from extensions.business.cybersec.red_mesh.models import WorkerProgress
+    wp = WorkerProgress(
+      job_id="job-1",
+      worker_addr="0xWorkerA",
+      pass_nr=2,
+      progress=45.5,
+      phase="service_probes",
+      ports_scanned=500,
+      ports_total=1024,
+      open_ports_found=[22, 80, 443],
+      completed_tests=["fingerprint_completed", "service_info_completed"],
+      updated_at=1700000000.0,
+      live_metrics={"total_duration": 30.5},
+    )
+    d = wp.to_dict()
+    wp2 = WorkerProgress.from_dict(d)
+    self.assertEqual(wp2.job_id, "job-1")
+    self.assertEqual(wp2.worker_addr, "0xWorkerA")
+    self.assertEqual(wp2.pass_nr, 2)
+    self.assertAlmostEqual(wp2.progress, 45.5)
+    self.assertEqual(wp2.phase, "service_probes")
+    self.assertEqual(wp2.ports_scanned, 500)
+    self.assertEqual(wp2.ports_total, 1024)
+    self.assertEqual(wp2.open_ports_found, [22, 80, 443])
+    self.assertEqual(wp2.completed_tests, ["fingerprint_completed", "service_info_completed"])
+    self.assertEqual(wp2.updated_at, 1700000000.0)
+    self.assertEqual(wp2.live_metrics, {"total_duration": 30.5})
+
+  def test_get_job_progress_filters_by_job(self):
+    """get_job_progress returns only workers for the requested job."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+
+    # Simulate two jobs' progress in the :live hset
+    live_data = {
+      "job-A:worker-1": {"job_id": "job-A", "progress": 50},
+      "job-A:worker-2": {"job_id": "job-A", "progress": 75},
+      "job-B:worker-3": {"job_id": "job-B", "progress": 30},
+    }
+    plugin.chainstore_hgetall.return_value = live_data
+
+    result = Plugin.get_job_progress(plugin, job_id="job-A")
+    self.assertEqual(result["job_id"], "job-A")
+    self.assertEqual(len(result["workers"]), 2)
+    self.assertIn("worker-1", result["workers"])
+    self.assertIn("worker-2", result["workers"])
+    self.assertNotIn("worker-3", result["workers"])
+
+  def test_get_job_progress_empty(self):
+    """get_job_progress for non-existent job returns empty workers dict."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.chainstore_hgetall.return_value = {}
+
+    result = Plugin.get_job_progress(plugin, job_id="nonexistent")
+    self.assertEqual(result["job_id"], "nonexistent")
+    self.assertEqual(result["workers"], {})
+
+  def test_publish_live_progress(self):
+    """_publish_live_progress writes progress to CStore :live hset."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+    plugin._last_progress_publish = 0
+    plugin.time.return_value = 100.0
+
+    # Mock a local worker with state
+    worker = MagicMock()
+    worker.state = {
+      "ports_scanned": list(range(100)),
+      "open_ports": [22, 80],
+      "completed_tests": ["fingerprint_completed"],
+      "done": False,
+    }
+    worker.initial_ports = list(range(1, 513))
+
+    plugin.scan_jobs = {"job-1": {"worker-thread-1": worker}}
+
+    # Mock CStore lookup for pass_nr
+    plugin.chainstore_hget.return_value = {"job_pass": 3}
+
+    Plugin._publish_live_progress(plugin)
+
+    # Verify hset was called with correct key pattern
+    plugin.chainstore_hset.assert_called_once()
+    call_args = plugin.chainstore_hset.call_args
+    self.assertEqual(call_args.kwargs["hkey"], "test-instance:live")
+    self.assertEqual(call_args.kwargs["key"], "job-1:node-A")
+    progress_data = call_args.kwargs["value"]
+    self.assertEqual(progress_data["job_id"], "job-1")
+    self.assertEqual(progress_data["worker_addr"], "node-A")
+    self.assertEqual(progress_data["pass_nr"], 3)
+    self.assertEqual(progress_data["phase"], "service_probes")
+    self.assertEqual(progress_data["ports_scanned"], 100)
+    self.assertEqual(progress_data["ports_total"], 512)
+    self.assertIn(22, progress_data["open_ports_found"])
+    self.assertIn(80, progress_data["open_ports_found"])
+
+  def test_clear_live_progress(self):
+    """_clear_live_progress deletes progress keys for all workers."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+
+    Plugin._clear_live_progress(plugin, "job-1", ["worker-A", "worker-B"])
+
+    self.assertEqual(plugin.chainstore_hset.call_count, 2)
+    calls = plugin.chainstore_hset.call_args_list
+    keys_deleted = {c.kwargs["key"] for c in calls}
+    self.assertEqual(keys_deleted, {"job-1:worker-A", "job-1:worker-B"})
+    for c in calls:
+      self.assertIsNone(c.kwargs["value"])
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -3714,4 +3847,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase4UiAggregate))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase3Archive))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase5Endpoints))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase12LiveProgress))
   runner.run(suite)
