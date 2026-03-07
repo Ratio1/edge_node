@@ -3028,6 +3028,477 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(ref["pass_nr"], 1)
 
 
+class TestPhase4UiAggregate(unittest.TestCase):
+  """Phase 4: UI Aggregate Computation."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return
+    TestPhase1ConfigCID._mock_plugin_modules()
+
+  def _get_plugin_class(self):
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def _make_plugin(self):
+    plugin = MagicMock()
+    Plugin = self._get_plugin_class()
+    plugin._count_services = lambda si: Plugin._count_services(plugin, si)
+    plugin._compute_ui_aggregate = lambda passes, agg: Plugin._compute_ui_aggregate(plugin, passes, agg)
+    plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
+    plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
+    return plugin, Plugin
+
+  def _make_finding(self, severity="HIGH", confidence="firm", finding_id="abc123", title="Test"):
+    return {"finding_id": finding_id, "severity": severity, "confidence": confidence, "title": title}
+
+  def _make_pass(self, pass_nr=1, findings=None, risk_score=0, worker_reports=None):
+    return {
+      "pass_nr": pass_nr,
+      "risk_score": risk_score,
+      "risk_breakdown": {"findings_score": 10},
+      "quick_summary": "Summary text",
+      "findings": findings,
+      "worker_reports": worker_reports or {
+        "w1": {"start_port": 1, "end_port": 512, "open_ports": [80]},
+      },
+    }
+
+  def _make_aggregated(self, open_ports=None, service_info=None):
+    return {
+      "open_ports": open_ports or [80, 443],
+      "service_info": service_info or {
+        "80": {"_service_info_http": {"findings": []}},
+        "443": {"_service_info_https": {"findings": []}},
+      },
+    }
+
+  def test_findings_count_uppercase_keys(self):
+    """findings_count keys are UPPERCASE."""
+    plugin, _ = self._make_plugin()
+    findings = [
+      self._make_finding(severity="CRITICAL", finding_id="f1"),
+      self._make_finding(severity="HIGH", finding_id="f2"),
+      self._make_finding(severity="HIGH", finding_id="f3"),
+      self._make_finding(severity="MEDIUM", finding_id="f4"),
+    ]
+    p = self._make_pass(findings=findings)
+    agg = self._make_aggregated()
+    result = plugin._compute_ui_aggregate([p], agg)
+    fc = result.to_dict()["findings_count"]
+    self.assertEqual(fc["CRITICAL"], 1)
+    self.assertEqual(fc["HIGH"], 2)
+    self.assertEqual(fc["MEDIUM"], 1)
+    for key in fc:
+      self.assertEqual(key, key.upper())
+
+  def test_top_findings_max_10(self):
+    """More than 10 CRITICAL+HIGH -> capped at 10."""
+    plugin, _ = self._make_plugin()
+    findings = [self._make_finding(severity="CRITICAL", finding_id=f"f{i}") for i in range(15)]
+    p = self._make_pass(findings=findings)
+    agg = self._make_aggregated()
+    result = plugin._compute_ui_aggregate([p], agg)
+    self.assertEqual(len(result.to_dict()["top_findings"]), 10)
+
+  def test_top_findings_sorted(self):
+    """CRITICAL before HIGH, within same severity sorted by confidence."""
+    plugin, _ = self._make_plugin()
+    findings = [
+      self._make_finding(severity="HIGH", confidence="certain", finding_id="f1", title="H-certain"),
+      self._make_finding(severity="CRITICAL", confidence="tentative", finding_id="f2", title="C-tentative"),
+      self._make_finding(severity="HIGH", confidence="tentative", finding_id="f3", title="H-tentative"),
+      self._make_finding(severity="CRITICAL", confidence="certain", finding_id="f4", title="C-certain"),
+    ]
+    p = self._make_pass(findings=findings)
+    agg = self._make_aggregated()
+    result = plugin._compute_ui_aggregate([p], agg)
+    top = result.to_dict()["top_findings"]
+    self.assertEqual(top[0]["title"], "C-certain")
+    self.assertEqual(top[1]["title"], "C-tentative")
+    self.assertEqual(top[2]["title"], "H-certain")
+    self.assertEqual(top[3]["title"], "H-tentative")
+
+  def test_top_findings_excludes_medium(self):
+    """MEDIUM/LOW/INFO findings never in top_findings."""
+    plugin, _ = self._make_plugin()
+    findings = [
+      self._make_finding(severity="MEDIUM", finding_id="f1"),
+      self._make_finding(severity="LOW", finding_id="f2"),
+      self._make_finding(severity="INFO", finding_id="f3"),
+    ]
+    p = self._make_pass(findings=findings)
+    agg = self._make_aggregated()
+    result = plugin._compute_ui_aggregate([p], agg)
+    d = result.to_dict()
+    self.assertNotIn("top_findings", d)  # stripped by _strip_none (None)
+
+  def test_finding_timeline_single_pass(self):
+    """1 pass -> finding_timeline is None (stripped)."""
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(findings=[])
+    agg = self._make_aggregated()
+    result = plugin._compute_ui_aggregate([p], agg)
+    d = result.to_dict()
+    self.assertNotIn("finding_timeline", d)  # None → stripped
+
+  def test_finding_timeline_multi_pass(self):
+    """3 passes with overlapping findings -> correct first_seen, last_seen, pass_count."""
+    plugin, _ = self._make_plugin()
+    f_persistent = self._make_finding(finding_id="persist1")
+    f_transient = self._make_finding(finding_id="transient1")
+    f_new = self._make_finding(finding_id="new1")
+    passes = [
+      self._make_pass(pass_nr=1, findings=[f_persistent, f_transient]),
+      self._make_pass(pass_nr=2, findings=[f_persistent]),
+      self._make_pass(pass_nr=3, findings=[f_persistent, f_new]),
+    ]
+    agg = self._make_aggregated()
+    result = plugin._compute_ui_aggregate(passes, agg)
+    ft = result.to_dict()["finding_timeline"]
+    self.assertEqual(ft["persist1"]["first_seen"], 1)
+    self.assertEqual(ft["persist1"]["last_seen"], 3)
+    self.assertEqual(ft["persist1"]["pass_count"], 3)
+    self.assertEqual(ft["transient1"]["first_seen"], 1)
+    self.assertEqual(ft["transient1"]["last_seen"], 1)
+    self.assertEqual(ft["transient1"]["pass_count"], 1)
+    self.assertEqual(ft["new1"]["first_seen"], 3)
+    self.assertEqual(ft["new1"]["last_seen"], 3)
+    self.assertEqual(ft["new1"]["pass_count"], 1)
+
+  def test_zero_findings(self):
+    """findings_count is {}, top_findings is [], total_findings is 0."""
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(findings=[])
+    agg = self._make_aggregated()
+    result = plugin._compute_ui_aggregate([p], agg)
+    d = result.to_dict()
+    self.assertEqual(d["total_findings"], 0)
+    # findings_count and top_findings are None (stripped) when empty
+    self.assertNotIn("findings_count", d)
+    self.assertNotIn("top_findings", d)
+
+  def test_open_ports_sorted_unique(self):
+    """total_open_ports is deduped and sorted."""
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(findings=[])
+    agg = self._make_aggregated(open_ports=[443, 80, 443, 22, 80])
+    result = plugin._compute_ui_aggregate([p], agg)
+    self.assertEqual(result.to_dict()["total_open_ports"], [22, 80, 443])
+
+  def test_count_services(self):
+    """_count_services counts unique probe names across ports."""
+    plugin, _ = self._make_plugin()
+    service_info = {
+      "80": {"_service_info_http": {}, "_web_test_xss": {}},
+      "443": {"_service_info_https": {}, "_service_info_http": {}},
+    }
+    self.assertEqual(plugin._count_services(service_info), 3)
+    self.assertEqual(plugin._count_services({}), 0)
+    self.assertEqual(plugin._count_services(None), 0)
+
+
+class TestPhase3Archive(unittest.TestCase):
+  """Phase 3: Job Close & Archive."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return
+    TestPhase1ConfigCID._mock_plugin_modules()
+
+  def _get_plugin_class(self):
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def _build_archive_plugin(self, job_id="test-job", pass_count=1, run_mode="SINGLEPASS",
+                              job_status="FINALIZED", r1fs_write_fail=False, r1fs_verify_fail=False):
+    """Build a mock plugin pre-configured for _build_job_archive testing."""
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "launcher-alias"
+    plugin.cfg_instance_id = "test-instance"
+    plugin.time.return_value = 1000200.0
+    plugin.json_dumps.return_value = "{}"
+
+    # R1FS mock
+    plugin.r1fs = MagicMock()
+
+    # Build pass report dicts and refs
+    pass_reports_data = []
+    pass_report_refs = []
+    for i in range(1, pass_count + 1):
+      pr = {
+        "pass_nr": i,
+        "date_started": 1000000.0 + (i - 1) * 100,
+        "date_completed": 1000000.0 + i * 100,
+        "duration": 100.0,
+        "aggregated_report_cid": f"QmAgg{i}",
+        "worker_reports": {
+          "worker-A": {"report_cid": f"QmWorker{i}A", "start_port": 1, "end_port": 512, "ports_scanned": 512, "open_ports": [80], "nr_findings": 2},
+        },
+        "risk_score": 25 + i,
+        "risk_breakdown": {"findings_score": 10},
+        "findings": [
+          {"finding_id": f"f{i}a", "severity": "HIGH", "confidence": "firm", "title": f"Finding {i}A"},
+          {"finding_id": f"f{i}b", "severity": "MEDIUM", "confidence": "firm", "title": f"Finding {i}B"},
+        ],
+        "quick_summary": f"Summary for pass {i}",
+      }
+      pass_reports_data.append(pr)
+      pass_report_refs.append({"pass_nr": i, "report_cid": f"QmPassReport{i}", "risk_score": 25 + i})
+
+    # Job config
+    job_config = {
+      "target": "example.com", "start_port": 1, "end_port": 1024,
+      "run_mode": run_mode, "enabled_features": [],
+    }
+
+    # Latest aggregated data
+    latest_aggregated = {
+      "open_ports": [80, 443], "service_info": {"80": {"_service_info_http": {}}},
+      "web_tests_info": {}, "completed_tests": ["port_scan"], "ports_scanned": 1024,
+    }
+
+    # R1FS get_json: return the right data for each CID
+    cid_map = {"QmConfigCID": job_config}
+    for i, pr in enumerate(pass_reports_data):
+      cid_map[f"QmPassReport{i+1}"] = pr
+      cid_map[f"QmAgg{i+1}"] = latest_aggregated
+
+    if r1fs_write_fail:
+      plugin.r1fs.add_json.return_value = None
+    else:
+      archive_cid = "QmArchiveCID"
+      plugin.r1fs.add_json.return_value = archive_cid
+      if r1fs_verify_fail:
+        # add_json succeeds but get_json for the archive CID returns None
+        orig_map = dict(cid_map)
+        def verify_fail_get(cid):
+          if cid == archive_cid:
+            return None
+          return orig_map.get(cid)
+        plugin.r1fs.get_json.side_effect = verify_fail_get
+      else:
+        # Verification succeeds — archive CID also returns data
+        cid_map[archive_cid] = {"job_id": job_id}  # minimal archive for verification
+        plugin.r1fs.get_json.side_effect = lambda cid: cid_map.get(cid)
+
+    if not r1fs_write_fail and not r1fs_verify_fail:
+      plugin.r1fs.get_json.side_effect = lambda cid: cid_map.get(cid)
+
+    # Job specs (running state)
+    job_specs = {
+      "job_id": job_id,
+      "job_status": job_status,
+      "job_pass": pass_count,
+      "run_mode": run_mode,
+      "launcher": "launcher-node",
+      "launcher_alias": "launcher-alias",
+      "target": "example.com",
+      "task_name": "Test",
+      "start_port": 1,
+      "end_port": 1024,
+      "date_created": 1000000.0,
+      "risk_score": 25 + pass_count,
+      "job_config_cid": "QmConfigCID",
+      "workers": {
+        "worker-A": {"start_port": 1, "end_port": 512, "finished": True, "report_cid": "QmReportA"},
+      },
+      "timeline": [
+        {"type": "created", "label": "Created", "date": 1000000.0, "actor": "launcher-alias", "actor_type": "system", "meta": {}},
+      ],
+      "pass_reports": pass_report_refs,
+    }
+
+    plugin.chainstore_hset = MagicMock()
+
+    # Bind real methods for archive building
+    Plugin = self._get_plugin_class()
+    plugin._compute_ui_aggregate = lambda passes, agg: Plugin._compute_ui_aggregate(plugin, passes, agg)
+    plugin._count_services = lambda si: Plugin._count_services(plugin, si)
+    plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
+    plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
+
+    return plugin, job_specs, pass_reports_data, job_config
+
+  def test_archive_written_to_r1fs(self):
+    """Archive stored in R1FS with job_id, job_config, passes, ui_aggregate."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, job_config = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    # r1fs.add_json called with archive dict
+    self.assertTrue(plugin.r1fs.add_json.called)
+    archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    self.assertEqual(archive_dict["job_id"], "test-job")
+    self.assertEqual(archive_dict["job_config"]["target"], "example.com")
+    self.assertEqual(len(archive_dict["passes"]), 1)
+    self.assertIn("ui_aggregate", archive_dict)
+    self.assertIn("total_open_ports", archive_dict["ui_aggregate"])
+
+  def test_archive_duration_computed(self):
+    """duration == date_completed - date_created, not 0."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    # date_created=1000000, time()=1000200 → duration=200
+    self.assertEqual(archive_dict["duration"], 200.0)
+    self.assertGreater(archive_dict["duration"], 0)
+
+  def test_stub_has_job_cid_and_config_cid(self):
+    """After prune, CStore stub has job_cid and job_config_cid."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    # Extract the stub written to CStore
+    hset_call = plugin.chainstore_hset.call_args
+    stub = hset_call[1]["value"]
+    self.assertEqual(stub["job_cid"], "QmArchiveCID")
+    self.assertEqual(stub["job_config_cid"], "QmConfigCID")
+
+  def test_stub_fields_match_model(self):
+    """Stub has exactly CStoreJobFinalized fields."""
+    from extensions.business.cybersec.red_mesh.models import CStoreJobFinalized
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    stub = plugin.chainstore_hset.call_args[1]["value"]
+    # Verify it can be loaded into CStoreJobFinalized
+    finalized = CStoreJobFinalized.from_dict(stub)
+    self.assertEqual(finalized.job_id, "test-job")
+    self.assertEqual(finalized.job_status, "FINALIZED")
+    self.assertEqual(finalized.target, "example.com")
+    self.assertEqual(finalized.pass_count, 1)
+    self.assertEqual(finalized.worker_count, 1)
+    self.assertEqual(finalized.start_port, 1)
+    self.assertEqual(finalized.end_port, 1024)
+    self.assertGreater(finalized.duration, 0)
+
+  def test_pass_report_cids_cleaned_up(self):
+    """After archive, individual pass CIDs deleted from R1FS."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    # Check delete_file was called for pass report CID
+    delete_calls = [c[0][0] for c in plugin.r1fs.delete_file.call_args_list]
+    self.assertIn("QmPassReport1", delete_calls)
+
+  def test_node_report_cids_preserved(self):
+    """Worker report CIDs NOT deleted."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    delete_calls = [c[0][0] for c in plugin.r1fs.delete_file.call_args_list]
+    self.assertNotIn("QmWorker1A", delete_calls)
+
+  def test_aggregated_report_cids_preserved(self):
+    """aggregated_report_cid per pass NOT deleted."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    delete_calls = [c[0][0] for c in plugin.r1fs.delete_file.call_args_list]
+    self.assertNotIn("QmAgg1", delete_calls)
+
+  def test_archive_write_failure_no_prune(self):
+    """R1FS write fails -> CStore untouched, full running state retained."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin(r1fs_write_fail=True)
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    # CStore should NOT have been pruned
+    plugin.chainstore_hset.assert_not_called()
+    # pass_reports still present in job_specs
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+
+  def test_archive_verify_failure_no_prune(self):
+    """CID not retrievable -> CStore untouched."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin(r1fs_verify_fail=True)
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    plugin.chainstore_hset.assert_not_called()
+
+  def test_stuck_recovery(self):
+    """FINALIZED without job_cid -> _build_job_archive retried via _maybe_finalize_pass."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin(job_status="FINALIZED")
+    # Simulate stuck state: FINALIZED but no job_cid
+    job_specs["job_status"] = "FINALIZED"
+    # No job_cid in specs
+
+    plugin.chainstore_hgetall.return_value = {"test-job": job_specs}
+    plugin._normalize_job_record = MagicMock(return_value=("test-job", job_specs))
+    plugin._build_job_archive = MagicMock()
+
+    Plugin._maybe_finalize_pass(plugin)
+
+    plugin._build_job_archive.assert_called_once_with("test-job", job_specs)
+
+  def test_idempotent_rebuild(self):
+    """Calling _build_job_archive twice doesn't corrupt state."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+    first_stub = plugin.chainstore_hset.call_args[1]["value"]
+
+    # Reset and call again (simulating a retry where data is still available)
+    plugin.chainstore_hset.reset_mock()
+    plugin.r1fs.add_json.reset_mock()
+    new_archive_cid = "QmArchiveCID2"
+    plugin.r1fs.add_json.return_value = new_archive_cid
+
+    # Update get_json to also return data for the new archive CID
+    orig_side_effect = plugin.r1fs.get_json.side_effect
+    def extended_get(cid):
+      if cid == new_archive_cid:
+        return {"job_id": "test-job"}
+      return orig_side_effect(cid)
+    plugin.r1fs.get_json.side_effect = extended_get
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    second_stub = plugin.chainstore_hset.call_args[1]["value"]
+    # Both produce valid stubs
+    self.assertEqual(first_stub["job_id"], second_stub["job_id"])
+    self.assertEqual(first_stub["pass_count"], second_stub["pass_count"])
+
+  def test_multipass_archive(self):
+    """Archive with 3 passes contains all pass data."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin(pass_count=3, run_mode="CONTINUOUS_MONITORING", job_status="STOPPED")
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    self.assertEqual(len(archive_dict["passes"]), 3)
+    self.assertEqual(archive_dict["passes"][0]["pass_nr"], 1)
+    self.assertEqual(archive_dict["passes"][2]["pass_nr"], 3)
+    stub = plugin.chainstore_hset.call_args[1]["value"]
+    self.assertEqual(stub["pass_count"], 3)
+    self.assertEqual(stub["job_status"], "STOPPED")
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -3043,4 +3514,6 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestScannerEnhancements))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase1ConfigCID))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase2PassFinalization))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase4UiAggregate))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase3Archive))
   runner.run(suite)
