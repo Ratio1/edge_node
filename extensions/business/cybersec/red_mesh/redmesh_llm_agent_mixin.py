@@ -301,9 +301,9 @@ class _RedMeshLlmAgentMixin(object):
     try:
       analysis_cid = self.r1fs.add_json(llm_analysis, show_logs=False)
       if analysis_cid:
-        # Always store in pass_history for consistency (both SINGLEPASS and CONTINUOUS)
-        pass_history = job_specs.get("pass_history", [])
-        for entry in pass_history:
+        # Always store in pass_reports for consistency (both SINGLEPASS and CONTINUOUS)
+        pass_reports = job_specs.get("pass_reports", [])
+        for entry in pass_reports:
           if entry.get("pass_nr") == pass_nr:
             entry["llm_analysis_cid"] = analysis_cid
             break
@@ -396,9 +396,9 @@ class _RedMeshLlmAgentMixin(object):
     try:
       summary_cid = self.r1fs.add_json(analysis_result, show_logs=False)
       if summary_cid:
-        # Store in pass_history
-        pass_history = job_specs.get("pass_history", [])
-        for entry in pass_history:
+        # Store in pass_reports
+        pass_reports = job_specs.get("pass_reports", [])
+        for entry in pass_reports:
           if entry.get("pass_nr") == pass_nr:
             entry["quick_summary_cid"] = summary_cid
             break
