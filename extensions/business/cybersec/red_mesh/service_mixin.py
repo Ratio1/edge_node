@@ -1354,6 +1354,12 @@ class _ServiceInfoMixin:
         result["ssh_version"] = ssh_version
         findings += check_cves(ssh_lib, ssh_version)
 
+        # --- 7. libssh auth bypass (CVE-2018-10933) ---
+        if ssh_lib == "libssh":
+          bypass = self._ssh_check_libssh_bypass(target, port)
+          if bypass:
+            findings.append(bypass)
+
     return probe_result(raw_data=result, findings=findings)
 
   # Patterns: (regex, product_name_for_cve_db)
@@ -1486,6 +1492,47 @@ class _ServiceInfoMixin:
       self.P(f"SSH cipher audit failed on {target}:{port}: {e}", color='y')
 
     return findings, weak_labels
+
+  def _ssh_check_libssh_bypass(self, target, port):
+    """Test CVE-2018-10933: libssh auth bypass via premature USERAUTH_SUCCESS.
+
+    Affected versions: libssh 0.6.0–0.8.3 (fixed in 0.7.6 / 0.8.4).
+    The vulnerability allows a client to send SSH2_MSG_USERAUTH_SUCCESS (52)
+    instead of a proper auth request, and the server accepts it.
+
+    Returns
+    -------
+    Finding or None
+    """
+    try:
+      transport = paramiko.Transport((target, port))
+      transport.connect()
+      # SSH2_MSG_USERAUTH_SUCCESS = 52 (0x34)
+      msg = paramiko.Message()
+      msg.add_byte(b'\x34')
+      transport._send_message(msg)
+      try:
+        chan = transport.open_session(timeout=3)
+        if chan is not None:
+          chan.close()
+          transport.close()
+          return Finding(
+            severity=Severity.CRITICAL,
+            title="libssh auth bypass (CVE-2018-10933)",
+            description="Server accepted SSH2_MSG_USERAUTH_SUCCESS from client, "
+                        "bypassing authentication entirely. Full shell access possible.",
+            evidence="Session channel opened after sending USERAUTH_SUCCESS.",
+            remediation="Upgrade libssh to >= 0.8.4 or >= 0.7.6.",
+            owasp_id="A07:2021",
+            cwe_id="CWE-287",
+            confidence="certain",
+          )
+      except Exception:
+        pass
+      transport.close()
+    except Exception as e:
+      self.P(f"libssh bypass check failed on {target}:{port}: {e}", color='y')
+    return None
 
   def _service_info_smtp(self, target, port):  # default port: 25
     """
@@ -4203,7 +4250,7 @@ class _ServiceInfoMixin:
     return findings
 
   def _es_check_nodes(self, base_url, raw):
-    """GET /_nodes — extract transport/publish addresses (IP leak)."""
+    """GET /_nodes — extract transport/publish addresses, classify IPs, check JVM."""
     findings = []
     try:
       resp = requests.get(f"{base_url}/_nodes", timeout=3)
@@ -4214,7 +4261,6 @@ class _ServiceInfoMixin:
         for node in nodes.values():
           for key in ("transport_address", "publish_address", "host"):
             val = node.get(key) or ""
-            # Extract IP from "1.2.3.4:9300" style
             ip = val.rsplit(":", 1)[0] if ":" in val else val
             if ip and ip not in ("127.0.0.1", "localhost", "0.0.0.0"):
               ips.add(ip)
@@ -4226,20 +4272,74 @@ class _ServiceInfoMixin:
                 v = net.get(k)
                 if v and v not in ("127.0.0.1", "localhost", "0.0.0.0"):
                   ips.add(v)
+
         if ips:
+          import ipaddress as _ipaddress
           raw["node_ips"] = list(ips)
+          public_ips, private_ips = [], []
           for ip_str in ips:
-            self._emit_metadata("internal_ips", {"ip": ip_str, "source": f"es_nodes:{port}"})
-          findings.append(Finding(
-            severity=Severity.MEDIUM,
-            title=f"Elasticsearch node IPs disclosed ({len(ips)})",
-            description=f"Node API exposes internal IPs: {', '.join(sorted(ips)[:5])}",
-            evidence=f"IPs: {', '.join(sorted(ips)[:10])}",
-            remediation="Restrict /_nodes endpoint access.",
-            owasp_id="A01:2021",
-            cwe_id="CWE-200",
-            confidence="certain",
-          ))
+            try:
+              is_priv = _ipaddress.ip_address(ip_str).is_private
+            except (ValueError, TypeError):
+              is_priv = True  # assume private on parse failure
+            if is_priv:
+              private_ips.append(ip_str)
+            else:
+              public_ips.append(ip_str)
+            self._emit_metadata("internal_ips", {"ip": ip_str, "source": "es_nodes"})
+
+          if public_ips:
+            findings.append(Finding(
+              severity=Severity.CRITICAL,
+              title=f"Elasticsearch leaks real public IP: {', '.join(sorted(public_ips)[:3])}",
+              description="The _nodes endpoint exposes public IP addresses, potentially revealing "
+                          "the real infrastructure behind NAT/VPN/honeypot.",
+              evidence=f"Public IPs: {', '.join(sorted(public_ips))}",
+              remediation="Restrict /_nodes endpoint; configure network.publish_host to a safe value.",
+              owasp_id="A01:2021",
+              cwe_id="CWE-200",
+              confidence="certain",
+            ))
+          if private_ips:
+            findings.append(Finding(
+              severity=Severity.MEDIUM,
+              title=f"Elasticsearch node internal IPs disclosed ({len(private_ips)})",
+              description=f"Node API exposes internal IPs: {', '.join(sorted(private_ips)[:5])}",
+              evidence=f"IPs: {', '.join(sorted(private_ips)[:10])}",
+              remediation="Restrict /_nodes endpoint access.",
+              owasp_id="A01:2021",
+              cwe_id="CWE-200",
+              confidence="certain",
+            ))
+
+        # --- JVM version extraction ---
+        for node in nodes.values():
+          jvm = node.get("jvm", {})
+          if isinstance(jvm, dict):
+            jvm_version = jvm.get("version")
+            if jvm_version:
+              raw["jvm_version"] = jvm_version
+              try:
+                if jvm_version.startswith("1."):
+                  # Java 1.x format: 1.7.0_55 → major=7, 1.8.0_345 → major=8
+                  major = int(jvm_version.split(".")[1])
+                else:
+                  # Modern format: 17.0.5 → major=17
+                  major = int(str(jvm_version).split(".")[0])
+                if major <= 8:
+                  findings.append(Finding(
+                    severity=Severity.MEDIUM,
+                    title=f"Elasticsearch running on EOL JVM: Java {jvm_version}",
+                    description=f"Java {jvm_version} is end-of-life and no longer receives security patches.",
+                    evidence=f"jvm.version={jvm_version}",
+                    remediation="Upgrade to a supported Java LTS release (17+).",
+                    owasp_id="A06:2021",
+                    cwe_id="CWE-1104",
+                    confidence="certain",
+                  ))
+              except (ValueError, IndexError):
+                pass
+              break  # one node is enough
     except Exception:
       pass
     return findings
@@ -4435,22 +4535,25 @@ class _ServiceInfoMixin:
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
       sock.settimeout(2)
       sock.connect((target, port))
-      data = sock.recv(256).decode('utf-8', errors='ignore')
-      if data:
-        banner = ''.join(ch if 32 <= ord(ch) < 127 else '.' for ch in data)
-        readable = banner.strip().replace('.', '')
-        if not readable:
-          # Pure binary data with no printable content — nothing useful.
-          sock.close()
-          return None
-        raw["banner"] = banner.strip()
-      else:
-        sock.close()
-        return None  # No banner — nothing useful to report
+      raw_bytes = sock.recv(512)
       sock.close()
+      if not raw_bytes:
+        return None
     except Exception as e:
       return probe_error(target, port, "generic", e)
 
+    # --- Protocol fingerprinting: detect known services on non-standard ports ---
+    reclassified = self._generic_fingerprint_protocol(raw_bytes, target, port)
+    if reclassified is not None:
+      return reclassified
+
+    # --- Standard banner analysis for truly unknown services ---
+    data = raw_bytes.decode('utf-8', errors='ignore')
+    banner = ''.join(ch if 32 <= ord(ch) < 127 else '.' for ch in data)
+    readable = banner.strip().replace('.', '')
+    if not readable:
+      return None
+    raw["banner"] = banner.strip()
     banner_text = raw["banner"]
 
     # --- 1. Version extraction + CVE check ---
@@ -4474,3 +4577,79 @@ class _ServiceInfoMixin:
         break  # First match wins
 
     return probe_result(raw_data=raw, findings=findings)
+
+  # Protocol signatures for reclassifying services on non-standard ports.
+  # Each entry: (check_function, protocol_name, probe_method_name)
+  # Check functions receive raw bytes and return True if matched.
+  @staticmethod
+  def _is_redis_banner(data):
+    """Redis RESP: starts with +, -, :, $, or * (protocol type bytes)."""
+    return len(data) > 0 and data[0:1] in (b'+', b'-', b'$', b'*', b':')
+
+  @staticmethod
+  def _is_ftp_banner(data):
+    """FTP: 220 greeting."""
+    return data[:4] in (b'220 ', b'220-')
+
+  @staticmethod
+  def _is_smtp_banner(data):
+    """SMTP: 220 greeting with SMTP/ESMTP keyword."""
+    text = data[:200].decode('utf-8', errors='ignore').upper()
+    return text.startswith('220') and ('SMTP' in text or 'ESMTP' in text)
+
+  @staticmethod
+  def _is_mysql_handshake(data):
+    """MySQL: 3-byte length + seq + protocol version 0x0a."""
+    if len(data) > 4:
+      payload = data[4:]
+      return payload[0:1] == b'\x0a'
+    return False
+
+  @staticmethod
+  def _is_rsync_banner(data):
+    """Rsync: @RSYNCD: version."""
+    return data.startswith(b'@RSYNCD:')
+
+  @staticmethod
+  def _is_telnet_banner(data):
+    """Telnet: IAC (0xFF) followed by WILL/WONT/DO/DONT."""
+    return len(data) >= 2 and data[0] == 0xFF and data[1] in (0xFB, 0xFC, 0xFD, 0xFE)
+
+  _PROTOCOL_SIGNATURES = None  # lazy init to avoid forward reference issues
+
+  def _generic_fingerprint_protocol(self, raw_bytes, target, port):
+    """Try to identify the protocol from raw banner bytes.
+
+    If a known protocol is detected, reclassifies the port and runs the
+    appropriate specialized probe directly.
+
+    Returns
+    -------
+    dict or None
+        Probe result from the specialized probe, or None if no match.
+    """
+    signatures = [
+      (self._is_redis_banner, "redis", "_service_info_redis"),
+      (self._is_ftp_banner, "ftp", "_service_info_ftp"),
+      (self._is_smtp_banner, "smtp", "_service_info_smtp"),
+      (self._is_mysql_handshake, "mysql", "_service_info_mysql"),
+      (self._is_rsync_banner, "rsync", "_service_info_rsync"),
+      (self._is_telnet_banner, "telnet", "_service_info_telnet"),
+    ]
+
+    for check_fn, proto, method_name in signatures:
+      try:
+        if check_fn(raw_bytes):
+          # Reclassify port protocol for future reference
+          port_protocols = self.state.get("port_protocols", {})
+          old_proto = port_protocols.get(port, "unknown")
+          port_protocols[port] = proto
+          self.P(f"Protocol reclassified: port {port} {old_proto} → {proto} (banner fingerprint)")
+
+          # Run the specialized probe directly
+          probe_fn = getattr(self, method_name, None)
+          if probe_fn:
+            return probe_fn(target, port)
+      except Exception:
+        continue
+    return None

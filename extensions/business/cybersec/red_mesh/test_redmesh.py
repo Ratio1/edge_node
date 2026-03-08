@@ -4613,6 +4613,164 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     self.assertTrue(sm["blocking_detected"])
 
 
+class TestPhase17aQuickWins(unittest.TestCase):
+  """Phase 17a: Quick Win probe enhancements."""
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [22]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-17a",
+      initiator="init@example",
+      local_id_prefix="Q",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  # ---- 17a-1: libssh auth bypass ----
+
+  def test_ssh_libssh_detected_in_banner(self):
+    """_ssh_identify_library detects libssh from banner."""
+    _, worker = self._build_worker()
+    lib, ver = worker._ssh_identify_library("SSH-2.0-libssh-0.8.1")
+    self.assertEqual(lib, "libssh")
+    self.assertEqual(ver, "0.8.1")
+
+  def test_ssh_libssh_bypass_returns_none_on_failure(self):
+    """_ssh_check_libssh_bypass returns None when connection fails."""
+    _, worker = self._build_worker()
+    result = worker._ssh_check_libssh_bypass("192.0.2.1", 99999)
+    self.assertIsNone(result)
+
+  def test_ssh_libssh_cves_in_db(self):
+    """CVE-2018-10933 is present in CVE database for libssh."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("libssh", "0.8.1")
+    self.assertTrue(len(findings) >= 1)
+    titles = [f.title for f in findings]
+    self.assertTrue(any("CVE-2018-10933" in t for t in titles))
+
+  # ---- 17a-2: Protocol fingerprinting ----
+
+  def test_generic_fingerprint_redis(self):
+    """Redis RESP banner is recognized."""
+    _, worker = self._build_worker()
+    self.assertTrue(worker._is_redis_banner(b"+PONG\r\n"))
+    self.assertTrue(worker._is_redis_banner(b"-ERR unknown command\r\n"))
+    self.assertTrue(worker._is_redis_banner(b"$11\r\nHello World\r\n"))
+    self.assertFalse(worker._is_redis_banner(b"HTTP/1.1 200 OK\r\n"))
+
+  def test_generic_fingerprint_ftp(self):
+    """FTP 220 banner is recognized."""
+    _, worker = self._build_worker()
+    self.assertTrue(worker._is_ftp_banner(b"220 Welcome to FTP\r\n"))
+    self.assertTrue(worker._is_ftp_banner(b"220-ProFTPD 1.3.5\r\n"))
+    self.assertFalse(worker._is_ftp_banner(b"SSH-2.0-OpenSSH\r\n"))
+
+  def test_generic_fingerprint_mysql(self):
+    """MySQL handshake packet is recognized."""
+    _, worker = self._build_worker()
+    # MySQL v10 handshake: 3-byte length + 1-byte seq + 0x0a + version string
+    handshake = b'\x4a\x00\x00\x00\x0a5.5.23\x00' + b'\x00' * 40
+    self.assertTrue(worker._is_mysql_handshake(handshake))
+    self.assertFalse(worker._is_mysql_handshake(b"HTTP/1.1 200 OK"))
+
+  def test_generic_fingerprint_smtp(self):
+    """SMTP banner is recognized."""
+    _, worker = self._build_worker()
+    self.assertTrue(worker._is_smtp_banner(b"220 mail.example.com ESMTP Postfix\r\n"))
+    self.assertFalse(worker._is_smtp_banner(b"220 ProFTPD 1.3\r\n"))
+
+  def test_generic_fingerprint_rsync(self):
+    """Rsync banner is recognized."""
+    _, worker = self._build_worker()
+    self.assertTrue(worker._is_rsync_banner(b"@RSYNCD: 31.0\n"))
+    self.assertFalse(worker._is_rsync_banner(b"+OK Dovecot ready\r\n"))
+
+  def test_generic_fingerprint_telnet(self):
+    """Telnet IAC sequence is recognized."""
+    _, worker = self._build_worker()
+    self.assertTrue(worker._is_telnet_banner(b"\xFF\xFB\x01\xFF\xFB\x03"))
+    self.assertFalse(worker._is_telnet_banner(b"HTTP/1.0 200"))
+
+  def test_generic_reclassifies_port_protocol(self):
+    """When a protocol is fingerprinted, port_protocols is updated."""
+    _, worker = self._build_worker(ports=[993])
+    worker.state["port_protocols"] = {993: "unknown"}
+    # Simulate Redis banner on port 993
+    redis_banner = b"+PONG\r\n"
+    # Mock the Redis probe to avoid real connection
+    mock_result = {"findings": [], "vulnerabilities": []}
+    with patch.object(worker, '_service_info_redis', return_value=mock_result):
+      result = worker._generic_fingerprint_protocol(redis_banner, "10.0.0.1", 993)
+    self.assertEqual(worker.state["port_protocols"][993], "redis")
+    self.assertIsNotNone(result)
+
+  # ---- 17a-5: ES IP classification + JVM ----
+
+  def test_es_nodes_public_ip_critical(self):
+    """Public IP from _nodes endpoint is flagged CRITICAL."""
+    _, worker = self._build_worker(ports=[9200])
+    worker.state["scan_metadata"] = {"internal_ips": []}
+    raw = {}
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {
+      "nodes": {
+        "n1": {
+          "host": "34.51.200.39",
+          "jvm": {"version": "1.7.0_55"},
+        }
+      }
+    }
+    with patch('requests.get', return_value=mock_resp):
+      findings = worker._es_check_nodes("http://10.0.0.1:9200", raw)
+    titles = [f.title for f in findings]
+    severities = [f.severity for f in findings]
+    # Public IP should be CRITICAL
+    self.assertTrue(any("public ip" in t.lower() for t in titles), f"Expected public IP finding, got: {titles}")
+    self.assertIn("CRITICAL", severities)
+    # JVM EOL
+    self.assertTrue(any("eol jvm" in t.lower() for t in titles), f"Expected EOL JVM finding, got: {titles}")
+    self.assertEqual(raw.get("jvm_version"), "1.7.0_55")
+
+  def test_es_nodes_private_ip_medium(self):
+    """Private IP from _nodes endpoint is flagged MEDIUM (not CRITICAL)."""
+    _, worker = self._build_worker(ports=[9200])
+    worker.state["scan_metadata"] = {"internal_ips": []}
+    raw = {}
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {
+      "nodes": {"n1": {"host": "192.168.1.100"}}
+    }
+    with patch('requests.get', return_value=mock_resp):
+      findings = worker._es_check_nodes("http://10.0.0.1:9200", raw)
+    severities = [f.severity for f in findings]
+    self.assertIn("MEDIUM", severities)
+    self.assertNotIn("CRITICAL", severities)
+
+  def test_es_nodes_jvm_modern_no_finding(self):
+    """Modern JVM (Java 17+) should not produce an EOL finding."""
+    _, worker = self._build_worker(ports=[9200])
+    worker.state["scan_metadata"] = {"internal_ips": []}
+    raw = {}
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.json.return_value = {
+      "nodes": {"n1": {"host": "10.0.0.5", "jvm": {"version": "17.0.5"}}}
+    }
+    with patch('requests.get', return_value=mock_resp):
+      findings = worker._es_check_nodes("http://10.0.0.1:9200", raw)
+    titles = [f.title for f in findings]
+    self.assertFalse(any("EOL JVM" in t for t in titles))
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -4635,4 +4793,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase14Purge))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase15Listing))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase16ScanMetrics))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17aQuickWins))
   runner.run(suite)
