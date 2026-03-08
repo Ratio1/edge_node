@@ -4081,6 +4081,123 @@ class TestPhase14Purge(unittest.TestCase):
     self.assertEqual(result, purge_result)
 
 
+class TestPhase15Listing(unittest.TestCase):
+  """Phase 15: Listing Endpoint Optimization."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return
+    TestPhase1ConfigCID._mock_plugin_modules()
+
+  def _get_plugin_class(self):
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def test_list_finalized_returns_stub_fields(self):
+    """Finalized jobs return exact CStoreJobFinalized fields."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+
+    finalized_stub = {
+      "job_id": "job-1",
+      "job_status": "FINALIZED",
+      "target": "10.0.0.1",
+      "task_name": "scan-1",
+      "risk_score": 75,
+      "run_mode": "SINGLEPASS",
+      "duration": 120.5,
+      "pass_count": 1,
+      "launcher": "0xLauncher",
+      "launcher_alias": "node1",
+      "worker_count": 2,
+      "start_port": 1,
+      "end_port": 1024,
+      "date_created": 1700000000.0,
+      "date_completed": 1700000120.0,
+      "job_cid": "QmArchive123",
+      "job_config_cid": "QmConfig456",
+    }
+    plugin.chainstore_hgetall.return_value = {"job-1": finalized_stub}
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", finalized_stub))
+
+    result = Plugin.list_network_jobs(plugin)
+    self.assertIn("job-1", result)
+    entry = result["job-1"]
+
+    # All CStoreJobFinalized fields present
+    self.assertEqual(entry["job_id"], "job-1")
+    self.assertEqual(entry["job_status"], "FINALIZED")
+    self.assertEqual(entry["job_cid"], "QmArchive123")
+    self.assertEqual(entry["job_config_cid"], "QmConfig456")
+    self.assertEqual(entry["target"], "10.0.0.1")
+    self.assertEqual(entry["risk_score"], 75)
+    self.assertEqual(entry["duration"], 120.5)
+    self.assertEqual(entry["pass_count"], 1)
+    self.assertEqual(entry["worker_count"], 2)
+
+  def test_list_running_stripped(self):
+    """Running jobs have listing fields but no heavy data."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+
+    running_spec = {
+      "job_id": "job-2",
+      "job_status": "RUNNING",
+      "target": "10.0.0.2",
+      "task_name": "scan-2",
+      "risk_score": 0,
+      "run_mode": "CONTINUOUS_MONITORING",
+      "start_port": 1,
+      "end_port": 65535,
+      "date_created": 1700000000.0,
+      "launcher": "0xLauncher",
+      "launcher_alias": "node1",
+      "job_pass": 3,
+      "job_config_cid": "QmConfig789",
+      "workers": {
+        "addr-A": {"start_port": 1, "end_port": 32767, "finished": False, "report_cid": "QmBigReport1"},
+        "addr-B": {"start_port": 32768, "end_port": 65535, "finished": False, "report_cid": "QmBigReport2"},
+      },
+      "timeline": [
+        {"event": "created", "ts": 1700000000.0},
+        {"event": "started", "ts": 1700000001.0},
+      ],
+      "pass_reports": [
+        {"pass_nr": 1, "report_cid": "QmPass1"},
+        {"pass_nr": 2, "report_cid": "QmPass2"},
+      ],
+      "redmesh_job_start_attestation": {"big": "blob"},
+    }
+    plugin.chainstore_hgetall.return_value = {"job-2": running_spec}
+    plugin._normalize_job_record = MagicMock(return_value=("job-2", running_spec))
+
+    result = Plugin.list_network_jobs(plugin)
+    self.assertIn("job-2", result)
+    entry = result["job-2"]
+
+    # Listing essentials present
+    self.assertEqual(entry["job_id"], "job-2")
+    self.assertEqual(entry["job_status"], "RUNNING")
+    self.assertEqual(entry["target"], "10.0.0.2")
+    self.assertEqual(entry["task_name"], "scan-2")
+    self.assertEqual(entry["run_mode"], "CONTINUOUS_MONITORING")
+    self.assertEqual(entry["job_pass"], 3)
+    self.assertEqual(entry["worker_count"], 2)
+    self.assertEqual(entry["pass_count"], 2)
+
+    # Heavy fields stripped
+    self.assertNotIn("workers", entry)
+    self.assertNotIn("timeline", entry)
+    self.assertNotIn("pass_reports", entry)
+    self.assertNotIn("redmesh_job_start_attestation", entry)
+    self.assertNotIn("job_config_cid", entry)
+    self.assertNotIn("report_cid", entry)
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -4101,4 +4218,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase5Endpoints))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase12LiveProgress))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase14Purge))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase15Listing))
   runner.run(suite)
