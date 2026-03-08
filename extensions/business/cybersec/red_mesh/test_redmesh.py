@@ -6255,9 +6255,9 @@ class TestBatch3GapFixes(unittest.TestCase):
       resp.ok = True
       resp.status_code = 200
       decoded = unquote(url)
-      # Evaluate {{7*7}} → 49, but don't echo the raw template back
-      if "name=" in decoded and "{{7*7}}" in decoded:
-        resp.text = '<html>Hello 49!</html>'
+      # Evaluate {{71*73}} → 5183, but don't echo the raw template back
+      if "name=" in decoded and "{{71*73}}" in decoded:
+        resp.text = '<html>Hello 5183!</html>'
       elif "name=" in decoded and "{{7*'7'}}" in decoded:
         resp.text = '<html>Hello 7777777!</html>'
       else:
@@ -6283,8 +6283,8 @@ class TestBatch3GapFixes(unittest.TestCase):
       resp.status_code = 200
       decoded = unquote(url)
       # Echo back the raw payload — this is XSS not SSTI
-      if "name=" in decoded and "{{7*7}}" in decoded:
-        resp.text = '<html>Hello {{7*7}}!</html>'
+      if "name=" in decoded and "{{71*73}}" in decoded:
+        resp.text = '<html>Hello {{71*73}}!</html>'
       elif "name=" in decoded and "{{7*'7'}}" in decoded:
         resp.text = "<html>Hello {{7*'7'}}!</html>"
       else:
@@ -6499,15 +6499,15 @@ class TestBatch3GapFixes(unittest.TestCase):
       resp = MagicMock()
       resp.ok = True
       resp.status_code = 200
-      # Every response contains "49" naturally (e.g. page content)
-      resp.text = '<html><p>Contact: +1-234-567-8949</p></html>'
+      # Every response contains "5183" naturally (e.g. page content)
+      resp.text = '<html><p>Order #5183 confirmed</p></html>'
       return resp
 
     with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
       result = worker._web_test_ssti("1.2.3.4", 4300)
 
     findings = result.get("findings", [])
-    self.assertEqual(len(findings), 0, f"Should NOT fire when '49' already in baseline. Got: {[f['title'] for f in findings]}")
+    self.assertEqual(len(findings), 0, f"Should NOT fire when '5183' already in baseline. Got: {[f['title'] for f in findings]}")
 
   # ── Shellshock via document root CGI paths ───────────────────────
 
@@ -6558,6 +6558,564 @@ class TestBatch3GapFixes(unittest.TestCase):
     self.assertEqual(result.get("server"), "Apache/2.4.25 (Debian)")
 
 
+class TestBatch4JavaGapFixes(unittest.TestCase):
+  """Tests for batch 4: Java application servers, Struts2, WebLogic, Spring."""
+
+  def setUp(self):
+    if MANUAL_RUN:
+      print()
+      color_print(f"[MANUAL] >>> Starting <{self._testMethodName}>", color='b')
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [80]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-batch4",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  # ── CVE database: Struts2 ─────────────────────────────────────────
+
+  def test_struts2_cve_2017_5638_match(self):
+    """CVE-2017-5638 should match Struts2 2.5.10."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("struts2", "2.5.10")
+    self.assertTrue(any("CVE-2017-5638" in f.title for f in findings))
+
+  def test_struts2_cve_2017_5638_patched(self):
+    """CVE-2017-5638 should NOT match Struts2 2.5.10.1."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("struts2", "2.5.10.1")
+    self.assertFalse(any("CVE-2017-5638" in f.title for f in findings))
+
+  def test_struts2_cve_2017_9805_match(self):
+    """CVE-2017-9805 should match Struts2 2.5.12."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("struts2", "2.5.12")
+    self.assertTrue(any("CVE-2017-9805" in f.title for f in findings))
+
+  def test_struts2_cve_2020_17530_match(self):
+    """CVE-2020-17530 should match Struts2 2.5.25."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("struts2", "2.5.25")
+    self.assertTrue(any("CVE-2020-17530" in f.title for f in findings))
+
+  def test_struts2_cve_2020_17530_patched(self):
+    """CVE-2020-17530 should NOT match Struts2 2.5.26."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("struts2", "2.5.26")
+    self.assertFalse(any("CVE-2020-17530" in f.title for f in findings))
+
+  # ── CVE database: WebLogic ────────────────────────────────────────
+
+  def test_weblogic_cve_2017_10271_match(self):
+    """CVE-2017-10271 should match WebLogic 10.3.6.0."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("weblogic", "10.3.6.0")
+    self.assertTrue(any("CVE-2017-10271" in f.title for f in findings))
+
+  def test_weblogic_cve_2020_14882_match(self):
+    """CVE-2020-14882 should match WebLogic 12.2.1.3."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("weblogic", "12.2.1.3")
+    self.assertTrue(any("CVE-2020-14882" in f.title for f in findings))
+
+  # ── CVE database: Tomcat ──────────────────────────────────────────
+
+  def test_tomcat_cve_2020_1938_match(self):
+    """CVE-2020-1938 Ghostcat should match Tomcat 9.0.30."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("tomcat", "9.0.30")
+    self.assertTrue(any("CVE-2020-1938" in f.title for f in findings))
+
+  def test_tomcat_cve_2020_1938_patched(self):
+    """CVE-2020-1938 should NOT match Tomcat 9.0.31."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("tomcat", "9.0.31")
+    self.assertFalse(any("CVE-2020-1938" in f.title for f in findings))
+
+  # ── CVE database: JBoss ───────────────────────────────────────────
+
+  def test_jboss_cve_2017_12149_match(self):
+    """CVE-2017-12149 should match JBoss 6.0."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("jboss", "6.0")
+    self.assertTrue(any("CVE-2017-12149" in f.title for f in findings))
+
+  def test_jboss_cve_2017_12149_patched(self):
+    """CVE-2017-12149 should NOT match JBoss 7.0."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("jboss", "7.0")
+    self.assertFalse(any("CVE-2017-12149" in f.title for f in findings))
+
+  # ── CVE database: Spring ──────────────────────────────────────────
+
+  def test_spring_cve_2022_22965_match(self):
+    """CVE-2022-22965 Spring4Shell should match Spring Framework 5.3.17."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("spring_framework", "5.3.17")
+    self.assertTrue(any("CVE-2022-22965" in f.title for f in findings))
+
+  def test_spring_cloud_cve_2022_22963_match(self):
+    """CVE-2022-22963 should match Spring Cloud Function 3.2.2."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("spring_cloud_function", "3.2.2")
+    self.assertTrue(any("CVE-2022-22963" in f.title for f in findings))
+
+  def test_spring_cloud_cve_2022_22963_patched(self):
+    """CVE-2022-22963 should NOT match Spring Cloud Function 3.2.3."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("spring_cloud_function", "3.2.3")
+    self.assertFalse(any("CVE-2022-22963" in f.title for f in findings))
+
+  # ── WebLogic detection probe ──────────────────────────────────────
+
+  def test_weblogic_console_detected(self):
+    """Java servers probe should detect WebLogic via console page."""
+    _, worker = self._build_worker(ports=[7102])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {}
+      if "/console/login/LoginForm.jsp" in url:
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '<html>WebLogic Server <span id="footerVersion">10.3.6.0</span></html>'
+      elif "/console/" in url:
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '<html>WebLogic login page</html>'
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_java_servers("1.2.3.4", 7102)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("WebLogic" in t and "10.3.6.0" in t for t in titles), f"Should detect WebLogic 10.3.6.0. Got: {titles}")
+    self.assertTrue(any("CVE-2017-10271" in t for t in titles), f"Should find CVE-2017-10271. Got: {titles}")
+    self.assertTrue(any("console exposed" in t.lower() for t in titles), f"Should flag console exposure. Got: {titles}")
+
+  # ── Tomcat detection probe ────────────────────────────────────────
+
+  def test_tomcat_detected_from_default_page(self):
+    """Java servers probe should detect Tomcat via default page."""
+    _, worker = self._build_worker(ports=[7104])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {}
+      if url.endswith(":7104"):
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '<html><h1>Apache Tomcat/9.0.30</h1></html>'
+        resp.headers = {"Server": "Apache-Coyote/1.1"}
+      elif "/console/login/LoginForm.jsp" in url:
+        pass  # 404
+      elif "/manager/html" in url:
+        resp.status_code = 401
+        resp.text = "Unauthorized"
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_java_servers("1.2.3.4", 7104)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("Tomcat" in t and "9.0.30" in t for t in titles), f"Should detect Tomcat 9.0.30. Got: {titles}")
+    self.assertTrue(any("CVE-2020-1938" in t for t in titles), f"Should find Ghostcat CVE. Got: {titles}")
+
+  # ── JBoss detection probe ─────────────────────────────────────────
+
+  def test_jboss_detected_from_header(self):
+    """Java servers probe should detect JBoss via X-Powered-By header."""
+    _, worker = self._build_worker(ports=[7106])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = "<html>Welcome to JBoss</html>"
+      resp.headers = {"X-Powered-By": "Servlet/3.0; JBossAS-6"}
+      if "/console/login/LoginForm.jsp" in url:
+        resp.ok = False
+        resp.status_code = 404
+        resp.text = ""
+        resp.headers = {}
+      elif "/jmx-console/" in url:
+        resp.status_code = 200
+        resp.text = "<html>JMX Console</html>"
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_java_servers("1.2.3.4", 7106)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("JBoss" in t for t in titles), f"Should detect JBoss. Got: {titles}")
+    self.assertTrue(any("CVE-2017-12149" in t for t in titles), f"Should find JBoss deser CVE. Got: {titles}")
+
+  # ── Spring detection probe ────────────────────────────────────────
+
+  def test_spring_detected_from_whitelabel(self):
+    """Java servers probe should detect Spring via Whitelabel Error Page."""
+    _, worker = self._build_worker(ports=[7108])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = "<html>App home</html>"
+      resp.headers = {}
+      if "/console/login/LoginForm.jsp" in url:
+        resp.ok = False
+        resp.status_code = 404
+        resp.text = ""
+      elif "/nonexistent_" in url:
+        resp.status_code = 404
+        resp.text = '<html><body><h1>Whitelabel Error Page</h1></body></html>'
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_java_servers("1.2.3.4", 7108)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("Spring" in t for t in titles), f"Should detect Spring. Got: {titles}")
+
+  # ── OGNL injection probe ──────────────────────────────────────────
+
+  def test_ognl_injection_s2_045_detected(self):
+    """OGNL probe should detect S2-045 via Content-Type header."""
+    _, worker = self._build_worker(ports=[7100])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = ""
+      headers = kwargs.get("headers", {})
+      ct = headers.get("Content-Type", "")
+      if "167837218" in ct and ("/index.action" in url or url.endswith(":7100/")):
+        resp.text = "167837218"
+      else:
+        resp.text = "<html>Normal page</html>"
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_ognl_injection("1.2.3.4", 7100)
+
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, "Should detect OGNL injection")
+    self.assertEqual(findings[0]["severity"], "CRITICAL")
+    self.assertIn("CVE-2017-5638", findings[0]["title"])
+
+  # ── Java deserialization probe ────────────────────────────────────
+
+  def test_weblogic_wlswsat_detected(self):
+    """Deserialization probe should detect wls-wsat endpoint."""
+    _, worker = self._build_worker(ports=[7102])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {}
+      if "/wls-wsat/CoordinatorPortType" in url:
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '<html>CoordinatorPortType WSDL</html>'
+        resp.headers = {"Content-Type": "text/xml"}
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_java_deserialization("1.2.3.4", 7102)
+
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, "Should detect wls-wsat endpoint")
+    self.assertIn("CVE-2017-10271", findings[0]["title"])
+
+  def test_jboss_invoker_detected(self):
+    """Deserialization probe should detect JBoss /invoker/readonly."""
+    _, worker = self._build_worker(ports=[7106])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {}
+      if "/invoker/readonly" in url:
+        resp.status_code = 500
+        resp.text = "Internal Server Error"
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_java_deserialization("1.2.3.4", 7106)
+
+    findings = result.get("findings", [])
+    self.assertTrue(any("CVE-2017-12149" in f["title"] for f in findings), f"Should detect JBoss invoker. Got: {[f['title'] for f in findings]}")
+
+  # ── Spring Actuator probe ─────────────────────────────────────────
+
+  def test_spring_actuator_env_detected(self):
+    """Spring actuator probe should detect exposed /actuator/env."""
+    _, worker = self._build_worker(ports=[7108])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {"Content-Type": "text/html"}
+      if "/actuator/env" in url:
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '{"propertySources":[{"name":"systemProperties"}]}'
+        resp.headers = {"Content-Type": "application/json"}
+      elif "/actuator/health" in url:
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '{"status":"UP"}'
+        resp.headers = {"Content-Type": "application/json"}
+      elif "/actuator" in url and "/actuator/" not in url:
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '{"_links":{"self":{"href":"/actuator"}}}'
+        resp.headers = {"Content-Type": "application/json"}
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 404
+      resp.text = ""
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_spring_actuator("1.2.3.4", 7108)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("actuator/env" in t.lower() for t in titles), f"Should detect /actuator/env. Got: {titles}")
+
+  def test_spring_cloud_spel_injection_detected(self):
+    """Spring actuator probe should detect CVE-2022-22963 SpEL injection."""
+    _, worker = self._build_worker(ports=[7109])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {"Content-Type": "text/html"}
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 404
+      resp.text = ""
+      if "/functionRouter" in url:
+        headers = kwargs.get("headers", {})
+        if "routing-expression" in str(headers):
+          resp.status_code = 500
+          resp.text = '{"error":"SpelEvaluationException: evaluation failed"}'
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_spring_actuator("1.2.3.4", 7109)
+
+    findings = result.get("findings", [])
+    self.assertTrue(any("CVE-2022-22963" in f["title"] for f in findings), f"Should detect SpEL injection. Got: {[f['title'] for f in findings]}")
+
+  # ── Gap fix: Struts2 detection via /struts/utils.js ─────────────
+
+  def test_struts2_detected_from_utils_js(self):
+    """Struts2 should be detected via /struts/utils.js (REST showcase)."""
+    _, worker = self._build_worker(ports=[7101])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {}
+      if "/console/login/LoginForm.jsp" in url:
+        pass  # 404
+      elif url.endswith(":7101") or url.endswith(":7101/"):
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '<html><body>REST showcase</body></html>'
+        resp.headers = {"Server": "Apache-Coyote/1.1"}
+      elif "/struts/utils.js" in url:
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = 'var StrutsUtils = {}; // Struts2 tag library utilities\n' * 5
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 404
+      resp.text = ""
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_java_servers("1.2.3.4", 7101)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("Struts2" in t for t in titles), f"Should detect Struts2 via utils.js. Got: {titles}")
+
+  # ── Gap fix: Tomcat + Struts2 co-detection (no early return) ────
+
+  def test_tomcat_and_struts2_codetected(self):
+    """Tomcat detection should NOT prevent Struts2 detection."""
+    _, worker = self._build_worker(ports=[7101])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {}
+      if "/console/login/LoginForm.jsp" in url:
+        pass  # 404
+      elif "nonexistent_" in url:
+        resp.text = '<html><h3>Apache Tomcat/8.5.33 - Error report</h3></html>'
+      elif url.endswith(":7101") or url.endswith(":7101/"):
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '<html><body>REST app</body></html>'
+        resp.headers = {"Server": "Apache-Coyote/1.1"}
+      elif "/struts/utils.js" in url:
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = 'var StrutsUtils = {}; // Struts2 utilities\n' * 5
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 404
+      resp.text = ""
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_java_servers("1.2.3.4", 7101)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("Tomcat" in t for t in titles), f"Should detect Tomcat. Got: {titles}")
+    self.assertTrue(any("Struts2" in t for t in titles), f"Should also detect Struts2. Got: {titles}")
+
+  # ── Gap fix: Spring MVC via POST 405 ────────────────────────────
+
+  def test_spring_detected_from_post_405(self):
+    """Spring MVC should be detected via POST → 405 with Spring message."""
+    _, worker = self._build_worker(ports=[7108])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {}
+      if "/console/login/LoginForm.jsp" in url:
+        pass  # 404
+      elif "nonexistent_" in url:
+        resp.text = '<html><h3>Apache Tomcat/8.5.77 - Error report</h3></html>'
+      elif url.endswith(":7108") or url.endswith(":7108/"):
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '<html>Hello, my name is , I am  years old.</html>'
+        resp.headers = {"Server": "Apache-Coyote/1.1"}
+      elif "/struts/utils.js" in url:
+        pass  # 404
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      if url.endswith(":7108") or url.endswith(":7108/"):
+        resp.status_code = 405
+        resp.text = ("<html><body><h1>HTTP Status 405 – Method Not Allowed</h1>"
+                     "<p><b>Message</b> Request method &#39;POST&#39; is not supported</p>"
+                     "</body></html>")
+      else:
+        resp.status_code = 404
+        resp.text = ""
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_java_servers("1.2.3.4", 7108)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("Tomcat" in t for t in titles), f"Should detect Tomcat. Got: {titles}")
+    self.assertTrue(any("Spring" in t for t in titles), f"Should detect Spring MVC via POST 405. Got: {titles}")
+
+  # ── Gap fix: Spring4Shell with 400/500 second check ─────────────
+
+  def test_spring4shell_detected_with_binding_error(self):
+    """Spring4Shell should be detected when URLs[0] returns 400 (type error)."""
+    _, worker = self._build_worker(ports=[7108])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = "<html>App</html>"
+      resp.headers = {"Content-Type": "text/html"}
+      if "class.module.classLoader.DefaultAssertionStatus" in url:
+        resp.status_code = 200  # Spring accepted classLoader binding
+      elif "class.module.classLoader.URLs" in url:
+        resp.status_code = 400  # Type conversion error — binding attempted
+        resp.text = "Bad Request"
+      elif "/actuator" in url:
+        resp.status_code = 404
+        resp.ok = False
+        resp.text = ""
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 404
+      resp.text = ""
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_spring_actuator("1.2.3.4", 7108)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("Spring4Shell" in t for t in titles), f"Should detect Spring4Shell via binding error. Got: {titles}")
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -6586,4 +7144,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestDetectionGapFixes))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch2GapFixes))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch3GapFixes))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch4JavaGapFixes))
   runner.run(suite)

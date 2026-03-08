@@ -167,6 +167,39 @@ CVE_DATABASE: list = [
   # ── Laravel / Ignition ─────────────────────────────────────────
   CveEntry("laravel_ignition", "<2.5.2",  "CVE-2021-3129", Severity.CRITICAL, "Ignition debug mode RCE via file_put_contents", "CWE-94"),
 
+  # ── Apache Struts2 ─────────────────────────────────────────────
+  CveEntry("struts2", ">=2.3.5,<2.3.32",   "CVE-2017-5638", Severity.CRITICAL, "S2-045: OGNL injection via Content-Type header RCE", "CWE-94"),
+  CveEntry("struts2", ">=2.5.0,<2.5.10.1", "CVE-2017-5638", Severity.CRITICAL, "S2-045: OGNL injection via Content-Type header RCE", "CWE-94"),
+  CveEntry("struts2", ">=2.3.5,<2.3.33",   "CVE-2017-9805", Severity.CRITICAL, "S2-052: XML deserialization RCE via REST plugin", "CWE-502"),
+  CveEntry("struts2", ">=2.5.0,<2.5.13",   "CVE-2017-9805", Severity.CRITICAL, "S2-052: XML deserialization RCE via REST plugin", "CWE-502"),
+  CveEntry("struts2", ">=2.0.0,<2.5.26",   "CVE-2020-17530", Severity.CRITICAL, "S2-061: Forced OGNL evaluation via tag attributes", "CWE-94"),
+
+  # ── Oracle WebLogic ──────────────────────────────────────────
+  CveEntry("weblogic", ">=10.3.6.0,<10.3.6.1", "CVE-2017-10271", Severity.CRITICAL, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
+  CveEntry("weblogic", ">=12.1.3.0,<12.1.3.1", "CVE-2017-10271", Severity.CRITICAL, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
+  CveEntry("weblogic", ">=10.3.6.0,<10.3.6.1", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
+  CveEntry("weblogic", ">=12.1.3.0,<12.2.1.5", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
+  CveEntry("weblogic", ">=12.2.1.3,<12.2.1.4", "CVE-2023-21839", Severity.HIGH, "IIOP/T3 protocol deserialization RCE", "CWE-502"),
+
+  # ── Apache Tomcat ────────────────────────────────────────────
+  CveEntry("tomcat", ">=9.0.0,<9.0.31",   "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
+  CveEntry("tomcat", ">=8.5.0,<8.5.51",   "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
+  CveEntry("tomcat", ">=7.0.0,<7.0.100",  "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
+  CveEntry("tomcat", ">=7.0.0,<7.0.81",   "CVE-2017-12615", Severity.HIGH, "PUT method JSP file upload RCE", "CWE-434"),
+  CveEntry("tomcat", ">=9.0.0,<9.0.99",   "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
+  CveEntry("tomcat", ">=10.1.0,<10.1.35", "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
+
+  # ── JBoss Application Server ─────────────────────────────────
+  CveEntry("jboss", ">=4.0,<7.0",   "CVE-2017-12149", Severity.CRITICAL, "Java deserialization RCE via /invoker/readonly", "CWE-502"),
+
+  # ── Spring Framework ─────────────────────────────────────────
+  CveEntry("spring_framework", ">=5.3.0,<5.3.18", "CVE-2022-22965", Severity.CRITICAL, "Spring4Shell: ClassLoader manipulation RCE", "CWE-94"),
+  CveEntry("spring_framework", ">=5.2.0,<5.2.20", "CVE-2022-22965", Severity.CRITICAL, "Spring4Shell: ClassLoader manipulation RCE", "CWE-94"),
+
+  # ── Spring Cloud Function ────────────────────────────────────
+  CveEntry("spring_cloud_function", ">=3.0.0,<3.1.7", "CVE-2022-22963", Severity.CRITICAL, "SpEL injection via routing header RCE", "CWE-94"),
+  CveEntry("spring_cloud_function", ">=3.2.0,<3.2.3", "CVE-2022-22963", Severity.CRITICAL, "SpEL injection via routing header RCE", "CWE-94"),
+
   # ── BIND (DNS) ──────────────────────────────────────────────────
   CveEntry("bind", "<9.11.37",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
   CveEntry("bind", "<9.16.33",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
