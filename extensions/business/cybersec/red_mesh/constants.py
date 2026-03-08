@@ -71,7 +71,7 @@ FEATURE_CATALOG = [
     "label": "Injection probes",
     "description": "Non-destructive probes for path traversal, reflected XSS, and SQL injection (OWASP WSTG-INPV).",
     "category": "web",
-    "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection"]
+    "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection", "_web_test_ssti", "_web_test_shellshock", "_web_test_php_cgi"]
   },
   {
     "id": "web_auth_design",

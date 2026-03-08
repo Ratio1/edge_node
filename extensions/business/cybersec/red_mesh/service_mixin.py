@@ -321,15 +321,12 @@ class _ServiceInfoMixin:
             raw["server"] = line.split(":", 1)[1].strip()
             break
 
-        if raw["server"]:
-          _m = _HTTP_SERVER_RE.search(raw["server"])
-          if _m:
-            _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
-            if _cve_product:
-              findings += check_cves(_cve_product, _m.group(2))
+        # NOTE: CVE matching intentionally omitted here — _service_info_http
+        # already handles CVE lookups for all HTTP ports.  Emitting them here
+        # caused duplicate findings on non-standard ports (batch 3 dedup fix).
     except Exception as e:
       return probe_error(target, port, "HTTP-ALT", e)
-    return probe_result(raw_data=raw, findings=findings)  
+    return probe_result(raw_data=raw, findings=findings)
 
 
   def _service_info_https(self, target, port):  # default port: 443

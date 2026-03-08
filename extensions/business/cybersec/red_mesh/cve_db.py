@@ -143,6 +143,30 @@ CVE_DATABASE: list = [
   # ── InfluxDB ────────────────────────────────────────────────────
   CveEntry("influxdb", "<1.7.6",  "CVE-2019-20933", Severity.CRITICAL, "JWT auth bypass via empty shared secret", "CWE-287"),
 
+  # ── Drupal ─────────────────────────────────────────────────────
+  CveEntry("drupal", ">=7.0,<7.58",      "CVE-2018-7600", Severity.CRITICAL, "Drupalgeddon2: RCE via Form API", "CWE-20"),
+  CveEntry("drupal", ">=8.0.0,<8.3.9",   "CVE-2018-7600", Severity.CRITICAL, "Drupalgeddon2: RCE via Form API", "CWE-20"),
+  CveEntry("drupal", ">=8.4.0,<8.4.6",   "CVE-2018-7600", Severity.CRITICAL, "Drupalgeddon2: RCE via Form API", "CWE-20"),
+  CveEntry("drupal", ">=8.5.0,<8.5.1",   "CVE-2018-7600", Severity.CRITICAL, "Drupalgeddon2: RCE via Form API", "CWE-20"),
+  CveEntry("drupal", ">=7.0,<7.59",      "CVE-2018-7602", Severity.CRITICAL, "Drupalgeddon3: RCE via Contextual links", "CWE-20"),
+  CveEntry("drupal", ">=8.0.0,<8.4.8",   "CVE-2018-7602", Severity.CRITICAL, "Drupalgeddon3: RCE via Contextual links", "CWE-20"),
+  CveEntry("drupal", ">=8.5.0,<8.5.3",   "CVE-2018-7602", Severity.CRITICAL, "Drupalgeddon3: RCE via Contextual links", "CWE-20"),
+  CveEntry("drupal", ">=7.0,<7.32",      "CVE-2014-3704", Severity.CRITICAL, "SQL injection via expand_arguments()", "CWE-89"),
+
+  # ── WordPress ──────────────────────────────────────────────────
+  CveEntry("wordpress", "<4.7.1",         "CVE-2016-10033", Severity.CRITICAL, "PHPMailer RCE via wp_mail()", "CWE-78"),
+  CveEntry("wordpress", "<4.7.4",         "CVE-2017-8295", Severity.HIGH, "Host header password reset hijack", "CWE-640"),
+  CveEntry("wordpress", ">=4.7.0,<4.7.2", "CVE-2017-1001000", Severity.HIGH, "REST API content injection", "CWE-284"),
+
+  # ── Joomla ─────────────────────────────────────────────────────
+  CveEntry("joomla", ">=4.0.0,<4.2.8",   "CVE-2023-23752", Severity.HIGH, "Unauthenticated information disclosure via REST API", "CWE-284"),
+
+  # ── Django ─────────────────────────────────────────────────────
+  CveEntry("django", "<1.11.5",          "CVE-2017-12794", Severity.MEDIUM, "Debug page XSS via invalid URL parameter", "CWE-79"),
+
+  # ── Laravel / Ignition ─────────────────────────────────────────
+  CveEntry("laravel_ignition", "<2.5.2",  "CVE-2021-3129", Severity.CRITICAL, "Ignition debug mode RCE via file_put_contents", "CWE-94"),
+
   # ── BIND (DNS) ──────────────────────────────────────────────────
   CveEntry("bind", "<9.11.37",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
   CveEntry("bind", "<9.16.33",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
