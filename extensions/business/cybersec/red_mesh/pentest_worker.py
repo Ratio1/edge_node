@@ -37,7 +37,10 @@ class MetricsCollector:
     self._ports_scanned = 0
     self._ports_skipped = 0
     self._open_ports = []
+    self._open_port_details = []  # [{"port": int, "protocol": str, "banner_confirmed": bool}]
     self._service_counts = {}
+    self._banner_confirmed = 0
+    self._banner_guessed = 0
     self._finding_counts = {}
     # For success rate over time windows
     self._connection_log = []  # [(timestamp, success_bool)]
@@ -65,8 +68,13 @@ class MetricsCollector:
   def record_probe(self, probe_name: str, result: str):
     self._probe_results[probe_name] = result
 
-  def record_open_port(self, port: int, protocol: str = None):
+  def record_open_port(self, port: int, protocol: str = None, banner_confirmed: bool = False):
     self._open_ports.append(port)
+    self._open_port_details.append({"port": port, "protocol": protocol or "unknown", "banner_confirmed": banner_confirmed})
+    if banner_confirmed:
+      self._banner_confirmed += 1
+    else:
+      self._banner_guessed += 1
     if protocol:
       self._service_counts[protocol] = self._service_counts.get(protocol, 0) + 1
 
@@ -172,13 +180,14 @@ class MetricsCollector:
     probes_skipped = sum(1 for v in self._probe_results.values() if v.startswith("skipped"))
     probes_failed = sum(1 for v in self._probe_results.values() if v == "failed")
 
+    banner_total = self._banner_confirmed + self._banner_guessed
     return ScanMetrics(
       phase_durations=self._compute_phase_durations(),
       total_duration=round(time.time() - self._scan_start, 2) if self._scan_start else 0,
       port_scan_delays=self._compute_stats(self._port_scan_delays),
       connection_outcomes=outcomes if total_connections > 0 else None,
       response_times=self._compute_stats(self._response_times),
-      slow_ports=None,  # TODO: implement slow port detection
+      slow_ports=None,
       success_rate_over_time=self._compute_success_windows(),
       rate_limiting_detected=self._detect_rate_limiting(),
       blocking_detected=self._detect_blocking(),
@@ -191,6 +200,8 @@ class MetricsCollector:
       port_distribution=self._compute_port_distribution(),
       service_distribution=dict(self._service_counts) if self._service_counts else None,
       finding_distribution=dict(self._finding_counts) if self._finding_counts else None,
+      open_port_details=list(self._open_port_details) if self._open_port_details else None,
+      banner_confirmation={"confirmed": self._banner_confirmed, "guessed": self._banner_guessed} if banner_total > 0 else None,
     )
 
 
@@ -740,7 +751,7 @@ class PentestLocalWorker(
           self.state["port_protocols"][port] = protocol
           self.state["port_banners"][port] = banner_text
           self.state["port_banner_confirmed"][port] = banner_confirmed
-          self.metrics.record_open_port(port, protocol)
+          self.metrics.record_open_port(port, protocol, banner_confirmed)
         else:
           # Port closed/filtered
           import errno
