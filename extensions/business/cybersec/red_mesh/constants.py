@@ -48,14 +48,14 @@ FEATURE_CATALOG = [
     "label": "Discovery",
     "description": "Enumerate exposed files, admin panels, homepage secrets, tech fingerprinting, and VPN endpoints (OWASP WSTG-INFO).",
     "category": "web",
-    "methods": ["_web_test_common", "_web_test_homepage", "_web_test_tech_fingerprint", "_web_test_vpn_endpoints"]
+    "methods": ["_web_test_common", "_web_test_homepage", "_web_test_tech_fingerprint", "_web_test_vpn_endpoints", "_web_test_cms_fingerprint"]
   },
   {
     "id": "web_hardening",
     "label": "Hardening audit",
     "description": "Audit cookie flags, security headers, CORS policy, redirect handling, and HTTP methods (OWASP WSTG-CONF).",
     "category": "web",
-    "methods": ["_web_test_flags", "_web_test_security_headers", "_web_test_cors_misconfiguration", "_web_test_open_redirect", "_web_test_http_methods"]
+    "methods": ["_web_test_flags", "_web_test_security_headers", "_web_test_cors_misconfiguration", "_web_test_open_redirect", "_web_test_http_methods", "_web_test_csrf"]
   },
   {
     "id": "web_api_exposure",
@@ -76,7 +76,7 @@ FEATURE_CATALOG = [
     "label": "Credential testing",
     "description": "Test default/weak credentials on database and remote access services. May trigger account lockout.",
     "category": "service",
-    "methods": ["_service_info_mysql_creds", "_service_info_postgresql_creds"]
+    "methods": ["_service_info_mysql_creds", "_service_info_postgresql_creds", "_service_info_http_basic_auth"]
   },
   {
     "id": "post_scan_correlation",
@@ -172,6 +172,7 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_generic": frozenset({"unknown"}),
     "_service_info_mysql_creds": frozenset({"mysql"}),
     "_service_info_postgresql_creds": frozenset({"postgresql"}),
+    "_service_info_http_basic_auth": frozenset({"http", "https"}),
 }
 
 # =====================================================================
