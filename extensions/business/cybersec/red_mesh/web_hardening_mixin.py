@@ -1,3 +1,4 @@
+import re as _re
 import requests
 from urllib.parse import quote
 
@@ -298,5 +299,90 @@ class _WebHardeningMixin:
     except Exception as e:
       self.P(f"HTTP methods probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "http_methods", e)
+
+    return probe_result(findings=findings_list)
+
+
+  # Regex for POST forms and hidden inputs (CSRF detection)
+  _FORM_RE = _re.compile(
+    r'<form[^>]*method\s*=\s*["\']?post["\']?[^>]*>(.*?)</form>',
+    _re.IGNORECASE | _re.DOTALL,
+  )
+  _HIDDEN_INPUT_RE = _re.compile(
+    r'<input[^>]*type\s*=\s*["\']?hidden["\']?[^>]*name\s*=\s*["\']?([^"\'>\s]+)',
+    _re.IGNORECASE,
+  )
+  _CSRF_FIELD_NAMES = frozenset({
+    "csrf_token", "_token", "csrfmiddlewaretoken",
+    "authenticity_token", "__requestverificationtoken",
+    "_csrf", "csrf", "xsrf_token", "_xsrf",
+    "anti-forgery-token", "__antiforgerytoken",
+  })
+
+  def _web_test_csrf(self, target, port):
+    """
+    Detect POST forms missing CSRF protection tokens.
+
+    Checks the landing page, /login, /contact, and /register for
+    <form method="POST"> tags without a CSRF-like hidden field.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    dict
+      Structured findings about missing CSRF protection.
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}"
+    if port not in (80, 443):
+      base_url = f"{scheme}://{target}:{port}"
+
+    for path in ("/", "/login", "/contact", "/register"):
+      try:
+        resp = requests.get(base_url + path, timeout=3, verify=False)
+        if resp.status_code != 200:
+          continue
+
+        # Check response headers for SPA-style CSRF tokens
+        has_header_token = any(
+          h.lower() in resp.headers
+          for h in ("x-csrf-token", "x-xsrf-token")
+        )
+        if has_header_token:
+          continue
+
+        for form_match in self._FORM_RE.finditer(resp.text):
+          form_html = form_match.group(1)
+          hidden_names = {
+            name.lower()
+            for name in self._HIDDEN_INPUT_RE.findall(form_html)
+          }
+          if hidden_names & self._CSRF_FIELD_NAMES:
+            continue  # has CSRF token — OK
+
+          # Extract form action for evidence
+          action_match = _re.search(r'action\s*=\s*["\']?([^"\'>\s]+)', form_match.group(0), _re.IGNORECASE)
+          action = action_match.group(1) if action_match else path
+
+          findings_list.append(Finding(
+            severity=Severity.MEDIUM,
+            title=f"POST form at {path} missing CSRF token",
+            description="A form submitting via POST has no hidden CSRF token field, "
+                        "making it vulnerable to cross-site request forgery.",
+            evidence=f"Form action={action}, hidden fields={sorted(hidden_names) if hidden_names else 'none'}",
+            remediation="Add a CSRF token to all state-changing forms.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-352",
+            confidence="firm",
+          ))
+      except Exception:
+        continue
 
     return probe_result(findings=findings_list)

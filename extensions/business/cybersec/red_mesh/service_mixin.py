@@ -378,6 +378,104 @@ class _ServiceInfoMixin:
     return probe_result(raw_data=raw, findings=findings)
 
 
+  # Default credentials for HTTP Basic Auth testing
+  _HTTP_BASIC_CREDS = [
+    ("admin", "admin"), ("admin", "password"), ("admin", "1234"),
+    ("root", "root"), ("root", "password"), ("root", "toor"),
+    ("user", "user"), ("test", "test"), ("guest", "guest"),
+    ("admin", ""), ("tomcat", "tomcat"), ("manager", "manager"),
+  ]
+
+  def _service_info_http_basic_auth(self, target, port):
+    """
+    Test HTTP Basic Auth endpoints for default/weak credentials.
+
+    Only runs when the target responds with 401 + WWW-Authenticate: Basic.
+    Tests a small set of default credential pairs.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Port being probed.
+
+    Returns
+    -------
+    dict or None
+      Structured findings, or None if no Basic Auth detected.
+    """
+    findings = []
+    raw = {"basic_auth_detected": False, "tested": 0, "accepted": []}
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    # Probe / and /admin for 401 + Basic auth
+    auth_url = None
+    realm = None
+    for path in ("/", "/admin", "/manager"):
+      try:
+        resp = requests.get(base_url + path, timeout=3, verify=False)
+        if resp.status_code == 401:
+          www_auth = resp.headers.get("WWW-Authenticate", "")
+          if "Basic" in www_auth:
+            auth_url = base_url + path
+            realm_match = _re.search(r'realm="?([^"]*)"?', www_auth, _re.IGNORECASE)
+            realm = realm_match.group(1) if realm_match else "unknown"
+            break
+      except Exception:
+        continue
+
+    if not auth_url:
+      return None  # No Basic auth detected — skip entirely
+
+    raw["basic_auth_detected"] = True
+    raw["realm"] = realm
+
+    # Test credentials
+    consecutive_401 = 0
+    for username, password in self._HTTP_BASIC_CREDS:
+      try:
+        resp = requests.get(auth_url, timeout=3, verify=False, auth=(username, password))
+        raw["tested"] += 1
+
+        if resp.status_code == 429:
+          break  # rate limited — stop
+
+        if resp.status_code == 200 or resp.status_code == 301 or resp.status_code == 302:
+          cred_str = f"{username}:{password}" if password else f"{username}:(empty)"
+          raw["accepted"].append(cred_str)
+          findings.append(Finding(
+            severity=Severity.CRITICAL,
+            title=f"HTTP Basic Auth default credential: {cred_str}",
+            description=f"The web server at {auth_url} (realm: {realm}) accepted a default credential.",
+            evidence=f"GET {auth_url} with {cred_str} → HTTP {resp.status_code}",
+            remediation="Change default credentials immediately.",
+            owasp_id="A07:2021",
+            cwe_id="CWE-798",
+            confidence="certain",
+          ))
+        elif resp.status_code == 401:
+          consecutive_401 += 1
+      except Exception:
+        break
+
+    # No rate limiting after all attempts
+    if consecutive_401 >= len(self._HTTP_BASIC_CREDS) - 1:
+      findings.append(Finding(
+        severity=Severity.MEDIUM,
+        title=f"HTTP Basic Auth has no rate limiting ({raw['tested']} attempts accepted)",
+        description="The server does not rate-limit failed authentication attempts.",
+        evidence=f"{consecutive_401} consecutive 401 responses without rate limiting.",
+        remediation="Implement account lockout or rate limiting for failed auth attempts.",
+        owasp_id="A07:2021",
+        cwe_id="CWE-307",
+        confidence="firm",
+      ))
+
+    return probe_result(raw_data=raw, findings=findings)
+
+
   def _service_info_tls(self, target, port):
     """
     Inspect TLS handshake, certificate chain, and cipher strength.
@@ -2847,6 +2945,36 @@ class _ServiceInfoMixin:
       # CVE check
       findings += check_cves("samba", samba_version)
 
+    # Share enumeration via null session
+    shares = self._smb_enum_shares(target, port)
+    if shares:
+      raw["shares"] = shares
+      share_names = [s["name"] for s in shares]
+      admin_shares = [s["name"] for s in shares if s["name"].upper() in ("ADMIN$", "C$", "D$", "E$")]
+
+      if admin_shares:
+        findings.append(Finding(
+          severity=Severity.HIGH,
+          title=f"SMB admin shares accessible via null session: {', '.join(admin_shares)}",
+          description="Administrative shares are accessible without authentication.",
+          evidence=f"Shares: {share_names}",
+          remediation="Disable null session access; restrict admin shares.",
+          owasp_id="A01:2021",
+          cwe_id="CWE-284",
+          confidence="certain",
+        ))
+      else:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title=f"SMB null session share enumeration ({len(shares)} shares listed)",
+          description="Anonymous user can enumerate available SMB shares.",
+          evidence=f"Shares: {share_names}",
+          remediation="Restrict anonymous share enumeration (RestrictNullSessAccess=1).",
+          owasp_id="A01:2021",
+          cwe_id="CWE-200",
+          confidence="certain",
+        ))
+
     if not findings:
       findings.append(Finding(
         severity=Severity.MEDIUM,
@@ -2871,6 +2999,474 @@ class _ServiceInfoMixin:
         return None
       buf += chunk
     return buf
+
+  def _smb_enum_shares(self, target, port):
+    """Enumerate SMB shares via null session + IPC$ + srvsvc NetShareEnumAll.
+
+    Performs the full SMBv1 protocol sequence:
+      Negotiate -> Session Setup (null) -> Tree Connect IPC$ ->
+      Open \\srvsvc pipe -> DCE/RPC Bind -> NetShareEnumAll -> parse results.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      SMB port (typically 445).
+
+    Returns
+    -------
+    list[dict]
+      Each dict has keys ``name`` (str), ``type`` (int), ``comment`` (str).
+      Returns empty list on any failure.
+    """
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+      sock.settimeout(4)
+      sock.connect((target, port))
+
+      def _send_smb(payload):
+        nb_hdr = b"\x00" + struct.pack(">I", len(payload))[1:]
+        sock.sendall(nb_hdr + payload)
+
+      def _recv_smb():
+        resp_hdr = self._smb_recv_exact(sock, 4)
+        if not resp_hdr:
+          return None
+        resp_len = struct.unpack(">I", b"\x00" + resp_hdr[1:4])[0]
+        return self._smb_recv_exact(sock, min(resp_len, 65536))
+
+      # ---- 1. Negotiate (NT LM 0.12) ----
+      dialects = b"\x02NT LM 0.12\x00"
+      smb_hdr = bytearray(32)
+      smb_hdr[0:4] = b"\xffSMB"
+      smb_hdr[4] = 0x72  # Negotiate
+      smb_hdr[13] = 0x18
+      struct.pack_into("<H", smb_hdr, 14, 0xC803)
+      smb_body = struct.pack("<BH", 0, len(dialects)) + dialects
+      _send_smb(bytes(smb_hdr) + smb_body)
+
+      neg_resp = _recv_smb()
+      if not neg_resp or len(neg_resp) < 32:
+        return []
+
+      # ---- 2. Session Setup AndX (null creds) ----
+      smb_hdr2 = bytearray(32)
+      smb_hdr2[0:4] = b"\xffSMB"
+      smb_hdr2[4] = 0x73  # Session Setup AndX
+      smb_hdr2[13] = 0x18
+      struct.pack_into("<H", smb_hdr2, 14, 0xC803)
+
+      words = struct.pack("<BBHHIHIHII",
+        13,        # word count
+        0xFF,      # AndXCommand: no further
+        0,         # reserved
+        0,         # AndXOffset
+        65535,     # max buffer size
+        1,         # max mpx count
+        0,         # VC number
+        0,         # session key
+        0,         # ANSI password length
+        0,         # Unicode password length
+      )
+      words += struct.pack("<I", 0x000000D4)  # capabilities
+      byte_data = b"\x00"
+      byte_count = struct.pack("<H", len(byte_data))
+      _send_smb(bytes(smb_hdr2) + words + byte_count + byte_data)
+
+      sess_resp = _recv_smb()
+      if not sess_resp or len(sess_resp) < 32:
+        return []
+
+      # Check NT Status (bytes 5-8): 0 = success
+      nt_status = struct.unpack_from("<I", sess_resp, 5)[0]
+      # Accept STATUS_SUCCESS (0) or STATUS_MORE_PROCESSING_REQUIRED (0xC0000016)
+      if nt_status not in (0x00000000, 0xC0000016):
+        return []
+
+      uid = struct.unpack_from("<H", sess_resp, 28)[0]
+
+      # ---- 3. Tree Connect AndX to \\target\IPC$ ----
+      smb_hdr3 = bytearray(32)
+      smb_hdr3[0:4] = b"\xffSMB"
+      smb_hdr3[4] = 0x75  # Tree Connect AndX
+      smb_hdr3[13] = 0x18
+      struct.pack_into("<H", smb_hdr3, 14, 0xC803)
+      struct.pack_into("<H", smb_hdr3, 28, uid)  # UID
+
+      # Tree Connect AndX words: word_count=4
+      path_str = f"\\\\{target}\\IPC$".encode("utf-16-le") + b"\x00\x00"
+      service_str = b"?????\x00"
+      tc_password = b"\x00"
+      tc_byte_data = tc_password + path_str + service_str
+      tc_words = struct.pack("<BBHHH",
+        4,         # word count
+        0xFF,      # AndXCommand: no further
+        0,         # reserved
+        0,         # AndXOffset
+        len(tc_password),  # password length
+      )
+      tc_byte_count = struct.pack("<H", len(tc_byte_data))
+      _send_smb(bytes(smb_hdr3) + tc_words + tc_byte_count + tc_byte_data)
+
+      tc_resp = _recv_smb()
+      if not tc_resp or len(tc_resp) < 32:
+        return []
+
+      nt_status = struct.unpack_from("<I", tc_resp, 5)[0]
+      if nt_status != 0:
+        return []
+
+      tid = struct.unpack_from("<H", tc_resp, 24)[0]
+
+      # ---- 4. NT Create AndX -- open \srvsvc named pipe ----
+      smb_hdr4 = bytearray(32)
+      smb_hdr4[0:4] = b"\xffSMB"
+      smb_hdr4[4] = 0xA2  # NT Create AndX
+      smb_hdr4[13] = 0x18
+      struct.pack_into("<H", smb_hdr4, 14, 0xC803)
+      struct.pack_into("<H", smb_hdr4, 24, tid)
+      struct.pack_into("<H", smb_hdr4, 28, uid)
+
+      pipe_name = "\\srvsvc".encode("utf-16-le") + b"\x00\x00"
+      # NT Create AndX words: word_count=24
+      nc_words = struct.pack("<BB", 24, 0xFF)  # word count, AndXCommand
+      nc_words += struct.pack("<B", 0)          # reserved
+      nc_words += struct.pack("<H", 0)          # AndXOffset
+      nc_words += struct.pack("<B", 0)          # reserved2
+      nc_words += struct.pack("<H", len(pipe_name))  # name length
+      nc_words += struct.pack("<I", 0x00000016)  # create flags
+      nc_words += struct.pack("<I", 0)           # root FID
+      nc_words += struct.pack("<I", 0x0002019F)  # desired access (read/write/execute)
+      nc_words += struct.pack("<Q", 0)           # allocation size
+      nc_words += struct.pack("<I", 0)           # ext file attributes
+      nc_words += struct.pack("<I", 0x00000007)  # share access (read|write|delete)
+      nc_words += struct.pack("<I", 0x00000001)  # create disposition (open)
+      nc_words += struct.pack("<I", 0x00000000)  # create options
+      nc_words += struct.pack("<I", 0x00000002)  # impersonation level
+      nc_words += struct.pack("<B", 0)           # security flags
+
+      nc_byte_count = struct.pack("<H", len(pipe_name))
+      _send_smb(bytes(smb_hdr4) + nc_words + nc_byte_count + pipe_name)
+
+      nc_resp = _recv_smb()
+      if not nc_resp or len(nc_resp) < 42:
+        return []
+
+      nt_status = struct.unpack_from("<I", nc_resp, 5)[0]
+      if nt_status != 0:
+        return []
+
+      # FID is in NT Create AndX response words.
+      # SMB header (32) + word_count(1) + AndXCommand(1) + reserved(1) +
+      #   AndXOffset(2) + OpLockLevel(1) + FID(2)
+      wc = nc_resp[32]
+      if wc < 1:
+        return []
+      fid = struct.unpack_from("<H", nc_resp, 32 + 1 + 1 + 1 + 2 + 1)[0]  # offset 38
+
+      # ---- 5. DCE/RPC Bind to srvsvc ----
+      # srvsvc UUID: 4b324fc8-1670-01d3-1278-5a47bf6ee188 v3.0
+      # NDR transfer syntax: 8a885d04-1ceb-11c9-9fe8-08002b104860 v2.0
+      srvsvc_uuid = (
+        struct.pack("<IHH", 0x4B324FC8, 0x1670, 0x01D3)
+        + b"\x12\x78\x5A\x47\xBF\x6E\xE1\x88"
+      )
+      ndr_uuid = (
+        struct.pack("<IHH", 0x8A885D04, 0x1CEB, 0x11C9)
+        + b"\x9F\xE8\x08\x00\x2B\x10\x48\x60"
+      )
+
+      # Context item: abstract syntax + transfer syntax
+      ctx_item = struct.pack("<HBB", 0, 1, 0)  # context_id=0, num_transfer=1, reserved
+      ctx_item += srvsvc_uuid + struct.pack("<HH", 3, 0)  # version 3.0
+      ctx_item += ndr_uuid + struct.pack("<HH", 2, 0)     # version 2.0
+
+      bind_body = struct.pack("<HHI", 4280, 4280, 0)  # max xmit, max recv, assoc group
+      bind_body += struct.pack("<I", 1)  # num_ctx_items (with padding byte included)
+      bind_body += ctx_item
+
+      # DCE/RPC header: version=5, minor=0, type=11(bind), flags=3
+      dce_hdr = struct.pack("<BBBBIHHI",
+        5, 0,        # version major, minor
+        11,          # packet type: bind
+        3,           # flags: first_frag | last_frag
+        0x00000010,  # data representation (little-endian, ASCII, IEEE)
+        24 + len(bind_body),  # frag length
+        0,           # auth length
+        1,           # call id
+      )
+      bind_pkt = dce_hdr + bind_body
+
+      # Write via SMB Write AndX
+      smb_hdr5 = bytearray(32)
+      smb_hdr5[0:4] = b"\xffSMB"
+      smb_hdr5[4] = 0x2F  # Write AndX
+      smb_hdr5[13] = 0x18
+      struct.pack_into("<H", smb_hdr5, 14, 0xC803)
+      struct.pack_into("<H", smb_hdr5, 24, tid)
+      struct.pack_into("<H", smb_hdr5, 28, uid)
+
+      # Write AndX words: word_count=14
+      data_offset = 32 + 1 + (14 * 2) + 2  # smb_header + wc_byte + words + byte_count
+      wr_words = struct.pack("<BB", 14, 0xFF)   # word count, AndXCommand
+      wr_words += struct.pack("<BH", 0, 0)       # reserved, AndXOffset
+      wr_words += struct.pack("<H", fid)          # FID
+      wr_words += struct.pack("<I", 0)            # offset
+      wr_words += struct.pack("<I", 0)            # reserved
+      wr_words += struct.pack("<HH", 0x0008, 0)  # write mode (message start), remaining
+      wr_words += struct.pack("<HH", 0, len(bind_pkt))  # data length high, data length
+      wr_words += struct.pack("<H", data_offset)  # data offset
+      wr_words += struct.pack("<I", 0)            # high offset
+
+      wr_byte_count = struct.pack("<H", len(bind_pkt))
+      _send_smb(bytes(smb_hdr5) + wr_words + wr_byte_count + bind_pkt)
+
+      wr_resp = _recv_smb()
+      if not wr_resp or len(wr_resp) < 32:
+        return []
+
+      # ---- Read Bind Ack ----
+      smb_hdr6 = bytearray(32)
+      smb_hdr6[0:4] = b"\xffSMB"
+      smb_hdr6[4] = 0x2E  # Read AndX
+      smb_hdr6[13] = 0x18
+      struct.pack_into("<H", smb_hdr6, 14, 0xC803)
+      struct.pack_into("<H", smb_hdr6, 24, tid)
+      struct.pack_into("<H", smb_hdr6, 28, uid)
+
+      # Read AndX words: word_count=12
+      rd_words = struct.pack("<BB", 12, 0xFF)   # word count, AndXCommand
+      rd_words += struct.pack("<BH", 0, 0)       # reserved, AndXOffset
+      rd_words += struct.pack("<H", fid)          # FID
+      rd_words += struct.pack("<I", 0)            # offset
+      rd_words += struct.pack("<H", 4096)         # max count
+      rd_words += struct.pack("<H", 4096)         # min count
+      rd_words += struct.pack("<I", 0)            # max count high (timeout)
+      rd_words += struct.pack("<H", 0)            # remaining
+      rd_words += struct.pack("<I", 0)            # high offset
+
+      rd_byte_count = struct.pack("<H", 0)
+      _send_smb(bytes(smb_hdr6) + rd_words + rd_byte_count)
+
+      bind_ack = _recv_smb()
+      if not bind_ack or len(bind_ack) < 32:
+        return []
+
+      # ---- 6. NetShareEnumAll request (opnum 15) ----
+      # Stub data: server name as referent pointer + info level + enum handle
+      server_name_u16 = target.encode("utf-16-le") + b"\x00\x00"
+      # Pad to 4-byte boundary
+      name_padded = server_name_u16
+      if len(name_padded) % 4:
+        name_padded += b"\x00" * (4 - len(name_padded) % 4)
+
+      char_count = len(server_name_u16) // 2  # number of UTF-16 chars including null
+
+      stub = struct.pack("<I", 0x00020000)        # referent ID (pointer)
+      stub += struct.pack("<I", char_count)        # max count
+      stub += struct.pack("<I", 0)                 # offset
+      stub += struct.pack("<I", char_count)        # actual count
+      stub += name_padded                          # server name (UTF-16LE, padded)
+      stub += struct.pack("<I", 1)                 # info level = 1
+      stub += struct.pack("<I", 1)                 # switch value = 1
+      stub += struct.pack("<I", 0x00020004)        # info struct pointer (referent)
+      stub += struct.pack("<I", 0)                 # entries read = 0
+      stub += struct.pack("<I", 0)                 # null buffer pointer
+      stub += struct.pack("<I", 0xFFFFFFFF)        # preferred max length
+      stub += struct.pack("<I", 0)                 # resume handle pointer (referent)
+      stub += struct.pack("<I", 0)                 # resume handle value
+
+      dce_req_hdr = struct.pack("<BBBBIHHI",
+        5, 0,        # version
+        0,           # packet type: request
+        3,           # flags: first_frag | last_frag
+        0x00000010,  # data representation
+        24 + 8 + len(stub),  # frag length (hdr + req fields + stub)
+        0,           # auth length
+        2,           # call id
+      )
+      # Request PDU fields: alloc_hint, context_id, opnum
+      dce_req_body = struct.pack("<IHH", len(stub), 0, 15)  # opnum 15 = NetShareEnumAll
+      req_pkt = dce_req_hdr + dce_req_body + stub
+
+      # Write the request
+      smb_hdr7 = bytearray(32)
+      smb_hdr7[0:4] = b"\xffSMB"
+      smb_hdr7[4] = 0x2F  # Write AndX
+      smb_hdr7[13] = 0x18
+      struct.pack_into("<H", smb_hdr7, 14, 0xC803)
+      struct.pack_into("<H", smb_hdr7, 24, tid)
+      struct.pack_into("<H", smb_hdr7, 28, uid)
+
+      data_offset2 = 32 + 1 + (14 * 2) + 2
+      wr_words2 = struct.pack("<BB", 14, 0xFF)
+      wr_words2 += struct.pack("<BH", 0, 0)
+      wr_words2 += struct.pack("<H", fid)
+      wr_words2 += struct.pack("<I", 0)
+      wr_words2 += struct.pack("<I", 0)
+      wr_words2 += struct.pack("<HH", 0x0008, 0)
+      wr_words2 += struct.pack("<HH", 0, len(req_pkt))
+      wr_words2 += struct.pack("<H", data_offset2)
+      wr_words2 += struct.pack("<I", 0)
+
+      wr2_byte_count = struct.pack("<H", len(req_pkt))
+      _send_smb(bytes(smb_hdr7) + wr_words2 + wr2_byte_count + req_pkt)
+
+      wr2_resp = _recv_smb()
+      if not wr2_resp or len(wr2_resp) < 32:
+        return []
+
+      # ---- Read NetShareEnumAll response ----
+      smb_hdr8 = bytearray(32)
+      smb_hdr8[0:4] = b"\xffSMB"
+      smb_hdr8[4] = 0x2E  # Read AndX
+      smb_hdr8[13] = 0x18
+      struct.pack_into("<H", smb_hdr8, 14, 0xC803)
+      struct.pack_into("<H", smb_hdr8, 24, tid)
+      struct.pack_into("<H", smb_hdr8, 28, uid)
+
+      rd_words2 = struct.pack("<BB", 12, 0xFF)
+      rd_words2 += struct.pack("<BH", 0, 0)
+      rd_words2 += struct.pack("<H", fid)
+      rd_words2 += struct.pack("<I", 0)
+      rd_words2 += struct.pack("<H", 8192)
+      rd_words2 += struct.pack("<H", 0)
+      rd_words2 += struct.pack("<I", 0)
+      rd_words2 += struct.pack("<H", 0)
+      rd_words2 += struct.pack("<I", 0)
+
+      rd2_byte_count = struct.pack("<H", 0)
+      _send_smb(bytes(smb_hdr8) + rd_words2 + rd2_byte_count)
+
+      enum_resp = _recv_smb()
+      if not enum_resp or len(enum_resp) < 60:
+        return []
+
+      # ---- 7. Parse the response ----
+      # Find DCE/RPC response data inside the SMB Read AndX response.
+      # SMB Read AndX response: header(32) + word_count(1) + words(wc*2) +
+      #   byte_count(2) + pad + data.
+      wc8 = enum_resp[32]
+      if wc8 < 12:
+        return []
+      # Data offset from start of SMB header is at word 6 (0-indexed)
+      data_off = struct.unpack_from("<H", enum_resp, 32 + 1 + 11 * 2)[0]
+      data_len = struct.unpack_from("<H", enum_resp, 32 + 1 + 5 * 2)[0]
+
+      if data_off + data_len > len(enum_resp):
+        data_len = len(enum_resp) - data_off
+      if data_off >= len(enum_resp) or data_len < 24:
+        return []
+
+      dce_data = enum_resp[data_off:data_off + data_len]
+
+      # DCE/RPC response header is 24 bytes, then stub data
+      if len(dce_data) < 24:
+        return []
+      dce_stub = dce_data[24:]
+
+      return self._parse_netshareenumall_response(dce_stub)
+
+    except Exception:
+      return []
+    finally:
+      if sock:
+        try:
+          sock.close()
+        except Exception:
+          pass
+
+  @staticmethod
+  def _parse_netshareenumall_response(stub):
+    """Parse NetShareEnumAll DCE/RPC stub response into share list.
+
+    Parameters
+    ----------
+    stub : bytes
+      DCE/RPC stub data (after the 24-byte response header).
+
+    Returns
+    -------
+    list[dict]
+      Each dict: {"name": str, "type": int, "comment": str}.
+    """
+    shares = []
+    try:
+      if len(stub) < 20:
+        return []
+
+      # Response stub layout:
+      # [4] info_level
+      # [4] switch_value
+      # [4] referent pointer for SHARE_INFO_1_CONTAINER
+      # [4] entries_read
+      # [4] referent pointer for array
+      # Then for each entry: [4] name_ptr, [4] type, [4] comment_ptr
+      # Then the actual strings (NDR conformant arrays)
+
+      offset = 0
+      offset += 4  # info_level
+      offset += 4  # switch_value
+      offset += 4  # referent pointer
+      if offset + 4 > len(stub):
+        return []
+      entries_read = struct.unpack_from("<I", stub, offset)[0]
+      offset += 4
+
+      if entries_read == 0 or entries_read > 500:
+        return []
+
+      offset += 4  # array referent pointer
+      offset += 4  # max count (NDR array header)
+
+      # Read the fixed-size entries: name_ptr(4) + type(4) + comment_ptr(4) each
+      entry_records = []
+      for _ in range(entries_read):
+        if offset + 12 > len(stub):
+          break
+        name_ptr = struct.unpack_from("<I", stub, offset)[0]
+        share_type = struct.unpack_from("<I", stub, offset + 4)[0]
+        comment_ptr = struct.unpack_from("<I", stub, offset + 8)[0]
+        entry_records.append((name_ptr, share_type, comment_ptr))
+        offset += 12
+
+      # Now read the NDR conformant strings (name then comment for each entry)
+      def read_ndr_string(data, off):
+        """Read an NDR conformant+varying Unicode string."""
+        if off + 12 > len(data):
+          return "", off
+        max_count = struct.unpack_from("<I", data, off)[0]
+        off += 4
+        str_offset = struct.unpack_from("<I", data, off)[0]
+        off += 4
+        actual_count = struct.unpack_from("<I", data, off)[0]
+        off += 4
+        byte_len = actual_count * 2  # UTF-16LE
+        if off + byte_len > len(data):
+          s = data[off:].decode("utf-16-le", errors="ignore").rstrip("\x00")
+          return s, len(data)
+        s = data[off:off + byte_len].decode("utf-16-le", errors="ignore").rstrip("\x00")
+        off += byte_len
+        # Align to 4-byte boundary
+        if off % 4:
+          off += 4 - (off % 4)
+        return s, off
+
+      for name_ptr, share_type, comment_ptr in entry_records:
+        name, offset = read_ndr_string(stub, offset)
+        comment, offset = read_ndr_string(stub, offset)
+        if name:
+          shares.append({
+            "name": name,
+            "type": share_type,
+            "comment": comment,
+          })
+
+    except Exception:
+      pass
+    return shares
 
   def _smb_try_null_session(self, target, port):
     """Attempt SMBv1 null session to extract Samba version from SessionSetup response.
@@ -3544,6 +4140,12 @@ class _ServiceInfoMixin:
           cwe_id="CWE-798",
           confidence="certain",
         ))
+        # Walk system MIB for additional intel
+        mib_result = self._snmp_walk_system_mib(target, port)
+        if mib_result:
+          sys_info = mib_result.get("system", {})
+          raw.update(sys_info)
+          findings.extend(mib_result.get("findings", []))
       else:
         raw["banner"] = readable.strip()[:120]
         findings.append(Finding(
@@ -3562,6 +4164,197 @@ class _ServiceInfoMixin:
         sock.close()
     return probe_result(raw_data=raw, findings=findings)
 
+  # -- SNMP MIB walk helpers ------------------------------------------------
+
+  _ICS_KEYWORDS = frozenset({
+    "siemens", "simatic", "schneider", "allen-bradley", "honeywell",
+    "abb", "modicon", "rockwell", "yokogawa", "emerson", "ge fanuc",
+  })
+
+  def _is_ics_indicator(self, text):
+    lower = text.lower()
+    return any(kw in lower for kw in self._ICS_KEYWORDS)
+
+  @staticmethod
+  def _snmp_encode_oid(oid_str):
+    parts = [int(p) for p in oid_str.split(".")]
+    body = bytes([40 * parts[0] + parts[1]])
+    for v in parts[2:]:
+      if v < 128:
+        body += bytes([v])
+      else:
+        chunks = []
+        chunks.append(v & 0x7F)
+        v >>= 7
+        while v:
+          chunks.append(0x80 | (v & 0x7F))
+          v >>= 7
+        body += bytes(reversed(chunks))
+    return body
+
+  def _snmp_build_getnext(self, community, oid_str, request_id=1):
+    oid_body = self._snmp_encode_oid(oid_str)
+    oid_tlv = bytes([0x06, len(oid_body)]) + oid_body
+    varbind = bytes([0x30, len(oid_tlv) + 2]) + oid_tlv + b"\x05\x00"
+    varbind_seq = bytes([0x30, len(varbind)]) + varbind
+    req_id = bytes([0x02, 0x01, request_id & 0xFF])
+    err_status = b"\x02\x01\x00"
+    err_index = b"\x02\x01\x00"
+    pdu_body = req_id + err_status + err_index + varbind_seq
+    pdu = bytes([0xA1, len(pdu_body)]) + pdu_body
+    version = b"\x02\x01\x00"
+    comm = bytes([0x04, len(community)]) + community.encode()
+    inner = version + comm + pdu
+    return bytes([0x30, len(inner)]) + inner
+
+  @staticmethod
+  def _snmp_parse_response(data):
+    try:
+      pos = 0
+      if data[pos] != 0x30:
+        return None, None
+      pos += 2  # skip SEQUENCE tag + length
+      # skip version
+      if data[pos] != 0x02:
+        return None, None
+      pos += 2 + data[pos + 1]
+      # skip community
+      if data[pos] != 0x04:
+        return None, None
+      pos += 2 + data[pos + 1]
+      # response PDU (0xA2)
+      if data[pos] != 0xA2:
+        return None, None
+      pos += 2
+      # skip request-id, error-status, error-index (3 integers)
+      for _ in range(3):
+        pos += 2 + data[pos + 1]
+      # varbind list SEQUENCE
+      pos += 2  # skip SEQUENCE tag + length
+      # first varbind SEQUENCE
+      pos += 2  # skip SEQUENCE tag + length
+      # OID
+      if data[pos] != 0x06:
+        return None, None
+      oid_len = data[pos + 1]
+      oid_bytes = data[pos + 2: pos + 2 + oid_len]
+      # decode OID
+      parts = [str(oid_bytes[0] // 40), str(oid_bytes[0] % 40)]
+      i = 1
+      while i < len(oid_bytes):
+        if oid_bytes[i] < 128:
+          parts.append(str(oid_bytes[i]))
+          i += 1
+        else:
+          val = 0
+          while i < len(oid_bytes) and oid_bytes[i] & 0x80:
+            val = (val << 7) | (oid_bytes[i] & 0x7F)
+            i += 1
+          if i < len(oid_bytes):
+            val = (val << 7) | oid_bytes[i]
+            i += 1
+          parts.append(str(val))
+      oid_str = ".".join(parts)
+      pos += 2 + oid_len
+      # value
+      val_tag = data[pos]
+      val_len = data[pos + 1]
+      val_raw = data[pos + 2: pos + 2 + val_len]
+      if val_tag == 0x04:  # OCTET STRING
+        value = val_raw.decode("utf-8", errors="replace")
+      elif val_tag == 0x02:  # INTEGER
+        value = str(int.from_bytes(val_raw, "big", signed=True))
+      elif val_tag == 0x43:  # TimeTicks
+        value = str(int.from_bytes(val_raw, "big"))
+      elif val_tag == 0x40:  # IpAddress (APPLICATION 0)
+        if len(val_raw) == 4:
+          value = ".".join(str(b) for b in val_raw)
+        else:
+          value = val_raw.hex()
+      else:
+        value = val_raw.hex()
+      return oid_str, value
+    except Exception:
+      return None, None
+
+  _SYSTEM_OID_NAMES = {
+    "1.3.6.1.2.1.1.1": "sysDescr",
+    "1.3.6.1.2.1.1.3": "sysUpTime",
+    "1.3.6.1.2.1.1.4": "sysContact",
+    "1.3.6.1.2.1.1.5": "sysName",
+    "1.3.6.1.2.1.1.6": "sysLocation",
+  }
+
+  def _snmp_walk_system_mib(self, target, port):
+    import ipaddress as _ipaddress
+    system = {}
+    walk_findings = []
+    sock = None
+    try:
+      sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+      sock.settimeout(2)
+
+      def _walk(prefix):
+        oid = prefix
+        results = []
+        for _ in range(20):
+          pkt = self._snmp_build_getnext("public", oid)
+          sock.sendto(pkt, (target, port))
+          try:
+            resp, _ = sock.recvfrom(1024)
+          except socket.timeout:
+            break
+          resp_oid, resp_val = self._snmp_parse_response(resp)
+          if resp_oid is None or not resp_oid.startswith(prefix + "."):
+            break
+          results.append((resp_oid, resp_val))
+          oid = resp_oid
+        return results
+
+      # Walk system MIB subtree
+      for resp_oid, resp_val in _walk("1.3.6.1.2.1.1"):
+        base = ".".join(resp_oid.split(".")[:8])
+        name = self._SYSTEM_OID_NAMES.get(base)
+        if name:
+          system[name] = resp_val
+
+      sys_descr = system.get("sysDescr", "")
+      if sys_descr:
+        self._emit_metadata("os_claims", f"snmp:{port}", sys_descr)
+        if self._is_ics_indicator(sys_descr):
+          walk_findings.append(Finding(
+            severity=Severity.HIGH,
+            title="SNMP exposes ICS/SCADA device identity",
+            description=f"sysDescr contains ICS keywords: {sys_descr[:120]}",
+            evidence=f"sysDescr={sys_descr[:120]}",
+            remediation="Isolate ICS devices from general network; restrict SNMP access.",
+            confidence="firm",
+          ))
+
+      # Walk ipAddrTable for interface IPs
+      for resp_oid, resp_val in _walk("1.3.6.1.2.1.4.20.1.1"):
+        try:
+          addr = _ipaddress.ip_address(resp_val)
+        except (ValueError, TypeError):
+          continue
+        if addr.is_private:
+          self._emit_metadata("internal_ips", {"ip": str(addr), "source": f"snmp_interface:{port}"})
+          walk_findings.append(Finding(
+            severity=Severity.MEDIUM,
+            title=f"SNMP leaks internal IP address {addr}",
+            description="Interface IP from ipAddrTable is RFC1918, revealing internal topology.",
+            evidence=f"ipAddrEntry={resp_val}",
+            remediation="Restrict SNMP read access; filter sensitive MIBs.",
+            confidence="certain",
+          ))
+    except Exception:
+      pass
+    finally:
+      if sock is not None:
+        sock.close()
+    if not system and not walk_findings:
+      return None
+    return {"system": system, "findings": walk_findings}
 
   def _service_info_dns(self, target, port):  # default port: 53
     """

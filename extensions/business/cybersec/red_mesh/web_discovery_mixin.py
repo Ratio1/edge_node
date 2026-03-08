@@ -315,3 +315,183 @@ class _WebDiscoveryMixin:
         pass
 
     return probe_result(raw_data=raw, findings=findings_list)
+
+
+  # --- CMS fingerprinting ---
+
+  _CMS_EOL = {
+    "WordPress": {"3": "2015", "4": "2018"},
+    "Drupal": {"7": "2025-01", "8": "2021-11"},
+    "Joomla": {"3": "2023-08"},
+  }
+
+  _WP_SENSITIVE_PATHS = [
+    ("/xmlrpc.php", "WordPress XML-RPC — brute-force amplification vector"),
+    ("/wp-json/wp/v2/users", "WordPress REST API user enumeration"),
+  ]
+
+  def _web_test_cms_fingerprint(self, target, port):
+    """
+    Detect and version-check common CMS platforms (WordPress, Drupal, Joomla).
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    dict
+      Structured findings with CMS name, version, and EOL status.
+    """
+    findings_list = []
+    raw = {"cms": None, "version": None}
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}"
+    if port not in (80, 443):
+      base_url = f"{scheme}://{target}:{port}"
+
+    # --- WordPress detection ---
+    wp_version = None
+    try:
+      resp = requests.get(base_url, timeout=3, verify=False)
+      if resp.ok:
+        gen_match = _re.search(
+          r'<meta[^>]*name=["\']generator["\'][^>]*content=["\']WordPress\s+([0-9.]+)',
+          resp.text, _re.IGNORECASE,
+        )
+        if gen_match:
+          wp_version = gen_match.group(1)
+        elif '/wp-content/' in resp.text or '/wp-includes/' in resp.text:
+          wp_version = "unknown"
+    except Exception:
+      pass
+
+    if not wp_version:
+      try:
+        resp = requests.get(base_url + "/wp-login.php", timeout=3, verify=False, allow_redirects=False)
+        if resp.status_code in (200, 302) and ('wp-login' in resp.text.lower() or 'wordpress' in resp.text.lower()):
+          wp_version = "unknown"
+      except Exception:
+        pass
+
+    if wp_version:
+      raw["cms"] = "WordPress"
+      raw["version"] = wp_version
+      findings_list.append(Finding(
+        severity=Severity.LOW,
+        title=f"WordPress {wp_version} detected",
+        description=f"WordPress {wp_version} identified on {target}:{port}.",
+        evidence="Detection via generator tag or wp-content paths.",
+        remediation="Keep WordPress updated to the latest version.",
+        confidence="certain",
+      ))
+      findings_list += self._cms_check_eol("WordPress", wp_version)
+      for path, desc in self._WP_SENSITIVE_PATHS:
+        try:
+          resp = requests.get(base_url + path, timeout=3, verify=False)
+          if resp.status_code == 200:
+            findings_list.append(Finding(
+              severity=Severity.MEDIUM,
+              title=f"WordPress {path} exposed",
+              description=desc,
+              evidence=f"GET {base_url}{path} → HTTP 200",
+              remediation=f"Block access to {path} via web server configuration.",
+              owasp_id="A05:2021",
+              cwe_id="CWE-200",
+              confidence="certain",
+            ))
+        except Exception:
+          continue
+      return probe_result(raw_data=raw, findings=findings_list)
+
+    # --- Drupal detection ---
+    drupal_version = None
+    try:
+      resp = requests.get(base_url + "/core/CHANGELOG.txt", timeout=3, verify=False)
+      if resp.ok and "Drupal" in resp.text:
+        ver_match = _re.search(r'Drupal\s+([0-9.]+)', resp.text)
+        drupal_version = ver_match.group(1) if ver_match else "unknown"
+    except Exception:
+      pass
+    if not drupal_version:
+      try:
+        resp = requests.get(base_url, timeout=3, verify=False)
+        if resp.ok:
+          gen_match = _re.search(
+            r'<meta[^>]*name=["\']generator["\'][^>]*content=["\']Drupal\s+([0-9.]+)',
+            resp.text, _re.IGNORECASE,
+          )
+          if gen_match:
+            drupal_version = gen_match.group(1)
+      except Exception:
+        pass
+
+    if drupal_version:
+      raw["cms"] = "Drupal"
+      raw["version"] = drupal_version
+      findings_list.append(Finding(
+        severity=Severity.LOW,
+        title=f"Drupal {drupal_version} detected",
+        description=f"Drupal {drupal_version} identified on {target}:{port}.",
+        evidence="Detection via CHANGELOG.txt or generator tag.",
+        remediation="Keep Drupal updated to the latest version.",
+        confidence="certain",
+      ))
+      findings_list += self._cms_check_eol("Drupal", drupal_version)
+      return probe_result(raw_data=raw, findings=findings_list)
+
+    # --- Joomla detection ---
+    joomla_version = None
+    try:
+      resp = requests.get(base_url + "/administrator/", timeout=3, verify=False, allow_redirects=False)
+      if resp.status_code in (200, 302) and 'joomla' in resp.text.lower():
+        joomla_version = "unknown"
+        try:
+          resp2 = requests.get(base_url + "/language/en-GB/en-GB.xml", timeout=3, verify=False)
+          if resp2.ok:
+            ver_match = _re.search(r'<version>([0-9.]+)</version>', resp2.text)
+            if ver_match:
+              joomla_version = ver_match.group(1)
+        except Exception:
+          pass
+    except Exception:
+      pass
+
+    if joomla_version:
+      raw["cms"] = "Joomla"
+      raw["version"] = joomla_version
+      findings_list.append(Finding(
+        severity=Severity.LOW,
+        title=f"Joomla {joomla_version} detected",
+        description=f"Joomla {joomla_version} identified on {target}:{port}.",
+        evidence="Detection via /administrator/ page.",
+        remediation="Keep Joomla updated to the latest version.",
+        confidence="certain",
+      ))
+      findings_list += self._cms_check_eol("Joomla", joomla_version)
+
+    return probe_result(raw_data=raw, findings=findings_list)
+
+  def _cms_check_eol(self, cms_name, version):
+    """Check if a CMS version is end-of-life."""
+    findings = []
+    if version == "unknown":
+      return findings
+    eol_map = self._CMS_EOL.get(cms_name, {})
+    major = version.split(".")[0]
+    eol_date = eol_map.get(major)
+    if eol_date:
+      findings.append(Finding(
+        severity=Severity.HIGH,
+        title=f"{cms_name} {version} is end-of-life (EOL since {eol_date})",
+        description=f"This {cms_name} version no longer receives security patches.",
+        evidence=f"Version: {version}, EOL: {eol_date}",
+        remediation=f"Upgrade to the latest supported {cms_name} version.",
+        owasp_id="A06:2021",
+        cwe_id="CWE-1104",
+        confidence="certain",
+      ))
+    return findings
