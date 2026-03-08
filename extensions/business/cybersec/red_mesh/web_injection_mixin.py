@@ -533,7 +533,7 @@ class _WebInjectionMixin(_InjectionTestBase):
     try:
       resp = requests.get(
         base_url,
-        headers={"User-Agentt": "zerodiumsystem(echo REDMESH_PHP_BACKDOOR);"},
+        headers={"User-Agentt": "zerodiumsystem('echo REDMESH_PHP_BACKDOOR');"},
         timeout=3,
         verify=False,
       )
@@ -572,7 +572,10 @@ class _WebInjectionMixin(_InjectionTestBase):
           timeout=3,
           verify=False,
         )
-        if "REDMESH_PHPCGI_TEST" in resp.text:
+        # Guard: auto_prepend_file output appears at the very start of the
+        # response when truly executed.  Debug/error pages (e.g. Laravel
+        # Ignition) may *reflect* the POST body deep in HTML, causing FP.
+        if "REDMESH_PHPCGI_TEST" in resp.text[:500]:
           findings_list.append(Finding(
             severity=Severity.CRITICAL,
             title="CVE-2024-4577: PHP-CGI argument injection RCE",

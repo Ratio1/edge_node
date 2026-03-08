@@ -6352,7 +6352,7 @@ class TestBatch3GapFixes(unittest.TestCase):
       resp.ok = True
       resp.status_code = 200
       headers = kwargs.get("headers", {})
-      if "zerodiumsystem" in headers.get("User-Agentt", ""):
+      if "zerodium" in headers.get("User-Agentt", ""):
         resp.text = "REDMESH_PHP_BACKDOOR\n"
       else:
         resp.text = "<html>PHP page</html>"
