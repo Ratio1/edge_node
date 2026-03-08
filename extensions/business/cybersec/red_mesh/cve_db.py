@@ -47,9 +47,7 @@ CVE_DATABASE: list = [
   CveEntry("redis", "<7.2.7",  "CVE-2024-46981", Severity.HIGH, "Lua GC use-after-free RCE", "CWE-416"),
 
   # ── MySQL ──────────────────────────────────────────────────────────
-  CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
-  CveEntry("mysql", ">=5.6,<5.6.33",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
-  CveEntry("mysql", ">=5.7,<5.7.15",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
+  CveEntry("mysql", ">=5.7,<5.7.20",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
   CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6664", Severity.HIGH, "Privilege escalation via mysqld_safe", "CWE-269"),
   CveEntry("mysql", ">=8.0,<8.0.23",  "CVE-2021-2022", Severity.MEDIUM, "InnoDB buffer pool corruption", "CWE-787"),
   CveEntry("mysql", ">=5.7,<5.7.44",  "CVE-2024-20973", Severity.HIGH, "Optimizer DoS via low-privilege network attack", "CWE-404"),
@@ -133,78 +131,6 @@ CVE_DATABASE: list = [
 
   # ── Erlang OTP SSH ──────────────────────────────────────────────
   CveEntry("erlang_ssh", "<5.2.2", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
-
-  # ── CouchDB ──────────────────────────────────────────────────────
-  CveEntry("couchdb", "<3.2.2",           "CVE-2022-24706", Severity.CRITICAL, "Default Erlang cookie RCE via cluster protocol", "CWE-1188"),
-  CveEntry("couchdb", ">=3.0.0,<3.1.2",   "CVE-2021-38295", Severity.HIGH, "Privilege escalation via cluster API", "CWE-269"),
-  CveEntry("couchdb", "<2.1.1",           "CVE-2017-12635", Severity.CRITICAL, "Admin creation race condition bypass", "CWE-269"),
-  CveEntry("couchdb", "<2.1.1",           "CVE-2017-12636", Severity.CRITICAL, "OS command injection via query server config", "CWE-78"),
-
-  # ── InfluxDB ────────────────────────────────────────────────────
-  CveEntry("influxdb", "<1.7.6",  "CVE-2019-20933", Severity.CRITICAL, "JWT auth bypass via empty shared secret", "CWE-287"),
-
-  # ── Drupal ─────────────────────────────────────────────────────
-  CveEntry("drupal", ">=7.0,<7.58",      "CVE-2018-7600", Severity.CRITICAL, "Drupalgeddon2: RCE via Form API", "CWE-20"),
-  CveEntry("drupal", ">=8.0.0,<8.3.9",   "CVE-2018-7600", Severity.CRITICAL, "Drupalgeddon2: RCE via Form API", "CWE-20"),
-  CveEntry("drupal", ">=8.4.0,<8.4.6",   "CVE-2018-7600", Severity.CRITICAL, "Drupalgeddon2: RCE via Form API", "CWE-20"),
-  CveEntry("drupal", ">=8.5.0,<8.5.1",   "CVE-2018-7600", Severity.CRITICAL, "Drupalgeddon2: RCE via Form API", "CWE-20"),
-  CveEntry("drupal", ">=7.0,<7.59",      "CVE-2018-7602", Severity.CRITICAL, "Drupalgeddon3: RCE via Contextual links", "CWE-20"),
-  CveEntry("drupal", ">=8.0.0,<8.4.8",   "CVE-2018-7602", Severity.CRITICAL, "Drupalgeddon3: RCE via Contextual links", "CWE-20"),
-  CveEntry("drupal", ">=8.5.0,<8.5.3",   "CVE-2018-7602", Severity.CRITICAL, "Drupalgeddon3: RCE via Contextual links", "CWE-20"),
-  CveEntry("drupal", ">=7.0,<7.32",      "CVE-2014-3704", Severity.CRITICAL, "SQL injection via expand_arguments()", "CWE-89"),
-
-  # ── WordPress ──────────────────────────────────────────────────
-  CveEntry("wordpress", "<4.7.1",         "CVE-2016-10033", Severity.CRITICAL, "PHPMailer RCE via wp_mail()", "CWE-78"),
-  CveEntry("wordpress", "<4.7.4",         "CVE-2017-8295", Severity.HIGH, "Host header password reset hijack", "CWE-640"),
-  CveEntry("wordpress", ">=4.7.0,<4.7.2", "CVE-2017-1001000", Severity.HIGH, "REST API content injection", "CWE-284"),
-
-  # ── Joomla ─────────────────────────────────────────────────────
-  CveEntry("joomla", ">=4.0.0,<4.2.8",   "CVE-2023-23752", Severity.HIGH, "Unauthenticated information disclosure via REST API", "CWE-284"),
-
-  # ── Django ─────────────────────────────────────────────────────
-  CveEntry("django", "<1.11.5",          "CVE-2017-12794", Severity.MEDIUM, "Debug page XSS via invalid URL parameter", "CWE-79"),
-
-  # ── Laravel / Ignition ─────────────────────────────────────────
-  CveEntry("laravel_ignition", "<2.5.2",  "CVE-2021-3129", Severity.CRITICAL, "Ignition debug mode RCE via file_put_contents", "CWE-94"),
-
-  # ── Apache Struts2 ─────────────────────────────────────────────
-  CveEntry("struts2", ">=2.3.5,<2.3.32",   "CVE-2017-5638", Severity.CRITICAL, "S2-045: OGNL injection via Content-Type header RCE", "CWE-94"),
-  CveEntry("struts2", ">=2.5.0,<2.5.10.1", "CVE-2017-5638", Severity.CRITICAL, "S2-045: OGNL injection via Content-Type header RCE", "CWE-94"),
-  CveEntry("struts2", ">=2.3.5,<2.3.33",   "CVE-2017-9805", Severity.CRITICAL, "S2-052: XML deserialization RCE via REST plugin", "CWE-502"),
-  CveEntry("struts2", ">=2.5.0,<2.5.13",   "CVE-2017-9805", Severity.CRITICAL, "S2-052: XML deserialization RCE via REST plugin", "CWE-502"),
-  CveEntry("struts2", ">=2.0.0,<2.5.26",   "CVE-2020-17530", Severity.CRITICAL, "S2-061: Forced OGNL evaluation via tag attributes", "CWE-94"),
-
-  # ── Oracle WebLogic ──────────────────────────────────────────
-  CveEntry("weblogic", ">=10.3.6.0,<10.3.6.1", "CVE-2017-10271", Severity.CRITICAL, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
-  CveEntry("weblogic", ">=12.1.3.0,<12.1.3.1", "CVE-2017-10271", Severity.CRITICAL, "XMLDecoder deserialization RCE via wls-wsat", "CWE-502"),
-  CveEntry("weblogic", ">=10.3.6.0,<10.3.6.1", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
-  CveEntry("weblogic", ">=12.1.3.0,<12.2.1.5", "CVE-2020-14882", Severity.CRITICAL, "Console unauthenticated takeover RCE", "CWE-306"),
-  CveEntry("weblogic", ">=12.2.1.3,<12.2.1.4", "CVE-2023-21839", Severity.HIGH, "IIOP/T3 protocol deserialization RCE", "CWE-502"),
-
-  # ── Apache Tomcat ────────────────────────────────────────────
-  CveEntry("tomcat", ">=9.0.0,<9.0.31",   "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
-  CveEntry("tomcat", ">=8.5.0,<8.5.51",   "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
-  CveEntry("tomcat", ">=7.0.0,<7.0.100",  "CVE-2020-1938", Severity.CRITICAL, "Ghostcat: AJP connector file read/inclusion RCE", "CWE-20"),
-  CveEntry("tomcat", ">=7.0.0,<7.0.81",   "CVE-2017-12615", Severity.HIGH, "PUT method JSP file upload RCE", "CWE-434"),
-  CveEntry("tomcat", ">=9.0.0,<9.0.99",   "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
-  CveEntry("tomcat", ">=10.1.0,<10.1.35", "CVE-2025-24813", Severity.CRITICAL, "Partial PUT deserialization RCE", "CWE-502"),
-
-  # ── JBoss Application Server ─────────────────────────────────
-  CveEntry("jboss", ">=4.0,<7.0",   "CVE-2017-12149", Severity.CRITICAL, "Java deserialization RCE via /invoker/readonly", "CWE-502"),
-
-  # ── Spring Framework ─────────────────────────────────────────
-  CveEntry("spring_framework", ">=5.3.0,<5.3.18", "CVE-2022-22965", Severity.CRITICAL, "Spring4Shell: ClassLoader manipulation RCE", "CWE-94"),
-  CveEntry("spring_framework", ">=5.2.0,<5.2.20", "CVE-2022-22965", Severity.CRITICAL, "Spring4Shell: ClassLoader manipulation RCE", "CWE-94"),
-
-  # ── Spring Cloud Function ────────────────────────────────────
-  CveEntry("spring_cloud_function", ">=3.0.0,<3.1.7", "CVE-2022-22963", Severity.CRITICAL, "SpEL injection via routing header RCE", "CWE-94"),
-  CveEntry("spring_cloud_function", ">=3.2.0,<3.2.3", "CVE-2022-22963", Severity.CRITICAL, "SpEL injection via routing header RCE", "CWE-94"),
-
-  # ── Eclipse Jetty ─────────────────────────────────────────────
-  CveEntry("jetty", ">=9.4.0,<9.4.52", "CVE-2023-26048", Severity.MEDIUM, "Request large content denial-of-service via multipart", "CWE-400"),
-  CveEntry("jetty", ">=9.4.0,<9.4.52", "CVE-2023-26049", Severity.MEDIUM, "Cookie parsing allows exfiltration of HttpOnly cookies", "CWE-200"),
-  CveEntry("jetty", ">=9.4.0,<9.4.54", "CVE-2023-36478", Severity.HIGH, "HTTP/2 HPACK integer overflow leads to buffer overflow", "CWE-190"),
-  CveEntry("jetty", ">=9.4.0,<9.4.51", "CVE-2023-40167", Severity.MEDIUM, "HTTP request smuggling via invalid Transfer-Encoding", "CWE-444"),
 
   # ── BIND (DNS) ──────────────────────────────────────────────────
   CveEntry("bind", "<9.11.37",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
