@@ -4771,6 +4771,275 @@ class TestPhase17aQuickWins(unittest.TestCase):
     self.assertFalse(any("EOL JVM" in t for t in titles))
 
 
+class TestPhase17bMediumFeatures(unittest.TestCase):
+  """Phase 17b: Medium feature probe enhancements."""
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [80]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-17b",
+      initiator="init@example",
+      local_id_prefix="M",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  # ---- 17b-2: HTTP Basic Auth ----
+
+  def test_http_basic_auth_detects_default_creds(self):
+    """Default admin:admin credential flagged when accepted."""
+    _, worker = self._build_worker(ports=[80])
+
+    def mock_get(url, **kwargs):
+      resp = MagicMock()
+      auth = kwargs.get("auth")
+      if auth is None:
+        # Initial probe — return 401 with Basic auth
+        resp.status_code = 401
+        resp.headers = {"WWW-Authenticate": 'Basic realm="test"'}
+      elif auth == ("admin", "admin"):
+        resp.status_code = 200
+        resp.headers = {}
+      else:
+        resp.status_code = 401
+        resp.headers = {}
+      return resp
+
+    with patch('requests.get', side_effect=mock_get):
+      result = worker._service_info_http_basic_auth("10.0.0.1", 80)
+    self.assertIsNotNone(result)
+    titles = [f["title"] for f in result.get("findings", [])]
+    self.assertTrue(any("default credential" in t.lower() for t in titles), f"titles={titles}")
+
+  def test_http_basic_auth_skips_non_basic(self):
+    """Probe returns None when no Basic auth is present."""
+    _, worker = self._build_worker(ports=[80])
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {}
+    with patch('requests.get', return_value=mock_resp):
+      result = worker._service_info_http_basic_auth("10.0.0.1", 80)
+    self.assertIsNone(result)
+
+  def test_http_basic_auth_no_rate_limiting(self):
+    """Flags missing rate limiting when all attempts return 401."""
+    _, worker = self._build_worker(ports=[80])
+    call_count = [0]
+
+    def mock_get(url, **kwargs):
+      resp = MagicMock()
+      call_count[0] += 1
+      resp.status_code = 401
+      resp.headers = {"WWW-Authenticate": 'Basic realm="test"'}
+      return resp
+
+    with patch('requests.get', side_effect=mock_get):
+      result = worker._service_info_http_basic_auth("10.0.0.1", 80)
+    self.assertIsNotNone(result)
+    titles = [f["title"] for f in result.get("findings", [])]
+    self.assertTrue(any("rate limiting" in t.lower() for t in titles), f"titles={titles}")
+
+  # ---- 17b-3: CSRF detection ----
+
+  def test_csrf_detects_missing_token(self):
+    """POST form without CSRF hidden field is flagged."""
+    _, worker = self._build_worker(ports=[80])
+    html = '<html><body><form method="POST" action="/submit"><input type="text" name="q"><button>Go</button></form></body></html>'
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = html
+    mock_resp.headers = {}
+    with patch('requests.get', return_value=mock_resp):
+      result = worker._web_test_csrf("10.0.0.1", 80)
+    titles = [f["title"] for f in result.get("findings", [])]
+    self.assertTrue(any("csrf" in t.lower() for t in titles), f"titles={titles}")
+
+  def test_csrf_passes_with_token(self):
+    """POST form with csrf_token field passes."""
+    _, worker = self._build_worker(ports=[80])
+    html = '<html><body><form method="POST"><input type="hidden" name="csrf_token" value="abc123"><input type="text" name="q"></form></body></html>'
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = html
+    mock_resp.headers = {}
+    with patch('requests.get', return_value=mock_resp):
+      result = worker._web_test_csrf("10.0.0.1", 80)
+    findings = result.get("findings", [])
+    csrf_findings = [f for f in findings if "csrf" in f.get("title", "").lower()]
+    self.assertEqual(len(csrf_findings), 0)
+
+  def test_csrf_passes_with_header_token(self):
+    """SPA-style X-CSRF-Token header causes skip."""
+    _, worker = self._build_worker(ports=[80])
+    html = '<html><body><form method="POST"><input type="text" name="q"></form></body></html>'
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.text = html
+    mock_resp.headers = {"x-csrf-token": "abc123"}
+    with patch('requests.get', return_value=mock_resp):
+      result = worker._web_test_csrf("10.0.0.1", 80)
+    findings = result.get("findings", [])
+    csrf_findings = [f for f in findings if "csrf" in f.get("title", "").lower()]
+    self.assertEqual(len(csrf_findings), 0)
+
+  # ---- 17b-4: SNMP MIB walk ----
+
+  def test_snmp_getnext_packet_valid(self):
+    """GETNEXT packet is well-formed ASN.1."""
+    _, worker = self._build_worker()
+    pkt = worker._snmp_build_getnext("public", "1.3.6.1.2.1.1.0")
+    # First byte is 0x30 (SEQUENCE)
+    self.assertEqual(pkt[0], 0x30)
+    # Community string "public" should be embedded
+    self.assertIn(b"public", pkt)
+
+  def test_snmp_encode_oid_basic(self):
+    """OID encoding for well-known system MIB OID."""
+    _, worker2 = self._build_worker()
+    encoded = worker2._snmp_encode_oid("1.3.6.1.2.1.1.1.0")
+    # First byte: 40*1 + 3 = 43 = 0x2B
+    self.assertEqual(encoded[0], 0x2B)
+
+  def test_snmp_encode_oid_large_value(self):
+    """OID encoding handles values >= 128."""
+    _, worker = self._build_worker()
+    encoded = worker._snmp_encode_oid("1.3.6.1.2.1.4.20.1.1")
+    self.assertEqual(encoded[0], 0x2B)  # 40*1 + 3
+
+  def test_snmp_parse_response_valid(self):
+    """Parse a well-formed SNMP response."""
+    # Build a valid SNMP response manually
+    _, worker = self._build_worker()
+    # Construct minimal SNMP response with OID 1.3.6.1.2.1.1.1.0 and value "Linux"
+    oid_body = worker._snmp_encode_oid("1.3.6.1.2.1.1.1.0")
+    oid_tlv = bytes([0x06, len(oid_body)]) + oid_body
+    value = b"Linux"
+    val_tlv = bytes([0x04, len(value)]) + value
+    varbind = bytes([0x30, len(oid_tlv) + len(val_tlv)]) + oid_tlv + val_tlv
+    varbind_seq = bytes([0x30, len(varbind)]) + varbind
+    req_id = b"\x02\x01\x01"
+    err_status = b"\x02\x01\x00"
+    err_index = b"\x02\x01\x00"
+    pdu_body = req_id + err_status + err_index + varbind_seq
+    pdu = bytes([0xA2, len(pdu_body)]) + pdu_body
+    version = b"\x02\x01\x00"
+    comm = bytes([0x04, 0x06]) + b"public"
+    inner = version + comm + pdu
+    packet = bytes([0x30, len(inner)]) + inner
+
+    oid_str, val_str = worker._snmp_parse_response(packet)
+    self.assertEqual(oid_str, "1.3.6.1.2.1.1.1.0")
+    self.assertEqual(val_str, "Linux")
+
+  def test_snmp_ics_detection(self):
+    """ICS keywords in sysDescr trigger detection."""
+    _, worker = self._build_worker()
+    self.assertTrue(worker._is_ics_indicator("Siemens SIMATIC S7-300"))
+    self.assertTrue(worker._is_ics_indicator("Schneider Electric Modicon M340"))
+    self.assertFalse(worker._is_ics_indicator("Linux 5.15.0-generic"))
+
+  # ---- 17b-5: CMS fingerprinting ----
+
+  def test_cms_detects_wordpress(self):
+    """WordPress detected via generator meta tag."""
+    _, worker = self._build_worker(ports=[80])
+    html = '<html><head><meta name="generator" content="WordPress 6.4.2"></head><body></body></html>'
+    mock_resp = MagicMock()
+    mock_resp.ok = True
+    mock_resp.status_code = 200
+    mock_resp.text = html
+    with patch('requests.get', return_value=mock_resp):
+      result = worker._web_test_cms_fingerprint("10.0.0.1", 80)
+    titles = [f["title"] for f in result.get("findings", [])]
+    self.assertTrue(any("WordPress 6.4.2" in t for t in titles), f"titles={titles}")
+
+  def test_cms_detects_drupal_changelog(self):
+    """Drupal detected via CHANGELOG.txt."""
+    _, worker = self._build_worker(ports=[80])
+
+    def mock_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      if "CHANGELOG" in url:
+        resp.text = "Drupal 10.2.1 (2024-01-15)"
+      else:
+        resp.text = "<html><body>Hello</body></html>"
+      return resp
+
+    with patch('requests.get', side_effect=mock_get):
+      result = worker._web_test_cms_fingerprint("10.0.0.1", 80)
+    titles = [f["title"] for f in result.get("findings", [])]
+    self.assertTrue(any("Drupal 10.2.1" in t for t in titles), f"titles={titles}")
+
+  def test_cms_flags_eol_drupal7(self):
+    """Drupal 7 flagged as EOL."""
+    _, worker = self._build_worker(ports=[80])
+    findings = worker._cms_check_eol("Drupal", "7.98")
+    self.assertTrue(any("end-of-life" in f.title.lower() for f in findings))
+
+  def test_cms_no_eol_modern_wordpress(self):
+    """WordPress 6.x not flagged as EOL."""
+    _, worker = self._build_worker(ports=[80])
+    findings = worker._cms_check_eol("WordPress", "6.4.2")
+    eol_findings = [f for f in findings if "end-of-life" in f.title.lower()]
+    self.assertEqual(len(eol_findings), 0)
+
+  # ---- 17b-1: SMB share enumeration ----
+
+  def test_smb_enum_shares_returns_list(self):
+    """_smb_enum_shares returns empty list on connection failure."""
+    _, worker = self._build_worker(ports=[445])
+    result = worker._smb_enum_shares("192.0.2.1", 99999)
+    self.assertIsInstance(result, list)
+    self.assertEqual(len(result), 0)
+
+  def test_smb_parse_netshareenumall_empty(self):
+    """Empty stub data returns empty list."""
+    _, worker = self._build_worker(ports=[445])
+    result = worker._parse_netshareenumall_response(b"")
+    self.assertEqual(result, [])
+
+  def test_smb_parse_netshareenumall_too_short(self):
+    """Short stub returns empty list."""
+    _, worker = self._build_worker(ports=[445])
+    result = worker._parse_netshareenumall_response(b"\x00" * 10)
+    self.assertEqual(result, [])
+
+  def test_smb_share_wiring_admin_shares_high(self):
+    """Admin shares found via null session produce HIGH finding."""
+    _, worker = self._build_worker(ports=[445])
+    mock_shares = [
+      {"name": "IPC$", "type": 3, "comment": "IPC Service"},
+      {"name": "C$", "type": 0, "comment": "Default share"},
+      {"name": "public", "type": 0, "comment": "Public files"},
+    ]
+    with patch.object(worker, '_smb_enum_shares', return_value=mock_shares), \
+         patch.object(worker, '_smb_try_null_session', return_value="4.10.0"), \
+         patch('socket.socket') as mock_sock_cls:
+      mock_sock = MagicMock()
+      mock_sock_cls.return_value = mock_sock
+      # Return SMBv1 negotiate response
+      smb_resp = bytearray(128)
+      smb_resp[0:4] = b"\xffSMB"
+      smb_resp[4] = 0x72
+      smb_resp[32] = 17  # word_count
+      smb_resp[35] = 0x08  # security_mode (signing required)
+      mock_sock.recv.side_effect = [
+        b"\x00\x00\x00\x80",  # NetBIOS header
+        bytes(smb_resp),       # SMB response
+      ]
+      result = worker._service_info_smb("10.0.0.1", 445)
+    titles = [f["title"] for f in result.get("findings", [])]
+    self.assertTrue(any("admin shares" in t.lower() for t in titles), f"titles={titles}")
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -4794,4 +5063,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase15Listing))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase16ScanMetrics))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17aQuickWins))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17bMediumFeatures))
   runner.run(suite)
