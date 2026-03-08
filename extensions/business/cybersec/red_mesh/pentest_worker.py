@@ -157,6 +157,7 @@ class MetricsCollector:
       "ports_scanned": self._ports_scanned,
       "ports_skipped": self._ports_skipped,
       "coverage_pct": pct,
+      "open_ports_count": len(self._open_ports),
     }
 
   def build(self) -> ScanMetrics:

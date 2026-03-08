@@ -4285,11 +4285,15 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     mc.start_scan(100)
     for i in range(50):
       mc.record_connection("connected" if i < 5 else "refused", 0.01)
+    # Simulate finding 5 open ports (via record_open_port)
+    for i in range(5):
+      mc.record_open_port(8000 + i)
     d = mc.build().to_dict()
     cov = d["coverage"]
     self.assertEqual(cov["ports_in_range"], 100)
     self.assertEqual(cov["ports_scanned"], 50)
     self.assertEqual(cov["coverage_pct"], 50.0)
+    self.assertEqual(cov["open_ports_count"], 5)
 
   def test_scan_metrics_model_roundtrip(self):
     """ScanMetrics.from_dict(sm.to_dict()) preserves all fields."""
@@ -4330,16 +4334,24 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     m1 = {
       "connection_outcomes": {"connected": 30, "timeout": 5, "total": 35},
-      "coverage": {"ports_in_range": 500, "ports_scanned": 500, "ports_skipped": 0, "coverage_pct": 100.0},
+      "coverage": {"ports_in_range": 500, "ports_scanned": 500, "ports_skipped": 0, "coverage_pct": 100.0, "open_ports_count": 3},
       "finding_distribution": {"HIGH": 2, "MEDIUM": 1},
+      "service_distribution": {"http": 2, "ssh": 1},
+      "probe_breakdown": {"_service_info_http": "completed", "_web_test_xss": "completed"},
+      "phase_durations": {"port_scan": 30.0, "fingerprint": 10.0, "service_probes": 15.0},
+      "response_times": {"min": 0.01, "max": 0.5, "mean": 0.05, "median": 0.04, "stddev": 0.03, "p95": 0.2, "p99": 0.4, "count": 500},
       "probes_attempted": 3, "probes_completed": 3, "probes_skipped": 0, "probes_failed": 0,
       "total_duration": 60.0,
       "rate_limiting_detected": False, "blocking_detected": False,
     }
     m2 = {
       "connection_outcomes": {"connected": 20, "timeout": 10, "total": 30},
-      "coverage": {"ports_in_range": 500, "ports_scanned": 400, "ports_skipped": 100, "coverage_pct": 80.0},
+      "coverage": {"ports_in_range": 500, "ports_scanned": 400, "ports_skipped": 100, "coverage_pct": 80.0, "open_ports_count": 2},
       "finding_distribution": {"HIGH": 1, "LOW": 3},
+      "service_distribution": {"http": 1, "mysql": 1},
+      "probe_breakdown": {"_service_info_http": "completed", "_service_info_mysql": "completed", "_web_test_xss": "failed"},
+      "phase_durations": {"port_scan": 45.0, "fingerprint": 8.0, "service_probes": 20.0},
+      "response_times": {"min": 0.02, "max": 0.8, "mean": 0.08, "median": 0.06, "stddev": 0.05, "p95": 0.3, "p99": 0.7, "count": 400},
       "probes_attempted": 3, "probes_completed": 2, "probes_skipped": 1, "probes_failed": 0,
       "total_duration": 75.0,
       "rate_limiting_detected": True, "blocking_detected": False,
@@ -4353,12 +4365,34 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     self.assertEqual(merged["coverage"]["ports_scanned"], 900)
     self.assertEqual(merged["coverage"]["ports_skipped"], 100)
     self.assertEqual(merged["coverage"]["coverage_pct"], 90.0)
+    self.assertEqual(merged["coverage"]["open_ports_count"], 5)
     self.assertEqual(merged["finding_distribution"]["HIGH"], 3)
     self.assertEqual(merged["finding_distribution"]["LOW"], 3)
     self.assertEqual(merged["finding_distribution"]["MEDIUM"], 1)
     self.assertEqual(merged["probes_attempted"], 6)
     self.assertEqual(merged["probes_completed"], 5)
     self.assertEqual(merged["probes_skipped"], 1)
+    # Service distribution summed
+    self.assertEqual(merged["service_distribution"]["http"], 3)
+    self.assertEqual(merged["service_distribution"]["ssh"], 1)
+    self.assertEqual(merged["service_distribution"]["mysql"], 1)
+    # Probe breakdown: union, worst status wins
+    self.assertEqual(merged["probe_breakdown"]["_service_info_http"], "completed")
+    self.assertEqual(merged["probe_breakdown"]["_service_info_mysql"], "completed")
+    self.assertEqual(merged["probe_breakdown"]["_web_test_xss"], "failed")  # failed > completed
+    # Phase durations: max per phase
+    self.assertEqual(merged["phase_durations"]["port_scan"], 45.0)
+    self.assertEqual(merged["phase_durations"]["fingerprint"], 10.0)
+    self.assertEqual(merged["phase_durations"]["service_probes"], 20.0)
+    # Response times: merged stats
+    rt = merged["response_times"]
+    self.assertEqual(rt["min"], 0.01)   # global min
+    self.assertEqual(rt["max"], 0.8)    # global max
+    self.assertEqual(rt["count"], 900)  # total count
+    # Weighted mean: (0.05*500 + 0.08*400) / 900 ≈ 0.0633
+    self.assertAlmostEqual(rt["mean"], 0.0633, places=3)
+    self.assertEqual(rt["p95"], 0.3)    # max of per-thread p95
+    self.assertEqual(rt["p99"], 0.7)    # max of per-thread p99
     # Max duration
     self.assertEqual(merged["total_duration"], 75.0)
     # OR flags
