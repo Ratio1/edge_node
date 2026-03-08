@@ -1466,6 +1466,7 @@ class _ServiceInfoMixin:
     (_re.compile(r'libssh[_\s-](\d+\.\d+(?:\.\d+)?)', _re.IGNORECASE), "libssh"),
     (_re.compile(r'dropbear[_\s](\d+(?:\.\d+)*)', _re.IGNORECASE), "dropbear"),
     (_re.compile(r'paramiko[_\s](\d+\.\d+(?:\.\d+)?)', _re.IGNORECASE), "paramiko"),
+    (_re.compile(r'Erlang[/\s](?:OTP[_/\s]*)?(\d+\.\d+(?:\.\d+)*)', _re.IGNORECASE), "erlang_ssh"),
   ]
 
   def _ssh_identify_library(self, banner):
@@ -1736,10 +1737,24 @@ class _ServiceInfoMixin:
 
     # CVE check on extracted MTA version
     _smtp_product_map = {'exim': 'exim', 'postfix': 'postfix', 'opensmtpd': 'opensmtpd'}
-    if version_match and version_match.group(2):
-      _cve_product = _smtp_product_map.get(version_match.group(1).lower())
+    _mta_version = version_match.group(2) if version_match and version_match.group(2) else None
+    _mta_name = version_match.group(1).lower() if version_match else None
+
+    # If banner lacks version (common with OpenSMTPD), try HELP command
+    if version_match and not _mta_version:
+      try:
+        code, msg = smtp.docmd("HELP")
+        help_text = msg.decode(errors="replace") if isinstance(msg, bytes) else str(msg)
+        _help_ver = _re.search(r'(\d+\.\d+(?:\.\d+)*(?:p\d+)?)', help_text)
+        if _help_ver:
+          _mta_version = _help_ver.group(1)
+      except Exception:
+        pass
+
+    if _mta_name and _mta_version:
+      _cve_product = _smtp_product_map.get(_mta_name)
       if _cve_product:
-        findings += check_cves(_cve_product, version_match.group(2))
+        findings += check_cves(_cve_product, _mta_version)
 
     if result["server_hostname"]:
       # Check if hostname reveals container/internal info
@@ -4420,6 +4435,10 @@ class _ServiceInfoMixin:
                     confidence="certain",
                   ))
                   parsed = True
+                  # CVE check — version.bind is BIND-specific
+                  _bind_m = _re.search(r'(\d+\.\d+(?:\.\d+)*)', txt)
+                  if _bind_m:
+                    findings += check_cves("bind", _bind_m.group(1))
 
       # Fallback: check raw data for version keywords
       if not parsed:
@@ -4463,32 +4482,79 @@ class _ServiceInfoMixin:
 
     return probe_result(raw_data=raw, findings=findings)
 
+  def _dns_discover_zones(self, target, port):
+    """Discover zone names the DNS server is authoritative for.
+
+    Strategy: send SOA queries for a set of candidate domains and check
+    for authoritative (AA-flag) responses.  This is far more reliable than
+    reverse-DNS guessing when the target serves non-obvious zones.
+
+    Returns list of domain strings (may be empty).
+    """
+    candidates = set()
+
+    # 1. Reverse DNS of target → extract domain
+    try:
+      import socket as _socket
+      hostname, _, _ = _socket.gethostbyaddr(target)
+      parts = hostname.split(".")
+      if len(parts) >= 2:
+        candidates.add(".".join(parts[-2:]))
+      if len(parts) >= 3:
+        candidates.add(".".join(parts[-3:]))
+    except Exception:
+      pass
+
+    # 2. Common pentest / CTF domains
+    candidates.update(["vulhub.org", "example.com", "test.local"])
+
+    # 3. Probe each candidate with a SOA query — keep only authoritative hits
+    authoritative = []
+    for domain in list(candidates):
+      try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(2)
+        tid = random.randint(0, 0xffff)
+        header = struct.pack('>HHHHHH', tid, 0x0100, 1, 0, 0, 0)
+        qname = b""
+        for label in domain.split("."):
+          qname += bytes([len(label)]) + label.encode()
+        qname += b"\x00"
+        question = struct.pack('>HH', 6, 1)  # QTYPE=SOA, QCLASS=IN
+        sock.sendto(header + qname + question, (target, port))
+        data, _ = sock.recvfrom(512)
+        sock.close()
+        if len(data) >= 12 and struct.unpack('>H', data[:2])[0] == tid:
+          flags = struct.unpack('>H', data[2:4])[0]
+          aa = (flags >> 10) & 1   # Authoritative Answer
+          rcode = flags & 0x0F
+          ancount = struct.unpack('>H', data[6:8])[0]
+          if aa and rcode == 0 and ancount > 0:
+            authoritative.append(domain)
+      except Exception:
+        pass
+
+    # Return authoritative zones first, then remaining candidates as fallback
+    seen = set(authoritative)
+    result = list(authoritative)
+    for d in candidates:
+      if d not in seen:
+        result.append(d)
+    return result
+
   def _dns_test_axfr(self, target, port):
     """Attempt DNS zone transfer (AXFR) via TCP.
+
+    Uses SOA-based zone discovery to find authoritative zones before
+    attempting AXFR, falling back to reverse DNS and common domains.
 
     Returns list of findings.
     """
     findings = []
 
-    # Derive domain from reverse DNS of target, or use a common test domain
-    test_domains = []
-    try:
-      import socket as _socket
-      hostname, _, _ = _socket.gethostbyaddr(target)
-      # Extract domain from hostname (e.g., "host.example.com" → "example.com")
-      parts = hostname.split(".")
-      if len(parts) >= 2:
-        test_domains.append(".".join(parts[-2:]))
-      if len(parts) >= 3:
-        test_domains.append(".".join(parts[-3:]))
-    except Exception:
-      pass
+    test_domains = self._dns_discover_zones(target, port)
 
-    # Always test with the target itself as a domain if nothing else
-    if not test_domains:
-      test_domains = ["vulhub.org", "example.com"]
-
-    for domain in test_domains[:2]:  # Test at most 2 domains
+    for domain in test_domains[:4]:  # Test at most 4 domains
       try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(3)

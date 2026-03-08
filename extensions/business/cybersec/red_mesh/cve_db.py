@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from .findings import Finding, Severity
 
-CVE_DB_LAST_UPDATED = "2026-02-20"
+CVE_DB_LAST_UPDATED = "2026-03-08"
 
 
 @dataclass(frozen=True)
@@ -128,6 +128,18 @@ CVE_DATABASE: list = [
   # ── Dropbear ─────────────────────────────────────────────────────
   CveEntry("dropbear", "<2018.76", "CVE-2018-15599", Severity.MEDIUM, "Username enumeration via response size", "CWE-203"),
   CveEntry("dropbear", "<2016.74", "CVE-2016-7406", Severity.HIGH, "Format string vulnerability in dbclient", "CWE-134"),
+
+  # ── Erlang OTP SSH ──────────────────────────────────────────────
+  CveEntry("erlang_ssh", "<5.2.2", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+
+  # ── BIND (DNS) ──────────────────────────────────────────────────
+  CveEntry("bind", "<9.11.37",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
+  CveEntry("bind", "<9.16.33",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),
+  CveEntry("bind", "<9.16.42",  "CVE-2023-2828", Severity.HIGH, "Cache exhaustion DoS via crafted queries", "CWE-770"),
+  CveEntry("bind", "<9.18.24",  "CVE-2023-4408", Severity.HIGH, "DNS message parsing CPU exhaustion DoS", "CWE-400"),
+  CveEntry("bind", "<9.11.31",  "CVE-2021-25216", Severity.CRITICAL, "GSSAPI SPNEGO buffer overflow RCE", "CWE-120"),
+  CveEntry("bind", "<9.11.19",  "CVE-2020-8617", Severity.HIGH, "TSIG validity check assertion failure DoS", "CWE-617"),
+  CveEntry("bind", "<9.10.4",   "CVE-2016-2776", Severity.HIGH, "Crafted query buffer.c assertion failure DoS", "CWE-617"),
 ]
 
 
