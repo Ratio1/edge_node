@@ -3829,6 +3829,258 @@ class TestPhase12LiveProgress(unittest.TestCase):
       self.assertIsNone(c.kwargs["value"])
 
 
+class TestPhase14Purge(unittest.TestCase):
+  """Phase 14: Job Deletion & Purge."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return
+    TestPhase1ConfigCID._mock_plugin_modules()
+
+  def _get_plugin_class(self):
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def _make_plugin(self):
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+    return plugin
+
+  def test_purge_finalized_collects_all_cids(self):
+    """Finalized purge collects archive + config + aggregated_report + worker report CIDs."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin()
+
+    # CStore stub for a finalized job
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "FINALIZED",
+      "job_cid": "cid-archive",
+      "job_config_cid": "cid-config",
+    }
+    plugin.chainstore_hget.return_value = job_specs
+
+    # Archive contains nested CIDs
+    archive = {
+      "passes": [
+        {
+          "aggregated_report_cid": "cid-agg-1",
+          "worker_reports": {
+            "worker-A": {"report_cid": "cid-wr-A"},
+            "worker-B": {"report_cid": "cid-wr-B"},
+          },
+        },
+      ],
+    }
+    plugin.r1fs.get_json.return_value = archive
+    plugin.r1fs.delete_file.return_value = True
+    plugin.chainstore_hgetall.return_value = {}
+
+    # Normalize returns the specs as-is
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
+
+    result = Plugin.purge_job(plugin, "job-1")
+    self.assertEqual(result["status"], "success")
+
+    # Verify all 5 CIDs were deleted
+    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
+    self.assertEqual(deleted_cids, {"cid-archive", "cid-config", "cid-agg-1", "cid-wr-A", "cid-wr-B"})
+    self.assertEqual(result["cids_deleted"], 5)
+    self.assertEqual(result["cids_total"], 5)
+
+  def test_purge_finalized_no_pass_report_cids(self):
+    """Finalized purge does NOT try to delete individual pass report CIDs (they are inside archive)."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin()
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "FINALIZED",
+      "job_cid": "cid-archive",
+      # No pass_reports key — finalized stubs don't have them
+    }
+    plugin.chainstore_hget.return_value = job_specs
+    plugin.r1fs.get_json.return_value = {"passes": []}
+    plugin.r1fs.delete_file.return_value = True
+    plugin.chainstore_hgetall.return_value = {}
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
+
+    result = Plugin.purge_job(plugin, "job-1")
+    self.assertEqual(result["status"], "success")
+
+    # Only archive CID should be deleted (no pass_reports, no config, no workers)
+    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
+    self.assertEqual(deleted_cids, {"cid-archive"})
+
+  def test_purge_running_collects_all_cids(self):
+    """Stopped (was running) purge collects config + worker CIDs + pass report CIDs + nested CIDs."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin()
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "STOPPED",
+      "job_config_cid": "cid-config",
+      "workers": {
+        "node-A": {"finished": True, "canceled": True, "report_cid": "cid-wr-A"},
+      },
+      "pass_reports": [
+        {"report_cid": "cid-pass-1"},
+      ],
+    }
+    plugin.chainstore_hget.return_value = job_specs
+
+    # Pass report contains nested CIDs
+    pass_report = {
+      "aggregated_report_cid": "cid-agg-1",
+      "worker_reports": {
+        "node-A": {"report_cid": "cid-pass-wr-A"},
+      },
+    }
+    plugin.r1fs.get_json.return_value = pass_report
+    plugin.r1fs.delete_file.return_value = True
+    plugin.chainstore_hgetall.return_value = {}
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
+
+    result = Plugin.purge_job(plugin, "job-1")
+    self.assertEqual(result["status"], "success")
+
+    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
+    self.assertEqual(deleted_cids, {"cid-config", "cid-wr-A", "cid-pass-1", "cid-agg-1", "cid-pass-wr-A"})
+
+  def test_purge_r1fs_failure_keeps_cstore(self):
+    """Partial R1FS failure leaves CStore intact and returns 'partial' status."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin()
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "FINALIZED",
+      "job_cid": "cid-archive",
+      "job_config_cid": "cid-config",
+    }
+    plugin.chainstore_hget.return_value = job_specs
+    plugin.r1fs.get_json.return_value = {"passes": []}
+
+    # First CID deletes ok, second raises
+    plugin.r1fs.delete_file.side_effect = [True, Exception("disk error")]
+
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
+
+    result = Plugin.purge_job(plugin, "job-1")
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["cids_deleted"], 1)
+    self.assertEqual(result["cids_failed"], 1)
+    self.assertEqual(result["cids_total"], 2)
+
+    # CStore should NOT be tombstoned
+    tombstone_calls = [
+      c for c in plugin.chainstore_hset.call_args_list
+      if c.kwargs.get("hkey") == "test-instance" and c.kwargs.get("value") is None
+    ]
+    self.assertEqual(len(tombstone_calls), 0)
+
+  def test_purge_cleans_live_progress(self):
+    """Purge deletes live progress keys for the job from :live hset."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin()
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "STOPPED",
+      "workers": {"node-A": {"finished": True}},
+    }
+    plugin.chainstore_hget.return_value = job_specs
+    plugin.r1fs.delete_file.return_value = True
+
+    # Live hset has keys for this job and another
+    plugin.chainstore_hgetall.return_value = {
+      "job-1:node-A": {"progress": 100},
+      "job-1:node-B": {"progress": 50},
+      "job-2:node-C": {"progress": 30},
+    }
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
+
+    result = Plugin.purge_job(plugin, "job-1")
+    self.assertEqual(result["status"], "success")
+
+    # Check that live progress keys for job-1 were deleted
+    live_delete_calls = [
+      c for c in plugin.chainstore_hset.call_args_list
+      if c.kwargs.get("hkey") == "test-instance:live" and c.kwargs.get("value") is None
+    ]
+    deleted_keys = {c.kwargs["key"] for c in live_delete_calls}
+    self.assertEqual(deleted_keys, {"job-1:node-A", "job-1:node-B"})
+    # job-2 key should NOT be touched
+    self.assertNotIn("job-2:node-C", deleted_keys)
+
+  def test_purge_success_tombstones_cstore(self):
+    """After all CIDs deleted, CStore key is tombstoned (set to None)."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin()
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "FINALIZED",
+      "job_cid": "cid-archive",
+    }
+    plugin.chainstore_hget.return_value = job_specs
+    plugin.r1fs.get_json.return_value = {"passes": []}
+    plugin.r1fs.delete_file.return_value = True
+    plugin.chainstore_hgetall.return_value = {}
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
+
+    result = Plugin.purge_job(plugin, "job-1")
+    self.assertEqual(result["status"], "success")
+
+    # CStore tombstone: hset(hkey=instance_id, key=job_id, value=None)
+    tombstone_calls = [
+      c for c in plugin.chainstore_hset.call_args_list
+      if c.kwargs.get("hkey") == "test-instance"
+        and c.kwargs.get("key") == "job-1"
+        and c.kwargs.get("value") is None
+    ]
+    self.assertEqual(len(tombstone_calls), 1)
+
+  def test_stop_and_delete_delegates_to_purge(self):
+    """stop_and_delete_job marks job stopped then delegates to purge_job."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin()
+    plugin.scan_jobs = {}
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "workers": {"node-A": {"finished": False}},
+    }
+    plugin.chainstore_hget.return_value = job_specs
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
+
+    # Mock purge_job to verify delegation
+    purge_result = {"status": "success", "job_id": "job-1", "cids_deleted": 3, "cids_total": 3}
+    plugin.purge_job = MagicMock(return_value=purge_result)
+
+    result = Plugin.stop_and_delete_job(plugin, "job-1")
+
+    # Verify job was marked stopped before purge
+    hset_calls = [
+      c for c in plugin.chainstore_hset.call_args_list
+      if c.kwargs.get("hkey") == "test-instance" and c.kwargs.get("key") == "job-1"
+    ]
+    self.assertEqual(len(hset_calls), 1)
+    saved_specs = hset_calls[0].kwargs["value"]
+    self.assertEqual(saved_specs["job_status"], "STOPPED")
+    self.assertTrue(saved_specs["workers"]["node-A"]["finished"])
+    self.assertTrue(saved_specs["workers"]["node-A"]["canceled"])
+
+    # Verify purge was called
+    plugin.purge_job.assert_called_once_with("job-1")
+    self.assertEqual(result, purge_result)
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -3848,4 +4100,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase3Archive))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase5Endpoints))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase12LiveProgress))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase14Purge))
   runner.run(suite)
