@@ -40,7 +40,9 @@ FEATURE_CATALOG = [
       "_service_info_elasticsearch",
       "_service_info_memcached",
       "_service_info_mongodb",
-      "_service_info_modbus"
+      "_service_info_modbus",
+      "_service_info_couchdb",
+      "_service_info_influxdb"
     ]
   },
   {
@@ -183,6 +185,8 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_modbus":     frozenset({"modbus"}),
     "_service_info_wins":    frozenset({"wins", "nbns"}),
     "_service_info_rsync":   frozenset({"rsync"}),
+    "_service_info_couchdb":    frozenset({"http", "https"}),
+    "_service_info_influxdb":   frozenset({"http", "https"}),
     "_service_info_generic": frozenset({"unknown"}),
     "_service_info_mysql_creds": frozenset({"mysql"}),
     "_service_info_postgresql_creds": frozenset({"postgresql"}),

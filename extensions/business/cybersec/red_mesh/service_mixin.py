@@ -4909,7 +4909,7 @@ class _ServiceInfoMixin:
             pwd_bytes = password.encode() + b'\x00'
             pwd_msg = b'p' + struct.pack('!I', len(pwd_bytes) + 4) + pwd_bytes
             sock.sendall(pwd_msg)
-            resp = sock.recv(128)
+            resp = sock.recv(4096)
             if resp and resp[0:1] == b'R' and len(resp) >= 9:
               result_code = struct.unpack('!I', resp[5:9])[0]
               if result_code == 0:
@@ -4925,6 +4925,33 @@ class _ServiceInfoMixin:
                   cwe_id="CWE-798",
                   confidence="certain",
                 ))
+                findings += self._pg_extract_version_findings(resp)
+          elif auth_code == 5 and len(data) >= 13:
+            # MD5 auth: server sends 4-byte salt at bytes 9:13
+            import hashlib
+            salt = data[9:13]
+            inner = hashlib.md5(password.encode() + username.encode()).hexdigest()
+            outer = 'md5' + hashlib.md5(inner.encode() + salt).hexdigest()
+            pwd_bytes = outer.encode() + b'\x00'
+            pwd_msg = b'p' + struct.pack('!I', len(pwd_bytes) + 4) + pwd_bytes
+            sock.sendall(pwd_msg)
+            resp = sock.recv(4096)
+            if resp and resp[0:1] == b'R' and len(resp) >= 9:
+              result_code = struct.unpack('!I', resp[5:9])[0]
+              if result_code == 0:
+                cred_str = f"{username}:{password}" if password else f"{username}:(empty)"
+                raw["accepted_credentials"].append(cred_str)
+                findings.append(Finding(
+                  severity=Severity.CRITICAL,
+                  title=f"PostgreSQL default credential accepted: {cred_str}",
+                  description=f"MD5 password auth accepted for {cred_str}.",
+                  evidence=f"Auth OK for {cred_str}",
+                  remediation="Change default passwords.",
+                  owasp_id="A07:2021",
+                  cwe_id="CWE-798",
+                  confidence="certain",
+                ))
+                findings += self._pg_extract_version_findings(resp)
         raw["tested_credentials"] += 1
         sock.close()
       except Exception:
@@ -4939,6 +4966,41 @@ class _ServiceInfoMixin:
       ))
 
     return probe_result(raw_data=raw, findings=findings)
+
+  def _pg_extract_version_findings(self, data):
+    """Parse ParameterStatus messages after PG auth success for version + CVEs."""
+    findings = []
+    pos = 0
+    while pos < len(data) - 5:
+      msg_type = data[pos:pos+1]
+      if msg_type not in (b'R', b'S', b'K', b'Z', b'E', b'N'):
+        break
+      msg_len = struct.unpack('!I', data[pos+1:pos+5])[0]
+      msg_end = pos + 1 + msg_len
+      if msg_type == b'S' and msg_end <= len(data):
+        kv = data[pos+5:msg_end]
+        parts = kv.split(b'\x00')
+        if len(parts) >= 2:
+          key = parts[0].decode('utf-8', errors='ignore')
+          val = parts[1].decode('utf-8', errors='ignore')
+          if key == 'server_version':
+            findings.append(Finding(
+              severity=Severity.LOW,
+              title=f"PostgreSQL version disclosed: {val}",
+              description=f"PostgreSQL reports version {val} (via authenticated session).",
+              evidence=f"server_version parameter: {val}",
+              remediation="Restrict network access to the PostgreSQL port.",
+              cwe_id="CWE-200",
+              confidence="certain",
+            ))
+            ver_match = _re.match(r'(\d+\.\d+(?:\.\d+)?)', val)
+            if ver_match:
+              findings += check_cves("postgresql", ver_match.group(1))
+            break
+      pos = msg_end
+      if pos >= len(data):
+        break
+    return findings
 
   def _service_info_memcached(self, target, port):  # default port: 11211
     """
@@ -5344,6 +5406,194 @@ class _ServiceInfoMixin:
     return data[str_start+4:str_start+4+str_len-1].decode('utf-8', errors='ignore')
 
 
+
+  # ── CouchDB ──────────────────────────────────────────────────────
+
+  def _service_info_couchdb(self, target, port):  # default port: 5984
+    """
+    Probe Apache CouchDB HTTP API for unauthenticated access, admin panel,
+    database listing, and version-based CVE matching.
+    """
+    findings, raw = [], {"version": None}
+    base_url = f"http://{target}:{port}"
+
+    # 1. Root endpoint — identifies CouchDB and extracts version
+    try:
+      resp = requests.get(base_url, timeout=3)
+      if not resp.ok:
+        return None
+      data = resp.json()
+      if "couchdb" not in str(data).lower():
+        return None  # Not CouchDB
+      raw["version"] = data.get("version")
+      raw["vendor"] = data.get("vendor", {}).get("name") if isinstance(data.get("vendor"), dict) else None
+    except Exception:
+      return None
+
+    if raw["version"]:
+      findings.append(Finding(
+        severity=Severity.LOW,
+        title=f"CouchDB version disclosed: {raw['version']}",
+        description=f"CouchDB on {target}:{port} reports version {raw['version']}.",
+        evidence=f"GET / → version={raw['version']}",
+        remediation="Restrict network access to the CouchDB port.",
+        cwe_id="CWE-200",
+        confidence="certain",
+      ))
+      ver_match = _re.match(r'(\d+\.\d+(?:\.\d+)?)', raw["version"])
+      if ver_match:
+        findings += check_cves("couchdb", ver_match.group(1))
+
+    # 2. Database listing — unauthenticated access to /_all_dbs
+    try:
+      resp = requests.get(f"{base_url}/_all_dbs", timeout=3)
+      if resp.ok:
+        dbs = resp.json()
+        if isinstance(dbs, list):
+          raw["databases"] = dbs
+          user_dbs = [d for d in dbs if not d.startswith("_")]
+          findings.append(Finding(
+            severity=Severity.CRITICAL if user_dbs else Severity.HIGH,
+            title=f"CouchDB unauthenticated database listing ({len(dbs)} databases)",
+            description=f"/_all_dbs accessible without credentials. "
+                        f"{'User databases exposed: ' + ', '.join(user_dbs[:5]) if user_dbs else 'Only system databases found.'}",
+            evidence=f"Databases: {', '.join(dbs[:10])}" + (f"... (+{len(dbs)-10} more)" if len(dbs) > 10 else ""),
+            remediation="Enable CouchDB authentication via [admins] section in local.ini.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-284",
+            confidence="certain",
+          ))
+    except Exception:
+      pass
+
+    # 3. Admin panel (Fauxton) accessibility
+    try:
+      resp = requests.get(f"{base_url}/_utils/", timeout=3, allow_redirects=True)
+      if resp.ok and ("fauxton" in resp.text.lower() or "couchdb" in resp.text.lower()):
+        findings.append(Finding(
+          severity=Severity.HIGH,
+          title="CouchDB admin panel (Fauxton) accessible",
+          description=f"/_utils/ on {target}:{port} serves the admin web interface.",
+          evidence=f"GET /_utils/ returned {resp.status_code}, content-length={len(resp.text)}",
+          remediation="Restrict access to /_utils via reverse proxy or bind to localhost.",
+          owasp_id="A01:2021",
+          cwe_id="CWE-284",
+          confidence="certain",
+        ))
+    except Exception:
+      pass
+
+    # 4. Config endpoint — critical if accessible
+    try:
+      resp = requests.get(f"{base_url}/_node/_local/_config", timeout=3)
+      if resp.ok and resp.text.startswith("{"):
+        findings.append(Finding(
+          severity=Severity.CRITICAL,
+          title="CouchDB configuration exposed without authentication",
+          description="/_node/_local/_config returns full server configuration including credentials.",
+          evidence=f"GET /_node/_local/_config returned {resp.status_code}",
+          remediation="Enable admin authentication immediately.",
+          owasp_id="A01:2021",
+          cwe_id="CWE-284",
+          confidence="certain",
+        ))
+    except Exception:
+      pass
+
+    if not findings:
+      findings.append(Finding(Severity.INFO, "CouchDB probe clean", "No issues detected."))
+    return probe_result(raw_data=raw, findings=findings)
+
+  # ── InfluxDB ────────────────────────────────────────────────────
+
+  def _service_info_influxdb(self, target, port):  # default port: 8086
+    """
+    Probe InfluxDB HTTP API for version disclosure, unauthenticated access,
+    and database listing.
+    """
+    findings, raw = [], {"version": None}
+    base_url = f"http://{target}:{port}"
+
+    # 1. Ping — extract version from X-Influxdb-Version header
+    try:
+      resp = requests.get(f"{base_url}/ping", timeout=3)
+      version = resp.headers.get("X-Influxdb-Version")
+      if not version:
+        return None  # Not InfluxDB
+      raw["version"] = version
+      findings.append(Finding(
+        severity=Severity.LOW,
+        title=f"InfluxDB version disclosed: {version}",
+        description=f"InfluxDB on {target}:{port} reports version {version}.",
+        evidence=f"X-Influxdb-Version: {version}",
+        remediation="Restrict network access to the InfluxDB port.",
+        cwe_id="CWE-200",
+        confidence="certain",
+      ))
+      ver_match = _re.match(r'(\d+\.\d+(?:\.\d+)?)', version)
+      if ver_match:
+        findings += check_cves("influxdb", ver_match.group(1))
+    except Exception:
+      return None
+
+    # 2. Unauthenticated database listing
+    try:
+      resp = requests.get(f"{base_url}/query", params={"q": "SHOW DATABASES"}, timeout=3)
+      if resp.ok:
+        data = resp.json()
+        results = data.get("results", [])
+        if results and not results[0].get("error"):
+          series = results[0].get("series", [])
+          db_names = []
+          for s in series:
+            for row in s.get("values", []):
+              if row:
+                db_names.append(row[0])
+          raw["databases"] = db_names
+          user_dbs = [d for d in db_names if d not in ("_internal",)]
+          findings.append(Finding(
+            severity=Severity.CRITICAL if user_dbs else Severity.HIGH,
+            title=f"InfluxDB unauthenticated access ({len(db_names)} databases)",
+            description=f"SHOW DATABASES succeeded without credentials. "
+                        f"{'User databases: ' + ', '.join(user_dbs[:5]) if user_dbs else 'Only internal databases found.'}",
+            evidence=f"Databases: {', '.join(db_names[:10])}",
+            remediation="Enable InfluxDB authentication in the configuration ([http] auth-enabled = true).",
+            owasp_id="A07:2021",
+            cwe_id="CWE-287",
+            confidence="certain",
+          ))
+        elif results and results[0].get("error"):
+          # Auth required — good
+          findings.append(Finding(
+            severity=Severity.INFO,
+            title="InfluxDB authentication enforced",
+            description="SHOW DATABASES rejected without credentials.",
+            evidence=f"Error: {results[0]['error'][:80]}",
+            confidence="certain",
+          ))
+    except Exception:
+      pass
+
+    # 3. Debug endpoint exposure
+    try:
+      resp = requests.get(f"{base_url}/debug/vars", timeout=3)
+      if resp.ok and "memstats" in resp.text:
+        findings.append(Finding(
+          severity=Severity.MEDIUM,
+          title="InfluxDB debug endpoint exposed (/debug/vars)",
+          description="Go runtime debug variables accessible, leaking memory stats and internal state.",
+          evidence=f"GET /debug/vars returned {resp.status_code}",
+          remediation="Disable or restrict access to debug endpoints.",
+          owasp_id="A05:2021",
+          cwe_id="CWE-200",
+          confidence="certain",
+        ))
+    except Exception:
+      pass
+
+    if not findings:
+      findings.append(Finding(Severity.INFO, "InfluxDB probe clean", "No issues detected."))
+    return probe_result(raw_data=raw, findings=findings)
 
   # Product patterns for generic banner version extraction.
   # Maps regex → CVE DB product name.  Each regex must have a named group 'ver'.
