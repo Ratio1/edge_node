@@ -4198,6 +4198,351 @@ class TestPhase15Listing(unittest.TestCase):
     self.assertNotIn("report_cid", entry)
 
 
+class TestPhase16ScanMetrics(unittest.TestCase):
+  """Phase 16: Scan Metrics Collection."""
+
+  def test_metrics_collector_empty_build(self):
+    """build() with zero data returns ScanMetrics with defaults, no crash."""
+    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    mc = MetricsCollector()
+    result = mc.build()
+    d = result.to_dict()
+    self.assertEqual(d.get("total_duration", 0), 0)
+    self.assertEqual(d.get("rate_limiting_detected", False), False)
+    self.assertEqual(d.get("blocking_detected", False), False)
+    # No crash, sparse output
+    self.assertNotIn("connection_outcomes", d)
+    self.assertNotIn("response_times", d)
+
+  def test_metrics_collector_records_connections(self):
+    """After recording outcomes, connection_outcomes has correct counts."""
+    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    mc = MetricsCollector()
+    mc.start_scan(100)
+    mc.record_connection("connected", 0.05)
+    mc.record_connection("connected", 0.03)
+    mc.record_connection("timeout", 1.0)
+    mc.record_connection("refused", 0.01)
+    d = mc.build().to_dict()
+    outcomes = d["connection_outcomes"]
+    self.assertEqual(outcomes["connected"], 2)
+    self.assertEqual(outcomes["timeout"], 1)
+    self.assertEqual(outcomes["refused"], 1)
+    self.assertEqual(outcomes["total"], 4)
+    # Response times computed
+    rt = d["response_times"]
+    self.assertIn("mean", rt)
+    self.assertIn("p95", rt)
+    self.assertEqual(rt["count"], 4)
+
+  def test_metrics_collector_records_probes(self):
+    """After recording probes, probe_breakdown has entries."""
+    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    mc = MetricsCollector()
+    mc.start_scan(10)
+    mc.record_probe("_service_info_http", "completed")
+    mc.record_probe("_service_info_ssh", "completed")
+    mc.record_probe("_web_test_xss", "skipped:no_http")
+    d = mc.build().to_dict()
+    self.assertEqual(d["probes_attempted"], 3)
+    self.assertEqual(d["probes_completed"], 2)
+    self.assertEqual(d["probes_skipped"], 1)
+    self.assertEqual(d["probe_breakdown"]["_service_info_http"], "completed")
+    self.assertEqual(d["probe_breakdown"]["_web_test_xss"], "skipped:no_http")
+
+  def test_metrics_collector_phase_durations(self):
+    """start/end phases produce positive durations."""
+    import time
+    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    mc = MetricsCollector()
+    mc.start_scan(10)
+    mc.phase_start("port_scan")
+    time.sleep(0.01)
+    mc.phase_end("port_scan")
+    d = mc.build().to_dict()
+    self.assertIn("phase_durations", d)
+    self.assertGreater(d["phase_durations"]["port_scan"], 0)
+
+  def test_metrics_collector_findings(self):
+    """record_finding tracks severity distribution."""
+    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    mc = MetricsCollector()
+    mc.start_scan(10)
+    mc.record_finding("HIGH")
+    mc.record_finding("HIGH")
+    mc.record_finding("MEDIUM")
+    mc.record_finding("INFO")
+    d = mc.build().to_dict()
+    fd = d["finding_distribution"]
+    self.assertEqual(fd["HIGH"], 2)
+    self.assertEqual(fd["MEDIUM"], 1)
+    self.assertEqual(fd["INFO"], 1)
+
+  def test_metrics_collector_coverage(self):
+    """Coverage tracks ports scanned vs in range."""
+    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    mc = MetricsCollector()
+    mc.start_scan(100)
+    for i in range(50):
+      mc.record_connection("connected" if i < 5 else "refused", 0.01)
+    d = mc.build().to_dict()
+    cov = d["coverage"]
+    self.assertEqual(cov["ports_in_range"], 100)
+    self.assertEqual(cov["ports_scanned"], 50)
+    self.assertEqual(cov["coverage_pct"], 50.0)
+
+  def test_scan_metrics_model_roundtrip(self):
+    """ScanMetrics.from_dict(sm.to_dict()) preserves all fields."""
+    from extensions.business.cybersec.red_mesh.models.shared import ScanMetrics
+    sm = ScanMetrics(
+      phase_durations={"port_scan": 10.5, "fingerprint": 3.2},
+      total_duration=15.0,
+      connection_outcomes={"connected": 50, "timeout": 5, "total": 55},
+      response_times={"min": 0.01, "max": 1.0, "mean": 0.1, "median": 0.08, "stddev": 0.05, "p95": 0.5, "p99": 0.9, "count": 55},
+      rate_limiting_detected=True,
+      blocking_detected=False,
+      coverage={"ports_in_range": 1000, "ports_scanned": 1000, "ports_skipped": 0, "coverage_pct": 100.0},
+      probes_attempted=5,
+      probes_completed=4,
+      probes_skipped=1,
+      probes_failed=0,
+      probe_breakdown={"_service_info_http": "completed"},
+      finding_distribution={"HIGH": 3, "MEDIUM": 2},
+    )
+    d = sm.to_dict()
+    sm2 = ScanMetrics.from_dict(d)
+    self.assertEqual(sm2.to_dict(), d)
+
+  def test_scan_metrics_strip_none(self):
+    """Empty/None fields stripped from serialization."""
+    from extensions.business.cybersec.red_mesh.models.shared import ScanMetrics
+    sm = ScanMetrics()
+    d = sm.to_dict()
+    self.assertNotIn("phase_durations", d)
+    self.assertNotIn("connection_outcomes", d)
+    self.assertNotIn("response_times", d)
+    self.assertNotIn("slow_ports", d)
+    self.assertNotIn("probe_breakdown", d)
+
+  def test_merge_worker_metrics(self):
+    """_merge_worker_metrics sums outcomes, coverage, findings; maxes duration; ORs flags."""
+    TestPhase15Listing._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    m1 = {
+      "connection_outcomes": {"connected": 30, "timeout": 5, "total": 35},
+      "coverage": {"ports_in_range": 500, "ports_scanned": 500, "ports_skipped": 0, "coverage_pct": 100.0},
+      "finding_distribution": {"HIGH": 2, "MEDIUM": 1},
+      "probes_attempted": 3, "probes_completed": 3, "probes_skipped": 0, "probes_failed": 0,
+      "total_duration": 60.0,
+      "rate_limiting_detected": False, "blocking_detected": False,
+    }
+    m2 = {
+      "connection_outcomes": {"connected": 20, "timeout": 10, "total": 30},
+      "coverage": {"ports_in_range": 500, "ports_scanned": 400, "ports_skipped": 100, "coverage_pct": 80.0},
+      "finding_distribution": {"HIGH": 1, "LOW": 3},
+      "probes_attempted": 3, "probes_completed": 2, "probes_skipped": 1, "probes_failed": 0,
+      "total_duration": 75.0,
+      "rate_limiting_detected": True, "blocking_detected": False,
+    }
+    merged = PentesterApi01Plugin._merge_worker_metrics([m1, m2])
+    # Sums
+    self.assertEqual(merged["connection_outcomes"]["connected"], 50)
+    self.assertEqual(merged["connection_outcomes"]["timeout"], 15)
+    self.assertEqual(merged["connection_outcomes"]["total"], 65)
+    self.assertEqual(merged["coverage"]["ports_in_range"], 1000)
+    self.assertEqual(merged["coverage"]["ports_scanned"], 900)
+    self.assertEqual(merged["coverage"]["ports_skipped"], 100)
+    self.assertEqual(merged["coverage"]["coverage_pct"], 90.0)
+    self.assertEqual(merged["finding_distribution"]["HIGH"], 3)
+    self.assertEqual(merged["finding_distribution"]["LOW"], 3)
+    self.assertEqual(merged["finding_distribution"]["MEDIUM"], 1)
+    self.assertEqual(merged["probes_attempted"], 6)
+    self.assertEqual(merged["probes_completed"], 5)
+    self.assertEqual(merged["probes_skipped"], 1)
+    # Max duration
+    self.assertEqual(merged["total_duration"], 75.0)
+    # OR flags
+    self.assertTrue(merged["rate_limiting_detected"])
+    self.assertFalse(merged["blocking_detected"])
+
+
+  def test_close_job_merges_thread_metrics(self):
+    """16b: _close_job replaces generically-merged scan_metrics with properly summed metrics."""
+    TestPhase15Listing._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+
+    # Two mock workers with different scan_metrics
+    worker1 = MagicMock()
+    worker1.get_status.return_value = {
+      "open_ports": [80], "service_info": {}, "scan_metrics": {
+        "connection_outcomes": {"connected": 10, "timeout": 2, "total": 12},
+        "total_duration": 30.0,
+        "probes_attempted": 2, "probes_completed": 2, "probes_skipped": 0, "probes_failed": 0,
+        "rate_limiting_detected": False, "blocking_detected": False,
+      }
+    }
+    worker2 = MagicMock()
+    worker2.get_status.return_value = {
+      "open_ports": [443], "service_info": {}, "scan_metrics": {
+        "connection_outcomes": {"connected": 8, "timeout": 5, "total": 13},
+        "total_duration": 45.0,
+        "probes_attempted": 2, "probes_completed": 1, "probes_skipped": 1, "probes_failed": 0,
+        "rate_limiting_detected": True, "blocking_detected": False,
+      }
+    }
+    plugin.scan_jobs = {"job-1": {"t1": worker1, "t2": worker2}}
+
+    # _get_aggregated_report with merge_objects_deep would do last-writer-wins on leaf ints
+    # Simulate that by returning worker2's metrics (wrong — should be summed)
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80, 443], "service_info": {},
+      "scan_metrics": {
+        "connection_outcomes": {"connected": 8, "timeout": 5, "total": 13},
+        "total_duration": 45.0,
+      }
+    })
+    # Use real static method for merge
+    plugin._merge_worker_metrics = PentesterApi01Plugin._merge_worker_metrics
+
+    saved_reports = []
+    def capture_add_json(data, show_logs=False):
+      saved_reports.append(data)
+      return "QmReport123"
+    plugin.r1fs.add_json.side_effect = capture_add_json
+
+    job_specs = {"job_id": "job-1", "target": "10.0.0.1", "workers": {}}
+    plugin.chainstore_hget.return_value = job_specs
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
+    plugin._get_job_config = MagicMock(return_value={"redact_credentials": False})
+    plugin._redact_report = MagicMock(side_effect=lambda r: r)
+
+    PentesterApi01Plugin._close_job(plugin, "job-1")
+
+    # The report saved to R1FS should have properly merged metrics
+    self.assertEqual(len(saved_reports), 1)
+    sm = saved_reports[0].get("scan_metrics")
+    self.assertIsNotNone(sm)
+    # Connection outcomes should be summed, not last-writer-wins
+    self.assertEqual(sm["connection_outcomes"]["connected"], 18)
+    self.assertEqual(sm["connection_outcomes"]["timeout"], 7)
+    self.assertEqual(sm["connection_outcomes"]["total"], 25)
+    # Max duration
+    self.assertEqual(sm["total_duration"], 45.0)
+    # Probes summed
+    self.assertEqual(sm["probes_attempted"], 4)
+    self.assertEqual(sm["probes_completed"], 3)
+    # OR flags
+    self.assertTrue(sm["rate_limiting_detected"])
+
+  def test_finalize_pass_attaches_pass_metrics(self):
+    """16c: _maybe_finalize_pass merges node metrics into PassReport.scan_metrics."""
+    TestPhase15Listing._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-launcher"
+    plugin.cfg_llm_agent_api_enabled = False
+    plugin.cfg_attestation_min_seconds_between_submits = 3600
+
+    # Two workers, each with a report_cid
+    workers = {
+      "node-A": {"finished": True, "report_cid": "cid-report-A"},
+      "node-B": {"finished": True, "report_cid": "cid-report-B"},
+    }
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "target": "10.0.0.1",
+      "run_mode": "SINGLEPASS",
+      "launcher": "node-launcher",
+      "workers": workers,
+      "job_pass": 1,
+      "pass_reports": [],
+      "timeline": [{"event": "created", "ts": 1700000000.0}],
+    }
+    plugin.chainstore_hgetall.return_value = {"job-1": job_specs}
+    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
+    plugin.time.return_value = 1700000120.0
+
+    # Node reports with different metrics
+    node_report_a = {
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "correlation_findings": [], "start_port": 1, "end_port": 32767,
+      "ports_scanned": 32767,
+      "scan_metrics": {
+        "connection_outcomes": {"connected": 5, "timeout": 1, "total": 6},
+        "total_duration": 50.0,
+        "probes_attempted": 3, "probes_completed": 3, "probes_skipped": 0, "probes_failed": 0,
+        "rate_limiting_detected": False, "blocking_detected": False,
+      }
+    }
+    node_report_b = {
+      "open_ports": [443], "service_info": {}, "web_tests_info": {},
+      "correlation_findings": [], "start_port": 32768, "end_port": 65535,
+      "ports_scanned": 32768,
+      "scan_metrics": {
+        "connection_outcomes": {"connected": 3, "timeout": 4, "total": 7},
+        "total_duration": 65.0,
+        "probes_attempted": 3, "probes_completed": 2, "probes_skipped": 0, "probes_failed": 1,
+        "rate_limiting_detected": False, "blocking_detected": True,
+      }
+    }
+
+    node_reports_by_addr = {"node-A": node_report_a, "node-B": node_report_b}
+    plugin._collect_node_reports = MagicMock(return_value=node_reports_by_addr)
+    # _get_aggregated_report would use merge_objects_deep (wrong for metrics)
+    # Return a dict with last-writer-wins metrics to simulate the bug
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80, 443], "service_info": {}, "web_tests_info": {},
+      "scan_metrics": node_report_b["scan_metrics"],  # wrong — just node B's
+    })
+    # Use real static method for merge
+    plugin._merge_worker_metrics = PentesterApi01Plugin._merge_worker_metrics
+
+    # Capture what gets saved as pass report
+    saved_pass_reports = []
+    def capture_add_json(data, show_logs=False):
+      saved_pass_reports.append(data)
+      return f"QmPassReport{len(saved_pass_reports)}"
+    plugin.r1fs.add_json.side_effect = capture_add_json
+
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 25, "breakdown": {}}, []))
+    plugin._get_job_config = MagicMock(return_value={})
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._build_job_archive = MagicMock()
+    plugin._clear_live_progress = MagicMock()
+    plugin._emit_timeline_event = MagicMock()
+    plugin._get_timeline_date = MagicMock(return_value=1700000000.0)
+    plugin.Pd = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    # Should have saved: aggregated_data (step 6) + pass_report (step 10)
+    self.assertGreaterEqual(len(saved_pass_reports), 2)
+    pass_report = saved_pass_reports[-1]  # Last one is the PassReport
+
+    sm = pass_report.get("scan_metrics")
+    self.assertIsNotNone(sm, "PassReport should have scan_metrics")
+    # Connection outcomes summed across nodes
+    self.assertEqual(sm["connection_outcomes"]["connected"], 8)
+    self.assertEqual(sm["connection_outcomes"]["timeout"], 5)
+    self.assertEqual(sm["connection_outcomes"]["total"], 13)
+    # Max duration
+    self.assertEqual(sm["total_duration"], 65.0)
+    # Probes summed
+    self.assertEqual(sm["probes_attempted"], 6)
+    self.assertEqual(sm["probes_completed"], 5)
+    self.assertEqual(sm["probes_failed"], 1)
+    # OR flags
+    self.assertFalse(sm["rate_limiting_detected"])
+    self.assertTrue(sm["blocking_detected"])
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -4219,4 +4564,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase12LiveProgress))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase14Purge))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase15Listing))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase16ScanMetrics))
   runner.run(suite)
