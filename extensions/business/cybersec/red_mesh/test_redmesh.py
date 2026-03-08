@@ -4285,15 +4285,24 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     mc.start_scan(100)
     for i in range(50):
       mc.record_connection("connected" if i < 5 else "refused", 0.01)
-    # Simulate finding 5 open ports (via record_open_port)
+    # Simulate finding 5 open ports with banner confirmation
     for i in range(5):
-      mc.record_open_port(8000 + i)
+      mc.record_open_port(8000 + i, protocol="http" if i < 3 else "ssh", banner_confirmed=(i < 3))
     d = mc.build().to_dict()
     cov = d["coverage"]
     self.assertEqual(cov["ports_in_range"], 100)
     self.assertEqual(cov["ports_scanned"], 50)
     self.assertEqual(cov["coverage_pct"], 50.0)
     self.assertEqual(cov["open_ports_count"], 5)
+    # Open port details
+    self.assertEqual(len(d["open_port_details"]), 5)
+    self.assertEqual(d["open_port_details"][0]["port"], 8000)
+    self.assertEqual(d["open_port_details"][0]["protocol"], "http")
+    self.assertTrue(d["open_port_details"][0]["banner_confirmed"])
+    self.assertFalse(d["open_port_details"][3]["banner_confirmed"])
+    # Banner confirmation
+    self.assertEqual(d["banner_confirmation"]["confirmed"], 3)
+    self.assertEqual(d["banner_confirmation"]["guessed"], 2)
 
   def test_scan_metrics_model_roundtrip(self):
     """ScanMetrics.from_dict(sm.to_dict()) preserves all fields."""
@@ -4343,6 +4352,12 @@ class TestPhase16ScanMetrics(unittest.TestCase):
       "probes_attempted": 3, "probes_completed": 3, "probes_skipped": 0, "probes_failed": 0,
       "total_duration": 60.0,
       "rate_limiting_detected": False, "blocking_detected": False,
+      "open_port_details": [
+        {"port": 22, "protocol": "ssh", "banner_confirmed": True},
+        {"port": 80, "protocol": "http", "banner_confirmed": True},
+        {"port": 443, "protocol": "http", "banner_confirmed": False},
+      ],
+      "banner_confirmation": {"confirmed": 2, "guessed": 1},
     }
     m2 = {
       "connection_outcomes": {"connected": 20, "timeout": 10, "total": 30},
@@ -4355,6 +4370,11 @@ class TestPhase16ScanMetrics(unittest.TestCase):
       "probes_attempted": 3, "probes_completed": 2, "probes_skipped": 1, "probes_failed": 0,
       "total_duration": 75.0,
       "rate_limiting_detected": True, "blocking_detected": False,
+      "open_port_details": [
+        {"port": 80, "protocol": "http", "banner_confirmed": True},  # duplicate port 80
+        {"port": 3306, "protocol": "mysql", "banner_confirmed": True},
+      ],
+      "banner_confirmation": {"confirmed": 2, "guessed": 0},
     }
     merged = PentesterApi01Plugin._merge_worker_metrics([m1, m2])
     # Sums
@@ -4398,6 +4418,16 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     # OR flags
     self.assertTrue(merged["rate_limiting_detected"])
     self.assertFalse(merged["blocking_detected"])
+    # Open port details: deduplicated by port, sorted
+    opd = merged["open_port_details"]
+    self.assertEqual(len(opd), 4)  # 22, 80, 443, 3306 (80 deduplicated)
+    self.assertEqual(opd[0]["port"], 22)
+    self.assertEqual(opd[1]["port"], 80)
+    self.assertEqual(opd[2]["port"], 443)
+    self.assertEqual(opd[3]["port"], 3306)
+    # Banner confirmation: summed
+    self.assertEqual(merged["banner_confirmation"]["confirmed"], 4)
+    self.assertEqual(merged["banner_confirmation"]["guessed"], 1)
 
 
   def test_close_job_merges_thread_metrics(self):
