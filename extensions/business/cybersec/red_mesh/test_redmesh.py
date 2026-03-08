@@ -118,7 +118,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       side_effect=fake_get,
     ):
       result = worker._web_test_common("example.com", 80)
-    self.assertIn("VULNERABILITY: Accessible resource", result)
+    self._assert_has_finding(result, "Accessible resource")
 
   def test_cryptographic_failures_cookie_flags(self):
     owner, worker = self._build_worker()
@@ -130,9 +130,9 @@ class RedMeshOWASPTests(unittest.TestCase):
       return_value=resp,
     ):
       result = worker._web_test_flags("example.com", 443)
-    self.assertIn("VULNERABILITY: Cookie missing Secure flag", result)
-    self.assertIn("VULNERABILITY: Cookie missing HttpOnly flag", result)
-    self.assertIn("VULNERABILITY: Cookie missing SameSite flag", result)
+    self._assert_has_finding(result, "Cookie missing Secure flag")
+    self._assert_has_finding(result, "Cookie missing HttpOnly flag")
+    self._assert_has_finding(result, "Cookie missing SameSite flag")
 
   def test_injection_sql_detected(self):
     owner, worker = self._build_worker()
@@ -168,7 +168,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return_value=resp,
     ):
       result = worker._web_test_security_headers("example.com", 80)
-    self.assertIn("VULNERABILITY: Missing security header", result)
+    self._assert_has_finding(result, "Missing security header")
 
   def test_vulnerable_component_banner_exposed(self):
     owner, worker = self._build_worker(ports=[80])
@@ -274,7 +274,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return_value=resp,
     ):
       result = worker._web_test_homepage("example.com", 80)
-    self.assertIn("VULNERABILITY: sensitive", result)
+    self._assert_has_finding(result, "private key")
 
   def test_security_logging_tracks_flow(self):
     owner, worker = self._build_worker()
@@ -371,6 +371,9 @@ class RedMeshOWASPTests(unittest.TestCase):
       def __exit__(self, exc_type, exc, tb):
         return False
 
+      def close(self):
+        pass
+
       def version(self):
         return "TLSv1.3"
 
@@ -445,6 +448,9 @@ class RedMeshOWASPTests(unittest.TestCase):
 
       def __exit__(self, exc_type, exc, tb):
         return False
+
+      def close(self):
+        pass
 
       def version(self):
         return "TLSv1.2"
@@ -911,7 +917,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return_value=resp,
     ):
       result = worker._web_test_graphql_introspection("example.com", 80)
-    self.assertIn("VULNERABILITY: GraphQL introspection", result)
+    self._assert_has_finding(result, "GraphQL introspection")
 
   def test_web_metadata_endpoint(self):
     owner, worker = self._build_worker()
@@ -926,7 +932,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       side_effect=fake_get,
     ):
       result = worker._web_test_metadata_endpoints("example.com", 80)
-    self.assertIn("VULNERABILITY: Cloud metadata endpoint", result)
+    self._assert_has_finding(result, "Cloud metadata endpoint")
 
   def test_web_api_auth_bypass(self):
     owner, worker = self._build_worker()
@@ -937,7 +943,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return_value=resp,
     ):
       result = worker._web_test_api_auth_bypass("example.com", 80)
-    self.assertIn("VULNERABILITY: API endpoint", result)
+    self._assert_has_finding(result, "API auth bypass")
 
   def test_cors_misconfiguration_detection(self):
     owner, worker = self._build_worker()
@@ -952,7 +958,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return_value=resp,
     ):
       result = worker._web_test_cors_misconfiguration("example.com", 80)
-    self.assertIn("VULNERABILITY: CORS misconfiguration", result)
+    self._assert_has_finding(result, "CORS misconfiguration")
 
   def test_open_redirect_detection(self):
     owner, worker = self._build_worker()
@@ -964,7 +970,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return_value=resp,
     ):
       result = worker._web_test_open_redirect("example.com", 80)
-    self.assertIn("VULNERABILITY: Open redirect", result)
+    self._assert_has_finding(result, "Open redirect")
 
   def test_http_methods_detection(self):
     owner, worker = self._build_worker()
@@ -976,7 +982,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return_value=resp,
     ):
       result = worker._web_test_http_methods("example.com", 80)
-    self.assertIn("VULNERABILITY: Risky HTTP methods", result)
+    self._assert_has_finding(result, "Risky HTTP methods")
 
   # ===== NEW TESTS — findings.py =====
 
