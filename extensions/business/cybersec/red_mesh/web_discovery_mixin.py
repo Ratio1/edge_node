@@ -3,6 +3,7 @@ import uuid as _uuid
 import requests
 
 from .findings import Finding, Severity, probe_result, probe_error
+from .cve_db import check_cves
 
 
 class _WebDiscoveryMixin:
@@ -389,6 +390,23 @@ class _WebDiscoveryMixin:
       except Exception:
         pass
 
+    # --- WordPress version fallback: /feed/, /wp-links-opml.php, /readme.html ---
+    if wp_version == "unknown":
+      for _wp_path, _wp_re in [
+        ("/feed/", r'<generator>https?://wordpress\.org/\?v=([0-9.]+)</generator>'),
+        ("/wp-links-opml.php", r'generator="WordPress/([0-9.]+)"'),
+        ("/readme.html", r'Version\s+([0-9.]+)'),
+      ]:
+        try:
+          resp = requests.get(base_url + _wp_path, timeout=3, verify=False)
+          if resp.ok:
+            _wp_m = _re.search(_wp_re, resp.text, _re.IGNORECASE)
+            if _wp_m:
+              wp_version = _wp_m.group(1)
+              break
+        except Exception:
+          pass
+
     if wp_version:
       raw["cms"] = "WordPress"
       raw["version"] = wp_version
@@ -401,6 +419,8 @@ class _WebDiscoveryMixin:
         confidence="certain",
       ))
       findings_list += self._cms_check_eol("WordPress", wp_version)
+      if wp_version != "unknown":
+        findings_list += check_cves("wordpress", wp_version)
       findings_list += self._wp_detect_plugins(base_url)
       for path, desc in self._WP_SENSITIVE_PATHS:
         try:
@@ -442,6 +462,24 @@ class _WebDiscoveryMixin:
       except Exception:
         pass
 
+    # --- Drupal version fallback: install.php, JS query strings ---
+    _DRUPAL_VERSION_SOURCES = [
+      ("/core/modules/system/system.info.yml", r"version:\s*'?([0-9]+\.[0-9]+\.[0-9]+)"),
+      ("/core/install.php", r'site-version[^>]*>([0-9]+\.[0-9]+\.[0-9]+)'),
+      ("/core/install.php", r'drupal\.js\?v=([0-9]+\.[0-9]+\.[0-9]+)'),
+    ]
+    if drupal_version and (drupal_version == "unknown" or _re.match(r'^\d+$', drupal_version)):
+      for _dp_path, _dp_re in _DRUPAL_VERSION_SOURCES:
+        try:
+          resp = requests.get(base_url + _dp_path, timeout=3, verify=False)
+          if resp.ok:
+            _dp_m = _re.search(_dp_re, resp.text)
+            if _dp_m:
+              drupal_version = _dp_m.group(1)
+              break
+        except Exception:
+          pass
+
     if drupal_version:
       raw["cms"] = "Drupal"
       raw["version"] = drupal_version
@@ -454,6 +492,8 @@ class _WebDiscoveryMixin:
         confidence="certain",
       ))
       findings_list += self._cms_check_eol("Drupal", drupal_version)
+      if drupal_version != "unknown" and not _re.match(r'^\d+$', drupal_version):
+        findings_list += check_cves("drupal", drupal_version)
       return probe_result(raw_data=raw, findings=findings_list)
 
     # --- Joomla detection ---
@@ -485,6 +525,102 @@ class _WebDiscoveryMixin:
         confidence="certain",
       ))
       findings_list += self._cms_check_eol("Joomla", joomla_version)
+      if joomla_version != "unknown":
+        findings_list += check_cves("joomla", joomla_version)
+      # CVE-2023-23752: Unauthenticated config disclosure via REST API
+      try:
+        resp = requests.get(
+          base_url + "/api/index.php/v1/config/application?public=true",
+          timeout=3, verify=False,
+        )
+        if resp.ok and ("password" in resp.text.lower() or '"db"' in resp.text.lower() or '"dbtype"' in resp.text.lower()):
+          findings_list.append(Finding(
+            severity=Severity.HIGH,
+            title="CVE-2023-23752: Joomla unauthenticated config disclosure",
+            description="Joomla REST API exposes application configuration "
+                        "including database credentials without authentication.",
+            evidence=f"GET {base_url}/api/index.php/v1/config/application?public=true → 200",
+            remediation="Upgrade Joomla to >= 4.2.8.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-284",
+            confidence="certain",
+          ))
+      except Exception:
+        pass
+      return probe_result(raw_data=raw, findings=findings_list)
+
+    # --- Laravel / Ignition detection ---
+    laravel_detected = False
+    ignition_detected = False
+
+    # Check /_ignition/health-check
+    try:
+      resp = requests.get(base_url + "/_ignition/health-check", timeout=3, verify=False)
+      if resp.ok and ("can_execute_commands" in resp.text or "ok" in resp.text.lower()):
+        ignition_detected = True
+        laravel_detected = True
+        findings_list.append(Finding(
+          severity=Severity.HIGH,
+          title="Laravel Ignition debug endpoint exposed",
+          description="/_ignition/health-check is accessible, indicating Laravel's "
+                      "debug error handler is enabled in production.",
+          evidence=f"GET {base_url}/_ignition/health-check → {resp.status_code}",
+          remediation="Set APP_DEBUG=false in production; remove Ignition package.",
+          owasp_id="A05:2021",
+          cwe_id="CWE-489",
+          confidence="certain",
+        ))
+    except Exception:
+      pass
+
+    # Check for Laravel indicators in error pages
+    if not laravel_detected:
+      try:
+        resp = requests.get(
+          base_url + "/nonexistent_" + _uuid.uuid4().hex[:8],
+          timeout=3, verify=False,
+        )
+        body = resp.text[:10000].lower()
+        if "laravel" in body or "illuminate" in body:
+          laravel_detected = True
+      except Exception:
+        pass
+
+    if ignition_detected:
+      # CVE-2021-3129: check execute-solution endpoint
+      try:
+        resp = requests.post(
+          base_url + "/_ignition/execute-solution",
+          json={"solution": "test", "parameters": {}},
+          timeout=3, verify=False,
+        )
+        if resp.status_code != 404:
+          findings_list.append(Finding(
+            severity=Severity.CRITICAL,
+            title="CVE-2021-3129: Laravel Ignition RCE endpoint accessible",
+            description="/_ignition/execute-solution accepts POST requests. "
+                        "With Ignition < 2.5.2, this enables unauthenticated RCE "
+                        "via file_put_contents abuse.",
+            evidence=f"POST {base_url}/_ignition/execute-solution → {resp.status_code}",
+            remediation="Upgrade Ignition to >= 2.5.2; set APP_DEBUG=false.",
+            owasp_id="A06:2021",
+            cwe_id="CWE-94",
+            confidence="firm",
+          ))
+      except Exception:
+        pass
+
+    if laravel_detected:
+      raw["cms"] = "Laravel"
+      raw["version"] = "unknown"
+      findings_list.append(Finding(
+        severity=Severity.LOW,
+        title="Laravel framework detected",
+        description=f"Laravel framework identified on {target}:{port}.",
+        evidence="Detection via Ignition endpoint or error page markers.",
+        remediation="Keep Laravel and dependencies updated.",
+        confidence="certain",
+      ))
 
     return probe_result(raw_data=raw, findings=findings_list)
 

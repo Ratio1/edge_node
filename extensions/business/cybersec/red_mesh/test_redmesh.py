@@ -6030,6 +6030,534 @@ class TestBatch2GapFixes(unittest.TestCase):
     self.assertFalse(any("CVE-2019-20933" in f.title for f in check_cves("influxdb", "1.7.6")))
 
 
+class TestBatch3GapFixes(unittest.TestCase):
+  """Tests for batch 3 gaps: CMS CVEs, SSTI, Shellshock, PHP CGI, dedup bug."""
+
+  def setUp(self):
+    if MANUAL_RUN:
+      print()
+      color_print(f"[MANUAL] >>> Starting <{self._testMethodName}>", color='b')
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [80]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-batch3",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  # ── CVE database: Drupal ───────────────────────────────────────────
+
+  def test_drupal_cve_2018_7600_match(self):
+    """CVE-2018-7600 should match Drupal 8.5.0."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("drupal", "8.5.0")
+    self.assertTrue(any("CVE-2018-7600" in f.title for f in findings))
+
+  def test_drupal_cve_2018_7600_patched(self):
+    """CVE-2018-7600 should NOT match Drupal 8.5.1."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("drupal", "8.5.1")
+    self.assertFalse(any("CVE-2018-7600" in f.title for f in findings))
+
+  def test_drupal_cve_2018_7602_match(self):
+    """CVE-2018-7602 should match Drupal 8.5.0."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("drupal", "8.5.0")
+    self.assertTrue(any("CVE-2018-7602" in f.title for f in findings))
+
+  def test_drupal_cve_2014_3704_match(self):
+    """CVE-2014-3704 should match Drupal 7.31."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("drupal", "7.31")
+    self.assertTrue(any("CVE-2014-3704" in f.title for f in findings))
+
+  # ── CVE database: WordPress ────────────────────────────────────────
+
+  def test_wordpress_cve_2016_10033_match(self):
+    """CVE-2016-10033 should match WordPress 4.6."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("wordpress", "4.6")
+    self.assertTrue(any("CVE-2016-10033" in f.title for f in findings))
+
+  def test_wordpress_cve_2016_10033_patched(self):
+    """CVE-2016-10033 should NOT match WordPress 4.7.1."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("wordpress", "4.7.1")
+    self.assertFalse(any("CVE-2016-10033" in f.title for f in findings))
+
+  def test_wordpress_cve_2017_8295_match(self):
+    """CVE-2017-8295 should match WordPress 4.6."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("wordpress", "4.6")
+    self.assertTrue(any("CVE-2017-8295" in f.title for f in findings))
+
+  # ── CVE database: Joomla, Django, Laravel ──────────────────────────
+
+  def test_joomla_cve_2023_23752_match(self):
+    """CVE-2023-23752 should match Joomla 4.2.7."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("joomla", "4.2.7")
+    self.assertTrue(any("CVE-2023-23752" in f.title for f in findings))
+
+  def test_joomla_cve_2023_23752_patched(self):
+    """CVE-2023-23752 should NOT match Joomla 4.2.8."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("joomla", "4.2.8")
+    self.assertFalse(any("CVE-2023-23752" in f.title for f in findings))
+
+  def test_django_cve_2017_12794_match(self):
+    """CVE-2017-12794 should match Django 1.11.4."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("django", "1.11.4")
+    self.assertTrue(any("CVE-2017-12794" in f.title for f in findings))
+
+  def test_laravel_ignition_cve_2021_3129_match(self):
+    """CVE-2021-3129 should match laravel_ignition 2.5.1."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("laravel_ignition", "2.5.1")
+    self.assertTrue(any("CVE-2021-3129" in f.title for f in findings))
+
+  # ── Drupal version extraction probe ────────────────────────────────
+
+  def test_drupal_version_from_system_info_yml(self):
+    """Drupal probe should extract version from system.info.yml fallback."""
+    _, worker = self._build_worker(ports=[4200])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = ""
+      if url.endswith(":4200"):
+        # Generator tag with major-only version
+        resp.text = '<html><meta name="generator" content="Drupal 8 (https://www.drupal.org)"></html>'
+      elif "/core/CHANGELOG.txt" in url:
+        resp.ok = False
+        resp.status_code = 403
+      elif "/core/modules/system/system.info.yml" in url:
+        resp.text = "name: System\ntype: module\nversion: '8.5.0'\ncore: 8.x"
+      else:
+        resp.ok = False
+        resp.status_code = 404
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_cms_fingerprint("1.2.3.4", 4200)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("8.5.0" in t for t in titles), f"Should extract Drupal 8.5.0. Got: {titles}")
+    self.assertTrue(any("CVE-2018-7600" in t for t in titles), f"Should find Drupalgeddon2. Got: {titles}")
+
+  # ── WordPress version extraction probe ─────────────────────────────
+
+  def test_wordpress_version_from_feed(self):
+    """WP probe should extract version from /feed/ generator tag."""
+    _, worker = self._build_worker(ports=[4400])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = ""
+      if url.endswith(":4400"):
+        resp.text = '<html><link rel="stylesheet" href="/wp-content/themes/style.css"></html>'
+      elif "/wp-login.php" in url:
+        resp.text = '<html><title>wp-login</title></html>'
+      elif "/feed/" in url:
+        resp.text = '<rss><channel><generator>https://wordpress.org/?v=4.6</generator></channel></rss>'
+      elif "/xmlrpc.php" in url:
+        resp.status_code = 200
+      elif "/wp-json/wp/v2/users" in url:
+        resp.status_code = 200
+      else:
+        resp.ok = False
+        resp.status_code = 404
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_cms_fingerprint("1.2.3.4", 4400)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("4.6" in t for t in titles), f"Should extract WP 4.6. Got: {titles}")
+    self.assertTrue(any("CVE-2016-10033" in t for t in titles), f"Should find PHPMailer RCE. Got: {titles}")
+
+  # ── Laravel Ignition detection ─────────────────────────────────────
+
+  def test_laravel_ignition_detected(self):
+    """Laravel probe should detect Ignition health check and execute-solution."""
+    _, worker = self._build_worker(ports=[6300])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = ""
+      resp.headers = {}
+      if url.endswith(":6300"):
+        # Homepage: no WP/Drupal markers
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '<html><head><title>Laravel</title></head><body>Welcome</body></html>'
+      elif "/_ignition/health-check" in url:
+        resp.ok = True
+        resp.status_code = 200
+        resp.text = '{"can_execute_commands":true}'
+      elif "/nonexistent_" in url:
+        resp.status_code = 404
+        resp.text = '<html>Not Found</html>'
+      # All other paths (wp-login, CHANGELOG, administrator) → 404
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 500
+      resp.text = '{"error":"..."}'
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_cms_fingerprint("1.2.3.4", 6300)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("Ignition debug" in t for t in titles), f"Should detect Ignition. Got: {titles}")
+    self.assertTrue(any("CVE-2021-3129" in t for t in titles), f"Should detect CVE-2021-3129. Got: {titles}")
+
+  # ── SSTI probe ─────────────────────────────────────────────────────
+
+  def test_ssti_jinja2_detected(self):
+    """SSTI probe should detect Jinja2 template evaluation."""
+    _, worker = self._build_worker(ports=[4700])
+    from urllib.parse import unquote
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      decoded = unquote(url)
+      # Evaluate {{7*7}} → 49, but don't echo the raw template back
+      if "name=" in decoded and "{{7*7}}" in decoded:
+        resp.text = '<html>Hello 49!</html>'
+      elif "name=" in decoded and "{{7*'7'}}" in decoded:
+        resp.text = '<html>Hello 7777777!</html>'
+      else:
+        resp.text = '<html>Hello world</html>'
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_ssti("1.2.3.4", 4700)
+
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, f"Should detect SSTI. Got: {findings}")
+    self.assertEqual(findings[0]["severity"], "CRITICAL")
+    self.assertIn("SSTI", findings[0]["title"])
+
+  def test_ssti_no_false_positive_on_xss(self):
+    """SSTI probe should NOT fire when template literal is echoed back (XSS)."""
+    _, worker = self._build_worker(ports=[4700])
+    from urllib.parse import unquote
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      decoded = unquote(url)
+      # Echo back the raw payload — this is XSS not SSTI
+      if "name=" in decoded and "{{7*7}}" in decoded:
+        resp.text = '<html>Hello {{7*7}}!</html>'
+      elif "name=" in decoded and "{{7*'7'}}" in decoded:
+        resp.text = "<html>Hello {{7*'7'}}!</html>"
+      else:
+        resp.text = '<html>Hello world</html>'
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_ssti("1.2.3.4", 4700)
+
+    findings = result.get("findings", [])
+    self.assertEqual(len(findings), 0, f"Should NOT fire on XSS reflection. Got: {[f['title'] for f in findings]}")
+
+  # ── Shellshock probe ───────────────────────────────────────────────
+
+  def test_shellshock_detected(self):
+    """Shellshock probe should detect CVE-2014-6271 via CGI marker echo."""
+    _, worker = self._build_worker(ports=[6600])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = ""
+      headers = kwargs.get("headers", {})
+      if "/cgi-bin/" in url and "REDMESH_SHELLSHOCK_DETECT" in headers.get("User-Agent", ""):
+        resp.text = "\nREDMESH_SHELLSHOCK_DETECT\n"
+      else:
+        resp.status_code = 404
+        resp.text = "Not Found"
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_shellshock("1.2.3.4", 6600)
+
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, "Should detect Shellshock")
+    self.assertEqual(findings[0]["severity"], "CRITICAL")
+    self.assertIn("CVE-2014-6271", findings[0]["title"])
+
+  def test_shellshock_no_match_on_non_cgi(self):
+    """Shellshock probe should not fire when no CGI endpoints respond."""
+    _, worker = self._build_worker(ports=[80])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = False
+      resp.status_code = 404
+      resp.text = "Not Found"
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_shellshock("1.2.3.4", 80)
+
+    findings = result.get("findings", [])
+    self.assertEqual(len(findings), 0)
+
+  # ── PHP backdoor probe ─────────────────────────────────────────────
+
+  def test_php_backdoor_detected(self):
+    """PHP probe should detect zerodium backdoor via User-Agentt header."""
+    _, worker = self._build_worker(ports=[6700])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      headers = kwargs.get("headers", {})
+      if "zerodiumsystem" in headers.get("User-Agentt", ""):
+        resp.text = "REDMESH_PHP_BACKDOOR\n"
+      else:
+        resp.text = "<html>PHP page</html>"
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = "<html>PHP page</html>"
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_php_cgi("1.2.3.4", 6700)
+
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, "Should detect PHP backdoor")
+    self.assertEqual(findings[0]["severity"], "CRITICAL")
+    self.assertIn("backdoor", findings[0]["title"].lower())
+
+  def test_php_cgi_arg_injection_detected(self):
+    """PHP probe should detect CVE-2024-4577 argument injection."""
+    _, worker = self._build_worker(ports=[6700])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = "<html>Normal page</html>"
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      if "%AD" in url:
+        resp.text = "REDMESH_PHPCGI_TEST"
+      else:
+        resp.text = "<html>Normal</html>"
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_php_cgi("1.2.3.4", 6700)
+
+    findings = result.get("findings", [])
+    self.assertTrue(any("CVE-2024-4577" in f["title"] for f in findings), f"Should detect arg injection. Got: {[f['title'] for f in findings]}")
+
+  # ── Drupal version from install.php (site-version span) ───────────
+
+  def test_drupal_version_from_install_php(self):
+    """Drupal probe should extract version from install.php site-version span."""
+    _, worker = self._build_worker(ports=[4200])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = ""
+      if url.endswith(":4200"):
+        resp.text = '<html><meta name="Generator" content="Drupal 8 (https://www.drupal.org)"></html>'
+      elif "/core/CHANGELOG.txt" in url:
+        resp.text = '<html><meta http-equiv="refresh" content="0;url=/core/install.php"></html>'
+        resp.ok = False
+        resp.status_code = 302
+      elif "/core/modules/system/system.info.yml" in url:
+        resp.ok = False
+        resp.status_code = 403
+        resp.text = "Forbidden"
+      elif "/core/install.php" in url:
+        resp.text = '''<html><span class="site-version">8.5.0</span>
+          <script src="/core/misc/drupal.js?v=8.5.0"></script></html>'''
+      else:
+        resp.ok = False
+        resp.status_code = 404
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_cms_fingerprint("1.2.3.4", 4200)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("8.5.0" in t for t in titles), f"Should extract Drupal 8.5.0 from install.php. Got: {titles}")
+    self.assertTrue(any("CVE-2018-7600" in t for t in titles), f"Should find Drupalgeddon2. Got: {titles}")
+
+  # ── WordPress version from readme.html ───────────────────────────
+
+  def test_wordpress_version_from_readme_html(self):
+    """WP probe should extract version from /readme.html when /feed/ is 404."""
+    _, worker = self._build_worker(ports=[4400])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = ""
+      if url.endswith(":4400"):
+        resp.text = '<html><link rel="stylesheet" href="/wp-content/themes/style.css"></html>'
+      elif "/wp-login.php" in url:
+        resp.text = '<html><title>wp-login</title></html>'
+      elif "/feed/" in url:
+        resp.ok = False
+        resp.status_code = 404
+        resp.text = "Not Found"
+      elif "/wp-links-opml.php" in url:
+        resp.ok = False
+        resp.status_code = 404
+        resp.text = "Not Found"
+      elif "/readme.html" in url:
+        resp.text = '<br /> Version 4.6\n<p>If you are updating from version 2.7'
+      elif "/xmlrpc.php" in url:
+        resp.status_code = 200
+      elif "/wp-json/wp/v2/users" in url:
+        resp.status_code = 200
+      else:
+        resp.ok = False
+        resp.status_code = 404
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_cms_fingerprint("1.2.3.4", 4400)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("4.6" in t for t in titles), f"Should extract WP 4.6 from readme.html. Got: {titles}")
+    self.assertTrue(any("CVE-2016-10033" in t for t in titles), f"Should find PHPMailer RCE. Got: {titles}")
+
+  # ── SSTI baseline false positive prevention ──────────────────────
+
+  def test_ssti_no_false_positive_on_baseline(self):
+    """SSTI probe should NOT fire when expected value already in baseline page."""
+    _, worker = self._build_worker(ports=[4300])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      # Every response contains "49" naturally (e.g. page content)
+      resp.text = '<html><p>Contact: +1-234-567-8949</p></html>'
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_ssti("1.2.3.4", 4300)
+
+    findings = result.get("findings", [])
+    self.assertEqual(len(findings), 0, f"Should NOT fire when '49' already in baseline. Got: {[f['title'] for f in findings]}")
+
+  # ── Shellshock via document root CGI paths ───────────────────────
+
+  def test_shellshock_via_victim_cgi(self):
+    """Shellshock probe should detect CVE-2014-6271 via /victim.cgi path."""
+    _, worker = self._build_worker(ports=[6600])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = ""
+      headers = kwargs.get("headers", {})
+      if "/victim.cgi" in url and "REDMESH_SHELLSHOCK_DETECT" in headers.get("User-Agent", ""):
+        resp.text = "\nREDMESH_SHELLSHOCK_DETECT\n"
+      else:
+        resp.status_code = 404
+        resp.text = "Not Found"
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+      result = worker._web_test_shellshock("1.2.3.4", 6600)
+
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, "Should detect Shellshock via /victim.cgi")
+    self.assertIn("CVE-2014-6271", findings[0]["title"])
+
+  # ── Dedup bug: _service_info_http_alt ──────────────────────────────
+
+  def test_http_alt_no_duplicate_cves(self):
+    """_service_info_http_alt should NOT emit CVE findings (dedup fix)."""
+    _, worker = self._build_worker(ports=[8080])
+
+    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket") as mock_sock:
+      mock_inst = MagicMock()
+      mock_inst.recv.return_value = (
+        b"HTTP/1.1 200 OK\r\n"
+        b"Server: Apache/2.4.25 (Debian)\r\n"
+        b"\r\n"
+      ).decode('utf-8').encode('utf-8')
+      mock_sock.return_value = mock_inst
+      result = worker._service_info_http_alt("1.2.3.4", 8080)
+
+    findings = result.get("findings", [])
+    cve_findings = [f for f in findings if "CVE-" in f.get("title", "")]
+    self.assertEqual(len(cve_findings), 0, f"http_alt should NOT emit CVEs. Got: {[f['title'] for f in cve_findings]}")
+    # But server header should still be captured
+    self.assertEqual(result.get("server"), "Apache/2.4.25 (Debian)")
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -6057,4 +6585,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestOWASPFullCoverage))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestDetectionGapFixes))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch2GapFixes))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch3GapFixes))
   runner.run(suite)
