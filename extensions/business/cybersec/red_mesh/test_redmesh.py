@@ -5633,6 +5633,194 @@ class TestOWASPFullCoverage(unittest.TestCase):
     self.assertEqual(len(plugin_findings), 0)
 
 
+class TestDetectionGapFixes(unittest.TestCase):
+  """Tests for detection gap fixes: Erlang SSH, BIND CVEs, DNS AXFR, SMTP HELP."""
+
+  def setUp(self):
+    if MANUAL_RUN:
+      print()
+      color_print(f"[MANUAL] >>> Starting <{self._testMethodName}>", color='b')
+
+  def tearDown(self):
+    if MANUAL_RUN:
+      color_print(f"[MANUAL] <<< Finished <{self._testMethodName}>", color='b')
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [22]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-gaps",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  # ── Erlang SSH detection ──────────────────────────────────────────
+
+  def test_erlang_ssh_banner_detection(self):
+    """SSH probe should identify Erlang SSH from banner."""
+    _, worker = self._build_worker()
+    lib, ver = worker._ssh_identify_library("SSH-2.0-Erlang/5.2.1")
+    self.assertEqual(lib, "erlang_ssh")
+    self.assertEqual(ver, "5.2.1")
+
+  def test_erlang_ssh_banner_otp_prefix(self):
+    """SSH probe should handle Erlang/OTP prefix in banner."""
+    _, worker = self._build_worker()
+    lib, ver = worker._ssh_identify_library("SSH-2.0-Erlang/OTP 5.1.4")
+    self.assertEqual(lib, "erlang_ssh")
+    self.assertEqual(ver, "5.1.4")
+
+  def test_erlang_ssh_cve_2025_32433(self):
+    """CVE-2025-32433 should match Erlang SSH < 5.2.2."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("erlang_ssh", "5.2.1")
+    cve_ids = [f.title for f in findings]
+    self.assertTrue(any("CVE-2025-32433" in t for t in cve_ids))
+
+  def test_erlang_ssh_cve_patched(self):
+    """CVE-2025-32433 should NOT match patched Erlang SSH >= 5.2.2."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("erlang_ssh", "5.2.2")
+    cve_ids = [f.title for f in findings]
+    self.assertFalse(any("CVE-2025-32433" in t for t in cve_ids))
+
+  # ── BIND CVE detection ───────────────────────────────────────────
+
+  def test_bind_cve_ancient_version(self):
+    """BIND 9.10.3 should match multiple CVEs."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("bind", "9.10.3")
+    self.assertTrue(len(findings) >= 5, f"Expected >=5 CVEs for BIND 9.10.3, got {len(findings)}")
+
+  def test_bind_cve_2016_2776(self):
+    """CVE-2016-2776 should match BIND < 9.10.4."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("bind", "9.10.3")
+    self.assertTrue(any("CVE-2016-2776" in f.title for f in findings))
+
+  def test_bind_cve_modern_patched(self):
+    """Modern BIND 9.20.x should not match any CVEs."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("bind", "9.20.0")
+    self.assertEqual(len(findings), 0)
+
+  # ── DNS AXFR zone discovery ──────────────────────────────────────
+
+  def test_dns_zone_discovery_soa_authoritative(self):
+    """Zone discovery should detect authoritative zones via SOA query."""
+    _, worker = self._build_worker()
+    # Mock socket to return authoritative SOA response for vulhub.org
+    tid = 0
+    def fake_socket_factory(family, typ):
+      sock = MagicMock()
+      def fake_sendto(data, addr):
+        nonlocal tid
+        tid = struct.unpack('>H', data[:2])[0]
+      sock.sendto = fake_sendto
+      # Build authoritative response: QR=1, AA=1, RCODE=0, ANCOUNT=1
+      def fake_recvfrom(size):
+        flags = (1 << 15) | (1 << 10)  # QR=1, AA=1
+        resp = struct.pack('>HHHHHH', tid, flags, 0, 1, 0, 0)
+        return resp, ("1.2.3.4", 53)
+      sock.recvfrom = fake_recvfrom
+      return sock
+    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket", side_effect=fake_socket_factory):
+      with patch("socket.gethostbyaddr", side_effect=Exception("no reverse")):
+        zones = worker._dns_discover_zones("1.2.3.4", 53)
+    # vulhub.org should be in the list (discovered as authoritative or as fallback)
+    self.assertIn("vulhub.org", zones)
+
+  def test_dns_zone_discovery_always_includes_fallbacks(self):
+    """Zone discovery should include fallback domains even when reverse DNS works."""
+    _, worker = self._build_worker()
+    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket") as mock_sock:
+      mock_inst = MagicMock()
+      mock_inst.recvfrom.side_effect = Exception("timeout")
+      mock_sock.return_value = mock_inst
+      with patch("socket.gethostbyaddr", return_value=("host.internal.gcp", [], ["10.0.0.1"])):
+        zones = worker._dns_discover_zones("10.0.0.1", 53)
+    # Should include both reverse-DNS derived domains AND fallbacks
+    self.assertIn("vulhub.org", zones)
+    self.assertIn("example.com", zones)
+    self.assertTrue(any("gcp" in d or "internal" in d for d in zones))
+
+  # ── DNS BIND CVE in probe ────────────────────────────────────────
+
+  def test_dns_probe_triggers_bind_cves(self):
+    """DNS probe should produce BIND CVE findings when version.bind reveals old BIND."""
+    _, worker = self._build_worker(ports=[53])
+    worker.state["scan_metadata"] = {}
+    version_txt = b"9.10.3-P4-Debian"
+    qname = b'\x07version\x04bind\x00'
+
+    # Capture tid from the probe's sendto call and build matching response
+    captured = {}
+    def fake_sendto(data, addr):
+      captured["tid"] = struct.unpack('>H', data[:2])[0]
+    def fake_recvfrom(size):
+      tid = captured["tid"]
+      header = struct.pack('>HHHHHH', tid, 0x8400, 1, 1, 0, 0)
+      question_section = qname + struct.pack('>HH', 16, 3)
+      answer = b'\xc0\x0c' + struct.pack('>HH', 16, 3) + struct.pack('>I', 0)
+      answer += struct.pack('>H', len(version_txt) + 1) + bytes([len(version_txt)]) + version_txt
+      return header + question_section + answer, ("1.2.3.4", 53)
+
+    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket") as mock_sock:
+      mock_inst = MagicMock()
+      mock_inst.sendto = fake_sendto
+      mock_inst.recvfrom = fake_recvfrom
+      mock_sock.return_value = mock_inst
+      with patch.object(worker, "_dns_test_axfr", return_value=[]):
+        with patch.object(worker, "_dns_test_open_resolver", return_value=None):
+          result = worker._service_info_dns("1.2.3.4", 53)
+    findings = result.get("findings", [])
+    cve_titles = [f["title"] for f in findings if "CVE-" in f.get("title", "")]
+    self.assertTrue(len(cve_titles) >= 3, f"Expected >=3 BIND CVEs, got {len(cve_titles)}: {cve_titles}")
+
+  # ── SMTP HELP version fallback ───────────────────────────────────
+
+  def test_smtp_help_extracts_version(self):
+    """SMTP probe should try HELP command when banner lacks version."""
+    _, worker = self._build_worker(ports=[25])
+    worker.state["scan_metadata"] = {}
+
+    mock_smtp = MagicMock()
+    mock_smtp.connect.return_value = (220, b"host ESMTP OpenSMTPD")
+    mock_smtp.ehlo.return_value = (250, b"host Hello\nSIZE 36700160")
+    mock_smtp.docmd.side_effect = [
+      # HELP command returns version
+      (214, b"OpenSMTPD 6.6.1p1"),
+      # STARTTLS
+      (502, b"Not supported"),
+      # MAIL FROM
+      (250, b"Ok"),
+      # RCPT TO
+      (550, b"Relay denied"),
+      # VRFY
+      (252, b"root"),
+      # EXPN
+      (502, b"Not supported"),
+    ]
+    mock_smtp.rset.return_value = (250, b"Ok")
+
+    with patch("smtplib.SMTP", return_value=mock_smtp):
+      result = worker._service_info_smtp("1.2.3.4", 25)
+
+    findings = result.get("findings", [])
+    cve_titles = [f["title"] for f in findings if "CVE-" in f.get("title", "")]
+    self.assertTrue(
+      any("CVE-2020-7247" in t for t in cve_titles),
+      f"Should detect CVE-2020-7247 via HELP version. CVEs found: {cve_titles}"
+    )
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -5658,4 +5846,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17aQuickWins))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17bMediumFeatures))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestOWASPFullCoverage))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestDetectionGapFixes))
   runner.run(suite)
