@@ -76,16 +76,19 @@ class _CorrelationMixin:
 
   def _post_scan_correlate(self):
     """Entry point: run all correlation checks and store findings."""
-    meta = self.state.get("scan_metadata")
-    if not meta:
-      return
-
     findings = []
-    findings += self._correlate_port_ratio()
-    findings += self._correlate_os_consistency()
-    findings += self._correlate_infrastructure_leak()
-    findings += self._correlate_tls_consistency()
-    findings += self._correlate_timezone_drift()
+
+    # Scan-metadata-dependent correlations
+    meta = self.state.get("scan_metadata")
+    if meta:
+      findings += self._correlate_port_ratio()
+      findings += self._correlate_os_consistency()
+      findings += self._correlate_infrastructure_leak()
+      findings += self._correlate_tls_consistency()
+      findings += self._correlate_timezone_drift()
+
+    # Cross-probe correlations (don't require scan_metadata)
+    findings += self._correlate_redirect_ssrf()
 
     if findings:
       self.P(f"Correlation engine produced {len(findings)} findings.")
@@ -209,5 +212,40 @@ class _CorrelationMixin:
         remediation="Investigate timezone configuration across services.",
         cwe_id="CWE-345",
         confidence="firm",
+      ))
+    return findings
+
+  def _correlate_redirect_ssrf(self):
+    """Flag SSRF chaining risk if open redirect + internal services detected."""
+    findings = []
+    web_info = self.state.get("web_tests_info", {})
+
+    has_open_redirect = False
+    has_metadata = False
+
+    for port_data in web_info.values():
+      for probe_name, result in port_data.items():
+        if not isinstance(result, dict):
+          continue
+        for f in result.get("findings", []):
+          title = f.get("title", "") if isinstance(f, dict) else ""
+          if "open redirect" in title.lower():
+            has_open_redirect = True
+          if "metadata" in title.lower() and "exposed" in title.lower():
+            has_metadata = True
+
+    if has_open_redirect and has_metadata:
+      findings.append(Finding(
+        severity=Severity.MEDIUM,
+        title="Open redirect may enable SSRF to cloud metadata",
+        description="An open redirect was found alongside accessible cloud metadata "
+                    "endpoints. If internal services follow redirects, an attacker "
+                    "can chain the redirect to access metadata credentials.",
+        evidence="Open redirect + cloud metadata endpoint both detected.",
+        remediation="Fix the open redirect; ensure internal HTTP clients do not follow "
+                    "redirects to metadata IPs.",
+        owasp_id="A10:2021",
+        cwe_id="CWE-918",
+        confidence="tentative",
       ))
     return findings

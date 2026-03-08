@@ -48,7 +48,7 @@ FEATURE_CATALOG = [
     "label": "Discovery",
     "description": "Enumerate exposed files, admin panels, homepage secrets, tech fingerprinting, and VPN endpoints (OWASP WSTG-INFO).",
     "category": "web",
-    "methods": ["_web_test_common", "_web_test_homepage", "_web_test_tech_fingerprint", "_web_test_vpn_endpoints", "_web_test_cms_fingerprint"]
+    "methods": ["_web_test_common", "_web_test_homepage", "_web_test_tech_fingerprint", "_web_test_vpn_endpoints", "_web_test_cms_fingerprint", "_web_test_verbose_errors"]
   },
   {
     "id": "web_hardening",
@@ -62,7 +62,7 @@ FEATURE_CATALOG = [
     "label": "API exposure",
     "description": "Detect GraphQL introspection leaks, cloud metadata endpoints, and API auth bypass (OWASP WSTG-APIT).",
     "category": "web",
-    "methods": ["_web_test_graphql_introspection", "_web_test_metadata_endpoints", "_web_test_api_auth_bypass"]
+    "methods": ["_web_test_graphql_introspection", "_web_test_metadata_endpoints", "_web_test_api_auth_bypass", "_web_test_ssrf_basic"]
   },
   {
     "id": "web_injection",
@@ -70,6 +70,20 @@ FEATURE_CATALOG = [
     "description": "Non-destructive probes for path traversal, reflected XSS, and SQL injection (OWASP WSTG-INPV).",
     "category": "web",
     "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection"]
+  },
+  {
+    "id": "web_auth_design",
+    "label": "Authentication & design flaws",
+    "description": "Detect account enumeration, missing rate limiting, and IDOR indicators (OWASP A04).",
+    "category": "web",
+    "methods": ["_web_test_account_enumeration", "_web_test_rate_limiting", "_web_test_idor_indicators"]
+  },
+  {
+    "id": "web_integrity",
+    "label": "Software integrity",
+    "description": "Check subresource integrity, mixed content, and client-side library versions (OWASP A08).",
+    "category": "web",
+    "methods": ["_web_test_subresource_integrity", "_web_test_mixed_content", "_web_test_js_library_versions"]
   },
   {
     "id": "active_auth",
@@ -173,6 +187,15 @@ PROBE_PROTOCOL_MAP = {
     "_service_info_mysql_creds": frozenset({"mysql"}),
     "_service_info_postgresql_creds": frozenset({"postgresql"}),
     "_service_info_http_basic_auth": frozenset({"http", "https"}),
+    # OWASP full coverage probes
+    "_web_test_ssrf_basic":            frozenset({"http", "https"}),
+    "_web_test_account_enumeration":   frozenset({"http", "https"}),
+    "_web_test_rate_limiting":         frozenset({"http", "https"}),
+    "_web_test_idor_indicators":       frozenset({"http", "https"}),
+    "_web_test_subresource_integrity": frozenset({"http", "https"}),
+    "_web_test_mixed_content":         frozenset({"http", "https"}),
+    "_web_test_js_library_versions":   frozenset({"http", "https"}),
+    "_web_test_verbose_errors":        frozenset({"http", "https"}),
 }
 
 # =====================================================================

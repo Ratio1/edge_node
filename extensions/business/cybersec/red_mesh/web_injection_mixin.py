@@ -1,3 +1,4 @@
+import re as _re
 import time
 import requests
 from urllib.parse import quote
@@ -332,5 +333,86 @@ class _WebInjectionMixin(_InjectionTestBase):
             ))
         except Exception:
           pass
+
+    return probe_result(findings=findings_list)
+
+
+  # ── A04:2021 — IDOR indicators ──────────────────────────────────────
+
+  _IDOR_PATHS = [
+    ("/api/users/", "users"),
+    ("/api/user/", "user"),
+    ("/api/account/", "account"),
+    ("/api/order/", "order"),
+  ]
+  _PII_PATTERNS = [
+    _re.compile(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'),  # email
+    _re.compile(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b'),                     # phone
+  ]
+
+  def _web_test_idor_indicators(self, target, port):
+    """
+    Detect predictable/sequential resource IDs (IDOR indicators).
+
+    Default severity is INFO.  Escalates to MEDIUM if PII-like patterns
+    (emails, phone numbers) are found in the response.
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    for path_prefix, resource in self._IDOR_PATHS:
+      if findings_list:
+        break
+      try:
+        url1 = f"{base_url.rstrip('/')}{path_prefix}1"
+        url2 = f"{base_url.rstrip('/')}{path_prefix}2"
+        resp1 = requests.get(url1, timeout=3, verify=False)
+        resp2 = requests.get(url2, timeout=3, verify=False)
+
+        if resp1.status_code != 200 or resp2.status_code != 200:
+          continue
+        if resp1.text == resp2.text:
+          continue  # same content — likely generic page, not individual resources
+
+        combined = resp1.text + resp2.text
+        has_pii = any(p.search(combined) for p in self._PII_PATTERNS)
+
+        if has_pii:
+          findings_list.append(Finding(
+            severity=Severity.MEDIUM,
+            title=f"Sequential resource IDs with PII exposure: {path_prefix}",
+            description=f"API endpoint {path_prefix}{{id}} returns different data for "
+                        "sequential IDs and contains PII patterns (email/phone), "
+                        "suggesting broken access control.",
+            evidence=f"GET {url1} and {url2} both returned 200 with PII in body.",
+            remediation="Use non-sequential identifiers (UUIDs); enforce per-user authorization.",
+            owasp_id="A04:2021",
+            cwe_id="CWE-639",
+            confidence="firm",
+          ))
+        else:
+          findings_list.append(Finding(
+            severity=Severity.INFO,
+            title=f"Sequential resource IDs detected: {path_prefix}",
+            description=f"API endpoint {path_prefix}{{id}} returns distinct data for "
+                        "sequential integer IDs. Manual IDOR verification recommended.",
+            evidence=f"GET {url1} and {url2} both returned 200 with different bodies.",
+            remediation="Consider using non-sequential identifiers (UUIDs).",
+            owasp_id="A04:2021",
+            cwe_id="CWE-639",
+            confidence="tentative",
+          ))
+      except Exception:
+        continue
 
     return probe_result(findings=findings_list)

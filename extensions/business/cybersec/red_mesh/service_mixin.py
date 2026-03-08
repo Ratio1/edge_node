@@ -2721,7 +2721,7 @@ class _ServiceInfoMixin:
             description="Root-level shell access was obtained over an unencrypted Telnet session.",
             evidence=f"uid=0 in id output: {uid_line}",
             remediation="Disable root login via Telnet; use SSH with key-based auth instead.",
-            owasp_id="A04:2021",
+            owasp_id="A07:2021",
             cwe_id="CWE-250",
             confidence="certain",
           ))
