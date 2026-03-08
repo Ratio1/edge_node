@@ -47,7 +47,9 @@ CVE_DATABASE: list = [
   CveEntry("redis", "<7.2.7",  "CVE-2024-46981", Severity.HIGH, "Lua GC use-after-free RCE", "CWE-416"),
 
   # ── MySQL ──────────────────────────────────────────────────────────
-  CveEntry("mysql", ">=5.7,<5.7.20",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
+  CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
+  CveEntry("mysql", ">=5.6,<5.6.33",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
+  CveEntry("mysql", ">=5.7,<5.7.15",  "CVE-2016-6662", Severity.CRITICAL, "Config file injection RCE", "CWE-94"),
   CveEntry("mysql", ">=5.5,<5.5.52",  "CVE-2016-6664", Severity.HIGH, "Privilege escalation via mysqld_safe", "CWE-269"),
   CveEntry("mysql", ">=8.0,<8.0.23",  "CVE-2021-2022", Severity.MEDIUM, "InnoDB buffer pool corruption", "CWE-787"),
   CveEntry("mysql", ">=5.7,<5.7.44",  "CVE-2024-20973", Severity.HIGH, "Optimizer DoS via low-privilege network attack", "CWE-404"),
@@ -131,6 +133,15 @@ CVE_DATABASE: list = [
 
   # ── Erlang OTP SSH ──────────────────────────────────────────────
   CveEntry("erlang_ssh", "<5.2.2", "CVE-2025-32433", Severity.CRITICAL, "Pre-auth RCE via SSH protocol message sequence", "CWE-306"),
+
+  # ── CouchDB ──────────────────────────────────────────────────────
+  CveEntry("couchdb", "<3.2.2",           "CVE-2022-24706", Severity.CRITICAL, "Default Erlang cookie RCE via cluster protocol", "CWE-1188"),
+  CveEntry("couchdb", ">=3.0.0,<3.1.2",   "CVE-2021-38295", Severity.HIGH, "Privilege escalation via cluster API", "CWE-269"),
+  CveEntry("couchdb", "<2.1.1",           "CVE-2017-12635", Severity.CRITICAL, "Admin creation race condition bypass", "CWE-269"),
+  CveEntry("couchdb", "<2.1.1",           "CVE-2017-12636", Severity.CRITICAL, "OS command injection via query server config", "CWE-78"),
+
+  # ── InfluxDB ────────────────────────────────────────────────────
+  CveEntry("influxdb", "<1.7.6",  "CVE-2019-20933", Severity.CRITICAL, "JWT auth bypass via empty shared secret", "CWE-287"),
 
   # ── BIND (DNS) ──────────────────────────────────────────────────
   CveEntry("bind", "<9.11.37",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
