@@ -50,7 +50,7 @@ FEATURE_CATALOG = [
     "label": "Discovery",
     "description": "Enumerate exposed files, admin panels, homepage secrets, tech fingerprinting, and VPN endpoints (OWASP WSTG-INFO).",
     "category": "web",
-    "methods": ["_web_test_common", "_web_test_homepage", "_web_test_tech_fingerprint", "_web_test_vpn_endpoints", "_web_test_cms_fingerprint", "_web_test_verbose_errors"]
+    "methods": ["_web_test_common", "_web_test_homepage", "_web_test_tech_fingerprint", "_web_test_vpn_endpoints", "_web_test_cms_fingerprint", "_web_test_verbose_errors", "_web_test_java_servers"]
   },
   {
     "id": "web_hardening",
@@ -71,7 +71,7 @@ FEATURE_CATALOG = [
     "label": "Injection probes",
     "description": "Non-destructive probes for path traversal, reflected XSS, and SQL injection (OWASP WSTG-INPV).",
     "category": "web",
-    "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection", "_web_test_ssti", "_web_test_shellshock", "_web_test_php_cgi"]
+    "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection", "_web_test_ssti", "_web_test_shellshock", "_web_test_php_cgi", "_web_test_ognl_injection", "_web_test_java_deserialization", "_web_test_spring_actuator"]
   },
   {
     "id": "web_auth_design",
@@ -200,6 +200,10 @@ PROBE_PROTOCOL_MAP = {
     "_web_test_mixed_content":         frozenset({"http", "https"}),
     "_web_test_js_library_versions":   frozenset({"http", "https"}),
     "_web_test_verbose_errors":        frozenset({"http", "https"}),
+    "_web_test_java_servers":          frozenset({"http", "https"}),
+    "_web_test_ognl_injection":        frozenset({"http", "https"}),
+    "_web_test_java_deserialization":  frozenset({"http", "https"}),
+    "_web_test_spring_actuator":       frozenset({"http", "https"}),
 }
 
 # =====================================================================

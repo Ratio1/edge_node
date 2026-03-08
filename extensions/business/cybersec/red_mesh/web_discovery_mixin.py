@@ -802,6 +802,303 @@ class _WebDiscoveryMixin:
     return probe_result(findings=findings_list)
 
 
+  # ── Java Application Server fingerprinting ──────────────────────────
+
+  _JAVA_SERVER_EOL = {
+    "JBoss AS": {"5": "2012", "6": "2016"},
+  }
+
+  def _web_test_java_servers(self, target, port):
+    """
+    Detect and version-check Java application servers and frameworks:
+    WebLogic, Tomcat, JBoss/WildFly, Struts2, Spring.
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    raw = {"java_server": None, "version": None, "framework": None}
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    # --- 1. WebLogic detection ---
+    weblogic_version = None
+    # Console login page
+    try:
+      resp = requests.get(base_url + "/console/login/LoginForm.jsp", timeout=4, verify=False, allow_redirects=True)
+      if resp.ok and "WebLogic" in resp.text:
+        raw["java_server"] = "WebLogic"
+        ver_m = _re.search(r'(?:WebLogic Server|footerVersion)[^0-9]*(\d+\.\d+\.\d+\.\d+)', resp.text)
+        if ver_m:
+          weblogic_version = ver_m.group(1)
+        else:
+          weblogic_version = "unknown"
+    except Exception:
+      pass
+    # T3/IIOP banner on root (some WebLogic instances)
+    if not weblogic_version:
+      try:
+        resp = requests.get(base_url, timeout=3, verify=False)
+        if resp.ok:
+          # Check for WebLogic error page patterns
+          if "WebLogic" in resp.text or "BEA-" in resp.text:
+            raw["java_server"] = "WebLogic"
+            weblogic_version = "unknown"
+          # Check X-Powered-By for Servlet/JSP versions typical of WebLogic
+          xpb = resp.headers.get("X-Powered-By", "")
+          if "Servlet" in xpb and "JSP" in xpb and not raw["java_server"]:
+            # Could be WebLogic or other Java server — check console
+            pass
+      except Exception:
+        pass
+
+    if weblogic_version:
+      raw["version"] = weblogic_version
+      findings_list.append(Finding(
+        severity=Severity.MEDIUM,
+        title=f"WebLogic Server {weblogic_version} detected",
+        description=f"Oracle WebLogic Server {weblogic_version} identified on {target}:{port}.",
+        evidence="Detection via /console/login/LoginForm.jsp or error page.",
+        remediation="Restrict access to the WebLogic console; keep WebLogic patched.",
+        owasp_id="A05:2021",
+        cwe_id="CWE-200",
+        confidence="certain",
+      ))
+      if weblogic_version != "unknown":
+        findings_list += check_cves("weblogic", weblogic_version)
+      # Check for console exposure
+      try:
+        resp = requests.get(base_url + "/console/", timeout=3, verify=False, allow_redirects=True)
+        if resp.ok and ("login" in resp.text.lower() or "WebLogic" in resp.text):
+          findings_list.append(Finding(
+            severity=Severity.HIGH,
+            title="WebLogic admin console exposed",
+            description="The WebLogic administration console is accessible without IP restriction.",
+            evidence=f"GET {base_url}/console/ → {resp.status_code}",
+            remediation="Restrict console access to management network only.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-306",
+            confidence="certain",
+          ))
+      except Exception:
+        pass
+      return probe_result(raw_data=raw, findings=findings_list)
+
+    # --- 2. Tomcat detection ---
+    tomcat_version = None
+    try:
+      resp = requests.get(base_url, timeout=3, verify=False)
+      if resp.ok:
+        # Tomcat default page or error page
+        tc_m = _re.search(r'Apache Tomcat[/\s]*(\d+\.\d+\.\d+)', resp.text)
+        if tc_m:
+          tomcat_version = tc_m.group(1)
+        elif "Apache Tomcat" in resp.text:
+          tomcat_version = "unknown"
+        # Server header
+        srv = resp.headers.get("Server", "")
+        if not tomcat_version and "Tomcat" in srv:
+          tc_m = _re.search(r'Tomcat[/\s]*(\d+\.\d+\.\d+)', srv)
+          tomcat_version = tc_m.group(1) if tc_m else "unknown"
+    except Exception:
+      pass
+    # Try 404 page which often reveals Tomcat version
+    if not tomcat_version:
+      try:
+        resp = requests.get(base_url + "/nonexistent_" + _uuid.uuid4().hex[:6], timeout=3, verify=False)
+        tc_m = _re.search(r'Apache Tomcat[/\s]*(\d+\.\d+\.\d+)', resp.text)
+        if tc_m:
+          tomcat_version = tc_m.group(1)
+      except Exception:
+        pass
+
+    if tomcat_version:
+      raw["java_server"] = "Tomcat"
+      raw["version"] = tomcat_version
+      findings_list.append(Finding(
+        severity=Severity.LOW,
+        title=f"Apache Tomcat {tomcat_version} detected",
+        description=f"Apache Tomcat {tomcat_version} identified on {target}:{port}.",
+        evidence="Detection via default page, error page, or Server header.",
+        remediation="Keep Tomcat updated; remove default applications.",
+        confidence="certain",
+      ))
+      if tomcat_version != "unknown":
+        findings_list += check_cves("tomcat", tomcat_version)
+      # Manager app exposure
+      for mgr_path in ["/manager/html", "/manager/status"]:
+        try:
+          resp = requests.get(base_url + mgr_path, timeout=3, verify=False)
+          if resp.status_code in (200, 401, 403):
+            findings_list.append(Finding(
+              severity=Severity.HIGH if resp.status_code == 200 else Severity.MEDIUM,
+              title=f"Tomcat Manager accessible: {mgr_path}",
+              description=f"Tomcat Manager at {mgr_path} returned {resp.status_code}.",
+              evidence=f"GET {base_url}{mgr_path} → {resp.status_code}",
+              remediation="Remove or restrict Tomcat Manager in production.",
+              owasp_id="A01:2021",
+              cwe_id="CWE-306",
+              confidence="certain",
+            ))
+            break
+        except Exception:
+          pass
+      # Do NOT return — frameworks (Spring, Struts2) often run on Tomcat
+
+    # --- 3. JBoss / WildFly detection ---
+    jboss_version = None
+    try:
+      resp = requests.get(base_url, timeout=3, verify=False)
+      xpb = resp.headers.get("X-Powered-By", "")
+      jb_m = _re.search(r'JBossAS[- ]*(\d+)', xpb)
+      if jb_m:
+        jboss_version = jb_m.group(1) + ".0"
+        raw["java_server"] = "JBoss AS"
+      elif "JBoss" in xpb or "WildFly" in xpb:
+        jboss_version = "unknown"
+        raw["java_server"] = "JBoss/WildFly"
+      # Check for JBoss welcome page
+      if not jboss_version and resp.ok:
+        if "JBoss" in resp.text or "WildFly" in resp.text:
+          jb_m = _re.search(r'(?:JBoss|WildFly)[/\s]*(\d+\.\d+\.\d+)', resp.text)
+          jboss_version = jb_m.group(1) if jb_m else "unknown"
+          raw["java_server"] = "JBoss" if "JBoss" in resp.text else "WildFly"
+    except Exception:
+      pass
+
+    if jboss_version:
+      raw["version"] = jboss_version
+      findings_list.append(Finding(
+        severity=Severity.LOW,
+        title=f"{raw['java_server']} {jboss_version} detected",
+        description=f"{raw['java_server']} {jboss_version} identified on {target}:{port}.",
+        evidence=f"Detection via X-Powered-By header or welcome page.",
+        remediation="Keep application server updated; restrict management interfaces.",
+        confidence="certain",
+      ))
+      # EOL check
+      if jboss_version != "unknown" and raw["java_server"] == "JBoss AS":
+        major = jboss_version.split(".")[0]
+        eol_date = self._JAVA_SERVER_EOL.get("JBoss AS", {}).get(major)
+        if eol_date:
+          findings_list.append(Finding(
+            severity=Severity.HIGH,
+            title=f"JBoss AS {jboss_version} is end-of-life (EOL since {eol_date})",
+            description=f"JBoss AS {jboss_version} no longer receives security patches.",
+            evidence=f"Version: {jboss_version}, EOL: {eol_date}",
+            remediation="Migrate to WildFly or JBoss EAP.",
+            owasp_id="A06:2021",
+            cwe_id="CWE-1104",
+            confidence="certain",
+          ))
+      if jboss_version != "unknown":
+        findings_list += check_cves("jboss", jboss_version)
+      # JMX console exposure
+      try:
+        resp = requests.get(base_url + "/jmx-console/", timeout=3, verify=False)
+        if resp.status_code in (200, 401):
+          findings_list.append(Finding(
+            severity=Severity.HIGH if resp.status_code == 200 else Severity.MEDIUM,
+            title="JBoss JMX console exposed",
+            description=f"JMX console at /jmx-console/ returned {resp.status_code}.",
+            evidence=f"GET {base_url}/jmx-console/ → {resp.status_code}",
+            remediation="Remove or restrict JMX console access.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-306",
+            confidence="certain",
+          ))
+      except Exception:
+        pass
+      # Do NOT return — frameworks (Spring, Struts2) may run on JBoss
+
+    # --- 4. Spring Framework detection ---
+    spring_detected = False
+    try:
+      resp = requests.get(base_url, timeout=3, verify=False)
+      body = resp.text[:10000]
+      # Spring Whitelabel Error Page
+      if "Whitelabel Error Page" in body or "Spring" in resp.headers.get("X-Application-Context", ""):
+        spring_detected = True
+      # JSESSIONID cookie (generic Java indicator)
+      if not spring_detected and "JSESSIONID" in resp.headers.get("Set-Cookie", ""):
+        raw["framework"] = "Java (JSESSIONID)"
+    except Exception:
+      pass
+    if not spring_detected:
+      try:
+        resp = requests.get(base_url + "/nonexistent_" + _uuid.uuid4().hex[:6], timeout=3, verify=False)
+        if "Whitelabel Error Page" in resp.text:
+          spring_detected = True
+        elif "org.springframework" in resp.text or "DispatcherServlet" in resp.text:
+          spring_detected = True
+      except Exception:
+        pass
+    # Spring MVC: POST to root returns 405 with Spring-specific message
+    if not spring_detected:
+      try:
+        resp = requests.post(base_url, data="", timeout=3, verify=False)
+        if resp.status_code == 405:
+          body = resp.text
+          if "Request method" in body and "not supported" in body:
+            spring_detected = True
+      except Exception:
+        pass
+
+    spring_evidence = []
+    if spring_detected:
+      raw["framework"] = "Spring"
+      spring_evidence.append("Spring MVC indicators detected")
+      findings_list.append(Finding(
+        severity=Severity.LOW,
+        title="Spring Framework detected",
+        description=f"Spring Framework identified on {target}:{port}.",
+        evidence="Whitelabel Error Page, X-Application-Context header, "
+                 "DispatcherServlet in error page, or Spring MVC 405 response.",
+        remediation="Disable the default error page in production; keep Spring updated.",
+        confidence="certain",
+      ))
+
+    # --- 5. Struts2 detection ---
+    struts_detected = False
+    struts_evidence = ""
+    # 5a. Check /struts/utils.js — present in all Struts2 apps using <s:head/> tag
+    try:
+      resp = requests.get(base_url + "/struts/utils.js", timeout=3, verify=False)
+      if resp.ok and len(resp.text) > 50:
+        struts_detected = True
+        struts_evidence = "/struts/utils.js present"
+    except Exception:
+      pass
+    # 5b. Check homepage for .action/.do URLs or Struts indicators
+    if not struts_detected:
+      try:
+        resp = requests.get(base_url, timeout=3, verify=False)
+        body = resp.text[:10000]
+        struts_indicators = [".action", ".do", "struts", "Struts Problem Report"]
+        if any(ind in body for ind in struts_indicators):
+          struts_detected = True
+          struts_evidence = ".action/.do URLs or Struts indicators in page"
+      except Exception:
+        pass
+    if struts_detected:
+      raw["framework"] = "Struts2"
+      findings_list.append(Finding(
+        severity=Severity.LOW,
+        title="Apache Struts2 framework detected",
+        description=f"Struts2 indicators found on {target}:{port}.",
+        evidence=f"Detection via {struts_evidence}.",
+        remediation="Keep Struts2 updated; review OGNL injection mitigations.",
+        confidence="firm",
+      ))
+
+    return probe_result(raw_data=raw, findings=findings_list)
+
   # ── A08:2021 / A06:2021 — JS library version detection ─────────────
 
   _JS_LIB_PATTERNS = [
