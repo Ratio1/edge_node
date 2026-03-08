@@ -68,6 +68,17 @@ class _WebDiscoveryMixin:
         "WordPress login page accessible — confirms WordPress deployment."),
       "/.well-known/security.txt": (Severity.INFO, "", "",
         "Security policy (RFC 9116) published."),
+      # Debug & monitoring endpoints (A09 — exposed monitoring)
+      "/actuator": (Severity.HIGH, "CWE-215", "A09:2021",
+        "Spring Boot Actuator exposed — may leak env vars, health, and beans."),
+      "/actuator/env": (Severity.HIGH, "CWE-215", "A09:2021",
+        "Spring Boot environment dump — leaks config, secrets, and database URLs."),
+      "/server-status": (Severity.HIGH, "CWE-215", "A09:2021",
+        "Apache mod_status exposed — reveals active connections and request details."),
+      "/server-info": (Severity.HIGH, "CWE-215", "A09:2021",
+        "Apache mod_info exposed — reveals server configuration."),
+      "/elmah.axd": (Severity.HIGH, "CWE-215", "A09:2021",
+        ".NET ELMAH error log viewer exposed — reveals stack traces and request data."),
     }
 
     try:
@@ -115,16 +126,17 @@ class _WebDiscoveryMixin:
       base_url = f"{scheme}://{target}:{port}"
 
     _MARKER_META = {
-      "API_KEY": (Severity.CRITICAL, "API key found in page source"),
-      "PASSWORD": (Severity.CRITICAL, "Password string found in page source"),
-      "SECRET": (Severity.HIGH, "Secret string found in page source"),
-      "BEGIN RSA PRIVATE KEY": (Severity.CRITICAL, "RSA private key found in page source"),
+      # (severity, title, owasp_id) — private key is A08 (integrity), rest is A01 (access control)
+      "API_KEY": (Severity.CRITICAL, "API key found in page source", "A01:2021"),
+      "PASSWORD": (Severity.CRITICAL, "Password string found in page source", "A01:2021"),
+      "SECRET": (Severity.HIGH, "Secret string found in page source", "A01:2021"),
+      "BEGIN RSA PRIVATE KEY": (Severity.CRITICAL, "RSA private key found in page source", "A08:2021"),
     }
 
     try:
       resp_main = requests.get(base_url, timeout=3, verify=False)
       text = resp_main.text[:10000]
-      for marker, (severity, title) in _MARKER_META.items():
+      for marker, (severity, title, owasp) in _MARKER_META.items():
         if marker in text:
           findings_list.append(Finding(
             severity=severity,
@@ -132,7 +144,7 @@ class _WebDiscoveryMixin:
             description=f"The string '{marker}' was found in the HTML source of {base_url}.",
             evidence=f"Marker '{marker}' present in first 10KB of response.",
             remediation="Remove sensitive data from client-facing HTML; use server-side environment variables.",
-            owasp_id="A01:2021",
+            owasp_id=owasp,
             cwe_id="CWE-540",
             confidence="firm",
           ))
@@ -389,6 +401,7 @@ class _WebDiscoveryMixin:
         confidence="certain",
       ))
       findings_list += self._cms_check_eol("WordPress", wp_version)
+      findings_list += self._wp_detect_plugins(base_url)
       for path, desc in self._WP_SENSITIVE_PATHS:
         try:
           resp = requests.get(base_url + path, timeout=3, verify=False)
@@ -495,3 +508,260 @@ class _WebDiscoveryMixin:
         confidence="certain",
       ))
     return findings
+
+  # --- WordPress plugin detection (A06 improvement) ---
+
+  _WP_PLUGIN_CHECKS = [
+    ("elementor", "Elementor"),
+    ("contact-form-7", "Contact Form 7"),
+    ("woocommerce", "WooCommerce"),
+    ("yoast-seo", "Yoast SEO"),
+    ("wordfence", "Wordfence"),
+    ("wpforms-lite", "WPForms"),
+    ("all-in-one-seo-pack", "All in One SEO"),
+    ("updraftplus", "UpdraftPlus"),
+  ]
+
+  def _wp_detect_plugins(self, base_url):
+    """Detect WordPress plugins via readme.txt version disclosure."""
+    findings = []
+    for slug, name in self._WP_PLUGIN_CHECKS:
+      try:
+        url = f"{base_url}/wp-content/plugins/{slug}/readme.txt"
+        resp = requests.get(url, timeout=3, verify=False)
+        if resp.status_code != 200:
+          continue
+        ver_match = _re.search(r'Stable tag:\s*([0-9.]+)', resp.text, _re.IGNORECASE)
+        version = ver_match.group(1) if ver_match else "unknown"
+        findings.append(Finding(
+          severity=Severity.LOW,
+          title=f"WordPress plugin version exposed: {name} {version}",
+          description=f"Plugin {name} detected via readme.txt. "
+                      "Version disclosure aids targeted exploit search.",
+          evidence=f"GET {url} → Stable tag: {version}",
+          remediation="Block access to plugin readme.txt files.",
+          owasp_id="A06:2021",
+          cwe_id="CWE-200",
+          confidence="certain",
+        ))
+      except Exception:
+        continue
+    return findings
+
+
+  # ── A09:2021 — Verbose errors & debug mode detection ────────────────
+
+  _STACK_TRACE_MARKERS = [
+    ("Traceback (most recent call last)", "Python"),
+    ("SQLSTATE[", "PHP PDO"),
+    ("Fatal error:", "PHP"),
+    ("Parse error:", "PHP"),
+    ("Exception in thread", "Java"),
+    ("Stack trace:", "Generic"),
+  ]
+  _DEBUG_MODE_MARKERS = [
+    ("djdt", "Django Debug Toolbar"),
+    ("Django REST framework", "Django REST"),
+  ]
+  _PATH_LEAK_PATTERNS = [
+    _re.compile(r'(/home/\w+|/var/www/|/opt/|/usr/local/|C:\\\\[Uu]sers)'),
+  ]
+
+  def _web_test_verbose_errors(self, target, port):
+    """
+    Detect verbose error pages and debug mode indicators (safe probes only).
+
+    Requests a random non-existent path to trigger 404 handling, then checks
+    for stack traces, framework debug output, and filesystem path leaks.
+    Also probes for debug endpoints (__debug__/, actuator/env).
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    # --- 1. Trigger a 404 and inspect the error page ---
+    try:
+      canary = f"/nonexistent_{_uuid.uuid4().hex[:8]}"
+      resp = requests.get(base_url + canary, timeout=3, verify=False)
+      body = resp.text[:10000]
+
+      for marker, framework in self._STACK_TRACE_MARKERS:
+        if marker in body:
+          findings_list.append(Finding(
+            severity=Severity.MEDIUM,
+            title=f"Verbose error page: {framework} stack trace exposed",
+            description=f"Error page at {canary} contains {framework} stack trace, "
+                        "leaking internal code structure and potentially secrets.",
+            evidence=f"Marker '{marker}' found in 404 response.",
+            remediation="Configure production error handling to return generic error pages.",
+            owasp_id="A09:2021",
+            cwe_id="CWE-209",
+            confidence="certain",
+          ))
+          break
+
+      for pattern in self._PATH_LEAK_PATTERNS:
+        match = pattern.search(body)
+        if match and not findings_list:
+          findings_list.append(Finding(
+            severity=Severity.LOW,
+            title=f"Internal path leaked in error page",
+            description="Error page reveals filesystem paths.",
+            evidence=f"Path pattern: {match.group(0)}",
+            remediation="Suppress internal paths in error responses.",
+            owasp_id="A09:2021",
+            cwe_id="CWE-209",
+            confidence="firm",
+          ))
+    except Exception:
+      pass
+
+    # --- 2. Debug mode detection on homepage ---
+    try:
+      resp = requests.get(base_url, timeout=3, verify=False)
+      body = resp.text[:10000]
+      for marker, framework in self._DEBUG_MODE_MARKERS:
+        if marker in body:
+          findings_list.append(Finding(
+            severity=Severity.HIGH,
+            title=f"Debug mode enabled: {framework}",
+            description=f"Debug interface detected on homepage, exposing internal "
+                        "state, SQL queries, and configuration.",
+            evidence=f"Marker '{marker}' found in homepage.",
+            remediation=f"Disable {framework} debug mode in production.",
+            owasp_id="A09:2021",
+            cwe_id="CWE-489",
+            confidence="certain",
+          ))
+          break
+    except Exception:
+      pass
+
+    # --- 3. Django __debug__/ endpoint ---
+    try:
+      resp = requests.get(base_url + "/__debug__/", timeout=3, verify=False)
+      if resp.status_code == 200 and "djdt" in resp.text.lower():
+        findings_list.append(Finding(
+          severity=Severity.HIGH,
+          title="Debug mode enabled: Django Debug Toolbar endpoint",
+          description="Django Debug Toolbar is accessible at /__debug__/.",
+          evidence="GET /__debug__/ returned 200 with djdt content.",
+          remediation="Remove django-debug-toolbar from production or restrict access.",
+          owasp_id="A09:2021",
+          cwe_id="CWE-489",
+          confidence="certain",
+        ))
+    except Exception:
+      pass
+
+    return probe_result(findings=findings_list)
+
+
+  # ── A08:2021 / A06:2021 — JS library version detection ─────────────
+
+  _JS_LIB_PATTERNS = [
+    # (filename regex, version-in-content regex, library name)
+    (_re.compile(r'jquery[.-]?(\d+\.\d+\.\d+)', _re.IGNORECASE), None, "jQuery"),
+    (None, _re.compile(r'/\*!?\s*jQuery\s+v(\d+\.\d+\.\d+)'), "jQuery"),
+    (None, _re.compile(r'AngularJS\s+v(\d+\.\d+\.\d+)'), "AngularJS"),
+    (_re.compile(r'angular[.-]?(\d+\.\d+\.\d+)', _re.IGNORECASE), None, "AngularJS"),
+    (None, _re.compile(r'Bootstrap\s+v(\d+\.\d+\.\d+)'), "Bootstrap"),
+    (None, _re.compile(r'Vue\.js\s+v(\d+\.\d+\.\d+)'), "Vue.js"),
+    (None, _re.compile(r'React\s+v(\d+\.\d+\.\d+)'), "React"),
+    (_re.compile(r'moment[.-]?(\d+\.\d+\.\d+)', _re.IGNORECASE), None, "Moment.js"),
+  ]
+  _JS_EOL_LIBRARIES = {
+    "AngularJS": "EOL since 2021-12-31",
+    "Moment.js": "Deprecated — use date-fns or Luxon",
+  }
+
+  def _web_test_js_library_versions(self, target, port):
+    """
+    Detect client-side JavaScript libraries and flag EOL/deprecated ones.
+
+    Version detection only — emits INFO findings with version data for LLM
+    analysis to cross-reference against CVE databases. Only definitively EOL
+    libraries (AngularJS, Moment.js) get MEDIUM severity.
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    raw = {"js_libraries": []}
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    try:
+      resp = requests.get(base_url, timeout=4, verify=False)
+      if resp.status_code != 200:
+        return probe_result(findings=findings_list)
+      html = resp.text
+      detected = {}  # lib_name → version
+
+      # Check script src URLs for version in filename
+      script_re = _re.compile(r'<script[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']', _re.IGNORECASE)
+      for match in script_re.finditer(html):
+        src = match.group(1)
+        for filename_re, _, lib_name in self._JS_LIB_PATTERNS:
+          if filename_re and lib_name not in detected:
+            ver_match = filename_re.search(src)
+            if ver_match:
+              detected[lib_name] = ver_match.group(1)
+
+      # Check inline script content for version comments
+      inline_re = _re.compile(r'<script[^>]*>(.*?)</script>', _re.IGNORECASE | _re.DOTALL)
+      for match in inline_re.finditer(html[:50000]):
+        content = match.group(1)
+        for _, content_re, lib_name in self._JS_LIB_PATTERNS:
+          if content_re and lib_name not in detected:
+            ver_match = content_re.search(content)
+            if ver_match:
+              detected[lib_name] = ver_match.group(1)
+
+      for lib_name, version in detected.items():
+        raw["js_libraries"].append({"name": lib_name, "version": version})
+        eol_note = self._JS_EOL_LIBRARIES.get(lib_name)
+        if eol_note:
+          findings_list.append(Finding(
+            severity=Severity.MEDIUM,
+            title=f"End-of-life JS library: {lib_name} {version}",
+            description=f"{lib_name} {version} is {eol_note}. "
+                        "No security patches are available.",
+            evidence=f"Detected {lib_name} {version} in page source.",
+            remediation=f"Migrate away from {lib_name} to a supported alternative.",
+            owasp_id="A08:2021",
+            cwe_id="CWE-1104",
+            confidence="certain",
+          ))
+        else:
+          findings_list.append(Finding(
+            severity=Severity.INFO,
+            title=f"JS library detected: {lib_name} {version}",
+            description=f"{lib_name} {version} detected in page source.",
+            evidence=f"Version {version} found via script tag analysis.",
+            remediation="Keep client-side libraries updated.",
+            owasp_id="A06:2021",
+            cwe_id="CWE-200",
+            confidence="certain",
+          ))
+
+    except Exception as e:
+      self.P(f"JS library probe failed on {base_url}: {e}", color='y')
+      return probe_error(target, port, "js_libs", e)
+
+    return probe_result(raw_data=raw, findings=findings_list)

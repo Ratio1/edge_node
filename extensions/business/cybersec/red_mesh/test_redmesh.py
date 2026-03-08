@@ -5040,6 +5040,599 @@ class TestPhase17bMediumFeatures(unittest.TestCase):
     self.assertTrue(any("admin shares" in t.lower() for t in titles), f"titles={titles}")
 
 
+class TestOWASPFullCoverage(unittest.TestCase):
+  """Tests for OWASP Top 10 full coverage probes (A04, A08, A09, A10 + re-tags)."""
+
+  def setUp(self):
+    if MANUAL_RUN:
+      print()
+      color_print(f"[MANUAL] >>> Starting <{self._testMethodName}>", color='b')
+
+  def tearDown(self):
+    if MANUAL_RUN:
+      color_print(f"[MANUAL] <<< Finished <{self._testMethodName}>", color='b')
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [80]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-owasp",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  # ── Phase 1: Re-tag verification ────────────────────────────────────
+
+  def test_metadata_endpoints_tagged_a10(self):
+    """Cloud metadata findings should use owasp_id A10:2021."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = "ami-id instance-id"
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_metadata_endpoints("example.com", 80)
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, "Should detect at least one metadata endpoint")
+    for f in findings:
+      self.assertEqual(f["owasp_id"], "A10:2021")
+
+  def test_homepage_private_key_tagged_a08(self):
+    """Private key in homepage should use owasp_id A08:2021."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = "-----BEGIN RSA PRIVATE KEY----- some key data"
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_homepage("example.com", 80)
+    findings = result.get("findings", [])
+    pk_findings = [f for f in findings if "private key" in f["title"].lower()]
+    self.assertTrue(len(pk_findings) > 0, "Should detect private key")
+    self.assertEqual(pk_findings[0]["owasp_id"], "A08:2021")
+
+  def test_homepage_api_key_still_a01(self):
+    """API key in homepage should still use A01:2021."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = "var API_KEY = 'abc123';"
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_homepage("example.com", 80)
+    findings = result.get("findings", [])
+    api_findings = [f for f in findings if "api key" in f["title"].lower()]
+    self.assertTrue(len(api_findings) > 0)
+    self.assertEqual(api_findings[0]["owasp_id"], "A01:2021")
+
+  # ── Phase 2: A10 SSRF ──────────────────────────────────────────────
+
+  def test_ssrf_metadata_azure(self):
+    """Azure IMDS endpoint should be detected."""
+    owner, worker = self._build_worker()
+
+    def fake_get(url, timeout=3, verify=False, headers=None):
+      resp = MagicMock()
+      if "api-version" in url:
+        resp.status_code = 200
+        resp.text = "hostname"
+      else:
+        resp.status_code = 404
+        resp.text = ""
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_metadata_endpoints("example.com", 80)
+    findings = result.get("findings", [])
+    azure_findings = [f for f in findings if "Azure" in f["title"]]
+    self.assertTrue(len(azure_findings) > 0, "Should detect Azure IMDS")
+    self.assertEqual(azure_findings[0]["owasp_id"], "A10:2021")
+
+  def test_ssrf_basic_url_param(self):
+    """SSRF basic probe should detect metadata in URL parameter response."""
+    owner, worker = self._build_worker()
+
+    def fake_get(url, timeout=4, verify=False, headers=None):
+      resp = MagicMock()
+      if "url=http" in url:
+        resp.status_code = 200
+        resp.text = "ami-id i-1234567890 instance-id"
+      else:
+        resp.status_code = 404
+        resp.text = ""
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_ssrf_basic("example.com", 80)
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, "Should detect SSRF via URL param")
+    self.assertEqual(findings[0]["owasp_id"], "A10:2021")
+    self.assertEqual(findings[0]["severity"], "CRITICAL")
+
+  def test_ssrf_basic_no_false_positive(self):
+    """Normal pages should not trigger SSRF findings."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = "<html><body>Welcome</body></html>"
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_ssrf_basic("example.com", 80)
+    self.assertEqual(len(result.get("findings", [])), 0)
+
+  # ── Phase 3: A04 Insecure Design ───────────────────────────────────
+
+  def test_account_enum_different_responses(self):
+    """Different error messages for valid/invalid users → enumeration finding."""
+    owner, worker = self._build_worker()
+    call_count = [0]
+
+    def fake_post(url, data=None, timeout=3, verify=False, allow_redirects=False):
+      resp = MagicMock()
+      resp.status_code = 200
+      call_count[0] += 1
+      username = data.get("username", "") if data else ""
+      if "nonexistent_user_" in username:
+        resp.text = "Error: user not found"
+      else:
+        resp.text = "Error: invalid password"
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.post",
+      side_effect=fake_post,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      side_effect=fake_post,
+    ):
+      result = worker._web_test_account_enumeration("example.com", 80)
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, "Should detect account enumeration")
+    self.assertEqual(findings[0]["owasp_id"], "A04:2021")
+
+  def test_account_enum_same_response(self):
+    """Identical responses for all users → no enumeration finding."""
+    owner, worker = self._build_worker()
+
+    def fake_post(url, data=None, timeout=3, verify=False, allow_redirects=False):
+      resp = MagicMock()
+      resp.status_code = 200
+      resp.text = "Error: invalid credentials"
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.post",
+      side_effect=fake_post,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      side_effect=fake_post,
+    ):
+      result = worker._web_test_account_enumeration("example.com", 80)
+    self.assertEqual(len(result.get("findings", [])), 0)
+
+  def test_rate_limiting_absent(self):
+    """5 requests all accepted → rate limiting finding."""
+    owner, worker = self._build_worker()
+
+    def fake_request(url, *args, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 200
+      resp.text = "invalid credentials"
+      resp.headers = {}
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.post",
+      side_effect=fake_request,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      side_effect=fake_request,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin._time.sleep",
+    ):
+      result = worker._web_test_rate_limiting("example.com", 80)
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0, "Should detect missing rate limiting")
+    self.assertEqual(findings[0]["owasp_id"], "A04:2021")
+    self.assertIn("CWE-307", findings[0]["cwe_id"])
+
+  def test_rate_limiting_present(self):
+    """429 response → no finding."""
+    owner, worker = self._build_worker()
+    call_count = [0]
+
+    def fake_post(url, *args, **kwargs):
+      resp = MagicMock()
+      call_count[0] += 1
+      resp.text = ""
+      resp.headers = {}
+      if call_count[0] >= 3:
+        resp.status_code = 429
+      else:
+        resp.status_code = 200
+      return resp
+
+    def fake_get(url, *args, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 200
+      resp.text = ""
+      resp.headers = {}
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.post",
+      side_effect=fake_post,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      side_effect=fake_get,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin._time.sleep",
+    ):
+      result = worker._web_test_rate_limiting("example.com", 80)
+    self.assertEqual(len(result.get("findings", [])), 0)
+
+  def test_idor_sequential_with_pii(self):
+    """Sequential IDs with PII in response → MEDIUM finding."""
+    owner, worker = self._build_worker()
+
+    def fake_get(url, timeout=3, verify=False):
+      resp = MagicMock()
+      if "/api/users/1" in url:
+        resp.status_code = 200
+        resp.text = '{"id": 1, "email": "alice@example.com", "name": "Alice"}'
+      elif "/api/users/2" in url:
+        resp.status_code = 200
+        resp.text = '{"id": 2, "email": "bob@example.com", "name": "Bob"}'
+      else:
+        resp.status_code = 404
+        resp.text = ""
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_idor_indicators("example.com", 80)
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0)
+    self.assertEqual(findings[0]["severity"], "MEDIUM")
+    self.assertEqual(findings[0]["owasp_id"], "A04:2021")
+
+  def test_idor_auth_required(self):
+    """401 for all → no finding."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 401
+    resp.text = "Unauthorized"
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_idor_indicators("example.com", 80)
+    self.assertEqual(len(result.get("findings", [])), 0)
+
+  # ── Phase 4: A08 Integrity ─────────────────────────────────────────
+
+  def test_sri_missing_external_script(self):
+    """External script without integrity= → MEDIUM finding."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = '<html><script src="https://cdn.other.com/lib.js"></script></html>'
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_subresource_integrity("example.com", 80)
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0)
+    self.assertEqual(findings[0]["owasp_id"], "A08:2021")
+    self.assertIn("SRI", findings[0]["title"])
+
+  def test_sri_present(self):
+    """External script with integrity= → no finding."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = '<html><script src="https://cdn.other.com/lib.js" integrity="sha384-abc" crossorigin="anonymous"></script></html>'
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_subresource_integrity("example.com", 80)
+    self.assertEqual(len(result.get("findings", [])), 0)
+
+  def test_sri_same_origin_ignored(self):
+    """Same-origin script → no finding regardless of SRI."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = '<html><script src="https://example.com/app.js"></script></html>'
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_subresource_integrity("example.com", 80)
+    self.assertEqual(len(result.get("findings", [])), 0)
+
+  def test_mixed_content_script(self):
+    """HTTPS page with HTTP script → HIGH finding."""
+    owner, worker = self._build_worker(ports=[443])
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = '<html><script src="http://evil.com/inject.js"></script></html>'
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_mixed_content("example.com", 443)
+    findings = result.get("findings", [])
+    self.assertTrue(len(findings) > 0)
+    self.assertEqual(findings[0]["severity"], "HIGH")
+    self.assertEqual(findings[0]["owasp_id"], "A08:2021")
+
+  def test_mixed_content_https_only(self):
+    """All resources over HTTPS → no finding."""
+    owner, worker = self._build_worker(ports=[443])
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = '<html><script src="https://cdn.example.com/app.js"></script></html>'
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_mixed_content("example.com", 443)
+    self.assertEqual(len(result.get("findings", [])), 0)
+
+  def test_mixed_content_non_https_port_skipped(self):
+    """Mixed content check only runs on HTTPS ports."""
+    owner, worker = self._build_worker(ports=[80])
+    result = worker._web_test_mixed_content("example.com", 80)
+    self.assertEqual(len(result.get("findings", [])), 0)
+
+  def test_js_lib_angularjs_eol(self):
+    """AngularJS detected → MEDIUM EOL finding."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = '<html><script>/*! AngularJS v1.8.2 */</script></html>'
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_js_library_versions("example.com", 80)
+    findings = result.get("findings", [])
+    eol_findings = [f for f in findings if "end-of-life" in f["title"].lower()]
+    self.assertTrue(len(eol_findings) > 0, "Should flag AngularJS as EOL")
+    self.assertEqual(eol_findings[0]["owasp_id"], "A08:2021")
+
+  def test_js_lib_version_detected(self):
+    """jQuery version detected → INFO finding."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 200
+    resp.text = '<html><script src="https://code.jquery.com/jquery-3.7.1.min.js"></script></html>'
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_js_library_versions("example.com", 80)
+    findings = result.get("findings", [])
+    jquery_findings = [f for f in findings if "jQuery" in f["title"]]
+    self.assertTrue(len(jquery_findings) > 0, "Should detect jQuery")
+    self.assertEqual(jquery_findings[0]["severity"], "INFO")
+
+  # ── Phase 5: A09 Logging/Monitoring ─────────────────────────────────
+
+  def test_verbose_error_python_traceback(self):
+    """Python traceback in 404 page → MEDIUM finding."""
+    owner, worker = self._build_worker()
+
+    def fake_get(url, timeout=3, verify=False, allow_redirects=None):
+      resp = MagicMock()
+      resp.status_code = 404 if "nonexistent_" in url else 200
+      if "nonexistent_" in url:
+        resp.text = 'Traceback (most recent call last):\n  File "app.py", line 42'
+      else:
+        resp.text = "<html><body>Welcome</body></html>"
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_verbose_errors("example.com", 80)
+    findings = result.get("findings", [])
+    traceback_findings = [f for f in findings if "stack trace" in f["title"].lower()]
+    self.assertTrue(len(traceback_findings) > 0, "Should detect Python traceback")
+    self.assertEqual(traceback_findings[0]["owasp_id"], "A09:2021")
+
+  def test_verbose_error_clean_404(self):
+    """Generic 404 page → no finding."""
+    owner, worker = self._build_worker()
+
+    def fake_get(url, timeout=3, verify=False, allow_redirects=None):
+      resp = MagicMock()
+      resp.status_code = 404 if "nonexistent_" in url else 200
+      resp.text = "<html><body>Not Found</body></html>"
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_verbose_errors("example.com", 80)
+    self.assertEqual(len(result.get("findings", [])), 0)
+
+  def test_debug_mode_django(self):
+    """Django debug toolbar marker in homepage → HIGH finding."""
+    owner, worker = self._build_worker()
+
+    def fake_get(url, timeout=3, verify=False, allow_redirects=None):
+      resp = MagicMock()
+      resp.status_code = 200
+      if "nonexistent_" in url:
+        resp.text = "<html><body>Page Not Found</body></html>"
+      elif "__debug__" in url:
+        resp.status_code = 404
+        resp.text = ""
+      else:
+        resp.text = '<html><body><div id="djdt">debug toolbar</div></body></html>'
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_verbose_errors("example.com", 80)
+    findings = result.get("findings", [])
+    debug_findings = [f for f in findings if "debug mode" in f["title"].lower()]
+    self.assertTrue(len(debug_findings) > 0, "Should detect Django debug mode")
+    self.assertEqual(debug_findings[0]["owasp_id"], "A09:2021")
+
+  def test_debug_endpoint_actuator(self):
+    """Spring Boot /actuator returning 200 → HIGH finding via _web_test_common."""
+    owner, worker = self._build_worker()
+
+    def fake_get(url, timeout=2, verify=False):
+      resp = MagicMock()
+      resp.headers = {}
+      resp.reason = "OK"
+      if "/actuator" in url:
+        resp.status_code = 200
+        resp.text = '{"_links": {"beans": ...}}'
+      else:
+        resp.status_code = 404
+        resp.text = ""
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_common("example.com", 80)
+    findings = result.get("findings", [])
+    actuator_findings = [f for f in findings if "actuator" in f.get("title", "").lower()]
+    self.assertTrue(len(actuator_findings) > 0, "Should detect /actuator")
+    self.assertEqual(actuator_findings[0]["owasp_id"], "A09:2021")
+
+  def test_debug_endpoint_404(self):
+    """/actuator returning 404 → no finding."""
+    owner, worker = self._build_worker()
+    resp = MagicMock()
+    resp.status_code = 404
+    resp.text = ""
+    resp.headers = {}
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      return_value=resp,
+    ):
+      result = worker._web_test_common("example.com", 80)
+    findings = result.get("findings", [])
+    actuator_findings = [f for f in findings if "actuator" in f.get("title", "").lower()]
+    self.assertEqual(len(actuator_findings), 0)
+
+  def test_correlation_open_redirect_ssrf(self):
+    """Open redirect + metadata endpoint → correlation finding."""
+    owner, worker = self._build_worker()
+    worker.state["scan_metadata"] = {}
+    worker.state["web_tests_info"] = {
+      80: {
+        "_web_test_open_redirect": {
+          "findings": [{"title": "Open redirect via next parameter", "severity": "MEDIUM"}],
+        },
+        "_web_test_metadata_endpoints": {
+          "findings": [{"title": "Cloud metadata endpoint exposed (AWS EC2)", "severity": "CRITICAL"}],
+        },
+      }
+    }
+    worker._post_scan_correlate()
+    corr = worker.state.get("correlation_findings", [])
+    redirect_ssrf = [f for f in corr if "redirect" in f["title"].lower() and "ssrf" in f["title"].lower()]
+    self.assertTrue(len(redirect_ssrf) > 0, "Should produce redirect→SSRF correlation")
+
+  # ── Phase 6: A06 WordPress plugins ──────────────────────────────────
+
+  def test_wp_plugin_version_exposed(self):
+    """WordPress plugin readme.txt with version → LOW finding."""
+    owner, worker = self._build_worker()
+
+    def fake_get(url, timeout=3, verify=False, allow_redirects=False):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      if "readme.txt" in url and "elementor" in url:
+        resp.text = "=== Elementor ===\nStable tag: 3.18.0\nRequires PHP: 7.4"
+      elif "readme.txt" in url:
+        resp.status_code = 404
+        resp.ok = False
+        resp.text = ""
+      elif "wp-login" in url:
+        resp.text = "wordpress wp-login"
+      else:
+        resp.text = '<meta name="generator" content="WordPress 6.4.2">'
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_cms_fingerprint("example.com", 80)
+    findings = result.get("findings", [])
+    plugin_findings = [f for f in findings if "plugin" in f.get("title", "").lower()]
+    self.assertTrue(len(plugin_findings) > 0, "Should detect Elementor plugin")
+    self.assertIn("3.18.0", plugin_findings[0]["title"])
+    self.assertEqual(plugin_findings[0]["owasp_id"], "A06:2021")
+
+  def test_wp_plugin_not_found(self):
+    """Plugin readme.txt returning 404 → no plugin finding."""
+    owner, worker = self._build_worker()
+
+    def fake_get(url, timeout=3, verify=False, allow_redirects=False):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      if "readme.txt" in url:
+        resp.status_code = 404
+        resp.ok = False
+        resp.text = ""
+      elif "wp-login" in url:
+        resp.text = "wordpress wp-login"
+      else:
+        resp.text = '<meta name="generator" content="WordPress 6.4.2">'
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._web_test_cms_fingerprint("example.com", 80)
+    findings = result.get("findings", [])
+    plugin_findings = [f for f in findings if "plugin" in f.get("title", "").lower()]
+    self.assertEqual(len(plugin_findings), 0)
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -5064,4 +5657,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase16ScanMetrics))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17aQuickWins))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17bMediumFeatures))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestOWASPFullCoverage))
   runner.run(suite)
