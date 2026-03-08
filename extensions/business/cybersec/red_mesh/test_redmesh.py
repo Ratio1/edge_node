@@ -5821,6 +5821,215 @@ class TestDetectionGapFixes(unittest.TestCase):
     )
 
 
+class TestBatch2GapFixes(unittest.TestCase):
+  """Tests for batch 2 gaps: MySQL CVE-2016-6662, PG MD5 creds, CouchDB, InfluxDB."""
+
+  def setUp(self):
+    if MANUAL_RUN:
+      print()
+      color_print(f"[MANUAL] >>> Starting <{self._testMethodName}>", color='b')
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [80]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-batch2",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  # ── MySQL CVE-2016-6662 fix ──────────────────────────────────────
+
+  def test_mysql_cve_2016_6662_on_55(self):
+    """CVE-2016-6662 should match MySQL 5.5.23."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("mysql", "5.5.23")
+    self.assertTrue(any("CVE-2016-6662" in f.title for f in findings))
+
+  def test_mysql_cve_2016_6662_on_56(self):
+    """CVE-2016-6662 should match MySQL 5.6.30."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("mysql", "5.6.30")
+    self.assertTrue(any("CVE-2016-6662" in f.title for f in findings))
+
+  def test_mysql_cve_2016_6662_on_57(self):
+    """CVE-2016-6662 should match MySQL 5.7.14."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("mysql", "5.7.14")
+    self.assertTrue(any("CVE-2016-6662" in f.title for f in findings))
+
+  def test_mysql_cve_2016_6662_patched(self):
+    """CVE-2016-6662 should NOT match MySQL 5.7.15."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("mysql", "5.7.15")
+    self.assertFalse(any("CVE-2016-6662" in f.title for f in findings))
+
+  # ── PostgreSQL MD5 credential testing ────────────────────────────
+
+  def test_pg_creds_handles_md5_auth(self):
+    """PG creds probe should authenticate via MD5 and extract version."""
+    _, worker = self._build_worker(ports=[5432])
+    worker.state["scan_metadata"] = {}
+
+    # MD5 auth request: R + len(12) + auth_code(5) + salt(4 bytes)
+    md5_request = b'R' + struct.pack('!I', 12) + struct.pack('!I', 5) + b'\xab\xcd\xef\x01'
+    # Auth OK + ParameterStatus with server_version
+    auth_ok = b'R' + struct.pack('!I', 8) + struct.pack('!I', 0)
+    version_param = b'server_version\x0010.7\x00'
+    param_msg = b'S' + struct.pack('!I', 4 + len(version_param)) + version_param
+    ready = b'Z' + struct.pack('!I', 5) + b'I'
+    auth_response = auth_ok + param_msg + ready
+
+    call_count = [0]
+    def fake_recv(size):
+      call_count[0] += 1
+      if call_count[0] == 1:
+        return md5_request
+      return auth_response
+
+    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket") as mock_sock:
+      mock_inst = MagicMock()
+      mock_inst.recv = fake_recv
+      mock_sock.return_value = mock_inst
+      result = worker._service_info_postgresql_creds("1.2.3.4", 5432)
+
+    findings = result.get("findings", [])
+    # Should find credential accepted
+    cred_findings = [f for f in findings if "credential accepted" in f.get("title", "").lower()]
+    self.assertTrue(len(cred_findings) > 0, f"Should accept postgres:postgres via MD5. Findings: {[f['title'] for f in findings]}")
+    # Should extract version and find CVEs
+    ver_findings = [f for f in findings if "version disclosed" in f.get("title", "").lower()]
+    self.assertTrue(len(ver_findings) > 0, "Should extract PG version after auth")
+    cve_findings = [f for f in findings if "CVE-" in f.get("title", "")]
+    self.assertTrue(len(cve_findings) > 0, f"Should find PG CVEs for 10.7. Found: {[f['title'] for f in findings]}")
+
+  # ── CouchDB probe ────────────────────────────────────────────────
+
+  def test_couchdb_probe_detects_version_and_dbs(self):
+    """CouchDB probe should extract version, list dbs, detect admin panel."""
+    _, worker = self._build_worker(ports=[5984])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      if url.endswith(":5984"):
+        resp.json.return_value = {"couchdb": "Welcome", "version": "3.2.1"}
+        resp.text = '{"couchdb": "Welcome", "version": "3.2.1"}'
+      elif "/_all_dbs" in url:
+        resp.json.return_value = ["_replicator", "_users", "mydata"]
+        resp.text = '["_replicator", "_users", "mydata"]'
+      elif "/_utils" in url:
+        resp.text = '<html><title>Fauxton</title></html>'
+      elif "/_node/_local/_config" in url:
+        resp.text = '{"httpd": {"bind_address": "0.0.0.0"}}'
+      else:
+        resp.ok = False
+        resp.status_code = 404
+      return resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      side_effect=fake_get,
+    ):
+      result = worker._service_info_couchdb("1.2.3.4", 5984)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("3.2.1" in t for t in titles), "Should detect CouchDB version")
+    self.assertTrue(any("CVE-2022-24706" in t for t in titles), "Should detect Erlang cookie CVE")
+    self.assertTrue(any("database listing" in t.lower() for t in titles), "Should detect unauth db listing")
+    self.assertTrue(any("Fauxton" in t or "admin panel" in t.lower() for t in titles), "Should detect admin panel")
+    self.assertTrue(any("configuration exposed" in t.lower() for t in titles), "Should detect config exposure")
+
+  def test_couchdb_probe_skips_non_couchdb(self):
+    """CouchDB probe should return None for non-CouchDB HTTP services."""
+    _, worker = self._build_worker()
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.json.return_value = {"status": "ok"}
+      resp.text = '{"status": "ok"}'
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.service_mixin.requests.get", side_effect=fake_get):
+      result = worker._service_info_couchdb("1.2.3.4", 80)
+    self.assertIsNone(result)
+
+  # ── InfluxDB probe ───────────────────────────────────────────────
+
+  def test_influxdb_probe_detects_version_and_unauth(self):
+    """InfluxDB probe should detect version and unauthenticated access."""
+    _, worker = self._build_worker(ports=[8086])
+    worker.state["scan_metadata"] = {}
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 204
+      resp.headers = {}
+      resp.text = ""
+      if "/ping" in url:
+        resp.headers["X-Influxdb-Version"] = "1.6.6"
+      elif "/query" in url:
+        resp.status_code = 200
+        resp.ok = True
+        resp.json.return_value = {
+          "results": [{"series": [{"values": [["_internal"], ["telegraf"]]}]}]
+        }
+      elif "/debug/vars" in url:
+        resp.status_code = 200
+        resp.text = '{"memstats": {"Alloc": 12345}}'
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.service_mixin.requests.get", side_effect=fake_get):
+      result = worker._service_info_influxdb("1.2.3.4", 8086)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("1.6.6" in t for t in titles), "Should detect InfluxDB version")
+    self.assertTrue(any("CVE-2019-20933" in t for t in titles), "Should detect JWT bypass CVE")
+    self.assertTrue(any("unauthenticated" in t.lower() for t in titles), "Should detect unauth access")
+    self.assertTrue(any("debug" in t.lower() for t in titles), "Should detect debug endpoint")
+
+  def test_influxdb_probe_skips_non_influxdb(self):
+    """InfluxDB probe should return None for non-InfluxDB services."""
+    _, worker = self._build_worker()
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.headers = {}
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.service_mixin.requests.get", side_effect=fake_get):
+      result = worker._service_info_influxdb("1.2.3.4", 80)
+    self.assertIsNone(result)
+
+  # ── CouchDB / InfluxDB CVE matching ──────────────────────────────
+
+  def test_couchdb_cve_2022_24706(self):
+    """CVE-2022-24706 should match CouchDB < 3.2.2."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    self.assertTrue(any("CVE-2022-24706" in f.title for f in check_cves("couchdb", "3.2.1")))
+    self.assertFalse(any("CVE-2022-24706" in f.title for f in check_cves("couchdb", "3.2.2")))
+
+  def test_influxdb_cve_2019_20933(self):
+    """CVE-2019-20933 should match InfluxDB < 1.7.6."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    self.assertTrue(any("CVE-2019-20933" in f.title for f in check_cves("influxdb", "1.6.6")))
+    self.assertFalse(any("CVE-2019-20933" in f.title for f in check_cves("influxdb", "1.7.6")))
+
+
 class VerboseResult(unittest.TextTestResult):
   def addSuccess(self, test):
     super().addSuccess(test)
@@ -5847,4 +6056,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17bMediumFeatures))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestOWASPFullCoverage))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestDetectionGapFixes))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch2GapFixes))
   runner.run(suite)
