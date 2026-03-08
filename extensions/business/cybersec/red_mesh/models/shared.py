@@ -120,6 +120,10 @@ class ScanMetrics:
   service_distribution: dict = None # { "http": 3, "ssh": 1, "mysql": 1 }
   finding_distribution: dict = None # { "CRITICAL": 1, "HIGH": 3, "MEDIUM": 7, ... }
 
+  # ── Open port details ──
+  open_port_details: list = None    # [ { "port": 22, "protocol": "ssh", "banner_confirmed": True }, ... ]
+  banner_confirmation: dict = None  # { "confirmed": 3, "guessed": 2 }
+
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
 
@@ -144,4 +148,6 @@ class ScanMetrics:
       port_distribution=d.get("port_distribution"),
       service_distribution=d.get("service_distribution"),
       finding_distribution=d.get("finding_distribution"),
+      open_port_details=d.get("open_port_details"),
+      banner_confirmation=d.get("banner_confirmation"),
     )
