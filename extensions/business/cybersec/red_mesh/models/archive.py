@@ -150,6 +150,9 @@ class PassReport:
   # Scan metrics (pass-level aggregate across all nodes)
   scan_metrics: dict = None         # ScanMetrics.to_dict()
 
+  # Per-node scan metrics (node_address -> ScanMetrics.to_dict())
+  worker_scan_metrics: dict = None
+
   # Attestation
   redmesh_test_attestation: dict = None
 
@@ -172,6 +175,7 @@ class PassReport:
       llm_failed=d.get("llm_failed"),
       findings=d.get("findings"),
       scan_metrics=d.get("scan_metrics"),
+      worker_scan_metrics=d.get("worker_scan_metrics"),
       redmesh_test_attestation=d.get("redmesh_test_attestation"),
     )
 
