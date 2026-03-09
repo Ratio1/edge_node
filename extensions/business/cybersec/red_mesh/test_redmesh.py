@@ -3195,13 +3195,13 @@ class TestPhase4UiAggregate(unittest.TestCase):
     self.assertEqual(result.to_dict()["total_open_ports"], [22, 80, 443])
 
   def test_count_services(self):
-    """_count_services counts unique probe names across ports."""
+    """_count_services counts ports with at least one detected service."""
     plugin, _ = self._make_plugin()
     service_info = {
       "80": {"_service_info_http": {}, "_web_test_xss": {}},
       "443": {"_service_info_https": {}, "_service_info_http": {}},
     }
-    self.assertEqual(plugin._count_services(service_info), 3)
+    self.assertEqual(plugin._count_services(service_info), 2)
     self.assertEqual(plugin._count_services({}), 0)
     self.assertEqual(plugin._count_services(None), 0)
 
@@ -7090,7 +7090,10 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
       resp.status_code = 200
       resp.text = "<html>App</html>"
       resp.headers = {"Content-Type": "text/html"}
-      if "class.module.classLoader.DefaultAssertionStatus" in url:
+      if "class.INVALID_RM_CTRL" in url:
+        resp.status_code = 400  # Spring rejects bogus class path
+        resp.text = "Bad Request"
+      elif "class.module.classLoader.DefaultAssertionStatus" in url:
         resp.status_code = 200  # Spring accepted classLoader binding
       elif "class.module.classLoader.URLs" in url:
         resp.status_code = 400  # Type conversion error — binding attempted
@@ -7114,6 +7117,245 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
     findings = result.get("findings", [])
     titles = [f["title"] for f in findings]
     self.assertTrue(any("Spring4Shell" in t for t in titles), f"Should detect Spring4Shell via binding error. Got: {titles}")
+
+
+class TestBatch5Improvements(unittest.TestCase):
+  """Tests for batch 5: Spring4Shell secondary gate, CVE dedup."""
+
+  def setUp(self):
+    if MANUAL_RUN:
+      print()
+      color_print(f"[MANUAL] >>> Starting <{self._testMethodName}>", color='b')
+
+  def _build_worker(self, ports=None):
+    if ports is None:
+      ports = [80]
+    owner = DummyOwner()
+    worker = PentestLocalWorker(
+      owner=owner,
+      target="example.com",
+      job_id="job-batch5",
+      initiator="init@example",
+      local_id_prefix="1",
+      worker_target_ports=ports,
+    )
+    worker.stop_event = MagicMock()
+    worker.stop_event.is_set.return_value = False
+    return owner, worker
+
+  # ── Spring4Shell secondary gate ─────────────────────────────────
+
+  def test_spring4shell_secondary_gate_detects_spring(self):
+    """Spring4Shell should be detected via URLs[0] secondary check when
+    DefaultAssertionStatus returns same 200 as control."""
+    _, worker = self._build_worker(ports=[7108])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = "<html>App</html>"
+      resp.headers = {"Content-Type": "text/html"}
+      # Both control and classLoader return 200 with same body (first gate can't distinguish)
+      if "class.INVALID_RM_CTRL.URLs" in url:
+        # Control URLs[0] → 200 (server ignores it)
+        resp.status_code = 200
+        resp.text = "<html>App</html>"
+      elif "class.module.classLoader.URLs" in url:
+        # Spring binding error on URLs[0] → 400
+        resp.status_code = 400
+        resp.text = "Bad Request"
+      elif "class.INVALID_RM_CTRL" in url:
+        resp.status_code = 200
+        resp.text = "<html>App</html>"
+      elif "class.module.classLoader.DefaultAssertionStatus" in url:
+        resp.status_code = 200
+        resp.text = "<html>App</html>"
+      elif "/actuator" in url:
+        resp.status_code = 404
+        resp.ok = False
+        resp.text = ""
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 404
+      resp.text = ""
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_spring_actuator("1.2.3.4", 7108)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertTrue(any("Spring4Shell" in t for t in titles),
+                    f"Should detect Spring4Shell via URLs[0] secondary gate. Got: {titles}")
+    # Check confidence is "firm" (not tentative)
+    spring4shell = [f for f in findings if "Spring4Shell" in f["title"]]
+    self.assertEqual(spring4shell[0]["confidence"], "firm")
+
+  def test_spring4shell_secondary_gate_skips_catchall(self):
+    """Spring4Shell secondary gate should NOT flag catch-all servers
+    where both classLoader.URLs[0] and control.URLs[0] return 200."""
+    _, worker = self._build_worker(ports=[7100])
+
+    def fake_get(url, **kwargs):
+      resp = MagicMock()
+      resp.ok = True
+      resp.status_code = 200
+      resp.text = "<html>Default page</html>"
+      resp.headers = {"Content-Type": "text/html"}
+      # Catch-all: returns 200 for everything
+      if "/actuator" in url:
+        resp.status_code = 404
+        resp.ok = False
+        resp.text = ""
+      return resp
+
+    def fake_post(url, **kwargs):
+      resp = MagicMock()
+      resp.status_code = 404
+      resp.text = ""
+      return resp
+
+    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+      result = worker._web_test_spring_actuator("1.2.3.4", 7100)
+
+    findings = result.get("findings", [])
+    titles = [f["title"] for f in findings]
+    self.assertFalse(any("Spring4Shell" in t for t in titles),
+                     f"Should NOT flag Spring4Shell on catch-all server. Got: {titles}")
+
+  # ── CVE deduplication ───────────────────────────────────────────
+
+  def _get_plugin_class(self):
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' not in sys.modules:
+      TestPhase1ConfigCID._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def test_cve_dedup_keeps_higher_confidence(self):
+    """Duplicate CVE on same port should be deduplicated, keeping higher confidence."""
+    Plugin = self._get_plugin_class()
+
+    aggregated = {
+      "open_ports": [7102],
+      "port_protocols": {"7102": "http"},
+      "service_info": {},
+      "web_tests_info": {
+        "7102": {
+          "_web_test_java_deserialization": {
+            "findings": [{
+              "severity": "CRITICAL",
+              "title": "CVE-2017-10271: WebLogic deserialization endpoint /wls-wsat",
+              "confidence": "firm",
+              "cwe_id": "CWE-502",
+            }],
+          },
+          "_web_test_java_servers": {
+            "findings": [{
+              "severity": "CRITICAL",
+              "title": "CVE-2017-10271: XMLDecoder deserialization RCE via wls-wsat (weblogic 10.3.6.0)",
+              "confidence": "tentative",
+              "cwe_id": "CWE-502",
+            }],
+          },
+        },
+      },
+    }
+
+    risk_result, flat_findings = Plugin._compute_risk_and_findings(None, aggregated)
+
+    cve_findings = [f for f in flat_findings if "CVE-2017-10271" in f.get("title", "")]
+    self.assertEqual(len(cve_findings), 1, f"Should have exactly 1 CVE-2017-10271, got {len(cve_findings)}")
+    self.assertEqual(cve_findings[0]["confidence"], "firm", "Should keep the 'firm' confidence finding")
+
+  def test_cve_dedup_different_ports_kept(self):
+    """Same CVE on different ports should NOT be deduplicated."""
+    Plugin = self._get_plugin_class()
+
+    aggregated = {
+      "open_ports": [7102, 7103],
+      "port_protocols": {"7102": "http", "7103": "http"},
+      "service_info": {},
+      "web_tests_info": {
+        "7102": {
+          "_web_test_java_servers": {
+            "findings": [{
+              "severity": "CRITICAL",
+              "title": "CVE-2020-14882: Console unauthenticated takeover RCE (weblogic 10.3.6.0)",
+              "confidence": "tentative",
+              "cwe_id": "CWE-306",
+            }],
+          },
+        },
+        "7103": {
+          "_web_test_java_servers": {
+            "findings": [{
+              "severity": "CRITICAL",
+              "title": "CVE-2020-14882: Console unauthenticated takeover RCE (weblogic 12.2.1.3)",
+              "confidence": "tentative",
+              "cwe_id": "CWE-306",
+            }],
+          },
+        },
+      },
+    }
+
+    risk_result, flat_findings = Plugin._compute_risk_and_findings(None, aggregated)
+
+    cve_findings = [f for f in flat_findings if "CVE-2020-14882" in f.get("title", "")]
+    self.assertEqual(len(cve_findings), 2, f"Same CVE on different ports should both be kept, got {len(cve_findings)}")
+
+  def test_cve_dedup_non_cve_not_affected(self):
+    """Non-CVE findings should not be affected by deduplication."""
+    Plugin = self._get_plugin_class()
+
+    aggregated = {
+      "open_ports": [80],
+      "port_protocols": {"80": "http"},
+      "service_info": {},
+      "web_tests_info": {
+        "80": {
+          "_web_test_security_headers": {
+            "findings": [
+              {"severity": "MEDIUM", "title": "Missing security header: CSP", "confidence": "certain", "cwe_id": ""},
+              {"severity": "MEDIUM", "title": "Missing security header: CSP", "confidence": "certain", "cwe_id": ""},
+            ],
+          },
+        },
+      },
+    }
+
+    risk_result, flat_findings = Plugin._compute_risk_and_findings(None, aggregated)
+
+    # Non-CVE duplicates are NOT deduplicated (that's a different issue)
+    csp_findings = [f for f in flat_findings if "CSP" in f.get("title", "")]
+    self.assertEqual(len(csp_findings), 2, "Non-CVE findings should not be deduplicated")
+
+  # ── Jetty CVE database ─────────────────────────────────────────
+
+  def test_jetty_cve_2023_36478_match(self):
+    """CVE-2023-36478 should match Jetty 9.4.31."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("jetty", "9.4.31")
+    self.assertTrue(any("CVE-2023-36478" in f.title for f in findings))
+
+  def test_jetty_cve_2023_36478_patched(self):
+    """CVE-2023-36478 should NOT match Jetty 9.4.54."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("jetty", "9.4.54")
+    self.assertFalse(any("CVE-2023-36478" in f.title for f in findings))
+
+  def test_jetty_all_cves_match(self):
+    """Jetty 9.4.31 should match all 4 Jetty CVEs."""
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+    findings = check_cves("jetty", "9.4.31")
+    cve_ids = {f.title.split(":")[0] for f in findings if "CVE-" in f.title}
+    expected = {"CVE-2023-26048", "CVE-2023-26049", "CVE-2023-36478", "CVE-2023-40167"}
+    self.assertEqual(cve_ids, expected, f"Should match all 4 Jetty CVEs, got {cve_ids}")
 
 
 class VerboseResult(unittest.TextTestResult):
@@ -7145,4 +7387,5 @@ if __name__ == "__main__":
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch2GapFixes))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch3GapFixes))
   suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch4JavaGapFixes))
+  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch5Improvements))
   runner.run(suite)
