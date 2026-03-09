@@ -168,7 +168,7 @@ class RedmeshLlmAgentApiPlugin(BasePlugin):
     """Set semaphore environment variables for paired plugins."""
     super(RedMeshLlmAgentApiPlugin, self)._setup_semaphore_env()
     localhost_ip = self.log.get_localhost_ip()
-    port = self.cfg_port
+    port = self.port
     self.semaphore_set_env('HOST', localhost_ip)
     self.semaphore_set_env('API_HOST', localhost_ip)
     if port:
