@@ -266,8 +266,8 @@ class _RedMeshLlmAgentMixin(object):
       self.P(f"No data to analyze for job {job_id}", color='y')
       return None
 
-    # Add job metadata to report for context
-    report_with_meta = dict(aggregated_report)
+    # Add job metadata to report for context (strip node_ip — never send to LLM)
+    report_with_meta = {k: v for k, v in aggregated_report.items() if k != "node_ip"}
     report_with_meta["_job_metadata"] = {
       "job_id": job_id,
       "target": target,
@@ -325,8 +325,8 @@ class _RedMeshLlmAgentMixin(object):
       self.P(f"No data for quick summary for job {job_id}", color='y')
       return None
 
-    # Add job metadata to report for context
-    report_with_meta = dict(aggregated_report)
+    # Add job metadata to report for context (strip node_ip — never send to LLM)
+    report_with_meta = {k: v for k, v in aggregated_report.items() if k != "node_ip"}
     report_with_meta["_job_metadata"] = {
       "job_id": job_id,
       "target": target,

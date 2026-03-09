@@ -95,6 +95,7 @@ class WorkerReportMeta:
   ports_scanned: int = 0
   open_ports: list = None           # [int]
   nr_findings: int = 0
+  node_ip: str = ""                 # worker node's IP address
 
   def to_dict(self) -> dict:
     d = asdict(self)
@@ -111,6 +112,7 @@ class WorkerReportMeta:
       ports_scanned=d.get("ports_scanned", 0),
       open_ports=d.get("open_ports", []),
       nr_findings=d.get("nr_findings", 0),
+      node_ip=d.get("node_ip", ""),
     )
 
 
