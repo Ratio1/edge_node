@@ -4406,7 +4406,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     self.assertEqual(merged["probe_breakdown"]["_service_info_http"], "completed")
     self.assertEqual(merged["probe_breakdown"]["_service_info_mysql"], "completed")
     self.assertEqual(merged["probe_breakdown"]["_web_test_xss"], "failed")  # failed > completed
-    # Phase durations: max per phase
+    # Phase durations: max per phase (threads/nodes run in parallel)
     self.assertEqual(merged["phase_durations"]["port_scan"], 45.0)
     self.assertEqual(merged["phase_durations"]["fingerprint"], 10.0)
     self.assertEqual(merged["phase_durations"]["service_probes"], 20.0)
