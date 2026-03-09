@@ -949,16 +949,58 @@ class _WebInjectionMixin(_InjectionTestBase):
 
     # --- 3. Spring4Shell indicator: check if class.module access is possible ---
     # Safe detection: send parameter that would trigger Spring4Shell but
-    # only look for error patterns, not actual exploitation
+    # only look for error patterns, not actual exploitation.
+    # Control-parameter comparison prevents false positives on servers
+    # with catch-all handlers (Struts2/Jetty, plain Tomcat, JBoss) that
+    # return 200 for any unknown parameter.
     try:
-      resp = requests.get(
+      # Control: send a bogus class path that no framework would bind
+      resp_control = requests.get(
+        base_url + "/?class.INVALID_RM_CTRL.x=1",
+        timeout=3,
+        verify=False,
+      )
+      resp_cl = requests.get(
         base_url + "/?class.module.classLoader.DefaultAssertionStatus=true",
         timeout=3,
         verify=False,
       )
-      # If this returns 200 (not 400), the classLoader parameter binding may work
-      if resp.status_code == 200:
-        # Double-check with a known-bad parameter
+      # If both return 200 with similar body length, server MAY ignore params.
+      # Use URLs[0] as secondary differentiator: Spring will 400/500 on URLs[0]=0
+      # while a catch-all server returns 200 unchanged.
+      if (resp_control.status_code == 200 and resp_cl.status_code == 200 and
+          abs(len(resp_control.text) - len(resp_cl.text)) < 50):
+        # Secondary check: URLs[0] differentiates Spring from catch-all servers
+        resp_urls = requests.get(
+          base_url + "/?class.module.classLoader.URLs%5B0%5D=0",
+          timeout=3,
+          verify=False,
+        )
+        resp_urls_ctrl = requests.get(
+          base_url + "/?class.INVALID_RM_CTRL.URLs%5B0%5D=0",
+          timeout=3,
+          verify=False,
+        )
+        if (resp_urls.status_code in (400, 500) and
+            resp_urls_ctrl.status_code == 200):
+          # Spring tried to bind classLoader.URLs[0] and got a type error,
+          # while the control was ignored — confirms Spring binding
+          findings_list.append(Finding(
+            severity=Severity.HIGH,
+            title="Spring4Shell (CVE-2022-22965) parameter binding indicator",
+            description="Spring MVC processes class.module.classLoader parameter "
+                        "binding (type error on URLs[0] vs ignored control), "
+                        "confirming Spring4Shell attack surface.",
+            evidence=f"classLoader.URLs[0]=0 → {resp_urls.status_code}, "
+                     f"control.URLs[0]=0 → {resp_urls_ctrl.status_code}.",
+            remediation="Upgrade Spring Framework to >= 5.3.18 or >= 5.2.20.",
+            owasp_id="A03:2021",
+            cwe_id="CWE-94",
+            confidence="firm",
+          ))
+      elif resp_cl.status_code == 200:
+        # Only classLoader accepted (or significantly different response) —
+        # proceed with URLs[0] check
         resp2 = requests.get(
           base_url + "/?class.module.classLoader.URLs%5B0%5D=0",
           timeout=3,

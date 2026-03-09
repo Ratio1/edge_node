@@ -200,6 +200,12 @@ CVE_DATABASE: list = [
   CveEntry("spring_cloud_function", ">=3.0.0,<3.1.7", "CVE-2022-22963", Severity.CRITICAL, "SpEL injection via routing header RCE", "CWE-94"),
   CveEntry("spring_cloud_function", ">=3.2.0,<3.2.3", "CVE-2022-22963", Severity.CRITICAL, "SpEL injection via routing header RCE", "CWE-94"),
 
+  # ── Eclipse Jetty ─────────────────────────────────────────────
+  CveEntry("jetty", ">=9.4.0,<9.4.52", "CVE-2023-26048", Severity.MEDIUM, "Request large content denial-of-service via multipart", "CWE-400"),
+  CveEntry("jetty", ">=9.4.0,<9.4.52", "CVE-2023-26049", Severity.MEDIUM, "Cookie parsing allows exfiltration of HttpOnly cookies", "CWE-200"),
+  CveEntry("jetty", ">=9.4.0,<9.4.54", "CVE-2023-36478", Severity.HIGH, "HTTP/2 HPACK integer overflow leads to buffer overflow", "CWE-190"),
+  CveEntry("jetty", ">=9.4.0,<9.4.51", "CVE-2023-40167", Severity.MEDIUM, "HTTP request smuggling via invalid Transfer-Encoding", "CWE-444"),
+
   # ── BIND (DNS) ──────────────────────────────────────────────────
   CveEntry("bind", "<9.11.37",  "CVE-2022-2795", Severity.MEDIUM, "Flooding targeted resolver with queries DoS", "CWE-400"),
   CveEntry("bind", "<9.16.33",  "CVE-2022-3080", Severity.HIGH, "TKEY assertion failure DoS on DNAME resolution", "CWE-617"),

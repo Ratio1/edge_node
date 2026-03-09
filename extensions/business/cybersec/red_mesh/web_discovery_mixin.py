@@ -888,6 +888,26 @@ class _WebDiscoveryMixin:
           ))
       except Exception:
         pass
+      # CVE-2020-14882: Console authentication bypass via double-encoded path
+      try:
+        bypass_url = base_url + "/console/css/%252e%252e%252fconsole.portal"
+        resp = requests.get(bypass_url, timeout=4, verify=False, allow_redirects=False)
+        if resp.status_code == 200 and len(resp.text) > 500 and (
+            "portal" in resp.text.lower() or "console" in resp.text.lower()):
+          findings_list.append(Finding(
+            severity=Severity.CRITICAL,
+            title="CVE-2020-14882: WebLogic console auth bypass confirmed",
+            description="WebLogic console authentication can be bypassed via "
+                        "double-encoded path traversal, enabling unauthenticated "
+                        "access to the admin console and RCE.",
+            evidence=f"GET {bypass_url} → 200 with console content.",
+            remediation="Upgrade WebLogic; restrict console access by IP.",
+            owasp_id="A01:2021",
+            cwe_id="CWE-306",
+            confidence="certain",
+          ))
+      except Exception:
+        pass
       return probe_result(raw_data=raw, findings=findings_list)
 
     # --- 2. Tomcat detection ---
@@ -1096,6 +1116,43 @@ class _WebDiscoveryMixin:
         remediation="Keep Struts2 updated; review OGNL injection mitigations.",
         confidence="firm",
       ))
+      # Advisory: flag critical Struts2 CVEs when version is unknown
+      findings_list.append(Finding(
+        severity=Severity.HIGH,
+        title="Struts2 detected — critical RCE CVEs likely applicable",
+        description="Apache Struts2 was detected but the version could not be "
+                    "extracted. Most Struts2 versions are affected by at least one "
+                    "critical OGNL injection RCE: CVE-2017-5638 (S2-045), "
+                    "CVE-2017-9805 (S2-052), CVE-2020-17530 (S2-061). "
+                    "Manual version verification recommended.",
+        evidence=f"Struts2 detected via {struts_evidence}, version unknown.",
+        remediation="Verify Struts2 version; upgrade to latest (>= 6.x). "
+                    "Disable OGNL expression evaluation in user input.",
+        owasp_id="A06:2021",
+        cwe_id="CWE-94",
+        confidence="tentative",
+      ))
+
+    # --- 6. Jetty detection (from Server header) ---
+    try:
+      resp = requests.get(base_url, timeout=3, verify=False)
+      srv = resp.headers.get("Server", "")
+      jetty_m = _re.search(r'[Jj]etty\(?(\d+\.\d+\.\d+)', srv)
+      if jetty_m:
+        jetty_version = jetty_m.group(1)
+        raw["java_server"] = raw.get("java_server") or "Jetty"
+        raw["version"] = raw.get("version") or jetty_version
+        findings_list.append(Finding(
+          severity=Severity.LOW,
+          title=f"Eclipse Jetty {jetty_version} detected",
+          description=f"Jetty {jetty_version} identified on {target}:{port} via Server header.",
+          evidence=f"Server: {srv}",
+          remediation="Keep Jetty updated; remove Server header in production.",
+          confidence="certain",
+        ))
+        findings_list += check_cves("jetty", jetty_version)
+    except Exception:
+      pass
 
     return probe_result(raw_data=raw, findings=findings_list)
 
