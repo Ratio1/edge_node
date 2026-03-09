@@ -35,6 +35,31 @@ class _RedMeshLlmAgentMixin(object):
     super(_RedMeshLlmAgentMixin, self).__init__(**kwargs)
     return
 
+  def _maybe_resolve_llm_agent_from_semaphore(self):
+    """
+    If SEMAPHORED_KEYS is configured and LLM Agent is enabled,
+    read API_HOST and API_PORT from semaphore env published by
+    the LLM Agent API plugin. Overrides static config values.
+    """
+    if not self.cfg_llm_agent_api_enabled:
+      return False
+    semaphored_keys = getattr(self, 'cfg_semaphored_keys', None)
+    if not semaphored_keys:
+      return False
+    if not self.semaphore_is_ready():
+      return False
+    env = self.semaphore_get_env()
+    if not env:
+      return False
+    api_host = env.get('HOST') or env.get('API_HOST')
+    api_port = env.get('PORT') or env.get('API_PORT')
+    if api_host and api_port:
+      self.P("Resolved LLM Agent API from semaphore: {}:{}".format(api_host, api_port))
+      self.config_data['LLM_AGENT_API_HOST'] = api_host
+      self.config_data['LLM_AGENT_API_PORT'] = int(api_port)
+      return True
+    return False
+
   def _get_llm_agent_api_url(self, endpoint: str) -> str:
     """
     Build URL for LLM Agent API endpoint.
