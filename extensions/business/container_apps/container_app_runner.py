@@ -3455,6 +3455,10 @@ class ContainerAppRunnerPlugin(
       return
 
     if not self.container:
+      # Check if we're in backoff period
+      if self._is_restart_backoff_active():
+        self.Pd("Container initial launch delayed due to active backoff period")
+        return
       self._handle_initial_launch()
       # If still no container (e.g., waiting for semaphores), return early
       # to avoid triggering restart logic
