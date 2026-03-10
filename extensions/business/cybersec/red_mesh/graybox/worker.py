@@ -1,0 +1,360 @@
+"""
+Graybox (authenticated webapp) scan worker.
+
+Inherits from BaseLocalWorker (Phase 0) and orchestrates:
+Preflight → Authentication → Route Discovery → Probes → Weak Auth → Cleanup.
+"""
+
+import importlib
+from urllib.parse import urlparse
+
+from ..worker.base import BaseLocalWorker
+from ..constants import GRAYBOX_PROBE_REGISTRY
+from .findings import GrayboxFinding
+from .auth import AuthManager
+from .discovery import DiscoveryModule
+from .safety import SafetyControls
+from .models.target_config import GrayboxTargetConfig
+
+# Weak auth uses a direct import (not the registry) because it is a
+# distinct pipeline phase, not a generic probe.
+from .probes.business_logic import BusinessLogicProbes
+
+
+class GrayboxLocalWorker(BaseLocalWorker):
+  """
+  Authenticated webapp probe worker.
+
+  Inherits from BaseLocalWorker (Phase 0), which provides:
+  - self.owner, self.job_id, self.initiator, self.target
+  - self.local_worker_id (format "RM-{prefix}-{uuid[:4]}")
+  - self.thread, self.stop_event (set by inherited start())
+  - self.metrics (MetricsCollector instance)
+  - self.initial_ports (declared, subclass populates)
+  - self.state (declared as {}, subclass populates with full key set)
+  - start(), stop(), _check_stopped(), P() — all inherited, not redefined
+
+  Uses the two-layer finding architecture:
+  - Probes create GrayboxFinding instances (layer 1)
+  - Worker stores serialized findings in state["graybox_results"] (layer 2)
+  - pentester_api_01.py normalizes them into flat finding dicts via
+    _compute_risk_and_findings()
+  """
+
+  def __init__(self, owner, job_id, target_url, job_config,
+               local_id="1", initiator=""):
+    parsed = urlparse(target_url)
+
+    super().__init__(
+      owner=owner,
+      job_id=job_id,
+      initiator=initiator,
+      local_id_prefix=local_id,
+      target=parsed.hostname,
+    )
+
+    self.target_url = target_url.rstrip("/")
+    self.job_config = job_config
+    self._port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    self._port_key = str(self._port)
+
+    self.initial_ports = [self._port]
+
+    self.target_config = GrayboxTargetConfig.from_dict(
+      job_config.target_config or {}
+    )
+
+    # Modules (composition)
+    self.safety = SafetyControls(
+      request_delay=job_config.scan_min_delay or None,
+      target_is_local=SafetyControls.is_local_target(target_url),
+    )
+    self.auth = AuthManager(
+      target_url=self.target_url,
+      target_config=self.target_config,
+      verify_tls=job_config.verify_tls,
+    )
+    self.discovery = DiscoveryModule(
+      target_url=self.target_url,
+      auth_manager=self.auth,
+      safety=self.safety,
+      target_config=self.target_config,
+    )
+
+    self.state = {
+      "job_id": job_id,
+      "initiator": initiator,
+      "target": parsed.hostname,
+      "scan_type": "webapp",
+      "target_url": self.target_url,
+      "open_ports": [self._port],
+      "ports_scanned": [self._port],
+      "port_protocols": {self._port_key: parsed.scheme},
+      "service_info": {},
+      "web_tests_info": {},
+      "correlation_findings": [],
+      "graybox_results": {},
+      "completed_tests": [],
+      "done": False,
+      "canceled": False,
+    }
+    self._phase = ""
+
+  # start(), stop(), _check_stopped(), P() are ALL inherited from
+  # BaseLocalWorker. NOT redefined here.
+
+  def get_status(self, for_aggregations=False):
+    """Return worker state for aggregation by pentester_api_01.py."""
+    status = dict(self.state)
+    status["scan_metrics"] = self.metrics.build().to_dict()
+    status["scenario_stats"] = self._compute_scenario_stats()
+
+    if not for_aggregations:
+      status["local_worker_id"] = self.local_worker_id
+      status["done"] = self.state["done"]
+      status["canceled"] = self.state["canceled"]
+      status["progress"] = self._phase or "initializing"
+
+    return status
+
+  def execute_job(self):
+    """Preflight → Auth → Discover → Probes → Weak Auth → Cleanup → Done."""
+    routes, forms = [], []
+    self.metrics.start_scan(1)
+    try:
+      # ── Phase 0: Preflight ──
+      self._set_phase("preflight")
+      self.metrics.phase_start("preflight")
+      target_error = self.safety.validate_target(
+        self.target_url, self.job_config.authorized,
+      )
+      if target_error:
+        self._record_fatal(target_error)
+        return
+
+      preflight_error = self.auth.preflight_check()
+      if preflight_error:
+        self._record_fatal(preflight_error)
+        return
+
+      if not self.job_config.verify_tls:
+        self.P(
+          f"WARNING: TLS verification disabled for {self.target_url}. "
+          "Credentials may be intercepted by a MITM attacker.", color='y'
+        )
+        self._store_findings("_graybox_preflight", [GrayboxFinding(
+          scenario_id="PREFLIGHT-TLS",
+          title="TLS verification disabled",
+          status="inconclusive",
+          severity="LOW",
+          owasp="A02:2021",
+          cwe=["CWE-295"],
+          evidence=[f"verify_tls=False", f"target={self.target_url}"],
+          remediation="Enable TLS verification or use a trusted certificate.",
+        )])
+
+      self.metrics.phase_end("preflight")
+
+      # ── Phase 1: Authentication ──
+      self._set_phase("authentication")
+      self.metrics.phase_start("authentication")
+      official_creds = {
+        "username": self.job_config.official_username,
+        "password": self.job_config.official_password,
+      }
+      regular_creds = None
+      if self.job_config.regular_username:
+        regular_creds = {
+          "username": self.job_config.regular_username,
+          "password": self.job_config.regular_password,
+        }
+
+      auth_ok = self.auth.authenticate(official_creds, regular_creds)
+      self._store_auth_results()
+      self.state["completed_tests"].append("graybox_auth")
+      self.metrics.phase_end("authentication")
+
+      if not auth_ok:
+        self._record_fatal("Official authentication failed. Cannot proceed with graybox scan.")
+        return
+
+      # ── Phase 2: Route discovery ──
+      if not self._check_stopped():
+        self._set_phase("discovery")
+        self.metrics.phase_start("discovery")
+        self.auth.ensure_sessions(official_creds, regular_creds)
+        routes, forms = self.discovery.discover(
+          known_routes=self.job_config.app_routes,
+        )
+        self._store_discovery_results(routes, forms)
+        self.state["completed_tests"].append("graybox_discovery")
+        self.metrics.phase_end("discovery")
+
+      # ── Phase 3: Probes ──
+      if not self._check_stopped():
+        self._set_phase("graybox_probes")
+        self.metrics.phase_start("graybox_probes")
+        self.auth.ensure_sessions(official_creds, regular_creds)
+
+        probe_kwargs = dict(
+          target_url=self.target_url,
+          auth_manager=self.auth,
+          target_config=self.target_config,
+          safety=self.safety,
+          discovered_routes=routes,
+          discovered_forms=forms,
+          regular_username=self.job_config.regular_username,
+          allow_stateful=self.job_config.allow_stateful_probes,
+        )
+
+        graybox_excluded = "graybox" in (self.job_config.excluded_features or [])
+
+        if not graybox_excluded:
+          for entry in GRAYBOX_PROBE_REGISTRY:
+            if self._check_stopped():
+              break
+
+            probe_cls = self._import_probe(entry["cls"])
+            store_key = entry["key"]
+
+            # Capability-based skip checks — read from the class itself
+            if probe_cls.is_stateful and not self.job_config.allow_stateful_probes:
+              self._store_findings(store_key, [GrayboxFinding(
+                scenario_id=f"SKIP-{store_key}",
+                title="Probe skipped: stateful probes disabled",
+                status="inconclusive", severity="INFO", owasp="",
+                evidence=["stateful_probes_disabled=True"],
+              )])
+              continue
+            if probe_cls.requires_regular_session and not self.auth.regular_session:
+              continue
+            if probe_cls.requires_auth and not self.auth.official_session:
+              continue
+
+            self.auth.ensure_sessions(official_creds, regular_creds)
+
+            try:
+              findings = probe_cls(**probe_kwargs).run()
+              self._store_findings(store_key, findings)
+            except Exception as exc:
+              self._record_probe_error(store_key, exc)
+
+        self.state["completed_tests"].append("graybox_probes")
+        self.metrics.phase_end("graybox_probes")
+
+      # ── Phase 4: Weak auth (optional) ──
+      if not self._check_stopped() and self.job_config.weak_candidates:
+        self._set_phase("weak_auth")
+        self.metrics.phase_start("weak_auth")
+        self.auth.ensure_sessions(official_creds, regular_creds)
+        bl_probe = BusinessLogicProbes(
+          **dict(probe_kwargs, allow_stateful=False),
+        )
+        weak_findings = bl_probe.run_weak_auth(
+          self.job_config.weak_candidates,
+          self.job_config.max_weak_attempts,
+        )
+        self._store_findings("_graybox_weak_auth", weak_findings)
+        self.state["completed_tests"].append("graybox_weak_auth")
+        self.metrics.phase_end("weak_auth")
+
+    except Exception as exc:
+      self._record_fatal(self.safety.sanitize_error(str(exc)))
+    finally:
+      self.auth.cleanup()
+      self.metrics.phase_end(self._phase)
+      self.state["done"] = True
+
+  def _store_findings(self, key, findings):
+    """Store GrayboxFinding dicts in graybox_results under the port key."""
+    port_results = self.state["graybox_results"].setdefault(self._port_key, {})
+    port_results[key] = {
+      "findings": [f.to_dict() for f in findings],
+    }
+
+  def _store_auth_results(self):
+    port_info = self.state["service_info"].setdefault(self._port_key, {})
+    port_info["_graybox_auth"] = {
+      "official_success": self.auth.official_session is not None,
+      "regular_success": self.auth.regular_session is not None,
+      "auth_errors": list(self.auth._auth_errors),
+      "findings": [],
+    }
+
+  def _store_discovery_results(self, routes, forms):
+    port_info = self.state["service_info"].setdefault(self._port_key, {})
+    port_info["_graybox_discovery"] = {
+      "routes": routes,
+      "forms": forms,
+      "findings": [],
+    }
+
+  def _record_fatal(self, message):
+    """Record unrecoverable error as a GrayboxFinding."""
+    self._store_findings("_graybox_fatal", [GrayboxFinding(
+      scenario_id="FATAL",
+      title="Scan aborted",
+      status="inconclusive",
+      severity="INFO",
+      owasp="",
+      evidence=[f"error={message}"],
+      error=message,
+    )])
+
+  def _record_probe_error(self, store_key, exc):
+    """Record per-probe error without killing the scan."""
+    sanitized = self.safety.sanitize_error(str(exc))
+    self._store_findings(store_key, [GrayboxFinding(
+      scenario_id=f"ERR-{store_key}",
+      title=f"Probe error: {store_key}",
+      status="inconclusive",
+      severity="INFO",
+      owasp="",
+      evidence=[f"error={sanitized}"],
+      error=sanitized,
+    )])
+
+  @staticmethod
+  def _import_probe(cls_path):
+    """Dynamically import a probe class from the registry."""
+    module_name, class_name = cls_path.rsplit(".", 1)
+    full_module = f"..probes.{module_name}"
+    mod = importlib.import_module(full_module, package=__name__)
+    return getattr(mod, class_name)
+
+  def _set_phase(self, phase):
+    self._phase = phase
+
+  def _compute_scenario_stats(self):
+    """Compute scenario stats from graybox_results."""
+    stats = {
+      "total": 0, "vulnerable": 0, "not_vulnerable": 0,
+      "inconclusive": 0, "error": 0,
+    }
+    for port_key, probes in self.state["graybox_results"].items():
+      for probe_key, probe_data in probes.items():
+        for finding in probe_data.get("findings", []):
+          status = finding.get("status", "")
+          if not status:
+            continue
+          stats["total"] += 1
+          if status in stats:
+            stats[status] += 1
+          else:
+            stats["error"] += 1
+    return stats
+
+  @staticmethod
+  def get_worker_specific_result_fields():
+    """Register graybox_results for aggregation."""
+    return {
+      "graybox_results": dict,
+      "service_info": dict,
+      "web_tests_info": dict,
+      "open_ports": list,
+      "completed_tests": list,
+      "port_protocols": dict,
+      "correlation_findings": list,
+      "scan_metrics": dict,
+      "ports_scanned": list,
+    }

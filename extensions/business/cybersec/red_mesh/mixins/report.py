@@ -175,6 +175,24 @@ class _ReportMixin:
             _re.sub(r'^(\S+?):(.+)$', r'\1:***', c) if isinstance(c, str) else c
             for c in creds
           ]
+    # Redact graybox_results credential evidence
+    _CRED_RE = _re.compile(r'(\S+?):(\S+)')
+    graybox_results = redacted.get("graybox_results", {})
+    for port_key, probes in graybox_results.items():
+      if not isinstance(probes, dict):
+        continue
+      for probe_name, probe_data in probes.items():
+        if not isinstance(probe_data, dict):
+          continue
+        for finding in probe_data.get("findings", []):
+          if not isinstance(finding, dict):
+            continue
+          evidence = finding.get("evidence", [])
+          if isinstance(evidence, list):
+            finding["evidence"] = [
+              _CRED_RE.sub(r'\1:***', e) if isinstance(e, str) else e
+              for e in evidence
+            ]
     return redacted
 
   @staticmethod
