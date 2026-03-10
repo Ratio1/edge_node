@@ -85,6 +85,29 @@ class _RiskScoringMixin:
     if isinstance(correlation_findings, list):
       process_findings(correlation_findings)
 
+    # A. Iterate graybox_results — uses GrayboxFinding.to_flat_finding()
+    from ..graybox.findings import GrayboxFinding as _GF
+    graybox_results = aggregated_report.get("graybox_results", {})
+    for port_key, probes in graybox_results.items():
+      if not isinstance(probes, dict):
+        continue
+      for probe_name, probe_data in probes.items():
+        if not isinstance(probe_data, dict):
+          continue
+        for finding_dict in probe_data.get("findings", []):
+          if not isinstance(finding_dict, dict):
+            continue
+          try:
+            gf = _GF(**{k: v for k, v in finding_dict.items() if k in _GF.__dataclass_fields__})
+          except (TypeError, KeyError):
+            continue
+          flat = gf.to_flat_finding(0, "unknown", probe_name)
+          weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
+          multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
+          findings_score += weight * multiplier
+          if flat["severity"] in finding_counts:
+            finding_counts[flat["severity"]] += 1
+
     # B. Open ports — diminishing returns: 15 × (1 - e^(-ports/8))
     open_ports = aggregated_report.get("open_ports", [])
     nr_ports = len(open_ports) if isinstance(open_ports, list) else 0
@@ -211,6 +234,37 @@ class _RiskScoringMixin:
     correlation_findings = aggregated_report.get("correlation_findings", [])
     if isinstance(correlation_findings, list):
       process_findings(correlation_findings, 0, "_correlation", "correlation")
+
+    # Walk graybox_results — delegates to GrayboxFinding.to_flat_finding()
+    from ..graybox.findings import GrayboxFinding as _GF
+    graybox_results = aggregated_report.get("graybox_results", {})
+    for port_key, probes in graybox_results.items():
+      if not isinstance(probes, dict):
+        continue
+      port = parse_port(port_key)
+      protocol = port_protocols.get(str(port), "unknown")
+      for probe_name, probe_data in probes.items():
+        if not isinstance(probe_data, dict):
+          continue
+        for finding_dict in probe_data.get("findings", []):
+          if not isinstance(finding_dict, dict):
+            continue
+          try:
+            gf = _GF(**{k: v for k, v in finding_dict.items() if k in _GF.__dataclass_fields__})
+          except (TypeError, KeyError):
+            continue
+          flat = gf.to_flat_finding(port, protocol, probe_name)
+
+          weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
+          multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
+          findings_score += weight * multiplier
+          if flat["severity"] in finding_counts:
+            finding_counts[flat["severity"]] += 1
+          title = flat.get("title", "")
+          if isinstance(title, str) and "default credential accepted" in title.lower():
+            cred_count += 1
+
+          flat_findings.append(flat)
 
     # B. Open ports — diminishing returns
     open_ports = aggregated_report.get("open_ports", [])
