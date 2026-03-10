@@ -6,12 +6,31 @@ and merging of scan metrics across worker threads.
 """
 
 from ..models import WorkerProgress
-from ..constants import PROGRESS_PUBLISH_INTERVAL, PHASE_ORDER
+from ..constants import PROGRESS_PUBLISH_INTERVAL, PHASE_ORDER, GRAYBOX_PHASE_ORDER
 
 
 def _thread_phase(state):
-  """Determine which phase a single thread is currently in."""
+  """Determine which phase a single thread is currently in.
+
+  Supports both network and webapp (graybox) scan types. Network
+  scans use the existing phase markers. Webapp scans use graybox_*
+  markers and map to their own phase names.
+  """
   tests = set(state.get("completed_tests", []))
+  scan_type = state.get("scan_type")
+
+  if scan_type == "webapp":
+    # Graybox phase progression:
+    # preflight -> authentication -> discovery -> graybox_probes -> weak_auth -> done
+    if "graybox_weak_auth" in tests or "graybox_probes" in tests:
+      return "done"
+    if "graybox_discovery" in tests:
+      return "graybox_probes"
+    if "graybox_auth" in tests:
+      return "discovery"
+    return "preflight"
+
+  # Network phase progression (unchanged):
   if "correlation_completed" in tests:
     return "done"
   if "web_tests_completed" in tests:
@@ -148,11 +167,17 @@ class _LiveProgressMixin:
     live_hkey = f"{self.cfg_instance_id}:live"
     ee_addr = self.ee_addr
 
-    nr_phases = len(PHASE_ORDER)
-
     for job_id, local_workers in self.scan_jobs.items():
       if not local_workers:
         continue
+
+      # Determine phase order based on scan type (inspect first worker)
+      first_worker = next(iter(local_workers.values()))
+      if first_worker.state.get("scan_type") == "webapp":
+        phase_order = GRAYBOX_PHASE_ORDER
+      else:
+        phase_order = PHASE_ORDER
+      nr_phases = len(phase_order)
 
       # Build per-thread data
       total_scanned = 0
@@ -185,9 +210,9 @@ class _LiveProgressMixin:
         }
 
       # Overall phase: earliest (least advanced) across threads
-      phase_indices = [PHASE_ORDER.index(p) if p in PHASE_ORDER else nr_phases for p in thread_phases]
+      phase_indices = [phase_order.index(p) if p in phase_order else nr_phases for p in thread_phases]
       min_phase_idx = min(phase_indices) if phase_indices else 0
-      phase = PHASE_ORDER[min_phase_idx] if min_phase_idx < nr_phases else "done"
+      phase = phase_order[min_phase_idx] if min_phase_idx < nr_phases else "done"
 
       # Stage-based progress: completed_stages / total * 100
       # During port_scan, add sub-progress based on ports scanned

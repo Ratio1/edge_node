@@ -260,3 +260,9 @@ PHASE_MARKERS = {
   "web_tests": "web_tests_completed",
   "correlation": "correlation_completed",
 }
+
+# Graybox scan phases in execution order
+GRAYBOX_PHASE_ORDER = [
+  "preflight", "authentication", "discovery", "graybox_probes",
+  "weak_auth",
+]

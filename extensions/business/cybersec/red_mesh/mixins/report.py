@@ -15,7 +15,7 @@ class _ReportMixin:
   SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
   CONFIDENCE_ORDER = {"certain": 0, "firm": 1, "tentative": 2}
 
-  def _get_aggregated_report(self, local_jobs):
+  def _get_aggregated_report(self, local_jobs, worker_cls=None):
     """
     Aggregate results from multiple local workers.
 
@@ -23,6 +23,9 @@ class _ReportMixin:
     ----------
     local_jobs : dict
       Mapping of worker id to result dicts.
+    worker_cls : type, optional
+      Worker class to resolve aggregation fields from. Defaults to
+      PentestLocalWorker for backward compat.
 
     Returns
     -------
@@ -35,7 +38,10 @@ class _ReportMixin:
       if local_jobs:
         self.P(f"Aggregating reports from {len(local_jobs)} local jobs...")
         for local_worker_id, local_job_status in local_jobs.items():
-          aggregation_fields = PentestLocalWorker.get_worker_specific_result_fields()
+          if worker_cls and hasattr(worker_cls, 'get_worker_specific_result_fields'):
+            aggregation_fields = worker_cls.get_worker_specific_result_fields()
+          else:
+            aggregation_fields = PentestLocalWorker.get_worker_specific_result_fields()
           for field in local_job_status:
             if field not in dct_aggregated_report:
               dct_aggregated_report[field] = local_job_status[field]
