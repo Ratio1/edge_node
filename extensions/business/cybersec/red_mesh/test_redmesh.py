@@ -2972,8 +2972,12 @@ class TestPhase2PassFinalization(unittest.TestCase):
 
     # CStore should NOT have pass_reports appended
     self.assertEqual(len(job_specs["pass_reports"]), 0)
-    # CStore hset should NOT have been called for finalization
-    plugin.chainstore_hset.assert_not_called()
+    # CStore hset was called for intermediate status updates (COLLECTING, ANALYZING, FINALIZING)
+    # but NOT for finalization — verify job_status is NOT FINALIZED in the last write
+    for call_args in plugin.chainstore_hset.call_args_list:
+      value = call_args.kwargs.get("value") or call_args[1].get("value") if len(call_args) > 1 else None
+      if isinstance(value, dict):
+        self.assertNotEqual(value.get("job_status"), "FINALIZED")
 
   def test_pass_report_write_failure(self):
     """R1FS fails for pass report → CStore pass_reports not appended."""
@@ -2999,8 +3003,11 @@ class TestPhase2PassFinalization(unittest.TestCase):
 
     # CStore should NOT have pass_reports appended
     self.assertEqual(len(job_specs["pass_reports"]), 0)
-    # CStore hset should NOT have been called for finalization
-    plugin.chainstore_hset.assert_not_called()
+    # CStore hset was called for status updates but NOT for finalization
+    for call_args in plugin.chainstore_hset.call_args_list:
+      value = call_args.kwargs.get("value") or call_args[1].get("value") if len(call_args) > 1 else None
+      if isinstance(value, dict):
+        self.assertNotEqual(value.get("job_status"), "FINALIZED")
 
   def test_cstore_risk_score_updated(self):
     """After pass, risk_score on CStore matches pass result."""
@@ -3779,7 +3786,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(result["workers"], {})
 
   def test_publish_live_progress(self):
-    """_publish_live_progress writes progress to CStore :live hset."""
+    """_publish_live_progress writes stage-based progress to CStore :live hset."""
     Plugin = self._get_plugin_class()
     plugin = MagicMock()
     plugin.cfg_instance_id = "test-instance"
@@ -3787,7 +3794,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin._last_progress_publish = 0
     plugin.time.return_value = 100.0
 
-    # Mock a local worker with state
+    # Mock a local worker with state (port scan partial + fingerprint done)
     worker = MagicMock()
     worker.state = {
       "ports_scanned": list(range(100)),
@@ -3818,6 +3825,58 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(progress_data["ports_total"], 512)
     self.assertIn(22, progress_data["open_ports_found"])
     self.assertIn(80, progress_data["open_ports_found"])
+    # Stage-based progress: service_probes = stage 3 (idx 2), so 2/5*100 = 40%
+    self.assertEqual(progress_data["progress"], 40.0)
+    # Single thread — no threads field
+    self.assertNotIn("threads", progress_data)
+
+  def test_publish_live_progress_multi_thread_phase(self):
+    """Phase is the earliest active phase; per-thread data is included."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+    plugin._last_progress_publish = 0
+    plugin.time.return_value = 100.0
+
+    # Thread 1: fully done
+    worker1 = MagicMock()
+    worker1.state = {
+      "ports_scanned": list(range(256)),
+      "open_ports": [22],
+      "completed_tests": ["fingerprint_completed", "service_info_completed", "web_tests_completed", "correlation_completed"],
+      "done": True,
+    }
+    worker1.initial_ports = list(range(1, 257))
+
+    # Thread 2: still on port scan (50 of 256 ports)
+    worker2 = MagicMock()
+    worker2.state = {
+      "ports_scanned": list(range(50)),
+      "open_ports": [],
+      "completed_tests": [],
+      "done": False,
+    }
+    worker2.initial_ports = list(range(257, 513))
+
+    plugin.scan_jobs = {"job-1": {"t1": worker1, "t2": worker2}}
+    plugin.chainstore_hget.return_value = {"job_pass": 1}
+
+    Plugin._publish_live_progress(plugin)
+
+    call_args = plugin.chainstore_hset.call_args
+    progress_data = call_args.kwargs["value"]
+    # Phase should be port_scan (earliest across threads), not done
+    self.assertEqual(progress_data["phase"], "port_scan")
+    # Stage-based: port_scan (idx 0) + sub-progress (306/512 * 20%) = ~12%
+    self.assertGreater(progress_data["progress"], 10)
+    self.assertLess(progress_data["progress"], 15)
+    # Per-thread data should be present (2 threads)
+    self.assertIn("threads", progress_data)
+    self.assertEqual(progress_data["threads"]["t1"]["phase"], "done")
+    self.assertEqual(progress_data["threads"]["t2"]["phase"], "port_scan")
+    self.assertEqual(progress_data["threads"]["t2"]["ports_scanned"], 50)
+    self.assertEqual(progress_data["threads"]["t2"]["ports_total"], 256)
 
   def test_clear_live_progress(self):
     """_clear_live_progress deletes progress keys for all workers."""
