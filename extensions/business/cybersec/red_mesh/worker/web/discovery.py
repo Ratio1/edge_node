@@ -2,8 +2,8 @@ import re as _re
 import uuid as _uuid
 import requests
 
-from .findings import Finding, Severity, probe_result, probe_error
-from .cve_db import check_cves
+from ...findings import Finding, Severity, probe_result, probe_error
+from ...cve_db import check_cves
 
 
 class _WebDiscoveryMixin:

@@ -8,7 +8,7 @@ OS mismatches, infrastructure leaks, and timezone drift.
 
 import ipaddress
 
-from .findings import Finding, Severity, probe_result
+from ..findings import Finding, Severity, probe_result
 
 
 # Map keywords found in OS strings to normalized OS families

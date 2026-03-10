@@ -5,8 +5,8 @@ Handles real-time scan progress publishing to the CStore `:live` hset
 and merging of scan metrics across worker threads.
 """
 
-from .models import WorkerProgress
-from .constants import PROGRESS_PUBLISH_INTERVAL, PHASE_ORDER
+from ..models import WorkerProgress
+from ..constants import PROGRESS_PUBLISH_INTERVAL, PHASE_ORDER
 
 
 def _thread_phase(state):
