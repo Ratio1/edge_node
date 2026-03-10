@@ -55,23 +55,23 @@ FEATURE_CATALOG = [
   {
     "id": "web_hardening",
     "label": "Hardening audit",
-    "description": "Audit cookie flags, security headers, CORS policy, redirect handling, and HTTP methods (OWASP WSTG-CONF).",
+    "description": "Audit cookie flags, security headers, CORS policy, CSRF tokens, and HTTP methods (OWASP WSTG-CONF).",
     "category": "web",
-    "methods": ["_web_test_flags", "_web_test_security_headers", "_web_test_cors_misconfiguration", "_web_test_open_redirect", "_web_test_http_methods", "_web_test_csrf"]
+    "methods": ["_web_test_flags", "_web_test_security_headers", "_web_test_cors_misconfiguration", "_web_test_http_methods", "_web_test_csrf"]
   },
   {
     "id": "web_api_exposure",
     "label": "API exposure",
     "description": "Detect GraphQL introspection leaks, cloud metadata endpoints, and API auth bypass (OWASP WSTG-APIT).",
     "category": "web",
-    "methods": ["_web_test_graphql_introspection", "_web_test_metadata_endpoints", "_web_test_api_auth_bypass", "_web_test_ssrf_basic"]
+    "methods": ["_web_test_graphql_introspection", "_web_test_metadata_endpoints", "_web_test_api_auth_bypass"]
   },
   {
     "id": "web_injection",
     "label": "Injection probes",
-    "description": "Non-destructive probes for path traversal, reflected XSS, and SQL injection (OWASP WSTG-INPV).",
+    "description": "Non-destructive probes for path traversal, reflected XSS, SQL injection, SSRF, and open redirect (OWASP WSTG-INPV).",
     "category": "web",
-    "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection", "_web_test_ssti", "_web_test_shellshock", "_web_test_php_cgi", "_web_test_ognl_injection", "_web_test_java_deserialization", "_web_test_spring_actuator"]
+    "methods": ["_web_test_path_traversal", "_web_test_xss", "_web_test_sql_injection", "_web_test_ssti", "_web_test_shellshock", "_web_test_php_cgi", "_web_test_ognl_injection", "_web_test_java_deserialization", "_web_test_spring_actuator", "_web_test_open_redirect", "_web_test_ssrf_basic"]
   },
   {
     "id": "web_auth_design",
