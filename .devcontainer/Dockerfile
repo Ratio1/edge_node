@@ -14,8 +14,8 @@ RUN set -eux; \
     ninja-build; \
     rm -rf /var/lib/apt/lists/*
          
-RUN wget https://dist.ipfs.tech/kubo/v0.32.1/kubo_v0.32.1_linux-amd64.tar.gz && \
-  tar -xvzf kubo_v0.32.1_linux-amd64.tar.gz && \
+RUN wget https://dist.ipfs.tech/kubo/v0.35.0/kubo_v0.35.0_linux-amd64.tar.gz && \
+  tar -xvzf kubo_v0.35.0_linux-amd64.tar.gz && \
   cd kubo && \
   bash install.sh
 # End Install IPFS
