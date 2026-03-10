@@ -105,6 +105,9 @@ FEATURE_CATALOG = [
 
 # Job status constants
 JOB_STATUS_RUNNING = "RUNNING"
+JOB_STATUS_COLLECTING = "COLLECTING"        # Launcher merging worker reports
+JOB_STATUS_ANALYZING = "ANALYZING"          # Running LLM analysis
+JOB_STATUS_FINALIZING = "FINALIZING"        # Computing risk, writing archive
 JOB_STATUS_SCHEDULED_FOR_STOP = "SCHEDULED_FOR_STOP"
 JOB_STATUS_STOPPED = "STOPPED"
 JOB_STATUS_FINALIZED = "FINALIZED"
@@ -235,4 +238,13 @@ MAX_CONTINUOUS_PASSES = 100
 # Live progress publishing
 # =====================================================================
 
-PROGRESS_PUBLISH_INTERVAL = 20  # seconds between progress updates to CStore
+PROGRESS_PUBLISH_INTERVAL = 10  # seconds between progress updates to CStore
+
+# Scan phases in execution order (5 phases total)
+PHASE_ORDER = ["port_scan", "fingerprint", "service_probes", "web_tests", "correlation"]
+PHASE_MARKERS = {
+  "fingerprint": "fingerprint_completed",
+  "service_probes": "service_info_completed",
+  "web_tests": "web_tests_completed",
+  "correlation": "correlation_completed",
+}
