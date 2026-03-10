@@ -117,6 +117,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {}
     plugin.chainstore_peers = ["node-1"]
     plugin.cfg_chainstore_peers = ["node-1"]
+    plugin._redact_job_config = staticmethod(lambda d: d)
     return plugin
 
   @classmethod
