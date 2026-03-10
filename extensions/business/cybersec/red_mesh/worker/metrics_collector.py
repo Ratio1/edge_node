@@ -1,7 +1,7 @@
 import time
 import statistics
 
-from .models.shared import ScanMetrics
+from ..models.shared import ScanMetrics
 
 
 class MetricsCollector:

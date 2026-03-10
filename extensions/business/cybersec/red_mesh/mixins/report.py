@@ -5,8 +5,8 @@ Handles merging worker results, credential redaction, and pre-computing
 the UI aggregate view for the frontend.
 """
 
-from .pentest_worker import PentestLocalWorker
-from .models import UiAggregate
+from ..worker import PentestLocalWorker
+from ..models import UiAggregate
 
 
 class _ReportMixin:

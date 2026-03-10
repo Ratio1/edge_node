@@ -4,29 +4,7 @@ import struct
 import unittest
 from unittest.mock import MagicMock, patch
 
-from extensions.business.cybersec.red_mesh.pentest_worker import PentestLocalWorker
-
-from xperimental.utils import color_print
-
-MANUAL_RUN = __name__ == "__main__"
-
-
-
-class DummyOwner:
-  def __init__(self):
-    self.messages = []
-
-  def P(self, message, **kwargs):
-    self.messages.append(message)
-    if MANUAL_RUN:
-      if "VULNERABILITY" in message:
-        color = 'r'
-      elif any(x in message for x in ["WARNING", "findings:"]):
-        color = 'y'
-      else:
-        color = 'd'
-      color_print(f"[DummyOwner] {message}", color=color)
-    return
+from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
 
 
 class RedMeshOWASPTests(unittest.TestCase):
@@ -114,7 +92,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_common("example.com", 80)
@@ -126,7 +104,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.headers = {"Set-Cookie": "sessionid=abc; Path=/"}
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_flags("example.com", 443)
@@ -140,7 +118,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.text = "sql syntax error near line"
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_sql_injection("example.com", 80)
@@ -152,7 +130,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.text = "root:x:0:0:root:/root:/bin/bash"
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_path_traversal("example.com", 80)
@@ -164,7 +142,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.headers = {"Server": "Test"}
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_security_headers("example.com", 80)
@@ -181,10 +159,10 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.headers = {"Server": "Apache/2.2.0"}
     resp.text = "<html></html>"
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.service.common.requests.get",
       return_value=resp,
     ), patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.requests.request",
+      "extensions.business.cybersec.red_mesh.worker.service.common.requests.request",
       side_effect=Exception("skip methods check"),
     ):
       worker._gather_service_info()
@@ -211,7 +189,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.ftplib.FTP",
+      "extensions.business.cybersec.red_mesh.worker.service.common.ftplib.FTP",
       return_value=DummyFTP(),
     ):
       result = worker._service_info_ftp("example.com", 21)
@@ -237,7 +215,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.ftplib.FTP",
+      "extensions.business.cybersec.red_mesh.worker.service.common.ftplib.FTP",
       return_value=DummyFTP(),
     ):
       result = worker._service_info_ftp("example.com", 2121)
@@ -270,7 +248,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.text = "BEGIN RSA PRIVATE KEY"
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_homepage("example.com", 80)
@@ -307,7 +285,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       worker._run_web_tests()
@@ -348,7 +326,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.text = f"Response with {payload} inside"
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_xss("example.com", 80)
@@ -416,13 +394,13 @@ class RedMeshOWASPTests(unittest.TestCase):
       return DummyContextUnverified()
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.create_connection",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.socket.create_connection",
       return_value=DummyConn(),
     ), patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.ssl.SSLContext",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.ssl.SSLContext",
       return_value=DummyContextUnverified(),
     ), patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.ssl.create_default_context",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.ssl.create_default_context",
       return_value=DummyContextVerified(),
     ):
       info = worker._service_info_tls("example.com", 443)
@@ -475,13 +453,13 @@ class RedMeshOWASPTests(unittest.TestCase):
     import ssl
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.create_connection",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.socket.create_connection",
       return_value=DummyConn(),
     ), patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.ssl.SSLContext",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.ssl.SSLContext",
       return_value=DummyContextUnverified(),
     ), patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.ssl.create_default_context",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.ssl.create_default_context",
       return_value=DummyContextVerified(),
     ):
       info = worker._service_info_tls("example.com", 443)
@@ -505,7 +483,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.pentest_worker.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket",
       return_value=DummySocket(),
     ):
       worker._scan_ports_step()
@@ -533,7 +511,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         self.closed = True
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.common.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_telnet("example.com", 23)
@@ -562,7 +540,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_smb("example.com", 445)
@@ -599,7 +577,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_vnc("example.com", 5900)
@@ -635,7 +613,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_vnc("example.com", 5900)
@@ -662,7 +640,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket",
       return_value=DummyUDPSocket(),
     ):
       info = worker._service_info_snmp("example.com", 161)
@@ -695,10 +673,10 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.random.randint",
+      "extensions.business.cybersec.red_mesh.worker.service.infrastructure.random.randint",
       return_value=tid,
     ), patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket",
       return_value=DummyUDPSocket(),
     ):
       info = worker._service_info_dns("example.com", 53)
@@ -727,7 +705,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_memcached("example.com", 11211)
@@ -745,7 +723,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       "tagline": "You Know, for Search",
     }
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.service.infrastructure.requests.get",
       return_value=resp,
     ):
       info = worker._service_info_elasticsearch("example.com", 9200)
@@ -774,7 +752,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_modbus("example.com", 502)
@@ -805,7 +783,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_postgresql("example.com", 5432)
@@ -840,7 +818,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_postgresql("example.com", 5432)
@@ -872,7 +850,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_mssql("example.com", 1433)
@@ -901,7 +879,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_mongodb("example.com", 27017)
@@ -913,7 +891,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.status_code = 200
     resp.text = "{\"data\":{\"__schema\":{}}}"
     with patch(
-      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.post",
+      "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.post",
       return_value=resp,
     ):
       result = worker._web_test_graphql_introspection("example.com", 80)
@@ -928,7 +906,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_metadata_endpoints("example.com", 80)
@@ -939,7 +917,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp = MagicMock()
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_api_auth_bypass("example.com", 80)
@@ -954,7 +932,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     }
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_cors_misconfiguration("example.com", 80)
@@ -966,7 +944,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.status_code = 302
     resp.headers = {"Location": "https://attacker.example"}
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_open_redirect("example.com", 80)
@@ -978,7 +956,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.headers = {"Allow": "GET, POST, PUT"}
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.options",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.options",
       return_value=resp,
     ):
       result = worker._web_test_http_methods("example.com", 80)
@@ -1085,7 +1063,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_redis("example.com", 6379)
@@ -1118,7 +1096,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_redis("example.com", 6379)
@@ -1151,7 +1129,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_mysql("example.com", 3306)
@@ -1169,7 +1147,7 @@ class RedMeshOWASPTests(unittest.TestCase):
     resp.text = '<html><head><meta name="generator" content="WordPress 6.1"></head></html>'
     resp.status_code = 200
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_tech_fingerprint("example.com", 80)
@@ -1208,7 +1186,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         mock_sock.recv.return_value = modbus_response
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._active_fingerprint_ports()
 
     self.assertEqual(worker.state["port_protocols"][1024], "modbus")
@@ -1227,7 +1205,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = b""
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._active_fingerprint_ports()
 
     self.assertEqual(worker.state["port_protocols"][1024], "unknown")
@@ -1247,7 +1225,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = fake_binary
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertNotEqual(worker.state["port_protocols"][37364], "mysql")
@@ -1269,7 +1247,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = mysql_greeting
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertEqual(worker.state["port_protocols"][3306], "mysql")
@@ -1288,7 +1266,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = telnet_banner
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertEqual(worker.state["port_protocols"][2323], "telnet")
@@ -1307,7 +1285,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = fake_binary
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertNotEqual(worker.state["port_protocols"][8502], "telnet")
@@ -1325,7 +1303,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = login_banner
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertEqual(worker.state["port_protocols"][2323], "telnet")
@@ -1353,7 +1331,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         mock_sock.recv.return_value = bad_modbus
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._active_fingerprint_ports()
 
     self.assertNotEqual(worker.state["port_protocols"][1024], "modbus")
@@ -1373,7 +1351,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = fake_pkt
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertNotEqual(worker.state["port_protocols"][9999], "mysql")
@@ -1392,7 +1370,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       def close(self): pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.socket.socket",
       return_value=DummySocket(),
     ):
       result = worker._service_info_generic("example.com", 9999)
@@ -1414,7 +1392,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       def close(self): pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.socket.socket",
       return_value=DummySocket(),
     ):
       result = worker._service_info_generic("example.com", 9999)
@@ -1436,7 +1414,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       def close(self): pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.socket.socket",
       return_value=DummySocket(),
     ):
       result = worker._service_info_generic("example.com", 9999)
@@ -1455,7 +1433,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       def close(self): pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.tls.socket.socket",
       return_value=DummySocket(),
     ):
       result = worker._service_info_generic("example.com", 9999)
@@ -1482,11 +1460,12 @@ class RedMeshOWASPTests(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_vpn_endpoints("example.com", 443)
     self._assert_has_finding(result, "FortiGate")
+
 
 
 class TestFindingsModule(unittest.TestCase):
@@ -1510,6 +1489,7 @@ class TestFindingsModule(unittest.TestCase):
     self.assertEqual(hash(f1), hash(f2))
     s = {f1, f2}
     self.assertEqual(len(s), 1)
+
 
 
 class TestCveDatabase(unittest.TestCase):
@@ -1536,6 +1516,7 @@ class TestCveDatabase(unittest.TestCase):
     findings = check_cves("apache", "2.4.49")
     cve_ids = [f.title for f in findings]
     self.assertTrue(any("CVE-2021-41773" in t for t in cve_ids))
+
 
 
 class TestCorrelationEngine(unittest.TestCase):
@@ -1692,7 +1673,7 @@ class TestCorrelationEngine(unittest.TestCase):
         pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_mysql("example.com", 3306)
@@ -1734,7 +1715,7 @@ class TestCorrelationEngine(unittest.TestCase):
         pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.ftplib.FTP",
+      "extensions.business.cybersec.red_mesh.worker.service.common.ftplib.FTP",
       return_value=DummyFTP(),
     ):
       info = worker._service_info_ftp("example.com", 21)
@@ -1755,7 +1736,7 @@ class TestCorrelationEngine(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_common("example.com", 80)
@@ -1837,7 +1818,7 @@ class TestCorrelationEngine(unittest.TestCase):
         pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.paramiko.Transport",
+      "extensions.business.cybersec.red_mesh.worker.service.common.paramiko.Transport",
       return_value=DummyTransport(),
     ):
       findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
@@ -1857,6 +1838,7 @@ class TestCorrelationEngine(unittest.TestCase):
 
     self.assertTrue(worker.state["done"])
     self.assertIn("correlation_completed", worker.state["completed_tests"])
+
 
 
 class TestScannerEnhancements(unittest.TestCase):
@@ -1976,7 +1958,7 @@ class TestScannerEnhancements(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_redis("example.com", 6379)
@@ -2015,7 +1997,7 @@ class TestScannerEnhancements(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.database.socket.socket",
       return_value=DummySocket(),
     ):
       info = worker._service_info_redis("example.com", 6379)
@@ -2048,7 +2030,7 @@ class TestScannerEnhancements(unittest.TestCase):
       def close(self): pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.paramiko.Transport",
+      "extensions.business.cybersec.red_mesh.worker.service.common.paramiko.Transport",
       return_value=DummyTransport(),
     ):
       findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
@@ -2080,7 +2062,7 @@ class TestScannerEnhancements(unittest.TestCase):
       def close(self): pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.paramiko.Transport",
+      "extensions.business.cybersec.red_mesh.worker.service.common.paramiko.Transport",
       return_value=DummyTransport(),
     ):
       findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
@@ -2112,7 +2094,7 @@ class TestScannerEnhancements(unittest.TestCase):
       def close(self): pass
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.paramiko.Transport",
+      "extensions.business.cybersec.red_mesh.worker.service.common.paramiko.Transport",
       return_value=DummyTransport(),
     ):
       findings, weak_labels = worker._ssh_check_ciphers("example.com", 22)
@@ -2188,7 +2170,7 @@ class TestScannerEnhancements(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_common("example.com", 80)
@@ -2210,7 +2192,7 @@ class TestScannerEnhancements(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_common("example.com", 80)
@@ -2232,7 +2214,7 @@ class TestScannerEnhancements(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_common("example.com", 80)
@@ -2261,10 +2243,10 @@ class TestScannerEnhancements(unittest.TestCase):
 
     # Case 1: requests fails, raw socket also gets empty reply
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.service.common.requests.get",
       side_effect=ReqConnError("RemoteDisconnected"),
     ), patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.common.socket.socket",
       return_value=DummySocket([b""]),
     ):
       result = worker._service_info_http("10.0.0.1", 81)
@@ -2292,10 +2274,10 @@ class TestScannerEnhancements(unittest.TestCase):
     raw_resp = b"HTTP/1.1 200 OK\r\nServer: nginx/1.24.0\r\n\r\n"
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.service.common.requests.get",
       side_effect=ReqConnError("RemoteDisconnected"),
     ), patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.common.socket.socket",
       return_value=DummySocket([raw_resp, b""]),
     ):
       result = worker._service_info_http("10.0.0.1", 81)
@@ -2328,10 +2310,10 @@ class TestScannerEnhancements(unittest.TestCase):
     )
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.service.common.requests.get",
       side_effect=ReqConnError("RemoteDisconnected"),
     ), patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.socket.socket",
+      "extensions.business.cybersec.red_mesh.worker.service.common.socket.socket",
       return_value=DummySocket([raw_resp, b""]),
     ):
       result = worker._service_info_http("10.0.0.1", 81)
@@ -2341,2335 +2323,6 @@ class TestScannerEnhancements(unittest.TestCase):
                     f"Expected directory listing finding, got: {titles}")
     self.assertEqual(result.get("title"), "Directory listing for /")
 
-
-class TestPhase1ConfigCID(unittest.TestCase):
-  """Phase 1: Job Config CID — extract static config from CStore to R1FS."""
-
-  def test_config_cid_roundtrip(self):
-    """JobConfig.from_dict(config.to_dict()) preserves all fields."""
-    from extensions.business.cybersec.red_mesh.models import JobConfig
-
-    original = JobConfig(
-      target="example.com",
-      start_port=1,
-      end_port=1024,
-      exceptions=[22, 80],
-      distribution_strategy="SLICE",
-      port_order="SHUFFLE",
-      nr_local_workers=4,
-      enabled_features=["http_headers", "sql_injection"],
-      excluded_features=["brute_force"],
-      run_mode="SINGLEPASS",
-      scan_min_delay=0.1,
-      scan_max_delay=0.5,
-      ics_safe_mode=True,
-      redact_credentials=False,
-      scanner_identity="test-scanner",
-      scanner_user_agent="RedMesh/1.0",
-      task_name="Test Scan",
-      task_description="A test scan",
-      monitor_interval=300,
-      selected_peers=["peer1", "peer2"],
-      created_by_name="tester",
-      created_by_id="user-123",
-      authorized=True,
-    )
-    d = original.to_dict()
-    restored = JobConfig.from_dict(d)
-    self.assertEqual(original, restored)
-
-  def test_config_to_dict_has_required_fields(self):
-    """to_dict() includes target, start_port, end_port, run_mode."""
-    from extensions.business.cybersec.red_mesh.models import JobConfig
-
-    config = JobConfig(
-      target="10.0.0.1",
-      start_port=1,
-      end_port=65535,
-      exceptions=[],
-      distribution_strategy="SLICE",
-      port_order="SEQUENTIAL",
-      nr_local_workers=2,
-      enabled_features=[],
-      excluded_features=[],
-      run_mode="CONTINUOUS_MONITORING",
-    )
-    d = config.to_dict()
-    self.assertEqual(d["target"], "10.0.0.1")
-    self.assertEqual(d["start_port"], 1)
-    self.assertEqual(d["end_port"], 65535)
-    self.assertEqual(d["run_mode"], "CONTINUOUS_MONITORING")
-
-  def test_config_strip_none(self):
-    """_strip_none removes None values from serialized config."""
-    from extensions.business.cybersec.red_mesh.models import JobConfig
-
-    config = JobConfig(
-      target="example.com",
-      start_port=1,
-      end_port=100,
-      exceptions=[],
-      distribution_strategy="SLICE",
-      port_order="SEQUENTIAL",
-      nr_local_workers=2,
-      enabled_features=[],
-      excluded_features=[],
-      run_mode="SINGLEPASS",
-      selected_peers=None,
-    )
-    d = config.to_dict()
-    self.assertNotIn("selected_peers", d)
-
-  @classmethod
-  def _mock_plugin_modules(cls):
-    """Install mock modules so pentester_api_01 can be imported without naeural_core."""
-    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
-      return  # Already imported successfully
-
-    # Build a real class to avoid metaclass conflicts
-    def endpoint_decorator(*args, **kwargs):
-      if args and callable(args[0]):
-        return args[0]
-      def wrapper(fn):
-        return fn
-      return wrapper
-
-    class FakeBasePlugin:
-      CONFIG = {'VALIDATION_RULES': {}}
-      endpoint = staticmethod(endpoint_decorator)
-
-    mock_module = MagicMock()
-    mock_module.FastApiWebAppPlugin = FakeBasePlugin
-
-    modules_to_mock = {
-      'naeural_core': MagicMock(),
-      'naeural_core.business': MagicMock(),
-      'naeural_core.business.default': MagicMock(),
-      'naeural_core.business.default.web_app': MagicMock(),
-      'naeural_core.business.default.web_app.fast_api_web_app': mock_module,
-    }
-    for mod_name, mod in modules_to_mock.items():
-      sys.modules.setdefault(mod_name, mod)
-
-  @classmethod
-  def _build_mock_plugin(cls, job_id="test-job", time_val=1000000.0, r1fs_cid="QmFakeConfigCID"):
-    """Build a mock plugin instance for launch_test testing."""
-    plugin = MagicMock()
-    plugin.ee_addr = "node-1"
-    plugin.ee_id = "node-alias-1"
-    plugin.cfg_instance_id = "test-instance"
-    plugin.cfg_port_order = "SEQUENTIAL"
-    plugin.cfg_excluded_features = []
-    plugin.cfg_distribution_strategy = "SLICE"
-    plugin.cfg_run_mode = "SINGLEPASS"
-    plugin.cfg_monitor_interval = 60
-    plugin.cfg_scanner_identity = ""
-    plugin.cfg_scanner_user_agent = ""
-    plugin.cfg_nr_local_workers = 2
-    plugin.cfg_llm_agent_api_enabled = False
-    plugin.cfg_ics_safe_mode = False
-    plugin.cfg_scan_min_rnd_delay = 0
-    plugin.cfg_scan_max_rnd_delay = 0
-    plugin.uuid.return_value = job_id
-    plugin.time.return_value = time_val
-    plugin.json_dumps.return_value = "{}"
-    plugin.r1fs = MagicMock()
-    plugin.r1fs.add_json.return_value = r1fs_cid
-    plugin.chainstore_hset = MagicMock()
-    plugin.chainstore_hgetall.return_value = {}
-    plugin.chainstore_peers = ["node-1"]
-    plugin.cfg_chainstore_peers = ["node-1"]
-    return plugin
-
-  @classmethod
-  def _extract_job_specs(cls, plugin, job_id):
-    """Extract the job_specs dict from chainstore_hset calls."""
-    for call in plugin.chainstore_hset.call_args_list:
-      kwargs = call[1] if call[1] else {}
-      if kwargs.get("key") == job_id:
-        return kwargs["value"]
-    return None
-
-  def _launch(self, plugin, **kwargs):
-    """Call launch_test with mocked base modules."""
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    defaults = dict(target="example.com", start_port=1, end_port=1024, exceptions="", authorized=True)
-    defaults.update(kwargs)
-    return PentesterApi01Plugin.launch_test(plugin, **defaults)
-
-  def test_launch_builds_job_config_and_stores_cid(self):
-    """launch_test() builds JobConfig, saves to R1FS, stores job_config_cid in CStore."""
-    plugin = self._build_mock_plugin(job_id="test-job-1", r1fs_cid="QmFakeConfigCID123")
-    self._launch(plugin)
-
-    # Verify r1fs.add_json was called with a JobConfig dict
-    self.assertTrue(plugin.r1fs.add_json.called)
-    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
-    self.assertEqual(config_dict["target"], "example.com")
-    self.assertEqual(config_dict["start_port"], 1)
-    self.assertEqual(config_dict["end_port"], 1024)
-    self.assertIn("run_mode", config_dict)
-
-    # Verify CStore has job_config_cid
-    job_specs = self._extract_job_specs(plugin, "test-job-1")
-    self.assertIsNotNone(job_specs, "Expected chainstore_hset call for job_specs")
-    self.assertEqual(job_specs["job_config_cid"], "QmFakeConfigCID123")
-
-  def test_cstore_has_no_static_config(self):
-    """After launch, CStore object has no exceptions, distribution_strategy, etc."""
-    plugin = self._build_mock_plugin(job_id="test-job-2")
-    self._launch(plugin)
-
-    job_specs = self._extract_job_specs(plugin, "test-job-2")
-    self.assertIsNotNone(job_specs)
-
-    # These static config fields must NOT be in CStore
-    removed_fields = [
-      "exceptions", "distribution_strategy", "enabled_features",
-      "excluded_features", "scan_min_delay", "scan_max_delay",
-      "ics_safe_mode", "redact_credentials", "scanner_identity",
-      "scanner_user_agent", "nr_local_workers", "task_description",
-      "monitor_interval", "selected_peers", "created_by_name",
-      "created_by_id", "authorized", "port_order",
-    ]
-    for field in removed_fields:
-      self.assertNotIn(field, job_specs, f"CStore should not contain '{field}'")
-
-  def test_cstore_has_listing_fields(self):
-    """CStore has target, task_name, start_port, end_port, date_created."""
-    plugin = self._build_mock_plugin(job_id="test-job-3", time_val=1700000000.0)
-    self._launch(plugin, start_port=80, end_port=443, task_name="Web Scan")
-
-    job_specs = self._extract_job_specs(plugin, "test-job-3")
-    self.assertIsNotNone(job_specs)
-
-    self.assertEqual(job_specs["target"], "example.com")
-    self.assertEqual(job_specs["task_name"], "Web Scan")
-    self.assertEqual(job_specs["start_port"], 80)
-    self.assertEqual(job_specs["end_port"], 443)
-    self.assertEqual(job_specs["date_created"], 1700000000.0)
-    self.assertEqual(job_specs["risk_score"], 0)
-
-  def test_pass_reports_initialized_empty(self):
-    """CStore has pass_reports: [] (no pass_history)."""
-    plugin = self._build_mock_plugin(job_id="test-job-4")
-    self._launch(plugin, start_port=1, end_port=100)
-
-    job_specs = self._extract_job_specs(plugin, "test-job-4")
-    self.assertIsNotNone(job_specs)
-
-    self.assertIn("pass_reports", job_specs)
-    self.assertEqual(job_specs["pass_reports"], [])
-    self.assertNotIn("pass_history", job_specs)
-
-  def test_launch_fails_if_r1fs_unavailable(self):
-    """If R1FS fails to store config, launch aborts with error."""
-    plugin = self._build_mock_plugin(job_id="test-job-5", r1fs_cid=None)
-    result = self._launch(plugin, start_port=1, end_port=100)
-
-    self.assertIn("error", result)
-    # CStore should NOT have been written with the job
-    job_specs = self._extract_job_specs(plugin, "test-job-5")
-    self.assertIsNone(job_specs)
-
-
-class TestPhase2PassFinalization(unittest.TestCase):
-  """Phase 2: Single Aggregation + Consolidated Pass Reports."""
-
-  @classmethod
-  def _mock_plugin_modules(cls):
-    """Install mock modules so pentester_api_01 can be imported without naeural_core."""
-    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
-      return
-    TestPhase1ConfigCID._mock_plugin_modules()
-
-  def _get_plugin_class(self):
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    return PentesterApi01Plugin
-
-  def _build_finalize_plugin(self, job_id="test-job", job_pass=1, run_mode="SINGLEPASS",
-                              llm_enabled=False, r1fs_returns=None):
-    """Build a mock plugin pre-configured for _maybe_finalize_pass testing."""
-    plugin = MagicMock()
-    plugin.ee_addr = "launcher-node"
-    plugin.ee_id = "launcher-alias"
-    plugin.cfg_instance_id = "test-instance"
-    plugin.cfg_llm_agent_api_enabled = llm_enabled
-    plugin.cfg_llm_agent_api_host = "localhost"
-    plugin.cfg_llm_agent_api_port = 8080
-    plugin.cfg_llm_agent_api_timeout = 30
-    plugin.cfg_llm_auto_analysis_type = "security_assessment"
-    plugin.cfg_monitor_interval = 60
-    plugin.cfg_monitor_jitter = 0
-    plugin.cfg_attestation_min_seconds_between_submits = 300
-    plugin.time.return_value = 1000100.0
-    plugin.json_dumps.return_value = "{}"
-
-    # R1FS mock
-    plugin.r1fs = MagicMock()
-    cid_counter = {"n": 0}
-    def fake_add_json(data, show_logs=True):
-      cid_counter["n"] += 1
-      if r1fs_returns is not None:
-        return r1fs_returns.get(cid_counter["n"], f"QmCID{cid_counter['n']}")
-      return f"QmCID{cid_counter['n']}"
-    plugin.r1fs.add_json.side_effect = fake_add_json
-
-    # Job config in R1FS
-    plugin.r1fs.get_json.return_value = {
-      "target": "example.com", "start_port": 1, "end_port": 1024,
-      "run_mode": run_mode, "enabled_features": [], "monitor_interval": 60,
-    }
-
-    # Build job_specs with two finished workers
-    job_specs = {
-      "job_id": job_id,
-      "job_status": "RUNNING",
-      "job_pass": job_pass,
-      "run_mode": run_mode,
-      "launcher": "launcher-node",
-      "launcher_alias": "launcher-alias",
-      "target": "example.com",
-      "task_name": "Test",
-      "start_port": 1,
-      "end_port": 1024,
-      "date_created": 1000000.0,
-      "risk_score": 0,
-      "job_config_cid": "QmConfigCID",
-      "workers": {
-        "worker-A": {"start_port": 1, "end_port": 512, "finished": True, "report_cid": "QmReportA"},
-        "worker-B": {"start_port": 513, "end_port": 1024, "finished": True, "report_cid": "QmReportB"},
-      },
-      "timeline": [{"type": "created", "label": "Created", "date": 1000000.0, "actor": "launcher-alias", "actor_type": "system", "meta": {}}],
-      "pass_reports": [],
-    }
-
-    plugin.chainstore_hgetall.return_value = {job_id: job_specs}
-    plugin.chainstore_hset = MagicMock()
-
-    return plugin, job_specs
-
-  def _sample_node_report(self, start_port=1, end_port=512, open_ports=None, findings=None):
-    """Build a sample node report dict."""
-    report = {
-      "start_port": start_port,
-      "end_port": end_port,
-      "open_ports": open_ports or [80, 443],
-      "ports_scanned": end_port - start_port + 1,
-      "nr_open_ports": len(open_ports or [80, 443]),
-      "service_info": {},
-      "web_tests_info": {},
-      "completed_tests": ["port_scan"],
-      "port_protocols": {"80": "http", "443": "https"},
-      "port_banners": {},
-      "correlation_findings": [],
-    }
-    if findings:
-      # Add findings under service_info for port 80
-      report["service_info"] = {
-        "80": {
-          "_service_info_http": {
-            "findings": findings,
-          }
-        }
-      }
-    return report
-
-  def test_single_aggregation(self):
-    """_collect_node_reports called exactly once per pass finalization."""
-    PentesterApi01Plugin = self._get_plugin_class()
-    plugin, job_specs = self._build_finalize_plugin()
-
-    # Mock _collect_node_reports and _get_aggregated_report
-    report_a = self._sample_node_report(1, 512, [80])
-    report_b = self._sample_node_report(513, 1024, [443])
-    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a, "worker-B": report_b})
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80, 443], "service_info": {}, "web_tests_info": {},
-      "completed_tests": ["port_scan"], "ports_scanned": 1024,
-      "nr_open_ports": 2, "port_protocols": {"80": "http", "443": "https"},
-    })
-    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
-    plugin._get_job_config = MagicMock(return_value={"target": "example.com", "monitor_interval": 60})
-    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 25, "breakdown": {}}, []))
-    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
-    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
-    plugin._emit_timeline_event = MagicMock()
-
-    PentesterApi01Plugin._maybe_finalize_pass(plugin)
-
-    # _collect_node_reports called exactly once
-    plugin._collect_node_reports.assert_called_once()
-
-  def test_pass_report_cid_in_r1fs(self):
-    """PassReport stored in R1FS with correct fields."""
-    PentesterApi01Plugin = self._get_plugin_class()
-    plugin, job_specs = self._build_finalize_plugin()
-
-    report_a = self._sample_node_report(1, 512, [80])
-    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80], "service_info": {}, "web_tests_info": {},
-      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
-      "port_protocols": {"80": "http"},
-    })
-    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
-    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
-    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {"findings_score": 5}}, []))
-    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
-    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
-    plugin._emit_timeline_event = MagicMock()
-
-    PentesterApi01Plugin._maybe_finalize_pass(plugin)
-
-    # r1fs.add_json called twice: once for aggregated data, once for PassReport
-    self.assertEqual(plugin.r1fs.add_json.call_count, 2)
-
-    # Second call is the PassReport
-    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
-    self.assertEqual(pass_report_dict["pass_nr"], 1)
-    self.assertIn("aggregated_report_cid", pass_report_dict)
-    self.assertIn("worker_reports", pass_report_dict)
-    self.assertEqual(pass_report_dict["risk_score"], 10)
-    self.assertIn("risk_breakdown", pass_report_dict)
-    self.assertIn("date_started", pass_report_dict)
-    self.assertIn("date_completed", pass_report_dict)
-
-  def test_aggregated_report_separate_cid(self):
-    """aggregated_report_cid is a separate R1FS write from the PassReport."""
-    PentesterApi01Plugin = self._get_plugin_class()
-    plugin, job_specs = self._build_finalize_plugin(r1fs_returns={1: "QmAggCID", 2: "QmPassCID"})
-
-    report_a = self._sample_node_report(1, 512, [80])
-    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80], "service_info": {}, "web_tests_info": {},
-      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
-      "port_protocols": {},
-    })
-    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
-    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
-    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
-    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
-    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
-    plugin._emit_timeline_event = MagicMock()
-
-    PentesterApi01Plugin._maybe_finalize_pass(plugin)
-
-    # First R1FS write = aggregated data, second = PassReport
-    agg_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
-    pass_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
-
-    # The PassReport references the aggregated CID
-    self.assertEqual(pass_dict["aggregated_report_cid"], "QmAggCID")
-
-    # Aggregated data should have open_ports (from AggregatedScanData)
-    self.assertIn("open_ports", agg_dict)
-
-  def test_finding_id_deterministic(self):
-    """Same input produces same finding_id; different title produces different id."""
-    PentesterApi01Plugin = self._get_plugin_class()
-
-    aggregated = {
-      "open_ports": [80], "ports_scanned": 100, "nr_open_ports": 1,
-      "port_protocols": {"80": "http"},
-      "service_info": {
-        "80": {
-          "_service_info_http": {
-            "findings": [
-              {"title": "SQL Injection", "severity": "HIGH", "cwe_id": "CWE-89", "confidence": "firm"},
-            ]
-          }
-        }
-      },
-      "web_tests_info": {},
-      "correlation_findings": [],
-    }
-
-    risk1, findings1 = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
-    risk2, findings2 = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
-
-    self.assertEqual(findings1[0]["finding_id"], findings2[0]["finding_id"])
-
-    # Different title → different finding_id
-    aggregated2 = {
-      "open_ports": [80], "ports_scanned": 100, "nr_open_ports": 1,
-      "port_protocols": {"80": "http"},
-      "service_info": {
-        "80": {
-          "_service_info_http": {
-            "findings": [
-              {"title": "XSS Vulnerability", "severity": "HIGH", "cwe_id": "CWE-79", "confidence": "firm"},
-            ]
-          }
-        }
-      },
-      "web_tests_info": {},
-      "correlation_findings": [],
-    }
-    _, findings3 = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated2)
-    self.assertNotEqual(findings1[0]["finding_id"], findings3[0]["finding_id"])
-
-  def test_finding_id_cwe_collision(self):
-    """Same CWE, different title, same port+probe → different finding_ids."""
-    PentesterApi01Plugin = self._get_plugin_class()
-
-    aggregated = {
-      "open_ports": [80], "ports_scanned": 100, "nr_open_ports": 1,
-      "port_protocols": {"80": "http"},
-      "service_info": {
-        "80": {
-          "_web_test_xss": {
-            "findings": [
-              {"title": "Reflected XSS in search", "severity": "HIGH", "cwe_id": "CWE-79", "confidence": "certain"},
-              {"title": "Stored XSS in comment", "severity": "HIGH", "cwe_id": "CWE-79", "confidence": "certain"},
-            ]
-          }
-        }
-      },
-      "web_tests_info": {},
-      "correlation_findings": [],
-    }
-
-    _, findings = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
-    self.assertEqual(len(findings), 2)
-    self.assertNotEqual(findings[0]["finding_id"], findings[1]["finding_id"])
-
-  def test_finding_enrichment_fields(self):
-    """Each finding has finding_id, port, protocol, probe, category."""
-    PentesterApi01Plugin = self._get_plugin_class()
-
-    aggregated = {
-      "open_ports": [443], "ports_scanned": 100, "nr_open_ports": 1,
-      "port_protocols": {"443": "https"},
-      "service_info": {
-        "443": {
-          "_service_info_ssl": {
-            "findings": [
-              {"title": "Weak TLS", "severity": "MEDIUM", "cwe_id": "CWE-326", "confidence": "certain"},
-            ]
-          }
-        }
-      },
-      "web_tests_info": {},
-      "correlation_findings": [],
-    }
-
-    _, findings = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
-    self.assertEqual(len(findings), 1)
-    f = findings[0]
-    self.assertIn("finding_id", f)
-    self.assertEqual(len(f["finding_id"]), 16)  # 16-char hex
-    self.assertEqual(f["port"], 443)
-    self.assertEqual(f["protocol"], "https")
-    self.assertEqual(f["probe"], "_service_info_ssl")
-    self.assertEqual(f["category"], "service")
-
-  def test_port_protocols_none(self):
-    """port_protocols is None → protocol defaults to 'unknown' (no crash)."""
-    PentesterApi01Plugin = self._get_plugin_class()
-
-    aggregated = {
-      "open_ports": [22], "ports_scanned": 100, "nr_open_ports": 1,
-      "port_protocols": None,
-      "service_info": {
-        "22": {
-          "_service_info_ssh": {
-            "findings": [
-              {"title": "Weak SSH key", "severity": "LOW", "cwe_id": "CWE-320", "confidence": "firm"},
-            ]
-          }
-        }
-      },
-      "web_tests_info": {},
-      "correlation_findings": [],
-    }
-
-    _, findings = PentesterApi01Plugin._compute_risk_and_findings(None, aggregated)
-    self.assertEqual(len(findings), 1)
-    self.assertEqual(findings[0]["protocol"], "unknown")
-
-  def test_llm_success_no_llm_failed(self):
-    """LLM succeeds → llm_failed absent from serialized PassReport."""
-    from extensions.business.cybersec.red_mesh.models import PassReport
-
-    pr = PassReport(
-      pass_nr=1, date_started=1000.0, date_completed=1100.0, duration=100.0,
-      aggregated_report_cid="QmAgg",
-      worker_reports={},
-      risk_score=50,
-      llm_analysis="# Analysis\nAll good.",
-      quick_summary="No critical issues found.",
-      llm_failed=None,  # success
-    )
-    d = pr.to_dict()
-    self.assertNotIn("llm_failed", d)
-    self.assertEqual(d["llm_analysis"], "# Analysis\nAll good.")
-
-  def test_llm_failure_flag_and_timeline(self):
-    """LLM fails → llm_failed: True, timeline event added."""
-    PentesterApi01Plugin = self._get_plugin_class()
-    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
-
-    report_a = self._sample_node_report(1, 512, [80])
-    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80], "service_info": {}, "web_tests_info": {},
-      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
-      "port_protocols": {},
-    })
-    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
-    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
-    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {}}, []))
-    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
-    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
-    plugin._emit_timeline_event = MagicMock()
-
-    # LLM returns None (failure)
-    plugin._run_aggregated_llm_analysis = MagicMock(return_value=None)
-    plugin._run_quick_summary_analysis = MagicMock(return_value=None)
-
-    PentesterApi01Plugin._maybe_finalize_pass(plugin)
-
-    # Check PassReport has llm_failed=True
-    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
-    self.assertTrue(pass_report_dict.get("llm_failed"))
-
-    # Check timeline event was emitted for llm_failed
-    llm_failed_calls = [
-      c for c in plugin._emit_timeline_event.call_args_list
-      if c[0][1] == "llm_failed"
-    ]
-    self.assertEqual(len(llm_failed_calls), 1)
-    # _emit_timeline_event(job_specs, "llm_failed", label, meta={"pass_nr": ...})
-    call_kwargs = llm_failed_calls[0][1]  # keyword args
-    meta = call_kwargs.get("meta", {})
-    self.assertIn("pass_nr", meta)
-
-  def test_aggregated_report_write_failure(self):
-    """R1FS fails for aggregated → pass finalization skipped, no partial state."""
-    PentesterApi01Plugin = self._get_plugin_class()
-    # First R1FS write (aggregated) returns None = failure
-    plugin, job_specs = self._build_finalize_plugin(r1fs_returns={1: None, 2: "QmPassCID"})
-
-    report_a = self._sample_node_report(1, 512, [80])
-    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80], "service_info": {}, "web_tests_info": {},
-      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
-      "port_protocols": {},
-    })
-    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
-    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
-    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
-    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
-    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
-    plugin._emit_timeline_event = MagicMock()
-
-    PentesterApi01Plugin._maybe_finalize_pass(plugin)
-
-    # CStore should NOT have pass_reports appended
-    self.assertEqual(len(job_specs["pass_reports"]), 0)
-    # CStore hset was called for intermediate status updates (COLLECTING, ANALYZING, FINALIZING)
-    # but NOT for finalization — verify job_status is NOT FINALIZED in the last write
-    for call_args in plugin.chainstore_hset.call_args_list:
-      value = call_args.kwargs.get("value") or call_args[1].get("value") if len(call_args) > 1 else None
-      if isinstance(value, dict):
-        self.assertNotEqual(value.get("job_status"), "FINALIZED")
-
-  def test_pass_report_write_failure(self):
-    """R1FS fails for pass report → CStore pass_reports not appended."""
-    PentesterApi01Plugin = self._get_plugin_class()
-    # First R1FS write (aggregated) succeeds, second (pass report) fails
-    plugin, job_specs = self._build_finalize_plugin(r1fs_returns={1: "QmAggCID", 2: None})
-
-    report_a = self._sample_node_report(1, 512, [80])
-    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80], "service_info": {}, "web_tests_info": {},
-      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
-      "port_protocols": {},
-    })
-    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
-    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
-    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
-    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
-    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
-    plugin._emit_timeline_event = MagicMock()
-
-    PentesterApi01Plugin._maybe_finalize_pass(plugin)
-
-    # CStore should NOT have pass_reports appended
-    self.assertEqual(len(job_specs["pass_reports"]), 0)
-    # CStore hset was called for status updates but NOT for finalization
-    for call_args in plugin.chainstore_hset.call_args_list:
-      value = call_args.kwargs.get("value") or call_args[1].get("value") if len(call_args) > 1 else None
-      if isinstance(value, dict):
-        self.assertNotEqual(value.get("job_status"), "FINALIZED")
-
-  def test_cstore_risk_score_updated(self):
-    """After pass, risk_score on CStore matches pass result."""
-    PentesterApi01Plugin = self._get_plugin_class()
-    plugin, job_specs = self._build_finalize_plugin()
-
-    report_a = self._sample_node_report(1, 512, [80])
-    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80], "service_info": {}, "web_tests_info": {},
-      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
-      "port_protocols": {},
-    })
-    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
-    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
-    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 42, "breakdown": {"findings_score": 30}}, []))
-    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
-    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
-    plugin._emit_timeline_event = MagicMock()
-
-    PentesterApi01Plugin._maybe_finalize_pass(plugin)
-
-    # CStore risk_score updated
-    self.assertEqual(job_specs["risk_score"], 42)
-
-    # PassReportRef in pass_reports has same risk_score
-    self.assertEqual(len(job_specs["pass_reports"]), 1)
-    ref = job_specs["pass_reports"][0]
-    self.assertEqual(ref["risk_score"], 42)
-    self.assertIn("report_cid", ref)
-    self.assertEqual(ref["pass_nr"], 1)
-
-
-class TestPhase4UiAggregate(unittest.TestCase):
-  """Phase 4: UI Aggregate Computation."""
-
-  @classmethod
-  def _mock_plugin_modules(cls):
-    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
-      return
-    TestPhase1ConfigCID._mock_plugin_modules()
-
-  def _get_plugin_class(self):
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    return PentesterApi01Plugin
-
-  def _make_plugin(self):
-    plugin = MagicMock()
-    Plugin = self._get_plugin_class()
-    plugin._count_services = lambda si: Plugin._count_services(plugin, si)
-    plugin._compute_ui_aggregate = lambda passes, agg: Plugin._compute_ui_aggregate(plugin, passes, agg)
-    plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
-    plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
-    return plugin, Plugin
-
-  def _make_finding(self, severity="HIGH", confidence="firm", finding_id="abc123", title="Test"):
-    return {"finding_id": finding_id, "severity": severity, "confidence": confidence, "title": title}
-
-  def _make_pass(self, pass_nr=1, findings=None, risk_score=0, worker_reports=None):
-    return {
-      "pass_nr": pass_nr,
-      "risk_score": risk_score,
-      "risk_breakdown": {"findings_score": 10},
-      "quick_summary": "Summary text",
-      "findings": findings,
-      "worker_reports": worker_reports or {
-        "w1": {"start_port": 1, "end_port": 512, "open_ports": [80]},
-      },
-    }
-
-  def _make_aggregated(self, open_ports=None, service_info=None):
-    return {
-      "open_ports": open_ports or [80, 443],
-      "service_info": service_info or {
-        "80": {"_service_info_http": {"findings": []}},
-        "443": {"_service_info_https": {"findings": []}},
-      },
-    }
-
-  def test_findings_count_uppercase_keys(self):
-    """findings_count keys are UPPERCASE."""
-    plugin, _ = self._make_plugin()
-    findings = [
-      self._make_finding(severity="CRITICAL", finding_id="f1"),
-      self._make_finding(severity="HIGH", finding_id="f2"),
-      self._make_finding(severity="HIGH", finding_id="f3"),
-      self._make_finding(severity="MEDIUM", finding_id="f4"),
-    ]
-    p = self._make_pass(findings=findings)
-    agg = self._make_aggregated()
-    result = plugin._compute_ui_aggregate([p], agg)
-    fc = result.to_dict()["findings_count"]
-    self.assertEqual(fc["CRITICAL"], 1)
-    self.assertEqual(fc["HIGH"], 2)
-    self.assertEqual(fc["MEDIUM"], 1)
-    for key in fc:
-      self.assertEqual(key, key.upper())
-
-  def test_top_findings_max_10(self):
-    """More than 10 CRITICAL+HIGH -> capped at 10."""
-    plugin, _ = self._make_plugin()
-    findings = [self._make_finding(severity="CRITICAL", finding_id=f"f{i}") for i in range(15)]
-    p = self._make_pass(findings=findings)
-    agg = self._make_aggregated()
-    result = plugin._compute_ui_aggregate([p], agg)
-    self.assertEqual(len(result.to_dict()["top_findings"]), 10)
-
-  def test_top_findings_sorted(self):
-    """CRITICAL before HIGH, within same severity sorted by confidence."""
-    plugin, _ = self._make_plugin()
-    findings = [
-      self._make_finding(severity="HIGH", confidence="certain", finding_id="f1", title="H-certain"),
-      self._make_finding(severity="CRITICAL", confidence="tentative", finding_id="f2", title="C-tentative"),
-      self._make_finding(severity="HIGH", confidence="tentative", finding_id="f3", title="H-tentative"),
-      self._make_finding(severity="CRITICAL", confidence="certain", finding_id="f4", title="C-certain"),
-    ]
-    p = self._make_pass(findings=findings)
-    agg = self._make_aggregated()
-    result = plugin._compute_ui_aggregate([p], agg)
-    top = result.to_dict()["top_findings"]
-    self.assertEqual(top[0]["title"], "C-certain")
-    self.assertEqual(top[1]["title"], "C-tentative")
-    self.assertEqual(top[2]["title"], "H-certain")
-    self.assertEqual(top[3]["title"], "H-tentative")
-
-  def test_top_findings_excludes_medium(self):
-    """MEDIUM/LOW/INFO findings never in top_findings."""
-    plugin, _ = self._make_plugin()
-    findings = [
-      self._make_finding(severity="MEDIUM", finding_id="f1"),
-      self._make_finding(severity="LOW", finding_id="f2"),
-      self._make_finding(severity="INFO", finding_id="f3"),
-    ]
-    p = self._make_pass(findings=findings)
-    agg = self._make_aggregated()
-    result = plugin._compute_ui_aggregate([p], agg)
-    d = result.to_dict()
-    self.assertNotIn("top_findings", d)  # stripped by _strip_none (None)
-
-  def test_finding_timeline_single_pass(self):
-    """1 pass -> finding_timeline is None (stripped)."""
-    plugin, _ = self._make_plugin()
-    p = self._make_pass(findings=[])
-    agg = self._make_aggregated()
-    result = plugin._compute_ui_aggregate([p], agg)
-    d = result.to_dict()
-    self.assertNotIn("finding_timeline", d)  # None → stripped
-
-  def test_finding_timeline_multi_pass(self):
-    """3 passes with overlapping findings -> correct first_seen, last_seen, pass_count."""
-    plugin, _ = self._make_plugin()
-    f_persistent = self._make_finding(finding_id="persist1")
-    f_transient = self._make_finding(finding_id="transient1")
-    f_new = self._make_finding(finding_id="new1")
-    passes = [
-      self._make_pass(pass_nr=1, findings=[f_persistent, f_transient]),
-      self._make_pass(pass_nr=2, findings=[f_persistent]),
-      self._make_pass(pass_nr=3, findings=[f_persistent, f_new]),
-    ]
-    agg = self._make_aggregated()
-    result = plugin._compute_ui_aggregate(passes, agg)
-    ft = result.to_dict()["finding_timeline"]
-    self.assertEqual(ft["persist1"]["first_seen"], 1)
-    self.assertEqual(ft["persist1"]["last_seen"], 3)
-    self.assertEqual(ft["persist1"]["pass_count"], 3)
-    self.assertEqual(ft["transient1"]["first_seen"], 1)
-    self.assertEqual(ft["transient1"]["last_seen"], 1)
-    self.assertEqual(ft["transient1"]["pass_count"], 1)
-    self.assertEqual(ft["new1"]["first_seen"], 3)
-    self.assertEqual(ft["new1"]["last_seen"], 3)
-    self.assertEqual(ft["new1"]["pass_count"], 1)
-
-  def test_zero_findings(self):
-    """findings_count is {}, top_findings is [], total_findings is 0."""
-    plugin, _ = self._make_plugin()
-    p = self._make_pass(findings=[])
-    agg = self._make_aggregated()
-    result = plugin._compute_ui_aggregate([p], agg)
-    d = result.to_dict()
-    self.assertEqual(d["total_findings"], 0)
-    # findings_count and top_findings are None (stripped) when empty
-    self.assertNotIn("findings_count", d)
-    self.assertNotIn("top_findings", d)
-
-  def test_open_ports_sorted_unique(self):
-    """total_open_ports is deduped and sorted."""
-    plugin, _ = self._make_plugin()
-    p = self._make_pass(findings=[])
-    agg = self._make_aggregated(open_ports=[443, 80, 443, 22, 80])
-    result = plugin._compute_ui_aggregate([p], agg)
-    self.assertEqual(result.to_dict()["total_open_ports"], [22, 80, 443])
-
-  def test_count_services(self):
-    """_count_services counts ports with at least one detected service."""
-    plugin, _ = self._make_plugin()
-    service_info = {
-      "80": {"_service_info_http": {}, "_web_test_xss": {}},
-      "443": {"_service_info_https": {}, "_service_info_http": {}},
-    }
-    self.assertEqual(plugin._count_services(service_info), 2)
-    self.assertEqual(plugin._count_services({}), 0)
-    self.assertEqual(plugin._count_services(None), 0)
-
-
-class TestPhase3Archive(unittest.TestCase):
-  """Phase 3: Job Close & Archive."""
-
-  @classmethod
-  def _mock_plugin_modules(cls):
-    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
-      return
-    TestPhase1ConfigCID._mock_plugin_modules()
-
-  def _get_plugin_class(self):
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    return PentesterApi01Plugin
-
-  def _build_archive_plugin(self, job_id="test-job", pass_count=1, run_mode="SINGLEPASS",
-                              job_status="FINALIZED", r1fs_write_fail=False, r1fs_verify_fail=False):
-    """Build a mock plugin pre-configured for _build_job_archive testing."""
-    plugin = MagicMock()
-    plugin.ee_addr = "launcher-node"
-    plugin.ee_id = "launcher-alias"
-    plugin.cfg_instance_id = "test-instance"
-    plugin.time.return_value = 1000200.0
-    plugin.json_dumps.return_value = "{}"
-
-    # R1FS mock
-    plugin.r1fs = MagicMock()
-
-    # Build pass report dicts and refs
-    pass_reports_data = []
-    pass_report_refs = []
-    for i in range(1, pass_count + 1):
-      pr = {
-        "pass_nr": i,
-        "date_started": 1000000.0 + (i - 1) * 100,
-        "date_completed": 1000000.0 + i * 100,
-        "duration": 100.0,
-        "aggregated_report_cid": f"QmAgg{i}",
-        "worker_reports": {
-          "worker-A": {"report_cid": f"QmWorker{i}A", "start_port": 1, "end_port": 512, "ports_scanned": 512, "open_ports": [80], "nr_findings": 2},
-        },
-        "risk_score": 25 + i,
-        "risk_breakdown": {"findings_score": 10},
-        "findings": [
-          {"finding_id": f"f{i}a", "severity": "HIGH", "confidence": "firm", "title": f"Finding {i}A"},
-          {"finding_id": f"f{i}b", "severity": "MEDIUM", "confidence": "firm", "title": f"Finding {i}B"},
-        ],
-        "quick_summary": f"Summary for pass {i}",
-      }
-      pass_reports_data.append(pr)
-      pass_report_refs.append({"pass_nr": i, "report_cid": f"QmPassReport{i}", "risk_score": 25 + i})
-
-    # Job config
-    job_config = {
-      "target": "example.com", "start_port": 1, "end_port": 1024,
-      "run_mode": run_mode, "enabled_features": [],
-    }
-
-    # Latest aggregated data
-    latest_aggregated = {
-      "open_ports": [80, 443], "service_info": {"80": {"_service_info_http": {}}},
-      "web_tests_info": {}, "completed_tests": ["port_scan"], "ports_scanned": 1024,
-    }
-
-    # R1FS get_json: return the right data for each CID
-    cid_map = {"QmConfigCID": job_config}
-    for i, pr in enumerate(pass_reports_data):
-      cid_map[f"QmPassReport{i+1}"] = pr
-      cid_map[f"QmAgg{i+1}"] = latest_aggregated
-
-    if r1fs_write_fail:
-      plugin.r1fs.add_json.return_value = None
-    else:
-      archive_cid = "QmArchiveCID"
-      plugin.r1fs.add_json.return_value = archive_cid
-      if r1fs_verify_fail:
-        # add_json succeeds but get_json for the archive CID returns None
-        orig_map = dict(cid_map)
-        def verify_fail_get(cid):
-          if cid == archive_cid:
-            return None
-          return orig_map.get(cid)
-        plugin.r1fs.get_json.side_effect = verify_fail_get
-      else:
-        # Verification succeeds — archive CID also returns data
-        cid_map[archive_cid] = {"job_id": job_id}  # minimal archive for verification
-        plugin.r1fs.get_json.side_effect = lambda cid: cid_map.get(cid)
-
-    if not r1fs_write_fail and not r1fs_verify_fail:
-      plugin.r1fs.get_json.side_effect = lambda cid: cid_map.get(cid)
-
-    # Job specs (running state)
-    job_specs = {
-      "job_id": job_id,
-      "job_status": job_status,
-      "job_pass": pass_count,
-      "run_mode": run_mode,
-      "launcher": "launcher-node",
-      "launcher_alias": "launcher-alias",
-      "target": "example.com",
-      "task_name": "Test",
-      "start_port": 1,
-      "end_port": 1024,
-      "date_created": 1000000.0,
-      "risk_score": 25 + pass_count,
-      "job_config_cid": "QmConfigCID",
-      "workers": {
-        "worker-A": {"start_port": 1, "end_port": 512, "finished": True, "report_cid": "QmReportA"},
-      },
-      "timeline": [
-        {"type": "created", "label": "Created", "date": 1000000.0, "actor": "launcher-alias", "actor_type": "system", "meta": {}},
-      ],
-      "pass_reports": pass_report_refs,
-    }
-
-    plugin.chainstore_hset = MagicMock()
-
-    # Bind real methods for archive building
-    Plugin = self._get_plugin_class()
-    plugin._compute_ui_aggregate = lambda passes, agg: Plugin._compute_ui_aggregate(plugin, passes, agg)
-    plugin._count_services = lambda si: Plugin._count_services(plugin, si)
-    plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
-    plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
-
-    return plugin, job_specs, pass_reports_data, job_config
-
-  def test_archive_written_to_r1fs(self):
-    """Archive stored in R1FS with job_id, job_config, passes, ui_aggregate."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, job_config = self._build_archive_plugin()
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    # r1fs.add_json called with archive dict
-    self.assertTrue(plugin.r1fs.add_json.called)
-    archive_dict = plugin.r1fs.add_json.call_args[0][0]
-    self.assertEqual(archive_dict["job_id"], "test-job")
-    self.assertEqual(archive_dict["job_config"]["target"], "example.com")
-    self.assertEqual(len(archive_dict["passes"]), 1)
-    self.assertIn("ui_aggregate", archive_dict)
-    self.assertIn("total_open_ports", archive_dict["ui_aggregate"])
-
-  def test_archive_duration_computed(self):
-    """duration == date_completed - date_created, not 0."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin()
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    archive_dict = plugin.r1fs.add_json.call_args[0][0]
-    # date_created=1000000, time()=1000200 → duration=200
-    self.assertEqual(archive_dict["duration"], 200.0)
-    self.assertGreater(archive_dict["duration"], 0)
-
-  def test_stub_has_job_cid_and_config_cid(self):
-    """After prune, CStore stub has job_cid and job_config_cid."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin()
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    # Extract the stub written to CStore
-    hset_call = plugin.chainstore_hset.call_args
-    stub = hset_call[1]["value"]
-    self.assertEqual(stub["job_cid"], "QmArchiveCID")
-    self.assertEqual(stub["job_config_cid"], "QmConfigCID")
-
-  def test_stub_fields_match_model(self):
-    """Stub has exactly CStoreJobFinalized fields."""
-    from extensions.business.cybersec.red_mesh.models import CStoreJobFinalized
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin()
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    stub = plugin.chainstore_hset.call_args[1]["value"]
-    # Verify it can be loaded into CStoreJobFinalized
-    finalized = CStoreJobFinalized.from_dict(stub)
-    self.assertEqual(finalized.job_id, "test-job")
-    self.assertEqual(finalized.job_status, "FINALIZED")
-    self.assertEqual(finalized.target, "example.com")
-    self.assertEqual(finalized.pass_count, 1)
-    self.assertEqual(finalized.worker_count, 1)
-    self.assertEqual(finalized.start_port, 1)
-    self.assertEqual(finalized.end_port, 1024)
-    self.assertGreater(finalized.duration, 0)
-
-  def test_pass_report_cids_cleaned_up(self):
-    """After archive, individual pass CIDs deleted from R1FS."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin()
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    # Check delete_file was called for pass report CID
-    delete_calls = [c[0][0] for c in plugin.r1fs.delete_file.call_args_list]
-    self.assertIn("QmPassReport1", delete_calls)
-
-  def test_node_report_cids_preserved(self):
-    """Worker report CIDs NOT deleted."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin()
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    delete_calls = [c[0][0] for c in plugin.r1fs.delete_file.call_args_list]
-    self.assertNotIn("QmWorker1A", delete_calls)
-
-  def test_aggregated_report_cids_preserved(self):
-    """aggregated_report_cid per pass NOT deleted."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin()
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    delete_calls = [c[0][0] for c in plugin.r1fs.delete_file.call_args_list]
-    self.assertNotIn("QmAgg1", delete_calls)
-
-  def test_archive_write_failure_no_prune(self):
-    """R1FS write fails -> CStore untouched, full running state retained."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin(r1fs_write_fail=True)
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    # CStore should NOT have been pruned
-    plugin.chainstore_hset.assert_not_called()
-    # pass_reports still present in job_specs
-    self.assertEqual(len(job_specs["pass_reports"]), 1)
-
-  def test_archive_verify_failure_no_prune(self):
-    """CID not retrievable -> CStore untouched."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin(r1fs_verify_fail=True)
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    plugin.chainstore_hset.assert_not_called()
-
-  def test_stuck_recovery(self):
-    """FINALIZED without job_cid -> _build_job_archive retried via _maybe_finalize_pass."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin(job_status="FINALIZED")
-    # Simulate stuck state: FINALIZED but no job_cid
-    job_specs["job_status"] = "FINALIZED"
-    # No job_cid in specs
-
-    plugin.chainstore_hgetall.return_value = {"test-job": job_specs}
-    plugin._normalize_job_record = MagicMock(return_value=("test-job", job_specs))
-    plugin._build_job_archive = MagicMock()
-
-    Plugin._maybe_finalize_pass(plugin)
-
-    plugin._build_job_archive.assert_called_once_with("test-job", job_specs)
-
-  def test_idempotent_rebuild(self):
-    """Calling _build_job_archive twice doesn't corrupt state."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin()
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-    first_stub = plugin.chainstore_hset.call_args[1]["value"]
-
-    # Reset and call again (simulating a retry where data is still available)
-    plugin.chainstore_hset.reset_mock()
-    plugin.r1fs.add_json.reset_mock()
-    new_archive_cid = "QmArchiveCID2"
-    plugin.r1fs.add_json.return_value = new_archive_cid
-
-    # Update get_json to also return data for the new archive CID
-    orig_side_effect = plugin.r1fs.get_json.side_effect
-    def extended_get(cid):
-      if cid == new_archive_cid:
-        return {"job_id": "test-job"}
-      return orig_side_effect(cid)
-    plugin.r1fs.get_json.side_effect = extended_get
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    second_stub = plugin.chainstore_hset.call_args[1]["value"]
-    # Both produce valid stubs
-    self.assertEqual(first_stub["job_id"], second_stub["job_id"])
-    self.assertEqual(first_stub["pass_count"], second_stub["pass_count"])
-
-  def test_multipass_archive(self):
-    """Archive with 3 passes contains all pass data."""
-    Plugin = self._get_plugin_class()
-    plugin, job_specs, _, _ = self._build_archive_plugin(pass_count=3, run_mode="CONTINUOUS_MONITORING", job_status="STOPPED")
-
-    Plugin._build_job_archive(plugin, "test-job", job_specs)
-
-    archive_dict = plugin.r1fs.add_json.call_args[0][0]
-    self.assertEqual(len(archive_dict["passes"]), 3)
-    self.assertEqual(archive_dict["passes"][0]["pass_nr"], 1)
-    self.assertEqual(archive_dict["passes"][2]["pass_nr"], 3)
-    stub = plugin.chainstore_hset.call_args[1]["value"]
-    self.assertEqual(stub["pass_count"], 3)
-    self.assertEqual(stub["job_status"], "STOPPED")
-
-
-class TestPhase5Endpoints(unittest.TestCase):
-  """Phase 5: API Endpoints."""
-
-  @classmethod
-  def _mock_plugin_modules(cls):
-    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
-      return
-    TestPhase1ConfigCID._mock_plugin_modules()
-
-  def _get_plugin_class(self):
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    return PentesterApi01Plugin
-
-  def _build_finalized_stub(self, job_id="test-job"):
-    """Build a CStoreJobFinalized-shaped dict."""
-    return {
-      "job_id": job_id,
-      "job_status": "FINALIZED",
-      "target": "example.com",
-      "task_name": "Test",
-      "risk_score": 42,
-      "run_mode": "SINGLEPASS",
-      "duration": 200.0,
-      "pass_count": 1,
-      "launcher": "launcher-node",
-      "launcher_alias": "launcher-alias",
-      "worker_count": 2,
-      "start_port": 1,
-      "end_port": 1024,
-      "date_created": 1000000.0,
-      "date_completed": 1000200.0,
-      "job_cid": "QmArchiveCID",
-      "job_config_cid": "QmConfigCID",
-    }
-
-  def _build_running_job(self, job_id="run-job", pass_count=8):
-    """Build a running job dict with N pass_reports."""
-    pass_reports = [
-      {"pass_nr": i, "report_cid": f"QmPass{i}", "risk_score": 10 + i}
-      for i in range(1, pass_count + 1)
-    ]
-    return {
-      "job_id": job_id,
-      "job_status": "RUNNING",
-      "job_pass": pass_count,
-      "run_mode": "CONTINUOUS_MONITORING",
-      "launcher": "launcher-node",
-      "launcher_alias": "launcher-alias",
-      "target": "example.com",
-      "task_name": "Continuous Test",
-      "start_port": 1,
-      "end_port": 1024,
-      "date_created": 1000000.0,
-      "risk_score": 18,
-      "job_config_cid": "QmConfigCID",
-      "workers": {
-        "worker-A": {"start_port": 1, "end_port": 512, "finished": False},
-        "worker-B": {"start_port": 513, "end_port": 1024, "finished": False},
-      },
-      "timeline": [
-        {"type": "created", "label": "Created", "date": 1000000.0, "actor": "launcher", "actor_type": "system", "meta": {}},
-        {"type": "started", "label": "Started", "date": 1000001.0, "actor": "launcher", "actor_type": "system", "meta": {}},
-      ],
-      "pass_reports": pass_reports,
-    }
-
-  def _build_plugin(self, jobs_dict):
-    """Build a mock plugin with given jobs in CStore."""
-    Plugin = self._get_plugin_class()
-    plugin = MagicMock()
-    plugin.ee_addr = "launcher-node"
-    plugin.ee_id = "launcher-alias"
-    plugin.cfg_instance_id = "test-instance"
-    plugin.r1fs = MagicMock()
-
-    plugin.chainstore_hgetall.return_value = dict(jobs_dict)
-    plugin.chainstore_hget.side_effect = lambda hkey, key: jobs_dict.get(key)
-    plugin._normalize_job_record = MagicMock(
-      side_effect=lambda k, v: (k, v) if isinstance(v, dict) and v.get("job_id") else (None, None)
-    )
-
-    # Bind real methods so endpoint logic executes properly
-    plugin._get_all_network_jobs = lambda: Plugin._get_all_network_jobs(plugin)
-    plugin._get_job_from_cstore = lambda job_id: Plugin._get_job_from_cstore(plugin, job_id)
-    return plugin
-
-  def test_get_job_archive_finalized(self):
-    """get_job_archive for finalized job returns archive with matching job_id."""
-    Plugin = self._get_plugin_class()
-    stub = self._build_finalized_stub("fin-job")
-    plugin = self._build_plugin({"fin-job": stub})
-
-    archive_data = {"job_id": "fin-job", "passes": [], "ui_aggregate": {}}
-    plugin.r1fs.get_json.return_value = archive_data
-
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
-    self.assertEqual(result["job_id"], "fin-job")
-    self.assertEqual(result["archive"]["job_id"], "fin-job")
-
-  def test_get_job_archive_running(self):
-    """get_job_archive for running job returns not_available error."""
-    Plugin = self._get_plugin_class()
-    running = self._build_running_job("run-job", pass_count=2)
-    plugin = self._build_plugin({"run-job": running})
-
-    result = Plugin.get_job_archive(plugin, job_id="run-job")
-    self.assertEqual(result["error"], "not_available")
-
-  def test_get_job_archive_integrity_mismatch(self):
-    """Corrupted job_cid pointing to wrong archive is rejected."""
-    Plugin = self._get_plugin_class()
-    stub = self._build_finalized_stub("fin-job")
-    plugin = self._build_plugin({"fin-job": stub})
-
-    # Archive has a different job_id
-    plugin.r1fs.get_json.return_value = {"job_id": "other-job", "passes": []}
-
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
-    self.assertEqual(result["error"], "integrity_mismatch")
-
-  def test_get_job_data_running_last_5(self):
-    """Running job with 8 passes returns last 5 refs only."""
-    Plugin = self._get_plugin_class()
-    running = self._build_running_job("run-job", pass_count=8)
-    plugin = self._build_plugin({"run-job": running})
-
-    result = Plugin.get_job_data(plugin, job_id="run-job")
-    self.assertTrue(result["found"])
-    refs = result["job"]["pass_reports"]
-    self.assertEqual(len(refs), 5)
-    # Should be the last 5 (pass_nr 4-8)
-    self.assertEqual(refs[0]["pass_nr"], 4)
-    self.assertEqual(refs[-1]["pass_nr"], 8)
-
-  def test_get_job_data_finalized_returns_stub(self):
-    """Finalized job returns stub as-is with job_cid."""
-    Plugin = self._get_plugin_class()
-    stub = self._build_finalized_stub("fin-job")
-    plugin = self._build_plugin({"fin-job": stub})
-
-    result = Plugin.get_job_data(plugin, job_id="fin-job")
-    self.assertTrue(result["found"])
-    self.assertEqual(result["job"]["job_cid"], "QmArchiveCID")
-    self.assertEqual(result["job"]["pass_count"], 1)
-
-  def test_list_jobs_finalized_as_is(self):
-    """Finalized stubs returned unmodified with all CStoreJobFinalized fields."""
-    Plugin = self._get_plugin_class()
-    stub = self._build_finalized_stub("fin-job")
-    plugin = self._build_plugin({"fin-job": stub})
-
-    result = Plugin.list_network_jobs(plugin)
-    self.assertIn("fin-job", result)
-    job = result["fin-job"]
-    self.assertEqual(job["job_cid"], "QmArchiveCID")
-    self.assertEqual(job["pass_count"], 1)
-    self.assertEqual(job["worker_count"], 2)
-    self.assertEqual(job["risk_score"], 42)
-    self.assertEqual(job["duration"], 200.0)
-
-  def test_list_jobs_running_stripped(self):
-    """Running jobs have counts but no timeline, workers, or pass_reports."""
-    Plugin = self._get_plugin_class()
-    running = self._build_running_job("run-job", pass_count=3)
-    plugin = self._build_plugin({"run-job": running})
-
-    result = Plugin.list_network_jobs(plugin)
-    self.assertIn("run-job", result)
-    job = result["run-job"]
-    # Should have counts
-    self.assertEqual(job["pass_count"], 3)
-    self.assertEqual(job["worker_count"], 2)
-    # Should NOT have heavy fields
-    self.assertNotIn("timeline", job)
-    self.assertNotIn("workers", job)
-    self.assertNotIn("pass_reports", job)
-
-  def test_get_job_archive_not_found(self):
-    """get_job_archive for non-existent job returns not_found."""
-    Plugin = self._get_plugin_class()
-    plugin = self._build_plugin({})
-
-    result = Plugin.get_job_archive(plugin, job_id="missing-job")
-    self.assertEqual(result["error"], "not_found")
-
-  def test_get_job_archive_r1fs_failure(self):
-    """get_job_archive when R1FS fails returns fetch_failed."""
-    Plugin = self._get_plugin_class()
-    stub = self._build_finalized_stub("fin-job")
-    plugin = self._build_plugin({"fin-job": stub})
-    plugin.r1fs.get_json.return_value = None
-
-    result = Plugin.get_job_archive(plugin, job_id="fin-job")
-    self.assertEqual(result["error"], "fetch_failed")
-
-
-class TestPhase12LiveProgress(unittest.TestCase):
-  """Phase 12: Live Worker Progress."""
-
-  @classmethod
-  def _mock_plugin_modules(cls):
-    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
-      return
-    TestPhase1ConfigCID._mock_plugin_modules()
-
-  def _get_plugin_class(self):
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    return PentesterApi01Plugin
-
-  def test_worker_progress_model_roundtrip(self):
-    """WorkerProgress.from_dict(wp.to_dict()) preserves all fields."""
-    from extensions.business.cybersec.red_mesh.models import WorkerProgress
-    wp = WorkerProgress(
-      job_id="job-1",
-      worker_addr="0xWorkerA",
-      pass_nr=2,
-      progress=45.5,
-      phase="service_probes",
-      ports_scanned=500,
-      ports_total=1024,
-      open_ports_found=[22, 80, 443],
-      completed_tests=["fingerprint_completed", "service_info_completed"],
-      updated_at=1700000000.0,
-      live_metrics={"total_duration": 30.5},
-    )
-    d = wp.to_dict()
-    wp2 = WorkerProgress.from_dict(d)
-    self.assertEqual(wp2.job_id, "job-1")
-    self.assertEqual(wp2.worker_addr, "0xWorkerA")
-    self.assertEqual(wp2.pass_nr, 2)
-    self.assertAlmostEqual(wp2.progress, 45.5)
-    self.assertEqual(wp2.phase, "service_probes")
-    self.assertEqual(wp2.ports_scanned, 500)
-    self.assertEqual(wp2.ports_total, 1024)
-    self.assertEqual(wp2.open_ports_found, [22, 80, 443])
-    self.assertEqual(wp2.completed_tests, ["fingerprint_completed", "service_info_completed"])
-    self.assertEqual(wp2.updated_at, 1700000000.0)
-    self.assertEqual(wp2.live_metrics, {"total_duration": 30.5})
-
-  def test_get_job_progress_filters_by_job(self):
-    """get_job_progress returns only workers for the requested job."""
-    Plugin = self._get_plugin_class()
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-
-    # Simulate two jobs' progress in the :live hset
-    live_data = {
-      "job-A:worker-1": {"job_id": "job-A", "progress": 50},
-      "job-A:worker-2": {"job_id": "job-A", "progress": 75},
-      "job-B:worker-3": {"job_id": "job-B", "progress": 30},
-    }
-    plugin.chainstore_hgetall.return_value = live_data
-
-    result = Plugin.get_job_progress(plugin, job_id="job-A")
-    self.assertEqual(result["job_id"], "job-A")
-    self.assertEqual(len(result["workers"]), 2)
-    self.assertIn("worker-1", result["workers"])
-    self.assertIn("worker-2", result["workers"])
-    self.assertNotIn("worker-3", result["workers"])
-
-  def test_get_job_progress_empty(self):
-    """get_job_progress for non-existent job returns empty workers dict."""
-    Plugin = self._get_plugin_class()
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-    plugin.chainstore_hgetall.return_value = {}
-
-    result = Plugin.get_job_progress(plugin, job_id="nonexistent")
-    self.assertEqual(result["job_id"], "nonexistent")
-    self.assertEqual(result["workers"], {})
-
-  def test_publish_live_progress(self):
-    """_publish_live_progress writes stage-based progress to CStore :live hset."""
-    Plugin = self._get_plugin_class()
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-    plugin.ee_addr = "node-A"
-    plugin._last_progress_publish = 0
-    plugin.time.return_value = 100.0
-
-    # Mock a local worker with state (port scan partial + fingerprint done)
-    worker = MagicMock()
-    worker.state = {
-      "ports_scanned": list(range(100)),
-      "open_ports": [22, 80],
-      "completed_tests": ["fingerprint_completed"],
-      "done": False,
-    }
-    worker.initial_ports = list(range(1, 513))
-
-    plugin.scan_jobs = {"job-1": {"worker-thread-1": worker}}
-
-    # Mock CStore lookup for pass_nr
-    plugin.chainstore_hget.return_value = {"job_pass": 3}
-
-    Plugin._publish_live_progress(plugin)
-
-    # Verify hset was called with correct key pattern
-    plugin.chainstore_hset.assert_called_once()
-    call_args = plugin.chainstore_hset.call_args
-    self.assertEqual(call_args.kwargs["hkey"], "test-instance:live")
-    self.assertEqual(call_args.kwargs["key"], "job-1:node-A")
-    progress_data = call_args.kwargs["value"]
-    self.assertEqual(progress_data["job_id"], "job-1")
-    self.assertEqual(progress_data["worker_addr"], "node-A")
-    self.assertEqual(progress_data["pass_nr"], 3)
-    self.assertEqual(progress_data["phase"], "service_probes")
-    self.assertEqual(progress_data["ports_scanned"], 100)
-    self.assertEqual(progress_data["ports_total"], 512)
-    self.assertIn(22, progress_data["open_ports_found"])
-    self.assertIn(80, progress_data["open_ports_found"])
-    # Stage-based progress: service_probes = stage 3 (idx 2), so 2/5*100 = 40%
-    self.assertEqual(progress_data["progress"], 40.0)
-    # Single thread — no threads field
-    self.assertNotIn("threads", progress_data)
-
-  def test_publish_live_progress_multi_thread_phase(self):
-    """Phase is the earliest active phase; per-thread data is included."""
-    Plugin = self._get_plugin_class()
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-    plugin.ee_addr = "node-A"
-    plugin._last_progress_publish = 0
-    plugin.time.return_value = 100.0
-
-    # Thread 1: fully done
-    worker1 = MagicMock()
-    worker1.state = {
-      "ports_scanned": list(range(256)),
-      "open_ports": [22],
-      "completed_tests": ["fingerprint_completed", "service_info_completed", "web_tests_completed", "correlation_completed"],
-      "done": True,
-    }
-    worker1.initial_ports = list(range(1, 257))
-
-    # Thread 2: still on port scan (50 of 256 ports)
-    worker2 = MagicMock()
-    worker2.state = {
-      "ports_scanned": list(range(50)),
-      "open_ports": [],
-      "completed_tests": [],
-      "done": False,
-    }
-    worker2.initial_ports = list(range(257, 513))
-
-    plugin.scan_jobs = {"job-1": {"t1": worker1, "t2": worker2}}
-    plugin.chainstore_hget.return_value = {"job_pass": 1}
-
-    Plugin._publish_live_progress(plugin)
-
-    call_args = plugin.chainstore_hset.call_args
-    progress_data = call_args.kwargs["value"]
-    # Phase should be port_scan (earliest across threads), not done
-    self.assertEqual(progress_data["phase"], "port_scan")
-    # Stage-based: port_scan (idx 0) + sub-progress (306/512 * 20%) = ~12%
-    self.assertGreater(progress_data["progress"], 10)
-    self.assertLess(progress_data["progress"], 15)
-    # Per-thread data should be present (2 threads)
-    self.assertIn("threads", progress_data)
-    self.assertEqual(progress_data["threads"]["t1"]["phase"], "done")
-    self.assertEqual(progress_data["threads"]["t2"]["phase"], "port_scan")
-    self.assertEqual(progress_data["threads"]["t2"]["ports_scanned"], 50)
-    self.assertEqual(progress_data["threads"]["t2"]["ports_total"], 256)
-
-  def test_clear_live_progress(self):
-    """_clear_live_progress deletes progress keys for all workers."""
-    Plugin = self._get_plugin_class()
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-
-    Plugin._clear_live_progress(plugin, "job-1", ["worker-A", "worker-B"])
-
-    self.assertEqual(plugin.chainstore_hset.call_count, 2)
-    calls = plugin.chainstore_hset.call_args_list
-    keys_deleted = {c.kwargs["key"] for c in calls}
-    self.assertEqual(keys_deleted, {"job-1:worker-A", "job-1:worker-B"})
-    for c in calls:
-      self.assertIsNone(c.kwargs["value"])
-
-
-class TestPhase14Purge(unittest.TestCase):
-  """Phase 14: Job Deletion & Purge."""
-
-  @classmethod
-  def _mock_plugin_modules(cls):
-    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
-      return
-    TestPhase1ConfigCID._mock_plugin_modules()
-
-  def _get_plugin_class(self):
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    return PentesterApi01Plugin
-
-  def _make_plugin(self):
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-    plugin.ee_addr = "node-A"
-    return plugin
-
-  def test_purge_finalized_collects_all_cids(self):
-    """Finalized purge collects archive + config + aggregated_report + worker report CIDs."""
-    Plugin = self._get_plugin_class()
-    plugin = self._make_plugin()
-
-    # CStore stub for a finalized job
-    job_specs = {
-      "job_id": "job-1",
-      "job_status": "FINALIZED",
-      "job_cid": "cid-archive",
-      "job_config_cid": "cid-config",
-    }
-    plugin.chainstore_hget.return_value = job_specs
-
-    # Archive contains nested CIDs
-    archive = {
-      "passes": [
-        {
-          "aggregated_report_cid": "cid-agg-1",
-          "worker_reports": {
-            "worker-A": {"report_cid": "cid-wr-A"},
-            "worker-B": {"report_cid": "cid-wr-B"},
-          },
-        },
-      ],
-    }
-    plugin.r1fs.get_json.return_value = archive
-    plugin.r1fs.delete_file.return_value = True
-    plugin.chainstore_hgetall.return_value = {}
-
-    # Normalize returns the specs as-is
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
-
-    result = Plugin.purge_job(plugin, "job-1")
-    self.assertEqual(result["status"], "success")
-
-    # Verify all 5 CIDs were deleted
-    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
-    self.assertEqual(deleted_cids, {"cid-archive", "cid-config", "cid-agg-1", "cid-wr-A", "cid-wr-B"})
-    self.assertEqual(result["cids_deleted"], 5)
-    self.assertEqual(result["cids_total"], 5)
-
-  def test_purge_finalized_no_pass_report_cids(self):
-    """Finalized purge does NOT try to delete individual pass report CIDs (they are inside archive)."""
-    Plugin = self._get_plugin_class()
-    plugin = self._make_plugin()
-
-    job_specs = {
-      "job_id": "job-1",
-      "job_status": "FINALIZED",
-      "job_cid": "cid-archive",
-      # No pass_reports key — finalized stubs don't have them
-    }
-    plugin.chainstore_hget.return_value = job_specs
-    plugin.r1fs.get_json.return_value = {"passes": []}
-    plugin.r1fs.delete_file.return_value = True
-    plugin.chainstore_hgetall.return_value = {}
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
-
-    result = Plugin.purge_job(plugin, "job-1")
-    self.assertEqual(result["status"], "success")
-
-    # Only archive CID should be deleted (no pass_reports, no config, no workers)
-    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
-    self.assertEqual(deleted_cids, {"cid-archive"})
-
-  def test_purge_running_collects_all_cids(self):
-    """Stopped (was running) purge collects config + worker CIDs + pass report CIDs + nested CIDs."""
-    Plugin = self._get_plugin_class()
-    plugin = self._make_plugin()
-
-    job_specs = {
-      "job_id": "job-1",
-      "job_status": "STOPPED",
-      "job_config_cid": "cid-config",
-      "workers": {
-        "node-A": {"finished": True, "canceled": True, "report_cid": "cid-wr-A"},
-      },
-      "pass_reports": [
-        {"report_cid": "cid-pass-1"},
-      ],
-    }
-    plugin.chainstore_hget.return_value = job_specs
-
-    # Pass report contains nested CIDs
-    pass_report = {
-      "aggregated_report_cid": "cid-agg-1",
-      "worker_reports": {
-        "node-A": {"report_cid": "cid-pass-wr-A"},
-      },
-    }
-    plugin.r1fs.get_json.return_value = pass_report
-    plugin.r1fs.delete_file.return_value = True
-    plugin.chainstore_hgetall.return_value = {}
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
-
-    result = Plugin.purge_job(plugin, "job-1")
-    self.assertEqual(result["status"], "success")
-
-    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
-    self.assertEqual(deleted_cids, {"cid-config", "cid-wr-A", "cid-pass-1", "cid-agg-1", "cid-pass-wr-A"})
-
-  def test_purge_r1fs_failure_keeps_cstore(self):
-    """Partial R1FS failure leaves CStore intact and returns 'partial' status."""
-    Plugin = self._get_plugin_class()
-    plugin = self._make_plugin()
-
-    job_specs = {
-      "job_id": "job-1",
-      "job_status": "FINALIZED",
-      "job_cid": "cid-archive",
-      "job_config_cid": "cid-config",
-    }
-    plugin.chainstore_hget.return_value = job_specs
-    plugin.r1fs.get_json.return_value = {"passes": []}
-
-    # First CID deletes ok, second raises
-    plugin.r1fs.delete_file.side_effect = [True, Exception("disk error")]
-
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
-
-    result = Plugin.purge_job(plugin, "job-1")
-    self.assertEqual(result["status"], "partial")
-    self.assertEqual(result["cids_deleted"], 1)
-    self.assertEqual(result["cids_failed"], 1)
-    self.assertEqual(result["cids_total"], 2)
-
-    # CStore should NOT be tombstoned
-    tombstone_calls = [
-      c for c in plugin.chainstore_hset.call_args_list
-      if c.kwargs.get("hkey") == "test-instance" and c.kwargs.get("value") is None
-    ]
-    self.assertEqual(len(tombstone_calls), 0)
-
-  def test_purge_cleans_live_progress(self):
-    """Purge deletes live progress keys for the job from :live hset."""
-    Plugin = self._get_plugin_class()
-    plugin = self._make_plugin()
-
-    job_specs = {
-      "job_id": "job-1",
-      "job_status": "STOPPED",
-      "workers": {"node-A": {"finished": True}},
-    }
-    plugin.chainstore_hget.return_value = job_specs
-    plugin.r1fs.delete_file.return_value = True
-
-    # Live hset has keys for this job and another
-    plugin.chainstore_hgetall.return_value = {
-      "job-1:node-A": {"progress": 100},
-      "job-1:node-B": {"progress": 50},
-      "job-2:node-C": {"progress": 30},
-    }
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
-
-    result = Plugin.purge_job(plugin, "job-1")
-    self.assertEqual(result["status"], "success")
-
-    # Check that live progress keys for job-1 were deleted
-    live_delete_calls = [
-      c for c in plugin.chainstore_hset.call_args_list
-      if c.kwargs.get("hkey") == "test-instance:live" and c.kwargs.get("value") is None
-    ]
-    deleted_keys = {c.kwargs["key"] for c in live_delete_calls}
-    self.assertEqual(deleted_keys, {"job-1:node-A", "job-1:node-B"})
-    # job-2 key should NOT be touched
-    self.assertNotIn("job-2:node-C", deleted_keys)
-
-  def test_purge_success_tombstones_cstore(self):
-    """After all CIDs deleted, CStore key is tombstoned (set to None)."""
-    Plugin = self._get_plugin_class()
-    plugin = self._make_plugin()
-
-    job_specs = {
-      "job_id": "job-1",
-      "job_status": "FINALIZED",
-      "job_cid": "cid-archive",
-    }
-    plugin.chainstore_hget.return_value = job_specs
-    plugin.r1fs.get_json.return_value = {"passes": []}
-    plugin.r1fs.delete_file.return_value = True
-    plugin.chainstore_hgetall.return_value = {}
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
-
-    result = Plugin.purge_job(plugin, "job-1")
-    self.assertEqual(result["status"], "success")
-
-    # CStore tombstone: hset(hkey=instance_id, key=job_id, value=None)
-    tombstone_calls = [
-      c for c in plugin.chainstore_hset.call_args_list
-      if c.kwargs.get("hkey") == "test-instance"
-        and c.kwargs.get("key") == "job-1"
-        and c.kwargs.get("value") is None
-    ]
-    self.assertEqual(len(tombstone_calls), 1)
-
-  def test_stop_and_delete_delegates_to_purge(self):
-    """stop_and_delete_job marks job stopped then delegates to purge_job."""
-    Plugin = self._get_plugin_class()
-    plugin = self._make_plugin()
-    plugin.scan_jobs = {}
-
-    job_specs = {
-      "job_id": "job-1",
-      "job_status": "RUNNING",
-      "workers": {"node-A": {"finished": False}},
-    }
-    plugin.chainstore_hget.return_value = job_specs
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
-
-    # Mock purge_job to verify delegation
-    purge_result = {"status": "success", "job_id": "job-1", "cids_deleted": 3, "cids_total": 3}
-    plugin.purge_job = MagicMock(return_value=purge_result)
-
-    result = Plugin.stop_and_delete_job(plugin, "job-1")
-
-    # Verify job was marked stopped before purge
-    hset_calls = [
-      c for c in plugin.chainstore_hset.call_args_list
-      if c.kwargs.get("hkey") == "test-instance" and c.kwargs.get("key") == "job-1"
-    ]
-    self.assertEqual(len(hset_calls), 1)
-    saved_specs = hset_calls[0].kwargs["value"]
-    self.assertEqual(saved_specs["job_status"], "STOPPED")
-    self.assertTrue(saved_specs["workers"]["node-A"]["finished"])
-    self.assertTrue(saved_specs["workers"]["node-A"]["canceled"])
-
-    # Verify purge was called
-    plugin.purge_job.assert_called_once_with("job-1")
-    self.assertEqual(result, purge_result)
-
-
-class TestPhase15Listing(unittest.TestCase):
-  """Phase 15: Listing Endpoint Optimization."""
-
-  @classmethod
-  def _mock_plugin_modules(cls):
-    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
-      return
-    TestPhase1ConfigCID._mock_plugin_modules()
-
-  def _get_plugin_class(self):
-    self._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    return PentesterApi01Plugin
-
-  def test_list_finalized_returns_stub_fields(self):
-    """Finalized jobs return exact CStoreJobFinalized fields."""
-    Plugin = self._get_plugin_class()
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-
-    finalized_stub = {
-      "job_id": "job-1",
-      "job_status": "FINALIZED",
-      "target": "10.0.0.1",
-      "task_name": "scan-1",
-      "risk_score": 75,
-      "run_mode": "SINGLEPASS",
-      "duration": 120.5,
-      "pass_count": 1,
-      "launcher": "0xLauncher",
-      "launcher_alias": "node1",
-      "worker_count": 2,
-      "start_port": 1,
-      "end_port": 1024,
-      "date_created": 1700000000.0,
-      "date_completed": 1700000120.0,
-      "job_cid": "QmArchive123",
-      "job_config_cid": "QmConfig456",
-    }
-    plugin.chainstore_hgetall.return_value = {"job-1": finalized_stub}
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", finalized_stub))
-
-    result = Plugin.list_network_jobs(plugin)
-    self.assertIn("job-1", result)
-    entry = result["job-1"]
-
-    # All CStoreJobFinalized fields present
-    self.assertEqual(entry["job_id"], "job-1")
-    self.assertEqual(entry["job_status"], "FINALIZED")
-    self.assertEqual(entry["job_cid"], "QmArchive123")
-    self.assertEqual(entry["job_config_cid"], "QmConfig456")
-    self.assertEqual(entry["target"], "10.0.0.1")
-    self.assertEqual(entry["risk_score"], 75)
-    self.assertEqual(entry["duration"], 120.5)
-    self.assertEqual(entry["pass_count"], 1)
-    self.assertEqual(entry["worker_count"], 2)
-
-  def test_list_running_stripped(self):
-    """Running jobs have listing fields but no heavy data."""
-    Plugin = self._get_plugin_class()
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-
-    running_spec = {
-      "job_id": "job-2",
-      "job_status": "RUNNING",
-      "target": "10.0.0.2",
-      "task_name": "scan-2",
-      "risk_score": 0,
-      "run_mode": "CONTINUOUS_MONITORING",
-      "start_port": 1,
-      "end_port": 65535,
-      "date_created": 1700000000.0,
-      "launcher": "0xLauncher",
-      "launcher_alias": "node1",
-      "job_pass": 3,
-      "job_config_cid": "QmConfig789",
-      "workers": {
-        "addr-A": {"start_port": 1, "end_port": 32767, "finished": False, "report_cid": "QmBigReport1"},
-        "addr-B": {"start_port": 32768, "end_port": 65535, "finished": False, "report_cid": "QmBigReport2"},
-      },
-      "timeline": [
-        {"event": "created", "ts": 1700000000.0},
-        {"event": "started", "ts": 1700000001.0},
-      ],
-      "pass_reports": [
-        {"pass_nr": 1, "report_cid": "QmPass1"},
-        {"pass_nr": 2, "report_cid": "QmPass2"},
-      ],
-      "redmesh_job_start_attestation": {"big": "blob"},
-    }
-    plugin.chainstore_hgetall.return_value = {"job-2": running_spec}
-    plugin._normalize_job_record = MagicMock(return_value=("job-2", running_spec))
-
-    result = Plugin.list_network_jobs(plugin)
-    self.assertIn("job-2", result)
-    entry = result["job-2"]
-
-    # Listing essentials present
-    self.assertEqual(entry["job_id"], "job-2")
-    self.assertEqual(entry["job_status"], "RUNNING")
-    self.assertEqual(entry["target"], "10.0.0.2")
-    self.assertEqual(entry["task_name"], "scan-2")
-    self.assertEqual(entry["run_mode"], "CONTINUOUS_MONITORING")
-    self.assertEqual(entry["job_pass"], 3)
-    self.assertEqual(entry["worker_count"], 2)
-    self.assertEqual(entry["pass_count"], 2)
-
-    # Heavy fields stripped
-    self.assertNotIn("workers", entry)
-    self.assertNotIn("timeline", entry)
-    self.assertNotIn("pass_reports", entry)
-    self.assertNotIn("redmesh_job_start_attestation", entry)
-    self.assertNotIn("job_config_cid", entry)
-    self.assertNotIn("report_cid", entry)
-
-
-class TestPhase16ScanMetrics(unittest.TestCase):
-  """Phase 16: Scan Metrics Collection."""
-
-  def test_metrics_collector_empty_build(self):
-    """build() with zero data returns ScanMetrics with defaults, no crash."""
-    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
-    mc = MetricsCollector()
-    result = mc.build()
-    d = result.to_dict()
-    self.assertEqual(d.get("total_duration", 0), 0)
-    self.assertEqual(d.get("rate_limiting_detected", False), False)
-    self.assertEqual(d.get("blocking_detected", False), False)
-    # No crash, sparse output
-    self.assertNotIn("connection_outcomes", d)
-    self.assertNotIn("response_times", d)
-
-  def test_metrics_collector_records_connections(self):
-    """After recording outcomes, connection_outcomes has correct counts."""
-    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
-    mc = MetricsCollector()
-    mc.start_scan(100)
-    mc.record_connection("connected", 0.05)
-    mc.record_connection("connected", 0.03)
-    mc.record_connection("timeout", 1.0)
-    mc.record_connection("refused", 0.01)
-    d = mc.build().to_dict()
-    outcomes = d["connection_outcomes"]
-    self.assertEqual(outcomes["connected"], 2)
-    self.assertEqual(outcomes["timeout"], 1)
-    self.assertEqual(outcomes["refused"], 1)
-    self.assertEqual(outcomes["total"], 4)
-    # Response times computed
-    rt = d["response_times"]
-    self.assertIn("mean", rt)
-    self.assertIn("p95", rt)
-    self.assertEqual(rt["count"], 4)
-
-  def test_metrics_collector_records_probes(self):
-    """After recording probes, probe_breakdown has entries."""
-    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
-    mc = MetricsCollector()
-    mc.start_scan(10)
-    mc.record_probe("_service_info_http", "completed")
-    mc.record_probe("_service_info_ssh", "completed")
-    mc.record_probe("_web_test_xss", "skipped:no_http")
-    d = mc.build().to_dict()
-    self.assertEqual(d["probes_attempted"], 3)
-    self.assertEqual(d["probes_completed"], 2)
-    self.assertEqual(d["probes_skipped"], 1)
-    self.assertEqual(d["probe_breakdown"]["_service_info_http"], "completed")
-    self.assertEqual(d["probe_breakdown"]["_web_test_xss"], "skipped:no_http")
-
-  def test_metrics_collector_phase_durations(self):
-    """start/end phases produce positive durations."""
-    import time
-    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
-    mc = MetricsCollector()
-    mc.start_scan(10)
-    mc.phase_start("port_scan")
-    time.sleep(0.01)
-    mc.phase_end("port_scan")
-    d = mc.build().to_dict()
-    self.assertIn("phase_durations", d)
-    self.assertGreater(d["phase_durations"]["port_scan"], 0)
-
-  def test_metrics_collector_findings(self):
-    """record_finding tracks severity distribution."""
-    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
-    mc = MetricsCollector()
-    mc.start_scan(10)
-    mc.record_finding("HIGH")
-    mc.record_finding("HIGH")
-    mc.record_finding("MEDIUM")
-    mc.record_finding("INFO")
-    d = mc.build().to_dict()
-    fd = d["finding_distribution"]
-    self.assertEqual(fd["HIGH"], 2)
-    self.assertEqual(fd["MEDIUM"], 1)
-    self.assertEqual(fd["INFO"], 1)
-
-  def test_metrics_collector_coverage(self):
-    """Coverage tracks ports scanned vs in range."""
-    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
-    mc = MetricsCollector()
-    mc.start_scan(100)
-    for i in range(50):
-      mc.record_connection("connected" if i < 5 else "refused", 0.01)
-    # Simulate finding 5 open ports with banner confirmation
-    for i in range(5):
-      mc.record_open_port(8000 + i, protocol="http" if i < 3 else "ssh", banner_confirmed=(i < 3))
-    d = mc.build().to_dict()
-    cov = d["coverage"]
-    self.assertEqual(cov["ports_in_range"], 100)
-    self.assertEqual(cov["ports_scanned"], 50)
-    self.assertEqual(cov["coverage_pct"], 50.0)
-    self.assertEqual(cov["open_ports_count"], 5)
-    # Open port details
-    self.assertEqual(len(d["open_port_details"]), 5)
-    self.assertEqual(d["open_port_details"][0]["port"], 8000)
-    self.assertEqual(d["open_port_details"][0]["protocol"], "http")
-    self.assertTrue(d["open_port_details"][0]["banner_confirmed"])
-    self.assertFalse(d["open_port_details"][3]["banner_confirmed"])
-    # Banner confirmation
-    self.assertEqual(d["banner_confirmation"]["confirmed"], 3)
-    self.assertEqual(d["banner_confirmation"]["guessed"], 2)
-
-  def test_scan_metrics_model_roundtrip(self):
-    """ScanMetrics.from_dict(sm.to_dict()) preserves all fields."""
-    from extensions.business.cybersec.red_mesh.models.shared import ScanMetrics
-    sm = ScanMetrics(
-      phase_durations={"port_scan": 10.5, "fingerprint": 3.2},
-      total_duration=15.0,
-      connection_outcomes={"connected": 50, "timeout": 5, "total": 55},
-      response_times={"min": 0.01, "max": 1.0, "mean": 0.1, "median": 0.08, "stddev": 0.05, "p95": 0.5, "p99": 0.9, "count": 55},
-      rate_limiting_detected=True,
-      blocking_detected=False,
-      coverage={"ports_in_range": 1000, "ports_scanned": 1000, "ports_skipped": 0, "coverage_pct": 100.0},
-      probes_attempted=5,
-      probes_completed=4,
-      probes_skipped=1,
-      probes_failed=0,
-      probe_breakdown={"_service_info_http": "completed"},
-      finding_distribution={"HIGH": 3, "MEDIUM": 2},
-    )
-    d = sm.to_dict()
-    sm2 = ScanMetrics.from_dict(d)
-    self.assertEqual(sm2.to_dict(), d)
-
-  def test_scan_metrics_strip_none(self):
-    """Empty/None fields stripped from serialization."""
-    from extensions.business.cybersec.red_mesh.models.shared import ScanMetrics
-    sm = ScanMetrics()
-    d = sm.to_dict()
-    self.assertNotIn("phase_durations", d)
-    self.assertNotIn("connection_outcomes", d)
-    self.assertNotIn("response_times", d)
-    self.assertNotIn("slow_ports", d)
-    self.assertNotIn("probe_breakdown", d)
-
-  def test_merge_worker_metrics(self):
-    """_merge_worker_metrics sums outcomes, coverage, findings; maxes duration; ORs flags."""
-    TestPhase15Listing._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-    m1 = {
-      "connection_outcomes": {"connected": 30, "timeout": 5, "total": 35},
-      "coverage": {"ports_in_range": 500, "ports_scanned": 500, "ports_skipped": 0, "coverage_pct": 100.0, "open_ports_count": 3},
-      "finding_distribution": {"HIGH": 2, "MEDIUM": 1},
-      "service_distribution": {"http": 2, "ssh": 1},
-      "probe_breakdown": {"_service_info_http": "completed", "_web_test_xss": "completed"},
-      "phase_durations": {"port_scan": 30.0, "fingerprint": 10.0, "service_probes": 15.0},
-      "response_times": {"min": 0.01, "max": 0.5, "mean": 0.05, "median": 0.04, "stddev": 0.03, "p95": 0.2, "p99": 0.4, "count": 500},
-      "probes_attempted": 3, "probes_completed": 3, "probes_skipped": 0, "probes_failed": 0,
-      "total_duration": 60.0,
-      "rate_limiting_detected": False, "blocking_detected": False,
-      "open_port_details": [
-        {"port": 22, "protocol": "ssh", "banner_confirmed": True},
-        {"port": 80, "protocol": "http", "banner_confirmed": True},
-        {"port": 443, "protocol": "http", "banner_confirmed": False},
-      ],
-      "banner_confirmation": {"confirmed": 2, "guessed": 1},
-    }
-    m2 = {
-      "connection_outcomes": {"connected": 20, "timeout": 10, "total": 30},
-      "coverage": {"ports_in_range": 500, "ports_scanned": 400, "ports_skipped": 100, "coverage_pct": 80.0, "open_ports_count": 2},
-      "finding_distribution": {"HIGH": 1, "LOW": 3},
-      "service_distribution": {"http": 1, "mysql": 1},
-      "probe_breakdown": {"_service_info_http": "completed", "_service_info_mysql": "completed", "_web_test_xss": "failed"},
-      "phase_durations": {"port_scan": 45.0, "fingerprint": 8.0, "service_probes": 20.0},
-      "response_times": {"min": 0.02, "max": 0.8, "mean": 0.08, "median": 0.06, "stddev": 0.05, "p95": 0.3, "p99": 0.7, "count": 400},
-      "probes_attempted": 3, "probes_completed": 2, "probes_skipped": 1, "probes_failed": 0,
-      "total_duration": 75.0,
-      "rate_limiting_detected": True, "blocking_detected": False,
-      "open_port_details": [
-        {"port": 80, "protocol": "http", "banner_confirmed": True},  # duplicate port 80
-        {"port": 3306, "protocol": "mysql", "banner_confirmed": True},
-      ],
-      "banner_confirmation": {"confirmed": 2, "guessed": 0},
-    }
-    merged = PentesterApi01Plugin._merge_worker_metrics([m1, m2])
-    # Sums
-    self.assertEqual(merged["connection_outcomes"]["connected"], 50)
-    self.assertEqual(merged["connection_outcomes"]["timeout"], 15)
-    self.assertEqual(merged["connection_outcomes"]["total"], 65)
-    self.assertEqual(merged["coverage"]["ports_in_range"], 1000)
-    self.assertEqual(merged["coverage"]["ports_scanned"], 900)
-    self.assertEqual(merged["coverage"]["ports_skipped"], 100)
-    self.assertEqual(merged["coverage"]["coverage_pct"], 90.0)
-    self.assertEqual(merged["coverage"]["open_ports_count"], 5)
-    self.assertEqual(merged["finding_distribution"]["HIGH"], 3)
-    self.assertEqual(merged["finding_distribution"]["LOW"], 3)
-    self.assertEqual(merged["finding_distribution"]["MEDIUM"], 1)
-    self.assertEqual(merged["probes_attempted"], 6)
-    self.assertEqual(merged["probes_completed"], 5)
-    self.assertEqual(merged["probes_skipped"], 1)
-    # Service distribution summed
-    self.assertEqual(merged["service_distribution"]["http"], 3)
-    self.assertEqual(merged["service_distribution"]["ssh"], 1)
-    self.assertEqual(merged["service_distribution"]["mysql"], 1)
-    # Probe breakdown: union, worst status wins
-    self.assertEqual(merged["probe_breakdown"]["_service_info_http"], "completed")
-    self.assertEqual(merged["probe_breakdown"]["_service_info_mysql"], "completed")
-    self.assertEqual(merged["probe_breakdown"]["_web_test_xss"], "failed")  # failed > completed
-    # Phase durations: max per phase (threads/nodes run in parallel)
-    self.assertEqual(merged["phase_durations"]["port_scan"], 45.0)
-    self.assertEqual(merged["phase_durations"]["fingerprint"], 10.0)
-    self.assertEqual(merged["phase_durations"]["service_probes"], 20.0)
-    # Response times: merged stats
-    rt = merged["response_times"]
-    self.assertEqual(rt["min"], 0.01)   # global min
-    self.assertEqual(rt["max"], 0.8)    # global max
-    self.assertEqual(rt["count"], 900)  # total count
-    # Weighted mean: (0.05*500 + 0.08*400) / 900 ≈ 0.0633
-    self.assertAlmostEqual(rt["mean"], 0.0633, places=3)
-    self.assertEqual(rt["p95"], 0.3)    # max of per-thread p95
-    self.assertEqual(rt["p99"], 0.7)    # max of per-thread p99
-    # Max duration
-    self.assertEqual(merged["total_duration"], 75.0)
-    # OR flags
-    self.assertTrue(merged["rate_limiting_detected"])
-    self.assertFalse(merged["blocking_detected"])
-    # Open port details: deduplicated by port, sorted
-    opd = merged["open_port_details"]
-    self.assertEqual(len(opd), 4)  # 22, 80, 443, 3306 (80 deduplicated)
-    self.assertEqual(opd[0]["port"], 22)
-    self.assertEqual(opd[1]["port"], 80)
-    self.assertEqual(opd[2]["port"], 443)
-    self.assertEqual(opd[3]["port"], 3306)
-    # Banner confirmation: summed
-    self.assertEqual(merged["banner_confirmation"]["confirmed"], 4)
-    self.assertEqual(merged["banner_confirmation"]["guessed"], 1)
-
-
-  def test_close_job_merges_thread_metrics(self):
-    """16b: _close_job replaces generically-merged scan_metrics with properly summed metrics."""
-    TestPhase15Listing._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-    plugin.ee_addr = "node-A"
-
-    # Two mock workers with different scan_metrics
-    worker1 = MagicMock()
-    worker1.get_status.return_value = {
-      "open_ports": [80], "service_info": {}, "scan_metrics": {
-        "connection_outcomes": {"connected": 10, "timeout": 2, "total": 12},
-        "total_duration": 30.0,
-        "probes_attempted": 2, "probes_completed": 2, "probes_skipped": 0, "probes_failed": 0,
-        "rate_limiting_detected": False, "blocking_detected": False,
-      }
-    }
-    worker2 = MagicMock()
-    worker2.get_status.return_value = {
-      "open_ports": [443], "service_info": {}, "scan_metrics": {
-        "connection_outcomes": {"connected": 8, "timeout": 5, "total": 13},
-        "total_duration": 45.0,
-        "probes_attempted": 2, "probes_completed": 1, "probes_skipped": 1, "probes_failed": 0,
-        "rate_limiting_detected": True, "blocking_detected": False,
-      }
-    }
-    plugin.scan_jobs = {"job-1": {"t1": worker1, "t2": worker2}}
-
-    # _get_aggregated_report with merge_objects_deep would do last-writer-wins on leaf ints
-    # Simulate that by returning worker2's metrics (wrong — should be summed)
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80, 443], "service_info": {},
-      "scan_metrics": {
-        "connection_outcomes": {"connected": 8, "timeout": 5, "total": 13},
-        "total_duration": 45.0,
-      }
-    })
-    # Use real static method for merge
-    plugin._merge_worker_metrics = PentesterApi01Plugin._merge_worker_metrics
-
-    saved_reports = []
-    def capture_add_json(data, show_logs=False):
-      saved_reports.append(data)
-      return "QmReport123"
-    plugin.r1fs.add_json.side_effect = capture_add_json
-
-    job_specs = {"job_id": "job-1", "target": "10.0.0.1", "workers": {}}
-    plugin.chainstore_hget.return_value = job_specs
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
-    plugin._get_job_config = MagicMock(return_value={"redact_credentials": False})
-    plugin._redact_report = MagicMock(side_effect=lambda r: r)
-
-    PentesterApi01Plugin._close_job(plugin, "job-1")
-
-    # The report saved to R1FS should have properly merged metrics
-    self.assertEqual(len(saved_reports), 1)
-    sm = saved_reports[0].get("scan_metrics")
-    self.assertIsNotNone(sm)
-    # Connection outcomes should be summed, not last-writer-wins
-    self.assertEqual(sm["connection_outcomes"]["connected"], 18)
-    self.assertEqual(sm["connection_outcomes"]["timeout"], 7)
-    self.assertEqual(sm["connection_outcomes"]["total"], 25)
-    # Max duration
-    self.assertEqual(sm["total_duration"], 45.0)
-    # Probes summed
-    self.assertEqual(sm["probes_attempted"], 4)
-    self.assertEqual(sm["probes_completed"], 3)
-    # OR flags
-    self.assertTrue(sm["rate_limiting_detected"])
-
-  def test_finalize_pass_attaches_pass_metrics(self):
-    """16c: _maybe_finalize_pass merges node metrics into PassReport.scan_metrics."""
-    TestPhase15Listing._mock_plugin_modules()
-    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
-
-    plugin = MagicMock()
-    plugin.cfg_instance_id = "test-instance"
-    plugin.ee_addr = "node-launcher"
-    plugin.cfg_llm_agent_api_enabled = False
-    plugin.cfg_attestation_min_seconds_between_submits = 3600
-
-    # Two workers, each with a report_cid
-    workers = {
-      "node-A": {"finished": True, "report_cid": "cid-report-A"},
-      "node-B": {"finished": True, "report_cid": "cid-report-B"},
-    }
-    job_specs = {
-      "job_id": "job-1",
-      "job_status": "RUNNING",
-      "target": "10.0.0.1",
-      "run_mode": "SINGLEPASS",
-      "launcher": "node-launcher",
-      "workers": workers,
-      "job_pass": 1,
-      "pass_reports": [],
-      "timeline": [{"event": "created", "ts": 1700000000.0}],
-    }
-    plugin.chainstore_hgetall.return_value = {"job-1": job_specs}
-    plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
-    plugin.time.return_value = 1700000120.0
-
-    # Node reports with different metrics
-    node_report_a = {
-      "open_ports": [80], "service_info": {}, "web_tests_info": {},
-      "correlation_findings": [], "start_port": 1, "end_port": 32767,
-      "ports_scanned": 32767,
-      "scan_metrics": {
-        "connection_outcomes": {"connected": 5, "timeout": 1, "total": 6},
-        "total_duration": 50.0,
-        "probes_attempted": 3, "probes_completed": 3, "probes_skipped": 0, "probes_failed": 0,
-        "rate_limiting_detected": False, "blocking_detected": False,
-      }
-    }
-    node_report_b = {
-      "open_ports": [443], "service_info": {}, "web_tests_info": {},
-      "correlation_findings": [], "start_port": 32768, "end_port": 65535,
-      "ports_scanned": 32768,
-      "scan_metrics": {
-        "connection_outcomes": {"connected": 3, "timeout": 4, "total": 7},
-        "total_duration": 65.0,
-        "probes_attempted": 3, "probes_completed": 2, "probes_skipped": 0, "probes_failed": 1,
-        "rate_limiting_detected": False, "blocking_detected": True,
-      }
-    }
-
-    node_reports_by_addr = {"node-A": node_report_a, "node-B": node_report_b}
-    plugin._collect_node_reports = MagicMock(return_value=node_reports_by_addr)
-    # _get_aggregated_report would use merge_objects_deep (wrong for metrics)
-    # Return a dict with last-writer-wins metrics to simulate the bug
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80, 443], "service_info": {}, "web_tests_info": {},
-      "scan_metrics": node_report_b["scan_metrics"],  # wrong — just node B's
-    })
-    # Use real static method for merge
-    plugin._merge_worker_metrics = PentesterApi01Plugin._merge_worker_metrics
-
-    # Capture what gets saved as pass report
-    saved_pass_reports = []
-    def capture_add_json(data, show_logs=False):
-      saved_pass_reports.append(data)
-      return f"QmPassReport{len(saved_pass_reports)}"
-    plugin.r1fs.add_json.side_effect = capture_add_json
-
-    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 25, "breakdown": {}}, []))
-    plugin._get_job_config = MagicMock(return_value={})
-    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
-    plugin._build_job_archive = MagicMock()
-    plugin._clear_live_progress = MagicMock()
-    plugin._emit_timeline_event = MagicMock()
-    plugin._get_timeline_date = MagicMock(return_value=1700000000.0)
-    plugin.Pd = MagicMock()
-
-    PentesterApi01Plugin._maybe_finalize_pass(plugin)
-
-    # Should have saved: aggregated_data (step 6) + pass_report (step 10)
-    self.assertGreaterEqual(len(saved_pass_reports), 2)
-    pass_report = saved_pass_reports[-1]  # Last one is the PassReport
-
-    sm = pass_report.get("scan_metrics")
-    self.assertIsNotNone(sm, "PassReport should have scan_metrics")
-    # Connection outcomes summed across nodes
-    self.assertEqual(sm["connection_outcomes"]["connected"], 8)
-    self.assertEqual(sm["connection_outcomes"]["timeout"], 5)
-    self.assertEqual(sm["connection_outcomes"]["total"], 13)
-    # Max duration
-    self.assertEqual(sm["total_duration"], 65.0)
-    # Probes summed
-    self.assertEqual(sm["probes_attempted"], 6)
-    self.assertEqual(sm["probes_completed"], 5)
-    self.assertEqual(sm["probes_failed"], 1)
-    # OR flags
-    self.assertFalse(sm["rate_limiting_detected"])
-    self.assertTrue(sm["blocking_detected"])
 
 
 class TestPhase17aQuickWins(unittest.TestCase):
@@ -4828,6 +2481,7 @@ class TestPhase17aQuickWins(unittest.TestCase):
       findings = worker._es_check_nodes("http://10.0.0.1:9200", raw)
     titles = [f.title for f in findings]
     self.assertFalse(any("EOL JVM" in t for t in titles))
+
 
 
 class TestPhase17bMediumFeatures(unittest.TestCase):
@@ -5099,6 +2753,7 @@ class TestPhase17bMediumFeatures(unittest.TestCase):
     self.assertTrue(any("admin shares" in t.lower() for t in titles), f"titles={titles}")
 
 
+
 class TestOWASPFullCoverage(unittest.TestCase):
   """Tests for OWASP Top 10 full coverage probes (A04, A08, A09, A10 + re-tags)."""
 
@@ -5136,7 +2791,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = "ami-id instance-id"
     with patch(
-      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_metadata_endpoints("example.com", 80)
@@ -5152,7 +2807,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = "-----BEGIN RSA PRIVATE KEY----- some key data"
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_homepage("example.com", 80)
@@ -5168,7 +2823,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = "var API_KEY = 'abc123';"
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_homepage("example.com", 80)
@@ -5194,7 +2849,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_metadata_endpoints("example.com", 80)
@@ -5218,7 +2873,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_ssrf_basic("example.com", 80)
@@ -5234,7 +2889,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = "<html><body>Welcome</body></html>"
     with patch(
-      "extensions.business.cybersec.red_mesh.web_api_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.api_exposure.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_ssrf_basic("example.com", 80)
@@ -5259,10 +2914,10 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.post",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.post",
       side_effect=fake_post,
     ), patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       side_effect=fake_post,
     ):
       result = worker._web_test_account_enumeration("example.com", 80)
@@ -5281,10 +2936,10 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.post",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.post",
       side_effect=fake_post,
     ), patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       side_effect=fake_post,
     ):
       result = worker._web_test_account_enumeration("example.com", 80)
@@ -5302,13 +2957,13 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.post",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.post",
       side_effect=fake_request,
     ), patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       side_effect=fake_request,
     ), patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin._time.sleep",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening._time.sleep",
     ):
       result = worker._web_test_rate_limiting("example.com", 80)
     findings = result.get("findings", [])
@@ -5340,13 +2995,13 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.post",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.post",
       side_effect=fake_post,
     ), patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       side_effect=fake_get,
     ), patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin._time.sleep",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening._time.sleep",
     ):
       result = worker._web_test_rate_limiting("example.com", 80)
     self.assertEqual(len(result.get("findings", [])), 0)
@@ -5369,7 +3024,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_idor_indicators("example.com", 80)
@@ -5385,7 +3040,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 401
     resp.text = "Unauthorized"
     with patch(
-      "extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.injection.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_idor_indicators("example.com", 80)
@@ -5400,7 +3055,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = '<html><script src="https://cdn.other.com/lib.js"></script></html>'
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_subresource_integrity("example.com", 80)
@@ -5416,7 +3071,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = '<html><script src="https://cdn.other.com/lib.js" integrity="sha384-abc" crossorigin="anonymous"></script></html>'
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_subresource_integrity("example.com", 80)
@@ -5429,7 +3084,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = '<html><script src="https://example.com/app.js"></script></html>'
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_subresource_integrity("example.com", 80)
@@ -5442,7 +3097,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = '<html><script src="http://evil.com/inject.js"></script></html>'
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_mixed_content("example.com", 443)
@@ -5458,7 +3113,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = '<html><script src="https://cdn.example.com/app.js"></script></html>'
     with patch(
-      "extensions.business.cybersec.red_mesh.web_hardening_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.hardening.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_mixed_content("example.com", 443)
@@ -5477,7 +3132,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = '<html><script>/*! AngularJS v1.8.2 */</script></html>'
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_js_library_versions("example.com", 80)
@@ -5493,7 +3148,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.status_code = 200
     resp.text = '<html><script src="https://code.jquery.com/jquery-3.7.1.min.js"></script></html>'
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_js_library_versions("example.com", 80)
@@ -5518,7 +3173,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_verbose_errors("example.com", 80)
@@ -5538,7 +3193,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_verbose_errors("example.com", 80)
@@ -5561,7 +3216,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_verbose_errors("example.com", 80)
@@ -5587,7 +3242,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_common("example.com", 80)
@@ -5604,7 +3259,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
     resp.text = ""
     resp.headers = {}
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       return_value=resp,
     ):
       result = worker._web_test_common("example.com", 80)
@@ -5654,7 +3309,7 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_cms_fingerprint("example.com", 80)
@@ -5683,13 +3338,14 @@ class TestOWASPFullCoverage(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_cms_fingerprint("example.com", 80)
     findings = result.get("findings", [])
     plugin_findings = [f for f in findings if "plugin" in f.get("title", "").lower()]
     self.assertEqual(len(plugin_findings), 0)
+
 
 
 class TestDetectionGapFixes(unittest.TestCase):
@@ -5790,7 +3446,7 @@ class TestDetectionGapFixes(unittest.TestCase):
         return resp, ("1.2.3.4", 53)
       sock.recvfrom = fake_recvfrom
       return sock
-    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket", side_effect=fake_socket_factory):
       with patch("socket.gethostbyaddr", side_effect=Exception("no reverse")):
         zones = worker._dns_discover_zones("1.2.3.4", 53)
     # vulhub.org should be in the list (discovered as authoritative or as fallback)
@@ -5799,7 +3455,7 @@ class TestDetectionGapFixes(unittest.TestCase):
   def test_dns_zone_discovery_always_includes_fallbacks(self):
     """Zone discovery should include fallback domains even when reverse DNS works."""
     _, worker = self._build_worker()
-    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket") as mock_sock:
+    with patch("extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket") as mock_sock:
       mock_inst = MagicMock()
       mock_inst.recvfrom.side_effect = Exception("timeout")
       mock_sock.return_value = mock_inst
@@ -5831,7 +3487,7 @@ class TestDetectionGapFixes(unittest.TestCase):
       answer += struct.pack('>H', len(version_txt) + 1) + bytes([len(version_txt)]) + version_txt
       return header + question_section + answer, ("1.2.3.4", 53)
 
-    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket") as mock_sock:
+    with patch("extensions.business.cybersec.red_mesh.worker.service.infrastructure.socket.socket") as mock_sock:
       mock_inst = MagicMock()
       mock_inst.sendto = fake_sendto
       mock_inst.recvfrom = fake_recvfrom
@@ -5878,6 +3534,7 @@ class TestDetectionGapFixes(unittest.TestCase):
       any("CVE-2020-7247" in t for t in cve_titles),
       f"Should detect CVE-2020-7247 via HELP version. CVEs found: {cve_titles}"
     )
+
 
 
 class TestBatch2GapFixes(unittest.TestCase):
@@ -5953,7 +3610,7 @@ class TestBatch2GapFixes(unittest.TestCase):
         return md5_request
       return auth_response
 
-    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket") as mock_sock:
+    with patch("extensions.business.cybersec.red_mesh.worker.service.database.socket.socket") as mock_sock:
       mock_inst = MagicMock()
       mock_inst.recv = fake_recv
       mock_sock.return_value = mock_inst
@@ -5996,7 +3653,7 @@ class TestBatch2GapFixes(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.service_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.service.database.requests.get",
       side_effect=fake_get,
     ):
       result = worker._service_info_couchdb("1.2.3.4", 5984)
@@ -6020,7 +3677,7 @@ class TestBatch2GapFixes(unittest.TestCase):
       resp.text = '{"status": "ok"}'
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.service_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.service.database.requests.get", side_effect=fake_get):
       result = worker._service_info_couchdb("1.2.3.4", 80)
     self.assertIsNone(result)
 
@@ -6050,7 +3707,7 @@ class TestBatch2GapFixes(unittest.TestCase):
         resp.text = '{"memstats": {"Alloc": 12345}}'
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.service_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.service.database.requests.get", side_effect=fake_get):
       result = worker._service_info_influxdb("1.2.3.4", 8086)
 
     findings = result.get("findings", [])
@@ -6070,7 +3727,7 @@ class TestBatch2GapFixes(unittest.TestCase):
       resp.headers = {}
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.service_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.service.database.requests.get", side_effect=fake_get):
       result = worker._service_info_influxdb("1.2.3.4", 80)
     self.assertIsNone(result)
 
@@ -6087,6 +3744,7 @@ class TestBatch2GapFixes(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.cve_db import check_cves
     self.assertTrue(any("CVE-2019-20933" in f.title for f in check_cves("influxdb", "1.6.6")))
     self.assertFalse(any("CVE-2019-20933" in f.title for f in check_cves("influxdb", "1.7.6")))
+
 
 
 class TestBatch3GapFixes(unittest.TestCase):
@@ -6211,7 +3869,7 @@ class TestBatch3GapFixes(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_cms_fingerprint("1.2.3.4", 4200)
@@ -6249,7 +3907,7 @@ class TestBatch3GapFixes(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_cms_fingerprint("1.2.3.4", 4400)
@@ -6293,8 +3951,8 @@ class TestBatch3GapFixes(unittest.TestCase):
       resp.text = '{"error":"..."}'
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.post", side_effect=fake_post):
       result = worker._web_test_cms_fingerprint("1.2.3.4", 6300)
 
     findings = result.get("findings", [])
@@ -6323,7 +3981,7 @@ class TestBatch3GapFixes(unittest.TestCase):
         resp.text = '<html>Hello world</html>'
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
       result = worker._web_test_ssti("1.2.3.4", 4700)
 
     findings = result.get("findings", [])
@@ -6350,7 +4008,7 @@ class TestBatch3GapFixes(unittest.TestCase):
         resp.text = '<html>Hello world</html>'
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
       result = worker._web_test_ssti("1.2.3.4", 4700)
 
     findings = result.get("findings", [])
@@ -6375,7 +4033,7 @@ class TestBatch3GapFixes(unittest.TestCase):
         resp.text = "Not Found"
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
       result = worker._web_test_shellshock("1.2.3.4", 6600)
 
     findings = result.get("findings", [])
@@ -6394,7 +4052,7 @@ class TestBatch3GapFixes(unittest.TestCase):
       resp.text = "Not Found"
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
       result = worker._web_test_shellshock("1.2.3.4", 80)
 
     findings = result.get("findings", [])
@@ -6424,8 +4082,8 @@ class TestBatch3GapFixes(unittest.TestCase):
       resp.text = "<html>PHP page</html>"
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
       result = worker._web_test_php_cgi("1.2.3.4", 6700)
 
     findings = result.get("findings", [])
@@ -6454,8 +4112,8 @@ class TestBatch3GapFixes(unittest.TestCase):
         resp.text = "<html>Normal</html>"
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
       result = worker._web_test_php_cgi("1.2.3.4", 6700)
 
     findings = result.get("findings", [])
@@ -6492,7 +4150,7 @@ class TestBatch3GapFixes(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_cms_fingerprint("1.2.3.4", 4200)
@@ -6538,7 +4196,7 @@ class TestBatch3GapFixes(unittest.TestCase):
       return resp
 
     with patch(
-      "extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get",
+      "extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get",
       side_effect=fake_get,
     ):
       result = worker._web_test_cms_fingerprint("1.2.3.4", 4400)
@@ -6562,7 +4220,7 @@ class TestBatch3GapFixes(unittest.TestCase):
       resp.text = '<html><p>Order #5183 confirmed</p></html>'
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
       result = worker._web_test_ssti("1.2.3.4", 4300)
 
     findings = result.get("findings", [])
@@ -6587,7 +4245,7 @@ class TestBatch3GapFixes(unittest.TestCase):
         resp.text = "Not Found"
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
       result = worker._web_test_shellshock("1.2.3.4", 6600)
 
     findings = result.get("findings", [])
@@ -6600,7 +4258,7 @@ class TestBatch3GapFixes(unittest.TestCase):
     """_service_info_http_alt should NOT emit CVE findings (dedup fix)."""
     _, worker = self._build_worker(ports=[8080])
 
-    with patch("extensions.business.cybersec.red_mesh.service_mixin.socket.socket") as mock_sock:
+    with patch("extensions.business.cybersec.red_mesh.worker.service.common.socket.socket") as mock_sock:
       mock_inst = MagicMock()
       mock_inst.recv.return_value = (
         b"HTTP/1.1 200 OK\r\n"
@@ -6615,6 +4273,7 @@ class TestBatch3GapFixes(unittest.TestCase):
     self.assertEqual(len(cve_findings), 0, f"http_alt should NOT emit CVEs. Got: {[f['title'] for f in cve_findings]}")
     # But server header should still be captured
     self.assertEqual(result.get("server"), "Apache/2.4.25 (Debian)")
+
 
 
 class TestBatch4JavaGapFixes(unittest.TestCase):
@@ -6758,7 +4417,7 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
         resp.text = '<html>WebLogic login page</html>'
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get", side_effect=fake_get):
       result = worker._web_test_java_servers("1.2.3.4", 7102)
 
     findings = result.get("findings", [])
@@ -6792,7 +4451,7 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
         resp.text = "Unauthorized"
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get", side_effect=fake_get):
       result = worker._web_test_java_servers("1.2.3.4", 7104)
 
     findings = result.get("findings", [])
@@ -6823,7 +4482,7 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
         resp.text = "<html>JMX Console</html>"
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get", side_effect=fake_get):
       result = worker._web_test_java_servers("1.2.3.4", 7106)
 
     findings = result.get("findings", [])
@@ -6853,7 +4512,7 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
         resp.text = '<html><body><h1>Whitelabel Error Page</h1></body></html>'
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get", side_effect=fake_get):
       result = worker._web_test_java_servers("1.2.3.4", 7108)
 
     findings = result.get("findings", [])
@@ -6879,7 +4538,7 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
         resp.text = "<html>Normal page</html>"
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
       result = worker._web_test_ognl_injection("1.2.3.4", 7100)
 
     findings = result.get("findings", [])
@@ -6906,7 +4565,7 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
         resp.headers = {"Content-Type": "text/xml"}
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
       result = worker._web_test_java_deserialization("1.2.3.4", 7102)
 
     findings = result.get("findings", [])
@@ -6928,7 +4587,7 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
         resp.text = "Internal Server Error"
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get):
       result = worker._web_test_java_deserialization("1.2.3.4", 7106)
 
     findings = result.get("findings", [])
@@ -6969,8 +4628,8 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
       resp.text = ""
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
       result = worker._web_test_spring_actuator("1.2.3.4", 7108)
 
     findings = result.get("findings", [])
@@ -7000,8 +4659,8 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
           resp.text = '{"error":"SpelEvaluationException: evaluation failed"}'
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
       result = worker._web_test_spring_actuator("1.2.3.4", 7109)
 
     findings = result.get("findings", [])
@@ -7039,8 +4698,8 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
       resp.text = ""
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.post", side_effect=fake_post):
       result = worker._web_test_java_servers("1.2.3.4", 7101)
 
     findings = result.get("findings", [])
@@ -7081,8 +4740,8 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
       resp.text = ""
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.post", side_effect=fake_post):
       result = worker._web_test_java_servers("1.2.3.4", 7101)
 
     findings = result.get("findings", [])
@@ -7128,8 +4787,8 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
         resp.text = ""
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_discovery_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.discovery.requests.post", side_effect=fake_post):
       result = worker._web_test_java_servers("1.2.3.4", 7108)
 
     findings = result.get("findings", [])
@@ -7169,13 +4828,14 @@ class TestBatch4JavaGapFixes(unittest.TestCase):
       resp.text = ""
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
       result = worker._web_test_spring_actuator("1.2.3.4", 7108)
 
     findings = result.get("findings", [])
     titles = [f["title"] for f in findings]
     self.assertTrue(any("Spring4Shell" in t for t in titles), f"Should detect Spring4Shell via binding error. Got: {titles}")
+
 
 
 class TestBatch5Improvements(unittest.TestCase):
@@ -7242,8 +4902,8 @@ class TestBatch5Improvements(unittest.TestCase):
       resp.text = ""
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
       result = worker._web_test_spring_actuator("1.2.3.4", 7108)
 
     findings = result.get("findings", [])
@@ -7278,8 +4938,8 @@ class TestBatch5Improvements(unittest.TestCase):
       resp.text = ""
       return resp
 
-    with patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.get", side_effect=fake_get), \
-         patch("extensions.business.cybersec.red_mesh.web_injection_mixin.requests.post", side_effect=fake_post):
+    with patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.get", side_effect=fake_get), \
+         patch("extensions.business.cybersec.red_mesh.worker.web.injection.requests.post", side_effect=fake_post):
       result = worker._web_test_spring_actuator("1.2.3.4", 7100)
 
     findings = result.get("findings", [])
@@ -7291,7 +4951,7 @@ class TestBatch5Improvements(unittest.TestCase):
 
   def _get_plugin_class(self):
     if 'extensions.business.cybersec.red_mesh.pentester_api_01' not in sys.modules:
-      TestPhase1ConfigCID._mock_plugin_modules()
+      mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     return PentesterApi01Plugin
 
@@ -7417,34 +5077,4 @@ class TestBatch5Improvements(unittest.TestCase):
     self.assertEqual(cve_ids, expected, f"Should match all 4 Jetty CVEs, got {cve_ids}")
 
 
-class VerboseResult(unittest.TextTestResult):
-  def addSuccess(self, test):
-    super().addSuccess(test)
-    self.stream.writeln()  # emits an extra "\n" after the usual "ok"
 
-if __name__ == "__main__":
-  runner = unittest.TextTestRunner(verbosity=2, resultclass=VerboseResult)
-  suite = unittest.TestSuite()
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(RedMeshOWASPTests))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestFindingsModule))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestCveDatabase))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestCorrelationEngine))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestScannerEnhancements))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase1ConfigCID))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase2PassFinalization))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase4UiAggregate))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase3Archive))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase5Endpoints))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase12LiveProgress))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase14Purge))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase15Listing))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase16ScanMetrics))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17aQuickWins))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestPhase17bMediumFeatures))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestOWASPFullCoverage))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestDetectionGapFixes))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch2GapFixes))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch3GapFixes))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch4JavaGapFixes))
-  suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestBatch5Improvements))
-  runner.run(suite)

@@ -1,6 +1,6 @@
 import requests
 
-from .findings import Finding, Severity, probe_result, probe_error
+from ...findings import Finding, Severity, probe_result, probe_error
 
 
 class _WebApiExposureMixin:

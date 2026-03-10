@@ -8,7 +8,7 @@ submission of attestations to the Ratio1 blockchain via the bc client.
 import ipaddress
 from urllib.parse import urlparse
 
-from .constants import RUN_MODE_SINGLEPASS, RUN_MODE_CONTINUOUS_MONITORING
+from ..constants import RUN_MODE_SINGLEPASS, RUN_MODE_CONTINUOUS_MONITORING
 
 
 class _AttestationMixin:

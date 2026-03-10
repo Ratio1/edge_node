@@ -5,7 +5,7 @@ Pure computation — takes aggregated scan reports and produces risk scores
 (0-100) with breakdowns and flat findings lists. No CStore or R1FS access.
 """
 
-from .constants import (
+from ..constants import (
   RISK_SEVERITY_WEIGHTS,
   RISK_CONFIDENCE_MULTIPLIERS,
   RISK_SIGMOID_K,
