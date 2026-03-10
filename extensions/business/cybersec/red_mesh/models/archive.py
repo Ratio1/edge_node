@@ -48,6 +48,19 @@ class JobConfig:
   created_by_name: str = ""
   created_by_id: str = ""
   authorized: bool = False
+  # ── graybox fields ──
+  scan_type: str = "network"          # "network" | "webapp"
+  target_url: str = ""                # required when scan_type == "webapp"
+  official_username: str = ""
+  official_password: str = ""
+  regular_username: str = ""
+  regular_password: str = ""
+  weak_candidates: list = None        # ["admin:admin", ...]
+  max_weak_attempts: int = 5
+  app_routes: list = None             # user-supplied known routes
+  verify_tls: bool = True             # TLS cert verification
+  target_config: dict = None          # GrayboxTargetConfig.to_dict()
+  allow_stateful_probes: bool = False # gate for A06 workflow probes
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -78,6 +91,18 @@ class JobConfig:
       created_by_name=d.get("created_by_name", ""),
       created_by_id=d.get("created_by_id", ""),
       authorized=d.get("authorized", False),
+      scan_type=d.get("scan_type", "network"),
+      target_url=d.get("target_url", ""),
+      official_username=d.get("official_username", ""),
+      official_password=d.get("official_password", ""),
+      regular_username=d.get("regular_username", ""),
+      regular_password=d.get("regular_password", ""),
+      weak_candidates=d.get("weak_candidates"),
+      max_weak_attempts=d.get("max_weak_attempts", 5),
+      app_routes=d.get("app_routes"),
+      verify_tls=d.get("verify_tls", True),
+      target_config=d.get("target_config"),
+      allow_stateful_probes=d.get("allow_stateful_probes", False),
     )
 
 
@@ -198,6 +223,12 @@ class UiAggregate:
   top_findings: list = None         # top 10 CRITICAL+HIGH findings for dashboard display
   finding_timeline: dict = None     # { finding_id: { first_seen, last_seen, pass_count } }
   worker_activity: list = None      # [ { id, start_port, end_port, open_ports } ]
+  # ── graybox-aware ──
+  scan_type: str = "network"
+  total_routes_discovered: int = 0          # webapp: discovered routes
+  total_forms_discovered: int = 0           # webapp: discovered forms
+  total_scenarios: int = 0                  # webapp: probe scenarios run
+  total_scenarios_vulnerable: int = 0       # webapp: vulnerable count
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -215,6 +246,11 @@ class UiAggregate:
       top_findings=d.get("top_findings"),
       finding_timeline=d.get("finding_timeline"),
       worker_activity=d.get("worker_activity"),
+      scan_type=d.get("scan_type", "network"),
+      total_routes_discovered=d.get("total_routes_discovered", 0),
+      total_forms_discovered=d.get("total_forms_discovered", 0),
+      total_scenarios=d.get("total_scenarios", 0),
+      total_scenarios_vulnerable=d.get("total_scenarios_vulnerable", 0),
     )
 
 
