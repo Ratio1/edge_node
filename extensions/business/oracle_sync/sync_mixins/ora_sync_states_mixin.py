@@ -1578,7 +1578,7 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool: True if the agreed median table for the last epoch has been received, False otherwise
       """
-      return self._last_epoch_synced == self._current_epoch - 1
+      return self._last_epoch_synced == self.netmon.epoch_manager.get_current_epoch() - 1
 
     def _last_epoch_synced_is_not_previous_epoch(self):
       """
