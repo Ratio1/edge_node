@@ -4,7 +4,7 @@ import struct
 import unittest
 from unittest.mock import MagicMock, patch
 
-from extensions.business.cybersec.red_mesh.redmesh_utils import PentestLocalWorker
+from extensions.business.cybersec.red_mesh.pentest_worker import PentestLocalWorker
 
 from xperimental.utils import color_print
 
@@ -505,7 +505,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         return None
 
     with patch(
-      "extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket",
+      "extensions.business.cybersec.red_mesh.pentest_worker.socket.socket",
       return_value=DummySocket(),
     ):
       worker._scan_ports_step()
@@ -1208,7 +1208,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         mock_sock.recv.return_value = modbus_response
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._active_fingerprint_ports()
 
     self.assertEqual(worker.state["port_protocols"][1024], "modbus")
@@ -1227,7 +1227,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = b""
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._active_fingerprint_ports()
 
     self.assertEqual(worker.state["port_protocols"][1024], "unknown")
@@ -1247,7 +1247,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = fake_binary
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertNotEqual(worker.state["port_protocols"][37364], "mysql")
@@ -1269,7 +1269,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = mysql_greeting
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertEqual(worker.state["port_protocols"][3306], "mysql")
@@ -1288,7 +1288,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = telnet_banner
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertEqual(worker.state["port_protocols"][2323], "telnet")
@@ -1307,7 +1307,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = fake_binary
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertNotEqual(worker.state["port_protocols"][8502], "telnet")
@@ -1325,7 +1325,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = login_banner
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertEqual(worker.state["port_protocols"][2323], "telnet")
@@ -1353,7 +1353,7 @@ class RedMeshOWASPTests(unittest.TestCase):
         mock_sock.recv.return_value = bad_modbus
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._active_fingerprint_ports()
 
     self.assertNotEqual(worker.state["port_protocols"][1024], "modbus")
@@ -1373,7 +1373,7 @@ class RedMeshOWASPTests(unittest.TestCase):
       mock_sock.recv.return_value = fake_pkt
       return mock_sock
 
-    with patch("extensions.business.cybersec.red_mesh.redmesh_utils.socket.socket", side_effect=fake_socket_factory):
+    with patch("extensions.business.cybersec.red_mesh.pentest_worker.socket.socket", side_effect=fake_socket_factory):
       worker._scan_ports_step()
 
     self.assertNotEqual(worker.state["port_protocols"][9999], "mysql")
@@ -4268,7 +4268,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
 
   def test_metrics_collector_empty_build(self):
     """build() with zero data returns ScanMetrics with defaults, no crash."""
-    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
     mc = MetricsCollector()
     result = mc.build()
     d = result.to_dict()
@@ -4281,7 +4281,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
 
   def test_metrics_collector_records_connections(self):
     """After recording outcomes, connection_outcomes has correct counts."""
-    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
     mc = MetricsCollector()
     mc.start_scan(100)
     mc.record_connection("connected", 0.05)
@@ -4302,7 +4302,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
 
   def test_metrics_collector_records_probes(self):
     """After recording probes, probe_breakdown has entries."""
-    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
     mc = MetricsCollector()
     mc.start_scan(10)
     mc.record_probe("_service_info_http", "completed")
@@ -4318,7 +4318,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
   def test_metrics_collector_phase_durations(self):
     """start/end phases produce positive durations."""
     import time
-    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
     mc = MetricsCollector()
     mc.start_scan(10)
     mc.phase_start("port_scan")
@@ -4330,7 +4330,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
 
   def test_metrics_collector_findings(self):
     """record_finding tracks severity distribution."""
-    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
     mc = MetricsCollector()
     mc.start_scan(10)
     mc.record_finding("HIGH")
@@ -4345,7 +4345,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
 
   def test_metrics_collector_coverage(self):
     """Coverage tracks ports scanned vs in range."""
-    from extensions.business.cybersec.red_mesh.redmesh_utils import MetricsCollector
+    from extensions.business.cybersec.red_mesh.pentest_worker import MetricsCollector
     mc = MetricsCollector()
     mc.start_scan(100)
     for i in range(50):
