@@ -2875,21 +2875,24 @@ class _DeeployMixin:
         self.Pd(f"Failed to load R1FS payload for job {job_id}: {exc}", color='y')
         pipeline = None
 
-      if pipeline is not None:
-        pipeline_owner = pipeline[NetMonCt.OWNER]
-        if pipeline_owner != owner:
-          self.Pd(
-            f"Skipping R1FS payload for job {job_id}: owner mismatch "
-            f"(expected {owner}, got {pipeline_owner}).",
-            color='y'
-          )
-          pipeline = None
+      if pipeline is None:
+        # If we don't have the details in R1FS, we skip the job. It can happen before the deploy, or for legacy jobs.
+        continue
+
+      pipeline_owner = pipeline[NetMonCt.OWNER.upper()]
+      if pipeline_owner != owner:
+        self.Pd(
+          f"Skipping R1FS payload for job {job_id}: owner mismatch "
+          f"(expected {owner}, got {pipeline_owner}).",
+          color='y'
+        )
+        continue
 
       if pipeline.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.PROJECT_ID) != project_id:
         self.Pd(f"Skipping R1FS payload for job {job_id}: project_id mismatch.", color='y')
-        pipeline = None
+        continue
 
-      if pipeline is None and len(online_apps) == 0 and project_id is not None and not chain_matches_project:
+      if len(online_apps) == 0 and project_id is not None and not chain_matches_project:
         # If a project filter is requested and neither source matches, skip this job.
         continue
 
