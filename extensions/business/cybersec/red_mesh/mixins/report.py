@@ -177,6 +177,30 @@ class _ReportMixin:
           ]
     return redacted
 
+  @staticmethod
+  def _redact_job_config(config_dict):
+    """
+    Redact credential fields from a job config dict before persistence.
+
+    Parameters
+    ----------
+    config_dict : dict
+      JobConfig.to_dict() output.
+
+    Returns
+    -------
+    dict
+      Copy with official_password, regular_password, and weak_candidates masked.
+    """
+    redacted = dict(config_dict)
+    if redacted.get("official_password"):
+      redacted["official_password"] = "***"
+    if redacted.get("regular_password"):
+      redacted["regular_password"] = "***"
+    if redacted.get("weak_candidates"):
+      redacted["weak_candidates"] = ["***"] * len(redacted["weak_candidates"])
+    return redacted
+
   def _compute_ui_aggregate(self, passes, latest_aggregated):
     """Compute pre-aggregated view for frontend from pass reports.
 
