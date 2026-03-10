@@ -2770,10 +2770,13 @@ class _DeeployMixin:
       result = filtered_result
     if job_id is not None:
       if isinstance(job_id, int):
-        job_id = [job_id]
-      unique_job_ids = set()
-      for raw_value in job_id:
-        unique_job_ids.add(raw_value)
+        unique_job_ids = {job_id}
+      elif isinstance(job_id, list):
+        if not all(isinstance(value, int) for value in job_id):
+          raise ValueError("job_id must be int or list of int")
+        unique_job_ids = set(job_id)
+      else:
+        raise ValueError("job_id must be int or list of int")
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
         for app_name, app_data in apps.items():
@@ -2819,14 +2822,6 @@ class _DeeployMixin:
     }
     return serialized
 
-  def _chain_job_matches_project_id(self, chain_job, project_id):
-    """
-    Validate whether serialized chain job details belong to the provided project.
-    """
-    if project_id is None:
-      return True
-    return str(chain_job["projectHash"]).lower() == str(project_id).lower()
-
   def _get_apps_by_escrow_active_jobs(self, sender_escrow, owner, project_id=None):
     """
     Build get_apps payload using active SC job IDs as source of truth, with optional online snapshots.
@@ -2835,7 +2830,7 @@ class _DeeployMixin:
       {
         "<job_id>": {
           "job_id": <int>,
-          "pipeline": <dict|None>,  # raw R1FS payload
+          "pipeline": <dict>,       # raw R1FS payload
           "chain_job": <dict>,      # serialized chain job details
           "online": <dict>,         # online apps snapshot keyed by node
         }
@@ -2863,8 +2858,6 @@ class _DeeployMixin:
     for active_job in active_jobs:
       job_id = int(active_job["jobId"])
       chain_job = self._serialize_chain_job(active_job)
-      chain_matches_project = self._chain_job_matches_project_id(chain_job, project_id)
-
       grouped_online_apps = online_apps_by_job_id.get(job_id, {})
       online_apps = {node: dict(apps) for node, apps in grouped_online_apps.items()}
 
@@ -2890,10 +2883,6 @@ class _DeeployMixin:
 
       if pipeline.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.PROJECT_ID) != project_id:
         self.Pd(f"Skipping R1FS payload for job {job_id}: project_id mismatch.", color='y')
-        continue
-
-      if len(online_apps) == 0 and project_id is not None and not chain_matches_project:
-        # If a project filter is requested and neither source matches, skip this job.
         continue
 
       result[str(job_id)] = {
