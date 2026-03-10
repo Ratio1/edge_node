@@ -191,7 +191,7 @@ class UiAggregate:
   total_open_ports: list            # sorted unique [int]
   total_services: int
   total_findings: int
-  latest_risk_score: float
+  latest_risk_score: float = None     # None while scan is in progress
   latest_risk_breakdown: dict = None  # RiskBreakdown.to_dict()
   latest_quick_summary: str = None
   findings_count: dict = None       # { CRITICAL: int, HIGH: int, MEDIUM: int, LOW: int, INFO: int }
