@@ -12,7 +12,7 @@ Usage:
 import requests
 from typing import Optional
 
-from .constants import RUN_MODE_SINGLEPASS
+from ..constants import RUN_MODE_SINGLEPASS
 
 
 class _RedMeshLlmAgentMixin(object):

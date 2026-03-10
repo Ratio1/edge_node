@@ -3,7 +3,7 @@ import time
 import requests
 from urllib.parse import quote
 
-from .findings import Finding, Severity, probe_result, probe_error
+from ...findings import Finding, Severity, probe_result, probe_error
 
 
 class _InjectionTestBase:
