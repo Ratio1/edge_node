@@ -87,6 +87,15 @@ class _LiveProgressMixin:
     # Sum probe counts
     for field in ("probes_attempted", "probes_completed", "probes_skipped", "probes_failed"):
       merged[field] = sum(m.get(field, 0) for m in metrics_list)
+    # Sum graybox scenario counters
+    for field in (
+      "scenarios_total",
+      "scenarios_vulnerable",
+      "scenarios_clean",
+      "scenarios_inconclusive",
+      "scenarios_error",
+    ):
+      merged[field] = sum(m.get(field, 0) for m in metrics_list)
     # Merge probe breakdown (union of all probes)
     probe_bd = {}
     for m in metrics_list:

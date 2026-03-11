@@ -222,6 +222,38 @@ class TestGrayboxRedaction(unittest.TestCase):
     self.assertNotIn("password123", finding["evidence"][0])
 
 
+class TestFindingCounting(unittest.TestCase):
+
+  def test_count_all_findings_walks_all_sections(self):
+    """_count_all_findings counts service, web, correlation, and graybox findings."""
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    host = MockHost()
+    report = {
+      "service_info": {
+        "80": {
+          "_service_info_http": {"findings": [{"title": "svc-1"}, {"title": "svc-2"}]},
+        },
+      },
+      "web_tests_info": {
+        "80": {
+          "_web_test_xss": {"findings": [{"title": "web-1"}]},
+        },
+      },
+      "correlation_findings": [{"title": "corr-1"}],
+      "graybox_results": {
+        "443": {
+          "_graybox_test": {"findings": [{"title": "gb-1"}, {"title": "gb-2"}]},
+        },
+      },
+    }
+
+    self.assertEqual(host._count_all_findings(report), 6)
+
+
 class TestLaunchValidation(unittest.TestCase):
 
   def test_launch_invalid_scan_type(self):

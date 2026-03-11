@@ -15,6 +15,98 @@ class _ReportMixin:
   SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4}
   CONFIDENCE_ORDER = {"certain": 0, "firm": 1, "tentative": 2}
 
+  @staticmethod
+  def _count_nested_findings(section):
+    """Count findings in a nested {port: {probe: {findings: []}}} section."""
+    total = 0
+    for per_port in (section or {}).values():
+      if not isinstance(per_port, dict):
+        continue
+      for per_probe in per_port.values():
+        if isinstance(per_probe, dict):
+          total += len(per_probe.get("findings", []))
+    return total
+
+  def _count_all_findings(self, report):
+    """Count all findings emitted by network and graybox reporting sections."""
+    if not isinstance(report, dict):
+      return 0
+    return (
+      self._count_nested_findings(report.get("service_info")) +
+      self._count_nested_findings(report.get("web_tests_info")) +
+      len(report.get("correlation_findings") or []) +
+      self._count_nested_findings(report.get("graybox_results"))
+    )
+
+  @staticmethod
+  def _dedupe_items(items):
+    """Deduplicate mixed scalar/dict items while preserving first-seen order."""
+    import json as _json
+
+    deduped = []
+    seen = set()
+    for item in items:
+      try:
+        key = _json.dumps(item, sort_keys=True, default=str)
+      except (TypeError, ValueError):
+        key = str(item)
+      if key in seen:
+        continue
+      seen.add(key)
+      deduped.append(item)
+    return deduped
+
+  def _extract_graybox_ui_stats(self, aggregated, latest_pass=None):
+    """Extract graybox-specific archive summary values from aggregated data."""
+    latest_pass = latest_pass or {}
+    scan_metrics = latest_pass.get("scan_metrics") or {}
+
+    service_info = aggregated.get("service_info") or {}
+    graybox_results = aggregated.get("graybox_results") or {}
+
+    routes = []
+    forms = []
+    for methods in service_info.values():
+      if not isinstance(methods, dict):
+        continue
+      discovery = methods.get("_graybox_discovery")
+      if not isinstance(discovery, dict):
+        continue
+      routes.extend(discovery.get("routes") or [])
+      forms.extend(discovery.get("forms") or [])
+
+    scenario_total = 0
+    scenario_vulnerable = 0
+    for probes in graybox_results.values():
+      if not isinstance(probes, dict):
+        continue
+      for probe_data in probes.values():
+        if not isinstance(probe_data, dict):
+          continue
+        for finding in probe_data.get("findings", []):
+          if not isinstance(finding, dict):
+            continue
+          status = finding.get("status")
+          if not status:
+            continue
+          scenario_total += 1
+          if status == "vulnerable":
+            scenario_vulnerable += 1
+
+    if scan_metrics:
+      scenario_total = max(scenario_total, scan_metrics.get("scenarios_total", 0) or 0)
+      scenario_vulnerable = max(
+        scenario_vulnerable,
+        scan_metrics.get("scenarios_vulnerable", 0) or 0,
+      )
+
+    return {
+      "total_routes_discovered": len(self._dedupe_items(routes)),
+      "total_forms_discovered": len(self._dedupe_items(forms)),
+      "total_scenarios": scenario_total,
+      "total_scenarios_vulnerable": scenario_vulnerable,
+    }
+
   def _get_aggregated_report(self, local_jobs, worker_cls=None):
     """
     Aggregate results from multiple local workers.
@@ -219,7 +311,7 @@ class _ReportMixin:
       redacted["weak_candidates"] = ["***"] * len(redacted["weak_candidates"])
     return redacted
 
-  def _compute_ui_aggregate(self, passes, latest_aggregated):
+  def _compute_ui_aggregate(self, passes, latest_aggregated, job_config=None):
     """Compute pre-aggregated view for frontend from pass reports.
 
     Parameters
@@ -238,6 +330,15 @@ class _ReportMixin:
     latest = passes[-1]
     agg = latest_aggregated
     findings = latest.get("findings", []) or []
+    scan_type = (job_config or {}).get("scan_type", "network")
+    graybox_stats = {
+      "total_routes_discovered": 0,
+      "total_forms_discovered": 0,
+      "total_scenarios": 0,
+      "total_scenarios_vulnerable": 0,
+    }
+    if scan_type == "webapp":
+      graybox_stats = self._extract_graybox_ui_stats(agg, latest)
 
     # Severity breakdown
     findings_count = dict(Counter(f.get("severity", "INFO") for f in findings))
@@ -283,4 +384,9 @@ class _ReportMixin:
         }
         for addr, w in (latest.get("worker_reports") or {}).items()
       ] or None,
+      scan_type=scan_type,
+      total_routes_discovered=graybox_stats["total_routes_discovered"],
+      total_forms_discovered=graybox_stats["total_forms_discovered"],
+      total_scenarios=graybox_stats["total_scenarios"],
+      total_scenarios_vulnerable=graybox_stats["total_scenarios_vulnerable"],
     )

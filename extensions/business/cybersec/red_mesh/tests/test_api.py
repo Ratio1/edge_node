@@ -289,9 +289,22 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin.chainstore_hgetall.return_value = {job_id: job_specs}
     plugin.chainstore_hset = MagicMock()
 
+    Plugin = self._get_plugin_class()
+    plugin._count_nested_findings = lambda section: Plugin._count_nested_findings(section)
+    plugin._count_all_findings = lambda report: Plugin._count_all_findings(plugin, report)
+
     return plugin, job_specs
 
-  def _sample_node_report(self, start_port=1, end_port=512, open_ports=None, findings=None):
+  def _sample_node_report(
+    self,
+    start_port=1,
+    end_port=512,
+    open_ports=None,
+    findings=None,
+    graybox_findings=None,
+    web_findings=None,
+    correlation_findings=None,
+  ):
     """Build a sample node report dict."""
     report = {
       "start_port": start_port,
@@ -304,7 +317,8 @@ class TestPhase2PassFinalization(unittest.TestCase):
       "completed_tests": ["port_scan"],
       "port_protocols": {"80": "http", "443": "https"},
       "port_banners": {},
-      "correlation_findings": [],
+      "correlation_findings": correlation_findings or [],
+      "graybox_results": {},
     }
     if findings:
       # Add findings under service_info for port 80
@@ -312,6 +326,22 @@ class TestPhase2PassFinalization(unittest.TestCase):
         "80": {
           "_service_info_http": {
             "findings": findings,
+          }
+        }
+      }
+    if web_findings:
+      report["web_tests_info"] = {
+        "80": {
+          "_web_test_xss": {
+            "findings": web_findings,
+          }
+        }
+      }
+    if graybox_findings:
+      report["graybox_results"] = {
+        "443": {
+          "_graybox_test": {
+            "findings": graybox_findings,
           }
         }
       }
@@ -376,6 +406,41 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertIn("risk_breakdown", pass_report_dict)
     self.assertIn("date_started", pass_report_dict)
     self.assertIn("date_completed", pass_report_dict)
+
+  def test_pass_report_worker_meta_counts_graybox_findings(self):
+    """WorkerReportMeta.nr_findings includes graybox findings."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+
+    report_a = self._sample_node_report(
+      1,
+      512,
+      [443],
+      findings=[{"title": "svc"}],
+      web_findings=[{"title": "web"}],
+      graybox_findings=[
+        {"scenario_id": "S1", "status": "vulnerable"},
+        {"scenario_id": "S2", "status": "not_vulnerable"},
+      ],
+      correlation_findings=[{"title": "corr"}],
+    )
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [443], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {"443": "https"}, "graybox_results": report_a["graybox_results"],
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com", "scan_type": "webapp"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {"findings_score": 5}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(pass_report_dict["worker_reports"]["worker-A"]["nr_findings"], 5)
 
   def test_aggregated_report_separate_cid(self):
     """aggregated_report_cid is a separate R1FS write from the PassReport."""
@@ -700,7 +765,13 @@ class TestPhase4UiAggregate(unittest.TestCase):
     plugin = MagicMock()
     Plugin = self._get_plugin_class()
     plugin._count_services = lambda si: Plugin._count_services(plugin, si)
-    plugin._compute_ui_aggregate = lambda passes, agg: Plugin._compute_ui_aggregate(plugin, passes, agg)
+    plugin._dedupe_items = lambda items: Plugin._dedupe_items(items)
+    plugin._extract_graybox_ui_stats = lambda aggregated, latest_pass=None: Plugin._extract_graybox_ui_stats(
+      plugin, aggregated, latest_pass
+    )
+    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None: Plugin._compute_ui_aggregate(
+      plugin, passes, agg, job_config=job_config
+    )
     plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
     plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
     return plugin, Plugin
@@ -726,6 +797,35 @@ class TestPhase4UiAggregate(unittest.TestCase):
       "service_info": service_info or {
         "80": {"_service_info_http": {"findings": []}},
         "443": {"_service_info_https": {"findings": []}},
+      },
+    }
+
+  def _make_webapp_aggregated(self):
+    return {
+      "open_ports": [443],
+      "service_info": {
+        "443": {
+          "_graybox_discovery": {
+            "routes": ["/login", "/login", "/admin"],
+            "forms": [
+              {"action": "/login", "method": "POST"},
+              {"action": "/login", "method": "POST"},
+              {"action": "/admin", "method": "POST"},
+            ],
+            "findings": [],
+          },
+        },
+      },
+      "graybox_results": {
+        "443": {
+          "_graybox_authz": {
+            "findings": [
+              {"scenario_id": "S-1", "status": "vulnerable", "severity": "HIGH"},
+              {"scenario_id": "S-2", "status": "not_vulnerable", "severity": "INFO"},
+              {"scenario_id": "S-3", "status": "inconclusive", "severity": "INFO"},
+            ],
+          },
+        },
       },
     }
 
@@ -853,6 +953,26 @@ class TestPhase4UiAggregate(unittest.TestCase):
     self.assertEqual(plugin._count_services({}), 0)
     self.assertEqual(plugin._count_services(None), 0)
 
+  def test_webapp_graybox_fields_populated(self):
+    """Webapp aggregates include scan_type, discovery counts, and scenario stats."""
+    plugin, _ = self._make_plugin()
+    p = self._make_pass(
+      findings=[self._make_finding(severity="HIGH", finding_id="gb1")],
+      worker_reports={"w1": {"start_port": 443, "end_port": 443, "open_ports": [443]}},
+    )
+    p["scan_metrics"] = {
+      "scenarios_total": 3,
+      "scenarios_vulnerable": 1,
+    }
+    agg = self._make_webapp_aggregated()
+
+    result = plugin._compute_ui_aggregate([p], agg, job_config={"scan_type": "webapp"}).to_dict()
+    self.assertEqual(result["scan_type"], "webapp")
+    self.assertEqual(result["total_routes_discovered"], 2)
+    self.assertEqual(result["total_forms_discovered"], 2)
+    self.assertEqual(result["total_scenarios"], 3)
+    self.assertEqual(result["total_scenarios_vulnerable"], 1)
+
 
 
 class TestPhase3Archive(unittest.TestCase):
@@ -901,6 +1021,10 @@ class TestPhase3Archive(unittest.TestCase):
           {"finding_id": f"f{i}a", "severity": "HIGH", "confidence": "firm", "title": f"Finding {i}A"},
           {"finding_id": f"f{i}b", "severity": "MEDIUM", "confidence": "firm", "title": f"Finding {i}B"},
         ],
+        "scan_metrics": {
+          "scenarios_total": 2,
+          "scenarios_vulnerable": 1,
+        },
         "quick_summary": f"Summary for pass {i}",
       }
       pass_reports_data.append(pr)
@@ -915,8 +1039,33 @@ class TestPhase3Archive(unittest.TestCase):
 
     # Latest aggregated data
     latest_aggregated = {
-      "open_ports": [80, 443], "service_info": {"80": {"_service_info_http": {}}},
-      "web_tests_info": {}, "completed_tests": ["port_scan"], "ports_scanned": 1024,
+      "open_ports": [80, 443],
+      "service_info": {
+        "80": {"_service_info_http": {}},
+        "443": {
+          "_graybox_discovery": {
+            "routes": ["/login", "/admin", "/login"],
+            "forms": [
+              {"action": "/login", "method": "POST"},
+              {"action": "/admin", "method": "POST"},
+              {"action": "/admin", "method": "POST"},
+            ],
+          },
+        },
+      },
+      "web_tests_info": {},
+      "graybox_results": {
+        "443": {
+          "_graybox_test": {
+            "findings": [
+              {"scenario_id": "S1", "status": "vulnerable"},
+              {"scenario_id": "S2", "status": "not_vulnerable"},
+            ],
+          },
+        },
+      },
+      "completed_tests": ["port_scan"],
+      "ports_scanned": 1024,
     }
 
     # R1FS get_json: return the right data for each CID
@@ -976,8 +1125,14 @@ class TestPhase3Archive(unittest.TestCase):
 
     # Bind real methods for archive building
     Plugin = self._get_plugin_class()
-    plugin._compute_ui_aggregate = lambda passes, agg: Plugin._compute_ui_aggregate(plugin, passes, agg)
+    plugin._compute_ui_aggregate = lambda passes, agg, job_config=None: Plugin._compute_ui_aggregate(
+      plugin, passes, agg, job_config=job_config
+    )
     plugin._count_services = lambda si: Plugin._count_services(plugin, si)
+    plugin._dedupe_items = lambda items: Plugin._dedupe_items(items)
+    plugin._extract_graybox_ui_stats = lambda aggregated, latest_pass=None: Plugin._extract_graybox_ui_stats(
+      plugin, aggregated, latest_pass
+    )
     plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
     plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
 
@@ -998,6 +1153,21 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(len(archive_dict["passes"]), 1)
     self.assertIn("ui_aggregate", archive_dict)
     self.assertIn("total_open_ports", archive_dict["ui_aggregate"])
+
+  def test_archive_ui_aggregate_includes_graybox_summary(self):
+    """Archive UI aggregate preserves graybox scan metadata and scenario counts."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    ui = archive_dict["ui_aggregate"]
+    self.assertEqual(ui["scan_type"], "webapp")
+    self.assertEqual(ui["total_routes_discovered"], 2)
+    self.assertEqual(ui["total_forms_discovered"], 2)
+    self.assertEqual(ui["total_scenarios"], 2)
+    self.assertEqual(ui["total_scenarios_vulnerable"], 1)
 
   def test_archive_duration_computed(self):
     """duration == date_completed - date_created, not 0."""
@@ -1377,3 +1547,73 @@ class TestPhase5Endpoints(unittest.TestCase):
     result = Plugin.get_job_archive(plugin, job_id="fin-job")
     self.assertEqual(result["error"], "fetch_failed")
 
+
+class TestPhase2AuditCounting(unittest.TestCase):
+  """Phase 2: audit counts include graybox findings."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return
+    mock_plugin_modules()
+
+  def _get_plugin_class(self):
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def test_close_job_audit_counts_graybox_findings(self):
+    """_close_job audit nr_findings includes graybox results."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.ee_addr = "node-A"
+    plugin.cfg_instance_id = "test-instance"
+    plugin.global_shmem = {}
+    plugin.log.get_localhost_ip.return_value = "127.0.0.1"
+    plugin.P = MagicMock()
+    plugin.json_dumps.return_value = "{}"
+    plugin.r1fs.add_json.return_value = "QmWorkerReport"
+    plugin._get_job_config = MagicMock(return_value={"redact_credentials": False})
+    plugin._redact_report = MagicMock(side_effect=lambda r: r)
+    plugin._normalize_job_record = MagicMock(side_effect=lambda job_id, raw: (job_id, raw))
+    plugin._log_audit_event = MagicMock()
+    plugin._count_nested_findings = lambda section: Plugin._count_nested_findings(section)
+    plugin._count_all_findings = lambda report: Plugin._count_all_findings(plugin, report)
+
+    report = {
+      "start_port": 443,
+      "end_port": 443,
+      "ports_scanned": 1,
+      "open_ports": [443],
+      "service_info": {
+        "443": {"_service_info_https": {"findings": [{"title": "svc"}]}},
+      },
+      "web_tests_info": {
+        "443": {"_web_test_xss": {"findings": [{"title": "web"}]}},
+      },
+      "correlation_findings": [{"title": "corr"}],
+      "graybox_results": {
+        "443": {"_graybox_test": {"findings": [{"scenario_id": "S1"}, {"scenario_id": "S2"}]}},
+      },
+    }
+
+    worker = MagicMock()
+    worker.get_status.return_value = report
+    plugin.scan_jobs = {"job-1": {"local-1": worker}}
+    plugin._get_aggregated_report = MagicMock(return_value=report)
+
+    job_specs = {
+      "job_id": "job-1",
+      "target": "example.com",
+      "workers": {"node-A": {"start_port": 443, "end_port": 443}},
+      "job_config_cid": "QmConfig",
+    }
+    plugin.chainstore_hget.return_value = job_specs
+    plugin.chainstore_hset = MagicMock()
+
+    Plugin._close_job(plugin, "job-1")
+
+    plugin._log_audit_event.assert_called_once()
+    event_type, details = plugin._log_audit_event.call_args[0]
+    self.assertEqual(event_type, "scan_completed")
+    self.assertEqual(details["nr_findings"], 5)
