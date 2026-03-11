@@ -1379,6 +1379,7 @@ class TestPhase3Archive(unittest.TestCase):
     )
     plugin.SEVERITY_ORDER = Plugin.SEVERITY_ORDER
     plugin.CONFIDENCE_ORDER = Plugin.CONFIDENCE_ORDER
+    plugin._redact_job_config = lambda d: Plugin._redact_job_config(d)
 
     return plugin, job_specs, pass_reports_data, job_config
 
