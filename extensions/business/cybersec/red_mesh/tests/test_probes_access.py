@@ -7,6 +7,7 @@ from extensions.business.cybersec.red_mesh.graybox.probes.access_control import 
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   GrayboxTargetConfig, AccessControlConfig, IdorEndpoint, AdminEndpoint,
+  BusinessLogicConfig, RecordEndpoint,
 )
 
 
@@ -204,6 +205,127 @@ class TestCapabilityDeclarations(unittest.TestCase):
     findings = probe.run()
     for f in findings:
       self.assertIsInstance(f, GrayboxFinding)
+
+
+class TestVerbTampering(unittest.TestCase):
+
+  def test_verb_tampering_bypass(self):
+    """Admin endpoint denies GET but accepts PUT → vulnerable/HIGH."""
+    ep = AdminEndpoint(path="/api/admin/users/", method="GET")
+    probe = _make_probe(admin_endpoints=[ep])
+    session = probe.auth.regular_session
+
+    # Baseline GET → 403
+    baseline = _mock_response(status=403, text="Forbidden")
+    # PUT → 200 (bypass)
+    bypass = _mock_response(status=200, text='{"users": []}')
+
+    call_count = [0]
+    def mock_request(method, url, **kwargs):
+      call_count[0] += 1
+      if method == "GET":
+        return baseline
+      return bypass
+
+    session.request = MagicMock(side_effect=mock_request)
+
+    probe._test_verb_tampering()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A01-03" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertIn("CWE-650", vuln[0].cwe)
+
+  def test_verb_tampering_all_denied(self):
+    """All methods return 403 → not_vulnerable."""
+    ep = AdminEndpoint(path="/api/admin/users/", method="GET")
+    probe = _make_probe(admin_endpoints=[ep])
+    session = probe.auth.regular_session
+    session.request = MagicMock(return_value=_mock_response(status=403, text="Forbidden"))
+
+    probe._test_verb_tampering()
+    clean = [f for f in probe.findings if f.scenario_id == "PT-A01-03" and f.status == "not_vulnerable"]
+    self.assertEqual(len(clean), 1)
+
+  def test_verb_tampering_baseline_accessible(self):
+    """Endpoint already accessible via normal method → skip (not a tampering target)."""
+    ep = AdminEndpoint(path="/api/public/", method="GET")
+    probe = _make_probe(admin_endpoints=[ep])
+    session = probe.auth.regular_session
+    session.request = MagicMock(return_value=_mock_response(status=200, text="Public data"))
+
+    probe._test_verb_tampering()
+    a01_03 = [f for f in probe.findings if f.scenario_id == "PT-A01-03"]
+    self.assertEqual(len(a01_03), 0)
+
+  def test_verb_tampering_no_endpoints(self):
+    """No admin endpoints → no findings."""
+    probe = _make_probe(admin_endpoints=[])
+    probe._test_verb_tampering()
+    self.assertEqual(len([f for f in probe.findings if f.scenario_id == "PT-A01-03"]), 0)
+
+
+class TestMassAssignment(unittest.TestCase):
+
+  def test_mass_assignment_detected(self):
+    """Privilege field persisted → vulnerable/HIGH."""
+    probe = _make_probe(allow_stateful=True)
+    probe.discovered_forms = ["/profile/"]
+    session = probe.auth.regular_session
+
+    form_html = '<form><input name="username" value="alice"><input type="submit"></form>'
+    # After POST, GET shows is_admin in response
+    verify_html = '<form><input name="username" value="alice"><input name="is_admin" value="true"></form>'
+
+    call_count = [0]
+    def mock_get(url, **kwargs):
+      call_count[0] += 1
+      if call_count[0] <= 1:
+        return _mock_response(status=200, text=form_html)
+      return _mock_response(status=200, text=verify_html)
+
+    session.get = MagicMock(side_effect=mock_get)
+    session.post = MagicMock(return_value=_mock_response(status=302, text=""))
+    probe.auth.detected_csrf_field = None
+    probe.auth.extract_csrf_value = MagicMock(return_value=None)
+
+    probe._test_mass_assignment()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A04-01" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertIn("CWE-915", vuln[0].cwe)
+
+  def test_mass_assignment_rejected(self):
+    """Server rejects extra fields → not_vulnerable."""
+    probe = _make_probe(allow_stateful=True)
+    probe.discovered_forms = ["/profile/"]
+    session = probe.auth.regular_session
+
+    form_html = '<form><input name="username" value="alice"></form>'
+    session.get = MagicMock(return_value=_mock_response(status=200, text=form_html))
+    session.post = MagicMock(return_value=_mock_response(
+      status=200, text="<div class='error'>Unknown field</div>",
+    ))
+    probe.auth.detected_csrf_field = None
+    probe.auth.extract_csrf_value = MagicMock(return_value=None)
+
+    probe._test_mass_assignment()
+    clean = [f for f in probe.findings if f.scenario_id == "PT-A04-01" and f.status == "not_vulnerable"]
+    self.assertEqual(len(clean), 1)
+
+  def test_mass_assignment_gated(self):
+    """Skipped when allow_stateful=False → inconclusive."""
+    probe = _make_probe(allow_stateful=False)
+    findings = probe.run()
+    skip = [f for f in findings if f.scenario_id == "PT-A04-01" and f.status == "inconclusive"]
+    self.assertEqual(len(skip), 1)
+    self.assertIn("stateful_probes_disabled=True", skip[0].evidence)
+
+  def test_mass_assignment_no_forms(self):
+    """No forms → no findings."""
+    probe = _make_probe(allow_stateful=True)
+    probe.discovered_forms = []
+    probe._test_mass_assignment()
+    self.assertEqual(len([f for f in probe.findings if f.scenario_id == "PT-A04-01"]), 0)
 
 
 if __name__ == '__main__':

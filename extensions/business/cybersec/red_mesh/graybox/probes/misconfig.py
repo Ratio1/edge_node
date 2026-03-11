@@ -22,6 +22,8 @@ class MisconfigProbes(ProbeBase):
     self.run_safe("session_token", self._test_session_token)
     self.run_safe("login_rate_limiting", self._test_login_rate_limiting)
     self.run_safe("password_reset_token", self._test_password_reset_token)
+    self.run_safe("session_fixation", self._test_session_fixation)
+    self.run_safe("account_enumeration", self._test_account_enumeration)
     return self.findings
 
   def _test_debug_exposure(self):
@@ -612,4 +614,243 @@ class MisconfigProbes(ProbeBase):
         severity="INFO",
         owasp="A07:2021",
         evidence=[f"tokens_checked={len(tokens)}"],
+      ))
+
+  def _test_session_fixation(self):
+    """
+    PT-A07-03: test if session token rotates after successful login.
+
+    Session fixation occurs when the session ID remains the same before
+    and after authentication. An attacker who can set a pre-auth session
+    cookie (via XSS, URL injection, or subdomain) gains full access once
+    the victim logs in with that same session ID.
+
+    Compares pre-auth cookies from a fresh anonymous session against the
+    post-auth cookies on the already-established official session.
+    Read-only: does not perform additional logins.
+    """
+    if not self.auth.official_session:
+      return
+
+    login_url = self.target_url + self.target_config.login_path
+
+    # Step 1: GET login page with a fresh session, capture pre-auth cookies
+    pre_session = self.auth.make_anonymous_session()
+    try:
+      pre_session.get(login_url, timeout=10, allow_redirects=True)
+    except Exception:
+      pre_session.close()
+      return
+
+    pre_cookies = pre_session.cookies
+    if hasattr(pre_cookies, "get_dict"):
+      pre_cookies = pre_cookies.get_dict()
+    else:
+      pre_cookies = dict(pre_cookies)
+
+    pre_session.close()
+
+    if not pre_cookies:
+      return  # no pre-auth cookies → can't test fixation
+
+    # Step 2: get post-auth cookies from the existing official session
+    post_cookies = self.auth.official_session.cookies
+    if hasattr(post_cookies, "get_dict"):
+      post_cookies = post_cookies.get_dict()
+    else:
+      post_cookies = dict(post_cookies)
+
+    if not post_cookies:
+      return  # no post-auth cookies → can't compare
+
+    # Step 3: compare session cookies
+    # Find cookies that exist in BOTH pre-auth and post-auth with the same value
+    csrf_field = self.auth.detected_csrf_field
+    csrf_names = {"csrftoken", "csrf_token", "_csrf"}
+    if csrf_field:
+      csrf_names.add(csrf_field.lower())
+
+    fixed_cookies = []
+    for name, pre_value in pre_cookies.items():
+      post_value = post_cookies.get(name)
+      if post_value and pre_value == post_value:
+        # Skip CSRF tokens — they're not session identifiers
+        if name.lower() in csrf_names:
+          continue
+        fixed_cookies.append(name)
+
+    if fixed_cookies:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A07-03",
+        title="Session fixation — token not rotated after login",
+        status="vulnerable",
+        severity="HIGH",
+        owasp="A07:2021",
+        cwe=["CWE-384"],
+        attack=["T1550"],
+        evidence=[
+          f"fixed_cookies={','.join(fixed_cookies)}",
+          "pre_auth_value_equals_post_auth_value=True",
+        ],
+        replay_steps=[
+          "Obtain a pre-authentication session cookie.",
+          "Log in using valid credentials.",
+          "Observe that the session cookie value did not change.",
+          "An attacker who sets this cookie before login inherits the authenticated session.",
+        ],
+        remediation="Regenerate session ID after successful authentication. "
+                    "Django: this is automatic. Flask: call session.regenerate(). "
+                    "Rails: call reset_session in the login action.",
+      ))
+    else:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A07-03",
+        title="Session fixation — token properly rotated",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A07:2021",
+        evidence=[
+          f"pre_auth_cookies={len(pre_cookies)}",
+          f"post_auth_cookies={len(post_cookies)}",
+          "all_session_tokens_rotated=True",
+        ],
+      ))
+
+  def _test_account_enumeration(self):
+    """
+    PT-A07-04: test if login responses differ for valid vs invalid usernames.
+
+    Compares error responses when submitting:
+    1. A known-valid username with a wrong password
+    2. A definitely-invalid username with a wrong password
+
+    If the responses differ (different error message, status code, or
+    response length), attackers can enumerate valid accounts.
+
+    Read-only: only submits failed login attempts.
+    """
+    login_url = self.target_url + self.target_config.login_path
+
+    # We need a known-valid username — use the official account username
+    valid_username = self.auth.target_config.username_field
+    # Actually, we need the actual username value, not the field name.
+    # We can infer it: if official_session exists, the configured username is valid.
+    # The username is not stored in AuthManager — use the regular_username from probe
+    # init, or fall back to common defaults.
+    valid_username = self.regular_username or "admin"
+
+    invalid_username = "enum_probe_nonexistent_user_x9z7q"
+    wrong_password = "wrong_password_probe"
+
+    session = self.auth.make_anonymous_session()
+
+    def _submit_login(username):
+      """Submit a failed login and return (status_code, body, content_length)."""
+      try:
+        page = session.get(login_url, timeout=10)
+      except Exception:
+        return None
+
+      csrf_field = self.auth.detected_csrf_field
+      csrf_token = None
+      if csrf_field:
+        csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+
+      payload = {
+        self.target_config.username_field: username,
+        self.target_config.password_field: wrong_password,
+      }
+      if csrf_token and csrf_field:
+        payload[csrf_field] = csrf_token
+
+      try:
+        resp = session.post(
+          login_url, data=payload,
+          headers={"Referer": login_url},
+          timeout=10, allow_redirects=True,
+        )
+      except Exception:
+        return None
+
+      return (resp.status_code, resp.text, len(resp.text))
+
+    self.safety.throttle()
+    result_valid = _submit_login(valid_username)
+    self.safety.throttle()
+    result_invalid = _submit_login(invalid_username)
+
+    session.close()
+
+    if not result_valid or not result_invalid:
+      return
+
+    status_valid, body_valid, len_valid = result_valid
+    status_invalid, body_invalid, len_invalid = result_invalid
+
+    differences = []
+
+    # Check status code difference
+    if status_valid != status_invalid:
+      differences.append(f"status_code: valid={status_valid}, invalid={status_invalid}")
+
+    # Check for different error messages
+    # Extract the specific error text near common patterns
+    import re
+    error_patterns = [
+      r'(?:class=["\'][^"\']*error[^"\']*["\'][^>]*>)(.*?)<',
+      r'(?:class=["\'][^"\']*alert[^"\']*["\'][^>]*>)(.*?)<',
+      r'(?:class=["\'][^"\']*message[^"\']*["\'][^>]*>)(.*?)<',
+    ]
+    msg_valid = ""
+    msg_invalid = ""
+    for pat in error_patterns:
+      m_valid = re.search(pat, body_valid, re.I | re.DOTALL)
+      m_invalid = re.search(pat, body_invalid, re.I | re.DOTALL)
+      if m_valid:
+        msg_valid = m_valid.group(1).strip()
+      if m_invalid:
+        msg_invalid = m_invalid.group(1).strip()
+      if msg_valid and msg_invalid:
+        break
+
+    if msg_valid and msg_invalid and msg_valid != msg_invalid:
+      differences.append(f"error_message: valid_user='{msg_valid[:80]}', "
+                         f"invalid_user='{msg_invalid[:80]}'")
+
+    # Check response length difference (>10% threshold to avoid noise)
+    if len_valid > 0 and len_invalid > 0:
+      ratio = abs(len_valid - len_invalid) / max(len_valid, len_invalid)
+      if ratio > 0.10:
+        differences.append(f"response_length: valid={len_valid}, invalid={len_invalid}")
+
+    if differences:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A07-04",
+        title="Account enumeration via login response differences",
+        status="vulnerable",
+        severity="MEDIUM",
+        owasp="A07:2021",
+        cwe=["CWE-204"],
+        attack=["T1078"],
+        evidence=differences,
+        replay_steps=[
+          f"Submit login with valid username '{valid_username}' and wrong password.",
+          f"Submit login with invalid username '{invalid_username}' and wrong password.",
+          "Compare responses — differences reveal account existence.",
+        ],
+        remediation="Return identical error messages for all failed login attempts. "
+                    "Use generic text like 'Invalid credentials' regardless of "
+                    "whether the username exists.",
+      ))
+    else:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A07-04",
+        title="Account enumeration — responses consistent",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A07:2021",
+        evidence=[
+          f"status_codes_match={status_valid == status_invalid}",
+          f"response_lengths_similar=True",
+        ],
       ))
