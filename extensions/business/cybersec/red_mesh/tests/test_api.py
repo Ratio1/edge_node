@@ -693,6 +693,30 @@ class TestPhase2PassFinalization(unittest.TestCase):
     # Aggregated data should have open_ports (from AggregatedScanData)
     self.assertIn("open_ports", agg_dict)
 
+  def test_continuous_pass_returns_job_status_to_running(self):
+    """Continuous monitoring jobs re-enter RUNNING after pass finalization."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(run_mode="CONTINUOUS_MONITORING")
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {"80": "http"},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com", "monitor_interval": 60})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "RUNNING")
+    self.assertIsNotNone(job_specs.get("next_pass_at"))
+
   def test_finding_id_deterministic(self):
     """Same input produces same finding_id; different title produces different id."""
     PentesterApi01Plugin = self._get_plugin_class()
