@@ -121,6 +121,30 @@ class TestPhase1ConfigCID(unittest.TestCase):
     return plugin
 
   @classmethod
+  def _bind_launch_helpers(cls, plugin):
+    """Bind real launch helper methods onto a MagicMock plugin host."""
+    cls._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin._validation_error = lambda message: PentesterApi01Plugin._validation_error(plugin, message)
+    plugin._parse_exceptions = lambda exceptions: PentesterApi01Plugin._parse_exceptions(plugin, exceptions)
+    plugin._resolve_enabled_features = lambda excluded: PentesterApi01Plugin._resolve_enabled_features(plugin, excluded)
+    plugin._resolve_active_peers = lambda selected: PentesterApi01Plugin._resolve_active_peers(plugin, selected)
+    plugin._normalize_common_launch_options = lambda **kwargs: PentesterApi01Plugin._normalize_common_launch_options(
+      plugin, **kwargs
+    )
+    plugin._build_network_workers = lambda active_peers, start_port, end_port, distribution_strategy: (
+      PentesterApi01Plugin._build_network_workers(plugin, active_peers, start_port, end_port, distribution_strategy)
+    )
+    plugin._build_webapp_workers = lambda active_peers, target_port: (
+      PentesterApi01Plugin._build_webapp_workers(plugin, active_peers, target_port)
+    )
+    plugin._announce_launch = lambda **kwargs: PentesterApi01Plugin._announce_launch(plugin, **kwargs)
+    plugin.launch_network_scan = lambda **kwargs: PentesterApi01Plugin.launch_network_scan(plugin, **kwargs)
+    plugin.launch_webapp_scan = lambda **kwargs: PentesterApi01Plugin.launch_webapp_scan(plugin, **kwargs)
+    return plugin
+
+  @classmethod
   def _extract_job_specs(cls, plugin, job_id):
     """Extract the job_specs dict from chainstore_hset calls."""
     for call in plugin.chainstore_hset.call_args_list:
@@ -133,9 +157,33 @@ class TestPhase1ConfigCID(unittest.TestCase):
     """Call launch_test with mocked base modules."""
     self._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    self._bind_launch_helpers(plugin)
     defaults = dict(target="example.com", start_port=1, end_port=1024, exceptions="", authorized=True)
     defaults.update(kwargs)
     return PentesterApi01Plugin.launch_test(plugin, **defaults)
+
+  def _launch_network(self, plugin, **kwargs):
+    """Call launch_network_scan with mocked base modules."""
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    self._bind_launch_helpers(plugin)
+    defaults = dict(target="example.com", start_port=1, end_port=1024, exceptions="", authorized=True)
+    defaults.update(kwargs)
+    return PentesterApi01Plugin.launch_network_scan(plugin, **defaults)
+
+  def _launch_webapp(self, plugin, **kwargs):
+    """Call launch_webapp_scan with mocked base modules."""
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    self._bind_launch_helpers(plugin)
+    defaults = dict(
+      target_url="https://example.com/app",
+      official_username="admin",
+      official_password="secret",
+      authorized=True,
+    )
+    defaults.update(kwargs)
+    return PentesterApi01Plugin.launch_webapp_scan(plugin, **defaults)
 
   def test_launch_builds_job_config_and_stores_cid(self):
     """launch_test() builds JobConfig, saves to R1FS, stores job_config_cid in CStore."""
@@ -211,6 +259,87 @@ class TestPhase1ConfigCID(unittest.TestCase):
     # CStore should NOT have been written with the job
     job_specs = self._extract_job_specs(plugin, "test-job-5")
     self.assertIsNone(job_specs)
+
+  def test_launch_webapp_scan_uses_mirrored_worker_assignments(self):
+    """Webapp launches assign the same resolved target port to every selected peer."""
+    plugin = self._build_mock_plugin(job_id="test-job-webapp")
+    plugin.chainstore_peers = ["node-1", "node-2"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2"]
+
+    result = self._launch_webapp(plugin, selected_peers=["node-1", "node-2"])
+    self.assertNotIn("error", result)
+
+    job_specs = self._extract_job_specs(plugin, "test-job-webapp")
+    workers = job_specs["workers"]
+    self.assertEqual(workers["node-1"]["start_port"], 443)
+    self.assertEqual(workers["node-1"]["end_port"], 443)
+    self.assertEqual(workers["node-2"]["start_port"], 443)
+    self.assertEqual(workers["node-2"]["end_port"], 443)
+
+  def test_launch_webapp_scan_neutralizes_network_only_fields(self):
+    """Webapp config does not persist bogus network defaults like exceptions='64297'."""
+    plugin = self._build_mock_plugin(job_id="test-job-webcfg")
+    self._launch_webapp(plugin)
+
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["scan_type"], "webapp")
+    self.assertEqual(config_dict["exceptions"], [])
+    self.assertEqual(config_dict["distribution_strategy"], "MIRROR")
+    self.assertEqual(config_dict["nr_local_workers"], 1)
+    self.assertEqual(config_dict["target_url"], "https://example.com/app")
+
+  def test_launch_webapp_scan_rejects_missing_target_url(self):
+    """Webapp endpoint returns structured validation error for missing URL."""
+    plugin = self._build_mock_plugin(job_id="test-job-weberr")
+    result = self._launch_webapp(plugin, target_url="")
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("target_url", result["message"])
+
+  def test_launch_webapp_scan_rejects_invalid_url_scheme(self):
+    """Webapp endpoint rejects malformed or non-http(s) targets."""
+    plugin = self._build_mock_plugin(job_id="test-job-webbadurl")
+    result = self._launch_webapp(plugin, target_url="ftp://example.com/app")
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("http/https", result["message"])
+
+  def test_launch_network_scan_requires_authorization_with_structured_error(self):
+    """Network endpoint returns validation_error when authorization is missing."""
+    plugin = self._build_mock_plugin(job_id="test-job-noauth")
+    result = self._launch_network(plugin, authorized=False)
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("authorization", result["message"].lower())
+
+  def test_launch_test_rejects_invalid_scan_type(self):
+    """Compatibility endpoint rejects unknown scan types with a structured error."""
+    plugin = self._build_mock_plugin(job_id="test-job-badtype")
+    result = self._launch(plugin, scan_type="invalid-scan-type")
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("Invalid scan_type", result["message"])
+
+  def test_launch_test_routes_to_scan_type_specific_endpoint(self):
+    """Compatibility launch_test routes to network/webapp launch methods."""
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.launch_network_scan = MagicMock(return_value={"route": "network"})
+    plugin.launch_webapp_scan = MagicMock(return_value={"route": "webapp"})
+
+    network = PentesterApi01Plugin.launch_test(plugin, target="example.com", authorized=True, scan_type="network")
+    webapp = PentesterApi01Plugin.launch_test(
+      plugin,
+      target="example.com",
+      target_url="https://example.com/app",
+      official_username="admin",
+      official_password="secret",
+      authorized=True,
+      scan_type="webapp",
+    )
+
+    self.assertEqual(network["route"], "network")
+    self.assertEqual(webapp["route"], "webapp")
+    plugin.launch_network_scan.assert_called_once()
+    plugin.launch_webapp_scan.assert_called_once()
 
 
 
