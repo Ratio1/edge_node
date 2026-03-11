@@ -62,53 +62,91 @@ class MisconfigProbes(ProbeBase):
       ))
 
   def _test_cors(self):
-    """PT-A02-02: check for permissive CORS configuration."""
+    """PT-A02-02: check for permissive CORS configuration.
+
+    Tests both the root URL and discovered API routes, since many apps
+    only set CORS headers on API endpoints (e.g. /api/*).
+    """
     session = self.auth.anon_session or self.auth.official_session
     if not session:
       return
 
-    self.safety.throttle()
-    try:
-      resp = session.get(
-        self.target_url + "/",
-        headers={"Origin": "http://evil.example.com"},
-        timeout=10,
-      )
-    except Exception:
-      return
+    # Build candidate URLs: root + configured endpoints + discovered API routes.
+    # Many apps only set CORS headers on API routes, so we must test those too.
+    test_paths = ["/"]
+    # Add configured endpoints (IDOR, admin, workflow) — these are known API paths
+    for ep in self.target_config.access_control.idor_endpoints:
+      test_paths.append(ep.path.replace("{id}", "1"))
+    for ep in self.target_config.access_control.admin_endpoints:
+      test_paths.append(ep.path)
+    for ep in self.target_config.business_logic.workflow_endpoints:
+      test_paths.append(ep.path.replace("{id}", "1"))
+    # Add discovered API-like routes
+    for route in self.discovered_routes:
+      if "/api/" in route.lower():
+        test_paths.append(route)
+    # Deduplicate while preserving order
+    seen = set()
+    unique_paths = []
+    for p in test_paths:
+      if p not in seen:
+        seen.add(p)
+        unique_paths.append(p)
 
-    acao = resp.headers.get("Access-Control-Allow-Origin", "")
-    acac = resp.headers.get("Access-Control-Allow-Credentials", "").lower()
+    worst_finding = None
+    for path in unique_paths:
+      self.safety.throttle()
+      try:
+        resp = session.get(
+          self.target_url + path,
+          headers={"Origin": "http://evil.example.com"},
+          timeout=10,
+          allow_redirects=False,
+        )
+      except Exception:
+        continue
 
-    if acao == "*":
-      self.findings.append(GrayboxFinding(
-        scenario_id="PT-A02-02",
-        title="Permissive CORS: wildcard origin",
-        status="vulnerable",
-        severity="MEDIUM",
-        owasp="A02:2021",
-        cwe=["CWE-942"],
-        evidence=[
-          f"access_control_allow_origin={acao}",
-          f"allow_credentials={acac}",
-        ],
-        remediation="Restrict Access-Control-Allow-Origin to trusted domains. Never use * with credentials.",
-      ))
-    elif acao == "http://evil.example.com":
-      severity = "HIGH" if acac == "true" else "MEDIUM"
-      self.findings.append(GrayboxFinding(
-        scenario_id="PT-A02-02",
-        title="CORS reflects arbitrary origin",
-        status="vulnerable",
-        severity=severity,
-        owasp="A02:2021",
-        cwe=["CWE-942"],
-        evidence=[
-          f"access_control_allow_origin={acao}",
-          f"allow_credentials={acac}",
-        ],
-        remediation="Validate the Origin header against an allowlist. Do not reflect arbitrary origins.",
-      ))
+      acao = resp.headers.get("Access-Control-Allow-Origin", "")
+      acac = resp.headers.get("Access-Control-Allow-Credentials", "").lower()
+
+      if acao == "*":
+        finding = GrayboxFinding(
+          scenario_id="PT-A02-02",
+          title="Permissive CORS: wildcard origin",
+          status="vulnerable",
+          severity="HIGH" if acac == "true" else "MEDIUM",
+          owasp="A02:2021",
+          cwe=["CWE-942"],
+          evidence=[
+            f"path={path}",
+            f"access_control_allow_origin={acao}",
+            f"allow_credentials={acac}",
+          ],
+          remediation="Restrict Access-Control-Allow-Origin to trusted domains. Never use * with credentials.",
+        )
+        if not worst_finding or finding.severity == "HIGH":
+          worst_finding = finding
+      elif acao == "http://evil.example.com":
+        severity = "HIGH" if acac == "true" else "MEDIUM"
+        finding = GrayboxFinding(
+          scenario_id="PT-A02-02",
+          title="CORS reflects arbitrary origin",
+          status="vulnerable",
+          severity=severity,
+          owasp="A02:2021",
+          cwe=["CWE-942"],
+          evidence=[
+            f"path={path}",
+            f"access_control_allow_origin={acao}",
+            f"allow_credentials={acac}",
+          ],
+          remediation="Validate the Origin header against an allowlist. Do not reflect arbitrary origins.",
+        )
+        if not worst_finding or severity == "HIGH":
+          worst_finding = finding
+
+    if worst_finding:
+      self.findings.append(worst_finding)
     else:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A02-02",
@@ -116,7 +154,7 @@ class MisconfigProbes(ProbeBase):
         status="not_vulnerable",
         severity="INFO",
         owasp="A02:2021",
-        evidence=[f"access_control_allow_origin={acao or 'absent'}"],
+        evidence=[f"paths_tested={len(unique_paths)}"],
       ))
 
   def _test_security_headers(self):
@@ -214,7 +252,8 @@ class MisconfigProbes(ProbeBase):
 
     csrf_test_endpoints = []
     for ep in self.target_config.business_logic.workflow_endpoints:
-      csrf_test_endpoints.append(ep.path)
+      path = ep.path.replace("{id}", "1") if "{id}" in ep.path else ep.path
+      csrf_test_endpoints.append(path)
     for form in self.discovered_forms:
       if form == self.target_config.login_path:
         continue

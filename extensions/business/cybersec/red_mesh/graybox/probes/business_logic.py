@@ -114,6 +114,9 @@ class BusinessLogicProbes(ProbeBase):
 
     Tests if regular user can access workflow endpoints that should
     require elevated permissions or specific state transitions.
+
+    For POST endpoints, includes the CSRF token so that CSRF rejection
+    doesn't mask a real authorization gap.
     """
     if not self.auth.regular_session:
       return
@@ -122,14 +125,50 @@ class BusinessLogicProbes(ProbeBase):
     if not endpoints:
       return
 
+    # Resolve {id} placeholders using IDOR test_ids (default: try 1 and 2)
+    idor_ids = [1, 2]
+    for iep in self.target_config.access_control.idor_endpoints:
+      if iep.test_ids:
+        idor_ids = iep.test_ids
+        break
+
     for ep in endpoints:
+      path = ep.path
+      if "{id}" in path:
+        path = path.replace("{id}", str(idor_ids[0]))
       self.safety.throttle()
-      url = self.target_url + ep.path
+      url = self.target_url + path
       method = ep.method.upper()
 
       try:
         if method == "POST":
-          resp = self.auth.regular_session.post(url, data={}, timeout=10)
+          # Fetch the endpoint (or a page that carries CSRF tokens) to get
+          # a fresh CSRF token — otherwise Django/Rails may return 403 for
+          # missing CSRF, masking the real authorization check.
+          csrf_token = None
+          csrf_field = self.auth.detected_csrf_field
+          if csrf_field:
+            csrf_token = self.auth.regular_session.cookies.get("csrftoken") or \
+                         self.auth.regular_session.cookies.get("csrf_token")
+          if not csrf_token and csrf_field:
+            try:
+              page_resp = self.auth.regular_session.get(
+                self.target_url + "/", timeout=10,
+              )
+              csrf_token = self.auth.extract_csrf_value(
+                page_resp.text, csrf_field,
+              )
+            except Exception:
+              pass
+
+          payload = {}
+          headers = {"Referer": self.target_url + path}
+          if csrf_token and csrf_field:
+            payload[csrf_field] = csrf_token
+            headers["X-CSRFToken"] = csrf_token
+          resp = self.auth.regular_session.post(
+            url, data=payload, headers=headers, timeout=10,
+          )
         else:
           resp = self.auth.regular_session.get(url, timeout=10)
       except Exception:
@@ -160,7 +199,7 @@ class BusinessLogicProbes(ProbeBase):
             ],
             replay_steps=[
               "Log in as regular user.",
-              f"Send {method} to {ep.path}.",
+              f"Send {method} to {path}.",
               f"Observe status {resp.status_code} instead of expected guard {expected}.",
             ],
             remediation="Enforce workflow state guards and role checks on all state-changing endpoints.",
