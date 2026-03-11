@@ -64,9 +64,11 @@ class TestPhase12LiveProgress(unittest.TestCase):
       "job-B:worker-3": {"job_id": "job-B", "progress": 30},
     }
     plugin.chainstore_hgetall.return_value = live_data
+    plugin.chainstore_hget.return_value = {"job_status": "RUNNING"}
 
     result = Plugin.get_job_progress(plugin, job_id="job-A")
     self.assertEqual(result["job_id"], "job-A")
+    self.assertEqual(result["status"], "RUNNING")
     self.assertEqual(len(result["workers"]), 2)
     self.assertIn("worker-1", result["workers"])
     self.assertIn("worker-2", result["workers"])
@@ -78,9 +80,11 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin = MagicMock()
     plugin.cfg_instance_id = "test-instance"
     plugin.chainstore_hgetall.return_value = {}
+    plugin.chainstore_hget.return_value = None
 
     result = Plugin.get_job_progress(plugin, job_id="nonexistent")
     self.assertEqual(result["job_id"], "nonexistent")
+    self.assertIsNone(result["status"])
     self.assertEqual(result["workers"], {})
 
   def test_publish_live_progress(self):
@@ -470,6 +474,8 @@ class TestPhase15Listing(unittest.TestCase):
       "job_id": "job-1",
       "job_status": "FINALIZED",
       "target": "10.0.0.1",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/app",
       "task_name": "scan-1",
       "risk_score": 75,
       "run_mode": "SINGLEPASS",
@@ -497,6 +503,8 @@ class TestPhase15Listing(unittest.TestCase):
     self.assertEqual(entry["job_status"], "FINALIZED")
     self.assertEqual(entry["job_cid"], "QmArchive123")
     self.assertEqual(entry["job_config_cid"], "QmConfig456")
+    self.assertEqual(entry["scan_type"], "webapp")
+    self.assertEqual(entry["target_url"], "https://example.com/app")
     self.assertEqual(entry["target"], "10.0.0.1")
     self.assertEqual(entry["risk_score"], 75)
     self.assertEqual(entry["duration"], 120.5)
@@ -513,6 +521,8 @@ class TestPhase15Listing(unittest.TestCase):
       "job_id": "job-2",
       "job_status": "RUNNING",
       "target": "10.0.0.2",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/live",
       "task_name": "scan-2",
       "risk_score": 0,
       "run_mode": "CONTINUOUS_MONITORING",
@@ -548,6 +558,8 @@ class TestPhase15Listing(unittest.TestCase):
     self.assertEqual(entry["job_id"], "job-2")
     self.assertEqual(entry["job_status"], "RUNNING")
     self.assertEqual(entry["target"], "10.0.0.2")
+    self.assertEqual(entry["scan_type"], "webapp")
+    self.assertEqual(entry["target_url"], "https://example.com/live")
     self.assertEqual(entry["task_name"], "scan-2")
     self.assertEqual(entry["run_mode"], "CONTINUOUS_MONITORING")
     self.assertEqual(entry["job_pass"], 3)
@@ -971,6 +983,5 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     # OR flags
     self.assertFalse(sm["rate_limiting_detected"])
     self.assertTrue(sm["blocking_detected"])
-
 
 

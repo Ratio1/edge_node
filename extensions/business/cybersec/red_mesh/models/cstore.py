@@ -126,6 +126,8 @@ class CStoreJobFinalized:
   job_id: str
   job_status: str                   # FINALIZED | STOPPED
   target: str
+  scan_type: str
+  target_url: str
   task_name: str
   risk_score: float
   run_mode: str
@@ -150,6 +152,8 @@ class CStoreJobFinalized:
       job_id=d["job_id"],
       job_status=d["job_status"],
       target=d["target"],
+      scan_type=d.get("scan_type", "network"),
+      target_url=d.get("target_url", ""),
       task_name=d.get("task_name", ""),
       risk_score=d.get("risk_score", 0),
       run_mode=d["run_mode"],

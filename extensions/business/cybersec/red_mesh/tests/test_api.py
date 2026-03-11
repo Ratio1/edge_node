@@ -909,7 +909,8 @@ class TestPhase3Archive(unittest.TestCase):
     # Job config
     job_config = {
       "target": "example.com", "start_port": 1, "end_port": 1024,
-      "run_mode": run_mode, "enabled_features": [],
+      "run_mode": run_mode, "enabled_features": [], "scan_type": "webapp",
+      "target_url": "https://example.com/app",
     }
 
     # Latest aggregated data
@@ -954,6 +955,8 @@ class TestPhase3Archive(unittest.TestCase):
       "launcher": "launcher-node",
       "launcher_alias": "launcher-alias",
       "target": "example.com",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/app",
       "task_name": "Test",
       "start_port": 1,
       "end_port": 1024,
@@ -1020,6 +1023,8 @@ class TestPhase3Archive(unittest.TestCase):
     stub = hset_call[1]["value"]
     self.assertEqual(stub["job_cid"], "QmArchiveCID")
     self.assertEqual(stub["job_config_cid"], "QmConfigCID")
+    self.assertEqual(stub["scan_type"], "webapp")
+    self.assertEqual(stub["target_url"], "https://example.com/app")
 
   def test_stub_fields_match_model(self):
     """Stub has exactly CStoreJobFinalized fields."""
@@ -1035,6 +1040,8 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(finalized.job_id, "test-job")
     self.assertEqual(finalized.job_status, "FINALIZED")
     self.assertEqual(finalized.target, "example.com")
+    self.assertEqual(finalized.scan_type, "webapp")
+    self.assertEqual(finalized.target_url, "https://example.com/app")
     self.assertEqual(finalized.pass_count, 1)
     self.assertEqual(finalized.worker_count, 1)
     self.assertEqual(finalized.start_port, 1)
@@ -1175,6 +1182,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       "job_id": job_id,
       "job_status": "FINALIZED",
       "target": "example.com",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/app",
       "task_name": "Test",
       "risk_score": 42,
       "run_mode": "SINGLEPASS",
@@ -1200,6 +1209,8 @@ class TestPhase5Endpoints(unittest.TestCase):
     return {
       "job_id": job_id,
       "job_status": "RUNNING",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/app",
       "job_pass": pass_count,
       "run_mode": "CONTINUOUS_MONITORING",
       "launcher": "launcher-node",
@@ -1315,6 +1326,8 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(job["worker_count"], 2)
     self.assertEqual(job["risk_score"], 42)
     self.assertEqual(job["duration"], 200.0)
+    self.assertEqual(job["scan_type"], "webapp")
+    self.assertEqual(job["target_url"], "https://example.com/app")
 
   def test_list_jobs_running_stripped(self):
     """Running jobs have counts but no timeline, workers, or pass_reports."""
@@ -1328,10 +1341,23 @@ class TestPhase5Endpoints(unittest.TestCase):
     # Should have counts
     self.assertEqual(job["pass_count"], 3)
     self.assertEqual(job["worker_count"], 2)
+    self.assertEqual(job["scan_type"], "webapp")
+    self.assertEqual(job["target_url"], "https://example.com/app")
     # Should NOT have heavy fields
     self.assertNotIn("timeline", job)
     self.assertNotIn("workers", job)
     self.assertNotIn("pass_reports", job)
+
+  def test_get_job_progress_returns_job_status(self):
+    """get_job_progress surfaces job_status from CStore job specs."""
+    Plugin = self._get_plugin_class()
+    running = self._build_running_job("run-job", pass_count=2)
+    plugin = self._build_plugin({"run-job": running})
+    plugin.chainstore_hgetall.return_value = {"run-job:worker-A": {"job_id": "run-job", "progress": 50}}
+
+    result = Plugin.get_job_progress(plugin, job_id="run-job")
+    self.assertEqual(result["status"], "RUNNING")
+    self.assertIn("worker-A", result["workers"])
 
   def test_get_job_archive_not_found(self):
     """get_job_archive for non-existent job returns not_found."""
@@ -1350,6 +1376,4 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job")
     self.assertEqual(result["error"], "fetch_failed")
-
-
 
