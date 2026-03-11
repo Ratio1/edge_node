@@ -280,12 +280,6 @@ RISK_CRED_PENALTY_CAP = 30
 JOB_ARCHIVE_VERSION = 1
 MAX_CONTINUOUS_PASSES = 100
 
-# =====================================================================
-# Live progress publishing
-# =====================================================================
-
-PROGRESS_PUBLISH_INTERVAL = 10  # seconds between progress updates to CStore
-
 # Scan phases in execution order (5 phases total)
 PHASE_ORDER = ["port_scan", "fingerprint", "service_probes", "web_tests", "correlation"]
 PHASE_MARKERS = {
