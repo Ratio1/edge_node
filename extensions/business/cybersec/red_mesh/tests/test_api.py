@@ -118,6 +118,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.chainstore_peers = ["node-1"]
     plugin.cfg_chainstore_peers = ["node-1"]
     plugin._redact_job_config = staticmethod(lambda d: d)
+    plugin._validate_feature_catalog = MagicMock()
     return plugin
 
   @classmethod
@@ -126,9 +127,19 @@ class TestPhase1ConfigCID(unittest.TestCase):
     cls._mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
 
+    plugin._coerce_scan_type = lambda scan_type=None: PentesterApi01Plugin._coerce_scan_type(plugin, scan_type)
     plugin._validation_error = lambda message: PentesterApi01Plugin._validation_error(plugin, message)
     plugin._parse_exceptions = lambda exceptions: PentesterApi01Plugin._parse_exceptions(plugin, exceptions)
-    plugin._resolve_enabled_features = lambda excluded: PentesterApi01Plugin._resolve_enabled_features(plugin, excluded)
+    plugin._get_supported_features = lambda scan_type=None, categs=False: PentesterApi01Plugin._get_supported_features(
+      plugin, scan_type=scan_type, categs=categs
+    )
+    plugin._get_all_features = lambda categs=False, scan_type=None: PentesterApi01Plugin._get_all_features(
+      plugin, categs=categs, scan_type=scan_type
+    )
+    plugin._get_feature_catalog = lambda scan_type=None: PentesterApi01Plugin._get_feature_catalog(plugin, scan_type)
+    plugin._resolve_enabled_features = lambda excluded, scan_type="network": (
+      PentesterApi01Plugin._resolve_enabled_features(plugin, excluded, scan_type=scan_type)
+    )
     plugin._resolve_active_peers = lambda selected: PentesterApi01Plugin._resolve_active_peers(plugin, selected)
     plugin._normalize_common_launch_options = lambda **kwargs: PentesterApi01Plugin._normalize_common_launch_options(
       plugin, **kwargs
@@ -340,6 +351,86 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(webapp["route"], "webapp")
     plugin.launch_network_scan.assert_called_once()
     plugin.launch_webapp_scan.assert_called_once()
+
+  def test_launch_webapp_scan_persists_graybox_enabled_features_only(self):
+    """Webapp launches resolve enabled features from the graybox capability set only."""
+    plugin = self._build_mock_plugin(job_id="test-job-webfeatures")
+    self._launch_webapp(plugin, excluded_features=["_graybox_injection"])
+
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["excluded_features"], ["_graybox_injection"])
+    self.assertIn("_graybox_access_control", config_dict["enabled_features"])
+    self.assertIn("_graybox_weak_auth", config_dict["enabled_features"])
+    self.assertNotIn("_graybox_injection", config_dict["enabled_features"])
+    self.assertFalse(any(method.startswith("_service_info_") for method in config_dict["enabled_features"]))
+    self.assertFalse(any(method.startswith("_web_test_") for method in config_dict["enabled_features"]))
+
+
+class TestPhase4FeatureCatalog(unittest.TestCase):
+  """Phase 4: feature catalog and scan-type capability modeling."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    mock_plugin_modules()
+
+  def _build_plugin(self):
+    plugin = MagicMock()
+    plugin.json_dumps = staticmethod(json.dumps)
+    plugin.P = MagicMock()
+    return TestPhase1ConfigCID._bind_launch_helpers(plugin)
+
+  def test_get_all_features_filters_by_scan_type(self):
+    """Capability discovery is scan-type-aware."""
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = self._build_plugin()
+    network = PentesterApi01Plugin._get_all_features(plugin, scan_type="network")
+    webapp = PentesterApi01Plugin._get_all_features(plugin, scan_type="webapp")
+    merged = PentesterApi01Plugin._get_all_features(plugin)
+
+    self.assertIn("_service_info_http", network)
+    self.assertIn("_post_scan_correlate", network)
+    self.assertNotIn("_graybox_access_control", network)
+    self.assertIn("_graybox_access_control", webapp)
+    self.assertNotIn("_service_info_http", webapp)
+    self.assertIn("_graybox_access_control", merged)
+    self.assertIn("_service_info_http", merged)
+
+  def test_get_feature_catalog_filters_graybox_category(self):
+    """Catalog filtering returns only graybox entries for webapp scans."""
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = self._build_plugin()
+    response = PentesterApi01Plugin.get_feature_catalog(plugin, scan_type="webapp")
+
+    self.assertEqual([item["category"] for item in response["catalog"]], ["graybox"])
+    self.assertIn("_graybox_access_control", response["all_methods"])
+    self.assertNotIn("_service_info_http", response["all_methods"])
+
+  def test_validate_feature_catalog_rejects_missing_worker_methods(self):
+    """Startup validation fails loudly when catalog methods are not executable."""
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = self._build_plugin()
+    bad_catalog = [
+      {
+        "id": "graybox",
+        "label": "Graybox",
+        "description": "Broken",
+        "category": "graybox",
+        "methods": ["_graybox_missing_method"],
+      }
+    ]
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.pentester_api_01.FEATURE_CATALOG",
+      bad_catalog,
+    ):
+      with self.assertRaises(RuntimeError):
+        PentesterApi01Plugin._validate_feature_catalog(plugin)
 
 
 
