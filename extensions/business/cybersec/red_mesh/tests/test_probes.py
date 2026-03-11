@@ -1839,6 +1839,22 @@ class TestCorrelationEngine(unittest.TestCase):
     self.assertTrue(worker.state["done"])
     self.assertIn("correlation_completed", worker.state["completed_tests"])
 
+  def test_execute_job_skips_disabled_correlation_probe(self):
+    """Disabled correlation is reflected as a skipped probe, not silently omitted."""
+    _, worker = self._build_worker()
+    worker._PentestLocalWorker__enabled_features = []
+
+    with patch.object(worker, "_scan_ports_step"), \
+         patch.object(worker, "_active_fingerprint_ports"), \
+         patch.object(worker, "_gather_service_info"), \
+         patch.object(worker, "_run_web_tests"), \
+         patch.object(worker, "_post_scan_correlate") as mock_correlate:
+      worker.execute_job()
+
+    mock_correlate.assert_not_called()
+    metrics = worker.metrics.build().to_dict()
+    self.assertEqual(metrics["probe_breakdown"]["_post_scan_correlate"], "skipped:disabled")
+
 
 
 class TestScannerEnhancements(unittest.TestCase):
@@ -5075,6 +5091,5 @@ class TestBatch5Improvements(unittest.TestCase):
     cve_ids = {f.title.split(":")[0] for f in findings if "CVE-" in f.title}
     expected = {"CVE-2023-26048", "CVE-2023-26049", "CVE-2023-36478", "CVE-2023-40167"}
     self.assertEqual(cve_ids, expected, f"Should match all 4 Jetty CVEs, got {cve_ids}")
-
 
 
