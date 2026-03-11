@@ -135,6 +135,20 @@ class TestStatus(unittest.TestCase):
     status = worker.get_status()
     self.assertIn("scenario_stats", status)
 
+  def test_get_status_merges_scenario_stats_into_scan_metrics(self):
+    """scan_metrics includes graybox scenario counters."""
+    worker = _make_worker()
+    worker._store_findings("_test_probe", [GrayboxFinding(
+      scenario_id="TEST-01",
+      title="Test",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="A01:2021",
+    )])
+    status = worker.get_status()
+    self.assertEqual(status["scan_metrics"]["scenarios_total"], 1)
+    self.assertEqual(status["scan_metrics"]["scenarios_vulnerable"], 1)
+
   def test_get_status_for_aggregations(self):
     """for_aggregations=True omits local_worker_id."""
     worker = _make_worker()
@@ -360,6 +374,66 @@ class TestProbeDispatch(unittest.TestCase):
       worker.execute_job()
       mock_import.assert_not_called()
 
+  def test_excluded_probe_key_skips_only_that_probe(self):
+    """Per-probe exclusions suppress only the disabled graybox probe."""
+    worker = _make_worker(excluded_features=["_graybox_injection"])
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+    worker.auth.authenticate.return_value = True
+    worker.auth.official_session = MagicMock()
+    worker.auth.regular_session = MagicMock()
+    worker.auth._auth_errors = []
+    worker.auth.ensure_sessions = MagicMock()
+    worker.auth.cleanup = MagicMock()
+    worker.discovery.discover.return_value = ([], [])
+
+    imported = []
+    mock_probe = MagicMock()
+    mock_probe.run.return_value = []
+    mock_cls = MagicMock(return_value=mock_probe)
+    mock_cls.is_stateful = False
+    mock_cls.requires_auth = False
+    mock_cls.requires_regular_session = False
+
+    def track_import(cls_path):
+      imported.append(cls_path)
+      return mock_cls
+
+    with patch("extensions.business.cybersec.red_mesh.graybox.worker.GRAYBOX_PROBE_REGISTRY", [
+      {"key": "_graybox_injection", "cls": "inj.Probe"},
+      {"key": "_graybox_access_control", "cls": "acc.Probe"},
+    ]):
+      with patch.object(GrayboxLocalWorker, "_import_probe", staticmethod(track_import)):
+        worker.execute_job()
+
+    self.assertEqual(imported, ["acc.Probe"])
+    metrics = worker.get_status()["scan_metrics"]
+    self.assertEqual(metrics["probe_breakdown"]["_graybox_injection"], "skipped:disabled")
+    self.assertEqual(metrics["probe_breakdown"]["_graybox_access_control"], "completed")
+
+  def test_excluded_weak_auth_probe_records_skip(self):
+    """Weak-auth probe is skipped cleanly when disabled by feature control."""
+    worker = _make_worker(
+      weak_candidates=["admin:admin"],
+      excluded_features=["_graybox_weak_auth"],
+    )
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+    worker.auth.authenticate.return_value = True
+    worker.auth.official_session = MagicMock()
+    worker.auth.regular_session = MagicMock()
+    worker.auth._auth_errors = []
+    worker.auth.ensure_sessions = MagicMock()
+    worker.auth.cleanup = MagicMock()
+    worker.discovery.discover.return_value = ([], [])
+
+    with patch("extensions.business.cybersec.red_mesh.graybox.worker.BusinessLogicProbes") as mock_probe:
+      worker.execute_job()
+      mock_probe.assert_not_called()
+
+    metrics = worker.get_status()["scan_metrics"]
+    self.assertEqual(metrics["probe_breakdown"]["_graybox_weak_auth"], "skipped:disabled")
+
   def test_get_worker_specific_result_fields(self):
     """Includes graybox_results."""
     fields = GrayboxLocalWorker.get_worker_specific_result_fields()
@@ -416,6 +490,11 @@ class TestProbeDispatch(unittest.TestCase):
     # OK probe still ran
     ok_findings = worker.state["graybox_results"]["8000"]["_ok"]["findings"]
     self.assertEqual(len(ok_findings), 1)
+    metrics = worker.get_status()["scan_metrics"]
+    self.assertEqual(metrics["probe_breakdown"]["_crash"], "failed")
+    self.assertEqual(metrics["probe_breakdown"]["_ok"], "completed")
+    self.assertEqual(metrics["probes_failed"], 1)
+    self.assertEqual(metrics["probes_completed"], 1)
 
   def test_probe_error_records_finding(self):
     """Crashed probe emits inconclusive finding."""

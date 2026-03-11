@@ -119,8 +119,17 @@ class GrayboxLocalWorker(BaseLocalWorker):
   def get_status(self, for_aggregations=False):
     """Return worker state for aggregation by pentester_api_01.py."""
     status = dict(self.state)
-    status["scan_metrics"] = self.metrics.build().to_dict()
-    status["scenario_stats"] = self._compute_scenario_stats()
+    scenario_stats = self._compute_scenario_stats()
+    metrics = self.metrics.build().to_dict()
+    metrics.update({
+      "scenarios_total": scenario_stats["total"],
+      "scenarios_vulnerable": scenario_stats["vulnerable"],
+      "scenarios_clean": scenario_stats["not_vulnerable"],
+      "scenarios_inconclusive": scenario_stats["inconclusive"],
+      "scenarios_error": scenario_stats["error"],
+    })
+    status["scan_metrics"] = metrics
+    status["scenario_stats"] = scenario_stats
 
     if not for_aggregations:
       status["local_worker_id"] = self.local_worker_id
@@ -220,18 +229,25 @@ class GrayboxLocalWorker(BaseLocalWorker):
           allow_stateful=self.job_config.allow_stateful_probes,
         )
 
-        graybox_excluded = "graybox" in (self.job_config.excluded_features or [])
+        excluded_features = set(self.job_config.excluded_features or [])
+        graybox_excluded = "graybox" in excluded_features
 
         if not graybox_excluded:
           for entry in GRAYBOX_PROBE_REGISTRY:
             if self._check_stopped():
               break
 
-            probe_cls = self._import_probe(entry["cls"])
             store_key = entry["key"]
+
+            if store_key in excluded_features:
+              self.metrics.record_probe(store_key, "skipped:disabled")
+              continue
+
+            probe_cls = self._import_probe(entry["cls"])
 
             # Capability-based skip checks — read from the class itself
             if probe_cls.is_stateful and not self.job_config.allow_stateful_probes:
+              self.metrics.record_probe(store_key, "skipped:stateful_disabled")
               self._store_findings(store_key, [GrayboxFinding(
                 scenario_id=f"SKIP-{store_key}",
                 title="Probe skipped: stateful probes disabled",
@@ -240,8 +256,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
               )])
               continue
             if probe_cls.requires_regular_session and not self.auth.regular_session:
+              self.metrics.record_probe(store_key, "skipped:missing_regular_session")
               continue
             if probe_cls.requires_auth and not self.auth.official_session:
+              self.metrics.record_probe(store_key, "skipped:missing_auth")
               continue
 
             self.auth.ensure_sessions(official_creds, regular_creds)
@@ -249,27 +267,43 @@ class GrayboxLocalWorker(BaseLocalWorker):
             try:
               findings = probe_cls(**probe_kwargs).run()
               self._store_findings(store_key, findings)
+              self.metrics.record_probe(store_key, "completed")
             except Exception as exc:
               self._record_probe_error(store_key, exc)
+              self.metrics.record_probe(store_key, "failed")
+        else:
+          for entry in GRAYBOX_PROBE_REGISTRY:
+            self.metrics.record_probe(entry["key"], "skipped:disabled")
 
         self.state["completed_tests"].append("graybox_probes")
         self.metrics.phase_end("graybox_probes")
 
       # ── Phase 4: Weak auth (optional) ──
-      if not self._check_stopped() and self.job_config.weak_candidates:
+      if (
+        not self._check_stopped()
+        and self.job_config.weak_candidates
+        and "_graybox_weak_auth" not in (self.job_config.excluded_features or [])
+      ):
         self._set_phase("weak_auth")
         self.metrics.phase_start("weak_auth")
         self.auth.ensure_sessions(official_creds, regular_creds)
         bl_probe = BusinessLogicProbes(
           **dict(probe_kwargs, allow_stateful=False),
         )
-        weak_findings = bl_probe.run_weak_auth(
-          self.job_config.weak_candidates,
-          self.job_config.max_weak_attempts,
-        )
-        self._store_findings("_graybox_weak_auth", weak_findings)
+        try:
+          weak_findings = bl_probe.run_weak_auth(
+            self.job_config.weak_candidates,
+            self.job_config.max_weak_attempts,
+          )
+          self._store_findings("_graybox_weak_auth", weak_findings)
+          self.metrics.record_probe("_graybox_weak_auth", "completed")
+        except Exception as exc:
+          self._record_probe_error("_graybox_weak_auth", exc)
+          self.metrics.record_probe("_graybox_weak_auth", "failed")
         self.state["completed_tests"].append("graybox_weak_auth")
         self.metrics.phase_end("weak_auth")
+      elif self.job_config.weak_candidates and "_graybox_weak_auth" in (self.job_config.excluded_features or []):
+        self.metrics.record_probe("_graybox_weak_auth", "skipped:disabled")
 
     except Exception as exc:
       self._record_fatal(self.safety.sanitize_error(str(exc)))
@@ -284,6 +318,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
     port_results[key] = {
       "findings": [f.to_dict() for f in findings],
     }
+    for finding in findings:
+      self.metrics.record_finding(getattr(finding, "severity", "INFO"))
 
   def _store_auth_results(self):
     port_info = self.state["service_info"].setdefault(self._port_key, {})
