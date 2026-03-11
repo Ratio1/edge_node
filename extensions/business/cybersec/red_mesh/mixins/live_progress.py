@@ -6,7 +6,7 @@ and merging of scan metrics across worker threads.
 """
 
 from ..models import WorkerProgress
-from ..constants import PROGRESS_PUBLISH_INTERVAL, PHASE_ORDER, GRAYBOX_PHASE_ORDER
+from ..constants import PHASE_ORDER, GRAYBOX_PHASE_ORDER
 
 
 def _thread_phase(state):
@@ -169,7 +169,7 @@ class _LiveProgressMixin:
     Per-thread data (phase, ports) is included when multiple threads are active.
     """
     now = self.time()
-    if now - self._last_progress_publish < PROGRESS_PUBLISH_INTERVAL:
+    if now - self._last_progress_publish < self.cfg_progress_publish_interval:
       return
     self._last_progress_publish = now
 
@@ -257,6 +257,13 @@ class _LiveProgressMixin:
         hkey=live_hkey,
         key=f"{job_id}:{ee_addr}",
         value=progress.to_dict(),
+      )
+      self.P(
+        "[LIVE->CSTORE] Published worker progress "
+        f"job_id={job_id} worker={ee_addr} pass={pass_nr} "
+        f"phase={phase} progress={progress_pct}% "
+        f"ports={total_scanned}/{total_ports} open={len(all_open)} "
+        f"key={job_id}:{ee_addr}"
       )
 
   def _clear_live_progress(self, job_id, worker_addresses):
