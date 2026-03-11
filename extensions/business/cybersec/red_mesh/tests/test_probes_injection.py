@@ -252,6 +252,98 @@ class TestStoredXss(unittest.TestCase):
     self.assertIn("stateful_probes_disabled=True", skip[0].evidence)
 
 
+class TestOpenRedirect(unittest.TestCase):
+
+  def test_open_redirect_detected(self):
+    """Redirect to evil domain → vulnerable/MEDIUM."""
+    probe = _make_probe()
+    session = probe.auth.official_session
+
+    # Response: 302 redirect to evil.example.com
+    redirect_resp = _mock_response(status=302, text="")
+    redirect_resp.headers["Location"] = "//evil.example.com"
+    session.get = MagicMock(return_value=redirect_resp)
+
+    probe._test_open_redirect()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A01-04" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].severity, "MEDIUM")
+    self.assertIn("CWE-601", vuln[0].cwe)
+
+  def test_open_redirect_safe(self):
+    """No redirect → not_vulnerable."""
+    probe = _make_probe()
+    session = probe.auth.official_session
+    session.get = MagicMock(return_value=_mock_response(status=200, text="Normal page"))
+
+    probe._test_open_redirect()
+    clean = [f for f in probe.findings if f.scenario_id == "PT-A01-04" and f.status == "not_vulnerable"]
+    self.assertEqual(len(clean), 1)
+
+  def test_open_redirect_internal_redirect(self):
+    """Redirect to same domain → not vulnerable."""
+    probe = _make_probe()
+    session = probe.auth.official_session
+
+    redirect_resp = _mock_response(status=302, text="")
+    redirect_resp.headers["Location"] = "/dashboard/"
+    session.get = MagicMock(return_value=redirect_resp)
+
+    probe._test_open_redirect()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A01-04" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 0)
+
+
+class TestPathTraversal(unittest.TestCase):
+
+  def test_path_traversal_detected(self):
+    """/etc/passwd content in response → vulnerable/HIGH."""
+    probe = _make_probe()
+    probe.discovered_routes = ["/download/"]
+    session = probe.auth.official_session
+
+    normal_resp = _mock_response(status=200, text="Normal content")
+    passwd_resp = _mock_response(
+      status=200,
+      text="root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin\n",
+    )
+
+    call_count = [0]
+    def mock_get(url, **kwargs):
+      call_count[0] += 1
+      params = kwargs.get("params", {})
+      for v in params.values():
+        if "etc/passwd" in str(v):
+          return passwd_resp
+      return normal_resp
+
+    session.get = MagicMock(side_effect=mock_get)
+
+    probe._test_path_traversal()
+    vuln = [f for f in probe.findings if f.scenario_id == "PT-A03-03" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertIn("CWE-22", vuln[0].cwe)
+
+  def test_path_traversal_safe(self):
+    """No file content markers → not_vulnerable."""
+    probe = _make_probe()
+    probe.discovered_routes = ["/page/"]
+    session = probe.auth.official_session
+    session.get = MagicMock(return_value=_mock_response(status=200, text="Safe page content"))
+
+    probe._test_path_traversal()
+    clean = [f for f in probe.findings if f.scenario_id == "PT-A03-03" and f.status == "not_vulnerable"]
+    self.assertEqual(len(clean), 1)
+
+  def test_path_traversal_no_session(self):
+    """No official session → skip."""
+    probe = _make_probe(official_session=None)
+    probe.auth.official_session = None
+    probe._test_path_traversal()
+    self.assertEqual(len(probe.findings), 0)
+
+
 class TestCapabilities(unittest.TestCase):
 
   def test_capabilities(self):
