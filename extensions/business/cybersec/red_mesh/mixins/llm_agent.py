@@ -152,7 +152,9 @@ class _RedMeshLlmAgentMixin(object):
       self.P(f"Error calling LLM Agent API: {e}", color='r')
       return {"error": str(e), "status": "error"}
 
-  def _auto_analyze_report(self, job_id: str, report: dict, target: str) -> Optional[dict]:
+  def _auto_analyze_report(
+      self, job_id: str, report: dict, target: str, scan_type: str = "network",
+  ) -> Optional[dict]:
     """
     Automatically analyze a completed scan report using LLM Agent API.
 
@@ -164,6 +166,8 @@ class _RedMeshLlmAgentMixin(object):
       Aggregated scan report to analyze.
     target : str
       Target hostname/IP that was scanned.
+    scan_type : str, optional
+      "network" or "webapp" — selects the prompt set.
 
     Returns
     -------
@@ -174,7 +178,7 @@ class _RedMeshLlmAgentMixin(object):
       self.Pd("LLM auto-analysis skipped (not enabled)")
       return None
 
-    self.P(f"Running LLM auto-analysis for job {job_id}, target {target}...")
+    self.P(f"Running LLM auto-analysis for job {job_id}, target {target} (scan_type={scan_type})...")
 
     analysis_result = self._call_llm_agent_api(
       endpoint="/analyze_scan",
@@ -182,6 +186,7 @@ class _RedMeshLlmAgentMixin(object):
       payload={
         "scan_results": report,
         "analysis_type": self.cfg_llm_auto_analysis_type,
+        "scan_type": scan_type,
         "focus_areas": None,
       }
     )
@@ -259,7 +264,8 @@ class _RedMeshLlmAgentMixin(object):
     str or None
       LLM analysis markdown text if successful, None otherwise.
     """
-    target = job_config.get("target", "unknown")
+    scan_type = job_config.get("scan_type", "network")
+    target = job_config.get("target_url") if scan_type == "webapp" else job_config.get("target", "unknown")
     self.P(f"Running aggregated LLM analysis for job {job_id}, target {target}...")
 
     if not aggregated_report:
@@ -268,17 +274,26 @@ class _RedMeshLlmAgentMixin(object):
 
     # Add job metadata to report for context (strip node_ip — never send to LLM)
     report_with_meta = {k: v for k, v in aggregated_report.items() if k != "node_ip"}
-    report_with_meta["_job_metadata"] = {
+
+    # Build scan-type-aware metadata
+    metadata = {
       "job_id": job_id,
       "target": target,
-      "start_port": job_config.get("start_port"),
-      "end_port": job_config.get("end_port"),
-      "enabled_features": job_config.get("enabled_features", []),
+      "scan_type": scan_type,
       "run_mode": job_config.get("run_mode", RUN_MODE_SINGLEPASS),
     }
+    if scan_type == "webapp":
+      metadata["target_url"] = job_config.get("target_url")
+      metadata["app_routes"] = job_config.get("app_routes", [])
+      metadata["excluded_features"] = job_config.get("excluded_features", [])
+    else:
+      metadata["start_port"] = job_config.get("start_port")
+      metadata["end_port"] = job_config.get("end_port")
+      metadata["enabled_features"] = job_config.get("enabled_features", [])
+    report_with_meta["_job_metadata"] = metadata
 
     # Call LLM analysis
-    llm_analysis = self._auto_analyze_report(job_id, report_with_meta, target)
+    llm_analysis = self._auto_analyze_report(job_id, report_with_meta, target, scan_type=scan_type)
 
     if not llm_analysis or "error" in llm_analysis:
       self.P(
@@ -318,7 +333,8 @@ class _RedMeshLlmAgentMixin(object):
     str or None
       Quick summary text if successful, None otherwise.
     """
-    target = job_config.get("target", "unknown")
+    scan_type = job_config.get("scan_type", "network")
+    target = job_config.get("target_url") if scan_type == "webapp" else job_config.get("target", "unknown")
     self.P(f"Running quick summary analysis for job {job_id}, target {target}...")
 
     if not aggregated_report:
@@ -327,14 +343,23 @@ class _RedMeshLlmAgentMixin(object):
 
     # Add job metadata to report for context (strip node_ip — never send to LLM)
     report_with_meta = {k: v for k, v in aggregated_report.items() if k != "node_ip"}
-    report_with_meta["_job_metadata"] = {
+
+    # Build scan-type-aware metadata
+    metadata = {
       "job_id": job_id,
       "target": target,
-      "start_port": job_config.get("start_port"),
-      "end_port": job_config.get("end_port"),
-      "enabled_features": job_config.get("enabled_features", []),
+      "scan_type": scan_type,
       "run_mode": job_config.get("run_mode", RUN_MODE_SINGLEPASS),
     }
+    if scan_type == "webapp":
+      metadata["target_url"] = job_config.get("target_url")
+      metadata["app_routes"] = job_config.get("app_routes", [])
+      metadata["excluded_features"] = job_config.get("excluded_features", [])
+    else:
+      metadata["start_port"] = job_config.get("start_port")
+      metadata["end_port"] = job_config.get("end_port")
+      metadata["enabled_features"] = job_config.get("enabled_features", [])
+    report_with_meta["_job_metadata"] = metadata
 
     # Call LLM analysis with quick_summary type
     analysis_result = self._call_llm_agent_api(
@@ -343,6 +368,7 @@ class _RedMeshLlmAgentMixin(object):
       payload={
         "scan_results": report_with_meta,
         "analysis_type": "quick_summary",
+        "scan_type": scan_type,
         "focus_areas": None,
       }
     )
