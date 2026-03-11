@@ -129,14 +129,36 @@ class InjectionConfig:
 
 
 @dataclass(frozen=True)
+class RecordEndpoint:
+  """Endpoint for business logic validation testing (PT-A06-02)."""
+  path: str                                  # e.g. "/records/{id}/"
+  method: str = "POST"
+  amount_field: str = "amount"               # field name for monetary amount
+  status_field: str = "status"               # field name for status/state
+  valid_transitions: dict[str, list[str]] = field(default_factory=dict)  # e.g. {"draft": ["submitted"]}
+
+  @classmethod
+  def from_dict(cls, d: dict) -> RecordEndpoint:
+    return cls(
+      path=d["path"],
+      method=d.get("method", "POST"),
+      amount_field=d.get("amount_field", "amount"),
+      status_field=d.get("status_field", "status"),
+      valid_transitions=d.get("valid_transitions", {}),
+    )
+
+
+@dataclass(frozen=True)
 class BusinessLogicConfig:
   """Config for business logic probes (A06)."""
   workflow_endpoints: list[WorkflowEndpoint] = field(default_factory=list)
+  record_endpoints: list[RecordEndpoint] = field(default_factory=list)
 
   @classmethod
   def from_dict(cls, d: dict) -> BusinessLogicConfig:
     return cls(
       workflow_endpoints=[WorkflowEndpoint.from_dict(e) for e in d.get("workflow_endpoints", [])],
+      record_endpoints=[RecordEndpoint.from_dict(e) for e in d.get("record_endpoints", [])],
     )
 
 
@@ -180,6 +202,8 @@ class GrayboxTargetConfig:
   # Login endpoint configuration (shared across probes)
   login_path: str = "/auth/login/"
   logout_path: str = "/auth/logout/"
+  password_reset_path: str = ""           # e.g. "/auth/password-reset/request/"
+  password_reset_confirm_path: str = ""   # e.g. "/auth/password-reset/confirm/"
   username_field: str = "username"
   password_field: str = "password"
   csrf_field: str = ""                    # empty = auto-detect from COMMON_CSRF_FIELDS
@@ -197,6 +221,8 @@ class GrayboxTargetConfig:
       discovery=DiscoveryConfig.from_dict(d.get("discovery", {})),
       login_path=d.get("login_path", "/auth/login/"),
       logout_path=d.get("logout_path", "/auth/logout/"),
+      password_reset_path=d.get("password_reset_path", ""),
+      password_reset_confirm_path=d.get("password_reset_confirm_path", ""),
       username_field=d.get("username_field", "username"),
       password_field=d.get("password_field", "password"),
       csrf_field=d.get("csrf_field", ""),

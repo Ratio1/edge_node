@@ -20,6 +20,8 @@ class MisconfigProbes(ProbeBase):
     self.run_safe("cookie_attributes", self._test_cookie_attributes)
     self.run_safe("csrf_bypass", self._test_csrf_bypass)
     self.run_safe("session_token", self._test_session_token)
+    self.run_safe("login_rate_limiting", self._test_login_rate_limiting)
+    self.run_safe("password_reset_token", self._test_password_reset_token)
     return self.findings
 
   def _test_debug_exposure(self):
@@ -364,3 +366,250 @@ class MisconfigProbes(ProbeBase):
       remediation="Use cryptographically random session IDs (128+ bits). "
                   "Never use alg=none in JWT. Validate JWT signatures server-side.",
     ))
+
+  def _test_login_rate_limiting(self):
+    """
+    PT-A02-07: test if login endpoint enforces rate limiting or account lockout.
+
+    Sends a bounded burst of failed login attempts and checks whether the
+    server blocks, throttles, or continues to accept them unchanged.
+    """
+    session = self.auth.make_anonymous_session()
+    login_url = self.target_url + self.target_config.login_path
+
+    try:
+      page = session.get(login_url, timeout=10)
+    except Exception:
+      session.close()
+      return
+
+    csrf_field = self.auth.detected_csrf_field
+    csrf_token = None
+    if csrf_field:
+      csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+
+    # Use a non-existent username to avoid locking a real account
+    test_username = "ratelimit_probe_user_nonexist"
+    attempts = 8
+    blocked = False
+    lockout_markers = [
+      "account locked", "too many attempts", "temporarily blocked",
+      "account suspended", "try again later", "rate limit",
+    ]
+
+    for i in range(attempts):
+      self.safety.throttle(min_delay=0.1)
+
+      # Re-extract CSRF token each time (some frameworks rotate it)
+      if csrf_field and i > 0:
+        try:
+          page = session.get(login_url, timeout=10)
+          csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+        except Exception:
+          pass
+
+      payload = {
+        self.target_config.username_field: test_username,
+        self.target_config.password_field: f"wrong_password_{i}",
+      }
+      if csrf_token and csrf_field:
+        payload[csrf_field] = csrf_token
+
+      try:
+        resp = session.post(
+          login_url, data=payload,
+          headers={"Referer": login_url},
+          timeout=10,
+        )
+      except Exception:
+        continue
+
+      if resp.status_code == 429:
+        blocked = True
+        break
+      body_lower = resp.text.lower()
+      if any(m in body_lower for m in lockout_markers):
+        blocked = True
+        break
+
+    session.close()
+
+    if not blocked:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A02-07",
+        title="Login rate limiting not enforced",
+        status="vulnerable",
+        severity="MEDIUM",
+        owasp="A02:2021",
+        cwe=["CWE-307"],
+        attack=["T1110"],
+        evidence=[
+          f"endpoint={login_url}",
+          f"attempts={attempts}",
+          "lockout_triggered=False",
+          "rate_limiting_detected=False",
+        ],
+        replay_steps=[
+          f"Send {attempts} failed login attempts in rapid succession.",
+          "Observe no lockout or rate limiting response.",
+        ],
+        remediation="Implement account lockout after repeated failures. "
+                    "Add rate limiting (e.g. 429 responses) on login endpoints.",
+      ))
+    else:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A02-07",
+        title="Login rate limiting — enforced",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A02:2021",
+        evidence=[
+          f"endpoint={login_url}",
+          f"lockout_triggered_after={attempts}_or_fewer_attempts",
+        ],
+      ))
+
+  def _test_password_reset_token(self):
+    """
+    PT-A07-02: test password reset token predictability.
+
+    Requests two reset tokens for the same user and checks:
+    1. Token is exposed in the response body (info leak).
+    2. Token matches a predictable pattern (e.g. reset-{username}).
+    3. Token is identical across requests (no randomness).
+    """
+    reset_path = self.target_config.password_reset_path
+    if not reset_path:
+      return
+
+    session = self.auth.make_anonymous_session()
+    reset_url = self.target_url + reset_path
+    test_username = self.auth.target_config.username_field and "admin"
+
+    # Get CSRF token for the reset form
+    try:
+      page = session.get(reset_url, timeout=10)
+    except Exception:
+      session.close()
+      return
+
+    if page.status_code == 404:
+      session.close()
+      return
+
+    csrf_field = self.auth.detected_csrf_field
+    csrf_token = None
+    if csrf_field:
+      csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+
+    import re
+    tokens = []
+    for i in range(2):
+      self.safety.throttle()
+      if i > 0 and csrf_field:
+        try:
+          page = session.get(reset_url, timeout=10)
+          csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+        except Exception:
+          pass
+
+      payload = {"username": test_username}
+      if csrf_token and csrf_field:
+        payload[csrf_field] = csrf_token
+
+      try:
+        resp = session.post(
+          reset_url, data=payload,
+          headers={"Referer": reset_url},
+          timeout=10, allow_redirects=True,
+        )
+      except Exception:
+        continue
+
+      # Look for token-like strings in the response
+      body = resp.text
+      # Common patterns: "token": "...", token=..., /confirm?token=...
+      token_patterns = [
+        re.compile(r'reset[-_]token["\s:=]+([a-zA-Z0-9_-]{4,})', re.I),
+        re.compile(r'token["\s:=]+([a-zA-Z0-9_-]{8,})', re.I),
+        re.compile(r'Your reset (?:token|code)[^<]*?(\S{4,})', re.I),
+        # Direct token display (e.g. "reset-admin")
+        re.compile(r'(reset-\w+)', re.I),
+      ]
+      for pat in token_patterns:
+        m = pat.search(body)
+        if m:
+          tokens.append(m.group(1))
+          break
+
+    session.close()
+
+    evidence = []
+    status = "not_vulnerable"
+    issues = []
+
+    if len(tokens) >= 1:
+      evidence.append(f"token_exposed_in_response=True")
+      issues.append("token_leaked_in_body")
+
+    if len(tokens) >= 2 and tokens[0] == tokens[1]:
+      evidence.append(f"tokens_identical=True")
+      issues.append("no_randomness")
+
+    for token in tokens:
+      # Check for predictable format: reset-{username}
+      if token.lower() == f"reset-{test_username}".lower():
+        evidence.append(f"predictable_token_format=reset-{{username}}")
+        issues.append("predictable_format")
+        break
+      # Check for very short tokens
+      if len(token) < 16:
+        evidence.append(f"token_length={len(token)}")
+        issues.append("short_token")
+        break
+
+    if "predictable_format" in issues or "no_randomness" in issues:
+      status = "vulnerable"
+    elif "token_leaked_in_body" in issues or "short_token" in issues:
+      status = "inconclusive"
+
+    if status == "vulnerable":
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A07-02",
+        title="Predictable password reset tokens",
+        status="vulnerable",
+        severity="HIGH",
+        owasp="A07:2021",
+        cwe=["CWE-640", "CWE-330"],
+        attack=["T1110"],
+        evidence=evidence,
+        replay_steps=[
+          f"POST to {reset_path} with username={test_username}.",
+          "Extract token from response body.",
+          "Observe token matches predictable pattern.",
+        ],
+        remediation="Use cryptographically random tokens (128+ bits). "
+                    "Never expose tokens in HTML responses. "
+                    "Enforce single-use and short expiration.",
+      ))
+    elif status == "inconclusive":
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A07-02",
+        title="Password reset token — potential weakness",
+        status="inconclusive",
+        severity="LOW",
+        owasp="A07:2021",
+        cwe=["CWE-640"],
+        evidence=evidence,
+        remediation="Use cryptographically random tokens (128+ bits). "
+                    "Do not expose tokens in HTML responses.",
+      ))
+    elif tokens:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A07-02",
+        title="Password reset token — no weakness detected",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A07:2021",
+        evidence=[f"tokens_checked={len(tokens)}"],
+      ))
