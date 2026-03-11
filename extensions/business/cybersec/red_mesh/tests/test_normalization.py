@@ -221,6 +221,55 @@ class TestGrayboxRedaction(unittest.TestCase):
     finding = redacted["graybox_results"]["443"]["_graybox_weak_auth"]["findings"][0]
     self.assertNotIn("password123", finding["evidence"][0])
 
+  def test_redaction_handles_special_characters_and_multiple_credential_formats(self):
+    """Credential redaction masks special-character passwords in both blackbox and graybox evidence."""
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    host = MockHost()
+    report = {
+      "service_info": {
+        "22": {
+          "_service_info_22": {
+            "findings": [
+              {"evidence": "Accepted credential: admin:p@$$:w0rd!"},
+              {"evidence": "Accepted random creds service-user:s3cr3t/with/slash"},
+            ],
+            "accepted_credentials": [
+              "admin:p@$$:w0rd!",
+              "service-user:s3cr3t/with/slash",
+            ],
+          },
+        },
+      },
+      "graybox_results": {
+        "443": {
+          "_graybox_weak_auth": {
+            "findings": [
+              {
+                "evidence": [
+                  "accepted=admin:p@$$:w0rd!",
+                  "candidate service-user:s3cr3t/with/slash worked",
+                ],
+              },
+            ],
+          },
+        },
+      },
+    }
+
+    redacted = host._redact_report(report)
+    service_findings = redacted["service_info"]["22"]["_service_info_22"]["findings"]
+    service_creds = redacted["service_info"]["22"]["_service_info_22"]["accepted_credentials"]
+    graybox_evidence = redacted["graybox_results"]["443"]["_graybox_weak_auth"]["findings"][0]["evidence"]
+
+    self.assertNotIn("p@$$:w0rd!", service_findings[0]["evidence"])
+    self.assertNotIn("s3cr3t/with/slash", service_findings[1]["evidence"])
+    self.assertEqual(service_creds, ["admin:***", "service-user:***"])
+    self.assertTrue(all("***" in item for item in graybox_evidence))
+
 
 class TestFindingCounting(unittest.TestCase):
 

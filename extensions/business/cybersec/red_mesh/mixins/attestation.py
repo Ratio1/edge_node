@@ -14,6 +14,22 @@ from ..constants import RUN_MODE_SINGLEPASS, RUN_MODE_CONTINUOUS_MONITORING
 class _AttestationMixin:
   """Blockchain attestation methods for PentesterApi01Plugin."""
 
+  @staticmethod
+  def _resolve_attestation_report_cid(workers: dict, preferred_cid=None) -> str | None:
+    if isinstance(preferred_cid, str) and preferred_cid.strip():
+      return preferred_cid.strip()
+    if not isinstance(workers, dict):
+      return None
+
+    report_cids = [
+      worker.get("report_cid", "").strip()
+      for worker in workers.values()
+      if isinstance(worker, dict) and isinstance(worker.get("report_cid"), str) and worker.get("report_cid").strip()
+    ]
+    if len(report_cids) == 1:
+      return report_cids[0]
+    return None
+
   def _attestation_get_tenant_private_key(self):
     private_key = self.cfg_attestation_private_key
     if private_key:
@@ -109,7 +125,15 @@ class _AttestationMixin:
       return digest
     return "0x" + str(digest)
 
-  def _submit_redmesh_test_attestation(self, job_id: str, job_specs: dict, workers: dict, vulnerability_score=0, node_ips=None):
+  def _submit_redmesh_test_attestation(
+    self,
+    job_id: str,
+    job_specs: dict,
+    workers: dict,
+    vulnerability_score=0,
+    node_ips=None,
+    report_cid=None,
+  ):
     self.P(f"[ATTESTATION] Test attestation requested for job {job_id} (score={vulnerability_score})")
     if not self.cfg_attestation_enabled:
       self.P("[ATTESTATION] Attestation is disabled via config. Skipping.", color='y')
@@ -128,7 +152,7 @@ class _AttestationMixin:
     node_count = len(workers) if isinstance(workers, dict) else 0
     target = job_specs.get("target")
     execution_id = self._attestation_pack_execution_id(job_id)
-    report_cid = workers.get(self.ee_addr, {}).get("report_cid", None) #TODO: use the correct CID
+    report_cid = self._resolve_attestation_report_cid(workers, preferred_cid=report_cid)
     node_eth_address = self.bc.eth_address
     ip_obfuscated = self._attestation_pack_ip_obfuscated(target)
     cid_obfuscated = self._attestation_pack_cid_obfuscated(report_cid)
