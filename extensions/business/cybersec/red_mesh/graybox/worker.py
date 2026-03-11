@@ -100,6 +100,19 @@ class GrayboxLocalWorker(BaseLocalWorker):
     }
     self._phase = ""
 
+  @classmethod
+  def get_feature_prefixes(cls):
+    """Return feature prefixes for compatibility with capability discovery."""
+    return ["_graybox_"]
+
+  @classmethod
+  def get_supported_features(cls, categs=False):
+    """Return supported graybox features from the explicit probe registry."""
+    features = [entry["key"] for entry in GRAYBOX_PROBE_REGISTRY] + ["_graybox_weak_auth"]
+    if categs:
+      return {"graybox": features}
+    return features
+
   # start(), stop(), _check_stopped(), P() are ALL inherited from
   # BaseLocalWorker. NOT redefined here.
 
