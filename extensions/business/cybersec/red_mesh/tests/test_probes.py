@@ -314,6 +314,37 @@ class RedMeshOWASPTests(unittest.TestCase):
     self.assertEqual(web_snap["_web_test_fake_one"], "web-one:10000")
     self.assertEqual(web_snap["_web_test_fake_two"], "web-two:10000")
 
+  def test_correlation_runs_all_enabled_methods(self):
+    owner, worker = self._build_worker(ports=[80])
+
+    marker = []
+
+    def fake_corr_one():
+      marker.append("one")
+
+    def fake_corr_two():
+      marker.append("two")
+
+    setattr(worker, "_post_scan_fake_one", fake_corr_one)
+    setattr(worker, "_post_scan_fake_two", fake_corr_two)
+    worker._PentestLocalWorker__enabled_features = ["_post_scan_fake_one", "_post_scan_fake_two"]
+
+    worker._run_correlation_tests()
+
+    self.assertEqual(marker, ["one", "two"])
+
+  def test_execute_job_uses_explicit_phase_plan(self):
+    _, worker = self._build_worker()
+    phases = []
+
+    def record_phase(phase_config):
+      phases.append(phase_config["phase"])
+
+    with patch.object(worker, "_execute_phase", side_effect=record_phase):
+      worker.execute_job()
+
+    self.assertEqual(phases, [entry["phase"] for entry in worker.PHASE_EXECUTION_PLAN])
+
   def test_ssrf_protection_respects_exceptions(self):
     owner, worker = self._build_worker(ports=[80, 9000], exceptions=[9000])
     self.assertNotIn(9000, worker.state["ports_to_scan"])
@@ -5091,5 +5122,4 @@ class TestBatch5Improvements(unittest.TestCase):
     cve_ids = {f.title.split(":")[0] for f in findings if "CVE-" in f.title}
     expected = {"CVE-2023-26048", "CVE-2023-26049", "CVE-2023-36478", "CVE-2023-40167"}
     self.assertEqual(cve_ids, expected, f"Should match all 4 Jetty CVEs, got {cve_ids}")
-
 
