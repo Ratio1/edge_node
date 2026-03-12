@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.constants import JOB_ARCHIVE_VERSION, MAX_CONTINUOUS_PASSES
+from extensions.business.cybersec.red_mesh.models import CStoreJobRunning
 
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
 
@@ -1817,6 +1818,72 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job")
     self.assertEqual(result["error"], "unsupported_archive_version")
+
+  def test_normalize_job_record_initializes_job_revision(self):
+    """Legacy records get a normalized integer job_revision."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    plugin._write_job_record = MagicMock(side_effect=lambda job_id, specs, context="": specs)
+    plugin._delete_job_record = MagicMock()
+
+    normalized_key, normalized = Plugin._normalize_job_record(plugin, "job-1", {"job_id": "job-1", "workers": {}})
+
+    self.assertEqual(normalized_key, "job-1")
+    self.assertEqual(normalized["job_revision"], 0)
+
+  def test_write_job_record_bumps_revision(self):
+    """Centralized job writes bump the revision counter."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    plugin.chainstore_hget.side_effect = None
+    plugin.chainstore_hget.return_value = {"job_id": "job-1", "job_revision": 2}
+    plugin.chainstore_hset = MagicMock()
+    plugin._log_audit_event = MagicMock()
+    plugin.P = MagicMock()
+
+    updated = Plugin._write_job_record(plugin, "job-1", {"job_id": "job-1", "job_revision": 2}, context="test")
+
+    self.assertEqual(updated["job_revision"], 3)
+    running = CStoreJobRunning.from_dict({
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "launcher_alias": "launcher-alias",
+      "target": "example.com",
+      "task_name": "Test",
+      "start_port": 1,
+      "end_port": 10,
+      "date_created": 1.0,
+      "job_config_cid": "QmConfig",
+      "workers": {},
+      "timeline": [],
+      "pass_reports": [],
+      "job_revision": updated["job_revision"],
+    })
+    self.assertEqual(running.job_revision, 3)
+    plugin._log_audit_event.assert_not_called()
+
+  def test_write_job_record_logs_stale_write(self):
+    """Revision mismatches are logged as stale-write detections."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    plugin.chainstore_hget.side_effect = None
+    plugin.chainstore_hget.return_value = {"job_id": "job-1", "job_revision": 5}
+    plugin.chainstore_hset = MagicMock()
+    plugin._log_audit_event = MagicMock()
+    plugin.P = MagicMock()
+
+    updated = Plugin._write_job_record(plugin, "job-1", {"job_id": "job-1", "job_revision": 3}, context="close_job")
+
+    self.assertEqual(updated["job_revision"], 6)
+    plugin._log_audit_event.assert_called_once_with("stale_write_detected", {
+      "job_id": "job-1",
+      "expected_revision": 3,
+      "current_revision": 5,
+      "context": "close_job",
+    })
 
   def test_get_job_data_running_last_5(self):
     """Running job with 8 passes returns last 5 refs only."""
