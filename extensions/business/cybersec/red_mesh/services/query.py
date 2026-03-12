@@ -1,4 +1,19 @@
 from ..models import JobArchive
+from ..repositories import ArtifactRepository, JobStateRepository
+
+
+def _job_repo(owner):
+  getter = getattr(type(owner), "_get_job_state_repository", None)
+  if callable(getter):
+    return getter(owner)
+  return JobStateRepository(owner)
+
+
+def _artifact_repo(owner):
+  getter = getattr(type(owner), "_get_artifact_repository", None)
+  if callable(getter):
+    return getter(owner)
+  return ArtifactRepository(owner)
 
 
 def get_job_data(owner, job_id: str):
@@ -46,7 +61,7 @@ def get_job_archive(owner, job_id: str):
   if not job_cid:
     return {"error": "not_available", "message": f"Job {job_id} is still running (no archive yet)."}
 
-  archive = owner.r1fs.get_json(job_cid)
+  archive = _artifact_repo(owner).get_json(job_cid)
   if archive is None:
     return {"error": "fetch_failed", "message": f"Failed to fetch archive from R1FS (CID: {job_cid})."}
 
@@ -75,7 +90,7 @@ def get_job_progress(owner, job_id: str):
   Return real-time progress for all workers in the given job.
   """
   live_hkey = f"{owner.cfg_instance_id}:live"
-  all_progress = owner.chainstore_hgetall(hkey=live_hkey) or {}
+  all_progress = _job_repo(owner).list_live_progress() or {}
   prefix = f"{job_id}:"
   result = {}
   for key, value in all_progress.items():
@@ -83,7 +98,7 @@ def get_job_progress(owner, job_id: str):
       worker_addr = key[len(prefix):]
       result[worker_addr] = value
 
-  job_specs = owner.chainstore_hget(hkey=owner.cfg_instance_id, key=job_id)
+  job_specs = _job_repo(owner).get_job(job_id)
   status = None
   scan_type = None
   if isinstance(job_specs, dict):
@@ -96,7 +111,7 @@ def list_network_jobs(owner):
   """
   Return a normalized network-job listing from CStore.
   """
-  raw_network_jobs = owner.chainstore_hgetall(hkey=owner.cfg_instance_id)
+  raw_network_jobs = _job_repo(owner).list_jobs()
   normalized_jobs = {}
   for job_key, job_spec in raw_network_jobs.items():
     normalized_key, normalized_spec = owner._normalize_job_record(job_key, job_spec)

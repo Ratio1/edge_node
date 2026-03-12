@@ -13,7 +13,15 @@ from ..constants import (
   ScanType,
 )
 from ..models import JobConfig
+from ..repositories import JobStateRepository
 from .secrets import persist_job_config_with_secrets
+
+
+def _job_repo(owner):
+  getter = getattr(type(owner), "_get_job_state_repository", None)
+  if callable(getter):
+    return getter(owner)
+  return JobStateRepository(owner)
 
 
 def validation_error(message: str):
@@ -317,7 +325,7 @@ def announce_launch(
   if callable(write_job_record):
     write_job_record(owner, job_id, job_specs, context="launch_test")
   else:
-    owner.chainstore_hset(hkey=owner.cfg_instance_id, key=job_id, value=job_specs)
+    _job_repo(owner).put_job(job_id, job_specs)
 
   owner._log_audit_event("scan_launched", {
     "job_id": job_id,
@@ -330,7 +338,7 @@ def announce_launch(
     "ics_safe_mode": ics_safe_mode,
   })
 
-  all_network_jobs = owner.chainstore_hgetall(hkey=owner.cfg_instance_id)
+  all_network_jobs = _job_repo(owner).list_jobs()
   report = {}
   for other_key, other_spec in all_network_jobs.items():
     normalized_key, normalized_spec = owner._normalize_job_record(other_key, other_spec)

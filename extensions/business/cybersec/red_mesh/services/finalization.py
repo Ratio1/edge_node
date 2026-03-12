@@ -13,7 +13,22 @@ from ..constants import (
   RUN_MODE_SINGLEPASS,
 )
 from ..models import AggregatedScanData, PassReport, PassReportRef, WorkerReportMeta
+from ..repositories import ArtifactRepository, JobStateRepository
 from .state_machine import is_intermediate_job_status, is_terminal_job_status, set_job_status
+
+
+def _job_repo(owner):
+  getter = getattr(type(owner), "_get_job_state_repository", None)
+  if callable(getter):
+    return getter(owner)
+  return JobStateRepository(owner)
+
+
+def _artifact_repo(owner):
+  getter = getattr(type(owner), "_get_artifact_repository", None)
+  if callable(getter):
+    return getter(owner)
+  return ArtifactRepository(owner)
 
 
 def _write_job_record(owner, job_key, job_specs, context):
@@ -27,7 +42,8 @@ def maybe_finalize_pass(owner):
   """
   Launcher finalizes completed passes and orchestrates continuous monitoring.
   """
-  all_jobs = owner.chainstore_hgetall(hkey=owner.cfg_instance_id)
+  all_jobs = _job_repo(owner).list_jobs()
+  artifacts = _artifact_repo(owner)
 
   for job_key, job_specs in all_jobs.items():
     normalized_key, job_specs = owner._normalize_job_record(job_key, job_specs)
@@ -111,7 +127,7 @@ def maybe_finalize_pass(owner):
       aggregated_report_cid = None
       if aggregated:
         aggregated_data = AggregatedScanData.from_dict(aggregated).to_dict()
-        aggregated_report_cid = owner.r1fs.add_json(aggregated_data, show_logs=False)
+        aggregated_report_cid = artifacts.put_json(aggregated_data, show_logs=False)
         if not aggregated_report_cid:
           owner.P(f"Failed to store aggregated report for pass {job_pass} in R1FS", color='r')
           continue
@@ -186,7 +202,7 @@ def maybe_finalize_pass(owner):
         redmesh_test_attestation=redmesh_test_attestation,
       )
 
-      pass_report_cid = owner.r1fs.add_json(pass_report.to_dict(), show_logs=False)
+      pass_report_cid = artifacts.put_json(pass_report.to_dict(), show_logs=False)
       if not pass_report_cid:
         owner.P(f"Failed to store pass report for pass {job_pass} in R1FS", color='r')
         continue
