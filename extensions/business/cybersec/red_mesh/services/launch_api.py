@@ -12,7 +12,7 @@ from ..constants import (
   RUN_MODE_SINGLEPASS,
   ScanType,
 )
-from ..models import JobConfig
+from ..models import CStoreJobRunning, JobConfig
 from ..repositories import JobStateRepository
 from .secrets import persist_job_config_with_secrets
 
@@ -258,37 +258,36 @@ def announce_launch(
     allow_stateful_probes=allow_stateful_probes,
   )
 
-  config_dict = job_config.to_dict()
   persisted_config, job_config_cid = persist_job_config_with_secrets(
     owner,
     job_id=job_id,
-    config_dict=config_dict,
+    config_dict=job_config.to_dict(),
   )
   if not job_config_cid:
     owner.P("Failed to store job config in R1FS — aborting launch", color='r')
     return {"error": "Failed to store job config in R1FS"}
 
-  job_specs = {
-    "job_id": job_id,
-    "target": target,
-    "task_name": task_name,
-    "scan_type": scan_type,
-    "target_url": target_url,
-    "start_port": start_port,
-    "end_port": end_port,
-    "risk_score": 0,
-    "date_created": owner.time(),
-    "launcher": owner.ee_addr,
-    "launcher_alias": owner.ee_id,
-    "timeline": [],
-    "workers": workers,
-    "job_status": JOB_STATUS_RUNNING,
-    "run_mode": run_mode,
-    "job_pass": 1,
-    "next_pass_at": None,
-    "pass_reports": [],
-    "job_config_cid": job_config_cid,
-  }
+  job_specs = CStoreJobRunning(
+    job_id=job_id,
+    job_status=JOB_STATUS_RUNNING,
+    job_pass=1,
+    run_mode=run_mode,
+    launcher=owner.ee_addr,
+    launcher_alias=owner.ee_id,
+    target=target,
+    task_name=task_name,
+    start_port=start_port,
+    end_port=end_port,
+    date_created=owner.time(),
+    job_config_cid=job_config_cid,
+    workers=workers,
+    timeline=[],
+    pass_reports=[],
+    next_pass_at=None,
+    risk_score=0,
+  ).to_dict()
+  job_specs["scan_type"] = scan_type
+  job_specs["target_url"] = target_url
   owner._emit_timeline_event(
     job_specs, "created",
     f"Job created by {created_by_name}",

@@ -1,5 +1,6 @@
 from copy import deepcopy
 
+from ..models import JobConfig
 from ..repositories import ArtifactRepository
 
 
@@ -57,6 +58,14 @@ def _blank_graybox_secret_fields(config_dict: dict) -> dict:
   return sanitized
 
 
+def _coerce_job_config_dict(config_dict: dict) -> dict:
+  raw = deepcopy(config_dict or {})
+  raw.setdefault("target", raw.get("target_url", ""))
+  raw.setdefault("start_port", 0)
+  raw.setdefault("end_port", 0)
+  return JobConfig.from_dict(raw).to_dict()
+
+
 def build_graybox_secret_payload(
   *,
   official_username="",
@@ -88,7 +97,7 @@ def persist_job_config_with_secrets(
   tuple[dict, str]
     Persisted config dict and resulting job_config_cid.
   """
-  persisted_config = deepcopy(config_dict)
+  persisted_config = _coerce_job_config_dict(config_dict)
   scan_type = persisted_config.get("scan_type", "network")
   if scan_type == "webapp":
     payload = build_graybox_secret_payload(
@@ -116,7 +125,7 @@ def persist_job_config_with_secrets(
       persisted_config["has_weak_candidates"] = bool(payload["weak_candidates"])
       persisted_config = _blank_graybox_secret_fields(persisted_config)
 
-  job_config_cid = _artifact_repo(owner).put_json(persisted_config, show_logs=False)
+  job_config_cid = _artifact_repo(owner).put_job_config(persisted_config, show_logs=False)
   return persisted_config, job_config_cid
 
 
@@ -128,7 +137,7 @@ def resolve_job_config_secrets(owner, config_dict: dict, include_secret_metadata
   - configs without secret_ref are returned unchanged
   - legacy inline secrets remain supported
   """
-  resolved = deepcopy(config_dict or {})
+  resolved = _coerce_job_config_dict(config_dict)
   secret_ref = resolved.get("secret_ref")
   if not secret_ref:
     return resolved
