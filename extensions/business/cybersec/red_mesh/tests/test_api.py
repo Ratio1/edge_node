@@ -1353,6 +1353,12 @@ class TestPhase3Archive(unittest.TestCase):
       "target": "example.com", "start_port": 1, "end_port": 1024,
       "run_mode": run_mode, "enabled_features": [], "scan_type": "webapp",
       "target_url": "https://example.com/app",
+      "redact_credentials": True,
+      "official_username": "admin",
+      "official_password": "super-secret",
+      "regular_username": "user",
+      "regular_password": "user-pass",
+      "weak_candidates": ["admin:admin", "user:user"],
     }
 
     # Latest aggregated data
@@ -1488,6 +1494,19 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(ui["total_forms_discovered"], 2)
     self.assertEqual(ui["total_scenarios"], 2)
     self.assertEqual(ui["total_scenarios_vulnerable"], 1)
+
+  def test_archive_redacts_job_config_credentials(self):
+    """Archived job_config masks credentials when redact_credentials is enabled."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    self.assertEqual(archive_dict["job_config"]["official_password"], "***")
+    self.assertEqual(archive_dict["job_config"]["regular_password"], "***")
+    self.assertEqual(archive_dict["job_config"]["weak_candidates"], ["***", "***"])
+    self.assertEqual(archive_dict["job_config"]["official_username"], "admin")
 
   def test_archive_duration_computed(self):
     """duration == date_completed - date_created, not 0."""
@@ -1865,6 +1884,19 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(running.job_revision, 3)
     plugin._log_audit_event.assert_not_called()
 
+  def test_job_write_guarantees_report_detection_only_mode(self):
+    """RedMesh exposes detection-only semantics when chainstore lacks CAS."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+
+    self.assertFalse(Plugin._supports_guarded_job_writes(plugin))
+    self.assertEqual(Plugin._get_job_write_guarantees(plugin), {
+      "mode": "detection_only",
+      "guarded_writes": False,
+      "stale_write_detection": True,
+      "job_revision": True,
+    })
+
   def test_write_job_record_logs_stale_write(self):
     """Revision mismatches are logged as stale-write detections."""
     Plugin = self._get_plugin_class()
@@ -1883,6 +1915,7 @@ class TestPhase5Endpoints(unittest.TestCase):
       "expected_revision": 3,
       "current_revision": 5,
       "context": "close_job",
+      "write_mode": "detection_only",
     })
 
   def test_get_job_data_running_last_5(self):

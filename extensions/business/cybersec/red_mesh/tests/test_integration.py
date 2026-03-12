@@ -216,6 +216,15 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(Plugin._get_progress_publish_interval(plugin), 30.0)
     plugin.chainstore_hset.assert_not_called()
 
+  def test_job_write_guarantees_are_detection_only(self):
+    """Mutable job writes explicitly advertise detection-only semantics."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+
+    self.assertFalse(Plugin._supports_guarded_job_writes(plugin))
+    self.assertEqual(Plugin._get_job_write_guarantees(plugin)["mode"], "detection_only")
+    self.assertFalse(Plugin._get_job_write_guarantees(plugin)["guarded_writes"])
+
   def test_publish_live_progress_multi_thread_phase(self):
     """Phase is the earliest active phase; per-thread data is included."""
     Plugin = self._get_plugin_class()
