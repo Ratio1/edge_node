@@ -84,6 +84,7 @@ class CStoreJobRunning:
   pass_reports: list                # [ PassReportRef.to_dict() ]
   next_pass_at: float = None
   risk_score: float = 0
+  job_revision: int = 0
   redmesh_job_start_attestation: dict = None
   last_attestation_at: float = None
 
@@ -110,6 +111,7 @@ class CStoreJobRunning:
       pass_reports=d.get("pass_reports", []),
       next_pass_at=d.get("next_pass_at"),
       risk_score=d.get("risk_score", 0),
+      job_revision=d.get("job_revision", 0),
       redmesh_job_start_attestation=d.get("redmesh_job_start_attestation"),
       last_attestation_at=d.get("last_attestation_at"),
     )
