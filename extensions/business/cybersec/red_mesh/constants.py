@@ -137,6 +137,23 @@ FEATURE_CATALOG = [
   },
 ]
 
+
+NETWORK_FEATURE_CATEGORIES = ("service", "web", "correlation")
+NETWORK_FEATURE_REGISTRY = {
+  category: tuple(
+    method
+    for item in FEATURE_CATALOG
+    if item.get("category") == category
+    for method in item.get("methods", [])
+  )
+  for category in NETWORK_FEATURE_CATEGORIES
+}
+NETWORK_FEATURE_METHODS = tuple(
+  method
+  for category in NETWORK_FEATURE_CATEGORIES
+  for method in NETWORK_FEATURE_REGISTRY[category]
+)
+
 # Job status constants
 JOB_STATUS_RUNNING = "RUNNING"
 JOB_STATUS_COLLECTING = "COLLECTING"        # Launcher merging worker reports

@@ -472,6 +472,18 @@ class TestPhase4FeatureCatalog(unittest.TestCase):
       with self.assertRaises(RuntimeError):
         PentesterApi01Plugin._validate_feature_catalog(plugin)
 
+  def test_network_features_come_from_explicit_registry(self):
+    """Network feature discovery stays tied to the explicit registry order."""
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.worker.pentest_worker import PentestLocalWorker
+    from extensions.business.cybersec.red_mesh.constants import NETWORK_FEATURE_METHODS, NETWORK_FEATURE_REGISTRY
+
+    self.assertEqual(PentestLocalWorker.get_supported_features(), list(NETWORK_FEATURE_METHODS))
+    self.assertEqual(PentestLocalWorker.get_supported_features(categs=True), {
+      category: list(methods)
+      for category, methods in NETWORK_FEATURE_REGISTRY.items()
+    })
+
 
 
 class TestPhase2PassFinalization(unittest.TestCase):
