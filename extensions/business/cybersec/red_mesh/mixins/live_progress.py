@@ -8,6 +8,8 @@ and merging of scan metrics across worker threads.
 from ..models import WorkerProgress
 from ..constants import PHASE_ORDER, GRAYBOX_PHASE_ORDER
 
+DEFAULT_PROGRESS_PUBLISH_INTERVAL = 30.0
+
 
 def _thread_phase(state):
   """Determine which phase a single thread is currently in.
@@ -44,6 +46,23 @@ def _thread_phase(state):
 
 class _LiveProgressMixin:
   """Live progress tracking methods for PentesterApi01Plugin."""
+
+  def _get_progress_publish_interval(self):
+    """Return a safe numeric live-progress publish interval in seconds."""
+    interval = getattr(self, "_progress_publish_interval", None)
+    if interval is None:
+      interval = getattr(self, "cfg_progress_publish_interval", None)
+    if interval is None:
+      config = getattr(self, "CONFIG", None)
+      if isinstance(config, dict):
+        interval = config.get("PROGRESS_PUBLISH_INTERVAL")
+    try:
+      interval = float(interval)
+    except (TypeError, ValueError):
+      interval = DEFAULT_PROGRESS_PUBLISH_INTERVAL
+    if interval <= 0:
+      interval = DEFAULT_PROGRESS_PUBLISH_INTERVAL
+    return interval
 
   @staticmethod
   def _merge_worker_metrics(metrics_list):
@@ -169,7 +188,8 @@ class _LiveProgressMixin:
     Per-thread data (phase, ports) is included when multiple threads are active.
     """
     now = self.time()
-    if now - self._last_progress_publish < self.cfg_progress_publish_interval:
+    publish_interval = _LiveProgressMixin._get_progress_publish_interval(self)
+    if now - self._last_progress_publish < publish_interval:
       return
     self._last_progress_publish = now
 
