@@ -309,6 +309,7 @@ class _ReportMixin:
       redacted["regular_password"] = "***"
     if redacted.get("weak_candidates"):
       redacted["weak_candidates"] = ["***"] * len(redacted["weak_candidates"])
+    redacted.pop("secret_ref", None)
     return redacted
 
   def _compute_ui_aggregate(self, passes, latest_aggregated, job_config=None):

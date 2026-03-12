@@ -51,11 +51,14 @@ class JobConfig:
   # ── graybox fields ──
   scan_type: str = "network"          # "network" | "webapp"
   target_url: str = ""                # required when scan_type == "webapp"
+  secret_ref: str = ""                # reference to separately persisted graybox secrets
+  has_regular_credentials: bool = False
+  has_weak_candidates: bool = False
   official_username: str = ""
   official_password: str = ""
   regular_username: str = ""
   regular_password: str = ""
-  weak_candidates: list = None        # ["admin:admin", ...]
+  weak_candidates: list = None        # legacy inline payload; new launches use secret_ref
   max_weak_attempts: int = 5
   app_routes: list = None             # user-supplied known routes
   verify_tls: bool = True             # TLS cert verification
@@ -93,6 +96,9 @@ class JobConfig:
       authorized=d.get("authorized", False),
       scan_type=d.get("scan_type", "network"),
       target_url=d.get("target_url", ""),
+      secret_ref=d.get("secret_ref", ""),
+      has_regular_credentials=d.get("has_regular_credentials", False),
+      has_weak_candidates=d.get("has_weak_candidates", False),
       official_username=d.get("official_username", ""),
       official_password=d.get("official_password", ""),
       regular_username=d.get("regular_username", ""),
