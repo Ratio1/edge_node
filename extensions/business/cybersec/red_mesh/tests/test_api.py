@@ -4,6 +4,8 @@ import struct
 import unittest
 from unittest.mock import MagicMock, patch
 
+from extensions.business.cybersec.red_mesh.constants import JOB_ARCHIVE_VERSION, MAX_CONTINUOUS_PASSES
+
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
 
 
@@ -717,6 +719,77 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(job_specs["job_status"], "RUNNING")
     self.assertIsNotNone(job_specs.get("next_pass_at"))
 
+  def test_continuous_pass_cap_stops_and_archives_job(self):
+    """Continuous jobs stop and archive instead of scheduling pass 101."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(
+      run_mode="CONTINUOUS_MONITORING",
+      job_pass=MAX_CONTINUOUS_PASSES,
+    )
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {"80": "http"},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com", "monitor_interval": 60})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin._build_job_archive = MagicMock()
+    plugin._clear_live_progress = MagicMock()
+    plugin._log_audit_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    self.assertIsNone(job_specs.get("next_pass_at"))
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    plugin._clear_live_progress.assert_called_once()
+    plugin._log_audit_event.assert_called_once_with("continuous_pass_cap_reached", {
+      "job_id": job_specs["job_id"],
+      "pass_nr": MAX_CONTINUOUS_PASSES,
+      "max_continuous_passes": MAX_CONTINUOUS_PASSES,
+    })
+    event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertIn("pass_cap_reached", event_types)
+    self.assertIn("stopped", event_types)
+
+  def test_continuous_pass_cap_handles_recovered_over_cap_state(self):
+    """Recovered continuous jobs already over cap are stopped cleanly."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(
+      run_mode="CONTINUOUS_MONITORING",
+      job_pass=MAX_CONTINUOUS_PASSES + 2,
+    )
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {"80": "http"},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com", "monitor_interval": 60})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin._build_job_archive = MagicMock()
+    plugin._clear_live_progress = MagicMock()
+    plugin._log_audit_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "STOPPED")
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    plugin._log_audit_event.assert_called_once()
+
   def test_finding_id_deterministic(self):
     """Same input produces same finding_id; different title produces different id."""
     PentesterApi01Plugin = self._get_plugin_class()
@@ -1393,6 +1466,7 @@ class TestPhase3Archive(unittest.TestCase):
     # r1fs.add_json called with archive dict
     self.assertTrue(plugin.r1fs.add_json.called)
     archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    self.assertEqual(archive_dict["archive_version"], JOB_ARCHIVE_VERSION)
     self.assertEqual(archive_dict["job_id"], "test-job")
     self.assertEqual(archive_dict["job_config"]["target"], "example.com")
     self.assertEqual(len(archive_dict["passes"]), 1)
@@ -1674,12 +1748,23 @@ class TestPhase5Endpoints(unittest.TestCase):
     stub = self._build_finalized_stub("fin-job")
     plugin = self._build_plugin({"fin-job": stub})
 
-    archive_data = {"job_id": "fin-job", "passes": [], "ui_aggregate": {}}
+    archive_data = {
+      "archive_version": JOB_ARCHIVE_VERSION,
+      "job_id": "fin-job",
+      "passes": [],
+      "ui_aggregate": {},
+      "job_config": {},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
     plugin.r1fs.get_json.return_value = archive_data
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job")
     self.assertEqual(result["job_id"], "fin-job")
     self.assertEqual(result["archive"]["job_id"], "fin-job")
+    self.assertEqual(result["archive"]["archive_version"], JOB_ARCHIVE_VERSION)
 
   def test_get_job_archive_running(self):
     """get_job_archive for running job returns not_available error."""
@@ -1697,10 +1782,41 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin = self._build_plugin({"fin-job": stub})
 
     # Archive has a different job_id
-    plugin.r1fs.get_json.return_value = {"job_id": "other-job", "passes": []}
+    plugin.r1fs.get_json.return_value = {
+      "archive_version": JOB_ARCHIVE_VERSION,
+      "job_id": "other-job",
+      "passes": [],
+      "ui_aggregate": {},
+      "job_config": {},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job")
     self.assertEqual(result["error"], "integrity_mismatch")
+
+  def test_get_job_archive_unsupported_version(self):
+    """Unsupported archive versions are rejected explicitly."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+
+    plugin.r1fs.get_json.return_value = {
+      "archive_version": JOB_ARCHIVE_VERSION + 1,
+      "job_id": "fin-job",
+      "passes": [],
+      "ui_aggregate": {},
+      "job_config": {},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
+
+    result = Plugin.get_job_archive(plugin, job_id="fin-job")
+    self.assertEqual(result["error"], "unsupported_archive_version")
 
   def test_get_job_data_running_last_5(self):
     """Running job with 8 passes returns last 5 refs only."""
