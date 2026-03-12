@@ -1,3 +1,9 @@
+from .control import (
+  purge_job,
+  stop_and_delete_job,
+  stop_monitoring,
+)
+from .finalization import maybe_finalize_pass
 from .launch import launch_local_jobs
 from .launch_api import (
   announce_launch,
@@ -56,10 +62,14 @@ __all__ = [
   "launch_webapp_scan",
   "list_local_jobs",
   "list_network_jobs",
+  "maybe_finalize_pass",
   "normalize_common_launch_options",
   "parse_exceptions",
+  "purge_job",
   "resolve_active_peers",
   "resolve_enabled_features",
   "set_job_status",
+  "stop_and_delete_job",
+  "stop_monitoring",
   "validation_error",
 ]
