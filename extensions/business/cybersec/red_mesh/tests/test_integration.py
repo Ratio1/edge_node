@@ -132,6 +132,90 @@ class TestPhase12LiveProgress(unittest.TestCase):
     # Single thread — no threads field
     self.assertNotIn("threads", progress_data)
 
+  def test_publish_live_progress_missing_interval_uses_default(self):
+    """Missing publish interval falls back to the default safely."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+    plugin._last_progress_publish = 0
+    plugin.time.return_value = 100.0
+    plugin._progress_publish_interval = None
+    plugin.cfg_progress_publish_interval = None
+    plugin.CONFIG = {"PROGRESS_PUBLISH_INTERVAL": 30}
+
+    worker = MagicMock()
+    worker.state = {
+      "ports_scanned": list(range(10)),
+      "open_ports": [],
+      "completed_tests": [],
+      "done": False,
+    }
+    worker.initial_ports = list(range(1, 33))
+    plugin.scan_jobs = {"job-1": {"worker-thread-1": worker}}
+    plugin.chainstore_hget.return_value = {"job_pass": 1}
+
+    Plugin._publish_live_progress(plugin)
+
+    self.assertEqual(Plugin._get_progress_publish_interval(plugin), 30.0)
+    plugin.chainstore_hset.assert_called_once()
+
+  def test_publish_live_progress_invalid_interval_uses_default(self):
+    """Malformed publish interval falls back to the default safely."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+    plugin._last_progress_publish = 80
+    plugin.time.return_value = 100.0
+    plugin._progress_publish_interval = None
+    plugin.cfg_progress_publish_interval = "invalid"
+    plugin.CONFIG = {"PROGRESS_PUBLISH_INTERVAL": 30}
+
+    worker = MagicMock()
+    worker.state = {
+      "ports_scanned": list(range(10)),
+      "open_ports": [],
+      "completed_tests": [],
+      "done": False,
+    }
+    worker.initial_ports = list(range(1, 33))
+    plugin.scan_jobs = {"job-1": {"worker-thread-1": worker}}
+    plugin.chainstore_hget.return_value = {"job_pass": 1}
+
+    Plugin._publish_live_progress(plugin)
+
+    self.assertEqual(Plugin._get_progress_publish_interval(plugin), 30.0)
+    plugin.chainstore_hset.assert_not_called()
+
+  def test_publish_live_progress_zero_interval_uses_default(self):
+    """Zero publish interval falls back to the default instead of tight-looping."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+    plugin._last_progress_publish = 80
+    plugin.time.return_value = 100.0
+    plugin._progress_publish_interval = None
+    plugin.cfg_progress_publish_interval = 0
+    plugin.CONFIG = {"PROGRESS_PUBLISH_INTERVAL": 30}
+
+    worker = MagicMock()
+    worker.state = {
+      "ports_scanned": list(range(10)),
+      "open_ports": [],
+      "completed_tests": [],
+      "done": False,
+    }
+    worker.initial_ports = list(range(1, 33))
+    plugin.scan_jobs = {"job-1": {"worker-thread-1": worker}}
+    plugin.chainstore_hget.return_value = {"job_pass": 1}
+
+    Plugin._publish_live_progress(plugin)
+
+    self.assertEqual(Plugin._get_progress_publish_interval(plugin), 30.0)
+    plugin.chainstore_hset.assert_not_called()
+
   def test_publish_live_progress_multi_thread_phase(self):
     """Phase is the earliest active phase; per-thread data is included."""
     Plugin = self._get_plugin_class()
@@ -983,5 +1067,3 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     # OR flags
     self.assertFalse(sm["rate_limiting_detected"])
     self.assertTrue(sm["blocking_detected"])
-
-
