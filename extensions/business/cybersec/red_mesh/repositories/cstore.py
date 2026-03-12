@@ -1,6 +1,19 @@
 from ..models import CStoreJobFinalized, CStoreJobRunning, WorkerProgress
 
 
+RUNNING_JOB_REQUIRED_FIELDS = {
+  "job_id",
+  "job_status",
+  "run_mode",
+  "launcher",
+  "target",
+  "start_port",
+  "end_port",
+  "date_created",
+  "job_config_cid",
+}
+
+
 class JobStateRepository:
   """Repository for mutable RedMesh job state stored in CStore."""
 
@@ -18,24 +31,51 @@ class JobStateRepository:
   def get_job(self, job_id):
     return self.owner.chainstore_hget(hkey=self._jobs_hkey, key=job_id)
 
+  def _coerce_job_payload(self, value):
+    if isinstance(value, CStoreJobRunning):
+      return value.to_dict()
+    if isinstance(value, CStoreJobFinalized):
+      return value.to_dict()
+    if not isinstance(value, dict):
+      return value
+    payload = dict(value)
+    if payload.get("job_cid"):
+      try:
+        return CStoreJobFinalized.from_dict(payload).to_dict()
+      except (KeyError, TypeError, ValueError):
+        return payload
+    if RUNNING_JOB_REQUIRED_FIELDS.issubset(payload):
+      try:
+        return CStoreJobRunning.from_dict(payload).to_dict()
+      except (KeyError, TypeError, ValueError):
+        return payload
+    return payload
+
   def get_running_job(self, job_id):
     payload = self.get_job(job_id)
     if not isinstance(payload, dict) or payload.get("job_cid"):
       return None
-    return CStoreJobRunning.from_dict(payload)
+    try:
+      return CStoreJobRunning.from_dict(payload)
+    except (KeyError, TypeError, ValueError):
+      return None
 
   def get_finalized_job(self, job_id):
     payload = self.get_job(job_id)
     if not isinstance(payload, dict) or not payload.get("job_cid"):
       return None
-    return CStoreJobFinalized.from_dict(payload)
+    try:
+      return CStoreJobFinalized.from_dict(payload)
+    except (KeyError, TypeError, ValueError):
+      return None
 
   def list_jobs(self):
     return self.owner.chainstore_hgetall(hkey=self._jobs_hkey)
 
   def put_job(self, job_id, value):
-    self.owner.chainstore_hset(hkey=self._jobs_hkey, key=job_id, value=value)
-    return value
+    payload = self._coerce_job_payload(value)
+    self.owner.chainstore_hset(hkey=self._jobs_hkey, key=job_id, value=payload)
+    return payload
 
   def put_running_job(self, job):
     if isinstance(job, CStoreJobRunning):

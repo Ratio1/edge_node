@@ -275,6 +275,8 @@ def announce_launch(
     launcher=owner.ee_addr,
     launcher_alias=owner.ee_id,
     target=target,
+    scan_type=scan_type,
+    target_url=target_url,
     task_name=task_name,
     start_port=start_port,
     end_port=end_port,
@@ -286,8 +288,6 @@ def announce_launch(
     next_pass_at=None,
     risk_score=0,
   ).to_dict()
-  job_specs["scan_type"] = scan_type
-  job_specs["target_url"] = target_url
   owner._emit_timeline_event(
     job_specs, "created",
     f"Job created by {created_by_name}",

@@ -58,6 +58,7 @@ class TestJobStateRepository(unittest.TestCase):
     self.assertIsInstance(running, CStoreJobRunning)
     persisted = repo.put_running_job(running)
     self.assertEqual(persisted["job_id"], "job-1")
+    self.assertEqual(persisted["scan_type"], "network")
 
   def test_job_state_repository_supports_typed_live_progress(self):
     owner = self._make_owner()
@@ -79,6 +80,33 @@ class TestJobStateRepository(unittest.TestCase):
 
     self.assertEqual(persisted["job_id"], "job-1")
     owner.chainstore_hset.assert_called_once()
+
+  def test_job_state_repository_put_job_coerces_running_job_shape(self):
+    owner = self._make_owner()
+    repo = JobStateRepository(owner)
+
+    payload = repo.put_job("job-1", {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "node-a",
+      "launcher_alias": "node-a",
+      "target": "example.com",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/app",
+      "task_name": "Test",
+      "start_port": 443,
+      "end_port": 443,
+      "date_created": 1.0,
+      "job_config_cid": "QmConfig",
+      "workers": {},
+      "timeline": [],
+      "pass_reports": [],
+    })
+
+    self.assertEqual(payload["scan_type"], "webapp")
+    self.assertEqual(payload["target_url"], "https://example.com/app")
 
 
 class TestArtifactRepository(unittest.TestCase):
