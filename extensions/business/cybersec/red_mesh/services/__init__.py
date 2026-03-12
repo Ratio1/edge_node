@@ -25,6 +25,12 @@ from .query import (
   list_local_jobs,
   list_network_jobs,
 )
+from .secrets import (
+  R1fsSecretStore,
+  collect_secret_refs_from_job_config,
+  persist_job_config_with_secrets,
+  resolve_job_config_secrets,
+)
 from .scan_strategy import (
   ScanStrategy,
   coerce_scan_type,
@@ -65,7 +71,11 @@ __all__ = [
   "maybe_finalize_pass",
   "normalize_common_launch_options",
   "parse_exceptions",
+  "persist_job_config_with_secrets",
   "purge_job",
+  "R1fsSecretStore",
+  "resolve_job_config_secrets",
+  "collect_secret_refs_from_job_config",
   "resolve_active_peers",
   "resolve_enabled_features",
   "set_job_status",

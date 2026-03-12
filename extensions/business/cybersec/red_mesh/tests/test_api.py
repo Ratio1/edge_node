@@ -295,12 +295,49 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin = self._build_mock_plugin(job_id="test-job-webcfg")
     self._launch_webapp(plugin)
 
-    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
     self.assertEqual(config_dict["scan_type"], "webapp")
     self.assertEqual(config_dict["exceptions"], [])
     self.assertEqual(config_dict["distribution_strategy"], "MIRROR")
     self.assertEqual(config_dict["nr_local_workers"], 1)
     self.assertEqual(config_dict["target_url"], "https://example.com/app")
+
+  def test_launch_webapp_scan_persists_secret_ref_not_inline_passwords(self):
+    """Webapp launch stores a separate secret blob and persists only secret_ref in JobConfig."""
+    plugin = self._build_mock_plugin(job_id="test-job-websecret")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="admin",
+      official_password="secret",
+      regular_username="user",
+      regular_password="pass",
+      weak_candidates=["admin:admin"],
+    )
+
+    self.assertNotIn("error", result)
+    self.assertEqual(len(plugin.r1fs.add_json.call_args_list), 2)
+
+    secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+
+    self.assertEqual(secret_doc["kind"], "redmesh_graybox_credentials")
+    self.assertEqual(secret_doc["payload"]["official_password"], "secret")
+    self.assertEqual(secret_doc["payload"]["regular_password"], "pass")
+    self.assertEqual(secret_doc["payload"]["weak_candidates"], ["admin:admin"])
+
+    self.assertEqual(config_dict["secret_ref"], "QmSecretCID")
+    self.assertEqual(config_dict["official_username"], "")
+    self.assertEqual(config_dict["official_password"], "")
+    self.assertEqual(config_dict["regular_username"], "")
+    self.assertEqual(config_dict["regular_password"], "")
+    self.assertNotIn("weak_candidates", config_dict)
+    self.assertTrue(config_dict["has_regular_credentials"])
+    self.assertTrue(config_dict["has_weak_candidates"])
+
+    job_specs = self._extract_job_specs(plugin, "test-job-websecret")
+    self.assertEqual(job_specs["job_config_cid"], "QmConfigCID")
 
   def test_launch_webapp_scan_rejects_missing_target_url(self):
     """Webapp endpoint returns structured validation error for missing URL."""
@@ -360,7 +397,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin = self._build_mock_plugin(job_id="test-job-webfeatures")
     self._launch_webapp(plugin, excluded_features=["_graybox_injection"])
 
-    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
     self.assertEqual(config_dict["excluded_features"], ["_graybox_injection"])
     self.assertIn("_graybox_access_control", config_dict["enabled_features"])
     self.assertIn("_graybox_weak_auth", config_dict["enabled_features"])
@@ -1508,6 +1545,40 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(archive_dict["job_config"]["weak_candidates"], ["***", "***"])
     self.assertEqual(archive_dict["job_config"]["official_username"], "admin")
 
+  def test_archive_redaction_removes_secret_ref(self):
+    """Archived job_config does not expose secret_ref references."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+    plugin.r1fs.get_json.side_effect = [
+      {
+        "target": "example.com",
+        "start_port": 443,
+        "end_port": 443,
+        "run_mode": "SINGLEPASS",
+        "scan_type": "webapp",
+        "target_url": "https://example.com/app",
+        "redact_credentials": True,
+        "secret_ref": "QmSecretCID",
+        "official_username": "",
+      },
+      {
+        "pass_nr": 1,
+        "date_started": 1,
+        "date_completed": 2,
+        "duration": 1,
+        "aggregated_report_cid": "QmAgg",
+        "worker_reports": {},
+        "risk_score": 0,
+      },
+      {"open_ports": [], "service_info": {}, "web_tests_info": {}},
+      {"job_id": "test-job"},
+    ]
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    archive_dict = plugin.r1fs.add_json.call_args[0][0]
+    self.assertNotIn("secret_ref", archive_dict["job_config"])
+
   def test_archive_duration_computed(self):
     """duration == date_completed - date_created, not 0."""
     Plugin = self._get_plugin_class()
@@ -1917,6 +1988,40 @@ class TestPhase5Endpoints(unittest.TestCase):
       "context": "close_job",
       "write_mode": "detection_only",
     })
+
+  def test_get_job_config_resolves_secret_ref_for_runtime(self):
+    """Runtime config loading resolves secret_ref into inline credentials."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    plugin.r1fs.get_json.side_effect = [
+      {
+        "scan_type": "webapp",
+        "target_url": "https://example.com/app",
+        "secret_ref": "QmSecretCID",
+        "official_username": "",
+        "official_password": "",
+        "regular_username": "",
+        "regular_password": "",
+      },
+      {
+        "kind": "redmesh_graybox_credentials",
+        "payload": {
+          "official_username": "admin",
+          "official_password": "secret",
+          "regular_username": "user",
+          "regular_password": "pass",
+          "weak_candidates": ["admin:admin"],
+        },
+      },
+    ]
+
+    config = Plugin._get_job_config(plugin, {"job_config_cid": "QmConfigCID"}, resolve_secrets=True)
+
+    self.assertEqual(config["official_username"], "admin")
+    self.assertEqual(config["official_password"], "secret")
+    self.assertEqual(config["regular_password"], "pass")
+    self.assertEqual(config["weak_candidates"], ["admin:admin"])
+    self.assertNotIn("secret_ref", config)
 
   def test_get_job_data_running_last_5(self):
     """Running job with 8 passes returns last 5 refs only."""

@@ -13,6 +13,7 @@ from ..constants import (
   ScanType,
 )
 from ..models import JobConfig
+from .secrets import persist_job_config_with_secrets
 
 
 def validation_error(message: str):
@@ -250,7 +251,11 @@ def announce_launch(
   )
 
   config_dict = job_config.to_dict()
-  job_config_cid = owner.r1fs.add_json(config_dict, show_logs=False)
+  persisted_config, job_config_cid = persist_job_config_with_secrets(
+    owner,
+    job_id=job_id,
+    config_dict=config_dict,
+  )
   if not job_config_cid:
     owner.P("Failed to store job config in R1FS — aborting launch", color='r')
     return {"error": "Failed to store job config in R1FS"}
@@ -337,6 +342,7 @@ def announce_launch(
     "job_specs": job_specs,
     "worker": owner.ee_addr,
     "other_jobs": report,
+    "job_config": persisted_config,
   }
 
 

@@ -5,6 +5,7 @@ from ..constants import (
   JOB_STATUS_STOPPED,
   RUN_MODE_CONTINUOUS_MONITORING,
 )
+from .secrets import collect_secret_refs_from_job_config
 from .state_machine import set_job_status
 
 
@@ -81,6 +82,10 @@ def purge_job(owner, job_id: str):
       owner.P(f"[PURGE] Collected CID {cid} from {source}")
 
   _track(job_specs.get("job_config_cid"), "job_specs.job_config_cid")
+  job_config = owner.r1fs.get_json(job_specs.get("job_config_cid")) if job_specs.get("job_config_cid") else {}
+  if isinstance(job_config, dict):
+    for secret_ref in collect_secret_refs_from_job_config(job_config):
+      _track(secret_ref, "job_config.secret_ref")
 
   job_cid = job_specs.get("job_cid")
   if job_cid:
