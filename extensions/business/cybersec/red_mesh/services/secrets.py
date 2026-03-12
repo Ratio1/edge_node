@@ -1,5 +1,14 @@
 from copy import deepcopy
 
+from ..repositories import ArtifactRepository
+
+
+def _artifact_repo(owner):
+  getter = getattr(type(owner), "_get_artifact_repository", None)
+  if callable(getter):
+    return getter(owner)
+  return ArtifactRepository(owner)
+
 
 class R1fsSecretStore:
   """Minimal secret-store adapter backed by a separate R1FS object."""
@@ -13,12 +22,12 @@ class R1fsSecretStore:
       "job_id": job_id,
       "payload": payload,
     }
-    return self.owner.r1fs.add_json(secret_doc, show_logs=False)
+    return _artifact_repo(self.owner).put_json(secret_doc, show_logs=False)
 
   def load_graybox_credentials(self, secret_ref: str) -> dict | None:
     if not secret_ref:
       return None
-    secret_doc = self.owner.r1fs.get_json(secret_ref)
+    secret_doc = _artifact_repo(self.owner).get_json(secret_ref)
     if not isinstance(secret_doc, dict):
       self.owner.P(f"Failed to fetch graybox secret payload from R1FS (CID: {secret_ref})", color='r')
       return None
@@ -32,7 +41,7 @@ class R1fsSecretStore:
     if not secret_ref:
       return True
     try:
-      return bool(self.owner.r1fs.delete_file(secret_ref, show_logs=False, raise_on_error=False))
+      return bool(_artifact_repo(self.owner).delete(secret_ref, show_logs=False, raise_on_error=False))
     except Exception as exc:
       self.owner.P(f"Failed to delete graybox secret ref {secret_ref}: {exc}", color='y')
       return False
@@ -107,7 +116,7 @@ def persist_job_config_with_secrets(
       persisted_config["has_weak_candidates"] = bool(payload["weak_candidates"])
       persisted_config = _blank_graybox_secret_fields(persisted_config)
 
-  job_config_cid = owner.r1fs.add_json(persisted_config, show_logs=False)
+  job_config_cid = _artifact_repo(owner).put_json(persisted_config, show_logs=False)
   return persisted_config, job_config_cid
 
 

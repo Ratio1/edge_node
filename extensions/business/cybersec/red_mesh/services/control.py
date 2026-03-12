@@ -5,15 +5,30 @@ from ..constants import (
   JOB_STATUS_STOPPED,
   RUN_MODE_CONTINUOUS_MONITORING,
 )
+from ..repositories import ArtifactRepository, JobStateRepository
 from .secrets import collect_secret_refs_from_job_config
 from .state_machine import set_job_status
+
+
+def _job_repo(owner):
+  getter = getattr(type(owner), "_get_job_state_repository", None)
+  if callable(getter):
+    return getter(owner)
+  return JobStateRepository(owner)
+
+
+def _artifact_repo(owner):
+  getter = getattr(type(owner), "_get_artifact_repository", None)
+  if callable(getter):
+    return getter(owner)
+  return ArtifactRepository(owner)
 
 
 def _write_job_record(owner, job_id, job_specs, context):
   write_job_record = getattr(type(owner), "_write_job_record", None)
   if callable(write_job_record):
     return write_job_record(owner, job_id, job_specs, context=context)
-  owner.chainstore_hset(hkey=owner.cfg_instance_id, key=job_id, value=job_specs)
+  _job_repo(owner).put_job(job_id, job_specs)
   return job_specs
 
 
@@ -22,7 +37,7 @@ def _delete_job_record(owner, job_id):
   if callable(delete_job_record):
     delete_job_record(owner, job_id)
     return
-  owner.chainstore_hset(hkey=owner.cfg_instance_id, key=job_id, value=None)
+  _job_repo(owner).delete_job(job_id)
 
 
 def stop_and_delete_job(owner, job_id: str):
@@ -39,7 +54,7 @@ def stop_and_delete_job(owner, job_id: str):
     owner.P(f"Job {job_id} stopped.")
   owner.scan_jobs.pop(job_id, None)
 
-  raw_job_specs = owner.chainstore_hget(hkey=owner.cfg_instance_id, key=job_id)
+  raw_job_specs = _job_repo(owner).get_job(job_id)
   if isinstance(raw_job_specs, dict):
     _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
     worker_entry = job_specs.setdefault("workers", {}).setdefault(owner.ee_addr, {})
@@ -61,7 +76,7 @@ def purge_job(owner, job_id: str):
   Purge a job: delete all R1FS artifacts, clean up live progress keys,
   then tombstone the CStore entry.
   """
-  raw = owner.chainstore_hget(hkey=owner.cfg_instance_id, key=job_id)
+  raw = _job_repo(owner).get_job(job_id)
   if not isinstance(raw, dict):
     return {"status": "error", "message": f"Job {job_id} not found."}
 
@@ -82,16 +97,17 @@ def purge_job(owner, job_id: str):
       owner.P(f"[PURGE] Collected CID {cid} from {source}")
 
   _track(job_specs.get("job_config_cid"), "job_specs.job_config_cid")
-  job_config = owner.r1fs.get_json(job_specs.get("job_config_cid")) if job_specs.get("job_config_cid") else {}
+  artifacts = _artifact_repo(owner)
+  job_config = artifacts.get_job_config(job_specs) if job_specs.get("job_config_cid") else {}
   if isinstance(job_config, dict):
     for secret_ref in collect_secret_refs_from_job_config(job_config):
-      _track(secret_ref, "job_config.secret_ref")
+        _track(secret_ref, "job_config.secret_ref")
 
   job_cid = job_specs.get("job_cid")
   if job_cid:
     _track(job_cid, "job_specs.job_cid")
     try:
-      archive = owner.r1fs.get_json(job_cid)
+      archive = artifacts.get_json(job_cid)
       if isinstance(archive, dict):
         owner.P(f"[PURGE] Archive fetched OK, {len(archive.get('passes', []))} passes")
         for pi, pass_data in enumerate(archive.get("passes", [])):
@@ -112,7 +128,7 @@ def purge_job(owner, job_id: str):
     if report_cid:
       _track(report_cid, f"pass_reports[{ri}].report_cid")
       try:
-        pass_data = owner.r1fs.get_json(report_cid)
+        pass_data = artifacts.get_pass_report(report_cid)
         if isinstance(pass_data, dict):
           _track(pass_data.get("aggregated_report_cid"), f"pass_reports[{ri}]->aggregated_report_cid")
           for addr, wr in (pass_data.get("worker_reports") or {}).items():
@@ -128,7 +144,7 @@ def purge_job(owner, job_id: str):
   deleted, failed = 0, 0
   for cid in cids:
     try:
-      success = owner.r1fs.delete_file(cid, show_logs=True, raise_on_error=False)
+      success = artifacts.delete(cid, show_logs=True, raise_on_error=False)
       if success:
         deleted += 1
         owner.P(f"[PURGE] Deleted CID {cid}")
@@ -150,14 +166,12 @@ def purge_job(owner, job_id: str):
       "message": "Some R1FS artifacts could not be deleted. Retry purge later.",
     }
 
-  all_live = owner.chainstore_hgetall(hkey=f"{owner.cfg_instance_id}:live")
+  all_live = _job_repo(owner).list_live_progress()
   if isinstance(all_live, dict):
     prefix = f"{job_id}:"
     for key in all_live:
       if key.startswith(prefix):
-        owner.chainstore_hset(
-          hkey=f"{owner.cfg_instance_id}:live", key=key, value=None
-        )
+        _job_repo(owner).delete_live_progress(key)
 
   _delete_job_record(owner, job_id)
 
@@ -171,7 +185,7 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
   """
   Stop a job (any run mode with HARD stop, continuous-only for SOFT stop).
   """
-  raw_job_specs = owner.chainstore_hget(hkey=owner.cfg_instance_id, key=job_id)
+  raw_job_specs = _job_repo(owner).get_job(job_id)
   if not raw_job_specs:
     return {"error": "Job not found", "job_id": job_id}
 
