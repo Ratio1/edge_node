@@ -74,6 +74,8 @@ class CStoreJobRunning:
   launcher: str
   launcher_alias: str
   target: str
+  scan_type: str
+  target_url: str
   task_name: str
   start_port: int
   end_port: int
@@ -101,6 +103,8 @@ class CStoreJobRunning:
       launcher=d["launcher"],
       launcher_alias=d.get("launcher_alias", ""),
       target=d["target"],
+      scan_type=d.get("scan_type", "network"),
+      target_url=d.get("target_url", ""),
       task_name=d.get("task_name", ""),
       start_port=d["start_port"],
       end_port=d["end_port"],
