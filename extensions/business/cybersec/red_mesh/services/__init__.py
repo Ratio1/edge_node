@@ -1,4 +1,17 @@
 from .launch import launch_local_jobs
+from .launch_api import (
+  announce_launch,
+  build_network_workers,
+  build_webapp_workers,
+  launch_network_scan,
+  launch_test,
+  launch_webapp_scan,
+  normalize_common_launch_options,
+  parse_exceptions,
+  resolve_active_peers,
+  resolve_enabled_features,
+  validation_error,
+)
 from .query import (
   get_job_archive,
   get_job_data,
@@ -27,6 +40,9 @@ __all__ = [
   "TERMINAL_JOB_STATUSES",
   "can_transition_job_status",
   "coerce_scan_type",
+  "announce_launch",
+  "build_network_workers",
+  "build_webapp_workers",
   "get_scan_strategy",
   "get_job_archive",
   "get_job_data",
@@ -35,7 +51,15 @@ __all__ = [
   "is_terminal_job_status",
   "iter_scan_strategies",
   "launch_local_jobs",
+  "launch_network_scan",
+  "launch_test",
+  "launch_webapp_scan",
   "list_local_jobs",
   "list_network_jobs",
+  "normalize_common_launch_options",
+  "parse_exceptions",
+  "resolve_active_peers",
+  "resolve_enabled_features",
   "set_job_status",
+  "validation_error",
 ]
