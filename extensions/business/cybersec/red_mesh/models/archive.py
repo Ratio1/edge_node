@@ -14,7 +14,7 @@ from dataclasses import dataclass, asdict
 
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
 from extensions.business.cybersec.red_mesh.constants import (
-  DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS,
+  DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS, JOB_ARCHIVE_VERSION,
 )
 
 
@@ -271,6 +271,7 @@ class JobArchive:
   duration: float
   date_created: float
   date_completed: float
+  archive_version: int = JOB_ARCHIVE_VERSION
   start_attestation: dict = None
 
   def to_dict(self) -> dict:
@@ -278,7 +279,13 @@ class JobArchive:
 
   @classmethod
   def from_dict(cls, d: dict) -> JobArchive:
+    archive_version = d.get("archive_version", JOB_ARCHIVE_VERSION)
+    if archive_version != JOB_ARCHIVE_VERSION:
+      raise ValueError(
+        f"Unsupported archive_version {archive_version}; expected {JOB_ARCHIVE_VERSION}"
+      )
     return cls(
+      archive_version=archive_version,
       job_id=d["job_id"],
       job_config=d.get("job_config", {}),
       timeline=d.get("timeline", []),
