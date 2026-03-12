@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 
+from extensions.business.cybersec.red_mesh.models import CStoreJobRunning, JobArchive, JobConfig, PassReport, WorkerProgress
 from extensions.business.cybersec.red_mesh.repositories import ArtifactRepository, JobStateRepository
 
 
@@ -30,6 +31,54 @@ class TestJobStateRepository(unittest.TestCase):
 
     repo.delete_live_progress("job-1:node-A")
     owner.chainstore_hset.assert_called_once_with(hkey="test-instance:live", key="job-1:node-A", value=None)
+
+  def test_job_state_repository_supports_typed_running_jobs(self):
+    owner = self._make_owner()
+    owner.chainstore_hget.return_value = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "node-a",
+      "launcher_alias": "node-a",
+      "target": "example.com",
+      "task_name": "Test",
+      "start_port": 1,
+      "end_port": 10,
+      "date_created": 1.0,
+      "job_config_cid": "QmConfig",
+      "workers": {},
+      "timeline": [],
+      "pass_reports": [],
+    }
+    repo = JobStateRepository(owner)
+
+    running = repo.get_running_job("job-1")
+
+    self.assertIsInstance(running, CStoreJobRunning)
+    persisted = repo.put_running_job(running)
+    self.assertEqual(persisted["job_id"], "job-1")
+
+  def test_job_state_repository_supports_typed_live_progress(self):
+    owner = self._make_owner()
+    repo = JobStateRepository(owner)
+    progress = WorkerProgress(
+      job_id="job-1",
+      worker_addr="node-a",
+      pass_nr=1,
+      progress=25.0,
+      phase="port_scan",
+      ports_scanned=10,
+      ports_total=40,
+      open_ports_found=[22],
+      completed_tests=["probe"],
+      updated_at=1.0,
+    )
+
+    persisted = repo.put_live_progress_model(progress)
+
+    self.assertEqual(persisted["job_id"], "job-1")
+    owner.chainstore_hset.assert_called_once()
 
 
 class TestArtifactRepository(unittest.TestCase):
@@ -63,3 +112,46 @@ class TestArtifactRepository(unittest.TestCase):
     self.assertFalse(repo.delete(""))
     owner.r1fs.delete_file.assert_not_called()
 
+  def test_artifact_repository_supports_typed_models(self):
+    owner = self._make_owner()
+    repo = ArtifactRepository(owner)
+    owner.r1fs.get_json.return_value = {
+      "target": "example.com",
+      "start_port": 1,
+      "end_port": 10,
+      "exceptions": [],
+      "distribution_strategy": "SLICE",
+      "port_order": "SEQUENTIAL",
+      "nr_local_workers": 2,
+      "enabled_features": [],
+      "excluded_features": [],
+      "run_mode": "SINGLEPASS",
+    }
+
+    job_config = repo.get_job_config_model({"job_config_cid": "QmConfig"})
+
+    self.assertIsInstance(job_config, JobConfig)
+
+    pass_report = PassReport(
+      pass_nr=1,
+      date_started=1.0,
+      date_completed=2.0,
+      duration=1.0,
+      aggregated_report_cid="QmAgg",
+      worker_reports={},
+    )
+    repo.put_pass_report(pass_report)
+
+    archive = JobArchive(
+      job_id="job-1",
+      job_config=job_config.to_dict(),
+      timeline=[],
+      passes=[],
+      ui_aggregate={"total_open_ports": [], "total_services": 0, "total_findings": 0},
+      duration=1.0,
+      date_created=1.0,
+      date_completed=2.0,
+    )
+    repo.put_archive(archive)
+
+    self.assertEqual(owner.r1fs.add_json.call_count, 2)

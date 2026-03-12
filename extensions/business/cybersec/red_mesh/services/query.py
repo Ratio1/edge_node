@@ -61,12 +61,11 @@ def get_job_archive(owner, job_id: str):
   if not job_cid:
     return {"error": "not_available", "message": f"Job {job_id} is still running (no archive yet)."}
 
-  archive = _artifact_repo(owner).get_json(job_cid)
-  if archive is None:
-    return {"error": "fetch_failed", "message": f"Failed to fetch archive from R1FS (CID: {job_cid})."}
-
   try:
-    archive = JobArchive.from_dict(archive).to_dict()
+    archive = _artifact_repo(owner).get_archive_model(job_specs)
+    if archive is None:
+      return {"error": "fetch_failed", "message": f"Failed to fetch archive from R1FS (CID: {job_cid})."}
+    archive = archive.to_dict()
   except ValueError as exc:
     return {
       "error": "unsupported_archive_version",

@@ -202,7 +202,7 @@ def maybe_finalize_pass(owner):
         redmesh_test_attestation=redmesh_test_attestation,
       )
 
-      pass_report_cid = artifacts.put_json(pass_report.to_dict(), show_logs=False)
+      pass_report_cid = artifacts.put_pass_report(pass_report, show_logs=False)
       if not pass_report_cid:
         owner.P(f"Failed to store pass report for pass {job_pass} in R1FS", color='r')
         continue
