@@ -195,6 +195,9 @@ class WorkerProgress:
   open_ports_found: list            # [int] — discovered so far
   completed_tests: list             # [str] — which probes finished
   updated_at: float                 # unix timestamp
+  scan_type: str = "network"        # network | webapp
+  phase_index: int = 0              # 1-based current stage index; 0 when unknown
+  total_phases: int = 0             # number of stages in the active phase family
   live_metrics: dict = None         # ScanMetrics.to_dict() — partial snapshot, progressively fills in
   threads: dict = None              # {thread_id: {phase, ports_scanned, ports_total, open_ports_found}}
 
@@ -209,6 +212,9 @@ class WorkerProgress:
       pass_nr=d.get("pass_nr", 1),
       progress=d.get("progress", 0),
       phase=d.get("phase", ""),
+      scan_type=d.get("scan_type", "network"),
+      phase_index=d.get("phase_index", 0),
+      total_phases=d.get("total_phases", 0),
       ports_scanned=d.get("ports_scanned", 0),
       ports_total=d.get("ports_total", 0),
       open_ports_found=d.get("open_ports_found", []),

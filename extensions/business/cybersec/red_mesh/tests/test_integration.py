@@ -30,6 +30,9 @@ class TestPhase12LiveProgress(unittest.TestCase):
       pass_nr=2,
       progress=45.5,
       phase="service_probes",
+      scan_type="network",
+      phase_index=3,
+      total_phases=5,
       ports_scanned=500,
       ports_total=1024,
       open_ports_found=[22, 80, 443],
@@ -44,6 +47,9 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(wp2.pass_nr, 2)
     self.assertAlmostEqual(wp2.progress, 45.5)
     self.assertEqual(wp2.phase, "service_probes")
+    self.assertEqual(wp2.scan_type, "network")
+    self.assertEqual(wp2.phase_index, 3)
+    self.assertEqual(wp2.total_phases, 5)
     self.assertEqual(wp2.ports_scanned, 500)
     self.assertEqual(wp2.ports_total, 1024)
     self.assertEqual(wp2.open_ports_found, [22, 80, 443])
@@ -123,6 +129,9 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(progress_data["worker_addr"], "node-A")
     self.assertEqual(progress_data["pass_nr"], 3)
     self.assertEqual(progress_data["phase"], "service_probes")
+    self.assertEqual(progress_data["scan_type"], "network")
+    self.assertEqual(progress_data["phase_index"], 3)
+    self.assertEqual(progress_data["total_phases"], 5)
     self.assertEqual(progress_data["ports_scanned"], 100)
     self.assertEqual(progress_data["ports_total"], 512)
     self.assertIn(22, progress_data["open_ports_found"])
@@ -272,6 +281,36 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(progress_data["threads"]["t2"]["phase"], "port_scan")
     self.assertEqual(progress_data["threads"]["t2"]["ports_scanned"], 50)
     self.assertEqual(progress_data["threads"]["t2"]["ports_total"], 256)
+
+  def test_publish_live_progress_webapp_phase_metadata(self):
+    """Graybox live progress publishes explicit scan_type and phase metadata."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+    plugin._last_progress_publish = 0
+    plugin.time.return_value = 100.0
+
+    worker = MagicMock()
+    worker.state = {
+      "scan_type": "webapp",
+      "ports_scanned": [443],
+      "open_ports": [443],
+      "completed_tests": ["graybox_auth", "graybox_discovery"],
+      "done": False,
+    }
+    worker.initial_ports = [443]
+
+    plugin.scan_jobs = {"job-1": {"worker-thread-1": worker}}
+    plugin.chainstore_hget.return_value = {"job_pass": 2}
+
+    Plugin._publish_live_progress(plugin)
+
+    progress_data = plugin.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(progress_data["scan_type"], "webapp")
+    self.assertEqual(progress_data["phase"], "graybox_probes")
+    self.assertEqual(progress_data["phase_index"], 4)
+    self.assertEqual(progress_data["total_phases"], 5)
 
   def test_clear_live_progress(self):
     """_clear_live_progress deletes progress keys for all workers."""
