@@ -6,7 +6,13 @@ from unittest.mock import MagicMock, patch, PropertyMock
 from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
 from extensions.business.cybersec.red_mesh.worker.base import BaseLocalWorker
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
-from extensions.business.cybersec.red_mesh.graybox.models import DiscoveryResult, GrayboxCredentialSet, GrayboxProbeContext
+from extensions.business.cybersec.red_mesh.graybox.models import (
+  DiscoveryResult,
+  GrayboxCredentialSet,
+  GrayboxProbeContext,
+  GrayboxProbeDefinition,
+  GrayboxProbeRunResult,
+)
 from extensions.business.cybersec.red_mesh.constants import (
   ScanType, GRAYBOX_PROBE_REGISTRY,
 )
@@ -251,6 +257,16 @@ class TestExecution(unittest.TestCase):
     self.assertEqual(context.discovered_forms, ["/f"])
     self.assertEqual(context.regular_username, "alice")
 
+  def test_supported_features_come_from_typed_probe_definitions(self):
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.worker.GRAYBOX_PROBE_REGISTRY",
+      [{"key": "_graybox_alpha", "cls": "fake.Alpha"}],
+    ):
+      self.assertEqual(
+        GrayboxLocalWorker.get_supported_features(),
+        ["_graybox_alpha", "_graybox_weak_auth"],
+      )
+
   def test_scenario_stats(self):
     """Scenario stats count findings by status."""
     worker = _make_worker()
@@ -287,6 +303,54 @@ class TestExecution(unittest.TestCase):
     self.assertEqual(worker.metrics.build().probes_failed, 1)
     self.assertIn("_graybox_fatal", worker.state["graybox_results"]["8000"])
     self.assertEqual(worker.metrics.build().probe_breakdown["_graybox_test"], "failed:auth_refresh")
+
+  def test_store_findings_accepts_typed_probe_run_result(self):
+    worker = _make_worker()
+    finding = GrayboxFinding(
+      scenario_id="TEST-01",
+      title="Typed result",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="A01:2021",
+    )
+    run_result = GrayboxProbeRunResult(findings=[finding], outcome="completed")
+
+    worker._store_findings("_typed_probe", run_result)
+
+    stored = worker.state["graybox_results"]["8000"]["_typed_probe"]
+    self.assertEqual(stored["outcome"], "completed")
+    self.assertEqual(len(stored["findings"]), 1)
+
+  def test_registered_probe_accepts_typed_probe_definition(self):
+    worker = _make_worker()
+    worker.auth.official_session = MagicMock()
+    worker.auth.regular_session = MagicMock()
+    worker.auth.ensure_sessions = MagicMock(return_value=True)
+    worker.auth._auth_errors = []
+    probe_context = worker._build_probe_kwargs(DiscoveryResult())
+    finding = GrayboxFinding(
+      scenario_id="TEST-02",
+      title="Registry typed",
+      status="not_vulnerable",
+      severity="INFO",
+      owasp="A01:2021",
+    )
+    mock_probe = MagicMock()
+    mock_probe.run.return_value = GrayboxProbeRunResult(findings=[finding], outcome="completed")
+    mock_cls = MagicMock(return_value=mock_probe)
+    mock_cls.requires_regular_session = False
+    mock_cls.requires_auth = True
+    mock_cls.is_stateful = False
+
+    with patch.object(worker, "_import_probe", return_value=mock_cls):
+      worker._run_registered_probe(
+        GrayboxProbeDefinition(key="_typed", cls_path="fake.Probe"),
+        probe_context,
+      )
+
+    stored = worker.state["graybox_results"]["8000"]["_typed"]
+    self.assertEqual(stored["outcome"], "completed")
+    self.assertEqual(worker.metrics.build().probe_breakdown["_typed"], "completed")
 
   def test_auth_failure_aborts(self):
     """Official login fails → fatal finding, done=True."""

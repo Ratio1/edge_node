@@ -14,7 +14,14 @@ from .findings import GrayboxFinding
 from .auth import AuthManager
 from .discovery import DiscoveryModule
 from .safety import SafetyControls
-from .models import DiscoveryResult, GrayboxCredentialSet, GrayboxProbeContext, GrayboxTargetConfig
+from .models import (
+  DiscoveryResult,
+  GrayboxCredentialSet,
+  GrayboxProbeContext,
+  GrayboxProbeDefinition,
+  GrayboxProbeRunResult,
+  GrayboxTargetConfig,
+)
 
 # Weak auth uses a direct import (not the registry) because it is a
 # distinct pipeline phase, not a generic probe.
@@ -117,10 +124,14 @@ class GrayboxLocalWorker(BaseLocalWorker):
   @classmethod
   def get_supported_features(cls, categs=False):
     """Return supported graybox features from the explicit probe registry."""
-    features = [entry["key"] for entry in GRAYBOX_PROBE_REGISTRY] + ["_graybox_weak_auth"]
+    features = [probe.key for probe in cls._iter_probe_definitions()] + ["_graybox_weak_auth"]
     if categs:
       return {"graybox": features}
     return features
+
+  @staticmethod
+  def _iter_probe_definitions():
+    return [GrayboxProbeDefinition.from_entry(entry) for entry in GRAYBOX_PROBE_REGISTRY]
 
   # start(), stop(), _check_stopped(), P() are ALL inherited from
   # BaseLocalWorker. NOT redefined here.
@@ -268,20 +279,20 @@ class GrayboxLocalWorker(BaseLocalWorker):
     graybox_excluded = "graybox" in excluded_features
 
     if not graybox_excluded:
-      for entry in GRAYBOX_PROBE_REGISTRY:
+      for probe_def in self._iter_probe_definitions():
         if self._check_stopped():
           break
 
-        store_key = entry["key"]
+        store_key = probe_def.key
 
         if store_key in excluded_features:
           self.metrics.record_probe(store_key, "skipped:disabled")
           continue
 
-        self._run_registered_probe(entry, probe_context)
+        self._run_registered_probe(probe_def, probe_context)
     else:
-      for entry in GRAYBOX_PROBE_REGISTRY:
-        self.metrics.record_probe(entry["key"], "skipped:disabled")
+      for probe_def in self._iter_probe_definitions():
+        self.metrics.record_probe(probe_def.key, "skipped:disabled")
 
     self.state["completed_tests"].append("graybox_probes")
     self.metrics.phase_end("graybox_probes")
@@ -315,10 +326,11 @@ class GrayboxLocalWorker(BaseLocalWorker):
     elif self._credentials.weak_candidates and "_graybox_weak_auth" in (self.job_config.excluded_features or []):
       self.metrics.record_probe("_graybox_weak_auth", "skipped:disabled")
 
-  def _run_registered_probe(self, entry: dict, probe_context: GrayboxProbeContext):
+  def _run_registered_probe(self, entry, probe_context: GrayboxProbeContext):
     """Run one registered probe through a shared capability and error boundary."""
-    store_key = entry["key"]
-    probe_cls = self._import_probe(entry["cls"])
+    probe_def = GrayboxProbeDefinition.from_entry(entry)
+    store_key = probe_def.key
+    probe_cls = self._import_probe(probe_def.cls_path)
 
     if probe_cls.is_stateful and not probe_context.allow_stateful:
       self.metrics.record_probe(store_key, "skipped:stateful_disabled")
@@ -348,9 +360,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
         probe = from_context(probe_context)
       else:
         probe = probe_cls(**probe_context.to_kwargs())
-      findings = probe.run()
-      self._store_findings(store_key, findings)
-      self.metrics.record_probe(store_key, "completed")
+      run_result = self._normalize_probe_run_result(probe.run())
+      self._store_findings(store_key, run_result)
+      self.metrics.record_probe(store_key, run_result.outcome)
     except Exception as exc:
       self._record_probe_error(store_key, exc)
       self.metrics.record_probe(store_key, "failed")
@@ -371,13 +383,19 @@ class GrayboxLocalWorker(BaseLocalWorker):
     )
     return False
 
+  @staticmethod
+  def _normalize_probe_run_result(value) -> GrayboxProbeRunResult:
+    return GrayboxProbeRunResult.from_value(value)
+
   def _store_findings(self, key, findings):
     """Store GrayboxFinding dicts in graybox_results under the port key."""
+    run_result = self._normalize_probe_run_result(findings)
     port_results = self.state["graybox_results"].setdefault(self._port_key, {})
     port_results[key] = {
-      "findings": [f.to_dict() for f in findings],
+      "findings": [f.to_dict() for f in run_result.findings],
+      "outcome": run_result.outcome,
     }
-    for finding in findings:
+    for finding in run_result.findings:
       self.metrics.record_finding(getattr(finding, "severity", "INFO"))
 
   def _store_auth_results(self):
