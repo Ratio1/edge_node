@@ -126,6 +126,20 @@ class TestArtifactRepository(unittest.TestCase):
     repo.put_json({"job_id": "job-1"}, show_logs=False)
     owner.r1fs.add_json.assert_called_once_with({"job_id": "job-1"}, show_logs=False)
 
+  def test_artifact_repository_passes_secret_for_protected_json(self):
+    owner = self._make_owner()
+    repo = ArtifactRepository(owner)
+
+    repo.get_json("QmCID", secret="node-secret-key")
+    owner.r1fs.get_json.assert_called_once_with("QmCID", secret="node-secret-key")
+
+    repo.put_json({"job_id": "job-1"}, show_logs=False, secret="node-secret-key")
+    owner.r1fs.add_json.assert_called_once_with(
+      {"job_id": "job-1"},
+      show_logs=False,
+      secret="node-secret-key",
+    )
+
   def test_artifact_repository_job_config_helper(self):
     owner = self._make_owner()
     repo = ArtifactRepository(owner)
