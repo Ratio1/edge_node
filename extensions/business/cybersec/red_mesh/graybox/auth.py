@@ -52,6 +52,8 @@ class AuthManager:
   def authenticate(self, official_creds, regular_creds=None):
     """Create fresh sessions for all configured users."""
     self.anon_session = self._make_session()
+    official_creds = self._coerce_creds(official_creds)
+    regular_creds = self._coerce_creds(regular_creds)
 
     self.official_session = self._try_login(
       official_creds["username"],
@@ -71,6 +73,20 @@ class AuthManager:
 
     self._created_at = time.time()
     return True
+
+  @staticmethod
+  def _coerce_creds(creds):
+    if creds is None:
+      return None
+    if isinstance(creds, dict):
+      return {
+        "username": creds.get("username", ""),
+        "password": creds.get("password", ""),
+      }
+    return {
+      "username": getattr(creds, "username", "") or "",
+      "password": getattr(creds, "password", "") or "",
+    }
 
   def cleanup(self):
     """
