@@ -14,6 +14,37 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class GrayboxEvidenceArtifact:
+  """Typed graybox evidence payload kept alongside legacy string summaries."""
+  summary: str = ""
+  request_snapshot: str = ""
+  response_snapshot: str = ""
+  captured_at: str = ""
+  raw_evidence_cid: str = ""
+  sensitive: bool = False
+
+  @classmethod
+  def from_value(cls, value: Any) -> "GrayboxEvidenceArtifact":
+    if isinstance(value, GrayboxEvidenceArtifact):
+      return value
+    if isinstance(value, dict):
+      return cls(
+        summary=value.get("summary", "") or "",
+        request_snapshot=value.get("request_snapshot", "") or "",
+        response_snapshot=value.get("response_snapshot", "") or "",
+        captured_at=value.get("captured_at", "") or "",
+        raw_evidence_cid=value.get("raw_evidence_cid", "") or "",
+        sensitive=bool(value.get("sensitive", False)),
+      )
+    if isinstance(value, str):
+      return cls(summary=value)
+    return cls()
+
+  def to_dict(self) -> dict[str, Any]:
+    return asdict(self)
+
+
+@dataclass(frozen=True)
 class GrayboxFinding:
   """
   Structured finding from an authenticated web-application probe.
@@ -31,13 +62,32 @@ class GrayboxFinding:
   cwe: list[str] = field(default_factory=list)      # e.g. ["CWE-639", "CWE-862"]
   attack: list[str] = field(default_factory=list)   # MITRE ATT&CK IDs e.g. ["T1078"]
   evidence: list[str] = field(default_factory=list) # ["endpoint=http://...", "status=200"]
+  evidence_artifacts: list[GrayboxEvidenceArtifact | dict] = field(default_factory=list)
   replay_steps: list[str] = field(default_factory=list)  # reproducibility steps
   remediation: str = ""
   error: str | None = None                          # non-None if probe had an error
 
   def to_dict(self) -> dict[str, Any]:
     """JSON-safe serialization."""
-    return asdict(self)
+    payload = asdict(self)
+    payload["evidence_artifacts"] = [
+      GrayboxEvidenceArtifact.from_value(item).to_dict()
+      for item in self.evidence_artifacts
+    ]
+    return payload
+
+  def _normalized_evidence_artifacts(self) -> list[GrayboxEvidenceArtifact]:
+    return [GrayboxEvidenceArtifact.from_value(item) for item in self.evidence_artifacts]
+
+  def _flat_evidence_summary(self) -> str:
+    evidence_lines = [line for line in self.evidence if isinstance(line, str) and line]
+    if evidence_lines:
+      return "; ".join(evidence_lines)
+    artifact_summaries = [
+      artifact.summary for artifact in self._normalized_evidence_artifacts()
+      if artifact.summary
+    ]
+    return "; ".join(artifact_summaries)
 
   def to_flat_finding(self, port: int, protocol: str, probe_name: str) -> dict:
     """
@@ -70,7 +120,10 @@ class GrayboxFinding:
       "description": f"Scenario {self.scenario_id}: {self.title}",
       "owasp_id": self.owasp,
       "cwe_id": cwe_joined,
-      "evidence": "; ".join(self.evidence),
+      "evidence": self._flat_evidence_summary(),
+      "evidence_artifacts": [
+        artifact.to_dict() for artifact in self._normalized_evidence_artifacts()
+      ],
       "remediation": self.remediation,
       "confidence": confidence_map.get(self.status, "tentative"),
       "port": port,

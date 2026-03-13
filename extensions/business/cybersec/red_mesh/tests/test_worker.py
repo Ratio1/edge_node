@@ -5,7 +5,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 
 from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
 from extensions.business.cybersec.red_mesh.worker.base import BaseLocalWorker
-from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxEvidenceArtifact, GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.models import (
   DiscoveryResult,
   GrayboxCredentialSet,
@@ -320,6 +320,34 @@ class TestExecution(unittest.TestCase):
     stored = worker.state["graybox_results"]["8000"]["_typed_probe"]
     self.assertEqual(stored["outcome"], "completed")
     self.assertEqual(len(stored["findings"]), 1)
+
+  def test_store_findings_persists_typed_probe_artifacts(self):
+    worker = _make_worker()
+    finding = GrayboxFinding(
+      scenario_id="TEST-ART",
+      title="Artifact result",
+      status="inconclusive",
+      severity="INFO",
+      owasp="A01:2021",
+    )
+    run_result = GrayboxProbeRunResult(
+      findings=[finding],
+      artifacts=[
+        GrayboxEvidenceArtifact(
+          summary="GET /admin -> 403",
+          request_snapshot="GET /admin",
+          response_snapshot="403 Forbidden",
+          raw_evidence_cid="QmArtifact",
+        ),
+      ],
+      outcome="completed",
+    )
+
+    worker._store_findings("_typed_probe", run_result)
+
+    stored = worker.state["graybox_results"]["8000"]["_typed_probe"]
+    self.assertEqual(stored["artifacts"][0]["summary"], "GET /admin -> 403")
+    self.assertEqual(stored["artifacts"][0]["raw_evidence_cid"], "QmArtifact")
 
   def test_registered_probe_accepts_typed_probe_definition(self):
     worker = _make_worker()

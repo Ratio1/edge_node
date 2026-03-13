@@ -270,6 +270,53 @@ class TestGrayboxRedaction(unittest.TestCase):
     self.assertEqual(service_creds, ["admin:***", "service-user:***"])
     self.assertTrue(all("***" in item for item in graybox_evidence))
 
+  def test_redaction_masks_graybox_evidence_artifacts(self):
+    """Typed graybox evidence artifacts are redacted alongside legacy evidence strings."""
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    host = MockHost()
+    report = {
+      "service_info": {},
+      "graybox_results": {
+        "443": {
+          "_graybox_weak_auth": {
+            "findings": [
+              {
+                "evidence": ["accepted=admin:password123"],
+                "evidence_artifacts": [
+                  {
+                    "summary": "accepted=admin:password123",
+                    "request_snapshot": "POST /login username=admin password=password123",
+                    "response_snapshot": "accepted admin:password123",
+                  },
+                ],
+              },
+            ],
+            "artifacts": [
+              {
+                "summary": "candidate=admin:password123",
+                "request_snapshot": "POST /login password=password123",
+                "response_snapshot": "200 admin:password123",
+              },
+            ],
+          },
+        },
+      },
+    }
+
+    redacted = host._redact_report(report)
+    finding = redacted["graybox_results"]["443"]["_graybox_weak_auth"]["findings"][0]
+    artifact = finding["evidence_artifacts"][0]
+    probe_artifact = redacted["graybox_results"]["443"]["_graybox_weak_auth"]["artifacts"][0]
+
+    self.assertNotIn("password123", artifact["summary"])
+    self.assertNotIn("password123", artifact["request_snapshot"])
+    self.assertNotIn("password123", artifact["response_snapshot"])
+    self.assertNotIn("password123", probe_artifact["summary"])
+
 
 class TestFindingCounting(unittest.TestCase):
 

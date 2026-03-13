@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 
 from ..worker.base import BaseLocalWorker
 from ..constants import GRAYBOX_PROBE_REGISTRY
-from .findings import GrayboxFinding
+from .findings import GrayboxEvidenceArtifact, GrayboxFinding
 from .auth import AuthManager
 from .discovery import DiscoveryModule
 from .safety import SafetyControls
@@ -393,6 +393,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
     port_results = self.state["graybox_results"].setdefault(self._port_key, {})
     port_results[key] = {
       "findings": [f.to_dict() for f in run_result.findings],
+      "artifacts": [
+        GrayboxEvidenceArtifact.from_value(artifact).to_dict()
+        for artifact in run_result.artifacts
+      ],
       "outcome": run_result.outcome,
     }
     for finding in run_result.findings:

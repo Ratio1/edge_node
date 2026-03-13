@@ -269,6 +269,15 @@ class _ReportMixin:
           ]
     # Redact graybox_results credential evidence
     _CRED_RE = _re.compile(r'(\S+?):(\S+)')
+    _PASSWORD_RE = _re.compile(r'((?:password|passwd|pwd)["\']?\s*[:=]\s*)(["\']?)[^\s"\'&]+', _re.I)
+
+    def _redact_graybox_text(value):
+      if not isinstance(value, str):
+        return value
+      value = _CRED_RE.sub(r'\1:***', value)
+      value = _PASSWORD_RE.sub(r'\1\2***', value)
+      return value
+
     graybox_results = redacted.get("graybox_results", {})
     for port_key, probes in graybox_results.items():
       if not isinstance(probes, dict):
@@ -282,9 +291,33 @@ class _ReportMixin:
           evidence = finding.get("evidence", [])
           if isinstance(evidence, list):
             finding["evidence"] = [
-              _CRED_RE.sub(r'\1:***', e) if isinstance(e, str) else e
+              _redact_graybox_text(e)
               for e in evidence
             ]
+          artifacts = finding.get("evidence_artifacts", [])
+          if isinstance(artifacts, list):
+            finding["evidence_artifacts"] = [
+              {
+                **artifact,
+                "summary": _redact_graybox_text(artifact.get("summary", "")),
+                "request_snapshot": _redact_graybox_text(artifact.get("request_snapshot", "")),
+                "response_snapshot": _redact_graybox_text(artifact.get("response_snapshot", "")),
+              }
+              if isinstance(artifact, dict) else artifact
+              for artifact in artifacts
+            ]
+        artifacts = probe_data.get("artifacts", [])
+        if isinstance(artifacts, list):
+          probe_data["artifacts"] = [
+            {
+              **artifact,
+              "summary": _redact_graybox_text(artifact.get("summary", "")),
+              "request_snapshot": _redact_graybox_text(artifact.get("request_snapshot", "")),
+              "response_snapshot": _redact_graybox_text(artifact.get("response_snapshot", "")),
+            }
+            if isinstance(artifact, dict) else artifact
+            for artifact in artifacts
+          ]
     return redacted
 
   @staticmethod
