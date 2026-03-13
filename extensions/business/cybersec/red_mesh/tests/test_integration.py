@@ -338,7 +338,11 @@ class TestPhase14Purge(unittest.TestCase):
     }
     plugin.r1fs.get_json.return_value = archive
     plugin.r1fs.delete_file.return_value = True
-    plugin.chainstore_hgetall.return_value = {}
+    plugin.chainstore_hgetall.side_effect = [
+      {},
+      {"job-1:f-1": {"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk"}},
+      {"job-1:f-1": [{"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk", "timestamp": 1.0}]},
+    ]
 
     # Normalize returns the specs as-is
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
@@ -351,6 +355,18 @@ class TestPhase14Purge(unittest.TestCase):
     self.assertEqual(deleted_cids, {"cid-archive", "cid-config", "cid-agg-1", "cid-wr-A", "cid-wr-B"})
     self.assertEqual(result["cids_deleted"], 5)
     self.assertEqual(result["cids_total"], 5)
+    triage_deletes = {
+      (c.kwargs["hkey"], c.kwargs["key"])
+      for c in plugin.chainstore_hset.call_args_list
+      if c.kwargs.get("value") is None and c.kwargs.get("hkey", "").endswith(":triage")
+    }
+    self.assertEqual(triage_deletes, {("test-instance:triage", "job-1:f-1")})
+    triage_audit_deletes = {
+      (c.kwargs["hkey"], c.kwargs["key"])
+      for c in plugin.chainstore_hset.call_args_list
+      if c.kwargs.get("value") is None and c.kwargs.get("hkey", "").endswith(":triage:audit")
+    }
+    self.assertEqual(triage_audit_deletes, {("test-instance:triage:audit", "job-1:f-1")})
 
   def test_purge_finalized_no_pass_report_cids(self):
     """Finalized purge does NOT try to delete individual pass report CIDs (they are inside archive)."""
@@ -366,7 +382,11 @@ class TestPhase14Purge(unittest.TestCase):
     plugin.chainstore_hget.return_value = job_specs
     plugin.r1fs.get_json.return_value = {"passes": []}
     plugin.r1fs.delete_file.return_value = True
-    plugin.chainstore_hgetall.return_value = {}
+    plugin.chainstore_hgetall.side_effect = [
+      {},
+      {"job-1:f-1": {"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk"}},
+      {"job-1:f-1": [{"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk", "timestamp": 1.0}]},
+    ]
     plugin._normalize_job_record = MagicMock(return_value=("job-1", job_specs))
 
     result = Plugin.purge_job(plugin, "job-1")

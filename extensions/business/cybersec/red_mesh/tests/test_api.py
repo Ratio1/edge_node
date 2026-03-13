@@ -1875,7 +1875,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     archive_data = {
       "archive_version": JOB_ARCHIVE_VERSION,
       "job_id": "fin-job",
-      "passes": [],
+      "passes": [{"findings": [{"finding_id": "f-1", "title": "Issue"}]}],
       "ui_aggregate": {},
       "job_config": {},
       "timeline": [],
@@ -1884,11 +1884,16 @@ class TestPhase5Endpoints(unittest.TestCase):
       "date_completed": 0,
     }
     plugin.r1fs.get_json.return_value = archive_data
+    plugin.chainstore_hgetall.side_effect = [
+      {"fin-job": stub},
+      {"fin-job:f-1": {"job_id": "fin-job", "finding_id": "f-1", "status": "accepted_risk", "note": "documented"}},
+    ]
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job")
     self.assertEqual(result["job_id"], "fin-job")
     self.assertEqual(result["archive"]["job_id"], "fin-job")
     self.assertEqual(result["archive"]["archive_version"], JOB_ARCHIVE_VERSION)
+    self.assertEqual(result["archive"]["passes"][0]["findings"][0]["triage"]["status"], "accepted_risk")
 
   def test_get_job_archive_running(self):
     """get_job_archive for running job returns not_available error."""
@@ -2179,6 +2184,84 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job")
     self.assertEqual(result["error"], "fetch_failed")
+
+  def test_update_finding_triage_persists_mutable_state(self):
+    """Analyst triage updates stay outside archive storage and append audit history."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+    plugin.r1fs.get_json.return_value = {
+      "archive_version": JOB_ARCHIVE_VERSION,
+      "job_id": "fin-job",
+      "passes": [{"findings": [{"finding_id": "f-1", "title": "Issue"}]}],
+      "ui_aggregate": {},
+      "job_config": {},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
+    plugin.time.return_value = 123.0
+    plugin._log_audit_event = MagicMock()
+    triage_store = {}
+    triage_audit_store = {}
+
+    def _chainstore_hget(hkey, key):
+      if hkey.endswith(":triage"):
+        return triage_store.get(key)
+      if hkey.endswith(":triage:audit"):
+        return triage_audit_store.get(key)
+      return {"fin-job": stub}.get(key)
+
+    def _chainstore_hgetall(hkey):
+      if hkey.endswith(":triage"):
+        return dict(triage_store)
+      if hkey.endswith(":triage:audit"):
+        return dict(triage_audit_store)
+      return {"fin-job": stub}
+
+    def _chainstore_hset(hkey, key, value):
+      if hkey.endswith(":triage"):
+        triage_store[key] = value
+      elif hkey.endswith(":triage:audit"):
+        triage_audit_store[key] = value
+
+    plugin.chainstore_hget.side_effect = _chainstore_hget
+    plugin.chainstore_hgetall.side_effect = _chainstore_hgetall
+    plugin.chainstore_hset.side_effect = _chainstore_hset
+
+    result = Plugin.update_finding_triage(
+      plugin,
+      job_id="fin-job",
+      finding_id="f-1",
+      status="accepted_risk",
+      note="Approved by analyst",
+      actor="alice",
+      review_at=456.0,
+    )
+
+    self.assertEqual(result["triage"]["status"], "accepted_risk")
+    self.assertEqual(result["audit"][-1]["actor"], "alice")
+    self.assertEqual(triage_store["fin-job:f-1"]["review_at"], 456.0)
+    plugin._log_audit_event.assert_called_once()
+
+  def test_get_job_triage_not_found(self):
+    """Triage query returns found=False when no mutable state exists yet."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+    plugin.chainstore_hgetall.side_effect = [
+      {"fin-job": stub},
+      {},
+    ]
+    plugin.chainstore_hget.side_effect = [
+      [],
+    ]
+
+    result = Plugin.get_job_triage(plugin, job_id="fin-job", finding_id="missing")
+
+    self.assertFalse(result["found"])
+    self.assertEqual(result["audit"], [])
 
 
 class TestPhase2AuditCounting(unittest.TestCase):

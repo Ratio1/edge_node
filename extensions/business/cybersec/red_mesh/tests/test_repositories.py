@@ -108,6 +108,26 @@ class TestJobStateRepository(unittest.TestCase):
     self.assertEqual(payload["scan_type"], "webapp")
     self.assertEqual(payload["target_url"], "https://example.com/app")
 
+  def test_job_state_repository_supports_finding_triage(self):
+    owner = self._make_owner()
+    owner.chainstore_hget.side_effect = [
+      {"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk", "note": "known issue"},
+      [{"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk", "timestamp": 10.0}],
+    ]
+    owner.chainstore_hgetall.side_effect = [
+      {"job-1:f-1": {"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk"}},
+      {"job-1:f-1": [{"job_id": "job-1", "finding_id": "f-1", "status": "accepted_risk", "timestamp": 10.0}]},
+    ]
+    repo = JobStateRepository(owner)
+
+    triage = repo.get_finding_triage_model("job-1", "f-1")
+    audit = repo.get_finding_triage_audit("job-1", "f-1")
+    repo.delete_job_triage("job-1")
+
+    self.assertEqual(triage.status, "accepted_risk")
+    self.assertEqual(audit[0]["finding_id"], "f-1")
+    self.assertEqual(owner.chainstore_hset.call_count, 2)
+
 
 class TestArtifactRepository(unittest.TestCase):
 

@@ -173,6 +173,7 @@ def purge_job(owner, job_id: str):
       if key.startswith(prefix):
         _job_repo(owner).delete_live_progress(key)
 
+  _job_repo(owner).delete_job_triage(job_id)
   _delete_job_record(owner, job_id)
 
   owner.P(f"Purged job {job_id}: {deleted}/{len(cids)} CIDs deleted.")
