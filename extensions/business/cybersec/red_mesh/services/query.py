@@ -1,5 +1,6 @@
 from ..models import JobArchive
 from ..repositories import ArtifactRepository, JobStateRepository
+from .triage import get_job_archive_with_triage
 
 
 def _job_repo(owner):
@@ -53,35 +54,7 @@ def get_job_archive(owner, job_id: str):
   """
   Retrieve the full archived job payload from R1FS for finalized jobs.
   """
-  job_specs = owner._get_job_from_cstore(job_id)
-  if not job_specs:
-    return {"error": "not_found", "message": f"Job {job_id} not found."}
-
-  job_cid = job_specs.get("job_cid")
-  if not job_cid:
-    return {"error": "not_available", "message": f"Job {job_id} is still running (no archive yet)."}
-
-  try:
-    archive = _artifact_repo(owner).get_archive_model(job_specs)
-    if archive is None:
-      return {"error": "fetch_failed", "message": f"Failed to fetch archive from R1FS (CID: {job_cid})."}
-    archive = archive.to_dict()
-  except ValueError as exc:
-    return {
-      "error": "unsupported_archive_version",
-      "message": str(exc),
-      "job_id": job_id,
-      "job_cid": job_cid,
-    }
-
-  if archive.get("job_id") != job_id:
-    owner.P(
-      f"[INTEGRITY] Archive CID {job_cid} has job_id={archive.get('job_id')}, expected {job_id}",
-      color='r'
-    )
-    return {"error": "integrity_mismatch", "message": "Archive job_id does not match requested job_id."}
-
-  return {"job_id": job_id, "archive": archive}
+  return get_job_archive_with_triage(owner, job_id)
 
 
 def get_job_progress(owner, job_id: str):

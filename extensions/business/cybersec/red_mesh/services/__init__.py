@@ -45,6 +45,11 @@ from .state_machine import (
   is_terminal_job_status,
   set_job_status,
 )
+from .triage import (
+  get_job_archive_with_triage,
+  get_job_triage,
+  update_finding_triage,
+)
 
 __all__ = [
   "INTERMEDIATE_JOB_STATUSES",
@@ -81,5 +86,8 @@ __all__ = [
   "set_job_status",
   "stop_and_delete_job",
   "stop_monitoring",
+  "get_job_archive_with_triage",
+  "get_job_triage",
+  "update_finding_triage",
   "validation_error",
 ]
