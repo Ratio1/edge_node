@@ -99,6 +99,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.ee_addr = "node-1"
     plugin.ee_id = "node-alias-1"
     plugin.cfg_instance_id = "test-instance"
+    plugin.cfg_redmesh_secret_store_key = "unit-test-redmesh-secret-key"
     plugin.cfg_port_order = "SEQUENTIAL"
     plugin.cfg_excluded_features = []
     plugin.cfg_distribution_strategy = "SLICE"
@@ -321,11 +322,14 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
     config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    secret_kwargs = plugin.r1fs.add_json.call_args_list[0][1]
 
     self.assertEqual(secret_doc["kind"], "redmesh_graybox_credentials")
+    self.assertEqual(secret_doc["storage_mode"], "encrypted_r1fs_json_v1")
     self.assertEqual(secret_doc["payload"]["official_password"], "secret")
     self.assertEqual(secret_doc["payload"]["regular_password"], "pass")
     self.assertEqual(secret_doc["payload"]["weak_candidates"], ["admin:admin"])
+    self.assertEqual(secret_kwargs["secret"], "unit-test-redmesh-secret-key")
 
     self.assertEqual(config_dict["secret_ref"], "QmSecretCID")
     self.assertEqual(config_dict["official_username"], "")
@@ -338,6 +342,22 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     job_specs = self._extract_job_specs(plugin, "test-job-websecret")
     self.assertEqual(job_specs["job_config_cid"], "QmConfigCID")
+
+  def test_launch_webapp_scan_rejects_secret_persistence_without_store_key(self):
+    """Webapp launch fails closed when no strong secret-store key is configured."""
+    plugin = self._build_mock_plugin(job_id="test-job-websecret-nokey")
+    plugin.cfg_redmesh_secret_store_key = ""
+    plugin.cfg_comms_host_key = ""
+    plugin.cfg_attestation_private_key = ""
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="admin",
+      official_password="secret",
+    )
+
+    self.assertEqual(result["error"], "Failed to store job config in R1FS")
+    self.assertEqual(len(plugin.r1fs.add_json.call_args_list), 0)
 
   def test_launch_webapp_scan_rejects_missing_target_url(self):
     """Webapp endpoint returns structured validation error for missing URL."""
@@ -1832,6 +1852,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin.ee_addr = "launcher-node"
     plugin.ee_id = "launcher-alias"
     plugin.cfg_instance_id = "test-instance"
+    plugin.cfg_redmesh_secret_store_key = "unit-test-redmesh-secret-key"
     plugin.r1fs = MagicMock()
 
     plugin.chainstore_hgetall.return_value = dict(jobs_dict)
@@ -2034,6 +2055,40 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(config["regular_password"], "pass")
     self.assertEqual(config["weak_candidates"], ["admin:admin"])
     self.assertNotIn("secret_ref", config)
+    self.assertEqual(
+      plugin.r1fs.get_json.call_args_list[1],
+      unittest.mock.call("QmSecretCID", secret="unit-test-redmesh-secret-key"),
+    )
+
+  def test_get_job_config_resolves_legacy_plaintext_secret_ref_without_key(self):
+    """Legacy plaintext secret refs remain readable as a compatibility fallback."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    plugin.cfg_redmesh_secret_store_key = ""
+    plugin.cfg_comms_host_key = ""
+    plugin.cfg_attestation_private_key = ""
+    plugin.r1fs.get_json.side_effect = [
+      {
+        "scan_type": "webapp",
+        "target_url": "https://example.com/app",
+        "secret_ref": "QmSecretCID",
+      },
+      {
+        "kind": "redmesh_graybox_credentials",
+        "payload": {
+          "official_username": "admin",
+          "official_password": "secret",
+        },
+      },
+    ]
+
+    config = Plugin._get_job_config(plugin, {"job_config_cid": "QmConfigCID"}, resolve_secrets=True)
+
+    self.assertEqual(config["official_password"], "secret")
+    self.assertEqual(
+      plugin.r1fs.get_json.call_args_list[1],
+      unittest.mock.call("QmSecretCID"),
+    )
 
   def test_get_job_data_running_last_5(self):
     """Running job with 8 passes returns last 5 refs only."""

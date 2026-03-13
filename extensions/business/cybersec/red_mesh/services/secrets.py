@@ -1,4 +1,5 @@
 from copy import deepcopy
+import os
 
 from ..models import JobConfig
 from ..repositories import ArtifactRepository
@@ -12,23 +13,58 @@ def _artifact_repo(owner):
 
 
 class R1fsSecretStore:
-  """Minimal secret-store adapter backed by a separate R1FS object."""
+  """Secret-store adapter backed by a protected R1FS JSON object."""
 
   def __init__(self, owner):
     self.owner = owner
 
+  @staticmethod
+  def _normalize_secret_key(value):
+    if not isinstance(value, str):
+      return ""
+    value = value.strip()
+    return value if len(value) >= 8 else ""
+
+  def _get_secret_store_key(self) -> str:
+    candidates = [
+      os.environ.get("REDMESH_SECRET_STORE_KEY", ""),
+      getattr(self.owner, "cfg_redmesh_secret_store_key", ""),
+      getattr(self.owner, "cfg_comms_host_key", ""),
+      getattr(self.owner, "cfg_attestation_private_key", ""),
+    ]
+    for candidate in candidates:
+      key = self._normalize_secret_key(candidate)
+      if key:
+        return key
+    return ""
+
   def save_graybox_credentials(self, job_id: str, payload: dict) -> str:
+    secret_key = self._get_secret_store_key()
+    if not secret_key:
+      self.owner.P(
+        "No strong RedMesh secret-store key is configured. "
+        "Graybox launch credentials cannot be persisted safely.",
+        color='r',
+      )
+      return ""
     secret_doc = {
       "kind": "redmesh_graybox_credentials",
       "job_id": job_id,
+      "storage_mode": "encrypted_r1fs_json_v1",
       "payload": payload,
     }
-    return _artifact_repo(self.owner).put_json(secret_doc, show_logs=False)
+    return _artifact_repo(self.owner).put_json(secret_doc, show_logs=False, secret=secret_key)
 
   def load_graybox_credentials(self, secret_ref: str) -> dict | None:
     if not secret_ref:
       return None
-    secret_doc = _artifact_repo(self.owner).get_json(secret_ref)
+    repo = _artifact_repo(self.owner)
+    secret_key = self._get_secret_store_key()
+    secret_doc = None
+    if secret_key:
+      secret_doc = repo.get_json(secret_ref, secret=secret_key)
+    if not isinstance(secret_doc, dict):
+      secret_doc = repo.get_json(secret_ref)
     if not isinstance(secret_doc, dict):
       self.owner.P(f"Failed to fetch graybox secret payload from R1FS (CID: {secret_ref})", color='r')
       return None

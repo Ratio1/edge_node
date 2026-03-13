@@ -15,12 +15,16 @@ class ArtifactRepository:
   def __init__(self, owner):
     self.owner = owner
 
-  def get_json(self, cid):
+  def get_json(self, cid, *, secret=None):
     if not cid:
       return None
+    if secret:
+      return self.owner.r1fs.get_json(cid, secret=secret)
     return self.owner.r1fs.get_json(cid)
 
-  def put_json(self, payload, *, show_logs=False):
+  def put_json(self, payload, *, show_logs=False, secret=None):
+    if secret:
+      return self.owner.r1fs.add_json(payload, show_logs=show_logs, secret=secret)
     return self.owner.r1fs.add_json(payload, show_logs=show_logs)
 
   def delete(self, cid, *, show_logs=False, raise_on_error=False):
