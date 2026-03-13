@@ -171,6 +171,18 @@ class TestGrayboxFinding(unittest.TestCase):
     self.assertEqual(flat["evidence"], "GET /admin -> 403")
     self.assertEqual(flat["evidence_artifacts"][0]["raw_evidence_cid"], "Qm1")
 
+  def test_cvss_metadata_survives_flattening(self):
+    """Optional CVSS metadata survives typed graybox normalization."""
+    f = self._make_finding(
+      cvss_score=8.8,
+      cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+    )
+
+    flat = f.to_flat_finding(port=443, protocol="https", probe_name="access_control")
+
+    self.assertEqual(flat["cvss_score"], 8.8)
+    self.assertEqual(flat["cvss_vector"], "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H")
+
   def test_frozen(self):
     """Finding is immutable."""
     f = self._make_finding()

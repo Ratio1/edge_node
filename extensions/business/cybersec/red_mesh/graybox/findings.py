@@ -66,6 +66,8 @@ class GrayboxFinding:
   replay_steps: list[str] = field(default_factory=list)  # reproducibility steps
   remediation: str = ""
   error: str | None = None                          # non-None if probe had an error
+  cvss_score: float | None = None
+  cvss_vector: str = ""
 
   @classmethod
   def from_dict(cls, payload: dict[str, Any]) -> "GrayboxFinding":
@@ -148,6 +150,8 @@ class GrayboxFinding:
       "status": self.status,
       "replay_steps": list(self.replay_steps),
       "attack_ids": list(self.attack),
+      "cvss_score": self.cvss_score,
+      "cvss_vector": self.cvss_vector,
     }
 
   @classmethod

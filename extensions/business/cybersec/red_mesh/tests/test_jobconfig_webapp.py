@@ -192,13 +192,27 @@ class TestScanMetricsGraybox(unittest.TestCase):
 
 
 class TestFindingUnchanged(unittest.TestCase):
-  """Verify blackbox Finding dataclass is not modified."""
+  """Verify blackbox Finding stays backward-compatible."""
 
-  def test_finding_has_8_fields(self):
-    """Finding has exactly 8 fields — no new fields added."""
+  def test_finding_has_expected_fields(self):
+    """Finding keeps legacy fields and adds optional CVSS metadata only."""
     import dataclasses
     fields = dataclasses.fields(Finding)
-    self.assertEqual(len(fields), 8, f"Expected 8 fields, got {len(fields)}: {[f.name for f in fields]}")
+    self.assertEqual(
+      [f.name for f in fields],
+      [
+        "severity",
+        "title",
+        "description",
+        "evidence",
+        "remediation",
+        "owasp_id",
+        "cwe_id",
+        "confidence",
+        "cvss_score",
+        "cvss_vector",
+      ],
+    )
 
   def test_finding_no_probe_type(self):
     """Finding does not have a probe_type attribute."""
@@ -218,9 +232,23 @@ class TestFindingUnchanged(unittest.TestCase):
       cwe_id="CWE-89",
       confidence="certain",
     )
+    self.assertIsNone(f.cvss_score)
+    self.assertEqual(f.cvss_vector, "")
     self.assertEqual(f.severity, Severity.CRITICAL)
     self.assertEqual(f.title, "SQL Injection")
     self.assertEqual(f.confidence, "certain")
+
+  def test_optional_cvss_metadata_supported(self):
+    """Finding supports optional CVSS metadata without affecting legacy fields."""
+    f = Finding(
+      severity=Severity.HIGH,
+      title="Broken Access Control",
+      description="Privilege escalation path found",
+      cvss_score=8.8,
+      cvss_vector="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H",
+    )
+    self.assertEqual(f.cvss_score, 8.8)
+    self.assertEqual(f.cvss_vector, "CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:H/A:H")
 
 
 if __name__ == '__main__':
