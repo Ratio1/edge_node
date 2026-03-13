@@ -139,6 +139,23 @@ class TestGrayboxNormalization(unittest.TestCase):
     self.assertEqual(flat_findings[0]["evidence"], "GET /admin -> 403")
     self.assertEqual(flat_findings[0]["evidence_artifacts"][0]["raw_evidence_cid"], "QmEvidence")
 
+  def test_graybox_cvss_metadata_survives_normalization(self):
+    """Graybox CVSS metadata survives flat finding normalization."""
+    finding = GrayboxFinding(
+      scenario_id="PT-A01-01",
+      title="Typed CVSS",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="A01:2021",
+      cvss_score=9.1,
+      cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L",
+    )
+    report = _make_graybox_report([finding.to_dict()])
+    host = _make_mixin()
+    _, flat_findings = host._compute_risk_and_findings(report)
+    self.assertEqual(flat_findings[0]["cvss_score"], 9.1)
+    self.assertEqual(flat_findings[0]["cvss_vector"], "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:L")
+
   def test_cwe_joined(self):
     """List CWEs joined with ', '."""
     finding = GrayboxFinding(
