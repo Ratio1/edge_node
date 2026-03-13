@@ -67,6 +67,18 @@ class GrayboxFinding:
   remediation: str = ""
   error: str | None = None                          # non-None if probe had an error
 
+  @classmethod
+  def from_dict(cls, payload: dict[str, Any]) -> "GrayboxFinding":
+    """Compatibility-safe constructor for persisted finding dicts."""
+    if not isinstance(payload, dict):
+      raise TypeError("GrayboxFinding payload must be a dict")
+    data = {k: v for k, v in payload.items() if k in cls.__dataclass_fields__}
+    data["evidence_artifacts"] = [
+      GrayboxEvidenceArtifact.from_value(item)
+      for item in data.get("evidence_artifacts", []) or []
+    ]
+    return cls(**data)
+
   def to_dict(self) -> dict[str, Any]:
     """JSON-safe serialization."""
     payload = asdict(self)
@@ -99,7 +111,8 @@ class GrayboxFinding:
     import hashlib
     canon_title = self.title.lower().strip()
     cwe_joined = ", ".join(self.cwe)
-    id_input = f"{port}:{probe_name}:{cwe_joined}:{canon_title}"
+    cwe_canonical = ", ".join(sorted({item.strip() for item in self.cwe if isinstance(item, str) and item.strip()}))
+    id_input = f"{port}:{probe_name}:{cwe_canonical}:{canon_title}"
     finding_id = hashlib.sha256(id_input.encode()).hexdigest()[:16]
 
     # Map status -> confidence and effective severity
@@ -136,3 +149,8 @@ class GrayboxFinding:
       "replay_steps": list(self.replay_steps),
       "attack_ids": list(self.attack),
     }
+
+  @classmethod
+  def flat_from_dict(cls, payload: dict[str, Any], port: int, protocol: str, probe_name: str) -> dict[str, Any]:
+    """Normalize a persisted graybox finding dict into the flat report contract."""
+    return cls.from_dict(payload).to_flat_finding(port, protocol, probe_name)

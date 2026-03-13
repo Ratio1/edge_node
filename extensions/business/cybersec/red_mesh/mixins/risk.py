@@ -98,10 +98,9 @@ class _RiskScoringMixin:
           if not isinstance(finding_dict, dict):
             continue
           try:
-            gf = _GF(**{k: v for k, v in finding_dict.items() if k in _GF.__dataclass_fields__})
-          except (TypeError, KeyError):
+            flat = _GF.flat_from_dict(finding_dict, 0, "unknown", probe_name)
+          except (TypeError, KeyError, ValueError):
             continue
-          flat = gf.to_flat_finding(0, "unknown", probe_name)
           weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
           multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
           findings_score += weight * multiplier
@@ -250,10 +249,9 @@ class _RiskScoringMixin:
           if not isinstance(finding_dict, dict):
             continue
           try:
-            gf = _GF(**{k: v for k, v in finding_dict.items() if k in _GF.__dataclass_fields__})
-          except (TypeError, KeyError):
+            flat = _GF.flat_from_dict(finding_dict, port, protocol, probe_name)
+          except (TypeError, KeyError, ValueError):
             continue
-          flat = gf.to_flat_finding(port, protocol, probe_name)
 
           weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
           multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
