@@ -108,6 +108,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.cfg_scanner_identity = ""
     plugin.cfg_scanner_user_agent = ""
     plugin.cfg_nr_local_workers = 2
+    plugin.cfg_scan_target_allowlist = []
+    plugin.cfg_network_concurrency_warning_threshold = 16
+    plugin.cfg_graybox_auth_attempt_budget = 10
+    plugin.cfg_graybox_route_discovery_budget = 100
+    plugin.cfg_graybox_stateful_action_budget = 1
     plugin.cfg_llm_agent_api_enabled = False
     plugin.cfg_ics_safe_mode = False
     plugin.cfg_scan_min_rnd_delay = 0
@@ -379,6 +384,72 @@ class TestPhase1ConfigCID(unittest.TestCase):
     result = self._launch_network(plugin, authorized=False)
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("authorization", result["message"].lower())
+
+  def test_launch_network_scan_rejects_target_confirmation_mismatch(self):
+    """Target confirmation must echo the resolved target host."""
+    plugin = self._build_mock_plugin(job_id="test-job-confirm")
+    result = self._launch_network(plugin, target="example.com", target_confirmation="other.example.com", authorized=True)
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("target_confirmation", result["message"])
+
+  def test_launch_webapp_scan_enforces_target_allowlist(self):
+    """Webapp targets outside the allowlist are rejected before launch."""
+    plugin = self._build_mock_plugin(job_id="test-job-allowlist")
+    result = self._launch_webapp(
+      plugin,
+      target_url="https://example.com/app",
+      target_allowlist=["internal.example.org"],
+    )
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("allowlist", result["message"])
+
+  def test_launch_webapp_scan_persists_authorization_context(self):
+    """Authorization metadata is stored in immutable job config and audit context."""
+    plugin = self._build_mock_plugin(job_id="test-job-authctx")
+    plugin._log_audit_event = MagicMock()
+
+    self._launch_webapp(
+      plugin,
+      target_confirmation="example.com",
+      scope_id="scope-123",
+      authorization_ref="TICKET-42",
+      engagement_metadata={"ticket": "TICKET-42", "owner": "alice"},
+      target_allowlist=["example.com", "/api/"],
+      target_config={"discovery": {"scope_prefix": "/api/"}},
+    )
+
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(config_dict["target_confirmation"], "example.com")
+    self.assertEqual(config_dict["scope_id"], "scope-123")
+    self.assertEqual(config_dict["authorization_ref"], "TICKET-42")
+    self.assertEqual(config_dict["engagement_metadata"]["owner"], "alice")
+    self.assertEqual(config_dict["target_allowlist"], ["example.com", "/api/"])
+    audit_payload = plugin._log_audit_event.call_args[0][1]
+    self.assertEqual(audit_payload["scope_id"], "scope-123")
+    self.assertEqual(audit_payload["authorization_ref"], "TICKET-42")
+
+  def test_launch_webapp_scan_applies_safety_policy_caps(self):
+    """Graybox launch policy caps weak-auth and discovery budgets and records warnings."""
+    plugin = self._build_mock_plugin(job_id="test-job-policy")
+    plugin.cfg_graybox_auth_attempt_budget = 3
+    plugin.cfg_graybox_route_discovery_budget = 20
+    plugin.cfg_graybox_stateful_action_budget = 0
+
+    self._launch_webapp(
+      plugin,
+      max_weak_attempts=9,
+      allow_stateful_probes=True,
+      verify_tls=False,
+      target_config={"discovery": {"scope_prefix": "/api/", "max_pages": 50}},
+    )
+
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(config_dict["max_weak_attempts"], 3)
+    self.assertEqual(config_dict["target_config"]["discovery"]["max_pages"], 20)
+    self.assertFalse(config_dict["allow_stateful_probes"])
+    warnings = config_dict["safety_policy"]["warnings"]
+    self.assertTrue(any("capped" in warning for warning in warnings))
+    self.assertTrue(any("TLS verification is disabled" in warning for warning in warnings))
 
   def test_launch_test_rejects_invalid_scan_type(self):
     """Compatibility endpoint rejects unknown scan types with a structured error."""
@@ -1712,6 +1783,29 @@ class TestPhase3Archive(unittest.TestCase):
 
     plugin.chainstore_hset.assert_not_called()
 
+  def test_archive_verify_retries_before_prune(self):
+    """Archive verification retries transient read-after-write failures before pruning CStore."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+    plugin.cfg_archive_verify_retries = 3
+    verify_attempts = {"count": 0}
+    orig_get = plugin.r1fs.get_json.side_effect
+
+    def flaky_get(cid):
+      if cid == "QmArchiveCID":
+        verify_attempts["count"] += 1
+        if verify_attempts["count"] < 3:
+          return None
+        return {"job_id": "test-job"}
+      return orig_get(cid)
+
+    plugin.r1fs.get_json.side_effect = flaky_get
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    self.assertEqual(verify_attempts["count"], 3)
+    plugin.chainstore_hset.assert_called_once()
+
   def test_stuck_recovery(self):
     """FINALIZED without job_cid -> _build_job_archive retried via _maybe_finalize_pass."""
     Plugin = self._get_plugin_class()
@@ -2184,6 +2278,75 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     result = Plugin.get_job_archive(plugin, job_id="fin-job")
     self.assertEqual(result["error"], "fetch_failed")
+
+  def test_get_job_archive_summary_only(self):
+    """Summary mode returns bounded pass-history summaries instead of full pass payloads."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+    plugin.r1fs.get_json.return_value = {
+      "archive_version": JOB_ARCHIVE_VERSION,
+      "job_id": "fin-job",
+      "passes": [
+        {
+          "pass_nr": 1,
+          "date_started": 1.0,
+          "date_completed": 2.0,
+          "duration": 1.0,
+          "risk_score": 10,
+          "quick_summary": "pass 1",
+          "aggregated_report_cid": "QmAgg1",
+          "worker_reports": {"node-A": {}},
+          "findings": [{"finding_id": "f-1"}],
+        },
+        {
+          "pass_nr": 2,
+          "date_started": 2.0,
+          "date_completed": 3.0,
+          "duration": 1.0,
+          "risk_score": 12,
+          "quick_summary": "pass 2",
+          "aggregated_report_cid": "QmAgg2",
+          "worker_reports": {"node-A": {}, "node-B": {}},
+          "findings": [{"finding_id": "f-2"}, {"finding_id": "f-3"}],
+        },
+      ],
+      "ui_aggregate": {},
+      "job_config": {},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
+
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", summary_only=True, pass_limit=1)
+
+    self.assertEqual(result["archive"]["archive_query"]["returned_passes"], 1)
+    self.assertTrue(result["archive"]["archive_query"]["summary_only"])
+    self.assertEqual(result["archive"]["passes"][0]["findings_count"], 1)
+    self.assertNotIn("findings", result["archive"]["passes"][0])
+
+  def test_get_job_archive_paginated_passes(self):
+    """Archive queries can page pass history without dropping the rest of the archive contract."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+    plugin.r1fs.get_json.return_value = {
+      "archive_version": JOB_ARCHIVE_VERSION,
+      "job_id": "fin-job",
+      "passes": [{"pass_nr": 1}, {"pass_nr": 2}, {"pass_nr": 3}],
+      "ui_aggregate": {},
+      "job_config": {},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
+
+    result = Plugin.get_job_archive(plugin, job_id="fin-job", pass_offset=1, pass_limit=1)
+
+    self.assertEqual([p["pass_nr"] for p in result["archive"]["passes"]], [2])
+    self.assertTrue(result["archive"]["archive_query"]["truncated"])
 
   def test_update_finding_triage_persists_mutable_state(self):
     """Analyst triage updates stay outside archive storage and append audit history."""

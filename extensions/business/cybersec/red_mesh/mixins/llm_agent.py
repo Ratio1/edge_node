@@ -13,6 +13,7 @@ import requests
 from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
+from ..services.resilience import run_bounded_retry
 
 
 class _RedMeshLlmAgentMixin(object):
@@ -115,8 +116,9 @@ class _RedMeshLlmAgentMixin(object):
 
     url = self._get_llm_agent_api_url(endpoint)
     timeout = timeout or self.cfg_llm_agent_api_timeout
+    retries = max(int(getattr(self, "cfg_llm_api_retries", 1) or 1), 1)
 
-    try:
+    def _attempt():
       self.Pd(f"Calling LLM Agent API: {method} {url}")
 
       if method.upper() == "GET":
@@ -142,15 +144,31 @@ class _RedMeshLlmAgentMixin(object):
         return response_data["result"]
       return response_data
 
+    def _is_success(response_data):
+      return isinstance(response_data, dict) and "error" not in response_data
+
+    try:
+      result = run_bounded_retry(self, "llm_agent_api", retries, _attempt, is_success=_is_success)
     except requests.exceptions.ConnectionError:
       self.P(f"LLM Agent API not reachable at {url}", color='y')
       return {"error": "LLM Agent API not reachable", "status": "connection_error"}
     except requests.exceptions.Timeout:
-      self.P(f"LLM Agent API request timed out", color='y')
+      self.P("LLM Agent API request timed out", color='y')
       return {"error": "LLM Agent API request timed out", "status": "timeout"}
     except Exception as e:
       self.P(f"Error calling LLM Agent API: {e}", color='r')
       return {"error": str(e), "status": "error"}
+
+    if isinstance(result, dict) and "error" in result:
+      status = result.get("status")
+      if status == "connection_error":
+        self.P(f"LLM Agent API not reachable at {url}", color='y')
+      elif status == "timeout":
+        self.P("LLM Agent API request timed out", color='y')
+      else:
+        self.P(f"LLM Agent API call failed: {result.get('error')}", color='y')
+      return result
+    return result
 
   def _auto_analyze_report(
       self, job_id: str, report: dict, target: str, scan_type: str = "network",
