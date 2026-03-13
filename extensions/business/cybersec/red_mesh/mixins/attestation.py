@@ -9,6 +9,7 @@ import ipaddress
 from urllib.parse import urlparse
 
 from ..constants import RUN_MODE_SINGLEPASS, RUN_MODE_CONTINUOUS_MONITORING
+from ..services.resilience import run_bounded_retry
 
 
 class _AttestationMixin:
@@ -162,28 +163,37 @@ class _AttestationMixin:
       f"nodes={node_count}, score={vulnerability_score}, target={ip_obfuscated}, "
       f"cid={cid_obfuscated}, sender={node_eth_address}"
     )
-    tx_hash = self.bc.submit_attestation(
-      function_name="submitRedmeshTestAttestation",
-      function_args=[
-        test_mode,
-        node_count,
-        vulnerability_score,
-        execution_id,
-        ip_obfuscated,
-        cid_obfuscated,
-      ],
-      signature_types=["bytes32", "uint8", "uint16", "uint8", "bytes8", "bytes2", "bytes10"],
-      signature_values=[
-        self.REDMESH_ATTESTATION_DOMAIN,
-        test_mode,
-        node_count,
-        vulnerability_score,
-        execution_id,
-        ip_obfuscated,
-        cid_obfuscated,
-      ],
-      tx_private_key=tenant_private_key,
+    retries = max(int(getattr(self, "cfg_attestation_retries", 1) or 1), 1)
+    tx_hash = run_bounded_retry(
+      self,
+      "submit_redmesh_test_attestation",
+      retries,
+      lambda: self.bc.submit_attestation(
+        function_name="submitRedmeshTestAttestation",
+        function_args=[
+          test_mode,
+          node_count,
+          vulnerability_score,
+          execution_id,
+          ip_obfuscated,
+          cid_obfuscated,
+        ],
+        signature_types=["bytes32", "uint8", "uint16", "uint8", "bytes8", "bytes2", "bytes10"],
+        signature_values=[
+          self.REDMESH_ATTESTATION_DOMAIN,
+          test_mode,
+          node_count,
+          vulnerability_score,
+          execution_id,
+          ip_obfuscated,
+          cid_obfuscated,
+        ],
+        tx_private_key=tenant_private_key,
+      ),
     )
+    if not tx_hash:
+      self.P(f"[ATTESTATION] Test attestation failed after {retries} attempts.", color='y')
+      return None
 
     # Obfuscate node IPs for attestation metadata
     obfuscated_node_ips = []
@@ -238,26 +248,35 @@ class _AttestationMixin:
       f"nodes={node_count}, target={ip_obfuscated}, node_hashes={node_hashes}, "
       f"workers={worker_addrs}, sender={node_eth_address}"
     )
-    tx_hash = self.bc.submit_attestation(
-      function_name="submitRedmeshJobStartAttestation",
-      function_args=[
-        test_mode,
-        node_count,
-        execution_id,
-        node_hashes,
-        ip_obfuscated,
-      ],
-      signature_types=["bytes32", "uint8", "uint16", "bytes8", "bytes32", "bytes2"],
-      signature_values=[
-        self.REDMESH_ATTESTATION_DOMAIN,
-        test_mode,
-        node_count,
-        execution_id,
-        node_hashes,
-        ip_obfuscated,
-      ],
-      tx_private_key=tenant_private_key,
+    retries = max(int(getattr(self, "cfg_attestation_retries", 1) or 1), 1)
+    tx_hash = run_bounded_retry(
+      self,
+      "submit_redmesh_job_start_attestation",
+      retries,
+      lambda: self.bc.submit_attestation(
+        function_name="submitRedmeshJobStartAttestation",
+        function_args=[
+          test_mode,
+          node_count,
+          execution_id,
+          node_hashes,
+          ip_obfuscated,
+        ],
+        signature_types=["bytes32", "uint8", "uint16", "bytes8", "bytes32", "bytes2"],
+        signature_values=[
+          self.REDMESH_ATTESTATION_DOMAIN,
+          test_mode,
+          node_count,
+          execution_id,
+          node_hashes,
+          ip_obfuscated,
+        ],
+        tx_private_key=tenant_private_key,
+      ),
     )
+    if not tx_hash:
+      self.P(f"[ATTESTATION] Job-start attestation failed after {retries} attempts.", color='y')
+      return None
 
     result = {
       "job_id": job_id,

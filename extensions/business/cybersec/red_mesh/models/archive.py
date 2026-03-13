@@ -48,6 +48,12 @@ class JobConfig:
   created_by_name: str = ""
   created_by_id: str = ""
   authorized: bool = False
+  target_confirmation: str = ""
+  scope_id: str = ""
+  authorization_ref: str = ""
+  engagement_metadata: dict = None
+  target_allowlist: list = None
+  safety_policy: dict = None
   # ── graybox fields ──
   scan_type: str = "network"          # "network" | "webapp"
   target_url: str = ""                # required when scan_type == "webapp"
@@ -94,6 +100,12 @@ class JobConfig:
       created_by_name=d.get("created_by_name", ""),
       created_by_id=d.get("created_by_id", ""),
       authorized=d.get("authorized", False),
+      target_confirmation=d.get("target_confirmation", ""),
+      scope_id=d.get("scope_id", ""),
+      authorization_ref=d.get("authorization_ref", ""),
+      engagement_metadata=d.get("engagement_metadata"),
+      target_allowlist=d.get("target_allowlist"),
+      safety_policy=d.get("safety_policy"),
       scan_type=d.get("scan_type", "network"),
       target_url=d.get("target_url", ""),
       secret_ref=d.get("secret_ref", ""),

@@ -17,6 +17,48 @@ def _artifact_repo(owner):
   return ArtifactRepository(owner)
 
 
+def _summarize_archive_passes(passes: list[dict]) -> list[dict]:
+  summaries = []
+  for pass_data in passes or []:
+    if not isinstance(pass_data, dict):
+      continue
+    findings = pass_data.get("findings") or []
+    summaries.append({
+      "pass_nr": pass_data.get("pass_nr"),
+      "date_started": pass_data.get("date_started"),
+      "date_completed": pass_data.get("date_completed"),
+      "duration": pass_data.get("duration"),
+      "risk_score": pass_data.get("risk_score", 0),
+      "quick_summary": pass_data.get("quick_summary"),
+      "llm_failed": pass_data.get("llm_failed", False),
+      "aggregated_report_cid": pass_data.get("aggregated_report_cid", ""),
+      "worker_count": len(pass_data.get("worker_reports") or {}),
+      "findings_count": len(findings),
+    })
+  return summaries
+
+
+def _paginate_archive_passes(archive: dict, *, summary_only: bool, pass_offset: int, pass_limit: int):
+  all_passes = list(archive.get("passes", []) or [])
+  total_passes = len(all_passes)
+  pass_offset = max(int(pass_offset or 0), 0)
+  pass_limit = max(int(pass_limit or 0), 0)
+  selected = all_passes[pass_offset:]
+  if pass_limit > 0:
+    selected = selected[:pass_limit]
+  archive = dict(archive)
+  archive["passes"] = _summarize_archive_passes(selected) if summary_only else selected
+  archive["archive_query"] = {
+    "summary_only": bool(summary_only),
+    "pass_offset": pass_offset,
+    "pass_limit": pass_limit,
+    "total_passes": total_passes,
+    "returned_passes": len(selected),
+    "truncated": pass_offset > 0 or (pass_limit > 0 and pass_offset + len(selected) < total_passes),
+  }
+  return archive
+
+
 def get_job_data(owner, job_id: str):
   """
   Retrieve job data from CStore.
@@ -50,11 +92,22 @@ def get_job_data(owner, job_id: str):
   }
 
 
-def get_job_archive(owner, job_id: str):
+def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset: int = 0, pass_limit: int = 0):
   """
   Retrieve the full archived job payload from R1FS for finalized jobs.
   """
-  return get_job_archive_with_triage(owner, job_id)
+  result = get_job_archive_with_triage(owner, job_id)
+  if "archive" not in result:
+    return result
+  if summary_only or int(pass_offset or 0) > 0 or int(pass_limit or 0) > 0:
+    result = dict(result)
+    result["archive"] = _paginate_archive_passes(
+      result["archive"],
+      summary_only=summary_only,
+      pass_offset=pass_offset,
+      pass_limit=pass_limit,
+    )
+  return result
 
 
 def get_job_progress(owner, job_id: str):

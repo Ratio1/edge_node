@@ -1,3 +1,4 @@
+from copy import deepcopy
 from urllib.parse import urlparse
 
 from ..constants import (
@@ -27,6 +28,203 @@ def _job_repo(owner):
 def validation_error(message: str):
   """Return a consistent validation error payload."""
   return {"error": "validation_error", "message": message}
+
+
+def _normalize_allowlist(entries):
+  if not entries:
+    return []
+  if not isinstance(entries, (str, list, tuple, set)):
+    return []
+  if isinstance(entries, str):
+    entries = [entries]
+  normalized = []
+  for entry in entries:
+    value = str(entry).strip()
+    if value:
+      normalized.append(value.lower())
+  return normalized
+
+
+def _split_allowlist_entries(entries):
+  hosts = []
+  scopes = []
+  for entry in _normalize_allowlist(entries):
+    if entry.startswith("/"):
+      scopes.append(entry)
+      continue
+    if "://" in entry:
+      parsed = urlparse(entry)
+      if parsed.hostname:
+        hosts.append(parsed.hostname.lower())
+      if parsed.path and parsed.path != "/":
+        scopes.append(parsed.path.rstrip("/"))
+      continue
+    hosts.append(entry)
+  return hosts, scopes
+
+
+def _host_in_allowlist(hostname: str, entries) -> bool:
+  hostname = (hostname or "").strip().lower()
+  if not hostname:
+    return False
+  hosts, _ = _split_allowlist_entries(entries)
+  if not hosts:
+    return True
+  return any(hostname == entry or hostname.endswith("." + entry) for entry in hosts)
+
+
+def _scope_in_allowlist(scope_prefix: str, entries) -> bool:
+  _, scopes = _split_allowlist_entries(entries)
+  if not scopes:
+    return True
+  scope_prefix = (scope_prefix or "").strip()
+  if not scope_prefix:
+    return False
+  return any(scope_prefix.startswith(entry) for entry in scopes)
+
+
+def _extract_scope_prefix(target_config) -> str:
+  if not isinstance(target_config, dict):
+    return ""
+  discovery = target_config.get("discovery") or {}
+  if not isinstance(discovery, dict):
+    return ""
+  return str(discovery.get("scope_prefix", "") or "")
+
+
+def _extract_discovery_max_pages(target_config) -> int:
+  if not isinstance(target_config, dict):
+    return 50
+  discovery = target_config.get("discovery") or {}
+  if not isinstance(discovery, dict):
+    return 50
+  try:
+    return max(int(discovery.get("max_pages", 50) or 50), 1)
+  except (TypeError, ValueError):
+    return 50
+
+
+def _validate_authorization_context(
+  owner,
+  *,
+  target_host: str,
+  scan_type: str,
+  authorized: bool,
+  target_confirmation: str,
+  scope_id: str,
+  authorization_ref: str,
+  engagement_metadata,
+  target_allowlist,
+  target_config,
+):
+  if not authorized:
+    return None, validation_error("Scan authorization required. Confirm you are authorized to scan this target.")
+  if engagement_metadata is not None and not isinstance(engagement_metadata, dict):
+    return None, validation_error("engagement_metadata must be a JSON object when provided")
+
+  normalized_host = (target_host or "").strip().lower()
+  normalized_confirmation = (target_confirmation or "").strip().lower()
+  if normalized_confirmation and normalized_confirmation != normalized_host:
+    return None, validation_error(
+      f"target_confirmation must echo the resolved target host ({normalized_host})"
+    )
+
+  normalized_allowlist = _normalize_allowlist(
+    target_allowlist or getattr(owner, "cfg_scan_target_allowlist", [])
+  )
+  if normalized_allowlist and not _host_in_allowlist(normalized_host, normalized_allowlist):
+    return None, validation_error(
+      f"Target {normalized_host} is outside the configured allowlist."
+    )
+
+  scope_prefix = _extract_scope_prefix(target_config)
+  if scan_type == ScanType.WEBAPP.value and scope_prefix and normalized_allowlist:
+    if not _scope_in_allowlist(scope_prefix, normalized_allowlist):
+      return None, validation_error(
+        f"Configured discovery scope {scope_prefix} is outside the configured allowlist."
+      )
+
+  return {
+    "target_confirmation": normalized_confirmation or normalized_host,
+    "scope_id": str(scope_id or "").strip(),
+    "authorization_ref": str(authorization_ref or "").strip(),
+    "engagement_metadata": deepcopy(engagement_metadata) if isinstance(engagement_metadata, dict) else None,
+    "target_allowlist": normalized_allowlist or None,
+  }, None
+
+
+def _apply_launch_safety_policy(
+  owner,
+  *,
+  scan_type: str,
+  active_peers: list[str],
+  nr_local_workers: int,
+  scan_min_delay: float,
+  max_weak_attempts: int,
+  target_config,
+  allow_stateful_probes: bool,
+  verify_tls: bool,
+):
+  warnings = []
+  policy = {"scan_type": scan_type}
+  target_config_dict = deepcopy(target_config) if isinstance(target_config, dict) else target_config
+
+  if scan_type == ScanType.NETWORK.value:
+    concurrency_budget = max(len(active_peers or []), 1) * max(int(nr_local_workers or 1), 1)
+    warning_threshold = max(int(getattr(owner, "cfg_network_concurrency_warning_threshold", 16) or 16), 1)
+    policy.update({
+      "concurrency_budget": concurrency_budget,
+      "recommended_concurrency_budget": warning_threshold,
+      "scan_min_delay": scan_min_delay,
+    })
+    if concurrency_budget > warning_threshold:
+      warnings.append(
+        f"Requested network concurrency {concurrency_budget} exceeds recommended threshold {warning_threshold}."
+      )
+    policy["warnings"] = warnings
+    return max_weak_attempts, target_config_dict, allow_stateful_probes, policy
+
+  auth_budget = max(int(getattr(owner, "cfg_graybox_auth_attempt_budget", 10) or 10), 1)
+  discovery_budget = max(int(getattr(owner, "cfg_graybox_route_discovery_budget", 100) or 100), 1)
+  stateful_budget = max(int(getattr(owner, "cfg_graybox_stateful_action_budget", 1) or 0), 0)
+
+  requested_attempts = max(int(max_weak_attempts or 0), 0)
+  effective_attempts = min(requested_attempts, auth_budget)
+  if requested_attempts > effective_attempts:
+    warnings.append(
+      f"max_weak_attempts capped from {requested_attempts} to policy budget {effective_attempts}."
+    )
+
+  requested_pages = _extract_discovery_max_pages(target_config_dict)
+  effective_pages = min(requested_pages, discovery_budget)
+  if isinstance(target_config_dict, dict):
+    discovery = dict(target_config_dict.get("discovery") or {})
+    discovery["max_pages"] = effective_pages
+    target_config_dict["discovery"] = discovery
+  if requested_pages > effective_pages:
+    warnings.append(
+      f"discovery.max_pages capped from {requested_pages} to policy budget {effective_pages}."
+    )
+
+  effective_stateful = bool(allow_stateful_probes and stateful_budget > 0)
+  if allow_stateful_probes and not effective_stateful:
+    warnings.append("Stateful graybox probes were disabled by policy budget.")
+  elif effective_stateful:
+    warnings.append("Stateful graybox probes are enabled. Use only for explicitly approved workflows.")
+
+  if not verify_tls:
+    warnings.append("TLS verification is disabled for an authenticated scan.")
+
+  policy.update({
+    "auth_attempt_budget": auth_budget,
+    "effective_auth_attempt_budget": effective_attempts,
+    "route_discovery_budget": discovery_budget,
+    "effective_route_discovery_budget": effective_pages,
+    "stateful_action_budget": stateful_budget,
+    "effective_stateful_action_budget": 1 if effective_stateful else 0,
+    "warnings": warnings,
+  })
+  return effective_attempts, target_config_dict, effective_stateful, policy
 
 
 def parse_exceptions(owner, exceptions):
@@ -203,6 +401,12 @@ def announce_launch(
   verify_tls,
   target_config,
   allow_stateful_probes,
+  target_confirmation,
+  scope_id,
+  authorization_ref,
+  engagement_metadata,
+  target_allowlist,
+  safety_policy,
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
   excluded_features, enabled_features = resolve_enabled_features(
@@ -244,6 +448,12 @@ def announce_launch(
     created_by_name=created_by_name or "",
     created_by_id=created_by_id or "",
     authorized=True,
+    target_confirmation=target_confirmation,
+    scope_id=scope_id,
+    authorization_ref=authorization_ref,
+    engagement_metadata=engagement_metadata,
+    target_allowlist=target_allowlist,
+    safety_policy=safety_policy,
     scan_type=scan_type,
     target_url=target_url,
     official_username=official_username,
@@ -335,6 +545,10 @@ def announce_launch(
     "enabled_features_count": len(enabled_features),
     "redact_credentials": redact_credentials,
     "ics_safe_mode": ics_safe_mode,
+    "scope_id": scope_id,
+    "authorization_ref": authorization_ref,
+    "has_target_allowlist": bool(target_allowlist),
+    "safety_warning_count": len((safety_policy or {}).get("warnings", [])),
   })
 
   all_network_jobs = _job_repo(owner).list_jobs()
@@ -378,10 +592,13 @@ def launch_network_scan(
   created_by_name="",
   created_by_id="",
   nr_local_workers=0,
+  target_confirmation="",
+  scope_id="",
+  authorization_ref="",
+  engagement_metadata=None,
+  target_allowlist=None,
 ):
   """Launch a network scan using network-specific validation and worker slicing."""
-  if not authorized:
-    return validation_error("Scan authorization required. Confirm you are authorized to scan this target.")
   if not target:
     return validation_error("target required for network scan")
 
@@ -403,6 +620,33 @@ def launch_network_scan(
   active_peers, peer_error = resolve_active_peers(owner, selected_peers)
   if peer_error:
     return peer_error
+
+  authorization_context, auth_error = _validate_authorization_context(
+    owner,
+    target_host=target,
+    scan_type=ScanType.NETWORK.value,
+    authorized=authorized,
+    target_confirmation=target_confirmation,
+    scope_id=scope_id,
+    authorization_ref=authorization_ref,
+    engagement_metadata=engagement_metadata,
+    target_allowlist=target_allowlist,
+    target_config=None,
+  )
+  if auth_error:
+    return auth_error
+
+  max_weak_attempts, target_config, allow_stateful_probes, safety_policy = _apply_launch_safety_policy(
+    owner,
+    scan_type=ScanType.NETWORK.value,
+    active_peers=active_peers,
+    nr_local_workers=options["nr_local_workers"],
+    scan_min_delay=options["scan_min_delay"],
+    max_weak_attempts=5,
+    target_config=None,
+    allow_stateful_probes=False,
+    verify_tls=True,
+  )
 
   workers, worker_error = build_network_workers(
     owner,
@@ -450,6 +694,12 @@ def launch_network_scan(
     verify_tls=True,
     target_config=None,
     allow_stateful_probes=False,
+    target_confirmation=authorization_context["target_confirmation"],
+    scope_id=authorization_context["scope_id"],
+    authorization_ref=authorization_context["authorization_ref"],
+    engagement_metadata=authorization_context["engagement_metadata"],
+    target_allowlist=authorization_context["target_allowlist"],
+    safety_policy=safety_policy,
   )
 
 
@@ -482,10 +732,13 @@ def launch_webapp_scan(
   verify_tls=True,
   target_config=None,
   allow_stateful_probes=False,
+  target_confirmation="",
+  scope_id="",
+  authorization_ref="",
+  engagement_metadata=None,
+  target_allowlist=None,
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment."""
-  if not authorized:
-    return validation_error("Scan authorization required. Confirm you are authorized to scan this target.")
   if not target_url:
     return validation_error("target_url required for webapp scan")
   if not official_username or not official_password:
@@ -497,6 +750,21 @@ def launch_webapp_scan(
 
   target = parsed.hostname
   target_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+
+  authorization_context, auth_error = _validate_authorization_context(
+    owner,
+    target_host=target,
+    scan_type=ScanType.WEBAPP.value,
+    authorized=authorized,
+    target_confirmation=target_confirmation,
+    scope_id=scope_id,
+    authorization_ref=authorization_ref,
+    engagement_metadata=engagement_metadata,
+    target_allowlist=target_allowlist,
+    target_config=target_config,
+  )
+  if auth_error:
+    return auth_error
 
   options = normalize_common_launch_options(
     owner,
@@ -511,6 +779,18 @@ def launch_webapp_scan(
   active_peers, peer_error = resolve_active_peers(owner, selected_peers)
   if peer_error:
     return peer_error
+
+  max_weak_attempts, target_config, allow_stateful_probes, safety_policy = _apply_launch_safety_policy(
+    owner,
+    scan_type=ScanType.WEBAPP.value,
+    active_peers=active_peers,
+    nr_local_workers=1,
+    scan_min_delay=options["scan_min_delay"],
+    max_weak_attempts=max_weak_attempts,
+    target_config=target_config,
+    allow_stateful_probes=allow_stateful_probes,
+    verify_tls=verify_tls,
+  )
 
   workers, worker_error = build_webapp_workers(owner, active_peers, target_port)
   if worker_error:
@@ -552,6 +832,12 @@ def launch_webapp_scan(
     verify_tls=verify_tls,
     target_config=target_config,
     allow_stateful_probes=allow_stateful_probes,
+    target_confirmation=authorization_context["target_confirmation"],
+    scope_id=authorization_context["scope_id"],
+    authorization_ref=authorization_context["authorization_ref"],
+    engagement_metadata=authorization_context["engagement_metadata"],
+    target_allowlist=authorization_context["target_allowlist"],
+    safety_policy=safety_policy,
   )
 
 
@@ -592,6 +878,11 @@ def launch_test(
   verify_tls=True,
   target_config=None,
   allow_stateful_probes=False,
+  target_confirmation="",
+  scope_id="",
+  authorization_ref="",
+  engagement_metadata=None,
+  target_allowlist=None,
 ):
   """Compatibility shim that routes to scan-type-specific launch endpoints."""
   try:
@@ -627,6 +918,11 @@ def launch_test(
       verify_tls=verify_tls,
       target_config=target_config,
       allow_stateful_probes=allow_stateful_probes,
+      target_confirmation=target_confirmation,
+      scope_id=scope_id,
+      authorization_ref=authorization_ref,
+      engagement_metadata=engagement_metadata,
+      target_allowlist=target_allowlist,
     )
 
   return owner.launch_network_scan(
@@ -652,4 +948,9 @@ def launch_test(
     created_by_name=created_by_name,
     created_by_id=created_by_id,
     nr_local_workers=nr_local_workers,
+    target_confirmation=target_confirmation,
+    scope_id=scope_id,
+    authorization_ref=authorization_ref,
+    engagement_metadata=engagement_metadata,
+    target_allowlist=target_allowlist,
   )
