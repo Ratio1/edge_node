@@ -64,10 +64,8 @@ def maybe_finalize_pass(owner):
     next_pass_at = job_specs.get("next_pass_at")
     job_pass = job_specs.get("job_pass", 1)
     job_id = job_specs.get("job_id")
-    pass_reports = job_specs.setdefault("pass_reports", [])
-
     if is_terminal_job_status(job_status):
-      if not job_specs.get("job_cid") and pass_reports:
+      if not job_specs.get("job_cid") and job_specs.get("pass_reports"):
         owner.P(f"[STUCK RECOVERY] {job_id} is {job_status} but has no job_cid — retrying archive build", color='y')
         owner._build_job_archive(job_id, job_specs)
       continue
@@ -214,7 +212,9 @@ def maybe_finalize_pass(owner):
         owner.P(f"Failed to store pass report for pass {job_pass} in R1FS", color='r')
         continue
 
-      pass_reports.append(PassReportRef(job_pass, pass_report_cid, risk_score).to_dict())
+      job_specs.setdefault("pass_reports", []).append(
+        PassReportRef(job_pass, pass_report_cid, risk_score).to_dict()
+      )
 
       set_job_status(job_specs, JOB_STATUS_FINALIZING)
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_finalizing")

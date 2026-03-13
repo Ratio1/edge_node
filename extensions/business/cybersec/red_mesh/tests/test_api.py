@@ -1147,6 +1147,36 @@ class TestPhase2PassFinalization(unittest.TestCase):
       color='y'
     )
 
+  def test_pass_reports_survive_typed_job_record_rewrites(self):
+    """Pass reports must stay attached after typed repository rewrites the job dict."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    job_specs["scan_type"] = "network"
+    job_specs["target_url"] = ""
+    plugin.chainstore_hget.return_value = job_specs
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {"80": "http"},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com", "scan_type": "network"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin._build_job_archive = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertEqual(job_specs["pass_reports"][0]["pass_nr"], 1)
+    archived_job_specs = plugin._build_job_archive.call_args[0][1]
+    self.assertEqual(len(archived_job_specs["pass_reports"]), 1)
+
   def test_aggregated_report_write_failure(self):
     """R1FS fails for aggregated → pass finalization skipped, no partial state."""
     PentesterApi01Plugin = self._get_plugin_class()
