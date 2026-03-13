@@ -203,8 +203,10 @@ class _LiveProgressMixin:
       # Determine phase order based on scan type (inspect first worker)
       first_worker = next(iter(local_workers.values()))
       if first_worker.state.get("scan_type") == "webapp":
+        scan_type = "webapp"
         phase_order = GRAYBOX_PHASE_ORDER
       else:
+        scan_type = "network"
         phase_order = PHASE_ORDER
       nr_phases = len(phase_order)
 
@@ -242,6 +244,7 @@ class _LiveProgressMixin:
       phase_indices = [phase_order.index(p) if p in phase_order else nr_phases for p in thread_phases]
       min_phase_idx = min(phase_indices) if phase_indices else 0
       phase = phase_order[min_phase_idx] if min_phase_idx < nr_phases else "done"
+      phase_index = nr_phases if phase == "done" else (min_phase_idx + 1 if phase in phase_order else 0)
 
       # Stage-based progress: completed_stages / total * 100
       # During port_scan, add sub-progress based on ports scanned
@@ -265,6 +268,9 @@ class _LiveProgressMixin:
         pass_nr=pass_nr,
         progress=progress_pct,
         phase=phase,
+        scan_type=scan_type,
+        phase_index=phase_index,
+        total_phases=nr_phases,
         ports_scanned=total_scanned,
         ports_total=total_ports,
         open_ports_found=sorted(all_open),
