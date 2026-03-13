@@ -160,7 +160,7 @@ class MetricsCollector:
     probes_attempted = len(self._probe_results)
     probes_completed = sum(1 for v in self._probe_results.values() if v == "completed")
     probes_skipped = sum(1 for v in self._probe_results.values() if v.startswith("skipped"))
-    probes_failed = sum(1 for v in self._probe_results.values() if v == "failed")
+    probes_failed = sum(1 for v in self._probe_results.values() if v == "failed" or v.startswith("failed:"))
 
     banner_total = self._banner_confirmed + self._banner_guessed
     return ScanMetrics(

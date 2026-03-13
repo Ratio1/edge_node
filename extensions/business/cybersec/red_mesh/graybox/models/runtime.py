@@ -76,3 +76,16 @@ class GrayboxProbeContext:
       "regular_username": self.regular_username,
       "allow_stateful": self.allow_stateful,
     }
+
+
+@dataclass(frozen=True)
+class GrayboxAuthState:
+  created_at: float = 0.0
+  refresh_count: int = 0
+  official_authenticated: bool = False
+  regular_authenticated: bool = False
+  auth_errors: tuple[str, ...] = ()
+
+  @property
+  def has_authenticated_session(self) -> bool:
+    return self.official_authenticated
