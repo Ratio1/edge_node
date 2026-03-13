@@ -109,6 +109,7 @@ class GrayboxProbeDefinition:
 @dataclass(frozen=True)
 class GrayboxProbeRunResult:
   findings: list[object] = field(default_factory=list)
+  artifacts: list[object] = field(default_factory=list)
   outcome: str = "completed"
 
   @classmethod

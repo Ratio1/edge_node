@@ -3,7 +3,7 @@
 import json
 import unittest
 
-from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxEvidenceArtifact, GrayboxFinding
 
 
 class TestGrayboxFinding(unittest.TestCase):
@@ -124,6 +124,32 @@ class TestGrayboxFinding(unittest.TestCase):
     self.assertIsNone(f.error)
     f2 = self._make_finding(error="Connection refused")
     self.assertEqual(f2.error, "Connection refused")
+
+  def test_evidence_artifacts_roundtrip(self):
+    """Typed evidence artifacts serialize as JSON-safe dicts."""
+    artifact = GrayboxEvidenceArtifact(
+      summary="GET /api/records/2 -> 200",
+      request_snapshot="GET /api/records/2",
+      response_snapshot='{"owner":"bob"}',
+      captured_at="2026-03-13T02:30:00Z",
+      raw_evidence_cid="QmEvidenceCID",
+    )
+    f = self._make_finding(evidence_artifacts=[artifact])
+
+    payload = f.to_dict()
+
+    self.assertEqual(payload["evidence_artifacts"][0]["summary"], "GET /api/records/2 -> 200")
+    self.assertEqual(payload["evidence_artifacts"][0]["raw_evidence_cid"], "QmEvidenceCID")
+
+  def test_flat_finding_uses_artifact_summary_when_evidence_strings_absent(self):
+    """Artifact summaries backfill the legacy flat evidence field."""
+    artifact = GrayboxEvidenceArtifact(summary="GET /admin -> 403")
+    f = self._make_finding(evidence=[], evidence_artifacts=[artifact])
+
+    flat = f.to_flat_finding(port=443, protocol="https", probe_name="access_control")
+
+    self.assertEqual(flat["evidence"], "GET /admin -> 403")
+    self.assertEqual(flat["evidence_artifacts"][0]["summary"], "GET /admin -> 403")
 
   def test_frozen(self):
     """Finding is immutable."""

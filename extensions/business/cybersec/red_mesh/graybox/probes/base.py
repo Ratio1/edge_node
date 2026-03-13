@@ -64,9 +64,13 @@ class ProbeBase:
     except Exception as exc:
       self._record_error(probe_name, self.safety.sanitize_error(str(exc)))
 
-  def build_result(self, outcome: str = "completed") -> GrayboxProbeRunResult:
+  def build_result(self, outcome: str = "completed", artifacts=None) -> GrayboxProbeRunResult:
     """Return a typed probe result without changing legacy run() contracts."""
-    return GrayboxProbeRunResult(findings=list(self.findings), outcome=outcome)
+    return GrayboxProbeRunResult(
+      findings=list(self.findings),
+      artifacts=list(artifacts or []),
+      outcome=outcome,
+    )
 
   def _record_error(self, probe_name, error_msg):
     """Store a non-fatal error as an INFO GrayboxFinding."""
