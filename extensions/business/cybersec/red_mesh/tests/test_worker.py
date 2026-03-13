@@ -234,6 +234,15 @@ class TestExecution(unittest.TestCase):
     self.assertIsInstance(result, DiscoveryResult)
     self.assertEqual(result.routes, ["/a"])
 
+  def test_discovery_phase_fails_closed_when_refresh_fails(self):
+    worker = _make_worker()
+    worker.auth.ensure_sessions = MagicMock(return_value=False)
+
+    result = worker._run_discovery_phase()
+
+    self.assertEqual(result, DiscoveryResult())
+    self.assertIn("_graybox_fatal", worker.state["graybox_results"]["8000"])
+
   def test_build_probe_context_returns_typed_context(self):
     worker = _make_worker(regular_username="alice")
     context = worker._build_probe_kwargs(DiscoveryResult(routes=["/r"], forms=["/f"]))
@@ -259,6 +268,25 @@ class TestExecution(unittest.TestCase):
     self.assertEqual(stats["total"], 2)
     self.assertEqual(stats["vulnerable"], 1)
     self.assertEqual(stats["not_vulnerable"], 1)
+
+  def test_registered_probe_records_auth_refresh_failure(self):
+    worker = _make_worker()
+    worker.auth.official_session = MagicMock()
+    worker.auth.regular_session = MagicMock()
+    worker.auth.ensure_sessions = MagicMock(return_value=False)
+    worker.auth._auth_errors = []
+    probe_context = worker._build_probe_kwargs(DiscoveryResult())
+    mock_cls = MagicMock()
+    mock_cls.requires_regular_session = False
+    mock_cls.requires_auth = True
+    mock_cls.is_stateful = False
+
+    with patch.object(worker, "_import_probe", return_value=mock_cls):
+      worker._run_registered_probe({"key": "_graybox_test", "cls": "fake.Probe"}, probe_context)
+
+    self.assertEqual(worker.metrics.build().probes_failed, 1)
+    self.assertIn("_graybox_fatal", worker.state["graybox_results"]["8000"])
+    self.assertEqual(worker.metrics.build().probe_breakdown["_graybox_test"], "failed:auth_refresh")
 
   def test_auth_failure_aborts(self):
     """Official login fails → fatal finding, done=True."""

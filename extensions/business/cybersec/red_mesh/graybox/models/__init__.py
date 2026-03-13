@@ -1,4 +1,10 @@
-from .runtime import DiscoveryResult, GrayboxCredential, GrayboxCredentialSet, GrayboxProbeContext
+from .runtime import (
+  DiscoveryResult,
+  GrayboxAuthState,
+  GrayboxCredential,
+  GrayboxCredentialSet,
+  GrayboxProbeContext,
+)
 from .target_config import (
   AccessControlConfig,
   AdminEndpoint,
@@ -21,6 +27,7 @@ __all__ = [
   "COMMON_CSRF_FIELDS",
   "DiscoveryConfig",
   "DiscoveryResult",
+  "GrayboxAuthState",
   "GrayboxCredential",
   "GrayboxCredentialSet",
   "GrayboxProbeContext",

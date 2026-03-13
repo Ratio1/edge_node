@@ -220,16 +220,77 @@ class TestAuthManagerLifecycle(unittest.TestCase):
     auth._created_at = time.time()
     self.assertFalse(auth.is_expired)
 
+  def test_auth_state_reflects_session_status(self):
+    """auth_state exposes a typed snapshot of current session state."""
+    auth = _make_auth()
+    auth.official_session = MagicMock()
+    auth.regular_session = None
+    auth._auth_errors = ["official_login_failed"]
+    auth._refresh_count = 2
+
+    state = auth.auth_state
+
+    self.assertTrue(state.official_authenticated)
+    self.assertFalse(state.regular_authenticated)
+    self.assertEqual(state.refresh_count, 2)
+    self.assertEqual(state.auth_errors, ("official_login_failed",))
+
   def test_cleanup_closes_sessions(self):
     """cleanup() closes all sessions."""
     auth = _make_auth()
     auth.official_session = MagicMock()
     auth.regular_session = MagicMock()
     auth.anon_session = MagicMock()
+    auth._created_at = time.time()
     auth.cleanup()
     auth.official_session is None  # already set to None
     auth.regular_session is None
     auth.anon_session is None
+    self.assertEqual(auth._created_at, 0.0)
+
+  def test_ensure_sessions_failed_refresh_clears_stale_sessions(self):
+    """Failed refresh tears down stale sessions instead of leaving mixed state."""
+    auth = _make_auth()
+    auth.official_session = MagicMock()
+    auth.regular_session = MagicMock()
+    auth._created_at = time.time() - GRAYBOX_SESSION_MAX_AGE - 1
+
+    with patch.object(auth, "authenticate", return_value=False) as mock_auth:
+      result = auth.ensure_sessions({"username": "admin", "password": "secret"})
+
+    self.assertFalse(result)
+    self.assertIsNone(auth.official_session)
+    self.assertIsNone(auth.regular_session)
+    self.assertEqual(auth.auth_state.refresh_count, 1)
+    mock_auth.assert_called_once()
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.time.sleep")
+  def test_authenticate_retries_transient_transport_error(self, mock_sleep, mock_requests):
+    """Transient transport failures retry once before giving up."""
+    import requests as real_requests
+
+    auth = _make_auth()
+    first_session = MagicMock()
+    second_session = MagicMock()
+    first_session.get.side_effect = real_requests.ConnectionError("temporary failure")
+    second_session.get.return_value = _mock_response(
+      text='<input type="hidden" name="csrf_token" value="tok">'
+    )
+    second_session.post.return_value = _mock_response(
+      url="http://testapp.local:8000/dashboard/",
+      history=[MagicMock()],
+    )
+    second_session.cookies.get_dict.return_value = {"sessionid": "abc"}
+    mock_requests.Session.side_effect = [MagicMock(), first_session, second_session]
+    mock_requests.RequestException = real_requests.RequestException
+
+    result = auth.authenticate({"username": "admin", "password": "secret"})
+
+    self.assertTrue(result)
+    self.assertIs(auth.official_session, second_session)
+    mock_sleep.assert_called_once()
+    self.assertEqual(auth._auth_errors, [])
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
   def test_preflight_unreachable(self, mock_requests):

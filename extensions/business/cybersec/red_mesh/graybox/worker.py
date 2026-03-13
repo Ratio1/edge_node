@@ -225,7 +225,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
   def _run_discovery_phase(self) -> DiscoveryResult:
     self._set_phase("discovery")
     self.metrics.phase_start("discovery")
-    self.auth.ensure_sessions(self._credentials.official, self._credentials.regular)
+    if not self._ensure_active_sessions("discovery"):
+      self.metrics.phase_end("discovery")
+      return DiscoveryResult()
     result = None
     discover_result = getattr(self.discovery, "discover_result", None)
     if callable(discover_result):
@@ -257,7 +259,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
   def _run_probe_phase(self, discovery_result: DiscoveryResult):
     self._set_phase("graybox_probes")
     self.metrics.phase_start("graybox_probes")
-    self.auth.ensure_sessions(self._credentials.official, self._credentials.regular)
+    if not self._ensure_active_sessions("graybox_probes"):
+      self.metrics.phase_end("graybox_probes")
+      return
 
     probe_context = self._build_probe_kwargs(discovery_result)
     excluded_features = set(self.job_config.excluded_features or [])
@@ -289,7 +293,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
     ):
       self._set_phase("weak_auth")
       self.metrics.phase_start("weak_auth")
-      self.auth.ensure_sessions(self._credentials.official, self._credentials.regular)
+      if not self._ensure_active_sessions("weak_auth"):
+        self.metrics.phase_end("weak_auth")
+        return
       probe_context = self._build_probe_kwargs(discovery_result)
       bl_probe = BusinessLogicProbes(
         **dict(probe_context.to_kwargs(), allow_stateful=False),
@@ -330,7 +336,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self.metrics.record_probe(store_key, "skipped:missing_auth")
       return
 
-    self.auth.ensure_sessions(self._credentials.official, self._credentials.regular)
+    require_regular = bool(probe_cls.requires_regular_session)
+    if not self._ensure_active_sessions(store_key, require_regular=require_regular):
+      self.metrics.record_probe(store_key, "failed:auth_refresh")
+      return
 
     try:
       from_context = getattr(probe_cls, "from_context", None)
@@ -345,6 +354,22 @@ class GrayboxLocalWorker(BaseLocalWorker):
     except Exception as exc:
       self._record_probe_error(store_key, exc)
       self.metrics.record_probe(store_key, "failed")
+
+  def _ensure_active_sessions(self, scope, require_regular=False):
+    """Fail closed if session refresh cannot restore required auth state."""
+    auth_ok = self.auth.ensure_sessions(
+      self._credentials.official,
+      self._credentials.regular if require_regular or self._credentials.regular else None,
+    )
+    if auth_ok:
+      return True
+
+    sanitized_scope = scope.replace("_", " ")
+    self._record_fatal(
+      f"Authentication session refresh failed during {sanitized_scope}. "
+      "Graybox scan cannot continue safely."
+    )
+    return False
 
   def _store_findings(self, key, findings):
     """Store GrayboxFinding dicts in graybox_results under the port key."""
