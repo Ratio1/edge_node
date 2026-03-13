@@ -14,7 +14,7 @@ from .findings import GrayboxFinding
 from .auth import AuthManager
 from .discovery import DiscoveryModule
 from .safety import SafetyControls
-from .models import DiscoveryResult, GrayboxCredentialSet, GrayboxTargetConfig
+from .models import DiscoveryResult, GrayboxCredentialSet, GrayboxProbeContext, GrayboxTargetConfig
 
 # Weak auth uses a direct import (not the registry) because it is a
 # distinct pipeline phase, not a generic probe.
@@ -243,7 +243,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     return result
 
   def _build_probe_kwargs(self, discovery_result: DiscoveryResult) -> dict:
-    return dict(
+    return GrayboxProbeContext(
       target_url=self.target_url,
       auth_manager=self.auth,
       target_config=self.target_config,
@@ -259,7 +259,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.metrics.phase_start("graybox_probes")
     self.auth.ensure_sessions(self._credentials.official, self._credentials.regular)
 
-    probe_kwargs = self._build_probe_kwargs(discovery_result)
+    probe_context = self._build_probe_kwargs(discovery_result)
     excluded_features = set(self.job_config.excluded_features or [])
     graybox_excluded = "graybox" in excluded_features
 
@@ -274,33 +274,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
           self.metrics.record_probe(store_key, "skipped:disabled")
           continue
 
-        probe_cls = self._import_probe(entry["cls"])
-
-        if probe_cls.is_stateful and not self.job_config.allow_stateful_probes:
-          self.metrics.record_probe(store_key, "skipped:stateful_disabled")
-          self._store_findings(store_key, [GrayboxFinding(
-            scenario_id=f"SKIP-{store_key}",
-            title="Probe skipped: stateful probes disabled",
-            status="inconclusive", severity="INFO", owasp="",
-            evidence=["stateful_probes_disabled=True"],
-          )])
-          continue
-        if probe_cls.requires_regular_session and not self.auth.regular_session:
-          self.metrics.record_probe(store_key, "skipped:missing_regular_session")
-          continue
-        if probe_cls.requires_auth and not self.auth.official_session:
-          self.metrics.record_probe(store_key, "skipped:missing_auth")
-          continue
-
-        self.auth.ensure_sessions(self._credentials.official, self._credentials.regular)
-
-        try:
-          findings = probe_cls(**probe_kwargs).run()
-          self._store_findings(store_key, findings)
-          self.metrics.record_probe(store_key, "completed")
-        except Exception as exc:
-          self._record_probe_error(store_key, exc)
-          self.metrics.record_probe(store_key, "failed")
+        self._run_registered_probe(entry, probe_context)
     else:
       for entry in GRAYBOX_PROBE_REGISTRY:
         self.metrics.record_probe(entry["key"], "skipped:disabled")
@@ -316,8 +290,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self._set_phase("weak_auth")
       self.metrics.phase_start("weak_auth")
       self.auth.ensure_sessions(self._credentials.official, self._credentials.regular)
+      probe_context = self._build_probe_kwargs(discovery_result)
       bl_probe = BusinessLogicProbes(
-        **dict(self._build_probe_kwargs(discovery_result), allow_stateful=False),
+        **dict(probe_context.to_kwargs(), allow_stateful=False),
       )
       try:
         weak_findings = bl_probe.run_weak_auth(
@@ -333,6 +308,43 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self.metrics.phase_end("weak_auth")
     elif self._credentials.weak_candidates and "_graybox_weak_auth" in (self.job_config.excluded_features or []):
       self.metrics.record_probe("_graybox_weak_auth", "skipped:disabled")
+
+  def _run_registered_probe(self, entry: dict, probe_context: GrayboxProbeContext):
+    """Run one registered probe through a shared capability and error boundary."""
+    store_key = entry["key"]
+    probe_cls = self._import_probe(entry["cls"])
+
+    if probe_cls.is_stateful and not probe_context.allow_stateful:
+      self.metrics.record_probe(store_key, "skipped:stateful_disabled")
+      self._store_findings(store_key, [GrayboxFinding(
+        scenario_id=f"SKIP-{store_key}",
+        title="Probe skipped: stateful probes disabled",
+        status="inconclusive", severity="INFO", owasp="",
+        evidence=["stateful_probes_disabled=True"],
+      )])
+      return
+    if probe_cls.requires_regular_session and not self.auth.regular_session:
+      self.metrics.record_probe(store_key, "skipped:missing_regular_session")
+      return
+    if probe_cls.requires_auth and not self.auth.official_session:
+      self.metrics.record_probe(store_key, "skipped:missing_auth")
+      return
+
+    self.auth.ensure_sessions(self._credentials.official, self._credentials.regular)
+
+    try:
+      from_context = getattr(probe_cls, "from_context", None)
+      has_explicit_from_context = "from_context" in getattr(probe_cls, "__dict__", {})
+      if has_explicit_from_context and callable(from_context):
+        probe = from_context(probe_context)
+      else:
+        probe = probe_cls(**probe_context.to_kwargs())
+      findings = probe.run()
+      self._store_findings(store_key, findings)
+      self.metrics.record_probe(store_key, "completed")
+    except Exception as exc:
+      self._record_probe_error(store_key, exc)
+      self.metrics.record_probe(store_key, "failed")
 
   def _store_findings(self, key, findings):
     """Store GrayboxFinding dicts in graybox_results under the port key."""

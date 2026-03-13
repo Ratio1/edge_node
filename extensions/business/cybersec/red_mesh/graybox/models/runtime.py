@@ -52,3 +52,27 @@ class DiscoveryResult:
 
   def to_tuple(self) -> tuple[list[str], list[str]]:
     return self.routes, self.forms
+
+
+@dataclass(frozen=True)
+class GrayboxProbeContext:
+  target_url: str
+  auth_manager: object
+  target_config: object
+  safety: object
+  discovered_routes: list[str] = field(default_factory=list)
+  discovered_forms: list[str] = field(default_factory=list)
+  regular_username: str = ""
+  allow_stateful: bool = False
+
+  def to_kwargs(self) -> dict:
+    return {
+      "target_url": self.target_url,
+      "auth_manager": self.auth_manager,
+      "target_config": self.target_config,
+      "safety": self.safety,
+      "discovered_routes": list(self.discovered_routes),
+      "discovered_forms": list(self.discovered_forms),
+      "regular_username": self.regular_username,
+      "allow_stateful": self.allow_stateful,
+    }
