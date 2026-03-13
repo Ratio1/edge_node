@@ -2824,7 +2824,8 @@ class _DeeployMixin:
 
   def _get_apps_by_escrow_active_jobs(self, sender_escrow, owner, project_id=None):
     """
-    Build get_apps payload using active SC job IDs as source of truth, with optional online snapshots.
+    Build get_apps payload using active SC job IDs as source of truth,
+    with snapshots from online nodes, if any.
 
     Response shape:
       {
@@ -2881,7 +2882,7 @@ class _DeeployMixin:
         )
         continue
 
-      if pipeline.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.PROJECT_ID) != project_id:
+      if project_id is not None and pipeline.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.PROJECT_ID) != project_id:
         self.Pd(f"Skipping R1FS payload for job {job_id}: project_id mismatch.", color='y')
         continue
 
