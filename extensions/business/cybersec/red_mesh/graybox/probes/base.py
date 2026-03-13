@@ -9,6 +9,7 @@ sessions or credentials themselves.
 import requests
 
 from ..findings import GrayboxFinding
+from ..models import GrayboxProbeContext
 
 
 class ProbeBase:
@@ -40,6 +41,11 @@ class ProbeBase:
     self.regular_username = regular_username
     self._allow_stateful = allow_stateful
     self.findings: list[GrayboxFinding] = []
+
+  @classmethod
+  def from_context(cls, context: GrayboxProbeContext):
+    """Build a probe from a typed worker-provided context."""
+    return cls(**context.to_kwargs())
 
   def run_safe(self, probe_name, probe_fn):
     """

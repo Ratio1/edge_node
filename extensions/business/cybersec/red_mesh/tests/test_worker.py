@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
 from extensions.business.cybersec.red_mesh.worker.base import BaseLocalWorker
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
-from extensions.business.cybersec.red_mesh.graybox.models import DiscoveryResult, GrayboxCredentialSet
+from extensions.business.cybersec.red_mesh.graybox.models import DiscoveryResult, GrayboxCredentialSet, GrayboxProbeContext
 from extensions.business.cybersec.red_mesh.constants import (
   ScanType, GRAYBOX_PROBE_REGISTRY,
 )
@@ -233,6 +233,14 @@ class TestExecution(unittest.TestCase):
 
     self.assertIsInstance(result, DiscoveryResult)
     self.assertEqual(result.routes, ["/a"])
+
+  def test_build_probe_context_returns_typed_context(self):
+    worker = _make_worker(regular_username="alice")
+    context = worker._build_probe_kwargs(DiscoveryResult(routes=["/r"], forms=["/f"]))
+    self.assertIsInstance(context, GrayboxProbeContext)
+    self.assertEqual(context.discovered_routes, ["/r"])
+    self.assertEqual(context.discovered_forms, ["/f"])
+    self.assertEqual(context.regular_username, "alice")
 
   def test_scenario_stats(self):
     """Scenario stats count findings by status."""

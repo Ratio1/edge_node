@@ -1,4 +1,4 @@
-from .runtime import DiscoveryResult, GrayboxCredential, GrayboxCredentialSet
+from .runtime import DiscoveryResult, GrayboxCredential, GrayboxCredentialSet, GrayboxProbeContext
 from .target_config import (
   AccessControlConfig,
   AdminEndpoint,
@@ -23,6 +23,7 @@ __all__ = [
   "DiscoveryResult",
   "GrayboxCredential",
   "GrayboxCredentialSet",
+  "GrayboxProbeContext",
   "GrayboxTargetConfig",
   "IdorEndpoint",
   "InjectionConfig",
