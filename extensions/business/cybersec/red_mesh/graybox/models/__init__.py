@@ -3,7 +3,9 @@ from .runtime import (
   GrayboxAuthState,
   GrayboxCredential,
   GrayboxCredentialSet,
+  GrayboxProbeDefinition,
   GrayboxProbeContext,
+  GrayboxProbeRunResult,
 )
 from .target_config import (
   AccessControlConfig,
@@ -30,7 +32,9 @@ __all__ = [
   "GrayboxAuthState",
   "GrayboxCredential",
   "GrayboxCredentialSet",
+  "GrayboxProbeDefinition",
   "GrayboxProbeContext",
+  "GrayboxProbeRunResult",
   "GrayboxTargetConfig",
   "IdorEndpoint",
   "InjectionConfig",

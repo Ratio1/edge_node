@@ -9,7 +9,7 @@ sessions or credentials themselves.
 import requests
 
 from ..findings import GrayboxFinding
-from ..models import GrayboxProbeContext
+from ..models import GrayboxProbeContext, GrayboxProbeRunResult
 
 
 class ProbeBase:
@@ -63,6 +63,10 @@ class ProbeBase:
       self._record_error(probe_name, "request_timeout")
     except Exception as exc:
       self._record_error(probe_name, self.safety.sanitize_error(str(exc)))
+
+  def build_result(self, outcome: str = "completed") -> GrayboxProbeRunResult:
+    """Return a typed probe result without changing legacy run() contracts."""
+    return GrayboxProbeRunResult(findings=list(self.findings), outcome=outcome)
 
   def _record_error(self, probe_name, error_msg):
     """Store a non-fatal error as an INFO GrayboxFinding."""
