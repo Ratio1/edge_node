@@ -122,6 +122,23 @@ class TestGrayboxNormalization(unittest.TestCase):
     _, flat_findings = host._compute_risk_and_findings(report)
     self.assertEqual(flat_findings[0]["evidence"], "a=1; b=2")
 
+  def test_typed_evidence_artifacts_survive_normalization(self):
+    """Graybox typed evidence artifacts survive into the flat finding contract."""
+    finding = GrayboxFinding(
+      scenario_id="PT-A01-01",
+      title="Typed evidence",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="A01:2021",
+      evidence=[],
+      evidence_artifacts=[{"summary": "GET /admin -> 403", "raw_evidence_cid": "QmEvidence"}],
+    )
+    report = _make_graybox_report([finding.to_dict()])
+    host = _make_mixin()
+    _, flat_findings = host._compute_risk_and_findings(report)
+    self.assertEqual(flat_findings[0]["evidence"], "GET /admin -> 403")
+    self.assertEqual(flat_findings[0]["evidence_artifacts"][0]["raw_evidence_cid"], "QmEvidence")
+
   def test_cwe_joined(self):
     """List CWEs joined with ', '."""
     finding = GrayboxFinding(

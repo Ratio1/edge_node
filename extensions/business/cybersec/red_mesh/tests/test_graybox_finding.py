@@ -88,6 +88,14 @@ class TestGrayboxFinding(unittest.TestCase):
     flat2 = f.to_flat_finding(port=443, protocol="https", probe_name="ac")
     self.assertEqual(flat1["finding_id"], flat2["finding_id"])
 
+  def test_finding_id_stable_for_equivalent_cwe_order(self):
+    """Equivalent CWE sets produce the same finding_id regardless of list order."""
+    f1 = self._make_finding(cwe=["CWE-639", "CWE-862"])
+    f2 = self._make_finding(cwe=["CWE-862", "CWE-639"])
+    flat1 = f1.to_flat_finding(port=443, protocol="https", probe_name="ac")
+    flat2 = f2.to_flat_finding(port=443, protocol="https", probe_name="ac")
+    self.assertEqual(flat1["finding_id"], flat2["finding_id"])
+
   def test_replay_steps_preserved(self):
     """Replay steps round-trip to flat finding."""
     steps = ["Login as user A", "GET /api/records/2/"]
@@ -150,6 +158,18 @@ class TestGrayboxFinding(unittest.TestCase):
 
     self.assertEqual(flat["evidence"], "GET /admin -> 403")
     self.assertEqual(flat["evidence_artifacts"][0]["summary"], "GET /admin -> 403")
+
+  def test_flat_from_dict_preserves_typed_evidence_artifacts(self):
+    """flat_from_dict is the canonical persisted-finding normalization path."""
+    payload = self._make_finding(
+      evidence=[],
+      evidence_artifacts=[{"summary": "GET /admin -> 403", "raw_evidence_cid": "Qm1"}],
+    ).to_dict()
+
+    flat = GrayboxFinding.flat_from_dict(payload, port=443, protocol="https", probe_name="access_control")
+
+    self.assertEqual(flat["evidence"], "GET /admin -> 403")
+    self.assertEqual(flat["evidence_artifacts"][0]["raw_evidence_cid"], "Qm1")
 
   def test_frozen(self):
     """Finding is immutable."""
