@@ -8,6 +8,7 @@ from extensions.business.cybersec.red_mesh.graybox.discovery import DiscoveryMod
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   GrayboxTargetConfig, DiscoveryConfig,
 )
+from extensions.business.cybersec.red_mesh.graybox.models import DiscoveryResult
 
 
 def _mock_response(status=200, text="", content_type="text/html"):
@@ -126,6 +127,15 @@ class TestDiscoveryModule(unittest.TestCase):
     routes, forms = disc.discover()
     self.assertIn("/api/submit/", forms)
     self.assertIn("/about/", routes)
+
+  def test_discover_result_returns_typed_payload(self):
+    disc = _make_discovery(routes_html={
+      "/": '<a href="/about/">About</a><form action="/api/submit/"></form>',
+    })
+    result = disc.discover_result()
+    self.assertIsInstance(result, DiscoveryResult)
+    self.assertIn("/about/", result.routes)
+    self.assertIn("/api/submit/", result.forms)
 
   def test_known_routes_included(self):
     """User-supplied routes are added to BFS queue."""

@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch, PropertyMock
 from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
 from extensions.business.cybersec.red_mesh.worker.base import BaseLocalWorker
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+from extensions.business.cybersec.red_mesh.graybox.models import DiscoveryResult, GrayboxCredentialSet
 from extensions.business.cybersec.red_mesh.constants import (
   ScanType, GRAYBOX_PROBE_REGISTRY,
 )
@@ -215,6 +216,23 @@ class TestExecution(unittest.TestCase):
     self.assertTrue(worker.state["done"])
     metrics = worker.metrics.build()
     self.assertTrue(len(metrics.phase_durations) > 0)
+
+  def test_worker_builds_typed_credentials(self):
+    worker = _make_worker(regular_username="alice", regular_password="pass", weak_candidates=["admin:admin"])
+    self.assertIsInstance(worker._credentials, GrayboxCredentialSet)
+    self.assertEqual(worker._credentials.official.username, "admin")
+    self.assertEqual(worker._credentials.regular.username, "alice")
+    self.assertEqual(worker._credentials.weak_candidates, ["admin:admin"])
+
+  def test_discovery_phase_returns_typed_result(self):
+    worker = _make_worker()
+    worker.auth.ensure_sessions = MagicMock()
+    worker.discovery.discover_result = MagicMock(return_value=DiscoveryResult(routes=["/a"], forms=["/f"]))
+
+    result = worker._run_discovery_phase()
+
+    self.assertIsInstance(result, DiscoveryResult)
+    self.assertEqual(result.routes, ["/a"])
 
   def test_scenario_stats(self):
     """Scenario stats count findings by status."""

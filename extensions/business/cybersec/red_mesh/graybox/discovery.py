@@ -12,6 +12,8 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
+from .models import DiscoveryResult
+
 
 class _RouteParser(HTMLParser):
   """Extract href and form action attributes from HTML."""
@@ -112,9 +114,65 @@ class DiscoveryModule:
         if normalized and self._in_scope(normalized):
           all_forms.add(normalized)
 
+    result = self.discover_result(known_routes=known_routes)
+    return result.to_tuple()
+
+  def discover_result(self, known_routes=None) -> DiscoveryResult:
+    """Discover application routes/forms and return a typed result."""
+    visited = set()
+    to_visit = deque([("/", 0)])
+
+    if known_routes:
+      for route in known_routes:
+        if self._in_scope(route):
+          to_visit.append((route, 0))
+
+    all_routes = set()
+    all_forms = set()
+
+    while to_visit and len(visited) < self._max_pages:
+      path, depth = to_visit.popleft()
+      if path in visited:
+        continue
+      visited.add(path)
+
+      self.safety.throttle()
+
+      session = self.auth.official_session or self.auth.anon_session
+      if session is None:
+        break
+
+      url = self.target_url + path
+      try:
+        resp = session.get(url, timeout=10, allow_redirects=True)
+      except requests.RequestException:
+        continue
+
+      all_routes.add(path)
+
+      if "text/html" not in resp.headers.get("Content-Type", ""):
+        continue
+
+      parser = _RouteParser()
+      try:
+        parser.feed(resp.text)
+      except Exception:
+        continue
+
+      if depth < self._max_depth:
+        for link in parser.links:
+          normalized = self._normalize(link)
+          if normalized and normalized not in visited and self._in_scope(normalized):
+            to_visit.append((normalized, depth + 1))
+
+      for action in parser.forms:
+        normalized = self._normalize(action)
+        if normalized and self._in_scope(normalized):
+          all_forms.add(normalized)
+
     self.routes = sorted(all_routes)
     self.forms = sorted(all_forms)
-    return self.routes, self.forms
+    return DiscoveryResult(routes=self.routes, forms=self.forms)
 
   def _normalize(self, raw):
     """Normalize a link to a same-origin, canonicalized path."""
