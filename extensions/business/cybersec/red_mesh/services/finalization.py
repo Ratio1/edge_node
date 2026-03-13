@@ -101,7 +101,14 @@ def maybe_finalize_pass(owner):
         set_job_status(job_specs, JOB_STATUS_ANALYZING)
         job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_analyzing")
         llm_text = owner._run_aggregated_llm_analysis(job_id, aggregated, job_config)
-        summary_text = owner._run_quick_summary_analysis(job_id, aggregated, job_config)
+        llm_status = getattr(owner, "_last_llm_analysis_status", None)
+        if llm_status in {"api_request_error", "provider_request_error"}:
+          owner.P(
+            f"Skipping quick summary for job {job_id} after non-retryable LLM failure ({llm_status})",
+            color='y'
+          )
+        else:
+          summary_text = owner._run_quick_summary_analysis(job_id, aggregated, job_config)
 
       llm_failed = True if (owner.cfg_llm_agent_api_enabled and (llm_text is None or summary_text is None)) else None
       if llm_failed:

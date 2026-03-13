@@ -15,6 +15,9 @@ from typing import Optional
 from ..constants import RUN_MODE_SINGLEPASS
 from ..services.resilience import run_bounded_retry
 
+_NON_RETRYABLE_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 413, 422}
+_NON_RETRYABLE_PROVIDER_STATUSES = _NON_RETRYABLE_HTTP_STATUSES
+
 
 class _RedMeshLlmAgentMixin(object):
   """
@@ -82,6 +85,44 @@ class _RedMeshLlmAgentMixin(object):
     endpoint = endpoint.lstrip("/")
     return f"http://{host}:{port}/{endpoint}"
 
+  def _extract_provider_http_status(self, error_details) -> int | None:
+    """Best-effort extraction of an upstream provider HTTP status from error details."""
+    if isinstance(error_details, dict):
+      for key in ("status_code", "http_status", "provider_status"):
+        value = error_details.get(key)
+        if isinstance(value, int):
+          return value
+      detail = error_details.get("detail") or error_details.get("error")
+      if isinstance(detail, str):
+        return self._extract_provider_http_status(detail)
+
+    if isinstance(error_details, str):
+      marker = "status "
+      if marker in error_details:
+        tail = error_details.split(marker, 1)[1]
+        digits = "".join(ch for ch in tail if ch.isdigit())
+        if digits:
+          try:
+            return int(digits)
+          except ValueError:
+            return None
+    return None
+
+  def _is_non_retryable_llm_error(self, result: dict | None) -> bool:
+    """Return True when an LLM/API error is permanent and retrying is wasteful."""
+    if not isinstance(result, dict) or "error" not in result:
+      return False
+
+    http_status = result.get("http_status")
+    if isinstance(http_status, int) and http_status in _NON_RETRYABLE_HTTP_STATUSES:
+      return True
+
+    provider_status = result.get("provider_status")
+    if isinstance(provider_status, int) and provider_status in _NON_RETRYABLE_PROVIDER_STATUSES:
+      return True
+
+    return result.get("status") in {"api_request_error", "provider_request_error"}
+
   def _call_llm_agent_api(
       self,
       endpoint: str,
@@ -132,10 +173,30 @@ class _RedMeshLlmAgentMixin(object):
         )
 
       if response.status_code != 200:
-        return {
+        details = response.text
+        try:
+          details = response.json()
+        except Exception:
+          pass
+
+        result = {
           "error": f"LLM Agent API returned status {response.status_code}",
           "status": "api_error",
-          "details": response.text
+          "details": details,
+          "http_status": response.status_code,
+        }
+        if response.status_code in _NON_RETRYABLE_HTTP_STATUSES:
+          result["status"] = "api_request_error"
+
+        provider_status = self._extract_provider_http_status(details)
+        if provider_status is not None:
+          result["provider_status"] = provider_status
+          if provider_status in _NON_RETRYABLE_PROVIDER_STATUSES:
+            result["status"] = "provider_request_error"
+
+        return {
+          **result,
+          "retryable": not self._is_non_retryable_llm_error(result),
         }
 
       # Unwrap response if FastAPI wrapped it (extract 'result' from envelope)
@@ -145,7 +206,11 @@ class _RedMeshLlmAgentMixin(object):
       return response_data
 
     def _is_success(response_data):
-      return isinstance(response_data, dict) and "error" not in response_data
+      if not isinstance(response_data, dict):
+        return False
+      if "error" not in response_data:
+        return True
+      return self._is_non_retryable_llm_error(response_data)
 
     try:
       result = run_bounded_retry(self, "llm_agent_api", retries, _attempt, is_success=_is_success)
@@ -165,6 +230,13 @@ class _RedMeshLlmAgentMixin(object):
         self.P(f"LLM Agent API not reachable at {url}", color='y')
       elif status == "timeout":
         self.P("LLM Agent API request timed out", color='y')
+      elif self._is_non_retryable_llm_error(result):
+        provider_status = result.get("provider_status")
+        detail = result.get("details")
+        suffix = f" (provider_status={provider_status})" if provider_status else ""
+        self.P(f"LLM Agent API request rejected{suffix}: {result.get('error')}", color='y')
+        if detail:
+          self.Pd(f"LLM Agent API rejection details: {detail}")
       else:
         self.P(f"LLM Agent API call failed: {result.get('error')}", color='y')
       return result
@@ -312,6 +384,7 @@ class _RedMeshLlmAgentMixin(object):
 
     # Call LLM analysis
     llm_analysis = self._auto_analyze_report(job_id, report_with_meta, target, scan_type=scan_type)
+    self._last_llm_analysis_status = llm_analysis.get("status") if isinstance(llm_analysis, dict) else None
 
     if not llm_analysis or "error" in llm_analysis:
       self.P(
@@ -390,6 +463,7 @@ class _RedMeshLlmAgentMixin(object):
         "focus_areas": None,
       }
     )
+    self._last_llm_summary_status = analysis_result.get("status") if isinstance(analysis_result, dict) else None
 
     if not analysis_result or "error" in analysis_result:
       self.P(

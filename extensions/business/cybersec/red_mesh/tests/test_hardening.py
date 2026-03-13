@@ -137,6 +137,50 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(result["analysis"], "ok")
     self.assertEqual(calls["count"], 2)
 
+  def test_call_llm_agent_api_does_not_retry_non_retryable_provider_rejection(self):
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent_api_enabled = True
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+        self.cfg_llm_agent_api_timeout = 5
+        self.cfg_llm_api_retries = 2
+
+      def P(self, *_args, **_kwargs):
+        return None
+
+      def Pd(self, *_args, **_kwargs):
+        return None
+
+    class Response:
+      status_code = 500
+      text = '{"detail":"DeepSeek API returned status 400"}'
+
+      @staticmethod
+      def json():
+        return {"detail": "DeepSeek API returned status 400"}
+
+    host = MockHost()
+    original_post = requests.post
+    calls = {"count": 0}
+
+    def rejected_post(*_args, **_kwargs):
+      calls["count"] += 1
+      return Response()
+
+    requests.post = rejected_post
+    try:
+      result = host._call_llm_agent_api("/analyze_scan", payload={"scan_results": {}})
+    finally:
+      requests.post = original_post
+
+    self.assertEqual(calls["count"], 1)
+    self.assertEqual(result["status"], "provider_request_error")
+    self.assertEqual(result["provider_status"], 400)
+    self.assertFalse(result["retryable"])
+
 
 class TestAuditLogHardening(unittest.TestCase):
 

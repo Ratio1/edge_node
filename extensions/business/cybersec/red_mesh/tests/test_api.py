@@ -1111,6 +1111,42 @@ class TestPhase2PassFinalization(unittest.TestCase):
     meta = call_kwargs.get("meta", {})
     self.assertIn("pass_nr", meta)
 
+  def test_non_retryable_llm_failure_skips_quick_summary(self):
+    """Permanent LLM request failures should not retry through quick summary."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin.P = MagicMock()
+    plugin._last_llm_analysis_status = None
+
+    def _fail_main(*_args, **_kwargs):
+      plugin._last_llm_analysis_status = "provider_request_error"
+      return None
+
+    plugin._run_aggregated_llm_analysis = MagicMock(side_effect=_fail_main)
+    plugin._run_quick_summary_analysis = MagicMock(return_value=None)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    plugin._run_quick_summary_analysis.assert_not_called()
+    plugin.P.assert_any_call(
+      f"Skipping quick summary for job {job_specs['job_id']} after non-retryable LLM failure (provider_request_error)",
+      color='y'
+    )
+
   def test_aggregated_report_write_failure(self):
     """R1FS fails for aggregated → pass finalization skipped, no partial state."""
     PentesterApi01Plugin = self._get_plugin_class()
