@@ -86,6 +86,21 @@ def get_job_data(owner, job_id: str):
   if isinstance(pass_reports, list) and len(pass_reports) > 5:
     job_specs["pass_reports"] = pass_reports[-5:]
 
+  if isinstance(job_specs.get("workers"), dict):
+    now = None
+    time_fn = getattr(owner, "time", None)
+    if callable(time_fn):
+      try:
+        now = float(time_fn())
+      except (TypeError, ValueError):
+        now = None
+    job_specs["workers_reconciled"] = reconcile_job_workers(
+      owner,
+      job_specs,
+      live_payloads=_job_repo(owner).list_live_progress() or {},
+      now=now,
+    )
+
   return {
     "job_id": job_id,
     "found": True,
