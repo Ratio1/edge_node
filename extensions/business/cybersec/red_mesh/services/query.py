@@ -110,6 +110,139 @@ def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset:
   return result
 
 
+def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None):
+  """
+  Retrieve stored LLM analysis for a job or pass report CID.
+
+  Finalized jobs are resolved from the archived job payload so analysis remains
+  available after CStore pruning. Running jobs continue to resolve via live
+  pass report references in CStore.
+  """
+  if cid:
+    try:
+      analysis = owner.r1fs.get_json(cid)
+      if analysis is None:
+        return {"error": "Analysis not found", "cid": cid}
+      return {"cid": cid, "analysis": analysis}
+    except Exception as e:
+      return {"error": str(e), "cid": cid}
+
+  if not job_id:
+    return {"error": "Either job_id or cid must be provided"}
+
+  job_specs = owner._get_job_from_cstore(job_id)
+  if not job_specs:
+    return {"error": "Job not found", "job_id": job_id}
+
+  job_status = job_specs.get("job_status")
+
+  if job_specs.get("job_cid"):
+    archive_result = get_job_archive_with_triage(owner, job_id)
+    if "archive" not in archive_result:
+      return {
+        "error": archive_result.get("error", "archive_unavailable"),
+        "message": archive_result.get("message"),
+        "job_id": job_id,
+        "job_status": job_status,
+      }
+
+    archive = archive_result["archive"]
+    passes = archive.get("passes", []) or []
+    if not passes:
+      return {"error": "No pass reports available for this job", "job_id": job_id, "job_status": job_status}
+
+    if pass_nr is not None:
+      target_pass = next((entry for entry in passes if entry.get("pass_nr") == pass_nr), None)
+      if not target_pass:
+        return {
+          "error": f"Pass {pass_nr} not found in history",
+          "job_id": job_id,
+          "available_passes": [entry.get("pass_nr") for entry in passes],
+          "job_status": job_status,
+        }
+    else:
+      target_pass = passes[-1]
+
+    llm_analysis = target_pass.get("llm_analysis")
+    if not llm_analysis:
+      return {
+        "error": "No LLM analysis available for this pass",
+        "job_id": job_id,
+        "pass_nr": target_pass.get("pass_nr"),
+        "llm_failed": target_pass.get("llm_failed", False),
+        "job_status": job_status,
+      }
+
+    job_config = archive.get("job_config", {}) or {}
+    target_value = job_config.get("target") or job_specs.get("target")
+    return {
+      "job_id": job_id,
+      "pass_nr": target_pass.get("pass_nr"),
+      "completed_at": target_pass.get("date_completed"),
+      "report_cid": target_pass.get("report_cid"),
+      "target": target_value,
+      "num_workers": len(target_pass.get("worker_reports", {}) or {}),
+      "total_passes": len(passes),
+      "analysis": llm_analysis,
+      "quick_summary": target_pass.get("quick_summary"),
+    }
+
+  pass_reports = job_specs.get("pass_reports", [])
+  if not pass_reports:
+    if job_status == "RUNNING":
+      return {"error": "Job still running, no passes completed yet", "job_id": job_id, "job_status": job_status}
+    return {"error": "No pass reports available for this job", "job_id": job_id, "job_status": job_status}
+
+  if pass_nr is not None:
+    target_pass = next((entry for entry in pass_reports if entry.get("pass_nr") == pass_nr), None)
+    if not target_pass:
+      return {
+        "error": f"Pass {pass_nr} not found in history",
+        "job_id": job_id,
+        "available_passes": [entry.get("pass_nr") for entry in pass_reports],
+      }
+  else:
+    target_pass = pass_reports[-1]
+
+  report_cid = target_pass.get("report_cid")
+  if not report_cid:
+    return {
+      "error": "No pass report CID available for this pass",
+      "job_id": job_id,
+      "pass_nr": target_pass.get("pass_nr"),
+      "job_status": job_status,
+    }
+
+  try:
+    pass_data = owner.r1fs.get_json(report_cid)
+    if pass_data is None:
+      return {"error": "Pass report not found in R1FS", "cid": report_cid, "job_id": job_id}
+
+    llm_analysis = pass_data.get("llm_analysis")
+    if not llm_analysis:
+      return {
+        "error": "No LLM analysis available for this pass",
+        "job_id": job_id,
+        "pass_nr": target_pass.get("pass_nr"),
+        "llm_failed": pass_data.get("llm_failed", False),
+        "job_status": job_status,
+      }
+
+    return {
+      "job_id": job_id,
+      "pass_nr": target_pass.get("pass_nr"),
+      "completed_at": pass_data.get("date_completed"),
+      "report_cid": report_cid,
+      "target": job_specs.get("target"),
+      "num_workers": len(job_specs.get("workers", {})),
+      "total_passes": len(pass_reports),
+      "analysis": llm_analysis,
+      "quick_summary": pass_data.get("quick_summary"),
+    }
+  except Exception as e:
+    return {"error": str(e), "cid": report_cid, "job_id": job_id}
+
+
 def get_job_progress(owner, job_id: str):
   """
   Return real-time progress for all workers in the given job.
