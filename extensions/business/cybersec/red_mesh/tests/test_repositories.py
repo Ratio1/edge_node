@@ -1,7 +1,9 @@
 import unittest
 from unittest.mock import MagicMock
 
-from extensions.business.cybersec.red_mesh.models import CStoreJobRunning, JobArchive, JobConfig, PassReport, WorkerProgress
+from extensions.business.cybersec.red_mesh.models import (
+  CStoreJobRunning, JobArchive, JobConfig, PassReport, WorkerProgress, CStoreWorker,
+)
 from extensions.business.cybersec.red_mesh.repositories import ArtifactRepository, JobStateRepository
 
 
@@ -67,6 +69,7 @@ class TestJobStateRepository(unittest.TestCase):
       job_id="job-1",
       worker_addr="node-a",
       pass_nr=1,
+      assignment_revision_seen=2,
       progress=25.0,
       phase="port_scan",
       scan_type="network",
@@ -77,12 +80,41 @@ class TestJobStateRepository(unittest.TestCase):
       open_ports_found=[22],
       completed_tests=["probe"],
       updated_at=1.0,
+      started_at=0.5,
+      first_seen_live_at=0.5,
+      last_seen_at=1.0,
     )
 
     persisted = repo.put_live_progress_model(progress)
 
     self.assertEqual(persisted["job_id"], "job-1")
+    self.assertEqual(persisted["assignment_revision_seen"], 2)
     owner.chainstore_hset.assert_called_once()
+
+  def test_cstore_worker_roundtrip_preserves_assignment_metadata(self):
+    worker = CStoreWorker(
+      start_port=1,
+      end_port=100,
+      assignment_revision=3,
+      assigned_at=10.0,
+      reannounce_count=2,
+      last_reannounce_at=12.0,
+      retry_reason="startup_timeout",
+      terminal_reason="unreachable",
+      error="worker missing",
+      unreachable_at=20.0,
+    )
+
+    worker2 = CStoreWorker.from_dict(worker.to_dict())
+
+    self.assertEqual(worker2.assignment_revision, 3)
+    self.assertEqual(worker2.assigned_at, 10.0)
+    self.assertEqual(worker2.reannounce_count, 2)
+    self.assertEqual(worker2.last_reannounce_at, 12.0)
+    self.assertEqual(worker2.retry_reason, "startup_timeout")
+    self.assertEqual(worker2.terminal_reason, "unreachable")
+    self.assertEqual(worker2.error, "worker missing")
+    self.assertEqual(worker2.unreachable_at, 20.0)
 
   def test_job_state_repository_put_job_coerces_running_job_shape(self):
     owner = self._make_owner()
