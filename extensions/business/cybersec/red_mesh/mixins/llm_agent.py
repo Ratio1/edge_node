@@ -18,6 +18,10 @@ from ..services.resilience import run_bounded_retry
 
 _NON_RETRYABLE_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 413, 422}
 _NON_RETRYABLE_PROVIDER_STATUSES = _NON_RETRYABLE_HTTP_STATUSES
+_LLM_EVIDENCE_MAX_CHARS = 240
+_LLM_BANNER_MAX_CHARS = 120
+_LLM_SERVICE_LIMIT = 40
+_LLM_TOP_FINDINGS_LIMIT = 80
 
 
 class _RedMeshLlmAgentMixin(object):
@@ -42,6 +46,167 @@ class _RedMeshLlmAgentMixin(object):
 
   def _get_llm_agent_config(self) -> dict:
     return get_llm_agent_config(self)
+
+  @staticmethod
+  def _llm_trim_text(value, max_chars):
+    if value is None:
+      return ""
+    text = str(value).strip()
+    if len(text) <= max_chars:
+      return text
+    return text[: max_chars - 3].rstrip() + "..."
+
+  def _extract_report_findings(self, report: dict) -> list[dict]:
+    findings = []
+    if not isinstance(report, dict):
+      return findings
+
+    direct = report.get("findings")
+    if isinstance(direct, list):
+      findings.extend(item for item in direct if isinstance(item, dict))
+
+    correlation = report.get("correlation_findings")
+    if isinstance(correlation, list):
+      findings.extend(item for item in correlation if isinstance(item, dict))
+
+    service_info = report.get("service_info")
+    if isinstance(service_info, dict):
+      for service_entry in service_info.values():
+        if not isinstance(service_entry, dict):
+          continue
+        nested = service_entry.get("findings")
+        if isinstance(nested, list):
+          findings.extend(item for item in nested if isinstance(item, dict))
+
+    web_tests = report.get("web_tests_info")
+    if isinstance(web_tests, dict):
+      for web_entry in web_tests.values():
+        if not isinstance(web_entry, dict):
+          continue
+        nested = web_entry.get("findings")
+        if isinstance(nested, list):
+          findings.extend(item for item in nested if isinstance(item, dict))
+
+    return findings
+
+  def _build_llm_metadata(self, job_id: str, target: str, scan_type: str, job_config: dict) -> dict:
+    metadata = {
+      "job_id": job_id,
+      "target": target,
+      "scan_type": scan_type,
+      "run_mode": job_config.get("run_mode", RUN_MODE_SINGLEPASS),
+    }
+    if scan_type == "webapp":
+      metadata["target_url"] = job_config.get("target_url")
+      metadata["excluded_features"] = list(job_config.get("excluded_features", []) or [])
+      metadata["app_routes_count"] = len(job_config.get("app_routes", []) or [])
+    else:
+      metadata["start_port"] = job_config.get("start_port")
+      metadata["end_port"] = job_config.get("end_port")
+      metadata["enabled_features_count"] = len(job_config.get("enabled_features", []) or [])
+    return metadata
+
+  def _build_network_service_summary(self, aggregated_report: dict) -> list[dict]:
+    services = []
+    service_info = aggregated_report.get("service_info")
+    if not isinstance(service_info, dict):
+      return services
+
+    for raw_port, raw_entry in sorted(service_info.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else str(item[0])):
+      if not isinstance(raw_entry, dict):
+        continue
+      entry = {
+        "port": raw_entry.get("port", raw_port),
+        "protocol": raw_entry.get("protocol"),
+        "service": raw_entry.get("service"),
+        "product": raw_entry.get("product") or raw_entry.get("server") or raw_entry.get("ssh_library"),
+        "version": raw_entry.get("version") or raw_entry.get("ssh_version"),
+        "banner": self._llm_trim_text(raw_entry.get("banner") or raw_entry.get("server") or "", _LLM_BANNER_MAX_CHARS),
+        "finding_count": len(raw_entry.get("findings") or []),
+      }
+      if raw_entry.get("findings"):
+        entry["top_titles"] = [
+          self._llm_trim_text(finding.get("title", ""), 100)
+          for finding in raw_entry.get("findings", [])[:3]
+          if isinstance(finding, dict) and finding.get("title")
+        ]
+      services.append(entry)
+      if len(services) >= _LLM_SERVICE_LIMIT:
+        break
+    return services
+
+  def _build_llm_top_findings(self, aggregated_report: dict) -> list[dict]:
+    findings = self._extract_report_findings(aggregated_report)
+    compact = []
+    for finding in findings[:_LLM_TOP_FINDINGS_LIMIT]:
+      compact.append({
+        "severity": finding.get("severity"),
+        "title": self._llm_trim_text(finding.get("title", ""), 160),
+        "port": finding.get("port"),
+        "protocol": finding.get("protocol"),
+        "probe": finding.get("probe"),
+        "cve": finding.get("cve_id") or finding.get("cve"),
+        "cwe": finding.get("cwe_id"),
+        "owasp": finding.get("owasp_id"),
+        "evidence": self._llm_trim_text(finding.get("evidence", ""), _LLM_EVIDENCE_MAX_CHARS),
+      })
+    return compact
+
+  def _build_llm_findings_summary(self, aggregated_report: dict) -> dict:
+    findings = self._extract_report_findings(aggregated_report)
+    counts = {}
+    for finding in findings:
+      severity = str(finding.get("severity") or "UNKNOWN").upper()
+      counts[severity] = counts.get(severity, 0) + 1
+    return {
+      "total_findings": len(findings),
+      "by_severity": counts,
+    }
+
+  def _build_llm_coverage_summary(self, aggregated_report: dict) -> dict:
+    open_ports = aggregated_report.get("open_ports") or []
+    worker_activity = aggregated_report.get("worker_activity") or []
+    return {
+      "ports_scanned": aggregated_report.get("ports_scanned"),
+      "open_ports_count": len(open_ports),
+      "open_ports_sample": list(open_ports[:40]),
+      "workers": [
+        {
+          "id": worker.get("id"),
+          "start_port": worker.get("start_port"),
+          "end_port": worker.get("end_port"),
+          "open_ports_count": len(worker.get("open_ports") or []),
+        }
+        for worker in worker_activity
+        if isinstance(worker, dict)
+      ],
+    }
+
+  def _build_llm_analysis_payload(self, job_id: str, aggregated_report: dict, job_config: dict, analysis_type: str) -> dict:
+    scan_type = job_config.get("scan_type", "network")
+    target = job_config.get("target_url") if scan_type == "webapp" else job_config.get("target", "unknown")
+    if scan_type != "webapp":
+      return {
+        "metadata": self._build_llm_metadata(job_id, target, scan_type, job_config),
+        "stats": {
+          "nr_open_ports": aggregated_report.get("nr_open_ports"),
+          "ports_scanned": aggregated_report.get("ports_scanned"),
+          "scan_metrics": aggregated_report.get("scan_metrics"),
+          "analysis_type": analysis_type,
+        },
+        "services": self._build_network_service_summary(aggregated_report),
+        "top_findings": self._build_llm_top_findings(aggregated_report),
+        "coverage": self._build_llm_coverage_summary(aggregated_report),
+        "truncation": {
+          "service_limit": _LLM_SERVICE_LIMIT,
+          "finding_limit": _LLM_TOP_FINDINGS_LIMIT,
+        },
+        "findings_summary": self._build_llm_findings_summary(aggregated_report),
+      }
+
+    report_with_meta = {k: v for k, v in aggregated_report.items() if k != "node_ip"}
+    report_with_meta["_job_metadata"] = self._build_llm_metadata(job_id, target, scan_type, job_config)
+    return report_with_meta
 
   def _maybe_resolve_llm_agent_from_semaphore(self):
     """
@@ -247,7 +412,7 @@ class _RedMeshLlmAgentMixin(object):
     return result
 
   def _auto_analyze_report(
-      self, job_id: str, report: dict, target: str, scan_type: str = "network",
+      self, job_id: str, report: dict, target: str, scan_type: str = "network", analysis_type: str = None,
   ) -> Optional[dict]:
     """
     Automatically analyze a completed scan report using LLM Agent API.
@@ -280,7 +445,7 @@ class _RedMeshLlmAgentMixin(object):
       method="POST",
       payload={
         "scan_results": report,
-        "analysis_type": llm_cfg["AUTO_ANALYSIS_TYPE"],
+        "analysis_type": analysis_type or llm_cfg["AUTO_ANALYSIS_TYPE"],
         "scan_type": scan_type,
         "focus_areas": None,
       }
@@ -367,25 +532,12 @@ class _RedMeshLlmAgentMixin(object):
       self.P(f"No data to analyze for job {job_id}", color='y')
       return None
 
-    # Add job metadata to report for context (strip node_ip — never send to LLM)
-    report_with_meta = {k: v for k, v in aggregated_report.items() if k != "node_ip"}
-
-    # Build scan-type-aware metadata
-    metadata = {
-      "job_id": job_id,
-      "target": target,
-      "scan_type": scan_type,
-      "run_mode": job_config.get("run_mode", RUN_MODE_SINGLEPASS),
-    }
-    if scan_type == "webapp":
-      metadata["target_url"] = job_config.get("target_url")
-      metadata["app_routes"] = job_config.get("app_routes", [])
-      metadata["excluded_features"] = job_config.get("excluded_features", [])
-    else:
-      metadata["start_port"] = job_config.get("start_port")
-      metadata["end_port"] = job_config.get("end_port")
-      metadata["enabled_features"] = job_config.get("enabled_features", [])
-    report_with_meta["_job_metadata"] = metadata
+    report_with_meta = self._build_llm_analysis_payload(
+      job_id,
+      aggregated_report,
+      job_config,
+      self._get_llm_agent_config()["AUTO_ANALYSIS_TYPE"],
+    )
 
     # Call LLM analysis
     llm_analysis = self._auto_analyze_report(job_id, report_with_meta, target, scan_type=scan_type)
@@ -437,25 +589,12 @@ class _RedMeshLlmAgentMixin(object):
       self.P(f"No data for quick summary for job {job_id}", color='y')
       return None
 
-    # Add job metadata to report for context (strip node_ip — never send to LLM)
-    report_with_meta = {k: v for k, v in aggregated_report.items() if k != "node_ip"}
-
-    # Build scan-type-aware metadata
-    metadata = {
-      "job_id": job_id,
-      "target": target,
-      "scan_type": scan_type,
-      "run_mode": job_config.get("run_mode", RUN_MODE_SINGLEPASS),
-    }
-    if scan_type == "webapp":
-      metadata["target_url"] = job_config.get("target_url")
-      metadata["app_routes"] = job_config.get("app_routes", [])
-      metadata["excluded_features"] = job_config.get("excluded_features", [])
-    else:
-      metadata["start_port"] = job_config.get("start_port")
-      metadata["end_port"] = job_config.get("end_port")
-      metadata["enabled_features"] = job_config.get("enabled_features", [])
-    report_with_meta["_job_metadata"] = metadata
+    report_with_meta = self._build_llm_analysis_payload(
+      job_id,
+      aggregated_report,
+      job_config,
+      "quick_summary",
+    )
 
     # Call LLM analysis with quick_summary type
     analysis_result = self._call_llm_agent_api(
