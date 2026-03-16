@@ -99,10 +99,9 @@ class TestLlmRetryHardening(unittest.TestCase):
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
-        self.cfg_llm_agent_api_enabled = True
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
         self.cfg_llm_agent_api_host = "127.0.0.1"
         self.cfg_llm_agent_api_port = 8080
-        self.cfg_llm_agent_api_timeout = 5
         self.cfg_llm_api_retries = 2
 
       def P(self, *_args, **_kwargs):
@@ -142,10 +141,9 @@ class TestLlmRetryHardening(unittest.TestCase):
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
-        self.cfg_llm_agent_api_enabled = True
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
         self.cfg_llm_agent_api_host = "127.0.0.1"
         self.cfg_llm_agent_api_port = 8080
-        self.cfg_llm_agent_api_timeout = 5
         self.cfg_llm_api_retries = 2
 
       def P(self, *_args, **_kwargs):

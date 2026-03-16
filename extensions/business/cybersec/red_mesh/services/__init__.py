@@ -1,4 +1,7 @@
-from .config import resolve_config_block
+from .config import (
+  get_llm_agent_config,
+  resolve_config_block,
+)
 from .control import (
   purge_job,
   stop_and_delete_job,
@@ -63,6 +66,7 @@ __all__ = [
   "TERMINAL_JOB_STATUSES",
   "can_transition_job_status",
   "coerce_scan_type",
+  "get_llm_agent_config",
   "resolve_config_block",
   "announce_launch",
   "build_network_workers",
