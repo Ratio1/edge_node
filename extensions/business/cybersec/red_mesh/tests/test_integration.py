@@ -688,6 +688,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(persisted["workers"]["worker-C"]["assignment_revision"], 2)
     self.assertEqual(persisted["workers"]["worker-C"]["reannounce_count"], 1)
     self.assertEqual(persisted["workers"]["worker-C"]["retry_reason"], "startup_timeout")
+    self.assertEqual(persisted["timeline"][-1]["type"], "worker_reannounced")
 
   def test_maybe_reannounce_worker_assignments_retries_stale_worker(self):
     """Launcher retries a matched worker whose live state is stale past grace."""
@@ -763,6 +764,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     persisted = plugin.chainstore_hset.call_args.kwargs["value"]
     self.assertEqual(persisted["workers"]["worker-C"]["assignment_revision"], 2)
     self.assertEqual(persisted["workers"]["worker-C"]["retry_reason"], "stale_live")
+    self.assertEqual(persisted["timeline"][-1]["type"], "worker_reannounced")
 
   def test_maybe_reannounce_worker_assignments_stops_job_after_retry_exhaustion(self):
     """Launcher stops the job explicitly once a worker exhausts re-announcement budget."""
