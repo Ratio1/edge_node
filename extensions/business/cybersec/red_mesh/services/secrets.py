@@ -3,6 +3,7 @@ import os
 
 from ..models import JobConfig
 from ..repositories import ArtifactRepository
+from .config import get_attestation_config
 
 
 def _artifact_repo(owner):
@@ -30,7 +31,7 @@ class R1fsSecretStore:
       os.environ.get("REDMESH_SECRET_STORE_KEY", ""),
       getattr(self.owner, "cfg_redmesh_secret_store_key", ""),
       getattr(self.owner, "cfg_comms_host_key", ""),
-      getattr(self.owner, "cfg_attestation_private_key", ""),
+      get_attestation_config(self.owner)["PRIVATE_KEY"],
     ]
     for candidate in candidates:
       key = self._normalize_secret_key(candidate)

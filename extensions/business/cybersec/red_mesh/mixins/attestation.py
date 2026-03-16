@@ -9,6 +9,7 @@ import ipaddress
 from urllib.parse import urlparse
 
 from ..constants import RUN_MODE_SINGLEPASS, RUN_MODE_CONTINUOUS_MONITORING
+from ..services.config import get_attestation_config
 from ..services.resilience import run_bounded_retry
 
 
@@ -32,7 +33,7 @@ class _AttestationMixin:
     return None
 
   def _attestation_get_tenant_private_key(self):
-    private_key = self.cfg_attestation_private_key
+    private_key = get_attestation_config(self)["PRIVATE_KEY"]
     if private_key:
       private_key = private_key.strip()
     if not private_key:
@@ -136,7 +137,8 @@ class _AttestationMixin:
     report_cid=None,
   ):
     self.P(f"[ATTESTATION] Test attestation requested for job {job_id} (score={vulnerability_score})")
-    if not self.cfg_attestation_enabled:
+    attestation_cfg = get_attestation_config(self)
+    if not attestation_cfg["ENABLED"]:
       self.P("[ATTESTATION] Attestation is disabled via config. Skipping.", color='y')
       return None
     tenant_private_key = self._attestation_get_tenant_private_key()
@@ -163,7 +165,7 @@ class _AttestationMixin:
       f"nodes={node_count}, score={vulnerability_score}, target={ip_obfuscated}, "
       f"cid={cid_obfuscated}, sender={node_eth_address}"
     )
-    retries = max(int(getattr(self, "cfg_attestation_retries", 1) or 1), 1)
+    retries = max(int(attestation_cfg["RETRIES"] or 1), 1)
     tx_hash = run_bounded_retry(
       self,
       "submit_redmesh_test_attestation",
@@ -221,7 +223,8 @@ class _AttestationMixin:
 
   def _submit_redmesh_job_start_attestation(self, job_id: str, job_specs: dict, workers: dict):
     self.P(f"[ATTESTATION] Job-start attestation requested for job {job_id}")
-    if not self.cfg_attestation_enabled:
+    attestation_cfg = get_attestation_config(self)
+    if not attestation_cfg["ENABLED"]:
       self.P("[ATTESTATION] Attestation is disabled via config. Skipping.", color='y')
       return None
     tenant_private_key = self._attestation_get_tenant_private_key()
@@ -248,7 +251,7 @@ class _AttestationMixin:
       f"nodes={node_count}, target={ip_obfuscated}, node_hashes={node_hashes}, "
       f"workers={worker_addrs}, sender={node_eth_address}"
     )
-    retries = max(int(getattr(self, "cfg_attestation_retries", 1) or 1), 1)
+    retries = max(int(attestation_cfg["RETRIES"] or 1), 1)
     tx_hash = run_bounded_retry(
       self,
       "submit_redmesh_job_start_attestation",

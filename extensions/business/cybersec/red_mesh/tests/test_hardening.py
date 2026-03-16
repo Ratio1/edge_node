@@ -33,8 +33,7 @@ class TestAttestationHelpers(unittest.TestCase):
       REDMESH_ATTESTATION_DOMAIN = "0x" + ("11" * 32)
 
       def __init__(self):
-        self.cfg_attestation_enabled = True
-        self.cfg_attestation_private_key = "0xprivate"
+        self.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "0xprivate", "RETRIES": 2}
         self.ee_addr = "0xlauncher"
         self.bc = MagicMock()
         self.bc.eth_address = "0xsender"
@@ -67,9 +66,7 @@ class TestAttestationHelpers(unittest.TestCase):
       REDMESH_ATTESTATION_DOMAIN = "0x" + ("11" * 32)
 
       def __init__(self):
-        self.cfg_attestation_enabled = True
-        self.cfg_attestation_private_key = "0xprivate"
-        self.cfg_attestation_retries = 2
+        self.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "0xprivate", "RETRIES": 2}
         self.ee_addr = "0xlauncher"
         self.bc = MagicMock()
         self.bc.eth_address = "0xsender"

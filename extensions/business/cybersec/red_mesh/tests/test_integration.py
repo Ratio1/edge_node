@@ -1562,7 +1562,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     plugin.cfg_instance_id = "test-instance"
     plugin.ee_addr = "node-launcher"
     plugin.cfg_llm_agent = {"ENABLED": False}
-    plugin.cfg_attestation_min_seconds_between_submits = 3600
+    plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 3600, "RETRIES": 2}
 
     # Two workers, each with a report_cid
     workers = {

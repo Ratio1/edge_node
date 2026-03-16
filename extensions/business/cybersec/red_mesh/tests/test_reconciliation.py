@@ -2,6 +2,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.services.config import (
+  get_attestation_config,
   get_llm_agent_config,
   resolve_config_block,
 )
@@ -101,6 +102,45 @@ class TestWorkerReconciliation(unittest.TestCase):
     self.assertEqual(config["ENABLED"], True)
     self.assertEqual(config["TIMEOUT"], 120.0)
     self.assertEqual(config["AUTO_ANALYSIS_TYPE"], "security_assessment")
+
+  def test_attestation_config_uses_defaults(self):
+    owner = MagicMock()
+    owner.cfg_attestation = None
+    owner.CONFIG = {}
+
+    config = get_attestation_config(owner)
+
+    self.assertEqual(config["ENABLED"], True)
+    self.assertEqual(config["PRIVATE_KEY"], "")
+    self.assertEqual(config["MIN_SECONDS_BETWEEN_SUBMITS"], 86400.0)
+    self.assertEqual(config["RETRIES"], 2)
+
+  def test_attestation_config_merges_partial_override(self):
+    owner = MagicMock()
+    owner.cfg_attestation = {"ENABLED": False, "RETRIES": 5}
+
+    config = get_attestation_config(owner)
+
+    self.assertEqual(config["ENABLED"], False)
+    self.assertEqual(config["PRIVATE_KEY"], "")
+    self.assertEqual(config["MIN_SECONDS_BETWEEN_SUBMITS"], 86400.0)
+    self.assertEqual(config["RETRIES"], 5)
+
+  def test_attestation_config_normalizes_invalid_values(self):
+    owner = MagicMock()
+    owner.cfg_attestation = {
+      "ENABLED": True,
+      "PRIVATE_KEY": None,
+      "MIN_SECONDS_BETWEEN_SUBMITS": -1,
+      "RETRIES": "bad",
+    }
+
+    config = get_attestation_config(owner)
+
+    self.assertEqual(config["ENABLED"], True)
+    self.assertEqual(config["PRIVATE_KEY"], "")
+    self.assertEqual(config["MIN_SECONDS_BETWEEN_SUBMITS"], 86400.0)
+    self.assertEqual(config["RETRIES"], 2)
 
   def test_reconciliation_config_uses_defaults(self):
     owner = MagicMock()
