@@ -1,5 +1,6 @@
 from ..models import JobArchive
 from ..repositories import ArtifactRepository, JobStateRepository
+from .reconciliation import reconcile_job_workers
 from .triage import get_job_archive_with_triage
 
 
@@ -247,21 +248,22 @@ def get_job_progress(owner, job_id: str):
   """
   Return real-time progress for all workers in the given job.
   """
-  live_hkey = f"{owner.cfg_instance_id}:live"
   all_progress = _job_repo(owner).list_live_progress() or {}
-  prefix = f"{job_id}:"
-  result = {}
-  for key, value in all_progress.items():
-    if key.startswith(prefix) and value is not None:
-      worker_addr = key[len(prefix):]
-      result[worker_addr] = value
 
   job_specs = _job_repo(owner).get_job(job_id)
   status = None
   scan_type = None
+  result = {}
   if isinstance(job_specs, dict):
     status = job_specs.get("job_status")
     scan_type = job_specs.get("scan_type")
+    result = reconcile_job_workers(owner, job_specs, live_payloads=all_progress)
+  else:
+    prefix = f"{job_id}:"
+    for key, value in all_progress.items():
+      if key.startswith(prefix) and value is not None:
+        worker_addr = key[len(prefix):]
+        result[worker_addr] = value
   return {"job_id": job_id, "status": status, "scan_type": scan_type, "workers": result}
 
 

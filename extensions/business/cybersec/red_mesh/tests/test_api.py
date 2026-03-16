@@ -2321,11 +2321,30 @@ class TestPhase5Endpoints(unittest.TestCase):
     Plugin = self._get_plugin_class()
     running = self._build_running_job("run-job", pass_count=2)
     plugin = self._build_plugin({"run-job": running})
-    plugin.chainstore_hgetall.return_value = {"run-job:worker-A": {"job_id": "run-job", "progress": 50}}
+    plugin.chainstore_hgetall.return_value = {
+      "run-job:worker-A": {
+        "job_id": "run-job",
+        "worker_addr": "worker-A",
+        "pass_nr": running["job_pass"],
+        "assignment_revision_seen": 1,
+        "progress": 50,
+        "phase": "service_probes",
+        "ports_scanned": 50,
+        "ports_total": 100,
+        "open_ports_found": [],
+        "completed_tests": [],
+        "updated_at": 100.0,
+        "started_at": 90.0,
+        "first_seen_live_at": 90.0,
+        "last_seen_at": 100.0,
+      },
+    }
+    plugin.time.return_value = 100.0
 
     result = Plugin.get_job_progress(plugin, job_id="run-job")
     self.assertEqual(result["status"], "RUNNING")
     self.assertIn("worker-A", result["workers"])
+    self.assertEqual(result["workers"]["worker-A"]["worker_state"], "active")
 
   def test_get_job_archive_not_found(self):
     """get_job_archive for non-existent job returns not_found."""

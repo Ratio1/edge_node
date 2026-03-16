@@ -75,12 +75,51 @@ class TestPhase12LiveProgress(unittest.TestCase):
 
     # Simulate two jobs' progress in the :live hset
     live_data = {
-      "job-A:worker-1": {"job_id": "job-A", "progress": 50},
-      "job-A:worker-2": {"job_id": "job-A", "progress": 75},
+      "job-A:worker-1": {
+        "job_id": "job-A",
+        "worker_addr": "worker-1",
+        "pass_nr": 1,
+        "assignment_revision_seen": 1,
+        "progress": 50,
+        "phase": "service_probes",
+        "ports_scanned": 50,
+        "ports_total": 100,
+        "open_ports_found": [],
+        "completed_tests": [],
+        "updated_at": 100.0,
+        "started_at": 90.0,
+        "first_seen_live_at": 90.0,
+        "last_seen_at": 100.0,
+      },
+      "job-A:worker-2": {
+        "job_id": "job-A",
+        "worker_addr": "worker-2",
+        "pass_nr": 1,
+        "assignment_revision_seen": 1,
+        "progress": 75,
+        "phase": "web_tests",
+        "ports_scanned": 75,
+        "ports_total": 100,
+        "open_ports_found": [],
+        "completed_tests": [],
+        "updated_at": 100.0,
+        "started_at": 90.0,
+        "first_seen_live_at": 90.0,
+        "last_seen_at": 100.0,
+      },
       "job-B:worker-3": {"job_id": "job-B", "progress": 30},
     }
     plugin.chainstore_hgetall.return_value = live_data
-    plugin.chainstore_hget.return_value = {"job_status": "RUNNING"}
+    plugin.chainstore_hget.return_value = {
+      "job_id": "job-A",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "workers": {
+        "worker-1": {"start_port": 1, "end_port": 100, "assignment_revision": 1},
+        "worker-2": {"start_port": 101, "end_port": 200, "assignment_revision": 1},
+      },
+    }
+    plugin.time.return_value = 100.0
 
     result = Plugin.get_job_progress(plugin, job_id="job-A")
     self.assertEqual(result["job_id"], "job-A")
@@ -89,6 +128,8 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertIn("worker-1", result["workers"])
     self.assertIn("worker-2", result["workers"])
     self.assertNotIn("worker-3", result["workers"])
+    self.assertEqual(result["workers"]["worker-1"]["worker_state"], "active")
+    self.assertEqual(result["workers"]["worker-2"]["worker_state"], "active")
 
   def test_get_job_progress_empty(self):
     """get_job_progress for non-existent job returns empty workers dict."""
@@ -102,6 +143,65 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(result["job_id"], "nonexistent")
     self.assertIsNone(result["status"])
     self.assertEqual(result["workers"], {})
+
+  def test_get_job_progress_marks_unseen_assigned_worker(self):
+    """Assigned workers with no matching :live record are surfaced as unseen."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.chainstore_hgetall.return_value = {}
+    plugin.chainstore_hget.return_value = {
+      "job_id": "job-A",
+      "job_status": "RUNNING",
+      "job_pass": 3,
+      "workers": {
+        "worker-1": {"start_port": 1, "end_port": 10, "assignment_revision": 2},
+      },
+    }
+    plugin.time.return_value = 100.0
+
+    result = Plugin.get_job_progress(plugin, job_id="job-A")
+
+    self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
+    self.assertEqual(result["workers"]["worker-1"]["assignment_revision"], 2)
+
+  def test_get_job_progress_ignores_live_from_old_revision(self):
+    """Mismatched live revision is ignored for the current assignment."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.chainstore_hgetall.return_value = {
+      "job-A:worker-1": {
+        "job_id": "job-A",
+        "worker_addr": "worker-1",
+        "pass_nr": 1,
+        "assignment_revision_seen": 1,
+        "progress": 60,
+        "phase": "service_probes",
+        "ports_scanned": 60,
+        "ports_total": 100,
+        "open_ports_found": [],
+        "completed_tests": [],
+        "updated_at": 100.0,
+        "started_at": 90.0,
+        "first_seen_live_at": 90.0,
+        "last_seen_at": 100.0,
+      },
+    }
+    plugin.chainstore_hget.return_value = {
+      "job_id": "job-A",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "workers": {
+        "worker-1": {"start_port": 1, "end_port": 10, "assignment_revision": 2},
+      },
+    }
+    plugin.time.return_value = 100.0
+
+    result = Plugin.get_job_progress(plugin, job_id="job-A")
+
+    self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
+    self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "revision_mismatch")
 
   def test_publish_live_progress(self):
     """_publish_live_progress writes stage-based progress to CStore :live hset."""
