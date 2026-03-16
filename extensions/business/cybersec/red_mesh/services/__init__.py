@@ -19,6 +19,7 @@ from .launch_api import (
   validation_error,
 )
 from .query import (
+  get_job_analysis,
   get_job_archive,
   get_job_data,
   get_job_progress,
@@ -61,6 +62,7 @@ __all__ = [
   "build_network_workers",
   "build_webapp_workers",
   "get_scan_strategy",
+  "get_job_analysis",
   "get_job_archive",
   "get_job_data",
   "get_job_progress",

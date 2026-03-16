@@ -2345,6 +2345,94 @@ class TestPhase5Endpoints(unittest.TestCase):
     result = Plugin.get_job_archive(plugin, job_id="fin-job")
     self.assertEqual(result["error"], "fetch_failed")
 
+  def test_get_analysis_finalized_reads_archive(self):
+    """Finalized jobs resolve stored LLM analysis from archive passes after CStore pruning."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+    plugin.r1fs.get_json.return_value = {
+      "archive_version": JOB_ARCHIVE_VERSION,
+      "job_id": "fin-job",
+      "passes": [
+        {
+          "pass_nr": 1,
+          "date_completed": 10.0,
+          "report_cid": "QmPass1",
+          "llm_analysis": "Archive-backed analysis",
+          "quick_summary": "Archive-backed summary",
+          "worker_reports": {"node-A": {}, "node-B": {}},
+        },
+      ],
+      "ui_aggregate": {},
+      "job_config": {"target": "10.0.0.1"},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
+
+    result = Plugin.get_analysis(plugin, job_id="fin-job")
+
+    self.assertEqual(result["job_id"], "fin-job")
+    self.assertEqual(result["analysis"], "Archive-backed analysis")
+    self.assertEqual(result["quick_summary"], "Archive-backed summary")
+    self.assertEqual(result["num_workers"], 2)
+    self.assertEqual(result["total_passes"], 1)
+
+  def test_get_analysis_finalized_reports_llm_failed_from_archive(self):
+    """Finalized archive reads surface llm_failed instead of pretending pass history is missing."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+    plugin.r1fs.get_json.return_value = {
+      "archive_version": JOB_ARCHIVE_VERSION,
+      "job_id": "fin-job",
+      "passes": [
+        {
+          "pass_nr": 1,
+          "date_completed": 10.0,
+          "report_cid": "QmPass1",
+          "llm_failed": True,
+          "quick_summary": None,
+          "worker_reports": {"node-A": {}},
+        },
+      ],
+      "ui_aggregate": {},
+      "job_config": {"target": "10.0.0.1"},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
+
+    result = Plugin.get_analysis(plugin, job_id="fin-job")
+
+    self.assertEqual(result["error"], "No LLM analysis available for this pass")
+    self.assertTrue(result["llm_failed"])
+    self.assertEqual(result["pass_nr"], 1)
+
+  def test_get_analysis_finalized_archive_integrity_error_bubbles_up(self):
+    """Archive integrity failures should be returned instead of falling back to pruned CStore state."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+    plugin.r1fs.get_json.return_value = {
+      "archive_version": JOB_ARCHIVE_VERSION,
+      "job_id": "other-job",
+      "passes": [],
+      "ui_aggregate": {},
+      "job_config": {},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
+
+    result = Plugin.get_analysis(plugin, job_id="fin-job")
+
+    self.assertEqual(result["error"], "integrity_mismatch")
+    self.assertEqual(result["job_id"], "fin-job")
+
   def test_get_job_archive_summary_only(self):
     """Summary mode returns bounded pass-history summaries instead of full pass payloads."""
     Plugin = self._get_plugin_class()
