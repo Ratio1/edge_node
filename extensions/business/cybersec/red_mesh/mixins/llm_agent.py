@@ -10,6 +10,7 @@ Usage:
 """
 
 import requests
+import json
 from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
@@ -120,6 +121,38 @@ class _RedMeshLlmAgentMixin(object):
 
   def _get_llm_payload_limits(self, analysis_type: str) -> dict:
     return dict(_LLM_PAYLOAD_LIMITS.get(analysis_type, _LLM_PAYLOAD_LIMITS["security_assessment"]))
+
+  def _estimate_llm_payload_size(self, payload: dict) -> int:
+    try:
+      return len(json.dumps(payload, sort_keys=True, default=str))
+    except Exception:
+      return len(str(payload))
+
+  def _record_llm_payload_stats(self, job_id: str, analysis_type: str, raw_report: dict, shaped_payload: dict):
+    truncation = shaped_payload.get("truncation", {}) if isinstance(shaped_payload, dict) else {}
+    stats = {
+      "job_id": job_id,
+      "analysis_type": analysis_type,
+      "raw_bytes": self._estimate_llm_payload_size(raw_report),
+      "shaped_bytes": self._estimate_llm_payload_size(shaped_payload),
+      "truncation": truncation,
+    }
+    reduction = stats["raw_bytes"] - stats["shaped_bytes"]
+    stats["reduction_bytes"] = reduction
+    stats["reduction_ratio"] = round((reduction / stats["raw_bytes"]), 4) if stats["raw_bytes"] else 0.0
+    self._last_llm_payload_stats = stats
+    self.Pd(
+      "LLM payload shaping stats for job {} [{}]: raw={}B shaped={}B reduction={}B ({:.1%}) truncation={}".format(
+        job_id,
+        analysis_type,
+        stats["raw_bytes"],
+        stats["shaped_bytes"],
+        reduction,
+        stats["reduction_ratio"],
+        truncation,
+      )
+    )
+    return stats
 
   @staticmethod
   def _llm_finding_key(finding: dict) -> tuple:
@@ -818,6 +851,12 @@ class _RedMeshLlmAgentMixin(object):
       job_config,
       self._get_llm_agent_config()["AUTO_ANALYSIS_TYPE"],
     )
+    self._record_llm_payload_stats(
+      job_id,
+      self._get_llm_agent_config()["AUTO_ANALYSIS_TYPE"],
+      aggregated_report,
+      report_with_meta,
+    )
 
     # Call LLM analysis
     llm_analysis = self._auto_analyze_report(job_id, report_with_meta, target, scan_type=scan_type)
@@ -875,6 +914,7 @@ class _RedMeshLlmAgentMixin(object):
       job_config,
       "quick_summary",
     )
+    self._record_llm_payload_stats(job_id, "quick_summary", aggregated_report, report_with_meta)
 
     # Call LLM analysis with quick_summary type
     analysis_result = self._call_llm_agent_api(
