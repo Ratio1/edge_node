@@ -1561,7 +1561,7 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     plugin = MagicMock()
     plugin.cfg_instance_id = "test-instance"
     plugin.ee_addr = "node-launcher"
-    plugin.cfg_llm_agent_api_enabled = False
+    plugin.cfg_llm_agent = {"ENABLED": False}
     plugin.cfg_attestation_min_seconds_between_submits = 3600
 
     # Two workers, each with a report_cid

@@ -14,6 +14,7 @@ from ..constants import (
 )
 from ..models import AggregatedScanData, PassReport, PassReportRef, WorkerReportMeta
 from ..repositories import ArtifactRepository, JobStateRepository
+from .config import get_llm_agent_config
 from .state_machine import is_intermediate_job_status, is_terminal_job_status, set_job_status
 
 
@@ -93,9 +94,10 @@ def maybe_finalize_pass(owner):
         owner.P(f"Risk score for job {job_id} pass {job_pass}: {risk_score}/100")
 
       job_config = owner._get_job_config(job_specs)
+      llm_cfg = get_llm_agent_config(owner)
       llm_text = None
       summary_text = None
-      if owner.cfg_llm_agent_api_enabled and aggregated:
+      if llm_cfg["ENABLED"] and aggregated:
         set_job_status(job_specs, JOB_STATUS_ANALYZING)
         job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_analyzing")
         llm_text = owner._run_aggregated_llm_analysis(job_id, aggregated, job_config)
@@ -108,7 +110,7 @@ def maybe_finalize_pass(owner):
         else:
           summary_text = owner._run_quick_summary_analysis(job_id, aggregated, job_config)
 
-      llm_failed = True if (owner.cfg_llm_agent_api_enabled and (llm_text is None or summary_text is None)) else None
+      llm_failed = True if (llm_cfg["ENABLED"] and (llm_text is None or summary_text is None)) else None
       if llm_failed:
         owner._emit_timeline_event(
           job_specs, "llm_failed",

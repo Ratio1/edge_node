@@ -1,7 +1,10 @@
 import unittest
 from unittest.mock import MagicMock
 
-from extensions.business.cybersec.red_mesh.services.config import resolve_config_block
+from extensions.business.cybersec.red_mesh.services.config import (
+  get_llm_agent_config,
+  resolve_config_block,
+)
 from extensions.business.cybersec.red_mesh.services.reconciliation import (
   get_distributed_job_reconciliation_config,
   reconcile_job_workers,
@@ -63,6 +66,41 @@ class TestWorkerReconciliation(unittest.TestCase):
     config["STARTUP_TIMEOUT"] = 10.0
 
     self.assertEqual(defaults["STARTUP_TIMEOUT"], 45.0)
+
+  def test_llm_agent_config_uses_defaults(self):
+    owner = MagicMock()
+    owner.cfg_llm_agent = None
+    owner.CONFIG = {}
+
+    config = get_llm_agent_config(owner)
+
+    self.assertEqual(config["ENABLED"], False)
+    self.assertEqual(config["TIMEOUT"], 120.0)
+    self.assertEqual(config["AUTO_ANALYSIS_TYPE"], "security_assessment")
+
+  def test_llm_agent_config_merges_partial_override(self):
+    owner = MagicMock()
+    owner.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 30}
+
+    config = get_llm_agent_config(owner)
+
+    self.assertEqual(config["ENABLED"], True)
+    self.assertEqual(config["TIMEOUT"], 30.0)
+    self.assertEqual(config["AUTO_ANALYSIS_TYPE"], "security_assessment")
+
+  def test_llm_agent_config_normalizes_invalid_values(self):
+    owner = MagicMock()
+    owner.cfg_llm_agent = {
+      "ENABLED": True,
+      "TIMEOUT": 0,
+      "AUTO_ANALYSIS_TYPE": "",
+    }
+
+    config = get_llm_agent_config(owner)
+
+    self.assertEqual(config["ENABLED"], True)
+    self.assertEqual(config["TIMEOUT"], 120.0)
+    self.assertEqual(config["AUTO_ANALYSIS_TYPE"], "security_assessment")
 
   def test_reconciliation_config_uses_defaults(self):
     owner = MagicMock()

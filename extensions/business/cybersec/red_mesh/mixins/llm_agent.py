@@ -13,6 +13,7 @@ import requests
 from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
+from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
 
 _NON_RETRYABLE_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 413, 422}
@@ -24,11 +25,9 @@ class _RedMeshLlmAgentMixin(object):
   Mixin providing LLM Agent API integration for RedMesh plugins.
 
   This mixin expects the host class to have the following config attributes:
-  - cfg_llm_agent_api_enabled: bool
+  - cfg_llm_agent: dict-like nested config block, or equivalent config_data/CONFIG block
   - cfg_llm_agent_api_host: str
   - cfg_llm_agent_api_port: int
-  - cfg_llm_agent_api_timeout: int
-  - cfg_llm_auto_analysis_type: str
 
   And the following methods/attributes:
   - self.r1fs: R1FS instance
@@ -41,13 +40,17 @@ class _RedMeshLlmAgentMixin(object):
     super(_RedMeshLlmAgentMixin, self).__init__(**kwargs)
     return
 
+  def _get_llm_agent_config(self) -> dict:
+    return get_llm_agent_config(self)
+
   def _maybe_resolve_llm_agent_from_semaphore(self):
     """
     If SEMAPHORED_KEYS is configured and LLM Agent is enabled,
     read API_IP and API_PORT from semaphore env published by
     the LLM Agent API plugin. Overrides static config values.
     """
-    if not self.cfg_llm_agent_api_enabled:
+    llm_cfg = self._get_llm_agent_config()
+    if not llm_cfg["ENABLED"]:
       return False
     semaphored_keys = getattr(self, 'cfg_semaphored_keys', None)
     if not semaphored_keys:
@@ -149,14 +152,15 @@ class _RedMeshLlmAgentMixin(object):
     dict
       API response or error object.
     """
-    if not self.cfg_llm_agent_api_enabled:
+    llm_cfg = self._get_llm_agent_config()
+    if not llm_cfg["ENABLED"]:
       return {"error": "LLM Agent API is not enabled", "status": "disabled"}
 
     if not self.cfg_llm_agent_api_port:
       return {"error": "LLM Agent API port not configured", "status": "config_error"}
 
     url = self._get_llm_agent_api_url(endpoint)
-    timeout = timeout or self.cfg_llm_agent_api_timeout
+    timeout = timeout or llm_cfg["TIMEOUT"]
     retries = max(int(getattr(self, "cfg_llm_api_retries", 1) or 1), 1)
 
     def _attempt():
@@ -264,7 +268,8 @@ class _RedMeshLlmAgentMixin(object):
     dict or None
       LLM analysis result or None if disabled/failed.
     """
-    if not self.cfg_llm_agent_api_enabled:
+    llm_cfg = self._get_llm_agent_config()
+    if not llm_cfg["ENABLED"]:
       self.Pd("LLM auto-analysis skipped (not enabled)")
       return None
 
@@ -275,7 +280,7 @@ class _RedMeshLlmAgentMixin(object):
       method="POST",
       payload={
         "scan_results": report,
-        "analysis_type": self.cfg_llm_auto_analysis_type,
+        "analysis_type": llm_cfg["AUTO_ANALYSIS_TYPE"],
         "scan_type": scan_type,
         "focus_areas": None,
       }
@@ -486,7 +491,8 @@ class _RedMeshLlmAgentMixin(object):
     dict
       Health status of the LLM Agent API.
     """
-    if not self.cfg_llm_agent_api_enabled:
+    llm_cfg = self._get_llm_agent_config()
+    if not llm_cfg["ENABLED"]:
       return {
         "enabled": False,
         "status": "disabled",

@@ -113,7 +113,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.cfg_graybox_auth_attempt_budget = 10
     plugin.cfg_graybox_route_discovery_budget = 100
     plugin.cfg_graybox_stateful_action_budget = 1
-    plugin.cfg_llm_agent_api_enabled = False
+    plugin.cfg_llm_agent = {"ENABLED": False}
     plugin.cfg_ics_safe_mode = False
     plugin.cfg_scan_min_rnd_delay = 0
     plugin.cfg_scan_max_rnd_delay = 0
@@ -599,11 +599,13 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin.ee_addr = "launcher-node"
     plugin.ee_id = "launcher-alias"
     plugin.cfg_instance_id = "test-instance"
-    plugin.cfg_llm_agent_api_enabled = llm_enabled
+    plugin.cfg_llm_agent = {
+      "ENABLED": llm_enabled,
+      "TIMEOUT": 30,
+      "AUTO_ANALYSIS_TYPE": "security_assessment",
+    }
     plugin.cfg_llm_agent_api_host = "localhost"
     plugin.cfg_llm_agent_api_port = 8080
-    plugin.cfg_llm_agent_api_timeout = 30
-    plugin.cfg_llm_auto_analysis_type = "security_assessment"
     plugin.cfg_monitor_interval = 60
     plugin.cfg_monitor_jitter = 0
     plugin.cfg_attestation_min_seconds_between_submits = 300
