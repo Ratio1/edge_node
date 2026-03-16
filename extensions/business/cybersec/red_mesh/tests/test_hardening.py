@@ -182,6 +182,111 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertIn("metadata", host.captured)
     self.assertNotIn("port_banners", host.captured)
 
+  def test_build_llm_analysis_payload_deduplicates_and_tracks_truncation(self):
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+
+    host = MockHost()
+    aggregated_report = {
+      "nr_open_ports": 3,
+      "ports_scanned": 200,
+      "open_ports": [22, 80, 443],
+      "service_info": {
+        "22": {
+          "port": 22,
+          "protocol": "ssh",
+          "service": "ssh",
+          "findings": [
+            {
+              "severity": "HIGH",
+              "title": "SSH weak key exchange",
+              "evidence": "Weak KEX offered: diffie-hellman-group14-sha1",
+              "port": 22,
+              "protocol": "ssh",
+            },
+            {
+              "severity": "HIGH",
+              "title": "SSH weak key exchange",
+              "evidence": "Duplicate evidence should be collapsed",
+              "port": 22,
+              "protocol": "ssh",
+            },
+          ],
+        },
+      },
+      "correlation_findings": [
+        {
+          "severity": "CRITICAL",
+          "title": f"Critical issue {idx}",
+          "evidence": "x" * 1000,
+          "port": 443,
+          "protocol": "tcp",
+        }
+        for idx in range(20)
+      ],
+      "worker_activity": [{"id": "node-a", "start_port": 1, "end_port": 5000, "open_ports": [22, 80, 443]}],
+    }
+    job_config = {"target": "10.0.0.1", "scan_type": "network", "run_mode": "SINGLEPASS", "start_port": 1, "end_port": 8000}
+
+    payload = host._build_llm_analysis_payload("job-2", aggregated_report, job_config, "security_assessment")
+
+    self.assertLessEqual(len(payload["top_findings"]), 40)
+    self.assertEqual(payload["findings_summary"]["total_findings"], 21)
+    self.assertEqual(payload["truncation"]["deduplicated_findings"], 21)
+    self.assertEqual(payload["truncation"]["included_by_severity"]["CRITICAL"], 16)
+    self.assertGreater(payload["truncation"]["truncated_findings_count"], 0)
+    self.assertTrue(all(len(finding["evidence"]) <= 220 for finding in payload["top_findings"]))
+
+  def test_quick_summary_payload_is_smaller_than_security_assessment(self):
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+
+    host = MockHost()
+    aggregated_report = {
+      "nr_open_ports": 50,
+      "ports_scanned": 1000,
+      "open_ports": list(range(1, 51)),
+      "service_info": {
+        str(port): {
+          "port": port,
+          "protocol": "tcp",
+          "service": f"svc-{port}",
+          "findings": [{
+            "severity": "HIGH" if port % 2 == 0 else "MEDIUM",
+            "title": f"Finding {port}",
+            "evidence": "e" * 400,
+            "port": port,
+            "protocol": "tcp",
+          }],
+        }
+        for port in range(1, 31)
+      },
+      "worker_activity": [{"id": "node-a", "start_port": 1, "end_port": 1000, "open_ports": list(range(1, 51))}],
+    }
+    job_config = {"target": "10.0.0.2", "scan_type": "network", "run_mode": "SINGLEPASS", "start_port": 1, "end_port": 1000}
+
+    security_payload = host._build_llm_analysis_payload("job-sec", aggregated_report, job_config, "security_assessment")
+    quick_payload = host._build_llm_analysis_payload("job-quick", aggregated_report, job_config, "quick_summary")
+
+    self.assertGreater(len(security_payload["services"]), len(quick_payload["services"]))
+    self.assertGreater(len(security_payload["top_findings"]), len(quick_payload["top_findings"]))
+    self.assertGreater(
+      len(security_payload["coverage"]["open_ports_sample"]),
+      len(quick_payload["coverage"]["open_ports_sample"]),
+    )
+    self.assertEqual(quick_payload["truncation"]["service_limit"], 12)
+    self.assertEqual(quick_payload["truncation"]["finding_limit"], 12)
+
   def test_call_llm_agent_api_retries_transient_connection_error(self):
     from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
 
