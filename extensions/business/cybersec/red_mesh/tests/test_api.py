@@ -2346,6 +2346,88 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertIn("worker-A", result["workers"])
     self.assertEqual(result["workers"]["worker-A"]["worker_state"], "active")
 
+  def test_get_job_status_does_not_report_completed_when_distributed_job_is_incomplete(self):
+    """Local completion must not hide an unfinished assigned peer."""
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    plugin.lst_completed_jobs = ["job-1"]
+    plugin.completed_jobs_reports = {
+      "job-1": {
+        "local-1": {"target": "example.com", "ports_scanned": 10},
+      },
+    }
+    plugin.scan_jobs = {}
+    plugin._get_job_status = lambda job_id: Plugin._get_job_status(plugin, job_id)
+    plugin.time.return_value = 100.0
+    plugin.chainstore_hget.return_value = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "target": "example.com",
+      "workers": {
+        "worker-A": {"start_port": 1, "end_port": 10, "finished": True, "assignment_revision": 1},
+        "worker-B": {"start_port": 11, "end_port": 20, "finished": False, "assignment_revision": 1},
+      },
+    }
+    plugin.chainstore_hgetall.side_effect = lambda hkey: (
+      {
+        "job-1:worker-A": {
+          "job_id": "job-1",
+          "worker_addr": "worker-A",
+          "pass_nr": 1,
+          "assignment_revision_seen": 1,
+          "progress": 100.0,
+          "phase": "done",
+          "ports_scanned": 10,
+          "ports_total": 10,
+          "open_ports_found": [],
+          "completed_tests": [],
+          "updated_at": 100.0,
+          "started_at": 90.0,
+          "first_seen_live_at": 90.0,
+          "last_seen_at": 100.0,
+          "finished": True,
+        },
+      } if hkey == "test-instance:live" else {"job-1": plugin.chainstore_hget.return_value}
+    )
+
+    result = Plugin.get_job_status(plugin, job_id="job-1")
+
+    self.assertEqual(result["status"], "network_tracked")
+    self.assertEqual(result["workers"]["worker-B"]["worker_state"], "unseen")
+
+  def test_get_job_data_includes_reconciled_workers(self):
+    """get_job_data includes reconciled worker state for active jobs."""
+    Plugin = self._get_plugin_class()
+    running = self._build_running_job("run-job", pass_count=2)
+    plugin = self._build_plugin({"run-job": running})
+    plugin.time.return_value = 100.0
+    plugin.chainstore_hgetall.side_effect = lambda hkey: (
+      {
+        "run-job:worker-A": {
+          "job_id": "run-job",
+          "worker_addr": "worker-A",
+          "pass_nr": running["job_pass"],
+          "assignment_revision_seen": 1,
+          "progress": 50,
+          "phase": "service_probes",
+          "ports_scanned": 50,
+          "ports_total": 100,
+          "open_ports_found": [],
+          "completed_tests": [],
+          "updated_at": 100.0,
+          "started_at": 90.0,
+          "first_seen_live_at": 90.0,
+          "last_seen_at": 100.0,
+        },
+      } if hkey == "test-instance:live" else {"run-job": running}
+    )
+
+    result = Plugin.get_job_data(plugin, job_id="run-job")
+
+    self.assertIn("workers_reconciled", result["job"])
+    self.assertEqual(result["job"]["workers_reconciled"]["worker-A"]["worker_state"], "active")
+
   def test_get_job_archive_not_found(self):
     """get_job_archive for non-existent job returns not_found."""
     Plugin = self._get_plugin_class()
