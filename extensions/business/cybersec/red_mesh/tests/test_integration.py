@@ -540,6 +540,164 @@ class TestPhase12LiveProgress(unittest.TestCase):
 
     mocked_launch.assert_not_called()
 
+  def test_maybe_reannounce_worker_assignments_retries_unseen_worker_only(self):
+    """Launcher bumps only the missing worker assignment revision."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-launcher"
+    plugin.cfg_check_jobs_each = 15
+    plugin.cfg_distributed_startup_timeout = 30
+    plugin.cfg_distributed_stale_grace = 20
+    plugin.cfg_distributed_max_reannounce_attempts = 3
+    plugin._last_worker_reconcile_check = 0
+    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin.P = MagicMock()
+    plugin._log_audit_event = MagicMock()
+    plugin.time.return_value = 100.0
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "node-launcher",
+      "launcher_alias": "rm1",
+      "target": "10.0.0.1",
+      "start_port": 1,
+      "end_port": 200,
+      "date_created": 10.0,
+      "job_config_cid": "QmConfig",
+      "workers": {
+        "worker-B": {
+          "start_port": 1,
+          "end_port": 100,
+          "assignment_revision": 1,
+          "assigned_at": 10.0,
+        },
+        "worker-C": {
+          "start_port": 101,
+          "end_port": 200,
+          "assignment_revision": 1,
+          "assigned_at": 10.0,
+        },
+      },
+      "timeline": [],
+      "pass_reports": [],
+      "job_revision": 0,
+    }
+    live_payloads = {
+      "job-1:worker-B": {
+        "job_id": "job-1",
+        "worker_addr": "worker-B",
+        "pass_nr": 1,
+        "assignment_revision_seen": 1,
+        "progress": 25.0,
+        "phase": "service_probes",
+        "ports_scanned": 25,
+        "ports_total": 100,
+        "open_ports_found": [],
+        "completed_tests": [],
+        "updated_at": 100.0,
+        "started_at": 20.0,
+        "first_seen_live_at": 20.0,
+        "last_seen_at": 100.0,
+      },
+    }
+
+    def _hgetall(*, hkey):
+      if hkey == "test-instance":
+        return {"job-1": dict(job_specs)}
+      if hkey == "test-instance:live":
+        return dict(live_payloads)
+      return {}
+
+    plugin.chainstore_hgetall.side_effect = _hgetall
+    plugin.chainstore_hget.return_value = dict(job_specs)
+
+    Plugin._maybe_reannounce_worker_assignments(plugin)
+
+    persisted = plugin.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(persisted["workers"]["worker-B"]["assignment_revision"], 1)
+    self.assertEqual(persisted["workers"]["worker-C"]["assignment_revision"], 2)
+    self.assertEqual(persisted["workers"]["worker-C"]["reannounce_count"], 1)
+    self.assertEqual(persisted["workers"]["worker-C"]["retry_reason"], "startup_timeout")
+
+  def test_maybe_reannounce_worker_assignments_retries_stale_worker(self):
+    """Launcher retries a matched worker whose live state is stale past grace."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-launcher"
+    plugin.cfg_check_jobs_each = 15
+    plugin.cfg_distributed_startup_timeout = 30
+    plugin.cfg_distributed_stale_grace = 20
+    plugin.cfg_distributed_max_reannounce_attempts = 3
+    plugin._last_worker_reconcile_check = 0
+    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin.P = MagicMock()
+    plugin._log_audit_event = MagicMock()
+    plugin.time.return_value = 100.0
+
+    job_specs = {
+      "job_id": "job-2",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "node-launcher",
+      "launcher_alias": "rm1",
+      "target": "10.0.0.2",
+      "start_port": 1,
+      "end_port": 100,
+      "date_created": 10.0,
+      "job_config_cid": "QmConfig",
+      "workers": {
+        "worker-C": {
+          "start_port": 1,
+          "end_port": 100,
+          "assignment_revision": 1,
+          "assigned_at": 10.0,
+        },
+      },
+      "timeline": [],
+      "pass_reports": [],
+      "job_revision": 0,
+    }
+    live_payloads = {
+      "job-2:worker-C": {
+        "job_id": "job-2",
+        "worker_addr": "worker-C",
+        "pass_nr": 1,
+        "assignment_revision_seen": 1,
+        "progress": 10.0,
+        "phase": "service_probes",
+        "ports_scanned": 10,
+        "ports_total": 100,
+        "open_ports_found": [],
+        "completed_tests": [],
+        "updated_at": 60.0,
+        "started_at": 20.0,
+        "first_seen_live_at": 20.0,
+        "last_seen_at": 60.0,
+      },
+    }
+
+    def _hgetall(*, hkey):
+      if hkey == "test-instance":
+        return {"job-2": dict(job_specs)}
+      if hkey == "test-instance:live":
+        return dict(live_payloads)
+      return {}
+
+    plugin.chainstore_hgetall.side_effect = _hgetall
+    plugin.chainstore_hget.return_value = dict(job_specs)
+
+    Plugin._maybe_reannounce_worker_assignments(plugin)
+
+    persisted = plugin.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(persisted["workers"]["worker-C"]["assignment_revision"], 2)
+    self.assertEqual(persisted["workers"]["worker-C"]["retry_reason"], "stale_live")
+
   def test_clear_live_progress(self):
     """_clear_live_progress deletes progress keys for all workers."""
     Plugin = self._get_plugin_class()
