@@ -32,7 +32,10 @@ def _matched_live_progress(job_id, worker_addr, pass_nr, assignment_revision, li
   payload = (live_payloads or {}).get(key)
   if not isinstance(payload, dict):
     return None, None
-  live = WorkerProgress.from_dict(payload)
+  try:
+    live = WorkerProgress.from_dict(payload)
+  except (KeyError, TypeError, ValueError):
+    return None, "malformed_live"
   if live.job_id != job_id:
     return None, "job_mismatch"
   if live.pass_nr != pass_nr:
@@ -103,6 +106,11 @@ def reconcile_job_workers(owner, job_specs, *, live_payloads=None, now=None):
       payload.update(live.to_dict())
     elif ignored_reason:
       payload["ignored_live_reason"] = ignored_reason
+      if ignored_reason == "malformed_live" and hasattr(owner, "P"):
+        owner.P(
+          f"[LIVE] Ignoring malformed live payload for job_id={job_id} worker={worker_addr}",
+          color='y',
+        )
 
     reconciled[worker_addr] = payload
   return reconciled

@@ -203,6 +203,72 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
     self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "revision_mismatch")
 
+  def test_get_job_progress_ignores_live_from_old_pass(self):
+    """Mismatched live pass is ignored for the current assignment."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.chainstore_hgetall.return_value = {
+      "job-A:worker-1": {
+        "job_id": "job-A",
+        "worker_addr": "worker-1",
+        "pass_nr": 1,
+        "assignment_revision_seen": 2,
+        "progress": 60,
+        "phase": "service_probes",
+        "ports_scanned": 60,
+        "ports_total": 100,
+        "open_ports_found": [],
+        "completed_tests": [],
+        "updated_at": 100.0,
+        "started_at": 90.0,
+        "first_seen_live_at": 90.0,
+        "last_seen_at": 100.0,
+      },
+    }
+    plugin.chainstore_hget.return_value = {
+      "job_id": "job-A",
+      "job_status": "RUNNING",
+      "job_pass": 2,
+      "workers": {
+        "worker-1": {"start_port": 1, "end_port": 10, "assignment_revision": 2},
+      },
+    }
+    plugin.time.return_value = 100.0
+
+    result = Plugin.get_job_progress(plugin, job_id="job-A")
+
+    self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
+    self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "pass_mismatch")
+
+  def test_get_job_progress_ignores_malformed_live_payload(self):
+    """Malformed live rows are ignored instead of crashing reconciliation."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.chainstore_hgetall.return_value = {
+      "job-A:worker-1": {
+        "job_id": "job-A",
+        "pass_nr": 2,
+      },
+    }
+    plugin.chainstore_hget.return_value = {
+      "job_id": "job-A",
+      "job_status": "RUNNING",
+      "job_pass": 2,
+      "workers": {
+        "worker-1": {"start_port": 1, "end_port": 10, "assignment_revision": 1},
+      },
+    }
+    plugin.time.return_value = 100.0
+    plugin.P = MagicMock()
+
+    result = Plugin.get_job_progress(plugin, job_id="job-A")
+
+    self.assertEqual(result["workers"]["worker-1"]["worker_state"], "unseen")
+    self.assertEqual(result["workers"]["worker-1"]["ignored_live_reason"], "malformed_live")
+    plugin.P.assert_called()
+
   def test_publish_live_progress(self):
     """_publish_live_progress writes stage-based progress to CStore :live hset."""
     Plugin = self._get_plugin_class()
