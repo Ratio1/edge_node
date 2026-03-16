@@ -1,7 +1,10 @@
 import unittest
 from unittest.mock import MagicMock
 
-from extensions.business.cybersec.red_mesh.services.reconciliation import reconcile_job_workers
+from extensions.business.cybersec.red_mesh.services.reconciliation import (
+  get_distributed_job_reconciliation_config,
+  reconcile_job_workers,
+)
 
 
 class TestWorkerReconciliation(unittest.TestCase):
@@ -9,8 +12,47 @@ class TestWorkerReconciliation(unittest.TestCase):
   def _make_owner(self, now=100.0, stale_timeout=30):
     owner = MagicMock()
     owner.time.return_value = now
-    owner.cfg_distributed_stale_timeout = stale_timeout
+    owner.cfg_distributed_job_reconciliation = {"STALE_TIMEOUT": stale_timeout}
     return owner
+
+  def test_reconciliation_config_uses_defaults(self):
+    owner = MagicMock()
+    owner.cfg_distributed_job_reconciliation = None
+    owner.CONFIG = {}
+
+    config = get_distributed_job_reconciliation_config(owner)
+
+    self.assertEqual(config["STARTUP_TIMEOUT"], 45.0)
+    self.assertEqual(config["STALE_TIMEOUT"], 120.0)
+    self.assertEqual(config["STALE_GRACE"], 30.0)
+    self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
+
+  def test_reconciliation_config_merges_partial_override(self):
+    owner = MagicMock()
+    owner.cfg_distributed_job_reconciliation = {"STARTUP_TIMEOUT": 20}
+
+    config = get_distributed_job_reconciliation_config(owner)
+
+    self.assertEqual(config["STARTUP_TIMEOUT"], 20.0)
+    self.assertEqual(config["STALE_TIMEOUT"], 120.0)
+    self.assertEqual(config["STALE_GRACE"], 30.0)
+    self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
+
+  def test_reconciliation_config_normalizes_invalid_values(self):
+    owner = MagicMock()
+    owner.cfg_distributed_job_reconciliation = {
+      "STARTUP_TIMEOUT": 0,
+      "STALE_TIMEOUT": -1,
+      "STALE_GRACE": -5,
+      "MAX_REANNOUNCE_ATTEMPTS": "bad",
+    }
+
+    config = get_distributed_job_reconciliation_config(owner)
+
+    self.assertEqual(config["STARTUP_TIMEOUT"], 45.0)
+    self.assertEqual(config["STALE_TIMEOUT"], 120.0)
+    self.assertEqual(config["STALE_GRACE"], 30.0)
+    self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
 
   def test_reconcile_job_workers_marks_active_worker(self):
     owner = self._make_owner()
