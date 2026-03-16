@@ -3,6 +3,7 @@ from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.services.config import (
   get_attestation_config,
+  get_graybox_budgets_config,
   get_llm_agent_config,
   resolve_config_block,
 )
@@ -141,6 +142,41 @@ class TestWorkerReconciliation(unittest.TestCase):
     self.assertEqual(config["PRIVATE_KEY"], "")
     self.assertEqual(config["MIN_SECONDS_BETWEEN_SUBMITS"], 86400.0)
     self.assertEqual(config["RETRIES"], 2)
+
+  def test_graybox_budgets_config_uses_defaults(self):
+    owner = MagicMock()
+    owner.cfg_graybox_budgets = None
+    owner.CONFIG = {}
+
+    config = get_graybox_budgets_config(owner)
+
+    self.assertEqual(config["AUTH_ATTEMPTS"], 10)
+    self.assertEqual(config["ROUTE_DISCOVERY"], 100)
+    self.assertEqual(config["STATEFUL_ACTIONS"], 1)
+
+  def test_graybox_budgets_config_merges_partial_override(self):
+    owner = MagicMock()
+    owner.cfg_graybox_budgets = {"AUTH_ATTEMPTS": 3, "STATEFUL_ACTIONS": 0}
+
+    config = get_graybox_budgets_config(owner)
+
+    self.assertEqual(config["AUTH_ATTEMPTS"], 3)
+    self.assertEqual(config["ROUTE_DISCOVERY"], 100)
+    self.assertEqual(config["STATEFUL_ACTIONS"], 0)
+
+  def test_graybox_budgets_config_normalizes_invalid_values(self):
+    owner = MagicMock()
+    owner.cfg_graybox_budgets = {
+      "AUTH_ATTEMPTS": 0,
+      "ROUTE_DISCOVERY": -1,
+      "STATEFUL_ACTIONS": "bad",
+    }
+
+    config = get_graybox_budgets_config(owner)
+
+    self.assertEqual(config["AUTH_ATTEMPTS"], 10)
+    self.assertEqual(config["ROUTE_DISCOVERY"], 100)
+    self.assertEqual(config["STATEFUL_ACTIONS"], 1)
 
   def test_reconciliation_config_uses_defaults(self):
     owner = MagicMock()

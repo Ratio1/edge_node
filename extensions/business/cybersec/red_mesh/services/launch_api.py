@@ -15,6 +15,7 @@ from ..constants import (
 )
 from ..models import CStoreJobRunning, JobConfig
 from ..repositories import JobStateRepository
+from .config import get_graybox_budgets_config
 from .secrets import persist_job_config_with_secrets
 
 
@@ -184,9 +185,10 @@ def _apply_launch_safety_policy(
     policy["warnings"] = warnings
     return max_weak_attempts, target_config_dict, allow_stateful_probes, policy
 
-  auth_budget = max(int(getattr(owner, "cfg_graybox_auth_attempt_budget", 10) or 10), 1)
-  discovery_budget = max(int(getattr(owner, "cfg_graybox_route_discovery_budget", 100) or 100), 1)
-  stateful_budget = max(int(getattr(owner, "cfg_graybox_stateful_action_budget", 1) or 0), 0)
+  graybox_budgets = get_graybox_budgets_config(owner)
+  auth_budget = graybox_budgets["AUTH_ATTEMPTS"]
+  discovery_budget = graybox_budgets["ROUTE_DISCOVERY"]
+  stateful_budget = graybox_budgets["STATEFUL_ACTIONS"]
 
   requested_attempts = max(int(max_weak_attempts or 0), 0)
   effective_attempts = min(requested_attempts, auth_budget)

@@ -110,9 +110,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.cfg_nr_local_workers = 2
     plugin.cfg_scan_target_allowlist = []
     plugin.cfg_network_concurrency_warning_threshold = 16
-    plugin.cfg_graybox_auth_attempt_budget = 10
-    plugin.cfg_graybox_route_discovery_budget = 100
-    plugin.cfg_graybox_stateful_action_budget = 1
+    plugin.cfg_graybox_budgets = {
+      "AUTH_ATTEMPTS": 10,
+      "ROUTE_DISCOVERY": 100,
+      "STATEFUL_ACTIONS": 1,
+    }
     plugin.cfg_llm_agent = {"ENABLED": False}
     plugin.cfg_ics_safe_mode = False
     plugin.cfg_scan_min_rnd_delay = 0
@@ -431,9 +433,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
   def test_launch_webapp_scan_applies_safety_policy_caps(self):
     """Graybox launch policy caps weak-auth and discovery budgets and records warnings."""
     plugin = self._build_mock_plugin(job_id="test-job-policy")
-    plugin.cfg_graybox_auth_attempt_budget = 3
-    plugin.cfg_graybox_route_discovery_budget = 20
-    plugin.cfg_graybox_stateful_action_budget = 0
+    plugin.cfg_graybox_budgets = {
+      "AUTH_ATTEMPTS": 3,
+      "ROUTE_DISCOVERY": 20,
+      "STATEFUL_ACTIONS": 0,
+    }
 
     self._launch_webapp(
       plugin,
