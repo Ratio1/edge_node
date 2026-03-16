@@ -353,7 +353,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin = self._build_mock_plugin(job_id="test-job-websecret-nokey")
     plugin.cfg_redmesh_secret_store_key = ""
     plugin.cfg_comms_host_key = ""
-    plugin.cfg_attestation_private_key = ""
+    plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 86400, "RETRIES": 2}
 
     result = self._launch_webapp(
       plugin,
@@ -608,7 +608,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin.cfg_llm_agent_api_port = 8080
     plugin.cfg_monitor_interval = 60
     plugin.cfg_monitor_jitter = 0
-    plugin.cfg_attestation_min_seconds_between_submits = 300
+    plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 300, "RETRIES": 2}
     plugin.time.return_value = 1000100.0
     plugin.json_dumps.return_value = "{}"
 
@@ -2233,7 +2233,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     plugin = self._build_plugin({})
     plugin.cfg_redmesh_secret_store_key = ""
     plugin.cfg_comms_host_key = ""
-    plugin.cfg_attestation_private_key = ""
+    plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 86400, "RETRIES": 2}
     plugin.r1fs.get_json.side_effect = [
       {
         "scan_type": "webapp",

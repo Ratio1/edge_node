@@ -1,4 +1,5 @@
 from .config import (
+  get_attestation_config,
   get_llm_agent_config,
   resolve_config_block,
 )
@@ -66,6 +67,7 @@ __all__ = [
   "TERMINAL_JOB_STATUSES",
   "can_transition_job_status",
   "coerce_scan_type",
+  "get_attestation_config",
   "get_llm_agent_config",
   "resolve_config_block",
   "announce_launch",

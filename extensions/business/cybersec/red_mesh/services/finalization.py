@@ -14,6 +14,7 @@ from ..constants import (
 )
 from ..models import AggregatedScanData, PassReport, PassReportRef, WorkerReportMeta
 from ..repositories import ArtifactRepository, JobStateRepository
+from .config import get_attestation_config
 from .config import get_llm_agent_config
 from .state_machine import is_intermediate_job_status, is_terminal_job_status, set_job_status
 
@@ -143,7 +144,7 @@ def maybe_finalize_pass(owner):
       should_submit_attestation = True
       if run_mode == RUN_MODE_CONTINUOUS_MONITORING:
         last_attestation_at = job_specs.get("last_attestation_at")
-        min_interval = owner.cfg_attestation_min_seconds_between_submits
+        min_interval = get_attestation_config(owner)["MIN_SECONDS_BETWEEN_SUBMITS"]
         if last_attestation_at is not None and now_ts - last_attestation_at < min_interval:
           elapsed = round(now_ts - last_attestation_at)
           owner.P(
