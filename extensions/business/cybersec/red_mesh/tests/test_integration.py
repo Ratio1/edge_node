@@ -613,9 +613,11 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.cfg_instance_id = "test-instance"
     plugin.ee_addr = "node-launcher"
     plugin.cfg_check_jobs_each = 15
-    plugin.cfg_distributed_startup_timeout = 30
-    plugin.cfg_distributed_stale_grace = 20
-    plugin.cfg_distributed_max_reannounce_attempts = 3
+    plugin.cfg_distributed_job_reconciliation = {
+      "STARTUP_TIMEOUT": 30,
+      "STALE_GRACE": 20,
+      "MAX_REANNOUNCE_ATTEMPTS": 3,
+    }
     plugin._last_worker_reconcile_check = 0
     plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
     plugin.P = MagicMock()
@@ -697,9 +699,12 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.cfg_instance_id = "test-instance"
     plugin.ee_addr = "node-launcher"
     plugin.cfg_check_jobs_each = 15
-    plugin.cfg_distributed_startup_timeout = 30
-    plugin.cfg_distributed_stale_grace = 20
-    plugin.cfg_distributed_max_reannounce_attempts = 3
+    plugin.cfg_distributed_job_reconciliation = {
+      "STARTUP_TIMEOUT": 30,
+      "STALE_TIMEOUT": 10,
+      "STALE_GRACE": 20,
+      "MAX_REANNOUNCE_ATTEMPTS": 3,
+    }
     plugin._last_worker_reconcile_check = 0
     plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
     plugin.P = MagicMock()
@@ -773,9 +778,11 @@ class TestPhase12LiveProgress(unittest.TestCase):
     plugin.cfg_instance_id = "test-instance"
     plugin.ee_addr = "node-launcher"
     plugin.cfg_check_jobs_each = 15
-    plugin.cfg_distributed_startup_timeout = 30
-    plugin.cfg_distributed_stale_grace = 20
-    plugin.cfg_distributed_max_reannounce_attempts = 3
+    plugin.cfg_distributed_job_reconciliation = {
+      "STARTUP_TIMEOUT": 30,
+      "STALE_GRACE": 20,
+      "MAX_REANNOUNCE_ATTEMPTS": 3,
+    }
     plugin._last_worker_reconcile_check = 0
     plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
     plugin.P = MagicMock()

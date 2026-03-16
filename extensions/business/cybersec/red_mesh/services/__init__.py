@@ -26,7 +26,10 @@ from .query import (
   list_local_jobs,
   list_network_jobs,
 )
-from .reconciliation import reconcile_job_workers
+from .reconciliation import (
+  get_distributed_job_reconciliation_config,
+  reconcile_job_workers,
+)
 from .secrets import (
   R1fsSecretStore,
   collect_secret_refs_from_job_config,
@@ -86,6 +89,7 @@ __all__ = [
   "collect_secret_refs_from_job_config",
   "resolve_active_peers",
   "resolve_enabled_features",
+  "get_distributed_job_reconciliation_config",
   "reconcile_job_workers",
   "set_job_status",
   "stop_and_delete_job",

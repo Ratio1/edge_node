@@ -1,5 +1,12 @@
 from ..models import WorkerProgress
 
+DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG = {
+  "STARTUP_TIMEOUT": 45.0,
+  "STALE_TIMEOUT": 120.0,
+  "STALE_GRACE": 30.0,
+  "MAX_REANNOUNCE_ATTEMPTS": 3,
+}
+
 
 def _safe_int(value, default):
   try:
@@ -15,16 +22,51 @@ def _safe_float(value, default=None):
     return default
 
 
-def _distributed_stale_timeout(owner):
-  timeout = getattr(owner, "cfg_distributed_stale_timeout", None)
-  if timeout is None:
+def get_distributed_job_reconciliation_config(owner):
+  """Return normalized distributed-job reconciliation config."""
+  merged = dict(DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG)
+  override = getattr(owner, "cfg_distributed_job_reconciliation", None)
+  if override is None:
     config = getattr(owner, "CONFIG", None)
     if isinstance(config, dict):
-      timeout = config.get("DISTRIBUTED_STALE_TIMEOUT")
-  timeout = _safe_float(timeout, 120.0)
-  if timeout is None or timeout <= 0:
-    return 120.0
-  return timeout
+      override = config.get("DISTRIBUTED_JOB_RECONCILIATION")
+  if isinstance(override, dict):
+    merged.update(override)
+
+  startup_timeout = _safe_float(
+    merged.get("STARTUP_TIMEOUT"),
+    DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STARTUP_TIMEOUT"],
+  )
+  if startup_timeout is None or startup_timeout <= 0:
+    startup_timeout = DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STARTUP_TIMEOUT"]
+
+  stale_timeout = _safe_float(
+    merged.get("STALE_TIMEOUT"),
+    DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STALE_TIMEOUT"],
+  )
+  if stale_timeout is None or stale_timeout <= 0:
+    stale_timeout = DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STALE_TIMEOUT"]
+
+  stale_grace = _safe_float(
+    merged.get("STALE_GRACE"),
+    DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STALE_GRACE"],
+  )
+  if stale_grace is None or stale_grace < 0:
+    stale_grace = DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STALE_GRACE"]
+
+  max_reannounce_attempts = _safe_int(
+    merged.get("MAX_REANNOUNCE_ATTEMPTS"),
+    DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["MAX_REANNOUNCE_ATTEMPTS"],
+  )
+  if max_reannounce_attempts < 0:
+    max_reannounce_attempts = DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["MAX_REANNOUNCE_ATTEMPTS"]
+
+  return {
+    "STARTUP_TIMEOUT": startup_timeout,
+    "STALE_TIMEOUT": stale_timeout,
+    "STALE_GRACE": stale_grace,
+    "MAX_REANNOUNCE_ATTEMPTS": max_reannounce_attempts,
+  }
 
 
 def _matched_live_progress(job_id, worker_addr, pass_nr, assignment_revision, live_payloads):
@@ -61,7 +103,7 @@ def reconcile_job_workers(owner, job_specs, *, live_payloads=None, now=None):
   pass_nr = _safe_int(job_specs.get("job_pass", 1), 1)
   workers = job_specs.get("workers") or {}
   live_payloads = live_payloads or {}
-  stale_timeout = _distributed_stale_timeout(owner)
+  stale_timeout = get_distributed_job_reconciliation_config(owner)["STALE_TIMEOUT"]
   if now is None:
     time_fn = getattr(owner, "time", None)
     if callable(time_fn):
