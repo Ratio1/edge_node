@@ -138,6 +138,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(progress_data["job_id"], "job-1")
     self.assertEqual(progress_data["worker_addr"], "node-A")
     self.assertEqual(progress_data["pass_nr"], 3)
+    self.assertEqual(progress_data["assignment_revision_seen"], 1)
     self.assertEqual(progress_data["phase"], "service_probes")
     self.assertEqual(progress_data["scan_type"], "network")
     self.assertEqual(progress_data["phase_index"], 3)
@@ -146,6 +147,10 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(progress_data["ports_total"], 512)
     self.assertIn(22, progress_data["open_ports_found"])
     self.assertIn(80, progress_data["open_ports_found"])
+    self.assertEqual(progress_data["started_at"], 100.0)
+    self.assertEqual(progress_data["first_seen_live_at"], 100.0)
+    self.assertEqual(progress_data["last_seen_at"], 100.0)
+    self.assertFalse(progress_data["finished"])
     # Stage-based progress: service_probes = stage 3 (idx 2), so 2/5*100 = 40%
     self.assertEqual(progress_data["progress"], 40.0)
     # Single thread — no threads field
@@ -321,6 +326,119 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(progress_data["phase"], "graybox_probes")
     self.assertEqual(progress_data["phase_index"], 4)
     self.assertEqual(progress_data["total_phases"], 5)
+
+  def test_maybe_launch_jobs_publishes_worker_startup_live_progress(self):
+    """Assigned worker launch writes an immediate startup record to :live."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.cfg_check_jobs_each = 15
+    plugin.ee_addr = "node-A"
+    plugin.scan_jobs = {}
+    plugin.completed_jobs_reports = {}
+    plugin.lst_completed_jobs = []
+    plugin._active_execution_identities = {}
+    plugin._execution_live_meta = {}
+    plugin._foreign_jobs_logged = set()
+    plugin._PentesterApi01Plugin__last_checked_jobs = 0
+    plugin.time.side_effect = [100.0, 100.0, 100.0]
+    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._get_job_config.return_value = {"scan_type": "network"}
+    plugin.P = MagicMock()
+    plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
+    plugin._remember_execution_identity = lambda job_id, identity, started_at: Plugin._remember_execution_identity(
+      plugin, job_id, identity, started_at
+    )
+    plugin._publish_worker_startup_progress = lambda job_id, job_specs, local_jobs, assignment_revision, started_at: (
+      Plugin._publish_worker_startup_progress(
+        plugin,
+        job_id,
+        job_specs,
+        local_jobs,
+        assignment_revision,
+        started_at,
+      )
+    )
+
+    job_specs = {
+      "job_id": "job-1",
+      "target": "10.0.0.1",
+      "job_pass": 2,
+      "launcher": "node-launcher",
+      "launcher_alias": "rm1",
+      "workers": {
+        "node-A": {
+          "start_port": 1,
+          "end_port": 100,
+          "assignment_revision": 2,
+        },
+      },
+    }
+    plugin.chainstore_hgetall.return_value = {"job-1": job_specs}
+
+    worker = MagicMock()
+    worker.state = {"scan_type": "network"}
+    worker.initial_ports = list(range(1, 101))
+    local_jobs = {"local-1": worker}
+
+    with patch("extensions.business.cybersec.red_mesh.pentester_api_01.launch_local_jobs", return_value=local_jobs):
+      Plugin._maybe_launch_jobs(plugin)
+
+    self.assertEqual(plugin.scan_jobs["job-1"], local_jobs)
+    startup_progress = plugin.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(startup_progress["job_id"], "job-1")
+    self.assertEqual(startup_progress["pass_nr"], 2)
+    self.assertEqual(startup_progress["assignment_revision_seen"], 2)
+    self.assertEqual(startup_progress["phase"], "port_scan")
+    self.assertEqual(startup_progress["started_at"], 100.0)
+    self.assertEqual(plugin._active_execution_identities["job-1"], ("job-1", 2, "node-A", 2))
+
+  def test_maybe_launch_jobs_skips_duplicate_execution_identity(self):
+    """A repeated announce of the same execution identity does not relaunch."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.cfg_check_jobs_each = 15
+    plugin.ee_addr = "node-A"
+    plugin.scan_jobs = {"job-1": {"local-1": MagicMock()}}
+    plugin.completed_jobs_reports = {}
+    plugin.lst_completed_jobs = []
+    plugin._active_execution_identities = {"job-1": ("job-1", 2, "node-A", 2)}
+    plugin._execution_live_meta = {
+      "job-1": {
+        "pass_nr": 2,
+        "assignment_revision_seen": 2,
+        "started_at": 95.0,
+        "first_seen_live_at": 95.0,
+      },
+    }
+    plugin._foreign_jobs_logged = set()
+    plugin._PentesterApi01Plugin__last_checked_jobs = 0
+    plugin.time.return_value = 100.0
+    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin.P = MagicMock()
+    plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
+
+    job_specs = {
+      "job_id": "job-1",
+      "target": "10.0.0.1",
+      "job_pass": 2,
+      "launcher": "node-launcher",
+      "launcher_alias": "rm1",
+      "workers": {
+        "node-A": {
+          "start_port": 1,
+          "end_port": 100,
+          "assignment_revision": 2,
+        },
+      },
+    }
+    plugin.chainstore_hgetall.return_value = {"job-1": job_specs}
+
+    with patch("extensions.business.cybersec.red_mesh.pentester_api_01.launch_local_jobs") as mocked_launch:
+      Plugin._maybe_launch_jobs(plugin)
+
+    mocked_launch.assert_not_called()
 
   def test_clear_live_progress(self):
     """_clear_live_progress deletes progress keys for all workers."""

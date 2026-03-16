@@ -47,6 +47,15 @@ def _thread_phase(state):
 class _LiveProgressMixin:
   """Live progress tracking methods for PentesterApi01Plugin."""
 
+  def _get_execution_live_meta(self, job_id):
+    """Return cached worker-owned live metadata for an active local execution."""
+    meta_map = getattr(self, "_execution_live_meta", None)
+    if isinstance(meta_map, dict):
+      meta = meta_map.get(job_id)
+      if isinstance(meta, dict):
+        return dict(meta)
+    return {}
+
   def _get_progress_publish_interval(self):
     """Return a safe numeric live-progress publish interval in seconds."""
     interval = getattr(self, "_progress_publish_interval", None)
@@ -256,8 +265,20 @@ class _LiveProgressMixin:
       # Look up pass number from CStore
       job_specs = self.chainstore_hget(hkey=self.cfg_instance_id, key=job_id)
       pass_nr = 1
+      assignment_revision = 1
       if isinstance(job_specs, dict):
         pass_nr = job_specs.get("job_pass", 1)
+        worker_entry = (job_specs.get("workers") or {}).get(ee_addr) or {}
+        try:
+          assignment_revision = int(worker_entry.get("assignment_revision", 1) or 1)
+        except (TypeError, ValueError):
+          assignment_revision = 1
+
+      live_meta = _LiveProgressMixin._get_execution_live_meta(self, job_id)
+      started_at = live_meta.get("started_at", now)
+      first_seen_live_at = live_meta.get("first_seen_live_at", started_at)
+      last_seen_at = now
+      assignment_revision_seen = live_meta.get("assignment_revision_seen", assignment_revision)
 
       # Merge metrics from all local threads
       merged_metrics = worker_metrics[0] if len(worker_metrics) == 1 else self._merge_worker_metrics(worker_metrics)
@@ -266,6 +287,7 @@ class _LiveProgressMixin:
         job_id=job_id,
         worker_addr=ee_addr,
         pass_nr=pass_nr,
+        assignment_revision_seen=assignment_revision_seen,
         progress=progress_pct,
         phase=phase,
         scan_type=scan_type,
@@ -276,6 +298,10 @@ class _LiveProgressMixin:
         open_ports_found=sorted(all_open),
         completed_tests=sorted(all_tests),
         updated_at=now,
+        started_at=started_at,
+        first_seen_live_at=first_seen_live_at,
+        last_seen_at=last_seen_at,
+        finished=False,
         live_metrics=merged_metrics,
         threads=thread_entries if len(thread_entries) > 1 else None,
       )
@@ -287,6 +313,7 @@ class _LiveProgressMixin:
       self.P(
         "[LIVE->CSTORE] Published worker progress "
         f"job_id={job_id} worker={ee_addr} pass={pass_nr} "
+        f"rev={assignment_revision_seen} "
         f"phase={phase} progress={progress_pct}% "
         f"ports={total_scanned}/{total_ports} open={len(all_open)} "
         f"key={job_id}:{ee_addr}"
