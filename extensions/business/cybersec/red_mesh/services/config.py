@@ -37,6 +37,12 @@ DEFAULT_ATTESTATION_CONFIG = {
   "RETRIES": 2,
 }
 
+DEFAULT_GRAYBOX_BUDGETS_CONFIG = {
+  "AUTH_ATTEMPTS": 10,
+  "ROUTE_DISCOVERY": 100,
+  "STATEFUL_ACTIONS": 1,
+}
+
 
 def get_llm_agent_config(owner):
   """Return normalized LLM agent integration config."""
@@ -101,5 +107,31 @@ def get_attestation_config(owner):
     owner,
     "ATTESTATION",
     DEFAULT_ATTESTATION_CONFIG,
+    normalizer=_normalize,
+  )
+
+
+def get_graybox_budgets_config(owner):
+  """Return normalized graybox execution budgets."""
+  def _normalize(merged, defaults):
+    def _bounded_int(key, minimum, default):
+      try:
+        value = int(merged.get(key, default))
+      except (TypeError, ValueError):
+        value = default
+      if value < minimum:
+        return default
+      return value
+
+    return {
+      "AUTH_ATTEMPTS": _bounded_int("AUTH_ATTEMPTS", 1, defaults["AUTH_ATTEMPTS"]),
+      "ROUTE_DISCOVERY": _bounded_int("ROUTE_DISCOVERY", 1, defaults["ROUTE_DISCOVERY"]),
+      "STATEFUL_ACTIONS": _bounded_int("STATEFUL_ACTIONS", 0, defaults["STATEFUL_ACTIONS"]),
+    }
+
+  return resolve_config_block(
+    owner,
+    "GRAYBOX_BUDGETS",
+    DEFAULT_GRAYBOX_BUDGETS_CONFIG,
     normalizer=_normalize,
   )
