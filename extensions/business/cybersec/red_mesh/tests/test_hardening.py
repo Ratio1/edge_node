@@ -181,6 +181,9 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertIsNotNone(host.captured)
     self.assertIn("metadata", host.captured)
     self.assertNotIn("port_banners", host.captured)
+    self.assertEqual(host._last_llm_payload_stats["analysis_type"], "security_assessment")
+    self.assertGreater(host._last_llm_payload_stats["raw_bytes"], host._last_llm_payload_stats["shaped_bytes"])
+    self.assertGreater(host._last_llm_payload_stats["reduction_bytes"], 0)
 
   def test_build_llm_analysis_payload_deduplicates_and_tracks_truncation(self):
     from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
@@ -286,6 +289,29 @@ class TestLlmRetryHardening(unittest.TestCase):
     )
     self.assertEqual(quick_payload["truncation"]["service_limit"], 12)
     self.assertEqual(quick_payload["truncation"]["finding_limit"], 12)
+
+  def test_record_llm_payload_stats_tracks_size_reduction(self):
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+
+      def Pd(self, *_args, **_kwargs):
+        return None
+
+    host = MockHost()
+    raw_report = {"service_info": {"80": {"banner": "x" * 3000}}, "port_banners": {"80": "y" * 4000}}
+    shaped = {"metadata": {"job_id": "job-obs"}, "truncation": {"finding_limit": 12}}
+
+    stats = host._record_llm_payload_stats("job-obs", "quick_summary", raw_report, shaped)
+
+    self.assertEqual(stats["analysis_type"], "quick_summary")
+    self.assertGreater(stats["raw_bytes"], stats["shaped_bytes"])
+    self.assertGreater(stats["reduction_ratio"], 0)
+    self.assertEqual(host._last_llm_payload_stats["job_id"], "job-obs")
 
   def test_extract_report_findings_includes_graybox_results(self):
     from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
