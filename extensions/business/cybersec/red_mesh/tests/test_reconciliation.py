@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import MagicMock
 
+from extensions.business.cybersec.red_mesh.services.config import resolve_config_block
 from extensions.business.cybersec.red_mesh.services.reconciliation import (
   get_distributed_job_reconciliation_config,
   reconcile_job_workers,
@@ -14,6 +15,54 @@ class TestWorkerReconciliation(unittest.TestCase):
     owner.time.return_value = now
     owner.cfg_distributed_job_reconciliation = {"STALE_TIMEOUT": stale_timeout}
     return owner
+
+  def test_resolve_config_block_uses_defaults(self):
+    owner = MagicMock()
+    owner.cfg_distributed_job_reconciliation = None
+    owner.CONFIG = {}
+
+    config = resolve_config_block(
+      owner,
+      "DISTRIBUTED_JOB_RECONCILIATION",
+      {"STARTUP_TIMEOUT": 45.0, "STALE_TIMEOUT": 120.0},
+    )
+
+    self.assertEqual(config, {"STARTUP_TIMEOUT": 45.0, "STALE_TIMEOUT": 120.0})
+
+  def test_resolve_config_block_merges_partial_override(self):
+    owner = MagicMock()
+    owner.cfg_distributed_job_reconciliation = {"STARTUP_TIMEOUT": 20}
+
+    config = resolve_config_block(
+      owner,
+      "DISTRIBUTED_JOB_RECONCILIATION",
+      {"STARTUP_TIMEOUT": 45.0, "STALE_TIMEOUT": 120.0},
+    )
+
+    self.assertEqual(config, {"STARTUP_TIMEOUT": 20, "STALE_TIMEOUT": 120.0})
+
+  def test_resolve_config_block_ignores_non_dict_override(self):
+    owner = MagicMock()
+    owner.cfg_distributed_job_reconciliation = "bad"
+    owner.CONFIG = {"DISTRIBUTED_JOB_RECONCILIATION": {"STARTUP_TIMEOUT": 25}}
+
+    config = resolve_config_block(
+      owner,
+      "DISTRIBUTED_JOB_RECONCILIATION",
+      {"STARTUP_TIMEOUT": 45.0, "STALE_TIMEOUT": 120.0},
+    )
+
+    self.assertEqual(config, {"STARTUP_TIMEOUT": 45.0, "STALE_TIMEOUT": 120.0})
+
+  def test_resolve_config_block_returns_copy(self):
+    owner = MagicMock()
+    owner.cfg_distributed_job_reconciliation = None
+    defaults = {"STARTUP_TIMEOUT": 45.0}
+
+    config = resolve_config_block(owner, "DISTRIBUTED_JOB_RECONCILIATION", defaults)
+    config["STARTUP_TIMEOUT"] = 10.0
+
+    self.assertEqual(defaults["STARTUP_TIMEOUT"], 45.0)
 
   def test_reconciliation_config_uses_defaults(self):
     owner = MagicMock()

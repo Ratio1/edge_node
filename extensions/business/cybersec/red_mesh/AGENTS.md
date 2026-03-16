@@ -1,6 +1,6 @@
 # RedMesh Backend Agent Memory
 
-Last updated: 2026-03-16T00:00:00Z
+Last updated: 2026-03-16T17:05:00Z
 
 ## Purpose
 
@@ -134,6 +134,7 @@ High-level responsibilities:
 - Shared job blobs are vulnerable to lost-update races if multiple nodes write unrelated fields concurrently.
 - Worker-owned runtime state should prefer isolated records over concurrent writes into the same job document.
 - Launcher-side reconciliation is safer than trusting many workers to merge shared orchestration state correctly.
+- Nested config blocks should resolve through one shared shallow merge helper, with validation kept in subsystem-specific wrappers.
 
 ## Testing and Verification
 
@@ -293,3 +294,8 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Change: identified a distributed-job orchestration gap where an assigned worker can miss the initial CStore job announcement and the launcher can wait indefinitely.
 - Change: added a companion implementation tracker for distributed job reconciliation in the shared RedMesh project docs.
 - Horizontal insight: current launcher/worker orchestration is strong enough to distribute work, but not yet strong enough to guarantee convergence when a peer misses assignment visibility; future agents should treat worker-owned runtime state and launcher-side reconciliation as the preferred fix direction.
+
+### 2026-03-16T17:05:00Z
+
+- Change: extracted a generic nested-config resolver in [`services/config.py`](./services/config.py) and moved distributed job reconciliation config onto that shared path.
+- Horizontal insight: RedMesh should centralize nested config block merge semantics, but keep validation local to each subsystem wrapper rather than introducing a broad deep-merge config framework prematurely.

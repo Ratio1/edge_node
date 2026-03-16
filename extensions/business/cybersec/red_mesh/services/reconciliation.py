@@ -1,4 +1,5 @@
 from ..models import WorkerProgress
+from .config import resolve_config_block
 
 DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG = {
   "STARTUP_TIMEOUT": 45.0,
@@ -24,49 +25,48 @@ def _safe_float(value, default=None):
 
 def get_distributed_job_reconciliation_config(owner):
   """Return normalized distributed-job reconciliation config."""
-  merged = dict(DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG)
-  override = getattr(owner, "cfg_distributed_job_reconciliation", None)
-  if override is None:
-    config = getattr(owner, "CONFIG", None)
-    if isinstance(config, dict):
-      override = config.get("DISTRIBUTED_JOB_RECONCILIATION")
-  if isinstance(override, dict):
-    merged.update(override)
+  def _normalize(merged, defaults):
+    startup_timeout = _safe_float(
+      merged.get("STARTUP_TIMEOUT"),
+      defaults["STARTUP_TIMEOUT"],
+    )
+    if startup_timeout is None or startup_timeout <= 0:
+      startup_timeout = defaults["STARTUP_TIMEOUT"]
 
-  startup_timeout = _safe_float(
-    merged.get("STARTUP_TIMEOUT"),
-    DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STARTUP_TIMEOUT"],
+    stale_timeout = _safe_float(
+      merged.get("STALE_TIMEOUT"),
+      defaults["STALE_TIMEOUT"],
+    )
+    if stale_timeout is None or stale_timeout <= 0:
+      stale_timeout = defaults["STALE_TIMEOUT"]
+
+    stale_grace = _safe_float(
+      merged.get("STALE_GRACE"),
+      defaults["STALE_GRACE"],
+    )
+    if stale_grace is None or stale_grace < 0:
+      stale_grace = defaults["STALE_GRACE"]
+
+    max_reannounce_attempts = _safe_int(
+      merged.get("MAX_REANNOUNCE_ATTEMPTS"),
+      defaults["MAX_REANNOUNCE_ATTEMPTS"],
+    )
+    if max_reannounce_attempts < 0:
+      max_reannounce_attempts = defaults["MAX_REANNOUNCE_ATTEMPTS"]
+
+    return {
+      "STARTUP_TIMEOUT": startup_timeout,
+      "STALE_TIMEOUT": stale_timeout,
+      "STALE_GRACE": stale_grace,
+      "MAX_REANNOUNCE_ATTEMPTS": max_reannounce_attempts,
+    }
+
+  return resolve_config_block(
+    owner,
+    "DISTRIBUTED_JOB_RECONCILIATION",
+    DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG,
+    normalizer=_normalize,
   )
-  if startup_timeout is None or startup_timeout <= 0:
-    startup_timeout = DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STARTUP_TIMEOUT"]
-
-  stale_timeout = _safe_float(
-    merged.get("STALE_TIMEOUT"),
-    DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STALE_TIMEOUT"],
-  )
-  if stale_timeout is None or stale_timeout <= 0:
-    stale_timeout = DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STALE_TIMEOUT"]
-
-  stale_grace = _safe_float(
-    merged.get("STALE_GRACE"),
-    DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STALE_GRACE"],
-  )
-  if stale_grace is None or stale_grace < 0:
-    stale_grace = DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["STALE_GRACE"]
-
-  max_reannounce_attempts = _safe_int(
-    merged.get("MAX_REANNOUNCE_ATTEMPTS"),
-    DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["MAX_REANNOUNCE_ATTEMPTS"],
-  )
-  if max_reannounce_attempts < 0:
-    max_reannounce_attempts = DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG["MAX_REANNOUNCE_ATTEMPTS"]
-
-  return {
-    "STARTUP_TIMEOUT": startup_timeout,
-    "STALE_TIMEOUT": stale_timeout,
-    "STALE_GRACE": stale_grace,
-    "MAX_REANNOUNCE_ATTEMPTS": max_reannounce_attempts,
-  }
 
 
 def _matched_live_progress(job_id, worker_addr, pass_nr, assignment_revision, live_payloads):
