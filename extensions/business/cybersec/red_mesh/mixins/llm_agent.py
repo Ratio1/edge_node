@@ -20,8 +20,19 @@ _NON_RETRYABLE_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 413, 422}
 _NON_RETRYABLE_PROVIDER_STATUSES = _NON_RETRYABLE_HTTP_STATUSES
 _LLM_EVIDENCE_MAX_CHARS = 240
 _LLM_BANNER_MAX_CHARS = 120
-_LLM_SERVICE_LIMIT = 40
-_LLM_TOP_FINDINGS_LIMIT = 80
+_LLM_PAYLOAD_LIMITS = {
+  "security_assessment": {"services": 25, "findings": 40, "evidence_chars": 220, "open_ports": 40},
+  "quick_summary": {"services": 12, "findings": 12, "evidence_chars": 140, "open_ports": 20},
+  "vulnerability_summary": {"services": 20, "findings": 30, "evidence_chars": 180, "open_ports": 30},
+  "remediation_plan": {"services": 18, "findings": 24, "evidence_chars": 180, "open_ports": 30},
+}
+_LLM_FINDING_BUCKETS = {
+  "security_assessment": {"CRITICAL": 16, "HIGH": 14, "MEDIUM": 8, "LOW": 2, "INFO": 0, "UNKNOWN": 0},
+  "quick_summary": {"CRITICAL": 6, "HIGH": 4, "MEDIUM": 2, "LOW": 0, "INFO": 0, "UNKNOWN": 0},
+  "vulnerability_summary": {"CRITICAL": 12, "HIGH": 10, "MEDIUM": 6, "LOW": 2, "INFO": 0, "UNKNOWN": 0},
+  "remediation_plan": {"CRITICAL": 10, "HIGH": 8, "MEDIUM": 4, "LOW": 2, "INFO": 0, "UNKNOWN": 0},
+}
+_LLM_SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3, "INFO": 4, "UNKNOWN": 5}
 
 
 class _RedMeshLlmAgentMixin(object):
@@ -89,6 +100,49 @@ class _RedMeshLlmAgentMixin(object):
 
     return findings
 
+  def _get_llm_payload_limits(self, analysis_type: str) -> dict:
+    return dict(_LLM_PAYLOAD_LIMITS.get(analysis_type, _LLM_PAYLOAD_LIMITS["security_assessment"]))
+
+  @staticmethod
+  def _llm_finding_key(finding: dict) -> tuple:
+    return (
+      str(finding.get("severity") or "").upper(),
+      str(finding.get("title") or "").strip().lower(),
+      finding.get("port"),
+      str(finding.get("protocol") or "").strip().lower(),
+    )
+
+  def _deduplicate_findings(self, findings: list[dict]) -> list[dict]:
+    deduped = []
+    seen = set()
+    for finding in findings:
+      if not isinstance(finding, dict):
+        continue
+      key = self._llm_finding_key(finding)
+      if key in seen:
+        continue
+      seen.add(key)
+      deduped.append(finding)
+    return deduped
+
+  def _rank_findings(self, findings: list[dict]) -> list[dict]:
+    def _finding_sort_key(finding):
+      severity = str(finding.get("severity") or "UNKNOWN").upper()
+      cve = 0 if (finding.get("cve_id") or finding.get("cve") or "CVE-" in str(finding.get("title") or "").upper()) else 1
+      port = finding.get("port")
+      try:
+        port = int(port)
+      except (TypeError, ValueError):
+        port = 0
+      return (
+        _LLM_SEVERITY_ORDER.get(severity, _LLM_SEVERITY_ORDER["UNKNOWN"]),
+        cve,
+        -port,
+        str(finding.get("title") or ""),
+      )
+
+    return sorted(findings, key=_finding_sort_key)
+
   def _build_llm_metadata(self, job_id: str, target: str, scan_type: str, job_config: dict) -> dict:
     metadata = {
       "job_id": job_id,
@@ -106,11 +160,14 @@ class _RedMeshLlmAgentMixin(object):
       metadata["enabled_features_count"] = len(job_config.get("enabled_features", []) or [])
     return metadata
 
-  def _build_network_service_summary(self, aggregated_report: dict) -> list[dict]:
+  def _build_network_service_summary(self, aggregated_report: dict, analysis_type: str) -> tuple[list[dict], dict]:
     services = []
     service_info = aggregated_report.get("service_info")
     if not isinstance(service_info, dict):
-      return services
+      return services, {"included_services": 0, "total_services": 0}
+
+    limits = self._get_llm_payload_limits(analysis_type)
+    total_services = len(service_info)
 
     for raw_port, raw_entry in sorted(service_info.items(), key=lambda item: int(item[0]) if str(item[0]).isdigit() else str(item[0])):
       if not isinstance(raw_entry, dict):
@@ -131,16 +188,27 @@ class _RedMeshLlmAgentMixin(object):
           if isinstance(finding, dict) and finding.get("title")
         ]
       services.append(entry)
-      if len(services) >= _LLM_SERVICE_LIMIT:
+      if len(services) >= limits["services"]:
         break
-    return services
+    return services, {"included_services": len(services), "total_services": total_services}
 
-  def _build_llm_top_findings(self, aggregated_report: dict) -> list[dict]:
+  def _build_llm_top_findings(self, aggregated_report: dict, analysis_type: str) -> tuple[list[dict], dict]:
     findings = self._extract_report_findings(aggregated_report)
+    total_findings = len(findings)
+    deduped = self._deduplicate_findings(findings)
+    ranked = self._rank_findings(deduped)
+    limits = self._get_llm_payload_limits(analysis_type)
+    bucket_limits = _LLM_FINDING_BUCKETS.get(analysis_type, _LLM_FINDING_BUCKETS["security_assessment"])
+    included_by_severity = {}
     compact = []
-    for finding in findings[:_LLM_TOP_FINDINGS_LIMIT]:
+    for finding in ranked:
+      severity = str(finding.get("severity") or "UNKNOWN").upper()
+      allowed = bucket_limits.get(severity, 0)
+      current = included_by_severity.get(severity, 0)
+      if current >= allowed:
+        continue
       compact.append({
-        "severity": finding.get("severity"),
+        "severity": severity,
         "title": self._llm_trim_text(finding.get("title", ""), 160),
         "port": finding.get("port"),
         "protocol": finding.get("protocol"),
@@ -148,12 +216,21 @@ class _RedMeshLlmAgentMixin(object):
         "cve": finding.get("cve_id") or finding.get("cve"),
         "cwe": finding.get("cwe_id"),
         "owasp": finding.get("owasp_id"),
-        "evidence": self._llm_trim_text(finding.get("evidence", ""), _LLM_EVIDENCE_MAX_CHARS),
+        "evidence": self._llm_trim_text(finding.get("evidence", ""), limits["evidence_chars"]),
       })
-    return compact
+      included_by_severity[severity] = current + 1
+      if len(compact) >= limits["findings"]:
+        break
+    return compact, {
+      "total_findings": total_findings,
+      "deduplicated_findings": len(deduped),
+      "included_findings": len(compact),
+      "included_by_severity": included_by_severity,
+      "truncated_findings_count": max(len(deduped) - len(compact), 0),
+    }
 
   def _build_llm_findings_summary(self, aggregated_report: dict) -> dict:
-    findings = self._extract_report_findings(aggregated_report)
+    findings = self._deduplicate_findings(self._extract_report_findings(aggregated_report))
     counts = {}
     for finding in findings:
       severity = str(finding.get("severity") or "UNKNOWN").upper()
@@ -163,13 +240,14 @@ class _RedMeshLlmAgentMixin(object):
       "by_severity": counts,
     }
 
-  def _build_llm_coverage_summary(self, aggregated_report: dict) -> dict:
+  def _build_llm_coverage_summary(self, aggregated_report: dict, analysis_type: str) -> dict:
     open_ports = aggregated_report.get("open_ports") or []
     worker_activity = aggregated_report.get("worker_activity") or []
+    limits = self._get_llm_payload_limits(analysis_type)
     return {
       "ports_scanned": aggregated_report.get("ports_scanned"),
       "open_ports_count": len(open_ports),
-      "open_ports_sample": list(open_ports[:40]),
+      "open_ports_sample": list(open_ports[:limits["open_ports"]]),
       "workers": [
         {
           "id": worker.get("id"),
@@ -182,10 +260,31 @@ class _RedMeshLlmAgentMixin(object):
       ],
     }
 
+  def _build_attack_surface_summary(self, services: list[dict], findings_summary: dict) -> dict:
+    exposed = []
+    for service in services[:10]:
+      exposed.append({
+        "port": service.get("port"),
+        "protocol": service.get("protocol"),
+        "service": service.get("service"),
+        "product": service.get("product"),
+        "finding_count": service.get("finding_count", 0),
+      })
+    return {
+      "exposed_services": exposed,
+      "critical_or_high_findings": (
+        findings_summary.get("by_severity", {}).get("CRITICAL", 0) +
+        findings_summary.get("by_severity", {}).get("HIGH", 0)
+      ),
+    }
+
   def _build_llm_analysis_payload(self, job_id: str, aggregated_report: dict, job_config: dict, analysis_type: str) -> dict:
     scan_type = job_config.get("scan_type", "network")
     target = job_config.get("target_url") if scan_type == "webapp" else job_config.get("target", "unknown")
     if scan_type != "webapp":
+      services, service_meta = self._build_network_service_summary(aggregated_report, analysis_type)
+      top_findings, finding_meta = self._build_llm_top_findings(aggregated_report, analysis_type)
+      findings_summary = self._build_llm_findings_summary(aggregated_report)
       return {
         "metadata": self._build_llm_metadata(job_id, target, scan_type, job_config),
         "stats": {
@@ -194,14 +293,17 @@ class _RedMeshLlmAgentMixin(object):
           "scan_metrics": aggregated_report.get("scan_metrics"),
           "analysis_type": analysis_type,
         },
-        "services": self._build_network_service_summary(aggregated_report),
-        "top_findings": self._build_llm_top_findings(aggregated_report),
-        "coverage": self._build_llm_coverage_summary(aggregated_report),
+        "services": services,
+        "top_findings": top_findings,
+        "coverage": self._build_llm_coverage_summary(aggregated_report, analysis_type),
+        "attack_surface": self._build_attack_surface_summary(services, findings_summary),
         "truncation": {
-          "service_limit": _LLM_SERVICE_LIMIT,
-          "finding_limit": _LLM_TOP_FINDINGS_LIMIT,
+          "service_limit": self._get_llm_payload_limits(analysis_type)["services"],
+          "finding_limit": self._get_llm_payload_limits(analysis_type)["findings"],
+          **service_meta,
+          **finding_meta,
         },
-        "findings_summary": self._build_llm_findings_summary(aggregated_report),
+        "findings_summary": findings_summary,
       }
 
     report_with_meta = {k: v for k, v in aggregated_report.items() if k != "node_ip"}
