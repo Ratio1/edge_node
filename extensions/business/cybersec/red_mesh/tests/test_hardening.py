@@ -91,6 +91,97 @@ class TestAttestationHelpers(unittest.TestCase):
 
 class TestLlmRetryHardening(unittest.TestCase):
 
+  def test_build_llm_analysis_payload_network_is_compact_and_structured(self):
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+
+    host = MockHost()
+    aggregated_report = {
+      "nr_open_ports": 2,
+      "ports_scanned": 100,
+      "open_ports": [22, 443],
+      "scan_metrics": {"total_duration": 45.0},
+      "service_info": {
+        "22": {
+          "port": 22,
+          "protocol": "ssh",
+          "service": "ssh",
+          "product": "OpenSSH",
+          "version": "9.6",
+          "banner": "SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.15",
+          "findings": [{
+            "severity": "HIGH",
+            "title": "SSH weak key exchange",
+            "evidence": "Weak KEX offered: diffie-hellman-group14-sha1",
+            "port": 22,
+            "protocol": "ssh",
+          }],
+        },
+      },
+      "correlation_findings": [{
+        "severity": "CRITICAL",
+        "title": "Redis unauthenticated access",
+        "evidence": "Response: +PONG",
+        "port": 6379,
+        "protocol": "redis",
+      }],
+      "port_banners": {"22": "x" * 5000},
+      "worker_activity": [{"id": "node-a", "start_port": 1, "end_port": 5000, "open_ports": [22, 443]}],
+    }
+    job_config = {"target": "10.0.0.1", "scan_type": "network", "run_mode": "SINGLEPASS", "start_port": 1, "end_port": 8000}
+
+    payload = host._build_llm_analysis_payload("job-1", aggregated_report, job_config, "security_assessment")
+
+    self.assertIn("metadata", payload)
+    self.assertIn("services", payload)
+    self.assertIn("top_findings", payload)
+    self.assertIn("findings_summary", payload)
+    self.assertNotIn("port_banners", payload)
+    self.assertEqual(payload["metadata"]["job_id"], "job-1")
+    self.assertEqual(payload["findings_summary"]["total_findings"], 2)
+
+  def test_run_aggregated_llm_analysis_uses_shaped_payload(self):
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+        self.captured = None
+
+      def P(self, *_args, **_kwargs):
+        return None
+
+      def Pd(self, *_args, **_kwargs):
+        return None
+
+      def _auto_analyze_report(self, job_id, report, target, scan_type="network", analysis_type=None):
+        self.captured = report
+        return {"content": "ok"}
+
+    host = MockHost()
+    aggregated_report = {
+      "nr_open_ports": 1,
+      "ports_scanned": 10,
+      "open_ports": [22],
+      "service_info": {"22": {"port": 22, "protocol": "ssh", "service": "ssh", "findings": []}},
+      "port_banners": {"22": "y" * 2000},
+    }
+    job_config = {"target": "10.0.0.1", "scan_type": "network", "run_mode": "SINGLEPASS", "start_port": 1, "end_port": 100}
+
+    result = host._run_aggregated_llm_analysis("job-1", aggregated_report, job_config)
+
+    self.assertEqual(result, "ok")
+    self.assertIsNotNone(host.captured)
+    self.assertIn("metadata", host.captured)
+    self.assertNotIn("port_banners", host.captured)
+
   def test_call_llm_agent_api_retries_transient_connection_error(self):
     from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
 
