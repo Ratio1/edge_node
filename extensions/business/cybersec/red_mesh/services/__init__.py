@@ -1,3 +1,4 @@
+from .config import resolve_config_block
 from .control import (
   purge_job,
   stop_and_delete_job,
@@ -62,6 +63,7 @@ __all__ = [
   "TERMINAL_JOB_STATUSES",
   "can_transition_job_status",
   "coerce_scan_type",
+  "resolve_config_block",
   "announce_launch",
   "build_network_workers",
   "build_webapp_workers",
