@@ -97,6 +97,24 @@ class _RedMeshLlmAgentMixin(object):
         nested = web_entry.get("findings")
         if isinstance(nested, list):
           findings.extend(item for item in nested if isinstance(item, dict))
+        for method_entry in web_entry.values():
+          if not isinstance(method_entry, dict):
+            continue
+          nested = method_entry.get("findings")
+          if isinstance(nested, list):
+            findings.extend(item for item in nested if isinstance(item, dict))
+
+    graybox_results = report.get("graybox_results")
+    if isinstance(graybox_results, dict):
+      for probe_map in graybox_results.values():
+        if not isinstance(probe_map, dict):
+          continue
+        for probe_entry in probe_map.values():
+          if not isinstance(probe_entry, dict):
+            continue
+          nested = probe_entry.get("findings")
+          if isinstance(nested, list):
+            findings.extend(item for item in nested if isinstance(item, dict))
 
     return findings
 
@@ -278,6 +296,145 @@ class _RedMeshLlmAgentMixin(object):
       ),
     }
 
+  def _build_webapp_route_summary(self, aggregated_report: dict, job_config: dict, analysis_type: str) -> dict:
+    limits = self._get_llm_payload_limits(analysis_type)
+    routes = []
+    forms = []
+    seen_routes = set()
+    seen_forms = set()
+
+    for route in job_config.get("app_routes", []) or []:
+      if not route or route in seen_routes:
+        continue
+      seen_routes.add(route)
+      routes.append(route)
+
+    service_info = aggregated_report.get("service_info")
+    if isinstance(service_info, dict):
+      for port_entry in service_info.values():
+        if not isinstance(port_entry, dict):
+          continue
+        for method_name, method_entry in port_entry.items():
+          if not isinstance(method_entry, dict):
+            continue
+          if not str(method_name).startswith("_graybox_discovery"):
+            continue
+          for route in method_entry.get("routes", []) or []:
+            if not route or route in seen_routes:
+              continue
+            seen_routes.add(route)
+            routes.append(route)
+          for form in method_entry.get("forms", []) or []:
+            if not isinstance(form, dict):
+              continue
+            form_key = (form.get("action"), str(form.get("method") or "GET").upper())
+            if form_key in seen_forms:
+              continue
+            seen_forms.add(form_key)
+            forms.append({
+              "action": form.get("action"),
+              "method": str(form.get("method") or "GET").upper(),
+            })
+
+    route_limit = limits["services"]
+    form_limit = max(6, min(12, limits["services"]))
+    return {
+      "routes_sample": routes[:route_limit],
+      "forms_sample": forms[:form_limit],
+      "total_routes": len(routes),
+      "total_forms": len(forms),
+      "route_limit": route_limit,
+      "form_limit": form_limit,
+    }
+
+  def _build_webapp_probe_summary(self, aggregated_report: dict, analysis_type: str) -> dict:
+    limits = self._get_llm_payload_limits(analysis_type)
+    probe_counts = {}
+    graybox_results = aggregated_report.get("graybox_results")
+    if isinstance(graybox_results, dict):
+      for probe_map in graybox_results.values():
+        if not isinstance(probe_map, dict):
+          continue
+        for probe_name, probe_entry in probe_map.items():
+          if not isinstance(probe_entry, dict):
+            continue
+          count = len([finding for finding in probe_entry.get("findings", []) if isinstance(finding, dict)])
+          probe_counts[probe_name] = probe_counts.get(probe_name, 0) + count
+
+    web_tests_info = aggregated_report.get("web_tests_info")
+    if isinstance(web_tests_info, dict):
+      for test_map in web_tests_info.values():
+        if not isinstance(test_map, dict):
+          continue
+        for test_name, test_entry in test_map.items():
+          if not isinstance(test_entry, dict):
+            continue
+          count = len([finding for finding in test_entry.get("findings", []) if isinstance(finding, dict)])
+          probe_counts[test_name] = probe_counts.get(test_name, 0) + count
+
+    ranked = sorted(probe_counts.items(), key=lambda item: (-item[1], item[0]))
+    return {
+      "top_probes": [
+        {"probe": probe_name, "finding_count": count}
+        for probe_name, count in ranked[:limits["services"]]
+      ],
+      "total_probes": len(probe_counts),
+    }
+
+  def _build_webapp_findings_summary(self, aggregated_report: dict) -> dict:
+    findings = self._deduplicate_findings(self._extract_report_findings(aggregated_report))
+    severity_counts = {}
+    status_counts = {}
+    owasp_counts = {}
+    vulnerable_titles = []
+    seen_titles = set()
+
+    for finding in findings:
+      severity = str(finding.get("severity") or "UNKNOWN").upper()
+      status = str(finding.get("status") or "unknown").lower()
+      owasp = str(finding.get("owasp_id") or finding.get("owasp") or "").strip()
+      title = str(finding.get("title") or "").strip()
+      severity_counts[severity] = severity_counts.get(severity, 0) + 1
+      status_counts[status] = status_counts.get(status, 0) + 1
+      if owasp:
+        owasp_counts[owasp] = owasp_counts.get(owasp, 0) + 1
+      if status == "vulnerable" and title and title not in seen_titles:
+        seen_titles.add(title)
+        vulnerable_titles.append(title)
+
+    top_owasp = sorted(owasp_counts.items(), key=lambda item: (-item[1], item[0]))
+    return {
+      "total_findings": len(findings),
+      "by_severity": severity_counts,
+      "by_status": status_counts,
+      "top_owasp_categories": [
+        {"category": category, "count": count}
+        for category, count in top_owasp[:6]
+      ],
+      "top_vulnerable_titles": vulnerable_titles[:8],
+    }
+
+  def _build_webapp_coverage_summary(self, aggregated_report: dict, job_config: dict, analysis_type: str) -> dict:
+    route_summary = self._build_webapp_route_summary(aggregated_report, job_config, analysis_type)
+    scan_metrics = aggregated_report.get("scan_metrics") or {}
+    scenario_stats = aggregated_report.get("scenario_stats") or scan_metrics.get("scenario_stats") or {}
+    return {
+      "routes": route_summary,
+      "scan_metrics": scan_metrics,
+      "scenario_stats": scenario_stats,
+      "completed_tests": list(aggregated_report.get("completed_tests") or []),
+    }
+
+  def _build_webapp_attack_surface_summary(self, aggregated_report: dict, findings_summary: dict, analysis_type: str) -> dict:
+    route_summary = self._build_webapp_route_summary(aggregated_report, {}, analysis_type)
+    return {
+      "route_count": route_summary["total_routes"],
+      "form_count": route_summary["total_forms"],
+      "vulnerable_scenarios": findings_summary.get("by_status", {}).get("vulnerable", 0),
+      "inconclusive_scenarios": findings_summary.get("by_status", {}).get("inconclusive", 0),
+      "top_owasp_categories": findings_summary.get("top_owasp_categories", []),
+    }
+
   def _build_llm_analysis_payload(self, job_id: str, aggregated_report: dict, job_config: dict, analysis_type: str) -> dict:
     scan_type = job_config.get("scan_type", "network")
     target = job_config.get("target_url") if scan_type == "webapp" else job_config.get("target", "unknown")
@@ -306,9 +463,30 @@ class _RedMeshLlmAgentMixin(object):
         "findings_summary": findings_summary,
       }
 
-    report_with_meta = {k: v for k, v in aggregated_report.items() if k != "node_ip"}
-    report_with_meta["_job_metadata"] = self._build_llm_metadata(job_id, target, scan_type, job_config)
-    return report_with_meta
+    top_findings, finding_meta = self._build_llm_top_findings(aggregated_report, analysis_type)
+    findings_summary = self._build_webapp_findings_summary(aggregated_report)
+    probe_summary = self._build_webapp_probe_summary(aggregated_report, analysis_type)
+    coverage = self._build_webapp_coverage_summary(aggregated_report, job_config, analysis_type)
+    return {
+      "metadata": self._build_llm_metadata(job_id, target, scan_type, job_config),
+      "stats": {
+        "analysis_type": analysis_type,
+        "scan_metrics": aggregated_report.get("scan_metrics"),
+        "scenario_stats": aggregated_report.get("scenario_stats"),
+      },
+      "top_findings": top_findings,
+      "findings_summary": findings_summary,
+      "probe_summary": probe_summary,
+      "coverage": coverage,
+      "attack_surface": self._build_webapp_attack_surface_summary(aggregated_report, findings_summary, analysis_type),
+      "truncation": {
+        "finding_limit": self._get_llm_payload_limits(analysis_type)["findings"],
+        **finding_meta,
+        "route_limit": coverage["routes"]["route_limit"],
+        "form_limit": coverage["routes"]["form_limit"],
+        "probe_limit": self._get_llm_payload_limits(analysis_type)["services"],
+      },
+    }
 
   def _maybe_resolve_llm_agent_from_semaphore(self):
     """

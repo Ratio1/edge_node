@@ -287,6 +287,115 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(quick_payload["truncation"]["service_limit"], 12)
     self.assertEqual(quick_payload["truncation"]["finding_limit"], 12)
 
+  def test_extract_report_findings_includes_graybox_results(self):
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+
+    host = MockHost()
+    findings = host._extract_report_findings({
+      "graybox_results": {
+        "443": {
+          "_graybox_authz": {
+            "findings": [{"scenario_id": "S-1", "title": "IDOR", "severity": "HIGH", "status": "vulnerable"}],
+          },
+        },
+      },
+    })
+
+    self.assertEqual(len(findings), 1)
+    self.assertEqual(findings[0]["scenario_id"], "S-1")
+
+  def test_build_llm_analysis_payload_webapp_is_compact_and_structured(self):
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+
+    host = MockHost()
+    aggregated_report = {
+      "scan_metrics": {"scenarios_total": 3, "scenarios_vulnerable": 1},
+      "scenario_stats": {"vulnerable": 1, "not_vulnerable": 1, "inconclusive": 1},
+      "service_info": {
+        "443": {
+          "_graybox_discovery": {
+            "routes": ["/login", "/admin", "/login"],
+            "forms": [
+              {"action": "/login", "method": "post"},
+              {"action": "/admin", "method": "post"},
+            ],
+          },
+        },
+      },
+      "graybox_results": {
+        "443": {
+          "_graybox_authz": {
+            "findings": [
+              {
+                "scenario_id": "PT-A01-01",
+                "title": "IDOR on records endpoint",
+                "status": "vulnerable",
+                "severity": "HIGH",
+                "owasp_id": "A01:2021",
+                "evidence": "GET /api/records/2 returned 200 for regular user",
+              },
+              {
+                "scenario_id": "PT-A01-01",
+                "title": "IDOR on records endpoint",
+                "status": "vulnerable",
+                "severity": "HIGH",
+                "owasp_id": "A01:2021",
+                "evidence": "Duplicate evidence should be collapsed",
+              },
+            ],
+          },
+        },
+      },
+      "web_tests_info": {
+        "443": {
+          "_web_test_xss": {
+            "findings": [
+              {
+                "scenario_id": "PT-A03-02",
+                "title": "Reflected XSS in search",
+                "status": "inconclusive",
+                "severity": "MEDIUM",
+                "owasp_id": "A03:2021",
+                "evidence": "Payload reflected in response body",
+              },
+            ],
+          },
+        },
+      },
+      "completed_tests": ["graybox_discovery", "_graybox_authz", "_web_test_xss"],
+    }
+    job_config = {
+      "target_url": "https://app.example.test",
+      "scan_type": "webapp",
+      "run_mode": "SINGLEPASS",
+      "app_routes": ["/seeded-route"],
+      "excluded_features": ["_graybox_stateful"],
+    }
+
+    payload = host._build_llm_analysis_payload("job-web", aggregated_report, job_config, "security_assessment")
+
+    self.assertEqual(payload["metadata"]["scan_type"], "webapp")
+    self.assertIn("probe_summary", payload)
+    self.assertIn("coverage", payload)
+    self.assertIn("attack_surface", payload)
+    self.assertNotIn("graybox_results", payload)
+    self.assertEqual(payload["findings_summary"]["total_findings"], 2)
+    self.assertEqual(payload["findings_summary"]["by_status"]["vulnerable"], 1)
+    self.assertEqual(payload["coverage"]["routes"]["total_routes"], 3)
+    self.assertEqual(payload["probe_summary"]["top_probes"][0]["probe"], "_graybox_authz")
+
   def test_call_llm_agent_api_retries_transient_connection_error(self):
     from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
 
