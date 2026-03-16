@@ -28,6 +28,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
       job_id="job-1",
       worker_addr="0xWorkerA",
       pass_nr=2,
+      assignment_revision_seen=4,
       progress=45.5,
       phase="service_probes",
       scan_type="network",
@@ -38,6 +39,10 @@ class TestPhase12LiveProgress(unittest.TestCase):
       open_ports_found=[22, 80, 443],
       completed_tests=["fingerprint_completed", "service_info_completed"],
       updated_at=1700000000.0,
+      started_at=1699999990.0,
+      first_seen_live_at=1699999990.0,
+      last_seen_at=1700000000.0,
+      finished=False,
       live_metrics={"total_duration": 30.5},
     )
     d = wp.to_dict()
@@ -45,6 +50,7 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(wp2.job_id, "job-1")
     self.assertEqual(wp2.worker_addr, "0xWorkerA")
     self.assertEqual(wp2.pass_nr, 2)
+    self.assertEqual(wp2.assignment_revision_seen, 4)
     self.assertAlmostEqual(wp2.progress, 45.5)
     self.assertEqual(wp2.phase, "service_probes")
     self.assertEqual(wp2.scan_type, "network")
@@ -55,6 +61,10 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(wp2.open_ports_found, [22, 80, 443])
     self.assertEqual(wp2.completed_tests, ["fingerprint_completed", "service_info_completed"])
     self.assertEqual(wp2.updated_at, 1700000000.0)
+    self.assertEqual(wp2.started_at, 1699999990.0)
+    self.assertEqual(wp2.first_seen_live_at, 1699999990.0)
+    self.assertEqual(wp2.last_seen_at, 1700000000.0)
+    self.assertFalse(wp2.finished)
     self.assertEqual(wp2.live_metrics, {"total_duration": 30.5})
 
   def test_get_job_progress_filters_by_job(self):
