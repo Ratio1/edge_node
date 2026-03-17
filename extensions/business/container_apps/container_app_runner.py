@@ -271,6 +271,7 @@ _CONFIG = {
   },
   "ENV": {},                # dict of env vars for the container
   "DYNAMIC_ENV": {},        # dict of dynamic env vars for the container
+  "EXPOSED_PORTS": {},      # normalized container-port config keyed by internal container port
   "PORT": None,             # internal container port if it's a web app (int)
   "CONTAINER_RESOURCES" : {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
@@ -434,6 +435,8 @@ class ContainerAppRunnerPlugin(
     self.volumes = {}
     self.env = {}
     self.dynamic_env = {}
+    self._normalized_exposed_ports = {}
+    self._normalized_main_exposed_port = None
 
     # Container state machine
     self.container_state = ContainerState.UNINITIALIZED
@@ -1225,6 +1228,9 @@ class ContainerAppRunnerPlugin(
       getattr(self, 'cfg_build_and_run_commands', None),
       field_name='BUILD_AND_RUN_COMMANDS',
     )
+
+    self._normalized_exposed_ports = self._normalize_exposed_ports_config()
+    self._normalized_main_exposed_port = self._get_main_exposed_port(self._normalized_exposed_ports)
 
     # Validate health endpoint port (soft error - disables health probing if invalid)
     self._validate_health_endpoint_port()

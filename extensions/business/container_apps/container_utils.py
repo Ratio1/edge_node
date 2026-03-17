@@ -163,6 +163,338 @@ class _ContainerUtilsMixin:
 
     return data
 
+  def _normalize_exposed_ports_value(self, exposed_ports):
+    """
+    Normalize and validate a raw EXPOSED_PORTS-style dictionary.
+
+    Parameters
+    ----------
+    exposed_ports : dict
+        Raw exposed ports config keyed by container port.
+    """
+    if not isinstance(exposed_ports, dict):
+      raise ValueError("EXPOSED_PORTS must be a dictionary keyed by container port")
+
+    normalized = {}
+    main_ports = []
+    used_host_ports = {}
+
+    for raw_container_port, raw_config in exposed_ports.items():
+      try:
+        container_port = int(raw_container_port)
+      except (TypeError, ValueError):
+        raise ValueError(f"EXPOSED_PORTS key must be an integer port, got: {raw_container_port}")
+
+      if container_port < 1 or container_port > 65535:
+        raise ValueError(f"EXPOSED_PORTS key must be a valid port number, got: {container_port}")
+
+      if raw_config is None:
+        raw_config = {}
+
+      if not isinstance(raw_config, dict):
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}] must be a dictionary, got: {type(raw_config)}"
+        )
+
+      config = self.deepcopy(raw_config)
+      is_main_port = config.get("is_main_port", False)
+      if not isinstance(is_main_port, bool):
+        raise ValueError(f"EXPOSED_PORTS[{container_port}].is_main_port must be a boolean")
+      if is_main_port:
+        main_ports.append(container_port)
+
+      host_port = config.get("host_port")
+      if host_port is not None:
+        try:
+          host_port = int(host_port)
+        except (TypeError, ValueError):
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].host_port must be an integer or null"
+          )
+        if host_port < 1 or host_port > 65535:
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].host_port must be a valid port number"
+          )
+        if host_port in used_host_ports:
+          raise ValueError(
+            "EXPOSED_PORTS defines duplicate host_port {} for container ports {} and {}".format(
+              host_port, used_host_ports[host_port], container_port
+            )
+          )
+        used_host_ports[host_port] = container_port
+
+      tunnel = config.get("tunnel")
+      if tunnel is None:
+        normalized_tunnel = None
+      else:
+        if not isinstance(tunnel, dict):
+          raise ValueError(f"EXPOSED_PORTS[{container_port}].tunnel must be a dictionary")
+        normalized_tunnel = self.deepcopy(tunnel)
+        enabled = normalized_tunnel.get("enabled", False)
+        if not isinstance(enabled, bool):
+          raise ValueError(f"EXPOSED_PORTS[{container_port}].tunnel.enabled must be a boolean")
+        engine = normalized_tunnel.get("engine", "cloudflare")
+        if engine is not None:
+          engine = str(engine).strip().lower()
+        if enabled and engine not in ("cloudflare",):
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].tunnel.engine must be 'cloudflare' when enabled"
+          )
+        token = normalized_tunnel.get("token")
+        if enabled and engine == "cloudflare":
+          if not isinstance(token, str) or not token.strip():
+            raise ValueError(
+              f"EXPOSED_PORTS[{container_port}].tunnel.token is required for enabled cloudflare tunnels"
+            )
+          token = token.strip()
+        normalized_tunnel = {
+          "enabled": enabled,
+          "engine": engine,
+          "token": token,
+        }
+
+      normalized[container_port] = {
+        "container_port": container_port,
+        "is_main_port": is_main_port,
+        "host_port": host_port,
+        "tunnel": normalized_tunnel,
+      }
+
+    if len(main_ports) > 1:
+      raise ValueError(f"EXPOSED_PORTS defines multiple main ports: {sorted(main_ports)}")
+
+    return normalized
+
+  def _get_legacy_main_tunnel_token(self):
+    """
+    Return the legacy main Cloudflare token, if configured.
+    """
+    if isinstance(getattr(self, 'cfg_cloudflare_token', None), str):
+      token = self.cfg_cloudflare_token.strip()
+      if token:
+        return token
+
+    params = getattr(self, 'cfg_tunnel_engine_parameters', None) or {}
+    if isinstance(params, dict):
+      token = params.get("CLOUDFLARE_TOKEN")
+      if isinstance(token, str):
+        token = token.strip()
+        if token:
+          return token
+    return None
+
+  def _merge_legacy_exposed_port_entry(
+    self, exposed_ports, container_port, is_main_port=None, host_port=None, tunnel=None
+  ):
+    """
+    Merge legacy CAR fields into a raw EXPOSED_PORTS-style entry.
+    """
+    try:
+      container_port = int(container_port)
+    except (TypeError, ValueError):
+      raise ValueError(f"Legacy container port must be an integer, got: {container_port}")
+
+    if container_port < 1 or container_port > 65535:
+      raise ValueError(f"Legacy container port must be a valid port number, got: {container_port}")
+
+    entry = exposed_ports.setdefault(str(container_port), {})
+
+    if is_main_port is True:
+      existing_is_main = entry.get("is_main_port", False)
+      if existing_is_main is False:
+        entry["is_main_port"] = True
+    elif "is_main_port" not in entry:
+      entry["is_main_port"] = False
+
+    if host_port is not None:
+      try:
+        host_port = int(host_port)
+      except (TypeError, ValueError):
+        raise ValueError(f"Legacy host port must be an integer, got: {host_port}")
+      existing_host_port = entry.get("host_port")
+      if existing_host_port is not None and int(existing_host_port) != host_port:
+        raise ValueError(
+          "Legacy config maps container port {} to conflicting host ports {} and {}".format(
+            container_port, existing_host_port, host_port
+          )
+        )
+      entry["host_port"] = host_port
+
+    if tunnel is not None:
+      existing_tunnel = entry.get("tunnel")
+      if existing_tunnel is not None and existing_tunnel != tunnel:
+        raise ValueError(
+          "Legacy config defines conflicting tunnel settings for container port {}".format(
+            container_port
+          )
+        )
+      entry["tunnel"] = self.deepcopy(tunnel)
+
+    return entry
+
+  def _build_exposed_ports_config_from_legacy(self):
+    """
+    Build a raw EXPOSED_PORTS-style config from legacy CAR fields.
+    """
+    exposed_ports = {}
+    main_port = getattr(self, 'cfg_port', None)
+    if main_port is not None:
+      self._merge_legacy_exposed_port_entry(
+        exposed_ports,
+        container_port=main_port,
+        is_main_port=True,
+      )
+
+    container_resources = getattr(self, 'cfg_container_resources', None) or {}
+    legacy_ports = container_resources.get("ports", [])
+
+    if isinstance(legacy_ports, list):
+      for container_port in legacy_ports:
+        self._merge_legacy_exposed_port_entry(
+          exposed_ports,
+          container_port=container_port,
+          is_main_port=(main_port is not None and int(container_port) == int(main_port)),
+        )
+    elif isinstance(legacy_ports, dict):
+      for raw_host_port, raw_container_port in legacy_ports.items():
+        self._merge_legacy_exposed_port_entry(
+          exposed_ports,
+          container_port=raw_container_port,
+          is_main_port=(main_port is not None and int(raw_container_port) == int(main_port)),
+          host_port=raw_host_port,
+        )
+
+    main_tunnel_token = self._get_legacy_main_tunnel_token()
+    if main_tunnel_token and main_port is not None:
+      self._merge_legacy_exposed_port_entry(
+        exposed_ports,
+        container_port=main_port,
+        is_main_port=True,
+        tunnel={
+          "enabled": True,
+          "engine": "cloudflare",
+          "token": main_tunnel_token,
+        },
+      )
+
+    legacy_extra_tunnels = getattr(self, 'cfg_extra_tunnels', None) or {}
+    if not isinstance(legacy_extra_tunnels, dict):
+      raise ValueError("EXTRA_TUNNELS must be a dictionary {container_port: token}")
+
+    for raw_container_port, raw_tunnel_config in legacy_extra_tunnels.items():
+      normalized_token = self._normalize_extra_tunnel_config(raw_container_port, raw_tunnel_config)
+      if not normalized_token:
+        raise ValueError(f"EXTRA_TUNNELS[{raw_container_port}] token is empty")
+      try:
+        container_port = int(raw_container_port)
+      except (TypeError, ValueError):
+        raise ValueError(f"EXTRA_TUNNELS key must be integer port, got: {raw_container_port}")
+
+      tunnel = {
+        "enabled": True,
+        "engine": "cloudflare",
+        "token": normalized_token,
+      }
+
+      entry = exposed_ports.get(str(container_port))
+      if (
+        entry is not None and
+        entry.get("tunnel") is not None and
+        main_port is not None and
+        container_port == int(main_port) and
+        entry.get("tunnel", {}).get("token") != normalized_token
+      ):
+        self.P(
+          "Legacy tunnel config for main PORT {} is overridden by EXTRA_TUNNELS entry".format(
+            container_port
+          ),
+          color='y'
+        )
+        entry["tunnel"] = tunnel
+        entry["is_main_port"] = True
+        continue
+
+      self._merge_legacy_exposed_port_entry(
+        exposed_ports,
+        container_port=container_port,
+        is_main_port=(main_port is not None and container_port == int(main_port)),
+        tunnel=tunnel,
+      )
+
+    return exposed_ports
+
+  def _normalize_exposed_ports_config(self):
+    """
+    Normalize and validate EXPOSED_PORTS configuration or synthesize it
+    from legacy CAR fields when the new config is absent.
+
+    Returns
+    -------
+    dict
+        Normalized exposed ports keyed by container port integer.
+    """
+    exposed_ports = getattr(self, 'cfg_exposed_ports', None)
+    if isinstance(exposed_ports, dict) and len(exposed_ports) > 0:
+      return self._normalize_exposed_ports_value(exposed_ports)
+
+    if exposed_ports in (None, {}):
+      legacy_exposed_ports = self._build_exposed_ports_config_from_legacy()
+      return self._normalize_exposed_ports_value(legacy_exposed_ports)
+
+    raise ValueError("EXPOSED_PORTS must be a dictionary keyed by container port")
+
+  def _get_main_exposed_port(self, normalized_exposed_ports=None):
+    """
+    Return the normalized EXPOSED_PORTS entry marked as main.
+
+    Parameters
+    ----------
+    normalized_exposed_ports : dict, optional
+        Normalized exposed ports mapping. Uses cached value when omitted.
+
+    Returns
+    -------
+    dict or None
+        Main exposed port entry or None if not configured.
+    """
+    if normalized_exposed_ports is None:
+      normalized_exposed_ports = getattr(self, '_normalized_exposed_ports', {})
+
+    for config in normalized_exposed_ports.values():
+      if config.get("is_main_port") == True:
+        return config
+    return None
+
+  def _get_container_to_host_port_map_from_exposed_ports(self, normalized_exposed_ports=None):
+    """
+    Build container->host mapping from normalized EXPOSED_PORTS for entries
+    that already define host_port.
+    """
+    if normalized_exposed_ports is None:
+      normalized_exposed_ports = getattr(self, '_normalized_exposed_ports', {})
+
+    result = {}
+    for container_port, config in normalized_exposed_ports.items():
+      host_port = config.get("host_port")
+      if host_port is not None:
+        result[int(container_port)] = int(host_port)
+    return result
+
+  def _get_host_to_container_port_map_from_exposed_ports(self, normalized_exposed_ports=None):
+    """
+    Build host->container mapping from normalized EXPOSED_PORTS for entries
+    that already define host_port.
+    """
+    if normalized_exposed_ports is None:
+      normalized_exposed_ports = getattr(self, '_normalized_exposed_ports', {})
+
+    result = {}
+    for container_port, config in normalized_exposed_ports.items():
+      host_port = config.get("host_port")
+      if host_port is not None:
+        result[int(host_port)] = int(container_port)
+    return result
+
   def _get_container_ip(self):
     """
     Get the container's IP address from Docker network settings.
