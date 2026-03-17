@@ -1516,6 +1516,71 @@ class _DeeployMixin:
               return True
     return False
 
+  def _compile_dynamic_env_ui(self, dynamic_env_ui):
+    """
+    Translate a UI-friendly dynamic env model into backend DYNAMIC_ENV entries.
+    """
+    if not isinstance(dynamic_env_ui, dict):
+      raise ValueError("DYNAMIC_ENV_UI must be a dictionary")
+
+    compiled = {}
+    for env_name, entries in dynamic_env_ui.items():
+      if not isinstance(entries, list):
+        raise ValueError(f"DYNAMIC_ENV_UI[{env_name}] must be a list")
+
+      compiled_entries = []
+      for entry in entries:
+        if not isinstance(entry, dict):
+          raise ValueError(f"DYNAMIC_ENV_UI[{env_name}] entries must be dictionaries")
+
+        source = entry.get("source")
+        if source == "static":
+          value = entry.get("value", "")
+          if not isinstance(value, str):
+            raise ValueError(f"DYNAMIC_ENV_UI[{env_name}] static value must be a string")
+          compiled_entries.append({
+            "type": "static",
+            "value": value,
+          })
+        elif source == "host_ip":
+          compiled_entries.append({
+            "type": "host_ip",
+          })
+        elif source == "container_ip":
+          provider = entry.get("provider")
+          if not isinstance(provider, str) or not provider.strip():
+            raise ValueError(f"DYNAMIC_ENV_UI[{env_name}] container_ip requires a provider")
+          compiled_entries.append({
+            "type": "shmem",
+            "path": [provider.strip(), "CONTAINER_IP"],
+          })
+        else:
+          raise ValueError(f"DYNAMIC_ENV_UI[{env_name}] has unsupported source '{source}'")
+
+      compiled[env_name] = compiled_entries
+
+    return compiled
+
+  def _translate_dynamic_env_ui_in_instance_payload(self, instance_payload):
+    """
+    Compile DYNAMIC_ENV_UI into DYNAMIC_ENV while preserving explicit DYNAMIC_ENV.
+    """
+    if not isinstance(instance_payload, dict):
+      return instance_payload
+
+    translated = self.deepcopy(instance_payload)
+    dynamic_env_ui = translated.pop("DYNAMIC_ENV_UI", None)
+    dynamic_env = translated.get("DYNAMIC_ENV")
+
+    if isinstance(dynamic_env, dict):
+      return translated
+
+    if dynamic_env_ui is None:
+      return translated
+
+    translated["DYNAMIC_ENV"] = self._compile_dynamic_env_ui(dynamic_env_ui)
+    return translated
+
   def _resolve_shmem_references(self, plugins, name_to_instance, app_id):
     """
     Resolve shmem-type DYNAMIC_ENV entries by replacing plugin names with semaphore keys.
@@ -1806,7 +1871,7 @@ class _DeeployMixin:
       self.ct.CONFIG_PLUGIN.K_INSTANCES : [
         {
           self.ct.CONFIG_INSTANCE.K_INSTANCE_ID : instance_id,
-          **inputs.app_params
+          **self._translate_dynamic_env_ui_in_instance_payload(inputs.app_params)
         }
       ]
     }
@@ -1878,6 +1943,8 @@ class _DeeployMixin:
           instance_payload = {}
       else:
         instance_payload = {}
+
+    instance_payload = self._translate_dynamic_env_ui_in_instance_payload(instance_payload)
 
     plugin = {
       self.ct.CONFIG_PLUGIN.K_SIGNATURE: signature,
@@ -1979,7 +2046,7 @@ class _DeeployMixin:
         # Prepare instance with INSTANCE_ID
         prepared_instance = {
           self.ct.CONFIG_INSTANCE.K_INSTANCE_ID: instance_id,
-          **instance_config
+          **self._translate_dynamic_env_ui_in_instance_payload(instance_config)
         }
 
         # Build name-to-instance mapping if plugin_name was provided

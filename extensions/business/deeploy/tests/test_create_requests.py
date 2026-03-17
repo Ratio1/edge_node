@@ -109,6 +109,33 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "EXPOSED_PORTS"):
       plugin._validate_plugins_array(plugins)
 
+  def test_prepare_single_plugin_instance_translates_dynamic_env_ui(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugin_signature="CONTAINER_APP_RUNNER",
+      app_params={
+        "IMAGE": "repo/app:latest",
+        "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+        "DYNAMIC_ENV_UI": {
+          "API_URL": [
+            {"source": "static", "value": "http://"},
+            {"source": "container_ip", "provider": "backend"},
+            {"source": "static", "value": ":3000"},
+          ]
+        },
+      },
+    )
+
+    prepared = plugin.deeploy_prepare_single_plugin_instance(inputs)
+
+    instance = prepared[plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertNotIn("DYNAMIC_ENV_UI", instance)
+    self.assertEqual(instance["DYNAMIC_ENV"]["API_URL"], [
+      {"type": "static", "value": "http://"},
+      {"type": "shmem", "path": ["backend", "CONTAINER_IP"]},
+      {"type": "static", "value": ":3000"},
+    ])
+
 
 if __name__ == "__main__":
   unittest.main()
