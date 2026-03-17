@@ -40,6 +40,10 @@ class _DummyBasePlugin:
   def run_tunnel_engine(self):
     return None
 
+  def get_cloudflare_token(self):
+    params = getattr(self, 'cfg_tunnel_engine_parameters', None) or {}
+    return getattr(self, 'cfg_cloudflare_token', None) or params.get("CLOUDFLARE_TOKEN")
+
   def time(self):
     return 0
 

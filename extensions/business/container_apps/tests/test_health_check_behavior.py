@@ -2,6 +2,7 @@ import types
 import unittest
 
 from extensions.business.container_apps.tests.support import make_container_app_runner
+from extensions.business.container_apps.container_app_runner import HealthCheckMode
 
 
 class ContainerAppRunnerHealthCheckTests(unittest.TestCase):
@@ -44,6 +45,25 @@ class ContainerAppRunnerHealthCheckTests(unittest.TestCase):
 
     self.assertTrue(is_valid)
     self.assertFalse(plugin._health_probing_disabled)
+
+  def test_health_defaults_to_main_exposed_port_without_legacy_port(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "3000": {
+        "is_main_port": True,
+      },
+      "3002": {},
+    }
+    plugin.extra_ports_mapping = {
+      20001: 3000,
+      20002: 3002,
+    }
+    plugin._get_health_config = lambda: types.SimpleNamespace(port=None, path=None, mode="auto")
+    plugin._refresh_normalized_exposed_ports_state()
+
+    self.assertEqual(plugin._get_valid_container_ports(), {3000, 3002})
+    self.assertEqual(plugin._get_health_check_port(), 20001)
+    self.assertEqual(plugin._get_effective_health_mode(), HealthCheckMode.TCP)
 
 
 if __name__ == "__main__":
