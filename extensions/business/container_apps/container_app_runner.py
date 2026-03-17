@@ -2620,13 +2620,24 @@ class ContainerAppRunnerPlugin(
     return self._app_ready
 
   def _setup_semaphore_env(self):
-    """Set semaphore environment variables for bundled plugins."""
+    """
+    Set semaphore environment variables for bundled plugins.
+
+    Legacy keys stay unchanged for compatibility. New code should prefer the
+    explicit host/container keys added here.
+    """
     localhost_ip = self.log.get_localhost_ip()
-    port = self.cfg_port
+    container_port = self._get_main_container_port()
+    host_port = self._get_host_port_for_container_port(container_port) if container_port else None
     self.semaphore_set_env('HOST', localhost_ip)
-    if port:
-      self.semaphore_set_env('PORT', str(port))
-      self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, port))
+    self.semaphore_set_env('HOST_IP', localhost_ip)
+    if container_port:
+      # Keep legacy PORT/URL semantics unchanged.
+      self.semaphore_set_env('PORT', str(container_port))
+      self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, container_port))
+      self.semaphore_set_env('CONTAINER_PORT', str(container_port))
+    if host_port:
+      self.semaphore_set_env('HOST_PORT', str(host_port))
     container_ip = self._get_container_ip()
     self.Pd(f"Container IP address: {container_ip}")
     if container_ip:
