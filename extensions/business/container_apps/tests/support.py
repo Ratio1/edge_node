@@ -79,8 +79,15 @@ from extensions.business.container_apps.container_app_runner import ContainerApp
 
 def make_container_app_runner():
   plugin = ContainerAppRunnerPlugin.__new__(ContainerAppRunnerPlugin)
-  plugin.P = lambda *args, **kwargs: None
-  plugin.Pd = lambda *args, **kwargs: None
+  plugin.logged_messages = []
+
+  def _log(*args, **kwargs):
+    if args:
+      plugin.logged_messages.append(str(args[0]))
+    return
+
+  plugin.P = _log
+  plugin.Pd = _log
   plugin.deque = deque
   plugin.os_path = os.path
   plugin.os = os
@@ -90,6 +97,7 @@ def make_container_app_runner():
   plugin.cfg_max_log_lines = 10
   plugin.cfg_env = {}
   plugin.cfg_dynamic_env = {}
+  plugin.cfg_exposed_ports = {}
   plugin.cfg_container_resources = {}
   plugin.cfg_volumes = {}
   plugin.cfg_file_volumes = {}
@@ -120,6 +128,8 @@ def make_container_app_runner():
   plugin._tunnel_next_restart_time = {}
   plugin._tunnel_last_successful_start = {}
   plugin._health_probing_disabled = False
+  plugin._normalized_exposed_ports = {}
+  plugin._normalized_main_exposed_port = None
   plugin.container = object()
   plugin.container_name = "car_instance_efgh"
   plugin.log = types.SimpleNamespace(get_localhost_ip=lambda: "127.0.0.1")
