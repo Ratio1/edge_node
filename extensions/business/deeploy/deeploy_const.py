@@ -43,6 +43,8 @@ class DEEPLOY_KEYS:
   PIPELINE_PARAMS = "pipeline_params"
   PIPELINE = "pipeline"
   PIPELINE_CID = "pipeline_cid"
+  ONLINE = "online"
+  CHAIN_JOB = "chain_job"
   JOB_CONFIG = "job_config"
   # App params keys
   APP_PARAMS = "app_params"
