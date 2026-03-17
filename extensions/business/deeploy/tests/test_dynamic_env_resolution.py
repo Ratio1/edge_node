@@ -68,6 +68,30 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
     self.assertEqual(provider_instance["SEMAPHORE"], sem_key)
     self.assertEqual(consumer_instance["SEMAPHORED_KEYS"], [sem_key])
 
+  def test_translate_dynamic_env_ui_keeps_explicit_dynamic_env_precedence(self):
+    plugin = make_deeploy_plugin()
+    translated = plugin._translate_dynamic_env_ui_in_instance_payload({
+      "DYNAMIC_ENV": {
+        "API_HOST": [{"type": "host_ip"}]
+      },
+      "DYNAMIC_ENV_UI": {
+        "API_HOST": [{"source": "container_ip", "provider": "backend"}]
+      },
+    })
+
+    self.assertEqual(translated["DYNAMIC_ENV"], {
+      "API_HOST": [{"type": "host_ip"}]
+    })
+    self.assertNotIn("DYNAMIC_ENV_UI", translated)
+
+  def test_translate_dynamic_env_ui_rejects_missing_container_provider(self):
+    plugin = make_deeploy_plugin()
+
+    with self.assertRaisesRegex(ValueError, "requires a provider"):
+      plugin._compile_dynamic_env_ui({
+        "API_HOST": [{"source": "container_ip"}]
+      })
+
 
 if __name__ == "__main__":
   unittest.main()
