@@ -55,6 +55,55 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
       "http://127.0.0.1:20005",
     ])
 
+  def test_normalized_main_tunnel_drives_cloudflare_token(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "3000": {
+        "is_main_port": True,
+        "tunnel": {
+          "enabled": True,
+          "engine": "cloudflare",
+          "token": "normalized-main-token",
+        },
+      }
+    }
+
+    plugin._refresh_normalized_exposed_ports_state()
+
+    self.assertTrue(plugin._should_start_main_tunnel())
+    self.assertEqual(plugin.get_cloudflare_token(), "normalized-main-token")
+
+  def test_validate_extra_tunnels_config_uses_normalized_non_main_tunnels(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "3000": {
+        "is_main_port": True,
+        "tunnel": {
+          "enabled": True,
+          "engine": "cloudflare",
+          "token": "main-token",
+        },
+      },
+      "3002": {
+        "tunnel": {
+          "enabled": True,
+          "engine": "cloudflare",
+          "token": "extra-token",
+        },
+      },
+    }
+
+    plugin._setup_resource_limits_and_ports()
+    plugin._validate_extra_tunnels_config()
+
+    self.assertEqual(plugin.extra_ports_mapping, {
+      20001: 3000,
+      20002: 3002,
+    })
+    self.assertEqual(plugin.extra_tunnel_configs, {
+      3002: "extra-token",
+    })
+
 
 if __name__ == "__main__":
   unittest.main()

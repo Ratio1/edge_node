@@ -63,6 +63,25 @@ class ContainerAppRunnerPortRuntimeTests(unittest.TestCase):
     })
     self.assertEqual(plugin.port, 20002)
 
+  def test_explicit_exposed_ports_drive_runtime_allocation(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "3000": {
+        "is_main_port": True,
+      },
+      "3002": {
+        "host_port": 18082,
+      },
+    }
+
+    plugin._setup_resource_limits_and_ports()
+
+    self.assertEqual(plugin.extra_ports_mapping, {
+      20001: 3000,
+      18082: 3002,
+    })
+    self.assertEqual(plugin.port, 20001)
+
 
 if __name__ == "__main__":
   unittest.main()

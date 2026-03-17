@@ -938,7 +938,7 @@ class ContainerAppRunnerPlugin(
           "Falling back to 'tcp' mode.",
           color='y'
         )
-        return HealthCheckMode.TCP if self.cfg_port else HealthCheckMode.DELAY
+        return HealthCheckMode.TCP if self._get_main_container_port() else HealthCheckMode.DELAY
       return HealthCheckMode.ENDPOINT
 
     # Direct modes pass through
@@ -948,7 +948,7 @@ class ContainerAppRunnerPlugin(
     # Auto mode: smart detection
     if health_config.path:
       return HealthCheckMode.ENDPOINT
-    elif self.cfg_port:
+    elif self._get_main_container_port():
       return HealthCheckMode.TCP
     return HealthCheckMode.DELAY
 
@@ -1229,8 +1229,7 @@ class ContainerAppRunnerPlugin(
       field_name='BUILD_AND_RUN_COMMANDS',
     )
 
-    self._normalized_exposed_ports = self._normalize_exposed_ports_config()
-    self._normalized_main_exposed_port = self._get_main_exposed_port(self._normalized_exposed_ports)
+    self._refresh_normalized_exposed_ports_state()
 
     # Validate health endpoint port (soft error - disables health probing if invalid)
     self._validate_health_endpoint_port()
@@ -1502,6 +1501,28 @@ class ContainerAppRunnerPlugin(
     # end if
     return
 
+  def _get_main_tunnel_config(self):
+    """
+    Return the normalized tunnel config for the main exposed port, if enabled.
+    """
+    normalized_exposed_ports = self._normalized_exposed_ports or self._refresh_normalized_exposed_ports_state()
+    main_exposed_port = self._get_main_exposed_port(normalized_exposed_ports)
+    if not main_exposed_port:
+      return None
+    tunnel_config = main_exposed_port.get("tunnel")
+    if not tunnel_config or tunnel_config.get("enabled") is not True:
+      return None
+    return tunnel_config
+
+  def get_cloudflare_token(self):
+    """
+    Prefer the normalized main-port tunnel token over legacy config fields.
+    """
+    tunnel_config = self._get_main_tunnel_config()
+    if tunnel_config and tunnel_config.get("engine") == "cloudflare":
+      return tunnel_config.get("token")
+    return super(ContainerAppRunnerPlugin, self).get_cloudflare_token()
+
 
   def stop_tunnel_engine(self):
     """
@@ -1622,11 +1643,6 @@ class ContainerAppRunnerPlugin(
     int or None
         Host port if found, None otherwise
     """
-    # Check main port first
-    if container_port == self.cfg_port:
-      return self.port
-
-    # Check extra ports mapping
     for host_port, c_port in self.extra_ports_mapping.items():
       if c_port == container_port:
         return host_port
@@ -1646,16 +1662,10 @@ class ContainerAppRunnerPlugin(
     set of int
         Set of valid container ports
     """
-    valid_ports = set()
-
-    # Main port
-    if self.cfg_port:
-      valid_ports.add(self.cfg_port)
-
-    # Extra ports (container ports from mapping)
-    for container_port in self.extra_ports_mapping.values():
-      valid_ports.add(container_port)
-
+    valid_ports = set(self.extra_ports_mapping.values())
+    normalized_exposed_ports = self._normalized_exposed_ports or self._normalize_exposed_ports_config()
+    if normalized_exposed_ports:
+      valid_ports.update(normalized_exposed_ports.keys())
     return valid_ports
 
 
@@ -1738,26 +1748,17 @@ class ContainerAppRunnerPlugin(
     bool
         True if main tunnel should start
     """
-    # Check if we have a token (backward compatibility)
-    has_cloudflare_token = bool(getattr(self, 'cfg_cloudflare_token', None))
-    has_params_token = bool(
-      self.cfg_tunnel_engine_parameters and
-      self.cfg_tunnel_engine_parameters.get("CLOUDFLARE_TOKEN")
+    main_container_port = self._get_main_container_port(
+      self._normalized_exposed_ports or self._normalize_exposed_ports_config()
     )
-
-    has_main_token = has_cloudflare_token or has_params_token
-
-    # If no token at all, no main tunnel
-    if not has_main_token:
-      # self.Pd("No main tunnel token configured, skipping main tunnel")
+    if main_container_port is None:
       return False
 
-    # If PORT is defined and in EXTRA_TUNNELS, skip main tunnel
-    if self.cfg_port and self.cfg_port in self.extra_tunnel_configs:
-      self.P(f"Main PORT {self.cfg_port} is defined in EXTRA_TUNNELS, using extra tunnel instead")
+    if main_container_port in self.extra_tunnel_configs:
+      self.P(f"Main PORT {main_container_port} is defined in EXTRA_TUNNELS, using extra tunnel instead")
       return False
 
-    return True
+    return self._get_main_tunnel_config() is not None
 
 
   def _start_extra_tunnel(self, container_port, token):
@@ -2397,7 +2398,7 @@ class ContainerAppRunnerPlugin(
     path = health.path if health.path.startswith('/') else '/' + health.path
 
     # Get container port (default to main port)
-    container_port = health.port or self.cfg_port
+    container_port = health.port or self._get_main_container_port()
     if not container_port:
       self.Pd("Health URL: no container port (HEALTH_CHECK.PORT or PORT not set)")
       return None
@@ -2456,7 +2457,7 @@ class ContainerAppRunnerPlugin(
         Host port for health checking, or None if not configured
     """
     health = self._get_health_config()
-    container_port = health.port or self.cfg_port
+    container_port = health.port or self._get_main_container_port()
     if not container_port:
       self.Pd("Health check port: no container port configured (HEALTH_CHECK.PORT or PORT)")
       return None
