@@ -751,7 +751,7 @@ class _DeeployMixin:
     index_str = f" at index {index}" if index is not None else ""
 
     # Type-specific validation
-    if signature == CONTAINER_APP_RUNNER_SIGNATURE:
+    if signature in CONTAINERIZED_APPS_SIGNATURES:
       # Check IMAGE field
       if not plugin_instance.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE):
         raise ValueError(
@@ -787,6 +787,12 @@ class _DeeployMixin:
       if DEEPLOY_RESOURCES.MEMORY not in resources:
         raise ValueError(
           f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'CONTAINER_RESOURCES.memory' is required."
+        )
+
+      exposed_ports = plugin_instance.get("EXPOSED_PORTS")
+      if exposed_ports is not None and not isinstance(exposed_ports, dict):
+        raise ValueError(
+          f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'EXPOSED_PORTS' must be a dictionary."
         )
 
     # Add validation for other plugin types here as needed

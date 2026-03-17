@@ -60,6 +60,55 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(instances[0][plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID], "dup")
     self.assertNotEqual(instances[1][plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID], "dup")
 
+  def test_prepare_single_plugin_instance_preserves_exposed_ports(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugin_signature="CONTAINER_APP_RUNNER",
+      app_params={
+        "IMAGE": "repo/app:latest",
+        "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+        "EXPOSED_PORTS": {
+          "3000": {"is_main_port": True},
+          "3001": {"tunnel": {"enabled": True, "engine": "cloudflare", "token": "cf-token"}},
+        },
+      },
+    )
+
+    prepared = plugin.deeploy_prepare_single_plugin_instance(inputs)
+
+    instance = prepared[plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertTrue(instance["EXPOSED_PORTS"]["3000"]["is_main_port"])
+    self.assertEqual(instance["EXPOSED_PORTS"]["3001"]["tunnel"]["token"], "cf-token")
+
+  def test_validate_plugins_array_accepts_container_runner_with_exposed_ports(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      make_plugin_entry(
+        "CONTAINER_APP_RUNNER",
+        IMAGE="repo/app:latest",
+        CONTAINER_RESOURCES={"cpu": 1, "memory": "128m"},
+        EXPOSED_PORTS={
+          "3000": {"is_main_port": True},
+        },
+      )
+    ]
+
+    self.assertTrue(plugin._validate_plugins_array(plugins))
+
+  def test_validate_plugins_array_rejects_non_dict_exposed_ports(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      make_plugin_entry(
+        "CONTAINER_APP_RUNNER",
+        IMAGE="repo/app:latest",
+        CONTAINER_RESOURCES={"cpu": 1, "memory": "128m"},
+        EXPOSED_PORTS=["3000"],
+      )
+    ]
+
+    with self.assertRaisesRegex(ValueError, "EXPOSED_PORTS"):
+      plugin._validate_plugins_array(plugins)
+
 
 if __name__ == "__main__":
   unittest.main()
