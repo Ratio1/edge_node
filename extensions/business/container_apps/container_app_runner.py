@@ -270,9 +270,9 @@ _CONFIG = {
     "PASSWORD": None,       # Optional registry password or token
   },
   "ENV": {},                # dict of env vars for the container
-  "DYNAMIC_ENV": {},        # dict of dynamic env vars for the container
+  "DYNAMIC_ENV": {},        # backend dynamic env definition; Deeploy may compile DYNAMIC_ENV_UI into this
   "EXPOSED_PORTS": {},      # normalized container-port config keyed by internal container port
-  "PORT": None,             # internal container port if it's a web app (int)
+  "PORT": None,             # legacy main internal container port if it's a web app (int)
   "CONTAINER_RESOURCES" : {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,          # 0 - no GPU, 1 - use GPU

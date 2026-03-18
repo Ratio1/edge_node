@@ -37,6 +37,10 @@ The Container Apps module provides plugins for managing Docker containers with i
 
 ## Features
 
+- **Normalized exposed ports**: `EXPOSED_PORTS` is the forward-looking config surface for container port exposure and per-port tunnel settings.
+- **Explicit semaphore networking keys**: container apps now publish `HOST_IP`, `HOST_PORT`, `CONTAINER_IP`, and `CONTAINER_PORT` in addition to legacy `HOST`, `PORT`, and `URL`.
+- **UI-friendly dynamic env support**: Deeploy can compile `DYNAMIC_ENV_UI` fragments to backend `DYNAMIC_ENV` entries, including generic plugin semaphore lookups.
+
 ### Health Check Configuration
 
 The plugin uses a consolidated `HEALTH_CHECK` configuration dict to determine when the application is ready before starting tunnels.
@@ -143,6 +147,55 @@ The plugin uses a consolidated `HEALTH_CHECK` configuration dict to determine wh
 ## Configuration Reference
 
 See `ContainerAppRunnerPlugin.CONFIG` for full configuration options.
+
+### Exposed Ports
+
+`EXPOSED_PORTS` is a dictionary keyed by internal container port:
+
+```python
+"EXPOSED_PORTS": {
+    "3000": {
+        "is_main_port": True,
+        "host_port": None,
+        "tunnel": {
+            "enabled": True,
+            "engine": "cloudflare",
+            "token": "cf_token_for_3000",
+        },
+    },
+    "3001": {
+        "host_port": None,
+        "tunnel": {
+            "enabled": False,
+        },
+    },
+}
+```
+
+Notes:
+
+- `is_main_port` marks the port used for default health checks, semaphore networking exports, and the primary app URL.
+- `host_port` is optional; when omitted, CAR allocates a host port automatically.
+- `tunnel.enabled=true` currently requires `engine="cloudflare"` and a token.
+- Legacy `PORT`, `CONTAINER_RESOURCES["ports"]`, `CLOUDFLARE_TOKEN`, and `EXTRA_TUNNELS` are still accepted as compatibility inputs and normalized internally to `EXPOSED_PORTS`.
+
+### Dynamic Env and Semaphore Values
+
+Deeploy accepts a UI-facing `DYNAMIC_ENV_UI` payload and compiles it to backend `DYNAMIC_ENV` entries:
+
+- `static` -> `{"type": "static", "value": "..."}`
+- `host_ip` -> `{"type": "host_ip"}`
+- `container_ip(provider)` -> `{"type": "shmem", "path": [provider, "CONTAINER_IP"]}`
+- `plugin_value(provider, key)` -> `{"type": "shmem", "path": [provider, key]}`
+
+When a container app acts as the provider, new consumers should prefer these explicit exported keys:
+
+- `HOST_IP`
+- `HOST_PORT`
+- `CONTAINER_IP`
+- `CONTAINER_PORT`
+
+Legacy `HOST`, `PORT`, and `URL` remain available for backward compatibility.
 
 ---
 

@@ -1519,6 +1519,15 @@ class _DeeployMixin:
   def _compile_dynamic_env_ui(self, dynamic_env_ui):
     """
     Translate a UI-friendly dynamic env model into backend DYNAMIC_ENV entries.
+
+    Supported UI sources:
+    - static -> {"type": "static", "value": "..."}
+    - host_ip -> {"type": "host_ip"}
+    - container_ip(provider) -> {"type": "shmem", "path": [provider, "CONTAINER_IP"]}
+    - plugin_value(provider, key) -> {"type": "shmem", "path": [provider, key]}
+
+    Explicit raw DYNAMIC_ENV remains the advanced path and should take
+    precedence over DYNAMIC_ENV_UI when both are provided.
     """
     if not isinstance(dynamic_env_ui, dict):
       raise ValueError("DYNAMIC_ENV_UI must be a dictionary")
@@ -1575,6 +1584,9 @@ class _DeeployMixin:
   def _translate_dynamic_env_ui_in_instance_payload(self, instance_payload):
     """
     Compile DYNAMIC_ENV_UI into DYNAMIC_ENV while preserving explicit DYNAMIC_ENV.
+
+    This keeps the request boundary UI-friendly while allowing advanced
+    callers to continue sending raw DYNAMIC_ENV definitions directly.
     """
     if not isinstance(instance_payload, dict):
       return instance_payload
