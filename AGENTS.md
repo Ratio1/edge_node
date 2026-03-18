@@ -103,6 +103,50 @@ The operating model intentionally follows current agent practice:
       - `npx tsc --noEmit --incremental false` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
       - `google-chrome --headless=new --disable-gpu --window-size=1440,2200 --screenshot=.playwright/container-networking-preview.png http://127.0.0.1:3005/playwright-preview`
     - Note: frontend preview screenshot confirmed the new exposed-ports and dynamic-env sections; legacy raw `shmem` references outside `CONTAINER_IP` are still not expressible in the simplified UI and remain an advanced compatibility edge case.
+    - Planned follow-up on `2026-03-18`: generalize dynamic-env UI beyond `container_ip` by adding a `plugin_value(provider, key)` source with built-in semaphore-key mappings for known plugin signatures and free-text key entry for custom signatures. Local working plan: `xperimental/dynamic_env_plugin_value_followup_plan.md`.
+    - Follow-up Phase A completed on `2026-03-18`: `deeploy-dapp` now supports `plugin_value` at the type/schema level, with validation requiring both provider and exported key, and a runnable schema test gate (`npm run test:dynamic-env-schema`) added for this follow-up track.
+    - Follow-up Phase B completed on `2026-03-18`: `deeploy-dapp` now has a centralized plugin-signature semaphore-key capability map with preset explicit keys for CAR/WAR, default `PORT` mapping for built-in native signatures, and manual-key fallback for custom or unknown signatures.
+    - Follow-up Phase C completed on `2026-03-18`: the `deeploy-dapp` dynamic-env editor now supports `plugin_value` with provider plus preset-or-manual key selection, and native-app dependency computation now treats `plugin_value` references the same way as `container_ip` references.
+    - Follow-up Phase D completed on `2026-03-18`: `deeploy-dapp` now serializes `plugin_value(provider, key)` through `DYNAMIC_ENV_UI`, and Deeploy compiles those entries to backend `shmem(path=[provider, key])` while preserving existing `container_ip` translation and explicit `DYNAMIC_ENV` precedence.
+    - Follow-up Phase D verification on `2026-03-18`:
+      - `npm run test:dynamic-env-serialization` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run test:dynamic-env-ui` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run test:plugin-semaphore-keys` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run test:dynamic-env-schema` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run lint` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npx tsc --noEmit --incremental false` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `python3 -m unittest discover -s extensions/business/deeploy/tests -p "test_*.py"`
+    - Follow-up Phase E completed on `2026-03-18`: `deeploy-dapp` now reverse-maps non-`CONTAINER_IP` semaphore paths to `plugin_value(provider, key)` during recovery, edit hydration, legacy JSON import, and read-only display, eliminating the prior flattening of supported `shmem` entries to empty `static` fragments.
+    - Follow-up Phase E verification on `2026-03-18`:
+      - `npm run test:dynamic-env-roundtrip` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run test:dynamic-env-serialization` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run test:dynamic-env-ui` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run test:plugin-semaphore-keys` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run test:dynamic-env-schema` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run lint` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npx tsc --noEmit --incremental false` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+    - Follow-up Phase G completed on `2026-03-18`: the `deeploy-dapp` preview harness now visibly exercises all generalized dynamic-env modes, including `container_ip`, built-in native `PORT`, and a custom free-text plugin key, with fresh desktop/mobile screenshots captured from `/playwright-preview`.
+    - Follow-up Phase G verification on `2026-03-18`:
+      - `npm run lint` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npx tsc --noEmit --incremental false` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `google-chrome --headless=new --disable-gpu --window-size=1440,2200 --screenshot=.playwright/dynamic-env-plugin-value-desktop.png http://localhost:3005/playwright-preview`
+      - `google-chrome --headless=new --disable-gpu --window-size=430,2200 --screenshot=.playwright/dynamic-env-plugin-value-mobile.png http://localhost:3005/playwright-preview`
+    - Follow-up Phase F closed on `2026-03-18`: the planned serializer/compiler/round-trip coverage was fully delivered in the Phase D and Phase E commits, so no separate code-bearing phase was needed beyond running the aggregated frontend/backend test gates.
+    - Post-implementation docs cleanup completed on `2026-03-18`: frontend README, container-app README, and Deeploy/CAR inline docs now describe `plugin_value(provider, key)`, normalized `EXPOSED_PORTS`, and the explicit container-app semaphore networking keys that new consumers should prefer.
+    - FastAPI native semaphore follow-up completed on `2026-03-18`: `FastApiWebAppPlugin` now exports default semaphore keys `HOST`, `PORT`, and `URL` using the allocated runtime port (`self.port`), so bare FastAPI native plugins such as `EDGE_NODE_API_TEST` can satisfy `plugin_value(..., "PORT")` dependencies without per-plugin overrides.
+    - FastAPI native semaphore verification on `2026-03-18`:
+      - `python3 -m unittest naeural_core.business.test_framework.test_fastapi_webapp_semaphore_env` (in `/home/vi/work/ratio1/repos/edge_node/naeural_core`)
+      - `python3 -m unittest discover -s extensions/business/deeploy/tests -p "test_*.py"`
+    - FastAPI native host-key follow-up completed on `2026-03-18`: `FastApiWebAppPlugin` now exports explicit `HOST_IP` and `HOST_PORT` alongside legacy `HOST` and `PORT`, and the `deeploy-dapp` native plugin key presets now expose those explicit host keys ahead of legacy `PORT`.
+    - FastAPI native host-key verification on `2026-03-18`:
+      - `python3 -m unittest naeural_core.business.test_framework.test_fastapi_webapp_semaphore_env` (in `/home/vi/work/ratio1/repos/edge_node/naeural_core`)
+      - `python3 -m unittest discover -s extensions/business/deeploy/tests -p "test_*.py"`
+      - `npm run test:plugin-semaphore-keys` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run test:dynamic-env-ui` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npm run lint` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npx tsc --noEmit --incremental false` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+    - Native UI key simplification completed on `2026-03-18`: the `deeploy-dapp` standard key list for built-in native providers now shows only `HOST_IP` and `HOST_PORT`; legacy `PORT` remains backend-supported and round-trippable but is no longer advertised as a parallel preset in the normal UI.
+    - FastAPI semaphore guard follow-up completed on `2026-03-18`: the default `FastApiWebAppPlugin` semaphore export now degrades gracefully when localhost IP resolution fails, skipping `HOST`/`HOST_IP`/`URL` export with warnings instead of aborting semaphore readiness for the provider.
 
 ### How To Run
 - Local dev (single node, local image):
