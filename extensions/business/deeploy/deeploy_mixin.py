@@ -2923,9 +2923,9 @@ class _DeeployMixin:
       }
 
     if failed_pipeline_cids:
-      self.Pd(
+      self.P(
         f"These job pipeline fetches failed during get_apps: {failed_pipeline_cids}",
-        color='y'
+        color='r'
       )
 
     return result
