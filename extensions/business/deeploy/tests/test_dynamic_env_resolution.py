@@ -92,6 +92,37 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
         "API_HOST": [{"source": "container_ip"}]
       })
 
+  def test_compile_dynamic_env_ui_supports_plugin_value(self):
+    plugin = make_deeploy_plugin()
+
+    compiled = plugin._compile_dynamic_env_ui({
+      "UPSTREAM_PORT": [
+        {"source": "plugin_value", "provider": "native-agent", "key": "PORT"}
+      ]
+    })
+
+    self.assertEqual(compiled, {
+      "UPSTREAM_PORT": [
+        {"type": "shmem", "path": ["native-agent", "PORT"]}
+      ]
+    })
+
+  def test_compile_dynamic_env_ui_rejects_plugin_value_without_provider(self):
+    plugin = make_deeploy_plugin()
+
+    with self.assertRaisesRegex(ValueError, "plugin_value requires a provider"):
+      plugin._compile_dynamic_env_ui({
+        "UPSTREAM_PORT": [{"source": "plugin_value", "key": "PORT"}]
+      })
+
+  def test_compile_dynamic_env_ui_rejects_plugin_value_without_key(self):
+    plugin = make_deeploy_plugin()
+
+    with self.assertRaisesRegex(ValueError, "plugin_value requires a key"):
+      plugin._compile_dynamic_env_ui({
+        "UPSTREAM_PORT": [{"source": "plugin_value", "provider": "native-agent"}]
+      })
+
 
 if __name__ == "__main__":
   unittest.main()

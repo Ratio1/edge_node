@@ -1554,6 +1554,17 @@ class _DeeployMixin:
             "type": "shmem",
             "path": [provider.strip(), "CONTAINER_IP"],
           })
+        elif source == "plugin_value":
+          provider = entry.get("provider")
+          key = entry.get("key")
+          if not isinstance(provider, str) or not provider.strip():
+            raise ValueError(f"DYNAMIC_ENV_UI[{env_name}] plugin_value requires a provider")
+          if not isinstance(key, str) or not key.strip():
+            raise ValueError(f"DYNAMIC_ENV_UI[{env_name}] plugin_value requires a key")
+          compiled_entries.append({
+            "type": "shmem",
+            "path": [provider.strip(), key.strip()],
+          })
         else:
           raise ValueError(f"DYNAMIC_ENV_UI[{env_name}] has unsupported source '{source}'")
 
