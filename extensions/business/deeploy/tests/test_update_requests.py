@@ -148,6 +148,30 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       {"type": "static", "value": ":3000"},
     ])
 
+  def test_prepare_single_plugin_instance_update_translates_plugin_value_dynamic_env_ui(self):
+    plugin = make_deeploy_plugin()
+
+    prepared = plugin.deeploy_prepare_single_plugin_instance_update(
+      inputs=make_inputs(),
+      instance_id="instance-5",
+      plugin_config={
+        DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        "IMAGE": "repo/app:latest",
+        "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+        "DYNAMIC_ENV_UI": {
+          "UPSTREAM_PORT": [
+            {"source": "plugin_value", "provider": "native-agent", "key": "PORT"},
+          ]
+        },
+      },
+    )
+
+    instance = prepared[plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertNotIn("DYNAMIC_ENV_UI", instance)
+    self.assertEqual(instance["DYNAMIC_ENV"]["UPSTREAM_PORT"], [
+      {"type": "shmem", "path": ["native-agent", "PORT"]},
+    ])
+
 
 if __name__ == "__main__":
   unittest.main()
