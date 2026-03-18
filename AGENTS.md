@@ -50,6 +50,60 @@ The operating model intentionally follows current agent practice:
   - `docker-compose/debug-docker-compose.yaml` expects `local_edge_node`
 - Kubernetes manifests are not self-consistent enough to treat as production-safe without review; validate names, namespaces, PVCs, and mount paths before use.
 
+### Active Refactors
+- CAR / Deeploy networking refactor planning:
+  - Local working plan lives at `xperimental/container_apps_deeploy_refactor_plan.md`.
+  - Approved sequencing is test-first:
+    1. Add CAR compatibility baseline under `extensions/business/container_apps/tests/`.
+    2. Add Deeploy compatibility baseline under `extensions/business/deeploy/tests/`.
+    3. Introduce normalized CAR `EXPOSED_PORTS` model with backward-compatible mappers.
+    4. Refactor CAR runtime and Deeploy request handling around the normalized model.
+  - Compatibility rules locked during planning:
+    - Keep legacy semaphore exports `HOST`, `PORT`, `URL` unchanged.
+    - Add explicit CAR exports `HOST_IP`, `HOST_PORT`, `CONTAINER_IP`, `CONTAINER_PORT`.
+    - Keep `shmem` backend-only for normal UI; UI should model dynamic env as `static`, `host_ip`, or `container_ip` with provider selection.
+  - Current status:
+    - Phase 0 completed on `2026-03-17`: focused CAR compatibility baseline added under `extensions/business/container_apps/tests/`.
+    - Verified passing command: `python3 -m unittest discover -s extensions/business/container_apps/tests -p "test_*.py"`.
+    - Note: existing top-level module `extensions.business.container_apps.test_worker_app_runner` currently has pre-existing failures on this branch and is not the Phase 0 compatibility gate.
+    - Phase 1 completed on `2026-03-17`: focused Deeploy compatibility baseline added under `extensions/business/deeploy/tests/`.
+    - Verified passing command: `python3 -m unittest discover -s extensions/business/deeploy/tests -p "test_*.py"`.
+    - Note: existing top-level module `extensions.business.deeploy.test_deeploy` currently is not a reliable gate on this branch because importing `DeeployManagerApiPlugin` hits an environment/import-time circular dependency in the installed `naeural_core`.
+    - Phase 2 completed on `2026-03-17`: CAR now parses and validates normalized `EXPOSED_PORTS` config and caches normalized state internally.
+    - Verified passing commands:
+      - `python3 -m unittest discover -s extensions/business/container_apps/tests -p "test_*.py"`
+      - `python3 -m unittest extensions.business.container_apps.tests.test_exposed_ports_model`
+    - Note: runtime port allocation and tunnel orchestration still follow legacy CAR paths; Phase 2 only adds normalized parsing/validation, preserving existing behavior unless `EXPOSED_PORTS` is explicitly provided.
+    - Phase 3 completed on `2026-03-17`: CAR now synthesizes normalized `EXPOSED_PORTS` state from legacy `PORT`, legacy port mappings, and legacy tunnel fields, with explicit precedence and conflict handling.
+    - Verified passing command: `python3 -m unittest discover -s extensions/business/container_apps/tests -p "test_*.py"`.
+    - Note: legacy runtime allocation and tunnel orchestration are still the active execution paths; Phase 3 changes only the internal normalized view used for later refactor steps.
+    - Phase 4 completed on `2026-03-17`: CAR runtime now allocates host ports, derives extra tunnels, and resolves health defaults from normalized `EXPOSED_PORTS` state while preserving `self.port` and `extra_ports_mapping` as compatibility outputs.
+    - Verified passing commands:
+      - `python3 -m unittest discover -s extensions/business/container_apps/tests -p "test_*.py"`
+      - `python3 -m unittest extensions.business.container_apps.tests.test_tunnel_runtime_behavior extensions.business.container_apps.tests.test_health_check_behavior`
+    - Note: main-tunnel and extra-tunnel processes remain separate for compatibility, but both are now driven from the normalized per-port model instead of raw legacy config fields.
+    - Phase 5 completed on `2026-03-17`: CAR now exports explicit semaphore networking keys `HOST_IP`, `HOST_PORT`, `CONTAINER_IP`, and `CONTAINER_PORT` while keeping legacy `HOST`, `PORT`, and `URL` semantics unchanged.
+    - Verified passing commands:
+      - `python3 -m unittest discover -s extensions/business/container_apps/tests -p "test_*.py"`
+      - `python3 -m unittest extensions.business.container_apps.tests.test_semaphore_exports`
+    - Note: explicit semaphore keys resolve from the normalized main port, so they work even when CAR is configured only through `EXPOSED_PORTS`.
+    - Phase 6 completed on `2026-03-17`: Deeploy create/update preparation now explicitly preserves normalized CAR `EXPOSED_PORTS` payloads, and containerized request validation rejects malformed non-dict `EXPOSED_PORTS` before the payload reaches CAR.
+    - Verified passing commands:
+      - `python3 -m unittest discover -s extensions/business/deeploy/tests -p "test_*.py"`
+      - `python3 -m unittest extensions.business.deeploy.tests.test_create_requests extensions.business.deeploy.tests.test_update_requests`
+    - Note: no Deeploy config flattening was needed; the main change was test coverage plus shallow request-shape validation at the translation boundary.
+    - Phase 7 completed on `2026-03-17`: Deeploy now translates a UI-friendly `DYNAMIC_ENV_UI` model into backend `DYNAMIC_ENV`, compiling `container_ip` providers to `shmem(..., CONTAINER_IP)` while keeping explicit raw `DYNAMIC_ENV` as the advanced-precedence path.
+    - Verified passing commands:
+      - `python3 -m unittest discover -s extensions/business/deeploy/tests -p "test_*.py"`
+      - `python3 -m unittest extensions.business.deeploy.tests.test_create_requests extensions.business.deeploy.tests.test_update_requests extensions.business.deeploy.tests.test_dynamic_env_resolution`
+    - Note: the frontend contract for this translation is now defined in backend code, but the actual UI implementation is still outside this repo.
+    - Phase 8 completed on `2026-03-17`: the `deeploy-dapp` frontend now edits generic CAR ports through `exposedPorts` rows, uses `container_ip` provider selection for dynamic env, serializes `EXPOSED_PORTS` / `DYNAMIC_ENV_UI`, and recovers/edits/display these values with legacy fallbacks.
+    - Verified passing commands:
+      - `npm run lint` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `npx tsc --noEmit --incremental false` (in `/home/vi/work/ratio1/repos/deeploy-dapp`)
+      - `google-chrome --headless=new --disable-gpu --window-size=1440,2200 --screenshot=.playwright/container-networking-preview.png http://127.0.0.1:3005/playwright-preview`
+    - Note: frontend preview screenshot confirmed the new exposed-ports and dynamic-env sections; legacy raw `shmem` references outside `CONTAINER_IP` are still not expressible in the simplified UI and remain an advanced compatibility edge case.
+
 ### How To Run
 - Local dev (single node, local image):
   - `./debug.sh`
@@ -570,6 +624,15 @@ Entry format:
 - Details: Timeout handler now uses pending_id from state and handles missing `now`; scale-up finalization extracts nodes from status entries safely.
 - Verification: Not run (not requested).
 - Links: `extensions/business/deeploy/deeploy_manager_api.py`
+
+- ID: `ML-20260317-001`
+- Timestamp: `2026-03-17T15:30:21Z`
+- Type: `decision`
+- Summary: Approved phased CAR/Deeploy networking refactor plan centered on a normalized `EXPOSED_PORTS` model and test-first compatibility baselines.
+- Criticality: Cross-cutting architecture and migration plan affecting container apps, Deeploy request handling, semaphore exports, and future UI contracts.
+- Details: Planning locked the sequence to separate CAR and Deeploy test baselines before code changes; the target CAR model is a dict-based `EXPOSED_PORTS` keyed by container port with per-port tunnel config and one `is_main_port`; legacy CAR config and legacy semaphore keys remain backward-compatible through translation; new explicit CAR semaphore env keys will be added for unambiguous host/container addressing; UI-facing dynamic env stays higher-level and compiles `container_ip` to backend `shmem(..., CONTAINER_IP)`.
+- Verification: `date -u +"%Y-%m-%dT%H:%M:%SZ"`; `sed -n '1,260p' AGENTS.md`; local plan written to `xperimental/container_apps_deeploy_refactor_plan.md`
+- Links: `AGENTS.md`, `xperimental/container_apps_deeploy_refactor_plan.md`, `extensions/business/container_apps/container_app_runner.py`, `extensions/business/deeploy/deeploy_mixin.py`
 
 - ID: `ML-20260317-001`
 - Timestamp: `2026-03-17T21:14:35Z`
