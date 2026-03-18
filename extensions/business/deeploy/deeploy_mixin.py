@@ -2837,7 +2837,9 @@ class _DeeployMixin:
         }
       }
     """
+    get_apps_r1fs_timeout = 30
     result = {}
+    failed_pipeline_cids = {}
 
     active_jobs = self.bc.get_escrow_active_jobs(sender_escrow)
     active_job_ids = [int(job["jobId"]) for job in active_jobs]
@@ -2861,16 +2863,43 @@ class _DeeployMixin:
       chain_job = self._serialize_chain_job(active_job)
       grouped_online_apps = online_apps_by_job_id.get(job_id, {})
       online_apps = {node: dict(apps) for node, apps in grouped_online_apps.items()}
+      pipeline_cid = self._get_pipeline_from_cstore(job_id)
 
       pipeline = None
-      try:
-        pipeline = self.get_job_pipeline_from_cstore(job_id)
-      except Exception as exc:
-        self.Pd(f"Failed to load R1FS payload for job {job_id}: {exc}", color='y')
-        pipeline = None
+      if pipeline_cid:
+        try:
+          pipeline = self.get_pipeline_from_r1fs(
+            pipeline_cid,
+            timeout=get_apps_r1fs_timeout,
+            pin=False,
+            raise_on_error=False,
+            show_logs=True,
+          )
+        except Exception as exc:
+          self.Pd(f"Failed to load R1FS payload for job {job_id}: {exc}", color='y')
+          pipeline = None
 
       if pipeline is None:
-        # If we don't have the details in R1FS, we skip the job. It can happen before the deploy, or for legacy jobs.
+        if pipeline_cid:
+          failed_pipeline_cids[str(job_id)] = pipeline_cid
+        if project_id is not None and chain_job.get("projectHash") != project_id:
+          self.Pd(
+            f"Skipping job {job_id}: project_id mismatch and pipeline payload is unavailable.",
+            color='y'
+          )
+          continue
+
+        self.Pd(
+          f"Returning partial get_apps data for job {job_id}: pipeline payload unavailable after "
+          f"{get_apps_r1fs_timeout}s R1FS fetch timeout.",
+          color='y'
+        )
+        result[str(job_id)] = {
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.PIPELINE: None,
+          DEEPLOY_KEYS.ONLINE: online_apps,
+          DEEPLOY_KEYS.CHAIN_JOB: chain_job,
+        }
         continue
 
       pipeline_owner = pipeline[NetMonCt.OWNER.upper()]
@@ -2892,6 +2921,12 @@ class _DeeployMixin:
         DEEPLOY_KEYS.ONLINE: online_apps,
         DEEPLOY_KEYS.CHAIN_JOB: chain_job,
       }
+
+    if failed_pipeline_cids:
+      self.Pd(
+        f"These job pipeline fetches failed during get_apps: {failed_pipeline_cids}",
+        color='y'
+      )
 
     return result
 
