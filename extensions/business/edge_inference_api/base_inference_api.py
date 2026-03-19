@@ -195,12 +195,9 @@ class BaseInferenceApiPlugin(
     it's executed after the on_init() method => self.port will
     already be allocated automatically if not already explicit.
     """
+    super(BaseInferenceApiPlugin, self)._setup_semaphore_env()
     localhost_ip = self.log.get_localhost_ip()
-    port = self.port
     self.semaphore_set_env('API_HOST', localhost_ip)
-    if port:
-      self.semaphore_set_env('API_PORT', str(port))
-      self.semaphore_set_env('API_URL', f'http://{localhost_ip}:{port}')
     return
 
   """PERSISTENCE + STATUS"""

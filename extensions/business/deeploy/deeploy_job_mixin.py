@@ -127,7 +127,14 @@ class _DeeployJobMixin:
     """
     return self.chainstore_hgetall(hkey=DEEPLOY_JOBS_CSTORE_HKEY)
 
-  def get_job_pipeline_from_cstore(self, job_id: int):
+  def get_job_pipeline_from_cstore(
+    self,
+    job_id: int,
+    timeout: int = None,
+    pin: bool = True,
+    raise_on_error: bool = False,
+    show_logs: bool = True,
+  ):
     """
     Get the pipeline from CSTORE and download it from R1FS.
     """
@@ -135,7 +142,13 @@ class _DeeployJobMixin:
     if not cid:
       return None
     
-    return self.get_pipeline_from_r1fs(cid)
+    return self.get_pipeline_from_r1fs(
+      cid,
+      timeout=timeout,
+      pin=pin,
+      raise_on_error=raise_on_error,
+      show_logs=show_logs,
+    )
     
   def _get_pipeline_from_cstore(self, job_id: int):
     """
@@ -143,11 +156,24 @@ class _DeeployJobMixin:
     """
     return self.chainstore_hget(hkey=DEEPLOY_JOBS_CSTORE_HKEY, key=str(job_id))
   
-  def get_pipeline_from_r1fs(self, cid: str):
+  def get_pipeline_from_r1fs(
+    self,
+    cid: str,
+    timeout: int = None,
+    pin: bool = True,
+    raise_on_error: bool = False,
+    show_logs: bool = True,
+  ):
     """
     Get the pipeline from R1FS.
     """
-    return self.r1fs.get_json(cid, show_logs=True)
+    return self.r1fs.get_json(
+      cid,
+      timeout=timeout,
+      pin=pin,
+      raise_on_error=raise_on_error,
+      show_logs=show_logs,
+    )
 
   def _save_pipeline_to_r1fs(self, pipeline: dict):
     """

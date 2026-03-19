@@ -38,7 +38,7 @@ class _RedMeshLlmAgentMixin(object):
   def _maybe_resolve_llm_agent_from_semaphore(self):
     """
     If SEMAPHORED_KEYS is configured and LLM Agent is enabled,
-    read API_HOST and API_PORT from semaphore env published by
+    read API_IP and API_PORT from semaphore env published by
     the LLM Agent API plugin. Overrides static config values.
     """
     if not self.cfg_llm_agent_api_enabled:
@@ -51,7 +51,7 @@ class _RedMeshLlmAgentMixin(object):
     env = self.semaphore_get_env()
     if not env:
       return False
-    api_host = env.get('HOST') or env.get('API_HOST')
+    api_host = env.get('API_IP') or env.get('API_HOST') or env.get('HOST')
     api_port = env.get('PORT') or env.get('API_PORT')
     if api_host and api_port:
       self.P("Resolved LLM Agent API from semaphore: {}:{}".format(api_host, api_port))
