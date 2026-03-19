@@ -2713,9 +2713,9 @@ class _DeeployMixin:
     self.P(f"Checked all job IDs.")
     return netmon_job_ids
   
-  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, allow_missing=False, discovered_instances=None):
+  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, target_nodes=None, allow_missing=False, discovered_instances=None):
     if discovered_instances is None:
-      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, target_nodes=target_nodes, owner=owner)
 
     if len(discovered_instances) == 0:
       if allow_missing:
@@ -2751,15 +2751,6 @@ class _DeeployMixin:
 
     """
     result = self.netmon.network_known_apps(target_nodes=target_nodes)
-    
-    # Count nodes and app instances
-    node_count = len(result)
-    total_pipelines = 0
-    
-    for node, pipelines in result.items():
-      total_pipelines += len(pipelines)
-    
-    self.Pd(f"Found {node_count} nodes with a total of {total_pipelines} pipelines")
     if owner is not None:
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
