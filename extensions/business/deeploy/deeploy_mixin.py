@@ -2851,6 +2851,7 @@ class _DeeployMixin:
       job_id=active_job_ids,
       project_id=project_id
     )
+    self.Pd(f"Fetched {len(all_online_apps)} online apps snapshot for active jobs")
 
     online_apps_by_job_id = self.defaultdict(lambda: self.defaultdict(dict))
     for node, apps in all_online_apps.items():
@@ -2858,6 +2859,7 @@ class _DeeployMixin:
         app_job_id = int(app_data[NetMonCt.DEEPLOY_SPECS][DEEPLOY_KEYS.JOB_ID])
         online_apps_by_job_id[app_job_id][node][app_name] = app_data
 
+    self.Pd(f"Iterating over active jobs and correlating with online apps")
     for active_job in active_jobs:
       job_id = int(active_job["jobId"])
       chain_job = self._serialize_chain_job(active_job)
@@ -2865,6 +2867,7 @@ class _DeeployMixin:
       online_apps = {node: dict(apps) for node, apps in grouped_online_apps.items()}
       pipeline_cid = self._get_pipeline_from_cstore(job_id)
 
+      self.Pd(f"Fetching R1FS payload for job {job_id}")
       pipeline = None
       if pipeline_cid:
         try:
@@ -2902,6 +2905,7 @@ class _DeeployMixin:
         }
         continue
 
+      self.Pd(f"Loaded R1FS payload for job {job_id}")
       pipeline_owner = pipeline[NetMonCt.OWNER.upper()]
       if pipeline_owner != owner:
         self.Pd(
