@@ -12,6 +12,7 @@ class _BCStub:
   """
   def __init__(self):
     self.submitted = []
+    self.active_jobs = []
 
   def node_addr_to_eth_addr(self, node):
     """
@@ -41,6 +42,22 @@ class _BCStub:
         Target node addresses.
     """
     self.submitted.append((job_id, list(nodes)))
+
+  def get_escrow_active_jobs(self, sender_escrow):
+    """
+    Return active jobs configured for the test.
+
+    Parameters
+    ----------
+    sender_escrow : str
+        Escrow address.
+
+    Returns
+    -------
+    list[dict]
+        Active jobs for the escrow.
+    """
+    return list(self.active_jobs)
 
 
 class _InputsStub(dict):
@@ -137,6 +154,24 @@ class _DeeployStub(DeeployManagerApiPlugin):
     """
     return self._chainstore.get(key)
 
+  def chainstore_hget(self, hkey, key):
+    """
+    Lookup a hash key in local stub storage.
+
+    Parameters
+    ----------
+    hkey : str
+        Hash key namespace.
+    key : str
+        Entry key.
+
+    Returns
+    -------
+    Any
+        Stored value or None.
+    """
+    return self._chainstore.get((hkey, key))
+
   def P(self, *args, **kwargs):
     """
     No-op logger.
@@ -213,7 +248,10 @@ class _DeeployStub(DeeployManagerApiPlugin):
     dict
         Auth result with escrow owner.
     """
-    return {DEEPLOY_KEYS.ESCROW_OWNER: "owner"}
+    return {
+      DEEPLOY_KEYS.ESCROW_OWNER: "owner",
+      DEEPLOY_KEYS.SENDER_ESCROW: "escrow1",
+    }
 
   def deeploy_check_payment_and_job_owner(self, inputs, owner, is_create=False, debug=False):
     """
@@ -237,7 +275,7 @@ class _DeeployStub(DeeployManagerApiPlugin):
     """
     return True
 
-  def _get_online_apps(self, job_id=None, owner=None):
+  def _get_online_apps(self, job_id=None, owner=None, project_id=None):
     """
     Stub online app discovery.
 
@@ -518,6 +556,89 @@ class DeeployEndpointTests(unittest.TestCase):
     }
     res = self.plugin.scale_up_job_workers(req)
     self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+
+  def test_get_apps_uses_fast_r1fs_fetch_without_pin(self):
+    """
+    Ensure get_apps uses the shorter non-pinning R1FS fetch path.
+    """
+    self.plugin.bc.active_jobs = [{
+      "jobId": 10,
+      "projectHash": "project-1",
+      "requestTimestamp": 1,
+      "startTimestamp": 2,
+      "lastNodesChangeTimestamp": 3,
+      "jobType": 4,
+      "pricePerEpoch": 5,
+      "lastExecutionEpoch": 6,
+      "numberOfNodesRequested": 1,
+      "balance": 7,
+      "lastAllocatedEpoch": 8,
+      "activeNodes": ["0xabc"],
+      "escrowAddress": "escrow1",
+    }]
+    self.plugin._get_online_apps = lambda owner=None, job_id=None, project_id=None: {}
+    self.plugin._chainstore[("DEEPLOY_DEPLOYED_JOBS", "10")] = "cid-10"
+
+    captured = {}
+
+    def _get_pipeline_from_r1fs(cid, timeout=None, pin=True, raise_on_error=False, show_logs=True):
+      captured.update({
+        "cid": cid,
+        "timeout": timeout,
+        "pin": pin,
+        "raise_on_error": raise_on_error,
+        "show_logs": show_logs,
+      })
+      return {
+        "OWNER": "owner",
+        "DEEPLOY_SPECS": {"project_id": "project-1"},
+      }
+
+    self.plugin.get_pipeline_from_r1fs = _get_pipeline_from_r1fs
+
+    apps = self.plugin._get_apps_by_escrow_active_jobs("escrow1", "owner")
+
+    self.assertIn("10", apps)
+    self.assertEqual(captured["cid"], "cid-10")
+    self.assertEqual(captured["timeout"], 30)
+    self.assertFalse(captured["pin"])
+    self.assertFalse(captured["raise_on_error"])
+    self.assertTrue(captured["show_logs"])
+
+  def test_get_apps_returns_partial_job_when_pipeline_fetch_fails(self):
+    """
+    Ensure get_apps keeps chain and online data when the pipeline cannot be loaded.
+    """
+    self.plugin.bc.active_jobs = [{
+      "jobId": 11,
+      "projectHash": "project-2",
+      "requestTimestamp": 10,
+      "startTimestamp": 20,
+      "lastNodesChangeTimestamp": 30,
+      "jobType": 40,
+      "pricePerEpoch": 50,
+      "lastExecutionEpoch": 60,
+      "numberOfNodesRequested": 2,
+      "balance": 70,
+      "lastAllocatedEpoch": 80,
+      "activeNodes": ["0xdef"],
+      "escrowAddress": "escrow1",
+    }]
+    self.plugin._get_online_apps = lambda owner=None, job_id=None, project_id=None: {}
+    self.plugin._chainstore[("DEEPLOY_DEPLOYED_JOBS", "11")] = "cid-11"
+
+    def _get_pipeline_from_r1fs(cid, timeout=None, pin=True, raise_on_error=False, show_logs=True):
+      return None
+
+    self.plugin.get_pipeline_from_r1fs = _get_pipeline_from_r1fs
+
+    apps = self.plugin._get_apps_by_escrow_active_jobs("escrow1", "owner")
+
+    self.assertIn("11", apps)
+    self.assertEqual(apps["11"][DEEPLOY_KEYS.JOB_ID], 11)
+    self.assertIsNone(apps["11"][DEEPLOY_KEYS.PIPELINE])
+    self.assertEqual(apps["11"][DEEPLOY_KEYS.CHAIN_JOB]["projectHash"], "project-2")
+    self.assertEqual(apps["11"][DEEPLOY_KEYS.ONLINE], {})
 
 
 if __name__ == "__main__":

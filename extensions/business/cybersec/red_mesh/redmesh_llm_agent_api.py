@@ -49,6 +49,7 @@ from .constants import (
   LLM_ANALYSIS_SECURITY_ASSESSMENT,
   LLM_ANALYSIS_VULNERABILITY_SUMMARY,
   LLM_ANALYSIS_REMEDIATION_PLAN,
+  LLM_ANALYSIS_QUICK_SUMMARY,
 )
 
 __VER__ = '0.1.0'
@@ -123,6 +124,8 @@ Include:
 5. Verification steps to confirm remediation
 
 Be practical and provide copy-paste ready solutions where possible.""",
+
+  LLM_ANALYSIS_QUICK_SUMMARY: """You are a cybersecurity expert. Based on the scan results below, write a quick executive summary in exactly 2-4 sentences. Cover: how many ports/services were found, the overall risk posture (critical/high/medium/low), and the single most important finding or action item. Be specific but extremely concise -- this is a dashboard glance summary, not a full report.""",
 }
 
 
@@ -159,6 +162,20 @@ class RedmeshLlmAgentApiPlugin(BasePlugin):
       self.P("WARNING: DeepSeek API key not configured! Set the DEEPSEEK_API_KEY environment variable.", color='r')
     else:
       self.P(f"RedMesh LLM Agent API initialized. Model: {self.cfg_deepseek_model}")
+    return
+
+  def _setup_semaphore_env(self):
+    """Set semaphore environment variables for paired plugins."""
+    super(RedMeshLlmAgentApiPlugin, self)._setup_semaphore_env()
+    localhost_ip = self.log.get_localhost_ip()
+    port = self.cfg_port
+    self.semaphore_set_env('HOST', localhost_ip)
+    self.semaphore_set_env('API_HOST', localhost_ip)
+    if port:
+      self.semaphore_set_env('PORT', str(port))
+      self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, port))
+      self.semaphore_set_env('API_PORT', str(port))
+      self.semaphore_set_env('API_URL', 'http://{}:{}'.format(localhost_ip, port))
     return
 
   def get_additional_fastapi_data(self):
@@ -503,6 +520,7 @@ class RedmeshLlmAgentApiPlugin(BasePlugin):
       LLM_ANALYSIS_SECURITY_ASSESSMENT,
       LLM_ANALYSIS_VULNERABILITY_SUMMARY,
       LLM_ANALYSIS_REMEDIATION_PLAN,
+      LLM_ANALYSIS_QUICK_SUMMARY,
     ]
     if analysis_type not in valid_types:
       return {
@@ -535,7 +553,12 @@ class RedmeshLlmAgentApiPlugin(BasePlugin):
 
     # Build and send request
     # Use higher max_tokens for analysis by default
-    effective_max_tokens = max_tokens if max_tokens is not None else 2048
+    if max_tokens is not None:
+      effective_max_tokens = max_tokens
+    elif analysis_type == LLM_ANALYSIS_QUICK_SUMMARY:
+      effective_max_tokens = 256
+    else:
+      effective_max_tokens = 2048
 
     payload = self._build_deepseek_request(
       messages=messages,
