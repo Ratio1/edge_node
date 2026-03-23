@@ -1221,42 +1221,6 @@ class _ContainerUtilsMixin:
       self.P(f"Error getting container stats: {e}", color='r')
       return None
 
-  def _validate_docker_image_format(self, image_name):
-    """
-    Validate Docker image name format.
-
-    Parameters
-    ----------
-    image_name : str
-        Docker image name to validate
-
-    Returns
-    -------
-    bool
-        True if image name format is valid, False otherwise
-
-    Notes
-    -----
-    Validation checks:
-    - Must be a string
-    - Must contain at least one ':' (tag) or '/' (repository)
-    - Must not contain whitespace characters
-    """
-    if not isinstance(image_name, str):
-      return False
-
-    # Basic validation - should contain at least one colon or slash
-    if ':' not in image_name and '/' not in image_name:
-      return False
-
-    # Check for invalid characters
-    invalid_chars = [' ', '\t', '\n', '\r']
-    for char in invalid_chars:
-      if char in image_name:
-        return False
-
-    return True
-
   ### END COMMON CONTAINER UTILITY METHODS ###
 
   ### EXTRA TUNNELS METHODS ###
