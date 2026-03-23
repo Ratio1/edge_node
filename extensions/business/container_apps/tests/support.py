@@ -99,6 +99,7 @@ def make_container_app_runner():
   plugin.uuid = lambda *a, **k: "efgh"
   plugin.time = lambda: 0
   plugin.cfg_max_log_lines = 10
+  plugin.cfg_image = "test/image:latest"
   plugin.cfg_env = {}
   plugin.cfg_dynamic_env = {}
   plugin.cfg_exposed_ports = {}

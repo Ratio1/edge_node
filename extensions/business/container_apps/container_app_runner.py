@@ -1214,6 +1214,15 @@ class ContainerAppRunnerPlugin(
     ValueError
         If configuration is invalid
     """
+    image = getattr(self, 'cfg_image', None)
+    if not image:
+      raise ValueError("IMAGE is required")
+    if not self._validate_docker_image_format(image):
+      raise ValueError(
+        f"IMAGE has invalid format: '{image}'. "
+        "Expected a Docker image reference (e.g. 'repo/image:tag')"
+      )
+
     self._entrypoint = self._normalize_container_command(
       getattr(self, 'cfg_container_entrypoint', None),
       field_name='CONTAINER_ENTRYPOINT',

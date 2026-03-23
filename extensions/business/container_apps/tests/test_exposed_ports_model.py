@@ -192,6 +192,38 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
         host_port=18081,
       )
 
+  def test_validate_runner_config_rejects_missing_image(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_image = None
+    plugin.cfg_container_entrypoint = None
+    plugin.cfg_container_start_command = None
+    plugin.cfg_build_and_run_commands = []
+
+    with self.assertRaisesRegex(ValueError, "IMAGE is required"):
+      plugin._validate_runner_config()
+
+  def test_validate_runner_config_rejects_invalid_image_format(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_image = "no-tag-or-repo"
+    plugin.cfg_container_entrypoint = None
+    plugin.cfg_container_start_command = None
+    plugin.cfg_build_and_run_commands = []
+
+    with self.assertRaisesRegex(ValueError, "invalid format"):
+      plugin._validate_runner_config()
+
+  def test_validate_runner_config_accepts_valid_image(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_image = "myregistry/myimage:v1.0"
+    plugin.cfg_exposed_ports = {"3000": {"is_main_port": True}}
+    plugin.cfg_container_entrypoint = None
+    plugin.cfg_container_start_command = None
+    plugin.cfg_build_and_run_commands = []
+
+    plugin._validate_runner_config()
+
+    self.assertEqual(plugin._normalized_exposed_ports[3000]["container_port"], 3000)
+
   def test_explicit_exposed_ports_win_over_legacy_fields(self):
     plugin = make_container_app_runner()
     plugin.cfg_exposed_ports = {
