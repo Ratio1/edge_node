@@ -20,6 +20,7 @@ class ContainerAppRunnerSemaphoreExportTests(unittest.TestCase):
     self.assertEqual(plugin.semaphore_env["PORT"], "3000")
     self.assertEqual(plugin.semaphore_env["URL"], "http://127.0.0.1:3000")
     self.assertEqual(plugin.semaphore_env["HOST_PORT"], "20001")
+    self.assertEqual(plugin.semaphore_env["HOST_URL"], "http://127.0.0.1:20001")
     self.assertEqual(plugin.semaphore_env["CONTAINER_PORT"], "3000")
     self.assertEqual(plugin.semaphore_env["CONTAINER_IP"], "172.18.0.5")
 
@@ -42,6 +43,7 @@ class ContainerAppRunnerSemaphoreExportTests(unittest.TestCase):
 
     self.assertEqual(plugin.semaphore_env["HOST_IP"], "127.0.0.1")
     self.assertEqual(plugin.semaphore_env["HOST_PORT"], "21001")
+    self.assertEqual(plugin.semaphore_env["HOST_URL"], "http://127.0.0.1:21001")
     self.assertEqual(plugin.semaphore_env["CONTAINER_PORT"], "3005")
     self.assertEqual(plugin.semaphore_env["CONTAINER_IP"], "172.18.0.5")
     self.assertEqual(plugin.semaphore_env["PORT"], "3005")

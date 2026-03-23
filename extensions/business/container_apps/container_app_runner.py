@@ -2638,6 +2638,7 @@ class ContainerAppRunnerPlugin(
       self.semaphore_set_env('CONTAINER_PORT', str(container_port))
     if host_port:
       self.semaphore_set_env('HOST_PORT', str(host_port))
+      self.semaphore_set_env('HOST_URL', 'http://{}:{}'.format(localhost_ip, host_port))
     container_ip = self._get_container_ip()
     self.Pd(f"Container IP address: {container_ip}")
     if container_ip:
