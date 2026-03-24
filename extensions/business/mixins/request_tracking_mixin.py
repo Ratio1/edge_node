@@ -82,8 +82,6 @@ class _RequestTrackingMixin(object):
           break
     except Exception as e:
       self.P(f"Error tracking response in cstore: {e}", color='r')
-    if self.__rt_dirty:
-      self.__rt_save()
     return
 
   def __rt_save(self):
