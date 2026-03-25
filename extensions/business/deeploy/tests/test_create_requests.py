@@ -21,7 +21,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(instance["IMAGE"], "repo/app:latest")
     self.assertEqual(instance["PORT"], 3000)
 
-  def test_prepare_plugins_groups_instances_by_signature_and_tracks_names(self):
+  def test_prepare_plugins_groups_instances_by_signature(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
       plugins=[
@@ -31,7 +31,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       ]
     )
 
-    prepared_plugins, name_to_instance = plugin.deeploy_prepare_plugins(inputs)
+    prepared_plugins = plugin.deeploy_prepare_plugins(inputs)
 
     self.assertEqual(len(prepared_plugins), 2)
     grouped = {
@@ -41,9 +41,19 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(len(grouped["CONTAINER_APP_RUNNER"]), 2)
     self.assertEqual(grouped["CONTAINER_APP_RUNNER"][0]["PORT"], 3000)
     self.assertEqual(grouped["CONTAINER_APP_RUNNER"][1]["PORT"], 3001)
-    self.assertEqual(name_to_instance["frontend"]["signature"], "CONTAINER_APP_RUNNER")
-    self.assertEqual(name_to_instance["worker"]["signature"], "CONTAINER_APP_RUNNER")
-    self.assertEqual(name_to_instance["native"]["signature"], "A_SIMPLE_PLUGIN")
+
+  def test_prepare_plugins_preserves_plugin_name_in_instance(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry("CONTAINER_APP_RUNNER", plugin_name="frontend", PORT=3000),
+      ]
+    )
+
+    prepared_plugins = plugin.deeploy_prepare_plugins(inputs)
+
+    instance = prepared_plugins[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(instance[DEEPLOY_KEYS.PLUGIN_NAME], "frontend")
 
   def test_prepare_plugins_regenerates_duplicate_instance_ids(self):
     plugin = make_deeploy_plugin()
@@ -54,7 +64,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       ]
     )
 
-    prepared_plugins, _ = plugin.deeploy_prepare_plugins(inputs)
+    prepared_plugins = plugin.deeploy_prepare_plugins(inputs)
 
     instances = prepared_plugins[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES]
     self.assertEqual(instances[0][plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID], "dup")
@@ -109,55 +119,79 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "EXPOSED_PORTS"):
       plugin._validate_plugins_array(plugins)
 
-  def test_prepare_single_plugin_instance_translates_dynamic_env_ui(self):
+  def test_prepare_plugins_resolves_shmem_with_app_id(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
-      plugin_signature="CONTAINER_APP_RUNNER",
-      app_params={
-        "IMAGE": "repo/app:latest",
-        "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
-        "DYNAMIC_ENV_UI": {
-          "API_URL": [
-            {"source": "static", "value": "http://"},
-            {"source": "container_ip", "provider": "backend"},
-            {"source": "static", "value": ":3000"},
-          ]
-        },
-      },
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", plugin_name="native-api", PROCESS_DELAY=5),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          DYNAMIC_ENV={
+            "API_HOST": [{"type": "shmem", "path": ["native-api", "CONTAINER_IP"]}]
+          },
+        ),
+      ]
     )
 
-    prepared = plugin.deeploy_prepare_single_plugin_instance(inputs)
+    prepared = plugin.deeploy_prepare_plugins(inputs, app_id="app-123")
 
-    instance = prepared[plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
-    self.assertNotIn("DYNAMIC_ENV_UI", instance)
-    self.assertEqual(instance["DYNAMIC_ENV"]["API_URL"], [
-      {"type": "static", "value": "http://"},
-      {"type": "shmem", "path": ["backend", "CONTAINER_IP"]},
-      {"type": "static", "value": ":3000"},
-    ])
+    native_instance = prepared[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    car_instance = prepared[1][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
 
-  def test_prepare_single_plugin_instance_translates_plugin_value_dynamic_env_ui(self):
+    # Semaphore key uses app_id__plugin_name (not sanitized)
+    self.assertEqual(native_instance["SEMAPHORE"], "app-123__native-api")
+    # Shmem path rewritten from plugin name to semaphore key
+    self.assertEqual(
+      car_instance["DYNAMIC_ENV"]["API_HOST"][0]["path"],
+      ["app-123__native-api", "CONTAINER_IP"],
+    )
+    # Consumer gets SEMAPHORED_KEYS
+    self.assertEqual(car_instance["SEMAPHORED_KEYS"], ["app-123__native-api"])
+
+  def test_prepare_plugins_rejects_duplicate_plugin_names(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
-      plugin_signature="CONTAINER_APP_RUNNER",
-      app_params={
-        "IMAGE": "repo/app:latest",
-        "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
-        "DYNAMIC_ENV_UI": {
-          "UPSTREAM_PORT": [
-            {"source": "plugin_value", "provider": "native-agent", "key": "PORT"}
-          ]
-        },
-      },
+      plugins=[
+        make_plugin_entry("CONTAINER_APP_RUNNER", plugin_name="backend", PORT=3000),
+        make_plugin_entry("CONTAINER_APP_RUNNER", plugin_name="backend", PORT=3001),
+      ]
     )
 
-    prepared = plugin.deeploy_prepare_single_plugin_instance(inputs)
+    with self.assertRaisesRegex(ValueError, "Duplicate plugin_name"):
+      plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
 
-    instance = prepared[plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
-    self.assertNotIn("DYNAMIC_ENV_UI", instance)
-    self.assertEqual(instance["DYNAMIC_ENV"]["UPSTREAM_PORT"], [
-      {"type": "shmem", "path": ["native-agent", "PORT"]},
-    ])
+  def test_prepare_plugins_rejects_shmem_referencing_unknown_plugin(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          DYNAMIC_ENV={
+            "API_HOST": [{"type": "shmem", "path": ["nonexistent", "PORT"]}]
+          },
+        ),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "unknown plugin 'nonexistent'"):
+      plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
+
+  def test_prepare_plugins_without_app_id_skips_resolution(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry("CONTAINER_APP_RUNNER", plugin_name="frontend", PORT=3000),
+      ]
+    )
+
+    prepared = plugin.deeploy_prepare_plugins(inputs)
+
+    instance = prepared[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertNotIn("SEMAPHORE", instance)
 
 
 if __name__ == "__main__":

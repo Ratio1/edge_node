@@ -1,5 +1,11 @@
 import copy
+import sys
+import types
 from types import SimpleNamespace
+
+# Stub heavy optional dependencies so naeural_core can be imported in lightweight test environments
+for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
+  sys.modules.setdefault(_mod_name, types.ModuleType(_mod_name))
 
 from naeural_core import constants as ct
 

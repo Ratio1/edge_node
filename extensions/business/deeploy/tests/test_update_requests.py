@@ -122,7 +122,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       },
     })
 
-  def test_prepare_single_plugin_instance_update_translates_dynamic_env_ui(self):
+  def test_prepare_single_plugin_instance_update_preserves_dynamic_env(self):
     plugin = make_deeploy_plugin()
 
     prepared = plugin.deeploy_prepare_single_plugin_instance_update(
@@ -131,24 +131,22 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       plugin_config={
         DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
         "IMAGE": "repo/app:latest",
-        "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
-        "DYNAMIC_ENV_UI": {
+        "DYNAMIC_ENV": {
           "API_HOST": [
-            {"source": "host_ip"},
-            {"source": "static", "value": ":3000"},
+            {"type": "host_ip"},
+            {"type": "static", "value": ":3000"},
           ]
         },
       },
     )
 
     instance = prepared[plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
-    self.assertNotIn("DYNAMIC_ENV_UI", instance)
     self.assertEqual(instance["DYNAMIC_ENV"]["API_HOST"], [
       {"type": "host_ip"},
       {"type": "static", "value": ":3000"},
     ])
 
-  def test_prepare_single_plugin_instance_update_translates_plugin_value_dynamic_env_ui(self):
+  def test_prepare_single_plugin_instance_update_preserves_shmem_dynamic_env(self):
     plugin = make_deeploy_plugin()
 
     prepared = plugin.deeploy_prepare_single_plugin_instance_update(
@@ -157,17 +155,15 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       plugin_config={
         DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
         "IMAGE": "repo/app:latest",
-        "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
-        "DYNAMIC_ENV_UI": {
+        "DYNAMIC_ENV": {
           "UPSTREAM_PORT": [
-            {"source": "plugin_value", "provider": "native-agent", "key": "PORT"},
+            {"type": "shmem", "path": ["native-agent", "PORT"]},
           ]
         },
       },
     )
 
     instance = prepared[plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
-    self.assertNotIn("DYNAMIC_ENV_UI", instance)
     self.assertEqual(instance["DYNAMIC_ENV"]["UPSTREAM_PORT"], [
       {"type": "shmem", "path": ["native-agent", "PORT"]},
     ])
