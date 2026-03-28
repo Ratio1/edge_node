@@ -159,6 +159,7 @@ class _DeeployMixin:
     dct_deeploy_specs = self._ensure_deeploy_specs_job_config(
       dct_deeploy_specs,
       pipeline_params=pipeline_params,
+      stack_job_config=inputs.get(DEEPLOY_KEYS.STACK_JOB_CONFIG),
     )
 
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
@@ -290,6 +291,7 @@ class _DeeployMixin:
     dct_deeploy_specs = self._ensure_deeploy_specs_job_config(
       dct_deeploy_specs,
       pipeline_params=pipeline_params,
+      stack_job_config=inputs.get(DEEPLOY_KEYS.STACK_JOB_CONFIG),
     )
 
     requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
@@ -945,7 +947,7 @@ class _DeeployMixin:
       return prepared_plugins
 
 
-  def _ensure_deeploy_specs_job_config(self, deeploy_specs, pipeline_params=None):
+  def _ensure_deeploy_specs_job_config(self, deeploy_specs, pipeline_params=None, stack_job_config=None):
     """
     Ensure deeploy_specs contains a job_config section holding pipeline_params.
     """
@@ -973,6 +975,28 @@ class _DeeployMixin:
       resolved_params = {}
 
     job_config[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(resolved_params)
+
+    if stack_job_config is None:
+      stack_job_config = job_config.get(DEEPLOY_KEYS.STACK_JOB_CONFIG)
+
+    if isinstance(stack_job_config, dict):
+      for key in (
+        DEEPLOY_KEYS.STACK_ID,
+        DEEPLOY_KEYS.STACK_ALIAS,
+        DEEPLOY_KEYS.STACK_INDEX,
+        DEEPLOY_KEYS.STACK_SIZE,
+        DEEPLOY_KEYS.STACK_CONTAINER_REF,
+        DEEPLOY_KEYS.STACK_CONTAINER_ALIAS,
+        DEEPLOY_KEYS.STACK_TYPE,
+      ):
+        if key in stack_job_config and stack_job_config[key] is not None:
+          job_config[key] = self.deepcopy(stack_job_config[key])
+    elif stack_job_config is not None:
+      self.Pd(
+        "Invalid stack_job_config detected while normalizing deeploy_specs; expected a dictionary.",
+        color='y'
+      )
+
     specs[DEEPLOY_KEYS.JOB_CONFIG] = job_config
     return specs
 
