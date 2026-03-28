@@ -15,7 +15,7 @@ from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
 from .deeploy_const import (
-  DEEPLOY_CREATE_REQUEST, DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
+  DEEPLOY_CREATE_REQUEST, DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN, DEEPLOY_CREATE_BATCH_REQUEST, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
   DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST,
   DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
@@ -521,6 +521,7 @@ class DeeployManagerApiPlugin(
       deeploy_specs_payload = self._ensure_deeploy_specs_job_config(
         deeploy_specs_payload,
         pipeline_params=pipeline_params,
+        stack_job_config=inputs.get(DEEPLOY_KEYS.STACK_JOB_CONFIG),
       )
 
       dct_status, str_status, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
@@ -1031,6 +1032,76 @@ class DeeployManagerApiPlugin(
     if isinstance(result, dict) and result.get('__pending__') is not None:
       return self._register_pending_deploy_request(result['__pending__'])
     return result
+
+  @BasePlugin.endpoint(method="post")
+  # /create_pipelines_batch
+  def create_pipelines_batch(
+    self,
+    request: dict = DEEPLOY_CREATE_BATCH_REQUEST
+  ):
+    """
+    Create multiple pipelines in one API call.
+
+    Expects `request.requests` to be a list of normal create_pipeline payloads.
+    Returns per-item results plus an aggregate status:
+      - success: all items succeeded/command_delivered
+      - fail: all items failed/timeout/error
+      - partial: mixed outcomes
+    """
+    self.Pd(f"Called Deeploy create_pipelines_batch endpoint")
+
+    try:
+      requests = request.get(DEEPLOY_KEYS.REQUESTS, [])
+      if not isinstance(requests, list) or len(requests) == 0:
+        raise ValueError(f"{DEEPLOY_ERRORS.REQUEST3}: '{DEEPLOY_KEYS.REQUESTS}' must be a non-empty list.")
+
+      results = []
+      statuses = []
+
+      for idx, request_item in enumerate(requests):
+        if not isinstance(request_item, dict):
+          item_result = {
+            DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.FAIL,
+            DEEPLOY_KEYS.ERROR: f"{DEEPLOY_ERRORS.REQUEST3}: request[{idx}] must be an object.",
+          }
+        else:
+          item_result = self._process_pipeline_request(
+            request=request_item,
+            is_create=True,
+            async_mode=False,
+          )
+          if not isinstance(item_result, dict):
+            item_result = {
+              DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.FAIL,
+              DEEPLOY_KEYS.ERROR: f"{DEEPLOY_ERRORS.GENERIC}: Unexpected item response type.",
+            }
+
+        item_result = self.deepcopy(item_result)
+        item_result[DEEPLOY_KEYS.ITEM_INDEX] = idx
+        results.append(item_result)
+        statuses.append(item_result.get(DEEPLOY_KEYS.STATUS, DEEPLOY_STATUS.FAIL))
+
+      success_statuses = {DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED}
+      fail_statuses = {DEEPLOY_STATUS.FAIL, DEEPLOY_STATUS.TIMEOUT, DEEPLOY_STATUS.ERROR}
+
+      if statuses and all(status in success_statuses for status in statuses):
+        aggregate_status = DEEPLOY_STATUS.SUCCESS
+      elif statuses and all(status in fail_statuses for status in statuses):
+        aggregate_status = DEEPLOY_STATUS.FAIL
+      else:
+        aggregate_status = DEEPLOY_STATUS.PARTIAL
+
+      result = {
+        DEEPLOY_KEYS.STATUS: aggregate_status,
+        DEEPLOY_KEYS.RESULTS: results,
+      }
+    except Exception as e:
+      result = self.__handle_error(e, request)
+
+    response = self._get_response({
+      **result
+    })
+    return response
 
   @BasePlugin.endpoint(method="post")
   # /update_pipeline
