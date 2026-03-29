@@ -70,6 +70,12 @@ Notes:
 
 Compatibility is required.
 
+Deployment reality:
+- `EXPOSED_PORTS` has not been deployed as a production contract yet.
+- There are currently no known deployed apps relying on the existing nested `EXPOSED_PORTS` shape as a stable production interface.
+- The primary backward-compatibility boundary for deployed users remains the legacy CAR config surface (`PORT`, legacy tunnel fields, legacy semaphore fields, and legacy update/create flows).
+- Even so, backend/frontend migration support for both flat and nested `EXPOSED_PORTS` remains worthwhile during rollout to avoid breaking in-flight development, testing, or unreleased payloads.
+
 Backend must accept all of the following during migration:
 
 1. Flat input:
@@ -107,6 +113,7 @@ Normalization rules:
 - Nested `tunnel` config is still accepted and normalized into the flat internal tunnel fields.
 - Explicit `EXPOSED_PORTS` still takes precedence over legacy fields.
 - Frontend recovery/edit paths should continue to read both flat and nested shapes during migration.
+- Legacy deployed configs that use `PORT`, `CLOUDFLARE_TOKEN`, `EXTRA_TUNNELS`, and related tunnel-engine fields must keep working unchanged.
 
 Conflict resolution inside a single `EXPOSED_PORTS[port]` entry:
 - Flat fields win over nested `tunnel` fields when both are present.
@@ -147,6 +154,12 @@ Planned migration end-state:
 - Phase B: frontend writes flat shape by default once backend rollout is complete.
 - Phase C: nested `tunnel` input remains accepted but is considered deprecated.
 - Phase D: optional later cleanup can remove nested input support in a separate breaking-change phase, not in this rollout.
+
+Compatibility priority order for this rollout:
+1. Do not break existing deployed legacy CAR configs based on `PORT` and related legacy tunnel fields.
+2. Keep create/update request translation safe for both legacy and `EXPOSED_PORTS`-based payloads.
+3. Keep unreleased nested `EXPOSED_PORTS` payloads readable during migration.
+4. Move new writes toward the flat `EXPOSED_PORTS` shape once backend support is present.
 
 ## Supported Tunnel Protocols
 
