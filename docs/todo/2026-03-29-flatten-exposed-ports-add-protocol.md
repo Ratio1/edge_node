@@ -1,7 +1,7 @@
 # Flatten EXPOSED_PORTS Tunnel Config + Add Protocol Support
 
 **Date:** 2026-03-29
-**Status:** Planned
+**Status:** Implemented (2026-03-29)
 **Repos:** `edge_node` (backend), `deeploy-dapp` (frontend)
 
 ---
