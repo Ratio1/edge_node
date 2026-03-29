@@ -19,7 +19,14 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
     plugin._validate_extra_tunnels_config()
 
     self.assertEqual(plugin.extra_tunnel_configs, {
-      3002: "token-3002"
+      3002: {
+        "token": "token-3002",
+        "protocol": "http",
+        "engine": "cloudflare",
+        "max_retries": None,
+        "backoff_initial": None,
+        "backoff_max": None,
+      }
     })
     self.assertEqual(plugin.extra_ports_mapping, {
       20001: 3000,
@@ -31,7 +38,14 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
     plugin.cfg_port = 3000
     plugin.cfg_cloudflare_token = "main-token"
     plugin.extra_tunnel_configs = {
-      3000: "extra-token"
+      3000: {
+        "token": "extra-token",
+        "protocol": "http",
+        "engine": "cloudflare",
+        "max_retries": None,
+        "backoff_initial": None,
+        "backoff_max": None,
+      }
     }
 
     self.assertFalse(plugin._should_start_main_tunnel())
@@ -101,7 +115,14 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
       20002: 3002,
     })
     self.assertEqual(plugin.extra_tunnel_configs, {
-      3002: "extra-token",
+      3002: {
+        "token": "extra-token",
+        "protocol": "http",
+        "engine": "cloudflare",
+        "max_retries": None,
+        "backoff_initial": None,
+        "backoff_max": None,
+      },
     })
 
 

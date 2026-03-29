@@ -1508,15 +1508,19 @@ class ContainerAppRunnerPlugin(
   def _get_main_tunnel_config(self):
     """
     Return the normalized tunnel config for the main exposed port, if enabled.
+    Reads flat fields (token, protocol, engine) from the normalized main port entry.
     """
-    normalized_exposed_ports = self._normalized_exposed_ports or self._refresh_normalized_exposed_ports_state()
-    main_exposed_port = self._get_main_exposed_port(normalized_exposed_ports)
-    if not main_exposed_port:
+    main = self._normalized_main_exposed_port
+    if not main:
       return None
-    tunnel_config = main_exposed_port.get("tunnel")
-    if not tunnel_config or tunnel_config.get("enabled") is not True:
+    token = main.get("token")
+    if not token:
       return None
-    return tunnel_config
+    return {
+      "token": token,
+      "protocol": main.get("protocol", "http"),
+      "engine": main.get("engine", "cloudflare"),
+    }
 
   def get_cloudflare_token(self):
     """
@@ -1526,6 +1530,16 @@ class ContainerAppRunnerPlugin(
     if tunnel_config and tunnel_config.get("engine") == "cloudflare":
       return tunnel_config.get("token")
     return super(ContainerAppRunnerPlugin, self).get_cloudflare_token()
+
+  def get_cloudflare_protocol(self):
+    """
+    Return the protocol for the main tunnel from normalized config,
+    falling back to the base class implementation.
+    """
+    main = self._normalized_main_exposed_port
+    if main:
+      return main.get("protocol", "http")
+    return super(ContainerAppRunnerPlugin, self).get_cloudflare_protocol()
 
 
   def stop_tunnel_engine(self):
@@ -1704,7 +1718,7 @@ class ContainerAppRunnerPlugin(
     return True
 
 
-  def _build_tunnel_command(self, container_port, token):
+  def _build_tunnel_command(self, container_port, token, protocol="http"):
     """
     Build Cloudflare tunnel command for a specific port.
 
@@ -1714,6 +1728,8 @@ class ContainerAppRunnerPlugin(
         Container port to tunnel
     token : str
         Cloudflare tunnel token
+    protocol : str, optional
+        Tunnel origin protocol (default "http")
 
     Returns
     -------
@@ -1734,7 +1750,7 @@ class ContainerAppRunnerPlugin(
       "--token",
       str(token),
       "--url",
-      f"http://127.0.0.1:{host_port}"
+      f"{protocol}://127.0.0.1:{host_port}"
     ]
 
 
@@ -1765,7 +1781,7 @@ class ContainerAppRunnerPlugin(
     return self._get_main_tunnel_config() is not None
 
 
-  def _start_extra_tunnel(self, container_port, token):
+  def _start_extra_tunnel(self, container_port, tunnel_config):
     """
     Start a single extra tunnel for a specific container port.
 
@@ -1773,20 +1789,27 @@ class ContainerAppRunnerPlugin(
     ----------
     container_port : int
         Container port to expose
-    token : str
-        Cloudflare tunnel token
+    tunnel_config : dict or str
+        Tunnel config dict with token/protocol/engine keys, or legacy string token
 
     Returns
     -------
     bool
         True if tunnel started successfully, False otherwise
     """
+    if isinstance(tunnel_config, dict):
+      token = tunnel_config.get("token")
+      protocol = tunnel_config.get("protocol", "http")
+    else:
+      token = tunnel_config  # legacy compat
+      protocol = "http"
+
     if not token:
       self.P(f"No token provided for extra tunnel on port {container_port}", color='r')
       return False
 
     # Build tunnel command
-    command = self._build_tunnel_command(container_port, token)
+    command = self._build_tunnel_command(container_port, token, protocol)
     if not command:
       return False
 
@@ -1852,8 +1875,8 @@ class ContainerAppRunnerPlugin(
     self.P(f"Starting {len(self.extra_tunnel_configs)} extra tunnel(s)...")
 
     started_count = 0
-    for container_port, token in self.extra_tunnel_configs.items():
-      if self._start_extra_tunnel(container_port, token):
+    for container_port, tunnel_config in self.extra_tunnel_configs.items():
+      if self._start_extra_tunnel(container_port, tunnel_config):
         started_count += 1
 
     self.P(f"Started {started_count}/{len(self.extra_tunnel_configs)} extra tunnels")
@@ -2759,14 +2782,14 @@ class ContainerAppRunnerPlugin(
           continue
 
         # All checks passed - attempt restart
-        token = self.extra_tunnel_configs.get(container_port)
-        if token:
+        tunnel_config = self.extra_tunnel_configs.get(container_port)
+        if tunnel_config:
           failures = self._tunnel_consecutive_failures.get(container_port, 0)
           self.P(
             f"Restarting extra tunnel for port {container_port} (attempt {failures})...",
             color='r'
           )
-          self._start_extra_tunnel(container_port, token)
+          self._start_extra_tunnel(container_port, tunnel_config)
       else:
         # Tunnel is running - maybe reset retry counter
         self._maybe_reset_tunnel_retry_counter(container_port)

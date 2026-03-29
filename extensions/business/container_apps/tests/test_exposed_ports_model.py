@@ -30,10 +30,12 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
     self.assertEqual(normalized[3000]["container_port"], 3000)
     self.assertTrue(normalized[3000]["is_main_port"])
     self.assertIsNone(normalized[3000]["host_port"])
-    self.assertEqual(normalized[3000]["tunnel"]["token"], "cf-token")
+    self.assertEqual(normalized[3000]["token"], "cf-token")
+    self.assertEqual(normalized[3000]["engine"], "cloudflare")
+    self.assertEqual(normalized[3000]["protocol"], "http")
     self.assertFalse(normalized[3001]["is_main_port"])
     self.assertIsNone(normalized[3001]["host_port"])
-    self.assertEqual(normalized[3001]["tunnel"]["enabled"], False)
+    self.assertIsNone(normalized[3001]["token"])
 
   def test_validate_runner_config_caches_normalized_exposed_ports(self):
     plugin = make_container_app_runner()
@@ -71,7 +73,7 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "duplicate host_port"):
       plugin._normalize_exposed_ports_config()
 
-  def test_normalize_exposed_ports_rejects_invalid_tunnel_config(self):
+  def test_normalize_exposed_ports_nested_tunnel_enabled_without_token_produces_no_tunnel(self):
     plugin = make_container_app_runner()
     plugin.cfg_exposed_ports = {
       "3000": {
@@ -82,8 +84,9 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
       }
     }
 
-    with self.assertRaisesRegex(ValueError, "tunnel.token is required"):
-      plugin._normalize_exposed_ports_config()
+    normalized = plugin._normalize_exposed_ports_config()
+
+    self.assertIsNone(normalized[3000]["token"])
 
   def test_normalize_exposed_ports_requires_dict_keyed_by_valid_ports(self):
     plugin = make_container_app_runner()
@@ -106,7 +109,7 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
     self.assertEqual(sorted(normalized.keys()), [3000, 3001, 3002])
     self.assertTrue(normalized[3001]["is_main_port"])
     self.assertIsNone(normalized[3000]["host_port"])
-    self.assertIsNone(normalized[3002]["tunnel"])
+    self.assertIsNone(normalized[3002]["token"])
 
   def test_legacy_explicit_host_port_mapping_normalizes_into_exposed_ports(self):
     plugin = make_container_app_runner()
@@ -131,11 +134,9 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
 
     normalized = plugin._normalize_exposed_ports_config()
 
-    self.assertEqual(normalized[3000]["tunnel"], {
-      "enabled": True,
-      "engine": "cloudflare",
-      "token": "main-token",
-    })
+    self.assertEqual(normalized[3000]["token"], "main-token")
+    self.assertEqual(normalized[3000]["engine"], "cloudflare")
+    self.assertEqual(normalized[3000]["protocol"], "http")
 
   def test_legacy_tunnel_engine_parameters_token_falls_back_for_main_port(self):
     plugin = make_container_app_runner()
@@ -146,7 +147,7 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
 
     normalized = plugin._normalize_exposed_ports_config()
 
-    self.assertEqual(normalized[3000]["tunnel"]["token"], "params-token")
+    self.assertEqual(normalized[3000]["token"], "params-token")
 
   def test_legacy_extra_tunnels_create_ports_and_attach_tunnel(self):
     plugin = make_container_app_runner()
@@ -158,11 +159,9 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
     normalized = plugin._normalize_exposed_ports_config()
 
     self.assertTrue(normalized[3000]["is_main_port"])
-    self.assertEqual(normalized[3002]["tunnel"], {
-      "enabled": True,
-      "engine": "cloudflare",
-      "token": "extra-token",
-    })
+    self.assertEqual(normalized[3002]["token"], "extra-token")
+    self.assertEqual(normalized[3002]["engine"], "cloudflare")
+    self.assertEqual(normalized[3002]["protocol"], "http")
 
   def test_legacy_main_extra_tunnel_override_prefers_explicit_per_port_token(self):
     plugin = make_container_app_runner()
@@ -174,7 +173,7 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
 
     normalized = plugin._normalize_exposed_ports_config()
 
-    self.assertEqual(normalized[3000]["tunnel"]["token"], "extra-token")
+    self.assertEqual(normalized[3000]["token"], "extra-token")
     self.assertTrue(any("overridden by EXTRA_TUNNELS" in msg for msg in plugin.logged_messages))
 
   def test_legacy_conflicting_explicit_host_ports_are_rejected(self):
@@ -211,6 +210,23 @@ class ContainerAppRunnerExposedPortsModelTests(unittest.TestCase):
 
     with self.assertRaisesRegex(ValueError, "IMAGE is required"):
       plugin._validate_runner_config()
+
+  def test_normalize_exposed_ports_accepts_flat_input(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_exposed_ports = {
+      "3000": {
+        "is_main_port": True,
+        "token": "cf-token",
+        "protocol": "http",
+      },
+    }
+
+    normalized = plugin._normalize_exposed_ports_config()
+
+    self.assertEqual(normalized[3000]["token"], "cf-token")
+    self.assertEqual(normalized[3000]["protocol"], "http")
+    self.assertEqual(normalized[3000]["engine"], "cloudflare")
+    self.assertTrue(normalized[3000]["is_main_port"])
 
   def test_explicit_exposed_ports_win_over_legacy_fields(self):
     plugin = make_container_app_runner()

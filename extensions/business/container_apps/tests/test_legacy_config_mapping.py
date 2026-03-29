@@ -26,7 +26,14 @@ class ContainerAppRunnerLegacyConfigMappingTests(unittest.TestCase):
     plugin._validate_extra_tunnels_config()
 
     self.assertEqual(plugin.extra_tunnel_configs, {
-      3005: "token-3005"
+      3005: {
+        "token": "token-3005",
+        "protocol": "http",
+        "engine": "cloudflare",
+        "max_retries": None,
+        "backoff_initial": None,
+        "backoff_max": None,
+      }
     })
     self.assertEqual(plugin.extra_ports_mapping, {
       20001: 3005

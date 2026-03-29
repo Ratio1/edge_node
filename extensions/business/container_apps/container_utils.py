@@ -10,6 +10,8 @@ import socket
 # Path for container volumes
 CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 
+ALLOWED_TUNNEL_PROTOCOLS = ("http", "https", "tcp", "ssh", "rdp", "smb")
+
 
 class _ContainerUtilsMixin:
 
@@ -223,41 +225,173 @@ class _ContainerUtilsMixin:
           )
         used_host_ports[host_port] = container_port
 
-      tunnel = config.get("tunnel")
-      if tunnel is None:
-        normalized_tunnel = None
-      else:
-        if not isinstance(tunnel, dict):
+      # --- Tunnel field normalization (flat + nested compat) ---
+      tunnel_nested = config.get("tunnel")
+      nested_token = None
+      nested_engine = None
+      if tunnel_nested is not None:
+        if not isinstance(tunnel_nested, dict):
           raise ValueError(f"EXPOSED_PORTS[{container_port}].tunnel must be a dictionary")
-        normalized_tunnel = self.deepcopy(tunnel)
-        enabled = normalized_tunnel.get("enabled", False)
-        if not isinstance(enabled, bool):
-          raise ValueError(f"EXPOSED_PORTS[{container_port}].tunnel.enabled must be a boolean")
-        engine = normalized_tunnel.get("engine", "cloudflare")
-        if engine is not None:
-          engine = str(engine).strip().lower()
-        if enabled and engine not in ("cloudflare",):
-          raise ValueError(
-            f"EXPOSED_PORTS[{container_port}].tunnel.engine must be 'cloudflare' when enabled"
+        nested_token = tunnel_nested.get("token")
+        if isinstance(nested_token, str):
+          nested_token = nested_token.strip() or None
+        else:
+          nested_token = None
+        nested_engine = tunnel_nested.get("engine")
+        if isinstance(nested_engine, str):
+          nested_engine = nested_engine.strip().lower() or None
+        else:
+          nested_engine = None
+        # If nested tunnel.enabled is explicitly False and no flat token, treat as no tunnel
+        nested_enabled = tunnel_nested.get("enabled", False)
+
+      # Read flat fields
+      flat_token = config.get("token")
+      if isinstance(flat_token, str):
+        flat_token = flat_token.strip() or None
+      else:
+        flat_token = None
+
+      flat_protocol = config.get("protocol")
+      flat_engine = config.get("engine")
+
+      # Resolve token: flat wins over nested
+      if flat_token is not None and nested_token is not None and flat_token != nested_token:
+        self.P(
+          f"EXPOSED_PORTS[{container_port}]: flat token overrides nested tunnel.token "
+          f"(deprecated nested format)",
+          color='y'
+        )
+      token = flat_token if flat_token is not None else nested_token
+
+      # If nested tunnel.enabled is False but flat token is present, flat wins
+      if (
+        tunnel_nested is not None and
+        not tunnel_nested.get("enabled", False) and
+        flat_token is not None
+      ):
+        self.P(
+          f"EXPOSED_PORTS[{container_port}]: flat token present but nested tunnel.enabled=False; "
+          f"tunnel is enabled via flat token",
+          color='y'
+        )
+
+      # Resolve engine: flat wins over nested
+      if flat_engine is not None:
+        if isinstance(flat_engine, str):
+          engine = flat_engine.strip().lower() or None
+        else:
+          engine = None
+        if nested_engine is not None and engine != nested_engine:
+          self.P(
+            f"EXPOSED_PORTS[{container_port}]: flat engine overrides nested tunnel.engine "
+            f"(deprecated nested format)",
+            color='y'
           )
-        token = normalized_tunnel.get("token")
-        if enabled and engine == "cloudflare":
-          if not isinstance(token, str) or not token.strip():
-            raise ValueError(
-              f"EXPOSED_PORTS[{container_port}].tunnel.token is required for enabled cloudflare tunnels"
-            )
-          token = token.strip()
-        normalized_tunnel = {
-          "enabled": enabled,
-          "engine": engine,
-          "token": token,
-        }
+      else:
+        engine = nested_engine
+
+      # Default engine to "cloudflare"
+      if engine is None:
+        engine = "cloudflare"
+
+      # Validate engine: only "cloudflare" allowed this phase
+      if engine not in ("cloudflare",):
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}].engine must be 'cloudflare' (got '{engine}')"
+        )
+
+      # Validate token when engine is cloudflare and token is provided
+      if token is not None:
+        if not isinstance(token, str) or not token.strip():
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].token must be a non-empty string when provided"
+          )
+        token = token.strip()
+
+      # Resolve protocol
+      if flat_protocol is not None:
+        if isinstance(flat_protocol, str):
+          protocol = flat_protocol.strip().lower()
+        else:
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].protocol must be a string"
+          )
+      else:
+        protocol = "http"
+
+      # Validate protocol
+      if protocol not in ALLOWED_TUNNEL_PROTOCOLS:
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}].protocol must be one of {ALLOWED_TUNNEL_PROTOCOLS}, "
+          f"got '{protocol}'"
+        )
+
+      # --- Retry overrides ---
+      max_retries = config.get("max_retries")
+      backoff_initial = config.get("backoff_initial")
+      backoff_max = config.get("backoff_max")
+
+      has_retry_overrides = any(v is not None for v in (max_retries, backoff_initial, backoff_max))
+      if has_retry_overrides and token is None:
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}]: retry overrides (max_retries, backoff_initial, "
+          f"backoff_max) require a tunnel token"
+        )
+
+      if max_retries is not None:
+        try:
+          max_retries = int(max_retries)
+        except (TypeError, ValueError):
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].max_retries must be an integer or null"
+          )
+        if max_retries < 0:
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].max_retries must be non-negative"
+          )
+
+      if backoff_initial is not None:
+        try:
+          backoff_initial = float(backoff_initial)
+        except (TypeError, ValueError):
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].backoff_initial must be a number or null"
+          )
+        if backoff_initial <= 0:
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].backoff_initial must be positive"
+          )
+
+      if backoff_max is not None:
+        try:
+          backoff_max = float(backoff_max)
+        except (TypeError, ValueError):
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].backoff_max must be a number or null"
+          )
+        if backoff_max <= 0:
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].backoff_max must be positive"
+          )
+
+      if backoff_initial is not None and backoff_max is not None:
+        if backoff_max < backoff_initial:
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].backoff_max ({backoff_max}) must be >= "
+            f"backoff_initial ({backoff_initial})"
+          )
 
       normalized[container_port] = {
         "container_port": container_port,
         "is_main_port": is_main_port,
         "host_port": host_port,
-        "tunnel": normalized_tunnel,
+        "token": token,
+        "protocol": protocol,
+        "engine": engine,
+        "max_retries": max_retries,
+        "backoff_initial": backoff_initial,
+        "backoff_max": backoff_max,
       }
 
     if len(main_ports) > 1:
@@ -284,7 +418,7 @@ class _ContainerUtilsMixin:
     return None
 
   def _merge_legacy_exposed_port_entry(
-    self, exposed_ports, container_port, is_main_port=None, host_port=None, tunnel=None
+    self, exposed_ports, container_port, is_main_port=None, host_port=None, token=None
   ):
     """
     Merge legacy CAR fields into a raw EXPOSED_PORTS-style entry.
@@ -320,15 +454,15 @@ class _ContainerUtilsMixin:
         )
       entry["host_port"] = host_port
 
-    if tunnel is not None:
-      existing_tunnel = entry.get("tunnel")
-      if existing_tunnel is not None and existing_tunnel != tunnel:
+    if token is not None:
+      existing_token = entry.get("token")
+      if existing_token is not None and existing_token != token:
         raise ValueError(
-          "Legacy config defines conflicting tunnel settings for container port {}".format(
+          "Legacy config defines conflicting tunnel token for container port {}".format(
             container_port
           )
         )
-      entry["tunnel"] = self.deepcopy(tunnel)
+      entry["token"] = token
 
     return entry
 
@@ -370,11 +504,7 @@ class _ContainerUtilsMixin:
         exposed_ports,
         container_port=main_port,
         is_main_port=True,
-        tunnel={
-          "enabled": True,
-          "engine": "cloudflare",
-          "token": main_tunnel_token,
-        },
+        token=main_tunnel_token,
       )
 
     legacy_extra_tunnels = getattr(self, 'cfg_extra_tunnels', None) or {}
@@ -390,19 +520,13 @@ class _ContainerUtilsMixin:
       except (TypeError, ValueError):
         raise ValueError(f"EXTRA_TUNNELS key must be integer port, got: {raw_container_port}")
 
-      tunnel = {
-        "enabled": True,
-        "engine": "cloudflare",
-        "token": normalized_token,
-      }
-
       entry = exposed_ports.get(str(container_port))
       if (
         entry is not None and
-        entry.get("tunnel") is not None and
+        entry.get("token") is not None and
         main_port is not None and
         container_port == int(main_port) and
-        entry.get("tunnel", {}).get("token") != normalized_token
+        entry.get("token") != normalized_token
       ):
         self.P(
           "Legacy tunnel config for main PORT {} is overridden by EXTRA_TUNNELS entry".format(
@@ -410,7 +534,7 @@ class _ContainerUtilsMixin:
           ),
           color='y'
         )
-        entry["tunnel"] = tunnel
+        entry["token"] = normalized_token
         entry["is_main_port"] = True
         continue
 
@@ -418,7 +542,7 @@ class _ContainerUtilsMixin:
         exposed_ports,
         container_port=container_port,
         is_main_port=(main_port is not None and container_port == int(main_port)),
-        tunnel=tunnel,
+        token=normalized_token,
       )
 
     return exposed_ports
@@ -1320,8 +1444,8 @@ class _ContainerUtilsMixin:
     main_container_port = self._get_main_container_port(normalized_exposed_ports)
 
     for container_port, port_config in normalized_exposed_ports.items():
-      tunnel_config = port_config.get("tunnel")
-      if not tunnel_config or tunnel_config.get("enabled") is not True:
+      token = port_config.get("token")
+      if not token:
         continue
 
       if container_port not in self.extra_ports_mapping.values():
@@ -1335,10 +1459,14 @@ class _ContainerUtilsMixin:
       if main_container_port is not None and container_port == main_container_port:
         continue
 
-      token = tunnel_config.get("token")
-      if not token:
-        raise ValueError(f"Normalized tunnel for port {container_port} is missing a token")
-      self.extra_tunnel_configs[container_port] = token
+      self.extra_tunnel_configs[container_port] = {
+        "token": token,
+        "protocol": port_config.get("protocol", "http"),
+        "engine": port_config.get("engine", "cloudflare"),
+        "max_retries": port_config.get("max_retries"),
+        "backoff_initial": port_config.get("backoff_initial"),
+        "backoff_max": port_config.get("backoff_max"),
+      }
 
     self.inverted_ports_mapping = {
       f"{container_port}/tcp": str(host_port)
