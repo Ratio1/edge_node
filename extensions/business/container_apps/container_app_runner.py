@@ -156,11 +156,13 @@ class HealthCheckMode(Enum):
     TCP: TCP port check - works for any protocol (HTTP, WebSocket, gRPC, raw TCP)
     ENDPOINT: HTTP probe to HEALTH_ENDPOINT_PATH - expects 2xx response
     DELAY: Simple time-based delay using TUNNEL_START_DELAY
+    DISABLED: No health probing - app is considered ready as soon as container is running
   """
   AUTO = "auto"
   TCP = "tcp"
   ENDPOINT = "endpoint"
   DELAY = "delay"
+  DISABLED = "disabled"
 
 
 @dataclass
@@ -242,15 +244,6 @@ _CONFIG = {
 
   "TUNNEL_ENGINE_ENABLED": True,
   "TUNNEL_ENGINE_PING_INTERVAL": 30,  # seconds
-  "TUNNEL_ENGINE_PARAMETERS": {
-  },
-
-  # Cloudflare token for main tunnel (backward compatibility)
-  "CLOUDFLARE_TOKEN": None,
-  "CLOUDFLARE_PROTOCOL": "http", # protocol to use for cloudflare tunnel (http or tcp)
-
-  # Extra tunnels for additional ports: {container_port: "cloudflare_token"}
-  "EXTRA_TUNNELS": {},
   "EXTRA_TUNNELS_PING_INTERVAL": 30,  # seconds to ping extra tunnel URLs
 
 
@@ -272,7 +265,6 @@ _CONFIG = {
   "ENV": {},                # dict of env vars for the container
   "DYNAMIC_ENV": {},        # backend dynamic env definition; Deeploy may compile DYNAMIC_ENV_UI into this
   "EXPOSED_PORTS": {},      # normalized container-port config keyed by internal container port
-  "PORT": None,             # legacy main internal container port if it's a web app (int)
   "CONTAINER_RESOURCES" : {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,          # 0 - no GPU, 1 - use GPU
@@ -341,6 +333,14 @@ _CONFIG = {
   "SEMAPHORE_LOG_INTERVAL": 10,
 
   # end of container-specific config options
+
+  # @deprecated — Legacy fields superseded by EXPOSED_PORTS.
+  # Kept for backward compatibility. New deployments should use EXPOSED_PORTS.
+  "PORT": None,                    # Use EXPOSED_PORTS[port].is_main_port
+  "CLOUDFLARE_TOKEN": None,        # Use EXPOSED_PORTS[port].token
+  "CLOUDFLARE_PROTOCOL": "http",   # Use EXPOSED_PORTS[port].protocol
+  "EXTRA_TUNNELS": {},             # Use EXPOSED_PORTS with per-port token
+  "TUNNEL_ENGINE_PARAMETERS": {},  # Use EXPOSED_PORTS[port].engine
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -942,7 +942,7 @@ class ContainerAppRunnerPlugin(
       return HealthCheckMode.ENDPOINT
 
     # Direct modes pass through
-    if mode_enum in (HealthCheckMode.TCP, HealthCheckMode.DELAY):
+    if mode_enum in (HealthCheckMode.TCP, HealthCheckMode.DELAY, HealthCheckMode.DISABLED):
       return mode_enum
 
     # Auto mode: smart detection
@@ -2565,6 +2565,12 @@ class ContainerAppRunnerPlugin(
     health = self._get_health_config()
     mode = self._get_effective_health_mode(health)
 
+    # Mode: DISABLED - app is ready immediately when container is running
+    if mode == HealthCheckMode.DISABLED:
+      self._app_ready = True
+      self._semaphore_set_ready_flag()
+      return True
+
     # Mode: DELAY - simple time-based waiting
     if mode == HealthCheckMode.DELAY or self._health_probing_disabled:
       elapsed = current_time - self.container_start_time
@@ -2663,9 +2669,13 @@ class ContainerAppRunnerPlugin(
       self.semaphore_set_env('PORT', str(container_port))
       self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, container_port))
       self.semaphore_set_env('CONTAINER_PORT', str(container_port))
+    # Derive protocol from main port config
+    main_port_config = self._normalized_main_exposed_port or {}
+    protocol = main_port_config.get("protocol", "http")
+    self.semaphore_set_env('HOST_PROTOCOL', protocol)
     if host_port:
       self.semaphore_set_env('HOST_PORT', str(host_port))
-      self.semaphore_set_env('HOST_URL', 'http://{}:{}'.format(localhost_ip, host_port))
+      self.semaphore_set_env('HOST_URL', '{}://{}:{}'.format(protocol, localhost_ip, host_port))
     container_ip = self._get_container_ip()
     self.Pd(f"Container IP address: {container_ip}")
     if container_ip:
