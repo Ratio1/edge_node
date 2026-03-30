@@ -23,9 +23,6 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
         "token": "token-3002",
         "protocol": "http",
         "engine": "cloudflare",
-        "max_retries": None,
-        "backoff_initial": None,
-        "backoff_max": None,
       }
     })
     self.assertEqual(plugin.extra_ports_mapping, {
@@ -42,9 +39,6 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
         "token": "extra-token",
         "protocol": "http",
         "engine": "cloudflare",
-        "max_retries": None,
-        "backoff_initial": None,
-        "backoff_max": None,
       }
     }
 
@@ -119,9 +113,6 @@ class ContainerAppRunnerTunnelRuntimeTests(unittest.TestCase):
         "token": "extra-token",
         "protocol": "http",
         "engine": "cloudflare",
-        "max_retries": None,
-        "backoff_initial": None,
-        "backoff_max": None,
       },
     })
 

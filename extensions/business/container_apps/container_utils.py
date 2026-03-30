@@ -327,61 +327,6 @@ class _ContainerUtilsMixin:
           f"got '{protocol}'"
         )
 
-      # --- Retry overrides ---
-      max_retries = config.get("max_retries")
-      backoff_initial = config.get("backoff_initial")
-      backoff_max = config.get("backoff_max")
-
-      has_retry_overrides = any(v is not None for v in (max_retries, backoff_initial, backoff_max))
-      if has_retry_overrides and token is None:
-        raise ValueError(
-          f"EXPOSED_PORTS[{container_port}]: retry overrides (max_retries, backoff_initial, "
-          f"backoff_max) require a tunnel token"
-        )
-
-      if max_retries is not None:
-        try:
-          max_retries = int(max_retries)
-        except (TypeError, ValueError):
-          raise ValueError(
-            f"EXPOSED_PORTS[{container_port}].max_retries must be an integer or null"
-          )
-        if max_retries < 0:
-          raise ValueError(
-            f"EXPOSED_PORTS[{container_port}].max_retries must be non-negative"
-          )
-
-      if backoff_initial is not None:
-        try:
-          backoff_initial = float(backoff_initial)
-        except (TypeError, ValueError):
-          raise ValueError(
-            f"EXPOSED_PORTS[{container_port}].backoff_initial must be a number or null"
-          )
-        if backoff_initial <= 0:
-          raise ValueError(
-            f"EXPOSED_PORTS[{container_port}].backoff_initial must be positive"
-          )
-
-      if backoff_max is not None:
-        try:
-          backoff_max = float(backoff_max)
-        except (TypeError, ValueError):
-          raise ValueError(
-            f"EXPOSED_PORTS[{container_port}].backoff_max must be a number or null"
-          )
-        if backoff_max <= 0:
-          raise ValueError(
-            f"EXPOSED_PORTS[{container_port}].backoff_max must be positive"
-          )
-
-      if backoff_initial is not None and backoff_max is not None:
-        if backoff_max < backoff_initial:
-          raise ValueError(
-            f"EXPOSED_PORTS[{container_port}].backoff_max ({backoff_max}) must be >= "
-            f"backoff_initial ({backoff_initial})"
-          )
-
       normalized[container_port] = {
         "container_port": container_port,
         "is_main_port": is_main_port,
@@ -389,9 +334,6 @@ class _ContainerUtilsMixin:
         "token": token,
         "protocol": protocol,
         "engine": engine,
-        "max_retries": max_retries,
-        "backoff_initial": backoff_initial,
-        "backoff_max": backoff_max,
       }
 
     if len(main_ports) > 1:
@@ -1463,9 +1405,6 @@ class _ContainerUtilsMixin:
         "token": token,
         "protocol": port_config.get("protocol", "http"),
         "engine": port_config.get("engine", "cloudflare"),
-        "max_retries": port_config.get("max_retries"),
-        "backoff_initial": port_config.get("backoff_initial"),
-        "backoff_max": port_config.get("backoff_max"),
       }
 
     self.inverted_ports_mapping = {
