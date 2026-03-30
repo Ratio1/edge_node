@@ -215,6 +215,10 @@ class _DeeployMixin:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+    self._reset_chainstore_response_keys(
+      prepared_response_keys,
+      context=f"create pipeline '{app_alias}'",
+    )
 
     saved_pipeline = None
     for addr, node_plugins in node_plugins_by_addr.items():
@@ -241,15 +245,8 @@ class _DeeployMixin:
       # endif addr is valid
     # endfor each target node
 
-    self.Pd(f"Pipeline started: {self.json_dumps(saved_pipeline)}")
-    try:
-      save_result = self.save_job_pipeline_in_cstore(saved_pipeline, job_id)
-      self.P(f"Pipeline CID saved in CSTORE: {save_result}", color='r' if not save_result else None)
-    except Exception as e:
-      self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
-
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
-    return cleaned_response_keys
+    return cleaned_response_keys, saved_pipeline
 
   def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
     """
@@ -454,6 +451,10 @@ class _DeeployMixin:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+    self._reset_chainstore_response_keys(
+      prepared_response_keys,
+      context=f"update pipeline '{app_alias}'",
+    )
 
     for addr, node_plugins in node_plugins_ready.items():
       msg = ''
@@ -481,11 +482,6 @@ class _DeeployMixin:
         pipelin_to_save = pipeline
       # endif addr is valid
     # endfor each target node
-    try:
-      save_result = self.save_job_pipeline_in_cstore(pipelin_to_save, job_id)
-      self.P(f"Pipeline saved in CSTORE: {save_result}")
-    except Exception as e:
-      self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
     if inputs.chainstore_response:
       if prepared_response_keys:
         dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
@@ -495,7 +491,7 @@ class _DeeployMixin:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
-    return cleaned_response_keys
+    return cleaned_response_keys, pipelin_to_save
 
   def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
     """
@@ -1037,6 +1033,27 @@ class _DeeployMixin:
           target.append(key)
 
     return merged
+
+  def _reset_chainstore_response_keys(self, response_keys, context: str = "pipeline commands"):
+    """
+    Clear chainstore response keys before dispatch so early confirmations are not lost.
+    """
+    normalized_keys = self._normalize_chainstore_response_mapping(response_keys)
+    if not normalized_keys:
+      return normalized_keys
+
+    self.P(f"Resetting response keys in chainstore before dispatching {context}...")
+    for _, node_response_keys in normalized_keys.items():
+      for response_key in node_response_keys:
+        try:
+          self.chainstore_set(response_key, None)
+        except Exception as e:
+          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
+        # end try
+      # end for
+    # end for
+
+    return normalized_keys
 
   def _get_pipeline_params_from_deeploy_specs(self, deeploy_specs):
     """
@@ -2061,45 +2078,38 @@ class _DeeployMixin:
 
     # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
     response_keys = {}
+    pipeline_to_persist = None
     if len(update_nodes) > 0:
-      update_response_keys = self.__update_pipeline_on_nodes(
+      update_response_keys, update_pipeline_to_persist = self.__update_pipeline_on_nodes(
         update_nodes, inputs, app_id, app_alias, app_type,
         owner, discovered_plugin_instances, dct_deeploy_specs,
         job_app_type=job_app_type
       )
       response_keys.update(update_response_keys)
+      if update_pipeline_to_persist is not None:
+        pipeline_to_persist = update_pipeline_to_persist
     if len(new_nodes) > 0:
-      new_response_keys = self.__create_pipeline_on_nodes(
+      new_response_keys, created_pipeline_to_persist = self.__create_pipeline_on_nodes(
         new_nodes, inputs, app_id, app_alias, app_type, owner,
         job_app_type=job_app_type,
         dct_deeploy_specs=dct_deeploy_specs_create
       )
       response_keys.update(new_response_keys)
+      if created_pipeline_to_persist is not None:
+        pipeline_to_persist = created_pipeline_to_persist
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
-    # Reset Response Keys
-    self.P("Resetting response keys in chainstore before waiting for new responses...")
-    for _, node_response_keys in response_keys.items():
-      for response_key in node_response_keys:
-        try:
-          self.chainstore_set(response_key, None)
-        except Exception as e:
-          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
-        # end try
-      # end for
-    # end for
-
     if wait_for_responses:
       dct_status, str_status = self._get_pipeline_responses(response_keys, 300)
     else:
       dct_status, str_status = {}, DEEPLOY_STATUS.PENDING
 
     self.P(f"Pipeline responses: str_status = {str_status} | dct_status =\n {self.json_dumps(dct_status, indent=2)}")
-    
+
     # if pipelines to not use CHAINSTORE_RESPONSE, we can assume nodes reveived the command (BLIND) - to be modified in native plugins
     # else we consider all good if str_status is SUCCESS
 
-    return dct_status, str_status, response_keys
+    return dct_status, str_status, response_keys, pipeline_to_persist
 
   def scale_up_job(self, new_nodes, update_nodes, job_id, owner, running_apps_for_job, wait_for_responses=True):
     """

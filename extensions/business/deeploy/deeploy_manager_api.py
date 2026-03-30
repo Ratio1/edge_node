@@ -3,6 +3,9 @@
 Needs configuration based on injected `EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER`
 
 """
+import threading
+from collections import deque
+
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
@@ -92,7 +95,127 @@ class DeeployManagerApiPlugin(
       self.maybe_stop_tunnel_engine()
     self._init_request_tracking()
     self.__pending_deploy_requests = {}
+    self.__pipeline_persistence_queue = deque()
+    self.__pipeline_persistence_lock = threading.Lock()
+    self.__pipeline_persistence_event = threading.Event()
+    self._start_pipeline_persistence_worker()
     return
+
+  def _start_pipeline_persistence_worker(self):
+    """
+    Start a background worker that persists deployed pipeline metadata outside the
+    request critical path.
+    """
+    def _worker():
+      while not getattr(self, 'done_loop', False):
+        job = None
+        wait_timeout = 0.5
+        now = self.time()
+
+        with self.__pipeline_persistence_lock:
+          if self.__pipeline_persistence_queue:
+            queue_len = len(self.__pipeline_persistence_queue)
+            for _ in range(queue_len):
+              candidate = self.__pipeline_persistence_queue.popleft()
+              next_retry_ts = candidate.get('next_retry_ts', 0)
+              if job is None and next_retry_ts <= now:
+                job = candidate
+                continue
+              self.__pipeline_persistence_queue.append(candidate)
+            if job is None and len(self.__pipeline_persistence_queue) > 0:
+              soonest_retry = min(
+                max(0.5, candidate.get('next_retry_ts', now) - now)
+                for candidate in self.__pipeline_persistence_queue
+              )
+              wait_timeout = min(soonest_retry, 5.0)
+
+        if job is None:
+          self.__pipeline_persistence_event.wait(timeout=wait_timeout)
+          self.__pipeline_persistence_event.clear()
+          continue
+
+        try:
+          ok = self.persist_job_pipeline_metadata(
+            pipeline=job['pipeline'],
+            job_id=job['job_id'],
+            previous_cid=job.get('previous_cid'),
+            delete_previous=job.get('delete_previous', False),
+          )
+        except Exception as exc:
+          ok = False
+          self.P(
+            f"Pipeline metadata persistence crashed for job {job.get('job_id')}: {exc}",
+            color='r'
+          )
+
+        if ok:
+          self.P(
+            f"Persisted deployed pipeline metadata for job {job.get('job_id')}"
+            f"{' (' + job.get('app_id') + ')' if job.get('app_id') else ''}."
+          )
+          continue
+
+        attempts = int(job.get('attempts', 0)) + 1
+        if attempts >= 3:
+          self.P(
+            f"Failed to persist deployed pipeline metadata for job {job.get('job_id')} after {attempts} attempts.",
+            color='r'
+          )
+          continue
+
+        job['attempts'] = attempts
+        job['next_retry_ts'] = self.time() + min(60.0, 5.0 * (2 ** (attempts - 1)))
+        with self.__pipeline_persistence_lock:
+          self.__pipeline_persistence_queue.append(job)
+        self.__pipeline_persistence_event.set()
+
+    self.__pipeline_persistence_thread = threading.Thread(
+      target=_worker,
+      name="DeeployPipelinePersistence",
+      daemon=True,
+    )
+    self.__pipeline_persistence_thread.start()
+    return
+
+  def _build_pipeline_persistence_state(
+    self,
+    job_id,
+    pipeline,
+    app_id=None,
+    previous_cid=None,
+    delete_previous=False,
+  ):
+    """
+    Build a persistence payload for background metadata commit.
+    """
+    if job_id is None or not isinstance(pipeline, dict):
+      return None
+
+    return {
+      'job_id': job_id,
+      'app_id': app_id,
+      'pipeline': self.deepcopy(pipeline),
+      'previous_cid': previous_cid,
+      'delete_previous': delete_previous,
+      'attempts': 0,
+      'next_retry_ts': self.time(),
+    }
+
+  def _queue_pipeline_persistence(self, persistence_state):
+    """
+    Queue a deployed pipeline metadata commit for background execution.
+    """
+    if not persistence_state:
+      return False
+
+    with self.__pipeline_persistence_lock:
+      self.__pipeline_persistence_queue.append(persistence_state)
+    self.__pipeline_persistence_event.set()
+    self.Pd(
+      f"Queued pipeline metadata persistence for job {persistence_state.get('job_id')}"
+      f"{' (' + persistence_state.get('app_id') + ')' if persistence_state.get('app_id') else ''}."
+    )
+    return True
 
 
   def on_request(self, request):
@@ -287,6 +410,7 @@ class DeeployManagerApiPlugin(
       confirmation_nodes = []
       nodes_changed = False
       deeploy_specs_for_update = None
+      previous_pipeline_cid = None
       if is_create:
         deployment_nodes = self._check_nodes_availability(inputs)
         confirmation_nodes = list(deployment_nodes)
@@ -337,6 +461,12 @@ class DeeployManagerApiPlugin(
           msg = f"{DEEPLOY_ERRORS.NODES2}: Update request must include at least one target node."
           raise ValueError(msg)
 
+        if job_id is not None:
+          try:
+            previous_pipeline_cid = self._get_pipeline_from_cstore(job_id)
+          except Exception as exc:
+            self.Pd(f"Unable to read previous pipeline CID for job {job_id}: {exc}", color='y')
+
         inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_targets
         inputs.target_nodes = deployment_targets
         inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
@@ -358,12 +488,6 @@ class DeeployManagerApiPlugin(
             f"Expected {deployment_targets}, validated {validated_nodes}."
           )
           raise ValueError(msg)
-
-        if job_id is not None:
-          try:
-            self.delete_job_pipeline_from_r1fs(job_id, remove_chainstore_entry=True)
-          except Exception as exc:
-            self.Pd(f"Non-blocking R1FS cleanup error for job {job_id}: {exc}", color='y')
 
         # All validations passed; remove the running job and immediately redeploy.
         self.delete_pipeline_from_nodes(
@@ -399,7 +523,7 @@ class DeeployManagerApiPlugin(
         pipeline_params=pipeline_params,
       )
 
-      dct_status, str_status, response_keys = self.check_and_deploy_pipelines(
+      dct_status, str_status, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         inputs=inputs,
         app_id=app_id,
@@ -411,6 +535,13 @@ class DeeployManagerApiPlugin(
         dct_deeploy_specs_create=deeploy_specs_payload,
         job_app_type=job_app_type,
         wait_for_responses=not async_mode,
+      )
+      persistence_state = self._build_pipeline_persistence_state(
+        job_id=job_id,
+        pipeline=pipeline_to_persist,
+        app_id=app_id,
+        previous_cid=previous_pipeline_cid,
+        delete_previous=not is_create,
       )
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
@@ -435,6 +566,7 @@ class DeeployManagerApiPlugin(
 
       if async_mode:
         if len(response_keys) == 0:
+          self._queue_pipeline_persistence(persistence_state)
           if nodes_changed and not is_confirmable_job:
             eth_nodes = [self.bc.node_addr_to_eth_addr(node) for node in confirmation_nodes]
             eth_nodes = sorted(eth_nodes)
@@ -476,8 +608,12 @@ class DeeployManagerApiPlugin(
             'is_confirmable_job': is_confirmable_job,
             'job_id': job_id,
           },
+          'persistence': persistence_state,
         }
         return {'__pending__': pending_state}
+
+      if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+        self._queue_pipeline_persistence(persistence_state)
 
       if nodes_changed and str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
         if (dct_status is not None and is_confirmable_job and len(confirmation_nodes) == len(dct_status)) or not is_confirmable_job:
@@ -621,6 +757,9 @@ class DeeployManagerApiPlugin(
         except Exception as e:
           self.P(f"An error occurred while submitting node update for job {job_id}: {e}", color='r')
     # endif nodes changed and success or delivered
+
+    if str_status in [DEEPLOY_STATUS.SUCCESS, DEEPLOY_STATUS.COMMAND_DELIVERED]:
+      self._queue_pipeline_persistence(pending.get('persistence'))
 
     return {
       DEEPLOY_KEYS.STATUS: str_status,
