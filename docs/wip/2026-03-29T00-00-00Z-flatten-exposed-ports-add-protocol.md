@@ -35,6 +35,7 @@ Current runtime reality:
 
 - Flatten the user-facing tunnel config inside `EXPOSED_PORTS`.
 - Add per-port tunnel `protocol` support.
+- Expose `protocol` in the UI now because it unlocks a real required capability for non-HTTP services.
 - Preserve backward compatibility for existing nested `tunnel` payloads and legacy CAR fields.
 - Keep health check configuration separate from tunnel configuration.
 - Add an explicit global way to disable health gating.
@@ -42,6 +43,7 @@ Current runtime reality:
 ## Non-Goals
 
 - No per-port health-check gating in this change.
+- No per-port tunnel retry overrides in this change.
 - No removal of legacy `PORT`, `CLOUDFLARE_TOKEN`, `EXTRA_TUNNELS`, or `TUNNEL_ENGINE_PARAMETERS` support in this change.
 - No assumption that `EXPOSED_PORTS` is unused; migration must be backward compatible.
 
@@ -54,9 +56,6 @@ Current runtime reality:
     "token": "cf-token",             # present = tunnel enabled, missing/None = no tunnel
     "protocol": "http",              # tunnel origin protocol, default "http"
     "engine": "cloudflare",          # default "cloudflare"
-    "max_retries": None,             # override global TUNNEL_RESTART_MAX_RETRIES
-    "backoff_initial": None,         # override global TUNNEL_RESTART_BACKOFF_INITIAL
-    "backoff_max": None,             # override global TUNNEL_RESTART_BACKOFF_MAX
 }
 ```
 
@@ -120,7 +119,6 @@ Conflict resolution inside a single `EXPOSED_PORTS[port]` entry:
 - Conflicting flat vs nested values should emit a deprecation warning in logs.
 - Matching flat+nested values are tolerated during migration.
 - If nested `tunnel.enabled` is `False` but flat `token` is present, flat `token` wins and the tunnel is considered enabled.
-- Retry overrides are read from flat fields only.
 
 Protocol precedence for the main tunnel:
 - Flat main-port `protocol`
@@ -218,16 +216,9 @@ Health config validation requirements:
 
 - **`_normalize_exposed_ports_value()`**
   - Accept both flat input and legacy nested `tunnel` input.
-  - Normalize to a canonical internal tunnel config with `token`, `protocol`, `engine`, and optional retry overrides.
+  - Normalize to a canonical internal tunnel config with `token`, `protocol`, and `engine`.
   - Validate protocol against the allowed set.
   - Preserve compatibility with current code paths that still read `container_port` from normalized state if needed.
-  - Enforce clear validation rules for retry overrides:
-    - `max_retries`: integer or null; `0` keeps existing “unlimited retries” semantics
-    - `backoff_initial`: positive number or null
-    - `backoff_max`: positive number or null
-    - reject negative values
-    - reject `backoff_max < backoff_initial` when both are set
-    - reject retry override fields when no tunnel token is configured for that port
   - Enforce clear validation rules for engine:
     - allow missing engine
     - allow `"cloudflare"`
@@ -243,12 +234,11 @@ Health config validation requirements:
 
 - **`_validate_extra_tunnels_config()`**
   - Stop storing extra tunnel runtime state as `{container_port: token}` only.
-  - Build richer per-port runtime tunnel config objects so protocol and retry overrides are available later in the lifecycle.
+  - Build richer per-port runtime tunnel config objects so protocol and engine are available later in the lifecycle.
   - The runtime object should be explicit enough to support:
     - token
     - protocol
     - engine
-    - effective retry settings for that port
 
 - **`_get_main_container_port()`**
   - May stop depending on normalized `container_port` values if convenient.
@@ -269,13 +259,14 @@ Health config validation requirements:
   - Extra tunnel status/ping/log handling should no longer assume every tunnel is represented as a browser-friendly HTTPS URL.
   - Keep backward-compatible URL fields where they already exist, but add a more generic endpoint/access metadata field for non-HTTP protocols instead of overloading browser-URL semantics.
 
-- **Retry overrides**
-  - Per-port retry overrides affect more than tunnel startup.
-  - The helper methods that calculate backoff and max-retry behavior must read effective values per port, with fallback to the existing global settings:
+- **Retry behavior**
+  - Keep existing global tunnel retry behavior unchanged in this phase.
+  - Continue using:
     - `TUNNEL_RESTART_MAX_RETRIES`
     - `TUNNEL_RESTART_BACKOFF_INITIAL`
     - `TUNNEL_RESTART_BACKOFF_MAX`
-    - existing multiplier/reset-interval globals stay global unless there is an explicit reason to widen scope
+    - existing multiplier/reset-interval globals
+  - Defer any per-port retry customization to a later phase if a concrete need appears.
 
 - **Semaphore env**
   - Export `HOST_PROTOCOL` alongside `HOST_URL` for the main exposed port.
@@ -308,9 +299,6 @@ type ExposedPortEntry = {
     token?: string;
     protocol?: string;
     engine?: string;
-    maxRetries?: number;
-    backoffInitial?: number;
-    backoffMax?: number;
 };
 ```
 
@@ -318,7 +306,10 @@ type ExposedPortEntry = {
 
 - Rename `cloudflareToken` input to `token`.
 - Add protocol dropdown when tunnel token is present.
-- Add an advanced section for per-port retry overrides.
+- Keep `protocol` in the normal row-level UI for this rollout; this is an important required feature, not an advanced/deferred option.
+- Default `protocol` to `"http"`.
+- Restrict choices to the backend-supported protocol set.
+- Add a brief UX hint that non-HTTP protocols are not browser URLs.
 - Continue recovering legacy nested `tunnel` data during edit hydration while the migration is in progress.
 
 ### Serialization
@@ -329,9 +320,8 @@ type ExposedPortEntry = {
 
 ### Schema
 
-- Add optional `protocol`, `engine`, and retry override fields.
+- Add optional `protocol` and `engine` fields.
 - Accept both flat and nested tunnel shapes during transition if schema constraints are enforced at the frontend boundary.
-- Enforce the same retry validation constraints in frontend schema/tests to avoid drift from backend behavior.
 - Enforce the same per-port engine restrictions in frontend schema/tests to avoid presenting unsupported options.
 
 ## Files Likely To Change
@@ -339,9 +329,9 @@ type ExposedPortEntry = {
 | File | Change |
 |---|---|
 | `extensions/business/container_apps/container_utils.py` | Flatten tunnel normalization, preserve compatibility, build richer per-port tunnel runtime config |
-| `extensions/business/container_apps/container_app_runner.py` | Main/extra tunnel protocol support, main protocol override, per-port retry override plumbing, health mode disable support |
+| `extensions/business/container_apps/container_app_runner.py` | Main/extra tunnel protocol support, main protocol override, health mode disable support |
 | `extensions/business/container_apps/tests/test_exposed_ports_model.py` | Flat shape assertions plus nested backward-compat coverage |
-| `extensions/business/container_apps/tests/test_tunnel_runtime_behavior.py` | Protocol in tunnel commands, richer extra tunnel config, retry override behavior |
+| `extensions/business/container_apps/tests/test_tunnel_runtime_behavior.py` | Protocol in tunnel commands and richer extra tunnel config |
 | `extensions/business/container_apps/tests/test_health_check_behavior.py` | Disabled health mode coverage and non-regression around default main-port behavior |
 | `extensions/business/container_apps/tests/test_semaphore_exports.py` | `HOST_PROTOCOL` export and legacy-key non-regression |
 | `AGENTS.md` | Update durable repo memory after rollout if the new flat tunnel shape becomes the documented normalized surface |
