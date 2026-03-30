@@ -51,12 +51,33 @@ class _DeeployMixin:
     """
     Verify the signature of the request.
     """
+    claimed_sender = payload.get("EE_ETH_SENDER", "unknown")
+    signature = payload.get("EE_ETH_SIGN", "missing")
+    self.Pd(
+      "Verifying signature for claimed sender={}, sig={}..., no_hash={}, prefix='{}'".format(
+        claimed_sender, signature[:20] if isinstance(signature, str) else signature, no_hash, MESSAGE_PREFIX
+      )
+    )
     sender = self.bc.eth_verify_payload_signature(
       payload=payload,
       message_prefix=MESSAGE_PREFIX,
       no_hash=no_hash,
       indent=1,
     )
+    if sender is None:
+      self.P(
+        "Signature verification FAILED for claimed sender={}. "
+        "Recovered address is None. Check that the signing key matches the sender address "
+        "and that the payload was not modified after signing.".format(claimed_sender),
+        color='r'
+      )
+    elif sender.lower() != claimed_sender.lower():
+      self.P(
+        "Signature verification MISMATCH: recovered={} != claimed={}".format(sender, claimed_sender),
+        color='r'
+      )
+    else:
+      self.Pd("Signature verification OK: recovered={}".format(sender))
     return sender
 
 
