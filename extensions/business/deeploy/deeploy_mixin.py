@@ -724,6 +724,8 @@ class _DeeployMixin:
     self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
 
     addr = self.__verify_signature(request, no_hash=no_hash)
+    if addr is None:
+      raise ValueError("Signature verification failed: could not recover address from signature")
     if addr.lower() != sender.lower():
       raise ValueError("Invalid signature: recovered {} != {}".format(addr, sender))
 
