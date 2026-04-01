@@ -398,7 +398,8 @@ class _DeeployMixin:
       node_plugins = plugins_by_node[addr]
       plugin_counts_by_node.append((addr, len(node_plugins)))
       all_plugins.extend(node_plugins)
-    all_plugins = self._resolve_shmem_in_plugins(all_plugins, app_id)
+    if self._has_shmem_dynamic_env(all_plugins):
+      all_plugins = self._resolve_shmem_in_plugins(all_plugins, app_id)
     idx = 0
     for addr, count in plugin_counts_by_node:
       plugins_by_node[addr] = all_plugins[idx:idx + count]
@@ -2050,7 +2051,7 @@ class _DeeployMixin:
         }
         prepared_plugins.append(prepared_plugin)
 
-      if app_id:
+      if app_id and self._has_shmem_dynamic_env(prepared_plugins):
         prepared_plugins = self._resolve_shmem_in_plugins(prepared_plugins, app_id)
 
       return prepared_plugins
