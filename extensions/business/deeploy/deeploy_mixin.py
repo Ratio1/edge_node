@@ -1610,6 +1610,13 @@ class _DeeployMixin:
           )
         used_names.add(pname)
         sem_key = "{}__{}".format(app_id, pname)
+        existing_sem = instance.get("SEMAPHORE")
+        if existing_sem and existing_sem != sem_key:
+          raise ValueError(
+            "plugin_name '{}' implies SEMAPHORE '{}' but instance already has '{}'.".format(
+              pname, sem_key, existing_sem
+            )
+          )
         instance["SEMAPHORE"] = sem_key
         name_to_key[pname] = sem_key
 

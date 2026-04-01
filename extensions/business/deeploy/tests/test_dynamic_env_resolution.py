@@ -119,6 +119,33 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
       with self.assertRaisesRegex(ValueError, "Invalid plugin_name"):
         plugin._resolve_shmem_in_plugins(plugins, "app-1")
 
+  def test_resolve_shmem_in_plugins_rejects_conflicting_semaphore(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "SOME_PLUGIN",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "p-1", "plugin_name": "alpha", "SEMAPHORE": "wrong__key"}
+        ],
+      },
+    ]
+    with self.assertRaisesRegex(ValueError, "already has"):
+      plugin._resolve_shmem_in_plugins(plugins, "app-1")
+
+  def test_resolve_shmem_in_plugins_keeps_matching_semaphore(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "SOME_PLUGIN",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "p-1", "plugin_name": "alpha", "SEMAPHORE": "app-1__alpha"}
+        ],
+      },
+    ]
+    resolved = plugin._resolve_shmem_in_plugins(plugins, "app-1")
+    instance = resolved[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(instance["SEMAPHORE"], "app-1__alpha")
+
   def test_resolve_shmem_in_plugins_noop_without_plugin_names(self):
     plugin = make_deeploy_plugin()
     plugins = [
