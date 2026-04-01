@@ -242,8 +242,11 @@ class _ContainerUtilsMixin:
           nested_engine = nested_engine.strip().lower() or None
         else:
           nested_engine = None
-        # If nested tunnel.enabled is explicitly False and no flat token, treat as no tunnel
+        # If nested tunnel.enabled is explicitly False, ignore nested token/engine
         nested_enabled = tunnel_nested.get("enabled", False)
+        if not nested_enabled:
+          nested_token = None
+          nested_engine = None
 
       # Read flat fields
       flat_token = config.get("token")
