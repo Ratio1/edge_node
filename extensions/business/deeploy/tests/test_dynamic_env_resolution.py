@@ -105,6 +105,20 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "Duplicate plugin_name"):
       plugin._resolve_shmem_in_plugins(plugins, "app-1")
 
+  def test_resolve_shmem_in_plugins_rejects_invalid_plugin_name(self):
+    plugin = make_deeploy_plugin()
+    for bad_name in ["my plugin", "plugin/foo", "plugin.bar", "plugin@1"]:
+      plugins = [
+        {
+          plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "SOME_PLUGIN",
+          plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+            {plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "p-1", "plugin_name": bad_name}
+          ],
+        },
+      ]
+      with self.assertRaisesRegex(ValueError, "Invalid plugin_name"):
+        plugin._resolve_shmem_in_plugins(plugins, "app-1")
+
   def test_resolve_shmem_in_plugins_noop_without_plugin_names(self):
     plugin = make_deeploy_plugin()
     plugins = [

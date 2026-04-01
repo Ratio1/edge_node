@@ -1556,6 +1556,23 @@ class _DeeployMixin:
               return True
     return False
 
+  @staticmethod
+  def _validate_plugin_name(plugin_name):
+    """
+    Validate that a plugin_name contains only safe characters for use in
+    semaphore keys. Allowed: letters, digits, hyphens, underscores.
+
+    Raises
+    ------
+    ValueError
+      If plugin_name contains invalid characters.
+    """
+    import re
+    if not re.fullmatch(r'[a-zA-Z0-9_-]+', plugin_name):
+      raise ValueError(
+        "Invalid plugin_name '{}'. Only letters, digits, hyphens and underscores are allowed.".format(plugin_name)
+      )
+
   def _resolve_shmem_in_plugins(self, plugins, app_id):
     """
     Resolve shmem-type DYNAMIC_ENV entries inline using plugin_name-based semaphore keys.
@@ -1586,6 +1603,7 @@ class _DeeployMixin:
         pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
         if not pname:
           continue
+        self._validate_plugin_name(pname)
         if pname in used_names:
           raise ValueError(
             "Duplicate plugin_name '{}'. Each plugin must have a unique name.".format(pname)
@@ -1788,6 +1806,8 @@ class _DeeployMixin:
             continue
           # end if
           plugin_name = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          if plugin_name:
+            self._validate_plugin_name(plugin_name)
           semaphore_key = "{}__{}".format(app_id, plugin_name) if plugin_name else self.sanitize_name("{}__{}".format(app_id, instance_id))
           instance["SEMAPHORE"] = semaphore_key
           semaphore_keys.append(semaphore_key)
