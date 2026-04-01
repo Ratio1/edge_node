@@ -1816,6 +1816,13 @@ class _DeeployMixin:
           if plugin_name:
             self._validate_plugin_name(plugin_name)
           semaphore_key = "{}__{}".format(app_id, plugin_name) if plugin_name else self.sanitize_name("{}__{}".format(app_id, instance_id))
+          existing_sem = instance.get("SEMAPHORE")
+          if existing_sem and existing_sem != semaphore_key:
+            raise ValueError(
+              "plugin_name '{}' implies SEMAPHORE '{}' but instance already has '{}'.".format(
+                plugin_name or instance_id, semaphore_key, existing_sem
+              )
+            )
           instance["SEMAPHORE"] = semaphore_key
           semaphore_keys.append(semaphore_key)
         # end for instance
