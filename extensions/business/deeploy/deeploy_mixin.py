@@ -2915,7 +2915,7 @@ class _DeeployMixin:
         )
         continue
 
-      if project_id is not None and pipeline.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.PROJECT_ID) != project_id:
+      if project_id is not None and pipeline.get(NetMonCt.DEEPLOY_SPECS.upper(), {}).get(DEEPLOY_KEYS.PROJECT_ID) != project_id:
         self.Pd(f"Skipping R1FS payload for job {job_id}: project_id mismatch.", color='y')
         continue
 

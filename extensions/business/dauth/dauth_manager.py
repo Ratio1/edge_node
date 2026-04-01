@@ -124,7 +124,9 @@ class DauthManagerPlugin(
     return
 
   def process(self):
-    self._maybe_log_and_save_tracked_requests()
+    # TODO: this will be re-enabled in the future.
+    if False:
+      self._maybe_log_and_save_tracked_requests()
     return
 
   def __get_current_epoch(self):
