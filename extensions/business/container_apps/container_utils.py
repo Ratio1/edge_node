@@ -451,6 +451,12 @@ class _ContainerUtilsMixin:
         is_main_port=True,
         token=main_tunnel_token,
       )
+      # Carry legacy CLOUDFLARE_PROTOCOL into the normalized entry
+      legacy_protocol = getattr(self, 'cfg_cloudflare_protocol', None)
+      if isinstance(legacy_protocol, str) and legacy_protocol.strip():
+        entry = exposed_ports.get(str(int(main_port)))
+        if entry is not None:
+          entry["protocol"] = legacy_protocol.strip().lower()
 
     legacy_extra_tunnels = getattr(self, 'cfg_extra_tunnels', None) or {}
     if not isinstance(legacy_extra_tunnels, dict):

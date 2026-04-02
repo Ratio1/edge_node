@@ -37,5 +37,33 @@ class ContainerAppRunnerLegacyConfigMappingTests(unittest.TestCase):
     })
 
 
+  def test_legacy_cloudflare_protocol_flows_into_normalized_ports(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_port = 5432
+    plugin.cfg_cloudflare_token = "tok-abc"
+    plugin.cfg_cloudflare_protocol = "tcp"
+    plugin.cfg_exposed_ports = {}
+    plugin.cfg_container_resources = {"cpu": 1, "memory": "512m", "ports": {}}
+
+    normalized = plugin._normalize_exposed_ports_config()
+
+    entry = normalized[5432]
+    self.assertEqual(entry["protocol"], "tcp")
+    self.assertEqual(entry["token"], "tok-abc")
+    self.assertTrue(entry["is_main_port"])
+
+  def test_legacy_cloudflare_protocol_defaults_to_http_when_absent(self):
+    plugin = make_container_app_runner()
+    plugin.cfg_port = 8080
+    plugin.cfg_cloudflare_token = "tok-xyz"
+    plugin.cfg_exposed_ports = {}
+    plugin.cfg_container_resources = {"cpu": 1, "memory": "512m", "ports": {}}
+
+    normalized = plugin._normalize_exposed_ports_config()
+
+    entry = normalized[8080]
+    self.assertEqual(entry["protocol"], "http")
+
+
 if __name__ == "__main__":
   unittest.main()
