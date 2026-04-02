@@ -226,7 +226,7 @@ def _get_analysis_prompts(scan_type: str) -> dict:
 ANALYSIS_PROMPTS = _NETWORK_PROMPTS
 
 
-class RedmeshLlmAgentApiPlugin(BasePlugin):
+class RedMeshLlmAgentApiPlugin(BasePlugin):
   """
   RedMesh LLM Agent API plugin for DeepSeek integration.
 
@@ -249,7 +249,7 @@ class RedmeshLlmAgentApiPlugin(BasePlugin):
 
   def on_init(self):
     """Initialize plugin and validate DeepSeek API key."""
-    super(RedmeshLlmAgentApiPlugin, self).on_init()
+    super(RedMeshLlmAgentApiPlugin, self).on_init()
     self._api_key = self._load_api_key()
     self._request_count = 0
     self._error_count = 0
@@ -318,7 +318,7 @@ class RedmeshLlmAgentApiPlugin(BasePlugin):
   def P(self, s, *args, **kwargs):
     """Prefixed logger for RedMesh LLM messages."""
     s = "[REDMESH_LLM] " + str(s)
-    return super(RedmeshLlmAgentApiPlugin, self).P(s, *args, **kwargs)
+    return super(RedMeshLlmAgentApiPlugin, self).P(s, *args, **kwargs)
 
   def Pd(self, s, *args, score=-1, **kwargs):
     """Debug logging with verbosity control."""
@@ -726,5 +726,5 @@ class RedmeshLlmAgentApiPlugin(BasePlugin):
 
   def process(self):
     """Main plugin loop (minimal for this API-only plugin)."""
-    super(RedmeshLlmAgentApiPlugin, self).process()
+    super(RedMeshLlmAgentApiPlugin, self).process()
     return
