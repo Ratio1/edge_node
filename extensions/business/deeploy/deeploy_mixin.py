@@ -391,21 +391,12 @@ class _DeeployMixin:
           )
           plugins_by_node[addr].append(prepared_plugin)
 
-    # Resolve shmem references across all nodes
-    all_plugins = []
-    plugin_counts_by_node = []
-    for addr in plugins_by_node:
-      node_plugins = plugins_by_node[addr]
-      plugin_counts_by_node.append((addr, len(node_plugins)))
-      all_plugins.extend(node_plugins)
-    if self._has_shmem_dynamic_env(all_plugins):
-      all_plugins = self._resolve_shmem_in_plugins(all_plugins, app_id)
-    idx = 0
-    for addr, count in plugin_counts_by_node:
-      plugins_by_node[addr] = all_plugins[idx:idx + count]
-      idx += count
-
+    # Resolve shmem and autowire per-node (not across all nodes),
+    # because multi-node jobs have the same logical plugin_names on each
+    # node, which would cause duplicate plugin_name errors if flattened.
     for addr, node_plugins in plugins_by_node.items():
+      if self._has_shmem_dynamic_env(node_plugins):
+        node_plugins = self._resolve_shmem_in_plugins(node_plugins, app_id)
       plugins_by_node[addr] = self._autowire_native_container_semaphore(
         app_id=app_id,
         plugins=node_plugins,
