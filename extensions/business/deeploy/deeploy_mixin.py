@@ -471,7 +471,7 @@ class _DeeployMixin:
 
         self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
         pipeline[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
-        pipelin_to_save = pipeline
+        pipeline_to_save = pipeline
       # endif addr is valid
     # endfor each target node
     if inputs.chainstore_response:
@@ -483,7 +483,7 @@ class _DeeployMixin:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
-    return cleaned_response_keys, pipelin_to_save
+    return cleaned_response_keys, pipeline_to_save
 
   def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
     """
@@ -1565,6 +1565,36 @@ class _DeeployMixin:
         "Invalid plugin_name '{}'. Only letters, digits, hyphens and underscores are allowed.".format(plugin_name)
       )
 
+  def _validate_plugin_names(self, plugins):
+    """
+    Validate all plugin_name values across prepared plugins for charset
+    and uniqueness.
+
+    Parameters
+    ----------
+    plugins : list
+      Prepared plugins payload with INSTANCES.
+
+    Raises
+    ------
+    ValueError
+      If a plugin_name has invalid characters or is duplicated.
+    """
+    used_names = set()
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        if not pname:
+          continue
+        self._validate_plugin_name(pname)
+        if pname in used_names:
+          raise ValueError(
+            "Duplicate plugin_name '{}'. Each plugin must have a unique name.".format(pname)
+          )
+        used_names.add(pname)
+
   def _resolve_shmem_in_plugins(self, plugins, app_id):
     """
     Resolve shmem-type DYNAMIC_ENV entries inline using plugin_name-based semaphore keys.
@@ -2041,6 +2071,9 @@ class _DeeployMixin:
           self.ct.CONFIG_PLUGIN.K_INSTANCES: instances
         }
         prepared_plugins.append(prepared_plugin)
+
+      # Validate plugin_name uniqueness and charset (independent of shmem)
+      self._validate_plugin_names(prepared_plugins)
 
       if app_id and self._has_shmem_dynamic_env(prepared_plugins):
         prepared_plugins = self._resolve_shmem_in_plugins(prepared_plugins, app_id)
