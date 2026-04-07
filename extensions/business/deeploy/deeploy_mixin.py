@@ -63,6 +63,7 @@ class _DeeployMixin:
       message_prefix=MESSAGE_PREFIX,
       no_hash=no_hash,
       indent=1,
+      verify_safe=True,
     )
     if sender is None:
       self.P(
