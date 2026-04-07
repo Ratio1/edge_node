@@ -213,13 +213,7 @@ class _DeeployStub(DeeployManagerApiPlugin):
     """
     return True
 
-  def deeploy_verify_and_get_inputs(
-    self,
-    request,
-    require_sender_is_oracle=False,
-    no_hash=True,
-    verify_safe=False,
-  ):
+  def deeploy_verify_and_get_inputs(self, request, require_sender_is_oracle=False, no_hash=True):
     """
     Stub request verification.
 
@@ -231,8 +225,6 @@ class _DeeployStub(DeeployManagerApiPlugin):
         Oracle enforcement flag.
     no_hash : bool, optional
         Hashing flag.
-    verify_safe : bool, optional
-        Safe signature verification flag.
 
     Returns
     -------

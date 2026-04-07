@@ -47,7 +47,7 @@ class _DeeployMixin:
     return types  
 
 
-  def __verify_signature(self, payload, no_hash=True, verify_safe=False):
+  def __verify_signature(self, payload, no_hash=True):
     """
     Verify the signature of the request.
     """
@@ -63,7 +63,7 @@ class _DeeployMixin:
       message_prefix=MESSAGE_PREFIX,
       no_hash=no_hash,
       indent=1,
-      verify_safe=verify_safe,
+      verify_safe=True,
     )
     if sender is None:
       self.P(
@@ -713,13 +713,7 @@ class _DeeployMixin:
     return str_timestamp
   
   
-  def deeploy_verify_and_get_inputs(
-    self,
-    request: dict,
-    require_sender_is_oracle: bool = False,
-    no_hash: bool = True,
-    verify_safe: bool = False,
-  ):
+  def deeploy_verify_and_get_inputs(self, request: dict, require_sender_is_oracle: bool = False, no_hash: bool = True):
     sender = request.get(BASE_CT.BCctbase.ETH_SENDER)
     assert self.bc.is_valid_eth_address(sender), f"Invalid sender address: {sender}"
 
@@ -739,7 +733,7 @@ class _DeeployMixin:
     inputs = self.NestedDotDict(request_with_defaults)
     self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
 
-    addr = self.__verify_signature(request, no_hash=no_hash, verify_safe=verify_safe)
+    addr = self.__verify_signature(request, no_hash=no_hash)
     if addr is None:
       raise ValueError("Signature verification failed: could not recover address from signature")
     if addr.lower() != sender.lower():
