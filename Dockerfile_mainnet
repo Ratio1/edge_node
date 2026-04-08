@@ -70,7 +70,9 @@ ENV EE_DEBUG_R1FS=false
 # althouh this is not recommended as it should be in .env file
 # ENV EE_DEVICE cuda:0
 
-RUN pip install --no-cache-dir -r requirements.txt
-RUN pip install --no-cache-dir --no-deps naeural-core
+RUN uv pip install --system --no-cache -r requirements_new.txt
+RUN uv pip install --system --no-cache --no-deps naeural-core
+#RUN pip install --no-cache-dir -r requirements.txt
+#RUN pip install --no-cache-dir --no-deps naeural-core
 
 CMD ["python3","device.py"]
