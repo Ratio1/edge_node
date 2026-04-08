@@ -6,63 +6,20 @@ on:
       - "develop"
       - "main"
   workflow_dispatch:
-    inputs:
-      networks:
-        description: "Networks to build (comma-separated: devnet,testnet,mainnet)"
-        required: false
-        default: "devnet,testnet"
 
 jobs:
-  build-and-push-gpu:
+  build-gpu-devnet:
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - network: devnet
-            dockerfile: Dockerfile_devnet
-            branch: develop
-          - network: testnet
-            dockerfile: Dockerfile_testnet
-            branch: develop
-          - network: mainnet
-            dockerfile: Dockerfile_mainnet
-            branch: main
-
-    # Only build if the branch matches, or if manually dispatched
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (matrix.branch == 'develop' && github.ref == 'refs/heads/develop') ||
-      (matrix.branch == 'main' && github.ref == 'refs/heads/main')
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure Git
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-
       - name: Retrieve edge node version
-        id: retrieve_version
         run: |
-          echo "VERSION=$(cat ver.py | grep -o "'.*'")" >> $GITHUB_ENV
-
-      - name: Check latest naeural_core version
-        id: check_core_latest_version
-        run: |
-          LATEST_VERSION=$(curl -s https://pypi.org/pypi/naeural-core/json | jq -r '.info.version')
-          echo "LATEST_NAEURAL_CORE_VERSION=$LATEST_VERSION" >> $GITHUB_ENV
-
-      - name: Debug version
-        run: |
-          VERSION=${VERSION//\'/}
-          echo "GPU build for ${{ matrix.network }}"
-          echo "Edge node version: '$VERSION'"
-          echo "Latest naeural_core version on PyPI: '$LATEST_NAEURAL_CORE_VERSION'"
-        env:
-          VERSION: ${{ env.VERSION }}
-          LATEST_NAEURAL_CORE_VERSION: ${{ env.LATEST_NAEURAL_CORE_VERSION }}
+          VERSION=$(cat ver.py | grep -o "'.*'" | tr -d "'")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "GPU devnet build — edge node version: $VERSION"
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -80,20 +37,101 @@ jobs:
 
       - name: Cleanup space
         run: |
-          echo "===========docker buildx du (before) ==================="
-          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
-          echo "===========docker buildx prune -f ============"
           docker buildx prune -f --verbose --builder "${{ steps.buildx.outputs.name }}"
-          echo "===========docker buildx du (after) ================="
-          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
 
-      - name: Build and push GPU ${{ matrix.network }} image
+      - name: Build and push GPU devnet image
         uses: docker/build-push-action@v6
         with:
           builder: ${{ steps.buildx.outputs.name }}
           context: .
-          file: ./${{ matrix.dockerfile }}
+          file: ./Dockerfile_devnet
           build-args: |
             BASE_IMAGE=ratio1/base_edge_node_amd64_gpu:latest
           push: true
-          tags: "ratio1/edge_node_gpu:${{ matrix.network }}"
+          tags: "ratio1/edge_node_gpu:devnet"
+
+  build-gpu-testnet:
+    if: github.ref == 'refs/heads/develop' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Retrieve edge node version
+        run: |
+          VERSION=$(cat ver.py | grep -o "'.*'" | tr -d "'")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "GPU testnet build — edge node version: $VERSION"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: "lab:latest"
+          driver: cloud
+          endpoint: "naeural/naeural-builder"
+
+      - name: Cleanup space
+        run: |
+          docker buildx prune -f --verbose --builder "${{ steps.buildx.outputs.name }}"
+
+      - name: Build and push GPU testnet image
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile_testnet
+          build-args: |
+            BASE_IMAGE=ratio1/base_edge_node_amd64_gpu:latest
+          push: true
+          tags: "ratio1/edge_node_gpu:testnet"
+
+  build-gpu-mainnet:
+    if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Retrieve edge node version
+        run: |
+          VERSION=$(cat ver.py | grep -o "'.*'" | tr -d "'")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "GPU mainnet build — edge node version: $VERSION"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: "lab:latest"
+          driver: cloud
+          endpoint: "naeural/naeural-builder"
+
+      - name: Cleanup space
+        run: |
+          docker buildx prune -f --verbose --builder "${{ steps.buildx.outputs.name }}"
+
+      - name: Build and push GPU mainnet image
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile_mainnet
+          build-args: |
+            BASE_IMAGE=ratio1/base_edge_node_amd64_gpu:latest
+          push: true
+          tags: |
+            ratio1/edge_node_gpu:mainnet
+            ratio1/edge_node_gpu:latest
