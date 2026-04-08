@@ -39,6 +39,8 @@ RUN rm -rf /edge_node/cmds
 ENV AINODE_DOCKER=Yes
 # set a generic env variable 
 ENV AINODE_DOCKER_SOURCE=main
+# enable Docker-in-Docker in the optional base-image entrypoint
+ENV EE_DD=1
 # set default Execution Engine id
 ENV EE_ID=E2dkr
 # Temporary fix:
