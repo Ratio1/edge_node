@@ -1,45 +1,30 @@
-# -d for dind
-#FROM aidamian/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-d
-FROM ratio1/base_edge_node:x86_64-py3.10.12-th2.3.1.cu121-tr4.43.3-dnctk
+# Base image: CPU by default, override with --build-arg BASE_IMAGE=ratio1/base_edge_node_amd64_gpu:latest for GPU
+# The base image provides: Python 3.13, PyTorch, FFmpeg, Docker Engine (DIND), Node.js, uv, and ML/data stack
+ARG BASE_IMAGE=ratio1/base_edge_node_amd64_cpu:latest
+FROM ${BASE_IMAGE}
 
-# Install IPFS
-# The line below was creating issues due to flaky external repos
-# RUN apt-get update && apt-get install -y wget && apt-get install -y tar
-# Install tools needed for the next steps without hitting flaky external repos
+# Install IPFS (Kubo) — needed for R1FS decentralized file system
+ARG KUBO_VERSION=v0.35.0
 RUN set -eux; \
-    # disable NodeSource (if present) so apt won't read it
-    rm -f /etc/apt/sources.list.d/nodesource*.list /etc/apt/sources.list.d/nodesource*.sources || true; \
-    apt-get update -o Acquire::Retries=3; \
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-    wget tar ca-certificates \
-    ninja-build; \
-    rm -rf /var/lib/apt/lists/*
-         
-RUN wget https://dist.ipfs.tech/kubo/v0.35.0/kubo_v0.35.0_linux-amd64.tar.gz && \
-  tar -xvzf kubo_v0.35.0_linux-amd64.tar.gz && \
-  cd kubo && \
-  bash install.sh
-# End Install IPFS
+    wget -q https://dist.ipfs.tech/kubo/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz; \
+    tar -xzf kubo_${KUBO_VERSION}_linux-amd64.tar.gz; \
+    cd kubo && bash install.sh; \
+    cd / && rm -rf kubo kubo_${KUBO_VERSION}_linux-amd64.tar.gz
 
-# Install Cloudflared
+# Install Cloudflared — tunnel engine for exposing webapp endpoints
 ARG CLOUDFLARED_VERSION=2025.7.0
-
 RUN set -eux; \
-    # --- map architecture names to Cloudflare’s file names -------
-    arch="$(uname -m)";                     \
-    case "$arch" in                         \
-      x86_64)  arch=amd64  ;;               \
-      aarch64 | arm64) arch=arm64 ;;        \
-      armv7l)  arch=armv7  ;;               \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64)  arch=amd64  ;; \
+      aarch64 | arm64) arch=arm64 ;; \
+      armv7l)  arch=armv7  ;; \
       *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
-    esac;                                   \
-    # --- download the pinned release --------------------------------
+    esac; \
     curl -L "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}" \
-         -o /usr/local/bin/cloudflared;     \
-    chmod +x /usr/local/bin/cloudflared;    \
-    # --- (optional) show version so it appears in build logs --------
+         -o /usr/local/bin/cloudflared; \
+    chmod +x /usr/local/bin/cloudflared; \
     cloudflared --version
-# End Install Cloudflared
 
 COPY ./cmds /usr/local/bin/
 RUN chmod +x /usr/local/bin/*
@@ -83,9 +68,6 @@ ENV EE_DEBUG_R1FS=true
 # also can use EE_DEVICE to define target such as cuda:0 or cuda:1 instead of cpu
 # althouh this is not recommended as it should be in .env file
 # ENV EE_DEVICE=cuda:0
-
-# to avoid issues with hnswlib and building from source
-ENV HNSWLIB_NO_NATIVE=1
 
 RUN pip install --no-cache-dir -r requirements.txt
 RUN pip install --no-cache-dir --no-deps naeural-core
