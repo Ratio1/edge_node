@@ -6,10 +6,10 @@ FROM ${BASE_IMAGE}
 # Install IPFS (Kubo) — needed for R1FS decentralized file system
 ARG KUBO_VERSION=v0.35.0
 RUN set -eux; \
-    wget -q https://dist.ipfs.tech/kubo/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz; \
-    tar -xzf kubo_${KUBO_VERSION}_linux-amd64.tar.gz; \
+    curl -fsSLo kubo.tar.gz https://dist.ipfs.tech/kubo/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz; \
+    tar -xzf kubo.tar.gz; \
     cd kubo && bash install.sh; \
-    cd / && rm -rf kubo kubo_${KUBO_VERSION}_linux-amd64.tar.gz
+    cd / && rm -rf kubo kubo.tar.gz
 
 # Install Cloudflared — tunnel engine for exposing webapp endpoints
 ARG CLOUDFLARED_VERSION=2025.7.0
