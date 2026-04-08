@@ -75,15 +75,20 @@ class _WebApiExposureMixin:
     if port not in (80, 443):
       base_url = f"{scheme}://{target}:{port}"
 
+    # (path, provider, extra_headers)
     metadata_paths = [
-      ("/latest/meta-data/", "AWS EC2"),
-      ("/metadata/computeMetadata/v1/", "GCP"),
-      ("/computeMetadata/v1/", "GCP (alt)"),
+      ("/latest/meta-data/", "AWS EC2", {}),
+      ("/metadata/computeMetadata/v1/", "GCP", {"Metadata-Flavor": "Google"}),
+      ("/computeMetadata/v1/", "GCP (alt)", {"Metadata-Flavor": "Google"}),
+      ("/metadata/instance?api-version=2021-02-01", "Azure IMDS", {"Metadata": "true"}),
+      ("/metadata/v1/", "DigitalOcean", {}),
+      ("/latest/meta-data", "Alibaba Cloud ECS", {}),
+      ("/opc/v2/instance/", "Oracle Cloud", {}),
     ]
     try:
-      for path, provider in metadata_paths:
+      for path, provider, extra_headers in metadata_paths:
         url = base_url.rstrip("/") + path
-        resp = requests.get(url, timeout=3, verify=False, headers={"Metadata-Flavor": "Google"})
+        resp = requests.get(url, timeout=3, verify=False, headers=extra_headers)
         if resp.status_code == 200:
           findings_list.append(Finding(
             severity=Severity.CRITICAL,
@@ -92,13 +97,81 @@ class _WebApiExposureMixin:
                         "IAM credentials, instance identity tokens, and cloud configuration.",
             evidence=f"GET {url} returned 200 OK.",
             remediation="Block metadata endpoint access from application layer; use IMDSv2 (AWS) or metadata concealment.",
-            owasp_id="A05:2021",
+            owasp_id="A10:2021",
             cwe_id="CWE-918",
             confidence="certain",
           ))
     except Exception as e:
       self.P(f"Metadata endpoint probe failed on {base_url}: {e}", color='y')
       return probe_error(target, port, "metadata", e)
+
+    return probe_result(findings=findings_list)
+
+
+  # SSRF-prone parameter names commonly seen in web applications
+  _SSRF_PARAMS = ("url", "redirect", "proxy", "callback", "dest", "uri",
+                  "src", "href", "link", "fetch")
+  # Markers that indicate internal/metadata content was returned
+  _SSRF_MARKERS = ("ami-id", "instance-id", "iam/security-credentials",
+                   "meta-data", "computeMetadata", "hostname", "local-ipv4")
+
+  def _web_test_ssrf_basic(self, target, port):
+    """
+    Low-confidence SSRF check: inject metadata URL into common parameters.
+
+    Real SSRF typically lives in backend webhook/PDF/image endpoints that
+    require deeper crawling to discover.  This probe catches low-hanging fruit
+    only — URL-accepting parameters on well-known paths.
+
+    Parameters
+    ----------
+    target : str
+      Hostname or IP address.
+    port : int
+      Web port to probe.
+
+    Returns
+    -------
+    dict
+      Structured findings.
+    """
+    findings_list = []
+    scheme = "https" if port in (443, 8443) else "http"
+    base_url = f"{scheme}://{target}" if port in (80, 443) else f"{scheme}://{target}:{port}"
+
+    ssrf_payload = "http://169.254.169.254/latest/meta-data/"
+    candidate_paths = ["/", "/api/", "/webhook"]
+
+    try:
+      for path in candidate_paths:
+        if len(findings_list) >= 2:
+          break
+        for param in self._SSRF_PARAMS:
+          if len(findings_list) >= 2:
+            break
+          try:
+            url = f"{base_url.rstrip('/')}{path}?{param}={ssrf_payload}"
+            resp = requests.get(url, timeout=4, verify=False)
+            body_lower = resp.text.lower()
+            if resp.status_code == 200 and any(m in body_lower for m in self._SSRF_MARKERS):
+              findings_list.append(Finding(
+                severity=Severity.CRITICAL,
+                title=f"SSRF: parameter '{param}' fetches internal resources",
+                description=f"Injecting a metadata URL into the '{param}' parameter at "
+                            f"{path} returned cloud metadata content, indicating SSRF.",
+                evidence=f"GET {url} returned metadata markers.",
+                remediation="Validate and restrict URLs accepted by server-side parameters; "
+                            "block requests to internal/metadata IPs.",
+                owasp_id="A10:2021",
+                cwe_id="CWE-918",
+                confidence="certain",
+              ))
+              break  # one finding per path is enough
+          except Exception:
+            pass
+    except Exception as e:
+      self.P(f"SSRF basic probe failed on {base_url}: {e}", color='y')
+      return probe_error(target, port, "ssrf_basic", e)
 
     return probe_result(findings=findings_list)
 

@@ -192,6 +192,79 @@ class _DeeployJobMixin:
     
     return cid
 
+  def _delete_pipeline_cid_from_r1fs(self, cid: str):
+    """
+    Remove a pipeline payload from R1FS by CID.
+
+    Parameters
+    ----------
+    cid: str
+        The CID to remove from R1FS.
+
+    Returns
+    -------
+    bool
+        True when deletion completed without raising, False otherwise.
+    """
+    if not cid or not isinstance(cid, str):
+      return False
+
+    try:
+      verbose_logs = getattr(self, "cfg_deeploy_verbose", 0) > 1
+      self.Pd(f"Deleting R1FS pipeline CID {cid}", color='y')
+      self.r1fs.delete_file(cid, show_logs=verbose_logs, raise_on_error=False)
+    except Exception as exc:
+      self.Pd(f"Unable to delete R1FS CID {cid}: {exc}", color='y')
+      return False
+
+    return True
+
+  def persist_job_pipeline_metadata(
+    self,
+    pipeline: dict,
+    job_id: int,
+    previous_cid: str = None,
+    delete_previous: bool = False,
+  ):
+    """
+    Persist the latest deployed pipeline metadata after deployment succeeds.
+
+    Parameters
+    ----------
+    pipeline: dict
+        The pipeline payload to persist.
+    job_id: int
+        Deeploy job identifier.
+    previous_cid: str
+        Previously stored CID, when available.
+    delete_previous: bool
+        When True, best-effort delete the previous R1FS object after the new CID
+        is committed in CSTORE.
+
+    Returns
+    -------
+    bool
+        True when the new metadata was saved successfully, False otherwise.
+    """
+    save_result = self.save_job_pipeline_in_cstore(pipeline, job_id)
+    if not save_result:
+      return False
+
+    if not delete_previous or not previous_cid or not isinstance(previous_cid, str):
+      return True
+
+    try:
+      current_cid = self._get_pipeline_from_cstore(job_id)
+    except Exception as exc:
+      self.Pd(f"Unable to read updated CSTORE CID for job {job_id}: {exc}", color='y')
+      return True
+
+    if not current_cid or current_cid == previous_cid:
+      return True
+
+    self._delete_pipeline_cid_from_r1fs(previous_cid)
+    return True
+
   def delete_job_pipeline_from_r1fs(self, job_id: int, remove_chainstore_entry: bool = False):
     """
     Remove a stored pipeline definition from R1FS (and optionally CSTORE) for the given job.
@@ -220,12 +293,7 @@ class _DeeployJobMixin:
     if not cid or not isinstance(cid, str):
       return False
 
-    try:
-      verbose_logs = getattr(self, "cfg_deeploy_verbose", 0) > 1
-      self.Pd(f"Deleting R1FS pipeline for job {job_id} (CID {cid})", color='y')
-      self.r1fs.delete_file(cid, show_logs=verbose_logs, raise_on_error=False)
-    except Exception as exc:
-      self.Pd(f"Unable to delete R1FS pipeline for job {job_id}: {exc}", color='y')
+    if not self._delete_pipeline_cid_from_r1fs(cid):
       return False
 
     if remove_chainstore_entry:

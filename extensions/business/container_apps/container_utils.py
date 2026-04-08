@@ -10,6 +10,8 @@ import socket
 # Path for container volumes
 CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 
+ALLOWED_TUNNEL_PROTOCOLS = ("http", "https", "tcp", "ssh", "rdp", "smb")
+
 
 class _ContainerUtilsMixin:
 
@@ -162,6 +164,432 @@ class _ContainerUtilsMixin:
     })
 
     return data
+
+  def _normalize_exposed_ports_value(self, exposed_ports):
+    """
+    Normalize and validate a raw EXPOSED_PORTS-style dictionary.
+
+    Parameters
+    ----------
+    exposed_ports : dict
+        Raw exposed ports config keyed by container port.
+    """
+    if not isinstance(exposed_ports, dict):
+      raise ValueError("EXPOSED_PORTS must be a dictionary keyed by container port")
+
+    normalized = {}
+    main_ports = []
+    used_host_ports = {}
+
+    for raw_container_port, raw_config in exposed_ports.items():
+      try:
+        container_port = int(raw_container_port)
+      except (TypeError, ValueError):
+        raise ValueError(f"EXPOSED_PORTS key must be an integer port, got: {raw_container_port}")
+
+      if container_port < 1 or container_port > 65535:
+        raise ValueError(f"EXPOSED_PORTS key must be a valid port number, got: {container_port}")
+
+      if raw_config is None:
+        raw_config = {}
+
+      if not isinstance(raw_config, dict):
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}] must be a dictionary, got: {type(raw_config)}"
+        )
+
+      config = self.deepcopy(raw_config)
+      is_main_port = config.get("is_main_port", False)
+      if not isinstance(is_main_port, bool):
+        raise ValueError(f"EXPOSED_PORTS[{container_port}].is_main_port must be a boolean")
+      if is_main_port:
+        main_ports.append(container_port)
+
+      host_port = config.get("host_port")
+      if host_port is not None:
+        try:
+          host_port = int(host_port)
+        except (TypeError, ValueError):
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].host_port must be an integer or null"
+          )
+        if host_port < 1 or host_port > 65535:
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].host_port must be a valid port number"
+          )
+        if host_port in used_host_ports:
+          raise ValueError(
+            "EXPOSED_PORTS defines duplicate host_port {} for container ports {} and {}".format(
+              host_port, used_host_ports[host_port], container_port
+            )
+          )
+        used_host_ports[host_port] = container_port
+
+      # --- Tunnel field normalization (flat + nested compat) ---
+      tunnel_nested = config.get("tunnel")
+      nested_token = None
+      nested_engine = None
+      if tunnel_nested is not None:
+        if not isinstance(tunnel_nested, dict):
+          raise ValueError(f"EXPOSED_PORTS[{container_port}].tunnel must be a dictionary")
+        nested_token = tunnel_nested.get("token")
+        if isinstance(nested_token, str):
+          nested_token = nested_token.strip() or None
+        else:
+          nested_token = None
+        nested_engine = tunnel_nested.get("engine")
+        if isinstance(nested_engine, str):
+          nested_engine = nested_engine.strip().lower() or None
+        else:
+          nested_engine = None
+        # If nested tunnel.enabled is explicitly False, ignore nested token/engine
+        nested_enabled = tunnel_nested.get("enabled", False)
+        if not nested_enabled:
+          nested_token = None
+          nested_engine = None
+
+      # Read flat fields
+      flat_token = config.get("token")
+      if isinstance(flat_token, str):
+        flat_token = flat_token.strip() or None
+      else:
+        flat_token = None
+
+      flat_protocol = config.get("protocol")
+      flat_engine = config.get("engine")
+
+      # Resolve token: flat wins over nested
+      if flat_token is not None and nested_token is not None and flat_token != nested_token:
+        self.P(
+          f"EXPOSED_PORTS[{container_port}]: flat token overrides nested tunnel.token "
+          f"(deprecated nested format)",
+          color='y'
+        )
+      token = flat_token if flat_token is not None else nested_token
+
+      # If nested tunnel.enabled is False but flat token is present, flat wins
+      if (
+        tunnel_nested is not None and
+        not tunnel_nested.get("enabled", False) and
+        flat_token is not None
+      ):
+        self.P(
+          f"EXPOSED_PORTS[{container_port}]: flat token present but nested tunnel.enabled=False; "
+          f"tunnel is enabled via flat token",
+          color='y'
+        )
+
+      # Resolve engine: flat wins over nested
+      if flat_engine is not None:
+        if isinstance(flat_engine, str):
+          engine = flat_engine.strip().lower() or None
+        else:
+          engine = None
+        if nested_engine is not None and engine != nested_engine:
+          self.P(
+            f"EXPOSED_PORTS[{container_port}]: flat engine overrides nested tunnel.engine "
+            f"(deprecated nested format)",
+            color='y'
+          )
+      else:
+        engine = nested_engine
+
+      # Default engine to "cloudflare"
+      if engine is None:
+        engine = "cloudflare"
+
+      # Validate engine: only "cloudflare" allowed this phase
+      if engine not in ("cloudflare",):
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}].engine must be 'cloudflare' (got '{engine}')"
+        )
+
+      # Validate token when engine is cloudflare and token is provided
+      if token is not None:
+        if not isinstance(token, str) or not token.strip():
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].token must be a non-empty string when provided"
+          )
+        token = token.strip()
+
+      # Resolve protocol
+      if flat_protocol is not None:
+        if isinstance(flat_protocol, str):
+          protocol = flat_protocol.strip().lower()
+        else:
+          raise ValueError(
+            f"EXPOSED_PORTS[{container_port}].protocol must be a string"
+          )
+      else:
+        protocol = "http"
+
+      # Validate protocol
+      if protocol not in ALLOWED_TUNNEL_PROTOCOLS:
+        raise ValueError(
+          f"EXPOSED_PORTS[{container_port}].protocol must be one of {ALLOWED_TUNNEL_PROTOCOLS}, "
+          f"got '{protocol}'"
+        )
+
+      normalized[container_port] = {
+        "container_port": container_port,
+        "is_main_port": is_main_port,
+        "host_port": host_port,
+        "token": token,
+        "protocol": protocol,
+        "engine": engine,
+      }
+
+    if len(main_ports) > 1:
+      raise ValueError(f"EXPOSED_PORTS defines multiple main ports: {sorted(main_ports)}")
+
+    return normalized
+
+  def _get_legacy_main_tunnel_token(self):
+    """
+    Return the legacy main Cloudflare token, if configured.
+    """
+    if isinstance(getattr(self, 'cfg_cloudflare_token', None), str):
+      token = self.cfg_cloudflare_token.strip()
+      if token:
+        return token
+
+    params = getattr(self, 'cfg_tunnel_engine_parameters', None) or {}
+    if isinstance(params, dict):
+      token = params.get("CLOUDFLARE_TOKEN")
+      if isinstance(token, str):
+        token = token.strip()
+        if token:
+          return token
+    return None
+
+  def _merge_legacy_exposed_port_entry(
+    self, exposed_ports, container_port, is_main_port=None, host_port=None, token=None
+  ):
+    """
+    Merge legacy CAR fields into a raw EXPOSED_PORTS-style entry.
+    """
+    try:
+      container_port = int(container_port)
+    except (TypeError, ValueError):
+      raise ValueError(f"Legacy container port must be an integer, got: {container_port}")
+
+    if container_port < 1 or container_port > 65535:
+      raise ValueError(f"Legacy container port must be a valid port number, got: {container_port}")
+
+    entry = exposed_ports.setdefault(str(container_port), {})
+
+    if is_main_port is True:
+      existing_is_main = entry.get("is_main_port", False)
+      if existing_is_main is False:
+        entry["is_main_port"] = True
+    elif "is_main_port" not in entry:
+      entry["is_main_port"] = False
+
+    if host_port is not None:
+      try:
+        host_port = int(host_port)
+      except (TypeError, ValueError):
+        raise ValueError(f"Legacy host port must be an integer, got: {host_port}")
+      existing_host_port = entry.get("host_port")
+      if existing_host_port is not None and int(existing_host_port) != host_port:
+        raise ValueError(
+          "Legacy config maps container port {} to conflicting host ports {} and {}".format(
+            container_port, existing_host_port, host_port
+          )
+        )
+      entry["host_port"] = host_port
+
+    if token is not None:
+      existing_token = entry.get("token")
+      if existing_token is not None and existing_token != token:
+        raise ValueError(
+          "Legacy config defines conflicting tunnel token for container port {}".format(
+            container_port
+          )
+        )
+      entry["token"] = token
+
+    return entry
+
+  def _build_exposed_ports_config_from_legacy(self):
+    """
+    Build a raw EXPOSED_PORTS-style config from legacy CAR fields.
+    """
+    exposed_ports = {}
+    main_port = getattr(self, 'cfg_port', None)
+    container_resources = getattr(self, 'cfg_container_resources', None) or {}
+    legacy_ports = container_resources.get("ports", [])
+
+    if isinstance(legacy_ports, list):
+      for container_port in legacy_ports:
+        self._merge_legacy_exposed_port_entry(
+          exposed_ports,
+          container_port=container_port,
+          is_main_port=(main_port is not None and int(container_port) == int(main_port)),
+        )
+    elif isinstance(legacy_ports, dict):
+      for raw_host_port, raw_container_port in legacy_ports.items():
+        self._merge_legacy_exposed_port_entry(
+          exposed_ports,
+          container_port=raw_container_port,
+          is_main_port=(main_port is not None and int(raw_container_port) == int(main_port)),
+          host_port=raw_host_port,
+        )
+
+    if main_port is not None and str(int(main_port)) not in exposed_ports:
+      self._merge_legacy_exposed_port_entry(
+        exposed_ports,
+        container_port=main_port,
+        is_main_port=True,
+      )
+
+    main_tunnel_token = self._get_legacy_main_tunnel_token()
+    if main_tunnel_token and main_port is not None:
+      self._merge_legacy_exposed_port_entry(
+        exposed_ports,
+        container_port=main_port,
+        is_main_port=True,
+        token=main_tunnel_token,
+      )
+      # Carry legacy CLOUDFLARE_PROTOCOL into the normalized entry
+      legacy_protocol = getattr(self, 'cfg_cloudflare_protocol', None)
+      if isinstance(legacy_protocol, str) and legacy_protocol.strip():
+        entry = exposed_ports.get(str(int(main_port)))
+        if entry is not None:
+          entry["protocol"] = legacy_protocol.strip().lower()
+
+    legacy_extra_tunnels = getattr(self, 'cfg_extra_tunnels', None) or {}
+    if not isinstance(legacy_extra_tunnels, dict):
+      raise ValueError("EXTRA_TUNNELS must be a dictionary {container_port: token}")
+
+    for raw_container_port, raw_tunnel_config in legacy_extra_tunnels.items():
+      normalized_token = self._normalize_extra_tunnel_config(raw_container_port, raw_tunnel_config)
+      if not normalized_token:
+        raise ValueError(f"EXTRA_TUNNELS[{raw_container_port}] token is empty")
+      try:
+        container_port = int(raw_container_port)
+      except (TypeError, ValueError):
+        raise ValueError(f"EXTRA_TUNNELS key must be integer port, got: {raw_container_port}")
+
+      entry = exposed_ports.get(str(container_port))
+      if (
+        entry is not None and
+        entry.get("token") is not None and
+        main_port is not None and
+        container_port == int(main_port) and
+        entry.get("token") != normalized_token
+      ):
+        self.P(
+          "Legacy tunnel config for main PORT {} is overridden by EXTRA_TUNNELS entry".format(
+            container_port
+          ),
+          color='y'
+        )
+        entry["token"] = normalized_token
+        entry["is_main_port"] = True
+        continue
+
+      self._merge_legacy_exposed_port_entry(
+        exposed_ports,
+        container_port=container_port,
+        is_main_port=(main_port is not None and container_port == int(main_port)),
+        token=normalized_token,
+      )
+
+    return exposed_ports
+
+  def _normalize_exposed_ports_config(self):
+    """
+    Normalize and validate EXPOSED_PORTS configuration or synthesize it
+    from legacy CAR fields when the new config is absent.
+
+    Returns
+    -------
+    dict
+        Normalized exposed ports keyed by container port integer.
+    """
+    exposed_ports = getattr(self, 'cfg_exposed_ports', None)
+    if isinstance(exposed_ports, dict) and len(exposed_ports) > 0:
+      return self._normalize_exposed_ports_value(exposed_ports)
+
+    if exposed_ports in (None, {}):
+      legacy_exposed_ports = self._build_exposed_ports_config_from_legacy()
+      return self._normalize_exposed_ports_value(legacy_exposed_ports)
+
+    raise ValueError("EXPOSED_PORTS must be a dictionary keyed by container port")
+
+  def _refresh_normalized_exposed_ports_state(self):
+    """
+    Recompute and cache normalized exposed ports from the current config.
+    """
+    self._normalized_exposed_ports = self._normalize_exposed_ports_config()
+    self._normalized_main_exposed_port = self._get_main_exposed_port(self._normalized_exposed_ports)
+    return self._normalized_exposed_ports
+
+  def _get_main_container_port(self, normalized_exposed_ports=None):
+    """
+    Return the container port marked as main, if any.
+    """
+    if normalized_exposed_ports is None:
+      normalized_exposed_ports = getattr(self, '_normalized_exposed_ports', {})
+      if not normalized_exposed_ports:
+        normalized_exposed_ports = self._normalize_exposed_ports_config()
+    main_exposed_port = self._get_main_exposed_port(normalized_exposed_ports)
+    if not main_exposed_port:
+      return None
+    return main_exposed_port.get("container_port")
+
+  def _get_main_exposed_port(self, normalized_exposed_ports=None):
+    """
+    Return the normalized EXPOSED_PORTS entry marked as main.
+
+    Parameters
+    ----------
+    normalized_exposed_ports : dict, optional
+        Normalized exposed ports mapping. Uses cached value when omitted.
+
+    Returns
+    -------
+    dict or None
+        Main exposed port entry or None if not configured.
+    """
+    if normalized_exposed_ports is None:
+      normalized_exposed_ports = getattr(self, '_normalized_exposed_ports', {})
+
+    for config in normalized_exposed_ports.values():
+      if config.get("is_main_port") == True:
+        return config
+    return None
+
+  def _get_container_to_host_port_map_from_exposed_ports(self, normalized_exposed_ports=None):
+    """
+    Build container->host mapping from normalized EXPOSED_PORTS for entries
+    that already define host_port.
+    """
+    if normalized_exposed_ports is None:
+      normalized_exposed_ports = getattr(self, '_normalized_exposed_ports', {})
+
+    result = {}
+    for container_port, config in normalized_exposed_ports.items():
+      host_port = config.get("host_port")
+      if host_port is not None:
+        result[int(container_port)] = int(host_port)
+    return result
+
+  def _get_host_to_container_port_map_from_exposed_ports(self, normalized_exposed_ports=None):
+    """
+    Build host->container mapping from normalized EXPOSED_PORTS for entries
+    that already define host_port.
+    """
+    if normalized_exposed_ports is None:
+      normalized_exposed_ports = getattr(self, '_normalized_exposed_ports', {})
+
+    result = {}
+    for container_port, config in normalized_exposed_ports.items():
+      host_port = config.get("host_port")
+      if host_port is not None:
+        result[int(host_port)] = int(container_port)
+    return result
 
   def _get_container_ip(self):
     """
@@ -369,147 +797,46 @@ class _ContainerUtilsMixin:
 
   def _setup_resource_limits_and_ports(self):
     """
-    Sets up resource limits and port mappings for the container based on configuration.
-
-    Port Handling Logic:
-      1. Process all ports from CONTAINER_RESOURCES["ports"] first
-      2. If main PORT exists and not in ports mapping, allocate it
-      3. All ports (including main PORT) go into extra_ports_mapping
-      4. Validate no duplicate container ports
-
-    Priority:
-      - Explicit mappings in CONTAINER_RESOURCES["ports"] take precedence
-      - Main PORT is allocated dynamically if not explicitly mapped
+    Sets up resource limits and runtime port mappings from normalized config.
     """
     DEFAULT_CPU_LIMIT = 1
     DEFAULT_GPU_LIMIT = 0
     DEFAULT_MEM_LIMIT = "512m"
-    DEFAULT_PORTS = []
+    container_resources = self.cfg_container_resources if isinstance(self.cfg_container_resources, dict) else {}
+    self._cpu_limit = float(container_resources.get("cpu", DEFAULT_CPU_LIMIT))
+    self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
+    self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
 
-    container_resources = self.cfg_container_resources
-    if isinstance(container_resources, dict) and len(container_resources) > 0:
-      self._cpu_limit = float(container_resources.get("cpu", DEFAULT_CPU_LIMIT))
-      self._gpu_limit = container_resources.get("gpu", DEFAULT_GPU_LIMIT)
-      self._mem_limit = container_resources.get("memory", DEFAULT_MEM_LIMIT)
+    normalized_exposed_ports = self._refresh_normalized_exposed_ports_state()
 
-      ports = container_resources.get("ports", DEFAULT_PORTS)
+    self.extra_ports_mapping = {}
+    self.inverted_ports_mapping = {}
+    self.port = None
 
-      # Track which container ports have been mapped to avoid duplicates
-      mapped_container_ports = set()
-      main_port_mapped = False
+    if normalized_exposed_ports:
+      self.P(f"Processing {len(normalized_exposed_ports)} normalized exposed port(s)...")
 
-      if len(ports) > 0:
-        if isinstance(ports, list):
-          # Handle list of container ports - allocate dynamic host ports
-          self.P("Processing container ports list...")
-          for container_port in ports:
-            if container_port in mapped_container_ports:
-              self.P(f"Warning: Container port {container_port} already mapped, skipping duplicate", color='y')
-              continue
+    for container_port, port_config in normalized_exposed_ports.items():
+      requested_host_port = port_config.get("host_port")
+      if requested_host_port is not None:
+        self.P(f"Allocating requested host port {requested_host_port} for container port {container_port}...")
+        host_port = self._allocate_port(requested_host_port, allow_dynamic=False)
+        if host_port != requested_host_port:
+          raise RuntimeError(
+            f"Failed to allocate requested host port {requested_host_port}. "
+            f"Port may be in use by another process."
+          )
+      else:
+        self.P(f"Container port {container_port} specified. Finding available host port...")
+        host_port = self._allocate_port(allow_dynamic=True)
 
-            self.P(f"Container port {container_port} specified. Finding available host port...")
-            host_port = self._allocate_port()
-            self.extra_ports_mapping[host_port] = container_port
-            mapped_container_ports.add(container_port)
-            self.P(f"Allocated host port {host_port} -> container port {container_port}")
+      self.extra_ports_mapping[host_port] = container_port
+      self.P(f"Allocated host port {host_port} -> container port {container_port}")
 
-            # Check if this is the main port
-            if self.cfg_port and container_port == self.cfg_port:
-              self.port = host_port
-              main_port_mapped = True
-              self.P(f"Main PORT {self.cfg_port} mapped to host port {host_port}", color='g')
-
-        elif isinstance(ports, dict):
-          # Handle dict of explicit host_port -> container_port mappings
-          self.P("Processing explicit port mappings...")
-
-          # First, validate for duplicate container ports
-          container_ports_in_dict = list(ports.values())
-          if len(container_ports_in_dict) != len(set(container_ports_in_dict)):
-            raise ValueError(
-              f"Duplicate container ports found in CONTAINER_RESOURCES['ports']: {ports}. "
-              "Each container port can only be mapped once."
-            )
-
-          # Process all explicit mappings
-          for host_port, container_port in ports.items():
-            try:
-              host_port = int(host_port)
-              container_port = int(container_port)
-
-              # Check if this mapping was already processed
-              if host_port in self.extra_ports_mapping:
-                existing_container_port = self.extra_ports_mapping[host_port]
-                if existing_container_port == container_port:
-                  self.Pd(f"Port mapping {host_port}->{container_port} already exists, skipping")
-                  continue
-                else:
-                  raise ValueError(
-                    f"Host port {host_port} is already mapped to container port {existing_container_port}. "
-                    f"Cannot map it to {container_port}"
-                  )
-
-              # Allocate the requested host port
-              self.P(f"Allocating requested host port {host_port} for container port {container_port}...")
-              allocated_port = self._allocate_port(host_port, allow_dynamic=False)
-
-              if allocated_port != host_port:
-                raise RuntimeError(
-                  f"Failed to allocate requested host port {host_port}. "
-                  f"Port may be in use by another process."
-                )
-
-              self.extra_ports_mapping[host_port] = container_port
-              mapped_container_ports.add(container_port)
-              self.P(f"Allocated host port {host_port} -> container port {container_port}", color='g')
-
-              # Check if this is the main port
-              if self.cfg_port and container_port == self.cfg_port:
-                self.port = host_port
-                main_port_mapped = True
-                self.P(f"Main PORT {self.cfg_port} mapped to host port {host_port} (from explicit mapping)", color='g')
-
-            except ValueError as e:
-              raise ValueError(f"Invalid port mapping {host_port}:{container_port} - {e}")
-            except Exception as e:
-              self.P(f"Failed to allocate port {host_port}: {e}", color='r')
-              raise RuntimeError(f"Port allocation failed for {host_port}:{container_port}")
-        else:
-          self.P(f"Invalid ports configuration type: {type(ports)}. Expected list or dict.", color='r')
-
-      # Handle main PORT if it exists and wasn't mapped yet
-      if self.cfg_port and not main_port_mapped:
-        if self.cfg_port in mapped_container_ports:
-          # Main PORT was mapped to a different host port in the loop above
-          # Find which host port it was mapped to
-          for h_port, c_port in self.extra_ports_mapping.items():
-            if c_port == self.cfg_port:
-              self.port = h_port
-              self.P(f"Main PORT {self.cfg_port} already mapped to host port {h_port}", color='d')
-              break
-        else:
-          # Allocate a dynamic host port for the main PORT
-          self.P(f"Main PORT {self.cfg_port} not in explicit mappings. Allocating dynamic host port...")
-          self.port = self._allocate_port(allow_dynamic=True)
-          self.extra_ports_mapping[self.port] = self.cfg_port
-          mapped_container_ports.add(self.cfg_port)
-          self.P(f"Allocated host port {self.port} -> main PORT {self.cfg_port}", color='g')
-        # endif main PORT
-      # endif main_port_mapped
-    else:
-      # No container resources specified, use defaults
-      self._cpu_limit = float(DEFAULT_CPU_LIMIT)
-      self._gpu_limit = DEFAULT_GPU_LIMIT
-      self._mem_limit = DEFAULT_MEM_LIMIT
-
-      # Still handle main PORT if specified
-      if self.cfg_port:
-        self.P(f"No CONTAINER_RESOURCES specified. Allocating dynamic host port for main PORT {self.cfg_port}...")
-        self.port = self._allocate_port(allow_dynamic=True)
-        self.extra_ports_mapping[self.port] = self.cfg_port
-        self.P(f"Allocated host port {self.port} -> main PORT {self.cfg_port}", color='g')
-      # endif main PORT
-    # endif container_resources
+      if port_config.get("is_main_port") is True:
+        self.port = host_port
+        self.P(f"Main PORT {container_port} mapped to host port {host_port}", color='g')
+    # endfor container_port
     return
 
   def _set_directory_permissions(self, path, mode=0o777):
@@ -969,42 +1296,6 @@ class _ContainerUtilsMixin:
       self.P(f"Error getting container stats: {e}", color='r')
       return None
 
-  def _validate_docker_image_format(self, image_name):
-    """
-    Validate Docker image name format.
-
-    Parameters
-    ----------
-    image_name : str
-        Docker image name to validate
-
-    Returns
-    -------
-    bool
-        True if image name format is valid, False otherwise
-
-    Notes
-    -----
-    Validation checks:
-    - Must be a string
-    - Must contain at least one ':' (tag) or '/' (repository)
-    - Must not contain whitespace characters
-    """
-    if not isinstance(image_name, str):
-      return False
-
-    # Basic validation - should contain at least one colon or slash
-    if ':' not in image_name and '/' not in image_name:
-      return False
-
-    # Check for invalid characters
-    invalid_chars = [' ', '\t', '\n', '\r']
-    for char in invalid_chars:
-      if char in image_name:
-        return False
-
-    return True
-
   ### END COMMON CONTAINER UTILITY METHODS ###
 
   ### EXTRA TUNNELS METHODS ###
@@ -1084,17 +1375,13 @@ class _ContainerUtilsMixin:
 
   def _validate_extra_tunnels_config(self):
     """
-    Validate EXTRA_TUNNELS configuration.
-
-    Key behaviors:
-    1. If TUNNEL_ENGINE_ENABLED=False, EXTRA_TUNNELS are IGNORED
-    2. Container ports can be defined only in EXTRA_TUNNELS (not in CONTAINER_RESOURCES)
-    3. Ports from EXTRA_TUNNELS will be allocated dynamically if needed
-    4. Dict keys can be strings or integers
+    Validate and derive runtime extra tunnel config from normalized ports.
 
     Returns:
       bool: True if valid
     """
+    self.extra_tunnel_configs = {}
+
     # Master switch check
     if not self.cfg_tunnel_engine_enabled:
       if self.cfg_extra_tunnels:
@@ -1104,48 +1391,36 @@ class _ContainerUtilsMixin:
         )
       return True
 
-    if not self.cfg_extra_tunnels:
-      self.Pd("No EXTRA_TUNNELS configured")
-      return True
+    normalized_exposed_ports = self._refresh_normalized_exposed_ports_state()
+    main_container_port = self._get_main_container_port(normalized_exposed_ports)
 
-    if not isinstance(self.cfg_extra_tunnels, dict):
-      raise ValueError("EXTRA_TUNNELS must be a dictionary {container_port: token}")
+    for container_port, port_config in normalized_exposed_ports.items():
+      token = port_config.get("token")
+      if not token:
+        continue
 
-    # Track which ports need to be allocated
-    ports_to_allocate = []
+      if container_port not in self.extra_ports_mapping.values():
+        requested_host_port = port_config.get("host_port")
+        if requested_host_port is not None:
+          host_port = self._allocate_port(requested_host_port, allow_dynamic=False)
+        else:
+          host_port = self._allocate_port(allow_dynamic=True)
+        self.extra_ports_mapping[host_port] = container_port
 
-    for port_key, tunnel_config in self.cfg_extra_tunnels.items():
-      # Convert port key to integer (handle both string and int keys)
-      try:
-        container_port = int(port_key)
-      except (ValueError, TypeError):
-        raise ValueError(f"EXTRA_TUNNELS key must be integer port, got: {port_key}")
+      if main_container_port is not None and container_port == main_container_port:
+        continue
 
-      # Check if port is already allocated
-      is_already_mapped = container_port in self.extra_ports_mapping.values()
+      self.extra_tunnel_configs[container_port] = {
+        "token": token,
+        "protocol": port_config.get("protocol", "http"),
+        "engine": port_config.get("engine", "cloudflare"),
+      }
 
-      if not is_already_mapped:
-        # Port not in CONTAINER_RESOURCES["ports"], will need to allocate
-        self.Pd(
-          f"EXTRA_TUNNELS port {container_port} not in CONTAINER_RESOURCES['ports'], "
-          f"will allocate dynamically"
-        )
-        ports_to_allocate.append(container_port)
-
-      # Normalize and validate tunnel config
-      try:
-        normalized = self._normalize_extra_tunnel_config(container_port, tunnel_config)
-        if not normalized:
-          raise ValueError(f"EXTRA_TUNNELS[{container_port}] token is empty")
-        self.extra_tunnel_configs[container_port] = normalized
-      except Exception as e:
-        raise ValueError(f"EXTRA_TUNNELS[{container_port}] validation failed: {e}")
-
-    # Allocate ports for EXTRA_TUNNELS not in CONTAINER_RESOURCES
-    if ports_to_allocate:
-      self._allocate_extra_tunnel_ports(ports_to_allocate)
-
-    self.P(f"EXTRA_TUNNELS validated: {len(self.extra_tunnel_configs)} tunnel(s) configured", color='g')
+    self.inverted_ports_mapping = {
+      f"{container_port}/tcp": str(host_port)
+      for host_port, container_port in self.extra_ports_mapping.items()
+    }
+    self.P(f"Extra tunnels derived from normalized config: {len(self.extra_tunnel_configs)} tunnel(s)", color='g')
     return True
 
   ### END EXTRA TUNNELS METHODS ###

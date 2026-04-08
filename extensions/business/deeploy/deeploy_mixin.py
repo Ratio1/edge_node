@@ -51,12 +51,34 @@ class _DeeployMixin:
     """
     Verify the signature of the request.
     """
+    claimed_sender = payload.get("EE_ETH_SENDER", "unknown")
+    signature = payload.get("EE_ETH_SIGN", "missing")
+    self.Pd(
+      "Verifying signature for claimed sender={}, sig={}..., no_hash={}, prefix='{}'".format(
+        claimed_sender, signature[:20] if isinstance(signature, str) else signature, no_hash, MESSAGE_PREFIX
+      )
+    )
     sender = self.bc.eth_verify_payload_signature(
       payload=payload,
       message_prefix=MESSAGE_PREFIX,
       no_hash=no_hash,
       indent=1,
+      verify_safe=True,
     )
+    if sender is None:
+      self.P(
+        "Signature verification FAILED for claimed sender={}. "
+        "Recovered address is None. Check that the signing key matches the sender address "
+        "and that the payload was not modified after signing.".format(claimed_sender),
+        color='r'
+      )
+    elif sender.lower() != claimed_sender.lower():
+      self.P(
+        "Signature verification MISMATCH: recovered={} != claimed={}".format(sender, claimed_sender),
+        color='r'
+      )
+    else:
+      self.Pd("Signature verification OK: recovered={}".format(sender))
     return sender
 
 
@@ -100,17 +122,7 @@ class _DeeployMixin:
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
-    plugins, name_to_instance = self.deeploy_prepare_plugins(inputs)
-    plugin_semaphore_map = {}
-    if name_to_instance:
-      plugins = self._resolve_shmem_references(plugins, name_to_instance, app_id)
-      # Build plugin_name → semaphore_key mapping only for actual providers
-      for plugin in plugins:
-        for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES, []):
-          sem_key = instance.get("SEMAPHORE")
-          pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
-          if sem_key and pname:
-            plugin_semaphore_map[pname] = sem_key
+    plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
     self._validate_dependency_tree(inputs)
     plugins = self._ensure_runner_cstore_auth_env(
       app_id=app_id,
@@ -165,9 +177,6 @@ class _DeeployMixin:
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
-    if plugin_semaphore_map:
-      dct_deeploy_specs[DEEPLOY_KEYS.JOB_CONFIG]["plugin_semaphore_map"] = plugin_semaphore_map
-
     plugins = self._autowire_native_container_semaphore(
       app_id=app_id,
       plugins=plugins,
@@ -207,6 +216,10 @@ class _DeeployMixin:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+    self._reset_chainstore_response_keys(
+      prepared_response_keys,
+      context=f"create pipeline '{app_alias}'",
+    )
 
     saved_pipeline = None
     for addr, node_plugins in node_plugins_by_addr.items():
@@ -233,15 +246,8 @@ class _DeeployMixin:
       # endif addr is valid
     # endfor each target node
 
-    self.Pd(f"Pipeline started: {self.json_dumps(saved_pipeline)}")
-    try:
-      save_result = self.save_job_pipeline_in_cstore(saved_pipeline, job_id)
-      self.P(f"Pipeline CID saved in CSTORE: {save_result}", color='r' if not save_result else None)
-    except Exception as e:
-      self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
-
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
-    return cleaned_response_keys
+    return cleaned_response_keys, saved_pipeline
 
   def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
     """
@@ -264,7 +270,7 @@ class _DeeployMixin:
     ts = self.time()
     detected_job_app_type = job_app_type
     if not detected_job_app_type:
-      plugins_for_detection, _ = self.deeploy_prepare_plugins(inputs)
+      plugins_for_detection = self.deeploy_prepare_plugins(inputs)
       detected_job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
 
     if not dct_deeploy_specs:
@@ -386,7 +392,12 @@ class _DeeployMixin:
           )
           plugins_by_node[addr].append(prepared_plugin)
 
+    # Resolve shmem and autowire per-node (not across all nodes),
+    # because multi-node jobs have the same logical plugin_names on each
+    # node, which would cause duplicate plugin_name errors if flattened.
     for addr, node_plugins in plugins_by_node.items():
+      if self._has_shmem_dynamic_env(node_plugins):
+        node_plugins = self._resolve_shmem_in_plugins(node_plugins, app_id)
       plugins_by_node[addr] = self._autowire_native_container_semaphore(
         app_id=app_id,
         plugins=node_plugins,
@@ -433,6 +444,10 @@ class _DeeployMixin:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+    self._reset_chainstore_response_keys(
+      prepared_response_keys,
+      context=f"update pipeline '{app_alias}'",
+    )
 
     for addr, node_plugins in node_plugins_ready.items():
       msg = ''
@@ -457,14 +472,9 @@ class _DeeployMixin:
 
         self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
         pipeline[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
-        pipelin_to_save = pipeline
+        pipeline_to_save = pipeline
       # endif addr is valid
     # endfor each target node
-    try:
-      save_result = self.save_job_pipeline_in_cstore(pipelin_to_save, job_id)
-      self.P(f"Pipeline saved in CSTORE: {save_result}")
-    except Exception as e:
-      self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
     if inputs.chainstore_response:
       if prepared_response_keys:
         dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
@@ -474,7 +484,7 @@ class _DeeployMixin:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
-    return cleaned_response_keys
+    return cleaned_response_keys, pipeline_to_save
 
   def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
     """
@@ -724,6 +734,8 @@ class _DeeployMixin:
     self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
 
     addr = self.__verify_signature(request, no_hash=no_hash)
+    if addr is None:
+      raise ValueError("Signature verification failed: could not recover address from signature")
     if addr.lower() != sender.lower():
       raise ValueError("Invalid signature: recovered {} != {}".format(addr, sender))
 
@@ -751,7 +763,7 @@ class _DeeployMixin:
     index_str = f" at index {index}" if index is not None else ""
 
     # Type-specific validation
-    if signature == CONTAINER_APP_RUNNER_SIGNATURE:
+    if signature in CONTAINERIZED_APPS_SIGNATURES:
       # Check IMAGE field
       if not plugin_instance.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE):
         raise ValueError(
@@ -787,6 +799,12 @@ class _DeeployMixin:
       if DEEPLOY_RESOURCES.MEMORY not in resources:
         raise ValueError(
           f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'CONTAINER_RESOURCES.memory' is required."
+        )
+
+      exposed_ports = plugin_instance.get("EXPOSED_PORTS")
+      if exposed_ports is not None and not isinstance(exposed_ports, dict):
+        raise ValueError(
+          f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'EXPOSED_PORTS' must be a dictionary."
         )
 
     # Add validation for other plugin types here as needed
@@ -1008,6 +1026,27 @@ class _DeeployMixin:
           target.append(key)
 
     return merged
+
+  def _reset_chainstore_response_keys(self, response_keys, context: str = "pipeline commands"):
+    """
+    Clear chainstore response keys before dispatch so early confirmations are not lost.
+    """
+    normalized_keys = self._normalize_chainstore_response_mapping(response_keys)
+    if not normalized_keys:
+      return normalized_keys
+
+    self.P(f"Resetting response keys in chainstore before dispatching {context}...")
+    for _, node_response_keys in normalized_keys.items():
+      for response_key in node_response_keys:
+        try:
+          self.chainstore_set(response_key, None)
+        except Exception as e:
+          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
+        # end try
+      # end for
+    # end for
+
+    return normalized_keys
 
   def _get_pipeline_params_from_deeploy_specs(self, deeploy_specs):
     """
@@ -1345,7 +1384,7 @@ class _DeeployMixin:
       if not job_app_type:
         try:
           self.Pd("  Detecting job app type from plugins...")
-          job_app_type = self.deeploy_detect_job_app_type(self.deeploy_prepare_plugins(inputs)[0])
+          job_app_type = self.deeploy_detect_job_app_type(self.deeploy_prepare_plugins(inputs))
           self.Pd(f"  Detected job app type: {job_app_type}")
         except Exception as exc:
           self.Pd(f"  Failed to detect job app type: {exc}")
@@ -1510,101 +1549,136 @@ class _DeeployMixin:
               return True
     return False
 
-  def _resolve_shmem_references(self, plugins, name_to_instance, app_id):
+  @staticmethod
+  def _validate_plugin_name(plugin_name):
     """
-    Resolve shmem-type DYNAMIC_ENV entries by replacing plugin names with semaphore keys.
-    Sets SEMAPHORE on provider instances and SEMAPHORED_KEYS on consumer instances.
+    Validate that a plugin_name contains only safe characters for use in
+    semaphore keys. Allowed: letters, digits, hyphens, underscores.
+
+    Raises
+    ------
+    ValueError
+      If plugin_name contains invalid characters.
+    """
+    import re
+    if not re.fullmatch(r'[a-zA-Z0-9_-]+', plugin_name):
+      raise ValueError(
+        "Invalid plugin_name '{}'. Only letters, digits, hyphens and underscores are allowed.".format(plugin_name)
+      )
+
+  def _validate_plugin_names(self, plugins):
+    """
+    Validate all plugin_name values across prepared plugins for charset
+    and uniqueness.
 
     Parameters
     ----------
     plugins : list
-      Prepared plugins payload.
-    name_to_instance : dict
-      Mapping of plugin_name -> { instance_id, signature }.
+      Prepared plugins payload with INSTANCES.
+
+    Raises
+    ------
+    ValueError
+      If a plugin_name has invalid characters or is duplicated.
+    """
+    used_names = set()
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        if not pname:
+          continue
+        self._validate_plugin_name(pname)
+        if pname in used_names:
+          raise ValueError(
+            "Duplicate plugin_name '{}'. Each plugin must have a unique name.".format(pname)
+          )
+        used_names.add(pname)
+
+  def _resolve_shmem_in_plugins(self, plugins, app_id):
+    """
+    Resolve shmem-type DYNAMIC_ENV entries inline using plugin_name-based semaphore keys.
+
+    For each named instance: sets SEMAPHORE = "app_id__plugin_name".
+    For each shmem path: rewrites path[0] from plugin_name to the semaphore key.
+    For each consumer: sets SEMAPHORED_KEYS with all referenced semaphore keys.
+
+    Parameters
+    ----------
+    plugins : list
+      Prepared plugins payload. Instances must have plugin_name in payload for shmem to work.
     app_id : str
-      Application identifier used to build semaphore keys.
+      Application identifier used to namespace semaphore keys.
 
     Returns
     -------
     list
       Modified plugins with shmem references resolved.
     """
-    try:
-      # Build name -> semaphore_key map
-      name_to_semaphore = {}
-      for pname, info in name_to_instance.items():
-        iid = info.get("instance_id", "")
-        name_to_semaphore[pname] = self.sanitize_name("{}__{}".format(app_id, iid))
+    # Build plugin_name -> semaphore_key map from all instances
+    name_to_key = {}
+    used_names = set()
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        if not pname:
+          continue
+        self._validate_plugin_name(pname)
+        if pname in used_names:
+          raise ValueError(
+            "Duplicate plugin_name '{}'. Each plugin must have a unique name.".format(pname)
+          )
+        used_names.add(pname)
+        sem_key = "{}__{}".format(app_id, pname)
+        existing_sem = instance.get("SEMAPHORE")
+        if existing_sem and existing_sem != sem_key:
+          raise ValueError(
+            "plugin_name '{}' implies SEMAPHORE '{}' but instance already has '{}'.".format(
+              pname, sem_key, existing_sem
+            )
+          )
+        instance["SEMAPHORE"] = sem_key
+        name_to_key[pname] = sem_key
 
-      # Build instance_id -> instance reference for quick lookup
-      instance_id_to_ref = {}
-      for plugin in plugins:
-        instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-        for instance in instances:
-          if isinstance(instance, dict):
-            iid = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-            if iid:
-              instance_id_to_ref[iid] = instance
+    if not name_to_key:
+      return plugins
 
-      providers = set()  # instance_ids that are referenced as providers
-      consumers = {}     # instance_id -> set of semaphore keys they depend on
+    # Resolve shmem paths and collect consumer dependencies
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        dynamic_env = instance.get("DYNAMIC_ENV")
+        if not isinstance(dynamic_env, dict):
+          continue
 
-      # Scan all instances for shmem DYNAMIC_ENV entries
-      for plugin in plugins:
-        instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-        for instance in instances:
-          if not isinstance(instance, dict):
+        consumer_sem_keys = set()
+        for _var_name, entries in dynamic_env.items():
+          if not isinstance(entries, list):
             continue
-          consumer_iid = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-          dynamic_env = instance.get("DYNAMIC_ENV")
-          if not isinstance(dynamic_env, dict):
-            continue
-
-          for _key, entries in dynamic_env.items():
-            if not isinstance(entries, list):
+          for entry in entries:
+            if not isinstance(entry, dict) or entry.get("type") != "shmem":
               continue
-            for entry in entries:
-              if not isinstance(entry, dict) or entry.get("type") != "shmem":
-                continue
-              path = entry.get("path")
-              if not isinstance(path, (list, tuple)) or len(path) < 2:
-                continue
-              provider_name = path[0]
-              if provider_name not in name_to_semaphore:
-                self.Pd(f"Warning: shmem references unknown plugin '{provider_name}'", color='y')
-                continue
+            path = entry.get("path")
+            if not isinstance(path, (list, tuple)) or len(path) < 2:
+              continue
+            provider_name = path[0]
+            if provider_name not in name_to_key:
+              raise ValueError(
+                "DYNAMIC_ENV shmem references unknown plugin '{}'. "
+                "Available plugins: {}".format(provider_name, sorted(name_to_key.keys()))
+              )
+            sem_key = name_to_key[provider_name]
+            entry["path"] = [sem_key, path[1]]
+            consumer_sem_keys.add(sem_key)
 
-              semaphore_key = name_to_semaphore[provider_name]
-              # Replace plugin name in path with the semaphore key
-              entry["path"] = [semaphore_key, path[1]]
+        if consumer_sem_keys:
+          instance["SEMAPHORED_KEYS"] = sorted(consumer_sem_keys)
 
-              # Track provider and consumer
-              provider_info = name_to_instance.get(provider_name, {})
-              provider_iid = provider_info.get("instance_id")
-              if provider_iid:
-                providers.add(provider_iid)
-              if consumer_iid:
-                if consumer_iid not in consumers:
-                  consumers[consumer_iid] = set()
-                consumers[consumer_iid].add(semaphore_key)
-
-      # Set SEMAPHORE on each provider instance
-      for provider_iid in providers:
-        ref = instance_id_to_ref.get(provider_iid)
-        if ref is not None:
-          sem_key = self.sanitize_name("{}__{}".format(app_id, provider_iid))
-          ref["SEMAPHORE"] = sem_key
-
-      # Set SEMAPHORED_KEYS on each consumer instance
-      for consumer_iid, sem_keys in consumers.items():
-        ref = instance_id_to_ref.get(consumer_iid)
-        if ref is not None:
-          ref["SEMAPHORED_KEYS"] = list(sem_keys)
-
-      return plugins
-    except Exception as exc:
-      self.Pd(f"Failed to resolve shmem references: {exc}", color='y')
-      return plugins
+    return plugins
 
   def _validate_dependency_tree(self, inputs):
     """
@@ -1761,7 +1835,17 @@ class _DeeployMixin:
           if not instance_id:
             continue
           # end if
-          semaphore_key = self.sanitize_name("{}__{}".format(app_id, instance_id))
+          plugin_name = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          if plugin_name:
+            self._validate_plugin_name(plugin_name)
+          semaphore_key = "{}__{}".format(app_id, plugin_name) if plugin_name else self.sanitize_name("{}__{}".format(app_id, instance_id))
+          existing_sem = instance.get("SEMAPHORE")
+          if existing_sem and existing_sem != semaphore_key:
+            raise ValueError(
+              "plugin_name '{}' implies SEMAPHORE '{}' but instance already has '{}'.".format(
+                plugin_name or instance_id, semaphore_key, existing_sem
+              )
+            )
           instance["SEMAPHORE"] = semaphore_key
           semaphore_keys.append(semaphore_key)
         # end for instance
@@ -1899,13 +1983,14 @@ class _DeeployMixin:
     response_key = instance_id + '_' + self.uuid(8)
     return response_key
 
-  def deeploy_prepare_plugins(self, inputs):
+  def deeploy_prepare_plugins(self, inputs, app_id=None):
     """
     Prepare the plugins for the pipeline creation.
     Converts simplified plugins array format to node-expected format with grouped instances.
 
     Args:
         inputs: Request inputs containing plugins array (simplified format) or legacy plugin_signature
+        app_id: Optional application identifier for shmem resolution.
 
     Input Format (simplified):
         plugins: [
@@ -1938,13 +2023,11 @@ class _DeeployMixin:
     if plugins_array and isinstance(plugins_array, list):
       # Group plugin instances by signature
       plugins_by_signature = {}
-      name_to_instance = {}
 
       used_instance_ids = set()
 
       for plugin_instance in plugins_array:
         signature = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
-        plugin_name = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
 
         # Extract instance config (everything except metadata keys)
         # Note: plugin_name is intentionally kept so it can be recovered during job editing
@@ -1976,13 +2059,6 @@ class _DeeployMixin:
           **instance_config
         }
 
-        # Build name-to-instance mapping if plugin_name was provided
-        if plugin_name:
-          name_to_instance[plugin_name] = {
-            "instance_id": instance_id,
-            "signature": signature,
-          }
-
         # Group by signature
         if signature not in plugins_by_signature:
           plugins_by_signature[signature] = []
@@ -1997,12 +2073,18 @@ class _DeeployMixin:
         }
         prepared_plugins.append(prepared_plugin)
 
-      return prepared_plugins, name_to_instance
+      # Validate plugin_name uniqueness and charset (independent of shmem)
+      self._validate_plugin_names(prepared_plugins)
+
+      if app_id and self._has_shmem_dynamic_env(prepared_plugins):
+        prepared_plugins = self._resolve_shmem_in_plugins(prepared_plugins, app_id)
+
+      return prepared_plugins
 
     # Legacy single-plugin format - use existing method
     plugin = self.deeploy_prepare_single_plugin_instance(inputs)
     plugins = [plugin]
-    return plugins, {}
+    return plugins
 
   def check_and_deploy_pipelines(
       self, owner, inputs, app_id,
@@ -2056,45 +2138,38 @@ class _DeeployMixin:
 
     # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
     response_keys = {}
+    pipeline_to_persist = None
     if len(update_nodes) > 0:
-      update_response_keys = self.__update_pipeline_on_nodes(
+      update_response_keys, update_pipeline_to_persist = self.__update_pipeline_on_nodes(
         update_nodes, inputs, app_id, app_alias, app_type,
         owner, discovered_plugin_instances, dct_deeploy_specs,
         job_app_type=job_app_type
       )
       response_keys.update(update_response_keys)
+      if update_pipeline_to_persist is not None:
+        pipeline_to_persist = update_pipeline_to_persist
     if len(new_nodes) > 0:
-      new_response_keys = self.__create_pipeline_on_nodes(
+      new_response_keys, created_pipeline_to_persist = self.__create_pipeline_on_nodes(
         new_nodes, inputs, app_id, app_alias, app_type, owner,
         job_app_type=job_app_type,
         dct_deeploy_specs=dct_deeploy_specs_create
       )
       response_keys.update(new_response_keys)
+      if created_pipeline_to_persist is not None:
+        pipeline_to_persist = created_pipeline_to_persist
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
-    # Reset Response Keys
-    self.P("Resetting response keys in chainstore before waiting for new responses...")
-    for _, node_response_keys in response_keys.items():
-      for response_key in node_response_keys:
-        try:
-          self.chainstore_set(response_key, None)
-        except Exception as e:
-          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
-        # end try
-      # end for
-    # end for
-
     if wait_for_responses:
       dct_status, str_status = self._get_pipeline_responses(response_keys, 300)
     else:
       dct_status, str_status = {}, DEEPLOY_STATUS.PENDING
 
     self.P(f"Pipeline responses: str_status = {str_status} | dct_status =\n {self.json_dumps(dct_status, indent=2)}")
-    
+
     # if pipelines to not use CHAINSTORE_RESPONSE, we can assume nodes reveived the command (BLIND) - to be modified in native plugins
     # else we consider all good if str_status is SUCCESS
 
-    return dct_status, str_status, response_keys
+    return dct_status, str_status, response_keys, pipeline_to_persist
 
   def scale_up_job(self, new_nodes, update_nodes, job_id, owner, running_apps_for_job, wait_for_responses=True):
     """
