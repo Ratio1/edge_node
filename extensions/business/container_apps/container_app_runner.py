@@ -2158,6 +2158,9 @@ class ContainerAppRunnerPlugin(
       self.container_id = self.container.short_id
       self.P(f"Container started (ID: {self.container.short_id})")
 
+      # Get container IP now that the container is running
+      self._update_container_ip()
+
       # Container started successfully
       self._set_container_state(ContainerState.RUNNING)
       self._record_restart_success()
