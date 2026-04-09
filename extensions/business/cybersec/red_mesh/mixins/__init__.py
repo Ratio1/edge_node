@@ -3,6 +3,7 @@ from .risk import _RiskScoringMixin
 from .report import _ReportMixin
 from .live_progress import _LiveProgressMixin
 from .llm_agent import _RedMeshLlmAgentMixin
+from .misp_export import _MispExportMixin
 
 __all__ = [
   "_AttestationMixin",
@@ -10,4 +11,5 @@ __all__ = [
   "_ReportMixin",
   "_LiveProgressMixin",
   "_RedMeshLlmAgentMixin",
+  "_MispExportMixin",
 ]
