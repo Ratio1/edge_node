@@ -658,5 +658,162 @@ class TestLifecycleEndToEnd(unittest.TestCase):
     self.assertEqual(plugin._consecutive_failures, 3)
 
 
+# ===========================================================================
+# Image Pull Backoff
+# ===========================================================================
+
+class TestImagePullBackoff(unittest.TestCase):
+  """Test exponential backoff with jitter for image pull retries."""
+
+  def test_first_pull_has_no_backoff(self):
+    plugin, _, _ = make_lifecycle_runner()
+    self.assertFalse(plugin._is_image_pull_backoff_active())
+    self.assertEqual(plugin._image_pull_failures, 0)
+
+  def test_failure_sets_backoff(self):
+    clock = {"now": 100}
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    plugin._record_image_pull_failure()
+
+    self.assertEqual(plugin._image_pull_failures, 1)
+    self.assertGreater(plugin._next_image_pull_time, clock["now"])
+    self.assertTrue(plugin._is_image_pull_backoff_active())
+
+  def test_backoff_clears_after_delay(self):
+    clock = {"now": 100}
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    plugin._record_image_pull_failure()
+
+    # Advance time well past backoff
+    clock["now"] += 10000
+    self.assertFalse(plugin._is_image_pull_backoff_active())
+
+  def test_success_resets_counters(self):
+    clock = {"now": 100}
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    # Accumulate failures
+    for _ in range(5):
+      plugin._record_image_pull_failure()
+      clock["now"] += 1
+
+    self.assertEqual(plugin._image_pull_failures, 5)
+
+    plugin._record_image_pull_success()
+
+    self.assertEqual(plugin._image_pull_failures, 0)
+    self.assertEqual(plugin._next_image_pull_time, 0)
+    self.assertFalse(plugin._is_image_pull_backoff_active())
+
+  def test_backoff_grows_exponentially(self):
+    clock = {"now": 100}
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    delays = []
+    for i in range(5):
+      plugin._image_pull_failures = i + 1
+      backoff = plugin._calculate_image_pull_backoff()
+      # Backoff = base * 2^(failures-1) + jitter, where jitter in [0, base * 2^(failures-1)]
+      # So minimum is base * 2^(failures-1), maximum is 2 * base * 2^(failures-1)
+      base_part = plugin.cfg_image_pull_backoff_base * (2 ** i)
+      self.assertGreaterEqual(backoff, base_part)
+      self.assertLessEqual(backoff, 2 * base_part)
+      delays.append(backoff)
+
+    # Each delay should be roughly double the previous (accounting for jitter)
+    for i in range(1, len(delays)):
+      # The minimum of delay[i] (= base * 2^i) should be >= minimum of delay[i-1] (= base * 2^(i-1))
+      self.assertGreater(delays[i], delays[i - 1] * 0.5)
+
+  def test_jitter_adds_randomness(self):
+    """Multiple backoff calculations with same failure count should differ."""
+    plugin, _, _ = make_lifecycle_runner()
+    plugin._image_pull_failures = 5
+
+    values = set()
+    for _ in range(20):
+      values.add(plugin._calculate_image_pull_backoff())
+
+    # With random jitter, we should get multiple distinct values
+    self.assertGreater(len(values), 1, "Expected jitter to produce varied backoff values")
+
+  def test_max_retries_gives_up(self):
+    plugin, client, _ = make_lifecycle_runner(cfg_image_pull_max_retries=3)
+    plugin._image_pull_failures = 3
+
+    result = plugin._pull_image_from_registry()
+
+    self.assertIsNone(result)
+    client.images.pull.assert_not_called()
+    msgs = [m for m in plugin.logged_messages if "abandoned" in m.lower()]
+    self.assertTrue(len(msgs) > 0)
+
+  def test_unlimited_retries_when_max_zero(self):
+    plugin, _, _ = make_lifecycle_runner(cfg_image_pull_max_retries=0)
+    plugin._image_pull_failures = 9999
+    self.assertFalse(plugin._has_exceeded_image_pull_retries())
+
+  def test_pull_failure_triggers_backoff_in_registry_method(self):
+    """_pull_image_from_registry should record failure and set backoff on exception."""
+    clock = {"now": 100}
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+    client.images.pull.side_effect = Exception("429 Too Many Requests")
+
+    result = plugin._pull_image_from_registry()
+
+    self.assertIsNone(result)
+    self.assertEqual(plugin._image_pull_failures, 1)
+    self.assertTrue(plugin._is_image_pull_backoff_active())
+
+  def test_pull_success_resets_backoff_in_registry_method(self):
+    """_pull_image_from_registry should reset counters on successful pull."""
+    clock = {"now": 100}
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    # Simulate prior failures
+    plugin._image_pull_failures = 3
+    plugin._next_image_pull_time = 0  # Allow pull
+
+    result = plugin._pull_image_from_registry()
+
+    self.assertIsNotNone(result)
+    self.assertEqual(plugin._image_pull_failures, 0)
+    self.assertEqual(plugin._next_image_pull_time, 0)
+
+  def test_backoff_skips_pull_attempt(self):
+    """When in backoff, _pull_image_from_registry should return None without calling Docker."""
+    clock = {"now": 100}
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    # Set active backoff
+    plugin._image_pull_failures = 1
+    plugin._next_image_pull_time = 200  # Backoff until t=200
+
+    result = plugin._pull_image_from_registry()
+
+    self.assertIsNone(result)
+    client.images.pull.assert_not_called()
+
+  def test_no_max_backoff_cap(self):
+    """Backoff should grow without limit (no artificial cap)."""
+    plugin, _, _ = make_lifecycle_runner()
+
+    # After 20 failures, backoff should be huge (base * 2^19 = 2 * 524288 = ~1M seconds)
+    plugin._image_pull_failures = 20
+    backoff = plugin._calculate_image_pull_backoff()
+
+    expected_min = plugin.cfg_image_pull_backoff_base * (2 ** 19)  # 1,048,576 seconds
+    self.assertGreaterEqual(backoff, expected_min)
+
+
 if __name__ == "__main__":
   unittest.main()
