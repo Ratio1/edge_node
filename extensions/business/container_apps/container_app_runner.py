@@ -278,7 +278,7 @@ _CONFIG = {
 
   # Image pull retry configuration (exponential backoff with jitter)
   "IMAGE_PULL_MAX_RETRIES": 100,      # Max pull attempts before giving up (0 = unlimited)
-  "IMAGE_PULL_BACKOFF_BASE": 2,       # Base delay in seconds for exponential backoff
+  "IMAGE_PULL_BACKOFF_BASE": 20,      # Base delay in seconds for exponential backoff
 
   # Restart retry configuration (exponential backoff)
   "RESTART_MAX_RETRIES": 5,     # Max consecutive restart attempts before giving up (0 = unlimited)
@@ -869,6 +869,16 @@ class ContainerAppRunnerPlugin(
     No max cap -- exponential growth naturally spaces out retries.
     The jitter component ensures multiple plugins on the same node
     don't retry simultaneously after a shared failure (e.g. DockerHub rate limit).
+
+    With default base=20s:
+      Failure 1:  20-40s
+      Failure 2:  40-80s
+      Failure 3:  80-160s   (~1-3 min)
+      Failure 5:  320-640s  (~5-11 min)
+      Failure 8:  2560-5120s (~43-85 min)
+      Failure 10: ~3-6 hours
+      Failure 13: ~1-2 days
+      Failure 15: ~4-8 days
 
     Returns
     -------
