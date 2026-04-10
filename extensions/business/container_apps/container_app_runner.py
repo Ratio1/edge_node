@@ -405,7 +405,7 @@ class ContainerAppRunnerPlugin(
   def __reset_vars(self):
     self.container = None
     self.container_id = None
-    self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
+    self.container_name = self.cfg_instance_id
 
     # Initialize Docker client with proper error handling
     try:
@@ -2072,6 +2072,30 @@ class ContainerAppRunnerPlugin(
         self.Pd(f"Error reading logs for tunnel {container_port}: {e}")
 
 
+  def _ensure_no_stale_container(self):
+    """
+    Remove any existing Docker container with this plugin's name.
+
+    Queries Docker by container name (not by self.container object reference,
+    which is lost after a crash). Force-removes any existing container regardless
+    of its state (running, stopped, created). This is a guardrail for deterministic
+    container naming -- it handles crash recovery, incomplete cleanup, and any state
+    where self.container is None but a Docker container still exists.
+    """
+    try:
+      stale = self.docker_client.containers.get(self.container_name)
+      self.P(
+        f"Found stale container '{self.container_name}' "
+        f"(id={stale.short_id}, status={stale.status}), removing..."
+      )
+      stale.remove(force=True)
+      self.P("Stale container removed.")
+    except docker.errors.NotFound:
+      pass
+    except Exception as exc:
+      self.P(f"Failed to remove stale container: {exc}", color='r')
+
+
   def start_container(self):
     """
     Start the Docker container with configured settings.
@@ -2149,6 +2173,9 @@ class ContainerAppRunnerPlugin(
 
       if self.cfg_container_user:
         run_kwargs['user'] = self.cfg_container_user
+
+      # Guardrail: remove any stale container with the same name (crash recovery)
+      self._ensure_no_stale_container()
 
       self.container = self.docker_client.containers.run(
         self._get_full_image_ref(),

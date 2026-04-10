@@ -136,7 +136,7 @@ def make_container_app_runner():
   plugin._normalized_exposed_ports = {}
   plugin._normalized_main_exposed_port = None
   plugin.container = object()
-  plugin.container_name = "car_instance_efgh"
+  plugin.container_name = "car_instance"
   plugin.log = types.SimpleNamespace(get_localhost_ip=lambda: "127.0.0.1")
   plugin.bc = types.SimpleNamespace(eth_address="0x0", get_evm_network=lambda: "testnet")
   plugin.re = __import__("re")
