@@ -919,9 +919,18 @@ class _ContainerUtilsMixin:
   def _configure_volumes(self):
     """
     Processes the volumes specified in the configuration.
+
+    .. deprecated::
+        VOLUMES is deprecated. Use FIXED_SIZE_VOLUMES for size-limited,
+        isolated volumes with ENOSPC enforcement.
     """
     default_volume_rights = "rw"
     if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
+      self.P(
+        "WARNING: VOLUMES is deprecated and will be removed in a future version. "
+        "Use FIXED_SIZE_VOLUMES instead for size-limited, isolated volumes.",
+        color='r'
+      )
       os.makedirs(CONTAINER_VOLUMES_PATH, exist_ok=True)
       self._set_directory_permissions(CONTAINER_VOLUMES_PATH)
       for host_path, container_path in self.cfg_volumes.items():
