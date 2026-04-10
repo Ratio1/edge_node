@@ -323,6 +323,12 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
   plugin.cfg_restart_backoff_multiplier = 2
   plugin.cfg_restart_reset_interval = 300
 
+  # Image pull backoff
+  plugin._image_pull_failures = 0
+  plugin._next_image_pull_time = 0
+  plugin.cfg_image_pull_max_retries = 100
+  plugin.cfg_image_pull_backoff_base = 2
+
   # Tunnel (disabled for lifecycle tests by default)
   plugin.cfg_tunnel_engine_enabled = False
   plugin.cfg_tunnel_engine = "cloudflare"

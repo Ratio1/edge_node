@@ -276,6 +276,10 @@ _CONFIG = {
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
   "AUTOUPDATE_INTERVAL": 100,
 
+  # Image pull retry configuration (exponential backoff with jitter)
+  "IMAGE_PULL_MAX_RETRIES": 100,      # Max pull attempts before giving up (0 = unlimited)
+  "IMAGE_PULL_BACKOFF_BASE": 2,       # Base delay in seconds for exponential backoff
+
   # Restart retry configuration (exponential backoff)
   "RESTART_MAX_RETRIES": 5,     # Max consecutive restart attempts before giving up (0 = unlimited)
   "RESTART_BACKOFF_INITIAL": 2,  # Initial backoff delay in seconds
@@ -484,6 +488,10 @@ class ContainerAppRunnerPlugin(
 
     # Image update tracking
     self.current_image_hash = None
+
+    # Image pull backoff tracking
+    self._image_pull_failures = 0
+    self._next_image_pull_time = 0
 
     # Command execution state
     self._commands_started = False
@@ -847,6 +855,97 @@ class ContainerAppRunnerPlugin(
       return False  # Unlimited retries
 
     return self._consecutive_failures >= self.cfg_restart_max_retries
+
+
+  # ============================================================================
+  # Image Pull Backoff (exponential with jitter to avoid thundering herd)
+  # ============================================================================
+
+  def _calculate_image_pull_backoff(self):
+    """
+    Calculate exponential backoff delay with random jitter for image pull retries.
+
+    Formula: base * 2^(failures-1) + uniform(0, base * 2^(failures-1))
+    No max cap -- exponential growth naturally spaces out retries.
+    The jitter component ensures multiple plugins on the same node
+    don't retry simultaneously after a shared failure (e.g. DockerHub rate limit).
+
+    Returns
+    -------
+    float
+        Seconds to wait before next pull attempt
+    """
+    import random
+    if self._image_pull_failures == 0:
+      return 0
+    base_backoff = self.cfg_image_pull_backoff_base * (
+      2 ** (self._image_pull_failures - 1)
+    )
+    jitter = random.uniform(0, base_backoff)
+    return base_backoff + jitter
+
+
+  def _record_image_pull_failure(self):
+    """
+    Record an image pull failure and schedule next attempt with backoff + jitter.
+
+    Returns
+    -------
+    None
+    """
+    self._image_pull_failures += 1
+    backoff = self._calculate_image_pull_backoff()
+    self._next_image_pull_time = self.time() + backoff
+    self.P(
+      f"Image pull failure #{self._image_pull_failures}. "
+      f"Next attempt in {backoff:.1f}s (backoff + jitter)",
+      color='r'
+    )
+
+
+  def _record_image_pull_success(self):
+    """
+    Record a successful image pull and reset backoff state.
+
+    Returns
+    -------
+    None
+    """
+    if self._image_pull_failures > 0:
+      self.P(
+        f"Image pull succeeded after {self._image_pull_failures} failure(s). "
+        f"Pull backoff reset.",
+      )
+    self._image_pull_failures = 0
+    self._next_image_pull_time = 0
+
+
+  def _is_image_pull_backoff_active(self):
+    """
+    Check if we're currently in image pull backoff period.
+
+    Returns
+    -------
+    bool
+        True if we should wait before attempting another pull
+    """
+    if self._next_image_pull_time == 0:
+      return False
+    return self.time() < self._next_image_pull_time
+
+
+  def _has_exceeded_image_pull_retries(self):
+    """
+    Check if max image pull retry attempts exceeded.
+
+    Returns
+    -------
+    bool
+        True if max retries exceeded (and max_retries > 0)
+    """
+    if self.cfg_image_pull_max_retries <= 0:
+      return False  # Unlimited retries
+    return self._image_pull_failures >= self.cfg_image_pull_max_retries
 
 
   def _set_container_state(self, new_state, stop_reason=None):
@@ -2942,20 +3041,35 @@ class ContainerAppRunnerPlugin(
 
   def _pull_image_from_registry(self):
     """
-    Pull image from registry (assumes authentication already done).
+    Pull image from registry with exponential backoff and jitter.
+
+    Implements rate-limit-aware pulling: when a pull fails (e.g. DockerHub 429),
+    subsequent attempts are delayed with exponential backoff plus random jitter.
+    This prevents multiple plugins on the same edge node from hammering the
+    registry simultaneously (thundering herd).
 
     Returns
     -------
     Image or None
-        Image object or None if pull failed
-
-    Raises
-    ------
-    RuntimeError
-        If authentication hasn't been performed
+        Image object or None if pull failed or in backoff
     """
     if not self.cfg_image:
       self.P("No Docker image configured", color='r')
+      return None
+
+    # Check if we've exhausted all retries
+    if self._has_exceeded_image_pull_retries():
+      self.P(
+        f"Image pull abandoned after {self._image_pull_failures} consecutive failures "
+        f"(max: {self.cfg_image_pull_max_retries})",
+        color='r'
+      )
+      return None
+
+    # Check if we're in backoff period
+    if self._is_image_pull_backoff_active():
+      remaining = self._next_image_pull_time - self.time()
+      self.Pd(f"Image pull backoff active: {remaining:.1f}s remaining")
       return None
 
     full_image = self._get_full_image_ref()
@@ -2968,10 +3082,12 @@ class ContainerAppRunnerPlugin(
         img = img[-1]
 
       self.P(f"Successfully pulled image '{full_image}'")
+      self._record_image_pull_success()
       return img
 
     except Exception as e:
       self.P(f"Image pull failed: {e}", color='r')
+      self._record_image_pull_failure()
       return None
 
 
