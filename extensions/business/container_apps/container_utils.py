@@ -611,7 +611,10 @@ class _ContainerUtilsMixin:
       self.container.reload()
       net_settings = self.container.attrs.get('NetworkSettings', {})
       # Try top-level IPAddress first (default bridge network)
-      container_ip = net_settings.get('IPAddress')
+      container_ip = net_settings.get('IPAddress') or None
+      # Docker sometimes returns string 'None' instead of actual None
+      if container_ip and container_ip.lower() == 'none':
+        container_ip = None
       available_keys = list(net_settings.keys())
       networks = net_settings.get('Networks', {})
       network_names = list(networks.keys())
