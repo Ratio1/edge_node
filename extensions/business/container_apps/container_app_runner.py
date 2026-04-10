@@ -290,8 +290,11 @@ _CONFIG = {
   "TUNNEL_RESTART_BACKOFF_MULTIPLIER": 2,  # Tunnel backoff multiplier
   "TUNNEL_RESTART_RESET_INTERVAL": 300,  # Reset tunnel retry count after successful run
 
-  "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
+  "VOLUMES": {},                # @deprecated -- use FIXED_SIZE_VOLUMES instead. Dict mapping host paths to container paths.
   "FILE_VOLUMES": {},           # dict mapping host paths to file configs: {"host_path": {"content": "...", "mounting_point": "..."}}
+  "FIXED_SIZE_VOLUMES": {},     # dict mapping logical names to fixed-size volume configs:
+                                #   {"vol_name": {"SIZE": "100M", "MOUNTING_POINT": "/app/data", "FS_TYPE": "ext4",
+                                #                 "OWNER_UID": None, "OWNER_GID": None, "FORCE_RECREATE": False}}
 
   # Health check configuration (consolidated)
   # Controls how app readiness is determined before starting tunnels
@@ -433,6 +436,7 @@ class ContainerAppRunnerPlugin(
     self.inverted_ports_mapping = {} # inverted mapping for docker-py container_port -> host_port
 
     self.volumes = {}
+    self._fixed_volumes = []  # list of FixedVolume instances for cleanup tracking
     self.env = {}
     self.dynamic_env = {}
     self._normalized_exposed_ports = {}
