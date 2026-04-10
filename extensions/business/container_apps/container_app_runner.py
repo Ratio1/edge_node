@@ -1303,8 +1303,9 @@ class ContainerAppRunnerPlugin(
     self.reset_tunnel_engine()
 
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
-    self._configure_volumes() # setup container volumes
+    self._configure_volumes() # setup container volumes (deprecated)
     self._configure_file_volumes() # setup file volumes with dynamic content
+    self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
 
     # If we have semaphored keys, defer _setup_env_and_ports() until semaphores are ready
     # This ensures we get the env vars from provider plugins before starting the container
@@ -2884,6 +2885,9 @@ class ContainerAppRunnerPlugin(
     # Stop the container if it's running
     self.stop_container()
 
+    # Cleanup fixed-size volumes (unmount + detach loop devices)
+    self._cleanup_fixed_size_volumes()
+
     # Save logs to disk (in instance-specific subfolder alongside persistent state)
     try:
       self.diskapi_save_pickle_to_data(
@@ -3217,6 +3221,7 @@ class ContainerAppRunnerPlugin(
     self._setup_resource_limits_and_ports()
     self._configure_volumes()
     self._configure_file_volumes()
+    self._configure_fixed_size_volumes()
 
     # For semaphored containers (consumers), defer env setup and container start
     # to _handle_initial_launch() which properly waits for provider semaphores.
