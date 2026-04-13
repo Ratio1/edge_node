@@ -1193,10 +1193,76 @@ class _DeeployMixin:
     except (TypeError, ValueError):
       raise ValueError(f"{DEEPLOY_ERRORS.REQUEST6}. 'CONTAINER_RESOURCES.cpu' must be a number.")
 
+  def _aggregate_fixed_size_volumes_storage_mb(self, params):
+    """
+    Sum FIXED_SIZE_VOLUMES sizes from a plugin instance or app_params dict.
+
+    Args:
+        params: dict containing an optional FIXED_SIZE_VOLUMES key
+
+    Returns:
+        int: Total storage in MB across all fixed-size volumes
+    """
+    fixed_volumes = params.get('FIXED_SIZE_VOLUMES', {})
+    if not isinstance(fixed_volumes, dict):
+      return 0
+    total_mb = 0
+    for vol_name, vol_config in fixed_volumes.items():
+      if not isinstance(vol_config, dict):
+        continue
+      size_str = vol_config.get('SIZE', '0')
+      try:
+        total_mb += parse_memory_to_mb(str(size_str))
+      except Exception:
+        self.Pd(f"  Failed to parse FIXED_SIZE_VOLUMES['{vol_name}'].SIZE='{size_str}'")
+    return total_mb
+
+
+  def _validate_fixed_size_volumes(self, params, context=""):
+    """
+    Validate FIXED_SIZE_VOLUMES structure in a plugin config or app_params.
+
+    Checks:
+    - Each entry is a dict with SIZE (parseable, > 0) and MOUNTING_POINT (non-empty)
+    - No duplicate volume names
+
+    Args:
+        params: dict that may contain FIXED_SIZE_VOLUMES key
+        context: string for error context (e.g., "plugin 0")
+
+    Raises:
+        ValueError: If validation fails
+    """
+    fixed_volumes = params.get('FIXED_SIZE_VOLUMES')
+    if not fixed_volumes:
+      return
+    if not isinstance(fixed_volumes, dict):
+      raise ValueError(f"FIXED_SIZE_VOLUMES must be a dict{' in ' + context if context else ''}")
+
+    for vol_name, vol_config in fixed_volumes.items():
+      ctx = f"FIXED_SIZE_VOLUMES['{vol_name}']{' in ' + context if context else ''}"
+      if not isinstance(vol_config, dict):
+        raise ValueError(f"{ctx} must be a dict with SIZE and MOUNTING_POINT")
+
+      size_str = vol_config.get('SIZE')
+      if not size_str:
+        raise ValueError(f"{ctx} missing required 'SIZE' field")
+      try:
+        size_mb = parse_memory_to_mb(str(size_str))
+      except Exception:
+        raise ValueError(f"{ctx} has unparseable SIZE='{size_str}'")
+      if size_mb <= 0:
+        raise ValueError(f"{ctx} SIZE must be > 0 (got '{size_str}')")
+
+      mounting_point = vol_config.get('MOUNTING_POINT')
+      if not mounting_point or not str(mounting_point).strip():
+        raise ValueError(f"{ctx} missing required 'MOUNTING_POINT' field")
+
+
   def _aggregate_container_resources(self, inputs):
     """
     Aggregate container resources across all CONTAINER_APP_RUNNER plugin instances.
-    Sums CPU and memory requirements for all container instances.
+    Sums CPU, memory, and storage (from FIXED_SIZE_VOLUMES) requirements.
 
     Args:
         inputs: Request inputs
@@ -1205,7 +1271,8 @@ class _DeeployMixin:
         dict: Aggregated resources in format:
           {
             "cpu": <total_cpu>,
-            "memory": "<total_memory_mb>m"
+            "memory": "<total_memory_mb>m",
+            "storage": "<total_storage_mb>m"  (only if > 0)
           }
     """
     self.Pd("Aggregating container resources...")
@@ -1222,12 +1289,18 @@ class _DeeployMixin:
           legacy_resources[DEEPLOY_RESOURCES.CPU] = self._parse_cpu_value(
             legacy_resources.get(DEEPLOY_RESOURCES.CPU)
           )
+      # Aggregate FIXED_SIZE_VOLUMES storage from legacy app_params
+      storage_mb = self._aggregate_fixed_size_volumes_storage_mb(app_params)
+      if storage_mb > 0:
+        legacy_resources[DEEPLOY_RESOURCES.STORAGE] = f"{storage_mb}m"
+        self.Pd(f"Legacy FIXED_SIZE_VOLUMES storage: {storage_mb}MB")
       self.Pd(f"Legacy resources: {legacy_resources}")
       return legacy_resources
 
     self.Pd(f"Processing {len(plugins_array)} plugin instances from plugins array")
     total_cpu = 0.0
     total_memory_mb = 0
+    total_storage_mb = 0
 
     # Iterate through plugins array (simplified format - each object is an instance)
     for idx, plugin_instance in enumerate(plugins_array):
@@ -1246,6 +1319,12 @@ class _DeeployMixin:
         memory_mb = parse_memory_to_mb(memory)
         self.Pd(f"  Parsed memory: {memory_mb}MB")
         total_memory_mb += memory_mb
+
+        # Aggregate FIXED_SIZE_VOLUMES storage
+        storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
+        if storage_mb > 0:
+          self.Pd(f"  FIXED_SIZE_VOLUMES storage: {storage_mb}MB")
+          total_storage_mb += storage_mb
       else:
         self.Pd(f"  Skipping non-container plugin: {signature}")
 
@@ -1254,6 +1333,8 @@ class _DeeployMixin:
       DEEPLOY_RESOURCES.CPU: total_cpu,
       DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m"
     }
+    if total_storage_mb > 0:
+      aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb}m"
     self.Pd(f"Aggregated resources: {aggregated}")
     return aggregated
 
@@ -1396,6 +1477,15 @@ class _DeeployMixin:
       else:
         self.Pd(f"  Validating resources for non-native job (type={job_app_type})...")
 
+        # Validate FIXED_SIZE_VOLUMES format (if present in any plugin)
+        plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+        if plugins_array:
+          for idx, pi in enumerate(plugins_array):
+            self._validate_fixed_size_volumes(pi, context=f"plugin {idx}")
+        else:
+          app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
+          self._validate_fixed_size_volumes(app_params, context="app_params")
+
         # Aggregate container resources across all plugins (for multi-plugin support)
         aggregated_resources = self._aggregate_container_resources(inputs)
         requested_cpu = aggregated_resources.get(DEEPLOY_RESOURCES.CPU)
@@ -1406,7 +1496,24 @@ class _DeeployMixin:
         self.Pd(f"  Requested: cpu={requested_cpu}, memory={requested_memory}")
         self.Pd(f"  Expected: cpu={expected_cpu}, memory={expected_memory}")
 
-        #TODO should also check disk and gpu as soon as they are supported and sent in the request
+        # Validate storage (FIXED_SIZE_VOLUMES total <= job type allocation)
+        requested_storage = aggregated_resources.get(DEEPLOY_RESOURCES.STORAGE)
+        expected_storage = expected_resources.get(DEEPLOY_RESOURCES.STORAGE)
+        if requested_storage and expected_storage:
+          requested_storage_mb = parse_memory_to_mb(requested_storage)
+          expected_storage_mb = parse_memory_to_mb(expected_storage)
+          self.Pd(f"  Storage: requested={requested_storage_mb}MB, allowed={expected_storage_mb}MB")
+          if requested_storage_mb > expected_storage_mb:
+            msg = (
+              f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Requested storage {requested_storage} "
+              f"exceeds allowed storage {expected_storage} for job type {job_type}."
+            )
+            self.P(msg)
+            raise ValueError(msg)
+          else:
+            self.Pd(f"  Storage validation passed ({requested_storage_mb}MB <= {expected_storage_mb}MB)")
+
+        #TODO should also check gpu as soon as it is supported and sent in the request
         # Normalize numeric values before comparison
         try:
           requested_cpu_val = None if requested_cpu is None else float(requested_cpu)
