@@ -14,7 +14,7 @@ from dataclasses import dataclass, asdict
 
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
 from extensions.business.cybersec.red_mesh.constants import (
-  DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS,
+  DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS, JOB_ARCHIVE_VERSION,
 )
 
 
@@ -48,6 +48,28 @@ class JobConfig:
   created_by_name: str = ""
   created_by_id: str = ""
   authorized: bool = False
+  target_confirmation: str = ""
+  scope_id: str = ""
+  authorization_ref: str = ""
+  engagement_metadata: dict = None
+  target_allowlist: list = None
+  safety_policy: dict = None
+  # ── graybox fields ──
+  scan_type: str = "network"          # "network" | "webapp"
+  target_url: str = ""                # required when scan_type == "webapp"
+  secret_ref: str = ""                # reference to separately persisted graybox secrets
+  has_regular_credentials: bool = False
+  has_weak_candidates: bool = False
+  official_username: str = ""
+  official_password: str = ""
+  regular_username: str = ""
+  regular_password: str = ""
+  weak_candidates: list = None        # legacy inline payload; new launches use secret_ref
+  max_weak_attempts: int = 5
+  app_routes: list = None             # user-supplied known routes
+  verify_tls: bool = True             # TLS cert verification
+  target_config: dict = None          # GrayboxTargetConfig.to_dict()
+  allow_stateful_probes: bool = False # gate for A06 workflow probes
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -78,6 +100,27 @@ class JobConfig:
       created_by_name=d.get("created_by_name", ""),
       created_by_id=d.get("created_by_id", ""),
       authorized=d.get("authorized", False),
+      target_confirmation=d.get("target_confirmation", ""),
+      scope_id=d.get("scope_id", ""),
+      authorization_ref=d.get("authorization_ref", ""),
+      engagement_metadata=d.get("engagement_metadata"),
+      target_allowlist=d.get("target_allowlist"),
+      safety_policy=d.get("safety_policy"),
+      scan_type=d.get("scan_type", "network"),
+      target_url=d.get("target_url", ""),
+      secret_ref=d.get("secret_ref", ""),
+      has_regular_credentials=d.get("has_regular_credentials", False),
+      has_weak_candidates=d.get("has_weak_candidates", False),
+      official_username=d.get("official_username", ""),
+      official_password=d.get("official_password", ""),
+      regular_username=d.get("regular_username", ""),
+      regular_password=d.get("regular_password", ""),
+      weak_candidates=d.get("weak_candidates"),
+      max_weak_attempts=d.get("max_weak_attempts", 5),
+      app_routes=d.get("app_routes"),
+      verify_tls=d.get("verify_tls", True),
+      target_config=d.get("target_config"),
+      allow_stateful_probes=d.get("allow_stateful_probes", False),
     )
 
 
@@ -198,6 +241,12 @@ class UiAggregate:
   top_findings: list = None         # top 10 CRITICAL+HIGH findings for dashboard display
   finding_timeline: dict = None     # { finding_id: { first_seen, last_seen, pass_count } }
   worker_activity: list = None      # [ { id, start_port, end_port, open_ports } ]
+  # ── graybox-aware ──
+  scan_type: str = "network"
+  total_routes_discovered: int = 0          # webapp: discovered routes
+  total_forms_discovered: int = 0           # webapp: discovered forms
+  total_scenarios: int = 0                  # webapp: probe scenarios run
+  total_scenarios_vulnerable: int = 0       # webapp: vulnerable count
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -215,6 +264,11 @@ class UiAggregate:
       top_findings=d.get("top_findings"),
       finding_timeline=d.get("finding_timeline"),
       worker_activity=d.get("worker_activity"),
+      scan_type=d.get("scan_type", "network"),
+      total_routes_discovered=d.get("total_routes_discovered", 0),
+      total_forms_discovered=d.get("total_forms_discovered", 0),
+      total_scenarios=d.get("total_scenarios", 0),
+      total_scenarios_vulnerable=d.get("total_scenarios_vulnerable", 0),
     )
 
 
@@ -235,6 +289,7 @@ class JobArchive:
   duration: float
   date_created: float
   date_completed: float
+  archive_version: int = JOB_ARCHIVE_VERSION
   start_attestation: dict = None
 
   def to_dict(self) -> dict:
@@ -242,7 +297,13 @@ class JobArchive:
 
   @classmethod
   def from_dict(cls, d: dict) -> JobArchive:
+    archive_version = d.get("archive_version", JOB_ARCHIVE_VERSION)
+    if archive_version != JOB_ARCHIVE_VERSION:
+      raise ValueError(
+        f"Unsupported archive_version {archive_version}; expected {JOB_ARCHIVE_VERSION}"
+      )
     return cls(
+      archive_version=archive_version,
       job_id=d["job_id"],
       job_config=d.get("job_config", {}),
       timeline=d.get("timeline", []),

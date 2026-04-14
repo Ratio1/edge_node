@@ -32,6 +32,8 @@ class Finding:
   owasp_id: str = ""       # e.g. "A07:2021"
   cwe_id: str = ""         # e.g. "CWE-287"
   confidence: str = "firm"  # certain | firm | tentative
+  cvss_score: float | None = None
+  cvss_vector: str = ""
 
 
 def probe_result(*, raw_data: dict = None, findings: list = None) -> dict:

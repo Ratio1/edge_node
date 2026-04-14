@@ -124,6 +124,13 @@ class ScanMetrics:
   open_port_details: list = None    # [ { "port": 22, "protocol": "ssh", "banner_confirmed": True }, ... ]
   banner_confirmation: dict = None  # { "confirmed": 3, "guessed": 2 }
 
+  # ── Graybox scenario stats (webapp scans only) ──
+  scenarios_total: int = 0
+  scenarios_vulnerable: int = 0
+  scenarios_clean: int = 0
+  scenarios_inconclusive: int = 0
+  scenarios_error: int = 0
+
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
 
@@ -150,4 +157,9 @@ class ScanMetrics:
       finding_distribution=d.get("finding_distribution"),
       open_port_details=d.get("open_port_details"),
       banner_confirmation=d.get("banner_confirmation"),
+      scenarios_total=d.get("scenarios_total", 0),
+      scenarios_vulnerable=d.get("scenarios_vulnerable", 0),
+      scenarios_clean=d.get("scenarios_clean", 0),
+      scenarios_inconclusive=d.get("scenarios_inconclusive", 0),
+      scenarios_error=d.get("scenarios_error", 0),
     )
