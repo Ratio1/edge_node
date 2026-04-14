@@ -190,12 +190,35 @@ def ensure_created(
     _run(["mkfs.ext4", "-F", "-m", "0", str(vol.img_path)], logger=logger)
 
 
+def _ensure_loop_device_nodes(logger: Optional[Callable] = None) -> None:
+  """Ensure enough /dev/loopN device nodes exist for losetup.
+
+  On some container environments (e.g., Docker-in-Docker), only a limited set
+  of loop device nodes exists (/dev/loop0-8), and they may all be in use by
+  the host (e.g., snap packages). This creates additional device nodes so
+  losetup can find a free one.
+  """
+  max_loop = 64
+  created = 0
+  for i in range(max_loop):
+    dev_path = Path(f"/dev/loop{i}")
+    if not dev_path.exists():
+      try:
+        os.mknod(str(dev_path), 0o660 | 0o60000, os.makedev(7, i))  # block device, major=7
+        created += 1
+      except (OSError, PermissionError):
+        break
+  if created > 0:
+    _log(logger, "INFO", f"Created {created} loop device nodes (up to /dev/loop{max_loop - 1})")
+
+
 def attach_loop(
   vol: FixedVolume,
   logger: Optional[Callable] = None,
 ) -> str:
   """Attach the image file to a loop device. Returns the device path."""
   _log(logger, "STEP", f"Attaching loop device img_path={vol.img_path}")
+  _ensure_loop_device_nodes(logger=logger)
   existing = _run(["losetup", "-j", str(vol.img_path)], capture=True, logger=logger)
   if existing:
     loop_dev = existing.split(":")[0]
