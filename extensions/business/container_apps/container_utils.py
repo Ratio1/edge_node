@@ -115,8 +115,12 @@ class _ContainerUtilsMixin:
       "EE_CHAINSTORE_PEERS": str_chainstore_peers,
       "R1EN_CHAINSTORE_PEERS": str_chainstore_peers,
 
-      "R1EN_CONTAINER_IP": self._get_container_ip()
-      
+      # NOTE: R1EN_CONTAINER_IP is set to empty string here as a placeholder.
+      # The actual IP is only known after the container starts. The container
+      # app should use _update_container_ip_file() which writes the IP to
+      # /tmp/r1en_container_ip inside the container after start.
+      "R1EN_CONTAINER_IP": "",
+
       # OBSERVATION: From now on only add new env vars with R1EN_ prefix
       #              to avoid missunderstandings with EE_ prefixed vars that
       #              are legacy from the Edge Node environment itself.
@@ -595,24 +599,64 @@ class _ContainerUtilsMixin:
     """
     Get the container's IP address from Docker network settings.
 
-    If a semaphore is configured, also sets the CONTAINER_IP env var
-    in shared memory for paired plugins.
-
     Returns
     -------
     str or None
         Container IP address, or None if unavailable
     """
     if not self.container:
+      self.P("_get_container_ip: no container object available", color='y')
       return None
     try:
       self.container.reload()
-      container_ip = self.container.attrs['NetworkSettings']['IPAddress']
-      return container_ip
+      net_settings = self.container.attrs.get('NetworkSettings', {})
+      # Try top-level IPAddress first (default bridge network)
+      container_ip = net_settings.get('IPAddress')
+      available_keys = list(net_settings.keys())
+      networks = net_settings.get('Networks', {})
+      network_names = list(networks.keys())
+      self.P(
+        f"_get_container_ip: top-level IPAddress='{container_ip}', "
+        f"NetworkSettings keys={available_keys}, "
+        f"Networks={network_names}",
+        color='d'
+      )
+      if not container_ip:
+        # Fall back to per-network IP (custom networks)
+        for net_name, net_info in networks.items():
+          ip = net_info.get('IPAddress')
+          self.P(f"_get_container_ip: network '{net_name}' IPAddress='{ip}'", color='d')
+          if ip:
+            container_ip = ip
+            break
+      if container_ip:
+        self.P(f"_get_container_ip: resolved IP={container_ip}", color='g')
+      else:
+        self.P("_get_container_ip: could not resolve any IP address", color='r')
+      return container_ip or None
     except Exception as e:
-      self.P(f"Could not get container IP: {e}", color='r')
+      self.P(f"_get_container_ip: exception: {e}", color='r')
       return None
 
+  def _update_container_ip(self):
+    """
+    Update R1EN_CONTAINER_IP in self.env after the container has started,
+    and write it to /tmp/r1en_container_ip inside the container so the
+    app can read its own IP.
+    Called post-start when the container IP is available.
+    """
+    container_ip = self._get_container_ip()
+    if container_ip:
+      self.env["R1EN_CONTAINER_IP"] = container_ip
+      self.P(f"Container IP: {container_ip}", color='g')
+      # Write IP to a file inside the container for the app to read
+      try:
+        self.container.exec_run(f"sh -c 'echo {container_ip} > /tmp/r1en_container_ip'")
+      except Exception as e:
+        self.P(f"Could not write container IP file: {e}", color='y')
+    else:
+      self.P("Container IP not available after start", color='y')
+    return
 
   def _setup_dynamic_env_var_host_ip(self, **kwargs):
     """
