@@ -57,19 +57,24 @@ class FixedVolume:
   owner_gid: Optional[int] = None
 
   @property
+  def _abs_root(self) -> Path:
+    """Root resolved to an absolute path (required for losetup/mount commands)."""
+    return self.root.resolve()
+
+  @property
   def img_path(self) -> Path:
     """Path to the file-backed image."""
-    return self.root / "images" / f"{self.name}.img"
+    return self._abs_root / "images" / f"{self.name}.img"
 
   @property
   def mount_path(self) -> Path:
     """Path to the mountpoint directory."""
-    return self.root / "mounts" / self.name
+    return self._abs_root / "mounts" / self.name
 
   @property
   def meta_path(self) -> Path:
     """Path to the metadata JSON file."""
-    return self.root / "meta" / f"{self.name}.json"
+    return self._abs_root / "meta" / f"{self.name}.json"
 
 
 def _run(
