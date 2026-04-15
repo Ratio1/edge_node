@@ -15,7 +15,6 @@ config_startup.json
 **/_output/**
 **/vectordb/**
 **/_vector_db**/
-**/ratio1_*
 **/db_cache/**
 
 .idea/**
