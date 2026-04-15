@@ -5,6 +5,8 @@ import types
 from collections import deque
 from unittest.mock import MagicMock
 
+import numpy as _np
+
 
 class _DummyBasePlugin:
   CONFIG = {'VALIDATION_RULES': {}}
@@ -170,6 +172,7 @@ def make_container_app_runner():
   plugin.deque = deque
   plugin.os_path = os.path
   plugin.os = os
+  plugin.np = _np
   plugin.cfg_instance_id = "car_instance"
   plugin.uuid = lambda *a, **k: "efgh"
   plugin.time = lambda: 0
