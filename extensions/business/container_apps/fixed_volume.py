@@ -129,14 +129,15 @@ def _require_tools(logger: Optional[Callable] = None) -> None:
 
 
 def _parse_size_to_bytes(size_str: str) -> int:
-  """Parse a fallocate-style size string (e.g. '100M', '1G') to bytes.
+  """Parse a fallocate-style size string (e.g. '100M', '1G', '0.5G') to bytes.
 
-  Supports K, M, G, T suffixes (case-insensitive). Plain integers are bytes.
+  Supports K, M, G, T suffixes (case-insensitive) with fractional values.
+  Plain integers are bytes.
   """
   s = size_str.strip().upper()
   multipliers = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}
   if s and s[-1] in multipliers:
-    return int(s[:-1]) * multipliers[s[-1]]
+    return int(float(s[:-1]) * multipliers[s[-1]])
   return int(s)
 
 
