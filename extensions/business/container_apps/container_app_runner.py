@@ -77,6 +77,7 @@ from docker.types import DeviceRequest
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
+from .fixed_size_volumes_mixin import _FixedSizeVolumesMixin
 
 __VER__ = "0.7.1"
 
@@ -356,6 +357,7 @@ _CONFIG = {
 
 
 class ContainerAppRunnerPlugin(
+  _FixedSizeVolumesMixin,
   _ContainerUtilsMixin,
   BasePlugin,
 ):
@@ -1412,6 +1414,16 @@ class ContainerAppRunnerPlugin(
     self.reset_tunnel_engine()
 
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
+
+    # Ensure image is available locally BEFORE configuring volumes so
+    # FIXED_SIZE_VOLUMES can introspect the image's USER directive to
+    # auto-detect OWNER_UID/OWNER_GID. _ensure_image_available is
+    # idempotent; the second call inside start_container will be a cache hit.
+    if not self._ensure_image_available():
+      raise RuntimeError(
+        f"Image '{self.cfg_image}' not available; cannot prepare container volumes."
+      )
+
     self._configure_volumes() # setup container volumes (deprecated)
     self._configure_file_volumes() # setup file volumes with dynamic content
     self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
