@@ -2250,6 +2250,7 @@ class ContainerAppRunnerPlugin(
 
     run_kwargs = dict(
       detach=True,
+      auto_remove=True,
       ports=self.inverted_ports_mapping,
       environment=self.env,
       volumes=self.volumes,
