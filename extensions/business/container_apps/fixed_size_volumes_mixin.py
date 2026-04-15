@@ -1,4 +1,7 @@
 """Mixin: provision and teardown fallocate-backed fixed-size volumes."""
+from pathlib import Path
+
+from extensions.business.container_apps import fixed_volume
 
 
 class _FixedSizeVolumesMixin:
@@ -198,12 +201,6 @@ class _FixedSizeVolumesMixin:
       self.P("FIXED_SIZE_VOLUMES must be a dictionary, skipping", color='r')
       return
 
-    from pathlib import Path
-    try:
-      from extensions.business.container_apps import fixed_volume
-    except ImportError:
-      from . import fixed_volume
-
     # Check required tools
     try:
       fixed_volume._require_tools(logger=self.P)
@@ -305,11 +302,6 @@ class _FixedSizeVolumesMixin:
     """
     if not hasattr(self, '_fixed_volumes') or not self._fixed_volumes:
       return
-
-    try:
-      from extensions.business.container_apps import fixed_volume
-    except ImportError:
-      from . import fixed_volume
 
     for vol in self._fixed_volumes:
       try:

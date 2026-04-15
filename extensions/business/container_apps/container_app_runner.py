@@ -887,13 +887,12 @@ class ContainerAppRunnerPlugin(
     float
         Seconds to wait before next pull attempt
     """
-    import random
     if self._image_pull_failures == 0:
       return 0
     base_backoff = self.cfg_image_pull_backoff_base * (
       2 ** (self._image_pull_failures - 1)
     )
-    jitter = random.uniform(0, base_backoff)
+    jitter = self.np.random.uniform(0, base_backoff)
     return base_backoff + jitter
 
 
