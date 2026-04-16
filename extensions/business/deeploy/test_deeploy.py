@@ -532,6 +532,71 @@ class DeeployEndpointTests(unittest.TestCase):
     res = self.plugin.create_pipeline({})
     self.assertEqual(res["status"], "ok")
 
+  def test_create_pipelines_batch_returns_success(self):
+    """
+    Ensure batch endpoint returns success when all items succeed.
+    """
+    def _process_pipeline_request(request, is_create=True, async_mode=False):
+      return {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.APP_ID: request.get("app_alias", "app"),
+      }
+
+    self.plugin._process_pipeline_request = _process_pipeline_request
+    res = self.plugin.create_pipelines_batch({
+      DEEPLOY_KEYS.REQUESTS: [
+        {"app_alias": "a1"},
+        {"app_alias": "a2"},
+      ]
+    })
+
+    self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
+    self.assertEqual(len(res[DEEPLOY_KEYS.RESULTS]), 2)
+    self.assertEqual(res[DEEPLOY_KEYS.RESULTS][0][DEEPLOY_KEYS.ITEM_INDEX], 0)
+    self.assertEqual(res[DEEPLOY_KEYS.RESULTS][1][DEEPLOY_KEYS.ITEM_INDEX], 1)
+
+  def test_create_pipelines_batch_returns_partial(self):
+    """
+    Ensure batch endpoint returns partial when outcomes are mixed.
+    """
+    def _process_pipeline_request(request, is_create=True, async_mode=False):
+      if request.get("app_alias") == "ok":
+        return {DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS}
+      return {DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.FAIL}
+
+    self.plugin._process_pipeline_request = _process_pipeline_request
+    res = self.plugin.create_pipelines_batch({
+      DEEPLOY_KEYS.REQUESTS: [
+        {"app_alias": "ok"},
+        {"app_alias": "bad"},
+      ]
+    })
+
+    self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.PARTIAL)
+    self.assertEqual(len(res[DEEPLOY_KEYS.RESULTS]), 2)
+
+  def test_ensure_specs_job_config_merges_stack_fields(self):
+    """
+    Ensure stack_job_config fields are merged into deeploy_specs.job_config.
+    """
+    normalized = self.plugin._ensure_deeploy_specs_job_config(
+      deeploy_specs={},
+      pipeline_params={"A": "1"},
+      stack_job_config={
+        DEEPLOY_KEYS.STACK_ID: "stack-1",
+        DEEPLOY_KEYS.STACK_ALIAS: "My Stack",
+        DEEPLOY_KEYS.STACK_INDEX: 0,
+        DEEPLOY_KEYS.STACK_SIZE: 2,
+        DEEPLOY_KEYS.STACK_CONTAINER_REF: "container-1",
+        DEEPLOY_KEYS.STACK_CONTAINER_ALIAS: "frontend",
+        DEEPLOY_KEYS.STACK_TYPE: "Stack",
+      },
+    )
+
+    self.assertEqual(normalized[DEEPLOY_KEYS.JOB_CONFIG][DEEPLOY_KEYS.PIPELINE_PARAMS], {"A": "1"})
+    self.assertEqual(normalized[DEEPLOY_KEYS.JOB_CONFIG][DEEPLOY_KEYS.STACK_ID], "stack-1")
+    self.assertEqual(normalized[DEEPLOY_KEYS.JOB_CONFIG][DEEPLOY_KEYS.STACK_CONTAINER_ALIAS], "frontend")
+
   def test_scale_up_job_workers_returns_postponed(self):
     """
     Ensure scale_up_job_workers returns PostponedRequest when response keys exist.
