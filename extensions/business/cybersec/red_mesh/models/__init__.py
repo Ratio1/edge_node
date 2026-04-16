@@ -47,6 +47,11 @@ from extensions.business.cybersec.red_mesh.models.archive import (
   UiAggregate,
   JobArchive,
 )
+from extensions.business.cybersec.red_mesh.models.triage import (
+  FindingTriageAuditEntry,
+  FindingTriageState,
+  VALID_TRIAGE_STATUSES,
+)
 
 __all__ = [
   # shared
@@ -70,4 +75,7 @@ __all__ = [
   "PassReport",
   "UiAggregate",
   "JobArchive",
+  "FindingTriageState",
+  "FindingTriageAuditEntry",
+  "VALID_TRIAGE_STATUSES",
 ]

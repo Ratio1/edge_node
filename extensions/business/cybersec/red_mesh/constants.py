@@ -2,6 +2,33 @@
 RedMesh constants and feature catalog definitions.
 """
 
+from enum import Enum
+
+
+class ScanType(str, Enum):
+  """Scan type enum — extensible for future scan types (api, mobile, etc.)."""
+  NETWORK = "network"
+  WEBAPP = "webapp"
+
+
+# Graybox probe registry — decouples probe addition from worker code.
+# Adding a new probe = new probe file + new registry entry. No worker changes.
+# Capabilities (requires_auth, requires_regular_session, is_stateful) live on
+# the ProbeBase subclass, not in the registry — single source of truth.
+GRAYBOX_PROBE_REGISTRY = [
+  {"key": "_graybox_access_control",  "cls": "access_control.AccessControlProbes"},
+  {"key": "_graybox_misconfig",       "cls": "misconfig.MisconfigProbes"},
+  {"key": "_graybox_injection",       "cls": "injection.InjectionProbes"},
+  {"key": "_graybox_business_logic",  "cls": "business_logic.BusinessLogicProbes"},
+]
+
+# Graybox timing and limits
+GRAYBOX_DEFAULT_DELAY = 0.2
+GRAYBOX_WEAK_AUTH_DELAY = 1.0
+GRAYBOX_MAX_WEAK_ATTEMPTS = 20
+GRAYBOX_SESSION_MAX_AGE = 1800
+
+
 FEATURE_CATALOG = [
   {
     "id": "service_info_common",
@@ -100,8 +127,32 @@ FEATURE_CATALOG = [
     "description": "Post-scan analysis: honeypot detection, OS consistency, infrastructure leak aggregation.",
     "category": "correlation",
     "methods": ["_post_scan_correlate"]
-  }
+  },
+  {
+    "id": "graybox",
+    "label": "Authenticated webapp testing",
+    "description": "OWASP-mapped application probes requiring login credentials: IDOR, privilege escalation, business logic, misconfiguration, injection, SSRF, and weak authentication.",
+    "category": "graybox",
+    "methods": [entry["key"] for entry in GRAYBOX_PROBE_REGISTRY] + ["_graybox_weak_auth"],
+  },
 ]
+
+
+NETWORK_FEATURE_CATEGORIES = ("service", "web", "correlation")
+NETWORK_FEATURE_REGISTRY = {
+  category: tuple(
+    method
+    for item in FEATURE_CATALOG
+    if item.get("category") == category
+    for method in item.get("methods", [])
+  )
+  for category in NETWORK_FEATURE_CATEGORIES
+}
+NETWORK_FEATURE_METHODS = tuple(
+  method
+  for category in NETWORK_FEATURE_CATEGORIES
+  for method in NETWORK_FEATURE_REGISTRY[category]
+)
 
 # Job status constants
 JOB_STATUS_RUNNING = "RUNNING"
@@ -246,12 +297,6 @@ RISK_CRED_PENALTY_CAP = 30
 JOB_ARCHIVE_VERSION = 1
 MAX_CONTINUOUS_PASSES = 100
 
-# =====================================================================
-# Live progress publishing
-# =====================================================================
-
-PROGRESS_PUBLISH_INTERVAL = 10  # seconds between progress updates to CStore
-
 # Scan phases in execution order (5 phases total)
 PHASE_ORDER = ["port_scan", "fingerprint", "service_probes", "web_tests", "correlation"]
 PHASE_MARKERS = {
@@ -260,3 +305,9 @@ PHASE_MARKERS = {
   "web_tests": "web_tests_completed",
   "correlation": "correlation_completed",
 }
+
+# Graybox scan phases in execution order
+GRAYBOX_PHASE_ORDER = [
+  "preflight", "authentication", "discovery", "graybox_probes",
+  "weak_auth",
+]

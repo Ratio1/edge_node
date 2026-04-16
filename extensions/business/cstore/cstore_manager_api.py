@@ -2,7 +2,7 @@ from typing import Any
 
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
-__VER__ = '0.2.2'
+__VER__ = '0.2.3'
 
 
 _CONFIG = {
@@ -194,3 +194,42 @@ class CstoreManagerApiPlugin(BasePlugin):
 
     return value
 
+
+  @BasePlugin.endpoint(method="post", require_token=False)
+  def hsync(self, hkey: str, chainstore_peers: list = None):
+    """
+    Refresh one hash namespace from live peer state.
+
+    Parameters
+    ----------
+    hkey : str
+      Logical hash namespace that should be merged from peer data.
+    chainstore_peers : list, optional
+      Additional peer addresses to target for this request. When omitted, the
+      wrapper leaves peer selection untouched so ``chainstore_hsync`` can use
+      its normal default-peer behavior.
+
+    Returns
+    -------
+    dict
+      Result envelope returned by ``chainstore_hsync``. On success it includes
+      the refreshed ``hkey``, the accepted ``source_peer``, and
+      ``merged_fields``.
+
+    Notes
+    -----
+    This wrapper is intentionally thin. The merge-only semantics, allowed-peer
+    filtering, and timeout behavior all live in `naeural_core`.
+    """
+    start_timer = self.time()
+    # Keep per-call peer targeting explicit so apps can trigger boot-time
+    # refreshes without mutating plugin-wide configuration.
+    result = self.chainstore_hsync(
+      hkey=hkey,
+      debug=self.cfg_debug,
+      extra_peers=chainstore_peers,
+    )
+    elapsed_time = self.time() - start_timer
+    self.Pd(f"CStore hsync took {elapsed_time:.4f} seconds")
+
+    return result
