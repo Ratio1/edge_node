@@ -170,9 +170,10 @@ class CStoreJobFinalized:
   date_completed: float
   job_cid: str                      # the one CID -> JobArchive
   job_config_cid: str               # standalone config CID (needed for purge cleanup)
+  misp_export: dict = None          # MISP export metadata (event_uuid, passes_exported, etc.)
 
   def to_dict(self) -> dict:
-    return asdict(self)
+    return _strip_none(asdict(self))
 
   @classmethod
   def from_dict(cls, d: dict) -> CStoreJobFinalized:
@@ -196,6 +197,7 @@ class CStoreJobFinalized:
       date_completed=d["date_completed"],
       job_cid=d["job_cid"],
       job_config_cid=d["job_config_cid"],
+      misp_export=d.get("misp_export"),
     )
 
 
