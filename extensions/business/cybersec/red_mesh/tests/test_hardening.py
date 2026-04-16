@@ -92,7 +92,7 @@ class TestAttestationHelpers(unittest.TestCase):
 class TestLlmRetryHardening(unittest.TestCase):
 
   def test_build_llm_analysis_payload_network_is_compact_and_structured(self):
-    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent_mixin import _RedMeshLlmAgentMixin
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
@@ -146,7 +146,7 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(payload["findings_summary"]["total_findings"], 2)
 
   def test_run_aggregated_llm_analysis_uses_shaped_payload(self):
-    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent_mixin import _RedMeshLlmAgentMixin
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
@@ -186,7 +186,7 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertGreater(host._last_llm_payload_stats["reduction_bytes"], 0)
 
   def test_build_llm_analysis_payload_deduplicates_and_tracks_truncation(self):
-    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent_mixin import _RedMeshLlmAgentMixin
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
@@ -246,7 +246,7 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertTrue(all(len(finding["evidence"]) <= 220 for finding in payload["top_findings"]))
 
   def test_quick_summary_payload_is_smaller_than_security_assessment(self):
-    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent_mixin import _RedMeshLlmAgentMixin
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
@@ -291,7 +291,7 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(quick_payload["truncation"]["finding_limit"], 12)
 
   def test_record_llm_payload_stats_tracks_size_reduction(self):
-    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent_mixin import _RedMeshLlmAgentMixin
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
@@ -314,7 +314,7 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(host._last_llm_payload_stats["job_id"], "job-obs")
 
   def test_extract_report_findings_includes_graybox_results(self):
-    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent_mixin import _RedMeshLlmAgentMixin
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
@@ -337,7 +337,7 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(findings[0]["scenario_id"], "S-1")
 
   def test_build_llm_analysis_payload_webapp_is_compact_and_structured(self):
-    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent_mixin import _RedMeshLlmAgentMixin
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
@@ -423,7 +423,7 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(payload["probe_summary"]["top_probes"][0]["probe"], "_graybox_authz")
 
   def test_call_llm_agent_api_retries_transient_connection_error(self):
-    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent_mixin import _RedMeshLlmAgentMixin
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):
@@ -465,7 +465,7 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(calls["count"], 2)
 
   def test_call_llm_agent_api_does_not_retry_non_retryable_provider_rejection(self):
-    from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
+    from extensions.business.cybersec.red_mesh.mixins.llm_agent_mixin import _RedMeshLlmAgentMixin
 
     class MockHost(_RedMeshLlmAgentMixin):
       def __init__(self):

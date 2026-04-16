@@ -5,6 +5,8 @@ python-telegram-bot[rate-limiter]
 protobuf
 ngrok
 
+bitsandbytes
+
 openai
 sqlfluff
 pypdf
