@@ -48,9 +48,10 @@ CstoreManagerApiPlugin = _load_plugin_class()
 
 
 class CstoreManagerApiPluginTests(unittest.TestCase):
-  def _make_plugin(self):
+  def _make_plugin(self, *, debug=False, nth=50):
     plugin = CstoreManagerApiPlugin()
-    plugin.cfg_debug = False
+    plugin.cfg_debug = debug
+    plugin.cfg_force_debug_each_nth_api_call = nth
     plugin.calls = []
 
     def _record_hsync(**kwargs):
@@ -83,6 +84,55 @@ class CstoreManagerApiPluginTests(unittest.TestCase):
       plugin.calls,
       [{"hkey": "players", "debug": False, "extra_peers": ["peer-a", "peer-b"]}],
     )
+
+  def test_default_config_disables_debug_and_forces_periodic_summary(self):
+    self.assertFalse(CstoreManagerApiPlugin.CONFIG["DEBUG"])
+    self.assertEqual(CstoreManagerApiPlugin.CONFIG["FORCE_DEBUG_EACH_NTH_API_CALL"], 50)
+
+  def test_forced_summary_emits_at_threshold_and_resets_window(self):
+    plugin = self._make_plugin(nth=2)
+
+    def _record_get(**kwargs):
+      plugin.calls.append(kwargs)
+      plugin._now += 0.25
+      return "value"
+
+    plugin.chainstore_get = _record_get
+
+    plugin.get("run:one")
+    self.assertEqual(plugin.messages, [])
+
+    plugin.get("run:two")
+    self.assertEqual(len(plugin.messages), 1)
+    self.assertIn("CStore API usage summary", plugin.messages[0])
+    self.assertIn("calls=2", plugin.messages[0])
+    self.assertIn("get[count=2", plugin.messages[0])
+    self.assertIn("targets=run(2)", plugin.messages[0])
+
+    plugin.get("ack:peer-a")
+    self.assertEqual(len(plugin.messages), 1)
+
+    plugin.get("ack:peer-b")
+    self.assertEqual(len(plugin.messages), 2)
+    self.assertIn("calls=2", plugin.messages[1])
+    self.assertIn("targets=ack(2)", plugin.messages[1])
+
+  def test_debug_mode_keeps_direct_debug_logs_and_skips_forced_summary(self):
+    plugin = self._make_plugin(debug=True, nth=1)
+
+    def _record_get(**kwargs):
+      plugin.calls.append(kwargs)
+      plugin._now += 0.10
+      return "value"
+
+    plugin.chainstore_get = _record_get
+
+    plugin.get("run:one")
+
+    self.assertEqual(plugin.calls, [{"key": "run:one", "debug": True}])
+    self.assertEqual(len(plugin.messages), 1)
+    self.assertIn("[DEBUG] CStore get took", plugin.messages[0])
+    self.assertNotIn("CStore API usage summary", plugin.messages[0])
 
 
 if __name__ == "__main__":
