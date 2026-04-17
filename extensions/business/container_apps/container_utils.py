@@ -994,11 +994,14 @@ class _ContainerUtilsMixin:
       return
 
     # Instance-scoped base: {data_folder}/pipelines_data/{sid}/{iid}/file_volumes/
-    file_volumes_base = self.os_path.join(
+    # `get_data_folder()` can return a relative path (logger stores _data_dir
+    # un-abspath'd); Docker bind mounts require absolute paths, so resolve
+    # here.
+    file_volumes_base = self.os_path.abspath(self.os_path.join(
       self.get_data_folder(),
       self._get_instance_data_subfolder(),
       "file_volumes",
-    )
+    ))
     os.makedirs(file_volumes_base, exist_ok=True)
     self._set_directory_permissions(file_volumes_base)
 
