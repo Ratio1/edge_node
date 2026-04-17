@@ -611,7 +611,10 @@ class _ContainerUtilsMixin:
       self.container.reload()
       net_settings = self.container.attrs.get('NetworkSettings', {})
       # Try top-level IPAddress first (default bridge network)
-      container_ip = net_settings.get('IPAddress')
+      container_ip = net_settings.get('IPAddress') or None
+      # Docker sometimes returns string 'None' instead of actual None
+      if container_ip and container_ip.lower() == 'none':
+        container_ip = None
       available_keys = list(net_settings.keys())
       networks = net_settings.get('Networks', {})
       network_names = list(networks.keys())
@@ -919,9 +922,18 @@ class _ContainerUtilsMixin:
   def _configure_volumes(self):
     """
     Processes the volumes specified in the configuration.
+
+    .. deprecated::
+        VOLUMES is deprecated. Use FIXED_SIZE_VOLUMES for size-limited,
+        isolated volumes with ENOSPC enforcement.
     """
     default_volume_rights = "rw"
     if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
+      self.P(
+        "WARNING: VOLUMES is deprecated and will be removed in a future version. "
+        "Use FIXED_SIZE_VOLUMES instead for size-limited, isolated volumes.",
+        color='r'
+      )
       os.makedirs(CONTAINER_VOLUMES_PATH, exist_ok=True)
       self._set_directory_permissions(CONTAINER_VOLUMES_PATH)
       for host_path, container_path in self.cfg_volumes.items():
@@ -1072,8 +1084,6 @@ class _ContainerUtilsMixin:
     # endfor each file volume
     return
 
-
-  ### END NEW CONTAINER MIXIN METHODS ###
 
   ### COMMON CONTAINER UTILITY METHODS ###
   def _setup_env_and_ports(self):

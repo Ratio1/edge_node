@@ -77,6 +77,12 @@ from docker.types import DeviceRequest
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
+from .mixins import (
+  _FixedSizeVolumesMixin,
+  _ImagePullBackoffMixin,
+  _RestartBackoffMixin,
+  _TunnelBackoffMixin,
+)
 
 __VER__ = "0.7.1"
 
@@ -276,6 +282,10 @@ _CONFIG = {
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
   "AUTOUPDATE_INTERVAL": 100,
 
+  # Image pull retry configuration (exponential backoff with jitter)
+  "IMAGE_PULL_MAX_RETRIES": 100,      # Max pull attempts before giving up (0 = unlimited)
+  "IMAGE_PULL_BACKOFF_BASE": 20,      # Base delay in seconds for exponential backoff
+
   # Restart retry configuration (exponential backoff)
   "RESTART_MAX_RETRIES": 5,     # Max consecutive restart attempts before giving up (0 = unlimited)
   "RESTART_BACKOFF_INITIAL": 2,  # Initial backoff delay in seconds
@@ -290,8 +300,11 @@ _CONFIG = {
   "TUNNEL_RESTART_BACKOFF_MULTIPLIER": 2,  # Tunnel backoff multiplier
   "TUNNEL_RESTART_RESET_INTERVAL": 300,  # Reset tunnel retry count after successful run
 
-  "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
+  "VOLUMES": {},                # @deprecated -- use FIXED_SIZE_VOLUMES instead. Dict mapping host paths to container paths.
   "FILE_VOLUMES": {},           # dict mapping host paths to file configs: {"host_path": {"content": "...", "mounting_point": "..."}}
+  "FIXED_SIZE_VOLUMES": {},     # dict mapping logical names to fixed-size volume configs:
+                                #   {"vol_name": {"SIZE": "100M", "MOUNTING_POINT": "/app/data", "FS_TYPE": "ext4",
+                                #                 "OWNER_UID": None, "OWNER_GID": None, "FORCE_RECREATE": False}}
 
   # Health check configuration (consolidated)
   # Controls how app readiness is determined before starting tunnels
@@ -349,6 +362,10 @@ _CONFIG = {
 
 
 class ContainerAppRunnerPlugin(
+  _RestartBackoffMixin,
+  _ImagePullBackoffMixin,
+  _TunnelBackoffMixin,
+  _FixedSizeVolumesMixin,
   _ContainerUtilsMixin,
   BasePlugin,
 ):
@@ -405,7 +422,7 @@ class ContainerAppRunnerPlugin(
   def __reset_vars(self):
     self.container = None
     self.container_id = None
-    self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
+    self.container_name = self.cfg_instance_id
 
     # Initialize Docker client with proper error handling
     try:
@@ -433,6 +450,7 @@ class ContainerAppRunnerPlugin(
     self.inverted_ports_mapping = {} # inverted mapping for docker-py container_port -> host_port
 
     self.volumes = {}
+    self._fixed_volumes = []  # list of FixedVolume instances for cleanup tracking
     self.env = {}
     self.dynamic_env = {}
     self._normalized_exposed_ports = {}
@@ -480,6 +498,10 @@ class ContainerAppRunnerPlugin(
 
     # Image update tracking
     self.current_image_hash = None
+
+    # Image pull backoff tracking
+    self._image_pull_failures = 0
+    self._next_image_pull_time = 0
 
     # Command execution state
     self._commands_started = False
@@ -707,144 +729,6 @@ class ContainerAppRunnerPlugin(
     return False
 
 
-  def _calculate_restart_backoff(self):
-    """
-    Calculate exponential backoff delay for restart attempts.
-
-    Returns
-    -------
-    float
-        Seconds to wait before next restart attempt
-    """
-    if self._consecutive_failures == 0:
-      return 0
-
-    # Exponential backoff: initial * (multiplier ^ (failures - 1))
-    backoff = self.cfg_restart_backoff_initial * (
-      self.cfg_restart_backoff_multiplier ** (self._consecutive_failures - 1)
-    )
-
-    # Cap at maximum backoff
-    backoff = min(backoff, self.cfg_restart_backoff_max)
-
-    return backoff
-
-
-  def _should_reset_retry_counter(self):
-    """
-    Check if container has been running long enough to reset retry counter.
-
-    Returns
-    -------
-    bool
-        True if retry counter should be reset
-    """
-    if not self._last_successful_start:
-      return False
-
-    uptime = self.time() - self._last_successful_start
-    return uptime >= self.cfg_restart_reset_interval
-
-
-  def _record_restart_failure(self):
-    """
-    Record a restart failure and update backoff state.
-
-    Returns
-    -------
-    None
-    """
-    self._consecutive_failures += 1
-    self._last_failure_time = self.time()
-    self._restart_backoff_seconds = self._calculate_restart_backoff()
-    self._next_restart_time = self.time() + self._restart_backoff_seconds
-
-    self.P(
-      f"Container restart failure #{self._consecutive_failures}. "
-      f"Next retry in {self._restart_backoff_seconds:.1f}s",
-      color='r'
-    )
-    return
-
-
-  def _record_restart_success(self):
-    """
-    Record a successful restart and reset failure counters if appropriate.
-
-    Returns
-    -------
-    None
-    """
-    self._last_successful_start = self.time()
-
-    # Reset failure counter after first successful start
-    if self._consecutive_failures > 0:
-      self.P(
-        f"Container started successfully after {self._consecutive_failures} failure(s). "
-        f"Retry counter will reset after {self.cfg_restart_reset_interval}s of uptime.",
-      )
-      # Don't reset immediately - wait for reset interval
-      # self._consecutive_failures = 0  # This happens in _maybe_reset_retry_counter
-    # end if
-    return
-
-
-  def _maybe_reset_retry_counter(self):
-    """
-    Reset retry counter if container has been running successfully.
-
-    Returns
-    -------
-    None
-    """
-    if self._consecutive_failures > 0 and self._should_reset_retry_counter():
-      old_failures = self._consecutive_failures
-      self._consecutive_failures = 0
-      self._restart_backoff_seconds = 0
-      self.P(
-        f"Container running successfully for {self.cfg_restart_reset_interval}s. "
-        f"Reset failure counter (was {old_failures})"
-      )
-    # end if
-    return
-
-
-  def _is_restart_backoff_active(self):
-    """
-    Check if we're currently in backoff period.
-
-    Returns
-    -------
-    bool
-        True if we should wait before restarting
-    """
-    if self._next_restart_time == 0:
-      return False
-
-    current_time = self.time()
-    if current_time < self._next_restart_time:
-      remaining = self._next_restart_time - current_time
-      self.Pd(f"Restart backoff active: {remaining:.1f}s remaining")
-      return True
-
-    return False
-
-
-  def _has_exceeded_max_retries(self):
-    """
-    Check if max retry attempts exceeded.
-
-    Returns
-    -------
-    bool
-        True if max retries exceeded (and max_retries > 0)
-    """
-    if self.cfg_restart_max_retries <= 0:
-      return False  # Unlimited retries
-
-    return self._consecutive_failures >= self.cfg_restart_max_retries
-
-
   def _set_container_state(self, new_state, stop_reason=None):
     """
     Update container state and optionally stop reason.
@@ -955,177 +839,6 @@ class ContainerAppRunnerPlugin(
   # ============================================================================
   # End of Health Check Configuration
   # ============================================================================
-
-  # ============================================================================
-  # Tunnel Restart Backoff Logic
-  # ============================================================================
-
-
-  def _calculate_tunnel_backoff(self, container_port):
-    """
-    Calculate exponential backoff delay for tunnel restart attempts.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    float
-        Seconds to wait before next tunnel restart attempt
-    """
-    failures = self._tunnel_consecutive_failures.get(container_port, 0)
-    if failures == 0:
-      return 0
-
-    # Exponential backoff: initial * (multiplier ^ (failures - 1))
-    backoff = self.cfg_tunnel_restart_backoff_initial * (
-      self.cfg_tunnel_restart_backoff_multiplier ** (failures - 1)
-    )
-
-    # Cap at maximum backoff
-    backoff = min(backoff, self.cfg_tunnel_restart_backoff_max)
-
-    return backoff
-
-
-  def _record_tunnel_restart_failure(self, container_port):
-    """
-    Record a tunnel restart failure and update backoff state.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    None
-    """
-    self._tunnel_consecutive_failures[container_port] = \
-      self._tunnel_consecutive_failures.get(container_port, 0) + 1
-    self._tunnel_last_failure_time[container_port] = self.time()
-
-    backoff = self._calculate_tunnel_backoff(container_port)
-    self._tunnel_next_restart_time[container_port] = self.time() + backoff
-
-    failures = self._tunnel_consecutive_failures[container_port]
-    self.P(
-      f"Tunnel restart failure for port {container_port} (#{failures}). "
-      f"Next retry in {backoff:.1f}s",
-      color='r'
-    )
-    return
-
-
-  def _record_tunnel_restart_success(self, container_port):
-    """
-    Record a successful tunnel restart.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    None
-    """
-    self._tunnel_last_successful_start[container_port] = self.time()
-
-    # Note success if there were previous failures
-    failures = self._tunnel_consecutive_failures.get(container_port, 0)
-    if failures > 0:
-      self.P(
-        f"Tunnel for port {container_port} started successfully after {failures} failure(s)."
-      )
-    return
-
-
-  def _is_tunnel_backoff_active(self, container_port):
-    """
-    Check if tunnel is currently in backoff period.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    bool
-        True if we should wait before restarting tunnel
-    """
-    next_restart = self._tunnel_next_restart_time.get(container_port, 0)
-    if next_restart == 0:
-      return False
-
-    current_time = self.time()
-    if current_time < next_restart:
-      remaining = next_restart - current_time
-      self.Pd(f"Tunnel {container_port} backoff active: {remaining:.1f}s remaining")
-      return True
-
-    return False
-
-
-  def _has_tunnel_exceeded_max_retries(self, container_port):
-    """
-    Check if tunnel has exceeded max retry attempts.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    bool
-        True if max retries exceeded (and max_retries > 0)
-    """
-    if self.cfg_tunnel_restart_max_retries <= 0:
-      return False  # Unlimited retries
-
-    failures = self._tunnel_consecutive_failures.get(container_port, 0)
-    return failures >= self.cfg_tunnel_restart_max_retries
-
-
-  def _maybe_reset_tunnel_retry_counter(self, container_port):
-    """
-    Reset tunnel retry counter if it has been running successfully.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    None
-    """
-    failures = self._tunnel_consecutive_failures.get(container_port, 0)
-    if failures == 0:
-      return
-
-    last_start = self._tunnel_last_successful_start.get(container_port, 0)
-    if not last_start:
-      return
-
-    uptime = self.time() - last_start
-    if uptime >= self.cfg_tunnel_restart_reset_interval:
-      self.P(
-        f"Tunnel {container_port} running successfully for {self.cfg_tunnel_restart_reset_interval}s. "
-        f"Reset failure counter (was {failures})",
-      )
-      self._tunnel_consecutive_failures[container_port] = 0
-
-    return
-
-  # ============================================================================
-  # End of Tunnel Restart Backoff Logic
-  # ============================================================================
-
 
   def _normalize_container_command(self, value, *, field_name):
     """
@@ -1299,8 +1012,19 @@ class ContainerAppRunnerPlugin(
     self.reset_tunnel_engine()
 
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
-    self._configure_volumes() # setup container volumes
+
+    # Ensure image is available locally BEFORE configuring volumes so
+    # FIXED_SIZE_VOLUMES can introspect the image's USER directive to
+    # auto-detect OWNER_UID/OWNER_GID. _ensure_image_available is
+    # idempotent; the second call inside start_container will be a cache hit.
+    if not self._ensure_image_available():
+      raise RuntimeError(
+        f"Image '{self.cfg_image}' not available; cannot prepare container volumes."
+      )
+
+    self._configure_volumes() # setup container volumes (deprecated)
     self._configure_file_volumes() # setup file volumes with dynamic content
+    self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
 
     # If we have semaphored keys, defer _setup_env_and_ports() until semaphores are ready
     # This ensures we get the env vars from provider plugins before starting the container
@@ -2072,6 +1796,30 @@ class ContainerAppRunnerPlugin(
         self.Pd(f"Error reading logs for tunnel {container_port}: {e}")
 
 
+  def _ensure_no_stale_container(self):
+    """
+    Remove any existing Docker container with this plugin's name.
+
+    Queries Docker by container name (not by self.container object reference,
+    which is lost after a crash). Force-removes any existing container regardless
+    of its state (running, stopped, created). This is a guardrail for deterministic
+    container naming -- it handles crash recovery, incomplete cleanup, and any state
+    where self.container is None but a Docker container still exists.
+    """
+    try:
+      stale = self.docker_client.containers.get(self.container_name)
+      self.P(
+        f"Found stale container '{self.container_name}' "
+        f"(id={stale.short_id}, status={stale.status}), removing..."
+      )
+      stale.remove(force=True)
+      self.P("Stale container removed.")
+    except docker.errors.NotFound:
+      pass
+    except Exception as exc:
+      self.P(f"Failed to remove stale container: {exc}", color='r')
+
+
   def start_container(self):
     """
     Start the Docker container with configured settings.
@@ -2112,6 +1860,7 @@ class ContainerAppRunnerPlugin(
 
     run_kwargs = dict(
       detach=True,
+      auto_remove=True,
       ports=self.inverted_ports_mapping,
       environment=self.env,
       volumes=self.volumes,
@@ -2149,6 +1898,9 @@ class ContainerAppRunnerPlugin(
 
       if self.cfg_container_user:
         run_kwargs['user'] = self.cfg_container_user
+
+      # Guardrail: remove any stale container with the same name (crash recovery)
+      self._ensure_no_stale_container()
 
       self.container = self.docker_client.containers.run(
         self._get_full_image_ref(),
@@ -2853,6 +2605,9 @@ class ContainerAppRunnerPlugin(
     # Stop the container if it's running
     self.stop_container()
 
+    # Cleanup fixed-size volumes (unmount + detach loop devices)
+    self._cleanup_fixed_size_volumes()
+
     # Save logs to disk (in instance-specific subfolder alongside persistent state)
     try:
       self.diskapi_save_pickle_to_data(
@@ -2907,20 +2662,35 @@ class ContainerAppRunnerPlugin(
 
   def _pull_image_from_registry(self):
     """
-    Pull image from registry (assumes authentication already done).
+    Pull image from registry with exponential backoff and jitter.
+
+    Implements rate-limit-aware pulling: when a pull fails (e.g. DockerHub 429),
+    subsequent attempts are delayed with exponential backoff plus random jitter.
+    This prevents multiple plugins on the same edge node from hammering the
+    registry simultaneously (thundering herd).
 
     Returns
     -------
     Image or None
-        Image object or None if pull failed
-
-    Raises
-    ------
-    RuntimeError
-        If authentication hasn't been performed
+        Image object or None if pull failed or in backoff
     """
     if not self.cfg_image:
       self.P("No Docker image configured", color='r')
+      return None
+
+    # Check if we've exhausted all retries
+    if self._has_exceeded_image_pull_retries():
+      self.P(
+        f"Image pull abandoned after {self._image_pull_failures} consecutive failures "
+        f"(max: {self.cfg_image_pull_max_retries})",
+        color='r'
+      )
+      return None
+
+    # Check if we're in backoff period
+    if self._is_image_pull_backoff_active():
+      remaining = self._next_image_pull_time - self.time()
+      self.Pd(f"Image pull backoff active: {remaining:.1f}s remaining")
       return None
 
     full_image = self._get_full_image_ref()
@@ -2933,10 +2703,12 @@ class ContainerAppRunnerPlugin(
         img = img[-1]
 
       self.P(f"Successfully pulled image '{full_image}'")
+      self._record_image_pull_success()
       return img
 
     except Exception as e:
       self.P(f"Image pull failed: {e}", color='r')
+      self._record_image_pull_failure()
       return None
 
 
@@ -3186,6 +2958,7 @@ class ContainerAppRunnerPlugin(
     self._setup_resource_limits_and_ports()
     self._configure_volumes()
     self._configure_file_volumes()
+    self._configure_fixed_size_volumes()
 
     # For semaphored containers (consumers), defer env setup and container start
     # to _handle_initial_launch() which properly waits for provider semaphores.
