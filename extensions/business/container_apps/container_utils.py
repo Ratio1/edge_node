@@ -968,7 +968,7 @@ class _ContainerUtilsMixin:
     """
     Processes FILE_VOLUMES configuration to create files with specified content
     and mount them into the container.
-    
+
     FILE_VOLUMES format:
       {
         "logical_name": {
@@ -976,59 +976,66 @@ class _ContainerUtilsMixin:
           "mounting_point": "/container/path/to/filename.ext"
         }
       }
-    
+
     The method will:
       1. Extract filename from mounting_point
-      2. Create a directory under CONTAINER_VOLUMES_PATH
+      2. Create a directory under
+         {data_folder}/pipelines_data/{stream_id}/{instance_id}/file_volumes/{logical_name}/
       3. Write content to a file with the extracted filename
       4. Add volume mapping to self.volumes
     """
     default_volume_rights = "rw"
-    
+
     if not hasattr(self, 'cfg_file_volumes') or not self.cfg_file_volumes:
       return
-    
+
     if not isinstance(self.cfg_file_volumes, dict):
       self.P("FILE_VOLUMES must be a dictionary, skipping file volume configuration", color='r')
       return
-    
-    os.makedirs(CONTAINER_VOLUMES_PATH, exist_ok=True)
-    self._set_directory_permissions(CONTAINER_VOLUMES_PATH)
-    
+
+    # Instance-scoped base: {data_folder}/pipelines_data/{sid}/{iid}/file_volumes/
+    file_volumes_base = self.os_path.join(
+      self.get_data_folder(),
+      self._get_instance_data_subfolder(),
+      "file_volumes",
+    )
+    os.makedirs(file_volumes_base, exist_ok=True)
+    self._set_directory_permissions(file_volumes_base)
+
     for logical_name, file_config in self.cfg_file_volumes.items():
       try:
         # Validate file_config structure
         if not isinstance(file_config, dict):
           self.P(f"FILE_VOLUMES['{logical_name}'] must be a dict with 'content' and 'mounting_point', skipping", color='r')
           continue
-        
+
         content = file_config.get('content')
         mounting_point = file_config.get('mounting_point')
-        
+
         if content is None:
           self.P(f"FILE_VOLUMES['{logical_name}'] missing 'content' field, skipping", color='r')
           continue
-        
+
         if not mounting_point:
           self.P(f"FILE_VOLUMES['{logical_name}'] missing 'mounting_point' field, skipping", color='r')
           continue
-        
+
         # Extract filename from mounting_point
         mounting_point = str(mounting_point)
         path_parts = mounting_point.rstrip('/').split('/')
         filename = path_parts[-1]
-        
+
         if not filename:
           self.P(f"FILE_VOLUMES['{logical_name}'] could not extract filename from mounting_point '{mounting_point}', skipping", color='r')
           continue
-        
-        # Create sanitized directory for this file volume
+
+        # Per-volume directory inside the instance-scoped file_volumes folder.
+        # No instance_id prefix needed -- parent path is already instance-scoped.
         sanitized_name = self.sanitize_name(str(logical_name))
-        prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
-        self.P(f"  Processing file volume '{logical_name}' → '{prefixed_name}/{filename}' → container '{mounting_point}'")
-        
+        self.P(f"  Processing file volume '{logical_name}' → '{sanitized_name}/{filename}' → container '{mounting_point}'")
+
         # Create host directory
-        host_volume_dir = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
+        host_volume_dir = self.os_path.join(file_volumes_base, sanitized_name)
         try:
           os.makedirs(host_volume_dir, exist_ok=True)
         except PermissionError as exc:
