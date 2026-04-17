@@ -88,11 +88,11 @@ __VER__ = "0.7.1"
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
-# Persistent state filename (stored in instance-specific subfolder)
+# Persistent state filename (stored under the plugin's auto-routed plugin_data/ folder)
 _PERSISTENT_STATE_FILE = "persistent_state.pkl"
 
-# Subfolder prefix for container app data
-_CONTAINER_APPS_SUBFOLDER = "container_apps"
+# Container logs filename (stored under the plugin's logs/ sibling folder)
+_CONTAINER_LOGS_FILE = "container_logs.pkl"
 
 
 class ContainerState(Enum):
@@ -538,25 +538,6 @@ class ContainerAppRunnerPlugin(
   # ============================================================================
 
 
-  def _get_instance_data_subfolder(self):
-    """
-    Get instance-specific subfolder for persistent data.
-
-    Uses plugin_id to ensure each plugin instance has its own data folder,
-    preventing collisions when multiple containers run on the same node.
-
-    Structure: container_apps/{plugin_id}/
-      - persistent_state.pkl
-      - (future: logs, etc.)
-
-    Returns
-    -------
-    str
-        Subfolder path: container_apps/{plugin_id}
-    """
-    return f"{_CONTAINER_APPS_SUBFOLDER}/{self.plugin_id}"
-
-
   def _load_persistent_state(self):
     """
     Load persistent state from disk.
@@ -566,10 +547,7 @@ class ContainerAppRunnerPlugin(
     dict
         Persistent state dictionary (empty dict if no state exists)
     """
-    state = self.diskapi_load_pickle_from_data(
-      _PERSISTENT_STATE_FILE,
-      subfolder=self._get_instance_data_subfolder()
-    )
+    state = self.diskapi_load_pickle_from_data(_PERSISTENT_STATE_FILE)
     return state if state is not None else {}
 
 
@@ -594,12 +572,8 @@ class ContainerAppRunnerPlugin(
     state = self._load_persistent_state()
     # Update with new values
     state.update(kwargs)
-    # Save back to disk
-    self.diskapi_save_pickle_to_data(
-      state,
-      _PERSISTENT_STATE_FILE,
-      subfolder=self._get_instance_data_subfolder()
-    )
+    # Save back to disk (diskapi auto-routes to pipelines_data/{sid}/{iid}/plugin_data/)
+    self.diskapi_save_pickle_to_data(state, _PERSISTENT_STATE_FILE)
     return
 
 
@@ -2608,12 +2582,13 @@ class ContainerAppRunnerPlugin(
     # Cleanup fixed-size volumes (unmount + detach loop devices)
     self._cleanup_fixed_size_volumes()
 
-    # Save logs to disk (in instance-specific subfolder alongside persistent state)
+    # Save logs to disk under the instance's `logs/` sibling folder
+    # (resolves to pipelines_data/{sid}/{iid}/logs/container_logs.pkl)
     try:
       self.diskapi_save_pickle_to_data(
         obj=list(self.container_logs),
-        filename="container_logs.pkl",
-        subfolder=self._get_instance_data_subfolder()
+        filename=_CONTAINER_LOGS_FILE,
+        subfolder="logs",
       )
       self.P("Container logs saved to disk.")
     except Exception as exc:
