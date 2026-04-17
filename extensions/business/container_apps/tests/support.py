@@ -136,6 +136,19 @@ class _DummyBasePlugin:
   def sanitize_name(self, name):
     return name.replace('/', '_')
 
+  def _safe_path_component(self, raw):
+    s = self.sanitize_name(str(raw))
+    if s in ('', '.', '..'):
+      s = '_'
+    return s
+
+  def _get_instance_data_subfolder(self):
+    # Mirror BasePluginExecutor._get_instance_data_subfolder so the CAR
+    # plugin (which no longer overrides it) resolves correctly in tests.
+    sid = self._safe_path_component(getattr(self, '_stream_id', 'test_stream'))
+    iid = self._safe_path_component(getattr(self, 'cfg_instance_id', 'test_instance'))
+    return "pipelines_data/{}/{}".format(sid, iid)
+
 
 def install_dummy_base_plugin():
   module_hierarchy = [
