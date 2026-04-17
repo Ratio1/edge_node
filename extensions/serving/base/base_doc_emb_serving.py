@@ -1,5 +1,3 @@
-from ratio1.ipfs import R1FSEngine
-
 from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess
 from transformers import AutoTokenizer, AutoModel
 import re
@@ -64,9 +62,6 @@ _CONFIG = {
   'MAX_BATCH_SIZE': 32,
 
   "SUPPORTED_REQUEST_TYPES": DocEmbCt.REQUEST_TYPES,
-  # TODO: activate this after fixing r1fs init in base_serving_process
-  #  (fix log parameter name)
-  "R1FS_ENABLED": False,
 
   'VALIDATION_RULES': {
     **BaseServingProcess.CONFIG['VALIDATION_RULES'],
@@ -237,11 +232,16 @@ class BaseDocEmbServing(BaseServingProcess):
     return
 
   def on_init(self):
+    """Finalize document-embedding startup after the base serving initialization.
+
+    Returns
+    -------
+    None
+        The method restores persisted vector database state in-place.
+    """
+
     super(BaseDocEmbServing, self).on_init()
     self.__maybe_load_backup()
-    self.r1fs = R1FSEngine(
-      logger=self.log
-    )
     return
 
   def _setup_llm(self):
@@ -886,4 +886,3 @@ class BaseDocEmbServing(BaseServingProcess):
     # endfor each total input
     return final_result
 # endclass BaseDocEmbServing
-
