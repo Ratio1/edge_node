@@ -60,10 +60,8 @@ class _DummyBasePlugin:
     return name.replace('/', '_')
 
   def _safe_path_component(self, raw):
-    s = self.sanitize_name(str(raw))
-    if s in ('', '.', '..'):
-      s = '_'
-    return s
+    from extensions.business.container_apps.fixed_volume import safe_path_component
+    return safe_path_component(raw)
 
   def _get_instance_data_subfolder(self):
     sid = self._safe_path_component(getattr(self, '_stream_id', 'test_stream'))

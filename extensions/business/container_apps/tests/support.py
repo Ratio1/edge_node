@@ -137,10 +137,8 @@ class _DummyBasePlugin:
     return name.replace('/', '_')
 
   def _safe_path_component(self, raw):
-    s = self.sanitize_name(str(raw))
-    if s in ('', '.', '..'):
-      s = '_'
-    return s
+    from extensions.business.container_apps.fixed_volume import safe_path_component
+    return safe_path_component(raw)
 
   def _get_instance_data_subfolder(self):
     # Mirror BasePluginExecutor._get_instance_data_subfolder so the CAR

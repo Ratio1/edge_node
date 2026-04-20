@@ -13,12 +13,31 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Dict, Optional
+
+
+def safe_path_component(raw, sanitize_fn=None):
+  """Sanitize a single path component to prevent directory traversal.
+
+  Applies an optional sanitize_fn (e.g. sanitize_name for cosmetic cleanup),
+  then verifies via os.path.realpath that the result cannot escape a parent
+  directory.  Returns '_' for any unsafe input.
+  """
+  if sanitize_fn is not None:
+    s = sanitize_fn(str(raw))
+  else:
+    s = re.sub(r'[^\w.\-]', '_', str(raw))
+  _parent = '/.__probe__'
+  _expected = os.path.join(_parent, s)
+  if not s or os.path.realpath(_expected) != _expected:
+    return '_'
+  return s
 
 
 def _log(logger: Optional[Callable], level: str, message: str) -> None:
@@ -55,6 +74,16 @@ class FixedVolume:
   fs_type: str = "ext4"
   owner_uid: Optional[int] = None
   owner_gid: Optional[int] = None
+
+  def __post_init__(self):
+    """Validate that the volume name cannot escape the root directory."""
+    abs_root = str(self._abs_root)
+    for derived in (self.img_path, self.mount_path, self.meta_path):
+      resolved = str(derived.resolve())
+      if not resolved.startswith(abs_root + os.sep):
+        raise ValueError(
+          f"Volume name {self.name!r} resolves outside root: {resolved!r}"
+        )
 
   @property
   def _abs_root(self) -> Path:

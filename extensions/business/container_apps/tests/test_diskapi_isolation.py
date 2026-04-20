@@ -141,10 +141,8 @@ class _TestPlugin(_DiskAPIMixin):
     return re.sub(r'[^\w\.-]', '_', name)
 
   def _safe_path_component(self, raw):
-    s = self.sanitize_name(str(raw))
-    if s in ('', '.', '..'):
-      s = '_'
-    return s
+    from extensions.business.container_apps.fixed_volume import safe_path_component
+    return safe_path_component(raw, sanitize_fn=self.sanitize_name)
 
   def _get_instance_data_subfolder(self):
     sid = self._safe_path_component(self._stream_id)

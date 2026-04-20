@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from extensions.business.container_apps import fixed_volume
+from extensions.business.container_apps.fixed_volume import safe_path_component
 
 
 class _FixedSizeVolumesMixin:
@@ -222,7 +223,7 @@ class _FixedSizeVolumesMixin:
     meta_dir = root / "meta"
     if meta_dir.is_dir():
       existing_names = {f.stem for f in meta_dir.glob("*.json")}
-      configured_names = set(self.cfg_fixed_size_volumes.keys())
+      configured_names = {safe_path_component(k) for k in self.cfg_fixed_size_volumes.keys()}
       orphaned = existing_names - configured_names
       for name in orphaned:
         self.P(
@@ -264,8 +265,9 @@ class _FixedSizeVolumesMixin:
         if owner_uid is None and owner_gid is None:
           owner_uid, owner_gid = self._resolve_image_owner()
 
+        safe_name = safe_path_component(logical_name)
         vol = fixed_volume.FixedVolume(
-          name=logical_name,
+          name=safe_name,
           size=str(size),
           root=root,
           fs_type=fs_type,
@@ -273,7 +275,7 @@ class _FixedSizeVolumesMixin:
           owner_gid=owner_gid,
         )
 
-        self.P(f"  Provisioning fixed-size volume '{logical_name}' size={size} -> container '{mounting_point}'")
+        self.P(f"  Provisioning fixed-size volume '{logical_name}' -> '{safe_name}' size={size} -> container '{mounting_point}'")
         fixed_volume.provision(vol, force_recreate=force_recreate, logger=self.P)
         provisioned.append(vol)
 

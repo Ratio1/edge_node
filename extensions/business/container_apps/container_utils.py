@@ -7,6 +7,8 @@ The utility mixin for container management used by ContainerAppRunnerPlugin
 import os
 import socket
 
+from extensions.business.container_apps.fixed_volume import safe_path_component
+
 # Path for container volumes
 CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 
@@ -1023,10 +1025,10 @@ class _ContainerUtilsMixin:
           self.P(f"FILE_VOLUMES['{logical_name}'] missing 'mounting_point' field, skipping", color='r')
           continue
 
-        # Extract filename from mounting_point
+        # Extract filename from mounting_point and sanitize
         mounting_point = str(mounting_point)
         path_parts = mounting_point.rstrip('/').split('/')
-        filename = path_parts[-1]
+        filename = safe_path_component(path_parts[-1])
 
         if not filename:
           self.P(f"FILE_VOLUMES['{logical_name}'] could not extract filename from mounting_point '{mounting_point}', skipping", color='r')
@@ -1034,11 +1036,17 @@ class _ContainerUtilsMixin:
 
         # Per-volume directory inside the instance-scoped file_volumes folder.
         # No instance_id prefix needed -- parent path is already instance-scoped.
-        sanitized_name = self.sanitize_name(str(logical_name))
+        sanitized_name = safe_path_component(logical_name)
         self.P(f"  Processing file volume '{logical_name}' → '{sanitized_name}/{filename}' → container '{mounting_point}'")
 
         # Create host directory
         host_volume_dir = self.os_path.join(file_volumes_base, sanitized_name)
+        # Realpath containment: reject if resolved path escapes file_volumes_base
+        real_dir = os.path.realpath(host_volume_dir)
+        real_base = os.path.realpath(file_volumes_base)
+        if not real_dir.startswith(real_base + os.sep) and real_dir != real_base:
+          self.P(f"FILE_VOLUMES['{logical_name}'] path escapes base directory, skipping", color='r')
+          continue
         try:
           os.makedirs(host_volume_dir, exist_ok=True)
         except PermissionError as exc:
