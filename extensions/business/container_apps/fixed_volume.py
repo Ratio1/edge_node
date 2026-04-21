@@ -48,6 +48,40 @@ def _log(logger: Optional[Callable], level: str, message: str) -> None:
     print(f"[FixedVolume] [{level}] {message}", flush=True)
 
 
+def _is_path_mounted(mount_path) -> bool:
+  """Return True iff `mount_path` is an exact mountpoint in /proc/mounts.
+
+  The kernel writes each /proc/mounts line as:
+    <device> <mountpoint> <fstype> <options> <dump> <pass>
+  with whitespace/backslashes in the mountpoint escaped as octal sequences
+  (`\\040` space, `\\011` tab, `\\012` newline, `\\134` backslash).
+
+  Substring/`in` matching on the whole file is unsafe: a mount at
+  `/a/b/data2` would make `/a/b/data` look mounted (prefix aliasing), so the
+  caller might skip a real mount step and lose the isolation guarantee.
+  This helper parses each line, unescapes the mountpoint, and compares
+  exactly.
+  """
+  try:
+    with open("/proc/mounts", "r", encoding="utf-8") as f:
+      lines = f.readlines()
+  except OSError:
+    return False
+  target = str(mount_path).rstrip("/")
+  for line in lines:
+    parts = line.split()
+    if len(parts) < 2:
+      continue
+    mp = parts[1]
+    mp = (mp.replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\"))
+    if mp.rstrip("/") == target:
+      return True
+  return False
+
+
 @dataclass
 class FixedVolume:
   """Fixed-size file-backed volume specification.
@@ -275,9 +309,7 @@ def mount_volume(
     logger, "STEP",
     f"Mounting loop_dev={loop_dev} mount_path={vol.mount_path} fs_type={vol.fs_type}",
   )
-  with open("/proc/mounts", "r", encoding="utf-8") as f:
-    mounts = f.read()
-  if str(vol.mount_path) in mounts:
+  if _is_path_mounted(vol.mount_path):
     _log(logger, "INFO", f"Mount already present mount_path={vol.mount_path}")
     return False
 
@@ -415,12 +447,6 @@ def cleanup_stale_mounts(
   if not meta_dir.is_dir():
     return
 
-  try:
-    with open("/proc/mounts", "r", encoding="utf-8") as f:
-      current_mounts = f.read()
-  except Exception:
-    current_mounts = ""
-
   for meta_file in sorted(meta_dir.glob("*.json")):
     try:
       meta = json.loads(meta_file.read_text(encoding="utf-8"))
@@ -431,8 +457,9 @@ def cleanup_stale_mounts(
     mount_path = meta.get("mount_path", "")
     loop_dev = meta.get("loop_dev", "")
 
-    # Skip if nothing is mounted at this path (edge node restart case)
-    if mount_path not in current_mounts:
+    # Skip if nothing is mounted at this exact path (edge node restart case).
+    # Exact match avoids false positives from sibling paths sharing a prefix.
+    if not mount_path or not _is_path_mounted(mount_path):
       _log(logger, "INFO", f"No active mount for {meta_file.stem}, skipping stale cleanup")
       continue
 

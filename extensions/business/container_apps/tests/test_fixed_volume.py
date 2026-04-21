@@ -11,6 +11,7 @@ from extensions.business.container_apps.fixed_volume import (
   FixedVolume,
   _parse_size_to_bytes,
   _require_tools,
+  _is_path_mounted,
   docker_bind_spec,
   ensure_created,
   attach_loop,
@@ -168,6 +169,49 @@ class TestAttachLoop(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Unit tests for _is_path_mounted (exact /proc/mounts matching)
+# ---------------------------------------------------------------------------
+
+class TestIsPathMounted(unittest.TestCase):
+
+  def _proc_mounts(self, data):
+    return patch("builtins.open", mock_open(read_data=data))
+
+  def test_exact_match_returns_true(self):
+    data = "/dev/loop0 /r/mounts/data ext4 rw 0 0\n"
+    with self._proc_mounts(data):
+      self.assertTrue(_is_path_mounted("/r/mounts/data"))
+
+  def test_prefix_sibling_does_not_alias(self):
+    # Previously a substring check matched /r/mounts/data against
+    # /r/mounts/data2 and made callers skip the real mount step.
+    data = "/dev/loop0 /r/mounts/data2 ext4 rw 0 0\n"
+    with self._proc_mounts(data):
+      self.assertFalse(_is_path_mounted("/r/mounts/data"))
+
+  def test_trailing_slash_normalized(self):
+    data = "/dev/loop0 /r/mounts/data ext4 rw 0 0\n"
+    with self._proc_mounts(data):
+      self.assertTrue(_is_path_mounted("/r/mounts/data/"))
+
+  def test_octal_escaped_space_in_mountpoint(self):
+    # /proc/mounts encodes a space as \040.
+    data = "/dev/loop0 /r/with\\040space ext4 rw 0 0\n"
+    with self._proc_mounts(data):
+      self.assertTrue(_is_path_mounted("/r/with space"))
+
+  def test_malformed_lines_ignored(self):
+    data = "garbage\n\n/dev/loop0 /r/mounts/data ext4 rw 0 0\n"
+    with self._proc_mounts(data):
+      self.assertTrue(_is_path_mounted("/r/mounts/data"))
+      self.assertFalse(_is_path_mounted("/r/mounts/missing"))
+
+  def test_returns_false_when_proc_mounts_unreadable(self):
+    with patch("builtins.open", side_effect=OSError("permission denied")):
+      self.assertFalse(_is_path_mounted("/anything"))
+
+
+# ---------------------------------------------------------------------------
 # Unit tests for mount_volume
 # ---------------------------------------------------------------------------
 
@@ -181,6 +225,17 @@ class TestMountVolume(unittest.TestCase):
       is_fresh = mount_volume(vol, "/dev/loop0")
     self.assertFalse(is_fresh)
     mock_run.assert_not_called()
+
+  @patch("extensions.business.container_apps.fixed_volume._run")
+  def test_does_not_alias_prefix_sibling_mount(self, mock_run):
+    # /r/mounts/data2 is mounted; /r/mounts/data must NOT be treated as
+    # already mounted, so mount_volume must still call `mount -t`.
+    vol = FixedVolume(name="data", size="100M", root=Path("/r"))
+    mount_data = "/dev/loop0 /r/mounts/data2 ext4 rw 0 0\n"
+    with patch("builtins.open", mock_open(read_data=mount_data)):
+      is_fresh = mount_volume(vol, "/dev/loop0")
+    self.assertTrue(is_fresh)
+    mock_run.assert_called()
 
 
 # ---------------------------------------------------------------------------
@@ -219,15 +274,32 @@ class TestCleanupStaleMounts(unittest.TestCase):
     """After edge node restart, nothing is mounted, so cleanup is a no-op."""
     root = Path("/tmp/fv")
     meta = {"mount_path": "/tmp/fv/mounts/data", "loop_dev": "/dev/loop3"}
-    meta_dir = root / "meta"
 
     with patch.object(Path, "is_dir", return_value=True), \
          patch.object(Path, "glob", return_value=[Path("/tmp/fv/meta/data.json")]), \
          patch.object(Path, "read_text", return_value=json.dumps(meta)), \
-         patch("builtins.open", mock_open(read_data="nothing mounted here\n")):
+         patch("builtins.open", mock_open(read_data="")):
       cleanup_stale_mounts(root)
 
     # _run should NOT be called since mount is not in /proc/mounts
+    mock_run.assert_not_called()
+
+  @patch("extensions.business.container_apps.fixed_volume._run")
+  def test_prefix_sibling_does_not_trigger_cleanup(self, mock_run):
+    """A sibling mount sharing a prefix must not cause cleanup of a different
+    stale entry. Previously substring matching aliased /data onto /data2."""
+    root = Path("/tmp/fv")
+    # Meta says /tmp/fv/mounts/data is the recorded mount, but only
+    # /tmp/fv/mounts/data2 is actually mounted.
+    meta = {"mount_path": "/tmp/fv/mounts/data", "loop_dev": "/dev/loop3"}
+    proc = "/dev/loop0 /tmp/fv/mounts/data2 ext4 rw 0 0\n"
+
+    with patch.object(Path, "is_dir", return_value=True), \
+         patch.object(Path, "glob", return_value=[Path("/tmp/fv/meta/data.json")]), \
+         patch.object(Path, "read_text", return_value=json.dumps(meta)), \
+         patch("builtins.open", mock_open(read_data=proc)):
+      cleanup_stale_mounts(root)
+
     mock_run.assert_not_called()
 
 
