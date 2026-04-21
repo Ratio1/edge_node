@@ -56,8 +56,8 @@ class TestLifecycleInit(unittest.TestCase):
 
   def test_container_name_is_deterministic(self):
     plugin, _, _ = make_lifecycle_runner()
-    self.assertEqual(plugin.container_name, "car_instance")
-    self.assertEqual(plugin.container_name, plugin.cfg_instance_id)
+    # Name is stream_id-qualified and sanitized (with "car_" prefix).
+    self.assertEqual(plugin.container_name, "car_test_stream_car_instance")
 
   def test_fixed_volumes_list_empty(self):
     plugin, _, _ = make_lifecycle_runner()
@@ -99,7 +99,7 @@ class TestLifecycleFirstLaunch(unittest.TestCase):
     plugin, client, _ = make_lifecycle_runner()
     plugin._handle_initial_launch()
     # containers.get should be called (stale check) as well as containers.run
-    client.containers.get.assert_called_with("car_instance")
+    client.containers.get.assert_called_with("car_test_stream_car_instance")
     client.containers.run.assert_called_once()
 
   def test_image_availability_checked(self):
@@ -114,7 +114,8 @@ class TestLifecycleFirstLaunch(unittest.TestCase):
     plugin, client, _ = make_lifecycle_runner()
     plugin._handle_initial_launch()
     _, kwargs = client.containers.run.call_args
-    self.assertEqual(kwargs["name"], "car_instance")
+    # Name is stream_id-qualified and sanitized (with "car_" prefix).
+    self.assertEqual(kwargs["name"], "car_test_stream_car_instance")
 
   def test_volumes_passed_to_docker_run(self):
     plugin, client, _ = make_lifecycle_runner()
@@ -280,7 +281,8 @@ class TestLifecycleRestart(unittest.TestCase):
       plugin._restart_container(StopReason.CRASH)
 
     _, kwargs = client.containers.run.call_args
-    self.assertEqual(kwargs["name"], "car_instance")
+    # See test_container_receives_deterministic_name for the naming rule.
+    self.assertEqual(kwargs["name"], "car_test_stream_car_instance")
 
 
 # ===========================================================================

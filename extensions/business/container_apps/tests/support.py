@@ -184,6 +184,7 @@ def make_container_app_runner():
   plugin.os_path = os.path
   plugin.os = os
   plugin.np = _np
+  plugin._stream_id = "test_stream"
   plugin.cfg_instance_id = "car_instance"
   plugin.uuid = lambda *a, **k: "efgh"
   plugin.time = lambda: 0
@@ -313,7 +314,10 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
   # Override container to None (lifecycle starts with no container)
   plugin.container = None
   plugin.container_id = None
-  plugin.container_name = plugin.cfg_instance_id
+  # Mirror what __reset_vars does in production: qualify + sanitize.
+  plugin.container_name = ContainerAppRunnerPlugin._compute_container_name(
+    plugin._stream_id, plugin.cfg_instance_id,
+  )
   plugin.docker_client = docker_client
   plugin.container_logs = deque(maxlen=plugin.cfg_max_log_lines)
 

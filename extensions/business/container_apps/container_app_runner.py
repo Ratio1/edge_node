@@ -77,6 +77,7 @@ from docker.types import DeviceRequest
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
+from .fixed_volume import safe_path_component
 from .mixins import (
   _FixedSizeVolumesMixin,
   _ImagePullBackoffMixin,
@@ -419,10 +420,22 @@ class ContainerAppRunnerPlugin(
     return
 
 
+  @staticmethod
+  def _compute_container_name(stream_id, instance_id):
+    # Qualify with stream_id so two pipelines that happen to reuse the same
+    # INSTANCE_ID get distinct container names and cannot stomp each other
+    # through _ensure_no_stale_container's force-remove-by-name path. The
+    # "car_" prefix guarantees a Docker-valid leading character even when
+    # stream_id / instance_id are empty or sanitized down to "_".
+    return "car_" + safe_path_component(f"{stream_id}_{instance_id}")
+
+
   def __reset_vars(self):
     self.container = None
     self.container_id = None
-    self.container_name = self.cfg_instance_id
+    self.container_name = self._compute_container_name(
+      self._stream_id, self.cfg_instance_id,
+    )
 
     # Initialize Docker client with proper error handling
     try:
