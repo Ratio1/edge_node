@@ -22,16 +22,22 @@ class _FixedSizeVolumesMixin:
 
   def _resolve_image_owner(self):
     """
-    Resolve the image's runtime USER to numeric (uid, gid) for volume chown.
+    Resolve the image's runtime USER to numeric (uid, gid) for volume chown,
+    WITHOUT executing the user-supplied image.
 
-    Returns (None, None) when the image has no USER directive or runs as
-    root, so the caller can keep the root-owned default behavior.
+    Returns:
+      (None, None) when the image has no USER, runs as root, or uses a
+      symbolic name (e.g. "appuser") that can't be resolved without running
+      the image. Caller keeps the root-owned default in those cases.
 
-    Supports:
-      - numeric forms: "1000", "1000:1000", "1000:2000"
-      - name forms: "appuser", "appuser:appgroup" — resolved via an ephemeral
-        `getent passwd` (with a `cat /etc/passwd` fallback for images that
-        don't ship `getent`, like distroless).
+      (uid, gid) for numeric USER directives: "1000", "1000:2000".
+
+    Previously this ran a throwaway container from the target image to read
+    /etc/passwd. That expanded the execution surface of volume provisioning
+    to user-supplied images before the main runtime start path. We now
+    inspect image metadata only. Users with symbolic-USER images and
+    non-root ownership needs must set OWNER_UID/OWNER_GID explicitly in
+    FIXED_SIZE_VOLUMES.
     """
     try:
       image_ref = self._get_full_image_ref()
@@ -42,15 +48,14 @@ class _FixedSizeVolumesMixin:
       return (None, None)
 
     raw = raw.strip()
-    if not raw or raw == "root" or raw == "0" or raw.startswith("0:"):
+    if not raw or raw in ("root", "0", "0:0", "root:root") or raw.startswith("0:"):
       self.P(
         f"[FixedVolume] Image '{image_ref}' runs as root (USER='{raw}'); "
         "keeping root-owned mount"
       )
       return (None, None)
 
-    # Split user[:group]
-    user_part, _, group_part = raw.partition(":")
+    user_part, sep, group_part = raw.partition(":")
 
     def _maybe_int(s):
       s = s.strip()
@@ -64,10 +69,8 @@ class _FixedSizeVolumesMixin:
     uid = _maybe_int(user_part)
     gid = _maybe_int(group_part) if group_part else None
 
-    if uid is not None and (gid is not None or not group_part):
-      # Fully numeric (or "<uid>" with no group part).
-      # Default gid to uid when only uid was provided, matching typical
-      # Docker USER conventions (appuser == appuser:appuser).
+    if uid is not None and (not group_part or gid is not None):
+      # Fully numeric. Default gid to uid when only uid was given.
       if gid is None:
         gid = uid
       self.P(
@@ -75,108 +78,13 @@ class _FixedSizeVolumesMixin:
       )
       return (uid, gid)
 
-    # Name-based (or partially named) form: need to look it up inside the image.
-    username = user_part
-    groupname = group_part if group_part and _maybe_int(group_part) is None else None
-    numeric_gid = _maybe_int(group_part) if group_part else None
-
-    passwd_line = self._lookup_passwd_in_image(image_ref, username)
-    if not passwd_line:
-      self.P(
-        f"[FixedVolume] Could not resolve USER '{raw}' from image '{image_ref}'; "
-        "falling back to root-owned mount",
-        color='y',
-      )
-      return (None, None)
-
-    # passwd format: name:x:uid:gid:gecos:home:shell
-    parts = passwd_line.split(":")
-    try:
-      resolved_uid = int(parts[2])
-      resolved_gid = int(parts[3])
-    except (IndexError, ValueError):
-      self.P(
-        f"[FixedVolume] Unexpected passwd line for USER '{raw}' in image '{image_ref}': "
-        f"{passwd_line!r}; falling back to root-owned mount",
-        color='y',
-      )
-      return (None, None)
-
-    # Group lookup is best-effort: if the USER directive had an explicit group
-    # that wasn't numeric, resolve it too. Numeric group wins over passwd gid.
-    if numeric_gid is not None:
-      resolved_gid = numeric_gid
-    elif groupname:
-      group_line = self._lookup_group_in_image(image_ref, groupname)
-      if group_line:
-        gparts = group_line.split(":")
-        try:
-          resolved_gid = int(gparts[2])
-        except (IndexError, ValueError):
-          pass
-
     self.P(
-      f"[FixedVolume] Image '{image_ref}' USER='{raw}' -> uid={resolved_uid} gid={resolved_gid}"
+      f"[FixedVolume] Image '{image_ref}' USER='{raw}' is symbolic and cannot "
+      "be resolved without running the image. Volume will be root-owned. "
+      "Set OWNER_UID/OWNER_GID in FIXED_SIZE_VOLUMES to override.",
+      color='y',
     )
-    return (resolved_uid, resolved_gid)
-
-  def _lookup_passwd_in_image(self, image_ref, username):
-    """Run a throwaway container to look up a username in /etc/passwd."""
-    # Prefer `getent passwd <user>` (Debian/Alpine/Ubuntu), fall back to
-    # reading /etc/passwd directly (works for distroless images that ship
-    # /etc/passwd but not getent).
-    for cmd in (
-      ["getent", "passwd", username],
-      ["cat", "/etc/passwd"],
-    ):
-      out = self._run_throwaway(image_ref, cmd)
-      if not out:
-        continue
-      for line in out.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-          continue
-        if line.split(":", 1)[0] == username:
-          return line
-    return None
-
-  def _lookup_group_in_image(self, image_ref, groupname):
-    """Run a throwaway container to look up a group in /etc/group."""
-    for cmd in (
-      ["getent", "group", groupname],
-      ["cat", "/etc/group"],
-    ):
-      out = self._run_throwaway(image_ref, cmd)
-      if not out:
-        continue
-      for line in out.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-          continue
-        if line.split(":", 1)[0] == groupname:
-          return line
-    return None
-
-  def _run_throwaway(self, image_ref, command):
-    """
-    Run a one-shot throwaway container against `image_ref` with the given
-    command, bypassing the image's ENTRYPOINT. Returns decoded stdout on
-    success, empty string on any failure (caller handles fallback).
-    """
-    try:
-      out = self.docker_client.containers.run(
-        image_ref,
-        command=command,
-        entrypoint="",
-        remove=True,
-        stdout=True,
-        stderr=False,
-      )
-      if isinstance(out, bytes):
-        out = out.decode("utf-8", errors="replace")
-      return out or ""
-    except Exception:
-      return ""
+    return (None, None)
 
   def _configure_fixed_size_volumes(self):
     """
