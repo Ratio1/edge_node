@@ -202,6 +202,21 @@ class _FixedSizeVolumesMixin:
       self.P("FIXED_SIZE_VOLUMES must be a dictionary, skipping", color='r')
       return
 
+    # Reject logical names that sanitize to the same backing name. Without
+    # this check `"a/b"` and `"a?b"` would both normalize to `"a_b"` and
+    # silently alias the same image/meta/mount paths, breaking isolation.
+    from collections import defaultdict
+    safe_to_logicals = defaultdict(list)
+    for logical in self.cfg_fixed_size_volumes.keys():
+      safe_to_logicals[safe_path_component(logical)].append(logical)
+    collisions = {s: ls for s, ls in safe_to_logicals.items() if len(ls) > 1}
+    if collisions:
+      details = "; ".join(f"{s!r} <- {ls}" for s, ls in collisions.items())
+      raise ValueError(
+        f"FIXED_SIZE_VOLUMES: multiple logical names normalize to the same "
+        f"sanitized name: {details}. Rename keys to use only [A-Za-z0-9._-]."
+      )
+
     # Check required tools
     try:
       fixed_volume._require_tools(logger=self.P)
