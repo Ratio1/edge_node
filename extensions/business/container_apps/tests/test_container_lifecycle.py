@@ -117,6 +117,15 @@ class TestLifecycleFirstLaunch(unittest.TestCase):
     # Name is stream_id-qualified and sanitized (with "car_" prefix).
     self.assertEqual(kwargs["name"], "car_test_stream_car_instance")
 
+  def test_container_is_not_run_with_auto_remove(self):
+    # auto_remove=True destroys post-mortem observability and races with the
+    # explicit stop_container() remove path. _ensure_no_stale_container
+    # handles crash recovery without it.
+    plugin, client, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    _, kwargs = client.containers.run.call_args
+    self.assertNotIn("auto_remove", kwargs)
+
   def test_volumes_passed_to_docker_run(self):
     plugin, client, _ = make_lifecycle_runner()
     plugin.volumes = {"/host/data": {"bind": "/app/data", "mode": "rw"}}

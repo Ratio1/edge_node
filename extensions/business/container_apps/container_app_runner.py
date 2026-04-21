@@ -1936,9 +1936,14 @@ class ContainerAppRunnerPlugin(
     nano_cpu_limit = int(self._cpu_limit * 1_000_000_000)
     mem_reservation = f"{parse_memory_to_mb(self._mem_limit, 0.9)}m"
 
+    # Intentionally NO auto_remove=True: exited containers stay inspectable
+    # in `docker ps -a` until the next start cycle, which preserves
+    # post-mortem observability. `_ensure_no_stale_container()` force-removes
+    # any prior container with this name before each launch, and
+    # stop_container() explicitly removes on graceful stop -- so the
+    # cleanup story is covered without Docker auto-removing.
     run_kwargs = dict(
       detach=True,
-      auto_remove=True,
       ports=self.inverted_ports_mapping,
       environment=self.env,
       volumes=self.volumes,
