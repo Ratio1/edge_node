@@ -63,7 +63,9 @@ EXTRA_TUNNELS Feature:
 """
 
 import docker
+import os
 import requests
+import shutil
 import threading
 import time
 import socket
@@ -94,6 +96,10 @@ _PERSISTENT_STATE_FILE = "persistent_state.pkl"
 
 # Container logs filename (stored under the plugin's logs/ sibling folder)
 _CONTAINER_LOGS_FILE = "container_logs.pkl"
+
+# Pre-refactor persistent-state / logs subfolder relative to the data folder.
+# Kept here only so we can migrate content once; do not use for new writes.
+_LEGACY_CONTAINER_APPS_SUBFOLDER = "container_apps"
 
 
 class ContainerState(Enum):
@@ -430,12 +436,97 @@ class ContainerAppRunnerPlugin(
     return "car_" + safe_path_component(f"{stream_id}_{instance_id}")
 
 
+  def _migrate_legacy_car_data(self):
+    """One-shot move from the pre-refactor CAR data location to the new
+    auto-routed plugin_data/ folder.
+
+    Pre-refactor, persistent state and logs lived under
+      {data_folder}/container_apps/{plugin_id}/
+    Current layout auto-routes them to
+      {data_folder}/pipelines_data/{sid}/{iid}/plugin_data/
+
+    Without migration, `manually_stopped` flags and any co-located logs
+    reset on upgrade. This method moves each legacy entry once, deletes
+    the legacy directory, and is idempotent (the `is_dir()` guard
+    short-circuits on every subsequent run). Failure-tolerant: any
+    exception is logged and container startup proceeds.
+    """
+    try:
+      get_df = getattr(self, 'get_data_folder', None)
+      if get_df is None:
+        return
+      data_folder = get_df()
+      plugin_id = getattr(self, 'plugin_id', None)
+      if not plugin_id:
+        return
+      legacy_dir = os.path.join(data_folder, _LEGACY_CONTAINER_APPS_SUBFOLDER, plugin_id)
+      if not os.path.isdir(legacy_dir):
+        return  # nothing to migrate -- idempotent no-op
+
+      # Resolve the new auto-routed plugin_data/ directory. Prefer the
+      # plugin-base accessor from the diskapi mixin; fall back to the
+      # subfolder resolver when unavailable (plain tests).
+      new_dir = None
+      get_base = getattr(self, '_get_plugin_absolute_base', None)
+      if callable(get_base):
+        base = get_base()
+        if base:
+          new_dir = os.path.join(base, 'plugin_data')
+      if new_dir is None:
+        sub_fn = getattr(self, '_resolve_data_subfolder', None)
+        if callable(sub_fn):
+          resolved = sub_fn(None)
+          if resolved:
+            new_dir = os.path.join(data_folder, resolved)
+      if new_dir is None:
+        self.P(
+          f"Legacy CAR data migration skipped: cannot resolve new plugin_data dir",
+          color='y',
+        )
+        return
+      os.makedirs(new_dir, exist_ok=True)
+
+      moved = 0
+      for entry in sorted(os.listdir(legacy_dir)):
+        src = os.path.join(legacy_dir, entry)
+        dest = os.path.join(new_dir, entry)
+        if os.path.exists(dest):
+          self.P(
+            f"Legacy CAR data migration: destination {dest} already exists, "
+            f"keeping new and discarding legacy {src}",
+            color='y',
+          )
+          continue
+        shutil.move(src, dest)
+        moved += 1
+
+      shutil.rmtree(legacy_dir, ignore_errors=True)
+      # Drop the empty wrapper dir too if no other plugin's data lives there.
+      parent = os.path.dirname(legacy_dir)
+      try:
+        os.rmdir(parent)
+      except OSError:
+        pass
+
+      self.P(
+        f"Legacy CAR data migration complete: moved {moved} entries from {legacy_dir}"
+      )
+    except Exception as exc:
+      self.P(f"Legacy CAR data migration skipped: {exc}", color='y')
+
+
   def __reset_vars(self):
     self.container = None
     self.container_id = None
     self.container_name = self._compute_container_name(
       self._stream_id, self.cfg_instance_id,
     )
+
+    # One-shot migration from pre-refactor container_apps/{plugin_id}/ to
+    # the auto-routed plugin_data/. Runs before any diskapi read/write so
+    # legacy persistent_state.pkl / container_logs.pkl are in place at the
+    # new location by the time we load them.
+    self._migrate_legacy_car_data()
 
     # Initialize Docker client with proper error handling
     try:
