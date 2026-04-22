@@ -463,21 +463,31 @@ class ContainerAppRunnerPlugin(
       if not os.path.isdir(legacy_dir):
         return  # nothing to migrate -- idempotent no-op
 
-      # Resolve the new auto-routed plugin_data/ directory. Prefer the
-      # plugin-base accessor from the diskapi mixin; fall back to the
-      # subfolder resolver when unavailable (plain tests).
+      # Resolve the new auto-routed plugin_data/ directory and the sibling
+      # logs/ directory. Persistent state (persistent_state.pkl) lives in
+      # plugin_data/ at the new layout; container_logs.pkl is written to
+      # the sibling logs/ folder (see _stop_container_and_save_logs_to_disk).
+      # Routing the legacy log file into plugin_data/ would strand it under
+      # a subfolder nothing reads or rewrites. Prefer the plugin-base
+      # accessor from the diskapi mixin; fall back to the subfolder resolver
+      # when unavailable (plain tests).
       new_dir = None
+      logs_dir = None
       get_base = getattr(self, '_get_plugin_absolute_base', None)
       if callable(get_base):
         base = get_base()
         if base:
           new_dir = os.path.join(base, 'plugin_data')
+          logs_dir = os.path.join(base, 'logs')
       if new_dir is None:
         sub_fn = getattr(self, '_resolve_data_subfolder', None)
         if callable(sub_fn):
           resolved = sub_fn(None)
           if resolved:
             new_dir = os.path.join(data_folder, resolved)
+            logs_resolved = sub_fn('logs')
+            if logs_resolved:
+              logs_dir = os.path.join(data_folder, logs_resolved)
       if new_dir is None:
         self.P(
           f"Legacy CAR data migration skipped: cannot resolve new plugin_data dir",
@@ -489,7 +499,12 @@ class ContainerAppRunnerPlugin(
       moved = 0
       for entry in sorted(os.listdir(legacy_dir)):
         src = os.path.join(legacy_dir, entry)
-        dest = os.path.join(new_dir, entry)
+        if entry == _CONTAINER_LOGS_FILE and logs_dir is not None:
+          dest_dir = logs_dir
+          os.makedirs(dest_dir, exist_ok=True)
+        else:
+          dest_dir = new_dir
+        dest = os.path.join(dest_dir, entry)
         if os.path.exists(dest):
           self.P(
             f"Legacy CAR data migration: destination {dest} already exists, "

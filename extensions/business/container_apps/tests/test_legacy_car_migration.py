@@ -58,6 +58,9 @@ class LegacyCarMigrationTests(unittest.TestCase):
   def _new_dir(self):
     return os.path.join(self.tmp, "pipelines_data", self.sid, self.iid, "plugin_data")
 
+  def _logs_dir(self):
+    return os.path.join(self.tmp, "pipelines_data", self.sid, self.iid, "logs")
+
   def _seed_legacy(self, files):
     legacy = self._legacy_dir()
     os.makedirs(legacy, exist_ok=True)
@@ -66,6 +69,9 @@ class LegacyCarMigrationTests(unittest.TestCase):
         f.write(content)
 
   def test_moves_files_to_new_dir_and_removes_legacy(self):
+    # persistent_state.pkl lands in plugin_data/; container_logs.pkl lands in
+    # the sibling logs/ folder to match the canonical write path used by
+    # _stop_container_and_save_logs_to_disk (subfolder="logs").
     self._seed_legacy({
       "persistent_state.pkl": b"state-bytes",
       "container_logs.pkl": b"log-bytes",
@@ -74,11 +80,16 @@ class LegacyCarMigrationTests(unittest.TestCase):
     h._migrate_legacy_car_data()
 
     new_dir = self._new_dir()
+    logs_dir = self._logs_dir()
     self.assertTrue(os.path.isdir(new_dir))
+    self.assertTrue(os.path.isdir(logs_dir))
     with open(os.path.join(new_dir, "persistent_state.pkl"), "rb") as f:
       self.assertEqual(f.read(), b"state-bytes")
-    with open(os.path.join(new_dir, "container_logs.pkl"), "rb") as f:
+    with open(os.path.join(logs_dir, "container_logs.pkl"), "rb") as f:
       self.assertEqual(f.read(), b"log-bytes")
+    # container_logs.pkl must not be left under plugin_data/ -- nothing reads
+    # or rewrites it there, so it would be silently stranded on upgrade.
+    self.assertFalse(os.path.exists(os.path.join(new_dir, "container_logs.pkl")))
     self.assertFalse(os.path.isdir(self._legacy_dir()))
     # container_apps/ wrapper dir is also cleaned up when empty
     self.assertFalse(os.path.isdir(os.path.join(self.tmp, "container_apps")))
@@ -105,6 +116,26 @@ class LegacyCarMigrationTests(unittest.TestCase):
 
     with open(os.path.join(new_dir, "persistent_state.pkl"), "rb") as f:
       self.assertEqual(f.read(), b"new-wins")
+    self.assertFalse(os.path.isdir(self._legacy_dir()))
+    self.assertTrue(
+      any("already exists" in m for m in h.logged),
+      "expected a conflict warning in logs",
+    )
+
+  def test_logs_destination_conflict_new_wins_legacy_is_discarded(self):
+    # A pre-existing logs/container_logs.pkl at the new location must win
+    # over the legacy bytes, mirroring the plugin_data/ conflict policy.
+    self._seed_legacy({"container_logs.pkl": b"legacy-logs"})
+    logs_dir = self._logs_dir()
+    os.makedirs(logs_dir, exist_ok=True)
+    with open(os.path.join(logs_dir, "container_logs.pkl"), "wb") as f:
+      f.write(b"new-logs-win")
+
+    h = _Harness(self.tmp, self.plugin_id, self.sid, self.iid)
+    h._migrate_legacy_car_data()
+
+    with open(os.path.join(logs_dir, "container_logs.pkl"), "rb") as f:
+      self.assertEqual(f.read(), b"new-logs-win")
     self.assertFalse(os.path.isdir(self._legacy_dir()))
     self.assertTrue(
       any("already exists" in m for m in h.logged),
