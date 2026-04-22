@@ -7,6 +7,8 @@ The utility mixin for container management used by ContainerAppRunnerPlugin
 import os
 import socket
 
+from extensions.business.container_apps.fixed_volume import safe_path_component
+
 # Path for container volumes
 CONTAINER_VOLUMES_PATH = "/edge_node/_local_cache/_data/container_volumes"
 
@@ -611,7 +613,10 @@ class _ContainerUtilsMixin:
       self.container.reload()
       net_settings = self.container.attrs.get('NetworkSettings', {})
       # Try top-level IPAddress first (default bridge network)
-      container_ip = net_settings.get('IPAddress')
+      container_ip = net_settings.get('IPAddress') or None
+      # Docker sometimes returns string 'None' instead of actual None
+      if container_ip and container_ip.lower() == 'none':
+        container_ip = None
       available_keys = list(net_settings.keys())
       networks = net_settings.get('Networks', {})
       network_names = list(networks.keys())
@@ -919,9 +924,18 @@ class _ContainerUtilsMixin:
   def _configure_volumes(self):
     """
     Processes the volumes specified in the configuration.
+
+    .. deprecated::
+        VOLUMES is deprecated. Use FIXED_SIZE_VOLUMES for size-limited,
+        isolated volumes with ENOSPC enforcement.
     """
     default_volume_rights = "rw"
     if hasattr(self, 'cfg_volumes') and self.cfg_volumes and len(self.cfg_volumes) > 0:
+      self.P(
+        "WARNING: VOLUMES is deprecated and will be removed in a future version. "
+        "Use FIXED_SIZE_VOLUMES instead for size-limited, isolated volumes.",
+        color='r'
+      )
       os.makedirs(CONTAINER_VOLUMES_PATH, exist_ok=True)
       self._set_directory_permissions(CONTAINER_VOLUMES_PATH)
       for host_path, container_path in self.cfg_volumes.items():
@@ -956,7 +970,7 @@ class _ContainerUtilsMixin:
     """
     Processes FILE_VOLUMES configuration to create files with specified content
     and mount them into the container.
-    
+
     FILE_VOLUMES format:
       {
         "logical_name": {
@@ -964,59 +978,75 @@ class _ContainerUtilsMixin:
           "mounting_point": "/container/path/to/filename.ext"
         }
       }
-    
+
     The method will:
       1. Extract filename from mounting_point
-      2. Create a directory under CONTAINER_VOLUMES_PATH
+      2. Create a directory under
+         {data_folder}/pipelines_data/{stream_id}/{instance_id}/file_volumes/{logical_name}/
       3. Write content to a file with the extracted filename
       4. Add volume mapping to self.volumes
     """
     default_volume_rights = "rw"
-    
+
     if not hasattr(self, 'cfg_file_volumes') or not self.cfg_file_volumes:
       return
-    
+
     if not isinstance(self.cfg_file_volumes, dict):
       self.P("FILE_VOLUMES must be a dictionary, skipping file volume configuration", color='r')
       return
-    
-    os.makedirs(CONTAINER_VOLUMES_PATH, exist_ok=True)
-    self._set_directory_permissions(CONTAINER_VOLUMES_PATH)
-    
+
+    # Instance-scoped base: {data_folder}/pipelines_data/{sid}/{iid}/file_volumes/
+    # `get_data_folder()` can return a relative path (logger stores _data_dir
+    # un-abspath'd); Docker bind mounts require absolute paths, so resolve
+    # here.
+    file_volumes_base = self.os_path.abspath(self.os_path.join(
+      self.get_data_folder(),
+      self._get_instance_data_subfolder(),
+      "file_volumes",
+    ))
+    os.makedirs(file_volumes_base, exist_ok=True)
+    self._set_directory_permissions(file_volumes_base)
+
     for logical_name, file_config in self.cfg_file_volumes.items():
       try:
         # Validate file_config structure
         if not isinstance(file_config, dict):
           self.P(f"FILE_VOLUMES['{logical_name}'] must be a dict with 'content' and 'mounting_point', skipping", color='r')
           continue
-        
+
         content = file_config.get('content')
         mounting_point = file_config.get('mounting_point')
-        
+
         if content is None:
           self.P(f"FILE_VOLUMES['{logical_name}'] missing 'content' field, skipping", color='r')
           continue
-        
+
         if not mounting_point:
           self.P(f"FILE_VOLUMES['{logical_name}'] missing 'mounting_point' field, skipping", color='r')
           continue
-        
-        # Extract filename from mounting_point
+
+        # Extract filename from mounting_point and sanitize
         mounting_point = str(mounting_point)
         path_parts = mounting_point.rstrip('/').split('/')
-        filename = path_parts[-1]
-        
+        filename = safe_path_component(path_parts[-1])
+
         if not filename:
           self.P(f"FILE_VOLUMES['{logical_name}'] could not extract filename from mounting_point '{mounting_point}', skipping", color='r')
           continue
-        
-        # Create sanitized directory for this file volume
-        sanitized_name = self.sanitize_name(str(logical_name))
-        prefixed_name = f"{self.cfg_instance_id}_{sanitized_name}"
-        self.P(f"  Processing file volume '{logical_name}' → '{prefixed_name}/{filename}' → container '{mounting_point}'")
-        
+
+        # Per-volume directory inside the instance-scoped file_volumes folder.
+        # No instance_id prefix needed -- parent path is already instance-scoped.
+        sanitized_name = safe_path_component(logical_name)
+        self.P(f"  Processing file volume '{logical_name}' → '{sanitized_name}/{filename}' → container '{mounting_point}'")
+
         # Create host directory
-        host_volume_dir = self.os_path.join(CONTAINER_VOLUMES_PATH, prefixed_name)
+        host_volume_dir = self.os_path.join(file_volumes_base, sanitized_name)
+        # Realpath containment: reject if resolved path escapes file_volumes_base
+        real_dir = os.path.realpath(host_volume_dir)
+        real_base = os.path.realpath(file_volumes_base)
+        if not real_dir.startswith(real_base + os.sep) and real_dir != real_base:
+          self.P(f"FILE_VOLUMES['{logical_name}'] path escapes base directory, skipping", color='r')
+          continue
         try:
           os.makedirs(host_volume_dir, exist_ok=True)
         except PermissionError as exc:
@@ -1072,8 +1102,6 @@ class _ContainerUtilsMixin:
     # endfor each file volume
     return
 
-
-  ### END NEW CONTAINER MIXIN METHODS ###
 
   ### COMMON CONTAINER UTILITY METHODS ###
   def _setup_env_and_ports(self):

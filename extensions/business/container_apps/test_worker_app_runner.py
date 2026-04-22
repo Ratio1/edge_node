@@ -59,6 +59,19 @@ class _DummyBasePlugin:
   def sanitize_name(self, name):
     return name.replace('/', '_')
 
+  def _safe_path_component(self, raw):
+    from extensions.business.container_apps.fixed_volume import safe_path_component
+    return safe_path_component(raw)
+
+  def _get_instance_data_subfolder(self):
+    sid = self._safe_path_component(getattr(self, '_stream_id', 'test_stream'))
+    iid = self._safe_path_component(getattr(self, 'cfg_instance_id', 'test_instance'))
+    return "pipelines_data/{}/{}".format(sid, iid)
+
+  def get_data_folder(self):
+    # Overridden per-test via `plugin.get_data_folder = lambda: <tmpdir>`.
+    return "/tmp/test_data"
+
 
 def _install_dummy_base_plugin():
   module_hierarchy = [
@@ -305,10 +318,10 @@ class ContainerAppRunnerConfigTests(unittest.TestCase):
 
     temp_dir = tempfile.mkdtemp()
     self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
-    volumes_base = os.path.join(temp_dir, "volumes")
 
-    with unittest.mock.patch.object(container_utils, "CONTAINER_VOLUMES_PATH", volumes_base):
-      plugin._configure_file_volumes()
+    # FILE_VOLUMES now resolves to <data_folder>/pipelines_data/<sid>/<iid>/file_volumes/
+    plugin.get_data_folder = lambda: temp_dir
+    plugin._configure_file_volumes()
 
     # Verify two file volumes were created
     self.assertEqual(len(plugin.volumes), 2)
@@ -358,10 +371,9 @@ class ContainerAppRunnerConfigTests(unittest.TestCase):
 
     temp_dir = tempfile.mkdtemp()
     self.addCleanup(shutil.rmtree, temp_dir, ignore_errors=True)
-    volumes_base = os.path.join(temp_dir, "volumes")
 
-    with unittest.mock.patch.object(container_utils, "CONTAINER_VOLUMES_PATH", volumes_base):
-      plugin._configure_file_volumes()
+    plugin.get_data_folder = lambda: temp_dir
+    plugin._configure_file_volumes()
 
     # Only the valid entry should be processed
     self.assertEqual(len(plugin.volumes), 1)
