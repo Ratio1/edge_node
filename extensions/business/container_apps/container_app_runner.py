@@ -295,8 +295,8 @@ _CONFIG = {
 
   # Restart retry configuration (exponential backoff)
   "RESTART_MAX_RETRIES": 5,     # Max consecutive restart attempts before giving up (0 = unlimited)
-  "RESTART_BACKOFF_INITIAL": 2,  # Initial backoff delay in seconds
-  "RESTART_BACKOFF_MAX": 300,    # Maximum backoff delay in seconds (5 minutes)
+  "RESTART_BACKOFF_INITIAL": 10,  # Initial backoff delay in seconds
+  "RESTART_BACKOFF_MAX": 600,    # Maximum backoff delay in seconds (5 minutes)
   "RESTART_BACKOFF_MULTIPLIER": 2,  # Backoff multiplier for exponential backoff
   "RESTART_RESET_INTERVAL": 300,  # Reset retry count after this many seconds of successful run
 
