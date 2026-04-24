@@ -191,11 +191,28 @@ def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None
 
     job_config = archive.get("job_config", {}) or {}
     target_value = job_config.get("target") or job_specs.get("target")
+    # Archived passes store aggregated_report_cid (written by
+    # finalization.py) — not report_cid. The running-branch response
+    # below returns a PassReport CID via the pass's report_cid field.
+    # Both are opaque to current consumers (Navigator doesn't call
+    # /get_analysis; MISP uses aggregated_report_cid directly). Key
+    # name "report_cid" kept stable for API continuity.
+    aggregated_cid = target_pass.get("aggregated_report_cid")
+    if not aggregated_cid:
+      # Archive-integrity anomaly: the pass has no aggregated CID,
+      # which should only happen if the aggregation step failed or
+      # the archive was written by an older, buggy path. Log with a
+      # grep-able [ARCHIVE-INTEGRITY] prefix so operators notice.
+      owner.P(
+        "[ARCHIVE-INTEGRITY] job=%s pass=%s missing aggregated_report_cid"
+        % (job_id, target_pass.get("pass_nr")),
+        color='y',
+      )
     return {
       "job_id": job_id,
       "pass_nr": target_pass.get("pass_nr"),
       "completed_at": target_pass.get("date_completed"),
-      "report_cid": target_pass.get("report_cid"),
+      "report_cid": aggregated_cid,
       "target": target_value,
       "num_workers": len(target_pass.get("worker_reports", {}) or {}),
       "total_passes": len(passes),
