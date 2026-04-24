@@ -243,7 +243,19 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(payload["truncation"]["deduplicated_findings"], 21)
     self.assertEqual(payload["truncation"]["included_by_severity"]["CRITICAL"], 16)
     self.assertGreater(payload["truncation"]["truncated_findings_count"], 0)
-    self.assertTrue(all(len(finding["evidence"]) <= 220 for finding in payload["top_findings"]))
+    # evidence is wrapped in untrusted-data delimiters (Phase 2
+    # prompt-injection hardening). The 220-char budget applies to
+    # content; the wrapper adds ~47 chars of fixed overhead.
+    wrapper_overhead = len("<untrusted_target_data>") + len("</untrusted_target_data>")
+    self.assertTrue(all(
+      len(finding["evidence"]) <= 220 + wrapper_overhead
+      for finding in payload["top_findings"]
+    ))
+    for finding in payload["top_findings"]:
+      ev = finding["evidence"]
+      if ev:
+        self.assertTrue(ev.startswith("<untrusted_target_data>"))
+        self.assertTrue(ev.endswith("</untrusted_target_data>"))
 
   def test_quick_summary_payload_is_smaller_than_security_assessment(self):
     from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin
