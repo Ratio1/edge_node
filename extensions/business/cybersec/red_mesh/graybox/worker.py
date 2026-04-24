@@ -28,6 +28,36 @@ from .models import (
 from .probes.business_logic import BusinessLogicProbes
 
 
+def _first_non_empty_str(values):
+  """Aggregation helper: return the first truthy string in values.
+
+  Used by get_worker_specific_result_fields() to merge top-level
+  string fields (abort_reason, abort_phase) across multiple workers.
+  Empty strings from non-aborted workers should not overwrite a real
+  reason from an aborted peer.
+  """
+  for value in values or []:
+    if isinstance(value, str) and value:
+      return value
+  return ""
+
+
+class GrayboxAbort(Exception):
+  """Signal that the graybox pipeline must stop immediately.
+
+  Raised only from inside phase methods when a fatal safety or policy
+  gate fails (unauthorized target, preflight rejection, unrecoverable
+  auth failure). Caught exclusively by GrayboxLocalWorker.execute_job
+  — do not catch elsewhere. The fatal finding is always recorded via
+  _record_fatal before the exception is raised.
+  """
+
+  def __init__(self, reason: str, reason_class: str = "unknown"):
+    self.reason = reason
+    self.reason_class = reason_class
+    super().__init__(reason)
+
+
 class GrayboxLocalWorker(BaseLocalWorker):
   PHASE_PLAN = (
     ("preflight", "_run_preflight_phase"),
@@ -112,8 +142,19 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "completed_tests": [],
       "done": False,
       "canceled": False,
+      # Safety-gate abort state. Populated only when a preflight /
+      # authorization / auth / session-refresh gate fails and raises
+      # GrayboxAbort. Consumers (UI, archive, LLM analysis) use these
+      # to distinguish a safety-aborted scan from a clean completion.
+      "aborted": False,
+      "abort_reason": "",
+      "abort_phase": "",
     }
+    # _phase_open is only touched on the worker thread — no cross-thread
+    # reads. Guards the finally clause from double-closing a phase that
+    # its owning method already closed explicitly.
     self._phase = ""
+    self._phase_open = False
     self._credentials = GrayboxCredentialSet.from_job_config(job_config)
 
   @classmethod
@@ -157,10 +198,22 @@ class GrayboxLocalWorker(BaseLocalWorker):
       status["canceled"] = self.state["canceled"]
       status["progress"] = self._phase or "initializing"
 
+    # aborted / abort_reason / abort_phase are already present in
+    # self.state and therefore in status via dict(self.state). They
+    # remain available in both running and aggregation-facing
+    # snapshots so finalization and live-progress can distinguish
+    # safety aborts from clean completion.
+
     return status
 
   def execute_job(self):
-    """Preflight → Auth → Discover → Probes → Weak Auth → Cleanup → Done."""
+    """Preflight → Auth → Discover → Probes → Weak Auth → Cleanup → Done.
+
+    Fail-closed: a GrayboxAbort from any phase (raised via _abort when a
+    safety/authorization gate fails) bypasses remaining phases. The
+    aborted state is recorded so downstream consumers can distinguish
+    "scan finished cleanly" from "scan was terminated at a safety gate."
+    """
     discovery_result = DiscoveryResult()
     self.metrics.start_scan(1)
     try:
@@ -168,92 +221,151 @@ class GrayboxLocalWorker(BaseLocalWorker):
       if self._check_stopped():
         return
 
-      auth_ok = self._run_authentication_phase()
-      if not auth_ok:
+      self._run_authentication_phase()
+      if self._check_stopped():
         return
 
-      if not self._check_stopped():
-        discovery_result = self._run_discovery_phase()
+      discovery_result = self._run_discovery_phase()
+      if self._check_stopped():
+        return
 
-      if not self._check_stopped():
-        self._run_probe_phase(discovery_result)
+      self._run_probe_phase(discovery_result)
+      if self._check_stopped():
+        return
 
-      if not self._check_stopped():
-        self._run_weak_auth_phase(discovery_result)
+      self._run_weak_auth_phase(discovery_result)
 
+    except GrayboxAbort as exc:
+      self.state["aborted"] = True
+      self.state["abort_reason"] = exc.reason
+      self.state["abort_phase"] = self._phase
+      self.metrics.record_abort(
+        phase=self._phase, reason_class=exc.reason_class,
+      )
+      # Auditable trail for compliance. Consistent [ABORT-ATTESTATION]
+      # prefix so operators can grep /logs for every aborted scan.
+      self.P(
+        "[ABORT-ATTESTATION] job=%s worker=%s phase=%s reason_class=%s"
+        % (self.job_id, self.local_worker_id,
+           self._phase or "unknown", exc.reason_class),
+        color='y',
+      )
     except Exception as exc:
       self._record_fatal(self.safety.sanitize_error(str(exc)))
     finally:
-      self.auth.cleanup()
-      self.metrics.phase_end(self._phase)
+      self._safe_cleanup()
+      if self._phase_open and self._phase:
+        self.metrics.phase_end(self._phase)
+        self._phase_open = False
       self.state["done"] = True
+
+  def _safe_cleanup(self):
+    """Run auth.cleanup without letting its errors mask an earlier abort."""
+    try:
+      self.auth.cleanup()
+    except Exception as exc:
+      self.P(
+        "[GRAYBOX] auth.cleanup raised during shutdown: %s"
+        % self.safety.sanitize_error(str(exc)),
+        color='y',
+      )
+
+  def _abort(self, reason: str, reason_class: str = "unknown"):
+    """Record a fatal finding and raise GrayboxAbort.
+
+    Parameters
+    ----------
+    reason : str
+      Human-readable explanation. MUST be a worker-produced string
+      (from code we control) — never raw target content (banners,
+      response bodies), because abort_reason is surfaced via
+      get_status() and may reach the LLM payload. Phase 2 of the
+      remediation adds a defense-in-depth sanitizer at the LLM
+      boundary, but the contract here is: don't rely on it.
+    reason_class : str
+      Short stable identifier for metrics grouping (e.g.
+      "unauthorized_target", "preflight_error", "auth_failed").
+    """
+    self._record_fatal(reason)
+    raise GrayboxAbort(reason, reason_class=reason_class)
 
   def _run_preflight_phase(self):
     self._set_phase("preflight")
     self.metrics.phase_start("preflight")
-    target_error = self.safety.validate_target(
-      self.target_url, self.job_config.authorized,
-    )
-    if target_error:
-      self._record_fatal(target_error)
-      return
-
-    preflight_error = self.auth.preflight_check()
-    if preflight_error:
-      self._record_fatal(preflight_error)
-      return
-
-    if not self.job_config.verify_tls:
-      self.P(
-        f"WARNING: TLS verification disabled for {self.target_url}. "
-        "Credentials may be intercepted by a MITM attacker.", color='y'
+    self._phase_open = True
+    try:
+      target_error = self.safety.validate_target(
+        self.target_url, self.job_config.authorized,
       )
-      self._store_findings("_graybox_preflight", [GrayboxFinding(
-        scenario_id="PREFLIGHT-TLS",
-        title="TLS verification disabled",
-        status="inconclusive",
-        severity="LOW",
-        owasp="A02:2021",
-        cwe=["CWE-295"],
-        evidence=[f"verify_tls=False", f"target={self.target_url}"],
-        remediation="Enable TLS verification or use a trusted certificate.",
-      )])
-    self.metrics.phase_end("preflight")
+      if target_error:
+        self._abort(target_error, reason_class="unauthorized_target")
 
-  def _run_authentication_phase(self) -> bool:
+      preflight_error = self.auth.preflight_check()
+      if preflight_error:
+        self._abort(preflight_error, reason_class="preflight_error")
+
+      if not self.job_config.verify_tls:
+        self.P(
+          f"WARNING: TLS verification disabled for {self.target_url}. "
+          "Credentials may be intercepted by a MITM attacker.", color='y'
+        )
+        self._store_findings("_graybox_preflight", [GrayboxFinding(
+          scenario_id="PREFLIGHT-TLS",
+          title="TLS verification disabled",
+          status="inconclusive",
+          severity="LOW",
+          owasp="A02:2021",
+          cwe=["CWE-295"],
+          evidence=[f"verify_tls=False", f"target={self.target_url}"],
+          remediation="Enable TLS verification or use a trusted certificate.",
+        )])
+    finally:
+      self.metrics.phase_end("preflight")
+      self._phase_open = False
+
+  def _run_authentication_phase(self):
     self._set_phase("authentication")
     self.metrics.phase_start("authentication")
-    auth_ok = self.auth.authenticate(self._credentials.official, self._credentials.regular)
-    self._store_auth_results()
-    self.state["completed_tests"].append("graybox_auth")
-    self.metrics.phase_end("authentication")
+    self._phase_open = True
+    try:
+      auth_ok = self.auth.authenticate(
+        self._credentials.official, self._credentials.regular,
+      )
+      self._store_auth_results()
+      self.state["completed_tests"].append("graybox_auth")
+    finally:
+      self.metrics.phase_end("authentication")
+      self._phase_open = False
 
     if not auth_ok:
-      self._record_fatal("Official authentication failed. Cannot proceed with graybox scan.")
-      return False
-    return True
+      self._abort(
+        "Official authentication failed. Cannot proceed with graybox scan.",
+        reason_class="auth_failed",
+      )
 
   def _run_discovery_phase(self) -> DiscoveryResult:
     self._set_phase("discovery")
     self.metrics.phase_start("discovery")
-    if not self._ensure_active_sessions("discovery"):
+    self._phase_open = True
+    try:
+      self._ensure_active_sessions("discovery")
+      result = None
+      discover_result = getattr(self.discovery, "discover_result", None)
+      if callable(discover_result):
+        maybe_result = discover_result(known_routes=self.job_config.app_routes)
+        if isinstance(maybe_result, DiscoveryResult):
+          result = maybe_result
+      if result is None:
+        routes, forms = self.discovery.discover(
+          known_routes=self.job_config.app_routes,
+        )
+        result = DiscoveryResult(routes=routes, forms=forms)
+      self._store_discovery_results(result.routes, result.forms)
+      self.state["completed_tests"].append("graybox_discovery")
+      return result
+    finally:
       self.metrics.phase_end("discovery")
-      return DiscoveryResult()
-    result = None
-    discover_result = getattr(self.discovery, "discover_result", None)
-    if callable(discover_result):
-      maybe_result = discover_result(known_routes=self.job_config.app_routes)
-      if isinstance(maybe_result, DiscoveryResult):
-        result = maybe_result
-    if result is None:
-      routes, forms = self.discovery.discover(
-        known_routes=self.job_config.app_routes,
-      )
-      result = DiscoveryResult(routes=routes, forms=forms)
-    self._store_discovery_results(result.routes, result.forms)
-    self.state["completed_tests"].append("graybox_discovery")
-    self.metrics.phase_end("discovery")
-    return result
+      self._phase_open = False
 
   def _build_probe_kwargs(self, discovery_result: DiscoveryResult) -> dict:
     return GrayboxProbeContext(
@@ -270,32 +382,34 @@ class GrayboxLocalWorker(BaseLocalWorker):
   def _run_probe_phase(self, discovery_result: DiscoveryResult):
     self._set_phase("graybox_probes")
     self.metrics.phase_start("graybox_probes")
-    if not self._ensure_active_sessions("graybox_probes"):
+    self._phase_open = True
+    try:
+      self._ensure_active_sessions("graybox_probes")
+
+      probe_context = self._build_probe_kwargs(discovery_result)
+      excluded_features = set(self.job_config.excluded_features or [])
+      graybox_excluded = "graybox" in excluded_features
+
+      if not graybox_excluded:
+        for probe_def in self._iter_probe_definitions():
+          if self._check_stopped():
+            break
+
+          store_key = probe_def.key
+
+          if store_key in excluded_features:
+            self.metrics.record_probe(store_key, "skipped:disabled")
+            continue
+
+          self._run_registered_probe(probe_def, probe_context)
+      else:
+        for probe_def in self._iter_probe_definitions():
+          self.metrics.record_probe(probe_def.key, "skipped:disabled")
+
+      self.state["completed_tests"].append("graybox_probes")
+    finally:
       self.metrics.phase_end("graybox_probes")
-      return
-
-    probe_context = self._build_probe_kwargs(discovery_result)
-    excluded_features = set(self.job_config.excluded_features or [])
-    graybox_excluded = "graybox" in excluded_features
-
-    if not graybox_excluded:
-      for probe_def in self._iter_probe_definitions():
-        if self._check_stopped():
-          break
-
-        store_key = probe_def.key
-
-        if store_key in excluded_features:
-          self.metrics.record_probe(store_key, "skipped:disabled")
-          continue
-
-        self._run_registered_probe(probe_def, probe_context)
-    else:
-      for probe_def in self._iter_probe_definitions():
-        self.metrics.record_probe(probe_def.key, "skipped:disabled")
-
-    self.state["completed_tests"].append("graybox_probes")
-    self.metrics.phase_end("graybox_probes")
+      self._phase_open = False
 
   def _run_weak_auth_phase(self, discovery_result: DiscoveryResult):
     if (
@@ -304,25 +418,27 @@ class GrayboxLocalWorker(BaseLocalWorker):
     ):
       self._set_phase("weak_auth")
       self.metrics.phase_start("weak_auth")
-      if not self._ensure_active_sessions("weak_auth"):
-        self.metrics.phase_end("weak_auth")
-        return
-      probe_context = self._build_probe_kwargs(discovery_result)
-      bl_probe = BusinessLogicProbes(
-        **dict(probe_context.to_kwargs(), allow_stateful=False),
-      )
+      self._phase_open = True
       try:
-        weak_findings = bl_probe.run_weak_auth(
-          self._credentials.weak_candidates,
-          self._credentials.max_weak_attempts,
+        self._ensure_active_sessions("weak_auth")
+        probe_context = self._build_probe_kwargs(discovery_result)
+        bl_probe = BusinessLogicProbes(
+          **dict(probe_context.to_kwargs(), allow_stateful=False),
         )
-        self._store_findings("_graybox_weak_auth", weak_findings)
-        self.metrics.record_probe("_graybox_weak_auth", "completed")
-      except Exception as exc:
-        self._record_probe_error("_graybox_weak_auth", exc)
-        self.metrics.record_probe("_graybox_weak_auth", "failed")
-      self.state["completed_tests"].append("graybox_weak_auth")
-      self.metrics.phase_end("weak_auth")
+        try:
+          weak_findings = bl_probe.run_weak_auth(
+            self._credentials.weak_candidates,
+            self._credentials.max_weak_attempts,
+          )
+          self._store_findings("_graybox_weak_auth", weak_findings)
+          self.metrics.record_probe("_graybox_weak_auth", "completed")
+        except Exception as exc:
+          self._record_probe_error("_graybox_weak_auth", exc)
+          self.metrics.record_probe("_graybox_weak_auth", "failed")
+        self.state["completed_tests"].append("graybox_weak_auth")
+      finally:
+        self.metrics.phase_end("weak_auth")
+        self._phase_open = False
     elif self._credentials.weak_candidates and "_graybox_weak_auth" in (self.job_config.excluded_features or []):
       self.metrics.record_probe("_graybox_weak_auth", "skipped:disabled")
 
@@ -349,7 +465,15 @@ class GrayboxLocalWorker(BaseLocalWorker):
       return
 
     require_regular = bool(probe_cls.requires_regular_session)
-    if not self._ensure_active_sessions(store_key, require_regular=require_regular):
+    # Per-probe session refresh: a transient auth-refresh failure must
+    # not kill the entire scan. Mark the probe as failed:auth_refresh
+    # and continue with subsequent probes. Phase-level session checks
+    # (discovery/weak_auth) use _ensure_active_sessions which raises
+    # on failure; this call explicitly does not.
+    if not self.auth.ensure_sessions(
+      self._credentials.official,
+      self._credentials.regular if require_regular or self._credentials.regular else None,
+    ):
       self.metrics.record_probe(store_key, "failed:auth_refresh")
       return
 
@@ -368,7 +492,12 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self.metrics.record_probe(store_key, "failed")
 
   def _ensure_active_sessions(self, scope, require_regular=False):
-    """Fail closed if session refresh cannot restore required auth state."""
+    """Fail closed if session refresh cannot restore required auth state.
+
+    Raises GrayboxAbort on failure — the scan cannot continue without
+    an authenticated session. Callers should NOT swallow the exception;
+    it propagates to execute_job's single handler.
+    """
     auth_ok = self.auth.ensure_sessions(
       self._credentials.official,
       self._credentials.regular if require_regular or self._credentials.regular else None,
@@ -377,11 +506,11 @@ class GrayboxLocalWorker(BaseLocalWorker):
       return True
 
     sanitized_scope = scope.replace("_", " ")
-    self._record_fatal(
+    self._abort(
       f"Authentication session refresh failed during {sanitized_scope}. "
-      "Graybox scan cannot continue safely."
+      "Graybox scan cannot continue safely.",
+      reason_class="session_refresh_failed",
     )
-    return False
 
   @staticmethod
   def _normalize_probe_run_result(value) -> GrayboxProbeRunResult:
@@ -487,4 +616,14 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "correlation_findings": list,
       "scan_metrics": dict,
       "ports_scanned": list,
+      # Abort state aggregation (Phase 1):
+      #   aborted:      OR across workers — any aborted → aggregate aborted
+      #   abort_reason: first non-empty wins
+      #   abort_phase:  first non-empty wins
+      # These are top-level strings/bools, so _get_aggregated_report
+      # dispatches them to the else-branch which calls the callable
+      # with [existing, new]; the callables below encode the merge rule.
+      "aborted": any,
+      "abort_reason": _first_non_empty_str,
+      "abort_phase": _first_non_empty_str,
     }
