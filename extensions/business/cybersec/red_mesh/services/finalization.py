@@ -16,6 +16,7 @@ from ..models import AggregatedScanData, PassReport, PassReportRef, WorkerReport
 from ..repositories import ArtifactRepository, JobStateRepository
 from .config import get_attestation_config
 from .config import get_llm_agent_config
+from .scan_strategy import coerce_scan_type, get_scan_strategy
 from .state_machine import is_intermediate_job_status, is_terminal_job_status, set_job_status
 
 
@@ -83,7 +84,28 @@ def maybe_finalize_pass(owner):
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_collecting")
 
       node_reports = owner._collect_node_reports(workers)
-      aggregated = owner._get_aggregated_report(node_reports) if node_reports else {}
+      # Audit #4: resolve the worker class from scan_type so
+      # graybox-specific aggregation fields (graybox_results,
+      # completed_tests, aborted/abort_reason/abort_phase) merge
+      # across multiple graybox workers instead of being dropped
+      # by the default network-worker rules.
+      scan_type_raw = job_specs.get("scan_type")
+      try:
+        strategy = get_scan_strategy(coerce_scan_type(scan_type_raw))
+        worker_cls = strategy.worker_cls
+      except Exception:
+        worker_cls = None
+      aggregated = (
+        owner._get_aggregated_report(node_reports, worker_cls=worker_cls)
+        if node_reports else {}
+      )
+      if node_reports:
+        owner.P(
+          f"[FINALIZE] {job_id} pass {job_pass} aggregating as "
+          f"{scan_type_raw or 'network'} via "
+          f"{worker_cls.__name__ if worker_cls else 'default'} "
+          f"({len(node_reports)} worker reports)"
+        )
 
       risk_score = 0
       flat_findings = []
