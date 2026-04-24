@@ -412,10 +412,10 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self._phase_open = False
 
   def _run_weak_auth_phase(self, discovery_result: DiscoveryResult):
-    if (
-      self._credentials.weak_candidates
-      and "_graybox_weak_auth" not in (self.job_config.excluded_features or [])
-    ):
+    # Single source of truth for the weak-auth gate — shared with
+    # live-progress so the UI never reports "done" while weak-auth
+    # still has work ahead.
+    if GrayboxCredentialSet.weak_auth_enabled(self.job_config):
       self._set_phase("weak_auth")
       self.metrics.phase_start("weak_auth")
       self._phase_open = True
