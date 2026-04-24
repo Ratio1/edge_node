@@ -46,7 +46,7 @@ jobs:
           context: .
           file: ./Dockerfile_devnet
           build-args: |
-            BASE_IMAGE=ratio1/base_edge_node_amd64_gpu:latest
+            BASE_IMAGE=ratio1/base_edge_node_amd64_gpu_new:latest
           push: true
           tags: "ratio1/edge_node_gpu:devnet"
 
@@ -88,7 +88,7 @@ jobs:
           context: .
           file: ./Dockerfile_testnet
           build-args: |
-            BASE_IMAGE=ratio1/base_edge_node_amd64_gpu:latest
+            BASE_IMAGE=ratio1/base_edge_node_amd64_gpu_new:latest
           push: true
           tags: "ratio1/edge_node_gpu:testnet"
 
