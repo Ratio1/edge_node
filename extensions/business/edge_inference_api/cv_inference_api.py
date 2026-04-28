@@ -192,6 +192,7 @@ class CvInferenceApiPlugin(BasePlugin):
         "results": results
       }
 
+    @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict(
         self,
@@ -226,6 +227,7 @@ class CvInferenceApiPlugin(BasePlugin):
         **kwargs
       )
 
+    @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict_async(
         self,
@@ -293,6 +295,10 @@ class CvInferenceApiPlugin(BasePlugin):
         'error': error_message,
         'request_id': request_id,
       }
+      self._annotate_result_with_node_roles(
+        result_payload=request_data['result'],
+        request_data=request_data,
+      )
       request_data['finished_at'] = now_ts
       request_data['updated_at'] = now_ts
       self._metrics['requests_failed'] += 1
@@ -330,6 +336,10 @@ class CvInferenceApiPlugin(BasePlugin):
       request_data['finished_at'] = now_ts
       request_data['updated_at'] = now_ts
       request_data['result'] = inference_payload
+      self._annotate_result_with_node_roles(
+        result_payload=request_data['result'],
+        request_data=request_data,
+      )
       self._metrics['requests_completed'] += 1
       self._metrics['requests_active'] -= 1
       return

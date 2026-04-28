@@ -2,7 +2,7 @@
 TODO: example pipeline with additional explanations
 """
 from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess
-from llama_cpp import Llama
+from llama_cpp import Llama, llama_cpp as llama_cpp_lib
 from extensions.serving.mixins_llm.llm_utils import LlmCT
 
 __VER__ = "0.1.0"
@@ -75,21 +75,40 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     configured_n_gpu_layers = self.cfg_n_gpu_layers
     gpu_info = self.log.gpu_info()
     gpu_available = len(gpu_info) > 0
+    gpu_offload_supported = self._llama_supports_gpu_offload()
     # Initially, only CPU is used.
     n_gpu_layers = 0
     if configured_n_gpu_layers is None:
       # AUTO: If gpu is available attempt to move all layers on GPU
-      n_gpu_layers = -1 if gpu_available else 0
+      if gpu_available and gpu_offload_supported is False:
+        self.P("WARN: GPU detected, but llama-cpp-python was built without GPU offload support. Switching to N_GPU_LAYERS=0.")
+      else:
+        n_gpu_layers = -1 if gpu_available else 0
     else:
       # CONFIGURED: n_gpu_layers provided => check if valid
-      if n_gpu_layers != 0:
-        if gpu_available:
-          n_gpu_layers = configured_n_gpu_layers
-        else:
+      if configured_n_gpu_layers != 0:
+        if not gpu_available:
           self.P(f"WARN: N_GPU_LAYERS={configured_n_gpu_layers}, but GPU not available. Switching to N_GPU_LAYERS=0.")
+        elif gpu_offload_supported is False:
+          self.P(
+            f"WARN: N_GPU_LAYERS={configured_n_gpu_layers}, but llama-cpp-python was built without GPU offload support. "
+            "Switching to N_GPU_LAYERS=0."
+          )
+        else:
+          n_gpu_layers = configured_n_gpu_layers
       # endif n_gpu_layers provided and not 0
     # endif n_gpu_layers auto
     return n_gpu_layers
+
+  def _llama_supports_gpu_offload(self):
+    support_fn = getattr(llama_cpp_lib, 'llama_supports_gpu_offload', None)
+    if not callable(support_fn):
+      return None
+    try:
+      return bool(support_fn())
+    except Exception as exc:
+      self.P(f"WARN: Could not determine llama.cpp GPU offload support: {exc}")
+      return None
 
   def get_default_response_format(self):
     return self.cfg_default_response_format

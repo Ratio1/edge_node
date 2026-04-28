@@ -206,6 +206,20 @@ class LLMInferenceApiPlugin(BasePlugin):
       # endif type checking
 
       def _check_schema(_schema: Any, where: str):
+        """Validate an optional JSON schema inside `response_format`.
+
+        Parameters
+        ----------
+        _schema : Any
+          Candidate schema value.
+        where : str
+          Human-readable schema location used in error messages.
+
+        Returns
+        -------
+        tuple[dict or None, str]
+          Normalized schema and an error message, empty when valid.
+        """
         if _schema is None:
           return None, ""
         if not isinstance(_schema, dict):
@@ -316,6 +330,7 @@ class LLMInferenceApiPlugin(BasePlugin):
 
   """API ENDPOINTS"""
   if True:
+    @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict(
         self,
@@ -370,6 +385,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         **kwargs
       )
 
+    @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict_async(
         self,
@@ -740,6 +756,10 @@ class LLMInferenceApiPlugin(BasePlugin):
         'TEXT_RESPONSE': text_response,
         LlmCT.FULL_OUTPUT: full_output,
       }
+      self._annotate_result_with_node_roles(
+        result_payload=self._requests[request_id]['result'],
+        request_data=request_data,
+      )
       self._requests[request_id]['finished'] = True
       return
 
@@ -814,6 +834,9 @@ class LLMInferenceApiPlugin(BasePlugin):
       response_payload['created'] = int(self.time())
       response_payload['id'] = request_id
       response_payload['model'] = model_name
+      self._annotate_result_with_node_roles(
+        result_payload=response_payload,
+        request_data=request_data,
+      )
       return response_payload
   """END INFERENCE HANDLING"""
-

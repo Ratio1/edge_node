@@ -159,17 +159,37 @@ class SdInferenceApiPlugin(BasePlugin):
       Returns
       -------
       dict
-        Payload fields including struct_data, metadata, and submission info.
+        Payload fields including the raw structured features, metadata, and
+        submission info.
       """
       params = request_data['parameters']
       submitted_at = request_data['created_at']
       metadata = params.get('metadata') or request_data.get('metadata') or {}
-      return {
+      struct_data = params['struct_data']
+      if isinstance(struct_data, dict):
+        struct_payload = {
+          **struct_data,
+          'request_id': request_id,
+          'metadata': metadata,
+        }
+      else:
+        struct_payload = struct_data
+
+      payload_kwargs = {
         'request_id': request_id,
-        'struct_data': params['struct_data'],
         'metadata': metadata,
         'type': params.get('request_type', 'prediction'),
         'submitted_at': submitted_at,
+      }
+
+      # The serving path expects a raw structured sample, but the request
+      # tracker still needs to recover `request_id` and metadata after the
+      # loopback bridge strips the outer wrapper. Embed them into the sample so
+      # the serving codec can ignore them while the inference API can recover
+      # them from the post-loopback input.
+      return {
+        **payload_kwargs,
+        'STRUCT_DATA': struct_payload,
       }
   """END VALIDATION"""
 
@@ -219,6 +239,7 @@ class SdInferenceApiPlugin(BasePlugin):
         "results": results
       }
 
+    @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict(
         self,
@@ -253,6 +274,7 @@ class SdInferenceApiPlugin(BasePlugin):
         **kwargs
       )
 
+    @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict_async(
         self,
@@ -320,6 +342,10 @@ class SdInferenceApiPlugin(BasePlugin):
         'error': error_message,
         'request_id': request_id,
       }
+      self._annotate_result_with_node_roles(
+        result_payload=request_data['result'],
+        request_data=request_data,
+      )
       request_data['finished_at'] = now_ts
       request_data['updated_at'] = now_ts
       self._metrics['requests_failed'] += 1
@@ -357,6 +383,10 @@ class SdInferenceApiPlugin(BasePlugin):
       request_data['finished_at'] = now_ts
       request_data['updated_at'] = now_ts
       request_data['result'] = inference_payload
+      self._annotate_result_with_node_roles(
+        result_payload=request_data['result'],
+        request_data=request_data,
+      )
       self._metrics['requests_completed'] += 1
       self._metrics['requests_active'] -= 1
       return
@@ -426,12 +456,37 @@ class SdInferenceApiPlugin(BasePlugin):
         raise RuntimeError(err_msg)
 
       prediction = inference_data.get('prediction', inference_data.get('result'))
+      if prediction is None:
+        # th_structured returns the decoded structured payload directly rather
+        # than wrapping it under `prediction` or `result`.
+        reserved_keys = {
+          'status',
+          'error',
+          'request_id',
+          'REQUEST_ID',
+          'metadata',
+          'processed_at',
+          'processor_version',
+          'model_name',
+          'scores',
+          'probabilities',
+          'data',
+        }
+        if any(key not in reserved_keys for key in inference_data):
+          prediction = {
+            key: value
+            for key, value in inference_data.items()
+            if key not in reserved_keys
+          }
+      processed_at = inference_data.get('processed_at')
+      if processed_at is None:
+        processed_at = self.time()
       result_payload = {
         'status': 'completed',
         'request_id': request_id,
         'prediction': prediction,
         'metadata': metadata or request_data.get('metadata') or {},
-        'processed_at': inference_data.get('processed_at', self.time()),
+        'processed_at': processed_at,
         'processor_version': inference_data.get('processor_version', 'unknown'),
       }
       if 'model_name' in inference_data:
