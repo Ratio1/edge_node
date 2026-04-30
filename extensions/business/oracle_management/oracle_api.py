@@ -586,7 +586,7 @@ class OracleApiPlugin(BasePlugin):
       tags = self.netmon.get_network_node_tags(node_addr)
       country_code = self.__get_country_code_from_tags(tags)
       if country_code is None:
-        continue
+        country_code = "Unknown"
 
       if country_code not in countries:
         countries[country_code] = {
@@ -598,7 +598,7 @@ class OracleApiPlugin(BasePlugin):
 
       countries[country_code]['count'] += 1
       countries[country_code]['datacenterCount'] += int(any(tag.startswith("DC:") for tag in tags))
-      countries[country_code]['kybCount'] += int(any("KYB" in tag for tag in tags))
+      countries[country_code]['kybCount'] += int(any("IS_KYB" in tags))
       countries_total_items += 1
     # endfor node_addr
 
