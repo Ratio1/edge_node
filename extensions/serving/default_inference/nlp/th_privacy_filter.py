@@ -340,6 +340,7 @@ class ThPrivacyFilter(ThHfModelBase):
       and span["end"] >= span["start"]
     ]
     for span in sorted(sortable_findings, key=lambda item: item["start"], reverse=True):
+      # Fixed-width replacement intentionally avoids leaking original span lengths.
       replacement = "*" * FIXED_CENSOR_SIZE
       censored = censored[:span["start"]] + replacement + censored[span["end"]:]
     return censored

@@ -520,6 +520,7 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     request_data["origin_addr"] = "peer-a"
     request_data["origin_alias"] = "alias-a"
     request_data["origin_instance_id"] = "inst-a"
+    plugin._executor_request_map["peer-a:origin-1"] = request_id  # pylint: disable=protected-access
 
     plugin._publish_executor_results()  # pylint: disable=protected-access
 
@@ -535,8 +536,41 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(result_body["DELEGATOR_NODE_ALIAS"], "alias-a")
     self.assertEqual(result_body["request_id"], "origin-1")
     self.assertNotIn("EXECUTOR_NODE_NETWORK", result_body)
+    self.assertNotIn("peer-a:origin-1", plugin._executor_request_map)  # pylint: disable=protected-access
     self.assertEqual(cleanup_call["hkey"], plugin._request_hkey())  # pylint: disable=protected-access
     self.assertEqual(cleanup_call["extra_peers"], ["peer-a"])
+
+  def test_delegated_executor_replay_does_not_overwrite_existing_request(self):
+    plugin = self._make_plugin(EE_ADDR="peer-b", INSTANCE_ID="inst-b")
+    first = plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=False,
+      _force_local_execution=True,
+      _delegated_execution=True,
+      _delegation_context={
+        "delegation_id": "deleg-1",
+        "origin_request_id": "origin-1",
+        "origin_addr": "peer-a",
+      },
+      metadata={"attempt": 1},
+    )
+    first["marker"] = "original"
+
+    replay = plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=False,
+      _force_local_execution=True,
+      _delegated_execution=True,
+      _delegation_context={
+        "delegation_id": "deleg-1",
+        "origin_request_id": "origin-1",
+        "origin_addr": "peer-a",
+      },
+      metadata={"attempt": 2},
+    )
+
+    self.assertIs(replay, first)
+    self.assertEqual(plugin._requests["deleg-1"]["marker"], "original")  # pylint: disable=protected-access
 
   def test_publish_executor_results_marks_oversized_result_failed_locally(self):
     plugin = self._make_plugin(EE_ADDR="peer-b", INSTANCE_ID="inst-b", REQUEST_BALANCING_MAX_CSTORE_BYTES=4096)

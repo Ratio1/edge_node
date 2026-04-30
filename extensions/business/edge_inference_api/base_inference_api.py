@@ -563,6 +563,24 @@ class BaseInferenceApiPlugin(
       return None
     return f"{origin_addr}:{origin_request_id}"
 
+  def _cleanup_executor_owner_map_for_request(self, request_id):
+    """Remove executor owner-map entries pointing to a local request.
+
+    Parameters
+    ----------
+    request_id : str
+        Local executor request identifier.
+
+    Returns
+    -------
+    None
+        Mutates `_executor_request_map` in place.
+    """
+    for owner_key, mapped_request_id in list(self._executor_request_map.items()):
+      if mapped_request_id == request_id:
+        self._executor_request_map.pop(owner_key, None)
+    return
+
   def _reserve_execution_slot(self, request_id):
     """Reserve a local execution slot for a request.
 
@@ -1186,7 +1204,9 @@ class BaseInferenceApiPlugin(
     Returns
     -------
     bool
-        `True` when the request is terminal, dispatched locally, or delegated.
+        `True` when the request was handled immediately by becoming terminal,
+        dispatching locally, or being delegated. `False` means it still needs
+        queueing or retrying later.
     """
     if self._is_request_terminal(request_data):
       return True
@@ -1304,6 +1324,7 @@ class BaseInferenceApiPlugin(
       result_body.setdefault('error', request_data.get('error'))
     result_body.setdefault('status', request_data.get('status', self.STATUS_FAILED))
     origin_request_id = request_data.get('origin_request_id', request_id)
+    # Executor-local ids must not leak to the origin-facing response body.
     result_body['request_id'] = origin_request_id
     if 'REQUEST_ID' in result_body:
       result_body['REQUEST_ID'] = origin_request_id
@@ -1673,12 +1694,14 @@ class BaseInferenceApiPlugin(
           updated_at=now_ts,
           expires_at=now_ts + self._get_result_balancing_ttl_seconds(),
         )
-      self._chainstore_hset_targeted(
+      ok = self._chainstore_hset_targeted(
         hkey=self._result_hkey(),
         key=request_data.get('delegation_id'),
         value=envelope,
         target_peer=origin_addr,
       )
+      if not ok:
+        continue
       self._cleanup_targeted_cstore_entry(
         hkey=self._request_hkey(),
         key=request_data.get('delegation_id'),
@@ -1686,9 +1709,7 @@ class BaseInferenceApiPlugin(
         mirror_peer=origin_addr,
       )
       request_data['delegated_result_sent_at'] = now_ts
-      owner_key = self._build_executor_owner_key(request_data)
-      if owner_key and self._executor_request_map.get(owner_key) == request_id:
-        self._executor_request_map.pop(owner_key, None)
+      self._cleanup_executor_owner_map_for_request(request_id=request_id)
     return
 
   def _poll_delegated_requests(self):
@@ -1746,18 +1767,19 @@ class BaseInferenceApiPlugin(
           updated_at=now_ts,
           expires_at=now_ts + self._get_result_balancing_ttl_seconds(),
         )
-        self._chainstore_hset_targeted(
+        ok = self._chainstore_hset_targeted(
           hkey=self._result_hkey(),
           key=delegation_id,
           value=result_envelope,
           target_peer=envelope.get('origin_addr'),
         )
-        self._cleanup_targeted_cstore_entry(
-          hkey=self._request_hkey(),
-          key=delegation_id,
-          target_peer=self.ee_addr,
-          mirror_peer=envelope.get('origin_addr'),
-        )
+        if ok:
+          self._cleanup_targeted_cstore_entry(
+            hkey=self._request_hkey(),
+            key=delegation_id,
+            target_peer=self.ee_addr,
+            mirror_peer=envelope.get('origin_addr'),
+          )
         continue
       endpoint_name = request_body.get('endpoint_name')
       endpoint_kwargs = request_body.get('endpoint_kwargs') or {}
@@ -1804,18 +1826,20 @@ class BaseInferenceApiPlugin(
           updated_at=now_ts,
           expires_at=now_ts + self._get_result_balancing_ttl_seconds(),
         )
-        self._chainstore_hset_targeted(
+        ok = self._chainstore_hset_targeted(
           hkey=self._result_hkey(),
           key=delegation_id,
           value=result_envelope,
           target_peer=envelope.get('origin_addr'),
         )
-        self._cleanup_targeted_cstore_entry(
-          hkey=self._request_hkey(),
-          key=delegation_id,
-          target_peer=self.ee_addr,
-          mirror_peer=envelope.get('origin_addr'),
-        )
+        if ok:
+          self._cleanup_targeted_cstore_entry(
+            hkey=self._request_hkey(),
+            key=delegation_id,
+            target_peer=self.ee_addr,
+            mirror_peer=envelope.get('origin_addr'),
+          )
+          self._cleanup_executor_owner_map_for_request(request_id=delegation_id)
     return
 
   def _poll_delegated_results(self):
@@ -1886,6 +1910,16 @@ class BaseInferenceApiPlugin(
     for delegation_id, retention_deadline in list(self._seen_delegation_ids.items()):
       if retention_deadline < now_ts:
         self._seen_delegation_ids.pop(delegation_id, None)
+    for owner_key, request_id in list(self._executor_request_map.items()):
+      request_data = self._requests.get(request_id)
+      if request_data is None:
+        self._executor_request_map.pop(owner_key, None)
+        continue
+      if (
+        self._is_request_terminal(request_data) and
+        (request_data.get('delegated_result_sent_at') is not None or not request_data.get('origin_addr'))
+      ):
+        self._executor_request_map.pop(owner_key, None)
     return
 
   def _reconcile_requests(self):
@@ -2758,6 +2792,16 @@ class BaseInferenceApiPlugin(
 
       if delegated_execution:
         subject = f"delegated:{delegation_context.get('origin_addr', 'peer')}"
+        delegation_id = delegation_context.get('delegation_id')
+        if delegation_id and delegation_id in self._requests:
+          return self._requests[delegation_id]
+        owner_key = self._build_executor_owner_key(delegation_context)
+        mapped_request_id = self._executor_request_map.get(owner_key) if owner_key else None
+        if mapped_request_id:
+          mapped_request = self._requests.get(mapped_request_id)
+          if mapped_request is not None:
+            return mapped_request
+          self._executor_request_map.pop(owner_key, None)
       else:
         try:
           subject = self.authorize_request(authorization)

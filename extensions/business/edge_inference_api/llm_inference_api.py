@@ -671,17 +671,18 @@ class LLMInferenceApiPlugin(BasePlugin):
         Payload keyed for downstream LLM handling.
       """
       request_parameters = request_data['parameters']
+      jeeves_content = {
+        (key.upper() if isinstance(key, str) else key): value
+        for key, value in request_parameters.items()
+      }
+      repeat_penalty = request_parameters.get('repeat_penalty')
+      if repeat_penalty is not None:
+        jeeves_content['REPETITION_PENALTY'] = repeat_penalty
+      jeeves_content.pop('REPEAT_PENALTY', None)
+      jeeves_content[LlmCT.REQUEST_ID] = request_id
+      jeeves_content[LlmCT.REQUEST_TYPE] = 'LLM'
       return {
-        'JEEVES_CONTENT': {
-          LlmCT.REQUEST_ID: request_id,
-          LlmCT.REQUEST_TYPE: 'LLM',
-          LlmCT.MESSAGES: request_parameters.get('messages'),
-          LlmCT.TEMPERATURE: request_parameters.get('temperature'),
-          LlmCT.MAX_TOKENS: request_parameters.get('max_tokens'),
-          LlmCT.TOP_P: request_parameters.get('top_p'),
-          'REPETITION_PENALTY': request_parameters.get('repeat_penalty'),
-          LlmCT.RESPONSE_FORMAT: request_parameters.get('response_format'),
-        }
+        'JEEVES_CONTENT': jeeves_content
       }
   """END PREDICT ENDPOINT HANDLING"""
 
