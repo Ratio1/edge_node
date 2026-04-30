@@ -1,6 +1,6 @@
 # Base image: CPU by default, override with --build-arg BASE_IMAGE=ratio1/base_edge_node_amd64_gpu:latest for GPU
 # The base image provides: Python 3.13, PyTorch, FFmpeg, Docker Engine (DIND), Node.js, uv, and ML/data stack
-ARG BASE_IMAGE=ratio1/base_edge_node_amd64_cpu_new:latest
+ARG BASE_IMAGE=ratio1/base_edge_node_amd64_cpu:latest
 FROM ${BASE_IMAGE}
 
 # Install IPFS (Kubo) — needed for R1FS decentralized file system
