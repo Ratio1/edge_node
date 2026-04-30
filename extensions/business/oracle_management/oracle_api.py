@@ -598,7 +598,7 @@ class OracleApiPlugin(BasePlugin):
 
       countries[country_code]['count'] += 1
       countries[country_code]['datacenterCount'] += int(any(tag.startswith("DC:") for tag in tags))
-      countries[country_code]['kybCount'] += int(any("IS_KYB" in tags))
+      countries[country_code]['kybCount'] += int("IS_KYB" in tags)
       countries_total_items += 1
     # endfor node_addr
 
