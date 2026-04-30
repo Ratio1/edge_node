@@ -15,6 +15,5 @@ pdfplumber
 docker
 aiofiles
 paramiko
-datasets
 # This has been moved to device.py additional_packages list for better compatibility with different devices.
 # llama-cpp-python>=0.2.82

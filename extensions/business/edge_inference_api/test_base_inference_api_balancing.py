@@ -309,6 +309,33 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
 
     self.assertEqual(selected["ee_addr"], "peer-two")
 
+  def test_select_execution_peer_allows_same_node_different_instance(self):
+    plugin = self._make_plugin(INSTANCE_ID="inst-a")
+    plugin.chainstore_hgetall_values[plugin._capacity_hkey()] = {
+      "same-instance": {
+        "ee_addr": plugin.ee_addr,
+        "pipeline": plugin.get_stream_id(),
+        "signature": plugin.get_signature(),
+        "instance_id": plugin.get_instance_id(),
+        "balancer_group": plugin._normalize_balancing_group(),
+        "capacity_free": 5,
+        "updated_at": plugin.time(),
+      },
+      "same-node-other-instance": {
+        "ee_addr": plugin.ee_addr,
+        "pipeline": plugin.get_stream_id(),
+        "signature": plugin.get_signature(),
+        "instance_id": "inst-b",
+        "balancer_group": plugin._normalize_balancing_group(),
+        "capacity_free": 1,
+        "updated_at": plugin.time(),
+      },
+    }
+
+    selected = plugin._select_execution_peer()  # pylint: disable=protected-access
+
+    self.assertEqual(selected["instance_id"], "inst-b")
+
   def test_write_delegated_request_targets_only_executor(self):
     plugin = self._make_plugin()
     request_id, request_data = plugin.register_request(
@@ -334,8 +361,29 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(write_call["extra_peers"], ["peer-b"])
     self.assertFalse(write_call["include_default_peers"])
     self.assertFalse(write_call["include_configured_peers"])
-    self.assertNotIn("timeout", write_call)
-    self.assertNotIn("max_retries", write_call)
+    self.assertEqual(write_call["timeout"], 2.0)
+    self.assertEqual(write_call["max_retries"], 0)
+
+  def test_write_delegated_request_rejects_unserializable_parameters_cleanly(self):
+    plugin = self._make_plugin()
+    request_id, request_data = plugin.register_request(
+      subject="anonymous",
+      parameters={"bad": object()},
+      metadata={},
+    )
+
+    delegation_id, err = plugin._write_delegated_request(  # pylint: disable=protected-access
+      request_id=request_id,
+      request_data=request_data,
+      target_record={
+        "ee_addr": "peer-b",
+        "instance_id": "inst-b",
+      },
+      endpoint_name="predict",
+    )
+
+    self.assertIsNone(delegation_id)
+    self.assertIn("could not encode delegated request envelope", err)
 
   def test_predict_entrypoint_queues_when_full_and_no_peer(self):
     plugin = self._make_plugin()
@@ -351,6 +399,54 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(len(plugin._pending_request_ids), 1)  # pylint: disable=protected-access
     request_id = result["request_id"]
     self.assertEqual(plugin._requests[request_id]["queue_state"], "queued")  # pylint: disable=protected-access
+
+  def test_predict_entrypoint_fails_cleanly_when_delegated_request_cannot_encode(self):
+    plugin = self._make_plugin()
+    plugin._active_execution_slots.add("busy")  # pylint: disable=protected-access
+    plugin.chainstore_hgetall_values[plugin._capacity_hkey()] = {
+      "peer-b": {
+        "ee_addr": "peer-b",
+        "pipeline": plugin.get_stream_id(),
+        "signature": plugin.get_signature(),
+        "instance_id": "inst-b",
+        "balancer_group": plugin._normalize_balancing_group(),
+        "capacity_free": 1,
+        "updated_at": plugin.time(),
+      },
+    }
+
+    result = plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=True,
+      bad=object(),
+    )
+
+    self.assertEqual(result["status"], plugin.STATUS_FAILED)
+    self.assertIn("could not encode delegated request envelope", result["error"])
+    self.assertEqual(len(plugin._pending_request_ids), 0)  # pylint: disable=protected-access
+
+  def test_delegated_executor_uses_delegation_id_and_returns_tracked_request(self):
+    plugin = self._make_plugin(EE_ADDR="peer-b", INSTANCE_ID="inst-b")
+
+    result = plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=False,
+      _force_local_execution=True,
+      _delegated_execution=True,
+      _delegation_context={
+        "delegation_id": "deleg-1",
+        "origin_request_id": "origin-1",
+        "origin_addr": "peer-a",
+        "origin_alias": "alias-a",
+        "origin_instance_id": "inst-a",
+      },
+      metadata={"source": "delegated"},
+    )
+
+    self.assertIs(result, plugin._requests["deleg-1"])  # pylint: disable=protected-access
+    self.assertNotIn("postponed", result)
+    self.assertEqual(result["origin_request_id"], "origin-1")
+    self.assertEqual(plugin.payloads[-1]["REQUEST_ID"], "deleg-1")
 
   def test_poll_delegated_results_updates_origin_request_and_cleans_mailbox(self):
     plugin = self._make_plugin()
@@ -437,9 +533,53 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(result_body["EXECUTOR_NODE_ALIAS"], "node-alias-a")
     self.assertEqual(result_body["DELEGATOR_NODE_ADDR"], "peer-a")
     self.assertEqual(result_body["DELEGATOR_NODE_ALIAS"], "alias-a")
+    self.assertEqual(result_body["request_id"], "origin-1")
     self.assertNotIn("EXECUTOR_NODE_NETWORK", result_body)
     self.assertEqual(cleanup_call["hkey"], plugin._request_hkey())  # pylint: disable=protected-access
     self.assertEqual(cleanup_call["extra_peers"], ["peer-a"])
+
+  def test_publish_executor_results_marks_oversized_result_failed_locally(self):
+    plugin = self._make_plugin(EE_ADDR="peer-b", INSTANCE_ID="inst-b", REQUEST_BALANCING_MAX_CSTORE_BYTES=4096)
+    request_id, request_data = plugin.register_request(
+      subject="delegated:peer-a",
+      parameters={},
+      metadata={},
+      request_id="deleg-1",
+    )
+    request_data["status"] = plugin.STATUS_COMPLETED
+    request_data["result"] = {
+      "status": plugin.STATUS_COMPLETED,
+      "request_id": "deleg-1",
+      "blob": [f"value-{idx}" for idx in range(3000)],
+    }
+    request_data["delegated_execution"] = True
+    request_data["delegation_id"] = "deleg-1"
+    request_data["origin_request_id"] = "origin-1"
+    request_data["origin_addr"] = "peer-a"
+    plugin._metrics["requests_completed"] = 1  # pylint: disable=protected-access
+
+    plugin._publish_executor_results()  # pylint: disable=protected-access
+
+    self.assertEqual(request_data["status"], plugin.STATUS_FAILED)
+    self.assertEqual(plugin._metrics["requests_completed"], 0)  # pylint: disable=protected-access
+    self.assertEqual(plugin._metrics["requests_failed"], 1)  # pylint: disable=protected-access
+    result_body = plugin._decode_transport_envelope_body(  # pylint: disable=protected-access
+      plugin.chainstore_hset_calls[-2]["value"]
+    )
+    self.assertEqual(result_body["request_id"], "origin-1")
+    self.assertIn("transport limit", result_body["error"])
+
+  def test_cleanup_balancing_state_uses_retention_deadline(self):
+    plugin = self._make_plugin(NOW=100.0)
+    plugin._seen_delegation_ids = {  # pylint: disable=protected-access
+      "expired": 99.0,
+      "retained": 101.0,
+    }
+
+    plugin._cleanup_balancing_state()  # pylint: disable=protected-access
+
+    self.assertNotIn("expired", plugin._seen_delegation_ids)  # pylint: disable=protected-access
+    self.assertIn("retained", plugin._seen_delegation_ids)  # pylint: disable=protected-access
 
   def test_fail_request_adds_executor_and_delegator_identity_inside_result(self):
     plugin = self._make_plugin(EE_ADDR="node-x", EE_ID="alias-x", ETH_ADDRESS="0xeth-x")

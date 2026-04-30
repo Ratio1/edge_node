@@ -232,6 +232,7 @@ class TextClassifierInferenceApiPlugin(BasePlugin):
         "results": results,
       }
 
+    # Override only to attach balanced endpoint metadata to the inherited handler.
     @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict(
@@ -267,6 +268,7 @@ class TextClassifierInferenceApiPlugin(BasePlugin):
         **kwargs
       )
 
+    # Override only to attach balanced endpoint metadata to the inherited handler.
     @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict_async(
@@ -330,7 +332,7 @@ class TextClassifierInferenceApiPlugin(BasePlugin):
       request_data["finished_at"] = now_ts
       request_data["updated_at"] = now_ts
       self._metrics["requests_failed"] += 1
-      self._metrics["requests_active"] -= 1
+      self._decrement_active_requests()
       return
 
     def _mark_request_completed(
@@ -353,7 +355,7 @@ class TextClassifierInferenceApiPlugin(BasePlugin):
         request_data=request_data,
       )
       self._metrics["requests_completed"] += 1
-      self._metrics["requests_active"] -= 1
+      self._decrement_active_requests()
       return
 
     def _extract_request_id(self, payload: Optional[Dict[str, Any]], inference: Any):

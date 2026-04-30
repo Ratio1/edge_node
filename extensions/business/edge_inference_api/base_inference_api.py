@@ -488,6 +488,81 @@ class BaseInferenceApiPlugin(
     """
     return self._get_capacity_free() > 0
 
+  def _decrement_active_requests(self):
+    """Decrease the active request metric without allowing underflow.
+
+    Returns
+    -------
+    None
+        Updates the in-memory active request counter.
+    """
+    self._metrics['requests_active'] = max(0, self._metrics.get('requests_active', 0) - 1)
+    return
+
+  def _is_current_instance_capacity_record(self, record):
+    """Return whether a capacity record belongs to this plugin instance.
+
+    Parameters
+    ----------
+    record : dict
+        Capacity record read from ChainStore.
+
+    Returns
+    -------
+    bool
+        `True` when the record identifies this exact node, stream, signature,
+        and instance.
+    """
+    if not isinstance(record, dict):
+      return False
+    return (
+      record.get('ee_addr') == self.ee_addr and
+      record.get('pipeline') == self.get_stream_id() and
+      record.get('signature') == self.get_signature() and
+      record.get('instance_id') == self.get_instance_id()
+    )
+
+  def _get_seen_delegation_deadline(self, envelope, now_ts):
+    """Return the retention deadline for a consumed delegation id.
+
+    Parameters
+    ----------
+    envelope : dict
+        Delegated request envelope.
+    now_ts : float
+        Current timestamp.
+
+    Returns
+    -------
+    float
+        Timestamp after which the delegation id can be forgotten.
+    """
+    expires_at = envelope.get('expires_at') if isinstance(envelope, dict) else None
+    if isinstance(expires_at, (int, float)):
+      base_ts = max(float(expires_at), now_ts)
+    else:
+      base_ts = now_ts
+    return base_ts + self._get_request_balancing_ttl_seconds()
+
+  def _build_executor_owner_key(self, delegation_context):
+    """Build the origin ownership key for executor-side delegated work.
+
+    Parameters
+    ----------
+    delegation_context : dict
+        Delegation metadata copied from the request envelope.
+
+    Returns
+    -------
+    str or None
+        Stable origin/request key, or `None` when required metadata is missing.
+    """
+    origin_addr = delegation_context.get('origin_addr')
+    origin_request_id = delegation_context.get('origin_request_id')
+    if not origin_addr or not origin_request_id:
+      return None
+    return f"{origin_addr}:{origin_request_id}"
+
   def _reserve_execution_slot(self, request_id):
     """Reserve a local execution slot for a request.
 
@@ -743,6 +818,8 @@ class BaseInferenceApiPlugin(
       extra_peers=[target_peer],
       include_default_peers=False,
       include_configured_peers=False,
+      timeout=self._get_capacity_cstore_timeout(),
+      max_retries=self._get_capacity_cstore_max_retries(),
     )
 
   def _cleanup_targeted_cstore_entry(self, hkey, key, target_peer, mirror_peer=None):
@@ -794,7 +871,7 @@ class BaseInferenceApiPlugin(
     for record in records.values():
       if not isinstance(record, dict):
         continue
-      if record.get('ee_addr') == self.ee_addr:
+      if self._is_current_instance_capacity_record(record):
         continue
       if record.get('balancer_group') != self._normalize_balancing_group():
         continue
@@ -930,20 +1007,25 @@ class BaseInferenceApiPlugin(
     tuple[str or None, str or None]
         Delegation id on success, otherwise `None` and an error message.
     """
-    delegation_id, envelope, encoded_size = self._build_delegated_request_envelope(
-      request_id=request_id,
-      request_data=request_data,
-      target_record=target_record,
-      endpoint_name=endpoint_name,
-    )
+    try:
+      delegation_id, envelope, encoded_size = self._build_delegated_request_envelope(
+        request_id=request_id,
+        request_data=request_data,
+        target_record=target_record,
+        endpoint_name=endpoint_name,
+      )
+    except Exception as exc:
+      return None, f"could not encode delegated request envelope: {exc}"
     if encoded_size > self._get_max_cstore_bytes():
       return None, 'encoded request envelope exceeds balancing transport limit'
-    self._chainstore_hset_targeted(
+    ok = self._chainstore_hset_targeted(
       hkey=self._request_hkey(),
       key=delegation_id,
       value=envelope,
       target_peer=target_record['ee_addr'],
     )
+    if not ok:
+      return None, 'delegated request write was not confirmed'
     request_data['delegation_id'] = delegation_id
     request_data['delegation_target_addr'] = target_record['ee_addr']
     request_data['delegation_target_instance_id'] = target_record.get('instance_id')
@@ -991,7 +1073,7 @@ class BaseInferenceApiPlugin(
       request_data['status'] = self.STATUS_FAILED
       request_data['error'] = result_body.get('error', 'Delegated request failed.')
       self._metrics['requests_failed'] += 1
-    self._metrics['requests_active'] = max(0, self._metrics['requests_active'] - 1)
+    self._decrement_active_requests()
     return
 
   def _is_request_terminal(self, request_data):
@@ -1086,7 +1168,7 @@ class BaseInferenceApiPlugin(
       self._metrics['requests_timeout'] += 1
     else:
       self._metrics['requests_failed'] += 1
-    self._metrics['requests_active'] = max(0, self._metrics['requests_active'] - 1)
+    self._decrement_active_requests()
     return True
 
   def _attempt_schedule_request(self, request_id, request_data, endpoint_name):
@@ -1124,7 +1206,8 @@ class BaseInferenceApiPlugin(
     )
     if delegation_id is None:
       self.Pd(f"Could not delegate request {request_id}: {err}")
-      return False
+      self._fail_request(request_id=request_id, error_message=err)
+      return True
     return True
 
   def _schedule_pending_requests(self):
@@ -1215,10 +1298,15 @@ class BaseInferenceApiPlugin(
       'error': request_data.get('error', 'Delegated execution failed.'),
       'request_id': request_data.get('origin_request_id', request_id),
     }
+    if isinstance(result_body, dict):
+      result_body = dict(result_body)
     if request_data.get('status') in {self.STATUS_FAILED, self.STATUS_TIMEOUT}:
       result_body.setdefault('error', request_data.get('error'))
     result_body.setdefault('status', request_data.get('status', self.STATUS_FAILED))
-    result_body.setdefault('request_id', request_data.get('origin_request_id', request_id))
+    origin_request_id = request_data.get('origin_request_id', request_id)
+    result_body['request_id'] = origin_request_id
+    if 'REQUEST_ID' in result_body:
+      result_body['REQUEST_ID'] = origin_request_id
     self._annotate_result_with_node_roles(
       result_payload=result_body,
       request_data=request_data,
@@ -1258,6 +1346,40 @@ class BaseInferenceApiPlugin(
       'request_id': request_data.get('origin_request_id', request_id),
       'error': 'encoded result envelope exceeds balancing transport limit',
     }
+
+  def _mark_executor_result_overflow(self, request_id, request_data, now_ts):
+    """Mark an executor-side delegated result as failed due to envelope size.
+
+    Parameters
+    ----------
+    request_id : str
+        Local executor request identifier.
+    request_data : dict
+        Tracked executor request metadata.
+    now_ts : float
+        Current timestamp.
+
+    Returns
+    -------
+    dict
+        Compact failure result body to publish back to the origin.
+    """
+    previous_status = request_data.get('status')
+    overflow_body = self._build_result_overflow_body(request_id, request_data)
+    if previous_status == self.STATUS_COMPLETED:
+      self._metrics['requests_completed'] = max(0, self._metrics.get('requests_completed', 0) - 1)
+      self._metrics['requests_failed'] += 1
+    elif previous_status == self.STATUS_TIMEOUT:
+      self._metrics['requests_timeout'] = max(0, self._metrics.get('requests_timeout', 0) - 1)
+      self._metrics['requests_failed'] += 1
+    elif previous_status != self.STATUS_FAILED:
+      self._metrics['requests_failed'] += 1
+    request_data['status'] = self.STATUS_FAILED
+    request_data['error'] = overflow_body['error']
+    request_data['result'] = overflow_body
+    request_data['updated_at'] = now_ts
+    request_data['finished_at'] = now_ts
+    return overflow_body
 
   def _build_node_identity(self, role, node_addr=None, node_alias=None):
     """Build node-role fields for a result payload.
@@ -1532,7 +1654,11 @@ class BaseInferenceApiPlugin(
         request_data=request_data,
       )
       if encoded_size > self._get_max_cstore_bytes():
-        overflow_body = self._build_result_overflow_body(request_id, request_data)
+        overflow_body = self._mark_executor_result_overflow(
+          request_id=request_id,
+          request_data=request_data,
+          now_ts=now_ts,
+        )
         envelope, _ = self._build_transport_envelope(
           overflow_body,
           kind='result',
@@ -1560,6 +1686,9 @@ class BaseInferenceApiPlugin(
         mirror_peer=origin_addr,
       )
       request_data['delegated_result_sent_at'] = now_ts
+      owner_key = self._build_executor_owner_key(request_data)
+      if owner_key and self._executor_request_map.get(owner_key) == request_id:
+        self._executor_request_map.pop(owner_key, None)
     return
 
   def _poll_delegated_requests(self):
@@ -1634,9 +1763,9 @@ class BaseInferenceApiPlugin(
       endpoint_kwargs = request_body.get('endpoint_kwargs') or {}
       handler = getattr(self, endpoint_name, None)
       if not callable(handler):
-        self._seen_delegation_ids[delegation_id] = now_ts
+        self._seen_delegation_ids[delegation_id] = self._get_seen_delegation_deadline(envelope, now_ts)
         continue
-      self._seen_delegation_ids[delegation_id] = now_ts
+      self._seen_delegation_ids[delegation_id] = self._get_seen_delegation_deadline(envelope, now_ts)
       result = handler(
         authorization=None,
         _force_local_execution=True,
@@ -1754,9 +1883,8 @@ class BaseInferenceApiPlugin(
     if not self._is_balancing_enabled():
       return
     now_ts = self.time()
-    seen_cutoff = now_ts - self._get_request_balancing_ttl_seconds()
-    for delegation_id, seen_at in list(self._seen_delegation_ids.items()):
-      if seen_at < seen_cutoff:
+    for delegation_id, retention_deadline in list(self._seen_delegation_ids.items()):
+      if retention_deadline < now_ts:
         self._seen_delegation_ids.pop(delegation_id, None)
     return
 
@@ -2209,7 +2337,7 @@ class BaseInferenceApiPlugin(
         request_data=request_data,
       )
       self._metrics['requests_failed'] += 1
-      self._metrics['requests_active'] -= 1
+      self._decrement_active_requests()
       return True
 
     def maybe_mark_request_timeout(self, request_id: str, request_data: Dict[str, Any]):
@@ -2253,7 +2381,7 @@ class BaseInferenceApiPlugin(
         request_data=request_data,
       )
       self._metrics['requests_timeout'] += 1
-      self._metrics['requests_active'] -= 1
+      self._decrement_active_requests()
       return True
 
     def solve_postponed_request(self, request_id: str):
@@ -2650,17 +2778,23 @@ class BaseInferenceApiPlugin(
       if 'metadata' in parameters:
         metadata = parameters.pop('metadata') or {}
       # endif 'metadata' in parameters
+      request_id_override = None
+      if delegated_execution:
+        request_id_override = delegation_context.get('delegation_id')
       request_id, request_data = self.register_request(
         subject=subject,
         parameters=parameters,
         metadata=metadata,
         timeout=parameters.get('timeout'),
-        request_id=delegation_context.get('origin_request_id'),
+        request_id=request_id_override,
       )
       request_data['endpoint_name'] = endpoint_name
       request_data['async_request'] = async_request
 
       if delegated_execution:
+        owner_key = self._build_executor_owner_key(delegation_context)
+        if owner_key:
+          self._executor_request_map[owner_key] = request_id
         request_data['delegated_execution'] = True
         request_data['delegation_id'] = delegation_context.get('delegation_id')
         request_data['origin_request_id'] = delegation_context.get('origin_request_id', request_id)
@@ -2696,6 +2830,8 @@ class BaseInferenceApiPlugin(
           request_data=request_data,
         )
 
+      if delegated_execution or force_local_execution:
+        return request_data
       if async_request:
         response = {
           'request_id': request_id,

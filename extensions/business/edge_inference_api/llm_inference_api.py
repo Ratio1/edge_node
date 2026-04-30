@@ -330,6 +330,7 @@ class LLMInferenceApiPlugin(BasePlugin):
 
   """API ENDPOINTS"""
   if True:
+    # Override only to attach balanced endpoint metadata to the inherited handler.
     @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict(
@@ -385,6 +386,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         **kwargs
       )
 
+    # Override only to attach balanced endpoint metadata to the inherited handler.
     @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict_async(
@@ -670,16 +672,92 @@ class LLMInferenceApiPlugin(BasePlugin):
       """
       request_parameters = request_data['parameters']
       return {
-        'jeeves_content': {
-          'REQUEST_ID': request_id,
-          'request_type': 'LLM',
-          **request_parameters,
+        'JEEVES_CONTENT': {
+          LlmCT.REQUEST_ID: request_id,
+          LlmCT.REQUEST_TYPE: 'LLM',
+          LlmCT.MESSAGES: request_parameters.get('messages'),
+          LlmCT.TEMPERATURE: request_parameters.get('temperature'),
+          LlmCT.MAX_TOKENS: request_parameters.get('max_tokens'),
+          LlmCT.TOP_P: request_parameters.get('top_p'),
+          'REPETITION_PENALTY': request_parameters.get('repeat_penalty'),
+          LlmCT.RESPONSE_FORMAT: request_parameters.get('response_format'),
         }
       }
   """END PREDICT ENDPOINT HANDLING"""
 
   """INFERENCE HANDLING"""
   if True:
+    def _extract_request_id_from_inference(self, inference):
+      """
+      Extract request id from LLM serving outputs while tolerating legacy key
+      casing and nested additional metadata.
+      """
+      if not isinstance(inference, dict):
+        return None
+      for key in [LlmCT.REQUEST_ID, 'request_id', 'id']:
+        value = inference.get(key)
+        if isinstance(value, str) and value:
+          return value
+      additional = inference.get(LlmCT.ADDITIONAL) or inference.get('additional')
+      if isinstance(additional, dict):
+        for key in [LlmCT.REQUEST_ID, 'request_id', 'id']:
+          value = additional.get(key)
+          if isinstance(value, str) and value:
+            return value
+      return None
+
+    def _get_single_pending_request_id(self):
+      """
+      Return the only pending request id when attribution is unambiguous.
+
+      Some LLM serving backends can produce a valid text result while omitting
+      the request metadata. The API dispatches one local LLM request at a time
+      for this flow, so a single pending request is a safe fallback target.
+      """
+      pending_status = getattr(self, "STATUS_PENDING", "pending")
+      pending_ids = [
+        request_id
+        for request_id, request_data in self._requests.items()
+        if request_data.get("status") == pending_status
+      ]
+      return pending_ids[0] if len(pending_ids) == 1 else None
+
+    def _has_text_result(self, inference):
+      text_value = inference.get(LlmCT.TEXT, None)
+      if isinstance(text_value, str) and len(text_value) > 0:
+        return True
+      full_output = inference.get(LlmCT.FULL_OUTPUT, None)
+      return full_output is not None
+
+    def filter_valid_inference(self, inference):
+      if not isinstance(inference, dict):
+        return False
+      if not inference.get("IS_VALID", True):
+        if not self._has_text_result(inference=inference):
+          self.P(f"Rejected invalid LLM inference without text output: {self.shorten_str(inference)}")
+          return False
+        self.P("Accepting text-bearing LLM inference despite IS_VALID=False.")
+      request_id = self._extract_request_id_from_inference(inference)
+      if request_id is None:
+        request_id = self._get_single_pending_request_id()
+        if request_id is None:
+          self.P(f"Rejected LLM inference without request id: {self.shorten_str(inference)}")
+          return False
+        self.P(f"Mapped request-id-less LLM inference to pending request {request_id}.")
+      inference[LlmCT.REQUEST_ID] = request_id
+      is_known = request_id in self._requests
+      if not is_known:
+        fallback_request_id = self._get_single_pending_request_id()
+        if fallback_request_id is not None:
+          self.P(
+            f"Mapped LLM inference with unknown request id {request_id} "
+            f"to pending request {fallback_request_id}."
+          )
+          inference[LlmCT.REQUEST_ID] = fallback_request_id
+          return True
+        self.P(f"Rejected LLM inference for unknown request id {request_id}: {self.shorten_str(inference)}")
+      return is_known
+
     def inference_to_response(self, inference, model_name, input_data=None):
       """
       Convert inference output into a lightweight response structure.
@@ -745,7 +823,7 @@ class LLMInferenceApiPlugin(BasePlugin):
       request_data['finished_at'] = self.time()
       request_data['updated_at'] = request_data['finished_at']
       self._metrics['requests_completed'] += 1
-      self._metrics['requests_active'] -= 1
+      self._decrement_active_requests()
 
       text_response = inference.get(LlmCT.TEXT, None)
       full_output = inference.get(LlmCT.FULL_OUTPUT, None)
