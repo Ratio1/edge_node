@@ -26,6 +26,10 @@ class MetricsCollector:
     self._finding_counts = {}
     # For success rate over time windows
     self._connection_log = []  # [(timestamp, success_bool)]
+    # Aborts: fatal safety/policy gate failures that stop the scan.
+    # Tracked separately from probe_failed because the abort is the
+    # reason the scan stopped, not a per-probe outcome.
+    self._aborts = []  # [{"phase": str, "reason_class": str, "ts": float}]
 
   def start_scan(self, ports_in_range: int):
     self._scan_start = time.time()
@@ -62,6 +66,17 @@ class MetricsCollector:
 
   def record_finding(self, severity: str):
     self._finding_counts[severity] = self._finding_counts.get(severity, 0) + 1
+
+  def record_abort(self, phase: str, reason_class: str):
+    self._aborts.append({
+      "phase": phase or "",
+      "reason_class": reason_class or "unknown",
+      "ts": time.time(),
+    })
+
+  @property
+  def abort_count(self) -> int:
+    return len(self._aborts)
 
   def _compute_stats(self, values: list) -> dict | None:
     if not values:

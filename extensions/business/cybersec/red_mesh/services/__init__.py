@@ -4,6 +4,13 @@ from .config import (
   get_llm_agent_config,
   resolve_config_block,
 )
+from .misp_config import get_misp_export_config
+from .misp_export import (
+  build_misp_event,
+  export_misp_json,
+  get_misp_export_status,
+  push_to_misp,
+)
 from .control import (
   purge_job,
   stop_and_delete_job,
@@ -71,6 +78,11 @@ __all__ = [
   "get_attestation_config",
   "get_graybox_budgets_config",
   "get_llm_agent_config",
+  "get_misp_export_config",
+  "build_misp_event",
+  "export_misp_json",
+  "get_misp_export_status",
+  "push_to_misp",
   "resolve_config_block",
   "announce_launch",
   "build_network_workers",
