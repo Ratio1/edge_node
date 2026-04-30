@@ -552,6 +552,67 @@ class OracleApiPlugin(BasePlugin):
     })
     return response
 
+  @staticmethod
+  def __get_country_code_from_tags(tags):
+    """
+    Extract the ISO-2 country code from node tags.
+    """
+    for tag in tags:
+      if tag.startswith("CT:"):
+        country_code = tag[3:].strip().upper()
+        return country_code or None
+    return None
+
+  @BasePlugin.endpoint
+  # /active_nodes_country_stats
+  def active_nodes_country_stats(self):
+    """
+    Returns active node counts grouped by country.
+
+    This endpoint is intentionally aggregated for map/list views that only need
+    location totals and should not load the full active node payload.
+    """
+    start = self.time()
+    error = None
+    countries = {}
+    total_items = 0
+    countries_total_items = 0
+
+    node_addresses = self.netmon.epoch_manager.get_node_list()
+    for node_addr in node_addresses:
+      if not self.netmon.network_node_is_online(node_addr):
+        continue
+      total_items += 1
+      tags = self.netmon.get_network_node_tags(node_addr)
+      country_code = self.__get_country_code_from_tags(tags)
+      if country_code is None:
+        continue
+
+      if country_code not in countries:
+        countries[country_code] = {
+          'code': country_code,
+          'count': 0,
+          'datacenterCount': 0,
+          'kybCount': 0,
+        }
+
+      countries[country_code]['count'] += 1
+      countries[country_code]['datacenterCount'] += int(any(tag.startswith("DC:") for tag in tags))
+      countries[country_code]['kybCount'] += int(any("KYB" in tag for tag in tags))
+      countries_total_items += 1
+    # endfor node_addr
+
+    countries = sorted(countries.values(), key=lambda country: (-country['count'], country['code']))
+    elapsed = self.time() - start
+    response = self.__get_response({
+      'error': error,
+      'countries': countries,
+      'nodes_total_items': total_items,
+      'countries_total_items': countries_total_items,
+      'query_time': round(elapsed, 2),
+    })
+    return response
+
 
   @BasePlugin.endpoint
   def node_epochs_range(
