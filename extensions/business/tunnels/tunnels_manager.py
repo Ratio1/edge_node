@@ -34,7 +34,8 @@ class TunnelsManagerPlugin(BasePlugin):
     return
 
   def on_init(self):
-    super(TunnelsManagerPlugin, self).on_init()    
+    super(TunnelsManagerPlugin, self).on_init()
+    self.chainstore_hsync(hkey="tunnels_manager_secrets")  # warm up the cache
     return
 
   def _cloudflare_update_metadata(self, tunnel_id: str, metadata: dict, cloudflare_account_id: str, cloudflare_api_key: str):
