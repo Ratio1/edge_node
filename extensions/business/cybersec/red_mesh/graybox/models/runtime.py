@@ -44,6 +44,19 @@ class GrayboxCredentialSet:
       max_weak_attempts=int(getattr(job_config, "max_weak_attempts", 5) or 5),
     )
 
+  @staticmethod
+  def weak_auth_enabled(job_config) -> bool:
+    """Pure predicate: does this job_config enable weak-auth probing?
+
+    Single source of truth for the "weak-auth will run" decision.
+    Used by both the worker phase gate and live-progress phase
+    resolution so the UI never reports a scan done while weak-auth
+    still has work to do.
+    """
+    creds = GrayboxCredentialSet.from_job_config(job_config)
+    excluded = set(getattr(job_config, "excluded_features", None) or [])
+    return bool(creds.weak_candidates) and "_graybox_weak_auth" not in excluded
+
 
 @dataclass(frozen=True)
 class DiscoveryResult:

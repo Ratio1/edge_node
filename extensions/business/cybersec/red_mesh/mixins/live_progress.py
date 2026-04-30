@@ -5,26 +5,40 @@ Handles real-time scan progress publishing to the CStore `:live` hset
 and merging of scan metrics across worker threads.
 """
 
+from ..graybox.models import GrayboxCredentialSet
 from ..models import WorkerProgress
 from ..constants import PHASE_ORDER, GRAYBOX_PHASE_ORDER
 
 DEFAULT_PROGRESS_PUBLISH_INTERVAL = 30.0
 
 
-def _thread_phase(state):
+def _thread_phase(state, worker):
   """Determine which phase a single thread is currently in.
 
-  Supports both network and webapp (graybox) scan types. Network
-  scans use the existing phase markers. Webapp scans use graybox_*
-  markers and map to their own phase names.
+  Supports both network and webapp (graybox) scan types. `worker` is
+  required (no default) so forgotten call sites fail loudly. Aborted
+  scans (state["aborted"] set by Phase 1) short-circuit to "done" so
+  the UI does not linger in a phase forever.
   """
   tests = set(state.get("completed_tests", []))
   scan_type = state.get("scan_type")
 
+  if state.get("aborted") or state.get("done"):
+    if scan_type == "webapp":
+      return "done"
+    return "done"
+
   if scan_type == "webapp":
     # Graybox phase progression:
-    # preflight -> authentication -> discovery -> graybox_probes -> weak_auth -> done
-    if "graybox_weak_auth" in tests or "graybox_probes" in tests:
+    # preflight -> authentication -> discovery -> graybox_probes
+    # -> weak_auth -> done. Audit #6 fix: do NOT return "done" as
+    # soon as graybox_probes lands — weak_auth may still be pending.
+    if "graybox_weak_auth" in tests:
+      return "done"
+    if "graybox_probes" in tests:
+      job_config = getattr(worker, "job_config", None)
+      if job_config is not None and GrayboxCredentialSet.weak_auth_enabled(job_config):
+        return "weak_auth"
       return "done"
     if "graybox_discovery" in tests:
       return "graybox_probes"
@@ -124,13 +138,30 @@ class _LiveProgressMixin:
       "scenarios_error",
     ):
       merged[field] = sum(m.get(field, 0) for m in metrics_list)
-    # Merge probe breakdown (union of all probes)
+    # Merge probe breakdown (union of all probes) with a total order
+    # on statuses so merge is provably commutative over worker order.
+    # Severity rank (lower wins):
+    #   failed > failed:* > skipped > skipped:* > completed > other
+    # Ties within failed:* / skipped:* broken by the suffix
+    # (lexicographically smallest wins) — order-independent.
+    def _status_rank(v):
+      if v == "failed":
+        return (0, "")
+      if isinstance(v, str) and v.startswith("failed:"):
+        return (1, v)
+      if v == "skipped":
+        return (2, "")
+      if isinstance(v, str) and v.startswith("skipped:"):
+        return (3, v)
+      if v == "completed":
+        return (4, "")
+      return (9, v if isinstance(v, str) else "")
+
     probe_bd = {}
     for m in metrics_list:
       for k, v in (m.get("probe_breakdown") or {}).items():
-        # Keep worst status: failed > skipped > completed
         existing = probe_bd.get(k)
-        if existing is None or v == "failed" or (v.startswith("skipped") and existing == "completed"):
+        if existing is None or _status_rank(v) < _status_rank(existing):
           probe_bd[k] = v
     if probe_bd:
       merged["probe_breakdown"] = probe_bd
@@ -233,7 +264,7 @@ class _LiveProgressMixin:
         nr_ports = len(worker.initial_ports)
         t_scanned = len(state.get("ports_scanned", []))
         t_open = sorted(state.get("open_ports", []))
-        t_phase = _thread_phase(state)
+        t_phase = _thread_phase(state, worker)
 
         total_scanned += t_scanned
         total_ports += nr_ports

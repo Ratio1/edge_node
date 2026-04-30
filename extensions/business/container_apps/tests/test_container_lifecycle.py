@@ -1,0 +1,830 @@
+"""
+Comprehensive integration tests for ContainerAppRunnerPlugin lifecycle.
+
+These tests emulate the edge node environment by mocking Docker at the
+docker-py client level and exercising the full plugin lifecycle:
+init -> process (first launch) -> process (running) -> restart -> stop -> close.
+
+All tests that trigger _restart_container() (which calls __reset_vars() ->
+docker.from_env()) must patch the docker module to return the mock client.
+"""
+
+import unittest
+from pathlib import Path
+from unittest.mock import patch, MagicMock
+
+import docker.errors
+import docker.types
+
+from extensions.business.container_apps.tests.support import (
+  make_lifecycle_runner,
+  make_mock_container,
+  make_mock_docker_client,
+)
+from extensions.business.container_apps.container_app_runner import (
+  ContainerState,
+  StopReason,
+)
+
+
+def _patch_docker_module(client):
+  """Context manager that patches the docker module for __reset_vars() calls."""
+  mock_docker = MagicMock()
+  mock_docker.from_env.return_value = client
+  mock_docker.errors = docker.errors
+  mock_docker.types = docker.types
+  return patch(
+    'extensions.business.container_apps.container_app_runner.docker',
+    mock_docker,
+  )
+
+
+# ===========================================================================
+# Init Phase
+# ===========================================================================
+
+class TestLifecycleInit(unittest.TestCase):
+  """Test initial state before any lifecycle methods run."""
+
+  def test_state_is_uninitialized(self):
+    plugin, _, _ = make_lifecycle_runner()
+    self.assertEqual(plugin.container_state, ContainerState.UNINITIALIZED)
+
+  def test_container_is_none(self):
+    plugin, _, _ = make_lifecycle_runner()
+    self.assertIsNone(plugin.container)
+
+  def test_container_name_is_deterministic(self):
+    plugin, _, _ = make_lifecycle_runner()
+    # Name is stream_id-qualified and sanitized (with "car_" prefix).
+    self.assertEqual(plugin.container_name, "car_test_stream_car_instance")
+
+  def test_fixed_volumes_list_empty(self):
+    plugin, _, _ = make_lifecycle_runner()
+    self.assertEqual(plugin._fixed_volumes, [])
+
+  def test_consecutive_failures_zero(self):
+    plugin, _, _ = make_lifecycle_runner()
+    self.assertEqual(plugin._consecutive_failures, 0)
+
+
+# ===========================================================================
+# First Launch
+# ===========================================================================
+
+class TestLifecycleFirstLaunch(unittest.TestCase):
+  """Test _handle_initial_launch() starting the container for the first time."""
+
+  def test_starts_container_via_docker_run(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    client.containers.run.assert_called_once()
+
+  def test_state_transitions_to_running(self):
+    plugin, _, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+  def test_container_object_is_set(self):
+    plugin, _, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    self.assertIsNotNone(plugin.container)
+
+  def test_container_id_is_set(self):
+    plugin, _, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    self.assertEqual(plugin.container_id, "abc1234567")
+
+  def test_stale_container_check_runs_before_docker_run(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    # containers.get should be called (stale check) as well as containers.run
+    client.containers.get.assert_called_with("car_test_stream_car_instance")
+    client.containers.run.assert_called_once()
+
+  def test_image_availability_checked(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    self.assertTrue(
+      client.images.get.called or client.images.pull.called,
+      "Expected image availability check",
+    )
+
+  def test_container_receives_deterministic_name(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    _, kwargs = client.containers.run.call_args
+    # Name is stream_id-qualified and sanitized (with "car_" prefix).
+    self.assertEqual(kwargs["name"], "car_test_stream_car_instance")
+
+  def test_container_is_not_run_with_auto_remove(self):
+    # auto_remove=True destroys post-mortem observability and races with the
+    # explicit stop_container() remove path. _ensure_no_stale_container
+    # handles crash recovery without it.
+    plugin, client, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    _, kwargs = client.containers.run.call_args
+    self.assertNotIn("auto_remove", kwargs)
+
+  def test_volumes_passed_to_docker_run(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.volumes = {"/host/data": {"bind": "/app/data", "mode": "rw"}}
+    plugin._handle_initial_launch()
+    _, kwargs = client.containers.run.call_args
+    self.assertIn("/host/data", kwargs["volumes"])
+
+  def test_env_passed_to_docker_run(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.env = {"MY_VAR": "hello"}
+    plugin._handle_initial_launch()
+    _, kwargs = client.containers.run.call_args
+    self.assertEqual(kwargs["environment"]["MY_VAR"], "hello")
+
+  def test_resource_limits_passed(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin._cpu_limit = 2.0
+    plugin._mem_limit = "1g"
+    plugin._handle_initial_launch()
+    _, kwargs = client.containers.run.call_args
+    self.assertEqual(kwargs["nano_cpus"], 2_000_000_000)
+    self.assertEqual(kwargs["mem_limit"], "1g")
+
+
+# ===========================================================================
+# Running State
+# ===========================================================================
+
+class TestLifecycleRunning(unittest.TestCase):
+  """Test _check_container_status() when container is running or crashed."""
+
+  def _launch(self):
+    plugin, client, container = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    return plugin, client, container
+
+  def test_running_container_returns_true(self):
+    plugin, _, container = self._launch()
+    container.status = "running"
+    self.assertTrue(plugin._check_container_status())
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+  def test_crash_detected_exit_code_nonzero(self):
+    plugin, _, container = self._launch()
+    container.status = "exited"
+    container.attrs = {"State": {"ExitCode": 1, "Running": False}}
+    self.assertFalse(plugin._check_container_status())
+    self.assertEqual(plugin.container_state, ContainerState.FAILED)
+    self.assertEqual(plugin.stop_reason, StopReason.CRASH)
+
+  def test_normal_exit_detected_exit_code_zero(self):
+    plugin, _, container = self._launch()
+    container.status = "exited"
+    container.attrs = {"State": {"ExitCode": 0, "Running": False}}
+    self.assertFalse(plugin._check_container_status())
+    self.assertEqual(plugin.stop_reason, StopReason.NORMAL_EXIT)
+
+  def test_failure_count_incremented_on_crash(self):
+    plugin, _, container = self._launch()
+    self.assertEqual(plugin._consecutive_failures, 0)
+    container.status = "exited"
+    container.attrs = {"State": {"ExitCode": 1, "Running": False}}
+    plugin._check_container_status()
+    self.assertEqual(plugin._consecutive_failures, 1)
+
+  def test_reload_called_to_refresh_status(self):
+    plugin, _, container = self._launch()
+    container.status = "running"
+    plugin._check_container_status()
+    container.reload.assert_called()
+
+  def test_container_none_returns_false(self):
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.container = None
+    self.assertFalse(plugin._check_container_status())
+
+
+# ===========================================================================
+# Restart
+# ===========================================================================
+
+class TestLifecycleRestart(unittest.TestCase):
+  """Test _restart_container() flow."""
+
+  def _launch_and_crash(self):
+    plugin, client, container = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    container.status = "exited"
+    container.attrs = {"State": {"ExitCode": 1, "Running": False}}
+    plugin._check_container_status()
+    return plugin, client, container
+
+  def test_restart_stops_old_container(self):
+    plugin, client, old_container = self._launch_and_crash()
+    new_container = make_mock_container()
+    client.containers.run.return_value = new_container
+
+    with _patch_docker_module(client):
+      plugin._restart_container(StopReason.CRASH)
+
+    old_container.stop.assert_called()
+    old_container.remove.assert_called()
+
+  def test_restart_starts_new_container(self):
+    plugin, client, _ = self._launch_and_crash()
+    new_container = make_mock_container()
+    client.containers.run.return_value = new_container
+
+    with _patch_docker_module(client):
+      plugin._restart_container(StopReason.CRASH)
+
+    # 2 total run calls: initial launch + restart
+    self.assertEqual(client.containers.run.call_count, 2)
+
+  def test_restart_transitions_through_restarting_state(self):
+    plugin, client, _ = self._launch_and_crash()
+    new_container = make_mock_container()
+    client.containers.run.return_value = new_container
+
+    states = []
+    orig = plugin._set_container_state
+    def track(s, r=None):
+      states.append(s)
+      orig(s, r)
+    plugin._set_container_state = track
+
+    with _patch_docker_module(client):
+      plugin._restart_container(StopReason.CRASH)
+
+    self.assertIn(ContainerState.RESTARTING, states)
+
+  def test_restart_ends_in_running_state(self):
+    plugin, client, _ = self._launch_and_crash()
+    new_container = make_mock_container()
+    client.containers.run.return_value = new_container
+
+    with _patch_docker_module(client):
+      plugin._restart_container(StopReason.CRASH)
+
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+  def test_restart_preserves_failure_count(self):
+    plugin, client, _ = self._launch_and_crash()
+    self.assertEqual(plugin._consecutive_failures, 1)
+
+    new_container = make_mock_container()
+    client.containers.run.return_value = new_container
+
+    with _patch_docker_module(client):
+      plugin._restart_container(StopReason.CRASH)
+
+    # Failure count preserved (not reset to 0 -- that happens via _maybe_reset_retry_counter
+    # after the container runs successfully for RESTART_RESET_INTERVAL seconds)
+    self.assertEqual(plugin._consecutive_failures, 1)
+
+  def test_restart_reuses_deterministic_name(self):
+    plugin, client, _ = self._launch_and_crash()
+    new_container = make_mock_container()
+    client.containers.run.return_value = new_container
+
+    with _patch_docker_module(client):
+      plugin._restart_container(StopReason.CRASH)
+
+    _, kwargs = client.containers.run.call_args
+    # See test_container_receives_deterministic_name for the naming rule.
+    self.assertEqual(kwargs["name"], "car_test_stream_car_instance")
+
+
+# ===========================================================================
+# Stop and Close
+# ===========================================================================
+
+class TestLifecycleStop(unittest.TestCase):
+  """Test stop_container() and on_close()."""
+
+  def _launch(self):
+    plugin, client, container = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    return plugin, client, container
+
+  def test_stop_calls_docker_stop_and_remove(self):
+    plugin, _, container = self._launch()
+    plugin.stop_container()
+    container.stop.assert_called_once_with(timeout=5)
+    container.remove.assert_called_once()
+
+  def test_stop_clears_container_reference(self):
+    plugin, _, _ = self._launch()
+    plugin.stop_container()
+    self.assertIsNone(plugin.container)
+    self.assertIsNone(plugin.container_id)
+
+  def test_stop_noop_when_no_container(self):
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.stop_container()  # should not raise
+
+  def test_stop_and_save_logs_saves_to_disk(self):
+    plugin, _, container = self._launch()
+    plugin.diskapi_save_pickle_to_data = MagicMock()
+    plugin._stop_container_and_save_logs_to_disk()
+    container.stop.assert_called()
+    plugin.diskapi_save_pickle_to_data.assert_called_once()
+
+  def test_on_close_stops_container(self):
+    plugin, _, container = self._launch()
+    plugin.on_close()
+    container.stop.assert_called()
+    container.remove.assert_called()
+
+
+# ===========================================================================
+# Stale Container Guardrail
+# ===========================================================================
+
+class TestLifecycleStaleContainer(unittest.TestCase):
+  """Test _ensure_no_stale_container()."""
+
+  def test_removes_stale_running_container(self):
+    plugin, client, _ = make_lifecycle_runner()
+    stale = make_mock_container(status="running")
+    client.containers.get.side_effect = None
+    client.containers.get.return_value = stale
+
+    plugin._ensure_no_stale_container()
+
+    stale.remove.assert_called_once_with(force=True)
+
+  def test_removes_stale_exited_container(self):
+    plugin, client, _ = make_lifecycle_runner()
+    stale = make_mock_container(status="exited")
+    client.containers.get.side_effect = None
+    client.containers.get.return_value = stale
+
+    plugin._ensure_no_stale_container()
+
+    stale.remove.assert_called_once_with(force=True)
+
+  def test_noop_when_no_stale_container(self):
+    plugin, client, _ = make_lifecycle_runner()
+    # Default: containers.get raises NotFound
+    plugin._ensure_no_stale_container()  # should not raise
+
+  def test_logs_error_on_removal_failure(self):
+    plugin, client, _ = make_lifecycle_runner()
+    stale = make_mock_container()
+    stale.remove.side_effect = Exception("permission denied")
+    client.containers.get.side_effect = None
+    client.containers.get.return_value = stale
+
+    plugin._ensure_no_stale_container()  # should not raise
+
+    errors = [m for m in plugin.logged_messages if "Failed to remove" in m]
+    self.assertTrue(len(errors) > 0)
+
+
+# ===========================================================================
+# Process Loop
+# ===========================================================================
+
+class TestLifecycleProcess(unittest.TestCase):
+  """Test process() main loop behavior."""
+
+  def test_process_launches_container_when_none(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.process()
+    client.containers.run.assert_called_once()
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+  def test_process_checks_status_when_running(self):
+    plugin, _, container = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    container.status = "running"
+
+    plugin.process()
+
+    container.reload.assert_called()
+
+  def test_process_triggers_restart_on_crash(self):
+    """process() detects crash on one iteration and restarts on the next (after backoff)."""
+    clock = {"now": 100}
+    plugin, client, container = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    with _patch_docker_module(client):
+      plugin._handle_initial_launch()
+
+      # Simulate crash
+      container.status = "exited"
+      container.attrs = {"State": {"ExitCode": 1, "Running": False}}
+
+      new_container = make_mock_container()
+      client.containers.run.return_value = new_container
+
+      # First process() detects crash, records failure, sets backoff
+      plugin.process()
+      self.assertEqual(plugin.container_state, ContainerState.FAILED)
+
+      # Advance time past backoff, second process() does the restart
+      clock["now"] += 600
+      plugin.process()
+
+    # Initial + restart = 2 run calls
+    self.assertEqual(client.containers.run.call_count, 2)
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+  def test_process_skips_when_paused(self):
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.container_state = ContainerState.PAUSED
+    plugin.process()
+    client.containers.run.assert_not_called()
+
+  def test_process_respects_restart_policy_no(self):
+    """With restart_policy='no', crashed container should not restart."""
+    plugin, client, container = make_lifecycle_runner(cfg_restart_policy="no")
+    plugin._handle_initial_launch()
+
+    container.status = "exited"
+    container.attrs = {"State": {"ExitCode": 1, "Running": False}}
+
+    plugin.process()
+
+    # Only the initial launch, no restart
+    self.assertEqual(client.containers.run.call_count, 1)
+
+  def test_process_respects_max_retries(self):
+    """After exceeding max retries, should stop restarting."""
+    plugin, client, container = make_lifecycle_runner(cfg_restart_max_retries=2)
+    plugin._handle_initial_launch()
+
+    # Simulate already exceeded retries
+    plugin._consecutive_failures = 3
+
+    container.status = "exited"
+    container.attrs = {"State": {"ExitCode": 1, "Running": False}}
+
+    plugin.process()
+
+    # Should NOT restart
+    self.assertEqual(client.containers.run.call_count, 1)
+    errors = [m for m in plugin.logged_messages if "abandoned" in m.lower()]
+    self.assertTrue(len(errors) > 0)
+
+  def test_process_multiple_iterations_running(self):
+    """Multiple process() calls with a healthy container should all succeed."""
+    plugin, _, container = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+    container.status = "running"
+
+    for _ in range(5):
+      plugin.process()
+
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+
+# ===========================================================================
+# Fixed-Size Volume Integration
+# ===========================================================================
+
+class TestLifecycleFixedVolumes(unittest.TestCase):
+  """Test fixed-size volumes through the lifecycle."""
+
+  @patch("extensions.business.container_apps.fixed_volume.provision")
+  @patch("extensions.business.container_apps.fixed_volume.cleanup_stale_mounts")
+  @patch("extensions.business.container_apps.fixed_volume._require_tools")
+  @patch("extensions.business.container_apps.fixed_volume.docker_bind_spec",
+         return_value={"/mnt/vol": {"bind": "/app/data", "mode": "rw"}})
+  def test_provision_before_start(self, mock_spec, mock_tools, mock_stale, mock_prov):
+    plugin, client, _ = make_lifecycle_runner(
+      cfg_fixed_size_volumes={"data": {"SIZE": "50M", "MOUNTING_POINT": "/app/data"}}
+    )
+
+    with patch.object(Path, "is_dir", return_value=False):
+      plugin._configure_fixed_size_volumes()
+
+    self.assertEqual(len(plugin._fixed_volumes), 1)
+    self.assertIn("/mnt/vol", plugin.volumes)
+    mock_prov.assert_called_once()
+
+  @patch("extensions.business.container_apps.fixed_volume.cleanup")
+  def test_cleanup_on_stop(self, mock_cleanup):
+    from extensions.business.container_apps.fixed_volume import FixedVolume
+
+    plugin, _, _ = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+
+    vol = FixedVolume(name="data", size="50M", root=Path("/tmp/fv"))
+    plugin._fixed_volumes = [vol]
+
+    plugin._stop_container_and_save_logs_to_disk()
+
+    mock_cleanup.assert_called_once_with(vol, logger=plugin.P)
+    self.assertEqual(plugin._fixed_volumes, [])
+
+  @patch("extensions.business.container_apps.fixed_volume.cleanup")
+  @patch("extensions.business.container_apps.fixed_volume.provision")
+  @patch("extensions.business.container_apps.fixed_volume.cleanup_stale_mounts")
+  @patch("extensions.business.container_apps.fixed_volume._require_tools")
+  @patch("extensions.business.container_apps.fixed_volume.docker_bind_spec",
+         return_value={"/mnt/vol": {"bind": "/app/data", "mode": "rw"}})
+  def test_reprovision_on_restart(
+    self, mock_spec, mock_tools, mock_stale, mock_prov, mock_cleanup
+  ):
+    from extensions.business.container_apps.fixed_volume import FixedVolume
+
+    plugin, client, container = make_lifecycle_runner(
+      cfg_fixed_size_volumes={"data": {"SIZE": "50M", "MOUNTING_POINT": "/app/data"}}
+    )
+    plugin._handle_initial_launch()
+
+    vol = FixedVolume(name="data", size="50M", root=Path("/tmp/fv"))
+    plugin._fixed_volumes = [vol]
+
+    # Crash
+    container.status = "exited"
+    container.attrs = {"State": {"ExitCode": 1, "Running": False}}
+    plugin._check_container_status()
+
+    new_container = make_mock_container()
+    client.containers.run.return_value = new_container
+
+    with _patch_docker_module(client), \
+         patch.object(Path, "is_dir", return_value=False):
+      plugin._restart_container(StopReason.CRASH)
+
+    mock_cleanup.assert_called()
+    mock_prov.assert_called()
+
+  @patch("extensions.business.container_apps.fixed_volume._require_tools",
+         side_effect=RuntimeError("missing tools"))
+  def test_graceful_degradation_missing_tools(self, mock_tools):
+    plugin, client, _ = make_lifecycle_runner(
+      cfg_fixed_size_volumes={"data": {"SIZE": "50M", "MOUNTING_POINT": "/app/data"}}
+    )
+
+    plugin._configure_fixed_size_volumes()
+
+    # Should not crash, volumes list empty, container can still start
+    self.assertEqual(plugin._fixed_volumes, [])
+    plugin._handle_initial_launch()
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+
+# ===========================================================================
+# Deprecated VOLUMES Warning
+# ===========================================================================
+
+class TestLifecycleDeprecation(unittest.TestCase):
+  """Test that VOLUMES deprecation warning is emitted."""
+
+  @patch("os.makedirs")
+  @patch("os.chmod")
+  def test_volumes_logs_deprecation_warning(self, mock_chmod, mock_makedirs):
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.cfg_volumes = {"/host/data": "/container/data"}
+
+    plugin._configure_volumes()
+
+    warnings = [m for m in plugin.logged_messages if "deprecated" in m.lower()]
+    self.assertTrue(len(warnings) > 0, "Expected deprecation warning for VOLUMES")
+
+  def test_no_warning_when_volumes_empty(self):
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.cfg_volumes = {}
+    plugin._configure_volumes()
+
+    warnings = [m for m in plugin.logged_messages if "deprecated" in m.lower()]
+    self.assertEqual(len(warnings), 0)
+
+
+# ===========================================================================
+# Full Lifecycle End-to-End
+# ===========================================================================
+
+class TestLifecycleEndToEnd(unittest.TestCase):
+  """End-to-end lifecycle: launch -> run -> crash -> restart -> stop -> close."""
+
+  def test_full_lifecycle(self):
+    clock = {"now": 100}
+    plugin, client, container = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    with _patch_docker_module(client):
+      # Phase 1: First launch via process()
+      plugin.process()
+      self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+      self.assertIsNotNone(plugin.container)
+
+      # Phase 2: Several healthy process() iterations
+      container.status = "running"
+      for _ in range(3):
+        clock["now"] += 5
+        plugin.process()
+      self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+      # Phase 3: Container crashes
+      container.status = "exited"
+      container.attrs = {"State": {"ExitCode": 137, "Running": False}}
+
+      new_container = make_mock_container()
+      client.containers.run.return_value = new_container
+
+      # First process() detects crash, sets backoff
+      plugin.process()
+      self.assertEqual(plugin.container_state, ContainerState.FAILED)
+
+      # Advance time past backoff, second process() restarts
+      clock["now"] += 600
+      plugin.process()
+
+      self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+      self.assertEqual(client.containers.run.call_count, 2)
+
+      # Phase 4: Running again after restart
+      new_container.status = "running"
+      plugin.process()
+      self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+      # Phase 5: Graceful shutdown
+      plugin.on_close()
+      self.assertIsNone(plugin.container)
+
+  def test_multiple_crashes_increment_failures(self):
+    plugin, client, container = make_lifecycle_runner()
+    plugin._handle_initial_launch()
+
+    for i in range(3):
+      # Crash
+      container.status = "exited"
+      container.attrs = {"State": {"ExitCode": 1, "Running": False}}
+      plugin._check_container_status()
+      self.assertEqual(plugin._consecutive_failures, i + 1)
+
+      # Restart
+      new_container = make_mock_container()
+      client.containers.run.return_value = new_container
+      container = new_container
+
+      with _patch_docker_module(client):
+        plugin._restart_container(StopReason.CRASH)
+
+    self.assertEqual(plugin._consecutive_failures, 3)
+
+
+# ===========================================================================
+# Image Pull Backoff
+# ===========================================================================
+
+class TestImagePullBackoff(unittest.TestCase):
+  """Test exponential backoff with jitter for image pull retries."""
+
+  def test_first_pull_has_no_backoff(self):
+    plugin, _, _ = make_lifecycle_runner()
+    self.assertFalse(plugin._is_image_pull_backoff_active())
+    self.assertEqual(plugin._image_pull_failures, 0)
+
+  def test_failure_sets_backoff(self):
+    clock = {"now": 100}
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    plugin._record_image_pull_failure()
+
+    self.assertEqual(plugin._image_pull_failures, 1)
+    self.assertGreater(plugin._next_image_pull_time, clock["now"])
+    self.assertTrue(plugin._is_image_pull_backoff_active())
+
+  def test_backoff_clears_after_delay(self):
+    clock = {"now": 100}
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    plugin._record_image_pull_failure()
+
+    # Advance time well past backoff
+    clock["now"] += 10000
+    self.assertFalse(plugin._is_image_pull_backoff_active())
+
+  def test_success_resets_counters(self):
+    clock = {"now": 100}
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    # Accumulate failures
+    for _ in range(5):
+      plugin._record_image_pull_failure()
+      clock["now"] += 1
+
+    self.assertEqual(plugin._image_pull_failures, 5)
+
+    plugin._record_image_pull_success()
+
+    self.assertEqual(plugin._image_pull_failures, 0)
+    self.assertEqual(plugin._next_image_pull_time, 0)
+    self.assertFalse(plugin._is_image_pull_backoff_active())
+
+  def test_backoff_grows_exponentially(self):
+    clock = {"now": 100}
+    plugin, _, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    delays = []
+    for i in range(5):
+      plugin._image_pull_failures = i + 1
+      backoff = plugin._calculate_image_pull_backoff()
+      # Backoff = base * 2^(failures-1) + jitter, where jitter in [0, base * 2^(failures-1)]
+      # So minimum is base * 2^(failures-1), maximum is 2 * base * 2^(failures-1)
+      base_part = plugin.cfg_image_pull_backoff_base * (2 ** i)
+      self.assertGreaterEqual(backoff, base_part)
+      self.assertLessEqual(backoff, 2 * base_part)
+      delays.append(backoff)
+
+    # Each delay should be roughly double the previous (accounting for jitter)
+    for i in range(1, len(delays)):
+      # The minimum of delay[i] (= base * 2^i) should be >= minimum of delay[i-1] (= base * 2^(i-1))
+      self.assertGreater(delays[i], delays[i - 1] * 0.5)
+
+  def test_jitter_adds_randomness(self):
+    """Multiple backoff calculations with same failure count should differ."""
+    plugin, _, _ = make_lifecycle_runner()
+    plugin._image_pull_failures = 5
+
+    values = set()
+    for _ in range(20):
+      values.add(plugin._calculate_image_pull_backoff())
+
+    # With random jitter, we should get multiple distinct values
+    self.assertGreater(len(values), 1, "Expected jitter to produce varied backoff values")
+
+  def test_max_retries_gives_up(self):
+    plugin, client, _ = make_lifecycle_runner(cfg_image_pull_max_retries=3)
+    plugin._image_pull_failures = 3
+
+    result = plugin._pull_image_from_registry()
+
+    self.assertIsNone(result)
+    client.images.pull.assert_not_called()
+    msgs = [m for m in plugin.logged_messages if "abandoned" in m.lower()]
+    self.assertTrue(len(msgs) > 0)
+
+  def test_unlimited_retries_when_max_zero(self):
+    plugin, _, _ = make_lifecycle_runner(cfg_image_pull_max_retries=0)
+    plugin._image_pull_failures = 9999
+    self.assertFalse(plugin._has_exceeded_image_pull_retries())
+
+  def test_pull_failure_triggers_backoff_in_registry_method(self):
+    """_pull_image_from_registry should record failure and set backoff on exception."""
+    clock = {"now": 100}
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+    client.images.pull.side_effect = Exception("429 Too Many Requests")
+
+    result = plugin._pull_image_from_registry()
+
+    self.assertIsNone(result)
+    self.assertEqual(plugin._image_pull_failures, 1)
+    self.assertTrue(plugin._is_image_pull_backoff_active())
+
+  def test_pull_success_resets_backoff_in_registry_method(self):
+    """_pull_image_from_registry should reset counters on successful pull."""
+    clock = {"now": 100}
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    # Simulate prior failures
+    plugin._image_pull_failures = 3
+    plugin._next_image_pull_time = 0  # Allow pull
+
+    result = plugin._pull_image_from_registry()
+
+    self.assertIsNotNone(result)
+    self.assertEqual(plugin._image_pull_failures, 0)
+    self.assertEqual(plugin._next_image_pull_time, 0)
+
+  def test_backoff_skips_pull_attempt(self):
+    """When in backoff, _pull_image_from_registry should return None without calling Docker."""
+    clock = {"now": 100}
+    plugin, client, _ = make_lifecycle_runner()
+    plugin.time = lambda: clock["now"]
+
+    # Set active backoff
+    plugin._image_pull_failures = 1
+    plugin._next_image_pull_time = 200  # Backoff until t=200
+
+    result = plugin._pull_image_from_registry()
+
+    self.assertIsNone(result)
+    client.images.pull.assert_not_called()
+
+  def test_no_max_backoff_cap(self):
+    """Backoff should grow without limit (no artificial cap)."""
+    plugin, _, _ = make_lifecycle_runner()
+
+    # After 20 failures, backoff should be huge (base * 2^19 = 2 * 524288 = ~1M seconds)
+    plugin._image_pull_failures = 20
+    backoff = plugin._calculate_image_pull_backoff()
+
+    expected_min = plugin.cfg_image_pull_backoff_base * (2 ** 19)  # 1,048,576 seconds
+    self.assertGreaterEqual(backoff, expected_min)
+
+
+if __name__ == "__main__":
+  unittest.main()

@@ -240,13 +240,23 @@ class TestExecution(unittest.TestCase):
     self.assertIsInstance(result, DiscoveryResult)
     self.assertEqual(result.routes, ["/a"])
 
-  def test_discovery_phase_fails_closed_when_refresh_fails(self):
+  def test_discovery_phase_aborts_when_refresh_fails(self):
+    """Phase-level session refresh failure raises GrayboxAbort.
+
+    Previously the discovery phase soft-failed (returned empty
+    DiscoveryResult, recorded a fatal finding, scan continued into
+    probes). Phase 1 of the PR 388 remediation makes this a real
+    abort — the scan cannot continue safely without an authenticated
+    session.
+    """
+    from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxAbort
     worker = _make_worker()
     worker.auth.ensure_sessions = MagicMock(return_value=False)
 
-    result = worker._run_discovery_phase()
+    with self.assertRaises(GrayboxAbort) as ctx:
+      worker._run_discovery_phase()
 
-    self.assertEqual(result, DiscoveryResult())
+    self.assertEqual(ctx.exception.reason_class, "session_refresh_failed")
     self.assertIn("_graybox_fatal", worker.state["graybox_results"]["8000"])
 
   def test_build_probe_context_returns_typed_context(self):
@@ -286,6 +296,13 @@ class TestExecution(unittest.TestCase):
     self.assertEqual(stats["not_vulnerable"], 1)
 
   def test_registered_probe_records_auth_refresh_failure(self):
+    """Per-probe auth refresh failure soft-fails the probe, not the scan.
+
+    This preserves the contract that one flaky re-auth mid-loop does
+    not kill all remaining probes. Phase-level session checks use
+    _ensure_active_sessions (which aborts); per-probe checks use
+    self.auth.ensure_sessions directly (which returns bool).
+    """
     worker = _make_worker()
     worker.auth.official_session = MagicMock()
     worker.auth.regular_session = MagicMock()
@@ -301,8 +318,9 @@ class TestExecution(unittest.TestCase):
       worker._run_registered_probe({"key": "_graybox_test", "cls": "fake.Probe"}, probe_context)
 
     self.assertEqual(worker.metrics.build().probes_failed, 1)
-    self.assertIn("_graybox_fatal", worker.state["graybox_results"]["8000"])
     self.assertEqual(worker.metrics.build().probe_breakdown["_graybox_test"], "failed:auth_refresh")
+    # Per-probe soft-fail does not record a scan-wide fatal.
+    self.assertFalse(worker.state["aborted"])
 
   def test_store_findings_accepts_typed_probe_run_result(self):
     worker = _make_worker()
@@ -821,6 +839,210 @@ class TestProbeDispatch(unittest.TestCase):
 
         mock_bl.assert_called_once()
         mock_instance.run_weak_auth.assert_called_once()
+
+
+class TestGrayboxAbortBehavior(unittest.TestCase):
+  """Phase 1 of PR 388 remediation: fail-closed aborts + bookkeeping."""
+
+  def test_unauthorized_target_aborts_before_authenticate(self):
+    """safety.validate_target returning a string aborts the scan
+    before auth.authenticate is ever called. state["aborted"] is True,
+    abort_reason and abort_phase are populated, one fatal finding
+    recorded, authenticate is never invoked.
+    """
+    worker = _make_worker()
+    worker.safety.validate_target.return_value = "Target not in authorized list"
+    worker.auth.authenticate = MagicMock()
+    worker.auth.cleanup = MagicMock()
+
+    worker.execute_job()
+
+    self.assertTrue(worker.state["done"])
+    self.assertTrue(worker.state["aborted"])
+    self.assertIn("Target not in authorized", worker.state["abort_reason"])
+    self.assertEqual(worker.state["abort_phase"], "preflight")
+    worker.auth.authenticate.assert_not_called()
+    fatal = (worker.state["graybox_results"]
+             .get("8000", {}).get("_graybox_fatal", {}).get("findings", []))
+    self.assertEqual(len(fatal), 1)
+
+  def test_preflight_check_error_sets_abort_state(self):
+    """auth.preflight_check returning an error string aborts the scan."""
+    worker = _make_worker()
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = "Login page 404"
+    worker.auth.authenticate = MagicMock()
+    worker.auth.cleanup = MagicMock()
+
+    worker.execute_job()
+
+    self.assertTrue(worker.state["aborted"])
+    self.assertIn("Login page 404", worker.state["abort_reason"])
+    self.assertEqual(worker.state["abort_phase"], "preflight")
+    worker.auth.authenticate.assert_not_called()
+
+  def test_auth_failure_sets_abort_state(self):
+    """Official authentication failure aborts the scan with auth_failed."""
+    worker = _make_worker()
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+    worker.auth.authenticate.return_value = False
+    worker.auth.official_session = None
+    worker.auth._auth_errors = ["Login failed"]
+    worker.auth.cleanup = MagicMock()
+
+    worker.execute_job()
+
+    self.assertTrue(worker.state["aborted"])
+    self.assertEqual(worker.state["abort_phase"], "authentication")
+    self.assertIn("authentication failed", worker.state["abort_reason"].lower())
+
+  def test_abort_records_metric_counter(self):
+    """record_abort is called exactly once on abort."""
+    worker = _make_worker()
+    worker.safety.validate_target.return_value = "nope"
+    worker.auth.cleanup = MagicMock()
+
+    worker.execute_job()
+
+    self.assertEqual(worker.metrics.abort_count, 1)
+    self.assertEqual(worker.metrics._aborts[0]["reason_class"], "unauthorized_target")
+    self.assertEqual(worker.metrics._aborts[0]["phase"], "preflight")
+
+  def test_abort_emits_audit_log_line(self):
+    """Every abort emits a [ABORT-ATTESTATION] log line for grep."""
+    owner_messages = []
+    worker = _make_worker()
+    worker.owner.P = lambda msg, **kw: owner_messages.append(msg)
+    worker.safety.validate_target.return_value = "nope"
+    worker.auth.cleanup = MagicMock()
+
+    worker.execute_job()
+
+    audit_lines = [m for m in owner_messages if "[ABORT-ATTESTATION]" in m]
+    self.assertEqual(len(audit_lines), 1)
+    self.assertIn("reason_class=unauthorized_target", audit_lines[0])
+    self.assertIn("phase=preflight", audit_lines[0])
+
+  def test_clean_completion_leaves_abort_state_default(self):
+    """Normal scan: aborted=False, abort_reason=empty, abort_phase=empty."""
+    worker = _make_worker()
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+    worker.auth.authenticate.return_value = True
+    worker.auth.official_session = MagicMock()
+    worker.auth._auth_errors = []
+    worker.auth.ensure_sessions = MagicMock(return_value=True)
+    worker.auth.cleanup = MagicMock()
+    worker.discovery.discover.return_value = ([], [])
+
+    with patch("extensions.business.cybersec.red_mesh.graybox.worker.GRAYBOX_PROBE_REGISTRY", []):
+      worker.execute_job()
+
+    self.assertTrue(worker.state["done"])
+    self.assertFalse(worker.state["aborted"])
+    self.assertEqual(worker.state["abort_reason"], "")
+    self.assertEqual(worker.state["abort_phase"], "")
+    self.assertEqual(worker.metrics.abort_count, 0)
+
+  def test_get_status_surfaces_abort_fields(self):
+    """get_status() includes aborted/abort_reason/abort_phase."""
+    worker = _make_worker()
+    worker.safety.validate_target.return_value = "bad"
+    worker.auth.cleanup = MagicMock()
+    worker.execute_job()
+
+    status = worker.get_status()
+    self.assertTrue(status["aborted"])
+    self.assertIn("bad", status["abort_reason"])
+    self.assertEqual(status["abort_phase"], "preflight")
+
+    agg_status = worker.get_status(for_aggregations=True)
+    self.assertTrue(agg_status["aborted"])
+    self.assertIn("bad", agg_status["abort_reason"])
+
+  def test_phase_end_not_double_called_on_abort(self):
+    """finally block does not double-close a phase_end already closed.
+
+    Each phase method closes its phase in its own finally. The
+    execute_job finally only closes if _phase_open is True.
+    """
+    worker = _make_worker()
+    worker.safety.validate_target.return_value = "nope"
+    worker.auth.cleanup = MagicMock()
+
+    phase_end_calls = []
+    orig_phase_end = worker.metrics.phase_end
+    def tracker(phase):
+      phase_end_calls.append(phase)
+      orig_phase_end(phase)
+    worker.metrics.phase_end = tracker
+
+    worker.execute_job()
+
+    self.assertEqual(phase_end_calls, ["preflight"])
+
+  def test_cleanup_exception_does_not_mask_abort(self):
+    """_safe_cleanup swallows auth.cleanup errors so the abort state
+    is preserved and surfaced to consumers.
+    """
+    worker = _make_worker()
+    worker.safety.validate_target.return_value = "nope"
+    worker.auth.cleanup.side_effect = RuntimeError("logout kaboom")
+    worker.safety.sanitize_error.return_value = "logout kaboom"
+
+    worker.execute_job()
+
+    self.assertTrue(worker.state["aborted"])
+    self.assertTrue(worker.state["done"])
+
+  def test_registered_aggregation_fields_include_abort_state(self):
+    """Phase 1 registration: aborted/abort_reason/abort_phase merge
+    rules are present in get_worker_specific_result_fields. Phase 3
+    depends on this registration already being in place.
+    """
+    fields = GrayboxLocalWorker.get_worker_specific_result_fields()
+    self.assertIn("aborted", fields)
+    self.assertIn("abort_reason", fields)
+    self.assertIn("abort_phase", fields)
+    self.assertIs(fields["aborted"], any)
+    # abort_reason/abort_phase use the first-non-empty helper.
+    from extensions.business.cybersec.red_mesh.graybox.worker import _first_non_empty_str
+    self.assertIs(fields["abort_reason"], _first_non_empty_str)
+    self.assertIs(fields["abort_phase"], _first_non_empty_str)
+    # First-non-empty semantics round-trip.
+    self.assertEqual(_first_non_empty_str(["", "preflight"]), "preflight")
+    self.assertEqual(_first_non_empty_str(["preflight", "auth"]), "preflight")
+    self.assertEqual(_first_non_empty_str(["", ""]), "")
+
+  def test_auth_errors_contain_no_plaintext_credentials(self):
+    """Secure logging audit: AuthManager records stable error codes,
+    never raw password or token strings. A known password used for
+    authentication does not end up anywhere in the serialized worker
+    state after an auth failure abort.
+    """
+    import json
+    from dataclasses import replace
+    secret = "TOPSECRET_PASSWORD_VALUE_123"
+    worker = _make_worker()
+    # Mutate the credential via dataclass replace (frozen).
+    worker._credentials = replace(
+      worker._credentials,
+      official=replace(worker._credentials.official, password=secret),
+    )
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+    worker.auth.authenticate.return_value = False
+    worker.auth.official_session = None
+    # AuthManager writes stable codes like "official_login_failed";
+    # no raw credential fields should end up here.
+    worker.auth._auth_errors = ["official_login_failed"]
+    worker.auth.cleanup = MagicMock()
+
+    worker.execute_job()
+
+    serialized = json.dumps(worker.state, default=str)
+    self.assertNotIn(secret, serialized)
 
 
 if __name__ == '__main__':

@@ -107,6 +107,62 @@ class _ReportMixin:
       "total_scenarios_vulnerable": scenario_vulnerable,
     }
 
+  @staticmethod
+  def _stamp_finding_list(findings, worker_id, node_addr):
+    """Stamp _source_worker_id / _source_node_addr on each finding.
+
+    Idempotent — setdefault preserves any stamps from upstream Phase
+    2 extraction. Non-dict entries are skipped silently.
+    """
+    for f in findings or []:
+      if isinstance(f, dict):
+        f.setdefault("_source_worker_id", worker_id)
+        f.setdefault("_source_node_addr", node_addr)
+
+  def _stamp_worker_source(self, local_job_status, worker_id, node_addr):
+    """Apply worker/node attribution to every finding-bearing structure.
+
+    Handles both the nested network shape ({port: {probe: {findings}}})
+    and the legacy flat shape ({port: {findings}}). Production uses
+    nested exclusively, but the stamper is shape-robust so migrated
+    or hand-built fixture data still gets stamped consistently.
+    """
+    if not isinstance(local_job_status, dict):
+      return
+    # service_info: nested + legacy flat.
+    for port_entry in (local_job_status.get("service_info") or {}).values():
+      if not isinstance(port_entry, dict):
+        continue
+      self._stamp_finding_list(port_entry.get("findings"),
+                               worker_id, node_addr)
+      for probe_entry in port_entry.values():
+        if isinstance(probe_entry, dict):
+          self._stamp_finding_list(probe_entry.get("findings"),
+                                   worker_id, node_addr)
+    # graybox_results: {port: {probe: {findings}}}
+    for port_probes in (local_job_status.get("graybox_results") or {}).values():
+      if not isinstance(port_probes, dict):
+        continue
+      for probe_entry in port_probes.values():
+        if isinstance(probe_entry, dict):
+          self._stamp_finding_list(probe_entry.get("findings"),
+                                   worker_id, node_addr)
+    # web_tests_info: mirrors service_info shape.
+    for port_entry in (local_job_status.get("web_tests_info") or {}).values():
+      if not isinstance(port_entry, dict):
+        continue
+      self._stamp_finding_list(port_entry.get("findings"),
+                               worker_id, node_addr)
+      for method_entry in port_entry.values():
+        if isinstance(method_entry, dict):
+          self._stamp_finding_list(method_entry.get("findings"),
+                                   worker_id, node_addr)
+    # Top-level lists.
+    self._stamp_finding_list(local_job_status.get("correlation_findings"),
+                             worker_id, node_addr)
+    self._stamp_finding_list(local_job_status.get("findings"),
+                             worker_id, node_addr)
+
   def _get_aggregated_report(self, local_jobs, worker_cls=None):
     """
     Aggregate results from multiple local workers.
@@ -130,6 +186,22 @@ class _ReportMixin:
       if local_jobs:
         self.P(f"Aggregating reports from {len(local_jobs)} local jobs...")
         for local_worker_id, local_job_status in local_jobs.items():
+          # Chain-of-custody: stamp _source_worker_id / _source_node_addr
+          # on every finding before merging so the pentest deliverable
+          # can trace every finding back to the worker/node that
+          # produced it. Idempotent via setdefault — re-aggregation
+          # does not overwrite existing stamps from Phase 2.
+          node_addr = (
+            local_job_status.get("node_addr")
+            or local_job_status.get("initiator")
+            or str(local_worker_id)
+          )
+          worker_id = (
+            local_job_status.get("local_worker_id")
+            or str(local_worker_id)
+          )
+          self._stamp_worker_source(local_job_status, worker_id, node_addr)
+
           if worker_cls and hasattr(worker_cls, 'get_worker_specific_result_fields'):
             aggregation_fields = worker_cls.get_worker_specific_result_fields()
           else:

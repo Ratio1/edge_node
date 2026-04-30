@@ -33,7 +33,7 @@ _CONFIG = {
   'PORT': None,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
-  'REQUEST_TIMEOUT': 300,
+  'REQUEST_TIMEOUT': 600,
   'POSTPONED_POLL_INTERVAL': 0.5,
 
   'DEEPLOY_VERBOSE' : 10,

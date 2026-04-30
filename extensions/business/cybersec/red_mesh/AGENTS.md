@@ -302,7 +302,7 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 
 ### 2026-03-16T20:40:00Z
 
-- Change: introduced a dedicated LLM payload-shaping boundary in [`mixins/llm_agent_mixin.py`](mixins/llm_agent_mixin.py) so RedMesh no longer sends the full aggregated report directly to the LLM path.
+- Change: introduced a dedicated LLM payload-shaping boundary in [`mixins/llm_agent.py`](./mixins/llm_agent.py) so RedMesh no longer sends the full aggregated report directly to the LLM path.
 - Change: added network and webapp-specific compact payload shaping, finding deduplication/ranking/capping, analysis-type budgets, and runtime payload-size observability.
 - Verification: the known failing job `a3a357bc` dropped from `303,760` raw bytes to `21,559` shaped bytes for `security_assessment` and completed manually in `38.97s` on rm1 instead of timing out.
 - Horizontal insight: RedMesh archive/report data and LLM reasoning data must remain separate contracts; future LLM work should extend the bounded payload model rather than re-coupling the agent to raw archived aggregates.
