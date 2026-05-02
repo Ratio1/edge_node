@@ -81,6 +81,16 @@ jobs:
             ratio1/edge_node:latest
             ratio1/edge_node:mainnet
 
+      # Free buildx-cloud cache before GPU build (CPU layers won't be reused).
+      - name: Prune buildx cache before GPU build
+        if: ${{ !cancelled() }}
+        run: |
+          echo "=========== buildx du (before GPU prune) ==========="
+          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
+          docker buildx prune -af --verbose --builder "${{ steps.buildx.outputs.name }}"
+          echo "=========== buildx du (after GPU prune) ==========="
+          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
+
       # 2. mainnet GPU
       - name: Build and push MAINNET GPU image
         if: ${{ !cancelled() }}
