@@ -11,28 +11,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
+  # 1. devnet CPU
+  devnet-cpu:
+    name: Build devnet CPU
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure Git
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
+      - uses: actions/checkout@v4
 
       - name: Retrieve edge node version
         run: |
           VERSION=$(cat ver.py | grep -o "'.*'" | tr -d "'")
           echo "VERSION=$VERSION" >> $GITHUB_ENV
           echo "Edge node version: $VERSION"
-
-      - name: Check latest naeural_core version
-        run: |
-          LATEST_VERSION=$(curl -s https://pypi.org/pypi/naeural-core/json | jq -r '.info.version')
-          echo "LATEST_NAEURAL_CORE_VERSION=$LATEST_VERSION" >> $GITHUB_ENV
-          echo "Latest naeural_core version on PyPI: $LATEST_VERSION"
 
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
@@ -50,16 +40,11 @@ jobs:
 
       - name: Cleanup builder cache
         run: |
-          echo "=========== buildx du (before) ==========="
           docker buildx du --builder "${{ steps.buildx.outputs.name }}"
-          echo "=========== buildx prune ==========="
           docker buildx prune -f --verbose --builder "${{ steps.buildx.outputs.name }}"
-          echo "=========== buildx du (after) ==========="
           docker buildx du --builder "${{ steps.buildx.outputs.name }}"
 
-      # 1. devnet CPU
       - name: Build and push DEVNET CPU image
-        if: ${{ !cancelled() }}
         uses: docker/build-push-action@v6
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -69,9 +54,30 @@ jobs:
           tags: |
             ratio1/edge_node:devnet
 
-      # 2. testnet CPU
+  # 2. testnet CPU
+  testnet-cpu:
+    name: Build testnet CPU
+    needs: devnet-cpu
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: "lab:latest"
+          driver: cloud
+          endpoint: "naeural/naeural-builder"
+
       - name: Build and push TESTNET CPU image
-        if: ${{ !cancelled() }}
         uses: docker/build-push-action@v6
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -81,9 +87,30 @@ jobs:
           tags: |
             ratio1/edge_node:testnet
 
-      # Free buildx-cloud cache before GPU pair (CPU layers won't be reused).
-      - name: Prune buildx cache before GPU builds
-        if: ${{ !cancelled() }}
+  # 3. devnet GPU (prunes the buildx-cloud cache first to free CPU layers)
+  devnet-gpu:
+    name: Build devnet GPU
+    needs: testnet-cpu
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: "lab:latest"
+          driver: cloud
+          endpoint: "naeural/naeural-builder"
+
+      - name: Prune buildx cache before GPU pair
         run: |
           echo "=========== buildx du (before GPU prune) ==========="
           docker buildx du --builder "${{ steps.buildx.outputs.name }}"
@@ -91,9 +118,7 @@ jobs:
           echo "=========== buildx du (after GPU prune) ==========="
           docker buildx du --builder "${{ steps.buildx.outputs.name }}"
 
-      # 3. devnet GPU
       - name: Build and push DEVNET GPU image
-        if: ${{ !cancelled() }}
         uses: docker/build-push-action@v6
         with:
           builder: ${{ steps.buildx.outputs.name }}
@@ -105,9 +130,30 @@ jobs:
           tags: |
             ratio1/edge_node_gpu:devnet
 
-      # 4. testnet GPU
+  # 4. testnet GPU
+  testnet-gpu:
+    name: Build testnet GPU
+    needs: devnet-gpu
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: "lab:latest"
+          driver: cloud
+          endpoint: "naeural/naeural-builder"
+
       - name: Build and push TESTNET GPU image
-        if: ${{ !cancelled() }}
         uses: docker/build-push-action@v6
         with:
           builder: ${{ steps.buildx.outputs.name }}
