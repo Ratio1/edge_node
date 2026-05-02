@@ -1,0 +1,97 @@
+name: Build mainnet images (CPU + GPU) and tag commit
+
+on:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+concurrency:
+  group: edge-node-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Retrieve edge node version
+        run: |
+          VERSION=$(cat ver.py | grep -o "'.*'" | tr -d "'")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "Edge node version: $VERSION"
+
+      - name: Check latest naeural_core version
+        run: |
+          LATEST_VERSION=$(curl -s https://pypi.org/pypi/naeural-core/json | jq -r '.info.version')
+          echo "LATEST_NAEURAL_CORE_VERSION=$LATEST_VERSION" >> $GITHUB_ENV
+          echo "Latest naeural_core version on PyPI: $LATEST_VERSION"
+
+      - name: Compute image tags
+        run: |
+          echo "IMAGE_TAG=ratio1/edge_node:${VERSION}" >> $GITHUB_ENV
+          echo "Tagging image as: ratio1/edge_node:${VERSION}"
+
+      - name: Tag main commit with version
+        run: |
+          git tag -a "$VERSION" -m "Version $VERSION"
+          git push origin "$VERSION"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: "lab:latest"
+          driver: cloud
+          endpoint: "naeural/naeural-builder"
+
+      - name: Cleanup builder cache
+        run: |
+          echo "=========== buildx du (before) ==========="
+          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
+          echo "=========== buildx prune ==========="
+          docker buildx prune -f --verbose --builder "${{ steps.buildx.outputs.name }}"
+          echo "=========== buildx du (after) ==========="
+          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
+
+      # 1. mainnet CPU
+      - name: Build and push MAINNET CPU image
+        if: ${{ !cancelled() }}
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile_mainnet
+          push: true
+          tags: |
+            ${{ env.IMAGE_TAG }}
+            ratio1/edge_node:latest
+            ratio1/edge_node:mainnet
+
+      # 2. mainnet GPU
+      - name: Build and push MAINNET GPU image
+        if: ${{ !cancelled() }}
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile_mainnet
+          build-args: |
+            BASE_IMAGE=ratio1/base_edge_node_amd64_gpu:latest
+          push: true
+          tags: |
+            ratio1/edge_node_gpu:mainnet
+            ratio1/edge_node_gpu:latest
