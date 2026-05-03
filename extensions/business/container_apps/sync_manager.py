@@ -264,12 +264,23 @@ class SyncManager:
     return self._append_history(history_received_dir(self.owner), entry)
 
   def _latest_in(self, history_dir: Path) -> Optional[dict]:
+    """Return the most recently *written* history entry.
+
+    Sorts by file mtime, not by filename. Filenames are version-prefixed
+    for chronological browsability under normal operation, but the
+    consumer's "what did I last apply?" question is about insert order,
+    not about whatever ``version`` happens to be in the entry. Using
+    mtime keeps the right answer even when a record arrives with a
+    back-dated version (e.g. a clock-skewed provider's snapshot, or any
+    case where multiple providers in a sync set produce non-monotonic
+    timestamps relative to each other).
+    """
     if not history_dir.is_dir():
       return None
-    candidates = sorted(p for p in history_dir.iterdir() if p.suffix == ".json")
+    candidates = [p for p in history_dir.iterdir() if p.suffix == ".json"]
     if not candidates:
       return None
-    latest = candidates[-1]
+    latest = max(candidates, key=lambda p: p.stat().st_mtime)
     try:
       with latest.open("r", encoding="utf-8") as handle:
         return json.load(handle)

@@ -282,14 +282,23 @@ class TestHistory(unittest.TestCase):
     path = self.sm.append_received(entry)
     self.assertEqual(path.parent, history_received_dir(self.owner))
 
-  def test_latest_picks_highest_version(self):
+  def test_latest_picks_most_recently_written(self):
+    """latest_sent / latest_received use mtime, not filename ordering, so a
+    back-dated version (e.g. clock-skewed provider) doesn't permanently
+    'win' over an entry written after it."""
     self.sm.append_sent({"cid": "Qm1", "version": 100})
+    # Tiny sleep to guarantee distinct mtimes on filesystems with low
+    # mtime resolution.
+    import time as _t; _t.sleep(0.01)
     self.sm.append_sent({"cid": "Qm3", "version": 300})
+    _t.sleep(0.01)
+    # Entry written LAST has version=200 — lex-smaller filename than
+    # Qm3's, but the most recent on disk. mtime sort returns it.
     self.sm.append_sent({"cid": "Qm2", "version": 200})
     latest = self.sm.latest_sent()
     self.assertIsNotNone(latest)
-    self.assertEqual(latest["version"], 300)
-    self.assertEqual(latest["cid"], "Qm3")
+    self.assertEqual(latest["cid"], "Qm2")
+    self.assertEqual(latest["version"], 200)
 
   def test_latest_returns_none_when_empty(self):
     self.assertIsNone(self.sm.latest_sent())

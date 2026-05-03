@@ -299,7 +299,16 @@ class _SyncMixin:
   # ----- consumer tick ---------------------------------------------------
 
   def _sync_consumer_tick(self, current_time: float) -> None:
-    """If a newer ChainStore record exists, fetch+extract+restart inline."""
+    """If the ChainStore record points at a different CID than what we last
+    applied, fetch+extract+restart inline. Identity is the CID, not the
+    version: the CID is content-addressed and uniquely identifies the
+    bundle, while ``version`` is informational metadata only (kept for
+    filename ordering + human-readable logs). Comparing CIDs eliminates
+    a class of clock-skew failure modes (a provider's wonky timestamp
+    can never make a consumer permanently ignore a corrected snapshot)
+    and makes multi-provider sync sets coherent without ordering
+    assumptions.
+    """
     sm = self._ensure_sync_manager()
     if sm is None or self._sync_role() != "consumer":
       return
@@ -309,17 +318,18 @@ class _SyncMixin:
     record = sm.fetch_latest()
     if not isinstance(record, dict):
       return
-    new_version = record.get("version")
-    if not isinstance(new_version, int):
+    record_cid = record.get("cid")
+    if not record_cid:
       return
 
     latest_local = sm.latest_received()
-    last_version = (latest_local or {}).get("version") if latest_local else None
-    if isinstance(last_version, int) and new_version <= last_version:
-      return  # already applied
+    last_cid = (latest_local or {}).get("cid") if latest_local else None
+    if last_cid and record_cid == last_cid:
+      return  # same bundle as the last apply — nothing to do
 
     self.P(
-      f"[sync] consumer tick: applying v{new_version} (cid={record.get('cid')})",
+      f"[sync] consumer tick: applying cid={record_cid} "
+      f"(v{record.get('version')})",
       color="b",
     )
 

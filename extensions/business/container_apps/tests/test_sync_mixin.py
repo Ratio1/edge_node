@@ -312,14 +312,52 @@ class TestConsumerTick(unittest.TestCase):
     self.assertEqual(target.read_bytes(), b"data1")
     self.assertTrue((volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists())
 
-  def test_skips_already_applied_version(self):
+  def test_skips_when_record_cid_matches_last_apply(self):
+    """The consumer's 'is this new?' check is by CID, not version. A second
+    tick that sees the same ChainStore record (same cid) is a no-op even
+    if version metadata changed."""
     self._publish()
     self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
     self.consumer_plugin.lifecycle_log.clear()
     self.consumer_plugin._last_sync_check = 0  # reset throttle
-    # Tick again without a new publish — should be a no-op.
+    # Tick again without a new publish — should be a no-op (same cid).
     self.consumer_plugin._sync_consumer_tick(current_time=3000.0)
     self.assertEqual(self.consumer_plugin.lifecycle_log, [])
+
+  def test_applies_when_cid_differs_even_if_version_lower(self):
+    """A consumer should apply any record whose cid differs from the last
+    applied entry, regardless of version ordering. This guards against
+    clock-skew failure modes where a provider's wonky timestamp could
+    otherwise make a corrected snapshot look 'older'."""
+    # First publish + apply (creates a baseline received entry).
+    self._publish(content=b"initial")
+    self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+    initial_received = self.consumer_plugin._sync_manager.latest_received()
+    self.assertIsNotNone(initial_received)
+    initial_version = initial_received["version"]
+
+    # Hand-craft a chainstore record with a *lower* version but a fresh CID.
+    # Under the old version-comparison logic this would be skipped; under
+    # CID comparison it must be applied.
+    spoofed_cid = "QmSPOOF_LOWER_VERSION_FRESH_CONTENT"
+    fake_tar = self.consumer_owner._r1fs.added.get(initial_received["cid"], b"")
+    self.consumer_owner._r1fs.added[spoofed_cid] = fake_tar
+    self.consumer_owner._cs.store[("CHAINSTORE_SYNC", "SYNC-KEY-1")] = {
+      "cid": spoofed_cid,
+      "version": initial_version - 100,  # explicitly older
+      "timestamp": 0.5,
+      "node_id": "ee_other",
+      "metadata": {"who": "wonky-clock"},
+      "manifest": initial_received["manifest"],
+    }
+
+    self.consumer_plugin.lifecycle_log.clear()
+    self.consumer_plugin._last_sync_check = 0
+    self.consumer_plugin._sync_consumer_tick(current_time=3000.0)
+    # The new (lower-versioned but different-cid) record was applied.
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start"])
+    latest = self.consumer_plugin._sync_manager.latest_received()
+    self.assertEqual(latest["cid"], spoofed_cid)
 
   def test_misalignment_skips_apply(self):
     # Store a record in chainstore that references a path consumer can't map.
