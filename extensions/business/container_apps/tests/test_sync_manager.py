@@ -45,14 +45,21 @@ def _make_owner(tmpdir: Path) -> SimpleNamespace:
   }
   (tmpdir / "tmpfs_legacy").mkdir()
 
+  output_folder = tmpdir / "output"
+  output_folder.mkdir()
+
   msgs: list[str] = []
   return SimpleNamespace(
     get_data_folder=lambda: str(data_folder),
     _get_instance_data_subfolder=lambda: instance_subfolder,
+    get_output_folder=lambda: str(output_folder),
     volumes=volumes,
     time=lambda: 1714742400.0,
+    ee_id="ee_test_provider",
     P=lambda msg, color=None: msgs.append(f"[{color or ''}] {msg}"),
     _msgs=msgs,
+    _fixed_root=fixed_root,
+    _output_folder=output_folder,
   )
 
 
@@ -229,6 +236,217 @@ class TestHistory(unittest.TestCase):
       history_sent_dir(self.owner), entry, succeeded=True, error=None
     )
     self.assertTrue(any("history file missing" in m for m in self.owner._msgs))
+
+
+# ---------------------------------------------------------------------------
+# claim_request
+# ---------------------------------------------------------------------------
+
+class TestClaimRequest(unittest.TestCase):
+  def setUp(self):
+    self._tmp = tempfile.TemporaryDirectory()
+    self.tmpdir = Path(self._tmp.name)
+    self.owner = _make_owner(self.tmpdir)
+    self.sm = SyncManager(self.owner)
+    # Provision the volume-sync subdir on the host (mimics _configure_system_volume)
+    self.vsd = volume_sync_dir(self.owner)
+    self.vsd.mkdir(parents=True, exist_ok=True)
+
+  def tearDown(self):
+    self._tmp.cleanup()
+
+  def _write_request(self, body):
+    (self.vsd / "request.json").write_text(json.dumps(body))
+
+  def _read_invalid(self):
+    p = self.vsd / "request.json.invalid"
+    if not p.exists():
+      return None
+    return json.loads(p.read_text())
+
+  def _read_response(self):
+    p = self.vsd / "response.json"
+    if not p.exists():
+      return None
+    return json.loads(p.read_text())
+
+  def test_no_pending_returns_none(self):
+    self.assertIsNone(self.sm.claim_request())
+
+  def test_happy_path(self):
+    self._write_request({"archive_paths": ["/app/data/"], "metadata": {"k": 1}})
+    result = self.sm.claim_request()
+    self.assertIsNotNone(result)
+    archive_paths, metadata = result
+    self.assertEqual(archive_paths, ["/app/data/"])
+    self.assertEqual(metadata, {"k": 1})
+    # request.json gone, .processing present, no .invalid
+    self.assertFalse((self.vsd / "request.json").exists())
+    self.assertTrue((self.vsd / "request.json.processing").exists())
+    self.assertIsNone(self._read_invalid())
+
+  def test_malformed_json(self):
+    (self.vsd / "request.json").write_text("not-json{")
+    self.assertIsNone(self.sm.claim_request())
+    invalid = self._read_invalid()
+    self.assertIsNotNone(invalid)
+    self.assertIsNone(invalid["request"])
+    self.assertEqual(invalid["_error"]["stage"], "validation")
+    self.assertIn("malformed JSON", invalid["_error"]["error"])
+    self.assertEqual(invalid["_error"]["raw_body"], "not-json{")
+    response = self._read_response()
+    self.assertEqual(response["status"], "error")
+    self.assertEqual(response["stage"], "validation")
+    self.assertFalse((self.vsd / "request.json.processing").exists())
+
+  def test_not_an_object(self):
+    self._write_request(["just", "a", "list"])
+    self.assertIsNone(self.sm.claim_request())
+    self.assertEqual(self._read_invalid()["_error"]["error"],
+                     "request.json must be a JSON object")
+
+  def test_missing_archive_paths(self):
+    self._write_request({"metadata": {}})
+    self.assertIsNone(self.sm.claim_request())
+    self.assertIn("archive_paths must be a non-empty list",
+                  self._read_invalid()["_error"]["error"])
+
+  def test_empty_archive_paths(self):
+    self._write_request({"archive_paths": []})
+    self.assertIsNone(self.sm.claim_request())
+    self.assertIn("archive_paths must be a non-empty list",
+                  self._read_invalid()["_error"]["error"])
+
+  def test_metadata_must_be_object(self):
+    self._write_request({"archive_paths": ["/app/data/"], "metadata": "nope"})
+    self.assertIsNone(self.sm.claim_request())
+    self.assertIn("metadata must be a JSON object",
+                  self._read_invalid()["_error"]["error"])
+
+  def test_path_traversal_rejected(self):
+    self._write_request({"archive_paths": ["/app/../../etc/passwd"]})
+    self.assertIsNone(self.sm.claim_request())
+    invalid = self._read_invalid()
+    self.assertEqual(invalid["_error"]["stage"], "validation")
+    self.assertIn("..", invalid["_error"]["error"])
+    self.assertEqual(invalid["request"]["archive_paths"], ["/app/../../etc/passwd"])
+
+  def test_unmounted_path_rejected(self):
+    self._write_request({"archive_paths": ["/nope/"]})
+    self.assertIsNone(self.sm.claim_request())
+    self.assertIn("no mounted volume covers",
+                  self._read_invalid()["_error"]["error"])
+
+  def test_non_fixed_size_rejected(self):
+    self._write_request({"archive_paths": ["/app/legacy/x"]})
+    self.assertIsNone(self.sm.claim_request())
+    self.assertIn("non-fixed-size mount",
+                  self._read_invalid()["_error"]["error"])
+
+  def test_system_volume_rejected(self):
+    self._write_request({"archive_paths": ["/r1en_system/x"]})
+    self.assertIsNone(self.sm.claim_request())
+    self.assertIn("anti-recursion",
+                  self._read_invalid()["_error"]["error"])
+
+  def test_invalid_response_carries_archive_paths(self):
+    self._write_request({"archive_paths": ["/nope/"], "metadata": {"v": 1}})
+    self.sm.claim_request()
+    response = self._read_response()
+    self.assertEqual(response["archive_paths"], ["/nope/"])
+
+  def test_failure_clears_processing(self):
+    self._write_request({"archive_paths": ["/nope/"]})
+    self.sm.claim_request()
+    self.assertFalse((self.vsd / "request.json.processing").exists())
+
+
+# ---------------------------------------------------------------------------
+# make_archive + extract_archive
+# ---------------------------------------------------------------------------
+
+class TestArchiveRoundtrip(unittest.TestCase):
+  """Build a tar from a fake provider mount, extract it into a fake consumer
+  mount with the same container path layout, and confirm bytes round-trip."""
+
+  def setUp(self):
+    self._tmp = tempfile.TemporaryDirectory()
+    self.tmpdir = Path(self._tmp.name)
+    self.provider = _make_owner(self.tmpdir / "provider")
+    self.consumer = _make_owner(self.tmpdir / "consumer")
+    self.sm_p = SyncManager(self.provider)
+    self.sm_c = SyncManager(self.consumer)
+    # Seed provider's /app/data with content
+    self.appdata_p = self.provider._fixed_root / "appdata"
+    (self.appdata_p / "foo.bin").write_bytes(b"hello world\x00\xff")
+    (self.appdata_p / "subdir").mkdir()
+    (self.appdata_p / "subdir" / "nested.txt").write_text("nested!")
+
+  def tearDown(self):
+    self._tmp.cleanup()
+
+  def test_round_trip_directory(self):
+    tar_path, size = self.sm_p.make_archive(["/app/data/"])
+    self.assertTrue(os.path.isfile(tar_path))
+    self.assertGreater(size, 0)
+
+    extracted = self.sm_c.extract_archive(tar_path)
+    self.assertTrue(any(e == "/app/data/" or e.startswith("/app/data/") for e in extracted))
+
+    appdata_c = self.consumer._fixed_root / "appdata"
+    self.assertEqual((appdata_c / "foo.bin").read_bytes(), b"hello world\x00\xff")
+    self.assertEqual((appdata_c / "subdir" / "nested.txt").read_text(), "nested!")
+
+  def test_round_trip_file_only(self):
+    tar_path, _ = self.sm_p.make_archive(["/app/data/foo.bin"])
+    self.sm_c.extract_archive(tar_path)
+    self.assertEqual(
+      (self.consumer._fixed_root / "appdata" / "foo.bin").read_bytes(),
+      b"hello world\x00\xff",
+    )
+
+  def test_make_archive_rejects_non_existent_host_path(self):
+    # Container path passes resolve_container_path but host file missing.
+    with self.assertRaisesRegex(FileNotFoundError, "does not exist"):
+      self.sm_p.make_archive(["/app/data/missing.bin"])
+
+  def test_make_archive_propagates_validation(self):
+    with self.assertRaisesRegex(ValueError, "no mounted volume covers"):
+      self.sm_p.make_archive(["/nope/"])
+
+  def test_extract_aborts_on_member_with_no_consumer_mount(self):
+    # Build a bespoke tar with a member at /app/missing/ that consumer
+    # doesn't have a mount for.
+    import tarfile as _tarfile
+    bad_tar = self.tmpdir / "bad.tar.gz"
+    src = self.tmpdir / "src"
+    src.mkdir()
+    (src / "x.bin").write_text("x")
+    with _tarfile.open(str(bad_tar), "w:gz") as tar:
+      tar.add(str(src / "x.bin"), arcname="/app/missing/x.bin")
+
+    with self.assertRaisesRegex(ValueError, "no mounted volume covers"):
+      self.sm_c.extract_archive(str(bad_tar))
+    # No file was created
+    self.assertFalse((self.consumer._fixed_root / "appdata" / "x.bin").exists())
+
+  def test_extract_skips_symlink_members(self):
+    import tarfile as _tarfile
+    sym_tar = self.tmpdir / "sym.tar.gz"
+    src = self.tmpdir / "sym_src"
+    src.mkdir()
+    (src / "real.txt").write_text("real")
+    link_path = src / "link"
+    os.symlink("real.txt", str(link_path))
+    with _tarfile.open(str(sym_tar), "w:gz") as tar:
+      tar.add(str(src / "real.txt"), arcname="/app/data/real.txt")
+      info = tar.gettarinfo(str(link_path), arcname="/app/data/link")
+      tar.addfile(info)
+    self.sm_c.extract_archive(str(sym_tar))
+    self.assertEqual(
+      (self.consumer._fixed_root / "appdata" / "real.txt").read_text(), "real"
+    )
+    self.assertFalse((self.consumer._fixed_root / "appdata" / "link").exists())
 
 
 if __name__ == "__main__":

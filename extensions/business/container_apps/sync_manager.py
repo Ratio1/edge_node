@@ -314,6 +314,64 @@ class SyncManager:
     self._write_json_atomic(path, data)
 
   # ----- provider --------------------------------------------------------
+  def _fail_request(
+    self,
+    request_body: Optional[dict],
+    stage: str,
+    error: str,
+    processing_path: Optional[Path],
+    raw_body: Optional[str] = None,
+  ) -> None:
+    """Write request.json.invalid + response.json (error), discard .processing.
+
+    Used by both claim_request validation failures and publish_snapshot
+    execution failures so the artifact pair is consistent across stages.
+    """
+    failed_ts = self.owner.time()
+    node_id = getattr(self.owner, "ee_id", None) or getattr(self.owner, "node_id", None)
+    invalid_payload: dict[str, Any] = {
+      "request": request_body,  # may be None for malformed JSON
+      "_error": {
+        "stage": stage,
+        "error": error,
+        "failed_timestamp": failed_ts,
+        "node_id": node_id,
+      },
+    }
+    if raw_body is not None and request_body is None:
+      invalid_payload["_error"]["raw_body"] = raw_body[:1024]
+
+    vsd = volume_sync_dir(self.owner)
+    try:
+      self._write_json_atomic(vsd / SYNC_INVALID_FILE, invalid_payload)
+    except Exception as exc:
+      self.owner.P(f"[sync] failed to write request.json.invalid: {exc}", color="r")
+
+    archive_paths: list[Any] = []
+    if isinstance(request_body, dict):
+      ap = request_body.get("archive_paths")
+      if isinstance(ap, list):
+        archive_paths = ap
+    response_payload = {
+      "status": "error",
+      "stage": stage,
+      "error": error,
+      "failed_timestamp": failed_ts,
+      "archive_paths": archive_paths,
+    }
+    try:
+      self._write_json_atomic(vsd / SYNC_RESPONSE_FILE, response_payload)
+    except Exception as exc:
+      self.owner.P(f"[sync] failed to write response.json: {exc}", color="r")
+
+    if processing_path is not None and processing_path.exists():
+      try:
+        os.unlink(str(processing_path))
+      except OSError as exc:
+        self.owner.P(
+          f"[sync] failed to delete .processing after error: {exc}", color="r"
+        )
+
   def claim_request(self) -> Optional[tuple[list[str], dict]]:
     """Atomically claim the pending request.json, validate, return its payload.
 
@@ -324,15 +382,98 @@ class SyncManager:
     ``response.json`` (error shape), discards the ``.processing`` file, and
     returns ``None``.
     """
-    raise NotImplementedError
+    vsd = volume_sync_dir(self.owner)
+    req_path = vsd / SYNC_REQUEST_FILE
+    proc_path = vsd / SYNC_PROCESSING_FILE
+
+    if not req_path.is_file():
+      return None  # nothing pending
+
+    try:
+      os.replace(str(req_path), str(proc_path))
+    except OSError as exc:
+      self.owner.P(
+        f"[sync] could not rename request.json -> .processing: {exc}", color="r"
+      )
+      return None
+
+    raw_body: Optional[str] = None
+    try:
+      raw_body = proc_path.read_text(encoding="utf-8")
+    except OSError as exc:
+      self._fail_request(
+        None, STAGE_VALIDATION, f"could not read .processing: {exc}", proc_path
+      )
+      return None
+
+    try:
+      body = json.loads(raw_body)
+    except json.JSONDecodeError as exc:
+      self._fail_request(
+        None, STAGE_VALIDATION, f"malformed JSON: {exc}", proc_path, raw_body=raw_body
+      )
+      return None
+
+    if not isinstance(body, dict):
+      self._fail_request(
+        None, STAGE_VALIDATION,
+        "request.json must be a JSON object", proc_path, raw_body=raw_body,
+      )
+      return None
+
+    archive_paths = body.get("archive_paths")
+    metadata = body.get("metadata", {}) or {}
+    if not isinstance(metadata, dict):
+      self._fail_request(
+        body, STAGE_VALIDATION, "metadata must be a JSON object", proc_path
+      )
+      return None
+
+    if not isinstance(archive_paths, list) or not archive_paths:
+      self._fail_request(
+        body, STAGE_VALIDATION,
+        "archive_paths must be a non-empty list of container-absolute paths",
+        proc_path,
+      )
+      return None
+
+    for entry in archive_paths:
+      try:
+        self.resolve_container_path(entry)
+      except ValueError as exc:
+        self._fail_request(body, STAGE_VALIDATION, str(exc), proc_path)
+        return None
+
+    return list(archive_paths), dict(metadata)
 
   def make_archive(self, archive_paths: list[str]) -> tuple[str, int]:
     """Build the snapshot tar.gz under the plugin output folder.
 
     Tar member names are the **container paths** (so consumers can reverse-
     resolve via their own self.volumes). Returns ``(tar_path, size_bytes)``.
+    Re-runs ``resolve_container_path`` for each entry as defence in depth.
     """
-    raise NotImplementedError
+    output_dir: Path
+    get_output = getattr(self.owner, "get_output_folder", None)
+    if callable(get_output):
+      output_dir = Path(get_output())
+    else:
+      output_dir = Path(tempfile.gettempdir())
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ts = int(self.owner.time())
+    tar_path = output_dir / f"sync_archive_{ts}_{os.getpid()}.tar.gz"
+
+    with tarfile.open(str(tar_path), "w:gz") as tar:
+      for container_path in archive_paths:
+        host_path, _bind, _host_root = self.resolve_container_path(container_path)
+        if not os.path.exists(host_path):
+          raise FileNotFoundError(
+            f"archive_paths target does not exist on host: {container_path!r} -> {host_path!r}"
+          )
+        tar.add(host_path, arcname=container_path, recursive=True)
+
+    return str(tar_path), os.path.getsize(str(tar_path))
 
   def publish_snapshot(self, archive_paths: list[str], metadata: dict) -> bool:
     """Full provider orchestration. See plan section "Code layout"."""
@@ -352,10 +493,81 @@ class SyncManager:
   def extract_archive(self, tar_path: str) -> list[str]:
     """Reverse-map tar member container paths to host paths and extract.
 
-    Aborts the entire extract on any unmapped/invalid member (no partial
-    state). Returns the list of container paths that were extracted.
+    Two-pass: first pass validates every member by feeding its name through
+    ``resolve_container_path`` (so the entire extract aborts before any
+    write if the consumer's volume layout doesn't cover all members).
+    Symlinks/hardlinks are skipped with a warning — never extracted, since
+    a malicious tar could otherwise create a link that subsequent regular
+    members would write through. Each regular file is written via tmp +
+    ``os.replace`` so a mid-flight crash never leaves a half-written file.
+    Returns the list of container paths that were applied (regular files +
+    directories created).
     """
-    raise NotImplementedError
+    extracted: list[str] = []
+    with tarfile.open(str(tar_path), "r:gz") as tar:
+      members = tar.getmembers()
+
+      # Pass 1: validate every member, build (member, host_path) pairs.
+      # Python's tarfile.add() strips leading '/' from arcnames as a POSIX
+      # safety default, so member names look like "app/data/foo.bin" even
+      # when we put them in as "/app/data/foo.bin". Normalize back to the
+      # container-absolute form before running through the resolver.
+      planned: list[tuple[tarfile.TarInfo, str]] = []
+      for member in members:
+        if member.issym() or member.islnk():
+          self.owner.P(
+            f"[sync] skipping link member in tar (security): {member.name}",
+            color="y",
+          )
+          continue
+        if any(part == ".." for part in member.name.split("/")):
+          raise ValueError(f"tar member name contains '..': {member.name!r}")
+        container_name = member.name
+        if not container_name.startswith("/"):
+          container_name = "/" + container_name
+        host_path, _bind, _host_root = self.resolve_container_path(container_name)
+        planned.append((member, host_path, container_name))
+
+      # Pass 2: actually extract.
+      for member, host_path, container_name in planned:
+        if member.isdir():
+          os.makedirs(host_path, exist_ok=True)
+          extracted.append(container_name)
+          continue
+        if not member.isfile():
+          continue
+        os.makedirs(os.path.dirname(host_path), exist_ok=True)
+        fobj = tar.extractfile(member)
+        if fobj is None:
+          continue
+        # Atomic per-file write: tmp in same directory, then os.replace.
+        fd, tmp_name = tempfile.mkstemp(
+          dir=os.path.dirname(host_path),
+          prefix=f".{os.path.basename(host_path)}.",
+          suffix=".tmp",
+        )
+        try:
+          with os.fdopen(fd, "wb") as out:
+            while True:
+              chunk = fobj.read(1024 * 1024)
+              if not chunk:
+                break
+              out.write(chunk)
+          os.replace(tmp_name, host_path)
+        except Exception:
+          try:
+            os.unlink(tmp_name)
+          except OSError:
+            pass
+          raise
+        try:
+          os.chmod(host_path, member.mode & 0o7777)
+        except OSError as exc:
+          self.owner.P(
+            f"[sync] could not chmod extracted file {host_path}: {exc}", color="y"
+          )
+        extracted.append(container_name)
+    return extracted
 
   def apply_snapshot(self, record: dict) -> bool:
     """Full consumer orchestration. See plan section "Code layout"."""
