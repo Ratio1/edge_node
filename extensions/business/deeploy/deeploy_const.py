@@ -16,6 +16,9 @@ class DEEPLOY_KEYS:
   ERROR = "error"
   TRACE = "trace"
   REQUEST = "request"
+  REQUESTS = "requests"
+  RESULTS = "results"
+  ITEM_INDEX = "item_index"
   RETURN_REQUEST = "return_request"
   STATUS_DETAILS = "status_details"
   APPS = "apps"
@@ -46,6 +49,14 @@ class DEEPLOY_KEYS:
   ONLINE = "online"
   CHAIN_JOB = "chain_job"
   JOB_CONFIG = "job_config"
+  STACK_JOB_CONFIG = "stack_job_config"
+  STACK_ID = "stack_id"
+  STACK_ALIAS = "stack_alias"
+  STACK_INDEX = "stack_index"
+  STACK_SIZE = "stack_size"
+  STACK_CONTAINER_REF = "stack_container_ref"
+  STACK_CONTAINER_ALIAS = "stack_container_alias"
+  STACK_TYPE = "stack_type"
   # App params keys
   APP_PARAMS = "app_params"
   APP_PARAMS_IMAGE = "IMAGE"
@@ -68,6 +79,7 @@ class DEEPLOY_KEYS:
 
 class DEEPLOY_STATUS:
   SUCCESS = "success"
+  PARTIAL = "partial"
   FAIL = "fail"
   ERROR = "error"
   PENDING = "pending"
@@ -590,6 +602,12 @@ DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN = {
       "TUNNEL_ENGINE_ENABLED": False
     }
   ]
+}
+
+DEEPLOY_CREATE_BATCH_REQUEST = {
+  DEEPLOY_KEYS.REQUESTS: [
+    DEEPLOY_CREATE_REQUEST,
+  ],
 }
 
 ###################################################################################################################
