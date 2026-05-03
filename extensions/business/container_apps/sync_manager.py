@@ -146,29 +146,140 @@ class SyncManager:
     Returns ``(host_path, bind_root, host_root)`` on success, raises
     ``ValueError`` on any rule violation.
     """
-    raise NotImplementedError
+    if not isinstance(container_path, str) or not container_path:
+      raise ValueError(f"archive_paths entry must be a non-empty string: {container_path!r}")
+
+    # Reject explicit '..' segments BEFORE normalization (rule 5). normpath
+    # will collapse them silently and we want the error to be clear.
+    parts = container_path.split("/")
+    if any(p == ".." for p in parts):
+      raise ValueError(f"archive_paths entries must not contain '..': {container_path!r}")
+
+    cp = os.path.normpath(container_path)
+    if not cp.startswith("/"):  # rule 1
+      raise ValueError(f"archive_paths entries must be absolute: {container_path!r}")
+
+    # Rule 4: refuse the system volume mount itself.
+    if cp == SYSTEM_VOLUME_MOUNT or cp.startswith(SYSTEM_VOLUME_MOUNT + "/"):
+      raise ValueError(
+        f"refusing to archive system volume content (anti-recursion): {container_path!r}"
+      )
+
+    fixed_root_marker = os.sep + os.path.join("fixed_volumes", "mounts") + os.sep
+
+    volumes = getattr(self.owner, "volumes", {}) or {}
+    for host_root, spec in volumes.items():
+      if not isinstance(spec, dict):
+        continue
+      bind = str(spec.get("bind", "")).rstrip("/")
+      if not bind:
+        continue
+      # Rule 2: container path must fall under this mount's bind point.
+      if cp != bind and not cp.startswith(bind + "/"):
+        continue
+
+      host_root_n = os.path.normpath(str(host_root))
+      # Rule 3: only fixed-size volumes are eligible. Their host root sits
+      # under <plugin_data>/fixed_volumes/mounts/. This rejects VOLUMES,
+      # FILE_VOLUMES, anonymous Docker mounts, and ephemeral container fs.
+      if fixed_root_marker not in (host_root_n + os.sep):
+        raise ValueError(
+          f"refusing non-fixed-size mount for {container_path!r}: "
+          f"host_root={host_root_n!r} (only FIXED_SIZE_VOLUMES-backed paths allowed)"
+        )
+
+      rel = "" if cp == bind else os.path.relpath(cp, bind)
+      host_path = os.path.normpath(os.path.join(host_root_n, rel))
+      # Rule 6: resolved path must stay within host_root.
+      if not (host_path == host_root_n or host_path.startswith(host_root_n + os.sep)):
+        raise ValueError(
+          f"resolved host path escapes mount root: {container_path!r} -> {host_path!r}"
+        )
+      return host_path, bind, host_root_n
+
+    raise ValueError(f"no mounted volume covers {container_path!r}")
 
   # ----- atomic I/O -------------------------------------------------------
   def _write_json_atomic(self, path: Path, payload: Any) -> None:
-    """Write JSON to ``path`` atomically (tmp + os.replace)."""
-    raise NotImplementedError
+    """Write JSON to ``path`` atomically (tmp + ``os.replace``).
+
+    Creates the parent directory if missing. Uses a NamedTemporaryFile in
+    the same directory so ``os.replace`` is an atomic rename within one
+    filesystem.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+      dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+      with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+        handle.flush()
+        os.fsync(handle.fileno())
+      os.replace(tmp_name, str(path))
+    except Exception:
+      try:
+        os.unlink(tmp_name)
+      except OSError:
+        pass
+      raise
 
   # ----- history ---------------------------------------------------------
+  @staticmethod
+  def _history_filename(version: int, cid: str) -> str:
+    """Build the canonical filename for a history entry.
+
+    ``<10-digit-version>__<12-char-cid>.json`` so lexical sort matches
+    chronological order (version is a Unix timestamp).
+    """
+    short_cid = (cid or "")[:12] or "no_cid"
+    # safe_path_component-like sanitisation kept simple — CIDs are base58.
+    safe_short = "".join(ch if ch.isalnum() else "_" for ch in short_cid)
+    return f"{int(version):010d}__{safe_short}.json"
+
+  def _ensure_history_dirs(self) -> None:
+    history_sent_dir(self.owner).mkdir(parents=True, exist_ok=True)
+    history_received_dir(self.owner).mkdir(parents=True, exist_ok=True)
+
+  def _append_history(self, history_dir: Path, entry: dict) -> Path:
+    self._ensure_history_dirs()
+    fname = self._history_filename(entry.get("version", 0), entry.get("cid", ""))
+    path = history_dir / fname
+    payload = dict(entry)
+    payload.setdefault("deletion", dict(_UNDELETED))
+    self._write_json_atomic(path, payload)
+    return path
+
   def append_sent(self, entry: dict) -> Path:
     """Write a provider history entry to sync_history/sent/."""
-    raise NotImplementedError
+    return self._append_history(history_sent_dir(self.owner), entry)
 
   def append_received(self, entry: dict) -> Path:
     """Write a consumer history entry to sync_history/received/."""
-    raise NotImplementedError
+    return self._append_history(history_received_dir(self.owner), entry)
+
+  def _latest_in(self, history_dir: Path) -> Optional[dict]:
+    if not history_dir.is_dir():
+      return None
+    candidates = sorted(p for p in history_dir.iterdir() if p.suffix == ".json")
+    if not candidates:
+      return None
+    latest = candidates[-1]
+    try:
+      with latest.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+      self.owner.P(f"[sync] failed to read history file {latest}: {exc}", color="r")
+      return None
 
   def latest_sent(self) -> Optional[dict]:
     """Return the most recent provider history entry, or None if empty."""
-    raise NotImplementedError
+    return self._latest_in(history_sent_dir(self.owner))
 
   def latest_received(self) -> Optional[dict]:
     """Return the most recent consumer history entry, or None if empty."""
-    raise NotImplementedError
+    return self._latest_in(history_received_dir(self.owner))
 
   def update_history_deletion(
     self, history_dir: Path, entry: dict, succeeded: bool, error: Optional[str]
@@ -177,8 +288,30 @@ class SyncManager:
 
     Atomic via tmp+rename. Identifies the file by its filename convention
     (``<version>__<short_cid>.json``) derived from the entry's fields.
+    Silently logs and returns if the file isn't found.
     """
-    raise NotImplementedError
+    fname = self._history_filename(entry.get("version", 0), entry.get("cid", ""))
+    path = Path(history_dir) / fname
+    if not path.is_file():
+      self.owner.P(
+        f"[sync] history file missing for deletion update: {path}", color="y"
+      )
+      return
+    try:
+      with path.open("r", encoding="utf-8") as handle:
+        data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+      self.owner.P(
+        f"[sync] failed to read history file for deletion update {path}: {exc}",
+        color="r",
+      )
+      return
+    data["deletion"] = {
+      "deleted_at": self.owner.time(),
+      "deletion_succeeded": bool(succeeded),
+      "deletion_error": error,
+    }
+    self._write_json_atomic(path, data)
 
   # ----- provider --------------------------------------------------------
   def claim_request(self) -> Optional[tuple[list[str], dict]]:
