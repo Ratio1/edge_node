@@ -205,7 +205,10 @@ class SyncManager:
 
     Creates the parent directory if missing. Uses a NamedTemporaryFile in
     the same directory so ``os.replace`` is an atomic rename within one
-    filesystem.
+    filesystem. The final file is chmod'd to 0o666 because CAR runs as
+    root inside the edge node but the app inside the container typically
+    runs as a non-root user — without world-readable mode the app can't
+    read response.json / last_apply.json / request.json.invalid.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,6 +220,7 @@ class SyncManager:
         json.dump(payload, handle, indent=2, sort_keys=True)
         handle.flush()
         os.fsync(handle.fileno())
+      os.chmod(tmp_name, 0o666)
       os.replace(tmp_name, str(path))
     except Exception:
       try:
@@ -680,6 +684,12 @@ class SyncManager:
       for member, host_path, container_name in planned:
         if member.isdir():
           os.makedirs(host_path, exist_ok=True)
+          # Widen dir mode so the in-container app user can traverse, even
+          # if CAR (running as root in the edge node) created the directory.
+          try:
+            os.chmod(host_path, max(member.mode & 0o7777, 0o755))
+          except OSError:
+            pass
           extracted.append(container_name)
           continue
         if not member.isfile():
@@ -701,6 +711,11 @@ class SyncManager:
               if not chunk:
                 break
               out.write(chunk)
+          # Widen mode before replace: extracted files end up owned by root
+          # (CAR runs as root); the app inside the container is typically a
+          # non-root user. Preserve the source mode but ensure at least
+          # world-readable so the app can ``cat`` what we just landed.
+          os.chmod(tmp_name, max(member.mode & 0o7777, 0o644))
           os.replace(tmp_name, host_path)
         except Exception:
           try:
@@ -708,12 +723,6 @@ class SyncManager:
           except OSError:
             pass
           raise
-        try:
-          os.chmod(host_path, member.mode & 0o7777)
-        except OSError as exc:
-          self.owner.P(
-            f"[sync] could not chmod extracted file {host_path}: {exc}", color="y"
-          )
         extracted.append(container_name)
     return extracted
 
