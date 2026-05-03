@@ -88,9 +88,13 @@ class _SyncMixin:
       / "fixed_volumes"
     )
 
-    # Recover any stale mounts from prior crashes (parity with
-    # _configure_fixed_size_volumes).
-    fixed_volume.cleanup_stale_mounts(root, logger=self.P)
+    # NOTE: deliberately do NOT call fixed_volume.cleanup_stale_mounts here.
+    # _FixedSizeVolumesMixin._configure_fixed_size_volumes() runs BEFORE us
+    # in on_init / _restart_container and already scans meta/ for the whole
+    # root. Calling it again from here would unmount any FIXED_SIZE_VOLUMES
+    # entries that the previous step just provisioned (because their meta/
+    # files exist) and then we'd never re-mount them — the data volume
+    # would land empty in the container.
 
     owner_uid, owner_gid = (None, None)
     resolver = getattr(self, "_resolve_image_owner", None)
