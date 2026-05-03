@@ -120,9 +120,29 @@ class _SyncMixin:
     self.volumes.update(fixed_volume.docker_bind_spec(vol, SYSTEM_VOLUME_MOUNT))
 
     # Ensure volume-sync subdir exists before container start so the app
-    # can drop a request.json on its first tick.
+    # can drop a request.json on its first tick. Chmod 0o777 so non-root
+    # apps inside the container can write here regardless of whether
+    # _resolve_image_owner() returned a usable UID/GID. This is safe:
+    # the system volume is per-CAR-instance and the app already owns the
+    # rest of its container — there's no isolation gain in restricting
+    # the control-plane subdir to root.
     vsd = volume_sync_dir(self)
     vsd.mkdir(parents=True, exist_ok=True)
+    try:
+      os.chmod(str(vsd), 0o777)
+    except OSError as exc:
+      self.P(
+        f"[sync] could not chmod {vsd} to 0o777: {exc}", color="y"
+      )
+    # Also widen the mount root so writes that need to land at the
+    # volume root (rare but possible for future control-plane features)
+    # don't 13-EACCES against a root-owned filesystem.
+    try:
+      os.chmod(str(vol.mount_path), 0o777)
+    except OSError as exc:
+      self.P(
+        f"[sync] could not chmod {vol.mount_path} to 0o777: {exc}", color="y"
+      )
     self.P(
       f"[sync] system volume ready: {vol.mount_path} -> {SYSTEM_VOLUME_MOUNT} "
       f"(volume-sync at {vsd})",
