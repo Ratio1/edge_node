@@ -84,6 +84,7 @@ from .mixins import (
   _FixedSizeVolumesMixin,
   _ImagePullBackoffMixin,
   _RestartBackoffMixin,
+  _SyncMixin,
   _TunnelBackoffMixin,
 )
 
@@ -313,6 +314,18 @@ _CONFIG = {
                                 #   {"vol_name": {"SIZE": "100M", "MOUNTING_POINT": "/app/data", "FS_TYPE": "ext4",
                                 #                 "OWNER_UID": None, "OWNER_GID": None, "FORCE_RECREATE": False}}
 
+  # Volume-sync (cross-node state replication). Always-on /r1en_system system
+  # volume is provisioned regardless; SYNC.ENABLED only controls the
+  # provider/consumer orchestration on top of it. See sync_manager.py for
+  # the full contract.
+  "SYNC": {
+    "ENABLED": False,             # master switch
+    "KEY": None,                  # shared UUID across the sync set (provider+consumer)
+    "TYPE": None,                 # "provider" | "consumer"
+    "POLL_INTERVAL": 10,          # seconds between sync ticks
+    "INITIAL_SYNC_TIMEOUT": 600,  # consumer-only first-boot block; 0 = wait forever
+  },
+
   # Health check configuration (consolidated)
   # Controls how app readiness is determined before starting tunnels
   #
@@ -373,6 +386,7 @@ class ContainerAppRunnerPlugin(
   _ImagePullBackoffMixin,
   _TunnelBackoffMixin,
   _FixedSizeVolumesMixin,
+  _SyncMixin,
   _ContainerUtilsMixin,
   BasePlugin,
 ):
@@ -614,6 +628,11 @@ class ContainerAppRunnerPlugin(
     self._last_image_check = 0
     self._last_extra_tunnels_ping = 0
     self._last_paused_log = 0  # Track when we last logged the paused message
+    self._last_sync_check = 0  # _SyncMixin throttle
+
+    # Volume-sync state. SyncManager is lazy-init'd by _ensure_sync_manager
+    # the first time a tick fires (or on_init for early provisioning).
+    self._sync_manager = None
 
     # Image update tracking
     self.current_image_hash = None
@@ -1048,6 +1067,39 @@ class ContainerAppRunnerPlugin(
     return
 
 
+  def _validate_sync_config(self):
+    """
+    Validate the SYNC config block when ENABLED. Disables SYNC with a
+    warning rather than raising — the system volume itself is independent
+    and the rest of the plugin must keep running.
+    """
+    if not self._sync_enabled():
+      return
+    sync = self._sync_cfg()
+    key = sync.get("KEY")
+    role = sync.get("TYPE")
+    if not key or not isinstance(key, str):
+      self.P(
+        "[sync] SYNC.ENABLED but SYNC.KEY missing/empty — disabling SYNC.",
+        color="r",
+      )
+      sync["ENABLED"] = False
+      return
+    if role not in ("provider", "consumer"):
+      self.P(
+        f"[sync] SYNC.TYPE must be 'provider' or 'consumer' (got {role!r}) — disabling SYNC.",
+        color="r",
+      )
+      sync["ENABLED"] = False
+      return
+    self.P(
+      f"[sync] SYNC enabled: role={role}, key={key}, "
+      f"poll={self._sync_poll_interval()}s",
+      color="g",
+    )
+    return
+
+
   def _validate_subclass_config(self):
     """
     Hook for subclasses to enforce additional validation.
@@ -1118,11 +1170,19 @@ class ContainerAppRunnerPlugin(
     self._configure_volumes() # setup container volumes (deprecated)
     self._configure_file_volumes() # setup file volumes with dynamic content
     self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
+    self._configure_system_volume() # always-on /r1en_system control-plane volume
+
+    # If a prior plugin run crashed mid-publish, request.json.processing may
+    # be left over inside volume-sync/. Rename it back so the next tick retries.
+    self._recover_stale_processing()
+
+    self._validate_sync_config()
 
     # If we have semaphored keys, defer _setup_env_and_ports() until semaphores are ready
     # This ensures we get the env vars from provider plugins before starting the container
     if not self._semaphore_get_keys():
       self._setup_env_and_ports()
+      self._inject_sync_env_vars()
     else:
       self.Pd("Deferring _setup_env_and_ports() until semaphores are ready")
 
@@ -3058,6 +3118,8 @@ class ContainerAppRunnerPlugin(
     self._configure_volumes()
     self._configure_file_volumes()
     self._configure_fixed_size_volumes()
+    self._configure_system_volume()
+    self._recover_stale_processing()
 
     # For semaphored containers (consumers), defer env setup and container start
     # to _handle_initial_launch() which properly waits for provider semaphores.
@@ -3076,6 +3138,7 @@ class ContainerAppRunnerPlugin(
     # Non-semaphored containers (providers): configure env and start immediately
     self._configure_dynamic_env()
     self._setup_env_and_ports()
+    self._inject_sync_env_vars()
 
     # Revalidate extra tunnels
     self._validate_extra_tunnels_config()
@@ -3259,7 +3322,12 @@ class ContainerAppRunnerPlugin(
       # Semaphores ready - dynamic env to resolve shmem values, then setup env
       self._configure_dynamic_env()
       self._setup_env_and_ports()
+      self._inject_sync_env_vars()
     # end if
+
+    # Consumer first-boot: block until at least one snapshot is available so
+    # the container starts on a populated /app/data, not an empty volume.
+    self._sync_initial_consumer_block()
 
     try:
       self.P("Initial container launch...")
@@ -3351,6 +3419,17 @@ class ContainerAppRunnerPlugin(
         return StopReason.EXTERNAL_UPDATE
       return None
     """
+    # Volume-sync drives stop_container/start_container INLINE so the loopback
+    # mount survives the archive/extract window. We must not return a
+    # StopReason from here because that would route through _restart_container,
+    # which calls _cleanup_fixed_size_volumes() and unmounts before our work
+    # can run. See plan Step 1 verification for the full rationale.
+    if self._sync_enabled():
+      role = self._sync_role()
+      if role == "provider":
+        self._sync_provider_tick(current_time)
+      elif role == "consumer":
+        self._sync_consumer_tick(current_time)
     return None
 
 
