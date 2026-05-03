@@ -15,6 +15,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from extensions.business.container_apps.sync_manager import (
+  SYNC_PROCESSING_FILE,
   SYSTEM_VOLUME_NAME,
   SYSTEM_VOLUME_MOUNT,
   SyncManager,
@@ -23,6 +24,78 @@ from extensions.business.container_apps.sync_manager import (
   system_volume_host_root,
   volume_sync_dir,
 )
+
+
+class _FakeR1FS:
+  """Minimal r1fs stub for orchestrator tests."""
+
+  def __init__(self):
+    self.added: dict[str, bytes] = {}
+    self.deleted: list[tuple[str, bool, bool]] = []
+    self.add_should_raise: Exception | None = None
+    self.add_should_return_empty = False
+    self.get_should_raise: Exception | None = None
+    self.delete_should_raise: Exception | None = None
+    self._counter = 0
+
+  def add_file(self, file_path: str) -> str:
+    if self.add_should_raise:
+      raise self.add_should_raise
+    if self.add_should_return_empty:
+      return ""
+    self._counter += 1
+    cid = f"QmFAKE{self._counter:08d}"
+    with open(file_path, "rb") as handle:
+      self.added[cid] = handle.read()
+    return cid
+
+  def get_file(self, cid: str) -> str:
+    if self.get_should_raise:
+      raise self.get_should_raise
+    if cid not in self.added:
+      return ""
+    fd, path = tempfile.mkstemp(suffix=".tar.gz")
+    with os.fdopen(fd, "wb") as out:
+      out.write(self.added[cid])
+    return path
+
+  def delete_file(
+    self,
+    cid: str,
+    unpin_remote: bool = False,
+    cleanup_local_files: bool = False,
+    **_kwargs,
+  ) -> dict:
+    if self.delete_should_raise:
+      raise self.delete_should_raise
+    self.added.pop(cid, None)
+    self.deleted.append((cid, unpin_remote, cleanup_local_files))
+    return {"ok": True}
+
+
+class _FakeChainStore:
+  """Minimal chainstore stub: a process-local hkey/key dict."""
+
+  def __init__(self):
+    self.store: dict[tuple[str, str], object] = {}
+    self.hset_calls: list[tuple[str, str, object]] = []
+    self.hsync_calls: list[str] = []
+    self.hset_should_raise: Exception | None = None
+    self.hset_returns: bool = True
+
+  def hset(self, hkey, key, value, **_kwargs):
+    if self.hset_should_raise:
+      raise self.hset_should_raise
+    self.hset_calls.append((hkey, key, value))
+    self.store[(hkey, key)] = value
+    return self.hset_returns
+
+  def hget(self, hkey, key, **_kwargs):
+    return self.store.get((hkey, key))
+
+  def hsync(self, hkey, **_kwargs):
+    self.hsync_calls.append(hkey)
+    return None
 
 
 def _make_owner(tmpdir: Path) -> SimpleNamespace:
@@ -49,17 +122,34 @@ def _make_owner(tmpdir: Path) -> SimpleNamespace:
   output_folder.mkdir()
 
   msgs: list[str] = []
+  r1fs = _FakeR1FS()
+  cs = _FakeChainStore()
+  # Track time so each call to time() returns a slightly larger float, which
+  # lets us emit successive snapshots with distinct version timestamps in
+  # the same test without sleeping.
+  clock = [1714742400.0]
+  def _time():
+    clock[0] += 1.0
+    return clock[0]
   return SimpleNamespace(
     get_data_folder=lambda: str(data_folder),
     _get_instance_data_subfolder=lambda: instance_subfolder,
     get_output_folder=lambda: str(output_folder),
     volumes=volumes,
-    time=lambda: 1714742400.0,
+    time=_time,
     ee_id="ee_test_provider",
+    cfg_sync_key="11111111-1111-1111-1111-111111111111",
+    cfg_sync_type="provider",
+    r1fs=r1fs,
+    chainstore_hset=cs.hset,
+    chainstore_hget=cs.hget,
+    chainstore_hsync=cs.hsync,
     P=lambda msg, color=None: msgs.append(f"[{color or ''}] {msg}"),
     _msgs=msgs,
     _fixed_root=fixed_root,
     _output_folder=output_folder,
+    _r1fs=r1fs,
+    _cs=cs,
   )
 
 
@@ -215,7 +305,7 @@ class TestHistory(unittest.TestCase):
     data = json.loads(path.read_text())
     self.assertTrue(data["deletion"]["deletion_succeeded"])
     self.assertEqual(data["deletion"]["deletion_error"], None)
-    self.assertEqual(data["deletion"]["deleted_at"], 1714742400.0)
+    self.assertGreater(data["deletion"]["deleted_at"], 1714742400.0)
     self.assertEqual(data["cid"], "Qm9")  # rest of payload preserved
 
   def test_update_history_deletion_records_failure(self):
@@ -447,6 +537,320 @@ class TestArchiveRoundtrip(unittest.TestCase):
       (self.consumer._fixed_root / "appdata" / "real.txt").read_text(), "real"
     )
     self.assertFalse((self.consumer._fixed_root / "appdata" / "link").exists())
+
+
+# ---------------------------------------------------------------------------
+# publish_snapshot
+# ---------------------------------------------------------------------------
+
+class TestPublishSnapshot(unittest.TestCase):
+  def setUp(self):
+    self._tmp = tempfile.TemporaryDirectory()
+    self.tmpdir = Path(self._tmp.name)
+    self.owner = _make_owner(self.tmpdir)
+    self.sm = SyncManager(self.owner)
+    self.vsd = volume_sync_dir(self.owner)
+    self.vsd.mkdir(parents=True, exist_ok=True)
+    # Seed the data volume so make_archive can find content
+    appdata = self.owner._fixed_root / "appdata"
+    (appdata / "weights.bin").write_bytes(b"weights-content")
+    # Simulate having claimed a request — leave a .processing file so
+    # publish_snapshot's clean-up paths can be exercised.
+    (self.vsd / SYNC_PROCESSING_FILE).write_text(
+      json.dumps({"archive_paths": ["/app/data/"], "metadata": {}})
+    )
+
+  def tearDown(self):
+    self._tmp.cleanup()
+
+  def test_happy_path_writes_response_history_and_chainstore(self):
+    ok = self.sm.publish_snapshot(["/app/data/"], {"epoch": 1})
+    self.assertTrue(ok)
+
+    # Response.json
+    resp = json.loads((self.vsd / "response.json").read_text())
+    self.assertEqual(resp["status"], "ok")
+    self.assertTrue(resp["cid"].startswith("QmFAKE"))
+    self.assertGreater(resp["archive_size_bytes"], 0)
+    self.assertTrue(resp["chainstore_ack"])
+
+    # ChainStore record
+    self.assertEqual(len(self.owner._cs.hset_calls), 1)
+    hkey, key, value = self.owner._cs.hset_calls[0]
+    self.assertEqual(hkey, "CHAINSTORE_SYNC")
+    self.assertEqual(key, "11111111-1111-1111-1111-111111111111")
+    self.assertEqual(value["cid"], resp["cid"])
+    self.assertEqual(value["manifest"]["archive_paths"], ["/app/data/"])
+    self.assertEqual(value["manifest"]["schema_version"], 1)
+    self.assertEqual(value["manifest"]["archive_format"], "tar.gz")
+    self.assertEqual(value["metadata"], {"epoch": 1})
+
+    # History
+    sent_dir = history_sent_dir(self.owner)
+    files = list(sent_dir.glob("*.json"))
+    self.assertEqual(len(files), 1)
+    entry = json.loads(files[0].read_text())
+    self.assertEqual(entry["cid"], resp["cid"])
+    self.assertEqual(entry["chainstore_ack"], True)
+    self.assertEqual(entry["request"]["archive_paths"], ["/app/data/"])
+    self.assertIsNone(entry["deletion"]["deleted_at"])
+
+    # .processing cleaned up
+    self.assertFalse((self.vsd / "request.json.processing").exists())
+    # No .invalid because success
+    self.assertFalse((self.vsd / "request.json.invalid").exists())
+
+  def test_clears_existing_invalid_on_success(self):
+    (self.vsd / "request.json.invalid").write_text('{"old": true}')
+    self.sm.publish_snapshot(["/app/data/"], {})
+    self.assertFalse((self.vsd / "request.json.invalid").exists())
+
+  def test_archive_build_failure(self):
+    self.owner._fixed_root.joinpath("appdata", "weights.bin").unlink()
+    ok = self.sm.publish_snapshot(["/app/data/missing.bin"], {})
+    self.assertFalse(ok)
+    invalid = json.loads((self.vsd / "request.json.invalid").read_text())
+    self.assertEqual(invalid["_error"]["stage"], "archive_build")
+    resp = json.loads((self.vsd / "response.json").read_text())
+    self.assertEqual(resp["status"], "error")
+    self.assertEqual(resp["stage"], "archive_build")
+    # No history entry written
+    self.assertEqual(len(list(history_sent_dir(self.owner).glob("*.json"))), 0)
+
+  def test_r1fs_upload_failure(self):
+    self.owner._r1fs.add_should_raise = RuntimeError("ipfs offline")
+    ok = self.sm.publish_snapshot(["/app/data/"], {})
+    self.assertFalse(ok)
+    invalid = json.loads((self.vsd / "request.json.invalid").read_text())
+    self.assertEqual(invalid["_error"]["stage"], "r1fs_upload")
+    self.assertIn("ipfs offline", invalid["_error"]["error"])
+    self.assertEqual(self.owner._cs.hset_calls, [])
+
+  def test_chainstore_publish_failure(self):
+    self.owner._cs.hset_should_raise = RuntimeError("peers unreachable")
+    ok = self.sm.publish_snapshot(["/app/data/"], {})
+    self.assertFalse(ok)
+    invalid = json.loads((self.vsd / "request.json.invalid").read_text())
+    self.assertEqual(invalid["_error"]["stage"], "chainstore_publish")
+    # No history because we failed before append
+    self.assertEqual(len(list(history_sent_dir(self.owner).glob("*.json"))), 0)
+    # CID landed in r1fs but was not retired
+    self.assertEqual(len(self.owner._r1fs.added), 1)
+
+  def test_chainstore_no_ack_still_succeeds(self):
+    # hset returning False (no peer confirmation) is recorded but not fatal.
+    self.owner._cs.hset_returns = False
+    ok = self.sm.publish_snapshot(["/app/data/"], {})
+    self.assertTrue(ok)
+    files = list(history_sent_dir(self.owner).glob("*.json"))
+    self.assertEqual(len(files), 1)
+    entry = json.loads(files[0].read_text())
+    self.assertFalse(entry["chainstore_ack"])
+
+  def test_two_snapshots_retire_first_cid(self):
+    self.sm.publish_snapshot(["/app/data/"], {"epoch": 1})
+    # Update content for the second snapshot
+    (self.owner._fixed_root / "appdata" / "weights.bin").write_bytes(b"v2")
+    # Re-create .processing because publish_snapshot deleted it
+    (self.vsd / SYNC_PROCESSING_FILE).write_text("{}")
+    self.sm.publish_snapshot(["/app/data/"], {"epoch": 2})
+
+    files = sorted(history_sent_dir(self.owner).glob("*.json"))
+    self.assertEqual(len(files), 2)
+    older = json.loads(files[0].read_text())
+    newer = json.loads(files[1].read_text())
+
+    self.assertTrue(older["deletion"]["deletion_succeeded"])
+    self.assertIsNotNone(older["deletion"]["deleted_at"])
+    self.assertIsNone(older["deletion"]["error"]) if older["deletion"].get("error") else None
+
+    self.assertIsNone(newer["deletion"]["deleted_at"])
+
+    deleted_cids = [d[0] for d in self.owner._r1fs.deleted]
+    self.assertEqual(deleted_cids, [older["cid"]])
+
+  def test_retire_records_failure(self):
+    self.sm.publish_snapshot(["/app/data/"], {"epoch": 1})
+    (self.owner._fixed_root / "appdata" / "weights.bin").write_bytes(b"v2")
+    (self.vsd / SYNC_PROCESSING_FILE).write_text("{}")
+    self.owner._r1fs.delete_should_raise = RuntimeError("daemon paused")
+
+    self.sm.publish_snapshot(["/app/data/"], {"epoch": 2})
+
+    files = sorted(history_sent_dir(self.owner).glob("*.json"))
+    older = json.loads(files[0].read_text())
+    self.assertFalse(older["deletion"]["deletion_succeeded"])
+    self.assertIn("daemon paused", older["deletion"]["deletion_error"])
+
+  def test_archive_tmp_cleaned_up_on_success(self):
+    self.sm.publish_snapshot(["/app/data/"], {})
+    leftovers = list(self.owner._output_folder.glob("sync_archive_*.tar.gz"))
+    self.assertEqual(leftovers, [])
+
+  def test_archive_tmp_cleaned_up_on_failure(self):
+    self.owner._cs.hset_should_raise = RuntimeError("boom")
+    self.sm.publish_snapshot(["/app/data/"], {})
+    leftovers = list(self.owner._output_folder.glob("sync_archive_*.tar.gz"))
+    self.assertEqual(leftovers, [])
+
+
+# ---------------------------------------------------------------------------
+# fetch_latest + validate_manifest + apply_snapshot
+# ---------------------------------------------------------------------------
+
+class TestConsumerFlow(unittest.TestCase):
+  def setUp(self):
+    self._tmp = tempfile.TemporaryDirectory()
+    self.tmpdir = Path(self._tmp.name)
+    # Build provider AND consumer owners that share an r1fs+chainstore so
+    # we can do a true end-to-end publish→apply round-trip.
+    shared_r1fs = _FakeR1FS()
+    shared_cs = _FakeChainStore()
+
+    self.provider = _make_owner(self.tmpdir / "p")
+    self.consumer = _make_owner(self.tmpdir / "c")
+    for o in (self.provider, self.consumer):
+      o.r1fs = shared_r1fs
+      o._r1fs = shared_r1fs
+      o.chainstore_hset = shared_cs.hset
+      o.chainstore_hget = shared_cs.hget
+      o.chainstore_hsync = shared_cs.hsync
+      o._cs = shared_cs
+    self.consumer.cfg_sync_type = "consumer"
+
+    self.sm_p = SyncManager(self.provider)
+    self.sm_c = SyncManager(self.consumer)
+
+    # Provision provider's volume-sync subdir + seed data
+    volume_sync_dir(self.provider).mkdir(parents=True, exist_ok=True)
+    volume_sync_dir(self.consumer).mkdir(parents=True, exist_ok=True)
+    (self.provider._fixed_root / "appdata" / "weights.bin").write_bytes(b"hello")
+
+  def tearDown(self):
+    self._tmp.cleanup()
+
+  # ----- validate_manifest --------------------------------------------------
+
+  def test_validate_manifest_empty_when_aligned(self):
+    record = {"manifest": {"archive_paths": ["/app/data/"]}}
+    self.assertEqual(self.sm_c.validate_manifest(record), [])
+
+  def test_validate_manifest_returns_missing_paths(self):
+    record = {"manifest": {"archive_paths": ["/app/data/", "/somewhere/else/"]}}
+    self.assertEqual(self.sm_c.validate_manifest(record), ["/somewhere/else/"])
+
+  def test_validate_manifest_handles_no_manifest(self):
+    self.assertEqual(self.sm_c.validate_manifest({}), [])
+    self.assertEqual(self.sm_c.validate_manifest({"manifest": {}}), [])
+
+  # ----- fetch_latest -------------------------------------------------------
+
+  def test_fetch_latest_empty_returns_none(self):
+    self.assertIsNone(self.sm_c.fetch_latest())
+    # hsync was still called
+    self.assertEqual(self.consumer._cs.hsync_calls, ["CHAINSTORE_SYNC"])
+
+  def test_fetch_latest_after_publish_returns_record(self):
+    (self.provider.__dict__["_fixed_root"] / "appdata" / "weights.bin").write_bytes(b"x")
+    (volume_sync_dir(self.provider) / SYNC_PROCESSING_FILE).write_text("{}")
+    self.sm_p.publish_snapshot(["/app/data/"], {"epoch": 5})
+    record = self.sm_c.fetch_latest()
+    self.assertIsNotNone(record)
+    self.assertEqual(record["metadata"], {"epoch": 5})
+
+  def test_fetch_latest_no_sync_key_returns_none(self):
+    self.consumer.cfg_sync_key = None
+    self.assertIsNone(self.sm_c.fetch_latest())
+
+  # ----- apply_snapshot -----------------------------------------------------
+
+  def test_apply_round_trip(self):
+    (volume_sync_dir(self.provider) / SYNC_PROCESSING_FILE).write_text("{}")
+    self.sm_p.publish_snapshot(["/app/data/"], {"epoch": 9})
+
+    record = self.sm_c.fetch_latest()
+    ok = self.sm_c.apply_snapshot(record)
+    self.assertTrue(ok)
+
+    # File extracted
+    target = self.consumer._fixed_root / "appdata" / "weights.bin"
+    self.assertEqual(target.read_bytes(), b"hello")
+
+    # last_apply.json written
+    la = json.loads((volume_sync_dir(self.consumer) / "last_apply.json").read_text())
+    self.assertEqual(la["cid"], record["cid"])
+    self.assertEqual(la["version"], record["version"])
+    self.assertIn("applied_timestamp", la)
+
+    # History entry
+    files = list(history_received_dir(self.consumer).glob("*.json"))
+    self.assertEqual(len(files), 1)
+    entry = json.loads(files[0].read_text())
+    self.assertEqual(entry["cid"], record["cid"])
+    # tarfile strips trailing slashes on directory members; the consumer
+    # re-prepends the leading slash on extract, so directory entries land
+    # without their trailing slash.
+    self.assertEqual(entry["extracted_paths"], ["/app/data", "/app/data/weights.bin"])
+    self.assertIsNone(entry["deletion"]["deleted_at"])
+
+  def test_apply_skips_when_misaligned(self):
+    # Provider includes a path consumer doesn't have a mount for.
+    # We can't legitimately publish such a record (provider would also reject
+    # it), so build it manually and stuff into chainstore.
+    self.consumer._cs.store[("CHAINSTORE_SYNC", self.consumer.cfg_sync_key)] = {
+      "cid": "QmFAKE99999999",
+      "version": 9999999999,
+      "timestamp": 1234.0,
+      "node_id": "ee_someone",
+      "metadata": {},
+      "manifest": {
+        "schema_version": 1,
+        "archive_paths": ["/app/data/", "/foo/bar/"],
+        "archive_format": "tar.gz",
+        "archive_size_bytes": 100,
+      },
+    }
+    record = self.sm_c.fetch_latest()
+    ok = self.sm_c.apply_snapshot(record)
+    self.assertFalse(ok)
+    # No last_apply, no history advance
+    self.assertFalse((volume_sync_dir(self.consumer) / "last_apply.json").exists())
+    self.assertEqual(len(list(history_received_dir(self.consumer).glob("*.json"))), 0)
+    # Useful error message
+    self.assertTrue(any("missing mounts for" in m for m in self.consumer._msgs))
+
+  def test_apply_aborts_on_r1fs_get_failure(self):
+    (volume_sync_dir(self.provider) / SYNC_PROCESSING_FILE).write_text("{}")
+    self.sm_p.publish_snapshot(["/app/data/"], {})
+    record = self.sm_c.fetch_latest()
+    self.consumer._r1fs.get_should_raise = RuntimeError("network down")
+    ok = self.sm_c.apply_snapshot(record)
+    self.assertFalse(ok)
+    self.assertFalse((volume_sync_dir(self.consumer) / "last_apply.json").exists())
+
+  def test_apply_two_snapshots_retires_first(self):
+    # First publish + apply
+    (volume_sync_dir(self.provider) / SYNC_PROCESSING_FILE).write_text("{}")
+    self.sm_p.publish_snapshot(["/app/data/"], {"v": 1})
+    rec1 = self.sm_c.fetch_latest()
+    self.sm_c.apply_snapshot(rec1)
+    # Second publish + apply
+    (self.provider._fixed_root / "appdata" / "weights.bin").write_bytes(b"v2")
+    (volume_sync_dir(self.provider) / SYNC_PROCESSING_FILE).write_text("{}")
+    self.sm_p.publish_snapshot(["/app/data/"], {"v": 2})
+    rec2 = self.sm_c.fetch_latest()
+    self.sm_c.apply_snapshot(rec2)
+
+    files = sorted(history_received_dir(self.consumer).glob("*.json"))
+    self.assertEqual(len(files), 2)
+    older = json.loads(files[0].read_text())
+    newer = json.loads(files[1].read_text())
+    self.assertTrue(older["deletion"]["deletion_succeeded"])
+    self.assertIsNone(newer["deletion"]["deleted_at"])
+    # Consumer-side delete used cleanup_local_files=True
+    deleted = self.consumer._r1fs.deleted
+    self.assertTrue(any(cid == older["cid"] and cleanup
+                        for (cid, _, cleanup) in deleted))
 
 
 if __name__ == "__main__":

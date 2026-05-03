@@ -476,19 +476,167 @@ class SyncManager:
     return str(tar_path), os.path.getsize(str(tar_path))
 
   def publish_snapshot(self, archive_paths: list[str], metadata: dict) -> bool:
-    """Full provider orchestration. See plan section "Code layout"."""
-    raise NotImplementedError
+    """Full provider orchestration: archive → R1FS add → ChainStore hset →
+    history append → response.json → clear .invalid → delete .processing →
+    retire previous CID.
+
+    Returns True on success, False on any failure (and writes
+    response.json/error + request.json.invalid for the app).
+    Always cleans up the archive tmp file.
+    """
+    request_body = {"archive_paths": list(archive_paths), "metadata": dict(metadata)}
+    vsd = volume_sync_dir(self.owner)
+    proc_path = vsd / SYNC_PROCESSING_FILE
+    tar_path: Optional[str] = None
+    try:
+      # ---- Stage: archive_build
+      try:
+        tar_path, size_bytes = self.make_archive(archive_paths)
+      except Exception as exc:
+        self._fail_request(request_body, STAGE_ARCHIVE_BUILD, str(exc), proc_path)
+        return False
+
+      # ---- Stage: r1fs_upload
+      try:
+        cid = self.owner.r1fs.add_file(tar_path)
+      except Exception as exc:
+        self._fail_request(request_body, STAGE_R1FS_UPLOAD, str(exc), proc_path)
+        return False
+      if not cid:
+        self._fail_request(
+          request_body, STAGE_R1FS_UPLOAD,
+          "r1fs.add_file returned no CID", proc_path,
+        )
+        return False
+
+      # Build the manifest + record
+      version = int(self.owner.time())
+      ts = self.owner.time()
+      node_id = getattr(self.owner, "ee_id", None) or getattr(self.owner, "node_id", None)
+      manifest = {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "archive_paths": list(archive_paths),
+        "archive_format": ARCHIVE_FORMAT,
+        "archive_size_bytes": size_bytes,
+        "encryption": "r1fs-default",
+      }
+      record = {
+        "cid": cid,
+        "version": version,
+        "timestamp": ts,
+        "node_id": node_id,
+        "metadata": dict(metadata),
+        "manifest": manifest,
+      }
+
+      # ---- Stage: chainstore_publish
+      try:
+        ack = self.owner.chainstore_hset(
+          hkey=CHAINSTORE_SYNC_HKEY,
+          key=getattr(self.owner, "cfg_sync_key", None),
+          value=record,
+        )
+      except Exception as exc:
+        self._fail_request(
+          request_body, STAGE_CHAINSTORE_PUBLISH, str(exc), proc_path
+        )
+        return False
+
+      # Persist history entry (pre-retirement so deletion update finds it).
+      entry = {
+        "cid": cid,
+        "version": version,
+        "published_timestamp": ts,
+        "request": dict(request_body),
+        "manifest": manifest,
+        "archive_size_bytes": size_bytes,
+        "chainstore_ack": bool(ack),
+        "node_id": node_id,
+      }
+      self.append_sent(entry)
+
+      # Write success response and clean up control-plane artifacts.
+      response_payload = {
+        "status": "ok",
+        "cid": cid,
+        "version": version,
+        "published_timestamp": ts,
+        "archive_paths": list(archive_paths),
+        "archive_size_bytes": size_bytes,
+        "chainstore_ack": bool(ack),
+      }
+      try:
+        self._write_json_atomic(vsd / SYNC_RESPONSE_FILE, response_payload)
+      except Exception as exc:
+        self.owner.P(
+          f"[sync] failed to write response.json: {exc}", color="r"
+        )
+
+      invalid_path = vsd / SYNC_INVALID_FILE
+      if invalid_path.exists():
+        try:
+          os.unlink(str(invalid_path))
+        except OSError:
+          pass
+      if proc_path.exists():
+        try:
+          os.unlink(str(proc_path))
+        except OSError as exc:
+          self.owner.P(
+            f"[sync] failed to delete .processing after success: {exc}", color="y"
+          )
+
+      # Retire prior CID (best-effort, never blocks success).
+      self._retire_previous_cid(history_sent_dir(self.owner))
+      return True
+    finally:
+      if tar_path:
+        try:
+          os.unlink(tar_path)
+        except OSError:
+          pass
 
   # ----- consumer --------------------------------------------------------
   def fetch_latest(self) -> Optional[dict]:
-    """``chainstore_hsync`` then ``chainstore_hget`` for the configured KEY."""
-    raise NotImplementedError
+    """``chainstore_hsync`` then ``chainstore_hget`` for the configured KEY.
+
+    ``chainstore_hsync`` failure is non-fatal — we log and still try the
+    local-replica ``hget``, so a temporarily-unreachable peer does not stop
+    a consumer that already has the record cached.
+    """
+    sync_key = getattr(self.owner, "cfg_sync_key", None)
+    if not sync_key:
+      return None
+    try:
+      self.owner.chainstore_hsync(hkey=CHAINSTORE_SYNC_HKEY)
+    except Exception as exc:
+      self.owner.P(f"[sync] chainstore_hsync error: {exc}", color="y")
+    try:
+      return self.owner.chainstore_hget(
+        hkey=CHAINSTORE_SYNC_HKEY, key=sync_key
+      )
+    except Exception as exc:
+      self.owner.P(f"[sync] chainstore_hget error: {exc}", color="r")
+      return None
 
   def validate_manifest(self, record: dict) -> list[str]:
-    """Return list of archive_paths in record.manifest that are not covered
-    by self.owner.volumes. Empty list means the consumer can apply.
+    """Return list of manifest archive_paths the consumer cannot map.
+
+    Empty list means the consumer's `self.volumes` covers every container
+    path in the manifest with a fixed-size mount. A non-empty list is a
+    misalignment / configuration error — the apply must be skipped.
     """
-    raise NotImplementedError
+    if not isinstance(record, dict):
+      return []
+    manifest = record.get("manifest") or {}
+    paths = manifest.get("archive_paths") or []
+    missing: list[str] = []
+    for entry in paths:
+      try:
+        self.resolve_container_path(entry)
+      except ValueError:
+        missing.append(entry)
+    return missing
 
   def extract_archive(self, tar_path: str) -> list[str]:
     """Reverse-map tar member container paths to host paths and extract.
@@ -570,8 +718,78 @@ class SyncManager:
     return extracted
 
   def apply_snapshot(self, record: dict) -> bool:
-    """Full consumer orchestration. See plan section "Code layout"."""
-    raise NotImplementedError
+    """Full consumer orchestration: validate_manifest → r1fs.get_file →
+    extract → history append → last_apply.json → retire previous CID.
+
+    Returns True on success, False on any failure. On failure no
+    last_apply.json is written so the consumer-side app can tell nothing
+    landed; history is not advanced.
+    """
+    if not isinstance(record, dict):
+      self.owner.P(f"[sync] apply_snapshot got non-dict record: {record!r}", color="r")
+      return False
+    cid = record.get("cid")
+    version = record.get("version")
+    if not cid or not isinstance(version, int):
+      self.owner.P(
+        f"[sync] apply_snapshot record missing cid/version: {record!r}", color="r"
+      )
+      return False
+
+    missing = self.validate_manifest(record)
+    if missing:
+      self.owner.P(
+        f"[sync] cannot apply v{version}: consumer volume layout missing "
+        f"mounts for {missing}",
+        color="r",
+      )
+      return False
+
+    try:
+      local_path = self.owner.r1fs.get_file(cid)
+    except Exception as exc:
+      self.owner.P(f"[sync] r1fs.get_file({cid}) failed: {exc}", color="r")
+      return False
+    if not local_path:
+      self.owner.P(f"[sync] r1fs.get_file({cid}) returned no path", color="r")
+      return False
+
+    try:
+      extracted = self.extract_archive(local_path)
+    except Exception as exc:
+      self.owner.P(f"[sync] extract_archive failed: {exc}", color="r")
+      return False
+
+    applied_ts = self.owner.time()
+    entry = {
+      "cid": cid,
+      "version": version,
+      "source_timestamp": record.get("timestamp"),
+      "applied_timestamp": applied_ts,
+      "node_id": record.get("node_id"),
+      "metadata": record.get("metadata") or {},
+      "manifest": record.get("manifest") or {},
+      "extracted_paths": extracted,
+    }
+    self.append_received(entry)
+
+    last_apply = {
+      "cid": cid,
+      "version": version,
+      "source_timestamp": record.get("timestamp"),
+      "applied_timestamp": applied_ts,
+      "node_id": record.get("node_id"),
+      "metadata": record.get("metadata") or {},
+    }
+    try:
+      self._write_json_atomic(
+        volume_sync_dir(self.owner) / SYNC_LAST_APPLY_FILE, last_apply
+      )
+    except Exception as exc:
+      self.owner.P(f"[sync] failed to write last_apply.json: {exc}", color="r")
+
+    self._retire_previous_cid(history_received_dir(self.owner), cleanup_local_files=True)
+    return True
 
   # ----- retirement ------------------------------------------------------
   def _retire_previous_cid(
@@ -583,4 +801,53 @@ class SyncManager:
     that entry's ``deletion`` sub-record. Never raises — deletion failures
     must not roll back the new publish/apply.
     """
-    raise NotImplementedError
+    if not history_dir.is_dir():
+      return
+    files = sorted(p for p in history_dir.iterdir() if p.suffix == ".json")
+    if len(files) < 2:
+      return  # nothing to retire yet
+    try:
+      with files[-1].open("r", encoding="utf-8") as handle:
+        latest = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+      self.owner.P(
+        f"[sync] retire: could not read latest history file: {exc}", color="y"
+      )
+      return
+    latest_cid = latest.get("cid")
+    target_entry: Optional[dict] = None
+    for path in reversed(files[:-1]):
+      try:
+        with path.open("r", encoding="utf-8") as handle:
+          entry = json.load(handle)
+      except (OSError, json.JSONDecodeError):
+        continue
+      if entry.get("cid") == latest_cid:
+        continue  # same content -- nothing to retire
+      if (entry.get("deletion") or {}).get("deleted_at") is not None:
+        continue  # already retired
+      target_entry = entry
+      break
+
+    if target_entry is None:
+      return
+    target_cid = target_entry.get("cid")
+    if not target_cid:
+      return
+
+    succeeded = False
+    error: Optional[str] = None
+    try:
+      self.owner.r1fs.delete_file(
+        cid=target_cid,
+        unpin_remote=True,
+        cleanup_local_files=cleanup_local_files,
+      )
+      succeeded = True
+    except Exception as exc:  # noqa: BLE001 — never raise
+      error = str(exc)
+      self.owner.P(
+        f"[sync] failed to retire CID {target_cid}: {exc}", color="y"
+      )
+
+    self.update_history_deletion(history_dir, target_entry, succeeded, error)
