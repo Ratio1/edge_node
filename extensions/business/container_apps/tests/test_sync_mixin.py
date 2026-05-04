@@ -15,11 +15,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from extensions.business.container_apps.mixins.sync_mixin import _SyncMixin
-from extensions.business.container_apps.sync_manager import (
+from extensions.business.container_apps.sync import (
   SYSTEM_VOLUME_MOUNT,
   SYSTEM_VOLUME_NAME,
   SyncManager,
+  _SyncMixin,
   history_received_dir,
   volume_sync_dir,
 )

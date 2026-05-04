@@ -28,7 +28,8 @@ from pathlib import Path
 from typing import Optional
 
 from extensions.business.container_apps import fixed_volume
-from extensions.business.container_apps.sync_manager import (
+
+from .constants import (
   CHAINSTORE_SYNC_HKEY,
   SYNC_INVALID_FILE,
   SYNC_LAST_APPLY_FILE,
@@ -38,8 +39,10 @@ from extensions.business.container_apps.sync_manager import (
   SYSTEM_VOLUME_MOUNT,
   SYSTEM_VOLUME_NAME,
   SYSTEM_VOLUME_SIZE,
-  SyncManager,
   VOLUME_SYNC_SUBDIR,
+)
+from .manager import (
+  SyncManager,
   history_received_dir,
   history_sent_dir,
   system_volume_host_root,

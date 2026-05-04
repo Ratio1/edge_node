@@ -84,9 +84,9 @@ from .mixins import (
   _FixedSizeVolumesMixin,
   _ImagePullBackoffMixin,
   _RestartBackoffMixin,
-  _SyncMixin,
   _TunnelBackoffMixin,
 )
+from .sync import _SyncMixin
 
 __VER__ = "0.7.1"
 
@@ -316,8 +316,8 @@ _CONFIG = {
 
   # Volume-sync (cross-node state replication). Always-on /r1en_system system
   # volume is provisioned regardless; SYNC.ENABLED only controls the
-  # provider/consumer orchestration on top of it. See sync_manager.py for
-  # the full contract.
+  # provider/consumer orchestration on top of it. See the sync/ subpackage
+  # (constants.py + manager.py + mixin.py) for the full contract.
   "SYNC": {
     "ENABLED": False,             # master switch
     "KEY": None,                  # shared UUID across the sync set (provider+consumer)

@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from extensions.business.container_apps.sync_manager import (
+from extensions.business.container_apps.sync import (
   SYNC_PROCESSING_FILE,
   SYSTEM_VOLUME_NAME,
   SYSTEM_VOLUME_MOUNT,
