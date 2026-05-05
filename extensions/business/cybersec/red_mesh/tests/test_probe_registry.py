@@ -8,16 +8,15 @@ Drift becomes impossible: a new probe that ships without registration
 fails this test, and the test runs as part of the standard pytest
 suite.
 
-Phase 1 transitional note
--------------------------
+Migration completion (PR-1.5)
+-----------------------------
 
-PR-1.2 ships the decorator and this CI gate scaffolding, but the
-decorator has not yet been applied to existing probes — that's the
-work of PR-1.3, PR-1.4, PR-1.5. To avoid blocking the entire suite
-during the migration, the CI gate uses a TRANSITIONAL allowlist of
-probe_ids that are *known to not yet be migrated*. Each probe-migration
-PR removes entries from the allowlist as it lands. When the allowlist
-hits zero, drop it.
+The transitional allowlist is now empty: PR-1.3 migrated 29 service
+probes, PR-1.4 migrated 32 web probes, PR-1.5 migrated the 7
+correlation probes. The CI gate now hard-fails on any undecorated
+probe; there is no allowlist escape hatch. The PROBE_MIGRATION_ALLOWLIST
+constant is preserved as an empty set for backwards-compat with any
+external test imports, but the test asserts it stays empty.
 
 Test harness
 ------------
@@ -52,15 +51,12 @@ from extensions.business.cybersec.red_mesh.worker.probe_registry import (
 )
 
 
-# Transitional allowlist of probe_ids that are NOT YET decorated.
-# Each PR-1.3 / 1.4 / 1.5 migration removes entries here as it lands.
-# When this set is empty, drop the allowlist machinery and require all.
-#
-# Source of truth: walk worker/service/, worker/web/, worker/correlation.py,
-# graybox/probes/ for any function whose name starts with one of the
-# known probe prefixes. The list below was generated 2026-05-04 from
-# the pre-migration state of the codebase.
-PROBE_MIGRATION_ALLOWLIST: set[str] = set()  # populated below by walking the codebase
+# Allowlist of probe_ids exempted from the registration requirement.
+# Phase 1 migration is complete — this is empty. The variable is kept
+# (rather than removed) so future emergency exemptions can be added
+# inline with a tracking comment, rather than requiring re-introducing
+# the test scaffolding from scratch.
+PROBE_MIGRATION_ALLOWLIST: set[str] = set()
 
 
 PROBE_PREFIXES = (
@@ -84,19 +80,11 @@ class TestRegisterProbeDecorator(unittest.TestCase):
     clear_registry_for_tests()
 
   def tearDown(self):
+    # Restore the registry directly without going through the
+    # decorator (which would reject duplicate __name__='<lambda>').
+    from extensions.business.cybersec.red_mesh.worker import probe_registry
     clear_registry_for_tests()
-    for k, v in self._saved.items():
-      register_probe(
-        display_name=v.display_name,
-        description=v.description,
-        category=v.category,
-        default_cwe=v.default_cwe,
-        default_owasp=v.default_owasp,
-        cvss_template=v.cvss_template,
-        stateful=v.stateful,
-        destructive=v.destructive,
-        references=v.references,
-      )(lambda *a, **kw: None).__name__  # noqa: B023 — restore by registering placeholder
+    probe_registry._REGISTRY.update(self._saved)
 
   def test_decorator_registers_metadata(self):
     @register_probe(
@@ -309,28 +297,15 @@ def _discover_probe_functions() -> dict[str, str]:
   return found
 
 
-# Populate the transitional allowlist on import — every currently-
-# undecorated probe is allowed. Migrations PR-1.3 to PR-1.5 will
-# delete entries one probe at a time.
-def _build_transitional_allowlist() -> None:
-  PROBE_MIGRATION_ALLOWLIST.clear()
-  found = _discover_probe_functions()
-  for probe_id, _ in found.items():
-    md = get_probe_metadata(probe_id)
-    if md is None:
-      PROBE_MIGRATION_ALLOWLIST.add(probe_id)
-
-
 class TestProbeRegistrationCoverage(unittest.TestCase):
-  """CI gate. Every probe must either be @register_probe-decorated OR
-  appear in the transitional allowlist."""
+  """CI gate. Every probe must be @register_probe-decorated.
 
-  @classmethod
-  def setUpClass(cls):
-    # Populate the allowlist from the current state of the codebase.
-    _build_transitional_allowlist()
+  Phase 1 migration is complete — there is no transitional allowlist.
+  A new probe that lands without registration fails this test and
+  blocks the merge.
+  """
 
-  def test_all_probes_decorated_or_allowlisted(self):
+  def test_all_probes_decorated(self):
     found = _discover_probe_functions()
     self.assertGreater(
       len(found), 0,
@@ -344,25 +319,34 @@ class TestProbeRegistrationCoverage(unittest.TestCase):
     if undecorated:
       msg = "\n  ".join(f"{pid} ({src})" for pid, src in undecorated)
       self.fail(
-        f"Probes not decorated and not in PROBE_MIGRATION_ALLOWLIST:\n  {msg}\n"
-        "Either decorate them with @register_probe (preferred) or — for a "
-        "deliberate transitional period — add them to PROBE_MIGRATION_ALLOWLIST."
+        f"Probes missing @register_probe decoration:\n  {msg}\n"
+        "Decorate each with @register_probe(...) — see "
+        "worker/probe_registry.py for the metadata schema."
       )
 
-  def test_allowlist_shrinks_or_holds_per_pr(self):
-    """Sanity check that the allowlist is not growing without intent.
-
-    This is a guidance test, not a hard floor — it logs the size so
-    PR reviewers can see whether the migration is making progress."""
-    found = _discover_probe_functions()
-    allowlist_size = len(PROBE_MIGRATION_ALLOWLIST)
-    decorated_size = sum(1 for pid in found if get_probe_metadata(pid) is not None)
-    print(
-      f"\n  [probe-registry] decorated={decorated_size}, "
-      f"allowlist={allowlist_size}, total={len(found)}"
+  def test_allowlist_is_empty(self):
+    """The migration allowlist must remain empty. New temporary
+    exemptions require a tracking issue and explicit reviewer
+    approval — adding to this set should be rare and brief."""
+    self.assertEqual(
+      len(PROBE_MIGRATION_ALLOWLIST), 0,
+      f"PROBE_MIGRATION_ALLOWLIST must be empty (Phase 1 migration "
+      f"complete). Got: {sorted(PROBE_MIGRATION_ALLOWLIST)}",
     )
-    # No assertion — informational only. The hard gate is the test
-    # above.
+
+  def test_registration_summary(self):
+    """Informational — print decorated/total counts for PR review."""
+    found = _discover_probe_functions()
+    decorated = sum(1 for pid in found if get_probe_metadata(pid) is not None)
+    by_category = {}
+    for pid in found:
+      md = get_probe_metadata(pid)
+      if md:
+        by_category[md.category] = by_category.get(md.category, 0) + 1
+    print(
+      f"\n  [probe-registry] {decorated}/{len(found)} decorated, "
+      f"by category: {by_category}"
+    )
 
 
 if __name__ == "__main__":
