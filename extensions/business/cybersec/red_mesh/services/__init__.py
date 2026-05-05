@@ -78,6 +78,10 @@ from .engagement_deletion import (
   DeleteEngagementResult,
   delete_engagement_data,
 )
+from .llm_structured import (
+  StructuredLlmResult,
+  generate_exec_summary,
+)
 
 __all__ = [
   "INTERMEDIATE_JOB_STATUSES",
@@ -137,4 +141,6 @@ __all__ = [
   "DeleteEngagementError",
   "DeleteEngagementResult",
   "delete_engagement_data",
+  "StructuredLlmResult",
+  "generate_exec_summary",
 ]

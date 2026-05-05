@@ -185,6 +185,17 @@ LLM_ANALYSIS_SECURITY_ASSESSMENT = "security_assessment"
 LLM_ANALYSIS_VULNERABILITY_SUMMARY = "vulnerability_summary"
 LLM_ANALYSIS_REMEDIATION_PLAN = "remediation_plan"
 LLM_ANALYSIS_QUICK_SUMMARY = "quick_summary"
+# Phase 4 PR-4.3 — full structured output conforming to
+# LlmReportSections (background_draft, overall_posture,
+# recommendation_summary[], strategic_roadmap{}, attack_chain_narratives[],
+# coverage_gaps[], conclusion). Used by the Phase 6/7 PDF rewrite to
+# render the labelled Executive Summary + AI-disclosure sections.
+LLM_ANALYSIS_EXEC_SUMMARY_PACKAGE = "exec_summary_package"
+
+# Prompt-template version. Stored on every emitted LlmReportSections
+# so the report's AI-disclosure appendix can show which template
+# version produced the narrative. Bump on any prompt change.
+LLM_PROMPT_VERSION_EXEC_SUMMARY = "exec-summary-v1"
 
 # =====================================================================
 # Protocol fingerprinting and probe routing
