@@ -63,6 +63,18 @@ from extensions.business.cybersec.red_mesh.models.engagement import (
   RulesOfEngagement,
   STRENGTH_OF_TEST,
 )
+from extensions.business.cybersec.red_mesh.models.llm_output import (
+  LlmReportSections,
+  ROADMAP_BUCKETS,
+  ROADMAP_LONG_TERM,
+  ROADMAP_MID_TERM,
+  ROADMAP_NEAR_TERM,
+  SEVERITY_ERROR,
+  SEVERITY_WARNING,
+  ValidationIssue,
+  ValidationResult,
+  validate_llm_output,
+)
 
 __all__ = [
   # shared
@@ -99,4 +111,15 @@ __all__ = [
   "ASSET_EXPOSURES",
   "STRENGTH_OF_TEST",
   "POST_EXPLOIT_RULES",
+  # llm output (Phase 4)
+  "LlmReportSections",
+  "ROADMAP_BUCKETS",
+  "ROADMAP_LONG_TERM",
+  "ROADMAP_MID_TERM",
+  "ROADMAP_NEAR_TERM",
+  "SEVERITY_ERROR",
+  "SEVERITY_WARNING",
+  "ValidationIssue",
+  "ValidationResult",
+  "validate_llm_output",
 ]
