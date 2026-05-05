@@ -8,12 +8,28 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ...cve_db import check_cves
+from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
 
 class _ServiceTlsMixin(_ServiceProbeBase):
   """TLS inspection and generic service fingerprinting probes."""
 
+  @register_probe(
+    display_name="TLS / SSL inspection",
+    description=(
+      "Inspect TLS handshake, certificate chain, cipher strength, "
+      "and protocol versions. Flags expired/self-signed certs, weak "
+      "ciphers, deprecated TLS versions."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(295, 326, 327, 757),
+    default_owasp=("A02:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    references=(
+      "https://owasp.org/Top10/A02_2021-Cryptographic_Failures/",
+    ),
+  )
   def _service_info_tls(self, target, port):
     """
     Inspect TLS handshake, certificate chain, and cipher strength.
@@ -596,6 +612,18 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     (_re.compile(r'TightVNC[/ ](?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "tightvnc"),
   ]
 
+  @register_probe(
+    display_name="Generic TCP banner grab",
+    description=(
+      "Fallback probe for ports not matching a specific service "
+      "module. Banner-grabs and matches against a regex catalog "
+      "of known products to fingerprint protocol + version."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_generic(self, target, port):
     """
     Attempt a generic TCP banner grab for uncovered ports.
