@@ -238,9 +238,16 @@ class PassReport:
   risk_breakdown: dict = None       # RiskBreakdown.to_dict()
 
   # LLM (inline text)
-  llm_analysis: str = None          # markdown
+  llm_analysis: str = None          # markdown — legacy
   quick_summary: str = None         # 2-4 sentences
   llm_failed: bool = None           # True if LLM API was unavailable — absent on success (_strip_none)
+
+  # Phase 4 PR-4.1 structured LLM payload — LlmReportSections.to_dict()
+  # output. Consumed by the Phase 6/7 PDF Executive Summary, Exploitation
+  # attack-chain narratives, Coverage gaps, and Conclusion. Absent (None)
+  # when the LLM Agent isn't enabled or when generate_exec_summary
+  # produced a fallback skeleton on a validation failure.
+  llm_report_sections: dict = None
 
   # Flat findings (enriched dicts extracted from service_info/web_tests_info/correlation_findings)
   findings: list = None             # [ { severity, confidence, port, protocol, probe, category, evidence, ... } ]
@@ -271,6 +278,7 @@ class PassReport:
       llm_analysis=d.get("llm_analysis"),
       quick_summary=d.get("quick_summary"),
       llm_failed=d.get("llm_failed"),
+      llm_report_sections=d.get("llm_report_sections"),
       findings=d.get("findings"),
       scan_metrics=d.get("scan_metrics"),
       worker_scan_metrics=d.get("worker_scan_metrics"),
