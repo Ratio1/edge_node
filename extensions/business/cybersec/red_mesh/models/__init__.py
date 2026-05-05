@@ -52,6 +52,17 @@ from extensions.business.cybersec.red_mesh.models.triage import (
   FindingTriageState,
   VALID_TRIAGE_STATUSES,
 )
+from extensions.business.cybersec.red_mesh.models.engagement import (
+  ASSET_EXPOSURES,
+  AuthorizationRef,
+  Contact,
+  DATA_CLASSIFICATIONS,
+  EngagementContext,
+  KickoffQuestionnaire,
+  POST_EXPLOIT_RULES,
+  RulesOfEngagement,
+  STRENGTH_OF_TEST,
+)
 
 __all__ = [
   # shared
@@ -78,4 +89,14 @@ __all__ = [
   "FindingTriageState",
   "FindingTriageAuditEntry",
   "VALID_TRIAGE_STATUSES",
+  # engagement
+  "Contact",
+  "EngagementContext",
+  "RulesOfEngagement",
+  "AuthorizationRef",
+  "KickoffQuestionnaire",
+  "DATA_CLASSIFICATIONS",
+  "ASSET_EXPOSURES",
+  "STRENGTH_OF_TEST",
+  "POST_EXPLOIT_RULES",
 ]
