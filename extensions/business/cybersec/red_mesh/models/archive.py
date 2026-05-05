@@ -54,6 +54,15 @@ class JobConfig:
   engagement_metadata: dict = None
   target_allowlist: list = None
   safety_policy: dict = None
+  # ── Phase 3 PR-3.3: typed engagement context ──
+  # The three legacy fields above (scope_id, authorization_ref,
+  # engagement_metadata) remain for backward-compat with existing
+  # archives in R1FS. New launches populate the typed fields below.
+  # Both shapes serialize alongside each other; consumers prefer the
+  # typed shape when present.
+  engagement: dict = None        # EngagementContext.to_dict() output
+  roe: dict = None               # RulesOfEngagement.to_dict() output
+  authorization: dict = None     # AuthorizationRef.to_dict() output
   # ── graybox fields ──
   scan_type: str = "network"          # "network" | "webapp"
   target_url: str = ""                # required when scan_type == "webapp"
@@ -121,6 +130,52 @@ class JobConfig:
       verify_tls=d.get("verify_tls", True),
       target_config=d.get("target_config"),
       allow_stateful_probes=d.get("allow_stateful_probes", False),
+      engagement=d.get("engagement"),
+      roe=d.get("roe"),
+      authorization=d.get("authorization"),
+    )
+
+  # -- Phase 3 PR-3.3: convenience accessors for the typed shape --
+
+  def get_engagement(self):
+    """Return EngagementContext or None. Resolves the typed `engagement`
+    field first; falls back to the legacy free-form `engagement_metadata`
+    dict for backward compat with archives created before PR-3.3."""
+    from .engagement import EngagementContext
+    if self.engagement:
+      return EngagementContext.from_dict(self.engagement)
+    if self.engagement_metadata:
+      return EngagementContext.from_dict(self.engagement_metadata)
+    return None
+
+  def get_roe(self):
+    """Return RulesOfEngagement or None."""
+    from .engagement import RulesOfEngagement
+    return RulesOfEngagement.from_dict(self.roe) if self.roe else None
+
+  def get_authorization(self):
+    """Return AuthorizationRef or None. Falls back to the legacy
+    string `authorization_ref` (just a CID, no signer) when the typed
+    field is absent."""
+    from .engagement import AuthorizationRef
+    if self.authorization:
+      return AuthorizationRef.from_dict(self.authorization)
+    if self.authorization_ref:
+      return AuthorizationRef(document_cid=self.authorization_ref)
+    return None
+
+  def get_kickoff_questionnaire(self):
+    """Return a KickoffQuestionnaire bundling engagement/roe/authorization
+    or None when none of the three fields carry data."""
+    from .engagement import KickoffQuestionnaire
+    eng = self.get_engagement()
+    roe = self.get_roe()
+    auth = self.get_authorization()
+    if all(x is None or (hasattr(x, 'is_empty') and x.is_empty())
+           for x in (eng, roe, auth)):
+      return None
+    return KickoffQuestionnaire(
+      engagement=eng, roe=roe, authorization=auth,
     )
 
 
