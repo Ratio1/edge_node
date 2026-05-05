@@ -4,11 +4,18 @@ Declarative CVE database for RedMesh version-based vulnerability matching.
 Each entry maps a product + version constraint to a known CVE.  The
 ``check_cves()`` helper returns ``Finding`` instances that feed directly
 into ``probe_result()``.
+
+Phase 2 PR-2.2b: ``check_cves()`` accepts an optional
+``DynamicReferenceCache`` (NVD CVSS + CISA KEV + FIRST EPSS) and
+populates the corresponding Finding fields when a cache is provided.
+Without a cache the function behaves as before — static severity only
+— so legacy callers remain unaffected.
 """
 
 import re
 from dataclasses import dataclass
 from .findings import Finding, Severity
+from .references import cwe_to_owasp
 
 CVE_DB_LAST_UPDATED = "2026-03-08"
 
@@ -217,25 +224,114 @@ CVE_DATABASE: list = [
 ]
 
 
-def check_cves(product: str, version: str) -> list:
-  """Match version against CVE database. Returns list of Findings."""
+def check_cves(product: str, version: str, *, dynamic_cache=None) -> list:
+  """Match version against CVE database. Returns list of Findings.
+
+  When ``dynamic_cache`` is a ``DynamicReferenceCache`` instance,
+  every emitted Finding is enriched with live NVD CVSS, CISA KEV
+  status, FIRST EPSS score, and OWASP Top 10 mapping (looked up via
+  the static cwe_to_owasp table). When no cache is provided, the
+  legacy behavior is preserved (static severity only).
+  """
   findings = []
   for entry in CVE_DATABASE:
     if entry.product != product:
       continue
-    if _matches_constraint(version, entry.constraint):
-      findings.append(Finding(
-        severity=entry.severity,
-        title=f"{entry.cve_id}: {entry.title} ({product} {version})",
-        description=f"{product} {version} is vulnerable to {entry.cve_id}. "
-                    "NOTE: Linux distributions backport security fixes without changing "
-                    "the upstream version number — this may be a false positive.",
-        evidence=f"Detected version: {version}, affected: {entry.constraint}",
-        remediation=f"Upgrade {product} to a patched version, or verify backport status with the OS vendor.",
-        cwe_id=entry.cwe_id,
-        confidence="tentative",
-      ))
+    if not _matches_constraint(version, entry.constraint):
+      continue
+    findings.append(_build_finding(entry, product, version, dynamic_cache))
   return findings
+
+
+def _build_finding(entry, product: str, version: str, dynamic_cache):
+  """Construct a Finding for a matched CveEntry, optionally enriched
+  via the dynamic reference cache."""
+  # Parse the legacy "CWE-22" format into an int CWE id for the
+  # list-form `cwe` field on Finding.
+  cwe_int = _parse_cwe_int(entry.cwe_id)
+  cwe_list = (cwe_int,) if cwe_int else ()
+
+  # Static OWASP mapping from the cwe_to_owasp reference table.
+  owasp_top10 = cwe_to_owasp(cwe_int) if cwe_int else ()
+
+  # Defaults (no dynamic cache or upstream miss).
+  cvss_score = None
+  cvss_vector = ""
+  cvss_score_env = None
+  cvss_vector_env = ""
+  cvss_version = "3.1"
+  cvss_freshness = ""
+  kev = False
+  epss_score = None
+  references_list: list[str] = []
+  severity = entry.severity
+
+  if dynamic_cache is not None:
+    try:
+      cvss_rec = dynamic_cache.get_cvss(entry.cve_id)
+      kev_rec = dynamic_cache.get_kev(entry.cve_id)
+      epss_rec = dynamic_cache.get_epss(entry.cve_id)
+    except Exception:
+      cvss_rec = kev_rec = epss_rec = None
+    if cvss_rec and cvss_rec.cve_id:
+      cvss_score = cvss_rec.score
+      cvss_vector = cvss_rec.vector
+      cvss_version = cvss_rec.version or cvss_version
+      cvss_freshness = cvss_rec.fetched_at
+      if cvss_rec.source_url:
+        references_list.append(cvss_rec.source_url)
+      # Trust NVD's qualitative severity over our static one when
+      # available, since NVD adjusts post-publication.
+      if cvss_rec.severity:
+        try:
+          severity = Severity(cvss_rec.severity.upper())
+        except ValueError:
+          pass
+    if kev_rec and kev_rec.cve_id:
+      kev = bool(kev_rec.in_kev)
+    if epss_rec and epss_rec.cve_id and epss_rec.score is not None:
+      epss_score = float(epss_rec.score)
+
+  return Finding(
+    severity=severity,
+    title=f"{entry.cve_id}: {entry.title} ({product} {version})",
+    description=f"{product} {version} is vulnerable to {entry.cve_id}. "
+                "NOTE: Linux distributions backport security fixes without changing "
+                "the upstream version number — this may be a false positive.",
+    evidence=f"Detected version: {version}, affected: {entry.constraint}",
+    remediation=f"Upgrade {product} to a patched version, or verify backport status with the OS vendor.",
+    cwe_id=entry.cwe_id,
+    confidence="tentative",
+    # Phase 1 / Phase 2 enriched fields
+    cvss_score=cvss_score,
+    cvss_vector=cvss_vector,
+    cvss_version=cvss_version,
+    cvss_score_env=cvss_score_env,
+    cvss_vector_env=cvss_vector_env,
+    cvss_data_freshness=cvss_freshness,
+    kev=kev,
+    epss_score=epss_score,
+    cwe=cwe_list,
+    cve=(entry.cve_id,),
+    owasp_top10=tuple(owasp_top10),
+    references=tuple(references_list),
+  )
+
+
+def _parse_cwe_int(cwe_str: str) -> int:
+  """Extract the integer CWE id from a string like 'CWE-22' or 'CWE-639'.
+
+  Returns 0 when the string is empty or not in the expected form.
+  """
+  if not isinstance(cwe_str, str) or not cwe_str:
+    return 0
+  m = re.match(r"^CWE-(\d+)$", cwe_str.strip())
+  if not m:
+    return 0
+  try:
+    return int(m.group(1))
+  except (TypeError, ValueError):
+    return 0
 
 
 def _matches_constraint(version: str, constraint: str) -> bool:
