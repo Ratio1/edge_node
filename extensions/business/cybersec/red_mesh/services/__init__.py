@@ -68,6 +68,16 @@ from .triage import (
   get_job_triage,
   update_finding_triage,
 )
+from .authorization_upload import (
+  AuthorizationUploadError,
+  AuthorizationUploadResult,
+  store_authorization_document,
+)
+from .engagement_deletion import (
+  DeleteEngagementError,
+  DeleteEngagementResult,
+  delete_engagement_data,
+)
 
 __all__ = [
   "INTERMEDIATE_JOB_STATUSES",
@@ -120,4 +130,11 @@ __all__ = [
   "get_job_triage",
   "update_finding_triage",
   "validation_error",
+  # engagement context (Phase 3)
+  "AuthorizationUploadError",
+  "AuthorizationUploadResult",
+  "store_authorization_document",
+  "DeleteEngagementError",
+  "DeleteEngagementResult",
+  "delete_engagement_data",
 ]
