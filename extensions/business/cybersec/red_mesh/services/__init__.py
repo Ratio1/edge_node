@@ -82,6 +82,10 @@ from .llm_structured import (
   StructuredLlmResult,
   generate_exec_summary,
 )
+from .llm_fixture_cache import (
+  LlmFixtureCacheMiss,
+  cached_llm_call,
+)
 
 __all__ = [
   "INTERMEDIATE_JOB_STATUSES",
@@ -143,4 +147,6 @@ __all__ = [
   "delete_engagement_data",
   "StructuredLlmResult",
   "generate_exec_summary",
+  "LlmFixtureCacheMiss",
+  "cached_llm_call",
 ]
