@@ -1,6 +1,7 @@
 import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
 class _WebApiExposureMixin:
@@ -9,6 +10,17 @@ class _WebApiExposureMixin:
   and API auth bypass (OWASP WSTG-APIT).
   """
 
+  @register_probe(
+    display_name="GraphQL introspection",
+    description=(
+      "Probe /graphql, /api/graphql, /v1/graphql etc. for "
+      "exposed introspection (full schema disclosure)."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(200, 215),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+  )
   def _web_test_graphql_introspection(self, target, port):
     """
     Check if GraphQL introspection is exposed in production endpoints.
@@ -53,6 +65,18 @@ class _WebApiExposureMixin:
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="Cloud metadata endpoint reachability",
+    description=(
+      "Probe known cloud metadata endpoints (AWS 169.254.169.254, "
+      "GCP metadata.google.internal, Azure, DigitalOcean, Alibaba, "
+      "Oracle) reflected through the target — SSRF surface."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(918, 200),
+    default_owasp=("A10:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:N",
+  )
   def _web_test_metadata_endpoints(self, target, port):
     """
     Probe cloud metadata paths to detect SSRF-style exposure.
@@ -115,6 +139,18 @@ class _WebApiExposureMixin:
   _SSRF_MARKERS = ("ami-id", "instance-id", "iam/security-credentials",
                    "meta-data", "computeMetadata", "hostname", "local-ipv4")
 
+  @register_probe(
+    display_name="SSRF — basic parameter probing",
+    description=(
+      "Test URL/redirect/proxy-style parameters with payloads "
+      "pointing at internal/loopback. Detects Server-Side Request "
+      "Forgery surface."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(918,),
+    default_owasp=("A10:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:N/A:N",
+  )
   def _web_test_ssrf_basic(self, target, port):
     """
     Low-confidence SSRF check: inject metadata URL into common parameters.
@@ -176,6 +212,18 @@ class _WebApiExposureMixin:
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="API auth bypass",
+    description=(
+      "Test API endpoints without auth, with empty Authorization, "
+      "and with header tricks (X-Forwarded-For, X-Original-URL). "
+      "Detects auth bypass weaknesses."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(287, 285),
+    default_owasp=("A01:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+  )
   def _web_test_api_auth_bypass(self, target, port):
     """
     Detect APIs that succeed despite invalid Authorization headers.
