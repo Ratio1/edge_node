@@ -11,9 +11,10 @@ Bridges :class:`SyncManager` into ``ContainerAppRunnerPlugin``'s lifecycle:
     which calls ``_cleanup_fixed_size_volumes`` and unmounts the loopback
     before we can read from it)
   * consumer role: same cadence polls ChainStore for newer ``version``, then
-    drives ``stop_container → apply_snapshot → start_container`` inline
-  * consumer first-boot: blocks the very first ``start_container`` until a
-    record is available (bounded by ``cfg_sync_initial_sync_timeout``)
+    drives ``stop_container → apply_snapshot → start_container`` inline.
+    First boot starts on an empty volume; the next tick picks up whatever
+    snapshot is in ChainStore. Apps that strictly require state at startup
+    must implement their own poll-and-retry in their entrypoint.
   * recovery: any orphan ``request.json.processing`` left behind by a prior
     crash is renamed back to ``request.json`` on plugin init so the next
     provider tick retries cleanly
@@ -204,13 +205,6 @@ class _SyncMixin:
     except (TypeError, ValueError):
       return 10.0
 
-  def _sync_initial_timeout(self) -> float:
-    raw = self._sync_cfg().get("INITIAL_SYNC_TIMEOUT", 600)
-    try:
-      return max(0.0, float(raw))
-    except (TypeError, ValueError):
-      return 600.0
-
   # convenience for SyncManager (it reads owner.cfg_sync_key)
   @property
   def cfg_sync_key(self):
@@ -347,56 +341,6 @@ class _SyncMixin:
       self.P(f"[sync] apply_snapshot raised unexpectedly: {exc}", color="r")
 
     self._sync_safe_start_container()
-
-  # ----- consumer first-boot block ---------------------------------------
-
-  def _sync_initial_consumer_block(self) -> None:
-    """Block the consumer's very first start_container until a record exists.
-
-    Polls ChainStore every ``POLL_INTERVAL`` seconds, up to
-    ``INITIAL_SYNC_TIMEOUT`` total (0 = wait forever). On timeout: log a
-    warning and proceed with an empty system volume. If a record is
-    available, applies it before returning so the container starts on a
-    populated volume.
-    """
-    sm = self._ensure_sync_manager()
-    if sm is None or self._sync_role() != "consumer":
-      return
-    # If we've already applied something locally, no need to block.
-    if sm.latest_received() is not None:
-      return
-
-    deadline = self._sync_initial_timeout()
-    poll = self._sync_poll_interval()
-    start = self.time()
-    forever = deadline == 0
-    self.P(
-      f"[sync] consumer first-boot: blocking until first snapshot lands "
-      f"(timeout={'forever' if forever else f'{deadline:.0f}s'}, poll={poll:.0f}s)",
-      color="y",
-    )
-
-    while True:
-      record = sm.fetch_latest()
-      if isinstance(record, dict) and isinstance(record.get("version"), int):
-        sm.apply_snapshot(record)
-        return
-      elapsed = self.time() - start
-      if not forever and elapsed >= deadline:
-        self.P(
-          f"[sync] consumer first-boot timed out after {elapsed:.0f}s — "
-          f"starting with an empty system volume",
-          color="r",
-        )
-        return
-      # Use the BasePlugin sleep helper if available for hook-friendly
-      # cooperative waiting; fall back to time.sleep otherwise.
-      sleeper = getattr(self, "sleep", None)
-      if callable(sleeper):
-        sleeper(poll)
-      else:  # pragma: no cover — non-plugin contexts
-        import time as _time
-        _time.sleep(poll)
 
   # ----- internal helpers ------------------------------------------------
 

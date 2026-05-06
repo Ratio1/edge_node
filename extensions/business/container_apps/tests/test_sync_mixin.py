@@ -66,7 +66,6 @@ def _make_plugin(tmpdir, *, role="provider", enabled=True, key="SYNC-KEY-1"):
     "KEY": key,
     "TYPE": role,
     "POLL_INTERVAL": 1,
-    "INITIAL_SYNC_TIMEOUT": 0,  # let tests opt-in to short timeouts
   }
   owner.cfg_sync_type = role
   owner.cfg_sync_key = key

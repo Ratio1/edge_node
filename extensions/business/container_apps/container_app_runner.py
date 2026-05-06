@@ -323,7 +323,6 @@ _CONFIG = {
     "KEY": None,                  # shared UUID across the sync set (provider+consumer)
     "TYPE": None,                 # "provider" | "consumer"
     "POLL_INTERVAL": 10,          # seconds between sync ticks
-    "INITIAL_SYNC_TIMEOUT": 600,  # consumer-only first-boot block; 0 = wait forever
   },
 
   # Health check configuration (consolidated)
@@ -3324,10 +3323,6 @@ class ContainerAppRunnerPlugin(
       self._setup_env_and_ports()
       self._inject_sync_env_vars()
     # end if
-
-    # Consumer first-boot: block until at least one snapshot is available so
-    # the container starts on a populated /app/data, not an empty volume.
-    self._sync_initial_consumer_block()
 
     try:
       self.P("Initial container launch...")
