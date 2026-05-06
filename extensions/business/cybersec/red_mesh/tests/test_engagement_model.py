@@ -216,6 +216,38 @@ class TestAuthorizationRef(unittest.TestCase):
     })
     self.assertEqual(a.third_party_auth_cids, ["QmCID1", "QmCID2"])
 
+  def test_upload_metadata_round_trip(self):
+    a = AuthorizationRef(
+      document_cid="QmAuthCID",
+      authorized_signer_name="Jane Roe",
+      document_filename="permission.pdf",
+      document_mime="application/pdf",
+      document_size_bytes=12345,
+      document_sha256="a" * 64,
+      document_uploaded_at="2026-05-06T12:00:00Z",
+    )
+    d = a.to_dict()
+    self.assertEqual(d["document_filename"], "permission.pdf")
+    self.assertEqual(d["document_mime"], "application/pdf")
+    self.assertEqual(d["document_size_bytes"], 12345)
+    self.assertEqual(d["document_sha256"], "a" * 64)
+    self.assertEqual(d["document_uploaded_at"], "2026-05-06T12:00:00Z")
+    restored = AuthorizationRef.from_dict(d)
+    self.assertEqual(restored.document_filename, "permission.pdf")
+    self.assertEqual(restored.document_size_bytes, 12345)
+    self.assertEqual(restored.document_sha256, "a" * 64)
+    self.assertFalse(restored.is_empty())
+
+  def test_upload_metadata_alone_makes_non_empty(self):
+    a = AuthorizationRef(document_filename="permission.pdf")
+    self.assertFalse(a.is_empty())
+
+  def test_size_bytes_coerces_strings_and_invalid(self):
+    a = AuthorizationRef.from_dict({"document_size_bytes": "9999"})
+    self.assertEqual(a.document_size_bytes, 9999)
+    b = AuthorizationRef.from_dict({"document_size_bytes": "not-a-number"})
+    self.assertEqual(b.document_size_bytes, 0)
+
 
 class TestKickoffQuestionnaire(unittest.TestCase):
 

@@ -301,6 +301,15 @@ class AuthorizationRef:
   authorized_signer_name: str = ""
   authorized_signer_role: str = ""
   third_party_auth_cids: list[str] = field(default_factory=list)
+  # Server-recorded upload metadata. Populated when the document is
+  # uploaded through /upload_authorization so Appendix D can show
+  # filename, MIME type, size, byte hash, and upload timestamp
+  # without re-fetching the R1FS envelope.
+  document_filename: str = ""
+  document_mime: str = ""
+  document_size_bytes: int = 0
+  document_sha256: str = ""
+  document_uploaded_at: str = ""
 
   def to_dict(self) -> dict:
     return {
@@ -309,6 +318,11 @@ class AuthorizationRef:
       "authorized_signer_name": self.authorized_signer_name,
       "authorized_signer_role": self.authorized_signer_role,
       "third_party_auth_cids": list(self.third_party_auth_cids),
+      "document_filename": self.document_filename,
+      "document_mime": self.document_mime,
+      "document_size_bytes": self.document_size_bytes,
+      "document_sha256": self.document_sha256,
+      "document_uploaded_at": self.document_uploaded_at,
     }
 
   @classmethod
@@ -317,12 +331,22 @@ class AuthorizationRef:
       return None
     raw_third = d.get("third_party_auth_cids") or []
     third_list = [str(c) for c in raw_third if c]
+    raw_size = d.get("document_size_bytes", 0)
+    try:
+      size_bytes = int(raw_size) if raw_size else 0
+    except (TypeError, ValueError):
+      size_bytes = 0
     return cls(
       document_cid=str(d.get("document_cid", "")),
       document_thumbnail_cid=str(d.get("document_thumbnail_cid", "")),
       authorized_signer_name=str(d.get("authorized_signer_name", "")),
       authorized_signer_role=str(d.get("authorized_signer_role", "")),
       third_party_auth_cids=third_list,
+      document_filename=str(d.get("document_filename", "")),
+      document_mime=str(d.get("document_mime", "")),
+      document_size_bytes=size_bytes,
+      document_sha256=str(d.get("document_sha256", "")),
+      document_uploaded_at=str(d.get("document_uploaded_at", "")),
     )
 
   def is_empty(self) -> bool:
@@ -332,6 +356,11 @@ class AuthorizationRef:
       not self.authorized_signer_name,
       not self.authorized_signer_role,
       not self.third_party_auth_cids,
+      not self.document_filename,
+      not self.document_mime,
+      not self.document_size_bytes,
+      not self.document_sha256,
+      not self.document_uploaded_at,
     ])
 
   def has_document(self) -> bool:
