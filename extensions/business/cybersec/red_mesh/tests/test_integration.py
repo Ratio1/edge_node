@@ -913,6 +913,102 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(persisted["workers"]["worker-C"]["retry_reason"], "startup_timeout")
     self.assertIn("worker-C", persisted["workers"]["worker-C"]["error"])
 
+  def test_maybe_hsync_live_progress_reconciles_local_live_without_network(self):
+    """Launcher repairs from already-local :live rows before any network hsync."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "launcher-A"
+    plugin.cfg_distributed_job_reconciliation = {"LIVE_HSYNC_ENABLED": True}
+    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._get_job_state_repository = lambda: Plugin._get_job_state_repository(plugin)
+    plugin._emit_timeline_event = lambda job_specs, event_type, label, actor=None, actor_type="system", meta=None: (
+      Plugin._emit_timeline_event(plugin, job_specs, event_type, label, actor, actor_type, meta)
+    )
+    plugin._write_job_record = lambda job_id, job_specs, context="": (
+      Plugin._write_job_record(plugin, job_id, job_specs, context=context)
+    )
+    plugin.time.return_value = 100.0
+    plugin.P = MagicMock()
+    plugin._log_audit_event = MagicMock()
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_pass": 2,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-A",
+      "target": "10.0.0.1",
+      "start_port": 1,
+      "end_port": 100,
+      "date_created": 10.0,
+      "job_config_cid": "QmConfig",
+      "workers": {
+        "worker-A": {
+          "start_port": 1,
+          "end_port": 100,
+          "finished": False,
+          "assignment_revision": 3,
+        },
+      },
+      "timeline": [],
+      "pass_reports": [],
+      "job_revision": 0,
+    }
+    live_payloads = {
+      "job-1:worker-A": {
+        "job_id": "job-1",
+        "worker_addr": "worker-A",
+        "pass_nr": 2,
+        "assignment_revision_seen": 3,
+        "progress": 100.0,
+        "phase": "done",
+        "ports_scanned": 100,
+        "ports_total": 100,
+        "open_ports_found": [80],
+        "completed_tests": ["correlation_completed"],
+        "updated_at": 100.0,
+        "started_at": 20.0,
+        "first_seen_live_at": 20.0,
+        "last_seen_at": 100.0,
+        "finished": True,
+        "report_cid": "QmWorkerReport",
+      },
+    }
+
+    def _hgetall(*, hkey):
+      if hkey == "test-instance":
+        return {"job-1": job_specs}
+      if hkey == "test-instance:live":
+        return live_payloads
+      return {}
+
+    plugin.chainstore_hgetall.side_effect = _hgetall
+    plugin.chainstore_hget.return_value = job_specs
+
+    changed_jobs = Plugin._maybe_hsync_live_progress(plugin)
+
+    self.assertEqual(changed_jobs, ["job-1"])
+    self.assertFalse(plugin.chainstore_hsync.called)
+    persisted = plugin.chainstore_hset.call_args.kwargs["value"]
+    worker = persisted["workers"]["worker-A"]
+    self.assertEqual(worker["finished"], True)
+    self.assertEqual(worker["report_cid"], "QmWorkerReport")
+    self.assertIsNone(worker["result"])
+    self.assertEqual(persisted["timeline"][-1]["type"], "reconciled")
+
+  def test_maybe_hsync_live_progress_disabled_does_not_repair_or_hsync(self):
+    """Disabled live hsync leaves local repair and network calls inactive."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_distributed_job_reconciliation = {"LIVE_HSYNC_ENABLED": False}
+
+    changed_jobs = Plugin._maybe_hsync_live_progress(plugin)
+
+    self.assertEqual(changed_jobs, [])
+    plugin.chainstore_hgetall.assert_not_called()
+    self.assertFalse(plugin.chainstore_hsync.called)
+
   def test_clear_live_progress(self):
     """_clear_live_progress deletes progress keys for all workers."""
     Plugin = self._get_plugin_class()
