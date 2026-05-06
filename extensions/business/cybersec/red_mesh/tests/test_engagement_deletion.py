@@ -13,12 +13,15 @@ Covers:
 from __future__ import annotations
 
 import unittest
+from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.services.engagement_deletion import (
   DeleteEngagementError,
   DeleteEngagementResult,
   delete_engagement_data,
 )
+
+from .conftest import mock_plugin_modules
 
 
 # ---------------------------------------------------------------------
@@ -180,6 +183,7 @@ class TestDocumentPreservation(unittest.TestCase):
     result = delete_engagement_data(
       job_id="abc123", job_specs=specs, artifact_repo=repo,
     )
+    self.assertFalse(result.ok)
     self.assertEqual(result.documents_failed, 2)
     self.assertEqual(result.documents_deleted, 3)
 
@@ -337,6 +341,103 @@ class TestEdgeCases(unittest.TestCase):
     self.assertEqual(result.documents_deleted, 1)
     self.assertEqual(repo.deleted, ["QmLegacyOnly"])
     self.assertEqual(result.fields_cleared, 1)
+
+
+class _EndpointOwner:
+  """Small JobStateRepository host for delete_job_engagement endpoint tests."""
+
+  cfg_instance_id = "test-instance"
+
+  def __init__(self, jobs: dict | None = None):
+    self.jobs = dict(jobs or {})
+    self.messages: list[str] = []
+    self.fail_put = False
+    self.chainstore_hset = MagicMock(side_effect=self._chainstore_hset)
+
+  def chainstore_hget(self, *, hkey, key):
+    return self.jobs.get(key)
+
+  def _chainstore_hset(self, *, hkey, key, value):
+    if self.fail_put:
+      raise RuntimeError("CStore write failed")
+    self.jobs[key] = value
+
+  def P(self, message, **kwargs):
+    self.messages.append(message)
+
+
+class TestDeleteJobEngagementEndpoint(unittest.TestCase):
+
+  def _plugin_class(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def test_endpoint_updates_cstore_and_deletes_documents_after_state_persist(self):
+    Plugin = self._plugin_class()
+    specs, repo = _build_specs()
+    owner = _EndpointOwner(jobs={"abc123": specs})
+
+    with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
+      result = Plugin.delete_job_engagement(
+        owner, job_id="abc123", delete_documents=True, requested_by="alice",
+      )
+
+    self.assertTrue(result["ok"])
+    self.assertEqual(result["documents_deleted"], 5)
+    self.assertEqual(result["documents_failed"], 0)
+    self.assertEqual(owner.jobs["abc123"]["job_config_cid"], result["new_job_config_cid"])
+    audit = owner.jobs["abc123"]["timeline"][-1]
+    self.assertEqual(audit["meta"]["documents_deleted"], 5)
+    self.assertEqual(audit["meta"]["documents_failed"], 0)
+    self.assertEqual(set(repo.deleted), {
+      "QmAuthDoc1", "QmAuthThumb1", "QmCloudAuth1",
+      "QmMsspAuth1", "QmLegacyAuthRef",
+    })
+
+  def test_endpoint_does_not_delete_documents_when_state_persist_fails(self):
+    Plugin = self._plugin_class()
+    specs, repo = _build_specs()
+    owner = _EndpointOwner(jobs={"abc123": specs})
+    owner.fail_put = True
+
+    with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
+      result = Plugin.delete_job_engagement(
+        owner, job_id="abc123", delete_documents=True, requested_by="alice",
+      )
+
+    self.assertEqual(result["error"], "state_persist_failed")
+    self.assertEqual(repo.deleted, [])
+
+  def test_endpoint_reports_document_delete_failures(self):
+    Plugin = self._plugin_class()
+    specs, repo = _build_specs()
+    repo.delete_failures = {"QmAuthDoc1"}
+    owner = _EndpointOwner(jobs={"abc123": specs})
+
+    with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
+      result = Plugin.delete_job_engagement(
+        owner, job_id="abc123", delete_documents=True, requested_by="alice",
+      )
+
+    self.assertFalse(result["ok"])
+    self.assertEqual(result["documents_deleted"], 4)
+    self.assertEqual(result["documents_failed"], 1)
+    audit = owner.jobs["abc123"]["timeline"][-1]
+    self.assertEqual(audit["meta"]["documents_failed"], 1)
+
+  def test_endpoint_explicitly_rejects_finalized_job_archives(self):
+    Plugin = self._plugin_class()
+    repo = _MockArtifactRepo()
+    owner = _EndpointOwner(jobs={
+      "fin123": {"job_id": "fin123", "job_cid": "QmArchive"},
+    })
+
+    with patch.object(Plugin, "_get_artifact_repository", return_value=repo):
+      result = Plugin.delete_job_engagement(owner, job_id="fin123")
+
+    self.assertEqual(result["error"], "unsupported_finalized_job")
+    self.assertEqual(repo.deleted, [])
 
 
 if __name__ == "__main__":

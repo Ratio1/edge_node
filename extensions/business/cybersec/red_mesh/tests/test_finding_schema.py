@@ -209,6 +209,21 @@ class TestSerialization(unittest.TestCase):
                 "cvss_score", "cvss_vector"):
       self.assertIn(key, raw, f"legacy field missing: {key}")
 
+  def test_probe_result_enriches_legacy_finding_when_probe_known(self):
+    f = Finding(
+      severity=Severity.HIGH,
+      title="legacy",
+      description="legacy description",
+      remediation="patch",
+      cwe_id="CWE-287",
+      owasp_id="A07:2021",
+    )
+    raw = probe_result(findings=[f], probe_id="_web_test_example")["findings"][0]
+    self.assertEqual(raw["cwe"], [287])
+    self.assertEqual(raw["owasp_top10"], ["A07:2021"])
+    self.assertEqual(raw["remediation_structured"]["primary"], "patch")
+    self.assertEqual(len(raw["finding_signature"]), 64)
+
 
 if __name__ == "__main__":
   unittest.main()

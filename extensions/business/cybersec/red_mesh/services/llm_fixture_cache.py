@@ -57,12 +57,13 @@ def cached_llm_call(
   Behavior:
     - LIVE_LLM=1 in env: forward to inner_llm_call, persist
       response to cache_dir / {hash}.json, return response.
-    - LIVE_LLM unset: load cached response from disk; raise
+    - Any other value, including unset, 0, false, and empty: load
+      cached response from disk; raise
       LlmFixtureCacheMiss if not found.
   """
   cache_path = Path(cache_dir) if cache_dir else _DEFAULT_CACHE_DIR
   cache_path.mkdir(parents=True, exist_ok=True)
-  is_live = bool(os.environ.get(live_env_var, "").strip())
+  is_live = os.environ.get(live_env_var, "").strip() == "1"
 
   def call(messages: list[dict], max_tokens: int, temperature: float) -> str:
     key = _cache_key(messages, max_tokens, temperature)

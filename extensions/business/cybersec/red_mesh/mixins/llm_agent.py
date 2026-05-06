@@ -15,6 +15,7 @@ from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
 from ..services.config import get_llm_agent_config
+from ..services.llm_fixture_cache import cached_llm_call
 from ..services.resilience import run_bounded_retry
 from ..services.llm_structured import generate_exec_summary
 
@@ -1234,10 +1235,12 @@ class _RedMeshLlmAgentMixin(object):
     to it, not instead of it.
     """
     llm_cfg = get_llm_agent_config(self)
+    self._last_structured_llm_failed = None
+    self._last_structured_llm_validation = None
     if not llm_cfg.get("ENABLED"):
       return None
 
-    def chat_call(messages: list, max_tokens: int, temperature: float) -> str:
+    def raw_chat_call(messages: list, max_tokens: int, temperature: float) -> str:
       """Adapter — turns the LLM Agent /chat HTTP response into the
       raw assistant content string generate_exec_summary expects."""
       response = self._call_llm_agent_api(
@@ -1258,6 +1261,8 @@ class _RedMeshLlmAgentMixin(object):
       content = message.get("content")
       return str(content) if content else ""
 
+    chat_call = cached_llm_call(raw_chat_call)
+
     try:
       result = generate_exec_summary(
         llm_call=chat_call,
@@ -1271,8 +1276,11 @@ class _RedMeshLlmAgentMixin(object):
         f"Structured LLM call failed for job {job_id}: {exc}",
         color='y',
       )
+      self._last_structured_llm_failed = True
       return None
 
+    self._last_structured_llm_failed = bool(result.error)
+    self._last_structured_llm_validation = result.validation.to_dict()
     if result.error:
       # Fallback skeleton — let the frontend render the
       # "[AI generation failed validation]" marker rather than
@@ -1285,7 +1293,12 @@ class _RedMeshLlmAgentMixin(object):
         color='y',
       )
 
-    return result.sections.to_dict()
+    sections = result.sections.to_dict()
+    if result.error:
+      sections["validation"] = result.validation.to_dict()
+      sections["error"] = True
+      sections["attempts"] = result.attempts
+    return sections
 
   def _run_quick_summary_analysis(
       self,

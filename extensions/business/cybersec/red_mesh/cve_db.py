@@ -13,11 +13,13 @@ Without a cache the function behaves as before — static severity only
 """
 
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass
-from .findings import Finding, Severity
+from .findings import Finding, Remediation, Severity
 from .references import cwe_to_owasp
 
 CVE_DB_LAST_UPDATED = "2026-03-08"
+_CURRENT_DYNAMIC_CACHE: ContextVar = ContextVar("redmesh_dynamic_reference_cache", default=None)
 
 
 @dataclass(frozen=True)
@@ -233,6 +235,9 @@ def check_cves(product: str, version: str, *, dynamic_cache=None) -> list:
   the static cwe_to_owasp table). When no cache is provided, the
   legacy behavior is preserved (static severity only).
   """
+  if dynamic_cache is None:
+    dynamic_cache = get_dynamic_reference_cache()
+
   findings = []
   for entry in CVE_DATABASE:
     if entry.product != product:
@@ -241,6 +246,21 @@ def check_cves(product: str, version: str, *, dynamic_cache=None) -> list:
       continue
     findings.append(_build_finding(entry, product, version, dynamic_cache))
   return findings
+
+
+def set_dynamic_reference_cache(dynamic_cache):
+  """Set the scan-local dynamic reference cache for check_cves callers."""
+  return _CURRENT_DYNAMIC_CACHE.set(dynamic_cache)
+
+
+def reset_dynamic_reference_cache(token) -> None:
+  """Reset the scan-local dynamic reference cache token."""
+  _CURRENT_DYNAMIC_CACHE.reset(token)
+
+
+def get_dynamic_reference_cache():
+  """Return the scan-local dynamic reference cache, if one is active."""
+  return _CURRENT_DYNAMIC_CACHE.get()
 
 
 def _build_finding(entry, product: str, version: str, dynamic_cache):
@@ -263,7 +283,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache):
   cvss_freshness = ""
   kev = False
   epss_score = None
-  references_list: list[str] = []
+  references_list: list[str] = [f"https://nvd.nist.gov/vuln/detail/{entry.cve_id}"]
   severity = entry.severity
 
   if dynamic_cache is not None:
@@ -292,7 +312,7 @@ def _build_finding(entry, product: str, version: str, dynamic_cache):
     if epss_rec and epss_rec.cve_id and epss_rec.score is not None:
       epss_score = float(epss_rec.score)
 
-  return Finding(
+  finding = Finding(
     severity=severity,
     title=f"{entry.cve_id}: {entry.title} ({product} {version})",
     description=f"{product} {version} is vulnerable to {entry.cve_id}. "
@@ -315,6 +335,17 @@ def _build_finding(entry, product: str, version: str, dynamic_cache):
     cve=(entry.cve_id,),
     owasp_top10=tuple(owasp_top10),
     references=tuple(references_list),
+    remediation_structured=Remediation(
+      primary=f"Upgrade {product} to a patched version, or verify backport status with the OS vendor.",
+      mitigation="Restrict exposure to trusted networks until patch status is confirmed.",
+      compensating="Use host or network controls to reduce exploitability for the affected service.",
+    ),
+  )
+  return finding.with_signature(
+    finding.compute_signature(
+      probe_id=f"cve:{product}",
+      asset_canonical=f"{product}:{version}:{entry.cve_id}",
+    )
   )
 
 

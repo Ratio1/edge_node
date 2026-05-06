@@ -159,22 +159,8 @@ def delete_engagement_data(
   # 2. Build sanitized copy
   sanitized, fields_cleared = _strip_engagement(config)
 
-  # 3. Optionally delete authorization documents from R1FS
-  documents_deleted = 0
-  documents_failed = 0
-  if delete_documents:
-    cids_to_delete = _collect_auth_document_cids(config)
-    for cid in cids_to_delete:
-      try:
-        ok = artifact_repo.delete(cid, show_logs=False, raise_on_error=False)
-      except Exception:
-        ok = False
-      if ok:
-        documents_deleted += 1
-      else:
-        documents_failed += 1
-
-  # 4. Persist sanitized JobConfig — new CID
+  # 3. Persist sanitized JobConfig before deleting documents. This avoids
+  # deleting R1FS objects while the job still points at an unwritten config.
   try:
     new_cid = artifact_repo.put_job_config(sanitized, show_logs=False)
   except Exception as exc:
@@ -188,8 +174,24 @@ def delete_engagement_data(
       message="put_job_config returned empty CID",
     )
 
-  # 5. Update job_specs to point at new config
+  # 4. Update job_specs to point at new config. Callers must persist this
+  # mutated job_specs through JobStateRepository before reporting success.
   job_specs["job_config_cid"] = new_cid
+
+  # 5. Optionally delete authorization documents from R1FS
+  documents_deleted = 0
+  documents_failed = 0
+  if delete_documents:
+    cids_to_delete = collect_engagement_document_cids(config)
+    for cid in cids_to_delete:
+      try:
+        ok = artifact_repo.delete(cid, show_logs=False, raise_on_error=False)
+      except Exception:
+        ok = False
+      if ok:
+        documents_deleted += 1
+      else:
+        documents_failed += 1
 
   # 6. Append audit entry to timeline (best-effort)
   performed_at = now_fn()
@@ -202,8 +204,9 @@ def delete_engagement_data(
     performed_at=performed_at,
   )
 
+  result_ok = documents_failed == 0
   return DeleteEngagementResult(
-    job_id=job_id, ok=True,
+    job_id=job_id, ok=result_ok,
     fields_cleared=fields_cleared,
     documents_deleted=documents_deleted,
     documents_failed=documents_failed,
@@ -260,7 +263,7 @@ def _strip_engagement(config: dict) -> tuple[dict, int]:
   return sanitized, cleared
 
 
-def _collect_auth_document_cids(config: dict) -> list[str]:
+def collect_engagement_document_cids(config: dict) -> list[str]:
   """Walk the AuthorizationRef and legacy authorization_ref fields and
   return every R1FS CID that points to an uploaded auth document."""
   out: list[str] = []
@@ -285,6 +288,11 @@ def _collect_auth_document_cids(config: dict) -> list[str]:
       seen.add(cid)
       unique.append(cid)
   return unique
+
+
+def _collect_auth_document_cids(config: dict) -> list[str]:
+  """Backward-compatible alias for older tests/imports."""
+  return collect_engagement_document_cids(config)
 
 
 def _append_redaction_audit(

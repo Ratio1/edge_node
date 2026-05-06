@@ -114,6 +114,19 @@ def fetch_archive(rm: str, job_id: str) -> dict:
   return resp.get("result", {}).get("archive", {})
 
 
+def archive_passes(archive: dict) -> list:
+  """Return current JobArchive.passes with legacy pass_reports fallback."""
+  if not isinstance(archive, dict):
+    return []
+  passes = archive.get("passes")
+  if isinstance(passes, list):
+    return passes
+  pass_reports = archive.get("pass_reports")
+  if isinstance(pass_reports, list):
+    return pass_reports
+  return []
+
+
 def assert_no_dup_findings(aggregated: dict, label: str) -> list[str]:
   """Phase 0 PR-0.1 invariant — every finding list under the canonical
   paths must have unique signatures (excluding _source_* stamps)."""
@@ -202,9 +215,9 @@ def run_scenario(rm: str, name: str, launch_fn, **launch_kwargs) -> dict:
   print(f"  duration: {job.get('duration', '?')}s, risk: {job.get('risk_score', '?')}", flush=True)
 
   archive = fetch_archive(rm, job_id)
-  pass_reports = archive.get("pass_reports", [])
+  pass_reports = archive_passes(archive)
   if not pass_reports:
-    raise AssertionError(f"{name}: archive has no pass_reports")
+    raise AssertionError(f"{name}: archive has no passes/pass_reports")
   pr = pass_reports[-1]
   agg_cid = pr.get("aggregated_report_cid")
   print(f"  aggregated_report_cid: {agg_cid}", flush=True)

@@ -112,6 +112,18 @@ class TestFixtureCacheReplayMode(unittest.TestCase):
         cached([{"role": "user", "content": "x"}], 100, 0.2)
     self.assertIn("LIVE_LLM=1", str(ctx.exception))
 
+  def test_only_literal_one_enables_live_mode(self):
+    """LIVE_LLM=0/false/empty must not call the real LLM."""
+    def boom(messages, max_tokens, temperature):
+      raise RuntimeError("MUST NOT REACH NETWORK")
+
+    for value in ("0", "false", "False", ""):
+      with self.subTest(value=value):
+        with mock.patch.dict(os.environ, {"LIVE_LLM": value}, clear=False):
+          cached = cached_llm_call(boom, cache_dir=self.cache_dir)
+          with self.assertRaises(LlmFixtureCacheMiss):
+            cached([{"role": "user", "content": value}], 100, 0.2)
+
   def test_replay_returns_cached_response_without_calling_inner(self):
     """Populate cache via live mode, then replay without network."""
     inner_calls = []

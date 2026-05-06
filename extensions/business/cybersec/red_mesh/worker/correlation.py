@@ -107,18 +107,10 @@ class _CorrelationMixin:
 
     if findings:
       self.P(f"Correlation engine produced {len(findings)} findings.")
-    self.state["correlation_findings"] = [
-      {
-        "severity": f.severity.value,
-        "title": f.title,
-        "description": f.description,
-        "evidence": f.evidence,
-        "remediation": f.remediation,
-        "cwe_id": f.cwe_id,
-        "confidence": f.confidence,
-      }
-      for f in findings
-    ]
+    self.state["correlation_findings"] = probe_result(
+      findings=findings,
+      probe_id="_post_scan_correlate",
+    )["findings"]
 
   @register_probe(
     display_name="Honeypot indicator (port-open ratio)",

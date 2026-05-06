@@ -74,6 +74,7 @@ from .authorization_upload import (
   store_authorization_document,
 )
 from .engagement_deletion import (
+  collect_engagement_document_cids,
   DeleteEngagementError,
   DeleteEngagementResult,
   delete_engagement_data,
@@ -141,6 +142,7 @@ __all__ = [
   # engagement context (Phase 3)
   "AuthorizationUploadError",
   "AuthorizationUploadResult",
+  "collect_engagement_document_cids",
   "store_authorization_document",
   "DeleteEngagementError",
   "DeleteEngagementResult",

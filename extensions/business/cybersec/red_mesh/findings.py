@@ -19,8 +19,9 @@ from the @register_probe decorator metadata + dynamic CVE DB lookup.
 """
 
 import hashlib
+import inspect
 import json
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from enum import Enum
 from typing import Any
 
@@ -250,7 +251,7 @@ def finding_from_dict(data: dict) -> Finding:
   return Finding(**_revive_finding_dict(data))
 
 
-def probe_result(*, raw_data: dict = None, findings: list = None) -> dict:
+def probe_result(*, raw_data: dict = None, findings: list = None, probe_id: str | None = None) -> dict:
   """Build a probe return dict: JSON-safe, merge_objects_deep-safe, backward-compat.
 
   Each finding is asdict()'d with the severity enum converted to its
@@ -259,9 +260,132 @@ def probe_result(*, raw_data: dict = None, findings: list = None) -> dict:
   """
   result = dict(raw_data or {})
   f_list = findings or []
-  result["findings"] = [_finding_to_jsonable(f) for f in f_list]
-  result["vulnerabilities"] = [f.title for f in f_list if f.severity in _VULN_SEVERITIES]
+  resolved_probe_id = probe_id or _infer_calling_probe_id()
+  enriched = [
+    enrich_finding_for_probe(f, resolved_probe_id)
+    for f in f_list
+  ]
+  result["findings"] = [_finding_to_jsonable(f) for f in enriched]
+  result["vulnerabilities"] = [f.title for f in enriched if f.severity in _VULN_SEVERITIES]
   return result
+
+
+def enrich_finding_for_probe(f: Finding, probe_id: str | None) -> Finding:
+  """Fill additive PTES fields from registered probe metadata.
+
+  Legacy probe call sites can keep constructing minimal ``Finding``
+  objects; this helper makes the registry metadata load-bearing at the
+  serialization boundary without mutating frozen dataclasses.
+  """
+  if not isinstance(f, Finding):
+    return f
+
+  cwe_values = _normalize_cwe_values(f.cwe)
+  if not cwe_values and f.cwe_id:
+    parsed = _parse_cwe_id(f.cwe_id)
+    if parsed:
+      cwe_values = (parsed,)
+
+  owasp_values = tuple(x for x in f.owasp_top10 if x)
+  if not owasp_values and f.owasp_id:
+    owasp_values = (f.owasp_id,)
+  references = tuple(x for x in f.references if x)
+  cvss_vector = f.cvss_vector
+
+  metadata = _get_probe_metadata_safe(probe_id)
+  if metadata is not None:
+    if not cwe_values:
+      cwe_values = tuple(metadata.default_cwe)
+    if not owasp_values:
+      owasp_values = tuple(metadata.default_owasp)
+    if not cvss_vector and metadata.cvss_template:
+      cvss_vector = metadata.cvss_template
+    references = _merge_unique(references, metadata.references)
+
+  updates: dict[str, Any] = {}
+  if cwe_values and not f.cwe:
+    updates["cwe"] = cwe_values
+  if cwe_values and not f.cwe_id:
+    updates["cwe_id"] = f"CWE-{cwe_values[0]}"
+  if owasp_values and not f.owasp_top10:
+    updates["owasp_top10"] = owasp_values
+  if owasp_values and not f.owasp_id:
+    updates["owasp_id"] = owasp_values[0]
+  if cvss_vector and not f.cvss_vector:
+    updates["cvss_vector"] = cvss_vector
+  if references != f.references:
+    updates["references"] = references
+  if f.remediation_structured is None:
+    primary = f.remediation or "Review the probe evidence and apply the vendor or platform hardening guidance for this finding."
+    updates["remediation_structured"] = Remediation(primary=primary)
+
+  enriched = replace(f, **updates) if updates else f
+  if probe_id and not enriched.finding_signature:
+    enriched = replace(
+      enriched,
+      finding_signature=enriched.compute_signature(probe_id=probe_id),
+    )
+  return enriched
+
+
+def _infer_calling_probe_id() -> str:
+  """Infer a probe id from the call stack for legacy probe_result callers."""
+  frame = inspect.currentframe()
+  if frame is not None:
+    frame = frame.f_back
+  prefixes = ("_service_info_", "_web_test_", "_post_scan_", "_correlate_", "_graybox_")
+  while frame is not None:
+    name = frame.f_code.co_name
+    if name.startswith(prefixes):
+      return name
+    frame = frame.f_back
+  return ""
+
+
+def _get_probe_metadata_safe(probe_id: str | None):
+  if not probe_id:
+    return None
+  try:
+    from .worker.probe_registry import get_probe_metadata
+    return get_probe_metadata(probe_id)
+  except Exception:
+    return None
+
+
+def _normalize_cwe_values(values) -> tuple[int, ...]:
+  out = []
+  for value in values or ():
+    try:
+      parsed = int(value)
+    except (TypeError, ValueError):
+      continue
+    if parsed > 0 and parsed not in out:
+      out.append(parsed)
+  return tuple(out)
+
+
+def _parse_cwe_id(value: str) -> int:
+  if not isinstance(value, str):
+    return 0
+  cleaned = value.strip().upper()
+  if cleaned.startswith("CWE-"):
+    cleaned = cleaned[4:]
+  try:
+    parsed = int(cleaned)
+  except (TypeError, ValueError):
+    return 0
+  return parsed if parsed > 0 else 0
+
+
+def _merge_unique(existing, extra) -> tuple[str, ...]:
+  out = []
+  seen = set()
+  for value in tuple(existing or ()) + tuple(extra or ()):
+    if not value or value in seen:
+      continue
+    seen.add(value)
+    out.append(value)
+  return tuple(out)
 
 
 def _finding_to_jsonable(f: Finding) -> dict:

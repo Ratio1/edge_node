@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import unittest
 
-from extensions.business.cybersec.red_mesh.cve_db import check_cves
+from extensions.business.cybersec.red_mesh.cve_db import (
+  check_cves,
+  reset_dynamic_reference_cache,
+  set_dynamic_reference_cache,
+)
 from extensions.business.cybersec.red_mesh.findings import Severity
 from extensions.business.cybersec.red_mesh.references.dynamic import (
   CvssRecord,
@@ -151,6 +155,18 @@ class TestEnrichmentWhenCachePresent(unittest.TestCase):
       f = findings[0]
       self.assertTrue(any("mock://nvd/" in r for r in f.references))
     finally:
+      cache.close()
+
+  def test_context_cache_used_when_argument_omitted(self):
+    cache = _make_cache(epss=0.77)
+    token = set_dynamic_reference_cache(cache)
+    try:
+      findings = check_cves("openssh", "8.0")
+      self.assertGreater(len(findings), 0)
+      self.assertEqual(findings[0].epss_score, 0.77)
+      self.assertEqual(len(findings[0].finding_signature), 64)
+    finally:
+      reset_dynamic_reference_cache(token)
       cache.close()
 
 
