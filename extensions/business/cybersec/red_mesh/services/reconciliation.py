@@ -141,6 +141,104 @@ def _matched_live_progress(job_id, worker_addr, pass_nr, assignment_revision, li
   return live, None
 
 
+def _job_repo(owner):
+  getter = getattr(owner, "_get_job_state_repository", None)
+  if callable(getter):
+    return getter()
+  return getattr(owner, "_job_state_repository", None)
+
+
+def reconcile_workers_from_live(owner, job_id, *, live_payloads=None, now=None):
+  """
+  Repair launcher-owned durable worker completion state from ``:live`` rows.
+
+  This helper intentionally copies only the terminal fields required for
+  finalization. Runtime progress stays in the worker-owned live namespace.
+  """
+  repo = _job_repo(owner)
+  if repo is None:
+    return False
+
+  raw = repo.get_job(job_id)
+  if not isinstance(raw, dict) or raw.get("job_cid"):
+    return False
+
+  normalizer = getattr(owner, "_normalize_job_record", None)
+  if callable(normalizer):
+    normalized_key, job_specs = normalizer(job_id, raw)
+  else:
+    normalized_key, job_specs = job_id, raw
+  if normalized_key is None or not isinstance(job_specs, dict):
+    return False
+  if job_specs.get("job_cid"):
+    return False
+  if job_specs.get("launcher") != getattr(owner, "ee_addr", None):
+    return False
+
+  workers = job_specs.get("workers") or {}
+  if not isinstance(workers, dict) or not workers:
+    return False
+
+  if live_payloads is None:
+    live_payloads = repo.list_live_progress() or {}
+
+  pass_nr = _safe_int(job_specs.get("job_pass", 1), 1)
+  changed_workers = []
+
+  for worker_addr, worker_entry in workers.items():
+    if not isinstance(worker_entry, dict):
+      continue
+    if worker_entry.get("canceled"):
+      continue
+    if worker_entry.get("terminal_reason") == "unreachable":
+      continue
+    if worker_entry.get("finished") and worker_entry.get("report_cid"):
+      continue
+
+    assignment_revision = _safe_int(worker_entry.get("assignment_revision", 1), 1)
+    live, _ignored_reason = _matched_live_progress(
+      job_specs.get("job_id"),
+      worker_addr,
+      pass_nr,
+      assignment_revision,
+      live_payloads,
+    )
+    if live is None:
+      continue
+    if not live.finished or not live.report_cid:
+      continue
+
+    if not worker_entry.get("report_cid"):
+      worker_entry["report_cid"] = live.report_cid
+    worker_entry["finished"] = True
+    worker_entry["result"] = None
+    changed_workers.append(worker_addr)
+
+  if not changed_workers:
+    return False
+
+  emit = getattr(owner, "_emit_timeline_event", None)
+  if callable(emit):
+    emit(
+      job_specs,
+      "reconciled",
+      "Reconciled missing worker completion from live state",
+      actor_type="system",
+      meta={
+        "workers": changed_workers,
+        "pass_nr": pass_nr,
+        "source": "live",
+      },
+    )
+
+  writer = getattr(owner, "_write_job_record", None)
+  if callable(writer):
+    writer(normalized_key, job_specs, context="reconcile_from_live")
+  else:
+    repo.put_job(normalized_key, job_specs)
+  return True
+
+
 def reconcile_job_workers(owner, job_specs, *, live_payloads=None, now=None):
   """
   Merge launcher-owned worker assignments with worker-owned :live state.

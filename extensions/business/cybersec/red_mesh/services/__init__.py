@@ -43,6 +43,7 @@ from .reconciliation import (
   DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
   get_distributed_job_reconciliation_config,
   reconcile_job_workers,
+  reconcile_workers_from_live,
 )
 from .secrets import (
   R1fsSecretStore,
@@ -134,6 +135,7 @@ __all__ = [
   "get_distributed_job_reconciliation_config",
   "DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS",
   "reconcile_job_workers",
+  "reconcile_workers_from_live",
   "set_job_status",
   "stop_and_delete_job",
   "stop_monitoring",
