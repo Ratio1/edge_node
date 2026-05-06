@@ -426,6 +426,75 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertTrue(Plugin._live_hsync_due(plugin, 100.0, cfg))
     self.assertTrue(Plugin._live_hsync_due(plugin, 101.0, cfg))
 
+  def test_publish_live_progress_final_requires_report_cid(self):
+    """Final live progress is not reconciliable until a report CID exists."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.time.return_value = 100.0
+
+    result = Plugin._publish_live_progress_final(plugin, "job-1", "")
+
+    self.assertFalse(result)
+    plugin.chainstore_hset.assert_not_called()
+
+  def test_publish_live_progress_final_writes_terminal_cid_row(self):
+    """Final live progress includes terminal state and the worker report CID."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+    plugin.time.return_value = 120.0
+    plugin._execution_live_meta = {
+      "job-1": {
+        "started_at": 90.0,
+        "first_seen_live_at": 90.0,
+        "assignment_revision_seen": 4,
+      },
+    }
+    plugin.chainstore_hget.return_value = {
+      "job_id": "job-1",
+      "job_pass": 3,
+      "workers": {
+        "node-A": {"assignment_revision": 4},
+      },
+    }
+
+    worker = MagicMock()
+    worker.initial_ports = [80, 443, 8080]
+    worker.state = {
+      "scan_type": "network",
+      "ports_scanned": [80, 443, 8080],
+      "open_ports": [80, 443],
+      "completed_tests": ["correlation_completed"],
+    }
+
+    result = Plugin._publish_live_progress_final(
+      plugin,
+      "job-1",
+      "QmReport123",
+      local_workers={"thread-1": worker},
+      report={"scan_metrics": {"total_duration": 42.0}},
+    )
+
+    self.assertTrue(result)
+    plugin.chainstore_hset.assert_called_once()
+    call = plugin.chainstore_hset.call_args.kwargs
+    value = call["value"]
+    self.assertEqual(call["hkey"], "test-instance:live")
+    self.assertEqual(call["key"], "job-1:node-A")
+    self.assertEqual(value["job_id"], "job-1")
+    self.assertEqual(value["worker_addr"], "node-A")
+    self.assertEqual(value["pass_nr"], 3)
+    self.assertEqual(value["assignment_revision_seen"], 4)
+    self.assertEqual(value["finished"], True)
+    self.assertEqual(value["phase"], "done")
+    self.assertEqual(value["progress"], 100.0)
+    self.assertEqual(value["report_cid"], "QmReport123")
+    self.assertEqual(value["ports_scanned"], 3)
+    self.assertEqual(value["ports_total"], 3)
+    self.assertEqual(value["open_ports_found"], [80, 443])
+    self.assertEqual(value["live_metrics"], {"total_duration": 42.0})
+
   def test_publish_live_progress_multi_thread_phase(self):
     """Phase is the earliest active phase; per-thread data is included."""
     Plugin = self._get_plugin_class()
@@ -1563,6 +1632,17 @@ class TestPhase16ScanMetrics(unittest.TestCase):
     self.assertEqual(sm["probes_completed"], 3)
     # OR flags
     self.assertTrue(sm["rate_limiting_detected"])
+
+    live_writes = [
+      call.kwargs["value"]
+      for call in plugin.chainstore_hset.call_args_list
+      if call.kwargs.get("hkey") == "test-instance:live"
+      and call.kwargs.get("key") == "job-1:node-A"
+    ]
+    self.assertGreaterEqual(len(live_writes), 2)
+    self.assertNotIn("report_cid", live_writes[0])
+    self.assertEqual(live_writes[-1]["report_cid"], "QmReport123")
+    self.assertEqual(live_writes[-1]["finished"], True)
 
   def test_finalize_pass_attaches_pass_metrics(self):
     """16c: _maybe_finalize_pass merges node metrics into PassReport.scan_metrics."""

@@ -350,6 +350,110 @@ class _LiveProgressMixin:
         f"key={job_id}:{ee_addr}"
       )
 
+  def _publish_live_progress_final(self, job_id, report_cid, local_workers=None, report=None, live_meta=None):
+    """Publish a terminal worker-owned live row after the report CID exists."""
+    if not report_cid:
+      return False
+
+    now = self.time()
+    ee_addr = self.ee_addr
+    raw_job_specs = self.chainstore_hget(hkey=self.cfg_instance_id, key=job_id)
+    pass_nr = 1
+    worker_entry = {}
+    if isinstance(raw_job_specs, dict):
+      pass_nr = raw_job_specs.get("job_pass", 1)
+      worker_entry = (raw_job_specs.get("workers") or {}).get(ee_addr) or {}
+    try:
+      assignment_revision = int(worker_entry.get("assignment_revision", 1) or 1)
+    except (TypeError, ValueError):
+      assignment_revision = 1
+
+    live_meta = dict(live_meta or _LiveProgressMixin._get_execution_live_meta(self, job_id))
+    started_at = live_meta.get("started_at", now)
+    first_seen_live_at = live_meta.get("first_seen_live_at", started_at)
+    assignment_revision_seen = live_meta.get("assignment_revision_seen", assignment_revision)
+
+    total_scanned = 0
+    total_ports = 0
+    all_open = set()
+    all_tests = set()
+    scan_type = "network"
+    thread_entries = {}
+
+    for tid, worker in (local_workers or {}).items():
+      state = getattr(worker, "state", {})
+      if not isinstance(state, dict):
+        state = {}
+      initial_ports = getattr(worker, "initial_ports", []) or []
+      if not isinstance(initial_ports, (list, tuple, set)):
+        initial_ports = []
+      ports_scanned = state.get("ports_scanned", []) or []
+      open_ports = state.get("open_ports", []) or []
+      completed_tests = state.get("completed_tests", []) or []
+      if state.get("scan_type") == "webapp":
+        scan_type = "webapp"
+
+      total_scanned += len(ports_scanned)
+      total_ports += len(initial_ports)
+      all_open.update(open_ports)
+      all_tests.update(completed_tests)
+      thread_entries[tid] = {
+        "phase": "done",
+        "ports_scanned": len(ports_scanned),
+        "ports_total": len(initial_ports),
+        "open_ports_found": sorted(open_ports),
+      }
+
+    if isinstance(report, dict):
+      if not all_open:
+        all_open.update(report.get("open_ports") or [])
+      if not total_scanned:
+        try:
+          total_scanned = int(report.get("ports_scanned", 0) or 0)
+        except (TypeError, ValueError):
+          total_scanned = 0
+      if report.get("scan_type") == "webapp":
+        scan_type = "webapp"
+
+    total_phases = len(GRAYBOX_PHASE_ORDER) if scan_type == "webapp" else len(PHASE_ORDER)
+    live_metrics = report.get("scan_metrics") if isinstance(report, dict) else None
+
+    progress = WorkerProgress(
+      job_id=job_id,
+      worker_addr=ee_addr,
+      pass_nr=pass_nr,
+      assignment_revision_seen=assignment_revision_seen,
+      progress=100.0,
+      phase="done",
+      scan_type=scan_type,
+      phase_index=total_phases,
+      total_phases=total_phases,
+      ports_scanned=total_scanned,
+      ports_total=total_ports,
+      open_ports_found=sorted(all_open),
+      completed_tests=sorted(all_tests),
+      updated_at=now,
+      started_at=started_at,
+      first_seen_live_at=first_seen_live_at,
+      last_seen_at=now,
+      finished=True,
+      report_cid=report_cid,
+      live_metrics=live_metrics,
+      threads=thread_entries if len(thread_entries) > 1 else None,
+    )
+    self.chainstore_hset(
+      hkey=f"{self.cfg_instance_id}:live",
+      key=f"{job_id}:{ee_addr}",
+      value=progress.to_dict(),
+    )
+    self.P(
+      "[LIVE->CSTORE] Published final worker progress "
+      f"job_id={job_id} worker={ee_addr} pass={pass_nr} "
+      f"rev={assignment_revision_seen} report_cid={report_cid} "
+      f"key={job_id}:{ee_addr}"
+    )
+    return True
+
   def _clear_live_progress(self, job_id, worker_addresses):
     """
     Remove live progress keys for a completed job.
