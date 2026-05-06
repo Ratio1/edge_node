@@ -1129,6 +1129,15 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(worker["report_cid"], "QmWorkerReport")
     self.assertIsNone(worker["result"])
     self.assertEqual(plugin._last_live_hsync_at, 100.0)
+    summary = plugin._last_live_hsync_summary
+    self.assertEqual(summary["jobs"], 1)
+    self.assertEqual(summary["missing_workers"], 1)
+    self.assertEqual(summary["targeted_calls"], 1)
+    self.assertEqual(summary["changed_jobs"], 1)
+    self.assertEqual(summary["changed_workers"], 1)
+    self.assertEqual(summary["targeted_failures"], 0)
+    self.assertEqual(plugin._live_hsync_counters["live_hsync_due"], 1)
+    self.assertEqual(plugin._live_hsync_counters["live_reconcile_changed_workers"], 1)
 
   def test_maybe_hsync_live_progress_waits_for_fixed_interval(self):
     """Missing workers do not trigger network hsync before the fixed cadence."""
@@ -1158,6 +1167,83 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(changed_jobs, [])
     plugin.chainstore_hsync.assert_not_called()
     self.assertEqual(plugin._last_live_hsync_at, 20.0)
+
+  def test_maybe_hsync_live_progress_summarizes_ignored_live_rows(self):
+    """Stale pass, stale revision, and missing CID ignores are summarized once."""
+    jobs = {
+      "job-1": {
+        "job_id": "job-1",
+        "job_status": "RUNNING",
+        "job_pass": 2,
+        "run_mode": "SINGLEPASS",
+        "launcher": "launcher-A",
+        "target": "10.0.0.1",
+        "start_port": 1,
+        "end_port": 100,
+        "date_created": 10.0,
+        "job_config_cid": "QmConfig",
+        "workers": {
+          "worker-A": {"assignment_revision": 1, "finished": False},
+          "worker-B": {"assignment_revision": 2, "finished": False},
+          "worker-C": {"assignment_revision": 3, "finished": False},
+        },
+        "timeline": [],
+        "pass_reports": [],
+        "job_revision": 0,
+      },
+    }
+    live_payloads = {
+      "job-1:worker-A": {
+        "job_id": "job-1",
+        "worker_addr": "worker-A",
+        "pass_nr": 1,
+        "assignment_revision_seen": 1,
+        "progress": 100.0,
+        "phase": "done",
+        "finished": True,
+        "report_cid": "QmOldPass",
+      },
+      "job-1:worker-B": {
+        "job_id": "job-1",
+        "worker_addr": "worker-B",
+        "pass_nr": 2,
+        "assignment_revision_seen": 1,
+        "progress": 100.0,
+        "phase": "done",
+        "finished": True,
+        "report_cid": "QmOldRevision",
+      },
+      "job-1:worker-C": {
+        "job_id": "job-1",
+        "worker_addr": "worker-C",
+        "pass_nr": 2,
+        "assignment_revision_seen": 3,
+        "progress": 100.0,
+        "phase": "done",
+        "finished": True,
+        "report_cid": "",
+      },
+    }
+    cfg = {
+      "LIVE_HSYNC_ENABLED": True,
+      "LIVE_HSYNC_FALLBACK_DEFAULT_PEERS": False,
+    }
+    Plugin, plugin = self._make_live_hsync_plugin(jobs, live_payloads, cfg=cfg, now=100.0)
+    plugin.chainstore_hsync.return_value = {"merged_fields": 0}
+
+    changed_jobs = Plugin._maybe_hsync_live_progress(plugin)
+
+    self.assertEqual(changed_jobs, [])
+    summary = plugin._last_live_hsync_summary
+    self.assertEqual(summary["ignored_stale_pass"], 1)
+    self.assertEqual(summary["ignored_revision"], 1)
+    self.assertEqual(summary["ignored_no_report_cid"], 1)
+    self.assertEqual(summary["changed_workers"], 0)
+    plugin.P.assert_called_once()
+    log_line = plugin.P.call_args.args[0]
+    self.assertIn("ignored_stale_pass=1", log_line)
+    self.assertIn("ignored_revision=1", log_line)
+    self.assertIn("ignored_no_report_cid=1", log_line)
 
   def test_maybe_hsync_live_progress_bounds_targeted_peers_per_tick(self):
     """One tick hsyncs no more than the configured number of missing workers."""

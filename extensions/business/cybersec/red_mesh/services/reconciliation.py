@@ -148,7 +148,23 @@ def _job_repo(owner):
   return getattr(owner, "_job_state_repository", None)
 
 
-def reconcile_workers_from_live(owner, job_id, *, live_payloads=None, now=None):
+def _stats_inc(stats, key, amount=1):
+  if isinstance(stats, dict):
+    stats[key] = int(stats.get(key, 0) or 0) + amount
+
+
+def _stats_inc_once(stats, key, identity):
+  if not isinstance(stats, dict):
+    return
+  seen_key = f"_seen_{key}"
+  seen = stats.setdefault(seen_key, set())
+  if identity in seen:
+    return
+  seen.add(identity)
+  _stats_inc(stats, key)
+
+
+def reconcile_workers_from_live(owner, job_id, *, live_payloads=None, now=None, stats=None):
   """
   Repair launcher-owned durable worker completion state from ``:live`` rows.
 
@@ -196,7 +212,7 @@ def reconcile_workers_from_live(owner, job_id, *, live_payloads=None, now=None):
       continue
 
     assignment_revision = _safe_int(worker_entry.get("assignment_revision", 1), 1)
-    live, _ignored_reason = _matched_live_progress(
+    live, ignored_reason = _matched_live_progress(
       job_specs.get("job_id"),
       worker_addr,
       pass_nr,
@@ -204,8 +220,15 @@ def reconcile_workers_from_live(owner, job_id, *, live_payloads=None, now=None):
       live_payloads,
     )
     if live is None:
+      if ignored_reason == "pass_mismatch":
+        _stats_inc_once(stats, "ignored_stale_pass", (job_id, worker_addr))
+      elif ignored_reason == "revision_mismatch":
+        _stats_inc_once(stats, "ignored_revision", (job_id, worker_addr))
       continue
-    if not live.finished or not live.report_cid:
+    if not live.finished:
+      continue
+    if not live.report_cid:
+      _stats_inc_once(stats, "ignored_no_report_cid", (job_id, worker_addr))
       continue
 
     if not worker_entry.get("report_cid"):
@@ -236,6 +259,7 @@ def reconcile_workers_from_live(owner, job_id, *, live_payloads=None, now=None):
     writer(normalized_key, job_specs, context="reconcile_from_live")
   else:
     repo.put_job(normalized_key, job_specs)
+  _stats_inc(stats, "changed_workers", len(changed_workers))
   return True
 
 
