@@ -74,7 +74,11 @@ _CONFIG = {
   "DEEPSEEK_API_URL": "https://api.deepseek.com/chat/completions",
   "DEEPSEEK_API_KEY": None,  # API key (can be provided directly via config)
   "DEEPSEEK_API_KEY_ENV": "DEEPSEEK_API_KEY",  # Fallback: env var name if key not in config
-  "DEEPSEEK_MODEL": "deepseek-chat",
+  # Default hardcoded to a local-model placeholder so the plugin
+  # boots without DeepSeek credentials. Restore the line below to
+  # route through the upstream DeepSeek API.
+  # "DEEPSEEK_MODEL": "deepseek-chat",
+  "DEEPSEEK_MODEL": "local-model",
 
   # Request defaults
   "DEFAULT_TEMPERATURE": 0.7,
