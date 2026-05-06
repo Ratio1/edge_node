@@ -1,11 +1,18 @@
 from ..models import WorkerProgress
 from .config import resolve_config_block
 
+DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS = 90.0
+
 DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG = {
   "STARTUP_TIMEOUT": 45.0,
   "STALE_TIMEOUT": 120.0,
   "STALE_GRACE": 30.0,
   "MAX_REANNOUNCE_ATTEMPTS": 3,
+  "LIVE_HSYNC_ENABLED": False,
+  "LIVE_HSYNC_INTERVAL_SECONDS": DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
+  "LIVE_HSYNC_TIMEOUT": 3.0,
+  "LIVE_HSYNC_MAX_PEERS_PER_TICK": 6,
+  "LIVE_HSYNC_FALLBACK_DEFAULT_PEERS": True,
 }
 
 
@@ -21,6 +28,21 @@ def _safe_float(value, default=None):
     return float(value)
   except (TypeError, ValueError):
     return default
+
+
+def _safe_bool(value, default=False):
+  if isinstance(value, bool):
+    return value
+  if value is None:
+    return default
+  if isinstance(value, str):
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+      return True
+    if normalized in {"0", "false", "no", "off", ""}:
+      return False
+    return default
+  return bool(value)
 
 
 def get_distributed_job_reconciliation_config(owner):
@@ -54,11 +76,43 @@ def get_distributed_job_reconciliation_config(owner):
     if max_reannounce_attempts < 0:
       max_reannounce_attempts = defaults["MAX_REANNOUNCE_ATTEMPTS"]
 
+    live_hsync_interval = _safe_float(
+      merged.get("LIVE_HSYNC_INTERVAL_SECONDS"),
+      defaults["LIVE_HSYNC_INTERVAL_SECONDS"],
+    )
+    if live_hsync_interval is None or live_hsync_interval <= 0:
+      live_hsync_interval = defaults["LIVE_HSYNC_INTERVAL_SECONDS"]
+
+    live_hsync_timeout = _safe_float(
+      merged.get("LIVE_HSYNC_TIMEOUT"),
+      defaults["LIVE_HSYNC_TIMEOUT"],
+    )
+    if live_hsync_timeout is None or live_hsync_timeout <= 0:
+      live_hsync_timeout = defaults["LIVE_HSYNC_TIMEOUT"]
+
+    live_hsync_max_peers = _safe_int(
+      merged.get("LIVE_HSYNC_MAX_PEERS_PER_TICK"),
+      defaults["LIVE_HSYNC_MAX_PEERS_PER_TICK"],
+    )
+    if live_hsync_max_peers <= 0:
+      live_hsync_max_peers = defaults["LIVE_HSYNC_MAX_PEERS_PER_TICK"]
+
     return {
       "STARTUP_TIMEOUT": startup_timeout,
       "STALE_TIMEOUT": stale_timeout,
       "STALE_GRACE": stale_grace,
       "MAX_REANNOUNCE_ATTEMPTS": max_reannounce_attempts,
+      "LIVE_HSYNC_ENABLED": _safe_bool(
+        merged.get("LIVE_HSYNC_ENABLED"),
+        defaults["LIVE_HSYNC_ENABLED"],
+      ),
+      "LIVE_HSYNC_INTERVAL_SECONDS": live_hsync_interval,
+      "LIVE_HSYNC_TIMEOUT": live_hsync_timeout,
+      "LIVE_HSYNC_MAX_PEERS_PER_TICK": live_hsync_max_peers,
+      "LIVE_HSYNC_FALLBACK_DEFAULT_PEERS": _safe_bool(
+        merged.get("LIVE_HSYNC_FALLBACK_DEFAULT_PEERS"),
+        defaults["LIVE_HSYNC_FALLBACK_DEFAULT_PEERS"],
+      ),
     }
 
   return resolve_config_block(

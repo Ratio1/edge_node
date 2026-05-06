@@ -415,6 +415,17 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(Plugin._get_job_write_guarantees(plugin)["mode"], "detection_only")
     self.assertFalse(Plugin._get_job_write_guarantees(plugin)["guarded_writes"])
 
+  def test_live_hsync_due_uses_fixed_config_interval(self):
+    """Launcher live-hsync schedule uses the normalized fixed interval."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin._last_live_hsync_at = 10.0
+    cfg = {"LIVE_HSYNC_INTERVAL_SECONDS": 90.0}
+
+    self.assertFalse(Plugin._live_hsync_due(plugin, 99.9, cfg))
+    self.assertTrue(Plugin._live_hsync_due(plugin, 100.0, cfg))
+    self.assertTrue(Plugin._live_hsync_due(plugin, 101.0, cfg))
+
   def test_publish_live_progress_multi_thread_phase(self):
     """Phase is the earliest active phase; per-thread data is included."""
     Plugin = self._get_plugin_class()

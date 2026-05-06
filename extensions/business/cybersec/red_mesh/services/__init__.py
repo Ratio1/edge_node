@@ -40,6 +40,7 @@ from .query import (
   list_network_jobs,
 )
 from .reconciliation import (
+  DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
   get_distributed_job_reconciliation_config,
   reconcile_job_workers,
 )
@@ -131,6 +132,7 @@ __all__ = [
   "resolve_active_peers",
   "resolve_enabled_features",
   "get_distributed_job_reconciliation_config",
+  "DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS",
   "reconcile_job_workers",
   "set_job_status",
   "stop_and_delete_job",

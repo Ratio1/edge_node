@@ -8,6 +8,7 @@ from extensions.business.cybersec.red_mesh.services.config import (
   resolve_config_block,
 )
 from extensions.business.cybersec.red_mesh.services.reconciliation import (
+  DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
   get_distributed_job_reconciliation_config,
   reconcile_job_workers,
 )
@@ -189,10 +190,25 @@ class TestWorkerReconciliation(unittest.TestCase):
     self.assertEqual(config["STALE_TIMEOUT"], 120.0)
     self.assertEqual(config["STALE_GRACE"], 30.0)
     self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
+    self.assertEqual(config["LIVE_HSYNC_ENABLED"], False)
+    self.assertEqual(
+      config["LIVE_HSYNC_INTERVAL_SECONDS"],
+      DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
+    )
+    self.assertEqual(config["LIVE_HSYNC_TIMEOUT"], 3.0)
+    self.assertEqual(config["LIVE_HSYNC_MAX_PEERS_PER_TICK"], 6)
+    self.assertEqual(config["LIVE_HSYNC_FALLBACK_DEFAULT_PEERS"], True)
 
   def test_reconciliation_config_merges_partial_override(self):
     owner = MagicMock()
-    owner.cfg_distributed_job_reconciliation = {"STARTUP_TIMEOUT": 20}
+    owner.cfg_distributed_job_reconciliation = {
+      "STARTUP_TIMEOUT": 20,
+      "LIVE_HSYNC_ENABLED": True,
+      "LIVE_HSYNC_INTERVAL_SECONDS": 120,
+      "LIVE_HSYNC_TIMEOUT": 5,
+      "LIVE_HSYNC_MAX_PEERS_PER_TICK": 2,
+      "LIVE_HSYNC_FALLBACK_DEFAULT_PEERS": False,
+    }
 
     config = get_distributed_job_reconciliation_config(owner)
 
@@ -200,6 +216,11 @@ class TestWorkerReconciliation(unittest.TestCase):
     self.assertEqual(config["STALE_TIMEOUT"], 120.0)
     self.assertEqual(config["STALE_GRACE"], 30.0)
     self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
+    self.assertEqual(config["LIVE_HSYNC_ENABLED"], True)
+    self.assertEqual(config["LIVE_HSYNC_INTERVAL_SECONDS"], 120.0)
+    self.assertEqual(config["LIVE_HSYNC_TIMEOUT"], 5.0)
+    self.assertEqual(config["LIVE_HSYNC_MAX_PEERS_PER_TICK"], 2)
+    self.assertEqual(config["LIVE_HSYNC_FALLBACK_DEFAULT_PEERS"], False)
 
   def test_reconciliation_config_normalizes_invalid_values(self):
     owner = MagicMock()
@@ -208,6 +229,11 @@ class TestWorkerReconciliation(unittest.TestCase):
       "STALE_TIMEOUT": -1,
       "STALE_GRACE": -5,
       "MAX_REANNOUNCE_ATTEMPTS": "bad",
+      "LIVE_HSYNC_ENABLED": "not-a-bool",
+      "LIVE_HSYNC_INTERVAL_SECONDS": 0,
+      "LIVE_HSYNC_TIMEOUT": -3,
+      "LIVE_HSYNC_MAX_PEERS_PER_TICK": 0,
+      "LIVE_HSYNC_FALLBACK_DEFAULT_PEERS": "not-a-bool",
     }
 
     config = get_distributed_job_reconciliation_config(owner)
@@ -216,6 +242,14 @@ class TestWorkerReconciliation(unittest.TestCase):
     self.assertEqual(config["STALE_TIMEOUT"], 120.0)
     self.assertEqual(config["STALE_GRACE"], 30.0)
     self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
+    self.assertEqual(config["LIVE_HSYNC_ENABLED"], False)
+    self.assertEqual(
+      config["LIVE_HSYNC_INTERVAL_SECONDS"],
+      DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
+    )
+    self.assertEqual(config["LIVE_HSYNC_TIMEOUT"], 3.0)
+    self.assertEqual(config["LIVE_HSYNC_MAX_PEERS_PER_TICK"], 6)
+    self.assertEqual(config["LIVE_HSYNC_FALLBACK_DEFAULT_PEERS"], True)
 
   def test_reconcile_job_workers_marks_active_worker(self):
     owner = self._make_owner()
