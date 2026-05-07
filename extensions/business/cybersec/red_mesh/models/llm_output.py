@@ -57,6 +57,7 @@ from typing import Any
 # Per-section length caps. The LLM is instructed in the prompt to stay
 # within these; the validator flags over-cap output as a warning rather
 # than a hard rejection (overage is truncated at render time).
+MAX_EXECUTIVE_HEADLINE_CHARS = 280
 MAX_BACKGROUND_DRAFT_CHARS = 1500
 MAX_OVERALL_POSTURE_CHARS = 4000
 MAX_RECOMMENDATION_BULLETS = 12
@@ -110,6 +111,7 @@ class LlmReportSections:
   """
 
   # Executive summary (PTES §3.1, §3.2)
+  executive_headline: str = ""   # 1-3 sentences for dashboard tile
   background_draft: str = ""
   overall_posture: str = ""
 
@@ -133,6 +135,7 @@ class LlmReportSections:
 
   def to_dict(self) -> dict:
     return {
+      "executive_headline": self.executive_headline,
       "background_draft": self.background_draft,
       "overall_posture": self.overall_posture,
       "recommendation_summary": list(self.recommendation_summary),
@@ -160,6 +163,7 @@ class LlmReportSections:
       for bucket in ROADMAP_BUCKETS
     }
     return cls(
+      executive_headline=str(d.get("executive_headline", "")),
       background_draft=str(d.get("background_draft", "")),
       overall_posture=str(d.get("overall_posture", "")),
       recommendation_summary=tuple(_str_list(d.get("recommendation_summary"))),
@@ -290,6 +294,13 @@ def validate_llm_output(
         ))
 
   # 2. Length cap warnings
+  if len(output.executive_headline) > MAX_EXECUTIVE_HEADLINE_CHARS:
+    issues.append(ValidationIssue(
+      SEVERITY_WARNING, "over_length",
+      f"executive_headline exceeds {MAX_EXECUTIVE_HEADLINE_CHARS} chars "
+      f"(got {len(output.executive_headline)})",
+      field="executive_headline",
+    ))
   if len(output.background_draft) > MAX_BACKGROUND_DRAFT_CHARS:
     issues.append(ValidationIssue(
       SEVERITY_WARNING, "over_length",
