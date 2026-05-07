@@ -1,13 +1,15 @@
 # Live Hsync Rollout
 
-Launcher-side live hsync is a canary feature for repairing lost worker
-completion announcements. It is disabled by default.
+Launcher-side live hsync repairs lost worker completion announcements. It is
+**enabled by default**. The flag is a per-node kill-switch, not a staged-rollout
+gate — disable it via config only if a regression is suspected on a specific
+launcher.
 
-Enable it on one launcher through the existing RedMesh config block:
+Default values from `DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG`:
 
 ```python
 "DISTRIBUTED_JOB_RECONCILIATION": {
-  "LIVE_HSYNC_ENABLED": True,
+  "LIVE_HSYNC_ENABLED": True,              # default; set False to disable
   "LIVE_HSYNC_INTERVAL_SECONDS": 90.0,
   "LIVE_HSYNC_TIMEOUT": 3.0,
   "LIVE_HSYNC_MAX_PEERS_PER_TICK": 6,
@@ -26,7 +28,8 @@ Expected behavior:
 - Successful repair writes `finished=True`, `report_cid`, and `result=None`,
   allowing the normal launcher-only finalization path to proceed.
 
-Canary checklist:
+Canary checklist (recommended on first deploy to one launcher before fleet
+rollout):
 
 - Run repeated distributed scans for at least one hour on one launcher.
 - Confirm stuck workers with terminal live rows repair within the next
@@ -34,8 +37,9 @@ Canary checklist:
 - Watch for one summary log per repair tick:
   `[LIVE-HSYNC] jobs=... missing_workers=... targeted_calls=...`.
 - Confirm no long process-loop stalls and no false finalization.
-- Roll back by setting `LIVE_HSYNC_ENABLED=False`; existing completion
-  announcement and reannounce paths remain unchanged.
+- Per-node kill-switch: set `LIVE_HSYNC_ENABLED=False` to disable on a single
+  launcher; existing completion announcement and reannounce paths remain
+  unchanged.
 
 Final verification on this implementation branch:
 

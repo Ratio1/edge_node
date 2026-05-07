@@ -225,7 +225,7 @@ class TestWorkerReconciliation(unittest.TestCase):
     self.assertEqual(config["STALE_TIMEOUT"], 120.0)
     self.assertEqual(config["STALE_GRACE"], 30.0)
     self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
-    self.assertEqual(config["LIVE_HSYNC_ENABLED"], False)
+    self.assertEqual(config["LIVE_HSYNC_ENABLED"], True)
     self.assertEqual(
       config["LIVE_HSYNC_INTERVAL_SECONDS"],
       DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
@@ -277,7 +277,7 @@ class TestWorkerReconciliation(unittest.TestCase):
     self.assertEqual(config["STALE_TIMEOUT"], 120.0)
     self.assertEqual(config["STALE_GRACE"], 30.0)
     self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
-    self.assertEqual(config["LIVE_HSYNC_ENABLED"], False)
+    self.assertEqual(config["LIVE_HSYNC_ENABLED"], True)
     self.assertEqual(
       config["LIVE_HSYNC_INTERVAL_SECONDS"],
       DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
