@@ -863,40 +863,6 @@ class TestPhase2PassFinalization(unittest.TestCase):
     pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
     self.assertEqual(pass_report_dict["worker_reports"]["worker-A"]["nr_findings"], 5)
 
-  def test_finalize_pass_sends_all_worker_node_ips_to_attestation(self):
-    """Attestation metadata receives one obfuscated-IP input per participating worker."""
-    PentesterApi01Plugin = self._get_plugin_class()
-    plugin, job_specs = self._build_finalize_plugin()
-
-    report_a = self._sample_node_report(1, 512, [80])
-    report_b = self._sample_node_report(513, 1024, [443])
-    report_a["node_ip"] = "10.132.0.3"
-    # Intentionally leave worker-B without node_ip; it should still
-    # preserve its participant slot as 0x0000 downstream.
-    plugin._collect_node_reports = MagicMock(return_value={
-      "worker-B": report_b,
-      "worker-A": report_a,
-    })
-    plugin._get_aggregated_report = MagicMock(return_value={
-      "open_ports": [80, 443], "service_info": {}, "web_tests_info": {},
-      "completed_tests": [], "ports_scanned": 1024, "nr_open_ports": 2,
-      "port_protocols": {"80": "http", "443": "https"},
-    })
-    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
-    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
-    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 10, "breakdown": {}}, []))
-    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
-    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
-    plugin._emit_timeline_event = MagicMock()
-
-    PentesterApi01Plugin._maybe_finalize_pass(plugin)
-
-    plugin._submit_redmesh_test_attestation.assert_called_once()
-    self.assertEqual(
-      plugin._submit_redmesh_test_attestation.call_args.kwargs["node_ips"],
-      ["10.132.0.3", ""],
-    )
-
   def test_aggregated_report_separate_cid(self):
     """aggregated_report_cid is a separate R1FS write from the PassReport."""
     PentesterApi01Plugin = self._get_plugin_class()

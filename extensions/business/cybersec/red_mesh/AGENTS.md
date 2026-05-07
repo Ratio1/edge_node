@@ -332,3 +332,9 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Change: added deterministic packed participant-node IP metadata for RedMesh test/pass attestations. Each worker contributes one obfuscated bytes2 value and the packed form concatenates them, e.g. `0x0a030a040000`.
 - Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_hardening.py -q` passed with 15 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 101 tests.
 - Horizontal insight: until the on-chain attestation contract accepts participant IP bytes directly, RedMesh should preserve full participant-IP evidence in attestation metadata/timeline/archive without changing deployed contract function signatures.
+
+### 2026-05-07T19:12:33Z
+
+- Change: reverted the packed participant-node IP metadata implementation from RedMesh test/pass attestation records after confirming the current on-chain `ipObfuscated` field already represents the scanned target.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_hardening.py -q` passed with 14 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 100 tests.
+- Horizontal insight: keep the current distinction clear: `ip_obfuscated` is target IP obfuscation, while participant node IPs should only be reintroduced if the attestation contract/event schema explicitly requires them.

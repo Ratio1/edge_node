@@ -93,22 +93,6 @@ class _AttestationMixin:
     last_octet = int(octets[-1])
     return f"0x{first_octet:02x}{last_octet:02x}"
 
-  def _attestation_pack_node_ips_obfuscated(self, node_ips) -> tuple[list[str], str]:
-    """
-    Pack participating-node IPs as:
-      - list form for local readability: ["0x0a03", "0x0a04"]
-      - concatenated bytes for compact attestations: "0x0a030a04"
-
-    Each node contributes exactly one bytes2 value. Missing or non-IPv4
-    addresses are represented as 0x0000 so the packed value still
-    preserves participant count/order.
-    """
-    if not isinstance(node_ips, (list, tuple)):
-      node_ips = []
-    obfuscated = [self._attestation_pack_ip_obfuscated(ip) for ip in node_ips]
-    packed = "0x" + "".join(ip[2:] for ip in obfuscated if isinstance(ip, str) and ip.startswith("0x"))
-    return obfuscated, packed
-
   @staticmethod
   def _attestation_pack_execution_id(job_id) -> str:
     if not isinstance(job_id, str):
@@ -213,10 +197,11 @@ class _AttestationMixin:
       self.P(f"[ATTESTATION] Test attestation failed after {retries} attempts.", color='y')
       return None
 
-    # Obfuscate all participating node IPs for attestation metadata.
-    obfuscated_node_ips, node_ips_obfuscated_packed = (
-      self._attestation_pack_node_ips_obfuscated(node_ips)
-    )
+    # Obfuscate node IPs for attestation metadata
+    obfuscated_node_ips = []
+    if node_ips:
+      for ip in node_ips:
+        obfuscated_node_ips.append(self._attestation_pack_ip_obfuscated(ip))
 
     result = {
       "job_id": job_id,
@@ -228,7 +213,6 @@ class _AttestationMixin:
       "report_cid": report_cid,
       "node_eth_address": node_eth_address,
       "node_ips_obfuscated": obfuscated_node_ips,
-      "node_ips_obfuscated_packed": node_ips_obfuscated_packed,
     }
     self.P(
       "Submitted RedMesh test attestation for "
