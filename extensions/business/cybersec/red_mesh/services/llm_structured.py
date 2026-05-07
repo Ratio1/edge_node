@@ -161,7 +161,7 @@ def generate_exec_summary(
   aggregated_report: dict | None = None,
   engagement: dict | None = None,
   model_name: str = "",
-  max_tokens: int = 2048,
+  max_tokens: int = 6000,
   temperature: float = 0.2,
   now_fn: Callable[[], str] | None = None,
 ) -> StructuredLlmResult:
