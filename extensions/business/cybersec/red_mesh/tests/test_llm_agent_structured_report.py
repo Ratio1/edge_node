@@ -51,8 +51,12 @@ def _valid_llm_response_content() -> str:
   })
 
 
-class _FakeOwner:
-  """Minimal stand-in for the plugin instance LlmAgentMixin runs on."""
+class _FakeOwner(LlmAgentMixin):
+  """Minimal stand-in for the plugin instance LlmAgentMixin runs on.
+
+  Inherits from the mixin so helper methods (e.g. diagnostic logging)
+  are resolvable on the owner just as they would be on a real plugin.
+  """
 
   def __init__(
     self, *,
@@ -192,6 +196,32 @@ class StructuredReportAdapterTests(unittest.TestCase):
     out = _run(owner, job_id="j1", findings=[], aggregated_report={})
     self.assertIsNotNone(out)
     self.assertIn("AI generation failed validation", out["background_draft"])
+
+  def test_failure_emits_per_attempt_diagnostic_log(self):
+    # Both attempts return prose instead of JSON. The launcher must
+    # log per-attempt diagnostics (length, parser hints, code, head/tail)
+    # so a future operator can triage similar issues from the journal
+    # without needing a re-run.
+    prose = "I'm sorry, I cannot produce that output. Please rephrase."
+    owner = _FakeOwner(chat_response={
+      "choices": [{"message": {"content": prose}}],
+    })
+    _run(owner, job_id="job-prose", findings=[], aggregated_report={})
+
+    diag_lines = [line for line in owner._logs if "[LLM-DIAG]" in line]
+    self.assertGreaterEqual(len(diag_lines), 2,
+                            f"expected per-attempt diagnostics, got: {owner._logs}")
+    # Each diagnostic carries the job id, attempt number, response length,
+    # validation code, the parser-hint flags, and bounded head/tail snippets.
+    first = diag_lines[0]
+    self.assertIn("job=job-prose", first)
+    self.assertIn("attempt=1", first)
+    self.assertIn("raw_len=", first)
+    self.assertIn("codes=json_parse_failed", first)
+    self.assertIn("appears_prose", first)
+    self.assertIn("no_open_brace", first)
+    self.assertIn("head=", first)
+    self.assertIn(diag_lines[1].split("attempt=")[1][0], "2")
 
   def test_fixture_cache_env_does_not_gate_runtime_chat_endpoint(self):
     for live_llm_value in (None, "0"):

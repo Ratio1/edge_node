@@ -1289,6 +1289,7 @@ class _RedMeshLlmAgentMixin(object):
         f"after {result.attempts} attempts; persisting fallback skeleton.",
         color='y',
       )
+      self._log_structured_llm_failure_diagnostics(job_id, result)
 
     sections = result.sections.to_dict()
     if result.error:
@@ -1296,6 +1297,46 @@ class _RedMeshLlmAgentMixin(object):
       sections["error"] = True
       sections["attempts"] = result.attempts
     return sections
+
+  def _log_structured_llm_failure_diagnostics(self, job_id, result):
+    """Verbose per-attempt diagnostics for an LLM structured-report failure.
+
+    Emits one summary line per failed attempt with parser hints
+    (truncation/prose/brace balance), validation codes, response length,
+    and bounded head/tail snippets — enough to triage similar failures
+    from the launcher journal without re-running the scan or capturing
+    the raw response separately.
+    """
+    attempt_logs = getattr(result, "attempt_logs", ()) or ()
+    if not attempt_logs:
+      return
+    for log in attempt_logs:
+      head = self._sanitize_llm_diag_text(log.get("raw_head", ""))
+      tail = self._sanitize_llm_diag_text(log.get("raw_tail", ""))
+      codes = ",".join(log.get("validation_codes") or []) or "-"
+      hints = []
+      if log.get("appears_truncated"):
+        hints.append("appears_truncated")
+      if log.get("appears_prose"):
+        hints.append("appears_prose")
+      if not log.get("has_open_brace"):
+        hints.append("no_open_brace")
+      if not log.get("has_close_brace"):
+        hints.append("no_close_brace")
+      hint_str = ",".join(hints) or "-"
+      self.P(
+        f"[LLM-DIAG] job={job_id} attempt={log.get('attempt')} "
+        f"raw_len={log.get('raw_len')} codes={codes} hints={hint_str} "
+        f"head={head!r} tail={tail!r}",
+        color='y',
+      )
+
+  @staticmethod
+  def _sanitize_llm_diag_text(value):
+    """Make a head/tail snippet safe for a single grep-friendly log line."""
+    if not isinstance(value, str):
+      return ""
+    return value.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
   def _run_quick_summary_analysis(
       self,

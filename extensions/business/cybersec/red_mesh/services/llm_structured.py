@@ -141,6 +141,7 @@ class StructuredLlmResult:
   error: bool
   attempts: int            # 1 on first-pass success, 2 if retried, 2 on failure
   raw_response: str = ""   # last raw text response from the LLM (post-strip)
+  attempt_logs: tuple = () # per-failed-attempt diagnostics (see _build_attempt_log)
 
 
 # ---------------------------------------------------------------------
@@ -220,6 +221,8 @@ def generate_exec_summary(
       raw_response=raw,
     )
 
+  attempt_logs = (_build_attempt_log(1, raw, validation),)
+
   # --- Retry once with corrective prompt. ---
   correction = CORRECTION_PROMPT_TEMPLATE.format(
     errors="\n".join(f"  - {i.code} ({i.field}): {i.message}"
@@ -240,7 +243,10 @@ def generate_exec_summary(
       error=False,
       attempts=2,
       raw_response=raw2,
+      attempt_logs=attempt_logs,
     )
+
+  attempt_logs = attempt_logs + (_build_attempt_log(2, raw2, validation2),)
 
   # --- Fallback skeleton. The PDF renderer surfaces this as
   # "[AI generation failed validation — see Appendix C]" boxes
@@ -253,6 +259,7 @@ def generate_exec_summary(
     error=True,
     attempts=2,
     raw_response=raw2,
+    attempt_logs=attempt_logs,
   )
 
 
@@ -300,6 +307,42 @@ def _attempt_once(
   parsed = LlmReportSections.from_dict(parsed_dict)
   validation = validate_llm_output(parsed, findings=findings_for_validation)
   return raw, parsed, validation
+
+
+_DIAG_RAW_HEAD_CHARS = 240
+_DIAG_RAW_TAIL_CHARS = 240
+
+
+def _build_attempt_log(attempt_no: int, raw: str, validation: ValidationResult) -> dict:
+  """Diagnostic snapshot of one failed LLM attempt.
+
+  Captures enough context (length, head, tail, parser hints) to triage
+  validation failures from the launcher journal without re-running the scan.
+  Truncates head/tail to keep log lines bounded; never logs the full raw
+  payload because it may include findings echoed back by the model.
+  """
+  raw = raw or ""
+  raw_len = len(raw)
+  head = raw[:_DIAG_RAW_HEAD_CHARS]
+  tail = raw[-_DIAG_RAW_TAIL_CHARS:] if raw_len > _DIAG_RAW_HEAD_CHARS else ""
+  stripped = raw.strip()
+  has_open_brace = "{" in stripped
+  has_close_brace = "}" in stripped
+  starts_with_brace = stripped.startswith("{") or stripped.startswith("```")
+  ends_with_brace = stripped.endswith("}") or stripped.endswith("```")
+  appears_truncated = starts_with_brace and not ends_with_brace
+  appears_prose = not has_open_brace
+  return {
+    "attempt": attempt_no,
+    "raw_len": raw_len,
+    "raw_head": head,
+    "raw_tail": tail,
+    "has_open_brace": has_open_brace,
+    "has_close_brace": has_close_brace,
+    "appears_truncated": appears_truncated,
+    "appears_prose": appears_prose,
+    "validation_codes": [issue.code for issue in validation.issues],
+  }
 
 
 # Strip prose preamble + optional ```json fence so a well-meaning
