@@ -15,7 +15,6 @@ from typing import Optional
 
 from ..constants import RUN_MODE_SINGLEPASS
 from ..services.config import get_llm_agent_config
-from ..services.llm_fixture_cache import cached_llm_call
 from ..services.resilience import run_bounded_retry
 from ..services.llm_structured import generate_exec_summary
 
@@ -1261,11 +1260,9 @@ class _RedMeshLlmAgentMixin(object):
       content = message.get("content")
       return str(content) if content else ""
 
-    chat_call = cached_llm_call(raw_chat_call)
-
     try:
       result = generate_exec_summary(
-        llm_call=chat_call,
+        llm_call=raw_chat_call,
         findings=findings or [],
         aggregated_report=aggregated_report,
         engagement=engagement,

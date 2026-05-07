@@ -21,8 +21,6 @@ from __future__ import annotations
 import json
 import os
 import unittest
-from tempfile import TemporaryDirectory
-from pathlib import Path
 from typing import Any
 
 from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin as LlmAgentMixin
@@ -97,16 +95,13 @@ class StructuredReportAdapterTests(unittest.TestCase):
     # toggle ENABLED per-test without touching the global config.
     from extensions.business.cybersec.red_mesh.mixins import llm_agent as mod
     self._orig_cfg = mod.get_llm_agent_config
-    self._orig_cache = mod.cached_llm_call
     self._cfg_value = {"ENABLED": True, "MODEL": "deepseek-chat"}
     mod.get_llm_agent_config = lambda _self: self._cfg_value
-    mod.cached_llm_call = lambda inner: inner
     self._orig_live_llm = os.environ.get("LIVE_LLM")
 
   def tearDown(self):
     from extensions.business.cybersec.red_mesh.mixins import llm_agent as mod
     mod.get_llm_agent_config = self._orig_cfg
-    mod.cached_llm_call = self._orig_cache
     if self._orig_live_llm is None:
       os.environ.pop("LIVE_LLM", None)
     else:
@@ -126,7 +121,15 @@ class StructuredReportAdapterTests(unittest.TestCase):
     })
     out = _run(
       owner, job_id="j1",
-      findings=[{"severity": "CRITICAL", "title": "Apache RCE", "port": 80, "protocol": "http", "probe": "service_http", "category": "service"}],
+      findings=[{
+        "severity": "CRITICAL",
+        "title": "Apache RCE",
+        "cve": ["CVE-2021-41773"],
+        "port": 80,
+        "protocol": "http",
+        "probe": "service_http",
+        "category": "service",
+      }],
       aggregated_report={"total_findings": 1, "total_open_ports": 1, "total_services": 1},
     )
     self.assertIsNotNone(out)
@@ -190,22 +193,40 @@ class StructuredReportAdapterTests(unittest.TestCase):
     self.assertIsNotNone(out)
     self.assertIn("AI generation failed validation", out["background_draft"])
 
-  def test_live_llm_zero_does_not_call_chat_endpoint(self):
-    from extensions.business.cybersec.red_mesh.mixins import llm_agent as mod
-    from extensions.business.cybersec.red_mesh.services.llm_fixture_cache import cached_llm_call
+  def test_fixture_cache_env_does_not_gate_runtime_chat_endpoint(self):
+    for live_llm_value in (None, "0"):
+      with self.subTest(LIVE_LLM=live_llm_value):
+        if live_llm_value is None:
+          os.environ.pop("LIVE_LLM", None)
+        else:
+          os.environ["LIVE_LLM"] = live_llm_value
 
-    os.environ["LIVE_LLM"] = "0"
-    owner = _FakeOwner(chat_response={
-      "choices": [{"message": {"content": _valid_llm_response_content()}}],
-    })
+        owner = _FakeOwner(chat_response={
+          "choices": [{"message": {"content": _valid_llm_response_content()}}],
+        })
+        out = _run(
+          owner,
+          job_id="j1",
+          findings=[{
+            "severity": "CRITICAL",
+            "title": "Apache RCE",
+            "cve": ["CVE-2021-41773"],
+            "port": 80,
+            "protocol": "http",
+            "probe": "service_http",
+            "category": "service",
+          }],
+          aggregated_report={
+            "total_findings": 1,
+            "total_open_ports": 1,
+            "total_services": 1,
+          },
+        )
 
-    with TemporaryDirectory() as tmp:
-      mod.cached_llm_call = lambda inner: cached_llm_call(inner, cache_dir=Path(tmp))
-      out = _run(owner, job_id="j1", findings=[], aggregated_report={})
-
-    self.assertIsNotNone(out)
-    self.assertEqual(owner._calls, [])
-    self.assertTrue(out.get("error"))
+        self.assertIsNotNone(out)
+        self.assertFalse(out.get("error", False))
+        self.assertGreaterEqual(len(owner._calls), 1)
+        self.assertEqual(owner._calls[0]["endpoint"], "/chat")
 
 
 if __name__ == "__main__":
