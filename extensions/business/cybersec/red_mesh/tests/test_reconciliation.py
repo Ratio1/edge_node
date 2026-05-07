@@ -221,9 +221,9 @@ class TestWorkerReconciliation(unittest.TestCase):
 
     config = get_distributed_job_reconciliation_config(owner)
 
-    self.assertEqual(config["STARTUP_TIMEOUT"], 45.0)
+    self.assertEqual(config["STARTUP_TIMEOUT"], 180.0)
     self.assertEqual(config["STALE_TIMEOUT"], 120.0)
-    self.assertEqual(config["STALE_GRACE"], 30.0)
+    self.assertEqual(config["STALE_GRACE"], 90.0)
     self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
     self.assertEqual(config["LIVE_HSYNC_ENABLED"], True)
     self.assertEqual(
@@ -249,7 +249,7 @@ class TestWorkerReconciliation(unittest.TestCase):
 
     self.assertEqual(config["STARTUP_TIMEOUT"], 20.0)
     self.assertEqual(config["STALE_TIMEOUT"], 120.0)
-    self.assertEqual(config["STALE_GRACE"], 30.0)
+    self.assertEqual(config["STALE_GRACE"], 90.0)
     self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
     self.assertEqual(config["LIVE_HSYNC_ENABLED"], True)
     self.assertEqual(config["LIVE_HSYNC_INTERVAL_SECONDS"], 120.0)
@@ -273,9 +273,9 @@ class TestWorkerReconciliation(unittest.TestCase):
 
     config = get_distributed_job_reconciliation_config(owner)
 
-    self.assertEqual(config["STARTUP_TIMEOUT"], 45.0)
+    self.assertEqual(config["STARTUP_TIMEOUT"], 180.0)
     self.assertEqual(config["STALE_TIMEOUT"], 120.0)
-    self.assertEqual(config["STALE_GRACE"], 30.0)
+    self.assertEqual(config["STALE_GRACE"], 90.0)
     self.assertEqual(config["MAX_REANNOUNCE_ATTEMPTS"], 3)
     self.assertEqual(config["LIVE_HSYNC_ENABLED"], True)
     self.assertEqual(

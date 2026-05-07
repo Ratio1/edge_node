@@ -959,6 +959,109 @@ class TestPhase12LiveProgress(unittest.TestCase):
     self.assertEqual(persisted["workers"]["worker-C"]["retry_reason"], "startup_timeout")
     self.assertIn("worker-C", persisted["workers"]["worker-C"]["error"])
 
+  def test_maybe_reannounce_skips_when_local_live_has_terminal_row(self):
+    """Defensive guard: a matching terminal :live row repairs the durable record
+    and prevents an assignment_revision bump that would otherwise clobber the
+    worker's completion."""
+    Plugin = self._get_plugin_class()
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-launcher"
+    plugin.cfg_check_jobs_each = 15
+    plugin.cfg_distributed_job_reconciliation = {
+      "STARTUP_TIMEOUT": 30,
+      "STALE_GRACE": 20,
+      "MAX_REANNOUNCE_ATTEMPTS": 3,
+    }
+    plugin._last_worker_reconcile_check = 0
+    plugin._normalize_job_record.side_effect = lambda job_id, payload, migrate=True: (job_id, payload)
+    plugin._get_job_state_repository = lambda: Plugin._get_job_state_repository(plugin)
+    plugin._emit_timeline_event = lambda job_specs, event_type, label, actor=None, actor_type="system", meta=None: (
+      Plugin._emit_timeline_event(plugin, job_specs, event_type, label, actor, actor_type, meta)
+    )
+    plugin._write_job_record = lambda job_id, job_specs, context="": (
+      Plugin._write_job_record(plugin, job_id, job_specs, context=context)
+    )
+    plugin.P = MagicMock()
+    plugin._log_audit_event = MagicMock()
+    plugin.time.return_value = 100.0
+
+    job_specs = {
+      "job_id": "job-rescue",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "node-launcher",
+      "launcher_alias": "rm1",
+      "target": "10.0.0.4",
+      "start_port": 1,
+      "end_port": 100,
+      "date_created": 10.0,
+      "job_config_cid": "QmConfig",
+      "workers": {
+        "worker-A": {
+          "start_port": 1,
+          "end_port": 100,
+          "assignment_revision": 1,
+          "assigned_at": 10.0,
+        },
+      },
+      "timeline": [],
+      "pass_reports": [],
+      "job_revision": 0,
+    }
+    # Worker A's announce was lost to the launcher's top-level replica, but its
+    # :live terminal row arrived. Without the defensive guard, the launcher would
+    # see worker-A as "unseen", trigger startup_timeout reannounce, bump
+    # assignment_revision to 2 — and any subsequent hsync rescue would then be
+    # rejected by the revision filter.
+    live_payloads = {
+      "job-rescue:worker-A": {
+        "job_id": "job-rescue",
+        "worker_addr": "worker-A",
+        "pass_nr": 1,
+        "assignment_revision_seen": 1,
+        "progress": 100.0,
+        "phase": "done",
+        "ports_scanned": 100,
+        "ports_total": 100,
+        "open_ports_found": [22, 80],
+        "completed_tests": ["correlation_completed"],
+        "updated_at": 100.0,
+        "started_at": 20.0,
+        "first_seen_live_at": 20.0,
+        "last_seen_at": 100.0,
+        "finished": True,
+        "report_cid": "QmRescuedReport",
+      },
+    }
+
+    def _hgetall(*, hkey):
+      if hkey == "test-instance":
+        return {"job-rescue": job_specs}
+      if hkey == "test-instance:live":
+        return live_payloads
+      return {}
+
+    plugin.chainstore_hgetall.side_effect = _hgetall
+    plugin.chainstore_hget.return_value = job_specs
+
+    Plugin._maybe_reannounce_worker_assignments(plugin)
+
+    persisted = plugin.chainstore_hset.call_args.kwargs["value"]
+    worker = persisted["workers"]["worker-A"]
+    # Durable record was repaired via the defensive guard.
+    self.assertEqual(worker["finished"], True)
+    self.assertEqual(worker["report_cid"], "QmRescuedReport")
+    self.assertIsNone(worker["result"])
+    # Critically, assignment_revision was NOT bumped — no clobber.
+    self.assertEqual(worker["assignment_revision"], 1)
+    self.assertNotIn("reannounce_count", worker)
+    # Timeline shows reconciliation, not reannounce.
+    timeline_types = [event["type"] for event in persisted["timeline"]]
+    self.assertIn("reconciled", timeline_types)
+    self.assertNotIn("worker_reannounced", timeline_types)
+
   def test_maybe_hsync_live_progress_reconciles_local_live_without_network(self):
     """Launcher repairs from already-local :live rows before any network hsync."""
     Plugin = self._get_plugin_class()
