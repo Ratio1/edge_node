@@ -190,8 +190,8 @@ def maybe_finalize_pass(owner):
       if should_submit_attestation:
         try:
           attestation_node_ips = [
-            r.get("node_ip") for r in node_reports.values()
-            if r.get("node_ip")
+            (node_reports.get(addr) or {}).get("node_ip", "")
+            for addr in sorted(node_reports.keys())
           ]
           redmesh_test_attestation = owner._submit_redmesh_test_attestation(
             job_id=job_id,

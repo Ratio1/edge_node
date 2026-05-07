@@ -326,3 +326,9 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Change: removed the dev fixture-cache wrapper from the production structured LLM `/chat` adapter in [`mixins/llm_agent.py`](./mixins/llm_agent.py), while keeping `llm_fixture_cache` available for explicit test-only use.
 - Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_llm_agent_injection.py extensions/business/cybersec/red_mesh/tests/test_llm_fixture_cache.py extensions/business/cybersec/red_mesh/tests/test_llm_structured_service.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_validator.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_structured_report.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_shape.py extensions/business/cybersec/red_mesh/tests/test_llm_input_isolation.py extensions/business/cybersec/red_mesh/tests/test_llm_output_validator.py -q` passed with 107 tests and 6 subtests.
 - Horizontal insight: production LLM availability must not depend on `LIVE_LLM` or checked-in prompt fixtures; fixture replay belongs at explicit test boundaries, not inside runtime adapters.
+
+### 2026-05-07T13:08:47Z
+
+- Change: added deterministic packed participant-node IP metadata for RedMesh test/pass attestations. Each worker contributes one obfuscated bytes2 value and the packed form concatenates them, e.g. `0x0a030a040000`.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_hardening.py -q` passed with 15 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 101 tests.
+- Horizontal insight: until the on-chain attestation contract accepts participant IP bytes directly, RedMesh should preserve full participant-IP evidence in attestation metadata/timeline/archive without changing deployed contract function signatures.

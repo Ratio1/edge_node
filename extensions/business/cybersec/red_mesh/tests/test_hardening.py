@@ -58,6 +58,24 @@ class TestAttestationHelpers(unittest.TestCase):
       submit_kwargs["function_args"][-1],
       host._attestation_pack_cid_obfuscated("QmAggregatedCid"),
     )
+    self.assertEqual(result["node_ips_obfuscated"], ["0x0a0a"])
+    self.assertEqual(result["node_ips_obfuscated_packed"], "0x0a0a")
+
+  def test_pack_node_ips_obfuscated_concatenates_all_participants(self):
+    from extensions.business.cybersec.red_mesh.mixins.attestation import _AttestationMixin
+
+    class MockHost(_AttestationMixin):
+      pass
+
+    host = MockHost()
+    obfuscated, packed = host._attestation_pack_node_ips_obfuscated([
+      "10.132.0.3",
+      "10.132.0.4",
+      "",
+    ])
+
+    self.assertEqual(obfuscated, ["0x0a03", "0x0a04", "0x0000"])
+    self.assertEqual(packed, "0x0a030a040000")
 
   def test_submit_test_attestation_retries_transient_failure(self):
     from extensions.business.cybersec.red_mesh.mixins.attestation import _AttestationMixin
