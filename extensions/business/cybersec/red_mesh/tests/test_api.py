@@ -1835,6 +1835,28 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(stub["scan_type"], "webapp")
     self.assertEqual(stub["target_url"], "https://example.com/app")
 
+  def test_archive_clears_live_progress_before_prune(self):
+    """Archive commit clears :live rows before the CStore stub is written."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+    events = []
+
+    def clear_live(job_id, worker_addresses):
+      events.append(("clear_live", job_id, tuple(worker_addresses)))
+
+    def record_hset(*args, **kwargs):
+      if kwargs.get("hkey") == "test-instance" and kwargs.get("key") == "test-job":
+        events.append(("archive_prune", kwargs["value"].get("job_cid")))
+
+    plugin._clear_live_progress = MagicMock(side_effect=clear_live)
+    plugin.chainstore_hset.side_effect = record_hset
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    self.assertGreaterEqual(len(events), 2)
+    self.assertEqual(events[0], ("clear_live", "test-job", ("worker-A",)))
+    self.assertEqual(events[1], ("archive_prune", "QmArchiveCID"))
+
   def test_stub_fields_match_model(self):
     """Stub has exactly CStoreJobFinalized fields."""
     from extensions.business.cybersec.red_mesh.models import CStoreJobFinalized
