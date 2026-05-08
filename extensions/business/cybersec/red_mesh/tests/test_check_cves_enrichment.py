@@ -170,6 +170,40 @@ class TestEnrichmentWhenCachePresent(unittest.TestCase):
       cache.close()
 
 
+class TestCatalogConstraintWidening(unittest.TestCase):
+  """Regression for CVE-2021-42013 — must fire on both 2.4.49 and 2.4.50.
+
+  Vulhub ships ``httpd:2.4.50`` as the CVE-2021-42013 image because the
+  bypass also works on 2.4.50 (the original CVE-2021-41773 fix in 2.4.50
+  was incomplete). The original catalog row pinned ``==2.4.49`` and
+  silently missed the 2.4.50 case.
+  """
+
+  def test_cve_2021_42013_fires_on_2_4_49(self):
+    findings = check_cves("apache", "2.4.49")
+    cves = {c for f in findings for c in (f.cve or ())}
+    self.assertIn(
+      "CVE-2021-42013", cves,
+      "CVE-2021-42013 must fire on Apache 2.4.49",
+    )
+
+  def test_cve_2021_42013_fires_on_2_4_50(self):
+    findings = check_cves("apache", "2.4.50")
+    cves = {c for f in findings for c in (f.cve or ())}
+    self.assertIn(
+      "CVE-2021-42013", cves,
+      "CVE-2021-42013 must also fire on Apache 2.4.50 (vulhub's image)",
+    )
+
+  def test_cve_2021_42013_does_not_fire_on_2_4_51(self):
+    findings = check_cves("apache", "2.4.51")
+    cves = {c for f in findings for c in (f.cve or ())}
+    self.assertNotIn(
+      "CVE-2021-42013", cves,
+      "CVE-2021-42013 must not fire on 2.4.51 (the actual fix release)",
+    )
+
+
 class TestGracefulDegradation(unittest.TestCase):
 
   def test_cache_with_failing_fetchers_does_not_raise(self):

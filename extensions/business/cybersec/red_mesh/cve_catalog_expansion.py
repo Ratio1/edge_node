@@ -15,7 +15,7 @@ EXPANDED_CVE_ROWS = (
   ("apache", ">=2.4.32,<=2.4.43", "CVE-2020-11984", "CRITICAL", "mod_proxy_uwsgi information disclosure and possible RCE", "CWE-120"),
   ("apache", ">=2.4.0,<=2.4.46", "CVE-2021-26691", "CRITICAL", "SessionHeader stack overflow", "CWE-122"),
   ("apache", "<2.4.49", "CVE-2021-39275", "CRITICAL", "ap_escape_quotes out-of-bounds write", "CWE-787"),
-  ("apache", "==2.4.49", "CVE-2021-42013", "CRITICAL", "Path traversal and RCE bypassing CVE-2021-41773 fix", "CWE-22"),
+  ("apache", ">=2.4.49,<=2.4.50", "CVE-2021-42013", "CRITICAL", "Path traversal and RCE bypassing CVE-2021-41773 fix", "CWE-22"),
   ("apache", "<=2.4.52", "CVE-2022-22720", "CRITICAL", "HTTP request smuggling through connection handling", "CWE-444"),
   ("apache", "<=2.4.52", "CVE-2022-22721", "CRITICAL", "Large XML request body integer overflow", "CWE-190"),
   ("apache", ">=2.4.0,<2.4.53", "CVE-2022-23943", "CRITICAL", "mod_sed out-of-bounds write", "CWE-190"),
