@@ -1028,6 +1028,19 @@ class AccessControlProbes(ProbeBase):
     """
     forms = self.discovered_forms or []
     if not forms:
+      # Coverage accounting: emit inconclusive INFO so the catalog row
+      # has *some* emission. The probe didn't run because discovery
+      # surfaced no forms — typically because discovery only collects
+      # forms with explicit ``action="..."`` attributes.
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A01-12",
+        title="Hidden field tampering — no forms discovered",
+        status="inconclusive",
+        severity="INFO",
+        owasp="A01:2021",
+        evidence=["discovered_forms=0",
+                  "reason=no_form_actions_collected_during_discovery"],
+      ))
       return
 
     import re
