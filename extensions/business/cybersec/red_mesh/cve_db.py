@@ -15,10 +15,11 @@ Without a cache the function behaves as before — static severity only
 import re
 from contextvars import ContextVar
 from dataclasses import dataclass
+from .cve_catalog_expansion import EXPANDED_CVE_ROWS
 from .findings import Finding, Remediation, Severity
 from .references import cwe_to_owasp
 
-CVE_DB_LAST_UPDATED = "2026-03-08"
+CVE_DB_LAST_UPDATED = "2026-05-08"
 _CURRENT_DYNAMIC_CACHE: ContextVar = ContextVar("redmesh_dynamic_reference_cache", default=None)
 
 
@@ -226,6 +227,17 @@ CVE_DATABASE: list = [
 ]
 
 
+for _product, _constraint, _cve_id, _severity, _title, _cwe_id in EXPANDED_CVE_ROWS:
+  CVE_DATABASE.append(CveEntry(
+    _product,
+    _constraint,
+    _cve_id,
+    Severity[_severity],
+    _title,
+    _cwe_id,
+  ))
+
+
 def check_cves(product: str, version: str, *, dynamic_cache=None) -> list:
   """Match version against CVE database. Returns list of Findings.
 
@@ -382,11 +394,28 @@ def _matches_constraint(version: str, constraint: str) -> bool:
 
 
 def _parse_version(version: str):
-  """Extract leading numeric version tuple from a string like '1.4.3-beta'."""
-  m = re.match(r"(\d+(?:\.\d+)*)", version.strip())
+  """Extract the first numeric version tuple from common banner strings.
+
+  Handles values like ``Apache/2.4.57 (Ubuntu)``, ``OpenSSH_8.9p1``,
+  ``nginx/1.22.1``, and the older leading-version form
+  ``1.4.3-beta``.
+  """
+  if not isinstance(version, str):
+    return None
+  m = re.search(r"(\d+(?:\.\d+)*)([a-z]+)?(\d*)", version.strip(), re.IGNORECASE)
   if not m:
     return None
-  return tuple(int(x) for x in m.group(1).split("."))
+  parts = [int(x) for x in m.group(1).split(".")]
+  suffix = m.group(2) or ""
+  suffix_number = m.group(3) or ""
+  if suffix:
+    suffix_value = 0
+    for char in suffix.lower():
+      suffix_value = suffix_value * 26 + (ord(char) - ord("a") + 1)
+    parts.append(suffix_value)
+  if suffix_number:
+    parts.append(int(suffix_number))
+  return tuple(parts)
 
 
 def _check_single(parsed: tuple, expr: str) -> bool:
