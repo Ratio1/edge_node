@@ -207,6 +207,56 @@ class TestCapabilityDeclarations(unittest.TestCase):
       self.assertIsInstance(f, GrayboxFinding)
 
 
+class TestMassAssignmentOwnershipPTA0402(unittest.TestCase):
+  """PT-A04-02 — ownership transfer via mass-assignable field."""
+
+  def _setup(self, before_owner, after_owner, patch_status=200):
+    ep = IdorEndpoint(path="/api/records/{id}/", test_ids=[2], owner_field="owner")
+    probe = _make_probe(idor_endpoints=[ep], allow_stateful=True)
+    sess = probe.auth.regular_session
+    sess.cookies = MagicMock()
+    sess.cookies.get = MagicMock(return_value="csrf123")
+    # GET sequence: probe reads twice (before, after)
+    get_calls = iter([
+      _mock_response(status=200, json_data={"id": 2, "owner": before_owner}),
+      _mock_response(status=200, json_data={"id": 2, "owner": after_owner}),
+    ])
+    sess.get = MagicMock(side_effect=lambda *a, **kw: next(get_calls))
+    sess.patch = MagicMock(return_value=_mock_response(status=patch_status))
+    probe.auth.detected_csrf_field = "csrfmiddlewaretoken"
+    return probe
+
+  def test_pt_a04_02_vulnerable_when_owner_changes(self):
+    probe = self._setup(before_owner="alice", after_owner="1000")
+    probe._test_mass_assignment_ownership()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A04-02"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+    self.assertEqual(f[0].severity, "HIGH")
+
+  def test_pt_a04_02_not_vulnerable_when_owner_unchanged(self):
+    probe = self._setup(before_owner="alice", after_owner="alice")
+    probe._test_mass_assignment_ownership()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A04-02"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+    self.assertEqual(f[0].severity, "INFO")
+
+  def test_pt_a04_02_skipped_when_stateful_disabled(self):
+    """run() should emit inconclusive INFO when stateful is off."""
+    ep = IdorEndpoint(path="/api/records/{id}/", test_ids=[2])
+    probe = _make_probe(idor_endpoints=[ep], allow_stateful=False)
+    probe.run()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A04-02"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "inconclusive")
+
+  def test_pt_a04_02_silent_when_no_idor_endpoints(self):
+    probe = _make_probe(idor_endpoints=[], allow_stateful=True)
+    probe._test_mass_assignment_ownership()
+    self.assertFalse(any(f.scenario_id == "PT-A04-02" for f in probe.findings))
+
+
 class TestVerbTampering(unittest.TestCase):
 
   def test_verb_tampering_bypass(self):

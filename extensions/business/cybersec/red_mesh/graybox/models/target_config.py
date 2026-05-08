@@ -104,16 +104,38 @@ class AccessControlConfig:
 
 
 @dataclass(frozen=True)
+class JwtEndpoint:
+  """Endpoint pair for JWT weak-algorithm testing (PT-A02-12)."""
+  token_path: str = ""             # e.g. "/api/token/" — issues JWT
+  protected_path: str = ""         # e.g. "/api/me/" — accepts Bearer JWT
+  username: str = ""               # creds for token issuance
+  password: str = ""
+
+  @classmethod
+  def from_dict(cls, d: dict) -> JwtEndpoint:
+    return cls(
+      token_path=d.get("token_path", ""),
+      protected_path=d.get("protected_path", ""),
+      username=d.get("username", ""),
+      password=d.get("password", ""),
+    )
+
+
+@dataclass(frozen=True)
 class MisconfigConfig:
   """Config for misconfiguration probes (A02)."""
   debug_paths: list[str] = field(default_factory=lambda: [
     "/debug/config/", "/.env", "/actuator/env", "/server-info",
     "/actuator", "/server-status",
   ])
+  jwt_endpoints: JwtEndpoint = field(default_factory=JwtEndpoint)
 
   @classmethod
   def from_dict(cls, d: dict) -> MisconfigConfig:
-    return cls(debug_paths=d.get("debug_paths", cls.__dataclass_fields__["debug_paths"].default_factory()))
+    return cls(
+      debug_paths=d.get("debug_paths", cls.__dataclass_fields__["debug_paths"].default_factory()),
+      jwt_endpoints=JwtEndpoint.from_dict(d.get("jwt_endpoints", {})),
+    )
 
 
 @dataclass(frozen=True)

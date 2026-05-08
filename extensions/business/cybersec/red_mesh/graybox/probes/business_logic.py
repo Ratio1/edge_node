@@ -246,6 +246,10 @@ class BusinessLogicProbes(ProbeBase):
         break
 
     bypass_evidence = []
+    # PT-A06-04 (Negative amount accepted) is a strict subset of PT-A06-02
+    # — track separately so the catalog row fires when negative amount is
+    # accepted, even if the invalid-state branch also triggers PT-A06-02.
+    negative_amount_evidence = []
 
     for ep in endpoints:
       path = ep.path
@@ -325,6 +329,9 @@ class BusinessLogicProbes(ProbeBase):
           accepted = not any(m in body_lower for m in error_markers)
         if accepted:
           bypass_evidence.append(f"negative_amount_accepted=True; endpoint={path}")
+          negative_amount_evidence.append(
+            f"endpoint={path}; submitted_amount=-9999.99; status={resp.status_code}"
+          )
 
       # Test B: Invalid state transition (if transitions are configured)
       if ep.valid_transitions and current_status:
@@ -403,5 +410,37 @@ class BusinessLogicProbes(ProbeBase):
         status="not_vulnerable",
         severity="INFO",
         owasp="A06:2021",
+        evidence=[f"endpoints_tested={len(endpoints)}"],
+      ))
+
+    # PT-A06-04 — Negative amount accepted (strict subset of PT-A06-02).
+    # Always emit one finding so coverage accounting shows the probe ran.
+    if negative_amount_evidence:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A06-04",
+        title="Negative monetary amount accepted",
+        status="vulnerable",
+        severity="HIGH",
+        owasp="A04:2021",
+        cwe=["CWE-20", "CWE-840"],
+        attack=["T1190"],
+        evidence=negative_amount_evidence,
+        replay_steps=[
+          "Log in as authenticated user.",
+          "Submit a record-update form with amount=-9999.99.",
+          "Observe the server accepts the negative value.",
+        ],
+        remediation="Enforce a server-side `amount >= 0` invariant on every "
+                    "endpoint that mutates monetary fields. Form-level "
+                    "validation alone is insufficient — always re-validate at "
+                    "the model or service boundary.",
+      ))
+    elif endpoints:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A06-04",
+        title="Negative amount — guard held",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A04:2021",
         evidence=[f"endpoints_tested={len(endpoints)}"],
       ))

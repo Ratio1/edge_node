@@ -27,6 +27,7 @@ class AccessControlProbes(ProbeBase):
       self.run_safe("verb_tampering", self._test_verb_tampering)
     if self.auth.regular_session and self._allow_stateful:
       self.run_safe("mass_assignment", self._test_mass_assignment)
+      self.run_safe("mass_assignment_ownership", self._test_mass_assignment_ownership)
     elif self.auth.regular_session:
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A04-01",
@@ -36,6 +37,15 @@ class AccessControlProbes(ProbeBase):
         owasp="A04:2021",
         evidence=["stateful_probes_disabled=True",
                   "reason=mass_assignment_modifies_target_data"],
+      ))
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A04-02",
+        title="Mass-assignment ownership probe skipped: stateful probes disabled",
+        status="inconclusive",
+        severity="INFO",
+        owasp="A04:2021",
+        evidence=["stateful_probes_disabled=True",
+                  "reason=ownership_transfer_mutates_target_data"],
       ))
     return self.findings
 
@@ -464,4 +474,129 @@ class AccessControlProbes(ProbeBase):
         severity="INFO",
         owasp="A04:2021",
         evidence=[f"forms_tested={tested}"],
+      ))
+
+  def _test_mass_assignment_ownership(self):
+    """
+    PT-A04-02: detect ownership transfer via mass-assignable field.
+
+    Distinct from PT-A04-01 (privilege fields like is_admin): some APIs
+    accept the row's owning-user id as a writable field, letting any
+    authenticated caller transfer records they own to themselves OR
+    transfer records they don't own. Both are catastrophic for
+    multi-tenant systems.
+
+    Strategy (stateful):
+      1. As regular user, PATCH each configured IDOR endpoint with a
+         JSON body containing common ownership-field aliases pointing
+         to a fabricated user id (1000).
+      2. GET the same endpoint and check the returned ``owner`` /
+         ``owner_id`` / ``owner_user_id`` field. If it changed, ownership
+         was mass-assigned.
+      3. If accepted, attempt to revert by PATCHing the original owner
+         back. Best-effort cleanup — the test is destructive by nature.
+    """
+    endpoints = self.target_config.access_control.idor_endpoints
+    if not endpoints:
+      return
+
+    transfer_targets = ["owner_user_id", "owner_id", "owner",
+                        "user_id", "user", "owned_by"]
+    fake_owner_id = 1000  # Synthetic — won't collide with seeded users
+
+    transferred_evidence = []
+    tested = 0
+
+    for ep in endpoints:
+      for record_id in (ep.test_ids or [1, 2]):
+        path = ep.path.replace("{id}", str(record_id))
+        url = self.target_url + path
+        self.safety.throttle()
+
+        try:
+          before = self.auth.regular_session.get(url, timeout=10)
+        except Exception:
+          continue
+        if before.status_code != 200:
+          continue
+        try:
+          before_owner = before.json().get(ep.owner_field)
+        except Exception:
+          continue
+        if before_owner is None:
+          continue
+
+        # PATCH with all common ownership-field aliases
+        patch_body = {field: fake_owner_id for field in transfer_targets}
+        headers = {"Content-Type": "application/json", "Referer": url}
+        csrf_field = self.auth.detected_csrf_field
+        csrf_token = self.auth.regular_session.cookies.get("csrftoken")
+        if csrf_token:
+          headers["X-CSRFToken"] = csrf_token
+        try:
+          import json as _json
+          patch_resp = self.auth.regular_session.patch(
+            url, data=_json.dumps(patch_body), headers=headers, timeout=10,
+          )
+        except Exception:
+          continue
+        tested += 1
+        if patch_resp.status_code >= 400:
+          continue
+
+        # Re-read and compare owner field
+        self.safety.throttle()
+        try:
+          after = self.auth.regular_session.get(url, timeout=10)
+          after_owner = after.json().get(ep.owner_field)
+        except Exception:
+          continue
+
+        if after_owner != before_owner:
+          transferred_evidence.append(
+            f"endpoint={path}; field={ep.owner_field}; "
+            f"before={before_owner!r}; after={after_owner!r}"
+          )
+          # Best-effort restore — try to PATCH owner back to original.
+          try:
+            restore_body = {field: before_owner for field in transfer_targets}
+            self.auth.regular_session.patch(
+              url, data=_json.dumps(restore_body), headers=headers, timeout=10,
+            )
+          except Exception:
+            pass
+          break  # one positive is enough; stop hammering
+
+      if transferred_evidence:
+        break
+
+    if transferred_evidence:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A04-02",
+        title="Mass assignment — ownership field transferable",
+        status="vulnerable",
+        severity="HIGH",
+        owasp="A04:2021",
+        cwe=["CWE-915", "CWE-639"],
+        attack=["T1078"],
+        evidence=transferred_evidence,
+        replay_steps=[
+          "Log in as regular user.",
+          "PATCH a record with body {\"owner_user_id\": <other-id>}.",
+          "GET the same record — observe ``owner`` field reflects "
+          "the attacker-supplied value.",
+        ],
+        remediation="Treat ownership/tenant-id as server-assigned only. "
+                    "Reject or strip ``owner_user_id`` (and aliases) on "
+                    "every write boundary. Use explicit field allowlists "
+                    "in serializers / form binding.",
+      ))
+    elif tested > 0:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A04-02",
+        title="Mass-assignment ownership — guard held",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A04:2021",
+        evidence=[f"endpoints_tested={tested}"],
       ))
