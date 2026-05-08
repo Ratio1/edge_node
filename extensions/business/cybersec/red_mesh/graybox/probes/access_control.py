@@ -502,10 +502,16 @@ class AccessControlProbes(ProbeBase):
 
     transfer_targets = ["owner_user_id", "owner_id", "owner",
                         "user_id", "user", "owned_by"]
-    fake_owner_id = 1000  # Synthetic — won't collide with seeded users
+    # Try real low-numbered ids first (most apps seed admin=1, regular user=2),
+    # then a synthetic one. If any of these IDs exist on the target, the
+    # transfer can succeed; otherwise the probe gracefully reports
+    # not_vulnerable on the most-recent attempt.
+    candidate_owner_ids = [1, 2, 3, 1000]
 
     transferred_evidence = []
     tested = 0
+
+    import json as _json
 
     for ep in endpoints:
       for record_id in (ep.test_ids or [1, 2]):
@@ -526,46 +532,51 @@ class AccessControlProbes(ProbeBase):
         if before_owner is None:
           continue
 
-        # PATCH with all common ownership-field aliases
-        patch_body = {field: fake_owner_id for field in transfer_targets}
-        headers = {"Content-Type": "application/json", "Referer": url}
-        csrf_field = self.auth.detected_csrf_field
         csrf_token = self.auth.regular_session.cookies.get("csrftoken")
+        headers = {"Content-Type": "application/json", "Referer": url}
         if csrf_token:
           headers["X-CSRFToken"] = csrf_token
-        try:
-          import json as _json
-          patch_resp = self.auth.regular_session.patch(
-            url, data=_json.dumps(patch_body), headers=headers, timeout=10,
-          )
-        except Exception:
-          continue
-        tested += 1
-        if patch_resp.status_code >= 400:
-          continue
 
-        # Re-read and compare owner field
-        self.safety.throttle()
-        try:
-          after = self.auth.regular_session.get(url, timeout=10)
-          after_owner = after.json().get(ep.owner_field)
-        except Exception:
-          continue
-
-        if after_owner != before_owner:
-          transferred_evidence.append(
-            f"endpoint={path}; field={ep.owner_field}; "
-            f"before={before_owner!r}; after={after_owner!r}"
-          )
-          # Best-effort restore — try to PATCH owner back to original.
+        # Try each candidate owner id until one transfer takes effect.
+        success = False
+        for owner_id in candidate_owner_ids:
+          patch_body = {field: owner_id for field in transfer_targets}
+          self.safety.throttle()
           try:
-            restore_body = {field: before_owner for field in transfer_targets}
-            self.auth.regular_session.patch(
-              url, data=_json.dumps(restore_body), headers=headers, timeout=10,
+            patch_resp = self.auth.regular_session.patch(
+              url, data=_json.dumps(patch_body), headers=headers, timeout=10,
             )
           except Exception:
-            pass
-          break  # one positive is enough; stop hammering
+            continue
+          tested += 1
+          if patch_resp.status_code >= 400:
+            continue
+
+          self.safety.throttle()
+          try:
+            after = self.auth.regular_session.get(url, timeout=10)
+            after_owner = after.json().get(ep.owner_field)
+          except Exception:
+            continue
+          if after_owner != before_owner:
+            transferred_evidence.append(
+              f"endpoint={path}; field={ep.owner_field}; "
+              f"injected_id={owner_id}; "
+              f"before={before_owner!r}; after={after_owner!r}"
+            )
+            # Best-effort restore — PATCH owner back to original by name.
+            try:
+              restore_body = {field: before_owner for field in transfer_targets}
+              self.auth.regular_session.patch(
+                url, data=_json.dumps(restore_body), headers=headers, timeout=10,
+              )
+            except Exception:
+              pass
+            success = True
+            break
+
+        if success:
+          break
 
       if transferred_evidence:
         break

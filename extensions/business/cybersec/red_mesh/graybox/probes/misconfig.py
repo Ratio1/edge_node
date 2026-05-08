@@ -502,16 +502,19 @@ class MisconfigProbes(ProbeBase):
       session.close()
       return
 
-    csrf_field = self.auth.detected_csrf_field
-    csrf_token = None
-    if csrf_field:
-      csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+    # Anonymous-session CSRF: fall back through detected → configured → default.
+    csrf_field = (
+      self.auth.detected_csrf_field
+      or self.target_config.csrf_field
+      or "csrfmiddlewaretoken"
+    )
+    csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
 
     import re
     tokens = []
     for i in range(2):
       self.safety.throttle()
-      if i > 0 and csrf_field:
+      if i > 0:
         try:
           page = session.get(reset_url, timeout=10)
           csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
@@ -519,13 +522,15 @@ class MisconfigProbes(ProbeBase):
           pass
 
       payload = {"username": test_username}
+      headers = {"Referer": reset_url}
       if csrf_token and csrf_field:
         payload[csrf_field] = csrf_token
+        headers["X-CSRFToken"] = csrf_token
 
       try:
         resp = session.post(
           reset_url, data=payload,
-          headers={"Referer": reset_url},
+          headers=headers,
           timeout=10, allow_redirects=True,
         )
       except Exception:
@@ -654,7 +659,14 @@ class MisconfigProbes(ProbeBase):
       session.close()
       return
 
-    csrf_field = self.auth.detected_csrf_field
+    # Probes that run on an anonymous session can't rely on AuthManager's
+    # detected_csrf_field (it's populated during auth, not for anon flows).
+    # Fall back to the configured csrf_field, then to Django's default.
+    csrf_field = (
+      self.auth.detected_csrf_field
+      or self.target_config.csrf_field
+      or "csrfmiddlewaretoken"
+    )
 
     import re
     token_patterns = [
@@ -667,20 +679,23 @@ class MisconfigProbes(ProbeBase):
     for _ in range(2):
       self.safety.throttle()
       csrf_token = None
-      if csrf_field:
-        try:
-          page = session.get(reset_url, timeout=10)
-          csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
-        except Exception:
-          pass
+      try:
+        page = session.get(reset_url, timeout=10)
+        csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+      except Exception:
+        pass
 
       payload = {"username": test_username}
+      headers = {"Referer": reset_url}
       if csrf_token and csrf_field:
         payload[csrf_field] = csrf_token
+        # Django checks the X-CSRFToken header against the cookie too —
+        # send both so the form-protected POST is accepted.
+        headers["X-CSRFToken"] = csrf_token
 
       try:
         resp = session.post(
-          reset_url, data=payload, headers={"Referer": reset_url},
+          reset_url, data=payload, headers=headers,
           timeout=10, allow_redirects=True,
         )
       except Exception:
@@ -773,6 +788,12 @@ class MisconfigProbes(ProbeBase):
     login_url = self.target_url + self.target_config.login_path
     sample_size = 6
 
+    csrf_field_default = (
+      self.auth.detected_csrf_field
+      or self.target_config.csrf_field
+      or "csrfmiddlewaretoken"
+    )
+
     def _measure(username: str) -> float | None:
       """Return wall-time of one POST in milliseconds, or None on error."""
       session = self.auth.make_anonymous_session()
@@ -781,10 +802,8 @@ class MisconfigProbes(ProbeBase):
       except Exception:
         session.close()
         return None
-      csrf_field = self.auth.detected_csrf_field
-      csrf_token = None
-      if csrf_field:
-        csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
+      csrf_field = csrf_field_default
+      csrf_token = self.auth.extract_csrf_value(page.text, csrf_field)
       payload = {"username": username, "password": "wrong-" + secrets.token_hex(4)}
       if csrf_token and csrf_field:
         payload[csrf_field] = csrf_token
