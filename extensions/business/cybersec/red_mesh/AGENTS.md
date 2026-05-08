@@ -306,3 +306,35 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Change: added network and webapp-specific compact payload shaping, finding deduplication/ranking/capping, analysis-type budgets, and runtime payload-size observability.
 - Verification: the known failing job `a3a357bc` dropped from `303,760` raw bytes to `21,559` shaped bytes for `security_assessment` and completed manually in `38.97s` on rm1 instead of timing out.
 - Horizontal insight: RedMesh archive/report data and LLM reasoning data must remain separate contracts; future LLM work should extend the bounded payload model rather than re-coupling the agent to raw archived aggregates.
+
+### 2026-05-05T22:10:00Z
+
+- Change: remediated PTES reporting backend contracts: typed engagement/RoE/authorization now persist through launch/finalization, PTES narrative uses structured LLM sections without legacy raw scan-output LLM paths, production finding enrichment is load-bearing, dynamic reference cache data is threaded into scan records, engagement deletion uses real `JobStateRepository.get_job`/`put_job` semantics, and the e2e harness reads current `JobArchive.passes`.
+- Change: engagement deletion now writes sanitized JobConfig state before deleting authorization documents, reports document-delete failures as unsuccessful, avoids deleting documents if CStore state persistence fails, and explicitly rejects immutable finalized archives with `unsupported_finalized_job`.
+- Verification: `PYTHONPATH=/home/vitalii/remote-dev/repos/edge_node pytest -q extensions/business/cybersec/red_mesh/tests/test_api.py extensions/business/cybersec/red_mesh/tests/test_engagement_deletion.py extensions/business/cybersec/red_mesh/tests/test_e2e_harness.py extensions/business/cybersec/red_mesh/tests/test_authorization_upload.py extensions/business/cybersec/red_mesh/tests/test_finding_schema.py extensions/business/cybersec/red_mesh/tests/test_check_cves_enrichment.py extensions/business/cybersec/red_mesh/tests/test_dynamic_references.py extensions/business/cybersec/red_mesh/tests/test_probe_registry.py extensions/business/cybersec/red_mesh/tests/test_base_worker.py extensions/business/cybersec/red_mesh/tests/test_llm_input_isolation.py extensions/business/cybersec/red_mesh/tests/test_llm_output_validator.py extensions/business/cybersec/red_mesh/tests/test_llm_structured_service.py extensions/business/cybersec/red_mesh/tests/test_llm_fixture_cache.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_structured_report.py` passed with 313 tests, 1 skipped, and 4 subtests; `python extensions/business/cybersec/red_mesh/tests/e2e/run_e2e.py --help` passed.
+- Horizontal insight: PTES report data, LLM narrative input, finding identity/enrichment, and deletion semantics are coupled production contracts; future backend changes should preserve typed JobConfig as the source of truth and avoid side effects, such as document deletion, before durable state pointers are updated.
+
+### 2026-05-07T08:43:00Z
+
+- Change: moved finalized-job live-progress cleanup into the archive commit point, after the archive CID is verified and before CStore is pruned to the finalized stub.
+- Change: updated the native semaphore contract test to read the current LLM mixin path after the mixin refactor.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 100 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_integration.py -q` passed with 51 tests; `python -m pytest extensions/business/cybersec/red_mesh/test_native_api_semaphore_contract.py -q` passed with 4 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests extensions/business/cybersec/red_mesh/test_native_api_semaphore_contract.py -q` passed with 1112 tests, 1 skipped, 3 warnings, and 4 subtests.
+- Horizontal insight: finalized-job archive pruning should clear worker-owned runtime state only after archive durability is verified, while the full worker map is still available.
+
+### 2026-05-07T10:13:09Z
+
+- Change: removed the dev fixture-cache wrapper from the production structured LLM `/chat` adapter in [`mixins/llm_agent.py`](./mixins/llm_agent.py), while keeping `llm_fixture_cache` available for explicit test-only use.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_llm_agent_injection.py extensions/business/cybersec/red_mesh/tests/test_llm_fixture_cache.py extensions/business/cybersec/red_mesh/tests/test_llm_structured_service.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_validator.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_structured_report.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_shape.py extensions/business/cybersec/red_mesh/tests/test_llm_input_isolation.py extensions/business/cybersec/red_mesh/tests/test_llm_output_validator.py -q` passed with 107 tests and 6 subtests.
+- Horizontal insight: production LLM availability must not depend on `LIVE_LLM` or checked-in prompt fixtures; fixture replay belongs at explicit test boundaries, not inside runtime adapters.
+
+### 2026-05-07T13:08:47Z
+
+- Change: added deterministic packed participant-node IP metadata for RedMesh test/pass attestations. Each worker contributes one obfuscated bytes2 value and the packed form concatenates them, e.g. `0x0a030a040000`.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_hardening.py -q` passed with 15 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 101 tests.
+- Horizontal insight: until the on-chain attestation contract accepts participant IP bytes directly, RedMesh should preserve full participant-IP evidence in attestation metadata/timeline/archive without changing deployed contract function signatures.
+
+### 2026-05-07T19:12:33Z
+
+- Change: reverted the packed participant-node IP metadata implementation from RedMesh test/pass attestation records after confirming the current on-chain `ipObfuscated` field already represents the scanned target.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_hardening.py -q` passed with 14 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 100 tests.
+- Horizontal insight: keep the current distinction clear: `ip_obfuscated` is target IP obfuscation, while participant node IPs should only be reintroduced if the attestation contract/event schema explicitly requires them.

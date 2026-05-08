@@ -13,7 +13,13 @@ from ..constants import (
   RUN_MODE_SINGLEPASS,
   ScanType,
 )
-from ..models import CStoreJobRunning, JobConfig
+from ..models import (
+  AuthorizationRef,
+  CStoreJobRunning,
+  EngagementContext,
+  JobConfig,
+  RulesOfEngagement,
+)
 from ..repositories import JobStateRepository
 from .config import get_graybox_budgets_config
 from .secrets import persist_job_config_with_secrets
@@ -152,6 +158,45 @@ def _validate_authorization_context(
     "engagement_metadata": deepcopy(engagement_metadata) if isinstance(engagement_metadata, dict) else None,
     "target_allowlist": normalized_allowlist or None,
   }, None
+
+
+def _normalize_typed_payload(name: str, payload, model_cls):
+  """Validate and normalize optional PTES typed launch payloads."""
+  if payload is None:
+    return None, None
+  if not isinstance(payload, dict):
+    return None, validation_error(f"{name} must be a JSON object when provided")
+  if not payload:
+    return None, None
+  try:
+    model = model_cls.from_dict(payload)
+  except Exception as exc:
+    return None, validation_error(f"{name} is malformed: {exc}")
+  if model is None:
+    return None, None
+  validate = getattr(model, "validate", None)
+  if callable(validate):
+    errors = validate()
+    if errors:
+      return None, validation_error(f"{name} is invalid: {'; '.join(errors)}")
+  is_empty = getattr(model, "is_empty", None)
+  if callable(is_empty) and is_empty():
+    return None, None
+  return model.to_dict(), None
+
+
+def _validate_typed_engagement_context(engagement, roe, authorization):
+  normalized = {}
+  for name, payload, model_cls in (
+    ("engagement", engagement, EngagementContext),
+    ("roe", roe, RulesOfEngagement),
+    ("authorization", authorization, AuthorizationRef),
+  ):
+    value, err = _normalize_typed_payload(name, payload, model_cls)
+    if err:
+      return None, err
+    normalized[name] = value
+  return normalized, None
 
 
 def _apply_launch_safety_policy(
@@ -409,6 +454,9 @@ def announce_launch(
   engagement_metadata,
   target_allowlist,
   safety_policy,
+  engagement=None,
+  roe=None,
+  authorization=None,
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
   excluded_features, enabled_features = resolve_enabled_features(
@@ -468,6 +516,9 @@ def announce_launch(
     verify_tls=verify_tls,
     target_config=target_config,
     allow_stateful_probes=allow_stateful_probes,
+    engagement=engagement,
+    roe=roe,
+    authorization=authorization,
   )
 
   persisted_config, job_config_cid = persist_job_config_with_secrets(
@@ -599,6 +650,9 @@ def launch_network_scan(
   authorization_ref="",
   engagement_metadata=None,
   target_allowlist=None,
+  engagement=None,
+  roe=None,
+  authorization=None,
 ):
   """Launch a network scan using network-specific validation and worker slicing."""
   if not target:
@@ -637,6 +691,11 @@ def launch_network_scan(
   )
   if auth_error:
     return auth_error
+  typed_context, typed_error = _validate_typed_engagement_context(
+    engagement, roe, authorization
+  )
+  if typed_error:
+    return typed_error
 
   max_weak_attempts, target_config, allow_stateful_probes, safety_policy = _apply_launch_safety_policy(
     owner,
@@ -702,6 +761,9 @@ def launch_network_scan(
     engagement_metadata=authorization_context["engagement_metadata"],
     target_allowlist=authorization_context["target_allowlist"],
     safety_policy=safety_policy,
+    engagement=typed_context["engagement"],
+    roe=typed_context["roe"],
+    authorization=typed_context["authorization"],
   )
 
 
@@ -739,6 +801,9 @@ def launch_webapp_scan(
   authorization_ref="",
   engagement_metadata=None,
   target_allowlist=None,
+  engagement=None,
+  roe=None,
+  authorization=None,
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment."""
   if not target_url:
@@ -767,6 +832,11 @@ def launch_webapp_scan(
   )
   if auth_error:
     return auth_error
+  typed_context, typed_error = _validate_typed_engagement_context(
+    engagement, roe, authorization
+  )
+  if typed_error:
+    return typed_error
 
   options = normalize_common_launch_options(
     owner,
@@ -840,6 +910,9 @@ def launch_webapp_scan(
     engagement_metadata=authorization_context["engagement_metadata"],
     target_allowlist=authorization_context["target_allowlist"],
     safety_policy=safety_policy,
+    engagement=typed_context["engagement"],
+    roe=typed_context["roe"],
+    authorization=typed_context["authorization"],
   )
 
 
@@ -885,6 +958,9 @@ def launch_test(
   authorization_ref="",
   engagement_metadata=None,
   target_allowlist=None,
+  engagement=None,
+  roe=None,
+  authorization=None,
 ):
   """Compatibility shim that routes to scan-type-specific launch endpoints."""
   try:
@@ -925,6 +1001,9 @@ def launch_test(
       authorization_ref=authorization_ref,
       engagement_metadata=engagement_metadata,
       target_allowlist=target_allowlist,
+      engagement=engagement,
+      roe=roe,
+      authorization=authorization,
     )
 
   return owner.launch_network_scan(
@@ -955,4 +1034,7 @@ def launch_test(
     authorization_ref=authorization_ref,
     engagement_metadata=engagement_metadata,
     target_allowlist=target_allowlist,
+    engagement=engagement,
+    roe=roe,
+    authorization=authorization,
   )

@@ -5,8 +5,115 @@ Handles merging worker results, credential redaction, and pre-computing
 the UI aggregate view for the frontend.
 """
 
+import json as _json
+
 from ..worker import PentestLocalWorker
 from ..models import UiAggregate
+
+
+# Fields stamped per-worker by _stamp_worker_source. Excluded from the
+# dedup signature so the same vulnerability seen by two workers
+# collapses to one finding (with one worker's stamp preserved).
+_DEDUP_EXCLUDE_FIELDS = ("_source_worker_id", "_source_node_addr")
+
+
+def _finding_dedup_key(item):
+  """Stable JSON-encoded signature of a finding-shaped dict.
+
+  Strips per-worker chain-of-custody fields so the same vuln seen by
+  multiple workers produces an identical key. Falls back to the raw
+  JSON for non-finding shapes.
+  """
+  if not isinstance(item, dict):
+    try:
+      return _json.dumps(item, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+      return repr(item)
+  # Strip per-worker stamps before hashing.
+  stripped = {k: v for k, v in item.items() if k not in _DEDUP_EXCLUDE_FIELDS}
+  try:
+    return _json.dumps(stripped, sort_keys=True, default=str)
+  except (TypeError, ValueError):
+    return repr(stripped)
+
+
+def _dedup_finding_list(findings):
+  """Dedup a list of finding dicts by stable signature.
+
+  Preserves order; first occurrence wins (keeps that worker's stamp).
+  No-op for None / non-list inputs.
+  """
+  if not isinstance(findings, list):
+    return findings
+  seen = set()
+  out = []
+  for item in findings:
+    key = _finding_dedup_key(item)
+    if key in seen:
+      continue
+    seen.add(key)
+    out.append(item)
+  return out
+
+
+def _dedup_findings_in_aggregated(aggregated):
+  """Walk the known finding-bearing paths in an aggregated report and
+  dedup each findings list by stable signature.
+
+  Mutates `aggregated` in place. Targets:
+    - service_info[port].findings
+    - service_info[port][probe].findings
+    - web_tests_info[port].findings
+    - web_tests_info[port][method].findings
+    - graybox_results[port][probe].findings
+    - correlation_findings (top-level)
+    - findings (top-level)
+
+  This is the Phase 0 dedup pass — it complements but does not replace
+  the per-CVE dedup in mixins/risk.py::_compute_risk_and_findings.
+  """
+  if not isinstance(aggregated, dict):
+    return aggregated
+
+  def _dedup_in_dict_at_findings(container):
+    if isinstance(container, dict) and isinstance(container.get("findings"), list):
+      container["findings"] = _dedup_finding_list(container["findings"])
+
+  # service_info: nested + legacy flat
+  for port_entry in (aggregated.get("service_info") or {}).values():
+    if not isinstance(port_entry, dict):
+      continue
+    _dedup_in_dict_at_findings(port_entry)
+    for probe_entry in port_entry.values():
+      if isinstance(probe_entry, dict):
+        _dedup_in_dict_at_findings(probe_entry)
+
+  # web_tests_info: same shape as service_info
+  for port_entry in (aggregated.get("web_tests_info") or {}).values():
+    if not isinstance(port_entry, dict):
+      continue
+    _dedup_in_dict_at_findings(port_entry)
+    for method_entry in port_entry.values():
+      if isinstance(method_entry, dict):
+        _dedup_in_dict_at_findings(method_entry)
+
+  # graybox_results: {port: {probe: {findings}}}
+  for port_probes in (aggregated.get("graybox_results") or {}).values():
+    if not isinstance(port_probes, dict):
+      continue
+    for probe_entry in port_probes.values():
+      if isinstance(probe_entry, dict):
+        _dedup_in_dict_at_findings(probe_entry)
+
+  # Top-level lists
+  if isinstance(aggregated.get("correlation_findings"), list):
+    aggregated["correlation_findings"] = _dedup_finding_list(
+      aggregated["correlation_findings"]
+    )
+  if isinstance(aggregated.get("findings"), list):
+    aggregated["findings"] = _dedup_finding_list(aggregated["findings"])
+
+  return aggregated
 
 
 class _ReportMixin:
@@ -242,6 +349,11 @@ class _ReportMixin:
         self.json_dumps(dct_aggregated_report, indent=2),
         type_or_func, field
       ))
+    # Phase 0 dedup pass: collapse findings duplicated across workers
+    # because each worker stamps its own _source_worker_id /
+    # _source_node_addr before merge. The JSON-key fallback in
+    # merge_objects_deep cannot dedup these because the stamps differ.
+    _dedup_findings_in_aggregated(dct_aggregated_report)
     return dct_aggregated_report
 
   def merge_objects_deep(self, obj_a, obj_b):

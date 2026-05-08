@@ -175,6 +175,15 @@ class TestPhase1ConfigCID(unittest.TestCase):
         return kwargs["value"]
     return None
 
+  @classmethod
+  def _latest_job_config(cls, plugin):
+    """Return the last R1FS JSON payload that looks like a JobConfig."""
+    for call in reversed(plugin.r1fs.add_json.call_args_list):
+      payload = call[0][0]
+      if isinstance(payload, dict) and "target" in payload and "start_port" in payload:
+        return payload
+    return None
+
   def _launch(self, plugin, **kwargs):
     """Call launch_test with mocked base modules."""
     self._mock_plugin_modules()
@@ -486,6 +495,49 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(webapp["route"], "webapp")
     plugin.launch_network_scan.assert_called_once()
     plugin.launch_webapp_scan.assert_called_once()
+
+  def test_launch_test_persists_typed_ptes_context(self):
+    """Compatibility launch_test preserves typed engagement/RoE/auth fields."""
+    plugin = self._build_mock_plugin(job_id="test-job-ptes-context")
+
+    result = self._launch(
+      plugin,
+      engagement={
+        "client_name": "ACME",
+        "data_classification": "PII",
+        "asset_exposure": "external",
+      },
+      roe={
+        "strength_of_test": "light",
+        "dos_allowed": False,
+        "post_exploit_rules": "va_only",
+      },
+      authorization={
+        "document_cid": "QmAuthCID",
+        "authorized_signer_name": "Alice",
+      },
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = self._latest_job_config(plugin)
+    self.assertEqual(config_dict["engagement"]["client_name"], "ACME")
+    self.assertEqual(config_dict["engagement"]["data_classification"], "PII")
+    self.assertEqual(config_dict["roe"]["strength_of_test"], "light")
+    self.assertEqual(config_dict["authorization"]["document_cid"], "QmAuthCID")
+    self.assertEqual(config_dict["authorization"]["authorized_signer_name"], "Alice")
+
+  def test_launch_rejects_invalid_typed_ptes_context(self):
+    """Typed PTES payloads are validated before JobConfig persistence."""
+    plugin = self._build_mock_plugin(job_id="test-job-ptes-invalid")
+
+    result = self._launch(
+      plugin,
+      engagement={"client_name": "ACME", "data_classification": "SECRET"},
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("engagement is invalid", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
 
   def test_launch_webapp_scan_persists_graybox_enabled_features_only(self):
     """Webapp launches resolve enabled features from the graybox capability set only."""
@@ -1078,7 +1130,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(d["llm_analysis"], "# Analysis\nAll good.")
 
   def test_llm_failure_flag_and_timeline(self):
-    """LLM fails → llm_failed: True, timeline event added."""
+    """Structured LLM validation failure → llm_failed: True, timeline event added."""
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
 
@@ -1096,15 +1148,21 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._get_timeline_date = MagicMock(return_value=1000000.0)
     plugin._emit_timeline_event = MagicMock()
 
-    # LLM returns None (failure)
-    plugin._run_aggregated_llm_analysis = MagicMock(return_value=None)
-    plugin._run_quick_summary_analysis = MagicMock(return_value=None)
+    def _structured_failure(*_args, **_kwargs):
+      plugin._last_structured_llm_failed = True
+      return {"background_draft": "[AI generation failed validation]", "error": True}
+
+    plugin._run_structured_report_sections = MagicMock(side_effect=_structured_failure)
+    plugin._run_aggregated_llm_analysis = MagicMock(side_effect=AssertionError("legacy raw LLM path must not run"))
+    plugin._run_quick_summary_analysis = MagicMock(side_effect=AssertionError("legacy quick summary path must not run"))
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     # Check PassReport has llm_failed=True
     pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
     self.assertTrue(pass_report_dict.get("llm_failed"))
+    self.assertTrue(pass_report_dict["llm_report_sections"]["error"])
+    plugin._run_structured_report_sections.assert_called_once()
 
     # Check timeline event was emitted for llm_failed
     llm_failed_calls = [
@@ -1117,8 +1175,8 @@ class TestPhase2PassFinalization(unittest.TestCase):
     meta = call_kwargs.get("meta", {})
     self.assertIn("pass_nr", meta)
 
-  def test_non_retryable_llm_failure_skips_quick_summary(self):
-    """Permanent LLM request failures should not retry through quick summary."""
+  def test_finalization_uses_structured_llm_only(self):
+    """PTES finalization must not call legacy raw aggregate/quick-summary LLM paths."""
     PentesterApi01Plugin = self._get_plugin_class()
     plugin, job_specs = self._build_finalize_plugin(llm_enabled=True)
 
@@ -1135,23 +1193,19 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
     plugin._get_timeline_date = MagicMock(return_value=1000000.0)
     plugin._emit_timeline_event = MagicMock()
-    plugin.P = MagicMock()
-    plugin._last_llm_analysis_status = None
+    def _structured_success(*_args, **_kwargs):
+      plugin._last_structured_llm_failed = False
+      return {"background_draft": "Structured summary", "overall_posture": "Structured posture"}
 
-    def _fail_main(*_args, **_kwargs):
-      plugin._last_llm_analysis_status = "provider_request_error"
-      return None
-
-    plugin._run_aggregated_llm_analysis = MagicMock(side_effect=_fail_main)
-    plugin._run_quick_summary_analysis = MagicMock(return_value=None)
+    plugin._run_structured_report_sections = MagicMock(side_effect=_structured_success)
+    plugin._run_aggregated_llm_analysis = MagicMock(side_effect=AssertionError("legacy raw LLM path must not run"))
+    plugin._run_quick_summary_analysis = MagicMock(side_effect=AssertionError("legacy quick summary path must not run"))
 
     PentesterApi01Plugin._maybe_finalize_pass(plugin)
 
     plugin._run_quick_summary_analysis.assert_not_called()
-    plugin.P.assert_any_call(
-      f"Skipping quick summary for job {job_specs['job_id']} after non-retryable LLM failure (provider_request_error)",
-      color='y'
-    )
+    plugin._run_aggregated_llm_analysis.assert_not_called()
+    plugin._run_structured_report_sections.assert_called_once()
 
   def test_pass_reports_survive_typed_job_record_rewrites(self):
     """Pass reports must stay attached after typed repository rewrites the job dict."""
@@ -1780,6 +1834,28 @@ class TestPhase3Archive(unittest.TestCase):
     self.assertEqual(stub["job_config_cid"], "QmConfigCID")
     self.assertEqual(stub["scan_type"], "webapp")
     self.assertEqual(stub["target_url"], "https://example.com/app")
+
+  def test_archive_clears_live_progress_before_prune(self):
+    """Archive commit clears :live rows before the CStore stub is written."""
+    Plugin = self._get_plugin_class()
+    plugin, job_specs, _, _ = self._build_archive_plugin()
+    events = []
+
+    def clear_live(job_id, worker_addresses):
+      events.append(("clear_live", job_id, tuple(worker_addresses)))
+
+    def record_hset(*args, **kwargs):
+      if kwargs.get("hkey") == "test-instance" and kwargs.get("key") == "test-job":
+        events.append(("archive_prune", kwargs["value"].get("job_cid")))
+
+    plugin._clear_live_progress = MagicMock(side_effect=clear_live)
+    plugin.chainstore_hset.side_effect = record_hset
+
+    Plugin._build_job_archive(plugin, "test-job", job_specs)
+
+    self.assertGreaterEqual(len(events), 2)
+    self.assertEqual(events[0], ("clear_live", "test-job", ("worker-A",)))
+    self.assertEqual(events[1], ("archive_prune", "QmArchiveCID"))
 
   def test_stub_fields_match_model(self):
     """Stub has exactly CStoreJobFinalized fields."""

@@ -120,20 +120,31 @@ def maybe_finalize_pass(owner):
       llm_cfg = get_llm_agent_config(owner)
       llm_text = None
       summary_text = None
+      llm_report_sections = None
+      structured_llm_failed = None
       if llm_cfg["ENABLED"] and aggregated:
         set_job_status(job_specs, JOB_STATUS_ANALYZING)
         job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_analyzing")
-        llm_text = owner._run_aggregated_llm_analysis(job_id, aggregated, job_config)
-        llm_status = getattr(owner, "_last_llm_analysis_status", None)
-        if llm_status in {"api_request_error", "provider_request_error"}:
-          owner.P(
-            f"Skipping quick summary for job {job_id} after non-retryable LLM failure ({llm_status})",
-            color='y'
+        # PTES report narrative uses only the structured LLM path.
+        # Legacy aggregate/quick-summary calls accepted raw scan-shaped
+        # payloads and are intentionally bypassed for report finalization.
+        try:
+          llm_report_sections = owner._run_structured_report_sections(
+            job_id=job_id,
+            findings=flat_findings,
+            aggregated_report=aggregated,
+            engagement=job_config.get("engagement") if isinstance(job_config, dict) else None,
           )
-        else:
-          summary_text = owner._run_quick_summary_analysis(job_id, aggregated, job_config)
+          structured_llm_failed = getattr(owner, "_last_structured_llm_failed", None)
+        except Exception as exc:
+          owner.P(
+            f"Structured LLM call raised for job {job_id}: {exc}",
+            color='y',
+          )
+          llm_report_sections = None
+          structured_llm_failed = True
 
-      llm_failed = True if (llm_cfg["ENABLED"] and (llm_text is None or summary_text is None)) else None
+      llm_failed = True if (llm_cfg["ENABLED"] and structured_llm_failed) else None
       if llm_failed:
         owner._emit_timeline_event(
           job_specs, "llm_failed",
@@ -226,6 +237,7 @@ def maybe_finalize_pass(owner):
         llm_analysis=llm_text,
         quick_summary=summary_text,
         llm_failed=llm_failed,
+        llm_report_sections=llm_report_sections,
         findings=flat_findings if flat_findings else None,
         scan_metrics=pass_metrics,
         worker_scan_metrics=worker_scan_metrics if worker_scan_metrics else None,

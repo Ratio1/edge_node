@@ -40,8 +40,10 @@ from .query import (
   list_network_jobs,
 )
 from .reconciliation import (
+  DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
   get_distributed_job_reconciliation_config,
   reconcile_job_workers,
+  reconcile_workers_from_live,
 )
 from .secrets import (
   R1fsSecretStore,
@@ -67,6 +69,25 @@ from .triage import (
   get_job_archive_with_triage,
   get_job_triage,
   update_finding_triage,
+)
+from .authorization_upload import (
+  AuthorizationUploadError,
+  AuthorizationUploadResult,
+  store_authorization_document,
+)
+from .engagement_deletion import (
+  collect_engagement_document_cids,
+  DeleteEngagementError,
+  DeleteEngagementResult,
+  delete_engagement_data,
+)
+from .llm_structured import (
+  StructuredLlmResult,
+  generate_exec_summary,
+)
+from .llm_fixture_cache import (
+  LlmFixtureCacheMiss,
+  cached_llm_call,
 )
 
 __all__ = [
@@ -112,7 +133,9 @@ __all__ = [
   "resolve_active_peers",
   "resolve_enabled_features",
   "get_distributed_job_reconciliation_config",
+  "DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS",
   "reconcile_job_workers",
+  "reconcile_workers_from_live",
   "set_job_status",
   "stop_and_delete_job",
   "stop_monitoring",
@@ -120,4 +143,16 @@ __all__ = [
   "get_job_triage",
   "update_finding_triage",
   "validation_error",
+  # engagement context (Phase 3)
+  "AuthorizationUploadError",
+  "AuthorizationUploadResult",
+  "collect_engagement_document_cids",
+  "store_authorization_document",
+  "DeleteEngagementError",
+  "DeleteEngagementResult",
+  "delete_engagement_data",
+  "StructuredLlmResult",
+  "generate_exec_summary",
+  "LlmFixtureCacheMiss",
+  "cached_llm_call",
 ]

@@ -104,27 +104,86 @@ class AccessControlConfig:
 
 
 @dataclass(frozen=True)
+class JwtEndpoint:
+  """Endpoint pair for JWT weak-algorithm testing (PT-A02-12)."""
+  token_path: str = ""             # e.g. "/api/token/" — issues JWT
+  protected_path: str = ""         # e.g. "/api/me/" — accepts Bearer JWT
+  username: str = ""               # creds for token issuance
+  password: str = ""
+
+  @classmethod
+  def from_dict(cls, d: dict) -> JwtEndpoint:
+    return cls(
+      token_path=d.get("token_path", ""),
+      protected_path=d.get("protected_path", ""),
+      username=d.get("username", ""),
+      password=d.get("password", ""),
+    )
+
+
+@dataclass(frozen=True)
 class MisconfigConfig:
   """Config for misconfiguration probes (A02)."""
   debug_paths: list[str] = field(default_factory=lambda: [
     "/debug/config/", "/.env", "/actuator/env", "/server-info",
     "/actuator", "/server-status",
   ])
+  jwt_endpoints: JwtEndpoint = field(default_factory=JwtEndpoint)
 
   @classmethod
   def from_dict(cls, d: dict) -> MisconfigConfig:
-    return cls(debug_paths=d.get("debug_paths", cls.__dataclass_fields__["debug_paths"].default_factory()))
+    return cls(
+      debug_paths=d.get("debug_paths", cls.__dataclass_fields__["debug_paths"].default_factory()),
+      jwt_endpoints=JwtEndpoint.from_dict(d.get("jwt_endpoints", {})),
+    )
+
+
+@dataclass(frozen=True)
+class ReflectiveEndpoint:
+  """Endpoint that reflects a single query param into the response.
+
+  Used by PT-A03-04 (XSS), PT-A03-06 (SSTI), PT-A03-07 (command),
+  PT-A03-12 (header). The probe sends a category-specific payload via
+  ``param`` and inspects the response body or headers.
+  """
+  path: str
+  param: str = "msg"
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ReflectiveEndpoint:
+    return cls(path=d["path"], param=d.get("param", "msg"))
+
+
+@dataclass(frozen=True)
+class JsonLookupEndpoint:
+  """Endpoint that takes a JSON body for PT-A03-15 type-confusion testing."""
+  path: str
+  field: str = "id"
+
+  @classmethod
+  def from_dict(cls, d: dict) -> JsonLookupEndpoint:
+    return cls(path=d["path"], field=d.get("field", "id"))
 
 
 @dataclass(frozen=True)
 class InjectionConfig:
   """Config for injection probes (A03/A05/API7)."""
   ssrf_endpoints: list[SsrfEndpoint] = field(default_factory=list)
+  xss_endpoints: list[ReflectiveEndpoint] = field(default_factory=list)
+  ssti_endpoints: list[ReflectiveEndpoint] = field(default_factory=list)
+  cmd_endpoints: list[ReflectiveEndpoint] = field(default_factory=list)
+  header_endpoints: list[ReflectiveEndpoint] = field(default_factory=list)
+  json_type_endpoints: list[JsonLookupEndpoint] = field(default_factory=list)
 
   @classmethod
   def from_dict(cls, d: dict) -> InjectionConfig:
     return cls(
       ssrf_endpoints=[SsrfEndpoint.from_dict(e) for e in d.get("ssrf_endpoints", [])],
+      xss_endpoints=[ReflectiveEndpoint.from_dict(e) for e in d.get("xss_endpoints", [])],
+      ssti_endpoints=[ReflectiveEndpoint.from_dict(e) for e in d.get("ssti_endpoints", [])],
+      cmd_endpoints=[ReflectiveEndpoint.from_dict(e) for e in d.get("cmd_endpoints", [])],
+      header_endpoints=[ReflectiveEndpoint.from_dict(e) for e in d.get("header_endpoints", [])],
+      json_type_endpoints=[JsonLookupEndpoint.from_dict(e) for e in d.get("json_type_endpoints", [])],
     )
 
 

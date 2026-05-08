@@ -670,9 +670,9 @@ class TestProbeDispatch(unittest.TestCase):
     self.assertEqual(findings[0]["status"], "inconclusive")
     self.assertIn("sanitized error", findings[0]["evidence"][0])
 
-  def test_verify_tls_false_emits_warning(self):
-    """TLS disabled → preflight finding."""
-    worker = _make_worker(verify_tls=False)
+  def test_verify_tls_false_emits_warning_for_https_target(self):
+    """TLS disabled on an https:// target → PREFLIGHT-TLS finding."""
+    worker = _make_worker(verify_tls=False, target_url="https://testapp.local:8000")
     worker.safety.validate_target.return_value = None
     worker.auth.preflight_check.return_value = None
     worker.auth.authenticate.return_value = True
@@ -689,6 +689,33 @@ class TestProbeDispatch(unittest.TestCase):
     self.assertEqual(len(preflight), 1)
     self.assertEqual(preflight[0]["scenario_id"], "PREFLIGHT-TLS")
     self.assertEqual(preflight[0]["severity"], "LOW")
+
+  def test_verify_tls_false_suppressed_for_http_target(self):
+    """TLS disabled on an http:// target → no PREFLIGHT-TLS noise.
+
+    The flag is a no-op for plaintext targets; emitting a finding just
+    pollutes the report against intentionally-plaintext honeypots.
+    """
+    worker = _make_worker(verify_tls=False, target_url="http://testapp.local:8000")
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+    worker.auth.authenticate.return_value = True
+    worker.auth.official_session = MagicMock()
+    worker.auth._auth_errors = []
+    worker.auth.ensure_sessions = MagicMock()
+    worker.auth.cleanup = MagicMock()
+    worker.discovery.discover.return_value = ([], [])
+
+    with patch("extensions.business.cybersec.red_mesh.graybox.worker.GRAYBOX_PROBE_REGISTRY", []):
+      worker.execute_job()
+
+    # No probes ran (registry is empty) AND no preflight finding was stored,
+    # so the per-port slot may not even exist. Either shape is acceptable —
+    # what we care about is that PREFLIGHT-TLS isn't in the findings.
+    port_results = worker.state["graybox_results"].get("8000", {})
+    preflight = port_results.get("_graybox_preflight", {}).get("findings", [])
+    self.assertEqual(len(preflight), 0,
+                     "PREFLIGHT-TLS must not fire on http:// targets")
 
   def test_probe_registry_iteration(self):
     """Probes loaded from GRAYBOX_PROBE_REGISTRY."""
