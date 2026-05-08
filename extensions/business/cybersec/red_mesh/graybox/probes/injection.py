@@ -40,6 +40,11 @@ class InjectionProbes(ProbeBase):
     self.run_safe("open_redirect", self._test_open_redirect)
     if self.auth.official_session:
       self.run_safe("path_traversal", self._test_path_traversal)
+      self.run_safe("reflected_xss", self._test_reflected_xss)
+      self.run_safe("template_injection", self._test_template_injection)
+      self.run_safe("command_injection", self._test_command_injection)
+      self.run_safe("header_injection", self._test_header_injection)
+      self.run_safe("json_type_confusion", self._test_json_type_confusion)
     return self.findings
 
   def _test_login_injection(self):
@@ -582,6 +587,348 @@ class InjectionProbes(ProbeBase):
       self.findings.append(GrayboxFinding(
         scenario_id="PT-A03-03",
         title="Path traversal — no vulnerability detected",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A03:2021",
+        evidence=[f"requests_tested={tested}"],
+      ))
+
+  # ── Batch 2 — A03 family expansion ──────────────────────────────────────
+
+  def _test_reflected_xss(self):
+    """PT-A03-04: detect reflected XSS behind authentication.
+
+    Sends a script payload to each configured xss_endpoint and looks
+    for unescaped reflection in the response body.
+    """
+    endpoints = self.target_config.injection.xss_endpoints
+    if not endpoints:
+      return
+
+    payload = "<script>alert(1)</script>"
+    sentinel = "<script>alert(1)</script>"
+
+    vulnerable = []
+    tested = 0
+    for ep in endpoints:
+      url = self.target_url + ep.path
+      self.safety.throttle()
+      try:
+        resp = self.auth.official_session.get(
+          url, params={ep.param: payload}, timeout=10,
+        )
+      except Exception:
+        continue
+      tested += 1
+      if resp.status_code == 200 and sentinel in resp.text:
+        vulnerable.append(f"endpoint={ep.path}; param={ep.param}; payload_reflected_unescaped=True")
+        break
+
+    if vulnerable:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-04",
+        title="Reflected XSS — payload echoed unescaped",
+        status="vulnerable",
+        severity="HIGH",
+        owasp="A03:2021",
+        cwe=["CWE-79"],
+        attack=["T1059.007"],
+        evidence=vulnerable,
+        replay_steps=[
+          f"GET {endpoints[0].path}?{endpoints[0].param}=<script>alert(1)</script>",
+          "Observe payload returned in body without HTML escaping.",
+        ],
+        remediation="Escape user input on output (Django ``|escape``, "
+                    "Jinja autoescape, etc.). Apply a Content Security "
+                    "Policy that disallows inline scripts.",
+      ))
+    elif tested > 0:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-04",
+        title="Reflected XSS — payload escaped or not reflected",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A03:2021",
+        evidence=[f"endpoints_tested={tested}"],
+      ))
+
+  def _test_template_injection(self):
+    """PT-A03-06: detect server-side template injection.
+
+    Sends ``${7*7}`` and ``{{7*7}}`` to each ssti_endpoint; vulnerable
+    if the response body contains ``49``.
+    """
+    endpoints = self.target_config.injection.ssti_endpoints
+    if not endpoints:
+      return
+
+    payloads = ["${7*7}", "{{7*7}}", "{{ 7*7 }}"]
+    sentinel = "49"
+
+    vulnerable = []
+    tested = 0
+    for ep in endpoints:
+      url = self.target_url + ep.path
+      for payload in payloads:
+        self.safety.throttle()
+        try:
+          resp = self.auth.official_session.get(
+            url, params={ep.param: payload}, timeout=10,
+          )
+        except Exception:
+          continue
+        tested += 1
+        # Avoid false positives on echo-only sinks: require the body to
+        # contain ``49`` BUT NOT contain the literal ``7*7`` (an echo
+        # would reflect both the payload and the sentinel).
+        if (resp.status_code == 200 and sentinel in resp.text
+            and "7*7" not in resp.text):
+          vulnerable.append(
+            f"endpoint={ep.path}; param={ep.param}; "
+            f"payload={payload}; sentinel_in_body=True"
+          )
+          break
+      if vulnerable:
+        break
+
+    if vulnerable:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-06",
+        title="Server-side template injection — expression evaluated",
+        status="vulnerable",
+        severity="HIGH",
+        owasp="A03:2021",
+        cwe=["CWE-94", "CWE-1336"],
+        attack=["T1059"],
+        evidence=vulnerable,
+        replay_steps=[
+          f"GET {endpoints[0].path}?{endpoints[0].param}=" + r"${7*7}",
+          "Observe the response body contains 49 (the evaluated result).",
+        ],
+        remediation="Never render user-controlled data through a template "
+                    "engine. If templates must be dynamic, use a sandbox "
+                    "or precompiled templates only.",
+      ))
+    elif tested > 0:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-06",
+        title="Template injection — no expression evaluation observed",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A03:2021",
+        evidence=[f"requests_tested={tested}"],
+      ))
+
+  def _test_command_injection(self):
+    """PT-A03-07: detect OS command injection via shell metacharacters.
+
+    Sends payloads ``;id`` and ``$(id)``; vulnerable if the response
+    body shows the canonical ``uid=`` prefix from ``id(1)``.
+    """
+    endpoints = self.target_config.injection.cmd_endpoints
+    if not endpoints:
+      return
+
+    payloads = [";id", "$(id)", "`id`", "|id"]
+    import re as _re
+    sentinel = _re.compile(r"uid=\d+\(")
+
+    vulnerable = []
+    tested = 0
+    for ep in endpoints:
+      url = self.target_url + ep.path
+      for payload in payloads:
+        self.safety.throttle()
+        try:
+          resp = self.auth.official_session.get(
+            url, params={ep.param: payload}, timeout=10,
+          )
+        except Exception:
+          continue
+        tested += 1
+        if resp.status_code == 200 and sentinel.search(resp.text):
+          vulnerable.append(
+            f"endpoint={ep.path}; param={ep.param}; "
+            f"payload={payload}; uid_marker_in_body=True"
+          )
+          break
+      if vulnerable:
+        break
+
+    if vulnerable:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-07",
+        title="OS command injection — shell metacharacters honored",
+        status="vulnerable",
+        severity="CRITICAL",
+        owasp="A03:2021",
+        cwe=["CWE-78"],
+        attack=["T1059.004"],
+        evidence=vulnerable,
+        replay_steps=[
+          f"GET {endpoints[0].path}?{endpoints[0].param}=;id",
+          "Observe ``uid=...`` from id(1) in the response body.",
+        ],
+        remediation="Never invoke a shell with user-controlled input. "
+                    "Use parameterised process invocation "
+                    "(``subprocess.run([...], shell=False)``) and pass "
+                    "the input as an argv element, never a substring of "
+                    "the command line.",
+      ))
+    elif tested > 0:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-07",
+        title="Command injection — shell metacharacters had no effect",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A03:2021",
+        evidence=[f"requests_tested={tested}"],
+      ))
+
+  def _test_header_injection(self):
+    """PT-A03-12: detect HTTP header injection via CRLF.
+
+    Sends a value with a CRLF + injected header; vulnerable if the
+    response carries the injected header (or splits/loses the
+    location header in a way that proves CRLF was honored).
+    """
+    endpoints = self.target_config.injection.header_endpoints
+    if not endpoints:
+      return
+
+    inject_name = "X-Injected"
+    inject_value = "pwned"
+    payload = f"/safe-target\r\n{inject_name}: {inject_value}"
+
+    vulnerable = []
+    tested = 0
+    for ep in endpoints:
+      url = self.target_url + ep.path
+      self.safety.throttle()
+      try:
+        resp = self.auth.official_session.get(
+          url, params={ep.param: payload},
+          allow_redirects=False, timeout=10,
+        )
+      except Exception:
+        continue
+      tested += 1
+      if resp.headers.get(inject_name) == inject_value:
+        vulnerable.append(
+          f"endpoint={ep.path}; param={ep.param}; "
+          f"injected_header={inject_name}: {inject_value}"
+        )
+        break
+
+    if vulnerable:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-12",
+        title="HTTP header injection via CRLF",
+        status="vulnerable",
+        severity="HIGH",
+        owasp="A03:2021",
+        cwe=["CWE-93", "CWE-113"],
+        attack=["T1190"],
+        evidence=vulnerable,
+        replay_steps=[
+          f"GET {endpoints[0].path}?{endpoints[0].param}=/x"
+          + r"\r\nX-Injected: pwned",
+          "Observe the X-Injected response header set with the "
+          "attacker-supplied value.",
+        ],
+        remediation="Strip ``\\r`` and ``\\n`` from values before they "
+                    "land in response headers. Validate redirect "
+                    "targets against an allowlist of paths.",
+      ))
+    elif tested > 0:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-12",
+        title="Header injection — CRLF stripped or not reflected",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A03:2021",
+        evidence=[f"requests_tested={tested}"],
+      ))
+
+  def _test_json_type_confusion(self):
+    """PT-A03-15: detect lax JSON body parsing on typed fields.
+
+    Sends ``{"<field>": [1]}`` and ``{"<field>": {"$gt": 0}}`` to
+    endpoints expecting an integer; vulnerable when a non-int payload
+    is accepted (HTTP 2xx) or the response distinguishes the variant
+    from a clean rejection.
+    """
+    endpoints = self.target_config.injection.json_type_endpoints
+    if not endpoints:
+      return
+
+    import json as _json
+
+    vulnerable = []
+    tested = 0
+    for ep in endpoints:
+      url = self.target_url + ep.path
+      headers = {"Content-Type": "application/json"}
+
+      # Baseline: clean integer
+      self.safety.throttle()
+      try:
+        baseline = self.auth.official_session.post(
+          url, data=_json.dumps({ep.field: 1}),
+          headers=headers, timeout=10,
+        )
+      except Exception:
+        continue
+      if baseline.status_code >= 500:
+        continue
+
+      # Variant: list
+      payloads_to_try = [[1], {"$gt": 0}]
+      for variant in payloads_to_try:
+        self.safety.throttle()
+        try:
+          resp = self.auth.official_session.post(
+            url, data=_json.dumps({ep.field: variant}),
+            headers=headers, timeout=10,
+          )
+        except Exception:
+          continue
+        tested += 1
+        if resp.status_code < 400:
+          vulnerable.append(
+            f"endpoint={ep.path}; field={ep.field}; "
+            f"variant={variant!r}; status={resp.status_code}"
+          )
+          break
+      if vulnerable:
+        break
+
+    if vulnerable:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-15",
+        title="JSON body type confusion — non-integer accepted",
+        status="vulnerable",
+        severity="MEDIUM",
+        owasp="A03:2021",
+        cwe=["CWE-843", "CWE-704"],
+        attack=["T1190"],
+        evidence=vulnerable,
+        replay_steps=[
+          f"POST {endpoints[0].path} with body "
+          f'``{{"{endpoints[0].field}": [1]}}`` or '
+          f'``{{"{endpoints[0].field}": {{"$gt": 0}}}}``',
+          "Observe the server processes the request without rejecting "
+          "the type mismatch.",
+        ],
+        remediation="Validate JSON body fields against a typed schema "
+                    "(pydantic, marshmallow, JSON Schema). Reject "
+                    "lists, dicts, or operator-keys when an integer "
+                    "is expected.",
+      ))
+    elif tested > 0:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A03-15",
+        title="JSON type confusion — typed validation in place",
         status="not_vulnerable",
         severity="INFO",
         owasp="A03:2021",

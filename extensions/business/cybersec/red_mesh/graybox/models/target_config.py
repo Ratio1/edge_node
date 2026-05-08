@@ -139,14 +139,51 @@ class MisconfigConfig:
 
 
 @dataclass(frozen=True)
+class ReflectiveEndpoint:
+  """Endpoint that reflects a single query param into the response.
+
+  Used by PT-A03-04 (XSS), PT-A03-06 (SSTI), PT-A03-07 (command),
+  PT-A03-12 (header). The probe sends a category-specific payload via
+  ``param`` and inspects the response body or headers.
+  """
+  path: str
+  param: str = "msg"
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ReflectiveEndpoint:
+    return cls(path=d["path"], param=d.get("param", "msg"))
+
+
+@dataclass(frozen=True)
+class JsonLookupEndpoint:
+  """Endpoint that takes a JSON body for PT-A03-15 type-confusion testing."""
+  path: str
+  field: str = "id"
+
+  @classmethod
+  def from_dict(cls, d: dict) -> JsonLookupEndpoint:
+    return cls(path=d["path"], field=d.get("field", "id"))
+
+
+@dataclass(frozen=True)
 class InjectionConfig:
   """Config for injection probes (A03/A05/API7)."""
   ssrf_endpoints: list[SsrfEndpoint] = field(default_factory=list)
+  xss_endpoints: list[ReflectiveEndpoint] = field(default_factory=list)
+  ssti_endpoints: list[ReflectiveEndpoint] = field(default_factory=list)
+  cmd_endpoints: list[ReflectiveEndpoint] = field(default_factory=list)
+  header_endpoints: list[ReflectiveEndpoint] = field(default_factory=list)
+  json_type_endpoints: list[JsonLookupEndpoint] = field(default_factory=list)
 
   @classmethod
   def from_dict(cls, d: dict) -> InjectionConfig:
     return cls(
       ssrf_endpoints=[SsrfEndpoint.from_dict(e) for e in d.get("ssrf_endpoints", [])],
+      xss_endpoints=[ReflectiveEndpoint.from_dict(e) for e in d.get("xss_endpoints", [])],
+      ssti_endpoints=[ReflectiveEndpoint.from_dict(e) for e in d.get("ssti_endpoints", [])],
+      cmd_endpoints=[ReflectiveEndpoint.from_dict(e) for e in d.get("cmd_endpoints", [])],
+      header_endpoints=[ReflectiveEndpoint.from_dict(e) for e in d.get("header_endpoints", [])],
+      json_type_endpoints=[JsonLookupEndpoint.from_dict(e) for e in d.get("json_type_endpoints", [])],
     )
 
 

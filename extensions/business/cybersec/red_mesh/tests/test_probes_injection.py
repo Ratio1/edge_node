@@ -7,6 +7,7 @@ from extensions.business.cybersec.red_mesh.graybox.probes.injection import Injec
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   GrayboxTargetConfig, InjectionConfig, SsrfEndpoint,
+  ReflectiveEndpoint, JsonLookupEndpoint,
 )
 
 
@@ -23,9 +24,19 @@ def _mock_response(status=200, text="", headers=None, content_type="text/html"):
 
 def _make_probe(ssrf_endpoints=None, discovered_forms=None,
                 official_session=None, allow_stateful=False,
-                login_path="/auth/login/", logout_path="/auth/logout/"):
+                login_path="/auth/login/", logout_path="/auth/logout/",
+                xss_endpoints=None, ssti_endpoints=None,
+                cmd_endpoints=None, header_endpoints=None,
+                json_type_endpoints=None):
   cfg = GrayboxTargetConfig(
-    injection=InjectionConfig(ssrf_endpoints=ssrf_endpoints or []),
+    injection=InjectionConfig(
+      ssrf_endpoints=ssrf_endpoints or [],
+      xss_endpoints=xss_endpoints or [],
+      ssti_endpoints=ssti_endpoints or [],
+      cmd_endpoints=cmd_endpoints or [],
+      header_endpoints=header_endpoints or [],
+      json_type_endpoints=json_type_endpoints or [],
+    ),
     login_path=login_path,
     logout_path=logout_path,
   )
@@ -342,6 +353,147 @@ class TestPathTraversal(unittest.TestCase):
     probe.auth.official_session = None
     probe._test_path_traversal()
     self.assertEqual(len(probe.findings), 0)
+
+
+class TestReflectedXssPTA0304(unittest.TestCase):
+  """PT-A03-04 — reflected XSS behind authentication."""
+
+  def test_pt_a03_04_vulnerable_when_payload_reflected(self):
+    ep = ReflectiveEndpoint(path="/api/echo/", param="msg")
+    probe = _make_probe(xss_endpoints=[ep])
+    probe.auth.official_session.get = MagicMock(return_value=_mock_response(
+      status=200, text="<p><script>alert(1)</script></p>",
+    ))
+    probe._test_reflected_xss()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-04"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+
+  def test_pt_a03_04_not_vulnerable_when_escaped(self):
+    ep = ReflectiveEndpoint(path="/api/echo/", param="msg")
+    probe = _make_probe(xss_endpoints=[ep])
+    probe.auth.official_session.get = MagicMock(return_value=_mock_response(
+      status=200, text="<p>&lt;script&gt;alert(1)&lt;/script&gt;</p>",
+    ))
+    probe._test_reflected_xss()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-04"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+  def test_pt_a03_04_silent_when_no_endpoints(self):
+    probe = _make_probe(xss_endpoints=[])
+    probe._test_reflected_xss()
+    self.assertFalse(any(f.scenario_id == "PT-A03-04" for f in probe.findings))
+
+
+class TestTemplateInjectionPTA0306(unittest.TestCase):
+  """PT-A03-06 — server-side template injection."""
+
+  def test_pt_a03_06_vulnerable_when_expression_evaluated(self):
+    ep = ReflectiveEndpoint(path="/api/template/", param="expr")
+    probe = _make_probe(ssti_endpoints=[ep])
+    probe.auth.official_session.get = MagicMock(return_value=_mock_response(
+      status=200, text="<pre>49</pre>",
+    ))
+    probe._test_template_injection()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-06"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+
+  def test_pt_a03_06_not_vulnerable_when_payload_echoed(self):
+    """Echo-only sink: body shows ``${7*7}`` literal — must not flag."""
+    ep = ReflectiveEndpoint(path="/api/template/", param="expr")
+    probe = _make_probe(ssti_endpoints=[ep])
+    probe.auth.official_session.get = MagicMock(return_value=_mock_response(
+      status=200, text="<pre>${7*7}</pre>",
+    ))
+    probe._test_template_injection()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-06"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+
+class TestCommandInjectionPTA0307(unittest.TestCase):
+  """PT-A03-07 — OS command injection."""
+
+  def test_pt_a03_07_vulnerable_on_uid_marker(self):
+    ep = ReflectiveEndpoint(path="/api/exec/", param="cmd")
+    probe = _make_probe(cmd_endpoints=[ep])
+    probe.auth.official_session.get = MagicMock(return_value=_mock_response(
+      status=200, text='{"cmd":";id","output":"OK\\nuid=33(www-data) gid=33"}',
+    ))
+    probe._test_command_injection()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-07"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+    self.assertEqual(f[0].severity, "CRITICAL")
+
+  def test_pt_a03_07_not_vulnerable_when_no_uid_marker(self):
+    ep = ReflectiveEndpoint(path="/api/exec/", param="cmd")
+    probe = _make_probe(cmd_endpoints=[ep])
+    probe.auth.official_session.get = MagicMock(return_value=_mock_response(
+      status=200, text='{"output":"OK"}',
+    ))
+    probe._test_command_injection()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-07"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+
+class TestHeaderInjectionPTA0312(unittest.TestCase):
+  """PT-A03-12 — CRLF header injection."""
+
+  def test_pt_a03_12_vulnerable_when_header_set(self):
+    ep = ReflectiveEndpoint(path="/api/redirect/", param="next")
+    probe = _make_probe(header_endpoints=[ep])
+    probe.auth.official_session.get = MagicMock(return_value=_mock_response(
+      status=302, text="",
+      headers={"X-Injected": "pwned", "Location": "/safe-target"},
+    ))
+    probe._test_header_injection()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-12"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+
+  def test_pt_a03_12_not_vulnerable_when_header_stripped(self):
+    ep = ReflectiveEndpoint(path="/api/redirect/", param="next")
+    probe = _make_probe(header_endpoints=[ep])
+    probe.auth.official_session.get = MagicMock(return_value=_mock_response(
+      status=302, text="", headers={"Location": "/safe-target"},
+    ))
+    probe._test_header_injection()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-12"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+
+class TestJsonTypeConfusionPTA0315(unittest.TestCase):
+  """PT-A03-15 — JSON body type confusion."""
+
+  def test_pt_a03_15_vulnerable_when_list_accepted(self):
+    ep = JsonLookupEndpoint(path="/api/lookup/", field="id")
+    probe = _make_probe(json_type_endpoints=[ep])
+    probe.auth.official_session.post = MagicMock(side_effect=[
+      _mock_response(status=200, text='{"matched":1}'),  # baseline int
+      _mock_response(status=200, text='{"matched":1}'),  # variant list
+    ])
+    probe._test_json_type_confusion()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-15"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+
+  def test_pt_a03_15_not_vulnerable_when_list_rejected(self):
+    ep = JsonLookupEndpoint(path="/api/lookup/", field="id")
+    probe = _make_probe(json_type_endpoints=[ep])
+    probe.auth.official_session.post = MagicMock(side_effect=[
+      _mock_response(status=200, text='{"matched":1}'),       # baseline OK
+      _mock_response(status=400, text='{"error":"id_must_be_integer"}'),
+      _mock_response(status=400, text='{"error":"id_must_be_integer"}'),
+    ])
+    probe._test_json_type_confusion()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A03-15"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
 
 
 class TestCapabilities(unittest.TestCase):
