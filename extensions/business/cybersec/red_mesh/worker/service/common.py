@@ -115,6 +115,13 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
             findings += check_cves(_cve_product, _m.group(2))
+        # Apache `ServerTokens Full` and some nginx builds disclose the
+        # bundled OpenSSL package version in the Server header (e.g.
+        # `Apache/2.4.50 (Unix) OpenSSL/1.0.2k`). Extract it as a separate
+        # product so OpenSSL CVEs fire even on a non-OpenSSL primary product.
+        _ssl_m = _re.search(r"OpenSSL/(\S+)", result["server"], _re.IGNORECASE)
+        if _ssl_m:
+          findings += check_cves("openssl", _ssl_m.group(1))
       powered_by = resp.headers.get("X-Powered-By")
 
       # Page title
@@ -372,6 +379,12 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
             findings += check_cves(_cve_product, _m.group(2))
+        # Co-disclosed OpenSSL package version in the HTTPS Server header
+        # (e.g. ``Apache/2.4.50 (Unix) OpenSSL/1.0.2k``) — common with
+        # ``ServerTokens Full`` and some nginx builds.
+        _ssl_m = _re.search(r"OpenSSL/(\S+)", raw["server"], _re.IGNORECASE)
+        if _ssl_m:
+          findings += check_cves("openssl", _ssl_m.group(1))
       findings.append(Finding(
         severity=Severity.INFO,
         title=f"HTTPS service detected ({resp.status_code} {resp.reason})",
