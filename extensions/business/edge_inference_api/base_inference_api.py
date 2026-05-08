@@ -134,19 +134,22 @@ _CONFIG = {
   "ALLOW_ANONYMOUS_ACCESS": True,
 
   "METRICS_REFRESH_SECONDS": 5 * 60,  # 5 minutes
-  "REQUEST_BALANCING_ENABLED": False,
-  "REQUEST_BALANCING_GROUP": None,
-  "REQUEST_BALANCING_CAPACITY": 1,
-  "REQUEST_BALANCING_PENDING_LIMIT": None,
-  "REQUEST_BALANCING_ANNOUNCE_PERIOD": 60,
-  "REQUEST_BALANCING_PEER_STALE_SECONDS": 180,
-  "REQUEST_BALANCING_MAILBOX_POLL_PERIOD": 1,
-  "REQUEST_BALANCING_CAPACITY_CSTORE_TIMEOUT": 2,
-  "REQUEST_BALANCING_CAPACITY_CSTORE_MAX_RETRIES": 0,
-  "REQUEST_BALANCING_CAPACITY_WARN_PERIOD": 60,
-  "REQUEST_BALANCING_MAX_CSTORE_BYTES": 512 * 1024,
-  "REQUEST_BALANCING_REQUEST_TTL_SECONDS": None,
-  "REQUEST_BALANCING_RESULT_TTL_SECONDS": None,
+  "REQUEST_BALANCING_ENABLED": False,  # enable peer-to-peer request delegation through ChainStore mailboxes
+  "REQUEST_BALANCING_GROUP": None,  # logical pool name; only instances in the same group share capacity/work
+  "REQUEST_BALANCING_CAPACITY": 1,  # max concurrent delegated executions accepted by this instance
+  "REQUEST_BALANCING_PENDING_LIMIT": None,  # max queued local requests; defaults to a capacity-based limit
+  "REQUEST_BALANCING_ANNOUNCE_PERIOD": 60,  # retry interval after a capacity publish fails or has not succeeded yet
+  "REQUEST_BALANCING_CAPACITY_REFRESH_PERIOD": 300,  # slow keepalive for unchanged successful capacity records
+  "REQUEST_BALANCING_CAPACITY_REFRESH_JITTER_SECONDS": 120,  # stable per-instance offset that spreads refresh load
+  "REQUEST_BALANCING_CAPACITY_DEBOUNCE_SECONDS": 10,  # minimum delay between successful changed-capacity publishes
+  "REQUEST_BALANCING_PEER_STALE_SECONDS": 600,  # ignore peer capacity records older than this
+  "REQUEST_BALANCING_MAILBOX_POLL_PERIOD": 1,  # how often executors poll delegated request/result mailboxes
+  "REQUEST_BALANCING_CAPACITY_CSTORE_TIMEOUT": 2,  # per-attempt confirmation wait for advisory capacity writes
+  "REQUEST_BALANCING_CAPACITY_CSTORE_MAX_RETRIES": 0,  # retries inside one capacity write attempt; keep low for soft-state
+  "REQUEST_BALANCING_CAPACITY_WARN_PERIOD": 60,  # throttle warning logs for failed capacity publishes
+  "REQUEST_BALANCING_MAX_CSTORE_BYTES": 512 * 1024,  # reject delegated request/result envelopes above this size
+  "REQUEST_BALANCING_REQUEST_TTL_SECONDS": None,  # optional delegated request mailbox retention override
+  "REQUEST_BALANCING_RESULT_TTL_SECONDS": None,  # optional delegated result mailbox retention override
 
   # Semaphore key for paired plugin synchronization (e.g., with WAR containers)
   # When set, this plugin will signal readiness and expose env vars to paired plugins
@@ -226,6 +229,8 @@ class BaseInferenceApiPlugin(
     self.last_persistence_save = 0
     self._last_capacity_announce = 0.0
     self._last_capacity_warn = 0.0
+    self._last_capacity_publish_ok = False
+    self._last_capacity_publish_snapshot = None
     self._last_balancing_mailbox_poll = 0.0
     self.load_persistence_data()
     tunneling_str = f"(with tunneling enabled)" if self.cfg_tunnel_engine_enabled else ""
@@ -341,6 +346,80 @@ class BaseInferenceApiPlugin(
       return configured
     return max(8, 4 * self._get_balancing_capacity())
 
+  def _get_capacity_announce_period(self):
+    """Return the minimum retry interval after a failed capacity publish.
+
+    Returns
+    -------
+    float
+        Non-negative retry interval in seconds.
+    """
+    value = getattr(self, 'cfg_request_balancing_announce_period', 60)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+      return 60.0
+    return max(0.0, float(value))
+
+  def _get_capacity_refresh_period(self):
+    """Return the periodic refresh interval for unchanged capacity records.
+
+    Returns
+    -------
+    float
+        Non-negative refresh interval in seconds. A value of 0 disables
+        unchanged periodic refreshes, leaving only change-triggered publishes.
+    """
+    value = getattr(self, 'cfg_request_balancing_capacity_refresh_period', 300)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+      return 300.0
+    return max(0.0, float(value))
+
+  def _get_capacity_refresh_jitter_seconds(self):
+    """Return stable per-instance jitter applied to unchanged refreshes.
+
+    Returns
+    -------
+    float
+        Non-negative jitter window in seconds.
+    """
+    value = getattr(self, 'cfg_request_balancing_capacity_refresh_jitter_seconds', 120)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+      return 120.0
+    return max(0.0, float(value))
+
+  def _get_capacity_refresh_due_seconds(self):
+    """Return this instance's unchanged-capacity refresh interval.
+
+    Returns
+    -------
+    float
+        Base refresh period plus a stable per-instance offset.
+    """
+    refresh_period = self._get_capacity_refresh_period()
+    jitter_seconds = self._get_capacity_refresh_jitter_seconds()
+    if refresh_period <= 0 or jitter_seconds < 1:
+      return refresh_period
+    # Use deterministic jitter instead of runtime randomness so the same
+    # instance keeps its offset across restarts without persisting extra state.
+    jitter_bucket_count = int(jitter_seconds) + 1
+    jitter_offset = int(
+      self.get_hash(self._get_instance_balance_key(), length=8, algorithm='sha256'),
+      16,
+    ) % jitter_bucket_count
+    return refresh_period + float(jitter_offset)
+
+  def _get_capacity_debounce_seconds(self):
+    """Return the minimum delay between successful changed-capacity publishes.
+
+    Returns
+    -------
+    float
+        Non-negative debounce interval in seconds.
+    """
+    value = getattr(self, 'cfg_request_balancing_capacity_debounce_seconds', 10)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+      return 10.0
+    return max(0.0, float(value))
+
   def _is_balancing_enabled(self):
     """Return whether request balancing is enabled and configured.
 
@@ -362,9 +441,9 @@ class BaseInferenceApiPlugin(
     float
         Minimum-positive stale interval in seconds.
     """
-    value = getattr(self, 'cfg_request_balancing_peer_stale_seconds', 180)
+    value = getattr(self, 'cfg_request_balancing_peer_stale_seconds', 600)
     if isinstance(value, bool) or not isinstance(value, (int, float)):
-      return 180.0
+      return 600.0
     return max(1.0, float(value))
 
   def _get_mailbox_poll_period(self):
@@ -627,13 +706,13 @@ class BaseInferenceApiPlugin(
     self._publish_capacity_record(force=True)
     return
 
-  def _build_capacity_record(self):
-    """Build the advisory capacity record published to peers.
+  def _build_capacity_record_snapshot(self):
+    """Build the stable part of the advisory capacity record.
 
     Returns
     -------
     dict
-        Capacity and readiness information for this plugin instance.
+        Capacity and readiness information without the volatile timestamp.
     """
     capacity_total = self._get_balancing_capacity()
     capacity_used = self._get_capacity_used()
@@ -649,12 +728,60 @@ class BaseInferenceApiPlugin(
       'capacity_used': capacity_used,
       'capacity_free': capacity_free,
       'max_cstore_bytes': self._get_max_cstore_bytes(),
-      'updated_at': self.time(),
       # Keep both fields: capacity_free is numeric slot availability, while
       # accepting_requests is admission/readiness policy and may be false even
       # when slots are physically free, e.g. during serving cold start.
       'accepting_requests': capacity_free > 0,
     }
+
+  def _build_capacity_record(self, updated_at=None):
+    """Build the advisory capacity record published to peers.
+
+    Parameters
+    ----------
+    updated_at : float, optional
+        Timestamp to place in the record. If omitted, the current plugin time
+        is used.
+
+    Returns
+    -------
+    dict
+        Capacity and readiness information for this plugin instance.
+    """
+    record = self._build_capacity_record_snapshot()
+    record['updated_at'] = self.time() if updated_at is None else updated_at
+    return record
+
+  def _should_publish_capacity_snapshot(self, snapshot, now_ts):
+    """Return whether a capacity snapshot should be published now.
+
+    Parameters
+    ----------
+    snapshot : dict
+        Stable capacity record content without ``updated_at``.
+    now_ts : float
+        Current plugin timestamp.
+
+    Returns
+    -------
+    bool
+        `True` when the snapshot is new, changed, or due for periodic refresh.
+    """
+    last_snapshot = self._last_capacity_publish_snapshot
+    if last_snapshot is None:
+      if self._last_capacity_announce <= 0:
+        return True
+      return (now_ts - self._last_capacity_announce) >= self._get_capacity_announce_period()
+
+    if snapshot != last_snapshot:
+      if not self._last_capacity_publish_ok:
+        return (now_ts - self._last_capacity_announce) >= self._get_capacity_announce_period()
+      return (now_ts - self._last_capacity_announce) >= self._get_capacity_debounce_seconds()
+
+    refresh_period = self._get_capacity_refresh_due_seconds()
+    if refresh_period <= 0:
+      return False
+    return (now_ts - self._last_capacity_announce) >= refresh_period
 
   def _publish_capacity_record(self, force=False):
     """Publish local capacity as advisory soft-state.
@@ -662,7 +789,8 @@ class BaseInferenceApiPlugin(
     Parameters
     ----------
     force : bool, optional
-        Publish immediately even when the announce period has not elapsed.
+        Kept for reserve/release call-site compatibility. Capacity publishes
+        are still gated by snapshot changes, debounce, refresh, and retry rules.
 
     Returns
     -------
@@ -671,25 +799,34 @@ class BaseInferenceApiPlugin(
 
     Notes
     -----
-    Capacity records are advisory soft-state, including forced reserve/release
-    publishes. Local `_active_execution_slots` remains the authoritative
-    admission control; peers repair stale capacity views on later announces.
+    Capacity records are advisory soft-state. They are published when the
+    meaningful capacity snapshot changes, when the unchanged snapshot is due
+    for a slow refresh, or when a previous publish has failed and the retry
+    interval has elapsed. Local `_active_execution_slots` remains the
+    authoritative admission control.
     """
     if not self._is_balancing_enabled():
       return
     now_ts = self.time()
-    if (not force) and (now_ts - self._last_capacity_announce) < getattr(
-      self, 'cfg_request_balancing_announce_period', 60
-    ):
+    snapshot = self._build_capacity_record_snapshot()
+    if not self._should_publish_capacity_snapshot(snapshot=snapshot, now_ts=now_ts):
       return
     ok = self.chainstore_hset(
       hkey=self._capacity_hkey(),
       key=self._get_instance_balance_key(),
-      value=self._build_capacity_record(),
+      value={
+        **snapshot,
+        'updated_at': now_ts,
+      },
       timeout=self._get_capacity_cstore_timeout(),
       max_retries=self._get_capacity_cstore_max_retries(),
     )
     self._last_capacity_announce = now_ts
+    self._last_capacity_publish_ok = bool(ok)
+    if ok:
+      self._last_capacity_publish_snapshot = {
+        **snapshot,
+      }
     if not ok:
       warn_period = self._get_capacity_warn_period()
       if warn_period <= 0 or (now_ts - self._last_capacity_warn) >= warn_period:
