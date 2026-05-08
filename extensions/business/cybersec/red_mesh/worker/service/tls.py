@@ -403,6 +403,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
             return Finding(
               severity=Severity.CRITICAL,
               title="TLS Heartbleed vulnerability (CVE-2014-0160)",
+              cve=("CVE-2014-0160",),
               description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
                           "An attacker can read up to 64KB of server memory per request, "
                           "potentially exposing private keys, session tokens, and passwords.",
@@ -510,6 +511,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
           return Finding(
             severity=Severity.CRITICAL,
             title="TLS Heartbleed vulnerability (CVE-2014-0160)",
+            cve=("CVE-2014-0160",),
             description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
                         "An attacker can read up to 64KB of server memory per request, "
                         "potentially exposing private keys, session tokens, and passwords.",
