@@ -74,9 +74,9 @@ class TestIdorProbe(unittest.TestCase):
     probe.auth.regular_session.get.return_value.json.return_value = {"owner": "alice"}
 
     findings = probe.run()
-    clean = [f for f in findings if f.status == "not_vulnerable"]
+    clean = [f for f in findings
+             if f.status == "not_vulnerable" and f.scenario_id == "PT-A01-01"]
     self.assertEqual(len(clean), 1)
-    self.assertEqual(clean[0].scenario_id, "PT-A01-01")
 
   def test_idor_one_finding_per_scenario(self):
     """Multiple endpoints → exactly one finding."""
@@ -255,6 +255,202 @@ class TestMassAssignmentOwnershipPTA0402(unittest.TestCase):
     probe = _make_probe(idor_endpoints=[], allow_stateful=True)
     probe._test_mass_assignment_ownership()
     self.assertFalse(any(f.scenario_id == "PT-A04-02" for f in probe.findings))
+
+
+class TestOwnershipUpdatePTA0105(unittest.TestCase):
+  """PT-A01-05 — regular user updates a non-owned record."""
+
+  def _setup(self, before_owner, after_title, sentinel_title="redmesh-pt-a01-05-probe-marker"):
+    ep = IdorEndpoint(path="/api/records/{id}/", test_ids=[1], owner_field="owner")
+    probe = _make_probe(idor_endpoints=[ep], allow_stateful=True, regular_username="alice")
+    sess = probe.auth.regular_session
+    sess.cookies = MagicMock()
+    sess.cookies.get = MagicMock(return_value="csrf123")
+    get_calls = iter([
+      _mock_response(status=200, json_data={"id": 1, "owner": before_owner, "title": "before"}),
+      _mock_response(status=200, json_data={"id": 1, "owner": before_owner, "title": after_title}),
+    ])
+    sess.get = MagicMock(side_effect=lambda *a, **kw: next(get_calls))
+    sess.patch = MagicMock(return_value=_mock_response(status=200))
+    return probe
+
+  def test_pt_a01_05_vulnerable_when_sentinel_persisted(self):
+    probe = self._setup(before_owner="bob", after_title="redmesh-pt-a01-05-probe-marker")
+    probe._test_ownership_update()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-05"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+    self.assertEqual(f[0].severity, "HIGH")
+
+  def test_pt_a01_05_not_vulnerable_when_title_unchanged(self):
+    probe = self._setup(before_owner="bob", after_title="before")
+    probe._test_ownership_update()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-05"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+  def test_pt_a01_05_skipped_when_only_self_owned(self):
+    """Records owned by the probe user are skipped — nothing to test."""
+    probe = self._setup(before_owner="alice", after_title="any")
+    probe._test_ownership_update()
+    self.assertFalse(any(f.scenario_id == "PT-A01-05" for f in probe.findings))
+
+
+class TestOwnershipDeletePTA0106(unittest.TestCase):
+  """PT-A01-06 — regular user deletes a non-owned record."""
+
+  def _setup(self, before_owner, followup_status, followup_body=None):
+    ep = IdorEndpoint(path="/api/records/{id}/", test_ids=[1], owner_field="owner")
+    probe = _make_probe(idor_endpoints=[ep], allow_stateful=True, regular_username="alice")
+    sess = probe.auth.regular_session
+    sess.cookies = MagicMock()
+    sess.cookies.get = MagicMock(return_value="csrf123")
+    get_calls = iter([
+      _mock_response(status=200, json_data={"id": 1, "owner": before_owner}),
+      _mock_response(status=followup_status, json_data=followup_body or {}),
+    ])
+    sess.get = MagicMock(side_effect=lambda *a, **kw: next(get_calls))
+    sess.delete = MagicMock(return_value=_mock_response(status=200, json_data={"id": 1, "deleted": True}))
+    return probe
+
+  def test_pt_a01_06_vulnerable_when_record_gone_after_delete(self):
+    probe = self._setup(before_owner="bob", followup_status=404)
+    probe._test_ownership_delete()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-06"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+    self.assertEqual(f[0].severity, "CRITICAL")
+
+  def test_pt_a01_06_not_vulnerable_when_record_still_present(self):
+    probe = self._setup(before_owner="bob", followup_status=200,
+                        followup_body={"id": 1, "owner": "bob"})
+    probe._test_ownership_delete()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-06"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+
+class TestAdminPathDiscoveryPTA0109(unittest.TestCase):
+  """PT-A01-09 — discovered admin-pattern routes reachable by regular user."""
+
+  def _make_probe_with_routes(self, routes, response_for_each):
+    probe = _make_probe(
+      idor_endpoints=[],
+      admin_endpoints=[],
+      discovered_routes=routes,
+      regular_username="alice",
+    )
+    probe.auth.regular_session.get = MagicMock(side_effect=response_for_each)
+    return probe
+
+  def test_pt_a01_09_vulnerable_when_admin_path_returns_200(self):
+    probe = self._make_probe_with_routes(
+      ["/admin-panel/", "/dashboard/"],
+      [_mock_response(status=200, text="<h1>Admin Panel</h1>")],
+    )
+    probe._test_admin_path_discovery()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-09"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+
+  def test_pt_a01_09_not_vulnerable_when_admin_path_denies(self):
+    probe = self._make_probe_with_routes(
+      ["/admin-panel/"],
+      [_mock_response(status=403, text="Forbidden")],
+    )
+    probe._test_admin_path_discovery()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-09"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+  def test_pt_a01_09_silent_when_no_admin_paths_in_routes(self):
+    probe = self._make_probe_with_routes(["/dashboard/", "/records/"], [])
+    probe._test_admin_path_discovery()
+    self.assertFalse(any(f.scenario_id == "PT-A01-09" for f in probe.findings))
+
+
+class TestQueryRoleOverridePTA0110(unittest.TestCase):
+  """PT-A01-10 — query-param role override."""
+
+  def test_pt_a01_10_vulnerable_when_admin_marker_appears(self):
+    probe = _make_probe(
+      idor_endpoints=[], admin_endpoints=[],
+      discovered_routes=["/dashboard/"], regular_username="alice",
+    )
+    probe.auth.regular_session.get = MagicMock(side_effect=[
+      _mock_response(status=200, text="<p>Hello alice</p>"),                  # baseline
+      _mock_response(status=200, text="<p>Hello alice</p><a href='/admin-panel'>Admin Panel</a>"),  # ?role=admin
+    ])
+    probe._test_query_role_override()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-10"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+
+  def test_pt_a01_10_not_vulnerable_when_baseline_unchanged(self):
+    probe = _make_probe(
+      idor_endpoints=[], admin_endpoints=[],
+      discovered_routes=["/dashboard/"], regular_username="alice",
+    )
+    probe.auth.regular_session.get = MagicMock(return_value=_mock_response(
+      status=200, text="<p>Hello alice</p>",
+    ))
+    probe._test_query_role_override()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-10"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+
+class TestHiddenFieldTamperingPTA0112(unittest.TestCase):
+  """PT-A01-12 — hidden auth-related field tampering."""
+
+  def _form_with_hidden_role(self, csrf="tok"):
+    return (
+      f'<form><input type="hidden" name="csrfmiddlewaretoken" value="{csrf}">'
+      f'<input type="hidden" name="role" value="user">'
+      f'<input type="text" name="title" value="thing">'
+      f'</form>'
+    )
+
+  def _make_probe_with_form(self, form_html, post_response):
+    probe = _make_probe(
+      idor_endpoints=[], admin_endpoints=[],
+      discovered_routes=[], regular_username="alice", allow_stateful=False,
+    )
+    probe.discovered_forms = ["/records/1/"]
+    probe.auth.detected_csrf_field = "csrfmiddlewaretoken"
+    probe.auth.extract_csrf_value = MagicMock(return_value="tok")
+    sess = probe.auth.regular_session
+    sess.get = MagicMock(return_value=_mock_response(status=200, text=form_html))
+    sess.post = MagicMock(return_value=post_response)
+    return probe
+
+  def test_pt_a01_12_vulnerable_when_tampered_value_accepted(self):
+    probe = self._make_probe_with_form(
+      self._form_with_hidden_role(),
+      _mock_response(status=302, text=""),
+    )
+    probe._test_hidden_field_tampering()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-12"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+
+  def test_pt_a01_12_not_vulnerable_when_form_rejected(self):
+    probe = self._make_probe_with_form(
+      self._form_with_hidden_role(),
+      _mock_response(status=200, text="<p>Invalid value for role</p>"),
+    )
+    probe._test_hidden_field_tampering()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A01-12"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+  def test_pt_a01_12_silent_when_no_hidden_auth_fields(self):
+    probe = self._make_probe_with_form(
+      '<form><input type="text" name="title"></form>',
+      _mock_response(status=200, text=""),
+    )
+    probe._test_hidden_field_tampering()
+    self.assertFalse(any(f.scenario_id == "PT-A01-12" for f in probe.findings))
 
 
 class TestVerbTampering(unittest.TestCase):
