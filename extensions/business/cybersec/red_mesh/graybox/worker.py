@@ -304,7 +304,11 @@ class GrayboxLocalWorker(BaseLocalWorker):
       if preflight_error:
         self._abort(preflight_error, reason_class="preflight_error")
 
-      if not self.job_config.verify_tls:
+      # Only warn about disabled TLS verification when the target is HTTPS —
+      # for plaintext http:// targets the flag is a no-op and emitting a
+      # PREFLIGHT-TLS finding is just noise.
+      target_is_https = (self.target_url or "").lower().startswith("https://")
+      if not self.job_config.verify_tls and target_is_https:
         self.P(
           f"WARNING: TLS verification disabled for {self.target_url}. "
           "Credentials may be intercepted by a MITM attacker.", color='y'

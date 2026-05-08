@@ -206,6 +206,7 @@ class AccessControlProbes(ProbeBase):
 
     tested = 0
     bypass_evidence = []
+    baseline_reachable = 0
 
     for ep in endpoints:
       # First, confirm the endpoint denies regular user via its normal method.
@@ -217,6 +218,7 @@ class AccessControlProbes(ProbeBase):
         )
       except Exception:
         continue
+      baseline_reachable += 1
 
       # Only test verb tampering if the baseline is denied (403/401/302-to-login)
       baseline_denied = baseline.status_code in (401, 403)
@@ -273,6 +275,21 @@ class AccessControlProbes(ProbeBase):
         severity="INFO",
         owasp="A01:2021",
         evidence=[f"endpoints_tested={len(endpoints)}", f"methods_tested={tested}"],
+      ))
+    elif baseline_reachable > 0:
+      # The probe ran every configured admin endpoint but none returned
+      # a baseline-denied response, so verb-tampering had nothing to test.
+      # Record the inconclusive outcome so coverage accounting reflects it.
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A01-03",
+        title="HTTP verb tampering — no baseline-denied admin endpoint found",
+        status="inconclusive",
+        severity="INFO",
+        owasp="A01:2021",
+        evidence=[
+          f"endpoints_reached={baseline_reachable}",
+          "reason=baseline_responses_were_not_denied_for_regular_user",
+        ],
       ))
 
   def _test_mass_assignment(self):

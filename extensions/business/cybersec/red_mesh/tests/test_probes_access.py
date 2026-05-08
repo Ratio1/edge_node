@@ -247,7 +247,12 @@ class TestVerbTampering(unittest.TestCase):
     self.assertEqual(len(clean), 1)
 
   def test_verb_tampering_baseline_accessible(self):
-    """Endpoint already accessible via normal method → skip (not a tampering target)."""
+    """Endpoint already accessible via normal method → emit inconclusive INFO.
+
+    The probe didn't actually exercise verb-tampering (no baseline-denied
+    response to bypass), but it DID reach the endpoint. Emit an INFO so
+    coverage accounting reflects that PT-A01-03 ran on this target.
+    """
     ep = AdminEndpoint(path="/api/public/", method="GET")
     probe = _make_probe(admin_endpoints=[ep])
     session = probe.auth.regular_session
@@ -255,7 +260,9 @@ class TestVerbTampering(unittest.TestCase):
 
     probe._test_verb_tampering()
     a01_03 = [f for f in probe.findings if f.scenario_id == "PT-A01-03"]
-    self.assertEqual(len(a01_03), 0)
+    self.assertEqual(len(a01_03), 1)
+    self.assertEqual(a01_03[0].status, "inconclusive")
+    self.assertEqual(a01_03[0].severity, "INFO")
 
   def test_verb_tampering_no_endpoints(self):
     """No admin endpoints → no findings."""

@@ -125,6 +125,8 @@ class BusinessLogicProbes(ProbeBase):
     endpoints = self.target_config.business_logic.workflow_endpoints
     if not endpoints:
       return
+    endpoints_tested = 0
+    bypass_emitted = False
 
     # Resolve {id} placeholders using IDOR test_ids (default: try 1 and 2)
     idor_ids = [1, 2]
@@ -175,6 +177,7 @@ class BusinessLogicProbes(ProbeBase):
       except Exception:
         continue
 
+      endpoints_tested += 1
       if resp.status_code < 400:
         body_lower = resp.text.lower()
         denial_markers = ["access denied", "permission denied", "forbidden",
@@ -205,6 +208,19 @@ class BusinessLogicProbes(ProbeBase):
             ],
             remediation="Enforce workflow state guards and role checks on all state-changing endpoints.",
           ))
+          bypass_emitted = True
+
+    # If we reached at least one endpoint and didn't fire vulnerable, record
+    # a not_vulnerable INFO so the inventory shows the probe ran.
+    if endpoints_tested > 0 and not bypass_emitted:
+      self.findings.append(GrayboxFinding(
+        scenario_id="PT-A06-01",
+        title="Workflow bypass — guards held",
+        status="not_vulnerable",
+        severity="INFO",
+        owasp="A06:2021",
+        evidence=[f"endpoints_tested={endpoints_tested}"],
+      ))
 
   def _test_validation_bypass(self):
     """
