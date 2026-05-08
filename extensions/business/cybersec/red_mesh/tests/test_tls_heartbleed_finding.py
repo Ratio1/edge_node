@@ -90,5 +90,84 @@ class TestHeartbleedFindingHasCveField(unittest.TestCase):
     )
 
 
+class TestHeartbleedTriggersOpenSslCveInference(unittest.TestCase):
+  """When Heartbleed fires positive, the OpenSSL package version is
+  deterministically ≤1.0.1f. The TLS pass should walk the catalog at
+  1.0.1f and emit every matching row in addition to the Heartbleed
+  Finding itself, deduplicating CVE-2014-0160.
+  """
+
+  def test_inference_emits_openssl_cves_without_duplicate_heartbleed(self):
+    from extensions.business.cybersec.red_mesh.cve_db import check_cves
+
+    inferred = check_cves("openssl", "1.0.1f")
+    inferred_cves = {c for f in inferred for c in (f.cve or ())}
+
+    # Sanity: the catalog row for Heartbleed itself fires when querying
+    # by OpenSSL version (so the dedup branch is reachable, not a no-op).
+    self.assertIn(
+      "CVE-2014-0160", inferred_cves,
+      "check_cves('openssl', '1.0.1f') must include CVE-2014-0160 — "
+      "otherwise the inference path's dedup branch is never exercised",
+    )
+
+    # The inference must contribute at least these well-known
+    # OpenSSL ≤1.0.1f CVEs (a non-empty contribution beyond Heartbleed).
+    additional = inferred_cves - {"CVE-2014-0160"}
+    self.assertTrue(
+      additional,
+      f"check_cves should return more than just Heartbleed for openssl "
+      f"1.0.1f; got {sorted(inferred_cves)}",
+    )
+
+  def test_service_info_tls_appends_inferred_cves_on_heartbleed(self):
+    from extensions.business.cybersec.red_mesh.worker.service.tls import _ServiceTlsMixin
+    from extensions.business.cybersec.red_mesh.findings import Finding, Severity
+
+    probe = _ServiceTlsMixin.__new__(_ServiceTlsMixin)
+
+    # Stub every sibling pass to no-op except heartbleed → positive.
+    probe._tls_unverified_connect = lambda t, p: ("TLSv1.2", "ECDHE-RSA-AES256-GCM-SHA384", None)
+    probe._tls_check_protocol = lambda proto, cipher: []
+    probe._tls_parse_san_from_der = lambda d: ([], [])
+    probe._tls_check_signature_algorithm = lambda d: []
+    probe._tls_check_validity_period = lambda d: []
+    probe._tls_check_certificate = lambda t, p, raw: []
+    probe._tls_check_expiry = lambda raw: []
+    probe._tls_check_default_cn = lambda raw: []
+    probe._tls_check_downgrade = lambda t, p: []
+    probe._tls_check_heartbleed = lambda t, p: Finding(
+      severity=Severity.CRITICAL,
+      title="TLS Heartbleed vulnerability (CVE-2014-0160)",
+      cve=("CVE-2014-0160",),
+      description="leak",
+      evidence="leak",
+      remediation="upgrade",
+      owasp_id="A06:2021",
+      cwe_id="CWE-126",
+      confidence="certain",
+    )
+
+    result = probe._service_info_tls("10.0.0.1", 8443)
+    findings = result["findings"]
+    # probe_result normalizes Finding instances to JSON-safe dicts; cve is a list.
+    cves = [c for f in findings for c in (f.get("cve") or []) if c]
+
+    # Heartbleed appears exactly once (no duplicate via inference).
+    self.assertEqual(
+      cves.count("CVE-2014-0160"), 1,
+      "Heartbleed must appear exactly once in the findings list — "
+      "the inference branch dedups it",
+    )
+
+    # At least one other OpenSSL CVE was inferred.
+    other_openssl = {c for c in cves if c != "CVE-2014-0160" and c.startswith("CVE-")}
+    self.assertTrue(
+      other_openssl,
+      f"Expected at least one additional OpenSSL CVE inferred from the "
+      f"Heartbleed positive, but got only {cves}",
+    )
+
+
 if __name__ == "__main__":
   unittest.main()

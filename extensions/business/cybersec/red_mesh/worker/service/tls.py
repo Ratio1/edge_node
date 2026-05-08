@@ -88,6 +88,14 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     heartbleed = self._tls_check_heartbleed(target, port)
     if heartbleed:
       findings.append(heartbleed)
+      # Behavioral version inference: a positive Heartbleed leak proves the
+      # OpenSSL package version is in [1.0.1, 1.0.1g). Walk the catalog at
+      # the upper bound (1.0.1f) and emit every additional row that fires.
+      # Skip the Heartbleed row itself — already emitted above.
+      for inferred in check_cves("openssl", "1.0.1f"):
+        if "CVE-2014-0160" in (inferred.cve or ()):
+          continue
+        findings.append(inferred)
 
     # Pass 5: Downgrade attacks (POODLE / BEAST)
     findings += self._tls_check_downgrade(target, port)
