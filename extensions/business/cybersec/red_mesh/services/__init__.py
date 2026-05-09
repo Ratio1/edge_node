@@ -45,6 +45,10 @@ from .integration_status import (
   record_integration_status,
   test_event_export,
 )
+from .suricata_correlation import (
+  correlate_suricata_eve,
+  get_detection_correlation,
+)
 from .log_export import (
   WAZUH_EVENT_GROUPS,
   build_wazuh_decoder_rules_example,
@@ -189,6 +193,7 @@ __all__ = [
   "get_job_data",
   "get_job_progress",
   "get_integration_status",
+  "get_detection_correlation",
   "WAZUH_EVENT_GROUPS",
   "SOC_EVENT_STATUS_SCHEMA_VERSION",
   "build_wazuh_decoder_rules_example",
@@ -225,6 +230,7 @@ __all__ = [
   "reconcile_job_workers",
   "reconcile_workers_from_live",
   "record_integration_status",
+  "correlate_suricata_eve",
   "set_job_status",
   "stop_and_delete_job",
   "stop_monitoring",

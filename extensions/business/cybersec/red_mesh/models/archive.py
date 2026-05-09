@@ -355,6 +355,7 @@ class JobArchive:
   archive_version: int = JOB_ARCHIVE_VERSION
   start_attestation: dict = None
   soc_event_status: dict = None
+  detection_correlation: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -378,4 +379,5 @@ class JobArchive:
       date_completed=d.get("date_completed", 0),
       start_attestation=d.get("start_attestation"),
       soc_event_status=d.get("soc_event_status"),
+      detection_correlation=d.get("detection_correlation"),
     )
