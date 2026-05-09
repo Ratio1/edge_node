@@ -607,6 +607,38 @@ class TestPushToMisp(unittest.TestCase):
     mock_misp.update_event.assert_called_once()
     mock_misp.add_event.assert_not_called()
 
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.emit_export_status_event")
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_successful_push_emits_soc_export_status(self, MockPyMISP, emit_export_status):
+    from pymisp import MISPEvent
+    mock_misp = MockPyMISP.return_value
+    response_event = MISPEvent()
+    response_event.uuid = "new-uuid-456"
+    response_event.id = 99
+    mock_misp.add_event.return_value = response_event
+
+    owner = self._setup_owner()
+    result = push_to_misp(owner, "test_job_1")
+
+    self.assertEqual(result["status"], "ok")
+    emit_export_status.assert_called_once()
+    kwargs = emit_export_status.call_args.kwargs
+    self.assertEqual(kwargs["adapter_type"], "misp")
+    self.assertEqual(kwargs["status"], "completed")
+    self.assertEqual(kwargs["artifact_refs"], {"misp_event_uuid": "new-uuid-456", "misp_event_id": 99})
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.emit_export_status_event")
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_failed_push_emits_soc_export_status(self, MockPyMISP, emit_export_status):
+    MockPyMISP.side_effect = Exception("Connection refused")
+    owner = self._setup_owner()
+
+    result = push_to_misp(owner, "test_job_1")
+
+    self.assertEqual(result["status"], "error")
+    emit_export_status.assert_called_once()
+    self.assertEqual(emit_export_status.call_args.kwargs["status"], "failed")
+
 
 if __name__ == "__main__":
   unittest.main()

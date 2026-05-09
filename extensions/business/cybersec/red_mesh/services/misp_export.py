@@ -18,6 +18,7 @@ from pymisp import MISPEvent, MISPObject, MISPAttribute, PyMISP
 
 from ..repositories import ArtifactRepository, JobStateRepository
 from .misp_config import get_misp_export_config, SEVERITY_LEVELS
+from .event_hooks import emit_export_status_event
 
 
 def _job_repo(owner):
@@ -371,14 +372,33 @@ def push_to_misp(owner, job_id, pass_nr=None):
   event_uuid in CStore), updates the existing event with new pass data.
   """
   cfg = get_misp_export_config(owner)
+  job_specs = owner._get_job_from_cstore(job_id)
+
+  def _record_export_status(status, artifact_refs=None):
+    if not job_specs:
+      return
+    emit_export_status_event(
+      owner,
+      job_specs,
+      adapter_type="misp",
+      status=status,
+      pass_nr=pass_nr,
+      destination_label="misp",
+      artifact_refs=artifact_refs,
+    )
+    _write_job_record(owner, job_id, job_specs, context="misp_export_status")
+
   if not cfg["ENABLED"]:
+    _record_export_status("skipped")
     return {"status": "disabled", "error": "MISP export is disabled"}
   if not cfg["MISP_URL"] or not cfg["MISP_API_KEY"]:
+    _record_export_status("failed")
     return {"status": "not_configured", "error": "MISP URL or API key not configured"}
 
   # Build the event
   result = build_misp_event(owner, job_id, pass_nr=pass_nr)
   if result["status"] != "ok":
+    _record_export_status("failed")
     return result
   event = result["event"]
   actual_pass_nr = result["pass_nr"]
@@ -388,10 +408,10 @@ def push_to_misp(owner, job_id, pass_nr=None):
     misp = PyMISP(cfg["MISP_URL"], cfg["MISP_API_KEY"],
                   ssl=cfg["MISP_VERIFY_TLS"], timeout=cfg["TIMEOUT"])
   except Exception as exc:
+    _record_export_status("failed")
     return {"status": "error", "error": f"MISP connection failed: {exc}", "retryable": True}
 
   # Check for existing event (re-export / continuous monitoring)
-  job_specs = owner._get_job_from_cstore(job_id)
   existing_export = (job_specs or {}).get("misp_export", {})
   existing_uuid = existing_export.get("event_uuid")
   passes_exported = list(existing_export.get("passes_exported", []))
@@ -424,6 +444,7 @@ def push_to_misp(owner, job_id, pass_nr=None):
       error_msg = str(response_event)
       if isinstance(response_event, dict):
         error_msg = response_event.get("message", response_event.get("errors", str(response_event)))
+      _record_export_status("failed")
       return {"status": "error", "error": f"MISP API error: {error_msg}", "retryable": False}
 
     event_uuid = str(response_event.uuid)
@@ -439,6 +460,7 @@ def push_to_misp(owner, job_id, pass_nr=None):
   except Exception as exc:
     error_str = str(exc)
     retryable = not any(code in error_str for code in ["401", "403", "404"])
+    _record_export_status("failed")
     return {"status": "error", "error": f"MISP push failed: {error_str}", "retryable": retryable}
 
   # Store export metadata in CStore
@@ -455,6 +477,15 @@ def push_to_misp(owner, job_id, pass_nr=None):
 
   if job_specs:
     job_specs["misp_export"] = misp_export_meta
+    emit_export_status_event(
+      owner,
+      job_specs,
+      adapter_type="misp",
+      status="completed",
+      pass_nr=actual_pass_nr,
+      destination_label="misp",
+      artifact_refs={"misp_event_uuid": event_uuid, "misp_event_id": event_id},
+    )
     job_key = job_id
     _write_job_record(owner, job_key, job_specs, context="misp_export")
 

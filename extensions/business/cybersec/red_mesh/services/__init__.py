@@ -53,6 +53,14 @@ from .log_export import (
   deliver_wazuh_event,
   format_syslog_json_line,
 )
+from .event_hooks import (
+  SOC_EVENT_STATUS_SCHEMA_VERSION,
+  emit_attestation_status_event,
+  emit_export_status_event,
+  emit_finding_event,
+  emit_lifecycle_event,
+  emit_redmesh_event,
+)
 from .control import (
   purge_job,
   stop_and_delete_job,
@@ -182,10 +190,16 @@ __all__ = [
   "get_job_progress",
   "get_integration_status",
   "WAZUH_EVENT_GROUPS",
+  "SOC_EVENT_STATUS_SCHEMA_VERSION",
   "build_wazuh_decoder_rules_example",
   "compute_payload_hmac",
   "deliver_redmesh_event",
   "deliver_wazuh_event",
+  "emit_attestation_status_event",
+  "emit_export_status_event",
+  "emit_finding_event",
+  "emit_lifecycle_event",
+  "emit_redmesh_event",
   "format_syslog_json_line",
   "is_intermediate_job_status",
   "is_terminal_job_status",

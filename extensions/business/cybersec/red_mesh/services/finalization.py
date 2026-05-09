@@ -16,6 +16,11 @@ from ..models import AggregatedScanData, PassReport, PassReportRef, WorkerReport
 from ..repositories import ArtifactRepository, JobStateRepository
 from .config import get_attestation_config
 from .config import get_llm_agent_config
+from .event_hooks import (
+  emit_attestation_status_event,
+  emit_finding_event,
+  emit_lifecycle_event,
+)
 from .scan_strategy import coerce_scan_type, get_scan_strategy
 from .state_machine import is_intermediate_job_status, is_terminal_job_status, set_job_status
 
@@ -201,8 +206,24 @@ def maybe_finalize_pass(owner):
             node_ips=attestation_node_ips,
             report_cid=aggregated_report_cid,
           )
-          if redmesh_test_attestation is not None:
+          if isinstance(redmesh_test_attestation, dict):
             job_specs["last_attestation_at"] = now_ts
+            emit_attestation_status_event(
+              owner,
+              job_specs,
+              state="submitted",
+              network=owner.REDMESH_ATTESTATION_NETWORK,
+              tx_hash=redmesh_test_attestation.get("tx_hash"),
+              pass_nr=job_pass,
+            )
+          elif redmesh_test_attestation is None:
+            emit_attestation_status_event(
+              owner,
+              job_specs,
+              state="skipped",
+              network=owner.REDMESH_ATTESTATION_NETWORK,
+              pass_nr=job_pass,
+            )
         except Exception as exc:
           import traceback
           owner.P(
@@ -212,6 +233,21 @@ def maybe_finalize_pass(owner):
             f"  Traceback:\n{traceback.format_exc()}",
             color='r'
           )
+          emit_attestation_status_event(
+            owner,
+            job_specs,
+            state="failed",
+            network=owner.REDMESH_ATTESTATION_NETWORK,
+            pass_nr=job_pass,
+          )
+      else:
+        emit_attestation_status_event(
+          owner,
+          job_specs,
+          state="skipped",
+          network=owner.REDMESH_ATTESTATION_NETWORK,
+          pass_nr=job_pass,
+        )
 
       worker_scan_metrics = {}
       for addr, report in node_reports.items():
@@ -252,6 +288,22 @@ def maybe_finalize_pass(owner):
       job_specs.setdefault("pass_reports", []).append(
         PassReportRef(job_pass, pass_report_cid, risk_score).to_dict()
       )
+      emit_lifecycle_event(
+        owner,
+        job_specs,
+        event_type="redmesh.job.pass_completed",
+        event_action="pass_completed",
+        event_outcome="success",
+        pass_nr=job_pass,
+      )
+      for finding in flat_findings or []:
+        emit_finding_event(
+          owner,
+          job_specs,
+          finding=finding,
+          event_action="created",
+          pass_nr=job_pass,
+        )
 
       set_job_status(job_specs, JOB_STATUS_FINALIZING)
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_finalizing")
@@ -275,6 +327,14 @@ def maybe_finalize_pass(owner):
       if job_status == JOB_STATUS_SCHEDULED_FOR_STOP:
         set_job_status(job_specs, JOB_STATUS_STOPPED)
         owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
+        emit_lifecycle_event(
+          owner,
+          job_specs,
+          event_type="redmesh.job.stopped",
+          event_action="stopped",
+          event_outcome="success",
+          pass_nr=job_pass,
+        )
         if redmesh_test_attestation is not None:
           owner._emit_timeline_event(
             job_specs, "blockchain_submit",
@@ -291,6 +351,14 @@ def maybe_finalize_pass(owner):
       if job_pass >= MAX_CONTINUOUS_PASSES:
         set_job_status(job_specs, JOB_STATUS_STOPPED)
         owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
+        emit_lifecycle_event(
+          owner,
+          job_specs,
+          event_type="redmesh.job.stopped",
+          event_action="stopped",
+          event_outcome="success",
+          pass_nr=job_pass,
+        )
         owner._emit_timeline_event(
           job_specs,
           "pass_cap_reached",
