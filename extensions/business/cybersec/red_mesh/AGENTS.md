@@ -338,3 +338,9 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Change: reverted the packed participant-node IP metadata implementation from RedMesh test/pass attestation records after confirming the current on-chain `ipObfuscated` field already represents the scanned target.
 - Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_hardening.py -q` passed with 14 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 100 tests.
 - Horizontal insight: keep the current distinction clear: `ip_obfuscated` is target IP obfuscation, while participant node IPs should only be reintroduced if the attestation contract/event schema explicitly requires them.
+
+### 2026-05-09T14:09:57Z
+
+- Change: introduced the first SOC/SIEM delivery boundary for canonical `redmesh.event.v1` events: Wazuh/generic SIEM HTTP JSON and syslog JSON delivery, bounded retries, idempotency headers/fields, HMAC signing, redacted failed-payload artifacts, and per-integration status updates.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_log_export.py extensions/business/cybersec/red_mesh/tests/test_wazuh_export.py extensions/business/cybersec/red_mesh/tests/test_integration_status.py extensions/business/cybersec/red_mesh/tests/test_integration_config.py -q` passed with 23 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed with 1205 tests, 1 skipped, 3 warnings, and 6 subtests.
+- Horizontal insight: SOC adapters should remain isolated delivery boundaries fed by the canonical event contract; missing signing/configuration dependencies must be visible in integration status and must not block scan execution.

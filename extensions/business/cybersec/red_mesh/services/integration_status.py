@@ -127,9 +127,11 @@ def _event_export_status(owner):
 
 def _wazuh_status(owner):
   cfg = get_wazuh_export_config(owner)
+  event_cfg = get_event_export_config(owner)
   mode = cfg["MODE"]
   host = cfg["SYSLOG_HOST"] if mode == "syslog" else _redacted_url_host(cfg["HTTP_URL"])
-  configured = bool(cfg["ENABLED"]) and bool(host)
+  missing_secret = event_cfg["SIGN_PAYLOADS"] and not _has_env_secret(event_cfg["HMAC_SECRET_ENV"])
+  configured = bool(cfg["ENABLED"]) and bool(host) and not missing_secret
   return _base_status(
     "wazuh",
     enabled=cfg["ENABLED"],
@@ -137,12 +139,14 @@ def _wazuh_status(owner):
     destination_type=mode,
     destination_label="wazuh",
     redacted_host=host,
+    error_class="missing_hmac_secret" if cfg["ENABLED"] and host and missing_secret else None,
     config={
       "mode": mode,
       "min_severity": cfg["MIN_SEVERITY"],
       "include_service_observations": cfg["INCLUDE_SERVICE_OBSERVATIONS"],
       "timeout_seconds": cfg["TIMEOUT_SECONDS"],
       "retry_attempts": cfg["RETRY_ATTEMPTS"],
+      "persist_failed_payloads": cfg["PERSIST_FAILED_PAYLOADS"],
     },
   )
 
@@ -282,6 +286,10 @@ def test_event_export(owner, integration_id="event_export"):
     tenant_id=str(getattr(owner, "cfg_instance_id", "") or ""),
     environment=str(getattr(owner, "cfg_ee_node_network", "") or ""),
   )
+  if integration_id == "wazuh":
+    from .log_export import deliver_redmesh_event
+    return deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True)
+
   persisted = record_integration_status(
     owner,
     integration_id,

@@ -93,6 +93,23 @@ class TestIntegrationStatus(unittest.TestCase):
     self.assertEqual(status["last_error_class"], "timeout")
     self.assertIsNotNone(status["last_failure_at"])
 
+  def test_wazuh_status_reflects_missing_shared_signing_secret(self):
+    self.owner.cfg_wazuh_export = {
+      "ENABLED": True,
+      "MODE": "syslog",
+      "SYSLOG_HOST": "127.0.0.1",
+    }
+    self.owner.cfg_event_export = {
+      "SIGN_PAYLOADS": True,
+      "HMAC_SECRET_ENV": "REDMESH_EVENT_HMAC_SECRET",
+    }
+
+    status = get_integration_status(self.owner)["integrations"]["wazuh"]
+
+    self.assertTrue(status["enabled"])
+    self.assertFalse(status["configured"])
+    self.assertEqual(status["last_error_class"], "missing_hmac_secret")
+
   def test_test_event_export_builds_safe_event_and_persists_dry_run(self):
     result = build_integration_test_event(self.owner, integration_id="event_export")
 

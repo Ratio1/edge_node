@@ -45,6 +45,14 @@ from .integration_status import (
   record_integration_status,
   test_event_export,
 )
+from .log_export import (
+  WAZUH_EVENT_GROUPS,
+  build_wazuh_decoder_rules_example,
+  compute_payload_hmac,
+  deliver_redmesh_event,
+  deliver_wazuh_event,
+  format_syslog_json_line,
+)
 from .control import (
   purge_job,
   stop_and_delete_job,
@@ -173,6 +181,12 @@ __all__ = [
   "get_job_data",
   "get_job_progress",
   "get_integration_status",
+  "WAZUH_EVENT_GROUPS",
+  "build_wazuh_decoder_rules_example",
+  "compute_payload_hmac",
+  "deliver_redmesh_event",
+  "deliver_wazuh_event",
+  "format_syslog_json_line",
   "is_intermediate_job_status",
   "is_terminal_job_status",
   "iter_scan_strategies",

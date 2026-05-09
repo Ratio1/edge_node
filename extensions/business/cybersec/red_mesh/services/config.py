@@ -72,6 +72,8 @@ DEFAULT_WAZUH_EXPORT_CONFIG = {
   "INCLUDE_SERVICE_OBSERVATIONS": True,
   "TIMEOUT_SECONDS": 5.0,
   "RETRY_ATTEMPTS": 2,
+  "PERSIST_FAILED_PAYLOADS": False,
+  "FAILED_PAYLOAD_SAMPLE_BYTES": 2048,
 }
 
 DEFAULT_SURICATA_CORRELATION_CONFIG = {
@@ -333,6 +335,13 @@ def get_wazuh_export_config(owner):
         merged.get("RETRY_ATTEMPTS", defaults["RETRY_ATTEMPTS"]),
         defaults["RETRY_ATTEMPTS"],
         minimum=0,
+      ),
+      "PERSIST_FAILED_PAYLOADS": bool(merged.get("PERSIST_FAILED_PAYLOADS", defaults["PERSIST_FAILED_PAYLOADS"])),
+      "FAILED_PAYLOAD_SAMPLE_BYTES": _bounded_int(
+        merged.get("FAILED_PAYLOAD_SAMPLE_BYTES", defaults["FAILED_PAYLOAD_SAMPLE_BYTES"]),
+        defaults["FAILED_PAYLOAD_SAMPLE_BYTES"],
+        minimum=256,
+        maximum=16384,
       ),
     }
 
