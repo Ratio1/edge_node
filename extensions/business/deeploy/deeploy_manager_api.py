@@ -18,7 +18,7 @@ from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
   DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST,
-  DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
+  DEEPLOY_NODE_SPECS_REQUEST, DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
 )
   
 
@@ -321,6 +321,36 @@ class DeeployManagerApiPlugin(
     except Exception as e:
       result = self.__handle_error(e, request)
     #endtry
+    response = self._get_response({
+      **result
+    })
+    return response
+
+
+  @BasePlugin.endpoint(method="post")
+  # /node_specs
+  def node_specs(
+    self,
+    request: dict = DEEPLOY_NODE_SPECS_REQUEST
+  ):
+    """
+    Return total and live-available resource specs for requested nodes.
+
+    This read-only endpoint is intentionally narrow: callers provide the node
+    addresses already visible in Deeploy, and the API returns capacity telemetry
+    keyed by normalized node address.
+    """
+    try:
+      target_nodes = request.get(DEEPLOY_KEYS.TARGET_NODES, request.get("nodes", []))
+      node_specs = self._get_node_specs(target_nodes)
+      result = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        "node_specs": node_specs,
+      }
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+
     response = self._get_response({
       **result
     })

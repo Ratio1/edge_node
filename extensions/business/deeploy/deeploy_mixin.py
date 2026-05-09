@@ -1,3 +1,5 @@
+from math import isfinite
+
 from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
@@ -27,6 +29,83 @@ class _DeeployMixin:
       s = "[DEPDBG] " + s
       self.P(s, *args, **kwargs)
     return  
+
+  @staticmethod
+  def _node_specs_number(value):
+    """
+    Normalize resource telemetry numbers for JSON responses.
+    """
+    if value is None or isinstance(value, bool):
+      return None
+    try:
+      number = float(value)
+    except (TypeError, ValueError):
+      return None
+    if not isfinite(number) or number < 0:
+      return None
+    if number.is_integer():
+      return int(number)
+    return round(number, 3)
+
+
+  def _normalize_node_specs_address(self, node_addr):
+    """
+    Normalize a caller-provided node address to the prefixed internal form.
+    """
+    if node_addr is None:
+      return None
+
+    raw_addr = str(node_addr).strip()
+    if not raw_addr:
+      return None
+
+    if hasattr(self, 'bc') and hasattr(self.bc, 'maybe_add_prefix'):
+      return self.bc.maybe_add_prefix(raw_addr)
+
+    return raw_addr if raw_addr.startswith("0xai_") else f"0xai_{raw_addr}"
+
+
+  def _get_node_specs(self, target_nodes):
+    """
+    Return total and live-available CPU, memory, and disk specs for nodes.
+    Values are reported in cores and GB, matching heartbeat telemetry units.
+    """
+    if not isinstance(target_nodes, (list, tuple, set)):
+      raise ValueError("'target_nodes' must be a list of node addresses.")
+
+    result = {}
+    seen = set()
+
+    for node in target_nodes:
+      node_addr = self._normalize_node_specs_address(node)
+      if not node_addr or node_addr in seen:
+        continue
+      seen.add(node_addr)
+
+      try:
+        result[node_addr] = {
+          "node_alias": self.netmon.network_node_eeid(node_addr),
+          "node_is_online": self.netmon.network_node_is_online(node_addr),
+          "cpu": {
+            "total": self._node_specs_number(self.netmon.network_node_total_cpu_cores(node_addr)),
+            "available": self._node_specs_number(self.netmon.network_node_avail_cpu_cores(node_addr)),
+          },
+          "memory": {
+            "total": self._node_specs_number(self.netmon.network_node_total_mem(node_addr)),
+            "available": self._node_specs_number(self.netmon.network_node_avail_mem(node_addr)),
+          },
+          "disk": {
+            "total": self._node_specs_number(self.netmon.network_node_total_disk(node_addr)),
+            "available": self._node_specs_number(self.netmon.network_node_avail_disk(node_addr)),
+          },
+        }
+      except Exception as exc:
+        result[node_addr] = {
+          "error": str(exc),
+        }
+    # endfor target_nodes
+
+    return result
 
 
   def __get_emv_types(self, values):
