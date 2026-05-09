@@ -221,6 +221,7 @@ def _taxii_status(owner):
       "mode": cfg["MODE"],
       "collection_id": cfg["COLLECTION_ID"],
       "token_env": cfg["TOKEN_ENV"],
+      "timeout_seconds": cfg["TIMEOUT_SECONDS"],
     },
   )
 

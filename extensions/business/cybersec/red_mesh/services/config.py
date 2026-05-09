@@ -106,6 +106,7 @@ DEFAULT_TAXII_EXPORT_CONFIG = {
   "TOKEN_ENV": "REDMESH_TAXII_TOKEN",
   "COLLECTION_ID": "",
   "MODE": "publish_manual",
+  "TIMEOUT_SECONDS": 30.0,
 }
 
 _REDACTION_MODES = {"hash_only", "summary", "internal_soc", "custom"}
@@ -450,6 +451,11 @@ def get_taxii_export_config(owner):
         merged.get("MODE"),
         {"publish_manual", "consume_manual"},
         defaults["MODE"],
+      ),
+      "TIMEOUT_SECONDS": _bounded_float(
+        merged.get("TIMEOUT_SECONDS", defaults["TIMEOUT_SECONDS"]),
+        defaults["TIMEOUT_SECONDS"],
+        minimum=0.001,
       ),
     }
 

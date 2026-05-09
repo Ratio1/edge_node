@@ -115,6 +115,7 @@ class CStoreJobRunning:
   detection_correlation: dict = None
   stix_export: dict = None
   opencti_export: dict = None
+  taxii_export: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -148,6 +149,7 @@ class CStoreJobRunning:
       detection_correlation=d.get("detection_correlation"),
       stix_export=d.get("stix_export"),
       opencti_export=d.get("opencti_export"),
+      taxii_export=d.get("taxii_export"),
     )
 
 
@@ -183,6 +185,7 @@ class CStoreJobFinalized:
   detection_correlation: dict = None
   stix_export: dict = None
   opencti_export: dict = None
+  taxii_export: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -214,6 +217,7 @@ class CStoreJobFinalized:
       detection_correlation=d.get("detection_correlation"),
       stix_export=d.get("stix_export"),
       opencti_export=d.get("opencti_export"),
+      taxii_export=d.get("taxii_export"),
     )
 
 

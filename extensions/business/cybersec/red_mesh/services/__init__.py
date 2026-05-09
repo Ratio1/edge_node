@@ -33,6 +33,11 @@ from .opencti_export import (
   get_opencti_export_status,
   push_to_opencti,
 )
+from .taxii_export import (
+  dry_run_taxii_export,
+  get_taxii_export_status,
+  publish_to_taxii,
+)
 from .event_builder import (
   build_attestation_event,
   build_export_status_event,
@@ -188,13 +193,16 @@ __all__ = [
   "build_test_event",
   "contains_sensitive_value",
   "dry_run_opencti_export",
+  "dry_run_taxii_export",
   "export_misp_json",
   "export_stix_bundle",
   "get_misp_export_status",
   "get_opencti_export_status",
   "get_stix_export_status",
+  "get_taxii_export_status",
   "push_to_misp",
   "push_to_opencti",
+  "publish_to_taxii",
   "redact_event_payload",
   "resolve_config_block",
   "stable_hmac_pseudonym",
