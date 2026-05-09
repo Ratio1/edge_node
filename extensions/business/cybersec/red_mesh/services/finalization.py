@@ -12,10 +12,21 @@ from ..constants import (
   RUN_MODE_CONTINUOUS_MONITORING,
   RUN_MODE_SINGLEPASS,
 )
-from ..models import AggregatedScanData, PassReport, PassReportRef, WorkerReportMeta
+from ..models import (
+  AggregatedScanData,
+  PassReport,
+  PassReportRef,
+  WorkerReportMeta,
+  render_legacy_llm_fields,
+)
 from ..repositories import ArtifactRepository, JobStateRepository
 from .config import get_attestation_config
 from .config import get_llm_agent_config
+from .event_hooks import (
+  emit_attestation_status_event,
+  emit_finding_event,
+  emit_lifecycle_event,
+)
 from .scan_strategy import coerce_scan_type, get_scan_strategy
 from .state_machine import is_intermediate_job_status, is_terminal_job_status, set_job_status
 
@@ -136,6 +147,8 @@ def maybe_finalize_pass(owner):
             engagement=job_config.get("engagement") if isinstance(job_config, dict) else None,
           )
           structured_llm_failed = getattr(owner, "_last_structured_llm_failed", None)
+          if llm_report_sections and not structured_llm_failed:
+            llm_text, summary_text = render_legacy_llm_fields(llm_report_sections)
         except Exception as exc:
           owner.P(
             f"Structured LLM call raised for job {job_id}: {exc}",
@@ -201,8 +214,24 @@ def maybe_finalize_pass(owner):
             node_ips=attestation_node_ips,
             report_cid=aggregated_report_cid,
           )
-          if redmesh_test_attestation is not None:
+          if isinstance(redmesh_test_attestation, dict):
             job_specs["last_attestation_at"] = now_ts
+            emit_attestation_status_event(
+              owner,
+              job_specs,
+              state="submitted",
+              network=owner.REDMESH_ATTESTATION_NETWORK,
+              tx_hash=redmesh_test_attestation.get("tx_hash"),
+              pass_nr=job_pass,
+            )
+          elif redmesh_test_attestation is None:
+            emit_attestation_status_event(
+              owner,
+              job_specs,
+              state="skipped",
+              network=owner.REDMESH_ATTESTATION_NETWORK,
+              pass_nr=job_pass,
+            )
         except Exception as exc:
           import traceback
           owner.P(
@@ -212,6 +241,21 @@ def maybe_finalize_pass(owner):
             f"  Traceback:\n{traceback.format_exc()}",
             color='r'
           )
+          emit_attestation_status_event(
+            owner,
+            job_specs,
+            state="failed",
+            network=owner.REDMESH_ATTESTATION_NETWORK,
+            pass_nr=job_pass,
+          )
+      else:
+        emit_attestation_status_event(
+          owner,
+          job_specs,
+          state="skipped",
+          network=owner.REDMESH_ATTESTATION_NETWORK,
+          pass_nr=job_pass,
+        )
 
       worker_scan_metrics = {}
       for addr, report in node_reports.items():
@@ -252,6 +296,33 @@ def maybe_finalize_pass(owner):
       job_specs.setdefault("pass_reports", []).append(
         PassReportRef(job_pass, pass_report_cid, risk_score).to_dict()
       )
+      pass_window_report_refs = {"pass_report_cid": pass_report_cid}
+      if aggregated_report_cid:
+        pass_window_report_refs["aggregated_report_cid"] = aggregated_report_cid
+      pass_window_egress_ips = [
+        meta.get("node_ip") for meta in worker_metas.values()
+        if meta.get("node_ip")
+      ]
+      emit_lifecycle_event(
+        owner,
+        job_specs,
+        event_type="redmesh.job.pass_completed",
+        event_action="pass_completed",
+        event_outcome="success",
+        pass_nr=job_pass,
+        started_at=pass_date_started,
+        actual_end_at=pass_date_completed,
+        expected_egress_ips=pass_window_egress_ips,
+        report_refs=pass_window_report_refs,
+      )
+      for finding in flat_findings or []:
+        emit_finding_event(
+          owner,
+          job_specs,
+          finding=finding,
+          event_action="created",
+          pass_nr=job_pass,
+        )
 
       set_job_status(job_specs, JOB_STATUS_FINALIZING)
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_finalizing")
@@ -275,6 +346,18 @@ def maybe_finalize_pass(owner):
       if job_status == JOB_STATUS_SCHEDULED_FOR_STOP:
         set_job_status(job_specs, JOB_STATUS_STOPPED)
         owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
+        emit_lifecycle_event(
+          owner,
+          job_specs,
+          event_type="redmesh.job.stopped",
+          event_action="stopped",
+          event_outcome="success",
+          pass_nr=job_pass,
+          started_at=pass_date_started,
+          actual_end_at=pass_date_completed,
+          expected_egress_ips=pass_window_egress_ips,
+          report_refs=pass_window_report_refs,
+        )
         if redmesh_test_attestation is not None:
           owner._emit_timeline_event(
             job_specs, "blockchain_submit",
@@ -291,6 +374,18 @@ def maybe_finalize_pass(owner):
       if job_pass >= MAX_CONTINUOUS_PASSES:
         set_job_status(job_specs, JOB_STATUS_STOPPED)
         owner._emit_timeline_event(job_specs, "scan_completed", f"Scan completed (pass {job_pass})")
+        emit_lifecycle_event(
+          owner,
+          job_specs,
+          event_type="redmesh.job.stopped",
+          event_action="stopped",
+          event_outcome="success",
+          pass_nr=job_pass,
+          started_at=pass_date_started,
+          actual_end_at=pass_date_completed,
+          expected_egress_ips=pass_window_egress_ips,
+          report_refs=pass_window_report_refs,
+        )
         owner._emit_timeline_event(
           job_specs,
           "pass_cap_reached",

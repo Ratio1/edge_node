@@ -6,6 +6,7 @@ from ..constants import (
   RUN_MODE_CONTINUOUS_MONITORING,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
+from .event_hooks import emit_lifecycle_event
 from .secrets import collect_secret_refs_from_job_config
 from .state_machine import set_job_status
 
@@ -62,6 +63,14 @@ def stop_and_delete_job(owner, job_id: str):
     worker_entry["canceled"] = True
     set_job_status(job_specs, JOB_STATUS_STOPPED)
     owner._emit_timeline_event(job_specs, "stopped", "Job stopped and deleted", actor_type="user")
+    emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.job.stopped",
+      event_action="stopped",
+      event_outcome="success",
+      pass_nr=job_specs.get("job_pass"),
+    )
     _write_job_record(owner, job_id, job_specs, context="stop_and_delete")
   else:
     owner._log_audit_event("scan_stopped", {"job_id": job_id})
@@ -213,6 +222,14 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
 
     set_job_status(job_specs, JOB_STATUS_STOPPED)
     owner._emit_timeline_event(job_specs, "stopped", "Job stopped", actor_type="user")
+    emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.job.stopped",
+      event_action="stopped",
+      event_outcome="success",
+      pass_nr=job_specs.get("job_pass"),
+    )
     owner.P(f"Hard stop for job {job_id} after {passes_completed} passes")
   else:
     set_job_status(job_specs, JOB_STATUS_SCHEDULED_FOR_STOP)

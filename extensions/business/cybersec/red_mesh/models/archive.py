@@ -354,6 +354,11 @@ class JobArchive:
   date_completed: float
   archive_version: int = JOB_ARCHIVE_VERSION
   start_attestation: dict = None
+  soc_event_status: dict = None
+  detection_correlation: dict = None
+  stix_export: dict = None
+  opencti_export: dict = None
+  taxii_export: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -376,4 +381,9 @@ class JobArchive:
       date_created=d.get("date_created", 0),
       date_completed=d.get("date_completed", 0),
       start_attestation=d.get("start_attestation"),
+      soc_event_status=d.get("soc_event_status"),
+      detection_correlation=d.get("detection_correlation"),
+      stix_export=d.get("stix_export"),
+      opencti_export=d.get("opencti_export"),
+      taxii_export=d.get("taxii_export"),
     )

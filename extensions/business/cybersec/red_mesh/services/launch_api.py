@@ -22,6 +22,7 @@ from ..models import (
 )
 from ..repositories import JobStateRepository
 from .config import get_graybox_budgets_config
+from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
 
 
@@ -558,6 +559,14 @@ def announce_launch(
     actor_type="user"
   )
   owner._emit_timeline_event(job_specs, "started", "Scan started", actor=owner.ee_id, actor_type="node")
+  emit_lifecycle_event(
+    owner,
+    job_specs,
+    event_type="redmesh.job.started",
+    event_action="started",
+    event_outcome="success",
+    pass_nr=1,
+  )
 
   try:
     redmesh_job_start_attestation = owner._submit_redmesh_job_start_attestation(
@@ -565,13 +574,29 @@ def announce_launch(
       job_specs=job_specs,
       workers=workers,
     )
-    if redmesh_job_start_attestation is not None:
+    if isinstance(redmesh_job_start_attestation, dict):
       job_specs["redmesh_job_start_attestation"] = redmesh_job_start_attestation
       owner._emit_timeline_event(
         job_specs, "blockchain_submit",
         "Job-start attestation submitted",
         actor_type="system",
         meta={**redmesh_job_start_attestation, "network": owner.REDMESH_ATTESTATION_NETWORK}
+      )
+      emit_attestation_status_event(
+        owner,
+        job_specs,
+        state="submitted",
+        network=owner.REDMESH_ATTESTATION_NETWORK,
+        tx_hash=redmesh_job_start_attestation.get("tx_hash"),
+        pass_nr=1,
+      )
+    elif redmesh_job_start_attestation is None:
+      emit_attestation_status_event(
+        owner,
+        job_specs,
+        state="skipped",
+        network=owner.REDMESH_ATTESTATION_NETWORK,
+        pass_nr=1,
       )
   except Exception as exc:
     import traceback
@@ -581,6 +606,13 @@ def announce_launch(
       f"  Args: {exc.args}\n"
       f"  Traceback:\n{traceback.format_exc()}",
       color='r'
+    )
+    emit_attestation_status_event(
+      owner,
+      job_specs,
+      state="failed",
+      network=owner.REDMESH_ATTESTATION_NETWORK,
+      pass_nr=1,
     )
 
   write_job_record = getattr(type(owner), "_write_job_record", None)
