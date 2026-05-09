@@ -507,10 +507,6 @@ def export_misp_json(owner, job_id, pass_nr=None):
 
   No MISP server connection needed.
   """
-  cfg = get_misp_export_config(owner)
-  if not cfg["ENABLED"]:
-    return {"status": "disabled", "error": "MISP export is disabled"}
-
   result = build_misp_event(owner, job_id, pass_nr=pass_nr)
   if result["status"] != "ok":
     return result

@@ -210,14 +210,17 @@ class TestStixExport(unittest.TestCase):
     self.assertIsNotNone(status["last_success_at"])
     self.assertIsNone(status["last_error_class"])
 
-  def test_disabled_export_does_not_build_or_persist(self):
+  @patch("extensions.business.cybersec.red_mesh.services.stix_export.emit_export_status_event")
+  def test_disabled_config_still_allows_manual_export(self, emit_status):
     owner = _owner({"ENABLED": False})
 
     result = export_stix_bundle(owner, "job-1")
 
-    self.assertEqual(result["status"], "disabled")
-    owner.r1fs.add_json.assert_not_called()
-    self.assertNotIn("stix_export", owner.job_specs)
+    self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["artifact_cid"], "QmStixBundle")
+    owner.r1fs.add_json.assert_called_once()
+    self.assertIn("stix_export", owner.job_specs)
+    emit_status.assert_called_once()
 
   @patch("extensions.business.cybersec.red_mesh.services.stix_export.emit_export_status_event")
   def test_get_export_status_reads_job_metadata(self, _emit_status):

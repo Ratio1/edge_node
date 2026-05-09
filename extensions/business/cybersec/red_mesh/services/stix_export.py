@@ -479,10 +479,6 @@ def build_stix_bundle(owner, job_id, pass_nr=None):
 
 def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
   """Build and optionally persist a STIX 2.1 bundle for manual export."""
-  cfg = get_stix_export_config(owner)
-  if not cfg["ENABLED"]:
-    return {"status": "disabled", "error": "STIX export is disabled", "job_id": job_id}
-
   job_specs = owner._get_job_from_cstore(job_id)
   if not isinstance(job_specs, dict):
     record_integration_status(owner, "stix", outcome="failure", error_class="job_not_found")

@@ -489,10 +489,11 @@ class TestExportMispJson(unittest.TestCase):
     self.assertIn("misp_event", result)
     self.assertIsInstance(result["misp_event"], dict)
 
-  def test_disabled_returns_status(self):
+  def test_disabled_config_still_returns_manual_json(self):
     owner = _make_integration_owner({"ENABLED": False})
     result = export_misp_json(owner, "test_job_1")
-    self.assertEqual(result["status"], "disabled")
+    self.assertEqual(result["status"], "ok")
+    self.assertIn("misp_event", result)
 
 
 class TestGetMispExportStatus(unittest.TestCase):
