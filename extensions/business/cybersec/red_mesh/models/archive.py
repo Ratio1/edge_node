@@ -356,6 +356,7 @@ class JobArchive:
   start_attestation: dict = None
   soc_event_status: dict = None
   detection_correlation: dict = None
+  stix_export: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -380,4 +381,5 @@ class JobArchive:
       start_attestation=d.get("start_attestation"),
       soc_event_status=d.get("soc_event_status"),
       detection_correlation=d.get("detection_correlation"),
+      stix_export=d.get("stix_export"),
     )

@@ -23,6 +23,11 @@ from .misp_export import (
   get_misp_export_status,
   push_to_misp,
 )
+from .stix_export import (
+  build_stix_bundle,
+  export_stix_bundle,
+  get_stix_export_status,
+)
 from .event_builder import (
   build_attestation_event,
   build_export_status_event,
@@ -171,13 +176,16 @@ __all__ = [
   "build_finding_event",
   "build_lifecycle_event",
   "build_misp_event",
+  "build_stix_bundle",
   "build_redmesh_event",
   "build_service_observed_event",
   "build_target_ref",
   "build_test_event",
   "contains_sensitive_value",
   "export_misp_json",
+  "export_stix_bundle",
   "get_misp_export_status",
+  "get_stix_export_status",
   "push_to_misp",
   "redact_event_payload",
   "resolve_config_block",

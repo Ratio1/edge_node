@@ -113,6 +113,7 @@ class CStoreJobRunning:
   last_attestation_at: float = None
   soc_event_status: dict = None
   detection_correlation: dict = None
+  stix_export: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -144,6 +145,7 @@ class CStoreJobRunning:
       last_attestation_at=d.get("last_attestation_at"),
       soc_event_status=d.get("soc_event_status"),
       detection_correlation=d.get("detection_correlation"),
+      stix_export=d.get("stix_export"),
     )
 
 
@@ -177,6 +179,7 @@ class CStoreJobFinalized:
   misp_export: dict = None          # MISP export metadata (event_uuid, passes_exported, etc.)
   soc_event_status: dict = None
   detection_correlation: dict = None
+  stix_export: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -206,6 +209,7 @@ class CStoreJobFinalized:
       misp_export=d.get("misp_export"),
       soc_event_status=d.get("soc_event_status"),
       detection_correlation=d.get("detection_correlation"),
+      stix_export=d.get("stix_export"),
     )
 
 
