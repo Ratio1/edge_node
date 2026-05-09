@@ -80,6 +80,7 @@ from extensions.business.cybersec.red_mesh.models.llm_output import (
   SEVERITY_WARNING,
   ValidationIssue,
   ValidationResult,
+  render_legacy_llm_fields,
   validate_llm_output,
 )
 
@@ -133,5 +134,6 @@ __all__ = [
   "SEVERITY_WARNING",
   "ValidationIssue",
   "ValidationResult",
+  "render_legacy_llm_fields",
   "validate_llm_output",
 ]

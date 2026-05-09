@@ -12,7 +12,13 @@ from ..constants import (
   RUN_MODE_CONTINUOUS_MONITORING,
   RUN_MODE_SINGLEPASS,
 )
-from ..models import AggregatedScanData, PassReport, PassReportRef, WorkerReportMeta
+from ..models import (
+  AggregatedScanData,
+  PassReport,
+  PassReportRef,
+  WorkerReportMeta,
+  render_legacy_llm_fields,
+)
 from ..repositories import ArtifactRepository, JobStateRepository
 from .config import get_attestation_config
 from .config import get_llm_agent_config
@@ -141,6 +147,8 @@ def maybe_finalize_pass(owner):
             engagement=job_config.get("engagement") if isinstance(job_config, dict) else None,
           )
           structured_llm_failed = getattr(owner, "_last_structured_llm_failed", None)
+          if llm_report_sections and not structured_llm_failed:
+            llm_text, summary_text = render_legacy_llm_fields(llm_report_sections)
         except Exception as exc:
           owner.P(
             f"Structured LLM call raised for job {job_id}: {exc}",

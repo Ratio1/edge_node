@@ -1195,7 +1195,13 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._emit_timeline_event = MagicMock()
     def _structured_success(*_args, **_kwargs):
       plugin._last_structured_llm_failed = False
-      return {"background_draft": "Structured summary", "overall_posture": "Structured posture"}
+      return {
+        "executive_headline": "Structured headline",
+        "background_draft": "Structured summary",
+        "overall_posture": "Structured posture",
+        "recommendation_summary": ["Patch exposed services"],
+        "conclusion": "Structured conclusion",
+      }
 
     plugin._run_structured_report_sections = MagicMock(side_effect=_structured_success)
     plugin._run_aggregated_llm_analysis = MagicMock(side_effect=AssertionError("legacy raw LLM path must not run"))
@@ -1206,6 +1212,10 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin._run_quick_summary_analysis.assert_not_called()
     plugin._run_aggregated_llm_analysis.assert_not_called()
     plugin._run_structured_report_sections.assert_called_once()
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(pass_report_dict["quick_summary"], "Structured headline")
+    self.assertIn("## Overall Posture", pass_report_dict["llm_analysis"])
+    self.assertIn("Structured posture", pass_report_dict["llm_analysis"])
 
   def test_pass_reports_survive_typed_job_record_rewrites(self):
     """Pass reports must stay attached after typed repository rewrites the job dict."""
@@ -2146,6 +2156,64 @@ class TestPhase5Endpoints(unittest.TestCase):
     result = Plugin.get_job_archive(plugin, job_id="run-job")
     self.assertEqual(result["error"], "not_available")
 
+  def test_manual_structured_analysis_backfills_legacy_fields(self):
+    """Manual structured analysis updates the pass report for get_analysis compatibility."""
+    Plugin = self._get_plugin_class()
+    job_specs = self._build_running_job("job-llm", pass_count=1)
+    for worker in job_specs["workers"].values():
+      worker["finished"] = True
+      worker["report_cid"] = "QmWorkerReport"
+
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.cfg_llm_agent = {
+      "ENABLED": True,
+      "TIMEOUT": 30,
+      "AUTO_ANALYSIS_TYPE": "security_assessment",
+    }
+    plugin.cfg_llm_agent_api_port = 8080
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.get_json.return_value = {
+      "pass_nr": 1,
+      "aggregated_report_cid": "QmAgg1",
+      "worker_reports": {"worker-A": {}},
+    }
+    plugin.r1fs.add_json.return_value = "QmUpdatedPass"
+    plugin.chainstore_hget.side_effect = lambda hkey, key: job_specs if key == "job-llm" else None
+    plugin.chainstore_hset = MagicMock()
+    plugin.P = MagicMock()
+    plugin._log_audit_event = MagicMock()
+    plugin._emit_timeline_event = MagicMock()
+    plugin._get_job_from_cstore = MagicMock(return_value=job_specs)
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": {"open_ports": [443]}})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [443],
+      "service_info": {},
+      "web_tests_info": {},
+    })
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
+
+    def _structured_success(*_args, **_kwargs):
+      plugin._last_structured_llm_failed = False
+      return {
+        "executive_headline": "Manual structured headline",
+        "overall_posture": "Manual structured posture",
+        "recommendation_summary": ["Review internet exposure"],
+        "conclusion": "Manual structured conclusion",
+      }
+
+    plugin._run_structured_report_sections = MagicMock(side_effect=_structured_success)
+
+    result = Plugin.analyze_job(plugin, job_id="job-llm")
+
+    updated_pass = plugin.r1fs.add_json.call_args[0][0]
+    self.assertEqual(result["analysis_type"], "structured_report_sections")
+    self.assertEqual(job_specs["pass_reports"][-1]["report_cid"], "QmUpdatedPass")
+    self.assertEqual(updated_pass["quick_summary"], "Manual structured headline")
+    self.assertIn("Manual structured posture", updated_pass["llm_analysis"])
+    self.assertIn("Review internet exposure", updated_pass["llm_analysis"])
+
   def test_get_job_archive_integrity_mismatch(self):
     """Corrupted job_cid pointing to wrong archive is rejected."""
     Plugin = self._get_plugin_class()
@@ -2561,6 +2629,42 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["quick_summary"], "Archive-backed summary")
     self.assertEqual(result["num_workers"], 2)
     self.assertEqual(result["total_passes"], 1)
+
+  def test_get_analysis_finalized_derives_legacy_fields_from_structured_sections(self):
+    """Structured-only archives still satisfy the legacy get_analysis contract."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("fin-job")
+    plugin = self._build_plugin({"fin-job": stub})
+    plugin.r1fs.get_json.return_value = {
+      "archive_version": JOB_ARCHIVE_VERSION,
+      "job_id": "fin-job",
+      "passes": [
+        {
+          "pass_nr": 1,
+          "date_completed": 10.0,
+          "aggregated_report_cid": "QmAgg1",
+          "llm_report_sections": {
+            "executive_headline": "Structured archive headline",
+            "overall_posture": "Structured archive posture",
+            "recommendation_summary": ["Reduce exposed services"],
+            "conclusion": "Structured archive conclusion",
+          },
+          "worker_reports": {"node-A": {}},
+        },
+      ],
+      "ui_aggregate": {},
+      "job_config": {"target": "10.0.0.1"},
+      "timeline": [],
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }
+
+    result = Plugin.get_analysis(plugin, job_id="fin-job")
+
+    self.assertEqual(result["quick_summary"], "Structured archive headline")
+    self.assertIn("Structured archive posture", result["analysis"])
+    self.assertIn("Reduce exposed services", result["analysis"])
 
   def test_get_analysis_finalized_reports_llm_failed_from_archive(self):
     """Finalized archive reads surface llm_failed instead of pretending pass history is missing."""
