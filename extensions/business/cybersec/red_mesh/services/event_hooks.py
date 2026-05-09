@@ -3,8 +3,9 @@ from __future__ import annotations
 import os
 from datetime import datetime, timezone
 
-from .config import get_event_export_config, get_wazuh_export_config
+from .config import get_event_export_config, get_suricata_correlation_config, get_wazuh_export_config
 from .event_builder import (
+  build_assessment_window,
   build_attestation_event,
   build_export_status_event,
   build_finding_event,
@@ -28,6 +29,30 @@ def _tenant_id(owner):
 
 def _environment(owner):
   return str(getattr(owner, "cfg_ee_node_network", "") or "")
+
+
+def _job_specs_for_event(owner, job_specs):
+  specs = dict(job_specs or {})
+  config = {}
+  getter = getattr(owner, "_get_job_config", None)
+  if callable(getter):
+    try:
+      config = getter(job_specs, resolve_secrets=False) or {}
+    except Exception:
+      config = {}
+  if not isinstance(config, dict):
+    config = {}
+  if not specs.get("authorized"):
+    specs["authorized"] = bool(config.get("authorized", False))
+  if not specs.get("authorization_id"):
+    specs["authorization_id"] = config.get("scope_id") or config.get("authorization_id")
+  if not specs.get("authorization_ref"):
+    typed_auth = config.get("authorization") if isinstance(config.get("authorization"), dict) else {}
+    specs["authorization_ref"] = (
+      config.get("authorization_ref")
+      or typed_auth.get("document_cid")
+    )
+  return specs
 
 
 def _event_export_secret(owner):
@@ -122,6 +147,33 @@ def _skip_result(reason):
   return {"status": "skipped", "integration_id": "wazuh", "error": reason}
 
 
+def _assessment_window(
+  owner,
+  job_specs,
+  hmac_secret,
+  *,
+  pass_nr=None,
+  started_at=None,
+  expected_end_at=None,
+  actual_end_at=None,
+  expected_egress_ips=None,
+  report_refs=None,
+):
+  cfg = get_suricata_correlation_config(owner)
+  return build_assessment_window(
+    job_specs,
+    hmac_secret=hmac_secret,
+    pass_nr=pass_nr,
+    started_at=started_at,
+    expected_end_at=expected_end_at,
+    actual_end_at=actual_end_at,
+    expected_egress_ips=expected_egress_ips,
+    report_refs=report_refs,
+    grace_seconds=cfg["MATCH_WINDOW_SECONDS"],
+    clock_skew_seconds=cfg["CLOCK_SKEW_SECONDS"],
+  )
+
+
 def emit_redmesh_event(owner, job_specs, event):
   """Best-effort automatic SOC event delivery. Never raises into scan paths."""
   enabled, reason = _automatic_export_enabled(owner)
@@ -151,13 +203,44 @@ def emit_redmesh_event(owner, job_specs, event):
   return result
 
 
-def emit_lifecycle_event(owner, job_specs, *, event_type, event_action, event_outcome="success", pass_nr=None):
+def emit_lifecycle_event(
+  owner,
+  job_specs,
+  *,
+  event_type,
+  event_action,
+  event_outcome="success",
+  pass_nr=None,
+  started_at=None,
+  expected_end_at=None,
+  actual_end_at=None,
+  expected_egress_ips=None,
+  report_refs=None,
+):
   secret, error = _event_export_secret(owner)
   if error:
     record_integration_status(owner, "wazuh", outcome="failure", error_class=error)
     return _skip_result(error)
+  if actual_end_at is None and event_type in {"redmesh.job.pass_completed", "redmesh.job.stopped"}:
+    time_fn = getattr(owner, "time", None)
+    if callable(time_fn):
+      candidate = time_fn()
+      if isinstance(candidate, (int, float, str)):
+        actual_end_at = candidate
+  event_specs = _job_specs_for_event(owner, job_specs)
+  window = _assessment_window(
+    owner,
+    event_specs,
+    secret,
+    pass_nr=pass_nr,
+    started_at=started_at,
+    expected_end_at=expected_end_at,
+    actual_end_at=actual_end_at,
+    expected_egress_ips=expected_egress_ips,
+    report_refs=report_refs,
+  )
   event = build_lifecycle_event(
-    job_specs,
+    event_specs,
     event_type=event_type,
     event_action=event_action,
     event_outcome=event_outcome,
@@ -165,6 +248,8 @@ def emit_lifecycle_event(owner, job_specs, *, event_type, event_action, event_ou
     tenant_id=_tenant_id(owner),
     environment=_environment(owner),
     pass_nr=pass_nr,
+    assessment_window=window,
+    artifact_refs=report_refs,
   )
   return emit_redmesh_event(owner, job_specs, event)
 

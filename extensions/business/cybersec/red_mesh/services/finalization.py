@@ -288,6 +288,13 @@ def maybe_finalize_pass(owner):
       job_specs.setdefault("pass_reports", []).append(
         PassReportRef(job_pass, pass_report_cid, risk_score).to_dict()
       )
+      pass_window_report_refs = {"pass_report_cid": pass_report_cid}
+      if aggregated_report_cid:
+        pass_window_report_refs["aggregated_report_cid"] = aggregated_report_cid
+      pass_window_egress_ips = [
+        meta.get("node_ip") for meta in worker_metas.values()
+        if meta.get("node_ip")
+      ]
       emit_lifecycle_event(
         owner,
         job_specs,
@@ -295,6 +302,10 @@ def maybe_finalize_pass(owner):
         event_action="pass_completed",
         event_outcome="success",
         pass_nr=job_pass,
+        started_at=pass_date_started,
+        actual_end_at=pass_date_completed,
+        expected_egress_ips=pass_window_egress_ips,
+        report_refs=pass_window_report_refs,
       )
       for finding in flat_findings or []:
         emit_finding_event(
@@ -334,6 +345,10 @@ def maybe_finalize_pass(owner):
           event_action="stopped",
           event_outcome="success",
           pass_nr=job_pass,
+          started_at=pass_date_started,
+          actual_end_at=pass_date_completed,
+          expected_egress_ips=pass_window_egress_ips,
+          report_refs=pass_window_report_refs,
         )
         if redmesh_test_attestation is not None:
           owner._emit_timeline_event(
@@ -358,6 +373,10 @@ def maybe_finalize_pass(owner):
           event_action="stopped",
           event_outcome="success",
           pass_nr=job_pass,
+          started_at=pass_date_started,
+          actual_end_at=pass_date_completed,
+          expected_egress_ips=pass_window_egress_ips,
+          report_refs=pass_window_report_refs,
         )
         owner._emit_timeline_event(
           job_specs,

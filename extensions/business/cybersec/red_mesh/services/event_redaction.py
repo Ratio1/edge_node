@@ -121,6 +121,31 @@ def redact_event_payload(
       worker["expected_egress_ip_pseudonym"] = stable_hmac_pseudonym(egress_ip, hmac_secret, prefix="ip")
       worker["expected_egress_ip"] = None
 
+  window = event.get("window")
+  if isinstance(window, dict):
+    raw_egress_ips = window.pop("expected_egress_ips", None)
+    if isinstance(raw_egress_ips, list) and raw_egress_ips:
+      if include_egress_ip:
+        window["expected_egress_ips"] = raw_egress_ips
+      else:
+        existing = window.get("expected_egress_ip_pseudonyms")
+        pseudonyms = list(existing) if isinstance(existing, list) else []
+        for ip in raw_egress_ips:
+          pseudonym = stable_hmac_pseudonym(ip, hmac_secret, prefix="ip")
+          if pseudonym not in pseudonyms:
+            pseudonyms.append(pseudonym)
+        window["expected_egress_ip_pseudonyms"] = pseudonyms
+        window["expected_egress_ip_count"] = max(
+          int(window.get("expected_egress_ip_count") or 0),
+          len(raw_egress_ips),
+        )
+    for key in ("target_value", "target_ip", "target_url", "target_hostname"):
+      raw_target = window.pop(key, None)
+      if raw_target and not window.get("target_pseudonym"):
+        window["target_pseudonym"] = stable_hmac_pseudonym(raw_target, hmac_secret, prefix="target")
+    if not include_target_display:
+      window["target_display"] = None
+
   observation = event.get("observation")
   if isinstance(observation, dict):
     banner = observation.get("banner")

@@ -21,6 +21,19 @@ def _utc_timestamp():
   return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def _iso_timestamp_from_value(value):
+  if value in (None, ""):
+    return None
+  if isinstance(value, (int, float)):
+    return (
+      datetime.fromtimestamp(value, timezone.utc)
+      .replace(microsecond=0)
+      .isoformat()
+      .replace("+00:00", "Z")
+    )
+  return str(value)
+
+
 def _normalized_severity(value):
   normalized = str(value or "INFO").strip().upper()
   return normalized if normalized in EVENT_SEVERITIES else "INFO"
@@ -75,6 +88,138 @@ def build_target_ref(target_value, *, hmac_secret, target_type="host", include_d
     "display": str(target_value) if include_display else None,
   }
   return target
+
+
+def _unique_strings(values):
+  seen = set()
+  result = []
+  for value in values or []:
+    text = str(value or "").strip()
+    if text and text not in seen:
+      seen.add(text)
+      result.append(text)
+  return result
+
+
+def _coerce_int(value, default=0):
+  try:
+    return int(value)
+  except (TypeError, ValueError):
+    return default
+
+
+def _expected_egress_ips(job_specs, explicit=None):
+  candidates = []
+  if explicit:
+    candidates.extend(explicit)
+  for key in ("expected_egress_ips", "egress_ips", "source_ips"):
+    value = job_specs.get(key)
+    if isinstance(value, list):
+      candidates.extend(value)
+  workers = job_specs.get("workers")
+  if isinstance(workers, dict):
+    for worker in workers.values():
+      if not isinstance(worker, dict):
+        continue
+      for key in ("expected_egress_ip", "source_ip", "node_ip"):
+        if worker.get(key):
+          candidates.append(worker.get(key))
+  return _unique_strings(candidates)
+
+
+def _source_node_ids(job_specs):
+  workers = job_specs.get("workers")
+  if isinstance(workers, dict):
+    return sorted(_unique_strings(workers.keys()))
+  selected = job_specs.get("selected_peers")
+  return sorted(_unique_strings(selected if isinstance(selected, list) else []))
+
+
+def _latest_report_refs(job_specs):
+  refs = {}
+  pass_reports = job_specs.get("pass_reports")
+  if isinstance(pass_reports, list) and pass_reports:
+    latest = pass_reports[-1]
+    if isinstance(latest, dict):
+      if latest.get("report_cid"):
+        refs["pass_report_cid"] = latest.get("report_cid")
+      if latest.get("pass_nr") is not None:
+        refs["pass_nr"] = latest.get("pass_nr")
+  for key in ("job_cid", "job_config_cid"):
+    if job_specs.get(key):
+      refs[key] = job_specs.get(key)
+  return refs or None
+
+
+def build_assessment_window(
+  job_specs,
+  *,
+  hmac_secret,
+  pass_nr=None,
+  started_at=None,
+  expected_end_at=None,
+  actual_end_at=None,
+  expected_egress_ips=None,
+  report_refs=None,
+  grace_seconds=300,
+  clock_skew_seconds=60,
+):
+  job_specs = job_specs or {}
+  start_port = _coerce_int(job_specs.get("start_port"), 0)
+  end_port = _coerce_int(job_specs.get("end_port"), start_port)
+  exceptions = [
+    _coerce_int(port)
+    for port in (job_specs.get("exceptions") or [])
+    if _coerce_int(port) > 0
+  ]
+  total_ports = max(0, end_port - start_port + 1)
+  source_nodes = _source_node_ids(job_specs)
+  egress_ips = _expected_egress_ips(job_specs, expected_egress_ips)
+  protocols = job_specs.get("protocols")
+  if not isinstance(protocols, list) or not protocols:
+    protocols = ["tcp", "http"] if job_specs.get("scan_type") == "webapp" else ["tcp"]
+
+  resolved_report_refs = report_refs or _latest_report_refs(job_specs)
+  resolved_expected_end_at = (
+    expected_end_at
+    if expected_end_at is not None
+    else job_specs.get("expected_end_at") or job_specs.get("next_pass_at")
+  )
+  return {
+    "schema_version": "1.0.0",
+    "pass_nr": pass_nr if pass_nr is not None else job_specs.get("job_pass"),
+    "started_at": _iso_timestamp_from_value(started_at if started_at is not None else job_specs.get("date_created")),
+    "expected_end_at": _iso_timestamp_from_value(resolved_expected_end_at),
+    "actual_end_at": _iso_timestamp_from_value(actual_end_at if actual_end_at is not None else job_specs.get("date_completed")),
+    "grace_seconds": _coerce_int(grace_seconds, 300),
+    "clock_skew_seconds": _coerce_int(clock_skew_seconds, 60),
+    "source_node_ids": source_nodes,
+    "source_node_count": len(source_nodes),
+    "expected_egress_ip_pseudonyms": [
+      stable_hmac_pseudonym(ip, hmac_secret, prefix="ip")
+      for ip in egress_ips
+    ],
+    "expected_egress_ip_count": len(egress_ips),
+    "target_pseudonym": (
+      stable_hmac_pseudonym(job_specs.get("target"), hmac_secret, prefix="target")
+      if job_specs.get("target")
+      else None
+    ),
+    "target_display": None,
+    "ports": {
+      "start": start_port,
+      "end": end_port,
+      "count": max(0, total_ports - len(set(exceptions))),
+      "exceptions": exceptions[:128],
+    },
+    "protocols": _unique_strings(protocols),
+    "authorization_context": {
+      "authorized": bool(job_specs.get("authorized", False)),
+      "authorization_id": job_specs.get("authorization_id"),
+      "authorization_ref": job_specs.get("authorization_ref"),
+    },
+    "report_refs": resolved_report_refs,
+  }
 
 
 def build_redmesh_event(
@@ -178,8 +323,15 @@ def build_lifecycle_event(
   tenant_id="",
   environment="",
   pass_nr=None,
+  assessment_window=None,
+  artifact_refs=None,
 ):
   job_specs = job_specs or {}
+  window = assessment_window if assessment_window is not None else build_assessment_window(
+    job_specs,
+    hmac_secret=hmac_secret,
+    pass_nr=pass_nr,
+  )
   target = build_target_ref(job_specs.get("target"), hmac_secret=hmac_secret)
   return build_redmesh_event(
     event_type=event_type,
@@ -194,6 +346,8 @@ def build_lifecycle_event(
     authorization_id=job_specs.get("authorization_id"),
     authorization_ref=job_specs.get("authorization_ref"),
     target=target,
+    window=window,
+    artifact_refs=artifact_refs,
     tenant_id=tenant_id,
     environment=environment,
     hmac_secret=hmac_secret,
