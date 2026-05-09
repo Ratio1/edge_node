@@ -40,6 +40,11 @@ from .event_redaction import (
   stable_sha256,
   strip_sensitive_fields,
 )
+from .integration_status import (
+  get_integration_status,
+  record_integration_status,
+  test_event_export,
+)
 from .control import (
   purge_job,
   stop_and_delete_job,
@@ -167,6 +172,7 @@ __all__ = [
   "get_job_archive",
   "get_job_data",
   "get_job_progress",
+  "get_integration_status",
   "is_intermediate_job_status",
   "is_terminal_job_status",
   "iter_scan_strategies",
@@ -190,9 +196,11 @@ __all__ = [
   "DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS",
   "reconcile_job_workers",
   "reconcile_workers_from_live",
+  "record_integration_status",
   "set_job_status",
   "stop_and_delete_job",
   "stop_monitoring",
+  "test_event_export",
   "get_job_archive_with_triage",
   "get_job_triage",
   "update_finding_triage",
