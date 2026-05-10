@@ -123,7 +123,33 @@ class TestEventLifecycleHooks(unittest.TestCase):
     self.assertIsNone(result["integration_id"])
     soc_status = job_specs["soc_event_status"]
     self.assertIsNone(soc_status["last_adapter"])
-    self.assertEqual(soc_status["history"][-1]["adapter"], None)
+    self.assertEqual(soc_status.get("history") or [], [])
+    self.assertFalse(owner._emit_timeline_event.called)
+    deliver.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
+  def test_disabled_skips_do_not_pollute_history_or_timeline(self, deliver):
+    owner = _owner(wazuh_export={"ENABLED": False})
+    job_specs = _job_specs()
+
+    for event_action, event_type in [
+      ("started", "redmesh.job.started"),
+      ("pass_completed", "redmesh.job.pass_completed"),
+      ("completed", "redmesh.job.completed"),
+    ]:
+      emit_lifecycle_event(
+        owner,
+        job_specs,
+        event_type=event_type,
+        event_action=event_action,
+        pass_nr=1,
+      )
+
+    soc_status = job_specs["soc_event_status"]
+    self.assertEqual(soc_status.get("history") or [], [])
+    self.assertEqual(soc_status["last_event_type"], "redmesh.job.completed")
+    self.assertEqual(soc_status["last_error_class"], "wazuh_disabled")
+    self.assertFalse(owner._emit_timeline_event.called)
     deliver.assert_not_called()
 
   @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")

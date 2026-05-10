@@ -75,6 +75,15 @@ def _automatic_export_enabled(owner):
   return True, None
 
 
+def _is_disabled_skip(result):
+  if not isinstance(result, dict):
+    return False
+  if result.get("status") != "skipped":
+    return False
+  reason = result.get("error")
+  return isinstance(reason, str) and reason.endswith("_disabled")
+
+
 def _safe_timeline(owner, job_specs, event_type, label, meta):
   emit = getattr(owner, "_emit_timeline_event", None)
   if not callable(emit) or not isinstance(job_specs, dict):
@@ -113,6 +122,10 @@ def _record_job_soc_status(owner, job_specs, event, result):
   if event_type.startswith("redmesh.attestation."):
     status["last_attestation_event_status"] = result.get("status")
     status["last_attestation_event_id"] = event.get("event_id")
+
+  if _is_disabled_skip(result):
+    job_specs["soc_event_status"] = status
+    return
 
   history = list(status.get("history") or [])
   history.append({
