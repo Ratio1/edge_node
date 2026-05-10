@@ -92,7 +92,7 @@ def _record_job_soc_status(owner, job_specs, event, result):
   status = dict(job_specs.get("soc_event_status") or {})
   status["schema_version"] = SOC_EVENT_STATUS_SCHEMA_VERSION
   status["last_updated_at"] = _utc_timestamp()
-  status["last_adapter"] = result.get("integration_id") or "wazuh"
+  status["last_adapter"] = result.get("integration_id")
   status["last_status"] = result.get("status")
   status["last_event_id"] = event.get("event_id")
   status["last_event_type"] = event.get("event_type")
@@ -144,7 +144,7 @@ def _record_job_soc_status(owner, job_specs, event, result):
 
 
 def _skip_result(reason):
-  return {"status": "skipped", "integration_id": "wazuh", "error": reason}
+  return {"status": "skipped", "integration_id": None, "error": reason}
 
 
 def _assessment_window(
