@@ -695,7 +695,14 @@ class ThHfModelBase(BaseServingProcess):
 
   def _runtime_allows_remote_code(self, manifest, runtime_config):
     """Return whether the selected runtime explicitly allows Python artifact code."""
-    return isinstance(runtime_config, dict) and bool(runtime_config.get("trust_remote_code"))
+    if isinstance(runtime_config, dict) and "trust_remote_code" in runtime_config:
+      return bool(runtime_config.get("trust_remote_code"))
+    # TODO: replace this temporary compatibility path with declarative ONNX
+    # decoders (for example multihead_classification_v1) so artifact Python
+    # does not execute unless each runtime explicitly opts into remote code.
+    # This currently preserves legacy Sentinel ONNX artifacts whose decoder is
+    # a reviewed contract file but whose manifest predates runtime-level trust.
+    return bool(self.cfg_trust_remote_code)
 
   def _load_hf_contract_decoder(self, model_dir, manifest, runtime_config):
     """Load the artifact decoder function declared by the selected HF runtime."""
@@ -713,8 +720,8 @@ class ThHfModelBase(BaseServingProcess):
       runtime_config=runtime_config,
     ):
       raise ValueError(
-        "HF ONNX artifact decoder requires global TRUST_REMOTE_CODE=True and runtime "
-        f"trust_remote_code=True because it executes Python code from {decoder_path}."
+        "HF ONNX artifact decoder requires TRUST_REMOTE_CODE=True and no explicit "
+        f"runtime trust_remote_code=False because it executes Python code from {decoder_path}."
       )
     module_name = f"hf_artifact_contract_{abs(hash(str(decoder_path)))}"
     spec = importlib.util.spec_from_file_location(module_name, decoder_path)

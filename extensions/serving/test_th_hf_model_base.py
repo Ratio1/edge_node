@@ -654,14 +654,14 @@ class ThHfModelBaseTests(unittest.TestCase):
         encoding="utf-8",
       )
 
-      with self.assertRaisesRegex(ValueError, "runtime trust_remote_code=True"):
+      with self.assertRaisesRegex(ValueError, "runtime trust_remote_code=False"):
         plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
           model_dir=str(model_dir),
           manifest={},
           runtime_config={"decoder": "contract.py", "trust_remote_code": False},
         )
 
-  def test_top_level_manifest_trust_remote_code_does_not_enable_runtime_decoder(self):
+  def test_missing_runtime_trust_remote_code_temporarily_inherits_global_trust(self):
     plugin = _ConcreteHfModel(
       MODEL_NAME="test/model",
       DEVICE="cpu",
@@ -676,12 +676,13 @@ class ThHfModelBaseTests(unittest.TestCase):
         encoding="utf-8",
       )
 
-      with self.assertRaisesRegex(ValueError, "runtime trust_remote_code=True"):
-        plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
-          model_dir=str(model_dir),
-          manifest={"trust_remote_code": True},
-          runtime_config={"decoder": "contract.py"},
-        )
+      decoder = plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
+        model_dir=str(model_dir),
+        manifest={},
+        runtime_config={"decoder": "contract.py"},
+      )
+
+      self.assertEqual(decoder({"ok": True}, {}), {"ok": True})
 
   def test_hf_artifact_paths_must_stay_inside_snapshot(self):
     plugin = _ConcreteHfModel(MODEL_NAME="test/model")
