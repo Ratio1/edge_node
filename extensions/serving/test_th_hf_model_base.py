@@ -174,6 +174,22 @@ class _ConcreteHfModel(ThHfModelBase):
   pass
 
 
+class _FallbackManifestHfModel(ThHfModelBase):
+  def _get_hf_onnx_fallback_manifest(self):
+    return {
+      "runtimes": {
+        "onnx_fp32": {
+          "runtime": "onnxruntime",
+          "files": ["model.onnx"],
+          "inline_schema": {
+            "inputs": [{"name": "input_ids", "dtype": "int64"}],
+            "outputs": [{"name": "scores"}],
+          },
+        },
+      },
+    }
+
+
 class ThHfModelBaseTests(unittest.TestCase):
   def setUp(self):
     _PIPELINE_FACTORY.calls = []
@@ -366,6 +382,58 @@ class ThHfModelBaseTests(unittest.TestCase):
     self.assertEqual(download_calls[0][0], "onnx_fp32")
     self.assertIn("model.onnx", download_calls[0][2])
     self.assertNotIn("model.safetensors", download_calls[0][2])
+
+  def test_auto_runtime_uses_subclass_onnx_fallback_manifest_when_hf_manifest_missing(self):
+    plugin = _FallbackManifestHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    download_calls = []
+    plugin._download_hf_artifact_file = (  # pylint: disable=protected-access
+      lambda filename: (_ for _ in ()).throw(RuntimeError("not found"))
+    )
+    plugin._download_hf_runtime_snapshot = (  # pylint: disable=protected-access
+      lambda runtime_key, runtime_config, allow_patterns: download_calls.append(
+        (runtime_key, runtime_config, allow_patterns)
+      ) or "/tmp/models/test-model"
+    )
+    plugin._build_hf_onnx_artifact_pipeline = (  # pylint: disable=protected-access
+      lambda model_dir, runtime_key, runtime_config, manifest: _FakePipeline(task="text-classification")
+    )
+
+    plugin.startup()
+
+    self.assertEqual(plugin.hf_runtime, "onnx_fp32")
+    self.assertEqual(download_calls[0][0], "onnx_fp32")
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 0)
+    self.assertTrue(
+      any("using subclass ONNX fallback manifest" in message[0][0] for message in plugin.logged_messages)
+    )
+
+  def test_forced_onnx_runtime_uses_subclass_fallback_manifest_when_hf_manifest_missing(self):
+    plugin = _FallbackManifestHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      HF_RUNTIME="onnx",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    plugin._download_hf_artifact_file = (  # pylint: disable=protected-access
+      lambda filename: (_ for _ in ()).throw(RuntimeError("not found"))
+    )
+    plugin._download_hf_runtime_snapshot = (  # pylint: disable=protected-access
+      lambda runtime_key, runtime_config, allow_patterns: "/tmp/models/test-model"
+    )
+    plugin._build_hf_onnx_artifact_pipeline = (  # pylint: disable=protected-access
+      lambda model_dir, runtime_key, runtime_config, manifest: _FakePipeline(task="text-classification")
+    )
+
+    plugin.startup()
+
+    self.assertEqual(plugin.hf_runtime, "onnx_fp32")
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 0)
 
   def test_auto_runtime_keeps_transformers_pipeline_when_gpu_available(self):
     plugin = _ConcreteHfModel(
@@ -722,6 +790,7 @@ class ThHfModelBaseTests(unittest.TestCase):
           '{"inputs":[{"name":"input_ids","dtype":"int64"},'
           '{"name":"attention_mask","dtype":"int64"}],'
           '"outputs":[{"name":"scores"}],'
+          '"tokenizer_kwargs":{"return_offsets_mapping":true},'
           '"models":{"onnx_fp32":{"path":"model.onnx"}}}'
         ),
         encoding="utf-8",
@@ -773,6 +842,7 @@ class ThHfModelBaseTests(unittest.TestCase):
     self.assertEqual(output_names, ["scores"])
     self.assertEqual(inputs["input_ids"].dtype, "int64")
     self.assertEqual(fake_tokenizer.calls[-1][1]["return_tensors"], "np")
+    self.assertTrue(fake_tokenizer.calls[-1][1]["return_offsets_mapping"])
 
 
 if __name__ == "__main__":

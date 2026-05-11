@@ -105,6 +105,10 @@ class HfOnnxArtifactPipeline:
       "return_tensors": "np",
       "truncation": bool(inference_kwargs.get("truncation", True)),
     }
+    for source in (self.schema, self.runtime_config):
+      extra_tokenize_kwargs = source.get("tokenizer_kwargs") if isinstance(source, dict) else None
+      if isinstance(extra_tokenize_kwargs, dict):
+        tokenize_kwargs.update(extra_tokenize_kwargs)
     max_length = self._get_max_length(inference_kwargs)
     if max_length is not None:
       tokenize_kwargs["max_length"] = max_length
@@ -179,7 +183,7 @@ class HfOnnxArtifactPipeline:
       for output_name, output_value in zip(output_names, raw_outputs)
     }
 
-  def _call_decoder(self, outputs_by_name, text, inference_kwargs):
+  def _call_decoder(self, outputs_by_name, text, encoded, inference_kwargs):
     if self.decoder is None:
       return outputs_by_name
     decoder_kwargs = {
@@ -188,6 +192,8 @@ class HfOnnxArtifactPipeline:
       "runtime_key": self.runtime_key,
       "text": text,
       "repo_id": self.repo_id,
+      "tokenizer_output": encoded,
+      "encoded": encoded,
       "inference_kwargs": dict(inference_kwargs or {}),
     }
     try:
@@ -214,6 +220,7 @@ class HfOnnxArtifactPipeline:
     return self._call_decoder(
       outputs_by_name=outputs_by_name,
       text=text,
+      encoded=encoded,
       inference_kwargs=inference_kwargs,
     )
 
@@ -477,15 +484,32 @@ class ThHfModelBase(BaseServingProcess):
       repo_type="model",
     )
 
+  def _get_hf_onnx_fallback_manifest(self):
+    """Return a subclass-provided ONNX manifest when the repo has no manifest.
+
+    This hook lets dedicated serving classes support standard HF ONNX layouts
+    without requiring remote Python artifact code or model-specific logic in
+    the shared base class.
+    """
+    return None
+
   def _load_hf_artifact_manifest(self):
     """Load the optional artifact manifest from the configured HF model repo."""
     manifest_name = getattr(self, "cfg_hf_artifact_manifest", None)
     if not manifest_name:
-      return None
+      return self._get_hf_onnx_fallback_manifest()
     try:
       manifest_path = self._download_hf_artifact_file(manifest_name)
       return json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     except Exception as exc:
+      fallback_manifest = self._get_hf_onnx_fallback_manifest()
+      if isinstance(fallback_manifest, dict):
+        self.P(
+          f"HF artifact manifest {manifest_name} not available for {self.get_model_name()}; "
+          "using subclass ONNX fallback manifest.",
+          color="y",
+        )
+        return fallback_manifest
       if self._requested_hf_runtime() != "auto":
         raise
       self.P(
@@ -647,6 +671,9 @@ class ThHfModelBase(BaseServingProcess):
 
   def _load_hf_schema(self, model_dir, manifest, runtime_config):
     """Load the JSON schema declared by the selected HF runtime."""
+    inline_schema = runtime_config.get("inline_schema") if isinstance(runtime_config, dict) else None
+    if isinstance(inline_schema, dict):
+      return inline_schema
     schema_path = self._resolve_manifest_file_path(
       model_dir=model_dir,
       manifest=manifest,
@@ -709,6 +736,22 @@ class ThHfModelBase(BaseServingProcess):
       raise ValueError(f"Could not resolve a decoder function in {decoder_path}.")
     return decoder
 
+  def _get_hf_onnx_artifact_schema(self, model_dir, manifest, runtime_config):
+    """Return the schema used by an ONNX artifact runtime."""
+    return self._load_hf_schema(
+      model_dir=model_dir,
+      manifest=manifest,
+      runtime_config=runtime_config,
+    )
+
+  def _get_hf_onnx_artifact_decoder(self, model_dir, manifest, runtime_config):
+    """Return the decoder used by an ONNX artifact runtime."""
+    return self._load_hf_contract_decoder(
+      model_dir=model_dir,
+      manifest=manifest,
+      runtime_config=runtime_config,
+    )
+
   def _resolve_hf_onnx_model_path(self, model_dir, runtime_key, runtime_config, schema):
     """Resolve the ONNX model file for the selected runtime."""
     for key in ("model", "model_file", "path"):
@@ -765,12 +808,12 @@ class ThHfModelBase(BaseServingProcess):
 
   def _build_hf_onnx_artifact_pipeline(self, model_dir, runtime_key, runtime_config, manifest):
     """Build a callable ONNX artifact pipeline from downloaded HF files."""
-    schema = self._load_hf_schema(
+    schema = self._get_hf_onnx_artifact_schema(
       model_dir=model_dir,
       manifest=manifest,
       runtime_config=runtime_config,
     )
-    decoder = self._load_hf_contract_decoder(
+    decoder = self._get_hf_onnx_artifact_decoder(
       model_dir=model_dir,
       manifest=manifest,
       runtime_config=runtime_config,

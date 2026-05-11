@@ -7,6 +7,9 @@ This serving is tailored to the privacy-filter span-detection contract:
 - redaction-friendly post-processing metadata
 """
 
+import json
+import math
+
 from extensions.serving.default_inference.nlp.th_hf_model_base import (
   _CONFIG as BASE_HF_MODEL_CONFIG,
   ThHfModelBase,
@@ -30,10 +33,355 @@ _CONFIG = {
 
 
 FIXED_CENSOR_SIZE = 4
+PRIVACY_FILTER_ONNX_RUNTIME_KEY = "onnx_fp32"
+PRIVACY_FILTER_ONNX_MODEL_FILE = "onnx/model.onnx"
+PRIVACY_FILTER_VITERBI_FILE = "viterbi_calibration.json"
 
 
 class ThPrivacyFilter(ThHfModelBase):
   CONFIG = _CONFIG
+
+  def _get_hf_onnx_fallback_manifest(self):
+    """Declare the public HF ONNX layout when no artifact manifest exists."""
+    if self.get_model_name() != "openai/privacy-filter":
+      return None
+    return {
+      "model_key": "openai_privacy_filter",
+      "source_repo_id": "openai/privacy-filter",
+      "pipeline_task": "token-classification",
+      "runtimes": {
+        PRIVACY_FILTER_ONNX_RUNTIME_KEY: {
+          "runtime": "onnxruntime",
+          "entrypoint": "onnxruntime.InferenceSession",
+          "pipeline_task": "token-classification",
+          "model": PRIVACY_FILTER_ONNX_MODEL_FILE,
+          "decoder_type": "privacy_filter_span_decoder",
+          "files": [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            PRIVACY_FILTER_VITERBI_FILE,
+            PRIVACY_FILTER_ONNX_MODEL_FILE,
+            "onnx/model.onnx_data",
+            "onnx/model.onnx_data_1",
+            "onnx/model.onnx_data_2",
+          ],
+          "recommended_allow_patterns": [
+            "config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            PRIVACY_FILTER_VITERBI_FILE,
+            PRIVACY_FILTER_ONNX_MODEL_FILE,
+            "onnx/model.onnx_data",
+            "onnx/model.onnx_data_1",
+            "onnx/model.onnx_data_2",
+          ],
+          "providers": ["CPUExecutionProvider"],
+        },
+      },
+    }
+
+  def _get_hf_onnx_artifact_schema(self, model_dir, manifest, runtime_config):
+    """Build a local schema for the privacy-filter ONNX artifacts."""
+    if runtime_config.get("decoder_type") != "privacy_filter_span_decoder":
+      return super()._get_hf_onnx_artifact_schema(
+        model_dir=model_dir,
+        manifest=manifest,
+        runtime_config=runtime_config,
+      )
+    config_path = self._resolve_hf_snapshot_path(model_dir=model_dir, file_path="config.json")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    calibration = {}
+    calibration_path = self._resolve_hf_snapshot_path(
+      model_dir=model_dir,
+      file_path=PRIVACY_FILTER_VITERBI_FILE,
+    )
+    if calibration_path.exists():
+      calibration = json.loads(calibration_path.read_text(encoding="utf-8"))
+    return {
+      "inputs": [
+        {"name": "input_ids", "dtype": "int64"},
+        {"name": "attention_mask", "dtype": "int64"},
+      ],
+      "outputs": [{"name": "logits"}],
+      "output_order": ["logits"],
+      "id2label": config.get("id2label", {}),
+      "tokenizer_kwargs": {"return_offsets_mapping": True},
+      "viterbi_calibration": calibration,
+    }
+
+  def _get_hf_onnx_artifact_decoder(self, model_dir, manifest, runtime_config):
+    """Use the local privacy-filter decoder instead of remote Python code."""
+    if runtime_config.get("decoder_type") == "privacy_filter_span_decoder":
+      return self._decode_privacy_filter_onnx_outputs
+    return super()._get_hf_onnx_artifact_decoder(
+      model_dir=model_dir,
+      manifest=manifest,
+      runtime_config=runtime_config,
+    )
+
+  def _to_plain_list(self, value):
+    """Convert tensors/arrays to plain Python lists for decoder logic."""
+    if hasattr(value, "tolist"):
+      return value.tolist()
+    return value
+
+  def _first_batch_item(self, value):
+    """Return the first batch element from a tensor-like value."""
+    value = self._to_plain_list(value)
+    if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list):
+      return value[0]
+    return value
+
+  def _get_tokenizer_field(self, tokenizer_output, field_name):
+    if not hasattr(tokenizer_output, "get"):
+      return None
+    return self._first_batch_item(tokenizer_output.get(field_name))
+
+  def _get_privacy_filter_id2label(self, schema):
+    raw_id2label = schema.get("id2label") if isinstance(schema, dict) else None
+    if not isinstance(raw_id2label, dict) or len(raw_id2label) == 0:
+      raise ValueError("Privacy-filter ONNX schema must provide id2label.")
+    labels_by_id = {
+      int(label_id): label
+      for label_id, label in raw_id2label.items()
+    }
+    return [
+      labels_by_id[idx]
+      for idx in range(max(labels_by_id) + 1)
+    ]
+
+  def _split_privacy_filter_label(self, label):
+    if not isinstance(label, str) or label == "O":
+      return "O", None
+    if "-" not in label:
+      return label, None
+    prefix, entity = label.split("-", 1)
+    return prefix, entity
+
+  def _get_privacy_filter_transition_biases(self, schema):
+    calibration = schema.get("viterbi_calibration") if isinstance(schema, dict) else None
+    operating_points = calibration.get("operating_points") if isinstance(calibration, dict) else None
+    default_point = operating_points.get("default") if isinstance(operating_points, dict) else None
+    biases = default_point.get("biases") if isinstance(default_point, dict) else None
+    return biases if isinstance(biases, dict) else {}
+
+  def _privacy_filter_transition_is_valid(self, previous_label, current_label):
+    current_prefix, current_entity = self._split_privacy_filter_label(current_label)
+    previous_prefix, previous_entity = self._split_privacy_filter_label(previous_label)
+    if previous_label is None:
+      return current_prefix in {"O", "B", "S"}
+    if previous_prefix in {"O", "E", "S"}:
+      return current_prefix in {"O", "B", "S"}
+    if previous_prefix in {"B", "I"}:
+      return current_prefix in {"I", "E"} and current_entity == previous_entity
+    return False
+
+  def _privacy_filter_terminal_is_valid(self, label):
+    prefix, _entity = self._split_privacy_filter_label(label)
+    return prefix in {"O", "E", "S"}
+
+  def _privacy_filter_transition_bias(self, previous_label, current_label, biases):
+    if previous_label is None:
+      return 0.0
+    previous_prefix, previous_entity = self._split_privacy_filter_label(previous_label)
+    current_prefix, current_entity = self._split_privacy_filter_label(current_label)
+    if previous_prefix == "O" and current_prefix == "O":
+      return float(biases.get("transition_bias_background_stay", 0.0))
+    if previous_prefix == "O" and current_prefix in {"B", "S"}:
+      return float(biases.get("transition_bias_background_to_start", 0.0))
+    if previous_prefix in {"E", "S"} and current_prefix == "O":
+      return float(biases.get("transition_bias_end_to_background", 0.0))
+    if previous_prefix in {"E", "S"} and current_prefix in {"B", "S"}:
+      return float(biases.get("transition_bias_end_to_start", 0.0))
+    if (
+      previous_prefix in {"B", "I"}
+      and current_prefix == "I"
+      and current_entity == previous_entity
+    ):
+      return float(biases.get("transition_bias_inside_to_continue", 0.0))
+    if (
+      previous_prefix in {"B", "I"}
+      and current_prefix == "E"
+      and current_entity == previous_entity
+    ):
+      return float(biases.get("transition_bias_inside_to_end", 0.0))
+    return 0.0
+
+  def _softmax(self, values):
+    if not values:
+      return []
+    max_value = max(values)
+    exps = [math.exp(value - max_value) for value in values]
+    total = sum(exps)
+    if total == 0:
+      return [0.0 for _ in values]
+    return [value / total for value in exps]
+
+  def _decode_privacy_filter_label_ids(self, logits, labels, offsets, attention_mask, schema):
+    """Run constrained BIOES Viterbi decoding over token logits."""
+    o_label_id = labels.index("O") if "O" in labels else 0
+    biases = self._get_privacy_filter_transition_biases(schema)
+    previous_scores = None
+    backpointers = []
+    selected_probabilities = []
+    probabilities_by_token = []
+    invalid_score = -1e9
+    for token_idx, token_logits in enumerate(logits):
+      token_logits = [float(value) for value in token_logits]
+      probabilities_by_token.append(self._softmax(token_logits))
+      is_content_token = True
+      if attention_mask is not None and token_idx < len(attention_mask):
+        is_content_token = bool(attention_mask[token_idx])
+      if offsets is not None and token_idx < len(offsets):
+        start, end = offsets[token_idx]
+        if int(start) == int(end):
+          is_content_token = False
+      if not is_content_token:
+        token_logits = [
+          0.0 if label_idx == o_label_id else invalid_score
+          for label_idx, _label in enumerate(labels)
+        ]
+      current_scores = []
+      current_backpointers = []
+      for label_idx, label in enumerate(labels):
+        emission_score = token_logits[label_idx]
+        if previous_scores is None:
+          if self._privacy_filter_transition_is_valid(None, label):
+            current_scores.append(emission_score)
+            current_backpointers.append(None)
+          else:
+            current_scores.append(invalid_score)
+            current_backpointers.append(None)
+          continue
+        best_score = invalid_score
+        best_previous_idx = 0
+        for previous_idx, previous_label in enumerate(labels):
+          if not self._privacy_filter_transition_is_valid(previous_label, label):
+            continue
+          score = (
+            previous_scores[previous_idx]
+            + self._privacy_filter_transition_bias(previous_label, label, biases)
+            + emission_score
+          )
+          if score > best_score:
+            best_score = score
+            best_previous_idx = previous_idx
+        current_scores.append(best_score)
+        current_backpointers.append(best_previous_idx)
+      previous_scores = current_scores
+      backpointers.append(current_backpointers)
+    if not previous_scores:
+      return [], []
+    terminal_scores = [
+      score if self._privacy_filter_terminal_is_valid(labels[idx]) else invalid_score
+      for idx, score in enumerate(previous_scores)
+    ]
+    if max(terminal_scores) > invalid_score:
+      previous_scores = terminal_scores
+    best_label_idx = max(range(len(previous_scores)), key=lambda idx: previous_scores[idx])
+    label_ids = []
+    for token_idx in range(len(backpointers) - 1, -1, -1):
+      label_ids.append(best_label_idx)
+      previous_idx = backpointers[token_idx][best_label_idx]
+      best_label_idx = previous_idx if previous_idx is not None else o_label_id
+    label_ids.reverse()
+    for token_idx, label_idx in enumerate(label_ids):
+      probabilities = probabilities_by_token[token_idx]
+      selected_probabilities.append(probabilities[label_idx] if label_idx < len(probabilities) else 0.0)
+    return label_ids, selected_probabilities
+
+  def _build_privacy_filter_spans(self, text, labels, label_ids, probabilities, offsets):
+    spans = []
+    current_span = None
+    for token_idx, label_id in enumerate(label_ids):
+      if offsets is None or token_idx >= len(offsets):
+        continue
+      start, end = offsets[token_idx]
+      start = int(start)
+      end = int(end)
+      if start == end:
+        continue
+      label = labels[label_id]
+      prefix, entity = self._split_privacy_filter_label(label)
+      token_score = probabilities[token_idx] if token_idx < len(probabilities) else 0.0
+      if prefix == "O":
+        if current_span is not None:
+          spans.append(current_span)
+          current_span = None
+        continue
+      if prefix == "S":
+        if current_span is not None:
+          spans.append(current_span)
+          current_span = None
+        spans.append({
+          "entity_group": entity,
+          "entity": entity,
+          "score": token_score,
+          "word": text[start:end],
+          "start": start,
+          "end": end,
+        })
+        continue
+      if prefix == "B" or current_span is None or current_span["entity_group"] != entity:
+        if current_span is not None:
+          spans.append(current_span)
+        current_span = {
+          "entity_group": entity,
+          "entity": entity,
+          "score": token_score,
+          "word": text[start:end],
+          "start": start,
+          "end": end,
+          "_scores": [token_score],
+        }
+        if prefix == "E":
+          current_span["_scores"].append(token_score)
+          current_span["end"] = end
+          current_span["word"] = text[current_span["start"]:current_span["end"]]
+          spans.append(current_span)
+          current_span = None
+        continue
+      current_span["end"] = end
+      current_span["word"] = text[current_span["start"]:current_span["end"]]
+      current_span["_scores"].append(token_score)
+      current_span["score"] = sum(current_span["_scores"]) / len(current_span["_scores"])
+      if prefix == "E":
+        spans.append(current_span)
+        current_span = None
+    if current_span is not None:
+      spans.append(current_span)
+    for span in spans:
+      span.pop("_scores", None)
+    return spans
+
+  def _decode_privacy_filter_onnx_outputs(self, outputs, schema, text=None, tokenizer_output=None, **kwargs):
+    """Decode ONNX token logits into privacy-filter span dictionaries."""
+    logits = outputs.get("logits") if isinstance(outputs, dict) else None
+    if logits is None and isinstance(outputs, dict) and outputs:
+      logits = next(iter(outputs.values()))
+    logits = self._first_batch_item(logits)
+    if not isinstance(logits, list):
+      raise ValueError("Privacy-filter ONNX decoder expected logits output.")
+    offsets = self._get_tokenizer_field(tokenizer_output, "offset_mapping")
+    if offsets is None:
+      raise ValueError("Privacy-filter ONNX decoder requires tokenizer offset_mapping.")
+    attention_mask = self._get_tokenizer_field(tokenizer_output, "attention_mask")
+    labels = self._get_privacy_filter_id2label(schema)
+    label_ids, probabilities = self._decode_privacy_filter_label_ids(
+      logits=logits,
+      labels=labels,
+      offsets=offsets,
+      attention_mask=attention_mask,
+      schema=schema,
+    )
+    return self._build_privacy_filter_spans(
+      text=text or "",
+      labels=labels,
+      label_ids=label_ids,
+      probabilities=probabilities,
+      offsets=offsets,
+    )
 
   def _extract_struct_payload(self, payload):
     """Extract the structured payload used by the privacy filter.
