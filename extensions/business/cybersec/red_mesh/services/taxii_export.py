@@ -260,6 +260,86 @@ def publish_to_taxii(owner, job_id, pass_nr=None):
   }
 
 
+def probe_taxii(owner):
+  """Read-only connectivity probe for the TAXII Test button.
+
+  GETs the configured SERVER_URL (the api root) with the integration's
+  auth header + the required TAXII Accept header. Doesn't publish or
+  read any objects; just validates reachability + auth + that the api
+  root exists.
+  """
+  cfg = get_taxii_export_config(owner)
+  config_error = _config_error(cfg)
+  if config_error == "disabled":
+    return {"status": "disabled", "integration_id": "taxii", "error": "disabled"}
+  if config_error:
+    record_integration_status(owner, "taxii", outcome="failure", error_class=config_error)
+    return {"status": "not_configured", "integration_id": "taxii", "error": config_error}
+
+  try:
+    auth_headers = build_auth_provider(cfg).headers()
+  except AuthError as exc:
+    record_integration_status(owner, "taxii", outcome="failure", error_class="invalid_auth_config")
+    return {
+      "status": "error",
+      "integration_id": "taxii",
+      "error": "invalid_auth_config",
+      "detail": str(exc),
+    }
+
+  headers = {
+    "Accept": TAXII_MEDIA_TYPE,
+    "User-Agent": "RedMesh/1.0",
+    **auth_headers,
+  }
+
+  # medallion responds 308 -> http:// (scheme-downgrade) when the api root
+  # is requested without a trailing slash; requests then drops the
+  # Authorization header on the cross-scheme redirect and we get a spurious
+  # 401. Always probe the slash-terminated URL.
+  probe_url = cfg["SERVER_URL"]
+  if not probe_url.endswith("/"):
+    probe_url = probe_url + "/"
+
+  try:
+    response = requests.get(probe_url, headers=headers, timeout=10)
+  except requests.exceptions.Timeout:
+    record_integration_status(owner, "taxii", outcome="failure", error_class="timeout")
+    return {"status": "error", "integration_id": "taxii", "error": "timeout"}
+  except requests.exceptions.RequestException as exc:
+    error_class = type(exc).__name__
+    record_integration_status(owner, "taxii", outcome="failure", error_class=error_class)
+    return {"status": "error", "integration_id": "taxii", "error": error_class}
+
+  if response.status_code >= 400:
+    error_class = f"http_{response.status_code}"
+    record_integration_status(owner, "taxii", outcome="failure", error_class=error_class)
+    return {"status": "error", "integration_id": "taxii", "error": error_class}
+
+  try:
+    payload = response.json()
+  except ValueError:
+    payload = {}
+  api_root_title = payload.get("title") if isinstance(payload, dict) else None
+  api_root_versions = payload.get("versions") if isinstance(payload, dict) else None
+
+  record_integration_status(
+    owner,
+    "taxii",
+    outcome="success",
+    event_id=cfg.get("COLLECTION_ID") or None,
+    dry_run=True,
+  )
+  return {
+    "status": "ok",
+    "dry_run": True,
+    "integration_id": "taxii",
+    "api_root_title": api_root_title,
+    "api_root_versions": api_root_versions,
+    "collection_id": cfg["COLLECTION_ID"],
+  }
+
+
 def get_taxii_export_status(owner, job_id):
   job_specs = owner._get_job_from_cstore(job_id)
   if not isinstance(job_specs, dict):

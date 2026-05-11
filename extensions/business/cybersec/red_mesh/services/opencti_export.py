@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 import requests
 
 from ..repositories import ArtifactRepository, JobStateRepository
-from .auth import AuthError, build_auth_provider
+from .auth import AuthError, build_auth_provider, credentials_missing
 from .config import get_opencti_export_config
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
@@ -75,10 +75,11 @@ def _config_error(cfg):
     return "disabled"
   if not cfg["URL"]:
     return "missing_url"
-  # OpenCTI only supports AUTH_MODE=static (UUID API tokens). An empty env
-  # value is a misconfig — surface it before bothering to build a bundle.
-  if not _token(cfg):
-    return "missing_token"
+  # credentials_missing() understands both inline TOKEN and TOKEN_ENV-indirected
+  # values, matching the live status panel logic.
+  credentials_error = credentials_missing(cfg)
+  if credentials_error:
+    return credentials_error
   return None
 
 
@@ -270,6 +271,72 @@ def push_to_opencti(owner, job_id, pass_nr=None):
     "pushed_at": pushed_at,
     "redacted_host": _redacted_host(cfg["URL"]),
     **_bundle_summary(result, artifact_cid=artifact_cid),
+  }
+
+
+def probe_opencti(owner):
+  """Read-only connectivity probe for the OpenCTI Test button.
+
+  Runs the GraphQL `me {}` query against the configured OpenCTI URL using
+  the integration's auth provider. Doesn't push or persist any data; only
+  validates that the URL is reachable, credentials are accepted, and the
+  GraphQL schema is responsive.
+  """
+  cfg = get_opencti_export_config(owner)
+  config_error = _config_error(cfg)
+  if config_error == "disabled":
+    return {"status": "disabled", "integration_id": "opencti", "error": "disabled"}
+  if config_error:
+    record_integration_status(owner, "opencti", outcome="failure", error_class=config_error)
+    return {"status": "not_configured", "integration_id": "opencti", "error": config_error}
+
+  try:
+    headers = build_auth_provider(cfg).headers()
+  except AuthError as exc:
+    record_integration_status(owner, "opencti", outcome="failure", error_class="invalid_auth_config")
+    return {
+      "status": "error",
+      "integration_id": "opencti",
+      "error": "invalid_auth_config",
+      "detail": str(exc),
+    }
+  headers["Content-Type"] = "application/json"
+  headers["User-Agent"] = "RedMesh/1.0"
+
+  body = json.dumps({"query": "query{me{id name user_email}}"})
+  try:
+    response = requests.post(_graphql_url(cfg["URL"]), headers=headers, data=body, timeout=10)
+  except requests.exceptions.Timeout:
+    record_integration_status(owner, "opencti", outcome="failure", error_class="timeout")
+    return {"status": "error", "integration_id": "opencti", "error": "timeout"}
+  except requests.exceptions.RequestException as exc:
+    error_class = type(exc).__name__
+    record_integration_status(owner, "opencti", outcome="failure", error_class=error_class)
+    return {"status": "error", "integration_id": "opencti", "error": error_class}
+
+  if response.status_code >= 400:
+    error_class = f"http_{response.status_code}"
+    record_integration_status(owner, "opencti", outcome="failure", error_class=error_class)
+    return {"status": "error", "integration_id": "opencti", "error": error_class}
+
+  try:
+    payload = response.json()
+  except ValueError:
+    payload = {}
+  me = ((payload.get("data") or {}).get("me") or {}) if isinstance(payload, dict) else {}
+  user_id = me.get("id") if isinstance(me, dict) else None
+  if not user_id:
+    record_integration_status(owner, "opencti", outcome="failure", error_class="graphql_error")
+    return {"status": "error", "integration_id": "opencti", "error": "graphql_error"}
+
+  record_integration_status(owner, "opencti", outcome="success", event_id=user_id, dry_run=True)
+  return {
+    "status": "ok",
+    "dry_run": True,
+    "integration_id": "opencti",
+    "user_id": user_id,
+    "user_name": me.get("name"),
+    "user_email": me.get("user_email"),
   }
 
 

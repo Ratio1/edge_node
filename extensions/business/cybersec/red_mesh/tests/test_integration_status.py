@@ -264,7 +264,10 @@ class TestIntegrationStatus(unittest.TestCase):
     self.assertTrue(status["configured"])
     self.assertIsNone(status["last_error_class"])
 
-  def test_configuration_error_survives_dry_run_success_when_unconfigured(self):
+  def test_opencti_test_button_reports_missing_token_when_unconfigured(self):
+    # Pre-refactor this test asserted status="ok" because the Test button
+    # was a no-op stub. The real probe now surfaces the actual config
+    # state, so an unconfigured integration returns "not_configured".
     self.owner.cfg_opencti_export = {
       "ENABLED": True,
       "URL": "https://opencti.example",
@@ -274,10 +277,24 @@ class TestIntegrationStatus(unittest.TestCase):
     result = build_integration_test_event(self.owner, integration_id="opencti")
     status = get_integration_status(self.owner)["integrations"]["opencti"]
 
-    self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["status"], "not_configured")
+    self.assertEqual(result["error"], "missing_token")
     self.assertFalse(status["configured"])
     self.assertEqual(status["last_error_class"], "missing_token")
-    self.assertEqual(status["last_event_id"], result["event"]["event_id"])
+
+  def test_suricata_test_button_reports_not_applicable(self):
+    result = build_integration_test_event(self.owner, integration_id="suricata")
+    self.assertEqual(result["status"], "not_applicable")
+    self.assertIn("upload", result["message"].lower())
+
+  def test_status_payload_includes_supports_test_flag(self):
+    status = get_integration_status(self.owner)["integrations"]
+    self.assertTrue(status["wazuh"]["supports_test"])
+    self.assertTrue(status["opencti"]["supports_test"])
+    self.assertTrue(status["taxii"]["supports_test"])
+    self.assertFalse(status["suricata"]["supports_test"])
+    self.assertFalse(status["stix"]["supports_test"])
+    self.assertFalse(status["event_export"]["supports_test"])
 
 
 if __name__ == "__main__":

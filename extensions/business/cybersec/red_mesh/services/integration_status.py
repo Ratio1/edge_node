@@ -67,6 +67,15 @@ def _has_env_secret(env_name):
   return bool(str(os.environ.get(str(env_name or ""), "")).strip())
 
 
+# Integrations whose Test button does a real probe (Wazuh delivery,
+# OpenCTI GraphQL me{}, TAXII api root GET). The frontend should only
+# render the Test button for these. Suricata is intentionally absent
+# because its integration is upload-based — there is no remote endpoint
+# to ping. event_export is also absent because the "test" was just
+# stamping a dry-run timestamp; the wazuh button covers the real flow.
+_INTEGRATIONS_WITH_TEST = {"wazuh", "opencti", "taxii"}
+
+
 def _base_status(integration_id, *, enabled, configured, destination_type, destination_label,
                  redacted_host="", redaction_mode="hash_only", error_class=None, config=None):
   return {
@@ -78,6 +87,7 @@ def _base_status(integration_id, *, enabled, configured, destination_type, desti
     "destination_label": destination_label,
     "redacted_host": redacted_host,
     "redaction_mode": redaction_mode,
+    "supports_test": integration_id in _INTEGRATIONS_WITH_TEST,
     "last_dry_run_at": None,
     "last_success_at": None,
     "last_failure_at": None,
@@ -306,6 +316,40 @@ def test_event_export(owner, integration_id="event_export"):
       "integration_id": integration_id,
     }
 
+  if integration_id == "wazuh":
+    cfg = get_event_export_config(owner)
+    secret = os.environ.get(cfg["HMAC_SECRET_ENV"]) or "redmesh-test-event-secret"
+    event = build_test_event(
+      hmac_secret=secret,
+      tenant_id=str(getattr(owner, "cfg_instance_id", "") or ""),
+      environment=str(getattr(owner, "cfg_ee_node_network", "") or ""),
+    )
+    from .log_export import deliver_redmesh_event
+    return deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True)
+
+  if integration_id == "opencti":
+    from .opencti_export import probe_opencti
+    return probe_opencti(owner)
+
+  if integration_id == "taxii":
+    from .taxii_export import probe_taxii
+    return probe_taxii(owner)
+
+  if integration_id == "suricata":
+    # Suricata correlation is pull-based — the operator uploads EVE JSONL
+    # after a job and RedMesh correlates against the job's time window.
+    # There's no remote endpoint to ping. UI hides the button via
+    # supports_test=False; this branch exists only for clients that ignore
+    # that hint and call the endpoint anyway.
+    return {
+      "status": "not_applicable",
+      "integration_id": "suricata",
+      "message": "Suricata is upload-based; upload EVE JSONL after a job to test correlation.",
+    }
+
+  # Fallback (event_export, stix): synthesize a sample event and stamp
+  # last_dry_run_at — these have no remote endpoint either, but the
+  # dry-run stamp is a useful "the schema builds and signs cleanly" smoke.
   cfg = get_event_export_config(owner)
   secret = os.environ.get(cfg["HMAC_SECRET_ENV"]) or "redmesh-test-event-secret"
   event = build_test_event(
@@ -313,10 +357,6 @@ def test_event_export(owner, integration_id="event_export"):
     tenant_id=str(getattr(owner, "cfg_instance_id", "") or ""),
     environment=str(getattr(owner, "cfg_ee_node_network", "") or ""),
   )
-  if integration_id == "wazuh":
-    from .log_export import deliver_redmesh_event
-    return deliver_redmesh_event(owner, event, integration_id=integration_id, dry_run=True)
-
   persisted = record_integration_status(
     owner,
     integration_id,
