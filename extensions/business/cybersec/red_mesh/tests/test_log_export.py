@@ -54,12 +54,12 @@ class TestLogExport(unittest.TestCase):
 
   def tearDown(self):
     os.environ.pop("REDMESH_EVENT_HMAC_SECRET", None)
-    os.environ.pop("REDMESH_WAZUH_HTTP_TOKEN", None)
+    os.environ.pop("REDMESH_WAZUH_TOKEN", None)
 
   @patch("extensions.business.cybersec.red_mesh.services.log_export.urllib.request.urlopen")
   def test_http_export_posts_canonical_json_with_signature_and_idempotency_headers(self, urlopen):
     os.environ["REDMESH_EVENT_HMAC_SECRET"] = "signing-secret"
-    os.environ["REDMESH_WAZUH_HTTP_TOKEN"] = "bearer-secret"
+    os.environ["REDMESH_WAZUH_TOKEN"] = "bearer-secret"
     response = MagicMock()
     response.__enter__.return_value.status = 202
     urlopen.return_value = response

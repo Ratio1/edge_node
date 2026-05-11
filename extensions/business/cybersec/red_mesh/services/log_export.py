@@ -10,6 +10,7 @@ import urllib.request
 
 from ..models.event_schema import validate_event_dict
 from ..repositories import ArtifactRepository
+from .auth import AuthError, build_auth_provider
 from .config import get_event_export_config, get_wazuh_export_config
 from .integration_status import record_integration_status
 
@@ -73,7 +74,7 @@ def _sign_payload_if_required(event_cfg, payload_bytes):
   return compute_payload_hmac(payload_bytes, secret), None
 
 
-def _http_headers(event, signature, token):
+def _http_headers(event, signature, provider=None):
   headers = {
     "Content-Type": "application/json",
     "X-RedMesh-Event-Id": _event_id(event),
@@ -81,8 +82,8 @@ def _http_headers(event, signature, token):
   }
   if signature:
     headers["X-RedMesh-Signature"] = f"sha256={signature}"
-  if token:
-    headers["Authorization"] = f"Bearer {token}"
+  if provider is not None:
+    headers.update(provider.headers())
   return headers
 
 
@@ -195,6 +196,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
   attempts_total = int(cfg["RETRY_ATTEMPTS"]) + 1
   timeout_seconds = float(cfg["TIMEOUT_SECONDS"])
 
+  provider = None
   if mode == "http":
     if not cfg["HTTP_URL"]:
       _record_failure(owner, integration_id, event, "missing_http_url", payload_bytes, cfg, dry_run=dry_run)
@@ -205,9 +207,22 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
         "mode": mode,
         "error": "missing_http_url",
       }
-    token = os.environ.get(cfg["HTTP_TOKEN_ENV"], "")
-    headers = _http_headers(event, signature, token)
-    send = lambda: _send_http_json(cfg["HTTP_URL"], payload_bytes, headers, timeout_seconds)
+    try:
+      provider = build_auth_provider(cfg)
+    except AuthError as exc:
+      _record_failure(owner, integration_id, event, "invalid_auth_config", payload_bytes, cfg, dry_run=dry_run)
+      return {
+        "status": "error",
+        "integration_id": integration_id,
+        "event_id": _event_id(event),
+        "mode": mode,
+        "error": "invalid_auth_config",
+        "detail": str(exc),
+      }
+
+    def send():
+      headers = _http_headers(event, signature, provider=provider)
+      return _send_http_json(cfg["HTTP_URL"], payload_bytes, headers, timeout_seconds)
   else:
     if not cfg["SYSLOG_HOST"]:
       _record_failure(owner, integration_id, event, "missing_syslog_host", payload_bytes, cfg, dry_run=dry_run)
@@ -222,7 +237,10 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
     send = lambda: _send_syslog_json(cfg["SYSLOG_HOST"], cfg["SYSLOG_PORT"], syslog_line, timeout_seconds)
 
   last_error = None
-  for attempt in range(1, attempts_total + 1):
+  refreshed_once = False
+  attempt = 0
+  while attempt < attempts_total:
+    attempt += 1
     try:
       response = send()
       record_integration_status(
@@ -241,6 +259,20 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
         "attempts": attempt,
         "response": response,
       }
+    except urllib.error.HTTPError as exc:
+      # 401 on http+provider mode: invalidate cached creds and retry once.
+      # The retry does NOT consume an attempt slot — credential expiry is
+      # not a transport failure. 403 (valid creds, no permission) is not
+      # refreshable and falls through to the normal error path.
+      if exc.code == 401 and provider is not None and not refreshed_once:
+        provider.invalidate()
+        refreshed_once = True
+        attempt -= 1
+        continue
+      last_error = _error_class_from_exception(exc)
+    except AuthError as exc:
+      last_error = "invalid_auth_config"
+      break
     except Exception as exc:
       last_error = _error_class_from_exception(exc)
 
@@ -251,7 +283,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
     "event_id": _event_id(event),
     "dedupe_key": _dedupe_key(event),
     "mode": mode,
-    "attempts": attempts_total,
+    "attempts": attempt,
     "error": last_error or "delivery_failed",
     "artifact_cid": artifact_cid,
   }
