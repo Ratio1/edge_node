@@ -75,6 +75,15 @@ def _automatic_export_enabled(owner):
   return True, None
 
 
+def _is_disabled_skip(result):
+  if not isinstance(result, dict):
+    return False
+  if result.get("status") != "skipped":
+    return False
+  reason = result.get("error")
+  return isinstance(reason, str) and reason.endswith("_disabled")
+
+
 def _safe_timeline(owner, job_specs, event_type, label, meta):
   emit = getattr(owner, "_emit_timeline_event", None)
   if not callable(emit) or not isinstance(job_specs, dict):
@@ -92,7 +101,7 @@ def _record_job_soc_status(owner, job_specs, event, result):
   status = dict(job_specs.get("soc_event_status") or {})
   status["schema_version"] = SOC_EVENT_STATUS_SCHEMA_VERSION
   status["last_updated_at"] = _utc_timestamp()
-  status["last_adapter"] = result.get("integration_id") or "wazuh"
+  status["last_adapter"] = result.get("integration_id")
   status["last_status"] = result.get("status")
   status["last_event_id"] = event.get("event_id")
   status["last_event_type"] = event.get("event_type")
@@ -113,6 +122,10 @@ def _record_job_soc_status(owner, job_specs, event, result):
   if event_type.startswith("redmesh.attestation."):
     status["last_attestation_event_status"] = result.get("status")
     status["last_attestation_event_id"] = event.get("event_id")
+
+  if _is_disabled_skip(result):
+    job_specs["soc_event_status"] = status
+    return
 
   history = list(status.get("history") or [])
   history.append({
@@ -144,7 +157,7 @@ def _record_job_soc_status(owner, job_specs, event, result):
 
 
 def _skip_result(reason):
-  return {"status": "skipped", "integration_id": "wazuh", "error": reason}
+  return {"status": "skipped", "integration_id": None, "error": reason}
 
 
 def _assessment_window(

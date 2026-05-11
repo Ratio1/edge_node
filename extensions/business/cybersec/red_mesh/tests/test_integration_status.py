@@ -27,9 +27,15 @@ class TestIntegrationStatus(unittest.TestCase):
     self.owner.chainstore_hset.side_effect = hset
 
   def tearDown(self):
-    os.environ.pop("REDMESH_EVENT_HMAC_SECRET", None)
-    os.environ.pop("REDMESH_OPENCTI_TOKEN", None)
-    os.environ.pop("REDMESH_TAXII_TOKEN", None)
+    for key in (
+      "REDMESH_EVENT_HMAC_SECRET",
+      "REDMESH_OPENCTI_TOKEN",
+      "REDMESH_TAXII_TOKEN",
+      "REDMESH_TAXII_PASSWORD",
+      "REDMESH_WAZUH_TOKEN",
+      "REDMESH_WAZUH_PASSWORD",
+    ):
+      os.environ.pop(key, None)
 
   def test_status_returns_all_integrations_without_secrets(self):
     self.owner.cfg_event_export = {
@@ -41,6 +47,8 @@ class TestIntegrationStatus(unittest.TestCase):
       "ENABLED": True,
       "MODE": "http",
       "HTTP_URL": "https://siem.example/ingest",
+      "AUTH_MODE": "static",
+      "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
     }
     self.owner.cfg_opencti_export = {
       "ENABLED": True,
@@ -48,6 +56,7 @@ class TestIntegrationStatus(unittest.TestCase):
       "TOKEN_ENV": "REDMESH_OPENCTI_TOKEN",
     }
     os.environ["REDMESH_EVENT_HMAC_SECRET"] = "event-secret"
+    os.environ["REDMESH_WAZUH_TOKEN"] = "wazuh-bearer"
 
     status = get_integration_status(self.owner)
 
@@ -66,6 +75,7 @@ class TestIntegrationStatus(unittest.TestCase):
     self.assertFalse(status["integrations"]["opencti"]["configured"])
     self.assertEqual(status["integrations"]["opencti"]["last_error_class"], "missing_token")
     self.assertNotIn("event-secret", str(status))
+    self.assertNotIn("wazuh-bearer", str(status))
 
   def test_status_records_last_success_failure_and_event_id(self):
     ok = record_integration_status(
@@ -148,7 +158,116 @@ class TestIntegrationStatus(unittest.TestCase):
     self.assertEqual(status["config"]["token_env"], "REDMESH_OPENCTI_TOKEN")
     self.assertNotIn("super-secret-token", str(status))
 
-  def test_configuration_error_survives_dry_run_success_when_unconfigured(self):
+  def test_wazuh_http_mode_with_no_credentials_is_not_configured(self):
+    # Regression: http mode used to claim "configured" with just an URL,
+    # even though the auth header would have been empty. The status panel
+    # now agrees with the delivery path.
+    self.owner.cfg_event_export = {
+      "ENABLED": True,
+      "SIGN_PAYLOADS": False,  # isolate the auth signal from HMAC noise
+    }
+    self.owner.cfg_wazuh_export = {
+      "ENABLED": True,
+      "MODE": "http",
+      "HTTP_URL": "https://siem.example/ingest",
+      "AUTH_MODE": "static",
+      "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+    }
+    os.environ.pop("REDMESH_WAZUH_TOKEN", None)
+
+    status = get_integration_status(self.owner)["integrations"]["wazuh"]
+
+    self.assertFalse(status["configured"])
+    self.assertEqual(status["last_error_class"], "missing_token")
+
+  def test_wazuh_http_jwt_mode_is_configured_with_username_and_password(self):
+    self.owner.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    self.owner.cfg_wazuh_export = {
+      "ENABLED": True,
+      "MODE": "http",
+      "HTTP_URL": "https://wazuh-api.example/events",
+      "AUTH_MODE": "wazuh_jwt",
+      "USERNAME": "wazuh-wui",
+      "PASSWORD_ENV": "REDMESH_WAZUH_PASSWORD",
+    }
+    os.environ["REDMESH_WAZUH_PASSWORD"] = "pw"
+
+    status = get_integration_status(self.owner)["integrations"]["wazuh"]
+
+    self.assertTrue(status["configured"])
+    self.assertEqual(status["config"]["auth_mode"], "wazuh_jwt")
+    self.assertIsNone(status["last_error_class"])
+    self.assertNotIn("pw", str(status))
+
+  def test_wazuh_jwt_mode_missing_username_reports_missing_credentials(self):
+    self.owner.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    self.owner.cfg_wazuh_export = {
+      "ENABLED": True,
+      "MODE": "http",
+      "HTTP_URL": "https://wazuh-api.example/events",
+      "AUTH_MODE": "wazuh_jwt",
+      "USERNAME": "",
+      "PASSWORD_ENV": "REDMESH_WAZUH_PASSWORD",
+    }
+    os.environ["REDMESH_WAZUH_PASSWORD"] = "pw"
+
+    status = get_integration_status(self.owner)["integrations"]["wazuh"]
+
+    self.assertFalse(status["configured"])
+    self.assertEqual(status["last_error_class"], "missing_credentials")
+
+  def test_taxii_basic_mode_is_configured_with_username_and_password(self):
+    self.owner.cfg_taxii_export = {
+      "ENABLED": True,
+      "SERVER_URL": "https://taxii.example/api1",
+      "AUTH_MODE": "basic",
+      "USERNAME": "redmesh",
+      "PASSWORD_ENV": "REDMESH_TAXII_PASSWORD",
+      "COLLECTION_ID": "collection-1",
+    }
+    os.environ["REDMESH_TAXII_PASSWORD"] = "secret"
+
+    status = get_integration_status(self.owner)["integrations"]["taxii"]
+
+    self.assertTrue(status["configured"])
+    self.assertEqual(status["config"]["auth_mode"], "basic")
+    self.assertIsNone(status["last_error_class"])
+    self.assertNotIn("secret", str(status))
+
+  def test_taxii_basic_mode_missing_password_env_reports_missing_credentials(self):
+    self.owner.cfg_taxii_export = {
+      "ENABLED": True,
+      "SERVER_URL": "https://taxii.example/api1",
+      "AUTH_MODE": "basic",
+      "USERNAME": "redmesh",
+      "PASSWORD_ENV": "REDMESH_TAXII_PASSWORD",
+      "COLLECTION_ID": "collection-1",
+    }
+    os.environ.pop("REDMESH_TAXII_PASSWORD", None)
+
+    status = get_integration_status(self.owner)["integrations"]["taxii"]
+
+    self.assertFalse(status["configured"])
+    self.assertEqual(status["last_error_class"], "missing_credentials")
+
+  def test_wazuh_syslog_mode_does_not_require_credentials(self):
+    self.owner.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    self.owner.cfg_wazuh_export = {
+      "ENABLED": True,
+      "MODE": "syslog",
+      "SYSLOG_HOST": "127.0.0.1",
+    }
+
+    status = get_integration_status(self.owner)["integrations"]["wazuh"]
+
+    # No AUTH_MODE check; syslog is authenticated by network position.
+    self.assertTrue(status["configured"])
+    self.assertIsNone(status["last_error_class"])
+
+  def test_opencti_test_button_reports_missing_token_when_unconfigured(self):
+    # Pre-refactor this test asserted status="ok" because the Test button
+    # was a no-op stub. The real probe now surfaces the actual config
+    # state, so an unconfigured integration returns "not_configured".
     self.owner.cfg_opencti_export = {
       "ENABLED": True,
       "URL": "https://opencti.example",
@@ -158,10 +277,24 @@ class TestIntegrationStatus(unittest.TestCase):
     result = build_integration_test_event(self.owner, integration_id="opencti")
     status = get_integration_status(self.owner)["integrations"]["opencti"]
 
-    self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["status"], "not_configured")
+    self.assertEqual(result["error"], "missing_token")
     self.assertFalse(status["configured"])
     self.assertEqual(status["last_error_class"], "missing_token")
-    self.assertEqual(status["last_event_id"], result["event"]["event_id"])
+
+  def test_suricata_test_button_reports_not_applicable(self):
+    result = build_integration_test_event(self.owner, integration_id="suricata")
+    self.assertEqual(result["status"], "not_applicable")
+    self.assertIn("upload", result["message"].lower())
+
+  def test_status_payload_includes_supports_test_flag(self):
+    status = get_integration_status(self.owner)["integrations"]
+    self.assertTrue(status["wazuh"]["supports_test"])
+    self.assertTrue(status["opencti"]["supports_test"])
+    self.assertTrue(status["taxii"]["supports_test"])
+    self.assertFalse(status["suricata"]["supports_test"])
+    self.assertFalse(status["stix"]["supports_test"])
+    self.assertFalse(status["event_export"]["supports_test"])
 
 
 if __name__ == "__main__":

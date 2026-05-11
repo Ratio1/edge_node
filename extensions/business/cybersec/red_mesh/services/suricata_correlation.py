@@ -12,8 +12,8 @@ from .integration_status import record_integration_status
 
 
 DETECTION_CORRELATION_SCHEMA_VERSION = "1.0.0"
-MAX_EVE_JSONL_BYTES = 5 * 1024 * 1024
-MAX_EVE_EVENTS = 20000
+MAX_EVE_JSONL_BYTES = 25 * 1024 * 1024
+MAX_EVE_EVENTS = 100000
 
 
 def _utc_timestamp():

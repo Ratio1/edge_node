@@ -159,6 +159,64 @@ class TestIntegrationConfig(unittest.TestCase):
     self.assertFalse(cfg["INCLUDE_OBSERVED_DATA"])
     self.assertEqual(cfg["INCLUDE_INDICATORS"], "ioc_only")
 
+  def test_wazuh_auth_fields_have_defaults(self):
+    cfg = get_wazuh_export_config(self._owner())
+    self.assertEqual(cfg["AUTH_MODE"], "static")
+    self.assertEqual(cfg["TOKEN_ENV"], "REDMESH_WAZUH_TOKEN")
+    self.assertEqual(cfg["PASSWORD_ENV"], "REDMESH_WAZUH_PASSWORD")
+    self.assertEqual(cfg["LOGIN_PATH"], "/security/user/authenticate?raw=true")
+    self.assertEqual(cfg["JWT_TTL_OVERRIDE_SECONDS"], 0)
+    self.assertEqual(cfg["USERNAME"], "")
+    self.assertEqual(cfg["LOGIN_URL"], "")
+
+  def test_wazuh_http_token_env_field_removed(self):
+    # Regression guard: the legacy HTTP_TOKEN_ENV field must be gone.
+    cfg = get_wazuh_export_config(self._owner())
+    self.assertNotIn("HTTP_TOKEN_ENV", cfg)
+    self.assertNotIn("HTTP_TOKEN_ENV", DEFAULT_WAZUH_EXPORT_CONFIG)
+
+  def test_wazuh_auth_mode_clamps_to_allowed_enum(self):
+    owner = self._owner("WAZUH_EXPORT", {"AUTH_MODE": "basic"})  # not allowed for Wazuh
+    cfg = get_wazuh_export_config(owner)
+    self.assertEqual(cfg["AUTH_MODE"], "static")
+
+    owner = self._owner("WAZUH_EXPORT", {"AUTH_MODE": "wazuh_jwt"})
+    cfg = get_wazuh_export_config(owner)
+    self.assertEqual(cfg["AUTH_MODE"], "wazuh_jwt")
+
+  def test_wazuh_jwt_ttl_override_negative_resets_to_default(self):
+    owner = self._owner("WAZUH_EXPORT", {"JWT_TTL_OVERRIDE_SECONDS": -10})
+    cfg = get_wazuh_export_config(owner)
+    self.assertEqual(cfg["JWT_TTL_OVERRIDE_SECONDS"], 0)
+
+  def test_wazuh_login_url_rejects_userinfo(self):
+    owner = self._owner("WAZUH_EXPORT", {
+      "LOGIN_URL": "https://user:secret@wazuh.example",
+    })
+    cfg = get_wazuh_export_config(owner)
+    self.assertEqual(cfg["LOGIN_URL"], "")
+
+  def test_taxii_auth_mode_clamps_and_credentials_visible(self):
+    owner = self._owner("TAXII_EXPORT", {
+      "AUTH_MODE": "wazuh_jwt",  # invalid for TAXII
+      "USERNAME": "redmesh",
+      "PASSWORD_ENV": "REDMESH_TAXII_PASSWORD",
+    })
+    cfg = get_taxii_export_config(owner)
+    self.assertEqual(cfg["AUTH_MODE"], "static")
+    self.assertEqual(cfg["USERNAME"], "redmesh")
+    self.assertEqual(cfg["PASSWORD_ENV"], "REDMESH_TAXII_PASSWORD")
+
+    owner = self._owner("TAXII_EXPORT", {"AUTH_MODE": "basic"})
+    cfg = get_taxii_export_config(owner)
+    self.assertEqual(cfg["AUTH_MODE"], "basic")
+
+  def test_opencti_auth_mode_only_static_allowed(self):
+    for attempt in ("basic", "wazuh_jwt", "oauth2", ""):
+      owner = self._owner("OPENCTI_EXPORT", {"AUTH_MODE": attempt})
+      cfg = get_opencti_export_config(owner)
+      self.assertEqual(cfg["AUTH_MODE"], "static")
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -106,6 +106,53 @@ class TestEventLifecycleHooks(unittest.TestCase):
     deliver.assert_not_called()
 
   @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
+  def test_skipped_delivery_does_not_claim_wazuh_adapter(self, deliver):
+    owner = _owner(wazuh_export={"ENABLED": False})
+    job_specs = _job_specs()
+
+    result = emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.job.started",
+      event_action="started",
+      pass_nr=1,
+    )
+
+    self.assertEqual(result["status"], "skipped")
+    self.assertEqual(result["error"], "wazuh_disabled")
+    self.assertIsNone(result["integration_id"])
+    soc_status = job_specs["soc_event_status"]
+    self.assertIsNone(soc_status["last_adapter"])
+    self.assertEqual(soc_status.get("history") or [], [])
+    self.assertFalse(owner._emit_timeline_event.called)
+    deliver.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
+  def test_disabled_skips_do_not_pollute_history_or_timeline(self, deliver):
+    owner = _owner(wazuh_export={"ENABLED": False})
+    job_specs = _job_specs()
+
+    for event_action, event_type in [
+      ("started", "redmesh.job.started"),
+      ("pass_completed", "redmesh.job.pass_completed"),
+      ("completed", "redmesh.job.completed"),
+    ]:
+      emit_lifecycle_event(
+        owner,
+        job_specs,
+        event_type=event_type,
+        event_action=event_action,
+        pass_nr=1,
+      )
+
+    soc_status = job_specs["soc_event_status"]
+    self.assertEqual(soc_status.get("history") or [], [])
+    self.assertEqual(soc_status["last_event_type"], "redmesh.job.completed")
+    self.assertEqual(soc_status["last_error_class"], "wazuh_disabled")
+    self.assertFalse(owner._emit_timeline_event.called)
+    deliver.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
   def test_delivery_exception_is_non_blocking_and_updates_integration_status(self, deliver):
     deliver.side_effect = RuntimeError("network down")
     owner = _owner()
