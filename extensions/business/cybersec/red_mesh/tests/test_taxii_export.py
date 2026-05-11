@@ -206,6 +206,46 @@ class TestTaxiiExport(unittest.TestCase):
     self.assertTrue(result["exported"])
     self.assertEqual(result["taxii_status_id"], "taxii-status-1")
 
+  @patch("extensions.business.cybersec.red_mesh.services.taxii_export.emit_export_status_event")
+  @patch("extensions.business.cybersec.red_mesh.services.taxii_export.requests.post")
+  def test_basic_auth_mode_emits_basic_header_with_utf8_password(self, post, emit_status):
+    import base64
+    os.environ["REDMESH_TAXII_PASSWORD_TEST"] = "TaxiiAdmin2026"
+    try:
+      post.return_value = _Response()
+      owner = _owner({
+        "AUTH_MODE": "basic",
+        "USERNAME": "redmesh",
+        "PASSWORD_ENV": "REDMESH_TAXII_PASSWORD_TEST",
+      })
+
+      result = publish_to_taxii(owner, "job-1")
+
+      self.assertEqual(result["status"], "ok")
+      expected = base64.b64encode(b"redmesh:TaxiiAdmin2026").decode("ascii")
+      _, kwargs = post.call_args
+      self.assertEqual(kwargs["headers"]["Authorization"], f"Basic {expected}")
+      self.assertEqual(kwargs["headers"]["Accept"], TAXII_MEDIA_TYPE)
+      self.assertEqual(kwargs["headers"]["Content-Type"], STIX_MEDIA_TYPE)
+    finally:
+      os.environ.pop("REDMESH_TAXII_PASSWORD_TEST", None)
+
+  def test_basic_auth_missing_password_is_missing_credentials_preflight(self):
+    os.environ.pop("REDMESH_TAXII_PASSWORD_TEST", None)
+    owner = _owner({
+      "AUTH_MODE": "basic",
+      "USERNAME": "redmesh",
+      "PASSWORD_ENV": "REDMESH_TAXII_PASSWORD_TEST",
+    })
+
+    result = publish_to_taxii(owner, "job-1")
+
+    self.assertEqual(result["status"], "not_configured")
+    self.assertEqual(result["error"], "missing_credentials")
+    owner.r1fs.add_json.assert_not_called()
+    status = get_integration_status(owner)["integrations"]["taxii"]
+    self.assertEqual(status["last_error_class"], "missing_credentials")
+
 
 if __name__ == "__main__":
   unittest.main()

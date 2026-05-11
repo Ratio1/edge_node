@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 import requests
 
 from ..repositories import ArtifactRepository, JobStateRepository
+from .auth import AuthError, build_auth_provider
 from .config import get_opencti_export_config
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
@@ -74,6 +75,8 @@ def _config_error(cfg):
     return "disabled"
   if not cfg["URL"]:
     return "missing_url"
+  # OpenCTI only supports AUTH_MODE=static (UUID API tokens). An empty env
+  # value is a misconfig — surface it before bothering to build a bundle.
   if not _token(cfg):
     return "missing_token"
   return None
@@ -174,7 +177,11 @@ def push_to_opencti(owner, job_id, pass_nr=None):
     "operations": json.dumps(operations),
     "map": json.dumps({"0": ["variables.file"]}),
   }
-  headers = {"Authorization": f"Bearer {_token(cfg)}"}
+  try:
+    headers = build_auth_provider(cfg).headers()
+  except AuthError as exc:
+    record_integration_status(owner, "opencti", outcome="failure", error_class="invalid_auth_config")
+    return {"status": "error", "error": "invalid_auth_config", "detail": str(exc), "job_id": job_id}
 
   try:
     response = requests.post(
