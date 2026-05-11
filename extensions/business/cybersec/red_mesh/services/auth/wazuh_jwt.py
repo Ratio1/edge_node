@@ -108,7 +108,8 @@ class WazuhJwtProvider(AuthProvider):
     self,
     login_url: str,
     username: str,
-    password_env: str,
+    password_env: str = "",
+    password: str = "",
     login_path: str = "/security/user/authenticate?raw=true",
     ttl_override_s: float = 0.0,
     timeout_seconds: float = 10.0,
@@ -117,11 +118,19 @@ class WazuhJwtProvider(AuthProvider):
     self.login_url = (login_url or "").strip()
     self.username = str(username or "")
     self.password_env = str(password_env or "").strip()
+    self._inline_password = str(password or "")
     self.login_path = login_path or "/security/user/authenticate?raw=true"
     self.ttl_override_s = float(ttl_override_s or 0.0)
     self.timeout_seconds = float(timeout_seconds or 10.0)
     # Injectable for tests; defaults to the real urlopen.
     self._http_post = http_post or urllib.request.urlopen
+
+  def _resolve_password(self) -> str:
+    if self._inline_password:
+      return self._inline_password
+    if self.password_env:
+      return os.environ.get(self.password_env, "")
+    return ""
 
   def headers(self) -> dict:
     jwt = self._get_or_login()
@@ -169,11 +178,12 @@ class WazuhJwtProvider(AuthProvider):
       raise AuthError("wazuh_jwt LOGIN_URL is not configured")
     if not self.username:
       raise AuthError("wazuh_jwt USERNAME is not configured")
-    if not self.password_env:
-      raise AuthError("wazuh_jwt PASSWORD_ENV is not configured")
-    password = os.environ.get(self.password_env, "")
+    password = self._resolve_password()
     if not password:
-      raise AuthError(f"wazuh_jwt password env {self.password_env!r} is not set")
+      raise AuthError(
+        "wazuh_jwt password is not configured "
+        f"(neither inline PASSWORD nor env {self.password_env!r} set)"
+      )
 
     url = _normalize_login_url(self.login_url, self.login_path)
     raw = f"{self.username}:{password}".encode("utf-8")
@@ -228,5 +238,6 @@ class WazuhJwtProvider(AuthProvider):
   def __repr__(self) -> str:
     return (
       f"WazuhJwtProvider(login_url={self.login_url!r}, "
-      f"username={self.username!r}, password_env={self.password_env!r})"
+      f"username={self.username!r}, password_env={self.password_env!r}, "
+      f"inline_password_set={bool(self._inline_password)})"
     )

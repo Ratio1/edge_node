@@ -25,30 +25,38 @@ def credentials_missing(integration_cfg: dict) -> str | None:
   otherwise a stable error_class string suitable for integration_status
   and config-error pre-flight in delivery functions.
 
-  This is the single source of truth for "are we configured to talk to
-  this integration." Both the delivery path (taxii_export, wazuh
-  log_export) and the status panel (integration_status) call into it so
-  the UI and the runtime can't disagree about whether an integration is
-  ready.
+  Credentials may be provided two ways:
+    - **Inline** in the config block — `TOKEN` for static mode, `PASSWORD`
+      for basic / wazuh_jwt. Mirrors MISP's `MISP_API_KEY` pattern; secrets
+      live in the persisted pipeline config alongside non-secret fields.
+    - **Indirected** via env-var name — `TOKEN_ENV` / `PASSWORD_ENV`. Useful
+      when secrets must come from the container env (e.g. orchestrator
+      injection).
+
+  Inline values take priority. If both are absent / empty, the integration
+  is reported as missing credentials.
   """
   if not isinstance(integration_cfg, dict):
     return "invalid_auth_config"
   mode = (integration_cfg.get("AUTH_MODE") or "static").lower()
 
   if mode == "static":
+    if (integration_cfg.get("TOKEN") or "").strip():
+      return None
     env_name = (integration_cfg.get("TOKEN_ENV") or "").strip()
-    if not env_name or not os.environ.get(env_name, "").strip():
-      return "missing_token"
-    return None
+    if env_name and os.environ.get(env_name, "").strip():
+      return None
+    return "missing_token"
 
-  # basic and wazuh_jwt both need username + password env var.
   if mode in {"basic", "wazuh_jwt"}:
     if not (integration_cfg.get("USERNAME") or "").strip():
       return "missing_credentials"
+    if (integration_cfg.get("PASSWORD") or "").strip():
+      return None
     pw_env = (integration_cfg.get("PASSWORD_ENV") or "").strip()
-    if not pw_env or not os.environ.get(pw_env, "").strip():
-      return "missing_credentials"
-    return None
+    if pw_env and os.environ.get(pw_env, "").strip():
+      return None
+    return "missing_credentials"
 
   return "invalid_auth_config"
 
@@ -69,12 +77,16 @@ def build_auth_provider(integration_cfg: dict) -> AuthProvider:
   mode = str(integration_cfg.get("AUTH_MODE") or "static").strip().lower()
 
   if mode == "static":
-    return StaticBearerProvider(token_env=integration_cfg.get("TOKEN_ENV") or "")
+    return StaticBearerProvider(
+      token_env=integration_cfg.get("TOKEN_ENV") or "",
+      token=integration_cfg.get("TOKEN") or "",
+    )
 
   if mode == "basic":
     return BasicAuthProvider(
       username=integration_cfg.get("USERNAME") or "",
       password_env=integration_cfg.get("PASSWORD_ENV") or "",
+      password=integration_cfg.get("PASSWORD") or "",
     )
 
   if mode == "wazuh_jwt":
@@ -89,6 +101,7 @@ def build_auth_provider(integration_cfg: dict) -> AuthProvider:
       login_url=login_url,
       username=integration_cfg.get("USERNAME") or "",
       password_env=integration_cfg.get("PASSWORD_ENV") or "",
+      password=integration_cfg.get("PASSWORD") or "",
       login_path=integration_cfg.get("LOGIN_PATH")
         or "/security/user/authenticate?raw=true",
       ttl_override_s=integration_cfg.get("JWT_TTL_OVERRIDE_SECONDS") or 0.0,

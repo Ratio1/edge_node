@@ -293,6 +293,128 @@ class WazuhJwtProviderTests(unittest.TestCase):
     self.assertEqual(_b64url_decode_padded(encoded), raw)
 
 
+class InlineCredentialTests(unittest.TestCase):
+  """Cover the inline TOKEN / PASSWORD path (the MISP_API_KEY-style pattern
+  where secrets live directly in the config block, not behind env-var
+  indirection)."""
+
+  def test_static_inline_token_overrides_env(self):
+    with patch.dict(os.environ, {"UNIT_TOKEN": "env-value"}):
+      provider = StaticBearerProvider(token_env="UNIT_TOKEN", token="inline-value")
+      self.assertEqual(provider.headers(), {"Authorization": "Bearer inline-value"})
+
+  def test_static_inline_token_only(self):
+    provider = StaticBearerProvider(token_env="", token="inline-only")
+    self.assertEqual(provider.headers(), {"Authorization": "Bearer inline-only"})
+
+  def test_static_falls_back_to_env_when_inline_empty(self):
+    with patch.dict(os.environ, {"UNIT_TOKEN": "from-env"}):
+      provider = StaticBearerProvider(token_env="UNIT_TOKEN", token="")
+      self.assertEqual(provider.headers(), {"Authorization": "Bearer from-env"})
+
+  def test_static_repr_does_not_leak_inline_token(self):
+    provider = StaticBearerProvider(token_env="", token="super-secret-value")
+    rendered = repr(provider)
+    self.assertIn("inline_token_set=True", rendered)
+    self.assertNotIn("super-secret-value", rendered)
+
+  def test_basic_inline_password_overrides_env(self):
+    import base64
+    with patch.dict(os.environ, {"UNIT_PW": "env-password"}):
+      provider = BasicAuthProvider(username="u", password_env="UNIT_PW", password="inline-password")
+      header = provider.headers()["Authorization"]
+      decoded = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
+      self.assertEqual(decoded, "u:inline-password")
+
+  def test_basic_inline_password_only(self):
+    import base64
+    provider = BasicAuthProvider(username="redmesh", password_env="", password="TaxiiAdmin2026")
+    decoded = base64.b64decode(provider.headers()["Authorization"].split(" ", 1)[1])
+    self.assertEqual(decoded, b"redmesh:TaxiiAdmin2026")
+
+  def test_basic_repr_does_not_leak_inline_password(self):
+    provider = BasicAuthProvider(username="u", password_env="", password="super-secret")
+    rendered = repr(provider)
+    self.assertIn("inline_password_set=True", rendered)
+    self.assertNotIn("super-secret", rendered)
+
+  def test_basic_no_credential_anywhere_raises(self):
+    provider = BasicAuthProvider(username="u", password_env="UNIT_MISSING", password="")
+    os.environ.pop("UNIT_MISSING", None)
+    with self.assertRaises(AuthError):
+      provider.headers()
+
+  def test_factory_passes_inline_credentials(self):
+    provider = build_auth_provider({
+      "AUTH_MODE": "basic",
+      "USERNAME": "redmesh",
+      "PASSWORD": "TaxiiAdmin2026",
+    })
+    import base64
+    header = provider.headers()["Authorization"]
+    decoded = base64.b64decode(header.split(" ", 1)[1]).decode("utf-8")
+    self.assertEqual(decoded, "redmesh:TaxiiAdmin2026")
+
+  def test_factory_passes_inline_token(self):
+    provider = build_auth_provider({
+      "AUTH_MODE": "static",
+      "TOKEN": "uuid-inline",
+    })
+    self.assertEqual(provider.headers(), {"Authorization": "Bearer uuid-inline"})
+
+  def test_factory_passes_inline_wazuh_jwt_password(self):
+    provider = build_auth_provider({
+      "AUTH_MODE": "wazuh_jwt",
+      "LOGIN_URL": "https://wazuh.example",
+      "USERNAME": "wazuh-wui",
+      "PASSWORD": "inline-wazuh-pw",
+    })
+    # Verify the inline password reached the provider — we test the resolver
+    # directly rather than triggering a real login.
+    self.assertEqual(provider._resolve_password(), "inline-wazuh-pw")
+
+
+class CredentialsMissingTests(unittest.TestCase):
+  def test_static_with_inline_token_is_complete(self):
+    from extensions.business.cybersec.red_mesh.services.auth import credentials_missing
+    self.assertIsNone(credentials_missing({"AUTH_MODE": "static", "TOKEN": "uuid"}))
+
+  def test_static_with_env_token_present_is_complete(self):
+    from extensions.business.cybersec.red_mesh.services.auth import credentials_missing
+    with patch.dict(os.environ, {"UNIT_T": "x"}):
+      self.assertIsNone(credentials_missing({"AUTH_MODE": "static", "TOKEN_ENV": "UNIT_T"}))
+
+  def test_static_with_nothing_returns_missing_token(self):
+    from extensions.business.cybersec.red_mesh.services.auth import credentials_missing
+    self.assertEqual(
+      credentials_missing({"AUTH_MODE": "static", "TOKEN_ENV": "UNIT_MISSING"}),
+      "missing_token",
+    )
+
+  def test_basic_with_inline_password_is_complete(self):
+    from extensions.business.cybersec.red_mesh.services.auth import credentials_missing
+    self.assertIsNone(credentials_missing({
+      "AUTH_MODE": "basic",
+      "USERNAME": "u",
+      "PASSWORD": "pw",
+    }))
+
+  def test_basic_missing_username_even_with_inline_password(self):
+    from extensions.business.cybersec.red_mesh.services.auth import credentials_missing
+    self.assertEqual(
+      credentials_missing({"AUTH_MODE": "basic", "PASSWORD": "pw"}),
+      "missing_credentials",
+    )
+
+  def test_wazuh_jwt_with_inline_password_is_complete(self):
+    from extensions.business.cybersec.red_mesh.services.auth import credentials_missing
+    self.assertIsNone(credentials_missing({
+      "AUTH_MODE": "wazuh_jwt",
+      "USERNAME": "wazuh-wui",
+      "PASSWORD": "pw",
+    }))
+
+
 class BuildAuthProviderTests(unittest.TestCase):
   def test_defaults_to_static(self):
     provider = build_auth_provider({"TOKEN_ENV": "REDMESH_OPENCTI_TOKEN"})
