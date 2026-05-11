@@ -67,7 +67,13 @@ DEFAULT_WAZUH_EXPORT_CONFIG = {
   "SYSLOG_HOST": "",
   "SYSLOG_PORT": 514,
   "HTTP_URL": "",
-  "HTTP_TOKEN_ENV": "REDMESH_WAZUH_HTTP_TOKEN",
+  "AUTH_MODE": "static",
+  "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+  "USERNAME": "",
+  "PASSWORD_ENV": "REDMESH_WAZUH_PASSWORD",
+  "LOGIN_URL": "",
+  "LOGIN_PATH": "/security/user/authenticate?raw=true",
+  "JWT_TTL_OVERRIDE_SECONDS": 0,
   "MIN_SEVERITY": "INFO",
   "INCLUDE_SERVICE_OBSERVATIONS": True,
   "TIMEOUT_SECONDS": 5.0,
@@ -95,6 +101,7 @@ DEFAULT_STIX_EXPORT_CONFIG = {
 DEFAULT_OPENCTI_EXPORT_CONFIG = {
   "ENABLED": False,
   "URL": "",
+  "AUTH_MODE": "static",
   "TOKEN_ENV": "REDMESH_OPENCTI_TOKEN",
   "PUSH_MODE": "manual",
   "MIN_SEVERITY": "MEDIUM",
@@ -103,11 +110,18 @@ DEFAULT_OPENCTI_EXPORT_CONFIG = {
 DEFAULT_TAXII_EXPORT_CONFIG = {
   "ENABLED": False,
   "SERVER_URL": "",
+  "AUTH_MODE": "static",
   "TOKEN_ENV": "REDMESH_TAXII_TOKEN",
+  "USERNAME": "",
+  "PASSWORD_ENV": "REDMESH_TAXII_PASSWORD",
   "COLLECTION_ID": "",
   "MODE": "publish_manual",
   "TIMEOUT_SECONDS": 30.0,
 }
+
+_WAZUH_AUTH_MODES = {"static", "wazuh_jwt"}
+_TAXII_AUTH_MODES = {"static", "basic"}
+_OPENCTI_AUTH_MODES = {"static"}
 
 _REDACTION_MODES = {"hash_only", "summary", "internal_soc", "custom"}
 _TRUST_PROFILES = {"restricted_redacted", "internal_soc", "custom"}
@@ -317,9 +331,27 @@ def get_wazuh_export_config(owner):
         maximum=65535,
       ),
       "HTTP_URL": _safe_http_url(merged.get("HTTP_URL") or defaults["HTTP_URL"]),
-      "HTTP_TOKEN_ENV": _safe_secret_env(
-        merged.get("HTTP_TOKEN_ENV"),
-        defaults["HTTP_TOKEN_ENV"],
+      "AUTH_MODE": _normalized_choice(
+        merged.get("AUTH_MODE"),
+        _WAZUH_AUTH_MODES,
+        defaults["AUTH_MODE"],
+      ),
+      "TOKEN_ENV": _safe_secret_env(
+        merged.get("TOKEN_ENV"),
+        defaults["TOKEN_ENV"],
+      ),
+      "USERNAME": str(merged.get("USERNAME") or defaults["USERNAME"]).strip(),
+      "PASSWORD_ENV": _safe_secret_env(
+        merged.get("PASSWORD_ENV"),
+        defaults["PASSWORD_ENV"],
+      ),
+      "LOGIN_URL": _safe_http_url(merged.get("LOGIN_URL") or defaults["LOGIN_URL"]),
+      "LOGIN_PATH": str(merged.get("LOGIN_PATH") or defaults["LOGIN_PATH"]).strip()
+        or defaults["LOGIN_PATH"],
+      "JWT_TTL_OVERRIDE_SECONDS": _bounded_int(
+        merged.get("JWT_TTL_OVERRIDE_SECONDS", defaults["JWT_TTL_OVERRIDE_SECONDS"]),
+        defaults["JWT_TTL_OVERRIDE_SECONDS"],
+        minimum=0,
       ),
       "MIN_SEVERITY": _normalized_upper_choice(
         merged.get("MIN_SEVERITY"),
@@ -418,6 +450,11 @@ def get_opencti_export_config(owner):
     return {
       "ENABLED": bool(merged.get("ENABLED", defaults["ENABLED"])),
       "URL": _safe_http_url(merged.get("URL") or defaults["URL"]),
+      "AUTH_MODE": _normalized_choice(
+        merged.get("AUTH_MODE"),
+        _OPENCTI_AUTH_MODES,
+        defaults["AUTH_MODE"],
+      ),
       "TOKEN_ENV": _safe_secret_env(merged.get("TOKEN_ENV"), defaults["TOKEN_ENV"]),
       "PUSH_MODE": _normalized_choice(
         merged.get("PUSH_MODE"),
@@ -445,7 +482,17 @@ def get_taxii_export_config(owner):
     return {
       "ENABLED": bool(merged.get("ENABLED", defaults["ENABLED"])),
       "SERVER_URL": _safe_http_url(merged.get("SERVER_URL") or defaults["SERVER_URL"]),
+      "AUTH_MODE": _normalized_choice(
+        merged.get("AUTH_MODE"),
+        _TAXII_AUTH_MODES,
+        defaults["AUTH_MODE"],
+      ),
       "TOKEN_ENV": _safe_secret_env(merged.get("TOKEN_ENV"), defaults["TOKEN_ENV"]),
+      "USERNAME": str(merged.get("USERNAME") or defaults["USERNAME"]).strip(),
+      "PASSWORD_ENV": _safe_secret_env(
+        merged.get("PASSWORD_ENV"),
+        defaults["PASSWORD_ENV"],
+      ),
       "COLLECTION_ID": str(merged.get("COLLECTION_ID") or defaults["COLLECTION_ID"]).strip(),
       "MODE": _normalized_choice(
         merged.get("MODE"),
