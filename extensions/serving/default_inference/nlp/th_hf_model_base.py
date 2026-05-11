@@ -179,14 +179,16 @@ class HfOnnxArtifactPipeline:
       for output_name, output_value in zip(output_names, raw_outputs)
     }
 
-  def _call_decoder(self, outputs_by_name, text):
+  def _call_decoder(self, outputs_by_name, text, inference_kwargs):
     if self.decoder is None:
       return outputs_by_name
     decoder_kwargs = {
+      **dict(inference_kwargs or {}),
       "runtime": self.runtime_key,
       "runtime_key": self.runtime_key,
       "text": text,
       "repo_id": self.repo_id,
+      "inference_kwargs": dict(inference_kwargs or {}),
     }
     try:
       signature = inspect.signature(self.decoder)
@@ -209,7 +211,11 @@ class HfOnnxArtifactPipeline:
     output_names = self._output_names()
     raw_outputs = self.session.run(output_names, session_inputs)
     outputs_by_name = self._build_output_map(raw_outputs, output_names)
-    return self._call_decoder(outputs_by_name=outputs_by_name, text=text)
+    return self._call_decoder(
+      outputs_by_name=outputs_by_name,
+      text=text,
+      inference_kwargs=inference_kwargs,
+    )
 
 
 class ThHfModelBase(BaseServingProcess):
@@ -545,12 +551,13 @@ class ThHfModelBase(BaseServingProcess):
     pattern = str(pattern)
     blocked_suffixes = (
       ".safetensors",
-      "pytorch_model.bin",
-      "tf_model.h5",
-      "flax_model.msgpack",
+      ".bin",
+      ".h5",
+      ".msgpack",
     )
-    blocked_wildcards = ("*.safetensors", "*.bin", "*.h5", "*.msgpack")
-    return pattern.endswith(blocked_suffixes) or pattern in blocked_wildcards
+    blocked_wildcards = ("*", "**/*", "*.safetensors", "*.bin", "*.h5", "*.msgpack")
+    blocked_directory_globs = pattern.endswith("/*") or pattern.endswith("/**")
+    return pattern.endswith(blocked_suffixes) or pattern in blocked_wildcards or blocked_directory_globs
 
   def _build_hf_runtime_allow_patterns(self, runtime_config):
     """Build safe HF snapshot allow-patterns for an ONNX runtime."""
@@ -565,8 +572,6 @@ class ThHfModelBase(BaseServingProcess):
           model_file,
           "*.onnx",
           "**/*.onnx",
-          "onnx/*",
-          "onnx/**",
           "*.json",
           "*.py",
           "*.txt",
@@ -606,6 +611,19 @@ class ThHfModelBase(BaseServingProcess):
     files = runtime_config.get("files") if isinstance(runtime_config, dict) else None
     return files if isinstance(files, list) else []
 
+  def _resolve_hf_snapshot_path(self, model_dir, file_path):
+    """Resolve a manifest path while keeping it inside the downloaded snapshot."""
+    path = Path(str(file_path))
+    if path.is_absolute():
+      raise ValueError(f"HF artifact path {file_path!r} must be relative to the model snapshot.")
+    snapshot_dir = Path(model_dir).resolve()
+    resolved_path = (snapshot_dir / path).resolve()
+    try:
+      resolved_path.relative_to(snapshot_dir)
+    except ValueError as exc:
+      raise ValueError(f"HF artifact path {file_path!r} escapes the model snapshot.") from exc
+    return resolved_path
+
   def _first_manifest_file_with_suffix(self, runtime_config, suffixes):
     """Return the first exact manifest file path ending with any suffix."""
     for file_path in self._runtime_file_list(runtime_config):
@@ -621,10 +639,10 @@ class ThHfModelBase(BaseServingProcess):
       if value is None and isinstance(manifest, dict):
         value = manifest.get(key)
       if value:
-        return Path(model_dir) / str(value)
+        return self._resolve_hf_snapshot_path(model_dir=model_dir, file_path=value)
     inferred = self._first_manifest_file_with_suffix(runtime_config, suffixes)
     if inferred:
-      return Path(model_dir) / inferred
+      return self._resolve_hf_snapshot_path(model_dir=model_dir, file_path=inferred)
     return None
 
   def _load_hf_schema(self, model_dir, manifest, runtime_config):
@@ -640,6 +658,13 @@ class ThHfModelBase(BaseServingProcess):
       raise ValueError(f"HF runtime {self.hf_runtime} does not declare a usable schema file.")
     return json.loads(schema_path.read_text(encoding="utf-8"))
 
+  def _runtime_allows_remote_code(self, manifest, runtime_config):
+    """Return whether the selected runtime explicitly allows Python artifact code."""
+    for source in (runtime_config, manifest):
+      if isinstance(source, dict) and "trust_remote_code" in source:
+        return bool(source.get("trust_remote_code"))
+    return False
+
   def _load_hf_contract_decoder(self, model_dir, manifest, runtime_config):
     """Load the artifact decoder function declared by the selected HF runtime."""
     decoder_path = self._resolve_manifest_file_path(
@@ -651,6 +676,14 @@ class ThHfModelBase(BaseServingProcess):
     )
     if decoder_path is None or not decoder_path.exists():
       raise ValueError(f"HF runtime {self.hf_runtime} does not declare a usable contract decoder.")
+    if not bool(self.cfg_trust_remote_code) or not self._runtime_allows_remote_code(
+      manifest=manifest,
+      runtime_config=runtime_config,
+    ):
+      raise ValueError(
+        "HF ONNX artifact decoder requires global TRUST_REMOTE_CODE=True and runtime "
+        f"trust_remote_code=True because it executes Python code from {decoder_path}."
+      )
     module_name = f"hf_artifact_contract_{abs(hash(str(decoder_path)))}"
     spec = importlib.util.spec_from_file_location(module_name, decoder_path)
     if spec is None or spec.loader is None:
@@ -684,7 +717,7 @@ class ThHfModelBase(BaseServingProcess):
     for key in ("model", "model_file", "path"):
       value = runtime_config.get(key) if isinstance(runtime_config, dict) else None
       if value:
-        return Path(model_dir) / str(value)
+        return self._resolve_hf_snapshot_path(model_dir=model_dir, file_path=value)
     models = schema.get("models") if isinstance(schema, dict) else None
     if isinstance(models, dict):
       candidates = [
@@ -699,10 +732,10 @@ class ThHfModelBase(BaseServingProcess):
             value = value.get("path") or value.get("file") or value.get("model")
           if not value:
             continue
-          return Path(model_dir) / str(value)
+          return self._resolve_hf_snapshot_path(model_dir=model_dir, file_path=value)
     model_file = self._first_manifest_file_with_suffix(runtime_config, (".onnx",))
     if model_file:
-      return Path(model_dir) / model_file
+      return self._resolve_hf_snapshot_path(model_dir=model_dir, file_path=model_file)
     raise ValueError(f"HF runtime {runtime_key} does not declare an ONNX model file.")
 
   def _resolve_hf_tokenizer_dir(self, model_dir, manifest, runtime_config, schema):
@@ -712,16 +745,19 @@ class ThHfModelBase(BaseServingProcess):
       if isinstance(source, dict) and source.get("tokenizer_dir"):
         tokenizer_dir = source["tokenizer_dir"]
         break
-    return Path(model_dir) / str(tokenizer_dir or ".")
+    return self._resolve_hf_snapshot_path(model_dir=model_dir, file_path=tokenizer_dir or ".")
 
-  def _load_hf_onnx_tokenizer(self, model_dir, runtime_config):
+  def _load_hf_onnx_tokenizer(self, model_dir, runtime_config, manifest=None):
     """Load the tokenizer for an ONNX HF artifact."""
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(
       str(model_dir),
       token=self.hf_token,
-      trust_remote_code=bool(runtime_config.get("trust_remote_code", False)),
+      trust_remote_code=bool(self.cfg_trust_remote_code) and self._runtime_allows_remote_code(
+        manifest=manifest,
+        runtime_config=runtime_config,
+      ),
     )
 
   def _create_hf_onnx_session(self, model_path, providers):
@@ -751,6 +787,7 @@ class ThHfModelBase(BaseServingProcess):
     tokenizer = self._load_hf_onnx_tokenizer(
       model_dir=tokenizer_dir,
       runtime_config=runtime_config,
+      manifest=manifest,
     )
     model_path = self._resolve_hf_onnx_model_path(
       model_dir=model_dir,
@@ -889,15 +926,32 @@ class ThHfModelBase(BaseServingProcess):
     self.hf_runtime_config = dict(runtime_config or {})
     self.hf_artifact_manifest = manifest if isinstance(manifest, dict) else None
 
+    run_warmup = True
     if self._runtime_is_onnx(runtime_key=runtime_key, runtime_config=runtime_config):
-      self._startup_hf_onnx_artifact(
-        runtime_key=runtime_key,
-        runtime_config=runtime_config,
-        manifest=manifest,
-      )
+      try:
+        self._startup_hf_onnx_artifact(
+          runtime_key=runtime_key,
+          runtime_config=runtime_config,
+          manifest=manifest,
+        )
+        self._run_startup_warmup()
+        run_warmup = False
+      except Exception as exc:
+        if requested_runtime != "auto":
+          raise
+        self.P(
+          f"HF auto runtime could not start ONNX artifact {runtime_key!r} for "
+          f"{self.get_model_name()}: {exc}. Falling back to Transformers/PT.",
+          color="y",
+        )
+        self.hf_runtime = "pt"
+        self.hf_runtime_config = {}
+        self.hf_artifact_manifest = None
+        self._startup_transformers_pipeline()
     else:
       self._startup_transformers_pipeline()
-    self._run_startup_warmup()
+    if run_warmup:
+      self._run_startup_warmup()
     return
 
   def _get_hf_artifact_model_metadata(self):
