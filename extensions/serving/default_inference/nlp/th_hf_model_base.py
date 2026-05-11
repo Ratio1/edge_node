@@ -9,6 +9,8 @@ input/output handling.
 import importlib.util
 import inspect
 import json
+import os
+import shutil
 from pathlib import Path, PurePosixPath
 
 import torch as th
@@ -798,6 +800,65 @@ class ThHfModelBase(BaseServingProcess):
       return self._resolve_hf_snapshot_path(model_dir=model_dir, file_path=model_file)
     raise ValueError(f"HF runtime {runtime_key} does not declare an ONNX model file.")
 
+  def _hf_onnx_materialized_root(self, model_dir, runtime_key):
+    """Return the local directory used for ORT-compatible ONNX artifacts."""
+    snapshot_name = Path(model_dir).name
+    model_key = str(self.get_model_name()).replace("/", "--")
+    return Path(self.cache_dir) / "_onnx_materialized" / model_key / snapshot_name / str(runtime_key)
+
+  def _materialize_hf_onnx_file(self, source_path, destination_path):
+    """Materialize one HF snapshot file as a real local file or hardlink."""
+    source_path = Path(source_path)
+    destination_path = Path(destination_path)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    resolved_source = source_path.resolve()
+    if destination_path.exists():
+      try:
+        if not destination_path.is_symlink() and destination_path.stat().st_size == resolved_source.stat().st_size:
+          return
+      except OSError:
+        pass
+      destination_path.unlink()
+    try:
+      os.link(resolved_source, destination_path)
+    except OSError:
+      shutil.copy2(resolved_source, destination_path)
+    return
+
+  def _materialize_hf_onnx_artifact(self, model_dir, runtime_key, runtime_config, schema, model_path):
+    """Prepare an ONNX artifact outside the HF symlink snapshot for ORT."""
+    root_dir = self._hf_onnx_materialized_root(model_dir=model_dir, runtime_key=runtime_key)
+    materialized_paths = []
+    model_snapshot_dir = Path(model_dir)
+    model_relative_path = Path(model_path).relative_to(model_snapshot_dir)
+    file_paths = []
+    for file_path in self._runtime_file_list(runtime_config):
+      file_path = str(file_path)
+      if file_path.endswith(".onnx") or ".onnx_data" in file_path or file_path.endswith(".onnx.data"):
+        file_paths.append(file_path)
+    if str(model_relative_path) not in file_paths:
+      file_paths.append(str(model_relative_path))
+    for file_path in file_paths:
+      source_path = self._resolve_hf_snapshot_path(model_dir=model_dir, file_path=file_path)
+      if not source_path.exists():
+        continue
+      destination_path = root_dir / Path(file_path)
+      self._materialize_hf_onnx_file(
+        source_path=source_path,
+        destination_path=destination_path,
+      )
+      materialized_paths.append(destination_path)
+    materialized_model_path = root_dir / model_relative_path
+    if not materialized_model_path.exists():
+      raise ValueError(f"Could not materialize ONNX model file {model_relative_path!s}.")
+    if materialized_paths:
+      self.P(
+        f"Materialized HF ONNX artifact {runtime_key} with {len(materialized_paths)} file(s) "
+        f"under {root_dir}.",
+        color="y",
+      )
+    return materialized_model_path
+
   def _resolve_hf_tokenizer_dir(self, model_dir, manifest, runtime_config, schema):
     """Resolve tokenizer directory for the selected artifact runtime."""
     tokenizer_dir = None
@@ -854,6 +915,13 @@ class ThHfModelBase(BaseServingProcess):
       runtime_key=runtime_key,
       runtime_config=runtime_config,
       schema=schema,
+    )
+    model_path = self._materialize_hf_onnx_artifact(
+      model_dir=model_dir,
+      runtime_key=runtime_key,
+      runtime_config=runtime_config,
+      schema=schema,
+      model_path=model_path,
     )
     provider = runtime_config.get("provider") or "CPUExecutionProvider"
     providers = runtime_config.get("providers") or [provider]

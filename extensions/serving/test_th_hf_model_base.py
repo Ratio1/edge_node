@@ -875,6 +875,78 @@ class ThHfModelBaseTests(unittest.TestCase):
     self.assertEqual(fake_tokenizer.calls[-1][1]["return_tensors"], "np")
     self.assertTrue(fake_tokenizer.calls[-1][1]["return_offsets_mapping"])
 
+  def test_onnx_artifact_pipeline_materializes_symlinked_external_data(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      TRUST_REMOTE_CODE=True,
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    fake_tokenizer = _FakeTokenizer()
+    fake_session = _FakeOrtSession()
+    created_sessions = []
+    plugin._load_hf_onnx_tokenizer = (  # pylint: disable=protected-access
+      lambda model_dir, runtime_config, manifest=None: fake_tokenizer
+    )
+    plugin._create_hf_onnx_session = (  # pylint: disable=protected-access
+      lambda model_path, providers: created_sessions.append((Path(model_path), providers)) or fake_session
+    )
+
+    with TemporaryDirectory() as tmpdir:
+      root_dir = Path(tmpdir)
+      model_dir = root_dir / "snapshot"
+      blob_dir = root_dir / "blobs"
+      cache_dir = root_dir / "models-cache"
+      onnx_dir = model_dir / "onnx"
+      blob_dir.mkdir(parents=True)
+      onnx_dir.mkdir(parents=True)
+      cache_dir.mkdir()
+      plugin.log.get_models_folder = lambda: str(cache_dir)
+      (blob_dir / "model.onnx").write_text("onnx", encoding="utf-8")
+      (blob_dir / "model.onnx_data").write_text("weights", encoding="utf-8")
+      (onnx_dir / "model.onnx").symlink_to(blob_dir / "model.onnx")
+      (onnx_dir / "model.onnx_data").symlink_to(blob_dir / "model.onnx_data")
+      (model_dir / "schema.json").write_text(
+        '{"outputs":[{"name":"scores"}],"models":{"onnx_fp32":{"path":"onnx/model.onnx"}}}',
+        encoding="utf-8",
+      )
+      (model_dir / "contract.py").write_text(
+        "def decode_outputs(outputs, schema, **kwargs):\n  return outputs\n",
+        encoding="utf-8",
+      )
+      manifest = {
+        "pipeline_task": "text-classification",
+        "runtimes": {
+          "onnx_fp32": {
+            "runtime": "onnxruntime",
+            "trust_remote_code": False,
+            "files": [
+              "onnx/model.onnx",
+              "onnx/model.onnx_data",
+              "schema.json",
+              "contract.py",
+            ],
+          }
+        },
+      }
+
+      plugin._build_hf_onnx_artifact_pipeline(  # pylint: disable=protected-access
+        model_dir=str(model_dir),
+        runtime_key="onnx_fp32",
+        runtime_config=manifest["runtimes"]["onnx_fp32"],
+        manifest=manifest,
+      )
+
+      materialized_model_path = created_sessions[0][0]
+      materialized_sidecar_path = materialized_model_path.parent / "model.onnx_data"
+      self.assertTrue(materialized_model_path.exists())
+      self.assertTrue(materialized_sidecar_path.exists())
+      self.assertFalse(materialized_model_path.is_symlink())
+      self.assertFalse(materialized_sidecar_path.is_symlink())
+      self.assertEqual(materialized_sidecar_path.read_text(encoding="utf-8"), "weights")
+      self.assertIn("_onnx_materialized", str(materialized_model_path))
+
 
 if __name__ == "__main__":
   unittest.main()
