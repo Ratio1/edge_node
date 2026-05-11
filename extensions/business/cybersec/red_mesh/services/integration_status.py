@@ -4,6 +4,7 @@ import os
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
+from .auth import credentials_missing
 from .config import (
   get_event_export_config,
   get_opencti_export_config,
@@ -131,7 +132,24 @@ def _wazuh_status(owner):
   mode = cfg["MODE"]
   host = cfg["SYSLOG_HOST"] if mode == "syslog" else _redacted_url_host(cfg["HTTP_URL"])
   missing_secret = event_cfg["SIGN_PAYLOADS"] and not _has_env_secret(event_cfg["HMAC_SECRET_ENV"])
-  configured = bool(cfg["ENABLED"]) and bool(host) and not missing_secret
+  # Credential check only applies to http mode; syslog over UDP/TCP is
+  # authenticated by network position, not by token or username.
+  credentials_error = credentials_missing(cfg) if mode == "http" else None
+  configured = (
+    bool(cfg["ENABLED"])
+    and bool(host)
+    and not missing_secret
+    and credentials_error is None
+  )
+  if cfg["ENABLED"] and host:
+    if missing_secret:
+      error_class = "missing_hmac_secret"
+    elif credentials_error:
+      error_class = credentials_error
+    else:
+      error_class = None
+  else:
+    error_class = None
   return _base_status(
     "wazuh",
     enabled=cfg["ENABLED"],
@@ -139,9 +157,10 @@ def _wazuh_status(owner):
     destination_type=mode,
     destination_label="wazuh",
     redacted_host=host,
-    error_class="missing_hmac_secret" if cfg["ENABLED"] and host and missing_secret else None,
+    error_class=error_class,
     config={
       "mode": mode,
+      "auth_mode": cfg["AUTH_MODE"],
       "min_severity": cfg["MIN_SEVERITY"],
       "include_service_observations": cfg["INCLUDE_SERVICE_OBSERVATIONS"],
       "timeout_seconds": cfg["TIMEOUT_SECONDS"],
@@ -186,8 +205,8 @@ def _stix_status(owner):
 def _opencti_status(owner):
   cfg = get_opencti_export_config(owner)
   host = _redacted_url_host(cfg["URL"])
-  token_ready = _has_env_secret(cfg["TOKEN_ENV"])
-  configured = bool(cfg["ENABLED"]) and bool(host) and token_ready
+  credentials_error = credentials_missing(cfg)
+  configured = bool(cfg["ENABLED"]) and bool(host) and credentials_error is None
   return _base_status(
     "opencti",
     enabled=cfg["ENABLED"],
@@ -195,10 +214,11 @@ def _opencti_status(owner):
     destination_type="http",
     destination_label="opencti",
     redacted_host=host,
-    error_class="missing_token" if cfg["ENABLED"] and host and not token_ready else None,
+    error_class=credentials_error if cfg["ENABLED"] and host else None,
     config={
       "push_mode": cfg["PUSH_MODE"],
       "min_severity": cfg["MIN_SEVERITY"],
+      "auth_mode": cfg["AUTH_MODE"],
       "token_env": cfg["TOKEN_ENV"],
     },
   )
@@ -207,8 +227,13 @@ def _opencti_status(owner):
 def _taxii_status(owner):
   cfg = get_taxii_export_config(owner)
   host = _redacted_url_host(cfg["SERVER_URL"])
-  token_ready = _has_env_secret(cfg["TOKEN_ENV"])
-  configured = bool(cfg["ENABLED"]) and bool(host) and bool(cfg["COLLECTION_ID"]) and token_ready
+  credentials_error = credentials_missing(cfg)
+  configured = (
+    bool(cfg["ENABLED"])
+    and bool(host)
+    and bool(cfg["COLLECTION_ID"])
+    and credentials_error is None
+  )
   return _base_status(
     "taxii",
     enabled=cfg["ENABLED"],
@@ -216,9 +241,10 @@ def _taxii_status(owner):
     destination_type="taxii_2.1",
     destination_label="taxii",
     redacted_host=host,
-    error_class="missing_token" if cfg["ENABLED"] and host and not token_ready else None,
+    error_class=credentials_error if cfg["ENABLED"] and host else None,
     config={
       "mode": cfg["MODE"],
+      "auth_mode": cfg["AUTH_MODE"],
       "collection_id": cfg["COLLECTION_ID"],
       "token_env": cfg["TOKEN_ENV"],
       "timeout_seconds": cfg["TIMEOUT_SECONDS"],

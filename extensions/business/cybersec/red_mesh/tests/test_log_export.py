@@ -101,6 +101,9 @@ class TestLogExport(unittest.TestCase):
   @patch("extensions.business.cybersec.red_mesh.services.log_export.urllib.request.urlopen")
   def test_http_export_retries_and_persists_redacted_failed_sample(self, urlopen):
     os.environ["REDMESH_EVENT_HMAC_SECRET"] = "signing-secret"
+    # Configure auth so the status panel's base-state error doesn't mask the
+    # actual transport-level error we're testing (URLError -> http_unreachable).
+    os.environ["REDMESH_WAZUH_TOKEN"] = "bearer-secret"
     owner = _owner({
       "RETRY_ATTEMPTS": 1,
       "PERSIST_FAILED_PAYLOADS": True,

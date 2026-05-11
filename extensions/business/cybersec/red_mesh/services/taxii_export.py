@@ -8,7 +8,7 @@ from urllib.parse import quote, urlsplit
 import requests
 
 from ..repositories import ArtifactRepository, JobStateRepository
-from .auth import AuthError, build_auth_provider
+from .auth import AuthError, build_auth_provider, credentials_missing
 from .config import get_taxii_export_config
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
@@ -56,23 +56,6 @@ def _token(cfg):
   return str(os.environ.get(cfg["TOKEN_ENV"]) or "").strip()
 
 
-def _credentials_missing(cfg):
-  """Pre-flight credential check before bothering to build a STIX bundle.
-  Returns None when creds look complete, otherwise a stable error_class."""
-  mode = (cfg.get("AUTH_MODE") or "static").lower()
-  if mode == "basic":
-    if not (cfg.get("USERNAME") or "").strip():
-      return "missing_credentials"
-    password_env = (cfg.get("PASSWORD_ENV") or "").strip()
-    if not password_env or not os.environ.get(password_env, "").strip():
-      return "missing_credentials"
-    return None
-  # static (default) — preserve the existing missing_token error class.
-  if not _token(cfg):
-    return "missing_token"
-  return None
-
-
 def _objects_url(server_url, collection_id):
   base = str(server_url or "").strip().rstrip("/")
   if not base:
@@ -95,7 +78,7 @@ def _config_error(cfg):
     return "missing_server_url"
   if not cfg["COLLECTION_ID"]:
     return "missing_collection_id"
-  credentials_error = _credentials_missing(cfg)
+  credentials_error = credentials_missing(cfg)
   if credentials_error:
     return credentials_error
   return None

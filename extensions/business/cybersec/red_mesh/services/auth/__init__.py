@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from .base import AuthConfigError, AuthError, AuthExpiredError, AuthProvider
 from .providers import BasicAuthProvider, StaticBearerProvider
 from .wazuh_jwt import WazuhJwtProvider, _origin_from_url
@@ -14,7 +16,41 @@ __all__ = [
   "BasicAuthProvider",
   "WazuhJwtProvider",
   "build_auth_provider",
+  "credentials_missing",
 ]
+
+
+def credentials_missing(integration_cfg: dict) -> str | None:
+  """Return None when the cfg has the credentials its AUTH_MODE needs,
+  otherwise a stable error_class string suitable for integration_status
+  and config-error pre-flight in delivery functions.
+
+  This is the single source of truth for "are we configured to talk to
+  this integration." Both the delivery path (taxii_export, wazuh
+  log_export) and the status panel (integration_status) call into it so
+  the UI and the runtime can't disagree about whether an integration is
+  ready.
+  """
+  if not isinstance(integration_cfg, dict):
+    return "invalid_auth_config"
+  mode = (integration_cfg.get("AUTH_MODE") or "static").lower()
+
+  if mode == "static":
+    env_name = (integration_cfg.get("TOKEN_ENV") or "").strip()
+    if not env_name or not os.environ.get(env_name, "").strip():
+      return "missing_token"
+    return None
+
+  # basic and wazuh_jwt both need username + password env var.
+  if mode in {"basic", "wazuh_jwt"}:
+    if not (integration_cfg.get("USERNAME") or "").strip():
+      return "missing_credentials"
+    pw_env = (integration_cfg.get("PASSWORD_ENV") or "").strip()
+    if not pw_env or not os.environ.get(pw_env, "").strip():
+      return "missing_credentials"
+    return None
+
+  return "invalid_auth_config"
 
 
 def build_auth_provider(integration_cfg: dict) -> AuthProvider:
