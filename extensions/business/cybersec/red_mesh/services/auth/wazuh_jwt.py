@@ -33,6 +33,12 @@ _EXPIRY_SAFETY_SECONDS = 60.0
 # configured. Kept short so the next call re-mints if needed.
 _DEFAULT_FALLBACK_TTL = 60.0
 
+# Identify ourselves on outbound HTTP. Many SIEM endpoints sit behind
+# Cloudflare or similar CDNs that block urllib's default "Python-urllib/3.12"
+# UA as a generic bot (Cloudflare error 1010). A self-identifying UA is both
+# polite and unblockable.
+_DEFAULT_USER_AGENT = "RedMesh/1.0"
+
 
 def _b64url_decode_padded(segment: str) -> bytes:
   """Decode a base64url-encoded JWT segment, restoring missing padding."""
@@ -175,7 +181,10 @@ class WazuhJwtProvider(AuthProvider):
     request = urllib.request.Request(
       url,
       data=b"",
-      headers={"Authorization": f"Basic {basic}"},
+      headers={
+        "Authorization": f"Basic {basic}",
+        "User-Agent": _DEFAULT_USER_AGENT,
+      },
       method="POST",
     )
 

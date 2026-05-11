@@ -77,6 +77,10 @@ def _sign_payload_if_required(event_cfg, payload_bytes):
 def _http_headers(event, signature, provider=None):
   headers = {
     "Content-Type": "application/json",
+    # Many SIEM/CTI endpoints sit behind Cloudflare or similar CDNs that
+    # block urllib's default UA as a bot (CF error 1010). Identify ourselves
+    # so we don't get challenged in production.
+    "User-Agent": "RedMesh/1.0",
     "X-RedMesh-Event-Id": _event_id(event),
     "X-RedMesh-Dedupe-Key": _dedupe_key(event),
   }
