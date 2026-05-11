@@ -660,10 +660,7 @@ class ThHfModelBase(BaseServingProcess):
 
   def _runtime_allows_remote_code(self, manifest, runtime_config):
     """Return whether the selected runtime explicitly allows Python artifact code."""
-    for source in (runtime_config, manifest):
-      if isinstance(source, dict) and "trust_remote_code" in source:
-        return bool(source.get("trust_remote_code"))
-    return False
+    return isinstance(runtime_config, dict) and bool(runtime_config.get("trust_remote_code"))
 
   def _load_hf_contract_decoder(self, model_dir, manifest, runtime_config):
     """Load the artifact decoder function declared by the selected HF runtime."""

@@ -585,6 +585,28 @@ class ThHfModelBaseTests(unittest.TestCase):
           runtime_config={"decoder": "contract.py", "trust_remote_code": False},
         )
 
+  def test_top_level_manifest_trust_remote_code_does_not_enable_runtime_decoder(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      TRUST_REMOTE_CODE=True,
+    )
+    plugin.hf_runtime = "onnx_fp32"
+
+    with TemporaryDirectory() as tmpdir:
+      model_dir = Path(tmpdir)
+      (model_dir / "contract.py").write_text(
+        "def decode_outputs(outputs, schema):\n  return outputs\n",
+        encoding="utf-8",
+      )
+
+      with self.assertRaisesRegex(ValueError, "runtime trust_remote_code=True"):
+        plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
+          model_dir=str(model_dir),
+          manifest={"trust_remote_code": True},
+          runtime_config={"decoder": "contract.py"},
+        )
+
   def test_hf_artifact_paths_must_stay_inside_snapshot(self):
     plugin = _ConcreteHfModel(MODEL_NAME="test/model")
     plugin.hf_runtime = "onnx_fp32"
