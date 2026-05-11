@@ -1,3 +1,8 @@
+import json
+import re
+from datetime import datetime, timezone
+from math import isfinite
+
 from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
@@ -5,13 +10,19 @@ from naeural_core import constants as ct
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
   DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL, \
-  CONTAINERIZED_APPS_SIGNATURES
+  CONTAINERIZED_APPS_SIGNATURES, DEEPLOY_PLUS_PREFERRED_NODES_HKEY
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
 DEEPLOY_DEBUG = True
 
 MESSAGE_PREFIX = "Please sign this message for Deeploy: "
+PREFERRED_NODE_ADDRESS_RE = re.compile(r"^0xai_[A-Za-z0-9_-]+$")
+PREFERRED_NODES_SCHEMA_VERSION = 1
+PREFERRED_NODES_MAX_COUNT = 100
+PREFERRED_NODES_MAX_PAYLOAD_BYTES = 32 * 1024
+PREFERRED_NODE_ALIAS_MAX_LENGTH = 128
+PREFERRED_NODE_DESCRIPTION_MAX_LENGTH = 512
 
 class _DeeployMixin:
   def __init__(self):
@@ -27,6 +38,382 @@ class _DeeployMixin:
       s = "[DEPDBG] " + s
       self.P(s, *args, **kwargs)
     return  
+
+  @staticmethod
+  def _node_specs_number(value):
+    """
+    Normalize resource telemetry numbers for JSON responses.
+    """
+    if value is None or isinstance(value, bool):
+      return None
+    try:
+      number = float(value)
+    except (TypeError, ValueError):
+      return None
+    if not isfinite(number) or number < 0:
+      return None
+    if number.is_integer():
+      return int(number)
+    return round(number, 3)
+
+
+  def _normalize_node_specs_address(self, node_addr):
+    """
+    Normalize a caller-provided node address to the prefixed internal form.
+    """
+    if node_addr is None:
+      return None
+
+    raw_addr = str(node_addr).strip()
+    if not raw_addr:
+      return None
+
+    if hasattr(self, 'bc') and hasattr(self.bc, 'maybe_add_prefix'):
+      return self.bc.maybe_add_prefix(raw_addr)
+
+    return raw_addr if raw_addr.startswith("0xai_") else f"0xai_{raw_addr}"
+
+
+  def _get_node_specs(self, target_nodes):
+    """
+    Return total and live-available CPU, memory, and disk specs for nodes.
+    Values are reported in cores and GB, matching heartbeat telemetry units.
+    """
+    if not isinstance(target_nodes, (list, tuple, set)):
+      raise ValueError("'target_nodes' must be a list of node addresses.")
+
+    result = {}
+    seen = set()
+
+    for node in target_nodes:
+      node_addr = self._normalize_node_specs_address(node)
+      if not node_addr or node_addr in seen:
+        continue
+      seen.add(node_addr)
+
+      try:
+        result[node_addr] = {
+          "node_alias": self.netmon.network_node_eeid(node_addr),
+          "node_is_online": self.netmon.network_node_is_online(node_addr),
+          "cpu": {
+            "total": self._node_specs_number(self.netmon.network_node_total_cpu_cores(node_addr)),
+            "available": self._node_specs_number(self.netmon.network_node_avail_cpu_cores(node_addr)),
+          },
+          "memory": {
+            "total": self._node_specs_number(self.netmon.network_node_total_mem(node_addr)),
+            "available": self._node_specs_number(self.netmon.network_node_avail_mem(node_addr)),
+          },
+          "disk": {
+            "total": self._node_specs_number(self.netmon.network_node_total_disk(node_addr)),
+            "available": self._node_specs_number(self.netmon.network_node_avail_disk(node_addr)),
+          },
+        }
+      except Exception as exc:
+        result[node_addr] = {
+          "error": str(exc),
+        }
+    # endfor target_nodes
+
+    return result
+
+
+  def _preferred_nodes_now(self):
+    """
+    Return the current timestamp for Preferred Nodes metadata.
+
+    Returns
+    -------
+    str
+        UTC ISO-8601 timestamp with millisecond precision. The format matches
+        the dApp's existing `Date.toISOString()` values so old local-cache
+        entries and CStore entries can be compared lexicographically.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+  def _preferred_node_default_alias(self, address: str):
+    """
+    Return the fallback alias for a preferred node address.
+
+    Parameters
+    ----------
+    address : str
+        Normalized Ratio1 node address.
+
+    Returns
+    -------
+    str
+        Compact address alias used only when live node metadata does not expose
+        `node_alias` yet.
+    """
+    if len(address) <= 18:
+      return address
+    return f"{address[:12]}...{address[-6:]}"
+
+
+  def _preferred_nodes_storage_key(self, auth_result: dict):
+    """
+    Build the CStore field key for a CSP's Preferred Nodes list.
+
+    Parameters
+    ----------
+    auth_result : dict
+        Deeploy auth result containing `escrow_owner`.
+
+    Returns
+    -------
+    str
+        Lowercase escrow owner address used as the first implementation's CSP
+        storage key.
+
+    Raises
+    ------
+    ValueError
+        If the auth result does not contain an escrow owner.
+    """
+    escrow_owner = str(auth_result.get(DEEPLOY_KEYS.ESCROW_OWNER, "")).strip()
+    if not escrow_owner:
+      raise ValueError("Preferred Nodes storage requires an escrow owner.")
+    # Keying by owner lets delegates share the owner CSP list in v1.
+    return escrow_owner.lower()
+
+
+  def get_plus_level_for_escrow(self, sender: str, sender_escrow: str, escrow_owner: str):
+    """
+    Return the Plus+ entitlement level for an active CSP escrow.
+
+    Parameters
+    ----------
+    sender : str
+        Wallet address that signed the Deeploy request.
+    sender_escrow : str
+        Escrow contract resolved by Deeploy auth.
+    escrow_owner : str
+        CSP owner resolved by Deeploy auth.
+
+    Returns
+    -------
+    int
+        Plus+ level. If the blockchain adapter exposes a Plus+ helper, that
+        helper is used. Otherwise active escrow users temporarily fall back to
+        level `1` until the escrow ABI exposes the storage getter everywhere.
+    """
+    if hasattr(self, "bc"):
+      get_csp_plus_level = getattr(self.bc, "get_csp_plus_level", None)
+      if callable(get_csp_plus_level):
+        return int(get_csp_plus_level(sender_escrow))
+
+      get_escrow_plus_level = getattr(self.bc, "get_escrow_plus_level", None)
+      if callable(get_escrow_plus_level):
+        return int(get_escrow_plus_level(sender_escrow))
+
+      get_sender_plus_level = getattr(self.bc, "get_plus_level_for_escrow", None)
+      if callable(get_sender_plus_level):
+        return int(get_sender_plus_level(sender, sender_escrow, escrow_owner))
+
+    return 1
+
+
+  def _normalize_preferred_node_entry(self, node: dict, now: str):
+    """
+    Normalize and validate one Preferred Nodes entry.
+
+    Parameters
+    ----------
+    node : dict
+        Raw preferred-node entry from API request or CStore payload.
+    now : str
+        Timestamp fallback for missing `createdAt` or `updatedAt` fields.
+
+    Returns
+    -------
+    dict
+        Normalized entry with address, alias, optional description, and
+        timestamps.
+
+    Raises
+    ------
+    ValueError
+        If the entry is not a dictionary, the address is invalid, or metadata
+        exceeds configured limits.
+    """
+    if not isinstance(node, dict):
+      raise ValueError("Preferred node entries must be dictionaries.")
+
+    address = str(node.get("address", "")).strip()
+    if not PREFERRED_NODE_ADDRESS_RE.match(address):
+      raise ValueError(f"Invalid preferred node address: {address}")
+
+    legacy_label = str(node.get("label", "")).strip()
+    alias = str(node.get("alias", "")).strip() or legacy_label or self._preferred_node_default_alias(address)
+    if len(alias) > PREFERRED_NODE_ALIAS_MAX_LENGTH:
+      raise ValueError("Preferred node alias is too long.")
+
+    description = str(node.get("description", "")).strip()
+    if len(description) > PREFERRED_NODE_DESCRIPTION_MAX_LENGTH:
+      raise ValueError("Preferred node description is too long.")
+
+    created_at = str(node.get("createdAt", "")).strip() or now
+    updated_at = str(node.get("updatedAt", "")).strip() or now
+
+    normalized = {
+      "address": address,
+      "alias": alias,
+      "createdAt": created_at,
+      "updatedAt": updated_at,
+    }
+    if description:
+      normalized["description"] = description
+    return normalized
+
+
+  def normalize_preferred_nodes(self, preferred_nodes):
+    """
+    Normalize a full Preferred Nodes list.
+
+    Parameters
+    ----------
+    preferred_nodes : list[dict]
+        Raw preferred-node list from API input or CStore.
+
+    Returns
+    -------
+    list[dict]
+        Normalized, deduplicated entries. If duplicate addresses are supplied,
+        the last entry wins while preserving the position of first occurrence.
+
+    Raises
+    ------
+    ValueError
+        If the list shape, list length, entry address, or entry metadata is
+        invalid.
+    """
+    if not isinstance(preferred_nodes, list):
+      raise ValueError("'preferred_nodes' must be a list.")
+    if len(preferred_nodes) > PREFERRED_NODES_MAX_COUNT:
+      raise ValueError(f"too many preferred nodes: {len(preferred_nodes)} > {PREFERRED_NODES_MAX_COUNT}")
+
+    now = self._preferred_nodes_now()
+    ordered_addresses = []
+    by_address = {}
+    for raw_node in preferred_nodes:
+      node = self._normalize_preferred_node_entry(raw_node, now)
+      address = node["address"]
+      if address not in by_address:
+        ordered_addresses.append(address)
+      by_address[address] = node
+    return [by_address[address] for address in ordered_addresses]
+
+
+  def _parse_preferred_nodes_payload(self, raw_payload):
+    """
+    Parse a Preferred Nodes CStore value.
+
+    Parameters
+    ----------
+    raw_payload : str | dict | list | None
+        Value returned by CStore. Versioned JSON text is preferred, while dict
+        and list values are accepted for compatibility with older or manual
+        writes.
+
+    Returns
+    -------
+    list[dict]
+        Normalized preferred-node entries.
+
+    Raises
+    ------
+    ValueError
+        If the stored payload cannot be parsed or has an unsupported shape.
+    """
+    if raw_payload is None:
+      return []
+
+    payload = raw_payload
+    if isinstance(raw_payload, str):
+      if not raw_payload.strip():
+        return []
+      try:
+        payload = json.loads(raw_payload)
+      except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid Preferred Nodes CStore JSON: {exc}") from exc
+
+    if isinstance(payload, dict):
+      nodes = payload.get(DEEPLOY_KEYS.PREFERRED_NODES, payload.get("nodes", []))
+    elif isinstance(payload, list):
+      nodes = payload
+    else:
+      raise ValueError("Unsupported Preferred Nodes CStore payload.")
+
+    return self.normalize_preferred_nodes(nodes)
+
+
+  def deeploy_load_preferred_nodes(self, auth_result: dict):
+    """
+    Load Preferred Nodes for the authenticated CSP from CStore.
+
+    Parameters
+    ----------
+    auth_result : dict
+        Deeploy auth result. The `escrow_owner` field determines the CStore
+        field key for this first implementation.
+
+    Returns
+    -------
+    list[dict]
+        Normalized preferred-node entries. Missing storage returns an empty
+        list.
+    """
+    key = self._preferred_nodes_storage_key(auth_result)
+    raw_payload = self.chainstore_hget(hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY, key=key)
+    return self._parse_preferred_nodes_payload(raw_payload)
+
+
+  def deeploy_save_preferred_nodes(self, sender: str, auth_result: dict, preferred_nodes):
+    """
+    Save Preferred Nodes for the authenticated CSP in CStore.
+
+    Parameters
+    ----------
+    sender : str
+        Wallet address that signed the save request.
+    auth_result : dict
+        Deeploy auth result. The `escrow_owner` field determines the CStore
+        field key.
+    preferred_nodes : list[dict]
+        Full replacement Preferred Nodes list.
+
+    Returns
+    -------
+    list[dict]
+        Normalized entries written to CStore.
+
+    Raises
+    ------
+    ValueError
+        If validation fails or the serialized CStore payload exceeds the
+        configured maximum size.
+    """
+    key = self._preferred_nodes_storage_key(auth_result)
+    nodes = self.normalize_preferred_nodes(preferred_nodes)
+    payload = {
+      "version": PREFERRED_NODES_SCHEMA_VERSION,
+      "updated_at": self._preferred_nodes_now(),
+      "updated_by": sender,
+      "nodes": nodes,
+    }
+    serialized_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if len(serialized_payload.encode("utf-8")) > PREFERRED_NODES_MAX_PAYLOAD_BYTES:
+      raise ValueError("Preferred Nodes payload is too large.")
+
+    saved = self.chainstore_hset(
+      hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY,
+      key=key,
+      value=serialized_payload,
+    )
+    if not saved:
+      raise ValueError("Failed to save Preferred Nodes to CStore.")
+    return nodes
 
 
   def __get_emv_types(self, values):

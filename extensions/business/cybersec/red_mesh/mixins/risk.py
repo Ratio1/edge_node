@@ -166,6 +166,12 @@ class _RiskScoringMixin:
     flat_findings = []
 
     port_protocols = aggregated_report.get("port_protocols") or {}
+    target = (
+      aggregated_report.get("target")
+      or aggregated_report.get("target_url")
+      or aggregated_report.get("host")
+      or ""
+    )
 
     def process_findings(findings_list, port, probe_name, category):
       nonlocal findings_score, cred_count
@@ -183,22 +189,120 @@ class _RiskScoringMixin:
         if isinstance(title, str) and "default credential accepted" in title.lower():
           cred_count += 1
 
-        # Build deterministic finding_id
-        canon_title = (finding.get("title") or "").lower().strip()
-        cwe = finding.get("cwe_id", "")
-        id_input = f"{port}:{probe_name}:{cwe}:{canon_title}"
-        finding_id = hashlib.sha256(id_input.encode()).hexdigest()[:16]
-
         protocol = port_protocols.get(str(port), "unknown")
+        flat_findings.append(
+          normalize_flat_finding(finding, port, protocol, probe_name, category)
+        )
 
-        flat_findings.append({
-          "finding_id": finding_id,
-          **{k: v for k, v in finding.items()},
-          "port": port,
-          "protocol": protocol,
-          "probe": probe_name,
-          "category": category,
-        })
+    def normalize_flat_finding(finding, port, protocol, probe_name, category):
+      item = {k: v for k, v in finding.items()}
+      cwe_values = normalize_cwe_values(item.get("cwe"))
+      if not cwe_values:
+        parsed_cwe = parse_cwe_id(item.get("cwe_id"))
+        if parsed_cwe:
+          cwe_values = (parsed_cwe,)
+      if cwe_values and not item.get("cwe"):
+        item["cwe"] = list(cwe_values)
+      if cwe_values and not item.get("cwe_id"):
+        item["cwe_id"] = f"CWE-{cwe_values[0]}"
+
+      owasp_values = normalize_string_list(item.get("owasp_top10"))
+      if not owasp_values and item.get("owasp_id"):
+        owasp_values = (str(item["owasp_id"]),)
+      if owasp_values and not item.get("owasp_top10"):
+        item["owasp_top10"] = list(owasp_values)
+      if owasp_values and not item.get("owasp_id"):
+        item["owasp_id"] = owasp_values[0]
+
+      if not item.get("remediation_structured"):
+        item["remediation_structured"] = {
+          "primary": item.get("remediation")
+                     or "Review the finding evidence and apply vendor or platform hardening guidance.",
+          "mitigation": "",
+          "compensating": "",
+        }
+
+      if not item.get("affected_assets"):
+        asset = {"host": target, "port": port if port else None}
+        url = item.get("url")
+        if url:
+          asset["url"] = url
+        item["affected_assets"] = [asset]
+
+      signature = item.get("finding_signature")
+      if not signature:
+        signature = compute_flat_signature(item, probe_name)
+        item["finding_signature"] = signature
+
+      item["finding_id"] = item.get("finding_id") or signature[:16]
+      item["port"] = port
+      item["protocol"] = protocol
+      item["probe"] = probe_name
+      item["category"] = category
+      return item
+
+    def compute_flat_signature(finding, probe_name):
+      asset_canonical = canonical_asset_string(finding.get("affected_assets"))
+      parts = [
+        probe_name or "",
+        asset_canonical,
+        finding.get("title") or "",
+        finding.get("description") or "",
+        finding.get("severity") or "",
+      ]
+      return hashlib.sha256("\x1e".join(str(p) for p in parts).encode()).hexdigest()
+
+    def canonical_asset_string(assets):
+      if not isinstance(assets, list) or not assets:
+        return ""
+      parts = []
+      for asset in assets:
+        if not isinstance(asset, dict):
+          continue
+        parts.append("|".join([
+          str(asset.get("host") or ""),
+          str(asset.get("port") or ""),
+          str(asset.get("url") or ""),
+          str(asset.get("parameter") or ""),
+          str(asset.get("method") or "").upper(),
+        ]))
+      return "\x1f".join(sorted(parts))
+
+    def normalize_cwe_values(values):
+      out = []
+      raw_values = values if isinstance(values, (list, tuple)) else []
+      for value in raw_values:
+        try:
+          parsed = int(value)
+        except (TypeError, ValueError):
+          continue
+        if parsed > 0 and parsed not in out:
+          out.append(parsed)
+      return tuple(out)
+
+    def normalize_string_list(values):
+      if isinstance(values, str):
+        values = [values]
+      if not isinstance(values, (list, tuple)):
+        return ()
+      out = []
+      for value in values:
+        text = str(value or "").strip()
+        if text and text not in out:
+          out.append(text)
+      return tuple(out)
+
+    def parse_cwe_id(value):
+      if not isinstance(value, str):
+        return 0
+      cleaned = value.strip().upper()
+      if cleaned.startswith("CWE-"):
+        cleaned = cleaned[4:]
+      try:
+        parsed = int(cleaned)
+      except (TypeError, ValueError):
+        return 0
+      return parsed if parsed > 0 else 0
 
     def parse_port(port_key):
       """Extract integer port from keys like '80/tcp' or '80'."""
@@ -262,7 +366,9 @@ class _RiskScoringMixin:
           if isinstance(title, str) and "default credential accepted" in title.lower():
             cred_count += 1
 
-          flat_findings.append(flat)
+          flat_findings.append(
+            normalize_flat_finding(flat, port, protocol, probe_name, "graybox")
+          )
 
     # B. Open ports — diminishing returns
     open_ports = aggregated_report.get("open_ports", [])
@@ -276,14 +382,38 @@ class _RiskScoringMixin:
     # D. Default credentials penalty
     credentials_penalty = min(cred_count * RISK_CRED_PENALTY_PER, RISK_CRED_PENALTY_CAP)
 
-    # Deduplicate CVE findings: when the same CVE appears on the same port
-    # from different probes (behavioral + version-based), keep the higher
-    # confidence detection and drop the duplicate.
+    # Deduplicate finding signatures first. CVE title fallback remains for
+    # older findings that represent the same CVE with different descriptions.
     import re as _re_dedup
     CONFIDENCE_RANK = {"certain": 3, "firm": 2, "tentative": 1}
-    cve_best = {}  # (cve_id, port) -> index of best finding
+    SEVERITY_RANK = {"CRITICAL": 5, "HIGH": 4, "MEDIUM": 3, "LOW": 2, "INFO": 1}
+
+    def finding_rank(f):
+      severity = SEVERITY_RANK.get(str(f.get("severity", "INFO")).upper(), 0)
+      confidence = CONFIDENCE_RANK.get(str(f.get("confidence", "tentative")).lower(), 0)
+      return severity, confidence
+
     drop_indices = set()
+    signature_best = {}
     for idx, f in enumerate(flat_findings):
+      signature = f.get("finding_signature")
+      if not signature:
+        continue
+      key = (signature, f.get("port", 0))
+      if key in signature_best:
+        prev_idx = signature_best[key]
+        if finding_rank(f) > finding_rank(flat_findings[prev_idx]):
+          drop_indices.add(prev_idx)
+          signature_best[key] = idx
+        else:
+          drop_indices.add(idx)
+      else:
+        signature_best[key] = idx
+
+    cve_best = {}  # (cve_id, port) -> index of best finding
+    for idx, f in enumerate(flat_findings):
+      if idx in drop_indices:
+        continue
       title = f.get("title", "")
       m = _re_dedup.search(r"CVE-\d{4}-\d+", title)
       if not m:

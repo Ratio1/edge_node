@@ -2,6 +2,7 @@ from copy import deepcopy
 
 from ..models import FindingTriageAuditEntry, FindingTriageState, VALID_TRIAGE_STATUSES
 from ..repositories import ArtifactRepository, JobStateRepository
+from .event_hooks import emit_finding_event
 
 
 def _job_repo(owner):
@@ -19,11 +20,15 @@ def _artifact_repo(owner):
 
 
 def _archive_contains_finding(archive: dict, finding_id: str) -> bool:
+  return _find_archive_finding(archive, finding_id) is not None
+
+
+def _find_archive_finding(archive: dict, finding_id: str):
   for pass_report in archive.get("passes", []) or []:
     for finding in pass_report.get("findings", []) or []:
       if isinstance(finding, dict) and finding.get("finding_id") == finding_id:
-        return True
-  return False
+        return finding
+  return None
 
 
 def _merge_triage_into_archive_dict(archive: dict, triage_map: dict) -> dict:
@@ -73,7 +78,8 @@ def update_finding_triage(owner, job_id: str, finding_id: str, status: str, note
   archive = _artifact_repo(owner).get_archive(job_specs)
   if not isinstance(archive, dict):
     return {"error": "fetch_failed", "message": f"Failed to fetch archive for job {job_id}."}
-  if not _archive_contains_finding(archive, finding_id):
+  archived_finding = _find_archive_finding(archive, finding_id)
+  if archived_finding is None:
     return {"error": "not_found", "message": f"Finding {finding_id} not found in archived job {job_id}."}
 
   triage_state = FindingTriageState(
@@ -102,6 +108,16 @@ def update_finding_triage(owner, job_id: str, finding_id: str, status: str, note
       "status": status,
       "actor": actor or "",
     })
+  finding_event = dict(archived_finding)
+  finding_event["triage_state"] = status
+  emit_finding_event(
+    owner,
+    job_specs,
+    finding=finding_event,
+    event_action="triaged",
+  )
+  if isinstance(job_specs.get("soc_event_status"), dict):
+    repo.put_job(job_id, job_specs)
   return {
     "job_id": job_id,
     "finding_id": finding_id,

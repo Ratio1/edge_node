@@ -1,7 +1,19 @@
 from .config import (
+  DEFAULT_EVENT_EXPORT_CONFIG,
+  DEFAULT_OPENCTI_EXPORT_CONFIG,
+  DEFAULT_STIX_EXPORT_CONFIG,
+  DEFAULT_SURICATA_CORRELATION_CONFIG,
+  DEFAULT_TAXII_EXPORT_CONFIG,
+  DEFAULT_WAZUH_EXPORT_CONFIG,
   get_attestation_config,
+  get_event_export_config,
   get_graybox_budgets_config,
   get_llm_agent_config,
+  get_opencti_export_config,
+  get_stix_export_config,
+  get_suricata_correlation_config,
+  get_taxii_export_config,
+  get_wazuh_export_config,
   resolve_config_block,
 )
 from .misp_config import get_misp_export_config
@@ -10,6 +22,63 @@ from .misp_export import (
   export_misp_json,
   get_misp_export_status,
   push_to_misp,
+)
+from .stix_export import (
+  build_stix_bundle,
+  export_stix_bundle,
+  get_stix_export_status,
+)
+from .opencti_export import (
+  dry_run_opencti_export,
+  get_opencti_export_status,
+  push_to_opencti,
+)
+from .taxii_export import (
+  dry_run_taxii_export,
+  get_taxii_export_status,
+  publish_to_taxii,
+)
+from .event_builder import (
+  build_attestation_event,
+  build_export_status_event,
+  build_finding_event,
+  build_lifecycle_event,
+  build_redmesh_event,
+  build_service_observed_event,
+  build_target_ref,
+  build_test_event,
+)
+from .event_redaction import (
+  contains_sensitive_value,
+  redact_event_payload,
+  stable_hmac_pseudonym,
+  stable_sha256,
+  strip_sensitive_fields,
+)
+from .integration_status import (
+  get_integration_status,
+  record_integration_status,
+  test_event_export,
+)
+from .suricata_correlation import (
+  correlate_suricata_eve,
+  get_detection_correlation,
+)
+from .log_export import (
+  WAZUH_EVENT_GROUPS,
+  build_wazuh_decoder_rules_example,
+  compute_payload_hmac,
+  deliver_redmesh_event,
+  deliver_wazuh_event,
+  format_syslog_json_line,
+)
+from .event_hooks import (
+  SOC_EVENT_STATUS_SCHEMA_VERSION,
+  emit_attestation_status_event,
+  emit_export_status_event,
+  emit_finding_event,
+  emit_lifecycle_event,
+  emit_redmesh_event,
 )
 from .control import (
   purge_job,
@@ -40,8 +109,10 @@ from .query import (
   list_network_jobs,
 )
 from .reconciliation import (
+  DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
   get_distributed_job_reconciliation_config,
   reconcile_job_workers,
+  reconcile_workers_from_live,
 )
 from .secrets import (
   R1fsSecretStore,
@@ -68,22 +139,75 @@ from .triage import (
   get_job_triage,
   update_finding_triage,
 )
+from .authorization_upload import (
+  AuthorizationUploadError,
+  AuthorizationUploadResult,
+  store_authorization_document,
+)
+from .engagement_deletion import (
+  collect_engagement_document_cids,
+  DeleteEngagementError,
+  DeleteEngagementResult,
+  delete_engagement_data,
+)
+from .llm_structured import (
+  StructuredLlmResult,
+  generate_exec_summary,
+)
+from .llm_fixture_cache import (
+  LlmFixtureCacheMiss,
+  cached_llm_call,
+)
 
 __all__ = [
   "INTERMEDIATE_JOB_STATUSES",
   "ScanStrategy",
   "TERMINAL_JOB_STATUSES",
+  "DEFAULT_EVENT_EXPORT_CONFIG",
+  "DEFAULT_OPENCTI_EXPORT_CONFIG",
+  "DEFAULT_STIX_EXPORT_CONFIG",
+  "DEFAULT_SURICATA_CORRELATION_CONFIG",
+  "DEFAULT_TAXII_EXPORT_CONFIG",
+  "DEFAULT_WAZUH_EXPORT_CONFIG",
   "can_transition_job_status",
   "coerce_scan_type",
   "get_attestation_config",
+  "get_event_export_config",
   "get_graybox_budgets_config",
   "get_llm_agent_config",
   "get_misp_export_config",
+  "get_opencti_export_config",
+  "get_stix_export_config",
+  "get_suricata_correlation_config",
+  "get_taxii_export_config",
+  "get_wazuh_export_config",
+  "build_attestation_event",
+  "build_export_status_event",
+  "build_finding_event",
+  "build_lifecycle_event",
   "build_misp_event",
+  "build_stix_bundle",
+  "build_redmesh_event",
+  "build_service_observed_event",
+  "build_target_ref",
+  "build_test_event",
+  "contains_sensitive_value",
+  "dry_run_opencti_export",
+  "dry_run_taxii_export",
   "export_misp_json",
+  "export_stix_bundle",
   "get_misp_export_status",
+  "get_opencti_export_status",
+  "get_stix_export_status",
+  "get_taxii_export_status",
   "push_to_misp",
+  "push_to_opencti",
+  "publish_to_taxii",
+  "redact_event_payload",
   "resolve_config_block",
+  "stable_hmac_pseudonym",
+  "stable_sha256",
+  "strip_sensitive_fields",
   "announce_launch",
   "build_network_workers",
   "build_webapp_workers",
@@ -92,6 +216,20 @@ __all__ = [
   "get_job_archive",
   "get_job_data",
   "get_job_progress",
+  "get_integration_status",
+  "get_detection_correlation",
+  "WAZUH_EVENT_GROUPS",
+  "SOC_EVENT_STATUS_SCHEMA_VERSION",
+  "build_wazuh_decoder_rules_example",
+  "compute_payload_hmac",
+  "deliver_redmesh_event",
+  "deliver_wazuh_event",
+  "emit_attestation_status_event",
+  "emit_export_status_event",
+  "emit_finding_event",
+  "emit_lifecycle_event",
+  "emit_redmesh_event",
+  "format_syslog_json_line",
   "is_intermediate_job_status",
   "is_terminal_job_status",
   "iter_scan_strategies",
@@ -112,12 +250,29 @@ __all__ = [
   "resolve_active_peers",
   "resolve_enabled_features",
   "get_distributed_job_reconciliation_config",
+  "DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS",
   "reconcile_job_workers",
+  "reconcile_workers_from_live",
+  "record_integration_status",
+  "correlate_suricata_eve",
   "set_job_status",
   "stop_and_delete_job",
   "stop_monitoring",
+  "test_event_export",
   "get_job_archive_with_triage",
   "get_job_triage",
   "update_finding_triage",
   "validation_error",
+  # engagement context (Phase 3)
+  "AuthorizationUploadError",
+  "AuthorizationUploadResult",
+  "collect_engagement_document_cids",
+  "store_authorization_document",
+  "DeleteEngagementError",
+  "DeleteEngagementResult",
+  "delete_engagement_data",
+  "StructuredLlmResult",
+  "generate_exec_summary",
+  "LlmFixtureCacheMiss",
+  "cached_llm_call",
 ]

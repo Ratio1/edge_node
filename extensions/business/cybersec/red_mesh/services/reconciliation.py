@@ -1,11 +1,18 @@
 from ..models import WorkerProgress
 from .config import resolve_config_block
 
+DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS = 90.0
+
 DEFAULT_DISTRIBUTED_JOB_RECONCILIATION_CONFIG = {
-  "STARTUP_TIMEOUT": 45.0,
+  "STARTUP_TIMEOUT": 180.0,
   "STALE_TIMEOUT": 120.0,
-  "STALE_GRACE": 30.0,
+  "STALE_GRACE": 90.0,
   "MAX_REANNOUNCE_ATTEMPTS": 3,
+  "LIVE_HSYNC_ENABLED": True,
+  "LIVE_HSYNC_INTERVAL_SECONDS": DEFAULT_LIVE_HSYNC_INTERVAL_SECONDS,
+  "LIVE_HSYNC_TIMEOUT": 3.0,
+  "LIVE_HSYNC_MAX_PEERS_PER_TICK": 6,
+  "LIVE_HSYNC_FALLBACK_DEFAULT_PEERS": True,
 }
 
 
@@ -21,6 +28,21 @@ def _safe_float(value, default=None):
     return float(value)
   except (TypeError, ValueError):
     return default
+
+
+def _safe_bool(value, default=False):
+  if isinstance(value, bool):
+    return value
+  if value is None:
+    return default
+  if isinstance(value, str):
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+      return True
+    if normalized in {"0", "false", "no", "off", ""}:
+      return False
+    return default
+  return bool(value)
 
 
 def get_distributed_job_reconciliation_config(owner):
@@ -54,11 +76,43 @@ def get_distributed_job_reconciliation_config(owner):
     if max_reannounce_attempts < 0:
       max_reannounce_attempts = defaults["MAX_REANNOUNCE_ATTEMPTS"]
 
+    live_hsync_interval = _safe_float(
+      merged.get("LIVE_HSYNC_INTERVAL_SECONDS"),
+      defaults["LIVE_HSYNC_INTERVAL_SECONDS"],
+    )
+    if live_hsync_interval is None or live_hsync_interval <= 0:
+      live_hsync_interval = defaults["LIVE_HSYNC_INTERVAL_SECONDS"]
+
+    live_hsync_timeout = _safe_float(
+      merged.get("LIVE_HSYNC_TIMEOUT"),
+      defaults["LIVE_HSYNC_TIMEOUT"],
+    )
+    if live_hsync_timeout is None or live_hsync_timeout <= 0:
+      live_hsync_timeout = defaults["LIVE_HSYNC_TIMEOUT"]
+
+    live_hsync_max_peers = _safe_int(
+      merged.get("LIVE_HSYNC_MAX_PEERS_PER_TICK"),
+      defaults["LIVE_HSYNC_MAX_PEERS_PER_TICK"],
+    )
+    if live_hsync_max_peers <= 0:
+      live_hsync_max_peers = defaults["LIVE_HSYNC_MAX_PEERS_PER_TICK"]
+
     return {
       "STARTUP_TIMEOUT": startup_timeout,
       "STALE_TIMEOUT": stale_timeout,
       "STALE_GRACE": stale_grace,
       "MAX_REANNOUNCE_ATTEMPTS": max_reannounce_attempts,
+      "LIVE_HSYNC_ENABLED": _safe_bool(
+        merged.get("LIVE_HSYNC_ENABLED"),
+        defaults["LIVE_HSYNC_ENABLED"],
+      ),
+      "LIVE_HSYNC_INTERVAL_SECONDS": live_hsync_interval,
+      "LIVE_HSYNC_TIMEOUT": live_hsync_timeout,
+      "LIVE_HSYNC_MAX_PEERS_PER_TICK": live_hsync_max_peers,
+      "LIVE_HSYNC_FALLBACK_DEFAULT_PEERS": _safe_bool(
+        merged.get("LIVE_HSYNC_FALLBACK_DEFAULT_PEERS"),
+        defaults["LIVE_HSYNC_FALLBACK_DEFAULT_PEERS"],
+      ),
     }
 
   return resolve_config_block(
@@ -85,6 +139,128 @@ def _matched_live_progress(job_id, worker_addr, pass_nr, assignment_revision, li
   if live.assignment_revision_seen != assignment_revision:
     return None, "revision_mismatch"
   return live, None
+
+
+def _job_repo(owner):
+  getter = getattr(owner, "_get_job_state_repository", None)
+  if callable(getter):
+    return getter()
+  return getattr(owner, "_job_state_repository", None)
+
+
+def _stats_inc(stats, key, amount=1):
+  if isinstance(stats, dict):
+    stats[key] = int(stats.get(key, 0) or 0) + amount
+
+
+def _stats_inc_once(stats, key, identity):
+  if not isinstance(stats, dict):
+    return
+  seen_key = f"_seen_{key}"
+  seen = stats.setdefault(seen_key, set())
+  if identity in seen:
+    return
+  seen.add(identity)
+  _stats_inc(stats, key)
+
+
+def reconcile_workers_from_live(owner, job_id, *, live_payloads=None, now=None, stats=None):
+  """
+  Repair launcher-owned durable worker completion state from ``:live`` rows.
+
+  This helper intentionally copies only the terminal fields required for
+  finalization. Runtime progress stays in the worker-owned live namespace.
+  """
+  repo = _job_repo(owner)
+  if repo is None:
+    return False
+
+  raw = repo.get_job(job_id)
+  if not isinstance(raw, dict) or raw.get("job_cid"):
+    return False
+
+  normalizer = getattr(owner, "_normalize_job_record", None)
+  if callable(normalizer):
+    normalized_key, job_specs = normalizer(job_id, raw)
+  else:
+    normalized_key, job_specs = job_id, raw
+  if normalized_key is None or not isinstance(job_specs, dict):
+    return False
+  if job_specs.get("job_cid"):
+    return False
+  if job_specs.get("launcher") != getattr(owner, "ee_addr", None):
+    return False
+
+  workers = job_specs.get("workers") or {}
+  if not isinstance(workers, dict) or not workers:
+    return False
+
+  if live_payloads is None:
+    live_payloads = repo.list_live_progress() or {}
+
+  pass_nr = _safe_int(job_specs.get("job_pass", 1), 1)
+  changed_workers = []
+
+  for worker_addr, worker_entry in workers.items():
+    if not isinstance(worker_entry, dict):
+      continue
+    if worker_entry.get("canceled"):
+      continue
+    if worker_entry.get("terminal_reason") == "unreachable":
+      continue
+    if worker_entry.get("finished") and worker_entry.get("report_cid"):
+      continue
+
+    assignment_revision = _safe_int(worker_entry.get("assignment_revision", 1), 1)
+    live, ignored_reason = _matched_live_progress(
+      job_specs.get("job_id"),
+      worker_addr,
+      pass_nr,
+      assignment_revision,
+      live_payloads,
+    )
+    if live is None:
+      if ignored_reason == "pass_mismatch":
+        _stats_inc_once(stats, "ignored_stale_pass", (job_id, worker_addr))
+      elif ignored_reason == "revision_mismatch":
+        _stats_inc_once(stats, "ignored_revision", (job_id, worker_addr))
+      continue
+    if not live.finished:
+      continue
+    if not live.report_cid:
+      _stats_inc_once(stats, "ignored_no_report_cid", (job_id, worker_addr))
+      continue
+
+    if not worker_entry.get("report_cid"):
+      worker_entry["report_cid"] = live.report_cid
+    worker_entry["finished"] = True
+    worker_entry["result"] = None
+    changed_workers.append(worker_addr)
+
+  if not changed_workers:
+    return False
+
+  emit = getattr(owner, "_emit_timeline_event", None)
+  if callable(emit):
+    emit(
+      job_specs,
+      "reconciled",
+      "Reconciled missing worker completion from live state",
+      actor_type="system",
+      meta={
+        "workers": changed_workers,
+        "pass_nr": pass_nr,
+        "source": "live",
+      },
+    )
+
+  writer = getattr(owner, "_write_job_record", None)
+  if callable(writer):
+    writer(normalized_key, job_specs, context="reconcile_from_live")
+  else:
+    repo.put_job(normalized_key, job_specs)
+  _stats_inc(stats, "changed_workers", len(changed_workers))
+  return True
 
 
 def reconcile_job_workers(owner, job_specs, *, live_payloads=None, now=None):
