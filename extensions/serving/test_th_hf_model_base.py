@@ -639,7 +639,7 @@ class ThHfModelBaseTests(unittest.TestCase):
           runtime_config={"decoder": "contract.py"},
         )
 
-  def test_hf_contract_decoder_requires_runtime_trust_remote_code(self):
+  def test_runtime_trust_remote_code_false_temporarily_inherits_global_trust(self):
     plugin = _ConcreteHfModel(
       MODEL_NAME="test/model",
       DEVICE="cpu",
@@ -654,12 +654,13 @@ class ThHfModelBaseTests(unittest.TestCase):
         encoding="utf-8",
       )
 
-      with self.assertRaisesRegex(ValueError, "runtime trust_remote_code=False"):
-        plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
-          model_dir=str(model_dir),
-          manifest={},
-          runtime_config={"decoder": "contract.py", "trust_remote_code": False},
-        )
+      decoder = plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
+        model_dir=str(model_dir),
+        manifest={},
+        runtime_config={"decoder": "contract.py", "trust_remote_code": False},
+      )
+
+      self.assertEqual(decoder({"ok": True}, {}), {"ok": True})
 
   def test_missing_runtime_trust_remote_code_temporarily_inherits_global_trust(self):
     plugin = _ConcreteHfModel(
