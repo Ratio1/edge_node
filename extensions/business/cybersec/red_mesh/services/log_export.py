@@ -201,7 +201,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
   timeout_seconds = float(cfg["TIMEOUT_SECONDS"])
 
   provider = None
-  if mode == "http":
+  if mode in {"http", "wazuh_api"}:
     if not cfg["HTTP_URL"]:
       _record_failure(owner, integration_id, event, "missing_http_url", payload_bytes, cfg, dry_run=dry_run)
       return {
@@ -224,9 +224,18 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
         "detail": str(exc),
       }
 
+    # In wazuh_api mode we re-shape the payload to match Wazuh manager
+    # `POST /events` (`{"events": ["<json-string>"]}`). The signed payload
+    # bytes still represent the original event for HMAC and idempotency.
+    if mode == "wazuh_api":
+      wrapped = _json_bytes({"events": [payload_bytes.decode("utf-8")]})
+      send_payload = wrapped
+    else:
+      send_payload = payload_bytes
+
     def send():
       headers = _http_headers(event, signature, provider=provider)
-      return _send_http_json(cfg["HTTP_URL"], payload_bytes, headers, timeout_seconds)
+      return _send_http_json(cfg["HTTP_URL"], send_payload, headers, timeout_seconds)
   else:
     if not cfg["SYSLOG_HOST"]:
       _record_failure(owner, integration_id, event, "missing_syslog_host", payload_bytes, cfg, dry_run=dry_run)

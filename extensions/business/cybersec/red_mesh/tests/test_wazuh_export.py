@@ -305,5 +305,94 @@ def urllib_error_HTTPError(url, code, msg):
   return urllib.error.HTTPError(url, code, msg, hdrs=None, fp=None)
 
 
+class TestWazuhApiModeEnvelope(unittest.TestCase):
+  """The wazuh_api MODE wraps payloads to match Wazuh manager
+  `POST /events` which expects `{"events": ["<json-string>"]}`."""
+
+  def setUp(self):
+    from extensions.business.cybersec.red_mesh.services.auth.wazuh_jwt import (
+      _purge_cache_for_tests,
+    )
+    _purge_cache_for_tests()
+    os.environ["REDMESH_EVENT_HMAC_SECRET"] = "signing-secret"
+
+  def tearDown(self):
+    for key in ("REDMESH_EVENT_HMAC_SECRET", "REDMESH_WAZUH_TOKEN"):
+      os.environ.pop(key, None)
+
+  def test_wazuh_api_mode_wraps_payload_in_events_envelope(self):
+    os.environ["REDMESH_WAZUH_TOKEN"] = "static-bearer"
+    owner = _owner(wazuh_config={
+      "ENABLED": True,
+      "MODE": "wazuh_api",
+      "HTTP_URL": "https://wazuh-api.example/events",
+      "AUTH_MODE": "static",
+      "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+      "TIMEOUT_SECONDS": 0.25,
+      "RETRY_ATTEMPTS": 0,
+    })
+    event = _event()
+
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+      captured["url"] = request.full_url
+      captured["body"] = request.data
+      mock_resp = MagicMock()
+      mock_resp.__enter__ = lambda s: s
+      mock_resp.__exit__ = lambda *a: False
+      mock_resp.status = 200
+      return mock_resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.services.log_export.urllib.request.urlopen",
+      side_effect=fake_urlopen,
+    ):
+      result = deliver_wazuh_event(owner, event)
+
+    self.assertEqual(result["status"], "sent")
+    self.assertEqual(captured["url"], "https://wazuh-api.example/events")
+    body = json.loads(captured["body"])
+    self.assertEqual(list(body.keys()), ["events"])
+    self.assertEqual(len(body["events"]), 1)
+    # The single envelope element is the original event JSON as a string.
+    inner = json.loads(body["events"][0])
+    self.assertEqual(inner["event_id"], event["event_id"])
+    self.assertEqual(inner["schema"], "redmesh.event.v1")
+
+  def test_http_mode_keeps_raw_json_payload(self):
+    os.environ["REDMESH_WAZUH_TOKEN"] = "static-bearer"
+    owner = _owner(wazuh_config={
+      "ENABLED": True,
+      "MODE": "http",
+      "HTTP_URL": "https://generic-siem.example/ingest",
+      "AUTH_MODE": "static",
+      "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+      "TIMEOUT_SECONDS": 0.25,
+      "RETRY_ATTEMPTS": 0,
+    })
+    event = _event()
+    captured = {}
+
+    def fake_urlopen(request, timeout=None):
+      captured["body"] = request.data
+      mock_resp = MagicMock()
+      mock_resp.__enter__ = lambda s: s
+      mock_resp.__exit__ = lambda *a: False
+      mock_resp.status = 200
+      return mock_resp
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.services.log_export.urllib.request.urlopen",
+      side_effect=fake_urlopen,
+    ):
+      deliver_wazuh_event(owner, event)
+
+    body = json.loads(captured["body"])
+    # Regression: http mode must NOT add the events envelope.
+    self.assertNotIn("events", body)
+    self.assertEqual(body["event_id"], event["event_id"])
+
+
 if __name__ == "__main__":
   unittest.main()

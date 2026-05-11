@@ -326,7 +326,11 @@ def get_event_export_config(owner):
 def get_wazuh_export_config(owner):
   """Return normalized Wazuh/generic SIEM export config."""
   def _normalize(merged, defaults):
-    mode = _normalized_choice(merged.get("MODE"), {"syslog", "http"}, defaults["MODE"])
+    mode = _normalized_choice(
+      merged.get("MODE"),
+      {"syslog", "http", "wazuh_api"},
+      defaults["MODE"],
+    )
     return {
       "ENABLED": bool(merged.get("ENABLED", defaults["ENABLED"])),
       "MODE": mode,
