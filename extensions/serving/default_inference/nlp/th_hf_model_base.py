@@ -9,7 +9,7 @@ input/output handling.
 import importlib.util
 import inspect
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import torch as th
 
@@ -589,11 +589,19 @@ class ThHfModelBase(BaseServingProcess):
     if configured_patterns:
       patterns = configured_patterns
     else:
-      patterns = runtime_config.get("recommended_allow_patterns") or runtime_config.get("files")
+      patterns = []
+      for source_patterns in (
+        runtime_config.get("recommended_allow_patterns"),
+        runtime_config.get("files"),
+        [runtime_config.get("model")] if runtime_config.get("model") else None,
+      ):
+        if not source_patterns:
+          continue
+        if isinstance(source_patterns, str):
+          source_patterns = [source_patterns]
+        patterns.extend(source_patterns)
       if not patterns:
-        model_file = runtime_config.get("model")
         patterns = [
-          model_file,
           "*.onnx",
           "**/*.onnx",
           "*.json",
@@ -637,16 +645,16 @@ class ThHfModelBase(BaseServingProcess):
 
   def _resolve_hf_snapshot_path(self, model_dir, file_path):
     """Resolve a manifest path while keeping it inside the downloaded snapshot."""
-    path = Path(str(file_path))
+    raw_path = str(file_path)
+    path = PurePosixPath(raw_path)
     if path.is_absolute():
       raise ValueError(f"HF artifact path {file_path!r} must be relative to the model snapshot.")
-    snapshot_dir = Path(model_dir).resolve()
-    resolved_path = (snapshot_dir / path).resolve()
-    try:
-      resolved_path.relative_to(snapshot_dir)
-    except ValueError as exc:
-      raise ValueError(f"HF artifact path {file_path!r} escapes the model snapshot.") from exc
-    return resolved_path
+    if ".." in path.parts:
+      raise ValueError(f"HF artifact path {file_path!r} escapes the model snapshot.")
+    # Hugging Face snapshots commonly symlink files into the shared cache
+    # blob store. A resolved containment check would reject valid snapshots,
+    # so keep the traversal guard lexical and return the snapshot path itself.
+    return Path(model_dir) / Path(*path.parts)
 
   def _first_manifest_file_with_suffix(self, runtime_config, suffixes):
     """Return the first exact manifest file path ending with any suffix."""

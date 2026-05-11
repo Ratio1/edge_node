@@ -321,6 +321,10 @@ class ThHfModelBaseTests(unittest.TestCase):
     plugin = _ConcreteHfModel(MODEL_NAME="test/model")
 
     allow_patterns = plugin._build_hf_runtime_allow_patterns({  # pylint: disable=protected-access
+      "recommended_allow_patterns": [
+        "onnx/*",
+        "schema.json",
+      ],
       "files": [
         "*",
         "**/*",
@@ -334,9 +338,13 @@ class ThHfModelBaseTests(unittest.TestCase):
         "tf_model.h5",
         "flax_model.msgpack",
       ],
+      "model": "model.onnx",
     })
 
-    self.assertEqual(allow_patterns, ["model.onnx", "tokenizer.json", "contract.py"])
+    self.assertEqual(
+      allow_patterns,
+      ["schema.json", "model.onnx", "tokenizer.json", "contract.py"],
+    )
 
   def test_auto_runtime_uses_onnx_artifact_on_cpu_only(self):
     manifest = {
@@ -712,6 +720,27 @@ class ThHfModelBaseTests(unittest.TestCase):
           runtime_config={"tokenizer_dir": "../tokenizer"},
           schema={},
         )
+
+  def test_hf_artifact_paths_allow_snapshot_symlink_targets_outside_snapshot(self):
+    plugin = _ConcreteHfModel(MODEL_NAME="test/model")
+    plugin.hf_runtime = "onnx_fp32"
+
+    with TemporaryDirectory() as tmpdir:
+      root_dir = Path(tmpdir)
+      model_dir = root_dir / "snapshot"
+      blob_dir = root_dir / "blobs"
+      model_dir.mkdir()
+      blob_dir.mkdir()
+      (blob_dir / "schema.json").write_text('{"inputs": []}', encoding="utf-8")
+      (model_dir / "schema.json").symlink_to(blob_dir / "schema.json")
+
+      schema = plugin._load_hf_schema(  # pylint: disable=protected-access
+        model_dir=str(model_dir),
+        manifest={},
+        runtime_config={"schema": "schema.json"},
+      )
+
+      self.assertEqual(schema, {"inputs": []})
 
   def test_onnx_tokenizer_remote_code_requires_global_trust_remote_code(self):
     calls = []
