@@ -69,10 +69,21 @@ class JobConfig:
   secret_ref: str = ""                # reference to separately persisted graybox secrets
   has_regular_credentials: bool = False
   has_weak_candidates: bool = False
+  # OWASP API Top 10 (Subphase 1.5 commit #8) — non-secret capability flags.
+  # Raw bearer_token / api_key / bearer_refresh_token values are blanked
+  # before persistence by `_blank_graybox_secret_fields` and instead live
+  # in the R1FS secret payload (resolved at worker startup via
+  # `resolve_job_config_secrets`).
+  has_bearer_token: bool = False
+  has_api_key: bool = False
+  has_bearer_refresh_token: bool = False
   official_username: str = ""
   official_password: str = ""
   regular_username: str = ""
   regular_password: str = ""
+  bearer_token: str = ""              # blanked before persistence; runtime-only
+  api_key: str = ""                   # blanked before persistence; runtime-only
+  bearer_refresh_token: str = ""      # blanked before persistence; runtime-only
   weak_candidates: list = None        # legacy inline payload; new launches use secret_ref
   max_weak_attempts: int = 5
   app_routes: list = None             # user-supplied known routes
@@ -120,10 +131,16 @@ class JobConfig:
       secret_ref=d.get("secret_ref", ""),
       has_regular_credentials=d.get("has_regular_credentials", False),
       has_weak_candidates=d.get("has_weak_candidates", False),
+      has_bearer_token=d.get("has_bearer_token", False),
+      has_api_key=d.get("has_api_key", False),
+      has_bearer_refresh_token=d.get("has_bearer_refresh_token", False),
       official_username=d.get("official_username", ""),
       official_password=d.get("official_password", ""),
       regular_username=d.get("regular_username", ""),
       regular_password=d.get("regular_password", ""),
+      bearer_token=d.get("bearer_token", ""),
+      api_key=d.get("api_key", ""),
+      bearer_refresh_token=d.get("bearer_refresh_token", ""),
       weak_candidates=d.get("weak_candidates"),
       max_weak_attempts=d.get("max_weak_attempts", 5),
       app_routes=d.get("app_routes"),

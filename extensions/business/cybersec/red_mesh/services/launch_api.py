@@ -458,6 +458,9 @@ def announce_launch(
   engagement=None,
   roe=None,
   authorization=None,
+  bearer_token="",
+  api_key="",
+  bearer_refresh_token="",
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
   excluded_features, enabled_features = resolve_enabled_features(
@@ -520,6 +523,13 @@ def announce_launch(
     engagement=engagement,
     roe=roe,
     authorization=authorization,
+    # OWASP API Top 10 (Subphase 1.5 commit #8): runtime-only secret
+    # fields. Blanked by `_blank_graybox_secret_fields` before persistence;
+    # `has_bearer_token` / `has_api_key` capability flags are set on the
+    # persisted JobConfig by `persist_job_config_with_secrets`.
+    bearer_token=bearer_token,
+    api_key=api_key,
+    bearer_refresh_token=bearer_refresh_token,
   )
 
   persisted_config, job_config_cid = persist_job_config_with_secrets(
@@ -836,6 +846,13 @@ def launch_webapp_scan(
   engagement=None,
   roe=None,
   authorization=None,
+  # OWASP API Top 10 (Subphase 1.5 commit #8) — top-level secret params.
+  # These NEVER appear inside the persisted JobConfig: they flow straight
+  # into the R1FS secret payload via persist_job_config_with_secrets and
+  # are zeroised on the public config before put_job_config().
+  bearer_token="",
+  api_key="",
+  bearer_refresh_token="",
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
 
@@ -846,11 +863,36 @@ def launch_webapp_scan(
   the OWASP API Top 10 ``api_security`` section added in Subphase 1.1 of
   the API Top 10 plan. ``_apply_launch_safety_policy`` only normalises
   the ``discovery`` section; it does not strip unknown keys.
+
+  Secret-handling: ``bearer_token``, ``api_key``, and
+  ``bearer_refresh_token`` (Subphase 1.5 commit #8) are top-level launch
+  parameters — NOT inside ``target_config``. They travel through the
+  same R1FS secret payload as ``official_password`` and are blanked from
+  the persisted JobConfig before archive write. Non-secret capability
+  flags ``has_bearer_token`` / ``has_api_key`` are surfaced on the
+  archived config so consumers know whether the credentials existed.
   """
   if not target_url:
     return validation_error("target_url required for webapp scan")
-  if not official_username or not official_password:
-    return validation_error("official credentials required for webapp scan")
+  # Form auth still requires username+password; Bearer / API-key targets
+  # set auth_type via target_config.api_security.auth and supply the
+  # secret as a top-level param instead.
+  auth_type = "form"
+  try:
+    auth_type = (target_config or {}).get("api_security", {}).get("auth", {}).get("auth_type", "form")
+  except (AttributeError, TypeError):
+    auth_type = "form"
+  if auth_type == "form":
+    if not official_username or not official_password:
+      return validation_error("official credentials required for webapp scan")
+  elif auth_type == "bearer":
+    if not bearer_token:
+      return validation_error("bearer_token required when auth_type='bearer'")
+  elif auth_type == "api_key":
+    if not api_key:
+      return validation_error("api_key required when auth_type='api_key'")
+  else:
+    return validation_error(f"unknown auth_type: {auth_type!r}")
 
   parsed = urlparse(target_url)
   if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -954,6 +996,9 @@ def launch_webapp_scan(
     engagement=typed_context["engagement"],
     roe=typed_context["roe"],
     authorization=typed_context["authorization"],
+    bearer_token=bearer_token,
+    api_key=api_key,
+    bearer_refresh_token=bearer_refresh_token,
   )
 
 

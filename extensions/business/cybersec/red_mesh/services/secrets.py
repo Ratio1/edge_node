@@ -91,6 +91,10 @@ def _blank_graybox_secret_fields(config_dict: dict) -> dict:
   sanitized["official_password"] = ""
   sanitized["regular_username"] = ""
   sanitized["regular_password"] = ""
+  # OWASP API Top 10 (Subphase 1.5 commit #8) — header-auth secrets.
+  sanitized["bearer_token"] = ""
+  sanitized["api_key"] = ""
+  sanitized["bearer_refresh_token"] = ""
   sanitized.pop("weak_candidates", None)
   return sanitized
 
@@ -110,6 +114,9 @@ def build_graybox_secret_payload(
   regular_username="",
   regular_password="",
   weak_candidates=None,
+  bearer_token="",
+  api_key="",
+  bearer_refresh_token="",
 ):
   return {
     "official_username": official_username or "",
@@ -117,6 +124,10 @@ def build_graybox_secret_payload(
     "regular_username": regular_username or "",
     "regular_password": regular_password or "",
     "weak_candidates": list(weak_candidates) if isinstance(weak_candidates, list) else weak_candidates,
+    # OWASP API Top 10 (Subphase 1.5 commit #8): API-native auth secrets.
+    "bearer_token": bearer_token or "",
+    "api_key": api_key or "",
+    "bearer_refresh_token": bearer_refresh_token or "",
   }
 
 
@@ -143,6 +154,9 @@ def persist_job_config_with_secrets(
       regular_username=persisted_config.get("regular_username", ""),
       regular_password=persisted_config.get("regular_password", ""),
       weak_candidates=persisted_config.get("weak_candidates"),
+      bearer_token=persisted_config.get("bearer_token", ""),
+      api_key=persisted_config.get("api_key", ""),
+      bearer_refresh_token=persisted_config.get("bearer_refresh_token", ""),
     )
     has_secret_payload = any([
       payload["official_username"],
@@ -150,6 +164,9 @@ def persist_job_config_with_secrets(
       payload["regular_username"],
       payload["regular_password"],
       payload["weak_candidates"],
+      payload["bearer_token"],
+      payload["api_key"],
+      payload["bearer_refresh_token"],
     ])
     if has_secret_payload:
       store = R1fsSecretStore(owner)
@@ -160,6 +177,10 @@ def persist_job_config_with_secrets(
       persisted_config["secret_ref"] = secret_ref
       persisted_config["has_regular_credentials"] = bool(payload["regular_username"] or payload["regular_password"])
       persisted_config["has_weak_candidates"] = bool(payload["weak_candidates"])
+      # OWASP API Top 10 (Subphase 1.5 commit #8) — non-secret capability flags.
+      persisted_config["has_bearer_token"] = bool(payload["bearer_token"])
+      persisted_config["has_api_key"] = bool(payload["api_key"])
+      persisted_config["has_bearer_refresh_token"] = bool(payload["bearer_refresh_token"])
       persisted_config = _blank_graybox_secret_fields(persisted_config)
 
   job_config_cid = _artifact_repo(owner).put_job_config(persisted_config, show_logs=False)
@@ -189,6 +210,10 @@ def resolve_job_config_secrets(owner, config_dict: dict, include_secret_metadata
     "regular_username": payload.get("regular_username", ""),
     "regular_password": payload.get("regular_password", ""),
     "weak_candidates": payload.get("weak_candidates"),
+    # OWASP API Top 10 (Subphase 1.5 commit #8) — API-native auth secrets.
+    "bearer_token": payload.get("bearer_token", ""),
+    "api_key": payload.get("api_key", ""),
+    "bearer_refresh_token": payload.get("bearer_refresh_token", ""),
   })
   if not include_secret_metadata:
     resolved.pop("secret_ref", None)
