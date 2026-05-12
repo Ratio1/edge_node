@@ -344,3 +344,87 @@ class BearerAuth(AuthStrategy):
     if self._creds is not None:
       # Don't clear caller-owned creds — AuthManager.cleanup() drives that.
       self._creds = None
+
+
+class ApiKeyAuth(AuthStrategy):
+  """API-key auth for legacy / partner APIs.
+
+  Places ``creds.api_key`` in either:
+    - a header (default; configured via
+      ``auth.api_key_header_name`` — e.g. ``X-Api-Key``)
+    - a query parameter (``auth.api_key_location='query'``;
+      configured via ``auth.api_key_query_param``).
+
+  Query-parameter placement is supported for legacy interoperability but
+  is a known anti-pattern (keys leak to access logs, proxies, referrers).
+  The Subphase 1.6 evidence scrubber redacts the configured query
+  parameter from finding evidence; the Navigator launch form shows a
+  warning banner (Subphase 8.5).
+  """
+
+  def __init__(self, target_url, target_config, verify_tls=True):
+    super().__init__(target_url, target_config, verify_tls)
+    self._auth_desc = self._resolve_auth_descriptor()
+    self._creds = None
+
+  def _resolve_auth_descriptor(self):
+    api_security = getattr(self.target_config, "api_security", None)
+    if api_security is not None:
+      auth = getattr(api_security, "auth", None)
+      if auth is not None:
+        return auth
+    from .models.target_config import AuthDescriptor
+    return AuthDescriptor()
+
+  def preflight(self) -> Optional[str]:
+    probe_path = (self._auth_desc.authenticated_probe_path or "").strip()
+    if not probe_path:
+      return None
+    url = self.target_url + probe_path
+    headers = {}
+    params = {}
+    if self._auth_desc.api_key_location == "query":
+      # We have no key here (preflight runs before authenticate's session
+      # is created); just check the probe path is reachable.
+      pass
+    try:
+      resp = requests.head(
+        url, headers=headers, params=params, timeout=10,
+        verify=self.verify_tls, allow_redirects=True,
+      )
+    except requests.RequestException as exc:
+      return f"Authenticated probe path unreachable: {exc}"
+    # 401/403 here is informational — we haven't sent the key yet so it
+    # may simply mean auth is enforced. Real validation happens after
+    # authenticate(), when probes start hitting endpoints.
+    return None
+
+  def authenticate(self, creds) -> Optional[requests.Session]:
+    if not creds.has_api_key():
+      return None
+    session = self.make_session()
+    location = self._auth_desc.api_key_location or "header"
+    if location == "header":
+      header_name = self._auth_desc.api_key_header_name or "X-Api-Key"
+      session.headers[header_name] = creds.api_key
+    elif location == "query":
+      # Stash the param name + value on the session for per-request mixing
+      # by probes. Cleanest cross-call carrier without a real session
+      # extension is the session.params attribute used by requests.
+      param_name = self._auth_desc.api_key_query_param or "api_key"
+      session.params = {**(session.params or {}), param_name: creds.api_key}
+    else:
+      session.close()
+      return None
+    self._session = session
+    self._creds = creds
+    return session
+
+  def refresh(self, creds) -> bool:
+    self.cleanup()
+    return self.authenticate(creds) is not None
+
+  def cleanup(self) -> None:
+    super().cleanup()
+    if self._creds is not None:
+      self._creds = None
