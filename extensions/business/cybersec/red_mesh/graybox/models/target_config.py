@@ -237,6 +237,298 @@ class DiscoveryConfig:
     )
 
 
+# ── OWASP API Top 10 2023 endpoint configs ──────────────────────────────
+#
+# Used by the five API probe families introduced in v1
+# (`api_access`, `api_auth`, `api_data`, `api_config`, `api_abuse`).
+# See `docs/adr/2026-05-12-scenario-id-convention.md` and the plan at
+# `_todos/2026-05-12-graybox-api-top10-plan-detailed.md` (Subphase 1.1).
+#
+# `ApiOutboundEndpoint` is deliberately absent — API10 is deferred to
+# Phase 9 (callback-receiver infrastructure required).
+
+@dataclass(frozen=True)
+class ApiObjectEndpoint:
+  """API object endpoint for BOLA testing (PT-OAPI1-01).
+
+  Probe iterates ``test_ids`` against ``path`` (a template containing
+  ``{id_param}``), as `regular_session`, expects ownership mismatch.
+  """
+  path: str                                  # e.g. "/api/records/{id}/"
+  test_ids: list[int] = field(default_factory=lambda: [1, 2])
+  owner_field: str = "owner"
+  id_param: str = "id"
+  tenant_field: str = ""                    # optional, for cross-tenant BOLA
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ApiObjectEndpoint:
+    return cls(
+      path=d["path"],
+      test_ids=d.get("test_ids", [1, 2]),
+      owner_field=d.get("owner_field", "owner"),
+      id_param=d.get("id_param", "id"),
+      tenant_field=d.get("tenant_field", ""),
+    )
+
+
+@dataclass(frozen=True)
+class ApiPropertyEndpoint:
+  """API property endpoint for BOPLA testing (PT-OAPI3-01 read, PT-OAPI3-02 write).
+
+  Read probe scans the JSON response for sensitive field names. Write
+  probe (stateful) attempts to set extra fields from ``tampering_fields``
+  on the object identified by ``test_id`` and verifies via re-GET.
+  """
+  path: str                                  # e.g. "/api/profile/{id}/"
+  method_read: str = "GET"
+  method_write: str = "PATCH"
+  test_id: int = 1                           # designated object for write test
+  id_param: str = "id"
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ApiPropertyEndpoint:
+    return cls(
+      path=d["path"],
+      method_read=d.get("method_read", "GET"),
+      method_write=d.get("method_write", "PATCH"),
+      test_id=d.get("test_id", 1),
+      id_param=d.get("id_param", "id"),
+    )
+
+
+@dataclass(frozen=True)
+class ApiFunctionEndpoint:
+  """API function endpoint for BFLA testing (PT-OAPI5-01..04).
+
+  ``method == "GET"`` entries are tested read-only in Phase 2.3
+  (PT-OAPI5-01 / PT-OAPI5-02). Non-GET entries require both
+  ``allow_stateful_probes=True`` AND ``revert_path``/``revert_body``
+  (Phase 3.4, PT-OAPI5-03 / PT-OAPI5-04, stateful contract).
+  """
+  path: str                                  # e.g. "/api/admin/users/{uid}/promote/"
+  method: str = "GET"
+  privilege: str = "admin"                  # "admin", "user", "anon"
+  auth_required_marker: str = ""            # body substring expected on 401/403
+  revert_path: str = ""                     # e.g. ".../demote/" — required for stateful
+  revert_body: dict = field(default_factory=dict)
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ApiFunctionEndpoint:
+    return cls(
+      path=d["path"],
+      method=d.get("method", "GET"),
+      privilege=d.get("privilege", "admin"),
+      auth_required_marker=d.get("auth_required_marker", ""),
+      revert_path=d.get("revert_path", ""),
+      revert_body=d.get("revert_body", {}),
+    )
+
+
+@dataclass(frozen=True)
+class ApiResourceEndpoint:
+  """API resource endpoint for bounded resource-consumption testing (PT-OAPI4-*).
+
+  Bounded by construction — no stress testing. Total requests across the
+  family stop at ``max_total_requests`` (per scan, see ApiSecurityConfig)
+  or earlier if a 429 is observed.
+
+  ``rate_limit_expected`` defaults to False — only set True when the
+  endpoint is genuinely supposed to be rate-limited; otherwise the
+  PT-OAPI4-03 (no-rate-limit) probe will produce noisy false positives.
+  """
+  path: str                                  # e.g. "/api/records/list/"
+  limit_param: str = "limit"
+  baseline_limit: int = 10
+  abuse_limit: int = 999_999
+  rate_limit_expected: bool = False
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ApiResourceEndpoint:
+    return cls(
+      path=d["path"],
+      limit_param=d.get("limit_param", "limit"),
+      baseline_limit=d.get("baseline_limit", 10),
+      abuse_limit=d.get("abuse_limit", 999_999),
+      rate_limit_expected=d.get("rate_limit_expected", False),
+    )
+
+
+@dataclass(frozen=True)
+class ApiBusinessFlow:
+  """Sensitive business-flow endpoint for abuse testing (PT-OAPI6-*).
+
+  All checks are stateful by definition — they create or replay data.
+  ``test_account`` is a tester-supplied non-privileged identity used so
+  the official user is never touched by abuse probes.
+  """
+  path: str                                  # e.g. "/api/auth/signup/"
+  method: str = "POST"
+  flow_name: str = "signup"                 # "signup", "password_reset", "purchase", etc.
+  body_template: dict = field(default_factory=dict)
+  verify_path: str = ""                     # endpoint to verify duplicate creation
+  test_account: str = ""                    # non-privileged identity used during abuse test
+  captcha_marker: str = ""                  # body substring indicating CAPTCHA challenge
+  mfa_marker: str = ""                      # body substring indicating MFA challenge
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ApiBusinessFlow:
+    return cls(
+      path=d["path"],
+      method=d.get("method", "POST"),
+      flow_name=d.get("flow_name", "signup"),
+      body_template=d.get("body_template", {}),
+      verify_path=d.get("verify_path", ""),
+      test_account=d.get("test_account", ""),
+      captcha_marker=d.get("captcha_marker", ""),
+      mfa_marker=d.get("mfa_marker", ""),
+    )
+
+
+@dataclass(frozen=True)
+class ApiTokenEndpoint:
+  """Token endpoint for broken-auth testing (PT-OAPI2-01..03).
+
+  ``token_path`` issues a JWT given credentials; ``protected_path`` accepts
+  it. ``logout_path`` is required for PT-OAPI2-03 (logout-doesn't-invalidate,
+  stateful — revert is re-authentication).
+
+  ``weak_secret_candidates`` is an inline dictionary used by PT-OAPI2-02.
+  Defaults are deliberately tiny — extend per engagement, or use a
+  Phase 9 wordlist follow-up.
+  """
+  token_path: str = ""                       # e.g. "/api/token/"
+  protected_path: str = ""                   # e.g. "/api/me/"
+  logout_path: str = ""                      # e.g. "/api/auth/logout/" — required for PT-OAPI2-03
+  weak_secret_candidates: list[str] = field(default_factory=lambda: [
+    "secret", "changeme", "password", "1234567890",
+    "jwt", "key", "topsecret", "default",
+  ])
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ApiTokenEndpoint:
+    defaults = cls.__dataclass_fields__["weak_secret_candidates"].default_factory()
+    return cls(
+      token_path=d.get("token_path", ""),
+      protected_path=d.get("protected_path", ""),
+      logout_path=d.get("logout_path", ""),
+      weak_secret_candidates=d.get("weak_secret_candidates", defaults),
+    )
+
+
+@dataclass(frozen=True)
+class ApiInventoryPaths:
+  """Inventory-related paths for API9 testing.
+
+  ``openapi_candidates`` are probed by PT-OAPI9-01 looking for an exposed
+  OpenAPI/Swagger document. ``current_version`` + sibling probing drives
+  PT-OAPI9-02 (version sprawl); ``deprecated_paths`` drives PT-OAPI9-03.
+  ``private_path_patterns`` is used as the substring/glob set indicating
+  paths in the spec that shouldn't be publicly exposed.
+  """
+  openapi_candidates: list[str] = field(default_factory=lambda: [
+    "/openapi.json", "/swagger.json", "/v3/api-docs",
+    "/api/swagger.json", "/api-docs", "/swagger-ui.html",
+  ])
+  current_version: str = ""                  # e.g. "/api/v2/"
+  version_sibling_candidates: list[str] = field(default_factory=lambda: [
+    "/api/v1/", "/api/v0/", "/api/beta/", "/api/internal/", "/api/legacy/",
+  ])
+  canonical_probe_path: str = ""             # canonical endpoint under current_version used to verify a sibling responds
+  private_path_patterns: list[str] = field(default_factory=list)
+  deprecated_paths: list[str] = field(default_factory=list)
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ApiInventoryPaths:
+    fields_ = cls.__dataclass_fields__
+    return cls(
+      openapi_candidates=d.get(
+        "openapi_candidates",
+        fields_["openapi_candidates"].default_factory(),
+      ),
+      current_version=d.get("current_version", ""),
+      version_sibling_candidates=d.get(
+        "version_sibling_candidates",
+        fields_["version_sibling_candidates"].default_factory(),
+      ),
+      canonical_probe_path=d.get("canonical_probe_path", ""),
+      private_path_patterns=d.get("private_path_patterns", []),
+      deprecated_paths=d.get("deprecated_paths", []),
+    )
+
+
+@dataclass(frozen=True)
+class ApiSecurityConfig:
+  """Aggregated config for the five OWASP API Top 10 graybox probe families.
+
+  Probes draw from exactly the section they own:
+    - api_access  → object_endpoints (BOLA), function_endpoints (BFLA)
+    - api_auth    → token_endpoints (broken auth)
+    - api_data    → property_endpoints (BOPLA read/write)
+    - api_config  → inventory_paths, debug_path_candidates (misconfig/inventory)
+    - api_abuse   → resource_endpoints, business_flows
+
+  ``ssrf_body_fields`` extends the legacy PT-API7-01 SSRF probe (lives in
+  injection.py, kept under its legacy ID) to scan JSON body fields by name.
+
+  ``sensitive_field_patterns`` augments the built-in default patterns used
+  by PT-OAPI3-01 (excessive property exposure). Entries are merged with,
+  not replacing, the defaults.
+
+  ``tampering_fields`` lists property names PT-OAPI3-02 will attempt to set
+  via mass assignment.
+
+  Auth descriptor (`auth`) and per-scan request budget
+  (`max_total_requests`) land in Subphases 1.5 and 1.7 respectively;
+  added here as future hooks would couple this subphase to those.
+  """
+  object_endpoints: list[ApiObjectEndpoint] = field(default_factory=list)
+  property_endpoints: list[ApiPropertyEndpoint] = field(default_factory=list)
+  function_endpoints: list[ApiFunctionEndpoint] = field(default_factory=list)
+  resource_endpoints: list[ApiResourceEndpoint] = field(default_factory=list)
+  business_flows: list[ApiBusinessFlow] = field(default_factory=list)
+  token_endpoints: ApiTokenEndpoint = field(default_factory=ApiTokenEndpoint)
+  inventory_paths: ApiInventoryPaths = field(default_factory=ApiInventoryPaths)
+
+  ssrf_body_fields: list[str] = field(default_factory=lambda: [
+    "url", "webhook", "callback", "image_url", "redirect_uri",
+  ])
+  sensitive_field_patterns: list[str] = field(default_factory=list)
+  tampering_fields: list[str] = field(default_factory=lambda: [
+    "is_admin", "is_superuser", "role", "verified", "email_verified",
+    "tenant_id", "owner_id", "balance",
+  ])
+  debug_path_candidates: list[str] = field(default_factory=lambda: [
+    "/debug", "/api/debug", "/api/_routes",
+    "/actuator", "/actuator/env", "/q/dev", "/__debug__",
+  ])
+
+  @classmethod
+  def from_dict(cls, d: dict) -> ApiSecurityConfig:
+    fields_ = cls.__dataclass_fields__
+    return cls(
+      object_endpoints=[ApiObjectEndpoint.from_dict(e) for e in d.get("object_endpoints", [])],
+      property_endpoints=[ApiPropertyEndpoint.from_dict(e) for e in d.get("property_endpoints", [])],
+      function_endpoints=[ApiFunctionEndpoint.from_dict(e) for e in d.get("function_endpoints", [])],
+      resource_endpoints=[ApiResourceEndpoint.from_dict(e) for e in d.get("resource_endpoints", [])],
+      business_flows=[ApiBusinessFlow.from_dict(e) for e in d.get("business_flows", [])],
+      token_endpoints=ApiTokenEndpoint.from_dict(d.get("token_endpoints", {})),
+      inventory_paths=ApiInventoryPaths.from_dict(d.get("inventory_paths", {})),
+      ssrf_body_fields=d.get(
+        "ssrf_body_fields",
+        fields_["ssrf_body_fields"].default_factory(),
+      ),
+      sensitive_field_patterns=d.get("sensitive_field_patterns", []),
+      tampering_fields=d.get(
+        "tampering_fields",
+        fields_["tampering_fields"].default_factory(),
+      ),
+      debug_path_candidates=d.get(
+        "debug_path_candidates",
+        fields_["debug_path_candidates"].default_factory(),
+      ),
+    )
+
+
 # ── Main config ─────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
