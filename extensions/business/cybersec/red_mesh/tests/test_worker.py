@@ -277,6 +277,51 @@ class TestExecution(unittest.TestCase):
         ["_graybox_alpha", "_graybox_weak_auth"],
       )
 
+  def test_supported_features_include_api_top10_families(self):
+    """All five OWASP API Top 10 probe families dispatch via the worker."""
+    features = GrayboxLocalWorker.get_supported_features()
+    for key in (
+      "_graybox_api_access", "_graybox_api_auth", "_graybox_api_data",
+      "_graybox_api_config", "_graybox_api_abuse",
+    ):
+      with self.subTest(key=key):
+        self.assertIn(key, features)
+
+  def test_api_family_skeletons_dispatch_cleanly(self):
+    """Skeleton run() returns an empty finding list on each new family.
+
+    Confirms the worker registry can resolve each module-relative dotted
+    path and the class can be instantiated against a minimal context.
+    """
+    import importlib
+    pkg = "extensions.business.cybersec.red_mesh.graybox.probes"
+    new_entries = [
+      e for e in GRAYBOX_PROBE_REGISTRY
+      if e["key"] in {
+        "_graybox_api_access", "_graybox_api_auth", "_graybox_api_data",
+        "_graybox_api_config", "_graybox_api_abuse",
+      }
+    ]
+    self.assertEqual(len(new_entries), 5)
+    for entry in new_entries:
+      with self.subTest(key=entry["key"]):
+        module_name, class_name = entry["cls"].split(".", 1)
+        mod = importlib.import_module(f"{pkg}.{module_name}")
+        cls = getattr(mod, class_name)
+        auth = MagicMock()
+        auth.regular_session = None
+        safety = MagicMock()
+        # Skeleton instantiates with the base ProbeBase signature.
+        probe = cls(
+          target_url="http://testapp.local",
+          auth_manager=auth,
+          target_config=MagicMock(),
+          safety=safety,
+        )
+        result = probe.run()
+        # Skeleton: no findings yet. Real probes land in Phase 2 / 3.
+        self.assertEqual(list(result), [])
+
   def test_scenario_stats(self):
     """Scenario stats count findings by status."""
     worker = _make_worker()

@@ -177,12 +177,40 @@ class TestProbeRegistry(unittest.TestCase):
         f"Registry entry has extra keys: {entry}")
 
   def test_registry_has_expected_probes(self):
-    """Registry includes access_control, misconfig, injection, business_logic."""
+    """Registry includes all legacy + five OWASP API Top 10 probe families."""
     keys = [e["key"] for e in GRAYBOX_PROBE_REGISTRY]
+    # Legacy (Web Top 10)
     self.assertIn("_graybox_access_control", keys)
     self.assertIn("_graybox_misconfig", keys)
     self.assertIn("_graybox_injection", keys)
     self.assertIn("_graybox_business_logic", keys)
+    # OWASP API Top 10 2023 (Subphase 1.3)
+    self.assertIn("_graybox_api_access", keys)
+    self.assertIn("_graybox_api_auth", keys)
+    self.assertIn("_graybox_api_data", keys)
+    self.assertIn("_graybox_api_config", keys)
+    self.assertIn("_graybox_api_abuse", keys)
+
+  def test_api_family_classes_importable(self):
+    """Each new API family resolves via its module-relative dotted path."""
+    import importlib
+    api_keys = (
+      "_graybox_api_access", "_graybox_api_auth", "_graybox_api_data",
+      "_graybox_api_config", "_graybox_api_abuse",
+    )
+    by_key = {e["key"]: e for e in GRAYBOX_PROBE_REGISTRY}
+    pkg = "extensions.business.cybersec.red_mesh.graybox.probes"
+    for key in api_keys:
+      with self.subTest(key=key):
+        entry = by_key[key]
+        module_name, class_name = entry["cls"].split(".", 1)
+        mod = importlib.import_module(f"{pkg}.{module_name}")
+        cls = getattr(mod, class_name)
+        # ProbeBase capability flags present and probe is non-stateful by default.
+        self.assertTrue(cls.requires_auth)
+        self.assertFalse(cls.is_stateful)
+        # run() returns iterable (skeleton returns self.findings == [])
+        # Instantiation requires a context; we only verify class import here.
 
 
 class TestCsrfFields(unittest.TestCase):
