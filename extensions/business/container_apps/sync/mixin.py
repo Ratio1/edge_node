@@ -43,6 +43,9 @@ from .constants import (
   VOLUME_SYNC_SUBDIR,
 )
 from .manager import (
+  CONSUMER_APPLY_OFFLINE_RESTART,
+  CONSUMER_APPLY_ONLINE_NO_RESTART,
+  CONSUMER_APPLY_ONLINE_RESTART,
   SyncManager,
   history_received_dir,
   history_sent_dir,
@@ -395,16 +398,45 @@ class _SyncMixin:
       color="b",
     )
 
-    self._stop_container_runtime_for_restart()
+    apply_mode = self._sync_record_consumer_apply_mode(record)
+    if apply_mode == CONSUMER_APPLY_OFFLINE_RESTART:
+      self._stop_container_runtime_for_restart()
 
+    applied = False
     try:
-      sm.apply_snapshot(record)
+      applied = bool(sm.apply_snapshot(record))
     except Exception as exc:
       self.P(f"[sync] apply_snapshot raised unexpectedly: {exc}", color="r")
 
-    self._sync_safe_start_container()
+    if apply_mode == CONSUMER_APPLY_OFFLINE_RESTART:
+      self._sync_safe_start_container()
+    elif apply_mode == CONSUMER_APPLY_ONLINE_RESTART and applied:
+      self._stop_container_runtime_for_restart()
+      self._sync_safe_start_container()
 
   # ----- internal helpers ------------------------------------------------
+
+  def _sync_record_consumer_apply_mode(self, record: dict) -> str:
+    runtime = record.get("runtime")
+    if not isinstance(runtime, dict):
+      runtime = (record.get("manifest") or {}).get("runtime")
+    if not isinstance(runtime, dict):
+      return CONSUMER_APPLY_OFFLINE_RESTART
+
+    mode = runtime.get("consumer_apply", CONSUMER_APPLY_OFFLINE_RESTART)
+    allowed = {
+      CONSUMER_APPLY_OFFLINE_RESTART,
+      CONSUMER_APPLY_ONLINE_NO_RESTART,
+      CONSUMER_APPLY_ONLINE_RESTART,
+    }
+    if mode not in allowed:
+      self.P(
+        f"[sync] unknown consumer_apply mode {mode!r}; using "
+        f"{CONSUMER_APPLY_OFFLINE_RESTART!r}",
+        color="y",
+      )
+      return CONSUMER_APPLY_OFFLINE_RESTART
+    return mode
 
   def _sync_should_tick(self, current_time: float) -> bool:
     last = getattr(self, "_last_sync_check", 0.0) or 0.0

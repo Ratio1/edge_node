@@ -390,11 +390,14 @@ class TestConsumerTick(unittest.TestCase):
   def tearDown(self):
     self._tmp.cleanup()
 
-  def _publish(self, content=b"data1"):
+  def _publish(self, content=b"data1", runtime=None):
     (self.provider_owner._fixed_root / "appdata" / "weights.bin").write_bytes(content)
     p_vsd = volume_sync_dir(self.provider_plugin)
     p_vsd.mkdir(parents=True, exist_ok=True)
-    (p_vsd / "request.json").write_text(json.dumps({"archive_paths": ["/app/data/"]}))
+    request = {"archive_paths": ["/app/data/"]}
+    if runtime is not None:
+      request["runtime"] = runtime
+    (p_vsd / "request.json").write_text(json.dumps(request))
     self.provider_plugin._last_sync_check = 0
     self.provider_plugin._sync_provider_tick(current_time=1000.0)
 
@@ -409,6 +412,45 @@ class TestConsumerTick(unittest.TestCase):
     target = self.consumer_owner._fixed_root / "appdata" / "weights.bin"
     self.assertEqual(target.read_bytes(), b"data1")
     self.assertTrue((volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists())
+
+  def test_consumer_explicit_offline_restart_stops_applies_and_restarts(self):
+    self._publish(runtime={"consumer_apply": "offline_restart"})
+
+    self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+
+    self.assertEqual(self.consumer_plugin.runtime_stop_calls, 1)
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"])
+    target = self.consumer_owner._fixed_root / "appdata" / "weights.bin"
+    self.assertEqual(target.read_bytes(), b"data1")
+
+  def test_consumer_online_no_restart_applies_without_lifecycle_stop_start(self):
+    self._publish(runtime={"consumer_apply": "online_no_restart"})
+
+    self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+
+    self.assertEqual(self.consumer_plugin.runtime_stop_calls, 0)
+    self.assertEqual(self.consumer_plugin.start_calls, 0)
+    self.assertEqual(self.consumer_plugin.lifecycle_log, [])
+    target = self.consumer_owner._fixed_root / "appdata" / "weights.bin"
+    self.assertEqual(target.read_bytes(), b"data1")
+    self.assertTrue((volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists())
+
+  def test_consumer_online_restart_applies_before_restart(self):
+    target = self.consumer_owner._fixed_root / "appdata" / "weights.bin"
+    target.write_bytes(b"old")
+    self._publish(content=b"new", runtime={"consumer_apply": "online_restart"})
+
+    orig_stop = self.consumer_plugin.stop_container
+
+    def stop_after_apply():
+      self.assertEqual(target.read_bytes(), b"new")
+      orig_stop()
+
+    self.consumer_plugin.stop_container = stop_after_apply
+    self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+
+    self.assertEqual(self.consumer_plugin.runtime_stop_calls, 1)
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"])
 
   def test_consumer_resets_runtime_state_after_apply(self):
     """After a sync slice, per-restart runtime markers must be reset so
