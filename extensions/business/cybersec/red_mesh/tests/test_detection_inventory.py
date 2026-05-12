@@ -11,6 +11,7 @@ from extensions.business.cybersec.red_mesh.cve_db import check_cves
 from extensions.business.cybersec.red_mesh.detection_inventory import build_detection_inventory
 from extensions.business.cybersec.red_mesh.graybox.scenario_catalog import (
   GRAYBOX_SCENARIO_CATALOG,
+  attack_for_scenario,
 )
 from extensions.business.cybersec.red_mesh.worker.blackbox_detection_catalog import (
   BLACKBOX_DETECTION_CATALOG,
@@ -23,7 +24,10 @@ class TestDetectionInventory(unittest.TestCase):
     counts = build_detection_inventory().counts()
     self.assertGreaterEqual(counts["total"], 300)
     self.assertGreaterEqual(counts["blackbox"], 220)
-    self.assertGreaterEqual(counts["graybox"], 80)
+    # Graybox floor bumped from 80 -> 103 by Subphase 1.2 of the API Top 10
+    # plan (23 new PT-OAPI* entries). Post-implementation target is >=120
+    # (continued OWASP Web Top 10 closing).
+    self.assertGreaterEqual(counts["graybox"], 103)
     self.assertGreaterEqual(counts["cves"], 200)
 
   def test_detection_ids_are_unique(self):
@@ -94,6 +98,58 @@ class TestDetectionInventory(unittest.TestCase):
     for source in rejects:
       with self.subTest(source=source):
         self.assertIsNone(self._SCENARIO_ID_RE.search(source))
+
+  def test_v1_api_scenarios_have_non_empty_attack_mapping(self):
+    """Every v1 OWASP API Top 10 scenario must declare ATT&CK techniques.
+
+    Implements the mandatory ATT&CK mapping requirement from Subphase 1.2
+    of the API Top 10 plan. The catalog is the single source of truth for
+    `attack=[]` defaults emitted by probes via `ProbeBase.emit_vulnerable`.
+    """
+    # In v1, the prefix `PT-OAPI` identifies the new API Top 10 scenarios.
+    # The legacy `PT-API7-01` is also subject to this requirement so the
+    # SSRF probe carries an ATT&CK mapping consistent with the others.
+    mandatory_prefixes = ("PT-OAPI", "PT-API7")
+    missing = []
+    for entry in GRAYBOX_SCENARIO_CATALOG:
+      sid = entry["id"]
+      if not any(sid.startswith(p) for p in mandatory_prefixes):
+        continue
+      attack = entry.get("attack")
+      if not attack:
+        missing.append(sid)
+    self.assertEqual(
+      missing,
+      [],
+      f"v1 API scenarios missing non-empty `attack` mapping: {missing}",
+    )
+
+  def test_attack_for_scenario_helper(self):
+    """Helper returns catalog's `attack` list or empty for unknown/legacy IDs."""
+    # Known new entry
+    self.assertEqual(attack_for_scenario("PT-OAPI1-01"), ["T1190", "T1078"])
+    # Legacy SSRF
+    self.assertEqual(attack_for_scenario("PT-API7-01"), ["T1190"])
+    # Legacy PT-A* without explicit attack -> empty
+    self.assertEqual(attack_for_scenario("PT-A01-01"), [])
+    # Unknown id -> empty (not KeyError)
+    self.assertEqual(attack_for_scenario("PT-NOT-REAL-99"), [])
+
+  def test_v1_api_scenario_count(self):
+    """v1 catalog contains exactly 23 new PT-OAPI scenarios; no PT-OAPI10."""
+    oapi_ids = {
+      entry["id"] for entry in GRAYBOX_SCENARIO_CATALOG
+      if entry["id"].startswith("PT-OAPI")
+    }
+    self.assertEqual(len(oapi_ids), 23)
+    # API10 deliberately omitted in v1 (Phase 9 follow-up)
+    self.assertNotIn("PT-OAPI10-01", oapi_ids)
+    # Spot-check coverage per category
+    for cat in (1, 2, 3, 4, 5, 6, 8, 9):
+      self.assertTrue(
+        any(i.startswith(f"PT-OAPI{cat}-") for i in oapi_ids),
+        f"missing PT-OAPI{cat}-* entries",
+      )
 
 
 class TestCveVersionNormalization(unittest.TestCase):
