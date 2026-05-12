@@ -157,7 +157,9 @@ class ProbeBase:
       except Exception:
         rollback_status = "revert_failed"
 
-    # 5. Emit. Confirmed = vulnerable; otherwise clean.
+    # 5. Emit. Confirmed = vulnerable; otherwise clean. `rollback_status`
+    # is set as a first-class field on the finding (Subphase 1.8 commit #2)
+    # so PDF/UI can render it as a badge without parsing evidence strings.
     if confirmed:
       severity = finding_kwargs.pop("severity", "HIGH")
       # Severity bump on revert failure: HIGH→CRITICAL, MEDIUM→HIGH.
@@ -165,7 +167,6 @@ class ProbeBase:
         severity = {"HIGH": "CRITICAL", "MEDIUM": "HIGH"}.get(severity, severity)
       cwe = finding_kwargs.pop("cwe", [])
       evidence = list(finding_kwargs.pop("evidence", []))
-      evidence.append(f"rollback_status={rollback_status}")
       remediation = finding_kwargs.pop("remediation", "")
       if rollback_status == "revert_failed":
         remediation = (
@@ -175,13 +176,15 @@ class ProbeBase:
       self.emit_vulnerable(
         scenario_id, title, severity, owasp, cwe, evidence,
         remediation=remediation,
+        rollback_status=rollback_status,
         **finding_kwargs,
       )
       return True
     else:
       self.emit_clean(
         scenario_id, title, owasp,
-        [f"rollback_status={rollback_status}"],
+        [],
+        rollback_status=rollback_status,
       )
       return False
 
@@ -261,8 +264,13 @@ class ProbeBase:
 
   def emit_vulnerable(self, scenario_id, title, severity, owasp, cwe,
                        evidence, *, attack=None, evidence_artifacts=None,
-                       replay_steps=None, remediation=None):
-    """Append a vulnerable GrayboxFinding using the catalog's ATT&CK default."""
+                       replay_steps=None, remediation=None,
+                       rollback_status=""):
+    """Append a vulnerable GrayboxFinding using the catalog's ATT&CK default.
+
+    ``rollback_status`` is set by `run_stateful` for stateful probes;
+    leave default for non-stateful findings.
+    """
     self.findings.append(GrayboxFinding(
       scenario_id=scenario_id,
       title=self._scrub_for_emission(title),
@@ -275,9 +283,11 @@ class ProbeBase:
       evidence_artifacts=self._scrub_for_emission(list(evidence_artifacts or [])),
       replay_steps=self._scrub_for_emission(list(replay_steps or [])),
       remediation=self._scrub_for_emission(remediation or ""),
+      rollback_status=rollback_status or "",
     ))
 
-  def emit_clean(self, scenario_id, title, owasp, evidence):
+  def emit_clean(self, scenario_id, title, owasp, evidence,
+                 *, rollback_status=""):
     """Append a not_vulnerable / INFO GrayboxFinding (test ran OK, nothing found)."""
     self.findings.append(GrayboxFinding(
       scenario_id=scenario_id,
@@ -286,6 +296,7 @@ class ProbeBase:
       severity="INFO",
       owasp=owasp,
       evidence=self._scrub_for_emission(list(evidence or [])),
+      rollback_status=rollback_status or "",
     ))
 
   def emit_inconclusive(self, scenario_id, title, owasp, reason):

@@ -153,6 +153,11 @@ class GrayboxFinding:
   error: str | None = None                          # non-None if probe had an error
   cvss_score: float | None = None
   cvss_vector: str = ""
+  # OWASP API Top 10 — Subphase 1.8. Stateful-probe rollback outcome.
+  # Populated by ProbeBase.run_stateful; remains "" for non-stateful
+  # findings. Renders as a badge in the Navigator UI (Phase 8.3) and in
+  # the PDF report when revert_failed (Phase 8.4 red-bordered note).
+  rollback_status: str = ""                         # "" | "reverted" | "revert_failed" | "no_revert_needed"
 
   @classmethod
   def from_dict(cls, payload: dict[str, Any]) -> "GrayboxFinding":
@@ -237,6 +242,7 @@ class GrayboxFinding:
       "attack_ids": list(self.attack),
       "cvss_score": self.cvss_score,
       "cvss_vector": self.cvss_vector,
+      "rollback_status": self.rollback_status,
     }
     return _scrub_flat_finding(flat)
 
