@@ -23,6 +23,7 @@ GRAYBOX_PROBE_REGISTRY = [
   # OWASP API Top 10 2023 — five themed families (Subphase 1.3).
   {"key": "_graybox_api_access",      "cls": "api_access.ApiAccessProbes"},
   {"key": "_graybox_api_auth",        "cls": "api_auth.ApiAuthProbes"},
+  {"key": "_graybox_api_data",        "cls": "api_data.ApiDataProbes"},
 ]
 
 # Graybox timing and limits
