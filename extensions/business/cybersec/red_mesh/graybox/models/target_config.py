@@ -555,6 +555,11 @@ class ApiSecurityConfig:
     "/debug", "/api/debug", "/api/_routes",
     "/actuator", "/actuator/env", "/q/dev", "/__debug__",
   ])
+  # OWASP API Top 10 — Subphase 1.7. Per-scan request budget cap. Each
+  # `ProbeBase.budget()` call decrements a shared `RequestBudget`; once
+  # exhausted, probes emit `inconclusive` with reason `budget_exhausted`
+  # rather than continuing to issue requests.
+  max_total_requests: int = 1000
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiSecurityConfig:
@@ -581,6 +586,7 @@ class ApiSecurityConfig:
         "debug_path_candidates",
         fields_["debug_path_candidates"].default_factory(),
       ),
+      max_total_requests=d.get("max_total_requests", 1000),
     )
 
 

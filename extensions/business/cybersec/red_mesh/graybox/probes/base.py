@@ -76,6 +76,19 @@ class ProbeBase:
       outcome=outcome,
     )
 
+  def budget(self, n: int = 1) -> bool:
+    """Consume ``n`` requests from the shared per-scan RequestBudget.
+
+    Returns False (and records an exhaustion event on the budget object)
+    when the budget can't cover the request. Probes that hit this should
+    stop iteration and emit `inconclusive` with reason
+    ``budget_exhausted``. Returns True when no budget is configured
+    (legacy callers / tests without a budget).
+    """
+    if self.request_budget is None:
+      return True
+    return self.request_budget.consume(n)
+
   def _record_error(self, probe_name, error_msg):
     """Store a non-fatal error as an INFO GrayboxFinding."""
     self.findings.append(GrayboxFinding(
