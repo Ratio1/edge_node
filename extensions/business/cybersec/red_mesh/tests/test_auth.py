@@ -110,6 +110,128 @@ class TestCsrfAutoDetect(unittest.TestCase):
     self.assertEqual(val, "pub-tok")
 
 
+class TestBearerAuthStrategy(unittest.TestCase):
+  """OWASP API Top 10 (Subphase 1.5 commit #6) — Bearer-token strategy."""
+
+  def _bearer(self, **auth_kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import BearerAuth
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      GrayboxTargetConfig, ApiSecurityConfig, AuthDescriptor,
+    )
+    desc = AuthDescriptor(**{"auth_type": "bearer", **auth_kwargs})
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=desc))
+    return BearerAuth("http://api.example", cfg, verify_tls=True)
+
+  def test_authenticate_stamps_default_header(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    ba = self._bearer()
+    sess = ba.authenticate(Credentials(bearer_token="abc.def.ghi"))
+    self.assertIsNotNone(sess)
+    self.assertEqual(sess.headers["Authorization"], "Bearer abc.def.ghi")
+
+  def test_authenticate_custom_header_and_scheme(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    ba = self._bearer(bearer_token_header_name="X-Auth-Token", bearer_scheme="Token")
+    sess = ba.authenticate(Credentials(bearer_token="xyz"))
+    self.assertEqual(sess.headers["X-Auth-Token"], "Token xyz")
+
+  def test_authenticate_empty_token_fails(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    ba = self._bearer()
+    self.assertIsNone(ba.authenticate(Credentials()))
+
+  def test_refresh_reauthenticates(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    ba = self._bearer()
+    creds = Credentials(bearer_token="t1")
+    ba.authenticate(creds)
+    self.assertTrue(ba.refresh(creds))
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_preflight_skipped_when_no_probe_path(self, mock_requests):
+    """Empty `authenticated_probe_path` means no preflight HTTP traffic."""
+    ba = self._bearer()
+    self.assertIsNone(ba.preflight())
+    mock_requests.head.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_preflight_401_returns_error(self, mock_requests):
+    import requests as real_requests
+    mock_requests.head.return_value = _mock_response(status=401)
+    mock_requests.RequestException = real_requests.RequestException
+    ba = self._bearer(authenticated_probe_path="/api/me")
+    err = ba.preflight()
+    self.assertIsNotNone(err)
+    self.assertIn("401", err)
+
+
+class TestApiKeyAuthStrategy(unittest.TestCase):
+  """OWASP API Top 10 (Subphase 1.5 commit #7) — API-key strategy."""
+
+  def _api_key(self, **auth_kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import ApiKeyAuth
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      GrayboxTargetConfig, ApiSecurityConfig, AuthDescriptor,
+    )
+    desc = AuthDescriptor(**{"auth_type": "api_key", **auth_kwargs})
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=desc))
+    return ApiKeyAuth("http://api.example", cfg, verify_tls=True)
+
+  def test_header_placement(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    ak = self._api_key(api_key_location="header", api_key_header_name="X-Custom-Key")
+    sess = ak.authenticate(Credentials(api_key="SECRET"))
+    self.assertEqual(sess.headers["X-Custom-Key"], "SECRET")
+    # No params used in header mode
+    self.assertEqual(sess.params or {}, {})
+
+  def test_query_placement(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    ak = self._api_key(api_key_location="query", api_key_query_param="apikey")
+    sess = ak.authenticate(Credentials(api_key="QSECRET"))
+    self.assertEqual(sess.params, {"apikey": "QSECRET"})
+    # No Authorization header set in query mode
+    self.assertNotIn("Authorization", sess.headers)
+
+  def test_unknown_location_fails(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    ak = self._api_key(api_key_location="weird")
+    self.assertIsNone(ak.authenticate(Credentials(api_key="x")))
+
+  def test_empty_key_fails(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    ak = self._api_key()
+    self.assertIsNone(ak.authenticate(Credentials()))
+
+
+class TestAuthManagerStrategyDispatch(unittest.TestCase):
+  """AuthManager.build_strategy routes by `auth_type` (Subphase 1.5 commits #5-#7)."""
+
+  def _auth_with(self, auth_type):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      GrayboxTargetConfig, ApiSecurityConfig, AuthDescriptor,
+    )
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=AuthDescriptor(auth_type=auth_type)))
+    return AuthManager("http://api.example", cfg)
+
+  def test_dispatch_form(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
+    self.assertIsInstance(self._auth_with("form")._build_strategy(), FormAuth)
+
+  def test_dispatch_bearer(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import BearerAuth
+    self.assertIsInstance(self._auth_with("bearer")._build_strategy(), BearerAuth)
+
+  def test_dispatch_api_key(self):
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import ApiKeyAuth
+    self.assertIsInstance(self._auth_with("api_key")._build_strategy(), ApiKeyAuth)
+
+  def test_dispatch_unknown(self):
+    auth = self._auth_with("bogus")
+    with self.assertRaises(ValueError):
+      auth._build_strategy()
+
+
 class TestLoginSuccessDetection(unittest.TestCase):
 
   def _check(self, auth, response, cookies=None):
