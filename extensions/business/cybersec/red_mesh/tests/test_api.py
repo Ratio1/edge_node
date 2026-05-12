@@ -439,6 +439,66 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(audit_payload["scope_id"], "scope-123")
     self.assertEqual(audit_payload["authorization_ref"], "TICKET-42")
 
+  def test_launch_webapp_scan_preserves_api_security_payload(self):
+    """OWASP API Top 10 target_config.api_security passes through to JobConfig."""
+    plugin = self._build_mock_plugin(job_id="test-job-api-security")
+
+    api_security_payload = {
+      "object_endpoints": [
+        {"path": "/api/records/{id}/", "test_ids": [1, 2],
+         "owner_field": "owner", "tenant_field": "tenant_id"},
+      ],
+      "function_endpoints": [
+        {"path": "/api/admin/users/{uid}/promote/",
+         "method": "POST", "privilege": "admin",
+         "revert_path": "/api/admin/users/{uid}/demote/"},
+      ],
+      "token_endpoints": {
+        "token_path": "/api/token/",
+        "protected_path": "/api/me/",
+        "logout_path": "/api/auth/logout/",
+      },
+      "inventory_paths": {
+        "current_version": "/api/v2/",
+        "canonical_probe_path": "/api/v2/records/1/",
+        "deprecated_paths": ["/api/v1/legacy/"],
+      },
+    }
+
+    self._launch_webapp(
+      plugin,
+      target_config={
+        "discovery": {"scope_prefix": "/api/"},
+        "api_security": api_security_payload,
+      },
+    )
+
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    api_security = config_dict["target_config"]["api_security"]
+    # Object endpoints preserved
+    self.assertEqual(len(api_security["object_endpoints"]), 1)
+    self.assertEqual(
+      api_security["object_endpoints"][0]["tenant_field"], "tenant_id"
+    )
+    # Function endpoints + revert path preserved
+    self.assertEqual(
+      api_security["function_endpoints"][0]["revert_path"],
+      "/api/admin/users/{uid}/demote/",
+    )
+    # Token endpoints preserved
+    self.assertEqual(
+      api_security["token_endpoints"]["logout_path"], "/api/auth/logout/"
+    )
+    # Inventory paths preserved
+    self.assertEqual(
+      api_security["inventory_paths"]["canonical_probe_path"],
+      "/api/v2/records/1/",
+    )
+    self.assertEqual(
+      api_security["inventory_paths"]["deprecated_paths"],
+      ["/api/v1/legacy/"],
+    )
+
   def test_launch_webapp_scan_applies_safety_policy_caps(self):
     """Graybox launch policy caps weak-auth and discovery budgets and records warnings."""
     plugin = self._build_mock_plugin(job_id="test-job-policy")
