@@ -24,6 +24,7 @@ import json
 import os
 import tarfile
 import tempfile
+import time as _time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -672,10 +673,22 @@ class SyncManager:
     now = self.owner.time()
     if now - self._last_hsync >= interval:
       self._last_hsync = now
+      # Always log the hsync attempt result (success or failure) — this is
+      # the only sync mixin log that fires on the happy path, so it doubles
+      # as the heartbeat that confirms the consumer is actually ticking and
+      # the rate-limit gating is working. Quiet enough at one log per
+      # HSYNC_POLL_INTERVAL window (default once per 10 min) to stay on in
+      # prod logs.
+      hsync_start = _time.monotonic()
       try:
         self.owner.chainstore_hsync(hkey=CHAINSTORE_SYNC_HKEY)
+        elapsed = _time.monotonic() - hsync_start
+        self.owner.P(f"[sync] chainstore_hsync ok ({elapsed:.2f}s)", color="g")
       except Exception as exc:
-        self.owner.P(f"[sync] chainstore_hsync error: {exc}", color="y")
+        elapsed = _time.monotonic() - hsync_start
+        self.owner.P(
+          f"[sync] chainstore_hsync error after {elapsed:.2f}s: {exc}", color="y"
+        )
 
     try:
       return self.owner.chainstore_hget(
