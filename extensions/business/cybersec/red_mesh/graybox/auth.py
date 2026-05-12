@@ -1,8 +1,18 @@
 """
 Authentication manager for graybox scanning.
 
-Handles CSRF auto-detection, login with robust success detection,
-session expiry, re-auth, and cleanup.
+Orchestrates `AuthStrategy` instances to establish authenticated sessions
+for one or more principals (`official`, `regular`). The strategy itself
+owns the protocol-level details (form login, Bearer header injection,
+API-key placement); the manager owns the lifecycle (expiry, retry,
+multi-principal coordination, cleanup).
+
+For backward compatibility this module continues to expose `AuthManager`
+with the same public API used by `graybox/worker.py` and by tests that
+patch `extensions...graybox.auth.requests`. Internally it delegates to
+`auth_strategies.FormAuth` for the legacy form-login flow; later
+subphases route to `BearerAuth` / `ApiKeyAuth` based on
+`target_config.api_security.auth.auth_type`.
 """
 
 import re
@@ -11,6 +21,8 @@ import time
 import requests
 
 from ..constants import GRAYBOX_SESSION_MAX_AGE
+from .auth_credentials import Credentials
+from .auth_strategies import FormAuth
 from .models.target_config import COMMON_CSRF_FIELDS
 from .models import GrayboxAuthState
 
@@ -145,32 +157,13 @@ class AuthManager:
     self._created_at = 0.0
 
   def preflight_check(self) -> str | None:
+    """Delegate preflight to the configured auth strategy.
+
+    Strategy chooses its own preflight semantics — FormAuth requires the
+    login_path to exist; BearerAuth / ApiKeyAuth (Subphase 1.5 #5-#7)
+    instead hit a configured authenticated endpoint.
     """
-    Verify target reachability and login page existence.
-
-    Returns error message if preflight fails, None if OK.
-    """
-    # 1. Target reachable?
-    try:
-      requests.head(
-        self.target_url,
-        timeout=10,
-        verify=self.verify_tls,
-        allow_redirects=True,
-      )
-    except requests.RequestException as exc:
-      return f"Target unreachable: {exc}"
-
-    # 2. Login page exists?
-    login_url = self.target_url + self.target_config.login_path
-    try:
-      resp = requests.get(login_url, timeout=10, verify=self.verify_tls)
-      if resp.status_code == 404:
-        return f"Login page not found: {login_url} returned 404"
-    except requests.RequestException as exc:
-      return f"Login page unreachable: {exc}"
-
-    return None
+    return self._build_strategy().preflight()
 
   def _make_session(self):
     s = requests.Session()
@@ -222,135 +215,43 @@ class AuthManager:
     return session
 
   def _try_login_attempt(self, username, password):
+    """Attempt one login via the configured strategy.
+
+    Returns ``(session, retryable_failure)``. Transport errors raised by
+    the strategy are translated into ``retryable_failure=True``; auth-level
+    failures into ``retryable_failure=False``.
     """
-    Attempt one login and classify whether failure is retryable.
-    """
-    session = self._make_session()
-    login_url = self.target_url + self.target_config.login_path
-
-    # GET login page
+    strategy = self._build_strategy()
+    creds = Credentials(username=username, password=password)
     try:
-      resp = session.get(login_url, timeout=10, allow_redirects=True)
+      session = strategy.authenticate(creds)
     except requests.RequestException:
-      session.close()
+      # Even on transport errors, the strategy may have already seen the
+      # login page and detected the CSRF field — preserve it.
+      if strategy.last_detected_csrf_field:
+        self._detected_csrf_field = strategy.last_detected_csrf_field
       return None, True
-
-    # Auto-detect or use configured CSRF field
-    csrf_field, csrf_token = self._extract_csrf(resp.text)
-
-    payload = {
-      self.target_config.username_field: username,
-      self.target_config.password_field: password,
-    }
-    headers = {"Referer": login_url}
-    if csrf_token and csrf_field:
-      payload[csrf_field] = csrf_token
-      headers["X-CSRFToken"] = csrf_token
-
-    try:
-      resp = session.post(
-        login_url, data=payload, headers=headers,
-        timeout=10, allow_redirects=True,
-      )
-    except requests.RequestException:
-      session.close()
-      return None, True
-
-    # Robust success detection
-    if self._is_login_success(resp, session, login_url):
+    # Always propagate whatever CSRF field the strategy saw, regardless
+    # of whether the credential check ultimately succeeded.
+    if strategy.last_detected_csrf_field:
+      self._detected_csrf_field = strategy.last_detected_csrf_field
+    if session is not None:
       return session, False
-
-    session.close()
     return None, False
 
-  def _is_login_success(self, response, session, login_url):
+  def _build_strategy(self) -> FormAuth:
+    """Construct the auth strategy for this manager.
+
+    Currently always FormAuth — Bearer/API-key dispatch lands in
+    Subphase 1.5 commit #5 (preflight strategy-aware) and #6/#7
+    (Bearer/ApiKey concrete strategies).
     """
-    Determine if login succeeded.
+    return FormAuth(self.target_url, self.target_config, self.verify_tls)
 
-    Checks (in order):
-    1. HTTP error -> fail
-    2. Response body contains failure markers -> fail
-    3. JSON error responses -> fail
-    4. Redirected away from login page AND cookies present -> success
-    5. Non-empty session cookies -> success
-    """
-    if response.status_code >= 400:
-      return False
-
-    # Check for failure markers in response body.
-    # Use multi-word phrases to avoid false matches — single words like
-    # "failed" can appear in legitimate post-login content.
-    failure_markers = [
-      "invalid credentials", "invalid username", "invalid password",
-      "incorrect password", "login failed", "authentication failed",
-      "try again", "wrong password", "unable to log in",
-      "account locked", "account disabled",
-    ]
-    body_lower = response.text.lower()
-    if any(marker in body_lower for marker in failure_markers):
-      return False
-
-    # SPA support: check JSON error responses
-    ct = response.headers.get("content-type", "")
-    if "application/json" in ct:
-      try:
-        data = response.json()
-        if isinstance(data, dict):
-          if data.get("error") or data.get("success") is False or data.get("authenticated") is False:
-            return False
-      except ValueError:
-        pass
-
-    has_cookies = bool(session.cookies.get_dict())
-
-    # Redirect away from login URL — require cookies to confirm
-    # session was actually established.
-    if response.url and "login" not in response.url.lower():
-      if has_cookies:
-        return True
-
-    # Redirect chain present and final URL differs AND cookies set
-    if response.history and login_url not in response.url:
-      if has_cookies:
-        return True
-
-    # Has auth-relevant cookies (even without redirect — SPA logins)
-    return has_cookies
-
-  def _extract_csrf(self, html):
-    """
-    Extract CSRF token from HTML.
-
-    If csrf_field is configured, use it directly.
-    Otherwise, try common framework field names.
-    Returns (field_name, token_value) tuple.
-    """
-    if self.target_config.csrf_field:
-      token = self._find_csrf_value(html, self.target_config.csrf_field)
-      return (self.target_config.csrf_field, token)
-
-    # Auto-detect: try common CSRF field names
-    if self._detected_csrf_field:
-      token = self._find_csrf_value(html, self._detected_csrf_field)
-      if token:
-        return (self._detected_csrf_field, token)
-
-    for field_name in COMMON_CSRF_FIELDS:
-      token = self._find_csrf_value(html, field_name)
-      if token:
-        self._detected_csrf_field = field_name
-        return (field_name, token)
-
-    # Fallback: any hidden input with "csrf" or "token" in name
-    m = re.search(
-      r'<input[^>]+type=["\']hidden["\'][^>]+name=["\']([^"\']*(?:csrf|token)[^"\']*)["\'][^>]+value=["\']([^"\']+)',
-      html or "", re.IGNORECASE,
-    )
-    if m:
-      self._detected_csrf_field = m.group(1)
-      return (m.group(1), m.group(2))
-
-    return (None, None)
+  # Form-login internals (``_is_login_success``, ``_extract_csrf``,
+  # ``_find_csrf_value``) moved into ``auth_strategies.FormAuth`` in
+  # Subphase 1.5 commit #3. ``extract_csrf_value`` remains a public
+  # static helper so existing probe-side callers keep working.
 
   @staticmethod
   def extract_csrf_value(html, field_name):
@@ -359,21 +260,4 @@ class AuthManager:
 
     Used by probes that need to include CSRF tokens in form submissions.
     """
-    return AuthManager._find_csrf_value(html, field_name)
-
-  @staticmethod
-  def _find_csrf_value(html, field_name):
-    """Find value of a named hidden input field."""
-    # Try name->value order
-    m = re.search(
-      rf'name=["\']?{re.escape(field_name)}["\']?\s[^>]*value=["\']([^"\']+)',
-      html or "", re.IGNORECASE,
-    )
-    if m:
-      return m.group(1)
-    # Try value->name order (some frameworks emit attrs differently)
-    m = re.search(
-      rf'value=["\']([^"\']+)["\'][^>]*name=["\']?{re.escape(field_name)}["\']?',
-      html or "", re.IGNORECASE,
-    )
-    return m.group(1) if m else None
+    return FormAuth._find_csrf_value(html, field_name)

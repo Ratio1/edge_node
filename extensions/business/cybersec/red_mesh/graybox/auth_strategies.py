@@ -55,6 +55,10 @@ class AuthStrategy(ABC):
     self.target_config = target_config
     self.verify_tls = verify_tls
     self._session: Optional[requests.Session] = None
+    # Strategies may expose protocol-specific diagnostic state here; the
+    # orchestrator copies it back into AuthManager so probe callers keep
+    # using the legacy public API.
+    self.last_detected_csrf_field: Optional[str] = None
 
   def make_session(self) -> requests.Session:
     """Create a fresh, unauthenticated ``requests.Session`` honouring TLS verify."""
@@ -154,18 +158,26 @@ class FormAuth(AuthStrategy):
     return None
 
   def authenticate(self, creds) -> Optional[requests.Session]:
+    """Return an authenticated session or None on auth-level failure.
+
+    Transport errors (``requests.RequestException``) bubble up so the
+    orchestrator can distinguish retryable transport failures from
+    definitive credential failures.
+    """
     session = self.make_session()
     login_url = self.target_url + self.target_config.login_path
 
-    # GET login page
+    # GET login page — transport errors bubble up (retryable).
     try:
       resp = session.get(login_url, timeout=10, allow_redirects=True)
     except requests.RequestException:
       session.close()
-      return None
+      raise
 
     # Auto-detect or use configured CSRF field
     csrf_field, csrf_token = self._extract_csrf(resp.text)
+    if csrf_field:
+      self.last_detected_csrf_field = csrf_field
 
     payload = {
       self.target_config.username_field: creds.username,
@@ -176,6 +188,7 @@ class FormAuth(AuthStrategy):
       payload[csrf_field] = csrf_token
       headers["X-CSRFToken"] = csrf_token
 
+    # POST credentials — transport errors bubble up (retryable).
     try:
       resp = session.post(
         login_url, data=payload, headers=headers,
@@ -183,7 +196,7 @@ class FormAuth(AuthStrategy):
       )
     except requests.RequestException:
       session.close()
-      return None
+      raise
 
     if self._is_login_success(resp, session, login_url):
       self._session = session
