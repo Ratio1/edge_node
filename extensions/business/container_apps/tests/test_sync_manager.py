@@ -205,6 +205,59 @@ class TestResolveContainerPath(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "non-empty"):
       self.sm.resolve_container_path("")
 
+  def test_longest_prefix_wins_for_nested_mounts(self):
+    """Nested fixed-size mounts (/app and /app/data) must resolve by the most
+    specific bind, not by dict insertion order. Docker overlays the deeper
+    mount on top of the broader one inside the container, so a path under
+    /app/data must resolve to the /app/data mount's host root even when /app
+    was added to self.volumes first. The previous first-match-wins iteration
+    silently mapped to the wrong host root (codex review finding 3 on PR #399).
+    """
+    fixed_root = self.owner._fixed_root
+    (fixed_root / "outer_app").mkdir(exist_ok=True)
+    (fixed_root / "inner_data").mkdir(exist_ok=True)
+    # Order matters: insert the broader mount FIRST so first-match-wins would
+    # pick the wrong one.
+    self.owner.volumes = {
+      str(fixed_root / "outer_app"): {"bind": "/app", "mode": "rw"},
+      str(fixed_root / "inner_data"): {"bind": "/app/data", "mode": "rw"},
+    }
+    host, bind, host_root = self.sm.resolve_container_path("/app/data/foo.bin")
+    self.assertTrue(host.endswith("fixed_volumes/mounts/inner_data/foo.bin"))
+    self.assertEqual(bind, "/app/data")
+    self.assertTrue(host_root.endswith("fixed_volumes/mounts/inner_data"))
+
+  def test_longest_prefix_wins_regardless_of_insertion_order(self):
+    """Same as above but with the dict items in the opposite order. The result
+    must be identical — specificity, not insertion order, decides the winner.
+    """
+    fixed_root = self.owner._fixed_root
+    (fixed_root / "outer_app").mkdir(exist_ok=True)
+    (fixed_root / "inner_data").mkdir(exist_ok=True)
+    self.owner.volumes = {
+      str(fixed_root / "inner_data"): {"bind": "/app/data", "mode": "rw"},
+      str(fixed_root / "outer_app"): {"bind": "/app", "mode": "rw"},
+    }
+    host, bind, _ = self.sm.resolve_container_path("/app/data/foo.bin")
+    self.assertTrue(host.endswith("fixed_volumes/mounts/inner_data/foo.bin"))
+    self.assertEqual(bind, "/app/data")
+
+  def test_outer_bind_still_resolves_for_paths_only_it_covers(self):
+    """Paths that fall under the broader mount but NOT the nested one must
+    still resolve to the broader mount — longest-prefix-match must not break
+    legitimate routes through the outer bind.
+    """
+    fixed_root = self.owner._fixed_root
+    (fixed_root / "outer_app").mkdir(exist_ok=True)
+    (fixed_root / "inner_data").mkdir(exist_ok=True)
+    self.owner.volumes = {
+      str(fixed_root / "outer_app"): {"bind": "/app", "mode": "rw"},
+      str(fixed_root / "inner_data"): {"bind": "/app/data", "mode": "rw"},
+    }
+    host, bind, _ = self.sm.resolve_container_path("/app/other.bin")
+    self.assertTrue(host.endswith("fixed_volumes/mounts/outer_app/other.bin"))
+    self.assertEqual(bind, "/app")
+
 
 # ---------------------------------------------------------------------------
 # _write_json_atomic

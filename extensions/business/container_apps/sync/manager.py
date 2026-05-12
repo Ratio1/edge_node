@@ -150,7 +150,15 @@ class SyncManager:
 
     fixed_root_marker = os.sep + os.path.join("fixed_volumes", "mounts") + os.sep
 
+    # Collect every mount whose bind prefix covers cp, then pick the longest.
+    # Docker overlays the more specific mount on top of the broader one inside
+    # the container (e.g. /app/data is shadowed onto /app), so the longest-
+    # prefix match is the one that actually serves reads/writes for cp. The
+    # previous first-match-wins iteration used dict insertion order, which has
+    # no relationship to overlay specificity and could resolve to the wrong
+    # host root for nested mounts.
     volumes = getattr(self.owner, "volumes", {}) or {}
+    matches: list[tuple[str, str]] = []
     for host_root, spec in volumes.items():
       if not isinstance(spec, dict):
         continue
@@ -160,27 +168,30 @@ class SyncManager:
       # Rule 2: container path must fall under this mount's bind point.
       if cp != bind and not cp.startswith(bind + "/"):
         continue
+      matches.append((str(host_root), bind))
 
-      host_root_n = os.path.normpath(str(host_root))
-      # Rule 3: only fixed-size volumes are eligible. Their host root sits
-      # under <plugin_data>/fixed_volumes/mounts/. This rejects VOLUMES,
-      # FILE_VOLUMES, anonymous Docker mounts, and ephemeral container fs.
-      if fixed_root_marker not in (host_root_n + os.sep):
-        raise ValueError(
-          f"refusing non-fixed-size mount for {container_path!r}: "
-          f"host_root={host_root_n!r} (only FIXED_SIZE_VOLUMES-backed paths allowed)"
-        )
+    if not matches:
+      raise ValueError(f"no mounted volume covers {container_path!r}")
 
-      rel = "" if cp == bind else os.path.relpath(cp, bind)
-      host_path = os.path.normpath(os.path.join(host_root_n, rel))
-      # Rule 6: resolved path must stay within host_root.
-      if not (host_path == host_root_n or host_path.startswith(host_root_n + os.sep)):
-        raise ValueError(
-          f"resolved host path escapes mount root: {container_path!r} -> {host_path!r}"
-        )
-      return host_path, bind, host_root_n
+    host_root, bind = max(matches, key=lambda hb: len(hb[1]))
+    host_root_n = os.path.normpath(host_root)
+    # Rule 3: only fixed-size volumes are eligible. Their host root sits
+    # under <plugin_data>/fixed_volumes/mounts/. This rejects VOLUMES,
+    # FILE_VOLUMES, anonymous Docker mounts, and ephemeral container fs.
+    if fixed_root_marker not in (host_root_n + os.sep):
+      raise ValueError(
+        f"refusing non-fixed-size mount for {container_path!r}: "
+        f"host_root={host_root_n!r} (only FIXED_SIZE_VOLUMES-backed paths allowed)"
+      )
 
-    raise ValueError(f"no mounted volume covers {container_path!r}")
+    rel = "" if cp == bind else os.path.relpath(cp, bind)
+    host_path = os.path.normpath(os.path.join(host_root_n, rel))
+    # Rule 6: resolved path must stay within host_root.
+    if not (host_path == host_root_n or host_path.startswith(host_root_n + os.sep)):
+      raise ValueError(
+        f"resolved host path escapes mount root: {container_path!r} -> {host_path!r}"
+      )
+    return host_path, bind, host_root_n
 
   # ----- atomic I/O -------------------------------------------------------
   def _write_json_atomic(self, path: Path, payload: Any) -> None:
