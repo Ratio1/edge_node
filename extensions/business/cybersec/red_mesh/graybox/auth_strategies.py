@@ -268,3 +268,79 @@ class FormAuth(AuthStrategy):
       html or "", re.IGNORECASE,
     )
     return m.group(1) if m else None
+
+
+class BearerAuth(AuthStrategy):
+  """Bearer-token auth for API-only targets.
+
+  Reads `creds.bearer_token` and injects it into every request via the
+  configured header/scheme (default ``Authorization: Bearer <token>``).
+  No HTTP traffic is needed during ``authenticate`` itself — the strategy
+  simply stamps the session with the token.
+
+  ``preflight`` validates that the token actually works by hitting
+  ``target_config.api_security.auth.authenticated_probe_path`` (when
+  configured) and asserting the response is not 401/403. If the path
+  is empty, preflight returns None (caller chose not to verify).
+  """
+
+  def __init__(self, target_url, target_config, verify_tls=True):
+    super().__init__(target_url, target_config, verify_tls)
+    self._auth_desc = self._resolve_auth_descriptor()
+    self._creds = None  # populated by authenticate(); needed for refresh()
+
+  def _resolve_auth_descriptor(self):
+    """Pluck `api_security.auth` off the config or fall back to defaults."""
+    api_security = getattr(self.target_config, "api_security", None)
+    if api_security is not None:
+      auth = getattr(api_security, "auth", None)
+      if auth is not None:
+        return auth
+    # Tests/callers without an ApiSecurityConfig get sensible defaults.
+    from .models.target_config import AuthDescriptor
+    return AuthDescriptor()
+
+  def preflight(self) -> Optional[str]:
+    probe_path = (self._auth_desc.authenticated_probe_path or "").strip()
+    if not probe_path:
+      # Caller opted out of pre-auth verification — strategy will fail
+      # loudly at the first probe call if the token is invalid.
+      return None
+    url = self.target_url + probe_path
+    try:
+      resp = requests.head(url, timeout=10, verify=self.verify_tls,
+                           allow_redirects=True)
+    except requests.RequestException as exc:
+      return f"Authenticated probe path unreachable: {exc}"
+    if resp.status_code in (401, 403):
+      return (
+        f"Authenticated probe path {probe_path} returned "
+        f"{resp.status_code} during preflight (token may be invalid)."
+      )
+    return None
+
+  def authenticate(self, creds) -> Optional[requests.Session]:
+    if not creds.has_bearer_token():
+      return None
+    session = self.make_session()
+    scheme = self._auth_desc.bearer_scheme or "Bearer"
+    header_name = self._auth_desc.bearer_token_header_name or "Authorization"
+    value = f"{scheme} {creds.bearer_token}".strip() if scheme else creds.bearer_token
+    session.headers[header_name] = value
+    self._session = session
+    self._creds = creds
+    return session
+
+  def refresh(self, creds) -> bool:
+    """Default behaviour: re-stamp the same token. Phase 9 OAuth2 follow-up
+    can replace this with a real refresh-grant call against
+    `bearer_refresh_url` using `creds.bearer_refresh_token`.
+    """
+    self.cleanup()
+    return self.authenticate(creds) is not None
+
+  def cleanup(self) -> None:
+    super().cleanup()
+    if self._creds is not None:
+      # Don't clear caller-owned creds — AuthManager.cleanup() drives that.
+      self._creds = None

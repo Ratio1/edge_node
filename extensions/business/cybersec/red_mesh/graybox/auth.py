@@ -22,7 +22,7 @@ import requests
 
 from ..constants import GRAYBOX_SESSION_MAX_AGE
 from .auth_credentials import Credentials
-from .auth_strategies import FormAuth
+from .auth_strategies import BearerAuth, FormAuth
 from .models.target_config import COMMON_CSRF_FIELDS
 from .models import GrayboxAuthState
 
@@ -264,9 +264,11 @@ class AuthManager:
     auth_type = self._resolve_auth_type()
     if auth_type == "form":
       return FormAuth(self.target_url, self.target_config, self.verify_tls)
+    if auth_type == "bearer":
+      return BearerAuth(self.target_url, self.target_config, self.verify_tls)
     raise NotImplementedError(
-      f"auth_type={auth_type!r} not yet supported; Subphase 1.5 commits "
-      "#6 (bearer) and #7 (api_key) wire the remaining strategies."
+      f"auth_type={auth_type!r} not yet supported; Subphase 1.5 commit "
+      "#7 (api_key) wires the remaining strategy."
     )
 
   # Form-login internals (``_is_login_success``, ``_extract_csrf``,
