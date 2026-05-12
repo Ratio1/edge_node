@@ -549,6 +549,7 @@ class GrayboxTargetConfig:
   injection: InjectionConfig = field(default_factory=InjectionConfig)
   business_logic: BusinessLogicConfig = field(default_factory=BusinessLogicConfig)
   discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
+  api_security: ApiSecurityConfig = field(default_factory=ApiSecurityConfig)
 
   # Login endpoint configuration (shared across probes)
   login_path: str = "/auth/login/"
@@ -570,6 +571,7 @@ class GrayboxTargetConfig:
       injection=InjectionConfig.from_dict(d.get("injection", {})),
       business_logic=BusinessLogicConfig.from_dict(d.get("business_logic", {})),
       discovery=DiscoveryConfig.from_dict(d.get("discovery", {})),
+      api_security=ApiSecurityConfig.from_dict(d.get("api_security", {})),
       login_path=d.get("login_path", "/auth/login/"),
       logout_path=d.get("logout_path", "/auth/logout/"),
       password_reset_path=d.get("password_reset_path", ""),
