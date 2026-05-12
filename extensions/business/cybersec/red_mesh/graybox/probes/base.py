@@ -83,3 +83,70 @@ class ProbeBase:
       evidence=[f"error={error_msg}"],
       error=error_msg,
     ))
+
+  # ── OWASP API Top 10 emit helpers (Subphase 1.6) ─────────────────────
+  #
+  # These wrap GrayboxFinding construction so probe authors don't repeat
+  # the boilerplate and so finding emission has a single point at which
+  # evidence redaction is enforced. The redaction itself is added in
+  # Subphase 1.6 commit #2 (centralised scrubber).
+  #
+  # ATT&CK defaults: when ``attack`` is None, the helper resolves the
+  # default mapping from the catalog via attack_for_scenario(scenario_id)
+  # so probes don't have to remember per-scenario technique IDs.
+
+  def _resolve_attack(self, scenario_id, attack):
+    if attack is not None:
+      return list(attack)
+    try:
+      from ..scenario_catalog import attack_for_scenario
+    except ImportError:
+      return []
+    return attack_for_scenario(scenario_id)
+
+  def emit_vulnerable(self, scenario_id, title, severity, owasp, cwe,
+                       evidence, *, attack=None, evidence_artifacts=None,
+                       replay_steps=None, remediation=None):
+    """Append a vulnerable GrayboxFinding using the catalog's ATT&CK default."""
+    self.findings.append(GrayboxFinding(
+      scenario_id=scenario_id,
+      title=title,
+      status="vulnerable",
+      severity=severity,
+      owasp=owasp,
+      cwe=list(cwe or []),
+      attack=self._resolve_attack(scenario_id, attack),
+      evidence=list(evidence or []),
+      evidence_artifacts=list(evidence_artifacts or []),
+      replay_steps=list(replay_steps or []),
+      remediation=remediation or "",
+    ))
+
+  def emit_clean(self, scenario_id, title, owasp, evidence):
+    """Append a not_vulnerable / INFO GrayboxFinding (test ran OK, nothing found)."""
+    self.findings.append(GrayboxFinding(
+      scenario_id=scenario_id,
+      title=title,
+      status="not_vulnerable",
+      severity="INFO",
+      owasp=owasp,
+      evidence=list(evidence or []),
+    ))
+
+  def emit_inconclusive(self, scenario_id, title, owasp, reason):
+    """Append an inconclusive / INFO GrayboxFinding.
+
+    Use when a scenario could not be evaluated (missing config, stateful
+    gating disabled, request budget exhausted, target returned an
+    unexpected shape, etc.). ``reason`` is a short machine-readable
+    string appended to the evidence as ``reason=<value>`` so reports can
+    group inconclusives by cause.
+    """
+    self.findings.append(GrayboxFinding(
+      scenario_id=scenario_id,
+      title=title,
+      status="inconclusive",
+      severity="INFO",
+      owasp=owasp,
+      evidence=[f"reason={reason}"],
+    ))
