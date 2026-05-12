@@ -3073,6 +3073,36 @@ class ContainerAppRunnerPlugin(
     return
 
 
+  def _reset_runtime_state_post_start(self):
+    """Bring per-restart runtime markers back to a fresh-boot baseline.
+
+    Called after a successful ``start_container()`` to:
+      - stamp ``container_start_time`` so health-probe elapsed timers measure
+        from this new boot
+      - clear readiness gates (``_app_ready``, ``_health_probe_start``,
+        ``_tunnel_start_allowed``) so health checks re-run against the new
+        container's state and tunnels gate on the new readiness probe
+      - clear the command-rerun gate (``_commands_started``) so
+        BUILD_AND_RUN_COMMANDS rerun against the new container
+      - re-attach log capture (the prior log thread was stopped at
+        ``stop_container`` time)
+      - run image-defined build/run commands
+
+    Shared between ``_restart_container`` and the volume-sync ticks
+    (``_SyncMixin._sync_safe_start_container``) so they stay in lockstep —
+    sync slices stop+start the container inline (to keep the system volume
+    mounted), and without this helper the readiness/probe state would still
+    point at the previous container instance.
+    """
+    self.container_start_time = self.time()
+    self._app_ready = False
+    self._health_probe_start = None
+    self._tunnel_start_allowed = False
+    self._commands_started = False
+    self._start_container_log_stream()
+    self._maybe_execute_build_and_run()
+
+
   def _restart_container(self, stop_reason=None):
     """
     Restart the container from scratch.
@@ -3156,9 +3186,7 @@ class ContainerAppRunnerPlugin(
       # start_container already recorded the failure
       return
 
-    self.container_start_time = self.time()
-    self._start_container_log_stream()
-    self._maybe_execute_build_and_run()
+    self._reset_runtime_state_post_start()
     return
 
 

@@ -355,8 +355,26 @@ class _SyncMixin:
     """Restart the container after a sync slice. Failures are logged, not
     raised, because the periodic loop will retry and ``_check_container_status``
     will pick up a still-stopped container on the next pass.
+
+    Calls ``_reset_runtime_state_post_start`` after the start so that
+    readiness gates, health-probe timers, log capture, and
+    BUILD_AND_RUN_COMMANDS all re-engage against the freshly-started
+    container — same contract ``_restart_container`` follows. Without this,
+    tunnels stay marked ready, health checks are skipped, log streams are
+    stale, and image-defined startup commands don't rerun.
+
+    The reset is guarded by its own try/except so a failed reset does not
+    roll back a successful start — the next periodic tick can re-evaluate
+    readiness.
     """
     try:
       self.start_container()
     except Exception as exc:
       self.P(f"[sync] start_container after sync slice failed: {exc}", color="r")
+      return
+    try:
+      self._reset_runtime_state_post_start()
+    except Exception as exc:
+      self.P(
+        f"[sync] runtime-state reset after sync slice failed: {exc}", color="r"
+      )

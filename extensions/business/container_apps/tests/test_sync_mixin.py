@@ -53,6 +53,19 @@ class _FakePlugin(_SyncMixin):
     self.start_calls += 1
     self.lifecycle_log.append("start")
 
+  def _reset_runtime_state_post_start(self):
+    """Mirror the real plugin's helper so sync-tick tests can observe both
+    the call order and the resulting state-marker resets.
+    """
+    self.lifecycle_log.append("reset")
+    # Same resets the real container_app_runner._reset_runtime_state_post_start
+    # performs. Log stream / build-and-run hooks are no-ops in this fake.
+    self.container_start_time = self.time()
+    self._app_ready = False
+    self._health_probe_start = None
+    self._tunnel_start_allowed = False
+    self._commands_started = False
+
   # Mark-as-mutable env so the mixin's _inject_sync_env_vars can write.
   @property
   def env(self):
@@ -233,7 +246,7 @@ class TestProviderTick(unittest.TestCase):
     self.plugin._sync_provider_tick(current_time=1000.0)
 
     # stop -> work -> start in that order
-    self.assertEqual(self.plugin.lifecycle_log, ["stop", "start"])
+    self.assertEqual(self.plugin.lifecycle_log, ["stop", "start", "reset"])
     # response.json + chainstore + history all produced
     response = json.loads((self.vsd / "response.json").read_text())
     self.assertEqual(response["status"], "ok")
@@ -253,7 +266,7 @@ class TestProviderTick(unittest.TestCase):
     self.owner._r1fs.add_should_raise = RuntimeError("ipfs gone")
     self.plugin._sync_provider_tick(current_time=1000.0)
     # We did stop because claim succeeded; the failure was at r1fs stage.
-    self.assertEqual(self.plugin.lifecycle_log, ["stop", "start"])
+    self.assertEqual(self.plugin.lifecycle_log, ["stop", "start", "reset"])
     response = json.loads((self.vsd / "response.json").read_text())
     self.assertEqual(response["stage"], "r1fs_upload")
 
@@ -306,10 +319,43 @@ class TestConsumerTick(unittest.TestCase):
   def test_full_consumer_flow(self):
     self._publish()
     self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
-    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start"])
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"])
     target = self.consumer_owner._fixed_root / "appdata" / "weights.bin"
     self.assertEqual(target.read_bytes(), b"data1")
     self.assertTrue((volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists())
+
+  def test_consumer_resets_runtime_state_after_apply(self):
+    """After a sync slice, per-restart runtime markers must be reset so
+    readiness gates, health-probe timers, and BUILD_AND_RUN_COMMANDS re-engage
+    against the freshly-started container. Otherwise tunnels stay marked
+    ready, health checks are skipped, and image-defined startup commands
+    don't rerun — the codex review's HIGH-severity finding 2 on PR #399.
+    """
+    # Seed the plugin with "previous container is running" markers.
+    self.consumer_plugin.container_start_time = 999.0
+    self.consumer_plugin._app_ready = True
+    self.consumer_plugin._health_probe_start = 999.0
+    self.consumer_plugin._tunnel_start_allowed = True
+    self.consumer_plugin._commands_started = True
+
+    self._publish()
+    self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+
+    # Order: stop, start, then reset (reset MUST come after start so the
+    # markers reflect the new container, not the prior one).
+    self.assertEqual(
+      self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"]
+    )
+    # All readiness / probe / command-rerun markers reset. The fake's
+    # ``time()`` is a monotonic counter that increments on each read, so
+    # compare against the seeded sentinel (999.0) rather than chasing the
+    # exact post-reset value.
+    self.assertNotEqual(self.consumer_plugin.container_start_time, 999.0)
+    self.assertIsNotNone(self.consumer_plugin.container_start_time)
+    self.assertFalse(self.consumer_plugin._app_ready)
+    self.assertIsNone(self.consumer_plugin._health_probe_start)
+    self.assertFalse(self.consumer_plugin._tunnel_start_allowed)
+    self.assertFalse(self.consumer_plugin._commands_started)
 
   def test_skips_when_record_cid_matches_last_apply(self):
     """The consumer's 'is this new?' check is by CID, not version. A second
@@ -354,7 +400,7 @@ class TestConsumerTick(unittest.TestCase):
     self.consumer_plugin._last_sync_check = 0
     self.consumer_plugin._sync_consumer_tick(current_time=3000.0)
     # The new (lower-versioned but different-cid) record was applied.
-    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start"])
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"])
     latest = self.consumer_plugin._sync_manager.latest_received()
     self.assertEqual(latest["cid"], spoofed_cid)
 
@@ -375,7 +421,7 @@ class TestConsumerTick(unittest.TestCase):
     }
     self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
     # We did stop — that's fine; we restart even on apply failure.
-    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start"])
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"])
     # No last_apply written
     self.assertFalse(
       (volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists()
