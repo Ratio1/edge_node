@@ -239,14 +239,35 @@ class AuthManager:
       return session, False
     return None, False
 
-  def _build_strategy(self) -> FormAuth:
-    """Construct the auth strategy for this manager.
+  def _resolve_auth_type(self) -> str:
+    """Return the configured auth_type, defaulting to ``form``.
 
-    Currently always FormAuth — Bearer/API-key dispatch lands in
-    Subphase 1.5 commit #5 (preflight strategy-aware) and #6/#7
-    (Bearer/ApiKey concrete strategies).
+    Targets that don't populate ``target_config.api_security.auth``
+    (everything pre-API-Top-10) keep ``form`` and behave identically
+    to before the refactor.
     """
-    return FormAuth(self.target_url, self.target_config, self.verify_tls)
+    api_security = getattr(self.target_config, "api_security", None)
+    if api_security is None:
+      return "form"
+    auth_desc = getattr(api_security, "auth", None)
+    if auth_desc is None:
+      return "form"
+    return getattr(auth_desc, "auth_type", "form") or "form"
+
+  def _build_strategy(self):
+    """Construct the auth strategy for this manager based on auth_type.
+
+    ``form``   → FormAuth (existing form-login)
+    ``bearer`` → BearerAuth (Subphase 1.5 commit #6)
+    ``api_key``→ ApiKeyAuth (Subphase 1.5 commit #7)
+    """
+    auth_type = self._resolve_auth_type()
+    if auth_type == "form":
+      return FormAuth(self.target_url, self.target_config, self.verify_tls)
+    raise NotImplementedError(
+      f"auth_type={auth_type!r} not yet supported; Subphase 1.5 commits "
+      "#6 (bearer) and #7 (api_key) wire the remaining strategies."
+    )
 
   # Form-login internals (``_is_login_success``, ``_extract_csrf``,
   # ``_find_csrf_value``) moved into ``auth_strategies.FormAuth`` in
