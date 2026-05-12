@@ -291,6 +291,102 @@ class TestControlCharsStripped(unittest.TestCase):
     self.assertEqual(out.findings[0]["title"], "hiddenpayload")
 
 
+class TestApiAuthSecretsScrubbed(unittest.TestCase):
+  """Subphase 1.6 commit #4 — API-flavoured secrets must be scrubbed by
+  the storage-boundary scrubber BEFORE the finding reaches the LLM input
+  builder. The build_llm_input layer applies its own length-cap +
+  prompt-injection neutralisation, but secret redaction is the
+  GrayboxFinding.to_flat_finding contract.
+
+  This test set treats build_llm_input as a downstream consumer that
+  receives already-flattened findings — so we feed it findings whose
+  fields contain secret patterns, and assert the LLM input does not
+  echo them back.
+  """
+
+  _SAMPLE_JWT = "eyJabcdefghi.payload-foo.signature-bar"
+  _LONG_BEARER = "abcdef0123456789abcdef0123456789"
+
+  def _make_api_finding(self, **overrides):
+    base = dict(ENRICHED_FINDING)
+    base.update({
+      "scenario_id": "PT-OAPI1-01",
+      "title": "API object-level authorization bypass (BOLA)",
+      "owasp_id": "API1:2023",
+    })
+    base.update(overrides)
+    return base
+
+  def test_authorization_header_never_in_llm_input(self):
+    """A finding whose evidence_items snippet contains an Authorization
+    header with a Bearer token should not surface the token in LLM input."""
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    f = GrayboxFinding(
+      scenario_id="PT-OAPI1-01",
+      title="API BOLA",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="API1:2023",
+      evidence=[f"Authorization: Bearer {self._SAMPLE_JWT}"],
+    )
+    flat = f.to_flat_finding(443, "https", "_graybox_api_access")
+    out = build_llm_input(findings=[flat])
+    serialised = repr(out.findings)
+    self.assertNotIn(self._SAMPLE_JWT, serialised)
+
+  def test_cookie_header_never_in_llm_input(self):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    f = GrayboxFinding(
+      scenario_id="PT-OAPI2-03",
+      title="API session not invalidated",
+      status="vulnerable",
+      severity="MEDIUM",
+      owasp="API2:2023",
+      evidence=["Cookie: sessionid=SUPER-SECRET-COOKIE-VALUE"],
+    )
+    flat = f.to_flat_finding(443, "https", "_graybox_api_auth")
+    out = build_llm_input(findings=[flat])
+    self.assertNotIn("SUPER-SECRET-COOKIE-VALUE", repr(out.findings))
+
+  def test_password_kv_never_in_llm_input(self):
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    f = GrayboxFinding(
+      scenario_id="PT-OAPI2-02",
+      title="API JWT weak HMAC",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="API2:2023",
+      evidence=["password=hunter2_leak", "weak_secret=changeme"],
+    )
+    flat = f.to_flat_finding(443, "https", "_graybox_api_auth")
+    out = build_llm_input(findings=[flat])
+    serialised = repr(out.findings)
+    self.assertNotIn("hunter2_leak", serialised)
+
+  def test_query_param_api_key_never_in_llm_input(self):
+    """API-key in URL query param: scrubbed end-to-end.
+
+    Note: build_llm_input drops the legacy `evidence` string field
+    entirely (test_legacy_evidence_field_not_forwarded covers that).
+    Whichever path is taken — drop or scrub — the secret value cannot
+    reach the LLM input.
+    """
+    from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
+    f = GrayboxFinding(
+      scenario_id="PT-OAPI8-01",
+      title="API permissive CORS — token=ABCDEFG12345",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="API8:2023",
+      evidence=["url=https://api.example.com/v1/me?api_key=ABCDEFG12345&page=1"],
+    )
+    flat = f.to_flat_finding(443, "https", "_graybox_api_config")
+    out = build_llm_input(findings=[flat])
+    serialised = repr(out.findings)
+    # Secret value redacted regardless of which field carried it.
+    self.assertNotIn("ABCDEFG12345", serialised)
+
+
 # ---------------------------------------------------------------------
 # Length caps
 # ---------------------------------------------------------------------
