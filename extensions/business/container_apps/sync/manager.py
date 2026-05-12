@@ -806,7 +806,17 @@ class SyncManager:
     """
     if not history_dir.is_dir():
       return
-    files = sorted(p for p in history_dir.iterdir() if p.suffix == ".json")
+    # Sort by mtime, not filename. Filenames embed the version prefix for
+    # chronological browsability under monotonic clocks, but the question
+    # "what did we just publish/apply?" is answered by file mtime — same
+    # contract as ``_latest_in`` (see the comment at that helper for the
+    # clock-skew rationale). Sorting by name here would retire the highest-
+    # *version* entry instead of the most-recently-written one, which can
+    # delete the CID we just successfully published.
+    files = sorted(
+      (p for p in history_dir.iterdir() if p.suffix == ".json"),
+      key=lambda p: p.stat().st_mtime,
+    )
     if len(files) < 2:
       return  # nothing to retire yet
     try:

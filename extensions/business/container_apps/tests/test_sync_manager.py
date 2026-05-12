@@ -691,6 +691,51 @@ class TestPublishSnapshot(unittest.TestCase):
     self.assertFalse(older["deletion"]["deletion_succeeded"])
     self.assertIn("daemon paused", older["deletion"]["deletion_error"])
 
+  def test_retire_uses_mtime_not_version(self):
+    """A higher-version entry that was written BEFORE a lower-version entry
+    must be retired when the lower-version one is "latest". Mirrors the
+    contract from ``_latest_in``: the answer to "what did we just do?" is
+    insert-order (mtime), not whatever ``version`` happens to be in the
+    entry. Without this guarantee a clock-skewed provider or multi-provider
+    sync set can cause the just-published CID to be retired on the next
+    publish.
+    """
+    sent_dir = history_sent_dir(self.owner)
+    sent_dir.mkdir(parents=True, exist_ok=True)
+
+    # Older-by-mtime but higher version (would sort last by filename).
+    # Use the canonical filename helper so update_history_deletion can find
+    # the file via its <version>__<short_cid>.json convention.
+    older_path = sent_dir / self.sm._history_filename(100, "QmCID_A")
+    older_path.write_text(json.dumps({
+      "cid": "QmCID_A", "version": 100,
+      "deletion": {"deleted_at": None, "deletion_succeeded": None, "deletion_error": None},
+    }))
+    os.utime(older_path, (1000, 1000))
+
+    # Newer-by-mtime but lower version (would sort first by filename)
+    newer_path = sent_dir / self.sm._history_filename(50, "QmCID_B")
+    newer_path.write_text(json.dumps({
+      "cid": "QmCID_B", "version": 50,
+      "deletion": {"deleted_at": None, "deletion_succeeded": None, "deletion_error": None},
+    }))
+    os.utime(newer_path, (2000, 2000))
+
+    self.sm._retire_previous_cid(sent_dir)
+
+    older_after = json.loads(older_path.read_text())
+    newer_after = json.loads(newer_path.read_text())
+
+    # The just-written (newer-by-mtime) entry must be left alone.
+    self.assertIsNone(newer_after["deletion"]["deleted_at"])
+    # The older-by-mtime entry should be retired, even though it has the
+    # higher version number.
+    self.assertIsNotNone(older_after["deletion"]["deleted_at"])
+    self.assertTrue(older_after["deletion"]["deletion_succeeded"])
+
+    deleted_cids = [d[0] for d in self.owner._r1fs.deleted]
+    self.assertEqual(deleted_cids, ["QmCID_A"])
+
   def test_archive_tmp_cleaned_up_on_success(self):
     self.sm.publish_snapshot(["/app/data/"], {})
     leftovers = list(self.owner._output_folder.glob("sync_archive_*.tar.gz"))
