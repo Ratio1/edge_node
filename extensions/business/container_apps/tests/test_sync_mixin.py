@@ -159,6 +159,28 @@ class TestEnvInjection(unittest.TestCase):
     self.assertEqual(plugin.env["R1_SYNC_TYPE"], "consumer")
     self.assertEqual(plugin.env["R1_SYNC_KEY"], "abc-123")
 
+  def test_no_env_when_sync_unavailable(self):
+    """If _configure_system_volume set _sync_unavailable (host tools missing),
+    _inject_sync_env_vars must not advertise R1_SYSTEM_VOLUME or any other
+    R1_* key — the mount doesn't exist on the host, so the app would write
+    into a phantom path while CAR polled a host root that was never
+    provisioned. Codex review finding 5 on PR #399."""
+    plugin, _ = _make_plugin(self.tmpdir, role="provider", key="abc-123")
+    plugin._sync_unavailable = True
+    plugin._inject_sync_env_vars()
+    for k in ("R1_SYSTEM_VOLUME", "R1_VOLUME_SYNC_DIR", "R1_SYNC_REQUEST_FILE",
+              "R1_SYNC_TYPE", "R1_SYNC_KEY"):
+      self.assertNotIn(k, plugin.env)
+
+  def test_sync_disabled_when_unavailable(self):
+    """_sync_enabled() must return False when _sync_unavailable is set, even
+    with SYNC.ENABLED=True in config — provider/consumer ticks would
+    otherwise poll a host root that doesn't exist."""
+    plugin, _ = _make_plugin(self.tmpdir, role="provider", enabled=True)
+    self.assertTrue(plugin._sync_enabled())  # baseline
+    plugin._sync_unavailable = True
+    self.assertFalse(plugin._sync_enabled())
+
 
 # ---------------------------------------------------------------------------
 # Stale .processing recovery

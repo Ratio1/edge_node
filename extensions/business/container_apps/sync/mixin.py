@@ -79,11 +79,21 @@ class _SyncMixin:
     try:
       fixed_volume._require_tools(logger=self.P)
     except RuntimeError as exc:
+      # Without the host tools we cannot provision /r1en_system, which means
+      # there is no shared filesystem for the app to drop request.json into
+      # and no host root for CAR to poll. Mark sync as unavailable so
+      # _sync_enabled() returns False (skipping all provider/consumer ticks)
+      # and _inject_sync_env_vars() refuses to advertise R1_SYSTEM_VOLUME
+      # to the container — otherwise the app would write to a non-existent
+      # in-container mount while CAR polled a host root that was never
+      # provisioned. Codex review finding 5 on PR #399.
       self.P(
         f"[sync] system volume unavailable: {exc}. "
-        f"SYNC will be effectively disabled until tools are installed.",
+        f"SYNC will be disabled and R1_SYSTEM_VOLUME env vars will not be "
+        f"exported until host tools are installed.",
         color="r",
       )
+      self._sync_unavailable = True
       return
 
     root = (
@@ -167,8 +177,14 @@ class _SyncMixin:
     won't act on it without ``SYNC.ENABLED``. ``R1_SYNC_TYPE`` and
     ``R1_SYNC_KEY`` are only set when SYNC is enabled so apps that want to
     branch on role can.
+
+    If ``_sync_unavailable`` was set during ``_configure_system_volume``
+    (host tools missing), inject nothing — advertising a mount that was
+    never provisioned would route the app's writes into a phantom path.
     """
     if not isinstance(getattr(self, "env", None), dict):
+      return
+    if getattr(self, "_sync_unavailable", False):
       return
     self.env["R1_SYSTEM_VOLUME"] = SYSTEM_VOLUME_MOUNT
     self.env["R1_VOLUME_SYNC_DIR"] = f"{SYSTEM_VOLUME_MOUNT}/{VOLUME_SYNC_SUBDIR}"
@@ -190,6 +206,8 @@ class _SyncMixin:
     return cfg if isinstance(cfg, dict) else {}
 
   def _sync_enabled(self) -> bool:
+    if getattr(self, "_sync_unavailable", False):
+      return False
     return bool(self._sync_cfg().get("ENABLED"))
 
   def _sync_role(self) -> Optional[str]:
