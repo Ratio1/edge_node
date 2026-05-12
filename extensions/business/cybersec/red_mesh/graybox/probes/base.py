@@ -104,33 +104,62 @@ class ProbeBase:
       return []
     return attack_for_scenario(scenario_id)
 
+  def _configured_secret_field_names(self):
+    """Read the configured API-key header/query names from target_config.
+
+    Returned as a tuple suitable for `scrub_graybox_secrets`. Falls back
+    to () when ApiSecurityConfig.auth is absent.
+    """
+    api_security = getattr(self.target_config, "api_security", None)
+    if api_security is None:
+      return ()
+    auth = getattr(api_security, "auth", None)
+    if auth is None:
+      return ()
+    names = []
+    if auth.api_key_header_name:
+      names.append(auth.api_key_header_name)
+    if auth.api_key_query_param:
+      names.append(auth.api_key_query_param)
+    if auth.bearer_token_header_name:
+      names.append(auth.bearer_token_header_name)
+    return tuple(names)
+
+  def _scrub_for_emission(self, value):
+    """Pre-emission scrub. Defense-in-depth alongside the storage-boundary
+    scrubber in ``findings.to_flat_finding`` (Subphase 1.6 commit #2)."""
+    from ..findings import scrub_graybox_secrets
+    return scrub_graybox_secrets(
+      value, secret_field_names=self._configured_secret_field_names(),
+    )
+
   def emit_vulnerable(self, scenario_id, title, severity, owasp, cwe,
                        evidence, *, attack=None, evidence_artifacts=None,
                        replay_steps=None, remediation=None):
     """Append a vulnerable GrayboxFinding using the catalog's ATT&CK default."""
     self.findings.append(GrayboxFinding(
       scenario_id=scenario_id,
-      title=title,
+      title=self._scrub_for_emission(title),
       status="vulnerable",
       severity=severity,
       owasp=owasp,
       cwe=list(cwe or []),
       attack=self._resolve_attack(scenario_id, attack),
-      evidence=list(evidence or []),
-      evidence_artifacts=list(evidence_artifacts or []),
-      replay_steps=list(replay_steps or []),
-      remediation=remediation or "",
+      evidence=self._scrub_for_emission(list(evidence or [])),
+      evidence_artifacts=self._scrub_for_emission(list(evidence_artifacts or [])),
+      replay_steps=self._scrub_for_emission(list(replay_steps or [])),
+      remediation=self._scrub_for_emission(remediation or ""),
     ))
 
   def emit_clean(self, scenario_id, title, owasp, evidence):
     """Append a not_vulnerable / INFO GrayboxFinding (test ran OK, nothing found)."""
     self.findings.append(GrayboxFinding(
       scenario_id=scenario_id,
-      title=title,
+      title=self._scrub_for_emission(title),
       status="not_vulnerable",
       severity="INFO",
       owasp=owasp,
-      evidence=list(evidence or []),
+      evidence=self._scrub_for_emission(list(evidence or [])),
     ))
 
   def emit_inconclusive(self, scenario_id, title, owasp, reason):
@@ -144,9 +173,9 @@ class ProbeBase:
     """
     self.findings.append(GrayboxFinding(
       scenario_id=scenario_id,
-      title=title,
+      title=self._scrub_for_emission(title),
       status="inconclusive",
       severity="INFO",
       owasp=owasp,
-      evidence=[f"reason={reason}"],
+      evidence=[f"reason={self._scrub_for_emission(reason)}"],
     ))

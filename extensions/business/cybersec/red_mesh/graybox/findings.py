@@ -5,12 +5,97 @@ GrayboxFinding is the probe-level finding type. It is converted to a
 unified flat finding dict (matching blackbox findings) at the report
 level via to_flat_finding(). The blackbox Finding in findings.py is
 NOT modified.
+
+Subphase 1.6 (centralised evidence scrubber): every finding traversing
+to_flat_finding() passes through `scrub_graybox_secrets`, which strips
+Authorization/Cookie/JWT/`password=…`/api_key/etc. patterns from the
+evidence list, evidence_artifacts request/response snapshots, finding
+description, title, and replay_steps. Probes still SHOULD redact at
+emission time (via ProbeBase.emit_*), but the storage-boundary
+scrubber is defense-in-depth — one forgetful probe author cannot leak
+secrets into the archive, LLM input, or PDF.
 """
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, asdict, field
 from typing import Any
+
+
+# ── Centralised secret scrubber (Subphase 1.6 commit #2) ────────────────
+
+# Generic patterns applied to every flat finding regardless of which
+# AuthDescriptor was active. Configured names (X-Custom-Key, custom query
+# params) are added to the per-call scrub via ``secret_field_names``
+# when ProbeBase.emit_* invokes the scrubber with the live AuthDescriptor.
+_SCRUB_PATTERNS = (
+  # Whole-header redaction: redact the full value, which spans until the
+  # next field separator (comma/semicolon/newline) or end of string.
+  (re.compile(r"(?i)\b(authorization)\s*:\s*[^,\r\n;]+"), r"\1: <redacted>"),
+  (re.compile(r"(?i)\b(cookie)\s*:\s*[^,\r\n;]+"), r"\1: <redacted>"),
+  (re.compile(r"(?i)\b(set-cookie)\s*:\s*[^,\r\n;]+"), r"\1: <redacted>"),
+  # JWT (3 base64url chunks separated by dots, leading eyJ).
+  (re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}"),
+   "<jwt-redacted>"),
+  # Bearer schema in body / URL: keep prefix only.
+  (re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{8,}"), "Bearer <redacted>"),
+  # Common name=value forms (cookie / form / URL query).
+  (re.compile(r"(?i)\b(password|secret|token|api_key|apikey)=([^&\s\";,]+)"),
+   r"\1=<redacted>"),
+  # JSON-style key:value.
+  (re.compile(r'(?i)"(password|secret|token|api_key|bearer_token|api[\w_-]*key)"\s*:\s*"[^"]+"'),
+   r'"\1": "<redacted>"'),
+)
+
+
+def scrub_graybox_secrets(value: Any, *, secret_field_names: tuple[str, ...] = ()) -> Any:
+  """Recursively redact known secret patterns from ``value``.
+
+  Accepts strings, lists, tuples, dicts. Non-string leaves pass through.
+  ``secret_field_names`` is a tuple of additional case-insensitive names
+  (e.g. configured API-key header / query param names) to scrub on top of
+  the generic pattern set.
+  """
+  if isinstance(value, str):
+    out = value
+    for pat, repl in _SCRUB_PATTERNS:
+      out = pat.sub(repl, out)
+    for name in secret_field_names:
+      if not name:
+        continue
+      esc = re.escape(name)
+      # name=val → name=<redacted>
+      out = re.sub(rf"(?i)\b({esc})=([^&\s\";]+)", r"\1=<redacted>", out)
+      # name: val (header form) → name: <redacted>
+      out = re.sub(rf"(?i)\b({esc})\s*:\s*\S+", r"\1: <redacted>", out)
+      # JSON "name":"val"
+      out = re.sub(rf'(?i)"({esc})"\s*:\s*"[^"]+"', r'"\1": "<redacted>"', out)
+    return out
+  if isinstance(value, list):
+    return [scrub_graybox_secrets(v, secret_field_names=secret_field_names) for v in value]
+  if isinstance(value, tuple):
+    return tuple(scrub_graybox_secrets(v, secret_field_names=secret_field_names) for v in value)
+  if isinstance(value, dict):
+    return {k: scrub_graybox_secrets(v, secret_field_names=secret_field_names) for k, v in value.items()}
+  return value
+
+
+def _scrub_flat_finding(flat: dict) -> dict:
+  """Final storage-boundary pass on a flat finding dict.
+
+  Targets the fields most likely to carry secret values:
+    - title, description, evidence, replay_steps
+    - evidence_artifacts (request/response snapshots, evidence_items)
+  Other fields (severity, owasp_id, scenario_id, etc.) are policy-bound
+  and pass through unchanged.
+  """
+  for key in ("title", "description", "evidence", "replay_steps", "remediation"):
+    if key in flat:
+      flat[key] = scrub_graybox_secrets(flat[key])
+  if "evidence_artifacts" in flat and isinstance(flat["evidence_artifacts"], list):
+    flat["evidence_artifacts"] = scrub_graybox_secrets(flat["evidence_artifacts"])
+  return flat
 
 
 @dataclass(frozen=True)
@@ -127,7 +212,7 @@ class GrayboxFinding:
     # override severity to INFO so they don't inflate finding_counts
     effective_severity = "INFO" if self.status == "not_vulnerable" else self.severity.upper()
 
-    return {
+    flat = {
       "finding_id": finding_id,
       "probe_type": "graybox",
       "severity": effective_severity,
@@ -153,6 +238,7 @@ class GrayboxFinding:
       "cvss_score": self.cvss_score,
       "cvss_vector": self.cvss_vector,
     }
+    return _scrub_flat_finding(flat)
 
   @classmethod
   def flat_from_dict(cls, payload: dict[str, Any], port: int, protocol: str, probe_name: str) -> dict[str, Any]:
