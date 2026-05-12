@@ -853,6 +853,9 @@ def launch_webapp_scan(
   bearer_token="",
   api_key="",
   bearer_refresh_token="",
+  # OWASP API Top 10 — Subphase 1.7. When set, overrides
+  # `target_config.api_security.max_total_requests` for the scan.
+  request_budget=None,
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
 
@@ -946,6 +949,17 @@ def launch_webapp_scan(
     allow_stateful_probes=allow_stateful_probes,
     verify_tls=verify_tls,
   )
+
+  # OWASP API Top 10 (Subphase 1.7): when the caller passed an explicit
+  # `request_budget`, inject it into `target_config.api_security` so the
+  # worker's RequestBudget sizing picks it up over any value the caller
+  # also placed in target_config.
+  if request_budget is not None:
+    if not isinstance(target_config, dict):
+      target_config = {}
+    api_security = dict(target_config.get("api_security") or {})
+    api_security["max_total_requests"] = int(request_budget)
+    target_config["api_security"] = api_security
 
   workers, worker_error = build_webapp_workers(owner, active_peers, target_port)
   if worker_error:
