@@ -231,6 +231,8 @@ class BaseInferenceApiPlugin(
     self._last_capacity_warn = 0.0
     self._last_capacity_publish_ok = False
     self._last_capacity_publish_snapshot = None
+    # Tracks the last attempted snapshot only to throttle repeated urgent retry
+    # attempts when ChainStore does not confirm publication.
     self._last_capacity_publish_attempt_snapshot = None
     self._last_balancing_mailbox_poll = 0.0
     self.load_persistence_data()
@@ -242,7 +244,7 @@ class BaseInferenceApiPlugin(
     start_msg += f"\t\tAI Engine: {self.cfg_ai_engine}\n"
     start_msg += f"\t\tLoopback key: loopback_dct_{self._stream_id}"
     self.P(start_msg)
-    self._publish_capacity_record(force=True)
+    self._publish_capacity_record()
     return
 
   def _json_dumps(self, data):
@@ -683,7 +685,7 @@ class BaseInferenceApiPlugin(
     if isinstance(request_data, dict):
       request_data['slot_reserved'] = True
       request_data['slot_reserved_at'] = self.time()
-    self._publish_capacity_record(force=True)
+    self._publish_capacity_record()
     return True
 
   def _release_execution_slot(self, request_id):
@@ -704,7 +706,7 @@ class BaseInferenceApiPlugin(
     if isinstance(request_data, dict):
       request_data['slot_reserved'] = False
       request_data['slot_released_at'] = self.time()
-    self._publish_capacity_record(force=True)
+    self._publish_capacity_record()
     return
 
   def _build_capacity_record_snapshot(self):
@@ -756,6 +758,9 @@ class BaseInferenceApiPlugin(
   def _should_publish_capacity_snapshot(self, snapshot, now_ts):
     """Return whether a capacity snapshot should be published now.
 
+    Decision order: first-publish or urgent deterioration, failed-publish retry,
+    changed-snapshot debounce, then unchanged-snapshot periodic refresh.
+
     Parameters
     ----------
     snapshot : dict
@@ -770,6 +775,16 @@ class BaseInferenceApiPlugin(
     """
     last_snapshot = self._last_capacity_publish_snapshot
     if last_snapshot is None:
+      # No successful publish exists yet. Peers should not know this executor
+      # unless a prior unconfirmed attempt was actually observed, so normal
+      # first-publish retries stay announce-period limited. The exception is an
+      # urgent deterioration from the last attempted available snapshot.
+      last_attempt_snapshot = self._last_capacity_publish_attempt_snapshot
+      if self._is_capacity_snapshot_urgent_deterioration(
+        snapshot=snapshot,
+        last_snapshot=last_attempt_snapshot,
+      ):
+        return True
       if self._last_capacity_announce <= 0:
         return True
       return (now_ts - self._last_capacity_announce) >= self._get_capacity_announce_period()
@@ -812,14 +827,8 @@ class BaseInferenceApiPlugin(
       return last_free > 0 and current_free <= 0
     return False
 
-  def _publish_capacity_record(self, force=False):
+  def _publish_capacity_record(self):
     """Publish local capacity as advisory soft-state.
-
-    Parameters
-    ----------
-    force : bool, optional
-        Kept for reserve/release call-site compatibility. Capacity publishes
-        are still gated by snapshot changes, debounce, refresh, and retry rules.
 
     Returns
     -------

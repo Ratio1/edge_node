@@ -114,8 +114,10 @@ class _FakeBasePlugin:
     import hashlib
     if algorithm == 'sha256':
       value = hashlib.sha256(str_data.encode("utf-8")).hexdigest()
-    else:
+    elif algorithm == 'md5':
       value = hashlib.md5(str_data.encode("utf-8")).hexdigest()
+    else:
+      raise NotImplementedError(f"Unsupported hash algorithm in test fake: {algorithm}")
     return value[:length] if length is not None else value
 
   @property
@@ -284,7 +286,7 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(plugin._last_capacity_announce, 100.0)  # pylint: disable=protected-access
 
     plugin._now = 101.0  # pylint: disable=protected-access
-    plugin._publish_capacity_record(force=True)  # pylint: disable=protected-access
+    plugin._publish_capacity_record()  # pylint: disable=protected-access
 
     self.assertEqual(len(plugin.logs), first_log_count)
     self.assertEqual(plugin._last_capacity_announce, 101.0)  # pylint: disable=protected-access
@@ -299,7 +301,7 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(len(plugin.chainstore_hset_calls), 1)
 
     plugin._now = 500.0  # pylint: disable=protected-access
-    plugin._publish_capacity_record(force=True)  # pylint: disable=protected-access
+    plugin._publish_capacity_record()  # pylint: disable=protected-access
 
     self.assertEqual(len(plugin.chainstore_hset_calls), 1)
 
@@ -363,12 +365,12 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
 
     plugin._active_execution_slots.add("req-1")  # pylint: disable=protected-access
     plugin._now = 105.0  # pylint: disable=protected-access
-    plugin._publish_capacity_record(force=True)  # pylint: disable=protected-access
+    plugin._publish_capacity_record()  # pylint: disable=protected-access
 
     self.assertEqual(len(plugin.chainstore_hset_calls), 1)
 
     plugin._now = 110.0  # pylint: disable=protected-access
-    plugin._publish_capacity_record(force=True)  # pylint: disable=protected-access
+    plugin._publish_capacity_record()  # pylint: disable=protected-access
 
     self.assertEqual(len(plugin.chainstore_hset_calls), 2)
     self.assertEqual(plugin.chainstore_hset_calls[-1]["value"]["capacity_used"], 1)
@@ -389,6 +391,37 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(len(plugin.chainstore_hset_calls), 2)
     self.assertEqual(plugin.chainstore_hset_calls[-1]["value"]["capacity_free"], 0)
     self.assertFalse(plugin.chainstore_hset_calls[-1]["value"]["accepting_requests"])
+
+  def test_failed_first_available_publish_allows_immediate_full_capacity_publish(self):
+    plugin = self._make_plugin(
+      CHAINSTORE_HSET_RESULT=False,
+      REQUEST_BALANCING_CAPACITY=1,
+      REQUEST_BALANCING_ANNOUNCE_PERIOD=60,
+      REQUEST_BALANCING_CAPACITY_DEBOUNCE_SECONDS=10,
+      REQUEST_BALANCING_CAPACITY_REFRESH_PERIOD=900,
+      REQUEST_BALANCING_CAPACITY_REFRESH_JITTER_SECONDS=0,
+      NOW=100.0,
+    )
+
+    self.assertEqual(len(plugin.chainstore_hset_calls), 1)
+    self.assertIsNone(plugin._last_capacity_publish_snapshot)  # pylint: disable=protected-access
+    self.assertEqual(
+      plugin._last_capacity_publish_attempt_snapshot["capacity_free"],  # pylint: disable=protected-access
+      1,
+    )
+
+    plugin._now = 101.0  # pylint: disable=protected-access
+    self.assertTrue(plugin._reserve_execution_slot("req-1"))  # pylint: disable=protected-access
+
+    self.assertEqual(len(plugin.chainstore_hset_calls), 2)
+    self.assertEqual(plugin.chainstore_hset_calls[-1]["value"]["updated_at"], 101.0)
+    self.assertEqual(plugin.chainstore_hset_calls[-1]["value"]["capacity_free"], 0)
+    self.assertFalse(plugin.chainstore_hset_calls[-1]["value"]["accepting_requests"])
+
+    plugin._now = 102.0  # pylint: disable=protected-access
+    plugin._publish_capacity_record()  # pylint: disable=protected-access
+
+    self.assertEqual(len(plugin.chainstore_hset_calls), 2)
 
   def test_reserve_release_burst_does_not_republish_non_urgent_capacity(self):
     plugin = self._make_plugin(
