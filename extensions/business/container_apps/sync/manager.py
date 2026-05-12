@@ -25,6 +25,7 @@ import os
 import tarfile
 import tempfile
 import time as _time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -33,6 +34,17 @@ from extensions.business.container_apps.container_utils import (
 )
 
 _HISTORY_WRITTEN_AT_NS = "history_written_at_ns"
+PROVIDER_CAPTURE_OFFLINE = "offline"
+PROVIDER_CAPTURE_ONLINE = "online"
+CONSUMER_APPLY_OFFLINE_RESTART = "offline_restart"
+CONSUMER_APPLY_ONLINE_NO_RESTART = "online_no_restart"
+CONSUMER_APPLY_ONLINE_RESTART = "online_restart"
+_PROVIDER_CAPTURE_MODES = {PROVIDER_CAPTURE_OFFLINE, PROVIDER_CAPTURE_ONLINE}
+_CONSUMER_APPLY_MODES = {
+  CONSUMER_APPLY_OFFLINE_RESTART,
+  CONSUMER_APPLY_ONLINE_NO_RESTART,
+  CONSUMER_APPLY_ONLINE_RESTART,
+}
 
 from .constants import (
   ARCHIVE_FORMAT,
@@ -58,6 +70,26 @@ from .constants import (
   VOLUME_SYNC_SUBDIR,
   _UNDELETED,
 )
+
+
+@dataclass(frozen=True)
+class SyncRuntimePolicy:
+  provider_capture: str = PROVIDER_CAPTURE_OFFLINE
+  consumer_apply: str = CONSUMER_APPLY_OFFLINE_RESTART
+
+
+@dataclass(frozen=True)
+class SyncRequest:
+  archive_paths: list[str]
+  metadata: dict
+  runtime: SyncRuntimePolicy
+
+
+def runtime_policy_to_dict(runtime: SyncRuntimePolicy) -> dict:
+  return {
+    "provider_capture": runtime.provider_capture,
+    "consumer_apply": runtime.consumer_apply,
+  }
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +164,25 @@ class SyncManager:
     # guarantees the first ``fetch_latest`` call still hsyncs.
     self._last_hsync = 0.0
 
+  @staticmethod
+  def _validate_container_path_shape(container_path: str) -> None:
+    if not isinstance(container_path, str) or not container_path:
+      raise ValueError(f"archive_paths entry must be a non-empty string: {container_path!r}")
+
+    parts = container_path.split("/")
+    if any(p == ".." for p in parts):
+      raise ValueError(f"archive_paths entries must not contain '..': {container_path!r}")
+
+    cp = os.path.normpath(container_path)
+    if not cp.startswith("/"):
+      raise ValueError(f"archive_paths entries must be absolute: {container_path!r}")
+
+    if cp == SYSTEM_VOLUME_MOUNT or cp.startswith(SYSTEM_VOLUME_MOUNT + "/"):
+      raise ValueError(
+        f"refusing to archive system volume content (anti-recursion): {container_path!r}"
+      )
+    return
+
   # ----- path resolution -------------------------------------------------
   def resolve_container_path(self, container_path: str) -> tuple[str, str, str]:
     """Map an app-perspective absolute path to a host path via owner.volumes.
@@ -147,24 +198,8 @@ class SyncManager:
     Returns ``(host_path, bind_root, host_root)`` on success, raises
     ``ValueError`` on any rule violation.
     """
-    if not isinstance(container_path, str) or not container_path:
-      raise ValueError(f"archive_paths entry must be a non-empty string: {container_path!r}")
-
-    # Reject explicit '..' segments BEFORE normalization (rule 5). normpath
-    # will collapse them silently and we want the error to be clear.
-    parts = container_path.split("/")
-    if any(p == ".." for p in parts):
-      raise ValueError(f"archive_paths entries must not contain '..': {container_path!r}")
-
+    self._validate_container_path_shape(container_path)
     cp = os.path.normpath(container_path)
-    if not cp.startswith("/"):  # rule 1
-      raise ValueError(f"archive_paths entries must be absolute: {container_path!r}")
-
-    # Rule 4: refuse the system volume mount itself.
-    if cp == SYSTEM_VOLUME_MOUNT or cp.startswith(SYSTEM_VOLUME_MOUNT + "/"):
-      raise ValueError(
-        f"refusing to archive system volume content (anti-recursion): {container_path!r}"
-      )
 
     # Rule 3 allow-list — both eligible roots are bounded, per-instance, and
     # inside the edge node's data root:
@@ -431,11 +466,35 @@ class SyncManager:
           f"[sync] failed to delete .processing after error: {exc}", color="r"
         )
 
-  def claim_request(self) -> Optional[tuple[list[str], dict]]:
+  def _parse_runtime_policy(self, body: dict) -> SyncRuntimePolicy:
+    runtime = body.get("runtime") or {}
+    if not isinstance(runtime, dict):
+      raise ValueError("runtime must be a JSON object")
+
+    provider_capture = runtime.get("provider_capture", PROVIDER_CAPTURE_OFFLINE)
+    consumer_apply = runtime.get("consumer_apply", CONSUMER_APPLY_OFFLINE_RESTART)
+
+    if provider_capture not in _PROVIDER_CAPTURE_MODES:
+      allowed = ", ".join(sorted(_PROVIDER_CAPTURE_MODES))
+      raise ValueError(
+        f"runtime.provider_capture must be one of [{allowed}], got {provider_capture!r}"
+      )
+    if consumer_apply not in _CONSUMER_APPLY_MODES:
+      allowed = ", ".join(sorted(_CONSUMER_APPLY_MODES))
+      raise ValueError(
+        f"runtime.consumer_apply must be one of [{allowed}], got {consumer_apply!r}"
+      )
+
+    return SyncRuntimePolicy(
+      provider_capture=provider_capture,
+      consumer_apply=consumer_apply,
+    )
+
+  def claim_request(self) -> Optional[SyncRequest]:
     """Atomically claim the pending request.json, validate, return its payload.
 
     On success: renames ``request.json`` → ``request.json.processing``,
-    returns ``(archive_paths, metadata)``.
+    returns a ``SyncRequest``.
     On any failure (no file, malformed JSON, validation): writes
     ``request.json.invalid`` (request body + ``_error`` diagnostics) and
     ``response.json`` (error shape), discards the ``.processing`` file, and
@@ -488,6 +547,12 @@ class SyncManager:
       )
       return None
 
+    try:
+      runtime = self._parse_runtime_policy(body)
+    except ValueError as exc:
+      self._fail_request(body, STAGE_VALIDATION, str(exc), proc_path)
+      return None
+
     if not isinstance(archive_paths, list) or not archive_paths:
       self._fail_request(
         body, STAGE_VALIDATION,
@@ -498,12 +563,19 @@ class SyncManager:
 
     for entry in archive_paths:
       try:
-        self.resolve_container_path(entry)
+        if runtime.provider_capture == PROVIDER_CAPTURE_ONLINE:
+          self._validate_container_path_shape(entry)
+        else:
+          self.resolve_container_path(entry)
       except ValueError as exc:
         self._fail_request(body, STAGE_VALIDATION, str(exc), proc_path)
         return None
 
-    return list(archive_paths), dict(metadata)
+    return SyncRequest(
+      archive_paths=list(archive_paths),
+      metadata=dict(metadata),
+      runtime=runtime,
+    )
 
   def make_archive(self, archive_paths: list[str]) -> tuple[str, int]:
     """Build the snapshot tar.gz under the plugin output folder.
@@ -534,7 +606,24 @@ class SyncManager:
 
     return str(tar_path), os.path.getsize(str(tar_path))
 
-  def publish_snapshot(self, archive_paths: list[str], metadata: dict) -> bool:
+  def _coerce_sync_request(
+    self,
+    request: SyncRequest | list[str],
+    metadata: Optional[dict] = None,
+  ) -> SyncRequest:
+    if isinstance(request, SyncRequest):
+      return request
+    return SyncRequest(
+      archive_paths=list(request),
+      metadata=dict(metadata or {}),
+      runtime=SyncRuntimePolicy(),
+    )
+
+  def publish_snapshot(
+    self,
+    request: SyncRequest | list[str],
+    metadata: Optional[dict] = None,
+  ) -> bool:
     """Full provider orchestration: archive → R1FS add → ChainStore hset →
     history append → response.json → clear .invalid → delete .processing →
     retire previous CID.
@@ -543,7 +632,14 @@ class SyncManager:
     response.json/error + request.json.invalid for the app).
     Always cleans up the archive tmp file.
     """
-    request_body = {"archive_paths": list(archive_paths), "metadata": dict(metadata)}
+    sync_request = self._coerce_sync_request(request, metadata)
+    archive_paths = sync_request.archive_paths
+    runtime_payload = runtime_policy_to_dict(sync_request.runtime)
+    request_body = {
+      "archive_paths": list(archive_paths),
+      "metadata": dict(sync_request.metadata),
+      "runtime": runtime_payload,
+    }
     vsd = volume_sync_dir(self.owner)
     proc_path = vsd / SYNC_PROCESSING_FILE
     tar_path: Optional[str] = None
@@ -578,13 +674,15 @@ class SyncManager:
         "archive_format": ARCHIVE_FORMAT,
         "archive_size_bytes": size_bytes,
         "encryption": "r1fs-default",
+        "runtime": runtime_payload,
       }
       record = {
         "cid": cid,
         "version": version,
         "timestamp": ts,
         "node_id": node_id,
-        "metadata": dict(metadata),
+        "metadata": dict(sync_request.metadata),
+        "runtime": runtime_payload,
         "manifest": manifest,
       }
 

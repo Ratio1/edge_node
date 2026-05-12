@@ -344,12 +344,12 @@ class _SyncMixin:
     if claimed is None:
       # claim_request already wrote .invalid + response.json
       return
-    archive_paths, metadata = claimed
 
-    self._stop_container_runtime_for_restart()
+    if claimed.runtime.provider_capture == "offline":
+      self._stop_container_runtime_for_restart()
 
     try:
-      sm.publish_snapshot(archive_paths, metadata)
+      sm.publish_snapshot(claimed)
     except Exception as exc:
       # SyncManager.publish_snapshot has internal try/except for every
       # stage, but we still wrap to guarantee we always restart the

@@ -473,13 +473,72 @@ class TestClaimRequest(unittest.TestCase):
     self._write_request({"archive_paths": ["/app/data/"], "metadata": {"k": 1}})
     result = self.sm.claim_request()
     self.assertIsNotNone(result)
-    archive_paths, metadata = result
-    self.assertEqual(archive_paths, ["/app/data/"])
-    self.assertEqual(metadata, {"k": 1})
+    self.assertEqual(result.archive_paths, ["/app/data/"])
+    self.assertEqual(result.metadata, {"k": 1})
+    self.assertEqual(result.runtime.provider_capture, "offline")
+    self.assertEqual(result.runtime.consumer_apply, "offline_restart")
     # request.json gone, .processing present, no .invalid
     self.assertFalse((self.vsd / "request.json").exists())
     self.assertTrue((self.vsd / "request.json.processing").exists())
     self.assertIsNone(self._read_invalid())
+
+  def test_runtime_policy_parsed(self):
+    self._write_request({
+      "archive_paths": ["/app/data/"],
+      "runtime": {
+        "provider_capture": "online",
+        "consumer_apply": "online_no_restart",
+      },
+    })
+
+    result = self.sm.claim_request()
+
+    self.assertIsNotNone(result)
+    self.assertEqual(result.runtime.provider_capture, "online")
+    self.assertEqual(result.runtime.consumer_apply, "online_no_restart")
+
+  def test_runtime_policy_must_be_object(self):
+    self._write_request({"archive_paths": ["/app/data/"], "runtime": "online"})
+
+    self.assertIsNone(self.sm.claim_request())
+
+    self.assertIn("runtime must be a JSON object", self._read_invalid()["_error"]["error"])
+
+  def test_invalid_provider_capture_rejected(self):
+    self._write_request({
+      "archive_paths": ["/app/data/"],
+      "runtime": {"provider_capture": "maybe"},
+    })
+
+    self.assertIsNone(self.sm.claim_request())
+
+    err = self._read_invalid()["_error"]["error"]
+    self.assertIn("provider_capture", err)
+    self.assertIn("maybe", err)
+
+  def test_invalid_consumer_apply_rejected(self):
+    self._write_request({
+      "archive_paths": ["/app/data/"],
+      "runtime": {"consumer_apply": "sometimes"},
+    })
+
+    self.assertIsNone(self.sm.claim_request())
+
+    err = self._read_invalid()["_error"]["error"]
+    self.assertIn("consumer_apply", err)
+    self.assertIn("sometimes", err)
+
+  def test_online_provider_capture_allows_unmounted_path(self):
+    self._write_request({
+      "archive_paths": ["/tmp/generated.txt"],
+      "runtime": {"provider_capture": "online"},
+    })
+
+    result = self.sm.claim_request()
+
+    self.assertIsNotNone(result)
+    self.assertEqual(result.archive_paths, ["/tmp/generated.txt"])
+    self.assertEqual(result.runtime.provider_capture, "online")
 
   def test_malformed_json(self):
     (self.vsd / "request.json").write_text("not-json{")
