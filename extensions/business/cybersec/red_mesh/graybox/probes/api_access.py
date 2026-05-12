@@ -47,6 +47,10 @@ class ApiAccessProbes(ProbeBase):
     if getattr(api_security, "object_endpoints", None):
       self.run_safe("api_bola", self._test_api_bola)
 
+    if getattr(api_security, "function_endpoints", None):
+      self.run_safe("api_bfla_regular", self._test_bfla_regular_as_admin)
+      self.run_safe("api_bfla_anon", self._test_bfla_anon_as_user)
+
     return self.findings
 
   # ── PT-OAPI1-01 — API object-level authorization bypass (BOLA) ──────
@@ -198,6 +202,169 @@ class ApiAccessProbes(ProbeBase):
        f"authenticated_user={expected_principal}"],
     )
     return "clean"
+
+  # ── PT-OAPI5-01 — BFLA: regular user reaches admin function ─────────
+
+  def _test_bfla_regular_as_admin(self):
+    """For each ApiFunctionEndpoint with method == GET (read-only),
+    GET it as the regular_session and expect ≥401/403.
+
+    Vulnerable iff status < 400 (no auth gate). Mutating endpoints
+    (method != GET) are deferred to PT-OAPI5-04 in Subphase 3.4 — they
+    require the stateful contract + a configured revert plan.
+    """
+    api_security = self.target_config.api_security
+    endpoints = api_security.function_endpoints
+    session = self.auth.regular_session
+    if session is None:
+      self.emit_inconclusive(
+        "PT-OAPI5-01",
+        "API function-level authorization bypass (regular as admin, read)",
+        "API5:2023",
+        "no_regular_session",
+      )
+      return
+
+    found_any = self._run_function_endpoints(
+      endpoints, session, "regular",
+      scenario_id="PT-OAPI5-01",
+      title="API function-level authorization bypass (regular as admin, read)",
+    )
+    if not found_any:
+      self.emit_inconclusive(
+        "PT-OAPI5-01",
+        "API function-level authorization bypass (regular as admin, read)",
+        "API5:2023",
+        "no_evaluable_function_endpoints",
+      )
+
+  # ── PT-OAPI5-02 — BFLA: anonymous user reaches user function ────────
+
+  def _test_bfla_anon_as_user(self):
+    """Anonymous (unauthenticated) GET against each function endpoint.
+
+    Same mechanics as PT-OAPI5-01 but uses
+    `auth.make_anonymous_session()` so caller cookies / Bearer headers
+    are not present.
+    """
+    api_security = self.target_config.api_security
+    endpoints = api_security.function_endpoints
+    if not hasattr(self.auth, "make_anonymous_session"):
+      self.emit_inconclusive(
+        "PT-OAPI5-02",
+        "API function-level authorization bypass (anonymous as user, read)",
+        "API5:2023",
+        "auth_manager_missing_anonymous_session",
+      )
+      return
+    session = self.auth.make_anonymous_session()
+    found_any = self._run_function_endpoints(
+      endpoints, session, "anonymous",
+      scenario_id="PT-OAPI5-02",
+      title="API function-level authorization bypass (anonymous as user, read)",
+    )
+    try:
+      session.close()
+    except Exception:
+      pass
+    if not found_any:
+      self.emit_inconclusive(
+        "PT-OAPI5-02",
+        "API function-level authorization bypass (anonymous as user, read)",
+        "API5:2023",
+        "no_evaluable_function_endpoints",
+      )
+
+  # ── Shared BFLA evaluator ────────────────────────────────────────────
+
+  def _run_function_endpoints(self, endpoints, session, principal, *,
+                                scenario_id, title):
+    """Iterate function endpoints in read-only mode; emit per-endpoint
+    finding. Returns True iff at least one endpoint yielded a definitive
+    (vulnerable or clean) result."""
+    cwe = ["CWE-285", "CWE-862"]
+    owasp = "API5:2023"
+    found_any = False
+
+    for ep in endpoints:
+      # Phase 2.3 covers read-only (method=GET) only. Mutating methods
+      # are deferred to PT-OAPI5-03 / PT-OAPI5-04 (stateful, Phase 3.4).
+      if (ep.method or "GET").upper() not in ("GET", "HEAD"):
+        continue
+
+      if not self.budget():
+        self.emit_inconclusive(
+          scenario_id, title, owasp, "budget_exhausted",
+        )
+        return found_any
+
+      url = self.target_url + ep.path
+      self.safety.throttle()
+      try:
+        resp = session.get(url, timeout=10, allow_redirects=False)
+      except requests.RequestException:
+        continue
+
+      status = resp.status_code
+      # Auth gate working as intended.
+      if status in (401, 403):
+        self.emit_clean(
+          scenario_id, title, owasp,
+          [f"endpoint={url}", f"principal={principal}",
+           f"response_status={status}",
+           "marker=auth_gate_returned_4xx"],
+        )
+        found_any = True
+        continue
+      # Other 4xx/5xx — endpoint refused for other reasons; skip.
+      if status >= 400:
+        continue
+
+      # 2xx/3xx without an auth-required marker = vulnerable.
+      body_lower = (resp.text or "").lower()[:2000]
+      marker = (ep.auth_required_marker or "").lower().strip()
+      marker_present = bool(marker and marker in body_lower)
+      if marker_present:
+        self.emit_clean(
+          scenario_id, title, owasp,
+          [f"endpoint={url}", f"principal={principal}",
+           f"response_status={status}",
+           "marker=configured_auth_required_marker_present"],
+        )
+        found_any = True
+        continue
+
+      # Severity: HIGH baseline; CRITICAL when path matches /admin or
+      # function_endpoint is explicitly tagged privilege=admin.
+      privilege = (ep.privilege or "").lower()
+      severity = "CRITICAL" if (privilege == "admin"
+                                  or "/admin" in ep.path.lower()) else "HIGH"
+      evidence = [
+        f"endpoint={url}", f"principal={principal}",
+        f"response_status={status}",
+        f"method={(ep.method or 'GET').upper()}",
+        "marker_absent=true",
+      ]
+      replay = [
+        f"Authenticate as the {principal} user (or none for anonymous).",
+        f"GET {url}",
+        "Observe a 2xx response — the endpoint did not enforce its "
+        "intended authorization.",
+      ]
+      self.emit_vulnerable(
+        scenario_id, title, severity, owasp, cwe, evidence,
+        replay_steps=replay,
+        remediation=(
+          "Add the appropriate authorization decorator/middleware on the "
+          "endpoint. For administrative functions verify that the caller "
+          "has the required role; for user-only functions require an "
+          "authenticated session. Returning 2xx to the wrong principal "
+          "leaks data or exposes side effects."
+        ),
+      )
+      found_any = True
+
+    return found_any
 
   @staticmethod
   def _collect_sensitive_field_names(payload):

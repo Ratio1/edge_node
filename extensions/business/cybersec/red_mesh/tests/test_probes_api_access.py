@@ -15,7 +15,8 @@ from extensions.business.cybersec.red_mesh.graybox.probes.api_access import (
   ApiAccessProbes,
 )
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
-  ApiObjectEndpoint, ApiSecurityConfig, GrayboxTargetConfig,
+  ApiObjectEndpoint, ApiFunctionEndpoint, ApiSecurityConfig,
+  GrayboxTargetConfig,
 )
 
 
@@ -34,14 +35,21 @@ def _mock_response(status=200, json_body=None, text="",
   return resp
 
 
-def _make_probe(*, object_endpoints=None, regular_username="alice",
-                regular_session=None):
+def _make_probe(*, object_endpoints=None, function_endpoints=None,
+                regular_username="alice", regular_session=None,
+                anon_session=None):
   cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(
     object_endpoints=list(object_endpoints or []),
+    function_endpoints=list(function_endpoints or []),
   ))
   auth = MagicMock()
   auth.regular_session = regular_session if regular_session is not None else MagicMock()
   auth.official_session = MagicMock()
+  if anon_session is not None:
+    auth.make_anonymous_session = MagicMock(return_value=anon_session)
+  else:
+    # Default to a fresh MagicMock when callers don't provide one
+    auth.make_anonymous_session = MagicMock(return_value=MagicMock())
   safety = MagicMock()
   safety.throttle = MagicMock()
   safety.sanitize_error = MagicMock(side_effect=lambda s: s)
@@ -188,6 +196,119 @@ class TestApi1Bola(unittest.TestCase):
     f = p.findings[0]
     self.assertEqual(f.status, "inconclusive")
     self.assertIn("no_authenticated_session", f.evidence[0])
+
+
+class TestApi5Bfla(unittest.TestCase):
+  """PT-OAPI5-01 + PT-OAPI5-02 — read-only BFLA (Subphase 2.3)."""
+
+  def _make_function_probe(self, **kw):
+    return _make_probe(**kw)
+
+  # ── PT-OAPI5-01 — regular user reaches admin function ──────────────
+
+  def test_regular_2xx_on_admin_function_emits_critical(self):
+    """Admin path returns 200 to regular user → CRITICAL."""
+    ep = ApiFunctionEndpoint(path="/api/admin/export-users/", method="GET",
+                              privilege="admin")
+    p = self._make_function_probe(function_endpoints=[ep])
+    p.auth.regular_session.get.return_value = _mock_response(
+      json_body={"users": [{"id": 1}]},
+    )
+    p.run()
+    vuln = [f for f in p.findings
+            if f.status == "vulnerable" and f.scenario_id == "PT-OAPI5-01"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].severity, "CRITICAL")  # /admin path
+    self.assertEqual(set(vuln[0].attack), {"T1190", "T1078"})
+
+  def test_regular_403_emits_clean(self):
+    """Auth gate working → not_vulnerable."""
+    ep = ApiFunctionEndpoint(path="/api/admin/export/", method="GET",
+                              privilege="admin")
+    p = self._make_function_probe(function_endpoints=[ep])
+    p.auth.regular_session.get.return_value = _mock_response(
+      status=403, json_body={"detail": "Forbidden"},
+    )
+    p.run()
+    clean = [f for f in p.findings
+             if f.status == "not_vulnerable" and f.scenario_id == "PT-OAPI5-01"]
+    self.assertEqual(len(clean), 1)
+    # Marker reason is auth_gate_returned_4xx
+    self.assertIn("auth_gate_returned_4xx",
+                   "\n".join(clean[0].evidence))
+
+  def test_auth_required_marker_in_2xx_emits_clean(self):
+    """If body contains the configured auth_required_marker, treat as clean."""
+    ep = ApiFunctionEndpoint(
+      path="/api/admin/users/", method="GET", privilege="admin",
+      auth_required_marker="login required",
+    )
+    p = self._make_function_probe(function_endpoints=[ep])
+    p.auth.regular_session.get.return_value = _mock_response(
+      status=200, text="<html>Login Required to access</html>",
+      content_type="text/html",
+    )
+    p.run()
+    clean = [f for f in p.findings
+             if f.status == "not_vulnerable" and f.scenario_id == "PT-OAPI5-01"]
+    self.assertEqual(len(clean), 1)
+
+  def test_non_admin_path_baseline_high(self):
+    """Non-admin function path defaults to HIGH (not CRITICAL)."""
+    ep = ApiFunctionEndpoint(path="/api/reports/", method="GET",
+                              privilege="user")
+    p = self._make_function_probe(function_endpoints=[ep])
+    p.auth.regular_session.get.return_value = _mock_response(
+      json_body={"reports": []},
+    )
+    p.run()
+    vuln = [f for f in p.findings
+            if f.status == "vulnerable" and f.scenario_id == "PT-OAPI5-01"]
+    self.assertEqual(vuln[0].severity, "HIGH")
+
+  def test_mutating_method_skipped_in_phase_2(self):
+    """method=POST is deferred to PT-OAPI5-04 (Subphase 3.4)."""
+    ep = ApiFunctionEndpoint(path="/api/admin/promote/", method="POST",
+                              privilege="admin")
+    p = self._make_function_probe(function_endpoints=[ep])
+    p.auth.regular_session.post.return_value = _mock_response(json_body={})
+    p.run()
+    # No 5-01 vulnerable; only the rolled-up inconclusive.
+    self.assertEqual(
+      [f for f in p.findings
+       if f.status == "vulnerable" and f.scenario_id == "PT-OAPI5-01"],
+      [],
+    )
+    incon = [f for f in p.findings
+             if f.status == "inconclusive" and f.scenario_id == "PT-OAPI5-01"]
+    self.assertEqual(len(incon), 1)
+
+  # ── PT-OAPI5-02 — anonymous reaches user function ──────────────────
+
+  def test_anon_session_used_for_pt_oapi5_02(self):
+    """PT-OAPI5-02 must use make_anonymous_session, not the regular session."""
+    ep = ApiFunctionEndpoint(path="/api/me/", method="GET", privilege="user")
+    anon = MagicMock()
+    anon.get.return_value = _mock_response(json_body={"id": 1})
+    p = self._make_function_probe(function_endpoints=[ep], anon_session=anon)
+    p.run()
+    vuln = [f for f in p.findings
+            if f.status == "vulnerable" and f.scenario_id == "PT-OAPI5-02"]
+    self.assertEqual(len(vuln), 1)
+    p.auth.make_anonymous_session.assert_called()
+
+  def test_anon_401_emits_clean(self):
+    """Anon hits 401 → clean."""
+    ep = ApiFunctionEndpoint(path="/api/me/", method="GET")
+    anon = MagicMock()
+    anon.get.return_value = _mock_response(
+      status=401, json_body={"detail": "Authentication required"},
+    )
+    p = self._make_function_probe(function_endpoints=[ep], anon_session=anon)
+    p.run()
+    clean = [f for f in p.findings
+             if f.status == "not_vulnerable" and f.scenario_id == "PT-OAPI5-02"]
+    self.assertEqual(len(clean), 1)
 
 
 if __name__ == "__main__":
