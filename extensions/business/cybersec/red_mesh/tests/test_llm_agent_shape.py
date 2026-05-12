@@ -10,7 +10,7 @@ attribution fields.
 import unittest
 from unittest.mock import MagicMock
 
-from extensions.business.cybersec.red_mesh.mixins.llm_agent import (
+from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import (
   _RedMeshLlmAgentMixin,
 )
 from extensions.business.cybersec.red_mesh.tests.fixtures.multi_probe_report import (

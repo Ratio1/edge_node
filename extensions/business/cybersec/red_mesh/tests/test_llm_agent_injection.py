@@ -1,6 +1,6 @@
 """Phase 2 of PR 388 remediation — prompt-injection defense.
 
-Tests the OWASP LLM01:2025 mitigations added to mixins/llm_agent.py:
+Tests the OWASP LLM01:2025 mitigations added to mixins/redmesh_llm_agent.py:
   - Every target-controlled string is wrapped in
     <untrusted_target_data>...</untrusted_target_data> delimiters.
   - Known injection tokens/phrases are replaced with <filtered>.
@@ -13,13 +13,13 @@ Primary defense is the delimiter + system-prompt rule (tested
 indirectly via _build_llm_analysis_payload shape). String filtering
 is belt-and-suspenders — it IS tested, but no promise that it's
 exhaustive (attackers can bypass with Unicode/splitting/base64 — see
-module-level comment in llm_agent.py).
+module-level comment in redmesh_llm_agent.py).
 """
 
 import unittest
 from unittest.mock import MagicMock
 
-from extensions.business.cybersec.red_mesh.mixins.llm_agent import (
+from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import (
   _RedMeshLlmAgentMixin,
 )
 from extensions.business.cybersec.red_mesh.tests.fixtures.multi_probe_report import (
