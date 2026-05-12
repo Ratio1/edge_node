@@ -629,15 +629,42 @@ class SyncManager:
       return None
 
   def validate_manifest(self, record: dict) -> list[str]:
-    """Return list of manifest archive_paths the consumer cannot map.
+    """Return list of human-readable rejection reasons for ``record``.
 
-    Empty list means the consumer's `self.volumes` covers every container
-    path in the manifest with a fixed-size mount. A non-empty list is a
-    misalignment / configuration error — the apply must be skipped.
+    Empty list means the manifest is acceptable: schema_version and
+    archive_format are recognised AND the consumer's ``self.volumes`` covers
+    every container path with a (fixed-size) mount. A non-empty list means
+    apply must be skipped without touching the filesystem.
+
+    Reasons are surfaced for:
+      - missing/wrong ``schema_version`` (must be an int <= MANIFEST_SCHEMA_VERSION)
+      - unexpected ``archive_format`` (must equal ARCHIVE_FORMAT)
+      - ``archive_paths`` entries that don't map to a mount on this consumer
+
+    Format/schema checks come first so they short-circuit before we burn
+    cycles resolving paths against a manifest we can't read anyway.
     """
     if not isinstance(record, dict):
-      return []
+      return ["manifest record is not a dict"]
     manifest = record.get("manifest") or {}
+    reasons: list[str] = []
+
+    sv = manifest.get("schema_version")
+    if not isinstance(sv, int):
+      reasons.append(
+        f"unsupported schema_version: {sv!r} (expected int, max supported: {MANIFEST_SCHEMA_VERSION})"
+      )
+    elif sv > MANIFEST_SCHEMA_VERSION:
+      reasons.append(
+        f"unsupported schema_version: {sv} (max supported by this CAR: {MANIFEST_SCHEMA_VERSION})"
+      )
+
+    fmt = manifest.get("archive_format")
+    if fmt != ARCHIVE_FORMAT:
+      reasons.append(
+        f"unsupported archive_format: {fmt!r} (expected: {ARCHIVE_FORMAT!r})"
+      )
+
     paths = manifest.get("archive_paths") or []
     missing: list[str] = []
     for entry in paths:
@@ -645,7 +672,9 @@ class SyncManager:
         self.resolve_container_path(entry)
       except ValueError:
         missing.append(entry)
-    return missing
+    if missing:
+      reasons.append(f"unmapped archive_paths on this consumer: {missing}")
+    return reasons
 
   def extract_archive(self, tar_path: str) -> list[str]:
     """Reverse-map tar member container paths to host paths and extract.
@@ -750,11 +779,11 @@ class SyncManager:
       )
       return False
 
-    missing = self.validate_manifest(record)
-    if missing:
+    rejection_reasons = self.validate_manifest(record)
+    if rejection_reasons:
       self.owner.P(
-        f"[sync] cannot apply v{version}: consumer volume layout missing "
-        f"mounts for {missing}",
+        f"[sync] cannot apply v{version} (cid={cid}): "
+        + "; ".join(rejection_reasons),
         color="r",
       )
       return False

@@ -838,17 +838,80 @@ class TestConsumerFlow(unittest.TestCase):
 
   # ----- validate_manifest --------------------------------------------------
 
+  def _ok_manifest(self, **overrides):
+    """Return a minimally-valid manifest dict. Tests override fields they
+    care about; the rest stay sane defaults so we don't have to copy the
+    schema boilerplate everywhere."""
+    manifest = {
+      "schema_version": 1,
+      "archive_format": "tar.gz",
+      "archive_paths": ["/app/data/"],
+    }
+    manifest.update(overrides)
+    return {"manifest": manifest}
+
   def test_validate_manifest_empty_when_aligned(self):
-    record = {"manifest": {"archive_paths": ["/app/data/"]}}
-    self.assertEqual(self.sm_c.validate_manifest(record), [])
+    self.assertEqual(self.sm_c.validate_manifest(self._ok_manifest()), [])
 
   def test_validate_manifest_returns_missing_paths(self):
-    record = {"manifest": {"archive_paths": ["/app/data/", "/somewhere/else/"]}}
-    self.assertEqual(self.sm_c.validate_manifest(record), ["/somewhere/else/"])
+    record = self._ok_manifest(archive_paths=["/app/data/", "/somewhere/else/"])
+    reasons = self.sm_c.validate_manifest(record)
+    self.assertEqual(len(reasons), 1)
+    self.assertIn("/somewhere/else/", reasons[0])
+    self.assertIn("unmapped archive_paths", reasons[0])
+
+  def test_validate_manifest_rejects_unsupported_schema_version(self):
+    """A manifest from a future CAR that bumped MANIFEST_SCHEMA_VERSION must
+    be refused rather than silently applied — schema bumps signal breaking
+    format changes the current consumer can't safely interpret. Codex
+    review finding 4 on PR #399."""
+    record = self._ok_manifest(schema_version=999)
+    reasons = self.sm_c.validate_manifest(record)
+    self.assertEqual(len(reasons), 1)
+    self.assertIn("schema_version", reasons[0])
+    self.assertIn("999", reasons[0])
+
+  def test_validate_manifest_rejects_missing_schema_version(self):
+    record = {"manifest": {"archive_format": "tar.gz", "archive_paths": ["/app/data/"]}}
+    reasons = self.sm_c.validate_manifest(record)
+    self.assertTrue(any("schema_version" in r for r in reasons))
+
+  def test_validate_manifest_rejects_non_int_schema_version(self):
+    record = self._ok_manifest(schema_version="1")
+    reasons = self.sm_c.validate_manifest(record)
+    self.assertTrue(any("schema_version" in r for r in reasons))
+
+  def test_validate_manifest_rejects_unsupported_archive_format(self):
+    record = self._ok_manifest(archive_format="zip")
+    reasons = self.sm_c.validate_manifest(record)
+    self.assertEqual(len(reasons), 1)
+    self.assertIn("archive_format", reasons[0])
+    self.assertIn("zip", reasons[0])
+    self.assertIn("tar.gz", reasons[0])
+
+  def test_validate_manifest_collects_multiple_violations(self):
+    """Schema + format + path violations all surface in one pass so the
+    operator sees the full picture in a single log line."""
+    record = self._ok_manifest(
+      schema_version=999, archive_format="zip",
+      archive_paths=["/app/data/", "/nope/"],
+    )
+    reasons = self.sm_c.validate_manifest(record)
+    self.assertEqual(len(reasons), 3)
+    joined = "; ".join(reasons)
+    self.assertIn("schema_version", joined)
+    self.assertIn("archive_format", joined)
+    self.assertIn("/nope/", joined)
 
   def test_validate_manifest_handles_no_manifest(self):
-    self.assertEqual(self.sm_c.validate_manifest({}), [])
-    self.assertEqual(self.sm_c.validate_manifest({"manifest": {}}), [])
+    # An empty record / empty manifest is non-conformant (missing required
+    # schema_version + archive_format), so it must be rejected.
+    self.assertNotEqual(self.sm_c.validate_manifest({}), [])
+    self.assertNotEqual(self.sm_c.validate_manifest({"manifest": {}}), [])
+
+  def test_validate_manifest_rejects_non_dict(self):
+    self.assertEqual(self.sm_c.validate_manifest(None), ["manifest record is not a dict"])
+    self.assertEqual(self.sm_c.validate_manifest("string"), ["manifest record is not a dict"])
 
   # ----- fetch_latest -------------------------------------------------------
 
@@ -923,8 +986,9 @@ class TestConsumerFlow(unittest.TestCase):
     # No last_apply, no history advance
     self.assertFalse((volume_sync_dir(self.consumer) / "last_apply.json").exists())
     self.assertEqual(len(list(history_received_dir(self.consumer).glob("*.json"))), 0)
-    # Useful error message
-    self.assertTrue(any("missing mounts for" in m for m in self.consumer._msgs))
+    # Useful error message — should name the path that couldn't be mapped.
+    self.assertTrue(any("unmapped archive_paths" in m for m in self.consumer._msgs))
+    self.assertTrue(any("/foo/bar/" in m for m in self.consumer._msgs))
 
   def test_apply_aborts_on_r1fs_get_failure(self):
     (volume_sync_dir(self.provider) / SYNC_PROCESSING_FILE).write_text("{}")
