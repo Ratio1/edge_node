@@ -13,6 +13,14 @@ from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   InjectionConfig,
   BusinessLogicConfig,
   DiscoveryConfig,
+  ApiObjectEndpoint,
+  ApiPropertyEndpoint,
+  ApiFunctionEndpoint,
+  ApiResourceEndpoint,
+  ApiBusinessFlow,
+  ApiTokenEndpoint,
+  ApiInventoryPaths,
+  ApiSecurityConfig,
   COMMON_CSRF_FIELDS,
 )
 from extensions.business.cybersec.red_mesh.constants import (
@@ -186,6 +194,185 @@ class TestCsrfFields(unittest.TestCase):
     self.assertIn("authenticity_token", COMMON_CSRF_FIELDS)
     self.assertIn("_csrf", COMMON_CSRF_FIELDS)
     self.assertIn("_token", COMMON_CSRF_FIELDS)
+
+
+class TestApiSecurityConfig(unittest.TestCase):
+  """Round-trip + defaults for the OWASP API Top 10 sub-models (Subphase 1.1)."""
+
+  # ── ApiObjectEndpoint ──────────────────────────────────────────────────
+  def test_api_object_endpoint_defaults(self):
+    ep = ApiObjectEndpoint.from_dict({"path": "/api/records/{id}/"})
+    self.assertEqual(ep.path, "/api/records/{id}/")
+    self.assertEqual(ep.test_ids, [1, 2])
+    self.assertEqual(ep.owner_field, "owner")
+    self.assertEqual(ep.id_param, "id")
+    self.assertEqual(ep.tenant_field, "")
+
+  def test_api_object_endpoint_full(self):
+    ep = ApiObjectEndpoint.from_dict({
+      "path": "/api/orgs/{org}/users/{id}/",
+      "test_ids": [5, 7, 11],
+      "owner_field": "user_id",
+      "id_param": "uid",
+      "tenant_field": "org_id",
+    })
+    self.assertEqual(ep.test_ids, [5, 7, 11])
+    self.assertEqual(ep.tenant_field, "org_id")
+
+  def test_api_object_endpoint_missing_path(self):
+    with self.assertRaises(KeyError):
+      ApiObjectEndpoint.from_dict({"test_ids": [1]})
+
+  # ── ApiPropertyEndpoint ────────────────────────────────────────────────
+  def test_api_property_endpoint_defaults(self):
+    ep = ApiPropertyEndpoint.from_dict({"path": "/api/profile/{id}/"})
+    self.assertEqual(ep.method_read, "GET")
+    self.assertEqual(ep.method_write, "PATCH")
+    self.assertEqual(ep.test_id, 1)
+
+  # ── ApiFunctionEndpoint ────────────────────────────────────────────────
+  def test_api_function_endpoint_defaults(self):
+    ep = ApiFunctionEndpoint.from_dict({"path": "/api/admin/users/"})
+    self.assertEqual(ep.method, "GET")
+    self.assertEqual(ep.privilege, "admin")
+    self.assertEqual(ep.revert_path, "")
+    self.assertEqual(ep.revert_body, {})
+
+  def test_api_function_endpoint_with_revert(self):
+    ep = ApiFunctionEndpoint.from_dict({
+      "path": "/api/admin/users/{uid}/promote/",
+      "method": "POST",
+      "revert_path": "/api/admin/users/{uid}/demote/",
+      "revert_body": {"reason": "test"},
+    })
+    self.assertEqual(ep.revert_path, "/api/admin/users/{uid}/demote/")
+    self.assertEqual(ep.revert_body, {"reason": "test"})
+
+  # ── ApiResourceEndpoint ────────────────────────────────────────────────
+  def test_api_resource_endpoint_defaults(self):
+    ep = ApiResourceEndpoint.from_dict({"path": "/api/records/"})
+    self.assertEqual(ep.limit_param, "limit")
+    self.assertEqual(ep.baseline_limit, 10)
+    self.assertEqual(ep.abuse_limit, 999_999)
+    self.assertFalse(ep.rate_limit_expected)
+
+  # ── ApiBusinessFlow ────────────────────────────────────────────────────
+  def test_api_business_flow_defaults(self):
+    bf = ApiBusinessFlow.from_dict({"path": "/api/auth/signup/"})
+    self.assertEqual(bf.method, "POST")
+    self.assertEqual(bf.flow_name, "signup")
+    self.assertEqual(bf.body_template, {})
+
+  # ── ApiTokenEndpoint ───────────────────────────────────────────────────
+  def test_api_token_endpoint_defaults(self):
+    tok = ApiTokenEndpoint.from_dict({})
+    self.assertEqual(tok.token_path, "")
+    self.assertEqual(tok.protected_path, "")
+    self.assertEqual(tok.logout_path, "")
+    # Defaults include at least the obvious weak-secret entries
+    self.assertIn("secret", tok.weak_secret_candidates)
+    self.assertIn("changeme", tok.weak_secret_candidates)
+
+  def test_api_token_endpoint_custom_wordlist(self):
+    tok = ApiTokenEndpoint.from_dict({
+      "token_path": "/api/token/",
+      "protected_path": "/api/me/",
+      "logout_path": "/api/auth/logout/",
+      "weak_secret_candidates": ["a", "b"],
+    })
+    self.assertEqual(tok.weak_secret_candidates, ["a", "b"])
+
+  # ── ApiInventoryPaths ──────────────────────────────────────────────────
+  def test_api_inventory_paths_defaults(self):
+    inv = ApiInventoryPaths.from_dict({})
+    self.assertIn("/openapi.json", inv.openapi_candidates)
+    self.assertIn("/swagger.json", inv.openapi_candidates)
+    self.assertEqual(inv.current_version, "")
+    self.assertEqual(inv.deprecated_paths, [])
+
+  # ── ApiSecurityConfig wrapper ──────────────────────────────────────────
+  def test_api_security_config_defaults(self):
+    cfg = ApiSecurityConfig.from_dict({})
+    self.assertEqual(cfg.object_endpoints, [])
+    self.assertEqual(cfg.function_endpoints, [])
+    self.assertEqual(cfg.business_flows, [])
+    # Default SSRF body fields populated
+    self.assertIn("url", cfg.ssrf_body_fields)
+    self.assertIn("webhook", cfg.ssrf_body_fields)
+    # Default tampering fields populated
+    self.assertIn("is_admin", cfg.tampering_fields)
+    # Default debug paths populated
+    self.assertIn("/api/debug", cfg.debug_path_candidates)
+
+  def test_api_security_config_full_roundtrip(self):
+    """Populated payload survives from_dict cleanly."""
+    payload = {
+      "object_endpoints": [
+        {"path": "/api/records/{id}/", "test_ids": [1, 2], "tenant_field": "tenant_id"},
+      ],
+      "property_endpoints": [
+        {"path": "/api/profile/{id}/", "method_write": "PUT", "test_id": 42},
+      ],
+      "function_endpoints": [
+        {"path": "/api/admin/users/{uid}/promote/",
+         "method": "POST", "privilege": "admin",
+         "revert_path": "/api/admin/users/{uid}/demote/"},
+      ],
+      "resource_endpoints": [
+        {"path": "/api/records/list/", "abuse_limit": 50000,
+         "rate_limit_expected": True},
+      ],
+      "business_flows": [
+        {"path": "/api/auth/signup/", "flow_name": "signup",
+         "body_template": {"username": "x", "email": "x@x"}},
+      ],
+      "token_endpoints": {
+        "token_path": "/api/token/",
+        "protected_path": "/api/me/",
+        "logout_path": "/api/auth/logout/",
+      },
+      "inventory_paths": {
+        "current_version": "/api/v2/",
+        "canonical_probe_path": "/api/v2/records/1/",
+        "deprecated_paths": ["/api/v1/legacy/"],
+      },
+      "sensitive_field_patterns": ["custom_*_secret"],
+      "ssrf_body_fields": ["redirect_uri"],
+    }
+    cfg = ApiSecurityConfig.from_dict(payload)
+    self.assertEqual(len(cfg.object_endpoints), 1)
+    self.assertEqual(cfg.object_endpoints[0].tenant_field, "tenant_id")
+    self.assertEqual(cfg.property_endpoints[0].method_write, "PUT")
+    self.assertEqual(cfg.function_endpoints[0].revert_path, "/api/admin/users/{uid}/demote/")
+    self.assertTrue(cfg.resource_endpoints[0].rate_limit_expected)
+    self.assertEqual(cfg.business_flows[0].body_template, {"username": "x", "email": "x@x"})
+    self.assertEqual(cfg.token_endpoints.logout_path, "/api/auth/logout/")
+    self.assertEqual(cfg.inventory_paths.canonical_probe_path, "/api/v2/records/1/")
+    self.assertEqual(cfg.sensitive_field_patterns, ["custom_*_secret"])
+    # Explicit override replaces, not merges
+    self.assertEqual(cfg.ssrf_body_fields, ["redirect_uri"])
+
+  # ── GrayboxTargetConfig wiring ─────────────────────────────────────────
+  def test_target_config_includes_api_security_default(self):
+    cfg = GrayboxTargetConfig.from_dict({})
+    self.assertIsInstance(cfg.api_security, ApiSecurityConfig)
+    self.assertEqual(cfg.api_security.object_endpoints, [])
+
+  def test_target_config_propagates_api_security_payload(self):
+    cfg = GrayboxTargetConfig.from_dict({
+      "api_security": {
+        "object_endpoints": [{"path": "/api/x/{id}/"}],
+      },
+    })
+    self.assertEqual(len(cfg.api_security.object_endpoints), 1)
+    self.assertEqual(cfg.api_security.object_endpoints[0].path, "/api/x/{id}/")
+
+  def test_target_config_missing_required_path_raises(self):
+    """Missing required `path` should raise (mirrors IdorEndpoint contract)."""
+    with self.assertRaises(KeyError):
+      GrayboxTargetConfig.from_dict({
+        "api_security": {"object_endpoints": [{"test_ids": [1]}]},
+      })
 
 
 if __name__ == '__main__':
