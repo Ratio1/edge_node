@@ -236,8 +236,9 @@ class ProbeBase:
   def _configured_secret_field_names(self):
     """Read the configured API-key header/query names from target_config.
 
-    Returned as a tuple suitable for `scrub_graybox_secrets`. Falls back
-    to () when ApiSecurityConfig.auth is absent.
+    Returned as a tuple of strings suitable for `scrub_graybox_secrets`.
+    Falls back to () when ApiSecurityConfig.auth is absent or the values
+    are not strings (e.g. MagicMock fixtures in unit tests).
     """
     api_security = getattr(self.target_config, "api_security", None)
     if api_security is None:
@@ -246,12 +247,11 @@ class ProbeBase:
     if auth is None:
       return ()
     names = []
-    if auth.api_key_header_name:
-      names.append(auth.api_key_header_name)
-    if auth.api_key_query_param:
-      names.append(auth.api_key_query_param)
-    if auth.bearer_token_header_name:
-      names.append(auth.bearer_token_header_name)
+    for attr in ("api_key_header_name", "api_key_query_param",
+                  "bearer_token_header_name"):
+      val = getattr(auth, attr, None)
+      if isinstance(val, str) and val:
+        names.append(val)
     return tuple(names)
 
   def _scrub_for_emission(self, value):
