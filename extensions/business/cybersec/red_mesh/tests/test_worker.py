@@ -319,8 +319,15 @@ class TestExecution(unittest.TestCase):
           safety=safety,
         )
         result = probe.run()
-        # Skeleton: no findings yet. Real probes land in Phase 2 / 3.
-        self.assertEqual(list(result), [])
+        # Result must be iterable; the actual content depends on which
+        # subphase has wired probe methods. Subphase 1.3 acceptance was
+        # "dispatches cleanly without exception"; once Phase 2 lands real
+        # probes, MagicMock target_config produces inconclusive findings
+        # (which still satisfies the contract).
+        self.assertIsNotNone(result)
+        for f in result:
+          # Every emitted finding must at least carry a recognised status.
+          self.assertIn(f.status, ("vulnerable", "not_vulnerable", "inconclusive"))
 
   def test_scenario_stats(self):
     """Scenario stats count findings by status."""
