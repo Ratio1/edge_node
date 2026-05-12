@@ -31,7 +31,8 @@ class ProbeBase:
 
   def __init__(self, target_url, auth_manager, target_config, safety,
                discovered_routes=None, discovered_forms=None,
-               regular_username="", allow_stateful=False):
+               regular_username="", allow_stateful=False,
+               request_budget=None):
     self.target_url = target_url.rstrip("/")
     self.auth = auth_manager
     self.target_config = target_config
@@ -40,6 +41,9 @@ class ProbeBase:
     self.discovered_forms = discovered_forms or []
     self.regular_username = regular_username
     self._allow_stateful = allow_stateful
+    # OWASP API Top 10 — Subphase 1.7. Optional shared RequestBudget.
+    # When None, `self.budget()` always returns True (no enforcement).
+    self.request_budget = request_budget
     self.findings: list[GrayboxFinding] = []
 
   @classmethod

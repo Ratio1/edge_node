@@ -77,6 +77,10 @@ class GrayboxProbeContext:
   discovered_forms: list[str] = field(default_factory=list)
   regular_username: str = ""
   allow_stateful: bool = False
+  # OWASP API Top 10 — Subphase 1.7. Reference (not value) to a shared
+  # mutable RequestBudget. The frozen dataclass owns the binding; the
+  # budget object itself mutates as probes consume.
+  request_budget: object = None
 
   def to_kwargs(self) -> dict:
     return {
@@ -88,6 +92,7 @@ class GrayboxProbeContext:
       "discovered_forms": list(self.discovered_forms),
       "regular_username": self.regular_username,
       "allow_stateful": self.allow_stateful,
+      "request_budget": self.request_budget,
     }
 
 

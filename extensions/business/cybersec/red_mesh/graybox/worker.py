@@ -109,6 +109,17 @@ class GrayboxLocalWorker(BaseLocalWorker):
       job_config.target_config or {}
     )
 
+    # OWASP API Top 10 — Subphase 1.7. Per-scan request budget shared by
+    # every probe instance. Default 1000; configurable via
+    # `target_config.api_security.max_total_requests`.
+    from .budget import RequestBudget
+    budget_total = max(1, int(getattr(
+      self.target_config.api_security, "max_total_requests", 1000,
+    )))
+    self.request_budget = RequestBudget(
+      remaining=budget_total, total=budget_total,
+    )
+
     # Modules (composition)
     self.safety = SafetyControls(
       request_delay=job_config.scan_min_delay or None,
@@ -381,6 +392,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       discovered_forms=discovery_result.forms,
       regular_username=self._credentials.regular.username if self._credentials.regular else "",
       allow_stateful=self.job_config.allow_stateful_probes,
+      request_budget=self.request_budget,
     )
 
   def _run_probe_phase(self, discovery_result: DiscoveryResult):
