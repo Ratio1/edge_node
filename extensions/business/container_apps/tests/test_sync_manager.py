@@ -8,6 +8,8 @@ the manager depends on.
 
 import json
 import os
+import io
+import tarfile
 import tempfile
 import time
 import unittest
@@ -24,6 +26,33 @@ from extensions.business.container_apps.sync import (
   system_volume_host_root,
   volume_sync_dir,
 )
+from extensions.business.container_apps.sync.manager import (
+  PROVIDER_CAPTURE_ONLINE,
+  SyncRequest,
+  SyncRuntimePolicy,
+)
+
+
+def _tar_bytes(name: str, content: bytes) -> bytes:
+  buff = io.BytesIO()
+  with tarfile.open(fileobj=buff, mode="w") as tar:
+    info = tarfile.TarInfo(name=name)
+    info.size = len(content)
+    info.mode = 0o644
+    tar.addfile(info, io.BytesIO(content))
+  return buff.getvalue()
+
+
+class _FakeDockerArchiveContainer:
+  def __init__(self, archives: dict[str, bytes]):
+    self.archives = dict(archives)
+    self.get_archive_calls: list[str] = []
+
+  def get_archive(self, path):
+    self.get_archive_calls.append(path)
+    archive = self.archives[path]
+    name = os.path.basename(path.rstrip("/")) or "/"
+    return iter([archive]), {"name": name}
 
 
 class _FakeR1FS:
@@ -846,6 +875,8 @@ class TestPublishSnapshot(unittest.TestCase):
     self.assertEqual(value["manifest"]["archive_paths"], ["/app/data/"])
     self.assertEqual(value["manifest"]["schema_version"], 1)
     self.assertEqual(value["manifest"]["archive_format"], "tar.gz")
+    self.assertEqual(value["manifest"]["runtime"]["provider_capture"], "offline")
+    self.assertEqual(value["manifest"]["runtime"]["consumer_apply"], "offline_restart")
     self.assertEqual(value["metadata"], {"epoch": 1})
 
     # History
@@ -862,6 +893,31 @@ class TestPublishSnapshot(unittest.TestCase):
     self.assertFalse((self.vsd / "request.json.processing").exists())
     # No .invalid because success
     self.assertFalse((self.vsd / "request.json.invalid").exists())
+
+  def test_online_provider_capture_uses_docker_archive_for_unmounted_path(self):
+    self.owner.container = _FakeDockerArchiveContainer({
+      "/tmp/generated.txt": _tar_bytes("generated.txt", b"from-container"),
+    })
+    request = SyncRequest(
+      archive_paths=["/tmp/generated.txt"],
+      metadata={"epoch": 2},
+      runtime=SyncRuntimePolicy(provider_capture=PROVIDER_CAPTURE_ONLINE),
+    )
+
+    ok = self.sm.publish_snapshot(request)
+
+    self.assertTrue(ok)
+    self.assertEqual(self.owner.container.get_archive_calls, ["/tmp/generated.txt"])
+    record = self.owner._cs.hset_calls[0][2]
+    self.assertEqual(record["manifest"]["archive_paths"], ["/tmp/generated.txt"])
+    self.assertEqual(record["manifest"]["runtime"]["provider_capture"], "online")
+
+    stored_tar = self.owner._r1fs.added[record["cid"]]
+    tar_path = self.tmpdir / "online.tar.gz"
+    tar_path.write_bytes(stored_tar)
+    with tarfile.open(tar_path, "r:gz") as tar:
+      member = tar.getmember("tmp/generated.txt")
+      self.assertEqual(tar.extractfile(member).read(), b"from-container")
 
   def test_clears_existing_invalid_on_success(self):
     (self.vsd / "request.json.invalid").write_text('{"old": true}')

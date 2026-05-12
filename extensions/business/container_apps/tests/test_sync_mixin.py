@@ -24,9 +24,11 @@ from extensions.business.container_apps.sync import (
   volume_sync_dir,
 )
 from extensions.business.container_apps.tests.test_sync_manager import (
+  _FakeDockerArchiveContainer,
   _FakeChainStore,
   _FakeR1FS,
   _make_owner,
+  _tar_bytes,
 )
 
 
@@ -319,6 +321,22 @@ class TestProviderTick(unittest.TestCase):
     self.assertEqual(self.plugin.runtime_stop_calls, 1)
     self.assertEqual(self.plugin.fixed_volume_cleanup_calls, 0)
     self.assertEqual(self.plugin.lifecycle_log, ["stop", "start", "reset"])
+
+  def test_online_provider_capture_skips_runtime_stop(self):
+    self.plugin.container = _FakeDockerArchiveContainer({
+      "/tmp/generated.txt": _tar_bytes("generated.txt", b"from-container"),
+    })
+    self._write_request({
+      "archive_paths": ["/tmp/generated.txt"],
+      "runtime": {"provider_capture": "online"},
+    })
+
+    self.plugin._sync_provider_tick(current_time=1000.0)
+
+    self.assertEqual(self.plugin.runtime_stop_calls, 0)
+    self.assertEqual(self.plugin.lifecycle_log, ["start", "reset"])
+    response = json.loads((self.vsd / "response.json").read_text())
+    self.assertEqual(response["status"], "ok")
 
   def test_validation_failure_does_not_stop_container(self):
     # claim_request fails fast; no need to disturb the container.

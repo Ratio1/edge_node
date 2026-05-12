@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import copy
 import tarfile
 import tempfile
 import time as _time
@@ -577,12 +578,78 @@ class SyncManager:
       runtime=runtime,
     )
 
-  def make_archive(self, archive_paths: list[str]) -> tuple[str, int]:
+  @staticmethod
+  def _docker_member_arcname(container_path: str, docker_name: str, member_name: str) -> str:
+    target = os.path.normpath(container_path).rstrip("/")
+    base = (docker_name or os.path.basename(target)).strip("/")
+    raw = member_name.strip("/")
+
+    if base and raw == base:
+      return target.lstrip("/")
+    if base and raw.startswith(base + "/"):
+      suffix = raw[len(base) + 1:]
+      return f"{target}/{suffix}".lstrip("/")
+    return f"{target}/{raw}".lstrip("/")
+
+  def _append_docker_archive_path(self, tar: tarfile.TarFile, container_path: str) -> None:
+    container = getattr(self.owner, "container", None)
+    if container is None:
+      raise RuntimeError("online provider capture requires a running container")
+
+    self._validate_container_path_shape(container_path)
+    bits, stat = container.get_archive(container_path)
+
+    output_dir = Path(tempfile.gettempdir())
+    get_output = getattr(self.owner, "get_output_folder", None)
+    if callable(get_output):
+      output_dir = Path(get_output())
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fd, tmp_name = tempfile.mkstemp(
+      dir=str(output_dir),
+      prefix="sync_docker_archive_",
+      suffix=".tar",
+    )
+    try:
+      with os.fdopen(fd, "wb") as handle:
+        if isinstance(bits, (bytes, bytearray)):
+          handle.write(bits)
+        else:
+          for chunk in bits:
+            handle.write(chunk)
+
+      docker_name = (stat or {}).get("name") or os.path.basename(
+        os.path.normpath(container_path)
+      )
+      with tarfile.open(tmp_name, "r:*") as src:
+        for member in src.getmembers():
+          if any(part == ".." for part in member.name.split("/")):
+            raise ValueError(f"docker archive member name contains '..': {member.name!r}")
+          new_member = copy.copy(member)
+          new_member.name = self._docker_member_arcname(
+            container_path, docker_name, member.name
+          )
+          fileobj = src.extractfile(member) if member.isfile() else None
+          tar.addfile(new_member, fileobj)
+    finally:
+      try:
+        os.unlink(tmp_name)
+      except OSError:
+        pass
+    return
+
+  def make_archive(
+    self,
+    archive_paths: list[str],
+    provider_capture: str = PROVIDER_CAPTURE_OFFLINE,
+  ) -> tuple[str, int]:
     """Build the snapshot tar.gz under the plugin output folder.
 
     Tar member names are the **container paths** (so consumers can reverse-
     resolve via their own self.volumes). Returns ``(tar_path, size_bytes)``.
-    Re-runs ``resolve_container_path`` for each entry as defence in depth.
+    Offline capture re-runs ``resolve_container_path`` for each entry as
+    defence in depth. Online capture uses Docker's archive API against the
+    running container, allowing non-mounted provider paths.
     """
     output_dir: Path
     get_output = getattr(self.owner, "get_output_folder", None)
@@ -597,12 +664,15 @@ class SyncManager:
 
     with tarfile.open(str(tar_path), "w:gz") as tar:
       for container_path in archive_paths:
-        host_path, _bind, _host_root = self.resolve_container_path(container_path)
-        if not os.path.exists(host_path):
-          raise FileNotFoundError(
-            f"archive_paths target does not exist on host: {container_path!r} -> {host_path!r}"
-          )
-        tar.add(host_path, arcname=container_path, recursive=True)
+        if provider_capture == PROVIDER_CAPTURE_ONLINE:
+          self._append_docker_archive_path(tar, container_path)
+        else:
+          host_path, _bind, _host_root = self.resolve_container_path(container_path)
+          if not os.path.exists(host_path):
+            raise FileNotFoundError(
+              f"archive_paths target does not exist on host: {container_path!r} -> {host_path!r}"
+            )
+          tar.add(host_path, arcname=container_path, recursive=True)
 
     return str(tar_path), os.path.getsize(str(tar_path))
 
@@ -646,7 +716,10 @@ class SyncManager:
     try:
       # ---- Stage: archive_build
       try:
-        tar_path, size_bytes = self.make_archive(archive_paths)
+        tar_path, size_bytes = self.make_archive(
+          archive_paths,
+          provider_capture=sync_request.runtime.provider_capture,
+        )
       except Exception as exc:
         self._fail_request(request_body, STAGE_ARCHIVE_BUILD, str(exc), proc_path)
         return False
