@@ -323,6 +323,20 @@ _CONFIG = {
     "KEY": None,                  # shared UUID across the sync set (provider+consumer)
     "TYPE": None,                 # "provider" | "consumer"
     "POLL_INTERVAL": 10,          # seconds between sync ticks
+    "HSYNC_POLL_INTERVAL": 600,   # seconds between chainstore_hsync refreshes
+                                  # (consumer only; provider only calls hset, never hsync).
+                                  # Clamped to min 300s, default 600s. The cheap local-
+                                  # replica hget still runs on every tick — only the
+                                  # network round-trip is rate-limited here.
+                                  #
+                                  # DEBUG/DEVELOPMENT ONLY — to be removed.
+                                  # This knob exists temporarily so we can dial down the
+                                  # hsync network burn while the ChainStore peer mesh and
+                                  # SYNC propagation behavior are still being tuned on
+                                  # devnet. Once propagation is reliable, the hsync
+                                  # cadence should be a fixed internal default and this
+                                  # operator-tunable field should be deleted from the
+                                  # SYNC config block.
   },
 
   # Health check configuration (consolidated)

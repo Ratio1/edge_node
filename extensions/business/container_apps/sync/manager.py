@@ -118,8 +118,16 @@ class SyncManager:
     - ee_id                                      (BasePlugin — node identity)
   """
 
+  # Fallback used by fetch_latest when the owner doesn't expose
+  # cfg_sync_hsync_poll_interval (e.g. test fixtures or older configs).
+  # Mirrors _SyncMixin._HSYNC_POLL_INTERVAL_DEFAULT.
+  _DEFAULT_HSYNC_POLL_INTERVAL = 600.0
+
   def __init__(self, owner):
     self.owner = owner
+    # Timestamp (owner.time() units) of the last hsync attempt. Initial 0
+    # guarantees the first ``fetch_latest`` call still hsyncs.
+    self._last_hsync = 0.0
 
   # ----- path resolution -------------------------------------------------
   def resolve_container_path(self, container_path: str) -> tuple[str, str, str]:
@@ -631,19 +639,44 @@ class SyncManager:
 
   # ----- consumer --------------------------------------------------------
   def fetch_latest(self) -> Optional[dict]:
-    """``chainstore_hsync`` then ``chainstore_hget`` for the configured KEY.
+    """Refresh the local CHAINSTORE_SYNC replica (gated by HSYNC_POLL_INTERVAL),
+    then read the configured KEY.
 
-    ``chainstore_hsync`` failure is non-fatal — we log and still try the
-    local-replica ``hget``, so a temporarily-unreachable peer does not stop
-    a consumer that already has the record cached.
+    The ``hsync`` is the expensive bit — a network round-trip to the chain
+    cluster with a 10s timeout. It used to fire on every consumer tick
+    (every ``SYNC.POLL_INTERVAL`` seconds, default 10s); now it fires at
+    most every ``SYNC.HSYNC_POLL_INTERVAL`` seconds (default 600s, min
+    300s). The cheap local-replica ``hget`` runs on every call regardless,
+    so a consumer that already has the record cached keeps reading it
+    without paying the network cost.
+
+    On ``hsync`` failure we still advance ``_last_hsync`` so we don't
+    hammer the cluster every tick while peers are unreachable; the next
+    attempt waits the full interval. The ``hget`` fall-through means
+    temporary peer flakiness doesn't break consumers that have a cached
+    record.
+
+    .. note::
+       DEBUG/DEVELOPMENT ONLY — to be removed. The HSYNC_POLL_INTERVAL
+       operator knob is temporary; once ChainStore propagation is reliable
+       the cadence should become a fixed internal default and the SYNC
+       config field should be deleted.
     """
     sync_key = getattr(self.owner, "cfg_sync_key", None)
     if not sync_key:
       return None
-    try:
-      self.owner.chainstore_hsync(hkey=CHAINSTORE_SYNC_HKEY)
-    except Exception as exc:
-      self.owner.P(f"[sync] chainstore_hsync error: {exc}", color="y")
+
+    interval = getattr(
+      self.owner, "cfg_sync_hsync_poll_interval", self._DEFAULT_HSYNC_POLL_INTERVAL,
+    )
+    now = self.owner.time()
+    if now - self._last_hsync >= interval:
+      self._last_hsync = now
+      try:
+        self.owner.chainstore_hsync(hkey=CHAINSTORE_SYNC_HKEY)
+      except Exception as exc:
+        self.owner.P(f"[sync] chainstore_hsync error: {exc}", color="y")
+
     try:
       return self.owner.chainstore_hget(
         hkey=CHAINSTORE_SYNC_HKEY, key=sync_key

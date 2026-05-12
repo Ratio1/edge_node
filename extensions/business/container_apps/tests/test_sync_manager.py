@@ -81,6 +81,7 @@ class _FakeChainStore:
     self.hset_calls: list[tuple[str, str, object]] = []
     self.hsync_calls: list[str] = []
     self.hset_should_raise: Exception | None = None
+    self.hsync_should_raise: Exception | None = None
     self.hset_returns: bool = True
 
   def hset(self, hkey, key, value, **_kwargs):
@@ -95,6 +96,8 @@ class _FakeChainStore:
 
   def hsync(self, hkey, **_kwargs):
     self.hsync_calls.append(hkey)
+    if self.hsync_should_raise:
+      raise self.hsync_should_raise
     return None
 
 
@@ -1070,6 +1073,37 @@ class TestConsumerFlow(unittest.TestCase):
   def test_fetch_latest_no_sync_key_returns_none(self):
     self.consumer.cfg_sync_key = None
     self.assertIsNone(self.sm_c.fetch_latest())
+
+  def test_hsync_gated_by_interval_skips_within_window(self):
+    """The expensive chainstore_hsync is rate-limited; a second fetch_latest
+    inside the configured HSYNC_POLL_INTERVAL window only does the cheap
+    local hget, leaving hsync_calls at one entry."""
+    self.consumer.cfg_sync_hsync_poll_interval = 600.0
+    self.sm_c.fetch_latest()
+    self.sm_c.fetch_latest()  # ~1s later (mock clock increments per time() call)
+    self.assertEqual(self.consumer._cs.hsync_calls, ["CHAINSTORE_SYNC"])
+
+  def test_hsync_fires_again_after_interval_elapses(self):
+    """Once HSYNC_POLL_INTERVAL has elapsed since the last hsync, the next
+    fetch_latest does a fresh network round-trip."""
+    self.consumer.cfg_sync_hsync_poll_interval = 600.0
+    self.sm_c.fetch_latest()
+    # Back-date the last-hsync stamp so the next call falls outside the
+    # window without having to actually wait 600s.
+    self.sm_c._last_hsync = self.sm_c._last_hsync - 700.0
+    self.sm_c.fetch_latest()
+    self.assertEqual(self.consumer._cs.hsync_calls, ["CHAINSTORE_SYNC", "CHAINSTORE_SYNC"])
+
+  def test_hsync_failure_still_advances_timestamp(self):
+    """A timing-out / failing hsync must still advance _last_hsync — otherwise
+    the consumer would retry every tick while peers are down, defeating the
+    rate-limit and burning the 10s timeout repeatedly. The hget fall-through
+    means stale-but-cached records can still surface during outages."""
+    self.consumer.cfg_sync_hsync_poll_interval = 600.0
+    self.consumer._cs.hsync_should_raise = RuntimeError("offline")
+    self.sm_c.fetch_latest()           # hsync raises (caught), timestamp advances
+    self.sm_c.fetch_latest()           # within window → skip hsync entirely
+    self.assertEqual(self.consumer._cs.hsync_calls, ["CHAINSTORE_SYNC"])
 
   # ----- apply_snapshot -----------------------------------------------------
 

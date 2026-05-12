@@ -128,6 +128,34 @@ class TestConfigHelpers(unittest.TestCase):
     owner.cfg_sync["POLL_INTERVAL"] = "nope"
     self.assertEqual(plugin._sync_poll_interval(), 10.0)
 
+  def test_hsync_poll_interval_default(self):
+    """When SYNC.HSYNC_POLL_INTERVAL is unset, ``_hsync_poll_interval``
+    returns the 600s default (10 min) so consumers don't go to the
+    network for fresh chain replicas more than once per default window.
+    """
+    plugin, owner = _make_plugin(self.tmpdir)
+    # Make sure the field really is absent on the test fixture.
+    owner.cfg_sync.pop("HSYNC_POLL_INTERVAL", None)
+    self.assertEqual(plugin._hsync_poll_interval(), 600.0)
+    # Same value surfaces via the SyncManager-facing property.
+    self.assertEqual(plugin.cfg_sync_hsync_poll_interval, 600.0)
+
+  def test_hsync_poll_interval_floor(self):
+    """Values below the 300s minimum are clamped up — the floor protects
+    the cluster from operators who set the knob aggressively low without
+    realising the network cost."""
+    plugin, owner = _make_plugin(self.tmpdir)
+    owner.cfg_sync["HSYNC_POLL_INTERVAL"] = 60
+    self.assertEqual(plugin._hsync_poll_interval(), 300.0)
+
+  def test_hsync_poll_interval_invalid_falls_back(self):
+    """Non-numeric values fall back to the default (not the floor) — same
+    pattern as ``_sync_poll_interval`` so misconfiguration is forgiving
+    but conservative."""
+    plugin, owner = _make_plugin(self.tmpdir)
+    owner.cfg_sync["HSYNC_POLL_INTERVAL"] = "nope"
+    self.assertEqual(plugin._hsync_poll_interval(), 600.0)
+
 
 # ---------------------------------------------------------------------------
 # Env-var injection

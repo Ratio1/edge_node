@@ -223,6 +223,34 @@ class _SyncMixin:
     except (TypeError, ValueError):
       return 10.0
 
+  # ----- hsync interval (consumer only) ----------------------------------
+  # Decoupled from POLL_INTERVAL: every consumer tick still does the cheap
+  # chainstore_hget against the local replica, but the expensive network
+  # hsync is gated by this interval. Provider does not call hsync.
+  _HSYNC_POLL_INTERVAL_MIN = 300.0
+  _HSYNC_POLL_INTERVAL_DEFAULT = 600.0
+
+  def _hsync_poll_interval(self) -> float:
+    """Seconds between chainstore_hsync refreshes on the consumer side.
+
+    Min 300s, default 600s. Non-numeric values fall back to the default;
+    values below the min are clamped up.
+
+    .. note::
+       DEBUG/DEVELOPMENT ONLY — to be removed. The HSYNC_POLL_INTERVAL
+       config field exists temporarily so we can dial down the hsync
+       network burn while ChainStore propagation is still being tuned on
+       devnet. Once propagation is reliable, this should become a fixed
+       internal default and the operator-tunable field should be deleted
+       from the SYNC config block.
+    """
+    raw = self._sync_cfg().get("HSYNC_POLL_INTERVAL", self._HSYNC_POLL_INTERVAL_DEFAULT)
+    try:
+      v = float(raw)
+    except (TypeError, ValueError):
+      return self._HSYNC_POLL_INTERVAL_DEFAULT
+    return max(self._HSYNC_POLL_INTERVAL_MIN, v)
+
   # convenience for SyncManager (it reads owner.cfg_sync_key)
   @property
   def cfg_sync_key(self):
@@ -231,6 +259,14 @@ class _SyncMixin:
   @property
   def cfg_sync_type(self):
     return self._sync_cfg().get("TYPE")
+
+  @property
+  def cfg_sync_hsync_poll_interval(self) -> float:
+    """Mirror of ``_hsync_poll_interval()`` accessible by ``SyncManager``
+    via ``owner.cfg_sync_hsync_poll_interval`` (same convention as
+    ``cfg_sync_key`` / ``cfg_sync_type``).
+    """
+    return self._hsync_poll_interval()
 
   # ----- manager handle ---------------------------------------------------
 
