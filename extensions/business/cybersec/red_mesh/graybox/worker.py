@@ -200,6 +200,15 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "scenarios_inconclusive": scenario_stats["inconclusive"],
       "scenarios_error": scenario_stats["error"],
     })
+    # OWASP API Top 10 — Subphase 1.7. Per-scan request budget snapshot
+    # surfaces in scan_metrics so operators can see whether the scan was
+    # budget-bound (and tune target_config.api_security.max_total_requests
+    # accordingly).
+    if self.request_budget is not None:
+      snap = self.request_budget.snapshot()
+      metrics["budget_total"] = snap["total"]
+      metrics["budget_remaining"] = snap["remaining"]
+      metrics["budget_exhausted_count"] = snap["exhausted_count"]
     status["scan_metrics"] = metrics
     status["scenario_stats"] = scenario_stats
 
