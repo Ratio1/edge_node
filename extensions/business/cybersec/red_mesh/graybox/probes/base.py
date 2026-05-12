@@ -76,6 +76,115 @@ class ProbeBase:
       outcome=outcome,
     )
 
+  # ── Stateful probe contract (Subphase 1.8) ──────────────────────────
+  #
+  # Every mutating check must implement: baseline → mutate → verify
+  # → revert → cleanup-evidence. `StatefulProbeMixin.run_stateful`
+  # orchestrates the four steps and the helper below builds the matching
+  # finding. The lint test in test_stateful_contract.py asserts that no
+  # stateful probe bypasses this path.
+  STATEFUL_PROBE_LINT_MARKER = "uses_run_stateful"
+
+  def run_stateful(self, scenario_id, *, baseline_fn, mutate_fn,
+                    verify_fn, revert_fn, finding_kwargs=None,
+                    skip_reason_no_revert="no_revert_path_configured"):
+    """Run a four-step stateful check.
+
+    Steps:
+      1. baseline_fn() -> baseline state (any pickle-safe value).
+      2. mutate_fn(baseline) -> True if the mutation appeared to land.
+      3. verify_fn(baseline) -> True if state actually changed
+         (i.e. the vulnerability is confirmed).
+      4. revert_fn(baseline) -> True if the revert succeeded.
+
+    Emits one GrayboxFinding via emit_vulnerable / emit_clean with the
+    `rollback_status` field populated on the finding. If the probe is
+    not gated on `allow_stateful=True`, emits inconclusive
+    (`stateful_probes_disabled`). If `revert_fn` is None, emits
+    inconclusive (`no_revert_path_configured` by default).
+
+    `finding_kwargs` supplies the title/severity/owasp/etc. for the
+    vulnerable case. The clean case reuses ``title`` and ``owasp``.
+    """
+    finding_kwargs = dict(finding_kwargs or {})
+    title = finding_kwargs.pop("title", scenario_id)
+    owasp = finding_kwargs.pop("owasp", "")
+
+    if not self._allow_stateful:
+      self.emit_inconclusive(scenario_id, title, owasp,
+                              "stateful_probes_disabled")
+      return False
+    if revert_fn is None:
+      self.emit_inconclusive(scenario_id, title, owasp, skip_reason_no_revert)
+      return False
+
+    # 1. Baseline.
+    try:
+      baseline = baseline_fn()
+    except Exception as exc:
+      self.emit_inconclusive(
+        scenario_id, title, owasp,
+        f"baseline_failed:{self.safety.sanitize_error(str(exc))}",
+      )
+      return False
+
+    # 2. Mutate.
+    mutated = False
+    try:
+      mutated = bool(mutate_fn(baseline))
+    except Exception as exc:
+      self.emit_inconclusive(
+        scenario_id, title, owasp,
+        f"mutate_failed:{self.safety.sanitize_error(str(exc))}",
+      )
+      return False
+
+    # 3. Verify.
+    confirmed = False
+    if mutated:
+      try:
+        confirmed = bool(verify_fn(baseline))
+      except Exception:
+        confirmed = False
+
+    # 4. Revert (always attempt — even if not confirmed, the mutate may
+    #    have left the target in an unintended state).
+    rollback_status = "no_revert_needed" if not mutated else "revert_failed"
+    if mutated:
+      try:
+        if revert_fn(baseline):
+          rollback_status = "reverted"
+      except Exception:
+        rollback_status = "revert_failed"
+
+    # 5. Emit. Confirmed = vulnerable; otherwise clean.
+    if confirmed:
+      severity = finding_kwargs.pop("severity", "HIGH")
+      # Severity bump on revert failure: HIGH→CRITICAL, MEDIUM→HIGH.
+      if rollback_status == "revert_failed":
+        severity = {"HIGH": "CRITICAL", "MEDIUM": "HIGH"}.get(severity, severity)
+      cwe = finding_kwargs.pop("cwe", [])
+      evidence = list(finding_kwargs.pop("evidence", []))
+      evidence.append(f"rollback_status={rollback_status}")
+      remediation = finding_kwargs.pop("remediation", "")
+      if rollback_status == "revert_failed":
+        remediation = (
+          (remediation + " ").strip()
+          + " Manual cleanup required — see Replay Steps."
+        )
+      self.emit_vulnerable(
+        scenario_id, title, severity, owasp, cwe, evidence,
+        remediation=remediation,
+        **finding_kwargs,
+      )
+      return True
+    else:
+      self.emit_clean(
+        scenario_id, title, owasp,
+        [f"rollback_status={rollback_status}"],
+      )
+      return False
+
   def budget(self, n: int = 1) -> bool:
     """Consume ``n`` requests from the shared per-scan RequestBudget.
 
