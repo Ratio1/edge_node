@@ -309,6 +309,37 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(len(plugin.chainstore_hset_calls), 2)
     self.assertEqual(plugin.chainstore_hset_calls[-1]["value"]["updated_at"], 1000.0)
 
+  def test_failed_unchanged_capacity_refresh_retries_after_announce_period(self):
+    plugin = self._make_plugin(
+      REQUEST_BALANCING_ANNOUNCE_PERIOD=60,
+      REQUEST_BALANCING_CAPACITY_REFRESH_PERIOD=300,
+      REQUEST_BALANCING_CAPACITY_REFRESH_JITTER_SECONDS=0,
+      REQUEST_BALANCING_CAPACITY_WARN_PERIOD=0,
+      NOW=100.0,
+    )
+
+    self.assertEqual(len(plugin.chainstore_hset_calls), 1)
+
+    plugin.chainstore_hset_result = False
+    plugin._now = 400.0  # pylint: disable=protected-access
+    plugin._publish_capacity_record()  # pylint: disable=protected-access
+
+    self.assertEqual(len(plugin.chainstore_hset_calls), 2)
+    self.assertFalse(plugin._last_capacity_publish_ok)  # pylint: disable=protected-access
+
+    plugin._now = 459.0  # pylint: disable=protected-access
+    plugin._publish_capacity_record()  # pylint: disable=protected-access
+
+    self.assertEqual(len(plugin.chainstore_hset_calls), 2)
+
+    plugin.chainstore_hset_result = True
+    plugin._now = 460.0  # pylint: disable=protected-access
+    plugin._publish_capacity_record()  # pylint: disable=protected-access
+
+    self.assertEqual(len(plugin.chainstore_hset_calls), 3)
+    self.assertEqual(plugin.chainstore_hset_calls[-1]["value"]["updated_at"], 460.0)
+    self.assertTrue(plugin._last_capacity_publish_ok)  # pylint: disable=protected-access
+
   def test_capacity_publish_can_disable_unchanged_refresh(self):
     plugin = self._make_plugin(
       REQUEST_BALANCING_CAPACITY_REFRESH_PERIOD=0,
@@ -343,9 +374,25 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(plugin.chainstore_hset_calls[-1]["value"]["capacity_used"], 1)
     self.assertEqual(plugin.chainstore_hset_calls[-1]["value"]["capacity_free"], 1)
 
-  def test_reserve_release_burst_does_not_republish_same_capacity(self):
+  def test_full_capacity_transition_publishes_immediately_without_debounce(self):
     plugin = self._make_plugin(
       REQUEST_BALANCING_CAPACITY=1,
+      REQUEST_BALANCING_CAPACITY_DEBOUNCE_SECONDS=10,
+      REQUEST_BALANCING_CAPACITY_REFRESH_PERIOD=900,
+      REQUEST_BALANCING_CAPACITY_REFRESH_JITTER_SECONDS=0,
+      NOW=100.0,
+    )
+
+    plugin._now = 101.0  # pylint: disable=protected-access
+    self.assertTrue(plugin._reserve_execution_slot("req-1"))  # pylint: disable=protected-access
+
+    self.assertEqual(len(plugin.chainstore_hset_calls), 2)
+    self.assertEqual(plugin.chainstore_hset_calls[-1]["value"]["capacity_free"], 0)
+    self.assertFalse(plugin.chainstore_hset_calls[-1]["value"]["accepting_requests"])
+
+  def test_reserve_release_burst_does_not_republish_non_urgent_capacity(self):
+    plugin = self._make_plugin(
+      REQUEST_BALANCING_CAPACITY=2,
       REQUEST_BALANCING_CAPACITY_DEBOUNCE_SECONDS=10,
       REQUEST_BALANCING_CAPACITY_REFRESH_PERIOD=900,
       REQUEST_BALANCING_CAPACITY_REFRESH_JITTER_SECONDS=0,

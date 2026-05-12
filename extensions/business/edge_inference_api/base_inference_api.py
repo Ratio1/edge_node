@@ -231,6 +231,7 @@ class BaseInferenceApiPlugin(
     self._last_capacity_warn = 0.0
     self._last_capacity_publish_ok = False
     self._last_capacity_publish_snapshot = None
+    self._last_capacity_publish_attempt_snapshot = None
     self._last_balancing_mailbox_poll = 0.0
     self.load_persistence_data()
     tunneling_str = f"(with tunneling enabled)" if self.cfg_tunnel_engine_enabled else ""
@@ -773,15 +774,43 @@ class BaseInferenceApiPlugin(
         return True
       return (now_ts - self._last_capacity_announce) >= self._get_capacity_announce_period()
 
-    if snapshot != last_snapshot:
-      if not self._last_capacity_publish_ok:
+    if self._is_capacity_snapshot_urgent_deterioration(snapshot=snapshot, last_snapshot=last_snapshot):
+      if (
+        not self._last_capacity_publish_ok and
+        self._last_capacity_publish_attempt_snapshot == snapshot
+      ):
         return (now_ts - self._last_capacity_announce) >= self._get_capacity_announce_period()
+      return True
+
+    if not self._last_capacity_publish_ok:
+      return (now_ts - self._last_capacity_announce) >= self._get_capacity_announce_period()
+
+    if snapshot != last_snapshot:
       return (now_ts - self._last_capacity_announce) >= self._get_capacity_debounce_seconds()
 
     refresh_period = self._get_capacity_refresh_due_seconds()
     if refresh_period <= 0:
       return False
     return (now_ts - self._last_capacity_announce) >= refresh_period
+
+  def _is_capacity_snapshot_urgent_deterioration(self, snapshot, last_snapshot):
+    """Return whether peers must stop treating this instance as available.
+
+    Capacity improvements and noisy count changes can be debounced. A transition
+    to no available execution capacity must publish immediately so peers do not
+    keep delegating to an executor that can no longer reserve work.
+    """
+    if not isinstance(snapshot, dict) or not isinstance(last_snapshot, dict):
+      return False
+    accepting_was_true = bool(last_snapshot.get('accepting_requests'))
+    accepting_is_false = not bool(snapshot.get('accepting_requests'))
+    if accepting_was_true and accepting_is_false:
+      return True
+    last_free = last_snapshot.get('capacity_free')
+    current_free = snapshot.get('capacity_free')
+    if isinstance(last_free, (int, float)) and isinstance(current_free, (int, float)):
+      return last_free > 0 and current_free <= 0
+    return False
 
   def _publish_capacity_record(self, force=False):
     """Publish local capacity as advisory soft-state.
@@ -822,6 +851,9 @@ class BaseInferenceApiPlugin(
       max_retries=self._get_capacity_cstore_max_retries(),
     )
     self._last_capacity_announce = now_ts
+    self._last_capacity_publish_attempt_snapshot = {
+      **snapshot,
+    }
     self._last_capacity_publish_ok = bool(ok)
     if ok:
       self._last_capacity_publish_snapshot = {
