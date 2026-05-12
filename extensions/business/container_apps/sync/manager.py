@@ -27,6 +27,10 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+from extensions.business.container_apps.container_utils import (
+  CONTAINER_VOLUMES_PATH,
+)
+
 from .constants import (
   ARCHIVE_FORMAT,
   CHAINSTORE_SYNC_HKEY,
@@ -122,9 +126,12 @@ class SyncManager:
     """Map an app-perspective absolute path to a host path via owner.volumes.
 
     Enforces the six-rule check from the plan:
-      1. absolute, 2. covered by a mount, 3. fixed-size mount,
-      4. not inside the system volume, 5. no ``..`` after normalization,
-      6. resolved host path stays within its host_root.
+      1. absolute, 2. covered by a mount, 3. backed by a volume-managed
+      mount (fixed-size OR legacy VOLUMES — both are per-instance host
+      directories under known roots; anonymous Docker mounts and ephemeral
+      container fs are still rejected), 4. not inside the system volume,
+      5. no ``..`` after normalization, 6. resolved host path stays within
+      its host_root.
 
     Returns ``(host_path, bind_root, host_root)`` on success, raises
     ``ValueError`` on any rule violation.
@@ -148,7 +155,17 @@ class SyncManager:
         f"refusing to archive system volume content (anti-recursion): {container_path!r}"
       )
 
+    # Rule 3 allow-list — both eligible roots are bounded, per-instance, and
+    # inside the edge node's data root:
+    #   - fixed_volumes/mounts/ : FIXED_SIZE_VOLUMES (ext4 loopbacks)
+    #   - CONTAINER_VOLUMES_PATH : legacy VOLUMES (raw bind dirs, deprecated
+    #     but still in use by some pipelines). These are functionally
+    #     equivalent for sync purposes: a per-instance host directory
+    #     identified by a known parent root.
+    # Anonymous Docker mounts, FILE_VOLUMES (content-injected single files),
+    # and ephemeral container fs all sit outside both roots and are rejected.
     fixed_root_marker = os.sep + os.path.join("fixed_volumes", "mounts") + os.sep
+    legacy_root_marker = os.path.normpath(CONTAINER_VOLUMES_PATH) + os.sep
 
     # Collect every mount whose bind prefix covers cp, then pick the longest.
     # Docker overlays the more specific mount on top of the broader one inside
@@ -175,13 +192,20 @@ class SyncManager:
 
     host_root, bind = max(matches, key=lambda hb: len(hb[1]))
     host_root_n = os.path.normpath(host_root)
-    # Rule 3: only fixed-size volumes are eligible. Their host root sits
-    # under <plugin_data>/fixed_volumes/mounts/. This rejects VOLUMES,
-    # FILE_VOLUMES, anonymous Docker mounts, and ephemeral container fs.
-    if fixed_root_marker not in (host_root_n + os.sep):
+    # Rule 3: the winning mount's host root must fall under a known
+    # volume-managed root (fixed-size or legacy VOLUMES). See the allow-list
+    # construction above for the rationale and the list of rejected cases.
+    host_root_with_sep = host_root_n + os.sep
+    if not (
+      fixed_root_marker in host_root_with_sep
+      or host_root_with_sep.startswith(legacy_root_marker)
+    ):
       raise ValueError(
-        f"refusing non-fixed-size mount for {container_path!r}: "
-        f"host_root={host_root_n!r} (only FIXED_SIZE_VOLUMES-backed paths allowed)"
+        f"refusing non-volume-backed mount for {container_path!r}: "
+        f"host_root={host_root_n!r} (only FIXED_SIZE_VOLUMES or legacy "
+        f"VOLUMES paths allowed; expected host root under "
+        f"{fixed_root_marker.strip(os.sep)!r} or "
+        f"{CONTAINER_VOLUMES_PATH!r})"
       )
 
     rel = "" if cp == bind else os.path.relpath(cp, bind)

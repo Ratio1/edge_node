@@ -189,8 +189,15 @@ class TestResolveContainerPath(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "no mounted volume covers"):
       self.sm.resolve_container_path("/nope/")
 
-  def test_rejects_non_fixed_size(self):
-    with self.assertRaisesRegex(ValueError, "non-fixed-size mount"):
+  def test_rejects_anonymous_mount(self):
+    """Rule 3 admits FIXED_SIZE_VOLUMES and legacy VOLUMES (both per-instance
+    host directories under known roots). Mounts that aren't under either —
+    anonymous Docker mounts, FILE_VOLUMES content files, ephemeral container
+    fs — are still rejected. The fixture's ``/app/legacy`` mount is bound at
+    ``tmpdir/tmpfs_legacy`` (outside both allow-listed roots) so it stands in
+    for the "anonymous mount" case here.
+    """
+    with self.assertRaisesRegex(ValueError, "non-volume-backed mount"):
       self.sm.resolve_container_path("/app/legacy/x")
 
   def test_rejects_system_volume(self):
@@ -257,6 +264,40 @@ class TestResolveContainerPath(unittest.TestCase):
     host, bind, _ = self.sm.resolve_container_path("/app/other.bin")
     self.assertTrue(host.endswith("fixed_volumes/mounts/outer_app/other.bin"))
     self.assertEqual(bind, "/app")
+
+  def test_legacy_volumes_resolves_to_host_root(self):
+    """Rule 3 admits legacy VOLUMES. Their host roots live under
+    CONTAINER_VOLUMES_PATH (/edge_node/_local_cache/_data/container_volumes/),
+    which is per-instance and bounded — functionally equivalent to
+    fixed-size for sync purposes. Plan: extend-sync-to-legacy-VOLUMES.
+    """
+    from extensions.business.container_apps.container_utils import (
+      CONTAINER_VOLUMES_PATH,
+    )
+    # Place a fake legacy host root and bind it into the volumes dict.
+    # We can't use the real CONTAINER_VOLUMES_PATH on a CI host without root,
+    # so monkeypatch it (constants_in_path comparison normalizes the value).
+    legacy_root = Path(self.tmpdir) / "edge_node" / "_local_cache" / "_data" / "container_volumes"
+    instance_dir = legacy_root / "test_instance_appdata"
+    instance_dir.mkdir(parents=True)
+
+    self.owner.volumes = {
+      str(instance_dir): {"bind": "/app/data", "mode": "rw"},
+    }
+
+    # Patch CONTAINER_VOLUMES_PATH on the manager module so the resolver
+    # accepts our temp legacy root for the duration of the test.
+    import extensions.business.container_apps.sync.manager as manager_mod
+    original = manager_mod.CONTAINER_VOLUMES_PATH
+    manager_mod.CONTAINER_VOLUMES_PATH = str(legacy_root)
+    try:
+      host, bind, host_root = self.sm.resolve_container_path("/app/data/foo.bin")
+    finally:
+      manager_mod.CONTAINER_VOLUMES_PATH = original
+
+    self.assertTrue(host.endswith("test_instance_appdata/foo.bin"))
+    self.assertEqual(bind, "/app/data")
+    self.assertEqual(host_root, str(instance_dir))
 
 
 # ---------------------------------------------------------------------------
@@ -489,10 +530,15 @@ class TestClaimRequest(unittest.TestCase):
     self.assertIn("no mounted volume covers",
                   self._read_invalid()["_error"]["error"])
 
-  def test_non_fixed_size_rejected(self):
+  def test_anonymous_mount_rejected(self):
+    """The fixture's ``/app/legacy`` mount is bound at ``tmpdir/tmpfs_legacy``
+    (outside both allow-listed roots), standing in for an anonymous Docker
+    mount or ephemeral fs. claim_request must surface a clear error so the
+    app sees ``request.json.invalid`` instead of a silent stall.
+    """
     self._write_request({"archive_paths": ["/app/legacy/x"]})
     self.assertIsNone(self.sm.claim_request())
-    self.assertIn("non-fixed-size mount",
+    self.assertIn("non-volume-backed mount",
                   self._read_invalid()["_error"]["error"])
 
   def test_system_volume_rejected(self):
@@ -565,6 +611,99 @@ class TestArchiveRoundtrip(unittest.TestCase):
   def test_make_archive_propagates_validation(self):
     with self.assertRaisesRegex(ValueError, "no mounted volume covers"):
       self.sm_p.make_archive(["/nope/"])
+
+  # ---- legacy VOLUMES round-trip tests ------------------------------------
+  #
+  # Rule 3 admits legacy VOLUMES in addition to FIXED_SIZE_VOLUMES; these
+  # tests prove the round-trip works regardless of which root backs each
+  # side's mount. The fake legacy root lives under tmpdir, and we
+  # monkeypatch ``manager_mod.CONTAINER_VOLUMES_PATH`` to point at it for
+  # the duration of each test so Rule 3 accepts the synthetic location.
+  #
+  # The cross-type cases (legacy ↔ fixed-size) confirm the soft-migration
+  # path: a snapshot can flow from a legacy provider into a fixed-size
+  # consumer (and vice versa) because resolve_container_path keys off the
+  # container path, not the host layout.
+
+  def _patch_legacy_root(self):
+    """Return a legacy root path under tmpdir and patch CONTAINER_VOLUMES_PATH
+    to match. Caller must call self._unpatch_legacy_root() to restore."""
+    import extensions.business.container_apps.sync.manager as manager_mod
+    legacy = self.tmpdir / "edge_node" / "_local_cache" / "_data" / "container_volumes"
+    legacy.mkdir(parents=True, exist_ok=True)
+    self._manager_mod = manager_mod
+    self._legacy_orig = manager_mod.CONTAINER_VOLUMES_PATH
+    manager_mod.CONTAINER_VOLUMES_PATH = str(legacy)
+    return legacy
+
+  def _unpatch_legacy_root(self):
+    self._manager_mod.CONTAINER_VOLUMES_PATH = self._legacy_orig
+
+  def test_round_trip_legacy_volumes_only(self):
+    """Provider + consumer both use legacy VOLUMES at the same container
+    path. Snapshots round-trip byte-for-byte across the legacy root."""
+    legacy = self._patch_legacy_root()
+    try:
+      prov_host = legacy / "provider_inst_appdata"
+      cons_host = legacy / "consumer_inst_appdata"
+      prov_host.mkdir()
+      cons_host.mkdir()
+      (prov_host / "weights.bin").write_bytes(b"legacy-only-payload")
+      (prov_host / "sub").mkdir()
+      (prov_host / "sub" / "n.txt").write_text("nested")
+      self.provider.volumes = {str(prov_host): {"bind": "/app/data", "mode": "rw"}}
+      self.consumer.volumes = {str(cons_host): {"bind": "/app/data", "mode": "rw"}}
+
+      tar_path, _ = self.sm_p.make_archive(["/app/data/"])
+      self.sm_c.extract_archive(tar_path)
+
+      self.assertEqual((cons_host / "weights.bin").read_bytes(), b"legacy-only-payload")
+      self.assertEqual((cons_host / "sub" / "n.txt").read_text(), "nested")
+    finally:
+      self._unpatch_legacy_root()
+
+  def test_round_trip_legacy_to_fixed_size(self):
+    """Provider legacy, consumer fixed-size at the same container path.
+    Proves the soft-migration scenario: a new fixed-size node can absorb
+    state from a legacy node without rebuilding the data on the operator
+    side. Container path is the routing key — host layout differences
+    are invisible to the archive."""
+    legacy = self._patch_legacy_root()
+    try:
+      prov_host = legacy / "provider_inst_appdata"
+      prov_host.mkdir()
+      (prov_host / "weights.bin").write_bytes(b"legacy-to-fixed")
+      self.provider.volumes = {str(prov_host): {"bind": "/app/data", "mode": "rw"}}
+      # Consumer keeps its default fixed-size mount at /app/data
+      # (set up by _make_owner — host root under fixed_volumes/mounts/).
+
+      tar_path, _ = self.sm_p.make_archive(["/app/data/"])
+      self.sm_c.extract_archive(tar_path)
+
+      cons_host = self.consumer._fixed_root / "appdata"
+      self.assertEqual((cons_host / "weights.bin").read_bytes(), b"legacy-to-fixed")
+    finally:
+      self._unpatch_legacy_root()
+
+  def test_round_trip_fixed_size_to_legacy(self):
+    """Symmetric of the above: provider fixed-size, consumer legacy. Same
+    archive, opposite host-layout pairing. Result must be identical —
+    container path drives the routing on both ends."""
+    legacy = self._patch_legacy_root()
+    try:
+      cons_host = legacy / "consumer_inst_appdata"
+      cons_host.mkdir()
+      # Provider's default fixed-size mount at /app/data is already seeded
+      # by setUp (foo.bin = b"hello world\x00\xff").
+      self.consumer.volumes = {str(cons_host): {"bind": "/app/data", "mode": "rw"}}
+
+      tar_path, _ = self.sm_p.make_archive(["/app/data/"])
+      self.sm_c.extract_archive(tar_path)
+
+      self.assertEqual((cons_host / "foo.bin").read_bytes(), b"hello world\x00\xff")
+      self.assertEqual((cons_host / "subdir" / "nested.txt").read_text(), "nested!")
+    finally:
+      self._unpatch_legacy_root()
 
   def test_extract_aborts_on_member_with_no_consumer_mount(self):
     # Build a bespoke tar with a member at /app/missing/ that consumer
