@@ -25,6 +25,7 @@ GRAYBOX_PROBE_REGISTRY = [
   {"key": "_graybox_api_auth",        "cls": "api_auth.ApiAuthProbes"},
   {"key": "_graybox_api_data",        "cls": "api_data.ApiDataProbes"},
   {"key": "_graybox_api_config",      "cls": "api_config.ApiConfigProbes"},
+  {"key": "_graybox_api_abuse",       "cls": "api_abuse.ApiAbuseProbes"},
 ]
 
 # Graybox timing and limits
