@@ -837,7 +837,16 @@ def launch_webapp_scan(
   roe=None,
   authorization=None,
 ):
-  """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment."""
+  """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
+
+  ``target_config`` is a free-form dict deep-copied into the persisted
+  ``JobConfig`` (`models/archive.py:80`) and parsed by the worker via
+  ``GrayboxTargetConfig.from_dict`` (`graybox/worker.py:108`). All sections
+  registered on ``GrayboxTargetConfig`` flow through unchanged, including
+  the OWASP API Top 10 ``api_security`` section added in Subphase 1.1 of
+  the API Top 10 plan. ``_apply_launch_safety_policy`` only normalises
+  the ``discovery`` section; it does not strip unknown keys.
+  """
   if not target_url:
     return validation_error("target_url required for webapp scan")
   if not official_username or not official_password:
