@@ -37,6 +37,8 @@ class _FakePlugin(_SyncMixin):
     self._delegate = owner_ns
     self.stop_calls = 0
     self.start_calls = 0
+    self.runtime_stop_calls = 0
+    self.fixed_volume_cleanup_calls = 0
     self.lifecycle_log: list[str] = []
     # Mirror SyncManager-required attributes onto self by attribute lookup.
     # We simply use __getattr__ to forward.
@@ -48,6 +50,13 @@ class _FakePlugin(_SyncMixin):
   def stop_container(self):
     self.stop_calls += 1
     self.lifecycle_log.append("stop")
+
+  def _stop_container_runtime_for_restart(self):
+    self.runtime_stop_calls += 1
+    self.stop_container()
+
+  def _cleanup_fixed_size_volumes(self):
+    self.fixed_volume_cleanup_calls += 1
 
   def start_container(self):
     self.start_calls += 1
@@ -301,6 +310,15 @@ class TestProviderTick(unittest.TestCase):
     response = json.loads((self.vsd / "response.json").read_text())
     self.assertEqual(response["status"], "ok")
     self.assertEqual(len(self.owner._cs.hset_calls), 1)
+
+  def test_provider_sync_uses_runtime_stop_without_fixed_volume_cleanup(self):
+    self._write_request({"archive_paths": ["/app/data/"]})
+
+    self.plugin._sync_provider_tick(current_time=1000.0)
+
+    self.assertEqual(self.plugin.runtime_stop_calls, 1)
+    self.assertEqual(self.plugin.fixed_volume_cleanup_calls, 0)
+    self.assertEqual(self.plugin.lifecycle_log, ["stop", "start", "reset"])
 
   def test_validation_failure_does_not_stop_container(self):
     # claim_request fails fast; no need to disturb the container.

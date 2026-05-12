@@ -2731,17 +2731,16 @@ class ContainerAppRunnerPlugin(
         self._maybe_reset_tunnel_retry_counter(container_port)
 
 
-  def _stop_container_and_save_logs_to_disk(self):
+  def _stop_container_runtime_for_restart(self):
     """
-    Stop the container and all tunnels, then save logs to disk.
+    Stop runtime sidecars and remove the Docker container.
 
-    Performs full shutdown sequence:
+    Performs the shared pre-restart shutdown sequence:
     - Clears semaphore (signals dependent plugins container is stopping)
     - Stops log streaming threads
     - Stops main tunnel engine
     - Stops all extra tunnels
     - Stops and removes container
-    - Saves logs to disk
 
     Returns
     -------
@@ -2775,6 +2774,28 @@ class ContainerAppRunnerPlugin(
 
     # Stop the container if it's running
     self.stop_container()
+
+    return
+
+
+  def _stop_container_and_save_logs_to_disk(self):
+    """
+    Stop the container and all tunnels, then save logs to disk.
+
+    Performs full shutdown sequence:
+    - Clears semaphore (signals dependent plugins container is stopping)
+    - Stops log streaming threads
+    - Stops main tunnel engine
+    - Stops all extra tunnels
+    - Stops and removes container
+    - Cleans fixed-size volumes
+    - Saves logs to disk
+
+    Returns
+    -------
+    None
+    """
+    self._stop_container_runtime_for_restart()
 
     # Cleanup fixed-size volumes (unmount + detach loop devices)
     self._cleanup_fixed_size_volumes()

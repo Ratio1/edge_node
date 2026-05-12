@@ -32,6 +32,8 @@ from extensions.business.container_apps.container_utils import (
   CONTAINER_VOLUMES_PATH,
 )
 
+_HISTORY_WRITTEN_AT_NS = "history_written_at_ns"
+
 from .constants import (
   ARCHIVE_FORMAT,
   CHAINSTORE_SYNC_HKEY,
@@ -278,9 +280,34 @@ class SyncManager:
     fname = self._history_filename(entry.get("version", 0), entry.get("cid", ""))
     path = history_dir / fname
     payload = dict(entry)
+    payload.setdefault(_HISTORY_WRITTEN_AT_NS, _time.time_ns())
     payload.setdefault("deletion", dict(_UNDELETED))
     self._write_json_atomic(path, payload)
     return path
+
+  def _read_history_entries(self, history_dir: Path) -> list[tuple[Path, dict, int]]:
+    """Read history JSON files with stable insertion-order metadata.
+
+    ``history_written_at_ns`` is set when an entry is first appended and is
+    preserved by deletion updates. Older history files fall back to mtime.
+    """
+    entries = []
+    if not history_dir.is_dir():
+      return entries
+    for path in history_dir.iterdir():
+      if path.suffix != ".json":
+        continue
+      try:
+        with path.open("r", encoding="utf-8") as handle:
+          entry = json.load(handle)
+      except (OSError, json.JSONDecodeError) as exc:
+        self.owner.P(f"[sync] failed to read history file {path}: {exc}", color="r")
+        continue
+      written_at = entry.get(_HISTORY_WRITTEN_AT_NS)
+      if not isinstance(written_at, int):
+        written_at = path.stat().st_mtime_ns
+      entries.append((path, entry, written_at))
+    return entries
 
   def append_sent(self, entry: dict) -> Path:
     """Write a provider history entry to sync_history/sent/."""
@@ -293,27 +320,17 @@ class SyncManager:
   def _latest_in(self, history_dir: Path) -> Optional[dict]:
     """Return the most recently *written* history entry.
 
-    Sorts by file mtime, not by filename. Filenames are version-prefixed
-    for chronological browsability under normal operation, but the
-    consumer's "what did I last apply?" question is about insert order,
-    not about whatever ``version`` happens to be in the entry. Using
-    mtime keeps the right answer even when a record arrives with a
-    back-dated version (e.g. a clock-skewed provider's snapshot, or any
-    case where multiple providers in a sync set produce non-monotonic
-    timestamps relative to each other).
+    Sorts by the append-time marker, not by filename. Filenames are
+    version-prefixed for chronological browsability under normal operation,
+    but the consumer's "what did I last apply?" question is about insert
+    order, not about whatever ``version`` happens to be in the entry.
+    Older files without that marker fall back to mtime.
     """
-    if not history_dir.is_dir():
+    entries = self._read_history_entries(history_dir)
+    if not entries:
       return None
-    candidates = [p for p in history_dir.iterdir() if p.suffix == ".json"]
-    if not candidates:
-      return None
-    latest = max(candidates, key=lambda p: p.stat().st_mtime)
-    try:
-      with latest.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-      self.owner.P(f"[sync] failed to read history file {latest}: {exc}", color="r")
-      return None
+    _, latest, _ = max(entries, key=lambda item: item[2])
+    return latest
 
   def latest_sent(self) -> Optional[dict]:
     """Return the most recent provider history entry, or None if empty."""
@@ -914,37 +931,21 @@ class SyncManager:
     that entry's ``deletion`` sub-record. Never raises — deletion failures
     must not roll back the new publish/apply.
     """
-    if not history_dir.is_dir():
-      return
-    # Sort by mtime, not filename. Filenames embed the version prefix for
-    # chronological browsability under monotonic clocks, but the question
-    # "what did we just publish/apply?" is answered by file mtime — same
-    # contract as ``_latest_in`` (see the comment at that helper for the
-    # clock-skew rationale). Sorting by name here would retire the highest-
-    # *version* entry instead of the most-recently-written one, which can
-    # delete the CID we just successfully published.
-    files = sorted(
-      (p for p in history_dir.iterdir() if p.suffix == ".json"),
-      key=lambda p: p.stat().st_mtime,
+    # Sort by append-time marker, not filename. Filenames embed the version
+    # prefix for chronological browsability under monotonic clocks, but the
+    # question "what did we just publish/apply?" is answered by insert order.
+    # Sorting by name here would retire the highest-*version* entry instead
+    # of the most-recently-appended one.
+    entries = sorted(
+      self._read_history_entries(history_dir),
+      key=lambda item: item[2],
     )
-    if len(files) < 2:
+    if len(entries) < 2:
       return  # nothing to retire yet
-    try:
-      with files[-1].open("r", encoding="utf-8") as handle:
-        latest = json.load(handle)
-    except (OSError, json.JSONDecodeError) as exc:
-      self.owner.P(
-        f"[sync] retire: could not read latest history file: {exc}", color="y"
-      )
-      return
+    latest = entries[-1][1]
     latest_cid = latest.get("cid")
     target_entry: Optional[dict] = None
-    for path in reversed(files[:-1]):
-      try:
-        with path.open("r", encoding="utf-8") as handle:
-          entry = json.load(handle)
-      except (OSError, json.JSONDecodeError):
-        continue
+    for _, entry, _ in reversed(entries[:-1]):
       if entry.get("cid") == latest_cid:
         continue  # same content -- nothing to retire
       if (entry.get("deletion") or {}).get("deleted_at") is not None:

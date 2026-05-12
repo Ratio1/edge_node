@@ -6,12 +6,12 @@ Bridges :class:`SyncManager` into ``ContainerAppRunnerPlugin``'s lifecycle:
     loopback identical in machinery to ``FIXED_SIZE_VOLUMES``) and exports
     ``R1_*`` env vars to the container
   * provider role: per ``cfg_sync_poll_interval`` polls for a pending
-    ``request.json``, then drives ``stop_container → publish_snapshot →
-    start_container`` inline (must NOT route through ``_restart_container``,
+    ``request.json``, then drives runtime stop → publish_snapshot →
+    start_container inline (must NOT route through ``_restart_container``,
     which calls ``_cleanup_fixed_size_volumes`` and unmounts the loopback
     before we can read from it)
   * consumer role: same cadence polls ChainStore for newer ``version``, then
-    drives ``stop_container → apply_snapshot → start_container`` inline.
+    drives runtime stop → apply_snapshot → start_container inline.
     First boot starts on an empty volume; the next tick picks up whatever
     snapshot is in ChainStore. Apps that strictly require state at startup
     must implement their own poll-and-retry in their entrypoint.
@@ -60,7 +60,8 @@ class _SyncMixin:
     - self._fixed_volumes (list, populated by _FixedSizeVolumesMixin)
     - self.env (dict, container env)
     - self.r1fs, self.chainstore_hset/hget/hsync     (BasePlugin API)
-    - self.stop_container(), self.start_container()  (CAR lifecycle)
+    - self._stop_container_runtime_for_restart(),
+      self.start_container()  (CAR lifecycle)
     - self.cfg_sync                                  (CAR config block)
     - self.ee_id                                     (BasePlugin identity)
   """
@@ -128,7 +129,20 @@ class _SyncMixin:
       owner_uid=owner_uid,
       owner_gid=owner_gid,
     )
-    fixed_volume.provision(vol, force_recreate=False, logger=self.P)
+    try:
+      fixed_volume.provision(vol, force_recreate=False, logger=self.P)
+    except Exception as exc:
+      # Tool presence alone is not enough: hosts can still lack usable loop
+      # devices, mount privileges, or filesystem support. Container execution
+      # should continue without advertising the sync volume in that case.
+      self.P(
+        f"[sync] system volume unavailable: could not provision "
+        f"{SYSTEM_VOLUME_NAME}: {exc}. SYNC will be disabled and "
+        f"R1_SYSTEM_VOLUME env vars will not be exported.",
+        color="r",
+      )
+      self._sync_unavailable = True
+      return
 
     # Track for shared cleanup (parity with FIXED_SIZE_VOLUMES).
     if not hasattr(self, "_fixed_volumes"):
@@ -145,7 +159,7 @@ class _SyncMixin:
     # rest of its container — there's no isolation gain in restricting
     # the control-plane subdir to root.
     vsd = volume_sync_dir(self)
-    vsd.mkdir(parents=True, exist_ok=True)
+    os.makedirs(str(vsd), exist_ok=True)
     try:
       os.chmod(str(vsd), 0o777)
     except OSError as exc:
@@ -308,7 +322,7 @@ class _SyncMixin:
   def _sync_provider_tick(self, current_time: float) -> None:
     """If a pending request.json exists, run the full publish flow.
 
-    Drives ``stop_container → publish_snapshot → start_container`` inline.
+    Drives runtime stop → publish_snapshot → start_container inline.
     Always returns ``None`` — must NOT use a StopReason because that would
     route through ``_restart_container``, which unmounts the system volume
     before we can read from it (see plan Step 1 verification).
@@ -332,10 +346,7 @@ class _SyncMixin:
       return
     archive_paths, metadata = claimed
 
-    try:
-      self.stop_container()
-    except Exception as exc:
-      self.P(f"[sync] stop_container before publish failed: {exc}", color="r")
+    self._stop_container_runtime_for_restart()
 
     try:
       sm.publish_snapshot(archive_paths, metadata)
@@ -384,10 +395,7 @@ class _SyncMixin:
       color="b",
     )
 
-    try:
-      self.stop_container()
-    except Exception as exc:
-      self.P(f"[sync] stop_container before apply failed: {exc}", color="r")
+    self._stop_container_runtime_for_restart()
 
     try:
       sm.apply_snapshot(record)

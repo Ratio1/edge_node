@@ -39,6 +39,21 @@ def _patch_docker_module(client):
   )
 
 
+class _JoinableThread:
+  def __init__(self):
+    self.join_calls = 0
+    self.join_timeout = None
+    self._alive = True
+
+  def is_alive(self):
+    return self._alive
+
+  def join(self, timeout=None):
+    self.join_calls += 1
+    self.join_timeout = timeout
+    self._alive = False
+
+
 # ===========================================================================
 # Init Phase
 # ===========================================================================
@@ -328,6 +343,35 @@ class TestLifecycleStop(unittest.TestCase):
     plugin._stop_container_and_save_logs_to_disk()
     container.stop.assert_called()
     plugin.diskapi_save_pickle_to_data.assert_called_once()
+
+  def test_runtime_stop_cleans_sidecars_without_fixed_volume_cleanup(self):
+    plugin, _, container = self._launch()
+    log_thread = _JoinableThread()
+    exec_thread = _JoinableThread()
+    plugin.log_thread = log_thread
+    plugin.exec_threads = [exec_thread]
+    plugin._commands_started = True
+    plugin._semaphore_reset_signal = MagicMock()
+    plugin.stop_tunnel_engine = MagicMock()
+    plugin.stop_extra_tunnels = MagicMock()
+    plugin._cleanup_fixed_size_volumes = MagicMock()
+
+    plugin._stop_container_runtime_for_restart()
+
+    plugin._semaphore_reset_signal.assert_called_once()
+    self.assertEqual(log_thread.join_calls, 1)
+    self.assertEqual(log_thread.join_timeout, 5)
+    self.assertIsNone(plugin.log_thread)
+    self.assertEqual(exec_thread.join_calls, 1)
+    self.assertEqual(exec_thread.join_timeout, 5)
+    self.assertEqual(plugin.exec_threads, [])
+    self.assertFalse(plugin._stop_event.is_set())
+    self.assertFalse(plugin._commands_started)
+    plugin.stop_tunnel_engine.assert_called_once()
+    plugin.stop_extra_tunnels.assert_called_once()
+    container.stop.assert_called_once_with(timeout=5)
+    container.remove.assert_called_once()
+    plugin._cleanup_fixed_size_volumes.assert_not_called()
 
   def test_on_close_stops_container(self):
     plugin, _, container = self._launch()
