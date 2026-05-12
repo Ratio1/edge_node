@@ -457,6 +457,59 @@ class ApiInventoryPaths:
 
 
 @dataclass(frozen=True)
+class AuthDescriptor:
+  """Non-secret auth configuration for graybox session establishment.
+
+  Secret values (`bearer_token`, `api_key`, `bearer_refresh_token`) are
+  **never** carried in this object or anywhere inside ``target_config``.
+  They travel as top-level launch parameters and are stored in the R1FS
+  secret payload — see Subphase 1.5 commit #8.
+
+  Fields:
+    auth_type: Selects the AuthStrategy at runtime. ``form`` is the
+               default and keeps existing behaviour. ``bearer`` and
+               ``api_key`` add API-native auth in Subphase 1.5.
+    bearer_token_header_name: HTTP header used for Bearer tokens. Default
+               ``Authorization``; rare APIs use ``X-Auth-Token`` etc.
+    bearer_scheme: Scheme prefix for Bearer tokens. Default ``Bearer``;
+               some APIs use ``Token`` or empty (raw token).
+    bearer_refresh_url: Optional. If set, BearerAuth will POST here to
+               refresh an expired token (Phase 9 OAuth2 will replace this
+               with a proper grant flow).
+    api_key_header_name: Header name for API-key auth, e.g. ``X-Api-Key``.
+    api_key_query_param: Query-parameter name for API-key auth when
+               ``api_key_location='query'``.
+    api_key_location: ``header`` (default) or ``query``. Query is allowed
+               for legacy APIs only; evidence scrubbers will redact the
+               configured param name from URLs at the finding boundary.
+    authenticated_probe_path: Path used by strategy preflight when
+               ``auth_type != 'form'`` to verify the credentials work
+               before any probe runs (e.g. ``/api/me``).
+  """
+  auth_type: str = "form"   # "form" | "bearer" | "api_key"
+  bearer_token_header_name: str = "Authorization"
+  bearer_scheme: str = "Bearer"
+  bearer_refresh_url: str = ""
+  api_key_header_name: str = "X-Api-Key"
+  api_key_query_param: str = "api_key"
+  api_key_location: str = "header"  # "header" | "query"
+  authenticated_probe_path: str = ""
+
+  @classmethod
+  def from_dict(cls, d: dict) -> AuthDescriptor:
+    return cls(
+      auth_type=d.get("auth_type", "form"),
+      bearer_token_header_name=d.get("bearer_token_header_name", "Authorization"),
+      bearer_scheme=d.get("bearer_scheme", "Bearer"),
+      bearer_refresh_url=d.get("bearer_refresh_url", ""),
+      api_key_header_name=d.get("api_key_header_name", "X-Api-Key"),
+      api_key_query_param=d.get("api_key_query_param", "api_key"),
+      api_key_location=d.get("api_key_location", "header"),
+      authenticated_probe_path=d.get("authenticated_probe_path", ""),
+    )
+
+
+@dataclass(frozen=True)
 class ApiSecurityConfig:
   """Aggregated config for the five OWASP API Top 10 graybox probe families.
 
@@ -488,6 +541,7 @@ class ApiSecurityConfig:
   business_flows: list[ApiBusinessFlow] = field(default_factory=list)
   token_endpoints: ApiTokenEndpoint = field(default_factory=ApiTokenEndpoint)
   inventory_paths: ApiInventoryPaths = field(default_factory=ApiInventoryPaths)
+  auth: AuthDescriptor = field(default_factory=AuthDescriptor)
 
   ssrf_body_fields: list[str] = field(default_factory=lambda: [
     "url", "webhook", "callback", "image_url", "redirect_uri",
@@ -513,6 +567,7 @@ class ApiSecurityConfig:
       business_flows=[ApiBusinessFlow.from_dict(e) for e in d.get("business_flows", [])],
       token_endpoints=ApiTokenEndpoint.from_dict(d.get("token_endpoints", {})),
       inventory_paths=ApiInventoryPaths.from_dict(d.get("inventory_paths", {})),
+      auth=AuthDescriptor.from_dict(d.get("auth", {})),
       ssrf_body_fields=d.get(
         "ssrf_body_fields",
         fields_["ssrf_body_fields"].default_factory(),
