@@ -303,7 +303,7 @@ class ApiFunctionEndpoint:
   ``method == "GET"`` entries are tested read-only in Phase 2.3
   (PT-OAPI5-01 / PT-OAPI5-02). Non-GET entries require both
   ``allow_stateful_probes=True`` AND ``revert_path``/``revert_body``
-  (Phase 3.4, PT-OAPI5-03 / PT-OAPI5-04, stateful contract).
+  (Phase 3.4, PT-OAPI5-03 / PT-OAPI5-02-mut, stateful contract).
   """
   path: str                                  # e.g. "/api/admin/users/{uid}/promote/"
   method: str = "GET"

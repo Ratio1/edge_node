@@ -31,7 +31,7 @@ class ApiAccessProbes(ProbeBase):
     PT-OAPI5-02 — Function-level authorization bypass (anonymous as user,
                   read) — Subphase 2.3.
     PT-OAPI5-03 — Method-override authorization bypass — Subphase 3.4.
-    PT-OAPI5-04 — Function-level authorization bypass (regular as admin,
+    PT-OAPI5-02-mut — Function-level authorization bypass (regular as admin,
                   mutating; stateful, requires revert plan) — Subphase 3.4.
   """
 
@@ -212,7 +212,7 @@ class ApiAccessProbes(ProbeBase):
     GET it as the regular_session and expect ≥401/403.
 
     Vulnerable iff status < 400 (no auth gate). Mutating endpoints
-    (method != GET) are deferred to PT-OAPI5-04 in Subphase 3.4 — they
+    (method != GET) are deferred to PT-OAPI5-02-mut in Subphase 3.4 — they
     require the stateful contract + a configured revert plan.
     """
     api_security = self.target_config.api_security
@@ -290,7 +290,7 @@ class ApiAccessProbes(ProbeBase):
 
     for ep in endpoints:
       # Phase 2.3 covers read-only (method=GET) only. Mutating methods
-      # are deferred to PT-OAPI5-03 / PT-OAPI5-04 (stateful, Phase 3.4).
+      # are deferred to PT-OAPI5-03 / PT-OAPI5-02-mut (stateful, Phase 3.4).
       if (ep.method or "GET").upper() not in ("GET", "HEAD"):
         continue
 
@@ -452,7 +452,7 @@ class ApiAccessProbes(ProbeBase):
         },
       )
 
-  # ── PT-OAPI5-04 — Regular user reaches admin function (MUTATING) ───
+  # ── PT-OAPI5-02-mut — Regular user reaches admin function (MUTATING) ───
 
   def _test_bfla_regular_as_admin_mutating(self):
     title = "API function-level authorization bypass (regular as admin, mutating)"
@@ -460,7 +460,7 @@ class ApiAccessProbes(ProbeBase):
     api_security = self.target_config.api_security
     session = self.auth.regular_session
     if session is None:
-      self.emit_inconclusive("PT-OAPI5-04", title, owasp, "no_regular_session")
+      self.emit_inconclusive("PT-OAPI5-02-mut", title, owasp, "no_regular_session")
       return
 
     for ep in api_security.function_endpoints:
@@ -469,7 +469,7 @@ class ApiAccessProbes(ProbeBase):
         continue
       if not ep.revert_path:
         self.emit_inconclusive(
-          "PT-OAPI5-04", title, owasp, "no_revert_path_configured",
+          "PT-OAPI5-02-mut", title, owasp, "no_revert_path_configured",
         )
         continue
 
@@ -508,7 +508,7 @@ class ApiAccessProbes(ProbeBase):
                   if privilege == "admin" or "/admin" in ep.path.lower()
                   else "HIGH")
       self.run_stateful(
-        "PT-OAPI5-04",
+        "PT-OAPI5-02-mut",
         baseline_fn=baseline,
         mutate_fn=mutate,
         verify_fn=verify,

@@ -126,7 +126,7 @@ class TestRunStatefulRevertFailureBumpsSeverity(unittest.TestCase):
       raise RuntimeError("revert HTTP exploded")
 
     p.run_stateful(
-      "PT-OAPI5-04",
+      "PT-OAPI5-02-mut",
       baseline_fn=lambda: None,
       mutate_fn=lambda b: True,
       verify_fn=lambda b: True,

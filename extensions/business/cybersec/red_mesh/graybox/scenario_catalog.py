@@ -164,7 +164,7 @@ GRAYBOX_SCENARIO_CATALOG = (
   {"id": "PT-OAPI5-03", "family": "api_access",
    "title": "API method-override authorization bypass",
    "owasp": "API5:2023", "attack": ["T1190", "T1078"]},
-  {"id": "PT-OAPI5-04", "family": "api_access",
+  {"id": "PT-OAPI5-02-mut", "family": "api_access",
    "title": "API function-level authorization bypass (regular as admin, mutating)",
    "owasp": "API5:2023", "attack": ["T1190", "T1078", "T1565"]},
 

@@ -74,7 +74,7 @@ Only `path` is required. Set `tenant_field` for cross-tenant BOLA.
 ```
 
 `revert_path` is **mandatory** when `method != "GET"` and you want
-PT-OAPI5-03 / PT-OAPI5-04 to run with `allow_stateful_probes=true`.
+PT-OAPI5-03 / PT-OAPI5-02-mut to run with `allow_stateful_probes=true`.
 Without it, the stateful probe emits `inconclusive`.
 
 ### `ApiResourceEndpoint` — drives **PT-OAPI4-01..03**
