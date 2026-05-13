@@ -11,6 +11,7 @@ from extensions.business.container_apps.sync.control_files import (
   JsonControlFile,
   JsonControlFileDecodeError,
   JsonControlFileObjectError,
+  JsonControlFileUnsafeError,
   write_json_atomic,
 )
 
@@ -91,6 +92,19 @@ class TestJsonControlFile(unittest.TestCase):
 
     self.assertEqual(ctx.exception.raw_body, '["just","a","list"]')
     self.assertIn("request.json must be a JSON object", str(ctx.exception))
+
+  def test_claim_object_rejects_symlink_without_reading_target(self):
+    secret = self.root / "secret.txt"
+    secret.write_text("host-secret")
+    os.symlink(str(secret), str(self.root / "request.json"))
+
+    with self.assertRaises(JsonControlFileUnsafeError) as ctx:
+      self.control.claim_object()
+
+    self.assertNotIn("host-secret", str(ctx.exception))
+    self.assertIsNone(ctx.exception.raw_body)
+    self.assertFalse((self.root / "request.json").exists())
+    self.assertTrue((self.root / "request.json.processing").is_symlink())
 
   def test_discard_processing_removes_processing_file(self):
     (self.root / "request.json.processing").write_text("{}")

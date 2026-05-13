@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
+import errno
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -55,6 +57,10 @@ class JsonControlFileDecodeError(JsonControlFileError):
 
 class JsonControlFileObjectError(JsonControlFileError):
   """The processing file was JSON, but not a JSON object."""
+
+
+class JsonControlFileUnsafeError(JsonControlFileError):
+  """The processing file is not a regular no-follow-readable file."""
 
 
 def write_json_atomic(path: Path, payload: Any) -> None:
@@ -102,11 +108,47 @@ class JsonControlFile:
     return self.root / self.processing_name
 
   def has_pending(self) -> bool:
-    return self.pending_path.is_file()
+    try:
+      os.lstat(str(self.pending_path))
+      return True
+    except FileNotFoundError:
+      return False
+
+  @staticmethod
+  def _read_text_no_follow(path: Path) -> str:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+      flags |= os.O_NOFOLLOW
+
+    fd: Optional[int] = None
+    try:
+      fd = os.open(str(path), flags)
+      st = os.fstat(fd)
+      if not stat.S_ISREG(st.st_mode):
+        raise JsonControlFileUnsafeError(
+          f"refusing to read non-regular control file: {path.name}",
+          processing_path=path,
+        )
+      with os.fdopen(fd, "r", encoding="utf-8") as handle:
+        fd = None
+        return handle.read()
+    except OSError as exc:
+      if getattr(exc, "errno", None) == errno.ELOOP:
+        raise JsonControlFileUnsafeError(
+          f"refusing to read symlink control file: {path.name}",
+          processing_path=path,
+        ) from exc
+      raise
+    finally:
+      if fd is not None:
+        try:
+          os.close(fd)
+        except OSError:
+          pass
 
   def claim_processing(self) -> Optional[Path]:
     """Atomically rename pending -> processing, returning the processing path."""
-    if not self.pending_path.is_file():
+    if not self.has_pending():
       return None
     try:
       os.replace(str(self.pending_path), str(self.processing_path))
@@ -129,7 +171,7 @@ class JsonControlFile:
       return None
 
     try:
-      raw_body = processing_path.read_text(encoding="utf-8")
+      raw_body = self._read_text_no_follow(processing_path)
     except OSError as exc:
       raise JsonControlFileReadError(
         str(exc), processing_path=processing_path,
@@ -178,5 +220,6 @@ __all__ = [
   "JsonControlFileError",
   "JsonControlFileObjectError",
   "JsonControlFileReadError",
+  "JsonControlFileUnsafeError",
   "write_json_atomic",
 ]

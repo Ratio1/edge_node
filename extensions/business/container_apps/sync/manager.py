@@ -40,6 +40,7 @@ from .control_files import (
   JsonControlFileDecodeError,
   JsonControlFileObjectError,
   JsonControlFileReadError,
+  JsonControlFileUnsafeError,
   write_json_atomic,
 )
 
@@ -510,6 +511,12 @@ class SyncManager:
       self._fail_request(
         None, STAGE_VALIDATION,
         f"could not read .processing: {exc}", control_file.processing_path,
+      )
+      return None
+    except JsonControlFileUnsafeError as exc:
+      self._fail_request(
+        None, STAGE_VALIDATION,
+        str(exc), control_file.processing_path,
       )
       return None
     except JsonControlFileDecodeError as exc:

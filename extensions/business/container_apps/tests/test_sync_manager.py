@@ -583,6 +583,22 @@ class TestClaimRequest(unittest.TestCase):
     self.assertEqual(response["stage"], "validation")
     self.assertFalse((self.vsd / "request.json.processing").exists())
 
+  def test_request_symlink_rejected_without_leaking_target_body(self):
+    secret = self.tmpdir / "host-secret.txt"
+    secret.write_text("not-json-secret-token")
+    os.symlink(str(secret), str(self.vsd / "request.json"))
+
+    self.assertIsNone(self.sm.claim_request())
+
+    invalid = self._read_invalid()
+    self.assertIsNotNone(invalid)
+    self.assertIsNone(invalid["request"])
+    self.assertEqual(invalid["_error"]["stage"], "validation")
+    self.assertIn("symlink control file", invalid["_error"]["error"])
+    self.assertNotIn("raw_body", invalid["_error"])
+    self.assertNotIn("not-json-secret-token", json.dumps(invalid))
+    self.assertFalse((self.vsd / "request.json.processing").exists())
+
   def test_not_an_object(self):
     self._write_request(["just", "a", "list"])
     self.assertIsNone(self.sm.claim_request())
