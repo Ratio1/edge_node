@@ -50,6 +50,8 @@ class ApiAccessProbes(ProbeBase):
     if getattr(api_security, "function_endpoints", None):
       self.run_safe("api_bfla_regular", self._test_bfla_regular_as_admin)
       self.run_safe("api_bfla_anon", self._test_bfla_anon_as_user)
+      self.run_safe("api_bfla_method_override", self._test_bfla_method_override)
+      self.run_safe("api_bfla_mutating", self._test_bfla_regular_as_admin_mutating)
 
     return self.findings
 
@@ -365,6 +367,164 @@ class ApiAccessProbes(ProbeBase):
       found_any = True
 
     return found_any
+
+  # ── PT-OAPI5-03 — Method-override bypass (STATEFUL) ────────────────
+
+  def _test_bfla_method_override(self):
+    title = "API method-override authorization bypass"
+    owasp = "API5:2023"
+    api_security = self.target_config.api_security
+    session = self.auth.regular_session
+    if session is None:
+      self.emit_inconclusive("PT-OAPI5-03", title, owasp, "no_regular_session")
+      return
+
+    for ep in api_security.function_endpoints:
+      method = (ep.method or "GET").upper()
+      if method == "GET":
+        # Method-override target should be a method-restricted endpoint
+        # — GET-only endpoints have nothing to override.
+        continue
+      if not ep.revert_path:
+        self.emit_inconclusive(
+          "PT-OAPI5-03", title, owasp, "no_revert_path_configured",
+        )
+        continue
+
+      url = self.target_url + ep.path
+      revert_url = self.target_url + ep.revert_path
+
+      def baseline(_ep=ep, _url=url):
+        # Control case: GET (without override) should be rejected.
+        if not self.budget():
+          raise RuntimeError("budget_exhausted")
+        self.safety.throttle()
+        try:
+          resp = session.get(_url, timeout=10, allow_redirects=False)
+        except requests.RequestException as exc:
+          raise RuntimeError(str(exc))
+        return {"control_status": resp.status_code}
+
+      def mutate(base, _ep=ep, _url=url):
+        if base.get("control_status", 0) < 400:
+          # Control case was already accessible — no override needed.
+          return False
+        if not self.budget():
+          return False
+        self.safety.throttle()
+        try:
+          resp = session.post(
+            _url, headers={"X-HTTP-Method-Override": "GET"},
+            timeout=10, allow_redirects=False,
+          )
+        except requests.RequestException:
+          return False
+        base["override_status"] = resp.status_code
+        return resp.status_code < 400
+
+      def verify(base):
+        return base.get("override_status", 999) < 400
+
+      def revert(base, _revert_url=revert_url, _ep=ep):
+        if not self.budget():
+          return False
+        try:
+          session.post(_revert_url, json=ep.revert_body or {}, timeout=10)
+        except requests.RequestException:
+          return False
+        return True
+
+      self.run_stateful(
+        "PT-OAPI5-03",
+        baseline_fn=baseline,
+        mutate_fn=mutate,
+        verify_fn=verify,
+        revert_fn=revert,
+        finding_kwargs={
+          "title": title, "owasp": owasp, "severity": "HIGH",
+          "cwe": ["CWE-285", "CWE-862"],
+          "evidence": [f"endpoint={url}", "override_header=X-HTTP-Method-Override: GET"],
+          "remediation": (
+            "Disable HTTP method override entirely or restrict it to "
+            "internal services. Authorization must be enforced on the "
+            "effective method used."
+          ),
+        },
+      )
+
+  # ── PT-OAPI5-04 — Regular user reaches admin function (MUTATING) ───
+
+  def _test_bfla_regular_as_admin_mutating(self):
+    title = "API function-level authorization bypass (regular as admin, mutating)"
+    owasp = "API5:2023"
+    api_security = self.target_config.api_security
+    session = self.auth.regular_session
+    if session is None:
+      self.emit_inconclusive("PT-OAPI5-04", title, owasp, "no_regular_session")
+      return
+
+    for ep in api_security.function_endpoints:
+      method = (ep.method or "GET").upper()
+      if method == "GET":
+        continue
+      if not ep.revert_path:
+        self.emit_inconclusive(
+          "PT-OAPI5-04", title, owasp, "no_revert_path_configured",
+        )
+        continue
+
+      url = self.target_url + ep.path
+      revert_url = self.target_url + ep.revert_path
+      method_fn = getattr(session, method.lower(), session.post)
+
+      def baseline(_ep=ep):
+        return {"method": method, "ep_path": _ep.path}
+
+      def mutate(base, _url=url, _method_fn=method_fn):
+        if not self.budget():
+          return False
+        self.safety.throttle()
+        try:
+          resp = _method_fn(_url, timeout=10)
+        except requests.RequestException:
+          return False
+        base["mutate_status"] = resp.status_code
+        return resp.status_code < 400
+
+      def verify(base):
+        return base.get("mutate_status", 999) < 400
+
+      def revert(base, _revert_url=revert_url, _ep=ep):
+        if not self.budget():
+          return False
+        try:
+          session.post(_revert_url, json=ep.revert_body or {}, timeout=10)
+        except requests.RequestException:
+          return False
+        return True
+
+      privilege = (ep.privilege or "").lower()
+      severity = ("CRITICAL"
+                  if privilege == "admin" or "/admin" in ep.path.lower()
+                  else "HIGH")
+      self.run_stateful(
+        "PT-OAPI5-04",
+        baseline_fn=baseline,
+        mutate_fn=mutate,
+        verify_fn=verify,
+        revert_fn=revert,
+        finding_kwargs={
+          "title": title, "owasp": owasp, "severity": severity,
+          "cwe": ["CWE-285", "CWE-862"],
+          "evidence": [f"endpoint={url}", f"method={method}",
+                       "principal=regular"],
+          "remediation": (
+            "Verify the caller's role on every mutating endpoint. The "
+            "URL alone is not an authorization claim — admin actions "
+            "must check the session/JWT role on the server."
+          ),
+        },
+      )
 
   @staticmethod
   def _collect_sensitive_field_names(payload):
