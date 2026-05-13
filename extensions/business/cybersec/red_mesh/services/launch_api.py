@@ -104,6 +104,13 @@ def _extract_scope_prefix(target_config) -> str:
 def _extract_discovery_max_pages(target_config) -> int:
   if not isinstance(target_config, dict):
     return 50
+  discovery = target_config.get("discovery") or {}
+  if not isinstance(discovery, dict):
+    return 50
+  try:
+    return max(int(discovery.get("max_pages", 50) or 50), 1)
+  except (TypeError, ValueError):
+    return 50
 
 
 def _validate_graybox_target_config(target_config):
@@ -119,13 +126,6 @@ def _validate_graybox_target_config(target_config):
   except (TypeError, ValueError) as exc:
     return validation_error(f"target_config is invalid: {exc}")
   return None
-  discovery = target_config.get("discovery") or {}
-  if not isinstance(discovery, dict):
-    return 50
-  try:
-    return max(int(discovery.get("max_pages", 50) or 50), 1)
-  except (TypeError, ValueError):
-    return 50
 
 
 def _validate_authorization_context(
