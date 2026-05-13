@@ -556,6 +556,7 @@ class TestConsumerTick(unittest.TestCase):
         "schema_version": 1,
         "archive_paths": ["/app/data/", "/nope/"],
         "archive_format": "tar.gz",
+        "encryption": "r1fs-default",
         "archive_size_bytes": 123,
       },
     }

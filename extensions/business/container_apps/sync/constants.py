@@ -39,6 +39,7 @@ CHAINSTORE_SYNC_HKEY = "CHAINSTORE_SYNC"
 # Manifest schema versioning so consumers can refuse newer-than-known formats
 MANIFEST_SCHEMA_VERSION = 1
 ARCHIVE_FORMAT = "tar.gz"
+ARCHIVE_ENCRYPTION = "r1fs-default"
 
 # Stages reported on failure (used in response.json + request.json.invalid)
 STAGE_VALIDATION = "validation"

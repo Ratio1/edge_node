@@ -17,6 +17,7 @@ reaching into individual modules.
 """
 
 from .constants import (
+  ARCHIVE_ENCRYPTION,
   ARCHIVE_FORMAT,
   CHAINSTORE_SYNC_HKEY,
   MANIFEST_SCHEMA_VERSION,
@@ -51,6 +52,7 @@ from .mixin import _SyncMixin
 
 __all__ = [
   # constants
+  "ARCHIVE_ENCRYPTION",
   "ARCHIVE_FORMAT",
   "CHAINSTORE_SYNC_HKEY",
   "MANIFEST_SCHEMA_VERSION",

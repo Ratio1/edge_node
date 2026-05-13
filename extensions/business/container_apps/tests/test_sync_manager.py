@@ -841,6 +841,20 @@ class TestArchiveRoundtrip(unittest.TestCase):
     # No file was created
     self.assertFalse((self.consumer._fixed_root / "appdata" / "x.bin").exists())
 
+  def test_extract_rejects_member_outside_manifest_archive_paths(self):
+    bad_tar = self.tmpdir / "outside-manifest.tar.gz"
+    src = self.tmpdir / "outside-manifest.txt"
+    src.write_text("outside")
+    with tarfile.open(str(bad_tar), "w:gz") as tar:
+      tar.add(str(src), arcname="/app/data/other.txt")
+
+    with self.assertRaisesRegex(ValueError, "outside manifest archive_paths"):
+      self.sm_c.extract_archive(
+        str(bad_tar), allowed_archive_paths=["/app/data/declared/"]
+      )
+
+    self.assertFalse((self.consumer._fixed_root / "appdata" / "other.txt").exists())
+
   def test_extract_skips_symlink_members(self):
     import tarfile as _tarfile
     sym_tar = self.tmpdir / "sym.tar.gz"
@@ -1167,6 +1181,7 @@ class TestConsumerFlow(unittest.TestCase):
     manifest = {
       "schema_version": 1,
       "archive_format": "tar.gz",
+      "encryption": "r1fs-default",
       "archive_paths": ["/app/data/"],
     }
     manifest.update(overrides)
@@ -1210,6 +1225,14 @@ class TestConsumerFlow(unittest.TestCase):
     self.assertIn("archive_format", reasons[0])
     self.assertIn("zip", reasons[0])
     self.assertIn("tar.gz", reasons[0])
+
+  def test_validate_manifest_rejects_unsupported_encryption(self):
+    record = self._ok_manifest(encryption="plaintext")
+    reasons = self.sm_c.validate_manifest(record)
+    self.assertEqual(len(reasons), 1)
+    self.assertIn("encryption", reasons[0])
+    self.assertIn("plaintext", reasons[0])
+    self.assertIn("r1fs-default", reasons[0])
 
   def test_validate_manifest_collects_multiple_violations(self):
     """Schema + format + path violations all surface in one pass so the
@@ -1330,6 +1353,7 @@ class TestConsumerFlow(unittest.TestCase):
         "schema_version": 1,
         "archive_paths": ["/app/data/", "/foo/bar/"],
         "archive_format": "tar.gz",
+        "encryption": "r1fs-default",
         "archive_size_bytes": 100,
       },
     }
@@ -1342,6 +1366,38 @@ class TestConsumerFlow(unittest.TestCase):
     # Useful error message — should name the path that couldn't be mapped.
     self.assertTrue(any("unmapped archive_paths" in m for m in self.consumer._msgs))
     self.assertTrue(any("/foo/bar/" in m for m in self.consumer._msgs))
+
+  def test_apply_rejects_tar_member_outside_manifest_archive_paths(self):
+    cid = "QmOUTSIDE_MANIFEST"
+    bad_tar = self.tmpdir / "outside-manifest-apply.tar.gz"
+    src = self.tmpdir / "outside-apply.txt"
+    src.write_text("outside")
+    with tarfile.open(str(bad_tar), "w:gz") as tar:
+      tar.add(str(src), arcname="/app/data/other.txt")
+    self.consumer._r1fs.added[cid] = bad_tar.read_bytes()
+
+    record = {
+      "cid": cid,
+      "version": 123,
+      "timestamp": 1.0,
+      "node_id": "ee_provider",
+      "metadata": {},
+      "manifest": {
+        "schema_version": 1,
+        "archive_paths": ["/app/data/declared/"],
+        "archive_format": "tar.gz",
+        "encryption": "r1fs-default",
+      },
+    }
+
+    ok = self.sm_c.apply_snapshot(record)
+
+    self.assertFalse(ok)
+    self.assertFalse((volume_sync_dir(self.consumer) / "last_apply.json").exists())
+    self.assertFalse((self.consumer._fixed_root / "appdata" / "other.txt").exists())
+    self.assertTrue(
+      any("outside manifest archive_paths" in m for m in self.consumer._msgs)
+    )
 
   def test_apply_aborts_on_r1fs_get_failure(self):
     (volume_sync_dir(self.provider) / SYNC_PROCESSING_FILE).write_text("{}")
@@ -1376,6 +1432,7 @@ class TestConsumerFlow(unittest.TestCase):
         "schema_version": 1,
         "archive_paths": ["/app/data/"],
         "archive_format": "tar.gz",
+        "encryption": "r1fs-default",
         "archive_size_bytes": bad_tar.stat().st_size,
       },
     }

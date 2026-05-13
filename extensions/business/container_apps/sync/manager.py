@@ -58,6 +58,7 @@ _CONSUMER_APPLY_MODES = {
 }
 
 from .constants import (
+  ARCHIVE_ENCRYPTION,
   ARCHIVE_FORMAT,
   CHAINSTORE_SYNC_HKEY,
   MANIFEST_SCHEMA_VERSION,
@@ -760,7 +761,7 @@ class SyncManager:
         "archive_paths": list(archive_paths),
         "archive_format": ARCHIVE_FORMAT,
         "archive_size_bytes": size_bytes,
-        "encryption": "r1fs-default",
+        "encryption": ARCHIVE_ENCRYPTION,
         "runtime": runtime_payload,
       }
       record = {
@@ -916,6 +917,7 @@ class SyncManager:
     Reasons are surfaced for:
       - missing/wrong ``schema_version`` (must be an int <= MANIFEST_SCHEMA_VERSION)
       - unexpected ``archive_format`` (must equal ARCHIVE_FORMAT)
+      - unexpected ``encryption`` (must equal ARCHIVE_ENCRYPTION)
       - ``archive_paths`` entries that don't map to a mount on this consumer
 
     Format/schema checks come first so they short-circuit before we burn
@@ -940,6 +942,12 @@ class SyncManager:
     if fmt != ARCHIVE_FORMAT:
       reasons.append(
         f"unsupported archive_format: {fmt!r} (expected: {ARCHIVE_FORMAT!r})"
+      )
+
+    enc = manifest.get("encryption")
+    if enc != ARCHIVE_ENCRYPTION:
+      reasons.append(
+        f"unsupported encryption: {enc!r} (expected: {ARCHIVE_ENCRYPTION!r})"
       )
 
     paths = manifest.get("archive_paths") or []
@@ -981,7 +989,29 @@ class SyncManager:
           f"tar member target escapes volume root: {container_name!r} -> {host_path!r}"
         )
 
-  def extract_archive(self, tar_path: str) -> list[str]:
+  @staticmethod
+  def _container_path_in_declared_archive_paths(
+    container_name: str,
+    archive_paths: list[str],
+  ) -> bool:
+    candidate = os.path.normpath(container_name)
+    if not candidate.startswith("/"):
+      candidate = "/" + candidate
+    for entry in archive_paths:
+      if not isinstance(entry, str) or not entry:
+        continue
+      declared = os.path.normpath(entry)
+      if not declared.startswith("/"):
+        declared = "/" + declared
+      if candidate == declared or candidate.startswith(declared.rstrip("/") + "/"):
+        return True
+    return False
+
+  def extract_archive(
+    self,
+    tar_path: str,
+    allowed_archive_paths: Optional[list[str]] = None,
+  ) -> list[str]:
     """Reverse-map tar member container paths to host paths and extract.
 
     Two-pass: first pass validates every member by feeding its name through
@@ -991,9 +1021,17 @@ class SyncManager:
     a malicious tar could otherwise create a link that subsequent regular
     members would write through. Each regular file is written via tmp +
     ``os.replace`` so a mid-flight crash never leaves a half-written file.
-    Returns the list of container paths that were applied (regular files +
-    directories created).
+    If ``allowed_archive_paths`` is provided, every extracted member must also
+    sit under at least one manifest-declared archive path. Returns the list of
+    container paths that were applied (regular files + directories created).
     """
+    return self._extract_archive(tar_path, allowed_archive_paths)
+
+  def _extract_archive(
+    self,
+    tar_path: str,
+    allowed_archive_paths: Optional[list[str]] = None,
+  ) -> list[str]:
     extracted: list[str] = []
     with tarfile.open(str(tar_path), "r:gz") as tar:
       members = tar.getmembers()
@@ -1016,6 +1054,15 @@ class SyncManager:
         container_name = member.name
         if not container_name.startswith("/"):
           container_name = "/" + container_name
+        if (
+          allowed_archive_paths is not None
+          and not self._container_path_in_declared_archive_paths(
+            container_name, allowed_archive_paths
+          )
+        ):
+          raise ValueError(
+            f"tar member outside manifest archive_paths: {container_name!r}"
+          )
         host_path, _bind, host_root = self.resolve_container_path(container_name)
         self._validate_extract_target_within_root(host_path, host_root, container_name)
         planned.append((member, host_path, container_name, host_root))
@@ -1106,7 +1153,11 @@ class SyncManager:
       return False
 
     try:
-      extracted = self.extract_archive(local_path)
+      manifest = record.get("manifest") or {}
+      extracted = self.extract_archive(
+        local_path,
+        allowed_archive_paths=manifest.get("archive_paths") or [],
+      )
     except Exception as exc:
       self.owner.P(f"[sync] extract_archive failed: {exc}", color="r")
       return False
