@@ -334,7 +334,8 @@ class TestProviderTick(unittest.TestCase):
     self.plugin._sync_provider_tick(current_time=1000.0)
 
     self.assertEqual(self.plugin.runtime_stop_calls, 0)
-    self.assertEqual(self.plugin.lifecycle_log, ["start", "reset"])
+    self.assertEqual(self.plugin.start_calls, 0)
+    self.assertEqual(self.plugin.lifecycle_log, [])
     response = json.loads((self.vsd / "response.json").read_text())
     self.assertEqual(response["status"], "ok")
 

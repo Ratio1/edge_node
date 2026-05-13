@@ -348,7 +348,8 @@ class _SyncMixin:
       # claim_request already wrote .invalid + response.json
       return
 
-    if claimed.runtime.provider_capture == "offline":
+    stopped_for_sync = claimed.runtime.provider_capture == "offline"
+    if stopped_for_sync:
       self._stop_container_runtime_for_restart()
 
     try:
@@ -359,7 +360,8 @@ class _SyncMixin:
       # container even if something truly unexpected escapes.
       self.P(f"[sync] publish_snapshot raised unexpectedly: {exc}", color="r")
 
-    self._sync_safe_start_container()
+    if stopped_for_sync:
+      self._sync_safe_start_container()
 
   # ----- consumer tick ---------------------------------------------------
 
