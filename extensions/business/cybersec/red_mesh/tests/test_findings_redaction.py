@@ -9,10 +9,20 @@ emission time.
 from __future__ import annotations
 
 import unittest
+from unittest.mock import MagicMock
 
+import requests
+
+from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+from extensions.business.cybersec.red_mesh.graybox.safety import SafetyControls
 from extensions.business.cybersec.red_mesh.graybox.findings import (
   GrayboxFinding,
   scrub_graybox_secrets,
+)
+from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+  ApiSecurityConfig,
+  AuthDescriptor,
+  GrayboxTargetConfig,
 )
 
 
@@ -136,6 +146,56 @@ class TestToFlatFindingScrubs(unittest.TestCase):
     # Non-secret content preserved
     self.assertIn("/api/users/2", haystack)
     self.assertIn("PT-OAPI1-01", haystack)
+
+
+class TestProbeErrorScrubsConfiguredNames(unittest.TestCase):
+
+  def _probe(self):
+    target_config = GrayboxTargetConfig(api_security=ApiSecurityConfig(
+      auth=AuthDescriptor(
+        auth_type="api_key",
+        api_key_location="query",
+        api_key_query_param="customer_key",
+        api_key_header_name="X-Customer-Api-Key",
+      )
+    ))
+    return ProbeBase(
+      "https://api.example.com",
+      MagicMock(),
+      target_config,
+      SafetyControls(),
+    )
+
+  def test_run_safe_redacts_configured_query_key_from_request_exception(self):
+    probe = self._probe()
+
+    def boom():
+      raise requests.RequestException(
+        "GET https://api.example.com/v1/users?customer_key=SECRET99&page=1 failed"
+      )
+
+    probe.run_safe("api_error_path", boom)
+
+    finding = probe.findings[0]
+    haystack = str(finding.to_dict())
+    self.assertNotIn("SECRET99", haystack)
+    self.assertIn("customer_key=<redacted>", haystack)
+    self.assertIn("page=1", haystack)
+
+  def test_connection_error_redacts_configured_header_name(self):
+    probe = self._probe()
+
+    def boom():
+      raise requests.exceptions.ConnectionError(
+        "request failed with X-Customer-Api-Key: SECRET-HEADER-VALUE"
+      )
+
+    probe.run_safe("api_connection", boom)
+
+    haystack = str(probe.findings[0].to_dict())
+    self.assertNotIn("SECRET-HEADER-VALUE", haystack)
+    self.assertIn("target_unreachable", haystack)
+    self.assertIn("X-Customer-Api-Key: <redacted>", haystack)
 
 
 if __name__ == "__main__":

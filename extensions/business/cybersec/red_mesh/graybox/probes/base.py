@@ -61,12 +61,12 @@ class ProbeBase:
     """
     try:
       probe_fn()
-    except requests.exceptions.ConnectionError:
-      self._record_error(probe_name, "target_unreachable")
-    except requests.exceptions.Timeout:
-      self._record_error(probe_name, "request_timeout")
+    except requests.exceptions.ConnectionError as exc:
+      self._record_error(probe_name, self._error_with_detail("target_unreachable", exc))
+    except requests.exceptions.Timeout as exc:
+      self._record_error(probe_name, self._error_with_detail("request_timeout", exc))
     except Exception as exc:
-      self._record_error(probe_name, self.safety.sanitize_error(str(exc)))
+      self._record_error(probe_name, self._sanitize_error(str(exc)))
 
   def build_result(self, outcome: str = "completed", artifacts=None) -> GrayboxProbeRunResult:
     """Return a typed probe result without changing legacy run() contracts."""
@@ -203,6 +203,7 @@ class ProbeBase:
 
   def _record_error(self, probe_name, error_msg):
     """Store a non-fatal error as an INFO GrayboxFinding."""
+    error_msg = self._sanitize_error(error_msg)
     self.findings.append(GrayboxFinding(
       scenario_id=f"ERR-{probe_name}",
       title=f"Probe error: {probe_name}",
@@ -212,6 +213,12 @@ class ProbeBase:
       evidence=[f"error={error_msg}"],
       error=error_msg,
     ))
+
+  def _error_with_detail(self, code, exc):
+    detail = self._sanitize_error(str(exc))
+    if not detail:
+      return code
+    return f"{code}:{detail}"
 
   # ── OWASP API Top 10 emit helpers (Subphase 1.6) ─────────────────────
   #
@@ -261,6 +268,17 @@ class ProbeBase:
     return scrub_graybox_secrets(
       value, secret_field_names=self._configured_secret_field_names(),
     )
+
+  def _sanitize_error(self, value):
+    """Sanitize target-controlled exception text with configured secret names."""
+    secret_field_names = self._configured_secret_field_names()
+    try:
+      sanitized = self.safety.sanitize_error(
+        str(value), secret_field_names=secret_field_names,
+      )
+    except TypeError:
+      sanitized = self.safety.sanitize_error(str(value))
+    return self._scrub_for_emission(sanitized)
 
   def emit_vulnerable(self, scenario_id, title, severity, owasp, cwe,
                        evidence, *, attack=None, evidence_artifacts=None,
