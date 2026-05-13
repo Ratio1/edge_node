@@ -34,6 +34,15 @@ from extensions.business.container_apps.container_utils import (
   CONTAINER_VOLUMES_PATH,
 )
 
+from .control_files import (
+  JsonControlFile,
+  JsonControlFileClaimError,
+  JsonControlFileDecodeError,
+  JsonControlFileObjectError,
+  JsonControlFileReadError,
+  write_json_atomic,
+)
+
 _HISTORY_WRITTEN_AT_NS = "history_written_at_ns"
 PROVIDER_CAPTURE_OFFLINE = "offline"
 PROVIDER_CAPTURE_ONLINE = "online"
@@ -165,6 +174,11 @@ class SyncManager:
     # guarantees the first ``fetch_latest`` call still hsyncs.
     self._last_hsync = 0.0
 
+  def _request_control_file(self) -> JsonControlFile:
+    return JsonControlFile(
+      volume_sync_dir(self.owner), SYNC_REQUEST_FILE, SYNC_PROCESSING_FILE
+    )
+
   @staticmethod
   def _validate_container_path_shape(container_path: str) -> None:
     if not isinstance(container_path, str) or not container_path:
@@ -275,24 +289,7 @@ class SyncManager:
     runs as a non-root user — without world-readable mode the app can't
     read response.json / last_apply.json / request.json.invalid.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-      dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
-    )
-    try:
-      with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        json.dump(payload, handle, indent=2, sort_keys=True)
-        handle.flush()
-        os.fsync(handle.fileno())
-      os.chmod(tmp_name, 0o666)
-      os.replace(tmp_name, str(path))
-    except Exception:
-      try:
-        os.unlink(tmp_name)
-      except OSError:
-        pass
-      raise
+    write_json_atomic(path, payload)
 
   # ----- history ---------------------------------------------------------
   @staticmethod
@@ -436,9 +433,9 @@ class SyncManager:
     if raw_body is not None and request_body is None:
       invalid_payload["_error"]["raw_body"] = raw_body[:1024]
 
-    vsd = volume_sync_dir(self.owner)
+    control_file = self._request_control_file()
     try:
-      self._write_json_atomic(vsd / SYNC_INVALID_FILE, invalid_payload)
+      control_file.write_json(SYNC_INVALID_FILE, invalid_payload)
     except Exception as exc:
       self.owner.P(f"[sync] failed to write request.json.invalid: {exc}", color="r")
 
@@ -455,13 +452,13 @@ class SyncManager:
       "archive_paths": archive_paths,
     }
     try:
-      self._write_json_atomic(vsd / SYNC_RESPONSE_FILE, response_payload)
+      control_file.write_json(SYNC_RESPONSE_FILE, response_payload)
     except Exception as exc:
       self.owner.P(f"[sync] failed to write response.json: {exc}", color="r")
 
     if processing_path is not None and processing_path.exists():
       try:
-        os.unlink(str(processing_path))
+        control_file.discard_processing()
       except OSError as exc:
         self.owner.P(
           f"[sync] failed to delete .processing after error: {exc}", color="r"
@@ -501,44 +498,39 @@ class SyncManager:
     ``response.json`` (error shape), discards the ``.processing`` file, and
     returns ``None``.
     """
-    vsd = volume_sync_dir(self.owner)
-    req_path = vsd / SYNC_REQUEST_FILE
-    proc_path = vsd / SYNC_PROCESSING_FILE
-
-    if not req_path.is_file():
-      return None  # nothing pending
-
+    control_file = self._request_control_file()
     try:
-      os.replace(str(req_path), str(proc_path))
-    except OSError as exc:
+      claimed = control_file.claim_object()
+    except JsonControlFileClaimError as exc:
       self.owner.P(
         f"[sync] could not rename request.json -> .processing: {exc}", color="r"
       )
       return None
-
-    raw_body: Optional[str] = None
-    try:
-      raw_body = proc_path.read_text(encoding="utf-8")
-    except OSError as exc:
-      self._fail_request(
-        None, STAGE_VALIDATION, f"could not read .processing: {exc}", proc_path
-      )
-      return None
-
-    try:
-      body = json.loads(raw_body)
-    except json.JSONDecodeError as exc:
-      self._fail_request(
-        None, STAGE_VALIDATION, f"malformed JSON: {exc}", proc_path, raw_body=raw_body
-      )
-      return None
-
-    if not isinstance(body, dict):
+    except JsonControlFileReadError as exc:
       self._fail_request(
         None, STAGE_VALIDATION,
-        "request.json must be a JSON object", proc_path, raw_body=raw_body,
+        f"could not read .processing: {exc}", control_file.processing_path,
       )
       return None
+    except JsonControlFileDecodeError as exc:
+      self._fail_request(
+        None, STAGE_VALIDATION,
+        f"malformed JSON: {exc}", control_file.processing_path,
+        raw_body=exc.raw_body,
+      )
+      return None
+    except JsonControlFileObjectError as exc:
+      self._fail_request(
+        None, STAGE_VALIDATION,
+        str(exc), control_file.processing_path, raw_body=exc.raw_body,
+      )
+      return None
+
+    if claimed is None:
+      return None  # nothing pending
+
+    body = claimed.body
+    proc_path = claimed.processing_path
 
     archive_paths = body.get("archive_paths")
     metadata = body.get("metadata", {}) or {}
@@ -710,8 +702,9 @@ class SyncManager:
       "metadata": dict(sync_request.metadata),
       "runtime": runtime_payload,
     }
+    control_file = self._request_control_file()
     vsd = volume_sync_dir(self.owner)
-    proc_path = vsd / SYNC_PROCESSING_FILE
+    proc_path = control_file.processing_path
     tar_path: Optional[str] = None
     try:
       # ---- Stage: archive_build
@@ -801,7 +794,7 @@ class SyncManager:
         "metadata": dict(sync_request.metadata),
       }
       try:
-        self._write_json_atomic(vsd / SYNC_RESPONSE_FILE, response_payload)
+        control_file.write_json(SYNC_RESPONSE_FILE, response_payload)
       except Exception as exc:
         self.owner.P(
           f"[sync] failed to write response.json: {exc}", color="r"
@@ -815,7 +808,7 @@ class SyncManager:
           pass
       if proc_path.exists():
         try:
-          os.unlink(str(proc_path))
+          control_file.discard_processing()
         except OSError as exc:
           self.owner.P(
             f"[sync] failed to delete .processing after success: {exc}", color="y"
