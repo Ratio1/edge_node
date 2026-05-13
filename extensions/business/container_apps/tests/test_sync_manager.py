@@ -512,6 +512,7 @@ class TestClaimRequest(unittest.TestCase):
     self.assertIsNone(self._read_invalid())
 
   def test_runtime_policy_parsed(self):
+    self.owner.cfg_sync_allow_online_provider_capture = True
     self._write_request({
       "archive_paths": ["/app/data/"],
       "runtime": {
@@ -558,6 +559,7 @@ class TestClaimRequest(unittest.TestCase):
     self.assertIn("sometimes", err)
 
   def test_online_provider_capture_allows_unmounted_path(self):
+    self.owner.cfg_sync_allow_online_provider_capture = True
     self._write_request({
       "archive_paths": ["/tmp/generated.txt"],
       "runtime": {"provider_capture": "online"},
@@ -568,6 +570,17 @@ class TestClaimRequest(unittest.TestCase):
     self.assertIsNotNone(result)
     self.assertEqual(result.archive_paths, ["/tmp/generated.txt"])
     self.assertEqual(result.runtime.provider_capture, "online")
+
+  def test_online_provider_capture_rejected_without_local_opt_in(self):
+    self._write_request({
+      "archive_paths": ["/tmp/generated.txt"],
+      "runtime": {"provider_capture": "online"},
+    })
+
+    self.assertIsNone(self.sm.claim_request())
+
+    err = self._read_invalid()["_error"]["error"]
+    self.assertIn("ALLOW_ONLINE_PROVIDER_CAPTURE", err)
 
   def test_malformed_json(self):
     (self.vsd / "request.json").write_text("not-json{")
@@ -946,6 +959,7 @@ class TestPublishSnapshot(unittest.TestCase):
     self.assertFalse((self.vsd / "request.json.invalid").exists())
 
   def test_online_provider_capture_uses_docker_archive_for_unmounted_path(self):
+    self.owner.cfg_sync_allow_online_provider_capture = True
     self.owner.container = _FakeDockerArchiveContainer({
       "/tmp/generated.txt": _tar_bytes("generated.txt", b"from-container"),
     })

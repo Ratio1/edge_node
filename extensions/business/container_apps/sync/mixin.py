@@ -282,6 +282,11 @@ class _SyncMixin:
     """
     return self._hsync_poll_interval()
 
+  @property
+  def cfg_sync_allow_online_provider_capture(self) -> bool:
+    """Provider-local opt-in for Docker archive capture from live containers."""
+    return bool(self._sync_cfg().get("ALLOW_ONLINE_PROVIDER_CAPTURE"))
+
   # ----- manager handle ---------------------------------------------------
 
   def _ensure_sync_manager(self) -> Optional[SyncManager]:
@@ -403,7 +408,7 @@ class _SyncMixin:
       color="b",
     )
 
-    apply_mode = self._sync_record_consumer_apply_mode(record)
+    apply_mode = self._sync_consumer_apply_mode(record)
     if apply_mode == CONSUMER_APPLY_OFFLINE_RESTART:
       self._stop_container_runtime_for_restart()
 
@@ -421,14 +426,15 @@ class _SyncMixin:
 
   # ----- internal helpers ------------------------------------------------
 
-  def _sync_record_consumer_apply_mode(self, record: dict) -> str:
-    runtime = record.get("runtime")
-    if not isinstance(runtime, dict):
-      runtime = (record.get("manifest") or {}).get("runtime")
-    if not isinstance(runtime, dict):
-      return CONSUMER_APPLY_OFFLINE_RESTART
+  def _sync_consumer_apply_mode(self, record: Optional[dict] = None) -> str:
+    """Return the consumer-local lifecycle policy for snapshot apply.
 
-    mode = runtime.get("consumer_apply", CONSUMER_APPLY_OFFLINE_RESTART)
+    Provider-published records may carry the requester's desired
+    ``runtime.consumer_apply`` for audit/UI purposes, but lifecycle safety is
+    decided by the consumer node. A provider must not be able to force a
+    running consumer to hot-apply files without local operator opt-in.
+    """
+    mode = self._sync_cfg().get("CONSUMER_APPLY_MODE", CONSUMER_APPLY_OFFLINE_RESTART)
     allowed = {
       CONSUMER_APPLY_OFFLINE_RESTART,
       CONSUMER_APPLY_ONLINE_NO_RESTART,
@@ -436,12 +442,16 @@ class _SyncMixin:
     }
     if mode not in allowed:
       self.P(
-        f"[sync] unknown consumer_apply mode {mode!r}; using "
+        f"[sync] unknown local CONSUMER_APPLY_MODE {mode!r}; using "
         f"{CONSUMER_APPLY_OFFLINE_RESTART!r}",
         color="y",
       )
       return CONSUMER_APPLY_OFFLINE_RESTART
     return mode
+
+  def _sync_record_consumer_apply_mode(self, record: dict) -> str:
+    """Backward-compatible wrapper for tests/older call sites."""
+    return self._sync_consumer_apply_mode(record)
 
   def _sync_should_tick(self, current_time: float) -> bool:
     last = getattr(self, "_last_sync_check", 0.0) or 0.0

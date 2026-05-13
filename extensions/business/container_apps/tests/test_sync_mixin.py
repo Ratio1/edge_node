@@ -323,6 +323,7 @@ class TestProviderTick(unittest.TestCase):
     self.assertEqual(self.plugin.lifecycle_log, ["stop", "start", "reset"])
 
   def test_online_provider_capture_skips_runtime_stop(self):
+    self.owner.cfg_sync["ALLOW_ONLINE_PROVIDER_CAPTURE"] = True
     self.plugin.container = _FakeDockerArchiveContainer({
       "/tmp/generated.txt": _tar_bytes("generated.txt", b"from-container"),
     })
@@ -425,6 +426,7 @@ class TestConsumerTick(unittest.TestCase):
     self.assertEqual(target.read_bytes(), b"data1")
 
   def test_consumer_online_no_restart_applies_without_lifecycle_stop_start(self):
+    self.consumer_owner.cfg_sync["CONSUMER_APPLY_MODE"] = "online_no_restart"
     self._publish(runtime={"consumer_apply": "online_no_restart"})
 
     self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
@@ -437,6 +439,7 @@ class TestConsumerTick(unittest.TestCase):
     self.assertTrue((volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists())
 
   def test_consumer_online_restart_applies_before_restart(self):
+    self.consumer_owner.cfg_sync["CONSUMER_APPLY_MODE"] = "online_restart"
     target = self.consumer_owner._fixed_root / "appdata" / "weights.bin"
     target.write_bytes(b"old")
     self._publish(content=b"new", runtime={"consumer_apply": "online_restart"})
@@ -448,6 +451,14 @@ class TestConsumerTick(unittest.TestCase):
       orig_stop()
 
     self.consumer_plugin.stop_container = stop_after_apply
+    self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+
+    self.assertEqual(self.consumer_plugin.runtime_stop_calls, 1)
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"])
+
+  def test_provider_record_cannot_force_consumer_online_apply(self):
+    self._publish(runtime={"consumer_apply": "online_no_restart"})
+
     self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
 
     self.assertEqual(self.consumer_plugin.runtime_stop_calls, 1)

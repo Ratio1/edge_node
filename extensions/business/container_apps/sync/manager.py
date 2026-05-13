@@ -564,6 +564,13 @@ class SyncManager:
     for entry in archive_paths:
       try:
         if runtime.provider_capture == PROVIDER_CAPTURE_ONLINE:
+          if not bool(
+            getattr(self.owner, "cfg_sync_allow_online_provider_capture", False)
+          ):
+            raise ValueError(
+              "runtime.provider_capture='online' requires local "
+              "SYNC.ALLOW_ONLINE_PROVIDER_CAPTURE=True"
+            )
           self._validate_container_path_shape(entry)
         else:
           self.resolve_container_path(entry)
@@ -664,6 +671,13 @@ class SyncManager:
     with tarfile.open(str(tar_path), "w:gz") as tar:
       for container_path in archive_paths:
         if provider_capture == PROVIDER_CAPTURE_ONLINE:
+          if not bool(
+            getattr(self.owner, "cfg_sync_allow_online_provider_capture", False)
+          ):
+            raise ValueError(
+              "provider_capture='online' requires local "
+              "SYNC.ALLOW_ONLINE_PROVIDER_CAPTURE=True"
+            )
           self._append_docker_archive_path(tar, container_path)
         else:
           host_path, _bind, _host_root = self.resolve_container_path(container_path)

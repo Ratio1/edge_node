@@ -323,6 +323,8 @@ _CONFIG = {
     "KEY": None,                  # shared UUID across the sync set (provider+consumer)
     "TYPE": None,                 # "provider" | "consumer"
     "POLL_INTERVAL": 10,          # seconds between sync ticks
+    "ALLOW_ONLINE_PROVIDER_CAPTURE": False,  # provider-local opt-in for live container fs capture
+    "CONSUMER_APPLY_MODE": "offline_restart",  # consumer-local apply lifecycle policy
     "HSYNC_POLL_INTERVAL": 600,   # seconds between chainstore_hsync refreshes
                                   # (consumer only; provider only calls hset, never hsync).
                                   # Clamped to min 300s, default 600s. The cheap local-
