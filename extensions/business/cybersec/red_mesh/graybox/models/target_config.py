@@ -366,6 +366,10 @@ class ApiBusinessFlow:
   flow_name: str = "signup"                 # "signup", "password_reset", "purchase", etc.
   body_template: dict = field(default_factory=dict)
   verify_path: str = ""                     # endpoint to verify duplicate creation
+  verify_method: str = "GET"
+  revert_path: str = ""                     # cleanup endpoint required before mutation
+  revert_method: str = "POST"
+  revert_body: dict = field(default_factory=dict)
   test_account: str = ""                    # non-privileged identity used during abuse test
   captcha_marker: str = ""                  # body substring indicating CAPTCHA challenge
   mfa_marker: str = ""                      # body substring indicating MFA challenge
@@ -378,6 +382,10 @@ class ApiBusinessFlow:
       flow_name=d.get("flow_name", "signup"),
       body_template=d.get("body_template", {}),
       verify_path=d.get("verify_path", ""),
+      verify_method=d.get("verify_method", "GET"),
+      revert_path=d.get("revert_path", ""),
+      revert_method=d.get("revert_method", "POST"),
+      revert_body=d.get("revert_body", {}),
       test_account=d.get("test_account", ""),
       captcha_marker=d.get("captcha_marker", ""),
       mfa_marker=d.get("mfa_marker", ""),

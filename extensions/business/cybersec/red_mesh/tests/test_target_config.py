@@ -290,6 +290,10 @@ class TestApiSecurityConfig(unittest.TestCase):
     self.assertEqual(bf.method, "POST")
     self.assertEqual(bf.flow_name, "signup")
     self.assertEqual(bf.body_template, {})
+    self.assertEqual(bf.verify_method, "GET")
+    self.assertEqual(bf.revert_path, "")
+    self.assertEqual(bf.revert_method, "POST")
+    self.assertEqual(bf.revert_body, {})
 
   # ── ApiTokenEndpoint ───────────────────────────────────────────────────
   def test_api_token_endpoint_defaults(self):
@@ -352,7 +356,12 @@ class TestApiSecurityConfig(unittest.TestCase):
       ],
       "business_flows": [
         {"path": "/api/auth/signup/", "flow_name": "signup",
-         "body_template": {"username": "x", "email": "x@x"}},
+         "body_template": {"username": "x", "email": "x@x"},
+         "verify_path": "/api/auth/signup/verify/",
+         "verify_method": "GET",
+         "revert_path": "/api/auth/signup/cleanup/",
+         "revert_method": "DELETE",
+         "revert_body": {"username": "x"}},
       ],
       "token_endpoints": {
         "token_path": "/api/token/",
@@ -374,6 +383,11 @@ class TestApiSecurityConfig(unittest.TestCase):
     self.assertEqual(cfg.function_endpoints[0].revert_path, "/api/admin/users/{uid}/demote/")
     self.assertTrue(cfg.resource_endpoints[0].rate_limit_expected)
     self.assertEqual(cfg.business_flows[0].body_template, {"username": "x", "email": "x@x"})
+    self.assertEqual(cfg.business_flows[0].verify_path, "/api/auth/signup/verify/")
+    self.assertEqual(cfg.business_flows[0].verify_method, "GET")
+    self.assertEqual(cfg.business_flows[0].revert_path, "/api/auth/signup/cleanup/")
+    self.assertEqual(cfg.business_flows[0].revert_method, "DELETE")
+    self.assertEqual(cfg.business_flows[0].revert_body, {"username": "x"})
     self.assertEqual(cfg.token_endpoints.logout_path, "/api/auth/logout/")
     self.assertEqual(cfg.inventory_paths.canonical_probe_path, "/api/v2/records/1/")
     self.assertEqual(cfg.sensitive_field_patterns, ["custom_*_secret"])

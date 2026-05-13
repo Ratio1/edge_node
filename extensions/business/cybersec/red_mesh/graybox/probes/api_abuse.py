@@ -36,6 +36,63 @@ class ApiAbuseProbes(ProbeBase):
   def _session(self):
     return self.auth.official_session or self.auth.regular_session
 
+  def _flow_request(self, session, method, url, body, timeout=10):
+    req = getattr(session, (method or "POST").lower(), session.post)
+    if (method or "POST").upper() in ("GET", "DELETE"):
+      return req(url, params=dict(body or {}), timeout=timeout)
+    return req(url, json=dict(body or {}), timeout=timeout)
+
+  def _flow_verify(self, session, flow):
+    if not flow.verify_path:
+      return True
+    if not self.budget():
+      return False
+    self.safety.throttle()
+    resp = self._flow_request(
+      session,
+      flow.verify_method,
+      self.target_url + flow.verify_path,
+      {},
+      timeout=10,
+    )
+    return resp.status_code < 400
+
+  def _flow_revert(self, session, flow):
+    if not flow.revert_path:
+      return False
+    if not self.budget():
+      return False
+    self.safety.throttle()
+    resp = self._flow_request(
+      session,
+      flow.revert_method,
+      self.target_url + flow.revert_path,
+      flow.revert_body,
+      timeout=10,
+    )
+    return resp.status_code < 400
+
+  def _flow_revert_fn(self, session, flow):
+    if not flow.revert_path:
+      return None
+
+    def revert(_baseline, _flow=flow):
+      return self._flow_revert(session, _flow)
+
+    return revert
+
+  def _flow_replay_steps(self, flow, url, action):
+    steps = [
+      f"{action}: {(flow.method or 'POST').upper()} {url}",
+    ]
+    if flow.revert_path:
+      steps.append(
+        "rollback: "
+        f"{(flow.revert_method or 'POST').upper()} "
+        f"{self.target_url + flow.revert_path}"
+      )
+    return steps
+
   # ── PT-OAPI4-01 — no pagination cap ────────────────────────────────
 
   def _test_no_pagination_cap(self):
@@ -181,9 +238,9 @@ class ApiAbuseProbes(ProbeBase):
             break
           self.safety.throttle()
           try:
-            method = (_flow.method or "POST").upper()
-            req = getattr(session, method.lower(), session.post)
-            resp = req(_url, json=dict(_flow.body_template), timeout=10)
+            resp = self._flow_request(
+              session, _flow.method, _url, _flow.body_template, timeout=10,
+            )
           except requests.RequestException:
             break
           attempts += 1
@@ -202,27 +259,28 @@ class ApiAbuseProbes(ProbeBase):
 
       def verify(baseline_, _flow=flow):
         state = getattr(_flow, "_probe_state", {}) or {}
-        return state.get("attempts", 0) >= 5 and not (
+        signals_confirmed = state.get("attempts", 0) >= 5 and not (
           state.get("captcha") or state.get("mfa")
         )
-
-      def revert(_b, _flow=flow):
-        # Best-effort: the flow may have created records. The operator
-        # is responsible for using `flow.test_account` so cleanup is
-        # scoped. We don't have a generic revert for "5 signup calls."
-        return False  # signals "no_revert_needed -> revert_failed mapping"
+        if not signals_confirmed:
+          return False
+        try:
+          return self._flow_verify(session, _flow)
+        except requests.RequestException:
+          return False
 
       self.run_stateful(
         "PT-OAPI6-01",
         baseline_fn=baseline,
         mutate_fn=mutate,
         verify_fn=verify,
-        revert_fn=revert,
+        revert_fn=self._flow_revert_fn(session, flow),
         finding_kwargs={
           "title": title, "owasp": owasp, "severity": "MEDIUM",
           "cwe": ["CWE-799", "CWE-840"],
           "evidence": [f"flow={flow.flow_name}", f"endpoint={url}",
                        "attempts=5"],
+          "replay_steps": self._flow_replay_steps(flow, url, "repeat 5 times"),
           "remediation": (
             "Add an abuse-prevention layer to sensitive flows: per-account "
             "quota, CAPTCHA challenge after N attempts, or MFA when the "
@@ -242,20 +300,22 @@ class ApiAbuseProbes(ProbeBase):
       return
     for flow in self.target_config.api_security.business_flows:
       url = self.target_url + flow.path
-      method = (flow.method or "POST").upper()
-      req = getattr(session, method.lower(), session.post)
 
       def baseline(_flow=flow):
         return {"flow_name": _flow.flow_name}
 
-      def mutate(_b, _flow=flow, _url=url, _req=req):
+      def mutate(_b, _flow=flow, _url=url):
         if not (self.budget() and self.budget()):
           return False
         try:
           self.safety.throttle()
-          r1 = _req(_url, json=dict(_flow.body_template), timeout=10)
+          r1 = self._flow_request(
+            session, _flow.method, _url, _flow.body_template, timeout=10,
+          )
           self.safety.throttle()
-          r2 = _req(_url, json=dict(_flow.body_template), timeout=10)
+          r2 = self._flow_request(
+            session, _flow.method, _url, _flow.body_template, timeout=10,
+          )
         except requests.RequestException:
           return False
         _flow.__dict__.setdefault("_probe_state2", {})
@@ -265,22 +325,25 @@ class ApiAbuseProbes(ProbeBase):
         return _flow._probe_state2["both_2xx"]
 
       def verify(_b, _flow=flow):
-        return (getattr(_flow, "_probe_state2", {}) or {}).get("both_2xx", False)
-
-      def revert(_b):
-        return False  # see PT-OAPI6-01 — no generic revert
+        if not (getattr(_flow, "_probe_state2", {}) or {}).get("both_2xx", False):
+          return False
+        try:
+          return self._flow_verify(session, _flow)
+        except requests.RequestException:
+          return False
 
       self.run_stateful(
         "PT-OAPI6-02",
         baseline_fn=baseline,
         mutate_fn=mutate,
         verify_fn=verify,
-        revert_fn=revert,
+        revert_fn=self._flow_revert_fn(session, flow),
         finding_kwargs={
           "title": title, "owasp": owasp, "severity": "MEDIUM",
           "cwe": ["CWE-840"],
           "evidence": [f"flow={flow.flow_name}", f"endpoint={url}",
                        "duplicate_accepted=true"],
+          "replay_steps": self._flow_replay_steps(flow, url, "submit twice"),
           "remediation": (
             "Enforce uniqueness server-side (e.g., unique constraint on "
             "username/email/voucher-code). Return 409 Conflict on duplicate."

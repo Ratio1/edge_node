@@ -105,6 +105,79 @@ class TestApi6FlowAbuse(unittest.TestCase):
     self.assertIn("stateful_probes_disabled",
                    "\n".join(incon[0].evidence))
 
+  def test_stateful_enabled_without_revert_path_does_not_mutate(self):
+    flow = ApiBusinessFlow(path="/api/auth/signup/", flow_name="signup",
+                            body_template={"u": "x", "p": "p"})
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-01" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("no_revert_path_configured", "\n".join(incon[0].evidence))
+    p.auth.official_session.post.assert_not_called()
+
+  def test_rate_limit_flow_reverts_after_confirmed_mutation(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "x", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "x"},
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.official_session.post.side_effect = [_resp(status=201)] * 6
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    vuln = [f for f in p.findings
+            if f.scenario_id == "PT-OAPI6-01" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].rollback_status, "reverted")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
+    self.assertIn("rollback:", "\n".join(vuln[0].replay_steps))
+    self.assertEqual(
+      p.auth.official_session.post.call_args_list[-1].args[0],
+      "http://api.example/api/auth/signup/cleanup/",
+    )
+
+  def test_uniqueness_flow_without_revert_path_does_not_mutate(self):
+    flow = ApiBusinessFlow(path="/api/orders/", flow_name="purchase",
+                            body_template={"sku": "sku-1"})
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+
+    p.run_safe("api_flow_no_uniqueness", p._test_flow_no_uniqueness)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-02" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("no_revert_path_configured", "\n".join(incon[0].evidence))
+    p.auth.official_session.post.assert_not_called()
+
+  def test_uniqueness_flow_revert_failure_escalates_severity(self):
+    flow = ApiBusinessFlow(
+      path="/api/orders/",
+      flow_name="purchase",
+      body_template={"sku": "sku-1"},
+      revert_path="/api/orders/cleanup/",
+      revert_body={"sku": "sku-1"},
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.official_session.post.side_effect = [
+      _resp(status=201),
+      _resp(status=201),
+      _resp(status=500),
+    ]
+
+    p.run_safe("api_flow_no_uniqueness", p._test_flow_no_uniqueness)
+
+    vuln = [f for f in p.findings
+            if f.scenario_id == "PT-OAPI6-02" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].rollback_status, "revert_failed")
+    self.assertEqual(vuln[0].severity, "HIGH")
+
 
 if __name__ == "__main__":
   unittest.main()
