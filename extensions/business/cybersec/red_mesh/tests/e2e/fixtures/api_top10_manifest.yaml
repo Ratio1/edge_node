@@ -103,10 +103,10 @@ scenarios:
     hardened_status: not_vulnerable
 
   - id: PT-OAPI5-03
-    honeypot_path: "/api/admin/users/2/promote/"
+    honeypot_path: "/api/admin/users/2/method-override-promote/"
     method: POST
     expected_severity: HIGH
-    expected_evidence_keys: ["override_header=X-HTTP-Method-Override"]
+    expected_evidence_keys: ["plain_status=403", "override_header=X-HTTP-Method-Override"]
     hardened_status: not_vulnerable
     revert_path: "/api/admin/users/2/demote/"
     notes: stateful
@@ -126,6 +126,7 @@ scenarios:
     expected_severity: MEDIUM
     expected_evidence_keys: ["flow=signup", "attempts=5"]
     hardened_status: not_vulnerable
+    revert_path: "/api/auth/signup/cleanup/"
     notes: stateful — creates duplicate accounts; honeypot rate-limits in hardened mode
 
   - id: PT-OAPI6-02
@@ -134,6 +135,7 @@ scenarios:
     expected_severity: MEDIUM
     expected_evidence_keys: ["duplicate_accepted=true"]
     hardened_status: not_vulnerable
+    revert_path: "/api/auth/signup/cleanup/"
 
   - id: PT-API7-01
     honeypot_path: "/api/webhook/test/"

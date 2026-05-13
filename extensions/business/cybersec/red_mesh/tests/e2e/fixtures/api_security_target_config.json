@@ -32,6 +32,13 @@
         "privilege": "admin"
       },
       {
+        "path": "/api/admin/users/2/method-override-promote/",
+        "method": "POST",
+        "privilege": "admin",
+        "revert_path": "/api/admin/users/2/demote/",
+        "revert_body": {}
+      },
+      {
         "path": "/api/admin/users/2/promote/",
         "method": "POST",
         "privilege": "admin",
@@ -58,6 +65,8 @@
         "method": "POST",
         "flow_name": "signup",
         "body_template": {"username": "abuse_canary", "password": "x"},
+        "revert_path": "/api/auth/signup/cleanup/",
+        "revert_body": {"username": "abuse_canary"},
         "test_account": "abuse_canary"
       }
     ],
