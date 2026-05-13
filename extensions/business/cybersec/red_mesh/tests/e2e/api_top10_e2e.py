@@ -145,6 +145,12 @@ def http_get(url: str, timeout: int = 30) -> dict:
     return json.loads(resp.read().decode())
 
 
+def unwrap_result(payload: dict) -> dict:
+  if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+    return payload["result"]
+  return payload
+
+
 # ── Scan orchestration ──────────────────────────────────────────────
 
 def launch_scan(rm: str, honeypot: str, target_config: dict, *,
@@ -162,23 +168,30 @@ def launch_scan(rm: str, honeypot: str, target_config: dict, *,
     "task_name": "api-top10-e2e",
   }
   resp = http_post(f"{rm}/launch_webapp_scan", payload)
-  if "job_id" not in resp:
+  result = unwrap_result(resp)
+  job_id = result.get("job_id") or (result.get("job_specs") or {}).get("job_id")
+  if not job_id:
     raise RuntimeError(f"launch_webapp_scan failed: {resp}")
-  return resp["job_id"]
+  return job_id
 
 
 def wait_for_finalize(rm: str, job_id: str, timeout: int = 600) -> dict:
   deadline = time.time() + timeout
   while time.time() < deadline:
-    resp = http_get(f"{rm}/job_status?job_id={job_id}")
-    if resp.get("status") in ("finalized", "done", "completed"):
+    resp = unwrap_result(http_get(f"{rm}/get_job_status?job_id={job_id}"))
+    status = (
+      resp.get("status") or resp.get("job_status")
+      or (resp.get("job") or {}).get("job_status") or ""
+    )
+    if str(status).lower() in ("finalized", "done", "completed"):
       return resp
     time.sleep(5)
   raise TimeoutError(f"job {job_id} did not finalize within {timeout}s")
 
 
 def fetch_archive(rm: str, job_id: str) -> dict:
-  return http_get(f"{rm}/get_job_archive?job_id={job_id}")
+  resp = unwrap_result(http_get(f"{rm}/get_job_archive?job_id={job_id}"))
+  return resp.get("archive", resp)
 
 
 def collect_findings(archive: dict) -> list[dict]:
@@ -210,7 +223,12 @@ def assert_vulnerable_run(findings: list[dict], manifest: dict) -> list[str]:
         f"{sid}: severity {f['severity']} != expected "
         f"{entry['expected_severity']}",
       )
-    haystack = "\n".join(f.get("evidence", [])) + "\n" + (f.get("description") or "")
+    evidence = f.get("evidence", "")
+    if isinstance(evidence, list):
+      evidence_text = "\n".join(str(x) for x in evidence)
+    else:
+      evidence_text = str(evidence or "")
+    haystack = evidence_text + "\n" + (f.get("description") or "")
     for key in entry.get("expected_evidence_keys", []) or []:
       if key not in haystack:
         errors.append(f"{sid}: evidence missing substring {key!r}")
@@ -293,12 +311,23 @@ def main() -> int:
   if args.scenario in ("stateful-gated", "all"):
     print("\n  Phase 7.4 — stateful-disabled run; expecting inconclusive findings")
     ok &= run("Stateful-gated run", False,
-               lambda fs, m: [
-                 e for e in []
-                 if any(f.get("scenario_id") == "PT-OAPI3-02"
-                          and f.get("status") == "vulnerable" for f in fs)
-                  for e in ["PT-OAPI3-02 must not fire while stateful gated"]
-               ])
+               lambda fs, m: (
+                 ["stateful scenarios must not be vulnerable while gated"]
+                 if any(
+                   f.get("scenario_id") in {"PT-OAPI2-03", "PT-OAPI3-02", "PT-OAPI5-03", "PT-OAPI5-04", "PT-OAPI6-01", "PT-OAPI6-02"}
+                   and f.get("status") == "vulnerable"
+                   for f in fs
+                 )
+                 else []
+               ) + (
+                 ["stateful-gated run produced no stateful inconclusive findings"]
+                 if not any(
+                   f.get("scenario_id") in {"PT-OAPI2-03", "PT-OAPI3-02", "PT-OAPI5-03", "PT-OAPI5-04", "PT-OAPI6-01", "PT-OAPI6-02"}
+                   and f.get("status") == "inconclusive"
+                   for f in fs
+                 )
+                 else []
+               ))
   if args.scenario in ("llm-boundary", "all"):
     print("\n  Phase 7.5 — sample one job's LLM input artifact")
     # Best-effort: actual artifact-fetch endpoint varies by deployment;
