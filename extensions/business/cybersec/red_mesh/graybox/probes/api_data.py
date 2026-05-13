@@ -253,13 +253,20 @@ class ApiDataProbes(ProbeBase):
 
   # ── helpers ────────────────────────────────────────────────────────
 
-  @staticmethod
-  def _render_url(path, id_param, test_id):
+  def _render_url(self, path, id_param, test_id):
+    """Substitute {id} into the endpoint path AND prepend target_url
+    so probes can pass the result directly to session.get/post/patch.
+
+    Previously this was a @staticmethod returning just the path, which
+    caused PT-OAPI3-01 / PT-OAPI3-02 to call session.get('/api/...')
+    with no scheme — requests raised MissingSchema and the probe
+    emitted `baseline_failed` instead of evaluating the response.
+    """
     if "{" + id_param + "}" in path:
       path = path.replace("{" + id_param + "}", str(test_id))
     elif "{id}" in path:
       path = path.replace("{id}", str(test_id))
-    return path
+    return self.target_url + path
 
   @staticmethod
   def _find_sensitive_keys(payload, patterns):
