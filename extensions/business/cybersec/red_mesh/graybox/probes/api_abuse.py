@@ -28,13 +28,32 @@ class ApiAbuseProbes(ProbeBase):
       self.run_safe("api_no_pagination_cap", self._test_no_pagination_cap)
       self.run_safe("api_oversized_payload", self._test_oversized_payload)
       self.run_safe("api_no_rate_limit", self._test_no_rate_limit)
+    else:
+      for sid, title in (
+        ("PT-OAPI4-01", "API endpoint lacks pagination cap"),
+        ("PT-OAPI4-02", "API endpoint accepts oversized payload"),
+        ("PT-OAPI4-03", "API endpoint lacks rate limit"),
+      ):
+        self.emit_inconclusive(sid, title, "API4:2023", "no_configured_resource_endpoints")
     if getattr(api_security, "business_flows", None):
       self.run_safe("api_flow_no_rate_limit", self._test_flow_no_rate_limit)
       self.run_safe("api_flow_no_uniqueness", self._test_flow_no_uniqueness)
+    else:
+      self.emit_inconclusive(
+        "PT-OAPI6-01", "API business flow lacks rate limit / abuse controls",
+        "API6:2023", "no_configured_business_flows",
+      )
+      self.emit_inconclusive(
+        "PT-OAPI6-02", "API business flow lacks uniqueness check",
+        "API6:2023", "no_configured_business_flows",
+      )
     return self.findings
 
   def _session(self):
     return self.auth.official_session or self.auth.regular_session
+
+  def _low_priv_session(self):
+    return self.auth.regular_session
 
   def _flow_request(self, session, method, url, body, timeout=10):
     req = getattr(session, (method or "POST").lower(), session.post)
@@ -46,7 +65,7 @@ class ApiAbuseProbes(ProbeBase):
     if not flow.verify_path:
       return True
     if not self.budget():
-      return False
+      raise RuntimeError("budget_exhausted")
     self.safety.throttle()
     resp = self._flow_request(
       session,
@@ -100,9 +119,16 @@ class ApiAbuseProbes(ProbeBase):
     owasp = "API4:2023"
     session = self._session()
     if session is None:
+      self.emit_inconclusive("PT-OAPI4-01", title, owasp, "no_authenticated_session")
       return
     for ep in self.target_config.api_security.resource_endpoints:
-      if not (self.budget() and self.budget()):
+      if not getattr(ep, "allow_high_limit_probe", False):
+        self.emit_inconclusive(
+          "PT-OAPI4-01", title, owasp, "high_limit_probe_not_authorized",
+        )
+        continue
+      if not self.budget(2):
+        self.emit_inconclusive("PT-OAPI4-01", title, owasp, "budget_exhausted")
         return
       url = self.target_url + ep.path
       self.safety.throttle()
@@ -147,11 +173,19 @@ class ApiAbuseProbes(ProbeBase):
     owasp = "API4:2023"
     session = self._session()
     if session is None:
+      self.emit_inconclusive("PT-OAPI4-02", title, owasp, "no_authenticated_session")
       return
-    big = "A" * 1_000_000  # 1 MB
     for ep in self.target_config.api_security.resource_endpoints:
+      if not getattr(ep, "allow_oversized_payload_probe", False):
+        self.emit_inconclusive(
+          "PT-OAPI4-02", title, owasp, "oversized_payload_probe_not_authorized",
+        )
+        continue
       if not self.budget():
+        self.emit_inconclusive("PT-OAPI4-02", title, owasp, "budget_exhausted")
         return
+      body_bytes = max(1, min(int(getattr(ep, "oversized_payload_bytes", 65_536) or 65_536), 262_144))
+      big = "A" * body_bytes
       url = self.target_url + ep.path
       self.safety.throttle()
       try:
@@ -163,7 +197,7 @@ class ApiAbuseProbes(ProbeBase):
       if resp.status_code < 400:
         self.emit_vulnerable(
           "PT-OAPI4-02", title, "MEDIUM", owasp, ["CWE-770"],
-          [f"endpoint={url}", "body_bytes=1000000",
+          [f"endpoint={url}", f"body_bytes={body_bytes}",
            f"response_status={resp.status_code}"],
           remediation=(
             "Enforce a request-body size limit at the reverse-proxy or "
@@ -178,6 +212,7 @@ class ApiAbuseProbes(ProbeBase):
     owasp = "API4:2023"
     session = self._session()
     if session is None:
+      self.emit_inconclusive("PT-OAPI4-03", title, owasp, "no_authenticated_session")
       return
     for ep in self.target_config.api_security.resource_endpoints:
       if not ep.rate_limit_expected:
@@ -188,6 +223,7 @@ class ApiAbuseProbes(ProbeBase):
       saw_ratelimit_header = False
       for _ in range(10):
         if not self.budget():
+          self.emit_inconclusive("PT-OAPI4-03", title, owasp, "budget_exhausted")
           break
         self.safety.throttle()
         try:
@@ -220,10 +256,14 @@ class ApiAbuseProbes(ProbeBase):
   def _test_flow_no_rate_limit(self):
     title = "API business flow lacks rate limit / abuse controls"
     owasp = "API6:2023"
-    session = self._session()
+    session = self._low_priv_session()
     if session is None:
+      self.emit_inconclusive("PT-OAPI6-01", title, owasp, "no_low_privileged_session")
       return
     for flow in self.target_config.api_security.business_flows:
+      if not flow.test_account:
+        self.emit_inconclusive("PT-OAPI6-01", title, owasp, "no_test_account_configured")
+        continue
       url = self.target_url + flow.path
 
       def baseline(_flow=flow):
@@ -235,7 +275,7 @@ class ApiAbuseProbes(ProbeBase):
         mfa = False
         for _ in range(5):
           if not self.budget():
-            break
+            raise RuntimeError("budget_exhausted")
           self.safety.throttle()
           try:
             resp = self._flow_request(
@@ -295,18 +335,22 @@ class ApiAbuseProbes(ProbeBase):
   def _test_flow_no_uniqueness(self):
     title = "API business flow lacks uniqueness check"
     owasp = "API6:2023"
-    session = self._session()
+    session = self._low_priv_session()
     if session is None:
+      self.emit_inconclusive("PT-OAPI6-02", title, owasp, "no_low_privileged_session")
       return
     for flow in self.target_config.api_security.business_flows:
+      if not flow.test_account:
+        self.emit_inconclusive("PT-OAPI6-02", title, owasp, "no_test_account_configured")
+        continue
       url = self.target_url + flow.path
 
       def baseline(_flow=flow):
         return {"flow_name": _flow.flow_name}
 
       def mutate(_b, _flow=flow, _url=url):
-        if not (self.budget() and self.budget()):
-          return False
+        if not self.budget(2):
+          raise RuntimeError("budget_exhausted")
         try:
           self.safety.throttle()
           r1 = self._flow_request(

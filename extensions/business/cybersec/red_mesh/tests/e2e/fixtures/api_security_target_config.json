@@ -13,7 +13,9 @@
         "test_ids": [1, 2],
         "owner_field": "username",
         "id_param": "id",
-        "tenant_field": "tenant_id"
+        "tenant_field": "tenant_id",
+        "expected_owner": "alice",
+        "expected_tenant": "tenant-a"
       }
     ],
     "property_endpoints": [
@@ -30,6 +32,12 @@
         "path": "/api/admin/export-users/",
         "method": "GET",
         "privilege": "admin"
+      },
+      {
+        "path": "/api/records/force-error/",
+        "method": "GET",
+        "privilege": "user",
+        "allow_malformed_json_probe": true
       },
       {
         "path": "/api/admin/users/2/method-override-promote/",
@@ -52,11 +60,14 @@
         "limit_param": "limit",
         "baseline_limit": 10,
         "abuse_limit": 999999,
-        "rate_limit_expected": true
+        "rate_limit_expected": true,
+        "allow_high_limit_probe": true
       },
       {
         "path": "/api/notes/",
-        "rate_limit_expected": false
+        "rate_limit_expected": false,
+        "allow_oversized_payload_probe": true,
+        "oversized_payload_bytes": 65536
       }
     ],
     "business_flows": [

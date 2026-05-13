@@ -85,7 +85,7 @@ class TestRunStatefulHappyPath(unittest.TestCase):
     self.assertEqual(f.severity, "HIGH")
     self.assertEqual(f.rollback_status, "reverted")
 
-  def test_not_vulnerable_when_verify_fails(self):
+  def test_inconclusive_when_verify_fails_after_mutation(self):
     p = _make_probe(allow_stateful=True)
     p.run_stateful(
       "PT-OAPI3-02",
@@ -96,7 +96,8 @@ class TestRunStatefulHappyPath(unittest.TestCase):
       finding_kwargs={"title": "Mass assignment", "owasp": "API3:2023"},
     )
     f = p.findings[0]
-    self.assertEqual(f.status, "not_vulnerable")
+    self.assertEqual(f.status, "inconclusive")
+    self.assertIn("mutation_unverified", f.evidence[0])
     self.assertEqual(f.rollback_status, "reverted")
 
 

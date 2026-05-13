@@ -121,7 +121,7 @@ class TestApi8DebugEndpointExposed(unittest.TestCase):
 class TestApi8VerboseError(unittest.TestCase):
 
   def test_stack_trace_in_response_medium(self):
-    ep = ApiFunctionEndpoint(path="/api/me/")
+    ep = ApiFunctionEndpoint(path="/api/me/", allow_malformed_json_probe=True)
     p = _make_probe(function_endpoints=[ep])
     p.auth.official_session.post.return_value = _resp(
       status=500,

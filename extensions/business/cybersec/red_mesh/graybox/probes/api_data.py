@@ -46,6 +46,15 @@ class ApiDataProbes(ProbeBase):
     if getattr(api_security, "property_endpoints", None):
       self.run_safe("api_property_exposure", self._test_api_property_exposure)
       self.run_safe("api_property_tampering", self._test_api_property_tampering)
+    else:
+      self.emit_inconclusive(
+        "PT-OAPI3-01", "API response leaks sensitive properties",
+        "API3:2023", "no_configured_property_endpoints",
+      )
+      self.emit_inconclusive(
+        "PT-OAPI3-02", "API accepts mass assignment of privileged properties",
+        "API3:2023", "no_configured_property_endpoints",
+      )
 
     return self.findings
 
@@ -138,10 +147,10 @@ class ApiDataProbes(ProbeBase):
     title = "API accepts mass assignment of privileged properties"
     owasp = "API3:2023"
 
-    session = self.auth.regular_session or self.auth.official_session
+    session = self.auth.regular_session
     if session is None:
       self.emit_inconclusive(
-        "PT-OAPI3-02", title, owasp, "no_authenticated_session",
+        "PT-OAPI3-02", title, owasp, "no_low_privileged_session",
       )
       return
 
@@ -174,7 +183,7 @@ class ApiDataProbes(ProbeBase):
         if base is None:
           return False
         if not self.budget():
-          return False
+          raise RuntimeError("budget_exhausted")
         self.safety.throttle()
         payload = {_field: True}
         try:
@@ -190,7 +199,7 @@ class ApiDataProbes(ProbeBase):
 
       def verify(base, _ep=ep, _url=read_url, _field=target_field):
         if not self.budget():
-          return False
+          raise RuntimeError("budget_exhausted")
         self.safety.throttle()
         try:
           resp = session.get(_url, timeout=10, allow_redirects=False)
@@ -213,7 +222,7 @@ class ApiDataProbes(ProbeBase):
         if base is None:
           return False
         if not self.budget():
-          return False
+          raise RuntimeError("budget_exhausted")
         before = base.get(_field, False)
         try:
           if _method == "PATCH":

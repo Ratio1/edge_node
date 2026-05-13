@@ -59,7 +59,13 @@ class ApiAuthProbes(ProbeBase):
     if api_security is None:
       return self.findings
     tok = api_security.token_endpoints
-    if not (tok.token_path and tok.protected_path):
+    if not tok.protected_path:
+      for sid, title in (
+        ("PT-OAPI2-01", "API JWT missing-signature accepted (alg=none)"),
+        ("PT-OAPI2-02", "API JWT signed with weak HMAC secret"),
+        ("PT-OAPI2-03", "API token not invalidated on logout"),
+      ):
+        self.emit_inconclusive(sid, title, "API2:2023", "no_protected_path_configured")
       return self.findings
     self.run_safe("api_jwt_alg_none", self._test_jwt_alg_none)
     self.run_safe("api_jwt_weak_hmac", self._test_jwt_weak_hmac)
@@ -70,17 +76,26 @@ class ApiAuthProbes(ProbeBase):
   # ── helpers ────────────────────────────────────────────────────────
 
   def _obtain_token(self):
-    """POST credentials to token_path; return (token, raw_payload) or (None, None)."""
+    """Return (token, raw_payload) from token_path or configured bearer session."""
     tok = self.target_config.api_security.token_endpoints
     session = self.auth.official_session or self.auth.regular_session
     if session is None:
       return None, None
+    if not tok.token_path:
+      token = self._configured_session_bearer_token(session)
+      return (token, {"source": "configured_bearer_token"}) if token else (None, None)
     if not self.budget():
       return None, None
     url = self.target_url + tok.token_path
+    method = (getattr(tok, "token_request_method", "POST") or "POST").upper()
+    body = dict(getattr(tok, "token_request_body", {}) or {})
     self.safety.throttle()
     try:
-      resp = session.post(url, timeout=10)
+      req = getattr(session, method.lower(), session.post)
+      if method in ("GET", "DELETE"):
+        resp = req(url, params=body, timeout=10)
+      else:
+        resp = req(url, json=body if body else None, timeout=10)
     except requests.RequestException:
       return None, None
     if resp.status_code >= 400:
@@ -89,10 +104,38 @@ class ApiAuthProbes(ProbeBase):
       data = resp.json()
     except (ValueError, requests.exceptions.JSONDecodeError):
       return None, None
-    token = (
-      data.get("token") or data.get("access_token") or data.get("jwt") or ""
-    )
+    field = (getattr(tok, "token_response_field", "") or "").strip()
+    token = data.get(field) if field else None
+    token = token or data.get("token") or data.get("access_token") or data.get("jwt") or ""
     return token, data
+
+  def _auth_descriptor(self):
+    api_security = getattr(self.target_config, "api_security", None)
+    auth = getattr(api_security, "auth", None) if api_security is not None else None
+    if auth is None:
+      from ..models.target_config import AuthDescriptor
+      return AuthDescriptor()
+    return auth
+
+  def _configured_session_bearer_token(self, session) -> str:
+    auth = self._auth_descriptor()
+    header_name = getattr(auth, "bearer_token_header_name", "Authorization") or "Authorization"
+    raw = ""
+    try:
+      raw = (session.headers or {}).get(header_name, "") or ""
+    except Exception:
+      raw = ""
+    scheme = getattr(auth, "bearer_scheme", "Bearer") or ""
+    if scheme and raw.lower().startswith((scheme + " ").lower()):
+      raw = raw[len(scheme):].strip()
+    return raw if raw.count(".") == 2 else ""
+
+  def _auth_headers_for_token(self, token: str) -> dict:
+    auth = self._auth_descriptor()
+    header_name = getattr(auth, "bearer_token_header_name", "Authorization") or "Authorization"
+    scheme = getattr(auth, "bearer_scheme", "Bearer") or "Bearer"
+    value = f"{scheme} {token}".strip() if scheme else token
+    return {header_name: value}
 
   # ── PT-OAPI2-01 — alg=none ────────────────────────────────────────
 
@@ -117,7 +160,7 @@ class ApiAuthProbes(ProbeBase):
     self.safety.throttle()
     try:
       resp = requests.get(
-        url, headers={"Authorization": f"Bearer {forged}"},
+        url, headers=self._auth_headers_for_token(forged),
         timeout=10, verify=self.auth.verify_tls if hasattr(self.auth, "verify_tls") else True,
         allow_redirects=False,
       )
@@ -234,7 +277,7 @@ class ApiAuthProbes(ProbeBase):
       self.safety.throttle()
       try:
         resp = requests.post(
-          url, headers={"Authorization": f"Bearer {base}"},
+          url, headers=self._auth_headers_for_token(base),
           timeout=10, allow_redirects=False,
         )
       except requests.RequestException:
@@ -247,7 +290,7 @@ class ApiAuthProbes(ProbeBase):
       url = self.target_url + tok.protected_path
       try:
         resp = requests.get(
-          url, headers={"Authorization": f"Bearer {base}"},
+          url, headers=self._auth_headers_for_token(base),
           timeout=10, allow_redirects=False,
         )
       except requests.RequestException:

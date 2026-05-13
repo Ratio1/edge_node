@@ -141,11 +141,16 @@ class ProbeBase:
 
     # 3. Verify.
     confirmed = False
+    verify_failed_reason = ""
     if mutated:
       try:
         confirmed = bool(verify_fn(baseline))
-      except Exception:
+        if not confirmed:
+          verify_failed_reason = "mutation_unverified"
+      except Exception as exc:
         confirmed = False
+        detail = self._sanitize_error(str(exc))
+        verify_failed_reason = f"verify_failed:{detail}" if detail else "verify_failed"
 
     # 4. Revert (always attempt — even if not confirmed, the mutate may
     #    have left the target in an unintended state).
@@ -157,9 +162,9 @@ class ProbeBase:
       except Exception:
         rollback_status = "revert_failed"
 
-    # 5. Emit. Confirmed = vulnerable; otherwise clean. `rollback_status`
-    # is set as a first-class field on the finding (Subphase 1.8 commit #2)
-    # so PDF/UI can render it as a badge without parsing evidence strings.
+    # 5. Emit. Confirmed = vulnerable. A mutation that cannot be verified
+    # is inconclusive, not clean: the target may have changed, or request
+    # budget/transport may have prevented confirmation.
     if confirmed:
       severity = finding_kwargs.pop("severity", "HIGH")
       # Severity bump on revert failure: HIGH→CRITICAL, MEDIUM→HIGH.
@@ -180,6 +185,13 @@ class ProbeBase:
         **finding_kwargs,
       )
       return True
+    elif mutated:
+      self.emit_inconclusive(
+        scenario_id, title, owasp,
+        verify_failed_reason or "mutation_unverified",
+        rollback_status=rollback_status,
+      )
+      return False
     else:
       self.emit_clean(
         scenario_id, title, owasp,
@@ -317,7 +329,8 @@ class ProbeBase:
       rollback_status=rollback_status or "",
     ))
 
-  def emit_inconclusive(self, scenario_id, title, owasp, reason):
+  def emit_inconclusive(self, scenario_id, title, owasp, reason,
+                        *, rollback_status=""):
     """Append an inconclusive / INFO GrayboxFinding.
 
     Use when a scenario could not be evaluated (missing config, stateful
@@ -333,4 +346,5 @@ class ProbeBase:
       severity="INFO",
       owasp=owasp,
       evidence=[f"reason={self._scrub_for_emission(reason)}"],
+      rollback_status=rollback_status or "",
     ))

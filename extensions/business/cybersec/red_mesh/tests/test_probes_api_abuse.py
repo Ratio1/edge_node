@@ -45,7 +45,8 @@ class TestApi4NoPaginationCap(unittest.TestCase):
 
   def test_size_explosion_emits_medium(self):
     ep = ApiResourceEndpoint(path="/api/records/", baseline_limit=10,
-                              abuse_limit=999_999)
+                              abuse_limit=999_999,
+                              allow_high_limit_probe=True)
     p = _make_probe(resource_endpoints=[ep])
     # 100B baseline → 1MB abuse response = >5× growth
     p.auth.official_session.get.side_effect = [
@@ -62,7 +63,9 @@ class TestApi4NoPaginationCap(unittest.TestCase):
 class TestApi4OversizedPayload(unittest.TestCase):
 
   def test_oversized_accepted_medium(self):
-    ep = ApiResourceEndpoint(path="/api/notes/")
+    ep = ApiResourceEndpoint(path="/api/notes/",
+                              allow_oversized_payload_probe=True,
+                              oversized_payload_bytes=65_536)
     p = _make_probe(resource_endpoints=[ep])
     p.auth.official_session.post.return_value = _resp(status=201)
     p.run_safe("api_oversized_payload", p._test_oversized_payload)
@@ -96,7 +99,8 @@ class TestApi6FlowAbuse(unittest.TestCase):
 
   def test_stateful_disabled_emits_inconclusive(self):
     flow = ApiBusinessFlow(path="/api/auth/signup/", flow_name="signup",
-                            body_template={"u": "x", "p": "p"})
+                            body_template={"u": "x", "p": "p"},
+                            test_account="api-low")
     p = _make_probe(business_flows=[flow], allow_stateful=False)
     p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
     incon = [f for f in p.findings
@@ -107,7 +111,8 @@ class TestApi6FlowAbuse(unittest.TestCase):
 
   def test_stateful_enabled_without_revert_path_does_not_mutate(self):
     flow = ApiBusinessFlow(path="/api/auth/signup/", flow_name="signup",
-                            body_template={"u": "x", "p": "p"})
+                            body_template={"u": "x", "p": "p"},
+                            test_account="api-low")
     p = _make_probe(business_flows=[flow], allow_stateful=True)
 
     p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
@@ -116,7 +121,7 @@ class TestApi6FlowAbuse(unittest.TestCase):
              if f.scenario_id == "PT-OAPI6-01" and f.status == "inconclusive"]
     self.assertEqual(len(incon), 1)
     self.assertIn("no_revert_path_configured", "\n".join(incon[0].evidence))
-    p.auth.official_session.post.assert_not_called()
+    p.auth.regular_session.post.assert_not_called()
 
   def test_rate_limit_flow_reverts_after_confirmed_mutation(self):
     flow = ApiBusinessFlow(
@@ -125,9 +130,10 @@ class TestApi6FlowAbuse(unittest.TestCase):
       body_template={"u": "x", "p": "p"},
       revert_path="/api/auth/signup/cleanup/",
       revert_body={"u": "x"},
+      test_account="api-low",
     )
     p = _make_probe(business_flows=[flow], allow_stateful=True)
-    p.auth.official_session.post.side_effect = [_resp(status=201)] * 6
+    p.auth.regular_session.post.side_effect = [_resp(status=201)] * 6
 
     p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
 
@@ -138,13 +144,14 @@ class TestApi6FlowAbuse(unittest.TestCase):
     self.assertEqual(vuln[0].severity, "MEDIUM")
     self.assertIn("rollback:", "\n".join(vuln[0].replay_steps))
     self.assertEqual(
-      p.auth.official_session.post.call_args_list[-1].args[0],
+      p.auth.regular_session.post.call_args_list[-1].args[0],
       "http://api.example/api/auth/signup/cleanup/",
     )
 
   def test_uniqueness_flow_without_revert_path_does_not_mutate(self):
     flow = ApiBusinessFlow(path="/api/orders/", flow_name="purchase",
-                            body_template={"sku": "sku-1"})
+                            body_template={"sku": "sku-1"},
+                            test_account="api-low")
     p = _make_probe(business_flows=[flow], allow_stateful=True)
 
     p.run_safe("api_flow_no_uniqueness", p._test_flow_no_uniqueness)
@@ -153,7 +160,7 @@ class TestApi6FlowAbuse(unittest.TestCase):
              if f.scenario_id == "PT-OAPI6-02" and f.status == "inconclusive"]
     self.assertEqual(len(incon), 1)
     self.assertIn("no_revert_path_configured", "\n".join(incon[0].evidence))
-    p.auth.official_session.post.assert_not_called()
+    p.auth.regular_session.post.assert_not_called()
 
   def test_uniqueness_flow_revert_failure_escalates_severity(self):
     flow = ApiBusinessFlow(
@@ -162,9 +169,10 @@ class TestApi6FlowAbuse(unittest.TestCase):
       body_template={"sku": "sku-1"},
       revert_path="/api/orders/cleanup/",
       revert_body={"sku": "sku-1"},
+      test_account="api-low",
     )
     p = _make_probe(business_flows=[flow], allow_stateful=True)
-    p.auth.official_session.post.side_effect = [
+    p.auth.regular_session.post.side_effect = [
       _resp(status=201),
       _resp(status=201),
       _resp(status=500),

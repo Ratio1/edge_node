@@ -77,7 +77,7 @@ scenarios:
     honeypot_path: "/api/notes/"
     method: POST
     expected_severity: MEDIUM
-    expected_evidence_keys: ["body_bytes=1000000"]
+    expected_evidence_keys: ["body_bytes=65536"]
     hardened_status: not_vulnerable
 
   - id: PT-OAPI4-03

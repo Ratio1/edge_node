@@ -52,6 +52,14 @@ class ApiConfigProbes(ProbeBase):
       self.run_safe("api_security_headers", self._test_security_headers)
       self.run_safe("api_unexpected_methods", self._test_unexpected_methods)
       self.run_safe("api_verbose_error", self._test_verbose_error)
+    else:
+      for sid, title in (
+        ("PT-OAPI8-01", "API permissive CORS configuration"),
+        ("PT-OAPI8-02", "API response missing security headers"),
+        ("PT-OAPI8-04", "API verbose error response leaks internals"),
+        ("PT-OAPI8-05", "API advertises unexpected HTTP methods"),
+      ):
+        self.emit_inconclusive(sid, title, "API8:2023", "no_configured_function_endpoints")
     self.run_safe("api_debug_endpoint", self._test_debug_endpoint_exposed)
 
     # API9 inventory
@@ -87,6 +95,10 @@ class ApiConfigProbes(ProbeBase):
     found_any = False
     for ep in api_security.function_endpoints:
       if not self.budget():
+        self.emit_inconclusive(
+          "PT-OAPI8-01", "API permissive CORS configuration",
+          "API8:2023", "budget_exhausted",
+        )
         return
       url = self.target_url + ep.path
       self.safety.throttle()
@@ -140,9 +152,17 @@ class ApiConfigProbes(ProbeBase):
     api_security = self.target_config.api_security
     session = self._session()
     if session is None:
+      self.emit_inconclusive(
+        "PT-OAPI8-02", "API response missing security headers",
+        "API8:2023", "no_authenticated_session",
+      )
       return
     for ep in api_security.function_endpoints:
       if not self.budget():
+        self.emit_inconclusive(
+          "PT-OAPI8-02", "API response missing security headers",
+          "API8:2023", "budget_exhausted",
+        )
         return
       url = self.target_url + ep.path
       self.safety.throttle()
@@ -184,9 +204,17 @@ class ApiConfigProbes(ProbeBase):
     api_security = self.target_config.api_security
     session = self._session()
     if session is None:
+      self.emit_inconclusive(
+        "PT-OAPI8-03", "API debug endpoint exposed",
+        "API8:2023", "no_authenticated_session",
+      )
       return
     for path in api_security.debug_path_candidates:
       if not self.budget():
+        self.emit_inconclusive(
+          "PT-OAPI8-03", "API debug endpoint exposed",
+          "API8:2023", "budget_exhausted",
+        )
         return
       url = self.target_url + path
       self.safety.throttle()
@@ -216,9 +244,25 @@ class ApiConfigProbes(ProbeBase):
     api_security = self.target_config.api_security
     session = self._session()
     if session is None:
+      self.emit_inconclusive(
+        "PT-OAPI8-04", "API verbose error response leaks internals",
+        "API8:2023", "no_authenticated_session",
+      )
       return
-    for ep in api_security.function_endpoints:
+    opted_in = [ep for ep in api_security.function_endpoints
+                if getattr(ep, "allow_malformed_json_probe", False)]
+    if not opted_in:
+      self.emit_inconclusive(
+        "PT-OAPI8-04", "API verbose error response leaks internals",
+        "API8:2023", "malformed_json_probe_not_authorized",
+      )
+      return
+    for ep in opted_in:
       if not self.budget():
+        self.emit_inconclusive(
+          "PT-OAPI8-04", "API verbose error response leaks internals",
+          "API8:2023", "budget_exhausted",
+        )
         return
       url = self.target_url + ep.path
       self.safety.throttle()
@@ -249,10 +293,18 @@ class ApiConfigProbes(ProbeBase):
     api_security = self.target_config.api_security
     session = self._session()
     if session is None:
+      self.emit_inconclusive(
+        "PT-OAPI8-05", "API advertises unexpected HTTP methods",
+        "API8:2023", "no_authenticated_session",
+      )
       return
     risky = {"TRACE", "PUT", "DELETE", "PATCH"}
     for ep in api_security.function_endpoints:
       if not self.budget():
+        self.emit_inconclusive(
+          "PT-OAPI8-05", "API advertises unexpected HTTP methods",
+          "API8:2023", "budget_exhausted",
+        )
         return
       url = self.target_url + ep.path
       self.safety.throttle()
@@ -290,6 +342,10 @@ class ApiConfigProbes(ProbeBase):
       return
     for path in inv.openapi_candidates:
       if not self.budget():
+        self.emit_inconclusive(
+          "PT-OAPI9-01", "API OpenAPI/Swagger specification publicly exposed",
+          "API9:2023", "budget_exhausted",
+        )
         return
       url = self.target_url + path
       self.safety.throttle()
@@ -343,6 +399,10 @@ class ApiConfigProbes(ProbeBase):
     api_security = self.target_config.api_security
     inv = api_security.inventory_paths
     if not inv.current_version or not inv.canonical_probe_path:
+      self.emit_inconclusive(
+        "PT-OAPI9-02", "API legacy version still live (version sprawl)",
+        "API9:2023", "no_current_version_or_canonical_probe_path",
+      )
       return
     session = self._session()
     if session is None:
@@ -354,6 +414,10 @@ class ApiConfigProbes(ProbeBase):
 
     for sibling in inv.version_sibling_candidates:
       if not self.budget():
+        self.emit_inconclusive(
+          "PT-OAPI9-02", "API legacy version still live (version sprawl)",
+          "API9:2023", "budget_exhausted",
+        )
         return
       sib = sibling.rstrip("/")
       if sib == current:
@@ -385,12 +449,20 @@ class ApiConfigProbes(ProbeBase):
     api_security = self.target_config.api_security
     inv = api_security.inventory_paths
     if not inv.deprecated_paths:
+      self.emit_inconclusive(
+        "PT-OAPI9-03", "API deprecated path still serving requests",
+        "API9:2023", "no_deprecated_paths_configured",
+      )
       return
     session = self._session()
     if session is None:
       return
     for path in inv.deprecated_paths:
       if not self.budget():
+        self.emit_inconclusive(
+          "PT-OAPI9-03", "API deprecated path still serving requests",
+          "API9:2023", "budget_exhausted",
+        )
         return
       url = self.target_url + path
       self.safety.throttle()

@@ -46,12 +46,27 @@ class ApiAccessProbes(ProbeBase):
 
     if getattr(api_security, "object_endpoints", None):
       self.run_safe("api_bola", self._test_api_bola)
+    else:
+      self.emit_inconclusive(
+        "PT-OAPI1-01",
+        "API object-level authorization bypass (BOLA)",
+        "API1:2023",
+        "no_configured_object_endpoints",
+      )
 
     if getattr(api_security, "function_endpoints", None):
       self.run_safe("api_bfla_regular", self._test_bfla_regular_as_admin)
       self.run_safe("api_bfla_anon", self._test_bfla_anon_as_user)
       self.run_safe("api_bfla_method_override", self._test_bfla_method_override)
       self.run_safe("api_bfla_mutating", self._test_bfla_regular_as_admin_mutating)
+    else:
+      for sid, title in (
+        ("PT-OAPI5-01", "API function-level authorization bypass (regular as admin, read)"),
+        ("PT-OAPI5-02", "API function-level authorization bypass (anonymous as user, read)"),
+        ("PT-OAPI5-03", "API method-override authorization bypass"),
+        ("PT-OAPI5-04", "API function-level authorization bypass (regular as admin, mutating)"),
+      ):
+        self.emit_inconclusive(sid, title, "API5:2023", "no_configured_function_endpoints")
 
     return self.findings
 
@@ -70,13 +85,13 @@ class ApiAccessProbes(ProbeBase):
     """
     api_security = self.target_config.api_security
     endpoints = api_security.object_endpoints
-    session = self.auth.regular_session or self.auth.official_session
+    session = self.auth.regular_session
     if session is None:
       self.emit_inconclusive(
         "PT-OAPI1-01",
         "API object-level authorization bypass (BOLA)",
         "API1:2023",
-        "no_authenticated_session",
+        "no_low_privileged_session",
       )
       return
 
@@ -101,7 +116,7 @@ class ApiAccessProbes(ProbeBase):
           continue
 
         outcome = self._evaluate_bola_response(ep, test_id, url, resp)
-        if outcome == "vulnerable" or outcome == "clean":
+        if outcome in ("vulnerable", "clean", "inconclusive"):
           found_any = True
 
     if not found_any:
@@ -148,19 +163,36 @@ class ApiAccessProbes(ProbeBase):
       return "skip"
     if not isinstance(data, dict):
       return "skip"
-    # FP guard 4: owner_field must be present (otherwise nothing to compare).
-    if ep.owner_field not in data:
+    tenant_field = (ep.tenant_field or "").strip()
+    owner_present = ep.owner_field in data
+    tenant_present = bool(tenant_field and tenant_field in data)
+    # FP guard 4: an expected owner/tenant field must be present.
+    if not owner_present and not tenant_present:
       return "skip"
 
-    expected_principal = self.regular_username or "<unknown>"
-    owner_value = str(data.get(ep.owner_field))
-    tenant_field = (ep.tenant_field or "").strip()
+    expected_owner = (getattr(ep, "expected_owner", "") or self.regular_username or "").strip()
+    expected_tenant = (getattr(ep, "expected_tenant", "") or "").strip()
+    if not expected_owner and not expected_tenant:
+      self.emit_inconclusive(
+        "PT-OAPI1-01", title, owasp, "no_expected_owner_or_tenant",
+      )
+      return "inconclusive"
 
-    owner_mismatch = owner_value and owner_value != expected_principal
+    owner_value = str(data.get(ep.owner_field)) if owner_present else ""
+    tenant_value = str(data.get(tenant_field)) if tenant_present else ""
+    owner_mismatch = bool(owner_present and expected_owner
+                            and owner_value != expected_owner)
     tenant_mismatch = bool(
-      tenant_field and tenant_field in data
-      and data[tenant_field] is not None
+      tenant_present and expected_tenant and tenant_value != expected_tenant
     )
+    if not owner_mismatch and not tenant_mismatch:
+      compared = bool((owner_present and expected_owner)
+                      or (tenant_present and expected_tenant))
+      if not compared:
+        self.emit_inconclusive(
+          "PT-OAPI1-01", title, owasp, "no_comparable_expected_owner_or_tenant",
+        )
+        return "inconclusive"
 
     if owner_mismatch or tenant_mismatch:
       sensitive_fields = self._collect_sensitive_field_names(data)
@@ -171,11 +203,13 @@ class ApiAccessProbes(ProbeBase):
         "content_type=application/json",
         f"owner_field={ep.owner_field}",
         f"owner_value={owner_value}",
-        f"authenticated_user={expected_principal}",
+        f"expected_owner={expected_owner}",
         f"test_id={test_id}",
       ]
       if tenant_mismatch:
         evidence.append(f"tenant_field={tenant_field}")
+        evidence.append(f"tenant_value={tenant_value}")
+        evidence.append(f"expected_tenant={expected_tenant}")
       if sensitive_fields:
         evidence.append("pii_fields=" + ",".join(sorted(sensitive_fields)))
       replay = [
@@ -201,7 +235,7 @@ class ApiAccessProbes(ProbeBase):
       [f"endpoint={url}", "response_status=200",
        f"owner_field={ep.owner_field}",
        f"owner_value={owner_value}",
-       f"authenticated_user={expected_principal}"],
+       f"expected_owner={expected_owner}"],
     )
     return "clean"
 

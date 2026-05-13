@@ -106,6 +106,7 @@ class TestApi1Bola(unittest.TestCase):
     ep = ApiObjectEndpoint(
       path="/api/records/{id}/", test_ids=[1],
       owner_field="owner", tenant_field="tenant_id",
+      expected_tenant="tenant-a",
     )
     p = _make_probe(object_endpoints=[ep])
     # owner matches alice, but tenant_id leaks cross-tenant data.
@@ -180,11 +181,13 @@ class TestApi1Bola(unittest.TestCase):
     statuses = [f.status for f in p.findings]
     self.assertNotIn("vulnerable", statuses)
 
-  def test_no_object_endpoints_no_findings(self):
-    """Empty config → run() emits nothing (no inconclusive noise)."""
+  def test_no_object_endpoints_emit_inconclusive_inventory(self):
+    """Empty config still tells the operator API1/API5 were not evaluated."""
     p = _make_probe(object_endpoints=[])
     p.run()
-    self.assertEqual(p.findings, [])
+    ids = {f.scenario_id for f in p.findings if f.status == "inconclusive"}
+    self.assertIn("PT-OAPI1-01", ids)
+    self.assertIn("PT-OAPI5-01", ids)
 
   def test_no_authenticated_session_emits_inconclusive(self):
     """No session at all → inconclusive (probe could not run)."""
@@ -196,7 +199,21 @@ class TestApi1Bola(unittest.TestCase):
     p.run()
     f = p.findings[0]
     self.assertEqual(f.status, "inconclusive")
-    self.assertIn("no_authenticated_session", f.evidence[0])
+    self.assertIn("no_low_privileged_session", f.evidence[0])
+
+  def test_no_regular_session_does_not_fallback_to_official(self):
+    ep = ApiObjectEndpoint(path="/api/records/{id}/", test_ids=[1],
+                            owner_field="owner")
+    p = _make_probe(object_endpoints=[ep])
+    p.auth.regular_session = None
+    p.auth.official_session.get.return_value = _mock_response(
+      json_body={"owner": "bob"},
+    )
+    p.run()
+    self.assertFalse(p.auth.official_session.get.called)
+    f = next(f for f in p.findings if f.scenario_id == "PT-OAPI1-01")
+    self.assertEqual(f.status, "inconclusive")
+    self.assertIn("no_low_privileged_session", f.evidence[0])
 
 
 class TestApi5Bfla(unittest.TestCase):
