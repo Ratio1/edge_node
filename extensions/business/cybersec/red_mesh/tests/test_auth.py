@@ -155,14 +155,13 @@ class TestBearerAuthStrategy(unittest.TestCase):
     mock_requests.head.assert_not_called()
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
-  def test_preflight_401_returns_error(self, mock_requests):
+  def test_preflight_401_is_allowed_before_token_is_sent(self, mock_requests):
     import requests as real_requests
     mock_requests.head.return_value = _mock_response(status=401)
     mock_requests.RequestException = real_requests.RequestException
     ba = self._bearer(authenticated_probe_path="/api/me")
     err = ba.preflight()
-    self.assertIsNotNone(err)
-    self.assertIn("401", err)
+    self.assertIsNone(err)
 
 
 class TestApiKeyAuthStrategy(unittest.TestCase):
@@ -230,6 +229,85 @@ class TestAuthManagerStrategyDispatch(unittest.TestCase):
     auth = self._auth_with("bogus")
     with self.assertRaises(ValueError):
       auth._build_strategy()
+
+
+class TestAuthManagerNativeApiCredentials(unittest.TestCase):
+  """AuthManager preserves token/key credentials through strategy dispatch."""
+
+  def _auth_with_descriptor(self, **auth_kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    desc = AuthDescriptor(**auth_kwargs)
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=desc))
+    return AuthManager("http://api.example", cfg, verify_tls=False)
+
+  def _mock_session(self, status=200):
+    session = MagicMock()
+    session.headers = {}
+    session.params = {}
+    session.head.return_value = _mock_response(status=status)
+    return session
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_authenticate_bearer_stamps_token_and_validates_after_auth(self, mock_requests):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+
+    session = self._mock_session(status=200)
+    mock_requests.Session.return_value = session
+
+    auth = self._auth_with_descriptor(
+      auth_type="bearer",
+      authenticated_probe_path="/api/me",
+    )
+    ok = auth.authenticate(Credentials(bearer_token="TOKEN-123"))
+
+    self.assertTrue(ok)
+    self.assertIs(auth.official_session, session)
+    self.assertEqual(session.headers["Authorization"], "Bearer TOKEN-123")
+    session.head.assert_called_once_with(
+      "http://api.example/api/me",
+      timeout=10,
+      allow_redirects=True,
+    )
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_authenticate_api_key_query_validates_with_session_params(self, mock_requests):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+
+    session = self._mock_session(status=200)
+    mock_requests.Session.return_value = session
+
+    auth = self._auth_with_descriptor(
+      auth_type="api_key",
+      authenticated_probe_path="/api/me",
+      api_key_location="query",
+      api_key_query_param="apikey",
+    )
+    ok = auth.authenticate(Credentials(api_key="KEY-123"))
+
+    self.assertTrue(ok)
+    self.assertIs(auth.official_session, session)
+    self.assertEqual(session.params, {"apikey": "KEY-123"})
+    session.head.assert_called_once()
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_authenticate_bearer_rejects_unauthorized_probe_path(self, mock_requests):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+
+    session = self._mock_session(status=401)
+    mock_requests.Session.return_value = session
+
+    auth = self._auth_with_descriptor(
+      auth_type="bearer",
+      authenticated_probe_path="/api/me",
+    )
+    ok = auth.authenticate(Credentials(bearer_token="BAD-TOKEN"))
+
+    self.assertFalse(ok)
+    self.assertIsNone(auth.official_session)
+    session.close.assert_called_once()
+    self.assertIn("official_login_failed", auth._auth_errors)
 
 
 class TestLoginSuccessDetection(unittest.TestCase):

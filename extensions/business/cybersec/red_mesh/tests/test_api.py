@@ -359,6 +359,42 @@ class TestPhase1ConfigCID(unittest.TestCase):
     job_specs = self._extract_job_specs(plugin, "test-job-websecret")
     self.assertEqual(job_specs["job_config_cid"], "QmConfigCID")
 
+  def test_launch_webapp_scan_persists_bearer_token_only_in_secret_payload(self):
+    """API-native bearer auth uses the same R1FS secret lane as form passwords."""
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-secret")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN-MUST-NOT-PERSIST",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+          },
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+    secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+
+    self.assertEqual(
+      secret_doc["payload"]["bearer_token"],
+      "BEARER-TOKEN-MUST-NOT-PERSIST",
+    )
+    self.assertEqual(config_dict["secret_ref"], "QmSecretCID")
+    self.assertTrue(config_dict["has_bearer_token"])
+    self.assertEqual(config_dict["bearer_token"], "")
+    self.assertNotIn(
+      "BEARER-TOKEN-MUST-NOT-PERSIST",
+      json.dumps(config_dict),
+    )
+
   def test_launch_webapp_scan_rejects_secret_persistence_without_store_key(self):
     """Webapp launch fails closed when no strong secret-store key is configured."""
     plugin = self._build_mock_plugin(job_id="test-job-websecret-nokey")
@@ -547,6 +583,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
       target_url="https://example.com/app",
       official_username="admin",
       official_password="secret",
+      bearer_token="TOKEN-123",
+      api_key="KEY-123",
+      bearer_refresh_token="REFRESH-123",
+      request_budget=42,
       authorized=True,
       scan_type="webapp",
     )
@@ -555,6 +595,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(webapp["route"], "webapp")
     plugin.launch_network_scan.assert_called_once()
     plugin.launch_webapp_scan.assert_called_once()
+    webapp_kwargs = plugin.launch_webapp_scan.call_args.kwargs
+    self.assertEqual(webapp_kwargs["bearer_token"], "TOKEN-123")
+    self.assertEqual(webapp_kwargs["api_key"], "KEY-123")
+    self.assertEqual(webapp_kwargs["bearer_refresh_token"], "REFRESH-123")
+    self.assertEqual(webapp_kwargs["request_budget"], 42)
 
   def test_launch_test_persists_typed_ptes_context(self):
     """Compatibility launch_test preserves typed engagement/RoE/auth fields."""

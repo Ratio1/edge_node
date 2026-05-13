@@ -81,8 +81,8 @@ class AuthManager:
 
   def ensure_sessions(self, official_creds, regular_creds=None):
     """Re-authenticate if sessions are stale or not yet created."""
-    regular_creds = self._coerce_creds(regular_creds)
-    require_regular = bool(regular_creds and regular_creds.get("username"))
+    regular_creds = self._coerce_creds(regular_creds, principal="regular")
+    require_regular = self._credentials_configured(regular_creds)
     if not self.needs_refresh(require_regular=require_regular):
       return True
     self.cleanup()
@@ -95,23 +95,21 @@ class AuthManager:
   def authenticate(self, official_creds, regular_creds=None):
     """Create fresh sessions for all configured users."""
     self.anon_session = self._make_session()
-    official_creds = self._coerce_creds(official_creds)
-    regular_creds = self._coerce_creds(regular_creds)
+    official_creds = self._coerce_creds(official_creds, principal="official")
+    regular_creds = self._coerce_creds(regular_creds, principal="regular")
     self._auth_errors = []
 
     self.official_session = self._try_login_with_retry(
       "official",
-      official_creds["username"],
-      official_creds["password"],
+      official_creds,
     )
     if not self.official_session:
       return False
 
-    if regular_creds and regular_creds.get("username"):
+    if self._credentials_configured(regular_creds):
       self.regular_session = self._try_login_with_retry(
         "regular",
-        regular_creds["username"],
-        regular_creds["password"],
+        regular_creds,
       )
       if not self.regular_session:
         self._record_auth_error("regular_login_failed")
@@ -120,18 +118,41 @@ class AuthManager:
     return True
 
   @staticmethod
-  def _coerce_creds(creds):
+  def _coerce_creds(creds, principal="official"):
     if creds is None:
       return None
+    if isinstance(creds, Credentials):
+      creds.principal = creds.principal or principal
+      return creds
+    if hasattr(creds, "to_credentials") and callable(creds.to_credentials):
+      return creds.to_credentials()
     if isinstance(creds, dict):
-      return {
-        "username": creds.get("username", ""),
-        "password": creds.get("password", ""),
-      }
-    return {
-      "username": getattr(creds, "username", "") or "",
-      "password": getattr(creds, "password", "") or "",
-    }
+      return Credentials(
+        username=creds.get("username", "") or "",
+        password=creds.get("password", "") or "",
+        bearer_token=creds.get("bearer_token", "") or "",
+        bearer_refresh_token=creds.get("bearer_refresh_token", "") or "",
+        api_key=creds.get("api_key", "") or "",
+        principal=creds.get("principal", principal) or principal,
+      )
+    return Credentials(
+      username=getattr(creds, "username", "") or "",
+      password=getattr(creds, "password", "") or "",
+      bearer_token=getattr(creds, "bearer_token", "") or "",
+      bearer_refresh_token=getattr(creds, "bearer_refresh_token", "") or "",
+      api_key=getattr(creds, "api_key", "") or "",
+      principal=getattr(creds, "principal", principal) or principal,
+    )
+
+  @staticmethod
+  def _credentials_configured(creds) -> bool:
+    if creds is None:
+      return False
+    return bool(
+      creds.has_form_credentials()
+      or creds.has_bearer_token()
+      or creds.has_api_key()
+    )
 
   def cleanup(self):
     """
@@ -190,10 +211,10 @@ class AuthManager:
   def _record_auth_error(self, code):
     self._auth_errors.append(code)
 
-  def _try_login_with_retry(self, principal, username, password):
+  def _try_login_with_retry(self, principal, creds):
     retryable_failure = False
     for attempt in range(1, self.MAX_AUTH_ATTEMPTS + 1):
-      session, retryable_failure = self._try_login_attempt(username, password)
+      session, retryable_failure = self._try_login_attempt(creds)
       if session is not None:
         return session
       if not retryable_failure:
@@ -211,10 +232,10 @@ class AuthManager:
     """
     Attempt login with CSRF auto-detection and robust success detection.
     """
-    session, _ = self._try_login_attempt(username, password)
+    session, _ = self._try_login_attempt(Credentials(username=username, password=password))
     return session
 
-  def _try_login_attempt(self, username, password):
+  def _try_login_attempt(self, creds):
     """Attempt one login via the configured strategy.
 
     Returns ``(session, retryable_failure)``. Transport errors raised by
@@ -222,7 +243,6 @@ class AuthManager:
     failures into ``retryable_failure=False``.
     """
     strategy = self._build_strategy()
-    creds = Credentials(username=username, password=password)
     try:
       session = strategy.authenticate(creds)
     except requests.RequestException:
@@ -236,8 +256,49 @@ class AuthManager:
     if strategy.last_detected_csrf_field:
       self._detected_csrf_field = strategy.last_detected_csrf_field
     if session is not None:
+      valid, retryable_failure = self._validate_authenticated_session(session)
+      if not valid:
+        try:
+          session.close()
+        except Exception:
+          pass
+        return None, retryable_failure
       return session, False
     return None, False
+
+  def _authenticated_probe_path(self) -> str:
+    api_security = getattr(self.target_config, "api_security", None)
+    if api_security is None:
+      return ""
+    auth_desc = getattr(api_security, "auth", None)
+    if auth_desc is None:
+      return ""
+    return (getattr(auth_desc, "authenticated_probe_path", "") or "").strip()
+
+  def _validate_authenticated_session(self, session) -> tuple[bool, bool]:
+    """Validate token/key sessions after credentials have been attached.
+
+    Bearer/API-key preflight intentionally runs without secret material, so
+    401/403 at that stage only proves the endpoint is protected. This check
+    runs after strategy.authenticate() stamps the session, and treats 401/403
+    as an authentication failure.
+    """
+    if self._resolve_auth_type() == "form":
+      return True, False
+    probe_path = self._authenticated_probe_path()
+    if not probe_path:
+      return True, False
+    try:
+      resp = session.head(
+        self.target_url + probe_path,
+        timeout=10,
+        allow_redirects=True,
+      )
+    except requests.RequestException:
+      return False, True
+    if getattr(resp, "status_code", None) in (401, 403):
+      return False, False
+    return True, False
 
   def _resolve_auth_type(self) -> str:
     """Return the configured auth_type, defaulting to ``form``.

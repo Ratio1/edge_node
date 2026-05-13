@@ -278,10 +278,10 @@ class BearerAuth(AuthStrategy):
   No HTTP traffic is needed during ``authenticate`` itself — the strategy
   simply stamps the session with the token.
 
-  ``preflight`` validates that the token actually works by hitting
-  ``target_config.api_security.auth.authenticated_probe_path`` (when
-  configured) and asserting the response is not 401/403. If the path
-  is empty, preflight returns None (caller chose not to verify).
+  ``preflight`` validates that the configured authenticated probe path is
+  reachable without sending secret material. A 401/403 is acceptable here
+  because it usually means auth is enforced; the AuthManager validates the
+  stamped session after ``authenticate``.
   """
 
   def __init__(self, target_url, target_config, verify_tls=True):
@@ -312,11 +312,6 @@ class BearerAuth(AuthStrategy):
                            allow_redirects=True)
     except requests.RequestException as exc:
       return f"Authenticated probe path unreachable: {exc}"
-    if resp.status_code in (401, 403):
-      return (
-        f"Authenticated probe path {probe_path} returned "
-        f"{resp.status_code} during preflight (token may be invalid)."
-      )
     return None
 
   def authenticate(self, creds) -> Optional[requests.Session]:

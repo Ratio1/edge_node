@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+from extensions.business.cybersec.red_mesh.graybox.models import GrayboxCredentialSet
 from extensions.business.cybersec.red_mesh.services.secrets import (
   _blank_graybox_secret_fields,
   build_graybox_secret_payload,
@@ -154,6 +155,48 @@ class TestSecretIsolationInCredentialsRepr(unittest.TestCase):
     # But capability booleans are visible
     self.assertIn("has_bearer_token=True", r)
     self.assertIn("has_api_key=True", r)
+
+
+class TestSecretIsolationInRuntimeCredentials(unittest.TestCase):
+
+  def test_worker_credential_set_carries_resolved_api_secrets(self):
+    """Resolved runtime config reaches AuthManager without persisting raw secrets."""
+    cfg = MagicMock()
+    cfg.official_username = ""
+    cfg.official_password = ""
+    cfg.regular_username = ""
+    cfg.regular_password = ""
+    cfg.weak_candidates = []
+    cfg.max_weak_attempts = 5
+    cfg.bearer_token = SENSITIVE_VALUES["bearer_token"]
+    cfg.api_key = SENSITIVE_VALUES["api_key"]
+    cfg.bearer_refresh_token = SENSITIVE_VALUES["bearer_refresh_token"]
+
+    creds = GrayboxCredentialSet.from_job_config(cfg)
+    official = creds.official.to_credentials()
+
+    self.assertEqual(official.bearer_token, SENSITIVE_VALUES["bearer_token"])
+    self.assertEqual(official.api_key, SENSITIVE_VALUES["api_key"])
+    self.assertEqual(official.bearer_refresh_token, SENSITIVE_VALUES["bearer_refresh_token"])
+    self.assertTrue(creds.official.is_configured)
+
+  def test_runtime_credential_dict_exposes_only_secret_capabilities(self):
+    cfg = MagicMock()
+    cfg.official_username = "alice"
+    cfg.official_password = "formpw"
+    cfg.regular_username = ""
+    cfg.regular_password = ""
+    cfg.weak_candidates = []
+    cfg.max_weak_attempts = 5
+    cfg.bearer_token = SENSITIVE_VALUES["bearer_token"]
+    cfg.api_key = SENSITIVE_VALUES["api_key"]
+    cfg.bearer_refresh_token = SENSITIVE_VALUES["bearer_refresh_token"]
+
+    serialized = json.dumps(GrayboxCredentialSet.from_job_config(cfg).official.to_dict())
+
+    self.assertFalse(_has_secrets(serialized), serialized)
+    self.assertNotIn("formpw", serialized)
+    self.assertIn('"has_bearer_token": true', serialized)
 
 
 if __name__ == "__main__":
