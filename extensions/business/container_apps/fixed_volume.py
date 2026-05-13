@@ -387,15 +387,18 @@ def provision(
 def cleanup(
   vol: FixedVolume,
   logger: Optional[Callable] = None,
-) -> None:
+) -> bool:
   """Unmount and detach the loop device for a volume.
 
   Graceful -- never raises. All errors are caught and logged as warnings.
+  Returns False when unmount/detach could not be confirmed so callers can
+  preserve cleanup handles and retry later.
   """
   _log(
     logger, "STEP",
     f"Cleaning up volume={vol.name} mount_path={vol.mount_path}",
   )
+  result = True
   loop_dev = None
   if vol.meta_path.exists():
     try:
@@ -403,23 +406,34 @@ def cleanup(
       loop_dev = meta.get("loop_dev")
       _log(logger, "INFO", f"Loaded metadata loop_dev={loop_dev}")
     except Exception as exc:
+      result = False
       _log(logger, "WARN", f"Failed to read metadata error={exc}")
 
-  try:
-    _run(["umount", str(vol.mount_path)], logger=logger)
-  except Exception as exc:
-    _log(logger, "WARN", f"Unmount failed mount_path={vol.mount_path} error={exc}")
+  if _is_path_mounted(vol.mount_path):
+    try:
+      _run(["umount", str(vol.mount_path)], logger=logger)
+    except Exception as exc:
+      result = False
+      _log(logger, "WARN", f"Unmount failed mount_path={vol.mount_path} error={exc}")
+  else:
+    _log(logger, "INFO", f"Mount path is not mounted mount_path={vol.mount_path}")
 
   if loop_dev:
     try:
       _run(["losetup", "-d", loop_dev], logger=logger)
     except Exception as exc:
+      result = False
       _log(logger, "WARN", f"Detach loop failed loop_dev={loop_dev} error={exc}")
+
+  if _is_path_mounted(vol.mount_path):
+    result = False
+    _log(logger, "WARN", f"Mount path is still mounted mount_path={vol.mount_path}")
 
   _log(
     logger, "INFO",
-    f"Cleanup complete mount_path={vol.mount_path} loop_dev={loop_dev}",
+    f"Cleanup complete mount_path={vol.mount_path} loop_dev={loop_dev} ok={result}",
   )
+  return result
 
 
 def docker_bind_spec(vol: FixedVolume, container_target: str) -> Dict[str, Dict[str, str]]:
