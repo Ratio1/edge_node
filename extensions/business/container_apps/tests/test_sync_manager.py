@@ -732,6 +732,26 @@ class TestArchiveRoundtrip(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "no mounted volume covers"):
       self.sm_p.make_archive(["/nope/"])
 
+  def test_make_archive_rejects_symlink_path(self):
+    outside = self.tmpdir / "outside-provider"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret")
+    (self.appdata_p / "escape").symlink_to(outside, target_is_directory=True)
+
+    with self.assertRaisesRegex(ValueError, "symlink"):
+      self.sm_p.make_archive(["/app/data/escape/secret.txt"])
+
+  def test_make_archive_rejects_symlink_descendant(self):
+    outside = self.tmpdir / "outside-provider-desc"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret")
+    (self.appdata_p / "subdir" / "escape").symlink_to(
+      outside, target_is_directory=True
+    )
+
+    with self.assertRaisesRegex(ValueError, "symlink"):
+      self.sm_p.make_archive(["/app/data/"])
+
   # ---- legacy VOLUMES round-trip tests ------------------------------------
   #
   # Rule 3 admits legacy VOLUMES in addition to FIXED_SIZE_VOLUMES; these
@@ -908,6 +928,28 @@ class TestArchiveRoundtrip(unittest.TestCase):
     self.assertTrue(symlink_file.is_symlink())
     self.assertEqual(outside.read_text(), "outside")
 
+  def test_extract_strips_special_mode_bits(self):
+    mode_tar = self.tmpdir / "special-modes.tar.gz"
+    with tarfile.open(str(mode_tar), "w:gz") as tar:
+      dir_info = tarfile.TarInfo(name="/app/data/special")
+      dir_info.type = tarfile.DIRTYPE
+      dir_info.mode = 0o7777
+      tar.addfile(dir_info)
+
+      content = b"payload"
+      file_info = tarfile.TarInfo(name="/app/data/special/run.sh")
+      file_info.size = len(content)
+      file_info.mode = 0o6755
+      tar.addfile(file_info, io.BytesIO(content))
+
+    self.sm_c.extract_archive(str(mode_tar))
+
+    target_dir = self.consumer._fixed_root / "appdata" / "special"
+    target_file = target_dir / "run.sh"
+    self.assertEqual(target_file.read_bytes(), b"payload")
+    self.assertEqual(os.stat(target_dir).st_mode & 0o7000, 0)
+    self.assertEqual(os.stat(target_file).st_mode & 0o7000, 0)
+
 
 # ---------------------------------------------------------------------------
 # publish_snapshot
@@ -1032,8 +1074,9 @@ class TestPublishSnapshot(unittest.TestCase):
     self.assertEqual(invalid["_error"]["stage"], "chainstore_publish")
     # No history because we failed before append
     self.assertEqual(len(list(history_sent_dir(self.owner).glob("*.json"))), 0)
-    # CID landed in r1fs but was not retired
-    self.assertEqual(len(self.owner._r1fs.added), 1)
+    # CID landed in r1fs but was cleaned up before returning failure.
+    self.assertEqual(len(self.owner._r1fs.added), 0)
+    self.assertEqual(len(self.owner._r1fs.deleted), 1)
 
   def test_chainstore_no_ack_still_succeeds(self):
     # hset returning False (no peer confirmation) is recorded but not fatal.
@@ -1077,8 +1120,24 @@ class TestPublishSnapshot(unittest.TestCase):
 
     files = sorted(history_sent_dir(self.owner).glob("*.json"))
     older = json.loads(files[0].read_text())
+    self.assertIsNone(older["deletion"]["deleted_at"])
     self.assertFalse(older["deletion"]["deletion_succeeded"])
     self.assertIn("daemon paused", older["deletion"]["deletion_error"])
+
+  def test_retire_retries_after_failure(self):
+    self.sm.publish_snapshot(["/app/data/"], {"epoch": 1})
+    (self.owner._fixed_root / "appdata" / "weights.bin").write_bytes(b"v2")
+    (self.vsd / SYNC_PROCESSING_FILE).write_text("{}")
+    self.owner._r1fs.delete_should_raise = RuntimeError("daemon paused")
+
+    self.sm.publish_snapshot(["/app/data/"], {"epoch": 2})
+    self.owner._r1fs.delete_should_raise = None
+    self.sm._retire_previous_cid(history_sent_dir(self.owner))
+
+    files = sorted(history_sent_dir(self.owner).glob("*.json"))
+    older = json.loads(files[0].read_text())
+    self.assertIsNotNone(older["deletion"]["deleted_at"])
+    self.assertTrue(older["deletion"]["deletion_succeeded"])
 
   def test_retire_uses_mtime_not_version(self):
     """A higher-version entry that was written BEFORE a lower-version entry
@@ -1253,6 +1312,24 @@ class TestConsumerFlow(unittest.TestCase):
     # schema_version + archive_format), so it must be rejected.
     self.assertNotEqual(self.sm_c.validate_manifest({}), [])
     self.assertNotEqual(self.sm_c.validate_manifest({"manifest": {}}), [])
+
+  def test_validate_manifest_rejects_missing_archive_paths(self):
+    record = self._ok_manifest()
+    del record["manifest"]["archive_paths"]
+    reasons = self.sm_c.validate_manifest(record)
+    self.assertTrue(any("archive_paths" in r for r in reasons))
+
+  def test_validate_manifest_rejects_empty_archive_paths(self):
+    reasons = self.sm_c.validate_manifest(self._ok_manifest(archive_paths=[]))
+    self.assertTrue(any("non-empty list" in r for r in reasons))
+
+  def test_validate_manifest_rejects_non_list_archive_paths(self):
+    reasons = self.sm_c.validate_manifest(self._ok_manifest(archive_paths="/app/data/"))
+    self.assertTrue(any("non-empty list" in r for r in reasons))
+
+  def test_validate_manifest_rejects_non_string_archive_path_entries(self):
+    reasons = self.sm_c.validate_manifest(self._ok_manifest(archive_paths=["/app/data/", 7]))
+    self.assertTrue(any("invalid archive_paths" in r for r in reasons))
 
   def test_validate_manifest_rejects_non_dict(self):
     self.assertEqual(self.sm_c.validate_manifest(None), ["manifest record is not a dict"])

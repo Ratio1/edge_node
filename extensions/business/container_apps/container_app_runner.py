@@ -3178,6 +3178,7 @@ class ContainerAppRunnerPlugin(
     self._configure_fixed_size_volumes()
     self._configure_system_volume()
     self._recover_stale_processing()
+    self._validate_sync_config()
 
     # For semaphored containers (consumers), defer env setup and container start
     # to _handle_initial_launch() which properly waits for provider semaphores.

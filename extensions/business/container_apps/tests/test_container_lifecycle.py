@@ -22,9 +22,11 @@ from extensions.business.container_apps.tests.support import (
   make_mock_docker_client,
 )
 from extensions.business.container_apps.container_app_runner import (
+  ContainerAppRunnerPlugin,
   ContainerState,
   StopReason,
 )
+from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
 
 
 def _patch_docker_module(client):
@@ -307,6 +309,51 @@ class TestLifecycleRestart(unittest.TestCase):
     _, kwargs = client.containers.run.call_args
     # See test_container_receives_deterministic_name for the naming rule.
     self.assertEqual(kwargs["name"], "car_test_stream_car_instance")
+
+  def test_restart_revalidates_sync_config_before_start(self):
+    plugin, client, _ = self._launch_and_crash()
+    plugin.cfg_sync = {"ENABLED": True, "KEY": "", "TYPE": "provider"}
+    plugin._sync_unavailable = False
+    new_container = make_mock_container()
+    client.containers.run.return_value = new_container
+
+    with _patch_docker_module(client), \
+         patch.object(plugin, "_configure_system_volume"), \
+         patch.object(plugin, "_recover_stale_processing"), \
+         patch.object(plugin, "_validate_sync_config", wraps=plugin._validate_sync_config) as validate:
+      plugin._restart_container(StopReason.CRASH)
+
+    validate.assert_called()
+    self.assertFalse(plugin.cfg_sync["ENABLED"])
+
+
+class TestWorkerAppRunnerLifecycle(unittest.TestCase):
+  """WorkerAppRunner-specific lifecycle integration."""
+
+  def test_additional_checks_runs_sync_before_git_updates(self):
+    plugin = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)
+    calls = []
+
+    def base_sync(_plugin, current_time):
+      calls.append(("sync", current_time))
+      return None
+
+    def git_updates(current_time):
+      calls.append(("git", current_time))
+      return StopReason.EXTERNAL_UPDATE
+
+    plugin._check_git_updates = git_updates
+
+    with patch.object(
+      ContainerAppRunnerPlugin,
+      "_perform_additional_checks",
+      autospec=True,
+      side_effect=base_sync,
+    ):
+      result = plugin._perform_additional_checks(123.0)
+
+    self.assertEqual(result, StopReason.EXTERNAL_UPDATE)
+    self.assertEqual(calls, [("sync", 123.0), ("git", 123.0)])
 
 
 # ===========================================================================

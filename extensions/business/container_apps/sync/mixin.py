@@ -19,18 +19,19 @@ Bridges :class:`SyncManager` into ``ContainerAppRunnerPlugin``'s lifecycle:
     crash is renamed back to ``request.json`` on plugin init so the next
     provider tick retries cleanly
 
-See ``docs/_todos/2026-05-03T17:37:43_car_volume_sync_provider_consumer.md``
-for the full design and rationale.
+See ``extensions/business/container_apps/README.md`` for the public
+operator/app contract.
 """
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 from typing import Optional
 
 from extensions.business.container_apps import fixed_volume
 
-from .control_files import JsonControlFile
+from .control_files import JsonControlFile, JsonControlFileUnsafeError
 from .constants import (
   SYNC_PROCESSING_FILE,
   SYNC_REQUEST_FILE,
@@ -153,29 +154,49 @@ class _SyncMixin:
 
     self.volumes.update(fixed_volume.docker_bind_spec(vol, SYSTEM_VOLUME_MOUNT))
 
-    # Ensure volume-sync subdir exists before container start so the app
-    # can drop a request.json on its first tick. Chmod 0o777 so non-root
-    # apps inside the container can write here regardless of whether
-    # _resolve_image_owner() returned a usable UID/GID. This is safe:
-    # the system volume is per-CAR-instance and the app already owns the
-    # rest of its container — there's no isolation gain in restricting
-    # the control-plane subdir to root.
-    vsd = volume_sync_dir(self)
-    os.makedirs(str(vsd), exist_ok=True)
+    # Ensure the mount root itself stays root-owned/non-app-writable so the
+    # app cannot replace volume-sync/ with a symlink after startup. Only the
+    # dedicated volume-sync/ subdir is app-writable.
     try:
-      os.chmod(str(vsd), 0o777)
+      os.chmod(str(vol.mount_path), 0o755)
     except OSError as exc:
       self.P(
-        f"[sync] could not chmod {vsd} to 0o777: {exc}", color="y"
+        f"[sync] could not chmod {vol.mount_path} to 0o755: {exc}", color="y"
       )
-    # Also widen the mount root so writes that need to land at the
-    # volume root (rare but possible for future control-plane features)
-    # don't 13-EACCES against a root-owned filesystem.
+
+    # Ensure volume-sync subdir exists before container start so the app
+    # can drop a request.json on its first tick. If a previous run left a
+    # symlink or non-directory here while /r1en_system was writable, remove it
+    # and recreate a real directory before exposing env vars to the container.
+    # Mode 1777 keeps it app-writable while preventing non-owners from
+    # deleting CAR-owned response/last_apply temp files.
+    vsd = volume_sync_dir(self)
     try:
-      os.chmod(str(vol.mount_path), 0o777)
+      try:
+        st = os.lstat(str(vsd))
+      except FileNotFoundError:
+        st = None
+      if st is not None and (
+        stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode)
+      ):
+        os.unlink(str(vsd))
+      os.makedirs(str(vsd), exist_ok=True)
+      st = os.lstat(str(vsd))
+      if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"{vsd} is not a real directory")
+    except Exception as exc:
+      self.P(
+        f"[sync] volume-sync directory unsafe/unavailable: {exc}. "
+        f"SYNC will be disabled and R1_SYSTEM_VOLUME env vars will not be exported.",
+        color="r",
+      )
+      self._sync_unavailable = True
+      return
+    try:
+      os.chmod(str(vsd), 0o1777)
     except OSError as exc:
       self.P(
-        f"[sync] could not chmod {vol.mount_path} to 0o777: {exc}", color="y"
+        f"[sync] could not chmod {vsd} to 0o1777: {exc}", color="y"
       )
     self.P(
       f"[sync] system volume ready: {vol.mount_path} -> {SYSTEM_VOLUME_MOUNT} "
@@ -280,7 +301,22 @@ class _SyncMixin:
   @property
   def cfg_sync_allow_online_provider_capture(self) -> bool:
     """Provider-local opt-in for Docker archive capture from live containers."""
-    return bool(self._sync_cfg().get("ALLOW_ONLINE_PROVIDER_CAPTURE"))
+    raw = self._sync_cfg().get("ALLOW_ONLINE_PROVIDER_CAPTURE", False)
+    if isinstance(raw, bool):
+      return raw
+    if isinstance(raw, str):
+      value = raw.strip().lower()
+      if value in ("1", "true", "yes", "on"):
+        return True
+      if value in ("0", "false", "no", "off", ""):
+        return False
+    if isinstance(raw, int) and raw in (0, 1):
+      return bool(raw)
+    self.P(
+      f"[sync] invalid ALLOW_ONLINE_PROVIDER_CAPTURE value {raw!r}; using False",
+      color="y",
+    )
+    return False
 
   # ----- manager handle ---------------------------------------------------
 
@@ -309,7 +345,7 @@ class _SyncMixin:
     req = control_file.pending_path
     try:
       recovered = control_file.recover_stale_processing()
-    except OSError as exc:
+    except (OSError, JsonControlFileUnsafeError) as exc:
       self.P(
         f"[sync] failed to recover orphan .processing: {exc}", color="r"
       )

@@ -14,8 +14,8 @@ Persistent per-plugin audit trail lives under
 ``<plugin_data>/sync_history/{sent,received}/<version>__<short_cid>.json``
 so both sides can be inspected with ``ls`` / ``cat`` / ``jq`` after the fact.
 
-See ``docs/_todos/2026-05-03T17:37:43_car_volume_sync_provider_consumer.md``
-for the full contract, validation rules, and lifecycle decisions.
+See ``extensions/business/container_apps/README.md`` for the public
+operator/app contract.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import copy
+import stat
 import tarfile
 import tempfile
 import time as _time
@@ -281,6 +282,127 @@ class SyncManager:
       )
     return host_path, bind, host_root_n
 
+  @staticmethod
+  def _is_within_root(path: str, root: str) -> bool:
+    path_n = os.path.normpath(path)
+    root_n = os.path.normpath(root)
+    return path_n == root_n or path_n.startswith(root_n + os.sep)
+
+  @staticmethod
+  def _archive_arcname(container_root: str, rel_path: str) -> str:
+    root = os.path.normpath(container_root)
+    if rel_path in ("", "."):
+      return root
+    return os.path.normpath(os.path.join(root, rel_path))
+
+  @staticmethod
+  def _safe_extract_mode(member_mode: int, *, is_dir: bool) -> int:
+    normal_bits = member_mode & 0o777
+    minimum = 0o755 if is_dir else 0o644
+    return normal_bits | minimum
+
+  def _validate_archive_source_path(
+    self,
+    host_path: str,
+    host_root: str,
+    container_path: str,
+  ) -> int:
+    """Validate an offline archive source without following symlinks."""
+    host_path_n = os.path.normpath(host_path)
+    host_root_n = os.path.normpath(host_root)
+    if not self._is_within_root(host_path_n, host_root_n):
+      raise ValueError(
+        f"archive source escapes volume root: {container_path!r} -> {host_path_n!r}"
+      )
+    rel = os.path.relpath(host_path_n, host_root_n)
+    current = host_root_n
+    for part in [] if rel == "." else rel.split(os.sep):
+      current = os.path.join(current, part)
+      try:
+        st = os.lstat(current)
+      except FileNotFoundError as exc:
+        raise FileNotFoundError(
+          f"archive_paths target does not exist on host: "
+          f"{container_path!r} -> {host_path_n!r}"
+        ) from exc
+      if stat.S_ISLNK(st.st_mode):
+        raise ValueError(
+          f"archive source contains symlink: {container_path!r} -> {current!r}"
+        )
+    root_real = os.path.realpath(host_root_n)
+    path_real = os.path.realpath(host_path_n)
+    if not self._is_within_root(path_real, root_real):
+      raise ValueError(
+        f"archive source escapes volume root: {container_path!r} -> {host_path_n!r}"
+      )
+    return os.lstat(host_path_n).st_mode
+
+  def _add_offline_archive_path(
+    self,
+    tar: tarfile.TarFile,
+    container_path: str,
+    host_path: str,
+    host_root: str,
+  ) -> None:
+    mode = self._validate_archive_source_path(
+      host_path, host_root, container_path
+    )
+    if stat.S_ISREG(mode):
+      tar.add(host_path, arcname=os.path.normpath(container_path), recursive=False)
+      return
+    if not stat.S_ISDIR(mode):
+      raise ValueError(
+        f"archive source is not a regular file or directory: {container_path!r}"
+      )
+
+    for current_root, dirnames, filenames in os.walk(
+      host_path, topdown=True, followlinks=False
+    ):
+      rel_root = os.path.relpath(current_root, host_path)
+      current_container = self._archive_arcname(container_path, rel_root)
+      current_mode = self._validate_archive_source_path(
+        current_root, host_root, current_container
+      )
+      if stat.S_ISLNK(current_mode):
+        raise ValueError(
+          f"archive source contains symlink: {current_container!r}"
+        )
+      tar.add(current_root, arcname=current_container, recursive=False)
+
+      kept_dirs: list[str] = []
+      for name in dirnames:
+        child = os.path.join(current_root, name)
+        child_container = self._archive_arcname(
+          container_path, os.path.relpath(child, host_path)
+        )
+        child_mode = self._validate_archive_source_path(
+          child, host_root, child_container
+        )
+        if stat.S_ISLNK(child_mode):
+          raise ValueError(
+            f"archive source contains symlink: {child_container!r}"
+          )
+        if not stat.S_ISDIR(child_mode):
+          raise ValueError(
+            f"archive source is not a directory: {child_container!r}"
+          )
+        kept_dirs.append(name)
+      dirnames[:] = kept_dirs
+
+      for name in filenames:
+        child = os.path.join(current_root, name)
+        child_container = self._archive_arcname(
+          container_path, os.path.relpath(child, host_path)
+        )
+        child_mode = self._validate_archive_source_path(
+          child, host_root, child_container
+        )
+        if not stat.S_ISREG(child_mode):
+          raise ValueError(
+            f"archive source is not a regular file: {child_container!r}"
+          )
+        tar.add(child, arcname=child_container, recursive=False)
+
   # ----- atomic I/O -------------------------------------------------------
   def _write_json_atomic(self, path: Path, payload: Any) -> None:
     """Write JSON to ``path`` atomically (tmp + ``os.replace``).
@@ -402,7 +524,7 @@ class SyncManager:
       )
       return
     data["deletion"] = {
-      "deleted_at": self.owner.time(),
+      "deleted_at": self.owner.time() if succeeded else None,
       "deletion_succeeded": bool(succeeded),
       "deletion_error": error,
     }
@@ -682,12 +804,8 @@ class SyncManager:
             )
           self._append_docker_archive_path(tar, container_path)
         else:
-          host_path, _bind, _host_root = self.resolve_container_path(container_path)
-          if not os.path.exists(host_path):
-            raise FileNotFoundError(
-              f"archive_paths target does not exist on host: {container_path!r} -> {host_path!r}"
-            )
-          tar.add(host_path, arcname=container_path, recursive=True)
+          host_path, _bind, host_root = self.resolve_container_path(container_path)
+          self._add_offline_archive_path(tar, container_path, host_path, host_root)
 
     return str(tar_path), os.path.getsize(str(tar_path))
 
@@ -703,6 +821,23 @@ class SyncManager:
       metadata=dict(metadata or {}),
       runtime=SyncRuntimePolicy(),
     )
+
+  def _delete_uploaded_cid_best_effort(
+    self,
+    cid: str,
+    *,
+    cleanup_local_files: bool = False,
+  ) -> None:
+    try:
+      self.owner.r1fs.delete_file(
+        cid=cid,
+        unpin_remote=True,
+        cleanup_local_files=cleanup_local_files,
+      )
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask root failure
+      self.owner.P(
+        f"[sync] failed to clean up uploaded CID {cid}: {exc}", color="y"
+      )
 
   def publish_snapshot(
     self,
@@ -783,6 +918,7 @@ class SyncManager:
           value=record,
         )
       except Exception as exc:
+        self._delete_uploaded_cid_best_effort(cid)
         self._fail_request(
           request_body, STAGE_CHAINSTORE_PUBLISH, str(exc), proc_path
         )
@@ -824,12 +960,12 @@ class SyncManager:
         )
 
       invalid_path = vsd / SYNC_INVALID_FILE
-      if invalid_path.exists():
+      if os.path.lexists(str(invalid_path)):
         try:
           os.unlink(str(invalid_path))
         except OSError:
           pass
-      if proc_path.exists():
+      if os.path.lexists(str(proc_path)):
         try:
           control_file.discard_processing()
         except OSError as exc:
@@ -946,7 +1082,20 @@ class SyncManager:
         f"unsupported encryption: {enc!r} (expected: {ARCHIVE_ENCRYPTION!r})"
       )
 
-    paths = manifest.get("archive_paths") or []
+    raw_paths = manifest.get("archive_paths")
+    paths: list[str] = []
+    if not isinstance(raw_paths, list) or not raw_paths:
+      reasons.append(
+        "archive_paths must be a non-empty list of container-absolute paths"
+      )
+    else:
+      invalid_paths = [
+        entry for entry in raw_paths
+        if not isinstance(entry, str) or not entry
+      ]
+      if invalid_paths:
+        reasons.append(f"invalid archive_paths entries: {invalid_paths!r}")
+      paths = [entry for entry in raw_paths if isinstance(entry, str) and entry]
     missing: list[str] = []
     for entry in paths:
       try:
@@ -1071,7 +1220,7 @@ class SyncManager:
           # Widen dir mode so the in-container app user can traverse, even
           # if CAR (running as root in the edge node) created the directory.
           try:
-            os.chmod(host_path, max(member.mode & 0o7777, 0o755))
+            os.chmod(host_path, self._safe_extract_mode(member.mode, is_dir=True))
           except OSError:
             pass
           extracted.append(container_name)
@@ -1100,7 +1249,7 @@ class SyncManager:
           # (CAR runs as root); the app inside the container is typically a
           # non-root user. Preserve the source mode but ensure at least
           # world-readable so the app can ``cat`` what we just landed.
-          os.chmod(tmp_name, max(member.mode & 0o7777, 0o644))
+          os.chmod(tmp_name, self._safe_extract_mode(member.mode, is_dir=False))
           os.replace(tmp_name, host_path)
         except Exception:
           try:

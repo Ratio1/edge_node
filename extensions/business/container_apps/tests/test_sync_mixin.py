@@ -168,6 +168,16 @@ class TestConfigHelpers(unittest.TestCase):
     owner.cfg_sync["HSYNC_POLL_INTERVAL"] = "nope"
     self.assertEqual(plugin._hsync_poll_interval(), 60.0)
 
+  def test_online_provider_capture_string_false_is_false(self):
+    plugin, owner = _make_plugin(self.tmpdir)
+    owner.cfg_sync["ALLOW_ONLINE_PROVIDER_CAPTURE"] = "false"
+    self.assertFalse(plugin.cfg_sync_allow_online_provider_capture)
+
+  def test_online_provider_capture_string_true_is_true(self):
+    plugin, owner = _make_plugin(self.tmpdir)
+    owner.cfg_sync["ALLOW_ONLINE_PROVIDER_CAPTURE"] = "true"
+    self.assertTrue(plugin.cfg_sync_allow_online_provider_capture)
+
 
 # ---------------------------------------------------------------------------
 # Env-var injection
@@ -235,6 +245,31 @@ class TestEnvInjection(unittest.TestCase):
 
     self.assertFalse(plugin._sync_unavailable)
     self.assertIn(SYSTEM_VOLUME_MOUNT, [spec["bind"] for spec in plugin.volumes.values()])
+    self.assertEqual(os.stat(volume_sync_dir(plugin).parent).st_mode & 0o777, 0o755)
+    self.assertEqual(os.stat(volume_sync_dir(plugin)).st_mode & 0o777, 0o777)
+    self.assertEqual(os.stat(volume_sync_dir(plugin)).st_mode & 0o1000, 0o1000)
+
+  def test_system_volume_config_recreates_symlinked_volume_sync_dir(self):
+    plugin, _ = _make_plugin(self.tmpdir, role="provider", enabled=True)
+    vsd = volume_sync_dir(plugin)
+    vsd.rmdir()
+    outside = self.tmpdir / "outside-control"
+    outside.mkdir()
+    os.symlink(str(outside), str(vsd))
+
+    with patch(
+      "extensions.business.container_apps.sync.mixin.fixed_volume._require_tools"
+    ), patch(
+      "extensions.business.container_apps.sync.mixin.fixed_volume.provision",
+      side_effect=lambda vol, **_kwargs: vol,
+    ):
+      plugin._configure_system_volume()
+
+    self.assertFalse(plugin._sync_unavailable)
+    self.assertTrue(vsd.is_dir())
+    self.assertFalse(vsd.is_symlink())
+    self.assertEqual(os.stat(vsd.parent).st_mode & 0o777, 0o755)
+    self.assertEqual(os.stat(vsd).st_mode & 0o1000, 0o1000)
 
 
 # ---------------------------------------------------------------------------

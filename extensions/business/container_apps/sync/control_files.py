@@ -9,11 +9,11 @@ validation and response payload shapes.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
 import tempfile
-import errno
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -63,6 +63,34 @@ class JsonControlFileUnsafeError(JsonControlFileError):
   """The processing file is not a regular no-follow-readable file."""
 
 
+def _ensure_real_directory(path: Path, *, create: bool) -> bool:
+  """Ensure ``path`` is a real directory, not a symlink.
+
+  Returns False only when ``create`` is False and the path is absent.
+  """
+  path = Path(path)
+  if create:
+    try:
+      path.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+      pass
+  try:
+    st = os.lstat(str(path))
+  except FileNotFoundError:
+    if create:
+      raise
+    return False
+  if stat.S_ISLNK(st.st_mode):
+    raise JsonControlFileUnsafeError(
+      f"refusing symlink control directory: {path}"
+    )
+  if not stat.S_ISDIR(st.st_mode):
+    raise JsonControlFileUnsafeError(
+      f"refusing non-directory control directory: {path}"
+    )
+  return True
+
+
 def write_json_atomic(path: Path, payload: Any) -> None:
   """Write JSON to ``path`` atomically and make it app-readable.
 
@@ -72,7 +100,7 @@ def write_json_atomic(path: Path, payload: Any) -> None:
   app inside the container often runs as a non-root user.
   """
   path = Path(path)
-  path.parent.mkdir(parents=True, exist_ok=True)
+  _ensure_real_directory(path.parent, create=True)
   fd, tmp_name = tempfile.mkstemp(
     dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
   )
@@ -107,7 +135,12 @@ class JsonControlFile:
   def processing_path(self) -> Path:
     return self.root / self.processing_name
 
+  def _root_is_safe(self) -> bool:
+    return _ensure_real_directory(self.root, create=False)
+
   def has_pending(self) -> bool:
+    if not self._root_is_safe():
+      return False
     try:
       os.lstat(str(self.pending_path))
       return True
@@ -198,12 +231,20 @@ class JsonControlFile:
     )
 
   def discard_processing(self) -> None:
-    if self.processing_path.exists():
+    if os.path.lexists(str(self.processing_path)):
       os.unlink(str(self.processing_path))
 
   def recover_stale_processing(self) -> bool:
     """Rename orphan processing -> pending without overwriting a pending file."""
-    if self.processing_path.is_file() and not self.pending_path.exists():
+    if not self._root_is_safe():
+      return False
+    if not os.path.lexists(str(self.processing_path)):
+      return False
+    st = os.lstat(str(self.processing_path))
+    if stat.S_ISLNK(st.st_mode):
+      os.unlink(str(self.processing_path))
+      return False
+    if stat.S_ISREG(st.st_mode) and not os.path.lexists(str(self.pending_path)):
       os.replace(str(self.processing_path), str(self.pending_path))
       return True
     return False

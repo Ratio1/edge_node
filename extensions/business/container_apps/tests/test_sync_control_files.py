@@ -46,6 +46,17 @@ class TestWriteJsonAtomic(unittest.TestCase):
     self.assertFalse(target.exists())
     self.assertEqual(list(self.root.glob(".state.json.*.tmp")), [])
 
+  def test_rejects_symlink_parent_directory(self):
+    outside = self.root / "outside"
+    outside.mkdir()
+    control_root = self.root / "volume-sync"
+    os.symlink(str(outside), str(control_root))
+
+    with self.assertRaises(JsonControlFileUnsafeError):
+      write_json_atomic(control_root / "response.json", {"status": "ok"})
+
+    self.assertFalse((outside / "response.json").exists())
+
 
 class TestJsonControlFile(unittest.TestCase):
   def setUp(self):
@@ -112,6 +123,21 @@ class TestJsonControlFile(unittest.TestCase):
     self.control.discard_processing()
 
     self.assertFalse((self.root / "request.json.processing").exists())
+
+  def test_discard_processing_removes_broken_symlink(self):
+    os.symlink(str(self.root / "missing.json"), str(self.root / "request.json.processing"))
+
+    self.control.discard_processing()
+
+    self.assertFalse(os.path.lexists(str(self.root / "request.json.processing")))
+
+  def test_recover_stale_processing_removes_symlink(self):
+    os.symlink(str(self.root / "missing.json"), str(self.root / "request.json.processing"))
+
+    recovered = self.control.recover_stale_processing()
+
+    self.assertFalse(recovered)
+    self.assertFalse(os.path.lexists(str(self.root / "request.json.processing")))
 
   def test_recover_stale_processing_renames_only_orphan(self):
     (self.root / "request.json.processing").write_text('{"old":true}')
