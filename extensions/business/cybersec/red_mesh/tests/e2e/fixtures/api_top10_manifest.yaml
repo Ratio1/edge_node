@@ -1,0 +1,200 @@
+# OWASP API Top 10 e2e manifest — Subphase 7.1 of the API Top 10 plan.
+#
+# Single source of truth consumed by:
+#   - the e2e harness (run_e2e.py) to build the target_config.api_security
+#     payload and to assert expected findings
+#   - the honeypot inventory (rm-gb-poc/docs/honeypot-scenario-inventory.md)
+#     for the "what the honeypot serves" review
+#
+# Each entry maps one scenario to:
+#   honeypot_path      — endpoint exercised by the probe
+#   method             — HTTP method (informational; probe owns the actual call)
+#   expected_severity  — severity the vulnerable run must emit
+#   expected_evidence_keys — substrings every finding must carry in evidence
+#   hardened_status    — what the same probe should emit when HONEYPOT_HARDEN_API=1
+#   revert_path        — companion endpoint required by Subphase 1.8 stateful probes
+#   notes              — free-form
+
+honeypot_base_url: "http://localhost:30001"
+hardened_env_var: HONEYPOT_HARDEN_API
+
+scenarios:
+  - id: PT-OAPI1-01
+    honeypot_path: "/api/orgs/tenant-a/users/2/"
+    method: GET
+    expected_severity: CRITICAL
+    expected_evidence_keys: ["endpoint=", "owner_value=", "tenant_field=tenant_id"]
+    hardened_status: not_vulnerable
+    notes: |
+      uid=2 lives under tenant-b; an authenticated alice (tenant-a) should
+      be rejected in hardened mode and returned in full in vulnerable mode.
+
+  - id: PT-OAPI2-01
+    honeypot_path: "/api/v2/me/"
+    method: GET
+    expected_severity: CRITICAL
+    expected_evidence_keys: ["forged_alg=none", "server_returned_status=200"]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI2-02
+    honeypot_path: "/api/v2/me/"
+    method: GET
+    expected_severity: HIGH
+    expected_evidence_keys: ["weak_secret_was=", "verification=local_HS256_compare"]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI2-03
+    honeypot_path: "/api/v2/me/"
+    method: GET
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["logout_path=/api/v2/auth/logout/"]
+    hardened_status: not_vulnerable
+    notes: stateful; requires allow_stateful_probes=true
+
+  - id: PT-OAPI3-01
+    honeypot_path: "/api/profile/1/"
+    method: GET
+    expected_severity: HIGH
+    expected_evidence_keys: ["sensitive_fields_present="]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI3-02
+    honeypot_path: "/api/profile/1/"
+    method: PATCH
+    expected_severity: HIGH
+    expected_evidence_keys: ["tampered_field=is_admin"]
+    hardened_status: not_vulnerable
+    notes: stateful; requires allow_stateful_probes=true
+
+  - id: PT-OAPI4-01
+    honeypot_path: "/api/records/list/"
+    method: GET
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["abuse_size_bytes="]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI4-02
+    honeypot_path: "/api/notes/"
+    method: POST
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["body_bytes=1000000"]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI4-03
+    honeypot_path: "/api/records/list/"
+    method: GET
+    expected_severity: LOW
+    expected_evidence_keys: ["requests_sent=", "rate_limit_signals=absent"]
+    hardened_status: not_vulnerable
+    notes: requires `rate_limit_expected=true` in target_config
+
+  - id: PT-OAPI5-01
+    honeypot_path: "/api/admin/export-users/"
+    method: GET
+    expected_severity: CRITICAL
+    expected_evidence_keys: ["principal=regular", "marker_absent=true"]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI5-02
+    honeypot_path: "/api/admin/export-users/"
+    method: GET
+    expected_severity: CRITICAL
+    expected_evidence_keys: ["principal=anonymous"]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI5-03
+    honeypot_path: "/api/admin/users/2/promote/"
+    method: POST
+    expected_severity: HIGH
+    expected_evidence_keys: ["override_header=X-HTTP-Method-Override"]
+    hardened_status: not_vulnerable
+    revert_path: "/api/admin/users/2/demote/"
+    notes: stateful
+
+  - id: PT-OAPI5-04
+    honeypot_path: "/api/admin/users/2/promote/"
+    method: POST
+    expected_severity: CRITICAL
+    expected_evidence_keys: ["method=POST", "principal=regular"]
+    hardened_status: not_vulnerable
+    revert_path: "/api/admin/users/2/demote/"
+    notes: stateful
+
+  - id: PT-OAPI6-01
+    honeypot_path: "/api/auth/signup/"
+    method: POST
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["flow=signup", "attempts=5"]
+    hardened_status: not_vulnerable
+    notes: stateful — creates duplicate accounts; honeypot rate-limits in hardened mode
+
+  - id: PT-OAPI6-02
+    honeypot_path: "/api/auth/signup/"
+    method: POST
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["duplicate_accepted=true"]
+    hardened_status: not_vulnerable
+
+  - id: PT-API7-01
+    honeypot_path: "/api/webhook/test/"
+    method: POST
+    expected_severity: HIGH
+    expected_evidence_keys: ["body_field=callback_url", "reflected_marker=internal-probe"]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI8-01
+    honeypot_path: "/api/v2/me/"
+    method: GET
+    expected_severity: HIGH
+    expected_evidence_keys: ["acao=", "acac=true"]
+    hardened_status: not_vulnerable
+    notes: depends on portal/middleware.py CORS being permissive
+
+  - id: PT-OAPI8-02
+    honeypot_path: "/api/v2/me/"
+    method: GET
+    expected_severity: LOW
+    expected_evidence_keys: ["missing_headers="]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI8-03
+    honeypot_path: "/api/_debug/routes/"
+    method: GET
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["debug_markers_present=true"]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI8-04
+    honeypot_path: "/api/records/force-error/"
+    method: POST
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["stack_trace_or_framework_marker=present"]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI8-05
+    honeypot_path: "/api/records/1/"
+    method: OPTIONS
+    expected_severity: LOW
+    expected_evidence_keys: ["unexpected_methods="]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI9-01
+    honeypot_path: "/openapi.json"
+    method: GET
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["spec_paths_count=", "private_paths_count="]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI9-02
+    honeypot_path: "/api/v1/records/1/"
+    method: GET
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["sibling=/api/v1"]
+    hardened_status: not_vulnerable
+
+  - id: PT-OAPI9-03
+    honeypot_path: "/api/v0/legacy/"
+    method: GET
+    expected_severity: MEDIUM
+    expected_evidence_keys: ["endpoint=", "status=200"]
+    hardened_status: not_vulnerable

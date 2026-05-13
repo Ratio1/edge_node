@@ -1,0 +1,83 @@
+{
+  "_comment": "OWASP API Top 10 target_config for the rm-gb-poc honeypot (port 30001). Generated from api_top10_manifest.yaml — Subphase 7.1.",
+  "discovery": {
+    "scope_prefix": "/api/",
+    "max_pages": 20,
+    "max_depth": 2
+  },
+  "api_security": {
+    "max_total_requests": 500,
+    "object_endpoints": [
+      {
+        "path": "/api/orgs/tenant-a/users/{id}/",
+        "test_ids": [1, 2],
+        "owner_field": "username",
+        "id_param": "id",
+        "tenant_field": "tenant_id"
+      }
+    ],
+    "property_endpoints": [
+      {
+        "path": "/api/profile/{id}/",
+        "method_read": "GET",
+        "method_write": "PATCH",
+        "test_id": 1,
+        "id_param": "id"
+      }
+    ],
+    "function_endpoints": [
+      {
+        "path": "/api/admin/export-users/",
+        "method": "GET",
+        "privilege": "admin"
+      },
+      {
+        "path": "/api/admin/users/2/promote/",
+        "method": "POST",
+        "privilege": "admin",
+        "revert_path": "/api/admin/users/2/demote/",
+        "revert_body": {}
+      }
+    ],
+    "resource_endpoints": [
+      {
+        "path": "/api/records/list/",
+        "limit_param": "limit",
+        "baseline_limit": 10,
+        "abuse_limit": 999999,
+        "rate_limit_expected": true
+      },
+      {
+        "path": "/api/notes/",
+        "rate_limit_expected": false
+      }
+    ],
+    "business_flows": [
+      {
+        "path": "/api/auth/signup/",
+        "method": "POST",
+        "flow_name": "signup",
+        "body_template": {"username": "abuse_canary", "password": "x"},
+        "test_account": "abuse_canary"
+      }
+    ],
+    "token_endpoints": {
+      "token_path": "/api/v2/token/",
+      "protected_path": "/api/v2/me/",
+      "logout_path": "/api/v2/auth/logout/",
+      "weak_secret_candidates": ["secret", "changeme", "password", "jwt"]
+    },
+    "inventory_paths": {
+      "openapi_candidates": ["/openapi.json", "/swagger.json"],
+      "current_version": "/api/v2/",
+      "canonical_probe_path": "/api/v2/me/",
+      "version_sibling_candidates": ["/api/v1/", "/api/v0/"],
+      "private_path_patterns": ["/internal/"],
+      "deprecated_paths": ["/api/v0/legacy/"]
+    },
+    "ssrf_body_fields": ["callback_url", "url", "webhook"]
+  },
+  "injection": {
+    "ssrf_endpoints": [{"path": "api/webhook/test/", "param": "url"}]
+  }
+}
