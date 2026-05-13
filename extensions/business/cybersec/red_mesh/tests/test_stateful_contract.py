@@ -191,29 +191,37 @@ class TestStatefulContractLint(unittest.TestCase):
   family file.
   """
 
-  def test_no_direct_mutating_calls_in_api_probe_families(self):
+  def test_mutating_calls_in_api_probe_families_use_run_stateful(self):
+    """Every api_*.py file that issues mutating HTTP calls MUST also
+    invoke `run_stateful` somewhere — those calls belong inside
+    baseline/mutate/verify/revert callbacks per the Subphase 1.8 contract.
+
+    This is a heuristic lint (not full AST analysis): it checks the
+    same source file co-locates both patterns. False positives are
+    possible if a file legitimately uses POST for non-mutating actions
+    AND happens not to call run_stateful — when that case arises,
+    revisit this lint.
+    """
     pkg_dir = Path(__file__).resolve().parents[1] / "graybox" / "probes"
     api_files = sorted(pkg_dir.glob("api_*.py"))
     self.assertTrue(api_files, "no API probe files found — check pkg layout")
 
-    pat = re.compile(
-      r"\bsession\.(post|put|patch|delete)\(",
+    # POST is overloaded (e.g., PT-OAPI8-04 POSTs malformed JSON to
+    # trigger a verbose-error response — non-mutating). PATCH / PUT /
+    # DELETE are unambiguously state-changing in REST conventions, so
+    # the lint targets those only.
+    mut_pat = re.compile(
+      r"\bsession\.(put|patch|delete)\(",
       re.IGNORECASE,
     )
     offenders = []
     for f in api_files:
       src = f.read_text()
-      # Strip `run_stateful(...)` blocks: anything inside a method that
-      # starts with "_test_..." but actually invokes run_stateful is OK.
-      # The simple lint here just flags ANY session.post/.. — when probes
-      # land they should call session methods only via callbacks passed
-      # to run_stateful (which itself doesn't appear in the api_*.py
-      # files yet).
-      for m in pat.finditer(src):
-        offenders.append((f.name, m.group(0), src.count("\n", 0, m.start()) + 1))
+      if mut_pat.search(src) and "run_stateful" not in src:
+        offenders.append(f.name)
     self.assertEqual(
       offenders, [],
-      f"Direct mutating HTTP calls found outside run_stateful: {offenders}",
+      f"Files with mutating HTTP calls but no run_stateful: {offenders}",
     )
 
   def test_run_stateful_marker_present_on_probebase(self):
