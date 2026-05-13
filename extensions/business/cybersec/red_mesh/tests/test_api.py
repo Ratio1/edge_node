@@ -2458,6 +2458,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       },
       {
         "kind": "redmesh_graybox_credentials",
+        "job_id": "test-job",
+        "storage_mode": "encrypted_r1fs_json_v1",
         "payload": {
           "official_username": "admin",
           "official_password": "secret",
@@ -2468,7 +2470,10 @@ class TestPhase5Endpoints(unittest.TestCase):
       },
     ]
 
-    config = Plugin._get_job_config(plugin, {"job_config_cid": "QmConfigCID"}, resolve_secrets=True)
+    config = Plugin._get_job_config(
+      plugin, {"job_id": "test-job", "job_config_cid": "QmConfigCID"},
+      resolve_secrets=True,
+    )
 
     self.assertEqual(config["official_username"], "admin")
     self.assertEqual(config["official_password"], "secret")
@@ -2480,8 +2485,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       unittest.mock.call("QmSecretCID", secret="unit-test-redmesh-secret-key"),
     )
 
-  def test_get_job_config_resolves_legacy_plaintext_secret_ref_without_key(self):
-    """Legacy plaintext secret refs remain readable as a compatibility fallback."""
+  def test_get_job_config_fails_closed_for_secret_ref_without_key(self):
+    """Secret refs are not resolved via plaintext fallback when no key exists."""
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
     plugin.cfg_redmesh_secret_store_key = ""
@@ -2502,13 +2507,12 @@ class TestPhase5Endpoints(unittest.TestCase):
       },
     ]
 
-    config = Plugin._get_job_config(plugin, {"job_config_cid": "QmConfigCID"}, resolve_secrets=True)
-
-    self.assertEqual(config["official_password"], "secret")
-    self.assertEqual(
-      plugin.r1fs.get_json.call_args_list[1],
-      unittest.mock.call("QmSecretCID"),
-    )
+    with self.assertRaises(ValueError):
+      Plugin._get_job_config(
+        plugin, {"job_id": "test-job", "job_config_cid": "QmConfigCID"},
+        resolve_secrets=True,
+      )
+    self.assertEqual(len(plugin.r1fs.get_json.call_args_list), 1)
 
   def test_get_job_data_running_last_5(self):
     """Running job with 8 passes returns last 5 refs only."""

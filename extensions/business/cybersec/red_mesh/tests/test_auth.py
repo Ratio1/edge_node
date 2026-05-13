@@ -246,6 +246,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     session = MagicMock()
     session.headers = {}
     session.params = {}
+    session.get.return_value = _mock_response(status=status)
     session.head.return_value = _mock_response(status=status)
     return session
 
@@ -265,7 +266,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     self.assertTrue(ok)
     self.assertIs(auth.official_session, session)
     self.assertEqual(session.headers["Authorization"], "Bearer TOKEN-123")
-    session.head.assert_called_once_with(
+    session.get.assert_called_once_with(
       "http://api.example/api/me",
       timeout=10,
       allow_redirects=True,
@@ -289,7 +290,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     self.assertTrue(ok)
     self.assertIs(auth.official_session, session)
     self.assertEqual(session.params, {"apikey": "KEY-123"})
-    session.head.assert_called_once()
+    session.get.assert_called_once()
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
   def test_authenticate_bearer_rejects_unauthorized_probe_path(self, mock_requests):

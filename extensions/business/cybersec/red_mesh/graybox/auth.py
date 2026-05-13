@@ -160,12 +160,13 @@ class AuthManager:
 
     Prevents session accumulation on targets with session limits.
     """
-    logout_url = self.target_url + self.target_config.logout_path
+    logout_url = self._logout_url_for_current_auth()
     for session in [self.official_session, self.regular_session]:
       if session is None:
         continue
       try:
-        session.get(logout_url, timeout=5)
+        if logout_url:
+          session.get(logout_url, timeout=5)
       except requests.RequestException:
         pass
       finally:
@@ -275,6 +276,21 @@ class AuthManager:
       return ""
     return (getattr(auth_desc, "authenticated_probe_path", "") or "").strip()
 
+  def _authenticated_probe_method(self) -> str:
+    api_security = getattr(self.target_config, "api_security", None)
+    auth_desc = getattr(api_security, "auth", None) if api_security is not None else None
+    method = (getattr(auth_desc, "authenticated_probe_method", "GET") or "GET").upper()
+    return method if method in ("GET", "POST", "HEAD", "OPTIONS") else "GET"
+
+  def _logout_url_for_current_auth(self) -> str:
+    if self._resolve_auth_type() == "form":
+      path = getattr(self.target_config, "logout_path", "") or ""
+    else:
+      api_security = getattr(self.target_config, "api_security", None)
+      auth_desc = getattr(api_security, "auth", None) if api_security is not None else None
+      path = getattr(auth_desc, "api_logout_path", "") or ""
+    return self.target_url + path if path else ""
+
   def _validate_authenticated_session(self, session) -> tuple[bool, bool]:
     """Validate token/key sessions after credentials have been attached.
 
@@ -289,14 +305,13 @@ class AuthManager:
     if not probe_path:
       return True, False
     try:
-      resp = session.head(
-        self.target_url + probe_path,
-        timeout=10,
-        allow_redirects=True,
-      )
+      method = self._authenticated_probe_method().lower()
+      req = getattr(session, method, session.get)
+      resp = req(self.target_url + probe_path, timeout=10, allow_redirects=True)
     except requests.RequestException:
       return False, True
-    if getattr(resp, "status_code", None) in (401, 403):
+    status = getattr(resp, "status_code", None)
+    if status is None or status >= 400:
       return False, False
     return True, False
 

@@ -56,18 +56,29 @@ class R1fsSecretStore:
     }
     return _artifact_repo(self.owner).put_json(secret_doc, show_logs=False, secret=secret_key)
 
-  def load_graybox_credentials(self, secret_ref: str) -> dict | None:
+  def load_graybox_credentials(self, secret_ref: str, *, expected_job_id: str = "") -> dict | None:
     if not secret_ref:
       return None
     repo = _artifact_repo(self.owner)
     secret_key = self._get_secret_store_key()
-    secret_doc = None
-    if secret_key:
-      secret_doc = repo.get_json(secret_ref, secret=secret_key)
-    if not isinstance(secret_doc, dict):
-      secret_doc = repo.get_json(secret_ref)
+    if not secret_key:
+      self.owner.P("No RedMesh secret-store key is configured; cannot resolve graybox secret_ref", color='r')
+      return None
+    secret_doc = repo.get_json(secret_ref, secret=secret_key)
     if not isinstance(secret_doc, dict):
       self.owner.P(f"Failed to fetch graybox secret payload from R1FS (CID: {secret_ref})", color='r')
+      return None
+    if secret_doc.get("kind") != "redmesh_graybox_credentials":
+      self.owner.P(f"Invalid graybox secret kind for ref {secret_ref}", color='r')
+      return None
+    if secret_doc.get("storage_mode") != "encrypted_r1fs_json_v1":
+      self.owner.P(f"Invalid graybox secret storage mode for ref {secret_ref}", color='r')
+      return None
+    if expected_job_id and secret_doc.get("job_id") != expected_job_id:
+      self.owner.P(
+        f"Graybox secret ref {secret_ref} belongs to job_id={secret_doc.get('job_id')}, expected {expected_job_id}",
+        color='r',
+      )
       return None
     payload = secret_doc.get("payload")
     if not isinstance(payload, dict):
@@ -95,6 +106,9 @@ def _blank_graybox_secret_fields(config_dict: dict) -> dict:
   sanitized["bearer_token"] = ""
   sanitized["api_key"] = ""
   sanitized["bearer_refresh_token"] = ""
+  sanitized["regular_bearer_token"] = ""
+  sanitized["regular_api_key"] = ""
+  sanitized["regular_bearer_refresh_token"] = ""
   sanitized.pop("weak_candidates", None)
   return sanitized
 
@@ -117,6 +131,9 @@ def build_graybox_secret_payload(
   bearer_token="",
   api_key="",
   bearer_refresh_token="",
+  regular_bearer_token="",
+  regular_api_key="",
+  regular_bearer_refresh_token="",
 ):
   return {
     "official_username": official_username or "",
@@ -128,6 +145,9 @@ def build_graybox_secret_payload(
     "bearer_token": bearer_token or "",
     "api_key": api_key or "",
     "bearer_refresh_token": bearer_refresh_token or "",
+    "regular_bearer_token": regular_bearer_token or "",
+    "regular_api_key": regular_api_key or "",
+    "regular_bearer_refresh_token": regular_bearer_refresh_token or "",
   }
 
 
@@ -157,6 +177,9 @@ def persist_job_config_with_secrets(
       bearer_token=persisted_config.get("bearer_token", ""),
       api_key=persisted_config.get("api_key", ""),
       bearer_refresh_token=persisted_config.get("bearer_refresh_token", ""),
+      regular_bearer_token=persisted_config.get("regular_bearer_token", ""),
+      regular_api_key=persisted_config.get("regular_api_key", ""),
+      regular_bearer_refresh_token=persisted_config.get("regular_bearer_refresh_token", ""),
     )
     has_secret_payload = any([
       payload["official_username"],
@@ -167,6 +190,9 @@ def persist_job_config_with_secrets(
       payload["bearer_token"],
       payload["api_key"],
       payload["bearer_refresh_token"],
+      payload["regular_bearer_token"],
+      payload["regular_api_key"],
+      payload["regular_bearer_refresh_token"],
     ])
     if has_secret_payload:
       store = R1fsSecretStore(owner)
@@ -181,6 +207,9 @@ def persist_job_config_with_secrets(
       persisted_config["has_bearer_token"] = bool(payload["bearer_token"])
       persisted_config["has_api_key"] = bool(payload["api_key"])
       persisted_config["has_bearer_refresh_token"] = bool(payload["bearer_refresh_token"])
+      persisted_config["has_regular_bearer_token"] = bool(payload["regular_bearer_token"])
+      persisted_config["has_regular_api_key"] = bool(payload["regular_api_key"])
+      persisted_config["has_regular_bearer_refresh_token"] = bool(payload["regular_bearer_refresh_token"])
       persisted_config = _blank_graybox_secret_fields(persisted_config)
 
   job_config_cid = _artifact_repo(owner).put_job_config(persisted_config, show_logs=False)
@@ -200,9 +229,12 @@ def resolve_job_config_secrets(owner, config_dict: dict, include_secret_metadata
   if not secret_ref:
     return resolved
 
-  payload = R1fsSecretStore(owner).load_graybox_credentials(secret_ref)
+  expected_job_id = resolved.get("job_id", "")
+  payload = R1fsSecretStore(owner).load_graybox_credentials(
+    secret_ref, expected_job_id=expected_job_id,
+  )
   if not payload:
-    return resolved
+    raise ValueError(f"Failed to resolve graybox secret_ref for job_id={expected_job_id or '<unknown>'}")
 
   resolved.update({
     "official_username": payload.get("official_username", ""),
@@ -214,6 +246,9 @@ def resolve_job_config_secrets(owner, config_dict: dict, include_secret_metadata
     "bearer_token": payload.get("bearer_token", ""),
     "api_key": payload.get("api_key", ""),
     "bearer_refresh_token": payload.get("bearer_refresh_token", ""),
+    "regular_bearer_token": payload.get("regular_bearer_token", ""),
+    "regular_api_key": payload.get("regular_api_key", ""),
+    "regular_bearer_refresh_token": payload.get("regular_bearer_refresh_token", ""),
   })
   if not include_secret_metadata:
     resolved.pop("secret_ref", None)

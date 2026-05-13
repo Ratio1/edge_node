@@ -31,6 +31,9 @@ SENSITIVE_VALUES = {
   "bearer_token": "eyJ.SECRET-BEARER-TOKEN-VALUE-1234567890.abc",
   "api_key": "SUPER-SECRET-API-KEY-9999",
   "bearer_refresh_token": "REFRESH-TOKEN-MUST-NOT-LEAK",
+  "regular_bearer_token": "eyJ.REGULAR-SECRET-BEARER-TOKEN.abc",
+  "regular_api_key": "REGULAR-SECRET-API-KEY-9999",
+  "regular_bearer_refresh_token": "REGULAR-REFRESH-TOKEN-MUST-NOT-LEAK",
 }
 
 
@@ -49,6 +52,9 @@ class TestSecretIsolationInBuildPayload(unittest.TestCase):
     self.assertEqual(payload["bearer_token"], SENSITIVE_VALUES["bearer_token"])
     self.assertEqual(payload["api_key"], SENSITIVE_VALUES["api_key"])
     self.assertEqual(payload["bearer_refresh_token"], SENSITIVE_VALUES["bearer_refresh_token"])
+    self.assertEqual(payload["regular_bearer_token"], SENSITIVE_VALUES["regular_bearer_token"])
+    self.assertEqual(payload["regular_api_key"], SENSITIVE_VALUES["regular_api_key"])
+    self.assertEqual(payload["regular_bearer_refresh_token"], SENSITIVE_VALUES["regular_bearer_refresh_token"])
 
   def test_blank_strips_all_new_secrets(self):
     """_blank_graybox_secret_fields zeroes every new secret field."""
@@ -59,6 +65,9 @@ class TestSecretIsolationInBuildPayload(unittest.TestCase):
     self.assertEqual(sanitized["bearer_token"], "")
     self.assertEqual(sanitized["api_key"], "")
     self.assertEqual(sanitized["bearer_refresh_token"], "")
+    self.assertEqual(sanitized["regular_bearer_token"], "")
+    self.assertEqual(sanitized["regular_api_key"], "")
+    self.assertEqual(sanitized["regular_bearer_refresh_token"], "")
 
 
 class TestSecretIsolationInPersistedConfig(unittest.TestCase):
@@ -105,11 +114,17 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
     self.assertTrue(persisted_config["has_bearer_token"])
     self.assertTrue(persisted_config["has_api_key"])
     self.assertTrue(persisted_config["has_bearer_refresh_token"])
+    self.assertTrue(persisted_config["has_regular_bearer_token"])
+    self.assertTrue(persisted_config["has_regular_api_key"])
+    self.assertTrue(persisted_config["has_regular_bearer_refresh_token"])
     self.assertEqual(persisted_config["secret_ref"], "fake://secret/cid")
     # Raw secret slots are blanked.
     self.assertEqual(persisted_config["bearer_token"], "")
     self.assertEqual(persisted_config["api_key"], "")
     self.assertEqual(persisted_config["bearer_refresh_token"], "")
+    self.assertEqual(persisted_config["regular_bearer_token"], "")
+    self.assertEqual(persisted_config["regular_api_key"], "")
+    self.assertEqual(persisted_config["regular_bearer_refresh_token"], "")
 
   @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
   def test_resolve_repopulates_secrets_for_worker(self, mock_store_cls):
@@ -128,8 +143,12 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
       "secret_ref": "fake://secret/cid",
       "official_username": "", "official_password": "",
       "bearer_token": "", "api_key": "", "bearer_refresh_token": "",
+      "regular_bearer_token": "", "regular_api_key": "",
+      "regular_bearer_refresh_token": "",
       "has_bearer_token": True, "has_api_key": True,
       "has_bearer_refresh_token": True,
+      "has_regular_bearer_token": True, "has_regular_api_key": True,
+      "has_regular_bearer_refresh_token": True,
     }
     resolved = resolve_job_config_secrets(MagicMock(), persisted)
     for k, v in SENSITIVE_VALUES.items():
@@ -171,6 +190,9 @@ class TestSecretIsolationInRuntimeCredentials(unittest.TestCase):
     cfg.bearer_token = SENSITIVE_VALUES["bearer_token"]
     cfg.api_key = SENSITIVE_VALUES["api_key"]
     cfg.bearer_refresh_token = SENSITIVE_VALUES["bearer_refresh_token"]
+    cfg.regular_bearer_token = ""
+    cfg.regular_api_key = ""
+    cfg.regular_bearer_refresh_token = ""
 
     creds = GrayboxCredentialSet.from_job_config(cfg)
     official = creds.official.to_credentials()
@@ -179,6 +201,28 @@ class TestSecretIsolationInRuntimeCredentials(unittest.TestCase):
     self.assertEqual(official.api_key, SENSITIVE_VALUES["api_key"])
     self.assertEqual(official.bearer_refresh_token, SENSITIVE_VALUES["bearer_refresh_token"])
     self.assertTrue(creds.official.is_configured)
+
+  def test_worker_credential_set_carries_regular_api_secrets(self):
+    cfg = MagicMock()
+    cfg.official_username = ""
+    cfg.official_password = ""
+    cfg.bearer_token = ""
+    cfg.api_key = ""
+    cfg.bearer_refresh_token = ""
+    cfg.regular_username = ""
+    cfg.regular_password = ""
+    cfg.regular_bearer_token = SENSITIVE_VALUES["regular_bearer_token"]
+    cfg.regular_api_key = SENSITIVE_VALUES["regular_api_key"]
+    cfg.regular_bearer_refresh_token = SENSITIVE_VALUES["regular_bearer_refresh_token"]
+    cfg.weak_candidates = []
+    cfg.max_weak_attempts = 5
+
+    creds = GrayboxCredentialSet.from_job_config(cfg)
+
+    self.assertIsNotNone(creds.regular)
+    self.assertEqual(creds.regular.bearer_token, SENSITIVE_VALUES["regular_bearer_token"])
+    self.assertEqual(creds.regular.api_key, SENSITIVE_VALUES["regular_api_key"])
+    self.assertEqual(creds.regular.principal, "regular")
 
   def test_runtime_credential_dict_exposes_only_secret_capabilities(self):
     cfg = MagicMock()
@@ -191,6 +235,9 @@ class TestSecretIsolationInRuntimeCredentials(unittest.TestCase):
     cfg.bearer_token = SENSITIVE_VALUES["bearer_token"]
     cfg.api_key = SENSITIVE_VALUES["api_key"]
     cfg.bearer_refresh_token = SENSITIVE_VALUES["bearer_refresh_token"]
+    cfg.regular_bearer_token = ""
+    cfg.regular_api_key = ""
+    cfg.regular_bearer_refresh_token = ""
 
     serialized = json.dumps(GrayboxCredentialSet.from_job_config(cfg).official.to_dict())
 

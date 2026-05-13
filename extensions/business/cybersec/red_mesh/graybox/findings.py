@@ -204,7 +204,16 @@ class GrayboxFinding:
     canon_title = self.title.lower().strip()
     cwe_joined = ", ".join(self.cwe)
     cwe_canonical = ", ".join(sorted({item.strip() for item in self.cwe if isinstance(item, str) and item.strip()}))
-    id_input = f"{port}:{probe_name}:{cwe_canonical}:{canon_title}"
+    evidence_identity = []
+    for item in self.evidence:
+      if not isinstance(item, str):
+        continue
+      if item.startswith(("endpoint=", "path=", "protected_path=", "token_path=", "flow=", "test_id=")):
+        evidence_identity.append(item)
+    id_input = (
+      f"{port}:{probe_name}:{self.scenario_id}:{cwe_canonical}:"
+      f"{canon_title}:{'|'.join(sorted(evidence_identity))}"
+    )
     finding_id = hashlib.sha256(id_input.encode()).hexdigest()[:16]
 
     # Map status -> confidence and effective severity

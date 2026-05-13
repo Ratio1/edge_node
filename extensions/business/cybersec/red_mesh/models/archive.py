@@ -77,6 +77,9 @@ class JobConfig:
   has_bearer_token: bool = False
   has_api_key: bool = False
   has_bearer_refresh_token: bool = False
+  has_regular_bearer_token: bool = False
+  has_regular_api_key: bool = False
+  has_regular_bearer_refresh_token: bool = False
   official_username: str = ""
   official_password: str = ""
   regular_username: str = ""
@@ -84,6 +87,9 @@ class JobConfig:
   bearer_token: str = ""              # blanked before persistence; runtime-only
   api_key: str = ""                   # blanked before persistence; runtime-only
   bearer_refresh_token: str = ""      # blanked before persistence; runtime-only
+  regular_bearer_token: str = ""      # blanked before persistence; runtime-only
+  regular_api_key: str = ""           # blanked before persistence; runtime-only
+  regular_bearer_refresh_token: str = ""  # blanked before persistence; runtime-only
   weak_candidates: list = None        # legacy inline payload; new launches use secret_ref
   max_weak_attempts: int = 5
   app_routes: list = None             # user-supplied known routes
@@ -134,6 +140,9 @@ class JobConfig:
       has_bearer_token=d.get("has_bearer_token", False),
       has_api_key=d.get("has_api_key", False),
       has_bearer_refresh_token=d.get("has_bearer_refresh_token", False),
+      has_regular_bearer_token=d.get("has_regular_bearer_token", False),
+      has_regular_api_key=d.get("has_regular_api_key", False),
+      has_regular_bearer_refresh_token=d.get("has_regular_bearer_refresh_token", False),
       official_username=d.get("official_username", ""),
       official_password=d.get("official_password", ""),
       regular_username=d.get("regular_username", ""),
@@ -141,6 +150,9 @@ class JobConfig:
       bearer_token=d.get("bearer_token", ""),
       api_key=d.get("api_key", ""),
       bearer_refresh_token=d.get("bearer_refresh_token", ""),
+      regular_bearer_token=d.get("regular_bearer_token", ""),
+      regular_api_key=d.get("regular_api_key", ""),
+      regular_bearer_refresh_token=d.get("regular_bearer_refresh_token", ""),
       weak_candidates=d.get("weak_candidates"),
       max_weak_attempts=d.get("max_weak_attempts", 5),
       app_routes=d.get("app_routes"),

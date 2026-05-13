@@ -259,6 +259,8 @@ class ApiObjectEndpoint:
   owner_field: str = "owner"
   id_param: str = "id"
   tenant_field: str = ""                    # optional, for cross-tenant BOLA
+  expected_owner: str = ""                  # expected low-privilege owner value
+  expected_tenant: str = ""                 # expected low-privilege tenant value
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiObjectEndpoint:
@@ -268,6 +270,8 @@ class ApiObjectEndpoint:
       owner_field=d.get("owner_field", "owner"),
       id_param=d.get("id_param", "id"),
       tenant_field=d.get("tenant_field", ""),
+      expected_owner=d.get("expected_owner", ""),
+      expected_tenant=d.get("expected_tenant", ""),
     )
 
 
@@ -311,6 +315,7 @@ class ApiFunctionEndpoint:
   auth_required_marker: str = ""            # body substring expected on 401/403
   revert_path: str = ""                     # e.g. ".../demote/" — required for stateful
   revert_body: dict = field(default_factory=dict)
+  allow_malformed_json_probe: bool = False  # opt-in for PT-OAPI8-04 malformed JSON POST
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiFunctionEndpoint:
@@ -321,6 +326,7 @@ class ApiFunctionEndpoint:
       auth_required_marker=d.get("auth_required_marker", ""),
       revert_path=d.get("revert_path", ""),
       revert_body=d.get("revert_body", {}),
+      allow_malformed_json_probe=d.get("allow_malformed_json_probe", False),
     )
 
 
@@ -341,6 +347,9 @@ class ApiResourceEndpoint:
   baseline_limit: int = 10
   abuse_limit: int = 999_999
   rate_limit_expected: bool = False
+  allow_high_limit_probe: bool = False
+  allow_oversized_payload_probe: bool = False
+  oversized_payload_bytes: int = 65_536
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiResourceEndpoint:
@@ -350,6 +359,9 @@ class ApiResourceEndpoint:
       baseline_limit=d.get("baseline_limit", 10),
       abuse_limit=d.get("abuse_limit", 999_999),
       rate_limit_expected=d.get("rate_limit_expected", False),
+      allow_high_limit_probe=d.get("allow_high_limit_probe", False),
+      allow_oversized_payload_probe=d.get("allow_oversized_payload_probe", False),
+      oversized_payload_bytes=d.get("oversized_payload_bytes", 65_536),
     )
 
 
@@ -407,6 +419,9 @@ class ApiTokenEndpoint:
   token_path: str = ""                       # e.g. "/api/token/"
   protected_path: str = ""                   # e.g. "/api/me/"
   logout_path: str = ""                      # e.g. "/api/auth/logout/" — required for PT-OAPI2-03
+  token_request_method: str = "POST"
+  token_request_body: dict = field(default_factory=dict)
+  token_response_field: str = ""
   weak_secret_candidates: list[str] = field(default_factory=lambda: [
     "secret", "changeme", "password", "1234567890",
     "jwt", "key", "topsecret", "default",
@@ -419,6 +434,9 @@ class ApiTokenEndpoint:
       token_path=d.get("token_path", ""),
       protected_path=d.get("protected_path", ""),
       logout_path=d.get("logout_path", ""),
+      token_request_method=d.get("token_request_method", "POST"),
+      token_request_body=d.get("token_request_body", {}),
+      token_response_field=d.get("token_response_field", ""),
       weak_secret_candidates=d.get("weak_secret_candidates", defaults),
     )
 
@@ -493,6 +511,11 @@ class AuthDescriptor:
     authenticated_probe_path: Path used by strategy preflight when
                ``auth_type != 'form'`` to verify the credentials work
                before any probe runs (e.g. ``/api/me``).
+    authenticated_probe_method: HTTP method for authenticated validation.
+               Defaults to GET because many APIs reject HEAD even when
+               credentials are valid.
+    api_logout_path: Optional explicit logout endpoint for API-native
+               sessions. Form scans continue using ``logout_path``.
   """
   auth_type: str = "form"   # "form" | "bearer" | "api_key"
   bearer_token_header_name: str = "Authorization"
@@ -502,6 +525,8 @@ class AuthDescriptor:
   api_key_query_param: str = "api_key"
   api_key_location: str = "header"  # "header" | "query"
   authenticated_probe_path: str = ""
+  authenticated_probe_method: str = "GET"
+  api_logout_path: str = ""
 
   @classmethod
   def from_dict(cls, d: dict) -> AuthDescriptor:
@@ -514,6 +539,8 @@ class AuthDescriptor:
       api_key_query_param=d.get("api_key_query_param", "api_key"),
       api_key_location=d.get("api_key_location", "header"),
       authenticated_probe_path=d.get("authenticated_probe_path", ""),
+      authenticated_probe_method=d.get("authenticated_probe_method", "GET"),
+      api_logout_path=d.get("api_logout_path", ""),
     )
 
 

@@ -49,10 +49,17 @@ class GrayboxCredentialSet:
   @classmethod
   def from_job_config(cls, job_config) -> GrayboxCredentialSet:
     regular = None
-    if getattr(job_config, "regular_username", ""):
+    if (
+      getattr(job_config, "regular_username", "")
+      or getattr(job_config, "regular_bearer_token", "")
+      or getattr(job_config, "regular_api_key", "")
+    ):
       regular = GrayboxCredential(
         username=getattr(job_config, "regular_username", "") or "",
         password=getattr(job_config, "regular_password", "") or "",
+        bearer_token=getattr(job_config, "regular_bearer_token", "") or "",
+        bearer_refresh_token=getattr(job_config, "regular_bearer_refresh_token", "") or "",
+        api_key=getattr(job_config, "regular_api_key", "") or "",
         principal="regular",
       )
     return cls(

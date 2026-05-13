@@ -20,6 +20,7 @@ from ..models import (
   JobConfig,
   RulesOfEngagement,
 )
+from ..graybox.models.target_config import GrayboxTargetConfig
 from ..repositories import JobStateRepository
 from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
@@ -103,6 +104,21 @@ def _extract_scope_prefix(target_config) -> str:
 def _extract_discovery_max_pages(target_config) -> int:
   if not isinstance(target_config, dict):
     return 50
+
+
+def _validate_graybox_target_config(target_config):
+  """Validate typed graybox target_config before workers see it."""
+  if target_config is None:
+    return None
+  if not isinstance(target_config, dict):
+    return validation_error("target_config must be a JSON object")
+  try:
+    GrayboxTargetConfig.from_dict(deepcopy(target_config))
+  except KeyError as exc:
+    return validation_error(f"target_config is missing required field: {exc}")
+  except (TypeError, ValueError) as exc:
+    return validation_error(f"target_config is invalid: {exc}")
+  return None
   discovery = target_config.get("discovery") or {}
   if not isinstance(discovery, dict):
     return 50
@@ -461,6 +477,9 @@ def announce_launch(
   bearer_token="",
   api_key="",
   bearer_refresh_token="",
+  regular_bearer_token="",
+  regular_api_key="",
+  regular_bearer_refresh_token="",
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
   excluded_features, enabled_features = resolve_enabled_features(
@@ -530,6 +549,9 @@ def announce_launch(
     bearer_token=bearer_token,
     api_key=api_key,
     bearer_refresh_token=bearer_refresh_token,
+    regular_bearer_token=regular_bearer_token,
+    regular_api_key=regular_api_key,
+    regular_bearer_refresh_token=regular_bearer_refresh_token,
   )
 
   persisted_config, job_config_cid = persist_job_config_with_secrets(
@@ -853,6 +875,9 @@ def launch_webapp_scan(
   bearer_token="",
   api_key="",
   bearer_refresh_token="",
+  regular_bearer_token="",
+  regular_api_key="",
+  regular_bearer_refresh_token="",
   # OWASP API Top 10 — Subphase 1.7. When set, overrides
   # `target_config.api_security.max_total_requests` for the scan.
   request_budget=None,
@@ -961,6 +986,10 @@ def launch_webapp_scan(
     api_security["max_total_requests"] = int(request_budget)
     target_config["api_security"] = api_security
 
+  config_error = _validate_graybox_target_config(target_config)
+  if config_error:
+    return config_error
+
   workers, worker_error = build_webapp_workers(owner, active_peers, target_port)
   if worker_error:
     return worker_error
@@ -1013,6 +1042,9 @@ def launch_webapp_scan(
     bearer_token=bearer_token,
     api_key=api_key,
     bearer_refresh_token=bearer_refresh_token,
+    regular_bearer_token=regular_bearer_token,
+    regular_api_key=regular_api_key,
+    regular_bearer_refresh_token=regular_bearer_refresh_token,
   )
 
 
@@ -1056,6 +1088,9 @@ def launch_test(
   bearer_token="",
   api_key="",
   bearer_refresh_token="",
+  regular_bearer_token="",
+  regular_api_key="",
+  regular_bearer_refresh_token="",
   request_budget=None,
   target_confirmation="",
   scope_id="",
@@ -1103,6 +1138,9 @@ def launch_test(
       bearer_token=bearer_token,
       api_key=api_key,
       bearer_refresh_token=bearer_refresh_token,
+      regular_bearer_token=regular_bearer_token,
+      regular_api_key=regular_api_key,
+      regular_bearer_refresh_token=regular_bearer_refresh_token,
       request_budget=request_budget,
       target_confirmation=target_confirmation,
       scope_id=scope_id,
