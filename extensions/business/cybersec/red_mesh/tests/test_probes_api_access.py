@@ -37,7 +37,7 @@ def _mock_response(status=200, json_body=None, text="",
 
 def _make_probe(*, object_endpoints=None, function_endpoints=None,
                 regular_username="alice", regular_session=None,
-                anon_session=None):
+                anon_session=None, allow_stateful=False):
   cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(
     object_endpoints=list(object_endpoints or []),
     function_endpoints=list(function_endpoints or []),
@@ -59,6 +59,7 @@ def _make_probe(*, object_endpoints=None, function_endpoints=None,
     target_config=cfg,
     safety=safety,
     regular_username=regular_username,
+    allow_stateful=allow_stateful,
   )
 
 
@@ -309,6 +310,92 @@ class TestApi5Bfla(unittest.TestCase):
     clean = [f for f in p.findings
              if f.status == "not_vulnerable" and f.scenario_id == "PT-OAPI5-02"]
     self.assertEqual(len(clean), 1)
+
+
+class TestApi5BflaStateful(unittest.TestCase):
+  """PT-OAPI5-03 + PT-OAPI5-04 stateful BFLA attribution and rollback."""
+
+  def _stateful_probe(self, ep):
+    return _make_probe(function_endpoints=[ep], allow_stateful=True)
+
+  def test_method_override_skips_when_plain_mutating_method_allowed(self):
+    ep = ApiFunctionEndpoint(
+      path="/api/admin/users/7/promote/",
+      method="POST",
+      privilege="admin",
+      revert_path="/api/admin/users/7/demote/",
+      revert_body={"role": "user"},
+    )
+    p = self._stateful_probe(ep)
+    p.auth.regular_session.post.side_effect = [
+      _mock_response(status=200),
+      _mock_response(status=200),
+    ]
+
+    p.run_safe("api_bfla_method_override", p._test_bfla_method_override)
+
+    self.assertEqual(
+      [f for f in p.findings
+       if f.status == "vulnerable" and f.scenario_id == "PT-OAPI5-03"],
+      [],
+    )
+    incon = [f for f in p.findings
+             if f.status == "inconclusive" and f.scenario_id == "PT-OAPI5-03"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("plain_mutating_method_allowed", "\n".join(incon[0].evidence))
+    self.assertEqual(p.auth.regular_session.post.call_count, 2)
+    self.assertEqual(
+      p.auth.regular_session.post.call_args_list[-1].args[0],
+      "http://api.example/api/admin/users/7/demote/",
+    )
+
+  def test_method_override_reports_only_after_plain_method_rejected(self):
+    ep = ApiFunctionEndpoint(
+      path="/api/admin/users/7/promote/",
+      method="POST",
+      privilege="admin",
+      revert_path="/api/admin/users/7/demote/",
+    )
+    p = self._stateful_probe(ep)
+    p.auth.regular_session.post.side_effect = [
+      _mock_response(status=403),
+      _mock_response(status=200),
+      _mock_response(status=200),
+    ]
+
+    p.run_safe("api_bfla_method_override", p._test_bfla_method_override)
+
+    vuln = [f for f in p.findings
+            if f.status == "vulnerable" and f.scenario_id == "PT-OAPI5-03"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].rollback_status, "reverted")
+    self.assertIn("plain_status=403", "\n".join(vuln[0].evidence))
+    override_call = p.auth.regular_session.post.call_args_list[1]
+    self.assertEqual(
+      override_call.kwargs["headers"],
+      {"X-HTTP-Method-Override": "GET"},
+    )
+
+  def test_mutating_bfla_revert_failure_escalates_severity(self):
+    ep = ApiFunctionEndpoint(
+      path="/api/admin/users/7/promote/",
+      method="POST",
+      privilege="admin",
+      revert_path="/api/admin/users/7/demote/",
+    )
+    p = self._stateful_probe(ep)
+    p.auth.regular_session.post.side_effect = [
+      _mock_response(status=200),
+      _mock_response(status=500),
+    ]
+
+    p.run_safe("api_bfla_mutating", p._test_bfla_regular_as_admin_mutating)
+
+    vuln = [f for f in p.findings
+            if f.status == "vulnerable" and f.scenario_id == "PT-OAPI5-04"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].rollback_status, "revert_failed")
+    self.assertEqual(vuln[0].severity, "CRITICAL")
 
 
 if __name__ == "__main__":

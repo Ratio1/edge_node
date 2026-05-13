@@ -393,21 +393,39 @@ class ApiAccessProbes(ProbeBase):
 
       url = self.target_url + ep.path
       revert_url = self.target_url + ep.revert_path
+      method_fn = getattr(session, method.lower(), session.post)
+
+      if not self.budget():
+        self.emit_inconclusive("PT-OAPI5-03", title, owasp, "budget_exhausted")
+        return
+      self.safety.throttle()
+      try:
+        plain_resp = method_fn(url, timeout=10, allow_redirects=False)
+      except requests.RequestException:
+        continue
+      if plain_resp.status_code < 400:
+        reverted = self._revert_function_endpoint(session, revert_url, ep)
+        reason = "plain_mutating_method_allowed"
+        if not reverted:
+          reason = "plain_mutating_method_allowed_revert_failed"
+        self.emit_inconclusive("PT-OAPI5-03", title, owasp, reason)
+        continue
+      if plain_resp.status_code not in (401, 403):
+        self.emit_inconclusive(
+          "PT-OAPI5-03",
+          title,
+          owasp,
+          f"plain_mutating_method_status_{plain_resp.status_code}",
+        )
+        continue
 
       def baseline(_ep=ep, _url=url):
-        # Control case: GET (without override) should be rejected.
-        if not self.budget():
-          raise RuntimeError("budget_exhausted")
-        self.safety.throttle()
-        try:
-          resp = session.get(_url, timeout=10, allow_redirects=False)
-        except requests.RequestException as exc:
-          raise RuntimeError(str(exc))
-        return {"control_status": resp.status_code}
+        # Plain mutating method was already rejected above. Baseline keeps
+        # that status so the override attribution is explicit.
+        return {"plain_status": plain_resp.status_code}
 
       def mutate(base, _ep=ep, _url=url):
-        if base.get("control_status", 0) < 400:
-          # Control case was already accessible — no override needed.
+        if base.get("plain_status") not in (401, 403):
           return False
         if not self.budget():
           return False
@@ -426,13 +444,7 @@ class ApiAccessProbes(ProbeBase):
         return base.get("override_status", 999) < 400
 
       def revert(base, _revert_url=revert_url, _ep=ep):
-        if not self.budget():
-          return False
-        try:
-          session.post(_revert_url, json=ep.revert_body or {}, timeout=10)
-        except requests.RequestException:
-          return False
-        return True
+        return self._revert_function_endpoint(session, _revert_url, _ep)
 
       self.run_stateful(
         "PT-OAPI5-03",
@@ -443,7 +455,9 @@ class ApiAccessProbes(ProbeBase):
         finding_kwargs={
           "title": title, "owasp": owasp, "severity": "HIGH",
           "cwe": ["CWE-285", "CWE-862"],
-          "evidence": [f"endpoint={url}", "override_header=X-HTTP-Method-Override: GET"],
+          "evidence": [f"endpoint={url}",
+                       f"plain_status={plain_resp.status_code}",
+                       "override_header=X-HTTP-Method-Override: GET"],
           "remediation": (
             "Disable HTTP method override entirely or restrict it to "
             "internal services. Authorization must be enforced on the "
@@ -495,13 +509,7 @@ class ApiAccessProbes(ProbeBase):
         return base.get("mutate_status", 999) < 400
 
       def revert(base, _revert_url=revert_url, _ep=ep):
-        if not self.budget():
-          return False
-        try:
-          session.post(_revert_url, json=ep.revert_body or {}, timeout=10)
-        except requests.RequestException:
-          return False
-        return True
+        return self._revert_function_endpoint(session, _revert_url, _ep)
 
       privilege = (ep.privilege or "").lower()
       severity = ("CRITICAL"
@@ -525,6 +533,16 @@ class ApiAccessProbes(ProbeBase):
           ),
         },
       )
+
+  def _revert_function_endpoint(self, session, revert_url, ep) -> bool:
+    if not self.budget():
+      return False
+    self.safety.throttle()
+    try:
+      resp = session.post(revert_url, json=ep.revert_body or {}, timeout=10)
+    except requests.RequestException:
+      return False
+    return resp.status_code < 400
 
   @staticmethod
   def _collect_sensitive_field_names(payload):
