@@ -111,7 +111,7 @@ scenarios:
     revert_path: "/api/admin/users/2/demote/"
     notes: stateful
 
-  - id: PT-OAPI5-02-mut
+  - id: PT-OAPI5-04
     honeypot_path: "/api/admin/users/2/promote/"
     method: POST
     expected_severity: CRITICAL

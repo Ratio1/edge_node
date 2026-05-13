@@ -11,7 +11,7 @@ New OWASP API Top 10 (2023) graybox scenarios use the prefix **`PT-OAPI<N>-<NN>`
 - `<N>` is the OWASP API category number (1–6, 8, 9 for v1; API7 keeps its legacy ID, API10 is reserved for Phase 9).
 - `<NN>` is a zero-padded sequence within the category (`01`, `02`, …).
 
-Examples: `PT-OAPI1-01` (BOLA), `PT-OAPI3-02` (mass assignment), `PT-OAPI5-02-mut` (mutating BFLA), `PT-OAPI9-01` (OpenAPI exposure).
+Examples: `PT-OAPI1-01` (BOLA), `PT-OAPI3-02` (mass assignment), `PT-OAPI5-04` (mutating BFLA), `PT-OAPI9-01` (OpenAPI exposure).
 
 **Out of scope of this ADR**: any scenario ID for API7 SSRF stays as the existing **`PT-API7-01`** for backward compatibility. Any scenario ID for API10 will be minted in Phase 9, not in v1.
 

@@ -58,11 +58,8 @@ class TestDetectionInventory(unittest.TestCase):
   #   PT-A<NN>-<NN>     — OWASP Web Top 10 2021 scenarios (existing).
   #   PT-API7-<NN>      — legacy SSRF ID, preserved for backward compatibility.
   #   PT-OAPI<N>-<NN>   — OWASP API Top 10 2023 scenarios (new in v1).
-  # PT-OAPI ids may carry an optional `-mut` suffix for stateful-mutating
-  # variants of an otherwise-read scenario (e.g. `PT-OAPI5-02-mut` in
-  # Subphase 3.4 of the API Top 10 plan).
   _SCENARIO_ID_RE = re.compile(
-    r"scenario_id\s*=\s*[\"'](PT-A\d+-\d+|PT-API7-\d+|PT-OAPI\d{1,2}-\d+(?:-mut)?)[\"']"
+    r"scenario_id\s*=\s*[\"'](PT-A\d+-\d+|PT-API7-\d+|PT-OAPI\d{1,2}-\d+)[\"']"
   )
 
   def test_existing_graybox_emitted_scenarios_are_registered(self):

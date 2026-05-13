@@ -267,7 +267,7 @@ class TestApi5Bfla(unittest.TestCase):
     self.assertEqual(vuln[0].severity, "HIGH")
 
   def test_mutating_method_skipped_in_phase_2(self):
-    """method=POST is deferred to PT-OAPI5-02-mut (Subphase 3.4)."""
+    """method=POST is deferred to PT-OAPI5-04 (Subphase 3.4)."""
     ep = ApiFunctionEndpoint(path="/api/admin/promote/", method="POST",
                               privilege="admin")
     p = self._make_function_probe(function_endpoints=[ep])
