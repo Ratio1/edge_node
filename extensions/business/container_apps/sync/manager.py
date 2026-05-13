@@ -785,7 +785,11 @@ class SyncManager:
       }
       self.append_sent(entry)
 
-      # Write success response and clean up control-plane artifacts.
+      # Write success response and clean up control-plane artifacts. We
+      # include the app-supplied metadata so the in-volume-sync state file
+      # is self-contained — UIs that surface response.json (without access
+      # to host-side sync_history/) can show the metadata that travelled
+      # with this snapshot.
       response_payload = {
         "status": "ok",
         "cid": cid,
@@ -794,6 +798,7 @@ class SyncManager:
         "archive_paths": list(archive_paths),
         "archive_size_bytes": size_bytes,
         "chainstore_ack": bool(ack),
+        "metadata": dict(sync_request.metadata),
       }
       try:
         self._write_json_atomic(vsd / SYNC_RESPONSE_FILE, response_payload)
