@@ -299,6 +299,32 @@ class TestApiTop10FlatFindingIntegration(unittest.TestCase):
     self.assertEqual(flat["severity"], "CRITICAL")
 
 
+class TestApiTop10DedupPosture(unittest.TestCase):
+  """Subphase 5.3: PT-A01-01 (web IDOR) and PT-OAPI1-01 (API BOLA) on the
+  same asset must NOT collapse — they describe different vulnerability
+  classes and should both surface in the report."""
+
+  def test_pt_a01_and_pt_oapi1_coexist(self):
+    from extensions.business.cybersec.red_mesh.graybox.findings import (
+      GrayboxFinding,
+    )
+    common = dict(status="vulnerable", severity="HIGH",
+                  evidence=["endpoint=/api/records/1"])
+    f_web = GrayboxFinding(scenario_id="PT-A01-01", title="IDOR/BOLA read bypass",
+                            owasp="A01:2021", cwe=["CWE-639"], **common)
+    f_api = GrayboxFinding(scenario_id="PT-OAPI1-01",
+                            title="API object-level authorization bypass (BOLA)",
+                            owasp="API1:2023", cwe=["CWE-639", "CWE-284"],
+                            **common)
+    flat_web = f_web.to_flat_finding(443, "https", "_graybox_access_control")
+    flat_api = f_api.to_flat_finding(443, "https", "_graybox_api_access")
+    # Different probe_name + different title + different scenario_id =
+    # different finding_id (sha256 of port:probe:cwe:title).
+    self.assertNotEqual(flat_web["finding_id"], flat_api["finding_id"])
+    self.assertNotEqual(flat_web["probe"], flat_api["probe"])
+    self.assertNotEqual(flat_web["scenario_id"], flat_api["scenario_id"])
+
+
 class TestApiTop10BudgetMetrics(unittest.TestCase):
   """OWASP API Top 10 — Subphase 5.1 budget integration assertion.
 
