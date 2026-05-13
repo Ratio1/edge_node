@@ -37,6 +37,11 @@ class InjectionProbes(ProbeBase):
                     "reason=stored_xss_writes_data_to_target"],
         ))
     self.run_safe("ssrf", self._test_ssrf)
+    # OWASP API Top 10 — Subphase 2.7: extend PT-API7-01 to scan JSON
+    # body fields configured via target_config.api_security.ssrf_body_fields.
+    api_security = getattr(self.target_config, "api_security", None)
+    if api_security is not None and getattr(api_security, "ssrf_body_fields", None):
+      self.run_safe("ssrf_body_field", self._test_ssrf_body_field)
     self.run_safe("open_redirect", self._test_open_redirect)
     if self.auth.official_session:
       self.run_safe("path_traversal", self._test_path_traversal)
@@ -385,6 +390,61 @@ class InjectionProbes(ProbeBase):
           remediation="Investigate with out-of-band callback to confirm blind SSRF.",
         ))
         return
+
+  def _test_ssrf_body_field(self):
+    """PT-API7-01 extension (Subphase 2.7): scan JSON request body fields.
+
+    For each SSRF endpoint configured under `injection.ssrf_endpoints`,
+    iterates the configured `api_security.ssrf_body_fields` names and
+    POSTs JSON bodies that embed an internal-probe URL under each field.
+    Vulnerable iff the response 200s and reflects the probe marker.
+    """
+    api_security = self.target_config.api_security
+    body_fields = api_security.ssrf_body_fields
+    ssrf_endpoints = self.target_config.injection.ssrf_endpoints
+    if not ssrf_endpoints or not body_fields:
+      return
+
+    payload_url = "http://127.0.0.1:1/internal-probe"
+    session = self.auth.official_session or getattr(self.auth, "anon_session", None)
+    if session is None:
+      return
+
+    import requests as _rq
+    for ep in ssrf_endpoints:
+      url = self.target_url + "/" + ep.path.lstrip("/")
+      for body_field in body_fields:
+        self.safety.throttle()
+        try:
+          resp = session.post(url, json={body_field: payload_url}, timeout=10)
+        except _rq.RequestException:
+          continue
+        if resp.status_code == 200 and "internal-probe" in (resp.text or ""):
+          self.findings.append(GrayboxFinding(
+            scenario_id="PT-API7-01",
+            title="Server-side request forgery (JSON body field)",
+            status="vulnerable",
+            severity="HIGH",
+            owasp="API7:2023",
+            cwe=["CWE-918"],
+            attack=["T1190"],
+            evidence=[f"endpoint={url}", f"body_field={body_field}",
+                       f"payload_url={payload_url}",
+                       "response_status=200",
+                       "reflected_marker=internal-probe"],
+            replay_steps=[
+              "Authenticate as the official user.",
+              f"POST {url} with JSON body `{{\"{body_field}\": \"{payload_url}\"}}`.",
+              "Observe the response reflects the internal-probe marker, "
+              "confirming the server fetched the user-controlled URL.",
+            ],
+            remediation=(
+              "Validate URL fields against an allowlist of schemes/hosts. "
+              "Reject loopback / link-local / private ranges before issuing "
+              "the outbound request."
+            ),
+          ))
+          return  # one body-field demo per scan is sufficient
 
   def _test_open_redirect(self):
     """
