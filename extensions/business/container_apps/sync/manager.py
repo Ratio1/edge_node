@@ -939,6 +939,34 @@ class SyncManager:
       reasons.append(f"unmapped archive_paths on this consumer: {missing}")
     return reasons
 
+  @staticmethod
+  def _is_within_real_root(path: str, root: str) -> bool:
+    root_real = os.path.realpath(root)
+    path_real = os.path.realpath(path)
+    return path_real == root_real or path_real.startswith(root_real + os.sep)
+
+  def _validate_extract_target_within_root(
+    self,
+    host_path: str,
+    host_root: str,
+    container_name: str,
+  ) -> None:
+    """Reject extraction targets that would resolve outside their volume.
+
+    ``resolve_container_path`` already proves the normalized string path sits
+    under the selected host root. This second check follows symlinks in the
+    target and parent path so a pre-existing symlink inside the mounted volume
+    cannot redirect extraction outside that volume.
+    """
+    candidates = [host_path]
+    if os.path.normpath(host_path) != os.path.normpath(host_root):
+      candidates.append(os.path.dirname(host_path) or host_root)
+    for candidate in candidates:
+      if not self._is_within_real_root(candidate, host_root):
+        raise ValueError(
+          f"tar member target escapes volume root: {container_name!r} -> {host_path!r}"
+        )
+
   def extract_archive(self, tar_path: str) -> list[str]:
     """Reverse-map tar member container paths to host paths and extract.
 
@@ -961,7 +989,7 @@ class SyncManager:
       # safety default, so member names look like "app/data/foo.bin" even
       # when we put them in as "/app/data/foo.bin". Normalize back to the
       # container-absolute form before running through the resolver.
-      planned: list[tuple[tarfile.TarInfo, str]] = []
+      planned: list[tuple[tarfile.TarInfo, str, str, str]] = []
       for member in members:
         if member.issym() or member.islnk():
           self.owner.P(
@@ -974,13 +1002,15 @@ class SyncManager:
         container_name = member.name
         if not container_name.startswith("/"):
           container_name = "/" + container_name
-        host_path, _bind, _host_root = self.resolve_container_path(container_name)
-        planned.append((member, host_path, container_name))
+        host_path, _bind, host_root = self.resolve_container_path(container_name)
+        self._validate_extract_target_within_root(host_path, host_root, container_name)
+        planned.append((member, host_path, container_name, host_root))
 
       # Pass 2: actually extract.
-      for member, host_path, container_name in planned:
+      for member, host_path, container_name, host_root in planned:
         if member.isdir():
           os.makedirs(host_path, exist_ok=True)
+          self._validate_extract_target_within_root(host_path, host_root, container_name)
           # Widen dir mode so the in-container app user can traverse, even
           # if CAR (running as root in the edge node) created the directory.
           try:
@@ -992,6 +1022,7 @@ class SyncManager:
         if not member.isfile():
           continue
         os.makedirs(os.path.dirname(host_path), exist_ok=True)
+        self._validate_extract_target_within_root(host_path, host_root, container_name)
         fobj = tar.extractfile(member)
         if fobj is None:
           continue

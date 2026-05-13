@@ -830,6 +830,41 @@ class TestArchiveRoundtrip(unittest.TestCase):
     )
     self.assertFalse((self.consumer._fixed_root / "appdata" / "link").exists())
 
+  def test_extract_rejects_member_through_symlink_directory(self):
+    outside = self.tmpdir / "outside"
+    outside.mkdir()
+    symlink_dir = self.consumer._fixed_root / "appdata" / "escape"
+    symlink_dir.symlink_to(outside, target_is_directory=True)
+
+    bad_tar = self.tmpdir / "symlink-dir-escape.tar.gz"
+    src = self.tmpdir / "escape-src.txt"
+    src.write_text("escaped")
+    with tarfile.open(str(bad_tar), "w:gz") as tar:
+      tar.add(str(src), arcname="/app/data/escape/pwn.txt")
+
+    with self.assertRaisesRegex(ValueError, "escapes volume root"):
+      self.sm_c.extract_archive(str(bad_tar))
+
+    self.assertFalse((outside / "pwn.txt").exists())
+
+  def test_extract_rejects_member_over_symlink_file(self):
+    outside = self.tmpdir / "outside-file.txt"
+    outside.write_text("outside")
+    symlink_file = self.consumer._fixed_root / "appdata" / "link.txt"
+    symlink_file.symlink_to(outside)
+
+    bad_tar = self.tmpdir / "symlink-file-escape.tar.gz"
+    src = self.tmpdir / "replacement.txt"
+    src.write_text("replacement")
+    with tarfile.open(str(bad_tar), "w:gz") as tar:
+      tar.add(str(src), arcname="/app/data/link.txt")
+
+    with self.assertRaisesRegex(ValueError, "escapes volume root"):
+      self.sm_c.extract_archive(str(bad_tar))
+
+    self.assertTrue(symlink_file.is_symlink())
+    self.assertEqual(outside.read_text(), "outside")
+
 
 # ---------------------------------------------------------------------------
 # publish_snapshot
@@ -1286,6 +1321,41 @@ class TestConsumerFlow(unittest.TestCase):
     ok = self.sm_c.apply_snapshot(record)
     self.assertFalse(ok)
     self.assertFalse((volume_sync_dir(self.consumer) / "last_apply.json").exists())
+
+  def test_apply_rejects_symlink_escape_without_advancing_state(self):
+    outside = self.tmpdir / "outside"
+    outside.mkdir()
+    symlink_dir = self.consumer._fixed_root / "appdata" / "escape"
+    symlink_dir.symlink_to(outside, target_is_directory=True)
+
+    bad_tar = self.tmpdir / "bad-apply.tar.gz"
+    src = self.tmpdir / "bad-apply-src.txt"
+    src.write_text("escaped")
+    with tarfile.open(str(bad_tar), "w:gz") as tar:
+      tar.add(str(src), arcname="/app/data/escape/pwn.txt")
+
+    cid = "QmBADSYMLINKESCAPE"
+    self.consumer._r1fs.added[cid] = bad_tar.read_bytes()
+    record = {
+      "cid": cid,
+      "version": 123,
+      "timestamp": 456.0,
+      "node_id": "ee_bad",
+      "metadata": {},
+      "manifest": {
+        "schema_version": 1,
+        "archive_paths": ["/app/data/"],
+        "archive_format": "tar.gz",
+        "archive_size_bytes": bad_tar.stat().st_size,
+      },
+    }
+
+    ok = self.sm_c.apply_snapshot(record)
+
+    self.assertFalse(ok)
+    self.assertFalse((outside / "pwn.txt").exists())
+    self.assertFalse((volume_sync_dir(self.consumer) / "last_apply.json").exists())
+    self.assertEqual(len(list(history_received_dir(self.consumer).glob("*.json"))), 0)
 
   def test_apply_two_snapshots_retires_first(self):
     # First publish + apply
