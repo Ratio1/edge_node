@@ -30,10 +30,8 @@ from typing import Optional
 
 from extensions.business.container_apps import fixed_volume
 
+from .control_files import JsonControlFile
 from .constants import (
-  CHAINSTORE_SYNC_HKEY,
-  SYNC_INVALID_FILE,
-  SYNC_LAST_APPLY_FILE,
   SYNC_PROCESSING_FILE,
   SYNC_REQUEST_FILE,
   SYSTEM_VOLUME_FS,
@@ -48,7 +46,6 @@ from .manager import (
   CONSUMER_APPLY_ONLINE_RESTART,
   SyncManager,
   history_received_dir,
-  history_sent_dir,
   system_volume_host_root,
   volume_sync_dir,
 )
@@ -305,20 +302,23 @@ class _SyncMixin:
     Called from the plugin's on_init so a crash mid-publish doesn't leave
     a request stuck. The next provider tick will then re-claim it.
     """
-    vsd = volume_sync_dir(self)
-    proc = vsd / SYNC_PROCESSING_FILE
-    req = vsd / SYNC_REQUEST_FILE
-    if proc.is_file() and not req.exists():
-      try:
-        os.replace(str(proc), str(req))
-        self.P(
-          f"[sync] recovered orphan {proc.name} -> {req.name} for retry",
-          color="y",
-        )
-      except OSError as exc:
-        self.P(
-          f"[sync] failed to recover orphan .processing: {exc}", color="r"
-        )
+    control_file = JsonControlFile(
+      volume_sync_dir(self), SYNC_REQUEST_FILE, SYNC_PROCESSING_FILE
+    )
+    proc = control_file.processing_path
+    req = control_file.pending_path
+    try:
+      recovered = control_file.recover_stale_processing()
+    except OSError as exc:
+      self.P(
+        f"[sync] failed to recover orphan .processing: {exc}", color="r"
+      )
+      return
+    if recovered:
+      self.P(
+        f"[sync] recovered orphan {proc.name} -> {req.name} for retry",
+        color="y",
+      )
 
   # ----- provider tick ---------------------------------------------------
 
@@ -336,12 +336,15 @@ class _SyncMixin:
     if not self._sync_should_tick(current_time):
       return
 
-    req = volume_sync_dir(self) / SYNC_REQUEST_FILE
-    if not req.is_file():
+    control_file = JsonControlFile(
+      volume_sync_dir(self), SYNC_REQUEST_FILE, SYNC_PROCESSING_FILE
+    )
+    if not control_file.has_pending():
       return
 
     self.P(
-      f"[sync] provider tick: claiming {req.name} for publish", color="b"
+      f"[sync] provider tick: claiming {control_file.pending_name} for publish",
+      color="b",
     )
     claimed = sm.claim_request()
     if claimed is None:
