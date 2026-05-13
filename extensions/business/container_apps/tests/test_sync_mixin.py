@@ -14,6 +14,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from extensions.business.container_apps.sync import (
   SYSTEM_VOLUME_MOUNT,
@@ -141,23 +142,23 @@ class TestConfigHelpers(unittest.TestCase):
 
   def test_hsync_poll_interval_default(self):
     """When SYNC.HSYNC_POLL_INTERVAL is unset, ``_hsync_poll_interval``
-    returns the 600s default (10 min) so consumers don't go to the
-    network for fresh chain replicas more than once per default window.
+    returns the 60s default so consumers don't go to the network for fresh
+    chain replicas more than once per default window.
     """
     plugin, owner = _make_plugin(self.tmpdir)
     # Make sure the field really is absent on the test fixture.
     owner.cfg_sync.pop("HSYNC_POLL_INTERVAL", None)
-    self.assertEqual(plugin._hsync_poll_interval(), 600.0)
+    self.assertEqual(plugin._hsync_poll_interval(), 60.0)
     # Same value surfaces via the SyncManager-facing property.
-    self.assertEqual(plugin.cfg_sync_hsync_poll_interval, 600.0)
+    self.assertEqual(plugin.cfg_sync_hsync_poll_interval, 60.0)
 
   def test_hsync_poll_interval_floor(self):
-    """Values below the 300s minimum are clamped up — the floor protects
+    """Values below the 10s minimum are clamped up — the floor protects
     the cluster from operators who set the knob aggressively low without
     realising the network cost."""
     plugin, owner = _make_plugin(self.tmpdir)
-    owner.cfg_sync["HSYNC_POLL_INTERVAL"] = 60
-    self.assertEqual(plugin._hsync_poll_interval(), 300.0)
+    owner.cfg_sync["HSYNC_POLL_INTERVAL"] = 1
+    self.assertEqual(plugin._hsync_poll_interval(), 10.0)
 
   def test_hsync_poll_interval_invalid_falls_back(self):
     """Non-numeric values fall back to the default (not the floor) — same
@@ -165,7 +166,7 @@ class TestConfigHelpers(unittest.TestCase):
     but conservative."""
     plugin, owner = _make_plugin(self.tmpdir)
     owner.cfg_sync["HSYNC_POLL_INTERVAL"] = "nope"
-    self.assertEqual(plugin._hsync_poll_interval(), 600.0)
+    self.assertEqual(plugin._hsync_poll_interval(), 60.0)
 
 
 # ---------------------------------------------------------------------------
@@ -219,6 +220,21 @@ class TestEnvInjection(unittest.TestCase):
     self.assertTrue(plugin._sync_enabled())  # baseline
     plugin._sync_unavailable = True
     self.assertFalse(plugin._sync_enabled())
+
+  def test_successful_system_volume_config_clears_sync_unavailable(self):
+    plugin, _ = _make_plugin(self.tmpdir, role="provider", enabled=True)
+    plugin._sync_unavailable = True
+
+    with patch(
+      "extensions.business.container_apps.sync.mixin.fixed_volume._require_tools"
+    ), patch(
+      "extensions.business.container_apps.sync.mixin.fixed_volume.provision",
+      side_effect=lambda vol, **_kwargs: vol,
+    ):
+      plugin._configure_system_volume()
+
+    self.assertFalse(plugin._sync_unavailable)
+    self.assertIn(SYSTEM_VOLUME_MOUNT, [spec["bind"] for spec in plugin.volumes.values()])
 
 
 # ---------------------------------------------------------------------------

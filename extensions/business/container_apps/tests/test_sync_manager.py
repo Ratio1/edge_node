@@ -1281,7 +1281,7 @@ class TestConsumerFlow(unittest.TestCase):
     """The expensive chainstore_hsync is rate-limited; a second fetch_latest
     inside the configured HSYNC_POLL_INTERVAL window only does the cheap
     local hget, leaving hsync_calls at one entry."""
-    self.consumer.cfg_sync_hsync_poll_interval = 600.0
+    self.consumer.cfg_sync_hsync_poll_interval = 60.0
     self.sm_c.fetch_latest()
     self.sm_c.fetch_latest()  # ~1s later (mock clock increments per time() call)
     self.assertEqual(self.consumer._cs.hsync_calls, ["CHAINSTORE_SYNC"])
@@ -1289,24 +1289,26 @@ class TestConsumerFlow(unittest.TestCase):
   def test_hsync_fires_again_after_interval_elapses(self):
     """Once HSYNC_POLL_INTERVAL has elapsed since the last hsync, the next
     fetch_latest does a fresh network round-trip."""
-    self.consumer.cfg_sync_hsync_poll_interval = 600.0
+    self.consumer.cfg_sync_hsync_poll_interval = 60.0
     self.sm_c.fetch_latest()
     # Back-date the last-hsync stamp so the next call falls outside the
-    # window without having to actually wait 600s.
-    self.sm_c._last_hsync = self.sm_c._last_hsync - 700.0
+    # window without having to actually wait 60s.
+    self.sm_c._last_hsync = self.sm_c._last_hsync - 70.0
     self.sm_c.fetch_latest()
     self.assertEqual(self.consumer._cs.hsync_calls, ["CHAINSTORE_SYNC", "CHAINSTORE_SYNC"])
 
-  def test_hsync_failure_still_advances_timestamp(self):
-    """A timing-out / failing hsync must still advance _last_hsync — otherwise
-    the consumer would retry every tick while peers are down, defeating the
-    rate-limit and burning the 10s timeout repeatedly. The hget fall-through
-    means stale-but-cached records can still surface during outages."""
-    self.consumer.cfg_sync_hsync_poll_interval = 600.0
+  def test_hsync_failure_retries_before_full_success_interval(self):
+    """A timing-out / failing hsync should not suppress retries for the full
+    success interval. It still avoids retrying on the immediate next tick, but
+    becomes eligible again after the shorter failure retry window."""
+    self.consumer.cfg_sync_hsync_poll_interval = 60.0
     self.consumer._cs.hsync_should_raise = RuntimeError("offline")
-    self.sm_c.fetch_latest()           # hsync raises (caught), timestamp advances
-    self.sm_c.fetch_latest()           # within window → skip hsync entirely
+    self.sm_c.fetch_latest()           # hsync raises (caught), retry after 30s
+    self.sm_c.fetch_latest()           # immediate next tick -> still skipped
     self.assertEqual(self.consumer._cs.hsync_calls, ["CHAINSTORE_SYNC"])
+    self.sm_c._last_hsync = self.sm_c._last_hsync - 31.0
+    self.sm_c.fetch_latest()
+    self.assertEqual(self.consumer._cs.hsync_calls, ["CHAINSTORE_SYNC", "CHAINSTORE_SYNC"])
 
   # ----- apply_snapshot -----------------------------------------------------
 

@@ -168,7 +168,8 @@ class SyncManager:
   # Fallback used by fetch_latest when the owner doesn't expose
   # cfg_sync_hsync_poll_interval (e.g. test fixtures or older configs).
   # Mirrors _SyncMixin._HSYNC_POLL_INTERVAL_DEFAULT.
-  _DEFAULT_HSYNC_POLL_INTERVAL = 600.0
+  _DEFAULT_HSYNC_POLL_INTERVAL = 60.0
+  _DEFAULT_HSYNC_FAILURE_RETRY_INTERVAL = 30.0
 
   def __init__(self, owner):
     self.owner = owner
@@ -852,24 +853,15 @@ class SyncManager:
     then read the configured KEY.
 
     The ``hsync`` is the expensive bit — a network round-trip to the chain
-    cluster with a 10s timeout. It used to fire on every consumer tick
-    (every ``SYNC.POLL_INTERVAL`` seconds, default 10s); now it fires at
-    most every ``SYNC.HSYNC_POLL_INTERVAL`` seconds (default 600s, min
-    300s). The cheap local-replica ``hget`` runs on every call regardless,
-    so a consumer that already has the record cached keeps reading it
-    without paying the network cost.
+    cluster with a timeout. It fires at most every
+    ``SYNC.HSYNC_POLL_INTERVAL`` seconds (default 60s, min 10s). The cheap
+    local-replica ``hget`` runs on every call regardless, so a consumer that
+    already has the record cached keeps reading it without paying the
+    network cost.
 
-    On ``hsync`` failure we still advance ``_last_hsync`` so we don't
-    hammer the cluster every tick while peers are unreachable; the next
-    attempt waits the full interval. The ``hget`` fall-through means
-    temporary peer flakiness doesn't break consumers that have a cached
-    record.
-
-    .. note::
-       DEBUG/DEVELOPMENT ONLY — to be removed. The HSYNC_POLL_INTERVAL
-       operator knob is temporary; once ChainStore propagation is reliable
-       the cadence should become a fixed internal default and the SYNC
-       config field should be deleted.
+    On ``hsync`` failure we retry sooner than the full success interval
+    (default 30s) to avoid leaving consumers stale for a whole cadence while
+    still avoiding a network attempt on every sync tick.
     """
     sync_key = getattr(self.owner, "cfg_sync_key", None)
     if not sync_key:
@@ -880,22 +872,26 @@ class SyncManager:
     )
     now = self.owner.time()
     if now - self._last_hsync >= interval:
-      self._last_hsync = now
       # Always log the hsync attempt result (success or failure) — this is
       # the only sync mixin log that fires on the happy path, so it doubles
       # as the heartbeat that confirms the consumer is actually ticking and
       # the rate-limit gating is working. Quiet enough at one log per
-      # HSYNC_POLL_INTERVAL window (default once per 10 min) to stay on in
+      # HSYNC_POLL_INTERVAL window (default once per minute) to stay on in
       # prod logs.
       hsync_start = _time.monotonic()
       try:
         self.owner.chainstore_hsync(hkey=CHAINSTORE_SYNC_HKEY)
+        self._last_hsync = now
         elapsed = _time.monotonic() - hsync_start
         self.owner.P(f"[sync] chainstore_hsync ok ({elapsed:.2f}s)", color="g")
       except Exception as exc:
+        retry_after = min(self._DEFAULT_HSYNC_FAILURE_RETRY_INTERVAL, interval)
+        self._last_hsync = now - max(0.0, interval - retry_after)
         elapsed = _time.monotonic() - hsync_start
         self.owner.P(
-          f"[sync] chainstore_hsync error after {elapsed:.2f}s: {exc}", color="y"
+          f"[sync] chainstore_hsync error after {elapsed:.2f}s "
+          f"(retry in {retry_after:.0f}s): {exc}",
+          color="y",
         )
 
     try:

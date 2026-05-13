@@ -144,6 +144,8 @@ class _SyncMixin:
       self._sync_unavailable = True
       return
 
+    self._sync_unavailable = False
+
     # Track for shared cleanup (parity with FIXED_SIZE_VOLUMES).
     if not hasattr(self, "_fixed_volumes"):
       self._fixed_volumes = []
@@ -241,22 +243,15 @@ class _SyncMixin:
   # Decoupled from POLL_INTERVAL: every consumer tick still does the cheap
   # chainstore_hget against the local replica, but the expensive network
   # hsync is gated by this interval. Provider does not call hsync.
-  _HSYNC_POLL_INTERVAL_MIN = 300.0
-  _HSYNC_POLL_INTERVAL_DEFAULT = 600.0
+  _HSYNC_POLL_INTERVAL_MIN = 10.0
+  _HSYNC_POLL_INTERVAL_DEFAULT = 60.0
 
   def _hsync_poll_interval(self) -> float:
     """Seconds between chainstore_hsync refreshes on the consumer side.
 
-    Min 300s, default 600s. Non-numeric values fall back to the default;
-    values below the min are clamped up.
-
-    .. note::
-       DEBUG/DEVELOPMENT ONLY — to be removed. The HSYNC_POLL_INTERVAL
-       config field exists temporarily so we can dial down the hsync
-       network burn while ChainStore propagation is still being tuned on
-       devnet. Once propagation is reliable, this should become a fixed
-       internal default and the operator-tunable field should be deleted
-       from the SYNC config block.
+    Min 10s, default 60s. Non-numeric values fall back to the default;
+    values below the min are clamped up. ``fetch_latest`` still reads the
+    cheap local replica every tick; this only gates network hsync.
     """
     raw = self._sync_cfg().get("HSYNC_POLL_INTERVAL", self._HSYNC_POLL_INTERVAL_DEFAULT)
     try:
