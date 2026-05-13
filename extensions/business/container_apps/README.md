@@ -9,6 +9,7 @@ Container application plugins for running Docker containers with Cloudflare tunn
 - [Features](#features)
   - [Health Check Configuration](#health-check-configuration)
 - [Configuration Reference](#configuration-reference)
+  - [Volume Sync](#volume-sync)
 - [Future Enhancements](#future-enhancements)
   - [Continuous Health Monitoring](#continuous-health-monitoring)
   - [Per-Port Health Checks](#per-port-health-checks)
@@ -196,6 +197,60 @@ When a container app acts as the provider, new consumers should prefer these exp
 - `CONTAINER_PORT`
 
 Legacy `HOST`, `PORT`, and `URL` remain available for backward compatibility.
+
+### Volume Sync
+
+`SYNC` lets one CAR publish mounted application state to R1FS/ChainStore and
+lets another CAR apply the latest snapshot for the same key. It is available on
+`ContainerAppRunnerPlugin` and inherited runners such as `WorkerAppRunnerPlugin`.
+
+```python
+"SYNC": {
+    "ENABLED": False,
+    "KEY": None,                         # shared ChainStore key
+    "TYPE": None,                        # "provider" | "consumer"
+    "POLL_INTERVAL": 10,                 # provider/consumer tick cadence
+    "HSYNC_POLL_INTERVAL": 60,           # consumer network refresh cadence, min 10
+    "ALLOW_ONLINE_PROVIDER_CAPTURE": False,
+    "CONSUMER_APPLY_MODE": "offline_restart",
+}
+```
+
+Provider apps request a publish by writing JSON to
+`/r1en_system/volume-sync/request.json`:
+
+```json
+{
+  "archive_paths": ["/app/data/"],
+  "metadata": {"epoch": 1},
+  "runtime": {
+    "provider_capture": "offline",
+    "consumer_apply": "offline_restart"
+  }
+}
+```
+
+`archive_paths` must be a non-empty list of absolute paths inside CAR-managed
+volumes. Offline capture rejects symlinks and unsupported special files. Online
+provider capture can read from the live container filesystem, including
+non-persistent paths, but only when the provider operator locally sets
+`ALLOW_ONLINE_PROVIDER_CAPTURE=True`.
+
+CAR writes provider results to `/r1en_system/volume-sync/response.json` and
+consumer apply results to `/r1en_system/volume-sync/last_apply.json`. Invalid
+requests are preserved as `request.json.invalid` with a sanitized error.
+
+Consumer lifecycle is local policy. Providers may publish runtime metadata, but
+consumers apply according to their own `CONSUMER_APPLY_MODE`:
+
+| Mode | Behavior |
+|------|----------|
+| `offline_restart` | Stop container, apply snapshot, restart container. Default. |
+| `online_no_restart` | Apply while the container remains running. |
+| `online_restart` | Apply while running, then restart the container. |
+
+Published manifests include `schema_version`, `archive_format`, `encryption`,
+and `archive_paths`. Consumers validate these before downloading/applying a CID.
 
 ---
 
