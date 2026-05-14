@@ -115,17 +115,28 @@ def _extract_discovery_max_pages(target_config) -> int:
 
 def _validate_graybox_target_config(target_config):
   """Validate typed graybox target_config before workers see it."""
+  _, _, error = normalize_graybox_target_config(target_config)
+  return error
+
+
+def normalize_graybox_target_config(target_config):
+  """Validate and canonicalize graybox target_config.
+
+  Returns ``(typed_config, canonical_dict, error)``. ``canonical_dict`` is
+  the only target_config shape that may be persisted; it is emitted from
+  the typed dataclasses after unknown-key and nested-secret validation.
+  """
   if target_config is None:
-    return None
+    return GrayboxTargetConfig(), None, None
   if not isinstance(target_config, dict):
-    return validation_error("target_config must be a JSON object")
+    return None, None, validation_error("target_config must be a JSON object")
   try:
-    GrayboxTargetConfig.from_dict(deepcopy(target_config))
+    typed_config = GrayboxTargetConfig.from_dict(deepcopy(target_config))
   except KeyError as exc:
-    return validation_error(f"target_config is missing required field: {exc}")
+    return None, None, validation_error(f"target_config is missing required field: {exc}")
   except (TypeError, ValueError) as exc:
-    return validation_error(f"target_config is invalid: {exc}")
-  return None
+    return None, None, validation_error(f"target_config is invalid: {exc}")
+  return typed_config, typed_config.to_dict(), None
 
 
 def _validate_authorization_context(
@@ -884,13 +895,11 @@ def launch_webapp_scan(
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
 
-  ``target_config`` is a free-form dict deep-copied into the persisted
-  ``JobConfig`` (`models/archive.py:80`) and parsed by the worker via
-  ``GrayboxTargetConfig.from_dict`` (`graybox/worker.py:108`). All sections
-  registered on ``GrayboxTargetConfig`` flow through unchanged, including
-  the OWASP API Top 10 ``api_security`` section added in Subphase 1.1 of
-  the API Top 10 plan. ``_apply_launch_safety_policy`` only normalises
-  the ``discovery`` section; it does not strip unknown keys.
+  ``target_config`` is parsed through ``GrayboxTargetConfig`` before any
+  authorization or persistence path sees it. The persisted ``JobConfig``
+  receives only the typed canonical dict returned by
+  ``normalize_graybox_target_config``; unknown keys and raw nested secret
+  material in request-body-like fields fail closed at launch.
 
   Secret-handling: ``bearer_token``, ``api_key``, and
   ``bearer_refresh_token`` (Subphase 1.5 commit #8) are top-level launch
@@ -902,14 +911,16 @@ def launch_webapp_scan(
   """
   if not target_url:
     return validation_error("target_url required for webapp scan")
+  typed_target_config, target_config, config_error = normalize_graybox_target_config(
+    target_config
+  )
+  if config_error:
+    return config_error
+
   # Form auth still requires username+password; Bearer / API-key targets
   # set auth_type via target_config.api_security.auth and supply the
   # secret as a top-level param instead.
-  auth_type = "form"
-  try:
-    auth_type = (target_config or {}).get("api_security", {}).get("auth", {}).get("auth_type", "form")
-  except (AttributeError, TypeError):
-    auth_type = "form"
+  auth_type = typed_target_config.api_security.auth.auth_type
   if auth_type == "form":
     if not official_username or not official_password:
       return validation_error("official credentials required for webapp scan")
@@ -986,7 +997,9 @@ def launch_webapp_scan(
     api_security["max_total_requests"] = int(request_budget)
     target_config["api_security"] = api_security
 
-  config_error = _validate_graybox_target_config(target_config)
+  typed_target_config, target_config, config_error = normalize_graybox_target_config(
+    target_config
+  )
   if config_error:
     return config_error
 

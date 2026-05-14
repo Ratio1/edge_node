@@ -1,5 +1,6 @@
 """Tests for JobConfig graybox fields and blackbox Finding unchanged."""
 
+import json
 import unittest
 
 from extensions.business.cybersec.red_mesh.models.archive import JobConfig, UiAggregate
@@ -134,6 +135,43 @@ class TestJobConfigWebapp(unittest.TestCase):
     redacted = _ReportMixin._redact_job_config(d)
     self.assertEqual(redacted["official_password"], "")
     self.assertEqual(redacted["regular_password"], "")
+
+  def test_redact_job_config_masks_nested_target_config_secrets(self):
+    """Defense-in-depth redaction catches legacy nested target_config secrets."""
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+    d = {
+      "target": "x",
+      "target_config": {
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_id": "redmesh",
+              "client_secret": "plain-secret",
+              "nested": {
+                "refresh_token": "refresh-secret",
+              },
+            },
+          },
+          "auth": {
+            "api_key_header_name": "X-Customer-Api-Key",
+          },
+        },
+      },
+    }
+    redacted = _ReportMixin._redact_job_config(d)
+    dumped = json.dumps(redacted)
+    self.assertNotIn("plain-secret", dumped)
+    self.assertNotIn("refresh-secret", dumped)
+    self.assertEqual(
+      redacted["target_config"]["api_security"]["token_endpoints"][
+        "token_request_body"
+      ]["client_secret"],
+      "***",
+    )
+    self.assertEqual(
+      redacted["target_config"]["api_security"]["auth"]["api_key_header_name"],
+      "X-Customer-Api-Key",
+    )
 
 
 class TestUiAggregateGraybox(unittest.TestCase):

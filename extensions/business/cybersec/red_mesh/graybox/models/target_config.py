@@ -10,7 +10,7 @@ Passed to the worker via JobConfig.target_config (serialized dict).
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict, field, fields
 from typing import Any
 
 
@@ -22,6 +22,110 @@ COMMON_CSRF_FIELDS = [
   "_csrf",                # Spring Security
   "_token",               # Laravel
 ]
+
+
+_SECRET_BODY_KEY_PARTS = (
+  "password", "passwd", "pwd", "secret", "api_key", "apikey",
+  "authorization", "cookie", "credential",
+)
+_SECRET_BODY_TOKEN_KEYS = {"token", "access_token", "refresh_token", "id_token"}
+_SECRET_BODY_VALUE_MARKERS = (
+  "bearer ", "basic ", "apikey=", "api_key=", "access_token=",
+  "refresh_token=", "client_secret=", "-----begin ",
+)
+_SAFE_SECRET_BODY_PREFIX = "__redmesh_"
+
+
+def _ensure_mapping(d, context: str) -> dict:
+  if d is None:
+    return {}
+  if not isinstance(d, dict):
+    raise TypeError(f"{context} must be an object")
+  return d
+
+
+def _checked_dict(cls, d, context: str = "") -> dict:
+  context = context or cls.__name__
+  d = _ensure_mapping(d, context)
+  allowed = {f.name for f in fields(cls)}
+  unknown = sorted((key for key in d.keys() if key not in allowed), key=str)
+  if unknown:
+    unknown_text = ", ".join(str(key) for key in unknown)
+    raise ValueError(f"{context} has unknown field(s): {unknown_text}")
+  return d
+
+
+def _looks_like_secret_body_key(key) -> bool:
+  normalized = str(key or "").strip().lower().replace("-", "_")
+  if normalized in _SECRET_BODY_TOKEN_KEYS:
+    return True
+  if normalized.endswith("_token") or normalized.endswith("_api_key"):
+    return True
+  return any(part in normalized for part in _SECRET_BODY_KEY_PARTS)
+
+
+def _looks_like_secret_body_value(value) -> bool:
+  if not isinstance(value, str):
+    return False
+  normalized = value.strip().lower()
+  if not normalized:
+    return False
+  if any(marker in normalized for marker in _SECRET_BODY_VALUE_MARKERS):
+    return True
+  # Compact JWT-looking strings are too easy to leak through examples.
+  return normalized.startswith("eyj") and normalized.count(".") >= 2
+
+
+def _is_typed_secret_ref(value) -> bool:
+  if not isinstance(value, dict):
+    return False
+  return (
+    set(value.keys()) == {"secret_ref"} and
+    isinstance(value.get("secret_ref"), str) and
+    bool(value.get("secret_ref").strip())
+  )
+
+
+def _is_safe_secret_body_placeholder(value) -> bool:
+  return (
+    isinstance(value, str) and
+    value.startswith(_SAFE_SECRET_BODY_PREFIX) and
+    value.endswith("__")
+  )
+
+
+def _reject_inline_secrets(value, context: str):
+  """Reject raw secret material in request-body-like config payloads.
+
+  Request bodies are persisted as part of JobConfig.target_config. They
+  may contain non-secret test data, but credentials must move through an
+  explicit secret reference so archives and reports remain publish-safe.
+  """
+  if _is_typed_secret_ref(value):
+    return
+  if isinstance(value, dict):
+    for key, item in value.items():
+      item_context = f"{context}.{key}"
+      if _is_typed_secret_ref(item):
+        continue
+      if _looks_like_secret_body_key(key):
+        if _is_safe_secret_body_placeholder(item):
+          continue
+        raise ValueError(
+          f"{item_context} contains secret-looking data; use secret_ref"
+        )
+      if _looks_like_secret_body_value(item):
+        raise ValueError(
+          f"{item_context} contains secret-looking data; use secret_ref"
+        )
+      _reject_inline_secrets(item, item_context)
+    return
+  if isinstance(value, list):
+    for idx, item in enumerate(value):
+      _reject_inline_secrets(item, f"{context}[{idx}]")
+    return
+  if _looks_like_secret_body_value(value):
+    raise ValueError(f"{context} contains secret-looking data; use secret_ref")
 
 
 # ── Typed endpoint configs (E4) ──────────────────────────────────────────
@@ -36,6 +140,7 @@ class IdorEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> IdorEndpoint:
+    d = _checked_dict(cls, d)
     return cls(
       path=d["path"],
       test_ids=d.get("test_ids", [1, 2]),
@@ -53,6 +158,7 @@ class AdminEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> AdminEndpoint:
+    d = _checked_dict(cls, d)
     return cls(
       path=d["path"],
       method=d.get("method", "GET"),
@@ -69,6 +175,7 @@ class WorkflowEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> WorkflowEndpoint:
+    d = _checked_dict(cls, d)
     return cls(
       path=d["path"],
       method=d.get("method", "POST"),
@@ -84,6 +191,7 @@ class SsrfEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> SsrfEndpoint:
+    d = _checked_dict(cls, d)
     return cls(path=d["path"], param=d.get("param", "url"))
 
 
@@ -97,6 +205,7 @@ class AccessControlConfig:
 
   @classmethod
   def from_dict(cls, d: dict) -> AccessControlConfig:
+    d = _checked_dict(cls, d)
     return cls(
       idor_endpoints=[IdorEndpoint.from_dict(e) for e in d.get("idor_endpoints", [])],
       admin_endpoints=[AdminEndpoint.from_dict(e) for e in d.get("admin_endpoints", [])],
@@ -113,6 +222,7 @@ class JwtEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> JwtEndpoint:
+    d = _checked_dict(cls, d)
     return cls(
       token_path=d.get("token_path", ""),
       protected_path=d.get("protected_path", ""),
@@ -132,6 +242,7 @@ class MisconfigConfig:
 
   @classmethod
   def from_dict(cls, d: dict) -> MisconfigConfig:
+    d = _checked_dict(cls, d)
     return cls(
       debug_paths=d.get("debug_paths", cls.__dataclass_fields__["debug_paths"].default_factory()),
       jwt_endpoints=JwtEndpoint.from_dict(d.get("jwt_endpoints", {})),
@@ -151,6 +262,7 @@ class ReflectiveEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> ReflectiveEndpoint:
+    d = _checked_dict(cls, d)
     return cls(path=d["path"], param=d.get("param", "msg"))
 
 
@@ -162,6 +274,7 @@ class JsonLookupEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> JsonLookupEndpoint:
+    d = _checked_dict(cls, d)
     return cls(path=d["path"], field=d.get("field", "id"))
 
 
@@ -177,6 +290,7 @@ class InjectionConfig:
 
   @classmethod
   def from_dict(cls, d: dict) -> InjectionConfig:
+    d = _checked_dict(cls, d)
     return cls(
       ssrf_endpoints=[SsrfEndpoint.from_dict(e) for e in d.get("ssrf_endpoints", [])],
       xss_endpoints=[ReflectiveEndpoint.from_dict(e) for e in d.get("xss_endpoints", [])],
@@ -198,6 +312,7 @@ class RecordEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> RecordEndpoint:
+    d = _checked_dict(cls, d)
     return cls(
       path=d["path"],
       method=d.get("method", "POST"),
@@ -215,6 +330,7 @@ class BusinessLogicConfig:
 
   @classmethod
   def from_dict(cls, d: dict) -> BusinessLogicConfig:
+    d = _checked_dict(cls, d)
     return cls(
       workflow_endpoints=[WorkflowEndpoint.from_dict(e) for e in d.get("workflow_endpoints", [])],
       record_endpoints=[RecordEndpoint.from_dict(e) for e in d.get("record_endpoints", [])],
@@ -230,6 +346,7 @@ class DiscoveryConfig:
 
   @classmethod
   def from_dict(cls, d: dict) -> DiscoveryConfig:
+    d = _checked_dict(cls, d)
     return cls(
       scope_prefix=d.get("scope_prefix", ""),
       max_pages=d.get("max_pages", 50),
@@ -264,6 +381,7 @@ class ApiObjectEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiObjectEndpoint:
+    d = _checked_dict(cls, d)
     return cls(
       path=d["path"],
       test_ids=d.get("test_ids", [1, 2]),
@@ -291,6 +409,7 @@ class ApiPropertyEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiPropertyEndpoint:
+    d = _checked_dict(cls, d)
     return cls(
       path=d["path"],
       method_read=d.get("method_read", "GET"),
@@ -319,6 +438,11 @@ class ApiFunctionEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiFunctionEndpoint:
+    d = _checked_dict(cls, d)
+    _reject_inline_secrets(
+      d.get("revert_body", {}),
+      "ApiFunctionEndpoint.revert_body",
+    )
     return cls(
       path=d["path"],
       method=d.get("method", "GET"),
@@ -353,6 +477,7 @@ class ApiResourceEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiResourceEndpoint:
+    d = _checked_dict(cls, d)
     return cls(
       path=d["path"],
       limit_param=d.get("limit_param", "limit"),
@@ -388,6 +513,15 @@ class ApiBusinessFlow:
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiBusinessFlow:
+    d = _checked_dict(cls, d)
+    _reject_inline_secrets(
+      d.get("body_template", {}),
+      "ApiBusinessFlow.body_template",
+    )
+    _reject_inline_secrets(
+      d.get("revert_body", {}),
+      "ApiBusinessFlow.revert_body",
+    )
     return cls(
       path=d["path"],
       method=d.get("method", "POST"),
@@ -429,6 +563,11 @@ class ApiTokenEndpoint:
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiTokenEndpoint:
+    d = _checked_dict(cls, d)
+    _reject_inline_secrets(
+      d.get("token_request_body", {}),
+      "ApiTokenEndpoint.token_request_body",
+    )
     defaults = cls.__dataclass_fields__["weak_secret_candidates"].default_factory()
     return cls(
       token_path=d.get("token_path", ""),
@@ -465,6 +604,7 @@ class ApiInventoryPaths:
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiInventoryPaths:
+    d = _checked_dict(cls, d)
     fields_ = cls.__dataclass_fields__
     return cls(
       openapi_candidates=d.get(
@@ -530,6 +670,7 @@ class AuthDescriptor:
 
   @classmethod
   def from_dict(cls, d: dict) -> AuthDescriptor:
+    d = _checked_dict(cls, d)
     return cls(
       auth_type=d.get("auth_type", "form"),
       bearer_token_header_name=d.get("bearer_token_header_name", "Authorization"),
@@ -598,6 +739,7 @@ class ApiSecurityConfig:
 
   @classmethod
   def from_dict(cls, d: dict) -> ApiSecurityConfig:
+    d = _checked_dict(cls, d)
     fields_ = cls.__dataclass_fields__
     return cls(
       object_endpoints=[ApiObjectEndpoint.from_dict(e) for e in d.get("object_endpoints", [])],
@@ -661,6 +803,7 @@ class GrayboxTargetConfig:
 
   @classmethod
   def from_dict(cls, d: dict) -> GrayboxTargetConfig:
+    d = _checked_dict(cls, d)
     return cls(
       access_control=AccessControlConfig.from_dict(d.get("access_control", {})),
       misconfig=MisconfigConfig.from_dict(d.get("misconfig", {})),

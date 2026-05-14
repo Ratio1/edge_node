@@ -1,5 +1,4 @@
 {
-  "_comment": "OWASP API Top 10 target_config for the rm-gb-poc honeypot (port 30001). Generated from api_top10_manifest.yaml — Subphase 7.1.",
   "discovery": {
     "scope_prefix": "/api/",
     "max_pages": 20,
@@ -75,7 +74,7 @@
         "path": "/api/auth/signup/",
         "method": "POST",
         "flow_name": "signup",
-        "body_template": {"username": "abuse_canary", "password": "x"},
+        "body_template": {"username": "abuse_canary", "password": "__redmesh_canary_password__"},
         "revert_path": "/api/auth/signup/cleanup/",
         "revert_body": {"username": "abuse_canary"},
         "test_account": "abuse_canary"

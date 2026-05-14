@@ -15,6 +15,59 @@ from ..models import UiAggregate
 # dedup signature so the same vulnerability seen by two workers
 # collapses to one finding (with one worker's stamp preserved).
 _DEDUP_EXCLUDE_FIELDS = ("_source_worker_id", "_source_node_addr")
+_PUBLISH_SAFE_METADATA_KEYS = {
+  "api_key_header_name",
+  "api_key_location",
+  "api_key_query_param",
+  "authenticated_probe_path",
+  "authenticated_probe_method",
+  "bearer_refresh_url",
+  "bearer_scheme",
+  "bearer_token_header_name",
+  "csrf_field",
+  "password_field",
+  "password_reset_confirm_path",
+  "password_reset_path",
+  "protected_path",
+  "token_path",
+  "token_request_method",
+  "token_response_field",
+}
+_SECRET_CONFIG_KEY_PARTS = (
+  "password", "passwd", "pwd", "secret", "authorization", "cookie",
+  "credential",
+)
+_SECRET_CONFIG_TOKEN_KEYS = {
+  "api_key", "apikey", "token", "access_token", "refresh_token", "id_token",
+  "secret_ref",
+}
+
+
+def _is_secret_config_key(key):
+  normalized = str(key or "").strip().lower().replace("-", "_")
+  if not normalized or normalized.startswith("has_"):
+    return False
+  if normalized in _PUBLISH_SAFE_METADATA_KEYS:
+    return False
+  if normalized in _SECRET_CONFIG_TOKEN_KEYS:
+    return True
+  if normalized.endswith("_token") or normalized.endswith("_api_key"):
+    return True
+  return any(part in normalized for part in _SECRET_CONFIG_KEY_PARTS)
+
+
+def _redact_nested_job_config(value):
+  if isinstance(value, dict):
+    redacted = {}
+    for key, item in value.items():
+      if _is_secret_config_key(key):
+        redacted[key] = "***"
+      else:
+        redacted[key] = _redact_nested_job_config(item)
+    return redacted
+  if isinstance(value, list):
+    return [_redact_nested_job_config(item) for item in value]
+  return value
 
 
 def _finding_dedup_key(item):
@@ -526,6 +579,10 @@ class _ReportMixin:
       redacted["regular_password"] = "***"
     if redacted.get("weak_candidates"):
       redacted["weak_candidates"] = ["***"] * len(redacted["weak_candidates"])
+    if isinstance(redacted.get("target_config"), dict):
+      redacted["target_config"] = _redact_nested_job_config(
+        redacted["target_config"]
+      )
     redacted.pop("secret_ref", None)
     return redacted
 

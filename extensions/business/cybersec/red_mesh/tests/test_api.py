@@ -395,6 +395,47 @@ class TestPhase1ConfigCID(unittest.TestCase):
       json.dumps(config_dict),
     )
 
+  def test_launch_webapp_scan_rejects_nested_target_config_secret(self):
+    """Nested request bodies cannot carry raw secrets into persisted JobConfig."""
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_id": "redmesh",
+              "client_secret": "plain-secret",
+            },
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("target_config", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_rejects_unknown_target_config_key(self):
+    """Unknown nested target_config keys fail closed instead of disappearing."""
+    plugin = self._build_mock_plugin(job_id="test-job-target-unknown")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "object_endpoints": [
+            {"path": "/api/records/{id}/", "typo": True},
+          ],
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("unknown field", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
   def test_launch_webapp_scan_rejects_secret_persistence_without_store_key(self):
     """Webapp launch fails closed when no strong secret-store key is configured."""
     plugin = self._build_mock_plugin(job_id="test-job-websecret-nokey")

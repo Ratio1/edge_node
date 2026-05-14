@@ -74,16 +74,29 @@ class TestGrayboxTargetConfig(unittest.TestCase):
     self.assertEqual(restored.discovery.scope_prefix, "/api/")
     self.assertEqual(restored.discovery.max_pages, 100)
 
-  def test_from_dict_ignores_unknown(self):
-    """Extra keys in dict don't raise."""
-    cfg = GrayboxTargetConfig.from_dict({"unknown_key": "value", "nested": {"foo": 1}})
-    self.assertEqual(cfg.login_path, "/auth/login/")
+  def test_from_dict_rejects_unknown(self):
+    """Extra keys are rejected instead of silently dropped."""
+    with self.assertRaises(ValueError) as cm:
+      GrayboxTargetConfig.from_dict({"unknown_key": "value", "nested": {"foo": 1}})
+    self.assertIn("unknown field", str(cm.exception))
 
   def test_from_dict_empty(self):
     """Empty dict produces all defaults."""
     cfg = GrayboxTargetConfig.from_dict({})
     self.assertEqual(cfg.login_path, "/auth/login/")
     self.assertEqual(cfg.access_control.idor_endpoints, [])
+
+  def test_from_dict_rejects_nested_unknown(self):
+    """Typos inside nested typed sections are rejected."""
+    with self.assertRaises(ValueError) as cm:
+      GrayboxTargetConfig.from_dict({
+        "api_security": {
+          "object_endpoints": [
+            {"path": "/api/records/{id}/", "typo": True},
+          ],
+        },
+      })
+    self.assertIn("typo", str(cm.exception))
 
 
 class TestTypedEndpoints(unittest.TestCase):
@@ -276,6 +289,15 @@ class TestApiSecurityConfig(unittest.TestCase):
     self.assertEqual(ep.revert_path, "/api/admin/users/{uid}/demote/")
     self.assertEqual(ep.revert_body, {"reason": "test"})
 
+  def test_api_function_endpoint_rejects_secret_revert_body(self):
+    with self.assertRaises(ValueError) as cm:
+      ApiFunctionEndpoint.from_dict({
+        "path": "/api/admin/users/{uid}/promote/",
+        "method": "POST",
+        "revert_body": {"refresh_token": "plain-token"},
+      })
+    self.assertIn("secret-looking", str(cm.exception))
+
   # ── ApiResourceEndpoint ────────────────────────────────────────────────
   def test_api_resource_endpoint_defaults(self):
     ep = ApiResourceEndpoint.from_dict({"path": "/api/records/"})
@@ -295,6 +317,27 @@ class TestApiSecurityConfig(unittest.TestCase):
     self.assertEqual(bf.revert_method, "POST")
     self.assertEqual(bf.revert_body, {})
 
+  def test_api_business_flow_rejects_secret_body_template(self):
+    with self.assertRaises(ValueError) as cm:
+      ApiBusinessFlow.from_dict({
+        "path": "/api/auth/signup/",
+        "body_template": {"username": "canary", "password": "plain-secret"},
+      })
+    self.assertIn("secret-looking", str(cm.exception))
+
+  def test_api_business_flow_accepts_redmesh_canary_placeholder(self):
+    bf = ApiBusinessFlow.from_dict({
+      "path": "/api/auth/signup/",
+      "body_template": {
+        "username": "canary",
+        "password": "__redmesh_canary_password__",
+      },
+    })
+    self.assertEqual(
+      bf.body_template["password"],
+      "__redmesh_canary_password__",
+    )
+
   # ── ApiTokenEndpoint ───────────────────────────────────────────────────
   def test_api_token_endpoint_defaults(self):
     tok = ApiTokenEndpoint.from_dict({})
@@ -313,6 +356,28 @@ class TestApiSecurityConfig(unittest.TestCase):
       "weak_secret_candidates": ["a", "b"],
     })
     self.assertEqual(tok.weak_secret_candidates, ["a", "b"])
+
+  def test_api_token_endpoint_rejects_inline_secret_request_body(self):
+    with self.assertRaises(ValueError) as cm:
+      ApiTokenEndpoint.from_dict({
+        "token_request_body": {
+          "client_id": "redmesh",
+          "client_secret": "plain-secret",
+        },
+      })
+    self.assertIn("secret-looking", str(cm.exception))
+
+  def test_api_token_endpoint_accepts_typed_secret_ref(self):
+    tok = ApiTokenEndpoint.from_dict({
+      "token_request_body": {
+        "client_id": "redmesh",
+        "client_secret": {"secret_ref": "oauth-client-secret"},
+      },
+    })
+    self.assertEqual(
+      tok.token_request_body["client_secret"],
+      {"secret_ref": "oauth-client-secret"},
+    )
 
   # ── ApiInventoryPaths ──────────────────────────────────────────────────
   def test_api_inventory_paths_defaults(self):
@@ -335,6 +400,22 @@ class TestApiSecurityConfig(unittest.TestCase):
     self.assertIn("is_admin", cfg.tampering_fields)
     # Default debug paths populated
     self.assertIn("/api/debug", cfg.debug_path_candidates)
+
+  def test_api_security_config_accepts_safe_secret_named_metadata(self):
+    cfg = ApiSecurityConfig.from_dict({
+      "token_endpoints": {
+        "token_response_field": "access_token",
+        "weak_secret_candidates": ["secret", "changeme"],
+      },
+      "auth": {
+        "auth_type": "api_key",
+        "api_key_header_name": "X-Customer-Api-Key",
+      },
+      "sensitive_field_patterns": ["custom_*_secret"],
+    })
+    self.assertEqual(cfg.token_endpoints.token_response_field, "access_token")
+    self.assertEqual(cfg.auth.api_key_header_name, "X-Customer-Api-Key")
+    self.assertEqual(cfg.sensitive_field_patterns, ["custom_*_secret"])
 
   def test_api_security_config_full_roundtrip(self):
     """Populated payload survives from_dict cleanly."""
