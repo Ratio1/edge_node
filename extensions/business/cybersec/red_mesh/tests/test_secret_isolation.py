@@ -56,6 +56,15 @@ class TestSecretIsolationInBuildPayload(unittest.TestCase):
     self.assertEqual(payload["regular_api_key"], SENSITIVE_VALUES["regular_api_key"])
     self.assertEqual(payload["regular_bearer_refresh_token"], SENSITIVE_VALUES["regular_bearer_refresh_token"])
 
+  def test_build_payload_carries_target_config_secrets(self):
+    payload = build_graybox_secret_payload(
+      target_config_secrets={"oauth_client_secret": "OAUTH-CLIENT-SECRET"},
+    )
+    self.assertEqual(
+      payload["target_config_secrets"],
+      {"oauth_client_secret": "OAUTH-CLIENT-SECRET"},
+    )
+
   def test_blank_strips_all_new_secrets(self):
     """_blank_graybox_secret_fields zeroes every new secret field."""
     sanitized = _blank_graybox_secret_fields({
@@ -127,6 +136,55 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
     self.assertEqual(persisted_config["regular_bearer_refresh_token"], "")
 
   @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
+  @patch("extensions.business.cybersec.red_mesh.services.secrets._artifact_repo")
+  def test_target_config_secret_ref_values_do_not_persist(self, mock_repo, mock_store_cls):
+    """Nested secret-ref values live only in the separate secret payload."""
+    fake_store = MagicMock()
+    fake_store.save_graybox_credentials.return_value = "fake://secret/cid"
+    mock_store_cls.return_value = fake_store
+    fake_repo = MagicMock()
+    fake_repo.put_job_config.return_value = "fake://config/cid"
+    mock_repo.return_value = fake_repo
+
+    config_dict = {
+      "target": "api.example.com",
+      "target_url": "https://api.example.com",
+      "start_port": 0, "end_port": 0,
+      "scan_type": "webapp",
+      "target_config": {
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_secret": {"secret_ref": "oauth_client_secret"},
+            },
+          },
+        },
+      },
+      "target_config_secrets": {
+        "oauth_client_secret": "OAUTH-CLIENT-SECRET",
+      },
+    }
+
+    persisted_config, _cid = persist_job_config_with_secrets(
+      MagicMock(), job_id="test-job-xyz", config_dict=config_dict,
+    )
+
+    payload = fake_store.save_graybox_credentials.call_args[0][1]
+    self.assertEqual(
+      payload["target_config_secrets"]["oauth_client_secret"],
+      "OAUTH-CLIENT-SECRET",
+    )
+    serialized = json.dumps(persisted_config)
+    self.assertNotIn("OAUTH-CLIENT-SECRET", serialized)
+    self.assertNotIn("target_config_secrets", persisted_config)
+    self.assertEqual(
+      persisted_config["target_config"]["api_security"]["token_endpoints"][
+        "token_request_body"
+      ]["client_secret"],
+      {"secret_ref": "oauth_client_secret"},
+    )
+
+  @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
   def test_resolve_repopulates_secrets_for_worker(self, mock_store_cls):
     """Worker-side resolve_job_config_secrets repopulates the runtime fields."""
     fake_store = MagicMock()
@@ -153,6 +211,77 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
     resolved = resolve_job_config_secrets(MagicMock(), persisted)
     for k, v in SENSITIVE_VALUES.items():
       self.assertEqual(resolved[k], v)
+
+  @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
+  def test_resolve_target_config_secret_refs_for_worker(self, mock_store_cls):
+    """Worker runtime config gets body secrets without mutating persisted config."""
+    fake_store = MagicMock()
+    fake_store.load_graybox_credentials.return_value = {
+      "target_config_secrets": {
+        "oauth_client_secret": "OAUTH-CLIENT-SECRET",
+      },
+    }
+    mock_store_cls.return_value = fake_store
+
+    persisted = {
+      "target": "api.example.com",
+      "start_port": 0, "end_port": 0,
+      "scan_type": "webapp",
+      "secret_ref": "fake://secret/cid",
+      "target_config": {
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_id": "redmesh",
+              "client_secret": {"secret_ref": "oauth_client_secret"},
+            },
+          },
+        },
+      },
+    }
+
+    resolved = resolve_job_config_secrets(MagicMock(), persisted)
+
+    self.assertEqual(
+      resolved["target_config"]["api_security"]["token_endpoints"][
+        "token_request_body"
+      ]["client_secret"],
+      "OAUTH-CLIENT-SECRET",
+    )
+    self.assertEqual(
+      persisted["target_config"]["api_security"]["token_endpoints"][
+        "token_request_body"
+      ]["client_secret"],
+      {"secret_ref": "oauth_client_secret"},
+    )
+
+  @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
+  def test_resolve_missing_target_config_secret_refs_fails_closed(self, mock_store_cls):
+    fake_store = MagicMock()
+    fake_store.load_graybox_credentials.return_value = {
+      "official_username": "alice",
+    }
+    mock_store_cls.return_value = fake_store
+
+    persisted = {
+      "target": "api.example.com",
+      "start_port": 0, "end_port": 0,
+      "scan_type": "webapp",
+      "secret_ref": "fake://secret/cid",
+      "target_config": {
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_secret": {"secret_ref": "oauth_client_secret"},
+            },
+          },
+        },
+      },
+    }
+
+    with self.assertRaises(ValueError) as cm:
+      resolve_job_config_secrets(MagicMock(), persisted)
+    self.assertIn("target_config secret_ref", str(cm.exception))
 
   @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
   def test_resolve_passes_expected_job_id_before_jobconfig_coercion(self, mock_store_cls):

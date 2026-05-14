@@ -436,6 +436,93 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertIn("unknown field", result["message"])
     self.assertEqual(plugin.r1fs.add_json.call_count, 0)
 
+  def test_launch_webapp_scan_persists_target_config_secret_ref_value_only_in_secret_payload(self):
+    """Typed target_config secret refs resolve through the R1FS secret payload."""
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret-ref")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_id": "redmesh",
+              "client_secret": {"secret_ref": "oauth_client_secret"},
+            },
+          },
+        },
+      },
+      target_config_secrets={"oauth_client_secret": "OAUTH-CLIENT-SECRET"},
+    )
+
+    self.assertNotIn("error", result)
+    secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(
+      secret_doc["payload"]["target_config_secrets"],
+      {"oauth_client_secret": "OAUTH-CLIENT-SECRET"},
+    )
+    self.assertNotIn("OAUTH-CLIENT-SECRET", json.dumps(config_dict))
+    self.assertEqual(
+      config_dict["target_config"]["api_security"]["token_endpoints"][
+        "token_request_body"
+      ]["client_secret"],
+      {"secret_ref": "oauth_client_secret"},
+    )
+
+  def test_launch_webapp_scan_rejects_missing_target_config_secret_ref_value(self):
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret-ref-missing")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_secret": {"secret_ref": "oauth_client_secret"},
+            },
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("missing", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_rejects_unknown_target_config_secret_value(self):
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret-ref-extra")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={"api_security": {"token_endpoints": {}}},
+      target_config_secrets={"unused": "secret"},
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("unknown secret_ref", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_rejects_secret_ref_outside_approved_body(self):
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret-ref-bad-place")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "auth": {
+            "api_key_header_name": {"secret_ref": "header_name"},
+          },
+        },
+      },
+      target_config_secrets={"header_name": "X-Secret"},
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("outside an approved request body", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
   def test_launch_webapp_scan_rejects_secret_persistence_without_store_key(self):
     """Webapp launch fails closed when no strong secret-store key is configured."""
     plugin = self._build_mock_plugin(job_id="test-job-websecret-nokey")

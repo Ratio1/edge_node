@@ -20,7 +20,11 @@ from ..models import (
   JobConfig,
   RulesOfEngagement,
 )
-from ..graybox.models.target_config import GrayboxTargetConfig
+from ..graybox.models.target_config import (
+  GrayboxTargetConfig,
+  collect_target_config_secret_refs,
+  validate_target_config_secret_ref_positions,
+)
 from ..repositories import JobStateRepository
 from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
@@ -119,7 +123,7 @@ def _validate_graybox_target_config(target_config):
   return error
 
 
-def normalize_graybox_target_config(target_config):
+def normalize_graybox_target_config(target_config, target_config_secrets=None):
   """Validate and canonicalize graybox target_config.
 
   Returns ``(typed_config, canonical_dict, error)``. ``canonical_dict`` is
@@ -127,16 +131,46 @@ def normalize_graybox_target_config(target_config):
   the typed dataclasses after unknown-key and nested-secret validation.
   """
   if target_config is None:
+    if target_config_secrets:
+      return None, None, validation_error(
+        "target_config_secrets were provided but target_config has no secret_ref entries"
+      )
     return GrayboxTargetConfig(), None, None
   if not isinstance(target_config, dict):
     return None, None, validation_error("target_config must be a JSON object")
+  if target_config_secrets is not None and not isinstance(target_config_secrets, dict):
+    return None, None, validation_error("target_config_secrets must be a JSON object when provided")
+  if isinstance(target_config_secrets, dict):
+    for key, value in target_config_secrets.items():
+      if not isinstance(key, str) or not key.strip():
+        return None, None, validation_error("target_config_secrets keys must be non-empty strings")
+      if not isinstance(value, str):
+        return None, None, validation_error(
+          f"target_config_secrets[{key!r}] must be a string"
+        )
   try:
     typed_config = GrayboxTargetConfig.from_dict(deepcopy(target_config))
+    canonical = typed_config.to_dict()
+    validate_target_config_secret_ref_positions(canonical)
+    required_refs = collect_target_config_secret_refs(canonical)
+    provided_refs = set((target_config_secrets or {}).keys())
+    missing_refs = [ref for ref in required_refs if ref not in provided_refs]
+    if missing_refs:
+      return None, None, validation_error(
+        "target_config secret_ref value(s) missing from target_config_secrets: "
+        + ", ".join(missing_refs)
+      )
+    unknown_refs = sorted(provided_refs - set(required_refs))
+    if unknown_refs:
+      return None, None, validation_error(
+        "target_config_secrets contains unknown secret_ref value(s): "
+        + ", ".join(unknown_refs)
+      )
   except KeyError as exc:
     return None, None, validation_error(f"target_config is missing required field: {exc}")
   except (TypeError, ValueError) as exc:
     return None, None, validation_error(f"target_config is invalid: {exc}")
-  return typed_config, typed_config.to_dict(), None
+  return typed_config, canonical, None
 
 
 def _validate_authorization_context(
@@ -491,6 +525,7 @@ def announce_launch(
   regular_bearer_token="",
   regular_api_key="",
   regular_bearer_refresh_token="",
+  target_config_secrets=None,
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
   excluded_features, enabled_features = resolve_enabled_features(
@@ -568,7 +603,10 @@ def announce_launch(
   persisted_config, job_config_cid = persist_job_config_with_secrets(
     owner,
     job_id=job_id,
-    config_dict=job_config.to_dict(),
+    config_dict={
+      **job_config.to_dict(),
+      "target_config_secrets": deepcopy(target_config_secrets or {}),
+    },
   )
   if not job_config_cid:
     owner.P("Failed to store job config in R1FS — aborting launch", color='r')
@@ -889,6 +927,7 @@ def launch_webapp_scan(
   regular_bearer_token="",
   regular_api_key="",
   regular_bearer_refresh_token="",
+  target_config_secrets=None,
   # OWASP API Top 10 — Subphase 1.7. When set, overrides
   # `target_config.api_security.max_total_requests` for the scan.
   request_budget=None,
@@ -912,7 +951,8 @@ def launch_webapp_scan(
   if not target_url:
     return validation_error("target_url required for webapp scan")
   typed_target_config, target_config, config_error = normalize_graybox_target_config(
-    target_config
+    target_config,
+    target_config_secrets=target_config_secrets,
   )
   if config_error:
     return config_error
@@ -998,7 +1038,8 @@ def launch_webapp_scan(
     target_config["api_security"] = api_security
 
   typed_target_config, target_config, config_error = normalize_graybox_target_config(
-    target_config
+    target_config,
+    target_config_secrets=target_config_secrets,
   )
   if config_error:
     return config_error
@@ -1058,6 +1099,7 @@ def launch_webapp_scan(
     regular_bearer_token=regular_bearer_token,
     regular_api_key=regular_api_key,
     regular_bearer_refresh_token=regular_bearer_refresh_token,
+    target_config_secrets=target_config_secrets,
   )
 
 
@@ -1104,6 +1146,7 @@ def launch_test(
   regular_bearer_token="",
   regular_api_key="",
   regular_bearer_refresh_token="",
+  target_config_secrets=None,
   request_budget=None,
   target_confirmation="",
   scope_id="",
@@ -1154,6 +1197,7 @@ def launch_test(
       regular_bearer_token=regular_bearer_token,
       regular_api_key=regular_api_key,
       regular_bearer_refresh_token=regular_bearer_refresh_token,
+      target_config_secrets=target_config_secrets,
       request_budget=request_budget,
       target_confirmation=target_confirmation,
       scope_id=scope_id,

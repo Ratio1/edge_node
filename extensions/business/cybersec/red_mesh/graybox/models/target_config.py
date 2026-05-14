@@ -34,6 +34,13 @@ _SECRET_BODY_VALUE_MARKERS = (
   "refresh_token=", "client_secret=", "-----begin ",
 )
 _SAFE_SECRET_BODY_PREFIX = "__redmesh_"
+_ALLOWED_SECRET_REF_PREFIXES = (
+  ("api_security", "token_endpoints", "token_request_body"),
+)
+_ALLOWED_SECRET_REF_LIST_FIELDS = {
+  ("api_security", "function_endpoints"): {"revert_body"},
+  ("api_security", "business_flows"): {"body_template", "revert_body"},
+}
 
 
 def _ensure_mapping(d, context: str) -> dict:
@@ -92,6 +99,75 @@ def _is_safe_secret_body_placeholder(value) -> bool:
     value.startswith(_SAFE_SECRET_BODY_PREFIX) and
     value.endswith("__")
   )
+
+
+def _is_allowed_secret_ref_path(path: tuple) -> bool:
+  for prefix in _ALLOWED_SECRET_REF_PREFIXES:
+    if path[:len(prefix)] == prefix:
+      return True
+  for list_prefix, allowed_fields in _ALLOWED_SECRET_REF_LIST_FIELDS.items():
+    if len(path) < len(list_prefix) + 2:
+      continue
+    if path[:len(list_prefix)] != list_prefix:
+      continue
+    if not isinstance(path[len(list_prefix)], int):
+      continue
+    if path[len(list_prefix) + 1] in allowed_fields:
+      return True
+  return False
+
+
+def iter_target_config_secret_refs(value, path: tuple = ()):
+  """Yield ``(path, ref_name)`` for typed target-config secret refs."""
+  if _is_typed_secret_ref(value):
+    yield path, value["secret_ref"].strip()
+    return
+  if isinstance(value, dict):
+    for key, item in value.items():
+      yield from iter_target_config_secret_refs(item, path + (key,))
+    return
+  if isinstance(value, list):
+    for idx, item in enumerate(value):
+      yield from iter_target_config_secret_refs(item, path + (idx,))
+
+
+def collect_target_config_secret_refs(value) -> list[str]:
+  refs = []
+  seen = set()
+  for _path, ref in iter_target_config_secret_refs(value):
+    if ref and ref not in seen:
+      seen.add(ref)
+      refs.append(ref)
+  return refs
+
+
+def validate_target_config_secret_ref_positions(value):
+  for path, ref in iter_target_config_secret_refs(value):
+    if not _is_allowed_secret_ref_path(path):
+      path_text = ".".join(str(part) for part in path)
+      raise ValueError(
+        f"{path_text} uses secret_ref {ref!r} outside an approved request body"
+      )
+
+
+def resolve_target_config_secret_refs(value, secret_values: dict):
+  """Return a copy with typed secret refs replaced by runtime values."""
+  if _is_typed_secret_ref(value):
+    ref = value["secret_ref"].strip()
+    if ref not in (secret_values or {}):
+      raise KeyError(ref)
+    return secret_values[ref]
+  if isinstance(value, dict):
+    return {
+      key: resolve_target_config_secret_refs(item, secret_values)
+      for key, item in value.items()
+    }
+  if isinstance(value, list):
+    return [
+      resolve_target_config_secret_refs(item, secret_values)
+      for item in value
+    ]
+  return value
 
 
 def _reject_inline_secrets(value, context: str):

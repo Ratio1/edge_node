@@ -579,6 +579,10 @@ class _ReportMixin:
       redacted["regular_password"] = "***"
     if redacted.get("weak_candidates"):
       redacted["weak_candidates"] = ["***"] * len(redacted["weak_candidates"])
+    if isinstance(redacted.get("target_config_secrets"), dict):
+      redacted["target_config_secrets"] = {
+        str(key): "***" for key in redacted["target_config_secrets"]
+      }
     if isinstance(redacted.get("target_config"), dict):
       redacted["target_config"] = _redact_nested_job_config(
         redacted["target_config"]

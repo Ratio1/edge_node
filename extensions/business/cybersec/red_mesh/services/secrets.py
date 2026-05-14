@@ -3,6 +3,10 @@ import os
 
 from ..models import JobConfig
 from ..repositories import ArtifactRepository
+from ..graybox.models.target_config import (
+  collect_target_config_secret_refs,
+  resolve_target_config_secret_refs,
+)
 from .config import get_attestation_config
 
 
@@ -109,6 +113,7 @@ def _blank_graybox_secret_fields(config_dict: dict) -> dict:
   sanitized["regular_bearer_token"] = ""
   sanitized["regular_api_key"] = ""
   sanitized["regular_bearer_refresh_token"] = ""
+  sanitized.pop("target_config_secrets", None)
   sanitized.pop("weak_candidates", None)
   return sanitized
 
@@ -134,6 +139,7 @@ def build_graybox_secret_payload(
   regular_bearer_token="",
   regular_api_key="",
   regular_bearer_refresh_token="",
+  target_config_secrets=None,
 ):
   return {
     "official_username": official_username or "",
@@ -148,6 +154,7 @@ def build_graybox_secret_payload(
     "regular_bearer_token": regular_bearer_token or "",
     "regular_api_key": regular_api_key or "",
     "regular_bearer_refresh_token": regular_bearer_refresh_token or "",
+    "target_config_secrets": dict(target_config_secrets) if isinstance(target_config_secrets, dict) else {},
   }
 
 
@@ -165,7 +172,9 @@ def persist_job_config_with_secrets(
   tuple[dict, str]
     Persisted config dict and resulting job_config_cid.
   """
-  persisted_config = _coerce_job_config_dict(config_dict)
+  raw_config = deepcopy(config_dict or {})
+  target_config_secrets = raw_config.get("target_config_secrets")
+  persisted_config = _coerce_job_config_dict(raw_config)
   scan_type = persisted_config.get("scan_type", "network")
   if scan_type == "webapp":
     payload = build_graybox_secret_payload(
@@ -180,6 +189,7 @@ def persist_job_config_with_secrets(
       regular_bearer_token=persisted_config.get("regular_bearer_token", ""),
       regular_api_key=persisted_config.get("regular_api_key", ""),
       regular_bearer_refresh_token=persisted_config.get("regular_bearer_refresh_token", ""),
+      target_config_secrets=target_config_secrets,
     )
     has_secret_payload = any([
       payload["official_username"],
@@ -193,6 +203,7 @@ def persist_job_config_with_secrets(
       payload["regular_bearer_token"],
       payload["regular_api_key"],
       payload["regular_bearer_refresh_token"],
+      payload["target_config_secrets"],
     ])
     if has_secret_payload:
       store = R1fsSecretStore(owner)
@@ -256,6 +267,29 @@ def resolve_job_config_secrets(
     "regular_api_key": payload.get("regular_api_key", ""),
     "regular_bearer_refresh_token": payload.get("regular_bearer_refresh_token", ""),
   })
+  target_config_secrets = payload.get("target_config_secrets") or {}
+  target_config_secret_refs = []
+  if isinstance(resolved.get("target_config"), dict):
+    target_config_secret_refs = collect_target_config_secret_refs(
+      resolved["target_config"]
+    )
+  if target_config_secret_refs and not target_config_secrets:
+    raise ValueError(
+      "Failed to resolve target_config secret_ref value(s) "
+      f"{', '.join(target_config_secret_refs)} for "
+      f"job_id={expected_job_id or '<unknown>'}"
+    )
+  if target_config_secret_refs:
+    try:
+      resolved["target_config"] = resolve_target_config_secret_refs(
+        resolved["target_config"],
+        target_config_secrets,
+      )
+    except KeyError as exc:
+      raise ValueError(
+        f"Failed to resolve target_config secret_ref {exc.args[0]!r} "
+        f"for job_id={expected_job_id or '<unknown>'}"
+      ) from exc
   if not include_secret_metadata:
     resolved.pop("secret_ref", None)
   return resolved

@@ -141,6 +141,9 @@ class TestJobConfigWebapp(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
     d = {
       "target": "x",
+      "target_config_secrets": {
+        "oauth_client_secret": "OAUTH-CLIENT-SECRET",
+      },
       "target_config": {
         "api_security": {
           "token_endpoints": {
@@ -162,6 +165,11 @@ class TestJobConfigWebapp(unittest.TestCase):
     dumped = json.dumps(redacted)
     self.assertNotIn("plain-secret", dumped)
     self.assertNotIn("refresh-secret", dumped)
+    self.assertNotIn("OAUTH-CLIENT-SECRET", dumped)
+    self.assertEqual(
+      redacted["target_config_secrets"],
+      {"oauth_client_secret": "***"},
+    )
     self.assertEqual(
       redacted["target_config"]["api_security"]["token_endpoints"][
         "token_request_body"
