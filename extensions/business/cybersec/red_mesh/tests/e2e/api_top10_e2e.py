@@ -36,6 +36,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib import error, request
+from urllib.parse import urlparse
 
 
 HERE = Path(__file__).resolve().parent
@@ -153,6 +154,11 @@ def unwrap_result(payload: dict) -> dict:
 
 # ── Scan orchestration ──────────────────────────────────────────────
 
+def target_confirmation_for_url(target_url: str) -> str:
+  """Return the host value expected by launch-side authorization checks."""
+  parsed = urlparse(target_url)
+  return parsed.hostname or target_url
+
 def launch_scan(rm: str, honeypot: str, target_config: dict, *,
                 allow_stateful: bool = True) -> str:
   payload = {
@@ -164,7 +170,7 @@ def launch_scan(rm: str, honeypot: str, target_config: dict, *,
     "target_config": target_config,
     "allow_stateful_probes": allow_stateful,
     "authorized": True,
-    "target_confirmation": honeypot,
+    "target_confirmation": target_confirmation_for_url(honeypot),
     "task_name": "api-top10-e2e",
   }
   resp = http_post(f"{rm}/launch_webapp_scan", payload)
@@ -200,6 +206,27 @@ def collect_findings(archive: dict) -> list[dict]:
   for p in archive.get("passes", []) or []:
     out.extend(p.get("findings", []) or [])
   return out
+
+
+def llm_boundary_blob_from_archive(archive: dict) -> str:
+  """Serialize archive fields that are allowed to feed LLM/report stages.
+
+  Deployments do not expose a stable ``/get_job_llm_input`` endpoint yet, so
+  the harness validates the immutable archive material that backs LLM/report
+  generation: flat findings, LLM analyses, quick summaries, and structured
+  report sections. Raw JobConfig and worker stdout are intentionally excluded.
+  """
+  boundary: list[dict[str, Any]] = []
+  for p in archive.get("passes", []) or []:
+    if not isinstance(p, dict):
+      continue
+    boundary.append({
+      "findings": p.get("findings", []),
+      "llm_analysis": p.get("llm_analysis"),
+      "quick_summary": p.get("quick_summary"),
+      "llm_report_sections": p.get("llm_report_sections"),
+    })
+  return json.dumps(boundary, sort_keys=True, default=str)
 
 
 # ── Assertions ──────────────────────────────────────────────────────
@@ -286,13 +313,17 @@ def main() -> int:
 
   ok = True
 
+  last_archive: dict | None = None
+
   def run(label: str, allow_stateful: bool, assert_fn) -> bool:
+    nonlocal last_archive
     print(f"\n=== {label} ===")
     job_id = launch_scan(args.rm, args.honeypot, target_config,
                           allow_stateful=allow_stateful)
     print(f"  job_id={job_id}")
     wait_for_finalize(args.rm, job_id, timeout=args.timeout)
     archive = fetch_archive(args.rm, job_id)
+    last_archive = archive
     findings = collect_findings(archive)
     errors = assert_fn(findings, manifest)
     if errors:
@@ -329,11 +360,21 @@ def main() -> int:
                  else []
                ))
   if args.scenario in ("llm-boundary", "all"):
-    print("\n  Phase 7.5 — sample one job's LLM input artifact")
-    # Best-effort: actual artifact-fetch endpoint varies by deployment;
-    # the contract under test is "no leak patterns in serialised input".
-    # In CI this would fetch via /get_job_llm_input?job_id=...
-    print("  (skipped — requires deployment-specific LLM input endpoint)")
+    print("\n  Phase 7.5 — verify archive material used for LLM/report input")
+    if last_archive is None:
+      job_id = launch_scan(args.rm, args.honeypot, target_config,
+                            allow_stateful=False)
+      print(f"  job_id={job_id}")
+      wait_for_finalize(args.rm, job_id, timeout=args.timeout)
+      last_archive = fetch_archive(args.rm, job_id)
+    errors = assert_llm_boundary(llm_boundary_blob_from_archive(last_archive))
+    if errors:
+      print(f"  FAIL: {len(errors)} boundary assertion errors:")
+      for e in errors[:20]:
+        print(f"    - {e}")
+      ok = False
+    else:
+      print("  OK (no LLM/report-boundary leak patterns)")
 
   return 0 if ok else 1
 
