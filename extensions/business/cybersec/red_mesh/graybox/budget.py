@@ -46,6 +46,8 @@ class RequestBudget:
   def consume(self, n: int = 1) -> bool:
     """Decrement by ``n`` if available; return False (and bump
     ``exhausted_count``) when the budget can't cover the request."""
+    if n <= 0:
+      raise ValueError("RequestBudget.consume requires n > 0")
     with self._lock:
       if self.remaining < n:
         self.exhausted_count += 1

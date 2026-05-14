@@ -49,6 +49,120 @@ def validation_error(message: str):
   return {"error": "validation_error", "message": message}
 
 
+def _parse_positive_int(value, field_path: str, *, default=None,
+                        maximum: int | None = None):
+  """Parse a launcher numeric input as a positive integer.
+
+  Numeric strings are accepted for UI/API compatibility. Invalid,
+  boolean, zero, and negative values are rejected instead of silently
+  falling back to defaults because these values affect scanner safety.
+  """
+  if value is None:
+    value = default
+  if isinstance(value, bool):
+    return None, validation_error(f"{field_path} must be a positive integer")
+  if isinstance(value, str):
+    value = value.strip()
+  if isinstance(value, float) and not value.is_integer():
+    return None, validation_error(f"{field_path} must be a positive integer")
+  if value == "" or value is None:
+    return None, validation_error(f"{field_path} must be a positive integer")
+  try:
+    parsed = int(value)
+  except (TypeError, ValueError):
+    return None, validation_error(f"{field_path} must be a positive integer")
+  if parsed <= 0:
+    return None, validation_error(f"{field_path} must be greater than 0")
+  if maximum is not None and parsed > maximum:
+    return None, validation_error(
+      f"{field_path} must be less than or equal to {maximum}"
+    )
+  return parsed, None
+
+
+def _validate_positive_int_field(container, key, field_path: str, *,
+                                  maximum: int | None = None):
+  if not isinstance(container, dict) or key not in container:
+    return None
+  parsed, err = _parse_positive_int(
+    container.get(key), field_path, maximum=maximum,
+  )
+  if err:
+    return err
+  container[key] = parsed
+  return None
+
+
+def _validate_positive_int_list(container, key, field_path: str):
+  if not isinstance(container, dict) or key not in container:
+    return None
+  values = container.get(key)
+  if not isinstance(values, list):
+    return validation_error(f"{field_path} must be a list of positive integers")
+  parsed_values = []
+  for idx, value in enumerate(values):
+    parsed, err = _parse_positive_int(value, f"{field_path}[{idx}]")
+    if err:
+      return err
+    parsed_values.append(parsed)
+  container[key] = parsed_values
+  return None
+
+
+def _validate_graybox_numeric_fields(canonical: dict | None):
+  """Validate scanner-safety numeric fields in canonical target_config."""
+  if not isinstance(canonical, dict):
+    return None
+  discovery = canonical.get("discovery") or {}
+  for key in ("max_pages", "max_depth"):
+    err = _validate_positive_int_field(discovery, key, f"discovery.{key}")
+    if err:
+      return err
+
+  access = canonical.get("access_control") or {}
+  for idx, endpoint in enumerate(access.get("idor_endpoints") or []):
+    err = _validate_positive_int_list(
+      endpoint, "test_ids", f"access_control.idor_endpoints[{idx}].test_ids",
+    )
+    if err:
+      return err
+
+  api = canonical.get("api_security") or {}
+  err = _validate_positive_int_field(
+    api, "max_total_requests", "api_security.max_total_requests",
+  )
+  if err:
+    return err
+  for idx, endpoint in enumerate(api.get("object_endpoints") or []):
+    err = _validate_positive_int_list(
+      endpoint, "test_ids", f"api_security.object_endpoints[{idx}].test_ids",
+    )
+    if err:
+      return err
+  for idx, endpoint in enumerate(api.get("property_endpoints") or []):
+    err = _validate_positive_int_field(
+      endpoint, "test_id",
+      f"api_security.property_endpoints[{idx}].test_id",
+    )
+    if err:
+      return err
+  for idx, endpoint in enumerate(api.get("resource_endpoints") or []):
+    for key in ("baseline_limit", "abuse_limit"):
+      err = _validate_positive_int_field(
+        endpoint, key, f"api_security.resource_endpoints[{idx}].{key}",
+      )
+      if err:
+        return err
+    err = _validate_positive_int_field(
+      endpoint, "oversized_payload_bytes",
+      f"api_security.resource_endpoints[{idx}].oversized_payload_bytes",
+      maximum=262_144,
+    )
+    if err:
+      return err
+  return None
+
+
 def _normalize_allowlist(entries):
   if not entries:
     return []
@@ -157,6 +271,10 @@ def normalize_graybox_target_config(target_config, target_config_secrets=None):
   try:
     typed_config = GrayboxTargetConfig.from_dict(deepcopy(target_config))
     canonical = typed_config.to_dict()
+    numeric_error = _validate_graybox_numeric_fields(canonical)
+    if numeric_error:
+      return None, None, numeric_error
+    typed_config = GrayboxTargetConfig.from_dict(deepcopy(canonical))
     validate_target_config_secret_ref_positions(canonical)
     required_refs = collect_target_config_secret_refs(canonical)
     provided_refs = set((target_config_secrets or {}).keys())
@@ -980,6 +1098,17 @@ def launch_webapp_scan(
   """
   if not target_url:
     return validation_error("target_url required for webapp scan")
+  max_weak_attempts, numeric_error = _parse_positive_int(
+    max_weak_attempts, "max_weak_attempts", default=5,
+  )
+  if numeric_error:
+    return numeric_error
+  if request_budget is not None:
+    request_budget, numeric_error = _parse_positive_int(
+      request_budget, "request_budget",
+    )
+    if numeric_error:
+      return numeric_error
   raw_target_config = deepcopy(target_config) if isinstance(target_config, dict) else target_config
   typed_target_config, target_config, config_error = normalize_graybox_target_config(
     target_config,
@@ -1072,7 +1201,7 @@ def launch_webapp_scan(
     if not isinstance(target_config, dict):
       target_config = {}
     api_security = dict(target_config.get("api_security") or {})
-    api_security["max_total_requests"] = int(request_budget)
+    api_security["max_total_requests"] = request_budget
     target_config["api_security"] = api_security
 
   typed_target_config, target_config, config_error = normalize_graybox_target_config(

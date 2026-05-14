@@ -242,6 +242,23 @@ class TestGrayboxWorkerAssignments(unittest.TestCase):
     self.assertIsNone(assignments)
     self.assertIn("MIRROR with stateful", error)
 
+  def test_invalid_request_budget_fails_assignment(self):
+    assignments, error = build_graybox_worker_assignments(
+      ["node-a"],
+      strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+      total_request_budget="abc",
+    )
+    self.assertIsNone(assignments)
+    self.assertIn("positive integer", error)
+
+    assignments, error = build_graybox_worker_assignments(
+      ["node-a"],
+      strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+      total_request_budget=0,
+    )
+    self.assertIsNone(assignments)
+    self.assertIn("positive integer", error)
+
 
 class TestScenarioAssignmentGates(unittest.TestCase):
 

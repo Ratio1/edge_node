@@ -838,6 +838,81 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertTrue(any("capped" in warning for warning in warnings))
     self.assertTrue(any("TLS verification is disabled" in warning for warning in warnings))
 
+  def test_launch_webapp_scan_rejects_invalid_numeric_safety_values(self):
+    plugin = self._build_mock_plugin(job_id="test-job-bad-request-budget")
+    result = self._launch_webapp(plugin, request_budget="abc")
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("request_budget", result["message"])
+
+    plugin = self._build_mock_plugin(job_id="test-job-bad-weak-attempts")
+    result = self._launch_webapp(plugin, max_weak_attempts=0)
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("max_weak_attempts", result["message"])
+
+  def test_launch_webapp_scan_rejects_invalid_target_config_numeric_values(self):
+    plugin = self._build_mock_plugin(job_id="test-job-bad-max-requests")
+    result = self._launch_webapp(
+      plugin,
+      target_config={"api_security": {"max_total_requests": "abc"}},
+    )
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("api_security.max_total_requests", result["message"])
+
+    plugin = self._build_mock_plugin(job_id="test-job-bad-discovery")
+    result = self._launch_webapp(
+      plugin,
+      target_config={"discovery": {"scope_prefix": "/api/", "max_pages": -1}},
+    )
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("discovery.max_pages", result["message"])
+
+    plugin = self._build_mock_plugin(job_id="test-job-bad-payload-size")
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "resource_endpoints": [
+            {
+              "path": "/api/records/",
+              "allow_oversized_payload_probe": True,
+              "oversized_payload_bytes": 262_145,
+            },
+          ],
+        },
+      },
+    )
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("oversized_payload_bytes", result["message"])
+
+  def test_launch_webapp_scan_normalizes_numeric_strings(self):
+    plugin = self._build_mock_plugin(job_id="test-job-numeric-strings")
+    self._launch_webapp(
+      plugin,
+      request_budget="42",
+      max_weak_attempts="5",
+      target_config={
+        "discovery": {"scope_prefix": "/api/", "max_pages": "12", "max_depth": "2"},
+        "api_security": {
+          "object_endpoints": [
+            {"path": "/api/records/{id}/", "test_ids": ["1", "2"]},
+          ],
+        },
+      },
+    )
+
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(config_dict["max_weak_attempts"], 5)
+    self.assertEqual(config_dict["target_config"]["discovery"]["max_pages"], 12)
+    self.assertEqual(config_dict["target_config"]["discovery"]["max_depth"], 2)
+    self.assertEqual(
+      config_dict["target_config"]["api_security"]["max_total_requests"],
+      42,
+    )
+    self.assertEqual(
+      config_dict["target_config"]["api_security"]["object_endpoints"][0]["test_ids"],
+      [1, 2],
+    )
+
   def test_launch_test_rejects_invalid_scan_type(self):
     """Compatibility endpoint rejects unknown scan types with a structured error."""
     plugin = self._build_mock_plugin(job_id="test-job-badtype")

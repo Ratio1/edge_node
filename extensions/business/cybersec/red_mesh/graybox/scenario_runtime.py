@@ -353,11 +353,16 @@ def build_graybox_worker_assignments(
       "allow_mirror_stateful override or a single selected worker.",
     )
 
+  raw_budget = (
+    GRAYBOX_DEFAULT_REQUEST_BUDGET
+    if total_request_budget is None else total_request_budget
+  )
   try:
-    total_budget = int(total_request_budget or GRAYBOX_DEFAULT_REQUEST_BUDGET)
+    total_budget = int(raw_budget)
   except (TypeError, ValueError):
-    total_budget = GRAYBOX_DEFAULT_REQUEST_BUDGET
-  total_budget = max(1, total_budget)
+    return None, "total_request_budget must be a positive integer."
+  if total_budget <= 0:
+    return None, "total_request_budget must be a positive integer."
 
   scenario_ids = runtime_scenario_ids()
   stateful_policy = "enabled" if allow_stateful else "disabled"

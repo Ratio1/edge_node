@@ -42,6 +42,15 @@ class TestRequestBudgetSequential(unittest.TestCase):
     self.assertEqual(b.remaining, 3)
     self.assertEqual(b.exhausted_count, 1)
 
+  def test_consume_rejects_non_positive_amount(self):
+    b = RequestBudget(remaining=3, total=3)
+    with self.assertRaises(ValueError):
+      b.consume(0)
+    with self.assertRaises(ValueError):
+      b.consume(-5)
+    self.assertEqual(b.remaining, 3)
+    self.assertEqual(b.exhausted_count, 0)
+
   def test_snapshot_shape(self):
     b = RequestBudget(remaining=10, total=10)
     b.consume(3)
