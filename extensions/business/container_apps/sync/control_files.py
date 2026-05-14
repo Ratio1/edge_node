@@ -205,6 +205,11 @@ class JsonControlFile:
 
     try:
       raw_body = self._read_text_no_follow(processing_path)
+    except UnicodeDecodeError as exc:
+      raise JsonControlFileDecodeError(
+        f"invalid UTF-8 in {self.pending_name}: {exc}",
+        processing_path=processing_path,
+      ) from exc
     except OSError as exc:
       raise JsonControlFileReadError(
         str(exc), processing_path=processing_path,

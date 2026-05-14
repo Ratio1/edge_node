@@ -95,6 +95,16 @@ class TestJsonControlFile(unittest.TestCase):
     self.assertEqual(ctx.exception.raw_body, "not-json{")
     self.assertTrue((self.root / "request.json.processing").is_file())
 
+  def test_claim_object_reports_invalid_utf8_without_raw_body(self):
+    (self.root / "request.json").write_bytes(b'{"archive_paths": ["\xff"]}')
+
+    with self.assertRaises(JsonControlFileDecodeError) as ctx:
+      self.control.claim_object()
+
+    self.assertIsNone(ctx.exception.raw_body)
+    self.assertIn("invalid UTF-8", str(ctx.exception))
+    self.assertTrue((self.root / "request.json.processing").is_file())
+
   def test_claim_object_reports_non_object_json_with_raw_body(self):
     (self.root / "request.json").write_text('["just","a","list"]')
 

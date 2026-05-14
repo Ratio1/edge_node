@@ -15,6 +15,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from extensions.business.container_apps.sync import (
   SYNC_PROCESSING_FILE,
@@ -950,6 +951,38 @@ class TestArchiveRoundtrip(unittest.TestCase):
     self.assertEqual(os.stat(target_dir).st_mode & 0o7000, 0)
     self.assertEqual(os.stat(target_file).st_mode & 0o7000, 0)
 
+  def test_extract_chowns_restored_entries_to_volume_owner(self):
+    owner_tar = self.tmpdir / "owner.tar.gz"
+    with tarfile.open(str(owner_tar), "w:gz") as tar:
+      dir_info = tarfile.TarInfo(name="/app/data/owned")
+      dir_info.type = tarfile.DIRTYPE
+      dir_info.mode = 0o755
+      tar.addfile(dir_info)
+
+      content = b"payload"
+      file_info = tarfile.TarInfo(name="/app/data/owned/file.txt")
+      file_info.size = len(content)
+      file_info.mode = 0o644
+      tar.addfile(file_info, io.BytesIO(content))
+
+    calls = []
+
+    def _fake_chown(path, uid, gid):
+      calls.append((os.path.basename(path), uid, gid))
+
+    with patch.object(self.sm_c, "_volume_owner", return_value=(1234, 2345)), patch(
+      "extensions.business.container_apps.sync.manager.os.chown",
+      side_effect=_fake_chown,
+    ):
+      self.sm_c.extract_archive(str(owner_tar))
+
+    self.assertIn(("owned", 1234, 2345), calls)
+    self.assertTrue(any(call[1:] == (1234, 2345) for call in calls))
+    self.assertEqual(
+      (self.consumer._fixed_root / "appdata" / "owned" / "file.txt").read_bytes(),
+      b"payload",
+    )
+
 
 # ---------------------------------------------------------------------------
 # publish_snapshot
@@ -1078,15 +1111,18 @@ class TestPublishSnapshot(unittest.TestCase):
     self.assertEqual(len(self.owner._r1fs.added), 0)
     self.assertEqual(len(self.owner._r1fs.deleted), 1)
 
-  def test_chainstore_no_ack_still_succeeds(self):
-    # hset returning False (no peer confirmation) is recorded but not fatal.
+  def test_chainstore_no_ack_fails_and_cleans_uploaded_cid(self):
     self.owner._cs.hset_returns = False
+
     ok = self.sm.publish_snapshot(["/app/data/"], {})
-    self.assertTrue(ok)
-    files = list(history_sent_dir(self.owner).glob("*.json"))
-    self.assertEqual(len(files), 1)
-    entry = json.loads(files[0].read_text())
-    self.assertFalse(entry["chainstore_ack"])
+
+    self.assertFalse(ok)
+    invalid = json.loads((self.vsd / "request.json.invalid").read_text())
+    self.assertEqual(invalid["_error"]["stage"], "chainstore_publish")
+    self.assertIn("ack", invalid["_error"]["error"])
+    self.assertEqual(len(list(history_sent_dir(self.owner).glob("*.json"))), 0)
+    self.assertEqual(self.owner._r1fs.added, {})
+    self.assertEqual(len(self.owner._r1fs.deleted), 1)
 
   def test_two_snapshots_retire_first_cid(self):
     self.sm.publish_snapshot(["/app/data/"], {"epoch": 1})
@@ -1313,6 +1349,11 @@ class TestConsumerFlow(unittest.TestCase):
     self.assertNotEqual(self.sm_c.validate_manifest({}), [])
     self.assertNotEqual(self.sm_c.validate_manifest({"manifest": {}}), [])
 
+  def test_validate_manifest_rejects_non_dict_manifest(self):
+    reasons = self.sm_c.validate_manifest({"manifest": "not-an-object"})
+
+    self.assertEqual(reasons, ["manifest must be a JSON object"])
+
   def test_validate_manifest_rejects_missing_archive_paths(self):
     record = self._ok_manifest()
     del record["manifest"]["archive_paths"]
@@ -1334,6 +1375,17 @@ class TestConsumerFlow(unittest.TestCase):
   def test_validate_manifest_rejects_non_dict(self):
     self.assertEqual(self.sm_c.validate_manifest(None), ["manifest record is not a dict"])
     self.assertEqual(self.sm_c.validate_manifest("string"), ["manifest record is not a dict"])
+
+  def test_validate_record_rejects_missing_envelope_fields(self):
+    reasons = self.sm_c.validate_record_for_apply({
+      "cid": "",
+      "version": "1",
+      "manifest": self._ok_manifest()["manifest"],
+    })
+
+    joined = "; ".join(reasons)
+    self.assertIn("cid", joined)
+    self.assertIn("version", joined)
 
   # ----- fetch_latest -------------------------------------------------------
 
@@ -1446,6 +1498,22 @@ class TestConsumerFlow(unittest.TestCase):
     self.assertTrue(any("unmapped archive_paths" in m for m in self.consumer._msgs))
     self.assertTrue(any("/foo/bar/" in m for m in self.consumer._msgs))
 
+  def test_apply_rejects_non_dict_manifest_without_raising(self):
+    record = {
+      "cid": "QmFAKE_BAD_MANIFEST",
+      "version": 123,
+      "timestamp": 1234.0,
+      "node_id": "ee_someone",
+      "metadata": {},
+      "manifest": "not-an-object",
+    }
+
+    ok = self.sm_c.apply_snapshot(record)
+
+    self.assertFalse(ok)
+    self.assertFalse((volume_sync_dir(self.consumer) / "last_apply.json").exists())
+    self.assertTrue(any("manifest must be a JSON object" in m for m in self.consumer._msgs))
+
   def test_apply_rejects_tar_member_outside_manifest_archive_paths(self):
     cid = "QmOUTSIDE_MANIFEST"
     bad_tar = self.tmpdir / "outside-manifest-apply.tar.gz"
@@ -1546,6 +1614,8 @@ class TestConsumerFlow(unittest.TestCase):
     deleted = self.consumer._r1fs.deleted
     self.assertTrue(any(cid == older["cid"] and cleanup
                         for (cid, _, cleanup) in deleted))
+    self.assertTrue(any(cid == older["cid"] and not unpin_remote
+                        for (cid, unpin_remote, _) in deleted))
 
 
 if __name__ == "__main__":

@@ -2104,23 +2104,28 @@ class ContainerAppRunnerPlugin(
 
     Returns
     -------
-    None
+    bool
+      True when there is no container or stop+remove completed without
+      exception. False when Docker reported a stop/remove failure.
 
     Notes
     -----
     If no container exists, logs a warning and returns.
-    Clears container and container_id attributes after removal.
+    Clears container and container_id attributes after successful removal.
     """
     if not self.container:
       self.P("No container to stop", color='r')
-      return
+      return True
 
+    stopped_ok = True
+    removed_ok = True
     try:
       # Stop the container (gracefully)
       self.P(f"Stopping container {self.container.short_id}...")
       self.container.stop(timeout=5)
       self.P(f"Container {self.container.short_id} stopped successfully")
     except Exception as e:
+      stopped_ok = False
       self.P(f"Error stopping container: {e}", color='r')
     # end try
 
@@ -2129,12 +2134,13 @@ class ContainerAppRunnerPlugin(
       self.container.remove()
       self.P(f"Container {self.container.short_id} removed successfully")
     except Exception as e:
+      removed_ok = False
       self.P(f"Error removing container: {e}", color='r')
-    finally:
+    if removed_ok:
       self.container = None
       self.container_id = None
     # end try
-    return
+    return stopped_ok and removed_ok
 
 
   def _stream_logs(self, log_stream):
@@ -2738,7 +2744,9 @@ class ContainerAppRunnerPlugin(
 
     Returns
     -------
-    None
+    bool
+      True when the Docker container is stopped/removed or absent, False when
+      Docker reported a failure.
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
 
@@ -2767,9 +2775,9 @@ class ContainerAppRunnerPlugin(
     self.stop_extra_tunnels()
 
     # Stop the container if it's running
-    self.stop_container()
+    stopped = self.stop_container()
 
-    return
+    return stopped
 
 
   def _stop_container_and_save_logs_to_disk(self):

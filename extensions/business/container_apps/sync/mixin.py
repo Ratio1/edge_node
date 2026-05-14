@@ -10,7 +10,7 @@ Bridges :class:`SyncManager` into ``ContainerAppRunnerPlugin``'s lifecycle:
     start_container inline (must NOT route through ``_restart_container``,
     which calls ``_cleanup_fixed_size_volumes`` and unmounts the loopback
     before we can read from it)
-  * consumer role: same cadence polls ChainStore for newer ``version``, then
+  * consumer role: same cadence polls ChainStore for a different ``cid``, then
     drives runtime stop → apply_snapshot → start_container inline.
     First boot starts on an empty volume; the next tick picks up whatever
     snapshot is in ChainStore. Apps that strictly require state at startup
@@ -35,6 +35,7 @@ from .control_files import JsonControlFile, JsonControlFileUnsafeError
 from .constants import (
   SYNC_PROCESSING_FILE,
   SYNC_REQUEST_FILE,
+  STAGE_RUNTIME_STOP,
   SYSTEM_VOLUME_FS,
   SYSTEM_VOLUME_MOUNT,
   SYSTEM_VOLUME_NAME,
@@ -47,6 +48,7 @@ from .manager import (
   CONSUMER_APPLY_ONLINE_RESTART,
   SyncManager,
   history_received_dir,
+  runtime_policy_to_dict,
   system_volume_host_root,
   volume_sync_dir,
 )
@@ -112,23 +114,13 @@ class _SyncMixin:
     # files exist) and then we'd never re-mount them — the data volume
     # would land empty in the container.
 
-    owner_uid, owner_gid = (None, None)
-    resolver = getattr(self, "_resolve_image_owner", None)
-    if callable(resolver):
-      try:
-        owner_uid, owner_gid = resolver()
-      except Exception as exc:
-        self.P(
-          f"[sync] _resolve_image_owner failed (using root): {exc}", color="y"
-        )
-
     vol = fixed_volume.FixedVolume(
       name=SYSTEM_VOLUME_NAME,
       size=SYSTEM_VOLUME_SIZE,
       root=root,
       fs_type=SYSTEM_VOLUME_FS,
-      owner_uid=owner_uid,
-      owner_gid=owner_gid,
+      owner_uid=None,
+      owner_gid=None,
     )
     try:
       fixed_volume.provision(vol, force_recreate=False, logger=self.P)
@@ -152,17 +144,22 @@ class _SyncMixin:
       self._fixed_volumes = []
     self._fixed_volumes.append(vol)
 
-    self.volumes.update(fixed_volume.docker_bind_spec(vol, SYSTEM_VOLUME_MOUNT))
-
     # Ensure the mount root itself stays root-owned/non-app-writable so the
-    # app cannot replace volume-sync/ with a symlink after startup. Only the
-    # dedicated volume-sync/ subdir is app-writable.
+    # app cannot replace volume-sync/ with a symlink after startup. This system
+    # volume is CAR/app control plane, not app data, so it deliberately ignores
+    # the image USER ownership used for FIXED_SIZE_VOLUMES.
     try:
+      os.chown(str(vol.mount_path), 0, 0)
       os.chmod(str(vol.mount_path), 0o755)
     except OSError as exc:
       self.P(
-        f"[sync] could not chmod {vol.mount_path} to 0o755: {exc}", color="y"
+        f"[sync] could not enforce root-owned {vol.mount_path} mode 0o755: "
+        f"{exc}. SYNC will be disabled and R1_SYSTEM_VOLUME env vars will not "
+        f"be exported.",
+        color="r",
       )
+      self._sync_unavailable = True
+      return
 
     # Ensure volume-sync subdir exists before container start so the app
     # can drop a request.json on its first tick. If a previous run left a
@@ -193,11 +190,17 @@ class _SyncMixin:
       self._sync_unavailable = True
       return
     try:
+      os.chown(str(vsd), 0, 0)
       os.chmod(str(vsd), 0o1777)
     except OSError as exc:
       self.P(
-        f"[sync] could not chmod {vsd} to 0o1777: {exc}", color="y"
+        f"[sync] could not enforce root-owned {vsd} mode 0o1777: {exc}. "
+        f"SYNC will be disabled and R1_SYSTEM_VOLUME env vars will not be exported.",
+        color="r",
       )
+      self._sync_unavailable = True
+      return
+    self.volumes.update(fixed_volume.docker_bind_spec(vol, SYSTEM_VOLUME_MOUNT))
     self.P(
       f"[sync] system volume ready: {vol.mount_path} -> {SYSTEM_VOLUME_MOUNT} "
       f"(volume-sync at {vsd})",
@@ -389,7 +392,20 @@ class _SyncMixin:
 
     stopped_for_sync = claimed.runtime.provider_capture == "offline"
     if stopped_for_sync:
-      self._stop_container_runtime_for_restart()
+      stopped = self._stop_container_runtime_for_restart()
+      if not stopped:
+        request_body = {
+          "archive_paths": list(claimed.archive_paths),
+          "metadata": dict(claimed.metadata),
+          "runtime": runtime_policy_to_dict(claimed.runtime),
+        }
+        sm._fail_request(
+          request_body,
+          STAGE_RUNTIME_STOP,
+          "could not stop/remove container for offline provider capture",
+          control_file.processing_path,
+        )
+        return
 
     try:
       sm.publish_snapshot(claimed)
@@ -433,6 +449,15 @@ class _SyncMixin:
     if last_cid and record_cid == last_cid:
       return  # same bundle as the last apply — nothing to do
 
+    rejection_reasons = sm.validate_record_for_apply(record)
+    if rejection_reasons:
+      self.P(
+        f"[sync] skipping consumer apply for cid={record_cid}: "
+        + "; ".join(rejection_reasons),
+        color="r",
+      )
+      return
+
     self.P(
       f"[sync] consumer tick: applying cid={record_cid} "
       f"(v{record.get('version')})",
@@ -441,7 +466,14 @@ class _SyncMixin:
 
     apply_mode = self._sync_consumer_apply_mode(record)
     if apply_mode == CONSUMER_APPLY_OFFLINE_RESTART:
-      self._stop_container_runtime_for_restart()
+      stopped = self._stop_container_runtime_for_restart()
+      if not stopped:
+        self.P(
+          f"[sync] aborting consumer apply for cid={record_cid}: "
+          "could not stop/remove container for offline apply",
+          color="r",
+        )
+        return
 
     applied = False
     try:
@@ -452,8 +484,14 @@ class _SyncMixin:
     if apply_mode == CONSUMER_APPLY_OFFLINE_RESTART:
       self._sync_safe_start_container()
     elif apply_mode == CONSUMER_APPLY_ONLINE_RESTART and applied:
-      self._stop_container_runtime_for_restart()
-      self._sync_safe_start_container()
+      stopped = self._stop_container_runtime_for_restart()
+      if stopped:
+        self._sync_safe_start_container()
+      else:
+        self.P(
+          f"[sync] post-apply restart failed to stop container for cid={record_cid}",
+          color="r",
+        )
 
   # ----- internal helpers ------------------------------------------------
 

@@ -581,7 +581,7 @@ class SyncManager:
     except Exception as exc:
       self.owner.P(f"[sync] failed to write response.json: {exc}", color="r")
 
-    if processing_path is not None and processing_path.exists():
+    if processing_path is not None and os.path.lexists(str(processing_path)):
       try:
         control_file.discard_processing()
       except OSError as exc:
@@ -923,6 +923,15 @@ class SyncManager:
           request_body, STAGE_CHAINSTORE_PUBLISH, str(exc), proc_path
         )
         return False
+      if not ack:
+        self._delete_uploaded_cid_best_effort(cid)
+        self._fail_request(
+          request_body,
+          STAGE_CHAINSTORE_PUBLISH,
+          "chainstore_hset returned false acknowledgement",
+          proc_path,
+        )
+        return False
 
       # Persist history entry (pre-retirement so deletion update finds it).
       entry = {
@@ -1058,6 +1067,8 @@ class SyncManager:
     if not isinstance(record, dict):
       return ["manifest record is not a dict"]
     manifest = record.get("manifest") or {}
+    if not isinstance(manifest, dict):
+      return ["manifest must be a JSON object"]
     reasons: list[str] = []
 
     sv = manifest.get("schema_version")
@@ -1106,6 +1117,24 @@ class SyncManager:
       reasons.append(f"unmapped archive_paths on this consumer: {missing}")
     return reasons
 
+  def validate_record_for_apply(self, record: dict) -> list[str]:
+    """Validate the full ChainStore record before disrupting a consumer.
+
+    This covers the record envelope plus the manifest. ``validate_manifest`` is
+    kept as the manifest-focused helper used by older tests and callers.
+    """
+    if not isinstance(record, dict):
+      return ["sync record is not a dict"]
+    reasons: list[str] = []
+    cid = record.get("cid")
+    if not isinstance(cid, str) or not cid:
+      reasons.append("record cid must be a non-empty string")
+    version = record.get("version")
+    if not isinstance(version, int):
+      reasons.append("record version must be an int")
+    reasons.extend(self.validate_manifest(record))
+    return reasons
+
   @staticmethod
   def _is_within_real_root(path: str, root: str) -> bool:
     root_real = os.path.realpath(root)
@@ -1133,6 +1162,38 @@ class SyncManager:
         raise ValueError(
           f"tar member target escapes volume root: {container_name!r} -> {host_path!r}"
         )
+
+  @staticmethod
+  def _volume_owner(host_root: str) -> tuple[int, int]:
+    st = os.stat(host_root)
+    return st.st_uid, st.st_gid
+
+  @staticmethod
+  def _chown_if_needed(path: str, uid: int, gid: int) -> None:
+    st = os.lstat(path)
+    if st.st_uid != uid or st.st_gid != gid:
+      os.chown(path, uid, gid)
+
+  def _ensure_directory_tree_owner(
+    self,
+    path: str,
+    host_root: str,
+    uid: int,
+    gid: int,
+  ) -> None:
+    os.makedirs(path, exist_ok=True)
+    host_root_n = os.path.normpath(host_root)
+    current = os.path.normpath(path)
+    dirs: list[str] = []
+    while current != host_root_n and self._is_within_root(current, host_root_n):
+      dirs.append(current)
+      parent = os.path.dirname(current)
+      if parent == current:
+        break
+      current = parent
+    for directory in reversed(dirs):
+      self._chown_if_needed(directory, uid, gid)
+      os.chmod(directory, 0o755)
 
   @staticmethod
   def _container_path_in_declared_archive_paths(
@@ -1214,20 +1275,20 @@ class SyncManager:
 
       # Pass 2: actually extract.
       for member, host_path, container_name, host_root in planned:
+        owner_uid, owner_gid = self._volume_owner(host_root)
         if member.isdir():
-          os.makedirs(host_path, exist_ok=True)
+          self._ensure_directory_tree_owner(
+            host_path, host_root, owner_uid, owner_gid
+          )
           self._validate_extract_target_within_root(host_path, host_root, container_name)
-          # Widen dir mode so the in-container app user can traverse, even
-          # if CAR (running as root in the edge node) created the directory.
-          try:
-            os.chmod(host_path, self._safe_extract_mode(member.mode, is_dir=True))
-          except OSError:
-            pass
+          os.chmod(host_path, self._safe_extract_mode(member.mode, is_dir=True))
           extracted.append(container_name)
           continue
         if not member.isfile():
           continue
-        os.makedirs(os.path.dirname(host_path), exist_ok=True)
+        self._ensure_directory_tree_owner(
+          os.path.dirname(host_path), host_root, owner_uid, owner_gid
+        )
         self._validate_extract_target_within_root(host_path, host_root, container_name)
         fobj = tar.extractfile(member)
         if fobj is None:
@@ -1245,10 +1306,7 @@ class SyncManager:
               if not chunk:
                 break
               out.write(chunk)
-          # Widen mode before replace: extracted files end up owned by root
-          # (CAR runs as root); the app inside the container is typically a
-          # non-root user. Preserve the source mode but ensure at least
-          # world-readable so the app can ``cat`` what we just landed.
+          self._chown_if_needed(tmp_name, owner_uid, owner_gid)
           os.chmod(tmp_name, self._safe_extract_mode(member.mode, is_dir=False))
           os.replace(tmp_name, host_path)
         except Exception:
@@ -1268,25 +1326,18 @@ class SyncManager:
     last_apply.json is written so the consumer-side app can tell nothing
     landed; history is not advanced.
     """
-    if not isinstance(record, dict):
-      self.owner.P(f"[sync] apply_snapshot got non-dict record: {record!r}", color="r")
-      return False
-    cid = record.get("cid")
-    version = record.get("version")
-    if not cid or not isinstance(version, int):
-      self.owner.P(
-        f"[sync] apply_snapshot record missing cid/version: {record!r}", color="r"
-      )
-      return False
-
-    rejection_reasons = self.validate_manifest(record)
+    rejection_reasons = self.validate_record_for_apply(record)
     if rejection_reasons:
+      cid = record.get("cid") if isinstance(record, dict) else None
+      version = record.get("version") if isinstance(record, dict) else None
       self.owner.P(
         f"[sync] cannot apply v{version} (cid={cid}): "
         + "; ".join(rejection_reasons),
         color="r",
       )
       return False
+    cid = record["cid"]
+    version = record["version"]
 
     try:
       local_path = self.owner.r1fs.get_file(cid)
@@ -1335,12 +1386,19 @@ class SyncManager:
     except Exception as exc:
       self.owner.P(f"[sync] failed to write last_apply.json: {exc}", color="r")
 
-    self._retire_previous_cid(history_received_dir(self.owner), cleanup_local_files=True)
+    self._retire_previous_cid(
+      history_received_dir(self.owner),
+      cleanup_local_files=True,
+      unpin_remote=False,
+    )
     return True
 
   # ----- retirement ------------------------------------------------------
   def _retire_previous_cid(
-    self, history_dir: Path, cleanup_local_files: bool = False
+    self,
+    history_dir: Path,
+    cleanup_local_files: bool = False,
+    unpin_remote: bool = True,
   ) -> None:
     """Delete the prior R1FS CID after a successful new operation.
 
@@ -1381,7 +1439,7 @@ class SyncManager:
     try:
       self.owner.r1fs.delete_file(
         cid=target_cid,
-        unpin_remote=True,
+        unpin_remote=unpin_remote,
         cleanup_local_files=cleanup_local_files,
       )
       succeeded = True

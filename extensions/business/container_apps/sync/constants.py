@@ -47,6 +47,7 @@ STAGE_ARCHIVE_BUILD = "archive_build"
 STAGE_R1FS_UPLOAD = "r1fs_upload"
 STAGE_CHAINSTORE_PUBLISH = "chainstore_publish"
 STAGE_EXTRACT = "extract"
+STAGE_RUNTIME_STOP = "runtime_stop"
 
 # History entry deletion sub-record default (filled in when superseded).
 _UNDELETED = {"deleted_at": None, "deletion_succeeded": None, "deletion_error": None}

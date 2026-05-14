@@ -370,7 +370,8 @@ class TestLifecycleStop(unittest.TestCase):
 
   def test_stop_calls_docker_stop_and_remove(self):
     plugin, _, container = self._launch()
-    plugin.stop_container()
+    result = plugin.stop_container()
+    self.assertTrue(result)
     container.stop.assert_called_once_with(timeout=5)
     container.remove.assert_called_once()
 
@@ -382,7 +383,18 @@ class TestLifecycleStop(unittest.TestCase):
 
   def test_stop_noop_when_no_container(self):
     plugin, _, _ = make_lifecycle_runner()
-    plugin.stop_container()  # should not raise
+    self.assertTrue(plugin.stop_container())  # should not raise
+
+  def test_stop_failure_returns_false_and_keeps_container_reference(self):
+    plugin, _, container = self._launch()
+    container.stop.side_effect = RuntimeError("docker timeout")
+    container.remove.side_effect = RuntimeError("still running")
+
+    result = plugin.stop_container()
+
+    self.assertFalse(result)
+    self.assertIs(plugin.container, container)
+    self.assertEqual(plugin.container_id, container.short_id)
 
   def test_stop_and_save_logs_saves_to_disk(self):
     plugin, _, container = self._launch()
@@ -403,8 +415,9 @@ class TestLifecycleStop(unittest.TestCase):
     plugin.stop_extra_tunnels = MagicMock()
     plugin._cleanup_fixed_size_volumes = MagicMock()
 
-    plugin._stop_container_runtime_for_restart()
+    result = plugin._stop_container_runtime_for_restart()
 
+    self.assertTrue(result)
     plugin._semaphore_reset_signal.assert_called_once()
     self.assertEqual(log_thread.join_calls, 1)
     self.assertEqual(log_thread.join_timeout, 5)

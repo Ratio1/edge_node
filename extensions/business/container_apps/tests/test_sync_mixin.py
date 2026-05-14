@@ -42,6 +42,7 @@ class _FakePlugin(_SyncMixin):
     self.start_calls = 0
     self.runtime_stop_calls = 0
     self.fixed_volume_cleanup_calls = 0
+    self.stop_result = True
     self.lifecycle_log: list[str] = []
     # Mirror SyncManager-required attributes onto self by attribute lookup.
     # We simply use __getattr__ to forward.
@@ -53,10 +54,11 @@ class _FakePlugin(_SyncMixin):
   def stop_container(self):
     self.stop_calls += 1
     self.lifecycle_log.append("stop")
+    return self.stop_result
 
   def _stop_container_runtime_for_restart(self):
     self.runtime_stop_calls += 1
-    self.stop_container()
+    return self.stop_container()
 
   def _cleanup_fixed_size_volumes(self):
     self.fixed_volume_cleanup_calls += 1
@@ -240,6 +242,8 @@ class TestEnvInjection(unittest.TestCase):
     ), patch(
       "extensions.business.container_apps.sync.mixin.fixed_volume.provision",
       side_effect=lambda vol, **_kwargs: vol,
+    ), patch(
+      "extensions.business.container_apps.sync.mixin.os.chown",
     ):
       plugin._configure_system_volume()
 
@@ -262,6 +266,8 @@ class TestEnvInjection(unittest.TestCase):
     ), patch(
       "extensions.business.container_apps.sync.mixin.fixed_volume.provision",
       side_effect=lambda vol, **_kwargs: vol,
+    ), patch(
+      "extensions.business.container_apps.sync.mixin.os.chown",
     ):
       plugin._configure_system_volume()
 
@@ -270,6 +276,31 @@ class TestEnvInjection(unittest.TestCase):
     self.assertFalse(vsd.is_symlink())
     self.assertEqual(os.stat(vsd.parent).st_mode & 0o777, 0o755)
     self.assertEqual(os.stat(vsd).st_mode & 0o1000, 0o1000)
+
+  def test_system_volume_ignores_image_owner_and_enforces_root_ownership(self):
+    plugin, _ = _make_plugin(self.tmpdir, role="provider", enabled=True)
+    plugin._resolve_image_owner = lambda: (1000, 1000)
+    seen = {}
+
+    def _provision(vol, **_kwargs):
+      seen["vol"] = vol
+      return vol
+
+    with patch(
+      "extensions.business.container_apps.sync.mixin.fixed_volume._require_tools"
+    ), patch(
+      "extensions.business.container_apps.sync.mixin.fixed_volume.provision",
+      side_effect=_provision,
+    ), patch(
+      "extensions.business.container_apps.sync.mixin.os.chown"
+    ) as chown:
+      plugin._configure_system_volume()
+
+    self.assertIsNone(seen["vol"].owner_uid)
+    self.assertIsNone(seen["vol"].owner_gid)
+    chown.assert_any_call(str(volume_sync_dir(plugin).parent), 0, 0)
+    chown.assert_any_call(str(volume_sync_dir(plugin)), 0, 0)
+    self.assertFalse(plugin._sync_unavailable)
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +440,19 @@ class TestProviderTick(unittest.TestCase):
     response = json.loads((self.vsd / "response.json").read_text())
     self.assertEqual(response["stage"], "r1fs_upload")
 
+  def test_offline_provider_stop_failure_aborts_before_publish(self):
+    self.plugin.stop_result = False
+    self._write_request({"archive_paths": ["/app/data/"]})
+
+    self.plugin._sync_provider_tick(current_time=1000.0)
+
+    self.assertEqual(self.plugin.lifecycle_log, ["stop"])
+    self.assertEqual(self.owner._cs.hset_calls, [])
+    self.assertEqual(self.owner._r1fs.added, {})
+    response = json.loads((self.vsd / "response.json").read_text())
+    self.assertEqual(response["status"], "error")
+    self.assertEqual(response["stage"], "runtime_stop")
+
 
 # ---------------------------------------------------------------------------
 # Consumer tick
@@ -499,7 +543,7 @@ class TestConsumerTick(unittest.TestCase):
 
     def stop_after_apply():
       self.assertEqual(target.read_bytes(), b"new")
-      orig_stop()
+      return orig_stop()
 
     self.consumer_plugin.stop_container = stop_after_apply
     self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
@@ -612,13 +656,43 @@ class TestConsumerTick(unittest.TestCase):
       },
     }
     self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
-    # We did stop — that's fine; we restart even on apply failure.
-    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"])
+    self.assertEqual(self.consumer_plugin.lifecycle_log, [])
     # No last_apply written
     self.assertFalse(
       (volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists()
     )
     # No history advance
+    self.assertEqual(
+      len(list(history_received_dir(self.consumer_plugin).glob("*.json"))), 0
+    )
+
+  def test_non_dict_manifest_skips_without_restart(self):
+    self.consumer_owner._cs.store[("CHAINSTORE_SYNC", "SYNC-KEY-1")] = {
+      "cid": "QmFAKE_BAD_MANIFEST",
+      "version": 9999999999,
+      "timestamp": 1.0,
+      "node_id": "ee_other",
+      "metadata": {},
+      "manifest": "not-an-object",
+    }
+
+    self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+
+    self.assertEqual(self.consumer_plugin.lifecycle_log, [])
+    self.assertFalse(
+      (volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists()
+    )
+
+  def test_offline_consumer_stop_failure_aborts_before_apply(self):
+    self._publish(content=b"new-data")
+    self.consumer_plugin.stop_result = False
+
+    self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop"])
+    self.assertFalse(
+      (volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists()
+    )
     self.assertEqual(
       len(list(history_received_dir(self.consumer_plugin).glob("*.json"))), 0
     )
