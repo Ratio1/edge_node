@@ -250,8 +250,8 @@ consumers apply according to their own `CONSUMER_APPLY_MODE`:
 | Mode | Behavior |
 |------|----------|
 | `offline_restart` | Stop container, apply snapshot, restart container. Default. |
-| `online_no_restart` | Apply while the container remains running. |
-| `online_restart` | Apply while running, then restart the container. |
+| `online_no_restart` | Accepted for compatibility, but currently forced to `offline_restart` for filesystem safety. |
+| `online_restart` | Accepted for compatibility, but currently forced to `offline_restart` for filesystem safety. |
 
 Published manifests include `schema_version`, `archive_format`, `encryption`,
 and `archive_paths`. Consumers validate these before downloading/applying a CID.

@@ -520,36 +520,45 @@ class TestConsumerTick(unittest.TestCase):
     target = self.consumer_owner._fixed_root / "appdata" / "weights.bin"
     self.assertEqual(target.read_bytes(), b"data1")
 
-  def test_consumer_online_no_restart_applies_without_lifecycle_stop_start(self):
+  def test_consumer_online_no_restart_falls_back_to_offline_restart(self):
     self.consumer_owner.cfg_sync["CONSUMER_APPLY_MODE"] = "online_no_restart"
     self._publish(runtime={"consumer_apply": "online_no_restart"})
 
     self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
 
-    self.assertEqual(self.consumer_plugin.runtime_stop_calls, 0)
-    self.assertEqual(self.consumer_plugin.start_calls, 0)
-    self.assertEqual(self.consumer_plugin.lifecycle_log, [])
+    self.assertEqual(self.consumer_plugin.runtime_stop_calls, 1)
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"])
+    self.assertEqual(
+      self.consumer_plugin._sync_last_apply_mode_resolution,
+      {
+        "requested_mode": "online_no_restart",
+        "effective_mode": "offline_restart",
+        "reason": "online_apply_disabled",
+      },
+    )
     target = self.consumer_owner._fixed_root / "appdata" / "weights.bin"
     self.assertEqual(target.read_bytes(), b"data1")
     self.assertTrue((volume_sync_dir(self.consumer_plugin) / "last_apply.json").exists())
 
-  def test_consumer_online_restart_applies_before_restart(self):
+  def test_consumer_online_restart_falls_back_to_offline_restart(self):
     self.consumer_owner.cfg_sync["CONSUMER_APPLY_MODE"] = "online_restart"
     target = self.consumer_owner._fixed_root / "appdata" / "weights.bin"
     target.write_bytes(b"old")
     self._publish(content=b"new", runtime={"consumer_apply": "online_restart"})
 
-    orig_stop = self.consumer_plugin.stop_container
-
-    def stop_after_apply():
-      self.assertEqual(target.read_bytes(), b"new")
-      return orig_stop()
-
-    self.consumer_plugin.stop_container = stop_after_apply
     self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
 
     self.assertEqual(self.consumer_plugin.runtime_stop_calls, 1)
     self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop", "start", "reset"])
+    self.assertEqual(target.read_bytes(), b"new")
+    self.assertEqual(
+      self.consumer_plugin._sync_last_apply_mode_resolution,
+      {
+        "requested_mode": "online_restart",
+        "effective_mode": "offline_restart",
+        "reason": "online_apply_disabled",
+      },
+    )
 
   def test_provider_record_cannot_force_consumer_online_apply(self):
     self._publish(runtime={"consumer_apply": "online_no_restart"})

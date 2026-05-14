@@ -498,7 +498,9 @@ class _SyncMixin:
     Provider-published records may carry the requester's desired
     ``runtime.consumer_apply`` for audit/UI purposes, but lifecycle safety is
     decided by the consumer node. A provider must not be able to force a
-    running consumer to hot-apply files without local operator opt-in.
+    running consumer to hot-apply files. Online consumer modes are accepted for
+    compatibility but normalized to offline restart until extraction is
+    descriptor-safe against app-side path races.
     """
     mode = self._sync_cfg().get("CONSUMER_APPLY_MODE", CONSUMER_APPLY_OFFLINE_RESTART)
     allowed = {
@@ -512,7 +514,29 @@ class _SyncMixin:
         f"{CONSUMER_APPLY_OFFLINE_RESTART!r}",
         color="y",
       )
+      self._sync_last_apply_mode_resolution = {
+        "requested_mode": mode,
+        "effective_mode": CONSUMER_APPLY_OFFLINE_RESTART,
+        "reason": "unknown_mode",
+      }
       return CONSUMER_APPLY_OFFLINE_RESTART
+    if mode in {CONSUMER_APPLY_ONLINE_NO_RESTART, CONSUMER_APPLY_ONLINE_RESTART}:
+      self.P(
+        f"[sync] local CONSUMER_APPLY_MODE {mode!r} is currently disabled for "
+        f"filesystem safety; using {CONSUMER_APPLY_OFFLINE_RESTART!r}",
+        color="y",
+      )
+      self._sync_last_apply_mode_resolution = {
+        "requested_mode": mode,
+        "effective_mode": CONSUMER_APPLY_OFFLINE_RESTART,
+        "reason": "online_apply_disabled",
+      }
+      return CONSUMER_APPLY_OFFLINE_RESTART
+    self._sync_last_apply_mode_resolution = {
+      "requested_mode": mode,
+      "effective_mode": mode,
+      "reason": None,
+    }
     return mode
 
   def _sync_record_consumer_apply_mode(self, record: dict) -> str:
