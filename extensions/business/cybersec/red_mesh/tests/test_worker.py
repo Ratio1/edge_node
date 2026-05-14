@@ -13,6 +13,9 @@ from extensions.business.cybersec.red_mesh.graybox.models import (
   GrayboxProbeDefinition,
   GrayboxProbeRunResult,
 )
+from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
+  build_graybox_worker_assignments,
+)
 from extensions.business.cybersec.red_mesh.constants import (
   ScanType, GRAYBOX_PROBE_REGISTRY,
 )
@@ -35,6 +38,10 @@ def _make_job_config(**overrides):
   cfg.excluded_features = []
   cfg.scan_min_delay = 0.0
   cfg.authorized = True
+  assignments, error = build_graybox_worker_assignments(["node-1"])
+  if error is None:
+    for key, value in assignments["node-1"].items():
+      setattr(cfg, key, value)
   for k, v in overrides.items():
     setattr(cfg, k, v)
   return cfg

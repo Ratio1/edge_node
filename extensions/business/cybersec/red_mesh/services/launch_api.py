@@ -27,6 +27,11 @@ from ..graybox.models.target_config import (
 )
 from ..graybox.http_client import validate_target_config_paths
 from ..repositories import JobStateRepository
+from ..graybox.scenario_runtime import (
+  GRAYBOX_ASSIGNMENT_MIRROR,
+  GRAYBOX_DEFAULT_REQUEST_BUDGET,
+  build_graybox_worker_assignments,
+)
 from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
@@ -459,10 +464,29 @@ def build_network_workers(owner, active_peers, start_port, end_port, distributio
   return workers, None
 
 
-def build_webapp_workers(owner, active_peers, target_port):
+def build_webapp_workers(
+  owner,
+  active_peers,
+  target_port,
+  *,
+  graybox_assignment_strategy,
+  request_budget=GRAYBOX_DEFAULT_REQUEST_BUDGET,
+  allow_stateful_probes=False,
+  allow_mirror_stateful=False,
+):
   """Build peer assignments for webapp scans. Every peer gets the same target."""
   if not active_peers:
     return None, validation_error("No workers available for job execution.")
+  assignments, assignment_error = build_graybox_worker_assignments(
+    active_peers,
+    strategy=graybox_assignment_strategy,
+    total_request_budget=request_budget,
+    allow_stateful=allow_stateful_probes,
+    allow_mirror_stateful=allow_mirror_stateful,
+    assignment_revision=1,
+  )
+  if assignment_error:
+    return None, validation_error(assignment_error)
   workers = {}
   for address in active_peers:
     workers[address] = {
@@ -470,6 +494,7 @@ def build_webapp_workers(owner, active_peers, target_port):
       "end_port": target_port,
       "finished": False,
       "result": None,
+      **assignments[address],
     }
   return workers, None
 
@@ -517,6 +542,7 @@ def announce_launch(
   engagement_metadata,
   target_allowlist,
   safety_policy,
+  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_MIRROR,
   engagement=None,
   roe=None,
   authorization=None,
@@ -586,6 +612,7 @@ def announce_launch(
     verify_tls=verify_tls,
     target_config=target_config,
     allow_stateful_probes=allow_stateful_probes,
+    graybox_assignment_strategy=graybox_assignment_strategy,
     engagement=engagement,
     roe=roe,
     authorization=authorization,
@@ -932,6 +959,8 @@ def launch_webapp_scan(
   # OWASP API Top 10 — Subphase 1.7. When set, overrides
   # `target_config.api_security.max_total_requests` for the scan.
   request_budget=None,
+  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+  allow_mirror_stateful=False,
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
 
@@ -1052,8 +1081,21 @@ def launch_webapp_scan(
   )
   if config_error:
     return config_error
+  effective_request_budget = (
+    request_budget
+    or typed_target_config.api_security.max_total_requests
+    or GRAYBOX_DEFAULT_REQUEST_BUDGET
+  )
 
-  workers, worker_error = build_webapp_workers(owner, active_peers, target_port)
+  workers, worker_error = build_webapp_workers(
+    owner,
+    active_peers,
+    target_port,
+    graybox_assignment_strategy=graybox_assignment_strategy,
+    request_budget=effective_request_budget,
+    allow_stateful_probes=allow_stateful_probes,
+    allow_mirror_stateful=allow_mirror_stateful,
+  )
   if worker_error:
     return worker_error
 
@@ -1093,6 +1135,7 @@ def launch_webapp_scan(
     verify_tls=verify_tls,
     target_config=target_config,
     allow_stateful_probes=allow_stateful_probes,
+    graybox_assignment_strategy=graybox_assignment_strategy,
     target_confirmation=authorization_context["target_confirmation"],
     scope_id=authorization_context["scope_id"],
     authorization_ref=authorization_context["authorization_ref"],
@@ -1157,6 +1200,8 @@ def launch_test(
   regular_bearer_refresh_token="",
   target_config_secrets=None,
   request_budget=None,
+  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+  allow_mirror_stateful=False,
   target_confirmation="",
   scope_id="",
   authorization_ref="",
@@ -1208,6 +1253,8 @@ def launch_test(
       regular_bearer_refresh_token=regular_bearer_refresh_token,
       target_config_secrets=target_config_secrets,
       request_budget=request_budget,
+      graybox_assignment_strategy=graybox_assignment_strategy,
+      allow_mirror_stateful=allow_mirror_stateful,
       target_confirmation=target_confirmation,
       scope_id=scope_id,
       authorization_ref=authorization_ref,

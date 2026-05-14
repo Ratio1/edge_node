@@ -15,6 +15,7 @@ from .auth import AuthManager
 from .discovery import DiscoveryModule
 from .http_client import GrayboxHttpClient
 from .safety import SafetyControls
+from .scenario_runtime import GrayboxWorkerAssignment
 from .models import (
   DiscoveryResult,
   GrayboxCredentialSet,
@@ -109,14 +110,19 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.target_config = GrayboxTargetConfig.from_dict(
       job_config.target_config or {}
     )
+    self.assignment = GrayboxWorkerAssignment.from_job_config(job_config)
 
     # OWASP API Top 10 — Subphase 1.7. Per-scan request budget shared by
     # every probe instance. Default 1000; configurable via
     # `target_config.api_security.max_total_requests`.
     from .budget import RequestBudget
-    budget_total = max(1, int(getattr(
-      self.target_config.api_security, "max_total_requests", 1000,
-    )))
+    if self.assignment.is_valid:
+      budget_total = self.assignment.assigned_request_budget
+    else:
+      budget_total = getattr(
+        self.target_config.api_security, "max_total_requests", 1000,
+      )
+    budget_total = max(1, int(budget_total))
     self.request_budget = RequestBudget(
       remaining=budget_total, total=budget_total,
     )
@@ -167,6 +173,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "aborted": False,
       "abort_reason": "",
       "abort_phase": "",
+      "graybox_assignment": (
+        self.assignment.to_dict() if self.assignment.is_valid else {}
+      ),
     }
     # _phase_open is only touched on the worker thread — no cross-thread
     # reads. Guards the finally clause from double-closing a phase that
@@ -321,6 +330,13 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.metrics.phase_start("preflight")
     self._phase_open = True
     try:
+      if not self.assignment.is_valid:
+        self._abort(
+          "Invalid graybox worker assignment: "
+          + self.assignment.validation_error,
+          reason_class="assignment_invalid",
+        )
+
       target_error = self.safety.validate_target(
         self.target_url, self.job_config.authorized,
       )
@@ -410,7 +426,9 @@ class GrayboxLocalWorker(BaseLocalWorker):
       regular_username=self._credentials.regular.username if self._credentials.regular else "",
       allow_stateful=self.job_config.allow_stateful_probes,
       request_budget=self.request_budget,
-      allowed_scenario_ids=tuple(allowed_scenario_ids) if allowed_scenario_ids else None,
+      allowed_scenario_ids=(
+        None if allowed_scenario_ids is None else tuple(allowed_scenario_ids)
+      ),
     )
 
   def _run_probe_phase(self, discovery_result: DiscoveryResult):

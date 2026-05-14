@@ -100,6 +100,13 @@ class JobConfig:
   verify_tls: bool = True             # TLS cert verification
   target_config: dict = None          # GrayboxTargetConfig.to_dict()
   allow_stateful_probes: bool = False # gate for A06 workflow probes
+  graybox_assignment_strategy: str = "MIRROR"
+  assigned_scenario_ids: list = None
+  assigned_request_budget: int = 0
+  budget_scope: str = ""
+  assignment_revision: int = 0
+  assignment_hash: str = ""
+  stateful_policy: str = ""
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -167,6 +174,13 @@ class JobConfig:
       verify_tls=d.get("verify_tls", True),
       target_config=d.get("target_config"),
       allow_stateful_probes=d.get("allow_stateful_probes", False),
+      graybox_assignment_strategy=d.get("graybox_assignment_strategy", "MIRROR"),
+      assigned_scenario_ids=d.get("assigned_scenario_ids"),
+      assigned_request_budget=d.get("assigned_request_budget", 0),
+      budget_scope=d.get("budget_scope", ""),
+      assignment_revision=d.get("assignment_revision", 0),
+      assignment_hash=d.get("assignment_hash", ""),
+      stateful_policy=d.get("stateful_policy", ""),
       engagement=d.get("engagement"),
       roe=d.get("roe"),
       authorization=d.get("authorization"),

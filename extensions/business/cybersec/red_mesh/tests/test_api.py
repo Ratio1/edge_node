@@ -5,6 +5,9 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.constants import JOB_ARCHIVE_VERSION, MAX_CONTINUOUS_PASSES
+from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
+  runtime_scenario_ids,
+)
 from extensions.business.cybersec.red_mesh.models import CStoreJobRunning
 
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
@@ -306,6 +309,59 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(workers["node-1"]["end_port"], 443)
     self.assertEqual(workers["node-2"]["start_port"], 443)
     self.assertEqual(workers["node-2"]["end_port"], 443)
+    self.assertEqual(
+      workers["node-1"]["assigned_scenario_ids"],
+      list(runtime_scenario_ids()),
+    )
+    self.assertEqual(
+      workers["node-2"]["assigned_scenario_ids"],
+      list(runtime_scenario_ids()),
+    )
+    self.assertEqual(workers["node-1"]["budget_scope"], "per_worker")
+    self.assertTrue(workers["node-1"]["assignment_hash"])
+
+  def test_launch_webapp_scan_can_slice_api_scenarios_between_workers(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-slice")
+    plugin.chainstore_peers = ["node-1", "node-2", "node-3"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2", "node-3"]
+
+    result = self._launch_webapp(
+      plugin,
+      selected_peers=["node-1", "node-2", "node-3"],
+      graybox_assignment_strategy="SLICE",
+      request_budget=30,
+    )
+    self.assertNotIn("error", result)
+
+    job_specs = self._extract_job_specs(plugin, "test-job-webapp-slice")
+    workers = job_specs["workers"]
+    assigned_sets = [
+      set(workers[node]["assigned_scenario_ids"])
+      for node in ("node-1", "node-2", "node-3")
+    ]
+    self.assertEqual(set().union(*assigned_sets), set(runtime_scenario_ids()))
+    self.assertFalse(assigned_sets[0] & assigned_sets[1])
+    self.assertFalse(assigned_sets[0] & assigned_sets[2])
+    self.assertFalse(assigned_sets[1] & assigned_sets[2])
+    self.assertEqual(
+      sum(workers[node]["assigned_request_budget"] for node in workers),
+      30,
+    )
+    self.assertEqual({workers[node]["budget_scope"] for node in workers}, {"per_scan"})
+
+  def test_launch_webapp_scan_rejects_mirror_stateful_multi_worker(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-stateful")
+    plugin.chainstore_peers = ["node-1", "node-2"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2"]
+
+    result = self._launch_webapp(
+      plugin,
+      selected_peers=["node-1", "node-2"],
+      allow_stateful_probes=True,
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("MIRROR with stateful", result["message"])
 
   def test_launch_webapp_scan_neutralizes_network_only_fields(self):
     """Webapp config does not persist bogus network defaults like exceptions='64297'."""

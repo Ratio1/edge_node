@@ -24,6 +24,13 @@ from extensions.business.cybersec.red_mesh.graybox.scenario_catalog import (
   GRAYBOX_SCENARIO_CATALOG,
 )
 from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
+  GRAYBOX_ASSIGNMENT_MIRROR,
+  GRAYBOX_ASSIGNMENT_SLICE,
+  GRAYBOX_BUDGET_PER_SCAN,
+  GRAYBOX_BUDGET_PER_WORKER,
+  GrayboxWorkerAssignment,
+  build_graybox_worker_assignments,
+  compute_assignment_hash,
   runtime_scenario_ids,
   runtime_scenarios,
 )
@@ -126,7 +133,20 @@ def _make_worker(*, assigned_scenario_ids=None):
   cfg.regular_bearer_token = ""
   cfg.regular_bearer_refresh_token = ""
   cfg.regular_api_key = ""
-  cfg.assigned_scenario_ids = assigned_scenario_ids
+  assignments, error = build_graybox_worker_assignments(["node-1"])
+  if error is None:
+    for key, value in assignments["node-1"].items():
+      setattr(cfg, key, value)
+  if assigned_scenario_ids is not None:
+    cfg.assigned_scenario_ids = list(assigned_scenario_ids)
+    cfg.assignment_hash = compute_assignment_hash(
+      strategy=cfg.graybox_assignment_strategy,
+      assigned_scenario_ids=cfg.assigned_scenario_ids,
+      assigned_request_budget=cfg.assigned_request_budget,
+      budget_scope=cfg.budget_scope,
+      assignment_revision=cfg.assignment_revision,
+      stateful_policy=cfg.stateful_policy,
+    )
 
   with patch("extensions.business.cybersec.red_mesh.graybox.worker.SafetyControls"):
     with patch("extensions.business.cybersec.red_mesh.graybox.worker.AuthManager"):
@@ -169,6 +189,60 @@ class TestRuntimeScenarioManifest(unittest.TestCase):
       )
 
 
+class TestGrayboxWorkerAssignments(unittest.TestCase):
+
+  def test_slice_assignments_are_disjoint_and_budgeted_per_scan(self):
+    assignments, error = build_graybox_worker_assignments(
+      ["node-a", "node-b", "node-c"],
+      strategy=GRAYBOX_ASSIGNMENT_SLICE,
+      total_request_budget=30,
+    )
+
+    self.assertIsNone(error)
+    assigned_sets = [
+      set(assignments[node]["assigned_scenario_ids"])
+      for node in ("node-a", "node-b", "node-c")
+    ]
+    for left_index, left in enumerate(assigned_sets):
+      for right in assigned_sets[left_index + 1:]:
+        self.assertFalse(left & right)
+    union = set().union(*assigned_sets)
+    self.assertEqual(union, set(runtime_scenario_ids()))
+    self.assertEqual(
+      {assignments[node]["budget_scope"] for node in assignments},
+      {GRAYBOX_BUDGET_PER_SCAN},
+    )
+    self.assertEqual(
+      sum(assignments[node]["assigned_request_budget"] for node in assignments),
+      30,
+    )
+
+  def test_mirror_assignments_are_full_and_budgeted_per_worker(self):
+    assignments, error = build_graybox_worker_assignments(
+      ["node-a", "node-b", "node-c"],
+      strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+      total_request_budget=30,
+    )
+
+    self.assertIsNone(error)
+    expected = list(runtime_scenario_ids())
+    for assignment in assignments.values():
+      self.assertEqual(assignment["assigned_scenario_ids"], expected)
+      self.assertEqual(assignment["assigned_request_budget"], 30)
+      self.assertEqual(assignment["budget_scope"], GRAYBOX_BUDGET_PER_WORKER)
+      self.assertTrue(assignment["assignment_hash"])
+
+  def test_mirror_stateful_multi_worker_requires_override(self):
+    assignments, error = build_graybox_worker_assignments(
+      ["node-a", "node-b"],
+      strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+      allow_stateful=True,
+    )
+
+    self.assertIsNone(assignments)
+    self.assertIn("MIRROR with stateful", error)
+
+
 class TestScenarioAssignmentGates(unittest.TestCase):
 
   def test_unassigned_api_auth_scenarios_make_zero_http_calls(self):
@@ -188,6 +262,22 @@ class TestScenarioAssignmentGates(unittest.TestCase):
     context = worker._build_probe_kwargs(DiscoveryResult())
 
     self.assertEqual(context.allowed_scenario_ids, ("PT-OAPI2-02",))
+
+  def test_invalid_assignment_aborts_before_target_preflight(self):
+    worker = _make_worker()
+    worker.assignment = GrayboxWorkerAssignment.invalid(
+      "missing_assigned_scenario_ids",
+    )
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+
+    worker.execute_job()
+
+    self.assertTrue(worker.state["aborted"])
+    self.assertEqual(worker.state["abort_phase"], "preflight")
+    self.assertIn("missing_assigned_scenario_ids", worker.state["abort_reason"])
+    worker.safety.validate_target.assert_not_called()
+    worker.auth.preflight_check.assert_not_called()
 
 
 if __name__ == "__main__":

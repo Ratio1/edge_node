@@ -38,6 +38,12 @@ class CStoreWorker:
   terminal_reason: str = None
   error: str = None
   unreachable_at: float = None
+  graybox_assignment_strategy: str = None
+  assigned_scenario_ids: list = None
+  assigned_request_budget: int = None
+  budget_scope: str = None
+  assignment_hash: str = None
+  stateful_policy: str = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -59,6 +65,12 @@ class CStoreWorker:
       terminal_reason=d.get("terminal_reason"),
       error=d.get("error"),
       unreachable_at=d.get("unreachable_at"),
+      graybox_assignment_strategy=d.get("graybox_assignment_strategy"),
+      assigned_scenario_ids=d.get("assigned_scenario_ids"),
+      assigned_request_budget=d.get("assigned_request_budget"),
+      budget_scope=d.get("budget_scope"),
+      assignment_hash=d.get("assignment_hash"),
+      stateful_policy=d.get("stateful_policy"),
     )
 
 

@@ -5,6 +5,9 @@ from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
+from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
+  build_graybox_worker_assignments,
+)
 from extensions.business.cybersec.red_mesh.worker import PentestLocalWorker
 from extensions.business.cybersec.red_mesh.constants import ScanType
 
@@ -423,6 +426,9 @@ class TestLaunchValidation(unittest.TestCase):
           cfg.target_config = None
           cfg.verify_tls = True
           cfg.scan_min_delay = 0
+          assignments, _error = build_graybox_worker_assignments(["node-1"])
+          for key, value in assignments["node-1"].items():
+            setattr(cfg, key, value)
           worker = GrayboxLocalWorker(
             owner=MagicMock(),
             job_id="j1",
@@ -455,6 +461,9 @@ class TestLaunchValidation(unittest.TestCase):
           cfg.regular_password = ""
           cfg.weak_candidates = None
           cfg.app_routes = None
+          assignments, _error = build_graybox_worker_assignments(["node-1"])
+          for key, value in assignments["node-1"].items():
+            setattr(cfg, key, value)
 
           worker = GrayboxLocalWorker(
             owner=MagicMock(),
