@@ -29,8 +29,10 @@ from ..graybox.http_client import validate_target_config_paths
 from ..repositories import JobStateRepository
 from ..graybox.scenario_runtime import (
   GRAYBOX_ASSIGNMENT_MIRROR,
+  GRAYBOX_ASSIGNMENT_SLICE,
   GRAYBOX_DEFAULT_REQUEST_BUDGET,
   build_graybox_worker_assignments,
+  summarize_graybox_worker_assignments,
 )
 from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
@@ -618,6 +620,7 @@ def build_webapp_workers(
   request_budget=GRAYBOX_DEFAULT_REQUEST_BUDGET,
   allow_stateful_probes=False,
   allow_mirror_stateful=False,
+  allow_mirror_per_worker_budget=False,
 ):
   """Build peer assignments for webapp scans. Every peer gets the same target."""
   if not active_peers:
@@ -628,6 +631,7 @@ def build_webapp_workers(
     total_request_budget=request_budget,
     allow_stateful=allow_stateful_probes,
     allow_mirror_stateful=allow_mirror_stateful,
+    allow_mirror_per_worker_budget=allow_mirror_per_worker_budget,
     assignment_revision=1,
   )
   if assignment_error:
@@ -687,7 +691,7 @@ def announce_launch(
   engagement_metadata,
   target_allowlist,
   safety_policy,
-  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_SLICE,
   engagement=None,
   roe=None,
   authorization=None,
@@ -785,6 +789,7 @@ def announce_launch(
     owner.P("Failed to store job config in R1FS — aborting launch", color='r')
     return {"error": "Failed to store job config in R1FS"}
 
+  assignment_summary = summarize_graybox_worker_assignments(workers) if scan_type == ScanType.WEBAPP.value else {}
   job_specs = CStoreJobRunning(
     job_id=job_id,
     job_status=JOB_STATUS_RUNNING,
@@ -805,6 +810,7 @@ def announce_launch(
     pass_reports=[],
     next_pass_at=None,
     risk_score=0,
+    graybox_assignment_summary=assignment_summary or None,
   ).to_dict()
   owner._emit_timeline_event(
     job_specs, "created",
@@ -1104,8 +1110,9 @@ def launch_webapp_scan(
   # OWASP API Top 10 — Subphase 1.7. When set, overrides
   # `target_config.api_security.max_total_requests` for the scan.
   request_budget=None,
-  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_SLICE,
   allow_mirror_stateful=False,
+  allow_mirror_per_worker_budget=False,
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
 
@@ -1255,6 +1262,7 @@ def launch_webapp_scan(
     request_budget=effective_request_budget,
     allow_stateful_probes=allow_stateful_probes,
     allow_mirror_stateful=allow_mirror_stateful,
+    allow_mirror_per_worker_budget=allow_mirror_per_worker_budget,
   )
   if worker_error:
     return worker_error
@@ -1360,8 +1368,9 @@ def launch_test(
   regular_bearer_refresh_token="",
   target_config_secrets=None,
   request_budget=None,
-  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_SLICE,
   allow_mirror_stateful=False,
+  allow_mirror_per_worker_budget=False,
   target_confirmation="",
   scope_id="",
   authorization_ref="",
@@ -1415,6 +1424,7 @@ def launch_test(
       request_budget=request_budget,
       graybox_assignment_strategy=graybox_assignment_strategy,
       allow_mirror_stateful=allow_mirror_stateful,
+      allow_mirror_per_worker_budget=allow_mirror_per_worker_budget,
       target_confirmation=target_confirmation,
       scope_id=scope_id,
       authorization_ref=authorization_ref,

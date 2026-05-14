@@ -295,8 +295,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
     job_specs = self._extract_job_specs(plugin, "test-job-5")
     self.assertIsNone(job_specs)
 
-  def test_launch_webapp_scan_uses_mirrored_worker_assignments(self):
-    """Webapp launches assign the same resolved target port to every selected peer."""
+  def test_launch_webapp_scan_default_slices_api_scenarios(self):
+    """B5: webapp launches default to SLICE so the per-scan budget stays per-scan."""
     plugin = self._build_mock_plugin(job_id="test-job-webapp")
     plugin.chainstore_peers = ["node-1", "node-2"]
     plugin.cfg_chainstore_peers = ["node-1", "node-2"]
@@ -306,20 +306,66 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     job_specs = self._extract_job_specs(plugin, "test-job-webapp")
     workers = job_specs["workers"]
-    self.assertEqual(workers["node-1"]["start_port"], 443)
-    self.assertEqual(workers["node-1"]["end_port"], 443)
-    self.assertEqual(workers["node-2"]["start_port"], 443)
-    self.assertEqual(workers["node-2"]["end_port"], 443)
-    self.assertEqual(
-      workers["node-1"]["assigned_scenario_ids"],
-      list(runtime_scenario_ids()),
-    )
-    self.assertEqual(
-      workers["node-2"]["assigned_scenario_ids"],
-      list(runtime_scenario_ids()),
-    )
-    self.assertEqual(workers["node-1"]["budget_scope"], "per_worker")
+    self.assertEqual(workers["node-1"]["graybox_assignment_strategy"], "SLICE")
+    self.assertEqual(workers["node-2"]["graybox_assignment_strategy"], "SLICE")
+    self.assertEqual({workers[node]["budget_scope"] for node in workers}, {"per_scan"})
     self.assertTrue(workers["node-1"]["assignment_hash"])
+
+  def test_launch_webapp_scan_explicit_mirror_divides_budget_without_opt_in(self):
+    """Multi-worker MIRROR without per-worker opt-in must divide the budget."""
+    plugin = self._build_mock_plugin(job_id="test-job-mirror-div")
+    plugin.chainstore_peers = ["node-1", "node-2"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2"]
+
+    result = self._launch_webapp(
+      plugin,
+      selected_peers=["node-1", "node-2"],
+      graybox_assignment_strategy="MIRROR",
+      request_budget=40,
+    )
+    self.assertNotIn("error", result)
+
+    workers = self._extract_job_specs(plugin, "test-job-mirror-div")["workers"]
+    self.assertEqual({workers[n]["budget_scope"] for n in workers}, {"per_scan"})
+    self.assertEqual(
+      sum(workers[n]["assigned_request_budget"] for n in workers),
+      40,
+    )
+
+  def test_launch_webapp_scan_explicit_mirror_per_worker_with_opt_in(self):
+    """MIRROR + multi-worker + allow_mirror_per_worker_budget=True keeps per-worker budget."""
+    plugin = self._build_mock_plugin(job_id="test-job-mirror-pw")
+    plugin.chainstore_peers = ["node-1", "node-2"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2"]
+
+    result = self._launch_webapp(
+      plugin,
+      selected_peers=["node-1", "node-2"],
+      graybox_assignment_strategy="MIRROR",
+      request_budget=40,
+      allow_mirror_per_worker_budget=True,
+    )
+    self.assertNotIn("error", result)
+
+    workers = self._extract_job_specs(plugin, "test-job-mirror-pw")["workers"]
+    self.assertEqual({workers[n]["budget_scope"] for n in workers}, {"per_worker"})
+    self.assertEqual(workers["node-1"]["assigned_request_budget"], 40)
+    self.assertEqual(workers["node-2"]["assigned_request_budget"], 40)
+
+  def test_launch_webapp_scan_emits_top_level_assignment_summary(self):
+    plugin = self._build_mock_plugin(job_id="test-job-summary")
+    plugin.chainstore_peers = ["node-1", "node-2"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2"]
+
+    result = self._launch_webapp(plugin, selected_peers=["node-1", "node-2"])
+    self.assertNotIn("error", result)
+
+    summary = self._extract_job_specs(plugin, "test-job-summary").get("graybox_assignment_summary")
+    self.assertIsNotNone(summary)
+    self.assertEqual(summary["graybox_assignment_strategy"], "SLICE")
+    self.assertEqual(summary["budget_scope"], "per_scan")
+    self.assertGreater(summary["total_assigned_scenarios"], 0)
+    self.assertEqual(len(summary["worker_assignment_summary"]), 2)
 
   def test_launch_webapp_scan_can_slice_api_scenarios_between_workers(self):
     plugin = self._build_mock_plugin(job_id="test-job-webapp-slice")
@@ -359,6 +405,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       plugin,
       selected_peers=["node-1", "node-2"],
       allow_stateful_probes=True,
+      graybox_assignment_strategy="MIRROR",
     )
 
     self.assertEqual(result["error"], "validation_error")

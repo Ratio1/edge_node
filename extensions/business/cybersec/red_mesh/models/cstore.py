@@ -128,6 +128,7 @@ class CStoreJobRunning:
   stix_export: dict = None
   opencti_export: dict = None
   taxii_export: dict = None
+  graybox_assignment_summary: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -162,6 +163,7 @@ class CStoreJobRunning:
       stix_export=d.get("stix_export"),
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
+      graybox_assignment_summary=d.get("graybox_assignment_summary"),
     )
 
 
@@ -198,6 +200,7 @@ class CStoreJobFinalized:
   stix_export: dict = None
   opencti_export: dict = None
   taxii_export: dict = None
+  graybox_assignment_summary: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -230,6 +233,7 @@ class CStoreJobFinalized:
       stix_export=d.get("stix_export"),
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
+      graybox_assignment_summary=d.get("graybox_assignment_summary"),
     )
 
 

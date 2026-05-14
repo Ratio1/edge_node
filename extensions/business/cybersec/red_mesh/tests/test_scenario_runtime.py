@@ -34,6 +34,7 @@ from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
   compute_assignment_hash,
   runtime_scenario_ids,
   runtime_scenarios,
+  summarize_graybox_worker_assignments,
 )
 from extensions.business.cybersec.red_mesh.graybox.worker import (
   GrayboxLocalWorker,
@@ -225,7 +226,8 @@ class TestGrayboxWorkerAssignments(unittest.TestCase):
       30,
     )
 
-  def test_mirror_assignments_are_full_and_budgeted_per_worker(self):
+  def test_mirror_multi_worker_default_divides_budget(self):
+    """B5: multi-worker MIRROR without opt-in divides the per-scan budget."""
     assignments, error = build_graybox_worker_assignments(
       ["node-a", "node-b", "node-c"],
       strategy=GRAYBOX_ASSIGNMENT_MIRROR,
@@ -236,9 +238,37 @@ class TestGrayboxWorkerAssignments(unittest.TestCase):
     expected = list(runtime_scenario_ids())
     for assignment in assignments.values():
       self.assertEqual(assignment["assigned_scenario_ids"], expected)
+      self.assertEqual(assignment["budget_scope"], GRAYBOX_BUDGET_PER_SCAN)
+    self.assertEqual(
+      sum(a["assigned_request_budget"] for a in assignments.values()),
+      30,
+    )
+
+  def test_mirror_multi_worker_per_worker_budget_with_explicit_opt_in(self):
+    assignments, error = build_graybox_worker_assignments(
+      ["node-a", "node-b", "node-c"],
+      strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+      total_request_budget=30,
+      allow_mirror_per_worker_budget=True,
+    )
+
+    self.assertIsNone(error)
+    for assignment in assignments.values():
       self.assertEqual(assignment["assigned_request_budget"], 30)
       self.assertEqual(assignment["budget_scope"], GRAYBOX_BUDGET_PER_WORKER)
-      self.assertTrue(assignment["assignment_hash"])
+
+  def test_mirror_single_worker_keeps_per_worker_budget(self):
+    """Single-worker MIRROR is meaningfully per-worker (no traffic multiplier)."""
+    assignments, error = build_graybox_worker_assignments(
+      ["node-a"],
+      strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+      total_request_budget=30,
+    )
+
+    self.assertIsNone(error)
+    a = assignments["node-a"]
+    self.assertEqual(a["assigned_request_budget"], 30)
+    self.assertEqual(a["budget_scope"], GRAYBOX_BUDGET_PER_WORKER)
 
   def test_mirror_stateful_multi_worker_requires_override(self):
     assignments, error = build_graybox_worker_assignments(
@@ -249,6 +279,41 @@ class TestGrayboxWorkerAssignments(unittest.TestCase):
 
     self.assertIsNone(assignments)
     self.assertIn("MIRROR with stateful", error)
+
+  def test_summary_aggregates_consistent_worker_assignments(self):
+    """B5: job-level summary surfaces strategy/budget/scope/scenarios for the dashboard."""
+    assignments, error = build_graybox_worker_assignments(
+      ["node-a", "node-b"],
+      strategy=GRAYBOX_ASSIGNMENT_SLICE,
+      total_request_budget=30,
+    )
+    self.assertIsNone(error)
+    summary = summarize_graybox_worker_assignments(assignments)
+    self.assertEqual(summary["graybox_assignment_strategy"], GRAYBOX_ASSIGNMENT_SLICE)
+    self.assertEqual(summary["budget_scope"], GRAYBOX_BUDGET_PER_SCAN)
+    self.assertEqual(summary["assigned_request_budget"], 30)
+    self.assertEqual(summary["total_assigned_scenarios"], len(runtime_scenario_ids()))
+    self.assertEqual(len(summary["worker_assignment_summary"]), 2)
+
+  def test_summary_marks_mixed_when_workers_disagree(self):
+    """Manual edits could break the launcher contract; summary records 'mixed' for visibility."""
+    assignments = {
+      "node-a": {
+        "graybox_assignment_strategy": "SLICE",
+        "assigned_request_budget": 15,
+        "budget_scope": "per_scan",
+        "assigned_scenario_ids": ["PT-OAPI1-01"],
+      },
+      "node-b": {
+        "graybox_assignment_strategy": "MIRROR",
+        "assigned_request_budget": 15,
+        "budget_scope": "per_worker",
+        "assigned_scenario_ids": ["PT-OAPI1-02"],
+      },
+    }
+    summary = summarize_graybox_worker_assignments(assignments)
+    self.assertEqual(summary["graybox_assignment_strategy"], "mixed")
+    self.assertEqual(summary["budget_scope"], "mixed")
 
   def test_invalid_request_budget_fails_assignment(self):
     assignments, error = build_graybox_worker_assignments(

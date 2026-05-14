@@ -326,13 +326,21 @@ class GrayboxWorkerAssignment:
 def build_graybox_worker_assignments(
   worker_addresses,
   *,
-  strategy: str = GRAYBOX_ASSIGNMENT_MIRROR,
+  strategy: str = GRAYBOX_ASSIGNMENT_SLICE,
   total_request_budget: int = GRAYBOX_DEFAULT_REQUEST_BUDGET,
   allow_stateful: bool = False,
   allow_mirror_stateful: bool = False,
+  allow_mirror_per_worker_budget: bool = False,
   assignment_revision: int = 1,
 ):
-  """Return launcher-owned per-worker API scenario assignments."""
+  """Return launcher-owned per-worker API scenario assignments.
+
+  Defaults to SLICE so the per-scan request budget is split across
+  workers (PR406 B5). MIRROR remains explicit and, when more than one
+  worker is selected, requires ``allow_mirror_per_worker_budget=True``
+  to acknowledge that total traffic is workers × budget; otherwise the
+  budget is divided across workers (budget_scope=per_scan).
+  """
   addresses = [addr for addr in (worker_addresses or []) if addr]
   if not addresses:
     return None, "No workers available for graybox assignment."
@@ -368,12 +376,30 @@ def build_graybox_worker_assignments(
   stateful_policy = "enabled" if allow_stateful else "disabled"
   assignments = {}
   if strategy == GRAYBOX_ASSIGNMENT_MIRROR:
-    for address in addresses:
+    if len(addresses) > 1 and allow_mirror_per_worker_budget:
+      mirror_budget = total_budget
+      mirror_budget_scope = GRAYBOX_BUDGET_PER_WORKER
+    elif len(addresses) > 1:
+      # Multi-worker MIRROR without explicit per-worker budget opt-in:
+      # divide the per-scan budget across workers so total traffic stays
+      # bounded by max_total_requests instead of workers × budget.
+      base_budget, budget_remainder = divmod(total_budget, len(addresses))
+      mirror_budget = None  # computed per worker below
+      mirror_budget_scope = GRAYBOX_BUDGET_PER_SCAN
+    else:
+      mirror_budget = total_budget
+      mirror_budget_scope = GRAYBOX_BUDGET_PER_WORKER
+
+    for index, address in enumerate(addresses):
+      if mirror_budget is None:
+        assigned_budget = max(1, base_budget + (1 if index < budget_remainder else 0))
+      else:
+        assigned_budget = mirror_budget
       assignment = GrayboxWorkerAssignment(
         strategy=strategy,
         assigned_scenario_ids=scenario_ids,
-        assigned_request_budget=total_budget,
-        budget_scope=GRAYBOX_BUDGET_PER_WORKER,
+        assigned_request_budget=assigned_budget,
+        budget_scope=mirror_budget_scope,
         assignment_revision=assignment_revision,
         assignment_hash="",
         stateful_policy=stateful_policy,
@@ -396,6 +422,59 @@ def build_graybox_worker_assignments(
     )
     assignments[address] = _with_assignment_hash(assignment).to_dict()
   return assignments, None
+
+
+def summarize_graybox_worker_assignments(assignments: dict) -> dict:
+  """Distil per-worker assignments into a job-level summary.
+
+  When all workers agree on strategy/budget_scope, the summary surfaces
+  them directly. When workers disagree (shouldn't happen with the
+  launcher-owned model, but defends against legacy/manual edits), the
+  summary records 'mixed' so the dashboard can flag it.
+  """
+  if not isinstance(assignments, dict) or not assignments:
+    return {}
+  strategies = set()
+  budget_scopes = set()
+  total_budget = 0
+  scenarios: set[str] = set()
+  worker_summary = []
+  for addr, entry in assignments.items():
+    if not isinstance(entry, dict):
+      continue
+    strategy = entry.get("graybox_assignment_strategy") or ""
+    budget_scope = entry.get("budget_scope") or ""
+    assigned_budget = int(entry.get("assigned_request_budget") or 0)
+    assigned_scenarios = list(entry.get("assigned_scenario_ids") or [])
+    if strategy:
+      strategies.add(strategy)
+    if budget_scope:
+      budget_scopes.add(budget_scope)
+    total_budget += assigned_budget
+    scenarios.update(assigned_scenarios)
+    worker_summary.append({
+      "worker_address": addr,
+      "graybox_assignment_strategy": strategy,
+      "assigned_request_budget": assigned_budget,
+      "budget_scope": budget_scope,
+      "assigned_scenario_count": len(assigned_scenarios),
+    })
+
+  if len(strategies) == 1:
+    strategy_value = next(iter(strategies))
+  else:
+    strategy_value = "mixed"
+  if len(budget_scopes) == 1:
+    budget_scope_value = next(iter(budget_scopes))
+  else:
+    budget_scope_value = "mixed"
+  return {
+    "graybox_assignment_strategy": strategy_value,
+    "budget_scope": budget_scope_value,
+    "assigned_request_budget": total_budget,
+    "total_assigned_scenarios": len(scenarios),
+    "worker_assignment_summary": worker_summary,
+  }
 
 
 def _with_assignment_hash(
