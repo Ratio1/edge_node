@@ -301,29 +301,187 @@ class AuthManager:
       path = getattr(auth_desc, "api_logout_path", "") or ""
     return self.target_url + path if path else ""
 
+  def _auth_descriptor(self):
+    api_security = getattr(self.target_config, "api_security", None)
+    if api_security is None:
+      return None
+    return getattr(api_security, "auth", None)
+
+  def _configured_success_statuses(self) -> tuple[int, ...]:
+    auth_desc = self._auth_descriptor()
+    if auth_desc is None:
+      return ()
+    return tuple(getattr(auth_desc, "authenticated_probe_success_statuses", ()) or ())
+
+  def _configured_success_marker(self) -> str:
+    auth_desc = self._auth_descriptor()
+    if auth_desc is None:
+      return ""
+    return str(getattr(auth_desc, "authenticated_probe_success_marker", "") or "")
+
+  def _configured_identity_json_path(self) -> str:
+    auth_desc = self._auth_descriptor()
+    if auth_desc is None:
+      return ""
+    return str(getattr(auth_desc, "authenticated_probe_identity_json_path", "") or "")
+
+  @staticmethod
+  def _traverse_identity_path(payload, path: str):
+    """Safely walk a dotted JSON path.
+
+    Only supports nested dict key lookups (no array indexing, no
+    expressions). Returns None if any segment is missing. The whole
+    traversal is bounded by the depth of the configured path so it
+    cannot be turned into an arbitrary-expression evaluator.
+    """
+    if not path or not isinstance(payload, dict):
+      return None
+    cursor = payload
+    for segment in path.split("."):
+      segment = segment.strip()
+      if not segment or not isinstance(cursor, dict):
+        return None
+      if segment not in cursor:
+        return None
+      cursor = cursor[segment]
+    return cursor
+
+  def _anonymous_control_response(self, method: str, url: str):
+    """Send the same probe request without credentials, no redirects."""
+    try:
+      session = requests.Session()
+      try:
+        return session.request(
+          method, url, timeout=10, allow_redirects=False, verify=self.verify_tls,
+        )
+      finally:
+        try:
+          session.close()
+        except Exception:
+          pass
+    except requests.RequestException:
+      return None
+
   def _validate_authenticated_session(self, session) -> tuple[bool, bool]:
     """Validate token/key sessions after credentials have been attached.
 
-    Bearer/API-key preflight intentionally runs without secret material, so
-    401/403 at that stage only proves the endpoint is protected. This check
-    runs after strategy.authenticate() stamps the session, and treats 401/403
-    as an authentication failure.
+    Tightened in B2 (PR406 remediation): we no longer follow redirects
+    or accept any <400 status, since an invalid bearer token frequently
+    triggers a 302 to a public 200 login page. The flow is:
+
+      1. Send the probe with allow_redirects=False; reject 3xx/401/403.
+      2. Send an anonymous control request to the same path. If the
+         control is also 2xx, require an explicit success assertion
+         (status allow-list, marker, or identity JSON path) before
+         accepting — otherwise the path is effectively public and the
+         configured token tells us nothing.
+      3. If a marker / identity path is configured, both the
+         authenticated AND anonymous responses must agree with the
+         assertion (marker present in authenticated body but missing
+         from anonymous; identity path non-empty when authenticated and
+         empty/missing when anonymous).
     """
     if self._resolve_auth_type() == "form":
       return True, False
     probe_path = self._authenticated_probe_path()
     if not probe_path:
       return True, False
+    method = self._authenticated_probe_method().lower()
+    probe_url = self.target_url + probe_path
     try:
-      method = self._authenticated_probe_method().lower()
       req = getattr(session, method, session.get)
-      resp = req(self.target_url + probe_path, timeout=10, allow_redirects=True)
+      resp = req(probe_url, timeout=10, allow_redirects=False)
     except requests.RequestException:
       return False, True
     status = getattr(resp, "status_code", None)
-    if status is None or status >= 400:
+    if status is None:
       return False, False
+    # Reject redirects (commonly mask invalid tokens) and explicit
+    # authentication failures.
+    if 300 <= status < 400:
+      return False, False
+    if status in (401, 403):
+      return False, False
+    if status >= 400:
+      return False, False
+
+    success_statuses = self._configured_success_statuses()
+    if success_statuses and status not in success_statuses:
+      return False, False
+
+    marker = self._configured_success_marker()
+    identity_path = self._configured_identity_json_path()
+    requires_assertion = bool(marker or identity_path)
+
+    auth_body = self._read_response_body(resp)
+    auth_json = self._read_response_json(resp, auth_body)
+
+    if requires_assertion:
+      if marker and marker not in auth_body:
+        return False, False
+      if identity_path:
+        value = self._traverse_identity_path(auth_json, identity_path)
+        if not value:
+          return False, False
+
+    control = self._anonymous_control_response(method.upper(), probe_url)
+    control_status = getattr(control, "status_code", None) if control is not None else None
+    control_is_success = (
+      control_status is not None and 200 <= control_status < 300
+    )
+
+    if not control_is_success:
+      # Anonymous request was rejected (or transport failed) — the
+      # authenticated 2xx is a meaningful delta. Accept without
+      # requiring a marker.
+      return True, False
+
+    # Anonymous request also got 2xx. The endpoint may be public; we
+    # need an assertion that distinguishes the two responses.
+    if not requires_assertion:
+      return False, False
+    control_body = self._read_response_body(control)
+    control_json = self._read_response_json(control, control_body)
+    if marker and marker in control_body:
+      return False, False
+    if identity_path:
+      anon_value = self._traverse_identity_path(control_json, identity_path)
+      if anon_value:
+        return False, False
     return True, False
+
+  @staticmethod
+  def _read_response_body(resp) -> str:
+    if resp is None:
+      return ""
+    text = getattr(resp, "text", None)
+    if isinstance(text, str):
+      return text
+    content = getattr(resp, "content", b"") or b""
+    if isinstance(content, (bytes, bytearray)):
+      try:
+        return content.decode("utf-8", errors="replace")
+      except Exception:
+        return ""
+    return str(content)
+
+  @staticmethod
+  def _read_response_json(resp, body_text: str):
+    if resp is None:
+      return None
+    json_fn = getattr(resp, "json", None)
+    if callable(json_fn):
+      try:
+        return json_fn()
+      except Exception:
+        pass
+    if not body_text:
+      return None
+    try:
+      import json as _json
+      return _json.loads(body_text)
+    except Exception:
+      return None
 
   def _resolve_auth_type(self) -> str:
     """Return the configured auth_type, defaulting to ``form``.

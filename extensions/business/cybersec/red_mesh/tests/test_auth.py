@@ -269,7 +269,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     session.get.assert_called_once_with(
       "http://api.example/api/me",
       timeout=10,
-      allow_redirects=True,
+      allow_redirects=False,
     )
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
@@ -290,7 +290,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     session.get.assert_called_once_with(
       "http://api.example/api/me",
       timeout=10,
-      allow_redirects=True,
+      allow_redirects=False,
     )
     session.post.assert_not_called()
 
@@ -314,7 +314,7 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     session.post.assert_called_once_with(
       "http://api.example/api/me",
       timeout=10,
-      allow_redirects=True,
+      allow_redirects=False,
     )
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
@@ -354,6 +354,156 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     self.assertIsNone(auth.official_session)
     session.close.assert_called_once()
     self.assertIn("official_login_failed", auth._auth_errors)
+
+
+class TestAuthenticatedSessionHardening(unittest.TestCase):
+  """B2 (PR406 remediation) — tighten bearer/API-key validation.
+
+  Validation must:
+    * use allow_redirects=False so a 302->200 login page can't masquerade
+      as an authenticated 2xx;
+    * reject 3xx/401/403/>=400;
+    * cross-check with an anonymous request and require a marker /
+      identity assertion when both are 2xx.
+  """
+
+  def _build_auth(self, **auth_kwargs):
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor,
+    )
+    desc = AuthDescriptor(**{"auth_type": "bearer", "authenticated_probe_path": "/api/me", **auth_kwargs})
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(auth=desc))
+    return AuthManager("http://api.example", cfg, verify_tls=False)
+
+  def _session_with(self, status, body="", json_value=None, content_type="application/json"):
+    sess = MagicMock()
+    sess.headers = {}
+    sess.params = {}
+    resp = _mock_response(status=status, text=body, content_type=content_type)
+    if json_value is not None:
+      resp.json.return_value = json_value
+    sess.get.return_value = resp
+    sess.head.return_value = resp
+    sess.post.return_value = resp
+    return sess, resp
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_3xx_redirect_to_login_is_rejected(self, mock_auth_requests):
+    auth = self._build_auth()
+    sess, _ = self._session_with(status=302, body="", content_type="text/html")
+    sess.get.return_value.headers = {"location": "/login"}
+    valid, retryable = auth._validate_authenticated_session(sess)
+    self.assertFalse(valid)
+    self.assertFalse(retryable)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_401_is_rejected(self, mock_auth_requests):
+    auth = self._build_auth()
+    sess, _ = self._session_with(status=401)
+    valid, retryable = auth._validate_authenticated_session(sess)
+    self.assertFalse(valid)
+    self.assertFalse(retryable)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_authenticated_2xx_and_anonymous_401_is_accepted(self, mock_auth_requests):
+    """The clean delta case — anonymous request is rejected, no marker required."""
+    auth = self._build_auth()
+    sess, _ = self._session_with(status=200, json_value={"user": "alice"})
+
+    anon_session = MagicMock()
+    anon_resp = _mock_response(status=401)
+    anon_session.request.return_value = anon_resp
+    mock_auth_requests.Session.return_value = anon_session
+    import requests as real_requests
+    mock_auth_requests.RequestException = real_requests.RequestException
+
+    valid, retryable = auth._validate_authenticated_session(sess)
+    self.assertTrue(valid)
+    self.assertFalse(retryable)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_anonymous_also_2xx_without_marker_is_rejected(self, mock_auth_requests):
+    """Endpoint is public — bearer token tells us nothing, must fail."""
+    auth = self._build_auth()
+    sess, _ = self._session_with(status=200, body="welcome")
+
+    anon_session = MagicMock()
+    anon_resp = _mock_response(status=200, text="welcome")
+    anon_session.request.return_value = anon_resp
+    mock_auth_requests.Session.return_value = anon_session
+    import requests as real_requests
+    mock_auth_requests.RequestException = real_requests.RequestException
+
+    valid, retryable = auth._validate_authenticated_session(sess)
+    self.assertFalse(valid)
+    self.assertFalse(retryable)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_marker_only_in_authenticated_response_is_accepted(self, mock_auth_requests):
+    auth = self._build_auth(authenticated_probe_success_marker='"principal":"alice"')
+    sess, _ = self._session_with(
+      status=200, body='{"principal":"alice"}'
+    )
+
+    anon_session = MagicMock()
+    anon_resp = _mock_response(status=200, text='{"public":true}')
+    anon_session.request.return_value = anon_resp
+    mock_auth_requests.Session.return_value = anon_session
+    import requests as real_requests
+    mock_auth_requests.RequestException = real_requests.RequestException
+
+    valid, retryable = auth._validate_authenticated_session(sess)
+    self.assertTrue(valid)
+    self.assertFalse(retryable)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_identity_json_path_distinguishes_authenticated_from_anonymous(self, mock_auth_requests):
+    auth = self._build_auth(authenticated_probe_identity_json_path="user.id")
+    sess, _ = self._session_with(
+      status=200, body="", json_value={"user": {"id": "alice-123"}},
+    )
+
+    anon_session = MagicMock()
+    anon_resp = _mock_response(status=200, text="")
+    anon_resp.json.return_value = {"user": {"id": ""}}
+    anon_session.request.return_value = anon_resp
+    mock_auth_requests.Session.return_value = anon_session
+    import requests as real_requests
+    mock_auth_requests.RequestException = real_requests.RequestException
+
+    valid, retryable = auth._validate_authenticated_session(sess)
+    self.assertTrue(valid)
+    self.assertFalse(retryable)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_identity_json_path_missing_in_authenticated_is_rejected(self, mock_auth_requests):
+    auth = self._build_auth(authenticated_probe_identity_json_path="user.id")
+    sess, _ = self._session_with(status=200, body="", json_value={"user": {}})
+    valid, retryable = auth._validate_authenticated_session(sess)
+    self.assertFalse(valid)
+    self.assertFalse(retryable)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_success_status_allowlist_filters_unexpected_2xx(self, mock_auth_requests):
+    auth = self._build_auth(
+      authenticated_probe_success_statuses=(204,),
+    )
+    sess, _ = self._session_with(status=200)
+    valid, retryable = auth._validate_authenticated_session(sess)
+    self.assertFalse(valid)
+    self.assertFalse(retryable)
+
+  def test_safe_identity_path_traversal_only_dotted_keys(self):
+    """The traversal helper must not evaluate arbitrary expressions."""
+    payload = {"user": {"id": "alice"}}
+    self.assertEqual(AuthManager._traverse_identity_path(payload, "user.id"), "alice")
+    # Missing path returns None
+    self.assertIsNone(AuthManager._traverse_identity_path(payload, "user.missing"))
+    # Non-dict mid-path returns None
+    self.assertIsNone(AuthManager._traverse_identity_path(payload, "user.id.deeper"))
+    # Empty/invalid path returns None
+    self.assertIsNone(AuthManager._traverse_identity_path(payload, ""))
+    self.assertIsNone(AuthManager._traverse_identity_path(None, "any"))
 
 
 class TestLoginSuccessDetection(unittest.TestCase):

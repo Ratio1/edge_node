@@ -51,6 +51,32 @@ def _ensure_mapping(d, context: str) -> dict:
   return d
 
 
+def _coerce_success_status_tuple(value) -> tuple[int, ...]:
+  """Normalize an authenticated-probe success-status list into a tuple of ints.
+
+  Accepts a list/tuple of integers (or numeric strings). Anything that does
+  not coerce cleanly is silently dropped — the upstream contract is that
+  callers either configure valid statuses or leave the field empty.
+  """
+  if value in (None, "", (), []):
+    return ()
+  if isinstance(value, (str, bytes)):
+    return ()
+  try:
+    iterator = iter(value)
+  except TypeError:
+    return ()
+  out: list[int] = []
+  for item in iterator:
+    try:
+      coerced = int(item)
+    except (TypeError, ValueError):
+      continue
+    if 100 <= coerced <= 599:
+      out.append(coerced)
+  return tuple(out)
+
+
 def _checked_dict(cls, d, context: str = "") -> dict:
   context = context or cls.__name__
   d = _ensure_mapping(d, context)
@@ -741,6 +767,20 @@ class AuthDescriptor:
                documented safe validation endpoints.
     api_logout_path: Optional explicit logout endpoint for API-native
                sessions. Form scans continue using ``logout_path``.
+    authenticated_probe_success_statuses: Optional explicit allow-list of
+               HTTP statuses that prove the session is authenticated.
+               Required when the probe path is also accessible
+               anonymously, so that the response distinguishes the two.
+               When empty, validation falls back to ``2xx + non-3xx``
+               plus the anonymous-control delta check below.
+    authenticated_probe_success_marker: Optional case-sensitive substring
+               that must appear in the authenticated response body and
+               NOT in the anonymous-control response body, used to
+               confirm the endpoint reflects the authenticated principal.
+    authenticated_probe_identity_json_path: Dotted JSON path (no array
+               indexing, no expressions) within the response body that
+               must resolve to a non-empty value when authenticated and
+               not when anonymous (e.g. ``user.id``).
   """
   auth_type: str = "form"   # "form" | "bearer" | "api_key"
   bearer_token_header_name: str = "Authorization"
@@ -754,6 +794,9 @@ class AuthDescriptor:
   allow_unverified_auth: bool = False
   allow_non_readonly_auth_validation_method: bool = False
   api_logout_path: str = ""
+  authenticated_probe_success_statuses: tuple[int, ...] = ()
+  authenticated_probe_success_marker: str = ""
+  authenticated_probe_identity_json_path: str = ""
 
   @classmethod
   def from_dict(cls, d: dict) -> AuthDescriptor:
@@ -773,6 +816,15 @@ class AuthDescriptor:
         "allow_non_readonly_auth_validation_method", False,
       ),
       api_logout_path=d.get("api_logout_path", ""),
+      authenticated_probe_success_statuses=_coerce_success_status_tuple(
+        d.get("authenticated_probe_success_statuses", ()),
+      ),
+      authenticated_probe_success_marker=str(
+        d.get("authenticated_probe_success_marker", "") or ""
+      ),
+      authenticated_probe_identity_json_path=str(
+        d.get("authenticated_probe_identity_json_path", "") or ""
+      ),
     )
 
 
