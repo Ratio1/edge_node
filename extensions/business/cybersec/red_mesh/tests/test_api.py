@@ -675,13 +675,34 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertIn("outside an approved request body", result["message"])
     self.assertEqual(plugin.r1fs.add_json.call_count, 0)
 
+  def test_launch_webapp_scan_fails_closed_without_secret_store_key(self):
+    """No dedicated key and no unsafe-fallback opt-in must abort the launch."""
+    plugin = self._build_mock_plugin(job_id="test-job-websecret-no-key")
+    plugin.cfg_redmesh_secret_store_key = ""
+    plugin.cfg_redmesh_allow_unsafe_secret_store_fallback = False
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    with patch.dict("os.environ", {}, clear=True):
+      result = self._launch_webapp(
+        plugin,
+        official_username="admin",
+        official_password="secret",
+      )
+
+    self.assertIn("error", result)
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
   def test_launch_webapp_scan_records_default_plugin_key_metadata(self):
-    """When no dedicated key is configured, persisted metadata records the built-in default key."""
+    """With unsafe fallback explicitly enabled, metadata reflects the well-known key."""
     plugin = self._build_mock_plugin(job_id="test-job-websecret-default-key")
     plugin.cfg_redmesh_secret_store_key = ""
     plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
 
-    with patch.dict("os.environ", {}, clear=True):
+    with patch.dict(
+      "os.environ",
+      {"REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK": "true"},
+      clear=True,
+    ):
       result = self._launch_webapp(
         plugin,
         official_username="admin",
@@ -2896,6 +2917,7 @@ class TestPhase5Endpoints(unittest.TestCase):
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
     plugin.cfg_redmesh_secret_store_key = ""
+    plugin.cfg_redmesh_allow_unsafe_secret_store_fallback = True
     plugin.r1fs.get_json.side_effect = [
       {
         "scan_type": "webapp",

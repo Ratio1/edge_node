@@ -7,13 +7,33 @@ from ..graybox.models.target_config import (
   collect_target_config_secret_refs,
   resolve_target_config_secret_refs,
 )
-# Built-in default secret-store key — identical on every node that ships this
-# plugin. Lets launcher and worker decrypt the same R1FS secret payload without
-# any per-deployment configuration ("plug and play"). Real deployments should
-# override via REDMESH_SECRET_STORE_KEY or cfg_redmesh_secret_store_key; the
-# default is flagged `unsafe_fallback: True` so audit trails reflect that the
-# key is well-known.
+# Built-in fallback secret-store key — only used when the deployment has
+# explicitly opted into the unsafe development fallback. This key is identical
+# on every node that ships this plugin, so anyone with read access to the
+# repository or to R1FS-stored secret payloads can decrypt them. Production
+# deployments MUST configure REDMESH_SECRET_STORE_KEY (env) or
+# cfg_redmesh_secret_store_key (config); otherwise persistence fails closed.
+# To enable the unsafe fallback for local development, set
+# REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK=true or
+# cfg_redmesh_allow_unsafe_secret_store_fallback=True. Production environments
+# (REDMESH_ENV=production) reject the unsafe fallback unconditionally.
 _DEFAULT_SECRET_STORE_KEY = "redmesh-default-plugin-key-v1"
+
+
+class SecretStoreKeyMissing(RuntimeError):
+  """Raised when no deployment-specific secret-store key is configured and
+  the unsafe development fallback has not been explicitly enabled."""
+
+  def __init__(self, message: str = ""):
+    super().__init__(
+      message or (
+        "RedMesh graybox secret-store key is not configured. Set "
+        "REDMESH_SECRET_STORE_KEY (env) or cfg_redmesh_secret_store_key "
+        "(config). For local development only, you may opt into the "
+        "well-known fallback with REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK"
+        "=true (never use in production)."
+      )
+    )
 
 
 def _artifact_repo(owner):
@@ -83,11 +103,26 @@ class R1fsSecretStore:
       "unsafe_fallback": True,
     }
 
+  def _is_production_env(self) -> bool:
+    env = os.environ.get("REDMESH_ENV", "") or os.environ.get("ENVIRONMENT", "")
+    return isinstance(env, str) and env.strip().lower() == "production"
+
+  def _unsafe_fallback_enabled(self) -> bool:
+    if self._is_production_env():
+      return False
+    env_flag = os.environ.get("REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK", "")
+    if self._truthy(env_flag):
+      return True
+    cfg_flag = getattr(self.owner, "cfg_redmesh_allow_unsafe_secret_store_fallback", False)
+    return self._truthy(cfg_flag)
+
   def _resolve_secret_store_key(self):
     key, metadata = self._dedicated_secret_store_key()
     if key:
       return key, metadata
-    return self._default_secret_store_key()
+    if self._unsafe_fallback_enabled():
+      return self._default_secret_store_key()
+    raise SecretStoreKeyMissing()
 
   def _get_secret_store_key(self) -> str:
     key, _metadata = self._resolve_secret_store_key()
@@ -253,10 +288,19 @@ def persist_job_config_with_secrets(
     ])
     if has_secret_payload:
       store = R1fsSecretStore(owner)
-      secret_ref = store.save_graybox_credentials(job_id, payload)
+      try:
+        secret_ref = store.save_graybox_credentials(job_id, payload)
+      except SecretStoreKeyMissing as exc:
+        owner.P(
+          f"RedMesh launch aborted: {exc}",
+          color='r',
+        )
+        # Blank secret-bearing fields in the returned dict even though we
+        # never persist it, so accidental log/debug exposure is reduced.
+        return _blank_graybox_secret_fields(persisted_config), ""
       if not secret_ref:
         owner.P("Failed to persist graybox secret payload in R1FS — aborting launch", color='r')
-        return persisted_config, ""
+        return _blank_graybox_secret_fields(persisted_config), ""
       persisted_config["secret_ref"] = secret_ref
       key_metadata = store.last_key_metadata if isinstance(store.last_key_metadata, dict) else {}
       persisted_config["secret_store_key_id"] = key_metadata.get("key_id", "")
@@ -298,9 +342,14 @@ def resolve_job_config_secrets(
   if not secret_ref:
     return resolved
 
-  payload = R1fsSecretStore(owner).load_graybox_credentials(
-    secret_ref, expected_job_id=expected_job_id,
-  )
+  try:
+    payload = R1fsSecretStore(owner).load_graybox_credentials(
+      secret_ref, expected_job_id=expected_job_id,
+    )
+  except SecretStoreKeyMissing as exc:
+    raise ValueError(
+      f"Failed to resolve graybox secret_ref for job_id={expected_job_id or '<unknown>'}: {exc}"
+    ) from exc
   if not payload:
     raise ValueError(f"Failed to resolve graybox secret_ref for job_id={expected_job_id or '<unknown>'}")
 

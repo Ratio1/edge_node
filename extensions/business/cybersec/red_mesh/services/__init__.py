@@ -116,6 +116,7 @@ from .reconciliation import (
 )
 from .secrets import (
   R1fsSecretStore,
+  SecretStoreKeyMissing,
   collect_secret_refs_from_job_config,
   persist_job_config_with_secrets,
   resolve_job_config_secrets,
@@ -245,6 +246,7 @@ __all__ = [
   "persist_job_config_with_secrets",
   "purge_job",
   "R1fsSecretStore",
+  "SecretStoreKeyMissing",
   "resolve_job_config_secrets",
   "collect_secret_refs_from_job_config",
   "resolve_active_peers",
