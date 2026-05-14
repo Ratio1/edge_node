@@ -9,6 +9,7 @@ Container application plugins for running Docker containers with Cloudflare tunn
 - [Features](#features)
   - [Health Check Configuration](#health-check-configuration)
 - [Configuration Reference](#configuration-reference)
+  - [Volume Sync](#volume-sync)
 - [Future Enhancements](#future-enhancements)
   - [Continuous Health Monitoring](#continuous-health-monitoring)
   - [Per-Port Health Checks](#per-port-health-checks)
@@ -196,6 +197,85 @@ When a container app acts as the provider, new consumers should prefer these exp
 - `CONTAINER_PORT`
 
 Legacy `HOST`, `PORT`, and `URL` remain available for backward compatibility.
+
+### Volume Sync
+
+`SYNC` lets one CAR publish mounted application state to R1FS/ChainStore and
+lets another CAR apply the latest snapshot for the same key. It is available on
+`ContainerAppRunnerPlugin` and inherited runners such as `WorkerAppRunnerPlugin`.
+
+```python
+"SYNC": {
+    "ENABLED": False,
+    "KEY": None,                         # shared ChainStore key
+    "TYPE": None,                        # "provider" | "consumer"
+    "POLL_INTERVAL": 10,                 # provider/consumer tick cadence
+    "HSYNC_POLL_INTERVAL": 60,           # consumer network refresh cadence, min 10
+    "ALLOW_ONLINE_PROVIDER_CAPTURE": False,
+    "CONSUMER_APPLY_MODE": "offline_restart",
+}
+```
+
+Provider apps request a publish by writing JSON to
+`/r1en_system/volume-sync/request.json`:
+
+```json
+{
+  "archive_paths": ["/app/data/"],
+  "metadata": {"epoch": 1},
+  "runtime": {
+    "provider_capture": "offline",
+    "consumer_apply": "offline_restart"
+  }
+}
+```
+
+`archive_paths` must be a non-empty list of absolute paths inside CAR-managed
+volumes. Offline capture rejects symlinks and unsupported special files. Online
+provider capture can read from the live container filesystem, including
+non-persistent paths, but only when the provider operator locally sets
+`ALLOW_ONLINE_PROVIDER_CAPTURE=True`.
+
+CAR writes provider results to `/r1en_system/volume-sync/response.json` and
+consumer apply results to `/r1en_system/volume-sync/last_apply.json`. Invalid
+requests are preserved as `request.json.invalid` with a sanitized error.
+`/r1en_system` is CAR-owned control plane: the mount root and `volume-sync/`
+directory are enforced as root-owned. Apps can write requests through the sticky
+`01777` `volume-sync/` directory, but cannot own or replace the control
+directory. CAR-owned result files are app-readable but not app-writable.
+
+Consumer lifecycle is local policy. Providers may publish runtime metadata, but
+consumers apply according to their own `CONSUMER_APPLY_MODE`:
+
+| Mode | Behavior |
+|------|----------|
+| `offline_restart` | Stop container, apply snapshot, restart container. Default. |
+| `online_no_restart` | Accepted for compatibility, but currently forced to `offline_restart` for filesystem safety. |
+| `online_restart` | Accepted for compatibility, but currently forced to `offline_restart` for filesystem safety. |
+
+Published manifests include `schema_version`, `archive_format`, `encryption`,
+and `archive_paths`. Consumers validate these before downloading/applying a CID.
+In `offline_restart` mode the consumer validates the ChainStore record,
+downloads the CID, validates the tar, and prepares an apply plan before stopping
+the container. Bad CIDs or corrupt archives are quarantined with retry backoff,
+so a bad publish does not repeatedly stop a consumer. Offline provider capture
+and offline consumer apply both abort without filesystem mutation if CAR cannot
+confirm the container stopped/removed.
+
+Consumer apply state is tracked in host-private plugin data. `last_apply.json`
+is app-visible notification only; CAR deduplicates from durable internal apply
+state and leaves the container stopped if rollback cannot prove the volume is
+consistent.
+
+Provider publishes require a positive `chainstore_hset` acknowledgement. If the
+record is not confirmed, CAR reports an error, removes the just-uploaded CID
+best-effort, and does not append sent history. Provider CID retirement may
+remote-unpin old CIDs it published; consumer retirement only removes local
+downloaded files and does not remote-unpin provider content.
+
+Restored files and directories are owned by the target consumer volume root
+owner/group, with unsafe special mode bits stripped. This keeps replicated state
+modifiable for non-root app images whose fixed-size data volume is app-owned.
 
 ---
 
