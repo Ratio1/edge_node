@@ -239,6 +239,10 @@ non-persistent paths, but only when the provider operator locally sets
 CAR writes provider results to `/r1en_system/volume-sync/response.json` and
 consumer apply results to `/r1en_system/volume-sync/last_apply.json`. Invalid
 requests are preserved as `request.json.invalid` with a sanitized error.
+`/r1en_system` is CAR-owned control plane: the mount root and `volume-sync/`
+directory are enforced as root-owned. Apps can write requests through the sticky
+`01777` `volume-sync/` directory, but cannot own or replace the control
+directory.
 
 Consumer lifecycle is local policy. Providers may publish runtime metadata, but
 consumers apply according to their own `CONSUMER_APPLY_MODE`:
@@ -251,6 +255,20 @@ consumers apply according to their own `CONSUMER_APPLY_MODE`:
 
 Published manifests include `schema_version`, `archive_format`, `encryption`,
 and `archive_paths`. Consumers validate these before downloading/applying a CID.
+In `offline_restart` mode the consumer validates the ChainStore record before
+stopping the container, and skips malformed or unmapped records without restart
+churn. Offline provider capture and offline consumer apply both abort without
+filesystem mutation if CAR cannot confirm the container stopped/removed.
+
+Provider publishes require a positive `chainstore_hset` acknowledgement. If the
+record is not confirmed, CAR reports an error, removes the just-uploaded CID
+best-effort, and does not append sent history. Provider CID retirement may
+remote-unpin old CIDs it published; consumer retirement only removes local
+downloaded files and does not remote-unpin provider content.
+
+Restored files and directories are owned by the target consumer volume root
+owner/group, with unsafe special mode bits stripped. This keeps replicated state
+modifiable for non-root app images whose fixed-size data volume is app-owned.
 
 ---
 
