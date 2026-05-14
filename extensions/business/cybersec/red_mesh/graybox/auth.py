@@ -283,7 +283,14 @@ class AuthManager:
     api_security = getattr(self.target_config, "api_security", None)
     auth_desc = getattr(api_security, "auth", None) if api_security is not None else None
     method = (getattr(auth_desc, "authenticated_probe_method", "GET") or "GET").upper()
-    return method if method in ("GET", "POST", "HEAD", "OPTIONS") else "GET"
+    allow_non_readonly = bool(
+      getattr(auth_desc, "allow_non_readonly_auth_validation_method", False)
+    )
+    if method in ("GET", "HEAD"):
+      return method
+    if allow_non_readonly and method in ("POST", "OPTIONS"):
+      return method
+    return "GET"
 
   def _logout_url_for_current_auth(self) -> str:
     if self._resolve_auth_type() == "form":

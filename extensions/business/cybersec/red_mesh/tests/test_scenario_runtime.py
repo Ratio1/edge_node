@@ -14,6 +14,7 @@ from extensions.business.cybersec.red_mesh.graybox.models import (
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   ApiSecurityConfig,
   ApiTokenEndpoint,
+  AuthDescriptor,
   GrayboxTargetConfig,
 )
 from extensions.business.cybersec.red_mesh.graybox.probes.api_auth import (
@@ -83,8 +84,15 @@ def _resp(status=200, json_body=None):
   return r
 
 
-def _make_api_auth_probe(*, allowed_scenario_ids=None):
+def _make_api_auth_probe(*, allowed_scenario_ids=None, unverified_api_auth=False):
+  auth_descriptor = AuthDescriptor()
+  if unverified_api_auth:
+    auth_descriptor = AuthDescriptor(
+      auth_type="bearer",
+      allow_unverified_auth=True,
+    )
   cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(
+    auth=auth_descriptor,
     token_endpoints=ApiTokenEndpoint(
       token_path="/api/token/",
       protected_path="/api/me/",
@@ -272,6 +280,22 @@ class TestScenarioAssignmentGates(unittest.TestCase):
     probe.run()
 
     self.assertEqual({f.scenario_id for f in probe.findings}, {"PT-OAPI2-02"})
+    probe.auth.make_anonymous_session.assert_not_called()
+
+  def test_unverified_api_auth_emits_inconclusive_without_http_calls(self):
+    probe = _make_api_auth_probe(
+      allowed_scenario_ids=("PT-OAPI2-01",),
+      unverified_api_auth=True,
+    )
+
+    probe.run()
+
+    self.assertEqual(len(probe.findings), 1)
+    finding = probe.findings[0]
+    self.assertEqual(finding.scenario_id, "PT-OAPI2-01")
+    self.assertEqual(finding.status, "inconclusive")
+    self.assertIn("reason=auth_unverified", finding.evidence)
+    probe.auth.official_session.post.assert_not_called()
     probe.auth.make_anonymous_session.assert_not_called()
 
   def test_worker_context_carries_launcher_assignment(self):

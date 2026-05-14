@@ -134,6 +134,38 @@ class TestStateShape(unittest.TestCase):
     self.assertIn("_test_probe", worker.state["graybox_results"]["8000"])
     self.assertEqual(worker.state["web_tests_info"], {})
 
+  def test_store_findings_redacts_configured_api_key_names(self):
+    worker = _make_worker(target_config={
+      "api_security": {
+        "auth": {
+          "auth_type": "api_key",
+          "api_key_location": "query",
+          "api_key_query_param": "customer_key",
+          "api_key_header_name": "X-Customer-Api-Key",
+        },
+      },
+    })
+    finding = GrayboxFinding(
+      scenario_id="PT-OAPI1-01",
+      title="API object-level authorization bypass (BOLA)",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="API1:2023",
+      evidence=[
+        "endpoint=https://api.example/users?customer_key=SECRET99&page=1",
+        "X-Customer-Api-Key: SECRET-HEADER",
+      ],
+    )
+
+    worker._store_findings("_graybox_api_access", [finding])
+
+    stored = worker.state["graybox_results"]["8000"]["_graybox_api_access"]
+    haystack = str(stored)
+    self.assertNotIn("SECRET99", haystack)
+    self.assertNotIn("SECRET-HEADER", haystack)
+    self.assertIn("customer_key=<redacted>", haystack)
+    self.assertIn("X-Customer-Api-Key: <redacted>", haystack)
+
 
 class TestStatus(unittest.TestCase):
 

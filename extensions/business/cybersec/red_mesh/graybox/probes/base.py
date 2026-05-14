@@ -84,9 +84,48 @@ class ProbeBase:
       return True
     return scenario_id in self.allowed_scenario_ids
 
+  def _api_auth_unverified(self) -> bool:
+    """Return True when API auth was explicitly accepted without validation."""
+    api_security = getattr(self.target_config, "api_security", None)
+    if api_security is None:
+      return False
+    auth = getattr(api_security, "auth", None)
+    if auth is None:
+      return False
+    auth_type = getattr(auth, "auth_type", "form") or "form"
+    if auth_type not in ("bearer", "api_key"):
+      return False
+    probe_path = (getattr(auth, "authenticated_probe_path", "") or "").strip()
+    return bool(getattr(auth, "allow_unverified_auth", False)) and not probe_path
+
+  @staticmethod
+  def _is_api_security_scenario(scenario_id: str) -> bool:
+    return scenario_id.startswith("PT-OAPI") or scenario_id == "PT-API7-01"
+
+  def _emit_auth_unverified(self, scenario_id: str):
+    if any(
+      f.scenario_id == scenario_id and "auth_unverified" in str(f.evidence)
+      for f in self.findings
+    ):
+      return
+    try:
+      from ..scenario_catalog import graybox_scenario
+      entry = graybox_scenario(scenario_id) or {}
+    except ImportError:
+      entry = {}
+    self.emit_inconclusive(
+      scenario_id,
+      entry.get("title") or scenario_id,
+      entry.get("owasp") or "",
+      "auth_unverified",
+    )
+
   def run_safe_scenario(self, scenario_id: str, probe_name: str, probe_fn):
     """Run a scenario only when the worker assignment permits it."""
     if not self.scenario_enabled(scenario_id):
+      return
+    if self._is_api_security_scenario(scenario_id) and self._api_auth_unverified():
+      self._emit_auth_unverified(scenario_id)
       return
     self.run_safe(probe_name, probe_fn)
 

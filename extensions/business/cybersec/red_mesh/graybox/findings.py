@@ -19,6 +19,7 @@ secrets into the archive, LLM input, or PDF.
 from __future__ import annotations
 
 import re
+import contextvars
 from dataclasses import dataclass, asdict, field
 from typing import Any
 
@@ -49,6 +50,45 @@ _SCRUB_PATTERNS = (
 )
 
 
+_FINDING_SECRET_FIELD_NAMES = contextvars.ContextVar(
+  "redmesh_graybox_finding_secret_field_names",
+  default=(),
+)
+
+
+def _merged_secret_field_names(extra=()) -> tuple[str, ...]:
+  names = []
+  for name in tuple(_FINDING_SECRET_FIELD_NAMES.get(()) or ()) + tuple(extra or ()):
+    if isinstance(name, str) and name and name not in names:
+      names.append(name)
+  return tuple(names)
+
+
+class FindingRedactionContext:
+  """Temporarily add configured auth field names to finding serialization."""
+
+  def __init__(self, *, secret_field_names=()):
+    self.secret_field_names = tuple(
+      name for name in (secret_field_names or ())
+      if isinstance(name, str) and name
+    )
+    self._token = None
+
+  def __enter__(self):
+    self._token = _FINDING_SECRET_FIELD_NAMES.set(self.secret_field_names)
+    return self
+
+  def __exit__(self, exc_type, exc, tb):
+    if self._token is not None:
+      _FINDING_SECRET_FIELD_NAMES.reset(self._token)
+    return False
+
+
+def current_finding_secret_field_names() -> tuple[str, ...]:
+  """Return configured names currently active for finding redaction."""
+  return tuple(_FINDING_SECRET_FIELD_NAMES.get(()) or ())
+
+
 def scrub_graybox_secrets(value: Any, *, secret_field_names: tuple[str, ...] = ()) -> Any:
   """Recursively redact known secret patterns from ``value``.
 
@@ -57,6 +97,7 @@ def scrub_graybox_secrets(value: Any, *, secret_field_names: tuple[str, ...] = (
   (e.g. configured API-key header / query param names) to scrub on top of
   the generic pattern set.
   """
+  secret_field_names = tuple(secret_field_names or ())
   if isinstance(value, str):
     out = value
     for pat, repl in _SCRUB_PATTERNS:
@@ -81,7 +122,7 @@ def scrub_graybox_secrets(value: Any, *, secret_field_names: tuple[str, ...] = (
   return value
 
 
-def _scrub_flat_finding(flat: dict) -> dict:
+def _scrub_flat_finding(flat: dict, *, secret_field_names=()) -> dict:
   """Final storage-boundary pass on a flat finding dict.
 
   Targets the fields most likely to carry secret values:
@@ -90,11 +131,16 @@ def _scrub_flat_finding(flat: dict) -> dict:
   Other fields (severity, owasp_id, scenario_id, etc.) are policy-bound
   and pass through unchanged.
   """
+  secret_field_names = _merged_secret_field_names(secret_field_names)
   for key in ("title", "description", "evidence", "replay_steps", "remediation"):
     if key in flat:
-      flat[key] = scrub_graybox_secrets(flat[key])
+      flat[key] = scrub_graybox_secrets(
+        flat[key], secret_field_names=secret_field_names,
+      )
   if "evidence_artifacts" in flat and isinstance(flat["evidence_artifacts"], list):
-    flat["evidence_artifacts"] = scrub_graybox_secrets(flat["evidence_artifacts"])
+    flat["evidence_artifacts"] = scrub_graybox_secrets(
+      flat["evidence_artifacts"], secret_field_names=secret_field_names,
+    )
   return flat
 
 
@@ -171,14 +217,17 @@ class GrayboxFinding:
     ]
     return cls(**data)
 
-  def to_dict(self) -> dict[str, Any]:
+  def to_dict(self, *, secret_field_names=()) -> dict[str, Any]:
     """JSON-safe serialization."""
     payload = asdict(self)
     payload["evidence_artifacts"] = [
       GrayboxEvidenceArtifact.from_value(item).to_dict()
       for item in self.evidence_artifacts
     ]
-    return payload
+    return scrub_graybox_secrets(
+      payload,
+      secret_field_names=_merged_secret_field_names(secret_field_names),
+    )
 
   def _normalized_evidence_artifacts(self) -> list[GrayboxEvidenceArtifact]:
     return [GrayboxEvidenceArtifact.from_value(item) for item in self.evidence_artifacts]
@@ -193,7 +242,8 @@ class GrayboxFinding:
     ]
     return "; ".join(artifact_summaries)
 
-  def to_flat_finding(self, port: int, protocol: str, probe_name: str) -> dict:
+  def to_flat_finding(self, port: int, protocol: str, probe_name: str,
+                      *, secret_field_names=()) -> dict:
     """
     Normalize to the unified flat finding dict schema used in PassReport.findings.
 
@@ -253,9 +303,12 @@ class GrayboxFinding:
       "cvss_vector": self.cvss_vector,
       "rollback_status": self.rollback_status,
     }
-    return _scrub_flat_finding(flat)
+    return _scrub_flat_finding(flat, secret_field_names=secret_field_names)
 
   @classmethod
-  def flat_from_dict(cls, payload: dict[str, Any], port: int, protocol: str, probe_name: str) -> dict[str, Any]:
+  def flat_from_dict(cls, payload: dict[str, Any], port: int, protocol: str,
+                     probe_name: str, *, secret_field_names=()) -> dict[str, Any]:
     """Normalize a persisted graybox finding dict into the flat report contract."""
-    return cls.from_dict(payload).to_flat_finding(port, protocol, probe_name)
+    return cls.from_dict(payload).to_flat_finding(
+      port, protocol, probe_name, secret_field_names=secret_field_names,
+    )

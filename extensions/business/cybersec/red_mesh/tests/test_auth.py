@@ -273,6 +273,51 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     )
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_bearer_validation_method_falls_back_to_get_without_override(self, mock_requests):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+
+    session = self._mock_session(status=200)
+    mock_requests.Session.return_value = session
+
+    auth = self._auth_with_descriptor(
+      auth_type="bearer",
+      authenticated_probe_path="/api/me",
+      authenticated_probe_method="POST",
+    )
+    ok = auth.authenticate(Credentials(bearer_token="TOKEN-123"))
+
+    self.assertTrue(ok)
+    session.get.assert_called_once_with(
+      "http://api.example/api/me",
+      timeout=10,
+      allow_redirects=True,
+    )
+    session.post.assert_not_called()
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_bearer_validation_method_allows_post_with_override(self, mock_requests):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+
+    session = self._mock_session(status=200)
+    session.post.return_value = _mock_response(status=200)
+    mock_requests.Session.return_value = session
+
+    auth = self._auth_with_descriptor(
+      auth_type="bearer",
+      authenticated_probe_path="/api/me",
+      authenticated_probe_method="POST",
+      allow_non_readonly_auth_validation_method=True,
+    )
+    ok = auth.authenticate(Credentials(bearer_token="TOKEN-123"))
+
+    self.assertTrue(ok)
+    session.post.assert_called_once_with(
+      "http://api.example/api/me",
+      timeout=10,
+      allow_redirects=True,
+    )
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
   def test_authenticate_api_key_query_validates_with_session_params(self, mock_requests):
     from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
 

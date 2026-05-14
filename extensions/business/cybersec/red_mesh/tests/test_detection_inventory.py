@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import ast
 import unittest
 from pathlib import Path
 
@@ -61,15 +62,72 @@ class TestDetectionInventory(unittest.TestCase):
   _SCENARIO_ID_RE = re.compile(
     r"scenario_id\s*=\s*[\"'](PT-A\d+-\d+|PT-API7-\d+|PT-OAPI\d{1,2}-\d+)[\"']"
   )
+  _SCENARIO_ID_VALUE_RE = re.compile(
+    r"^(PT-A\d+-\d+|PT-API7-\d+|PT-OAPI\d{1,2}-\d+)$"
+  )
+  _SCENARIO_CALLS = {
+    "emit_vulnerable",
+    "emit_clean",
+    "emit_inconclusive",
+    "run_safe_scenario",
+    "run_stateful",
+  }
+
+  @classmethod
+  def _collect_ast_scenario_ids(cls, redmesh_root):
+    source_ids = set()
+    for path in (redmesh_root / "graybox").rglob("*.py"):
+      tree = ast.parse(path.read_text(), filename=str(path))
+      for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+          continue
+        func = node.func
+        name = ""
+        if isinstance(func, ast.Attribute):
+          name = func.attr
+        elif isinstance(func, ast.Name):
+          name = func.id
+        candidates = []
+        if name in cls._SCENARIO_CALLS and node.args:
+          candidates.append(node.args[0])
+        if name == "GrayboxFinding":
+          candidates.extend(
+            kw.value for kw in node.keywords
+            if kw.arg == "scenario_id"
+          )
+        candidates.extend(
+          kw.value for kw in node.keywords
+          if kw.arg == "scenario_id"
+        )
+        for candidate in candidates:
+          if isinstance(candidate, ast.Constant) and isinstance(candidate.value, str):
+            if cls._SCENARIO_ID_VALUE_RE.match(candidate.value):
+              source_ids.add(candidate.value)
+    return source_ids
 
   def test_existing_graybox_emitted_scenarios_are_registered(self):
     redmesh_root = Path(__file__).resolve().parents[1]
-    source_ids = set()
+    source_ids = self._collect_ast_scenario_ids(redmesh_root)
     for path in (redmesh_root / "graybox").rglob("*.py"):
       source_ids.update(self._SCENARIO_ID_RE.findall(path.read_text()))
     catalog_ids = {entry["id"] for entry in GRAYBOX_SCENARIO_CATALOG}
     self.assertTrue(source_ids)
     self.assertEqual(source_ids - catalog_ids, set())
+
+  def test_api_probe_modules_use_emit_helpers_for_findings(self):
+    """New API probe families should not bypass central emission helpers."""
+    redmesh_root = Path(__file__).resolve().parents[1]
+    direct = []
+    for path in (redmesh_root / "graybox" / "probes").glob("api_*.py"):
+      tree = ast.parse(path.read_text(), filename=str(path))
+      for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+          continue
+        func = node.func
+        name = func.id if isinstance(func, ast.Name) else ""
+        if name == "GrayboxFinding":
+          direct.append(f"{path.name}:{node.lineno}")
+    self.assertEqual(direct, [])
 
   def test_scenario_id_regex_accepts_all_valid_prefixes(self):
     """Regex must accept the three valid prefixes documented in the ADR."""

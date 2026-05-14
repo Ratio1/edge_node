@@ -452,6 +452,101 @@ class TestPhase1ConfigCID(unittest.TestCase):
       json.dumps(config_dict),
     )
 
+  def test_launch_webapp_scan_rejects_bearer_without_validation_path(self):
+    """Bearer/API-key auth must be validated unless explicitly unverified."""
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-no-probe")
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN",
+      target_config={
+        "api_security": {
+          "auth": {"auth_type": "bearer"},
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("authenticated_probe_path", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_scan_allows_explicit_unverified_bearer(self):
+    """Explicit opt-out persists as non-secret policy metadata."""
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-unverified")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "allow_unverified_auth": True,
+          },
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    auth_config = config_dict["target_config"]["api_security"]["auth"]
+    self.assertTrue(auth_config["allow_unverified_auth"])
+    self.assertEqual(auth_config["authenticated_probe_path"], "")
+
+  def test_launch_webapp_scan_rejects_mutating_auth_validation_method(self):
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-post-probe")
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+            "authenticated_probe_method": "POST",
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("authenticated_probe_method", result["message"])
+
+  def test_launch_webapp_scan_allows_explicit_non_readonly_validation(self):
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-post-override")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+            "authenticated_probe_method": "POST",
+            "allow_non_readonly_auth_validation_method": True,
+          },
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    auth_config = config_dict["target_config"]["api_security"]["auth"]
+    self.assertEqual(auth_config["authenticated_probe_method"], "POST")
+    self.assertTrue(auth_config["allow_non_readonly_auth_validation_method"])
+
   def test_launch_webapp_scan_rejects_nested_target_config_secret(self):
     """Nested request bodies cannot carry raw secrets into persisted JobConfig."""
     plugin = self._build_mock_plugin(job_id="test-job-target-secret")

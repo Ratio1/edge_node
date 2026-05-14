@@ -16,6 +16,7 @@ import requests
 from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
 from extensions.business.cybersec.red_mesh.graybox.safety import SafetyControls
 from extensions.business.cybersec.red_mesh.graybox.findings import (
+  FindingRedactionContext,
   GrayboxFinding,
   scrub_graybox_secrets,
 )
@@ -146,6 +147,38 @@ class TestToFlatFindingScrubs(unittest.TestCase):
     # Non-secret content preserved
     self.assertIn("/api/users/2", haystack)
     self.assertIn("PT-OAPI1-01", haystack)
+
+  def test_flatten_context_scrubs_configured_names(self):
+    f = GrayboxFinding(
+      scenario_id="PT-OAPI1-01",
+      title="API object-level authorization bypass (BOLA)",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="API1:2023",
+      evidence=[
+        "X-Customer-Api-Key: SECRET-HEADER",
+        "endpoint=https://api.example/v1/users?customer_key=SECRET99&page=1",
+      ],
+      evidence_artifacts=[{
+        "request_snapshot": (
+          "GET /v1/users?customer_key=SECRET99 "
+          "X-Customer-Api-Key: SECRET-HEADER"
+        ),
+      }],
+      replay_steps=["GET /v1/users?customer_key=SECRET99"],
+    )
+
+    with FindingRedactionContext(
+      secret_field_names=("X-Customer-Api-Key", "customer_key"),
+    ):
+      flat = f.to_flat_finding(443, "https", "_graybox_api_access")
+      stored = f.to_dict()
+
+    haystack = f"{flat} {stored}"
+    self.assertNotIn("SECRET99", haystack)
+    self.assertNotIn("SECRET-HEADER", haystack)
+    self.assertIn("customer_key=<redacted>", haystack)
+    self.assertIn("X-Customer-Api-Key: <redacted>", haystack)
 
 
 class TestProbeErrorScrubsConfiguredNames(unittest.TestCase):

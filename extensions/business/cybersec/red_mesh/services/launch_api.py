@@ -163,6 +163,33 @@ def _validate_graybox_numeric_fields(canonical: dict | None):
   return None
 
 
+def _validate_api_auth_descriptor(auth_desc):
+  auth_type = getattr(auth_desc, "auth_type", "form") or "form"
+  if auth_type not in ("bearer", "api_key"):
+    return None
+  probe_path = (getattr(auth_desc, "authenticated_probe_path", "") or "").strip()
+  allow_unverified = bool(getattr(auth_desc, "allow_unverified_auth", False))
+  if not probe_path and not allow_unverified:
+    return validation_error(
+      "api_security.auth.authenticated_probe_path is required for bearer/api_key "
+      "auth unless allow_unverified_auth=true"
+    )
+  if not probe_path:
+    return None
+  method = (
+    getattr(auth_desc, "authenticated_probe_method", "GET") or "GET"
+  ).upper()
+  allow_non_readonly = bool(
+    getattr(auth_desc, "allow_non_readonly_auth_validation_method", False)
+  )
+  if method not in ("GET", "HEAD") and not allow_non_readonly:
+    return validation_error(
+      "api_security.auth.authenticated_probe_method must be GET or HEAD "
+      "unless allow_non_readonly_auth_validation_method=true"
+    )
+  return None
+
+
 def _normalize_allowlist(entries):
   if not entries:
     return []
@@ -1120,7 +1147,8 @@ def launch_webapp_scan(
   # Form auth still requires username+password; Bearer / API-key targets
   # set auth_type via target_config.api_security.auth and supply the
   # secret as a top-level param instead.
-  auth_type = typed_target_config.api_security.auth.auth_type
+  auth_desc = typed_target_config.api_security.auth
+  auth_type = auth_desc.auth_type
   if auth_type == "form":
     if not official_username or not official_password:
       return validation_error("official credentials required for webapp scan")
@@ -1132,6 +1160,9 @@ def launch_webapp_scan(
       return validation_error("api_key required when auth_type='api_key'")
   else:
     return validation_error(f"unknown auth_type: {auth_type!r}")
+  auth_validation_error = _validate_api_auth_descriptor(auth_desc)
+  if auth_validation_error:
+    return auth_validation_error
 
   parsed = urlparse(target_url)
   if parsed.scheme not in ("http", "https") or not parsed.hostname:

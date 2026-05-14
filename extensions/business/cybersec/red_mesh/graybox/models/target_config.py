@@ -732,6 +732,13 @@ class AuthDescriptor:
     authenticated_probe_method: HTTP method for authenticated validation.
                Defaults to GET because many APIs reject HEAD even when
                credentials are valid.
+    allow_unverified_auth: Explicit opt-out for Bearer/API-key
+               validation. When true and no authenticated_probe_path is
+               configured, auth-dependent API probes emit auth_unverified
+               inconclusive findings instead of clean/vulnerable claims.
+    allow_non_readonly_auth_validation_method: Explicit opt-in for
+               validation methods outside GET/HEAD. Use only for
+               documented safe validation endpoints.
     api_logout_path: Optional explicit logout endpoint for API-native
                sessions. Form scans continue using ``logout_path``.
   """
@@ -744,6 +751,8 @@ class AuthDescriptor:
   api_key_location: str = "header"  # "header" | "query"
   authenticated_probe_path: str = ""
   authenticated_probe_method: str = "GET"
+  allow_unverified_auth: bool = False
+  allow_non_readonly_auth_validation_method: bool = False
   api_logout_path: str = ""
 
   @classmethod
@@ -759,6 +768,10 @@ class AuthDescriptor:
       api_key_location=d.get("api_key_location", "header"),
       authenticated_probe_path=d.get("authenticated_probe_path", ""),
       authenticated_probe_method=d.get("authenticated_probe_method", "GET"),
+      allow_unverified_auth=d.get("allow_unverified_auth", False),
+      allow_non_readonly_auth_validation_method=d.get(
+        "allow_non_readonly_auth_validation_method", False,
+      ),
       api_logout_path=d.get("api_logout_path", ""),
     )
 

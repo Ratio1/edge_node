@@ -10,7 +10,11 @@ from urllib.parse import urlparse
 
 from ..worker.base import BaseLocalWorker
 from ..constants import GRAYBOX_PROBE_REGISTRY
-from .findings import GrayboxEvidenceArtifact, GrayboxFinding
+from .findings import (
+  FindingRedactionContext,
+  GrayboxEvidenceArtifact,
+  GrayboxFinding,
+)
 from .auth import AuthManager
 from .discovery import DiscoveryModule
 from .http_client import GrayboxHttpClient
@@ -296,7 +300,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
         color='y',
       )
     except Exception as exc:
-      self._record_fatal(self.safety.sanitize_error(str(exc)))
+      self._record_fatal(self._sanitize_error(str(exc)))
     finally:
       self._safe_cleanup()
       if self._phase_open and self._phase:
@@ -311,7 +315,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     except Exception as exc:
       self.P(
         "[GRAYBOX] auth.cleanup raised during shutdown: %s"
-        % self.safety.sanitize_error(str(exc)),
+        % self._sanitize_error(str(exc)),
         color='y',
       )
 
@@ -586,16 +590,40 @@ class GrayboxLocalWorker(BaseLocalWorker):
     """Store GrayboxFinding dicts in graybox_results under the port key."""
     run_result = self._normalize_probe_run_result(findings)
     port_results = self.state["graybox_results"].setdefault(self._port_key, {})
-    port_results[key] = {
-      "findings": [f.to_dict() for f in run_result.findings],
-      "artifacts": [
-        GrayboxEvidenceArtifact.from_value(artifact).to_dict()
-        for artifact in run_result.artifacts
-      ],
-      "outcome": run_result.outcome,
-    }
+    with FindingRedactionContext(
+      secret_field_names=self._configured_secret_field_names(),
+    ):
+      port_results[key] = {
+        "findings": [f.to_dict() for f in run_result.findings],
+        "artifacts": [
+          GrayboxEvidenceArtifact.from_value(artifact).to_dict()
+          for artifact in run_result.artifacts
+        ],
+        "outcome": run_result.outcome,
+      }
     for finding in run_result.findings:
       self.metrics.record_finding(getattr(finding, "severity", "INFO"))
+
+  def _configured_secret_field_names(self):
+    api_security = getattr(self.target_config, "api_security", None)
+    auth = getattr(api_security, "auth", None) if api_security is not None else None
+    if auth is None:
+      return ()
+    names = []
+    for attr in ("api_key_header_name", "api_key_query_param",
+                  "bearer_token_header_name"):
+      value = getattr(auth, attr, None)
+      if isinstance(value, str) and value:
+        names.append(value)
+    return tuple(names)
+
+  def _sanitize_error(self, value):
+    try:
+      return self.safety.sanitize_error(
+        str(value), secret_field_names=self._configured_secret_field_names(),
+      )
+    except TypeError:
+      return self.safety.sanitize_error(str(value))
 
   def _store_auth_results(self):
     port_info = self.state["service_info"].setdefault(self._port_key, {})
@@ -628,7 +656,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
 
   def _record_probe_error(self, store_key, exc):
     """Record per-probe error without killing the scan."""
-    sanitized = self.safety.sanitize_error(str(exc))
+    sanitized = self._sanitize_error(str(exc))
     self._store_findings(store_key, [GrayboxFinding(
       scenario_id=f"ERR-{store_key}",
       title=f"Probe error: {store_key}",

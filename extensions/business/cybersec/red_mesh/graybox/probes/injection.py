@@ -36,12 +36,14 @@ class InjectionProbes(ProbeBase):
           evidence=["stateful_probes_disabled=True",
                     "reason=stored_xss_writes_data_to_target"],
         ))
-    self.run_safe("ssrf", self._test_ssrf)
+    self.run_safe_scenario("PT-API7-01", "ssrf", self._test_ssrf)
     # OWASP API Top 10 — Subphase 2.7: extend PT-API7-01 to scan JSON
     # body fields configured via target_config.api_security.ssrf_body_fields.
     api_security = getattr(self.target_config, "api_security", None)
     if api_security is not None and getattr(api_security, "ssrf_body_fields", None):
-      self.run_safe("ssrf_body_field", self._test_ssrf_body_field)
+      self.run_safe_scenario(
+        "PT-API7-01", "ssrf_body_field", self._test_ssrf_body_field,
+      )
     self.run_safe("open_redirect", self._test_open_redirect)
     if self.auth.official_session:
       self.run_safe("path_traversal", self._test_path_traversal)

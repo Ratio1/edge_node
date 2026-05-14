@@ -386,6 +386,39 @@ class TestApiAuthSecretsScrubbed(unittest.TestCase):
     # Secret value redacted regardless of which field carried it.
     self.assertNotIn("ABCDEFG12345", serialised)
 
+  def test_configured_query_param_api_key_never_in_llm_input(self):
+    from extensions.business.cybersec.red_mesh.graybox.findings import (
+      FindingRedactionContext,
+      GrayboxFinding,
+    )
+    f = GrayboxFinding(
+      scenario_id="PT-OAPI1-01",
+      title="API BOLA",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="API1:2023",
+      evidence=[
+        "url=https://api.example.com/v1/me?customer_key=SECRET99&page=1",
+      ],
+      evidence_artifacts=[{
+        "summary": "X-Customer-Api-Key: SECRET-HEADER",
+        "request_snapshot": (
+          "GET /v1/me?customer_key=SECRET99 "
+          "X-Customer-Api-Key: SECRET-HEADER"
+        ),
+      }],
+    )
+
+    with FindingRedactionContext(
+      secret_field_names=("customer_key", "X-Customer-Api-Key"),
+    ):
+      flat = f.to_flat_finding(443, "https", "_graybox_api_access")
+    out = build_llm_input(findings=[flat])
+    serialised = repr(out.findings)
+
+    self.assertNotIn("SECRET99", serialised)
+    self.assertNotIn("SECRET-HEADER", serialised)
+
 
 # ---------------------------------------------------------------------
 # Length caps
