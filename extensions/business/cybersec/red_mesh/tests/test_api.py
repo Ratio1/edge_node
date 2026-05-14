@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.constants import JOB_ARCHIVE_VERSION, MAX_CONTINUOUS_PASSES
 from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
+  build_graybox_worker_assignments,
   runtime_scenario_ids,
 )
 from extensions.business.cybersec.red_mesh.models import CStoreJobRunning
@@ -2790,6 +2791,80 @@ class TestPhase5Endpoints(unittest.TestCase):
         resolve_secrets=True,
       )
     self.assertEqual(len(plugin.r1fs.get_json.call_args_list), 1)
+
+  def test_mark_worker_terminal_error_sets_common_fields(self):
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    job_specs = {
+      "job_id": "job-terminal",
+      "workers": {"worker-a": {"start_port": 443, "end_port": 443}},
+    }
+
+    with patch.object(Plugin, "_write_job_record", return_value=job_specs) as write:
+      Plugin._mark_worker_terminal_error(
+        plugin,
+        job_specs,
+        "worker-a",
+        "secret_resolution_failed",
+        "Failed to resolve graybox secret_ref",
+        context="test_terminal",
+      )
+
+    worker = job_specs["workers"]["worker-a"]
+    self.assertTrue(worker["finished"])
+    self.assertEqual(worker["terminal_reason"], "secret_resolution_failed")
+    self.assertIn("secret_ref", worker["error"])
+    write.assert_called_once()
+
+  def test_maybe_launch_jobs_secret_resolution_failure_marks_terminal(self):
+    Plugin = self._get_plugin_class()
+    assignments, error = build_graybox_worker_assignments(["launcher-node"])
+    self.assertIsNone(error)
+    worker_entry = {
+      "start_port": 443,
+      "end_port": 443,
+      "finished": False,
+      "result": None,
+      **assignments["launcher-node"],
+    }
+    job_specs = {
+      "job_id": "job-secret-fail",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "target": "example.com",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/app",
+      "launcher": "launcher-node",
+      "launcher_alias": "launcher",
+      "workers": {"launcher-node": worker_entry},
+      "run_mode": "SINGLEPASS",
+      "job_config_cid": "QmConfigCID",
+    }
+    plugin = self._build_plugin({"job-secret-fail": job_specs})
+    plugin._PentesterApi01Plugin__last_checked_jobs = 0
+    plugin.cfg_check_jobs_each = 0
+    plugin.time.return_value = 100
+    plugin.scan_jobs = {}
+    plugin.completed_jobs_reports = {}
+    plugin.lst_completed_jobs = []
+    plugin._foreign_jobs_logged = set()
+    plugin._normalize_job_record = lambda key, spec, migrate=False: (key, spec)
+    plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
+    plugin._get_active_execution_identity = lambda job_id: None
+    plugin._build_execution_identity = lambda job_id, pass_nr, worker_addr, revision: (
+      job_id, pass_nr, worker_addr, revision,
+    )
+    plugin._get_job_config = MagicMock(
+      side_effect=ValueError("Failed to resolve graybox secret_ref")
+    )
+
+    with patch.object(Plugin, "_write_job_record", return_value=job_specs) as write:
+      Plugin._maybe_launch_jobs(plugin)
+
+    self.assertTrue(worker_entry["finished"])
+    self.assertEqual(worker_entry["terminal_reason"], "secret_resolution_failed")
+    self.assertIn("secret_ref", worker_entry["error"])
+    write.assert_called_once()
 
   def test_get_job_data_running_last_5(self):
     """Running job with 8 passes returns last 5 refs only."""
