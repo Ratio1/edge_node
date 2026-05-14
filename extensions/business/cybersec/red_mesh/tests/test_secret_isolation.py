@@ -84,58 +84,22 @@ class TestSecretIsolationInBuildPayload(unittest.TestCase):
 class TestSecretStoreKeySeparation(unittest.TestCase):
 
   @patch.dict(os.environ, {}, clear=True)
-  def test_production_refuses_unsafe_fallback_keys(self):
+  def test_default_uses_builtin_plugin_key_for_plug_and_play(self):
     owner = MagicMock()
     owner.P = MagicMock()
     owner.cfg_redmesh_secret_store_key = ""
-    owner.cfg_comms_host_key = "unsafe-comms-host-key"
-    owner.cfg_attestation = {
-      "ENABLED": True,
-      "PRIVATE_KEY": "unsafe-attestation-key",
-      "MIN_SECONDS_BETWEEN_SUBMITS": 86400,
-      "RETRIES": 2,
-    }
-    owner.r1fs.add_json = MagicMock()
+    owner.r1fs.add_json.return_value = "fake://secret/cid"
 
     secret_ref = R1fsSecretStore(owner).save_graybox_credentials(
       "job-1",
       {"official_password": "secret"},
     )
 
-    self.assertEqual(secret_ref, "")
-    owner.r1fs.add_json.assert_not_called()
-
-  @patch.dict(
-    os.environ,
-    {"REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK": "1"},
-    clear=True,
-  )
-  def test_development_fallback_requires_explicit_unsafe_flag(self):
-    owner = MagicMock()
-    owner.P = MagicMock()
-    owner.cfg_redmesh_secret_store_key = ""
-    owner.cfg_comms_host_key = "unsafe-comms-host-key"
-    owner.cfg_attestation = {
-      "ENABLED": True,
-      "PRIVATE_KEY": "",
-      "MIN_SECONDS_BETWEEN_SUBMITS": 86400,
-      "RETRIES": 2,
-    }
-    owner.r1fs.add_json.return_value = "fake://secret/cid"
-
-    store = R1fsSecretStore(owner)
-    secret_ref = store.save_graybox_credentials(
-      "job-1",
-      {"official_password": "secret"},
-    )
-
     self.assertEqual(secret_ref, "fake://secret/cid")
     secret_doc = owner.r1fs.add_json.call_args[0][0]
-    secret_kwargs = owner.r1fs.add_json.call_args[1]
     self.assertTrue(secret_doc["unsafe_key_fallback"])
-    self.assertEqual(secret_doc["key_id"], "unsafe-dev:cfg_comms_host_key")
-    self.assertEqual(secret_doc["key_version"], "unsafe-dev")
-    self.assertEqual(secret_kwargs["secret"], "unsafe-comms-host-key")
+    self.assertEqual(secret_doc["key_id"], "redmesh:default_plugin_key")
+    self.assertEqual(secret_doc["key_version"], "v1")
 
   @patch.dict(
     os.environ,
@@ -423,6 +387,170 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
     fake_store.load_graybox_credentials.assert_called_once_with(
       "fake://secret/cid", expected_job_id="job-A",
     )
+
+
+class _FakeR1FSBackend:
+  """In-memory R1FS that mimics symmetric secret-keyed put/get.
+
+  Mirrors the contract used by ``ArtifactRepository.put_json`` /
+  ``get_json``: stores payloads under a CID, only returns them if the
+  ``secret`` arg matches what was used at put-time. Lets us exercise the
+  real ``R1fsSecretStore`` end-to-end without mocking it.
+  """
+
+  def __init__(self):
+    self._store: dict[str, tuple[dict, str]] = {}
+    self._counter = 0
+
+  def add_json(self, payload, show_logs=False, secret=None):
+    self._counter += 1
+    cid = f"Qm{self._counter:040d}"
+    self._store[cid] = (json.loads(json.dumps(payload)), secret or "")
+    return cid
+
+  def get_json(self, cid, secret=None):
+    if cid not in self._store:
+      return None
+    payload, stored_secret = self._store[cid]
+    if (secret or "") != stored_secret:
+      return None
+    return json.loads(json.dumps(payload))
+
+
+class _FakeNode:
+  """Minimal stand-in for an EE plugin instance."""
+
+  def __init__(self, r1fs: _FakeR1FSBackend, *, cfg_redmesh_secret_store_key: str = ""):
+    self.r1fs = r1fs
+    self.cfg_redmesh_secret_store_key = cfg_redmesh_secret_store_key
+    self.cfg_redmesh_secret_store_key_id = ""
+    self.cfg_redmesh_secret_store_key_version = ""
+    self.cfg_comms_host_key = ""
+    self.cfg_attestation = {"ENABLED": False, "PRIVATE_KEY": ""}
+    self.prints: list[str] = []
+
+  def P(self, msg, **k):
+    self.prints.append(str(msg))
+
+
+class TestSecretRoundTripAcrossNodes(unittest.TestCase):
+  """Simulates launcher (rm1) → worker (rm2) using a shared R1FS backend.
+
+  This is the scenario that broke job 2e867b02 in dev: the launcher
+  persisted credentials via the built-in default secret-store key and
+  the worker resolved them via the *same* default key on a different
+  plugin instance. The test pins this contract so a regression is
+  caught at unit-test time instead of "official_login_failed" in a
+  live scan.
+  """
+
+  @patch.dict(os.environ, {}, clear=True)
+  def test_default_key_round_trip_restores_form_credentials(self):
+    r1fs = _FakeR1FSBackend()
+    launcher = _FakeNode(r1fs)
+    worker = _FakeNode(r1fs)
+
+    config_dict = {
+      "job_id": "job-rt-1",
+      "target": "honeypot.local",
+      "target_url": "https://honeypot.local",
+      "start_port": 0, "end_port": 0,
+      "scan_type": "webapp",
+      "official_username": "admin",
+      "official_password": "P3n13st3R",
+      "regular_username": "user",
+      "regular_password": "12345678",
+    }
+
+    persisted_config, config_cid = persist_job_config_with_secrets(
+      launcher, job_id="job-rt-1", config_dict=config_dict,
+    )
+
+    self.assertTrue(config_cid, "launcher failed to persist JobConfig")
+    self.assertEqual(persisted_config["official_username"], "")
+    self.assertEqual(persisted_config["official_password"], "")
+    self.assertEqual(persisted_config["regular_username"], "")
+    self.assertEqual(persisted_config["regular_password"], "")
+    self.assertTrue(persisted_config["secret_ref"])
+    self.assertEqual(
+      persisted_config["secret_store_key_id"], "redmesh:default_plugin_key",
+    )
+
+    persisted_from_r1fs = r1fs.get_json(config_cid)
+    self.assertIsNotNone(persisted_from_r1fs)
+    persisted_from_r1fs["job_id"] = "job-rt-1"
+
+    resolved = resolve_job_config_secrets(worker, persisted_from_r1fs)
+
+    self.assertEqual(resolved["official_username"], "admin")
+    self.assertEqual(resolved["official_password"], "P3n13st3R")
+    self.assertEqual(resolved["regular_username"], "user")
+    self.assertEqual(resolved["regular_password"], "12345678")
+
+  @patch.dict(os.environ, {}, clear=True)
+  def test_default_key_round_trip_handles_api_native_secrets(self):
+    r1fs = _FakeR1FSBackend()
+    launcher = _FakeNode(r1fs)
+    worker = _FakeNode(r1fs)
+
+    config_dict = {
+      "job_id": "job-rt-2",
+      "target": "api.local",
+      "target_url": "https://api.local",
+      "start_port": 0, "end_port": 0,
+      "scan_type": "webapp",
+      "official_username": "alice",
+      "official_password": "",
+      "bearer_token": SENSITIVE_VALUES["bearer_token"],
+      "api_key": SENSITIVE_VALUES["api_key"],
+      "regular_bearer_token": SENSITIVE_VALUES["regular_bearer_token"],
+    }
+
+    persisted_config, _cid = persist_job_config_with_secrets(
+      launcher, job_id="job-rt-2", config_dict=config_dict,
+    )
+
+    self.assertTrue(persisted_config["has_bearer_token"])
+    self.assertTrue(persisted_config["has_api_key"])
+    self.assertEqual(persisted_config["bearer_token"], "")
+    self.assertEqual(persisted_config["api_key"], "")
+
+    persisted_config["job_id"] = "job-rt-2"
+    resolved = resolve_job_config_secrets(worker, persisted_config)
+
+    self.assertEqual(resolved["bearer_token"], SENSITIVE_VALUES["bearer_token"])
+    self.assertEqual(resolved["api_key"], SENSITIVE_VALUES["api_key"])
+    self.assertEqual(
+      resolved["regular_bearer_token"],
+      SENSITIVE_VALUES["regular_bearer_token"],
+    )
+
+  @patch.dict(os.environ, {}, clear=True)
+  def test_custom_key_on_one_node_default_on_other_fails_closed(self):
+    """Launcher set REDMESH_SECRET_STORE_KEY but worker did not — must fail."""
+    r1fs = _FakeR1FSBackend()
+    launcher = _FakeNode(r1fs, cfg_redmesh_secret_store_key="operator-only-key")
+    worker = _FakeNode(r1fs)
+
+    persisted_config, _cid = persist_job_config_with_secrets(
+      launcher,
+      job_id="job-rt-3",
+      config_dict={
+        "job_id": "job-rt-3",
+        "target": "honeypot.local",
+        "target_url": "https://honeypot.local",
+        "start_port": 0, "end_port": 0,
+        "scan_type": "webapp",
+        "official_username": "admin",
+        "official_password": "P3n13st3R",
+      },
+    )
+    self.assertEqual(persisted_config["secret_store_key_source"], "config")
+    self.assertFalse(persisted_config["secret_store_unsafe_fallback"])
+
+    persisted_config["job_id"] = "job-rt-3"
+    with self.assertRaises(ValueError):
+      resolve_job_config_secrets(worker, persisted_config)
 
 
 class TestSecretIsolationInCredentialsRepr(unittest.TestCase):

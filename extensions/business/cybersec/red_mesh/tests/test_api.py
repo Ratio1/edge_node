@@ -675,52 +675,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertIn("outside an approved request body", result["message"])
     self.assertEqual(plugin.r1fs.add_json.call_count, 0)
 
-  def test_launch_webapp_scan_rejects_secret_persistence_without_store_key(self):
-    """Webapp launch fails closed when no strong secret-store key is configured."""
-    plugin = self._build_mock_plugin(job_id="test-job-websecret-nokey")
+  def test_launch_webapp_scan_records_default_plugin_key_metadata(self):
+    """When no dedicated key is configured, persisted metadata records the built-in default key."""
+    plugin = self._build_mock_plugin(job_id="test-job-websecret-default-key")
     plugin.cfg_redmesh_secret_store_key = ""
-    plugin.cfg_comms_host_key = ""
-    plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 86400, "RETRIES": 2}
-
-    with patch.dict("os.environ", {}, clear=True):
-      result = self._launch_webapp(
-        plugin,
-        official_username="admin",
-        official_password="secret",
-      )
-
-    self.assertEqual(result["error"], "Failed to store job config in R1FS")
-    self.assertEqual(len(plugin.r1fs.add_json.call_args_list), 0)
-
-  def test_launch_webapp_scan_rejects_implicit_secret_store_fallback_key(self):
-    """Communication/attestation keys are not reused unless unsafe dev fallback is explicit."""
-    plugin = self._build_mock_plugin(job_id="test-job-websecret-fallback-key")
-    plugin.cfg_redmesh_secret_store_key = ""
-    plugin.cfg_comms_host_key = "unsafe-comms-host-key"
-    plugin.cfg_allow_unsafe_secret_store_fallback = False
-    plugin.cfg_attestation = {
-      "ENABLED": True,
-      "PRIVATE_KEY": "unsafe-attestation-key",
-      "MIN_SECONDS_BETWEEN_SUBMITS": 86400,
-      "RETRIES": 2,
-    }
-
-    with patch.dict("os.environ", {}, clear=True):
-      result = self._launch_webapp(
-        plugin,
-        official_username="admin",
-        official_password="secret",
-      )
-
-    self.assertEqual(result["error"], "Failed to store job config in R1FS")
-    self.assertEqual(len(plugin.r1fs.add_json.call_args_list), 0)
-
-  def test_launch_webapp_scan_records_unsafe_secret_store_fallback_metadata(self):
-    """Explicit unsafe fallback is visible in persisted non-secret metadata."""
-    plugin = self._build_mock_plugin(job_id="test-job-websecret-dev-fallback")
-    plugin.cfg_redmesh_secret_store_key = ""
-    plugin.cfg_comms_host_key = "unsafe-comms-host-key"
-    plugin.cfg_allow_unsafe_secret_store_fallback = True
     plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
 
     with patch.dict("os.environ", {}, clear=True):
@@ -734,9 +692,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
     secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
     config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
     self.assertTrue(secret_doc["unsafe_key_fallback"])
-    self.assertEqual(secret_doc["key_id"], "unsafe-dev:cfg_comms_host_key")
+    self.assertEqual(secret_doc["key_id"], "redmesh:default_plugin_key")
     self.assertTrue(config_dict["secret_store_unsafe_fallback"])
-    self.assertEqual(config_dict["secret_store_key_id"], "unsafe-dev:cfg_comms_host_key")
+    self.assertEqual(config_dict["secret_store_key_id"], "redmesh:default_plugin_key")
 
   def test_launch_webapp_scan_rejects_missing_target_url(self):
     """Webapp endpoint returns structured validation error for missing URL."""
@@ -2933,13 +2891,11 @@ class TestPhase5Endpoints(unittest.TestCase):
       unittest.mock.call("QmSecretCID", secret="unit-test-redmesh-secret-key"),
     )
 
-  def test_get_job_config_fails_closed_for_secret_ref_without_key(self):
-    """Secret refs are not resolved via plaintext fallback when no key exists."""
+  def test_get_job_config_fails_closed_for_malformed_secret_payload(self):
+    """Secret refs decrypt with the default key, but malformed payloads (missing storage_mode) are rejected."""
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
     plugin.cfg_redmesh_secret_store_key = ""
-    plugin.cfg_comms_host_key = ""
-    plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 86400, "RETRIES": 2}
     plugin.r1fs.get_json.side_effect = [
       {
         "scan_type": "webapp",
@@ -2960,7 +2916,7 @@ class TestPhase5Endpoints(unittest.TestCase):
         plugin, {"job_id": "test-job", "job_config_cid": "QmConfigCID"},
         resolve_secrets=True,
       )
-    self.assertEqual(len(plugin.r1fs.get_json.call_args_list), 1)
+    self.assertEqual(len(plugin.r1fs.get_json.call_args_list), 2)
 
   def test_mark_worker_terminal_error_sets_common_fields(self):
     Plugin = self._get_plugin_class()

@@ -7,7 +7,13 @@ from ..graybox.models.target_config import (
   collect_target_config_secret_refs,
   resolve_target_config_secret_refs,
 )
-from .config import get_attestation_config
+# Built-in default secret-store key — identical on every node that ships this
+# plugin. Lets launcher and worker decrypt the same R1FS secret payload without
+# any per-deployment configuration ("plug and play"). Real deployments should
+# override via REDMESH_SECRET_STORE_KEY or cfg_redmesh_secret_store_key; the
+# default is flagged `unsafe_fallback: True` so audit trails reflect that the
+# key is well-known.
+_DEFAULT_SECRET_STORE_KEY = "redmesh-default-plugin-key-v1"
 
 
 def _artifact_repo(owner):
@@ -39,13 +45,6 @@ class R1fsSecretStore:
       return value.strip().lower() in {"1", "true", "yes", "y", "on"}
     return False
 
-  def _unsafe_fallback_allowed(self) -> bool:
-    return any([
-      self._truthy(os.environ.get("REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK", "")),
-      self._truthy(getattr(self.owner, "cfg_allow_unsafe_secret_store_fallback", False)),
-      self._truthy(getattr(self.owner, "cfg_redmesh_allow_unsafe_secret_store_fallback", False)),
-    ])
-
   def _dedicated_secret_store_key(self):
     env_key = self._normalize_secret_key(os.environ.get("REDMESH_SECRET_STORE_KEY", ""))
     if env_key:
@@ -76,34 +75,19 @@ class R1fsSecretStore:
       }
     return "", {}
 
-  def _unsafe_fallback_secret_store_key(self):
-    if not self._unsafe_fallback_allowed():
-      return "", {}
-    comms_key = self._normalize_secret_key(getattr(self.owner, "cfg_comms_host_key", ""))
-    if comms_key:
-      return comms_key, {
-        "key_id": "unsafe-dev:cfg_comms_host_key",
-        "key_version": "unsafe-dev",
-        "key_source": "unsafe_dev_fallback_comms",
-        "unsafe_fallback": True,
-      }
-    attestation_key = self._normalize_secret_key(
-      get_attestation_config(self.owner)["PRIVATE_KEY"]
-    )
-    if attestation_key:
-      return attestation_key, {
-        "key_id": "unsafe-dev:attestation_private_key",
-        "key_version": "unsafe-dev",
-        "key_source": "unsafe_dev_fallback_attestation",
-        "unsafe_fallback": True,
-      }
-    return "", {}
+  def _default_secret_store_key(self):
+    return _DEFAULT_SECRET_STORE_KEY, {
+      "key_id": "redmesh:default_plugin_key",
+      "key_version": "v1",
+      "key_source": "redmesh_default",
+      "unsafe_fallback": True,
+    }
 
   def _resolve_secret_store_key(self):
     key, metadata = self._dedicated_secret_store_key()
     if key:
       return key, metadata
-    return self._unsafe_fallback_secret_store_key()
+    return self._default_secret_store_key()
 
   def _get_secret_store_key(self) -> str:
     key, _metadata = self._resolve_secret_store_key()
@@ -112,14 +96,6 @@ class R1fsSecretStore:
   def save_graybox_credentials(self, job_id: str, payload: dict) -> str:
     secret_key, key_metadata = self._resolve_secret_store_key()
     self.last_key_metadata = dict(key_metadata or {})
-    if not secret_key:
-      self.owner.P(
-        "No dedicated RedMesh secret-store key is configured. "
-        "Set REDMESH_SECRET_STORE_KEY or cfg_redmesh_secret_store_key. "
-        "Development fallback requires REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK=1.",
-        color='r',
-      )
-      return ""
     secret_doc = {
       "kind": "redmesh_graybox_credentials",
       "job_id": job_id,
@@ -138,9 +114,6 @@ class R1fsSecretStore:
     repo = _artifact_repo(self.owner)
     secret_key, key_metadata = self._resolve_secret_store_key()
     self.last_key_metadata = dict(key_metadata or {})
-    if not secret_key:
-      self.owner.P("No dedicated RedMesh secret-store key is configured; cannot resolve graybox secret_ref", color='r')
-      return None
     secret_doc = repo.get_json(secret_ref, secret=secret_key)
     if not isinstance(secret_doc, dict):
       self.owner.P(f"Failed to fetch graybox secret payload from R1FS (CID: {secret_ref})", color='r')
