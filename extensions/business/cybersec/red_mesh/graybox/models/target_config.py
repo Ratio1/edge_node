@@ -584,6 +584,7 @@ class ApiBusinessFlow:
   revert_method: str = "POST"
   revert_body: dict = field(default_factory=dict)
   test_account: str = ""                    # non-privileged identity used during abuse test
+  allow_static_test_account_body: bool = False
   captcha_marker: str = ""                  # body substring indicating CAPTCHA challenge
   mfa_marker: str = ""                      # body substring indicating MFA challenge
 
@@ -609,6 +610,7 @@ class ApiBusinessFlow:
       revert_method=d.get("revert_method", "POST"),
       revert_body=d.get("revert_body", {}),
       test_account=d.get("test_account", ""),
+      allow_static_test_account_body=d.get("allow_static_test_account_body", False),
       captcha_marker=d.get("captcha_marker", ""),
       mfa_marker=d.get("mfa_marker", ""),
     )

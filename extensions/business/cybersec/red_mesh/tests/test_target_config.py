@@ -316,6 +316,7 @@ class TestApiSecurityConfig(unittest.TestCase):
     self.assertEqual(bf.revert_path, "")
     self.assertEqual(bf.revert_method, "POST")
     self.assertEqual(bf.revert_body, {})
+    self.assertFalse(bf.allow_static_test_account_body)
 
   def test_api_business_flow_rejects_secret_body_template(self):
     with self.assertRaises(ValueError) as cm:
@@ -442,7 +443,8 @@ class TestApiSecurityConfig(unittest.TestCase):
          "verify_method": "GET",
          "revert_path": "/api/auth/signup/cleanup/",
          "revert_method": "DELETE",
-         "revert_body": {"username": "x"}},
+         "revert_body": {"username": "x"},
+         "allow_static_test_account_body": True},
       ],
       "token_endpoints": {
         "token_path": "/api/token/",
@@ -469,6 +471,7 @@ class TestApiSecurityConfig(unittest.TestCase):
     self.assertEqual(cfg.business_flows[0].revert_path, "/api/auth/signup/cleanup/")
     self.assertEqual(cfg.business_flows[0].revert_method, "DELETE")
     self.assertEqual(cfg.business_flows[0].revert_body, {"username": "x"})
+    self.assertTrue(cfg.business_flows[0].allow_static_test_account_body)
     self.assertEqual(cfg.token_endpoints.logout_path, "/api/auth/logout/")
     self.assertEqual(cfg.inventory_paths.canonical_probe_path, "/api/v2/records/1/")
     self.assertEqual(cfg.sensitive_field_patterns, ["custom_*_secret"])

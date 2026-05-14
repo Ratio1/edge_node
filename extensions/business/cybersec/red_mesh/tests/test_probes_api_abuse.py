@@ -116,7 +116,7 @@ class TestApi6FlowAbuse(unittest.TestCase):
 
   def test_stateful_disabled_emits_inconclusive(self):
     flow = ApiBusinessFlow(path="/api/auth/signup/", flow_name="signup",
-                            body_template={"u": "x", "p": "p"},
+                            body_template={"u": "{test_account}", "p": "p"},
                             test_account="api-low")
     p = _make_probe(business_flows=[flow], allow_stateful=False)
     p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
@@ -128,7 +128,7 @@ class TestApi6FlowAbuse(unittest.TestCase):
 
   def test_stateful_enabled_without_revert_path_does_not_mutate(self):
     flow = ApiBusinessFlow(path="/api/auth/signup/", flow_name="signup",
-                            body_template={"u": "x", "p": "p"},
+                            body_template={"u": "{test_account}", "p": "p"},
                             test_account="api-low")
     p = _make_probe(business_flows=[flow], allow_stateful=True)
 
@@ -144,9 +144,9 @@ class TestApi6FlowAbuse(unittest.TestCase):
     flow = ApiBusinessFlow(
       path="/api/auth/signup/",
       flow_name="signup",
-      body_template={"u": "x", "p": "p"},
+      body_template={"u": "{test_account}", "p": "p"},
       revert_path="/api/auth/signup/cleanup/",
-      revert_body={"u": "x"},
+      revert_body={"u": "{test_account}"},
       test_account="api-low",
     )
     p = _make_probe(business_flows=[flow], allow_stateful=True)
@@ -164,10 +164,92 @@ class TestApi6FlowAbuse(unittest.TestCase):
       p.auth.regular_session.post.call_args_list[-1].args[0],
       "http://api.example/api/auth/signup/cleanup/",
     )
+    for call in p.auth.regular_session.post.call_args_list:
+      self.assertEqual(call.kwargs["json"]["u"], "api-low")
+
+  def test_static_flow_body_without_placeholder_does_not_mutate(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "real-user", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "real-user"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-01" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("test_account_placeholder_required",
+                   "\n".join(incon[0].evidence))
+    p.auth.regular_session.post.assert_not_called()
+
+  def test_static_flow_body_requires_explicit_unsafe_override(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "fixture-user", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "fixture-user"},
+      test_account="api-low",
+      allow_static_test_account_body=True,
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.regular_session.post.side_effect = [_resp(status=201)] * 6
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    self.assertTrue(p.auth.regular_session.post.called)
+    self.assertEqual(
+      p.auth.regular_session.post.call_args_list[0].kwargs["json"]["u"],
+      "fixture-user",
+    )
+
+  def test_runtime_state_does_not_mutate_flow_config(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "{test_account}", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "{test_account}"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.regular_session.post.side_effect = [_resp(status=201)] * 6
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    self.assertFalse(hasattr(flow, "_probe_state"))
+    self.assertFalse(hasattr(flow, "_probe_state2"))
+    self.assertEqual(flow.body_template["u"], "{test_account}")
+
+  def test_unsupported_template_expression_does_not_mutate(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "scan-{test_account}", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "{test_account}"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-01" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("unsupported_template_expression",
+                   "\n".join(incon[0].evidence))
+    p.auth.regular_session.post.assert_not_called()
 
   def test_uniqueness_flow_without_revert_path_does_not_mutate(self):
     flow = ApiBusinessFlow(path="/api/orders/", flow_name="purchase",
-                            body_template={"sku": "sku-1"},
+                            body_template={"account": "{test_account}",
+                                           "sku": "sku-1"},
                             test_account="api-low")
     p = _make_probe(business_flows=[flow], allow_stateful=True)
 
@@ -183,9 +265,9 @@ class TestApi6FlowAbuse(unittest.TestCase):
     flow = ApiBusinessFlow(
       path="/api/orders/",
       flow_name="purchase",
-      body_template={"sku": "sku-1"},
+      body_template={"account": "{test_account}", "sku": "sku-1"},
       revert_path="/api/orders/cleanup/",
-      revert_body={"sku": "sku-1"},
+      revert_body={"account": "{test_account}", "sku": "sku-1"},
       test_account="api-low",
     )
     p = _make_probe(business_flows=[flow], allow_stateful=True)
@@ -202,6 +284,10 @@ class TestApi6FlowAbuse(unittest.TestCase):
     self.assertEqual(len(vuln), 1)
     self.assertEqual(vuln[0].rollback_status, "revert_failed")
     self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertEqual(
+      p.auth.regular_session.post.call_args_list[0].kwargs["json"]["account"],
+      "api-low",
+    )
 
 
 if __name__ == "__main__":

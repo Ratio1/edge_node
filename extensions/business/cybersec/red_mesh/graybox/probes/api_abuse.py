@@ -1,11 +1,15 @@
 """API abuse probes — OWASP API4 (Resource Consumption) and API6 (Business Flows)."""
 
+import re
+
 import requests
 
 from .base import ProbeBase
 
 
 MAX_HIGH_LIMIT_PROBE_LIMIT = 1_000
+_EXACT_TEMPLATE_RE = re.compile(r"^\{([a-zA-Z_][a-zA-Z0-9_]*)\}$")
+_ALLOWED_TEMPLATE_KEYS = ("test_account", "run_id", "job_id")
 
 
 class ApiAbuseProbes(ProbeBase):
@@ -51,6 +55,64 @@ class ApiAbuseProbes(ProbeBase):
       return req(url, params=dict(body or {}), timeout=timeout)
     return req(url, json=dict(body or {}), timeout=timeout)
 
+  def _flow_template_context(self, flow):
+    job_id = self.job_id or "local"
+    run_id = f"{job_id}:{self.assignment_revision or 0}"
+    return {
+      "test_account": flow.test_account,
+      "run_id": run_id,
+      "job_id": job_id,
+    }
+
+  def _render_template_value(self, value, context):
+    if isinstance(value, str):
+      match = _EXACT_TEMPLATE_RE.match(value)
+      if match:
+        key = match.group(1)
+        if key not in _ALLOWED_TEMPLATE_KEYS:
+          raise ValueError(f"unsupported_template_key:{key}")
+        return context[key], key == "test_account"
+      if "{" in value or "}" in value:
+        raise ValueError("unsupported_template_expression")
+      return value, False
+    if isinstance(value, dict):
+      out = {}
+      used_test_account = False
+      for key, item in value.items():
+        rendered, used = self._render_template_value(item, context)
+        out[key] = rendered
+        used_test_account = used_test_account or used
+      return out, used_test_account
+    if isinstance(value, list):
+      out = []
+      used_test_account = False
+      for item in value:
+        rendered, used = self._render_template_value(item, context)
+        out.append(rendered)
+        used_test_account = used_test_account or used
+      return out, used_test_account
+    return value, False
+
+  def _render_flow_payloads(self, flow):
+    context = self._flow_template_context(flow)
+    try:
+      body, body_uses_test_account = self._render_template_value(
+        flow.body_template or {}, context,
+      )
+      revert_body, revert_uses_test_account = self._render_template_value(
+        flow.revert_body or {}, context,
+      )
+    except ValueError as exc:
+      return None, None, str(exc)
+    unsafe_static_body = bool(
+      getattr(flow, "allow_static_test_account_body", False)
+    )
+    if not body_uses_test_account and not unsafe_static_body:
+      return None, None, "test_account_placeholder_required"
+    if flow.revert_body and not revert_uses_test_account and not unsafe_static_body:
+      return None, None, "revert_test_account_placeholder_required"
+    return body, revert_body, ""
+
   def _flow_verify(self, session, flow):
     if not flow.verify_path:
       return True
@@ -66,7 +128,7 @@ class ApiAbuseProbes(ProbeBase):
     )
     return resp.status_code < 400
 
-  def _flow_revert(self, session, flow):
+  def _flow_revert(self, session, flow, revert_body):
     if not flow.revert_path:
       return False
     if not self.cleanup_budget():
@@ -76,17 +138,17 @@ class ApiAbuseProbes(ProbeBase):
       session,
       flow.revert_method,
       self.target_url + flow.revert_path,
-      flow.revert_body,
+      revert_body,
       timeout=10,
     )
     return resp.status_code < 400
 
-  def _flow_revert_fn(self, session, flow):
+  def _flow_revert_fn(self, session, flow, revert_body):
     if not flow.revert_path:
       return None
 
-    def revert(_baseline, _flow=flow):
-      return self._flow_revert(session, _flow)
+    def revert(_baseline, _flow=flow, _revert_body=revert_body):
+      return self._flow_revert(session, _flow, _revert_body)
 
     return revert
 
@@ -290,12 +352,18 @@ class ApiAbuseProbes(ProbeBase):
       if not flow.test_account:
         self.emit_inconclusive("PT-OAPI6-01", title, owasp, "no_test_account_configured")
         continue
+      body, revert_body, template_error = self._render_flow_payloads(flow)
+      if template_error:
+        self.emit_inconclusive("PT-OAPI6-01", title, owasp, template_error)
+        continue
       url = self.target_url + flow.path
+      probe_state = {}
 
       def baseline(_flow=flow):
         return {"flow_name": _flow.flow_name}
 
-      def mutate(_baseline, _flow=flow, _url=url):
+      def mutate(_baseline, _flow=flow, _url=url, _body=body,
+                 _probe_state=probe_state):
         attempts = 0
         captcha = False
         mfa = False
@@ -305,7 +373,7 @@ class ApiAbuseProbes(ProbeBase):
           self.safety.throttle()
           try:
             resp = self._flow_request(
-              session, _flow.method, _url, _flow.body_template, timeout=10,
+              session, _flow.method, _url, _body, timeout=10,
             )
           except requests.RequestException:
             return self.MUTATION_ATTEMPTED_UNKNOWN
@@ -317,14 +385,13 @@ class ApiAbuseProbes(ProbeBase):
             captcha = True
           if _flow.mfa_marker and _flow.mfa_marker.lower() in body:
             mfa = True
-        _flow.__dict__.setdefault("_probe_state", {})
-        _flow._probe_state["attempts"] = attempts
-        _flow._probe_state["captcha"] = captcha
-        _flow._probe_state["mfa"] = mfa
+        _probe_state["attempts"] = attempts
+        _probe_state["captcha"] = captcha
+        _probe_state["mfa"] = mfa
         return attempts >= 5 and not (captcha or mfa)
 
-      def verify(baseline_, _flow=flow):
-        state = getattr(_flow, "_probe_state", {}) or {}
+      def verify(baseline_, _flow=flow, _probe_state=probe_state):
+        state = _probe_state
         signals_confirmed = state.get("attempts", 0) >= 5 and not (
           state.get("captcha") or state.get("mfa")
         )
@@ -340,7 +407,7 @@ class ApiAbuseProbes(ProbeBase):
         baseline_fn=baseline,
         mutate_fn=mutate,
         verify_fn=verify,
-        revert_fn=self._flow_revert_fn(session, flow),
+        revert_fn=self._flow_revert_fn(session, flow, revert_body),
         finding_kwargs={
           "title": title, "owasp": owasp, "severity": "MEDIUM",
           "cwe": ["CWE-799", "CWE-840"],
@@ -354,6 +421,7 @@ class ApiAbuseProbes(ProbeBase):
             "IP layer is insufficient."
           ),
         },
+        no_mutation_reason_fn=lambda base: "abuse_signals_not_confirmed",
       )
 
   # ── PT-OAPI6-02 — flow no uniqueness check (STATEFUL) ──────────────
@@ -376,33 +444,38 @@ class ApiAbuseProbes(ProbeBase):
       if not flow.test_account:
         self.emit_inconclusive("PT-OAPI6-02", title, owasp, "no_test_account_configured")
         continue
+      body, revert_body, template_error = self._render_flow_payloads(flow)
+      if template_error:
+        self.emit_inconclusive("PT-OAPI6-02", title, owasp, template_error)
+        continue
       url = self.target_url + flow.path
+      probe_state = {}
 
       def baseline(_flow=flow):
         return {"flow_name": _flow.flow_name}
 
-      def mutate(_b, _flow=flow, _url=url):
+      def mutate(_b, _flow=flow, _url=url, _body=body,
+                 _probe_state=probe_state):
         if not self.budget(2):
           raise RuntimeError("budget_exhausted")
         try:
           self.safety.throttle()
           r1 = self._flow_request(
-            session, _flow.method, _url, _flow.body_template, timeout=10,
+            session, _flow.method, _url, _body, timeout=10,
           )
           self.safety.throttle()
           r2 = self._flow_request(
-            session, _flow.method, _url, _flow.body_template, timeout=10,
+            session, _flow.method, _url, _body, timeout=10,
           )
         except requests.RequestException:
           return False
-        _flow.__dict__.setdefault("_probe_state2", {})
-        _flow._probe_state2["both_2xx"] = (
+        _probe_state["both_2xx"] = (
           r1.status_code < 400 and r2.status_code < 400
         )
-        return _flow._probe_state2["both_2xx"]
+        return _probe_state["both_2xx"]
 
-      def verify(_b, _flow=flow):
-        if not (getattr(_flow, "_probe_state2", {}) or {}).get("both_2xx", False):
+      def verify(_b, _flow=flow, _probe_state=probe_state):
+        if not _probe_state.get("both_2xx", False):
           return False
         try:
           return self._flow_verify(session, _flow)
@@ -414,7 +487,7 @@ class ApiAbuseProbes(ProbeBase):
         baseline_fn=baseline,
         mutate_fn=mutate,
         verify_fn=verify,
-        revert_fn=self._flow_revert_fn(session, flow),
+        revert_fn=self._flow_revert_fn(session, flow, revert_body),
         finding_kwargs={
           "title": title, "owasp": owasp, "severity": "MEDIUM",
           "cwe": ["CWE-840"],
@@ -426,4 +499,5 @@ class ApiAbuseProbes(ProbeBase):
             "username/email/voucher-code). Return 409 Conflict on duplicate."
           ),
         },
+        no_mutation_reason_fn=lambda base: "duplicate_submission_not_accepted",
       )
