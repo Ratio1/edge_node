@@ -160,6 +160,96 @@ class TestApi2LogoutInvalidation(unittest.TestCase):
     self.assertIn("no_logout_path_configured",
                    "\n".join(incon[0].evidence))
 
+  def test_no_protected_path_inconclusive(self):
+    tok = ApiTokenEndpoint(
+      token_path="/api/token/", protected_path="",
+      logout_path="/api/auth/logout/",
+    )
+    p = _make_probe(token_endpoints=tok, allow_stateful=True)
+    p.run_safe("api_token_logout_invalidation",
+                p._test_token_logout_invalidation)
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI2-03" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("no_protected_path_configured",
+                   "\n".join(incon[0].evidence))
+
+  def test_without_token_path_does_not_logout_primary_bearer(self):
+    tok = ApiTokenEndpoint(
+      token_path="", protected_path="/api/me/",
+      logout_path="/api/auth/logout/",
+    )
+    p = _make_probe(token_endpoints=tok, allow_stateful=True)
+    p.auth.official_session.headers = {
+      "Authorization": f"Bearer {_hs256_jwt({'sub': 'scanner'}, 's')}",
+    }
+
+    p.run_safe("api_token_logout_invalidation",
+                p._test_token_logout_invalidation)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI2-03" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("disposable_logout_token_required",
+                   "\n".join(incon[0].evidence))
+    p.auth.make_anonymous_session.assert_not_called()
+    p.auth.official_session.post.assert_not_called()
+
+  def test_uses_disposable_token_and_reauth_revert_when_clean(self):
+    tok = ApiTokenEndpoint(
+      token_path="/api/token/", protected_path="/api/me/",
+      logout_path="/api/auth/logout/",
+    )
+    p = _make_probe(token_endpoints=tok, allow_stateful=True)
+    first_token = _hs256_jwt({"sub": "alice", "jti": "one"}, "s")
+    fresh_token = _hs256_jwt({"sub": "alice", "jti": "two"}, "s")
+    p.auth.official_session.post.side_effect = [
+      _resp(json_body={"token": first_token}),
+      _resp(json_body={"token": fresh_token}),
+    ]
+    anon = MagicMock()
+    anon.post.return_value = _resp(status=204)
+    anon.get.return_value = _resp(status=401)
+    p.auth.make_anonymous_session.return_value = anon
+
+    p.run_safe("api_token_logout_invalidation",
+                p._test_token_logout_invalidation)
+
+    clean = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI2-03" and f.status == "not_vulnerable"]
+    self.assertEqual(len(clean), 1)
+    self.assertEqual(clean[0].rollback_status, "reverted")
+    self.assertEqual(p.auth.official_session.post.call_count, 2)
+    logout_headers = anon.post.call_args.kwargs["headers"]
+    self.assertIn(first_token, next(iter(logout_headers.values())))
+    self.assertNotIn(fresh_token, next(iter(logout_headers.values())))
+
+  def test_uses_disposable_token_and_reauth_revert_when_vulnerable(self):
+    tok = ApiTokenEndpoint(
+      token_path="/api/token/", protected_path="/api/me/",
+      logout_path="/api/auth/logout/",
+    )
+    p = _make_probe(token_endpoints=tok, allow_stateful=True)
+    first_token = _hs256_jwt({"sub": "alice", "jti": "one"}, "s")
+    fresh_token = _hs256_jwt({"sub": "alice", "jti": "two"}, "s")
+    p.auth.official_session.post.side_effect = [
+      _resp(json_body={"token": first_token}),
+      _resp(json_body={"token": fresh_token}),
+    ]
+    anon = MagicMock()
+    anon.post.return_value = _resp(status=204)
+    anon.get.return_value = _resp(status=200)
+    p.auth.make_anonymous_session.return_value = anon
+
+    p.run_safe("api_token_logout_invalidation",
+                p._test_token_logout_invalidation)
+
+    vuln = [f for f in p.findings
+            if f.scenario_id == "PT-OAPI2-03" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].rollback_status, "reverted")
+    self.assertEqual(p.auth.official_session.post.call_count, 2)
+
 
 if __name__ == "__main__":
   unittest.main()

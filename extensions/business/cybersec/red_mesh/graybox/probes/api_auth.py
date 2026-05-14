@@ -63,7 +63,7 @@ class ApiAuthProbes(ProbeBase):
 
   # ── helpers ────────────────────────────────────────────────────────
 
-  def _obtain_token(self):
+  def _obtain_token(self, *, consume_budget: bool = True):
     """Return (token, raw_payload) from token_path or configured bearer session."""
     tok = self.target_config.api_security.token_endpoints
     session = self.auth.official_session or self.auth.regular_session
@@ -72,7 +72,7 @@ class ApiAuthProbes(ProbeBase):
     if not tok.token_path:
       token = self._configured_session_bearer_token(session)
       return (token, {"source": "configured_bearer_token"}) if token else (None, None)
-    if not self.budget():
+    if consume_budget and not self.budget():
       return None, None
     url = self.target_url + tok.token_path
     method = (getattr(tok, "token_request_method", "POST") or "POST").upper()
@@ -273,8 +273,14 @@ class ApiAuthProbes(ProbeBase):
         "PT-OAPI2-03", title, owasp, "no_logout_path_configured",
       )
       return
+    if not tok.token_path:
+      self.emit_inconclusive(
+        "PT-OAPI2-03", title, owasp, "disposable_logout_token_required",
+      )
+      return
 
     real_token = [None]
+    no_mutation_reason = [""]
 
     def baseline():
       t, _ = self._obtain_token()
@@ -285,6 +291,7 @@ class ApiAuthProbes(ProbeBase):
 
     def mutate(base):
       if not self.budget():
+        no_mutation_reason[0] = "budget_exhausted"
         return False
       url = self.target_url + tok.logout_path
       self.safety.throttle()
@@ -298,11 +305,14 @@ class ApiAuthProbes(ProbeBase):
         return self.MUTATION_ATTEMPTED_UNKNOWN
       finally:
         session.close()
-      return resp.status_code < 400
+      accepted = resp.status_code < 400
+      if not accepted:
+        no_mutation_reason[0] = f"logout_status={resp.status_code}"
+      return accepted
 
     def verify(base):
       if not self.budget():
-        return False
+        raise RuntimeError("budget_exhausted")
       url = self.target_url + tok.protected_path
       session = self.auth.make_anonymous_session()
       try:
@@ -310,17 +320,16 @@ class ApiAuthProbes(ProbeBase):
           url, headers=self._auth_headers_for_token(base),
           timeout=10, allow_redirects=False,
         )
-      except requests.RequestException:
-        return False
+      except requests.RequestException as exc:
+        raise RuntimeError("protected_path_transport_error") from exc
       finally:
         session.close()
       # Vulnerable iff protected path STILL accepts the supposedly-revoked token.
       return resp.status_code < 400
 
     def revert(base):
-      # Cleanup is implicit — orchestrator can re-authenticate on demand
-      # via `ensure_sessions`. We just note the rollback path here.
-      return True
+      fresh_token, _ = self._obtain_token(consume_budget=False)
+      return bool(fresh_token)
 
     self.run_stateful(
       "PT-OAPI2-03",
@@ -328,6 +337,10 @@ class ApiAuthProbes(ProbeBase):
       mutate_fn=mutate,
       verify_fn=verify,
       revert_fn=revert,
+      no_mutation_reason_fn=lambda base: (
+        no_mutation_reason[0] or "logout_request_not_accepted"
+      ),
+      clean_when_verify_false=True,
       finding_kwargs={
         "title": title, "owasp": owasp, "severity": "MEDIUM",
         "cwe": ["CWE-613"],

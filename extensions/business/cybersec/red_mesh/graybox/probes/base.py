@@ -128,7 +128,8 @@ class ProbeBase:
                     skip_reason_no_revert="no_revert_path_configured",
                     mutation_unverified_reason_fn=None,
                     no_mutation_reason_fn=None,
-                    mutation_plan=None):
+                    mutation_plan=None,
+                    clean_when_verify_false=False):
     """Run a four-step stateful check.
 
     Steps:
@@ -264,6 +265,13 @@ class ProbeBase:
       return True
     elif mutated:
       reason = verify_failed_reason or "mutation_unverified"
+      if clean_when_verify_false and reason == "mutation_unverified":
+        self.emit_clean(
+          scenario_id, title, owasp,
+          list(finding_kwargs.get("evidence", []) or []),
+          rollback_status=rollback_status,
+        )
+        return False
       if callable(mutation_unverified_reason_fn):
         try:
           reason = mutation_unverified_reason_fn(baseline, rollback_status) or reason

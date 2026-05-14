@@ -106,6 +106,26 @@ class TestRunStatefulHappyPath(unittest.TestCase):
     self.assertIn("mutation_unverified", f.evidence[0])
     self.assertEqual(f.rollback_status, "reverted")
 
+  def test_clean_when_verify_false_opt_in(self):
+    p = _make_probe(allow_stateful=True)
+    p.run_stateful(
+      "PT-OAPI2-03",
+      baseline_fn=lambda: {"token": "disposable"},
+      mutate_fn=lambda b: True,
+      verify_fn=lambda b: False,
+      revert_fn=lambda b: True,
+      clean_when_verify_false=True,
+      finding_kwargs={
+        "title": "Logout invalidation",
+        "owasp": "API2:2023",
+        "evidence": ["logout_path=/api/auth/logout/"],
+      },
+    )
+    f = p.findings[0]
+    self.assertEqual(f.status, "not_vulnerable")
+    self.assertEqual(f.rollback_status, "reverted")
+    self.assertIn("logout_path=/api/auth/logout/", f.evidence)
+
   def test_journal_record_is_pending_before_mutate_and_reverted_after(self):
     journal = RollbackJournalRepository(job_id="job-1", worker_id="worker-1")
     p = _make_probe(allow_stateful=True, rollback_journal=journal)
