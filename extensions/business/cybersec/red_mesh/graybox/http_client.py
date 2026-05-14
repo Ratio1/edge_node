@@ -284,7 +284,7 @@ class GrayboxHttpClient:
       if not location:
         return response
       current_url = self.validate_url(location)
-      if response.status_code == 303:
+      if response.status_code in (301, 302, 303) and method != "HEAD":
         method = "GET"
         kwargs.pop("data", None)
         kwargs.pop("json", None)
