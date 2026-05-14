@@ -2105,8 +2105,9 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     bool
-      True when there is no container or stop+remove completed without
-      exception. False when Docker reported a stop/remove failure.
+      True when there is no container or the container was removed from Docker.
+      False when Docker reported a remove failure and the container may still
+      exist/running.
 
     Notes
     -----
@@ -2137,10 +2138,16 @@ class ContainerAppRunnerPlugin(
       removed_ok = False
       self.P(f"Error removing container: {e}", color='r')
     if removed_ok:
+      if not stopped_ok:
+        self.P(
+          "Container stop reported an error, but remove succeeded; treating "
+          "container as stopped for restart/cleanup purposes.",
+          color='y',
+        )
       self.container = None
       self.container_id = None
     # end try
-    return stopped_ok and removed_ok
+    return removed_ok
 
 
   def _stream_logs(self, log_stream):
@@ -2776,6 +2783,15 @@ class ContainerAppRunnerPlugin(
 
     # Stop the container if it's running
     stopped = self.stop_container()
+    if not stopped:
+      self._runtime_stop_degraded = True
+      self.P(
+        "Container runtime stop failed after sidecars were stopped; container "
+        "may still be running and volume mutation/cleanup must be skipped.",
+        color='r',
+      )
+    else:
+      self._runtime_stop_degraded = False
 
     return stopped
 
@@ -2797,10 +2813,16 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    self._stop_container_runtime_for_restart()
+    stopped = self._stop_container_runtime_for_restart()
 
     # Cleanup fixed-size volumes (unmount + detach loop devices)
-    self._cleanup_fixed_size_volumes()
+    if stopped:
+      self._cleanup_fixed_size_volumes()
+    else:
+      self.P(
+        "Skipping fixed-size volume cleanup because container stop/remove failed.",
+        color='r',
+      )
 
     # Save logs to disk under the instance's `logs/` sibling folder
     # (resolves to pipelines_data/{sid}/{iid}/logs/container_logs.pkl)

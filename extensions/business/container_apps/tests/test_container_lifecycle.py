@@ -396,6 +396,17 @@ class TestLifecycleStop(unittest.TestCase):
     self.assertIs(plugin.container, container)
     self.assertEqual(plugin.container_id, container.short_id)
 
+  def test_stop_error_but_remove_success_returns_true_and_clears_reference(self):
+    plugin, _, container = self._launch()
+    container.stop.side_effect = RuntimeError("docker timeout")
+
+    result = plugin.stop_container()
+
+    self.assertTrue(result)
+    container.remove.assert_called_once()
+    self.assertIsNone(plugin.container)
+    self.assertIsNone(plugin.container_id)
+
   def test_stop_and_save_logs_saves_to_disk(self):
     plugin, _, container = self._launch()
     plugin.diskapi_save_pickle_to_data = MagicMock()
@@ -432,6 +443,28 @@ class TestLifecycleStop(unittest.TestCase):
     container.stop.assert_called_once_with(timeout=5)
     container.remove.assert_called_once()
     plugin._cleanup_fixed_size_volumes.assert_not_called()
+    self.assertFalse(plugin._runtime_stop_degraded)
+
+  def test_runtime_stop_failure_marks_degraded(self):
+    plugin, _, container = self._launch()
+    container.remove.side_effect = RuntimeError("still running")
+
+    result = plugin._stop_container_runtime_for_restart()
+
+    self.assertFalse(result)
+    self.assertTrue(plugin._runtime_stop_degraded)
+    self.assertIs(plugin.container, container)
+
+  def test_stop_and_save_logs_skips_volume_cleanup_on_stop_failure(self):
+    plugin, _, container = self._launch()
+    container.remove.side_effect = RuntimeError("still running")
+    plugin.diskapi_save_pickle_to_data = MagicMock()
+    plugin._cleanup_fixed_size_volumes = MagicMock()
+
+    plugin._stop_container_and_save_logs_to_disk()
+
+    plugin._cleanup_fixed_size_volumes.assert_not_called()
+    plugin.diskapi_save_pickle_to_data.assert_called_once()
 
   def test_on_close_stops_container(self):
     plugin, _, container = self._launch()
