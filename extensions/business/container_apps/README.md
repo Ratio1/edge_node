@@ -242,7 +242,7 @@ requests are preserved as `request.json.invalid` with a sanitized error.
 `/r1en_system` is CAR-owned control plane: the mount root and `volume-sync/`
 directory are enforced as root-owned. Apps can write requests through the sticky
 `01777` `volume-sync/` directory, but cannot own or replace the control
-directory.
+directory. CAR-owned result files are app-readable but not app-writable.
 
 Consumer lifecycle is local policy. Providers may publish runtime metadata, but
 consumers apply according to their own `CONSUMER_APPLY_MODE`:
@@ -255,10 +255,17 @@ consumers apply according to their own `CONSUMER_APPLY_MODE`:
 
 Published manifests include `schema_version`, `archive_format`, `encryption`,
 and `archive_paths`. Consumers validate these before downloading/applying a CID.
-In `offline_restart` mode the consumer validates the ChainStore record before
-stopping the container, and skips malformed or unmapped records without restart
-churn. Offline provider capture and offline consumer apply both abort without
-filesystem mutation if CAR cannot confirm the container stopped/removed.
+In `offline_restart` mode the consumer validates the ChainStore record,
+downloads the CID, validates the tar, and prepares an apply plan before stopping
+the container. Bad CIDs or corrupt archives are quarantined with retry backoff,
+so a bad publish does not repeatedly stop a consumer. Offline provider capture
+and offline consumer apply both abort without filesystem mutation if CAR cannot
+confirm the container stopped/removed.
+
+Consumer apply state is tracked in host-private plugin data. `last_apply.json`
+is app-visible notification only; CAR deduplicates from durable internal apply
+state and leaves the container stopped if rollback cannot prove the volume is
+consistent.
 
 Provider publishes require a positive `chainstore_hset` acknowledgement. If the
 record is not confirmed, CAR reports an error, removes the just-uploaded CID

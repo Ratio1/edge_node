@@ -24,6 +24,7 @@ from extensions.business.container_apps.sync import (
   history_received_dir,
   volume_sync_dir,
 )
+from extensions.business.container_apps.sync.manager import ApplyResult
 from extensions.business.container_apps.tests.test_sync_manager import (
   _FakeDockerArchiveContainer,
   _FakeChainStore,
@@ -674,6 +675,38 @@ class TestConsumerTick(unittest.TestCase):
     self.assertEqual(
       len(list(history_received_dir(self.consumer_plugin).glob("*.json"))), 0
     )
+
+  def test_r1fs_failure_is_quarantined_before_container_stop(self):
+    self._publish(content=b"new-data")
+    self.consumer_owner._r1fs.get_should_raise = RuntimeError("network down")
+
+    self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+
+    self.assertEqual(self.consumer_plugin.lifecycle_log, [])
+    record = self.consumer_owner._cs.store[("CHAINSTORE_SYNC", "SYNC-KEY-1")]
+    self.assertIsNotNone(self.consumer_plugin._sync_manager.quarantined_record(record))
+
+    self.consumer_plugin._last_sync_check = 0
+    self.consumer_plugin._sync_consumer_tick(current_time=3000.0)
+
+    self.assertEqual(self.consumer_plugin.lifecycle_log, [])
+
+  def test_uncertain_apply_does_not_restart_container(self):
+    self._publish(content=b"new-data")
+
+    def uncertain(_prepared):
+      return ApplyResult(False, False, "uncertain", [], "rollback failed")
+
+    sm = self.consumer_plugin._ensure_sync_manager()
+    with patch.object(
+      sm,
+      "commit_prepared_apply",
+      side_effect=uncertain,
+    ):
+      self.consumer_plugin._sync_consumer_tick(current_time=2000.0)
+
+    self.assertEqual(self.consumer_plugin.lifecycle_log, ["stop"])
+    self.assertEqual(self.consumer_plugin.start_calls, 0)
 
   def test_non_dict_manifest_skips_without_restart(self):
     self.consumer_owner._cs.store[("CHAINSTORE_SYNC", "SYNC-KEY-1")] = {

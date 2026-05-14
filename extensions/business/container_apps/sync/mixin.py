@@ -441,18 +441,22 @@ class _SyncMixin:
     if not record_cid:
       return
 
-    latest_local = sm.latest_received()
+    latest_local = sm.latest_applied()
     last_cid = (latest_local or {}).get("cid") if latest_local else None
     if last_cid and record_cid == last_cid:
       return  # same bundle as the last apply — nothing to do
 
-    rejection_reasons = sm.validate_record_for_apply(record)
-    if rejection_reasons:
+    quarantined = sm.quarantined_record(record)
+    if quarantined is not None:
       self.P(
-        f"[sync] skipping consumer apply for cid={record_cid}: "
-        + "; ".join(rejection_reasons),
-        color="r",
+        f"[sync] skipping quarantined consumer cid={record_cid} until "
+        f"{quarantined.get('next_retry_after')}: {quarantined.get('error')}",
+        color="y",
       )
+      return
+
+    prepared = sm.prepare_apply(record)
+    if prepared is None:
       return
 
     self.P(
@@ -470,16 +474,28 @@ class _SyncMixin:
           "could not stop/remove container for offline apply",
           color="r",
         )
+        sm._cleanup_tree(prepared.staging_dir)
         return
 
     applied = False
+    restart_safe = True
     try:
-      applied = bool(sm.apply_snapshot(record))
+      result = sm.commit_prepared_apply(prepared)
+      applied = bool(result.success)
+      restart_safe = bool(result.restart_safe)
+      if applied:
+        sm._finalize_apply_success(record, result.extracted_paths)
     except Exception as exc:
-      self.P(f"[sync] apply_snapshot raised unexpectedly: {exc}", color="r")
+      restart_safe = False
+      self.P(f"[sync] commit_prepared_apply raised unexpectedly: {exc}", color="r")
 
-    if apply_mode == CONSUMER_APPLY_OFFLINE_RESTART:
+    if apply_mode == CONSUMER_APPLY_OFFLINE_RESTART and restart_safe:
       self._sync_safe_start_container()
+    elif apply_mode == CONSUMER_APPLY_OFFLINE_RESTART:
+      self.P(
+        f"[sync] leaving container stopped after uncertain apply for cid={record_cid}",
+        color="r",
+      )
     elif apply_mode == CONSUMER_APPLY_ONLINE_RESTART and applied:
       stopped = self._stop_container_runtime_for_restart()
       if stopped:

@@ -24,6 +24,7 @@ from extensions.business.container_apps.sync import (
   SyncManager,
   history_received_dir,
   history_sent_dir,
+  sync_state_dir,
   system_volume_host_root,
   volume_sync_dir,
 )
@@ -1488,6 +1489,11 @@ class TestConsumerFlow(unittest.TestCase):
     self.assertEqual(la["version"], record["version"])
     self.assertIn("applied_timestamp", la)
 
+    # Host-private apply state is the durable dedupe source.
+    state = json.loads((sync_state_dir(self.consumer) / "current_apply.json").read_text())
+    self.assertEqual(state["state"], "applied")
+    self.assertEqual(state["cid"], record["cid"])
+
     # History entry
     files = list(history_received_dir(self.consumer).glob("*.json"))
     self.assertEqual(len(files), 1)
@@ -1583,6 +1589,68 @@ class TestConsumerFlow(unittest.TestCase):
     ok = self.sm_c.apply_snapshot(record)
     self.assertFalse(ok)
     self.assertFalse((volume_sync_dir(self.consumer) / "last_apply.json").exists())
+    self.assertIsNotNone(self.sm_c.quarantined_record(record))
+
+  def test_apply_success_dedupes_from_state_when_history_append_fails(self):
+    (volume_sync_dir(self.provider) / SYNC_PROCESSING_FILE).write_text("{}")
+    self.sm_p.publish_snapshot(["/app/data/"], {})
+    record = self.sm_c.fetch_latest()
+
+    with patch.object(self.sm_c, "append_received", side_effect=RuntimeError("disk full")):
+      ok = self.sm_c.apply_snapshot(record)
+
+    self.assertTrue(ok)
+    self.assertEqual(len(list(history_received_dir(self.consumer).glob("*.json"))), 0)
+    latest = self.sm_c.latest_applied()
+    self.assertEqual(latest["state"], "applied")
+    self.assertEqual(latest["cid"], record["cid"])
+
+  def test_commit_prepared_apply_rolls_back_touched_files_on_failure(self):
+    target = self.consumer._fixed_root / "appdata" / "weights.bin"
+    target.write_bytes(b"old")
+    second = self.consumer._fixed_root / "appdata" / "second.bin"
+
+    tar_path = self.tmpdir / "rollback.tar.gz"
+    src1 = self.tmpdir / "new-weights.bin"
+    src2 = self.tmpdir / "second.bin"
+    src1.write_bytes(b"new")
+    src2.write_bytes(b"second")
+    with tarfile.open(str(tar_path), "w:gz") as tar:
+      tar.add(str(src1), arcname="/app/data/weights.bin")
+      tar.add(str(src2), arcname="/app/data/second.bin")
+
+    cid = "QmROLLBACK"
+    self.consumer._r1fs.added[cid] = tar_path.read_bytes()
+    record = {
+      "cid": cid,
+      "version": 123,
+      "timestamp": 1.0,
+      "node_id": "ee_provider",
+      "metadata": {},
+      "manifest": {
+        "schema_version": 1,
+        "archive_paths": ["/app/data/"],
+        "archive_format": "tar.gz",
+        "encryption": "r1fs-default",
+      },
+    }
+    prepared = self.sm_c.prepare_apply(record)
+    self.assertIsNotNone(prepared)
+
+    with patch.object(
+      self.sm_c,
+      "_safe_extract_mode",
+      side_effect=[0o644, RuntimeError("chmod failed")],
+    ):
+      result = self.sm_c.commit_prepared_apply(prepared)
+
+    self.assertFalse(result.success)
+    self.assertTrue(result.restart_safe)
+    self.assertEqual(result.state, "failed_rolled_back")
+    self.assertEqual(target.read_bytes(), b"old")
+    self.assertFalse(second.exists())
+    state = json.loads((sync_state_dir(self.consumer) / "current_apply.json").read_text())
+    self.assertEqual(state["state"], "failed_rolled_back")
 
   def test_apply_rejects_symlink_escape_without_advancing_state(self):
     outside = self.tmpdir / "outside"

@@ -46,6 +46,7 @@ from .manager import (
   history_received_dir,
   history_root,
   history_sent_dir,
+  sync_state_dir,
   system_volume_host_root,
   volume_sync_dir,
 )
@@ -80,6 +81,7 @@ __all__ = [
   "history_received_dir",
   "history_root",
   "history_sent_dir",
+  "sync_state_dir",
   "system_volume_host_root",
   "volume_sync_dir",
   # classes

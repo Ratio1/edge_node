@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 import copy
+import hashlib
 import stat
 import tarfile
 import tempfile
@@ -46,6 +47,11 @@ from .control_files import (
 )
 
 _HISTORY_WRITTEN_AT_NS = "history_written_at_ns"
+_SYNC_STATE_DIR = "state"
+_SYNC_APPLY_STATE_FILE = "current_apply.json"
+_SYNC_QUARANTINE_DIR = "quarantine"
+_BAD_CID_RETRY_BASE_SECONDS = 60.0
+_BAD_CID_RETRY_MAX_SECONDS = 3600.0
 PROVIDER_CAPTURE_OFFLINE = "offline"
 PROVIDER_CAPTURE_ONLINE = "online"
 CONSUMER_APPLY_OFFLINE_RESTART = "offline_restart"
@@ -98,6 +104,36 @@ class SyncRequest:
   runtime: SyncRuntimePolicy
 
 
+@dataclass(frozen=True)
+class PlannedApplyMember:
+  container_name: str
+  host_path: str
+  host_root: str
+  staging_path: Optional[Path]
+  mode: int
+  is_dir: bool
+
+
+@dataclass(frozen=True)
+class PreparedApply:
+  record: dict
+  cid: str
+  version: int
+  local_path: str
+  staging_dir: Path
+  members: list[PlannedApplyMember]
+  manifest: dict
+
+
+@dataclass(frozen=True)
+class ApplyResult:
+  success: bool
+  restart_safe: bool
+  state: str
+  extracted_paths: list[str]
+  error: Optional[str] = None
+
+
 def runtime_policy_to_dict(runtime: SyncRuntimePolicy) -> dict:
   return {
     "provider_capture": runtime.provider_capture,
@@ -143,6 +179,19 @@ def history_sent_dir(owner) -> Path:
 
 def history_received_dir(owner) -> Path:
   return history_root(owner) / SYNC_HISTORY_RECEIVED
+
+
+def sync_state_dir(owner) -> Path:
+  """Host-private sync state root; never mounted into the app container."""
+  return history_root(owner) / _SYNC_STATE_DIR
+
+
+def apply_state_path(owner) -> Path:
+  return sync_state_dir(owner) / _SYNC_APPLY_STATE_FILE
+
+
+def quarantine_dir(owner) -> Path:
+  return sync_state_dir(owner) / _SYNC_QUARANTINE_DIR
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +546,104 @@ class SyncManager:
   def latest_received(self) -> Optional[dict]:
     """Return the most recent consumer history entry, or None if empty."""
     return self._latest_in(history_received_dir(self.owner))
+
+  def _write_apply_state(
+    self,
+    state: str,
+    record: dict,
+    **extra: Any,
+  ) -> dict:
+    payload = {
+      "state": state,
+      "cid": record.get("cid") if isinstance(record, dict) else None,
+      "version": record.get("version") if isinstance(record, dict) else None,
+      "timestamp": self.owner.time(),
+    }
+    payload.update(extra)
+    self._write_json_atomic(apply_state_path(self.owner), payload)
+    return payload
+
+  def read_apply_state(self) -> Optional[dict]:
+    path = apply_state_path(self.owner)
+    try:
+      with path.open("r", encoding="utf-8") as handle:
+        state = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+      return None
+    return state if isinstance(state, dict) else None
+
+  def latest_applied(self) -> Optional[dict]:
+    """Return the durable last-applied state, falling back to old history."""
+    state = self.read_apply_state()
+    if state and state.get("state") == "applied" and state.get("cid"):
+      return state
+    return self.latest_received()
+
+  @staticmethod
+  def _record_digest(record: dict) -> str:
+    payload = {
+      "cid": record.get("cid"),
+      "manifest": record.get("manifest") if isinstance(record, dict) else None,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+  def _quarantine_path(self, record: dict) -> Path:
+    cid = str(record.get("cid") or "no_cid")
+    safe_cid = "".join(ch if ch.isalnum() else "_" for ch in cid)[:32] or "no_cid"
+    return quarantine_dir(self.owner) / f"{safe_cid}__{self._record_digest(record)[:16]}.json"
+
+  def _record_preflight_failure(self, record: dict, stage: str, error: str) -> None:
+    now = self.owner.time()
+    path = self._quarantine_path(record)
+    previous = {}
+    try:
+      with path.open("r", encoding="utf-8") as handle:
+        loaded = json.load(handle)
+        if isinstance(loaded, dict):
+          previous = loaded
+    except (OSError, json.JSONDecodeError):
+      previous = {}
+
+    failure_count = int(previous.get("failure_count") or 0) + 1
+    retry_after = min(
+      _BAD_CID_RETRY_MAX_SECONDS,
+      _BAD_CID_RETRY_BASE_SECONDS * (2 ** min(failure_count - 1, 5)),
+    )
+    payload = {
+      "cid": record.get("cid"),
+      "version": record.get("version"),
+      "manifest_digest": self._record_digest(record),
+      "stage": stage,
+      "error": error,
+      "failure_count": failure_count,
+      "first_seen": previous.get("first_seen", now),
+      "last_failed": now,
+      "next_retry_after": now + retry_after,
+    }
+    try:
+      self._write_json_atomic(path, payload)
+    except Exception as exc:
+      self.owner.P(f"[sync] failed to write quarantine state: {exc}", color="r")
+      return
+    try:
+      self._write_apply_state("failed_preflight", record, stage=stage, error=error)
+    except Exception as exc:
+      self.owner.P(f"[sync] failed to write apply preflight state: {exc}", color="r")
+
+  def quarantined_record(self, record: dict) -> Optional[dict]:
+    path = self._quarantine_path(record)
+    try:
+      with path.open("r", encoding="utf-8") as handle:
+        payload = json.load(handle)
+    except (OSError, json.JSONDecodeError):
+      return None
+    if not isinstance(payload, dict):
+      return None
+    next_retry_after = payload.get("next_retry_after")
+    if isinstance(next_retry_after, (int, float)) and self.owner.time() < next_retry_after:
+      return payload
+    return None
 
   def update_history_deletion(
     self, history_dir: Path, entry: dict, succeeded: bool, error: Optional[str]
@@ -1332,46 +1479,290 @@ class SyncManager:
         extracted.append(container_name)
     return extracted
 
-  def apply_snapshot(self, record: dict) -> bool:
-    """Full consumer orchestration: validate_manifest → r1fs.get_file →
-    extract → history append → last_apply.json → retire previous CID.
+  def _new_apply_staging_dir(self) -> Path:
+    root = sync_state_dir(self.owner) / "staging"
+    root.mkdir(parents=True, exist_ok=True)
+    return Path(tempfile.mkdtemp(prefix="apply.", dir=str(root)))
 
-    Returns True on success, False on any failure. On failure no
-    last_apply.json is written so the consumer-side app can tell nothing
-    landed; history is not advanced.
-    """
+  @staticmethod
+  def _cleanup_tree(path: Optional[Path]) -> None:
+    if path is None:
+      return
+    try:
+      if path.is_dir():
+        for child in sorted(path.rglob("*"), reverse=True):
+          if child.is_dir():
+            child.rmdir()
+          else:
+            child.unlink()
+        path.rmdir()
+      elif path.exists():
+        path.unlink()
+    except OSError:
+      pass
+
+  def _stage_tar_member(self, fobj, staging_dir: Path, index: int) -> Path:
+    staging_path = staging_dir / f"{index:06d}.blob"
+    with staging_path.open("wb") as out:
+      while True:
+        chunk = fobj.read(1024 * 1024)
+        if not chunk:
+          break
+        out.write(chunk)
+      out.flush()
+      os.fsync(out.fileno())
+    return staging_path
+
+  def prepare_apply(self, record: dict) -> Optional[PreparedApply]:
+    """Validate and stage a consumer snapshot before stopping the app."""
     rejection_reasons = self.validate_record_for_apply(record)
     if rejection_reasons:
       cid = record.get("cid") if isinstance(record, dict) else None
       version = record.get("version") if isinstance(record, dict) else None
-      self.owner.P(
-        f"[sync] cannot apply v{version} (cid={cid}): "
-        + "; ".join(rejection_reasons),
-        color="r",
-      )
-      return False
+      error = "; ".join(rejection_reasons)
+      self.owner.P(f"[sync] cannot prepare v{version} (cid={cid}): {error}", color="r")
+      if isinstance(record, dict) and record.get("cid"):
+        self._record_preflight_failure(record, STAGE_VALIDATION, error)
+      return None
+
     cid = record["cid"]
     version = record["version"]
+    try:
+      self._write_apply_state("preparing", record)
+    except Exception as exc:
+      self.owner.P(f"[sync] failed to write apply preparing state: {exc}", color="r")
 
     try:
       local_path = self.owner.r1fs.get_file(cid)
     except Exception as exc:
       self.owner.P(f"[sync] r1fs.get_file({cid}) failed: {exc}", color="r")
-      return False
+      self._record_preflight_failure(record, "r1fs_download", str(exc))
+      return None
     if not local_path:
-      self.owner.P(f"[sync] r1fs.get_file({cid}) returned no path", color="r")
-      return False
+      error = f"r1fs.get_file({cid}) returned no path"
+      self.owner.P(f"[sync] {error}", color="r")
+      self._record_preflight_failure(record, "r1fs_download", error)
+      return None
 
+    staging_dir: Optional[Path] = None
     try:
+      staging_dir = self._new_apply_staging_dir()
       manifest = record.get("manifest") or {}
-      extracted = self.extract_archive(
-        local_path,
-        allowed_archive_paths=manifest.get("archive_paths") or [],
+      allowed_archive_paths = manifest.get("archive_paths") or []
+      planned: list[PlannedApplyMember] = []
+      with tarfile.open(str(local_path), "r:gz") as tar:
+        for index, member in enumerate(tar.getmembers()):
+          if member.issym() or member.islnk():
+            self.owner.P(
+              f"[sync] skipping link member in tar (security): {member.name}",
+              color="y",
+            )
+            continue
+          if any(part == ".." for part in member.name.split("/")):
+            raise ValueError(f"tar member name contains '..': {member.name!r}")
+          container_name = member.name
+          if not container_name.startswith("/"):
+            container_name = "/" + container_name
+          if not self._container_path_in_declared_archive_paths(
+            container_name, allowed_archive_paths
+          ):
+            raise ValueError(
+              f"tar member outside manifest archive_paths: {container_name!r}"
+            )
+          host_path, _bind, host_root = self.resolve_container_path(container_name)
+          self._validate_extract_target_within_root(host_path, host_root, container_name)
+          if member.isdir():
+            planned.append(PlannedApplyMember(
+              container_name=container_name,
+              host_path=host_path,
+              host_root=host_root,
+              staging_path=None,
+              mode=member.mode,
+              is_dir=True,
+            ))
+            continue
+          if not member.isfile():
+            continue
+          fobj = tar.extractfile(member)
+          if fobj is None:
+            continue
+          staging_path = self._stage_tar_member(fobj, staging_dir, index)
+          planned.append(PlannedApplyMember(
+            container_name=container_name,
+            host_path=host_path,
+            host_root=host_root,
+            staging_path=staging_path,
+            mode=member.mode,
+            is_dir=False,
+          ))
+      return PreparedApply(
+        record=dict(record),
+        cid=cid,
+        version=version,
+        local_path=str(local_path),
+        staging_dir=staging_dir,
+        members=planned,
+        manifest=dict(manifest),
       )
     except Exception as exc:
-      self.owner.P(f"[sync] extract_archive failed: {exc}", color="r")
-      return False
+      self.owner.P(f"[sync] prepare_apply failed for cid={cid}: {exc}", color="r")
+      self._cleanup_tree(staging_dir)
+      self._record_preflight_failure(record, STAGE_EXTRACT, str(exc))
+      return None
 
+  @staticmethod
+  def _new_backup_path(host_path: str) -> str:
+    directory = os.path.dirname(host_path)
+    fd, backup_path = tempfile.mkstemp(
+      dir=directory,
+      prefix=f".{os.path.basename(host_path)}.syncbak.",
+      suffix=".bak",
+    )
+    os.close(fd)
+    os.unlink(backup_path)
+    return backup_path
+
+  @staticmethod
+  def _unlink_path(path: str) -> None:
+    try:
+      os.unlink(path)
+    except FileNotFoundError:
+      pass
+
+  def _rollback_apply_ops(self, ops: list[tuple[str, str, Optional[str]]]) -> bool:
+    ok = True
+    for op, path, backup in reversed(ops):
+      try:
+        if op == "restore" and backup:
+          self._unlink_path(path)
+          os.replace(backup, path)
+        elif op == "remove_file":
+          self._unlink_path(path)
+        elif op == "remove_dir":
+          os.rmdir(path)
+      except OSError as exc:
+        ok = False
+        self.owner.P(f"[sync] rollback operation failed for {path}: {exc}", color="r")
+    return ok
+
+  def _cleanup_backups(self, ops: list[tuple[str, str, Optional[str]]]) -> None:
+    for op, _path, backup in ops:
+      if op == "restore" and backup:
+        try:
+          os.unlink(backup)
+        except OSError:
+          pass
+
+  def commit_prepared_apply(self, prepared: PreparedApply) -> ApplyResult:
+    """Apply a prepared snapshot while the app container is stopped."""
+    try:
+      self._write_apply_state("applying", prepared.record)
+    except Exception as exc:
+      error = f"could not write applying state: {exc}"
+      self.owner.P(f"[sync] {error}", color="r")
+      self._cleanup_tree(prepared.staging_dir)
+      return ApplyResult(False, True, "failed_preflight", [], error)
+
+    ops: list[tuple[str, str, Optional[str]]] = []
+    extracted: list[str] = []
+    try:
+      for planned in prepared.members:
+        owner_uid, owner_gid = self._volume_owner(planned.host_root)
+        self._validate_extract_target_within_root(
+          planned.host_path, planned.host_root, planned.container_name
+        )
+        if planned.is_dir:
+          existed = os.path.isdir(planned.host_path)
+          self._ensure_directory_tree_owner(
+            planned.host_path, planned.host_root, owner_uid, owner_gid
+          )
+          self._validate_extract_target_within_root(
+            planned.host_path, planned.host_root, planned.container_name
+          )
+          os.chmod(planned.host_path, self._safe_extract_mode(planned.mode, is_dir=True))
+          if not existed:
+            ops.append(("remove_dir", planned.host_path, None))
+          extracted.append(planned.container_name)
+          continue
+
+        if planned.staging_path is None:
+          continue
+        parent = os.path.dirname(planned.host_path)
+        self._ensure_directory_tree_owner(parent, planned.host_root, owner_uid, owner_gid)
+        self._validate_extract_target_within_root(
+          planned.host_path, planned.host_root, planned.container_name
+        )
+        if os.path.isdir(planned.host_path):
+          raise ValueError(f"cannot replace directory with file: {planned.container_name!r}")
+
+        backup_path = None
+        if os.path.lexists(planned.host_path):
+          backup_path = self._new_backup_path(planned.host_path)
+          os.replace(planned.host_path, backup_path)
+          ops.append(("restore", planned.host_path, backup_path))
+        else:
+          ops.append(("remove_file", planned.host_path, None))
+
+        fd, tmp_name = tempfile.mkstemp(
+          dir=parent,
+          prefix=f".{os.path.basename(planned.host_path)}.",
+          suffix=".tmp",
+        )
+        try:
+          with os.fdopen(fd, "wb") as out, planned.staging_path.open("rb") as src:
+            while True:
+              chunk = src.read(1024 * 1024)
+              if not chunk:
+                break
+              out.write(chunk)
+            out.flush()
+            os.fsync(out.fileno())
+          self._chown_if_needed(tmp_name, owner_uid, owner_gid)
+          os.chmod(tmp_name, self._safe_extract_mode(planned.mode, is_dir=False))
+          os.replace(tmp_name, planned.host_path)
+        except Exception:
+          try:
+            os.unlink(tmp_name)
+          except OSError:
+            pass
+          raise
+        extracted.append(planned.container_name)
+
+      try:
+        self._write_apply_state(
+          "applied",
+          prepared.record,
+          extracted_paths=list(extracted),
+        )
+      except Exception as exc:
+        raise RuntimeError(f"could not write applied state: {exc}") from exc
+
+      self._cleanup_backups(ops)
+      self._cleanup_tree(prepared.staging_dir)
+      return ApplyResult(True, True, "applied", extracted)
+    except Exception as exc:
+      rollback_ok = self._rollback_apply_ops(ops)
+      state = "failed_rolled_back" if rollback_ok else "uncertain"
+      try:
+        self._write_apply_state(
+          state,
+          prepared.record,
+          error=str(exc),
+          extracted_paths=list(extracted),
+        )
+      except Exception as state_exc:
+        self.owner.P(f"[sync] failed to write apply failure state: {state_exc}", color="r")
+      self._cleanup_tree(prepared.staging_dir)
+      self.owner.P(f"[sync] commit_prepared_apply failed: {exc}", color="r")
+      return ApplyResult(False, rollback_ok, state, extracted, str(exc))
+
+  def _finalize_apply_success(
+    self,
+    record: dict,
+    extracted: list[str],
+  ) -> None:
+    cid = record["cid"]
+    version = record["version"]
     applied_ts = self.owner.time()
     entry = {
       "cid": cid,
@@ -1383,7 +1774,15 @@ class SyncManager:
       "manifest": record.get("manifest") or {},
       "extracted_paths": extracted,
     }
-    self.append_received(entry)
+    history_appended = False
+    try:
+      self.append_received(entry)
+      history_appended = True
+    except Exception as exc:
+      self.owner.P(
+        f"[sync] apply succeeded but received-history append failed: {exc}",
+        color="r",
+      )
 
     last_apply = {
       "cid": cid,
@@ -1400,11 +1799,27 @@ class SyncManager:
     except Exception as exc:
       self.owner.P(f"[sync] failed to write last_apply.json: {exc}", color="r")
 
-    self._retire_previous_cid(
-      history_received_dir(self.owner),
-      cleanup_local_files=True,
-      unpin_remote=False,
-    )
+    if history_appended:
+      self._retire_previous_cid(
+        history_received_dir(self.owner),
+        cleanup_local_files=True,
+        unpin_remote=False,
+      )
+
+  def apply_snapshot(self, record: dict) -> bool:
+    """Full consumer orchestration for callers that already stopped the app.
+
+    ``_SyncMixin`` uses ``prepare_apply`` before stopping the container and
+    ``commit_prepared_apply`` after stopping it. This wrapper keeps older tests
+    and direct callers on the same transaction/state path.
+    """
+    prepared = self.prepare_apply(record)
+    if prepared is None:
+      return False
+    result = self.commit_prepared_apply(prepared)
+    if not result.success:
+      return False
+    self._finalize_apply_success(record, result.extracted_paths)
     return True
 
   # ----- retirement ------------------------------------------------------
