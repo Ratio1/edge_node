@@ -242,17 +242,24 @@ class ProbeBase:
         )
       return False
 
-    # 3. Verify.
+    # 3. Verify. Only literal True confirms; the MUTATION_ATTEMPTED_UNKNOWN
+    # sentinel (and any non-bool truthy value) must NEVER become a
+    # vulnerable finding because Python truthiness collapsed uncertainty
+    # into "confirmed" (PR406 B4).
     confirmed = False
     verify_failed_reason = ""
     if mutated:
       try:
-        confirmed = bool(verify_fn(baseline))
-        if not confirmed:
-          verify_failed_reason = (
-            "mutation_attempted_unknown"
-            if mutation_attempted_unknown else "mutation_unverified"
-          )
+        verify_result = verify_fn(baseline)
+        if verify_result is True:
+          confirmed = True
+        else:
+          confirmed = False
+          if verify_result == MUTATION_ATTEMPTED_UNKNOWN or mutation_attempted_unknown:
+            verify_failed_reason = "mutation_attempted_unknown"
+            mutation_attempted_unknown = True
+          else:
+            verify_failed_reason = "mutation_unverified"
       except Exception as exc:
         confirmed = False
         detail = self._sanitize_error(str(exc))

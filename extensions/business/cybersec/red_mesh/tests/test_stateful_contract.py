@@ -172,6 +172,47 @@ class TestRunStatefulHappyPath(unittest.TestCase):
     self.assertEqual(f.rollback_status, "reverted")
     self.assertEqual(journal.records[0]["status"], "reverted")
 
+  def test_verify_attempted_unknown_must_not_become_vulnerable(self):
+    """B4 (PR406): MUTATION_ATTEMPTED_UNKNOWN from verify_fn is not a confirmation."""
+    p = _make_probe(allow_stateful=True)
+    revert_called = [False]
+
+    def revert(_b):
+      revert_called[0] = True
+      return True
+
+    p.run_stateful(
+      "PT-OAPI6-01",
+      baseline_fn=lambda: None,
+      mutate_fn=lambda b: True,
+      verify_fn=lambda b: MUTATION_ATTEMPTED_UNKNOWN,
+      revert_fn=revert,
+      finding_kwargs={"title": "Verify uncertain", "owasp": "API6:2023"},
+    )
+
+    self.assertTrue(revert_called[0])
+    f = p.findings[0]
+    self.assertEqual(f.status, "inconclusive")
+    self.assertIn("mutation_attempted_unknown", f.evidence[0])
+    self.assertEqual(f.rollback_status, "reverted")
+
+  def test_verify_non_bool_truthy_value_does_not_become_vulnerable(self):
+    """Stray non-bool returns (dicts, strings) must NOT be confirmed via Python truthiness."""
+    p = _make_probe(allow_stateful=True)
+    p.run_stateful(
+      "PT-OAPI3-02",
+      baseline_fn=lambda: {"is_admin": False},
+      mutate_fn=lambda b: True,
+      verify_fn=lambda b: {"changed": True},  # truthy dict, not a confirmation
+      revert_fn=lambda b: True,
+      finding_kwargs={"title": "Mass assignment", "owasp": "API3:2023"},
+    )
+
+    f = p.findings[0]
+    self.assertEqual(f.status, "inconclusive")
+    self.assertNotEqual(f.status, "vulnerable")
+    self.assertEqual(f.rollback_status, "reverted")
+
   def test_cleanup_revert_not_blocked_by_exhausted_probe_budget(self):
     p = _make_probe(allow_stateful=True)
     p.request_budget = RequestBudget(remaining=0, total=0)
