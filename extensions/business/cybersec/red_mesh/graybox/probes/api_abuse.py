@@ -458,16 +458,24 @@ class ApiAbuseProbes(ProbeBase):
                  _probe_state=probe_state):
         if not self.budget(2):
           raise RuntimeError("budget_exhausted")
+        # Track whether the first mutating request was already issued so a
+        # transport failure on the second send still triggers revert
+        # (PR406 B3): leaving the target with the first duplicate in place
+        # while reporting "no mutation needed" is unsafe.
+        mutation_sent = False
         try:
           self.safety.throttle()
           r1 = self._flow_request(
             session, _flow.method, _url, _body, timeout=10,
           )
+          mutation_sent = True
           self.safety.throttle()
           r2 = self._flow_request(
             session, _flow.method, _url, _body, timeout=10,
           )
         except requests.RequestException:
+          if mutation_sent:
+            return self.MUTATION_ATTEMPTED_UNKNOWN
           return False
         _probe_state["both_2xx"] = (
           r1.status_code < 400 and r2.status_code < 400
@@ -480,7 +488,7 @@ class ApiAbuseProbes(ProbeBase):
         try:
           return self._flow_verify(session, _flow)
         except requests.RequestException:
-          return False
+          return self.MUTATION_ATTEMPTED_UNKNOWN
 
       self.run_stateful(
         "PT-OAPI6-02",

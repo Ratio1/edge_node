@@ -6,6 +6,8 @@ import json
 import unittest
 from unittest.mock import MagicMock
 
+import requests
+
 from extensions.business.cybersec.red_mesh.graybox.probes.api_abuse import (
   ApiAbuseProbes,
 )
@@ -260,6 +262,52 @@ class TestApi6FlowAbuse(unittest.TestCase):
     self.assertEqual(len(incon), 1)
     self.assertIn("no_revert_path_configured", "\n".join(incon[0].evidence))
     p.auth.regular_session.post.assert_not_called()
+
+  def test_uniqueness_flow_partial_mutation_still_triggers_revert(self):
+    """B3 (PR406): r1 sent, r2 times out -> revert must run, finding inconclusive."""
+    flow = ApiBusinessFlow(
+      path="/api/orders/",
+      flow_name="purchase",
+      body_template={"account": "{test_account}", "sku": "sku-1"},
+      revert_path="/api/orders/cleanup/",
+      revert_body={"account": "{test_account}", "sku": "sku-1"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    revert_response = _resp(status=204)
+    p.auth.regular_session.post.side_effect = [
+      _resp(status=201),
+      requests.ConnectTimeout("simulated timeout on second send"),
+      revert_response,
+    ]
+
+    p.run_safe("api_flow_no_uniqueness", p._test_flow_no_uniqueness)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-02" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1, p.findings)
+    self.assertEqual(incon[0].rollback_status, "reverted")
+    # Three POSTs: r1, r2 (raises), revert.
+    self.assertEqual(p.auth.regular_session.post.call_count, 3)
+
+  def test_uniqueness_flow_transport_error_before_mutation_skips_revert(self):
+    """If transport fails on r1, nothing was mutated → no revert needed."""
+    flow = ApiBusinessFlow(
+      path="/api/orders/",
+      flow_name="purchase",
+      body_template={"account": "{test_account}", "sku": "sku-1"},
+      revert_path="/api/orders/cleanup/",
+      revert_body={"account": "{test_account}", "sku": "sku-1"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.regular_session.post.side_effect = [
+      requests.ConnectTimeout("simulated timeout on first send"),
+    ]
+
+    p.run_safe("api_flow_no_uniqueness", p._test_flow_no_uniqueness)
+
+    self.assertEqual(p.auth.regular_session.post.call_count, 1)
 
   def test_uniqueness_flow_revert_failure_escalates_severity(self):
     flow = ApiBusinessFlow(
