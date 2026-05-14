@@ -154,6 +154,30 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
     for k, v in SENSITIVE_VALUES.items():
       self.assertEqual(resolved[k], v)
 
+  @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
+  def test_resolve_passes_expected_job_id_before_jobconfig_coercion(self, mock_store_cls):
+    """job_id is not part of JobConfig; preserve it before coercion for secret binding."""
+    fake_store = MagicMock()
+    fake_store.load_graybox_credentials.return_value = {
+      "official_username": "alice", "official_password": "apw",
+      **SENSITIVE_VALUES,
+    }
+    mock_store_cls.return_value = fake_store
+
+    persisted = {
+      "job_id": "job-A",
+      "target": "api.example.com",
+      "start_port": 0, "end_port": 0,
+      "scan_type": "webapp",
+      "secret_ref": "fake://secret/cid",
+    }
+
+    resolve_job_config_secrets(MagicMock(), persisted)
+
+    fake_store.load_graybox_credentials.assert_called_once_with(
+      "fake://secret/cid", expected_job_id="job-A",
+    )
+
 
 class TestSecretIsolationInCredentialsRepr(unittest.TestCase):
 

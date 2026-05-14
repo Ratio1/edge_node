@@ -216,7 +216,12 @@ def persist_job_config_with_secrets(
   return persisted_config, job_config_cid
 
 
-def resolve_job_config_secrets(owner, config_dict: dict, include_secret_metadata: bool = True) -> dict:
+def resolve_job_config_secrets(
+  owner,
+  config_dict: dict,
+  include_secret_metadata: bool = True,
+  expected_job_id: str = "",
+) -> dict:
   """
   Resolve secret_ref into runtime-only inline credentials for worker execution.
 
@@ -224,12 +229,13 @@ def resolve_job_config_secrets(owner, config_dict: dict, include_secret_metadata
   - configs without secret_ref are returned unchanged
   - legacy inline secrets remain supported
   """
-  resolved = _coerce_job_config_dict(config_dict)
+  raw = deepcopy(config_dict or {})
+  expected_job_id = expected_job_id or raw.get("job_id", "")
+  resolved = _coerce_job_config_dict(raw)
   secret_ref = resolved.get("secret_ref")
   if not secret_ref:
     return resolved
 
-  expected_job_id = resolved.get("job_id", "")
   payload = R1fsSecretStore(owner).load_graybox_credentials(
     secret_ref, expected_job_id=expected_job_id,
   )
