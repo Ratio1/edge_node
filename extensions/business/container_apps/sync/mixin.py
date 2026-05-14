@@ -378,17 +378,14 @@ class _SyncMixin:
     control_file = JsonControlFile(
       volume_sync_dir(self), SYNC_REQUEST_FILE, SYNC_PROCESSING_FILE
     )
-    if not control_file.has_pending():
-      return
-
-    self.P(
-      f"[sync] provider tick: claiming {control_file.pending_name} for publish",
-      color="b",
-    )
     claimed = sm.claim_request()
     if claimed is None:
       # claim_request already wrote .invalid + response.json
       return
+    self.P(
+      f"[sync] provider tick: claimed {control_file.processing_name} for publish",
+      color="b",
+    )
 
     stopped_for_sync = claimed.runtime.provider_capture == "offline"
     if stopped_for_sync:

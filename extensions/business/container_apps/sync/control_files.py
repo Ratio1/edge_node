@@ -14,6 +14,7 @@ import json
 import os
 import stat
 import tempfile
+import time as _time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -96,8 +97,8 @@ def write_json_atomic(path: Path, payload: Any) -> None:
 
   Creates the parent directory if missing. Uses a temporary file in the same
   directory so ``os.replace`` is atomic within the filesystem. The final file
-  is chmod'd to 0o666 because CAR runs as root inside the edge node but the
-  app inside the container often runs as a non-root user.
+  is chmod'd to 0o644 so apps can read CAR-owned status/control results
+  without being able to rewrite them.
   """
   path = Path(path)
   _ensure_real_directory(path.parent, create=True)
@@ -109,7 +110,7 @@ def write_json_atomic(path: Path, payload: Any) -> None:
       json.dump(payload, handle, indent=2, sort_keys=True)
       handle.flush()
       os.fsync(handle.fileno())
-    os.chmod(tmp_name, 0o666)
+    os.chmod(tmp_name, 0o644)
     os.replace(tmp_name, str(path))
   except Exception:
     try:
@@ -148,10 +149,58 @@ class JsonControlFile:
       return False
 
   @staticmethod
+  def _quarantine_directory(path: Path) -> None:
+    parent = path.parent
+    base_name = path.name
+    for _ in range(5):
+      target = parent / f"{base_name}.unsafe.{_time.time_ns()}"
+      try:
+        os.replace(str(path), str(target))
+        return
+      except FileExistsError:
+        continue
+    raise JsonControlFileUnsafeError(
+      f"could not quarantine unsafe control directory: {base_name}",
+      processing_path=path,
+    )
+
+  @classmethod
+  def _remove_unsafe_entry(cls, path: Path) -> None:
+    st = os.lstat(str(path))
+    if stat.S_ISDIR(st.st_mode):
+      try:
+        os.rmdir(str(path))
+      except OSError as exc:
+        if getattr(exc, "errno", None) in (errno.ENOTEMPTY, errno.EEXIST):
+          cls._quarantine_directory(path)
+          return
+        raise
+      return
+    os.unlink(str(path))
+
+  @classmethod
+  def _reject_non_regular_control_file(cls, path: Path) -> None:
+    try:
+      st = os.lstat(str(path))
+    except FileNotFoundError:
+      raise
+    if stat.S_ISREG(st.st_mode):
+      return
+    try:
+      cls._remove_unsafe_entry(path)
+    finally:
+      raise JsonControlFileUnsafeError(
+        f"refusing non-regular control file: {path.name}",
+        processing_path=path,
+      )
+
+  @staticmethod
   def _read_text_no_follow(path: Path) -> str:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
       flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+      flags |= os.O_NONBLOCK
 
     fd: Optional[int] = None
     try:
@@ -183,6 +232,7 @@ class JsonControlFile:
     """Atomically rename pending -> processing, returning the processing path."""
     if not self.has_pending():
       return None
+    self._reject_non_regular_control_file(self.pending_path)
     try:
       os.replace(str(self.pending_path), str(self.processing_path))
     except OSError as exc:
@@ -237,7 +287,7 @@ class JsonControlFile:
 
   def discard_processing(self) -> None:
     if os.path.lexists(str(self.processing_path)):
-      os.unlink(str(self.processing_path))
+      self._remove_unsafe_entry(self.processing_path)
 
   def recover_stale_processing(self) -> bool:
     """Rename orphan processing -> pending without overwriting a pending file."""
@@ -252,6 +302,8 @@ class JsonControlFile:
     if stat.S_ISREG(st.st_mode) and not os.path.lexists(str(self.pending_path)):
       os.replace(str(self.processing_path), str(self.pending_path))
       return True
+    if not stat.S_ISREG(st.st_mode):
+      self._remove_unsafe_entry(self.processing_path)
     return False
 
   def write_json(self, file_name: str, payload: Any) -> None:

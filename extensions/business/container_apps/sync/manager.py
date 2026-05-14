@@ -409,10 +409,10 @@ class SyncManager:
 
     Creates the parent directory if missing. Uses a NamedTemporaryFile in
     the same directory so ``os.replace`` is an atomic rename within one
-    filesystem. The final file is chmod'd to 0o666 because CAR runs as
+    filesystem. The final file is chmod'd to 0o644 because CAR runs as
     root inside the edge node but the app inside the container typically
-    runs as a non-root user — without world-readable mode the app can't
-    read response.json / last_apply.json / request.json.invalid.
+    runs as a non-root user. Apps can read response.json / last_apply.json /
+    request.json.invalid, but cannot rewrite CAR-owned outputs.
     """
     write_json_atomic(path, payload)
 

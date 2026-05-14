@@ -30,7 +30,7 @@ class TestWriteJsonAtomic(unittest.TestCase):
     write_json_atomic(target, {"status": "ok", "version": 2})
 
     self.assertEqual(json.loads(target.read_text()), {"status": "ok", "version": 2})
-    self.assertEqual(os.stat(target).st_mode & 0o777, 0o666)
+    self.assertEqual(os.stat(target).st_mode & 0o777, 0o644)
     self.assertEqual(list(target.parent.glob(".response.json.*.tmp")), [])
 
   def test_cleans_tmp_file_on_write_failure(self):
@@ -125,7 +125,30 @@ class TestJsonControlFile(unittest.TestCase):
     self.assertNotIn("host-secret", str(ctx.exception))
     self.assertIsNone(ctx.exception.raw_body)
     self.assertFalse((self.root / "request.json").exists())
-    self.assertTrue((self.root / "request.json.processing").is_symlink())
+    self.assertFalse(os.path.lexists(str(self.root / "request.json.processing")))
+
+  def test_claim_object_rejects_fifo_without_blocking(self):
+    fifo = self.root / "request.json"
+    os.mkfifo(str(fifo))
+
+    with self.assertRaises(JsonControlFileUnsafeError):
+      self.control.claim_object()
+
+    self.assertFalse(os.path.lexists(str(fifo)))
+    self.assertFalse(os.path.lexists(str(self.root / "request.json.processing")))
+
+  def test_claim_object_quarantines_non_empty_directory_request(self):
+    request_dir = self.root / "request.json"
+    request_dir.mkdir()
+    (request_dir / "payload").write_text("keep me")
+
+    with self.assertRaises(JsonControlFileUnsafeError):
+      self.control.claim_object()
+
+    self.assertFalse(os.path.lexists(str(request_dir)))
+    quarantined = list(self.root.glob("request.json.unsafe.*"))
+    self.assertEqual(len(quarantined), 1)
+    self.assertEqual((quarantined[0] / "payload").read_text(), "keep me")
 
   def test_discard_processing_removes_processing_file(self):
     (self.root / "request.json.processing").write_text("{}")
@@ -140,6 +163,18 @@ class TestJsonControlFile(unittest.TestCase):
     self.control.discard_processing()
 
     self.assertFalse(os.path.lexists(str(self.root / "request.json.processing")))
+
+  def test_discard_processing_quarantines_non_empty_directory(self):
+    proc_dir = self.root / "request.json.processing"
+    proc_dir.mkdir()
+    (proc_dir / "payload").write_text("keep me")
+
+    self.control.discard_processing()
+
+    self.assertFalse(os.path.lexists(str(proc_dir)))
+    quarantined = list(self.root.glob("request.json.processing.unsafe.*"))
+    self.assertEqual(len(quarantined), 1)
+    self.assertEqual((quarantined[0] / "payload").read_text(), "keep me")
 
   def test_recover_stale_processing_removes_symlink(self):
     os.symlink(str(self.root / "missing.json"), str(self.root / "request.json.processing"))
@@ -167,6 +202,19 @@ class TestJsonControlFile(unittest.TestCase):
     self.assertFalse(recovered)
     self.assertEqual(json.loads((self.root / "request.json").read_text()), {"new": True})
     self.assertTrue((self.root / "request.json.processing").exists())
+
+  def test_recover_stale_processing_quarantines_non_regular_directory(self):
+    proc_dir = self.root / "request.json.processing"
+    proc_dir.mkdir()
+    (proc_dir / "payload").write_text("keep me")
+
+    recovered = self.control.recover_stale_processing()
+
+    self.assertFalse(recovered)
+    self.assertFalse(os.path.lexists(str(proc_dir)))
+    quarantined = list(self.root.glob("request.json.processing.unsafe.*"))
+    self.assertEqual(len(quarantined), 1)
+    self.assertEqual((quarantined[0] / "payload").read_text(), "keep me")
 
   def test_write_json_writes_relative_to_control_root(self):
     self.control.write_json("response.json", {"status": "ok"})
