@@ -22,6 +22,7 @@ class R1fsSecretStore:
 
   def __init__(self, owner):
     self.owner = owner
+    self.last_key_metadata = {}
 
   @staticmethod
   def _normalize_secret_key(value):
@@ -30,25 +31,92 @@ class R1fsSecretStore:
     value = value.strip()
     return value if len(value) >= 8 else ""
 
+  @staticmethod
+  def _truthy(value) -> bool:
+    if isinstance(value, bool):
+      return value
+    if isinstance(value, str):
+      return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return False
+
+  def _unsafe_fallback_allowed(self) -> bool:
+    return any([
+      self._truthy(os.environ.get("REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK", "")),
+      self._truthy(getattr(self.owner, "cfg_allow_unsafe_secret_store_fallback", False)),
+      self._truthy(getattr(self.owner, "cfg_redmesh_allow_unsafe_secret_store_fallback", False)),
+    ])
+
+  def _dedicated_secret_store_key(self):
+    env_key = self._normalize_secret_key(os.environ.get("REDMESH_SECRET_STORE_KEY", ""))
+    if env_key:
+      return env_key, {
+        "key_id": os.environ.get("REDMESH_SECRET_STORE_KEY_ID", "env:REDMESH_SECRET_STORE_KEY"),
+        "key_version": os.environ.get(
+          "REDMESH_SECRET_STORE_KEY_VERSION",
+          str(getattr(self.owner, "cfg_redmesh_secret_store_key_version", "") or "v1"),
+        ),
+        "key_source": "environment",
+        "unsafe_fallback": False,
+      }
+    cfg_key = self._normalize_secret_key(getattr(self.owner, "cfg_redmesh_secret_store_key", ""))
+    if cfg_key:
+      return cfg_key, {
+        "key_id": str(getattr(
+          self.owner,
+          "cfg_redmesh_secret_store_key_id",
+          "config:cfg_redmesh_secret_store_key",
+        ) or "config:cfg_redmesh_secret_store_key"),
+        "key_version": str(getattr(
+          self.owner,
+          "cfg_redmesh_secret_store_key_version",
+          "v1",
+        ) or "v1"),
+        "key_source": "config",
+        "unsafe_fallback": False,
+      }
+    return "", {}
+
+  def _unsafe_fallback_secret_store_key(self):
+    if not self._unsafe_fallback_allowed():
+      return "", {}
+    comms_key = self._normalize_secret_key(getattr(self.owner, "cfg_comms_host_key", ""))
+    if comms_key:
+      return comms_key, {
+        "key_id": "unsafe-dev:cfg_comms_host_key",
+        "key_version": "unsafe-dev",
+        "key_source": "unsafe_dev_fallback_comms",
+        "unsafe_fallback": True,
+      }
+    attestation_key = self._normalize_secret_key(
+      get_attestation_config(self.owner)["PRIVATE_KEY"]
+    )
+    if attestation_key:
+      return attestation_key, {
+        "key_id": "unsafe-dev:attestation_private_key",
+        "key_version": "unsafe-dev",
+        "key_source": "unsafe_dev_fallback_attestation",
+        "unsafe_fallback": True,
+      }
+    return "", {}
+
+  def _resolve_secret_store_key(self):
+    key, metadata = self._dedicated_secret_store_key()
+    if key:
+      return key, metadata
+    return self._unsafe_fallback_secret_store_key()
+
   def _get_secret_store_key(self) -> str:
-    candidates = [
-      os.environ.get("REDMESH_SECRET_STORE_KEY", ""),
-      getattr(self.owner, "cfg_redmesh_secret_store_key", ""),
-      getattr(self.owner, "cfg_comms_host_key", ""),
-      get_attestation_config(self.owner)["PRIVATE_KEY"],
-    ]
-    for candidate in candidates:
-      key = self._normalize_secret_key(candidate)
-      if key:
-        return key
-    return ""
+    key, _metadata = self._resolve_secret_store_key()
+    return key
 
   def save_graybox_credentials(self, job_id: str, payload: dict) -> str:
-    secret_key = self._get_secret_store_key()
+    secret_key, key_metadata = self._resolve_secret_store_key()
+    self.last_key_metadata = dict(key_metadata or {})
     if not secret_key:
       self.owner.P(
-        "No strong RedMesh secret-store key is configured. "
-        "Graybox launch credentials cannot be persisted safely.",
+        "No dedicated RedMesh secret-store key is configured. "
+        "Set REDMESH_SECRET_STORE_KEY or cfg_redmesh_secret_store_key. "
+        "Development fallback requires REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK=1.",
         color='r',
       )
       return ""
@@ -56,6 +124,10 @@ class R1fsSecretStore:
       "kind": "redmesh_graybox_credentials",
       "job_id": job_id,
       "storage_mode": "encrypted_r1fs_json_v1",
+      "key_id": key_metadata.get("key_id", ""),
+      "key_version": key_metadata.get("key_version", ""),
+      "key_source": key_metadata.get("key_source", ""),
+      "unsafe_key_fallback": bool(key_metadata.get("unsafe_fallback", False)),
       "payload": payload,
     }
     return _artifact_repo(self.owner).put_json(secret_doc, show_logs=False, secret=secret_key)
@@ -64,9 +136,10 @@ class R1fsSecretStore:
     if not secret_ref:
       return None
     repo = _artifact_repo(self.owner)
-    secret_key = self._get_secret_store_key()
+    secret_key, key_metadata = self._resolve_secret_store_key()
+    self.last_key_metadata = dict(key_metadata or {})
     if not secret_key:
-      self.owner.P("No RedMesh secret-store key is configured; cannot resolve graybox secret_ref", color='r')
+      self.owner.P("No dedicated RedMesh secret-store key is configured; cannot resolve graybox secret_ref", color='r')
       return None
     secret_doc = repo.get_json(secret_ref, secret=secret_key)
     if not isinstance(secret_doc, dict):
@@ -212,6 +285,11 @@ def persist_job_config_with_secrets(
         owner.P("Failed to persist graybox secret payload in R1FS — aborting launch", color='r')
         return persisted_config, ""
       persisted_config["secret_ref"] = secret_ref
+      key_metadata = store.last_key_metadata if isinstance(store.last_key_metadata, dict) else {}
+      persisted_config["secret_store_key_id"] = key_metadata.get("key_id", "")
+      persisted_config["secret_store_key_version"] = key_metadata.get("key_version", "")
+      persisted_config["secret_store_key_source"] = key_metadata.get("key_source", "")
+      persisted_config["secret_store_unsafe_fallback"] = bool(key_metadata.get("unsafe_fallback", False))
       persisted_config["has_regular_credentials"] = bool(payload["regular_username"] or payload["regular_password"])
       persisted_config["has_weak_candidates"] = bool(payload["weak_candidates"])
       # OWASP API Top 10 (Subphase 1.5 commit #8) — non-secret capability flags.

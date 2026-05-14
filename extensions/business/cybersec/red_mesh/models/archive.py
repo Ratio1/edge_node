@@ -80,6 +80,10 @@ class JobConfig:
   has_regular_bearer_token: bool = False
   has_regular_api_key: bool = False
   has_regular_bearer_refresh_token: bool = False
+  secret_store_key_id: str = ""
+  secret_store_key_version: str = ""
+  secret_store_key_source: str = ""
+  secret_store_unsafe_fallback: bool = False
   official_username: str = ""
   official_password: str = ""
   regular_username: str = ""
@@ -143,6 +147,10 @@ class JobConfig:
       has_regular_bearer_token=d.get("has_regular_bearer_token", False),
       has_regular_api_key=d.get("has_regular_api_key", False),
       has_regular_bearer_refresh_token=d.get("has_regular_bearer_refresh_token", False),
+      secret_store_key_id=d.get("secret_store_key_id", ""),
+      secret_store_key_version=d.get("secret_store_key_version", ""),
+      secret_store_key_source=d.get("secret_store_key_source", ""),
+      secret_store_unsafe_fallback=d.get("secret_store_unsafe_fallback", False),
       official_username=d.get("official_username", ""),
       official_password=d.get("official_password", ""),
       regular_username=d.get("regular_username", ""),

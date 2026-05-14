@@ -14,6 +14,7 @@ verifying.
 from __future__ import annotations
 
 import json
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,7 @@ from extensions.business.cybersec.red_mesh.services.secrets import (
   build_graybox_secret_payload,
   persist_job_config_with_secrets,
   resolve_job_config_secrets,
+  R1fsSecretStore,
 )
 
 
@@ -77,6 +79,92 @@ class TestSecretIsolationInBuildPayload(unittest.TestCase):
     self.assertEqual(sanitized["regular_bearer_token"], "")
     self.assertEqual(sanitized["regular_api_key"], "")
     self.assertEqual(sanitized["regular_bearer_refresh_token"], "")
+
+
+class TestSecretStoreKeySeparation(unittest.TestCase):
+
+  @patch.dict(os.environ, {}, clear=True)
+  def test_production_refuses_unsafe_fallback_keys(self):
+    owner = MagicMock()
+    owner.P = MagicMock()
+    owner.cfg_redmesh_secret_store_key = ""
+    owner.cfg_comms_host_key = "unsafe-comms-host-key"
+    owner.cfg_attestation = {
+      "ENABLED": True,
+      "PRIVATE_KEY": "unsafe-attestation-key",
+      "MIN_SECONDS_BETWEEN_SUBMITS": 86400,
+      "RETRIES": 2,
+    }
+    owner.r1fs.add_json = MagicMock()
+
+    secret_ref = R1fsSecretStore(owner).save_graybox_credentials(
+      "job-1",
+      {"official_password": "secret"},
+    )
+
+    self.assertEqual(secret_ref, "")
+    owner.r1fs.add_json.assert_not_called()
+
+  @patch.dict(
+    os.environ,
+    {"REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK": "1"},
+    clear=True,
+  )
+  def test_development_fallback_requires_explicit_unsafe_flag(self):
+    owner = MagicMock()
+    owner.P = MagicMock()
+    owner.cfg_redmesh_secret_store_key = ""
+    owner.cfg_comms_host_key = "unsafe-comms-host-key"
+    owner.cfg_attestation = {
+      "ENABLED": True,
+      "PRIVATE_KEY": "",
+      "MIN_SECONDS_BETWEEN_SUBMITS": 86400,
+      "RETRIES": 2,
+    }
+    owner.r1fs.add_json.return_value = "fake://secret/cid"
+
+    store = R1fsSecretStore(owner)
+    secret_ref = store.save_graybox_credentials(
+      "job-1",
+      {"official_password": "secret"},
+    )
+
+    self.assertEqual(secret_ref, "fake://secret/cid")
+    secret_doc = owner.r1fs.add_json.call_args[0][0]
+    secret_kwargs = owner.r1fs.add_json.call_args[1]
+    self.assertTrue(secret_doc["unsafe_key_fallback"])
+    self.assertEqual(secret_doc["key_id"], "unsafe-dev:cfg_comms_host_key")
+    self.assertEqual(secret_doc["key_version"], "unsafe-dev")
+    self.assertEqual(secret_kwargs["secret"], "unsafe-comms-host-key")
+
+  @patch.dict(
+    os.environ,
+    {
+      "REDMESH_SECRET_STORE_KEY": "dedicated-secret-store-key",
+      "REDMESH_SECRET_STORE_KEY_ID": "kms/redmesh/env",
+      "REDMESH_SECRET_STORE_KEY_VERSION": "2026-05",
+    },
+    clear=True,
+  )
+  def test_dedicated_env_key_records_metadata(self):
+    owner = MagicMock()
+    owner.P = MagicMock()
+    owner.cfg_redmesh_secret_store_key = ""
+    owner.r1fs.add_json.return_value = "fake://secret/cid"
+
+    store = R1fsSecretStore(owner)
+    secret_ref = store.save_graybox_credentials(
+      "job-1",
+      {"official_password": "secret"},
+    )
+
+    self.assertEqual(secret_ref, "fake://secret/cid")
+    secret_doc = owner.r1fs.add_json.call_args[0][0]
+    secret_kwargs = owner.r1fs.add_json.call_args[1]
+    self.assertEqual(secret_doc["key_id"], "kms/redmesh/env")
+    self.assertEqual(secret_doc["key_version"], "2026-05")
+    self.assertFalse(secret_doc["unsafe_key_fallback"])
+    self.assertEqual(secret_kwargs["secret"], "dedicated-secret-store-key")
 
 
 class TestSecretIsolationInPersistedConfig(unittest.TestCase):
@@ -183,6 +271,35 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
       ]["client_secret"],
       {"secret_ref": "oauth_client_secret"},
     )
+
+  @patch.dict(os.environ, {}, clear=True)
+  def test_persist_records_dedicated_key_metadata(self):
+    owner = MagicMock()
+    owner.P = MagicMock()
+    owner.cfg_redmesh_secret_store_key = "dedicated-secret-store-key"
+    owner.cfg_redmesh_secret_store_key_id = "kms/redmesh/graybox"
+    owner.cfg_redmesh_secret_store_key_version = "2026-05"
+    owner.r1fs.add_json.side_effect = ["fake://secret/cid", "fake://config/cid"]
+
+    persisted_config, _cid = persist_job_config_with_secrets(
+      owner,
+      job_id="test-job-xyz",
+      config_dict={
+        "target": "api.example.com",
+        "target_url": "https://api.example.com",
+        "start_port": 0, "end_port": 0,
+        "scan_type": "webapp",
+        "official_password": "apw",
+      },
+    )
+
+    secret_doc = owner.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(secret_doc["key_id"], "kms/redmesh/graybox")
+    self.assertEqual(secret_doc["key_version"], "2026-05")
+    self.assertFalse(secret_doc["unsafe_key_fallback"])
+    self.assertEqual(persisted_config["secret_store_key_id"], "kms/redmesh/graybox")
+    self.assertEqual(persisted_config["secret_store_key_version"], "2026-05")
+    self.assertFalse(persisted_config["secret_store_unsafe_fallback"])
 
   @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
   def test_resolve_repopulates_secrets_for_worker(self, mock_store_cls):

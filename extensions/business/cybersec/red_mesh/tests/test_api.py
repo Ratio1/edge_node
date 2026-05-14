@@ -530,14 +530,61 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin.cfg_comms_host_key = ""
     plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 86400, "RETRIES": 2}
 
-    result = self._launch_webapp(
-      plugin,
-      official_username="admin",
-      official_password="secret",
-    )
+    with patch.dict("os.environ", {}, clear=True):
+      result = self._launch_webapp(
+        plugin,
+        official_username="admin",
+        official_password="secret",
+      )
 
     self.assertEqual(result["error"], "Failed to store job config in R1FS")
     self.assertEqual(len(plugin.r1fs.add_json.call_args_list), 0)
+
+  def test_launch_webapp_scan_rejects_implicit_secret_store_fallback_key(self):
+    """Communication/attestation keys are not reused unless unsafe dev fallback is explicit."""
+    plugin = self._build_mock_plugin(job_id="test-job-websecret-fallback-key")
+    plugin.cfg_redmesh_secret_store_key = ""
+    plugin.cfg_comms_host_key = "unsafe-comms-host-key"
+    plugin.cfg_allow_unsafe_secret_store_fallback = False
+    plugin.cfg_attestation = {
+      "ENABLED": True,
+      "PRIVATE_KEY": "unsafe-attestation-key",
+      "MIN_SECONDS_BETWEEN_SUBMITS": 86400,
+      "RETRIES": 2,
+    }
+
+    with patch.dict("os.environ", {}, clear=True):
+      result = self._launch_webapp(
+        plugin,
+        official_username="admin",
+        official_password="secret",
+      )
+
+    self.assertEqual(result["error"], "Failed to store job config in R1FS")
+    self.assertEqual(len(plugin.r1fs.add_json.call_args_list), 0)
+
+  def test_launch_webapp_scan_records_unsafe_secret_store_fallback_metadata(self):
+    """Explicit unsafe fallback is visible in persisted non-secret metadata."""
+    plugin = self._build_mock_plugin(job_id="test-job-websecret-dev-fallback")
+    plugin.cfg_redmesh_secret_store_key = ""
+    plugin.cfg_comms_host_key = "unsafe-comms-host-key"
+    plugin.cfg_allow_unsafe_secret_store_fallback = True
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    with patch.dict("os.environ", {}, clear=True):
+      result = self._launch_webapp(
+        plugin,
+        official_username="admin",
+        official_password="secret",
+      )
+
+    self.assertNotIn("error", result)
+    secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(secret_doc["unsafe_key_fallback"])
+    self.assertEqual(secret_doc["key_id"], "unsafe-dev:cfg_comms_host_key")
+    self.assertTrue(config_dict["secret_store_unsafe_fallback"])
+    self.assertEqual(config_dict["secret_store_key_id"], "unsafe-dev:cfg_comms_host_key")
 
   def test_launch_webapp_scan_rejects_missing_target_url(self):
     """Webapp endpoint returns structured validation error for missing URL."""
