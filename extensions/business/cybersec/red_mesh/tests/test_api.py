@@ -3011,6 +3011,75 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertIn("secret_ref", worker["error"])
     write.assert_called_once()
 
+  def test_mark_worker_terminal_error_merges_against_current_record(self):
+    """B8: concurrent terminal writes must merge by worker key, not overwrite."""
+    Plugin = self._get_plugin_class()
+    # Current record in CStore has worker-A already terminal (written by
+    # worker A's concurrent failure).
+    current_record = {
+      "job_id": "job-concurrent",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "target": "example.com",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/app",
+      "start_port": 443,
+      "end_port": 443,
+      "date_created": 1000000.0,
+      "job_config_cid": "QmConfig",
+      "workers": {
+        "worker-A": {
+          "start_port": 443, "end_port": 443,
+          "finished": True,
+          "terminal_reason": "assignment_validation_failed",
+          "error": "A error",
+        },
+        "worker-B": {"start_port": 443, "end_port": 443, "finished": False},
+      },
+      "timeline": [],
+      "pass_reports": [],
+      "job_revision": 7,
+    }
+    plugin = self._build_plugin({"job-concurrent": current_record})
+
+    # Worker-B's stale local snapshot doesn't know about A's terminal flag.
+    stale_snapshot = {
+      "job_id": "job-concurrent",
+      "workers": {
+        "worker-A": {"start_port": 443, "end_port": 443, "finished": False},
+        "worker-B": {"start_port": 443, "end_port": 443, "finished": False},
+      },
+    }
+
+    captured = {}
+
+    def _capture(self_plugin, job_id, job_specs, expected_revision=None, context=""):
+      captured["job_id"] = job_id
+      captured["job_specs"] = dict(job_specs)
+      captured["context"] = context
+      return job_specs
+
+    with patch.object(Plugin, "_write_job_record", side_effect=_capture):
+      Plugin._mark_worker_terminal_error(
+        plugin,
+        stale_snapshot,
+        "worker-B",
+        "launch_failed",
+        "B error",
+        context="b_terminal",
+      )
+
+    persisted_workers = captured["job_specs"]["workers"]
+    # A's pre-existing terminal data survived the B write.
+    self.assertTrue(persisted_workers["worker-A"]["finished"])
+    self.assertEqual(persisted_workers["worker-A"]["terminal_reason"], "assignment_validation_failed")
+    self.assertEqual(persisted_workers["worker-A"]["error"], "A error")
+    # B's terminal patch is applied.
+    self.assertTrue(persisted_workers["worker-B"]["finished"])
+    self.assertEqual(persisted_workers["worker-B"]["terminal_reason"], "launch_failed")
+
   def test_maybe_launch_jobs_secret_resolution_failure_marks_terminal(self):
     Plugin = self._get_plugin_class()
     assignments, error = build_graybox_worker_assignments(["launcher-node"])
