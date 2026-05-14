@@ -424,6 +424,74 @@ def build_graybox_worker_assignments(
   return assignments, None
 
 
+_LEGACY_ASSIGNMENT_FIELDS = (
+  "graybox_assignment_strategy",
+  "assigned_scenario_ids",
+  "assigned_request_budget",
+  "budget_scope",
+  "assignment_hash",
+)
+
+
+def synthesize_legacy_mirror_assignment(
+  job_config: dict | None,
+  worker_entry: dict | None,
+) -> dict | None:
+  """Build a compat MIRROR assignment for assignmentless webapp jobs (PR406 B7).
+
+  Returns a dict matching ``GrayboxWorkerAssignment.to_dict()`` plus an
+  ``assignment_compat_mode`` audit marker. Returns None when:
+
+    * the worker entry already carries at least one new assignment
+      field (partial/corrupt — must fail closed);
+    * the entry is not a dict;
+    * the entry already includes an explicit compat marker.
+
+  The synthesized assignment runs all runtime scenarios with the
+  per-scan budget derived from
+  ``target_config.api_security.max_total_requests`` (or the default).
+  """
+  if not isinstance(worker_entry, dict):
+    return None
+  if worker_entry.get("assignment_compat_mode"):
+    return None
+  present = [
+    field for field in _LEGACY_ASSIGNMENT_FIELDS
+    if worker_entry.get(field) not in (None, "", 0, [], ())
+  ]
+  if present:
+    # Any single new field present means this is a launcher-owned
+    # assignment that just happens to be incomplete — refuse to
+    # synthesize and let the normal validation reject it.
+    return None
+
+  budget = 0
+  if isinstance(job_config, dict):
+    api_security = job_config.get("target_config", {})
+    if isinstance(api_security, dict):
+      api_security = api_security.get("api_security") or {}
+    if isinstance(api_security, dict):
+      try:
+        budget = int(api_security.get("max_total_requests") or 0)
+      except (TypeError, ValueError):
+        budget = 0
+  if budget <= 0:
+    budget = GRAYBOX_DEFAULT_REQUEST_BUDGET
+  scenarios = runtime_scenario_ids()
+  assignment = GrayboxWorkerAssignment(
+    strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+    assigned_scenario_ids=scenarios,
+    assigned_request_budget=budget,
+    budget_scope=GRAYBOX_BUDGET_PER_WORKER,
+    assignment_revision=1,
+    assignment_hash="",
+    stateful_policy="disabled",
+  )
+  result = _with_assignment_hash(assignment).to_dict()
+  result["assignment_compat_mode"] = "legacy_mirror"
+  return result
+
+
 def rehash_worker_assignment_dict(worker_entry: dict) -> dict:
   """Recompute ``assignment_hash`` in place for a worker entry.
 

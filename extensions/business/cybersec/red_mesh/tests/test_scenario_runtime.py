@@ -36,6 +36,7 @@ from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
   runtime_scenario_ids,
   runtime_scenarios,
   summarize_graybox_worker_assignments,
+  synthesize_legacy_mirror_assignment,
 )
 from extensions.business.cybersec.red_mesh.graybox.worker import (
   GrayboxLocalWorker,
@@ -280,6 +281,39 @@ class TestGrayboxWorkerAssignments(unittest.TestCase):
 
     self.assertIsNone(assignments)
     self.assertIn("MIRROR with stateful", error)
+
+  def test_synthesize_legacy_mirror_for_assignmentless_worker(self):
+    """B7: assignmentless worker entries get a synthesized MIRROR assignment."""
+    worker_entry = {
+      "start_port": 443,
+      "end_port": 443,
+      "finished": False,
+    }
+    job_config = {"target_config": {"api_security": {"max_total_requests": 25}}}
+    compat = synthesize_legacy_mirror_assignment(job_config, worker_entry)
+    self.assertIsNotNone(compat)
+    self.assertEqual(compat["graybox_assignment_strategy"], GRAYBOX_ASSIGNMENT_MIRROR)
+    self.assertEqual(compat["assigned_request_budget"], 25)
+    self.assertEqual(compat["budget_scope"], GRAYBOX_BUDGET_PER_WORKER)
+    self.assertEqual(compat["assignment_compat_mode"], "legacy_mirror")
+    self.assertTrue(compat["assignment_hash"])
+
+  def test_synthesize_legacy_mirror_refuses_partial_assignment(self):
+    """A single new assignment field present must NOT trigger legacy compat."""
+    worker_entry = {
+      "start_port": 443,
+      "end_port": 443,
+      "graybox_assignment_strategy": "MIRROR",  # only one of the fields
+    }
+    self.assertIsNone(
+      synthesize_legacy_mirror_assignment({}, worker_entry),
+    )
+
+  def test_synthesize_legacy_mirror_falls_back_to_default_budget(self):
+    """No max_total_requests configured -> use the default budget."""
+    compat = synthesize_legacy_mirror_assignment({}, {"start_port": 443, "end_port": 443})
+    self.assertIsNotNone(compat)
+    self.assertGreater(compat["assigned_request_budget"], 0)
 
   def test_rehash_after_revision_bump_yields_valid_assignment(self):
     """B6: bumping assignment_revision must also recompute assignment_hash."""
