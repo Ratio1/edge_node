@@ -5,6 +5,9 @@ import requests
 from .base import ProbeBase
 
 
+MAX_HIGH_LIMIT_PROBE_LIMIT = 1_000
+
+
 class ApiAbuseProbes(ProbeBase):
   """OWASP API4 + API6 graybox probes.
 
@@ -54,6 +57,15 @@ class ApiAbuseProbes(ProbeBase):
 
   def _low_priv_session(self):
     return self.auth.regular_session
+
+  @staticmethod
+  def _bounded_int(value, *, default: int, minimum: int = 1,
+                   maximum: int = MAX_HIGH_LIMIT_PROBE_LIMIT) -> int:
+    try:
+      parsed = int(value)
+    except (TypeError, ValueError):
+      parsed = default
+    return max(minimum, min(parsed, maximum))
 
   def _flow_request(self, session, method, url, body, timeout=10):
     req = getattr(session, (method or "POST").lower(), session.post)
@@ -131,17 +143,24 @@ class ApiAbuseProbes(ProbeBase):
         self.emit_inconclusive("PT-OAPI4-01", title, owasp, "budget_exhausted")
         return
       url = self.target_url + ep.path
+      baseline_limit = self._bounded_int(ep.baseline_limit, default=10)
+      abuse_limit = self._bounded_int(ep.abuse_limit, default=MAX_HIGH_LIMIT_PROBE_LIMIT)
+      if abuse_limit <= baseline_limit:
+        self.emit_inconclusive(
+          "PT-OAPI4-01", title, owasp, "invalid_limit_bounds",
+        )
+        continue
       self.safety.throttle()
       try:
         baseline = session.get(
-          url, params={ep.limit_param: ep.baseline_limit}, timeout=10,
+          url, params={ep.limit_param: baseline_limit}, timeout=10,
         )
       except requests.RequestException:
         continue
       self.safety.throttle()
       try:
         abuse = session.get(
-          url, params={ep.limit_param: ep.abuse_limit}, timeout=10,
+          url, params={ep.limit_param: abuse_limit}, timeout=10,
         )
       except requests.RequestException:
         continue
@@ -153,6 +172,7 @@ class ApiAbuseProbes(ProbeBase):
         self.emit_vulnerable(
           "PT-OAPI4-01", title, "MEDIUM", owasp, ["CWE-770"],
           [f"endpoint={url}", f"requested_limit={ep.abuse_limit}",
+           f"effective_limit={abuse_limit}",
            f"baseline_size_bytes={base_size}",
            f"abuse_size_bytes={abuse_size}"],
           remediation=(

@@ -121,7 +121,7 @@ class TestApi3PropertyTampering(unittest.TestCase):
 
   def test_mass_assignment_confirmed_emits_vulnerable(self):
     ep = ApiPropertyEndpoint(path="/api/profile/{id}/", test_id=1,
-                              method_write="PATCH")
+                             method_write="PATCH")
     p = _make_probe(property_endpoints=[ep], allow_stateful=True,
                      tampering_fields=["is_admin"])
     # PT-OAPI3-01 runs first (reads the endpoint to check sensitive fields),
@@ -140,6 +140,28 @@ class TestApi3PropertyTampering(unittest.TestCase):
     self.assertEqual(len(vuln), 1)
     self.assertEqual(vuln[0].rollback_status, "reverted")
     self.assertEqual(vuln[0].severity, "HIGH")
+
+  def test_mass_assignment_new_field_marks_revert_failed(self):
+    ep = ApiPropertyEndpoint(path="/api/profile/{id}/", test_id=1,
+                             method_write="PATCH")
+    p = _make_probe(property_endpoints=[ep], allow_stateful=True,
+                    tampering_fields=["is_admin"])
+    p.auth.regular_session.get.side_effect = [
+      _mock_response(json_body={"username": "alice"}),  # 3-01 read
+      _mock_response(json_body={"username": "alice"}),  # 3-02 baseline lacks is_admin
+      _mock_response(json_body={"username": "alice", "is_admin": True}),
+    ]
+    p.auth.regular_session.patch.return_value = _mock_response(
+      json_body={"is_admin": True}
+    )
+
+    p.run()
+
+    vuln = [f for f in p.findings
+            if f.scenario_id == "PT-OAPI3-02" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].rollback_status, "revert_failed")
+    self.assertEqual(vuln[0].severity, "CRITICAL")
 
 
 if __name__ == "__main__":

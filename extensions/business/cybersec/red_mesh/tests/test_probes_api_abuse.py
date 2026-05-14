@@ -45,8 +45,8 @@ class TestApi4NoPaginationCap(unittest.TestCase):
 
   def test_size_explosion_emits_medium(self):
     ep = ApiResourceEndpoint(path="/api/records/", baseline_limit=10,
-                              abuse_limit=999_999,
-                              allow_high_limit_probe=True)
+                             abuse_limit=999_999,
+                             allow_high_limit_probe=True)
     p = _make_probe(resource_endpoints=[ep])
     # 100B baseline → 1MB abuse response = >5× growth
     p.auth.official_session.get.side_effect = [
@@ -58,6 +58,23 @@ class TestApi4NoPaginationCap(unittest.TestCase):
             if f.scenario_id == "PT-OAPI4-01" and f.status == "vulnerable"]
     self.assertEqual(len(vuln), 1)
     self.assertEqual(vuln[0].severity, "MEDIUM")
+
+  def test_high_limit_probe_caps_requested_limit(self):
+    ep = ApiResourceEndpoint(path="/api/records/", baseline_limit=10,
+                             abuse_limit=999_999,
+                             allow_high_limit_probe=True)
+    p = _make_probe(resource_endpoints=[ep])
+    p.auth.official_session.get.side_effect = [
+      _resp(status=200, text="x" * 100),
+      _resp(status=200, text="y" * 1_000),
+    ]
+
+    p.run_safe("api_no_pagination_cap", p._test_no_pagination_cap)
+
+    self.assertEqual(
+      p.auth.official_session.get.call_args_list[1].kwargs["params"],
+      {"limit": 1000},
+    )
 
 
 class TestApi4OversizedPayload(unittest.TestCase):

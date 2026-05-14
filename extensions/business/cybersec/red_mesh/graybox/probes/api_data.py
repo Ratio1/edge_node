@@ -221,9 +221,11 @@ class ApiDataProbes(ProbeBase):
                   _field=target_field):
         if base is None:
           return False
+        if _field not in base:
+          return False
         if not self.budget():
           raise RuntimeError("budget_exhausted")
-        before = base.get(_field, False)
+        before = base.get(_field)
         try:
           if _method == "PATCH":
             resp = session.patch(_url, json={_field: before}, timeout=10)
