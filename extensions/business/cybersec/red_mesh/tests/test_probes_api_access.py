@@ -335,6 +335,23 @@ class TestApi5BflaStateful(unittest.TestCase):
   def _stateful_probe(self, ep):
     return _make_probe(function_endpoints=[ep], allow_stateful=True)
 
+  def test_method_override_stateful_disabled_does_not_mutate(self):
+    ep = ApiFunctionEndpoint(
+      path="/api/admin/users/7/promote/",
+      method="POST",
+      privilege="admin",
+      revert_path="/api/admin/users/7/demote/",
+    )
+    p = _make_probe(function_endpoints=[ep], allow_stateful=False)
+
+    p.run_safe("api_bfla_method_override", p._test_bfla_method_override)
+
+    p.auth.regular_session.post.assert_not_called()
+    incon = [f for f in p.findings
+             if f.status == "inconclusive" and f.scenario_id == "PT-OAPI5-03"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("stateful_probes_disabled", "\n".join(incon[0].evidence))
+
   def test_method_override_skips_when_plain_mutating_method_allowed(self):
     ep = ApiFunctionEndpoint(
       path="/api/admin/users/7/promote/",

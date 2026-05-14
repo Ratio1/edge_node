@@ -87,7 +87,9 @@ class ProbeBase:
 
   def run_stateful(self, scenario_id, *, baseline_fn, mutate_fn,
                     verify_fn, revert_fn, finding_kwargs=None,
-                    skip_reason_no_revert="no_revert_path_configured"):
+                    skip_reason_no_revert="no_revert_path_configured",
+                    mutation_unverified_reason_fn=None,
+                    no_mutation_reason_fn=None):
     """Run a four-step stateful check.
 
     Steps:
@@ -186,13 +188,33 @@ class ProbeBase:
       )
       return True
     elif mutated:
+      reason = verify_failed_reason or "mutation_unverified"
+      if callable(mutation_unverified_reason_fn):
+        try:
+          reason = mutation_unverified_reason_fn(baseline, rollback_status) or reason
+        except Exception as exc:
+          detail = self._sanitize_error(str(exc))
+          reason = f"verify_reason_failed:{detail}" if detail else reason
       self.emit_inconclusive(
         scenario_id, title, owasp,
-        verify_failed_reason or "mutation_unverified",
+        reason,
         rollback_status=rollback_status,
       )
       return False
     else:
+      reason = ""
+      if callable(no_mutation_reason_fn):
+        try:
+          reason = no_mutation_reason_fn(baseline) or ""
+        except Exception as exc:
+          detail = self._sanitize_error(str(exc))
+          reason = f"no_mutation_reason_failed:{detail}" if detail else ""
+      if reason:
+        self.emit_inconclusive(
+          scenario_id, title, owasp, reason,
+          rollback_status=rollback_status,
+        )
+        return False
       self.emit_clean(
         scenario_id, title, owasp,
         [],
