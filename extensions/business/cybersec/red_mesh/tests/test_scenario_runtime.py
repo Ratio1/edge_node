@@ -32,6 +32,7 @@ from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
   GrayboxWorkerAssignment,
   build_graybox_worker_assignments,
   compute_assignment_hash,
+  rehash_worker_assignment_dict,
   runtime_scenario_ids,
   runtime_scenarios,
   summarize_graybox_worker_assignments,
@@ -279,6 +280,29 @@ class TestGrayboxWorkerAssignments(unittest.TestCase):
 
     self.assertIsNone(assignments)
     self.assertIn("MIRROR with stateful", error)
+
+  def test_rehash_after_revision_bump_yields_valid_assignment(self):
+    """B6: bumping assignment_revision must also recompute assignment_hash."""
+    assignments, error = build_graybox_worker_assignments(
+      ["node-a"],
+      strategy=GRAYBOX_ASSIGNMENT_MIRROR,
+      total_request_budget=20,
+    )
+    self.assertIsNone(error)
+    entry = dict(assignments["node-a"])
+    original_hash = entry["assignment_hash"]
+    self.assertTrue(original_hash)
+
+    entry["assignment_revision"] += 1
+    rehash_worker_assignment_dict(entry)
+    self.assertNotEqual(entry["assignment_hash"], original_hash)
+
+    # GrayboxWorkerAssignment.from_job_config validates by recomputing the
+    # hash from the same payload — the rehashed entry must round-trip.
+    from types import SimpleNamespace
+    job_config = SimpleNamespace(scan_type="webapp", **entry)
+    assignment = GrayboxWorkerAssignment.from_job_config(job_config)
+    self.assertTrue(assignment.is_valid, assignment.validation_error)
 
   def test_summary_aggregates_consistent_worker_assignments(self):
     """B5: job-level summary surfaces strategy/budget/scope/scenarios for the dashboard."""

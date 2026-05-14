@@ -424,6 +424,32 @@ def build_graybox_worker_assignments(
   return assignments, None
 
 
+def rehash_worker_assignment_dict(worker_entry: dict) -> dict:
+  """Recompute ``assignment_hash`` in place for a worker entry.
+
+  Used after assignment-bearing fields change (notably
+  ``assignment_revision`` during reannounce — PR406 B6) so the hash the
+  worker validates against `JobConfig` stays in sync. Returns the same
+  dict for chaining; if the entry is missing assignment fields, the
+  hash field is left untouched.
+  """
+  if not isinstance(worker_entry, dict):
+    return worker_entry
+  strategy = (worker_entry.get("graybox_assignment_strategy") or "").upper()
+  scenario_ids = worker_entry.get("assigned_scenario_ids")
+  if not strategy or scenario_ids is None:
+    return worker_entry
+  worker_entry["assignment_hash"] = compute_assignment_hash(
+    strategy=strategy,
+    assigned_scenario_ids=tuple(scenario_ids or ()),
+    assigned_request_budget=int(worker_entry.get("assigned_request_budget") or 0),
+    budget_scope=worker_entry.get("budget_scope") or "",
+    assignment_revision=int(worker_entry.get("assignment_revision") or 1),
+    stateful_policy=worker_entry.get("stateful_policy") or "disabled",
+  )
+  return worker_entry
+
+
 def summarize_graybox_worker_assignments(assignments: dict) -> dict:
   """Distil per-worker assignments into a job-level summary.
 
