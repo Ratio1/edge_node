@@ -455,7 +455,7 @@ class ApiAccessProbes(ProbeBase):
         try:
           plain_resp = _method_fn(_url, timeout=10, allow_redirects=False)
         except requests.RequestException:
-          return False
+          return self.MUTATION_ATTEMPTED_UNKNOWN
         base["plain_status"] = plain_resp.status_code
         _evidence.append(f"plain_status={plain_resp.status_code}")
         if plain_resp.status_code < 400:
@@ -474,7 +474,7 @@ class ApiAccessProbes(ProbeBase):
             timeout=10, allow_redirects=False,
           )
         except requests.RequestException:
-          return False
+          return self.MUTATION_ATTEMPTED_UNKNOWN
         base["override_status"] = resp.status_code
         _evidence.append(f"override_status={resp.status_code}")
         return resp.status_code < 400
@@ -562,7 +562,7 @@ class ApiAccessProbes(ProbeBase):
         try:
           resp = _method_fn(_url, timeout=10)
         except requests.RequestException:
-          return False
+          return self.MUTATION_ATTEMPTED_UNKNOWN
         base["mutate_status"] = resp.status_code
         return resp.status_code < 400
 
@@ -596,7 +596,7 @@ class ApiAccessProbes(ProbeBase):
       )
 
   def _revert_function_endpoint(self, session, revert_url, ep) -> bool:
-    if not self.budget():
+    if not self.cleanup_budget():
       return False
     self.safety.throttle()
     try:

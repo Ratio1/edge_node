@@ -10,6 +10,7 @@ import requests
 
 from ..findings import GrayboxFinding
 from ..models import GrayboxProbeContext, GrayboxProbeRunResult
+from ..rollback import MUTATION_ATTEMPTED_UNKNOWN, StatefulMutationPlan
 
 
 class ProbeBase:
@@ -32,7 +33,9 @@ class ProbeBase:
   def __init__(self, target_url, auth_manager, target_config, safety,
                discovered_routes=None, discovered_forms=None,
                regular_username="", allow_stateful=False,
-               request_budget=None, allowed_scenario_ids=None):
+               request_budget=None, allowed_scenario_ids=None,
+               rollback_journal=None, job_id="", worker_id="",
+               assignment_revision=0):
     self.target_url = target_url.rstrip("/")
     self.auth = auth_manager
     self.target_config = target_config
@@ -47,6 +50,10 @@ class ProbeBase:
     self.allowed_scenario_ids = (
       None if allowed_scenario_ids is None else set(allowed_scenario_ids)
     )
+    self.rollback_journal = rollback_journal
+    self.job_id = job_id
+    self.worker_id = worker_id
+    self.assignment_revision = assignment_revision
     self.findings: list[GrayboxFinding] = []
 
   @classmethod
@@ -114,12 +121,14 @@ class ProbeBase:
   # finding. The lint test in test_stateful_contract.py asserts that no
   # stateful probe bypasses this path.
   STATEFUL_PROBE_LINT_MARKER = "uses_run_stateful"
+  MUTATION_ATTEMPTED_UNKNOWN = MUTATION_ATTEMPTED_UNKNOWN
 
   def run_stateful(self, scenario_id, *, baseline_fn, mutate_fn,
                     verify_fn, revert_fn, finding_kwargs=None,
                     skip_reason_no_revert="no_revert_path_configured",
                     mutation_unverified_reason_fn=None,
-                    no_mutation_reason_fn=None):
+                    no_mutation_reason_fn=None,
+                    mutation_plan=None):
     """Run a four-step stateful check.
 
     Steps:
@@ -162,15 +171,35 @@ class ProbeBase:
       )
       return False
 
-    # 2. Mutate.
+    # 2. Mutate. Journal before invoking mutate_fn so a timeout/crash
+    # after the outbound request still leaves a cleanup record.
+    journal_record_id = ""
+    if self.rollback_journal is not None:
+      plan = mutation_plan
+      if plan is None:
+        plan = StatefulMutationPlan(
+          scenario_id=scenario_id,
+          principal=getattr(self, "regular_username", "") or "",
+        )
+      journal_record_id = self.rollback_journal.record_pending(scenario_id, plan)
     mutated = False
+    mutation_attempted_unknown = False
     try:
-      mutated = bool(mutate_fn(baseline))
+      mutate_result = mutate_fn(baseline)
+      if mutate_result == MUTATION_ATTEMPTED_UNKNOWN:
+        mutated = True
+        mutation_attempted_unknown = True
+      else:
+        mutated = bool(mutate_result)
     except Exception as exc:
       self.emit_inconclusive(
         scenario_id, title, owasp,
         f"mutate_failed:{self.safety.sanitize_error(str(exc))}",
       )
+      if journal_record_id:
+        self.rollback_journal.update_status(
+          journal_record_id, "mutation_failed",
+        )
       return False
 
     # 3. Verify.
@@ -180,7 +209,10 @@ class ProbeBase:
       try:
         confirmed = bool(verify_fn(baseline))
         if not confirmed:
-          verify_failed_reason = "mutation_unverified"
+          verify_failed_reason = (
+            "mutation_attempted_unknown"
+            if mutation_attempted_unknown else "mutation_unverified"
+          )
       except Exception as exc:
         confirmed = False
         detail = self._sanitize_error(str(exc))
@@ -195,6 +227,17 @@ class ProbeBase:
           rollback_status = "reverted"
       except Exception:
         rollback_status = "revert_failed"
+    if journal_record_id:
+      journal_status = {
+        "no_revert_needed": "not_attempted",
+        "reverted": "reverted",
+        "revert_failed": "manual_cleanup_required",
+      }.get(rollback_status, rollback_status)
+      self.rollback_journal.update_status(
+        journal_record_id,
+        journal_status,
+        rollback_status=rollback_status,
+      )
 
     # 5. Emit. Confirmed = vulnerable. A mutation that cannot be verified
     # is inconclusive, not clean: the target may have changed, or request
@@ -267,6 +310,14 @@ class ProbeBase:
       return True
     return self.request_budget.consume(n)
 
+  def cleanup_budget(self, n: int = 1) -> bool:
+    """Return True for cleanup/revert requests.
+
+    Cleanup requests are deliberately exempt from the normal probe
+    request budget; budget exhaustion must not prevent rollback.
+    """
+    return True
+
   def request(self, session, method: str, url: str, **kwargs):
     """Probe-facing HTTP helper.
 
@@ -275,6 +326,10 @@ class ProbeBase:
     preserving the existing requests-like API.
     """
     return session.request(method, url, **kwargs)
+
+  def stateful_request(self, session, method: str, url: str, **kwargs):
+    """Issue a state-changing request through the scoped session wrapper."""
+    return self.request(session, method, url, **kwargs)
 
   def _record_error(self, probe_name, error_msg):
     """Store a non-fatal error as an INFO GrayboxFinding."""

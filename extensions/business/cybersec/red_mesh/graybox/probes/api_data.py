@@ -196,7 +196,7 @@ class ApiDataProbes(ProbeBase):
           else:
             resp = session.post(_url, json=payload, timeout=10)
         except requests.RequestException:
-          return False
+          return self.MUTATION_ATTEMPTED_UNKNOWN
         return resp.status_code < 400
 
       def verify(base, _ep=ep, _url=read_url, _field=target_field):
@@ -225,8 +225,8 @@ class ApiDataProbes(ProbeBase):
           return False
         if _field not in base:
           return False
-        if not self.budget():
-          raise RuntimeError("budget_exhausted")
+        if not self.cleanup_budget():
+          return False
         before = base.get(_field)
         try:
           if _method == "PATCH":

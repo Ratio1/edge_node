@@ -13,7 +13,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from extensions.business.cybersec.red_mesh.graybox.budget import RequestBudget
 from extensions.business.cybersec.red_mesh.graybox.probes.base import ProbeBase
+from extensions.business.cybersec.red_mesh.graybox.rollback import (
+  MUTATION_ATTEMPTED_UNKNOWN,
+  RollbackJournalRepository,
+)
 
 
 class _StatefulProbe(ProbeBase):
@@ -21,11 +26,12 @@ class _StatefulProbe(ProbeBase):
     return self.findings
 
 
-def _make_probe(*, allow_stateful=False):
+def _make_probe(*, allow_stateful=False, rollback_journal=None):
   return _StatefulProbe(
     target_url="http://x", auth_manager=MagicMock(),
     target_config=MagicMock(), safety=MagicMock(spec=["sanitize_error"]),
     allow_stateful=allow_stateful,
+    rollback_journal=rollback_journal,
   )
 
 
@@ -100,6 +106,68 @@ class TestRunStatefulHappyPath(unittest.TestCase):
     self.assertIn("mutation_unverified", f.evidence[0])
     self.assertEqual(f.rollback_status, "reverted")
 
+  def test_journal_record_is_pending_before_mutate_and_reverted_after(self):
+    journal = RollbackJournalRepository(job_id="job-1", worker_id="worker-1")
+    p = _make_probe(allow_stateful=True, rollback_journal=journal)
+
+    def mutate(_b):
+      self.assertEqual(len(journal.records), 1)
+      self.assertEqual(journal.records[0]["status"], "pending")
+      return True
+
+    p.run_stateful(
+      "PT-OAPI3-02",
+      baseline_fn=lambda: {"is_admin": False},
+      mutate_fn=mutate,
+      verify_fn=lambda b: True,
+      revert_fn=lambda b: True,
+      finding_kwargs={"title": "Mass assignment", "owasp": "API3:2023"},
+    )
+
+    self.assertEqual(journal.records[0]["status"], "reverted")
+    self.assertEqual(journal.records[0]["scenario_id"], "PT-OAPI3-02")
+
+  def test_attempted_unknown_still_reverts_and_is_inconclusive(self):
+    journal = RollbackJournalRepository(job_id="job-1", worker_id="worker-1")
+    p = _make_probe(allow_stateful=True, rollback_journal=journal)
+    revert_called = [False]
+
+    def revert(_b):
+      revert_called[0] = True
+      return True
+
+    p.run_stateful(
+      "PT-OAPI5-04",
+      baseline_fn=lambda: None,
+      mutate_fn=lambda b: MUTATION_ATTEMPTED_UNKNOWN,
+      verify_fn=lambda b: False,
+      revert_fn=revert,
+      finding_kwargs={"title": "BFLA", "owasp": "API5:2023"},
+    )
+
+    self.assertTrue(revert_called[0])
+    f = p.findings[0]
+    self.assertEqual(f.status, "inconclusive")
+    self.assertIn("mutation_attempted_unknown", f.evidence[0])
+    self.assertEqual(f.rollback_status, "reverted")
+    self.assertEqual(journal.records[0]["status"], "reverted")
+
+  def test_cleanup_revert_not_blocked_by_exhausted_probe_budget(self):
+    p = _make_probe(allow_stateful=True)
+    p.request_budget = RequestBudget(remaining=0, total=0)
+
+    p.run_stateful(
+      "PT-OAPI3-02",
+      baseline_fn=lambda: None,
+      mutate_fn=lambda b: True,
+      verify_fn=lambda b: True,
+      revert_fn=lambda b: p.cleanup_budget(),
+      finding_kwargs={"title": "Mass assignment", "owasp": "API3:2023"},
+    )
+
+    self.assertEqual(p.findings[0].status, "vulnerable")
+    self.assertEqual(p.findings[0].rollback_status, "reverted")
+
 
 class TestRunStatefulRevertFailureBumpsSeverity(unittest.TestCase):
 
@@ -119,6 +187,21 @@ class TestRunStatefulRevertFailureBumpsSeverity(unittest.TestCase):
     self.assertEqual(f.severity, "CRITICAL")
     self.assertEqual(f.rollback_status, "revert_failed")
     self.assertIn("Manual cleanup required", f.remediation)
+
+  def test_revert_failure_marks_journal_manual_cleanup_required(self):
+    journal = RollbackJournalRepository(job_id="job-1", worker_id="worker-1")
+    p = _make_probe(allow_stateful=True, rollback_journal=journal)
+
+    p.run_stateful(
+      "PT-OAPI5-04",
+      baseline_fn=lambda: None,
+      mutate_fn=lambda b: True,
+      verify_fn=lambda b: True,
+      revert_fn=lambda b: False,
+      finding_kwargs={"title": "BFLA", "owasp": "API5:2023"},
+    )
+
+    self.assertEqual(journal.records[0]["status"], "manual_cleanup_required")
 
   def test_revert_exception_treated_as_failure(self):
     p = _make_probe(allow_stateful=True)
@@ -177,6 +260,21 @@ class TestRunStatefulErrorPaths(unittest.TestCase):
       finding_kwargs={"title": "T", "owasp": "API3:2023"},
     )
     self.assertIn("mutate_failed", p.findings[0].evidence[0])
+
+
+class TestRollbackJournalRecovery(unittest.TestCase):
+
+  def test_claim_and_replay_pending_record(self):
+    journal = RollbackJournalRepository(job_id="job-1", worker_id="worker-1")
+    record_id = journal.record_pending("PT-OAPI5-04", {"path": "/api/x/"})
+
+    claimed = journal.claim_pending("launcher", lease_expires_at=123)
+    self.assertEqual(len(claimed), 1)
+    self.assertEqual(claimed[0]["record_id"], record_id)
+
+    journal.replay_claimed({record_id: lambda record: True})
+
+    self.assertEqual(journal.records[0]["status"], "reverted")
 
 
 class TestStatefulContractLint(unittest.TestCase):

@@ -114,6 +114,10 @@ class GrayboxProbeContext:
   # budget object itself mutates as probes consume.
   request_budget: object = None
   allowed_scenario_ids: tuple[str, ...] | None = None
+  rollback_journal: object = None
+  job_id: str = ""
+  worker_id: str = ""
+  assignment_revision: int = 0
 
   def to_kwargs(self) -> dict:
     return {
@@ -127,6 +131,10 @@ class GrayboxProbeContext:
       "allow_stateful": self.allow_stateful,
       "request_budget": self.request_budget,
       "allowed_scenario_ids": self.allowed_scenario_ids,
+      "rollback_journal": self.rollback_journal,
+      "job_id": self.job_id,
+      "worker_id": self.worker_id,
+      "assignment_revision": self.assignment_revision,
     }
 
 

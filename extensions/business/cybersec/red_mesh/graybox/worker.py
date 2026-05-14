@@ -15,6 +15,7 @@ from .auth import AuthManager
 from .discovery import DiscoveryModule
 from .http_client import GrayboxHttpClient
 from .safety import SafetyControls
+from .rollback import RollbackJournalRepository
 from .scenario_runtime import GrayboxWorkerAssignment
 from .models import (
   DiscoveryResult,
@@ -176,7 +177,15 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "graybox_assignment": (
         self.assignment.to_dict() if self.assignment.is_valid else {}
       ),
+      "rollback_journal": [],
     }
+    self.rollback_journal = RollbackJournalRepository(
+      job_id=job_id,
+      worker_id=self.local_worker_id,
+      assignment_revision=self.assignment.assignment_revision
+      if self.assignment.is_valid else 0,
+      records=self.state["rollback_journal"],
+    )
     # _phase_open is only touched on the worker thread — no cross-thread
     # reads. Guards the finally clause from double-closing a phase that
     # its owning method already closed explicitly.
@@ -429,6 +438,11 @@ class GrayboxLocalWorker(BaseLocalWorker):
       allowed_scenario_ids=(
         None if allowed_scenario_ids is None else tuple(allowed_scenario_ids)
       ),
+      rollback_journal=self.rollback_journal,
+      job_id=self.job_id,
+      worker_id=self.local_worker_id,
+      assignment_revision=self.assignment.assignment_revision
+      if self.assignment.is_valid else 0,
     )
 
   def _run_probe_phase(self, discovery_result: DiscoveryResult):

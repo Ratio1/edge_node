@@ -69,7 +69,7 @@ class ApiAbuseProbes(ProbeBase):
   def _flow_revert(self, session, flow):
     if not flow.revert_path:
       return False
-    if not self.budget():
+    if not self.cleanup_budget():
       return False
     self.safety.throttle()
     resp = self._flow_request(
@@ -308,7 +308,7 @@ class ApiAbuseProbes(ProbeBase):
               session, _flow.method, _url, _flow.body_template, timeout=10,
             )
           except requests.RequestException:
-            break
+            return self.MUTATION_ATTEMPTED_UNKNOWN
           attempts += 1
           if resp.status_code == 429:
             break
@@ -333,7 +333,7 @@ class ApiAbuseProbes(ProbeBase):
         try:
           return self._flow_verify(session, _flow)
         except requests.RequestException:
-          return False
+          return self.MUTATION_ATTEMPTED_UNKNOWN
 
       self.run_stateful(
         "PT-OAPI6-01",

@@ -295,7 +295,7 @@ class ApiAuthProbes(ProbeBase):
           timeout=10, allow_redirects=False,
         )
       except requests.RequestException:
-        return False
+        return self.MUTATION_ATTEMPTED_UNKNOWN
       finally:
         session.close()
       return resp.status_code < 400
