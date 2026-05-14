@@ -158,10 +158,11 @@ class ApiAuthProbes(ProbeBase):
     if not self.budget():
       return
     self.safety.throttle()
+    session = self.auth.make_anonymous_session()
     try:
-      resp = requests.get(
+      resp = session.get(
         url, headers=self._auth_headers_for_token(forged),
-        timeout=10, verify=self.auth.verify_tls if hasattr(self.auth, "verify_tls") else True,
+        timeout=10,
         allow_redirects=False,
       )
     except requests.RequestException:
@@ -169,6 +170,8 @@ class ApiAuthProbes(ProbeBase):
         "PT-OAPI2-01", title, owasp, "protected_path_transport_error",
       )
       return
+    finally:
+      session.close()
 
     if resp.status_code < 400:
       self.emit_vulnerable(
@@ -275,26 +278,32 @@ class ApiAuthProbes(ProbeBase):
         return False
       url = self.target_url + tok.logout_path
       self.safety.throttle()
+      session = self.auth.make_anonymous_session()
       try:
-        resp = requests.post(
+        resp = session.post(
           url, headers=self._auth_headers_for_token(base),
           timeout=10, allow_redirects=False,
         )
       except requests.RequestException:
         return False
+      finally:
+        session.close()
       return resp.status_code < 400
 
     def verify(base):
       if not self.budget():
         return False
       url = self.target_url + tok.protected_path
+      session = self.auth.make_anonymous_session()
       try:
-        resp = requests.get(
+        resp = session.get(
           url, headers=self._auth_headers_for_token(base),
           timeout=10, allow_redirects=False,
         )
       except requests.RequestException:
         return False
+      finally:
+        session.close()
       # Vulnerable iff protected path STILL accepts the supposedly-revoked token.
       return resp.status_code < 400
 

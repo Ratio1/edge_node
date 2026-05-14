@@ -25,6 +25,7 @@ from ..graybox.models.target_config import (
   collect_target_config_secret_refs,
   validate_target_config_secret_ref_positions,
 )
+from ..graybox.http_client import validate_target_config_paths
 from ..repositories import JobStateRepository
 from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
@@ -950,6 +951,7 @@ def launch_webapp_scan(
   """
   if not target_url:
     return validation_error("target_url required for webapp scan")
+  raw_target_config = deepcopy(target_config) if isinstance(target_config, dict) else target_config
   typed_target_config, target_config, config_error = normalize_graybox_target_config(
     target_config,
     target_config_secrets=target_config_secrets,
@@ -994,6 +996,13 @@ def launch_webapp_scan(
   )
   if auth_error:
     return auth_error
+  path_scope_errors = validate_target_config_paths(
+    target_url,
+    raw_target_config,
+    authorization_context["target_allowlist"],
+  )
+  if path_scope_errors:
+    return validation_error("; ".join(path_scope_errors))
   typed_context, typed_error = _validate_typed_engagement_context(
     engagement, roe, authorization
   )

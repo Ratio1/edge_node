@@ -50,10 +50,12 @@ class AuthStrategy(ABC):
   sessions concurrently).
   """
 
-  def __init__(self, target_url: str, target_config, verify_tls: bool = True):
+  def __init__(self, target_url: str, target_config, verify_tls: bool = True,
+               http_client=None):
     self.target_url = target_url.rstrip("/")
     self.target_config = target_config
     self.verify_tls = verify_tls
+    self.http_client = http_client
     self._session: Optional[requests.Session] = None
     # Strategies may expose protocol-specific diagnostic state here; the
     # orchestrator copies it back into AuthManager so probe callers keep
@@ -64,6 +66,8 @@ class AuthStrategy(ABC):
     """Create a fresh, unauthenticated ``requests.Session`` honouring TLS verify."""
     s = requests.Session()
     s.verify = self.verify_tls
+    if self.http_client is not None:
+      return self.http_client.wrap_session(s)
     return s
 
   @property
@@ -135,6 +139,20 @@ class FormAuth(AuthStrategy):
   """
 
   def preflight(self) -> Optional[str]:
+    if self.http_client is not None:
+      session = self.make_session()
+      try:
+        session.head(self.target_url, timeout=10, allow_redirects=True)
+        login_url = self.target_url + self.target_config.login_path
+        resp = session.get(login_url, timeout=10)
+        if resp.status_code == 404:
+          return f"Login page not found: {login_url} returned 404"
+      except requests.RequestException as exc:
+        return f"Login page unreachable: {exc}"
+      finally:
+        session.close()
+      return None
+
     # 1. Target reachable?
     try:
       requests.head(
@@ -284,8 +302,8 @@ class BearerAuth(AuthStrategy):
   stamped session after ``authenticate``.
   """
 
-  def __init__(self, target_url, target_config, verify_tls=True):
-    super().__init__(target_url, target_config, verify_tls)
+  def __init__(self, target_url, target_config, verify_tls=True, http_client=None):
+    super().__init__(target_url, target_config, verify_tls, http_client)
     self._auth_desc = self._resolve_auth_descriptor()
     self._creds = None  # populated by authenticate(); needed for refresh()
 
@@ -308,8 +326,15 @@ class BearerAuth(AuthStrategy):
       return None
     url = self.target_url + probe_path
     try:
-      resp = requests.head(url, timeout=10, verify=self.verify_tls,
-                           allow_redirects=True)
+      if self.http_client is not None:
+        session = self.make_session()
+        try:
+          resp = session.head(url, timeout=10, allow_redirects=True)
+        finally:
+          session.close()
+      else:
+        resp = requests.head(url, timeout=10, verify=self.verify_tls,
+                             allow_redirects=True)
     except requests.RequestException as exc:
       return f"Authenticated probe path unreachable: {exc}"
     return None
@@ -357,8 +382,8 @@ class ApiKeyAuth(AuthStrategy):
   warning banner (Subphase 8.5).
   """
 
-  def __init__(self, target_url, target_config, verify_tls=True):
-    super().__init__(target_url, target_config, verify_tls)
+  def __init__(self, target_url, target_config, verify_tls=True, http_client=None):
+    super().__init__(target_url, target_config, verify_tls, http_client)
     self._auth_desc = self._resolve_auth_descriptor()
     self._creds = None
 
@@ -383,10 +408,20 @@ class ApiKeyAuth(AuthStrategy):
       # is created); just check the probe path is reachable.
       pass
     try:
-      resp = requests.head(
-        url, headers=headers, params=params, timeout=10,
-        verify=self.verify_tls, allow_redirects=True,
-      )
+      if self.http_client is not None:
+        session = self.make_session()
+        try:
+          resp = session.head(
+            url, headers=headers, params=params, timeout=10,
+            allow_redirects=True,
+          )
+        finally:
+          session.close()
+      else:
+        resp = requests.head(
+          url, headers=headers, params=params, timeout=10,
+          verify=self.verify_tls, allow_redirects=True,
+        )
     except requests.RequestException as exc:
       return f"Authenticated probe path unreachable: {exc}"
     # 401/403 here is informational — we haven't sent the key yet so it

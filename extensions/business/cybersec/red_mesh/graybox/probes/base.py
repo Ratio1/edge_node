@@ -235,6 +235,15 @@ class ProbeBase:
       return True
     return self.request_budget.consume(n)
 
+  def request(self, session, method: str, url: str, **kwargs):
+    """Probe-facing HTTP helper.
+
+    Worker-created sessions are scoped by GrayboxHttpClient, so routing
+    calls through the session keeps scope enforcement centralized while
+    preserving the existing requests-like API.
+    """
+    return session.request(method, url, **kwargs)
+
   def _record_error(self, probe_name, error_msg):
     """Store a non-fatal error as an INFO GrayboxFinding."""
     error_msg = self._sanitize_error(error_msg)

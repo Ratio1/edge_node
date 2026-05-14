@@ -13,6 +13,7 @@ from ..constants import GRAYBOX_PROBE_REGISTRY
 from .findings import GrayboxEvidenceArtifact, GrayboxFinding
 from .auth import AuthManager
 from .discovery import DiscoveryModule
+from .http_client import GrayboxHttpClient
 from .safety import SafetyControls
 from .models import (
   DiscoveryResult,
@@ -119,6 +120,11 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.request_budget = RequestBudget(
       remaining=budget_total, total=budget_total,
     )
+    self.http_client = GrayboxHttpClient(
+      self.target_url,
+      allowlist=getattr(job_config, "target_allowlist", None) or [],
+      target_config=self.target_config,
+    )
 
     # Modules (composition)
     self.safety = SafetyControls(
@@ -129,6 +135,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       target_url=self.target_url,
       target_config=self.target_config,
       verify_tls=job_config.verify_tls,
+      http_client=self.http_client,
     )
     self.discovery = DiscoveryModule(
       target_url=self.target_url,

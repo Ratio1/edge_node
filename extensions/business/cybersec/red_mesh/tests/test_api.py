@@ -625,6 +625,48 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("allowlist", result["message"])
 
+  def test_launch_webapp_scan_rejects_out_of_scope_api_paths(self):
+    """Path-scoped authorization applies to configured API probe paths."""
+    plugin = self._build_mock_plugin(job_id="test-job-path-scope")
+
+    result = self._launch_webapp(
+      plugin,
+      target_allowlist=["example.com", "/api/public/"],
+      target_config={
+        "login_path": "/api/public/login/",
+        "logout_path": "/api/public/logout/",
+        "api_security": {
+          "function_endpoints": [
+            {"path": "/admin/export-users/"},
+          ],
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("outside authorized scope", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_accepts_in_scope_templated_api_paths(self):
+    """Templated API paths are normalized and allowed inside the scope prefix."""
+    plugin = self._build_mock_plugin(job_id="test-job-path-scope-ok")
+
+    result = self._launch_webapp(
+      plugin,
+      target_allowlist=["example.com", "/api/public/"],
+      target_config={
+        "login_path": "/api/public/login/",
+        "logout_path": "/api/public/logout/",
+        "api_security": {
+          "object_endpoints": [
+            {"path": "/api/public/users/{id}/"},
+          ],
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+
   def test_launch_webapp_scan_persists_authorization_context(self):
     """Authorization metadata is stored in immutable job config and audit context."""
     plugin = self._build_mock_plugin(job_id="test-job-authctx")
@@ -637,7 +679,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
       authorization_ref="TICKET-42",
       engagement_metadata={"ticket": "TICKET-42", "owner": "alice"},
       target_allowlist=["example.com", "/api/"],
-      target_config={"discovery": {"scope_prefix": "/api/"}},
+      target_config={
+        "login_path": "/api/login/",
+        "logout_path": "/api/logout/",
+        "discovery": {"scope_prefix": "/api/"},
+      },
     )
 
     config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]

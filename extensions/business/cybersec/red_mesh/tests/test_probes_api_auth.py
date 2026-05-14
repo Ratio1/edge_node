@@ -68,7 +68,9 @@ class TestApi2AlgNone(unittest.TestCase):
     p.auth.official_session.post.return_value = _resp(
       json_body={"token": real},
     )
-    mock_requests.get.return_value = _resp(json_body={"id": 1, "is_admin": True})
+    p.auth.make_anonymous_session.return_value.get.return_value = _resp(
+      json_body={"id": 1, "is_admin": True},
+    )
     p.run_safe("api_jwt_alg_none", p._test_jwt_alg_none)
     vuln = [f for f in p.findings
             if f.scenario_id == "PT-OAPI2-01" and f.status == "vulnerable"]
@@ -85,7 +87,7 @@ class TestApi2AlgNone(unittest.TestCase):
     p.auth.official_session.post.return_value = _resp(
       json_body={"token": real},
     )
-    mock_requests.get.return_value = _resp(status=401)
+    p.auth.make_anonymous_session.return_value.get.return_value = _resp(status=401)
     p.run_safe("api_jwt_alg_none", p._test_jwt_alg_none)
     clean = [f for f in p.findings
              if f.scenario_id == "PT-OAPI2-01" and f.status == "not_vulnerable"]

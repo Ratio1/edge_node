@@ -38,10 +38,11 @@ class AuthManager:
   session expiry, re-auth, and cleanup.
   """
 
-  def __init__(self, target_url, target_config, verify_tls=True):
+  def __init__(self, target_url, target_config, verify_tls=True, http_client=None):
     self.target_url = target_url.rstrip("/")
     self.target_config = target_config
     self.verify_tls = verify_tls
+    self.http_client = http_client
 
     self.anon_session = None
     self.official_session = None
@@ -190,6 +191,8 @@ class AuthManager:
   def _make_session(self):
     s = requests.Session()
     s.verify = self.verify_tls
+    if self.http_client is not None:
+      return self.http_client.wrap_session(s)
     return s
 
   def make_anonymous_session(self):
@@ -339,11 +342,11 @@ class AuthManager:
     """
     auth_type = self._resolve_auth_type()
     if auth_type == "form":
-      return FormAuth(self.target_url, self.target_config, self.verify_tls)
+      return FormAuth(self.target_url, self.target_config, self.verify_tls, self.http_client)
     if auth_type == "bearer":
-      return BearerAuth(self.target_url, self.target_config, self.verify_tls)
+      return BearerAuth(self.target_url, self.target_config, self.verify_tls, self.http_client)
     if auth_type == "api_key":
-      return ApiKeyAuth(self.target_url, self.target_config, self.verify_tls)
+      return ApiKeyAuth(self.target_url, self.target_config, self.verify_tls, self.http_client)
     raise ValueError(f"Unknown auth_type: {auth_type!r}")
 
   # Form-login internals (``_is_login_success``, ``_extract_csrf``,
