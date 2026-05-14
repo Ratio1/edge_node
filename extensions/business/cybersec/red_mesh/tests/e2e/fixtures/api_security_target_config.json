@@ -1,6 +1,6 @@
 {
   "discovery": {
-    "scope_prefix": "/api/",
+    "scope_prefix": "/",
     "max_pages": 20,
     "max_depth": 2
   },
@@ -79,9 +79,9 @@
         "path": "/api/auth/signup/",
         "method": "POST",
         "flow_name": "signup",
-        "body_template": {"username": "abuse_canary", "password": "__redmesh_canary_password__"},
+        "body_template": {"username": "{test_account}", "password": "__redmesh_canary_password__"},
         "revert_path": "/api/auth/signup/cleanup/",
-        "revert_body": {"username": "abuse_canary"},
+        "revert_body": {"username": "{test_account}"},
         "test_account": "abuse_canary"
       }
     ],
