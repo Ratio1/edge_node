@@ -186,11 +186,15 @@ class JsonControlFile:
       raise
     if stat.S_ISREG(st.st_mode):
       return
+    if stat.S_ISLNK(st.st_mode):
+      message = f"refusing symlink control file: {path.name}"
+    else:
+      message = f"refusing non-regular control file: {path.name}"
     try:
       cls._remove_unsafe_entry(path)
     finally:
       raise JsonControlFileUnsafeError(
-        f"refusing non-regular control file: {path.name}",
+        message,
         processing_path=path,
       )
 

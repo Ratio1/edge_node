@@ -944,7 +944,17 @@ class SyncManager:
         "chainstore_ack": bool(ack),
         "node_id": node_id,
       }
-      self.append_sent(entry)
+      history_error = None
+      history_appended = False
+      try:
+        self.append_sent(entry)
+        history_appended = True
+      except Exception as exc:
+        history_error = str(exc)
+        self.owner.P(
+          f"[sync] ChainStore publish succeeded but sent-history append failed: {exc}",
+          color="r",
+        )
 
       # Write success response and clean up control-plane artifacts. We
       # include the app-supplied metadata so the in-volume-sync state file
@@ -961,6 +971,8 @@ class SyncManager:
         "chainstore_ack": bool(ack),
         "metadata": dict(sync_request.metadata),
       }
+      if history_error is not None:
+        response_payload["history_error"] = history_error
       try:
         control_file.write_json(SYNC_RESPONSE_FILE, response_payload)
       except Exception as exc:
@@ -982,8 +994,10 @@ class SyncManager:
             f"[sync] failed to delete .processing after success: {exc}", color="y"
           )
 
-      # Retire prior CID (best-effort, never blocks success).
-      self._retire_previous_cid(history_sent_dir(self.owner))
+      # Retire prior CID only when the new sent-history entry exists. Without
+      # that entry there is no durable local record for deletion bookkeeping.
+      if history_appended:
+        self._retire_previous_cid(history_sent_dir(self.owner))
       return True
     finally:
       if tar_path:

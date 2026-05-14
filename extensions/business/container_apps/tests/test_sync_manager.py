@@ -1124,6 +1124,35 @@ class TestPublishSnapshot(unittest.TestCase):
     self.assertEqual(self.owner._r1fs.added, {})
     self.assertEqual(len(self.owner._r1fs.deleted), 1)
 
+  def test_sent_history_failure_after_chainstore_ack_still_completes_request(self):
+    with patch.object(self.sm, "append_sent", side_effect=RuntimeError("disk full")):
+      ok = self.sm.publish_snapshot(["/app/data/"], {"epoch": 7})
+
+    self.assertTrue(ok)
+    self.assertEqual(len(self.owner._cs.hset_calls), 1)
+    resp = json.loads((self.vsd / "response.json").read_text())
+    self.assertEqual(resp["status"], "ok")
+    self.assertIn("disk full", resp["history_error"])
+    self.assertFalse((self.vsd / "request.json.processing").exists())
+    self.assertFalse((self.vsd / "request.json.invalid").exists())
+
+  def test_sent_history_failure_skips_prior_cid_retirement(self):
+    self.sm.publish_snapshot(["/app/data/"], {"epoch": 1})
+    first = json.loads(next(history_sent_dir(self.owner).glob("*.json")).read_text())
+
+    (self.owner._fixed_root / "appdata" / "weights.bin").write_bytes(b"v2")
+    (self.vsd / SYNC_PROCESSING_FILE).write_text("{}")
+    with patch.object(self.sm, "append_sent", side_effect=RuntimeError("disk full")):
+      ok = self.sm.publish_snapshot(["/app/data/"], {"epoch": 2})
+
+    self.assertTrue(ok)
+    files = list(history_sent_dir(self.owner).glob("*.json"))
+    self.assertEqual(len(files), 1)
+    still_first = json.loads(files[0].read_text())
+    self.assertEqual(still_first["cid"], first["cid"])
+    self.assertIsNone(still_first["deletion"]["deleted_at"])
+    self.assertFalse(self.owner._r1fs.deleted)
+
   def test_two_snapshots_retire_first_cid(self):
     self.sm.publish_snapshot(["/app/data/"], {"epoch": 1})
     # Update content for the second snapshot
