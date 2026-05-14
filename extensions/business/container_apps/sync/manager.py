@@ -134,6 +134,21 @@ class ApplyResult:
   error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class DirectoryMetadata:
+  uid: int
+  gid: int
+  mode: int
+
+
+@dataclass(frozen=True)
+class ApplyRollbackOp:
+  op: str
+  path: str
+  backup: Optional[str] = None
+  metadata: Optional[DirectoryMetadata] = None
+
+
 def runtime_policy_to_dict(runtime: SyncRuntimePolicy) -> dict:
   return {
     "provider_capture": runtime.provider_capture,
@@ -1335,26 +1350,73 @@ class SyncManager:
     if st.st_uid != uid or st.st_gid != gid:
       os.chown(path, uid, gid)
 
+  @staticmethod
+  def _directory_metadata(path: str) -> DirectoryMetadata:
+    st = os.lstat(path)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+      raise ValueError(f"directory path is not a real directory: {path!r}")
+    return DirectoryMetadata(
+      uid=st.st_uid,
+      gid=st.st_gid,
+      mode=stat.S_IMODE(st.st_mode),
+    )
+
+  def _record_directory_metadata(
+    self,
+    path: str,
+    ops: Optional[list[ApplyRollbackOp]],
+    tracked_dirs: Optional[set[str]],
+  ) -> None:
+    if ops is None:
+      return
+    path_n = os.path.normpath(path)
+    if tracked_dirs is not None and path_n in tracked_dirs:
+      return
+    metadata = self._directory_metadata(path_n)
+    ops.append(ApplyRollbackOp("restore_dir_meta", path_n, metadata=metadata))
+    if tracked_dirs is not None:
+      tracked_dirs.add(path_n)
+
   def _ensure_directory_tree_owner(
     self,
     path: str,
     host_root: str,
     uid: int,
     gid: int,
+    ops: Optional[list[ApplyRollbackOp]] = None,
+    tracked_dirs: Optional[set[str]] = None,
   ) -> None:
-    os.makedirs(path, exist_ok=True)
     host_root_n = os.path.normpath(host_root)
-    current = os.path.normpath(path)
-    dirs: list[str] = []
-    while current != host_root_n and self._is_within_root(current, host_root_n):
-      dirs.append(current)
-      parent = os.path.dirname(current)
-      if parent == current:
-        break
-      current = parent
-    for directory in reversed(dirs):
-      self._chown_if_needed(directory, uid, gid)
-      os.chmod(directory, 0o755)
+    path_n = os.path.normpath(path)
+    if not self._is_within_root(path_n, host_root_n):
+      raise ValueError(f"directory path escapes volume root: {path_n!r}")
+    if path_n == host_root_n:
+      return
+
+    rel = os.path.relpath(path_n, host_root_n)
+    current = host_root_n
+    for part in rel.split(os.sep):
+      if not part or part == ".":
+        continue
+      if part == "..":
+        raise ValueError(f"directory path escapes volume root: {path_n!r}")
+      current = os.path.join(current, part)
+      try:
+        st = os.lstat(current)
+      except FileNotFoundError:
+        os.mkdir(current)
+        if ops is not None:
+          ops.append(ApplyRollbackOp("remove_dir", current))
+        if tracked_dirs is not None:
+          tracked_dirs.add(os.path.normpath(current))
+        st = os.lstat(current)
+
+      if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise ValueError(f"directory path is not a real directory: {current!r}")
+
+      self._record_directory_metadata(current, ops, tracked_dirs)
+      self._chown_if_needed(current, uid, gid)
+      os.chmod(current, 0o755)
 
   @staticmethod
   def _container_path_in_declared_archive_paths(
@@ -1629,27 +1691,30 @@ class SyncManager:
     except FileNotFoundError:
       pass
 
-  def _rollback_apply_ops(self, ops: list[tuple[str, str, Optional[str]]]) -> bool:
+  def _rollback_apply_ops(self, ops: list[ApplyRollbackOp]) -> bool:
     ok = True
-    for op, path, backup in reversed(ops):
+    for op in reversed(ops):
       try:
-        if op == "restore" and backup:
-          self._unlink_path(path)
-          os.replace(backup, path)
-        elif op == "remove_file":
-          self._unlink_path(path)
-        elif op == "remove_dir":
-          os.rmdir(path)
+        if op.op == "restore" and op.backup:
+          self._unlink_path(op.path)
+          os.replace(op.backup, op.path)
+        elif op.op == "remove_file":
+          self._unlink_path(op.path)
+        elif op.op == "remove_dir":
+          os.rmdir(op.path)
+        elif op.op == "restore_dir_meta" and op.metadata:
+          self._chown_if_needed(op.path, op.metadata.uid, op.metadata.gid)
+          os.chmod(op.path, op.metadata.mode)
       except OSError as exc:
         ok = False
-        self.owner.P(f"[sync] rollback operation failed for {path}: {exc}", color="r")
+        self.owner.P(f"[sync] rollback operation failed for {op.path}: {exc}", color="r")
     return ok
 
-  def _cleanup_backups(self, ops: list[tuple[str, str, Optional[str]]]) -> None:
-    for op, _path, backup in ops:
-      if op == "restore" and backup:
+  def _cleanup_backups(self, ops: list[ApplyRollbackOp]) -> None:
+    for op in ops:
+      if op.op == "restore" and op.backup:
         try:
-          os.unlink(backup)
+          os.unlink(op.backup)
         except OSError:
           pass
 
@@ -1663,7 +1728,8 @@ class SyncManager:
       self._cleanup_tree(prepared.staging_dir)
       return ApplyResult(False, True, "failed_preflight", [], error)
 
-    ops: list[tuple[str, str, Optional[str]]] = []
+    ops: list[ApplyRollbackOp] = []
+    tracked_dirs: set[str] = set()
     extracted: list[str] = []
     try:
       for planned in prepared.members:
@@ -1674,21 +1740,33 @@ class SyncManager:
         if planned.is_dir:
           existed = os.path.isdir(planned.host_path)
           self._ensure_directory_tree_owner(
-            planned.host_path, planned.host_root, owner_uid, owner_gid
+            planned.host_path, planned.host_root, owner_uid, owner_gid,
+            ops, tracked_dirs
           )
           self._validate_extract_target_within_root(
             planned.host_path, planned.host_root, planned.container_name
           )
+          self._record_directory_metadata(planned.host_path, ops, tracked_dirs)
           os.chmod(planned.host_path, self._safe_extract_mode(planned.mode, is_dir=True))
           if not existed:
-            ops.append(("remove_dir", planned.host_path, None))
+            created_path = os.path.normpath(planned.host_path)
+            if not any(
+              op.op == "remove_dir" and os.path.normpath(op.path) == created_path
+              for op in ops
+            ):
+              ops.append(ApplyRollbackOp("remove_dir", planned.host_path))
           extracted.append(planned.container_name)
           continue
 
         if planned.staging_path is None:
           continue
         parent = os.path.dirname(planned.host_path)
-        self._ensure_directory_tree_owner(parent, planned.host_root, owner_uid, owner_gid)
+        self._validate_extract_target_within_root(
+          parent, planned.host_root, planned.container_name
+        )
+        self._ensure_directory_tree_owner(
+          parent, planned.host_root, owner_uid, owner_gid, ops, tracked_dirs
+        )
         self._validate_extract_target_within_root(
           planned.host_path, planned.host_root, planned.container_name
         )
@@ -1699,9 +1777,9 @@ class SyncManager:
         if os.path.lexists(planned.host_path):
           backup_path = self._new_backup_path(planned.host_path)
           os.replace(planned.host_path, backup_path)
-          ops.append(("restore", planned.host_path, backup_path))
+          ops.append(ApplyRollbackOp("restore", planned.host_path, backup_path))
         else:
-          ops.append(("remove_file", planned.host_path, None))
+          ops.append(ApplyRollbackOp("remove_file", planned.host_path))
 
         fd, tmp_name = tempfile.mkstemp(
           dir=parent,

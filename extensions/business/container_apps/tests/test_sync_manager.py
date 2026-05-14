@@ -9,6 +9,7 @@ the manager depends on.
 import json
 import os
 import io
+import stat
 import tarfile
 import tempfile
 import time
@@ -1651,6 +1652,155 @@ class TestConsumerFlow(unittest.TestCase):
     self.assertFalse(second.exists())
     state = json.loads((sync_state_dir(self.consumer) / "current_apply.json").read_text())
     self.assertEqual(state["state"], "failed_rolled_back")
+
+  def test_commit_prepared_apply_restores_directory_metadata_on_failure(self):
+    existing = self.consumer._fixed_root / "appdata" / "existing"
+    existing.mkdir()
+    os.chmod(existing, 0o700)
+    before_mode = stat.S_IMODE(os.stat(existing).st_mode)
+
+    tar_path = self.tmpdir / "rollback-dir-metadata.tar.gz"
+    src = self.tmpdir / "new.bin"
+    src.write_bytes(b"new")
+    with tarfile.open(str(tar_path), "w:gz") as tar:
+      info = tarfile.TarInfo(name="/app/data/existing")
+      info.type = tarfile.DIRTYPE
+      info.mode = 0o755
+      tar.addfile(info)
+      tar.add(str(src), arcname="/app/data/new.bin")
+
+    cid = "QmDIRMETAROLLBACK"
+    self.consumer._r1fs.added[cid] = tar_path.read_bytes()
+    record = {
+      "cid": cid,
+      "version": 123,
+      "timestamp": 1.0,
+      "node_id": "ee_provider",
+      "metadata": {},
+      "manifest": {
+        "schema_version": 1,
+        "archive_paths": ["/app/data/"],
+        "archive_format": "tar.gz",
+        "encryption": "r1fs-default",
+      },
+    }
+    prepared = self.sm_c.prepare_apply(record)
+    self.assertIsNotNone(prepared)
+
+    with patch.object(
+      self.sm_c,
+      "_safe_extract_mode",
+      side_effect=[0o755, RuntimeError("forced later failure")],
+    ):
+      result = self.sm_c.commit_prepared_apply(prepared)
+
+    self.assertFalse(result.success)
+    self.assertTrue(result.restart_safe)
+    self.assertEqual(result.state, "failed_rolled_back")
+    self.assertEqual(stat.S_IMODE(os.stat(existing).st_mode), before_mode)
+    self.assertFalse((self.consumer._fixed_root / "appdata" / "new.bin").exists())
+    state = json.loads((sync_state_dir(self.consumer) / "current_apply.json").read_text())
+    self.assertEqual(state["state"], "failed_rolled_back")
+
+  def test_commit_prepared_apply_removes_created_parent_dirs_on_failure(self):
+    new_root = self.consumer._fixed_root / "appdata" / "new"
+    child = new_root / "child"
+    target = child / "file.bin"
+
+    tar_path = self.tmpdir / "rollback-created-parents.tar.gz"
+    src = self.tmpdir / "file.bin"
+    src.write_bytes(b"new")
+    with tarfile.open(str(tar_path), "w:gz") as tar:
+      tar.add(str(src), arcname="/app/data/new/child/file.bin")
+
+    cid = "QmCREATEDPARENTS"
+    self.consumer._r1fs.added[cid] = tar_path.read_bytes()
+    record = {
+      "cid": cid,
+      "version": 123,
+      "timestamp": 1.0,
+      "node_id": "ee_provider",
+      "metadata": {},
+      "manifest": {
+        "schema_version": 1,
+        "archive_paths": ["/app/data/"],
+        "archive_format": "tar.gz",
+        "encryption": "r1fs-default",
+      },
+    }
+    prepared = self.sm_c.prepare_apply(record)
+    self.assertIsNotNone(prepared)
+
+    with patch.object(
+      self.sm_c,
+      "_safe_extract_mode",
+      side_effect=RuntimeError("forced file failure"),
+    ):
+      result = self.sm_c.commit_prepared_apply(prepared)
+
+    self.assertFalse(result.success)
+    self.assertTrue(result.restart_safe)
+    self.assertEqual(result.state, "failed_rolled_back")
+    self.assertFalse(target.exists())
+    self.assertFalse(child.exists())
+    self.assertFalse(new_root.exists())
+
+  def test_commit_prepared_apply_reports_uncertain_when_dir_metadata_rollback_fails(self):
+    existing = self.consumer._fixed_root / "appdata" / "existing"
+    existing.mkdir()
+    os.chmod(existing, 0o700)
+
+    tar_path = self.tmpdir / "rollback-dir-metadata-fails.tar.gz"
+    src = self.tmpdir / "new.bin"
+    src.write_bytes(b"new")
+    with tarfile.open(str(tar_path), "w:gz") as tar:
+      info = tarfile.TarInfo(name="/app/data/existing")
+      info.type = tarfile.DIRTYPE
+      info.mode = 0o755
+      tar.addfile(info)
+      tar.add(str(src), arcname="/app/data/new.bin")
+
+    cid = "QmDIRMETAUNCERTAIN"
+    self.consumer._r1fs.added[cid] = tar_path.read_bytes()
+    record = {
+      "cid": cid,
+      "version": 123,
+      "timestamp": 1.0,
+      "node_id": "ee_provider",
+      "metadata": {},
+      "manifest": {
+        "schema_version": 1,
+        "archive_paths": ["/app/data/"],
+        "archive_format": "tar.gz",
+        "encryption": "r1fs-default",
+      },
+    }
+    prepared = self.sm_c.prepare_apply(record)
+    self.assertIsNotNone(prepared)
+
+    import extensions.business.container_apps.sync.manager as manager_mod
+    original_chmod = manager_mod.os.chmod
+
+    def _fail_restoring_existing_dir(path, mode):
+      if os.path.normpath(path) == os.path.normpath(existing) and mode == 0o700:
+        raise OSError("restore chmod failed")
+      return original_chmod(path, mode)
+
+    with patch.object(
+      self.sm_c,
+      "_safe_extract_mode",
+      side_effect=[0o755, RuntimeError("forced later failure")],
+    ), patch(
+      "extensions.business.container_apps.sync.manager.os.chmod",
+      side_effect=_fail_restoring_existing_dir,
+    ):
+      result = self.sm_c.commit_prepared_apply(prepared)
+
+    self.assertFalse(result.success)
+    self.assertFalse(result.restart_safe)
+    self.assertEqual(result.state, "uncertain")
+    state = json.loads((sync_state_dir(self.consumer) / "current_apply.json").read_text())
+    self.assertEqual(state["state"], "uncertain")
 
   def test_apply_rejects_symlink_escape_without_advancing_state(self):
     outside = self.tmpdir / "outside"
