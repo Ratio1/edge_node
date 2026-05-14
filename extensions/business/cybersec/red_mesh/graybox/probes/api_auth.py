@@ -53,25 +53,13 @@ class ApiAuthProbes(ProbeBase):
   requires_auth = True
   requires_regular_session = False
   is_stateful = False
+  probe_key = "_graybox_api_auth"
 
   def run(self):
     api_security = getattr(self.target_config, "api_security", None)
     if api_security is None:
       return self.findings
-    tok = api_security.token_endpoints
-    if not tok.protected_path:
-      for sid, title in (
-        ("PT-OAPI2-01", "API JWT missing-signature accepted (alg=none)"),
-        ("PT-OAPI2-02", "API JWT signed with weak HMAC secret"),
-        ("PT-OAPI2-03", "API token not invalidated on logout"),
-      ):
-        self.emit_inconclusive(sid, title, "API2:2023", "no_protected_path_configured")
-      return self.findings
-    self.run_safe("api_jwt_alg_none", self._test_jwt_alg_none)
-    self.run_safe("api_jwt_weak_hmac", self._test_jwt_weak_hmac)
-    self.run_safe("api_token_logout_invalidation",
-                   self._test_token_logout_invalidation)
-    return self.findings
+    return self.run_runtime_scenarios(self.probe_key)
 
   # ── helpers ────────────────────────────────────────────────────────
 
@@ -140,8 +128,16 @@ class ApiAuthProbes(ProbeBase):
   # ── PT-OAPI2-01 — alg=none ────────────────────────────────────────
 
   def _test_jwt_alg_none(self):
+    if not self.scenario_enabled("PT-OAPI2-01"):
+      return
     title = "API JWT missing-signature accepted (alg=none)"
     owasp = "API2:2023"
+    tok = self.target_config.api_security.token_endpoints
+    if not tok.protected_path:
+      self.emit_inconclusive(
+        "PT-OAPI2-01", title, owasp, "no_protected_path_configured",
+      )
+      return
     real_token, _ = self._obtain_token()
     if not real_token:
       self.emit_inconclusive(
@@ -153,7 +149,6 @@ class ApiAuthProbes(ProbeBase):
     forged_payload["is_admin"] = True
     forged = _forge_jwt({"alg": "none", "typ": "JWT"}, forged_payload)
 
-    tok = self.target_config.api_security.token_endpoints
     url = self.target_url + tok.protected_path
     if not self.budget():
       return
@@ -197,8 +192,16 @@ class ApiAuthProbes(ProbeBase):
   # ── PT-OAPI2-02 — weak HMAC secret ───────────────────────────────
 
   def _test_jwt_weak_hmac(self):
+    if not self.scenario_enabled("PT-OAPI2-02"):
+      return
     title = "API JWT signed with weak HMAC secret"
     owasp = "API2:2023"
+    tok = self.target_config.api_security.token_endpoints
+    if not tok.protected_path:
+      self.emit_inconclusive(
+        "PT-OAPI2-02", title, owasp, "no_protected_path_configured",
+      )
+      return
     real_token, _ = self._obtain_token()
     if not real_token:
       self.emit_inconclusive(
@@ -255,9 +258,16 @@ class ApiAuthProbes(ProbeBase):
   # ── PT-OAPI2-03 — Logout doesn't invalidate (STATEFUL) ───────────
 
   def _test_token_logout_invalidation(self):
+    if not self.scenario_enabled("PT-OAPI2-03"):
+      return
     title = "API token not invalidated on logout"
     owasp = "API2:2023"
     tok = self.target_config.api_security.token_endpoints
+    if not tok.protected_path:
+      self.emit_inconclusive(
+        "PT-OAPI2-03", title, owasp, "no_protected_path_configured",
+      )
+      return
     if not tok.logout_path:
       self.emit_inconclusive(
         "PT-OAPI2-03", title, owasp, "no_logout_path_configured",

@@ -113,6 +113,7 @@ class GrayboxProbeContext:
   # mutable RequestBudget. The frozen dataclass owns the binding; the
   # budget object itself mutates as probes consume.
   request_budget: object = None
+  allowed_scenario_ids: tuple[str, ...] | None = None
 
   def to_kwargs(self) -> dict:
     return {
@@ -125,6 +126,7 @@ class GrayboxProbeContext:
       "regular_username": self.regular_username,
       "allow_stateful": self.allow_stateful,
       "request_budget": self.request_budget,
+      "allowed_scenario_ids": self.allowed_scenario_ids,
     }
 
 

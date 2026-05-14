@@ -399,6 +399,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self._phase_open = False
 
   def _build_probe_kwargs(self, discovery_result: DiscoveryResult) -> dict:
+    allowed_scenario_ids = getattr(self.job_config, "assigned_scenario_ids", None)
     return GrayboxProbeContext(
       target_url=self.target_url,
       auth_manager=self.auth,
@@ -409,6 +410,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       regular_username=self._credentials.regular.username if self._credentials.regular else "",
       allow_stateful=self.job_config.allow_stateful_probes,
       request_budget=self.request_budget,
+      allowed_scenario_ids=tuple(allowed_scenario_ids) if allowed_scenario_ids else None,
     )
 
   def _run_probe_phase(self, discovery_result: DiscoveryResult):

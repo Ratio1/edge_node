@@ -32,7 +32,7 @@ class ProbeBase:
   def __init__(self, target_url, auth_manager, target_config, safety,
                discovered_routes=None, discovered_forms=None,
                regular_username="", allow_stateful=False,
-               request_budget=None):
+               request_budget=None, allowed_scenario_ids=None):
     self.target_url = target_url.rstrip("/")
     self.auth = auth_manager
     self.target_config = target_config
@@ -44,6 +44,9 @@ class ProbeBase:
     # OWASP API Top 10 — Subphase 1.7. Optional shared RequestBudget.
     # When None, `self.budget()` always returns True (no enforcement).
     self.request_budget = request_budget
+    self.allowed_scenario_ids = (
+      None if allowed_scenario_ids is None else set(allowed_scenario_ids)
+    )
     self.findings: list[GrayboxFinding] = []
 
   @classmethod
@@ -67,6 +70,33 @@ class ProbeBase:
       self._record_error(probe_name, self._error_with_detail("request_timeout", exc))
     except Exception as exc:
       self._record_error(probe_name, self._sanitize_error(str(exc)))
+
+  def scenario_enabled(self, scenario_id: str) -> bool:
+    """Return whether this worker is allowed to execute ``scenario_id``."""
+    if self.allowed_scenario_ids is None:
+      return True
+    return scenario_id in self.allowed_scenario_ids
+
+  def run_safe_scenario(self, scenario_id: str, probe_name: str, probe_fn):
+    """Run a scenario only when the worker assignment permits it."""
+    if not self.scenario_enabled(scenario_id):
+      return
+    self.run_safe(probe_name, probe_fn)
+
+  def run_runtime_scenarios(self, probe_key: str):
+    """Run assigned runtime-manifest scenarios for one probe family."""
+    from ..scenario_runtime import runtime_scenarios_for_probe
+
+    for scenario in runtime_scenarios_for_probe(probe_key):
+      if not self.scenario_enabled(scenario.scenario_id):
+        continue
+      runner = getattr(self, scenario.runner)
+      self.run_safe_scenario(
+        scenario.scenario_id,
+        scenario.runner.lstrip("_"),
+        runner,
+      )
+    return self.findings
 
   def build_result(self, outcome: str = "completed", artifacts=None) -> GrayboxProbeRunResult:
     """Return a typed probe result without changing legacy run() contracts."""
@@ -112,6 +142,8 @@ class ProbeBase:
     title = finding_kwargs.pop("title", scenario_id)
     owasp = finding_kwargs.pop("owasp", "")
 
+    if not self.scenario_enabled(scenario_id):
+      return False
     if not self._allow_stateful:
       self.emit_inconclusive(scenario_id, title, owasp,
                               "stateful_probes_disabled")

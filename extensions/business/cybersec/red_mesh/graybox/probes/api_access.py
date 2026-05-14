@@ -38,41 +38,19 @@ class ApiAccessProbes(ProbeBase):
   requires_auth = True
   requires_regular_session = False
   is_stateful = False
+  probe_key = "_graybox_api_access"
 
   def run(self):
     api_security = getattr(self.target_config, "api_security", None)
     if api_security is None:
       return self.findings
-
-    if getattr(api_security, "object_endpoints", None):
-      self.run_safe("api_bola", self._test_api_bola)
-    else:
-      self.emit_inconclusive(
-        "PT-OAPI1-01",
-        "API object-level authorization bypass (BOLA)",
-        "API1:2023",
-        "no_configured_object_endpoints",
-      )
-
-    if getattr(api_security, "function_endpoints", None):
-      self.run_safe("api_bfla_regular", self._test_bfla_regular_as_admin)
-      self.run_safe("api_bfla_anon", self._test_bfla_anon_as_user)
-      self.run_safe("api_bfla_method_override", self._test_bfla_method_override)
-      self.run_safe("api_bfla_mutating", self._test_bfla_regular_as_admin_mutating)
-    else:
-      for sid, title in (
-        ("PT-OAPI5-01", "API function-level authorization bypass (regular as admin, read)"),
-        ("PT-OAPI5-02", "API function-level authorization bypass (anonymous as user, read)"),
-        ("PT-OAPI5-03", "API method-override authorization bypass"),
-        ("PT-OAPI5-04", "API function-level authorization bypass (regular as admin, mutating)"),
-      ):
-        self.emit_inconclusive(sid, title, "API5:2023", "no_configured_function_endpoints")
-
-    return self.findings
+    return self.run_runtime_scenarios(self.probe_key)
 
   # ── PT-OAPI1-01 — API object-level authorization bypass (BOLA) ──────
 
   def _test_api_bola(self):
+    if not self.scenario_enabled("PT-OAPI1-01"):
+      return
     """For each configured ApiObjectEndpoint, iterate ``test_ids`` against
     ``path`` (template) using the regular_session (or official_session if
     no regular configured). Vulnerable iff response is 200 + JSON +
@@ -85,6 +63,14 @@ class ApiAccessProbes(ProbeBase):
     """
     api_security = self.target_config.api_security
     endpoints = api_security.object_endpoints
+    if not endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI1-01",
+        "API object-level authorization bypass (BOLA)",
+        "API1:2023",
+        "no_configured_object_endpoints",
+      )
+      return
     session = self.auth.regular_session
     if session is None:
       self.emit_inconclusive(
@@ -242,6 +228,8 @@ class ApiAccessProbes(ProbeBase):
   # ── PT-OAPI5-01 — BFLA: regular user reaches admin function ─────────
 
   def _test_bfla_regular_as_admin(self):
+    if not self.scenario_enabled("PT-OAPI5-01"):
+      return
     """For each ApiFunctionEndpoint with method == GET (read-only),
     GET it as the regular_session and expect ≥401/403.
 
@@ -251,6 +239,14 @@ class ApiAccessProbes(ProbeBase):
     """
     api_security = self.target_config.api_security
     endpoints = api_security.function_endpoints
+    if not endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI5-01",
+        "API function-level authorization bypass (regular as admin, read)",
+        "API5:2023",
+        "no_configured_function_endpoints",
+      )
+      return
     session = self.auth.regular_session
     if session is None:
       self.emit_inconclusive(
@@ -277,6 +273,8 @@ class ApiAccessProbes(ProbeBase):
   # ── PT-OAPI5-02 — BFLA: anonymous user reaches user function ────────
 
   def _test_bfla_anon_as_user(self):
+    if not self.scenario_enabled("PT-OAPI5-02"):
+      return
     """Anonymous (unauthenticated) GET against each function endpoint.
 
     Same mechanics as PT-OAPI5-01 but uses
@@ -285,6 +283,14 @@ class ApiAccessProbes(ProbeBase):
     """
     api_security = self.target_config.api_security
     endpoints = api_security.function_endpoints
+    if not endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI5-02",
+        "API function-level authorization bypass (anonymous as user, read)",
+        "API5:2023",
+        "no_configured_function_endpoints",
+      )
+      return
     if not hasattr(self.auth, "make_anonymous_session"):
       self.emit_inconclusive(
         "PT-OAPI5-02",
@@ -405,9 +411,16 @@ class ApiAccessProbes(ProbeBase):
   # ── PT-OAPI5-03 — Method-override bypass (STATEFUL) ────────────────
 
   def _test_bfla_method_override(self):
+    if not self.scenario_enabled("PT-OAPI5-03"):
+      return
     title = "API method-override authorization bypass"
     owasp = "API5:2023"
     api_security = self.target_config.api_security
+    if not api_security.function_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI5-03", title, owasp, "no_configured_function_endpoints",
+      )
+      return
     session = self.auth.regular_session
     if session is None:
       self.emit_inconclusive("PT-OAPI5-03", title, owasp, "no_regular_session")
@@ -510,9 +523,16 @@ class ApiAccessProbes(ProbeBase):
   # ── PT-OAPI5-04 — Regular user reaches admin function (MUTATING) ───
 
   def _test_bfla_regular_as_admin_mutating(self):
+    if not self.scenario_enabled("PT-OAPI5-04"):
+      return
     title = "API function-level authorization bypass (regular as admin, mutating)"
     owasp = "API5:2023"
     api_security = self.target_config.api_security
+    if not api_security.function_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI5-04", title, owasp, "no_configured_function_endpoints",
+      )
+      return
     session = self.auth.regular_session
     if session is None:
       self.emit_inconclusive("PT-OAPI5-04", title, owasp, "no_regular_session")

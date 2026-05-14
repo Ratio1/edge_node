@@ -37,32 +37,27 @@ class ApiDataProbes(ProbeBase):
   requires_auth = True
   requires_regular_session = False
   is_stateful = False
+  probe_key = "_graybox_api_data"
 
   def run(self):
     api_security = getattr(self.target_config, "api_security", None)
     if api_security is None:
       return self.findings
-
-    if getattr(api_security, "property_endpoints", None):
-      self.run_safe("api_property_exposure", self._test_api_property_exposure)
-      self.run_safe("api_property_tampering", self._test_api_property_tampering)
-    else:
-      self.emit_inconclusive(
-        "PT-OAPI3-01", "API response leaks sensitive properties",
-        "API3:2023", "no_configured_property_endpoints",
-      )
-      self.emit_inconclusive(
-        "PT-OAPI3-02", "API accepts mass assignment of privileged properties",
-        "API3:2023", "no_configured_property_endpoints",
-      )
-
-    return self.findings
+    return self.run_runtime_scenarios(self.probe_key)
 
   # ── PT-OAPI3-01 — Excessive property exposure ─────────────────────
 
   def _test_api_property_exposure(self):
+    if not self.scenario_enabled("PT-OAPI3-01"):
+      return
     api_security = self.target_config.api_security
     endpoints = api_security.property_endpoints
+    if not endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI3-01", "API response leaks sensitive properties",
+        "API3:2023", "no_configured_property_endpoints",
+      )
+      return
     session = self.auth.regular_session or self.auth.official_session
     if session is None:
       self.emit_inconclusive(
@@ -143,9 +138,16 @@ class ApiDataProbes(ProbeBase):
   # ── PT-OAPI3-02 — Mass-assignment write (Subphase 3.1, STATEFUL) ──
 
   def _test_api_property_tampering(self):
+    if not self.scenario_enabled("PT-OAPI3-02"):
+      return
     api_security = self.target_config.api_security
     title = "API accepts mass assignment of privileged properties"
     owasp = "API3:2023"
+    if not api_security.property_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI3-02", title, owasp, "no_configured_property_endpoints",
+      )
+      return
 
     session = self.auth.regular_session
     if session is None:

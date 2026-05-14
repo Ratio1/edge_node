@@ -22,35 +22,13 @@ class ApiAbuseProbes(ProbeBase):
   requires_auth = True
   requires_regular_session = False
   is_stateful = False
+  probe_key = "_graybox_api_abuse"
 
   def run(self):
     api_security = getattr(self.target_config, "api_security", None)
     if api_security is None:
       return self.findings
-    if getattr(api_security, "resource_endpoints", None):
-      self.run_safe("api_no_pagination_cap", self._test_no_pagination_cap)
-      self.run_safe("api_oversized_payload", self._test_oversized_payload)
-      self.run_safe("api_no_rate_limit", self._test_no_rate_limit)
-    else:
-      for sid, title in (
-        ("PT-OAPI4-01", "API endpoint lacks pagination cap"),
-        ("PT-OAPI4-02", "API endpoint accepts oversized payload"),
-        ("PT-OAPI4-03", "API endpoint lacks rate limit"),
-      ):
-        self.emit_inconclusive(sid, title, "API4:2023", "no_configured_resource_endpoints")
-    if getattr(api_security, "business_flows", None):
-      self.run_safe("api_flow_no_rate_limit", self._test_flow_no_rate_limit)
-      self.run_safe("api_flow_no_uniqueness", self._test_flow_no_uniqueness)
-    else:
-      self.emit_inconclusive(
-        "PT-OAPI6-01", "API business flow lacks rate limit / abuse controls",
-        "API6:2023", "no_configured_business_flows",
-      )
-      self.emit_inconclusive(
-        "PT-OAPI6-02", "API business flow lacks uniqueness check",
-        "API6:2023", "no_configured_business_flows",
-      )
-    return self.findings
+    return self.run_runtime_scenarios(self.probe_key)
 
   def _session(self):
     return self.auth.official_session or self.auth.regular_session
@@ -127,8 +105,15 @@ class ApiAbuseProbes(ProbeBase):
   # ── PT-OAPI4-01 — no pagination cap ────────────────────────────────
 
   def _test_no_pagination_cap(self):
+    if not self.scenario_enabled("PT-OAPI4-01"):
+      return
     title = "API endpoint lacks pagination cap"
     owasp = "API4:2023"
+    if not self.target_config.api_security.resource_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI4-01", title, owasp, "no_configured_resource_endpoints",
+      )
+      return
     session = self._session()
     if session is None:
       self.emit_inconclusive("PT-OAPI4-01", title, owasp, "no_authenticated_session")
@@ -189,8 +174,15 @@ class ApiAbuseProbes(ProbeBase):
   # ── PT-OAPI4-02 — oversized payload ────────────────────────────────
 
   def _test_oversized_payload(self):
+    if not self.scenario_enabled("PT-OAPI4-02"):
+      return
     title = "API endpoint accepts oversized payload"
     owasp = "API4:2023"
+    if not self.target_config.api_security.resource_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI4-02", title, owasp, "no_configured_resource_endpoints",
+      )
+      return
     session = self._session()
     if session is None:
       self.emit_inconclusive("PT-OAPI4-02", title, owasp, "no_authenticated_session")
@@ -228,8 +220,15 @@ class ApiAbuseProbes(ProbeBase):
   # ── PT-OAPI4-03 — no rate limit ────────────────────────────────────
 
   def _test_no_rate_limit(self):
+    if not self.scenario_enabled("PT-OAPI4-03"):
+      return
     title = "API endpoint lacks rate limit"
     owasp = "API4:2023"
+    if not self.target_config.api_security.resource_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI4-03", title, owasp, "no_configured_resource_endpoints",
+      )
+      return
     session = self._session()
     if session is None:
       self.emit_inconclusive("PT-OAPI4-03", title, owasp, "no_authenticated_session")
@@ -274,8 +273,15 @@ class ApiAbuseProbes(ProbeBase):
   # ── PT-OAPI6-01 — flow no rate limit (STATEFUL) ────────────────────
 
   def _test_flow_no_rate_limit(self):
+    if not self.scenario_enabled("PT-OAPI6-01"):
+      return
     title = "API business flow lacks rate limit / abuse controls"
     owasp = "API6:2023"
+    if not self.target_config.api_security.business_flows:
+      self.emit_inconclusive(
+        "PT-OAPI6-01", title, owasp, "no_configured_business_flows",
+      )
+      return
     session = self._low_priv_session()
     if session is None:
       self.emit_inconclusive("PT-OAPI6-01", title, owasp, "no_low_privileged_session")
@@ -353,8 +359,15 @@ class ApiAbuseProbes(ProbeBase):
   # ── PT-OAPI6-02 — flow no uniqueness check (STATEFUL) ──────────────
 
   def _test_flow_no_uniqueness(self):
+    if not self.scenario_enabled("PT-OAPI6-02"):
+      return
     title = "API business flow lacks uniqueness check"
     owasp = "API6:2023"
+    if not self.target_config.api_security.business_flows:
+      self.emit_inconclusive(
+        "PT-OAPI6-02", title, owasp, "no_configured_business_flows",
+      )
+      return
     session = self._low_priv_session()
     if session is None:
       self.emit_inconclusive("PT-OAPI6-02", title, owasp, "no_low_privileged_session")

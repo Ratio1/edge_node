@@ -39,34 +39,13 @@ class ApiConfigProbes(ProbeBase):
   requires_auth = True
   requires_regular_session = False
   is_stateful = False
+  probe_key = "_graybox_api_config"
 
   def run(self):
     api_security = getattr(self.target_config, "api_security", None)
     if api_security is None:
       return self.findings
-
-    # API8 misconfig probes — require a function endpoint to probe AGAINST
-    # (CORS / methods) or run against `debug_path_candidates` directly.
-    if getattr(api_security, "function_endpoints", None):
-      self.run_safe("api_cors_misconfig", self._test_cors_misconfig)
-      self.run_safe("api_security_headers", self._test_security_headers)
-      self.run_safe("api_unexpected_methods", self._test_unexpected_methods)
-      self.run_safe("api_verbose_error", self._test_verbose_error)
-    else:
-      for sid, title in (
-        ("PT-OAPI8-01", "API permissive CORS configuration"),
-        ("PT-OAPI8-02", "API response missing security headers"),
-        ("PT-OAPI8-04", "API verbose error response leaks internals"),
-        ("PT-OAPI8-05", "API advertises unexpected HTTP methods"),
-      ):
-        self.emit_inconclusive(sid, title, "API8:2023", "no_configured_function_endpoints")
-    self.run_safe("api_debug_endpoint", self._test_debug_endpoint_exposed)
-
-    # API9 inventory
-    self.run_safe("api_openapi_exposed", self._test_openapi_exposed)
-    self.run_safe("api_version_sprawl", self._test_version_sprawl)
-    self.run_safe("api_deprecated_live", self._test_deprecated_live)
-    return self.findings
+    return self.run_runtime_scenarios(self.probe_key)
 
   # ── helpers ────────────────────────────────────────────────────────
 
@@ -84,7 +63,15 @@ class ApiConfigProbes(ProbeBase):
   # ── PT-OAPI8-01 — Permissive CORS ─────────────────────────────────
 
   def _test_cors_misconfig(self):
+    if not self.scenario_enabled("PT-OAPI8-01"):
+      return
     api_security = self.target_config.api_security
+    if not api_security.function_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI8-01", "API permissive CORS configuration",
+        "API8:2023", "no_configured_function_endpoints",
+      )
+      return
     session = self._session()
     if session is None:
       self.emit_inconclusive(
@@ -149,7 +136,15 @@ class ApiConfigProbes(ProbeBase):
   # ── PT-OAPI8-02 — Missing security headers ────────────────────────
 
   def _test_security_headers(self):
+    if not self.scenario_enabled("PT-OAPI8-02"):
+      return
     api_security = self.target_config.api_security
+    if not api_security.function_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI8-02", "API response missing security headers",
+        "API8:2023", "no_configured_function_endpoints",
+      )
+      return
     session = self._session()
     if session is None:
       self.emit_inconclusive(
@@ -201,6 +196,8 @@ class ApiConfigProbes(ProbeBase):
   # ── PT-OAPI8-03 — Debug endpoint exposed ─────────────────────────
 
   def _test_debug_endpoint_exposed(self):
+    if not self.scenario_enabled("PT-OAPI8-03"):
+      return
     api_security = self.target_config.api_security
     session = self._session()
     if session is None:
@@ -241,7 +238,15 @@ class ApiConfigProbes(ProbeBase):
   # ── PT-OAPI8-04 — Verbose error response ─────────────────────────
 
   def _test_verbose_error(self):
+    if not self.scenario_enabled("PT-OAPI8-04"):
+      return
     api_security = self.target_config.api_security
+    if not api_security.function_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI8-04", "API verbose error response leaks internals",
+        "API8:2023", "no_configured_function_endpoints",
+      )
+      return
     session = self._session()
     if session is None:
       self.emit_inconclusive(
@@ -290,7 +295,15 @@ class ApiConfigProbes(ProbeBase):
   # ── PT-OAPI8-05 — Unexpected methods ─────────────────────────────
 
   def _test_unexpected_methods(self):
+    if not self.scenario_enabled("PT-OAPI8-05"):
+      return
     api_security = self.target_config.api_security
+    if not api_security.function_endpoints:
+      self.emit_inconclusive(
+        "PT-OAPI8-05", "API advertises unexpected HTTP methods",
+        "API8:2023", "no_configured_function_endpoints",
+      )
+      return
     session = self._session()
     if session is None:
       self.emit_inconclusive(
@@ -335,6 +348,8 @@ class ApiConfigProbes(ProbeBase):
   # ── PT-OAPI9-01 — OpenAPI exposed ────────────────────────────────
 
   def _test_openapi_exposed(self):
+    if not self.scenario_enabled("PT-OAPI9-01"):
+      return
     api_security = self.target_config.api_security
     inv = api_security.inventory_paths
     session = self._anon_session() or self._session()
@@ -396,6 +411,8 @@ class ApiConfigProbes(ProbeBase):
   # ── PT-OAPI9-02 — Version sprawl ─────────────────────────────────
 
   def _test_version_sprawl(self):
+    if not self.scenario_enabled("PT-OAPI9-02"):
+      return
     api_security = self.target_config.api_security
     inv = api_security.inventory_paths
     if not inv.current_version or not inv.canonical_probe_path:
@@ -446,6 +463,8 @@ class ApiConfigProbes(ProbeBase):
   # ── PT-OAPI9-03 — Deprecated still live ─────────────────────────
 
   def _test_deprecated_live(self):
+    if not self.scenario_enabled("PT-OAPI9-03"):
+      return
     api_security = self.target_config.api_security
     inv = api_security.inventory_paths
     if not inv.deprecated_paths:
