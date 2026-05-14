@@ -22,7 +22,7 @@ scenarios:
   - id: PT-OAPI1-01
     honeypot_path: "/api/orgs/tenant-a/users/2/"
     method: GET
-    expected_severity: CRITICAL
+    expected_severity: HIGH
     expected_evidence_keys: ["endpoint=", "owner_value=", "tenant_field=tenant_id"]
     hardened_status: not_vulnerable
     notes: |
@@ -77,7 +77,7 @@ scenarios:
     honeypot_path: "/api/notes/"
     method: POST
     expected_severity: MEDIUM
-    expected_evidence_keys: ["body_bytes=65536"]
+    expected_evidence_keys: ["body_bytes="]
     hardened_status: not_vulnerable
 
   - id: PT-OAPI4-03

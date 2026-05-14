@@ -39,6 +39,11 @@
         "allow_malformed_json_probe": true
       },
       {
+        "path": "/api/_debug/routes/",
+        "method": "GET",
+        "privilege": "user"
+      },
+      {
         "path": "/api/admin/users/2/method-override-promote/",
         "method": "POST",
         "privilege": "admin",
@@ -88,12 +93,13 @@
     },
     "inventory_paths": {
       "openapi_candidates": ["/openapi.json", "/swagger.json"],
-      "current_version": "/api/v2/",
-      "canonical_probe_path": "/api/v2/me/",
-      "version_sibling_candidates": ["/api/v1/", "/api/v0/"],
+      "current_version": "/api/v2/records/",
+      "canonical_probe_path": "/api/v2/records/1/",
+      "version_sibling_candidates": ["/api/v1/records/", "/api/v0/records/"],
       "private_path_patterns": ["/internal/"],
       "deprecated_paths": ["/api/v0/legacy/"]
     },
+    "debug_path_candidates": ["/api/_debug/routes/"],
     "ssrf_body_fields": ["callback_url", "url", "webhook"]
   },
   "injection": {

@@ -2,6 +2,7 @@ from extensions.business.cybersec.red_mesh.tests.e2e.run_e2e import archive_pass
 from extensions.business.cybersec.red_mesh.tests.e2e.api_top10_e2e import (
   assert_llm_boundary,
   llm_boundary_blob_from_archive,
+  target_config_with_bearer_auth,
   target_confirmation_for_url,
 )
 
@@ -30,6 +31,25 @@ def test_api_top10_target_confirmation_uses_host_only():
   assert target_confirmation_for_url("http://localhost:30001") == "localhost"
   assert target_confirmation_for_url("https://api.example.com/app") == "api.example.com"
   assert target_confirmation_for_url("api.internal") == "api.internal"
+
+
+def test_api_top10_target_config_layers_bearer_auth_without_mutating_fixture():
+  fixture = {
+    "api_security": {
+      "object_endpoints": [{"path": "/api/users/{id}/"}],
+    },
+  }
+
+  configured = target_config_with_bearer_auth(fixture)
+
+  assert fixture["api_security"].get("auth") is None
+  assert configured["api_security"]["object_endpoints"] == [{"path": "/api/users/{id}/"}]
+  assert configured["api_security"]["auth"] == {
+    "auth_type": "bearer",
+    "bearer_token_header_name": "Authorization",
+    "bearer_scheme": "Bearer",
+    "authenticated_probe_path": "/api/v2/me/",
+  }
 
 
 def test_api_top10_llm_boundary_blob_uses_archive_report_fields():

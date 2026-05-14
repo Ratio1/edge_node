@@ -159,15 +159,52 @@ def target_confirmation_for_url(target_url: str) -> str:
   parsed = urlparse(target_url)
   return parsed.hostname or target_url
 
+
+def target_config_with_bearer_auth(target_config: dict) -> dict:
+  """Return a launch config that exercises API-native bearer auth.
+
+  The honeypot's browser form has CSRF protection, while the API Top 10
+  endpoints expose `/api/v2/token/` and `/api/v2/me/` specifically for
+  API-auth validation. Keep the fixture's scenario inventory intact and
+  layer only the auth descriptor required by the backend launch contract.
+  """
+  cfg = json.loads(json.dumps(target_config))
+  api_security = dict(cfg.get("api_security") or {})
+  auth = dict(api_security.get("auth") or {})
+  auth.update({
+    "auth_type": "bearer",
+    "bearer_token_header_name": "Authorization",
+    "bearer_scheme": "Bearer",
+    "authenticated_probe_path": "/api/v2/me/",
+  })
+  api_security["auth"] = auth
+  cfg["api_security"] = api_security
+  return cfg
+
+
+def mint_bearer_token(honeypot: str) -> str:
+  result = unwrap_result(http_post(
+    f"{honeypot.rstrip('/')}/api/v2/token/",
+    {"username": "alice", "password": "secret"},
+  ))
+  token = result.get("token") if isinstance(result, dict) else None
+  if not token:
+    raise RuntimeError(f"honeypot token endpoint did not return token: {result}")
+  return str(token)
+
 def launch_scan(rm: str, honeypot: str, target_config: dict, *,
                 allow_stateful: bool = True) -> str:
+  official_token = mint_bearer_token(honeypot)
+  regular_token = mint_bearer_token(honeypot)
   payload = {
     "target_url": honeypot,
     "official_username": "alice",
-    "official_password": "secret",
+    "official_password": "",
     "regular_username": "alice",
-    "regular_password": "secret",
-    "target_config": target_config,
+    "regular_password": "",
+    "target_config": target_config_with_bearer_auth(target_config),
+    "bearer_token": official_token,
+    "regular_bearer_token": regular_token,
     "allow_stateful_probes": allow_stateful,
     "authorized": True,
     "target_confirmation": target_confirmation_for_url(honeypot),
@@ -184,7 +221,11 @@ def launch_scan(rm: str, honeypot: str, target_config: dict, *,
 def wait_for_finalize(rm: str, job_id: str, timeout: int = 600) -> dict:
   deadline = time.time() + timeout
   while time.time() < deadline:
-    resp = unwrap_result(http_get(f"{rm}/get_job_status?job_id={job_id}"))
+    try:
+      resp = unwrap_result(http_get(f"{rm}/get_job_status?job_id={job_id}"))
+    except (TimeoutError, OSError, error.URLError):
+      time.sleep(5)
+      continue
     status = (
       resp.get("status") or resp.get("job_status")
       or (resp.get("job") or {}).get("job_status") or ""
