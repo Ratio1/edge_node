@@ -497,6 +497,23 @@ class TestLifecycleStop(unittest.TestCase):
     plugin._cleanup_fixed_size_volumes.assert_not_called()
     plugin.diskapi_save_pickle_to_data.assert_called_once()
 
+  def test_stop_and_save_logs_cleans_volumes_when_only_sidecar_cleanup_failed(self):
+    plugin, _, container = self._launch()
+    plugin.stop_tunnel_engine = MagicMock(return_value=False)
+    plugin.stop_extra_tunnels = MagicMock(return_value=True)
+    plugin.diskapi_save_pickle_to_data = MagicMock()
+    plugin._cleanup_fixed_size_volumes = MagicMock(return_value=True)
+
+    result = plugin._stop_container_and_save_logs_to_disk()
+
+    self.assertFalse(result)
+    self.assertTrue(plugin._cleanup_failed)
+    self.assertFalse(plugin._runtime_stop_degraded)
+    container.remove.assert_called_once()
+    plugin._cleanup_fixed_size_volumes.assert_called_once()
+    messages = "\n".join(plugin.logged_messages)
+    self.assertIn("runtime sidecar cleanup still needs retry", messages)
+
   def test_on_close_stops_container(self):
     plugin, _, container = self._launch()
     plugin.on_close()
@@ -636,6 +653,63 @@ class TestLifecycleProcess(unittest.TestCase):
     errors = [m for m in plugin.logged_messages if "abandoned" in m.lower()]
     self.assertTrue(len(errors) > 0)
 
+  def test_failed_cleanup_abandonment_logs_once(self):
+    clock = {"now": 100}
+    plugin, _, _ = make_lifecycle_runner(cfg_restart_max_retries=2)
+    plugin.time = lambda: clock["now"]
+    plugin._cleanup_failed = True
+    plugin._consecutive_failures = 2
+    plugin._next_restart_time = 200
+    plugin.container_state = ContainerState.FAILED
+
+    plugin.process()
+    clock["now"] += 1
+    plugin.process()
+
+    errors = [
+      m for m in plugin.logged_messages
+      if "Container cleanup retry abandoned" in m
+    ]
+    self.assertEqual(len(errors), 1)
+
+  def test_abandoned_cleanup_retries_after_backoff_then_restarts(self):
+    clock = {"now": 100}
+    plugin, client, _ = make_lifecycle_runner(cfg_restart_max_retries=2)
+    plugin.time = lambda: clock["now"]
+    plugin._cleanup_failed = True
+    plugin._consecutive_failures = 2
+    plugin._next_restart_time = 90
+    plugin.container_state = ContainerState.FAILED
+    plugin._stop_container_and_save_logs_to_disk = MagicMock(return_value=True)
+
+    plugin.process()
+
+    self.assertFalse(plugin._cleanup_failed)
+    plugin._stop_container_and_save_logs_to_disk.assert_called_once()
+    client.containers.run.assert_called_once()
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+  def test_abandoned_cleanup_failure_schedules_future_probe_without_incrementing_failures(self):
+    clock = {"now": 100}
+    plugin, client, _ = make_lifecycle_runner(
+      cfg_restart_max_retries=2,
+      cfg_restart_backoff_max=60,
+    )
+    plugin.time = lambda: clock["now"]
+    plugin._cleanup_failed = True
+    plugin._consecutive_failures = 2
+    plugin._next_restart_time = 90
+    plugin.container_state = ContainerState.FAILED
+    plugin._stop_container_and_save_logs_to_disk = MagicMock(return_value=False)
+
+    plugin.process()
+
+    self.assertTrue(plugin._cleanup_failed)
+    self.assertEqual(plugin._consecutive_failures, 2)
+    self.assertEqual(plugin._next_restart_time, 160)
+    plugin._stop_container_and_save_logs_to_disk.assert_called_once()
+    client.containers.run.assert_not_called()
+
   def test_process_retries_failed_cleanup_then_restarts(self):
     """A transient cleanup failure must not permanently block process()."""
     clock = {"now": 100}
@@ -774,6 +848,37 @@ class _FakeProcess:
     return 0
 
 
+class _StoppedProcess:
+  def __init__(self, pgid):
+    self.pid = pgid
+    self._r1_process_group_id = pgid
+    self.terminated = False
+    self.killed = False
+
+  def poll(self):
+    return 0
+
+  def terminate(self):
+    self.terminated = True
+    return
+
+  def kill(self):
+    self.killed = True
+    return
+
+  def wait(self, timeout=None):
+    return 0
+
+
+def _fake_proc_stat_open(proc_entries):
+  def fake_open(path, *args, **kwargs):
+    pid_name = Path(path).parent.name
+    state, pgid = proc_entries[pid_name]
+    stat = f"{pid_name} (cloudflared) {state} 1 {pgid} 0 0\n"
+    return MagicMock(__enter__=lambda self: self, __exit__=lambda *args: None, read=lambda: stat)
+  return fake_open
+
+
 class TestTunnelCompatibilityFallbacks(unittest.TestCase):
   """The edge PR must work even before the matching core PR is deployed."""
 
@@ -786,6 +891,56 @@ class TestTunnelCompatibilityFallbacks(unittest.TestCase):
 
     self.assertTrue(process.terminated)
     self.assertTrue(process.killed)
+
+  def test_local_subprocess_fallback_treats_zombie_only_group_as_stopped(self):
+    plugin, _, _ = make_lifecycle_runner()
+    process = _StoppedProcess(pgid=123)
+    proc_entries = {"456": ("Z", 123)}
+
+    with patch("extensions.business.container_apps.container_app_runner.os.name", "posix"), \
+         patch("extensions.business.container_apps.container_app_runner.os.path.isdir", return_value=True), \
+         patch("extensions.business.container_apps.container_app_runner.os.listdir", return_value=list(proc_entries)), \
+         patch("extensions.business.container_apps.container_app_runner.os.killpg", return_value=None), \
+         patch("builtins.open", _fake_proc_stat_open(proc_entries)):
+      self.assertTrue(plugin._terminate_subprocess_tree(process, terminate_timeout=0, kill_timeout=0))
+
+    self.assertFalse(process.terminated)
+    self.assertFalse(process.killed)
+
+  def test_local_subprocess_fallback_keeps_live_group_failed(self):
+    plugin, _, _ = make_lifecycle_runner()
+    process = _StoppedProcess(pgid=123)
+    proc_entries = {"456": ("S", 123)}
+
+    with patch("extensions.business.container_apps.container_app_runner.os.name", "posix"), \
+         patch("extensions.business.container_apps.container_app_runner.os.path.isdir", return_value=True), \
+         patch("extensions.business.container_apps.container_app_runner.os.listdir", return_value=list(proc_entries)), \
+         patch("extensions.business.container_apps.container_app_runner.os.killpg", return_value=None), \
+         patch("builtins.open", _fake_proc_stat_open(proc_entries)):
+      self.assertFalse(plugin._terminate_subprocess_tree(process, terminate_timeout=0, kill_timeout=0))
+
+    self.assertFalse(process.terminated)
+    self.assertFalse(process.killed)
+
+  def test_extra_tunnel_stopped_parent_with_live_descendant_is_preserved(self):
+    plugin, _, _ = make_lifecycle_runner()
+    process = _StoppedProcess(pgid=123)
+    proc_entries = {"456": ("S", 123)}
+    plugin.extra_tunnel_processes = {8080: process}
+    plugin.extra_tunnel_log_readers = {8080: {}}
+    plugin.extra_tunnel_urls = {8080: "https://example.test"}
+    plugin.extra_tunnel_start_times = {8080: 10}
+
+    with patch("extensions.business.container_apps.container_app_runner.os.name", "posix"), \
+         patch("extensions.business.container_apps.container_app_runner.os.path.isdir", return_value=True), \
+         patch("extensions.business.container_apps.container_app_runner.os.listdir", return_value=list(proc_entries)), \
+         patch("extensions.business.container_apps.container_app_runner.os.killpg", return_value=None), \
+         patch("builtins.open", _fake_proc_stat_open(proc_entries)):
+      self.assertFalse(plugin._stop_extra_tunnel(8080))
+
+    self.assertIn(8080, plugin.extra_tunnel_processes)
+    self.assertIn(8080, plugin.extra_tunnel_log_readers)
+    self.assertIn(8080, plugin.extra_tunnel_urls)
 
 
 # ===========================================================================
