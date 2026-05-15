@@ -604,6 +604,7 @@ class ContainerAppRunnerPlugin(
     self.container_state = ContainerState.UNINITIALIZED
     self.stop_reason = StopReason.UNKNOWN
     self._cleanup_failed = False
+    self._cleanup_retry_abandoned_logged = False
     self._manual_stop_pending = False
 
     # Restart policy and retry logic
@@ -1480,36 +1481,72 @@ class ContainerAppRunnerPlugin(
 
   def _terminate_subprocess_tree(self, process, label="subprocess", terminate_timeout=5, kill_timeout=5):
     """
-    Terminate a tunnel subprocess tree with a compatibility fallback.
+    Terminate a tunnel subprocess tree with edge-local compatibility behavior.
 
-    Prefer the core implementation when present; otherwise use the same bounded
-    POSIX process-group shutdown strategy locally so mixed-version deployments
-    do not leak extra tunnel children.
+    Keep this implementation local instead of delegating to core. Deployed edge
+    images can temporarily run with an older core that has a process-group helper
+    but does not understand zombie-only tunnel groups, which was enough to keep
+    cleanup permanently latched on drs1.
     """
-    base_method = getattr(super(ContainerAppRunnerPlugin, self), "_terminate_subprocess_tree", None)
-    if callable(base_method):
-      return base_method(
-        process,
-        label=label,
-        terminate_timeout=terminate_timeout,
-        kill_timeout=kill_timeout,
-      )
     if process is None:
       return True
 
     pgid = getattr(process, "_r1_process_group_id", None)
+
+    def process_group_has_live_members():
+      """
+      Return True only when the process group still has non-zombie members.
+
+      POSIX reports zombie members through ``killpg(pgid, 0)`` until their
+      parent reaps them. Zombie-only tunnel groups cannot serve traffic or be
+      killed again, so treating them as alive would keep cleanup retries stuck.
+      """
+      proc_root = "/proc"
+      if os.name == "nt" or pgid is None or not os.path.isdir(proc_root):
+        return None
+      try:
+        pid_names = os.listdir(proc_root)
+      except OSError as exc:
+        self.P(f"Could not inspect {label} process group {pgid}: {exc}", color='r')
+        return None
+
+      found_member = False
+      for pid_name in pid_names:
+        if not pid_name.isdigit():
+          continue
+        try:
+          with open(os.path.join(proc_root, pid_name, "stat"), "r") as fh:
+            stat = fh.read()
+          stat_tail = stat.rsplit(")", 1)[1].strip().split()
+          state = stat_tail[0]
+          member_pgid = int(stat_tail[2])
+        except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+          continue
+        except Exception as exc:
+          self.P(f"Could not inspect {label} process {pid_name}: {exc}", color='r')
+          continue
+        if member_pgid != pgid:
+          continue
+        found_member = True
+        # Stopped/traced members can resume later, so only zombies are treated as inert.
+        if state != "Z":
+          return True
+      return False if found_member else None
 
     def is_process_group_alive():
       if os.name == "nt" or pgid is None:
         return False
       try:
         os.killpg(pgid, 0)
-        return True
       except ProcessLookupError:
         return False
       except Exception as exc:
         self.P(f"Could not probe {label} process group {pgid}: {exc}", color='r')
         return True
+      live_members = process_group_has_live_members()
+      if live_members is not None:
+        return live_members
+      return True
 
     def wait_process_tree(timeout):
       deadline = time.monotonic() + timeout
@@ -1563,6 +1600,28 @@ class ContainerAppRunnerPlugin(
       return True
     self.P(f"{label} did not exit after kill; continuing shutdown.", color='r')
     return False
+
+
+  def _schedule_abandoned_cleanup_probe(self):
+    """
+    Schedule a low-noise cleanup probe after retry exhaustion.
+
+    Max restart retries should stop aggressive relaunch attempts, not freeze the
+    cleanup state forever. A stale live tunnel can disappear later, and the app
+    should self-heal without requiring a node restart.
+    """
+    configured_delay = self.cfg_restart_backoff_max
+    if configured_delay is None:
+      configured_delay = self.cfg_restart_backoff_initial
+    if configured_delay is None:
+      configured_delay = 1.0
+    probe_delay = max(1.0, float(configured_delay))
+    self._restart_backoff_seconds = probe_delay
+    self._next_restart_time = self.time() + probe_delay
+    self.Pd(
+      "Abandoned cleanup probe scheduled in {:.1f}s".format(probe_delay)
+    )
+    return
 
 
   def stop_tunnel_engine(self):
@@ -1949,13 +2008,13 @@ class ContainerAppRunnerPlugin(
       # Read remaining logs before stopping
       self._read_extra_tunnel_logs(container_port)
 
-      # Stop process
-      if process.poll() is None:  # Still running
-        process_stopped = self._terminate_subprocess_tree(
-          process,
-          label=f"Extra tunnel for port {container_port}",
-        )
-        result = process_stopped and result
+      # Stop the recorded process group even if the Popen parent has exited:
+      # shell wrappers can leave live tunnel descendants behind.
+      process_stopped = self._terminate_subprocess_tree(
+        process,
+        label=f"Extra tunnel for port {container_port}",
+      )
+      result = process_stopped and result
 
       # Clean up log readers (following base class pattern)
       log_readers = self.extra_tunnel_log_readers.get(container_port, {})
@@ -2936,8 +2995,9 @@ class ContainerAppRunnerPlugin(
     Returns
     -------
     bool
-      True when the Docker container is stopped/removed or absent, False when
-      Docker reported a failure.
+      True when all runtime cleanup steps completed. False can mean either the
+      Docker container may still be present (tracked by ``_runtime_stop_degraded``)
+      or a sidecar/log-reader step still needs retry after Docker removal.
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
 
@@ -3039,8 +3099,18 @@ class ContainerAppRunnerPlugin(
     runtime_ok = self._stop_container_runtime_for_restart()
     cleanup_errors = []
 
-    if runtime_ok:
+    if runtime_ok or not self._runtime_stop_degraded:
       try:
+        if not runtime_ok:
+          # Fixed-size volume mutation only depends on the Docker container no
+          # longer owning the mount. Tunnel/log-reader failures remain retryable,
+          # but they should not keep loop devices mounted after Docker removal.
+          cleanup_errors.append("runtime")
+          self.P(
+            "Fixed-size volume cleanup is safe because Docker container stop/remove "
+            "succeeded; runtime sidecar cleanup still needs retry.",
+            color='y',
+          )
         if self._cleanup_fixed_size_volumes() is False:
           cleanup_errors.append("fixed-size volumes")
       except Exception as exc:
@@ -3067,9 +3137,11 @@ class ContainerAppRunnerPlugin(
 
     if cleanup_errors:
       self._cleanup_failed = True
+      self._cleanup_retry_abandoned_logged = False
       self.P("Container cleanup completed with failed step(s): {}.".format(", ".join(cleanup_errors)), color='r')
       return False
     self._cleanup_failed = False
+    self._cleanup_retry_abandoned_logged = False
     return True
 
 
@@ -3775,12 +3847,35 @@ class ContainerAppRunnerPlugin(
       return True
 
     if self._has_exceeded_max_retries():
-      self.P(
-        "Container cleanup retry abandoned after {} consecutive failure(s).".format(
-          self._consecutive_failures
-        ),
-        color='r',
-      )
+      if not self._cleanup_retry_abandoned_logged:
+        self.P(
+          "Container cleanup retry abandoned after {} consecutive failure(s).".format(
+            self._consecutive_failures
+          ),
+          color='r',
+        )
+        self._cleanup_retry_abandoned_logged = True
+      if self._is_restart_backoff_active():
+        return False
+      self.P("Rechecking abandoned container cleanup after backoff...", color='y')
+      cleanup_ok = self._stop_container_and_save_logs_to_disk()
+      if cleanup_ok:
+        self._cleanup_failed = False
+        self._cleanup_retry_abandoned_logged = False
+        # Cleanup recovered after max-retry abandonment; clear retry accounting before relaunch.
+        self._consecutive_failures = 0
+        self._last_failure_time = 0
+        self._restart_backoff_seconds = 0
+        self._next_restart_time = 0
+        self.P("Previously abandoned container cleanup succeeded.", color='g')
+        if self._manual_stop_pending:
+          self._save_persistent_state(manually_stopped=True)
+          self._manual_stop_pending = False
+          self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
+          return False
+        return True
+      self._schedule_abandoned_cleanup_probe()
+      self._set_container_state(ContainerState.FAILED, self.stop_reason or StopReason.UNKNOWN)
       return False
 
     if self._is_restart_backoff_active():

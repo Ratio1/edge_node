@@ -109,6 +109,11 @@ class _DummyBasePlugin:
   def stop_tunnel_command(self, *args, **kwargs):
     return
 
+  def _terminate_subprocess_tree(self, *args, **kwargs):
+    # Tests ensure CAR keeps its own mixed-version fallback instead of trusting
+    # whatever tunnel cleanup helper an older core happens to expose.
+    return False
+
   def run_tunnel_engine(self):
     return None
 
@@ -262,6 +267,7 @@ def make_container_app_runner():
   plugin._normalized_exposed_ports = {}
   plugin._normalized_main_exposed_port = None
   plugin._cleanup_failed = False
+  plugin._cleanup_retry_abandoned_logged = False
   plugin._manual_stop_pending = False
   plugin.container = object()
   plugin.container_name = "car_instance"
@@ -367,6 +373,7 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
   plugin.container_state = ContainerState.UNINITIALIZED
   plugin.stop_reason = StopReason.UNKNOWN
   plugin._cleanup_failed = False
+  plugin._cleanup_retry_abandoned_logged = False
   plugin._manual_stop_pending = False
 
   # Restart/backoff
