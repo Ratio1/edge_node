@@ -20,7 +20,20 @@ from ..models import (
   JobConfig,
   RulesOfEngagement,
 )
+from ..graybox.models.target_config import (
+  GrayboxTargetConfig,
+  collect_target_config_secret_refs,
+  validate_target_config_secret_ref_positions,
+)
+from ..graybox.http_client import validate_target_config_paths
 from ..repositories import JobStateRepository
+from ..graybox.scenario_runtime import (
+  GRAYBOX_ASSIGNMENT_MIRROR,
+  GRAYBOX_ASSIGNMENT_SLICE,
+  GRAYBOX_DEFAULT_REQUEST_BUDGET,
+  build_graybox_worker_assignments,
+  summarize_graybox_worker_assignments,
+)
 from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
@@ -36,6 +49,147 @@ def _job_repo(owner):
 def validation_error(message: str):
   """Return a consistent validation error payload."""
   return {"error": "validation_error", "message": message}
+
+
+def _parse_positive_int(value, field_path: str, *, default=None,
+                        maximum: int | None = None):
+  """Parse a launcher numeric input as a positive integer.
+
+  Numeric strings are accepted for UI/API compatibility. Invalid,
+  boolean, zero, and negative values are rejected instead of silently
+  falling back to defaults because these values affect scanner safety.
+  """
+  if value is None:
+    value = default
+  if isinstance(value, bool):
+    return None, validation_error(f"{field_path} must be a positive integer")
+  if isinstance(value, str):
+    value = value.strip()
+  if isinstance(value, float) and not value.is_integer():
+    return None, validation_error(f"{field_path} must be a positive integer")
+  if value == "" or value is None:
+    return None, validation_error(f"{field_path} must be a positive integer")
+  try:
+    parsed = int(value)
+  except (TypeError, ValueError):
+    return None, validation_error(f"{field_path} must be a positive integer")
+  if parsed <= 0:
+    return None, validation_error(f"{field_path} must be greater than 0")
+  if maximum is not None and parsed > maximum:
+    return None, validation_error(
+      f"{field_path} must be less than or equal to {maximum}"
+    )
+  return parsed, None
+
+
+def _validate_positive_int_field(container, key, field_path: str, *,
+                                  maximum: int | None = None):
+  if not isinstance(container, dict) or key not in container:
+    return None
+  parsed, err = _parse_positive_int(
+    container.get(key), field_path, maximum=maximum,
+  )
+  if err:
+    return err
+  container[key] = parsed
+  return None
+
+
+def _validate_positive_int_list(container, key, field_path: str):
+  if not isinstance(container, dict) or key not in container:
+    return None
+  values = container.get(key)
+  if not isinstance(values, list):
+    return validation_error(f"{field_path} must be a list of positive integers")
+  parsed_values = []
+  for idx, value in enumerate(values):
+    parsed, err = _parse_positive_int(value, f"{field_path}[{idx}]")
+    if err:
+      return err
+    parsed_values.append(parsed)
+  container[key] = parsed_values
+  return None
+
+
+def _validate_graybox_numeric_fields(canonical: dict | None):
+  """Validate scanner-safety numeric fields in canonical target_config."""
+  if not isinstance(canonical, dict):
+    return None
+  discovery = canonical.get("discovery") or {}
+  for key in ("max_pages", "max_depth"):
+    err = _validate_positive_int_field(discovery, key, f"discovery.{key}")
+    if err:
+      return err
+
+  access = canonical.get("access_control") or {}
+  for idx, endpoint in enumerate(access.get("idor_endpoints") or []):
+    err = _validate_positive_int_list(
+      endpoint, "test_ids", f"access_control.idor_endpoints[{idx}].test_ids",
+    )
+    if err:
+      return err
+
+  api = canonical.get("api_security") or {}
+  err = _validate_positive_int_field(
+    api, "max_total_requests", "api_security.max_total_requests",
+  )
+  if err:
+    return err
+  for idx, endpoint in enumerate(api.get("object_endpoints") or []):
+    err = _validate_positive_int_list(
+      endpoint, "test_ids", f"api_security.object_endpoints[{idx}].test_ids",
+    )
+    if err:
+      return err
+  for idx, endpoint in enumerate(api.get("property_endpoints") or []):
+    err = _validate_positive_int_field(
+      endpoint, "test_id",
+      f"api_security.property_endpoints[{idx}].test_id",
+    )
+    if err:
+      return err
+  for idx, endpoint in enumerate(api.get("resource_endpoints") or []):
+    for key in ("baseline_limit", "abuse_limit"):
+      err = _validate_positive_int_field(
+        endpoint, key, f"api_security.resource_endpoints[{idx}].{key}",
+      )
+      if err:
+        return err
+    err = _validate_positive_int_field(
+      endpoint, "oversized_payload_bytes",
+      f"api_security.resource_endpoints[{idx}].oversized_payload_bytes",
+      maximum=262_144,
+    )
+    if err:
+      return err
+  return None
+
+
+def _validate_api_auth_descriptor(auth_desc):
+  auth_type = getattr(auth_desc, "auth_type", "form") or "form"
+  if auth_type not in ("bearer", "api_key"):
+    return None
+  probe_path = (getattr(auth_desc, "authenticated_probe_path", "") or "").strip()
+  allow_unverified = bool(getattr(auth_desc, "allow_unverified_auth", False))
+  if not probe_path and not allow_unverified:
+    return validation_error(
+      "api_security.auth.authenticated_probe_path is required for bearer/api_key "
+      "auth unless allow_unverified_auth=true"
+    )
+  if not probe_path:
+    return None
+  method = (
+    getattr(auth_desc, "authenticated_probe_method", "GET") or "GET"
+  ).upper()
+  allow_non_readonly = bool(
+    getattr(auth_desc, "allow_non_readonly_auth_validation_method", False)
+  )
+  if method not in ("GET", "HEAD") and not allow_non_readonly:
+    return validation_error(
+      "api_security.auth.authenticated_probe_method must be GET or HEAD "
+      "unless allow_non_readonly_auth_validation_method=true"
+    )
+  return None
 
 
 def _normalize_allowlist(entries):
@@ -110,6 +264,66 @@ def _extract_discovery_max_pages(target_config) -> int:
     return max(int(discovery.get("max_pages", 50) or 50), 1)
   except (TypeError, ValueError):
     return 50
+
+
+def _validate_graybox_target_config(target_config):
+  """Validate typed graybox target_config before workers see it."""
+  _, _, error = normalize_graybox_target_config(target_config)
+  return error
+
+
+def normalize_graybox_target_config(target_config, target_config_secrets=None):
+  """Validate and canonicalize graybox target_config.
+
+  Returns ``(typed_config, canonical_dict, error)``. ``canonical_dict`` is
+  the only target_config shape that may be persisted; it is emitted from
+  the typed dataclasses after unknown-key and nested-secret validation.
+  """
+  if target_config is None:
+    if target_config_secrets:
+      return None, None, validation_error(
+        "target_config_secrets were provided but target_config has no secret_ref entries"
+      )
+    return GrayboxTargetConfig(), None, None
+  if not isinstance(target_config, dict):
+    return None, None, validation_error("target_config must be a JSON object")
+  if target_config_secrets is not None and not isinstance(target_config_secrets, dict):
+    return None, None, validation_error("target_config_secrets must be a JSON object when provided")
+  if isinstance(target_config_secrets, dict):
+    for key, value in target_config_secrets.items():
+      if not isinstance(key, str) or not key.strip():
+        return None, None, validation_error("target_config_secrets keys must be non-empty strings")
+      if not isinstance(value, str):
+        return None, None, validation_error(
+          f"target_config_secrets[{key!r}] must be a string"
+        )
+  try:
+    typed_config = GrayboxTargetConfig.from_dict(deepcopy(target_config))
+    canonical = typed_config.to_dict()
+    numeric_error = _validate_graybox_numeric_fields(canonical)
+    if numeric_error:
+      return None, None, numeric_error
+    typed_config = GrayboxTargetConfig.from_dict(deepcopy(canonical))
+    validate_target_config_secret_ref_positions(canonical)
+    required_refs = collect_target_config_secret_refs(canonical)
+    provided_refs = set((target_config_secrets or {}).keys())
+    missing_refs = [ref for ref in required_refs if ref not in provided_refs]
+    if missing_refs:
+      return None, None, validation_error(
+        "target_config secret_ref value(s) missing from target_config_secrets: "
+        + ", ".join(missing_refs)
+      )
+    unknown_refs = sorted(provided_refs - set(required_refs))
+    if unknown_refs:
+      return None, None, validation_error(
+        "target_config_secrets contains unknown secret_ref value(s): "
+        + ", ".join(unknown_refs)
+      )
+  except KeyError as exc:
+    return None, None, validation_error(f"target_config is missing required field: {exc}")
+  except (TypeError, ValueError) as exc:
+    return None, None, validation_error(f"target_config is invalid: {exc}")
+  return typed_config, canonical, None
 
 
 def _validate_authorization_context(
@@ -397,10 +611,31 @@ def build_network_workers(owner, active_peers, start_port, end_port, distributio
   return workers, None
 
 
-def build_webapp_workers(owner, active_peers, target_port):
+def build_webapp_workers(
+  owner,
+  active_peers,
+  target_port,
+  *,
+  graybox_assignment_strategy,
+  request_budget=GRAYBOX_DEFAULT_REQUEST_BUDGET,
+  allow_stateful_probes=False,
+  allow_mirror_stateful=False,
+  allow_mirror_per_worker_budget=False,
+):
   """Build peer assignments for webapp scans. Every peer gets the same target."""
   if not active_peers:
     return None, validation_error("No workers available for job execution.")
+  assignments, assignment_error = build_graybox_worker_assignments(
+    active_peers,
+    strategy=graybox_assignment_strategy,
+    total_request_budget=request_budget,
+    allow_stateful=allow_stateful_probes,
+    allow_mirror_stateful=allow_mirror_stateful,
+    allow_mirror_per_worker_budget=allow_mirror_per_worker_budget,
+    assignment_revision=1,
+  )
+  if assignment_error:
+    return None, validation_error(assignment_error)
   workers = {}
   for address in active_peers:
     workers[address] = {
@@ -408,6 +643,7 @@ def build_webapp_workers(owner, active_peers, target_port):
       "end_port": target_port,
       "finished": False,
       "result": None,
+      **assignments[address],
     }
   return workers, None
 
@@ -455,9 +691,17 @@ def announce_launch(
   engagement_metadata,
   target_allowlist,
   safety_policy,
+  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_SLICE,
   engagement=None,
   roe=None,
   authorization=None,
+  bearer_token="",
+  api_key="",
+  bearer_refresh_token="",
+  regular_bearer_token="",
+  regular_api_key="",
+  regular_bearer_refresh_token="",
+  target_config_secrets=None,
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
   excluded_features, enabled_features = resolve_enabled_features(
@@ -517,20 +761,35 @@ def announce_launch(
     verify_tls=verify_tls,
     target_config=target_config,
     allow_stateful_probes=allow_stateful_probes,
+    graybox_assignment_strategy=graybox_assignment_strategy,
     engagement=engagement,
     roe=roe,
     authorization=authorization,
+    # OWASP API Top 10 (Subphase 1.5 commit #8): runtime-only secret
+    # fields. Blanked by `_blank_graybox_secret_fields` before persistence;
+    # `has_bearer_token` / `has_api_key` capability flags are set on the
+    # persisted JobConfig by `persist_job_config_with_secrets`.
+    bearer_token=bearer_token,
+    api_key=api_key,
+    bearer_refresh_token=bearer_refresh_token,
+    regular_bearer_token=regular_bearer_token,
+    regular_api_key=regular_api_key,
+    regular_bearer_refresh_token=regular_bearer_refresh_token,
   )
 
   persisted_config, job_config_cid = persist_job_config_with_secrets(
     owner,
     job_id=job_id,
-    config_dict=job_config.to_dict(),
+    config_dict={
+      **job_config.to_dict(),
+      "target_config_secrets": deepcopy(target_config_secrets or {}),
+    },
   )
   if not job_config_cid:
     owner.P("Failed to store job config in R1FS — aborting launch", color='r')
     return {"error": "Failed to store job config in R1FS"}
 
+  assignment_summary = summarize_graybox_worker_assignments(workers) if scan_type == ScanType.WEBAPP.value else {}
   job_specs = CStoreJobRunning(
     job_id=job_id,
     job_status=JOB_STATUS_RUNNING,
@@ -551,6 +810,7 @@ def announce_launch(
     pass_reports=[],
     next_pass_at=None,
     risk_score=0,
+    graybox_assignment_summary=assignment_summary or None,
   ).to_dict()
   owner._emit_timeline_event(
     job_specs, "created",
@@ -836,12 +1096,80 @@ def launch_webapp_scan(
   engagement=None,
   roe=None,
   authorization=None,
+  # OWASP API Top 10 (Subphase 1.5 commit #8) — top-level secret params.
+  # These NEVER appear inside the persisted JobConfig: they flow straight
+  # into the R1FS secret payload via persist_job_config_with_secrets and
+  # are zeroised on the public config before put_job_config().
+  bearer_token="",
+  api_key="",
+  bearer_refresh_token="",
+  regular_bearer_token="",
+  regular_api_key="",
+  regular_bearer_refresh_token="",
+  target_config_secrets=None,
+  # OWASP API Top 10 — Subphase 1.7. When set, overrides
+  # `target_config.api_security.max_total_requests` for the scan.
+  request_budget=None,
+  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_SLICE,
+  allow_mirror_stateful=False,
+  allow_mirror_per_worker_budget=False,
 ):
-  """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment."""
+  """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
+
+  ``target_config`` is parsed through ``GrayboxTargetConfig`` before any
+  authorization or persistence path sees it. The persisted ``JobConfig``
+  receives only the typed canonical dict returned by
+  ``normalize_graybox_target_config``; unknown keys and raw nested secret
+  material in request-body-like fields fail closed at launch.
+
+  Secret-handling: ``bearer_token``, ``api_key``, and
+  ``bearer_refresh_token`` (Subphase 1.5 commit #8) are top-level launch
+  parameters — NOT inside ``target_config``. They travel through the
+  same R1FS secret payload as ``official_password`` and are blanked from
+  the persisted JobConfig before archive write. Non-secret capability
+  flags ``has_bearer_token`` / ``has_api_key`` are surfaced on the
+  archived config so consumers know whether the credentials existed.
+  """
   if not target_url:
     return validation_error("target_url required for webapp scan")
-  if not official_username or not official_password:
-    return validation_error("official credentials required for webapp scan")
+  max_weak_attempts, numeric_error = _parse_positive_int(
+    max_weak_attempts, "max_weak_attempts", default=5,
+  )
+  if numeric_error:
+    return numeric_error
+  if request_budget is not None:
+    request_budget, numeric_error = _parse_positive_int(
+      request_budget, "request_budget",
+    )
+    if numeric_error:
+      return numeric_error
+  raw_target_config = deepcopy(target_config) if isinstance(target_config, dict) else target_config
+  typed_target_config, target_config, config_error = normalize_graybox_target_config(
+    target_config,
+    target_config_secrets=target_config_secrets,
+  )
+  if config_error:
+    return config_error
+
+  # Form auth still requires username+password; Bearer / API-key targets
+  # set auth_type via target_config.api_security.auth and supply the
+  # secret as a top-level param instead.
+  auth_desc = typed_target_config.api_security.auth
+  auth_type = auth_desc.auth_type
+  if auth_type == "form":
+    if not official_username or not official_password:
+      return validation_error("official credentials required for webapp scan")
+  elif auth_type == "bearer":
+    if not bearer_token:
+      return validation_error("bearer_token required when auth_type='bearer'")
+  elif auth_type == "api_key":
+    if not api_key:
+      return validation_error("api_key required when auth_type='api_key'")
+  else:
+    return validation_error(f"unknown auth_type: {auth_type!r}")
+  auth_validation_error = _validate_api_auth_descriptor(auth_desc)
+  if auth_validation_error:
+    return auth_validation_error
 
   parsed = urlparse(target_url)
   if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -864,6 +1192,13 @@ def launch_webapp_scan(
   )
   if auth_error:
     return auth_error
+  path_scope_errors = validate_target_config_paths(
+    target_url,
+    raw_target_config,
+    authorization_context["target_allowlist"],
+  )
+  if path_scope_errors:
+    return validation_error("; ".join(path_scope_errors))
   typed_context, typed_error = _validate_typed_engagement_context(
     engagement, roe, authorization
   )
@@ -896,7 +1231,39 @@ def launch_webapp_scan(
     verify_tls=verify_tls,
   )
 
-  workers, worker_error = build_webapp_workers(owner, active_peers, target_port)
+  # OWASP API Top 10 (Subphase 1.7): when the caller passed an explicit
+  # `request_budget`, inject it into `target_config.api_security` so the
+  # worker's RequestBudget sizing picks it up over any value the caller
+  # also placed in target_config.
+  if request_budget is not None:
+    if not isinstance(target_config, dict):
+      target_config = {}
+    api_security = dict(target_config.get("api_security") or {})
+    api_security["max_total_requests"] = request_budget
+    target_config["api_security"] = api_security
+
+  typed_target_config, target_config, config_error = normalize_graybox_target_config(
+    target_config,
+    target_config_secrets=target_config_secrets,
+  )
+  if config_error:
+    return config_error
+  effective_request_budget = (
+    request_budget
+    or typed_target_config.api_security.max_total_requests
+    or GRAYBOX_DEFAULT_REQUEST_BUDGET
+  )
+
+  workers, worker_error = build_webapp_workers(
+    owner,
+    active_peers,
+    target_port,
+    graybox_assignment_strategy=graybox_assignment_strategy,
+    request_budget=effective_request_budget,
+    allow_stateful_probes=allow_stateful_probes,
+    allow_mirror_stateful=allow_mirror_stateful,
+    allow_mirror_per_worker_budget=allow_mirror_per_worker_budget,
+  )
   if worker_error:
     return worker_error
 
@@ -936,6 +1303,7 @@ def launch_webapp_scan(
     verify_tls=verify_tls,
     target_config=target_config,
     allow_stateful_probes=allow_stateful_probes,
+    graybox_assignment_strategy=graybox_assignment_strategy,
     target_confirmation=authorization_context["target_confirmation"],
     scope_id=authorization_context["scope_id"],
     authorization_ref=authorization_context["authorization_ref"],
@@ -945,6 +1313,13 @@ def launch_webapp_scan(
     engagement=typed_context["engagement"],
     roe=typed_context["roe"],
     authorization=typed_context["authorization"],
+    bearer_token=bearer_token,
+    api_key=api_key,
+    bearer_refresh_token=bearer_refresh_token,
+    regular_bearer_token=regular_bearer_token,
+    regular_api_key=regular_api_key,
+    regular_bearer_refresh_token=regular_bearer_refresh_token,
+    target_config_secrets=target_config_secrets,
   )
 
 
@@ -985,6 +1360,17 @@ def launch_test(
   verify_tls=True,
   target_config=None,
   allow_stateful_probes=False,
+  bearer_token="",
+  api_key="",
+  bearer_refresh_token="",
+  regular_bearer_token="",
+  regular_api_key="",
+  regular_bearer_refresh_token="",
+  target_config_secrets=None,
+  request_budget=None,
+  graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_SLICE,
+  allow_mirror_stateful=False,
+  allow_mirror_per_worker_budget=False,
   target_confirmation="",
   scope_id="",
   authorization_ref="",
@@ -1028,6 +1414,17 @@ def launch_test(
       verify_tls=verify_tls,
       target_config=target_config,
       allow_stateful_probes=allow_stateful_probes,
+      bearer_token=bearer_token,
+      api_key=api_key,
+      bearer_refresh_token=bearer_refresh_token,
+      regular_bearer_token=regular_bearer_token,
+      regular_api_key=regular_api_key,
+      regular_bearer_refresh_token=regular_bearer_refresh_token,
+      target_config_secrets=target_config_secrets,
+      request_budget=request_budget,
+      graybox_assignment_strategy=graybox_assignment_strategy,
+      allow_mirror_stateful=allow_mirror_stateful,
+      allow_mirror_per_worker_budget=allow_mirror_per_worker_budget,
       target_confirmation=target_confirmation,
       scope_id=scope_id,
       authorization_ref=authorization_ref,

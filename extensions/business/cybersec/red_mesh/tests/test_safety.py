@@ -56,19 +56,19 @@ class TestSafetyControls(unittest.TestCase):
     """Password values are scrubbed."""
     msg = SafetyControls.sanitize_error('Error: password="secret123" is wrong')
     self.assertNotIn("secret123", msg)
-    self.assertIn("***", msg)
+    self.assertIn("<redacted>", msg)
 
   def test_sanitize_error_token(self):
     """Token values are scrubbed."""
     msg = SafetyControls.sanitize_error("token=abc123def in header")
     self.assertNotIn("abc123def", msg)
-    self.assertIn("***", msg)
+    self.assertIn("<redacted>", msg)
 
   def test_sanitize_error_secret(self):
     """Secret values are scrubbed."""
     msg = SafetyControls.sanitize_error("secret=mysecretvalue leaked")
     self.assertNotIn("mysecretvalue", msg)
-    self.assertIn("***", msg)
+    self.assertIn("<redacted>", msg)
 
   def test_sanitize_error_preserves_normal_text(self):
     """Normal text without credentials is preserved."""

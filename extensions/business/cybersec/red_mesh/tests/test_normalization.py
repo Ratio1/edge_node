@@ -5,6 +5,9 @@ from unittest.mock import MagicMock
 
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.worker import GrayboxLocalWorker
+from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
+  build_graybox_worker_assignments,
+)
 from extensions.business.cybersec.red_mesh.worker import PentestLocalWorker
 from extensions.business.cybersec.red_mesh.constants import ScanType
 
@@ -351,6 +354,58 @@ class TestGrayboxRedaction(unittest.TestCase):
     self.assertNotIn("password123", artifact["response_snapshot"])
     self.assertNotIn("password123", probe_artifact["summary"])
 
+  def test_redaction_masks_configured_graybox_api_secret_names(self):
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+
+    class MockHost(_ReportMixin):
+      pass
+
+    host = MockHost()
+    report = {
+      "target_config": {
+        "api_security": {
+          "auth": {
+            "api_key_query_param": "customer_key",
+            "api_key_header_name": "X-Customer-Api-Key",
+          },
+        },
+      },
+      "service_info": {},
+      "graybox_results": {
+        "443": {
+          "_graybox_api_access": {
+            "findings": [
+              {
+                "title": "X-Customer-Api-Key: SECRET-HEADER",
+                "evidence": [
+                  "GET /v1/users?customer_key=SECRET99&page=1",
+                ],
+                "replay_steps": [
+                  "curl /v1/users?customer_key=SECRET99",
+                ],
+                "evidence_artifacts": [
+                  {
+                    "request_snapshot": (
+                      "GET /v1/users?customer_key=SECRET99 "
+                      "X-Customer-Api-Key: SECRET-HEADER"
+                    ),
+                  },
+                ],
+              },
+            ],
+          },
+        },
+      },
+    }
+
+    redacted = host._redact_report(report)
+
+    haystack = str(redacted)
+    self.assertNotIn("SECRET99", haystack)
+    self.assertNotIn("SECRET-HEADER", haystack)
+    self.assertIn("customer_key=<redacted>", haystack)
+    self.assertIn("X-Customer-Api-Key: <redacted>", haystack)
+
 
 class TestFindingCounting(unittest.TestCase):
 
@@ -423,6 +478,9 @@ class TestLaunchValidation(unittest.TestCase):
           cfg.target_config = None
           cfg.verify_tls = True
           cfg.scan_min_delay = 0
+          assignments, _error = build_graybox_worker_assignments(["node-1"])
+          for key, value in assignments["node-1"].items():
+            setattr(cfg, key, value)
           worker = GrayboxLocalWorker(
             owner=MagicMock(),
             job_id="j1",
@@ -455,6 +513,9 @@ class TestLaunchValidation(unittest.TestCase):
           cfg.regular_password = ""
           cfg.weak_candidates = None
           cfg.app_routes = None
+          assignments, _error = build_graybox_worker_assignments(["node-1"])
+          for key, value in assignments["node-1"].items():
+            setattr(cfg, key, value)
 
           worker = GrayboxLocalWorker(
             owner=MagicMock(),

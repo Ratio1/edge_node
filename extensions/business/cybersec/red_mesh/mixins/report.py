@@ -15,6 +15,89 @@ from ..models import UiAggregate
 # dedup signature so the same vulnerability seen by two workers
 # collapses to one finding (with one worker's stamp preserved).
 _DEDUP_EXCLUDE_FIELDS = ("_source_worker_id", "_source_node_addr")
+_PUBLISH_SAFE_METADATA_KEYS = {
+  "api_key_header_name",
+  "api_key_location",
+  "api_key_query_param",
+  "authenticated_probe_path",
+  "authenticated_probe_method",
+  "allow_non_readonly_auth_validation_method",
+  "allow_unverified_auth",
+  "bearer_refresh_url",
+  "bearer_scheme",
+  "bearer_token_header_name",
+  "csrf_field",
+  "password_field",
+  "password_reset_confirm_path",
+  "password_reset_path",
+  "protected_path",
+  "token_path",
+  "token_request_method",
+  "token_response_field",
+}
+_SECRET_CONFIG_KEY_PARTS = (
+  "password", "passwd", "pwd", "secret", "authorization", "cookie",
+  "credential",
+)
+_SECRET_CONFIG_TOKEN_KEYS = {
+  "api_key", "apikey", "token", "access_token", "refresh_token", "id_token",
+  "secret_ref",
+}
+
+
+def _is_secret_config_key(key):
+  normalized = str(key or "").strip().lower().replace("-", "_")
+  if not normalized or normalized.startswith("has_"):
+    return False
+  if normalized in _PUBLISH_SAFE_METADATA_KEYS:
+    return False
+  if normalized in _SECRET_CONFIG_TOKEN_KEYS:
+    return True
+  if normalized.endswith("_token") or normalized.endswith("_api_key"):
+    return True
+  return any(part in normalized for part in _SECRET_CONFIG_KEY_PARTS)
+
+
+def _redact_nested_job_config(value):
+  if isinstance(value, dict):
+    redacted = {}
+    for key, item in value.items():
+      if _is_secret_config_key(key):
+        redacted[key] = "***"
+      else:
+        redacted[key] = _redact_nested_job_config(item)
+    return redacted
+  if isinstance(value, list):
+    return [_redact_nested_job_config(item) for item in value]
+  return value
+
+
+def _configured_graybox_secret_names_from_report(report):
+  """Extract configured API auth field names from report/job target config."""
+  if not isinstance(report, dict):
+    return ()
+  candidates = []
+  for key in ("target_config",):
+    if isinstance(report.get(key), dict):
+      candidates.append(report[key])
+  job_config = report.get("job_config")
+  if isinstance(job_config, dict) and isinstance(job_config.get("target_config"), dict):
+    candidates.append(job_config["target_config"])
+
+  names = []
+  for target_config in candidates:
+    api_security = target_config.get("api_security") or {}
+    auth = api_security.get("auth") or {}
+    if not isinstance(auth, dict):
+      continue
+    for key in (
+      "api_key_header_name", "api_key_query_param",
+      "bearer_token_header_name",
+    ):
+      value = auth.get(key)
+      if isinstance(value, str) and value and value not in names:
+        names.append(value)
+  return tuple(names)
 
 
 def _finding_dedup_key(item):
@@ -421,7 +504,12 @@ class _ReportMixin:
     """
     import re as _re
     from copy import deepcopy
+    try:
+      from ..graybox.findings import scrub_graybox_secrets as _scrub_graybox
+    except Exception:
+      _scrub_graybox = None
     redacted = deepcopy(report)
+    graybox_secret_names = _configured_graybox_secret_names_from_report(redacted)
     service_info = redacted.get("service_info", {})
     for port_key, methods in service_info.items():
       if not isinstance(methods, dict):
@@ -458,8 +546,16 @@ class _ReportMixin:
     def _redact_graybox_text(value):
       if not isinstance(value, str):
         return value
+      if _scrub_graybox is not None:
+        value = _scrub_graybox(
+          value, secret_field_names=graybox_secret_names,
+        )
       value = _CRED_RE.sub(r'\1:***', value)
       value = _PASSWORD_RE.sub(r'\1\2***', value)
+      if _scrub_graybox is not None:
+        value = _scrub_graybox(
+          value, secret_field_names=graybox_secret_names,
+        )
       return value
 
     graybox_results = redacted.get("graybox_results", {})
@@ -472,6 +568,13 @@ class _ReportMixin:
         for finding in probe_data.get("findings", []):
           if not isinstance(finding, dict):
             continue
+          for text_key in ("title", "description", "remediation", "error"):
+            if isinstance(finding.get(text_key), str):
+              finding[text_key] = _redact_graybox_text(finding[text_key])
+          if isinstance(finding.get("replay_steps"), list):
+            finding["replay_steps"] = [
+              _redact_graybox_text(step) for step in finding["replay_steps"]
+            ]
           evidence = finding.get("evidence", [])
           if isinstance(evidence, list):
             finding["evidence"] = [
@@ -526,6 +629,14 @@ class _ReportMixin:
       redacted["regular_password"] = "***"
     if redacted.get("weak_candidates"):
       redacted["weak_candidates"] = ["***"] * len(redacted["weak_candidates"])
+    if isinstance(redacted.get("target_config_secrets"), dict):
+      redacted["target_config_secrets"] = {
+        str(key): "***" for key in redacted["target_config_secrets"]
+      }
+    if isinstance(redacted.get("target_config"), dict):
+      redacted["target_config"] = _redact_nested_job_config(
+        redacted["target_config"]
+      )
     redacted.pop("secret_ref", None)
     return redacted
 

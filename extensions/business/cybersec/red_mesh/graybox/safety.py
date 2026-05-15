@@ -78,14 +78,21 @@ class SafetyControls:
     return None
 
   @staticmethod
-  def sanitize_error(msg: str) -> str:
+  def sanitize_error(msg: str, *, secret_field_names=()) -> str:
     """
     Remove potential credential leaks from error messages.
 
-    Scrubs password= patterns and common secret markers.
+    Scrubs password= patterns, common secret markers, and configured
+    API auth header/query names when provided by the caller.
     """
     import re
     msg = re.sub(r'password["\']?\s*[:=]\s*["\']?[^\s"\'&]+', 'password=***', msg, flags=re.I)
     msg = re.sub(r'secret["\']?\s*[:=]\s*["\']?[^\s"\'&]+', 'secret=***', msg, flags=re.I)
     msg = re.sub(r'token["\']?\s*[:=]\s*["\']?[^\s"\'&]+', 'token=***', msg, flags=re.I)
-    return msg
+    try:
+      from .findings import scrub_graybox_secrets
+    except Exception:
+      return msg
+    return scrub_graybox_secrets(
+      msg, secret_field_names=tuple(secret_field_names or ()),
+    )

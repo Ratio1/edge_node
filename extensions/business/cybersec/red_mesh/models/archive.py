@@ -69,16 +69,44 @@ class JobConfig:
   secret_ref: str = ""                # reference to separately persisted graybox secrets
   has_regular_credentials: bool = False
   has_weak_candidates: bool = False
+  # OWASP API Top 10 (Subphase 1.5 commit #8) — non-secret capability flags.
+  # Raw bearer_token / api_key / bearer_refresh_token values are blanked
+  # before persistence by `_blank_graybox_secret_fields` and instead live
+  # in the R1FS secret payload (resolved at worker startup via
+  # `resolve_job_config_secrets`).
+  has_bearer_token: bool = False
+  has_api_key: bool = False
+  has_bearer_refresh_token: bool = False
+  has_regular_bearer_token: bool = False
+  has_regular_api_key: bool = False
+  has_regular_bearer_refresh_token: bool = False
+  secret_store_key_id: str = ""
+  secret_store_key_version: str = ""
+  secret_store_key_source: str = ""
+  secret_store_unsafe_fallback: bool = False
   official_username: str = ""
   official_password: str = ""
   regular_username: str = ""
   regular_password: str = ""
+  bearer_token: str = ""              # blanked before persistence; runtime-only
+  api_key: str = ""                   # blanked before persistence; runtime-only
+  bearer_refresh_token: str = ""      # blanked before persistence; runtime-only
+  regular_bearer_token: str = ""      # blanked before persistence; runtime-only
+  regular_api_key: str = ""           # blanked before persistence; runtime-only
+  regular_bearer_refresh_token: str = ""  # blanked before persistence; runtime-only
   weak_candidates: list = None        # legacy inline payload; new launches use secret_ref
   max_weak_attempts: int = 5
   app_routes: list = None             # user-supplied known routes
   verify_tls: bool = True             # TLS cert verification
   target_config: dict = None          # GrayboxTargetConfig.to_dict()
   allow_stateful_probes: bool = False # gate for A06 workflow probes
+  graybox_assignment_strategy: str = "MIRROR"
+  assigned_scenario_ids: list = None
+  assigned_request_budget: int = 0
+  budget_scope: str = ""
+  assignment_revision: int = 0
+  assignment_hash: str = ""
+  stateful_policy: str = ""
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -120,16 +148,39 @@ class JobConfig:
       secret_ref=d.get("secret_ref", ""),
       has_regular_credentials=d.get("has_regular_credentials", False),
       has_weak_candidates=d.get("has_weak_candidates", False),
+      has_bearer_token=d.get("has_bearer_token", False),
+      has_api_key=d.get("has_api_key", False),
+      has_bearer_refresh_token=d.get("has_bearer_refresh_token", False),
+      has_regular_bearer_token=d.get("has_regular_bearer_token", False),
+      has_regular_api_key=d.get("has_regular_api_key", False),
+      has_regular_bearer_refresh_token=d.get("has_regular_bearer_refresh_token", False),
+      secret_store_key_id=d.get("secret_store_key_id", ""),
+      secret_store_key_version=d.get("secret_store_key_version", ""),
+      secret_store_key_source=d.get("secret_store_key_source", ""),
+      secret_store_unsafe_fallback=d.get("secret_store_unsafe_fallback", False),
       official_username=d.get("official_username", ""),
       official_password=d.get("official_password", ""),
       regular_username=d.get("regular_username", ""),
       regular_password=d.get("regular_password", ""),
+      bearer_token=d.get("bearer_token", ""),
+      api_key=d.get("api_key", ""),
+      bearer_refresh_token=d.get("bearer_refresh_token", ""),
+      regular_bearer_token=d.get("regular_bearer_token", ""),
+      regular_api_key=d.get("regular_api_key", ""),
+      regular_bearer_refresh_token=d.get("regular_bearer_refresh_token", ""),
       weak_candidates=d.get("weak_candidates"),
       max_weak_attempts=d.get("max_weak_attempts", 5),
       app_routes=d.get("app_routes"),
       verify_tls=d.get("verify_tls", True),
       target_config=d.get("target_config"),
       allow_stateful_probes=d.get("allow_stateful_probes", False),
+      graybox_assignment_strategy=d.get("graybox_assignment_strategy", "MIRROR"),
+      assigned_scenario_ids=d.get("assigned_scenario_ids"),
+      assigned_request_budget=d.get("assigned_request_budget", 0),
+      budget_scope=d.get("budget_scope", ""),
+      assignment_revision=d.get("assignment_revision", 0),
+      assignment_hash=d.get("assignment_hash", ""),
+      stateful_policy=d.get("stateful_policy", ""),
       engagement=d.get("engagement"),
       roe=d.get("roe"),
       authorization=d.get("authorization"),

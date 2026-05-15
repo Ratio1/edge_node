@@ -5,6 +5,10 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.constants import JOB_ARCHIVE_VERSION, MAX_CONTINUOUS_PASSES
+from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
+  build_graybox_worker_assignments,
+  runtime_scenario_ids,
+)
 from extensions.business.cybersec.red_mesh.models import CStoreJobRunning
 
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
@@ -291,8 +295,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
     job_specs = self._extract_job_specs(plugin, "test-job-5")
     self.assertIsNone(job_specs)
 
-  def test_launch_webapp_scan_uses_mirrored_worker_assignments(self):
-    """Webapp launches assign the same resolved target port to every selected peer."""
+  def test_launch_webapp_scan_default_slices_api_scenarios(self):
+    """B5: webapp launches default to SLICE so the per-scan budget stays per-scan."""
     plugin = self._build_mock_plugin(job_id="test-job-webapp")
     plugin.chainstore_peers = ["node-1", "node-2"]
     plugin.cfg_chainstore_peers = ["node-1", "node-2"]
@@ -302,10 +306,110 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     job_specs = self._extract_job_specs(plugin, "test-job-webapp")
     workers = job_specs["workers"]
-    self.assertEqual(workers["node-1"]["start_port"], 443)
-    self.assertEqual(workers["node-1"]["end_port"], 443)
-    self.assertEqual(workers["node-2"]["start_port"], 443)
-    self.assertEqual(workers["node-2"]["end_port"], 443)
+    self.assertEqual(workers["node-1"]["graybox_assignment_strategy"], "SLICE")
+    self.assertEqual(workers["node-2"]["graybox_assignment_strategy"], "SLICE")
+    self.assertEqual({workers[node]["budget_scope"] for node in workers}, {"per_scan"})
+    self.assertTrue(workers["node-1"]["assignment_hash"])
+
+  def test_launch_webapp_scan_explicit_mirror_divides_budget_without_opt_in(self):
+    """Multi-worker MIRROR without per-worker opt-in must divide the budget."""
+    plugin = self._build_mock_plugin(job_id="test-job-mirror-div")
+    plugin.chainstore_peers = ["node-1", "node-2"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2"]
+
+    result = self._launch_webapp(
+      plugin,
+      selected_peers=["node-1", "node-2"],
+      graybox_assignment_strategy="MIRROR",
+      request_budget=40,
+    )
+    self.assertNotIn("error", result)
+
+    workers = self._extract_job_specs(plugin, "test-job-mirror-div")["workers"]
+    self.assertEqual({workers[n]["budget_scope"] for n in workers}, {"per_scan"})
+    self.assertEqual(
+      sum(workers[n]["assigned_request_budget"] for n in workers),
+      40,
+    )
+
+  def test_launch_webapp_scan_explicit_mirror_per_worker_with_opt_in(self):
+    """MIRROR + multi-worker + allow_mirror_per_worker_budget=True keeps per-worker budget."""
+    plugin = self._build_mock_plugin(job_id="test-job-mirror-pw")
+    plugin.chainstore_peers = ["node-1", "node-2"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2"]
+
+    result = self._launch_webapp(
+      plugin,
+      selected_peers=["node-1", "node-2"],
+      graybox_assignment_strategy="MIRROR",
+      request_budget=40,
+      allow_mirror_per_worker_budget=True,
+    )
+    self.assertNotIn("error", result)
+
+    workers = self._extract_job_specs(plugin, "test-job-mirror-pw")["workers"]
+    self.assertEqual({workers[n]["budget_scope"] for n in workers}, {"per_worker"})
+    self.assertEqual(workers["node-1"]["assigned_request_budget"], 40)
+    self.assertEqual(workers["node-2"]["assigned_request_budget"], 40)
+
+  def test_launch_webapp_scan_emits_top_level_assignment_summary(self):
+    plugin = self._build_mock_plugin(job_id="test-job-summary")
+    plugin.chainstore_peers = ["node-1", "node-2"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2"]
+
+    result = self._launch_webapp(plugin, selected_peers=["node-1", "node-2"])
+    self.assertNotIn("error", result)
+
+    summary = self._extract_job_specs(plugin, "test-job-summary").get("graybox_assignment_summary")
+    self.assertIsNotNone(summary)
+    self.assertEqual(summary["graybox_assignment_strategy"], "SLICE")
+    self.assertEqual(summary["budget_scope"], "per_scan")
+    self.assertGreater(summary["total_assigned_scenarios"], 0)
+    self.assertEqual(len(summary["worker_assignment_summary"]), 2)
+
+  def test_launch_webapp_scan_can_slice_api_scenarios_between_workers(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-slice")
+    plugin.chainstore_peers = ["node-1", "node-2", "node-3"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2", "node-3"]
+
+    result = self._launch_webapp(
+      plugin,
+      selected_peers=["node-1", "node-2", "node-3"],
+      graybox_assignment_strategy="SLICE",
+      request_budget=30,
+    )
+    self.assertNotIn("error", result)
+
+    job_specs = self._extract_job_specs(plugin, "test-job-webapp-slice")
+    workers = job_specs["workers"]
+    assigned_sets = [
+      set(workers[node]["assigned_scenario_ids"])
+      for node in ("node-1", "node-2", "node-3")
+    ]
+    self.assertEqual(set().union(*assigned_sets), set(runtime_scenario_ids()))
+    self.assertFalse(assigned_sets[0] & assigned_sets[1])
+    self.assertFalse(assigned_sets[0] & assigned_sets[2])
+    self.assertFalse(assigned_sets[1] & assigned_sets[2])
+    self.assertEqual(
+      sum(workers[node]["assigned_request_budget"] for node in workers),
+      30,
+    )
+    self.assertEqual({workers[node]["budget_scope"] for node in workers}, {"per_scan"})
+
+  def test_launch_webapp_scan_rejects_mirror_stateful_multi_worker(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-stateful")
+    plugin.chainstore_peers = ["node-1", "node-2"]
+    plugin.cfg_chainstore_peers = ["node-1", "node-2"]
+
+    result = self._launch_webapp(
+      plugin,
+      selected_peers=["node-1", "node-2"],
+      allow_stateful_probes=True,
+      graybox_assignment_strategy="MIRROR",
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("MIRROR with stateful", result["message"])
 
   def test_launch_webapp_scan_neutralizes_network_only_fields(self):
     """Webapp config does not persist bogus network defaults like exceptions='64297'."""
@@ -359,21 +463,286 @@ class TestPhase1ConfigCID(unittest.TestCase):
     job_specs = self._extract_job_specs(plugin, "test-job-websecret")
     self.assertEqual(job_specs["job_config_cid"], "QmConfigCID")
 
-  def test_launch_webapp_scan_rejects_secret_persistence_without_store_key(self):
-    """Webapp launch fails closed when no strong secret-store key is configured."""
-    plugin = self._build_mock_plugin(job_id="test-job-websecret-nokey")
-    plugin.cfg_redmesh_secret_store_key = ""
-    plugin.cfg_comms_host_key = ""
-    plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 86400, "RETRIES": 2}
+  def test_launch_webapp_scan_persists_bearer_token_only_in_secret_payload(self):
+    """API-native bearer auth uses the same R1FS secret lane as form passwords."""
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-secret")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
 
     result = self._launch_webapp(
       plugin,
-      official_username="admin",
-      official_password="secret",
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN-MUST-NOT-PERSIST",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+          },
+        },
+      },
     )
 
-    self.assertEqual(result["error"], "Failed to store job config in R1FS")
-    self.assertEqual(len(plugin.r1fs.add_json.call_args_list), 0)
+    self.assertNotIn("error", result)
+    secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+
+    self.assertEqual(
+      secret_doc["payload"]["bearer_token"],
+      "BEARER-TOKEN-MUST-NOT-PERSIST",
+    )
+    self.assertEqual(config_dict["secret_ref"], "QmSecretCID")
+    self.assertTrue(config_dict["has_bearer_token"])
+    self.assertEqual(config_dict["bearer_token"], "")
+    self.assertNotIn(
+      "BEARER-TOKEN-MUST-NOT-PERSIST",
+      json.dumps(config_dict),
+    )
+
+  def test_launch_webapp_scan_rejects_bearer_without_validation_path(self):
+    """Bearer/API-key auth must be validated unless explicitly unverified."""
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-no-probe")
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN",
+      target_config={
+        "api_security": {
+          "auth": {"auth_type": "bearer"},
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("authenticated_probe_path", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_scan_allows_explicit_unverified_bearer(self):
+    """Explicit opt-out persists as non-secret policy metadata."""
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-unverified")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "allow_unverified_auth": True,
+          },
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    auth_config = config_dict["target_config"]["api_security"]["auth"]
+    self.assertTrue(auth_config["allow_unverified_auth"])
+    self.assertEqual(auth_config["authenticated_probe_path"], "")
+
+  def test_launch_webapp_scan_rejects_mutating_auth_validation_method(self):
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-post-probe")
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+            "authenticated_probe_method": "POST",
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("authenticated_probe_method", result["message"])
+
+  def test_launch_webapp_scan_allows_explicit_non_readonly_validation(self):
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-post-override")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="BEARER-TOKEN",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+            "authenticated_probe_method": "POST",
+            "allow_non_readonly_auth_validation_method": True,
+          },
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    auth_config = config_dict["target_config"]["api_security"]["auth"]
+    self.assertEqual(auth_config["authenticated_probe_method"], "POST")
+    self.assertTrue(auth_config["allow_non_readonly_auth_validation_method"])
+
+  def test_launch_webapp_scan_rejects_nested_target_config_secret(self):
+    """Nested request bodies cannot carry raw secrets into persisted JobConfig."""
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_id": "redmesh",
+              "client_secret": "plain-secret",
+            },
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("target_config", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_rejects_unknown_target_config_key(self):
+    """Unknown nested target_config keys fail closed instead of disappearing."""
+    plugin = self._build_mock_plugin(job_id="test-job-target-unknown")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "object_endpoints": [
+            {"path": "/api/records/{id}/", "typo": True},
+          ],
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("unknown field", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_persists_target_config_secret_ref_value_only_in_secret_payload(self):
+    """Typed target_config secret refs resolve through the R1FS secret payload."""
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret-ref")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_id": "redmesh",
+              "client_secret": {"secret_ref": "oauth_client_secret"},
+            },
+          },
+        },
+      },
+      target_config_secrets={"oauth_client_secret": "OAUTH-CLIENT-SECRET"},
+    )
+
+    self.assertNotIn("error", result)
+    secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(
+      secret_doc["payload"]["target_config_secrets"],
+      {"oauth_client_secret": "OAUTH-CLIENT-SECRET"},
+    )
+    self.assertNotIn("OAUTH-CLIENT-SECRET", json.dumps(config_dict))
+    self.assertEqual(
+      config_dict["target_config"]["api_security"]["token_endpoints"][
+        "token_request_body"
+      ]["client_secret"],
+      {"secret_ref": "oauth_client_secret"},
+    )
+
+  def test_launch_webapp_scan_rejects_missing_target_config_secret_ref_value(self):
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret-ref-missing")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_secret": {"secret_ref": "oauth_client_secret"},
+            },
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("missing", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_rejects_unknown_target_config_secret_value(self):
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret-ref-extra")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={"api_security": {"token_endpoints": {}}},
+      target_config_secrets={"unused": "secret"},
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("unknown secret_ref", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_rejects_secret_ref_outside_approved_body(self):
+    plugin = self._build_mock_plugin(job_id="test-job-target-secret-ref-bad-place")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "auth": {
+            "api_key_header_name": {"secret_ref": "header_name"},
+          },
+        },
+      },
+      target_config_secrets={"header_name": "X-Secret"},
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("outside an approved request body", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_records_default_plugin_key_metadata(self):
+    """With no dedicated key, the built-in default is used automatically and
+    metadata reflects the well-known key."""
+    plugin = self._build_mock_plugin(job_id="test-job-websecret-default-key")
+    plugin.cfg_redmesh_secret_store_key = ""
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    with patch.dict("os.environ", {}, clear=True):
+      result = self._launch_webapp(
+        plugin,
+        official_username="admin",
+        official_password="secret",
+      )
+
+    self.assertNotIn("error", result)
+    secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(secret_doc["unsafe_key_fallback"])
+    self.assertEqual(secret_doc["key_id"], "redmesh:default_plugin_key")
+    self.assertTrue(config_dict["secret_store_unsafe_fallback"])
+    self.assertEqual(config_dict["secret_store_key_id"], "redmesh:default_plugin_key")
 
   def test_launch_webapp_scan_rejects_missing_target_url(self):
     """Webapp endpoint returns structured validation error for missing URL."""
@@ -414,6 +783,48 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("allowlist", result["message"])
 
+  def test_launch_webapp_scan_rejects_out_of_scope_api_paths(self):
+    """Path-scoped authorization applies to configured API probe paths."""
+    plugin = self._build_mock_plugin(job_id="test-job-path-scope")
+
+    result = self._launch_webapp(
+      plugin,
+      target_allowlist=["example.com", "/api/public/"],
+      target_config={
+        "login_path": "/api/public/login/",
+        "logout_path": "/api/public/logout/",
+        "api_security": {
+          "function_endpoints": [
+            {"path": "/admin/export-users/"},
+          ],
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("outside authorized scope", result["message"])
+    self.assertEqual(plugin.r1fs.add_json.call_count, 0)
+
+  def test_launch_webapp_scan_accepts_in_scope_templated_api_paths(self):
+    """Templated API paths are normalized and allowed inside the scope prefix."""
+    plugin = self._build_mock_plugin(job_id="test-job-path-scope-ok")
+
+    result = self._launch_webapp(
+      plugin,
+      target_allowlist=["example.com", "/api/public/"],
+      target_config={
+        "login_path": "/api/public/login/",
+        "logout_path": "/api/public/logout/",
+        "api_security": {
+          "object_endpoints": [
+            {"path": "/api/public/users/{id}/"},
+          ],
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+
   def test_launch_webapp_scan_persists_authorization_context(self):
     """Authorization metadata is stored in immutable job config and audit context."""
     plugin = self._build_mock_plugin(job_id="test-job-authctx")
@@ -426,7 +837,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
       authorization_ref="TICKET-42",
       engagement_metadata={"ticket": "TICKET-42", "owner": "alice"},
       target_allowlist=["example.com", "/api/"],
-      target_config={"discovery": {"scope_prefix": "/api/"}},
+      target_config={
+        "login_path": "/api/login/",
+        "logout_path": "/api/logout/",
+        "discovery": {"scope_prefix": "/api/"},
+      },
     )
 
     config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
@@ -438,6 +853,66 @@ class TestPhase1ConfigCID(unittest.TestCase):
     audit_payload = plugin._log_audit_event.call_args[0][1]
     self.assertEqual(audit_payload["scope_id"], "scope-123")
     self.assertEqual(audit_payload["authorization_ref"], "TICKET-42")
+
+  def test_launch_webapp_scan_preserves_api_security_payload(self):
+    """OWASP API Top 10 target_config.api_security passes through to JobConfig."""
+    plugin = self._build_mock_plugin(job_id="test-job-api-security")
+
+    api_security_payload = {
+      "object_endpoints": [
+        {"path": "/api/records/{id}/", "test_ids": [1, 2],
+         "owner_field": "owner", "tenant_field": "tenant_id"},
+      ],
+      "function_endpoints": [
+        {"path": "/api/admin/users/{uid}/promote/",
+         "method": "POST", "privilege": "admin",
+         "revert_path": "/api/admin/users/{uid}/demote/"},
+      ],
+      "token_endpoints": {
+        "token_path": "/api/token/",
+        "protected_path": "/api/me/",
+        "logout_path": "/api/auth/logout/",
+      },
+      "inventory_paths": {
+        "current_version": "/api/v2/",
+        "canonical_probe_path": "/api/v2/records/1/",
+        "deprecated_paths": ["/api/v1/legacy/"],
+      },
+    }
+
+    self._launch_webapp(
+      plugin,
+      target_config={
+        "discovery": {"scope_prefix": "/api/"},
+        "api_security": api_security_payload,
+      },
+    )
+
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    api_security = config_dict["target_config"]["api_security"]
+    # Object endpoints preserved
+    self.assertEqual(len(api_security["object_endpoints"]), 1)
+    self.assertEqual(
+      api_security["object_endpoints"][0]["tenant_field"], "tenant_id"
+    )
+    # Function endpoints + revert path preserved
+    self.assertEqual(
+      api_security["function_endpoints"][0]["revert_path"],
+      "/api/admin/users/{uid}/demote/",
+    )
+    # Token endpoints preserved
+    self.assertEqual(
+      api_security["token_endpoints"]["logout_path"], "/api/auth/logout/"
+    )
+    # Inventory paths preserved
+    self.assertEqual(
+      api_security["inventory_paths"]["canonical_probe_path"],
+      "/api/v2/records/1/",
+    )
+    self.assertEqual(
+      api_security["inventory_paths"]["deprecated_paths"],
+      ["/api/v1/legacy/"],
+    )
 
   def test_launch_webapp_scan_applies_safety_policy_caps(self):
     """Graybox launch policy caps weak-auth and discovery budgets and records warnings."""
@@ -464,6 +939,81 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertTrue(any("capped" in warning for warning in warnings))
     self.assertTrue(any("TLS verification is disabled" in warning for warning in warnings))
 
+  def test_launch_webapp_scan_rejects_invalid_numeric_safety_values(self):
+    plugin = self._build_mock_plugin(job_id="test-job-bad-request-budget")
+    result = self._launch_webapp(plugin, request_budget="abc")
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("request_budget", result["message"])
+
+    plugin = self._build_mock_plugin(job_id="test-job-bad-weak-attempts")
+    result = self._launch_webapp(plugin, max_weak_attempts=0)
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("max_weak_attempts", result["message"])
+
+  def test_launch_webapp_scan_rejects_invalid_target_config_numeric_values(self):
+    plugin = self._build_mock_plugin(job_id="test-job-bad-max-requests")
+    result = self._launch_webapp(
+      plugin,
+      target_config={"api_security": {"max_total_requests": "abc"}},
+    )
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("api_security.max_total_requests", result["message"])
+
+    plugin = self._build_mock_plugin(job_id="test-job-bad-discovery")
+    result = self._launch_webapp(
+      plugin,
+      target_config={"discovery": {"scope_prefix": "/api/", "max_pages": -1}},
+    )
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("discovery.max_pages", result["message"])
+
+    plugin = self._build_mock_plugin(job_id="test-job-bad-payload-size")
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "resource_endpoints": [
+            {
+              "path": "/api/records/",
+              "allow_oversized_payload_probe": True,
+              "oversized_payload_bytes": 262_145,
+            },
+          ],
+        },
+      },
+    )
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("oversized_payload_bytes", result["message"])
+
+  def test_launch_webapp_scan_normalizes_numeric_strings(self):
+    plugin = self._build_mock_plugin(job_id="test-job-numeric-strings")
+    self._launch_webapp(
+      plugin,
+      request_budget="42",
+      max_weak_attempts="5",
+      target_config={
+        "discovery": {"scope_prefix": "/api/", "max_pages": "12", "max_depth": "2"},
+        "api_security": {
+          "object_endpoints": [
+            {"path": "/api/records/{id}/", "test_ids": ["1", "2"]},
+          ],
+        },
+      },
+    )
+
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(config_dict["max_weak_attempts"], 5)
+    self.assertEqual(config_dict["target_config"]["discovery"]["max_pages"], 12)
+    self.assertEqual(config_dict["target_config"]["discovery"]["max_depth"], 2)
+    self.assertEqual(
+      config_dict["target_config"]["api_security"]["max_total_requests"],
+      42,
+    )
+    self.assertEqual(
+      config_dict["target_config"]["api_security"]["object_endpoints"][0]["test_ids"],
+      [1, 2],
+    )
+
   def test_launch_test_rejects_invalid_scan_type(self):
     """Compatibility endpoint rejects unknown scan types with a structured error."""
     plugin = self._build_mock_plugin(job_id="test-job-badtype")
@@ -487,6 +1037,10 @@ class TestPhase1ConfigCID(unittest.TestCase):
       target_url="https://example.com/app",
       official_username="admin",
       official_password="secret",
+      bearer_token="TOKEN-123",
+      api_key="KEY-123",
+      bearer_refresh_token="REFRESH-123",
+      request_budget=42,
       authorized=True,
       scan_type="webapp",
     )
@@ -495,6 +1049,11 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(webapp["route"], "webapp")
     plugin.launch_network_scan.assert_called_once()
     plugin.launch_webapp_scan.assert_called_once()
+    webapp_kwargs = plugin.launch_webapp_scan.call_args.kwargs
+    self.assertEqual(webapp_kwargs["bearer_token"], "TOKEN-123")
+    self.assertEqual(webapp_kwargs["api_key"], "KEY-123")
+    self.assertEqual(webapp_kwargs["bearer_refresh_token"], "REFRESH-123")
+    self.assertEqual(webapp_kwargs["request_budget"], 42)
 
   def test_launch_test_persists_typed_ptes_context(self):
     """Compatibility launch_test preserves typed engagement/RoE/auth fields."""
@@ -2353,6 +2912,8 @@ class TestPhase5Endpoints(unittest.TestCase):
       },
       {
         "kind": "redmesh_graybox_credentials",
+        "job_id": "test-job",
+        "storage_mode": "encrypted_r1fs_json_v1",
         "payload": {
           "official_username": "admin",
           "official_password": "secret",
@@ -2363,7 +2924,10 @@ class TestPhase5Endpoints(unittest.TestCase):
       },
     ]
 
-    config = Plugin._get_job_config(plugin, {"job_config_cid": "QmConfigCID"}, resolve_secrets=True)
+    config = Plugin._get_job_config(
+      plugin, {"job_id": "test-job", "job_config_cid": "QmConfigCID"},
+      resolve_secrets=True,
+    )
 
     self.assertEqual(config["official_username"], "admin")
     self.assertEqual(config["official_password"], "secret")
@@ -2375,13 +2939,11 @@ class TestPhase5Endpoints(unittest.TestCase):
       unittest.mock.call("QmSecretCID", secret="unit-test-redmesh-secret-key"),
     )
 
-  def test_get_job_config_resolves_legacy_plaintext_secret_ref_without_key(self):
-    """Legacy plaintext secret refs remain readable as a compatibility fallback."""
+  def test_get_job_config_fails_closed_for_malformed_secret_payload(self):
+    """Secret refs decrypt with the default key, but malformed payloads (missing storage_mode) are rejected."""
     Plugin = self._get_plugin_class()
     plugin = self._build_plugin({})
     plugin.cfg_redmesh_secret_store_key = ""
-    plugin.cfg_comms_host_key = ""
-    plugin.cfg_attestation = {"ENABLED": True, "PRIVATE_KEY": "", "MIN_SECONDS_BETWEEN_SUBMITS": 86400, "RETRIES": 2}
     plugin.r1fs.get_json.side_effect = [
       {
         "scan_type": "webapp",
@@ -2397,13 +2959,155 @@ class TestPhase5Endpoints(unittest.TestCase):
       },
     ]
 
-    config = Plugin._get_job_config(plugin, {"job_config_cid": "QmConfigCID"}, resolve_secrets=True)
+    with self.assertRaises(ValueError):
+      Plugin._get_job_config(
+        plugin, {"job_id": "test-job", "job_config_cid": "QmConfigCID"},
+        resolve_secrets=True,
+      )
+    self.assertEqual(len(plugin.r1fs.get_json.call_args_list), 2)
 
-    self.assertEqual(config["official_password"], "secret")
-    self.assertEqual(
-      plugin.r1fs.get_json.call_args_list[1],
-      unittest.mock.call("QmSecretCID"),
+  def test_mark_worker_terminal_error_sets_common_fields(self):
+    Plugin = self._get_plugin_class()
+    plugin = self._build_plugin({})
+    job_specs = {
+      "job_id": "job-terminal",
+      "workers": {"worker-a": {"start_port": 443, "end_port": 443}},
+    }
+
+    with patch.object(Plugin, "_write_job_record", return_value=job_specs) as write:
+      Plugin._mark_worker_terminal_error(
+        plugin,
+        job_specs,
+        "worker-a",
+        "secret_resolution_failed",
+        "Failed to resolve graybox secret_ref",
+        context="test_terminal",
+      )
+
+    worker = job_specs["workers"]["worker-a"]
+    self.assertTrue(worker["finished"])
+    self.assertEqual(worker["terminal_reason"], "secret_resolution_failed")
+    self.assertIn("secret_ref", worker["error"])
+    write.assert_called_once()
+
+  def test_mark_worker_terminal_error_merges_against_current_record(self):
+    """B8: concurrent terminal writes must merge by worker key, not overwrite."""
+    Plugin = self._get_plugin_class()
+    # Current record in CStore has worker-A already terminal (written by
+    # worker A's concurrent failure).
+    current_record = {
+      "job_id": "job-concurrent",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "target": "example.com",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/app",
+      "start_port": 443,
+      "end_port": 443,
+      "date_created": 1000000.0,
+      "job_config_cid": "QmConfig",
+      "workers": {
+        "worker-A": {
+          "start_port": 443, "end_port": 443,
+          "finished": True,
+          "terminal_reason": "assignment_validation_failed",
+          "error": "A error",
+        },
+        "worker-B": {"start_port": 443, "end_port": 443, "finished": False},
+      },
+      "timeline": [],
+      "pass_reports": [],
+      "job_revision": 7,
+    }
+    plugin = self._build_plugin({"job-concurrent": current_record})
+
+    # Worker-B's stale local snapshot doesn't know about A's terminal flag.
+    stale_snapshot = {
+      "job_id": "job-concurrent",
+      "workers": {
+        "worker-A": {"start_port": 443, "end_port": 443, "finished": False},
+        "worker-B": {"start_port": 443, "end_port": 443, "finished": False},
+      },
+    }
+
+    captured = {}
+
+    def _capture(self_plugin, job_id, job_specs, expected_revision=None, context=""):
+      captured["job_id"] = job_id
+      captured["job_specs"] = dict(job_specs)
+      captured["context"] = context
+      return job_specs
+
+    with patch.object(Plugin, "_write_job_record", side_effect=_capture):
+      Plugin._mark_worker_terminal_error(
+        plugin,
+        stale_snapshot,
+        "worker-B",
+        "launch_failed",
+        "B error",
+        context="b_terminal",
+      )
+
+    persisted_workers = captured["job_specs"]["workers"]
+    # A's pre-existing terminal data survived the B write.
+    self.assertTrue(persisted_workers["worker-A"]["finished"])
+    self.assertEqual(persisted_workers["worker-A"]["terminal_reason"], "assignment_validation_failed")
+    self.assertEqual(persisted_workers["worker-A"]["error"], "A error")
+    # B's terminal patch is applied.
+    self.assertTrue(persisted_workers["worker-B"]["finished"])
+    self.assertEqual(persisted_workers["worker-B"]["terminal_reason"], "launch_failed")
+
+  def test_maybe_launch_jobs_secret_resolution_failure_marks_terminal(self):
+    Plugin = self._get_plugin_class()
+    assignments, error = build_graybox_worker_assignments(["launcher-node"])
+    self.assertIsNone(error)
+    worker_entry = {
+      "start_port": 443,
+      "end_port": 443,
+      "finished": False,
+      "result": None,
+      **assignments["launcher-node"],
+    }
+    job_specs = {
+      "job_id": "job-secret-fail",
+      "job_status": "RUNNING",
+      "job_pass": 1,
+      "target": "example.com",
+      "scan_type": "webapp",
+      "target_url": "https://example.com/app",
+      "launcher": "launcher-node",
+      "launcher_alias": "launcher",
+      "workers": {"launcher-node": worker_entry},
+      "run_mode": "SINGLEPASS",
+      "job_config_cid": "QmConfigCID",
+    }
+    plugin = self._build_plugin({"job-secret-fail": job_specs})
+    plugin._PentesterApi01Plugin__last_checked_jobs = 0
+    plugin.cfg_check_jobs_each = 0
+    plugin.time.return_value = 100
+    plugin.scan_jobs = {}
+    plugin.completed_jobs_reports = {}
+    plugin.lst_completed_jobs = []
+    plugin._foreign_jobs_logged = set()
+    plugin._normalize_job_record = lambda key, spec, migrate=False: (key, spec)
+    plugin._get_worker_entry = lambda job_id, spec: Plugin._get_worker_entry(plugin, job_id, spec)
+    plugin._get_active_execution_identity = lambda job_id: None
+    plugin._build_execution_identity = lambda job_id, pass_nr, worker_addr, revision: (
+      job_id, pass_nr, worker_addr, revision,
     )
+    plugin._get_job_config = MagicMock(
+      side_effect=ValueError("Failed to resolve graybox secret_ref")
+    )
+
+    with patch.object(Plugin, "_write_job_record", return_value=job_specs) as write:
+      Plugin._maybe_launch_jobs(plugin)
+
+    self.assertTrue(worker_entry["finished"])
+    self.assertEqual(worker_entry["terminal_reason"], "secret_resolution_failed")
+    self.assertIn("secret_ref", worker_entry["error"])
+    write.assert_called_once()
 
   def test_get_job_data_running_last_5(self):
     """Running job with 8 passes returns last 5 refs only."""

@@ -81,6 +81,18 @@ class TestSsrfProbe(unittest.TestCase):
     self.assertEqual(vuln[0].severity, "MEDIUM")
     self.assertIn("CWE-918", vuln[0].cwe)
 
+  def test_ssrf_respects_runtime_assignment_gate(self):
+    ep = SsrfEndpoint(path="/api/fetch/", param="url")
+    probe = _make_probe(ssrf_endpoints=[ep])
+    probe.allowed_scenario_ids = {"PT-OAPI2-01"}
+
+    probe.run_safe_scenario("PT-API7-01", "ssrf", probe._test_ssrf)
+
+    probe.auth.official_session.get.assert_not_called()
+    self.assertFalse(
+      any(f.scenario_id == "PT-API7-01" for f in probe.findings),
+    )
+
   def test_ssrf_no_hit(self):
     """Normal response → no finding."""
     ep = SsrfEndpoint(path="/api/fetch/", param="url")
