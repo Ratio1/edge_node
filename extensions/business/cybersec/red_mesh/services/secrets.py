@@ -11,12 +11,13 @@ from ..graybox.models.target_config import (
 # explicitly opted into the unsafe development fallback. This key is identical
 # on every node that ships this plugin, so anyone with read access to the
 # repository or to R1FS-stored secret payloads can decrypt them. Production
-# deployments MUST configure REDMESH_SECRET_STORE_KEY (env) or
-# cfg_redmesh_secret_store_key (config); otherwise persistence fails closed.
-# To enable the unsafe fallback for local development, set
-# REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK=true or
-# cfg_redmesh_allow_unsafe_secret_store_fallback=True. Production environments
-# (REDMESH_ENV=production) reject the unsafe fallback unconditionally.
+# deployments SHOULD configure REDMESH_SECRET_STORE_KEY (env) or
+# cfg_redmesh_secret_store_key (config); otherwise persistence fails closed
+# unless the unsafe fallback is explicitly enabled. To enable the unsafe
+# fallback, set REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK=true or
+# cfg_redmesh_allow_unsafe_secret_store_fallback=True. The opt-in is honored
+# regardless of REDMESH_ENV so operators carry full responsibility for the
+# trade-off when no dedicated key is configured.
 _DEFAULT_SECRET_STORE_KEY = "redmesh-default-plugin-key-v1"
 
 
@@ -29,9 +30,10 @@ class SecretStoreKeyMissing(RuntimeError):
       message or (
         "RedMesh graybox secret-store key is not configured. Set "
         "REDMESH_SECRET_STORE_KEY (env) or cfg_redmesh_secret_store_key "
-        "(config). For local development only, you may opt into the "
-        "well-known fallback with REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK"
-        "=true (never use in production)."
+        "(config). To opt into the shared well-known fallback key, set "
+        "REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK=true (note: the key "
+        "is identical on every node — anyone with read access to "
+        "secret payloads can decrypt them)."
       )
     )
 
@@ -103,13 +105,7 @@ class R1fsSecretStore:
       "unsafe_fallback": True,
     }
 
-  def _is_production_env(self) -> bool:
-    env = os.environ.get("REDMESH_ENV", "") or os.environ.get("ENVIRONMENT", "")
-    return isinstance(env, str) and env.strip().lower() == "production"
-
   def _unsafe_fallback_enabled(self) -> bool:
-    if self._is_production_env():
-      return False
     env_flag = os.environ.get("REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK", "")
     if self._truthy(env_flag):
       return True

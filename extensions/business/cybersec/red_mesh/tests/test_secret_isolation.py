@@ -148,18 +148,21 @@ class TestSecretStoreKeySeparation(unittest.TestCase):
     },
     clear=True,
   )
-  def test_production_env_rejects_unsafe_fallback(self):
-    """Even with explicit opt-in, REDMESH_ENV=production rejects the fallback."""
+  def test_production_env_honors_unsafe_fallback_opt_in(self):
+    """REDMESH_ENV is not consulted — explicit opt-in is honored regardless."""
     owner = MagicMock()
     owner.P = MagicMock()
     owner.cfg_redmesh_secret_store_key = ""
     owner.cfg_redmesh_allow_unsafe_secret_store_fallback = True
     owner.r1fs.add_json.return_value = "fake://secret/cid"
 
-    with self.assertRaises(SecretStoreKeyMissing):
-      R1fsSecretStore(owner).save_graybox_credentials(
-        "job-1", {"official_password": "secret"},
-      )
+    secret_ref = R1fsSecretStore(owner).save_graybox_credentials(
+      "job-1", {"official_password": "secret"},
+    )
+
+    self.assertEqual(secret_ref, "fake://secret/cid")
+    secret_doc = owner.r1fs.add_json.call_args[0][0]
+    self.assertTrue(secret_doc["unsafe_key_fallback"])
 
   @patch.dict(
     os.environ,
