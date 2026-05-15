@@ -1778,11 +1778,12 @@ class TestPurgeAllJobs(unittest.TestCase):
     triage_audit = {"orphan-job:f-1": [{"status": "accepted_risk"}]}
     plugin = self._make_plugin(jobs, live=live, triage=triage, triage_audit=triage_audit)
 
-    def _fake_stop_and_delete(job_id):
+    def _fake_purge(job_id):
       plugin._hashes["test-instance"].pop(job_id, None)
       return {"status": "success", "job_id": job_id, "cids_deleted": 3, "cids_total": 3}
 
-    plugin.stop_and_delete_job.side_effect = _fake_stop_and_delete
+    # FINALIZED/STOPPED jobs route directly to purge_job.
+    plugin.purge_job.side_effect = _fake_purge
 
     result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
@@ -1792,6 +1793,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     self.assertEqual(result["jobs_failed"], 0)
     self.assertEqual(result["jobs_force_purged"], 0)
     self.assertEqual(result["cids_deleted"], 6)
+    plugin.stop_and_delete_job.assert_not_called()
     self.assertEqual(result["cids_failed"], 0)
     self.assertEqual(result["errors"], [])
 
@@ -1826,7 +1828,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     }
     plugin = self._make_plugin(jobs, live=live, triage=triage, triage_audit=triage_audit)
 
-    def _fake_stop_and_delete(job_id):
+    def _fake_purge(job_id):
       if job_id == "job-good":
         plugin._hashes["test-instance"].pop(job_id, None)
         return {"status": "success", "job_id": job_id, "cids_deleted": 2, "cids_total": 2}
@@ -1840,7 +1842,7 @@ class TestPurgeAllJobs(unittest.TestCase):
         "message": "Some R1FS artifacts could not be deleted.",
       }
 
-    plugin.stop_and_delete_job.side_effect = _fake_stop_and_delete
+    plugin.purge_job.side_effect = _fake_purge
 
     result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
@@ -1882,13 +1884,13 @@ class TestPurgeAllJobs(unittest.TestCase):
     plugin.r1fs = MagicMock()
     plugin.r1fs.delete_file.return_value = True
 
-    def _fake_stop_and_delete(job_id):
+    def _fake_purge(job_id):
       if job_id == "job-explode":
         raise RuntimeError("schema mismatch")
       plugin._hashes["test-instance"].pop(job_id, None)
       return {"status": "success", "job_id": job_id, "cids_deleted": 1, "cids_total": 1}
 
-    plugin.stop_and_delete_job.side_effect = _fake_stop_and_delete
+    plugin.purge_job.side_effect = _fake_purge
 
     result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
@@ -2010,17 +2012,42 @@ class TestPurgeAllJobs(unittest.TestCase):
     }
     plugin = self._make_plugin(jobs)
 
-    def _fake_stop_and_delete(job_id):
+    def _fake_purge(job_id):
       plugin._hashes["test-instance"].pop(job_id, None)
       return {"status": "success", "job_id": job_id, "cids_deleted": 0, "cids_total": 0}
 
-    plugin.stop_and_delete_job.side_effect = _fake_stop_and_delete
+    plugin.purge_job.side_effect = _fake_purge
 
     result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
     self.assertEqual(result["jobs_total"], 1)
     self.assertEqual(result["jobs_succeeded"], 1)
-    plugin.stop_and_delete_job.assert_called_once_with("real-job")
+    plugin.purge_job.assert_called_once_with("real-job")
+
+  def test_running_jobs_route_through_stop_and_delete(self):
+    """RUNNING jobs go through stop_and_delete_job; terminal jobs go direct to purge_job."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "job-running": {"job_id": "job-running", "job_status": "RUNNING"},
+      "job-finalized": {"job_id": "job-finalized", "job_status": "FINALIZED"},
+      "job-stopped": {"job_id": "job-stopped", "job_status": "STOPPED"},
+    }
+    plugin = self._make_plugin(jobs)
+
+    def _success(job_id):
+      plugin._hashes["test-instance"].pop(job_id, None)
+      return {"status": "success", "job_id": job_id, "cids_deleted": 0, "cids_total": 0}
+
+    plugin.stop_and_delete_job.side_effect = _success
+    plugin.purge_job.side_effect = _success
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "success")
+    self.assertEqual(result["jobs_succeeded"], 3)
+    plugin.stop_and_delete_job.assert_called_once_with("job-running")
+    purge_call_args = {c.args[0] for c in plugin.purge_job.call_args_list}
+    self.assertEqual(purge_call_args, {"job-finalized", "job-stopped"})
 
   def test_empty_state_returns_success(self):
     """No jobs and no orphans → success with zero counts."""

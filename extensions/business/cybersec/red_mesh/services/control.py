@@ -283,9 +283,15 @@ def purge_all_jobs(owner):
   failed_job_ids = set()
   errors = []
 
+  terminal_statuses = (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED)
   for job_id, raw_payload in job_entries:
+    raw_status = raw_payload.get("job_status") if isinstance(raw_payload, dict) else None
+    use_direct_purge = raw_status in terminal_statuses
     try:
-      result = owner.stop_and_delete_job(job_id)
+      if use_direct_purge:
+        result = owner.purge_job(job_id)
+      else:
+        result = owner.stop_and_delete_job(job_id)
     except Exception as exc:
       owner.P(f"[PURGE_ALL] stop_and_delete_job({job_id}) raised: {exc}; falling back to force-purge.", color='y')
       errors.append({"job_id": job_id, "message": f"{type(exc).__name__}: {exc}"})
