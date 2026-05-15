@@ -86,6 +86,7 @@ from .mixins import (
   _RestartBackoffMixin,
   _TunnelBackoffMixin,
 )
+from .sync import _SyncMixin
 
 __VER__ = "0.7.1"
 
@@ -313,6 +314,25 @@ _CONFIG = {
                                 #   {"vol_name": {"SIZE": "100M", "MOUNTING_POINT": "/app/data", "FS_TYPE": "ext4",
                                 #                 "OWNER_UID": None, "OWNER_GID": None, "FORCE_RECREATE": False}}
 
+  # Volume-sync (cross-node state replication). Always-on /r1en_system system
+  # volume is provisioned regardless; SYNC.ENABLED only controls the
+  # provider/consumer orchestration on top of it. See the sync/ subpackage
+  # (constants.py + manager.py + mixin.py) for the full contract.
+  "SYNC": {
+    "ENABLED": False,             # master switch
+    "KEY": None,                  # shared UUID across the sync set (provider+consumer)
+    "TYPE": None,                 # "provider" | "consumer"
+    "POLL_INTERVAL": 10,          # seconds between sync ticks
+    "ALLOW_ONLINE_PROVIDER_CAPTURE": False,  # provider-local opt-in for live container fs capture
+    "CONSUMER_APPLY_MODE": "offline_restart",  # consumer-local apply lifecycle policy
+    "HSYNC_POLL_INTERVAL": 60,    # seconds between chainstore_hsync refreshes
+                                  # (consumer only; provider only calls hset, never hsync).
+                                  # Clamped to min 10s. The cheap local-replica hget
+                                  # still runs on every tick; only the network round-trip
+                                  # is rate-limited here. Failed hsync attempts retry
+                                  # sooner than the full interval.
+  },
+
   # Health check configuration (consolidated)
   # Controls how app readiness is determined before starting tunnels
   #
@@ -373,6 +393,7 @@ class ContainerAppRunnerPlugin(
   _ImagePullBackoffMixin,
   _TunnelBackoffMixin,
   _FixedSizeVolumesMixin,
+  _SyncMixin,
   _ContainerUtilsMixin,
   BasePlugin,
 ):
@@ -614,6 +635,11 @@ class ContainerAppRunnerPlugin(
     self._last_image_check = 0
     self._last_extra_tunnels_ping = 0
     self._last_paused_log = 0  # Track when we last logged the paused message
+    self._last_sync_check = 0  # _SyncMixin throttle
+
+    # Volume-sync state. SyncManager is lazy-init'd by _ensure_sync_manager
+    # the first time a tick fires (or on_init for early provisioning).
+    self._sync_manager = None
 
     # Image update tracking
     self.current_image_hash = None
@@ -1048,6 +1074,39 @@ class ContainerAppRunnerPlugin(
     return
 
 
+  def _validate_sync_config(self):
+    """
+    Validate the SYNC config block when ENABLED. Disables SYNC with a
+    warning rather than raising — the system volume itself is independent
+    and the rest of the plugin must keep running.
+    """
+    if not self._sync_enabled():
+      return
+    sync = self._sync_cfg()
+    key = sync.get("KEY")
+    role = sync.get("TYPE")
+    if not key or not isinstance(key, str):
+      self.P(
+        "[sync] SYNC.ENABLED but SYNC.KEY missing/empty — disabling SYNC.",
+        color="r",
+      )
+      sync["ENABLED"] = False
+      return
+    if role not in ("provider", "consumer"):
+      self.P(
+        f"[sync] SYNC.TYPE must be 'provider' or 'consumer' (got {role!r}) — disabling SYNC.",
+        color="r",
+      )
+      sync["ENABLED"] = False
+      return
+    self.P(
+      f"[sync] SYNC enabled: role={role}, key={key}, "
+      f"poll={self._sync_poll_interval()}s",
+      color="g",
+    )
+    return
+
+
   def _validate_subclass_config(self):
     """
     Hook for subclasses to enforce additional validation.
@@ -1118,11 +1177,19 @@ class ContainerAppRunnerPlugin(
     self._configure_volumes() # setup container volumes (deprecated)
     self._configure_file_volumes() # setup file volumes with dynamic content
     self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
+    self._configure_system_volume() # always-on /r1en_system control-plane volume
+
+    # If a prior plugin run crashed mid-publish, request.json.processing may
+    # be left over inside volume-sync/. Rename it back so the next tick retries.
+    self._recover_stale_processing()
+
+    self._validate_sync_config()
 
     # If we have semaphored keys, defer _setup_env_and_ports() until semaphores are ready
     # This ensures we get the env vars from provider plugins before starting the container
     if not self._semaphore_get_keys():
       self._setup_env_and_ports()
+      self._inject_sync_env_vars()
     else:
       self.Pd("Deferring _setup_env_and_ports() until semaphores are ready")
 
@@ -2037,23 +2104,29 @@ class ContainerAppRunnerPlugin(
 
     Returns
     -------
-    None
+    bool
+      True when there is no container or the container was removed from Docker.
+      False when Docker reported a remove failure and the container may still
+      exist/running.
 
     Notes
     -----
     If no container exists, logs a warning and returns.
-    Clears container and container_id attributes after removal.
+    Clears container and container_id attributes after successful removal.
     """
     if not self.container:
       self.P("No container to stop", color='r')
-      return
+      return True
 
+    stopped_ok = True
+    removed_ok = True
     try:
       # Stop the container (gracefully)
       self.P(f"Stopping container {self.container.short_id}...")
       self.container.stop(timeout=5)
       self.P(f"Container {self.container.short_id} stopped successfully")
     except Exception as e:
+      stopped_ok = False
       self.P(f"Error stopping container: {e}", color='r')
     # end try
 
@@ -2062,12 +2135,19 @@ class ContainerAppRunnerPlugin(
       self.container.remove()
       self.P(f"Container {self.container.short_id} removed successfully")
     except Exception as e:
+      removed_ok = False
       self.P(f"Error removing container: {e}", color='r')
-    finally:
+    if removed_ok:
+      if not stopped_ok:
+        self.P(
+          "Container stop reported an error, but remove succeeded; treating "
+          "container as stopped for restart/cleanup purposes.",
+          color='y',
+        )
       self.container = None
       self.container_id = None
     # end try
-    return
+    return removed_ok
 
 
   def _stream_logs(self, log_stream):
@@ -2658,21 +2738,22 @@ class ContainerAppRunnerPlugin(
         self._maybe_reset_tunnel_retry_counter(container_port)
 
 
-  def _stop_container_and_save_logs_to_disk(self):
+  def _stop_container_runtime_for_restart(self):
     """
-    Stop the container and all tunnels, then save logs to disk.
+    Stop runtime sidecars and remove the Docker container.
 
-    Performs full shutdown sequence:
+    Performs the shared pre-restart shutdown sequence:
     - Clears semaphore (signals dependent plugins container is stopping)
     - Stops log streaming threads
     - Stops main tunnel engine
     - Stops all extra tunnels
     - Stops and removes container
-    - Saves logs to disk
 
     Returns
     -------
-    None
+    bool
+      True when the Docker container is stopped/removed or absent, False when
+      Docker reported a failure.
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
 
@@ -2701,10 +2782,47 @@ class ContainerAppRunnerPlugin(
     self.stop_extra_tunnels()
 
     # Stop the container if it's running
-    self.stop_container()
+    stopped = self.stop_container()
+    if not stopped:
+      self._runtime_stop_degraded = True
+      self.P(
+        "Container runtime stop failed after sidecars were stopped; container "
+        "may still be running and volume mutation/cleanup must be skipped.",
+        color='r',
+      )
+    else:
+      self._runtime_stop_degraded = False
+
+    return stopped
+
+
+  def _stop_container_and_save_logs_to_disk(self):
+    """
+    Stop the container and all tunnels, then save logs to disk.
+
+    Performs full shutdown sequence:
+    - Clears semaphore (signals dependent plugins container is stopping)
+    - Stops log streaming threads
+    - Stops main tunnel engine
+    - Stops all extra tunnels
+    - Stops and removes container
+    - Cleans fixed-size volumes
+    - Saves logs to disk
+
+    Returns
+    -------
+    None
+    """
+    stopped = self._stop_container_runtime_for_restart()
 
     # Cleanup fixed-size volumes (unmount + detach loop devices)
-    self._cleanup_fixed_size_volumes()
+    if stopped:
+      self._cleanup_fixed_size_volumes()
+    else:
+      self.P(
+        "Skipping fixed-size volume cleanup because container stop/remove failed.",
+        color='r',
+      )
 
     # Save logs to disk under the instance's `logs/` sibling folder
     # (resolves to pipelines_data/{sid}/{iid}/logs/container_logs.pkl)
@@ -3014,6 +3132,36 @@ class ContainerAppRunnerPlugin(
     return
 
 
+  def _reset_runtime_state_post_start(self):
+    """Bring per-restart runtime markers back to a fresh-boot baseline.
+
+    Called after a successful ``start_container()`` to:
+      - stamp ``container_start_time`` so health-probe elapsed timers measure
+        from this new boot
+      - clear readiness gates (``_app_ready``, ``_health_probe_start``,
+        ``_tunnel_start_allowed``) so health checks re-run against the new
+        container's state and tunnels gate on the new readiness probe
+      - clear the command-rerun gate (``_commands_started``) so
+        BUILD_AND_RUN_COMMANDS rerun against the new container
+      - re-attach log capture (the prior log thread was stopped at
+        ``stop_container`` time)
+      - run image-defined build/run commands
+
+    Shared between ``_restart_container`` and the volume-sync ticks
+    (``_SyncMixin._sync_safe_start_container``) so they stay in lockstep —
+    sync slices stop+start the container inline (to keep the system volume
+    mounted), and without this helper the readiness/probe state would still
+    point at the previous container instance.
+    """
+    self.container_start_time = self.time()
+    self._app_ready = False
+    self._health_probe_start = None
+    self._tunnel_start_allowed = False
+    self._commands_started = False
+    self._start_container_log_stream()
+    self._maybe_execute_build_and_run()
+
+
   def _restart_container(self, stop_reason=None):
     """
     Restart the container from scratch.
@@ -3058,6 +3206,9 @@ class ContainerAppRunnerPlugin(
     self._configure_volumes()
     self._configure_file_volumes()
     self._configure_fixed_size_volumes()
+    self._configure_system_volume()
+    self._recover_stale_processing()
+    self._validate_sync_config()
 
     # For semaphored containers (consumers), defer env setup and container start
     # to _handle_initial_launch() which properly waits for provider semaphores.
@@ -3076,6 +3227,7 @@ class ContainerAppRunnerPlugin(
     # Non-semaphored containers (providers): configure env and start immediately
     self._configure_dynamic_env()
     self._setup_env_and_ports()
+    self._inject_sync_env_vars()
 
     # Revalidate extra tunnels
     self._validate_extra_tunnels_config()
@@ -3094,9 +3246,7 @@ class ContainerAppRunnerPlugin(
       # start_container already recorded the failure
       return
 
-    self.container_start_time = self.time()
-    self._start_container_log_stream()
-    self._maybe_execute_build_and_run()
+    self._reset_runtime_state_post_start()
     return
 
 
@@ -3259,6 +3409,7 @@ class ContainerAppRunnerPlugin(
       # Semaphores ready - dynamic env to resolve shmem values, then setup env
       self._configure_dynamic_env()
       self._setup_env_and_ports()
+      self._inject_sync_env_vars()
     # end if
 
     try:
@@ -3351,6 +3502,17 @@ class ContainerAppRunnerPlugin(
         return StopReason.EXTERNAL_UPDATE
       return None
     """
+    # Volume-sync drives stop_container/start_container INLINE so the loopback
+    # mount survives the archive/extract window. We must not return a
+    # StopReason from here because that would route through _restart_container,
+    # which calls _cleanup_fixed_size_volumes() and unmounts before our work
+    # can run. See plan Step 1 verification for the full rationale.
+    if self._sync_enabled():
+      role = self._sync_role()
+      if role == "provider":
+        self._sync_provider_tick(current_time)
+      elif role == "consumer":
+        self._sync_consumer_tick(current_time)
     return None
 
 
