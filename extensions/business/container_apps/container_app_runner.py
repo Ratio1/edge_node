@@ -1506,7 +1506,7 @@ class ContainerAppRunnerPlugin(
         return None
       try:
         pid_names = os.listdir(proc_root)
-      except Exception as exc:
+      except OSError as exc:
         self.P(f"Could not inspect {label} process group {pgid}: {exc}", color='r')
         return None
 
@@ -1524,10 +1524,11 @@ class ContainerAppRunnerPlugin(
           continue
         except Exception as exc:
           self.P(f"Could not inspect {label} process {pid_name}: {exc}", color='r')
-          return None
+          continue
         if member_pgid != pgid:
           continue
         found_member = True
+        # Stopped/traced members can resume later, so only zombies are treated as inert.
         if state != "Z":
           return True
       return False if found_member else None
@@ -1609,14 +1610,12 @@ class ContainerAppRunnerPlugin(
     cleanup state forever. A stale live tunnel can disappear later, and the app
     should self-heal without requiring a node restart.
     """
-    probe_delay = max(
-      1.0,
-      float(
-        self.cfg_restart_backoff_max
-        or self.cfg_restart_backoff_initial
-        or 1.0
-      )
-    )
+    configured_delay = self.cfg_restart_backoff_max
+    if configured_delay is None:
+      configured_delay = self.cfg_restart_backoff_initial
+    if configured_delay is None:
+      configured_delay = 1.0
+    probe_delay = max(1.0, float(configured_delay))
     self._restart_backoff_seconds = probe_delay
     self._next_restart_time = self.time() + probe_delay
     self.Pd(
@@ -3863,6 +3862,11 @@ class ContainerAppRunnerPlugin(
       if cleanup_ok:
         self._cleanup_failed = False
         self._cleanup_retry_abandoned_logged = False
+        # Cleanup recovered after max-retry abandonment; clear retry accounting before relaunch.
+        self._consecutive_failures = 0
+        self._last_failure_time = 0
+        self._restart_backoff_seconds = 0
+        self._next_restart_time = 0
         self.P("Previously abandoned container cleanup succeeded.", color='g')
         if self._manual_stop_pending:
           self._save_persistent_state(manually_stopped=True)
