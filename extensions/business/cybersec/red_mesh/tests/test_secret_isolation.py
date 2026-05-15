@@ -26,7 +26,6 @@ from extensions.business.cybersec.red_mesh.services.secrets import (
   persist_job_config_with_secrets,
   resolve_job_config_secrets,
   R1fsSecretStore,
-  SecretStoreKeyMissing,
 )
 
 
@@ -85,28 +84,9 @@ class TestSecretIsolationInBuildPayload(unittest.TestCase):
 class TestSecretStoreKeySeparation(unittest.TestCase):
 
   @patch.dict(os.environ, {}, clear=True)
-  def test_no_key_and_no_unsafe_fallback_fails_closed(self):
-    """Without a dedicated key or unsafe-fallback opt-in, persistence raises."""
-    owner = MagicMock()
-    owner.P = MagicMock()
-    owner.cfg_redmesh_secret_store_key = ""
-    owner.cfg_redmesh_allow_unsafe_secret_store_fallback = False
-    owner.r1fs.add_json.return_value = "fake://secret/cid"
-
-    with self.assertRaises(SecretStoreKeyMissing):
-      R1fsSecretStore(owner).save_graybox_credentials(
-        "job-1",
-        {"official_password": "secret"},
-      )
-    owner.r1fs.add_json.assert_not_called()
-
-  @patch.dict(
-    os.environ,
-    {"REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK": "true"},
-    clear=True,
-  )
-  def test_unsafe_fallback_env_opt_in_uses_default_key(self):
-    """Explicit env opt-in re-enables the well-known dev key (with metadata)."""
+  def test_no_dedicated_key_uses_default_with_metadata(self):
+    """Without any dedicated key configured, the built-in default is used and the
+    resulting metadata records `unsafe_key_fallback=True` for audit."""
     owner = MagicMock()
     owner.P = MagicMock()
     owner.cfg_redmesh_secret_store_key = ""
@@ -122,47 +102,6 @@ class TestSecretStoreKeySeparation(unittest.TestCase):
     self.assertTrue(secret_doc["unsafe_key_fallback"])
     self.assertEqual(secret_doc["key_id"], "redmesh:default_plugin_key")
     self.assertEqual(secret_doc["key_version"], "v1")
-
-  @patch.dict(os.environ, {}, clear=True)
-  def test_unsafe_fallback_cfg_opt_in_uses_default_key(self):
-    """Config-level opt-in is honored in dev-like deployments."""
-    owner = MagicMock()
-    owner.P = MagicMock()
-    owner.cfg_redmesh_secret_store_key = ""
-    owner.cfg_redmesh_allow_unsafe_secret_store_fallback = True
-    owner.r1fs.add_json.return_value = "fake://secret/cid"
-
-    secret_ref = R1fsSecretStore(owner).save_graybox_credentials(
-      "job-1", {"official_password": "secret"},
-    )
-
-    self.assertEqual(secret_ref, "fake://secret/cid")
-    secret_doc = owner.r1fs.add_json.call_args[0][0]
-    self.assertTrue(secret_doc["unsafe_key_fallback"])
-
-  @patch.dict(
-    os.environ,
-    {
-      "REDMESH_ENV": "production",
-      "REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK": "true",
-    },
-    clear=True,
-  )
-  def test_production_env_honors_unsafe_fallback_opt_in(self):
-    """REDMESH_ENV is not consulted — explicit opt-in is honored regardless."""
-    owner = MagicMock()
-    owner.P = MagicMock()
-    owner.cfg_redmesh_secret_store_key = ""
-    owner.cfg_redmesh_allow_unsafe_secret_store_fallback = True
-    owner.r1fs.add_json.return_value = "fake://secret/cid"
-
-    secret_ref = R1fsSecretStore(owner).save_graybox_credentials(
-      "job-1", {"official_password": "secret"},
-    )
-
-    self.assertEqual(secret_ref, "fake://secret/cid")
-    secret_doc = owner.r1fs.add_json.call_args[0][0]
-    self.assertTrue(secret_doc["unsafe_key_fallback"])
 
   @patch.dict(
     os.environ,
@@ -488,15 +427,11 @@ class _FakeNode:
     r1fs: _FakeR1FSBackend,
     *,
     cfg_redmesh_secret_store_key: str = "",
-    cfg_redmesh_allow_unsafe_secret_store_fallback: bool = False,
   ):
     self.r1fs = r1fs
     self.cfg_redmesh_secret_store_key = cfg_redmesh_secret_store_key
     self.cfg_redmesh_secret_store_key_id = ""
     self.cfg_redmesh_secret_store_key_version = ""
-    self.cfg_redmesh_allow_unsafe_secret_store_fallback = (
-      cfg_redmesh_allow_unsafe_secret_store_fallback
-    )
     self.cfg_comms_host_key = ""
     self.cfg_attestation = {"ENABLED": False, "PRIVATE_KEY": ""}
     self.prints: list[str] = []
@@ -516,11 +451,7 @@ class TestSecretRoundTripAcrossNodes(unittest.TestCase):
   live scan.
   """
 
-  @patch.dict(
-    os.environ,
-    {"REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK": "true"},
-    clear=True,
-  )
+  @patch.dict(os.environ, {}, clear=True)
   def test_default_key_round_trip_restores_form_credentials(self):
     r1fs = _FakeR1FSBackend()
     launcher = _FakeNode(r1fs)
@@ -563,11 +494,7 @@ class TestSecretRoundTripAcrossNodes(unittest.TestCase):
     self.assertEqual(resolved["regular_username"], "user")
     self.assertEqual(resolved["regular_password"], "12345678")
 
-  @patch.dict(
-    os.environ,
-    {"REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK": "true"},
-    clear=True,
-  )
+  @patch.dict(os.environ, {}, clear=True)
   def test_default_key_round_trip_handles_api_native_secrets(self):
     r1fs = _FakeR1FSBackend()
     launcher = _FakeNode(r1fs)
@@ -603,37 +530,6 @@ class TestSecretRoundTripAcrossNodes(unittest.TestCase):
     self.assertEqual(
       resolved["regular_bearer_token"],
       SENSITIVE_VALUES["regular_bearer_token"],
-    )
-
-  @patch.dict(os.environ, {}, clear=True)
-  def test_persist_aborts_when_no_key_and_no_unsafe_fallback(self):
-    """Without a dedicated key or unsafe-fallback opt-in, launch aborts cleanly."""
-    r1fs = _FakeR1FSBackend()
-    launcher = _FakeNode(r1fs)
-
-    persisted_config, config_cid = persist_job_config_with_secrets(
-      launcher,
-      job_id="job-fail-closed",
-      config_dict={
-        "job_id": "job-fail-closed",
-        "target": "honeypot.local",
-        "target_url": "https://honeypot.local",
-        "start_port": 0, "end_port": 0,
-        "scan_type": "webapp",
-        "official_username": "admin",
-        "official_password": "P3n13st3R",
-      },
-    )
-
-    self.assertEqual(config_cid, "")
-    # JobConfig coercion sets the field; on abort it must remain unset.
-    self.assertEqual(persisted_config.get("secret_ref", ""), "")
-    # Raw secret fields must not be returned even when persist aborts.
-    self.assertEqual(persisted_config.get("official_password", ""), "")
-    self.assertEqual(persisted_config.get("official_username", ""), "")
-    self.assertTrue(
-      any("secret-store key is not configured" in p for p in launcher.prints),
-      f"expected fail-closed message, got prints={launcher.prints!r}",
     )
 
   @patch.dict(os.environ, {}, clear=True)

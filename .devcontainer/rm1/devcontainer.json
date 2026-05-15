@@ -33,8 +33,7 @@
     "EE_ETH_ENABLED": "true",
     "EE_EVM_NET": "devnet",
     "PYTHONDONTWRITEBYTECODE": "1",
-    "PYTHONUNBUFFERED": "1",
-    "REDMESH_ALLOW_UNSAFE_SECRET_STORE_FALLBACK": "true"
+    "PYTHONUNBUFFERED": "1"
   },
 
   // Docker-in-Docker support
