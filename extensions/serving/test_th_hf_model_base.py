@@ -1,7 +1,9 @@
+import sys
 import types
 import unittest
 
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -14,6 +16,11 @@ class _FakeBaseServingProcess:
     self.cfg_model_name = kwargs.get("MODEL_NAME")
     self.cfg_tokenizer_name = kwargs.get("TOKENIZER_NAME")
     self.cfg_pipeline_task = kwargs.get("PIPELINE_TASK")
+    self.cfg_model_revision = kwargs.get("MODEL_REVISION")
+    self.cfg_hf_runtime = kwargs.get("HF_RUNTIME", "auto")
+    self.cfg_hf_artifact_manifest = kwargs.get("HF_ARTIFACT_MANIFEST", "artifact_manifest.json")
+    self.cfg_hf_onnx_runtime_key = kwargs.get("HF_ONNX_RUNTIME_KEY", "onnx_fp32")
+    self.cfg_hf_onnx_allow_patterns = kwargs.get("HF_ONNX_ALLOW_PATTERNS")
     self.cfg_max_length = kwargs.get("MAX_LENGTH", 512)
     self.cfg_model_weights_size = kwargs.get("MODEL_WEIGHTS_SIZE")
     self.cfg_hf_token = kwargs.get("HF_TOKEN")
@@ -77,6 +84,7 @@ class _FakeBitsAndBytesConfig:
 class _FakePipeline:
   def __init__(self, task=None):
     self.task = task
+    self.framework = "pt"
     self.inference_calls = []
 
   def __call__(self, text, **kwargs):
@@ -104,6 +112,37 @@ class _FakeTorch:
       return True
 
 
+class _FakeEncodedValue:
+  def __init__(self, value):
+    self.value = value
+    self.dtype = None
+
+  def astype(self, dtype):
+    self.dtype = dtype
+    return self
+
+
+class _FakeTokenizer:
+  def __init__(self):
+    self.calls = []
+
+  def __call__(self, text, **kwargs):
+    self.calls.append((text, kwargs))
+    return {
+      "input_ids": _FakeEncodedValue([1, 2, 3]),
+      "attention_mask": _FakeEncodedValue([1, 1, 1]),
+    }
+
+
+class _FakeOrtSession:
+  def __init__(self):
+    self.calls = []
+
+  def run(self, output_names, inputs):
+    self.calls.append((output_names, inputs))
+    return [[0.25, 0.75]]
+
+
 def _load_base_class():
   factory = _PipelineFactory()
   source_path = ROOT / "extensions" / "serving" / "default_inference" / "nlp" / "th_hf_model_base.py"
@@ -125,17 +164,38 @@ def _load_base_class():
     "__name__": "loaded_th_hf_model_base",
   }
   exec(compile(source, str(source_path), "exec"), namespace)  # noqa: S102
-  return namespace["ThHfModelBase"], factory
+  return namespace["ThHfModelBase"], namespace["HfOnnxArtifactPipeline"], factory
 
 
-ThHfModelBase, _PIPELINE_FACTORY = _load_base_class()
+ThHfModelBase, HfOnnxArtifactPipeline, _PIPELINE_FACTORY = _load_base_class()
 
 
 class _ConcreteHfModel(ThHfModelBase):
   pass
 
 
+class _FallbackManifestHfModel(ThHfModelBase):
+  def _get_hf_onnx_fallback_manifest(self):
+    return {
+      "runtimes": {
+        "onnx_fp32": {
+          "runtime": "onnxruntime",
+          "files": ["model.onnx"],
+          "inline_schema": {
+            "inputs": [{"name": "input_ids", "dtype": "int64"}],
+            "outputs": [{"name": "scores"}],
+          },
+        },
+      },
+    }
+
+
 class ThHfModelBaseTests(unittest.TestCase):
+  def setUp(self):
+    _PIPELINE_FACTORY.calls = []
+    _PIPELINE_FACTORY.instance.inference_calls = []
+    return
+
   def test_hf_serving_raises_default_wait_time_above_generic_base(self):
     self.assertEqual(_ConcreteHfModel.CONFIG["MAX_WAIT_TIME"], 60)
 
@@ -223,6 +283,669 @@ class ThHfModelBaseTests(unittest.TestCase):
     after_calls = len(_PIPELINE_FACTORY.instance.inference_calls)
 
     self.assertEqual(after_calls, before_calls)
+
+  def test_forced_pt_runtime_passes_model_revision_to_transformers_pipeline(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      MODEL_REVISION="rev-123",
+      HF_RUNTIME="pt",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+
+    plugin.startup()
+
+    _args, kwargs = _PIPELINE_FACTORY.calls[-1]
+    self.assertEqual(kwargs["revision"], "rev-123")
+    self.assertEqual(plugin.hf_runtime, "pt")
+
+  def test_forced_pt_runtime_on_cpu_skips_manifest_lookup(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      HF_RUNTIME="pt",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    plugin._load_hf_artifact_manifest = (  # pylint: disable=protected-access
+      lambda: (_ for _ in ()).throw(AssertionError("manifest should not be loaded"))
+    )
+
+    plugin.startup()
+
+    self.assertEqual(plugin.device, -1)
+    self.assertEqual(plugin.hf_runtime, "pt")
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 1)
+
+  def test_onnx_allow_patterns_reject_framework_weights_and_broad_downloads(self):
+    plugin = _ConcreteHfModel(MODEL_NAME="test/model")
+
+    allow_patterns = plugin._build_hf_runtime_allow_patterns({  # pylint: disable=protected-access
+      "recommended_allow_patterns": [
+        "onnx/*",
+        "schema.json",
+      ],
+      "files": [
+        "*",
+        "**/*",
+        "onnx/*",
+        "onnx/**",
+        "model.onnx",
+        "tokenizer.json",
+        "contract.py",
+        "pytorch_model-00001-of-00002.bin",
+        "model.safetensors",
+        "tf_model.h5",
+        "flax_model.msgpack",
+      ],
+      "model": "model.onnx",
+    })
+
+    self.assertEqual(
+      allow_patterns,
+      ["schema.json", "model.onnx", "tokenizer.json", "contract.py"],
+    )
+
+  def test_auto_runtime_uses_onnx_artifact_on_cpu_only(self):
+    manifest = {
+      "model_key": "generic_text_classifier",
+      "model_version": "2026.05.09",
+      "pipeline_task": "text-classification",
+      "runtimes": {
+        "onnx_fp32": {
+          "runtime": "onnxruntime",
+          "entrypoint": "onnxruntime.InferenceSession",
+          "files": [
+            "model.onnx",
+            "tokenizer.json",
+            "contract.py",
+            "schema.json",
+            "model.safetensors",
+          ],
+        }
+      },
+    }
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    download_calls = []
+    plugin._load_hf_artifact_manifest = lambda: manifest  # pylint: disable=protected-access
+
+    def fake_download(runtime_key, runtime_config, allow_patterns):
+      download_calls.append((runtime_key, runtime_config, allow_patterns))
+      return "/tmp/models/test-model"
+
+    plugin._download_hf_runtime_snapshot = fake_download  # pylint: disable=protected-access
+    plugin._build_hf_onnx_artifact_pipeline = (  # pylint: disable=protected-access
+      lambda model_dir, runtime_key, runtime_config, manifest: _FakePipeline(task="text-classification")
+    )
+
+    plugin.startup()
+
+    self.assertEqual(plugin.hf_runtime, "onnx_fp32")
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 0)
+    self.assertEqual(download_calls[0][0], "onnx_fp32")
+    self.assertIn("model.onnx", download_calls[0][2])
+    self.assertNotIn("model.safetensors", download_calls[0][2])
+
+  def test_auto_runtime_uses_subclass_onnx_fallback_manifest_when_hf_manifest_missing(self):
+    plugin = _FallbackManifestHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    download_calls = []
+    plugin._download_hf_artifact_file = (  # pylint: disable=protected-access
+      lambda filename: (_ for _ in ()).throw(RuntimeError("not found"))
+    )
+    plugin._download_hf_runtime_snapshot = (  # pylint: disable=protected-access
+      lambda runtime_key, runtime_config, allow_patterns: download_calls.append(
+        (runtime_key, runtime_config, allow_patterns)
+      ) or "/tmp/models/test-model"
+    )
+    plugin._build_hf_onnx_artifact_pipeline = (  # pylint: disable=protected-access
+      lambda model_dir, runtime_key, runtime_config, manifest: _FakePipeline(task="text-classification")
+    )
+
+    plugin.startup()
+
+    self.assertEqual(plugin.hf_runtime, "onnx_fp32")
+    self.assertEqual(download_calls[0][0], "onnx_fp32")
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 0)
+    self.assertTrue(
+      any("using subclass ONNX fallback manifest" in message[0][0] for message in plugin.logged_messages)
+    )
+
+  def test_forced_onnx_runtime_uses_subclass_fallback_manifest_when_hf_manifest_missing(self):
+    plugin = _FallbackManifestHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      HF_RUNTIME="onnx",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    plugin._download_hf_artifact_file = (  # pylint: disable=protected-access
+      lambda filename: (_ for _ in ()).throw(RuntimeError("not found"))
+    )
+    plugin._download_hf_runtime_snapshot = (  # pylint: disable=protected-access
+      lambda runtime_key, runtime_config, allow_patterns: "/tmp/models/test-model"
+    )
+    plugin._build_hf_onnx_artifact_pipeline = (  # pylint: disable=protected-access
+      lambda model_dir, runtime_key, runtime_config, manifest: _FakePipeline(task="text-classification")
+    )
+
+    plugin.startup()
+
+    self.assertEqual(plugin.hf_runtime, "onnx_fp32")
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 0)
+
+  def test_auto_runtime_keeps_transformers_pipeline_when_gpu_available(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    plugin._load_hf_artifact_manifest = lambda: {  # pylint: disable=protected-access
+      "runtimes": {
+        "onnx_fp32": {
+          "runtime": "onnxruntime",
+          "entrypoint": "onnxruntime.InferenceSession",
+          "files": ["model.onnx"],
+        }
+      },
+    }
+
+    plugin.startup()
+
+    self.assertEqual(plugin.device, 0)
+    self.assertEqual(plugin.hf_runtime, "pt")
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 1)
+
+  def test_forced_onnx_runtime_uses_manifest_runtime_without_hardcoded_key(self):
+    manifest = {
+      "runtimes": {
+        "cpu_artifact": {
+          "runtime": "onnxruntime",
+          "entrypoint": "onnxruntime.InferenceSession",
+          "files": ["model.onnx", "schema.json", "contract.py"],
+        }
+      },
+    }
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      HF_RUNTIME="onnx",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    plugin._load_hf_artifact_manifest = lambda: manifest  # pylint: disable=protected-access
+    plugin._download_hf_runtime_snapshot = (  # pylint: disable=protected-access
+      lambda runtime_key, runtime_config, allow_patterns: "/tmp/models/test-model"
+    )
+    plugin._build_hf_onnx_artifact_pipeline = (  # pylint: disable=protected-access
+      lambda model_dir, runtime_key, runtime_config, manifest: _FakePipeline(task="text-classification")
+    )
+
+    plugin.startup()
+
+    self.assertEqual(plugin.hf_runtime, "cpu_artifact")
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 0)
+
+  def test_auto_runtime_falls_back_to_transformers_when_onnx_startup_fails(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    plugin._load_hf_artifact_manifest = lambda: {  # pylint: disable=protected-access
+      "runtimes": {
+        "onnx_fp32": {
+          "runtime": "onnxruntime",
+          "entrypoint": "onnxruntime.InferenceSession",
+          "files": ["model.onnx", "schema.json", "contract.py"],
+        }
+      },
+    }
+
+    def fail_onnx_startup(runtime_key, runtime_config, manifest):  # pylint: disable=unused-argument
+      raise RuntimeError("onnxruntime is not installed")
+
+    plugin._startup_hf_onnx_artifact = fail_onnx_startup  # pylint: disable=protected-access
+
+    plugin.startup()
+
+    self.assertEqual(plugin.hf_runtime, "pt")
+    self.assertEqual(plugin.hf_runtime_config, {})
+    self.assertIsNone(plugin.hf_artifact_manifest)
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 1)
+    self.assertTrue(
+      any("Falling back to Transformers/PT" in message[0][0] for message in plugin.logged_messages)
+    )
+
+  def test_forced_onnx_runtime_does_not_fallback_after_startup_failure(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      HF_RUNTIME="onnx",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    plugin._load_hf_artifact_manifest = lambda: {  # pylint: disable=protected-access
+      "runtimes": {
+        "onnx_fp32": {
+          "runtime": "onnxruntime",
+          "entrypoint": "onnxruntime.InferenceSession",
+          "files": ["model.onnx", "schema.json", "contract.py"],
+        }
+      },
+    }
+    plugin._startup_hf_onnx_artifact = (  # pylint: disable=protected-access
+      lambda runtime_key, runtime_config, manifest: (_ for _ in ()).throw(RuntimeError("bad onnx"))
+    )
+
+    with self.assertRaisesRegex(RuntimeError, "bad onnx"):
+      plugin.startup()
+
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 0)
+
+  def test_named_onnx_runtime_does_not_fallback_after_startup_failure(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      HF_RUNTIME="onnx_fp32",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    plugin._load_hf_artifact_manifest = lambda: {  # pylint: disable=protected-access
+      "runtimes": {
+        "onnx_fp32": {
+          "runtime": "onnxruntime",
+          "entrypoint": "onnxruntime.InferenceSession",
+          "files": ["model.onnx", "schema.json", "contract.py"],
+        }
+      },
+    }
+    plugin._startup_hf_onnx_artifact = (  # pylint: disable=protected-access
+      lambda runtime_key, runtime_config, manifest: (_ for _ in ()).throw(RuntimeError("bad named onnx"))
+    )
+
+    with self.assertRaisesRegex(RuntimeError, "bad named onnx"):
+      plugin.startup()
+
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 0)
+
+  def test_auto_runtime_falls_back_to_transformers_when_onnx_warmup_fails(self):
+    class _FailingWarmupPipeline:
+      task = "text-classification"
+      schema = {}
+
+      def __call__(self, text, **kwargs):  # pylint: disable=unused-argument
+        raise RuntimeError("onnx warmup failed")
+
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      PIPELINE_TASK="text-classification",
+    )
+    plugin._load_hf_artifact_manifest = lambda: {  # pylint: disable=protected-access
+      "runtimes": {
+        "onnx_fp32": {
+          "runtime": "onnxruntime",
+          "entrypoint": "onnxruntime.InferenceSession",
+          "files": ["model.onnx", "schema.json", "contract.py"],
+        }
+      },
+    }
+
+    def set_failing_pipeline(runtime_key, runtime_config, manifest):  # pylint: disable=unused-argument
+      plugin.classifier = _FailingWarmupPipeline()
+      return
+
+    plugin._startup_hf_onnx_artifact = set_failing_pipeline  # pylint: disable=protected-access
+
+    plugin.startup()
+
+    self.assertEqual(plugin.hf_runtime, "pt")
+    self.assertEqual(len(_PIPELINE_FACTORY.calls), 1)
+    self.assertEqual(_PIPELINE_FACTORY.instance.inference_calls[-1][0], "Warmup request.")
+    self.assertTrue(
+      any("Falling back to Transformers/PT" in message[0][0] for message in plugin.logged_messages)
+    )
+
+  def test_hf_contract_decoder_requires_global_trust_remote_code(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      TRUST_REMOTE_CODE=False,
+    )
+    plugin.hf_runtime = "onnx_fp32"
+
+    with TemporaryDirectory() as tmpdir:
+      model_dir = Path(tmpdir)
+      (model_dir / "contract.py").write_text(
+        "def decode_outputs(outputs, schema):\n  return outputs\n",
+        encoding="utf-8",
+      )
+
+      with self.assertRaisesRegex(ValueError, "TRUST_REMOTE_CODE=True"):
+        plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
+          model_dir=str(model_dir),
+          manifest={},
+          runtime_config={"decoder": "contract.py"},
+        )
+
+  def test_runtime_trust_remote_code_false_temporarily_inherits_global_trust(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      TRUST_REMOTE_CODE=True,
+    )
+    plugin.hf_runtime = "onnx_fp32"
+
+    with TemporaryDirectory() as tmpdir:
+      model_dir = Path(tmpdir)
+      (model_dir / "contract.py").write_text(
+        "def decode_outputs(outputs, schema):\n  return outputs\n",
+        encoding="utf-8",
+      )
+
+      decoder = plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
+        model_dir=str(model_dir),
+        manifest={},
+        runtime_config={"decoder": "contract.py", "trust_remote_code": False},
+      )
+
+      self.assertEqual(decoder({"ok": True}, {}), {"ok": True})
+
+  def test_missing_runtime_trust_remote_code_temporarily_inherits_global_trust(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      TRUST_REMOTE_CODE=True,
+    )
+    plugin.hf_runtime = "onnx_fp32"
+
+    with TemporaryDirectory() as tmpdir:
+      model_dir = Path(tmpdir)
+      (model_dir / "contract.py").write_text(
+        "def decode_outputs(outputs, schema):\n  return outputs\n",
+        encoding="utf-8",
+      )
+
+      decoder = plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
+        model_dir=str(model_dir),
+        manifest={},
+        runtime_config={"decoder": "contract.py"},
+      )
+
+      self.assertEqual(decoder({"ok": True}, {}), {"ok": True})
+
+  def test_hf_artifact_paths_must_stay_inside_snapshot(self):
+    plugin = _ConcreteHfModel(MODEL_NAME="test/model")
+    plugin.hf_runtime = "onnx_fp32"
+
+    with TemporaryDirectory() as tmpdir:
+      model_dir = Path(tmpdir)
+      (model_dir / "schema.json").write_text("{}", encoding="utf-8")
+
+      with self.assertRaisesRegex(ValueError, "escapes the model snapshot"):
+        plugin._load_hf_schema(  # pylint: disable=protected-access
+          model_dir=str(model_dir),
+          manifest={},
+          runtime_config={"schema": "../schema.json"},
+        )
+
+      with self.assertRaisesRegex(ValueError, "must be relative"):
+        plugin._load_hf_contract_decoder(  # pylint: disable=protected-access
+          model_dir=str(model_dir),
+          manifest={},
+          runtime_config={"decoder": str((model_dir / "contract.py").resolve())},
+        )
+
+      with self.assertRaisesRegex(ValueError, "escapes the model snapshot"):
+        plugin._resolve_hf_onnx_model_path(  # pylint: disable=protected-access
+          model_dir=str(model_dir),
+          runtime_key="onnx_fp32",
+          runtime_config={"model": "../model.onnx"},
+          schema={},
+        )
+
+      with self.assertRaisesRegex(ValueError, "escapes the model snapshot"):
+        plugin._resolve_hf_tokenizer_dir(  # pylint: disable=protected-access
+          model_dir=str(model_dir),
+          manifest={},
+          runtime_config={"tokenizer_dir": "../tokenizer"},
+          schema={},
+        )
+
+  def test_hf_artifact_paths_allow_snapshot_symlink_targets_outside_snapshot(self):
+    plugin = _ConcreteHfModel(MODEL_NAME="test/model")
+    plugin.hf_runtime = "onnx_fp32"
+
+    with TemporaryDirectory() as tmpdir:
+      root_dir = Path(tmpdir)
+      model_dir = root_dir / "snapshot"
+      blob_dir = root_dir / "blobs"
+      model_dir.mkdir()
+      blob_dir.mkdir()
+      (blob_dir / "schema.json").write_text('{"inputs": []}', encoding="utf-8")
+      (model_dir / "schema.json").symlink_to(blob_dir / "schema.json")
+
+      schema = plugin._load_hf_schema(  # pylint: disable=protected-access
+        model_dir=str(model_dir),
+        manifest={},
+        runtime_config={"schema": "schema.json"},
+      )
+
+      self.assertEqual(schema, {"inputs": []})
+
+  def test_onnx_tokenizer_remote_code_requires_global_trust_remote_code(self):
+    calls = []
+
+    class _FakeAutoTokenizer:
+      @staticmethod
+      def from_pretrained(model_dir, **kwargs):
+        calls.append((model_dir, kwargs))
+        return _FakeTokenizer()
+
+    fake_transformers = types.SimpleNamespace(AutoTokenizer=_FakeAutoTokenizer)
+    original_transformers = sys.modules.get("transformers")
+    sys.modules["transformers"] = fake_transformers
+    try:
+      plugin = _ConcreteHfModel(
+        MODEL_NAME="test/model",
+        DEVICE="cpu",
+        TRUST_REMOTE_CODE=False,
+      )
+      plugin._load_hf_onnx_tokenizer(  # pylint: disable=protected-access
+        model_dir="/tmp/model",
+        runtime_config={"trust_remote_code": True},
+      )
+
+      self.assertFalse(calls[-1][1]["trust_remote_code"])
+
+      plugin = _ConcreteHfModel(
+        MODEL_NAME="test/model",
+        DEVICE="cpu",
+        TRUST_REMOTE_CODE=True,
+      )
+      plugin._load_hf_onnx_tokenizer(  # pylint: disable=protected-access
+        model_dir="/tmp/model",
+        runtime_config={"trust_remote_code": True},
+      )
+
+      self.assertTrue(calls[-1][1]["trust_remote_code"])
+
+      plugin._load_hf_onnx_tokenizer(  # pylint: disable=protected-access
+        model_dir="/tmp/model",
+        runtime_config={"trust_remote_code": False},
+      )
+
+      self.assertFalse(calls[-1][1]["trust_remote_code"])
+    finally:
+      if original_transformers is None:
+        sys.modules.pop("transformers", None)
+      else:
+        sys.modules["transformers"] = original_transformers
+
+  def test_onnx_artifact_pipeline_uses_hf_contract_decoder(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    fake_tokenizer = _FakeTokenizer()
+    fake_session = _FakeOrtSession()
+    created_sessions = []
+    plugin._load_hf_onnx_tokenizer = (  # pylint: disable=protected-access
+      lambda model_dir, runtime_config, manifest=None: fake_tokenizer
+    )
+
+    def fake_create_session(model_path, providers):
+      created_sessions.append((model_path, providers))
+      return fake_session
+
+    plugin._create_hf_onnx_session = fake_create_session  # pylint: disable=protected-access
+
+    with TemporaryDirectory() as tmpdir:
+      model_dir = Path(tmpdir)
+      (model_dir / "model.onnx").write_text("fake", encoding="utf-8")
+      (model_dir / "schema.json").write_text(
+        (
+          '{"inputs":[{"name":"input_ids","dtype":"int64"},'
+          '{"name":"attention_mask","dtype":"int64"}],'
+          '"outputs":[{"name":"scores"}],'
+          '"tokenizer_kwargs":{"return_offsets_mapping":true},'
+          '"models":{"onnx_fp32":{"path":"model.onnx"}}}'
+        ),
+        encoding="utf-8",
+      )
+      (model_dir / "contract.py").write_text(
+        (
+          "def decode_generic_outputs(outputs, schema, aggregation_strategy=None, inference_kwargs=None, **kwargs):\n"
+          "  return {\n"
+          "    'contract': 'hf',\n"
+          "    'outputs': outputs,\n"
+          "    'repo_id': kwargs.get('repo_id'),\n"
+          "    'runtime': kwargs.get('runtime_key'),\n"
+          "    'aggregation_strategy': aggregation_strategy,\n"
+          "    'inference_kwargs': inference_kwargs,\n"
+          "  }\n"
+        ),
+        encoding="utf-8",
+      )
+      manifest = {
+        "pipeline_task": "text-classification",
+        "runtimes": {
+          "onnx_fp32": {
+            "runtime": "onnxruntime",
+            "trust_remote_code": True,
+            "files": ["model.onnx", "schema.json", "contract.py"],
+          }
+        },
+      }
+
+      pipeline = plugin._build_hf_onnx_artifact_pipeline(  # pylint: disable=protected-access
+        model_dir=str(model_dir),
+        runtime_key="onnx_fp32",
+        runtime_config=manifest["runtimes"]["onnx_fp32"],
+        manifest=manifest,
+      )
+      result = pipeline("hello world", aggregation_strategy="simple", threshold=0.7)
+      batched_single_result = pipeline(["hello world"])
+
+    self.assertIsInstance(pipeline, HfOnnxArtifactPipeline)
+    self.assertEqual(result["contract"], "hf")
+    self.assertEqual(batched_single_result["contract"], "hf")
+    self.assertEqual(result["outputs"], {"scores": [0.25, 0.75]})
+    self.assertEqual(result["repo_id"], "test/model")
+    self.assertEqual(result["runtime"], "onnx_fp32")
+    self.assertEqual(result["aggregation_strategy"], "simple")
+    self.assertEqual(result["inference_kwargs"]["threshold"], 0.7)
+    self.assertEqual(Path(created_sessions[0][0]).name, "model.onnx")
+    output_names, inputs = fake_session.calls[-1]
+    self.assertEqual(output_names, ["scores"])
+    self.assertEqual(inputs["input_ids"].dtype, "int64")
+    self.assertEqual(fake_tokenizer.calls[-1][1]["return_tensors"], "np")
+    self.assertTrue(fake_tokenizer.calls[-1][1]["return_offsets_mapping"])
+
+  def test_onnx_artifact_pipeline_materializes_symlinked_external_data(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      DEVICE="cpu",
+      TRUST_REMOTE_CODE=True,
+      PIPELINE_TASK="text-classification",
+      WARMUP_ENABLED=False,
+    )
+    fake_tokenizer = _FakeTokenizer()
+    fake_session = _FakeOrtSession()
+    created_sessions = []
+    plugin._load_hf_onnx_tokenizer = (  # pylint: disable=protected-access
+      lambda model_dir, runtime_config, manifest=None: fake_tokenizer
+    )
+    plugin._create_hf_onnx_session = (  # pylint: disable=protected-access
+      lambda model_path, providers: created_sessions.append((Path(model_path), providers)) or fake_session
+    )
+
+    with TemporaryDirectory() as tmpdir:
+      root_dir = Path(tmpdir)
+      model_dir = root_dir / "snapshot"
+      blob_dir = root_dir / "blobs"
+      cache_dir = root_dir / "models-cache"
+      onnx_dir = model_dir / "onnx"
+      blob_dir.mkdir(parents=True)
+      onnx_dir.mkdir(parents=True)
+      cache_dir.mkdir()
+      plugin.log.get_models_folder = lambda: str(cache_dir)
+      (blob_dir / "model.onnx").write_text("onnx", encoding="utf-8")
+      (blob_dir / "model.onnx_data").write_text("weights", encoding="utf-8")
+      (onnx_dir / "model.onnx").symlink_to(blob_dir / "model.onnx")
+      (onnx_dir / "model.onnx_data").symlink_to(blob_dir / "model.onnx_data")
+      (model_dir / "schema.json").write_text(
+        '{"outputs":[{"name":"scores"}],"models":{"onnx_fp32":{"path":"onnx/model.onnx"}}}',
+        encoding="utf-8",
+      )
+      (model_dir / "contract.py").write_text(
+        "def decode_outputs(outputs, schema, **kwargs):\n  return outputs\n",
+        encoding="utf-8",
+      )
+      manifest = {
+        "pipeline_task": "text-classification",
+        "runtimes": {
+          "onnx_fp32": {
+            "runtime": "onnxruntime",
+            "trust_remote_code": False,
+            "files": [
+              "onnx/model.onnx",
+              "onnx/model.onnx_data",
+              "schema.json",
+              "contract.py",
+            ],
+          }
+        },
+      }
+
+      plugin._build_hf_onnx_artifact_pipeline(  # pylint: disable=protected-access
+        model_dir=str(model_dir),
+        runtime_key="onnx_fp32",
+        runtime_config=manifest["runtimes"]["onnx_fp32"],
+        manifest=manifest,
+      )
+
+      materialized_model_path = created_sessions[0][0]
+      materialized_sidecar_path = materialized_model_path.parent / "model.onnx_data"
+      self.assertTrue(materialized_model_path.exists())
+      self.assertTrue(materialized_sidecar_path.exists())
+      self.assertFalse(materialized_model_path.is_symlink())
+      self.assertFalse(materialized_sidecar_path.is_symlink())
+      self.assertEqual(materialized_sidecar_path.read_text(encoding="utf-8"), "weights")
+      self.assertIn("_onnx_materialized", str(materialized_model_path))
 
 
 if __name__ == "__main__":

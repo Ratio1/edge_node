@@ -55,6 +55,11 @@ class PrivacyFilterInferenceApiPluginTests(unittest.TestCase):
         "FINDINGS_COUNT": 1,
         "MODEL_NAME": "openai/privacy-filter",
         "PIPELINE_TASK": "token-classification",
+        "MODEL": {"model_key": "privacy_filter", "model_version": "2026.05.09"},
+        "MODEL_VERSION": "2026.05.09",
+        "MODEL_REVISION": "rev-privacy",
+        "HF_RUNTIME": "pt",
+        "RUNTIME": "transformers",
       },
       metadata={},
       request_data={"metadata": {}, "parameters": {"text": "example text"}},
@@ -73,6 +78,14 @@ class PrivacyFilterInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(result_payload["findings_count"], 1)
     self.assertEqual(result_payload["model_name"], "openai/privacy-filter")
     self.assertEqual(result_payload["pipeline_task"], "token-classification")
+    self.assertEqual(
+      result_payload["model"],
+      {"model_key": "privacy_filter", "model_version": "2026.05.09"},
+    )
+    self.assertEqual(result_payload["model_version"], "2026.05.09")
+    self.assertEqual(result_payload["model_revision"], "rev-privacy")
+    self.assertEqual(result_payload["hf_runtime"], "pt")
+    self.assertEqual(result_payload["runtime"], "transformers")
 
 
 if __name__ == "__main__":

@@ -152,6 +152,33 @@ class TextClassifierInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(result_payload["model_name"], "openai/privacy-filter")
     self.assertEqual(result_payload["pipeline_task"], "token-classification")
 
+  def test_build_result_from_inference_preserves_runtime_model_metadata(self):
+    plugin = TextClassifierInferenceApiPlugin()
+
+    result_payload = plugin._build_result_from_inference(  # pylint: disable=protected-access
+      request_id="req-onnx",
+      inference={
+        "REQUEST_ID": "req-onnx",
+        "TEXT": "example text",
+        "result": {"prediction": "safe"},
+        "MODEL": {"key": "generic_text_classifier", "version": "2026.05.09"},
+        "MODEL_VERSION": "2026.05.09",
+        "HF_RUNTIME": "onnx_fp32",
+        "RUNTIME": "onnxruntime",
+      },
+      metadata={},
+      request_data={"metadata": {}, "parameters": {"text": "example text"}},
+    )
+
+    self.assertEqual(result_payload["classification"], {"prediction": "safe"})
+    self.assertEqual(
+      result_payload["model"],
+      {"key": "generic_text_classifier", "version": "2026.05.09"},
+    )
+    self.assertEqual(result_payload["model_version"], "2026.05.09")
+    self.assertEqual(result_payload["hf_runtime"], "onnx_fp32")
+    self.assertEqual(result_payload["runtime"], "onnxruntime")
+
   def test_handle_inferences_falls_back_to_payload_request_id(self):
     plugin = TextClassifierInferenceApiPlugin()
     plugin._requests = {"req-1": {"status": "pending"}}  # pylint: disable=protected-access
