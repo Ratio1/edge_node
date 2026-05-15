@@ -8,6 +8,41 @@ from unittest.mock import MagicMock
 import numpy as _np
 
 
+def install_docker_stub_if_needed():
+  """Provide the tiny docker-py surface these unit tests need."""
+  if "docker" in sys.modules and "docker.errors" in sys.modules and "docker.types" in sys.modules:
+    return
+
+  docker_mod = types.ModuleType("docker")
+  errors_mod = types.ModuleType("docker.errors")
+  types_mod = types.ModuleType("docker.types")
+
+  class DockerException(Exception):
+    pass
+
+  class NotFound(DockerException):
+    pass
+
+  class DeviceRequest:
+    def __init__(self, **kwargs):
+      self.kwargs = kwargs
+
+  errors_mod.DockerException = DockerException
+  errors_mod.NotFound = NotFound
+  types_mod.DeviceRequest = DeviceRequest
+  docker_mod.errors = errors_mod
+  docker_mod.types = types_mod
+  docker_mod.from_env = MagicMock()
+
+  sys.modules.setdefault("docker", docker_mod)
+  sys.modules.setdefault("docker.errors", errors_mod)
+  sys.modules.setdefault("docker.types", types_mod)
+  return
+
+
+install_docker_stub_if_needed()
+
+
 class _DummyBasePlugin:
   CONFIG = {'VALIDATION_RULES': {}}
 
@@ -210,6 +245,7 @@ def make_container_app_runner():
   plugin.cfg_extra_tunnels_ping_interval = 30
   plugin.cfg_health_check = {}
   plugin.cfg_restart_policy = "always"
+  plugin.cfg_plugin_stop_timeout = 45
   plugin.volumes = {}
   plugin.extra_ports_mapping = {}
   plugin.inverted_ports_mapping = {}
@@ -225,6 +261,8 @@ def make_container_app_runner():
   plugin._health_probing_disabled = False
   plugin._normalized_exposed_ports = {}
   plugin._normalized_main_exposed_port = None
+  plugin._cleanup_failed = False
+  plugin._manual_stop_pending = False
   plugin.container = object()
   plugin.container_name = "car_instance"
   plugin.log = types.SimpleNamespace(get_localhost_ip=lambda: "127.0.0.1")
@@ -328,6 +366,8 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
   # State machine
   plugin.container_state = ContainerState.UNINITIALIZED
   plugin.stop_reason = StopReason.UNKNOWN
+  plugin._cleanup_failed = False
+  plugin._manual_stop_pending = False
 
   # Restart/backoff
   plugin._consecutive_failures = 0
@@ -371,6 +411,7 @@ def make_lifecycle_runner(docker_client=None, mock_container=None, **cfg_overrid
   plugin._last_extra_tunnels_ping = 0
   plugin._last_paused_log = 0
   plugin.cfg_paused_state_log_interval = 60
+  plugin.cfg_plugin_stop_timeout = 45
   plugin.cfg_show_log_each = 60
   plugin.cfg_show_log_last_lines = 5
   plugin.cfg_semaphore_log_interval = 10
