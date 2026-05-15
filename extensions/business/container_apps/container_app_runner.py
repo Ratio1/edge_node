@@ -2030,7 +2030,10 @@ class ContainerAppRunnerPlugin(
     for container_port in list(self.extra_tunnel_processes.keys()):
       result = self._stop_extra_tunnel(container_port) and result
 
-    self.P("All extra tunnels stopped")
+    if result:
+      self.P("All extra tunnels stopped", color='g')
+    else:
+      self.P("One or more extra tunnels failed to stop; preserving live handles for retry.", color='r')
     return result
 
 

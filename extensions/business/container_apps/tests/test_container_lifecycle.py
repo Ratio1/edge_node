@@ -22,6 +22,7 @@ import docker.errors
 import docker.types
 
 from extensions.business.container_apps.tests.support import (
+  make_container_app_runner,
   make_lifecycle_runner,
   make_mock_container,
   make_mock_docker_client,
@@ -223,6 +224,27 @@ class TestLifecycleRunning(unittest.TestCase):
     plugin, _, _ = make_lifecycle_runner()
     plugin.container = None
     self.assertFalse(plugin._check_container_status())
+
+
+class TestExtraTunnelCleanup(unittest.TestCase):
+
+  def test_stop_extra_tunnels_logs_failure_when_any_tunnel_fails(self):
+    plugin = make_container_app_runner()
+    plugin.extra_tunnel_processes = {
+      8001: object(),
+      8002: object(),
+    }
+    plugin._stop_extra_tunnel = MagicMock(side_effect=[False, True])
+
+    result = plugin.stop_extra_tunnels()
+
+    self.assertFalse(result)
+    self.assertEqual(plugin._stop_extra_tunnel.call_count, 2)
+    self.assertIn(
+      "One or more extra tunnels failed to stop",
+      plugin.logged_messages[-1],
+    )
+    self.assertNotIn("All extra tunnels stopped", plugin.logged_messages[-1])
 
 
 # ===========================================================================
