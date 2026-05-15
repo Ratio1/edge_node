@@ -48,6 +48,33 @@ def _log(logger: Optional[Callable], level: str, message: str) -> None:
     print(f"[FixedVolume] [{level}] {message}", flush=True)
 
 
+def _decode_proc_mount_field(value: str) -> str:
+  """Decode the octal escapes used by /proc/mounts fields."""
+  return (value.replace("\\040", " ")
+               .replace("\\011", "\t")
+               .replace("\\012", "\n")
+               .replace("\\134", "\\"))
+
+
+def _get_mount_source(mount_path) -> Optional[str]:
+  """Return the exact source device mounted at ``mount_path``, if any."""
+  try:
+    with open("/proc/mounts", "r", encoding="utf-8") as f:
+      lines = f.readlines()
+  except OSError:
+    return None
+  target = str(mount_path).rstrip("/")
+  for line in lines:
+    parts = line.split()
+    if len(parts) < 2:
+      continue
+    source = _decode_proc_mount_field(parts[0])
+    mp = _decode_proc_mount_field(parts[1])
+    if mp.rstrip("/") == target:
+      return source
+  return None
+
+
 def _is_path_mounted(mount_path) -> bool:
   """Return True iff `mount_path` is an exact mountpoint in /proc/mounts.
 
@@ -72,11 +99,7 @@ def _is_path_mounted(mount_path) -> bool:
     parts = line.split()
     if len(parts) < 2:
       continue
-    mp = parts[1]
-    mp = (mp.replace("\\040", " ")
-            .replace("\\011", "\t")
-            .replace("\\012", "\n")
-            .replace("\\134", "\\"))
+    mp = _decode_proc_mount_field(parts[1])
     if mp.rstrip("/") == target:
       return True
   return False
@@ -400,16 +423,53 @@ def cleanup(
   )
   result = True
   loop_dev = None
+  metadata_error = False
   if vol.meta_path.exists():
     try:
       meta = json.loads(vol.meta_path.read_text(encoding="utf-8"))
       loop_dev = meta.get("loop_dev")
       _log(logger, "INFO", f"Loaded metadata loop_dev={loop_dev}")
     except Exception as exc:
-      result = False
+      metadata_error = True
       _log(logger, "WARN", f"Failed to read metadata error={exc}")
 
-  if _is_path_mounted(vol.mount_path):
+  mount_source = _get_mount_source(vol.mount_path)
+  mount_source_is_loop = mount_source and str(mount_source).startswith("/dev/loop")
+  if mount_source_is_loop and loop_dev is None:
+    # A mounted loop source is a stronger identity than the sidecar metadata:
+    # it lets us unmount and detach safely even when metadata was lost/corrupt.
+    loop_dev = mount_source
+    metadata_error = False
+    _log(logger, "WARN", f"Recovered loop device from /proc/mounts loop_dev={loop_dev}")
+  elif mount_source_is_loop and loop_dev != mount_source:
+    # Metadata can be stale after interrupted cleanup/restart. The mounted
+    # source is the device that must be detached after unmount, so prefer it.
+    _log(
+      logger, "WARN",
+      f"Metadata loop_dev={loop_dev} differs from mounted source={mount_source}; using mounted source.",
+    )
+    loop_dev = mount_source
+  elif mount_source and loop_dev is None:
+    # A mounted path without a positive loop-device identity must not be
+    # reported as a clean fixed-volume teardown; callers need to retain it for
+    # operator inspection/retry instead of dropping cleanup tracking.
+    result = False
+    _log(logger, "WARN", f"Mounted path has no loop metadata source={mount_source}")
+  elif mount_source:
+    # A fixed-size volume should be mounted from a loop device. If /proc/mounts
+    # says otherwise, fail closed instead of detaching a possibly unrelated
+    # metadata loop device and reporting success.
+    result = False
+    _log(
+      logger, "WARN",
+      f"Mounted path source is not a loop device source={mount_source}; refusing metadata loop detach.",
+    )
+    loop_dev = None
+
+  if metadata_error:
+    result = False
+
+  if mount_source is not None:
     try:
       _run(["umount", str(vol.mount_path)], logger=logger)
     except Exception as exc:

@@ -251,6 +251,67 @@ class TestCleanup(unittest.TestCase):
     cleanup(vol)
 
   @patch("extensions.business.container_apps.fixed_volume._run")
+  def test_missing_metadata_with_mounted_path_reports_failure(self, mock_run):
+    vol = FixedVolume(name="data", size="100M", root=Path("/r"))
+    proc = f"/dev/sdb1 {vol.mount_path} ext4 rw 0 0\n"
+    with patch.object(Path, "exists", return_value=False), \
+         patch("builtins.open", mock_open(read_data=proc)):
+      result = cleanup(vol)
+    self.assertFalse(result)
+    mock_run.assert_called_once_with(["umount", str(vol.mount_path)], logger=None)
+
+  @patch("extensions.business.container_apps.fixed_volume._run")
+  def test_missing_metadata_with_loop_mount_recovers_and_detaches(self, mock_run):
+    vol = FixedVolume(name="data", size="100M", root=Path("/r"))
+    with patch.object(Path, "exists", return_value=False), \
+         patch("extensions.business.container_apps.fixed_volume._get_mount_source", return_value="/dev/loop7"), \
+         patch("extensions.business.container_apps.fixed_volume._is_path_mounted", return_value=False):
+      result = cleanup(vol)
+    self.assertTrue(result)
+    self.assertEqual(
+      [call_args.args[0] for call_args in mock_run.call_args_list],
+      [["umount", str(vol.mount_path)], ["losetup", "-d", "/dev/loop7"]],
+    )
+
+  @patch("extensions.business.container_apps.fixed_volume._run")
+  def test_malformed_metadata_reports_failure(self, mock_run):
+    vol = FixedVolume(name="data", size="100M", root=Path("/r"))
+    with patch.object(Path, "exists", return_value=True), \
+         patch.object(Path, "read_text", return_value="{not-json"), \
+         patch("builtins.open", mock_open(read_data="")):
+      result = cleanup(vol)
+    self.assertFalse(result)
+
+  @patch("extensions.business.container_apps.fixed_volume._run")
+  def test_malformed_metadata_with_loop_mount_recovers_and_detaches(self, mock_run):
+    vol = FixedVolume(name="data", size="100M", root=Path("/r"))
+    with patch.object(Path, "exists", return_value=True), \
+         patch.object(Path, "read_text", return_value="{not-json"), \
+         patch("extensions.business.container_apps.fixed_volume._get_mount_source", return_value="/dev/loop9"), \
+         patch("extensions.business.container_apps.fixed_volume._is_path_mounted", return_value=False):
+      result = cleanup(vol)
+    self.assertTrue(result)
+    self.assertEqual(
+      [call_args.args[0] for call_args in mock_run.call_args_list],
+      [["umount", str(vol.mount_path)], ["losetup", "-d", "/dev/loop9"]],
+    )
+
+  @patch("extensions.business.container_apps.fixed_volume._run")
+  def test_mounted_loop_source_overrides_stale_metadata_loop(self, mock_run):
+    vol = FixedVolume(name="data", size="100M", root=Path("/r"))
+    meta = {"loop_dev": "/dev/loop3"}
+    with patch.object(Path, "exists", return_value=True), \
+         patch.object(Path, "read_text", return_value=json.dumps(meta)), \
+         patch("extensions.business.container_apps.fixed_volume._get_mount_source", return_value="/dev/loop7"), \
+         patch("extensions.business.container_apps.fixed_volume._is_path_mounted", return_value=False):
+      result = cleanup(vol)
+    self.assertTrue(result)
+    self.assertEqual(
+      [call_args.args[0] for call_args in mock_run.call_args_list],
+      [["umount", str(vol.mount_path)], ["losetup", "-d", "/dev/loop7"]],
+    )
+
+  @patch("extensions.business.container_apps.fixed_volume._run")
   def test_handles_umount_failure(self, mock_run):
     vol = FixedVolume(name="data", size="100M", root=Path("/tmp/fv"))
     meta = {"loop_dev": "/dev/loop3"}
@@ -432,7 +493,18 @@ class TestCleanupFixedSizeVolumes(unittest.TestCase):
     self.assertEqual(plugin._fixed_volumes, [])
 
   @patch("extensions.business.container_apps.fixed_volume.cleanup",
-         side_effect=[Exception("fail"), None])
+         side_effect=[False, True])
+  def test_retains_volume_when_cleanup_returns_false(self, mock_cleanup):
+    plugin = make_container_app_runner()
+    vol1 = FixedVolume(name="a", size="50M", root=Path("/r"))
+    vol2 = FixedVolume(name="b", size="50M", root=Path("/r"))
+    plugin._fixed_volumes = [vol1, vol2]
+    self.assertFalse(plugin._cleanup_fixed_size_volumes())
+    self.assertEqual(mock_cleanup.call_count, 2)
+    self.assertEqual(plugin._fixed_volumes, [vol1])
+
+  @patch("extensions.business.container_apps.fixed_volume.cleanup",
+         side_effect=[Exception("fail"), True])
   def test_continues_on_failure(self, mock_cleanup):
     plugin = make_container_app_runner()
     vol1 = FixedVolume(name="a", size="50M", root=Path("/r"))
@@ -440,7 +512,7 @@ class TestCleanupFixedSizeVolumes(unittest.TestCase):
     plugin._fixed_volumes = [vol1, vol2]
     plugin._cleanup_fixed_size_volumes()  # should not raise
     self.assertEqual(mock_cleanup.call_count, 2)
-    self.assertEqual(plugin._fixed_volumes, [])
+    self.assertEqual(plugin._fixed_volumes, [vol1])
 
 
 if __name__ == "__main__":

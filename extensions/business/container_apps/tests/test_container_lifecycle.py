@@ -10,8 +10,13 @@ docker.from_env()) must patch the docker module to return the mock client.
 """
 
 import unittest
+import subprocess
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+
+from extensions.business.container_apps.tests.support import install_docker_stub_if_needed
+
+install_docker_stub_if_needed()
 
 import docker.errors
 import docker.types
@@ -468,6 +473,107 @@ class TestLifecycleProcess(unittest.TestCase):
     errors = [m for m in plugin.logged_messages if "abandoned" in m.lower()]
     self.assertTrue(len(errors) > 0)
 
+  def test_process_retries_failed_cleanup_then_restarts(self):
+    """A transient cleanup failure must not permanently block process()."""
+    clock = {"now": 100}
+    plugin, client, _ = make_lifecycle_runner(cfg_restart_backoff_initial=0)
+    plugin.time = lambda: clock["now"]
+    plugin._cleanup_failed = True
+    plugin.container_state = ContainerState.FAILED
+
+    attempts = {"count": 0}
+
+    def retry_cleanup():
+      attempts["count"] += 1
+      plugin._cleanup_failed = attempts["count"] == 1
+      return not plugin._cleanup_failed
+
+    plugin._stop_container_and_save_logs_to_disk = retry_cleanup
+
+    plugin.process()
+    self.assertTrue(plugin._cleanup_failed)
+    client.containers.run.assert_not_called()
+
+    with _patch_docker_module(client):
+      plugin.process()
+
+    self.assertFalse(plugin._cleanup_failed)
+    client.containers.run.assert_called_once()
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+  def test_manual_stop_persists_only_after_cleanup_success(self):
+    plugin, _, _ = make_lifecycle_runner(cfg_restart_backoff_initial=0)
+    plugin._save_persistent_state = MagicMock()
+    plugin._clear_manual_stop_state = MagicMock()
+    plugin._stop_container_and_save_logs_to_disk = MagicMock(return_value=False)
+
+    plugin.on_command("STOP")
+
+    plugin._save_persistent_state.assert_not_called()
+    plugin._clear_manual_stop_state.assert_called_once()
+    self.assertTrue(plugin._manual_stop_pending)
+    self.assertEqual(plugin.container_state, ContainerState.FAILED)
+
+  def test_pending_manual_stop_pauses_after_cleanup_retry_success(self):
+    plugin, client, _ = make_lifecycle_runner(cfg_restart_backoff_initial=0)
+    plugin._cleanup_failed = True
+    plugin._manual_stop_pending = True
+    plugin.container_state = ContainerState.FAILED
+    plugin._save_persistent_state = MagicMock()
+    plugin._stop_container_and_save_logs_to_disk = MagicMock(return_value=True)
+
+    plugin.process()
+
+    plugin._save_persistent_state.assert_called_once_with(manually_stopped=True)
+    client.containers.run.assert_not_called()
+    self.assertFalse(plugin._manual_stop_pending)
+    self.assertEqual(plugin.container_state, ContainerState.PAUSED)
+
+  def test_restart_clears_pending_manual_stop_before_cleanup_retry(self):
+    plugin, client, _ = make_lifecycle_runner(cfg_restart_backoff_initial=0)
+    plugin._manual_stop_pending = True
+    plugin._cleanup_failed = True
+    plugin._save_persistent_state = MagicMock()
+    plugin._clear_manual_stop_state = MagicMock()
+    attempts = {"count": 0}
+
+    def cleanup():
+      attempts["count"] += 1
+      plugin._cleanup_failed = attempts["count"] == 1
+      return not plugin._cleanup_failed
+
+    plugin._stop_container_and_save_logs_to_disk = cleanup
+
+    plugin.on_command("RESTART")
+
+    plugin._clear_manual_stop_state.assert_called_once()
+    plugin._save_persistent_state.assert_not_called()
+    self.assertFalse(plugin._manual_stop_pending)
+    self.assertTrue(plugin._cleanup_failed)
+
+    with _patch_docker_module(client):
+      plugin.process()
+
+    plugin._save_persistent_state.assert_not_called()
+    self.assertFalse(plugin._cleanup_failed)
+    self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+  def test_config_restart_respects_pending_manual_stop_cleanup(self):
+    plugin, _, _ = make_lifecycle_runner(cfg_restart_backoff_initial=0)
+    plugin._manual_stop_pending = True
+    plugin._cleanup_failed = True
+    plugin._save_persistent_state = MagicMock()
+    plugin._stop_container_and_save_logs_to_disk = MagicMock(return_value=True)
+    restart_callable = MagicMock()
+
+    plugin._handle_config_restart(restart_callable)
+
+    restart_callable.assert_not_called()
+    plugin._save_persistent_state.assert_called_once_with(manually_stopped=True)
+    self.assertFalse(plugin._manual_stop_pending)
+    self.assertFalse(plugin._cleanup_failed)
+    self.assertEqual(plugin.container_state, ContainerState.PAUSED)
+
   def test_process_multiple_iterations_running(self):
     """Multiple process() calls with a healthy container should all succeed."""
     plugin, _, container = make_lifecycle_runner()
@@ -478,6 +584,45 @@ class TestLifecycleProcess(unittest.TestCase):
       plugin.process()
 
     self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+
+class _FakeProcess:
+  def __init__(self):
+    self.terminated = False
+    self.killed = False
+    self.wait_calls = 0
+
+  def poll(self):
+    return 0 if self.killed else None
+
+  def terminate(self):
+    self.terminated = True
+    return
+
+  def kill(self):
+    self.killed = True
+    return
+
+  def wait(self, timeout=None):
+    self.wait_calls += 1
+    if self.wait_calls == 1:
+      raise subprocess.TimeoutExpired(cmd="fake", timeout=timeout)
+    self.killed = True
+    return 0
+
+
+class TestTunnelCompatibilityFallbacks(unittest.TestCase):
+  """The edge PR must work even before the matching core PR is deployed."""
+
+  def test_local_subprocess_termination_fallback_without_core_helper(self):
+    plugin, _, _ = make_lifecycle_runner()
+    process = _FakeProcess()
+
+    with patch("extensions.business.container_apps.container_app_runner.os.name", "nt"):
+      self.assertTrue(plugin._terminate_subprocess_tree(process, terminate_timeout=0, kill_timeout=0))
+
+    self.assertTrue(process.terminated)
+    self.assertTrue(process.killed)
 
 
 # ===========================================================================
