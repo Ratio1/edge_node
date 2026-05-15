@@ -191,6 +191,124 @@ def purge_job(owner, job_id: str):
   return {"status": "success", "job_id": job_id, "cids_deleted": deleted, "cids_total": len(cids)}
 
 
+def purge_all_jobs(owner):
+  """
+  Purge every RedMesh job on this edge node: stop running jobs, delete all
+  R1FS artifacts, tombstone CStore records, and sweep orphan rows in the
+  live progress / triage / triage audit hashes.
+
+  Preserves the single-job partial-failure contract: any job whose purge
+  returned ``partial``/``error`` keeps its CStore rows intact so the operator
+  can retry artifact deletion later.
+  """
+  raw_jobs = _job_repo(owner).list_jobs() or {}
+  job_ids = [jid for jid, payload in raw_jobs.items() if isinstance(jid, str) and isinstance(payload, dict)]
+
+  jobs_total = len(job_ids)
+  jobs_succeeded = 0
+  jobs_failed = 0
+  cids_deleted = 0
+  cids_failed = 0
+  failed_job_ids = set()
+  errors = []
+
+  for job_id in job_ids:
+    try:
+      result = owner.stop_and_delete_job(job_id)
+    except Exception as exc:
+      jobs_failed += 1
+      failed_job_ids.add(job_id)
+      errors.append({"job_id": job_id, "message": f"{type(exc).__name__}: {exc}"})
+      owner.P(f"[PURGE_ALL] stop_and_delete_job({job_id}) raised: {exc}", color='r')
+      continue
+
+    if not isinstance(result, dict):
+      jobs_failed += 1
+      failed_job_ids.add(job_id)
+      errors.append({"job_id": job_id, "message": f"unexpected non-dict response: {type(result).__name__}"})
+      continue
+
+    status = result.get("status")
+    cids_deleted += int(result.get("cids_deleted", 0) or 0)
+    cids_failed += int(result.get("cids_failed", 0) or 0)
+
+    if status == "success":
+      jobs_succeeded += 1
+    else:
+      jobs_failed += 1
+      failed_job_ids.add(job_id)
+      errors.append({
+        "job_id": job_id,
+        "message": result.get("message") or f"purge returned status={status!r}",
+      })
+
+  cfg_instance_id = owner.cfg_instance_id
+  live_hkey = f"{cfg_instance_id}:live"
+  triage_hkey = f"{cfg_instance_id}:triage"
+  triage_audit_hkey = f"{cfg_instance_id}:triage:audit"
+
+  def _job_id_from_compound_key(key):
+    if not isinstance(key, str):
+      return None
+    return key.split(":", 1)[0]
+
+  def _sweep_hash(hkey, expected_value_types):
+    rows = owner.chainstore_hgetall(hkey=hkey)
+    if not isinstance(rows, dict):
+      return
+    for key, value in list(rows.items()):
+      if not isinstance(key, str):
+        continue
+      if expected_value_types is not None and not isinstance(value, expected_value_types):
+        continue
+      job_id_prefix = _job_id_from_compound_key(key)
+      if job_id_prefix and job_id_prefix in failed_job_ids:
+        continue
+      try:
+        owner.chainstore_hset(hkey=hkey, key=key, value=None)
+      except Exception as exc:
+        owner.P(f"[PURGE_ALL] failed to tombstone {hkey}/{key}: {exc}", color='r')
+        errors.append({"job_id": job_id_prefix or "", "scope": hkey, "message": f"{type(exc).__name__}: {exc}"})
+
+  _sweep_hash(live_hkey, dict)
+  _sweep_hash(triage_hkey, dict)
+  _sweep_hash(triage_audit_hkey, list)
+
+  surviving = owner.chainstore_hgetall(hkey=cfg_instance_id)
+  if isinstance(surviving, dict):
+    for key, value in list(surviving.items()):
+      if not isinstance(key, str) or not isinstance(value, dict):
+        continue
+      if key in failed_job_ids:
+        continue
+      try:
+        owner.chainstore_hset(hkey=cfg_instance_id, key=key, value=None)
+      except Exception as exc:
+        owner.P(f"[PURGE_ALL] failed to tombstone job record {key}: {exc}", color='r')
+        errors.append({"job_id": key, "scope": cfg_instance_id, "message": f"{type(exc).__name__}: {exc}"})
+
+  status = "success" if jobs_failed == 0 and cids_failed == 0 else "partial"
+
+  owner._log_audit_event("all_data_purged", {
+    "jobs_total": jobs_total,
+    "jobs_succeeded": jobs_succeeded,
+    "jobs_failed": jobs_failed,
+    "cids_deleted": cids_deleted,
+    "cids_failed": cids_failed,
+  })
+  owner.P(f"[PURGE_ALL] {jobs_succeeded}/{jobs_total} jobs purged, {cids_deleted} CIDs deleted, {cids_failed} CIDs failed.")
+
+  return {
+    "status": status,
+    "jobs_total": jobs_total,
+    "jobs_succeeded": jobs_succeeded,
+    "jobs_failed": jobs_failed,
+    "cids_deleted": cids_deleted,
+    "cids_failed": cids_failed,
+    "errors": errors,
+  }
+
+
 def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
   """
   Stop a job (any run mode with HARD stop, continuous-only for SOFT stop).
