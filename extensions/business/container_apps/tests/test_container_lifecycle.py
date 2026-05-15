@@ -27,9 +27,11 @@ from extensions.business.container_apps.tests.support import (
   make_mock_docker_client,
 )
 from extensions.business.container_apps.container_app_runner import (
+  ContainerAppRunnerPlugin,
   ContainerState,
   StopReason,
 )
+from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
 
 
 def _patch_docker_module(client):
@@ -42,6 +44,21 @@ def _patch_docker_module(client):
     'extensions.business.container_apps.container_app_runner.docker',
     mock_docker,
   )
+
+
+class _JoinableThread:
+  def __init__(self):
+    self.join_calls = 0
+    self.join_timeout = None
+    self._alive = True
+
+  def is_alive(self):
+    return self._alive
+
+  def join(self, timeout=None):
+    self.join_calls += 1
+    self.join_timeout = timeout
+    self._alive = False
 
 
 # ===========================================================================
@@ -298,6 +315,51 @@ class TestLifecycleRestart(unittest.TestCase):
     # See test_container_receives_deterministic_name for the naming rule.
     self.assertEqual(kwargs["name"], "car_test_stream_car_instance")
 
+  def test_restart_revalidates_sync_config_before_start(self):
+    plugin, client, _ = self._launch_and_crash()
+    plugin.cfg_sync = {"ENABLED": True, "KEY": "", "TYPE": "provider"}
+    plugin._sync_unavailable = False
+    new_container = make_mock_container()
+    client.containers.run.return_value = new_container
+
+    with _patch_docker_module(client), \
+         patch.object(plugin, "_configure_system_volume"), \
+         patch.object(plugin, "_recover_stale_processing"), \
+         patch.object(plugin, "_validate_sync_config", wraps=plugin._validate_sync_config) as validate:
+      plugin._restart_container(StopReason.CRASH)
+
+    validate.assert_called()
+    self.assertFalse(plugin.cfg_sync["ENABLED"])
+
+
+class TestWorkerAppRunnerLifecycle(unittest.TestCase):
+  """WorkerAppRunner-specific lifecycle integration."""
+
+  def test_additional_checks_runs_sync_before_git_updates(self):
+    plugin = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)
+    calls = []
+
+    def base_sync(_plugin, current_time):
+      calls.append(("sync", current_time))
+      return None
+
+    def git_updates(current_time):
+      calls.append(("git", current_time))
+      return StopReason.EXTERNAL_UPDATE
+
+    plugin._check_git_updates = git_updates
+
+    with patch.object(
+      ContainerAppRunnerPlugin,
+      "_perform_additional_checks",
+      autospec=True,
+      side_effect=base_sync,
+    ):
+      result = plugin._perform_additional_checks(123.0)
+
+    self.assertEqual(result, StopReason.EXTERNAL_UPDATE)
+    self.assertEqual(calls, [("sync", 123.0), ("git", 123.0)])
+
 
 # ===========================================================================
 # Stop and Close
@@ -313,7 +375,8 @@ class TestLifecycleStop(unittest.TestCase):
 
   def test_stop_calls_docker_stop_and_remove(self):
     plugin, _, container = self._launch()
-    plugin.stop_container()
+    result = plugin.stop_container()
+    self.assertTrue(result)
     container.stop.assert_called_once_with(timeout=5)
     container.remove.assert_called_once()
 
@@ -325,13 +388,91 @@ class TestLifecycleStop(unittest.TestCase):
 
   def test_stop_noop_when_no_container(self):
     plugin, _, _ = make_lifecycle_runner()
-    plugin.stop_container()  # should not raise
+    self.assertTrue(plugin.stop_container())  # should not raise
+
+  def test_stop_failure_returns_false_and_keeps_container_reference(self):
+    plugin, _, container = self._launch()
+    container.stop.side_effect = RuntimeError("docker timeout")
+    container.remove.side_effect = RuntimeError("still running")
+
+    result = plugin.stop_container()
+
+    self.assertFalse(result)
+    self.assertIs(plugin.container, container)
+    self.assertEqual(plugin.container_id, container.short_id)
+
+  def test_stop_error_but_remove_success_returns_true_and_clears_reference(self):
+    plugin, _, container = self._launch()
+    container.stop.side_effect = RuntimeError("docker timeout")
+
+    result = plugin.stop_container()
+
+    self.assertTrue(result)
+    container.remove.assert_called_once()
+    self.assertIsNone(plugin.container)
+    self.assertIsNone(plugin.container_id)
 
   def test_stop_and_save_logs_saves_to_disk(self):
     plugin, _, container = self._launch()
     plugin.diskapi_save_pickle_to_data = MagicMock()
     plugin._stop_container_and_save_logs_to_disk()
     container.stop.assert_called()
+    plugin.diskapi_save_pickle_to_data.assert_called_once()
+
+  def test_runtime_stop_cleans_sidecars_without_fixed_volume_cleanup(self):
+    plugin, _, container = self._launch()
+    log_thread = _JoinableThread()
+    exec_thread = _JoinableThread()
+    plugin.log_thread = log_thread
+    plugin.exec_threads = [exec_thread]
+    plugin._commands_started = True
+    plugin._semaphore_reset_signal = MagicMock()
+    plugin.stop_tunnel_engine = MagicMock()
+    plugin.stop_extra_tunnels = MagicMock()
+    plugin._cleanup_fixed_size_volumes = MagicMock()
+
+    result = plugin._stop_container_runtime_for_restart()
+
+    self.assertTrue(result)
+    plugin._semaphore_reset_signal.assert_called_once()
+    self.assertEqual(log_thread.join_calls, 1)
+    # Runtime shutdown uses one shared deadline, so each join receives the
+    # remaining budget rather than exactly the original 5 second timeout.
+    self.assertLessEqual(log_thread.join_timeout, 5)
+    self.assertGreater(log_thread.join_timeout, 0)
+    self.assertIsNone(plugin.log_thread)
+    self.assertEqual(exec_thread.join_calls, 1)
+    self.assertLessEqual(exec_thread.join_timeout, 5)
+    self.assertGreater(exec_thread.join_timeout, 0)
+    self.assertEqual(plugin.exec_threads, [])
+    self.assertFalse(plugin._stop_event.is_set())
+    self.assertFalse(plugin._commands_started)
+    plugin.stop_tunnel_engine.assert_called_once()
+    plugin.stop_extra_tunnels.assert_called_once()
+    container.stop.assert_called_once_with(timeout=5)
+    container.remove.assert_called_once()
+    plugin._cleanup_fixed_size_volumes.assert_not_called()
+    self.assertFalse(plugin._runtime_stop_degraded)
+
+  def test_runtime_stop_failure_marks_degraded(self):
+    plugin, _, container = self._launch()
+    container.remove.side_effect = RuntimeError("still running")
+
+    result = plugin._stop_container_runtime_for_restart()
+
+    self.assertFalse(result)
+    self.assertTrue(plugin._runtime_stop_degraded)
+    self.assertIs(plugin.container, container)
+
+  def test_stop_and_save_logs_skips_volume_cleanup_on_stop_failure(self):
+    plugin, _, container = self._launch()
+    container.remove.side_effect = RuntimeError("still running")
+    plugin.diskapi_save_pickle_to_data = MagicMock()
+    plugin._cleanup_fixed_size_volumes = MagicMock()
+
+    plugin._stop_container_and_save_logs_to_disk()
+
+    plugin._cleanup_fixed_size_volumes.assert_not_called()
     plugin.diskapi_save_pickle_to_data.assert_called_once()
 
   def test_on_close_stops_container(self):
