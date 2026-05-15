@@ -1784,12 +1784,13 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.stop_and_delete_job.side_effect = _fake_stop_and_delete
 
-    result = Plugin.purge_all_redmesh_data(plugin)
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["jobs_total"], 2)
     self.assertEqual(result["jobs_succeeded"], 2)
     self.assertEqual(result["jobs_failed"], 0)
+    self.assertEqual(result["jobs_force_purged"], 0)
     self.assertEqual(result["cids_deleted"], 6)
     self.assertEqual(result["cids_failed"], 0)
     self.assertEqual(result["errors"], [])
@@ -1841,7 +1842,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.stop_and_delete_job.side_effect = _fake_stop_and_delete
 
-    result = Plugin.purge_all_redmesh_data(plugin)
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_total"], 2)
@@ -1863,35 +1864,141 @@ class TestPurgeAllJobs(unittest.TestCase):
     self.assertNotIn("job-good:node-A", plugin._hashes["test-instance:live"])
     self.assertNotIn("job-good:f-1", plugin._hashes["test-instance:triage"])
 
-  def test_exception_during_stop_and_delete_is_captured(self):
-    """An exception from stop_and_delete_job is recorded and does not abort the sweep."""
+  def test_exception_falls_back_to_force_purge(self):
+    """Exception from stop_and_delete_job triggers force-purge (CStore tombstoned)."""
     Plugin = self._get_plugin_class()
     jobs = {
-      "job-explode": {"job_id": "job-explode", "job_status": "FINALIZED"},
+      "job-explode": {
+        "job_id": "job-explode",
+        "job_status": "FINALIZED",
+        "job_cid": "cid-archive",
+        "job_config_cid": "cid-config",
+      },
       "job-ok": {"job_id": "job-ok", "job_status": "FINALIZED"},
     }
-    plugin = self._make_plugin(jobs)
+    live = {"job-explode:node-X": {"progress": 50}}
+    triage = {"job-explode:f-99": {"status": "accepted_risk"}}
+    plugin = self._make_plugin(jobs, live=live, triage=triage)
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = True
 
     def _fake_stop_and_delete(job_id):
       if job_id == "job-explode":
-        raise RuntimeError("boom")
+        raise RuntimeError("schema mismatch")
       plugin._hashes["test-instance"].pop(job_id, None)
       return {"status": "success", "job_id": job_id, "cids_deleted": 1, "cids_total": 1}
 
     plugin.stop_and_delete_job.side_effect = _fake_stop_and_delete
 
-    result = Plugin.purge_all_redmesh_data(plugin)
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
     self.assertEqual(result["status"], "partial")
     self.assertEqual(result["jobs_failed"], 1)
     self.assertEqual(result["jobs_succeeded"], 1)
-    self.assertEqual(len(result["errors"]), 1)
+    self.assertEqual(result["jobs_force_purged"], 1)
+    # 1 from job-ok + 2 force-purged CIDs (job_cid + job_config_cid) = 3
+    self.assertEqual(result["cids_deleted"], 3)
+    self.assertGreaterEqual(len(result["errors"]), 1)
     self.assertEqual(result["errors"][0]["job_id"], "job-explode")
     self.assertIn("RuntimeError", result["errors"][0]["message"])
-    # job-explode cstore record preserved
-    self.assertIn("job-explode", plugin._hashes["test-instance"])
-    # job-ok was purged
+    # job-explode force-purged: cstore + secondary rows tombstoned
+    self.assertNotIn("job-explode", plugin._hashes["test-instance"])
+    self.assertNotIn("job-explode:node-X", plugin._hashes["test-instance:live"])
+    self.assertNotIn("job-explode:f-99", plugin._hashes["test-instance:triage"])
+    # job-ok was purged normally
     self.assertNotIn("job-ok", plugin._hashes["test-instance"])
+    # R1FS deletes called for the force-purged CIDs
+    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
+    self.assertEqual(deleted_cids, {"cid-archive", "cid-config"})
+
+  def test_force_purge_legacy_schema_recursively_finds_cids(self):
+    """Force-purge of a legacy record finds nested *_cid fields recursively."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "legacy-job": {
+        "job_id": "legacy-job",
+        "weird_old_field": "stale",
+        "report_cid": "cid-report-top",
+        "nested": {
+          "passes": [
+            {"aggregated_report_cid": "cid-agg", "worker_reports": {"w1": {"report_cid": "cid-w1"}}},
+            {"aggregated_report_cid": "cid-agg-2"},
+          ],
+        },
+      },
+    }
+    plugin = self._make_plugin(jobs)
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = True
+
+    plugin.stop_and_delete_job.side_effect = RuntimeError("cannot parse legacy schema")
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["jobs_force_purged"], 1)
+    self.assertEqual(result["cids_deleted"], 4)
+    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
+    self.assertEqual(deleted_cids, {"cid-report-top", "cid-agg", "cid-w1", "cid-agg-2"})
+    self.assertNotIn("legacy-job", plugin._hashes["test-instance"])
+
+  def test_status_error_falls_back_to_force_purge(self):
+    """status='error' from purge_job also triggers force-purge (distinct from 'partial')."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "job-error": {
+        "job_id": "job-error",
+        "job_cid": "cid-x",
+      },
+    }
+    plugin = self._make_plugin(jobs)
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = True
+
+    plugin.stop_and_delete_job.return_value = {"status": "error", "message": "not found"}
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["jobs_force_purged"], 1)
+    self.assertNotIn("job-error", plugin._hashes["test-instance"])
+    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
+    self.assertEqual(deleted_cids, {"cid-x"})
+
+  def test_partial_status_preserves_state_no_force_purge(self):
+    """status='partial' is the retry contract — state preserved, no force-purge."""
+    Plugin = self._get_plugin_class()
+    jobs = {"job-partial": {"job_id": "job-partial", "job_cid": "cid-y"}}
+    plugin = self._make_plugin(jobs)
+    plugin.r1fs = MagicMock()
+
+    plugin.stop_and_delete_job.return_value = {
+      "status": "partial",
+      "cids_deleted": 0,
+      "cids_failed": 1,
+    }
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["jobs_force_purged"], 0)
+    self.assertEqual(result["cids_failed"], 1)
+    # cstore preserved
+    self.assertIn("job-partial", plugin._hashes["test-instance"])
+    # no force-purge R1FS calls
+    plugin.r1fs.delete_file.assert_not_called()
+
+  def test_confirm_required(self):
+    """Endpoint refuses to purge without confirm=True."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin({"job-1": {"job_id": "job-1"}})
+
+    result = Plugin.purge_all_redmesh_data(plugin)
+    self.assertEqual(result["status"], "error")
+    self.assertIn("confirm", result["message"].lower())
+    plugin.stop_and_delete_job.assert_not_called()
+    # cstore untouched
+    self.assertIn("job-1", plugin._hashes["test-instance"])
 
   def test_non_dict_job_rows_are_skipped(self):
     """Tombstoned (None) or non-dict job rows do not count toward jobs_total."""
@@ -1909,7 +2016,7 @@ class TestPurgeAllJobs(unittest.TestCase):
 
     plugin.stop_and_delete_job.side_effect = _fake_stop_and_delete
 
-    result = Plugin.purge_all_redmesh_data(plugin)
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
     self.assertEqual(result["jobs_total"], 1)
     self.assertEqual(result["jobs_succeeded"], 1)
@@ -1920,7 +2027,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     Plugin = self._get_plugin_class()
     plugin = self._make_plugin({})
 
-    result = Plugin.purge_all_redmesh_data(plugin)
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
 
     self.assertEqual(result["status"], "success")
     self.assertEqual(result["jobs_total"], 0)

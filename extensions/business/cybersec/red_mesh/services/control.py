@@ -191,41 +191,118 @@ def purge_job(owner, job_id: str):
   return {"status": "success", "job_id": job_id, "cids_deleted": deleted, "cids_total": len(cids)}
 
 
+def _collect_cids_from_raw(payload):
+  """Walk a raw CStore payload and yield every value stored under a `*_cid` key."""
+  if isinstance(payload, dict):
+    for key, value in payload.items():
+      if isinstance(key, str) and key.endswith("_cid") and isinstance(value, str) and value:
+        yield value
+      else:
+        yield from _collect_cids_from_raw(value)
+  elif isinstance(payload, (list, tuple)):
+    for item in payload:
+      yield from _collect_cids_from_raw(item)
+
+
+def _force_purge_job(owner, job_id, raw_payload, errors):
+  """
+  Best-effort wipe of a job whose record could not be parsed/purged by
+  ``stop_and_delete_job``. Returns (cids_deleted, cids_failed).
+
+  Scans the raw payload for ``*_cid`` fields, attempts R1FS deletion, then
+  tombstones the CStore record and matching live/triage rows regardless.
+  """
+  cids = sorted({c for c in _collect_cids_from_raw(raw_payload) if isinstance(c, str)})
+  cids_deleted = 0
+  cids_failed = 0
+  artifacts = _artifact_repo(owner)
+  for cid in cids:
+    try:
+      success = artifacts.delete(cid, show_logs=True, raise_on_error=False)
+      if success:
+        cids_deleted += 1
+        owner.P(f"[PURGE_ALL_FORCE] Deleted CID {cid} for {job_id}")
+      else:
+        cids_failed += 1
+        owner.P(f"[PURGE_ALL_FORCE] delete returned False for CID {cid} ({job_id})", color='y')
+    except Exception as exc:
+      cids_failed += 1
+      owner.P(f"[PURGE_ALL_FORCE] Failed to delete CID {cid} ({job_id}): {exc}", color='r')
+      errors.append({"job_id": job_id, "scope": "r1fs", "message": f"{type(exc).__name__}: {exc}"})
+
+  cfg_instance_id = owner.cfg_instance_id
+  prefix = f"{job_id}:"
+
+  for hkey in (f"{cfg_instance_id}:live", f"{cfg_instance_id}:triage", f"{cfg_instance_id}:triage:audit"):
+    try:
+      rows = owner.chainstore_hgetall(hkey=hkey)
+    except Exception as exc:
+      errors.append({"job_id": job_id, "scope": hkey, "message": f"{type(exc).__name__}: {exc}"})
+      continue
+    if not isinstance(rows, dict):
+      continue
+    for key in list(rows):
+      if isinstance(key, str) and key.startswith(prefix):
+        try:
+          owner.chainstore_hset(hkey=hkey, key=key, value=None)
+        except Exception as exc:
+          errors.append({"job_id": job_id, "scope": hkey, "message": f"{type(exc).__name__}: {exc}"})
+
+  try:
+    owner.chainstore_hset(hkey=cfg_instance_id, key=job_id, value=None)
+  except Exception as exc:
+    errors.append({"job_id": job_id, "scope": cfg_instance_id, "message": f"{type(exc).__name__}: {exc}"})
+
+  owner.P(f"[PURGE_ALL_FORCE] Force-purged {job_id}: {cids_deleted}/{len(cids)} CIDs deleted.")
+  return cids_deleted, cids_failed
+
+
 def purge_all_jobs(owner):
   """
   Purge every RedMesh job on this edge node: stop running jobs, delete all
   R1FS artifacts, tombstone CStore records, and sweep orphan rows in the
   live progress / triage / triage audit hashes.
 
-  Preserves the single-job partial-failure contract: any job whose purge
-  returned ``partial``/``error`` keeps its CStore rows intact so the operator
-  can retry artifact deletion later.
+  Records that cannot be parsed by the current schema (legacy structures)
+  are force-tombstoned via :func:`_force_purge_job` with best-effort R1FS
+  cleanup.
+
+  Preserves the single-job partial-failure contract for parseable records:
+  any job whose purge returned ``partial`` keeps its CStore rows intact so
+  the operator can retry artifact deletion later.
   """
   raw_jobs = _job_repo(owner).list_jobs() or {}
-  job_ids = [jid for jid, payload in raw_jobs.items() if isinstance(jid, str) and isinstance(payload, dict)]
+  job_entries = [(jid, payload) for jid, payload in raw_jobs.items() if isinstance(jid, str) and isinstance(payload, dict)]
 
-  jobs_total = len(job_ids)
+  jobs_total = len(job_entries)
   jobs_succeeded = 0
   jobs_failed = 0
+  jobs_force_purged = 0
   cids_deleted = 0
   cids_failed = 0
   failed_job_ids = set()
   errors = []
 
-  for job_id in job_ids:
+  for job_id, raw_payload in job_entries:
     try:
       result = owner.stop_and_delete_job(job_id)
     except Exception as exc:
-      jobs_failed += 1
-      failed_job_ids.add(job_id)
+      owner.P(f"[PURGE_ALL] stop_and_delete_job({job_id}) raised: {exc}; falling back to force-purge.", color='y')
       errors.append({"job_id": job_id, "message": f"{type(exc).__name__}: {exc}"})
-      owner.P(f"[PURGE_ALL] stop_and_delete_job({job_id}) raised: {exc}", color='r')
+      fc_deleted, fc_failed = _force_purge_job(owner, job_id, raw_payload, errors)
+      cids_deleted += fc_deleted
+      cids_failed += fc_failed
+      jobs_failed += 1
+      jobs_force_purged += 1
       continue
 
     if not isinstance(result, dict):
-      jobs_failed += 1
-      failed_job_ids.add(job_id)
       errors.append({"job_id": job_id, "message": f"unexpected non-dict response: {type(result).__name__}"})
+      fc_deleted, fc_failed = _force_purge_job(owner, job_id, raw_payload, errors)
+      cids_deleted += fc_deleted
+      cids_failed += fc_failed
+      jobs_failed += 1
+      jobs_force_purged += 1
       continue
 
     status = result.get("status")
@@ -234,13 +311,23 @@ def purge_all_jobs(owner):
 
     if status == "success":
       jobs_succeeded += 1
-    else:
+    elif status == "partial":
       jobs_failed += 1
       failed_job_ids.add(job_id)
       errors.append({
         "job_id": job_id,
+        "message": result.get("message") or "purge returned status='partial'",
+      })
+    else:
+      errors.append({
+        "job_id": job_id,
         "message": result.get("message") or f"purge returned status={status!r}",
       })
+      fc_deleted, fc_failed = _force_purge_job(owner, job_id, raw_payload, errors)
+      cids_deleted += fc_deleted
+      cids_failed += fc_failed
+      jobs_failed += 1
+      jobs_force_purged += 1
 
   cfg_instance_id = owner.cfg_instance_id
   live_hkey = f"{cfg_instance_id}:live"
@@ -293,16 +380,21 @@ def purge_all_jobs(owner):
     "jobs_total": jobs_total,
     "jobs_succeeded": jobs_succeeded,
     "jobs_failed": jobs_failed,
+    "jobs_force_purged": jobs_force_purged,
     "cids_deleted": cids_deleted,
     "cids_failed": cids_failed,
   })
-  owner.P(f"[PURGE_ALL] {jobs_succeeded}/{jobs_total} jobs purged, {cids_deleted} CIDs deleted, {cids_failed} CIDs failed.")
+  owner.P(
+    f"[PURGE_ALL] {jobs_succeeded}/{jobs_total} jobs purged "
+    f"({jobs_force_purged} force-wiped), {cids_deleted} CIDs deleted, {cids_failed} CIDs failed."
+  )
 
   return {
     "status": status,
     "jobs_total": jobs_total,
     "jobs_succeeded": jobs_succeeded,
     "jobs_failed": jobs_failed,
+    "jobs_force_purged": jobs_force_purged,
     "cids_deleted": cids_deleted,
     "cids_failed": cids_failed,
     "errors": errors,
