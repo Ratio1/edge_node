@@ -81,6 +81,7 @@ from .event_hooks import (
   emit_redmesh_event,
 )
 from .control import (
+  purge_all_jobs,
   purge_job,
   stop_and_delete_job,
   stop_monitoring,
@@ -243,6 +244,7 @@ __all__ = [
   "normalize_common_launch_options",
   "parse_exceptions",
   "persist_job_config_with_secrets",
+  "purge_all_jobs",
   "purge_job",
   "R1fsSecretStore",
   "resolve_job_config_secrets",
