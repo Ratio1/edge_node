@@ -1580,6 +1580,11 @@ class TestCorrelationEngine(unittest.TestCase):
       any("honeypot" in f["title"].lower() and "port" in f["title"].lower() for f in findings),
       f"Expected port ratio honeypot finding, got: {findings}"
     )
+    finding = next(f for f in findings if "honeypot" in f["title"].lower())
+    self.assertEqual(finding["cwe"], [345])
+    self.assertEqual(finding["owasp_top10"], ["A05:2021"])
+    self.assertEqual(len(finding["finding_signature"]), 64)
+    self.assertEqual(finding["remediation_structured"]["primary"], finding["remediation"])
 
   def test_port_ratio_normal(self):
     """5/1000 open ports should NOT trigger honeypot finding."""
@@ -5097,9 +5102,12 @@ class TestBatch5Improvements(unittest.TestCase):
 
     risk_result, flat_findings = Plugin._compute_risk_and_findings(None, aggregated)
 
-    # Non-CVE duplicates are NOT deduplicated (that's a different issue)
+    # Signature deduplication now catches exact non-CVE duplicates too.
     csp_findings = [f for f in flat_findings if "CSP" in f.get("title", "")]
-    self.assertEqual(len(csp_findings), 2, "Non-CVE findings should not be deduplicated")
+    self.assertEqual(len(csp_findings), 1, "Exact non-CVE duplicates should deduplicate by finding_signature")
+    self.assertEqual(len(csp_findings[0]["finding_signature"]), 64)
+    self.assertEqual(csp_findings[0]["remediation_structured"]["primary"],
+                     "Review the finding evidence and apply vendor or platform hardening guidance.")
 
   # ── Jetty CVE database ─────────────────────────────────────────
 
@@ -5122,4 +5130,3 @@ class TestBatch5Improvements(unittest.TestCase):
     cve_ids = {f.title.split(":")[0] for f in findings if "CVE-" in f.title}
     expected = {"CVE-2023-26048", "CVE-2023-26049", "CVE-2023-36478", "CVE-2023-40167"}
     self.assertEqual(cve_ids, expected, f"Should match all 4 Jetty CVEs, got {cve_ids}")
-

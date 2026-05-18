@@ -2,7 +2,7 @@ from .attestation import _AttestationMixin
 from .risk import _RiskScoringMixin
 from .report import _ReportMixin
 from .live_progress import _LiveProgressMixin
-from .llm_agent import _RedMeshLlmAgentMixin
+from .redmesh_llm_agent import _RedMeshLlmAgentMixin
 from .misp_export import _MispExportMixin
 
 __all__ = [

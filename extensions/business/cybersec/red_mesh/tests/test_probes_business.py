@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, call
 from extensions.business.cybersec.red_mesh.graybox.probes.business_logic import BusinessLogicProbes
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
-  GrayboxTargetConfig, BusinessLogicConfig, WorkflowEndpoint,
+  GrayboxTargetConfig, BusinessLogicConfig, WorkflowEndpoint, RecordEndpoint,
 )
 from extensions.business.cybersec.red_mesh.constants import GRAYBOX_MAX_WEAK_ATTEMPTS
 
@@ -19,19 +19,23 @@ def _mock_response(status=200, text="", headers=None):
   return resp
 
 
-def _make_probe(workflow_endpoints=None, allow_stateful=False,
-                regular_session=None):
+def _make_probe(workflow_endpoints=None, record_endpoints=None,
+                allow_stateful=False, regular_session=None,
+                official_session=None):
   cfg = GrayboxTargetConfig(
     business_logic=BusinessLogicConfig(
       workflow_endpoints=workflow_endpoints or [],
+      record_endpoints=record_endpoints or [],
     ),
   )
   auth = MagicMock()
   auth.regular_session = regular_session or MagicMock()
-  auth.official_session = MagicMock()
+  auth.official_session = official_session or MagicMock()
   auth.anon_session = MagicMock()
   auth.target_url = "http://testapp.local:8000"
   auth.target_config = cfg
+  auth.detected_csrf_field = None
+  auth.extract_csrf_value = MagicMock(return_value=None)
   safety = MagicMock()
   safety.throttle = MagicMock()
   safety.throttle_auth = MagicMock()
@@ -188,6 +192,69 @@ class TestWeakAuth(unittest.TestCase):
 
     probe.run_weak_auth(["nocolon", "also_no_colon"], max_attempts=10)
     probe.auth.try_credentials.assert_not_called()
+
+
+class TestNegativeAmountScenarioPTA0604(unittest.TestCase):
+  """PT-A06-04 — Negative monetary amount accepted.
+
+  Refines the umbrella PT-A06-02 finding by emitting a dedicated
+  scenario id when the negative-amount branch fires. Coverage
+  accounting must show the probe produces *some* PT-A06-04 finding
+  whenever a record endpoint is configured — vulnerable on accept,
+  not_vulnerable on reject.
+  """
+
+  def _form_response(self, csrf="tok", amount="100.00", status="draft"):
+    body = (
+      f'<form><input name="csrfmiddlewaretoken" value="{csrf}">'
+      f'<input name="amount" value="{amount}">'
+      f'<input name="status" value="{status}">'
+      f'</form>'
+    )
+    return _mock_response(status=200, text=body)
+
+  def test_pt_a06_04_emits_vulnerable_when_negative_amount_accepted(self):
+    record_ep = RecordEndpoint(path="/records/1/")
+    probe = _make_probe(record_endpoints=[record_ep], allow_stateful=True)
+    sess = probe.auth.official_session
+    # GET form (extract fields), POST returns 302 → accepted
+    sess.get = MagicMock(return_value=self._form_response())
+    sess.post = MagicMock(return_value=_mock_response(status=302))
+
+    probe._test_validation_bypass()
+
+    a06_04 = [f for f in probe.findings if f.scenario_id == "PT-A06-04"]
+    self.assertEqual(len(a06_04), 1)
+    self.assertEqual(a06_04[0].status, "vulnerable")
+    self.assertEqual(a06_04[0].severity, "HIGH")
+    self.assertTrue(any("submitted_amount=-9999.99" in e for e in a06_04[0].evidence))
+
+  def test_pt_a06_04_emits_not_vulnerable_when_amount_rejected(self):
+    record_ep = RecordEndpoint(path="/records/1/")
+    probe = _make_probe(record_endpoints=[record_ep], allow_stateful=True)
+    sess = probe.auth.official_session
+    sess.get = MagicMock(return_value=self._form_response())
+    # 200 with explicit error rejecting negative amount
+    sess.post = MagicMock(return_value=_mock_response(
+      status=200, text="Amount must be greater than zero",
+    ))
+
+    probe._test_validation_bypass()
+
+    a06_04 = [f for f in probe.findings if f.scenario_id == "PT-A06-04"]
+    self.assertEqual(len(a06_04), 1)
+    self.assertEqual(a06_04[0].status, "not_vulnerable")
+    self.assertEqual(a06_04[0].severity, "INFO")
+
+  def test_pt_a06_04_silent_when_no_record_endpoint_configured(self):
+    """No record endpoint → probe doesn't run → no PT-A06-04 emission.
+
+    The scenario can't fire without a target. No INFO either; that would
+    be misleading because no test was actually attempted.
+    """
+    probe = _make_probe(record_endpoints=[], allow_stateful=True)
+    probe._test_validation_bypass()
+    self.assertFalse(any(f.scenario_id == "PT-A06-04" for f in probe.findings))
 
 
 class TestCapabilities(unittest.TestCase):

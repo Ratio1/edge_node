@@ -7,12 +7,24 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ...cve_db import check_cves
+from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
 
 class _ServiceInfraMixin(_ServiceProbeBase):
   """RDP, VNC, SNMP, DNS, SMB, WINS, Modbus and Elasticsearch probes."""
 
+  @register_probe(
+    display_name="RDP service detection",
+    description=(
+      "X.224 connection request to detect Remote Desktop Protocol. "
+      "Flags exposed RDP (BlueKeep / DejaBlue surface)."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 200),
+    default_owasp=("A05:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_rdp(self, target, port):  # default port: 3389
     """
     Verify reachability of RDP services without full negotiation.
@@ -48,6 +60,18 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       return probe_error(target, port, "RDP", e)
     return probe_result(raw_data=raw, findings=findings)
 
+  @register_probe(
+    display_name="VNC service detection",
+    description=(
+      "RFB protocol handshake to detect VNC. Identifies security "
+      "type (None, VNC password, TLS, ARD, etc.) — None auth is "
+      "always reported critical."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 326),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _service_info_vnc(self, target, port):  # default port: 5900
     """
     VNC handshake: read version banner, negotiate security types.
@@ -157,6 +181,18 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     return probe_result(raw_data=raw, findings=findings)
 
 
+  @register_probe(
+    display_name="SNMP service detection",
+    description=(
+      "SNMP v1/v2c/v3 detection with default-community probes "
+      "(public/private). Walks system MIB to detect ICS/SCADA "
+      "indicators and leaked interface IPs."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 200),
+    default_owasp=("A05:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+  )
   def _service_info_snmp(self, target, port):  # default port: 161
     """
     Attempt SNMP community string disclosure using 'public'.
@@ -414,6 +450,18 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       return None
     return {"system": system, "findings": walk_findings}
 
+  @register_probe(
+    display_name="DNS service detection",
+    description=(
+      "DNS server fingerprint, version.bind / hostname.bind / "
+      "id.server CHAOS-class queries, AXFR zone-transfer attempt "
+      "with SOA-based zone discovery. Runs CVE checks for BIND."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200, 538),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_dns(self, target, port):  # default port: 53
     """
     Query CHAOS TXT version.bind to detect DNS version disclosure.
@@ -697,6 +745,18 @@ class _ServiceInfraMixin(_ServiceProbeBase):
       pass
     return None
 
+  @register_probe(
+    display_name="SMB service detection",
+    description=(
+      "SMB protocol negotiation, version detection, share "
+      "enumeration via null session. Detects SMBv1, MS17-010 "
+      "surface, anonymous shares, and CVE-2017-7494 (Samba)."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 200, 326),
+    default_owasp=("A02:2021", "A05:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _service_info_smb(self, target, port):  # default port: 445
     """
     Probe SMB services: dialect negotiation, version extraction, CVE matching,
@@ -1513,6 +1573,17 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     0x1E: "Browser Election Service",
   }
 
+  @register_probe(
+    display_name="WINS / NetBIOS service detection",
+    description=(
+      "WINS (TCP/42) and NetBIOS Name Service (UDP/137) probes. "
+      "Detects legacy Windows name resolution exposure."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_wins(self, target, port):  # ports: 42 (WINS/TCP), 137 (NBNS/UDP)
     """
     Probe WINS / NetBIOS Name Service for name enumeration and service detection.
@@ -1785,6 +1856,17 @@ class _ServiceInfraMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=raw, findings=findings)
 
+  @register_probe(
+    display_name="Modbus service detection",
+    description=(
+      "Modbus/TCP read-only function-code 17 (Report Server ID) "
+      "probe. Detects ICS/SCADA exposure on the public internet."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 200),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _service_info_modbus(self, target, port):  # default port: 502
     """
     Send Modbus device identification request to detect exposed PLCs.
@@ -1830,6 +1912,17 @@ class _ServiceInfraMixin(_ServiceProbeBase):
     return probe_result(raw_data=raw, findings=findings)
 
 
+  @register_probe(
+    display_name="Elasticsearch service detection",
+    description=(
+      "GET / + cluster info probe. Detects unauthenticated ES, "
+      "version, JVM info, and public-IP classification (data leak)."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 200),
+    default_owasp=("A05:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+  )
   def _service_info_elasticsearch(self, target, port):  # default port: 9200
     """
     Deep Elasticsearch probe: cluster info, index listing, node IPs, CVE matching.

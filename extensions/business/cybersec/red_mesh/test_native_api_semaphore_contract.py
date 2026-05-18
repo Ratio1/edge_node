@@ -38,7 +38,7 @@ class NativeApiSemaphoreContractTests(unittest.TestCase):
       self.assertIn("self.semaphore_set_env('API_URL', 'http://{}:{}'.format(localhost_ip, port))", source, relative_path)
 
   def test_redmesh_llm_agent_consumer_prefers_api_ip(self):
-    source = self._read("extensions/business/cybersec/red_mesh/redmesh_llm_agent_mixin.py")
+    source = self._read("extensions/business/cybersec/red_mesh/mixins/llm_agent_mixin.py")
     self.assertIn("env.get('API_IP') or env.get('API_HOST') or env.get('HOST')", source)
     self.assertIn("env.get('PORT') or env.get('API_PORT')", source)
 

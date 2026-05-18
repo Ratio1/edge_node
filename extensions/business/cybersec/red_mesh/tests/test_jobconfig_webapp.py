@@ -1,5 +1,6 @@
 """Tests for JobConfig graybox fields and blackbox Finding unchanged."""
 
+import json
 import unittest
 
 from extensions.business.cybersec.red_mesh.models.archive import JobConfig, UiAggregate
@@ -135,6 +136,51 @@ class TestJobConfigWebapp(unittest.TestCase):
     self.assertEqual(redacted["official_password"], "")
     self.assertEqual(redacted["regular_password"], "")
 
+  def test_redact_job_config_masks_nested_target_config_secrets(self):
+    """Defense-in-depth redaction catches legacy nested target_config secrets."""
+    from extensions.business.cybersec.red_mesh.mixins.report import _ReportMixin
+    d = {
+      "target": "x",
+      "target_config_secrets": {
+        "oauth_client_secret": "OAUTH-CLIENT-SECRET",
+      },
+      "target_config": {
+        "api_security": {
+          "token_endpoints": {
+            "token_request_body": {
+              "client_id": "redmesh",
+              "client_secret": "plain-secret",
+              "nested": {
+                "refresh_token": "refresh-secret",
+              },
+            },
+          },
+          "auth": {
+            "api_key_header_name": "X-Customer-Api-Key",
+          },
+        },
+      },
+    }
+    redacted = _ReportMixin._redact_job_config(d)
+    dumped = json.dumps(redacted)
+    self.assertNotIn("plain-secret", dumped)
+    self.assertNotIn("refresh-secret", dumped)
+    self.assertNotIn("OAUTH-CLIENT-SECRET", dumped)
+    self.assertEqual(
+      redacted["target_config_secrets"],
+      {"oauth_client_secret": "***"},
+    )
+    self.assertEqual(
+      redacted["target_config"]["api_security"]["token_endpoints"][
+        "token_request_body"
+      ]["client_secret"],
+      "***",
+    )
+    self.assertEqual(
+      redacted["target_config"]["api_security"]["auth"]["api_key_header_name"],
+      "X-Customer-Api-Key",
+    )
+
 
 class TestUiAggregateGraybox(unittest.TestCase):
 
@@ -192,27 +238,51 @@ class TestScanMetricsGraybox(unittest.TestCase):
 
 
 class TestFindingUnchanged(unittest.TestCase):
-  """Verify blackbox Finding stays backward-compatible."""
+  """Verify blackbox Finding keeps the legacy fields available.
 
-  def test_finding_has_expected_fields(self):
-    """Finding keeps legacy fields and adds optional CVSS metadata only."""
+  Phase 1 (PR-1.1) added new optional fields to Finding for PTES
+  alignment. The contract is *additive*: every legacy field is still
+  there with the same name and default semantics, so existing probes
+  that emit Finding(severity=..., title=..., description=..., ...)
+  continue to work. New fields all carry safe defaults.
+  """
+
+  LEGACY_FIELDS = {
+    "severity",
+    "title",
+    "description",
+    "evidence",
+    "remediation",
+    "owasp_id",
+    "cwe_id",
+    "confidence",
+    "cvss_score",
+    "cvss_vector",
+  }
+
+  def test_finding_has_legacy_fields(self):
+    """All legacy fields still exist with their original names."""
     import dataclasses
-    fields = dataclasses.fields(Finding)
-    self.assertEqual(
-      [f.name for f in fields],
-      [
-        "severity",
-        "title",
-        "description",
-        "evidence",
-        "remediation",
-        "owasp_id",
-        "cwe_id",
-        "confidence",
-        "cvss_score",
-        "cvss_vector",
-      ],
+    field_names = {f.name for f in dataclasses.fields(Finding)}
+    missing = self.LEGACY_FIELDS - field_names
+    self.assertFalse(missing, f"Legacy fields removed: {missing}")
+
+  def test_finding_legacy_construction_still_works(self):
+    """A probe that constructs Finding with only the legacy positional
+    + keyword arguments still produces a valid Finding."""
+    f = Finding(
+      severity=Severity.HIGH,
+      title="Default credentials accepted",
+      description="Probed PG with admin/admin",
+      evidence="psql -h target -U admin",
+      remediation="Rotate credentials",
+      owasp_id="A07:2021",
+      cwe_id="CWE-521",
+      cvss_score=8.1,
+      cvss_vector="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
     )
+    self.assertEqual(f.severity, Severity.HIGH)
+    self.assertEqual(f.confidence, "firm")  # default preserved
 
   def test_finding_no_probe_type(self):
     """Finding does not have a probe_type attribute."""

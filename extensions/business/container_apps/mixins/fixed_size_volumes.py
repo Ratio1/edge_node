@@ -226,12 +226,19 @@ class _FixedSizeVolumesMixin:
     Called during container stop/close to free loop device resources.
     """
     if not hasattr(self, '_fixed_volumes') or not self._fixed_volumes:
-      return
+      return True
 
+    result = True
+    remaining_volumes = []
     for vol in self._fixed_volumes:
       try:
-        fixed_volume.cleanup(vol, logger=self.P)
+        cleaned = fixed_volume.cleanup(vol, logger=self.P)
+        if not cleaned:
+          result = False
+          remaining_volumes.append(vol)
       except Exception as exc:
+        result = False
+        remaining_volumes.append(vol)
         self.P(f"Failed to cleanup fixed volume '{vol.name}': {exc}", color='r')
-    self._fixed_volumes = []
-    return
+    self._fixed_volumes = remaining_volumes
+    return result

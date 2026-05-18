@@ -16,6 +16,7 @@ from typing import Optional
 from ..constants import RUN_MODE_SINGLEPASS
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
+from ..services.llm_structured import generate_exec_summary
 
 _NON_RETRYABLE_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 413, 422}
 _NON_RETRYABLE_PROVIDER_STATUSES = _NON_RETRYABLE_HTTP_STATUSES
@@ -1206,6 +1207,136 @@ class _RedMeshLlmAgentMixin(object):
     if isinstance(llm_analysis, dict):
       return llm_analysis.get("content", llm_analysis.get("analysis", llm_analysis.get("markdown", str(llm_analysis))))
     return str(llm_analysis)
+
+  def _run_structured_report_sections(
+      self,
+      job_id: str,
+      findings: list,
+      aggregated_report: dict,
+      engagement: dict | None = None,
+  ) -> dict | None:
+    """
+    Run the Phase 4 structured-LLM call and return the dict form
+    of LlmReportSections, or None when:
+      - LLM Agent is disabled / unreachable
+      - the chat call returned an HTTP error
+      - generate_exec_summary returned a fallback skeleton (error=True)
+
+    The returned dict is persisted on PassReport.llm_report_sections
+    and surfaced to the frontend by the archive normalization in
+    Navigator's lib/api/jobs.ts. The Phase 6/7 PDF orchestrator
+    consumes it for the Executive Summary, attack-chain narratives,
+    coverage gaps, and conclusion subsections.
+
+    Failures are silent on purpose — the renderer's no-data
+    fallbacks already handle a missing payload. The legacy
+    llm_analysis markdown path is unaffected; this runs in addition
+    to it, not instead of it.
+    """
+    llm_cfg = get_llm_agent_config(self)
+    self._last_structured_llm_failed = None
+    self._last_structured_llm_validation = None
+    if not llm_cfg.get("ENABLED"):
+      return None
+
+    def raw_chat_call(messages: list, max_tokens: int, temperature: float) -> str:
+      """Adapter — turns the LLM Agent /chat HTTP response into the
+      raw assistant content string generate_exec_summary expects."""
+      response = self._call_llm_agent_api(
+        endpoint="/chat",
+        method="POST",
+        payload={
+          "messages": messages,
+          "max_tokens": max_tokens,
+          "temperature": temperature,
+        },
+      )
+      if not isinstance(response, dict) or "error" in response:
+        return ""
+      choices = response.get("choices") or []
+      if not choices:
+        return ""
+      message = choices[0].get("message") or {}
+      content = message.get("content")
+      return str(content) if content else ""
+
+    try:
+      result = generate_exec_summary(
+        llm_call=raw_chat_call,
+        findings=findings or [],
+        aggregated_report=aggregated_report,
+        engagement=engagement,
+        model_name=llm_cfg.get("MODEL", "deepseek-chat"),
+      )
+    except Exception as exc:
+      self.P(
+        f"Structured LLM call failed for job {job_id}: {exc}",
+        color='y',
+      )
+      self._last_structured_llm_failed = True
+      return None
+
+    self._last_structured_llm_failed = bool(result.error)
+    self._last_structured_llm_validation = result.validation.to_dict()
+    if result.error:
+      # Fallback skeleton — let the frontend render the
+      # "[AI generation failed validation]" marker rather than
+      # showing the empty fields. We surface the populated dict
+      # though so the AI-disclosure appendix can show what
+      # validation tripped on.
+      self.P(
+        f"Structured LLM validation failed for job {job_id} "
+        f"after {result.attempts} attempts; persisting fallback skeleton.",
+        color='y',
+      )
+      self._log_structured_llm_failure_diagnostics(job_id, result)
+
+    sections = result.sections.to_dict()
+    if result.error:
+      sections["validation"] = result.validation.to_dict()
+      sections["error"] = True
+      sections["attempts"] = result.attempts
+    return sections
+
+  def _log_structured_llm_failure_diagnostics(self, job_id, result):
+    """Verbose per-attempt diagnostics for an LLM structured-report failure.
+
+    Emits one summary line per failed attempt with parser hints
+    (truncation/prose/brace balance), validation codes, response length,
+    and bounded head/tail snippets — enough to triage similar failures
+    from the launcher journal without re-running the scan or capturing
+    the raw response separately.
+    """
+    attempt_logs = getattr(result, "attempt_logs", ()) or ()
+    if not attempt_logs:
+      return
+    for log in attempt_logs:
+      head = self._sanitize_llm_diag_text(log.get("raw_head", ""))
+      tail = self._sanitize_llm_diag_text(log.get("raw_tail", ""))
+      codes = ",".join(log.get("validation_codes") or []) or "-"
+      hints = []
+      if log.get("appears_truncated"):
+        hints.append("appears_truncated")
+      if log.get("appears_prose"):
+        hints.append("appears_prose")
+      if not log.get("has_open_brace"):
+        hints.append("no_open_brace")
+      if not log.get("has_close_brace"):
+        hints.append("no_close_brace")
+      hint_str = ",".join(hints) or "-"
+      self.P(
+        f"[LLM-DIAG] job={job_id} attempt={log.get('attempt')} "
+        f"raw_len={log.get('raw_len')} codes={codes} hints={hint_str} "
+        f"head={head!r} tail={tail!r}",
+        color='y',
+      )
+
+  @staticmethod
+  def _sanitize_llm_diag_text(value):
+    """Make a head/tail snippet safe for a single grep-friendly log line."""
+    if not isinstance(value, str):
+      return ""
+    return value.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
   def _run_quick_summary_analysis(
       self,

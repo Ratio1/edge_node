@@ -8,12 +8,28 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ...cve_db import check_cves
+from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
 
 class _ServiceTlsMixin(_ServiceProbeBase):
   """TLS inspection and generic service fingerprinting probes."""
 
+  @register_probe(
+    display_name="TLS / SSL inspection",
+    description=(
+      "Inspect TLS handshake, certificate chain, cipher strength, "
+      "and protocol versions. Flags expired/self-signed certs, weak "
+      "ciphers, deprecated TLS versions."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(295, 326, 327, 757),
+    default_owasp=("A02:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    references=(
+      "https://owasp.org/Top10/A02_2021-Cryptographic_Failures/",
+    ),
+  )
   def _service_info_tls(self, target, port):
     """
     Inspect TLS handshake, certificate chain, and cipher strength.
@@ -72,6 +88,14 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     heartbleed = self._tls_check_heartbleed(target, port)
     if heartbleed:
       findings.append(heartbleed)
+      # Behavioral version inference: a positive Heartbleed leak proves the
+      # OpenSSL package version is in [1.0.1, 1.0.1g). Walk the catalog at
+      # the upper bound (1.0.1f) and emit every additional row that fires.
+      # Skip the Heartbleed row itself — already emitted above.
+      for inferred in check_cves("openssl", "1.0.1f"):
+        if "CVE-2014-0160" in (inferred.cve or ()):
+          continue
+        findings.append(inferred)
 
     # Pass 5: Downgrade attacks (POODLE / BEAST)
     findings += self._tls_check_downgrade(target, port)
@@ -387,6 +411,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
             return Finding(
               severity=Severity.CRITICAL,
               title="TLS Heartbleed vulnerability (CVE-2014-0160)",
+              cve=("CVE-2014-0160",),
               description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
                           "An attacker can read up to 64KB of server memory per request, "
                           "potentially exposing private keys, session tokens, and passwords.",
@@ -494,6 +519,7 @@ class _ServiceTlsMixin(_ServiceProbeBase):
           return Finding(
             severity=Severity.CRITICAL,
             title="TLS Heartbleed vulnerability (CVE-2014-0160)",
+            cve=("CVE-2014-0160",),
             description=f"Server at {target}:{port} is vulnerable to Heartbleed. "
                         "An attacker can read up to 64KB of server memory per request, "
                         "potentially exposing private keys, session tokens, and passwords.",
@@ -596,6 +622,18 @@ class _ServiceTlsMixin(_ServiceProbeBase):
     (_re.compile(r'TightVNC[/ ](?P<ver>\d+\.\d+(?:\.\d+)?)', _re.I), "tightvnc"),
   ]
 
+  @register_probe(
+    display_name="Generic TCP banner grab",
+    description=(
+      "Fallback probe for ports not matching a specific service "
+      "module. Banner-grabs and matches against a regex catalog "
+      "of known products to fingerprint protocol + version."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_generic(self, target, port):
     """
     Attempt a generic TCP banner grab for uncovered ports.

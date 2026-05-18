@@ -54,22 +54,59 @@ class JobConfig:
   engagement_metadata: dict = None
   target_allowlist: list = None
   safety_policy: dict = None
+  # ── Phase 3 PR-3.3: typed engagement context ──
+  # The three legacy fields above (scope_id, authorization_ref,
+  # engagement_metadata) remain for backward-compat with existing
+  # archives in R1FS. New launches populate the typed fields below.
+  # Both shapes serialize alongside each other; consumers prefer the
+  # typed shape when present.
+  engagement: dict = None        # EngagementContext.to_dict() output
+  roe: dict = None               # RulesOfEngagement.to_dict() output
+  authorization: dict = None     # AuthorizationRef.to_dict() output
   # ── graybox fields ──
   scan_type: str = "network"          # "network" | "webapp"
   target_url: str = ""                # required when scan_type == "webapp"
   secret_ref: str = ""                # reference to separately persisted graybox secrets
   has_regular_credentials: bool = False
   has_weak_candidates: bool = False
+  # OWASP API Top 10 (Subphase 1.5 commit #8) — non-secret capability flags.
+  # Raw bearer_token / api_key / bearer_refresh_token values are blanked
+  # before persistence by `_blank_graybox_secret_fields` and instead live
+  # in the R1FS secret payload (resolved at worker startup via
+  # `resolve_job_config_secrets`).
+  has_bearer_token: bool = False
+  has_api_key: bool = False
+  has_bearer_refresh_token: bool = False
+  has_regular_bearer_token: bool = False
+  has_regular_api_key: bool = False
+  has_regular_bearer_refresh_token: bool = False
+  secret_store_key_id: str = ""
+  secret_store_key_version: str = ""
+  secret_store_key_source: str = ""
+  secret_store_unsafe_fallback: bool = False
   official_username: str = ""
   official_password: str = ""
   regular_username: str = ""
   regular_password: str = ""
+  bearer_token: str = ""              # blanked before persistence; runtime-only
+  api_key: str = ""                   # blanked before persistence; runtime-only
+  bearer_refresh_token: str = ""      # blanked before persistence; runtime-only
+  regular_bearer_token: str = ""      # blanked before persistence; runtime-only
+  regular_api_key: str = ""           # blanked before persistence; runtime-only
+  regular_bearer_refresh_token: str = ""  # blanked before persistence; runtime-only
   weak_candidates: list = None        # legacy inline payload; new launches use secret_ref
   max_weak_attempts: int = 5
   app_routes: list = None             # user-supplied known routes
   verify_tls: bool = True             # TLS cert verification
   target_config: dict = None          # GrayboxTargetConfig.to_dict()
   allow_stateful_probes: bool = False # gate for A06 workflow probes
+  graybox_assignment_strategy: str = "MIRROR"
+  assigned_scenario_ids: list = None
+  assigned_request_budget: int = 0
+  budget_scope: str = ""
+  assignment_revision: int = 0
+  assignment_hash: str = ""
+  stateful_policy: str = ""
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -111,16 +148,85 @@ class JobConfig:
       secret_ref=d.get("secret_ref", ""),
       has_regular_credentials=d.get("has_regular_credentials", False),
       has_weak_candidates=d.get("has_weak_candidates", False),
+      has_bearer_token=d.get("has_bearer_token", False),
+      has_api_key=d.get("has_api_key", False),
+      has_bearer_refresh_token=d.get("has_bearer_refresh_token", False),
+      has_regular_bearer_token=d.get("has_regular_bearer_token", False),
+      has_regular_api_key=d.get("has_regular_api_key", False),
+      has_regular_bearer_refresh_token=d.get("has_regular_bearer_refresh_token", False),
+      secret_store_key_id=d.get("secret_store_key_id", ""),
+      secret_store_key_version=d.get("secret_store_key_version", ""),
+      secret_store_key_source=d.get("secret_store_key_source", ""),
+      secret_store_unsafe_fallback=d.get("secret_store_unsafe_fallback", False),
       official_username=d.get("official_username", ""),
       official_password=d.get("official_password", ""),
       regular_username=d.get("regular_username", ""),
       regular_password=d.get("regular_password", ""),
+      bearer_token=d.get("bearer_token", ""),
+      api_key=d.get("api_key", ""),
+      bearer_refresh_token=d.get("bearer_refresh_token", ""),
+      regular_bearer_token=d.get("regular_bearer_token", ""),
+      regular_api_key=d.get("regular_api_key", ""),
+      regular_bearer_refresh_token=d.get("regular_bearer_refresh_token", ""),
       weak_candidates=d.get("weak_candidates"),
       max_weak_attempts=d.get("max_weak_attempts", 5),
       app_routes=d.get("app_routes"),
       verify_tls=d.get("verify_tls", True),
       target_config=d.get("target_config"),
       allow_stateful_probes=d.get("allow_stateful_probes", False),
+      graybox_assignment_strategy=d.get("graybox_assignment_strategy", "MIRROR"),
+      assigned_scenario_ids=d.get("assigned_scenario_ids"),
+      assigned_request_budget=d.get("assigned_request_budget", 0),
+      budget_scope=d.get("budget_scope", ""),
+      assignment_revision=d.get("assignment_revision", 0),
+      assignment_hash=d.get("assignment_hash", ""),
+      stateful_policy=d.get("stateful_policy", ""),
+      engagement=d.get("engagement"),
+      roe=d.get("roe"),
+      authorization=d.get("authorization"),
+    )
+
+  # -- Phase 3 PR-3.3: convenience accessors for the typed shape --
+
+  def get_engagement(self):
+    """Return EngagementContext or None. Resolves the typed `engagement`
+    field first; falls back to the legacy free-form `engagement_metadata`
+    dict for backward compat with archives created before PR-3.3."""
+    from .engagement import EngagementContext
+    if self.engagement:
+      return EngagementContext.from_dict(self.engagement)
+    if self.engagement_metadata:
+      return EngagementContext.from_dict(self.engagement_metadata)
+    return None
+
+  def get_roe(self):
+    """Return RulesOfEngagement or None."""
+    from .engagement import RulesOfEngagement
+    return RulesOfEngagement.from_dict(self.roe) if self.roe else None
+
+  def get_authorization(self):
+    """Return AuthorizationRef or None. Falls back to the legacy
+    string `authorization_ref` (just a CID, no signer) when the typed
+    field is absent."""
+    from .engagement import AuthorizationRef
+    if self.authorization:
+      return AuthorizationRef.from_dict(self.authorization)
+    if self.authorization_ref:
+      return AuthorizationRef(document_cid=self.authorization_ref)
+    return None
+
+  def get_kickoff_questionnaire(self):
+    """Return a KickoffQuestionnaire bundling engagement/roe/authorization
+    or None when none of the three fields carry data."""
+    from .engagement import KickoffQuestionnaire
+    eng = self.get_engagement()
+    roe = self.get_roe()
+    auth = self.get_authorization()
+    if all(x is None or (hasattr(x, 'is_empty') and x.is_empty())
+           for x in (eng, roe, auth)):
+      return None
+    return KickoffQuestionnaire(
+      engagement=eng, roe=roe, authorization=auth,
     )
 
 
@@ -183,9 +289,16 @@ class PassReport:
   risk_breakdown: dict = None       # RiskBreakdown.to_dict()
 
   # LLM (inline text)
-  llm_analysis: str = None          # markdown
+  llm_analysis: str = None          # markdown — legacy
   quick_summary: str = None         # 2-4 sentences
   llm_failed: bool = None           # True if LLM API was unavailable — absent on success (_strip_none)
+
+  # Phase 4 PR-4.1 structured LLM payload — LlmReportSections.to_dict()
+  # output. Consumed by the Phase 6/7 PDF Executive Summary, Exploitation
+  # attack-chain narratives, Coverage gaps, and Conclusion. Absent (None)
+  # when the LLM Agent isn't enabled or when generate_exec_summary
+  # produced a fallback skeleton on a validation failure.
+  llm_report_sections: dict = None
 
   # Flat findings (enriched dicts extracted from service_info/web_tests_info/correlation_findings)
   findings: list = None             # [ { severity, confidence, port, protocol, probe, category, evidence, ... } ]
@@ -216,6 +329,7 @@ class PassReport:
       llm_analysis=d.get("llm_analysis"),
       quick_summary=d.get("quick_summary"),
       llm_failed=d.get("llm_failed"),
+      llm_report_sections=d.get("llm_report_sections"),
       findings=d.get("findings"),
       scan_metrics=d.get("scan_metrics"),
       worker_scan_metrics=d.get("worker_scan_metrics"),
@@ -291,6 +405,11 @@ class JobArchive:
   date_completed: float
   archive_version: int = JOB_ARCHIVE_VERSION
   start_attestation: dict = None
+  soc_event_status: dict = None
+  detection_correlation: dict = None
+  stix_export: dict = None
+  opencti_export: dict = None
+  taxii_export: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -313,4 +432,9 @@ class JobArchive:
       date_created=d.get("date_created", 0),
       date_completed=d.get("date_completed", 0),
       start_attestation=d.get("start_attestation"),
+      soc_event_status=d.get("soc_event_status"),
+      detection_correlation=d.get("detection_correlation"),
+      stix_export=d.get("stix_export"),
+      opencti_export=d.get("opencti_export"),
+      taxii_export=d.get("taxii_export"),
     )

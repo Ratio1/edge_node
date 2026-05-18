@@ -5,8 +5,198 @@ Handles merging worker results, credential redaction, and pre-computing
 the UI aggregate view for the frontend.
 """
 
+import json as _json
+
 from ..worker import PentestLocalWorker
 from ..models import UiAggregate
+
+
+# Fields stamped per-worker by _stamp_worker_source. Excluded from the
+# dedup signature so the same vulnerability seen by two workers
+# collapses to one finding (with one worker's stamp preserved).
+_DEDUP_EXCLUDE_FIELDS = ("_source_worker_id", "_source_node_addr")
+_PUBLISH_SAFE_METADATA_KEYS = {
+  "api_key_header_name",
+  "api_key_location",
+  "api_key_query_param",
+  "authenticated_probe_path",
+  "authenticated_probe_method",
+  "allow_non_readonly_auth_validation_method",
+  "allow_unverified_auth",
+  "bearer_refresh_url",
+  "bearer_scheme",
+  "bearer_token_header_name",
+  "csrf_field",
+  "password_field",
+  "password_reset_confirm_path",
+  "password_reset_path",
+  "protected_path",
+  "token_path",
+  "token_request_method",
+  "token_response_field",
+}
+_SECRET_CONFIG_KEY_PARTS = (
+  "password", "passwd", "pwd", "secret", "authorization", "cookie",
+  "credential",
+)
+_SECRET_CONFIG_TOKEN_KEYS = {
+  "api_key", "apikey", "token", "access_token", "refresh_token", "id_token",
+  "secret_ref",
+}
+
+
+def _is_secret_config_key(key):
+  normalized = str(key or "").strip().lower().replace("-", "_")
+  if not normalized or normalized.startswith("has_"):
+    return False
+  if normalized in _PUBLISH_SAFE_METADATA_KEYS:
+    return False
+  if normalized in _SECRET_CONFIG_TOKEN_KEYS:
+    return True
+  if normalized.endswith("_token") or normalized.endswith("_api_key"):
+    return True
+  return any(part in normalized for part in _SECRET_CONFIG_KEY_PARTS)
+
+
+def _redact_nested_job_config(value):
+  if isinstance(value, dict):
+    redacted = {}
+    for key, item in value.items():
+      if _is_secret_config_key(key):
+        redacted[key] = "***"
+      else:
+        redacted[key] = _redact_nested_job_config(item)
+    return redacted
+  if isinstance(value, list):
+    return [_redact_nested_job_config(item) for item in value]
+  return value
+
+
+def _configured_graybox_secret_names_from_report(report):
+  """Extract configured API auth field names from report/job target config."""
+  if not isinstance(report, dict):
+    return ()
+  candidates = []
+  for key in ("target_config",):
+    if isinstance(report.get(key), dict):
+      candidates.append(report[key])
+  job_config = report.get("job_config")
+  if isinstance(job_config, dict) and isinstance(job_config.get("target_config"), dict):
+    candidates.append(job_config["target_config"])
+
+  names = []
+  for target_config in candidates:
+    api_security = target_config.get("api_security") or {}
+    auth = api_security.get("auth") or {}
+    if not isinstance(auth, dict):
+      continue
+    for key in (
+      "api_key_header_name", "api_key_query_param",
+      "bearer_token_header_name",
+    ):
+      value = auth.get(key)
+      if isinstance(value, str) and value and value not in names:
+        names.append(value)
+  return tuple(names)
+
+
+def _finding_dedup_key(item):
+  """Stable JSON-encoded signature of a finding-shaped dict.
+
+  Strips per-worker chain-of-custody fields so the same vuln seen by
+  multiple workers produces an identical key. Falls back to the raw
+  JSON for non-finding shapes.
+  """
+  if not isinstance(item, dict):
+    try:
+      return _json.dumps(item, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+      return repr(item)
+  # Strip per-worker stamps before hashing.
+  stripped = {k: v for k, v in item.items() if k not in _DEDUP_EXCLUDE_FIELDS}
+  try:
+    return _json.dumps(stripped, sort_keys=True, default=str)
+  except (TypeError, ValueError):
+    return repr(stripped)
+
+
+def _dedup_finding_list(findings):
+  """Dedup a list of finding dicts by stable signature.
+
+  Preserves order; first occurrence wins (keeps that worker's stamp).
+  No-op for None / non-list inputs.
+  """
+  if not isinstance(findings, list):
+    return findings
+  seen = set()
+  out = []
+  for item in findings:
+    key = _finding_dedup_key(item)
+    if key in seen:
+      continue
+    seen.add(key)
+    out.append(item)
+  return out
+
+
+def _dedup_findings_in_aggregated(aggregated):
+  """Walk the known finding-bearing paths in an aggregated report and
+  dedup each findings list by stable signature.
+
+  Mutates `aggregated` in place. Targets:
+    - service_info[port].findings
+    - service_info[port][probe].findings
+    - web_tests_info[port].findings
+    - web_tests_info[port][method].findings
+    - graybox_results[port][probe].findings
+    - correlation_findings (top-level)
+    - findings (top-level)
+
+  This is the Phase 0 dedup pass — it complements but does not replace
+  the per-CVE dedup in mixins/risk.py::_compute_risk_and_findings.
+  """
+  if not isinstance(aggregated, dict):
+    return aggregated
+
+  def _dedup_in_dict_at_findings(container):
+    if isinstance(container, dict) and isinstance(container.get("findings"), list):
+      container["findings"] = _dedup_finding_list(container["findings"])
+
+  # service_info: nested + legacy flat
+  for port_entry in (aggregated.get("service_info") or {}).values():
+    if not isinstance(port_entry, dict):
+      continue
+    _dedup_in_dict_at_findings(port_entry)
+    for probe_entry in port_entry.values():
+      if isinstance(probe_entry, dict):
+        _dedup_in_dict_at_findings(probe_entry)
+
+  # web_tests_info: same shape as service_info
+  for port_entry in (aggregated.get("web_tests_info") or {}).values():
+    if not isinstance(port_entry, dict):
+      continue
+    _dedup_in_dict_at_findings(port_entry)
+    for method_entry in port_entry.values():
+      if isinstance(method_entry, dict):
+        _dedup_in_dict_at_findings(method_entry)
+
+  # graybox_results: {port: {probe: {findings}}}
+  for port_probes in (aggregated.get("graybox_results") or {}).values():
+    if not isinstance(port_probes, dict):
+      continue
+    for probe_entry in port_probes.values():
+      if isinstance(probe_entry, dict):
+        _dedup_in_dict_at_findings(probe_entry)
+
+  # Top-level lists
+  if isinstance(aggregated.get("correlation_findings"), list):
+    aggregated["correlation_findings"] = _dedup_finding_list(
+      aggregated["correlation_findings"]
+    )
+  if isinstance(aggregated.get("findings"), list):
+    aggregated["findings"] = _dedup_finding_list(aggregated["findings"])
+
+  return aggregated
 
 
 class _ReportMixin:
@@ -242,6 +432,11 @@ class _ReportMixin:
         self.json_dumps(dct_aggregated_report, indent=2),
         type_or_func, field
       ))
+    # Phase 0 dedup pass: collapse findings duplicated across workers
+    # because each worker stamps its own _source_worker_id /
+    # _source_node_addr before merge. The JSON-key fallback in
+    # merge_objects_deep cannot dedup these because the stamps differ.
+    _dedup_findings_in_aggregated(dct_aggregated_report)
     return dct_aggregated_report
 
   def merge_objects_deep(self, obj_a, obj_b):
@@ -309,7 +504,12 @@ class _ReportMixin:
     """
     import re as _re
     from copy import deepcopy
+    try:
+      from ..graybox.findings import scrub_graybox_secrets as _scrub_graybox
+    except Exception:
+      _scrub_graybox = None
     redacted = deepcopy(report)
+    graybox_secret_names = _configured_graybox_secret_names_from_report(redacted)
     service_info = redacted.get("service_info", {})
     for port_key, methods in service_info.items():
       if not isinstance(methods, dict):
@@ -346,8 +546,16 @@ class _ReportMixin:
     def _redact_graybox_text(value):
       if not isinstance(value, str):
         return value
+      if _scrub_graybox is not None:
+        value = _scrub_graybox(
+          value, secret_field_names=graybox_secret_names,
+        )
       value = _CRED_RE.sub(r'\1:***', value)
       value = _PASSWORD_RE.sub(r'\1\2***', value)
+      if _scrub_graybox is not None:
+        value = _scrub_graybox(
+          value, secret_field_names=graybox_secret_names,
+        )
       return value
 
     graybox_results = redacted.get("graybox_results", {})
@@ -360,6 +568,13 @@ class _ReportMixin:
         for finding in probe_data.get("findings", []):
           if not isinstance(finding, dict):
             continue
+          for text_key in ("title", "description", "remediation", "error"):
+            if isinstance(finding.get(text_key), str):
+              finding[text_key] = _redact_graybox_text(finding[text_key])
+          if isinstance(finding.get("replay_steps"), list):
+            finding["replay_steps"] = [
+              _redact_graybox_text(step) for step in finding["replay_steps"]
+            ]
           evidence = finding.get("evidence", [])
           if isinstance(evidence, list):
             finding["evidence"] = [
@@ -414,6 +629,14 @@ class _ReportMixin:
       redacted["regular_password"] = "***"
     if redacted.get("weak_candidates"):
       redacted["weak_candidates"] = ["***"] * len(redacted["weak_candidates"])
+    if isinstance(redacted.get("target_config_secrets"), dict):
+      redacted["target_config_secrets"] = {
+        str(key): "***" for key in redacted["target_config_secrets"]
+      }
+    if isinstance(redacted.get("target_config"), dict):
+      redacted["target_config"] = _redact_nested_job_config(
+        redacted["target_config"]
+      )
     redacted.pop("secret_ref", None)
     return redacted
 

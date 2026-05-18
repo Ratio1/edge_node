@@ -1,0 +1,67 @@
+{
+  "version": "2021",
+  "last_refreshed": "2026-05-04",
+  "source": "https://owasp.org/Top10/",
+  "categories": {
+    "A01:2021": {
+      "code": "A01:2021",
+      "name": "Broken Access Control",
+      "short_name": "Broken Access Control",
+      "description": "Restrictions on what authenticated users are allowed to do are often not properly enforced. Attackers can exploit these flaws to access unauthorized functionality and/or data."
+    },
+    "A02:2021": {
+      "code": "A02:2021",
+      "name": "Cryptographic Failures",
+      "short_name": "Cryptographic Failures",
+      "description": "Failures related to cryptography (or lack thereof) which often lead to exposure of sensitive data or system compromise. Previously known as Sensitive Data Exposure."
+    },
+    "A03:2021": {
+      "code": "A03:2021",
+      "name": "Injection",
+      "short_name": "Injection",
+      "description": "Untrusted data is sent to an interpreter as part of a command or query, leading to execution of unintended commands or unauthorized data access. Includes SQLi, NoSQLi, OS command injection, LDAP, OGNL, expression-language injection."
+    },
+    "A04:2021": {
+      "code": "A04:2021",
+      "name": "Insecure Design",
+      "short_name": "Insecure Design",
+      "description": "A category about risks related to design and architectural flaws. A secure design can still have implementation defects, but an insecure design cannot be saved by perfect implementation."
+    },
+    "A05:2021": {
+      "code": "A05:2021",
+      "name": "Security Misconfiguration",
+      "short_name": "Security Misconfiguration",
+      "description": "Insecure default configurations, incomplete or ad-hoc configurations, open cloud storage, misconfigured HTTP headers, verbose error messages containing sensitive information."
+    },
+    "A06:2021": {
+      "code": "A06:2021",
+      "name": "Vulnerable and Outdated Components",
+      "short_name": "Vulnerable Components",
+      "description": "Using components with known vulnerabilities. Includes EOL software, missing patches, libraries with known CVEs, and missing component-version inventories."
+    },
+    "A07:2021": {
+      "code": "A07:2021",
+      "name": "Identification and Authentication Failures",
+      "short_name": "Auth Failures",
+      "description": "Confirmation of the user's identity, authentication, and session management is critical to protect against authentication-related attacks. Previously known as Broken Authentication."
+    },
+    "A08:2021": {
+      "code": "A08:2021",
+      "name": "Software and Data Integrity Failures",
+      "short_name": "Integrity Failures",
+      "description": "Code and infrastructure that does not protect against integrity violations. Includes insecure deserialization (formerly A08:2017), unsigned auto-updates, untrusted CI/CD pipelines."
+    },
+    "A09:2021": {
+      "code": "A09:2021",
+      "name": "Security Logging and Monitoring Failures",
+      "short_name": "Logging Failures",
+      "description": "Inadequate logging and monitoring, coupled with missing or ineffective integration with incident response, allows attackers to attack systems further, maintain persistence, pivot, and tamper or destroy data."
+    },
+    "A10:2021": {
+      "code": "A10:2021",
+      "name": "Server-Side Request Forgery (SSRF)",
+      "short_name": "SSRF",
+      "description": "SSRF flaws occur whenever a web application is fetching a remote resource without validating the user-supplied URL. It allows an attacker to coerce the application to send a crafted request to an unexpected destination."
+    }
+  }
+}

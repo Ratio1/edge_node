@@ -6,12 +6,24 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ...cve_db import check_cves
+from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
+
+# Common per-probe metadata reused below (kept as module-level for
+# clarity; each probe still passes its own values to @register_probe).
 
 class _ServiceDatabaseMixin(_ServiceProbeBase):
   """MySQL, Redis, MSSQL, PostgreSQL, Memcached, MongoDB, CouchDB and InfluxDB probes."""
 
+  @register_probe(
+    display_name="MySQL service detection",
+    description="Handshake probe: extract MySQL version, auth plugin, run CVE checks.",
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_mysql(self, target, port):  # default port: 3306
     """
     MySQL handshake probe: extract version, auth plugin, and check CVEs.
@@ -123,6 +135,18 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=raw, findings=findings)
 
+  @register_probe(
+    display_name="MySQL credential check",
+    description=(
+      "Tests known weak / default credential pairs against MySQL's "
+      "native auth (mysql_native_password). Skipped when the server "
+      "advertises caching_sha2_password without a known weak account."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(521, 798),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _service_info_mysql_creds(self, target, port):  # default port: 3306
     """
     MySQL default credential testing (opt-in via active_auth feature group).
@@ -367,6 +391,18 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     return None
 
   # SAFETY: Read-only commands only. NEVER add CONFIG SET, SLAVEOF, MODULE LOAD, EVAL, DEBUG.
+  @register_probe(
+    display_name="Redis service detection",
+    description=(
+      "INFO and CONFIG probes for Redis: detects unauthenticated "
+      "access, version, persistence config, and dangerous "
+      "CONFIG SET write-paths."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 306),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _service_info_redis(self, target, port):  # default port: 6379
     """
     Deep Redis probe: auth check, version, config readability, data size, client list.
@@ -602,6 +638,14 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     return findings
 
 
+  @register_probe(
+    display_name="MSSQL service detection",
+    description="TDS prelogin to detect SQL Server version + encryption posture.",
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_mssql(self, target, port):  # default port: 1433
     """
     Send a TDS prelogin probe to expose SQL Server version data.
@@ -649,6 +693,14 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     return probe_result(raw_data=raw, findings=findings)
 
 
+  @register_probe(
+    display_name="PostgreSQL service detection",
+    description="StartupMessage probe to extract PG version + auth requirement; runs CVE checks.",
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_postgresql(self, target, port):  # default port: 5432
     """
     Probe PostgreSQL authentication method and extract server version.
@@ -805,6 +857,14 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=raw, findings=findings)
 
+  @register_probe(
+    display_name="PostgreSQL credential check",
+    description="Tests known weak / default credentials against PostgreSQL md5/scram auth.",
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(521, 798),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _service_info_postgresql_creds(self, target, port):  # default port: 5432
     """
     PostgreSQL default credential testing (opt-in via active_auth feature group).
@@ -950,6 +1010,17 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
         break
     return findings
 
+  @register_probe(
+    display_name="Memcached service detection",
+    description=(
+      "stats / version probes against Memcached: detects "
+      "unauthenticated public exposure (DDoS amplification source)."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 306),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:H",
+  )
   def _service_info_memcached(self, target, port):  # default port: 11211
     """
     Issue Memcached stats command to detect unauthenticated access.
@@ -1020,6 +1091,17 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
     return probe_result(raw_data=raw, findings=findings)
 
 
+  @register_probe(
+    display_name="MongoDB service detection",
+    description=(
+      "isMaster + buildInfo probes against MongoDB: detects "
+      "unauthenticated public exposure, version, collection enum risk."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 306),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+  )
   def _service_info_mongodb(self, target, port):  # default port: 27017
     """
     Attempt MongoDB isMaster + buildInfo to detect unauthenticated access
@@ -1118,6 +1200,17 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
   # ── CouchDB ──────────────────────────────────────────────────────
 
+  @register_probe(
+    display_name="CouchDB service detection",
+    description=(
+      "Welcome page, _all_dbs, Fauxton UI, and config endpoint "
+      "probes for CouchDB. Detects unauthenticated admin and CVEs."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 306),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _service_info_couchdb(self, target, port):  # default port: 5984
     """
     Probe Apache CouchDB HTTP API for unauthenticated access, admin panel,
@@ -1215,6 +1308,18 @@ class _ServiceDatabaseMixin(_ServiceProbeBase):
 
   # ── InfluxDB ────────────────────────────────────────────────────
 
+  @register_probe(
+    display_name="InfluxDB service detection",
+    description=(
+      "/ping (version header), SHOW DATABASES, /debug/vars probes "
+      "for InfluxDB. Detects version, unauthenticated DB list, "
+      "and exposed debug surface."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 200),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_influxdb(self, target, port):  # default port: 8086
     """
     Probe InfluxDB HTTP API for version disclosure, unauthenticated access,

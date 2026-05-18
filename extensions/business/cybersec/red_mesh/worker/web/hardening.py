@@ -5,6 +5,7 @@ import requests
 from urllib.parse import quote
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
 class _WebHardeningMixin:
@@ -13,6 +14,14 @@ class _WebHardeningMixin:
   and HTTP methods (OWASP WSTG-CONF).
   """
 
+  @register_probe(
+    display_name="Cookie security flags",
+    description="Audit Set-Cookie for missing Secure / HttpOnly / SameSite flags.",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(614, 1004, 1275),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:N",
+  )
   def _web_test_flags(self, target, port):
     """
     Check cookies for Secure/HttpOnly/SameSite and directory listing.
@@ -94,6 +103,17 @@ class _WebHardeningMixin:
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="Security headers audit",
+    description=(
+      "Check for HSTS, CSP, X-Frame-Options, X-Content-Type-Options, "
+      "Referrer-Policy, Permissions-Policy. Reports missing / weak."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(693, 1021),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N",
+  )
   def _web_test_security_headers(self, target, port):
     """
     Flag missing HTTP security headers.
@@ -150,6 +170,18 @@ class _WebHardeningMixin:
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="CORS misconfiguration",
+    description=(
+      "Probe Access-Control-Allow-Origin behavior with crafted "
+      "Origin headers. Detects null origin acceptance, "
+      "credentials + wildcard, reflected origin."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(942, 346),
+    default_owasp=("A05:2021", "A01:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:H/I:H/A:N",
+  )
   def _web_test_cors_misconfiguration(self, target, port):
     """
     Detect overly permissive CORS policies.
@@ -210,6 +242,14 @@ class _WebHardeningMixin:
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="Open redirect",
+    description="Detect open redirect via common redirect parameter names + external host payloads.",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(601,),
+    default_owasp=("A01:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:L/A:N",
+  )
   def _web_test_open_redirect(self, target, port):
     """
     Check common redirect parameters for open redirect abuse.
@@ -260,6 +300,14 @@ class _WebHardeningMixin:
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="HTTP method enumeration",
+    description="Enumerate allowed methods via OPTIONS, flag risky ones (PUT/DELETE/TRACE).",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(749, 200),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N",
+  )
   def _web_test_http_methods(self, target, port):
     """
     Surface risky HTTP verbs enabled on the root resource.
@@ -321,6 +369,18 @@ class _WebHardeningMixin:
     "anti-forgery-token", "__antiforgerytoken",
   })
 
+  @register_probe(
+    display_name="CSRF token presence",
+    description=(
+      "Detect HTML forms missing CSRF tokens (state-changing forms "
+      "without anti-CSRF). Heuristic — false positives possible "
+      "on GET-only forms."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(352,),
+    default_owasp=("A01:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:N",
+  )
   def _web_test_csrf(self, target, port):
     """
     Detect POST forms missing CSRF protection tokens.
@@ -397,6 +457,18 @@ class _WebHardeningMixin:
     "invalid username", "email not found", "does not exist",
   })
 
+  @register_probe(
+    display_name="Account enumeration via login response diff",
+    description=(
+      "Probe login form with valid-format vs. invalid usernames; "
+      "diff response bodies / status / timing for username "
+      "enumeration vulnerability."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(204, 203),
+    default_owasp=("A04:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _web_test_account_enumeration(self, target, port):
     """
     Detect account enumeration via login response differences.
@@ -482,6 +554,14 @@ class _WebHardeningMixin:
 
   _CAPTCHA_KEYWORDS = frozenset({"captcha", "recaptcha", "hcaptcha", "g-recaptcha"})
 
+  @register_probe(
+    display_name="Rate limiting (login endpoint)",
+    description="Send 5 rapid requests with 500ms spacing; flag if no rate limit enforced.",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(307, 770),
+    default_owasp=("A04:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:L/A:L",
+  )
   def _web_test_rate_limiting(self, target, port):
     """
     Detect missing rate limiting on authentication endpoints.
@@ -570,6 +650,14 @@ class _WebHardeningMixin:
     r'<iframe[^>]*\bsrc\s*=\s*["\']([^"\']+)["\']', _re.IGNORECASE,
   )
 
+  @register_probe(
+    display_name="Subresource Integrity (SRI)",
+    description="Inspect <script src=...> tags from external origins for missing SRI hashes.",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(353,),
+    default_owasp=("A08:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:H/PR:N/UI:R/S:C/C:H/I:H/A:N",
+  )
   def _web_test_subresource_integrity(self, target, port):
     """
     Detect external scripts/stylesheets loaded without SRI attributes.
@@ -646,6 +734,14 @@ class _WebHardeningMixin:
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="Mixed content",
+    description="On HTTPS pages, detect resource references over plain HTTP (mixed content).",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(311, 319),
+    default_owasp=("A02:2021", "A08:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:U/C:L/I:L/A:N",
+  )
   def _web_test_mixed_content(self, target, port):
     """
     Detect HTTPS pages loading resources over plain HTTP.

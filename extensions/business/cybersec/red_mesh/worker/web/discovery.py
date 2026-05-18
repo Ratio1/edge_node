@@ -4,6 +4,7 @@ import requests
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ...cve_db import check_cves
+from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
 class _WebDiscoveryMixin:
@@ -11,6 +12,20 @@ class _WebDiscoveryMixin:
   Enumerate exposed files, admin panels, and homepage secrets (OWASP WSTG-INFO).
   """
 
+  @register_probe(
+    display_name="Common admin / debug endpoint discovery",
+    description=(
+      "Probe known administrative & debug paths (/admin, /actuator, "
+      "/server-status, /elmah.axd, etc.) plus typical exposed files "
+      "(.env, .git/config, web.config). OWASP A05:2021 — surfaces "
+      "monitoring / debug endpoints that should not be public."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(200, 16),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+    references=("https://owasp.org/www-project-web-security-testing-guide/v42/",),
+  )
   def _web_test_common(self, target, port):
     """
     Look for exposed common endpoints and weak access controls.
@@ -104,6 +119,17 @@ class _WebDiscoveryMixin:
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="Homepage banner / secrets",
+    description=(
+      "Fetch the homepage and inspect for leaked secrets in HTML "
+      "(API keys, tokens, internal URLs, credentials in comments)."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(200, 540),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+  )
   def _web_test_homepage(self, target, port):
     """
     Scan landing pages for clear-text secrets or database dumps.
@@ -155,6 +181,17 @@ class _WebDiscoveryMixin:
 
     return probe_result(findings=findings_list)
 
+  @register_probe(
+    display_name="Technology fingerprint",
+    description=(
+      "Identify backend technologies from headers / cookies / HTML "
+      "(framework, language runtime, server). Feeds CVE checks."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _web_test_tech_fingerprint(self, target, port):
     """
     Technology fingerprinting: extract Server header, X-Powered-By,
@@ -258,6 +295,17 @@ class _WebDiscoveryMixin:
 
     return probe_result(raw_data=raw, findings=findings_list)
 
+  @register_probe(
+    display_name="VPN / portal endpoint discovery",
+    description=(
+      "Probe known VPN appliance paths (SSL VPN, Citrix, Pulse, "
+      "FortiGate, etc.). Detects exposed admin portals."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _web_test_vpn_endpoints(self, target, port):
     """
     Detect VPN management endpoints from major vendors.
@@ -343,6 +391,18 @@ class _WebDiscoveryMixin:
     ("/wp-json/wp/v2/users", "WordPress REST API user enumeration"),
   ]
 
+  @register_probe(
+    display_name="CMS fingerprint",
+    description=(
+      "Detect WordPress / Drupal / Joomla / Magento / etc. via "
+      "fingerprints (readme files, generator meta, plugin paths). "
+      "Flags EOL CMS versions."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(1104, 200),
+    default_owasp=("A06:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _web_test_cms_fingerprint(self, target, port):
     """
     Detect and version-check common CMS platforms (WordPress, Drupal, Joomla).
@@ -703,6 +763,18 @@ class _WebDiscoveryMixin:
     _re.compile(r'(/home/\w+|/var/www/|/opt/|/usr/local/|C:\\\\[Uu]sers)'),
   ]
 
+  @register_probe(
+    display_name="Verbose error disclosure",
+    description=(
+      "Trigger known-bad inputs (oversized, malformed type, etc.) "
+      "and parse responses for stack traces, library versions, "
+      "internal paths. Maps to OWASP A09:2021 (logging / monitoring)."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(209, 200),
+    default_owasp=("A09:2021", "A05:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _web_test_verbose_errors(self, target, port):
     """
     Detect verbose error pages and debug mode indicators (safe probes only).
@@ -808,6 +880,18 @@ class _WebDiscoveryMixin:
     "JBoss AS": {"5": "2012", "6": "2016"},
   }
 
+  @register_probe(
+    display_name="Java application server fingerprint",
+    description=(
+      "Tomcat / JBoss / Jetty / WebLogic / WebSphere fingerprint "
+      "via known paths and headers. Detects exposed manager apps "
+      "(Tomcat /manager) and version banners feeding CVE checks."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(200, 1104),
+    default_owasp=("A05:2021", "A06:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _web_test_java_servers(self, target, port):
     """
     Detect and version-check Java application servers and frameworks:
@@ -1174,6 +1258,18 @@ class _WebDiscoveryMixin:
     "Moment.js": "Deprecated — use date-fns or Luxon",
   }
 
+  @register_probe(
+    display_name="JavaScript library version detection",
+    description=(
+      "Detect frontend JS library versions (jQuery, Angular, React, "
+      "Lodash, etc.) from script src + content hashes. Reports "
+      "versions only — LLM does CVE assessment per A08 (integrity)."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(1104,),
+    default_owasp=("A08:2021", "A06:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _web_test_js_library_versions(self, target, port):
     """
     Detect client-side JavaScript libraries and flag EOL/deprecated ones.

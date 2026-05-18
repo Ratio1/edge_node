@@ -9,6 +9,7 @@ OS mismatches, infrastructure leaks, and timezone drift.
 import ipaddress
 
 from ..findings import Finding, Severity, probe_result
+from .probe_registry import register_probe, CATEGORY_CORRELATION
 
 
 # Map keywords found in OS strings to normalized OS families
@@ -74,6 +75,20 @@ class _CorrelationMixin:
   OS consistency checks, infrastructure leak detection, and timezone drift.
   """
 
+  @register_probe(
+    display_name="Post-scan correlation",
+    description=(
+      "Cross-service analysis of aggregated scan output. Runs all "
+      "_correlate_* sub-checks (port ratio, OS consistency, "
+      "infrastructure leak, TLS consistency, timezone drift, "
+      "redirect-to-SSRF chain). Emits findings that no single probe "
+      "could identify alone."
+    ),
+    category=CATEGORY_CORRELATION,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _post_scan_correlate(self):
     """Entry point: run all correlation checks and store findings."""
     findings = []
@@ -92,19 +107,22 @@ class _CorrelationMixin:
 
     if findings:
       self.P(f"Correlation engine produced {len(findings)} findings.")
-    self.state["correlation_findings"] = [
-      {
-        "severity": f.severity.value,
-        "title": f.title,
-        "description": f.description,
-        "evidence": f.evidence,
-        "remediation": f.remediation,
-        "cwe_id": f.cwe_id,
-        "confidence": f.confidence,
-      }
-      for f in findings
-    ]
+    self.state["correlation_findings"] = probe_result(
+      findings=findings,
+      probe_id="_post_scan_correlate",
+    )["findings"]
 
+  @register_probe(
+    display_name="Honeypot indicator (port-open ratio)",
+    description=(
+      "Flag suspicious open-port ratios that suggest a honeypot "
+      "(too many ports open across unrelated services)."
+    ),
+    category=CATEGORY_CORRELATION,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
+  )
   def _correlate_port_ratio(self):
     """Flag honeypot if >50% of scanned ports are open and >20 ports open."""
     findings = []
@@ -126,6 +144,18 @@ class _CorrelationMixin:
       ))
     return findings
 
+  @register_probe(
+    display_name="OS-family consistency check",
+    description=(
+      "Compare OS hints across probes (SSH banner, Telnet system info, "
+      "RDP fingerprint, SNMP sysDescr). Inconsistency suggests "
+      "honeypot or NAT'd multi-host."
+    ),
+    category=CATEGORY_CORRELATION,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
+  )
   def _correlate_os_consistency(self):
     """Flag honeypot if services report conflicting OS families."""
     findings = []
@@ -153,6 +183,17 @@ class _CorrelationMixin:
       ))
     return findings
 
+  @register_probe(
+    display_name="Internal infrastructure leak",
+    description=(
+      "Detect internal IPs / hostnames leaked through public-facing "
+      "responses (SNMP interface IPs, error pages, Server headers)."
+    ),
+    category=CATEGORY_CORRELATION,
+    default_cwe=(200, 209),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _correlate_infrastructure_leak(self):
     """Detect Docker multi-network architecture from distinct /16 private subnets."""
     findings = []
@@ -184,11 +225,34 @@ class _CorrelationMixin:
       ))
     return findings
 
+  @register_probe(
+    display_name="TLS certificate consistency",
+    description=(
+      "Compare TLS certificate SANs / CN across ports and probes. "
+      "Inconsistency may indicate a load-balancer with mixed "
+      "certificates or virtual host fronting."
+    ),
+    category=CATEGORY_CORRELATION,
+    default_cwe=(295,),
+    default_owasp=("A02:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
+  )
   def _correlate_tls_consistency(self):
     """Compare cert issuers across TLS ports. Placeholder for future SAN emission."""
     # Will be populated once TLS SAN emission is fully wired
     return []
 
+  @register_probe(
+    display_name="Server timezone drift",
+    description=(
+      "Compare server timestamps in HTTP / SMTP / SSH headers vs. "
+      "reference clock. Drift suggests NTP misconfig or honeypot."
+    ),
+    category=CATEGORY_CORRELATION,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:N/I:N/A:N",
+  )
   def _correlate_timezone_drift(self):
     """Detect inconsistent timezone offsets across services."""
     findings = []
@@ -215,6 +279,18 @@ class _CorrelationMixin:
       ))
     return findings
 
+  @register_probe(
+    display_name="Open redirect + SSRF chain",
+    description=(
+      "Chain analysis: when an open redirect AND a metadata-endpoint "
+      "indicator coexist on the same target, flag the SSRF "
+      "exfiltration chain (PTES attack-chain narrative)."
+    ),
+    category=CATEGORY_CORRELATION,
+    default_cwe=(601, 918),
+    default_owasp=("A10:2021", "A01:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:C/C:H/I:H/A:N",
+  )
   def _correlate_redirect_ssrf(self):
     """Flag SSRF chaining risk if open redirect + internal services detected."""
     findings = []

@@ -10,6 +10,7 @@ from extensions.business.cybersec.red_mesh.graybox.probes.misconfig import Misco
 from extensions.business.cybersec.red_mesh.graybox.findings import GrayboxFinding
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   GrayboxTargetConfig, MisconfigConfig, BusinessLogicConfig, WorkflowEndpoint,
+  JwtEndpoint,
 )
 
 
@@ -26,8 +27,12 @@ def _mock_response(status=200, text="", headers=None, content_type="text/html"):
 
 def _make_probe(debug_paths=None, workflow_endpoints=None,
                 official_session=None, anon_session=None,
-                discovered_forms=None, login_path="/auth/login/"):
-  misconfig = MisconfigConfig(debug_paths=debug_paths or ["/debug/"])
+                discovered_forms=None, login_path="/auth/login/",
+                password_reset_path="", jwt_endpoints=None):
+  misconfig = MisconfigConfig(
+    debug_paths=debug_paths or ["/debug/"],
+    jwt_endpoints=jwt_endpoints or JwtEndpoint(),
+  )
   business = BusinessLogicConfig(
     workflow_endpoints=workflow_endpoints or [],
   )
@@ -35,10 +40,13 @@ def _make_probe(debug_paths=None, workflow_endpoints=None,
     misconfig=misconfig,
     business_logic=business,
     login_path=login_path,
+    password_reset_path=password_reset_path,
   )
   auth = MagicMock()
   auth.official_session = official_session
   auth.anon_session = anon_session or MagicMock()
+  auth.detected_csrf_field = None
+  auth.extract_csrf_value = MagicMock(return_value=None)
   safety = MagicMock()
   safety.throttle = MagicMock()
 
@@ -308,6 +316,187 @@ class TestSessionFixation(unittest.TestCase):
     self.assertEqual(len(vuln), 0)
     clean = [f for f in probe.findings if f.scenario_id == "PT-A07-03" and f.status == "not_vulnerable"]
     self.assertEqual(len(clean), 1)
+
+
+class TestAccountEnumerationTimingPTA0217(unittest.TestCase):
+  """PT-A02-17 — login response timing leak detection."""
+
+  def _make_probe_with_timings(self, known_ms, unknown_ms):
+    probe = _make_probe(login_path="/auth/login/")
+    probe.regular_username = "alice"
+
+    # Mock make_anonymous_session to return a session whose POST takes a
+    # configurable number of milliseconds. A list of times is consumed
+    # round-robin: even indices are 'known', odd are 'unknown'.
+    timings = list(known_ms) + list(unknown_ms)
+    timing_iter = iter(timings)
+
+    def _make_session():
+      sess = MagicMock()
+      sess.get = MagicMock(return_value=_mock_response(status=200, text=""))
+      def _post(*args, **kwargs):
+        ms = next(timing_iter)
+        import time
+        time.sleep(ms / 1000.0)
+        return _mock_response(status=200, text="")
+      sess.post = MagicMock(side_effect=_post)
+      sess.close = MagicMock()
+      return sess
+
+    probe.auth.make_anonymous_session = MagicMock(side_effect=_make_session)
+    return probe
+
+  def test_pt_a02_17_vulnerable_when_known_user_slower(self):
+    # Known user → ~250ms, unknown → ~10ms (clear gap above 100ms threshold)
+    probe = self._make_probe_with_timings([250]*6, [10]*6)
+    probe._test_account_enumeration_timing()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-17"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+    self.assertEqual(f[0].severity, "HIGH")
+
+  def test_pt_a02_17_not_vulnerable_when_timings_match(self):
+    # Both groups ~50ms — no enumeration signal
+    probe = self._make_probe_with_timings([50]*6, [55]*6)
+    probe._test_account_enumeration_timing()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-17"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+    self.assertEqual(f[0].severity, "INFO")
+
+  def test_pt_a02_17_silent_when_no_login_path(self):
+    probe = _make_probe(login_path="")
+    probe._test_account_enumeration_timing()
+    self.assertFalse(any(f.scenario_id == "PT-A02-17" for f in probe.findings))
+
+
+class TestJwtWeakAlgPTA0212(unittest.TestCase):
+  """PT-A02-12 — verifier accepts alg=none."""
+
+  def _b64url(self, b: bytes) -> str:
+    import base64
+    return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+  def _make_jwt_hs256(self):
+    """Return a fake but well-formed three-segment JWT (signature is bogus)."""
+    import json as _json
+    h = self._b64url(_json.dumps({"alg": "HS256", "typ": "JWT"}).encode())
+    p = self._b64url(_json.dumps({"sub": "alice", "is_admin": False}).encode())
+    s = self._b64url(b"\x00" * 32)
+    return f"{h}.{p}.{s}"
+
+  def _setup(self, me_response):
+    jwt_cfg = JwtEndpoint(
+      token_path="/api/token/", protected_path="/api/me/",
+      username="alice", password="alice-pass",
+    )
+    probe = _make_probe(jwt_endpoints=jwt_cfg)
+    sess = MagicMock()
+    sess.post = MagicMock(return_value=_mock_response(
+      status=200, content_type="application/json"
+    ))
+    sess.post.return_value.json = MagicMock(return_value={
+      "access_token": self._make_jwt_hs256(),
+    })
+    sess.get = MagicMock(return_value=me_response)
+    sess.close = MagicMock()
+    probe.auth.make_anonymous_session = MagicMock(return_value=sess)
+    return probe
+
+  def test_pt_a02_12_vulnerable_when_alg_none_accepted(self):
+    me = _mock_response(status=200, content_type="application/json")
+    me.json = MagicMock(return_value={"username": "alice", "is_admin": True, "alg": "none"})
+    probe = self._setup(me)
+    probe._test_jwt_weak_alg()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-12"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+    self.assertEqual(f[0].severity, "HIGH")
+
+  def test_pt_a02_12_not_vulnerable_when_alg_none_rejected(self):
+    me = _mock_response(status=401, content_type="application/json")
+    me.json = MagicMock(return_value={"error": "invalid_token"})
+    probe = self._setup(me)
+    probe._test_jwt_weak_alg()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-12"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+
+  def test_pt_a02_12_silent_when_jwt_endpoints_unconfigured(self):
+    probe = _make_probe(jwt_endpoints=JwtEndpoint())
+    probe._test_jwt_weak_alg()
+    self.assertFalse(any(f.scenario_id == "PT-A02-12" for f in probe.findings))
+
+  def test_pt_a02_12_inconclusive_when_password_missing(self):
+    jwt_cfg = JwtEndpoint(token_path="/api/token/", protected_path="/api/me/",
+                          username="alice", password="")
+    probe = _make_probe(jwt_endpoints=jwt_cfg)
+    probe._test_jwt_weak_alg()
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-12"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "inconclusive")
+
+
+class TestPasswordResetTokenReusePTA0218(unittest.TestCase):
+  """PT-A02-18 — token-not-invalidated detection via two-issue identity check."""
+
+  def _make_session(self, post_responses):
+    sess = MagicMock()
+    sess.get = MagicMock(return_value=_mock_response(status=200, text=""))
+    sess.post = MagicMock(side_effect=post_responses)
+    sess.close = MagicMock()
+    return sess
+
+  def test_pt_a02_18_vulnerable_when_tokens_identical(self):
+    probe = _make_probe(password_reset_path="/auth/password-reset/request/")
+    sess = self._make_session([
+      _mock_response(status=200, text="<code>reset-admin</code>"),
+      _mock_response(status=200, text="<code>reset-admin</code>"),
+    ])
+    probe.auth.make_anonymous_session = MagicMock(return_value=sess)
+
+    probe._test_password_reset_token_reuse()
+
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-18"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "vulnerable")
+    self.assertEqual(f[0].severity, "HIGH")
+    self.assertTrue(any("tokens_identical=True" in e for e in f[0].evidence))
+
+  def test_pt_a02_18_not_vulnerable_when_tokens_differ(self):
+    probe = _make_probe(password_reset_path="/auth/password-reset/request/")
+    sess = self._make_session([
+      _mock_response(status=200, text="<code>reset-abcd1234efgh5678</code>"),
+      _mock_response(status=200, text="<code>reset-zyxw9876vutsrqpo</code>"),
+    ])
+    probe.auth.make_anonymous_session = MagicMock(return_value=sess)
+
+    probe._test_password_reset_token_reuse()
+
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-18"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "not_vulnerable")
+    self.assertEqual(f[0].severity, "INFO")
+
+  def test_pt_a02_18_inconclusive_when_token_not_extractable(self):
+    probe = _make_probe(password_reset_path="/auth/password-reset/request/")
+    sess = self._make_session([
+      _mock_response(status=200, text="<p>reset email sent</p>"),
+      _mock_response(status=200, text="<p>reset email sent</p>"),
+    ])
+    probe.auth.make_anonymous_session = MagicMock(return_value=sess)
+
+    probe._test_password_reset_token_reuse()
+
+    f = [x for x in probe.findings if x.scenario_id == "PT-A02-18"]
+    self.assertEqual(len(f), 1)
+    self.assertEqual(f[0].status, "inconclusive")
+    self.assertEqual(f[0].severity, "INFO")
+
+  def test_pt_a02_18_silent_when_no_reset_path(self):
+    probe = _make_probe(password_reset_path="")
+    probe._test_password_reset_token_reuse()
+    self.assertFalse(any(f.scenario_id == "PT-A02-18" for f in probe.findings))
 
 
 class TestAccountEnumeration(unittest.TestCase):

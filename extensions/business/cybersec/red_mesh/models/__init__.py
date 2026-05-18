@@ -52,6 +52,37 @@ from extensions.business.cybersec.red_mesh.models.triage import (
   FindingTriageState,
   VALID_TRIAGE_STATUSES,
 )
+from extensions.business.cybersec.red_mesh.models.engagement import (
+  ASSET_EXPOSURES,
+  AuthorizationRef,
+  Contact,
+  DATA_CLASSIFICATIONS,
+  EngagementContext,
+  KickoffQuestionnaire,
+  POST_EXPLOIT_RULES,
+  RulesOfEngagement,
+  STRENGTH_OF_TEST,
+)
+from extensions.business.cybersec.red_mesh.models.event_schema import (
+  REDMESH_EVENT_SCHEMA,
+  REDMESH_EVENT_SCHEMA_VERSION,
+  REQUIRED_EVENT_FIELDS,
+  RedMeshEvent,
+  validate_event_dict,
+)
+from extensions.business.cybersec.red_mesh.models.llm_output import (
+  LlmReportSections,
+  ROADMAP_BUCKETS,
+  ROADMAP_LONG_TERM,
+  ROADMAP_MID_TERM,
+  ROADMAP_NEAR_TERM,
+  SEVERITY_ERROR,
+  SEVERITY_WARNING,
+  ValidationIssue,
+  ValidationResult,
+  render_legacy_llm_fields,
+  validate_llm_output,
+)
 
 __all__ = [
   # shared
@@ -78,4 +109,31 @@ __all__ = [
   "FindingTriageState",
   "FindingTriageAuditEntry",
   "VALID_TRIAGE_STATUSES",
+  # engagement
+  "Contact",
+  "EngagementContext",
+  "RulesOfEngagement",
+  "AuthorizationRef",
+  "KickoffQuestionnaire",
+  "DATA_CLASSIFICATIONS",
+  "ASSET_EXPOSURES",
+  "STRENGTH_OF_TEST",
+  "POST_EXPLOIT_RULES",
+  "REDMESH_EVENT_SCHEMA",
+  "REDMESH_EVENT_SCHEMA_VERSION",
+  "REQUIRED_EVENT_FIELDS",
+  "RedMeshEvent",
+  "validate_event_dict",
+  # llm output (Phase 4)
+  "LlmReportSections",
+  "ROADMAP_BUCKETS",
+  "ROADMAP_LONG_TERM",
+  "ROADMAP_MID_TERM",
+  "ROADMAP_NEAR_TERM",
+  "SEVERITY_ERROR",
+  "SEVERITY_WARNING",
+  "ValidationIssue",
+  "ValidationResult",
+  "render_legacy_llm_fields",
+  "validate_llm_output",
 ]

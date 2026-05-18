@@ -263,6 +263,9 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     StopReason or None
         StopReason.EXTERNAL_UPDATE if new commit detected, None otherwise
     """
+    sync_reason = super()._perform_additional_checks(current_time)
+    if sync_reason:
+      return sync_reason
     return self._check_git_updates(current_time)
 
   def _check_git_updates(self, current_time=None):

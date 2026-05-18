@@ -11,6 +11,7 @@ import paramiko
 
 from ...findings import Finding, Severity, probe_result, probe_error
 from ...cve_db import check_cves
+from ..probe_registry import register_probe, CATEGORY_SERVICE_INFO
 from ._base import _ServiceProbeBase
 
 # Default credentials commonly found on exposed SSH services.
@@ -55,6 +56,17 @@ _HTTP_PRODUCT_MAP = {'apache': 'apache', 'nginx': 'nginx'}
 class _ServiceCommonMixin(_ServiceProbeBase):
   """HTTP, FTP, SSH, SMTP, Telnet and Rsync service probes."""
 
+  @register_probe(
+    display_name="HTTP service detection",
+    description=(
+      "Banner-grab + GET / probe on HTTP. Captures Server header, "
+      "title, X-Powered-By, and runs CVE checks for known web servers."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_http(self, target, port):  # default port: 80
     """
     Assess HTTP service: server fingerprint, technology detection,
@@ -103,6 +115,13 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
             findings += check_cves(_cve_product, _m.group(2))
+        # Apache `ServerTokens Full` and some nginx builds disclose the
+        # bundled OpenSSL package version in the Server header (e.g.
+        # `Apache/2.4.50 (Unix) OpenSSL/1.0.2k`). Extract it as a separate
+        # product so OpenSSL CVEs fire even on a non-OpenSSL primary product.
+        _ssl_m = _re.search(r"OpenSSL/(\S+)", result["server"], _re.IGNORECASE)
+        if _ssl_m:
+          findings += check_cves("openssl", _ssl_m.group(1))
       powered_by = resp.headers.get("X-Powered-By")
 
       # Page title
@@ -259,6 +278,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     return probe_result(raw_data=result, findings=findings)
 
 
+  @register_probe(
+    display_name="HTTP service detection (alt port)",
+    description="HTTP probe targeting common alternate ports (8080, 8000, 8888, etc.).",
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_http_alt(self, target, port):  # default port: 8080
     """
     Probe alternate HTTP port 8080 for verbose banners.
@@ -310,6 +337,14 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     return probe_result(raw_data=raw, findings=findings)
 
 
+  @register_probe(
+    display_name="HTTPS service detection",
+    description="HTTPS probe with TLS handshake, GET / over TLS, banner extraction.",
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(200,),
+    default_owasp=("A05:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_https(self, target, port):  # default port: 443
     """
     Collect HTTPS response banner data for TLS services.
@@ -344,6 +379,12 @@ class _ServiceCommonMixin(_ServiceProbeBase):
           _cve_product = _HTTP_PRODUCT_MAP.get(_m.group(1).lower())
           if _cve_product:
             findings += check_cves(_cve_product, _m.group(2))
+        # Co-disclosed OpenSSL package version in the HTTPS Server header
+        # (e.g. ``Apache/2.4.50 (Unix) OpenSSL/1.0.2k``) — common with
+        # ``ServerTokens Full`` and some nginx builds.
+        _ssl_m = _re.search(r"OpenSSL/(\S+)", raw["server"], _re.IGNORECASE)
+        if _ssl_m:
+          findings += check_cves("openssl", _ssl_m.group(1))
       findings.append(Finding(
         severity=Severity.INFO,
         title=f"HTTPS service detected ({resp.status_code} {resp.reason})",
@@ -364,6 +405,17 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     ("admin", ""), ("tomcat", "tomcat"), ("manager", "manager"),
   ]
 
+  @register_probe(
+    display_name="HTTP Basic Auth credential check",
+    description=(
+      "Tests known weak credentials against HTTP Basic Auth-protected "
+      "URLs (admin panels, embedded device interfaces, etc.)."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(521, 798),
+    default_owasp=("A07:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _service_info_http_basic_auth(self, target, port):
     """
     Test HTTP Basic Auth endpoints for default/weak credentials.
@@ -454,6 +506,17 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     return probe_result(raw_data=raw, findings=findings)
 
 
+  @register_probe(
+    display_name="FTP service detection",
+    description=(
+      "FTP banner / features / anonymous-login / write-access probes. "
+      "Detects exposed FTP, anonymous read/write, missing FTPS."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 319),
+    default_owasp=("A02:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_ftp(self, target, port):  # default port: 21
     """
     Assess FTP service security: banner, anonymous access, default creds,
@@ -729,6 +792,19 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=result, findings=findings)
 
+  @register_probe(
+    display_name="SSH service detection",
+    description=(
+      "Banner-grab + KEX inspection: SSH version, library "
+      "(OpenSSH/libssh/Dropbear/Erlang/Paramiko), weak algorithms, "
+      "auth methods. Runs CVE checks (incl. libssh CVE-2018-10933, "
+      "Erlang SSH CVE-2025-32433)."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(326, 327),
+    default_owasp=("A02:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_ssh(self, target, port):  # default port: 22
     """
     Assess SSH service security: banner, auth methods, and default credentials.
@@ -1056,6 +1132,17 @@ class _ServiceCommonMixin(_ServiceProbeBase):
       self.P(f"libssh bypass check failed on {target}:{port}: {e}", color='y')
     return None
 
+  @register_probe(
+    display_name="SMTP service detection",
+    description=(
+      "EHLO / HELP / VRFY / EXPN probes against SMTP. Detects "
+      "open relay, user enumeration, missing STARTTLS."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 319),
+    default_owasp=("A02:2021", "A05:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:L/A:N",
+  )
   def _service_info_smtp(self, target, port):  # default port: 25
     """
     Assess SMTP service security: banner, EHLO features, STARTTLS,
@@ -1320,6 +1407,17 @@ class _ServiceCommonMixin(_ServiceProbeBase):
 
     return probe_result(raw_data=result, findings=findings)
 
+  @register_probe(
+    display_name="Telnet service detection",
+    description=(
+      "Telnet negotiation + login banner probe. Detects unencrypted "
+      "remote-shell exposure (always a finding) and anonymous login."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(319, 287),
+    default_owasp=("A02:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _service_info_telnet(self, target, port):  # default port: 23
     """
     Assess Telnet service security: banner, negotiation options, default
@@ -1570,6 +1668,17 @@ class _ServiceCommonMixin(_ServiceProbeBase):
     return probe_result(raw_data=result, findings=findings)
 
 
+  @register_probe(
+    display_name="rsync service detection",
+    description=(
+      "rsync banner + module list (#list) probe. Detects exposed "
+      "rsync daemon, anonymous module access, leaked filesystem paths."
+    ),
+    category=CATEGORY_SERVICE_INFO,
+    default_cwe=(287, 200),
+    default_owasp=("A05:2021", "A07:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:L/I:N/A:N",
+  )
   def _service_info_rsync(self, target, port):  # default port: 873
     """
     Rsync service probe: version handshake, module enumeration, auth check.

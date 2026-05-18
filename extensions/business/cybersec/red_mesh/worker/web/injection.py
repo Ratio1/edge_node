@@ -4,6 +4,7 @@ import requests
 from urllib.parse import quote
 
 from ...findings import Finding, Severity, probe_result, probe_error
+from ..probe_registry import register_probe, CATEGORY_WEB_TEST
 
 
 class _InjectionTestBase:
@@ -41,6 +42,14 @@ class _WebInjectionMixin(_InjectionTestBase):
   and SQL injection (OWASP WSTG-INPV).
   """
 
+  @register_probe(
+    display_name="Path traversal",
+    description="Test parameter values with ../../../etc/passwd-style payloads.",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(22, 23),
+    default_owasp=("A01:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:N/A:N",
+  )
   def _web_test_path_traversal(self, target, port):
     """
     Attempt path traversal via URL path and query parameters with encoding variants.
@@ -137,6 +146,14 @@ class _WebInjectionMixin(_InjectionTestBase):
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="Reflected XSS",
+    description="Reflect-back XSS detection across common parameters.",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(79,),
+    default_owasp=("A03:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:R/S:C/C:L/I:L/A:N",
+  )
   def _web_test_xss(self, target, port):
     """
     Probe reflected XSS via URL path injection and query parameters.
@@ -218,6 +235,14 @@ class _WebInjectionMixin(_InjectionTestBase):
     return probe_result(findings=findings_list)
 
 
+  @register_probe(
+    display_name="SQL injection",
+    description="Error-based + boolean-based + time-based SQLi probes against parameters.",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(89,),
+    default_owasp=("A03:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _web_test_sql_injection(self, target, port):
     """
     Multi-technique SQL injection probe: error-based, boolean-blind, time-based.
@@ -339,6 +364,14 @@ class _WebInjectionMixin(_InjectionTestBase):
 
   # ── SSTI (Server-Side Template Injection) ────────────────────────────
 
+  @register_probe(
+    display_name="Server-Side Template Injection (SSTI)",
+    description="Detect SSTI in Jinja2/Twig/Freemarker/Velocity etc. via arithmetic payloads.",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(94, 1336),
+    default_owasp=("A03:2021",),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _web_test_ssti(self, target, port):
     """
     Probe for Server-Side Template Injection via safe math expressions.
@@ -443,6 +476,14 @@ class _WebInjectionMixin(_InjectionTestBase):
 
   # ── Shellshock (CVE-2014-6271) ──────────────────────────────────────
 
+  @register_probe(
+    display_name="Shellshock (CVE-2014-6271)",
+    description="Probe Bash-via-CGI vulnerability via crafted User-Agent / Referer headers.",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(78,),
+    default_owasp=("A03:2021", "A06:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _web_test_shellshock(self, target, port):
     """
     Test for CVE-2014-6271 (Shellshock) by sending bash function definitions
@@ -516,6 +557,14 @@ class _WebInjectionMixin(_InjectionTestBase):
 
   # ── PHP CGI argument injection + backdoor ───────────────────────────
 
+  @register_probe(
+    display_name="PHP-CGI argument injection (CVE-2012-1823)",
+    description="Detect exposed php-cgi accepting query-string args (-d/--define).",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(78, 88),
+    default_owasp=("A03:2021", "A06:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _web_test_php_cgi(self, target, port):
     """
     Test for PHP-CGI vulnerabilities:
@@ -624,6 +673,14 @@ class _WebInjectionMixin(_InjectionTestBase):
 
   # ── OGNL Injection (Struts2) ─────────────────────────────────────────
 
+  @register_probe(
+    display_name="OGNL injection (Struts2)",
+    description="Probe Apache Struts2 OGNL injection (S2-045/S2-052/S2-057-class).",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(94, 917),
+    default_owasp=("A03:2021", "A06:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _web_test_ognl_injection(self, target, port):
     """
     Test for Apache Struts2 OGNL injection via Content-Type header (S2-045)
@@ -732,6 +789,14 @@ class _WebInjectionMixin(_InjectionTestBase):
 
   # ── Java Deserialization endpoints ─────────────────────────────────
 
+  @register_probe(
+    display_name="Java deserialization",
+    description="Detect endpoints accepting serialized Java objects (rO0AB/marshalsec gadgets).",
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(502,),
+    default_owasp=("A08:2021", "A06:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+  )
   def _web_test_java_deserialization(self, target, port):
     """
     Detect exposed Java deserialization endpoints:
@@ -817,6 +882,18 @@ class _WebInjectionMixin(_InjectionTestBase):
 
   # ── Spring Actuator & SpEL injection ───────────────────────────────
 
+  @register_probe(
+    display_name="Spring Boot Actuator exposure",
+    description=(
+      "Probe /actuator/* endpoints (env, heapdump, mappings, "
+      "trace). Detects exposed Actuator endpoints that leak "
+      "config / credentials and Spring4Shell surface."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(200, 1188),
+    default_owasp=("A05:2021", "A01:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:N",
+  )
   def _web_test_spring_actuator(self, target, port):
     """
     Detect Spring Boot Actuator exposure and Spring Cloud Function SpEL injection.
@@ -1054,6 +1131,18 @@ class _WebInjectionMixin(_InjectionTestBase):
     _re.compile(r'\b\d{3}[-.]?\d{3}[-.]?\d{4}\b'),                     # phone
   ]
 
+  @register_probe(
+    display_name="IDOR indicators (PII / sensitive data)",
+    description=(
+      "Heuristic IDOR check: enumerate sequential ID-style URL "
+      "params and inspect responses for PII (email, SSN, etc.). "
+      "INFO by default; MEDIUM when PII is observed."
+    ),
+    category=CATEGORY_WEB_TEST,
+    default_cwe=(639, 285),
+    default_owasp=("A04:2021", "A01:2021"),
+    cvss_template="CVSS:3.1/AV:N/AC:L/PR:L/UI:N/S:U/C:H/I:N/A:N",
+  )
   def _web_test_idor_indicators(self, target, port):
     """
     Detect predictable/sequential resource IDs (IDOR indicators).

@@ -18,7 +18,8 @@ from .deeploy_const import (
   DEEPLOY_CREATE_REQUEST, DEEPLOY_CREATE_REQUEST_MULTI_PLUGIN, DEEPLOY_GET_APPS_REQUEST, DEEPLOY_DELETE_REQUEST,
   DEEPLOY_ERRORS, DEEPLOY_KEYS, DEEPLOY_SCALE_UP_JOB_WORKERS_REQUEST, DEEPLOY_STATUS, DEEPLOY_INSTANCE_COMMAND_REQUEST,
   DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST,
-  DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
+  DEEPLOY_NODE_SPECS_REQUEST, DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
+  DEEPLOY_GET_PREFERRED_NODES_REQUEST, DEEPLOY_SAVE_PREFERRED_NODES_REQUEST,
 )
   
 
@@ -321,6 +322,171 @@ class DeeployManagerApiPlugin(
     except Exception as e:
       result = self.__handle_error(e, request)
     #endtry
+    response = self._get_response({
+      **result
+    })
+    return response
+
+
+  @BasePlugin.endpoint(method="post")
+  # /node_specs
+  def node_specs(
+    self,
+    request: dict = DEEPLOY_NODE_SPECS_REQUEST
+  ):
+    """
+    Return total and live-available resource specs for requested nodes.
+
+    This read-only endpoint is intentionally narrow: callers provide the node
+    addresses already visible in Deeploy, and the API returns capacity telemetry
+    keyed by normalized node address.
+    """
+    try:
+      target_nodes = request.get(DEEPLOY_KEYS.TARGET_NODES, request.get("nodes", []))
+      node_specs = self._get_node_specs(target_nodes)
+      result = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        "node_specs": node_specs,
+      }
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+
+    response = self._get_response({
+      **result
+    })
+    return response
+
+
+  def _get_request_plus_level(self, sender, auth_result):
+    """
+    Resolve and validate Plus+ entitlement for a signed Deeploy request.
+
+    Parameters
+    ----------
+    sender : str
+        Wallet address recovered and validated by Deeploy auth.
+    auth_result : dict
+        Deeploy auth result containing `sender_escrow` and `escrow_owner`.
+
+    Returns
+    -------
+    int
+        Plus+ level for the CSP. Values greater than zero enable Plus+.
+
+    Raises
+    ------
+    ValueError
+        If the CSP does not have a Plus+ level above zero.
+    """
+    plus_level = self.get_plus_level_for_escrow(
+      sender=sender,
+      sender_escrow=auth_result[DEEPLOY_KEYS.SENDER_ESCROW],
+      escrow_owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+    )
+    if plus_level <= 0:
+      raise ValueError("Plus+ access is required for Preferred Nodes.")
+    return plus_level
+
+
+  @BasePlugin.endpoint(method="post")
+  # /get_preferred_nodes
+  def get_preferred_nodes(
+    self,
+    request: dict = DEEPLOY_GET_PREFERRED_NODES_REQUEST
+  ):
+    """
+    Return the authenticated CSP's Plus+ Preferred Nodes list.
+
+    Parameters
+    ----------
+    request : dict
+        Signed Deeploy request containing `nonce`, `EE_ETH_SENDER`, and
+        `EE_ETH_SIGN`.
+
+    Returns
+    -------
+    dict
+        Deeploy response with `status`, `plus_level`, `preferred_nodes`, and
+        `auth`. Missing CStore data returns an empty list.
+
+    Raises
+    ------
+    ValueError
+        Converted to a fail response when signature, escrow, Plus+ entitlement,
+        or CStore payload validation fails.
+    """
+    try:
+      self.Pd("Called Deeploy get_preferred_nodes endpoint")
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      auth_result = self.deeploy_get_auth_result(inputs)
+      plus_level = self._get_request_plus_level(sender, auth_result)
+      preferred_nodes = self.deeploy_load_preferred_nodes(auth_result)
+      result = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.PLUS_LEVEL: plus_level,
+        DEEPLOY_KEYS.PREFERRED_NODES: preferred_nodes,
+        DEEPLOY_KEYS.AUTH: auth_result,
+      }
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+
+    response = self._get_response({
+      **result
+    })
+    return response
+
+
+  @BasePlugin.endpoint(method="post")
+  # /save_preferred_nodes
+  def save_preferred_nodes(
+    self,
+    request: dict = DEEPLOY_SAVE_PREFERRED_NODES_REQUEST
+  ):
+    """
+    Replace the authenticated CSP's Plus+ Preferred Nodes list.
+
+    Parameters
+    ----------
+    request : dict
+        Signed Deeploy request containing `nonce`, `EE_ETH_SENDER`,
+        `EE_ETH_SIGN`, and a full `preferred_nodes` replacement list.
+
+    Returns
+    -------
+    dict
+        Deeploy response with `status`, `plus_level`, normalized
+        `preferred_nodes`, and `auth`.
+
+    Raises
+    ------
+    ValueError
+        Converted to a fail response when signature, escrow, Plus+ entitlement,
+        preferred-node validation, or CStore write validation fails.
+    """
+    try:
+      self.Pd("Called Deeploy save_preferred_nodes endpoint")
+      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      auth_result = self.deeploy_get_auth_result(inputs)
+      plus_level = self._get_request_plus_level(sender, auth_result)
+      if DEEPLOY_KEYS.PREFERRED_NODES not in inputs:
+        raise ValueError("'preferred_nodes' is required for save_preferred_nodes.")
+      preferred_nodes = self.deeploy_save_preferred_nodes(
+        sender=sender,
+        auth_result=auth_result,
+        preferred_nodes=inputs.get(DEEPLOY_KEYS.PREFERRED_NODES),
+      )
+      result = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.PLUS_LEVEL: plus_level,
+        DEEPLOY_KEYS.PREFERRED_NODES: preferred_nodes,
+        DEEPLOY_KEYS.AUTH: auth_result,
+      }
+    except Exception as e:
+      result = self.__handle_error(e, request)
+    #endtry
+
     response = self._get_response({
       **result
     })

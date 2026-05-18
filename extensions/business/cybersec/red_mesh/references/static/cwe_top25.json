@@ -1,0 +1,33 @@
+{
+  "version": "2024",
+  "last_refreshed": "2026-05-04",
+  "source": "https://cwe.mitre.org/top25/",
+  "note": "MITRE CWE Top 25 — most dangerous software weaknesses. Used by the Methodology appendix and to surface 'most-dangerous' callouts on findings. Refresh annually when MITRE publishes the new list.",
+  "ranked": [
+    {"rank": 1,  "cwe": 79,  "name": "Improper Neutralization of Input During Web Page Generation ('Cross-site Scripting')"},
+    {"rank": 2,  "cwe": 787, "name": "Out-of-bounds Write"},
+    {"rank": 3,  "cwe": 89,  "name": "Improper Neutralization of Special Elements used in an SQL Command ('SQL Injection')"},
+    {"rank": 4,  "cwe": 352, "name": "Cross-Site Request Forgery (CSRF)"},
+    {"rank": 5,  "cwe": 22,  "name": "Improper Limitation of a Pathname to a Restricted Directory ('Path Traversal')"},
+    {"rank": 6,  "cwe": 125, "name": "Out-of-bounds Read"},
+    {"rank": 7,  "cwe": 78,  "name": "Improper Neutralization of Special Elements used in an OS Command ('OS Command Injection')"},
+    {"rank": 8,  "cwe": 416, "name": "Use After Free"},
+    {"rank": 9,  "cwe": 862, "name": "Missing Authorization"},
+    {"rank": 10, "cwe": 434, "name": "Unrestricted Upload of File with Dangerous Type"},
+    {"rank": 11, "cwe": 94,  "name": "Improper Control of Generation of Code ('Code Injection')"},
+    {"rank": 12, "cwe": 20,  "name": "Improper Input Validation"},
+    {"rank": 13, "cwe": 77,  "name": "Improper Neutralization of Special Elements used in a Command ('Command Injection')"},
+    {"rank": 14, "cwe": 287, "name": "Improper Authentication"},
+    {"rank": 15, "cwe": 269, "name": "Improper Privilege Management"},
+    {"rank": 16, "cwe": 502, "name": "Deserialization of Untrusted Data"},
+    {"rank": 17, "cwe": 200, "name": "Exposure of Sensitive Information to an Unauthorized Actor"},
+    {"rank": 18, "cwe": 863, "name": "Incorrect Authorization"},
+    {"rank": 19, "cwe": 918, "name": "Server-Side Request Forgery (SSRF)"},
+    {"rank": 20, "cwe": 119, "name": "Improper Restriction of Operations within the Bounds of a Memory Buffer"},
+    {"rank": 21, "cwe": 476, "name": "NULL Pointer Dereference"},
+    {"rank": 22, "cwe": 798, "name": "Use of Hard-coded Credentials"},
+    {"rank": 23, "cwe": 190, "name": "Integer Overflow or Wraparound"},
+    {"rank": 24, "cwe": 400, "name": "Uncontrolled Resource Consumption"},
+    {"rank": 25, "cwe": 306, "name": "Missing Authentication for Critical Function"}
+  ]
+}
