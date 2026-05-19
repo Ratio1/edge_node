@@ -145,7 +145,10 @@ class TestTaxiiExport(unittest.TestCase):
     self.assertEqual(kwargs["timeout"], 7.0)
     uploaded = kwargs["data"]
     self.assertNotIn("10.0.0.1", uploaded)
-    self.assertIn('"type": "bundle"', uploaded)
+    parsed = json.loads(uploaded)
+    self.assertEqual(list(parsed.keys()), ["objects"])
+    self.assertNotIn("type", parsed)
+    self.assertIsInstance(parsed["objects"], list)
     emit_status.assert_called_once()
     self.assertEqual(emit_status.call_args.kwargs["adapter_type"], "taxii")
 
