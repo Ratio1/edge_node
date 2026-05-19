@@ -261,7 +261,8 @@ def purge_all_jobs(owner):
   """
   Purge every RedMesh job on this edge node: stop running jobs, delete all
   R1FS artifacts, tombstone CStore records, and sweep orphan rows in the
-  live progress / triage / triage audit hashes.
+  live progress / triage / triage audit hashes. When all jobs purge cleanly,
+  also clear integration status rows that point at now-deleted job activity.
 
   Records that cannot be parsed by the current schema (legacy structures)
   are force-tombstoned via :func:`_force_purge_job` with best-effort R1FS
@@ -339,6 +340,7 @@ def purge_all_jobs(owner):
   live_hkey = f"{cfg_instance_id}:live"
   triage_hkey = f"{cfg_instance_id}:triage"
   triage_audit_hkey = f"{cfg_instance_id}:triage:audit"
+  integrations_hkey = f"{cfg_instance_id}:integrations"
 
   def _job_id_from_compound_key(key):
     if not isinstance(key, str):
@@ -346,9 +348,10 @@ def purge_all_jobs(owner):
     return key.split(":", 1)[0]
 
   def _sweep_hash(hkey, expected_value_types):
+    rows_deleted = 0
     rows = owner.chainstore_hgetall(hkey=hkey)
     if not isinstance(rows, dict):
-      return
+      return rows_deleted
     for key, value in list(rows.items()):
       if not isinstance(key, str):
         continue
@@ -359,13 +362,18 @@ def purge_all_jobs(owner):
         continue
       try:
         owner.chainstore_hset(hkey=hkey, key=key, value=None)
+        rows_deleted += 1
       except Exception as exc:
         owner.P(f"[PURGE_ALL] failed to tombstone {hkey}/{key}: {exc}", color='r')
         errors.append({"job_id": job_id_prefix or "", "scope": hkey, "message": f"{type(exc).__name__}: {exc}"})
+    return rows_deleted
 
   _sweep_hash(live_hkey, dict)
   _sweep_hash(triage_hkey, dict)
   _sweep_hash(triage_audit_hkey, list)
+  integration_status_rows_deleted = 0
+  if jobs_failed == 0 and cids_failed == 0:
+    integration_status_rows_deleted = _sweep_hash(integrations_hkey, dict)
 
   surviving = owner.chainstore_hgetall(hkey=cfg_instance_id)
   if isinstance(surviving, dict):
@@ -389,10 +397,12 @@ def purge_all_jobs(owner):
     "jobs_force_purged": jobs_force_purged,
     "cids_deleted": cids_deleted,
     "cids_failed": cids_failed,
+    "integration_status_rows_deleted": integration_status_rows_deleted,
   })
   owner.P(
     f"[PURGE_ALL] {jobs_succeeded}/{jobs_total} jobs purged "
-    f"({jobs_force_purged} force-wiped), {cids_deleted} CIDs deleted, {cids_failed} CIDs failed."
+    f"({jobs_force_purged} force-wiped), {cids_deleted} CIDs deleted, {cids_failed} CIDs failed, "
+    f"{integration_status_rows_deleted} integration status rows deleted."
   )
 
   return {
@@ -403,6 +413,7 @@ def purge_all_jobs(owner):
     "jobs_force_purged": jobs_force_purged,
     "cids_deleted": cids_deleted,
     "cids_failed": cids_failed,
+    "integration_status_rows_deleted": integration_status_rows_deleted,
     "errors": errors,
   }
 
