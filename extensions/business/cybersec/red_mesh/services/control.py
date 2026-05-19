@@ -58,9 +58,12 @@ def stop_and_delete_job(owner, job_id: str):
   raw_job_specs = _job_repo(owner).get_job(job_id)
   if isinstance(raw_job_specs, dict):
     _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
-    worker_entry = job_specs.setdefault("workers", {}).setdefault(owner.ee_addr, {})
-    worker_entry["finished"] = True
-    worker_entry["canceled"] = True
+    workers_map = job_specs.setdefault("workers", {})
+    workers_map.setdefault(owner.ee_addr, {})
+    for worker_entry in workers_map.values():
+      if not worker_entry.get("finished"):
+        worker_entry["finished"] = True
+        worker_entry["canceled"] = True
     set_job_status(job_specs, JOB_STATUS_STOPPED)
     owner._emit_timeline_event(job_specs, "stopped", "Job stopped and deleted", actor_type="user")
     emit_lifecycle_event(
@@ -93,10 +96,9 @@ def purge_job(owner, job_id: str):
 
   job_status = job_specs.get("job_status", "")
   workers = job_specs.get("workers", {})
-  if workers and any(not w.get("finished") for w in workers.values()):
-    return {"status": "error", "message": "Cannot purge a running job. Stop it first."}
-  if job_status not in (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED) and workers:
-    return {"status": "error", "message": "Cannot purge a running job. Stop it first."}
+  if job_status not in (JOB_STATUS_FINALIZED, JOB_STATUS_STOPPED):
+    if workers and any(not w.get("finished") for w in workers.values()):
+      return {"status": "error", "message": "Cannot purge a running job. Stop it first."}
 
   cids = set()
 
