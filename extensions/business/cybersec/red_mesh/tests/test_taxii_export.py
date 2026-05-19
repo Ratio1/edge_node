@@ -140,7 +140,7 @@ class TestTaxiiExport(unittest.TestCase):
     self.assertEqual(kwargs["headers"], {
       "Accept": TAXII_MEDIA_TYPE,
       "Authorization": "Bearer taxii-secret-token",
-      "Content-Type": STIX_MEDIA_TYPE,
+      "Content-Type": TAXII_MEDIA_TYPE,
     })
     self.assertEqual(kwargs["timeout"], 7.0)
     uploaded = kwargs["data"]
@@ -226,7 +226,7 @@ class TestTaxiiExport(unittest.TestCase):
       _, kwargs = post.call_args
       self.assertEqual(kwargs["headers"]["Authorization"], f"Basic {expected}")
       self.assertEqual(kwargs["headers"]["Accept"], TAXII_MEDIA_TYPE)
-      self.assertEqual(kwargs["headers"]["Content-Type"], STIX_MEDIA_TYPE)
+      self.assertEqual(kwargs["headers"]["Content-Type"], TAXII_MEDIA_TYPE)
     finally:
       os.environ.pop("REDMESH_TAXII_PASSWORD_TEST", None)
 

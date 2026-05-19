@@ -172,7 +172,7 @@ def publish_to_taxii(owner, job_id, pass_nr=None):
 
   headers = {
     "Accept": TAXII_MEDIA_TYPE,
-    "Content-Type": STIX_MEDIA_TYPE,
+    "Content-Type": TAXII_MEDIA_TYPE,
     **auth_headers,
   }
   try:
