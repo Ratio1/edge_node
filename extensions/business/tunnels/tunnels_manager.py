@@ -1,6 +1,6 @@
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.2.0'
+__VER__ = '0.2.2'
 
 MESSAGE_PREFIX = "Please sign this message to manage your tunnels: "
 MESSAGE_PREFIX_DEEPLOY = "Please sign this message for Deeploy: "
@@ -79,6 +79,7 @@ class TunnelsManagerPlugin(BasePlugin):
           no_hash=True,
           indent=1,
           raise_if_error=True,
+          verify_safe=True,
         )
         break
       except Exception as exc:
@@ -101,6 +102,7 @@ class TunnelsManagerPlugin(BasePlugin):
       payload=payload,
       no_hash=True,
       indent=1,
+      verify_safe=True,
     )
     secrets = {
       "cloudflare_api_key": payload['cloudflare_api_key'],
