@@ -172,14 +172,16 @@ def publish_to_taxii(owner, job_id, pass_nr=None):
 
   headers = {
     "Accept": TAXII_MEDIA_TYPE,
-    "Content-Type": STIX_MEDIA_TYPE,
+    "Content-Type": TAXII_MEDIA_TYPE,
     **auth_headers,
   }
+  bundle_objects = (result.get("bundle") or {}).get("objects") or []
+  envelope = {"objects": bundle_objects}
   try:
     response = requests.post(
       _objects_url(cfg["SERVER_URL"], cfg["COLLECTION_ID"]),
       headers=headers,
-      data=json.dumps(result["bundle"], sort_keys=True),
+      data=json.dumps(envelope, sort_keys=True),
       timeout=cfg["TIMEOUT_SECONDS"],
     )
   except requests.exceptions.Timeout:
