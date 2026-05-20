@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
 __VER__ = '0.2.2'
@@ -65,29 +63,30 @@ class TunnelsManagerPlugin(BasePlugin):
     str_timestamp = self.time_to_str(_time)
     return str_timestamp
 
-  def _verify_secrets_payload_signature(self, payload: dict, message_prefix: str):
-    self._verify_nonce(payload['nonce'])
-    claimed_sender = payload.get('EE_ETH_SENDER')
-    sender = self.bc.eth_verify_payload_signature(
-      payload=payload,
-      message_prefix=message_prefix,
-      no_hash=True,
-      indent=1,
-      raise_if_error=True,
-      verify_safe=True,
-    )
-    if sender is None:
-      raise Exception("Signature verification failed: could not recover address from signature")
-    if claimed_sender is None or sender.lower() != claimed_sender.lower():
-      raise Exception(f"Invalid signature: recovered {sender} != {claimed_sender}")
-    return sender
-
   @BasePlugin.endpoint(method="post")
   def get_secrets(self, payload: dict):
     """
     Get Cloudflare secrets for the sender address.
     """
-    sender = self._verify_secrets_payload_signature(payload, message_prefix=MESSAGE_PREFIX_DEEPLOY)
+    self._verify_nonce(payload['nonce'])
+    sender = None
+    signature_errors = []
+    for prefix in (MESSAGE_PREFIX, MESSAGE_PREFIX_DEEPLOY):
+      try:
+        sender = self.bc.eth_verify_payload_signature(
+          payload=payload,
+          message_prefix=prefix,
+          no_hash=True,
+          indent=1,
+          raise_if_error=True,
+          verify_safe=True,
+        )
+        break
+      except Exception as exc:
+        signature_errors.append(str(exc))
+    if sender is None:
+      signature_errors_msg = "\n".join(signature_errors)
+      raise Exception(f"Signature verification failed for provided payload: {signature_errors_msg}")
     secrets = self.chainstore_hget(hkey="tunnels_manager_secrets", key=sender)
     # TODO we should add a CSP password to be used as token in cstore
     if secrets is None:
@@ -99,7 +98,12 @@ class TunnelsManagerPlugin(BasePlugin):
     """
     Endpoint for CSP addresses to add their own Cloudflare secrets.
     """
-    sender = self._verify_secrets_payload_signature(payload, message_prefix=MESSAGE_PREFIX)
+    sender = self.bc.eth_verify_payload_signature(
+      payload=payload,
+      no_hash=True,
+      indent=1,
+      verify_safe=True,
+    )
     secrets = {
       "cloudflare_api_key": payload['cloudflare_api_key'],
       "cloudflare_account_id": payload['cloudflare_account_id'],
