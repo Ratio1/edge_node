@@ -10,6 +10,8 @@ This plugin:
   - Streams logs and manages tunnel lifecycle through the base runner
 """
 
+import shlex
+
 import requests
 from urllib.parse import urlsplit
 
@@ -211,6 +213,14 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     inner_block = " ".join(f"{part};" for part in checks) + " fi;"
     return f"if ! command -v git >/dev/null 2>&1; then {inner_block} fi"
 
+  def _build_git_clone_command(self, repo_path):
+    repo_url = shlex.quote(self.repo_url)
+    repo_path = shlex.quote(repo_path)
+    if self.branch:
+      branch = shlex.quote(self.branch)
+      return f"git clone --branch {branch} --single-branch {repo_url} {repo_path}"
+    return f"git clone {repo_url} {repo_path}"
+
   def _collect_exec_commands(self):
     """
     Collect commands to execute inside container.
@@ -241,7 +251,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     ]
     if self.cfg_setup_repo:
       commands.append(f"rm -rf {repo_path}")
-      commands.append(f"git clone {self.repo_url} {repo_path}")
+      commands.append(self._build_git_clone_command(repo_path))
     # endif
     # last_commit = commit
     commands.extend([f"cd {repo_path} && {cmd}" for cmd in base_commands])
