@@ -213,7 +213,7 @@ class _DeeployStub(DeeployManagerApiPlugin):
     """
     return True
 
-  def deeploy_verify_and_get_inputs(self, request, require_sender_is_oracle=False, no_hash=True):
+  def deeploy_verify_and_get_inputs(self, request, require_sender_is_oracle=False, no_hash=True, request_type=None):
     """
     Stub request verification.
 
