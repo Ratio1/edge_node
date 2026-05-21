@@ -468,6 +468,67 @@ class _DeeployMixin:
       self.Pd("Signature verification OK: recovered={}".format(sender))
     return sender
 
+  def __verify_hash_signature(self, payload):
+    """
+    Verify a request where EE_ETH_SIGN signs only the canonical EE_HASH value.
+    """
+    claimed_sender = payload.get(BASE_CT.BCctbase.ETH_SENDER, "unknown")
+    signature = payload.get(BASE_CT.BCctbase.ETH_SIGN, "missing")
+    received_hash = payload.get(BASE_CT.BCctbase.HASH)
+
+    if not isinstance(received_hash, str) or len(received_hash.strip()) == 0:
+      raise ValueError(f"{BASE_CT.BCctbase.HASH} is required for hash-signed Deeploy requests.")
+
+    hash_payload = self.deepcopy(payload)
+    hash_payload.pop("address", None)
+    hash_payload.pop("signature", None)
+    hash_payload.pop(BASE_CT.BCctbase.SIGN, None)
+    hash_payload.pop(BASE_CT.BCctbase.SENDER, None)
+    hash_payload.pop(BASE_CT.BCctbase.HASH, None)
+    hash_payload.pop(BASE_CT.BCctbase.SIGN_CANON_V, None)
+    hash_payload.pop(BASE_CT.BCctbase.ETH_SIGN, None)
+    hash_payload.pop(BASE_CT.BCctbase.ETH_SENDER, None)
+    computed_hash = self.bc.compute_hash(hash_payload)
+    normalized_received_hash = received_hash.strip().removeprefix("0x")
+
+    if computed_hash != normalized_received_hash:
+      raise ValueError(
+        "Invalid payload hash: received {} != computed {}".format(
+          normalized_received_hash,
+          computed_hash,
+        )
+      )
+
+    self.Pd(
+      "Verifying hash signature for claimed sender={}, sig={}..., hash={}".format(
+        claimed_sender,
+        signature[:20] if isinstance(signature, str) else signature,
+        normalized_received_hash,
+      )
+    )
+    sender = self.bc.eth_verify_text_signature(
+      text=normalized_received_hash,
+      signature=signature,
+      no_hash=True,
+      message_prefix="",
+      expected_signer=claimed_sender,
+    )
+    if sender is None:
+      self.P(
+        "Hash signature verification FAILED for claimed sender={}. "
+        "Recovered address is None. Check that the signing key matches the sender address "
+        "and that the payload hash was not modified after signing.".format(claimed_sender),
+        color='r'
+      )
+    elif sender.lower() != claimed_sender.lower():
+      self.P(
+        "Hash signature verification MISMATCH: recovered={} != claimed={}".format(sender, claimed_sender),
+        color='r'
+      )
+    else:
+      self.Pd("Hash signature verification OK: recovered={}".format(sender))
+    return sender
+
 
   def _check_plugin_signature(self, signature: str):
     """
@@ -1100,7 +1161,7 @@ class _DeeployMixin:
     return str_timestamp
   
   
-  def deeploy_verify_and_get_inputs(self, request: dict, require_sender_is_oracle: bool = False, no_hash: bool = True):
+  def deeploy_verify_and_get_inputs(self, request: dict, require_sender_is_oracle: bool = False, no_hash: bool = True, signed_hash: bool = False):
     sender = request.get(BASE_CT.BCctbase.ETH_SENDER)
     assert self.bc.is_valid_eth_address(sender), f"Invalid sender address: {sender}"
 
@@ -1120,7 +1181,10 @@ class _DeeployMixin:
     inputs = self.NestedDotDict(request_with_defaults)
     self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
 
-    addr = self.__verify_signature(request, no_hash=no_hash)
+    if signed_hash:
+      addr = self.__verify_hash_signature(request)
+    else:
+      addr = self.__verify_signature(request, no_hash=no_hash)
     if addr is None:
       raise ValueError("Signature verification failed: could not recover address from signature")
     if addr.lower() != sender.lower():

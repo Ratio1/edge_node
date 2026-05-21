@@ -518,7 +518,7 @@ class DeeployManagerApiPlugin(
     """
     try:
       self.__ensure_eth_balance()
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, signed_hash=True)
       normalized_request = self._normalize_plugins_input(self.deepcopy(request))
       if DEEPLOY_KEYS.PLUGINS in normalized_request:
         inputs[DEEPLOY_KEYS.PLUGINS] = normalized_request[DEEPLOY_KEYS.PLUGINS]
@@ -1306,7 +1306,7 @@ class DeeployManagerApiPlugin(
     """
     try:
       self.__ensure_eth_balance()
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, signed_hash=True)
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       if not job_id:
