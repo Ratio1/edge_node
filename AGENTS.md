@@ -686,3 +686,12 @@ Entry format:
 - Details: Added repo purpose/runtime constraints, ownership table, safe-edit boundaries, required verification matrix, role-based agent cards, A2A-style task contract, mandatory handoff envelope, single-agent loop, actor-critic workflow, reusable lessons-learned section, worked examples, and explicit AGENTS review triggers. Critic concerns addressed in the update: keep single-agent as default to avoid unnecessary delegation, require executable evidence for actor-vs-critic disputes, and keep memory logging critical-only instead of turning the file into an activity log.
 - Verification: `sed -n '1,260p' AGENTS.md`; `rg -n "Module And File Ownership|Safe-Edit Boundaries|Required Verification Commands|Agent Cards|A2A-Style Task Contract|Actor-Critic|AGENTS Review Triggers|ML-20260317-001" AGENTS.md`
 - Links: `AGENTS.md`
+
+- ID: `ML-20260508-001`
+- Timestamp: `2026-05-08T23:08:05Z`
+- Type: `change`
+- Summary: Shared HF text serving now auto-selects ONNX artifacts for CPU-only runtime when the HF repo declares a compatible runtime manifest.
+- Criticality: Serving runtime architecture change affecting model loading, artifact downloads, output decoding, and API metadata across generic text-classification deployments.
+- Details: `ThHfModelBase` keeps Transformers/PT as the default GPU and fallback path, but CPU-only `HF_RUNTIME=auto` now loads `artifact_manifest.json`, selects a declared ONNX Runtime artifact, downloads only safe allow-patterns, loads schema and contract decoder from HF artifacts, and exposes the decoded artifact contract through the existing text-classifier flow. Business API response shaping now passes through generic model/runtime metadata emitted by serving.
+- Verification: `python3 -m unittest extensions.serving.test_th_hf_model_base extensions.serving.test_th_text_classifier extensions.serving.test_th_privacy_filter extensions.business.edge_inference_api.test_text_classifier_inference_api extensions.business.edge_inference_api.test_privacy_filter_inference_api`; `python3 -m py_compile extensions/serving/default_inference/nlp/th_hf_model_base.py extensions/business/edge_inference_api/text_classifier_inference_api.py`; required serving gate `python3 -m unittest extensions.serving.model_testing.test_llm_servings` currently fails at import with `ImportError: cannot import name 'Logger' from 'naeural_core'`.
+- Links: `extensions/serving/default_inference/nlp/th_hf_model_base.py`, `extensions/business/edge_inference_api/text_classifier_inference_api.py`, `extensions/serving/test_th_hf_model_base.py`

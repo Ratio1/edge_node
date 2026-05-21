@@ -61,6 +61,9 @@ class _FakeHfModelBase:
       "PIPELINE_TASK": pipeline_task or self.get_pipeline_task(),
     }
 
+  def get_last_pipeline_timings(self):
+    return {}
+
   def get_expected_ai_engines(self):
     expected = self.cfg_expected_ai_engines
     if expected is None:
@@ -210,6 +213,16 @@ class ThTextClassifierTests(unittest.TestCase):
     self.assertEqual(kwargs["max_length"], 512)
     self.assertEqual(kwargs["batch_size"], 4)
     self.assertEqual(predictions["outputs"][0]["label"], "ok")
+    self.assertEqual(predictions["serving_timings"]["active_payloads"], 1)
+    self.assertEqual(predictions["serving_timings"]["batch_size"], 1)
+    self.assertGreaterEqual(predictions["serving_timings"]["model_pipeline_elapsed_s"], 0.0)
+
+    decoded = plugin.post_process(predictions)
+
+    self.assertEqual(
+      decoded[0]["SERVING_TIMINGS"],
+      predictions["serving_timings"],
+    )
 
   def test_predict_falls_back_to_sequential_for_broken_custom_batch_pipeline(self):
     plugin = ThTextClassifier(MODEL_NAME="org/generic-text-classifier")
@@ -224,6 +237,9 @@ class ThTextClassifierTests(unittest.TestCase):
     self.assertEqual(len(predictions["outputs"]), 2)
     self.assertEqual(predictions["outputs"][0]["label"], "ok")
     self.assertEqual(predictions["outputs"][1]["label"], "ok")
+    self.assertEqual(predictions["serving_timings"]["active_payloads"], 2)
+    self.assertEqual(predictions["serving_timings"]["batch_size"], 2)
+    self.assertGreaterEqual(predictions["serving_timings"]["model_pipeline_elapsed_s"], 0.0)
     self.assertEqual(plugin.classifier.calls[0][0], ["hello", "world"])
     self.assertEqual(plugin.classifier.calls[1][0], "hello")
     self.assertEqual(plugin.classifier.calls[2][0], "world")
