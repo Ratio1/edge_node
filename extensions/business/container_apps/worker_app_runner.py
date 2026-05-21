@@ -11,6 +11,7 @@ This plugin:
 """
 
 import requests
+import shlex
 from urllib.parse import urlsplit
 
 from extensions.business.container_apps.container_app_runner import (
@@ -43,7 +44,7 @@ _CONFIG = {
     "REPO_OWNER": None,  # optional legacy support
     "REPO_NAME": None,   # optional legacy support
     "REPO_URL": None,
-    "BRANCH": "main",
+    "BRANCH": None,
     "POLL_INTERVAL": 60,
     "RATE_LIMIT_BACKOFF": 5 * 60,
   },
@@ -211,6 +212,23 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     inner_block = " ".join(f"{part};" for part in checks) + " fi;"
     return f"if ! command -v git >/dev/null 2>&1; then {inner_block} fi"
 
+  def _build_git_clone_command(self, repo_path):
+    """
+    Build the git clone command for the configured repository and branch.
+
+    When a branch is resolved, clone that branch explicitly so the code that
+    runs inside the container matches the branch monitored for updates.
+    """
+    repo_url = shlex.quote(self.repo_url)
+    repo_path = shlex.quote(repo_path)
+    branch_name = self._normalize_branch_name(self.branch)
+
+    if branch_name:
+      branch = shlex.quote(branch_name)
+      return f"git clone --branch {branch} --single-branch {repo_url} {repo_path}"
+
+    return f"git clone {repo_url} {repo_path}"
+
   def _collect_exec_commands(self):
     """
     Collect commands to execute inside container.
@@ -241,7 +259,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     ]
     if self.cfg_setup_repo:
       commands.append(f"rm -rf {repo_path}")
-      commands.append(f"git clone {self.repo_url} {repo_path}")
+      commands.append(self._build_git_clone_command(repo_path))
     # endif
     # last_commit = commit
     commands.extend([f"cd {repo_path} && {cmd}" for cmd in base_commands])
@@ -303,6 +321,19 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     return None
 
   # --- Git helpers -----------------------------------------------------------
+
+  def _normalize_branch_name(self, branch):
+    """
+    Normalize an optional branch value.
+
+    Treat None and blank strings as unset so missing branch config can fall
+    through to repository default-branch detection.
+    """
+    if branch is None:
+      return None
+
+    branch = str(branch).strip()
+    return branch or None
 
   @property
   def _git_poll_interval(self):
@@ -412,11 +443,11 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     3. 'main' as final fallback
     """
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
-    repo_branch = vcs_data.get('BRANCH')
+    repo_branch = self._normalize_branch_name(vcs_data.get('BRANCH'))
     repo_owner = self._repo_owner or vcs_data.get('REPO_OWNER')
     repo_name = self._repo_name or vcs_data.get('REPO_NAME')
 
-    self.branch = repo_branch or self.branch
+    self.branch = repo_branch or self._normalize_branch_name(self.branch)
 
     if repo_owner and repo_name and repo_branch is None:
       try:
@@ -443,10 +474,11 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       self.P("Git repository owner or name not configured", color='y')
       return (None, None) if return_data else None
 
-    if self.branch is None:
+    branch = self._normalize_branch_name(self.branch)
+    if branch is None:
       api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}"
     else:
-      api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/branches/{self.branch}"
+      api_url = f"https://api.github.com/repos/{repo_owner}/{repo_name}/branches/{branch}"
 
     headers = {"Authorization": f"token {token}"} if token else {}
 
