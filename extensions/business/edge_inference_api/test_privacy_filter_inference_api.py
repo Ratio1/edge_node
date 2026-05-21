@@ -60,6 +60,11 @@ class PrivacyFilterInferenceApiPluginTests(unittest.TestCase):
         "MODEL_REVISION": "rev-privacy",
         "HF_RUNTIME": "pt",
         "RUNTIME": "transformers",
+        "SERVING_TIMINGS": {
+          "model_pipeline_elapsed_s": 0.456,
+          "active_payloads": 1,
+          "batch_size": 1,
+        },
       },
       metadata={},
       request_data={"metadata": {}, "parameters": {"text": "example text"}},
@@ -86,6 +91,14 @@ class PrivacyFilterInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(result_payload["model_revision"], "rev-privacy")
     self.assertEqual(result_payload["hf_runtime"], "pt")
     self.assertEqual(result_payload["runtime"], "transformers")
+    self.assertEqual(
+      result_payload["serving_timings"],
+      {
+        "model_pipeline_elapsed_s": 0.456,
+        "active_payloads": 1,
+        "batch_size": 1,
+      },
+    )
 
 
 if __name__ == "__main__":

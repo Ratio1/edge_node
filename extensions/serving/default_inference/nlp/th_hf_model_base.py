@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 from pathlib import Path, PurePosixPath
+from time import perf_counter
 
 import torch as th
 
@@ -48,6 +49,7 @@ _CONFIG = {
   "INFERENCE_KWARGS": {},
   "WARMUP_ENABLED": True,
   "WARMUP_TEXT": "Warmup request.",
+  "WARMUP_TEXTS": None,
   "WARMUP_INFERENCE_KWARGS": {},
   "RUNS_ON_EMPTY_INPUT": False,
   "VALIDATION_RULES": {
@@ -81,17 +83,41 @@ class HfOnnxArtifactPipeline:
     self.task = task
     self.framework = "onnxruntime"
     self.max_length = max_length
+    self.last_call_timings = None
     return
 
   def __call__(self, texts, **kwargs):
     """Run one or more text inputs through the ONNX artifact."""
     is_single_text = isinstance(texts, str)
     text_items = [texts] if is_single_text else list(texts or [])
-    results = [
-      self._run_single_text(text=text, inference_kwargs=kwargs)
-      for text in text_items
-    ]
+    call_started = perf_counter()
+    results = []
+    item_timings = []
+    for text in text_items:
+      result, timings = self._run_single_text(text=text, inference_kwargs=kwargs)
+      results.append(result)
+      item_timings.append(timings)
+    self.last_call_timings = self._aggregate_item_timings(
+      item_timings=item_timings,
+      total_s=perf_counter() - call_started,
+    )
     return results[0] if is_single_text or len(results) == 1 else results
+
+  def _aggregate_item_timings(self, item_timings, total_s):
+    """Aggregate per-text ONNX timings for the last pipeline call."""
+    totals = {
+      "onnx_pipeline_total_s": total_s,
+      "onnx_items": len(item_timings),
+    }
+    for key in (
+      "onnx_tokenize_s",
+      "onnx_prepare_inputs_s",
+      "onnx_session_run_s",
+      "onnx_decode_s",
+      "onnx_single_total_s",
+    ):
+      totals[key] = sum(item.get(key, 0.0) for item in item_timings)
+    return totals
 
   def _get_max_length(self, inference_kwargs):
     max_length = inference_kwargs.get("max_length")
@@ -214,17 +240,33 @@ class HfOnnxArtifactPipeline:
     return self.decoder(outputs_by_name, self.schema, **decoder_kwargs)
 
   def _run_single_text(self, text, inference_kwargs):
+    total_started = perf_counter()
+    started = perf_counter()
     encoded = self._tokenize(text=text, inference_kwargs=inference_kwargs)
+    tokenize_s = perf_counter() - started
+    started = perf_counter()
     session_inputs = self._prepare_session_inputs(encoded)
+    prepare_inputs_s = perf_counter() - started
     output_names = self._output_names()
+    started = perf_counter()
     raw_outputs = self.session.run(output_names, session_inputs)
+    session_run_s = perf_counter() - started
+    started = perf_counter()
     outputs_by_name = self._build_output_map(raw_outputs, output_names)
-    return self._call_decoder(
+    decoded = self._call_decoder(
       outputs_by_name=outputs_by_name,
       text=text,
       encoded=encoded,
       inference_kwargs=inference_kwargs,
     )
+    decode_s = perf_counter() - started
+    return decoded, {
+      "onnx_tokenize_s": tokenize_s,
+      "onnx_prepare_inputs_s": prepare_inputs_s,
+      "onnx_session_run_s": session_run_s,
+      "onnx_decode_s": decode_s,
+      "onnx_single_total_s": perf_counter() - total_started,
+    }
 
 
 class ThHfModelBase(BaseServingProcess):
@@ -409,6 +451,22 @@ class ThHfModelBase(BaseServingProcess):
       return warmup_text.strip()
     return None
 
+  def get_warmup_texts(self):
+    """Return startup warmup texts, preserving `WARMUP_TEXT` compatibility."""
+    warmup_texts = getattr(self, "cfg_warmup_texts", None)
+    if isinstance(warmup_texts, str):
+      warmup_texts = [warmup_texts]
+    if isinstance(warmup_texts, (list, tuple)):
+      texts = [
+        text.strip()
+        for text in warmup_texts
+        if isinstance(text, str) and len(text.strip()) > 0
+      ]
+      if texts:
+        return texts
+    warmup_text = self.get_warmup_text()
+    return [warmup_text] if warmup_text is not None else []
+
   def build_warmup_inference_kwargs(self):
     """Build keyword arguments used by the startup warmup call.
 
@@ -422,6 +480,11 @@ class ThHfModelBase(BaseServingProcess):
       **self.build_inference_kwargs(),
       **dict(self.cfg_warmup_inference_kwargs or {}),
     }
+
+  def get_last_pipeline_timings(self):
+    """Return optional stage timings exposed by the loaded pipeline adapter."""
+    timings = getattr(self.classifier, "last_call_timings", None)
+    return dict(timings) if isinstance(timings, dict) else {}
 
   def _get_device_map(self):
     """Return the model-loading device map for helper configuration.
@@ -963,22 +1026,25 @@ class ThHfModelBase(BaseServingProcess):
     Notes
     -----
     Warmup is intentionally skipped when the pipeline is missing, disabled, or
-    configured with an empty warmup text.
+    configured without valid warmup texts.
     """
     if not self.cfg_warmup_enabled or self.classifier is None:
       return
-    warmup_text = self.get_warmup_text()
-    if warmup_text is None:
+    warmup_texts = self.get_warmup_texts()
+    if not warmup_texts:
       return
     warmup_started_at = self.time()
     self.P(
-      f"Running startup warmup for {self.get_model_name()} on device {self.device}...",
+      f"Running startup warmup for {self.get_model_name()} on device {self.device} "
+      f"with {len(warmup_texts)} text(s)...",
       color="y",
     )
-    self.classifier(
-      warmup_text,
-      **self.build_warmup_inference_kwargs(),
-    )
+    warmup_inference_kwargs = self.build_warmup_inference_kwargs()
+    for warmup_text in warmup_texts:
+      self.classifier(
+        warmup_text,
+        **warmup_inference_kwargs,
+      )
     self.P(
       "Startup warmup completed in {:.3f}s".format(self.time() - warmup_started_at),
       color="g",

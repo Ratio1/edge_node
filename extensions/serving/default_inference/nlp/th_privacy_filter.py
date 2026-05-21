@@ -9,6 +9,7 @@ This serving is tailored to the privacy-filter span-detection contract:
 
 import json
 import math
+from time import perf_counter
 
 from extensions.serving.default_inference.nlp.th_hf_model_base import (
   _CONFIG as BASE_HF_MODEL_CONFIG,
@@ -26,16 +27,89 @@ _CONFIG = {
   "TRUST_REMOTE_CODE": False,
   "EXPECTED_AI_ENGINES": ["privacy_filter"],
   "MAX_LENGTH": None,
+  "HF_ONNX_RUNTIME_KEY": "onnx_quantized",
   "INFERENCE_KWARGS": {
     "aggregation_strategy": "simple",
   },
+  # Multi-text privacy-filter warmup is configurable, but should not be the
+  # built-in default: on CPU the representative warmup corpus took minutes and
+  # still did not remove varied-input ONNX Runtime shape tails.
+  "WARMUP_TEXTS": None,
 }
 
 
 FIXED_CENSOR_SIZE = 4
-PRIVACY_FILTER_ONNX_RUNTIME_KEY = "onnx_fp32"
+PRIVACY_FILTER_ONNX_RUNTIME_KEY = "onnx_quantized"
 PRIVACY_FILTER_ONNX_MODEL_FILE = "onnx/model.onnx"
 PRIVACY_FILTER_VITERBI_FILE = "viterbi_calibration.json"
+PRIVACY_FILTER_ONNX_COMMON_FILES = [
+  "config.json",
+  "tokenizer.json",
+  "tokenizer_config.json",
+  PRIVACY_FILTER_VITERBI_FILE,
+]
+PRIVACY_FILTER_ONNX_RUNTIME_SPECS = {
+  # Keep the preferred CPU runtime first as a defensive fallback for configs
+  # that request generic "onnx" without setting HF_ONNX_RUNTIME_KEY.
+  "onnx_quantized": {
+    "model": "onnx/model_quantized.onnx",
+    "sidecars": ["onnx/model_quantized.onnx_data"],
+    "precision": "quantized",
+    "stability": "experimental_cpu",
+  },
+  "onnx_fp32": {
+    "model": PRIVACY_FILTER_ONNX_MODEL_FILE,
+    "sidecars": [
+      "onnx/model.onnx_data",
+      "onnx/model.onnx_data_1",
+      "onnx/model.onnx_data_2",
+    ],
+    "precision": "fp32",
+    "stability": "default",
+  },
+  "onnx_fp16": {
+    "model": "onnx/model_fp16.onnx",
+    "sidecars": [
+      "onnx/model_fp16.onnx_data",
+      "onnx/model_fp16.onnx_data_1",
+    ],
+    "precision": "fp16",
+    "stability": "experimental_cpu",
+  },
+  "onnx_q4": {
+    "model": "onnx/model_q4.onnx",
+    "sidecars": ["onnx/model_q4.onnx_data"],
+    "precision": "q4",
+    "stability": "experimental_cpu",
+  },
+  "onnx_q4f16": {
+    "model": "onnx/model_q4f16.onnx",
+    "sidecars": ["onnx/model_q4f16.onnx_data"],
+    "precision": "q4f16",
+    "stability": "experimental_cpu",
+  },
+}
+
+
+def _build_privacy_filter_onnx_runtime_config(spec):
+  """Build a manifest runtime entry for one public Privacy Filter ONNX file."""
+  files = [
+    *PRIVACY_FILTER_ONNX_COMMON_FILES,
+    spec["model"],
+    *spec.get("sidecars", []),
+  ]
+  return {
+    "runtime": "onnxruntime",
+    "entrypoint": "onnxruntime.InferenceSession",
+    "pipeline_task": "token-classification",
+    "model": spec["model"],
+    "decoder_type": "privacy_filter_span_decoder",
+    "files": files,
+    "recommended_allow_patterns": list(files),
+    "providers": ["CPUExecutionProvider"],
+    "precision": spec.get("precision"),
+    "stability": spec.get("stability"),
+  }
 
 
 class ThPrivacyFilter(ThHfModelBase):
@@ -50,34 +124,8 @@ class ThPrivacyFilter(ThHfModelBase):
       "source_repo_id": "openai/privacy-filter",
       "pipeline_task": "token-classification",
       "runtimes": {
-        PRIVACY_FILTER_ONNX_RUNTIME_KEY: {
-          "runtime": "onnxruntime",
-          "entrypoint": "onnxruntime.InferenceSession",
-          "pipeline_task": "token-classification",
-          "model": PRIVACY_FILTER_ONNX_MODEL_FILE,
-          "decoder_type": "privacy_filter_span_decoder",
-          "files": [
-            "config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            PRIVACY_FILTER_VITERBI_FILE,
-            PRIVACY_FILTER_ONNX_MODEL_FILE,
-            "onnx/model.onnx_data",
-            "onnx/model.onnx_data_1",
-            "onnx/model.onnx_data_2",
-          ],
-          "recommended_allow_patterns": [
-            "config.json",
-            "tokenizer.json",
-            "tokenizer_config.json",
-            PRIVACY_FILTER_VITERBI_FILE,
-            PRIVACY_FILTER_ONNX_MODEL_FILE,
-            "onnx/model.onnx_data",
-            "onnx/model.onnx_data_1",
-            "onnx/model.onnx_data_2",
-          ],
-          "providers": ["CPUExecutionProvider"],
-        },
+        runtime_key: _build_privacy_filter_onnx_runtime_config(spec)
+        for runtime_key, spec in PRIVACY_FILTER_ONNX_RUNTIME_SPECS.items()
       },
     }
 
@@ -546,10 +594,23 @@ class ThPrivacyFilter(ThHfModelBase):
         "max_length": self.cfg_max_length,
         **inference_kwargs,
       }
-    outputs = [] if not texts else self.classifier(texts, **inference_kwargs)
+    model_pipeline_elapsed_s = 0.0
+    if texts:
+      model_pipeline_started = perf_counter()
+      outputs = self.classifier(texts, **inference_kwargs)
+      model_pipeline_elapsed_s = perf_counter() - model_pipeline_started
+    else:
+      outputs = []
+    serving_timings = {
+      "model_pipeline_elapsed_s": model_pipeline_elapsed_s,
+      "active_payloads": len(texts),
+      "batch_size": len(texts),
+      **self.get_last_pipeline_timings(),
+    }
     return {
       "payloads": preprocessed_inputs,
       "outputs": outputs,
+      "serving_timings": serving_timings,
     }
 
   def _is_privacy_span(self, item):
@@ -717,6 +778,7 @@ class ThPrivacyFilter(ThHfModelBase):
     output_iter = iter(normalized_outputs)
     decoded = []
     additional_metadata = self.get_additional_metadata()
+    serving_timings = predictions.get("serving_timings")
     for payload_info in predictions["payloads"]:
       if payload_info.get("ignored"):
         decoded.append([])
@@ -731,7 +793,7 @@ class ThPrivacyFilter(ThHfModelBase):
         label = self._extract_span_label(span)
         if label is not None and label not in detected_labels:
           detected_labels.append(label)
-      decoded.append({
+      decoded_output = {
         "REQUEST_ID": payload_info["request_id"],
         "TEXT": payload_info["text"],
         "result": findings,
@@ -741,5 +803,8 @@ class ThPrivacyFilter(ThHfModelBase):
         "DETECTED_ENTITY_GROUPS": detected_labels,
         "FINDINGS_COUNT": len(findings),
         **additional_metadata,
-      })
+      }
+      if isinstance(serving_timings, dict):
+        decoded_output["SERVING_TIMINGS"] = dict(serving_timings)
+      decoded.append(decoded_output)
     return decoded

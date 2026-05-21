@@ -105,4 +105,6 @@ class PrivacyFilterInferenceApiPlugin(TextClassifierInferenceApiPlugin):
       result_payload["hf_runtime"] = inference["HF_RUNTIME"]
     if "RUNTIME" in inference:
       result_payload["runtime"] = inference["RUNTIME"]
+    if "SERVING_TIMINGS" in inference:
+      result_payload["serving_timings"] = inference["SERVING_TIMINGS"]
     return result_payload

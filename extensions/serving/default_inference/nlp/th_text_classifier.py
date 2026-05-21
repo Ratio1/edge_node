@@ -6,6 +6,8 @@ pipeline API. This keeps the serving surface minimal and makes custom
 remote-code models usable by specifying only the Hugging Face model id.
 """
 
+from time import perf_counter
+
 from extensions.serving.default_inference.nlp.th_hf_model_base import (
   _CONFIG as BASE_HF_MODEL_CONFIG,
   ThHfModelBase,
@@ -199,7 +201,9 @@ class ThTextClassifier(ThHfModelBase):
       **dict(self.cfg_inference_kwargs or {}),
     }
     outputs = []
+    model_pipeline_elapsed_s = 0.0
     if texts:
+      model_pipeline_started = perf_counter()
       try:
         outputs = self.classifier(texts, **inference_kwargs)
       except AttributeError as exc:
@@ -209,9 +213,17 @@ class ThTextClassifier(ThHfModelBase):
           self.classifier(text, **inference_kwargs)
           for text in texts
         ]
+      model_pipeline_elapsed_s = perf_counter() - model_pipeline_started
+    serving_timings = {
+      "model_pipeline_elapsed_s": model_pipeline_elapsed_s,
+      "active_payloads": len(texts),
+      "batch_size": len(texts),
+      **self.get_last_pipeline_timings(),
+    }
     return {
       "payloads": preprocessed_inputs,
       "outputs": outputs,
+      "serving_timings": serving_timings,
     }
 
   def _normalize_outputs(self, outputs, expected_count):
@@ -249,7 +261,7 @@ class ThTextClassifier(ThHfModelBase):
       f"Pipeline returned a scalar output for {expected_count} payloads."
     )
 
-  def _default_decode_outputs(self, outputs, payloads):
+  def _default_decode_outputs(self, outputs, payloads, serving_timings=None):
     """Decode raw model outputs into the serving response contract.
 
     Parameters
@@ -277,13 +289,16 @@ class ThTextClassifier(ThHfModelBase):
       serving_target = None
       if isinstance(payload_info.get("struct_payload"), dict):
         serving_target = payload_info["struct_payload"].get("__SERVING_TARGET__")
-      decoded.append({
+      decoded_output = {
         "REQUEST_ID": payload_info["request_id"],
         "TEXT": payload_info["text"],
         "result": model_output,
         "SERVING_TARGET": serving_target,
         **additional_metadata,
-      })
+      }
+      if isinstance(serving_timings, dict):
+        decoded_output["SERVING_TIMINGS"] = dict(serving_timings)
+      decoded.append(decoded_output)
     return decoded
 
   def post_process(self, predictions):
@@ -304,4 +319,5 @@ class ThTextClassifier(ThHfModelBase):
     return self._default_decode_outputs(
       outputs=predictions["outputs"],
       payloads=predictions["payloads"],
+      serving_timings=predictions.get("serving_timings"),
     )

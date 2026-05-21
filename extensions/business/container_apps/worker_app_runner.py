@@ -218,6 +218,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     repo_path = shlex.quote(repo_path)
     if self.branch:
       branch = shlex.quote(self.branch)
+      # Fetch only the configured branch; this keeps startup clones smaller
+      # and avoids accidentally running code from a different branch.
       return f"git clone --branch {branch} --single-branch {repo_url} {repo_path}"
     return f"git clone {repo_url} {repo_path}"
 

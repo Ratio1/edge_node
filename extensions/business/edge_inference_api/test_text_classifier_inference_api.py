@@ -165,6 +165,11 @@ class TextClassifierInferenceApiPluginTests(unittest.TestCase):
         "MODEL_VERSION": "2026.05.09",
         "HF_RUNTIME": "onnx_fp32",
         "RUNTIME": "onnxruntime",
+        "SERVING_TIMINGS": {
+          "model_pipeline_elapsed_s": 0.123,
+          "active_payloads": 1,
+          "batch_size": 1,
+        },
       },
       metadata={},
       request_data={"metadata": {}, "parameters": {"text": "example text"}},
@@ -178,6 +183,14 @@ class TextClassifierInferenceApiPluginTests(unittest.TestCase):
     self.assertEqual(result_payload["model_version"], "2026.05.09")
     self.assertEqual(result_payload["hf_runtime"], "onnx_fp32")
     self.assertEqual(result_payload["runtime"], "onnxruntime")
+    self.assertEqual(
+      result_payload["serving_timings"],
+      {
+        "model_pipeline_elapsed_s": 0.123,
+        "active_payloads": 1,
+        "batch_size": 1,
+      },
+    )
 
   def test_handle_inferences_falls_back_to_payload_request_id(self):
     plugin = TextClassifierInferenceApiPlugin()

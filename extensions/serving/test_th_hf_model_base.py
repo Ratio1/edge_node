@@ -31,6 +31,7 @@ class _FakeBaseServingProcess:
     self.cfg_inference_kwargs = kwargs.get("INFERENCE_KWARGS", {})
     self.cfg_warmup_enabled = kwargs.get("WARMUP_ENABLED", True)
     self.cfg_warmup_text = kwargs.get("WARMUP_TEXT", "Warmup request.")
+    self.cfg_warmup_texts = kwargs.get("WARMUP_TEXTS")
     self.cfg_warmup_inference_kwargs = kwargs.get("WARMUP_INFERENCE_KWARGS", {})
     self.cfg_model_instance_id = kwargs.get("MODEL_INSTANCE_ID")
     self.os_environ = {}
@@ -216,6 +217,21 @@ class ThHfModelBaseTests(unittest.TestCase):
       _PIPELINE_FACTORY.instance.inference_calls[-1][1]["truncation"],
       True,
     )
+
+  def test_startup_runs_configured_warmup_texts(self):
+    plugin = _ConcreteHfModel(
+      MODEL_NAME="test/model",
+      PIPELINE_TASK="text-classification",
+      WARMUP_TEXTS=["short warmup", "longer warmup text"],
+    )
+
+    plugin.startup()
+
+    calls = _PIPELINE_FACTORY.instance.inference_calls
+    self.assertEqual([call[0] for call in calls[-2:]], ["short warmup", "longer warmup text"])
+    for _text, kwargs in calls[-2:]:
+      self.assertEqual(kwargs["max_length"], 512)
+      self.assertEqual(kwargs["truncation"], True)
 
   def test_startup_adds_4bit_quantization_config(self):
     plugin = _ConcreteHfModel(
@@ -874,6 +890,10 @@ class ThHfModelBaseTests(unittest.TestCase):
     self.assertEqual(inputs["input_ids"].dtype, "int64")
     self.assertEqual(fake_tokenizer.calls[-1][1]["return_tensors"], "np")
     self.assertTrue(fake_tokenizer.calls[-1][1]["return_offsets_mapping"])
+    self.assertEqual(pipeline.last_call_timings["onnx_items"], 1)
+    self.assertIn("onnx_tokenize_s", pipeline.last_call_timings)
+    self.assertIn("onnx_session_run_s", pipeline.last_call_timings)
+    self.assertIn("onnx_decode_s", pipeline.last_call_timings)
 
   def test_onnx_artifact_pipeline_materializes_symlinked_external_data(self):
     plugin = _ConcreteHfModel(
