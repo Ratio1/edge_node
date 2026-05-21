@@ -1733,7 +1733,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
     return PentesterApi01Plugin
 
-  def _make_plugin(self, jobs, live=None, triage=None, triage_audit=None):
+  def _make_plugin(self, jobs, live=None, triage=None, triage_audit=None, integrations=None):
     """Build a plugin mock backed by mutable hash dicts keyed by hkey."""
     plugin = MagicMock()
     plugin.cfg_instance_id = "test-instance"
@@ -1746,6 +1746,7 @@ class TestPurgeAllJobs(unittest.TestCase):
       "test-instance:live": dict(live or {}),
       "test-instance:triage": dict(triage or {}),
       "test-instance:triage:audit": dict(triage_audit or {}),
+      "test-instance:integrations": dict(integrations or {}),
     }
 
     def _hgetall(*, hkey):
@@ -1776,7 +1777,18 @@ class TestPurgeAllJobs(unittest.TestCase):
     }
     triage = {"orphan-job:f-1": {"status": "accepted_risk"}}
     triage_audit = {"orphan-job:f-1": [{"status": "accepted_risk"}]}
-    plugin = self._make_plugin(jobs, live=live, triage=triage, triage_audit=triage_audit)
+    integrations = {
+      "wazuh": {"last_success_at": "2026-05-19T00:00:00Z", "last_event_id": "event-1"},
+      "taxii": {"last_artifact_cid": "cid-taxii"},
+    }
+    plugin = self._make_plugin(
+      jobs,
+      live=live,
+      triage=triage,
+      triage_audit=triage_audit,
+      integrations=integrations,
+    )
+    plugin._hashes["test-instance:auth"] = {"user-1": {"role": "admin"}}
 
     def _fake_purge(job_id):
       plugin._hashes["test-instance"].pop(job_id, None)
@@ -1793,6 +1805,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     self.assertEqual(result["jobs_failed"], 0)
     self.assertEqual(result["jobs_force_purged"], 0)
     self.assertEqual(result["cids_deleted"], 6)
+    self.assertEqual(result["integration_status_rows_deleted"], 2)
     plugin.stop_and_delete_job.assert_not_called()
     self.assertEqual(result["cids_failed"], 0)
     self.assertEqual(result["errors"], [])
@@ -1801,12 +1814,15 @@ class TestPurgeAllJobs(unittest.TestCase):
     self.assertEqual(plugin._hashes["test-instance:live"], {})
     self.assertEqual(plugin._hashes["test-instance:triage"], {})
     self.assertEqual(plugin._hashes["test-instance:triage:audit"], {})
+    self.assertEqual(plugin._hashes["test-instance:integrations"], {})
+    self.assertEqual(plugin._hashes["test-instance:auth"], {"user-1": {"role": "admin"}})
 
     plugin._log_audit_event.assert_called_once()
     event_name, payload = plugin._log_audit_event.call_args.args
     self.assertEqual(event_name, "all_data_purged")
     self.assertEqual(payload["jobs_succeeded"], 2)
     self.assertEqual(payload["jobs_failed"], 0)
+    self.assertEqual(payload["integration_status_rows_deleted"], 2)
 
   def test_partial_failure_keeps_failed_job_state(self):
     """A job whose CIDs failed to delete keeps its CStore + triage + live rows."""
@@ -1826,7 +1842,14 @@ class TestPurgeAllJobs(unittest.TestCase):
     triage_audit = {
       "job-bad:f-2": [{"status": "accepted_risk"}],
     }
-    plugin = self._make_plugin(jobs, live=live, triage=triage, triage_audit=triage_audit)
+    integrations = {"taxii": {"last_artifact_cid": "cid-taxii"}}
+    plugin = self._make_plugin(
+      jobs,
+      live=live,
+      triage=triage,
+      triage_audit=triage_audit,
+      integrations=integrations,
+    )
 
     def _fake_purge(job_id):
       if job_id == "job-good":
@@ -1852,6 +1875,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     self.assertEqual(result["jobs_failed"], 1)
     self.assertEqual(result["cids_deleted"], 3)
     self.assertEqual(result["cids_failed"], 1)
+    self.assertEqual(result["integration_status_rows_deleted"], 0)
     self.assertEqual(len(result["errors"]), 1)
     self.assertEqual(result["errors"][0]["job_id"], "job-bad")
 
@@ -1860,6 +1884,7 @@ class TestPurgeAllJobs(unittest.TestCase):
     self.assertIn("job-bad:node-B", plugin._hashes["test-instance:live"])
     self.assertIn("job-bad:f-2", plugin._hashes["test-instance:triage"])
     self.assertIn("job-bad:f-2", plugin._hashes["test-instance:triage:audit"])
+    self.assertEqual(plugin._hashes["test-instance:integrations"], integrations)
 
     # job-good rows were tombstoned
     self.assertNotIn("job-good", plugin._hashes["test-instance"])

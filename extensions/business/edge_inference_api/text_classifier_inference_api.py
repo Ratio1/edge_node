@@ -405,6 +405,18 @@ class TextClassifierInferenceApiPlugin(BasePlugin):
         result_payload["tokenizer_name"] = inference["TOKENIZER_NAME"]
       if "PIPELINE_TASK" in inference:
         result_payload["pipeline_task"] = inference["PIPELINE_TASK"]
+      if "MODEL" in inference:
+        result_payload["model"] = inference["MODEL"]
+      if "MODEL_VERSION" in inference:
+        result_payload["model_version"] = inference["MODEL_VERSION"]
+      if "MODEL_REVISION" in inference:
+        result_payload["model_revision"] = inference["MODEL_REVISION"]
+      if "HF_RUNTIME" in inference:
+        result_payload["hf_runtime"] = inference["HF_RUNTIME"]
+      if "RUNTIME" in inference:
+        result_payload["runtime"] = inference["RUNTIME"]
+      if "SERVING_TIMINGS" in inference:
+        result_payload["serving_timings"] = inference["SERVING_TIMINGS"]
       return result_payload
 
     def handle_inference_for_request(

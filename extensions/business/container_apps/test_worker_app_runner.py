@@ -89,7 +89,23 @@ def _install_dummy_base_plugin():
   sys.modules['naeural_core.business.base.web_app.base_tunnel_engine_plugin'] = base_tunnel_mod
 
 
+def _install_dummy_docker_module():
+  docker_mod = types.ModuleType('docker')
+  docker_types_mod = types.ModuleType('docker.types')
+
+  class _DummyDeviceRequest:
+    def __init__(self, *args, **kwargs):
+      self.args = args
+      self.kwargs = kwargs
+
+  docker_types_mod.DeviceRequest = _DummyDeviceRequest
+  docker_mod.types = docker_types_mod
+  sys.modules.setdefault('docker', docker_mod)
+  sys.modules.setdefault('docker.types', docker_types_mod)
+
+
 _install_dummy_base_plugin()
+_install_dummy_docker_module()
 
 from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
 from extensions.business.container_apps import container_utils
@@ -171,6 +187,29 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     }
     plugin._configure_repo_url()
     self.assertEqual(plugin.repo_url, "https://token@github.com/ratio1/demo.git")
+
+  def test_git_clone_command_uses_configured_branch(self):
+    """Test repository setup clones the same branch monitored for updates."""
+    plugin = self._make_plugin()
+    plugin.repo_url = "https://github.com/ratio1/demo.git"
+    plugin.branch = "develop"
+
+    command = plugin._build_git_clone_command("/app")
+
+    self.assertEqual(
+      command,
+      "git clone --branch develop --single-branch https://github.com/ratio1/demo.git /app",
+    )
+
+  def test_git_clone_command_allows_branchless_clone(self):
+    """Test repository setup keeps the old default-branch behavior if branch is absent."""
+    plugin = self._make_plugin()
+    plugin.repo_url = "https://github.com/ratio1/demo.git"
+    plugin.branch = None
+
+    command = plugin._build_git_clone_command("/app")
+
+    self.assertEqual(command, "git clone https://github.com/ratio1/demo.git /app")
 
   def test_check_image_updates_respects_autoupdate_flag(self):
     """Test that image update checks respect the AUTOUPDATE flag."""
