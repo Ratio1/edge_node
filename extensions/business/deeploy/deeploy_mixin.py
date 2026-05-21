@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -466,6 +467,177 @@ class _DeeployMixin:
       )
     else:
       self.Pd("Signature verification OK: recovered={}".format(sender))
+    return sender
+
+
+  def _deeploy_clean_payload_for_hash(self, payload):
+    """
+    Remove signature-envelope fields before Deeploy v3 payload hashing.
+
+    Parameters
+    ----------
+    payload : dict
+        Deeploy request payload as received from the API request body.
+
+    Returns
+    -------
+    dict
+        Payload copy containing only data fields that are bound by ``EE_HASH``.
+    """
+    ignored_keys = {
+      "address",
+      "signature",
+      BASE_CT.BCctbase.SIGN,
+      BASE_CT.BCctbase.SENDER,
+      BASE_CT.BCctbase.HASH,
+      BASE_CT.BCctbase.ETH_SIGN,
+      BASE_CT.BCctbase.ETH_SENDER,
+      "SIGN_CANON_V",
+    }
+    return {key: payload[key] for key in payload if key not in ignored_keys}
+
+
+  def _deeploy_payload_hash_v3(self, payload):
+    """
+    Compute the Deeploy v3 compact-canonical SHA-256 payload hash.
+
+    Parameters
+    ----------
+    payload : dict
+        Deeploy request payload as received from the API request body.
+
+    Returns
+    -------
+    str
+        Lowercase SHA-256 hex digest of the compact canonical payload.
+    """
+    cleaned_payload = self._deeploy_clean_payload_for_hash(payload)
+    compact_json = self.bc.compact_canonical_json(cleaned_payload)
+    return hashlib.sha256(compact_json.encode("utf-8")).hexdigest()
+
+
+  def _deeploy_wrapper_nodes_count(self, payload):
+    """
+    Resolve the node count shown in the Deeploy v3 signing wrapper.
+
+    Parameters
+    ----------
+    payload : dict
+        Deeploy request payload.
+
+    Returns
+    -------
+    int or str
+        Explicit target node list length when present, otherwise
+        ``target_nodes_count`` or ``0``.
+    """
+    target_nodes = payload.get(DEEPLOY_KEYS.TARGET_NODES, [])
+    if isinstance(target_nodes, list) and len(target_nodes) > 0:
+      return len(target_nodes)
+    target_nodes_count = payload.get(DEEPLOY_KEYS.TARGET_NODES_COUNT, 0)
+    if isinstance(target_nodes_count, (int, str)):
+      return target_nodes_count
+    return 0
+
+
+  def _deeploy_wrapper_message(self, request_type, payload, payload_hash):
+    """
+    Build the human-readable Deeploy v3 wallet message.
+
+    Parameters
+    ----------
+    request_type : str
+        Operation label shown to the user, for example ``create pipeline``.
+    payload : dict
+        Deeploy request payload.
+    payload_hash : str
+        Compact-canonical SHA-256 payload hash bound by the signature.
+
+    Returns
+    -------
+    str
+        Exact multiline message that ``deeploy-dapp`` signs.
+    """
+    lines = [
+      "Please sign this Deeploy request:",
+      "",
+      f"Request type: {request_type}",
+    ]
+    plugins = payload.get(DEEPLOY_KEYS.PLUGINS)
+    if isinstance(plugins, list):
+      lines.append(f"Plugins: {len(plugins)}")
+    lines.append(f"Nodes: {self._deeploy_wrapper_nodes_count(payload)}")
+    lines.append(f"Hash: {payload_hash}")
+    return "\n".join(lines)
+
+
+  def __verify_signature_v3(self, payload, request_type):
+    """
+    Verify a Deeploy v3 human-readable wrapper signature.
+
+    Parameters
+    ----------
+    payload : dict
+        Deeploy request payload with ``EE_HASH``, ``EE_ETH_SIGN``, and
+        ``EE_ETH_SENDER`` fields.
+    request_type : str
+        Operation label used in the signed wrapper message.
+
+    Returns
+    -------
+    str or None
+        Recovered signer address, matching the v2 verifier contract.
+
+    Raises
+    ------
+    ValueError
+        If the request type is missing or the claimed hash does not match the
+        compact-canonical payload.
+    """
+    if not request_type:
+      raise ValueError("Deeploy v3 signature verification requires a request type.")
+
+    claimed_sender = payload.get(BASE_CT.BCctbase.ETH_SENDER, "unknown")
+    signature = payload.get(BASE_CT.BCctbase.ETH_SIGN, "missing")
+    claimed_hash = str(payload.get(BASE_CT.BCctbase.HASH, "")).lower()
+    expected_hash = self._deeploy_payload_hash_v3(payload)
+
+    if expected_hash != claimed_hash:
+      raise ValueError(
+        "Invalid Deeploy v3 request hash: expected {} but received {}.".format(
+          expected_hash, claimed_hash
+        )
+      )
+
+    message = self._deeploy_wrapper_message(
+      request_type=request_type,
+      payload=payload,
+      payload_hash=expected_hash,
+    )
+    self.Pd(
+      "Verifying Deeploy v3 signature for claimed sender={}, sig={}..., request_type='{}'".format(
+        claimed_sender, signature[:20] if isinstance(signature, str) else signature, request_type
+      )
+    )
+    sender = self.bc.eth_verify_text_signature(
+      text=message,
+      signature=signature,
+      message_prefix="",
+      no_hash=True,
+      expected_signer=claimed_sender,
+    )
+    if sender is None:
+      self.P(
+        "Deeploy v3 signature verification FAILED for claimed sender={}.".format(claimed_sender),
+        color='r'
+      )
+    elif sender.lower() != claimed_sender.lower():
+      self.P(
+        "Deeploy v3 signature verification MISMATCH: recovered={} != claimed={}".format(sender, claimed_sender),
+        color='r'
+      )
+    else:
+      self.Pd("Deeploy v3 signature verification OK: recovered={}".format(sender))
     return sender
 
 
@@ -1100,7 +1272,26 @@ class _DeeployMixin:
     return str_timestamp
   
   
-  def deeploy_verify_and_get_inputs(self, request: dict, require_sender_is_oracle: bool = False, no_hash: bool = True):
+  def deeploy_verify_and_get_inputs(self, request: dict, require_sender_is_oracle: bool = False, no_hash: bool = True, request_type: str = None):
+    """
+    Verify Deeploy request auth and return normalized request inputs.
+
+    Parameters
+    ----------
+    request : dict
+        Deeploy request payload.
+    require_sender_is_oracle : bool, optional
+        Require the signer to be an oracle instead of a whitelisted wallet.
+    no_hash : bool, optional
+        Existing v2 signature mode flag. Preserved for legacy callers.
+    request_type : str, optional
+        Human-readable v3 request type used when ``EE_HASH`` is present.
+
+    Returns
+    -------
+    tuple[str, NestedDotDict]
+        Verified sender and request inputs with defaults applied.
+    """
     sender = request.get(BASE_CT.BCctbase.ETH_SENDER)
     assert self.bc.is_valid_eth_address(sender), f"Invalid sender address: {sender}"
 
@@ -1120,7 +1311,10 @@ class _DeeployMixin:
     inputs = self.NestedDotDict(request_with_defaults)
     self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
 
-    addr = self.__verify_signature(request, no_hash=no_hash)
+    if BASE_CT.BCctbase.HASH in request:
+      addr = self.__verify_signature_v3(request, request_type=request_type)
+    else:
+      addr = self.__verify_signature(request, no_hash=no_hash)
     if addr is None:
       raise ValueError("Signature verification failed: could not recover address from signature")
     if addr.lower() != sender.lower():

@@ -13,6 +13,21 @@ from uuid import uuid4
 
 DEEPLOY_PLUS_PREFERRED_NODES_HKEY = "plus_preferred_nodes"
 
+
+class DEEPLOY_REQUEST_TYPES:
+  CREATE_PIPELINE = "create pipeline"
+  UPDATE_PIPELINE = "update pipeline"
+  SCALE_UP_JOB_WORKERS = "scale up workers"
+  DELETE_PIPELINE = "delete pipeline"
+  SEND_APP_COMMAND = "send app command"
+  SEND_INSTANCE_COMMAND = "send instance command"
+  GET_APPS = "get apps"
+  GET_PREFERRED_NODES = "get preferred nodes"
+  SAVE_PREFERRED_NODES = "save preferred nodes"
+  GET_R1FS_JOB_PIPELINE = "get r1fs job pipeline"
+  GET_ORACLE_JOB_DETAILS = "get oracle job details"
+
+
 class DEEPLOY_KEYS:
   STATUS = "status"
   ERROR = "error"

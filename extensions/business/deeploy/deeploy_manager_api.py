@@ -20,6 +20,7 @@ from .deeploy_const import (
   DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST,
   DEEPLOY_NODE_SPECS_REQUEST, DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
   DEEPLOY_GET_PREFERRED_NODES_REQUEST, DEEPLOY_SAVE_PREFERRED_NODES_REQUEST,
+  DEEPLOY_REQUEST_TYPES,
 )
   
 
@@ -305,7 +306,7 @@ class DeeployManagerApiPlugin(
     """
     try:
       self.Pd(f"Called Deeploy get_apps endpoint")
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=DEEPLOY_REQUEST_TYPES.GET_APPS)
       auth_result = self.deeploy_get_auth_result(inputs)
       
       apps = self._get_apps_by_escrow_active_jobs(
@@ -418,7 +419,7 @@ class DeeployManagerApiPlugin(
     """
     try:
       self.Pd("Called Deeploy get_preferred_nodes endpoint")
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=DEEPLOY_REQUEST_TYPES.GET_PREFERRED_NODES)
       auth_result = self.deeploy_get_auth_result(inputs)
       plus_level = self._get_request_plus_level(sender, auth_result)
       preferred_nodes = self.deeploy_load_preferred_nodes(auth_result)
@@ -467,7 +468,7 @@ class DeeployManagerApiPlugin(
     """
     try:
       self.Pd("Called Deeploy save_preferred_nodes endpoint")
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=DEEPLOY_REQUEST_TYPES.SAVE_PREFERRED_NODES)
       auth_result = self.deeploy_get_auth_result(inputs)
       plus_level = self._get_request_plus_level(sender, auth_result)
       if DEEPLOY_KEYS.PREFERRED_NODES not in inputs:
@@ -518,7 +519,8 @@ class DeeployManagerApiPlugin(
     """
     try:
       self.__ensure_eth_balance()
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      request_type = DEEPLOY_REQUEST_TYPES.CREATE_PIPELINE if is_create else DEEPLOY_REQUEST_TYPES.UPDATE_PIPELINE
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=request_type)
       normalized_request = self._normalize_plugins_input(self.deepcopy(request))
       if DEEPLOY_KEYS.PLUGINS in normalized_request:
         inputs[DEEPLOY_KEYS.PLUGINS] = normalized_request[DEEPLOY_KEYS.PLUGINS]
@@ -1306,7 +1308,7 @@ class DeeployManagerApiPlugin(
     """
     try:
       self.__ensure_eth_balance()
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=DEEPLOY_REQUEST_TYPES.SCALE_UP_JOB_WORKERS)
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       if not job_id:
@@ -1420,7 +1422,7 @@ class DeeployManagerApiPlugin(
     try:
       self.__ensure_eth_balance()
       self.Pd(f"Called Deeploy delete_pipeline endpoint")
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=DEEPLOY_REQUEST_TYPES.DELETE_PIPELINE)
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
@@ -1480,7 +1482,7 @@ class DeeployManagerApiPlugin(
     try:
       self.__ensure_eth_balance()
       self.Pd(f"Called Deeploy send_instance_command endpoint")
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=DEEPLOY_REQUEST_TYPES.SEND_INSTANCE_COMMAND)
       auth_result = self.deeploy_get_auth_result(inputs)
 
       # Validate the request fields.
@@ -1534,7 +1536,7 @@ class DeeployManagerApiPlugin(
     try:
       self.__ensure_eth_balance()
       self.Pd(f"Called Deeploy send_app_command endpoint")
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=DEEPLOY_REQUEST_TYPES.SEND_APP_COMMAND)
       auth_result = self.deeploy_get_auth_result(inputs)
 
       # Validate the request fields.
@@ -1599,7 +1601,12 @@ class DeeployManagerApiPlugin(
         A dictionary containing the job details
     """
     try:
-      sender, inputs = self.deeploy_verify_and_get_inputs(request, require_sender_is_oracle=True, no_hash=False)
+      sender, inputs = self.deeploy_verify_and_get_inputs(
+        request,
+        require_sender_is_oracle=True,
+        no_hash=False,
+        request_type=DEEPLOY_REQUEST_TYPES.GET_ORACLE_JOB_DETAILS,
+      )
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       if not job_id:
         msg = f"{DEEPLOY_ERRORS.REQUEST11}: Job ID is required."
@@ -1656,7 +1663,7 @@ class DeeployManagerApiPlugin(
         A dictionary with the stored pipeline payload from R1FS.
     """
     try:
-      sender, inputs = self.deeploy_verify_and_get_inputs(request)
+      sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=DEEPLOY_REQUEST_TYPES.GET_R1FS_JOB_PIPELINE)
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
 
