@@ -1,4 +1,4 @@
-from ..models import JobArchive
+from ..models import JobArchive, render_legacy_llm_fields
 from ..repositories import ArtifactRepository, JobStateRepository
 from .reconciliation import reconcile_job_workers
 from .triage import get_job_archive_with_triage
@@ -180,6 +180,10 @@ def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None
       target_pass = passes[-1]
 
     llm_analysis = target_pass.get("llm_analysis")
+    quick_summary = target_pass.get("quick_summary")
+    if not llm_analysis:
+      llm_analysis, derived_summary = render_legacy_llm_fields(target_pass.get("llm_report_sections"))
+      quick_summary = quick_summary or derived_summary
     if not llm_analysis:
       return {
         "error": "No LLM analysis available for this pass",
@@ -217,7 +221,7 @@ def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None
       "num_workers": len(target_pass.get("worker_reports", {}) or {}),
       "total_passes": len(passes),
       "analysis": llm_analysis,
-      "quick_summary": target_pass.get("quick_summary"),
+      "quick_summary": quick_summary,
     }
 
   pass_reports = job_specs.get("pass_reports", [])
@@ -252,6 +256,10 @@ def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None
       return {"error": "Pass report not found in R1FS", "cid": report_cid, "job_id": job_id}
 
     llm_analysis = pass_data.get("llm_analysis")
+    quick_summary = pass_data.get("quick_summary")
+    if not llm_analysis:
+      llm_analysis, derived_summary = render_legacy_llm_fields(pass_data.get("llm_report_sections"))
+      quick_summary = quick_summary or derived_summary
     if not llm_analysis:
       return {
         "error": "No LLM analysis available for this pass",
@@ -270,7 +278,7 @@ def get_job_analysis(owner, job_id: str = "", cid: str = "", pass_nr: int = None
       "num_workers": len(job_specs.get("workers", {})),
       "total_passes": len(pass_reports),
       "analysis": llm_analysis,
-      "quick_summary": pass_data.get("quick_summary"),
+      "quick_summary": quick_summary,
     }
   except Exception as e:
     return {"error": str(e), "cid": report_cid, "job_id": job_id}

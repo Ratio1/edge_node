@@ -3,6 +3,19 @@
 The catalog defines stable, countable authenticated-testing scenarios. Probe
 implementations may emit a subset on any given target depending on configured
 endpoints, auth state, and safety gates.
+
+Schema (per-entry dict):
+  id:     stable scenario identifier (see docs/adr/2026-05-12-scenario-id-convention.md).
+  family: owning probe area; for v1 OWASP API Top 10 use one of
+          "api_access", "api_auth", "api_data", "api_config", "api_abuse";
+          legacy families "access_control"/"misconfiguration"/"injection"/
+          "business_logic" remain for OWASP Web Top 10 scenarios.
+  title:  short human-facing title rendered in reports.
+  owasp:  OWASP category tag, e.g. "A01:2021" (Web Top 10 2021) or
+          "API1:2023" (API Top 10 2023).
+  attack: optional list of MITRE ATT&CK technique IDs the finding maps to.
+          Mandatory and non-empty for v1 OWASP API Top 10 scenarios
+          (Subphase 1.2). Legacy PT-A* entries may omit this field.
 """
 
 GRAYBOX_SCENARIO_CATALOG = (
@@ -96,10 +109,125 @@ GRAYBOX_SCENARIO_CATALOG = (
   {"id": "PT-A07-02", "family": "misconfiguration", "title": "Password reset token predictability", "owasp": "A07:2021"},
   {"id": "PT-A07-03", "family": "misconfiguration", "title": "Session not rotated after login", "owasp": "A07:2021"},
   {"id": "PT-A07-04", "family": "misconfiguration", "title": "Account enumeration by response body", "owasp": "A07:2021"},
-  {"id": "PT-API7-01", "family": "injection", "title": "Authenticated SSRF", "owasp": "A10:2021"},
+  # Legacy SSRF scenario kept under its original ID for backward compat.
+  # Probe emits owasp="API7:2023"; catalog now matches.
+  {"id": "PT-API7-01", "family": "injection", "title": "Authenticated SSRF",
+   "owasp": "API7:2023", "attack": ["T1190"]},
+
+  # ── OWASP API Top 10 2023 (v1 — Subphase 1.2) ──────────────────────────
+  # ATT&CK mappings copied from the V1 Scenario Manifest in the plan
+  # (`_todos/2026-05-12-graybox-api-top10-plan-detailed.md`, lines 90-115).
+  # API10 (Unsafe Consumption) intentionally omitted — Phase 9 follow-up.
+
+  # API1 — Broken Object Level Authorization
+  {"id": "PT-OAPI1-01", "family": "api_access",
+   "title": "API object-level authorization bypass (BOLA)",
+   "owasp": "API1:2023", "attack": ["T1190", "T1078"]},
+
+  # API2 — Broken Authentication
+  {"id": "PT-OAPI2-01", "family": "api_auth",
+   "title": "API JWT missing-signature accepted (alg=none)",
+   "owasp": "API2:2023", "attack": ["T1078", "T1552"]},
+  {"id": "PT-OAPI2-02", "family": "api_auth",
+   "title": "API JWT signed with weak HMAC secret",
+   "owasp": "API2:2023", "attack": ["T1212", "T1552"]},
+  {"id": "PT-OAPI2-03", "family": "api_auth",
+   "title": "API token not invalidated on logout",
+   "owasp": "API2:2023", "attack": ["T1078"]},
+
+  # API3 — Broken Object Property Level Authorization (BOPLA)
+  {"id": "PT-OAPI3-01", "family": "api_data",
+   "title": "API response leaks sensitive properties (excessive exposure)",
+   "owasp": "API3:2023", "attack": ["T1552", "T1190"]},
+  {"id": "PT-OAPI3-02", "family": "api_data",
+   "title": "API accepts mass assignment of privileged properties",
+   "owasp": "API3:2023", "attack": ["T1565", "T1078"]},
+
+  # API4 — Unrestricted Resource Consumption
+  {"id": "PT-OAPI4-01", "family": "api_abuse",
+   "title": "API endpoint lacks pagination cap",
+   "owasp": "API4:2023", "attack": ["T1499"]},
+  {"id": "PT-OAPI4-02", "family": "api_abuse",
+   "title": "API endpoint accepts oversized payload",
+   "owasp": "API4:2023", "attack": ["T1499"]},
+  {"id": "PT-OAPI4-03", "family": "api_abuse",
+   "title": "API endpoint lacks rate limit",
+   "owasp": "API4:2023", "attack": ["T1499"]},
+
+  # API5 — Broken Function Level Authorization
+  {"id": "PT-OAPI5-01", "family": "api_access",
+   "title": "API function-level authorization bypass (regular as admin, read)",
+   "owasp": "API5:2023", "attack": ["T1190", "T1078"]},
+  {"id": "PT-OAPI5-02", "family": "api_access",
+   "title": "API function-level authorization bypass (anonymous as user, read)",
+   "owasp": "API5:2023", "attack": ["T1190"]},
+  {"id": "PT-OAPI5-03", "family": "api_access",
+   "title": "API method-override authorization bypass",
+   "owasp": "API5:2023", "attack": ["T1190", "T1078"]},
+  {"id": "PT-OAPI5-04", "family": "api_access",
+   "title": "API function-level authorization bypass (regular as admin, mutating)",
+   "owasp": "API5:2023", "attack": ["T1190", "T1078", "T1565"]},
+
+  # API6 — Unrestricted Access to Sensitive Business Flows
+  {"id": "PT-OAPI6-01", "family": "api_abuse",
+   "title": "API business flow lacks rate limit / abuse controls",
+   "owasp": "API6:2023", "attack": ["T1499", "T1190"]},
+  {"id": "PT-OAPI6-02", "family": "api_abuse",
+   "title": "API business flow lacks uniqueness check",
+   "owasp": "API6:2023", "attack": ["T1565", "T1190"]},
+
+  # API8 — Security Misconfiguration
+  {"id": "PT-OAPI8-01", "family": "api_config",
+   "title": "API permissive CORS configuration",
+   "owasp": "API8:2023", "attack": ["T1190"]},
+  {"id": "PT-OAPI8-02", "family": "api_config",
+   "title": "API response missing security headers",
+   "owasp": "API8:2023", "attack": ["T1190"]},
+  {"id": "PT-OAPI8-03", "family": "api_config",
+   "title": "API debug endpoint exposed",
+   "owasp": "API8:2023", "attack": ["T1552", "T1190"]},
+  {"id": "PT-OAPI8-04", "family": "api_config",
+   "title": "API verbose error response leaks internals",
+   "owasp": "API8:2023", "attack": ["T1190"]},
+  {"id": "PT-OAPI8-05", "family": "api_config",
+   "title": "API advertises unexpected HTTP methods",
+   "owasp": "API8:2023", "attack": ["T1190"]},
+
+  # API9 — Improper Inventory Management
+  {"id": "PT-OAPI9-01", "family": "api_config",
+   "title": "API OpenAPI/Swagger specification publicly exposed",
+   "owasp": "API9:2023", "attack": ["T1595", "T1190"]},
+  {"id": "PT-OAPI9-02", "family": "api_config",
+   "title": "API legacy version still live (version sprawl)",
+   "owasp": "API9:2023", "attack": ["T1595", "T1190"]},
+  {"id": "PT-OAPI9-03", "family": "api_config",
+   "title": "API deprecated path still serving requests",
+   "owasp": "API9:2023", "attack": ["T1190"]},
 )
 
 
 def graybox_scenario_ids() -> set[str]:
   """Return stable graybox scenario IDs."""
   return {entry["id"] for entry in GRAYBOX_SCENARIO_CATALOG}
+
+
+def graybox_scenario(scenario_id: str) -> dict | None:
+  """Return the catalog entry for ``scenario_id`` or None if missing."""
+  for entry in GRAYBOX_SCENARIO_CATALOG:
+    if entry["id"] == scenario_id:
+      return entry
+  return None
+
+
+def attack_for_scenario(scenario_id: str) -> list[str]:
+  """Return the ATT&CK technique IDs for ``scenario_id``.
+
+  Returns an empty list when the scenario is unknown or the entry has no
+  ``attack`` field set. Used by `ProbeBase.emit_vulnerable(..., attack=None)`
+  as the default attack mapping so the catalog is the single source of
+  truth (see Subphase 1.6).
+  """
+  entry = graybox_scenario(scenario_id)
+  if entry is None:
+    return []
+  return list(entry.get("attack", []))

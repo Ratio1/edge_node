@@ -38,6 +38,12 @@ class CStoreWorker:
   terminal_reason: str = None
   error: str = None
   unreachable_at: float = None
+  graybox_assignment_strategy: str = None
+  assigned_scenario_ids: list = None
+  assigned_request_budget: int = None
+  budget_scope: str = None
+  assignment_hash: str = None
+  stateful_policy: str = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -59,6 +65,12 @@ class CStoreWorker:
       terminal_reason=d.get("terminal_reason"),
       error=d.get("error"),
       unreachable_at=d.get("unreachable_at"),
+      graybox_assignment_strategy=d.get("graybox_assignment_strategy"),
+      assigned_scenario_ids=d.get("assigned_scenario_ids"),
+      assigned_request_budget=d.get("assigned_request_budget"),
+      budget_scope=d.get("budget_scope"),
+      assignment_hash=d.get("assignment_hash"),
+      stateful_policy=d.get("stateful_policy"),
     )
 
 
@@ -111,6 +123,12 @@ class CStoreJobRunning:
   job_revision: int = 0
   redmesh_job_start_attestation: dict = None
   last_attestation_at: float = None
+  soc_event_status: dict = None
+  detection_correlation: dict = None
+  stix_export: dict = None
+  opencti_export: dict = None
+  taxii_export: dict = None
+  graybox_assignment_summary: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -140,6 +158,12 @@ class CStoreJobRunning:
       job_revision=d.get("job_revision", 0),
       redmesh_job_start_attestation=d.get("redmesh_job_start_attestation"),
       last_attestation_at=d.get("last_attestation_at"),
+      soc_event_status=d.get("soc_event_status"),
+      detection_correlation=d.get("detection_correlation"),
+      stix_export=d.get("stix_export"),
+      opencti_export=d.get("opencti_export"),
+      taxii_export=d.get("taxii_export"),
+      graybox_assignment_summary=d.get("graybox_assignment_summary"),
     )
 
 
@@ -171,6 +195,12 @@ class CStoreJobFinalized:
   job_cid: str                      # the one CID -> JobArchive
   job_config_cid: str               # standalone config CID (needed for purge cleanup)
   misp_export: dict = None          # MISP export metadata (event_uuid, passes_exported, etc.)
+  soc_event_status: dict = None
+  detection_correlation: dict = None
+  stix_export: dict = None
+  opencti_export: dict = None
+  taxii_export: dict = None
+  graybox_assignment_summary: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -198,6 +228,12 @@ class CStoreJobFinalized:
       job_cid=d["job_cid"],
       job_config_cid=d["job_config_cid"],
       misp_export=d.get("misp_export"),
+      soc_event_status=d.get("soc_event_status"),
+      detection_correlation=d.get("detection_correlation"),
+      stix_export=d.get("stix_export"),
+      opencti_export=d.get("opencti_export"),
+      taxii_export=d.get("taxii_export"),
+      graybox_assignment_summary=d.get("graybox_assignment_summary"),
     )
 
 

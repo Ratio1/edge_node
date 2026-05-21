@@ -13,6 +13,9 @@ from extensions.business.cybersec.red_mesh.graybox.models import (
   GrayboxProbeDefinition,
   GrayboxProbeRunResult,
 )
+from extensions.business.cybersec.red_mesh.graybox.scenario_runtime import (
+  build_graybox_worker_assignments,
+)
 from extensions.business.cybersec.red_mesh.constants import (
   ScanType, GRAYBOX_PROBE_REGISTRY,
 )
@@ -35,6 +38,10 @@ def _make_job_config(**overrides):
   cfg.excluded_features = []
   cfg.scan_min_delay = 0.0
   cfg.authorized = True
+  assignments, error = build_graybox_worker_assignments(["node-1"])
+  if error is None:
+    for key, value in assignments["node-1"].items():
+      setattr(cfg, key, value)
   for k, v in overrides.items():
     setattr(cfg, k, v)
   return cfg
@@ -126,6 +133,38 @@ class TestStateShape(unittest.TestCase):
     self.assertIn("8000", worker.state["graybox_results"])
     self.assertIn("_test_probe", worker.state["graybox_results"]["8000"])
     self.assertEqual(worker.state["web_tests_info"], {})
+
+  def test_store_findings_redacts_configured_api_key_names(self):
+    worker = _make_worker(target_config={
+      "api_security": {
+        "auth": {
+          "auth_type": "api_key",
+          "api_key_location": "query",
+          "api_key_query_param": "customer_key",
+          "api_key_header_name": "X-Customer-Api-Key",
+        },
+      },
+    })
+    finding = GrayboxFinding(
+      scenario_id="PT-OAPI1-01",
+      title="API object-level authorization bypass (BOLA)",
+      status="vulnerable",
+      severity="HIGH",
+      owasp="API1:2023",
+      evidence=[
+        "endpoint=https://api.example/users?customer_key=SECRET99&page=1",
+        "X-Customer-Api-Key: SECRET-HEADER",
+      ],
+    )
+
+    worker._store_findings("_graybox_api_access", [finding])
+
+    stored = worker.state["graybox_results"]["8000"]["_graybox_api_access"]
+    haystack = str(stored)
+    self.assertNotIn("SECRET99", haystack)
+    self.assertNotIn("SECRET-HEADER", haystack)
+    self.assertIn("customer_key=<redacted>", haystack)
+    self.assertIn("X-Customer-Api-Key: <redacted>", haystack)
 
 
 class TestStatus(unittest.TestCase):
@@ -276,6 +315,58 @@ class TestExecution(unittest.TestCase):
         GrayboxLocalWorker.get_supported_features(),
         ["_graybox_alpha", "_graybox_weak_auth"],
       )
+
+  def test_supported_features_include_api_top10_families(self):
+    """All five OWASP API Top 10 probe families dispatch via the worker."""
+    features = GrayboxLocalWorker.get_supported_features()
+    for key in (
+      "_graybox_api_access", "_graybox_api_auth", "_graybox_api_data",
+      "_graybox_api_config", "_graybox_api_abuse",
+    ):
+      with self.subTest(key=key):
+        self.assertIn(key, features)
+
+  def test_api_family_skeletons_dispatch_cleanly(self):
+    """Skeleton run() returns an empty finding list on each new family.
+
+    Confirms the worker registry can resolve each module-relative dotted
+    path and the class can be instantiated against a minimal context.
+    """
+    import importlib
+    pkg = "extensions.business.cybersec.red_mesh.graybox.probes"
+    new_entries = [
+      e for e in GRAYBOX_PROBE_REGISTRY
+      if e["key"] in {
+        "_graybox_api_access", "_graybox_api_auth", "_graybox_api_data",
+        "_graybox_api_config", "_graybox_api_abuse",
+      }
+    ]
+    self.assertEqual(len(new_entries), 5)
+    for entry in new_entries:
+      with self.subTest(key=entry["key"]):
+        module_name, class_name = entry["cls"].split(".", 1)
+        mod = importlib.import_module(f"{pkg}.{module_name}")
+        cls = getattr(mod, class_name)
+        auth = MagicMock()
+        auth.regular_session = None
+        safety = MagicMock()
+        # Skeleton instantiates with the base ProbeBase signature.
+        probe = cls(
+          target_url="http://testapp.local",
+          auth_manager=auth,
+          target_config=MagicMock(),
+          safety=safety,
+        )
+        result = probe.run()
+        # Result must be iterable; the actual content depends on which
+        # subphase has wired probe methods. Subphase 1.3 acceptance was
+        # "dispatches cleanly without exception"; once Phase 2 lands real
+        # probes, MagicMock target_config produces inconclusive findings
+        # (which still satisfies the contract).
+        self.assertIsNotNone(result)
+        for f in result:
+          # Every emitted finding must at least carry a recognised status.
+          self.assertIn(f.status, ("vulnerable", "not_vulnerable", "inconclusive"))
 
   def test_scenario_stats(self):
     """Scenario stats count findings by status."""

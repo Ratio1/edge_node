@@ -1,0 +1,342 @@
+"""OWASP API Top 10 — Subphases 3.2 + 3.3 (ApiAbuseProbes)."""
+
+from __future__ import annotations
+
+import json
+import unittest
+from unittest.mock import MagicMock
+
+import requests
+
+from extensions.business.cybersec.red_mesh.graybox.probes.api_abuse import (
+  ApiAbuseProbes,
+)
+from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+  ApiBusinessFlow, ApiResourceEndpoint, ApiSecurityConfig, GrayboxTargetConfig,
+)
+
+
+def _resp(status=200, text="", headers=None):
+  r = MagicMock()
+  r.status_code = status
+  r.text = text
+  r.headers = headers or {}
+  return r
+
+
+def _make_probe(*, resource_endpoints=None, business_flows=None,
+                 allow_stateful=False):
+  cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(
+    resource_endpoints=list(resource_endpoints or []),
+    business_flows=list(business_flows or []),
+  ))
+  auth = MagicMock()
+  auth.official_session = MagicMock()
+  auth.regular_session = MagicMock()
+  safety = MagicMock()
+  safety.throttle = MagicMock()
+  safety.sanitize_error = MagicMock(side_effect=lambda s: s)
+  return ApiAbuseProbes(
+    target_url="http://api.example",
+    auth_manager=auth, target_config=cfg, safety=safety,
+    allow_stateful=allow_stateful,
+  )
+
+
+class TestApi4NoPaginationCap(unittest.TestCase):
+
+  def test_size_explosion_emits_medium(self):
+    ep = ApiResourceEndpoint(path="/api/records/", baseline_limit=10,
+                             abuse_limit=999_999,
+                             allow_high_limit_probe=True)
+    p = _make_probe(resource_endpoints=[ep])
+    # 100B baseline → 1MB abuse response = >5× growth
+    p.auth.official_session.get.side_effect = [
+      _resp(status=200, text="x" * 100),
+      _resp(status=200, text="y" * 1_000_000),
+    ]
+    p.run_safe("api_no_pagination_cap", p._test_no_pagination_cap)
+    vuln = [f for f in p.findings
+            if f.scenario_id == "PT-OAPI4-01" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].severity, "MEDIUM")
+
+  def test_high_limit_probe_caps_requested_limit(self):
+    ep = ApiResourceEndpoint(path="/api/records/", baseline_limit=10,
+                             abuse_limit=999_999,
+                             allow_high_limit_probe=True)
+    p = _make_probe(resource_endpoints=[ep])
+    p.auth.official_session.get.side_effect = [
+      _resp(status=200, text="x" * 100),
+      _resp(status=200, text="y" * 1_000),
+    ]
+
+    p.run_safe("api_no_pagination_cap", p._test_no_pagination_cap)
+
+    self.assertEqual(
+      p.auth.official_session.get.call_args_list[1].kwargs["params"],
+      {"limit": 1000},
+    )
+
+
+class TestApi4OversizedPayload(unittest.TestCase):
+
+  def test_oversized_accepted_medium(self):
+    ep = ApiResourceEndpoint(path="/api/notes/",
+                              allow_oversized_payload_probe=True,
+                              oversized_payload_bytes=65_536)
+    p = _make_probe(resource_endpoints=[ep])
+    p.auth.official_session.post.return_value = _resp(status=201)
+    p.run_safe("api_oversized_payload", p._test_oversized_payload)
+    vuln = [f for f in p.findings
+            if f.scenario_id == "PT-OAPI4-02" and f.status == "vulnerable"]
+    self.assertEqual(vuln[0].severity, "MEDIUM")
+
+
+class TestApi4NoRateLimit(unittest.TestCase):
+
+  def test_only_fires_when_rate_limit_expected(self):
+    ep = ApiResourceEndpoint(path="/api/list/", rate_limit_expected=False)
+    p = _make_probe(resource_endpoints=[ep])
+    p.auth.official_session.get.return_value = _resp(status=200)
+    p.run_safe("api_no_rate_limit", p._test_no_rate_limit)
+    self.assertEqual(
+      [f for f in p.findings if f.scenario_id == "PT-OAPI4-03"], [],
+    )
+
+  def test_10_requests_no_429_or_headers_low(self):
+    ep = ApiResourceEndpoint(path="/api/list/", rate_limit_expected=True)
+    p = _make_probe(resource_endpoints=[ep])
+    p.auth.official_session.get.return_value = _resp(status=200)
+    p.run_safe("api_no_rate_limit", p._test_no_rate_limit)
+    vuln = [f for f in p.findings
+            if f.scenario_id == "PT-OAPI4-03" and f.status == "vulnerable"]
+    self.assertEqual(vuln[0].severity, "LOW")
+
+
+class TestApi6FlowAbuse(unittest.TestCase):
+
+  def test_stateful_disabled_emits_inconclusive(self):
+    flow = ApiBusinessFlow(path="/api/auth/signup/", flow_name="signup",
+                            body_template={"u": "{test_account}", "p": "p"},
+                            test_account="api-low")
+    p = _make_probe(business_flows=[flow], allow_stateful=False)
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-01" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("stateful_probes_disabled",
+                   "\n".join(incon[0].evidence))
+
+  def test_stateful_enabled_without_revert_path_does_not_mutate(self):
+    flow = ApiBusinessFlow(path="/api/auth/signup/", flow_name="signup",
+                            body_template={"u": "{test_account}", "p": "p"},
+                            test_account="api-low")
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-01" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("no_revert_path_configured", "\n".join(incon[0].evidence))
+    p.auth.regular_session.post.assert_not_called()
+
+  def test_rate_limit_flow_reverts_after_confirmed_mutation(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "{test_account}", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "{test_account}"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.regular_session.post.side_effect = [_resp(status=201)] * 6
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    vuln = [f for f in p.findings
+            if f.scenario_id == "PT-OAPI6-01" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].rollback_status, "reverted")
+    self.assertEqual(vuln[0].severity, "MEDIUM")
+    self.assertIn("rollback:", "\n".join(vuln[0].replay_steps))
+    self.assertEqual(
+      p.auth.regular_session.post.call_args_list[-1].args[0],
+      "http://api.example/api/auth/signup/cleanup/",
+    )
+    for call in p.auth.regular_session.post.call_args_list:
+      self.assertEqual(call.kwargs["json"]["u"], "api-low")
+
+  def test_static_flow_body_without_placeholder_does_not_mutate(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "real-user", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "real-user"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-01" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("test_account_placeholder_required",
+                   "\n".join(incon[0].evidence))
+    p.auth.regular_session.post.assert_not_called()
+
+  def test_static_flow_body_requires_explicit_unsafe_override(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "fixture-user", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "fixture-user"},
+      test_account="api-low",
+      allow_static_test_account_body=True,
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.regular_session.post.side_effect = [_resp(status=201)] * 6
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    self.assertTrue(p.auth.regular_session.post.called)
+    self.assertEqual(
+      p.auth.regular_session.post.call_args_list[0].kwargs["json"]["u"],
+      "fixture-user",
+    )
+
+  def test_runtime_state_does_not_mutate_flow_config(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "{test_account}", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "{test_account}"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.regular_session.post.side_effect = [_resp(status=201)] * 6
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    self.assertFalse(hasattr(flow, "_probe_state"))
+    self.assertFalse(hasattr(flow, "_probe_state2"))
+    self.assertEqual(flow.body_template["u"], "{test_account}")
+
+  def test_unsupported_template_expression_does_not_mutate(self):
+    flow = ApiBusinessFlow(
+      path="/api/auth/signup/",
+      flow_name="signup",
+      body_template={"u": "scan-{test_account}", "p": "p"},
+      revert_path="/api/auth/signup/cleanup/",
+      revert_body={"u": "{test_account}"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+
+    p.run_safe("api_flow_no_rate_limit", p._test_flow_no_rate_limit)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-01" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("unsupported_template_expression",
+                   "\n".join(incon[0].evidence))
+    p.auth.regular_session.post.assert_not_called()
+
+  def test_uniqueness_flow_without_revert_path_does_not_mutate(self):
+    flow = ApiBusinessFlow(path="/api/orders/", flow_name="purchase",
+                            body_template={"account": "{test_account}",
+                                           "sku": "sku-1"},
+                            test_account="api-low")
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+
+    p.run_safe("api_flow_no_uniqueness", p._test_flow_no_uniqueness)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-02" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1)
+    self.assertIn("no_revert_path_configured", "\n".join(incon[0].evidence))
+    p.auth.regular_session.post.assert_not_called()
+
+  def test_uniqueness_flow_partial_mutation_still_triggers_revert(self):
+    """B3 (PR406): r1 sent, r2 times out -> revert must run, finding inconclusive."""
+    flow = ApiBusinessFlow(
+      path="/api/orders/",
+      flow_name="purchase",
+      body_template={"account": "{test_account}", "sku": "sku-1"},
+      revert_path="/api/orders/cleanup/",
+      revert_body={"account": "{test_account}", "sku": "sku-1"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    revert_response = _resp(status=204)
+    p.auth.regular_session.post.side_effect = [
+      _resp(status=201),
+      requests.ConnectTimeout("simulated timeout on second send"),
+      revert_response,
+    ]
+
+    p.run_safe("api_flow_no_uniqueness", p._test_flow_no_uniqueness)
+
+    incon = [f for f in p.findings
+             if f.scenario_id == "PT-OAPI6-02" and f.status == "inconclusive"]
+    self.assertEqual(len(incon), 1, p.findings)
+    self.assertEqual(incon[0].rollback_status, "reverted")
+    # Three POSTs: r1, r2 (raises), revert.
+    self.assertEqual(p.auth.regular_session.post.call_count, 3)
+
+  def test_uniqueness_flow_transport_error_before_mutation_skips_revert(self):
+    """If transport fails on r1, nothing was mutated → no revert needed."""
+    flow = ApiBusinessFlow(
+      path="/api/orders/",
+      flow_name="purchase",
+      body_template={"account": "{test_account}", "sku": "sku-1"},
+      revert_path="/api/orders/cleanup/",
+      revert_body={"account": "{test_account}", "sku": "sku-1"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.regular_session.post.side_effect = [
+      requests.ConnectTimeout("simulated timeout on first send"),
+    ]
+
+    p.run_safe("api_flow_no_uniqueness", p._test_flow_no_uniqueness)
+
+    self.assertEqual(p.auth.regular_session.post.call_count, 1)
+
+  def test_uniqueness_flow_revert_failure_escalates_severity(self):
+    flow = ApiBusinessFlow(
+      path="/api/orders/",
+      flow_name="purchase",
+      body_template={"account": "{test_account}", "sku": "sku-1"},
+      revert_path="/api/orders/cleanup/",
+      revert_body={"account": "{test_account}", "sku": "sku-1"},
+      test_account="api-low",
+    )
+    p = _make_probe(business_flows=[flow], allow_stateful=True)
+    p.auth.regular_session.post.side_effect = [
+      _resp(status=201),
+      _resp(status=201),
+      _resp(status=500),
+    ]
+
+    p.run_safe("api_flow_no_uniqueness", p._test_flow_no_uniqueness)
+
+    vuln = [f for f in p.findings
+            if f.scenario_id == "PT-OAPI6-02" and f.status == "vulnerable"]
+    self.assertEqual(len(vuln), 1)
+    self.assertEqual(vuln[0].rollback_status, "revert_failed")
+    self.assertEqual(vuln[0].severity, "HIGH")
+    self.assertEqual(
+      p.auth.regular_session.post.call_args_list[0].kwargs["json"]["account"],
+      "api-low",
+    )
+
+
+if __name__ == "__main__":
+  unittest.main()

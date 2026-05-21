@@ -63,6 +63,13 @@ from extensions.business.cybersec.red_mesh.models.engagement import (
   RulesOfEngagement,
   STRENGTH_OF_TEST,
 )
+from extensions.business.cybersec.red_mesh.models.event_schema import (
+  REDMESH_EVENT_SCHEMA,
+  REDMESH_EVENT_SCHEMA_VERSION,
+  REQUIRED_EVENT_FIELDS,
+  RedMeshEvent,
+  validate_event_dict,
+)
 from extensions.business.cybersec.red_mesh.models.llm_output import (
   LlmReportSections,
   ROADMAP_BUCKETS,
@@ -73,6 +80,7 @@ from extensions.business.cybersec.red_mesh.models.llm_output import (
   SEVERITY_WARNING,
   ValidationIssue,
   ValidationResult,
+  render_legacy_llm_fields,
   validate_llm_output,
 )
 
@@ -111,6 +119,11 @@ __all__ = [
   "ASSET_EXPOSURES",
   "STRENGTH_OF_TEST",
   "POST_EXPLOIT_RULES",
+  "REDMESH_EVENT_SCHEMA",
+  "REDMESH_EVENT_SCHEMA_VERSION",
+  "REQUIRED_EVENT_FIELDS",
+  "RedMeshEvent",
+  "validate_event_dict",
   # llm output (Phase 4)
   "LlmReportSections",
   "ROADMAP_BUCKETS",
@@ -121,5 +134,6 @@ __all__ = [
   "SEVERITY_WARNING",
   "ValidationIssue",
   "ValidationResult",
+  "render_legacy_llm_fields",
   "validate_llm_output",
 ]

@@ -10,10 +10,17 @@ from urllib.parse import urlparse
 
 from ..worker.base import BaseLocalWorker
 from ..constants import GRAYBOX_PROBE_REGISTRY
-from .findings import GrayboxEvidenceArtifact, GrayboxFinding
+from .findings import (
+  FindingRedactionContext,
+  GrayboxEvidenceArtifact,
+  GrayboxFinding,
+)
 from .auth import AuthManager
 from .discovery import DiscoveryModule
+from .http_client import GrayboxHttpClient
 from .safety import SafetyControls
+from .rollback import RollbackJournalRepository
+from .scenario_runtime import GrayboxWorkerAssignment
 from .models import (
   DiscoveryResult,
   GrayboxCredentialSet,
@@ -108,6 +115,27 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.target_config = GrayboxTargetConfig.from_dict(
       job_config.target_config or {}
     )
+    self.assignment = GrayboxWorkerAssignment.from_job_config(job_config)
+
+    # OWASP API Top 10 — Subphase 1.7. Per-scan request budget shared by
+    # every probe instance. Default 1000; configurable via
+    # `target_config.api_security.max_total_requests`.
+    from .budget import RequestBudget
+    if self.assignment.is_valid:
+      budget_total = self.assignment.assigned_request_budget
+    else:
+      budget_total = getattr(
+        self.target_config.api_security, "max_total_requests", 1000,
+      )
+    budget_total = max(1, int(budget_total))
+    self.request_budget = RequestBudget(
+      remaining=budget_total, total=budget_total,
+    )
+    self.http_client = GrayboxHttpClient(
+      self.target_url,
+      allowlist=getattr(job_config, "target_allowlist", None) or [],
+      target_config=self.target_config,
+    )
 
     # Modules (composition)
     self.safety = SafetyControls(
@@ -118,6 +146,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       target_url=self.target_url,
       target_config=self.target_config,
       verify_tls=job_config.verify_tls,
+      http_client=self.http_client,
     )
     self.discovery = DiscoveryModule(
       target_url=self.target_url,
@@ -149,7 +178,18 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "aborted": False,
       "abort_reason": "",
       "abort_phase": "",
+      "graybox_assignment": (
+        self.assignment.to_dict() if self.assignment.is_valid else {}
+      ),
+      "rollback_journal": [],
     }
+    self.rollback_journal = RollbackJournalRepository(
+      job_id=job_id,
+      worker_id=self.local_worker_id,
+      assignment_revision=self.assignment.assignment_revision
+      if self.assignment.is_valid else 0,
+      records=self.state["rollback_journal"],
+    )
     # _phase_open is only touched on the worker thread — no cross-thread
     # reads. Guards the finally clause from double-closing a phase that
     # its owning method already closed explicitly.
@@ -189,6 +229,15 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "scenarios_inconclusive": scenario_stats["inconclusive"],
       "scenarios_error": scenario_stats["error"],
     })
+    # OWASP API Top 10 — Subphase 1.7. Per-scan request budget snapshot
+    # surfaces in scan_metrics so operators can see whether the scan was
+    # budget-bound (and tune target_config.api_security.max_total_requests
+    # accordingly).
+    if self.request_budget is not None:
+      snap = self.request_budget.snapshot()
+      metrics["budget_total"] = snap["total"]
+      metrics["budget_remaining"] = snap["remaining"]
+      metrics["budget_exhausted_count"] = snap["exhausted_count"]
     status["scan_metrics"] = metrics
     status["scenario_stats"] = scenario_stats
 
@@ -251,7 +300,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
         color='y',
       )
     except Exception as exc:
-      self._record_fatal(self.safety.sanitize_error(str(exc)))
+      self._record_fatal(self._sanitize_error(str(exc)))
     finally:
       self._safe_cleanup()
       if self._phase_open and self._phase:
@@ -266,7 +315,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     except Exception as exc:
       self.P(
         "[GRAYBOX] auth.cleanup raised during shutdown: %s"
-        % self.safety.sanitize_error(str(exc)),
+        % self._sanitize_error(str(exc)),
         color='y',
       )
 
@@ -294,6 +343,13 @@ class GrayboxLocalWorker(BaseLocalWorker):
     self.metrics.phase_start("preflight")
     self._phase_open = True
     try:
+      if not self.assignment.is_valid:
+        self._abort(
+          "Invalid graybox worker assignment: "
+          + self.assignment.validation_error,
+          reason_class="assignment_invalid",
+        )
+
       target_error = self.safety.validate_target(
         self.target_url, self.job_config.authorized,
       )
@@ -372,6 +428,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self._phase_open = False
 
   def _build_probe_kwargs(self, discovery_result: DiscoveryResult) -> dict:
+    allowed_scenario_ids = getattr(self.job_config, "assigned_scenario_ids", None)
     return GrayboxProbeContext(
       target_url=self.target_url,
       auth_manager=self.auth,
@@ -381,6 +438,15 @@ class GrayboxLocalWorker(BaseLocalWorker):
       discovered_forms=discovery_result.forms,
       regular_username=self._credentials.regular.username if self._credentials.regular else "",
       allow_stateful=self.job_config.allow_stateful_probes,
+      request_budget=self.request_budget,
+      allowed_scenario_ids=(
+        None if allowed_scenario_ids is None else tuple(allowed_scenario_ids)
+      ),
+      rollback_journal=self.rollback_journal,
+      job_id=self.job_id,
+      worker_id=self.local_worker_id,
+      assignment_revision=self.assignment.assignment_revision
+      if self.assignment.is_valid else 0,
     )
 
   def _run_probe_phase(self, discovery_result: DiscoveryResult):
@@ -524,16 +590,40 @@ class GrayboxLocalWorker(BaseLocalWorker):
     """Store GrayboxFinding dicts in graybox_results under the port key."""
     run_result = self._normalize_probe_run_result(findings)
     port_results = self.state["graybox_results"].setdefault(self._port_key, {})
-    port_results[key] = {
-      "findings": [f.to_dict() for f in run_result.findings],
-      "artifacts": [
-        GrayboxEvidenceArtifact.from_value(artifact).to_dict()
-        for artifact in run_result.artifacts
-      ],
-      "outcome": run_result.outcome,
-    }
+    with FindingRedactionContext(
+      secret_field_names=self._configured_secret_field_names(),
+    ):
+      port_results[key] = {
+        "findings": [f.to_dict() for f in run_result.findings],
+        "artifacts": [
+          GrayboxEvidenceArtifact.from_value(artifact).to_dict()
+          for artifact in run_result.artifacts
+        ],
+        "outcome": run_result.outcome,
+      }
     for finding in run_result.findings:
       self.metrics.record_finding(getattr(finding, "severity", "INFO"))
+
+  def _configured_secret_field_names(self):
+    api_security = getattr(self.target_config, "api_security", None)
+    auth = getattr(api_security, "auth", None) if api_security is not None else None
+    if auth is None:
+      return ()
+    names = []
+    for attr in ("api_key_header_name", "api_key_query_param",
+                  "bearer_token_header_name"):
+      value = getattr(auth, attr, None)
+      if isinstance(value, str) and value:
+        names.append(value)
+    return tuple(names)
+
+  def _sanitize_error(self, value):
+    try:
+      return self.safety.sanitize_error(
+        str(value), secret_field_names=self._configured_secret_field_names(),
+      )
+    except TypeError:
+      return self.safety.sanitize_error(str(value))
 
   def _store_auth_results(self):
     port_info = self.state["service_info"].setdefault(self._port_key, {})
@@ -566,7 +656,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
 
   def _record_probe_error(self, store_key, exc):
     """Record per-probe error without killing the scan."""
-    sanitized = self.safety.sanitize_error(str(exc))
+    sanitized = self._sanitize_error(str(exc))
     self._store_findings(store_key, [GrayboxFinding(
       scenario_id=f"ERR-{store_key}",
       title=f"Probe error: {store_key}",

@@ -182,9 +182,12 @@ class OracleApiPlugin(BasePlugin):
   
   def __get_signed_data(self, node_addr : str, epochs : list, epochs_vals : list, sign=True, node_addr_eth=None):
     """    
-    Sign the given data using the blockchain engine.
-    Returns the signature. 
-    Use the data param as it will be modified in place.
+    Sign the requested node availability range using the blockchain engine.
+
+    The EVM signature covers the compact claim payload:
+    ``node_eth_address, from_epoch, to_epoch, packed_availabilities``. The
+    response also keeps the expanded ``epochs`` and ``epochs_vals`` lists so
+    API consumers can inspect the oracle data that was packed.
     
     Parameters
     ----------
@@ -209,9 +212,15 @@ class OracleApiPlugin(BasePlugin):
       )    
       eth_signature = res["signature"]
       inputs = res["eth_signed_data"]
+      from_epoch = res["from_epoch"]
+      to_epoch = res["to_epoch"]
+      packed_availabilities = res["packed_availabilities"]
     else:
       eth_signature = []
       inputs = []
+      from_epoch = epochs[0] if len(epochs) > 0 else None
+      to_epoch = epochs[-1] if len(epochs) > 0 else None
+      packed_availabilities = "0x"
     
     eth_signatures = [eth_signature]
     eth_addresses = [self.bc.eth_address]
@@ -226,6 +235,9 @@ class OracleApiPlugin(BasePlugin):
       'node_alias': node_alias,
       'epochs': epochs,
       'epochs_vals': epochs_vals,
+      'from_epoch': from_epoch,
+      'to_epoch': to_epoch,
+      'packed_availabilities': packed_availabilities,
       
       'eth_signed_data' : {
         "input" : inputs,

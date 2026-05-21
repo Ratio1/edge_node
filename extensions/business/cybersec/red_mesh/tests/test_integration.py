@@ -1719,6 +1719,374 @@ class TestPhase14Purge(unittest.TestCase):
     self.assertEqual(result, purge_result)
 
 
+class TestPurgeAllJobs(unittest.TestCase):
+  """purge_all_jobs: bulk wipe across every RedMesh job."""
+
+  @classmethod
+  def _mock_plugin_modules(cls):
+    if 'extensions.business.cybersec.red_mesh.pentester_api_01' in sys.modules:
+      return
+    mock_plugin_modules()
+
+  def _get_plugin_class(self):
+    self._mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+    return PentesterApi01Plugin
+
+  def _make_plugin(self, jobs, live=None, triage=None, triage_audit=None, integrations=None):
+    """Build a plugin mock backed by mutable hash dicts keyed by hkey."""
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "test-instance"
+    plugin.ee_addr = "node-A"
+    plugin.P = MagicMock()
+    plugin._log_audit_event = MagicMock()
+
+    hashes = {
+      "test-instance": dict(jobs),
+      "test-instance:live": dict(live or {}),
+      "test-instance:triage": dict(triage or {}),
+      "test-instance:triage:audit": dict(triage_audit or {}),
+      "test-instance:integrations": dict(integrations or {}),
+    }
+
+    def _hgetall(*, hkey):
+      return hashes.get(hkey, {})
+
+    def _hset(*, hkey, key, value):
+      bucket = hashes.setdefault(hkey, {})
+      if value is None:
+        bucket.pop(key, None)
+      else:
+        bucket[key] = value
+
+    plugin.chainstore_hgetall.side_effect = _hgetall
+    plugin.chainstore_hset.side_effect = _hset
+    plugin._hashes = hashes
+    return plugin
+
+  def test_purges_every_job_and_sweeps_orphans(self):
+    """All jobs are purged, orphan secondary-hash rows are tombstoned, audit logged."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "job-1": {"job_id": "job-1", "job_status": "FINALIZED"},
+      "job-2": {"job_id": "job-2", "job_status": "STOPPED"},
+    }
+    live = {
+      "job-1:node-A": {"progress": 100},
+      "orphan-job:node-Z": {"progress": 0},
+    }
+    triage = {"orphan-job:f-1": {"status": "accepted_risk"}}
+    triage_audit = {"orphan-job:f-1": [{"status": "accepted_risk"}]}
+    integrations = {
+      "wazuh": {"last_success_at": "2026-05-19T00:00:00Z", "last_event_id": "event-1"},
+      "taxii": {"last_artifact_cid": "cid-taxii"},
+    }
+    plugin = self._make_plugin(
+      jobs,
+      live=live,
+      triage=triage,
+      triage_audit=triage_audit,
+      integrations=integrations,
+    )
+    plugin._hashes["test-instance:auth"] = {"user-1": {"role": "admin"}}
+
+    def _fake_purge(job_id):
+      plugin._hashes["test-instance"].pop(job_id, None)
+      return {"status": "success", "job_id": job_id, "cids_deleted": 3, "cids_total": 3}
+
+    # FINALIZED/STOPPED jobs route directly to purge_job.
+    plugin.purge_job.side_effect = _fake_purge
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "success")
+    self.assertEqual(result["jobs_total"], 2)
+    self.assertEqual(result["jobs_succeeded"], 2)
+    self.assertEqual(result["jobs_failed"], 0)
+    self.assertEqual(result["jobs_force_purged"], 0)
+    self.assertEqual(result["cids_deleted"], 6)
+    self.assertEqual(result["integration_status_rows_deleted"], 2)
+    plugin.stop_and_delete_job.assert_not_called()
+    self.assertEqual(result["cids_failed"], 0)
+    self.assertEqual(result["errors"], [])
+
+    self.assertEqual(plugin._hashes["test-instance"], {})
+    self.assertEqual(plugin._hashes["test-instance:live"], {})
+    self.assertEqual(plugin._hashes["test-instance:triage"], {})
+    self.assertEqual(plugin._hashes["test-instance:triage:audit"], {})
+    self.assertEqual(plugin._hashes["test-instance:integrations"], {})
+    self.assertEqual(plugin._hashes["test-instance:auth"], {"user-1": {"role": "admin"}})
+
+    plugin._log_audit_event.assert_called_once()
+    event_name, payload = plugin._log_audit_event.call_args.args
+    self.assertEqual(event_name, "all_data_purged")
+    self.assertEqual(payload["jobs_succeeded"], 2)
+    self.assertEqual(payload["jobs_failed"], 0)
+    self.assertEqual(payload["integration_status_rows_deleted"], 2)
+
+  def test_partial_failure_keeps_failed_job_state(self):
+    """A job whose CIDs failed to delete keeps its CStore + triage + live rows."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "job-good": {"job_id": "job-good", "job_status": "FINALIZED"},
+      "job-bad": {"job_id": "job-bad", "job_status": "FINALIZED"},
+    }
+    live = {
+      "job-good:node-A": {"progress": 100},
+      "job-bad:node-B": {"progress": 100},
+    }
+    triage = {
+      "job-good:f-1": {"status": "accepted_risk"},
+      "job-bad:f-2": {"status": "accepted_risk"},
+    }
+    triage_audit = {
+      "job-bad:f-2": [{"status": "accepted_risk"}],
+    }
+    integrations = {"taxii": {"last_artifact_cid": "cid-taxii"}}
+    plugin = self._make_plugin(
+      jobs,
+      live=live,
+      triage=triage,
+      triage_audit=triage_audit,
+      integrations=integrations,
+    )
+
+    def _fake_purge(job_id):
+      if job_id == "job-good":
+        plugin._hashes["test-instance"].pop(job_id, None)
+        return {"status": "success", "job_id": job_id, "cids_deleted": 2, "cids_total": 2}
+      # Simulate purge_job's partial-failure contract: cstore rows preserved.
+      return {
+        "status": "partial",
+        "job_id": job_id,
+        "cids_deleted": 1,
+        "cids_failed": 1,
+        "cids_total": 2,
+        "message": "Some R1FS artifacts could not be deleted.",
+      }
+
+    plugin.purge_job.side_effect = _fake_purge
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["jobs_total"], 2)
+    self.assertEqual(result["jobs_succeeded"], 1)
+    self.assertEqual(result["jobs_failed"], 1)
+    self.assertEqual(result["cids_deleted"], 3)
+    self.assertEqual(result["cids_failed"], 1)
+    self.assertEqual(result["integration_status_rows_deleted"], 0)
+    self.assertEqual(len(result["errors"]), 1)
+    self.assertEqual(result["errors"][0]["job_id"], "job-bad")
+
+    # job-bad cstore + per-job secondary rows preserved
+    self.assertIn("job-bad", plugin._hashes["test-instance"])
+    self.assertIn("job-bad:node-B", plugin._hashes["test-instance:live"])
+    self.assertIn("job-bad:f-2", plugin._hashes["test-instance:triage"])
+    self.assertIn("job-bad:f-2", plugin._hashes["test-instance:triage:audit"])
+    self.assertEqual(plugin._hashes["test-instance:integrations"], integrations)
+
+    # job-good rows were tombstoned
+    self.assertNotIn("job-good", plugin._hashes["test-instance"])
+    self.assertNotIn("job-good:node-A", plugin._hashes["test-instance:live"])
+    self.assertNotIn("job-good:f-1", plugin._hashes["test-instance:triage"])
+
+  def test_exception_falls_back_to_force_purge(self):
+    """Exception from stop_and_delete_job triggers force-purge (CStore tombstoned)."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "job-explode": {
+        "job_id": "job-explode",
+        "job_status": "FINALIZED",
+        "job_cid": "cid-archive",
+        "job_config_cid": "cid-config",
+      },
+      "job-ok": {"job_id": "job-ok", "job_status": "FINALIZED"},
+    }
+    live = {"job-explode:node-X": {"progress": 50}}
+    triage = {"job-explode:f-99": {"status": "accepted_risk"}}
+    plugin = self._make_plugin(jobs, live=live, triage=triage)
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = True
+
+    def _fake_purge(job_id):
+      if job_id == "job-explode":
+        raise RuntimeError("schema mismatch")
+      plugin._hashes["test-instance"].pop(job_id, None)
+      return {"status": "success", "job_id": job_id, "cids_deleted": 1, "cids_total": 1}
+
+    plugin.purge_job.side_effect = _fake_purge
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["jobs_failed"], 1)
+    self.assertEqual(result["jobs_succeeded"], 1)
+    self.assertEqual(result["jobs_force_purged"], 1)
+    # 1 from job-ok + 2 force-purged CIDs (job_cid + job_config_cid) = 3
+    self.assertEqual(result["cids_deleted"], 3)
+    self.assertGreaterEqual(len(result["errors"]), 1)
+    self.assertEqual(result["errors"][0]["job_id"], "job-explode")
+    self.assertIn("RuntimeError", result["errors"][0]["message"])
+    # job-explode force-purged: cstore + secondary rows tombstoned
+    self.assertNotIn("job-explode", plugin._hashes["test-instance"])
+    self.assertNotIn("job-explode:node-X", plugin._hashes["test-instance:live"])
+    self.assertNotIn("job-explode:f-99", plugin._hashes["test-instance:triage"])
+    # job-ok was purged normally
+    self.assertNotIn("job-ok", plugin._hashes["test-instance"])
+    # R1FS deletes called for the force-purged CIDs
+    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
+    self.assertEqual(deleted_cids, {"cid-archive", "cid-config"})
+
+  def test_force_purge_legacy_schema_recursively_finds_cids(self):
+    """Force-purge of a legacy record finds nested *_cid fields recursively."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "legacy-job": {
+        "job_id": "legacy-job",
+        "weird_old_field": "stale",
+        "report_cid": "cid-report-top",
+        "nested": {
+          "passes": [
+            {"aggregated_report_cid": "cid-agg", "worker_reports": {"w1": {"report_cid": "cid-w1"}}},
+            {"aggregated_report_cid": "cid-agg-2"},
+          ],
+        },
+      },
+    }
+    plugin = self._make_plugin(jobs)
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = True
+
+    plugin.stop_and_delete_job.side_effect = RuntimeError("cannot parse legacy schema")
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["jobs_force_purged"], 1)
+    self.assertEqual(result["cids_deleted"], 4)
+    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
+    self.assertEqual(deleted_cids, {"cid-report-top", "cid-agg", "cid-w1", "cid-agg-2"})
+    self.assertNotIn("legacy-job", plugin._hashes["test-instance"])
+
+  def test_status_error_falls_back_to_force_purge(self):
+    """status='error' from purge_job also triggers force-purge (distinct from 'partial')."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "job-error": {
+        "job_id": "job-error",
+        "job_cid": "cid-x",
+      },
+    }
+    plugin = self._make_plugin(jobs)
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.delete_file.return_value = True
+
+    plugin.stop_and_delete_job.return_value = {"status": "error", "message": "not found"}
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["jobs_force_purged"], 1)
+    self.assertNotIn("job-error", plugin._hashes["test-instance"])
+    deleted_cids = {c.args[0] for c in plugin.r1fs.delete_file.call_args_list}
+    self.assertEqual(deleted_cids, {"cid-x"})
+
+  def test_partial_status_preserves_state_no_force_purge(self):
+    """status='partial' is the retry contract — state preserved, no force-purge."""
+    Plugin = self._get_plugin_class()
+    jobs = {"job-partial": {"job_id": "job-partial", "job_cid": "cid-y"}}
+    plugin = self._make_plugin(jobs)
+    plugin.r1fs = MagicMock()
+
+    plugin.stop_and_delete_job.return_value = {
+      "status": "partial",
+      "cids_deleted": 0,
+      "cids_failed": 1,
+    }
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["jobs_force_purged"], 0)
+    self.assertEqual(result["cids_failed"], 1)
+    # cstore preserved
+    self.assertIn("job-partial", plugin._hashes["test-instance"])
+    # no force-purge R1FS calls
+    plugin.r1fs.delete_file.assert_not_called()
+
+  def test_confirm_required(self):
+    """Endpoint refuses to purge without confirm=True."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin({"job-1": {"job_id": "job-1"}})
+
+    result = Plugin.purge_all_redmesh_data(plugin)
+    self.assertEqual(result["status"], "error")
+    self.assertIn("confirm", result["message"].lower())
+    plugin.stop_and_delete_job.assert_not_called()
+    # cstore untouched
+    self.assertIn("job-1", plugin._hashes["test-instance"])
+
+  def test_non_dict_job_rows_are_skipped(self):
+    """Tombstoned (None) or non-dict job rows do not count toward jobs_total."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "real-job": {"job_id": "real-job", "job_status": "FINALIZED"},
+      "tombstoned": None,
+      "weird-row": "not-a-dict",
+    }
+    plugin = self._make_plugin(jobs)
+
+    def _fake_purge(job_id):
+      plugin._hashes["test-instance"].pop(job_id, None)
+      return {"status": "success", "job_id": job_id, "cids_deleted": 0, "cids_total": 0}
+
+    plugin.purge_job.side_effect = _fake_purge
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["jobs_total"], 1)
+    self.assertEqual(result["jobs_succeeded"], 1)
+    plugin.purge_job.assert_called_once_with("real-job")
+
+  def test_running_jobs_route_through_stop_and_delete(self):
+    """RUNNING jobs go through stop_and_delete_job; terminal jobs go direct to purge_job."""
+    Plugin = self._get_plugin_class()
+    jobs = {
+      "job-running": {"job_id": "job-running", "job_status": "RUNNING"},
+      "job-finalized": {"job_id": "job-finalized", "job_status": "FINALIZED"},
+      "job-stopped": {"job_id": "job-stopped", "job_status": "STOPPED"},
+    }
+    plugin = self._make_plugin(jobs)
+
+    def _success(job_id):
+      plugin._hashes["test-instance"].pop(job_id, None)
+      return {"status": "success", "job_id": job_id, "cids_deleted": 0, "cids_total": 0}
+
+    plugin.stop_and_delete_job.side_effect = _success
+    plugin.purge_job.side_effect = _success
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "success")
+    self.assertEqual(result["jobs_succeeded"], 3)
+    plugin.stop_and_delete_job.assert_called_once_with("job-running")
+    purge_call_args = {c.args[0] for c in plugin.purge_job.call_args_list}
+    self.assertEqual(purge_call_args, {"job-finalized", "job-stopped"})
+
+  def test_empty_state_returns_success(self):
+    """No jobs and no orphans → success with zero counts."""
+    Plugin = self._get_plugin_class()
+    plugin = self._make_plugin({})
+
+    result = Plugin.purge_all_redmesh_data(plugin, confirm=True)
+
+    self.assertEqual(result["status"], "success")
+    self.assertEqual(result["jobs_total"], 0)
+    self.assertEqual(result["jobs_succeeded"], 0)
+    self.assertEqual(result["cids_deleted"], 0)
+    plugin._log_audit_event.assert_called_once()
+
 
 class TestPhase15Listing(unittest.TestCase):
   """Phase 15: Listing Endpoint Optimization."""

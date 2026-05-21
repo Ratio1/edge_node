@@ -23,7 +23,7 @@ import os
 import unittest
 from typing import Any
 
-from extensions.business.cybersec.red_mesh.mixins.llm_agent import _RedMeshLlmAgentMixin as LlmAgentMixin
+from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import _RedMeshLlmAgentMixin as LlmAgentMixin
 
 
 def _valid_llm_response_content() -> str:
@@ -97,14 +97,14 @@ class StructuredReportAdapterTests(unittest.TestCase):
   def setUp(self):
     # Patch the get_llm_agent_config import the mixin uses so we can
     # toggle ENABLED per-test without touching the global config.
-    from extensions.business.cybersec.red_mesh.mixins import llm_agent as mod
+    from extensions.business.cybersec.red_mesh.mixins import redmesh_llm_agent as mod
     self._orig_cfg = mod.get_llm_agent_config
     self._cfg_value = {"ENABLED": True, "MODEL": "deepseek-chat"}
     mod.get_llm_agent_config = lambda _self: self._cfg_value
     self._orig_live_llm = os.environ.get("LIVE_LLM")
 
   def tearDown(self):
-    from extensions.business.cybersec.red_mesh.mixins import llm_agent as mod
+    from extensions.business.cybersec.red_mesh.mixins import redmesh_llm_agent as mod
     mod.get_llm_agent_config = self._orig_cfg
     if self._orig_live_llm is None:
       os.environ.pop("LIVE_LLM", None)

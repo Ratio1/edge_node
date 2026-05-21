@@ -86,26 +86,34 @@ class _RiskScoringMixin:
       process_findings(correlation_findings)
 
     # A. Iterate graybox_results — uses GrayboxFinding.to_flat_finding()
-    from ..graybox.findings import GrayboxFinding as _GF
+    from ..graybox.findings import (
+      FindingRedactionContext,
+      GrayboxFinding as _GF,
+    )
+    from .report import _configured_graybox_secret_names_from_report
+    graybox_secret_names = _configured_graybox_secret_names_from_report(
+      aggregated_report,
+    )
     graybox_results = aggregated_report.get("graybox_results", {})
-    for port_key, probes in graybox_results.items():
-      if not isinstance(probes, dict):
-        continue
-      for probe_name, probe_data in probes.items():
-        if not isinstance(probe_data, dict):
+    with FindingRedactionContext(secret_field_names=graybox_secret_names):
+      for port_key, probes in graybox_results.items():
+        if not isinstance(probes, dict):
           continue
-        for finding_dict in probe_data.get("findings", []):
-          if not isinstance(finding_dict, dict):
+        for probe_name, probe_data in probes.items():
+          if not isinstance(probe_data, dict):
             continue
-          try:
-            flat = _GF.flat_from_dict(finding_dict, 0, "unknown", probe_name)
-          except (TypeError, KeyError, ValueError):
-            continue
-          weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
-          multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
-          findings_score += weight * multiplier
-          if flat["severity"] in finding_counts:
-            finding_counts[flat["severity"]] += 1
+          for finding_dict in probe_data.get("findings", []):
+            if not isinstance(finding_dict, dict):
+              continue
+            try:
+              flat = _GF.flat_from_dict(finding_dict, 0, "unknown", probe_name)
+            except (TypeError, KeyError, ValueError):
+              continue
+            weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
+            multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
+            findings_score += weight * multiplier
+            if flat["severity"] in finding_counts:
+              finding_counts[flat["severity"]] += 1
 
     # B. Open ports — diminishing returns: 15 × (1 - e^(-ports/8))
     open_ports = aggregated_report.get("open_ports", [])
@@ -339,36 +347,44 @@ class _RiskScoringMixin:
       process_findings(correlation_findings, 0, "_correlation", "correlation")
 
     # Walk graybox_results — delegates to GrayboxFinding.to_flat_finding()
-    from ..graybox.findings import GrayboxFinding as _GF
+    from ..graybox.findings import (
+      FindingRedactionContext,
+      GrayboxFinding as _GF,
+    )
+    from .report import _configured_graybox_secret_names_from_report
+    graybox_secret_names = _configured_graybox_secret_names_from_report(
+      aggregated_report,
+    )
     graybox_results = aggregated_report.get("graybox_results", {})
-    for port_key, probes in graybox_results.items():
-      if not isinstance(probes, dict):
-        continue
-      port = parse_port(port_key)
-      protocol = port_protocols.get(str(port), "unknown")
-      for probe_name, probe_data in probes.items():
-        if not isinstance(probe_data, dict):
+    with FindingRedactionContext(secret_field_names=graybox_secret_names):
+      for port_key, probes in graybox_results.items():
+        if not isinstance(probes, dict):
           continue
-        for finding_dict in probe_data.get("findings", []):
-          if not isinstance(finding_dict, dict):
+        port = parse_port(port_key)
+        protocol = port_protocols.get(str(port), "unknown")
+        for probe_name, probe_data in probes.items():
+          if not isinstance(probe_data, dict):
             continue
-          try:
-            flat = _GF.flat_from_dict(finding_dict, port, protocol, probe_name)
-          except (TypeError, KeyError, ValueError):
-            continue
+          for finding_dict in probe_data.get("findings", []):
+            if not isinstance(finding_dict, dict):
+              continue
+            try:
+              flat = _GF.flat_from_dict(finding_dict, port, protocol, probe_name)
+            except (TypeError, KeyError, ValueError):
+              continue
 
-          weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
-          multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
-          findings_score += weight * multiplier
-          if flat["severity"] in finding_counts:
-            finding_counts[flat["severity"]] += 1
-          title = flat.get("title", "")
-          if isinstance(title, str) and "default credential accepted" in title.lower():
-            cred_count += 1
+            weight = RISK_SEVERITY_WEIGHTS.get(flat["severity"], 0)
+            multiplier = RISK_CONFIDENCE_MULTIPLIERS.get(flat["confidence"], 0.5)
+            findings_score += weight * multiplier
+            if flat["severity"] in finding_counts:
+              finding_counts[flat["severity"]] += 1
+            title = flat.get("title", "")
+            if isinstance(title, str) and "default credential accepted" in title.lower():
+              cred_count += 1
 
-          flat_findings.append(
-            normalize_flat_finding(flat, port, protocol, probe_name, "graybox")
-          )
+            flat_findings.append(
+              normalize_flat_finding(flat, port, protocol, probe_name, "graybox")
+            )
 
     # B. Open ports — diminishing returns
     open_ports = aggregated_report.get("open_ports", [])

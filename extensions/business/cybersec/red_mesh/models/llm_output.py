@@ -177,6 +177,94 @@ class LlmReportSections:
     )
 
 
+def render_legacy_llm_fields(sections: dict | LlmReportSections | None) -> tuple[str | None, str | None]:
+  """Render structured LLM sections into the legacy analysis contract.
+
+  `get_analysis` still returns a markdown analysis string plus a short
+  summary. Structured report sections are the canonical source for PTES PDF
+  rendering, but this adapter keeps the older API usable without calling the
+  legacy raw-report LLM path again.
+  """
+  if isinstance(sections, LlmReportSections):
+    raw = sections.to_dict()
+  elif isinstance(sections, dict):
+    raw = sections
+  else:
+    return None, None
+
+  if raw.get("error"):
+    return None, None
+
+  parsed = LlmReportSections.from_dict(raw)
+  quick_summary = (
+    _clean_legacy_text(parsed.executive_headline)
+    or _first_legacy_line(parsed.overall_posture)
+    or _first_legacy_line(parsed.conclusion)
+  )
+  if quick_summary and len(quick_summary) > 500:
+    quick_summary = quick_summary[:497].rstrip() + "..."
+
+  blocks: list[str] = []
+  _append_legacy_section(blocks, "Executive Headline", parsed.executive_headline)
+  _append_legacy_section(blocks, "Background", parsed.background_draft)
+  _append_legacy_section(blocks, "Overall Posture", parsed.overall_posture)
+  _append_legacy_list_section(blocks, "Recommendations", parsed.recommendation_summary)
+  _append_legacy_roadmap(blocks, parsed.strategic_roadmap)
+  _append_legacy_list_section(blocks, "Attack Chain Narratives", parsed.attack_chain_narratives)
+  _append_legacy_list_section(blocks, "Coverage Gaps", parsed.coverage_gaps)
+  _append_legacy_section(blocks, "Conclusion", parsed.conclusion)
+
+  markdown = "\n\n".join(blocks).strip()
+  return (markdown or None), (quick_summary or None)
+
+
+def _clean_legacy_text(value: str | None) -> str:
+  if not isinstance(value, str):
+    return ""
+  return " ".join(value.split()).strip()
+
+
+def _first_legacy_line(value: str | None) -> str:
+  if not isinstance(value, str):
+    return ""
+  for line in value.splitlines():
+    cleaned = _clean_legacy_text(line)
+    if cleaned:
+      return cleaned
+  return ""
+
+
+def _append_legacy_section(blocks: list[str], title: str, value: str | None):
+  text = _clean_legacy_text(value)
+  if text:
+    blocks.append(f"## {title}\n{text}")
+
+
+def _append_legacy_list_section(blocks: list[str], title: str, values: tuple[str, ...] | list[str]):
+  items = [_clean_legacy_text(v) for v in values or ()]
+  items = [v for v in items if v]
+  if items:
+    blocks.append("## {}\n{}".format(title, "\n".join(f"- {item}" for item in items)))
+
+
+def _append_legacy_roadmap(blocks: list[str], roadmap: dict[str, tuple[str, ...]]):
+  lines = []
+  labels = {
+    ROADMAP_NEAR_TERM: "Near term",
+    ROADMAP_MID_TERM: "Mid term",
+    ROADMAP_LONG_TERM: "Long term",
+  }
+  for bucket in ROADMAP_BUCKETS:
+    items = [_clean_legacy_text(v) for v in roadmap.get(bucket, ()) or ()]
+    items = [v for v in items if v]
+    if not items:
+      continue
+    lines.append(f"### {labels[bucket]}")
+    lines.extend(f"- {item}" for item in items)
+  if lines:
+    blocks.append("## Strategic Roadmap\n" + "\n".join(lines))
+
+
 def _str_list(value: Any) -> list[str]:
   if not isinstance(value, (list, tuple)):
     return []

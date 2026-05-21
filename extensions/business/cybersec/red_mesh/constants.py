@@ -20,6 +20,12 @@ GRAYBOX_PROBE_REGISTRY = [
   {"key": "_graybox_misconfig",       "cls": "misconfig.MisconfigProbes"},
   {"key": "_graybox_injection",       "cls": "injection.InjectionProbes"},
   {"key": "_graybox_business_logic",  "cls": "business_logic.BusinessLogicProbes"},
+  # OWASP API Top 10 2023 — five themed families (Subphase 1.3).
+  {"key": "_graybox_api_access",      "cls": "api_access.ApiAccessProbes"},
+  {"key": "_graybox_api_auth",        "cls": "api_auth.ApiAuthProbes"},
+  {"key": "_graybox_api_data",        "cls": "api_data.ApiDataProbes"},
+  {"key": "_graybox_api_config",      "cls": "api_config.ApiConfigProbes"},
+  {"key": "_graybox_api_abuse",       "cls": "api_abuse.ApiAbuseProbes"},
 ]
 
 # Graybox timing and limits
