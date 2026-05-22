@@ -1,4 +1,3 @@
-import hashlib
 import json
 import re
 from datetime import datetime, timezone
@@ -7,6 +6,7 @@ from math import isfinite
 from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
+from ratio1.bc.base import compact_canonical_sha256
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
@@ -482,53 +482,11 @@ class _DeeployMixin:
     return sender
 
 
-  @staticmethod
-  def _compact_canonical_json(value):
-    """
-    Serialize Deeploy payload values exactly like the dApp v3 hash builder.
-    """
-    if value is None:
-      return "null"
-
-    if isinstance(value, list):
-      items = []
-      for item in value:
-        serialized_item = _DeeployMixin._compact_canonical_json(item)
-        items.append(serialized_item if serialized_item is not None else "null")
-      return "[{}]".format(",".join(items))
-
-    if isinstance(value, dict):
-      entries = []
-      for key in sorted(value.keys(), key=lambda item: str(item)):
-        serialized_value = _DeeployMixin._compact_canonical_json(value[key])
-        if serialized_value is None:
-          continue
-        serialized_key = json.dumps(str(key), ensure_ascii=False, separators=(",", ":"))
-        entries.append("{}:{}".format(serialized_key, serialized_value))
-      return "{{{}}}".format(",".join(entries))
-
-    if isinstance(value, float) and not isfinite(value):
-      return "null"
-
-    try:
-      return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-    except (TypeError, ValueError):
-      return None
-
-
   def _deeploy_payload_hash(self, payload):
     """
     Return the v3 compact-canonical SHA-256 hash for a Deeploy request.
     """
-    cleaned_payload = {
-      key: value
-      for key, value in payload.items()
-      if key not in DEEPLOY_V3_HASH_EXCLUDED_KEYS
-    }
-    json_payload = self._compact_canonical_json(cleaned_payload)
-    if json_payload is None:
-      json_payload = "null"
-    return hashlib.sha256(json_payload.encode("utf-8")).hexdigest()
+    return compact_canonical_sha256(payload, excluded_keys=DEEPLOY_V3_HASH_EXCLUDED_KEYS)
 
 
   @staticmethod
