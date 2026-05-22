@@ -41,12 +41,120 @@ class TunnelsManagerPlugin(BasePlugin):
   def _cloudflare_update_metadata(self, tunnel_id: str, metadata: dict, cloudflare_account_id: str, cloudflare_api_key: str):
     url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel/{tunnel_id}"
     headers = {
-      "Authorization": f"Bearer {cloudflare_api_key}"
+      "Authorization": f"Bearer {cloudflare_api_key}",
+      "Accept": "application/json",
     }
     data = {
       "metadata": metadata
     }
     return self.requests.patch(url, headers=headers, json=data).json()
+
+  def _format_cloudflare_errors(self, response):
+    """
+    Return a sanitized, user-actionable Cloudflare error string.
+
+    Parameters
+    ----------
+    response : dict
+        Parsed Cloudflare API response.
+
+    Returns
+    -------
+    str
+        Concise error text built from Cloudflare error/message fields.
+    """
+    if not isinstance(response, dict):
+      return "invalid response from Cloudflare"
+
+    errors = response.get("errors") or []
+    messages = response.get("messages") or []
+    if not isinstance(errors, (list, tuple)):
+      errors = [errors]
+    if not isinstance(messages, (list, tuple)):
+      messages = [messages]
+    parts = []
+
+    for item in list(errors) + list(messages):
+      if isinstance(item, dict):
+        code = item.get("code")
+        message = item.get("message") or item.get("error") or str(item)
+        parts.append(f"{code}: {message}" if code else str(message))
+      else:
+        parts.append(str(item))
+
+    if parts:
+      return "; ".join(parts)
+    return "Cloudflare returned an unsuccessful response"
+
+  def _require_cloudflare_result(self, response, action, require_result=True):
+    """
+    Validate a Cloudflare API response before indexing into ``result``.
+
+    Parameters
+    ----------
+    response : dict
+        Parsed Cloudflare API response.
+    action : str
+        Human-readable operation name used in raised errors.
+    require_result : bool, optional
+        Whether a non-empty ``result`` value is required.
+
+    Returns
+    -------
+    dict
+        The validated Cloudflare ``result`` payload.
+    """
+    if not isinstance(response, dict):
+      raise Exception(f"{action}: invalid response from Cloudflare")
+
+    result = response.get("result")
+    if response.get("success") is not True or (require_result and result is None):
+      raise Exception(f"{action}: {self._format_cloudflare_errors(response)}")
+    return result
+
+  def _cleanup_partial_tunnel(self, cloudflare_account_id, cloudflare_zone_id, cloudflare_api_key, tunnel_id=None, dns_record_ids=None):
+    """
+    Best-effort cleanup for resources created before a tunnel setup failure.
+
+    Parameters
+    ----------
+    cloudflare_account_id : str
+        Cloudflare account id.
+    cloudflare_zone_id : str
+        Cloudflare zone id.
+    cloudflare_api_key : str
+        Cloudflare API token.
+    tunnel_id : str, optional
+        Created tunnel id to delete.
+    dns_record_ids : list[str], optional
+        Created DNS record ids to delete before deleting the tunnel.
+    """
+    headers = {
+      "Authorization": f"Bearer {cloudflare_api_key}",
+      "Accept": "application/json",
+    }
+    logger = getattr(self, "P", lambda *args, **kwargs: None)
+
+    for dns_record_id in dns_record_ids or []:
+      if not dns_record_id:
+        continue
+      try:
+        url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records/{dns_record_id}"
+        response = self.requests.delete(url, headers=headers).json()
+        if isinstance(response, dict) and response.get("success") is False:
+          logger(f"Cloudflare cleanup failed for DNS record {dns_record_id}: {self._format_cloudflare_errors(response)}", color="y")
+      except Exception as exc:
+        logger(f"Cloudflare cleanup raised while deleting DNS record {dns_record_id}: {exc}", color="y")
+
+    if tunnel_id:
+      try:
+        url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel/{tunnel_id}"
+        response = self.requests.delete(url, headers=headers).json()
+        if isinstance(response, dict) and response.get("success") is False:
+          logger(f"Cloudflare cleanup failed for tunnel {tunnel_id}: {self._format_cloudflare_errors(response)}", color="y")
+      except Exception as exc:
+        logger(f"Cloudflare cleanup raised while deleting tunnel {tunnel_id}: {exc}", color="y")
+    return
 
   def _verify_nonce(self, hex_nonce: str):
     str_nonce = hex_nonce.replace("0x", "")
@@ -143,6 +251,9 @@ class TunnelsManagerPlugin(BasePlugin):
     if tunnel_type not in ["http", "tcp"]:
       raise Exception("Invalid tunnel type. Must be 'http' or 'tcp'.")
 
+    tunnel_id = None
+    dns_record_id = None
+    dns_record_public_id = None
     new_uuid = self.uuid()
     prefixes = []
     if tunnel_type == "tcp":
@@ -150,60 +261,79 @@ class TunnelsManagerPlugin(BasePlugin):
     if service_name is not None:
       prefixes.append(service_name)
     new_id = f"{'-'.join(prefixes)}-{new_uuid}" if prefixes else new_uuid
-    url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel"
     headers = {
-      "Authorization": f"Bearer {cloudflare_api_key}"
+      "Authorization": f"Bearer {cloudflare_api_key}",
+      "Accept": "application/json",
     }
-    data = {
-      "name": new_id,
-      "config_src": "local"
-    }
-    tunnel_info = self.requests.post(url, headers=headers, json=data).json()
-    if tunnel_info["success"] is False:
-      raise Exception("Error creating tunnel: " + str(tunnel_info['errors']))
 
-    url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records"
-    headers = {
-      "Authorization": f"Bearer {cloudflare_api_key}"
-    }
-    data = {
-      "type": "CNAME",
-      "proxied": True,
-      "name": new_id,
-      "content": f"{tunnel_info['result']['id']}.cfargotunnel.com",
-    }
-    dns_record = self.requests.post(url, headers=headers, json=data).json()
+    try:
+      url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel"
+      data = {
+        "name": new_id,
+        "config_src": "local"
+      }
+      tunnel_info = self.requests.post(url, headers=headers, json=data).json()
+      tunnel_result = self._require_cloudflare_result(tunnel_info, "Error creating tunnel")
+      tunnel_id = tunnel_result.get("id")
+      tunnel_token = tunnel_result.get("token")
+      if not tunnel_id or not tunnel_token:
+        raise Exception("Error creating tunnel: Cloudflare response is missing tunnel id or token")
 
-    public_name = None
-    dns_record_public = None
-    if tunnel_type == "tcp":
-      # For TCP tunnels, we also need to create a CNAME for the public URL
-      public_name = new_id.removeprefix(f"{self.cfg_tcp_prefix}-")
-      data_public = {
+      url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records"
+      data = {
         "type": "CNAME",
         "proxied": True,
-        "name": public_name,
-        "content": self.cfg_tcp_proxy_url,
+        "name": new_id,
+        "content": f"{tunnel_id}.cfargotunnel.com",
       }
-      dns_record_public = self.requests.post(url, headers=headers, json=data_public).json()
+      dns_record = self.requests.post(url, headers=headers, json=data).json()
+      dns_record_result = self._require_cloudflare_result(dns_record, "Error creating tunnel DNS record")
+      dns_record_id = dns_record_result.get("id")
+      if not dns_record_id:
+        raise Exception("Error creating tunnel DNS record: Cloudflare response is missing DNS record id")
 
-    res = self._cloudflare_update_metadata(
-      tunnel_id=tunnel_info['result']['id'],
-      metadata={
-        "alias": alias,
-        "tunnel_token": tunnel_info['result']['token'],
-        "dns_record_id": dns_record['result']['id'],
-        "dns_name": f"{new_id}.{cloudflare_domain}",
-        "dns_record_public_id": dns_record_public['result']['id'] if dns_record_public else None,
-        "dns_public_name": f"{public_name}.{cloudflare_domain}" if public_name else None,
-        "custom_hostnames": [],
-        "type": tunnel_type,
-        "creator": "ratio1"
-      },
-      cloudflare_account_id=cloudflare_account_id,
-      cloudflare_api_key=cloudflare_api_key
-    )
-    return res['result']
+      public_name = None
+      if tunnel_type == "tcp":
+        # TCP tunnels need a second public CNAME that points at the TCP proxy.
+        public_name = new_id.removeprefix(f"{self.cfg_tcp_prefix}-")
+        data_public = {
+          "type": "CNAME",
+          "proxied": True,
+          "name": public_name,
+          "content": self.cfg_tcp_proxy_url,
+        }
+        dns_record_public = self.requests.post(url, headers=headers, json=data_public).json()
+        dns_record_public_result = self._require_cloudflare_result(dns_record_public, "Error creating TCP tunnel public DNS record")
+        dns_record_public_id = dns_record_public_result.get("id")
+        if not dns_record_public_id:
+          raise Exception("Error creating TCP tunnel public DNS record: Cloudflare response is missing DNS record id")
+
+      res = self._cloudflare_update_metadata(
+        tunnel_id=tunnel_id,
+        metadata={
+          "alias": alias,
+          "tunnel_token": tunnel_token,
+          "dns_record_id": dns_record_id,
+          "dns_name": f"{new_id}.{cloudflare_domain}",
+          "dns_record_public_id": dns_record_public_id,
+          "dns_public_name": f"{public_name}.{cloudflare_domain}" if public_name else None,
+          "custom_hostnames": [],
+          "type": tunnel_type,
+          "creator": "ratio1"
+        },
+        cloudflare_account_id=cloudflare_account_id,
+        cloudflare_api_key=cloudflare_api_key
+      )
+      return self._require_cloudflare_result(res, "Error updating tunnel metadata")
+    except Exception:
+      self._cleanup_partial_tunnel(
+        cloudflare_account_id=cloudflare_account_id,
+        cloudflare_zone_id=cloudflare_zone_id,
+        cloudflare_api_key=cloudflare_api_key,
+        tunnel_id=tunnel_id,
+        dns_record_ids=[dns_record_public_id, dns_record_id],
+      )
+      raise
 
   @BasePlugin.endpoint(method="get")
   def get_tunnels(self, cloudflare_account_id: str, cloudflare_api_key: str):
