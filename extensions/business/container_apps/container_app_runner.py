@@ -88,6 +88,7 @@ from .mixins import (
   _TunnelBackoffMixin,
 )
 from .env_overrides import _EnvOverridesMixin
+from .reset import _ResetMixin
 from .sync import _SyncMixin
 
 __VER__ = "0.7.1"
@@ -284,6 +285,9 @@ _CONFIG = {
   "ENV_OVERRIDES": {
     "ENABLED": True,        # app-local request.json patches under /r1en_system/env-overrides
   },
+  "RESET": {
+    "ENABLED": True,        # app-local request.json reset under /r1en_system/reset
+  },
   "EXPOSED_PORTS": {},      # normalized container-port config keyed by internal container port
   "CONTAINER_RESOURCES" : {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
@@ -403,6 +407,7 @@ class ContainerAppRunnerPlugin(
   _TunnelBackoffMixin,
   _FixedSizeVolumesMixin,
   _EnvOverridesMixin,
+  _ResetMixin,
   _SyncMixin,
   _ContainerUtilsMixin,
   BasePlugin,
@@ -657,6 +662,8 @@ class ContainerAppRunnerPlugin(
     self._runtime_stop_degraded = False
     self._env_overrides_manager = None
     self._env_overrides_unavailable = False
+    self._reset_manager = None
+    self._reset_unavailable = False
 
     # Image update tracking
     self.current_image_hash = None
@@ -1196,11 +1203,13 @@ class ContainerAppRunnerPlugin(
     self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
     self._configure_system_volume() # always-on /r1en_system control-plane volume
     self._configure_env_overrides_control_dir()
+    self._configure_reset_control_dir()
 
     # If a prior plugin run crashed mid-publish, request.json.processing may
     # be left over inside volume-sync/. Rename it back so the next tick retries.
     self._recover_stale_processing()
     self._recover_env_overrides_processing()
+    self._recover_reset_processing()
     self._validate_sync_config()
 
     # If we have semaphored keys, defer _setup_env_and_ports() until semaphores are ready
@@ -1209,6 +1218,7 @@ class ContainerAppRunnerPlugin(
       self._setup_env_and_ports()
       self._inject_sync_env_vars()
       self._inject_env_overrides_env_vars()
+      self._inject_reset_env_vars()
     else:
       self.Pd("Deferring _setup_env_and_ports() until semaphores are ready")
 
@@ -3538,8 +3548,10 @@ class ContainerAppRunnerPlugin(
     self._configure_fixed_size_volumes()
     self._configure_system_volume()
     self._configure_env_overrides_control_dir()
+    self._configure_reset_control_dir()
     self._recover_stale_processing()
     self._recover_env_overrides_processing()
+    self._recover_reset_processing()
     self._validate_sync_config()
 
     # For semaphored containers (consumers), defer env setup and container start
@@ -3561,6 +3573,7 @@ class ContainerAppRunnerPlugin(
     self._setup_env_and_ports()
     self._inject_sync_env_vars()
     self._inject_env_overrides_env_vars()
+    self._inject_reset_env_vars()
 
     # Revalidate extra tunnels
     self._validate_extra_tunnels_config()
@@ -3744,6 +3757,7 @@ class ContainerAppRunnerPlugin(
       self._setup_env_and_ports()
       self._inject_sync_env_vars()
       self._inject_env_overrides_env_vars()
+      self._inject_reset_env_vars()
     # end if
 
     try:
@@ -3843,6 +3857,8 @@ class ContainerAppRunnerPlugin(
     # can run.
     if self._env_overrides_tick(current_time):
       return StopReason.ENV_OVERRIDE
+
+    self._reset_tick(current_time)
 
     if self._sync_enabled():
       role = self._sync_role()

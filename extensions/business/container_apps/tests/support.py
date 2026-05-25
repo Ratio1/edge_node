@@ -233,6 +233,7 @@ def make_container_app_runner():
   plugin.cfg_env = {}
   plugin.cfg_dynamic_env = {}
   plugin.cfg_env_overrides = {"ENABLED": True}
+  plugin.cfg_reset = {"ENABLED": True}
   plugin.cfg_exposed_ports = {}
   plugin.cfg_container_resources = {}
   plugin.cfg_volumes = {}
