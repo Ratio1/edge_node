@@ -1116,6 +1116,7 @@ class _ContainerUtilsMixin:
       2. Dynamic env vars (computed at runtime)
       3. Semaphore env vars (from paired provider plugins)
       4. cfg_env (user-configured)
+      5. local env overrides (host-private, managed via /r1en_system)
     """
     # Environment variables
     # allow cfg_env to override default env vars
@@ -1144,6 +1145,9 @@ class _ContainerUtilsMixin:
     if self.dynamic_env:
       self.env.update(self.dynamic_env)
     # endif dynamic env
+
+    if hasattr(self, "_apply_env_overrides_to_env"):
+      self._apply_env_overrides_to_env()
 
     # Format ports for Docker API
     # Docker expects: {"container_port/tcp": "host_port"}

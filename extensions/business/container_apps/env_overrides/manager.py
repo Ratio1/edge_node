@@ -133,7 +133,13 @@ class EnvOverrideManager:
 
     normalized = {}
     for key, value in loaded.items():
-      if isinstance(key, str) and isinstance(value, str):
+      if (
+        isinstance(key, str)
+        and isinstance(value, str)
+        and self._name_re.match(key)
+        and key not in RESERVED_ENV_NAMES
+        and not key.startswith(RESERVED_ENV_PREFIXES)
+      ):
         normalized[key] = value
       else:
         self._log(
