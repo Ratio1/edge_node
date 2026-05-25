@@ -75,6 +75,20 @@ def _get_mount_source(mount_path) -> Optional[str]:
   return None
 
 
+def _normalize_device_path(value) -> Optional[str]:
+  """Return a stripped device path string, or None for empty values."""
+  if value is None:
+    return None
+  normalized = str(value).strip()
+  return normalized or None
+
+
+def _is_loop_device_path(value) -> bool:
+  """Return True for Linux loop-device paths such as /dev/loop7."""
+  normalized = _normalize_device_path(value)
+  return bool(normalized and re.match(r"^/dev/loop\d+(?:p\d+)?$", normalized))
+
+
 def _is_path_mounted(mount_path) -> bool:
   """Return True iff `mount_path` is an exact mountpoint in /proc/mounts.
 
@@ -427,14 +441,14 @@ def cleanup(
   if vol.meta_path.exists():
     try:
       meta = json.loads(vol.meta_path.read_text(encoding="utf-8"))
-      loop_dev = meta.get("loop_dev")
+      loop_dev = _normalize_device_path(meta.get("loop_dev"))
       _log(logger, "INFO", f"Loaded metadata loop_dev={loop_dev}")
     except Exception as exc:
       metadata_error = True
       _log(logger, "WARN", f"Failed to read metadata error={exc}")
 
-  mount_source = _get_mount_source(vol.mount_path)
-  mount_source_is_loop = mount_source and str(mount_source).startswith("/dev/loop")
+  mount_source = _normalize_device_path(_get_mount_source(vol.mount_path))
+  mount_source_is_loop = _is_loop_device_path(mount_source)
   if mount_source_is_loop and loop_dev is None:
     # A mounted loop source is a stronger identity than the sidecar metadata:
     # it lets us unmount and detach safely even when metadata was lost/corrupt.
@@ -449,6 +463,10 @@ def cleanup(
       f"Metadata loop_dev={loop_dev} differs from mounted source={mount_source}; using mounted source.",
     )
     loop_dev = mount_source
+  elif mount_source_is_loop:
+    # Metadata and /proc/mounts agree. Keep the metadata loop device for the
+    # detach step after unmount.
+    pass
   elif mount_source and loop_dev is None:
     # A mounted path without a positive loop-device identity must not be
     # reported as a clean fixed-volume teardown; callers need to retain it for

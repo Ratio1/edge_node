@@ -3963,8 +3963,12 @@ class ContainerAppRunnerPlugin(
         self._last_paused_log = current_time
       return
 
-    if self._cleanup_failed and not self._retry_failed_cleanup():
-      return
+    if self._cleanup_failed:
+      if not self._retry_failed_cleanup():
+        return
+      if not self.container:
+        self._restart_container(self.stop_reason or StopReason.UNKNOWN, cleanup_first=False)
+        return
 
     if not self.container:
       # Check if we're in backoff period

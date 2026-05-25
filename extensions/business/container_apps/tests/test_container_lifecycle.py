@@ -681,12 +681,21 @@ class TestLifecycleProcess(unittest.TestCase):
     plugin._next_restart_time = 90
     plugin.container_state = ContainerState.FAILED
     plugin._stop_container_and_save_logs_to_disk = MagicMock(return_value=True)
+    def restart(reason, cleanup_first=True):
+      plugin.container = object()
+      plugin.container_state = ContainerState.RUNNING
+      return True
+    plugin._restart_container = MagicMock(side_effect=restart)
 
     plugin.process()
 
     self.assertFalse(plugin._cleanup_failed)
     plugin._stop_container_and_save_logs_to_disk.assert_called_once()
-    client.containers.run.assert_called_once()
+    plugin._restart_container.assert_called_once_with(
+      StopReason.UNKNOWN,
+      cleanup_first=False,
+    )
+    client.containers.run.assert_not_called()
     self.assertEqual(plugin.container_state, ContainerState.RUNNING)
     self.assertEqual(plugin._consecutive_failures, 0)
     self.assertEqual(plugin._restart_backoff_seconds, 0)
@@ -753,6 +762,23 @@ class TestLifecycleProcess(unittest.TestCase):
     self.assertFalse(plugin._cleanup_failed)
     client.containers.run.assert_called_once()
     self.assertEqual(plugin.container_state, ContainerState.RUNNING)
+
+  def test_cleanup_retry_success_uses_full_restart_path(self):
+    """Recovered cleanup must rebuild runtime config before starting again."""
+    plugin, client, _ = make_lifecycle_runner(cfg_restart_backoff_initial=0)
+    plugin._cleanup_failed = True
+    plugin.container_state = ContainerState.FAILED
+    plugin.stop_reason = StopReason.ENV_OVERRIDE
+    plugin._stop_container_and_save_logs_to_disk = MagicMock(return_value=True)
+    plugin._restart_container = MagicMock(return_value=True)
+
+    plugin.process()
+
+    plugin._restart_container.assert_called_once_with(
+      StopReason.ENV_OVERRIDE,
+      cleanup_first=False,
+    )
+    client.containers.run.assert_not_called()
 
   def test_manual_stop_persists_only_after_cleanup_success(self):
     plugin, _, _ = make_lifecycle_runner(cfg_restart_backoff_initial=0)
