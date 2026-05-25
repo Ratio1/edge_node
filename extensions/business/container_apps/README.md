@@ -9,6 +9,8 @@ Container application plugins for running Docker containers with Cloudflare tunn
 - [Features](#features)
   - [Health Check Configuration](#health-check-configuration)
 - [Configuration Reference](#configuration-reference)
+  - [Local Env Overrides](#local-env-overrides)
+  - [Reset](#reset)
   - [Volume Sync](#volume-sync)
 - [Future Enhancements](#future-enhancements)
   - [Continuous Health Monitoring](#continuous-health-monitoring)
@@ -41,6 +43,7 @@ The Container Apps module provides plugins for managing Docker containers with i
 - **Normalized exposed ports**: `EXPOSED_PORTS` is the forward-looking config surface for container port exposure and per-port tunnel settings.
 - **Explicit semaphore networking keys**: container apps now publish `HOST_IP`, `HOST_PORT`, `CONTAINER_IP`, and `CONTAINER_PORT` in addition to legacy `HOST`, `PORT`, and `URL`.
 - **UI-friendly dynamic env support**: Deeploy can compile `DYNAMIC_ENV_UI` fragments to backend `DYNAMIC_ENV` entries, including generic plugin semaphore lookups.
+- **App-local control files**: apps can request local env overrides and fixed-volume resets through `/r1en_system`.
 
 ### Health Check Configuration
 
@@ -197,6 +200,85 @@ When a container app acts as the provider, new consumers should prefer these exp
 - `CONTAINER_PORT`
 
 Legacy `HOST`, `PORT`, and `URL` remain available for backward compatibility.
+
+### Local Env Overrides
+
+`ENV_OVERRIDES` lets an app add or override its own container environment
+without changing Deeploy/config. The feature is enabled by default:
+
+```python
+"ENV_OVERRIDES": {
+    "ENABLED": True,
+}
+```
+
+Apps write one request to `/r1en_system/env-overrides/request.json`:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "env-001",
+  "apply": "restart_now",
+  "set": {
+    "LOG_LEVEL": "trace",
+    "FEATURE_FLAGS": ["fast", "debug"]
+  },
+  "remove": ["OLD_LOCAL_OVERRIDE"]
+}
+```
+
+`apply` defaults to `"next_restart"` and also accepts `"restart_now"`.
+`request_id` is correlation only; repeating the same request processes it again.
+`clear_all` is not part of v1.
+
+`set` accepts strings, numbers, booleans, arrays, and objects. Docker receives
+strings: strings are unchanged, booleans become `true`/`false`, numbers become
+decimal strings, and arrays/objects become compact JSON strings. `null` is
+invalid; use `remove` instead. Variable names must match
+`^[A-Za-z_][A-Za-z0-9_]*$`. CAR rejects reserved control/system variables,
+including `R1EN_*`, `R1_*`, `EE_*`, `CONTAINER_NAME`, and CAR networking keys.
+
+Overrides are stored host-private as `plugin_data/env_overrides.json`, survive
+container restarts, CAR restarts, config updates, and reset requests, and are
+applied after default env, semaphore env, config `ENV`, and `DYNAMIC_ENV`.
+Invalid requests write `request.json.invalid` and `response.json` with
+`status="error"`; successful requests write `response.json` with changed keys
+and active override count, not a full effective env dump.
+
+### Reset
+
+`RESET` lets an app request a local destructive reset of CAR-managed app data
+volumes followed by a container restart. The feature is enabled by default:
+
+```python
+"RESET": {
+    "ENABLED": True,
+}
+```
+
+Apps write one request to `/r1en_system/reset/request.json`:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "reset-001",
+  "mode": "volumes",
+  "apply": "restart_now",
+  "volumes": ["data"]
+}
+```
+
+V1 supports only `mode="volumes"` and only `apply="restart_now"`. `volumes`
+is optional; when omitted, CAR resets all active `FIXED_SIZE_VOLUMES`. When
+present, entries must be logical `FIXED_SIZE_VOLUMES` names, not paths.
+
+Reset scope is deliberately narrow: v1 clears the contents inside selected
+fixed-size volume mount roots without deleting the mount root itself. It does
+not reset legacy `VOLUMES`, `FILE_VOLUMES`, `/r1en_system`, CAR plugin
+metadata, or `plugin_data/env_overrides.json`. CAR validates the plan before
+stopping the runtime and aborts without filesystem mutation if it cannot prove
+the container stopped/removed. Invalid requests write `request.json.invalid`
+and `response.json` with `status="error"`.
 
 ### Volume Sync
 
