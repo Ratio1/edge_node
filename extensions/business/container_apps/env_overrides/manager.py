@@ -108,22 +108,18 @@ class EnvOverrideManager:
     loader = getattr(self.owner, "diskapi_load_json_from_data", None)
     if callable(loader):
       try:
-        loaded = loader(ENV_OVERRIDES_STATE_FILE, verbose=False)
+        loaded = loader(
+          ENV_OVERRIDES_STATE_FILE,
+          subfolder="plugin_data",
+          verbose=False,
+        )
       except TypeError:
-        loaded = loader(ENV_OVERRIDES_STATE_FILE)
+        loaded = self._load_overrides_from_path()
       except Exception as exc:
         self._log(f"[env-overrides] could not load state via diskapi: {exc}", color="y")
         loaded = None
     else:
-      path = self._state_path()
-      try:
-        with open(path, "r", encoding="utf-8") as handle:
-          loaded = json.load(handle)
-      except FileNotFoundError:
-        loaded = None
-      except Exception as exc:
-        self._log(f"[env-overrides] could not load {path}: {exc}", color="y")
-        loaded = None
+      loaded = self._load_overrides_from_path()
 
     if loaded is None:
       return {}
@@ -152,11 +148,27 @@ class EnvOverrideManager:
     saver = getattr(self.owner, "diskapi_save_json_to_data", None)
     if callable(saver):
       try:
-        saver(overrides, ENV_OVERRIDES_STATE_FILE, indent=True)
+        saver(
+          overrides,
+          ENV_OVERRIDES_STATE_FILE,
+          subfolder="plugin_data",
+          indent=True,
+        )
       except TypeError:
-        saver(overrides, ENV_OVERRIDES_STATE_FILE)
+        write_json_atomic(self._state_path(), overrides)
       return
     write_json_atomic(self._state_path(), overrides)
+
+  def _load_overrides_from_path(self):
+    path = self._state_path()
+    try:
+      with open(path, "r", encoding="utf-8") as handle:
+        return json.load(handle)
+    except FileNotFoundError:
+      return None
+    except Exception as exc:
+      self._log(f"[env-overrides] could not load {path}: {exc}", color="y")
+      return None
 
   # ----- public operations ----------------------------------------------
 

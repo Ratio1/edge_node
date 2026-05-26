@@ -225,8 +225,6 @@ class _ResetMixin:
       cleared_count = manager.reset_volumes(plan)
     except Exception as exc:
       reset_error = str(exc)
-
-    restart_started = self._reset_safe_start_container()
     if reset_error is not None:
       self._fail_reset_request(
         claimed.body,
@@ -234,10 +232,11 @@ class _ResetMixin:
         reset_error,
         claimed.processing_path,
         plan=plan,
-        restart_started=restart_started,
+        restart_started=False,
       )
       return
 
+    restart_started = self._reset_safe_start_container()
     restart_error = None if restart_started else "container restart failed after reset"
     response = ResetApplyResult(
       request_id=plan.request_id,

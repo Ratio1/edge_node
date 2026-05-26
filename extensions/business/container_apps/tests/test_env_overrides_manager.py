@@ -30,6 +30,53 @@ class _Owner:
     self.messages.append(str(message))
 
 
+class _DiskApiOwner(_Owner):
+  def __init__(self, root):
+    super().__init__(root)
+    self.load_calls = []
+    self.save_calls = []
+
+  def diskapi_load_json_from_data(self, filename, subfolder=None, verbose=True):
+    self.load_calls.append({
+      "filename": filename,
+      "subfolder": subfolder,
+      "verbose": verbose,
+    })
+    if subfolder != "plugin_data":
+      flat_path = self.root / filename
+      if flat_path.exists():
+        with open(flat_path, "r", encoding="utf-8") as handle:
+          return json.load(handle)
+      return None
+
+    path = (
+      self.root
+      / self._get_instance_data_subfolder()
+      / "plugin_data"
+      / filename
+    )
+    if not path.exists():
+      return None
+    with open(path, "r", encoding="utf-8") as handle:
+      return json.load(handle)
+
+  def diskapi_save_json_to_data(self, dct, filename, subfolder=None, indent=True):
+    self.save_calls.append({
+      "filename": filename,
+      "subfolder": subfolder,
+      "indent": indent,
+    })
+    path = (
+      self.root
+      / self._get_instance_data_subfolder()
+      / (subfolder or "plugin_data")
+      / filename
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+      json.dump(dct, handle, indent=2 if indent else None)
+
+
 class TestEnvOverrideManager(unittest.TestCase):
 
   def setUp(self):
@@ -186,6 +233,40 @@ class TestEnvOverrideManager(unittest.TestCase):
       json.dump(["not", "an", "object"], handle)
 
     self.assertEqual(self.manager.load_overrides(), {})
+
+  def test_diskapi_load_uses_plugin_data_without_flat_fallback(self):
+    owner = _DiskApiOwner(self.tmp.name)
+    manager = EnvOverrideManager(owner)
+    flat_state = Path(self.tmp.name) / ENV_OVERRIDES_STATE_FILE
+    with open(flat_state, "w", encoding="utf-8") as handle:
+      json.dump({"LOG_LEVEL": "flat"}, handle)
+
+    self.assertEqual(manager.load_overrides(), {})
+    self.assertEqual(owner.load_calls, [{
+      "filename": ENV_OVERRIDES_STATE_FILE,
+      "subfolder": "plugin_data",
+      "verbose": False,
+    }])
+
+  def test_diskapi_save_targets_plugin_data_explicitly(self):
+    owner = _DiskApiOwner(self.tmp.name)
+    manager = EnvOverrideManager(owner)
+
+    manager.save_overrides({"LOG_LEVEL": "trace"})
+
+    self.assertEqual(owner.save_calls, [{
+      "filename": ENV_OVERRIDES_STATE_FILE,
+      "subfolder": "plugin_data",
+      "indent": True,
+    }])
+    state_path = (
+      Path(self.tmp.name)
+      / owner._get_instance_data_subfolder()
+      / "plugin_data"
+      / ENV_OVERRIDES_STATE_FILE
+    )
+    with open(state_path, "r", encoding="utf-8") as handle:
+      self.assertEqual(json.load(handle), {"LOG_LEVEL": "trace"})
 
 
 if __name__ == "__main__":

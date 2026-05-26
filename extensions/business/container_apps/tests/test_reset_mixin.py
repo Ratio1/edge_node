@@ -164,6 +164,28 @@ class TestResetTick(unittest.TestCase):
     self.assertEqual(response["stage"], "runtime_stop")
     self.assertEqual(response["reset"]["status"], "skipped")
 
+  def test_volume_reset_failure_does_not_restart_container(self):
+    manager = self.plugin._ensure_reset_manager()
+    (self.data_root / "payload.txt").write_text("data", encoding="utf-8")
+    self._write_request({
+      "schema_version": 1,
+      "request_id": "reset-volume-fail",
+      "mode": "volumes",
+      "volumes": ["data"],
+    })
+
+    with patch.object(manager, "reset_volumes", side_effect=RuntimeError("clear failed")):
+      self.plugin._reset_tick(current_time=123.0)
+
+    self.assertEqual(self.plugin.lifecycle_log, ["stop"])
+    self.assertTrue((self.data_root / "payload.txt").is_file())
+    response = json.loads((self.root / RESET_RESPONSE_FILE).read_text())
+    self.assertEqual(response["status"], "error")
+    self.assertEqual(response["stage"], "volume_reset")
+    self.assertEqual(response["reset"]["status"], "error")
+    self.assertEqual(response["restart"]["started"], False)
+    self.assertFalse((self.root / RESET_PROCESSING_FILE).exists())
+
   def test_invalid_request_writes_invalid_and_does_not_restart_or_mutate(self):
     (self.data_root / "payload.txt").write_text("data", encoding="utf-8")
     self._write_request({
