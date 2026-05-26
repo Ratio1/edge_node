@@ -54,10 +54,10 @@ class TestResetManagerPlanning(unittest.TestCase):
     plan = self.manager.plan_request({
       "schema_version": 1,
       "request_id": "reset-001",
-      "mode": RESET_MODE_VOLUMES,
     })
 
     self.assertEqual(plan.request_id, "reset-001")
+    self.assertEqual(plan.mode, RESET_MODE_VOLUMES)
     self.assertEqual(plan.apply, RESET_APPLY_RESTART_NOW)
     self.assertEqual(plan.volume_names(), ["data", "logs"])
 
@@ -73,7 +73,6 @@ class TestResetManagerPlanning(unittest.TestCase):
   def test_invalid_requests_are_rejected(self):
     cases = [
       ({"schema_version": 2, "mode": "volumes"}, "schema_version"),
-      ({"schema_version": 1}, "mode"),
       ({"schema_version": 1, "mode": "everything"}, "mode"),
       ({"schema_version": 1, "mode": "volumes", "apply": "later"}, "apply"),
       ({"schema_version": 1, "mode": "volumes", "volumes": "data"}, "volumes"),
@@ -89,6 +88,12 @@ class TestResetManagerPlanning(unittest.TestCase):
         },
         "env_overrides",
       ),
+      ({"schema_version": 1, "clear_all": True}, "unsupported request field"),
+      ({"schema_version": 1, "secrets": {"TOKEN": "x"}}, "unsupported request field"),
+      (
+        {"schema_version": 1, "preserve": {"env_overrides": True, "logs": True}},
+        "unsupported preserve field",
+      ),
     ]
 
     for request, message in cases:
@@ -101,7 +106,7 @@ class TestResetManagerPlanning(unittest.TestCase):
     manager = ResetManager(owner)
 
     with self.assertRaisesRegex(ResetValidationError, "not active"):
-      manager.plan_request({"schema_version": 1, "mode": "volumes"})
+      manager.plan_request({"schema_version": 1})
 
   def test_rejects_active_volume_outside_car_mount_root(self):
     outside = self.tmpdir / "outside" / "data"

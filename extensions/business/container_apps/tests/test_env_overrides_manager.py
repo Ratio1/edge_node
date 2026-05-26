@@ -204,6 +204,8 @@ class TestEnvOverrideManager(unittest.TestCase):
       ({"schema_version": 1, "set": {"VALUE": object()}}, "unsupported"),
       ({"schema_version": 1, "set": {"VALUE": "x"}, "remove": ["VALUE"]}, "both"),
       ({"schema_version": 1, "request_id": 123}, "request_id"),
+      ({"schema_version": 1, "clear_all": True}, "unsupported request field"),
+      ({"schema_version": 1, "secrets": {"TOKEN": "x"}}, "unsupported request field"),
     ]
 
     for request, message in cases:

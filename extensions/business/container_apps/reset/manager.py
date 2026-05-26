@@ -92,6 +92,16 @@ class ResetApplyResult:
 class ResetManager:
   """Validate and execute fixed-size volume reset requests."""
 
+  _request_keys = frozenset({
+    "schema_version",
+    "request_id",
+    "mode",
+    "apply",
+    "preserve",
+    "volumes",
+  })
+  _preserve_keys = frozenset({"env_overrides"})
+
   def __init__(self, owner):
     self.owner = owner
 
@@ -105,13 +115,15 @@ class ResetManager:
     if "request_id" in request_body and request_id is None:
       raise ResetValidationError("request_id must be a string")
 
+    self._reject_unknown_fields(request_body, self._request_keys, request_id)
+
     if request_body.get("schema_version") != RESET_SCHEMA_VERSION:
       raise ResetValidationError(
         f"schema_version must be {RESET_SCHEMA_VERSION}",
         request_id=request_id,
       )
 
-    mode = request_body.get("mode")
+    mode = request_body.get("mode", RESET_MODE_VOLUMES)
     if mode != RESET_MODE_VOLUMES:
       raise ResetValidationError(
         f"mode must be {RESET_MODE_VOLUMES!r}",
@@ -130,6 +142,7 @@ class ResetManager:
       preserve = {}
     if not isinstance(preserve, dict):
       raise ResetValidationError("preserve must be a JSON object", request_id=request_id)
+    self._reject_unknown_fields(preserve, self._preserve_keys, request_id, scope="preserve")
     if preserve.get("env_overrides", True) is not True:
       raise ResetValidationError(
         "preserve.env_overrides is always true in v1",
@@ -212,6 +225,21 @@ class ResetManager:
         seen.add(raw_name)
         names.append(raw_name)
     return names
+
+  @staticmethod
+  def _reject_unknown_fields(
+    request_body: dict,
+    allowed: frozenset[str],
+    request_id: Optional[str],
+    *,
+    scope: str = "request",
+  ) -> None:
+    unknown = sorted(set(request_body).difference(allowed))
+    if unknown:
+      raise ResetValidationError(
+        "unsupported {} field(s): {}".format(scope, ", ".join(unknown)),
+        request_id=request_id,
+      )
 
   @staticmethod
   def _is_path_like(name: str) -> bool:

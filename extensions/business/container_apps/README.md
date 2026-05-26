@@ -229,7 +229,7 @@ Apps write one request to `/r1en_system/env-overrides/request.json`:
 
 `apply` defaults to `"next_restart"` and also accepts `"restart_now"`.
 `request_id` is correlation only; repeating the same request processes it again.
-`clear_all` is not part of v1.
+Unknown top-level fields are rejected; `clear_all` and secrets are not part of v1.
 
 `set` accepts strings, numbers, booleans, arrays, and objects. Docker receives
 strings: strings are unchanged, booleans become `true`/`false`, numbers become
@@ -247,8 +247,8 @@ and active override count, not a full effective env dump.
 
 ### Reset
 
-`RESET` lets an app request a local destructive reset of CAR-managed app data
-volumes followed by a container restart. The feature is enabled by default:
+`RESET` lets an app request a local destructive reset of CAR-managed fixed-size
+app data volumes followed by a container restart. The feature is enabled by default:
 
 ```python
 "RESET": {
@@ -268,9 +268,11 @@ Apps write one request to `/r1en_system/reset/request.json`:
 }
 ```
 
-V1 supports only `mode="volumes"` and only `apply="restart_now"`. `volumes`
-is optional; when omitted, CAR resets all active `FIXED_SIZE_VOLUMES`. When
-present, entries must be logical `FIXED_SIZE_VOLUMES` names, not paths.
+V1 supports only `mode="volumes"` and only `apply="restart_now"`; both fields
+default to those values when omitted. `volumes` is optional; when omitted, CAR
+resets all active `FIXED_SIZE_VOLUMES`. When present, entries must be logical
+`FIXED_SIZE_VOLUMES` names, not paths. Unknown top-level request fields are
+rejected.
 
 Reset scope is deliberately narrow: v1 clears the contents inside selected
 fixed-size volume mount roots without deleting the mount root itself. It does

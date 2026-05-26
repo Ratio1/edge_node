@@ -88,6 +88,13 @@ class EnvOverrideManager:
   """Validate, persist, and overlay CAR local environment overrides."""
 
   _name_re = re.compile(ENV_NAME_PATTERN)
+  _request_keys = frozenset({
+    "schema_version",
+    "request_id",
+    "apply",
+    "set",
+    "remove",
+  })
 
   def __init__(self, owner):
     self.owner = owner
@@ -230,6 +237,8 @@ class EnvOverrideManager:
     if "request_id" in request_body and request_id is None:
       raise EnvOverrideValidationError("request_id must be a string")
 
+    self._reject_unknown_fields(request_body, self._request_keys, request_id)
+
     if request_body.get("schema_version") != ENV_OVERRIDES_SCHEMA_VERSION:
       raise EnvOverrideValidationError(
         f"schema_version must be {ENV_OVERRIDES_SCHEMA_VERSION}",
@@ -272,6 +281,19 @@ class EnvOverrideManager:
       "set": set_values,
       "remove": remove_names,
     }
+
+  @staticmethod
+  def _reject_unknown_fields(
+    request_body: dict,
+    allowed: frozenset[str],
+    request_id: Optional[str],
+  ) -> None:
+    unknown = sorted(set(request_body).difference(allowed))
+    if unknown:
+      raise EnvOverrideValidationError(
+        "unsupported request field(s): {}".format(", ".join(unknown)),
+        request_id=request_id,
+      )
 
   def _validate_raw_size(self, raw_body: Optional[str]) -> None:
     if raw_body is None:

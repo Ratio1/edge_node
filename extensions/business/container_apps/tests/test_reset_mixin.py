@@ -129,7 +129,6 @@ class TestResetTick(unittest.TestCase):
     self._write_request({
       "schema_version": 1,
       "request_id": "reset-001",
-      "mode": "volumes",
       "volumes": ["data"],
     })
 
@@ -205,6 +204,23 @@ class TestResetTick(unittest.TestCase):
     self.assertEqual(invalid["_error"]["request_id"], "reset-bad")
     self.assertEqual(response["status"], "error")
     self.assertEqual(response["request_id"], "reset-bad")
+
+  def test_unsupported_request_field_writes_invalid_and_does_not_restart(self):
+    (self.data_root / "payload.txt").write_text("data", encoding="utf-8")
+    self._write_request({
+      "schema_version": 1,
+      "request_id": "reset-clear-all",
+      "clear_all": True,
+    })
+
+    self.plugin._reset_tick(current_time=123.0)
+
+    self.assertEqual(self.plugin.lifecycle_log, [])
+    self.assertTrue((self.data_root / "payload.txt").is_file())
+    response = json.loads((self.root / RESET_RESPONSE_FILE).read_text())
+    self.assertEqual(response["status"], "error")
+    self.assertEqual(response["request_id"], "reset-clear-all")
+    self.assertIn("unsupported request field", response["error"])
 
   def test_env_override_state_is_outside_reset_scope(self):
     plugin_data = (

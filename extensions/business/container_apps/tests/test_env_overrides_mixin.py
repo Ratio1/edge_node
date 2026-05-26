@@ -219,6 +219,22 @@ class TestEnvOverrideTick(unittest.TestCase):
     self.assertEqual(response["status"], "error")
     self.assertEqual(response["request_id"], "env-bad")
 
+  def test_unsupported_request_field_writes_error_without_persisting(self):
+    self._write_request({
+      "schema_version": 1,
+      "request_id": "env-clear-all",
+      "clear_all": True,
+    })
+
+    restart = self.plugin._env_overrides_tick(current_time=100.0)
+
+    self.assertFalse(restart)
+    self.assertFalse(self._state_path().exists())
+    response = json.loads((self.eod / ENV_OVERRIDES_RESPONSE_FILE).read_text())
+    self.assertEqual(response["status"], "error")
+    self.assertEqual(response["request_id"], "env-clear-all")
+    self.assertIn("unsupported request field", response["error"])
+
   def test_malformed_json_writes_raw_body_diagnostic(self):
     (self.eod / ENV_OVERRIDES_REQUEST_FILE).write_text("{not-json", encoding="utf-8")
 
