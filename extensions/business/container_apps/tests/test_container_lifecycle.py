@@ -382,6 +382,32 @@ class TestWorkerAppRunnerLifecycle(unittest.TestCase):
     self.assertEqual(result, StopReason.EXTERNAL_UPDATE)
     self.assertEqual(calls, [("sync", 123.0), ("git", 123.0)])
 
+  def test_additional_checks_skips_git_after_reset_work(self):
+    plugin = WorkerAppRunnerPlugin.__new__(WorkerAppRunnerPlugin)
+    calls = []
+
+    def base_reset(_plugin, current_time):
+      calls.append(("base", current_time))
+      _plugin._reset_processed_this_tick = True
+      return None
+
+    def git_updates(current_time):
+      calls.append(("git", current_time))
+      return StopReason.EXTERNAL_UPDATE
+
+    plugin._check_git_updates = git_updates
+
+    with patch.object(
+      ContainerAppRunnerPlugin,
+      "_perform_additional_checks",
+      autospec=True,
+      side_effect=base_reset,
+    ):
+      result = plugin._perform_additional_checks(123.0)
+
+    self.assertIsNone(result)
+    self.assertEqual(calls, [("base", 123.0)])
+
 
 # ===========================================================================
 # Stop and Close

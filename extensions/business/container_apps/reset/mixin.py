@@ -158,46 +158,46 @@ class _ResetMixin:
       RESET_PROCESSING_FILE,
     )
 
-  def _reset_tick(self, current_time: float) -> None:
+  def _reset_tick(self, current_time: float) -> bool:
     """Process one pending reset request inline. Never routes through _restart_container."""
     if not self._reset_control_available():
-      return
+      return False
 
     manager = self._ensure_reset_manager()
     if manager is None:
-      return
+      return False
 
     control_file = self._request_reset_control_file()
     try:
       claimed = control_file.claim_object()
     except JsonControlFileClaimError as exc:
       self.P(f"[reset] could not rename request.json -> .processing: {exc}", color="r")
-      return
+      return False
     except JsonControlFileReadError as exc:
       self._fail_reset_request(
         None, STAGE_VALIDATION,
         f"could not read .processing: {exc}", control_file.processing_path,
       )
-      return
+      return True
     except JsonControlFileUnsafeError as exc:
       self._fail_reset_request(None, STAGE_VALIDATION, str(exc), control_file.processing_path)
-      return
+      return True
     except JsonControlFileDecodeError as exc:
       self._fail_reset_request(
         None, STAGE_VALIDATION,
         f"malformed JSON: {exc}", control_file.processing_path,
         raw_body=exc.raw_body,
       )
-      return
+      return True
     except JsonControlFileObjectError as exc:
       self._fail_reset_request(
         None, STAGE_VALIDATION, str(exc), control_file.processing_path,
         raw_body=exc.raw_body,
       )
-      return
+      return True
 
     if claimed is None:
-      return
+      return False
 
     try:
       plan = manager.plan_request(claimed.body)
@@ -206,7 +206,7 @@ class _ResetMixin:
         claimed.body, exc.stage, str(exc), claimed.processing_path,
         raw_body=claimed.raw_body,
       )
-      return
+      return True
 
     stopped = self._stop_container_runtime_for_restart()
     if not stopped:
@@ -217,7 +217,7 @@ class _ResetMixin:
         claimed.processing_path,
         plan=plan,
       )
-      return
+      return True
 
     reset_error = None
     cleared_count = 0
@@ -235,7 +235,7 @@ class _ResetMixin:
         plan=plan,
         restart_started=False,
       )
-      return
+      return True
 
     restart_started = self._reset_safe_start_container()
     restart_error = None if restart_started else "container restart failed after reset"
@@ -256,6 +256,7 @@ class _ResetMixin:
       control_file.discard_processing()
     except OSError as exc:
       self.P(f"[reset] failed to delete .processing after reset: {exc}", color="r")
+    return True
 
   def _reset_safe_start_container(self) -> bool:
     try:

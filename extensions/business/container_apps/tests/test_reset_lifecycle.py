@@ -79,6 +79,29 @@ class TestResetLifecycleIntegration(unittest.TestCase):
     self.assertEqual(response["status"], "ok")
     self.assertEqual(response["request_id"], "reset-inline")
 
+  def test_reset_processing_skips_sync_for_same_monitoring_tick(self):
+    lifecycle = []
+    self.plugin._stop_container_runtime_for_restart = lambda: lifecycle.append("stop") or True
+    self.plugin.start_container = lambda: lifecycle.append("start") or object()
+    self.plugin._reset_runtime_state_post_start = lambda: lifecycle.append("reset-state")
+    self.plugin._sync_enabled = lambda: True
+    self.plugin._sync_role = lambda: "provider"
+    self.plugin._sync_provider_tick = lambda _current_time: lifecycle.append("sync-provider")
+    (reset_dir(self.plugin) / RESET_REQUEST_FILE).write_text(
+      json.dumps({
+        "schema_version": 1,
+        "request_id": "reset-before-sync",
+        "volumes": ["data"],
+      }),
+      encoding="utf-8",
+    )
+
+    result = self.plugin._perform_additional_checks(current_time=123.0)
+
+    self.assertIsNone(result)
+    self.assertEqual(lifecycle, ["stop", "start", "reset-state"])
+    self.assertTrue(self.plugin._reset_processed_this_tick)
+
   def test_volume_reset_failure_does_not_auto_start_on_next_process_tick(self):
     plugin, client, _container = make_lifecycle_runner(
       cfg_autoupdate=False,

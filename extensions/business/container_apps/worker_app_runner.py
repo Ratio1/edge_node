@@ -278,6 +278,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     sync_reason = super()._perform_additional_checks(current_time)
     if sync_reason:
       return sync_reason
+    if getattr(self, "_reset_processed_this_tick", False):
+      return None
     return self._check_git_updates(current_time)
 
   def _check_git_updates(self, current_time=None):

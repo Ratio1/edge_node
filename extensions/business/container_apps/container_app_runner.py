@@ -3886,10 +3886,13 @@ class ContainerAppRunnerPlugin(
     # StopReason from here because that would route through _restart_container,
     # which calls _cleanup_fixed_size_volumes() and unmounts before our work
     # can run.
+    self._reset_processed_this_tick = False
     if self._env_overrides_tick(current_time):
       return StopReason.ENV_OVERRIDE
 
-    self._reset_tick(current_time)
+    if self._reset_tick(current_time):
+      self._reset_processed_this_tick = True
+      return None
 
     if self._sync_enabled():
       role = self._sync_role()
