@@ -435,14 +435,16 @@ class ProbeBase:
     if api_security is None:
       return ()
     auth = getattr(api_security, "auth", None)
-    if auth is None:
-      return ()
+    gateway_auth = getattr(api_security, "gateway_auth", None)
     names = []
-    for attr in ("api_key_header_name", "api_key_query_param",
-                  "bearer_token_header_name"):
-      val = getattr(auth, attr, None)
-      if isinstance(val, str) and val:
-        names.append(val)
+    for descriptor in (auth, gateway_auth):
+      if descriptor is None:
+        continue
+      for attr in ("api_key_header_name", "api_key_query_param",
+                    "bearer_token_header_name"):
+        val = getattr(descriptor, attr, None)
+        if isinstance(val, str) and val and val not in names:
+          names.append(val)
     return tuple(names)
 
   def _scrub_for_emission(self, value):

@@ -88,15 +88,17 @@ def _configured_graybox_secret_names_from_report(report):
   for target_config in candidates:
     api_security = target_config.get("api_security") or {}
     auth = api_security.get("auth") or {}
-    if not isinstance(auth, dict):
-      continue
-    for key in (
-      "api_key_header_name", "api_key_query_param",
-      "bearer_token_header_name",
-    ):
-      value = auth.get(key)
-      if isinstance(value, str) and value and value not in names:
-        names.append(value)
+    gateway_auth = api_security.get("gateway_auth") or {}
+    for descriptor in (auth, gateway_auth):
+      if not isinstance(descriptor, dict):
+        continue
+      for key in (
+        "api_key_header_name", "api_key_query_param",
+        "bearer_token_header_name",
+      ):
+        value = descriptor.get(key)
+        if isinstance(value, str) and value and value not in names:
+          names.append(value)
   return tuple(names)
 
 

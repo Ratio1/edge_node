@@ -20,6 +20,7 @@ from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   ApiBusinessFlow,
   ApiTokenEndpoint,
   ApiInventoryPaths,
+  GatewayAuthDescriptor,
   ApiSecurityConfig,
   COMMON_CSRF_FIELDS,
 )
@@ -417,6 +418,48 @@ class TestApiSecurityConfig(unittest.TestCase):
     self.assertEqual(cfg.token_endpoints.token_response_field, "access_token")
     self.assertEqual(cfg.auth.api_key_header_name, "X-Customer-Api-Key")
     self.assertEqual(cfg.sensitive_field_patterns, ["custom_*_secret"])
+
+  def test_api_security_config_gateway_auth_defaults_to_absent(self):
+    cfg = ApiSecurityConfig.from_dict({})
+
+    self.assertIsNone(cfg.gateway_auth)
+    target_dict = GrayboxTargetConfig.from_dict({}).to_dict()
+    self.assertNotIn("gateway_auth", target_dict["api_security"])
+
+  def test_api_security_config_accepts_gateway_api_key_descriptor(self):
+    cfg = ApiSecurityConfig.from_dict({
+      "auth": {
+        "auth_type": "bearer",
+        "authenticated_probe_path": "/api/me/",
+      },
+      "gateway_auth": {
+        "auth_type": "api_key",
+        "api_key_location": "header",
+        "api_key_header_name": "X-Gateway-Key",
+        "provider": "api_gateway",
+        "classification": "gateway",
+        "warnings": ["manual_mapping_confirmed"],
+      },
+    })
+
+    self.assertIsInstance(cfg.gateway_auth, GatewayAuthDescriptor)
+    self.assertEqual(cfg.auth.auth_type, "bearer")
+    self.assertEqual(cfg.gateway_auth.auth_type, "api_key")
+    self.assertEqual(cfg.gateway_auth.api_key_header_name, "X-Gateway-Key")
+    self.assertEqual(cfg.gateway_auth.provider, "api_gateway")
+    self.assertEqual(cfg.gateway_auth.warnings, ("manual_mapping_confirmed",))
+
+  def test_api_security_config_rejects_gateway_secret_inline(self):
+    with self.assertRaises(ValueError) as cm:
+      ApiSecurityConfig.from_dict({
+        "gateway_auth": {
+          "auth_type": "api_key",
+          "api_key": "GATEWAY-SECRET-MUST-NOT-LIVE-HERE",
+        },
+      })
+
+    self.assertIn("unknown field", str(cm.exception))
+    self.assertIn("api_key", str(cm.exception))
 
   def test_api_security_config_full_roundtrip(self):
     """Populated payload survives from_dict cleanly."""

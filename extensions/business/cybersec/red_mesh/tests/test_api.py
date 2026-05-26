@@ -499,6 +499,185 @@ class TestPhase1ConfigCID(unittest.TestCase):
       json.dumps(config_dict),
     )
 
+  def test_launch_webapp_scan_persists_gateway_api_key_only_in_secret_payload(self):
+    """Gateway credentials use the same secret lane while descriptor metadata persists."""
+    plugin = self._build_mock_plugin(job_id="test-job-gateway-api-key")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="APP-BEARER-TOKEN-MUST-NOT-PERSIST",
+      gateway_api_key="GATEWAY-KEY-MUST-NOT-PERSIST",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+          },
+          "gateway_auth": {
+            "auth_type": "api_key",
+            "api_key_location": "header",
+            "api_key_header_name": "X-Gateway-Key",
+          },
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+    secret_doc = plugin.r1fs.add_json.call_args_list[0][0][0]
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(
+      secret_doc["payload"]["gateway_api_key"],
+      "GATEWAY-KEY-MUST-NOT-PERSIST",
+    )
+    self.assertEqual(
+      secret_doc["payload"]["bearer_token"],
+      "APP-BEARER-TOKEN-MUST-NOT-PERSIST",
+    )
+    self.assertEqual(config_dict["secret_ref"], "QmSecretCID")
+    self.assertTrue(config_dict["has_gateway_api_key"])
+    self.assertEqual(config_dict["gateway_api_key"], "")
+    self.assertEqual(
+      config_dict["target_config"]["api_security"]["gateway_auth"]["api_key_header_name"],
+      "X-Gateway-Key",
+    )
+    serialized_config = json.dumps(config_dict)
+    self.assertNotIn("GATEWAY-KEY-MUST-NOT-PERSIST", serialized_config)
+    self.assertNotIn("APP-BEARER-TOKEN-MUST-NOT-PERSIST", serialized_config)
+
+  def test_launch_webapp_scan_rejects_missing_gateway_secret(self):
+    plugin = self._build_mock_plugin(job_id="test-job-gateway-missing-secret")
+
+    result = self._launch_webapp(
+      plugin,
+      target_config={
+        "api_security": {
+          "gateway_auth": {
+            "auth_type": "api_key",
+            "api_key_header_name": "X-Gateway-Key",
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("gateway_api_key", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_scan_rejects_same_authorization_carrier(self):
+    plugin = self._build_mock_plugin(job_id="test-job-gateway-auth-conflict")
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="APP-BEARER",
+      gateway_bearer_token="GATEWAY-BEARER",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+          },
+          "gateway_auth": {
+            "auth_type": "bearer",
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("same carrier", result["message"])
+    self.assertIn("Authorization", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_scan_rejects_same_query_carrier(self):
+    plugin = self._build_mock_plugin(job_id="test-job-gateway-query-conflict")
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      api_key="APP-QUERY-KEY",
+      gateway_api_key="GATEWAY-QUERY-KEY",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "api_key",
+            "api_key_location": "query",
+            "api_key_query_param": "shared_key",
+            "allow_unverified_auth": True,
+          },
+          "gateway_auth": {
+            "auth_type": "api_key",
+            "api_key_location": "query",
+            "api_key_query_param": "shared_key",
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("same carrier", result["message"])
+    self.assertIn("shared_key", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_scan_allows_gateway_query_key_plus_app_bearer(self):
+    plugin = self._build_mock_plugin(job_id="test-job-gateway-query-safe")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="APP-BEARER",
+      gateway_api_key="GATEWAY-QUERY-KEY",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+          },
+          "gateway_auth": {
+            "auth_type": "api_key",
+            "api_key_location": "query",
+            "api_key_query_param": "gateway_key",
+          },
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(config_dict["has_gateway_api_key"])
+    self.assertEqual(
+      config_dict["target_config"]["api_security"]["gateway_auth"]["api_key_query_param"],
+      "gateway_key",
+    )
+
+  def test_launch_webapp_scan_allows_gateway_bearer_plus_form_auth(self):
+    plugin = self._build_mock_plugin(job_id="test-job-gateway-form-safe")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+
+    result = self._launch_webapp(
+      plugin,
+      gateway_bearer_token="GATEWAY-BEARER-MUST-NOT-PERSIST",
+      target_config={
+        "api_security": {
+          "gateway_auth": {
+            "auth_type": "bearer",
+          },
+        },
+      },
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertTrue(config_dict["has_gateway_bearer_token"])
+    self.assertEqual(config_dict["gateway_bearer_token"], "")
+
   def test_launch_webapp_scan_rejects_bearer_without_validation_path(self):
     """Bearer/API-key auth must be validated unless explicitly unverified."""
     plugin = self._build_mock_plugin(job_id="test-job-bearer-no-probe")
@@ -1040,6 +1219,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
       bearer_token="TOKEN-123",
       api_key="KEY-123",
       bearer_refresh_token="REFRESH-123",
+      gateway_api_key="GATEWAY-KEY-123",
+      gateway_bearer_token="GATEWAY-TOKEN-123",
+      gateway_bearer_refresh_token="GATEWAY-REFRESH-123",
       request_budget=42,
       authorized=True,
       scan_type="webapp",
@@ -1053,6 +1235,12 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(webapp_kwargs["bearer_token"], "TOKEN-123")
     self.assertEqual(webapp_kwargs["api_key"], "KEY-123")
     self.assertEqual(webapp_kwargs["bearer_refresh_token"], "REFRESH-123")
+    self.assertEqual(webapp_kwargs["gateway_api_key"], "GATEWAY-KEY-123")
+    self.assertEqual(webapp_kwargs["gateway_bearer_token"], "GATEWAY-TOKEN-123")
+    self.assertEqual(
+      webapp_kwargs["gateway_bearer_refresh_token"],
+      "GATEWAY-REFRESH-123",
+    )
     self.assertEqual(webapp_kwargs["request_budget"], 42)
 
   def test_launch_test_persists_typed_ptes_context(self):

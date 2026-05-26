@@ -160,6 +160,9 @@ def _blank_graybox_secret_fields(config_dict: dict) -> dict:
   sanitized["regular_bearer_token"] = ""
   sanitized["regular_api_key"] = ""
   sanitized["regular_bearer_refresh_token"] = ""
+  sanitized["gateway_api_key"] = ""
+  sanitized["gateway_bearer_token"] = ""
+  sanitized["gateway_bearer_refresh_token"] = ""
   sanitized.pop("target_config_secrets", None)
   sanitized.pop("weak_candidates", None)
   return sanitized
@@ -186,6 +189,9 @@ def build_graybox_secret_payload(
   regular_bearer_token="",
   regular_api_key="",
   regular_bearer_refresh_token="",
+  gateway_api_key="",
+  gateway_bearer_token="",
+  gateway_bearer_refresh_token="",
   target_config_secrets=None,
 ):
   return {
@@ -201,6 +207,9 @@ def build_graybox_secret_payload(
     "regular_bearer_token": regular_bearer_token or "",
     "regular_api_key": regular_api_key or "",
     "regular_bearer_refresh_token": regular_bearer_refresh_token or "",
+    "gateway_api_key": gateway_api_key or "",
+    "gateway_bearer_token": gateway_bearer_token or "",
+    "gateway_bearer_refresh_token": gateway_bearer_refresh_token or "",
     "target_config_secrets": dict(target_config_secrets) if isinstance(target_config_secrets, dict) else {},
   }
 
@@ -236,6 +245,9 @@ def persist_job_config_with_secrets(
       regular_bearer_token=persisted_config.get("regular_bearer_token", ""),
       regular_api_key=persisted_config.get("regular_api_key", ""),
       regular_bearer_refresh_token=persisted_config.get("regular_bearer_refresh_token", ""),
+      gateway_api_key=persisted_config.get("gateway_api_key", ""),
+      gateway_bearer_token=persisted_config.get("gateway_bearer_token", ""),
+      gateway_bearer_refresh_token=persisted_config.get("gateway_bearer_refresh_token", ""),
       target_config_secrets=target_config_secrets,
     )
     has_secret_payload = any([
@@ -250,6 +262,9 @@ def persist_job_config_with_secrets(
       payload["regular_bearer_token"],
       payload["regular_api_key"],
       payload["regular_bearer_refresh_token"],
+      payload["gateway_api_key"],
+      payload["gateway_bearer_token"],
+      payload["gateway_bearer_refresh_token"],
       payload["target_config_secrets"],
     ])
     if has_secret_payload:
@@ -273,6 +288,9 @@ def persist_job_config_with_secrets(
       persisted_config["has_regular_bearer_token"] = bool(payload["regular_bearer_token"])
       persisted_config["has_regular_api_key"] = bool(payload["regular_api_key"])
       persisted_config["has_regular_bearer_refresh_token"] = bool(payload["regular_bearer_refresh_token"])
+      persisted_config["has_gateway_api_key"] = bool(payload["gateway_api_key"])
+      persisted_config["has_gateway_bearer_token"] = bool(payload["gateway_bearer_token"])
+      persisted_config["has_gateway_bearer_refresh_token"] = bool(payload["gateway_bearer_refresh_token"])
       persisted_config = _blank_graybox_secret_fields(persisted_config)
 
   job_config_cid = _artifact_repo(owner).put_job_config(persisted_config, show_logs=False)
@@ -318,6 +336,9 @@ def resolve_job_config_secrets(
     "regular_bearer_token": payload.get("regular_bearer_token", ""),
     "regular_api_key": payload.get("regular_api_key", ""),
     "regular_bearer_refresh_token": payload.get("regular_bearer_refresh_token", ""),
+    "gateway_api_key": payload.get("gateway_api_key", ""),
+    "gateway_bearer_token": payload.get("gateway_bearer_token", ""),
+    "gateway_bearer_refresh_token": payload.get("gateway_bearer_refresh_token", ""),
   })
   target_config_secrets = payload.get("target_config_secrets") or {}
   target_config_secret_refs = []

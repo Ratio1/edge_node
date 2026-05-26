@@ -38,9 +38,15 @@ SENSITIVE_VALUES = {
   "regular_bearer_refresh_token": "REGULAR-REFRESH-TOKEN-MUST-NOT-LEAK",
 }
 
+GATEWAY_VALUES = {
+  "gateway_api_key": "GATEWAY-SECRET-API-KEY-9999",
+  "gateway_bearer_token": "eyJ.GATEWAY-SECRET-BEARER-TOKEN.abc",
+  "gateway_bearer_refresh_token": "GATEWAY-REFRESH-TOKEN-MUST-NOT-LEAK",
+}
+
 
 def _has_secrets(text: str) -> bool:
-  return any(v in text for v in SENSITIVE_VALUES.values())
+  return any(v in text for v in [*SENSITIVE_VALUES.values(), *GATEWAY_VALUES.values()])
 
 
 class TestSecretIsolationInBuildPayload(unittest.TestCase):
@@ -58,6 +64,16 @@ class TestSecretIsolationInBuildPayload(unittest.TestCase):
     self.assertEqual(payload["regular_api_key"], SENSITIVE_VALUES["regular_api_key"])
     self.assertEqual(payload["regular_bearer_refresh_token"], SENSITIVE_VALUES["regular_bearer_refresh_token"])
 
+  def test_build_payload_carries_gateway_secrets(self):
+    payload = build_graybox_secret_payload(**GATEWAY_VALUES)
+
+    self.assertEqual(payload["gateway_api_key"], GATEWAY_VALUES["gateway_api_key"])
+    self.assertEqual(payload["gateway_bearer_token"], GATEWAY_VALUES["gateway_bearer_token"])
+    self.assertEqual(
+      payload["gateway_bearer_refresh_token"],
+      GATEWAY_VALUES["gateway_bearer_refresh_token"],
+    )
+
   def test_build_payload_carries_target_config_secrets(self):
     payload = build_graybox_secret_payload(
       target_config_secrets={"oauth_client_secret": "OAUTH-CLIENT-SECRET"},
@@ -72,6 +88,7 @@ class TestSecretIsolationInBuildPayload(unittest.TestCase):
     sanitized = _blank_graybox_secret_fields({
       "official_username": "alice", "official_password": "apw",
       **SENSITIVE_VALUES,
+      **GATEWAY_VALUES,
     })
     self.assertEqual(sanitized["bearer_token"], "")
     self.assertEqual(sanitized["api_key"], "")
@@ -79,6 +96,9 @@ class TestSecretIsolationInBuildPayload(unittest.TestCase):
     self.assertEqual(sanitized["regular_bearer_token"], "")
     self.assertEqual(sanitized["regular_api_key"], "")
     self.assertEqual(sanitized["regular_bearer_refresh_token"], "")
+    self.assertEqual(sanitized["gateway_api_key"], "")
+    self.assertEqual(sanitized["gateway_bearer_token"], "")
+    self.assertEqual(sanitized["gateway_bearer_refresh_token"], "")
 
 
 class TestSecretStoreKeySeparation(unittest.TestCase):
@@ -160,6 +180,7 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
       "scan_type": "webapp",
       "official_username": "alice", "official_password": "apw",
       **SENSITIVE_VALUES,
+      **GATEWAY_VALUES,
     }
 
     owner, _ = self._build_owner()
@@ -180,6 +201,9 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
     self.assertTrue(persisted_config["has_regular_bearer_token"])
     self.assertTrue(persisted_config["has_regular_api_key"])
     self.assertTrue(persisted_config["has_regular_bearer_refresh_token"])
+    self.assertTrue(persisted_config["has_gateway_api_key"])
+    self.assertTrue(persisted_config["has_gateway_bearer_token"])
+    self.assertTrue(persisted_config["has_gateway_bearer_refresh_token"])
     self.assertEqual(persisted_config["secret_ref"], "fake://secret/cid")
     # Raw secret slots are blanked.
     self.assertEqual(persisted_config["bearer_token"], "")
@@ -188,6 +212,9 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
     self.assertEqual(persisted_config["regular_bearer_token"], "")
     self.assertEqual(persisted_config["regular_api_key"], "")
     self.assertEqual(persisted_config["regular_bearer_refresh_token"], "")
+    self.assertEqual(persisted_config["gateway_api_key"], "")
+    self.assertEqual(persisted_config["gateway_bearer_token"], "")
+    self.assertEqual(persisted_config["gateway_bearer_refresh_token"], "")
 
   @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
   @patch("extensions.business.cybersec.red_mesh.services.secrets._artifact_repo")
@@ -274,6 +301,7 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
     fake_store.load_graybox_credentials.return_value = {
       "official_username": "alice", "official_password": "apw",
       **SENSITIVE_VALUES,
+      **GATEWAY_VALUES,
     }
     mock_store_cls.return_value = fake_store
 
@@ -286,13 +314,17 @@ class TestSecretIsolationInPersistedConfig(unittest.TestCase):
       "bearer_token": "", "api_key": "", "bearer_refresh_token": "",
       "regular_bearer_token": "", "regular_api_key": "",
       "regular_bearer_refresh_token": "",
+      "gateway_api_key": "", "gateway_bearer_token": "",
+      "gateway_bearer_refresh_token": "",
       "has_bearer_token": True, "has_api_key": True,
       "has_bearer_refresh_token": True,
       "has_regular_bearer_token": True, "has_regular_api_key": True,
       "has_regular_bearer_refresh_token": True,
+      "has_gateway_api_key": True, "has_gateway_bearer_token": True,
+      "has_gateway_bearer_refresh_token": True,
     }
     resolved = resolve_job_config_secrets(MagicMock(), persisted)
-    for k, v in SENSITIVE_VALUES.items():
+    for k, v in {**SENSITIVE_VALUES, **GATEWAY_VALUES}.items():
       self.assertEqual(resolved[k], v)
 
   @patch("extensions.business.cybersec.red_mesh.services.secrets.R1fsSecretStore")
@@ -511,6 +543,8 @@ class TestSecretRoundTripAcrossNodes(unittest.TestCase):
       "bearer_token": SENSITIVE_VALUES["bearer_token"],
       "api_key": SENSITIVE_VALUES["api_key"],
       "regular_bearer_token": SENSITIVE_VALUES["regular_bearer_token"],
+      "gateway_api_key": GATEWAY_VALUES["gateway_api_key"],
+      "gateway_bearer_token": GATEWAY_VALUES["gateway_bearer_token"],
     }
 
     persisted_config, _cid = persist_job_config_with_secrets(
@@ -519,8 +553,12 @@ class TestSecretRoundTripAcrossNodes(unittest.TestCase):
 
     self.assertTrue(persisted_config["has_bearer_token"])
     self.assertTrue(persisted_config["has_api_key"])
+    self.assertTrue(persisted_config["has_gateway_api_key"])
+    self.assertTrue(persisted_config["has_gateway_bearer_token"])
     self.assertEqual(persisted_config["bearer_token"], "")
     self.assertEqual(persisted_config["api_key"], "")
+    self.assertEqual(persisted_config["gateway_api_key"], "")
+    self.assertEqual(persisted_config["gateway_bearer_token"], "")
 
     persisted_config["job_id"] = "job-rt-2"
     resolved = resolve_job_config_secrets(worker, persisted_config)
@@ -530,6 +568,11 @@ class TestSecretRoundTripAcrossNodes(unittest.TestCase):
     self.assertEqual(
       resolved["regular_bearer_token"],
       SENSITIVE_VALUES["regular_bearer_token"],
+    )
+    self.assertEqual(resolved["gateway_api_key"], GATEWAY_VALUES["gateway_api_key"])
+    self.assertEqual(
+      resolved["gateway_bearer_token"],
+      GATEWAY_VALUES["gateway_bearer_token"],
     )
 
   @patch.dict(os.environ, {}, clear=True)

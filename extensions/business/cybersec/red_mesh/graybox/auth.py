@@ -50,6 +50,7 @@ class AuthManager:
     self._created_at = 0.0
     self._refresh_count = 0
     self._auth_errors = []
+    self._auth_diagnostics = []
     self._detected_csrf_field = None
 
   @property
@@ -99,6 +100,7 @@ class AuthManager:
     official_creds = self._coerce_creds(official_creds, principal="official")
     regular_creds = self._coerce_creds(regular_creds, principal="regular")
     self._auth_errors = []
+    self._auth_diagnostics = []
 
     self.official_session = self._try_login_with_retry(
       "official",
@@ -214,6 +216,65 @@ class AuthManager:
 
   def _record_auth_error(self, code):
     self._auth_errors.append(code)
+
+  def _has_gateway_auth(self) -> bool:
+    api_security = getattr(self.target_config, "api_security", None)
+    gateway_auth = (
+      getattr(api_security, "gateway_auth", None)
+      if api_security is not None else None
+    )
+    return gateway_auth is not None
+
+  @staticmethod
+  def _response_header(resp, name: str) -> str:
+    headers = getattr(resp, "headers", None) or {}
+    getter = getattr(headers, "get", None)
+    if callable(getter):
+      value = getter(name)
+      if value is not None:
+        return str(value)
+    lower_name = name.lower()
+    for key, value in getattr(headers, "items", lambda: [])():
+      if str(key).lower() == lower_name:
+        return str(value)
+    return ""
+
+  def _classify_auth_failure(self, resp) -> str:
+    if not self._has_gateway_auth():
+      return "app_auth_likely"
+    fixture_layer = self._response_header(resp, "X-RedMesh-Fixture-Layer").lower()
+    proxy_status = self._response_header(resp, "Proxy-Status").lower()
+    aws_gateway_signal = any(
+      self._response_header(resp, name)
+      for name in ("x-amzn-ErrorType", "x-amzn-RequestId", "x-amz-apigw-id")
+    )
+    if fixture_layer == "gateway" or "error=" in proxy_status or aws_gateway_signal:
+      return "gateway_block_likely"
+    if fixture_layer == "app":
+      return "app_auth_likely"
+    return "ambiguous_auth_failure"
+
+  def _record_auth_diagnostic(self, stage: str, resp=None, error: str = ""):
+    status = getattr(resp, "status_code", None) if resp is not None else None
+    classification = self._classify_auth_failure(resp)
+    diagnostic = {
+      "classification": classification,
+      "stage": stage,
+      "status": status,
+      "fixture_layer": self._response_header(resp, "X-RedMesh-Fixture-Layer"),
+      "proxy_status": self._response_header(resp, "Proxy-Status"),
+      "www_authenticate": bool(self._response_header(resp, "WWW-Authenticate")),
+      "provider_gateway_signal": any(
+        self._response_header(resp, name)
+        for name in ("x-amzn-ErrorType", "x-amzn-RequestId", "x-amz-apigw-id")
+      ),
+      "error": error,
+    }
+    self._auth_diagnostics.append({
+      key: value
+      for key, value in diagnostic.items()
+      if value not in (None, "", False)
+    })
 
   def _try_login_with_retry(self, principal, creds):
     retryable_failure = False
@@ -349,7 +410,7 @@ class AuthManager:
   def _anonymous_control_response(self, method: str, url: str):
     """Send the same probe request without credentials, no redirects."""
     try:
-      session = requests.Session()
+      session = self._make_session()
       try:
         return session.request(
           method, url, timeout=10, allow_redirects=False, verify=self.verify_tls,
@@ -392,21 +453,29 @@ class AuthManager:
       req = getattr(session, method, session.get)
       resp = req(probe_url, timeout=10, allow_redirects=False)
     except requests.RequestException:
+      self._record_auth_diagnostic(
+        "authenticated_probe_transport", error="transport_error",
+      )
       return False, True
     status = getattr(resp, "status_code", None)
     if status is None:
+      self._record_auth_diagnostic("authenticated_probe_missing_status", resp)
       return False, False
     # Reject redirects (commonly mask invalid tokens) and explicit
     # authentication failures.
     if 300 <= status < 400:
+      self._record_auth_diagnostic("authenticated_probe_redirect", resp)
       return False, False
     if status in (401, 403):
+      self._record_auth_diagnostic("authenticated_probe_rejected", resp)
       return False, False
     if status >= 400:
+      self._record_auth_diagnostic("authenticated_probe_error", resp)
       return False, False
 
     success_statuses = self._configured_success_statuses()
     if success_statuses and status not in success_statuses:
+      self._record_auth_diagnostic("authenticated_probe_unexpected_status", resp)
       return False, False
 
     marker = self._configured_success_marker()
@@ -418,10 +487,12 @@ class AuthManager:
 
     if requires_assertion:
       if marker and marker not in auth_body:
+        self._record_auth_diagnostic("authenticated_probe_marker_missing", resp)
         return False, False
       if identity_path:
         value = self._traverse_identity_path(auth_json, identity_path)
         if not value:
+          self._record_auth_diagnostic("authenticated_probe_identity_missing", resp)
           return False, False
 
     control = self._anonymous_control_response(method.upper(), probe_url)
@@ -439,6 +510,7 @@ class AuthManager:
     # Anonymous request also got 2xx. The endpoint may be public; we
     # need an assertion that distinguishes the two responses.
     if not requires_assertion:
+      self._record_auth_diagnostic("authenticated_probe_public_control", resp)
       return False, False
     control_body = self._read_response_body(control)
     control_json = self._read_response_json(control, control_body)

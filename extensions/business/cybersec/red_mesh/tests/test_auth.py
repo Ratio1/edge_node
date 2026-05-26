@@ -21,7 +21,8 @@ def _make_auth(**overrides):
 
 
 def _mock_response(status=200, text="", url="http://testapp.local:8000/dashboard/",
-                   history=None, cookies=None, content_type="text/html"):
+                   history=None, cookies=None, content_type="text/html",
+                   headers=None):
   """Build a mock requests.Response."""
   resp = MagicMock()
   resp.status_code = status
@@ -29,6 +30,8 @@ def _mock_response(status=200, text="", url="http://testapp.local:8000/dashboard
   resp.url = url
   resp.history = history or []
   resp.headers = {"content-type": content_type}
+  if headers:
+    resp.headers.update(headers)
   resp.json.return_value = {}
   if cookies is not None:
     resp.cookies = cookies
@@ -250,6 +253,33 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     session.head.return_value = _mock_response(status=status)
     return session
 
+  def _layered_auth_with_descriptor(self):
+    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor, GatewayAuthDescriptor,
+    )
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(
+      auth=AuthDescriptor(
+        auth_type="bearer",
+        authenticated_probe_path="/api/me",
+      ),
+      gateway_auth=GatewayAuthDescriptor(
+        auth_type="api_key",
+        api_key_header_name="X-Gateway-Key",
+      ),
+    ))
+    client = GrayboxHttpClient(
+      "http://api.example",
+      target_config=cfg,
+      gateway_api_key="GATEWAY-KEY",
+    )
+    return AuthManager(
+      "http://api.example",
+      cfg,
+      verify_tls=False,
+      http_client=client,
+    )
+
   @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
   def test_authenticate_bearer_stamps_token_and_validates_after_auth(self, mock_requests):
     from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
@@ -355,6 +385,145 @@ class TestAuthManagerNativeApiCredentials(unittest.TestCase):
     session.close.assert_called_once()
     self.assertIn("official_login_failed", auth._auth_errors)
 
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_bearer_validation_request_carries_gateway_auth(
+    self, mock_strategy_requests, mock_auth_requests,
+  ):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    import requests as real_requests
+
+    session = MagicMock()
+    session.headers = {}
+    session.params = {}
+    session.request.return_value = _mock_response(status=200)
+    mock_strategy_requests.Session.return_value = session
+    mock_strategy_requests.RequestException = real_requests.RequestException
+
+    anon_session = MagicMock()
+    anon_session.headers = {}
+    anon_session.params = {}
+    anon_session.request.return_value = _mock_response(status=401)
+    mock_auth_requests.Session.return_value = anon_session
+    mock_auth_requests.RequestException = real_requests.RequestException
+
+    auth = self._layered_auth_with_descriptor()
+    ok = auth.authenticate(Credentials(bearer_token="APP-TOKEN"))
+
+    self.assertTrue(ok)
+    self.assertEqual(session.headers["Authorization"], "Bearer APP-TOKEN")
+    validation_call = session.request.call_args_list[0]
+    self.assertEqual(validation_call.args[0], "GET")
+    self.assertEqual(validation_call.kwargs["headers"]["X-Gateway-Key"], "GATEWAY-KEY")
+    self.assertNotIn("APP-TOKEN", str(validation_call.kwargs["headers"]))
+
+  def test_gateway_fixture_rejection_records_gateway_block_diagnostic(self):
+    auth = self._layered_auth_with_descriptor()
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+      status=403,
+      headers={
+        "X-RedMesh-Fixture-Layer": "gateway",
+        "Proxy-Status": 'RedMeshGateway; error="invalid_gateway_key"',
+      },
+    )
+
+    valid, retryable = auth._validate_authenticated_session(session)
+
+    self.assertFalse(valid)
+    self.assertFalse(retryable)
+    self.assertEqual(
+      auth._auth_diagnostics[-1]["classification"],
+      "gateway_block_likely",
+    )
+    self.assertEqual(auth._auth_diagnostics[-1]["stage"], "authenticated_probe_rejected")
+
+  def test_app_fixture_rejection_records_app_auth_diagnostic(self):
+    auth = self._layered_auth_with_descriptor()
+    session = MagicMock()
+    session.get.return_value = _mock_response(
+      status=401,
+      headers={"X-RedMesh-Fixture-Layer": "app"},
+    )
+
+    valid, retryable = auth._validate_authenticated_session(session)
+
+    self.assertFalse(valid)
+    self.assertFalse(retryable)
+    self.assertEqual(
+      auth._auth_diagnostics[-1]["classification"],
+      "app_auth_likely",
+    )
+
+  def test_unmarked_gateway_rejection_records_ambiguous_diagnostic(self):
+    auth = self._layered_auth_with_descriptor()
+    session = MagicMock()
+    session.get.return_value = _mock_response(status=403)
+
+    valid, retryable = auth._validate_authenticated_session(session)
+
+    self.assertFalse(valid)
+    self.assertFalse(retryable)
+    self.assertEqual(
+      auth._auth_diagnostics[-1]["classification"],
+      "ambiguous_auth_failure",
+    )
+
+
+class TestLayeredFormAuthGateway(unittest.TestCase):
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth_strategies.requests")
+  def test_form_login_get_and_post_carry_gateway_auth(self, mock_requests):
+    from extensions.business.cybersec.red_mesh.graybox.auth_credentials import Credentials
+    from extensions.business.cybersec.red_mesh.graybox.auth_strategies import FormAuth
+    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, GatewayAuthDescriptor,
+    )
+
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(
+      gateway_auth=GatewayAuthDescriptor(
+        auth_type="api_key",
+        api_key_header_name="X-Gateway-Key",
+      ),
+    ))
+    client = GrayboxHttpClient(
+      "http://testapp.local:8000",
+      target_config=cfg,
+      gateway_api_key="GATEWAY-KEY",
+    )
+    raw_session = MagicMock()
+    raw_session.headers = {}
+    raw_session.params = {}
+    raw_session.cookies.get_dict.return_value = {"sessionid": "abc"}
+    raw_session.request.side_effect = [
+      _mock_response(
+        text='<input type="hidden" name="csrf_token" value="tok">',
+        url="http://testapp.local:8000/auth/login/",
+      ),
+      _mock_response(
+        url="http://testapp.local:8000/dashboard/",
+        history=[MagicMock()],
+      ),
+    ]
+    mock_requests.Session.return_value = raw_session
+
+    strategy = FormAuth(
+      "http://testapp.local:8000",
+      cfg,
+      verify_tls=False,
+      http_client=client,
+    )
+    session = strategy.authenticate(Credentials(username="admin", password="secret"))
+
+    self.assertIsNotNone(session)
+    self.assertEqual(raw_session.request.call_count, 2)
+    get_headers = raw_session.request.call_args_list[0].kwargs["headers"]
+    post_headers = raw_session.request.call_args_list[1].kwargs["headers"]
+    self.assertEqual(get_headers["X-Gateway-Key"], "GATEWAY-KEY")
+    self.assertEqual(post_headers["X-Gateway-Key"], "GATEWAY-KEY")
+    self.assertEqual(post_headers["X-CSRFToken"], "tok")
+
 
 class TestAuthenticatedSessionHardening(unittest.TestCase):
   """B2 (PR406 remediation) — tighten bearer/API-key validation.
@@ -420,6 +589,50 @@ class TestAuthenticatedSessionHardening(unittest.TestCase):
     valid, retryable = auth._validate_authenticated_session(sess)
     self.assertTrue(valid)
     self.assertFalse(retryable)
+
+  @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
+  def test_anonymous_control_response_uses_gateway_only_session(self, mock_auth_requests):
+    from extensions.business.cybersec.red_mesh.graybox.http_client import GrayboxHttpClient
+    from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
+      ApiSecurityConfig, AuthDescriptor, GatewayAuthDescriptor,
+    )
+    import requests as real_requests
+
+    cfg = GrayboxTargetConfig(api_security=ApiSecurityConfig(
+      auth=AuthDescriptor(
+        auth_type="bearer",
+        authenticated_probe_path="/api/me",
+      ),
+      gateway_auth=GatewayAuthDescriptor(
+        auth_type="api_key",
+        api_key_header_name="X-Gateway-Key",
+      ),
+    ))
+    client = GrayboxHttpClient(
+      "http://api.example",
+      target_config=cfg,
+      gateway_api_key="GATEWAY-KEY",
+    )
+    auth = AuthManager(
+      "http://api.example",
+      cfg,
+      verify_tls=False,
+      http_client=client,
+    )
+    anon_session = MagicMock()
+    anon_session.headers = {}
+    anon_session.params = {}
+    anon_session.request.return_value = _mock_response(status=401)
+    mock_auth_requests.Session.return_value = anon_session
+    mock_auth_requests.RequestException = real_requests.RequestException
+
+    resp = auth._anonymous_control_response("GET", "http://api.example/api/me")
+
+    self.assertEqual(resp.status_code, 401)
+    headers = anon_session.request.call_args.kwargs["headers"]
+    self.assertEqual(headers["X-Gateway-Key"], "GATEWAY-KEY")
+    self.assertNotIn("Authorization", anon_session.headers)
+    self.assertNotIn("Authorization", headers)
 
   @patch("extensions.business.cybersec.red_mesh.graybox.auth.requests")
   def test_anonymous_also_2xx_without_marker_is_rejected(self, mock_auth_requests):
