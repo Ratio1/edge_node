@@ -388,8 +388,10 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     username = vcs_data.get('USERNAME')
     token = vcs_data.get('TOKEN')
 
-    owner = self._repo_owner
-    repo = self._repo_name
+    owner = getattr(self, "_repo_owner", None)
+    repo = getattr(self, "_repo_name", None)
+    if not owner or not repo:
+      owner, repo = self._extract_repo_identifier(vcs_data)
 
     if not owner or not repo:
       self.repo_url = None
@@ -427,8 +429,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     """
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
     repo_branch = vcs_data.get('BRANCH')
-    repo_owner = self._repo_owner or vcs_data.get('REPO_OWNER')
-    repo_name = self._repo_name or vcs_data.get('REPO_NAME')
+    repo_owner = getattr(self, "_repo_owner", None) or vcs_data.get('REPO_OWNER')
+    repo_name = getattr(self, "_repo_name", None) or vcs_data.get('REPO_NAME')
 
     self.branch = repo_branch or self.branch
 
@@ -449,8 +451,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
   def _get_latest_commit(self, return_data=False):
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
-    repo_owner = self._repo_owner or vcs_data.get('REPO_OWNER')
-    repo_name = self._repo_name or vcs_data.get('REPO_NAME')
+    repo_owner = getattr(self, "_repo_owner", None) or vcs_data.get('REPO_OWNER')
+    repo_name = getattr(self, "_repo_name", None) or vcs_data.get('REPO_NAME')
     token = vcs_data.get('TOKEN')
 
     if not repo_owner or not repo_name:

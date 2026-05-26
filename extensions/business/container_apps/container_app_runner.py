@@ -1427,6 +1427,11 @@ class ContainerAppRunnerPlugin(
     return self._handle_config_restart(lambda: self._restart_container(StopReason.CONFIG_UPDATE, cleanup_first=False))
 
 
+  def _on_config(self, *args, **kwargs):
+    """Compatibility alias for runtimes that call the underscored hook."""
+    return self.on_config(*args, **kwargs)
+
+
   def on_post_container_start(self):
     """
     Lifecycle hook called after container starts.
