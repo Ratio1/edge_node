@@ -17,12 +17,14 @@ from extensions.business.container_apps.sync.control_files import (
   JsonControlFileDecodeError,
   JsonControlFileObjectError,
   JsonControlFileReadError,
+  JsonControlFileSizeError,
   JsonControlFileUnsafeError,
 )
 from extensions.business.container_apps.sync.manager import system_volume_host_root
 
 from .constants import (
   ENV_OVERRIDES_INVALID_FILE,
+  ENV_OVERRIDES_MAX_BYTES,
   ENV_OVERRIDES_PROCESSING_FILE,
   ENV_OVERRIDES_REQUEST_FILE,
   ENV_OVERRIDES_RESPONSE_FILE,
@@ -176,7 +178,7 @@ class _EnvOverridesMixin:
 
     control_file = self._request_env_overrides_control_file()
     try:
-      claimed = control_file.claim_object()
+      claimed = control_file.claim_object(max_bytes=ENV_OVERRIDES_MAX_BYTES)
     except JsonControlFileClaimError as exc:
       self.P(
         f"[env-overrides] could not rename request.json -> .processing: {exc}",
@@ -191,6 +193,9 @@ class _EnvOverridesMixin:
       )
       return False
     except JsonControlFileUnsafeError as exc:
+      self._fail_env_override_request(None, str(exc), control_file.processing_path)
+      return False
+    except JsonControlFileSizeError as exc:
       self._fail_env_override_request(None, str(exc), control_file.processing_path)
       return False
     except JsonControlFileDecodeError as exc:

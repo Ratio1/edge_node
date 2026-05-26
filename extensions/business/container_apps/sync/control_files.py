@@ -52,6 +52,10 @@ class JsonControlFileReadError(JsonControlFileError):
   """The processing file could not be read."""
 
 
+class JsonControlFileSizeError(JsonControlFileError):
+  """The processing file exceeded the caller's byte limit."""
+
+
 class JsonControlFileDecodeError(JsonControlFileError):
   """The processing file was not valid JSON."""
 
@@ -199,7 +203,27 @@ class JsonControlFile:
       )
 
   @staticmethod
-  def _read_text_no_follow(path: Path) -> str:
+  def _read_limited_bytes(fd: int, max_bytes: Optional[int]) -> bytes:
+    if max_bytes is None:
+      chunks = []
+      while True:
+        chunk = os.read(fd, 1024 * 1024)
+        if not chunk:
+          return b"".join(chunks)
+        chunks.append(chunk)
+
+    chunks = []
+    remaining = max_bytes + 1
+    while remaining > 0:
+      chunk = os.read(fd, min(remaining, 1024 * 1024))
+      if not chunk:
+        break
+      chunks.append(chunk)
+      remaining -= len(chunk)
+    return b"".join(chunks)
+
+  @staticmethod
+  def _read_text_no_follow(path: Path, *, max_bytes: Optional[int] = None) -> str:
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
       flags |= os.O_NOFOLLOW
@@ -215,9 +239,18 @@ class JsonControlFile:
           f"refusing to read non-regular control file: {path.name}",
           processing_path=path,
         )
-      with os.fdopen(fd, "r", encoding="utf-8") as handle:
-        fd = None
-        return handle.read()
+      if max_bytes is not None and st.st_size > max_bytes:
+        raise JsonControlFileSizeError(
+          f"{path.name} exceeds {max_bytes} byte limit",
+          processing_path=path,
+        )
+      raw_bytes = JsonControlFile._read_limited_bytes(fd, max_bytes)
+      if max_bytes is not None and len(raw_bytes) > max_bytes:
+        raise JsonControlFileSizeError(
+          f"{path.name} exceeds {max_bytes} byte limit",
+          processing_path=path,
+        )
+      return raw_bytes.decode("utf-8")
     except OSError as exc:
       if getattr(exc, "errno", None) == errno.ELOOP:
         raise JsonControlFileUnsafeError(
@@ -245,7 +278,7 @@ class JsonControlFile:
       ) from exc
     return self.processing_path
 
-  def claim_object(self) -> Optional[ClaimedJsonObject]:
+  def claim_object(self, *, max_bytes: Optional[int] = None) -> Optional[ClaimedJsonObject]:
     """Claim a pending JSON object control file.
 
     Returns None when no pending file exists. Raises a JsonControlFileError
@@ -258,7 +291,7 @@ class JsonControlFile:
       return None
 
     try:
-      raw_body = self._read_text_no_follow(processing_path)
+      raw_body = self._read_text_no_follow(processing_path, max_bytes=max_bytes)
     except UnicodeDecodeError as exc:
       raise JsonControlFileDecodeError(
         f"invalid UTF-8 in {self.pending_name}: {exc}",
@@ -322,6 +355,7 @@ __all__ = [
   "JsonControlFileError",
   "JsonControlFileObjectError",
   "JsonControlFileReadError",
+  "JsonControlFileSizeError",
   "JsonControlFileUnsafeError",
   "write_json_atomic",
 ]

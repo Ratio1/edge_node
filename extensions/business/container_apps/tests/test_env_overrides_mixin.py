@@ -14,6 +14,7 @@ from extensions.business.container_apps.env_overrides import (
   env_overrides_dir,
 )
 from extensions.business.container_apps.env_overrides.constants import (
+  ENV_OVERRIDES_MAX_BYTES,
   ENV_OVERRIDES_STATE_FILE,
 )
 from extensions.business.container_apps.tests.test_sync_manager import _make_owner
@@ -229,6 +230,52 @@ class TestEnvOverrideTick(unittest.TestCase):
     self.assertIsNone(invalid["request"])
     self.assertIn("raw_body", invalid["_error"])
     self.assertEqual(response["status"], "error")
+
+  def test_oversized_valid_json_is_rejected_before_apply(self):
+    body = {
+      "schema_version": 1,
+      "set": {
+        "BIG_VALUE": "x" * ENV_OVERRIDES_MAX_BYTES,
+      },
+    }
+    (self.eod / ENV_OVERRIDES_REQUEST_FILE).write_text(json.dumps(body), encoding="utf-8")
+
+    restart = self.plugin._env_overrides_tick(current_time=100.0)
+
+    self.assertFalse(restart)
+    self.assertFalse(self._state_path().exists())
+    self.assertFalse((self.eod / ENV_OVERRIDES_PROCESSING_FILE).exists())
+    response = json.loads((self.eod / ENV_OVERRIDES_RESPONSE_FILE).read_text())
+    self.assertEqual(response["status"], "error")
+    self.assertIn("exceeds", response["error"])
+
+  def test_oversized_malformed_json_is_rejected_without_raw_body_diagnostic(self):
+    (self.eod / ENV_OVERRIDES_REQUEST_FILE).write_text(
+      "{" + ("x" * ENV_OVERRIDES_MAX_BYTES),
+      encoding="utf-8",
+    )
+
+    restart = self.plugin._env_overrides_tick(current_time=100.0)
+
+    self.assertFalse(restart)
+    invalid = json.loads((self.eod / ENV_OVERRIDES_INVALID_FILE).read_text())
+    response = json.loads((self.eod / ENV_OVERRIDES_RESPONSE_FILE).read_text())
+    self.assertEqual(response["status"], "error")
+    self.assertIn("exceeds", response["error"])
+    self.assertNotIn("raw_body", invalid["_error"])
+
+  def test_oversized_non_object_json_is_rejected_by_size_limit_first(self):
+    (self.eod / ENV_OVERRIDES_REQUEST_FILE).write_text(
+      "[" + (" " * ENV_OVERRIDES_MAX_BYTES) + "]",
+      encoding="utf-8",
+    )
+
+    restart = self.plugin._env_overrides_tick(current_time=100.0)
+
+    self.assertFalse(restart)
+    response = json.loads((self.eod / ENV_OVERRIDES_RESPONSE_FILE).read_text())
+    self.assertEqual(response["status"], "error")
+    self.assertIn("exceeds", response["error"])
 
 
 if __name__ == "__main__":
