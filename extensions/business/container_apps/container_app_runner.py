@@ -147,6 +147,7 @@ class StopReason(Enum):
   CONFIG_UPDATE = "config_update"   # Restarting for config change
   EXTERNAL_UPDATE = "external_update"  # Generic external trigger (VCS, DB, file watch, etc.)
   ENV_OVERRIDE = "env_override"     # Restarting for accepted local env override patch
+  RESET_FAILED = "reset_failed"     # Reset stopped the app, but volume mutation failed
 
 
 class RestartPolicy(Enum):
@@ -842,6 +843,10 @@ class ContainerAppRunnerPlugin(
       self.Pd(f"Container manually stopped, restart policy '{policy.value}' will not trigger restart")
       return False
 
+    if stop_reason == StopReason.RESET_FAILED:
+      self.Pd("Container stopped after failed reset; restart policy will not trigger restart")
+      return False
+
     # Check if we're in PAUSED state
     if self.container_state == ContainerState.PAUSED:
       self.Pd("Container is paused, restart policy will not trigger restart")
@@ -895,6 +900,24 @@ class ContainerAppRunnerPlugin(
     # end if
 
     self.Pd(f"Container state: {old_state.value} -> {new_state.value}", score=0)
+    return
+
+
+  def _is_reset_failure_halt_active(self):
+    """Return True when a failed reset must block implicit container starts."""
+    return (
+      getattr(self, "container_state", None) == ContainerState.FAILED
+      and getattr(self, "stop_reason", None) == StopReason.RESET_FAILED
+    )
+
+
+  def _mark_reset_volume_reset_failed(self, error=None):
+    """Keep the app stopped after reset volume mutation fails."""
+    message = "Reset volume mutation failed; keeping container stopped until explicit RESTART"
+    if error:
+      message = f"{message}: {error}"
+    self.P(message, color='r')
+    self._set_container_state(ContainerState.FAILED, StopReason.RESET_FAILED)
     return
 
   # ============================================================================
@@ -1355,6 +1378,14 @@ class ContainerAppRunnerPlugin(
       )
       if self._cleanup_failed:
         self._retry_failed_cleanup()
+      return
+
+    if self._is_reset_failure_halt_active():
+      self.P(
+        "Container is stopped after a failed reset. Ignoring config restart; "
+        "send RESTART to resume after inspecting the reset error.",
+        color='y',
+      )
       return
 
     # Check persistent state as fallback (in case container_state not yet set)
@@ -3971,6 +4002,12 @@ class ContainerAppRunnerPlugin(
         return
 
     if not self.container:
+      if self._is_reset_failure_halt_active():
+        self.Pd(
+          "Container remains stopped after failed reset; send RESTART to resume "
+          "after inspecting response.json."
+        )
+        return
       # Check if we're in backoff period
       if self._is_restart_backoff_active():
         self.Pd("Container initial launch delayed due to active backoff period")

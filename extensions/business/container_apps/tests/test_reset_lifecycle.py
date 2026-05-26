@@ -3,13 +3,21 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from extensions.business.container_apps.reset import (
   RESET_REQUEST_FILE,
   RESET_RESPONSE_FILE,
   reset_dir,
 )
-from extensions.business.container_apps.tests.support import make_container_app_runner
+from extensions.business.container_apps.tests.support import (
+  make_container_app_runner,
+  make_lifecycle_runner,
+)
+from extensions.business.container_apps.container_app_runner import (
+  ContainerState,
+  StopReason,
+)
 
 
 class TestResetLifecycleIntegration(unittest.TestCase):
@@ -70,6 +78,63 @@ class TestResetLifecycleIntegration(unittest.TestCase):
     response = json.loads((reset_dir(self.plugin) / RESET_RESPONSE_FILE).read_text())
     self.assertEqual(response["status"], "ok")
     self.assertEqual(response["request_id"], "reset-inline")
+
+  def test_volume_reset_failure_does_not_auto_start_on_next_process_tick(self):
+    plugin, client, _container = make_lifecycle_runner(
+      cfg_autoupdate=False,
+      cfg_tunnel_engine_enabled=False,
+    )
+    plugin.get_data_folder = lambda: str(self.tmpdir)
+    plugin.cfg_reset = {"ENABLED": True}
+    plugin.cfg_sync = {"ENABLED": False}
+    plugin._sync_unavailable = False
+    plugin._reset_unavailable = False
+    plugin._reset_manager = None
+    plugin.ee_id = "ee_test"
+
+    data_root = (
+      self.tmpdir
+      / plugin._get_instance_data_subfolder()
+      / "fixed_volumes"
+      / "mounts"
+      / "data"
+    )
+    data_root.mkdir(parents=True, exist_ok=True)
+    plugin.cfg_fixed_size_volumes = {
+      "data": {"SIZE": "10M", "MOUNTING_POINT": "/app/data"}
+    }
+    plugin._fixed_volumes = [
+      SimpleNamespace(name="data", mount_path=data_root, owner_uid=None, owner_gid=None)
+    ]
+    reset_dir(plugin).mkdir(parents=True, exist_ok=True)
+    plugin._handle_initial_launch()
+    self.assertEqual(client.containers.run.call_count, 1)
+
+    manager = plugin._ensure_reset_manager()
+    (data_root / "payload.txt").write_text("data", encoding="utf-8")
+    (reset_dir(plugin) / RESET_REQUEST_FILE).write_text(
+      json.dumps({
+        "schema_version": 1,
+        "request_id": "reset-fails-before-start",
+        "mode": "volumes",
+        "volumes": ["data"],
+      }),
+      encoding="utf-8",
+    )
+
+    with patch.object(manager, "reset_volumes", side_effect=RuntimeError("clear failed")):
+      plugin.process()
+
+    response = json.loads((reset_dir(plugin) / RESET_RESPONSE_FILE).read_text())
+    self.assertIsNone(plugin.container)
+    self.assertEqual(response["stage"], "volume_reset")
+    self.assertEqual(response["restart"]["started"], False)
+
+    plugin.process()
+
+    self.assertEqual(client.containers.run.call_count, 1)
+    self.assertEqual(plugin.container_state, ContainerState.FAILED)
+    self.assertEqual(plugin.stop_reason, StopReason.RESET_FAILED)
 
 
 if __name__ == "__main__":

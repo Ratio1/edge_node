@@ -226,6 +226,7 @@ class _ResetMixin:
     except Exception as exc:
       reset_error = str(exc)
     if reset_error is not None:
+      self._mark_reset_volume_reset_failed(reset_error)
       self._fail_reset_request(
         claimed.body,
         STAGE_VOLUME_RESET,
@@ -269,6 +270,10 @@ class _ResetMixin:
     except Exception as exc:
       self.P(f"[reset] runtime-state reset after reset failed: {exc}", color="r")
     return True
+
+  def _mark_reset_volume_reset_failed(self, error=None) -> None:
+    """Hook for the runner lifecycle to block implicit starts after reset failure."""
+    return
 
   def _fail_reset_request(
     self,
