@@ -109,7 +109,25 @@ _install_dummy_docker_module()
 
 from extensions.business.container_apps.worker_app_runner import WorkerAppRunnerPlugin
 from extensions.business.container_apps import container_utils
-from extensions.business.container_apps.container_app_runner import ContainerAppRunnerPlugin
+from extensions.business.container_apps.container_app_runner import (
+  ContainerAppRunnerPlugin,
+  ContainerState,
+  StopReason,
+)
+
+
+def _seed_lifecycle_state(plugin):
+  plugin.container_state = ContainerState.RUNNING
+  plugin.stop_reason = StopReason.UNKNOWN
+  plugin._cleanup_failed = False
+  plugin._manual_stop_pending = False
+  plugin._load_manual_stop_state = lambda: False
+  plugin._set_container_state = lambda state, reason=None: (
+    setattr(plugin, "container_state", state),
+    setattr(plugin, "stop_reason", reason or plugin.stop_reason),
+  )
+  plugin._record_restart_failure = lambda: None
+  return plugin
 
 
 class WorkerAppRunnerConfigTests(unittest.TestCase):
@@ -153,6 +171,15 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     plugin.inverted_ports_mapping = {}
     plugin.log = types.SimpleNamespace(get_localhost_ip=lambda: "127.0.0.1")
     plugin.bc = types.SimpleNamespace(eth_address="0x0", get_evm_network=lambda: "testnet")
+    plugin.current_commit = None
+    plugin.branch = None
+    plugin.repo_url = None
+    plugin._last_git_check = 0
+    plugin._git_backoff_until = 0
+    plugin._repo_configured = False
+    plugin._repo_owner = None
+    plugin._repo_name = None
+    _seed_lifecycle_state(plugin)
     return plugin
 
   def test_configure_repo_url_public(self):
@@ -232,12 +259,12 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
     plugin._last_image_check = 0
     plugin._get_latest_image_hash = lambda: "new"
     restart_calls = []
-    plugin._restart_from_scratch = lambda: restart_calls.append("called")
+    plugin._restart_container = lambda reason: restart_calls.append(reason)
 
     plugin._check_image_updates(current_time=15)
 
     self.assertEqual(plugin.current_image_hash, "new")
-    self.assertEqual(restart_calls, ["called"])
+    self.assertEqual(restart_calls, [StopReason.IMAGE_UPDATE])
 
   def test_configure_volumes_primary_path(self):
     """Test volume configuration creates directories with correct permissions."""
@@ -260,22 +287,22 @@ class WorkerAppRunnerConfigTests(unittest.TestCase):
   def test_on_config_triggers_restart(self):
     """Test that configuration changes trigger container restart."""
     plugin = self._make_plugin()
-    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
-         mock.patch.object(plugin, "_restart_from_scratch") as restart_mock:
+    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk", return_value=True) as stop_mock, \
+         mock.patch.object(plugin, "_restart_container") as restart_mock:
       plugin.on_config()
 
     stop_mock.assert_called_once()
-    restart_mock.assert_called_once()
+    restart_mock.assert_called_once_with(StopReason.CONFIG_UPDATE, cleanup_first=False)
 
   def test__on_config_aliases_to_on_config(self):
     """Test that _on_config is an alias for on_config method."""
     plugin = self._make_plugin()
-    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
-         mock.patch.object(plugin, "_restart_from_scratch") as restart_mock:
+    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk", return_value=True) as stop_mock, \
+         mock.patch.object(plugin, "_restart_container") as restart_mock:
       plugin._on_config()
 
     stop_mock.assert_called_once()
-    restart_mock.assert_called_once()
+    restart_mock.assert_called_once_with(StopReason.CONFIG_UPDATE, cleanup_first=False)
 
 
 class ContainerAppRunnerConfigTests(unittest.TestCase):
@@ -319,27 +346,28 @@ class ContainerAppRunnerConfigTests(unittest.TestCase):
     plugin.inverted_ports_mapping = {}
     plugin.log = types.SimpleNamespace(get_localhost_ip=lambda: "127.0.0.1")
     plugin.bc = types.SimpleNamespace(eth_address="0x0", get_evm_network=lambda: "testnet")
+    _seed_lifecycle_state(plugin)
     return plugin
 
   def test_on_config_triggers_restart(self):
     """Test that configuration changes trigger container restart."""
     plugin = self._make_plugin()
-    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
+    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk", return_value=True) as stop_mock, \
          mock.patch.object(plugin, "_restart_container") as restart_mock:
       plugin.on_config()
 
     stop_mock.assert_called_once()
-    restart_mock.assert_called_once()
+    restart_mock.assert_called_once_with(StopReason.CONFIG_UPDATE, cleanup_first=False)
 
   def test__on_config_aliases_to_on_config(self):
     """Test that _on_config is an alias for on_config method."""
     plugin = self._make_plugin()
-    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk") as stop_mock, \
+    with mock.patch.object(plugin, "_stop_container_and_save_logs_to_disk", return_value=True) as stop_mock, \
          mock.patch.object(plugin, "_restart_container") as restart_mock:
       plugin._on_config()
 
     stop_mock.assert_called_once()
-    restart_mock.assert_called_once()
+    restart_mock.assert_called_once_with(StopReason.CONFIG_UPDATE, cleanup_first=False)
 
   def test_configure_file_volumes(self):
     """Test FILE_VOLUMES feature creates files with correct content and mounts them."""

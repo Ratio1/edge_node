@@ -87,6 +87,8 @@ from .mixins import (
   _RestartBackoffMixin,
   _TunnelBackoffMixin,
 )
+from .env_overrides import _EnvOverridesMixin
+from .reset import _ResetMixin
 from .sync import _SyncMixin
 
 __VER__ = "0.7.1"
@@ -144,6 +146,8 @@ class StopReason(Enum):
   IMAGE_UPDATE = "image_update"     # Restarting for image update
   CONFIG_UPDATE = "config_update"   # Restarting for config change
   EXTERNAL_UPDATE = "external_update"  # Generic external trigger (VCS, DB, file watch, etc.)
+  ENV_OVERRIDE = "env_override"     # Restarting for accepted local env override patch
+  RESET_FAILED = "reset_failed"     # Reset stopped the app, but volume mutation failed
 
 
 class RestartPolicy(Enum):
@@ -279,6 +283,12 @@ _CONFIG = {
   },
   "ENV": {},                # dict of env vars for the container
   "DYNAMIC_ENV": {},        # backend dynamic env definition; Deeploy may compile DYNAMIC_ENV_UI into this
+  "ENV_OVERRIDES": {
+    "ENABLED": True,        # app-local request.json patches under /r1en_system/env-overrides
+  },
+  "RESET": {
+    "ENABLED": True,        # app-local request.json reset under /r1en_system/reset
+  },
   "EXPOSED_PORTS": {},      # normalized container-port config keyed by internal container port
   "CONTAINER_RESOURCES" : {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
@@ -397,6 +407,8 @@ class ContainerAppRunnerPlugin(
   _ImagePullBackoffMixin,
   _TunnelBackoffMixin,
   _FixedSizeVolumesMixin,
+  _EnvOverridesMixin,
+  _ResetMixin,
   _SyncMixin,
   _ContainerUtilsMixin,
   BasePlugin,
@@ -649,6 +661,10 @@ class ContainerAppRunnerPlugin(
     self._sync_manager = None
     self._sync_unavailable = False
     self._runtime_stop_degraded = False
+    self._env_overrides_manager = None
+    self._env_overrides_unavailable = False
+    self._reset_manager = None
+    self._reset_unavailable = False
 
     # Image update tracking
     self.current_image_hash = None
@@ -827,6 +843,10 @@ class ContainerAppRunnerPlugin(
       self.Pd(f"Container manually stopped, restart policy '{policy.value}' will not trigger restart")
       return False
 
+    if stop_reason == StopReason.RESET_FAILED:
+      self.Pd("Container stopped after failed reset; restart policy will not trigger restart")
+      return False
+
     # Check if we're in PAUSED state
     if self.container_state == ContainerState.PAUSED:
       self.Pd("Container is paused, restart policy will not trigger restart")
@@ -880,6 +900,24 @@ class ContainerAppRunnerPlugin(
     # end if
 
     self.Pd(f"Container state: {old_state.value} -> {new_state.value}", score=0)
+    return
+
+
+  def _is_reset_failure_halt_active(self):
+    """Return True when a failed reset must block implicit container starts."""
+    return (
+      getattr(self, "container_state", None) == ContainerState.FAILED
+      and getattr(self, "stop_reason", None) == StopReason.RESET_FAILED
+    )
+
+
+  def _mark_reset_volume_reset_failed(self, error=None):
+    """Keep the app stopped after reset volume mutation fails."""
+    message = "Reset volume mutation failed; keeping container stopped until explicit RESTART"
+    if error:
+      message = f"{message}: {error}"
+    self.P(message, color='r')
+    self._set_container_state(ContainerState.FAILED, StopReason.RESET_FAILED)
     return
 
   # ============================================================================
@@ -1187,10 +1225,14 @@ class ContainerAppRunnerPlugin(
     self._configure_file_volumes() # setup file volumes with dynamic content
     self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
     self._configure_system_volume() # always-on /r1en_system control-plane volume
+    self._configure_env_overrides_control_dir()
+    self._configure_reset_control_dir()
 
     # If a prior plugin run crashed mid-publish, request.json.processing may
     # be left over inside volume-sync/. Rename it back so the next tick retries.
     self._recover_stale_processing()
+    self._recover_env_overrides_processing()
+    self._recover_reset_processing()
     self._validate_sync_config()
 
     # If we have semaphored keys, defer _setup_env_and_ports() until semaphores are ready
@@ -1198,6 +1240,8 @@ class ContainerAppRunnerPlugin(
     if not self._semaphore_get_keys():
       self._setup_env_and_ports()
       self._inject_sync_env_vars()
+      self._inject_env_overrides_env_vars()
+      self._inject_reset_env_vars()
     else:
       self.Pd("Deferring _setup_env_and_ports() until semaphores are ready")
 
@@ -1336,6 +1380,14 @@ class ContainerAppRunnerPlugin(
         self._retry_failed_cleanup()
       return
 
+    if self._is_reset_failure_halt_active():
+      self.P(
+        "Container is stopped after a failed reset. Ignoring config restart; "
+        "send RESTART to resume after inspecting the reset error.",
+        color='y',
+      )
+      return
+
     # Check persistent state as fallback (in case container_state not yet set)
     if self._load_manual_stop_state():
       self.P(
@@ -1373,6 +1425,11 @@ class ContainerAppRunnerPlugin(
     None
     """
     return self._handle_config_restart(lambda: self._restart_container(StopReason.CONFIG_UPDATE, cleanup_first=False))
+
+
+  def _on_config(self, *args, **kwargs):
+    """Compatibility alias for runtimes that call the underscored hook."""
+    return self.on_config(*args, **kwargs)
 
 
   def on_post_container_start(self):
@@ -3526,7 +3583,11 @@ class ContainerAppRunnerPlugin(
     self._configure_file_volumes()
     self._configure_fixed_size_volumes()
     self._configure_system_volume()
+    self._configure_env_overrides_control_dir()
+    self._configure_reset_control_dir()
     self._recover_stale_processing()
+    self._recover_env_overrides_processing()
+    self._recover_reset_processing()
     self._validate_sync_config()
 
     # For semaphored containers (consumers), defer env setup and container start
@@ -3547,6 +3608,8 @@ class ContainerAppRunnerPlugin(
     self._configure_dynamic_env()
     self._setup_env_and_ports()
     self._inject_sync_env_vars()
+    self._inject_env_overrides_env_vars()
+    self._inject_reset_env_vars()
 
     # Revalidate extra tunnels
     self._validate_extra_tunnels_config()
@@ -3729,6 +3792,8 @@ class ContainerAppRunnerPlugin(
       self._configure_dynamic_env()
       self._setup_env_and_ports()
       self._inject_sync_env_vars()
+      self._inject_env_overrides_env_vars()
+      self._inject_reset_env_vars()
     # end if
 
     try:
@@ -3826,6 +3891,14 @@ class ContainerAppRunnerPlugin(
     # StopReason from here because that would route through _restart_container,
     # which calls _cleanup_fixed_size_volumes() and unmounts before our work
     # can run.
+    self._reset_processed_this_tick = False
+    if self._env_overrides_tick(current_time):
+      return StopReason.ENV_OVERRIDE
+
+    if self._reset_tick(current_time):
+      self._reset_processed_this_tick = True
+      return None
+
     if self._sync_enabled():
       role = self._sync_role()
       if role == "provider":
@@ -3929,10 +4002,20 @@ class ContainerAppRunnerPlugin(
         self._last_paused_log = current_time
       return
 
-    if self._cleanup_failed and not self._retry_failed_cleanup():
-      return
+    if self._cleanup_failed:
+      if not self._retry_failed_cleanup():
+        return
+      if not self.container:
+        self._restart_container(self.stop_reason or StopReason.UNKNOWN, cleanup_first=False)
+        return
 
     if not self.container:
+      if self._is_reset_failure_halt_active():
+        self.Pd(
+          "Container remains stopped after failed reset; send RESTART to resume "
+          "after inspecting response.json."
+        )
+        return
       # Check if we're in backoff period
       if self._is_restart_backoff_active():
         self.Pd("Container initial launch delayed due to active backoff period")

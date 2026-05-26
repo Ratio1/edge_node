@@ -274,6 +274,21 @@ class TestCleanup(unittest.TestCase):
     )
 
   @patch("extensions.business.container_apps.fixed_volume._run")
+  def test_loop_mount_source_is_normalized_before_cleanup(self, mock_run):
+    vol = FixedVolume(name="data", size="100M", root=Path("/r"))
+    meta = {"loop_dev": " /dev/loop7\n"}
+    with patch.object(Path, "exists", return_value=True), \
+         patch.object(Path, "read_text", return_value=json.dumps(meta)), \
+         patch("extensions.business.container_apps.fixed_volume._get_mount_source", return_value=" /dev/loop7\n"), \
+         patch("extensions.business.container_apps.fixed_volume._is_path_mounted", return_value=False):
+      result = cleanup(vol)
+    self.assertTrue(result)
+    self.assertEqual(
+      [call_args.args[0] for call_args in mock_run.call_args_list],
+      [["umount", str(vol.mount_path)], ["losetup", "-d", "/dev/loop7"]],
+    )
+
+  @patch("extensions.business.container_apps.fixed_volume._run")
   def test_malformed_metadata_reports_failure(self, mock_run):
     vol = FixedVolume(name="data", size="100M", root=Path("/r"))
     with patch.object(Path, "exists", return_value=True), \
