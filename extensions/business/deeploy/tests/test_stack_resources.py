@@ -93,6 +93,27 @@ class DeeployStackResourceTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, DEEPLOY_ERRORS.JOB_RESOURCES3):
       plugin.deeploy_check_payment_and_job_owner(inputs, "0xowner", is_create=True)
 
+  def test_stack_resources_reject_when_storage_is_omitted(self):
+    plugin = make_deeploy_plugin()
+    plugin.bc = _FakeBlockchain(job_type=1)  # ENTRY: 1 CPU, 2GB RAM, 8GB storage
+    inputs = make_inputs(
+      job_id=123,
+      job_app_type=JOB_APP_TYPES.STACK,
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          CONTAINER_RESOURCES={"cpu": 0.5, "memory": "512m"},
+        ),
+        make_plugin_entry(
+          "WORKER_APP_RUNNER",
+          CONTAINER_RESOURCES={"cpu": 0.25, "memory": "512m"},
+        ),
+      ],
+    )
+
+    with self.assertRaisesRegex(ValueError, DEEPLOY_ERRORS.JOB_RESOURCES3):
+      plugin.deeploy_check_payment_and_job_owner(inputs, "0xowner", is_create=True)
+
 
 if __name__ == "__main__":
   unittest.main()

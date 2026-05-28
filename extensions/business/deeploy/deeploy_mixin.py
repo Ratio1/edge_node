@@ -1851,7 +1851,7 @@ class _DeeployMixin:
     # Return aggregated resources in standard format
     aggregated = {
       DEEPLOY_RESOURCES.CPU: total_cpu,
-      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m"
+      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m",
     }
     if total_storage_mb > 0:
       aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb}m"
@@ -2002,6 +2002,19 @@ class _DeeployMixin:
         if plugins_array:
           for idx, pi in enumerate(plugins_array):
             self._validate_fixed_size_volumes(pi, context=f"plugin {idx}")
+            signature = pi.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, "").upper()
+            resources = pi.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+            if (
+              job_app_type == JOB_APP_TYPES.STACK and
+              signature in CONTAINERIZED_APPS_SIGNATURES and
+              (not isinstance(resources, dict) or DEEPLOY_RESOURCES.STORAGE not in resources)
+            ):
+              msg = (
+                f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container storage resources are required "
+                f"for plugin {idx}."
+              )
+              self.P(msg)
+              raise ValueError(msg)
         else:
           app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
           self._validate_fixed_size_volumes(app_params, context="app_params")
@@ -2019,6 +2032,13 @@ class _DeeployMixin:
         # Validate storage (FIXED_SIZE_VOLUMES total <= job type allocation)
         requested_storage = aggregated_resources.get(DEEPLOY_RESOURCES.STORAGE)
         expected_storage = expected_resources.get(DEEPLOY_RESOURCES.STORAGE)
+        if job_app_type == JOB_APP_TYPES.STACK and (requested_storage is None or expected_storage is None):
+          msg = (
+            f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack storage resources are required "
+            f"for job type {job_type}."
+          )
+          self.P(msg)
+          raise ValueError(msg)
         if requested_storage and expected_storage:
           requested_storage_mb = parse_memory_to_mb(requested_storage)
           expected_storage_mb = parse_memory_to_mb(expected_storage)
@@ -2058,13 +2078,22 @@ class _DeeployMixin:
         self.Pd(f"  Normalized: requested_memory={requested_memory_mb}MB, expected_memory={expected_memory_mb}MB")
 
         if job_app_type == JOB_APP_TYPES.STACK:
+          requested_storage_mb = (
+            None if requested_storage is None else parse_memory_to_mb(requested_storage)
+          )
+          expected_storage_mb = (
+            None if expected_storage is None else parse_memory_to_mb(expected_storage)
+          )
           resources_match = (
             requested_cpu_val is not None and
             expected_cpu_val is not None and
             requested_memory_mb is not None and
             expected_memory_mb is not None and
+            requested_storage_mb is not None and
+            expected_storage_mb is not None and
             requested_cpu_val <= expected_cpu_val and
-            requested_memory_mb <= expected_memory_mb
+            requested_memory_mb <= expected_memory_mb and
+            requested_storage_mb <= expected_storage_mb
           )
         else:
           resources_match = (
