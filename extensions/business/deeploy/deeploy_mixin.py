@@ -2015,6 +2015,15 @@ class _DeeployMixin:
               )
               self.P(msg)
               raise ValueError(msg)
+            if job_app_type == JOB_APP_TYPES.STACK and signature in CONTAINERIZED_APPS_SIGNATURES:
+              storage_mb = parse_memory_to_mb(str(resources.get(DEEPLOY_RESOURCES.STORAGE)))
+              if storage_mb <= 0:
+                msg = (
+                  f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container storage must be greater than 0 "
+                  f"for plugin {idx}."
+                )
+                self.P(msg)
+                raise ValueError(msg)
         else:
           app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
           self._validate_fixed_size_volumes(app_params, context="app_params")
