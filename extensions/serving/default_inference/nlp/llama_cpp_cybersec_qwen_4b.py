@@ -20,6 +20,7 @@ _CONFIG = {
   "MODEL_FILENAME": "CyberSecQwen-4B.Q4_K_M.gguf",
   "MODEL_N_CTX": 4096,
   "N_GPU_LAYERS": 0,
+  "N_THREADS": 4,
   "MODEL_INSTANCE_ID": "cybersecqwen-4b",
 
   # Keep default generations bounded on CPU. Callers may request less.
