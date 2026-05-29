@@ -1,0 +1,65 @@
+{
+  "COMMUNICATION": {
+    "INSTANCES": {
+      "COMMANDCONTROL": {
+        "RECV_FROM": "CTRL_CHANNEL",
+        "SEND_TO": "CONFIG_CHANNEL"
+      },
+      "DEFAULT": {
+        "SEND_TO": "PAYLOADS_CHANNEL"
+      },
+      "HEARTBEATS": {
+        "RECV_FROM": "CONFIG_CHANNEL",
+        "SEND_TO": "CTRL_CHANNEL"
+      },
+      "NOTIFICATIONS": {
+        "SEND_TO": "NOTIF_CHANNEL"
+      }
+    },
+    "LOCAL_PARAMS": {
+      "HOST": "deeploy_test_mqtt",
+      "PASS": "",
+      "PORT": 1883,
+      "USER": "",
+      "QOS": 0,
+      "SECURED": 0
+    },
+    "PARAMS": {
+      "CONFIG_CHANNEL": {
+        "TOPIC": "deeploy_testbed/{}/config"
+      },
+      "CTRL_CHANNEL": {
+        "TOPIC": "deeploy_testbed/ctrl"
+      },
+      "HOST": "$EE_MQTT_HOST",
+      "NOTIF_CHANNEL": {
+        "TOPIC": "deeploy_testbed/notif"
+      },
+      "PASS": "$EE_MQTT",
+      "PAYLOADS_CHANNEL": {
+        "TOPIC": "deeploy_testbed/payloads",
+        "TARGETED_TOPIC": "deeploy_testbed/{}/payloads"
+      },
+      "PORT": "$EE_MQTT_PORT",
+      "QOS": 0,
+      "USER": "$EE_MQTT_USER",
+      "SUBTOPIC": "$EE_MQTT_SUBTOPIC",
+      "SECURED": 0,
+      "CERT_PATH": ""
+    },
+    "TYPE": "mqtt"
+  },
+  "FILE_UPLOAD": {
+    "CONFIG_UPLOADER": {
+      "ACCESS_KEY": "$EE_MINIO_ACCESS_KEY",
+      "BUCKET_NAME": "$EE_MINIO_UPLOAD_BUCKET",
+      "ENDPOINT": "$EE_MINIO_ENDPOINT",
+      "SECRET_KEY": "$EE_MINIO_SECRET_KEY",
+      "SECURE": "$EE_MINIO_SECURE"
+    },
+    "TYPE": "minio"
+  },
+  "PAYLOAD_TYPE": "INSTANCE",
+  "SECONDS_HEARTBEAT": 3,
+  "SERVING_IN_PROCESS": true
+}

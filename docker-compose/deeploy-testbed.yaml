@@ -1,0 +1,89 @@
+name: deeploy-delete-testbed
+
+x-edge-node-env: &edge-node-env
+  EE_CONFIG: /edge_node/docker-compose/deeploy-testbed/config_startup_deeploy_testbed.json
+  EE_DEVICE: cpu
+  EE_ETH_ENABLED: "false"
+  EE_EVM_NET: devnet
+  EE_DAUTH_URL: N/A
+  EE_MQTT_HOST: deeploy_test_mqtt
+  EE_MQTT_PORT: "1883"
+  EE_MQTT_USER: ""
+  EE_MQTT: ""
+  EE_MQTT_SUBTOPIC: address
+  EE_MQTT_SECURED: "false"
+  EE_SECURED: "0"
+  EE_MINIO_ENDPOINT: ""
+  EE_MINIO_ACCESS_KEY: ""
+  EE_MINIO_SECRET_KEY: ""
+  EE_MINIO_SECURE: "false"
+  EE_MINIO_MODEL_BUCKET: ""
+  EE_MINIO_UPLOAD_BUCKET: ""
+  EE_GITVER: ""
+  EE_NGROK_AUTH_TOKEN: ""
+  EE_NGROK_EDGE_LABEL: ""
+  EE_NGROK_EDGE_LABEL_DEEPLOY_MANAGER: ""
+  EE_CLOUDFLARE_TOKEN_DEEPLOY_MANAGER: ""
+  EE_TUNNEL_ENGINE: none
+
+x-edge-node: &edge-node
+  image: local_edge_node_deeploy_0002
+  build:
+    context: ..
+    dockerfile: Dockerfile_devnet
+  privileged: true
+  restart: "no"
+  command: ["python3", "/edge_node/docker-compose/deeploy-testbed/device_no_extra_packages.py"]
+  depends_on:
+    deeploy_test_mqtt:
+      condition: service_healthy
+  environment: *edge-node-env
+  volumes:
+    - ./deeploy-testbed:/edge_node/docker-compose/deeploy-testbed:ro
+    - ./deeploy-testbed/plugins/business/deeploy_testbed_plugin.py:/edge_node/plugins/business/deeploy_testbed_plugin.py:ro
+    - ./deeploy-testbed/plugins/data/deeploy_testbed_stream.py:/edge_node/plugins/data/deeploy_testbed_stream.py:ro
+
+services:
+  deeploy_test_mqtt:
+    image: eclipse-mosquitto:2
+    container_name: deeploy_test_mqtt
+    restart: "no"
+    ports:
+      - "18883:1883"
+    volumes:
+      - ./deeploy-testbed/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "mosquitto_pub -h localhost -p 1883 -t deeploy_testbed/health -m ok >/dev/null 2>&1"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+
+  deeploy_test_node_1:
+    <<: *edge-node
+    container_name: deeploy_test_node_1
+    environment:
+      <<: *edge-node-env
+      EE_ID: deeploy_node_1
+      EE_SUPERVISOR: "false"
+    volumes:
+      - deeploy_test_node_1_cache:/edge_node/_local_cache
+      - ./deeploy-testbed:/edge_node/docker-compose/deeploy-testbed:ro
+      - ./deeploy-testbed/plugins/business/deeploy_testbed_plugin.py:/edge_node/plugins/business/deeploy_testbed_plugin.py:ro
+      - ./deeploy-testbed/plugins/data/deeploy_testbed_stream.py:/edge_node/plugins/data/deeploy_testbed_stream.py:ro
+
+  deeploy_test_node_2:
+    <<: *edge-node
+    container_name: deeploy_test_node_2
+    environment:
+      <<: *edge-node-env
+      EE_ID: deeploy_node_2
+      EE_SUPERVISOR: "false"
+    volumes:
+      - deeploy_test_node_2_cache:/edge_node/_local_cache
+      - ./deeploy-testbed:/edge_node/docker-compose/deeploy-testbed:ro
+      - ./deeploy-testbed/plugins/business/deeploy_testbed_plugin.py:/edge_node/plugins/business/deeploy_testbed_plugin.py:ro
+      - ./deeploy-testbed/plugins/data/deeploy_testbed_stream.py:/edge_node/plugins/data/deeploy_testbed_stream.py:ro
+
+volumes:
+  deeploy_test_node_1_cache:
+  deeploy_test_node_2_cache:
