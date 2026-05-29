@@ -228,13 +228,27 @@ def main():
 
     harness = make_delete_harness(session)
     discovered = make_discovered_instances(APP_ID, node_addresses)
+    discovery_calls = []
+
+    def discover(**kwargs):
+      discovery_calls.append(kwargs)
+      return discovered
+
+    harness._discover_plugin_instances = discover
     returned = harness.delete_pipeline_from_nodes(
       app_id=APP_ID,
       owner=OWNER,
-      discovered_instances=discovered,
+      target_nodes=0,
     )
     if returned is not discovered:
       raise AssertionError("delete_pipeline_from_nodes did not preserve discovered instance list")
+    if discovery_calls != [{
+      "app_id": APP_ID,
+      "job_id": None,
+      "owner": OWNER,
+      "target_nodes": None,
+    }]:
+      raise AssertionError(f"Expected unfiltered discovery call; got {discovery_calls}")
 
     for container in CONTAINERS:
       wait_for_stream_state(container, APP_ID, expected_exists=False)
@@ -256,6 +270,7 @@ def main():
       "baseline_delete_counts": baseline_counts,
       "final_delete_counts": final_counts,
       "delete_count_deltas": deltas,
+      "discovery_calls": discovery_calls,
       "result": "ok",
     }, indent=2))
   finally:

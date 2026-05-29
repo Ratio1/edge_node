@@ -3429,6 +3429,9 @@ class _DeeployMixin:
     return netmon_job_ids
   
   def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, target_nodes=None, allow_missing=False, discovered_instances=None):
+    if not target_nodes:
+      target_nodes = None
+
     if discovered_instances is None:
       discovered_instances = self._discover_plugin_instances(
         app_id=app_id,

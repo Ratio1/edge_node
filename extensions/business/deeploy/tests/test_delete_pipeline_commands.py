@@ -143,6 +143,33 @@ class DeeployDeletePipelineCommandTests(unittest.TestCase):
     }])
     self.assertEqual(plugin.stop_calls, [("0xai_node_2", "app-1")])
 
+  def test_falsy_target_nodes_default_discovers_all_nodes(self):
+    plugin = _make_delete_plugin()
+    discovered = [
+      _discovered_instance("app-1", "0xai_node_2", "PLUGIN_A", "a-2"),
+    ]
+    discovery_calls = []
+
+    def discover(**kwargs):
+      discovery_calls.append(kwargs)
+      return discovered
+
+    plugin._discover_plugin_instances = discover
+
+    plugin.delete_pipeline_from_nodes(
+      app_id="app-1",
+      owner="0xOwner",
+      target_nodes=0,
+    )
+
+    self.assertEqual(discovery_calls, [{
+      "app_id": "app-1",
+      "job_id": None,
+      "owner": "0xOwner",
+      "target_nodes": None,
+    }])
+    self.assertEqual(plugin.stop_calls, [("0xai_node_2", "app-1")])
+
   def test_allow_missing_still_returns_empty_without_command(self):
     plugin = _make_delete_plugin()
     plugin._discover_plugin_instances = lambda **kwargs: []
@@ -194,6 +221,56 @@ class DeeployDeletePipelineEndpointTests(unittest.TestCase):
     })
     self.assertEqual(res[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
     self.assertEqual(res[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.TARGETS], [])
+
+  def test_delete_endpoint_omitted_target_nodes_discovers_all_targets(self):
+    plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
+    plugin.stop_calls = []
+    plugin.discovery_calls = []
+    plugin.cfg_deeploy_verbose = 0
+    plugin.P = lambda *args, **kwargs: None
+    plugin.Pd = lambda *args, **kwargs: None
+    plugin._get_response = lambda dct_data: dct_data
+    plugin.deeploy_verify_and_get_inputs = lambda request, **kwargs: (
+      "0xSender",
+      InputsStub({
+        **request,
+        DEEPLOY_KEYS.TARGET_NODES: 0,
+      }),
+    )
+    plugin.deeploy_get_auth_result = lambda inputs: {
+      DEEPLOY_KEYS.SENDER: "0xSender",
+      DEEPLOY_KEYS.SENDER_ESCROW: "0xEscrow",
+      DEEPLOY_KEYS.ESCROW_OWNER: "0xOwner",
+    }
+    plugin._DeeployManagerApiPlugin__ensure_eth_balance = lambda: None
+    plugin.cmdapi_stop_pipeline = lambda node_address, name: plugin.stop_calls.append((node_address, name))
+
+    def discover(**kwargs):
+      plugin.discovery_calls.append(kwargs)
+      return [
+        _discovered_instance("app-1", "0xai_node_1", "PLUGIN_A", "a-1"),
+        _discovered_instance("app-1", "0xai_node_2", "PLUGIN_A", "a-2"),
+      ]
+
+    plugin._discover_plugin_instances = discover
+
+    res = plugin.delete_pipeline({
+      DEEPLOY_KEYS.APP_ID: "app-1",
+      DEEPLOY_KEYS.NONCE: "0x1",
+    })
+
+    self.assertEqual(plugin.discovery_calls, [{
+      "app_id": "app-1",
+      "job_id": None,
+      "owner": "0xOwner",
+      "target_nodes": None,
+    }])
+    self.assertEqual(plugin.stop_calls, [
+      ("0xai_node_1", "app-1"),
+      ("0xai_node_2", "app-1"),
+    ])
+    self.assertEqual(res[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
+    self.assertEqual(len(res[DEEPLOY_KEYS.REQUEST][DEEPLOY_KEYS.TARGETS]), 2)
 
 
 if __name__ == "__main__":
