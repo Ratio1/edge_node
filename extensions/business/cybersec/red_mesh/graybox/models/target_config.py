@@ -829,6 +829,51 @@ class AuthDescriptor:
 
 
 @dataclass(frozen=True)
+class GatewayAuthDescriptor:
+  """Non-secret perimeter auth applied before application/API auth.
+
+  Secret values (`gateway_api_key`, `gateway_bearer_token`,
+  `gateway_bearer_refresh_token`) are top-level launch parameters and live
+  only in the graybox secret payload.
+  """
+  auth_type: str = ""   # "api_key" | "bearer"
+  bearer_token_header_name: str = "Authorization"
+  bearer_scheme: str = "Bearer"
+  api_key_header_name: str = "X-Gateway-Key"
+  api_key_query_param: str = "api_key"
+  api_key_location: str = "header"  # "header" | "query"
+  provider: str = ""
+  classification: str = ""
+  warnings: tuple[str, ...] = ()
+  security_import_status: str = ""
+  security_import_requirement_index: int = -1
+
+  @classmethod
+  def from_dict(cls, d: dict) -> GatewayAuthDescriptor:
+    d = _checked_dict(cls, d)
+    warnings = d.get("warnings", ())
+    if isinstance(warnings, str):
+      warnings = (warnings,)
+    elif warnings in (None, "", [], ()):
+      warnings = ()
+    else:
+      warnings = tuple(str(item) for item in warnings if str(item))
+    return cls(
+      auth_type=d.get("auth_type", ""),
+      bearer_token_header_name=d.get("bearer_token_header_name", "Authorization"),
+      bearer_scheme=d.get("bearer_scheme", "Bearer"),
+      api_key_header_name=d.get("api_key_header_name", "X-Gateway-Key"),
+      api_key_query_param=d.get("api_key_query_param", "api_key"),
+      api_key_location=d.get("api_key_location", "header"),
+      provider=d.get("provider", ""),
+      classification=d.get("classification", ""),
+      warnings=warnings,
+      security_import_status=d.get("security_import_status", ""),
+      security_import_requirement_index=d.get("security_import_requirement_index", -1),
+    )
+
+
+@dataclass(frozen=True)
 class ApiSecurityConfig:
   """Aggregated config for the five OWASP API Top 10 graybox probe families.
 
@@ -861,6 +906,7 @@ class ApiSecurityConfig:
   token_endpoints: ApiTokenEndpoint = field(default_factory=ApiTokenEndpoint)
   inventory_paths: ApiInventoryPaths = field(default_factory=ApiInventoryPaths)
   auth: AuthDescriptor = field(default_factory=AuthDescriptor)
+  gateway_auth: GatewayAuthDescriptor | None = None
 
   ssrf_body_fields: list[str] = field(default_factory=lambda: [
     "url", "webhook", "callback", "image_url", "redirect_uri",
@@ -884,6 +930,9 @@ class ApiSecurityConfig:
   def from_dict(cls, d: dict) -> ApiSecurityConfig:
     d = _checked_dict(cls, d)
     fields_ = cls.__dataclass_fields__
+    gateway_auth = None
+    if d.get("gateway_auth") not in (None, {}):
+      gateway_auth = GatewayAuthDescriptor.from_dict(d.get("gateway_auth", {}))
     return cls(
       object_endpoints=[ApiObjectEndpoint.from_dict(e) for e in d.get("object_endpoints", [])],
       property_endpoints=[ApiPropertyEndpoint.from_dict(e) for e in d.get("property_endpoints", [])],
@@ -893,6 +942,7 @@ class ApiSecurityConfig:
       token_endpoints=ApiTokenEndpoint.from_dict(d.get("token_endpoints", {})),
       inventory_paths=ApiInventoryPaths.from_dict(d.get("inventory_paths", {})),
       auth=AuthDescriptor.from_dict(d.get("auth", {})),
+      gateway_auth=gateway_auth,
       ssrf_body_fields=d.get(
         "ssrf_body_fields",
         fields_["ssrf_body_fields"].default_factory(),
@@ -942,7 +992,11 @@ class GrayboxTargetConfig:
   csrf_field: str = ""                    # empty = auto-detect from COMMON_CSRF_FIELDS
 
   def to_dict(self) -> dict:
-    return {k: v for k, v in asdict(self).items() if v is not None}
+    data = asdict(self)
+    api_security = data.get("api_security")
+    if isinstance(api_security, dict) and api_security.get("gateway_auth") is None:
+      api_security.pop("gateway_auth", None)
+    return {k: v for k, v in data.items() if v is not None}
 
   @classmethod
   def from_dict(cls, d: dict) -> GrayboxTargetConfig:

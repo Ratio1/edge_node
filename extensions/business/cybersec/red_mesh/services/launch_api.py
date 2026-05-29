@@ -192,6 +192,69 @@ def _validate_api_auth_descriptor(auth_desc):
   return None
 
 
+def _normalize_carrier_name(value: str) -> str:
+  return str(value or "").strip().lower()
+
+
+def _auth_descriptor_carrier(auth_desc, *, default_auth_type="form"):
+  auth_type = getattr(auth_desc, "auth_type", default_auth_type) or default_auth_type
+  if auth_type == "bearer":
+    header_name = getattr(auth_desc, "bearer_token_header_name", "Authorization")
+    return ("header", _normalize_carrier_name(header_name), header_name or "Authorization")
+  if auth_type == "api_key":
+    location = _normalize_carrier_name(getattr(auth_desc, "api_key_location", "header")) or "header"
+    if location == "query":
+      param_name = getattr(auth_desc, "api_key_query_param", "api_key")
+      return ("query", _normalize_carrier_name(param_name), param_name or "api_key")
+    header_name = getattr(auth_desc, "api_key_header_name", "X-Api-Key")
+    return ("header", _normalize_carrier_name(header_name), header_name or "X-Api-Key")
+  return None
+
+
+def _validate_gateway_auth_descriptor(gateway_desc):
+  if not gateway_desc:
+    return None
+  auth_type = getattr(gateway_desc, "auth_type", "") or ""
+  if auth_type not in ("api_key", "bearer"):
+    return validation_error(
+      "api_security.gateway_auth.auth_type must be 'api_key' or 'bearer'"
+    )
+  if auth_type == "bearer":
+    header_name = getattr(gateway_desc, "bearer_token_header_name", "Authorization")
+    if not _normalize_carrier_name(header_name):
+      return validation_error("api_security.gateway_auth.bearer_token_header_name required")
+    return None
+  location = _normalize_carrier_name(getattr(gateway_desc, "api_key_location", "header")) or "header"
+  if location not in ("header", "query"):
+    return validation_error(
+      "api_security.gateway_auth.api_key_location must be 'header' or 'query'"
+    )
+  if location == "header":
+    header_name = getattr(gateway_desc, "api_key_header_name", "X-Gateway-Key")
+    if not _normalize_carrier_name(header_name):
+      return validation_error("api_security.gateway_auth.api_key_header_name required")
+  else:
+    param_name = getattr(gateway_desc, "api_key_query_param", "api_key")
+    if not _normalize_carrier_name(param_name):
+      return validation_error("api_security.gateway_auth.api_key_query_param required")
+  return None
+
+
+def _validate_layered_auth_carriers(gateway_desc, app_desc):
+  gateway_carrier = _auth_descriptor_carrier(gateway_desc, default_auth_type="")
+  app_carrier = _auth_descriptor_carrier(app_desc, default_auth_type="form")
+  if not gateway_carrier or not app_carrier:
+    return None
+  gateway_kind, gateway_name, gateway_display = gateway_carrier
+  app_kind, app_name, _app_display = app_carrier
+  if gateway_kind == app_kind and gateway_name and gateway_name == app_name:
+    return validation_error(
+      "api_security.gateway_auth and api_security.auth use the same carrier "
+      f"{gateway_kind} {gateway_display!r}; configure distinct headers or query parameters"
+    )
+  return None
+
+
 def _normalize_allowlist(entries):
   if not entries:
     return []
@@ -701,6 +764,9 @@ def announce_launch(
   regular_bearer_token="",
   regular_api_key="",
   regular_bearer_refresh_token="",
+  gateway_api_key="",
+  gateway_bearer_token="",
+  gateway_bearer_refresh_token="",
   target_config_secrets=None,
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
@@ -775,6 +841,9 @@ def announce_launch(
     regular_bearer_token=regular_bearer_token,
     regular_api_key=regular_api_key,
     regular_bearer_refresh_token=regular_bearer_refresh_token,
+    gateway_api_key=gateway_api_key,
+    gateway_bearer_token=gateway_bearer_token,
+    gateway_bearer_refresh_token=gateway_bearer_refresh_token,
   )
 
   persisted_config, job_config_cid = persist_job_config_with_secrets(
@@ -1106,6 +1175,9 @@ def launch_webapp_scan(
   regular_bearer_token="",
   regular_api_key="",
   regular_bearer_refresh_token="",
+  gateway_api_key="",
+  gateway_bearer_token="",
+  gateway_bearer_refresh_token="",
   target_config_secrets=None,
   # OWASP API Top 10 — Subphase 1.7. When set, overrides
   # `target_config.api_security.max_total_requests` for the scan.
@@ -1122,13 +1194,10 @@ def launch_webapp_scan(
   ``normalize_graybox_target_config``; unknown keys and raw nested secret
   material in request-body-like fields fail closed at launch.
 
-  Secret-handling: ``bearer_token``, ``api_key``, and
-  ``bearer_refresh_token`` (Subphase 1.5 commit #8) are top-level launch
-  parameters — NOT inside ``target_config``. They travel through the
-  same R1FS secret payload as ``official_password`` and are blanked from
-  the persisted JobConfig before archive write. Non-secret capability
-  flags ``has_bearer_token`` / ``has_api_key`` are surfaced on the
-  archived config so consumers know whether the credentials existed.
+  Secret-handling: bearer/api-key app secrets and gateway secrets are
+  top-level launch parameters — NOT inside ``target_config``. They travel
+  through the same R1FS secret payload as ``official_password`` and are
+  blanked from the persisted JobConfig before archive write.
   """
   if not target_url:
     return validation_error("target_url required for webapp scan")
@@ -1170,6 +1239,23 @@ def launch_webapp_scan(
   auth_validation_error = _validate_api_auth_descriptor(auth_desc)
   if auth_validation_error:
     return auth_validation_error
+  gateway_auth_desc = typed_target_config.api_security.gateway_auth
+  gateway_auth_error = _validate_gateway_auth_descriptor(gateway_auth_desc)
+  if gateway_auth_error:
+    return gateway_auth_error
+  if gateway_auth_desc:
+    gateway_auth_type = gateway_auth_desc.auth_type
+    if gateway_auth_type == "api_key" and not gateway_api_key:
+      return validation_error(
+        "gateway_api_key required when api_security.gateway_auth.auth_type='api_key'"
+      )
+    if gateway_auth_type == "bearer" and not gateway_bearer_token:
+      return validation_error(
+        "gateway_bearer_token required when api_security.gateway_auth.auth_type='bearer'"
+      )
+  carrier_error = _validate_layered_auth_carriers(gateway_auth_desc, auth_desc)
+  if carrier_error:
+    return carrier_error
 
   parsed = urlparse(target_url)
   if parsed.scheme not in ("http", "https") or not parsed.hostname:
@@ -1319,6 +1405,9 @@ def launch_webapp_scan(
     regular_bearer_token=regular_bearer_token,
     regular_api_key=regular_api_key,
     regular_bearer_refresh_token=regular_bearer_refresh_token,
+    gateway_api_key=gateway_api_key,
+    gateway_bearer_token=gateway_bearer_token,
+    gateway_bearer_refresh_token=gateway_bearer_refresh_token,
     target_config_secrets=target_config_secrets,
   )
 
@@ -1366,6 +1455,9 @@ def launch_test(
   regular_bearer_token="",
   regular_api_key="",
   regular_bearer_refresh_token="",
+  gateway_api_key="",
+  gateway_bearer_token="",
+  gateway_bearer_refresh_token="",
   target_config_secrets=None,
   request_budget=None,
   graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_SLICE,
@@ -1420,6 +1512,9 @@ def launch_test(
       regular_bearer_token=regular_bearer_token,
       regular_api_key=regular_api_key,
       regular_bearer_refresh_token=regular_bearer_refresh_token,
+      gateway_api_key=gateway_api_key,
+      gateway_bearer_token=gateway_bearer_token,
+      gateway_bearer_refresh_token=gateway_bearer_refresh_token,
       target_config_secrets=target_config_secrets,
       request_budget=request_budget,
       graybox_assignment_strategy=graybox_assignment_strategy,

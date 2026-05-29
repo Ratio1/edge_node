@@ -497,6 +497,11 @@ class TestExecution(unittest.TestCase):
     worker.auth.authenticate.return_value = False
     worker.auth.official_session = None
     worker.auth._auth_errors = ["Login failed"]
+    worker.auth._auth_diagnostics = [{
+      "classification": "gateway_block_likely",
+      "stage": "authenticated_probe_rejected",
+      "status": 403,
+    }]
     worker.auth.cleanup = MagicMock()
 
     worker.execute_job()
@@ -507,6 +512,11 @@ class TestExecution(unittest.TestCase):
     self.assertEqual(len(fatal), 1)
     self.assertEqual(fatal[0]["status"], "inconclusive")
     self.assertIn("authentication failed", fatal[0]["evidence"][0].lower())
+    auth_info = worker.state["service_info"]["8000"]["_graybox_auth"]
+    self.assertEqual(
+      auth_info["auth_diagnostics"][0]["classification"],
+      "gateway_block_likely",
+    )
 
   def test_preflight_failure_aborts(self):
     """Bad URL → fatal finding, done=True."""

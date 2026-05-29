@@ -7,7 +7,8 @@ keeping the existing probe-facing ``requests.Session`` shape.
 from __future__ import annotations
 
 import posixpath
-from urllib.parse import unquote, urlsplit, urlunsplit
+from collections.abc import Mapping
+from urllib.parse import parse_qsl, urlencode, unquote, urlsplit, urlunsplit
 
 import requests
 
@@ -249,13 +250,133 @@ class ScopedSession:
 class GrayboxHttpClient:
   """Runtime host/path scope guard for graybox HTTP traffic."""
 
-  def __init__(self, target_url: str, *, allowlist=None, target_config=None):
+  def __init__(
+    self,
+    target_url: str,
+    *,
+    allowlist=None,
+    target_config=None,
+    gateway_api_key="",
+    gateway_bearer_token="",
+    gateway_bearer_refresh_token="",
+  ):
     self.target_url = target_url.rstrip("/")
     self.scopes = path_scopes_from_allowlist(target_url, allowlist)
     discovery = getattr(target_config, "discovery", None)
     scope_prefix = getattr(discovery, "scope_prefix", "") if discovery else ""
     if scope_prefix and not self.scopes:
       self.scopes = [_normalize_path(scope_prefix)]
+    self._protected_headers, self._protected_params = self._build_gateway_auth(
+      target_config,
+      gateway_api_key=gateway_api_key,
+      gateway_bearer_token=gateway_bearer_token,
+      gateway_bearer_refresh_token=gateway_bearer_refresh_token,
+    )
+
+  @staticmethod
+  def _value(source, key, default=None):
+    if isinstance(source, dict):
+      return source.get(key, default)
+    return getattr(source, key, default)
+
+  @classmethod
+  def _gateway_auth_descriptor(cls, target_config):
+    api_security = cls._value(target_config, "api_security")
+    if api_security is None:
+      return None
+    return cls._value(api_security, "gateway_auth")
+
+  @classmethod
+  def _build_gateway_auth(
+    cls,
+    target_config,
+    *,
+    gateway_api_key="",
+    gateway_bearer_token="",
+    gateway_bearer_refresh_token="",
+  ):
+    gateway_auth = cls._gateway_auth_descriptor(target_config)
+    if gateway_auth is None:
+      return {}, {}
+    auth_type = cls._value(gateway_auth, "auth_type", "") or ""
+    if auth_type == "bearer" and gateway_bearer_token:
+      scheme = cls._value(gateway_auth, "bearer_scheme", "Bearer") or ""
+      header_name = cls._value(
+        gateway_auth, "bearer_token_header_name", "Authorization",
+      ) or "Authorization"
+      value = f"{scheme} {gateway_bearer_token}".strip() if scheme else gateway_bearer_token
+      return {header_name: value}, {}
+    if auth_type == "api_key" and gateway_api_key:
+      location = cls._value(gateway_auth, "api_key_location", "header") or "header"
+      if location == "query":
+        param_name = cls._value(gateway_auth, "api_key_query_param", "api_key") or "api_key"
+        return {}, {param_name: gateway_api_key}
+      header_name = cls._value(gateway_auth, "api_key_header_name", "X-Gateway-Key") or "X-Gateway-Key"
+      return {header_name: gateway_api_key}, {}
+    return {}, {}
+
+  @staticmethod
+  def _coerce_mapping(value):
+    if not value:
+      return {}
+    if isinstance(value, Mapping):
+      return dict(value)
+    try:
+      return dict(value)
+    except (TypeError, ValueError):
+      return {}
+
+  @staticmethod
+  def _set_protected_value(container, key, value):
+    normalized = str(key or "").strip().lower()
+    if normalized:
+      for existing in list(container.keys()):
+        if str(existing or "").strip().lower() == normalized:
+          container.pop(existing, None)
+    container[key] = value
+
+  def _with_protected_gateway_auth(self, kwargs):
+    if not self._protected_headers and not self._protected_params:
+      return kwargs
+    merged = dict(kwargs)
+    if self._protected_headers:
+      headers = self._coerce_mapping(merged.get("headers"))
+      for key, value in self._protected_headers.items():
+        self._set_protected_value(headers, key, value)
+      merged["headers"] = headers
+    if self._protected_params:
+      params = self._coerce_mapping(merged.get("params"))
+      for key, value in self._protected_params.items():
+        self._set_protected_value(params, key, value)
+      merged["params"] = params
+    return merged
+
+  @staticmethod
+  def _without_protected_query_values(url: str, protected_params: Mapping) -> str:
+    if not protected_params:
+      return url
+    parsed = urlsplit(url)
+    if not parsed.query:
+      return url
+    protected_names = {
+      str(key or "").strip().lower()
+      for key in protected_params.keys()
+      if str(key or "").strip()
+    }
+    if not protected_names:
+      return url
+    query_items = [
+      (key, value)
+      for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+      if str(key or "").strip().lower() not in protected_names
+    ]
+    return urlunsplit((
+      parsed.scheme,
+      parsed.netloc,
+      parsed.path,
+      urlencode(query_items, doseq=True),
+      parsed.fragment,
+    ))
 
   def wrap_session(self, session):
     if isinstance(session, ScopedSession):
@@ -272,6 +393,9 @@ class GrayboxHttpClient:
   def request(self, session, method, url, **kwargs):
     allow_redirects = bool(kwargs.pop("allow_redirects", False))
     safe_url = self.validate_url(url)
+    kwargs = self._with_protected_gateway_auth(kwargs)
+    if self._protected_params:
+      safe_url = self._without_protected_query_values(safe_url, self._protected_params)
     if not allow_redirects:
       return session.request(method, safe_url, allow_redirects=False, **kwargs)
     current_url = safe_url

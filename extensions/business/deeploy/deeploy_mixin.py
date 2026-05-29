@@ -1547,13 +1547,10 @@ class _DeeployMixin:
       return normalized_keys
 
     self.P(f"Resetting response keys in chainstore before dispatching {context}...")
+    reset_kwargs = self._get_chainstore_response_local_reset_write_kwargs()
     for _, node_response_keys in normalized_keys.items():
       for response_key in node_response_keys:
-        try:
-          self.chainstore_set(response_key, None)
-        except Exception as e:
-          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
-        # end try
+        self._reset_chainstore_response_key(response_key, write_kwargs=reset_kwargs)
       # end for
     # end for
 
@@ -1794,17 +1791,23 @@ class _DeeployMixin:
       self.Pd("Using legacy format (app_params) for resource aggregation")
       app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
       legacy_resources = app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+      storage_mb = 0
       if isinstance(legacy_resources, dict):
         legacy_resources = self.deepcopy(legacy_resources)
         if DEEPLOY_RESOURCES.CPU in legacy_resources:
           legacy_resources[DEEPLOY_RESOURCES.CPU] = self._parse_cpu_value(
             legacy_resources.get(DEEPLOY_RESOURCES.CPU)
           )
+        container_storage = legacy_resources.get(DEEPLOY_RESOURCES.STORAGE)
+        if container_storage:
+          storage_mb = parse_memory_to_mb(str(container_storage))
+        else:
+          storage_mb = 0
       # Aggregate FIXED_SIZE_VOLUMES storage from legacy app_params
-      storage_mb = self._aggregate_fixed_size_volumes_storage_mb(app_params)
+      storage_mb += self._aggregate_fixed_size_volumes_storage_mb(app_params)
       if storage_mb > 0:
         legacy_resources[DEEPLOY_RESOURCES.STORAGE] = f"{storage_mb}m"
-        self.Pd(f"Legacy FIXED_SIZE_VOLUMES storage: {storage_mb}MB")
+        self.Pd(f"Legacy storage requirement: {storage_mb}MB")
       self.Pd(f"Legacy resources: {legacy_resources}")
       return legacy_resources
 
@@ -1823,6 +1826,7 @@ class _DeeployMixin:
         resources = plugin_instance.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
         cpu = self._parse_cpu_value(resources.get(DEEPLOY_RESOURCES.CPU, 0))
         memory = resources.get(DEEPLOY_RESOURCES.MEMORY, "0m")
+        container_storage = resources.get(DEEPLOY_RESOURCES.STORAGE)
 
         self.Pd(f"  Container resources: cpu={cpu}, memory={memory}")
 
@@ -1830,6 +1834,11 @@ class _DeeployMixin:
         memory_mb = parse_memory_to_mb(memory)
         self.Pd(f"  Parsed memory: {memory_mb}MB")
         total_memory_mb += memory_mb
+
+        if container_storage:
+          storage_mb = parse_memory_to_mb(str(container_storage))
+          self.Pd(f"  Container storage: {storage_mb}MB")
+          total_storage_mb += storage_mb
 
         # Aggregate FIXED_SIZE_VOLUMES storage
         storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
@@ -2048,24 +2057,34 @@ class _DeeployMixin:
         self.Pd(f"  Normalized: requested_cpu={requested_cpu_val}, expected_cpu={expected_cpu_val}")
         self.Pd(f"  Normalized: requested_memory={requested_memory_mb}MB, expected_memory={expected_memory_mb}MB")
 
-        resources_match = (
-          requested_cpu_val is not None and
-          expected_cpu_val is not None and
-          requested_memory_mb is not None and
-          expected_memory_mb is not None and
-          requested_cpu_val == expected_cpu_val and
-          requested_memory_mb == expected_memory_mb
-        )
+        if job_app_type == JOB_APP_TYPES.STACK:
+          resources_match = (
+            requested_cpu_val is not None and
+            expected_cpu_val is not None and
+            requested_memory_mb is not None and
+            expected_memory_mb is not None and
+            requested_cpu_val <= expected_cpu_val and
+            requested_memory_mb <= expected_memory_mb
+          )
+        else:
+          resources_match = (
+            requested_cpu_val is not None and
+            expected_cpu_val is not None and
+            requested_memory_mb is not None and
+            expected_memory_mb is not None and
+            requested_cpu_val == expected_cpu_val and
+            requested_memory_mb == expected_memory_mb
+          )
 
         self.Pd(f"  Resources match: {resources_match}")
 
         if not resources_match:
           self.P(
-            f"Requested resources {aggregated_resources} do not match paid resources "
+            f"Requested resources {aggregated_resources} do not fit paid resources "
             f"{expected_resources} for job type {job_type}."
           )
           msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Requested resources {aggregated_resources} " +
-                 f"do not match paid resources {expected_resources} for job type {job_type}.")
+                 f"do not fit paid resources {expected_resources} for job type {job_type}.")
           raise ValueError(msg)
         else:
           self.Pd(f"  Resource validation passed!")
@@ -2808,13 +2827,11 @@ class _DeeployMixin:
     self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")
 
     # RESET chainstore_response_keys here
-    try:
-      self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
-      for node_addr, response_keys in chainstore_response_keys.items():
-        for response_key in response_keys:
-          self.chainstore_set(response_key, None)
-    except Exception as e:
-      self.P(f"Error resetting chainstore keys: {e}", color='r')
+    self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
+    self._reset_chainstore_response_keys(
+      chainstore_response_keys,
+      context=f"scale up job {job_id}",
+    )
 
     # Start pipelines on nodes.
     self._start_create_update_pipelines(create_pipelines=create_pipelines,
@@ -3406,9 +3423,17 @@ class _DeeployMixin:
     self.P(f"Checked all job IDs.")
     return netmon_job_ids
   
-  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, allow_missing=False, discovered_instances=None):
+  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, target_nodes=None, allow_missing=False, discovered_instances=None):
+    if not target_nodes:
+      target_nodes = None
+
     if discovered_instances is None:
-      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+      discovered_instances = self._discover_plugin_instances(
+        app_id=app_id,
+        job_id=job_id,
+        owner=owner,
+        target_nodes=target_nodes,
+      )
 
     if len(discovered_instances) == 0:
       if allow_missing:
@@ -3418,11 +3443,32 @@ class _DeeployMixin:
       msg += f"{f'app_id {app_id}' if app_id else f'job_id {job_id}'} and owner '{owner}'."
       raise ValueError(msg)
     #endif
+
+    seen_targets = set()
+    unique_targets = []
+    duplicate_count = 0
     for instance in discovered_instances:
-      self.P(f"Stopping pipeline '{instance[DEEPLOY_PLUGIN_DATA.APP_ID]}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
+      node = instance[DEEPLOY_PLUGIN_DATA.NODE]
+      pipeline_app_id = instance[DEEPLOY_PLUGIN_DATA.APP_ID]
+      target_key = (node, pipeline_app_id)
+      if target_key in seen_targets:
+        duplicate_count += 1
+        continue
+      seen_targets.add(target_key)
+      unique_targets.append(target_key)
+
+    if duplicate_count:
+      self.P(
+        f"Collapsed {duplicate_count} duplicate Deeploy delete target(s) from "
+        f"{len(discovered_instances)} discovered plugin instance(s).",
+        color='y',
+      )
+
+    for node, pipeline_app_id in unique_targets:
+      self.P(f"Stopping pipeline '{pipeline_app_id}' on {node}")
       self.cmdapi_stop_pipeline(
-        node_address=instance[DEEPLOY_PLUGIN_DATA.NODE],
-        name=instance[DEEPLOY_PLUGIN_DATA.APP_ID],
+        node_address=node,
+        name=pipeline_app_id,
       )
     #endfor each target node
     return discovered_instances

@@ -1,6 +1,7 @@
 from extensions.business.cybersec.red_mesh.tests.e2e.run_e2e import archive_passes
 from extensions.business.cybersec.red_mesh.tests.e2e.api_top10_e2e import (
   assert_llm_boundary,
+  gateway_request_headers,
   llm_boundary_blob_from_archive,
   target_config_with_bearer_auth,
   target_confirmation_for_url,
@@ -49,6 +50,36 @@ def test_api_top10_target_config_layers_bearer_auth_without_mutating_fixture():
     "bearer_token_header_name": "Authorization",
     "bearer_scheme": "Bearer",
     "authenticated_probe_path": "/api/v2/me/",
+  }
+  assert "gateway_auth" not in configured["api_security"]
+
+
+def test_api_top10_target_config_layers_gateway_auth_when_key_is_configured():
+  fixture = {
+    "api_security": {
+      "object_endpoints": [{"path": "/api/users/{id}/"}],
+    },
+  }
+
+  configured = target_config_with_bearer_auth(
+    fixture,
+    gateway_header="X-Gateway-Key",
+    gateway_api_key="secret-not-persisted-in-config",
+  )
+
+  assert fixture["api_security"].get("gateway_auth") is None
+  assert configured["api_security"]["gateway_auth"] == {
+    "auth_type": "api_key",
+    "api_key_location": "header",
+    "api_key_header_name": "X-Gateway-Key",
+  }
+  assert "secret-not-persisted-in-config" not in str(configured)
+
+
+def test_api_top10_gateway_request_headers_only_adds_secret_when_present():
+  assert gateway_request_headers("X-Gateway-Key", "") == {}
+  assert gateway_request_headers("X-Gateway-Key", "gateway-secret") == {
+    "X-Gateway-Key": "gateway-secret",
   }
 
 
