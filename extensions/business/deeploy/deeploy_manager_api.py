@@ -1425,8 +1425,14 @@ class DeeployManagerApiPlugin(
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       app_id = inputs.get(DEEPLOY_KEYS.APP_ID, None)
+      target_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None)
 
-      discovered_instances = self.delete_pipeline_from_nodes(app_id=app_id, job_id=job_id, owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER])
+      discovered_instances = self.delete_pipeline_from_nodes(
+        app_id=app_id,
+        job_id=job_id,
+        owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+        target_nodes=target_nodes,
+      )
       request_payload = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
         DEEPLOY_KEYS.TARGETS: discovered_instances,
