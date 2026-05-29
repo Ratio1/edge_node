@@ -95,6 +95,7 @@ def _make_plugin(port: int):
   plugin.cfg_deepseek_api_url = "https://should-not-be-called.invalid/chat/completions"
   plugin.cfg_deepseek_api_key = None
   plugin.cfg_deepseek_api_key_env = "DEEPSEEK_API_KEY"
+  plugin.cfg_remote_llm_model = "deepseek-chat"
   plugin.cfg_deepseek_model = "deepseek-chat"
   plugin.cfg_default_temperature = 0.7
   plugin.cfg_default_max_tokens = 1024

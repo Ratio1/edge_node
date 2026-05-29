@@ -36,10 +36,8 @@ def _make_plugin(**overrides):
   plugin.cfg_deepseek_api_url = overrides.get("deepseek_api_url", "https://api.deepseek.com/chat/completions")
   plugin.cfg_deepseek_api_key = overrides.get("deepseek_api_key")
   plugin.cfg_deepseek_api_key_env = overrides.get("deepseek_api_key_env", "DEEPSEEK_API_KEY")
-  plugin.cfg_deepseek_model = overrides.get(
-    "deepseek_model",
-    RedMeshLlmAgentApiPlugin.CONFIG["DEEPSEEK_MODEL"],
-  )
+  plugin.cfg_remote_llm_model = overrides.get("remote_llm_model", RedMeshLlmAgentApiPlugin.CONFIG["REMOTE_LLM_MODEL"])
+  plugin.cfg_deepseek_model = overrides.get("deepseek_model", RedMeshLlmAgentApiPlugin.CONFIG["DEEPSEEK_MODEL"])
   plugin.cfg_default_temperature = overrides.get("default_temperature", 0.7)
   plugin.cfg_default_max_tokens = overrides.get("default_max_tokens", 1024)
   plugin.cfg_default_top_p = overrides.get("default_top_p", 1.0)
@@ -288,6 +286,46 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
     self.assertEqual(mocked_post.call_args.args[0], "https://api.deepseek.com/chat/completions")
     self.assertEqual(mocked_post.call_args.kwargs["headers"]["Authorization"], "Bearer deepseek-secret")
     self.assertEqual(mocked_post.call_args.kwargs["json"]["model"], "deepseek-chat")
+
+  def test_deepseek_provider_uses_generic_remote_model_name(self):
+    plugin = _make_plugin(
+      llm_provider="deepseek",
+      api_key="deepseek-secret",
+      remote_llm_model="deepseek-reasoner",
+      deepseek_model="legacy-deepseek-chat",
+    )
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_llm_agent_api.requests.post",
+      return_value=_Response(payload={
+        "model": "deepseek-reasoner",
+        "choices": [{"message": {"content": "remote response"}}],
+      }),
+    ) as mocked_post:
+      result = plugin.chat(messages=[{"role": "user", "content": "hello"}])
+
+    self.assertEqual(result["provider"], "deepseek")
+    self.assertEqual(mocked_post.call_args.kwargs["json"]["model"], "deepseek-reasoner")
+    self.assertEqual(plugin.status()["config"]["model"], "deepseek-reasoner")
+
+  def test_deepseek_model_is_legacy_alias_when_remote_model_missing(self):
+    plugin = _make_plugin(
+      llm_provider="deepseek",
+      api_key="deepseek-secret",
+      remote_llm_model="",
+      deepseek_model="legacy-deepseek-chat",
+    )
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_llm_agent_api.requests.post",
+      return_value=_Response(payload={
+        "model": "legacy-deepseek-chat",
+        "choices": [{"message": {"content": "remote response"}}],
+      }),
+    ) as mocked_post:
+      plugin.chat(messages=[{"role": "user", "content": "hello"}])
+
+    self.assertEqual(mocked_post.call_args.kwargs["json"]["model"], "legacy-deepseek-chat")
 
   def test_health_reports_local_config_error_without_token_or_prompt_leak(self):
     plugin = _make_plugin(local_llm_api_port=None, local_api_token="secret-token")

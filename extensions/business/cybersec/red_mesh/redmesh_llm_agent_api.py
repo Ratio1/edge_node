@@ -91,11 +91,13 @@ _CONFIG = {
   "LOCAL_LLM_MAX_TOKENS": 4096,
   "LOCAL_LLM_MAX_FINDINGS": 24,
 
-  # DeepSeek configuration
+  # Remote provider configuration. DeepSeek is currently the implemented
+  # remote provider, but the model name is intentionally provider-neutral.
   "DEEPSEEK_API_URL": "https://api.deepseek.com/chat/completions",
   "DEEPSEEK_API_KEY": None,  # API key (can be provided directly via config)
   "DEEPSEEK_API_KEY_ENV": "DEEPSEEK_API_KEY",  # Fallback: env var name if key not in config
-  "DEEPSEEK_MODEL": "deepseek-chat",
+  "REMOTE_LLM_MODEL": "deepseek-chat",
+  "DEEPSEEK_MODEL": None,  # Legacy alias; prefer REMOTE_LLM_MODEL.
 
   # Request defaults
   "DEFAULT_TEMPERATURE": 0.7,
@@ -306,7 +308,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     elif self._provider == "local":
       self.P(f"RedMesh LLM Agent API initialized. Provider: local, model: {self.cfg_local_llm_model}")
     else:
-      self.P(f"RedMesh LLM Agent API initialized. Provider: deepseek, model: {self.cfg_deepseek_model}")
+      self.P(f"RedMesh LLM Agent API initialized. Provider: deepseek, model: {self._remote_model()}")
     return
 
   def _setup_semaphore_env(self):
@@ -422,6 +424,13 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       provider = self._normalize_provider(self.cfg_llm_provider)
       self._provider = provider
     return provider
+
+  def _remote_model(self) -> str:
+    """Return the remote model, preserving DEEPSEEK_MODEL as a legacy alias."""
+    model = getattr(self, "cfg_remote_llm_model", None)
+    if not model:
+      model = getattr(self, "cfg_deepseek_model", None)
+    return str(model or "deepseek-chat").strip() or "deepseek-chat"
 
   def _local_llm_url(self, path: Optional[str] = None) -> Optional[str]:
     explicit_url = self.cfg_local_llm_api_url
@@ -627,7 +636,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       DeepSeek API request payload.
     """
     payload = {
-      "model": model or self.cfg_deepseek_model,
+      "model": model or self._remote_model(),
       "messages": messages,
       "temperature": temperature if temperature is not None else self.cfg_default_temperature,
       "max_tokens": max_tokens if max_tokens is not None else self.cfg_default_max_tokens,
@@ -876,7 +885,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     if provider == "deepseek":
       return self._normalize_chat_response(
         self._call_deepseek_api(payload),
-        fallback_model=self.cfg_deepseek_model,
+        fallback_model=self._remote_model(),
       )
     return self._call_local_llm_api(payload)
 
@@ -935,7 +944,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       return {
         **base,
         "api_key_configured": self._api_key is not None,
-        "model": self.cfg_deepseek_model,
+        "model": self._remote_model(),
         "api_url": self._redact_url(self.cfg_deepseek_api_url),
       }
 
@@ -1001,7 +1010,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       },
       "config": {
         "provider": self._selected_provider(),
-        "model": self.cfg_local_llm_model if self._selected_provider() == "local" else self.cfg_deepseek_model,
+        "model": self.cfg_local_llm_model if self._selected_provider() == "local" else self._remote_model(),
         "default_temperature": self.cfg_default_temperature,
         "default_max_tokens": self.cfg_default_max_tokens,
         "timeout_seconds": self.cfg_request_timeout_seconds,
