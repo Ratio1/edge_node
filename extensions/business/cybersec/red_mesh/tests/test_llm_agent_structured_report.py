@@ -150,6 +150,10 @@ class StructuredReportAdapterTests(unittest.TestCase):
     # The /chat payload carries the OpenAI message shape.
     self.assertIn("messages", owner._calls[0]["payload"])
     self.assertGreater(len(owner._calls[0]["payload"]["messages"]), 0)
+    self.assertEqual(
+      owner._calls[0]["payload"]["response_format"]["type"],
+      "json_schema",
+    )
 
   def test_persists_fallback_skeleton_on_validation_failure(self):
     # LLM returns parseable but content-empty JSON twice — corrective

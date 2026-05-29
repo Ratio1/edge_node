@@ -32,6 +32,8 @@ DEFAULT_LLM_AGENT_CONFIG = {
   "TIMEOUT": 120.0,
   "AUTO_ANALYSIS_TYPE": "security_assessment",
   "MODEL": "CyberSecQwen-4B.Q4_K_M.gguf",
+  "STRUCTURED_MAX_FINDINGS": 1,
+  "STRUCTURED_MAX_TOKENS": 1024,
 }
 
 DEFAULT_ATTESTATION_CONFIG = {
@@ -214,11 +216,29 @@ def get_llm_agent_config(owner):
       model_value = merged.get("LOCAL_LLM_MODEL")
     model = str(model_value or defaults["MODEL"]).strip() or defaults["MODEL"]
 
+    try:
+      structured_max_findings = int(
+        merged.get("STRUCTURED_MAX_FINDINGS", defaults["STRUCTURED_MAX_FINDINGS"])
+      )
+    except (TypeError, ValueError):
+      structured_max_findings = defaults["STRUCTURED_MAX_FINDINGS"]
+    structured_max_findings = max(1, min(structured_max_findings, 24))
+
+    try:
+      structured_max_tokens = int(
+        merged.get("STRUCTURED_MAX_TOKENS", defaults["STRUCTURED_MAX_TOKENS"])
+      )
+    except (TypeError, ValueError):
+      structured_max_tokens = defaults["STRUCTURED_MAX_TOKENS"]
+    structured_max_tokens = max(64, min(structured_max_tokens, 2048))
+
     return {
       "ENABLED": enabled,
       "TIMEOUT": timeout,
       "AUTO_ANALYSIS_TYPE": analysis_type,
       "MODEL": model,
+      "STRUCTURED_MAX_FINDINGS": structured_max_findings,
+      "STRUCTURED_MAX_TOKENS": structured_max_tokens,
     }
 
   return resolve_config_block(

@@ -277,6 +277,35 @@ class TestTrustBoundary(unittest.TestCase):
     # Operator-trusted client_name IS forwarded
     self.assertIn("ACME", sent_text)
 
+  def test_low_context_prompt_caps_and_compacts_findings(self):
+    findings = []
+    for idx in range(20):
+      findings.append({
+        "severity": "HIGH",
+        "title": f"Finding {idx} " + ("title " * 80),
+        "description": "description " * 200,
+        "impact": "impact " * 200,
+        "remediation": "remediation " * 200,
+        "evidence": [{"snippet": "target-controlled raw response " * 100}],
+        "cve": [f"CVE-2026-{idx:04d}", "CVE-extra-1", "CVE-extra-2", "CVE-extra-3"],
+      })
+    llm = _MockLlm([json.dumps(_make_valid_response_dict())])
+    generate_exec_summary(
+      llm_call=llm,
+      findings=findings,
+      aggregated_report={"scenario_stats": {"total": 20, "vulnerable": 20}},
+      model_name="CyberSecQwen-4B.Q4_K_M.gguf",
+      max_findings=3,
+      max_tokens=256,
+    )
+
+    user_content = llm.calls[0][1]["content"]
+    self.assertIn('"included_findings":3', user_content)
+    self.assertIn('"truncated_findings":17', user_content)
+    self.assertNotIn("target-controlled raw response", user_content)
+    self.assertNotIn('"evidence"', user_content)
+    self.assertLess(len(user_content), 5000)
+
 
 # ---------------------------------------------------------------------
 # Provenance

@@ -16,7 +16,10 @@ from typing import Optional
 from ..constants import RUN_MODE_SINGLEPASS
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
-from ..services.llm_structured import generate_exec_summary
+from ..services.llm_structured import (
+  LLM_REPORT_SECTIONS_JSON_SCHEMA,
+  generate_exec_summary,
+)
 
 _NON_RETRYABLE_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 413, 422}
 _NON_RETRYABLE_PROVIDER_STATUSES = _NON_RETRYABLE_HTTP_STATUSES
@@ -1040,6 +1043,21 @@ class _RedMeshLlmAgentMixin(object):
       self.P(f"Error calling LLM Agent API: {e}", color='r')
       return {"error": str(e), "status": "error"}
 
+    if result is None:
+      self.P("LLM Agent API call exhausted retries without a response", color='y')
+      return {
+        "error": "LLM Agent API call exhausted retries without a response",
+        "status": "retry_exhausted",
+        "retryable": True,
+      }
+    if not isinstance(result, dict):
+      self.P("LLM Agent API returned an invalid response", color='y')
+      return {
+        "error": "LLM Agent API returned an invalid response",
+        "status": "invalid_response",
+        "retryable": True,
+      }
+
     if isinstance(result, dict) and "error" in result:
       status = result.get("status")
       if status == "connection_error":
@@ -1249,6 +1267,10 @@ class _RedMeshLlmAgentMixin(object):
           "messages": messages,
           "max_tokens": max_tokens,
           "temperature": temperature,
+          "response_format": {
+            "type": "json_schema",
+            "schema": LLM_REPORT_SECTIONS_JSON_SCHEMA,
+          },
         },
       )
       if not isinstance(response, dict) or "error" in response:
@@ -1267,6 +1289,8 @@ class _RedMeshLlmAgentMixin(object):
         aggregated_report=aggregated_report,
         engagement=engagement,
         model_name=llm_cfg.get("MODEL", "CyberSecQwen-4B.Q4_K_M.gguf"),
+        max_findings=llm_cfg.get("STRUCTURED_MAX_FINDINGS", 1),
+        max_tokens=llm_cfg.get("STRUCTURED_MAX_TOKENS", 1024),
       )
     except Exception as exc:
       self.P(
@@ -1431,7 +1455,7 @@ class _RedMeshLlmAgentMixin(object):
 
     result = self._call_llm_agent_api(endpoint="/health", method="GET", timeout=5)
 
-    if "error" in result:
+    if isinstance(result, dict) and "error" in result:
       return {
         "enabled": True,
         "status": result.get("status", "error"),

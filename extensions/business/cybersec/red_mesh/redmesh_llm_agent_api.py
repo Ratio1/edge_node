@@ -55,6 +55,7 @@ from .constants import (
   LLM_ANALYSIS_REMEDIATION_PLAN,
   LLM_ANALYSIS_QUICK_SUMMARY,
 )
+from .llm_input_builder import MAX_FINDINGS_INCLUDED, build_llm_input
 
 __VER__ = '0.1.0'
 
@@ -88,6 +89,7 @@ _CONFIG = {
   "LOCAL_LLM_API_TOKEN_ENV": "LLM_API_TOKEN",
   "LOCAL_LLM_MODEL": "CyberSecQwen-4B.Q4_K_M.gguf",
   "LOCAL_LLM_MAX_TOKENS": 4096,
+  "LOCAL_LLM_MAX_FINDINGS": 24,
 
   # DeepSeek configuration
   "DEEPSEEK_API_URL": "https://api.deepseek.com/chat/completions",
@@ -477,6 +479,111 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       upper = 4096
     return max(16, min(requested, upper))
 
+  def _local_max_findings(self) -> int:
+    try:
+      configured = int(getattr(self, "cfg_local_llm_max_findings", 24) or 24)
+    except (TypeError, ValueError):
+      configured = 24
+    return max(1, min(configured, MAX_FINDINGS_INCLUDED))
+
+  def _normalize_finding_for_llm(self, finding: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(finding, dict):
+      return {}
+
+    cwe_values = finding.get("cwe") or []
+    cwe_ids = []
+    cwe_label = finding.get("cwe_id") or ""
+    if isinstance(cwe_values, (list, tuple)):
+      for item in cwe_values:
+        if isinstance(item, int):
+          cwe_ids.append(item)
+        elif isinstance(item, str):
+          if not cwe_label:
+            cwe_label = item
+          digits = "".join(ch for ch in item if ch.isdigit())
+          if digits:
+            try:
+              cwe_ids.append(int(digits))
+            except ValueError:
+              pass
+
+    owasp_value = finding.get("owasp_top10") or finding.get("owasp")
+    if isinstance(owasp_value, str):
+      owasp_top10 = [owasp_value]
+    elif isinstance(owasp_value, (list, tuple)):
+      owasp_top10 = [str(item) for item in owasp_value if item is not None]
+    else:
+      owasp_top10 = []
+
+    normalized = {
+      "finding_signature": finding.get("finding_signature") or finding.get("scenario_id") or "",
+      "severity": finding.get("severity", ""),
+      "title": finding.get("title", ""),
+      "description": finding.get("description") or finding.get("status") or "",
+      "impact": finding.get("impact", ""),
+      "confidence": finding.get("confidence", ""),
+      "owasp_id": finding.get("owasp_id") or (owasp_top10[0] if owasp_top10 else ""),
+      "owasp_top10": owasp_top10,
+      "cwe_id": cwe_label,
+      "cwe": cwe_ids,
+      "cvss_vector": finding.get("cvss_vector", ""),
+      "cvss_score": finding.get("cvss_score"),
+      "kev": finding.get("kev", False),
+      "epss_score": finding.get("epss_score"),
+      "cve": finding.get("cve") or [],
+      "references": finding.get("references") or [],
+      "tags": finding.get("tags") or [],
+      "affected_assets": finding.get("affected_assets") or [],
+      "remediation": finding.get("remediation", ""),
+    }
+    return normalized
+
+  def _collect_findings_for_llm(self, scan_results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    findings = []
+    seen = set()
+
+    def add_finding(item):
+      if not isinstance(item, dict):
+        return
+      key = (
+        item.get("finding_signature"),
+        item.get("scenario_id"),
+        item.get("title"),
+        item.get("severity"),
+        item.get("status"),
+      )
+      if key in seen:
+        return
+      seen.add(key)
+      findings.append(self._normalize_finding_for_llm(item))
+
+    def visit(value, depth=0):
+      if depth > 10:
+        return
+      if isinstance(value, dict):
+        for findings_key in ("findings", "top_findings"):
+          nested_findings = value.get(findings_key)
+          if isinstance(nested_findings, list):
+            for item in nested_findings:
+              add_finding(item)
+        for child in value.values():
+          visit(child, depth + 1)
+      elif isinstance(value, list):
+        for child in value:
+          visit(child, depth + 1)
+
+    visit(scan_results)
+    return findings
+
+  def _build_llm_scan_context(self, scan_results: Dict[str, Any], provider: str) -> Dict[str, Any]:
+    max_findings = self._local_max_findings() if provider == "local" else MAX_FINDINGS_INCLUDED
+    llm_input = build_llm_input(
+      findings=self._collect_findings_for_llm(scan_results),
+      aggregated_report=scan_results,
+      max_findings=max_findings,
+    )
+    return llm_input.to_dict()
+
   def P(self, s, *args, **kwargs):
     """Prefixed logger for RedMesh LLM messages."""
     s = "[REDMESH_LLM] " + str(s)
@@ -496,6 +603,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       temperature: Optional[float] = None,
       max_tokens: Optional[int] = None,
       top_p: Optional[float] = None,
+      response_format: Optional[Dict[str, Any]] = None,
   ) -> Dict:
     """
     Build the payload for DeepSeek API.
@@ -518,7 +626,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     dict
       DeepSeek API request payload.
     """
-    return {
+    payload = {
       "model": model or self.cfg_deepseek_model,
       "messages": messages,
       "temperature": temperature if temperature is not None else self.cfg_default_temperature,
@@ -526,6 +634,9 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       "top_p": top_p if top_p is not None else self.cfg_default_top_p,
       "stream": False,
     }
+    if response_format is not None:
+      payload["response_format"] = response_format
+    return payload
 
   def _build_local_request(
       self,
@@ -534,9 +645,10 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       temperature: Optional[float] = None,
       max_tokens: Optional[int] = None,
       top_p: Optional[float] = None,
+      response_format: Optional[Dict[str, Any]] = None,
   ) -> Dict:
     """Build the payload expected by LLM_INFERENCE_API."""
-    return {
+    payload = {
       "messages": messages,
       "temperature": temperature if temperature is not None else self.cfg_default_temperature,
       "max_tokens": self._bounded_local_max_tokens(max_tokens),
@@ -546,6 +658,9 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         "requested_model": model or self.cfg_local_llm_model,
       },
     }
+    if response_format is not None:
+      payload["response_format"] = response_format
+    return payload
 
   def _extract_assistant_content(self, response: Dict) -> Optional[str]:
     """Extract assistant text from OpenAI-like or LLM_INFERENCE_API result shapes."""
@@ -901,6 +1016,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       temperature: Optional[float] = None,
       max_tokens: Optional[int] = None,
       top_p: Optional[float] = None,
+      response_format: Optional[Dict[str, Any]] = None,
       **kwargs
   ) -> Dict:
     """
@@ -918,6 +1034,8 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       Max tokens to generate (default: 1024)
     top_p : float, optional
       Nucleus sampling (default: 1.0)
+    response_format : dict, optional
+      Provider-native response-format hint, e.g. {"type": "json_object"}.
 
     Returns
     -------
@@ -940,6 +1058,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
+        response_format=response_format,
       )
     else:
       payload = self._build_local_request(
@@ -948,6 +1067,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         temperature=temperature,
         max_tokens=max_tokens,
         top_p=top_p,
+        response_format=response_format,
       )
 
     self.Pd(f"Chat request: {len(messages)} messages, provider={provider}")
@@ -1023,9 +1143,14 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       focus_str = ", ".join(focus_areas)
       system_prompt += f"\n\nFocus your analysis on these areas: {focus_str}"
 
-    # Format scan results for LLM
+    provider = self._selected_provider()
+
+    # Format scan results for LLM through the RedMesh trust boundary. This
+    # keeps raw target-controlled blobs out of the prompt and keeps local GGUF
+    # prompts inside the CPU context budget.
     try:
-      scan_json = json.dumps(scan_results, indent=2, default=str)
+      llm_context = self._build_llm_scan_context(scan_results=scan_results, provider=provider)
+      scan_json = json.dumps(llm_context, indent=2, default=str)
     except Exception as e:
       return {
         "error": f"Failed to serialize scan_results: {e}",
@@ -1047,7 +1172,6 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     else:
       effective_max_tokens = 2048
 
-    provider = self._selected_provider()
     if provider == "deepseek":
       payload = self._build_deepseek_request(
         messages=messages,

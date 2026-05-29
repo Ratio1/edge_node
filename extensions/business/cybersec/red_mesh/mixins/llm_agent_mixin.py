@@ -706,6 +706,21 @@ class _RedMeshLlmAgentMixin(object):
       self.P(f"Error calling LLM Agent API: {e}", color='r')
       return {"error": str(e), "status": "error"}
 
+    if result is None:
+      self.P("LLM Agent API call exhausted retries without a response", color='y')
+      return {
+        "error": "LLM Agent API call exhausted retries without a response",
+        "status": "retry_exhausted",
+        "retryable": True,
+      }
+    if not isinstance(result, dict):
+      self.P("LLM Agent API returned an invalid response", color='y')
+      return {
+        "error": "LLM Agent API returned an invalid response",
+        "status": "invalid_response",
+        "retryable": True,
+      }
+
     if isinstance(result, dict) and "error" in result:
       status = result.get("status")
       if status == "connection_error":
@@ -967,7 +982,7 @@ class _RedMeshLlmAgentMixin(object):
 
     result = self._call_llm_agent_api(endpoint="/health", method="GET", timeout=5)
 
-    if "error" in result:
+    if isinstance(result, dict) and "error" in result:
       return {
         "enabled": True,
         "status": result.get("status", "error"),
