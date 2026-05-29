@@ -24,7 +24,7 @@ def _load_deeploy_chainstore_response_mixin():
   to these focused tests.
   """
   checked_paths = []
-  for module_path in _iter_chainstore_response_mixin_paths():
+  for module_path in _iter_deeploy_chainstore_response_mixin_paths():
     if module_path in checked_paths:
       continue
     checked_paths.append(module_path)
@@ -46,7 +46,7 @@ def _load_deeploy_chainstore_response_mixin():
   )
 
 
-def _iter_chainstore_response_mixin_paths():
+def _iter_deeploy_chainstore_response_mixin_paths():
   """
   Yield likely source paths for the installed, nested, or sibling naeural_core.
   """
@@ -56,7 +56,7 @@ def _iter_chainstore_response_mixin_paths():
       Path(constants_file).resolve().parent
       / "business"
       / "mixins_base"
-      / "chainstore_response_mixin.py"
+      / "deeploy_chainstore_response_mixin.py"
     )
 
   edge_root = Path(__file__).resolve().parents[4]
@@ -66,7 +66,7 @@ def _iter_chainstore_response_mixin_paths():
     / "naeural_core"
     / "business"
     / "mixins_base"
-    / "chainstore_response_mixin.py"
+    / "deeploy_chainstore_response_mixin.py"
   )
   yield (
     edge_root.parent
@@ -74,7 +74,7 @@ def _iter_chainstore_response_mixin_paths():
     / "naeural_core"
     / "business"
     / "mixins_base"
-    / "chainstore_response_mixin.py"
+    / "deeploy_chainstore_response_mixin.py"
   )
 
   for entry in sys.path:
@@ -85,7 +85,7 @@ def _iter_chainstore_response_mixin_paths():
       / "naeural_core"
       / "business"
       / "mixins_base"
-      / "chainstore_response_mixin.py"
+      / "deeploy_chainstore_response_mixin.py"
     )
 
 
