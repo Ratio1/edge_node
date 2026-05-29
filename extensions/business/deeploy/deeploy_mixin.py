@@ -1,5 +1,4 @@
 import json
-import random
 import re
 from datetime import datetime, timezone
 from math import isfinite
@@ -1539,75 +1538,6 @@ class _DeeployMixin:
 
     return merged
 
-  def _get_chainstore_response_reset_seed_nodes(self):
-    """
-    Return the configured seed oracle addresses for the current EVM network.
-    """
-    try:
-      seed_nodes = ct.CURRENT_EVM_NET_CONSTANTS.get(
-        BASE_CT.EvmNetConstants.SEED_NODES_ADDRESSES_KEY,
-        []
-      )
-    except Exception as exc:
-      self.P(f"Unable to read seed oracle addresses for chainstore response reset: {exc}", color='y')
-      return []
-
-    if not isinstance(seed_nodes, (list, tuple, set)):
-      self.P(
-        f"Seed oracle addresses for chainstore response reset must be a list, got {type(seed_nodes)}",
-        color='y'
-      )
-      return []
-
-    return list(seed_nodes)
-
-  def _select_chainstore_response_reset_seed_peer(self, seed_peers):
-    """
-    Select one seed oracle for chainstore response reset propagation.
-    """
-    if len(seed_peers) == 0:
-      return None
-    return random.choice(seed_peers)
-
-  def _get_chainstore_response_reset_peers(self):
-    """
-    Build explicit oracle peers for pre-dispatch chainstore response resets.
-
-    The local write clears the initiating Deeploy oracle. The explicit peer
-    list adds one seed oracle and intentionally excludes app chainstore peers,
-    configured chainstore peers, and backend default peers.
-    """
-    seed_nodes = [
-      peer
-      for peer in self._get_chainstore_response_reset_seed_nodes()
-      if isinstance(peer, str) and len(peer) > 0
-    ]
-    if len(seed_nodes) == 0:
-      self.P(
-        "No seed oracle addresses configured for chainstore response reset routing",
-        color='y'
-      )
-      return []
-
-    current_addr = getattr(self, 'ee_addr', None)
-    candidate_seed_nodes = [peer for peer in seed_nodes if peer != current_addr]
-    if len(candidate_seed_nodes) == 0:
-      candidate_seed_nodes = seed_nodes
-
-    seed_peer = self._select_chainstore_response_reset_seed_peer(candidate_seed_nodes)
-    return [seed_peer] if seed_peer else []
-
-  def _get_chainstore_response_reset_kwargs(self):
-    """
-    Return restricted ChainStore kwargs for pre-dispatch response-key resets.
-    """
-    return {
-      'extra_peers': self._get_chainstore_response_reset_peers(),
-      'include_default_peers': False,
-      'include_configured_peers': False,
-      'debug': True,
-    }
-
   def _reset_chainstore_response_keys(self, response_keys, context: str = "pipeline commands"):
     """
     Clear chainstore response keys before dispatch so early confirmations are not lost.
@@ -1617,14 +1547,10 @@ class _DeeployMixin:
       return normalized_keys
 
     self.P(f"Resetting response keys in chainstore before dispatching {context}...")
-    reset_kwargs = self._get_chainstore_response_reset_kwargs()
+    reset_kwargs = self._get_chainstore_response_local_reset_write_kwargs()
     for _, node_response_keys in normalized_keys.items():
       for response_key in node_response_keys:
-        try:
-          self.chainstore_set(response_key, None, **reset_kwargs)
-        except Exception as e:
-          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
-        # end try
+        self._reset_chainstore_response_key(response_key, write_kwargs=reset_kwargs)
       # end for
     # end for
 

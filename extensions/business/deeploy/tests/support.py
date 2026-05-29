@@ -1,4 +1,6 @@
 import copy
+import importlib.util
+from pathlib import Path
 import sys
 import types
 from types import SimpleNamespace
@@ -13,6 +15,34 @@ from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 
 
+def _load_deeploy_chainstore_response_mixin():
+  """
+  Load only the chainstore-response mixin module for lightweight Deeploy tests.
+
+  Importing `naeural_core.business.mixins_base` executes package-level imports
+  that require optional runtime dependencies such as cv2, which are unrelated
+  to these focused tests.
+  """
+  module_path = (
+    Path(__file__).resolve().parents[4]
+    / "naeural_core"
+    / "naeural_core"
+    / "business"
+    / "mixins_base"
+    / "chainstore_response_mixin.py"
+  )
+  spec = importlib.util.spec_from_file_location(
+    "deeploy_chainstore_response_mixin_for_tests",
+    module_path,
+  )
+  module = importlib.util.module_from_spec(spec)
+  spec.loader.exec_module(module)
+  return module._DeeployChainstoreResponseMixin
+
+
+_DeeployChainstoreResponseMixin = _load_deeploy_chainstore_response_mixin()
+
+
 class InputsStub(dict):
   def __getattr__(self, item):
     try:
@@ -21,7 +51,7 @@ class InputsStub(dict):
       raise AttributeError(item) from exc
 
 
-class _TestDeeployPlugin(_DeeployMixin):
+class _TestDeeployPlugin(_DeeployMixin, _DeeployChainstoreResponseMixin):
   pass
 
 

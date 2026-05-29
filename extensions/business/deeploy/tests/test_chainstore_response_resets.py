@@ -11,7 +11,7 @@ class DeeployChainstoreResponseResetTests(unittest.TestCase):
     plugin.seed_nodes = seed_nodes or ["seed-oracle-1", "seed-oracle-2"]
     plugin.selected_seed = selected_seed or plugin.seed_nodes[0]
     plugin.chainstore_calls = []
-    plugin._get_chainstore_response_reset_seed_nodes = lambda: plugin.seed_nodes
+    plugin._get_chainstore_response_seed_nodes = lambda: plugin.seed_nodes
 
     def select_seed(seed_peers):
       plugin.seed_selection_input = list(seed_peers)
@@ -23,7 +23,7 @@ class DeeployChainstoreResponseResetTests(unittest.TestCase):
       plugin.chainstore_calls.append((args, kwargs))
       return True
 
-    plugin._select_chainstore_response_reset_seed_peer = select_seed
+    plugin._select_chainstore_response_seed_peer = select_seed
     plugin.chainstore_set = chainstore_set
     return plugin
 
@@ -51,7 +51,7 @@ class DeeployChainstoreResponseResetTests(unittest.TestCase):
       selected_seed="seed-oracle-2",
     )
 
-    peers = plugin._get_chainstore_response_reset_peers()
+    peers = plugin._get_chainstore_response_local_reset_peers()
 
     self.assertEqual(peers, ["seed-oracle-2"])
     self.assertEqual(plugin.seed_selection_input, ["seed-oracle-2"])
