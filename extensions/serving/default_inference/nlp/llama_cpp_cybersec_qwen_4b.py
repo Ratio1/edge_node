@@ -33,4 +33,3 @@ _CONFIG = {
 
 class LlamaCppCybersecQwen4B(BaseServingProcess):
   CONFIG = _CONFIG
-
