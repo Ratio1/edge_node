@@ -33,6 +33,8 @@ x-edge-node: &edge-node
     dockerfile: Dockerfile_devnet
   privileged: true
   restart: "no"
+  # Keep the node runtime real while skipping device.py's optional
+  # llama-cpp-python bootstrap, which is unrelated to config command handling.
   command: ["python3", "/edge_node/docker-compose/deeploy-testbed/device_no_extra_packages.py"]
   depends_on:
     deeploy_test_mqtt:
@@ -45,6 +47,8 @@ x-edge-node: &edge-node
 
 services:
   deeploy_test_mqtt:
+    # Mosquitto is intentionally used as a minimal private MQTT broker for this
+    # Deeploy command-path test. This is not an EMQX parity or backpressure test.
     image: eclipse-mosquitto:2
     container_name: deeploy_test_mqtt
     restart: "no"

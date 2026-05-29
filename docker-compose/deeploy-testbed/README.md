@@ -20,7 +20,15 @@ under the normal root plugin search paths.
 
 The compose stack intentionally overrides the node command with
 `device_no_extra_packages.py` so this minimal config-command workflow does not
-spend startup time building optional serving packages.
+spend startup time building optional serving packages. The containers still use
+`Dockerfile_devnet` and still run `naeural_core.main.entrypoint.main()`, so
+comms, config handling, plugin loading, stream create/delete, and command
+processing are exercised by real local nodes.
+
+Mosquitto is used here as the smallest private MQTT broker needed to validate
+the Deeploy command path. This testbed does not claim EMQX parity and does not
+cover EMQX auth, ACL, retained/session behavior, or production backpressure
+tuning.
 
 `EE_DAUTH_URL` is set to `N/A` in compose to avoid contacting live dAuth/Cap
 services during local validation.
