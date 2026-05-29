@@ -41,12 +41,10 @@ Example pipeline configuration:
       "INSTANCES": [
         {
           "INSTANCE_ID": "llm_interface",
-          "AI_ENGINE": "llama_cpp",
+          "AI_ENGINE": "cybersec_qwen_4b",
           "PORT": <chosen_api_port>,
           "STARTUP_AI_ENGINE_PARAMS": {
             "HF_TOKEN": "<hf_token_if_needed>",
-            "MODEL_FILENAME": "llama-3.2-1b-instruct-q4_k_m.gguf",
-            "MODEL_NAME": "hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF",
             "SERVER_COLLECTOR_TIMEDELTA": 360000
           }
         }
