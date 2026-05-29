@@ -80,6 +80,9 @@ class JobConfig:
   has_regular_bearer_token: bool = False
   has_regular_api_key: bool = False
   has_regular_bearer_refresh_token: bool = False
+  has_gateway_api_key: bool = False
+  has_gateway_bearer_token: bool = False
+  has_gateway_bearer_refresh_token: bool = False
   secret_store_key_id: str = ""
   secret_store_key_version: str = ""
   secret_store_key_source: str = ""
@@ -94,6 +97,9 @@ class JobConfig:
   regular_bearer_token: str = ""      # blanked before persistence; runtime-only
   regular_api_key: str = ""           # blanked before persistence; runtime-only
   regular_bearer_refresh_token: str = ""  # blanked before persistence; runtime-only
+  gateway_api_key: str = ""           # blanked before persistence; runtime-only
+  gateway_bearer_token: str = ""      # blanked before persistence; runtime-only
+  gateway_bearer_refresh_token: str = ""  # blanked before persistence; runtime-only
   weak_candidates: list = None        # legacy inline payload; new launches use secret_ref
   max_weak_attempts: int = 5
   app_routes: list = None             # user-supplied known routes
@@ -154,6 +160,9 @@ class JobConfig:
       has_regular_bearer_token=d.get("has_regular_bearer_token", False),
       has_regular_api_key=d.get("has_regular_api_key", False),
       has_regular_bearer_refresh_token=d.get("has_regular_bearer_refresh_token", False),
+      has_gateway_api_key=d.get("has_gateway_api_key", False),
+      has_gateway_bearer_token=d.get("has_gateway_bearer_token", False),
+      has_gateway_bearer_refresh_token=d.get("has_gateway_bearer_refresh_token", False),
       secret_store_key_id=d.get("secret_store_key_id", ""),
       secret_store_key_version=d.get("secret_store_key_version", ""),
       secret_store_key_source=d.get("secret_store_key_source", ""),
@@ -168,6 +177,9 @@ class JobConfig:
       regular_bearer_token=d.get("regular_bearer_token", ""),
       regular_api_key=d.get("regular_api_key", ""),
       regular_bearer_refresh_token=d.get("regular_bearer_refresh_token", ""),
+      gateway_api_key=d.get("gateway_api_key", ""),
+      gateway_bearer_token=d.get("gateway_bearer_token", ""),
+      gateway_bearer_refresh_token=d.get("gateway_bearer_refresh_token", ""),
       weak_candidates=d.get("weak_candidates"),
       max_weak_attempts=d.get("max_weak_attempts", 5),
       app_routes=d.get("app_routes"),

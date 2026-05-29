@@ -22,6 +22,16 @@ Usage:
         --honeypot http://localhost:30001 \\
         --scenario vulnerable|hardened|stateful-gated|llm-boundary|all
 
+Layered gateway fixture:
+    python api_top10_e2e.py --rm http://localhost:5082 \\
+        --honeypot http://172.17.0.1:30003 \\
+        --gateway-api-key redmesh-gateway-test-key \\
+        --scenario vulnerable
+
+For Docker-hosted RedMesh workers, use a honeypot URL reachable from the
+worker containers, not the host browser URL. On the default Linux bridge
+setup that is usually ``http://172.17.0.1:30003``.
+
 This harness deliberately uses ``urllib`` rather than ``requests`` so it
 inherits no extra dependency. PyYAML is the only optional dep — falls
 back to a minimal in-tree parser if absent.
@@ -131,11 +141,18 @@ def _scalar(v: str) -> Any:
 
 # ── HTTP helpers ────────────────────────────────────────────────────
 
-def http_post(url: str, payload: dict, timeout: int = 30) -> dict:
+def http_post(
+  url: str,
+  payload: dict,
+  timeout: int = 30,
+  headers: dict[str, str] | None = None,
+) -> dict:
   data = json.dumps(payload).encode()
+  req_headers = {"Content-Type": "application/json"}
+  req_headers.update(headers or {})
   req = request.Request(
     url, data=data, method="POST",
-    headers={"Content-Type": "application/json"},
+    headers=req_headers,
   )
   with request.urlopen(req, timeout=timeout) as resp:
     return json.loads(resp.read().decode())
@@ -160,7 +177,21 @@ def target_confirmation_for_url(target_url: str) -> str:
   return parsed.hostname or target_url
 
 
-def target_config_with_bearer_auth(target_config: dict) -> dict:
+def gateway_request_headers(
+  gateway_header: str = "X-Gateway-Key",
+  gateway_api_key: str = "",
+) -> dict[str, str]:
+  if not gateway_api_key:
+    return {}
+  return {(gateway_header or "X-Gateway-Key"): gateway_api_key}
+
+
+def target_config_with_bearer_auth(
+  target_config: dict,
+  *,
+  gateway_header: str = "X-Gateway-Key",
+  gateway_api_key: str = "",
+) -> dict:
   """Return a launch config that exercises API-native bearer auth.
 
   The honeypot's browser form has CSRF protection, while the API Top 10
@@ -178,14 +209,26 @@ def target_config_with_bearer_auth(target_config: dict) -> dict:
     "authenticated_probe_path": "/api/v2/me/",
   })
   api_security["auth"] = auth
+  if gateway_api_key:
+    api_security["gateway_auth"] = {
+      "auth_type": "api_key",
+      "api_key_location": "header",
+      "api_key_header_name": gateway_header or "X-Gateway-Key",
+    }
   cfg["api_security"] = api_security
   return cfg
 
 
-def mint_bearer_token(honeypot: str) -> str:
+def mint_bearer_token(
+  honeypot: str,
+  *,
+  gateway_header: str = "X-Gateway-Key",
+  gateway_api_key: str = "",
+) -> str:
   result = unwrap_result(http_post(
     f"{honeypot.rstrip('/')}/api/v2/token/",
     {"username": "alice", "password": "secret"},
+    headers=gateway_request_headers(gateway_header, gateway_api_key),
   ))
   token = result.get("token") if isinstance(result, dict) else None
   if not token:
@@ -193,16 +236,30 @@ def mint_bearer_token(honeypot: str) -> str:
   return str(token)
 
 def launch_scan(rm: str, honeypot: str, target_config: dict, *,
-                allow_stateful: bool = True) -> str:
-  official_token = mint_bearer_token(honeypot)
-  regular_token = mint_bearer_token(honeypot)
+                allow_stateful: bool = True,
+                gateway_header: str = "X-Gateway-Key",
+                gateway_api_key: str = "") -> str:
+  official_token = mint_bearer_token(
+    honeypot,
+    gateway_header=gateway_header,
+    gateway_api_key=gateway_api_key,
+  )
+  regular_token = mint_bearer_token(
+    honeypot,
+    gateway_header=gateway_header,
+    gateway_api_key=gateway_api_key,
+  )
   payload = {
     "target_url": honeypot,
     "official_username": "alice",
     "official_password": "",
     "regular_username": "alice",
     "regular_password": "",
-    "target_config": target_config_with_bearer_auth(target_config),
+    "target_config": target_config_with_bearer_auth(
+      target_config,
+      gateway_header=gateway_header,
+      gateway_api_key=gateway_api_key,
+    ),
     "bearer_token": official_token,
     "regular_bearer_token": regular_token,
     "allow_stateful_probes": allow_stateful,
@@ -211,6 +268,8 @@ def launch_scan(rm: str, honeypot: str, target_config: dict, *,
     "target_confirmation": target_confirmation_for_url(honeypot),
     "task_name": "api-top10-e2e",
   }
+  if gateway_api_key:
+    payload["gateway_api_key"] = gateway_api_key
   resp = http_post(f"{rm}/launch_webapp_scan", payload)
   result = unwrap_result(resp)
   job_id = result.get("job_id") or (result.get("job_specs") or {}).get("job_id")
@@ -342,6 +401,16 @@ def main() -> int:
   ap.add_argument("--rm", required=True, help="Edge node base URL")
   ap.add_argument("--honeypot", default="http://localhost:30001")
   ap.add_argument(
+    "--gateway-header",
+    default="X-Gateway-Key",
+    help="Gateway API-key header name for layered-auth fixture runs.",
+  )
+  ap.add_argument(
+    "--gateway-api-key",
+    default="",
+    help="Gateway API-key value. When set, the harness adds gateway_auth.",
+  )
+  ap.add_argument(
     "--scenario", default="all",
     choices=("vulnerable", "hardened", "stateful-gated", "llm-boundary", "all"),
   )
@@ -361,7 +430,9 @@ def main() -> int:
     nonlocal last_archive
     print(f"\n=== {label} ===")
     job_id = launch_scan(args.rm, args.honeypot, target_config,
-                          allow_stateful=allow_stateful)
+                          allow_stateful=allow_stateful,
+                          gateway_header=args.gateway_header,
+                          gateway_api_key=args.gateway_api_key)
     print(f"  job_id={job_id}")
     wait_for_finalize(args.rm, job_id, timeout=args.timeout)
     archive = fetch_archive(args.rm, job_id)
@@ -405,7 +476,9 @@ def main() -> int:
     print("\n  Phase 7.5 — verify archive material used for LLM/report input")
     if last_archive is None:
       job_id = launch_scan(args.rm, args.honeypot, target_config,
-                            allow_stateful=False)
+                            allow_stateful=False,
+                            gateway_header=args.gateway_header,
+                            gateway_api_key=args.gateway_api_key)
       print(f"  job_id={job_id}")
       wait_for_finalize(args.rm, job_id, timeout=args.timeout)
       last_archive = fetch_archive(args.rm, job_id)

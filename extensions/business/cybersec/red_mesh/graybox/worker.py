@@ -135,6 +135,11 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self.target_url,
       allowlist=getattr(job_config, "target_allowlist", None) or [],
       target_config=self.target_config,
+      gateway_api_key=getattr(job_config, "gateway_api_key", "") or "",
+      gateway_bearer_token=getattr(job_config, "gateway_bearer_token", "") or "",
+      gateway_bearer_refresh_token=getattr(
+        job_config, "gateway_bearer_refresh_token", "",
+      ) or "",
     )
 
     # Modules (composition)
@@ -607,14 +612,19 @@ class GrayboxLocalWorker(BaseLocalWorker):
   def _configured_secret_field_names(self):
     api_security = getattr(self.target_config, "api_security", None)
     auth = getattr(api_security, "auth", None) if api_security is not None else None
-    if auth is None:
-      return ()
+    gateway_auth = (
+      getattr(api_security, "gateway_auth", None)
+      if api_security is not None else None
+    )
     names = []
-    for attr in ("api_key_header_name", "api_key_query_param",
-                  "bearer_token_header_name"):
-      value = getattr(auth, attr, None)
-      if isinstance(value, str) and value:
-        names.append(value)
+    for descriptor in (auth, gateway_auth):
+      if descriptor is None:
+        continue
+      for attr in ("api_key_header_name", "api_key_query_param",
+                    "bearer_token_header_name"):
+        value = getattr(descriptor, attr, None)
+        if isinstance(value, str) and value and value not in names:
+          names.append(value)
     return tuple(names)
 
   def _sanitize_error(self, value):
@@ -631,6 +641,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
       "official_success": self.auth.official_session is not None,
       "regular_success": self.auth.regular_session is not None,
       "auth_errors": list(self.auth._auth_errors),
+      "auth_diagnostics": list(getattr(self.auth, "_auth_diagnostics", [])),
       "findings": [],
     }
 

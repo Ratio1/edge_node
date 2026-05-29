@@ -23,6 +23,7 @@ from extensions.business.cybersec.red_mesh.graybox.findings import (
 from extensions.business.cybersec.red_mesh.graybox.models.target_config import (
   ApiSecurityConfig,
   AuthDescriptor,
+  GatewayAuthDescriptor,
   GrayboxTargetConfig,
 )
 
@@ -229,6 +230,69 @@ class TestProbeErrorScrubsConfiguredNames(unittest.TestCase):
     self.assertNotIn("SECRET-HEADER-VALUE", haystack)
     self.assertIn("target_unreachable", haystack)
     self.assertIn("X-Customer-Api-Key: <redacted>", haystack)
+
+  def test_gateway_secret_names_are_redacted_from_probe_errors(self):
+    target_config = GrayboxTargetConfig(api_security=ApiSecurityConfig(
+      auth=AuthDescriptor(auth_type="form"),
+      gateway_auth=GatewayAuthDescriptor(
+        auth_type="api_key",
+        api_key_location="query",
+        api_key_query_param="gateway_key",
+        api_key_header_name="X-Gateway-Key",
+      ),
+    ))
+    probe = ProbeBase(
+      "https://api.example.com",
+      MagicMock(),
+      target_config,
+      SafetyControls(),
+    )
+
+    def boom():
+      raise requests.RequestException(
+        "GET https://api.example.com/v1?gateway_key=SECRET99 "
+        "failed with X-Gateway-Key: SECRET-HEADER"
+      )
+
+    probe.run_safe("gateway_error_path", boom)
+
+    haystack = str(probe.findings[0].to_dict())
+    self.assertNotIn("SECRET99", haystack)
+    self.assertNotIn("SECRET-HEADER", haystack)
+    self.assertIn("gateway_key=<redacted>", haystack)
+    self.assertIn("X-Gateway-Key: <redacted>", haystack)
+
+
+class TestConfiguredNamesFromReport(unittest.TestCase):
+
+  def test_report_secret_name_extraction_includes_gateway_auth(self):
+    from extensions.business.cybersec.red_mesh.mixins.report import (
+      _configured_graybox_secret_names_from_report,
+    )
+
+    names = _configured_graybox_secret_names_from_report({
+      "job_config": {
+        "target_config": {
+          "api_security": {
+            "auth": {
+              "api_key_header_name": "X-App-Key",
+              "api_key_query_param": "app_key",
+            },
+            "gateway_auth": {
+              "api_key_header_name": "X-Gateway-Key",
+              "api_key_query_param": "gateway_key",
+              "bearer_token_header_name": "X-Gateway-Authorization",
+            },
+          },
+        },
+      },
+    })
+
+    self.assertIn("X-App-Key", names)
+    self.assertIn("app_key", names)
+    self.assertIn("X-Gateway-Key", names)
+    self.assertIn("gateway_key", names)
+    self.assertIn("X-Gateway-Authorization", names)
 
 
 if __name__ == "__main__":
