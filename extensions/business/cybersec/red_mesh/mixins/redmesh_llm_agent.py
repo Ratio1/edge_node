@@ -1266,7 +1266,7 @@ class _RedMeshLlmAgentMixin(object):
         findings=findings or [],
         aggregated_report=aggregated_report,
         engagement=engagement,
-        model_name=llm_cfg.get("MODEL", "deepseek-chat"),
+        model_name=llm_cfg.get("MODEL", "CyberSecQwen-4B.Q4_K_M.gguf"),
       )
     except Exception as exc:
       self.P(

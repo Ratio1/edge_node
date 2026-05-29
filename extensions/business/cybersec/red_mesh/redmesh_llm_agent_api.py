@@ -387,7 +387,11 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     return "local"
 
   def _redact_url(self, url: Optional[str]) -> Optional[str]:
-    """Return a URL safe for status payloads by stripping userinfo."""
+    """Return a URL safe for status payloads and local calls.
+
+    Query strings and fragments are intentionally dropped because operators may
+    accidentally place tokens there while configuring LOCAL_LLM_API_URL.
+    """
     if not url:
       return url
     try:
@@ -397,7 +401,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     netloc = parsed.hostname or ""
     if parsed.port:
       netloc = f"{netloc}:{parsed.port}"
-    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    return urlunsplit((parsed.scheme, netloc, parsed.path, "", ""))
 
   def _sanitize_local_health(self, payload: Dict) -> Dict:
     """Allowlist local health fields before exposing them through RedMesh."""
@@ -624,7 +628,11 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     dict
       API response or error object.
     """
+    self._request_count += 1
+    self._last_request_time = self.time()
+
     if not self._api_key:
+      self._error_count += 1
       return {
         "error": "DeepSeek API key not configured",
         "status": LLM_API_STATUS_ERROR,
@@ -634,9 +642,6 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       "Content-Type": "application/json",
       "Authorization": f"Bearer {self._api_key}"
     }
-
-    self._request_count += 1
-    self._last_request_time = self.time()
 
     try:
       self.Pd(f"Calling DeepSeek API: {self.cfg_deepseek_api_url}")
@@ -686,6 +691,9 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
 
   def _call_local_llm_api(self, payload: Dict) -> Dict:
     """Execute HTTP request to local LLM_INFERENCE_API."""
+    self._request_count += 1
+    self._last_request_time = self.time()
+
     url = self._local_llm_url()
     if not url:
       self._error_count += 1
@@ -694,10 +702,6 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         "status": "config_error",
         "provider": "local",
       }
-
-    self._request_count += 1
-    self._last_request_time = self.time()
-
     try:
       self.Pd(f"Calling local LLM API: {url}")
       response = requests.post(
@@ -817,7 +821,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         **base,
         "api_key_configured": self._api_key is not None,
         "model": self.cfg_deepseek_model,
-        "api_url": self.cfg_deepseek_api_url,
+        "api_url": self._redact_url(self.cfg_deepseek_api_url),
       }
 
     local_base_url = self._local_llm_base_url()

@@ -31,6 +31,7 @@ DEFAULT_LLM_AGENT_CONFIG = {
   "ENABLED": False,
   "TIMEOUT": 120.0,
   "AUTO_ANALYSIS_TYPE": "security_assessment",
+  "MODEL": "CyberSecQwen-4B.Q4_K_M.gguf",
 }
 
 DEFAULT_ATTESTATION_CONFIG = {
@@ -205,10 +206,19 @@ def get_llm_agent_config(owner):
       merged.get("AUTO_ANALYSIS_TYPE") or defaults["AUTO_ANALYSIS_TYPE"]
     ).strip() or defaults["AUTO_ANALYSIS_TYPE"]
 
+    model_value = merged.get("MODEL")
+    if (
+      (not model_value or model_value == defaults["MODEL"])
+      and merged.get("LOCAL_LLM_MODEL")
+    ):
+      model_value = merged.get("LOCAL_LLM_MODEL")
+    model = str(model_value or defaults["MODEL"]).strip() or defaults["MODEL"]
+
     return {
       "ENABLED": enabled,
       "TIMEOUT": timeout,
       "AUTO_ANALYSIS_TYPE": analysis_type,
+      "MODEL": model,
     }
 
   return resolve_config_block(

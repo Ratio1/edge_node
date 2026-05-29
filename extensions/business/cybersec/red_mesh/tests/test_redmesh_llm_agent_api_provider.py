@@ -133,6 +133,9 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
 
     self.assertEqual(result["status"], "config_error")
     self.assertEqual(result["provider"], "local")
+    self.assertEqual(plugin.status()["metrics"]["total_requests"], 1)
+    self.assertEqual(plugin.status()["metrics"]["failed_requests"], 1)
+    self.assertEqual(plugin.status()["metrics"]["success_rate"], 0.0)
     mocked_post.assert_not_called()
 
   def test_remote_alias_is_not_deepseek_opt_in(self):
@@ -198,7 +201,10 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
   def test_health_checks_local_llm_api_without_leaking_token(self):
     plugin = _make_plugin(
       local_api_token="secret-token",
-      local_llm_api_url="http://user:secret-url-token@127.0.0.1:5090/create_chat_completion",
+      local_llm_api_url=(
+        "http://user:secret-url-token@127.0.0.1:5090/create_chat_completion"
+        "?token=query-secret#fragment-secret"
+      ),
       local_llm_api_port=None,
     )
 
@@ -224,6 +230,8 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
     self.assertEqual(mocked_get.call_args.kwargs["headers"]["Authorization"], "Bearer secret-token")
     self.assertNotIn("secret-token", str(result))
     self.assertNotIn("secret-url-token", str(result))
+    self.assertNotIn("query-secret", str(result))
+    self.assertNotIn("fragment-secret", str(result))
     self.assertNotIn("raw prompt", str(result))
     self.assertNotIn("hidden", str(result))
 
