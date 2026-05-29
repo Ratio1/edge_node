@@ -6,6 +6,23 @@ from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_
 
 class DeeployCreateRequestPreparationTests(unittest.TestCase):
 
+  def test_advance_lifecycle_specs_increments_generation(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 123.0
+
+    specs = plugin._advance_deeploy_lifecycle_specs(
+      {
+        DEEPLOY_KEYS.LIFECYCLE_GENERATION: 4,
+        DEEPLOY_KEYS.DATE_CREATED: 100.0,
+      },
+      operation="update",
+    )
+
+    self.assertEqual(specs[DEEPLOY_KEYS.LIFECYCLE_GENERATION], 5)
+    self.assertEqual(specs[DEEPLOY_KEYS.LIFECYCLE_OPERATION], "update")
+    self.assertEqual(specs[DEEPLOY_KEYS.DATE_UPDATED], 123.0)
+    self.assertEqual(specs[DEEPLOY_KEYS.DATE_CREATED], 100.0)
+
   def test_prepare_single_plugin_instance_uses_signature_and_app_params(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(

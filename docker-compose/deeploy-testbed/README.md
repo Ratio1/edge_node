@@ -11,9 +11,22 @@ PYTHONPATH=/mnt/c/repos/naeural_core:/mnt/c/repos/naeural_client:. /home/bleot/v
 docker compose -f docker-compose/deeploy-testbed.yaml down -v
 ```
 
+When validating local `naeural_core` receiver changes before they are published,
+mount the local package into both node containers:
+
+```bash
+DEEPLOY_TESTBED_CORE_PATH=/absolute/path/to/naeural_core/naeural_core \
+docker compose -f docker-compose/deeploy-testbed.yaml -f docker-compose/deeploy-testbed.local-core.yaml up -d --build
+PYTHONPATH=/absolute/path/to/naeural_core:/absolute/path/to/naeural_client:. python docker-compose/deeploy-testbed/validate_delete_workflow.py
+DEEPLOY_TESTBED_CORE_PATH=/absolute/path/to/naeural_core/naeural_core \
+docker compose -f docker-compose/deeploy-testbed.yaml -f docker-compose/deeploy-testbed.local-core.yaml down -v
+```
+
 The validation script creates one Deeploy-like multi-plugin app pipeline on
 each local node, calls the real `delete_pipeline_from_nodes()` path, and asserts
 that each node receives exactly one `DELETE_CONFIG` for the app.
+It also updates the pipeline to a newer Deeploy lifecycle generation, sends an
+older structured delete command, and asserts the newer saved config remains.
 
 The app uses testbed-only data/business plugins mounted into the node containers
 under the normal root plugin search paths.

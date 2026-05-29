@@ -27,7 +27,7 @@ x-edge-node-env: &edge-node-env
   EE_TUNNEL_ENGINE: none
 
 x-edge-node: &edge-node
-  image: local_edge_node_deeploy_0002
+  image: local_edge_node_deeploy_testbed
   build:
     context: ..
     dockerfile: Dockerfile_devnet

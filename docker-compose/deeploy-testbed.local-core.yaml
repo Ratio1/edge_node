@@ -1,0 +1,8 @@
+services:
+  deeploy_test_node_1:
+    volumes:
+      - ${DEEPLOY_TESTBED_CORE_PATH:?set DEEPLOY_TESTBED_CORE_PATH to the local naeural_core package directory}:/opt/python/lib/python3.13/site-packages/naeural_core:ro
+
+  deeploy_test_node_2:
+    volumes:
+      - ${DEEPLOY_TESTBED_CORE_PATH:?set DEEPLOY_TESTBED_CORE_PATH to the local naeural_core package directory}:/opt/python/lib/python3.13/site-packages/naeural_core:ro
