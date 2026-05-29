@@ -33,11 +33,11 @@ def _make_plugin(**overrides):
   plugin.cfg_local_llm_model = overrides.get("local_llm_model", "CyberSecQwen-4B.Q4_K_M.gguf")
   plugin.cfg_local_llm_max_tokens = overrides.get("local_llm_max_tokens", 4096)
   plugin.cfg_local_llm_max_findings = overrides.get("local_llm_max_findings", 24)
-  plugin.cfg_deepseek_api_url = overrides.get("deepseek_api_url", "https://api.deepseek.com/chat/completions")
-  plugin.cfg_deepseek_api_key = overrides.get("deepseek_api_key")
-  plugin.cfg_deepseek_api_key_env = overrides.get("deepseek_api_key_env", "DEEPSEEK_API_KEY")
+  plugin.cfg_remote_llm_provider = overrides.get("remote_llm_provider", RedMeshLlmAgentApiPlugin.CONFIG["REMOTE_LLM_PROVIDER"])
   plugin.cfg_remote_llm_model = overrides.get("remote_llm_model", RedMeshLlmAgentApiPlugin.CONFIG["REMOTE_LLM_MODEL"])
-  plugin.cfg_deepseek_model = overrides.get("deepseek_model", RedMeshLlmAgentApiPlugin.CONFIG["DEEPSEEK_MODEL"])
+  plugin.cfg_remote_llm_api_url = overrides.get("remote_llm_api_url", RedMeshLlmAgentApiPlugin.CONFIG["REMOTE_LLM_API_URL"])
+  plugin.cfg_remote_llm_api_key = overrides.get("remote_llm_api_key")
+  plugin.cfg_remote_llm_api_key_env = overrides.get("remote_llm_api_key_env", "REMOTE_LLM_API_KEY")
   plugin.cfg_default_temperature = overrides.get("default_temperature", 0.7)
   plugin.cfg_default_max_tokens = overrides.get("default_max_tokens", 1024)
   plugin.cfg_default_top_p = overrides.get("default_top_p", 1.0)
@@ -54,14 +54,29 @@ def _make_plugin(**overrides):
   plugin.P = lambda *_args, **_kwargs: None
   plugin.Pd = lambda *_args, **_kwargs: None
   plugin._provider = plugin._normalize_provider(plugin.cfg_llm_provider)
+  plugin._remote_provider = plugin._normalize_remote_provider(plugin.cfg_remote_llm_provider)
   return plugin
 
 
 class RedMeshLlmAgentProviderTests(unittest.TestCase):
+  def test_public_config_uses_generic_remote_keys(self):
+    config = RedMeshLlmAgentApiPlugin.CONFIG
+
+    self.assertIn("REMOTE_LLM_PROVIDER", config)
+    self.assertIn("REMOTE_LLM_MODEL", config)
+    self.assertIn("REMOTE_LLM_API_URL", config)
+    self.assertIn("REMOTE_LLM_API_KEY", config)
+    self.assertIn("REMOTE_LLM_API_KEY_ENV", config)
+    self.assertNotIn("DEEPSEEK_MODEL", config)
+    self.assertNotIn("DEEPSEEK_API_URL", config)
+    self.assertNotIn("DEEPSEEK_API_KEY", config)
+    self.assertNotIn("DEEPSEEK_API_KEY_ENV", config)
+
   def test_local_provider_calls_llm_inference_api_and_clamps_tokens(self):
     plugin = _make_plugin(
       local_llm_api_port=5090,
-      deepseek_api_url="https://should-not-be-called.invalid/chat/completions",
+      remote_llm_api_url="https://should-not-be-called.invalid/chat/completions",
+      remote_llm_api_key="remote-secret",
     )
     response_payload = {
       "id": "req-1",
@@ -126,7 +141,7 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
       "http://llm.local:5090/create_chat_completion",
     )
 
-  def test_local_provider_missing_endpoint_does_not_call_deepseek(self):
+  def test_local_provider_missing_endpoint_does_not_call_remote(self):
     plugin = _make_plugin(local_llm_api_port=None, api_key="deepseek-secret")
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_llm_agent_api.requests.post") as mocked_post:
@@ -139,8 +154,8 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
     self.assertEqual(plugin.status()["metrics"]["success_rate"], 0.0)
     mocked_post.assert_not_called()
 
-  def test_remote_alias_is_not_deepseek_opt_in(self):
-    plugin = _make_plugin(llm_provider="remote", local_llm_api_port=None, api_key="deepseek-secret")
+  def test_deepseek_top_level_provider_is_not_remote_opt_in(self):
+    plugin = _make_plugin(llm_provider="deepseek", local_llm_api_port=None, api_key="deepseek-secret")
 
     with patch("extensions.business.cybersec.red_mesh.redmesh_llm_agent_api.requests.post") as mocked_post:
       result = plugin.chat(messages=[{"role": "user", "content": "hello"}])
@@ -148,6 +163,26 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
     self.assertEqual(result["status"], "config_error")
     self.assertEqual(result["provider"], "local")
     mocked_post.assert_not_called()
+
+  def test_remote_provider_is_explicit_opt_in(self):
+    plugin = _make_plugin(llm_provider="remote", local_llm_api_port=None, api_key="deepseek-secret")
+    response_payload = {
+      "model": "deepseek-chat",
+      "choices": [{"message": {"content": "remote response"}}],
+    }
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_llm_agent_api.requests.post",
+      return_value=_Response(payload=response_payload),
+    ) as mocked_post:
+      result = plugin.chat(messages=[{"role": "user", "content": "hello"}])
+
+    self.assertEqual(result["choices"][0]["message"]["content"], "remote response")
+    self.assertEqual(result["provider"], "remote")
+    self.assertEqual(result["remote_provider"], "deepseek")
+    self.assertEqual(mocked_post.call_args.args[0], "https://api.deepseek.com/chat/completions")
+    self.assertEqual(mocked_post.call_args.kwargs["headers"]["Authorization"], "Bearer deepseek-secret")
+    self.assertEqual(mocked_post.call_args.kwargs["json"]["model"], "deepseek-chat")
 
   def test_analyze_scan_keeps_contract_with_local_provider_metadata(self):
     plugin = _make_plugin()
@@ -170,6 +205,26 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
     self.assertEqual(result["model"], "cybersec_qwen_4b")
     self.assertEqual(result["scan_summary"]["open_ports"], 1)
     self.assertEqual(result["usage"]["total_tokens"], 15)
+
+  def test_analyze_scan_keeps_contract_with_remote_provider_metadata(self):
+    plugin = _make_plugin(llm_provider="remote", api_key="deepseek-secret")
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.redmesh_llm_agent_api.requests.post",
+      return_value=_Response(payload={
+        "model": "deepseek-chat",
+        "choices": [{"message": {"content": "remote assessment"}}],
+      }),
+    ):
+      result = plugin.analyze_scan(
+        scan_results={"open_ports": [443], "service_info": {"443": {"service": "https"}}},
+        analysis_type="quick_summary",
+      )
+
+    self.assertEqual(result["content"], "remote assessment")
+    self.assertEqual(result["provider"], "remote")
+    self.assertEqual(result["remote_provider"], "deepseek")
+    self.assertEqual(result["model"], "deepseek-chat")
 
   def test_analyze_scan_compacts_local_prompt_through_llm_boundary(self):
     plugin = _make_plugin(local_llm_max_findings=3)
@@ -268,31 +323,11 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
     self.assertNotIn("service_info", user_content)
     self.assertNotIn("IGNORE PRIOR INSTRUCTIONS", user_content)
 
-  def test_deepseek_provider_is_explicit_opt_in(self):
-    plugin = _make_plugin(llm_provider="deepseek", api_key="deepseek-secret")
-    response_payload = {
-      "model": "deepseek-chat",
-      "choices": [{"message": {"content": "remote response"}}],
-    }
-
-    with patch(
-      "extensions.business.cybersec.red_mesh.redmesh_llm_agent_api.requests.post",
-      return_value=_Response(payload=response_payload),
-    ) as mocked_post:
-      result = plugin.chat(messages=[{"role": "user", "content": "hello"}])
-
-    self.assertEqual(result["choices"][0]["message"]["content"], "remote response")
-    self.assertEqual(result["provider"], "deepseek")
-    self.assertEqual(mocked_post.call_args.args[0], "https://api.deepseek.com/chat/completions")
-    self.assertEqual(mocked_post.call_args.kwargs["headers"]["Authorization"], "Bearer deepseek-secret")
-    self.assertEqual(mocked_post.call_args.kwargs["json"]["model"], "deepseek-chat")
-
   def test_deepseek_provider_uses_generic_remote_model_name(self):
     plugin = _make_plugin(
-      llm_provider="deepseek",
+      llm_provider="remote",
       api_key="deepseek-secret",
       remote_llm_model="deepseek-reasoner",
-      deepseek_model="legacy-deepseek-chat",
     )
 
     with patch(
@@ -304,28 +339,38 @@ class RedMeshLlmAgentProviderTests(unittest.TestCase):
     ) as mocked_post:
       result = plugin.chat(messages=[{"role": "user", "content": "hello"}])
 
-    self.assertEqual(result["provider"], "deepseek")
+    self.assertEqual(result["provider"], "remote")
+    self.assertEqual(result["remote_provider"], "deepseek")
     self.assertEqual(mocked_post.call_args.kwargs["json"]["model"], "deepseek-reasoner")
     self.assertEqual(plugin.status()["config"]["model"], "deepseek-reasoner")
+    self.assertEqual(plugin.status()["config"]["provider"], "remote")
+    self.assertEqual(plugin.status()["config"]["remote_provider"], "deepseek")
 
-  def test_deepseek_model_is_legacy_alias_when_remote_model_missing(self):
+  def test_remote_provider_loads_generic_api_key_env(self):
     plugin = _make_plugin(
-      llm_provider="deepseek",
-      api_key="deepseek-secret",
-      remote_llm_model="",
-      deepseek_model="legacy-deepseek-chat",
+      llm_provider="remote",
+      remote_llm_api_key_env="CUSTOM_REMOTE_KEY",
+      os_environ={"CUSTOM_REMOTE_KEY": " env-secret "},
+    )
+
+    self.assertEqual(plugin._load_remote_api_key(), "env-secret")
+
+  def test_unsupported_remote_adapter_returns_config_error(self):
+    plugin = _make_plugin(
+      llm_provider="remote",
+      remote_llm_provider="other",
+      api_key="remote-secret",
     )
 
     with patch(
       "extensions.business.cybersec.red_mesh.redmesh_llm_agent_api.requests.post",
-      return_value=_Response(payload={
-        "model": "legacy-deepseek-chat",
-        "choices": [{"message": {"content": "remote response"}}],
-      }),
     ) as mocked_post:
-      plugin.chat(messages=[{"role": "user", "content": "hello"}])
+      result = plugin.chat(messages=[{"role": "user", "content": "hello"}])
 
-    self.assertEqual(mocked_post.call_args.kwargs["json"]["model"], "legacy-deepseek-chat")
+    self.assertEqual(result["status"], "config_error")
+    self.assertEqual(result["provider"], "remote")
+    self.assertEqual(result["remote_provider"], "other")
+    mocked_post.assert_not_called()
 
   def test_health_reports_local_config_error_without_token_or_prompt_leak(self):
     plugin = _make_plugin(local_llm_api_port=None, local_api_token="secret-token")

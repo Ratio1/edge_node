@@ -53,11 +53,11 @@ class LlmAgentConfigTests(unittest.TestCase):
 
     self.assertEqual(config["MODEL"], "alias-local-model")
 
-  def test_prompt_profile_and_provider_overrides_are_preserved(self):
+  def test_prompt_profile_and_remote_provider_overrides_are_preserved(self):
     owner = MagicMock()
     owner.cfg_llm_agent = {
       "ENABLED": True,
-      "PROVIDER": "deepseek",
+      "PROVIDER": "remote",
       "MODEL": "deepseek-chat",
       "PROMPT_PROFILE": "remote_rich_v1",
       "STRUCTURED_MAX_FINDINGS": 12,
@@ -67,12 +67,25 @@ class LlmAgentConfigTests(unittest.TestCase):
 
     config = _config.get_llm_agent_config(owner)
 
-    self.assertEqual(config["PROVIDER"], "deepseek")
+    self.assertEqual(config["PROVIDER"], "remote")
     self.assertEqual(config["MODEL"], "deepseek-chat")
     self.assertEqual(config["PROMPT_PROFILE"], "remote_rich_v1")
     self.assertEqual(config["STRUCTURED_MAX_FINDINGS"], 12)
     self.assertEqual(config["STRUCTURED_MAX_TOKENS"], 3072)
     self.assertEqual(config["STRUCTURED_TEMPERATURE"], 0.25)
+
+  def test_deepseek_provider_name_is_not_preserved(self):
+    owner = MagicMock()
+    owner.cfg_llm_agent = {
+      "ENABLED": True,
+      "PROVIDER": "deepseek",
+      "MODEL": "deepseek-chat",
+    }
+
+    config = _config.get_llm_agent_config(owner)
+
+    self.assertEqual(config["PROVIDER"], "local")
+    self.assertEqual(config["MODEL"], "deepseek-chat")
 
 
 if __name__ == "__main__":

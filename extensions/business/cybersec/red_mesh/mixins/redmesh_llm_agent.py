@@ -1267,7 +1267,7 @@ class _RedMeshLlmAgentMixin(object):
     if requested_profile == PROMPT_PROFILE_AUTO:
       requested_profile = (
         llm_cfg.get("REMOTE_PROMPT_PROFILE")
-        if provider_path in ("deepseek", "remote", "openai", "anthropic")
+        if provider_path in ("remote", "openai", "anthropic")
         else llm_cfg.get("LOCAL_PROMPT_PROFILE")
       )
     profile = resolve_prompt_profile(

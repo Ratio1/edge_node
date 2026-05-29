@@ -143,7 +143,7 @@ _TRUST_PROFILES = {"restricted_redacted", "internal_soc", "custom"}
 _TLP_VALUES = {"clear", "green", "amber", "amber_strict", "red"}
 _STIX_INDICATOR_MODES = {"ioc_only", "never", "all"}
 _SEVERITY_LEVELS = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
-_LLM_PROVIDER_PATHS = {"local", "deepseek", "remote", "openai", "anthropic", "auto"}
+_LLM_PROVIDER_PATHS = {"local", "remote", "openai", "anthropic", "auto"}
 
 
 def _normalized_choice(value, allowed, default):
@@ -219,9 +219,6 @@ def get_llm_agent_config(owner):
       _LLM_PROVIDER_PATHS,
       defaults["PROVIDER"],
     )
-    if provider == "remote":
-      provider = "deepseek"
-
     model_value = merged.get("MODEL")
     if (
       (not model_value or model_value == defaults["MODEL"])

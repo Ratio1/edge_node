@@ -92,11 +92,11 @@ def _make_plugin(port: int):
   plugin.cfg_local_llm_api_token_env = "LLM_API_TOKEN"
   plugin.cfg_local_llm_model = "CyberSecQwen-4B.Q4_K_M.gguf"
   plugin.cfg_local_llm_max_tokens = 4096
-  plugin.cfg_deepseek_api_url = "https://should-not-be-called.invalid/chat/completions"
-  plugin.cfg_deepseek_api_key = None
-  plugin.cfg_deepseek_api_key_env = "DEEPSEEK_API_KEY"
+  plugin.cfg_remote_llm_provider = "deepseek"
   plugin.cfg_remote_llm_model = "deepseek-chat"
-  plugin.cfg_deepseek_model = "deepseek-chat"
+  plugin.cfg_remote_llm_api_url = "https://should-not-be-called.invalid/chat/completions"
+  plugin.cfg_remote_llm_api_key = None
+  plugin.cfg_remote_llm_api_key_env = "REMOTE_LLM_API_KEY"
   plugin.cfg_default_temperature = 0.7
   plugin.cfg_default_max_tokens = 1024
   plugin.cfg_default_top_p = 1.0
@@ -104,6 +104,7 @@ def _make_plugin(port: int):
   plugin.cfg_redmesh_verbose = 0
   plugin.os_environ = {}
   plugin._provider = plugin._normalize_provider(plugin.cfg_llm_provider)
+  plugin._remote_provider = plugin._normalize_remote_provider(plugin.cfg_remote_llm_provider)
   plugin._api_key = None
   plugin._local_api_token = None
   plugin._request_count = 0

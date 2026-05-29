@@ -2,8 +2,8 @@
 RedMesh LLM Agent API Plugin
 
 Local API for RedMesh LLM integration.
-By default it calls a locally served LLM_INFERENCE_API instance. DeepSeek remains
-available only when explicitly selected as the provider.
+By default it calls a locally served LLM_INFERENCE_API instance. Remote providers
+remain available only when explicitly selected.
 
 Pipeline configuration example:
 ```json
@@ -34,7 +34,7 @@ Available Endpoints:
 
 Environment Variables:
 - LLM_API_TOKEN: optional bearer token for the local LLM_INFERENCE_API
-- DEEPSEEK_API_KEY: API key for DeepSeek (required only when LLM_PROVIDER=deepseek)
+- REMOTE_LLM_API_KEY: API key for the selected remote provider
 """
 
 import json
@@ -75,9 +75,9 @@ _CONFIG = {
   "API_TITLE": "RedMesh LLM Agent API",
   "API_SUMMARY": "Local API for RedMesh LLM integration.",
 
-  # Provider configuration. The default is local-only: no DeepSeek key is read
+  # Provider configuration. The default is local-only: no remote key is read
   # and no remote request is made unless LLM_PROVIDER is explicitly set to
-  # "deepseek".
+  # "remote".
   "LLM_PROVIDER": "local",
 
   # Local LLM_INFERENCE_API configuration
@@ -92,12 +92,12 @@ _CONFIG = {
   "LOCAL_LLM_MAX_FINDINGS": 24,
 
   # Remote provider configuration. DeepSeek is currently the implemented
-  # remote provider, but the model name is intentionally provider-neutral.
-  "DEEPSEEK_API_URL": "https://api.deepseek.com/chat/completions",
-  "DEEPSEEK_API_KEY": None,  # API key (can be provided directly via config)
-  "DEEPSEEK_API_KEY_ENV": "DEEPSEEK_API_KEY",  # Fallback: env var name if key not in config
+  # adapter, but public configuration stays provider-neutral.
+  "REMOTE_LLM_PROVIDER": "deepseek",
   "REMOTE_LLM_MODEL": "deepseek-chat",
-  "DEEPSEEK_MODEL": None,  # Legacy alias; prefer REMOTE_LLM_MODEL.
+  "REMOTE_LLM_API_URL": "https://api.deepseek.com/chat/completions",
+  "REMOTE_LLM_API_KEY": None,
+  "REMOTE_LLM_API_KEY_ENV": "REMOTE_LLM_API_KEY",
 
   # Request defaults
   "DEFAULT_TEMPERATURE": 0.7,
@@ -283,7 +283,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
   CONFIG : dict
     Plugin configuration merged with BasePlugin defaults.
   _api_key : str or None
-    DeepSeek API key loaded from environment when the DeepSeek provider is selected.
+    Remote LLM API key loaded from environment when the remote provider is selected.
   _local_api_token : str or None
     Optional local LLM_INFERENCE_API bearer token.
   _request_count : int
@@ -297,18 +297,25 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     """Initialize plugin and validate selected provider configuration."""
     super(RedMeshLlmAgentApiPlugin, self).on_init()
     self._provider = self._normalize_provider(self.cfg_llm_provider)
-    self._api_key = self._load_api_key() if self._provider == "deepseek" else None
+    self._remote_provider = self._normalize_remote_provider(self.cfg_remote_llm_provider)
+    self._api_key = self._load_remote_api_key() if self._provider == "remote" else None
     self._local_api_token = self._load_local_api_token() if self._provider == "local" else None
     self._request_count = 0
     self._error_count = 0
     self._last_request_time = None
 
-    if self._provider == "deepseek" and not self._api_key:
-      self.P("WARNING: DeepSeek API key not configured! Set the DEEPSEEK_API_KEY environment variable.", color='r')
+    if self._provider == "remote" and self._remote_provider != "deepseek":
+      self.P(f"WARNING: Unsupported remote LLM provider '{self._remote_provider}'.", color='r')
+    elif self._provider == "remote" and not self._api_key:
+      env_name = self.cfg_remote_llm_api_key_env or "REMOTE_LLM_API_KEY"
+      self.P(f"WARNING: Remote LLM API key not configured! Set the {env_name} environment variable.", color='r')
     elif self._provider == "local":
       self.P(f"RedMesh LLM Agent API initialized. Provider: local, model: {self.cfg_local_llm_model}")
     else:
-      self.P(f"RedMesh LLM Agent API initialized. Provider: deepseek, model: {self._remote_model()}")
+      self.P(
+        "RedMesh LLM Agent API initialized. "
+        f"Provider: remote/{self._remote_provider}, model: {self._remote_model()}"
+      )
     return
 
   def _setup_semaphore_env(self):
@@ -333,13 +340,13 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     """Override to return empty dict - no node metadata in responses."""
     return {}
 
-  def _load_api_key(self) -> Optional[str]:
+  def _load_remote_api_key(self) -> Optional[str]:
     """
-    Load DeepSeek API key from config or environment variable.
+    Load remote LLM API key from config or environment variable.
 
     Priority:
-    1. DEEPSEEK_API_KEY config parameter (direct)
-    2. Environment variable specified by DEEPSEEK_API_KEY_ENV
+    1. REMOTE_LLM_API_KEY config parameter (direct)
+    2. Environment variable specified by REMOTE_LLM_API_KEY_ENV
 
     Returns
     -------
@@ -347,7 +354,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       The API key if found, otherwise None.
     """
     # First check if API key is provided directly in config
-    api_key = self.cfg_deepseek_api_key
+    api_key = self.cfg_remote_llm_api_key
     if api_key:
       api_key = api_key.strip()
       if api_key:
@@ -355,7 +362,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         return api_key
 
     # Fallback to environment variable
-    env_name = self.cfg_deepseek_api_key_env
+    env_name = self.cfg_remote_llm_api_key_env or "REMOTE_LLM_API_KEY"
     api_key = self.os_environ.get(env_name, None)
     if api_key:
       api_key = api_key.strip()
@@ -385,10 +392,13 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     provider = str(provider or "local").strip().lower()
     if provider in {"local", "llm_inference_api", "llm-inference-api"}:
       return "local"
-    if provider == "deepseek":
-      return "deepseek"
+    if provider == "remote":
+      return "remote"
     self.P(f"Unknown LLM provider '{provider}', falling back to local.", color='y')
     return "local"
+
+  def _normalize_remote_provider(self, provider: str) -> str:
+    return str(provider or "deepseek").strip().lower() or "deepseek"
 
   def _redact_url(self, url: Optional[str]) -> Optional[str]:
     """Return a URL safe for status payloads and local calls.
@@ -425,11 +435,16 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       self._provider = provider
     return provider
 
+  def _selected_remote_provider(self) -> str:
+    provider = getattr(self, "_remote_provider", None)
+    if provider is None:
+      provider = self._normalize_remote_provider(self.cfg_remote_llm_provider)
+      self._remote_provider = provider
+    return provider
+
   def _remote_model(self) -> str:
-    """Return the remote model, preserving DEEPSEEK_MODEL as a legacy alias."""
+    """Return the configured remote model."""
     model = getattr(self, "cfg_remote_llm_model", None)
-    if not model:
-      model = getattr(self, "cfg_deepseek_model", None)
     return str(model or "deepseek-chat").strip() or "deepseek-chat"
 
   def _local_llm_url(self, path: Optional[str] = None) -> Optional[str]:
@@ -758,8 +773,10 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     if not self._api_key:
       self._error_count += 1
       return {
-        "error": "DeepSeek API key not configured",
+        "error": "Remote LLM API key not configured",
         "status": LLM_API_STATUS_ERROR,
+        "provider": "remote",
+        "remote_provider": self._selected_remote_provider(),
       }
 
     headers = {
@@ -768,9 +785,9 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     }
 
     try:
-      self.Pd(f"Calling DeepSeek API: {self.cfg_deepseek_api_url}")
+      self.Pd(f"Calling DeepSeek remote adapter: {self.cfg_remote_llm_api_url}")
       response = requests.post(
-        self.cfg_deepseek_api_url,
+        self.cfg_remote_llm_api_url,
         headers=headers,
         json=payload,
         timeout=self.cfg_request_timeout_seconds
@@ -784,8 +801,10 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         except Exception:
           pass
         return {
-          "error": f"DeepSeek API returned status {response.status_code}",
+          "error": f"Remote LLM provider returned status {response.status_code}",
           "status": LLM_API_STATUS_ERROR,
+          "provider": "remote",
+          "remote_provider": self._selected_remote_provider(),
           "details": error_detail,
         }
 
@@ -793,24 +812,30 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
 
     except requests.exceptions.Timeout:
       self._error_count += 1
-      self.P("DeepSeek API request timed out", color='r')
+      self.P("Remote LLM provider request timed out", color='r')
       return {
-        "error": "DeepSeek API request timed out",
+        "error": "Remote LLM provider request timed out",
         "status": LLM_API_STATUS_TIMEOUT,
+        "provider": "remote",
+        "remote_provider": self._selected_remote_provider(),
       }
     except requests.exceptions.RequestException as e:
       self._error_count += 1
-      self.P(f"DeepSeek API request failed: {e}", color='r')
+      self.P(f"Remote LLM provider request failed: {e}", color='r')
       return {
         "error": str(e),
         "status": LLM_API_STATUS_ERROR,
+        "provider": "remote",
+        "remote_provider": self._selected_remote_provider(),
       }
     except Exception as e:
       self._error_count += 1
-      self.P(f"Unexpected error calling DeepSeek API: {e}\n{traceback.format_exc()}", color='r')
+      self.P(f"Unexpected error calling remote LLM provider: {e}\n{traceback.format_exc()}", color='r')
       return {
         "error": f"Unexpected error: {e}",
         "status": LLM_API_STATUS_ERROR,
+        "provider": "remote",
+        "remote_provider": self._selected_remote_provider(),
       }
 
   def _call_local_llm_api(self, payload: Dict) -> Dict:
@@ -882,11 +907,23 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
 
   def _call_provider_api(self, payload: Dict) -> Dict:
     provider = self._selected_provider()
-    if provider == "deepseek":
-      return self._normalize_chat_response(
+    if provider == "remote":
+      remote_provider = self._selected_remote_provider()
+      if remote_provider != "deepseek":
+        self._error_count += 1
+        return {
+          "error": f"Unsupported remote LLM provider '{remote_provider}'",
+          "status": "config_error",
+          "provider": "remote",
+          "remote_provider": remote_provider,
+        }
+      response = self._normalize_chat_response(
         self._call_deepseek_api(payload),
         fallback_model=self._remote_model(),
       )
+      response.setdefault("provider", "remote")
+      response.setdefault("remote_provider", remote_provider)
+      return response
     return self._call_local_llm_api(payload)
 
   def _validate_messages(self, messages: List[Dict]) -> Optional[str]:
@@ -940,12 +977,21 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       "uptime_seconds": self.time() - self.start_time if hasattr(self, 'start_time') else 0,
       "version": __VER__,
     }
-    if provider == "deepseek":
+    if provider == "remote":
+      remote_provider = self._selected_remote_provider()
       return {
         **base,
+        "remote_provider": remote_provider,
         "api_key_configured": self._api_key is not None,
         "model": self._remote_model(),
-        "api_url": self._redact_url(self.cfg_deepseek_api_url),
+        "api_url": self._redact_url(self.cfg_remote_llm_api_url),
+        **(
+          {
+            "status": "config_error",
+            "error": f"Unsupported remote LLM provider '{remote_provider}'",
+          }
+          if remote_provider != "deepseek" else {}
+        ),
       }
 
     local_base_url = self._local_llm_base_url()
@@ -1010,7 +1056,16 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       },
       "config": {
         "provider": self._selected_provider(),
+        "remote_provider": (
+          self._selected_remote_provider()
+          if self._selected_provider() == "remote" else None
+        ),
         "model": self.cfg_local_llm_model if self._selected_provider() == "local" else self._remote_model(),
+        "api_url": (
+          self._redact_url(self._local_llm_base_url())
+          if self._selected_provider() == "local"
+          else self._redact_url(self.cfg_remote_llm_api_url)
+        ),
         "default_temperature": self.cfg_default_temperature,
         "default_max_tokens": self.cfg_default_max_tokens,
         "timeout_seconds": self.cfg_request_timeout_seconds,
@@ -1060,7 +1115,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       }
 
     provider = self._selected_provider()
-    if provider == "deepseek":
+    if provider == "remote":
       payload = self._build_deepseek_request(
         messages=messages,
         model=model,
@@ -1181,7 +1236,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     else:
       effective_max_tokens = 2048
 
-    if provider == "deepseek":
+    if provider == "remote":
       payload = self._build_deepseek_request(
         messages=messages,
         model=model,
@@ -1234,6 +1289,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         "focus_areas": focus_areas,
         "model": response.get("model"),
         "provider": response.get("provider", provider),
+        "remote_provider": response.get("remote_provider") if provider == "remote" else None,
         "content": content,
         "usage": {
           "prompt_tokens": usage.get("prompt_tokens"),

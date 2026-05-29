@@ -168,10 +168,10 @@ class StructuredReportAdapterTests(unittest.TestCase):
     self.assertEqual(out["prompt_profile"], "local_cybersecqwen_quota_v1")
     self.assertEqual(out["provider_path"], "local")
 
-  def test_deepseek_profile_uses_json_object_response_format(self):
+  def test_remote_profile_uses_json_object_response_format(self):
     self._cfg_value = {
       "ENABLED": True,
-      "PROVIDER": "deepseek",
+      "PROVIDER": "remote",
       "MODEL": "deepseek-chat",
       "PROMPT_PROFILE": "auto",
       "LOCAL_PROMPT_PROFILE": "local_cybersecqwen_quota_v1",

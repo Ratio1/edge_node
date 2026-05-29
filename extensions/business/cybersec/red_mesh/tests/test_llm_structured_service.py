@@ -333,7 +333,7 @@ class TestTrustBoundary(unittest.TestCase):
       llm_call=llm,
       findings=SAMPLE_FINDINGS,
       model_name="deepseek-chat",
-      provider_path="deepseek",
+      provider_path="remote",
       prompt_profile="auto",
     )
 
