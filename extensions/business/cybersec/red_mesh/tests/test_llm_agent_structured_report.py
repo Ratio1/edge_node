@@ -29,6 +29,7 @@ from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import _RedM
 def _valid_llm_response_content() -> str:
   """A complete LlmReportSections JSON the validator accepts."""
   return json.dumps({
+    "executive_headline": "Critical Apache exposure requires immediate remediation and retesting.",
     "background_draft": "Engagement targeted the perimeter of the example.com infrastructure to assess external exposure.",
     "overall_posture": "The external surface shows a high-severity finding requiring prompt remediation; otherwise hardening is acceptable.",
     "recommendation_summary": [
@@ -99,7 +100,17 @@ class StructuredReportAdapterTests(unittest.TestCase):
     # toggle ENABLED per-test without touching the global config.
     from extensions.business.cybersec.red_mesh.mixins import redmesh_llm_agent as mod
     self._orig_cfg = mod.get_llm_agent_config
-    self._cfg_value = {"ENABLED": True, "MODEL": "deepseek-chat"}
+    self._cfg_value = {
+      "ENABLED": True,
+      "PROVIDER": "local",
+      "MODEL": "CyberSecQwen-4B.Q4_K_M.gguf",
+      "PROMPT_PROFILE": "auto",
+      "LOCAL_PROMPT_PROFILE": "local_cybersecqwen_quota_v1",
+      "REMOTE_PROMPT_PROFILE": "remote_rich_v1",
+      "STRUCTURED_MAX_FINDINGS": 6,
+      "STRUCTURED_MAX_TOKENS": 2048,
+      "STRUCTURED_TEMPERATURE": None,
+    }
     mod.get_llm_agent_config = lambda _self: self._cfg_value
     self._orig_live_llm = os.environ.get("LIVE_LLM")
 
@@ -154,6 +165,43 @@ class StructuredReportAdapterTests(unittest.TestCase):
       owner._calls[0]["payload"]["response_format"]["type"],
       "json_schema",
     )
+    self.assertEqual(out["prompt_profile"], "local_cybersecqwen_quota_v1")
+    self.assertEqual(out["provider_path"], "local")
+
+  def test_deepseek_profile_uses_json_object_response_format(self):
+    self._cfg_value = {
+      "ENABLED": True,
+      "PROVIDER": "deepseek",
+      "MODEL": "deepseek-chat",
+      "PROMPT_PROFILE": "auto",
+      "LOCAL_PROMPT_PROFILE": "local_cybersecqwen_quota_v1",
+      "REMOTE_PROMPT_PROFILE": "remote_rich_v1",
+      "STRUCTURED_MAX_FINDINGS": 12,
+      "STRUCTURED_MAX_TOKENS": 3072,
+      "STRUCTURED_TEMPERATURE": 0.25,
+    }
+    owner = _FakeOwner(chat_response={
+      "choices": [{"message": {"content": _valid_llm_response_content()}}],
+    })
+    out = _run(
+      owner,
+      job_id="j1",
+      findings=[{
+        "severity": "HIGH",
+        "title": "Authorization bypass",
+        "port": 443,
+      }],
+      aggregated_report={"total_findings": 1},
+    )
+
+    self.assertIsNotNone(out)
+    self.assertEqual(out["prompt_profile"], "remote_rich_v1")
+    self.assertEqual(out["provider_path"], "remote")
+    self.assertEqual(
+      owner._calls[0]["payload"]["response_format"],
+      {"type": "json_object"},
+    )
+    self.assertEqual(owner._calls[0]["payload"]["temperature"], 0.25)
 
   def test_persists_fallback_skeleton_on_validation_failure(self):
     # LLM returns parseable but content-empty JSON twice — corrective

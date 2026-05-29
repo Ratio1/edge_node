@@ -31,9 +31,14 @@ DEFAULT_LLM_AGENT_CONFIG = {
   "ENABLED": False,
   "TIMEOUT": 120.0,
   "AUTO_ANALYSIS_TYPE": "security_assessment",
+  "PROVIDER": "local",
   "MODEL": "CyberSecQwen-4B.Q4_K_M.gguf",
-  "STRUCTURED_MAX_FINDINGS": 1,
-  "STRUCTURED_MAX_TOKENS": 1024,
+  "PROMPT_PROFILE": "auto",
+  "LOCAL_PROMPT_PROFILE": "local_cybersecqwen_quota_v1",
+  "REMOTE_PROMPT_PROFILE": "remote_rich_v1",
+  "STRUCTURED_MAX_FINDINGS": 6,
+  "STRUCTURED_MAX_TOKENS": 2048,
+  "STRUCTURED_TEMPERATURE": None,
 }
 
 DEFAULT_ATTESTATION_CONFIG = {
@@ -138,6 +143,7 @@ _TRUST_PROFILES = {"restricted_redacted", "internal_soc", "custom"}
 _TLP_VALUES = {"clear", "green", "amber", "amber_strict", "red"}
 _STIX_INDICATOR_MODES = {"ioc_only", "never", "all"}
 _SEVERITY_LEVELS = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"}
+_LLM_PROVIDER_PATHS = {"local", "deepseek", "remote", "openai", "anthropic", "auto"}
 
 
 def _normalized_choice(value, allowed, default):
@@ -208,6 +214,14 @@ def get_llm_agent_config(owner):
       merged.get("AUTO_ANALYSIS_TYPE") or defaults["AUTO_ANALYSIS_TYPE"]
     ).strip() or defaults["AUTO_ANALYSIS_TYPE"]
 
+    provider = _normalized_choice(
+      merged.get("PROVIDER") or merged.get("LLM_PROVIDER"),
+      _LLM_PROVIDER_PATHS,
+      defaults["PROVIDER"],
+    )
+    if provider == "remote":
+      provider = "deepseek"
+
     model_value = merged.get("MODEL")
     if (
       (not model_value or model_value == defaults["MODEL"])
@@ -230,15 +244,41 @@ def get_llm_agent_config(owner):
       )
     except (TypeError, ValueError):
       structured_max_tokens = defaults["STRUCTURED_MAX_TOKENS"]
-    structured_max_tokens = max(64, min(structured_max_tokens, 2048))
+    structured_max_tokens = max(64, min(structured_max_tokens, 4096))
+
+    prompt_profile = str(
+      merged.get("PROMPT_PROFILE") or defaults["PROMPT_PROFILE"]
+    ).strip().lower() or defaults["PROMPT_PROFILE"]
+    local_prompt_profile = str(
+      merged.get("LOCAL_PROMPT_PROFILE") or defaults["LOCAL_PROMPT_PROFILE"]
+    ).strip().lower() or defaults["LOCAL_PROMPT_PROFILE"]
+    remote_prompt_profile = str(
+      merged.get("REMOTE_PROMPT_PROFILE") or defaults["REMOTE_PROMPT_PROFILE"]
+    ).strip().lower() or defaults["REMOTE_PROMPT_PROFILE"]
+
+    structured_temperature = merged.get("STRUCTURED_TEMPERATURE", defaults["STRUCTURED_TEMPERATURE"])
+    if structured_temperature in (None, ""):
+      structured_temperature = defaults["STRUCTURED_TEMPERATURE"]
+    else:
+      try:
+        structured_temperature = float(structured_temperature)
+      except (TypeError, ValueError):
+        structured_temperature = defaults["STRUCTURED_TEMPERATURE"]
+      if structured_temperature is not None:
+        structured_temperature = max(0.0, min(structured_temperature, 2.0))
 
     return {
       "ENABLED": enabled,
       "TIMEOUT": timeout,
       "AUTO_ANALYSIS_TYPE": analysis_type,
+      "PROVIDER": provider,
       "MODEL": model,
+      "PROMPT_PROFILE": prompt_profile,
+      "LOCAL_PROMPT_PROFILE": local_prompt_profile,
+      "REMOTE_PROMPT_PROFILE": remote_prompt_profile,
       "STRUCTURED_MAX_FINDINGS": structured_max_findings,
       "STRUCTURED_MAX_TOKENS": structured_max_tokens,
+      "STRUCTURED_TEMPERATURE": structured_temperature,
     }
 
   return resolve_config_block(

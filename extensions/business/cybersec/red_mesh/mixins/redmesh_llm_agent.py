@@ -17,8 +17,10 @@ from ..constants import RUN_MODE_SINGLEPASS
 from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
 from ..services.llm_structured import (
-  LLM_REPORT_SECTIONS_JSON_SCHEMA,
+  PROMPT_PROFILE_AUTO,
+  build_response_format_for_prompt_profile,
   generate_exec_summary,
+  resolve_prompt_profile,
 )
 
 _NON_RETRYABLE_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 413, 422}
@@ -1254,8 +1256,28 @@ class _RedMeshLlmAgentMixin(object):
     llm_cfg = get_llm_agent_config(self)
     self._last_structured_llm_failed = None
     self._last_structured_llm_validation = None
+    self._last_structured_llm_profile = None
+    self._last_structured_llm_provider_path = None
     if not llm_cfg.get("ENABLED"):
       return None
+
+    model_name = llm_cfg.get("MODEL", "CyberSecQwen-4B.Q4_K_M.gguf")
+    provider_path = llm_cfg.get("PROVIDER", "local")
+    requested_profile = llm_cfg.get("PROMPT_PROFILE", PROMPT_PROFILE_AUTO)
+    if requested_profile == PROMPT_PROFILE_AUTO:
+      requested_profile = (
+        llm_cfg.get("REMOTE_PROMPT_PROFILE")
+        if provider_path in ("deepseek", "remote", "openai", "anthropic")
+        else llm_cfg.get("LOCAL_PROMPT_PROFILE")
+      )
+    profile = resolve_prompt_profile(
+      requested_profile,
+      provider_path=provider_path,
+      model_name=model_name,
+    )
+    response_format = build_response_format_for_prompt_profile(profile)
+    self._last_structured_llm_profile = profile.id
+    self._last_structured_llm_provider_path = profile.provider_path
 
     def raw_chat_call(messages: list, max_tokens: int, temperature: float) -> str:
       """Adapter — turns the LLM Agent /chat HTTP response into the
@@ -1267,10 +1289,7 @@ class _RedMeshLlmAgentMixin(object):
           "messages": messages,
           "max_tokens": max_tokens,
           "temperature": temperature,
-          "response_format": {
-            "type": "json_schema",
-            "schema": LLM_REPORT_SECTIONS_JSON_SCHEMA,
-          },
+          "response_format": response_format,
         },
       )
       if not isinstance(response, dict) or "error" in response:
@@ -1288,9 +1307,12 @@ class _RedMeshLlmAgentMixin(object):
         findings=findings or [],
         aggregated_report=aggregated_report,
         engagement=engagement,
-        model_name=llm_cfg.get("MODEL", "CyberSecQwen-4B.Q4_K_M.gguf"),
+        model_name=model_name,
+        provider_path=provider_path,
+        prompt_profile=profile.id,
         max_findings=llm_cfg.get("STRUCTURED_MAX_FINDINGS", 1),
         max_tokens=llm_cfg.get("STRUCTURED_MAX_TOKENS", 1024),
+        temperature=llm_cfg.get("STRUCTURED_TEMPERATURE"),
       )
     except Exception as exc:
       self.P(
@@ -1316,6 +1338,8 @@ class _RedMeshLlmAgentMixin(object):
       self._log_structured_llm_failure_diagnostics(job_id, result)
 
     sections = result.sections.to_dict()
+    sections["prompt_profile"] = result.prompt_profile
+    sections["provider_path"] = result.provider_path
     if result.error:
       sections["validation"] = result.validation.to_dict()
       sections["error"] = True
