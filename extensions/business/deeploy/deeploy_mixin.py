@@ -1547,13 +1547,10 @@ class _DeeployMixin:
       return normalized_keys
 
     self.P(f"Resetting response keys in chainstore before dispatching {context}...")
+    reset_kwargs = self._get_chainstore_response_local_reset_write_kwargs()
     for _, node_response_keys in normalized_keys.items():
       for response_key in node_response_keys:
-        try:
-          self.chainstore_set(response_key, None)
-        except Exception as e:
-          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
-        # end try
+        self._reset_chainstore_response_key(response_key, write_kwargs=reset_kwargs)
       # end for
     # end for
 
@@ -2830,13 +2827,11 @@ class _DeeployMixin:
     self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")
 
     # RESET chainstore_response_keys here
-    try:
-      self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
-      for node_addr, response_keys in chainstore_response_keys.items():
-        for response_key in response_keys:
-          self.chainstore_set(response_key, None)
-    except Exception as e:
-      self.P(f"Error resetting chainstore keys: {e}", color='r')
+    self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
+    self._reset_chainstore_response_keys(
+      chainstore_response_keys,
+      context=f"scale up job {job_id}",
+    )
 
     # Start pipelines on nodes.
     self._start_create_update_pipelines(create_pipelines=create_pipelines,

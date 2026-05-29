@@ -145,14 +145,14 @@ class _ContainerUtilsMixin:
     Returns:
         dict: Response data including container details, ports, and timing info.
     """
-    # Start with base plugin data (from _ChainstoreResponseMixin)
-    # Note: Since this mixin is used alongside _ChainstoreResponseMixin,
+    # Start with base plugin data (from _DeeployChainstoreResponseMixin)
+    # Note: Since this mixin is used alongside _DeeployChainstoreResponseMixin,
     # we should check if super() provides base data
     try:
-      # Try to get base data if _ChainstoreResponseMixin is in the MRO
+      # Try to get base data if _DeeployChainstoreResponseMixin is in the MRO
       data = super()._get_chainstore_response_data()
     except (AttributeError, TypeError):
-      # Fallback if _ChainstoreResponseMixin is not in the inheritance chain
+      # Fallback if _DeeployChainstoreResponseMixin is not in the inheritance chain
       data = {
         'plugin_signature': self.__class__.__name__,
         'instance_id': getattr(self, 'cfg_instance_id', None),
