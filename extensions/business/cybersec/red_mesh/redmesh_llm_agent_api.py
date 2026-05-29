@@ -1,8 +1,9 @@
 """
 RedMesh LLM Agent API Plugin
 
-Local API for DeepSeek LLM integration in RedMesh workflows.
-Provides chat completion and scan analysis endpoints that proxy to DeepSeek API.
+Local API for RedMesh LLM integration.
+By default it calls a locally served LLM_INFERENCE_API instance. DeepSeek remains
+available only when explicitly selected as the provider.
 
 Pipeline configuration example:
 ```json
@@ -16,7 +17,8 @@ Pipeline configuration example:
         {
           "INSTANCE_ID": "llm_agent",
           "PORT": 5050,
-          "DEEPSEEK_MODEL": "deepseek-chat"
+          "LLM_PROVIDER": "local",
+          "LOCAL_LLM_API_PORT": 5090
         }
       ]
     }
@@ -25,13 +27,14 @@ Pipeline configuration example:
 ```
 
 Available Endpoints:
-- POST /chat - Chat completion via DeepSeek API
+- POST /chat - Chat completion via the selected provider
 - POST /analyze_scan - Analyze RedMesh scan results with LLM
 - GET /health - Health check with API key status
 - GET /status - Request metrics
 
 Environment Variables:
-- DEEPSEEK_API_KEY: API key for DeepSeek (required)
+- LLM_API_TOKEN: optional bearer token for the local LLM_INFERENCE_API
+- DEEPSEEK_API_KEY: API key for DeepSeek (required only when LLM_PROVIDER=deepseek)
 """
 
 import json
@@ -39,6 +42,7 @@ import requests
 import traceback
 
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from naeural_core.business.default.web_app.fast_api_web_app import FastApiWebAppPlugin as BasePlugin
 
@@ -68,17 +72,28 @@ _CONFIG = {
 
   # API metadata
   "API_TITLE": "RedMesh LLM Agent API",
-  "API_SUMMARY": "Local API for DeepSeek LLM integration in RedMesh workflows.",
+  "API_SUMMARY": "Local API for RedMesh LLM integration.",
+
+  # Provider configuration. The default is local-only: no DeepSeek key is read
+  # and no remote request is made unless LLM_PROVIDER is explicitly set to
+  # "deepseek".
+  "LLM_PROVIDER": "local",
+
+  # Local LLM_INFERENCE_API configuration
+  "LOCAL_LLM_API_URL": None,
+  "LOCAL_LLM_API_HOST": "127.0.0.1",
+  "LOCAL_LLM_API_PORT": None,
+  "LOCAL_LLM_API_PATH": "/create_chat_completion",
+  "LOCAL_LLM_API_TOKEN": None,
+  "LOCAL_LLM_API_TOKEN_ENV": "LLM_API_TOKEN",
+  "LOCAL_LLM_MODEL": "CyberSecQwen-4B.Q4_K_M.gguf",
+  "LOCAL_LLM_MAX_TOKENS": 4096,
 
   # DeepSeek configuration
   "DEEPSEEK_API_URL": "https://api.deepseek.com/chat/completions",
   "DEEPSEEK_API_KEY": None,  # API key (can be provided directly via config)
   "DEEPSEEK_API_KEY_ENV": "DEEPSEEK_API_KEY",  # Fallback: env var name if key not in config
-  # Default hardcoded to a local-model placeholder so the plugin
-  # boots without DeepSeek credentials. Restore the line below to
-  # route through the upstream DeepSeek API.
-  # "DEEPSEEK_MODEL": "deepseek-chat",
-  "DEEPSEEK_MODEL": "local-model",
+  "DEEPSEEK_MODEL": "deepseek-chat",
 
   # Request defaults
   "DEFAULT_TEMPERATURE": 0.7,
@@ -253,10 +268,10 @@ ANALYSIS_PROMPTS = _NETWORK_PROMPTS
 
 class RedMeshLlmAgentApiPlugin(BasePlugin):
   """
-  RedMesh LLM Agent API plugin for DeepSeek integration.
+  RedMesh LLM Agent API plugin.
 
   This plugin exposes FastAPI endpoints for:
-  - General chat completion via DeepSeek API
+  - General chat completion via a selected provider
   - Automated analysis of RedMesh scan results
 
   Attributes
@@ -264,7 +279,9 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
   CONFIG : dict
     Plugin configuration merged with BasePlugin defaults.
   _api_key : str or None
-    DeepSeek API key loaded from environment.
+    DeepSeek API key loaded from environment when the DeepSeek provider is selected.
+  _local_api_token : str or None
+    Optional local LLM_INFERENCE_API bearer token.
   _request_count : int
     Total number of API requests made.
   _error_count : int
@@ -273,17 +290,21 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
   CONFIG = _CONFIG
 
   def on_init(self):
-    """Initialize plugin and validate DeepSeek API key."""
+    """Initialize plugin and validate selected provider configuration."""
     super(RedMeshLlmAgentApiPlugin, self).on_init()
-    self._api_key = self._load_api_key()
+    self._provider = self._normalize_provider(self.cfg_llm_provider)
+    self._api_key = self._load_api_key() if self._provider == "deepseek" else None
+    self._local_api_token = self._load_local_api_token() if self._provider == "local" else None
     self._request_count = 0
     self._error_count = 0
     self._last_request_time = None
 
-    if not self._api_key:
+    if self._provider == "deepseek" and not self._api_key:
       self.P("WARNING: DeepSeek API key not configured! Set the DEEPSEEK_API_KEY environment variable.", color='r')
+    elif self._provider == "local":
+      self.P(f"RedMesh LLM Agent API initialized. Provider: local, model: {self.cfg_local_llm_model}")
     else:
-      self.P(f"RedMesh LLM Agent API initialized. Model: {self.cfg_deepseek_model}")
+      self.P(f"RedMesh LLM Agent API initialized. Provider: deepseek, model: {self.cfg_deepseek_model}")
     return
 
   def _setup_semaphore_env(self):
@@ -310,7 +331,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
 
   def _load_api_key(self) -> Optional[str]:
     """
-    Load API key from config or environment variable.
+    Load DeepSeek API key from config or environment variable.
 
     Priority:
     1. DEEPSEEK_API_KEY config parameter (direct)
@@ -339,6 +360,118 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         return api_key
 
     return None
+
+  def _load_local_api_token(self) -> Optional[str]:
+    """Load optional local LLM_INFERENCE_API bearer token without logging it."""
+    token = self.cfg_local_llm_api_token
+    if token:
+      token = token.strip()
+      if token:
+        return token
+
+    env_name = self.cfg_local_llm_api_token_env
+    token = self.os_environ.get(env_name, None)
+    if token:
+      token = token.strip()
+      if token:
+        return token
+    return None
+
+  def _normalize_provider(self, provider: str) -> str:
+    provider = str(provider or "local").strip().lower()
+    if provider in {"local", "llm_inference_api", "llm-inference-api"}:
+      return "local"
+    if provider == "deepseek":
+      return "deepseek"
+    self.P(f"Unknown LLM provider '{provider}', falling back to local.", color='y')
+    return "local"
+
+  def _redact_url(self, url: Optional[str]) -> Optional[str]:
+    """Return a URL safe for status payloads by stripping userinfo."""
+    if not url:
+      return url
+    try:
+      parsed = urlsplit(str(url))
+    except Exception:
+      return ""
+    netloc = parsed.hostname or ""
+    if parsed.port:
+      netloc = f"{netloc}:{parsed.port}"
+    return urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+
+  def _sanitize_local_health(self, payload: Dict) -> Dict:
+    """Allowlist local health fields before exposing them through RedMesh."""
+    if not isinstance(payload, dict):
+      return {"status": "non_json_health"}
+    sanitized = {}
+    for key in ("status", "model", "version", "uptime_seconds"):
+      value = payload.get(key)
+      if isinstance(value, (str, int, float, bool)) or value is None:
+        sanitized[key] = value
+    return sanitized
+
+  def _selected_provider(self) -> str:
+    provider = getattr(self, "_provider", None)
+    if provider is None:
+      provider = self._normalize_provider(self.cfg_llm_provider)
+      self._provider = provider
+    return provider
+
+  def _local_llm_url(self, path: Optional[str] = None) -> Optional[str]:
+    explicit_url = self.cfg_local_llm_api_url
+    endpoint = path if path is not None else self.cfg_local_llm_api_path
+    endpoint = str(endpoint or "/create_chat_completion").strip()
+    if not endpoint.startswith("/"):
+      endpoint = "/" + endpoint
+
+    if explicit_url:
+      url = str(self._redact_url(explicit_url)).rstrip("/")
+      if url.endswith(endpoint):
+        return url
+      return url + endpoint
+
+    port = self.cfg_local_llm_api_port
+    if not port:
+      return None
+    host = self.cfg_local_llm_api_host or "127.0.0.1"
+    return f"http://{host}:{int(port)}{endpoint}"
+
+  def _local_llm_base_url(self) -> Optional[str]:
+    explicit_url = self.cfg_local_llm_api_url
+    if explicit_url:
+      # LOCAL_LLM_API_URL may include the completion path. Strip the configured
+      # path when deriving the health endpoint base.
+      url = str(self._redact_url(explicit_url)).rstrip("/")
+      path = str(self.cfg_local_llm_api_path or "").strip("/")
+      suffix = "/" + path if path else ""
+      if suffix and url.endswith(suffix):
+        return url[:-len(suffix)]
+      return url
+
+    port = self.cfg_local_llm_api_port
+    if not port:
+      return None
+    host = self.cfg_local_llm_api_host or "127.0.0.1"
+    return f"http://{host}:{int(port)}"
+
+  def _local_headers(self) -> Dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    token = getattr(self, "_local_api_token", None)
+    if token:
+      headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+  def _bounded_local_max_tokens(self, value: Optional[int]) -> int:
+    default_value = int(self.cfg_default_max_tokens or 1024)
+    try:
+      requested = int(value if value is not None else default_value)
+    except (TypeError, ValueError):
+      requested = default_value
+    try:
+      upper = int(self.cfg_local_llm_max_tokens or 4096)
+    except (TypeError, ValueError):
+      upper = 4096
+    return max(16, min(requested, upper))
 
   def P(self, s, *args, **kwargs):
     """Prefixed logger for RedMesh LLM messages."""
@@ -389,6 +522,93 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       "top_p": top_p if top_p is not None else self.cfg_default_top_p,
       "stream": False,
     }
+
+  def _build_local_request(
+      self,
+      messages: List[Dict],
+      model: Optional[str] = None,
+      temperature: Optional[float] = None,
+      max_tokens: Optional[int] = None,
+      top_p: Optional[float] = None,
+  ) -> Dict:
+    """Build the payload expected by LLM_INFERENCE_API."""
+    return {
+      "messages": messages,
+      "temperature": temperature if temperature is not None else self.cfg_default_temperature,
+      "max_tokens": self._bounded_local_max_tokens(max_tokens),
+      "top_p": top_p if top_p is not None else self.cfg_default_top_p,
+      "metadata": {
+        "source": "redmesh_llm_agent_api",
+        "requested_model": model or self.cfg_local_llm_model,
+      },
+    }
+
+  def _extract_assistant_content(self, response: Dict) -> Optional[str]:
+    """Extract assistant text from OpenAI-like or LLM_INFERENCE_API result shapes."""
+    if not isinstance(response, dict):
+      return None
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices:
+      message = choices[0].get("message", {}) if isinstance(choices[0], dict) else {}
+      content = message.get("content") if isinstance(message, dict) else None
+      if isinstance(content, str):
+        return content
+    for key in ("TEXT_RESPONSE", "text", "content", "analysis", "summary"):
+      value = response.get(key)
+      if isinstance(value, str):
+        return value
+    full_output = response.get("FULL_OUTPUT")
+    if isinstance(full_output, list) and full_output:
+      return self._extract_assistant_content(full_output[0])
+    if isinstance(full_output, dict):
+      return self._extract_assistant_content(full_output)
+    return None
+
+  def _normalize_chat_response(self, response: Dict, fallback_model: Optional[str] = None) -> Dict:
+    """Normalize provider output to the OpenAI-like shape RedMesh already consumes."""
+    if isinstance(response, dict) and "result" in response and isinstance(response["result"], dict):
+      response = response["result"]
+
+    if not isinstance(response, dict):
+      return {
+        "error": "LLM provider returned a non-object response",
+        "status": LLM_API_STATUS_ERROR,
+      }
+
+    if "error" in response:
+      return response
+
+    content = self._extract_assistant_content(response)
+    if content is None:
+      return {
+        "error": "LLM provider response did not contain assistant content",
+        "status": LLM_API_STATUS_ERROR,
+        "provider": self._selected_provider(),
+      }
+
+    if "choices" in response and isinstance(response.get("choices"), list):
+      normalized = dict(response)
+    else:
+      normalized = {
+        "id": response.get("id") or response.get("REQUEST_ID"),
+        "object": response.get("object", "chat.completion"),
+        "created": response.get("created", int(self.time())),
+        "model": response.get("model") or response.get("MODEL_NAME") or fallback_model,
+        "choices": [
+          {
+            "index": 0,
+            "message": {
+              "role": "assistant",
+              "content": content,
+            },
+            "finish_reason": response.get("finish_reason", "stop"),
+          }
+        ],
+        "usage": response.get("usage", {}),
+      }
+    normalized.setdefault("provider", self._selected_provider())
+    normalized.setdefault("model", fallback_model or normalized.get("model"))
+    return normalized
 
   def _call_deepseek_api(self, payload: Dict) -> Dict:
     """
@@ -464,6 +684,83 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         "status": LLM_API_STATUS_ERROR,
       }
 
+  def _call_local_llm_api(self, payload: Dict) -> Dict:
+    """Execute HTTP request to local LLM_INFERENCE_API."""
+    url = self._local_llm_url()
+    if not url:
+      self._error_count += 1
+      return {
+        "error": "Local LLM API port or URL not configured",
+        "status": "config_error",
+        "provider": "local",
+      }
+
+    self._request_count += 1
+    self._last_request_time = self.time()
+
+    try:
+      self.Pd(f"Calling local LLM API: {url}")
+      response = requests.post(
+        url,
+        headers=self._local_headers(),
+        json=payload,
+        timeout=self.cfg_request_timeout_seconds
+      )
+
+      if response.status_code != 200:
+        self._error_count += 1
+        error_detail = response.text
+        try:
+          error_detail = response.json()
+        except Exception:
+          pass
+        return {
+          "error": f"Local LLM API returned status {response.status_code}",
+          "status": LLM_API_STATUS_ERROR,
+          "provider": "local",
+          "details": error_detail,
+          "provider_status": response.status_code,
+        }
+
+      return self._normalize_chat_response(
+        response.json(),
+        fallback_model=self.cfg_local_llm_model,
+      )
+
+    except requests.exceptions.Timeout:
+      self._error_count += 1
+      self.P("Local LLM API request timed out", color='r')
+      return {
+        "error": "Local LLM API request timed out",
+        "status": LLM_API_STATUS_TIMEOUT,
+        "provider": "local",
+      }
+    except requests.exceptions.RequestException as e:
+      self._error_count += 1
+      self.P(f"Local LLM API request failed: {e}", color='r')
+      return {
+        "error": str(e),
+        "status": LLM_API_STATUS_ERROR,
+        "provider": "local",
+      }
+    except Exception as e:
+      self._error_count += 1
+      self.P(f"Unexpected error calling local LLM API: {e}\n{traceback.format_exc()}", color='r')
+      return {
+        "error": f"Unexpected error: {e}",
+        "status": LLM_API_STATUS_ERROR,
+        "provider": "local",
+      }
+
+  def _call_provider_api(self, payload: Dict) -> Dict:
+    provider = self._selected_provider()
+    if provider == "deepseek":
+      return self._normalize_chat_response(
+        self._call_deepseek_api(payload),
+        fallback_model=self.cfg_deepseek_model,
+      )
+    return self._call_local_llm_api(payload)
+
   def _validate_messages(self, messages: List[Dict]) -> Optional[str]:
     """
     Validate chat messages format.
@@ -501,21 +798,66 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="GET")
   def health(self) -> Dict:
     """
-    Check API health and DeepSeek configuration.
+    Check API health and selected provider configuration.
 
     Returns
     -------
     dict
       Health status including API key presence and metrics.
     """
-    return {
+    provider = self._selected_provider()
+    base = {
       "status": LLM_API_STATUS_OK,
-      "api_key_configured": self._api_key is not None,
-      "model": self.cfg_deepseek_model,
-      "api_url": self.cfg_deepseek_api_url,
+      "provider": provider,
       "uptime_seconds": self.time() - self.start_time if hasattr(self, 'start_time') else 0,
       "version": __VER__,
     }
+    if provider == "deepseek":
+      return {
+        **base,
+        "api_key_configured": self._api_key is not None,
+        "model": self.cfg_deepseek_model,
+        "api_url": self.cfg_deepseek_api_url,
+      }
+
+    local_base_url = self._local_llm_base_url()
+    local_status = {
+      **base,
+      "auth_token_configured": self._local_api_token is not None,
+      "model": self.cfg_local_llm_model,
+      "api_url": self._redact_url(local_base_url),
+      "available": False,
+    }
+    if not local_base_url:
+      return {
+        **local_status,
+        "status": "config_error",
+        "error": "Local LLM API port or URL not configured",
+      }
+
+    try:
+      response = requests.get(
+        local_base_url.rstrip("/") + "/health",
+        headers=self._local_headers(),
+        timeout=5,
+      )
+      local_status["provider_status"] = response.status_code
+      local_status["available"] = response.status_code == 200
+      if response.status_code == 200:
+        try:
+          local_status["local_llm_health"] = self._sanitize_local_health(response.json())
+        except Exception:
+          local_status["local_llm_health"] = {"status": "non_json_health"}
+      else:
+        local_status["status"] = LLM_API_STATUS_ERROR
+        local_status["error"] = f"Local LLM API returned status {response.status_code}"
+      return local_status
+    except requests.exceptions.RequestException as exc:
+      return {
+        **local_status,
+        "status": LLM_API_STATUS_ERROR,
+        "error": str(exc),
+      }
 
   @BasePlugin.endpoint(method="GET")
   def status(self) -> Dict:
@@ -539,7 +881,8 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         "last_request_time": self._last_request_time,
       },
       "config": {
-        "model": self.cfg_deepseek_model,
+        "provider": self._selected_provider(),
+        "model": self.cfg_local_llm_model if self._selected_provider() == "local" else self.cfg_deepseek_model,
         "default_temperature": self.cfg_default_temperature,
         "default_max_tokens": self.cfg_default_max_tokens,
         "timeout_seconds": self.cfg_request_timeout_seconds,
@@ -557,7 +900,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       **kwargs
   ) -> Dict:
     """
-    Send a chat completion request to DeepSeek API.
+    Send a chat completion request to the selected provider.
 
     Parameters
     ----------
@@ -585,17 +928,26 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         "status": LLM_API_STATUS_ERROR,
       }
 
-    # Build and send request
-    payload = self._build_deepseek_request(
-      messages=messages,
-      model=model,
-      temperature=temperature,
-      max_tokens=max_tokens,
-      top_p=top_p,
-    )
+    provider = self._selected_provider()
+    if provider == "deepseek":
+      payload = self._build_deepseek_request(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+      )
+    else:
+      payload = self._build_local_request(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        top_p=top_p,
+      )
 
-    self.Pd(f"Chat request: {len(messages)} messages, model={payload['model']}")
-    return self._call_deepseek_api(payload)
+    self.Pd(f"Chat request: {len(messages)} messages, provider={provider}")
+    return self._call_provider_api(payload)
 
   @BasePlugin.endpoint(method="POST")
   def analyze_scan(
@@ -610,7 +962,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
       **kwargs
   ) -> Dict:
     """
-    Analyze RedMesh scan results using DeepSeek LLM.
+    Analyze RedMesh scan results using the selected LLM provider.
 
     Parameters
     ----------
@@ -691,15 +1043,24 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
     else:
       effective_max_tokens = 2048
 
-    payload = self._build_deepseek_request(
-      messages=messages,
-      model=model,
-      temperature=temperature,
-      max_tokens=effective_max_tokens,
-    )
+    provider = self._selected_provider()
+    if provider == "deepseek":
+      payload = self._build_deepseek_request(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=effective_max_tokens,
+      )
+    else:
+      payload = self._build_local_request(
+        messages=messages,
+        model=model,
+        temperature=temperature,
+        max_tokens=effective_max_tokens,
+      )
 
     self.Pd(f"Analyze scan request: type={analysis_type}, focus={focus_areas}")
-    response = self._call_deepseek_api(payload)
+    response = self._call_provider_api(payload)
 
     # Extract only what we need from the response
     if "error" not in response:
@@ -735,6 +1096,7 @@ class RedMeshLlmAgentApiPlugin(BasePlugin):
         "scan_type": scan_type or "network",
         "focus_areas": focus_areas,
         "model": response.get("model"),
+        "provider": response.get("provider", provider),
         "content": content,
         "usage": {
           "prompt_tokens": usage.get("prompt_tokens"),
