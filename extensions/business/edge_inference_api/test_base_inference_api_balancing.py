@@ -603,6 +603,22 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     self.assertEqual(result["request_id"], "req-1")
     self.assertIn("req-1", plugin._requests)  # pylint: disable=protected-access
 
+  def test_sync_predict_does_not_treat_request_id_as_tracking_override(self):
+    plugin = self._make_plugin()
+
+    plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=False,
+      request_id="client-sync-id",
+      REQUEST_ID="client-sync-id-upper",
+    )
+
+    self.assertIn("req-1", plugin._requests)  # pylint: disable=protected-access
+    self.assertNotIn("client-sync-id", plugin._requests)  # pylint: disable=protected-access
+    self.assertNotIn("request_id", plugin._requests["req-1"]["parameters"])  # pylint: disable=protected-access
+    self.assertNotIn("REQUEST_ID", plugin._requests["req-1"]["parameters"])  # pylint: disable=protected-access
+    self.assertEqual(plugin.payloads[-1]["REQUEST_ID"], "req-1")
+
   def test_predict_entrypoint_accepts_uppercase_request_id_alias(self):
     plugin = self._make_plugin()
 

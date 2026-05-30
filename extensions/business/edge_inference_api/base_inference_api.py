@@ -3035,11 +3035,16 @@ class BaseInferenceApiPlugin(
       request_id_override = None
       if delegated_execution:
         request_id_override = delegation_context.get('delegation_id')
-      else:
+      elif async_request:
         try:
           request_id_override = self._extract_request_id_override(kwargs)
         except ValueError as exc:
           return {'error': str(exc), 'status': 'error'}
+      else:
+        # `request_id` is reserved for async tracking and must not leak into
+        # synchronous model parameters when clients reuse async payload shapes.
+        kwargs.pop('request_id', None)
+        kwargs.pop('REQUEST_ID', None)
 
       err = self.check_predict_params(**kwargs)
       if err is not None:
