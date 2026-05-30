@@ -283,6 +283,7 @@ class SdInferenceApiPlugin(BasePlugin):
         struct_data: Any = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        request_id: Optional[str] = None,
         **kwargs
     ):
       """
@@ -296,6 +297,9 @@ class SdInferenceApiPlugin(BasePlugin):
         Optional metadata accompanying the request.
       authorization : str or None, optional
         Bearer token used for authentication.
+      request_id : str or None, optional
+        Caller-provided id to use for request tracking. If omitted, the API
+        keeps the legacy generated-id behavior.
       **kwargs
         Extra parameters forwarded to the base handler.
 
@@ -308,6 +312,7 @@ class SdInferenceApiPlugin(BasePlugin):
         struct_data=struct_data,
         metadata=metadata,
         authorization=authorization,
+        request_id=request_id,
         **kwargs
       )
   """END API ENDPOINTS"""

@@ -2596,6 +2596,39 @@ class BaseInferenceApiPlugin(
       self._decrement_active_requests()
       return True
 
+    def _extract_request_id_override(self, kwargs: Dict[str, Any]):
+      """Extract an optional caller-provided request id from endpoint kwargs.
+
+      Existing callers do not pass a request id and keep the generated-id path.
+      New paired apps may pass `request_id` so wrapper and inference tracking use
+      the same id without a separate mapping store.
+      """
+      if not isinstance(kwargs, dict):
+        return None
+      values = []
+      for key in ('request_id', 'REQUEST_ID'):
+        if key in kwargs:
+          value = kwargs.pop(key)
+          if value is not None:
+            values.append(value)
+      if not values:
+        return None
+      request_id = values[0]
+      for value in values[1:]:
+        if value != request_id:
+          raise ValueError("Conflicting request_id and REQUEST_ID values.")
+      if not isinstance(request_id, str):
+        raise ValueError("request_id must be a string.")
+      request_id = request_id.strip()
+      if not request_id:
+        raise ValueError("request_id must not be empty.")
+      if len(request_id) > 256:
+        raise ValueError("request_id must not exceed 256 characters.")
+      allowed_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
+      if any(ch not in allowed_chars for ch in request_id):
+        raise ValueError("request_id contains unsupported characters.")
+      return request_id
+
     def solve_postponed_request(self, request_id: str):
       """
       Resolve or requeue a postponed request by checking its current status.
@@ -2666,6 +2699,8 @@ class BaseInferenceApiPlugin(
         Generated request_id and the stored request data dictionary.
       """
       request_id = request_id or self.uuid()
+      if request_id in self._requests:
+        raise ValueError(f"Request ID {request_id} already exists.")
       start_time = self.time()
       request_data = {
         "request_id": request_id,
@@ -2857,6 +2892,7 @@ class BaseInferenceApiPlugin(
     def predict_async(
         self,
         authorization: Optional[str] = None,
+        request_id: Optional[str] = None,
         **kwargs
     ):
       """
@@ -2866,6 +2902,9 @@ class BaseInferenceApiPlugin(
       ----------
       authorization : str or None, optional
         Authorization token supplied by the caller.
+      request_id : str or None, optional
+        Caller-provided id to use for request tracking. If omitted, the API
+        keeps the legacy generated-id behavior.
       **kwargs
         Additional parameters forwarded to request handling.
 
@@ -2877,6 +2916,7 @@ class BaseInferenceApiPlugin(
       return self._predict_entrypoint(
         authorization=authorization,
         async_request=True,
+        request_id=request_id,
         **kwargs
       )
   """END API ENDPOINTS"""
@@ -2992,6 +3032,15 @@ class BaseInferenceApiPlugin(
           return {'error': f"Unexpected error: {str(exc)}", 'status': 'error'}
         # endtry
 
+      request_id_override = None
+      if delegated_execution:
+        request_id_override = delegation_context.get('delegation_id')
+      else:
+        try:
+          request_id_override = self._extract_request_id_override(kwargs)
+        except ValueError as exc:
+          return {'error': str(exc), 'status': 'error'}
+
       err = self.check_predict_params(**kwargs)
       if err is not None:
         return {'error': err}
@@ -3000,16 +3049,16 @@ class BaseInferenceApiPlugin(
       if 'metadata' in parameters:
         metadata = parameters.pop('metadata') or {}
       # endif 'metadata' in parameters
-      request_id_override = None
-      if delegated_execution:
-        request_id_override = delegation_context.get('delegation_id')
-      request_id, request_data = self.register_request(
-        subject=subject,
-        parameters=parameters,
-        metadata=metadata,
-        timeout=parameters.get('timeout'),
-        request_id=request_id_override,
-      )
+      try:
+        request_id, request_data = self.register_request(
+          subject=subject,
+          parameters=parameters,
+          metadata=metadata,
+          timeout=parameters.get('timeout'),
+          request_id=request_id_override,
+        )
+      except ValueError as exc:
+        return {'error': str(exc), 'status': 'error'}
       request_data['endpoint_name'] = endpoint_name
       request_data['async_request'] = async_request
 
