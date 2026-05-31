@@ -580,6 +580,88 @@ class BaseInferenceApiBalancingTests(unittest.TestCase):
     request_id = result["request_id"]
     self.assertEqual(plugin._requests[request_id]["queue_state"], "queued")  # pylint: disable=protected-access
 
+  def test_predict_entrypoint_accepts_caller_request_id(self):
+    plugin = self._make_plugin()
+
+    result = plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=True,
+      request_id="client-req_1.2:3",
+      metadata={"source": "test"},
+    )
+
+    self.assertEqual(result["request_id"], "client-req_1.2:3")
+    self.assertIn("client-req_1.2:3", plugin._requests)  # pylint: disable=protected-access
+    self.assertEqual(plugin.payloads[-1]["REQUEST_ID"], "client-req_1.2:3")
+    self.assertNotIn("request_id", plugin._requests["client-req_1.2:3"]["parameters"])  # pylint: disable=protected-access
+
+  def test_predict_async_without_request_id_keeps_generated_id_behavior(self):
+    plugin = self._make_plugin()
+
+    result = plugin.predict_async(authorization=None, request_id=None)
+
+    self.assertEqual(result["request_id"], "req-1")
+    self.assertIn("req-1", plugin._requests)  # pylint: disable=protected-access
+
+  def test_sync_predict_does_not_treat_request_id_as_tracking_override(self):
+    plugin = self._make_plugin()
+
+    plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=False,
+      request_id="client-sync-id",
+      REQUEST_ID="client-sync-id-upper",
+    )
+
+    self.assertIn("req-1", plugin._requests)  # pylint: disable=protected-access
+    self.assertNotIn("client-sync-id", plugin._requests)  # pylint: disable=protected-access
+    self.assertNotIn("request_id", plugin._requests["req-1"]["parameters"])  # pylint: disable=protected-access
+    self.assertNotIn("REQUEST_ID", plugin._requests["req-1"]["parameters"])  # pylint: disable=protected-access
+    self.assertEqual(plugin.payloads[-1]["REQUEST_ID"], "req-1")
+
+  def test_predict_entrypoint_accepts_uppercase_request_id_alias(self):
+    plugin = self._make_plugin()
+
+    result = plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=True,
+      REQUEST_ID="client-req-2",
+    )
+
+    self.assertEqual(result["request_id"], "client-req-2")
+    self.assertIn("client-req-2", plugin._requests)  # pylint: disable=protected-access
+
+  def test_predict_entrypoint_rejects_duplicate_caller_request_id(self):
+    plugin = self._make_plugin()
+
+    first = plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=True,
+      request_id="client-req-dup",
+    )
+    second = plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=True,
+      request_id="client-req-dup",
+    )
+
+    self.assertEqual(first["request_id"], "client-req-dup")
+    self.assertEqual(second["status"], "error")
+    self.assertIn("already exists", second["error"])
+
+  def test_predict_entrypoint_rejects_invalid_caller_request_id(self):
+    plugin = self._make_plugin()
+
+    result = plugin._predict_entrypoint(  # pylint: disable=protected-access
+      authorization=None,
+      async_request=True,
+      request_id="../bad",
+    )
+
+    self.assertEqual(result["status"], "error")
+    self.assertIn("unsupported characters", result["error"])
+    self.assertNotIn("../bad", plugin._requests)  # pylint: disable=protected-access
+
   def test_predict_entrypoint_fails_cleanly_when_delegated_request_cannot_encode(self):
     plugin = self._make_plugin()
     plugin._active_execution_slots.add("busy")  # pylint: disable=protected-access
