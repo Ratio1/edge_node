@@ -399,6 +399,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format: Optional[Dict[str, Any]] = None,
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        request_id: Optional[str] = None,
         **kwargs
     ):
       """
@@ -422,6 +423,9 @@ class LLMInferenceApiPlugin(BasePlugin):
         Additional metadata to store with the request.
       authorization : str or None, optional
         Bearer token used for authentication.
+      request_id : str or None, optional
+        Caller-provided id to use for request tracking. If omitted, the API
+        keeps the legacy generated-id behavior.
       **kwargs
         Extra parameters forwarded to the base handler.
 
@@ -439,6 +443,7 @@ class LLMInferenceApiPlugin(BasePlugin):
         response_format=response_format,
         metadata=metadata,
         authorization=authorization,
+        request_id=request_id,
         **kwargs
       )
 
