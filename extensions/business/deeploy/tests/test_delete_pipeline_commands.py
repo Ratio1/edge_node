@@ -1,3 +1,4 @@
+import copy
 import sys
 import types
 import unittest
@@ -25,9 +26,10 @@ sys.modules.setdefault(
 from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS, DEEPLOY_PLUGIN_DATA, DEEPLOY_STATUS
 from extensions.business.deeploy.deeploy_manager_api import DeeployManagerApiPlugin
 from extensions.business.deeploy.tests.support import InputsStub, make_deeploy_plugin
+from naeural_core import constants as ct
 
 
-def _discovered_instance(app_id, node, signature, instance_id):
+def _discovered_instance(app_id, node, signature, instance_id, lifecycle_generation=3, date_updated=300.0):
   return {
     DEEPLOY_PLUGIN_DATA.APP_ID: app_id,
     DEEPLOY_PLUGIN_DATA.NODE: node,
@@ -38,14 +40,25 @@ def _discovered_instance(app_id, node, signature, instance_id):
       "instance_conf": {},
     },
     DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: None,
+    DEEPLOY_PLUGIN_DATA.DEEPLOY_SPECS: {
+      DEEPLOY_KEYS.LIFECYCLE_GENERATION: lifecycle_generation,
+      DEEPLOY_KEYS.DATE_UPDATED: date_updated,
+      DEEPLOY_KEYS.JOB_ID: 77,
+    },
   }
 
 
 def _make_delete_plugin():
   plugin = make_deeploy_plugin()
   plugin.stop_calls = []
+  plugin.stop_payloads = []
   plugin.logs = []
-  plugin.cmdapi_stop_pipeline = lambda node_address, name: plugin.stop_calls.append((node_address, name))
+
+  def stop_pipeline(node_address, name, command_content=None):
+    plugin.stop_calls.append((node_address, name))
+    plugin.stop_payloads.append(command_content)
+
+  plugin.cmdapi_stop_pipeline = stop_pipeline
   plugin.P = lambda msg, *args, **kwargs: plugin.logs.append(str(msg))
   plugin.Pd = lambda msg, *args, **kwargs: plugin.logs.append(str(msg))
   return plugin
@@ -70,6 +83,39 @@ class DeeployDeletePipelineCommandTests(unittest.TestCase):
     self.assertIs(returned, discovered)
     self.assertEqual(plugin.stop_calls, [("0xai_node_1", "sentinelapi-0_d60b35d")])
     self.assertTrue(any("duplicate" in log.lower() or "collapsed" in log.lower() for log in plugin.logs))
+
+  def test_delete_command_uses_discovered_lifecycle_generation(self):
+    plugin = _make_delete_plugin()
+    discovered = [
+      _discovered_instance(
+        "app-1",
+        "0xai_node_1",
+        "PLUGIN_A",
+        "a-1",
+        lifecycle_generation=4,
+        date_updated=400.0,
+      ),
+    ]
+
+    plugin.delete_pipeline_from_nodes(
+      app_id="app-1",
+      owner="0xOwner",
+      discovered_instances=discovered,
+    )
+
+    self.assertEqual(plugin.stop_calls, [("0xai_node_1", "app-1")])
+    self.assertEqual(len(plugin.stop_payloads), 1)
+    payload = plugin.stop_payloads[0]
+    self.assertEqual(payload[ct.CONFIG_STREAM.NAME], "app-1")
+    self.assertEqual(payload[ct.CONFIG_STREAM.K_OWNER], "0xOwner")
+    self.assertEqual(
+      payload[ct.CONFIG_STREAM.DEEPLOY_SPECS][DEEPLOY_KEYS.LIFECYCLE_GENERATION],
+      4,
+    )
+    self.assertEqual(
+      payload[ct.CONFIG_STREAM.DEEPLOY_SPECS][DEEPLOY_KEYS.DATE_UPDATED],
+      400.0,
+    )
 
   def test_multinode_delete_emits_one_stop_per_node_in_first_discovery_order(self):
     plugin = _make_delete_plugin()
@@ -226,6 +272,7 @@ class DeeployDeletePipelineEndpointTests(unittest.TestCase):
     plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
     plugin.stop_calls = []
     plugin.discovery_calls = []
+    plugin.deepcopy = copy.deepcopy
     plugin.cfg_deeploy_verbose = 0
     plugin.P = lambda *args, **kwargs: None
     plugin.Pd = lambda *args, **kwargs: None
@@ -243,7 +290,11 @@ class DeeployDeletePipelineEndpointTests(unittest.TestCase):
       DEEPLOY_KEYS.ESCROW_OWNER: "0xOwner",
     }
     plugin._DeeployManagerApiPlugin__ensure_eth_balance = lambda: None
-    plugin.cmdapi_stop_pipeline = lambda node_address, name: plugin.stop_calls.append((node_address, name))
+
+    def stop_pipeline(node_address, name, command_content=None):
+      plugin.stop_calls.append((node_address, name))
+
+    plugin.cmdapi_stop_pipeline = stop_pipeline
 
     def discover(**kwargs):
       plugin.discovery_calls.append(kwargs)

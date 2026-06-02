@@ -620,6 +620,48 @@ class _DeeployMixin:
       raise ValueError("Sender {} is not an oracle".format(sender))
     return True
 
+  def _coerce_deeploy_lifecycle_generation(self, value):
+    if isinstance(value, bool) or value is None:
+      return 0
+    try:
+      return max(0, int(float(value)))
+    except (TypeError, ValueError):
+      return 0
+
+  def _advance_deeploy_lifecycle_specs(self, dct_deeploy_specs, operation):
+    specs = self.deepcopy(dct_deeploy_specs) if isinstance(dct_deeploy_specs, dict) else {}
+    ts = self.time()
+    current_generation = self._coerce_deeploy_lifecycle_generation(
+      specs.get(DEEPLOY_KEYS.LIFECYCLE_GENERATION)
+    )
+    specs[DEEPLOY_KEYS.LIFECYCLE_GENERATION] = current_generation + 1
+    specs[DEEPLOY_KEYS.LIFECYCLE_OPERATION] = operation
+    specs[DEEPLOY_KEYS.DATE_UPDATED] = ts
+    if DEEPLOY_KEYS.DATE_CREATED not in specs:
+      specs[DEEPLOY_KEYS.DATE_CREATED] = ts
+    return specs
+
+  def _make_deeploy_delete_command_content(self, app_id, owner, deeploy_specs):
+    source_specs = deeploy_specs if isinstance(deeploy_specs, dict) else {}
+    command_specs = {}
+    for key in (
+      DEEPLOY_KEYS.LIFECYCLE_GENERATION,
+      DEEPLOY_KEYS.DATE_UPDATED,
+      DEEPLOY_KEYS.DATE_CREATED,
+      DEEPLOY_KEYS.JOB_ID,
+      DEEPLOY_KEYS.PROJECT_ID,
+      DEEPLOY_KEYS.PROJECT_NAME,
+    ):
+      if key in source_specs:
+        command_specs[key] = self.deepcopy(source_specs[key])
+    command_specs[DEEPLOY_KEYS.LIFECYCLE_OPERATION] = "delete"
+
+    return {
+      ct.CONFIG_STREAM.NAME: app_id,
+      ct.CONFIG_STREAM.K_OWNER: owner,
+      ct.CONFIG_STREAM.DEEPLOY_SPECS: command_specs,
+    }
+
   def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, job_app_type=None, dct_deeploy_specs=None):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
@@ -678,6 +720,10 @@ class _DeeployMixin:
     detected_job_app_type = job_app_type or self.deeploy_detect_job_app_type(plugins)
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
+    dct_deeploy_specs = self._advance_deeploy_lifecycle_specs(
+      dct_deeploy_specs,
+      operation="create",
+    )
 
     plugins = self._autowire_native_container_semaphore(
       app_id=app_id,
@@ -798,6 +844,10 @@ class _DeeployMixin:
     dct_deeploy_specs = self._ensure_deeploy_specs_job_config(
       dct_deeploy_specs,
       pipeline_params=pipeline_params,
+    )
+    dct_deeploy_specs = self._advance_deeploy_lifecycle_specs(
+      dct_deeploy_specs,
+      operation="update",
     )
 
     requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
@@ -1026,7 +1076,6 @@ class _DeeployMixin:
       return None
 
     refreshed_specs = self.deepcopy(specs)
-    refreshed_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     refreshed_specs = self._ensure_deeploy_specs_job_config(refreshed_specs)
     return refreshed_specs
 
@@ -2886,6 +2935,21 @@ class _DeeployMixin:
       iter_plugins = []
       if target_nodes is not None and node not in target_nodes:
         continue
+
+      def _append_discovered_plugin(pipeline_app_id, pipeline_specs, current_plugin_signature, instance_dict):
+        current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
+        chainstore_key = instance_dict['instance_conf'].get(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, None)
+        iter_plugins.append({
+          DEEPLOY_PLUGIN_DATA.APP_ID: pipeline_app_id,
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: current_instance_id,
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: current_plugin_signature,
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: instance_dict,
+          DEEPLOY_PLUGIN_DATA.NODE: node,
+          DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: chainstore_key,
+          DEEPLOY_PLUGIN_DATA.DEEPLOY_SPECS: self.deepcopy(pipeline_specs or {}),
+        })
+        return
+
       # search by job_id
       if job_id is not None:
         for current_pipeline_app_id, pipeline in pipelines.items():
@@ -2896,59 +2960,50 @@ class _DeeployMixin:
           for current_plugin_signature, plugins_instances in pipeline[NetMonCt.PLUGINS].items():
             for instance_dict in plugins_instances:
               current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
-              chainstore_key = instance_dict['instance_conf'].get(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, None)
               if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
                 # If we find a match by signature and instance_id, add it to the list and break.
-                iter_plugins.append({
-                  DEEPLOY_PLUGIN_DATA.APP_ID: current_pipeline_app_id,
-                  DEEPLOY_PLUGIN_DATA.INSTANCE_ID: current_instance_id,
-                  DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: current_plugin_signature,
-                  DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: instance_dict,
-                  DEEPLOY_PLUGIN_DATA.NODE: node,
-                  DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: chainstore_key,
-                })
+                _append_discovered_plugin(
+                  pipeline_app_id=current_pipeline_app_id,
+                  pipeline_specs=current_pipeline_deeploy_specs,
+                  current_plugin_signature=current_plugin_signature,
+                  instance_dict=instance_dict,
+                )
                 break
               if instance_id is None and (plugin_signature is None or plugin_signature == current_plugin_signature):
                 # If no specific signature or instance_id is provided, add all instances
-                iter_plugins.append({
-                  DEEPLOY_PLUGIN_DATA.APP_ID: current_pipeline_app_id,
-                  DEEPLOY_PLUGIN_DATA.INSTANCE_ID: current_instance_id,
-                  DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: current_plugin_signature,
-                  DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: instance_dict,
-                  DEEPLOY_PLUGIN_DATA.NODE: node,
-                  DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: chainstore_key,
-                })
+                _append_discovered_plugin(
+                  pipeline_app_id=current_pipeline_app_id,
+                  pipeline_specs=current_pipeline_deeploy_specs,
+                  current_plugin_signature=current_plugin_signature,
+                  instance_dict=instance_dict,
+                )
       # search by app_id
       if len(iter_plugins) > 0:
         discovered_plugins.extend(iter_plugins)
         continue
       if app_id is not None and app_id in pipelines:
+        current_pipeline_deeploy_specs = pipelines[app_id].get(NetMonCt.DEEPLOY_SPECS, None)
         for current_plugin_signature, plugins_instances in pipelines[app_id][NetMonCt.PLUGINS].items():
           # plugins_instances is a list of dictionaries
           for instance_dict in plugins_instances:
             current_instance_id = instance_dict[NetMonCt.PLUGIN_INSTANCE]
-            chainstore_key = instance_dict['instance_conf'].get(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, None)
             if current_plugin_signature == plugin_signature and current_instance_id == instance_id:
               # If we find a match by signature and instance_id, add it to the list and break.
-              iter_plugins.append({
-                DEEPLOY_PLUGIN_DATA.APP_ID : app_id,
-                DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
-                DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
-                DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE : instance_dict,
-                DEEPLOY_PLUGIN_DATA.NODE: node,
-                DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: chainstore_key,
-              })
+              _append_discovered_plugin(
+                pipeline_app_id=app_id,
+                pipeline_specs=current_pipeline_deeploy_specs,
+                current_plugin_signature=current_plugin_signature,
+                instance_dict=instance_dict,
+              )
               break
             if instance_id is None and (plugin_signature is None or plugin_signature == current_plugin_signature):
               # If no specific signature or instance_id is provided, add all instances
-              iter_plugins.append({
-                DEEPLOY_PLUGIN_DATA.APP_ID : app_id,
-                DEEPLOY_PLUGIN_DATA.INSTANCE_ID : current_instance_id,
-                DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE : current_plugin_signature,
-                DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE : instance_dict,
-                DEEPLOY_PLUGIN_DATA.NODE: node,
-                DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: chainstore_key,
-              })
+              _append_discovered_plugin(
+                pipeline_app_id=app_id,
+                pipeline_specs=current_pipeline_deeploy_specs,
+                current_plugin_signature=current_plugin_signature,
+                instance_dict=instance_dict,
+              )
           # endfor each instance
         # endfor each plugin signature
       # endif app_id found
@@ -3219,7 +3274,10 @@ class _DeeployMixin:
     )
     if isinstance(deeploy_specs, dict):
       deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
-      deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+      deeploy_specs = self._advance_deeploy_lifecycle_specs(
+        deeploy_specs,
+        operation="scale",
+      )
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
 
     chainstore_response_keys = self.defaultdict(list)
@@ -3450,12 +3508,13 @@ class _DeeployMixin:
     for instance in discovered_instances:
       node = instance[DEEPLOY_PLUGIN_DATA.NODE]
       pipeline_app_id = instance[DEEPLOY_PLUGIN_DATA.APP_ID]
+      deeploy_specs = instance.get(DEEPLOY_PLUGIN_DATA.DEEPLOY_SPECS, {})
       target_key = (node, pipeline_app_id)
       if target_key in seen_targets:
         duplicate_count += 1
         continue
       seen_targets.add(target_key)
-      unique_targets.append(target_key)
+      unique_targets.append((node, pipeline_app_id, deeploy_specs))
 
     if duplicate_count:
       self.P(
@@ -3464,11 +3523,16 @@ class _DeeployMixin:
         color='y',
       )
 
-    for node, pipeline_app_id in unique_targets:
+    for node, pipeline_app_id, deeploy_specs in unique_targets:
       self.P(f"Stopping pipeline '{pipeline_app_id}' on {node}")
       self.cmdapi_stop_pipeline(
         node_address=node,
         name=pipeline_app_id,
+        command_content=self._make_deeploy_delete_command_content(
+          app_id=pipeline_app_id,
+          owner=owner,
+          deeploy_specs=deeploy_specs,
+        ),
       )
     #endfor each target node
     return discovered_instances

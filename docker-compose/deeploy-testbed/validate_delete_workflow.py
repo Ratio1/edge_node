@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import copy
 import json
 import os
 import subprocess
@@ -80,6 +81,10 @@ def stream_exists(container, app_id):
   return result.returncode == 0
 
 
+def read_stream_config(container, app_id):
+  return read_json_file(container, stream_config_path(app_id))
+
+
 def wait_for_stream_state(container, app_id, expected_exists):
   deadline = time.time() + POLL_TIMEOUT
   while time.time() < deadline:
@@ -88,6 +93,26 @@ def wait_for_stream_state(container, app_id, expected_exists):
     time.sleep(2)
   state = "exist" if expected_exists else "be deleted"
   raise TimeoutError(f"Timed out waiting for {app_id} to {state} on {container}")
+
+
+def wait_for_stream_generation(container, app_id, generation):
+  deadline = time.time() + POLL_TIMEOUT
+  last_generation = None
+  while time.time() < deadline:
+    if stream_exists(container, app_id):
+      try:
+        config = read_stream_config(container, app_id)
+        specs = config.get("DEEPLOY_SPECS", {})
+        last_generation = specs.get(DEEPLOY_KEYS.LIFECYCLE_GENERATION)
+        if last_generation == generation:
+          return config
+      except Exception:
+        pass
+    time.sleep(2)
+  raise TimeoutError(
+    f"Timed out waiting for {app_id} generation {generation} on {container}; "
+    f"last observed generation was {last_generation}"
+  )
 
 
 def list_received_command_files(container):
@@ -110,12 +135,28 @@ def count_delete_commands(container, app_id):
       data = read_json_file(container, path)
     except Exception:
       continue
-    if data.get("ACTION") == "DELETE_CONFIG" and data.get("PAYLOAD") == app_id:
+    payload = data.get("PAYLOAD")
+    payload_app_id = payload.get("NAME") if isinstance(payload, dict) else payload
+    if data.get("ACTION") == "DELETE_CONFIG" and payload_app_id == app_id:
       count += 1
   return count
 
 
-def make_pipeline_config(app_id, node_addresses):
+def wait_for_delete_command_count(container, app_id, expected_count):
+  deadline = time.time() + POLL_TIMEOUT
+  last_count = None
+  while time.time() < deadline:
+    last_count = count_delete_commands(container, app_id)
+    if last_count >= expected_count:
+      return last_count
+    time.sleep(2)
+  raise TimeoutError(
+    f"Timed out waiting for {expected_count} DELETE_CONFIG command(s) for {app_id} "
+    f"on {container}; last observed count was {last_count}"
+  )
+
+
+def make_pipeline_config(app_id, node_addresses, lifecycle_generation=1, lifecycle_operation="create"):
   now = time.time()
   return {
     ct.CONFIG_STREAM.NAME: app_id,
@@ -132,7 +173,9 @@ def make_pipeline_config(app_id, node_addresses):
       DEEPLOY_KEYS.CURRENT_TARGET_NODES: list(node_addresses),
       DEEPLOY_KEYS.DATE_CREATED: now,
       DEEPLOY_KEYS.DATE_UPDATED: now,
-      DEEPLOY_KEYS.JOB_TAGS: ["deeploy-0002-e2e"],
+      DEEPLOY_KEYS.LIFECYCLE_GENERATION: lifecycle_generation,
+      DEEPLOY_KEYS.LIFECYCLE_OPERATION: lifecycle_operation,
+      DEEPLOY_KEYS.JOB_TAGS: ["deeploy-0003-e2e"],
       DEEPLOY_KEYS.SPARE_NODES: [],
       DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: False,
     },
@@ -148,7 +191,27 @@ def make_pipeline_config(app_id, node_addresses):
   }
 
 
-def make_discovered_instances(app_id, node_addresses):
+def make_delete_payload(app_id, deeploy_specs):
+  command_specs = {}
+  for key in (
+    DEEPLOY_KEYS.JOB_ID,
+    DEEPLOY_KEYS.PROJECT_ID,
+    DEEPLOY_KEYS.LIFECYCLE_GENERATION,
+    DEEPLOY_KEYS.LIFECYCLE_OPERATION,
+    DEEPLOY_KEYS.DATE_CREATED,
+    DEEPLOY_KEYS.DATE_UPDATED,
+  ):
+    if key in deeploy_specs:
+      command_specs[key] = copy.deepcopy(deeploy_specs[key])
+  command_specs[DEEPLOY_KEYS.LIFECYCLE_OPERATION] = "delete"
+  return {
+    ct.CONFIG_STREAM.NAME: app_id,
+    ct.CONFIG_STREAM.K_OWNER: OWNER,
+    ct.CONFIG_STREAM.DEEPLOY_SPECS: command_specs,
+  }
+
+
+def make_discovered_instances(app_id, node_addresses, deeploy_specs):
   discovered = []
   for node in node_addresses:
     for instance_id in PLUGIN_INSTANCES:
@@ -162,6 +225,7 @@ def make_discovered_instances(app_id, node_addresses):
           "instance_conf": {},
         },
         DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: None,
+        DEEPLOY_PLUGIN_DATA.DEEPLOY_SPECS: copy.deepcopy(deeploy_specs),
       })
   return discovered
 
@@ -174,9 +238,10 @@ def make_delete_harness(session):
   plugin = RuntimeDeleteHarness.__new__(RuntimeDeleteHarness)
   plugin.P = lambda msg, *args, **kwargs: print(f"[deeploy-delete] {msg}")
   plugin.Pd = plugin.P
-  plugin.cmdapi_stop_pipeline = lambda node_address, name: session._send_command_delete_pipeline(
+  plugin.deepcopy = copy.deepcopy
+  plugin.cmdapi_stop_pipeline = lambda node_address, name, command_content=None: session._send_command_delete_pipeline(
     node_address,
-    name,
+    command_content if command_content is not None else name,
     show_command=False,
   )
   return plugin
@@ -197,7 +262,7 @@ def main():
     secured=False,
     encrypt_comms=False,
     root_topic=ROOT_TOPIC,
-    name="deeploy-0002-e2e",
+    name="deeploy-0003-e2e",
     auto_configuration=False,
     run_dauth=False,
     use_home_folder=False,
@@ -220,6 +285,37 @@ def main():
 
     for container in CONTAINERS:
       wait_for_stream_state(container, APP_ID, expected_exists=True)
+      wait_for_stream_generation(container, APP_ID, generation=1)
+
+    updated_pipeline_config = make_pipeline_config(
+      APP_ID,
+      node_addresses,
+      lifecycle_generation=2,
+      lifecycle_operation="update",
+    )
+    for node_address in node_addresses:
+      session._send_command_create_pipeline(node_address, updated_pipeline_config, show_command=False)
+
+    for container in CONTAINERS:
+      wait_for_stream_generation(container, APP_ID, generation=2)
+
+    stale_delete_counts = {
+      container: count_delete_commands(container, APP_ID)
+      for container in CONTAINERS
+    }
+    stale_payload = make_delete_payload(APP_ID, pipeline_config["DEEPLOY_SPECS"])
+    for node_address in node_addresses:
+      session._send_command_delete_pipeline(node_address, stale_payload, show_command=False)
+
+    for container in CONTAINERS:
+      wait_for_delete_command_count(container, APP_ID, stale_delete_counts[container] + 1)
+
+    # The stale delete has been received; leave the node a short settle window
+    # before asserting that the newer generation is still the saved config.
+    time.sleep(5)
+    for container in CONTAINERS:
+      wait_for_stream_state(container, APP_ID, expected_exists=True)
+      wait_for_stream_generation(container, APP_ID, generation=2)
 
     baseline_counts = {
       container: count_delete_commands(container, APP_ID)
@@ -227,7 +323,11 @@ def main():
     }
 
     harness = make_delete_harness(session)
-    discovered = make_discovered_instances(APP_ID, node_addresses)
+    discovered = make_discovered_instances(
+      APP_ID,
+      node_addresses,
+      updated_pipeline_config["DEEPLOY_SPECS"],
+    )
     discovery_calls = []
 
     def discover(**kwargs):
@@ -267,6 +367,7 @@ def main():
     print(json.dumps({
       "app_id": APP_ID,
       "node_addresses": node_addresses,
+      "stale_delete_counts": stale_delete_counts,
       "baseline_delete_counts": baseline_counts,
       "final_delete_counts": final_counts,
       "delete_count_deltas": deltas,
