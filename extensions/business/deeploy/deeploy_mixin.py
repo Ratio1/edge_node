@@ -1547,13 +1547,10 @@ class _DeeployMixin:
       return normalized_keys
 
     self.P(f"Resetting response keys in chainstore before dispatching {context}...")
+    reset_kwargs = self._get_chainstore_response_local_reset_write_kwargs()
     for _, node_response_keys in normalized_keys.items():
       for response_key in node_response_keys:
-        try:
-          self.chainstore_set(response_key, None)
-        except Exception as e:
-          self.P(f"Error resetting response key {response_key} in chainstore: {e}", color='r')
-        # end try
+        self._reset_chainstore_response_key(response_key, write_kwargs=reset_kwargs)
       # end for
     # end for
 
@@ -2830,13 +2827,11 @@ class _DeeployMixin:
     self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")
 
     # RESET chainstore_response_keys here
-    try:
-      self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
-      for node_addr, response_keys in chainstore_response_keys.items():
-        for response_key in response_keys:
-          self.chainstore_set(response_key, None)
-    except Exception as e:
-      self.P(f"Error resetting chainstore keys: {e}", color='r')
+    self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
+    self._reset_chainstore_response_keys(
+      chainstore_response_keys,
+      context=f"scale up job {job_id}",
+    )
 
     # Start pipelines on nodes.
     self._start_create_update_pipelines(create_pipelines=create_pipelines,
@@ -3428,9 +3423,17 @@ class _DeeployMixin:
     self.P(f"Checked all job IDs.")
     return netmon_job_ids
   
-  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, allow_missing=False, discovered_instances=None):
+  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, target_nodes=None, allow_missing=False, discovered_instances=None):
+    if not target_nodes:
+      target_nodes = None
+
     if discovered_instances is None:
-      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+      discovered_instances = self._discover_plugin_instances(
+        app_id=app_id,
+        job_id=job_id,
+        owner=owner,
+        target_nodes=target_nodes,
+      )
 
     if len(discovered_instances) == 0:
       if allow_missing:
@@ -3440,11 +3443,32 @@ class _DeeployMixin:
       msg += f"{f'app_id {app_id}' if app_id else f'job_id {job_id}'} and owner '{owner}'."
       raise ValueError(msg)
     #endif
+
+    seen_targets = set()
+    unique_targets = []
+    duplicate_count = 0
     for instance in discovered_instances:
-      self.P(f"Stopping pipeline '{instance[DEEPLOY_PLUGIN_DATA.APP_ID]}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
+      node = instance[DEEPLOY_PLUGIN_DATA.NODE]
+      pipeline_app_id = instance[DEEPLOY_PLUGIN_DATA.APP_ID]
+      target_key = (node, pipeline_app_id)
+      if target_key in seen_targets:
+        duplicate_count += 1
+        continue
+      seen_targets.add(target_key)
+      unique_targets.append(target_key)
+
+    if duplicate_count:
+      self.P(
+        f"Collapsed {duplicate_count} duplicate Deeploy delete target(s) from "
+        f"{len(discovered_instances)} discovered plugin instance(s).",
+        color='y',
+      )
+
+    for node, pipeline_app_id in unique_targets:
+      self.P(f"Stopping pipeline '{pipeline_app_id}' on {node}")
       self.cmdapi_stop_pipeline(
-        node_address=instance[DEEPLOY_PLUGIN_DATA.NODE],
-        name=instance[DEEPLOY_PLUGIN_DATA.APP_ID],
+        node_address=node,
+        name=pipeline_app_id,
       )
     #endfor each target node
     return discovered_instances

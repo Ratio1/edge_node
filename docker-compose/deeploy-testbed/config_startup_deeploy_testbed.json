@@ -1,0 +1,102 @@
+{
+  "EE_ID": "deeploy_node",
+  "SECURED": false,
+  "IO_FORMATTER": "",
+  "MAIN_LOOP_RESOLUTION": 10,
+  "SYSTEM_TEMPERATURE_CHECK": false,
+  "COMPRESS_HEARTBEAT": false,
+  "MIN_AVAIL_MEM_THR": -10.09,
+  "MIN_AVAIL_DISK_SIZE_GB": -100,
+  "CRITICAL_RESTART_LOW_MEM": -10.20,
+  "CHECK_RAM_ON_SHUTDOWN": false,
+  "RESET_ADMIN_PIPELINE": true,
+  "SECONDS_HEARTBEAT": 3,
+  "HEARTBEAT_TIMERS": false,
+  "HEARTBEAT_LOG": false,
+  "PLUGINS_ON_THREADS": true,
+  "ADMIN_PIPELINE_ASYNC_DISPATCH": true,
+  "CAPTURE_STATS_DISPLAY": 60,
+  "SHUTDOWN_NO_STREAMS": false,
+  "TIMERS_DUMP_INTERVAL": 654,
+  "EXTENDED_TIMERS_DUMP": false,
+  "PLUGINS_DEBUG_CONFIG_CHANGES": true,
+  "BLOCKCHAIN_CONFIG": {
+    "PEM_FILE": "e2.pem",
+    "PASSWORD": null,
+    "PEM_LOCATION": "data"
+  },
+  "CAPTURE_ENVIRONMENT": {
+    "FORCE_CAP_RESOLUTION": -1,
+    "DEFAULT_PLUGIN": false,
+    "DISALLOWED_URL_DUPLICATES": ["VideoStream"]
+  },
+  "SERVING_ENVIRONMENT": {
+    "LOG_TIMEOUTS_PERIOD": 3600,
+    "COMM_ENGINE": "queue",
+    "USE_AMP": false,
+    "MAX_WAIT_TIME_MULTIPLIER": 50,
+    "SERVER_COLLECTOR_TIMEDELTA": 3600,
+    "AUTO_WARMUPS": {},
+    "COMM_METHOD": "default",
+    "SERVING_IN_PROCESS": false,
+    "CHECK_BLOCKED_INPROCESS_SERVING": false,
+    "MODEL_ZOO_CONFIG": {
+      "endpoint": "$EE_MINIO_ENDPOINT",
+      "access_key": "$EE_MINIO_ACCESS_KEY",
+      "secret_key": "$EE_MINIO_SECRET_KEY",
+      "secure": "$EE_MINIO_SECURE",
+      "bucket_name": "$EE_MINIO_MODEL_BUCKET"
+    }
+  },
+  "PLUGINS_ENVIRONMENT": {
+    "DEMO_MODE": true,
+    "DEBUG_OBJECTS": false,
+    "SEND_MANIFEST_EACH": 290,
+    "ADD_ORIGINAL_IMAGE": false,
+    "DEBUG_CONFIG_CHANGES": true
+  },
+  "ADMIN_PIPELINE": {
+    "NET_CONFIG_MONITOR": {
+      "PROCESS_DELAY": 0
+    },
+    "NET_MON_01": {
+      "PROCESS_DELAY": 3
+    },
+    "UPDATE_MONITOR_01": {
+      "DELAY_RESTART_ON_ORACLE": false,
+      "PROCESS_DELAY": 3600,
+      "VERSION_TOKEN": "",
+      "RESTART_ON_BEHIND": false,
+      "VERSION_URL": "",
+      "USE_YAML": false,
+      "FORCE_RESTART_AFTER": null,
+      "REBOOT_ON_RESTART": false,
+      "RELEASE_TAG": "develop"
+    }
+  },
+  "COMMUNICATION_ENVIRONMENT": {
+    "ENCRYPTED_COMMS": false,
+    "ACCEPT_UNENCRYPTED_COMMANDS": true,
+    "LOCAL_COMMAND_BYPASS": true,
+    "QOS": 0,
+    "CONN_MAX_RETRY_ITERS": 5,
+    "LOG_SEND_COMMANDS": true,
+    "SAVE_RECEIVED_COMMANDS": true,
+    "DEBUG_COMM_ERRORS": true,
+    "DEBUG_LOG_PAYLOADS": false,
+    "DEBUG_LOG_PAYLOADS_PIPELINES": [],
+    "DEBUG_LOG_PAYLOADS_SIGNATURES": [],
+    "DEBUG_LOG_PAYLOADS_SAVE_FILTER": null,
+    "DEBUG_LOG_PAYLOADS_REVALIDATE": false
+  },
+  "HEAVY_OPS_CONFIG": {
+    "ACTIVE_COMM_ASYNC": [],
+    "ACTIVE_ON_COMM_THREAD": []
+  },
+  "CONFIG_RETRIEVE": [
+    {
+      "TYPE": "local",
+      "APP_CONFIG_ENDPOINT": "/edge_node/docker-compose/deeploy-testbed/config_app_deeploy_testbed.json"
+    }
+  ]
+}
