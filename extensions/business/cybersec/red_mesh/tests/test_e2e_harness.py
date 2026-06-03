@@ -1,7 +1,10 @@
+import unittest
+
 from extensions.business.cybersec.red_mesh.tests.e2e.run_e2e import archive_passes
 from extensions.business.cybersec.red_mesh.tests.e2e.api_top10_e2e import (
   assert_llm_boundary,
   gateway_request_headers,
+  job_status_values,
   llm_boundary_blob_from_archive,
   target_config_with_bearer_auth,
   target_confirmation_for_url,
@@ -105,3 +108,27 @@ def test_api_top10_llm_boundary_blob_uses_archive_report_fields():
   assert "not included" not in blob
   assert assert_llm_boundary(blob) == []
   assert assert_llm_boundary(blob + " Authorization: Bearer eyJabc.def.ghi")
+
+
+class ApiTop10StatusTests(unittest.TestCase):
+  def test_job_status_values_prioritizes_nested_terminal_statuses(self):
+    resp = {
+      "status": "network_tracked",
+      "job": {"job_status": "FINALIZED"},
+    }
+
+    self.assertEqual(
+      job_status_values(resp, "job-1"),
+      ["FINALIZED", "network_tracked"],
+    )
+
+  def test_job_status_values_reads_job_keyed_responses(self):
+    resp = {
+      "RM-1": {"job_id": "job-1", "status": "completed"},
+      "status": "network_tracked",
+    }
+
+    self.assertEqual(
+      job_status_values(resp, "job-1"),
+      ["completed", "network_tracked"],
+    )

@@ -1,6 +1,8 @@
 """
 TODO: example pipeline with additional explanations
 """
+import os
+
 from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess
 from llama_cpp import Llama, llama_cpp as llama_cpp_lib
 from extensions.serving.mixins_llm.llm_utils import LlmCT
@@ -29,6 +31,7 @@ _CONFIG = {
 
   "MODEL_NAME": None,
   "MODEL_FILENAME": None,
+  "MODEL_PATH": None,
 
   # Format used to compute the prompt for the model
   "CHAT_FORMAT": None,
@@ -39,6 +42,7 @@ _CONFIG = {
   # TODO: have method for partial moving of the layers depending on the
   #  available VRAM
   "N_GPU_LAYERS": None,
+  "N_THREADS": None,
 
   # Format used by the model when answering requests
   "DEFAULT_RESPONSE_FORMAT": None,
@@ -53,15 +57,33 @@ _CONFIG = {
 class LlamaCppBaseServingProcess(BaseServingProcess):
   CONFIG = _CONFIG
 
+  def _get_model_path(self):
+    model_path = self.cfg_model_path
+    if model_path is None:
+      return None
+    if isinstance(model_path, str):
+      model_path = model_path.strip()
+      if not model_path:
+        return None
+    return os.path.abspath(os.path.expanduser(os.fspath(model_path)))
+
+  def _get_model_path_display_name(self, model_path):
+    model_name = os.path.basename(model_path.rstrip(os.sep))
+    return model_name or "local_gguf_model"
+
   def _load_tokenizer(self):
     # llama.cpp uses built-in tokenizer
     return
 
   def get_model_name(self):
+    model_path = self._get_model_path()
+    if model_path is not None:
+      return self._get_model_path_display_name(model_path)
+    # endif local model path
     model_id = self.cfg_model_name
     model_filename = self.cfg_model_filename
     if model_id is None or model_filename is None:
-      raise ValueError("Both MODEL_NAME and MODEL_FILENAME must be specified for Llama_cpp models.")
+      raise ValueError("Either MODEL_PATH or both MODEL_NAME and MODEL_FILENAME must be specified for Llama_cpp models.")
     # endif model id/filename check
     return f"{model_id}/{model_filename}"
 
@@ -114,8 +136,22 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     return self.cfg_default_response_format
 
   def _load_model(self):
+    model_path = self._get_model_path()
     model_id = self.cfg_model_name
     model_filename = self.cfg_model_filename
+    if model_path is not None:
+      model_ref = self._get_model_path_display_name(model_path)
+      if not os.path.isfile(model_path):
+        raise FileNotFoundError(f"Llama_cpp MODEL_PATH does not exist or is not a file: {model_ref}")
+      # endif invalid local path
+      safe_model_id = model_ref
+    else:
+      if model_id is None or model_filename is None:
+        raise ValueError("Either MODEL_PATH or both MODEL_NAME and MODEL_FILENAME must be specified for Llama_cpp models.")
+      # endif model id/filename check
+      model_ref = f"{model_id}/{model_filename}"
+      safe_model_id = model_id
+    # endif local path
 
     n_ctx = self.cfg_model_n_ctx
     if not isinstance(n_ctx, (int, float)):
@@ -132,8 +168,16 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       'n_gpu_layers': self.get_n_gpu_layers(),
       'verbose': True,
     }
+    n_threads = self.cfg_n_threads
+    if isinstance(n_threads, (int, float)) and int(n_threads) > 0:
+      model_params['n_threads'] = int(n_threads)
+    # endif configured thread count
 
-    self.P(f"Loading Llama_cpp model '{model_id}' from file '{model_filename}' with parameters: {self.json_dumps(model_params, indent=2)}")
+    if model_path is not None:
+      self.P(f"Loading Llama_cpp model from local file '{model_ref}' with parameters: {self.json_dumps(model_params, indent=2)}")
+    else:
+      self.P(f"Loading Llama_cpp model '{model_id}' from file '{model_filename}' with parameters: {self.json_dumps(model_params, indent=2)}")
+    # endif local path
 
     # This is safe because the _llama_from_pretrained() method will be called
     # synchronously by safe_load_model() and if the first time it fails it will be
@@ -142,7 +186,7 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
     # if this is the second call
     first_attempt_done = False
 
-    def _llama_from_pretrained():
+    def _load_llama_cpp_model():
       nonlocal first_attempt_done
       if first_attempt_done:
         # This means, this is the second attempt to load the model.
@@ -153,6 +197,12 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
         # endif layers offloaded to GPU
       first_attempt_done = True
       # endif not the first attempt
+      if model_path is not None:
+        return Llama(
+          model_path=model_path,
+          **model_params,
+        )
+      # endif local model path
       return Llama.from_pretrained(
         repo_id=model_id,
         filename=model_filename,
@@ -161,9 +211,9 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
       )
 
     self.model = self.safe_load_model(
-      load_model_method=_llama_from_pretrained,
-      model_id=model_id,
-      model_str_id=f"{model_id}/{model_filename}",
+      load_model_method=_load_llama_cpp_model,
+      model_id=safe_model_id,
+      model_str_id=model_ref,
     )
     self.P("Model loaded successfully.")
     return

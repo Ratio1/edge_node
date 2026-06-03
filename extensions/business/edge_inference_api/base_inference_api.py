@@ -47,7 +47,7 @@ Example pipeline configuration:
       "INSTANCES": [
         {
           "INSTANCE_ID": "llm_interface",
-          "AI_ENGINE": "llama_cpp",
+          "AI_ENGINE": "llama_cpp_small",
           "STARTUP_AI_ENGINE_PARAMS": {
             "HF_TOKEN": "<hf_token_if_needed>",
             "MODEL_FILENAME": "llama-3.2-1b-instruct-q4_k_m.gguf",
@@ -70,7 +70,7 @@ Example balanced peer configuration (Node A):
       "INSTANCES": [
         {
           "INSTANCE_ID": "llm_api_a",
-          "AI_ENGINE": "llama_cpp",
+          "AI_ENGINE": "llama_cpp_small",
           "REQUEST_BALANCING_ENABLED": true,
           "REQUEST_BALANCING_GROUP": "llm_cluster_prod",
           "REQUEST_BALANCING_CAPACITY": 1
@@ -90,7 +90,7 @@ Example balanced peer configuration (Node B):
       "INSTANCES": [
         {
           "INSTANCE_ID": "llm_api_b",
-          "AI_ENGINE": "llama_cpp",
+          "AI_ENGINE": "llama_cpp_small",
           "REQUEST_BALANCING_ENABLED": true,
           "REQUEST_BALANCING_GROUP": "llm_cluster_prod",
           "REQUEST_BALANCING_CAPACITY": 1

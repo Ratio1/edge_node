@@ -278,6 +278,38 @@ def launch_scan(rm: str, honeypot: str, target_config: dict, *,
   return job_id
 
 
+TERMINAL_JOB_STATUSES = {"finalized", "done", "completed"}
+
+
+def job_status_values(resp: dict, job_id: str) -> list[str]:
+  statuses = []
+
+  def add_status(value):
+    if value is None or value == "":
+      return
+    statuses.append(str(value))
+
+  if not isinstance(resp, dict):
+    return statuses
+
+  job = resp.get("job")
+  if isinstance(job, dict):
+    add_status(job.get("status"))
+    add_status(job.get("job_status"))
+
+  for item in resp.values():
+    if not isinstance(item, dict):
+      continue
+    if item.get("job_id") != job_id:
+      continue
+    add_status(item.get("status"))
+    add_status(item.get("job_status"))
+
+  add_status(resp.get("status"))
+  add_status(resp.get("job_status"))
+  return statuses
+
+
 def wait_for_finalize(rm: str, job_id: str, timeout: int = 600) -> dict:
   deadline = time.time() + timeout
   while time.time() < deadline:
@@ -286,11 +318,7 @@ def wait_for_finalize(rm: str, job_id: str, timeout: int = 600) -> dict:
     except (TimeoutError, OSError, error.URLError):
       time.sleep(5)
       continue
-    status = (
-      resp.get("status") or resp.get("job_status")
-      or (resp.get("job") or {}).get("job_status") or ""
-    )
-    if str(status).lower() in ("finalized", "done", "completed"):
+    if any(status.lower() in TERMINAL_JOB_STATUSES for status in job_status_values(resp, job_id)):
       return resp
     time.sleep(5)
   raise TimeoutError(f"job {job_id} did not finalize within {timeout}s")
