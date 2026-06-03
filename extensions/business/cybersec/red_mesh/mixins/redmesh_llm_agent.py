@@ -18,8 +18,10 @@ from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
 from ..services.llm_structured import (
   PROMPT_PROFILE_AUTO,
+  PROVIDER_PATH_REMOTE,
   build_response_format_for_prompt_profile,
   generate_exec_summary,
+  infer_provider_path,
   resolve_prompt_profile,
 )
 
@@ -1265,9 +1267,19 @@ class _RedMeshLlmAgentMixin(object):
     provider_path = llm_cfg.get("PROVIDER", "local")
     requested_profile = llm_cfg.get("PROMPT_PROFILE", PROMPT_PROFILE_AUTO)
     if requested_profile == PROMPT_PROFILE_AUTO:
+      # Resolve the auto profile through the same provider inference the
+      # structured service uses, so that an "auto" provider (or any value
+      # outside the literal remote set) still picks the remote profile when
+      # the model itself is remote (e.g. deepseek-chat). Pre-resolving to a
+      # concrete profile name here would otherwise short-circuit the
+      # model-based inference inside resolve_prompt_profile.
+      effective_path = infer_provider_path(
+        provider_path=provider_path,
+        model_name=model_name,
+      )
       requested_profile = (
         llm_cfg.get("REMOTE_PROMPT_PROFILE")
-        if provider_path in ("remote", "openai", "anthropic")
+        if effective_path == PROVIDER_PATH_REMOTE
         else llm_cfg.get("LOCAL_PROMPT_PROFILE")
       )
     profile = resolve_prompt_profile(

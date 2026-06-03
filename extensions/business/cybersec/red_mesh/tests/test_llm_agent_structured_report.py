@@ -203,6 +203,46 @@ class StructuredReportAdapterTests(unittest.TestCase):
     )
     self.assertEqual(owner._calls[0]["payload"]["temperature"], 0.25)
 
+  def test_auto_provider_with_remote_model_picks_remote_profile(self):
+    # Regression: PROVIDER="auto" must not be treated as local when the
+    # model itself is remote (e.g. deepseek-chat). Pre-resolving the
+    # "auto" prompt profile against a literal remote whitelist used to
+    # send the local json_schema profile to a remote model that only
+    # supports json_object. The auto provider now flows through the same
+    # model-based inference the structured service uses.
+    self._cfg_value = {
+      "ENABLED": True,
+      "PROVIDER": "auto",
+      "MODEL": "deepseek-chat",
+      "PROMPT_PROFILE": "auto",
+      "LOCAL_PROMPT_PROFILE": "local_cybersecqwen_quota_v1",
+      "REMOTE_PROMPT_PROFILE": "remote_rich_v1",
+      "STRUCTURED_MAX_FINDINGS": 12,
+      "STRUCTURED_MAX_TOKENS": 3072,
+      "STRUCTURED_TEMPERATURE": 0.25,
+    }
+    owner = _FakeOwner(chat_response={
+      "choices": [{"message": {"content": _valid_llm_response_content()}}],
+    })
+    out = _run(
+      owner,
+      job_id="j1",
+      findings=[{
+        "severity": "HIGH",
+        "title": "Authorization bypass",
+        "port": 443,
+      }],
+      aggregated_report={"total_findings": 1},
+    )
+
+    self.assertIsNotNone(out)
+    self.assertEqual(out["prompt_profile"], "remote_rich_v1")
+    self.assertEqual(out["provider_path"], "remote")
+    self.assertEqual(
+      owner._calls[0]["payload"]["response_format"],
+      {"type": "json_object"},
+    )
+
   def test_persists_fallback_skeleton_on_validation_failure(self):
     # LLM returns parseable but content-empty JSON twice — corrective
     # retry won't fix it, so generate_exec_summary returns the
