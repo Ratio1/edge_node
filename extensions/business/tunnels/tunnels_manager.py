@@ -11,6 +11,7 @@ _CONFIG = {
   **BasePlugin.CONFIG,
 
   'PORT': None,
+  'PROCESS_DELAY': 5 * 60,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
@@ -43,6 +44,10 @@ class TunnelsManagerPlugin(BasePlugin):
     self._sync_tcp_routes()
     return
 
+  def process(self):
+    self._sync_tcp_routes()
+    return
+
   def _tcp_route_key(self, public_port):
     return str(int(public_port))
 
@@ -62,27 +67,21 @@ class TunnelsManagerPlugin(BasePlugin):
       raise Exception(f"Invalid TCP public port range: {start}-{end}")
     return start, end
 
-  def _sync_tcp_routes(self, required=False):
+  def _sync_tcp_routes(self):
     try:
       return self.chainstore_hsync(hkey=self.cfg_tcp_routes_hkey)
     except Exception as exc:
-      if required:
-        raise Exception(f"Could not sync TCP route registry: {exc}") from exc
       self.P(f"Could not sync TCP route registry: {exc}", color="y")
     return None
 
-  def _get_tcp_routes(self, sync=False, require_sync=False):
-    if sync:
-      self._sync_tcp_routes(required=require_sync)
+  def _get_tcp_routes(self):
     routes = self.chainstore_hgetall(hkey=self.cfg_tcp_routes_hkey)
     if not isinstance(routes, dict):
       return {}
     return routes
 
-  def _get_tcp_route_record(self, public_port, sync=False, require_sync=False):
+  def _get_tcp_route_record(self, public_port):
     port = self._normalize_public_port(public_port)
-    if sync:
-      self._sync_tcp_routes(required=require_sync)
     route = self.chainstore_hget(hkey=self.cfg_tcp_routes_hkey, key=self._tcp_route_key(port))
     return route if isinstance(route, dict) else None
 
@@ -99,8 +98,8 @@ class TunnelsManagerPlugin(BasePlugin):
       "created_at": self.time_to_str(self.time()) if hasattr(self, "time_to_str") else None,
     }
 
-  def _find_tcp_route_for_tunnel(self, tunnel_id, sync=False):
-    routes = self._get_tcp_routes(sync=sync)
+  def _find_tcp_route_for_tunnel(self, tunnel_id):
+    routes = self._get_tcp_routes()
     for port_key, route in routes.items():
       if not isinstance(route, dict):
         continue
@@ -124,7 +123,7 @@ class TunnelsManagerPlugin(BasePlugin):
 
     for port in candidates:
       route_key = self._tcp_route_key(port)
-      routes = self._get_tcp_routes(sync=True, require_sync=True)
+      routes = self._get_tcp_routes()
       existing = routes.get(route_key)
       if existing:
         continue
@@ -144,7 +143,7 @@ class TunnelsManagerPlugin(BasePlugin):
       if not stored:
         continue
 
-      verified = self._get_tcp_route_record(port, sync=True, require_sync=True)
+      verified = self._get_tcp_route_record(port)
       if isinstance(verified, dict) and verified.get("tunnel_id") == tunnel_id and verified.get("hostname") == hostname:
         return verified
 
@@ -154,7 +153,7 @@ class TunnelsManagerPlugin(BasePlugin):
     if public_port is None:
       return False
     port = self._normalize_public_port(public_port)
-    route = self._get_tcp_route_record(port, sync=True, require_sync=True)
+    route = self._get_tcp_route_record(port)
     if not isinstance(route, dict):
       return False
     if expected_tunnel_id is not None and route.get("tunnel_id") != expected_tunnel_id:
@@ -165,13 +164,13 @@ class TunnelsManagerPlugin(BasePlugin):
       value=None,
     )
 
-  def _attach_tcp_route_to_tunnel(self, tunnel, sync=False):
+  def _attach_tcp_route_to_tunnel(self, tunnel):
     if not isinstance(tunnel, dict):
       return tunnel
     metadata = tunnel.get("metadata") or {}
     if metadata.get("type", "http") != "tcp":
       return tunnel
-    route = self._find_tcp_route_for_tunnel(tunnel.get("id"), sync=sync)
+    route = self._find_tcp_route_for_tunnel(tunnel.get("id"))
     if not route:
       return tunnel
     tunnel["tcp_route"] = route
@@ -186,7 +185,7 @@ class TunnelsManagerPlugin(BasePlugin):
     """
     Return only the Cloudflare origin hostname for a public TCP proxy port.
     """
-    route = self._get_tcp_route_record(public_port, sync=True, require_sync=True)
+    route = self._get_tcp_route_record(public_port)
     if not route or not route.get("enabled", True):
       raise Exception(f"No TCP route found for port {public_port}")
     hostname = route.get("hostname")
@@ -515,7 +514,6 @@ class TunnelsManagerPlugin(BasePlugin):
       raise Exception("Error fetching tunnels: " + str(response['errors']))
     result = response['result']
     if isinstance(result, list):
-      self._sync_tcp_routes()
       for tunnel in result:
         self._attach_tcp_route_to_tunnel(tunnel)
     return result
@@ -532,7 +530,7 @@ class TunnelsManagerPlugin(BasePlugin):
     response = self.requests.get(url, headers=headers).json()
     if response["success"] is False:
       raise Exception("Error fetching tunnel: " + str(response['errors']))
-    return self._attach_tcp_route_to_tunnel(response['result'], sync=True)
+    return self._attach_tcp_route_to_tunnel(response['result'])
 
   @BasePlugin.endpoint(method="get")
   def get_tunnel_by_token(self, tunnel_token: str, cloudflare_account_id: str, cloudflare_api_key: str):

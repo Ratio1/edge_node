@@ -10,6 +10,9 @@ _supervisor_module = types.ModuleType("naeural_core.business.default.web_app.sup
 class _BasePluginStub:
   CONFIG = {"VALIDATION_RULES": {}}
 
+  def on_init(self):
+    return
+
   @classmethod
   def endpoint(cls, **kwargs):
     def decorator(fn):
@@ -80,8 +83,10 @@ def make_plugin(requests):
   plugin.np = types.SimpleNamespace(random=_RandomStub())
   plugin._chainstore = {}
   plugin._chainstore_hsets = []
+  plugin._chainstore_hsyncs = []
 
   def chainstore_hsync(**kwargs):
+    plugin._chainstore_hsyncs.append(kwargs)
     return {"merged_fields": 0}
 
   def chainstore_hgetall(hkey, **kwargs):
@@ -506,7 +511,27 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     delete_writes = [call for call in plugin._chainstore_hsets if call["value"] is None]
     self.assertEqual(delete_writes, [])
 
-  def test_tcp_route_allocation_requires_chainstore_sync(self):
+  def test_tcp_route_sync_runs_only_on_init_and_process(self):
+    requests = _RequestsStub()
+    plugin = make_plugin(requests)
+
+    self.assertEqual(TunnelsManagerPlugin.CONFIG["PROCESS_DELAY"], 5 * 60)
+
+    plugin.on_init()
+
+    self.assertEqual(
+      [call["hkey"] for call in plugin._chainstore_hsyncs],
+      ["tunnels_manager_secrets", plugin.cfg_tcp_routes_hkey],
+    )
+
+    plugin.process()
+
+    self.assertEqual(
+      [call["hkey"] for call in plugin._chainstore_hsyncs],
+      ["tunnels_manager_secrets", plugin.cfg_tcp_routes_hkey, plugin.cfg_tcp_routes_hkey],
+    )
+
+  def test_tcp_route_allocation_uses_cached_chainstore_without_sync(self):
     requests = _RequestsStub()
     plugin = make_plugin(requests)
 
@@ -515,15 +540,14 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
 
     plugin.chainstore_hsync = failing_hsync
 
-    with self.assertRaises(Exception) as ctx:
-      plugin._claim_tcp_route(
-        tunnel_id="tunnel-id",
-        hostname="uuid-001.ratio1.link",
-        alias="My TCP Tunnel",
-      )
+    route = plugin._claim_tcp_route(
+      tunnel_id="tunnel-id",
+      hostname="uuid-001.ratio1.link",
+      alias="My TCP Tunnel",
+    )
 
-    self.assertIn("Could not sync TCP route registry", str(ctx.exception))
-    self.assertEqual(plugin._chainstore_hsets, [])
+    self.assertEqual(route["public_port"], 30000)
+    self.assertEqual(plugin.get_tcp_route(30000), "uuid-001.ratio1.link")
 
   def test_tcp_alias_creates_origin_hostname_only(self):
     requests = _RequestsStub(
