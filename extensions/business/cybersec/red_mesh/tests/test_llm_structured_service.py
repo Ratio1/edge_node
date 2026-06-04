@@ -87,6 +87,45 @@ def _make_valid_response_dict(*, with_critical_acknowledgement=True) -> dict:
   }
 
 
+def _make_valid_local_chunk_responses() -> list[str]:
+  full = _make_valid_response_dict()
+  return [
+    json.dumps({
+      "executive_headline": full["executive_headline"],
+      "background_draft": full["background_draft"],
+      "overall_posture": full["overall_posture"],
+    }),
+    json.dumps({
+      "recommendation_summary": full["recommendation_summary"] + [
+        "Review exposed API authorization boundaries.",
+        "Retest all critical paths after remediation.",
+        "Track remediation owners in the risk register.",
+      ],
+      "strategic_roadmap": {
+        "near_term": [
+          "Apply patches by end of week.",
+          "Rotate exposed credentials immediately.",
+        ],
+        "mid_term": [
+          "Implement quarterly patch reviews.",
+          "Add API authorization regression tests.",
+        ],
+        "long_term": [
+          "Adopt continuous vulnerability management.",
+          "Integrate executive risk reporting into governance reviews.",
+        ],
+      },
+    }),
+    json.dumps({
+      "attack_chain_narratives": full["attack_chain_narratives"],
+      "coverage_gaps": full["coverage_gaps"] + [
+        "Source-code review was not part of the automated scan.",
+      ],
+      "conclusion": full["conclusion"] + " Executive ownership should track closure.",
+    }),
+  ]
+
+
 # Sample input findings (Phase 1 schema; one CRITICAL).
 SAMPLE_FINDINGS = [
   {
@@ -134,6 +173,7 @@ class TestHappyPath(unittest.TestCase):
     llm = _MockLlm([response])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="x",
+      provider_path="remote",
     )
     self.assertFalse(result.error)
     self.assertEqual(result.attempts, 1)
@@ -148,6 +188,7 @@ class TestHappyPath(unittest.TestCase):
     llm = _MockLlm([response])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="x",
+      provider_path="remote",
     )
     self.assertFalse(result.error)
 
@@ -170,6 +211,7 @@ class TestRetryOnValidationFailure(unittest.TestCase):
     llm = _MockLlm([json.dumps(bad), json.dumps(good)])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="x",
+      provider_path="remote",
     )
     self.assertFalse(result.error)
     self.assertEqual(result.attempts, 2)
@@ -186,6 +228,7 @@ class TestRetryOnValidationFailure(unittest.TestCase):
     llm = _MockLlm(["this is not json", json.dumps(_make_valid_response_dict())])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="x",
+      provider_path="remote",
     )
     self.assertFalse(result.error)
     self.assertEqual(result.attempts, 2)
@@ -206,6 +249,7 @@ class TestFallbackSkeleton(unittest.TestCase):
     llm = _MockLlm([bad, bad])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="dseek",
+      provider_path="remote",
     )
     self.assertTrue(result.error)
     self.assertEqual(result.attempts, 2)
@@ -225,6 +269,7 @@ class TestFallbackSkeleton(unittest.TestCase):
     llm = _MockLlm(["", ""])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="x",
+      provider_path="remote",
     )
     self.assertTrue(result.error)
     # First-attempt validation issue should be empty_response
@@ -235,6 +280,7 @@ class TestFallbackSkeleton(unittest.TestCase):
       raise RuntimeError("network down")
     result = generate_exec_summary(
       llm_call=boom, findings=SAMPLE_FINDINGS, model_name="x",
+      provider_path="remote",
     )
     self.assertTrue(result.error)
     self.assertEqual(result.attempts, 2)
@@ -269,6 +315,7 @@ class TestTrustBoundary(unittest.TestCase):
         "point_of_contact": {"email": "secret@private.example"},
       },
       model_name="x",
+      provider_path="remote",
     )
     # Inspect the messages that were sent to the LLM.
     sent_text = repr(llm.calls[0])
@@ -292,7 +339,7 @@ class TestTrustBoundary(unittest.TestCase):
         "evidence": [{"snippet": "target-controlled raw response " * 100}],
         "cve": [f"CVE-2026-{idx:04d}", "CVE-extra-1", "CVE-extra-2", "CVE-extra-3"],
       })
-    llm = _MockLlm([json.dumps(_make_valid_response_dict())])
+    llm = _MockLlm(_make_valid_local_chunk_responses())
     generate_exec_summary(
       llm_call=llm,
       findings=findings,
@@ -309,8 +356,8 @@ class TestTrustBoundary(unittest.TestCase):
     self.assertNotIn('"evidence"', user_content)
     self.assertLess(len(user_content), 5000)
 
-  def test_local_cybersecqwen_profile_uses_single_user_quota_prompt(self):
-    llm = _MockLlm([json.dumps(_make_valid_response_dict())])
+  def test_local_cybersecqwen_profile_uses_schema_free_chunks(self):
+    llm = _MockLlm(_make_valid_local_chunk_responses())
     result = generate_exec_summary(
       llm_call=llm,
       findings=SAMPLE_FINDINGS,
@@ -322,10 +369,30 @@ class TestTrustBoundary(unittest.TestCase):
     self.assertFalse(result.error)
     self.assertEqual(result.prompt_profile, PROMPT_PROFILE_LOCAL_CYBERSECQWEN_V1)
     self.assertEqual(result.provider_path, "local")
+    self.assertEqual(result.attempts, 3)
+    self.assertEqual(len(llm.calls), 3)
     self.assertEqual(len(llm.calls[0]), 1)
     self.assertEqual(llm.calls[0][0]["role"], "user")
-    self.assertIn("recommendation_summary: exactly five", llm.calls[0][0]["content"])
+    self.assertIn("executive_headline", llm.calls[0][0]["content"])
+    self.assertIn("recommendation_summary", llm.calls[1][0]["content"])
+    self.assertIn("coverage_gaps", llm.calls[2][0]["content"])
     self.assertIn("Sanitized RedMesh context JSON", llm.calls[0][0]["content"])
+
+  def test_local_chunk_parse_failure_returns_fallback_with_chunk_diagnostic(self):
+    llm = _MockLlm(["not json"])
+    result = generate_exec_summary(
+      llm_call=llm,
+      findings=SAMPLE_FINDINGS,
+      model_name="CyberSecQwen-4B.Q4_K_M.gguf",
+      provider_path="local",
+      prompt_profile="auto",
+    )
+
+    self.assertTrue(result.error)
+    self.assertEqual(result.attempts, 1)
+    self.assertEqual(result.attempt_logs[0]["chunk"], "posture")
+    self.assertIn("json_parse_failed", result.attempt_logs[0]["validation_codes"])
+    self.assertIsInstance(result.attempt_logs[0]["elapsed_seconds"], float)
 
   def test_remote_profile_uses_richer_system_user_prompt(self):
     llm = _MockLlm([json.dumps(_make_valid_response_dict())])
@@ -356,6 +423,7 @@ class TestProvenance(unittest.TestCase):
     llm = _MockLlm([json.dumps(_make_valid_response_dict())])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="m",
+      provider_path="remote",
     )
     self.assertEqual(
       result.sections.prompt_version, LLM_PROMPT_VERSION_EXEC_SUMMARY,
@@ -368,6 +436,7 @@ class TestProvenance(unittest.TestCase):
     llm = _MockLlm(["{}", "{}"])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="m",
+      provider_path="remote",
     )
     self.assertEqual(
       result.sections.prompt_version, LLM_PROMPT_VERSION_EXEC_SUMMARY,
@@ -377,6 +446,7 @@ class TestProvenance(unittest.TestCase):
     llm = _MockLlm([json.dumps(_make_valid_response_dict())])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="custom-llm-7b",
+      provider_path="remote",
     )
     self.assertEqual(result.sections.model, "custom-llm-7b")
 
@@ -385,6 +455,7 @@ class TestProvenance(unittest.TestCase):
     llm = _MockLlm([json.dumps(_make_valid_response_dict())])
     result = generate_exec_summary(
       llm_call=llm, findings=SAMPLE_FINDINGS, model_name="x",
+      provider_path="remote",
     )
     self.assertRegex(result.sections.generated_at,
                      r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")

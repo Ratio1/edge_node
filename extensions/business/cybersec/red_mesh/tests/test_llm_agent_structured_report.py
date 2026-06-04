@@ -83,7 +83,12 @@ class _FakeOwner(LlmAgentMixin):
   # monkeypatching the import path inside the mixin in setUp.
 
   def _call_llm_agent_api(self, *, endpoint: str, method: str, payload: dict, timeout=None):
-    self._calls.append({"endpoint": endpoint, "method": method, "payload": payload})
+    self._calls.append({
+      "endpoint": endpoint,
+      "method": method,
+      "payload": payload,
+      "timeout": timeout,
+    })
     if self._chat_raises is not None:
       raise self._chat_raises
     return self._chat_response or {}
@@ -161,10 +166,8 @@ class StructuredReportAdapterTests(unittest.TestCase):
     # The /chat payload carries the OpenAI message shape.
     self.assertIn("messages", owner._calls[0]["payload"])
     self.assertGreater(len(owner._calls[0]["payload"]["messages"]), 0)
-    self.assertEqual(
-      owner._calls[0]["payload"]["response_format"]["type"],
-      "json_schema",
-    )
+    self.assertNotIn("response_format", owner._calls[0]["payload"])
+    self.assertEqual(owner._calls[0]["timeout"], 120)
     self.assertEqual(out["prompt_profile"], "local_cybersecqwen_quota_v1")
     self.assertEqual(out["provider_path"], "local")
 
@@ -201,6 +204,7 @@ class StructuredReportAdapterTests(unittest.TestCase):
       owner._calls[0]["payload"]["response_format"],
       {"type": "json_object"},
     )
+    self.assertIsNone(owner._calls[0]["timeout"])
     self.assertEqual(owner._calls[0]["payload"]["temperature"], 0.25)
 
   def test_auto_provider_with_remote_model_picks_remote_profile(self):
@@ -301,19 +305,21 @@ class StructuredReportAdapterTests(unittest.TestCase):
     _run(owner, job_id="job-prose", findings=[], aggregated_report={})
 
     diag_lines = [line for line in owner._logs if "[LLM-DIAG]" in line]
-    self.assertGreaterEqual(len(diag_lines), 2,
+    self.assertGreaterEqual(len(diag_lines), 1,
                             f"expected per-attempt diagnostics, got: {owner._logs}")
     # Each diagnostic carries the job id, attempt number, response length,
-    # validation code, the parser-hint flags, and bounded head/tail snippets.
+    # chunk name, validation code, the parser-hint flags, and bounded
+    # head/tail snippets.
     first = diag_lines[0]
     self.assertIn("job=job-prose", first)
     self.assertIn("attempt=1", first)
+    self.assertIn("chunk=posture", first)
+    self.assertIn("elapsed=", first)
     self.assertIn("raw_len=", first)
     self.assertIn("codes=json_parse_failed", first)
     self.assertIn("appears_prose", first)
     self.assertIn("no_open_brace", first)
     self.assertIn("head=", first)
-    self.assertIn(diag_lines[1].split("attempt=")[1][0], "2")
 
   def test_fixture_cache_env_does_not_gate_runtime_chat_endpoint(self):
     for live_llm_value in (None, "0"):
