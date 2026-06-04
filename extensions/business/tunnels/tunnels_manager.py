@@ -1,6 +1,8 @@
+from typing import Optional
+
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
 
-__VER__ = '0.2.2'
+__VER__ = '0.3.0'
 
 MESSAGE_PREFIX = "Please sign this message to manage your tunnels: "
 MESSAGE_PREFIX_DEEPLOY = "Please sign this message for Deeploy: "
@@ -9,6 +11,7 @@ _CONFIG = {
   **BasePlugin.CONFIG,
 
   'PORT': None,
+  'PROCESS_DELAY': 5 * 60,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
@@ -16,7 +19,9 @@ _CONFIG = {
 
   'BASE_CLOUDFLARE_URL': 'https://api.cloudflare.com',
   'TCP_PROXY_URL': 'tcp.ratio1.link',
-  'TCP_PREFIX': 'cft',
+  'TCP_ROUTES_HKEY': 'tunnels_manager_tcp_routes',
+  'TCP_PUBLIC_PORT_RANGE_START': 30000,
+  'TCP_PUBLIC_PORT_RANGE_END': 30499,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -36,7 +41,150 @@ class TunnelsManagerPlugin(BasePlugin):
   def on_init(self):
     super(TunnelsManagerPlugin, self).on_init()
     self.chainstore_hsync(hkey="tunnels_manager_secrets")  # warm up the cache
+    self._sync_tcp_routes()
     return
+
+  def process(self):
+    self._sync_tcp_routes()
+    return
+
+  def _tcp_route_key(self, public_port):
+    return str(int(public_port))
+
+  def _normalize_public_port(self, public_port):
+    try:
+      port = int(public_port)
+    except (TypeError, ValueError):
+      raise Exception(f"Invalid TCP public port: {public_port}")
+    if port < 1 or port > 65535:
+      raise Exception(f"Invalid TCP public port: {public_port}")
+    return port
+
+  def _tcp_public_range(self):
+    start = int(self.cfg_tcp_public_port_range_start)
+    end = int(self.cfg_tcp_public_port_range_end)
+    if start < 1 or end > 65535 or end < start:
+      raise Exception(f"Invalid TCP public port range: {start}-{end}")
+    return start, end
+
+  def _sync_tcp_routes(self):
+    try:
+      return self.chainstore_hsync(hkey=self.cfg_tcp_routes_hkey)
+    except Exception as exc:
+      self.P(f"Could not sync TCP route registry: {exc}", color="y")
+    return None
+
+  def _get_tcp_route_record(self, public_port):
+    port = self._normalize_public_port(public_port)
+    route = self.chainstore_hget(hkey=self.cfg_tcp_routes_hkey, key=self._tcp_route_key(port))
+    return route if isinstance(route, dict) else None
+
+  def _make_tcp_route_record(self, public_port, tunnel_id, hostname, alias):
+    port = self._normalize_public_port(public_port)
+    return {
+      "public_port": port,
+      "public_host": self.cfg_tcp_proxy_url,
+      "public_endpoint": f"{self.cfg_tcp_proxy_url}:{port}",
+      "tunnel_id": tunnel_id,
+      "hostname": hostname,
+      "alias": alias,
+      "enabled": True,
+    }
+
+  def _is_tcp_route_record_owner(self, route, tunnel_id, hostname):
+    return isinstance(route, dict) and route.get("tunnel_id") == tunnel_id and route.get("hostname") == hostname
+
+  def _claim_tcp_route(self, tunnel_id, hostname, alias):
+    start, end = self._tcp_public_range()
+    tried_ports = set()
+    max_attempts = end - start + 1
+
+    while len(tried_ports) < max_attempts:
+      port = int(self.np.random.randint(start, end + 1))
+      if port in tried_ports:
+        continue
+      tried_ports.add(port)
+
+      existing = self._get_tcp_route_record(port)
+      if existing:
+        continue
+
+      route = self._make_tcp_route_record(
+        public_port=port,
+        tunnel_id=tunnel_id,
+        hostname=hostname,
+        alias=alias,
+      )
+      stored = self.chainstore_hset(
+        hkey=self.cfg_tcp_routes_hkey,
+        key=self._tcp_route_key(port),
+        value=route,
+      )
+      if not stored:
+        verified = self._get_tcp_route_record(port)
+        if self._is_tcp_route_record_owner(verified, tunnel_id, hostname):
+          self._delete_tcp_route(public_port=port, expected_tunnel_id=tunnel_id)
+        continue
+
+      verified = self._get_tcp_route_record(port)
+      if self._is_tcp_route_record_owner(verified, tunnel_id, hostname):
+        return verified
+
+    raise Exception(f"No available TCP public ports in range {start}-{end}")
+
+  def _delete_tcp_route(self, public_port, expected_tunnel_id=None):
+    if public_port is None:
+      return False
+    port = self._normalize_public_port(public_port)
+    route = self._get_tcp_route_record(port)
+    if not isinstance(route, dict):
+      return False
+    if expected_tunnel_id is not None and route.get("tunnel_id") != expected_tunnel_id:
+      raise Exception(f"Refusing to delete TCP route {port}: route belongs to tunnel {route.get('tunnel_id')}, not {expected_tunnel_id}")
+    deleted = self.chainstore_hset(
+      hkey=self.cfg_tcp_routes_hkey,
+      key=self._tcp_route_key(port),
+      value=None,
+    )
+    if not deleted:
+      raise Exception(f"Could not delete TCP route {port}")
+    return deleted
+
+  def _attach_tcp_route_to_tunnel(self, tunnel):
+    if not isinstance(tunnel, dict):
+      return tunnel
+    metadata = tunnel.get("metadata") or {}
+    if metadata.get("type", "http") != "tcp":
+      return tunnel
+    public_port = metadata.get("tcp_public_port")
+    if public_port is None:
+      return tunnel
+    route = self._get_tcp_route_record(public_port)
+    if not route or route.get("tunnel_id") != tunnel.get("id"):
+      return tunnel
+    try:
+      route = self.deepcopy(route)
+    except Exception:
+      route = dict(route)
+    route["public_port"] = self._normalize_public_port(route["public_port"])
+    tunnel["tcp_route"] = route
+    tunnel["tcp_public_port"] = route["public_port"]
+    tunnel["tcp_public_host"] = route["public_host"]
+    tunnel["tcp_public_endpoint"] = route["public_endpoint"]
+    return tunnel
+
+  @BasePlugin.endpoint(method="get")
+  def get_tcp_route(self, public_port: int):
+    """
+    Return only the Cloudflare origin hostname for a public TCP proxy port.
+    """
+    route = self._get_tcp_route_record(public_port)
+    if not route or not route.get("enabled", True):
+      raise Exception(f"No TCP route found for port {public_port}")
+    hostname = route.get("hostname")
+    if not hostname:
+      raise Exception(f"TCP route for port {public_port} has no hostname")
+    return hostname
 
   def _cloudflare_update_metadata(self, tunnel_id: str, metadata: dict, cloudflare_account_id: str, cloudflare_api_key: str):
     url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel/{tunnel_id}"
@@ -235,7 +383,7 @@ class TunnelsManagerPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="post")
-  def new_tunnel(self, alias: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str, cloudflare_domain: str, tunnel_type: str = "http", service_name: str | None = None,):
+  def new_tunnel(self, alias: str, cloudflare_account_id: str, cloudflare_zone_id: str, cloudflare_api_key: str, cloudflare_domain: str, tunnel_type: str = "http", service_name: Optional[str] = None,):
     """
     Create a new Cloudflare tunnel.
 
@@ -253,11 +401,9 @@ class TunnelsManagerPlugin(BasePlugin):
 
     tunnel_id = None
     dns_record_id = None
-    dns_record_public_id = None
+    tcp_route = None
     new_uuid = self.uuid()
     prefixes = []
-    if tunnel_type == "tcp":
-      prefixes.append(self.cfg_tcp_prefix)
     if service_name is not None:
       prefixes.append(service_name)
     new_id = f"{'-'.join(prefixes)}-{new_uuid}" if prefixes else new_uuid
@@ -292,46 +438,61 @@ class TunnelsManagerPlugin(BasePlugin):
       if not dns_record_id:
         raise Exception("Error creating tunnel DNS record: Cloudflare response is missing DNS record id")
 
-      public_name = None
       if tunnel_type == "tcp":
-        # TCP tunnels need a second public CNAME that points at the TCP proxy.
-        public_name = new_id.removeprefix(f"{self.cfg_tcp_prefix}-")
-        data_public = {
-          "type": "CNAME",
-          "proxied": True,
-          "name": public_name,
-          "content": self.cfg_tcp_proxy_url,
-        }
-        dns_record_public = self.requests.post(url, headers=headers, json=data_public).json()
-        dns_record_public_result = self._require_cloudflare_result(dns_record_public, "Error creating TCP tunnel public DNS record")
-        dns_record_public_id = dns_record_public_result.get("id")
-        if not dns_record_public_id:
-          raise Exception("Error creating TCP tunnel public DNS record: Cloudflare response is missing DNS record id")
+        tcp_route = self._claim_tcp_route(
+          tunnel_id=tunnel_id,
+          hostname=f"{new_id}.{cloudflare_domain}",
+          alias=alias,
+        )
+
+      metadata = {
+        "alias": alias,
+        "tunnel_token": tunnel_token,
+        "dns_record_id": dns_record_id,
+        "dns_name": f"{new_id}.{cloudflare_domain}",
+        "custom_hostnames": [],
+        "type": tunnel_type,
+        "creator": "ratio1"
+      }
+      if tcp_route is not None:
+        metadata.update({
+          "tcp_public_port": tcp_route["public_port"],
+          "tcp_public_host": tcp_route["public_host"],
+          "tcp_public_endpoint": tcp_route["public_endpoint"],
+        })
 
       res = self._cloudflare_update_metadata(
         tunnel_id=tunnel_id,
-        metadata={
-          "alias": alias,
-          "tunnel_token": tunnel_token,
-          "dns_record_id": dns_record_id,
-          "dns_name": f"{new_id}.{cloudflare_domain}",
-          "dns_record_public_id": dns_record_public_id,
-          "dns_public_name": f"{public_name}.{cloudflare_domain}" if public_name else None,
-          "custom_hostnames": [],
-          "type": tunnel_type,
-          "creator": "ratio1"
-        },
+        metadata=metadata,
         cloudflare_account_id=cloudflare_account_id,
         cloudflare_api_key=cloudflare_api_key
       )
-      return self._require_cloudflare_result(res, "Error updating tunnel metadata")
+      result = self._require_cloudflare_result(res, "Error updating tunnel metadata")
+      if isinstance(result, dict):
+        result_metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
+        result_metadata.update(metadata)
+        result["metadata"] = result_metadata
+        if tcp_route is not None:
+          result["tcp_route"] = tcp_route
+          result["tcp_public_port"] = tcp_route["public_port"]
+          result["tcp_public_host"] = tcp_route["public_host"]
+          result["tcp_public_endpoint"] = tcp_route["public_endpoint"]
+      return result
     except Exception:
+      if tcp_route is not None:
+        try:
+          self._delete_tcp_route(
+            public_port=tcp_route["public_port"],
+            expected_tunnel_id=tunnel_id,
+          )
+        except Exception as exc:
+          self.P(f"TCP route cleanup failed for tunnel {tunnel_id}: {exc}", color="y")
       self._cleanup_partial_tunnel(
         cloudflare_account_id=cloudflare_account_id,
         cloudflare_zone_id=cloudflare_zone_id,
         cloudflare_api_key=cloudflare_api_key,
         tunnel_id=tunnel_id,
-        dns_record_ids=[dns_record_public_id, dns_record_id],
+        dns_record_ids=[dns_record_id],
       )
       raise
 
@@ -347,7 +508,11 @@ class TunnelsManagerPlugin(BasePlugin):
     response = self.requests.get(url, headers=headers).json()
     if response["success"] is False:
       raise Exception("Error fetching tunnels: " + str(response['errors']))
-    return response['result']
+    result = response['result']
+    if isinstance(result, list):
+      for tunnel in result:
+        self._attach_tcp_route_to_tunnel(tunnel)
+    return result
 
   @BasePlugin.endpoint(method="get")
   def get_tunnel(self, tunnel_id: str, cloudflare_account_id: str, cloudflare_api_key: str):
@@ -361,7 +526,7 @@ class TunnelsManagerPlugin(BasePlugin):
     response = self.requests.get(url, headers=headers).json()
     if response["success"] is False:
       raise Exception("Error fetching tunnel: " + str(response['errors']))
-    return response['result']
+    return self._attach_tcp_route_to_tunnel(response['result'])
 
   @BasePlugin.endpoint(method="get")
   def get_tunnel_by_token(self, tunnel_token: str, cloudflare_account_id: str, cloudflare_api_key: str):
@@ -383,27 +548,21 @@ class TunnelsManagerPlugin(BasePlugin):
     """
     value = self.get_tunnel(tunnel_id, cloudflare_account_id, cloudflare_api_key)
 
-    if (len(value['metadata']['custom_hostnames']) > 0):
+    metadata = value.get('metadata', {})
+    if (len(metadata.get('custom_hostnames', [])) > 0):
       raise Exception("Cannot delete tunnel with custom hostnames. Please remove them first.")
 
+    is_tcp_tunnel = metadata.get('type', 'http') == "tcp"
+    tcp_public_port = metadata.get("tcp_public_port") if is_tcp_tunnel else None
+
     # Delete the DNS record first
-    url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records/{value['metadata']['dns_record_id']}"
+    url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records/{metadata['dns_record_id']}"
     headers = {
       "Authorization": f"Bearer {cloudflare_api_key}"
     }
     response = self.requests.delete(url, headers=headers).json()
     if response["success"] is False:
       raise Exception("Error deleting DNS record: " + str(response['errors']))
-
-    # Also delete the public DNS record for TCP tunnels
-    if value['metadata'].get('type', 'http') == "tcp":
-      url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records/{value['metadata']['dns_record_public_id']}"
-      headers = {
-        "Authorization": f"Bearer {cloudflare_api_key}"
-      }
-      response = self.requests.delete(url, headers=headers).json()
-      if response["success"] is False:
-        raise Exception("Error deleting public DNS record: " + str(response['errors']))
 
     # Then delete the tunnel
     url = f"{self.cfg_base_cloudflare_url}/client/v4/accounts/{cloudflare_account_id}/cfd_tunnel/{value['id']}"
@@ -413,6 +572,9 @@ class TunnelsManagerPlugin(BasePlugin):
     response = self.requests.delete(url, headers=headers).json()
     if response["success"] is False:
       raise Exception("Error deleting tunnel: " + str(response['errors']))
+
+    if is_tcp_tunnel:
+      self._delete_tcp_route(public_port=tcp_public_port, expected_tunnel_id=value['id'])
 
     return {
       "success": True,
@@ -513,35 +675,24 @@ class TunnelsManagerPlugin(BasePlugin):
       "Authorization": f"Bearer {cloudflare_api_key}"
     }
     tunnel_type = value['metadata'].get('type', 'http')
-    prefix = f"{self.cfg_tcp_prefix}-" if tunnel_type == "tcp" else ""
     data = {
       "type": "CNAME",
       "proxied": True,
-      "name": f"{prefix}{alias}",
+      "name": alias,
       "content": f"{value['id']}.cfargotunnel.com",
     }
     dns_record = self.requests.post(url, headers=headers, json=data).json()
     if dns_record["success"] is False:
       raise Exception("Error creating alias: " + str(dns_record['errors']))
 
-    if tunnel_type == "tcp":
-      data_public = {
-        "type": "CNAME",
-        "proxied": True,
-        "name": alias,
-        "content": self.cfg_tcp_proxy_url,
-      }
-      dns_record_public = self.requests.post(url, headers=headers, json=data_public).json()
-      if dns_record_public["success"] is False:
-        raise Exception("Error creating public alias: " + str(dns_record_public['errors']))
-
     if 'aliases' not in value['metadata']:
       value['metadata']['aliases'] = []
-    value['metadata']['aliases'].append({
+    alias_metadata = {
       "id": dns_record['result']['id'],
       "name": alias,
-      "public_id": dns_record_public['result']['id'] if tunnel_type == "tcp" else None,
-    })
+      "type": "origin" if tunnel_type == "tcp" else "dns",
+    }
+    value['metadata']['aliases'].append(alias_metadata)
     self._cloudflare_update_metadata(
       tunnel_id=tunnel_id,
       metadata=value['metadata'],
