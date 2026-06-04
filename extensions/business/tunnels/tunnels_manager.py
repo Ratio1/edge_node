@@ -43,12 +43,6 @@ class TunnelsManagerPlugin(BasePlugin):
     self._sync_tcp_routes()
     return
 
-  def _safe_log(self, message, color=None):
-    logger = getattr(self, "P", None)
-    if callable(logger):
-      logger(message, color=color)
-    return
-
   def _tcp_route_key(self, public_port):
     return str(int(public_port))
 
@@ -74,7 +68,7 @@ class TunnelsManagerPlugin(BasePlugin):
     except Exception as exc:
       if required:
         raise Exception(f"Could not sync TCP route registry: {exc}") from exc
-      self._safe_log(f"Could not sync TCP route registry: {exc}", color="y")
+      self.P(f"Could not sync TCP route registry: {exc}", color="y")
     return None
 
   def _get_tcp_routes(self, sync=False, require_sync=False):
@@ -497,7 +491,7 @@ class TunnelsManagerPlugin(BasePlugin):
             expected_tunnel_id=tunnel_id,
           )
         except Exception as exc:
-          self._safe_log(f"TCP route cleanup failed for tunnel {tunnel_id}: {exc}", color="y")
+          self.P(f"TCP route cleanup failed for tunnel {tunnel_id}: {exc}", color="y")
       self._cleanup_partial_tunnel(
         cloudflare_account_id=cloudflare_account_id,
         cloudflare_zone_id=cloudflare_zone_id,
