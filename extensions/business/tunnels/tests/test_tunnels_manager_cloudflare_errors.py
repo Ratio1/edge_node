@@ -75,6 +75,7 @@ def make_plugin(requests):
   plugin.cfg_tcp_routes_hkey = "tcp_routes"
   plugin.cfg_tcp_public_port_range_start = 30000
   plugin.cfg_tcp_public_port_range_end = 30499
+  plugin.cfg_tcp_routes_sync_interval = 5 * 60
   plugin.uuid = lambda: "uuid-001"
   plugin.time = lambda: 1000
   plugin.time_to_str = lambda value: f"time-{value}"
@@ -718,11 +719,12 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     self.assertNotIn("tcp_route", result)
     self.assertEqual(result["metadata"]["tcp_public_port"], 30000)
 
-  def test_tcp_route_sync_runs_only_on_init_and_process(self):
+  def test_tcp_route_sync_runs_on_init_and_interval(self):
     requests = _RequestsStub()
     plugin = make_plugin(requests)
 
-    self.assertEqual(TunnelsManagerPlugin.CONFIG["PROCESS_DELAY"], 5 * 60)
+    self.assertEqual(TunnelsManagerPlugin.CONFIG["PROCESS_DELAY"], 0)
+    self.assertEqual(TunnelsManagerPlugin.CONFIG["TCP_ROUTES_SYNC_INTERVAL"], 5 * 60)
 
     plugin.on_init()
 
@@ -731,6 +733,14 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
       ["tunnels_manager_secrets", plugin.cfg_tcp_routes_hkey],
     )
 
+    plugin.process()
+
+    self.assertEqual(
+      [call["hkey"] for call in plugin._chainstore_hsyncs],
+      ["tunnels_manager_secrets", plugin.cfg_tcp_routes_hkey],
+    )
+
+    plugin.time = lambda: 1300
     plugin.process()
 
     self.assertEqual(

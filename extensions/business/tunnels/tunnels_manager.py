@@ -11,7 +11,6 @@ _CONFIG = {
   **BasePlugin.CONFIG,
 
   'PORT': None,
-  'PROCESS_DELAY': 5 * 60,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   
@@ -22,6 +21,7 @@ _CONFIG = {
   'TCP_ROUTES_HKEY': 'tunnels_manager_tcp_routes',
   'TCP_PUBLIC_PORT_RANGE_START': 30000,
   'TCP_PUBLIC_PORT_RANGE_END': 30499,
+  'TCP_ROUTES_SYNC_INTERVAL': 5 * 60,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
@@ -40,12 +40,16 @@ class TunnelsManagerPlugin(BasePlugin):
 
   def on_init(self):
     super(TunnelsManagerPlugin, self).on_init()
+    self._last_tcp_routes_sync = None
     self.chainstore_hsync(hkey="tunnels_manager_secrets")  # warm up the cache
     self._sync_tcp_routes()
     return
 
   def process(self):
-    self._sync_tcp_routes()
+    now = self.time()
+    last_sync = getattr(self, "_last_tcp_routes_sync", None)
+    if last_sync is None or now - last_sync >= self.cfg_tcp_routes_sync_interval:
+      self._sync_tcp_routes()
     return
 
   def _tcp_route_key(self, public_port):
@@ -68,6 +72,7 @@ class TunnelsManagerPlugin(BasePlugin):
     return start, end
 
   def _sync_tcp_routes(self):
+    self._last_tcp_routes_sync = self.time()
     try:
       return self.chainstore_hsync(hkey=self.cfg_tcp_routes_hkey)
     except Exception as exc:
