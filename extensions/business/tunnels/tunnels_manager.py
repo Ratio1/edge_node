@@ -163,14 +163,11 @@ class TunnelsManagerPlugin(BasePlugin):
       route = self.deepcopy(route)
     except Exception:
       route = dict(route)
-    route.setdefault("public_port", self._normalize_public_port(public_port))
-    route.setdefault("public_host", self.cfg_tcp_proxy_url)
-    route.setdefault("public_endpoint", f"{route['public_host']}:{route['public_port']}")
+    route["public_port"] = self._normalize_public_port(route["public_port"])
     tunnel["tcp_route"] = route
-    metadata = tunnel.setdefault("metadata", {})
-    metadata["tcp_public_port"] = route.get("public_port")
-    metadata["tcp_public_host"] = route.get("public_host")
-    metadata["tcp_public_endpoint"] = route.get("public_endpoint")
+    tunnel["tcp_public_port"] = route["public_port"]
+    tunnel["tcp_public_host"] = route["public_host"]
+    tunnel["tcp_public_endpoint"] = route["public_endpoint"]
     return tunnel
 
   @BasePlugin.endpoint(method="get")
@@ -456,9 +453,9 @@ class TunnelsManagerPlugin(BasePlugin):
       }
       if tcp_route is not None:
         metadata.update({
-          "tcp_public_port": tcp_route.get("public_port"),
-          "tcp_public_host": tcp_route.get("public_host"),
-          "tcp_public_endpoint": tcp_route.get("public_endpoint"),
+          "tcp_public_port": tcp_route["public_port"],
+          "tcp_public_host": tcp_route["public_host"],
+          "tcp_public_endpoint": tcp_route["public_endpoint"],
         })
 
       res = self._cloudflare_update_metadata(
@@ -474,12 +471,15 @@ class TunnelsManagerPlugin(BasePlugin):
         result["metadata"] = result_metadata
         if tcp_route is not None:
           result["tcp_route"] = tcp_route
+          result["tcp_public_port"] = tcp_route["public_port"]
+          result["tcp_public_host"] = tcp_route["public_host"]
+          result["tcp_public_endpoint"] = tcp_route["public_endpoint"]
       return result
     except Exception:
       if tcp_route is not None:
         try:
           self._delete_tcp_route(
-            public_port=tcp_route.get("public_port"),
+            public_port=tcp_route["public_port"],
             expected_tunnel_id=tunnel_id,
           )
         except Exception as exc:
@@ -551,8 +551,6 @@ class TunnelsManagerPlugin(BasePlugin):
 
     if metadata.get('type', 'http') == "tcp":
       public_port = metadata.get("tcp_public_port")
-      if public_port is None and value.get("tcp_route"):
-        public_port = value["tcp_route"].get("public_port")
       self._delete_tcp_route(public_port=public_port, expected_tunnel_id=value['id'])
 
     # Delete the DNS record first

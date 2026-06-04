@@ -271,6 +271,9 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     self.assertEqual(requests.posts[1]["json"]["name"], "uuid-001")
     self.assertEqual(result["tcp_route"]["public_port"], 30000)
     self.assertEqual(result["tcp_route"]["hostname"], "uuid-001.ratio1.link")
+    self.assertEqual(result["tcp_public_port"], 30000)
+    self.assertEqual(result["tcp_public_host"], "tcp.ratio1.link")
+    self.assertEqual(result["tcp_public_endpoint"], "tcp.ratio1.link:30000")
     self.assertEqual(result["metadata"]["alias"], "My TCP Tunnel")
     self.assertEqual(result["metadata"]["dns_name"], "uuid-001.ratio1.link")
     self.assertEqual(plugin.get_tcp_route(30000), "uuid-001.ratio1.link")
@@ -469,6 +472,8 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     plugin._chainstore[plugin.cfg_tcp_routes_hkey] = {
       "30000": {
         "public_port": 30000,
+        "public_host": "tcp.ratio1.link",
+        "public_endpoint": "tcp.ratio1.link:30000",
         "hostname": "uuid-001.ratio1.link",
         "tunnel_id": "tunnel-id",
         "enabled": True,
@@ -517,6 +522,8 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     plugin._chainstore[plugin.cfg_tcp_routes_hkey] = {
       "30000": {
         "public_port": 30000,
+        "public_host": "tcp.ratio1.link",
+        "public_endpoint": "tcp.ratio1.link:30000",
         "hostname": "uuid-001.ratio1.link",
         "tunnel_id": "tunnel-id",
         "enabled": True,
@@ -533,7 +540,10 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     result = plugin._attach_tcp_route_to_tunnel(tunnel)
 
     self.assertEqual(result["tcp_route"]["hostname"], "uuid-001.ratio1.link")
-    self.assertEqual(result["metadata"]["tcp_public_endpoint"], "tcp.ratio1.link:30000")
+    self.assertEqual(result["tcp_public_port"], 30000)
+    self.assertEqual(result["tcp_public_host"], "tcp.ratio1.link")
+    self.assertEqual(result["tcp_public_endpoint"], "tcp.ratio1.link:30000")
+    self.assertNotIn("tcp_public_endpoint", result["metadata"])
 
   def test_attach_tcp_route_does_not_scan_without_matching_metadata_port(self):
     requests = _RequestsStub()
