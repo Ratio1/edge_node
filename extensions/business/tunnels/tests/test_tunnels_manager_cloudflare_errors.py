@@ -279,6 +279,7 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     self.assertEqual(result["metadata"]["dns_name"], "uuid-001.ratio1.link")
     self.assertEqual(plugin.get_tcp_route(30000), "uuid-001.ratio1.link")
     self.assertEqual(requests.patches[0]["json"]["metadata"]["tcp_public_endpoint"], "tcp.ratio1.link:30000")
+    self.assertFalse(plugin._chainstore_hsets[0]["readonly"])
 
   def test_tcp_port_allocation_skips_occupied_ports(self):
     requests = _RequestsStub(
@@ -390,6 +391,37 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
 
     self.assertEqual(hset_calls[:2], ["30000", "30001"])
     self.assertEqual(result["tcp_route"]["public_port"], 30001)
+
+  def test_tcp_port_allocation_removes_local_route_after_failed_store(self):
+    requests = _RequestsStub()
+    plugin = make_plugin(requests)
+    plugin.cfg_tcp_public_port_range_start = 30000
+    plugin.cfg_tcp_public_port_range_end = 30000
+
+    def failing_hset(hkey, key, value, readonly=False, **kwargs):
+      plugin._chainstore_hsets.append({"hkey": hkey, "key": str(key), "value": deepcopy(value), "readonly": readonly})
+      store = plugin._chainstore.setdefault(hkey, {})
+      key = str(key)
+      if value is None:
+        store.pop(key, None)
+        return True
+      store[key] = deepcopy(value)
+      return False
+
+    plugin.chainstore_hset = failing_hset
+
+    with self.assertRaises(Exception) as ctx:
+      plugin._claim_tcp_route(
+        tunnel_id="tunnel-id",
+        hostname="uuid-001.ratio1.link",
+        alias="My TCP Tunnel",
+      )
+
+    self.assertIn("No available TCP public ports", str(ctx.exception))
+    self.assertNotIn("30000", plugin._chainstore.get(plugin.cfg_tcp_routes_hkey, {}))
+    self.assertEqual(plugin._chainstore_hsets[0]["readonly"], False)
+    self.assertEqual(plugin._chainstore_hsets[-1]["key"], "30000")
+    self.assertIsNone(plugin._chainstore_hsets[-1]["value"])
 
   def test_tcp_port_allocation_exhaustion_cleans_partial_cloudflare_resources(self):
     requests = _RequestsStub(
@@ -543,6 +575,66 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     self.assertIn("30000", plugin._chainstore[plugin.cfg_tcp_routes_hkey])
     delete_writes = [call for call in plugin._chainstore_hsets if call["value"] is None]
     self.assertEqual(delete_writes, [])
+
+  def test_delete_tcp_tunnel_raises_when_chainstore_route_delete_fails(self):
+    requests = _RequestsStub(
+      get_payloads=[
+        {
+          "success": True,
+          "result": {
+            "id": "tunnel-id",
+            "metadata": {
+              "dns_record_id": "dns-record-id",
+              "custom_hostnames": [],
+              "type": "tcp",
+              "tcp_public_port": 30000,
+            },
+          },
+        },
+      ],
+      delete_payloads=[
+        {
+          "success": True,
+          "result": {},
+        },
+        {
+          "success": True,
+          "result": {},
+        },
+      ],
+    )
+    plugin = make_plugin(requests)
+    plugin._chainstore[plugin.cfg_tcp_routes_hkey] = {
+      "30000": {
+        "public_port": 30000,
+        "public_host": "tcp.ratio1.link",
+        "public_endpoint": "tcp.ratio1.link:30000",
+        "hostname": "uuid-001.ratio1.link",
+        "tunnel_id": "tunnel-id",
+        "enabled": True,
+      }
+    }
+
+    def failing_delete_hset(hkey, key, value, readonly=False, **kwargs):
+      plugin._chainstore_hsets.append({"hkey": hkey, "key": str(key), "value": deepcopy(value), "readonly": readonly})
+      if value is None:
+        return False
+      plugin._chainstore.setdefault(hkey, {})[str(key)] = deepcopy(value)
+      return True
+
+    plugin.chainstore_hset = failing_delete_hset
+
+    with self.assertRaises(Exception) as ctx:
+      plugin.delete_tunnel(
+        tunnel_id="tunnel-id",
+        cloudflare_account_id="account-id",
+        cloudflare_zone_id="zone-id",
+        cloudflare_api_key="api-key",
+      )
+
+    self.assertIn("Could not delete TCP route 30000", str(ctx.exception))
+    self.assertEqual(len(requests.deletes), 2)
+    self.assertIn("30000", plugin._chainstore[plugin.cfg_tcp_routes_hkey])
 
   def test_delete_tcp_route_missing_or_owned_by_other_tunnel_is_not_deleted(self):
     requests = _RequestsStub()

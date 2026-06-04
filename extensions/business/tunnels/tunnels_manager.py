@@ -91,6 +91,9 @@ class TunnelsManagerPlugin(BasePlugin):
       "enabled": True,
     }
 
+  def _is_tcp_route_record_owner(self, route, tunnel_id, hostname):
+    return isinstance(route, dict) and route.get("tunnel_id") == tunnel_id and route.get("hostname") == hostname
+
   def _claim_tcp_route(self, tunnel_id, hostname, alias):
     start, end = self._tcp_public_range()
     tried_ports = set()
@@ -116,13 +119,15 @@ class TunnelsManagerPlugin(BasePlugin):
         hkey=self.cfg_tcp_routes_hkey,
         key=self._tcp_route_key(port),
         value=route,
-        readonly=True,
       )
       if not stored:
+        verified = self._get_tcp_route_record(port)
+        if self._is_tcp_route_record_owner(verified, tunnel_id, hostname):
+          self._delete_tcp_route(public_port=port, expected_tunnel_id=tunnel_id)
         continue
 
       verified = self._get_tcp_route_record(port)
-      if isinstance(verified, dict) and verified.get("tunnel_id") == tunnel_id and verified.get("hostname") == hostname:
+      if self._is_tcp_route_record_owner(verified, tunnel_id, hostname):
         return verified
 
     raise Exception(f"No available TCP public ports in range {start}-{end}")
@@ -136,11 +141,14 @@ class TunnelsManagerPlugin(BasePlugin):
       return False
     if expected_tunnel_id is not None and route.get("tunnel_id") != expected_tunnel_id:
       raise Exception(f"Refusing to delete TCP route {port}: route belongs to tunnel {route.get('tunnel_id')}, not {expected_tunnel_id}")
-    return self.chainstore_hset(
+    deleted = self.chainstore_hset(
       hkey=self.cfg_tcp_routes_hkey,
       key=self._tcp_route_key(port),
       value=None,
     )
+    if not deleted:
+      raise Exception(f"Could not delete TCP route {port}")
+    return deleted
 
   def _attach_tcp_route_to_tunnel(self, tunnel):
     if not isinstance(tunnel, dict):
