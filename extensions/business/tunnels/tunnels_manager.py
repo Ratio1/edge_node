@@ -97,22 +97,6 @@ class TunnelsManagerPlugin(BasePlugin):
       "enabled": True,
     }
 
-  def _find_tcp_route_for_tunnel(self, tunnel_id):
-    routes = self._get_tcp_routes()
-    for port_key, route in routes.items():
-      if not isinstance(route, dict):
-        continue
-      if route.get("tunnel_id") == tunnel_id:
-        try:
-          route = self.deepcopy(route)
-        except Exception:
-          route = dict(route)
-        route.setdefault("public_port", self._normalize_public_port(port_key))
-        route.setdefault("public_host", self.cfg_tcp_proxy_url)
-        route.setdefault("public_endpoint", f"{route['public_host']}:{route['public_port']}")
-        return route
-    return None
-
   def _claim_tcp_route(self, tunnel_id, hostname, alias):
     start, end = self._tcp_public_range()
     candidates = list(range(start, end + 1))
@@ -169,9 +153,19 @@ class TunnelsManagerPlugin(BasePlugin):
     metadata = tunnel.get("metadata") or {}
     if metadata.get("type", "http") != "tcp":
       return tunnel
-    route = self._find_tcp_route_for_tunnel(tunnel.get("id"))
-    if not route:
+    public_port = metadata.get("tcp_public_port")
+    if public_port is None:
       return tunnel
+    route = self._get_tcp_route_record(public_port)
+    if not route or route.get("tunnel_id") != tunnel.get("id"):
+      return tunnel
+    try:
+      route = self.deepcopy(route)
+    except Exception:
+      route = dict(route)
+    route.setdefault("public_port", self._normalize_public_port(public_port))
+    route.setdefault("public_host", self.cfg_tcp_proxy_url)
+    route.setdefault("public_endpoint", f"{route['public_host']}:{route['public_port']}")
     tunnel["tcp_route"] = route
     metadata = tunnel.setdefault("metadata", {})
     metadata["tcp_public_port"] = route.get("public_port")

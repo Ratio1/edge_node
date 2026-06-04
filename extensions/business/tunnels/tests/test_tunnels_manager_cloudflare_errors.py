@@ -511,6 +511,60 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     delete_writes = [call for call in plugin._chainstore_hsets if call["value"] is None]
     self.assertEqual(delete_writes, [])
 
+  def test_attach_tcp_route_uses_metadata_port_hint(self):
+    requests = _RequestsStub()
+    plugin = make_plugin(requests)
+    plugin._chainstore[plugin.cfg_tcp_routes_hkey] = {
+      "30000": {
+        "public_port": 30000,
+        "hostname": "uuid-001.ratio1.link",
+        "tunnel_id": "tunnel-id",
+        "enabled": True,
+      }
+    }
+    tunnel = {
+      "id": "tunnel-id",
+      "metadata": {
+        "type": "tcp",
+        "tcp_public_port": 30000,
+      },
+    }
+
+    result = plugin._attach_tcp_route_to_tunnel(tunnel)
+
+    self.assertEqual(result["tcp_route"]["hostname"], "uuid-001.ratio1.link")
+    self.assertEqual(result["metadata"]["tcp_public_endpoint"], "tcp.ratio1.link:30000")
+
+  def test_attach_tcp_route_does_not_scan_without_matching_metadata_port(self):
+    requests = _RequestsStub()
+    plugin = make_plugin(requests)
+    plugin._chainstore[plugin.cfg_tcp_routes_hkey] = {
+      "30000": {
+        "public_port": 30000,
+        "hostname": "other.ratio1.link",
+        "tunnel_id": "other-tunnel",
+        "enabled": True,
+      },
+      "30001": {
+        "public_port": 30001,
+        "hostname": "uuid-001.ratio1.link",
+        "tunnel_id": "tunnel-id",
+        "enabled": True,
+      },
+    }
+    tunnel = {
+      "id": "tunnel-id",
+      "metadata": {
+        "type": "tcp",
+        "tcp_public_port": 30000,
+      },
+    }
+
+    result = plugin._attach_tcp_route_to_tunnel(tunnel)
+
+    self.assertNotIn("tcp_route", result)
+    self.assertEqual(result["metadata"]["tcp_public_port"], 30000)
+
   def test_tcp_route_sync_runs_only_on_init_and_process(self):
     requests = _RequestsStub()
     plugin = make_plugin(requests)
