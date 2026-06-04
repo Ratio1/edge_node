@@ -74,12 +74,6 @@ class TunnelsManagerPlugin(BasePlugin):
       self.P(f"Could not sync TCP route registry: {exc}", color="y")
     return None
 
-  def _get_tcp_routes(self):
-    routes = self.chainstore_hgetall(hkey=self.cfg_tcp_routes_hkey)
-    if not isinstance(routes, dict):
-      return {}
-    return routes
-
   def _get_tcp_route_record(self, public_port):
     port = self._normalize_public_port(public_port)
     route = self.chainstore_hget(hkey=self.cfg_tcp_routes_hkey, key=self._tcp_route_key(port))
@@ -108,9 +102,7 @@ class TunnelsManagerPlugin(BasePlugin):
         continue
       tried_ports.add(port)
 
-      route_key = self._tcp_route_key(port)
-      routes = self._get_tcp_routes()
-      existing = routes.get(route_key)
+      existing = self._get_tcp_route_record(port)
       if existing:
         continue
 
@@ -122,7 +114,7 @@ class TunnelsManagerPlugin(BasePlugin):
       )
       stored = self.chainstore_hset(
         hkey=self.cfg_tcp_routes_hkey,
-        key=route_key,
+        key=self._tcp_route_key(port),
         value=route,
         readonly=True,
       )
@@ -552,9 +544,8 @@ class TunnelsManagerPlugin(BasePlugin):
     if (len(metadata.get('custom_hostnames', [])) > 0):
       raise Exception("Cannot delete tunnel with custom hostnames. Please remove them first.")
 
-    if metadata.get('type', 'http') == "tcp":
-      public_port = metadata.get("tcp_public_port")
-      self._delete_tcp_route(public_port=public_port, expected_tunnel_id=value['id'])
+    is_tcp_tunnel = metadata.get('type', 'http') == "tcp"
+    tcp_public_port = metadata.get("tcp_public_port") if is_tcp_tunnel else None
 
     # Delete the DNS record first
     url = f"{self.cfg_base_cloudflare_url}/client/v4/zones/{cloudflare_zone_id}/dns_records/{metadata['dns_record_id']}"
@@ -573,6 +564,9 @@ class TunnelsManagerPlugin(BasePlugin):
     response = self.requests.delete(url, headers=headers).json()
     if response["success"] is False:
       raise Exception("Error deleting tunnel: " + str(response['errors']))
+
+    if is_tcp_tunnel:
+      self._delete_tcp_route(public_port=tcp_public_port, expected_tunnel_id=value['id'])
 
     return {
       "success": True,

@@ -89,9 +89,6 @@ def make_plugin(requests):
     plugin._chainstore_hsyncs.append(kwargs)
     return {"merged_fields": 0}
 
-  def chainstore_hgetall(hkey, **kwargs):
-    return deepcopy(plugin._chainstore.get(hkey, {}))
-
   def chainstore_hget(hkey, key, **kwargs):
     value = plugin._chainstore.get(hkey, {}).get(str(key))
     return deepcopy(value)
@@ -109,7 +106,6 @@ def make_plugin(requests):
     return True
 
   plugin.chainstore_hsync = chainstore_hsync
-  plugin.chainstore_hgetall = chainstore_hgetall
   plugin.chainstore_hget = chainstore_hget
   plugin.chainstore_hset = chainstore_hset
   return plugin
@@ -499,6 +495,54 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     self.assertEqual(len(requests.deletes), 2)
     self.assertEqual(plugin._chainstore_hsets[-1]["key"], "30000")
     self.assertIsNone(plugin._chainstore_hsets[-1]["value"])
+
+  def test_delete_tcp_tunnel_keeps_chainstore_route_when_cloudflare_delete_fails(self):
+    requests = _RequestsStub(
+      get_payloads=[
+        {
+          "success": True,
+          "result": {
+            "id": "tunnel-id",
+            "metadata": {
+              "dns_record_id": "dns-record-id",
+              "custom_hostnames": [],
+              "type": "tcp",
+              "tcp_public_port": 30000,
+            },
+          },
+        },
+      ],
+      delete_payloads=[
+        {
+          "success": False,
+          "errors": ["delete failed"],
+        },
+      ],
+    )
+    plugin = make_plugin(requests)
+    plugin._chainstore[plugin.cfg_tcp_routes_hkey] = {
+      "30000": {
+        "public_port": 30000,
+        "public_host": "tcp.ratio1.link",
+        "public_endpoint": "tcp.ratio1.link:30000",
+        "hostname": "uuid-001.ratio1.link",
+        "tunnel_id": "tunnel-id",
+        "enabled": True,
+      }
+    }
+
+    with self.assertRaises(Exception) as ctx:
+      plugin.delete_tunnel(
+        tunnel_id="tunnel-id",
+        cloudflare_account_id="account-id",
+        cloudflare_zone_id="zone-id",
+        cloudflare_api_key="api-key",
+      )
+
+    self.assertIn("Error deleting DNS record", str(ctx.exception))
+    self.assertIn("30000", plugin._chainstore[plugin.cfg_tcp_routes_hkey])
+    delete_writes = [call for call in plugin._chainstore_hsets if call["value"] is None]
+    self.assertEqual(delete_writes, [])
 
   def test_delete_tcp_route_missing_or_owned_by_other_tunnel_is_not_deleted(self):
     requests = _RequestsStub()
