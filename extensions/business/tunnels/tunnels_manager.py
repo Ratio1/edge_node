@@ -95,7 +95,6 @@ class TunnelsManagerPlugin(BasePlugin):
       "hostname": hostname,
       "alias": alias,
       "enabled": True,
-      "created_at": self.time_to_str(self.time()) if hasattr(self, "time_to_str") else None,
     }
 
   def _find_tcp_route_for_tunnel(self, tunnel_id):
