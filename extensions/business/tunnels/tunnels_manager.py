@@ -21,7 +21,7 @@ _CONFIG = {
   'TCP_PROXY_URL': 'tcp.ratio1.link',
   'TCP_ROUTES_HKEY': 'tunnels_manager_tcp_routes',
   'TCP_PUBLIC_PORT_RANGE_START': 30000,
-  'TCP_PUBLIC_PORT_RANGE_END': 39999,
+  'TCP_PUBLIC_PORT_RANGE_END': 30499,
 
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],

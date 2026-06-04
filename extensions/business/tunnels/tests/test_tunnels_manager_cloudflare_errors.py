@@ -74,7 +74,7 @@ def make_plugin(requests):
   plugin.cfg_tcp_proxy_url = "tcp.ratio1.link"
   plugin.cfg_tcp_routes_hkey = "tcp_routes"
   plugin.cfg_tcp_public_port_range_start = 30000
-  plugin.cfg_tcp_public_port_range_end = 39999
+  plugin.cfg_tcp_public_port_range_end = 30499
   plugin.uuid = lambda: "uuid-001"
   plugin.time = lambda: 1000
   plugin.time_to_str = lambda value: f"time-{value}"
@@ -661,8 +661,8 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
       alias="My TCP Tunnel",
     )
 
-    self.assertEqual(route["public_port"], 39999)
-    self.assertEqual(plugin.get_tcp_route(39999), "uuid-001.ratio1.link")
+    self.assertEqual(route["public_port"], 30499)
+    self.assertEqual(plugin.get_tcp_route(30499), "uuid-001.ratio1.link")
 
   def test_tcp_alias_creates_origin_hostname_only(self):
     requests = _RequestsStub(
