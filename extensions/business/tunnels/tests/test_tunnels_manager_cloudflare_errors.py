@@ -117,9 +117,14 @@ def make_plugin(requests):
 
 class _RandomStub:
 
+  def __init__(self, values=None):
+    self.values = list(values or [])
+
   def randint(self, low, high=None):
     if high is None:
       low, high = 0, low
+    if self.values:
+      return self.values.pop(0)
     return high - 1
 
 
@@ -309,6 +314,7 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     plugin = make_plugin(requests)
     plugin.cfg_tcp_public_port_range_start = 30000
     plugin.cfg_tcp_public_port_range_end = 30001
+    plugin.np.random = _RandomStub([30000, 30001])
     plugin._chainstore[plugin.cfg_tcp_routes_hkey] = {
       "30000": {
         "public_port": 30000,
@@ -359,6 +365,7 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     plugin = make_plugin(requests)
     plugin.cfg_tcp_public_port_range_start = 30000
     plugin.cfg_tcp_public_port_range_end = 30001
+    plugin.np.random = _RandomStub([30000, 30001])
     original_hset = plugin.chainstore_hset
     hset_calls = []
 
@@ -610,8 +617,8 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
       alias="My TCP Tunnel",
     )
 
-    self.assertEqual(route["public_port"], 30000)
-    self.assertEqual(plugin.get_tcp_route(30000), "uuid-001.ratio1.link")
+    self.assertEqual(route["public_port"], 39999)
+    self.assertEqual(plugin.get_tcp_route(39999), "uuid-001.ratio1.link")
 
   def test_tcp_alias_creates_origin_hostname_only(self):
     requests = _RequestsStub(

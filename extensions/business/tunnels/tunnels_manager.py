@@ -99,12 +99,15 @@ class TunnelsManagerPlugin(BasePlugin):
 
   def _claim_tcp_route(self, tunnel_id, hostname, alias):
     start, end = self._tcp_public_range()
-    candidates = list(range(start, end + 1))
-    for idx in range(len(candidates) - 1, 0, -1):
-      swap_idx = int(self.np.random.randint(0, idx + 1))
-      candidates[idx], candidates[swap_idx] = candidates[swap_idx], candidates[idx]
+    tried_ports = set()
+    max_attempts = end - start + 1
 
-    for port in candidates:
+    while len(tried_ports) < max_attempts:
+      port = int(self.np.random.randint(start, end + 1))
+      if port in tried_ports:
+        continue
+      tried_ports.add(port)
+
       route_key = self._tcp_route_key(port)
       routes = self._get_tcp_routes()
       existing = routes.get(route_key)
