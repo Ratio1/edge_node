@@ -658,7 +658,7 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     self.assertEqual(len(requests.posts), 1)
     self.assertEqual(requests.posts[0]["json"]["name"], "alias.ratio1.link")
     aliases = requests.patches[0]["json"]["metadata"]["aliases"]
-    self.assertEqual(aliases[0]["public_id"], None)
+    self.assertNotIn("public_id", aliases[0])
     self.assertEqual(aliases[0]["type"], "origin")
 
 

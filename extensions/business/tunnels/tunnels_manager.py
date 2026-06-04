@@ -682,12 +682,12 @@ class TunnelsManagerPlugin(BasePlugin):
 
     if 'aliases' not in value['metadata']:
       value['metadata']['aliases'] = []
-    value['metadata']['aliases'].append({
+    alias_metadata = {
       "id": dns_record['result']['id'],
       "name": alias,
-      "public_id": None,
       "type": "origin" if tunnel_type == "tcp" else "dns",
-    })
+    }
+    value['metadata']['aliases'].append(alias_metadata)
     self._cloudflare_update_metadata(
       tunnel_id=tunnel_id,
       metadata=value['metadata'],
