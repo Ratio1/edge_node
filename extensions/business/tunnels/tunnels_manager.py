@@ -1,5 +1,3 @@
-import random
-import threading
 from typing import Optional
 
 from naeural_core.business.default.web_app.supervisor_fast_api_web_app import SupervisorFastApiWebApp as BasePlugin
@@ -70,13 +68,6 @@ class TunnelsManagerPlugin(BasePlugin):
       raise Exception(f"Invalid TCP public port range: {start}-{end}")
     return start, end
 
-  def _tcp_allocation_lock(self):
-    lock = getattr(self, "_tcp_allocation_lock_obj", None)
-    if lock is None:
-      lock = threading.Lock()
-      setattr(self, "_tcp_allocation_lock_obj", lock)
-    return lock
-
   def _sync_tcp_routes(self, required=False):
     try:
       return self.chainstore_hsync(hkey=self.cfg_tcp_routes_hkey)
@@ -131,36 +122,37 @@ class TunnelsManagerPlugin(BasePlugin):
     return None
 
   def _claim_tcp_route(self, tunnel_id, hostname, alias):
-    with self._tcp_allocation_lock():
-      start, end = self._tcp_public_range()
-      candidates = list(range(start, end + 1))
-      random.SystemRandom().shuffle(candidates)
+    start, end = self._tcp_public_range()
+    candidates = list(range(start, end + 1))
+    for idx in range(len(candidates) - 1, 0, -1):
+      swap_idx = int(self.np.random.randint(0, idx + 1))
+      candidates[idx], candidates[swap_idx] = candidates[swap_idx], candidates[idx]
 
-      for port in candidates:
-        route_key = self._tcp_route_key(port)
-        routes = self._get_tcp_routes(sync=True, require_sync=True)
-        existing = routes.get(route_key)
-        if existing:
-          continue
+    for port in candidates:
+      route_key = self._tcp_route_key(port)
+      routes = self._get_tcp_routes(sync=True, require_sync=True)
+      existing = routes.get(route_key)
+      if existing:
+        continue
 
-        route = self._make_tcp_route_record(
-          public_port=port,
-          tunnel_id=tunnel_id,
-          hostname=hostname,
-          alias=alias,
-        )
-        stored = self.chainstore_hset(
-          hkey=self.cfg_tcp_routes_hkey,
-          key=route_key,
-          value=route,
-          readonly=True,
-        )
-        if not stored:
-          continue
+      route = self._make_tcp_route_record(
+        public_port=port,
+        tunnel_id=tunnel_id,
+        hostname=hostname,
+        alias=alias,
+      )
+      stored = self.chainstore_hset(
+        hkey=self.cfg_tcp_routes_hkey,
+        key=route_key,
+        value=route,
+        readonly=True,
+      )
+      if not stored:
+        continue
 
-        verified = self._get_tcp_route_record(port, sync=True, require_sync=True)
-        if isinstance(verified, dict) and verified.get("tunnel_id") == tunnel_id and verified.get("hostname") == hostname:
-          return verified
+      verified = self._get_tcp_route_record(port, sync=True, require_sync=True)
+      if isinstance(verified, dict) and verified.get("tunnel_id") == tunnel_id and verified.get("hostname") == hostname:
+        return verified
 
     raise Exception(f"No available TCP public ports in range {start}-{end}")
 

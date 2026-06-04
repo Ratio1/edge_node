@@ -2,7 +2,6 @@ import sys
 import types
 import unittest
 from copy import deepcopy
-from unittest import mock
 
 
 _supervisor_module = types.ModuleType("naeural_core.business.default.web_app.supervisor_fast_api_web_app")
@@ -78,6 +77,7 @@ def make_plugin(requests):
   plugin.time_to_str = lambda value: f"time-{value}"
   plugin.deepcopy = deepcopy
   plugin.P = lambda *args, **kwargs: None
+  plugin.np = types.SimpleNamespace(random=_RandomStub())
   plugin._chainstore = {}
   plugin._chainstore_hsets = []
 
@@ -110,13 +110,12 @@ def make_plugin(requests):
   return plugin
 
 
-class _FixedRandom:
+class _RandomStub:
 
-  def __init__(self, ordered_ports):
-    self.ordered_ports = ordered_ports
-
-  def shuffle(self, candidates):
-    candidates[:] = self.ordered_ports
+  def randint(self, low, high=None):
+    if high is None:
+      low, high = 0, low
+    return high - 1
 
 
 class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
@@ -311,18 +310,14 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
       }
     }
 
-    with mock.patch(
-      "extensions.business.tunnels.tunnels_manager.random.SystemRandom",
-      return_value=_FixedRandom([30000, 30001]),
-    ):
-      result = plugin.new_tunnel(
-        alias="My TCP Tunnel",
-        cloudflare_account_id="account-id",
-        cloudflare_zone_id="zone-id",
-        cloudflare_api_key="api-key",
-        cloudflare_domain="ratio1.link",
-        tunnel_type="tcp",
-      )
+    result = plugin.new_tunnel(
+      alias="My TCP Tunnel",
+      cloudflare_account_id="account-id",
+      cloudflare_zone_id="zone-id",
+      cloudflare_api_key="api-key",
+      cloudflare_domain="ratio1.link",
+      tunnel_type="tcp",
+    )
 
     self.assertEqual(result["tcp_route"]["public_port"], 30001)
 
@@ -373,18 +368,14 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
 
     plugin.chainstore_hset = colliding_hset
 
-    with mock.patch(
-      "extensions.business.tunnels.tunnels_manager.random.SystemRandom",
-      return_value=_FixedRandom([30000, 30001]),
-    ):
-      result = plugin.new_tunnel(
-        alias="My TCP Tunnel",
-        cloudflare_account_id="account-id",
-        cloudflare_zone_id="zone-id",
-        cloudflare_api_key="api-key",
-        cloudflare_domain="ratio1.link",
-        tunnel_type="tcp",
-      )
+    result = plugin.new_tunnel(
+      alias="My TCP Tunnel",
+      cloudflare_account_id="account-id",
+      cloudflare_zone_id="zone-id",
+      cloudflare_api_key="api-key",
+      cloudflare_domain="ratio1.link",
+      tunnel_type="tcp",
+    )
 
     self.assertEqual(hset_calls[:2], ["30000", "30001"])
     self.assertEqual(result["tcp_route"]["public_port"], 30001)
