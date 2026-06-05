@@ -201,7 +201,7 @@ LLM_ANALYSIS_EXEC_SUMMARY_PACKAGE = "exec_summary_package"
 # Prompt-template version. Stored on every emitted LlmReportSections
 # so the report's AI-disclosure appendix can show which template
 # version produced the narrative. Bump on any prompt change.
-LLM_PROMPT_VERSION_EXEC_SUMMARY = "exec-summary-v1"
+LLM_PROMPT_VERSION_EXEC_SUMMARY = "exec-summary-v2"
 
 # =====================================================================
 # Protocol fingerprinting and probe routing

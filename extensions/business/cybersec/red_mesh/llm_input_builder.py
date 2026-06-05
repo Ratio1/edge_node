@@ -55,6 +55,7 @@ from typing import Any
 MAX_FINDING_TITLE_CHARS = 200
 MAX_FINDING_DESCRIPTION_CHARS = 600
 MAX_FINDING_IMPACT_CHARS = 400
+MAX_FINDING_REMEDIATION_CHARS = 600
 MAX_EVIDENCE_CAPTION_CHARS = 240
 MAX_EVIDENCE_SNIPPET_CHARS = 200
 MAX_FINDINGS_INCLUDED = 80          # cap on findings forwarded to LLM
@@ -287,10 +288,30 @@ def _summarize_scan(
   # Graybox-specific count fields
   graybox = aggregated.get("graybox_results") or {}
   if isinstance(graybox, dict):
-    routes = aggregated.get("scenario_stats") or {}
-    if isinstance(routes, dict):
-      out["routes_discovered"] = int(routes.get("routes_discovered", 0) or 0)
-      out["scenarios_tested"] = int(routes.get("scenarios_tested", 0) or 0)
+    discovery_count = 0
+    for port_data in graybox.values():
+      if not isinstance(port_data, dict):
+        continue
+      discovery = port_data.get("_graybox_discovery") or {}
+      if isinstance(discovery, dict):
+        routes = discovery.get("routes") or []
+        if isinstance(routes, (list, tuple)):
+          discovery_count += len(routes)
+    out["routes_discovered"] = discovery_count
+    scenario_stats = aggregated.get("scenario_stats") or {}
+    scan_metrics = aggregated.get("scan_metrics") or {}
+    if isinstance(scenario_stats, dict):
+      out["scenarios_tested"] = int(
+        scenario_stats.get("total")
+        or scenario_stats.get("scenarios_tested")
+        or 0
+      )
+    if not out["scenarios_tested"] and isinstance(scan_metrics, dict):
+      out["scenarios_tested"] = int(
+        scan_metrics.get("scenarios_total")
+        or scan_metrics.get("scenarios_tested")
+        or 0
+      )
 
   return out
 
@@ -317,6 +338,7 @@ def _sanitize_finding(f: dict) -> dict:
     "title": _sanitize(f.get("title", ""), MAX_FINDING_TITLE_CHARS),
     "description": _sanitize(f.get("description", ""), MAX_FINDING_DESCRIPTION_CHARS),
     "impact": _sanitize(f.get("impact", ""), MAX_FINDING_IMPACT_CHARS),
+    "remediation": _sanitize(f.get("remediation", ""), MAX_FINDING_REMEDIATION_CHARS),
     "confidence": _sanitize(f.get("confidence", ""), 32),
     "owasp_id": _sanitize(f.get("owasp_id", ""), 32),
     "cwe_id": _sanitize(f.get("cwe_id", ""), 32),

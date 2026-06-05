@@ -476,6 +476,76 @@ class TestLlmRetryHardening(unittest.TestCase):
     self.assertEqual(result["analysis"], "ok")
     self.assertEqual(calls["count"], 2)
 
+  def test_call_llm_agent_api_returns_error_after_retry_exhaustion(self):
+    from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+        self.cfg_llm_api_retries = 2
+        self.audit_events = []
+
+      def P(self, *_args, **_kwargs):
+        return None
+
+      def Pd(self, *_args, **_kwargs):
+        return None
+
+      def _log_audit_event(self, event, payload):
+        self.audit_events.append((event, payload))
+
+    host = MockHost()
+    original_post = requests.post
+    calls = {"count": 0}
+
+    def timeout_post(*_args, **_kwargs):
+      calls["count"] += 1
+      raise requests.exceptions.Timeout("busy local model")
+
+    requests.post = timeout_post
+    try:
+      result = host._call_llm_agent_api("/analyze_scan", payload={"scan_results": {}})
+    finally:
+      requests.post = original_post
+
+    self.assertEqual(calls["count"], 2)
+    self.assertEqual(result["status"], "retry_exhausted")
+    self.assertTrue(result["retryable"])
+    self.assertEqual(host.audit_events[-1][0], "retry_exhausted")
+
+  def test_llm_health_reports_retry_exhaustion_without_raising(self):
+    from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import _RedMeshLlmAgentMixin
+
+    class MockHost(_RedMeshLlmAgentMixin):
+      def __init__(self):
+        self.cfg_llm_agent = {"ENABLED": True, "TIMEOUT": 5, "AUTO_ANALYSIS_TYPE": "security_assessment"}
+        self.cfg_llm_agent_api_host = "127.0.0.1"
+        self.cfg_llm_agent_api_port = 8080
+        self.cfg_llm_api_retries = 2
+
+      def P(self, *_args, **_kwargs):
+        return None
+
+      def Pd(self, *_args, **_kwargs):
+        return None
+
+    host = MockHost()
+    original_get = requests.get
+
+    def timeout_get(*_args, **_kwargs):
+      raise requests.exceptions.Timeout("busy local model")
+
+    requests.get = timeout_get
+    try:
+      result = host._get_llm_health_status()
+    finally:
+      requests.get = original_get
+
+    self.assertEqual(result["status"], "retry_exhausted")
+    self.assertIn("exhausted retries", result["message"])
+
   def test_call_llm_agent_api_does_not_retry_non_retryable_provider_rejection(self):
     from extensions.business.cybersec.red_mesh.mixins.redmesh_llm_agent import _RedMeshLlmAgentMixin
 

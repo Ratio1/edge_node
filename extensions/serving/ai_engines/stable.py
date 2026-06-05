@@ -21,6 +21,10 @@ AI_ENGINES['llama_cpp_large'] = {
   'SERVING_PROCESS': 'llama_cpp_llama_8b'
 }
 
+AI_ENGINES['cybersec_qwen_4b'] = {
+  'SERVING_PROCESS': 'llama_cpp_cybersec_qwen_4b'
+}
+
 AI_ENGINES['llm_reason'] = {
   'SERVING_PROCESS': 'deepseek_r1_qwen_7b'
 }

@@ -25,6 +25,8 @@ from extensions.business.cybersec.red_mesh.constants import (
   LLM_PROMPT_VERSION_EXEC_SUMMARY,
 )
 from extensions.business.cybersec.red_mesh.services.llm_structured import (
+  PROMPT_PROFILE_LOCAL_CYBERSECQWEN_V1,
+  PROMPT_PROFILE_REMOTE_RICH_V1,
   StructuredLlmResult,
   generate_exec_summary,
 )
@@ -62,6 +64,7 @@ def _make_valid_response_dict(*, with_critical_acknowledgement=True) -> dict:
     else "The engagement identified several findings worth attention."
   )
   return {
+    "executive_headline": "Critical and high-severity exposure requires near-term executive attention.",
     "background_draft": "Quarterly external pentest commissioned by the client.",
     "overall_posture": posture,
     "recommendation_summary": [
@@ -276,6 +279,70 @@ class TestTrustBoundary(unittest.TestCase):
     self.assertNotIn("secret@private.example", sent_text)
     # Operator-trusted client_name IS forwarded
     self.assertIn("ACME", sent_text)
+
+  def test_low_context_prompt_caps_and_compacts_findings(self):
+    findings = []
+    for idx in range(20):
+      findings.append({
+        "severity": "HIGH",
+        "title": f"Finding {idx} " + ("title " * 80),
+        "description": "description " * 200,
+        "impact": "impact " * 200,
+        "remediation": "remediation " * 200,
+        "evidence": [{"snippet": "target-controlled raw response " * 100}],
+        "cve": [f"CVE-2026-{idx:04d}", "CVE-extra-1", "CVE-extra-2", "CVE-extra-3"],
+      })
+    llm = _MockLlm([json.dumps(_make_valid_response_dict())])
+    generate_exec_summary(
+      llm_call=llm,
+      findings=findings,
+      aggregated_report={"scenario_stats": {"total": 20, "vulnerable": 20}},
+      model_name="CyberSecQwen-4B.Q4_K_M.gguf",
+      max_findings=3,
+      max_tokens=256,
+    )
+
+    user_content = llm.calls[0][-1]["content"]
+    self.assertIn('"included_findings":3', user_content)
+    self.assertIn('"truncated_findings":17', user_content)
+    self.assertNotIn("target-controlled raw response", user_content)
+    self.assertNotIn('"evidence"', user_content)
+    self.assertLess(len(user_content), 5000)
+
+  def test_local_cybersecqwen_profile_uses_single_user_quota_prompt(self):
+    llm = _MockLlm([json.dumps(_make_valid_response_dict())])
+    result = generate_exec_summary(
+      llm_call=llm,
+      findings=SAMPLE_FINDINGS,
+      model_name="CyberSecQwen-4B.Q4_K_M.gguf",
+      provider_path="local",
+      prompt_profile="auto",
+    )
+
+    self.assertFalse(result.error)
+    self.assertEqual(result.prompt_profile, PROMPT_PROFILE_LOCAL_CYBERSECQWEN_V1)
+    self.assertEqual(result.provider_path, "local")
+    self.assertEqual(len(llm.calls[0]), 1)
+    self.assertEqual(llm.calls[0][0]["role"], "user")
+    self.assertIn("recommendation_summary: exactly five", llm.calls[0][0]["content"])
+    self.assertIn("Sanitized RedMesh context JSON", llm.calls[0][0]["content"])
+
+  def test_remote_profile_uses_richer_system_user_prompt(self):
+    llm = _MockLlm([json.dumps(_make_valid_response_dict())])
+    result = generate_exec_summary(
+      llm_call=llm,
+      findings=SAMPLE_FINDINGS,
+      model_name="deepseek-chat",
+      provider_path="remote",
+      prompt_profile="auto",
+    )
+
+    self.assertFalse(result.error)
+    self.assertEqual(result.prompt_profile, PROMPT_PROFILE_REMOTE_RICH_V1)
+    self.assertEqual(result.provider_path, "remote")
+    self.assertEqual(len(llm.calls[0]), 2)
+    self.assertEqual(llm.calls[0][0]["role"], "system")
+    self.assertIn("six to eight", llm.calls[0][1]["content"])
 
 
 # ---------------------------------------------------------------------

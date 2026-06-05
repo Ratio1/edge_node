@@ -44,6 +44,11 @@ class EdgeNodeReloader(PatternMatchingEventHandler):
     self.last_restart = 0
     self.debounce_seconds = debounce_seconds
     self.restart_pending = False
+    self.crash_timestamps = []
+    self.crash_window_seconds = 300.0
+    self.max_crashes_in_window = 5
+    self.base_crash_restart_delay = 2.0
+    self.max_crash_restart_delay = 30.0
 
   def start_process(self):
     """Start or restart the edge node process."""
@@ -78,6 +83,21 @@ class EdgeNodeReloader(PatternMatchingEventHandler):
   def _should_restart(self):
     """Check if enough time has passed since last restart."""
     return time.time() - self.last_restart >= self.debounce_seconds
+
+  def _crash_restart_delay(self):
+    """Return a backoff delay for repeated unexpected exits, or None if we should stop auto-retrying."""
+    now = time.time()
+    self.crash_timestamps = [
+      timestamp for timestamp in self.crash_timestamps
+      if now - timestamp <= self.crash_window_seconds
+    ]
+    self.crash_timestamps.append(now)
+
+    if len(self.crash_timestamps) > self.max_crashes_in_window:
+      return None
+
+    delay = self.base_crash_restart_delay * (2 ** (len(self.crash_timestamps) - 1))
+    return min(delay, self.max_crash_restart_delay)
 
   def _trigger_restart(self, event_path):
     """Handle a file change event."""
@@ -174,7 +194,25 @@ def main():
       if handler.process and handler.process.poll() is not None:
         exit_code = handler.process.returncode
         if exit_code != 0:
-          print("\n  Process exited with code {}. Waiting for file changes...".format(exit_code))
+          delay = handler._crash_restart_delay()
+          if delay is None:
+            print(
+              "\n  Process exited with code {} too many times in {}s. Waiting for file changes...".format(
+                exit_code, int(handler.crash_window_seconds)
+              )
+            )
+            handler.process = None
+          else:
+            print(
+              "\n  Process exited with code {}. Restarting in {:.1f}s...".format(
+                exit_code, delay
+              )
+            )
+            handler.process = None
+            time.sleep(delay)
+            handler.start_process()
+        else:
+          print("\n  Process exited cleanly. Waiting for file changes...")
           handler.process = None
   except KeyboardInterrupt:
     pass
