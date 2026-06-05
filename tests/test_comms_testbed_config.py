@@ -136,6 +136,17 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertIn("ENV EE_ENABLE_NETMON_API_PROBE=1", dockerfile)
     self.assertIn("CMD [\"python3\", \"/usr/local/bin/device_comms.py\"]", dockerfile)
 
+  def test_runtime_images_enable_oracle_only_heartbeat_receive_by_default(self):
+    for dockerfile_name in [
+      "Dockerfile_devnet",
+      "Dockerfile_testnet",
+      "Dockerfile_mainnet",
+      "Dockerfile_devnet_local",
+    ]:
+      with self.subTest(dockerfile_name=dockerfile_name):
+        dockerfile = (REPO_ROOT / dockerfile_name).read_text()
+        self.assertIn("ENV EE_NETMON_ORACLE_ONLY_HEARTBEAT_RECEIVE=1", dockerfile)
+
   def test_read_only_netmon_status_dump_command_is_present(self):
     command_path = REPO_ROOT / "cmds" / "dump_netmon_status"
 

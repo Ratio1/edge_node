@@ -57,6 +57,8 @@ ENV EE_EPOCH_MANAGER_DEBUG=1
 ENV EE_NETMON_ADDRESS_INDEX=true
 ENV EE_NETMON_SEND_CURRENT_NETWORK_EACH=50
 ENV EE_NETMON_SEND_ONLY_ONLINE=true
+# Default rollout: non-supervisors use supervisor summaries instead of subscribing to every heartbeat.
+ENV EE_NETMON_ORACLE_ONLY_HEARTBEAT_RECEIVE=1
 
 ENV EE_EVM_NET=devnet
 
