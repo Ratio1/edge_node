@@ -493,17 +493,20 @@ class OracleSync01Plugin(
 
     self._last_epoch_synced = self.netmon.epoch_manager.get_last_sync_epoch()
     if (
+      DEBUG_MODE and
       _env_flag("EE_ORACLE_SYNC_BOOTSTRAP_PREVIOUS_EPOCH") and
       not self._local_history_bootstrap_done
     ):
       self._local_history_bootstrap_done = True
       previous_epoch = self.netmon.epoch_manager.get_current_epoch() - 1
       if previous_epoch > self._last_epoch_synced:
-        # Testbeds often start from a fresh local era with no historical
-        # consensus table. Bootstrap to the previous epoch so the plugin tests
-        # live consensus instead of spending the run backfilling fake history.
-        # This must run only once; applying it at the epoch-change reset would
-        # make the live consensus update look already persisted.
+        # Debug testbeds often start from a fresh local era with no historical
+        # consensus table. Bootstrap to the previous epoch so local tests can
+        # exercise live consensus instead of backfilling fake history. Keep this
+        # behind DEBUG_MODE; production must not skip real historical epochs
+        # because a bootstrap env flag leaked into the runtime environment.
+        # This must run only once; applying it at every epoch-change reset would
+        # make live consensus updates look already persisted.
         self.P(
           f"Bootstrapping last synced epoch from {self._last_epoch_synced} to {previous_epoch}.",
           color='y',

@@ -118,6 +118,7 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertIn("EE_ORACLE_SYNC_DEBUG_MODE", oracle_constants)
     self.assertIn("derive", oracle_constants)
     self.assertIn("EE_ORACLE_SYNC_BOOTSTRAP_PREVIOUS_EPOCH", oracle_plugin)
+    self.assertIn("DEBUG_MODE and", oracle_plugin)
     self.assertIn("fake history", oracle_plugin)
     self.assertIn("run only once", oracle_plugin)
 
