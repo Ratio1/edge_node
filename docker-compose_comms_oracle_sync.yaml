@@ -1,13 +1,14 @@
 # Optional OracleSync overlay for the isolated local communication testbed.
 #
 # Usage:
-#   EE_COMMS_ORACLE_SYNC_GENESIS="$(date -u -d '11 minutes ago' '+%Y-%m-%d %H:%M:%S')" \
+#   EE_COMMS_ORACLE_SYNC_EPOCH_INTERVAL_SECONDS=60 \
+#   EE_COMMS_ORACLE_SYNC_GENESIS="$(date -u -d '20 seconds ago' '+%Y-%m-%d %H:%M:%S')" \
 #     docker compose -f docker-compose_comms.yaml -f docker-compose_comms_oracle_sync.yaml up -d --build --force-recreate
 #
-# The dynamic genesis example starts the stack early in epoch 1, giving the
-# nodes enough live time in that epoch before OracleSync tests consensus at the
-# next epoch boundary. All containers must share the same local era or the
-# availability tables are not comparable.
+# The dynamic genesis example starts a short local epoch with enough remaining
+# time for nodes to accumulate live availability before OracleSync tests
+# consensus at the next boundary. All containers must share the same local era
+# or the availability tables are not comparable.
 x-oracle-sync-era: &oracle-sync-era
   EE_GENESIS_EPOCH_DATE: "${EE_COMMS_ORACLE_SYNC_GENESIS:-2026-06-05 00:00:00}"
   EE_EPOCH_INTERVALS: "${EE_COMMS_ORACLE_SYNC_EPOCH_INTERVALS:-1}"
