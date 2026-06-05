@@ -60,6 +60,16 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertEqual(params["PAYLOADS_CHANNEL"]["QOS"], 0)
     self.assertEqual(params["NOTIF_CHANNEL"]["QOS"], 0)
 
+  def test_default_app_config_enables_segregated_heartbeat_and_command_qos(self):
+    config = json.loads((REPO_ROOT / ".config_app.json").read_text())
+    params = config["COMMUNICATION"]["PARAMS"]
+
+    self.assertEqual(params["CTRL_CHANNEL"]["TOPIC"], "naeural/ctrl")
+    self.assertEqual(params["CTRL_CHANNEL"]["QOS"], 1)
+    self.assertEqual(params["CONFIG_CHANNEL"]["TOPIC"], "naeural/{}/config")
+    self.assertEqual(params["CONFIG_CHANNEL"]["QOS"], 2)
+    self.assertEqual(params["QOS"], 2)
+
   def test_startup_config_keeps_required_admin_pipeline_only(self):
     config = json.loads((REPO_ROOT / ".config_startup_comms.json").read_text())
     admin_pipeline = config["ADMIN_PIPELINE"]
