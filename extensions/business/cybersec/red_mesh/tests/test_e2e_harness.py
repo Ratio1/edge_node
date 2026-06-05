@@ -1,6 +1,14 @@
 import unittest
+from unittest.mock import patch
 
-from extensions.business.cybersec.red_mesh.tests.e2e.run_e2e import archive_passes
+from extensions.business.cybersec.red_mesh.tests.e2e.run_e2e import (
+  archive_passes,
+  fetch_archive,
+  is_failed_job_status,
+  is_terminal_job_status,
+  job_status_values as generic_job_status_values,
+  wait_for_finalize,
+)
 from extensions.business.cybersec.red_mesh.tests.e2e.api_top10_e2e import (
   assert_llm_boundary,
   gateway_request_headers,
@@ -29,6 +37,101 @@ def test_archive_passes_keeps_legacy_pass_reports_fallback():
 def test_archive_passes_handles_invalid_archives():
   assert archive_passes(None) == []
   assert archive_passes({"passes": "bad", "pass_reports": "bad"}) == []
+
+
+class GenericE2eHarnessStatusTests(unittest.TestCase):
+  def test_job_status_values_reads_listing_and_status_shapes(self):
+    listing = {
+      "result": {
+        "job-1": {"job_status": "FINALIZED"},
+      },
+    }
+    status = {
+      "result": {
+        "status": "completed",
+      },
+    }
+
+    self.assertEqual(generic_job_status_values(listing, "job-1"), ["FINALIZED"])
+    self.assertEqual(generic_job_status_values(status, "job-1"), ["completed"])
+    self.assertTrue(is_terminal_job_status(listing, "job-1"))
+    self.assertTrue(is_terminal_job_status(status, "job-1"))
+    self.assertTrue(is_failed_job_status({"result": {"job-1": {"job_status": "FAILED"}}}, "job-1"))
+
+  def test_wait_for_finalize_survives_transient_poll_timeout(self):
+    calls = []
+
+    def fake_http_get(url, timeout=15):
+      calls.append((url, timeout))
+      if url.endswith("/list_network_jobs") and len(calls) == 1:
+        raise TimeoutError("local LLM busy")
+      if url.endswith("/list_network_jobs"):
+        return {"result": {"job-1": {"job_status": "FINALIZED", "duration": 1}}}
+      return {"result": {"status": "completed"}}
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.tests.e2e.run_e2e.http_get",
+      side_effect=fake_http_get,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.tests.e2e.run_e2e.time.sleep",
+      return_value=None,
+    ):
+      job = wait_for_finalize(
+        "http://rm",
+        "job-1",
+        timeout=30,
+        poll_every=0,
+        request_timeout=7,
+      )
+
+    self.assertEqual(job["status"], "completed")
+    self.assertEqual(job["_harness_poll_failures"], 1)
+    self.assertIn(("http://rm/list_network_jobs", 7), calls)
+
+  def test_wait_for_finalize_fails_promptly_on_failed_job_status(self):
+    def fake_http_get(url, timeout=15):
+      return {"result": {"job-1": {"job_status": "FAILED"}}}
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.tests.e2e.run_e2e.http_get",
+      side_effect=fake_http_get,
+    ):
+      with self.assertRaisesRegex(RuntimeError, "failed with status"):
+        wait_for_finalize(
+          "http://rm",
+          "job-1",
+          timeout=30,
+          poll_every=0,
+        )
+
+  def test_fetch_archive_retries_until_passes_are_readable(self):
+    responses = [
+      TimeoutError("api busy"),
+      {"result": {"archive": {"passes": [{"pass_nr": 1}]}}},
+    ]
+
+    def fake_http_get(url, timeout=30):
+      item = responses.pop(0)
+      if isinstance(item, Exception):
+        raise item
+      return item
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.tests.e2e.run_e2e.http_get",
+      side_effect=fake_http_get,
+    ), patch(
+      "extensions.business.cybersec.red_mesh.tests.e2e.run_e2e.time.sleep",
+      return_value=None,
+    ):
+      archive = fetch_archive(
+        "http://rm",
+        "job-1",
+        timeout=30,
+        poll_every=0,
+        request_timeout=9,
+      )
+
+    self.assertEqual(archive["passes"], [{"pass_nr": 1}])
 
 
 def test_api_top10_target_confirmation_uses_host_only():
