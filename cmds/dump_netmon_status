@@ -1,0 +1,13 @@
+#!/bin/bash
+###
+### This script dumps the optional NET_MON_01 status snapshot.
+###
+FILE=/edge_node/_local_cache/_data/netmon_status.json
+
+if [ ! -f "$FILE" ]; then
+    echo "Error: $FILE does not exist"
+    exit 1
+fi
+
+# `cat` is called this way in order to have a newline after the file content.
+echo "`cat $FILE`"

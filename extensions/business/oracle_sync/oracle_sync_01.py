@@ -56,6 +56,8 @@ To deploy for the first time:
 echo 'journalctl -u edge_node_service.service -a -S "2025-08-05 18:00:00" | grep -A 9 "self-assessment"' > predict_consensus.sh && chmod +x predict_consensus.sh
 """
 
+import os
+
 from naeural_core.business.base.network_processor import NetworkProcessorPlugin
 from extensions.business.oracle_sync.sync_mixins.ora_sync_utils_mixin import _OraSyncUtilsMixin
 from extensions.business.oracle_sync.sync_mixins.ora_sync_states_mixin import _OraSyncStatesCallbacksMixin
@@ -117,6 +119,13 @@ if DEBUG_MODE:
 # endif DEBUG_MODE
 
 __VER__ = '0.1.0'
+
+
+def _env_flag(name, default=False):
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class OracleSync01Plugin(
@@ -396,6 +405,7 @@ class OracleSync01Plugin(
     self._last_oracle_list_refresh = None
     self._last_oracle_list_refresh_attempt = None
     self._last_self_assessment_ts = None
+    self._local_history_bootstrap_done = False
 
     self._self_assessment_data = {
       'series': self.deque(maxlen=10),
@@ -482,6 +492,23 @@ class OracleSync01Plugin(
     self.early_stopping_iterations = {}
 
     self._last_epoch_synced = self.netmon.epoch_manager.get_last_sync_epoch()
+    if (
+      _env_flag("EE_ORACLE_SYNC_BOOTSTRAP_PREVIOUS_EPOCH") and
+      not self._local_history_bootstrap_done
+    ):
+      self._local_history_bootstrap_done = True
+      previous_epoch = self.netmon.epoch_manager.get_current_epoch() - 1
+      if previous_epoch > self._last_epoch_synced:
+        # Testbeds often start from a fresh local era with no historical
+        # consensus table. Bootstrap to the previous epoch so the plugin tests
+        # live consensus instead of spending the run backfilling fake history.
+        # This must run only once; applying it at the epoch-change reset would
+        # make the live consensus update look already persisted.
+        self.P(
+          f"Bootstrapping last synced epoch from {self._last_epoch_synced} to {previous_epoch}.",
+          color='y',
+        )
+        self._last_epoch_synced = previous_epoch
     self.first_time_request_agreed_median_table_sent = None
     self.last_time_request_agreed_median_table_sent = None
     self.P(f'Current epoch: {self._current_epoch}, Last epoch synced: {self._last_epoch_synced}.')

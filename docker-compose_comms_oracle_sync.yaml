@@ -1,0 +1,40 @@
+# Optional OracleSync overlay for the isolated local communication testbed.
+#
+# Usage:
+#   EE_COMMS_ORACLE_SYNC_GENESIS="$(date -u -d '11 minutes ago' '+%Y-%m-%d %H:%M:%S')" \
+#     docker compose -f docker-compose_comms.yaml -f docker-compose_comms_oracle_sync.yaml up -d --build --force-recreate
+#
+# The dynamic genesis example starts the stack early in epoch 1, giving the
+# nodes enough live time in that epoch before OracleSync tests consensus at the
+# next epoch boundary. All containers must share the same local era or the
+# availability tables are not comparable.
+x-oracle-sync-era: &oracle-sync-era
+  EE_GENESIS_EPOCH_DATE: "${EE_COMMS_ORACLE_SYNC_GENESIS:-2026-06-05 00:00:00}"
+  EE_EPOCH_INTERVALS: "${EE_COMMS_ORACLE_SYNC_EPOCH_INTERVALS:-1}"
+  EE_EPOCH_INTERVAL_SECONDS: "${EE_COMMS_ORACLE_SYNC_EPOCH_INTERVAL_SECONDS:-600}"
+
+x-oracle-sync-plugin: &oracle-sync-plugin
+  EE_ENABLE_LOCAL_ORACLE_SYNC: "1"
+  EE_ORACLE_SYNC_DEBUG_MODE: "1"
+  EE_ORACLE_SYNC_DEBUG_FULL: "${EE_ORACLE_SYNC_DEBUG_FULL:-0}"
+  EE_ORACLE_SYNC_BOOTSTRAP_PREVIOUS_EPOCH: "1"
+  EE_ORACLE_SYNC_SEND_PERIOD: "${EE_ORACLE_SYNC_SEND_PERIOD:-20}"
+  EE_ORACLE_SYNC_SEND_INTERVAL: "${EE_ORACLE_SYNC_SEND_INTERVAL:-5}"
+  EE_ORACLE_SYNC_SELF_ASSESSMENT_INTERVAL: "${EE_ORACLE_SYNC_SELF_ASSESSMENT_INTERVAL:-60}"
+
+services:
+  ratio1_comm_oracle_01:
+    environment:
+      <<: [*oracle-sync-era, *oracle-sync-plugin]
+
+  ratio1_comm_oracle_02:
+    environment:
+      <<: [*oracle-sync-era, *oracle-sync-plugin]
+
+  ratio1_comm_node_01:
+    environment:
+      <<: *oracle-sync-era
+
+  ratio1_comm_node_02:
+    environment:
+      <<: *oracle-sync-era
