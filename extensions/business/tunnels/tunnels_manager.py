@@ -10,7 +10,7 @@ MESSAGE_PREFIX_DEEPLOY = "Please sign this message for Deeploy: "
 _CONFIG = {
   **BasePlugin.CONFIG,
 
-  'PORT': None,
+  'PORT': 31236,
   
   'ASSETS' : 'nothing', # TODO: this should not be required in future
   

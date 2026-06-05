@@ -723,6 +723,7 @@ class TunnelsManagerCloudflareErrorTests(unittest.TestCase):
     requests = _RequestsStub()
     plugin = make_plugin(requests)
 
+    self.assertEqual(TunnelsManagerPlugin.CONFIG["PORT"], 31236)
     self.assertEqual(TunnelsManagerPlugin.CONFIG["PROCESS_DELAY"], 0)
     self.assertEqual(TunnelsManagerPlugin.CONFIG["TCP_ROUTES_SYNC_INTERVAL"], 5 * 60)
 
