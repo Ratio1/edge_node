@@ -1,0 +1,69 @@
+{
+  "COMMUNICATION": {
+    "INSTANCES": {
+      "COMMANDCONTROL": {
+        "RECV_FROM": "CTRL_CHANNEL",
+        "SEND_TO": "CONFIG_CHANNEL"
+      },
+      "DEFAULT": {
+        "SEND_TO": "PAYLOADS_CHANNEL"
+      },
+      "HEARTBEATS": {
+        "RECV_FROM": "CONFIG_CHANNEL",
+        "SEND_TO": "CTRL_CHANNEL"
+      },
+      "NOTIFICATIONS": {
+        "SEND_TO": "NOTIF_CHANNEL"
+      }
+    },
+    "LOCAL_PARAMS": {
+      "HOST": "emqx",
+      "PASS": "",
+      "PORT": 1883,
+      "USER": "",
+      "QOS": 0,
+      "SECURED": 0
+    },
+    "PARAMS": {
+      "CONFIG_CHANNEL": {
+        "TOPIC": "naeural_comms_local/{}/config",
+        "QOS": 2
+      },
+      "CTRL_CHANNEL": {
+        "TOPIC": "naeural_comms_local/ctrl",
+        "QOS": 1
+      },
+      "HOST": "emqx",
+      "NOTIF_CHANNEL": {
+        "TOPIC": "naeural_comms_local/notif",
+        "QOS": 0
+      },
+      "PASS": "",
+      "PAYLOADS_CHANNEL": {
+        "TOPIC": "naeural_comms_local/payloads",
+        "TARGETED_TOPIC": "naeural_comms_local/{}/payloads",
+        "QOS": 0
+      },
+      "PORT": 1883,
+      "QOS": 0,
+      "USER": "",
+      "SUBTOPIC": "address",
+      "SECURED": 0,
+      "CERT_PATH": ""
+    },
+    "TYPE": "mqtt"
+  },
+  "FILE_UPLOAD": {
+    "CONFIG_UPLOADER": {
+      "ACCESS_KEY": "",
+      "BUCKET_NAME": "",
+      "ENDPOINT": "",
+      "SECRET_KEY": "",
+      "SECURE": false
+    },
+    "TYPE": "minio"
+  },
+  "PAYLOAD_TYPE": "INSTANCE",
+  "SECONDS_HEARTBEAT": 5,
+  "SERVING_IN_PROCESS": true
+}
