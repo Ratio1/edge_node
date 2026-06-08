@@ -151,6 +151,15 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
         self.assertNotIn("EE_NETMON_ORACLE_ONLY_HEARTBEAT_RECEIVE", dockerfile)
         self.assertNotIn("EE_NETMON_USE_SUMMARY_STATUS", dockerfile)
 
+  def test_runtime_requirements_include_channel_qos_capable_sdk(self):
+    for requirements_name in [
+      "requirements.txt",
+      ".devcontainer/requirements.txt",
+    ]:
+      with self.subTest(requirements_name=requirements_name):
+        requirements = (REPO_ROOT / requirements_name).read_text()
+        self.assertIn("ratio1>=3.5.41", requirements)
+
   def test_read_only_netmon_status_dump_command_is_present(self):
     command_path = REPO_ROOT / "cmds" / "dump_netmon_status"
 

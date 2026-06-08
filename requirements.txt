@@ -1,5 +1,5 @@
 kmonitor
-ratio1
+ratio1>=3.5.41
 decentra-vision
 python-telegram-bot[rate-limiter]
 protobuf
