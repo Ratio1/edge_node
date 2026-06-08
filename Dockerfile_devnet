@@ -57,6 +57,9 @@ ENV EE_EPOCH_MANAGER_DEBUG=1
 ENV EE_NETMON_ADDRESS_INDEX=true
 ENV EE_NETMON_SEND_CURRENT_NETWORK_EACH=50
 ENV EE_NETMON_SEND_ONLY_ONLINE=true
+# Default rollout policy: non-supervisors derive both heartbeat receive
+# reduction and authorized NetMon summary fallback from this single switch.
+ENV EE_NETMON_ORACLE_ONLY_HEARTBEAT_MODE=1
 
 ENV EE_EVM_NET=devnet
 
