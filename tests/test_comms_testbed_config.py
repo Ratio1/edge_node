@@ -36,10 +36,11 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
 
     self.assertEqual(compose_text.count("EE_SUPERVISOR: \"true\""), 2)
     self.assertEqual(compose_text.count("EE_SUPERVISOR: \"false\""), 2)
-    self.assertIn("EE_NETMON_ORACLE_ONLY_HEARTBEAT_RECEIVE: \"1\"", compose_text)
+    self.assertIn("EE_NETMON_ORACLE_ONLY_HEARTBEAT_MODE: \"1\"", compose_text)
+    self.assertNotIn("EE_NETMON_ORACLE_ONLY_HEARTBEAT_RECEIVE", compose_text)
     self.assertIn("EE_ENABLE_NETMON_API_PROBE: \"1\"", compose_text)
     self.assertIn("EE_NETMON_ACCEPT_LOCAL_SUPERVISOR_SUMMARY: \"1\"", compose_text)
-    self.assertEqual(compose_text.count("EE_NETMON_USE_SUMMARY_STATUS: \"1\""), 2)
+    self.assertNotIn("EE_NETMON_USE_SUMMARY_STATUS", compose_text)
 
   def test_app_config_has_isolated_topics_and_channel_qos(self):
     config = json.loads((REPO_ROOT / ".config_app_comms.json").read_text())
@@ -137,7 +138,7 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertIn("ENV EE_ENABLE_NETMON_API_PROBE=1", dockerfile)
     self.assertIn("CMD [\"python3\", \"/usr/local/bin/device_comms.py\"]", dockerfile)
 
-  def test_runtime_images_enable_oracle_only_heartbeat_receive_by_default(self):
+  def test_runtime_images_enable_oracle_only_heartbeat_mode_by_default(self):
     for dockerfile_name in [
       "Dockerfile_devnet",
       "Dockerfile_testnet",
@@ -146,7 +147,9 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     ]:
       with self.subTest(dockerfile_name=dockerfile_name):
         dockerfile = (REPO_ROOT / dockerfile_name).read_text()
-        self.assertIn("ENV EE_NETMON_ORACLE_ONLY_HEARTBEAT_RECEIVE=1", dockerfile)
+        self.assertIn("ENV EE_NETMON_ORACLE_ONLY_HEARTBEAT_MODE=1", dockerfile)
+        self.assertNotIn("EE_NETMON_ORACLE_ONLY_HEARTBEAT_RECEIVE", dockerfile)
+        self.assertNotIn("EE_NETMON_USE_SUMMARY_STATUS", dockerfile)
 
   def test_read_only_netmon_status_dump_command_is_present(self):
     command_path = REPO_ROOT / "cmds" / "dump_netmon_status"

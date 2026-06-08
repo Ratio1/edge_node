@@ -77,7 +77,7 @@ ENV EE_NETMON_ADDRESS_INDEX=true
 ENV EE_NETMON_SEND_CURRENT_NETWORK_EACH=50
 ENV EE_NETMON_SEND_ONLY_ONLINE=true
 # Keep the standalone local image aligned with the compose testbed defaults.
-ENV EE_NETMON_ORACLE_ONLY_HEARTBEAT_RECEIVE=1
+ENV EE_NETMON_ORACLE_ONLY_HEARTBEAT_MODE=1
 # The constants module requires a known selector even when ETH is disabled.
 ENV EE_EVM_NET=devnet
 ENV EE_DEBUG_R1FS=true

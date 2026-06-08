@@ -27,7 +27,7 @@ x-edge-comms-node: &edge-comms-node
     EE_MQTT_SUBTOPIC: address
     EE_MQTT_HEARTBEAT_QOS: "1"
     EE_MQTT_COMMAND_QOS: "2"
-    EE_NETMON_ORACLE_ONLY_HEARTBEAT_RECEIVE: "1"
+    EE_NETMON_ORACLE_ONLY_HEARTBEAT_MODE: "1"
     EE_ENABLE_NETMON_API_PROBE: "1"
     # Only the isolated non-EVM comms testbed may trust supervisor-marked
     # NET_MON_01 summaries without a blockchain oracle registry.
@@ -80,7 +80,6 @@ services:
       <<: *edge-comms-env
       EE_ID: comm_oracle_01
       EE_SUPERVISOR: "true"
-      EE_NETMON_USE_SUMMARY_STATUS: "0"
     volumes:
       - r1_comms_oracle_01:/edge_node/_local_cache
     ports:
@@ -93,7 +92,6 @@ services:
       <<: *edge-comms-env
       EE_ID: comm_oracle_02
       EE_SUPERVISOR: "true"
-      EE_NETMON_USE_SUMMARY_STATUS: "0"
     volumes:
       - r1_comms_oracle_02:/edge_node/_local_cache
     ports:
@@ -106,7 +104,6 @@ services:
       <<: *edge-comms-env
       EE_ID: comm_node_01
       EE_SUPERVISOR: "false"
-      EE_NETMON_USE_SUMMARY_STATUS: "1"
     volumes:
       - r1_comms_node_01:/edge_node/_local_cache
     ports:
@@ -119,7 +116,6 @@ services:
       <<: *edge-comms-env
       EE_ID: comm_node_02
       EE_SUPERVISOR: "false"
-      EE_NETMON_USE_SUMMARY_STATUS: "1"
     volumes:
       - r1_comms_node_02:/edge_node/_local_cache
     ports:
