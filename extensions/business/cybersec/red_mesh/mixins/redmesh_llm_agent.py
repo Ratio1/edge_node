@@ -18,6 +18,7 @@ from ..services.config import get_llm_agent_config
 from ..services.resilience import run_bounded_retry
 from ..services.llm_structured import (
   PROMPT_PROFILE_AUTO,
+  PROVIDER_PATH_LOCAL,
   PROVIDER_PATH_REMOTE,
   build_response_format_for_prompt_profile,
   generate_exec_summary,
@@ -27,6 +28,7 @@ from ..services.llm_structured import (
 
 _NON_RETRYABLE_HTTP_STATUSES = {400, 401, 403, 404, 409, 410, 413, 422}
 _NON_RETRYABLE_PROVIDER_STATUSES = _NON_RETRYABLE_HTTP_STATUSES
+_LOCAL_STRUCTURED_CHUNK_TIMEOUT_SECONDS = 120
 _LLM_EVIDENCE_MAX_CHARS = 240
 _LLM_BANNER_MAX_CHARS = 120
 
@@ -1287,25 +1289,38 @@ class _RedMeshLlmAgentMixin(object):
       provider_path=provider_path,
       model_name=model_name,
     )
-    response_format = build_response_format_for_prompt_profile(profile)
+    response_format = None
+    if profile.provider_path != PROVIDER_PATH_LOCAL:
+      response_format = build_response_format_for_prompt_profile(profile)
     self._last_structured_llm_profile = profile.id
     self._last_structured_llm_provider_path = profile.provider_path
+    structured_timeout = None
+    if profile.provider_path == PROVIDER_PATH_LOCAL:
+      structured_timeout = min(
+        int(llm_cfg.get("TIMEOUT") or _LOCAL_STRUCTURED_CHUNK_TIMEOUT_SECONDS),
+        _LOCAL_STRUCTURED_CHUNK_TIMEOUT_SECONDS,
+      )
 
     def raw_chat_call(messages: list, max_tokens: int, temperature: float) -> str:
       """Adapter — turns the LLM Agent /chat HTTP response into the
       raw assistant content string generate_exec_summary expects."""
+      payload = {
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+      }
+      if response_format is not None:
+        payload["response_format"] = response_format
       response = self._call_llm_agent_api(
         endpoint="/chat",
         method="POST",
-        payload={
-          "messages": messages,
-          "max_tokens": max_tokens,
-          "temperature": temperature,
-          "response_format": response_format,
-        },
+        payload=payload,
+        timeout=structured_timeout,
       )
       if not isinstance(response, dict) or "error" in response:
-        return ""
+        status = response.get("status") if isinstance(response, dict) else "invalid_response"
+        error = response.get("error") if isinstance(response, dict) else "invalid response"
+        raise RuntimeError(f"LLM Agent API {status}: {error}")
       choices = response.get("choices") or []
       if not choices:
         return ""
@@ -1356,7 +1371,23 @@ class _RedMeshLlmAgentMixin(object):
       sections["validation"] = result.validation.to_dict()
       sections["error"] = True
       sections["attempts"] = result.attempts
+      sections["diagnostics"] = {
+        "attempt_logs": self._public_structured_llm_attempt_logs(result),
+      }
     return sections
+
+  @staticmethod
+  def _public_structured_llm_attempt_logs(result):
+    public_logs = []
+    for log in getattr(result, "attempt_logs", ()) or ():
+      public_logs.append({
+        "attempt": log.get("attempt"),
+        "chunk": log.get("chunk") or None,
+        "elapsed_seconds": log.get("elapsed_seconds"),
+        "raw_len": log.get("raw_len"),
+        "validation_codes": list(log.get("validation_codes") or []),
+      })
+    return public_logs
 
   def _log_structured_llm_failure_diagnostics(self, job_id, result):
     """Verbose per-attempt diagnostics for an LLM structured-report failure.
@@ -1384,8 +1415,11 @@ class _RedMeshLlmAgentMixin(object):
       if not log.get("has_close_brace"):
         hints.append("no_close_brace")
       hint_str = ",".join(hints) or "-"
+      chunk = log.get("chunk") or "-"
+      elapsed = log.get("elapsed_seconds")
+      elapsed_part = f" elapsed={elapsed}s" if elapsed is not None else ""
       self.P(
-        f"[LLM-DIAG] job={job_id} attempt={log.get('attempt')} "
+        f"[LLM-DIAG] job={job_id} attempt={log.get('attempt')} chunk={chunk}{elapsed_part} "
         f"raw_len={log.get('raw_len')} codes={codes} hints={hint_str} "
         f"head={head!r} tail={tail!r}",
         color='y',

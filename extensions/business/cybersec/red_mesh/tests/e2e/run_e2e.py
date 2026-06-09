@@ -29,6 +29,9 @@ import time
 from typing import Any
 from urllib import error, request
 
+TERMINAL_JOB_STATUSES = {"finalized", "done", "completed"}
+FAILED_JOB_STATUSES = {"failed", "cancelled", "canceled", "error"}
+
 
 def http_post(url: str, payload: dict, timeout: int = 30) -> dict:
   data = json.dumps(payload).encode("utf-8")
@@ -90,28 +93,182 @@ def launch_graybox(rm: str, target_url: str, target_host: str,
   return job_id
 
 
+def _unwrap_result(payload: dict) -> dict:
+  if isinstance(payload, dict) and isinstance(payload.get("result"), dict):
+    return payload["result"]
+  return payload if isinstance(payload, dict) else {}
+
+
+def job_status_values(resp: dict, job_id: str) -> list[str]:
+  """Extract possible job statuses from current and legacy API shapes."""
+  statuses: list[str] = []
+
+  def add_status(value):
+    if value is not None and value != "":
+      statuses.append(str(value))
+
+  payload = _unwrap_result(resp)
+  job = payload.get(job_id) if isinstance(payload, dict) else None
+  if isinstance(job, dict):
+    add_status(job.get("job_status"))
+    add_status(job.get("status"))
+
+  if isinstance(payload, dict):
+    nested = payload.get("job")
+    if isinstance(nested, dict):
+      add_status(nested.get("job_status"))
+      add_status(nested.get("status"))
+    add_status(payload.get("job_status"))
+    add_status(payload.get("status"))
+
+  return statuses
+
+
+def is_terminal_job_status(resp: dict, job_id: str) -> bool:
+  return any(
+    status.lower() in TERMINAL_JOB_STATUSES
+    for status in job_status_values(resp, job_id)
+  )
+
+
+def is_failed_job_status(resp: dict, job_id: str) -> bool:
+  return any(
+    status.lower() in FAILED_JOB_STATUSES
+    for status in job_status_values(resp, job_id)
+  )
+
+
+def _job_from_listing(resp: dict, job_id: str) -> dict:
+  payload = _unwrap_result(resp)
+  if not isinstance(payload, dict):
+    return {}
+  job = payload.get(job_id)
+  return job if isinstance(job, dict) else {}
+
+
+def _is_transient_poll_error(exc: BaseException) -> bool:
+  return isinstance(exc, (TimeoutError, OSError, error.URLError))
+
+
+def _format_exc(exc: BaseException) -> str:
+  return f"{exc.__class__.__name__}: {exc}"
+
+
 def wait_for_finalize(rm: str, job_id: str, timeout: int = 600,
-                      poll_every: int = 10) -> dict:
+                      poll_every: int = 10,
+                      request_timeout: int = 15) -> dict:
   deadline = time.time() + timeout
   last_status = None
+  poll_failures = 0
+  last_poll_error = None
   while time.time() < deadline:
-    listing = http_get(f"{rm}/list_network_jobs").get("result", {})
-    job = listing.get(job_id)
-    if not job:
-      time.sleep(poll_every); continue
-    status = job.get("job_status")
-    if status != last_status:
-      print(f"  [{time.strftime('%H:%M:%S')}] {job_id}: {status}", flush=True)
-      last_status = status
-    if status == "FINALIZED":
-      return job
+    job = {}
+    try:
+      listing_resp = http_get(
+        f"{rm}/list_network_jobs",
+        timeout=request_timeout,
+      )
+      job = _job_from_listing(listing_resp, job_id)
+      status = (job.get("job_status") or job.get("status")) if job else None
+      if status != last_status:
+        print(f"  [{time.strftime('%H:%M:%S')}] {job_id}: {status or 'not listed'}", flush=True)
+        last_status = status
+      if is_failed_job_status(listing_resp, job_id):
+        raise RuntimeError(f"job {job_id} failed with status {status!r}")
+      if is_terminal_job_status(listing_resp, job_id):
+        job["_harness_poll_failures"] = poll_failures
+        return job
+    except Exception as exc:
+      if not _is_transient_poll_error(exc):
+        raise
+      poll_failures += 1
+      last_poll_error = exc
+      if poll_failures == 1 or poll_failures % 3 == 0:
+        print(
+          f"  [{time.strftime('%H:%M:%S')}] {job_id}: "
+          f"control-plane poll timeout via list_network_jobs "
+          f"({poll_failures} transient; {_format_exc(exc)}); "
+          "continuing while scan/report finalization may still be active",
+          flush=True,
+        )
+
+    try:
+      status_resp = http_get(
+        f"{rm}/get_job_status?job_id={job_id}",
+        timeout=request_timeout,
+      )
+      if is_failed_job_status(status_resp, job_id):
+        statuses = ", ".join(job_status_values(status_resp, job_id))
+        raise RuntimeError(f"job {job_id} failed with status {statuses}")
+      if is_terminal_job_status(status_resp, job_id):
+        job = _unwrap_result(status_resp)
+        if isinstance(job, dict):
+          job["_harness_poll_failures"] = poll_failures
+          return job
+    except Exception as exc:
+      if not _is_transient_poll_error(exc):
+        raise
+      poll_failures += 1
+      last_poll_error = exc
+      if poll_failures == 1 or poll_failures % 3 == 0:
+        print(
+          f"  [{time.strftime('%H:%M:%S')}] {job_id}: "
+          f"control-plane poll timeout via get_job_status "
+          f"({poll_failures} transient; {_format_exc(exc)}); "
+          "continuing within bounded harness timeout",
+          flush=True,
+        )
+
     time.sleep(poll_every)
-  raise TimeoutError(f"job {job_id} did not finalize within {timeout}s; last={last_status}")
+  detail = f"; last poll error={_format_exc(last_poll_error)}" if last_poll_error else ""
+  raise TimeoutError(
+    f"job {job_id} did not finalize within {timeout}s; "
+    f"last={last_status}; transient_poll_failures={poll_failures}{detail}",
+  )
 
 
-def fetch_archive(rm: str, job_id: str) -> dict:
-  resp = http_get(f"{rm}/get_job_archive?job_id={job_id}")
-  return resp.get("result", {}).get("archive", {})
+def fetch_archive(
+  rm: str,
+  job_id: str,
+  *,
+  timeout: int = 180,
+  poll_every: int = 5,
+  request_timeout: int = 30,
+) -> dict:
+  deadline = time.time() + timeout
+  failures = 0
+  last_error = None
+  while time.time() < deadline:
+    try:
+      resp = http_get(
+        f"{rm}/get_job_archive?job_id={job_id}",
+        timeout=request_timeout,
+      )
+      archive = resp.get("result", {}).get("archive", {})
+      if archive_passes(archive):
+        if failures:
+          print(
+            f"  archive became available after {failures} transient fetch timeout(s)",
+            flush=True,
+          )
+        return archive
+    except Exception as exc:
+      if not _is_transient_poll_error(exc):
+        raise
+      failures += 1
+      last_error = exc
+      if failures == 1 or failures % 3 == 0:
+        print(
+          f"  [{time.strftime('%H:%M:%S')}] {job_id}: archive fetch timeout "
+          f"({failures} transient; {_format_exc(exc)}); waiting for final archive",
+          flush=True,
+        )
+    time.sleep(poll_every)
+  detail = f"; last archive error={_format_exc(last_error)}" if last_error else ""
+  raise TimeoutError(
+    f"archive for {job_id} was not readable within {timeout}s"
+    f"; transient_archive_failures={failures}{detail}",
+  )
 
 
 def archive_passes(archive: dict) -> list:
@@ -207,14 +364,38 @@ def assert_legacy_finding_fields(aggregated: dict) -> list[str]:
   return failures
 
 
-def run_scenario(rm: str, name: str, launch_fn, **launch_kwargs) -> dict:
+def run_scenario(
+  rm: str,
+  name: str,
+  launch_fn,
+  *,
+  timeout: int = 900,
+  poll_timeout: int = 15,
+  **launch_kwargs,
+) -> dict:
   print(f"\n=== Scenario: {name} ===", flush=True)
   job_id = launch_fn(rm, **launch_kwargs)
   print(f"  launched: {job_id}", flush=True)
-  job = wait_for_finalize(rm, job_id, timeout=600)
+  job = wait_for_finalize(
+    rm,
+    job_id,
+    timeout=timeout,
+    request_timeout=poll_timeout,
+  )
   print(f"  duration: {job.get('duration', '?')}s, risk: {job.get('risk_score', '?')}", flush=True)
+  if job.get("_harness_poll_failures"):
+    print(
+      f"  tolerated transient control-plane poll timeouts: "
+      f"{job['_harness_poll_failures']}",
+      flush=True,
+    )
 
-  archive = fetch_archive(rm, job_id)
+  archive = fetch_archive(
+    rm,
+    job_id,
+    timeout=min(240, max(60, timeout // 3)),
+    request_timeout=max(poll_timeout, 30),
+  )
   pass_reports = archive_passes(archive)
   if not pass_reports:
     raise AssertionError(f"{name}: archive has no passes/pass_reports")
@@ -252,13 +433,19 @@ def main() -> int:
   parser.add_argument("--target", default="10.132.0.3")
   parser.add_argument("--target-url", default="http://10.132.0.3:10000")
   parser.add_argument("--scenario", choices=["blackbox", "graybox", "all"], default="all")
+  parser.add_argument("--timeout", type=int, default=900,
+                      help="Per-scenario bounded wait for scan/report finalization.")
+  parser.add_argument("--poll-timeout", type=int, default=15,
+                      help="Per-request timeout for control-plane polling.")
   args = parser.parse_args()
 
   results: list[dict] = []
   if args.scenario in ("blackbox", "all"):
     try:
       results.append(run_scenario(
-        args.rm1, "blackbox", launch_blackbox, target=args.target,
+        args.rm1, "blackbox", launch_blackbox,
+        timeout=args.timeout, poll_timeout=args.poll_timeout,
+        target=args.target,
       ))
     except Exception as exc:
       print(f"  EXCEPTION: {exc}", flush=True)
@@ -268,6 +455,7 @@ def main() -> int:
     try:
       results.append(run_scenario(
         args.rm1, "graybox", launch_graybox,
+        timeout=args.timeout, poll_timeout=args.poll_timeout,
         target_url=args.target_url, target_host=args.target,
       ))
     except Exception as exc:
