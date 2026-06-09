@@ -87,6 +87,19 @@ class _DeeployMixin:
     return raw_addr if raw_addr.startswith("0xai_") else f"0xai_{raw_addr}"
 
 
+  def _netmon_node_is_online_for_control(self, node_addr):
+    """
+    Use NetMon's explicit command/control liveness predicate when available.
+
+    Summary-backed liveness is only a preflight for control/deploy requests; the
+    actual mutation still depends on command dispatch and response handling.
+    """
+    checker = getattr(self.netmon, "network_node_is_online_for_control", None)
+    if callable(checker):
+      return checker(node_addr)
+    return self.netmon.network_node_is_online(node_addr)
+
+
   def _get_node_specs(self, target_nodes):
     """
     Return total and live-available CPU, memory, and disk specs for nodes.
@@ -107,7 +120,7 @@ class _DeeployMixin:
       try:
         result[node_addr] = {
           "node_alias": self.netmon.network_node_eeid(node_addr),
-          "node_is_online": self.netmon.network_node_is_online(node_addr),
+          "node_is_online": self._netmon_node_is_online_for_control(node_addr),
           "cpu": {
             "total": self._node_specs_number(self.netmon.network_node_total_cpu_cores(node_addr)),
             "available": self._node_specs_number(self.netmon.network_node_avail_cpu_cores(node_addr)),

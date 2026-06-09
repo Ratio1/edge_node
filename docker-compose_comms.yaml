@@ -29,6 +29,9 @@ x-edge-comms-node: &edge-comms-node
     EE_MQTT_COMMAND_QOS: "2"
     EE_NETMON_ORACLE_ONLY_HEARTBEAT_MODE: "1"
     EE_ENABLE_NETMON_API_PROBE: "1"
+    # The comms testbed does not run child workloads, so DinD TLS only adds a
+    # local certificate-validity dependency that can stop worker startup.
+    DOCKER_TLS_CERTDIR: ""
     # Only the isolated non-EVM comms testbed may trust supervisor-marked
     # NET_MON_01 summaries without a blockchain oracle registry.
     EE_NETMON_ACCEPT_LOCAL_SUPERVISOR_SUMMARY: "1"

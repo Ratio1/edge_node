@@ -176,6 +176,9 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
     self.assertIn("EE_ENABLE_NETMON_API_PROBE", plugin_text)
     self.assertIn("probe_nodes", plugin_text)
     self.assertIn("probe_node", plugin_text)
+    self.assertIn("network_node_is_online_for_control", plugin_text)
+    self.assertIn("network_node_total_cpu_cores", plugin_text)
+    self.assertIn("get_network_node_tags", plugin_text)
 
   def test_live_validation_scripts_are_present(self):
     broker_probe = REPO_ROOT / "tests" / "validate_comms_broker_state.py"
