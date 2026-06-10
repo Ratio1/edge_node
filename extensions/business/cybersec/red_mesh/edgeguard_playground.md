@@ -8,6 +8,7 @@ The playground uses three edge-node runtime pieces:
 - `EDGEGUARD_LLM_AGENT_API` for guarded text-to-Cypher generation
 - `EDGEGUARD_API` as the UI-facing facade for health, model metadata, generation, validation, and
   request-scoped Neo4j test/query calls
+- `WORKER_APP_RUNNER` for the Next.js UI repo
 
 The model artifact is private in Hugging Face:
 
@@ -75,6 +76,39 @@ again before Neo4j execution.
           "NEO4J_MAX_ROWS": 100
         }
       ]
+    },
+    {
+      "SIGNATURE": "WORKER_APP_RUNNER",
+      "INSTANCES": [
+        {
+          "INSTANCE_ID": "edgeguard_playground_ui",
+          "PORT": 3010,
+          "BUILD_AND_RUN_COMMANDS": [
+            "npm install",
+            "npm run build",
+            "npm run start -- --hostname 0.0.0.0 --port 3010"
+          ],
+          "VCS_DATA": {
+            "PROVIDER": "github",
+            "USERNAME": "toderian",
+            "TOKEN": "$EDGEGUARD_PLAYGROUND_UI_GH_TOKEN",
+            "REPO_URL": "git@github.com:Ratio1/edgeguard-playground-ui.git",
+            "BRANCH": "main",
+            "POLL_INTERVAL": 60
+          },
+          "AUTOUPDATE": true,
+          "TUNNEL_ENGINE_ENABLED": true,
+          "ENV": {
+            "EDGEGUARD_PLAYGROUND_PASSWORD": "$EDGEGUARD_PLAYGROUND_PASSWORD",
+            "EDGEGUARD_SESSION_SECRET": "$EDGEGUARD_SESSION_SECRET",
+            "EDGEGUARD_API_BASE_URL": "http://127.0.0.1:5055",
+            "EDGEGUARD_API_TOKEN": "$EDGEGUARD_API_TOKEN"
+          },
+          "HEALTH_CHECK": {
+            "PATH": "/api/health"
+          }
+        }
+      ]
     }
   ]
 }
@@ -82,3 +116,11 @@ again before Neo4j execution.
 
 Neo4j execution requires the `neo4j` Python driver in the runtime image. If the driver is missing,
 `EDGEGUARD_API` reports Neo4j execution as unavailable and does not attempt to connect.
+
+## Required Secrets
+
+- `HF_TOKEN` for the private Hugging Face model artifact.
+- `EDGEGUARD_PLAYGROUND_PASSWORD` for the shared UI password gate.
+- `EDGEGUARD_SESSION_SECRET` for the UI session cookie signature.
+- `EDGEGUARD_PLAYGROUND_UI_GH_TOKEN` for Worker App Runner access to the private UI repo.
+- `EDGEGUARD_API_TOKEN` only if an API bearer-token boundary is enabled.
