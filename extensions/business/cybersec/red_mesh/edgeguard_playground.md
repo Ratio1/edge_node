@@ -71,6 +71,7 @@ again before Neo4j execution.
       "INSTANCES": [
         {
           "INSTANCE_ID": "edgeguard_api",
+          "SEMAPHORE": "edgeguard_api",
           "PORT": 5055,
           "EDGEGUARD_LLM_AGENT_PORT": 5060,
           "NEO4J_MAX_ROWS": 100
@@ -82,6 +83,7 @@ again before Neo4j execution.
       "INSTANCES": [
         {
           "INSTANCE_ID": "edgeguard_playground_ui",
+          "SEMAPHORED_KEYS": ["edgeguard_api"],
           "PORT": 3010,
           "BUILD_AND_RUN_COMMANDS": [
             "npm install",
@@ -110,10 +112,17 @@ again before Neo4j execution.
             }
           },
           "TUNNEL_ENGINE_ENABLED": true,
+          "DYNAMIC_ENV": {
+            "EDGEGUARD_API_BASE_URL": [
+              {
+                "type": "shmem",
+                "path": ["edgeguard_api", "API_URL"]
+              }
+            ]
+          },
           "ENV": {
             "EDGEGUARD_PLAYGROUND_PASSWORD": "$EDGEGUARD_PLAYGROUND_PASSWORD",
             "EDGEGUARD_SESSION_SECRET": "$EDGEGUARD_SESSION_SECRET",
-            "EDGEGUARD_API_BASE_URL": "http://127.0.0.1:5055",
             "EDGEGUARD_API_TOKEN": "$EDGEGUARD_API_TOKEN"
           },
           "HEALTH_CHECK": {
@@ -125,6 +134,10 @@ again before Neo4j execution.
   ]
 }
 ```
+
+The UI must not hardcode `EDGEGUARD_API_BASE_URL` when deployed in edge-node. `EDGEGUARD_API`
+publishes `API_URL` through semaphore key `edgeguard_api`; `WORKER_APP_RUNNER` waits for that
+semaphore and injects the resolved value through `DYNAMIC_ENV` before starting the Next.js app.
 
 Neo4j execution requires the `neo4j` Python driver in the runtime image. If the driver is missing,
 `EDGEGUARD_API` reports Neo4j execution as unavailable and does not attempt to connect.

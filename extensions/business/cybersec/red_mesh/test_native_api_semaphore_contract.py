@@ -26,6 +26,8 @@ class NativeApiSemaphoreContractTests(unittest.TestCase):
   def test_other_native_emitters_preserve_legacy_aliases_on_top_of_fastapi_defaults(self):
     for relative_path, class_name in [
       ("extensions/business/cybersec/red_mesh/redmesh_llm_agent_api.py", "RedMeshLlmAgentApiPlugin"),
+      ("extensions/business/cybersec/red_mesh/edgeguard_llm_agent_api.py", "EdgeguardLlmAgentApiPlugin"),
+      ("extensions/business/cybersec/red_mesh/edgeguard_api.py", "EdgeguardApiPlugin"),
       ("plugins/business/cerviguard/local_serving_api.py", "LocalServingApiPlugin"),
     ]:
       source = self._read(relative_path)
@@ -41,6 +43,17 @@ class NativeApiSemaphoreContractTests(unittest.TestCase):
     source = self._read("extensions/business/cybersec/red_mesh/mixins/llm_agent_mixin.py")
     self.assertIn("env.get('API_IP') or env.get('API_HOST') or env.get('HOST')", source)
     self.assertIn("env.get('PORT') or env.get('API_PORT')", source)
+
+  def test_edgeguard_playground_uses_api_semaphore_for_ui_base_url(self):
+    source = self._read("extensions/business/cybersec/red_mesh/edgeguard_playground.md")
+
+    self.assertIn('"SEMAPHORE": "edgeguard_api"', source)
+    self.assertIn('"SEMAPHORED_KEYS": ["edgeguard_api"]', source)
+    self.assertIn('"DYNAMIC_ENV": {', source)
+    self.assertIn('"EDGEGUARD_API_BASE_URL": [', source)
+    self.assertIn('"type": "shmem"', source)
+    self.assertIn('"path": ["edgeguard_api", "API_URL"]', source)
+    self.assertNotIn('"EDGEGUARD_API_BASE_URL": "http://127.0.0.1:5055"', source)
 
 
 if __name__ == "__main__":

@@ -13,6 +13,8 @@ def mock_plugin_modules():
   class FakeBasePlugin:
     CONFIG = {'VALIDATION_RULES': {}}
     endpoint = staticmethod(endpoint_decorator)
+    def _setup_semaphore_env(self):
+      return
 
   class FakeModule:
     FastApiWebAppPlugin = FakeBasePlugin
@@ -74,6 +76,12 @@ def _make_agent(**overrides):
   plugin.time = lambda: 1000
   plugin.P = lambda *_args, **_kwargs: None
   plugin.Pd = lambda *_args, **_kwargs: None
+  plugin.log = MagicMock()
+  plugin.log.get_localhost_ip.return_value = "127.0.0.1"
+  plugin.port = overrides.get("port", 5060)
+  plugin.cfg_port = overrides.get("cfg_port", 5060)
+  plugin.semaphore_env = {}
+  plugin.semaphore_set_env = lambda key, value: plugin.semaphore_env.__setitem__(key, str(value))
   return plugin
 
 
@@ -97,10 +105,25 @@ def _make_api(**overrides):
   plugin.time = lambda: 1000
   plugin.P = lambda *_args, **_kwargs: None
   plugin.Pd = lambda *_args, **_kwargs: None
+  plugin.log = MagicMock()
+  plugin.log.get_localhost_ip.return_value = "127.0.0.1"
+  plugin.port = overrides.get("port", 5055)
+  plugin.cfg_port = overrides.get("cfg_port", 5055)
+  plugin.semaphore_env = {}
+  plugin.semaphore_set_env = lambda key, value: plugin.semaphore_env.__setitem__(key, str(value))
   return plugin
 
 
 class EdgeGuardAgentTests(unittest.TestCase):
+  def test_agent_exports_api_url_for_semaphore_consumers(self):
+    plugin = _make_agent(port=5060)
+
+    plugin._setup_semaphore_env()
+
+    self.assertEqual(plugin.semaphore_env["API_HOST"], "127.0.0.1")
+    self.assertEqual(plugin.semaphore_env["API_PORT"], "5060")
+    self.assertEqual(plugin.semaphore_env["API_URL"], "http://127.0.0.1:5060")
+
   def test_agent_accepts_valid_first_output(self):
     plugin = _make_agent()
     payload = {
@@ -177,6 +200,15 @@ class EdgeGuardAgentTests(unittest.TestCase):
 
 
 class EdgeGuardApiTests(unittest.TestCase):
+  def test_api_exports_api_url_for_semaphore_consumers(self):
+    plugin = _make_api(port=5055)
+
+    plugin._setup_semaphore_env()
+
+    self.assertEqual(plugin.semaphore_env["API_HOST"], "127.0.0.1")
+    self.assertEqual(plugin.semaphore_env["API_PORT"], "5055")
+    self.assertEqual(plugin.semaphore_env["API_URL"], "http://127.0.0.1:5055")
+
   def test_edgeguard_ai_engine_is_registered(self):
     from extensions.serving.ai_engines.stable import AI_ENGINES
 
