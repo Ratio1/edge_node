@@ -275,8 +275,13 @@ class _DeeployTargetNodesMixin:
     )
     required_mem = container_requested_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
     required_mem_bytes = self._parse_memory(required_mem)
+    required_storage = container_requested_resources.get(DEEPLOY_RESOURCES.STORAGE)
+    required_storage_bytes = self._parse_memory(required_storage) if required_storage else 0
 
-    self.Pd(f"Required resources: CPU={required_cpu} cores, Memory={required_mem} ({required_mem_bytes} bytes)")
+    self.Pd(
+      f"Required resources: CPU={required_cpu} cores, Memory={required_mem} "
+      f"({required_mem_bytes} bytes), Storage={required_storage} ({required_storage_bytes} bytes)"
+    )
 
     for addr, node_resources in nodes_with_resources.items():
       self.Pd(f"Evaluating node {addr}")
@@ -355,7 +360,11 @@ class _DeeployTargetNodesMixin:
       # Check if the node has enough resources
       node_cpu = self._parse_node_telemetry_cpu(node_resources.get('cpu'))
       node_memory = self._parse_node_telemetry_bytes(node_resources.get('memory'))
-      self.Pd(f"Node {addr} total resources: CPU={node_cpu} cores, Memory={node_memory} bytes")
+      node_storage = self._parse_node_telemetry_bytes(node_resources.get(DEEPLOY_RESOURCES.STORAGE))
+      self.Pd(
+        f"Node {addr} total resources: CPU={node_cpu} cores, Memory={node_memory} bytes, "
+        f"Available storage={node_storage} bytes"
+      )
       has_failed = False
       if used_cpu > node_cpu:
         self.Pd(f"Node {addr} has not enough CPU cores. used_cpu ({used_cpu}) > node_cpu ({node_cpu})")
@@ -363,6 +372,13 @@ class _DeeployTargetNodesMixin:
 
       if used_memory > node_memory:
         self.Pd(f"Node {addr} has not enough RAM. used_memory ({used_memory}) > node_memory ({node_memory})")
+        has_failed = True
+
+      if required_storage_bytes > 0 and required_storage_bytes > node_storage:
+        self.Pd(
+          f"Node {addr} has not enough disk. required_storage "
+          f"({required_storage_bytes}) > available_storage ({node_storage})"
+        )
         has_failed = True
 
       if has_failed:
@@ -478,6 +494,7 @@ class _DeeployTargetNodesMixin:
       current_node_total_resources = {
         'cpu': total_cpu,
         'memory': total_memory_bytes,
+        DEEPLOY_RESOURCES.STORAGE: self._parse_node_telemetry_bytes(self.netmon.network_node_available_disk(addr)),
       }
 
       if node_res_req:
@@ -689,8 +706,10 @@ class _DeeployTargetNodesMixin:
       required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU),
       default=DEFAULT_CONTAINER_RESOURCES.CPU,
     )
+    required_storage = required_resources.get(DEEPLOY_RESOURCES.STORAGE)
 
     required_mem_bytes = self._parse_memory(required_mem)
+    required_disk_bytes = self._parse_memory(required_storage) if required_storage else 0
 
     # CPU check
     if avail_cpu < required_cpu:
@@ -717,6 +736,21 @@ class _DeeployTargetNodesMixin:
           DEEPLOY_RESOURCES.RESOURCE: DEEPLOY_RESOURCES.MEMORY,
           DEEPLOY_RESOURCES.AVAILABLE_VALUE: avail_mem_mb,
           DEEPLOY_RESOURCES.REQUIRED_VALUE: required_mem_mb,
+          DEEPLOY_RESOURCES.UNIT: DEEPLOY_RESOURCES.MB
+      })
+
+    # Check Volume Storage / disk availability.
+    if required_disk_bytes > 0 and avail_disk < required_disk_bytes:
+      result[DEEPLOY_RESOURCES.AVAILABLE][DEEPLOY_RESOURCES.STORAGE] = avail_disk
+      result[DEEPLOY_RESOURCES.REQUIRED][DEEPLOY_RESOURCES.STORAGE] = required_disk_bytes
+
+      result[DEEPLOY_RESOURCES.STATUS] = False
+      avail_disk_mb = avail_disk / (1024 * 1024)
+      required_disk_mb = required_disk_bytes / (1024 * 1024)
+      result[DEEPLOY_RESOURCES.DETAILS].append({
+          DEEPLOY_RESOURCES.RESOURCE: DEEPLOY_RESOURCES.STORAGE,
+          DEEPLOY_RESOURCES.AVAILABLE_VALUE: avail_disk_mb,
+          DEEPLOY_RESOURCES.REQUIRED_VALUE: required_disk_mb,
           DEEPLOY_RESOURCES.UNIT: DEEPLOY_RESOURCES.MB
       })
 
