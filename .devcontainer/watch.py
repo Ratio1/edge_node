@@ -53,6 +53,7 @@ class EdgeNodeReloader(PatternMatchingEventHandler):
   def start_process(self):
     """Start or restart the edge node process."""
     self.stop_process()
+    self.cleanup_fastapi_servers()
 
     print("\n" + "=" * 60)
     print("  Starting edge node...")
@@ -79,6 +80,52 @@ class EdgeNodeReloader(PatternMatchingEventHandler):
         os.killpg(pgid, signal.SIGKILL)
         self.process.wait()
       print("  Stopped.")
+    self.cleanup_fastapi_servers()
+
+  def cleanup_fastapi_servers(self):
+    """Stop FastAPI child servers left behind by a previous node process."""
+    try:
+      result = subprocess.run(
+        ["pgrep", "-f", r"/usr/local/bin/uvicorn --app-dir /tmp/"],
+        check=False,
+        capture_output=True,
+        text=True,
+      )
+    except Exception as exc:
+      print("  Failed to inspect FastAPI child servers: {}".format(exc))
+      return
+
+    pids = [pid.strip() for pid in result.stdout.splitlines() if pid.strip()]
+    if not pids:
+      return
+
+    print("  Stopping stale FastAPI child servers: {}".format(", ".join(pids)))
+    for pid in pids:
+      try:
+        os.kill(int(pid), signal.SIGTERM)
+      except ProcessLookupError:
+        pass
+      except Exception as exc:
+        print("  Failed to stop FastAPI child server {}: {}".format(pid, exc))
+
+    deadline = time.time() + 5
+    remaining = set(pids)
+    while remaining and time.time() < deadline:
+      for pid in list(remaining):
+        try:
+          os.kill(int(pid), 0)
+        except ProcessLookupError:
+          remaining.discard(pid)
+      if remaining:
+        time.sleep(0.2)
+
+    for pid in remaining:
+      try:
+        os.kill(int(pid), signal.SIGKILL)
+      except ProcessLookupError:
+        pass
+      except Exception as exc:
+        print("  Failed to force-stop FastAPI child server {}: {}".format(pid, exc))
 
   def _should_restart(self):
     """Check if enough time has passed since last restart."""

@@ -200,7 +200,7 @@ class EdgeguardApiPlugin(BasePlugin):
     }
 
   @BasePlugin.endpoint(method="POST")
-  def validate(self, cypher: str, **kwargs) -> Dict[str, Any]:
+  def check_cypher(self, cypher: str, **kwargs) -> Dict[str, Any]:
     analysis = analyze_generated_cypher(cypher)
     return {
       "status": STATUS_ACCEPTED if analysis["accepted"] else STATUS_REJECTED,

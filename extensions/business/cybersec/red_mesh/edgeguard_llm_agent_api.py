@@ -167,6 +167,8 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
     return ""
 
   def _normalize_local_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
+    if isinstance(response, dict) and isinstance(response.get("result"), dict):
+      response = response["result"]
     if "choices" in response and isinstance(response.get("choices"), list):
       response.setdefault("model", self.cfg_local_llm_model)
       response.setdefault("provider", "local")

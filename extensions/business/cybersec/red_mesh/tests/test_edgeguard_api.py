@@ -152,6 +152,29 @@ class EdgeGuardAgentTests(unittest.TestCase):
     self.assertEqual(call_payload["temperature"], 0.0)
     self.assertIn("Allowed EdgeGuard Cypher schema", call_payload["messages"][0]["content"])
 
+  def test_agent_unwraps_local_inference_api_result_envelope(self):
+    plugin = _make_agent()
+    payload = {
+      "result": {
+        "REQUEST_ID": "req-1",
+        "MODEL_NAME": "edgeguard-cypher-qwen3-4b-v0.4.Q4_K_M.gguf",
+        "TEXT_RESPONSE": "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
+      },
+    }
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api.requests.post",
+      return_value=_Response(payload=payload),
+    ):
+      result = plugin.generate(request="Show internet-facing hosts and their IP addresses")
+
+    self.assertTrue(result["accepted"])
+    self.assertEqual(result["status"], "accepted")
+    self.assertEqual(
+      result["accepted_cypher"],
+      "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
+    )
+
   def test_agent_retries_after_schema_rejection(self):
     plugin = _make_agent()
     responses = [
@@ -240,7 +263,7 @@ class EdgeGuardApiTests(unittest.TestCase):
   def test_api_validate_accepts_schema_query(self):
     plugin = _make_api()
 
-    result = plugin.validate(cypher="MATCH (i:Indicator) RETURN i.value AS value LIMIT 10")
+    result = plugin.check_cypher(cypher="MATCH (i:Indicator) RETURN i.value AS value LIMIT 10")
 
     self.assertEqual(result["status"], "accepted")
     self.assertTrue(result["accepted"])
