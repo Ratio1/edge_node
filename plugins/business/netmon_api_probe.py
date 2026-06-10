@@ -150,6 +150,10 @@ class NetmonApiProbePlugin(BasePlugin):
           "network_node_is_online_allow_summary",
           lambda: self.netmon.network_node_is_online(target_addr, allow_summary=True),
         ),
+        "is_online_for_control": self._call_netmon(
+          "network_node_is_online_for_control",
+          lambda: self.netmon.network_node_is_online_for_control(target_addr),
+        ),
         "is_available": self._call_netmon(
           "network_node_is_available",
           lambda: self.netmon.network_node_is_available(target_addr),
@@ -177,6 +181,54 @@ class NetmonApiProbePlugin(BasePlugin):
         "apps": self._call_netmon(
           "network_node_apps",
           lambda: self.netmon.network_node_apps(target_addr),
+        ),
+        "main_loop": self._call_netmon(
+          "network_node_main_loop",
+          lambda: self.netmon.network_node_main_loop(target_addr),
+        ),
+        "total_cpu_cores": self._call_netmon(
+          "network_node_total_cpu_cores",
+          lambda: self.netmon.network_node_total_cpu_cores(target_addr),
+        ),
+        "avail_cpu_cores": self._call_netmon(
+          "network_node_avail_cpu_cores",
+          lambda: self.netmon.network_node_avail_cpu_cores(target_addr),
+        ),
+        "avg_avail_cpu_cores": self._call_netmon(
+          "network_node_get_cpu_avail_cores",
+          lambda: self.netmon.network_node_get_cpu_avail_cores(target_addr),
+        ),
+        "total_mem": self._call_netmon(
+          "network_node_total_mem",
+          lambda: self.netmon.network_node_total_mem(target_addr),
+        ),
+        "avail_mem": self._call_netmon(
+          "network_node_available_memory",
+          lambda: self.netmon.network_node_available_memory(target_addr),
+        ),
+        "avail_mem_prc": self._call_netmon(
+          "network_node_available_memory_prc",
+          lambda: self.netmon.network_node_available_memory_prc(target_addr),
+        ),
+        "total_disk": self._call_netmon(
+          "network_node_total_disk",
+          lambda: self.netmon.network_node_total_disk(target_addr),
+        ),
+        "avail_disk": self._call_netmon(
+          "network_node_available_disk",
+          lambda: self.netmon.network_node_available_disk(target_addr),
+        ),
+        "avail_disk_prc": self._call_netmon(
+          "network_node_available_disk_prc",
+          lambda: self.netmon.network_node_available_disk_prc(target_addr),
+        ),
+        "has_did": self._call_netmon(
+          "network_node_has_did",
+          lambda: self.netmon.network_node_has_did(target_addr),
+        ),
+        "tags": self._call_netmon(
+          "get_network_node_tags",
+          lambda: self.netmon.get_network_node_tags(target_addr),
         ),
         "is_supervisor": self._call_netmon(
           "network_node_is_supervisor",
