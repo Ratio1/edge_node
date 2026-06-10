@@ -97,6 +97,18 @@ again before Neo4j execution.
             "POLL_INTERVAL": 60
           },
           "AUTOUPDATE": true,
+          "EXPOSED_PORTS": {
+            "3010": {
+              "is_main_port": true,
+              "host_port": null,
+              "tunnel": {
+                "enabled": true,
+                "engine": "cloudflare",
+                "token": "$EDGEGUARD_PLAYGROUND_UI_CF_TOKEN",
+                "protocol": "http"
+              }
+            }
+          },
           "TUNNEL_ENGINE_ENABLED": true,
           "ENV": {
             "EDGEGUARD_PLAYGROUND_PASSWORD": "$EDGEGUARD_PLAYGROUND_PASSWORD",
@@ -123,4 +135,5 @@ Neo4j execution requires the `neo4j` Python driver in the runtime image. If the 
 - `EDGEGUARD_PLAYGROUND_PASSWORD` for the shared UI password gate.
 - `EDGEGUARD_SESSION_SECRET` for the UI session cookie signature.
 - `EDGEGUARD_PLAYGROUND_UI_GH_TOKEN` for Worker App Runner access to the private UI repo.
+- `EDGEGUARD_PLAYGROUND_UI_CF_TOKEN` for the Worker App Runner Cloudflare tunnel on UI port `3010`.
 - `EDGEGUARD_API_TOKEN` only if an API bearer-token boundary is enabled.
