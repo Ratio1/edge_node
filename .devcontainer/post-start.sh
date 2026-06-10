@@ -89,6 +89,18 @@ EOF
   done
 }
 
+restore_dauth_app_config_endpoint() {
+  local startup_config="/edge_node/_local_cache/config_startup.json"
+
+  [ "${EE_ID:-}" = "edg3" ] || return 0
+  [ -f "$startup_config" ] || return 0
+
+  if grep -q '"APP_CONFIG_ENDPOINT"[[:space:]]*:[[:space:]]*"\./\.config_app_comms\.json"' "$startup_config"; then
+    log "Restoring dAuth-backed app config endpoint for edg3"
+    sed -i 's#"APP_CONFIG_ENDPOINT"[[:space:]]*:[[:space:]]*"\./\.config_app_comms\.json"#"APP_CONFIG_ENDPOINT": "./.config_app.json"#' "$startup_config"
+  fi
+}
+
 start_watchdog() {
   if pgrep -f 'python3 .devcontainer/watch.py' >/dev/null 2>&1; then
     log "devcontainer watchdog is already running"
@@ -100,6 +112,7 @@ start_watchdog() {
 }
 
 prefer_nft_iptables
+restore_dauth_app_config_endpoint
 start_docker_daemon
 cleanup_orphaned_fastapi_servers
 start_watchdog
