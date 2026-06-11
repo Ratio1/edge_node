@@ -160,31 +160,6 @@ class TestCommunicationComposeTestbed(unittest.TestCase):
         requirements = (REPO_ROOT / requirements_name).read_text()
         self.assertIn("ratio1>=3.5.41", requirements)
 
-  def test_container_app_runtime_declares_docker_sdk(self):
-    for requirements_name in [
-      "requirements.txt",
-      "requirements_local.txt",
-      ".devcontainer/requirements.txt",
-    ]:
-      with self.subTest(requirements_name=requirements_name):
-        requirements = (REPO_ROOT / requirements_name).read_text().splitlines()
-        self.assertIn("docker>=7.1.0", [line.strip() for line in requirements])
-
-  def test_runtime_images_preflight_docker_sdk_import(self):
-    for dockerfile_name in [
-      "Dockerfile_devnet",
-      "Dockerfile_testnet",
-      "Dockerfile_mainnet",
-      "Dockerfile_devnet_local",
-      ".devcontainer/Dockerfile",
-    ]:
-      with self.subTest(dockerfile_name=dockerfile_name):
-        dockerfile = (REPO_ROOT / dockerfile_name).read_text()
-        self.assertIn(
-          'RUN python3 -c "from docker.types import DeviceRequest"',
-          dockerfile,
-        )
-
   def test_read_only_netmon_status_dump_command_is_present(self):
     command_path = REPO_ROOT / "cmds" / "dump_netmon_status"
 

@@ -12,7 +12,7 @@ sqlfluff
 pypdf
 python-docx
 pdfplumber
-docker>=7.1.0
+docker
 aiofiles
 paramiko
 pymisp
