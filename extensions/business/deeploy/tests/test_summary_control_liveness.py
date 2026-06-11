@@ -5,10 +5,11 @@ import unittest
 from extensions.business.deeploy.deeploy_const import (
   CONTAINER_APP_RUNNER_SIGNATURE,
   DEEPLOY_RESOURCES,
+  JOB_APP_TYPES,
 )
+from extensions.business.deeploy.tests.support import make_inputs, make_plugin_entry
 from extensions.business.deeploy.deeploy_mixin import _DeeployMixin
 from extensions.business.deeploy.deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
-from extensions.business.deeploy.tests.support import make_inputs
 
 
 class _SummaryControlDeeployPlugin(_DeeployMixin, _DeeployTargetNodesMixin):
@@ -60,6 +61,22 @@ class _NetmonStub:
     self.supervisor_by_addr = dict(supervisor_by_addr or {})
     self.status_by_addr = dict(status_by_addr or {})
 
+  def _value_for_addr(self, value, addr):
+    if not isinstance(value, dict):
+      return value
+
+    keys = [addr]
+    if isinstance(addr, str):
+      if addr.startswith("0xai_"):
+        keys.append(addr[5:])
+      else:
+        keys.append(f"0xai_{addr}")
+
+    for key in keys:
+      if key in value:
+        return value[key]
+    return None
+
   def network_node_is_supervisor(self, addr):
     return self.supervisor_by_addr.get(addr, self.is_supervisor)
 
@@ -75,19 +92,19 @@ class _NetmonStub:
     return addr in self.online_for_control
 
   def network_node_get_cpu_avail_cores(self, addr):
-    return self.avail_cpu
+    return self._value_for_addr(self.avail_cpu, addr)
 
   def network_node_available_memory(self, addr):
-    return self.avail_mem
+    return self._value_for_addr(self.avail_mem, addr)
 
   def network_node_available_disk(self, addr):
-    return self.avail_disk
+    return self._value_for_addr(self.avail_disk, addr)
 
   def network_node_total_cpu_cores(self, addr):
-    return self.total_cpu
+    return self._value_for_addr(self.total_cpu, addr)
 
   def network_node_total_mem(self, addr):
-    return self.total_mem
+    return self._value_for_addr(self.total_mem, addr)
 
   def network_node_has_did(self, addr):
     return self.has_did
@@ -228,6 +245,136 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
       [item[DEEPLOY_RESOURCES.RESOURCE] for item in result[DEEPLOY_RESOURCES.DETAILS]],
       [DEEPLOY_RESOURCES.CPU, DEEPLOY_RESOURCES.MEMORY],
     )
+
+  def test_stack_target_node_disk_uses_selected_volume_storage(self):
+    plugin = _plugin()
+    plugin.netmon = _NetmonStub(
+      avail_cpu=2,
+      avail_mem=4,
+      avail_disk=4 * 1024 * 1024 * 1024,
+    )
+    inputs = make_inputs(
+      job_app_type=JOB_APP_TYPES.STACK,
+      plugins=[
+        make_plugin_entry(
+          CONTAINER_APP_RUNNER_SIGNATURE,
+          CONTAINER_RESOURCES={"cpu": 0.5, "memory": "512m", "storage": "4g"},
+          FIXED_SIZE_VOLUMES={"data": {"SIZE": "1G", "MOUNTING_POINT": "/data"}},
+        ),
+      ],
+    )
+
+    result = plugin.check_node_available_resources("0xai_node_gamma", inputs)
+
+    self.assertTrue(result[DEEPLOY_RESOURCES.STATUS])
+
+  def test_stack_target_node_disk_rejects_selected_storage_over_available(self):
+    plugin = _plugin()
+    plugin.netmon = _NetmonStub(
+      avail_cpu=2,
+      avail_mem=4,
+      avail_disk=3 * 1024 * 1024 * 1024,
+    )
+    inputs = make_inputs(
+      job_app_type=JOB_APP_TYPES.STACK,
+      plugins=[
+        make_plugin_entry(
+          CONTAINER_APP_RUNNER_SIGNATURE,
+          CONTAINER_RESOURCES={"cpu": 0.5, "memory": "512m", "storage": "4g"},
+        ),
+      ],
+    )
+
+    result = plugin.check_node_available_resources("0xai_node_gamma", inputs)
+
+    self.assertFalse(result[DEEPLOY_RESOURCES.STATUS])
+    self.assertEqual(
+      [item[DEEPLOY_RESOURCES.RESOURCE] for item in result[DEEPLOY_RESOURCES.DETAILS]],
+      [DEEPLOY_RESOURCES.STORAGE],
+    )
+
+  def test_stack_auto_selection_disk_uses_selected_volume_storage(self):
+    plugin = _plugin()
+    plugin.datetime = datetime
+    plugin.json_dumps = lambda obj, **kwargs: str(obj)
+    plugin._get_online_apps = lambda: {
+      "0xai_node_alpha": {},
+      "0xai_node_beta": {},
+    }
+    plugin.netmon = _NetmonStub(
+      total_cpu={"node_alpha": 8, "node_beta": 8},
+      total_mem={"node_alpha": 32, "node_beta": 32},
+      avail_disk={
+        "node_alpha": 4 * 1024 * 1024 * 1024,
+        "node_beta": 5 * 1024 * 1024 * 1024,
+      },
+      has_did=True,
+      online_for_control={"0xai_node_alpha", "0xai_node_beta"},
+      supervisor_by_addr={
+        "0xai_node_alpha": False,
+        "0xai_node_beta": False,
+      },
+      status_by_addr={
+        "node_alpha": {"SCORE": 100},
+        "node_beta": {"SCORE": 80},
+      },
+    )
+    inputs = make_inputs(
+      target_nodes_count=1,
+      job_app_type=JOB_APP_TYPES.STACK,
+      plugins=[
+        make_plugin_entry(
+          CONTAINER_APP_RUNNER_SIGNATURE,
+          CONTAINER_RESOURCES={"cpu": 0.5, "memory": "512m", "storage": "4g"},
+          FIXED_SIZE_VOLUMES={"data": {"SIZE": "1G", "MOUNTING_POINT": "/data"}},
+        ),
+      ],
+    )
+
+    nodes = plugin._find_nodes_for_deeployment(inputs)
+
+    self.assertEqual(nodes, ["node_alpha"])
+
+  def test_stack_auto_selection_disk_rejects_selected_storage_over_available(self):
+    plugin = _plugin()
+    plugin.datetime = datetime
+    plugin.json_dumps = lambda obj, **kwargs: str(obj)
+    plugin._get_online_apps = lambda: {
+      "0xai_node_alpha": {},
+      "0xai_node_beta": {},
+    }
+    plugin.netmon = _NetmonStub(
+      total_cpu={"node_alpha": 8, "node_beta": 8},
+      total_mem={"node_alpha": 32, "node_beta": 32},
+      avail_disk={
+        "node_alpha": 3 * 1024 * 1024 * 1024,
+        "node_beta": 5 * 1024 * 1024 * 1024,
+      },
+      has_did=True,
+      online_for_control={"0xai_node_alpha", "0xai_node_beta"},
+      supervisor_by_addr={
+        "0xai_node_alpha": False,
+        "0xai_node_beta": False,
+      },
+      status_by_addr={
+        "node_alpha": {"SCORE": 100},
+        "node_beta": {"SCORE": 80},
+      },
+    )
+    inputs = make_inputs(
+      target_nodes_count=1,
+      job_app_type=JOB_APP_TYPES.STACK,
+      plugins=[
+        make_plugin_entry(
+          CONTAINER_APP_RUNNER_SIGNATURE,
+          CONTAINER_RESOURCES={"cpu": 0.5, "memory": "512m", "storage": "4g"},
+        ),
+      ],
+    )
+
+    nodes = plugin._find_nodes_for_deeployment(inputs)
+
+    self.assertEqual(nodes, ["node_beta"])
 
   def test_malformed_total_resources_fail_closed_without_crashing(self):
     plugin = _plugin()

@@ -1,6 +1,7 @@
 import json
 import re
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 from math import isfinite
 
 from naeural_core.constants import BASE_CT
@@ -16,6 +17,7 @@ from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KE
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
 DEEPLOY_DEBUG = True
+STACK_CPU_QUANTUM = Decimal("0.01")
 
 MESSAGE_PREFIX = "Please sign this message for Deeploy: "
 DEEPLOY_WRAPPER_HEADER = "Please sign this Deeploy request:"
@@ -1714,6 +1716,30 @@ class _DeeployMixin:
     except (TypeError, ValueError):
       raise ValueError(f"{DEEPLOY_ERRORS.REQUEST6}. 'CONTAINER_RESOURCES.cpu' must be a number.")
 
+  def _parse_cpu_decimal(self, value, default=None):
+    """
+    Parse CPU using decimal arithmetic so Stack paid-tier boundary checks do
+    not reject valid two-decimal allocations because of binary float drift.
+    """
+    if value is None:
+      return default
+    try:
+      return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST6}. 'CONTAINER_RESOURCES.cpu' must be a number.")
+
+  def _format_cpu_decimal(self, value):
+    return float(value.quantize(STACK_CPU_QUANTUM))
+
+  def _parse_stack_storage_mb(self, value, context=""):
+    raw_value = str(value).strip()
+    if not re.fullmatch(r"\d+(?:\.\d+)?\s*[bkmg]?", raw_value, flags=re.IGNORECASE):
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container Volume Storage is invalid "
+        f"{'in ' + context if context else ''}."
+      )
+    return parse_memory_to_mb(raw_value)
+
   def _aggregate_fixed_size_volumes_storage_mb(self, params):
     """
     Sum FIXED_SIZE_VOLUMES sizes from a plugin instance or app_params dict.
@@ -1780,10 +1806,34 @@ class _DeeployMixin:
         raise ValueError(f"{ctx} missing required 'MOUNTING_POINT' field")
 
 
+  def _validate_stack_fixed_volume_storage_cap(self, resources, params, context=""):
+    """
+    Stack storage is selected Volume Storage. Fixed-size volumes reserve that
+    selected budget; they are not additional storage on top of it.
+    """
+    fixed_volume_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(params)
+    if fixed_volume_storage_mb <= 0:
+      return
+
+    selected_storage = resources.get(DEEPLOY_RESOURCES.STORAGE) if isinstance(resources, dict) else None
+    try:
+      selected_storage_mb = self._parse_stack_storage_mb(selected_storage, context=context)
+    except ValueError:
+      raise
+
+    if fixed_volume_storage_mb > selected_storage_mb:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: FIXED_SIZE_VOLUMES reserve {fixed_volume_storage_mb}m "
+        f"but selected Volume Storage is {selected_storage_mb}m{' in ' + context if context else ''}."
+      )
+
+
   def _aggregate_container_resources(self, inputs):
     """
     Aggregate container resources across all CONTAINER_APP_RUNNER plugin instances.
-    Sums CPU, memory, and storage (from FIXED_SIZE_VOLUMES) requirements.
+    Sums CPU, memory, and storage requirements. Stack treats fixed-size
+    volumes as reservations inside selected Volume Storage; other app types
+    keep the legacy additive FIXED_SIZE_VOLUMES behavior.
 
     Args:
         inputs: Request inputs
@@ -1798,6 +1848,8 @@ class _DeeployMixin:
     """
     self.Pd("Aggregating container resources...")
     plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+    is_stack_app = isinstance(job_app_type, str) and job_app_type.lower() == JOB_APP_TYPES.STACK
 
     # For legacy format, use existing app_params
     if not plugins_array:
@@ -1805,29 +1857,33 @@ class _DeeployMixin:
       app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
       legacy_resources = app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
       storage_mb = 0
+      has_storage_resource = False
       if isinstance(legacy_resources, dict):
         legacy_resources = self.deepcopy(legacy_resources)
         if DEEPLOY_RESOURCES.CPU in legacy_resources:
-          legacy_resources[DEEPLOY_RESOURCES.CPU] = self._parse_cpu_value(
+          legacy_resources[DEEPLOY_RESOURCES.CPU] = self._format_cpu_decimal(self._parse_cpu_decimal(
             legacy_resources.get(DEEPLOY_RESOURCES.CPU)
-          )
+          ))
         container_storage = legacy_resources.get(DEEPLOY_RESOURCES.STORAGE)
-        if container_storage:
-          storage_mb = parse_memory_to_mb(str(container_storage))
-        else:
-          storage_mb = 0
-      # Aggregate FIXED_SIZE_VOLUMES storage from legacy app_params
-      storage_mb += self._aggregate_fixed_size_volumes_storage_mb(app_params)
-      if storage_mb > 0:
+        if DEEPLOY_RESOURCES.STORAGE in legacy_resources:
+          has_storage_resource = True
+          storage_mb = self._parse_stack_storage_mb(container_storage)
+      if not is_stack_app:
+        fixed_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(app_params)
+        if fixed_storage_mb > 0:
+          storage_mb += fixed_storage_mb
+          has_storage_resource = True
+      if has_storage_resource:
         legacy_resources[DEEPLOY_RESOURCES.STORAGE] = f"{storage_mb}m"
         self.Pd(f"Legacy storage requirement: {storage_mb}MB")
       self.Pd(f"Legacy resources: {legacy_resources}")
       return legacy_resources
 
     self.Pd(f"Processing {len(plugins_array)} plugin instances from plugins array")
-    total_cpu = 0.0
+    total_cpu = Decimal("0")
     total_memory_mb = 0
     total_storage_mb = 0
+    has_storage_resource = False
 
     # Iterate through plugins array (simplified format - each object is an instance)
     for idx, plugin_instance in enumerate(plugins_array):
@@ -1837,7 +1893,7 @@ class _DeeployMixin:
       # Only aggregate for CONTAINER_APP_RUNNER and WORKER_APP_RUNNER plugins
       if signature in CONTAINERIZED_APPS_SIGNATURES:
         resources = plugin_instance.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
-        cpu = self._parse_cpu_value(resources.get(DEEPLOY_RESOURCES.CPU, 0))
+        cpu = self._parse_cpu_decimal(resources.get(DEEPLOY_RESOURCES.CPU, 0), default=Decimal("0"))
         memory = resources.get(DEEPLOY_RESOURCES.MEMORY, "0m")
         container_storage = resources.get(DEEPLOY_RESOURCES.STORAGE)
 
@@ -1848,25 +1904,26 @@ class _DeeployMixin:
         self.Pd(f"  Parsed memory: {memory_mb}MB")
         total_memory_mb += memory_mb
 
-        if container_storage:
-          storage_mb = parse_memory_to_mb(str(container_storage))
+        if DEEPLOY_RESOURCES.STORAGE in resources:
+          has_storage_resource = True
+          storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}")
           self.Pd(f"  Container storage: {storage_mb}MB")
           total_storage_mb += storage_mb
-
-        # Aggregate FIXED_SIZE_VOLUMES storage
-        storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
-        if storage_mb > 0:
-          self.Pd(f"  FIXED_SIZE_VOLUMES storage: {storage_mb}MB")
-          total_storage_mb += storage_mb
+        if not is_stack_app:
+          storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
+          if storage_mb > 0:
+            self.Pd(f"  FIXED_SIZE_VOLUMES storage: {storage_mb}MB")
+            total_storage_mb += storage_mb
+            has_storage_resource = True
       else:
         self.Pd(f"  Skipping non-container plugin: {signature}")
 
     # Return aggregated resources in standard format
     aggregated = {
-      DEEPLOY_RESOURCES.CPU: total_cpu,
+      DEEPLOY_RESOURCES.CPU: self._format_cpu_decimal(total_cpu),
       DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m",
     }
-    if total_storage_mb > 0:
+    if has_storage_resource:
       aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb}m"
     self.Pd(f"Aggregated resources: {aggregated}")
     return aggregated
@@ -2029,14 +2086,19 @@ class _DeeployMixin:
               self.P(msg)
               raise ValueError(msg)
             if job_app_type == JOB_APP_TYPES.STACK and signature in CONTAINERIZED_APPS_SIGNATURES:
-              storage_mb = parse_memory_to_mb(str(resources.get(DEEPLOY_RESOURCES.STORAGE)))
-              if storage_mb <= 0:
+              try:
+                storage_mb = self._parse_stack_storage_mb(resources.get(DEEPLOY_RESOURCES.STORAGE), context=f"plugin {idx}")
+              except ValueError as exc:
+                self.P(str(exc))
+                raise
+              if storage_mb < 0:
                 msg = (
-                  f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container storage must be greater than 0 "
+                  f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container Volume Storage cannot be negative "
                   f"for plugin {idx}."
                 )
                 self.P(msg)
                 raise ValueError(msg)
+              self._validate_stack_fixed_volume_storage_cap(resources, pi, context=f"plugin {idx}")
         else:
           app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
           self._validate_fixed_size_volumes(app_params, context="app_params")
@@ -2078,14 +2140,14 @@ class _DeeployMixin:
         #TODO should also check gpu as soon as it is supported and sent in the request
         # Normalize numeric values before comparison
         try:
-          requested_cpu_val = None if requested_cpu is None else float(requested_cpu)
-        except (TypeError, ValueError) as e:
+          requested_cpu_val = None if requested_cpu is None else self._parse_cpu_decimal(requested_cpu)
+        except (TypeError, ValueError, InvalidOperation) as e:
           self.Pd(f"  Failed to parse requested CPU: {e}")
           requested_cpu_val = None
 
         try:
-          expected_cpu_val = None if expected_cpu is None else float(expected_cpu)
-        except (TypeError, ValueError) as e:
+          expected_cpu_val = None if expected_cpu is None else self._parse_cpu_decimal(expected_cpu)
+        except (TypeError, ValueError, InvalidOperation) as e:
           self.Pd(f"  Failed to parse expected CPU: {e}")
           expected_cpu_val = None
 
