@@ -8,7 +8,7 @@ sqlfluff
 pypdf
 python-docx
 pdfplumber
-docker
+docker>=7.1.0
 aiofiles
 paramiko
 datasets

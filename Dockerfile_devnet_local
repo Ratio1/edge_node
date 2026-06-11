@@ -51,6 +51,7 @@ RUN set -eux; \
     else \
       echo "Skipping local requirements install; base image is expected to provide them."; \
     fi
+RUN python3 -c "from docker.types import DeviceRequest"
 RUN uv pip install --system --no-cache --no-deps /opt/ratio1
 RUN uv pip install --system --no-cache --no-deps /opt/naeural_core
 

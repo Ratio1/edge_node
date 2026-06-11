@@ -62,7 +62,16 @@ EXTRA_TUNNELS Feature:
 
 """
 
-import docker
+try:
+  import docker
+  from docker.types import DeviceRequest
+except ModuleNotFoundError as exc:
+  if exc.name in {"docker", "docker.types"}:
+    raise ModuleNotFoundError(
+      "Container apps require the Docker SDK for Python. Install the "
+      "'docker>=7.1.0' package in the edge-node runtime image."
+    ) from exc
+  raise
 import os
 import requests
 import shutil
@@ -75,7 +84,6 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Optional
 
-from docker.types import DeviceRequest
 
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 

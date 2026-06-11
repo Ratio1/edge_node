@@ -79,6 +79,7 @@ ENV EE_EVM_NET=devnet
 # ENV EE_DEVICE=cuda:0
 
 RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -c "from docker.types import DeviceRequest"
 RUN pip install --no-cache-dir --no-deps --upgrade naeural_core
 
 CMD ["python3","device.py"]
