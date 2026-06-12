@@ -1,3 +1,5 @@
+import os
+
 from naeural_core.constants import (
   SUPERVISOR_MIN_AVAIL_PRC, EPOCH_MAX_VALUE, ORACLE_SYNC_USE_R1FS,
   ORACLE_SYNC_BLOCKCHAIN_PRESENCE_MIN_THRESHOLD,
@@ -5,7 +7,19 @@ from naeural_core.constants import (
 )
 
 MAX_RECEIVED_MESSAGES_PER_ORACLE = 50
-DEBUG_MODE = False
+
+
+def _env_flag(name, default=False):
+  value = os.environ.get(name)
+  if value is None:
+    return default
+  return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Local/test deployments can bypass the blockchain oracle registry and derive
+# the oracle list from supervisor heartbeats. Production keeps the historical
+# behavior unless this flag is explicitly enabled before plugin import.
+DEBUG_MODE = _env_flag("EE_ORACLE_SYNC_DEBUG_MODE", False)
 SIGNATURES_EXCHANGE_MULTIPLIER = 2
 REQUEST_AGREEMENT_TABLE_MULTIPLIER = 5 if DEBUG_MODE else 2
 LOCAL_TABLE_SEND_MULTIPLIER = 3 if DEBUG_MODE else 2
@@ -88,4 +102,3 @@ VALUE_STANDARDS = {
     'type': str,
   }
 }
-

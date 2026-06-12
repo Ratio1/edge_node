@@ -21,6 +21,7 @@ class _NetmonStub:
       "0xai_node_beta": {
         "alias": "beta",
         "online": False,
+        "control_online": False,
         "cpu_total": 4,
         "cpu_avail": 1,
         "mem_total": 16,
@@ -28,7 +29,19 @@ class _NetmonStub:
         "disk_total": 256,
         "disk_avail": 120,
       },
+      "0xai_node_gamma": {
+        "alias": "gamma",
+        "online": False,
+        "control_online": True,
+        "cpu_total": 12,
+        "cpu_avail": 9,
+        "mem_total": 64,
+        "mem_avail": 40,
+        "disk_total": 1024,
+        "disk_avail": 900,
+      },
     }
+    self.nodes["0xai_node_alpha"]["control_online"] = self.nodes["0xai_node_alpha"]["online"]
 
   def _get(self, addr, key):
     if addr not in self.nodes:
@@ -40,6 +53,9 @@ class _NetmonStub:
 
   def network_node_is_online(self, addr):
     return self._get(addr, "online")
+
+  def network_node_is_online_for_control(self, addr):
+    return self._get(addr, "control_online")
 
   def network_node_total_cpu_cores(self, addr):
     return self._get(addr, "cpu_total")
@@ -83,6 +99,18 @@ class DeeployNodeSpecsTests(unittest.TestCase):
       },
     )
     self.assertEqual(specs["0xai_node_beta"]["node_is_online"], False)
+
+  def test_node_specs_use_control_liveness_for_summary_backed_nodes(self):
+    plugin = make_deeploy_plugin()
+    plugin.netmon = _NetmonStub()
+    plugin.bc = SimpleNamespace(
+      maybe_add_prefix=lambda addr: addr if str(addr).startswith("0xai_") else f"0xai_{addr}"
+    )
+
+    specs = plugin._get_node_specs(["node_gamma"])
+
+    self.assertFalse(plugin.netmon.network_node_is_online("0xai_node_gamma"))
+    self.assertTrue(specs["0xai_node_gamma"]["node_is_online"])
 
   def test_returns_per_node_error_without_failing_entire_specs_request(self):
     plugin = make_deeploy_plugin()

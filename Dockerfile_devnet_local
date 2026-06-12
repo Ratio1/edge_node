@@ -1,0 +1,85 @@
+# Local-dependency image for the isolated communication testbed.
+# Build context must be the parent directory containing edge_node,
+# naeural_core, and naeural_client.
+ARG BASE_IMAGE=ratio1/base_edge_node_amd64_cpu:latest
+FROM ${BASE_IMAGE}
+
+ARG INSTALL_KUBO=1
+ARG KUBO_VERSION=v0.35.0
+RUN set -eux; \
+    if [ "${INSTALL_KUBO}" = "1" ]; then \
+      curl -fsSLo kubo.tar.gz https://dist.ipfs.tech/kubo/${KUBO_VERSION}/kubo_${KUBO_VERSION}_linux-amd64.tar.gz; \
+      tar -xzf kubo.tar.gz; \
+      cd kubo && bash install.sh; \
+      cd / && rm -rf kubo kubo.tar.gz; \
+    else \
+      echo "Skipping Kubo install; base image is expected to provide it."; \
+    fi
+
+ARG INSTALL_CLOUDFLARED=1
+ARG CLOUDFLARED_VERSION=2025.7.0
+RUN set -eux; \
+    if [ "${INSTALL_CLOUDFLARED}" = "1" ]; then \
+      arch="$(uname -m)"; \
+      case "$arch" in \
+        x86_64) arch=amd64 ;; \
+        aarch64 | arm64) arch=arm64 ;; \
+        armv7l) arch=armv7 ;; \
+        *) echo "Unsupported arch: $arch" >&2; exit 1 ;; \
+      esac; \
+      curl -L "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}" \
+        -o /usr/local/bin/cloudflared; \
+      chmod +x /usr/local/bin/cloudflared; \
+      cloudflared --version; \
+    else \
+      echo "Skipping cloudflared install; base image is expected to provide it."; \
+    fi
+
+COPY ./edge_node/cmds /usr/local/bin/
+RUN chmod +x /usr/local/bin/*
+
+WORKDIR /workspace
+COPY ./edge_node /edge_node
+COPY ./naeural_core /opt/naeural_core
+COPY ./naeural_client /opt/ratio1
+RUN rm -rf /edge_node/cmds
+
+ARG INSTALL_LOCAL_REQUIREMENTS=1
+RUN set -eux; \
+    if [ "${INSTALL_LOCAL_REQUIREMENTS}" = "1" ]; then \
+      uv pip install --system --no-cache -r /edge_node/requirements_local.txt; \
+    else \
+      echo "Skipping local requirements install; base image is expected to provide them."; \
+    fi
+RUN uv pip install --system --no-cache --no-deps /opt/ratio1
+RUN uv pip install --system --no-cache --no-deps /opt/naeural_core
+
+WORKDIR /edge_node
+
+ENV AINODE_DOCKER=Yes
+ENV AINODE_DOCKER_SOURCE=develop
+ENV EE_DD=1
+ENV EE_ID=E2dkr
+ENV AINODE_ENV=$AI_ENV
+ENV AINODE_ENV_VER=$AI_ENV_VER
+# This image is only for the isolated comms testbed. If someone runs it outside
+# compose, default to the local config/offline auth path instead of live devnet
+# startup behavior.
+ENV EE_CONFIG=.config_startup_comms.json
+ENV EE_ETH_ENABLED=false
+ENV EE_SECURED=0
+ENV EE_DAUTH_URL=N/A
+ENV EE_ENABLE_NETMON_API_PROBE=1
+ENV EE_HB_CONTAINS_PIPELINES=0
+ENV EE_HB_CONTAINS_ACTIVE_PLUGINS=1
+ENV EE_EPOCH_MANAGER_DEBUG=1
+ENV EE_NETMON_ADDRESS_INDEX=true
+ENV EE_NETMON_SEND_CURRENT_NETWORK_EACH=50
+ENV EE_NETMON_SEND_ONLY_ONLINE=true
+# Keep the standalone local image aligned with the compose testbed defaults.
+ENV EE_NETMON_ORACLE_ONLY_HEARTBEAT_MODE=1
+# The constants module requires a known selector even when ETH is disabled.
+ENV EE_EVM_NET=devnet
+ENV EE_DEBUG_R1FS=true
+
+CMD ["python3", "/usr/local/bin/device_comms.py"]

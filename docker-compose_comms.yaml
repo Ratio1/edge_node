@@ -1,0 +1,136 @@
+# Dedicated local communication testbed for heartbeat/QoS refactors.
+# The stack owns a local EMQX broker and an isolated topic root, so it does not
+# touch devnet, testnet, or mainnet.
+x-edge-comms-node: &edge-comms-node
+  image: ${EDGE_NODE_COMMS_IMAGE:-local_edge_node_comms}
+  build:
+    context: ..
+    dockerfile: edge_node/Dockerfile_devnet_local
+    args:
+      BASE_IMAGE: ${EDGE_NODE_BASE_IMAGE:-ratio1/base_edge_node_amd64_cpu:latest}
+      INSTALL_KUBO: ${INSTALL_KUBO:-1}
+      INSTALL_CLOUDFLARED: ${INSTALL_CLOUDFLARED:-1}
+      INSTALL_LOCAL_REQUIREMENTS: ${INSTALL_LOCAL_REQUIREMENTS:-1}
+  depends_on:
+    emqx:
+      condition: service_healthy
+  # The edge-node image starts an inner Docker daemon during entrypoint.
+  # Without privileged mode the container exits before communication starts.
+  privileged: true
+  environment: &edge-comms-env
+    EE_CONFIG: .config_startup_comms.json
+    EE_MQTT_HOST: emqx
+    EE_MQTT_PORT: "1883"
+    EE_MQTT_USER: ""
+    EE_MQTT: ""
+    EE_MQTT_CERT: ""
+    EE_MQTT_SUBTOPIC: address
+    EE_MQTT_HEARTBEAT_QOS: "1"
+    EE_MQTT_COMMAND_QOS: "2"
+    EE_NETMON_ORACLE_ONLY_HEARTBEAT_MODE: "1"
+    EE_ENABLE_NETMON_API_PROBE: "1"
+    # The comms testbed does not run child workloads, so DinD TLS only adds a
+    # local certificate-validity dependency that can stop worker startup.
+    DOCKER_TLS_CERTDIR: ""
+    # Only the isolated non-EVM comms testbed may trust supervisor-marked
+    # NET_MON_01 summaries without a blockchain oracle registry.
+    EE_NETMON_ACCEPT_LOCAL_SUPERVISOR_SUMMARY: "1"
+    EE_NETMON_SEND_CURRENT_NETWORK_EACH: "5"
+    EE_NETMON_SEND_ONLY_ONLINE: "true"
+    EE_NETMON_ADDRESS_INDEX: "true"
+    EE_HB_CONTAINS_PIPELINES: "0"
+    EE_HB_CONTAINS_ACTIVE_PLUGINS: "1"
+    EE_ETH_ENABLED: "false"
+    EE_SECURED: "0"
+    # Keep the isolated comms testbed off live dAuth. The runtime still calls
+    # dAuth autocomplete during init; an invalid URL makes it continue locally.
+    EE_DAUTH_URL: N/A
+    # The runtime constants require a known EVM selector at import time even
+    # when ETH is disabled. Isolation comes from EE_ETH_ENABLED=false plus the
+    # local MQTT host/topic root, not from inventing a fake EVM network key.
+    EE_EVM_NET: devnet
+    EE_PRIVACY_FILTER_HF_RUNTIME: ${EE_PRIVACY_FILTER_HF_RUNTIME:-auto}
+    EE_PRIVACY_FILTER_ONNX_RUNTIME_KEY: ${EE_PRIVACY_FILTER_ONNX_RUNTIME_KEY:-onnx_fp32}
+  networks:
+    - comms_local
+
+services:
+  emqx:
+    image: emqx/emqx:5.8
+    container_name: r1_comms_emqx
+    environment:
+      EMQX_NODE__NAME: emqx@r1_comms_emqx
+      EMQX_LOG__CONSOLE_HANDLER__LEVEL: warning
+      EMQX_DASHBOARD__DEFAULT_USERNAME: admin
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: public
+    healthcheck:
+      # The HTTP status endpoint is the reliable readiness oracle for this
+      # single-node EMQX image; CLI ping can fail even after listeners are up.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:18083/status | grep -q 'running'"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    ports:
+      - "127.0.0.1:18883:1883"
+      - "127.0.0.1:18083:18083"
+    networks:
+      - comms_local
+
+  ratio1_comm_oracle_01:
+    <<: *edge-comms-node
+    container_name: ratio1_comm_oracle_01
+    environment:
+      <<: *edge-comms-env
+      EE_ID: comm_oracle_01
+      EE_SUPERVISOR: "true"
+    volumes:
+      - r1_comms_oracle_01:/edge_node/_local_cache
+    ports:
+      - "127.0.0.1:3101:3000"
+
+  ratio1_comm_oracle_02:
+    <<: *edge-comms-node
+    container_name: ratio1_comm_oracle_02
+    environment:
+      <<: *edge-comms-env
+      EE_ID: comm_oracle_02
+      EE_SUPERVISOR: "true"
+    volumes:
+      - r1_comms_oracle_02:/edge_node/_local_cache
+    ports:
+      - "127.0.0.1:3102:3000"
+
+  ratio1_comm_node_01:
+    <<: *edge-comms-node
+    container_name: ratio1_comm_node_01
+    environment:
+      <<: *edge-comms-env
+      EE_ID: comm_node_01
+      EE_SUPERVISOR: "false"
+    volumes:
+      - r1_comms_node_01:/edge_node/_local_cache
+    ports:
+      - "127.0.0.1:3103:3000"
+
+  ratio1_comm_node_02:
+    <<: *edge-comms-node
+    container_name: ratio1_comm_node_02
+    environment:
+      <<: *edge-comms-env
+      EE_ID: comm_node_02
+      EE_SUPERVISOR: "false"
+    volumes:
+      - r1_comms_node_02:/edge_node/_local_cache
+    ports:
+      - "127.0.0.1:3104:3000"
+
+networks:
+  comms_local:
+    name: r1_comms_local
+    driver: bridge
+
+volumes:
+  r1_comms_oracle_01:
+  r1_comms_oracle_02:
+  r1_comms_node_01:
+  r1_comms_node_02:
