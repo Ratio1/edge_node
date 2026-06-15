@@ -113,6 +113,22 @@ class _DeeployTargetNodesMixin:
       return 0
     return int(parsed)
 
+  def _parse_node_telemetry_disk_bytes(self, value):
+    """
+    Parse NetMon disk telemetry.
+
+    NetMon reports total/available disk in GB for display-facing node specs,
+    while Deeploy resource requests are compared in bytes. Keep malformed
+    values fail-closed as zero capacity, but convert valid GB values first.
+    """
+    try:
+      disk_gb = float(value)
+    except (TypeError, ValueError):
+      return 0
+    if not math.isfinite(disk_gb) or disk_gb < 0:
+      return 0
+    return int(disk_gb * 1024 * 1024 * 1024)
+
   def _parse_node_telemetry_bool(self, value):
     """
     Parse boolean node telemetry with a fail-closed policy. This protects
@@ -494,7 +510,7 @@ class _DeeployTargetNodesMixin:
       current_node_total_resources = {
         'cpu': total_cpu,
         'memory': total_memory_bytes,
-        DEEPLOY_RESOURCES.STORAGE: self._parse_node_telemetry_bytes(self.netmon.network_node_available_disk(addr)),
+        DEEPLOY_RESOURCES.STORAGE: self._parse_node_telemetry_disk_bytes(self.netmon.network_node_available_disk(addr)),
       }
 
       if node_res_req:
@@ -697,7 +713,7 @@ class _DeeployTargetNodesMixin:
     avail_cpu = self._parse_node_telemetry_cpu(self.netmon.network_node_get_cpu_avail_cores(addr))
     avail_mem = self.netmon.network_node_available_memory(addr)  # in GB
     avail_mem_bytes = self._parse_node_telemetry_memory_bytes(avail_mem)
-    avail_disk = self._parse_node_telemetry_bytes(self.netmon.network_node_available_disk(addr))  # in bytes
+    avail_disk = self._parse_node_telemetry_disk_bytes(self.netmon.network_node_available_disk(addr))  # in bytes
 
     # Get required resources from the request
     required_resources = self._aggregate_container_resources(inputs) or {}

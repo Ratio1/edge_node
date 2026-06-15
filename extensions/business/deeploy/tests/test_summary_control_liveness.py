@@ -251,7 +251,7 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
     plugin.netmon = _NetmonStub(
       avail_cpu=2,
       avail_mem=4,
-      avail_disk=4 * 1024 * 1024 * 1024,
+      avail_disk=4,
     )
     inputs = make_inputs(
       job_app_type=JOB_APP_TYPES.STACK,
@@ -268,12 +268,33 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
 
     self.assertTrue(result[DEEPLOY_RESOURCES.STATUS])
 
+  def test_stack_target_node_disk_treats_netmon_disk_as_gb(self):
+    plugin = _plugin()
+    plugin.netmon = _NetmonStub(
+      avail_cpu=8,
+      avail_mem=32,
+      avail_disk=20.4,
+    )
+    inputs = make_inputs(
+      job_app_type=JOB_APP_TYPES.STACK,
+      plugins=[
+        make_plugin_entry(
+          CONTAINER_APP_RUNNER_SIGNATURE,
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "1g", "storage": "8g"},
+        ),
+      ],
+    )
+
+    result = plugin.check_node_available_resources("0xai_node_gamma", inputs)
+
+    self.assertTrue(result[DEEPLOY_RESOURCES.STATUS])
+
   def test_stack_target_node_disk_rejects_selected_storage_over_available(self):
     plugin = _plugin()
     plugin.netmon = _NetmonStub(
       avail_cpu=2,
       avail_mem=4,
-      avail_disk=3 * 1024 * 1024 * 1024,
+      avail_disk=3,
     )
     inputs = make_inputs(
       job_app_type=JOB_APP_TYPES.STACK,
@@ -305,8 +326,8 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
       total_cpu={"node_alpha": 8, "node_beta": 8},
       total_mem={"node_alpha": 32, "node_beta": 32},
       avail_disk={
-        "node_alpha": 4 * 1024 * 1024 * 1024,
-        "node_beta": 5 * 1024 * 1024 * 1024,
+        "node_alpha": 4,
+        "node_beta": 5,
       },
       has_did=True,
       online_for_control={"0xai_node_alpha", "0xai_node_beta"},
@@ -347,8 +368,8 @@ class DeeploySummaryControlLivenessTests(unittest.TestCase):
       total_cpu={"node_alpha": 8, "node_beta": 8},
       total_mem={"node_alpha": 32, "node_beta": 32},
       avail_disk={
-        "node_alpha": 3 * 1024 * 1024 * 1024,
-        "node_beta": 5 * 1024 * 1024 * 1024,
+        "node_alpha": 3,
+        "node_beta": 5,
       },
       has_did=True,
       online_for_control={"0xai_node_alpha", "0xai_node_beta"},
