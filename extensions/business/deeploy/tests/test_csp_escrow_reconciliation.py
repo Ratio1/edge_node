@@ -1,5 +1,6 @@
 import copy
 import unittest
+from collections import defaultdict
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS
 from extensions.business.deeploy.tests.support import InputsStub, make_deeploy_plugin
@@ -13,6 +14,7 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
   def setUp(self):
     self.plugin = make_deeploy_plugin()
     self.plugin.NestedDotDict = InputsStub
+    self.plugin.defaultdict = defaultdict
     self.plugin.time = lambda: 1_000.0
     self.persisted = []
     self.deleted = []
@@ -67,6 +69,7 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
             {
               "INSTANCE_ID": "inst1",
               "IMAGE": "repo/app:latest",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "512m"},
               "CHAINSTORE_RESPONSE_KEY": "resp1",
             }
           ],
@@ -177,6 +180,36 @@ class DeeployCspEscrowReconciliationTests(unittest.TestCase):
 
     self.assertEqual(result[DEEPLOY_KEYS.STATUS], "failed")
     self.assertEqual(self.persisted, [])
+    self.assertEqual(self.deploy_calls, [])
+
+  def test_reconcile_validates_restart_payload_before_stopping_pipeline(self):
+    """
+    Invalid reconstructed configs fail before any stop command is sent.
+    """
+    pipeline = self._pipeline(owner="0xOld")
+    del pipeline["PLUGINS"][0]["INSTANCES"][0]["IMAGE"]
+    self._install_pipeline(pipeline)
+    self.plugin._get_online_apps = lambda **kwargs: {
+      "node1": {"app1": {"owner": "0xOld", "deeploy_specs": {"job_id": 10}}}
+    }
+    self.plugin._discover_plugin_instances = lambda **kwargs: [{
+      "app_id": "app1",
+      "instance_id": "inst1",
+      "plugin_signature": "CONTAINER_APP_RUNNER",
+      "plugin_instance": {"instance_conf": {"CONTAINER_RESOURCES": {"cpu": 1, "memory": "512m"}}},
+      "NODE": "node1",
+      "CHAINSTORE_RESPONSE_KEY": "resp1",
+    }]
+
+    result = self.plugin._reconcile_csp_escrow_job_owner(
+      job_id=10,
+      old_owner="0xOld",
+      new_owner="0xNew",
+    )
+
+    self.assertEqual(result[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn("invalid", result[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(self.deleted, [])
     self.assertEqual(self.deploy_calls, [])
 
 

@@ -1117,6 +1117,39 @@ class _DeeployMixin:
         break
     return stale_nodes
 
+  def _validate_csp_reconcile_restart_payload(
+    self,
+    inputs,
+    migrated_pipeline,
+    deeploy_specs,
+    discovered_instances,
+  ):
+    """
+    Validate the reconstructed restart request before any live pipeline is stopped.
+    """
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    self._validate_plugins_array(plugins_array)
+    self._validate_dependency_tree(inputs)
+
+    pipeline_params = self._extract_pipeline_params(inputs)
+    inputs[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
+    inputs.pipeline_params = pipeline_params
+
+    app_id = migrated_pipeline.get("NAME")
+    prepared_plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
+    self.deeploy_detect_job_app_type(prepared_plugins)
+    self._ensure_deeploy_specs_job_config(
+      deeploy_specs,
+      pipeline_params=pipeline_params,
+    )
+    self._ensure_plugin_instance_ids(
+      inputs,
+      discovered_plugin_instances=discovered_instances,
+      app_id=app_id,
+      job_id=inputs.get(DEEPLOY_KEYS.JOB_ID),
+    )
+    return True
+
   # Repairs Deeploy's off-chain pipeline metadata and live node configs after
   # PoAI Manager moves a CSP escrow to a new owner on-chain.
   def _reconcile_csp_escrow_job_owner(self, job_id, old_owner, new_owner):
@@ -1200,6 +1233,24 @@ class _DeeployMixin:
         target_nodes=target_nodes,
         chainstore_response=chainstore_response,
       )
+      try:
+        self._validate_csp_reconcile_restart_payload(
+          inputs=inputs,
+          migrated_pipeline=migrated_pipeline,
+          deeploy_specs=deeploy_specs,
+          discovered_instances=discovered_instances,
+        )
+      except Exception as exc:
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: f"Reconstructed restart payload is invalid: {exc}",
+          "old_owner": old_owner,
+          "previous_owner": previous_owner,
+          "new_owner": new_owner,
+          "stale_nodes": stale_nodes,
+        }
+
       self.delete_pipeline_from_nodes(
         job_id=job_id,
         owner=None,

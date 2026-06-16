@@ -76,6 +76,7 @@ class DEEPLOY_KEYS:
 
 class DEEPLOY_STATUS:
   SUCCESS = "success"
+  PARTIAL_SUCCESS = "partial_success"
   FAIL = "fail"
   ERROR = "error"
   PENDING = "pending"

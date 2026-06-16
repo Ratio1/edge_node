@@ -365,8 +365,19 @@ class DeeployManagerApiPlugin(
             DEEPLOY_KEYS.ERROR: str(exc),
           }
 
+      failed_jobs = [
+        job_result for job_result in job_results.values()
+        if job_result.get(DEEPLOY_KEYS.STATUS) == "failed"
+      ]
+      if not failed_jobs:
+        status = DEEPLOY_STATUS.SUCCESS
+      elif len(failed_jobs) == len(job_results):
+        status = DEEPLOY_STATUS.FAIL
+      else:
+        status = DEEPLOY_STATUS.PARTIAL_SUCCESS
+
       result = {
-        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.STATUS: status,
         DEEPLOY_KEYS.TRANSFER: transfer,
         DEEPLOY_KEYS.RESULTS: job_results,
       }
