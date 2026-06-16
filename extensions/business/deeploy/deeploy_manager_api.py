@@ -327,6 +327,56 @@ class DeeployManagerApiPlugin(
     })
     return response
 
+  @BasePlugin.endpoint(method="post")
+  # /reconcile_csp_escrow_jobs
+  def reconcile_csp_escrow_jobs(self, request: dict = None):
+    """
+    Reconcile Deeploy pipeline ownership after a CSP escrow owner transfer.
+    """
+    if request is None:
+      request = {}
+
+    try:
+      tx_hash = request.get(DEEPLOY_KEYS.TX_HASH, request.get("txHash", None))
+      log_index = request.get(DEEPLOY_KEYS.LOG_INDEX, request.get("logIndex", None))
+
+      transfer = self.bc.get_csp_escrow_owner_transfer_from_tx(
+        tx_hash=tx_hash,
+        log_index=log_index,
+      )
+      escrow = transfer["escrow"]
+      old_owner = transfer["old_owner"]
+      new_owner = transfer["new_owner"]
+      active_jobs = self.bc.get_escrow_active_jobs(escrow)
+
+      job_results = {}
+      for active_job in active_jobs:
+        job_id = int(active_job["jobId"])
+        try:
+          job_results[str(job_id)] = self._reconcile_csp_escrow_job_owner(
+            job_id=job_id,
+            old_owner=old_owner,
+            new_owner=new_owner,
+          )
+        except Exception as exc:
+          job_results[str(job_id)] = {
+            DEEPLOY_KEYS.STATUS: "failed",
+            DEEPLOY_KEYS.JOB_ID: job_id,
+            DEEPLOY_KEYS.ERROR: str(exc),
+          }
+
+      result = {
+        DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
+        DEEPLOY_KEYS.TRANSFER: transfer,
+        DEEPLOY_KEYS.RESULTS: job_results,
+      }
+    except Exception as e:
+      result = self.__handle_error(e, request)
+
+    response = self._get_response({
+      **result
+    })
+    return response
 
   @BasePlugin.endpoint(method="post")
   # /node_specs

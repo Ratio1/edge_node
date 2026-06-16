@@ -20,6 +20,7 @@ class DEEPLOY_KEYS:
   REQUEST = "request"
   RETURN_REQUEST = "return_request"
   STATUS_DETAILS = "status_details"
+  RESULTS = "results"
   APPS = "apps"
   APP_ID = "app_id"
   NONCE = "nonce"
@@ -68,6 +69,9 @@ class DEEPLOY_KEYS:
   # Config keys
   DATE_UPDATED = "date_updated"
   DATE_CREATED = "date_created"
+  TX_HASH = "tx_hash"
+  LOG_INDEX = "log_index"
+  TRANSFER = "transfer"
   
 
 class DEEPLOY_STATUS:
