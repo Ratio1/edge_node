@@ -1045,6 +1045,273 @@ class _DeeployMixin:
     refreshed_specs = self._ensure_deeploy_specs_job_config(refreshed_specs)
     return refreshed_specs
 
+  def _pipeline_plugins_to_reconcile_request(self, pipeline):
+    """
+    Convert persisted pipeline plugin config back to Deeploy request plugin entries.
+    """
+    request_plugins = []
+    for plugin in pipeline.get(NetMonCt.PLUGINS.upper(), []):
+      signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE) or plugin.get("signature")
+      if not signature:
+        continue
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES, []):
+        if not isinstance(instance, dict):
+          continue
+        request_plugin = {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: signature,
+          **self.deepcopy(instance),
+        }
+        instance_id = request_plugin.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+        if instance_id:
+          request_plugin[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
+        request_plugins.append(request_plugin)
+    return request_plugins
+
+  def _build_csp_reconcile_inputs(self, pipeline, job_id, target_nodes, chainstore_response):
+    """
+    Build internal Deeploy inputs from persisted pipeline data, not from the public request.
+    """
+    deeploy_specs = pipeline.get(NetMonCt.DEEPLOY_SPECS.upper(), {})
+    if not isinstance(deeploy_specs, dict):
+      deeploy_specs = {}
+    pipeline_params = (
+      pipeline.get(DEEPLOY_KEYS.PIPELINE_PARAMS)
+      or deeploy_specs.get(DEEPLOY_KEYS.JOB_CONFIG, {}).get(DEEPLOY_KEYS.PIPELINE_PARAMS)
+      or {}
+    )
+    request_data = {
+      DEEPLOY_KEYS.APP_ALIAS: pipeline.get("APP_ALIAS") or pipeline.get("NAME"),
+      DEEPLOY_KEYS.APP_ID: pipeline.get("NAME"),
+      DEEPLOY_KEYS.CHAINSTORE_RESPONSE: bool(chainstore_response),
+      DEEPLOY_KEYS.JOB_ID: job_id,
+      DEEPLOY_KEYS.JOB_APP_TYPE: deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
+      DEEPLOY_KEYS.JOB_TAGS: deeploy_specs.get(DEEPLOY_KEYS.JOB_TAGS, []),
+      DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: pipeline.get("TYPE", "void"),
+      DEEPLOY_KEYS.PIPELINE_INPUT_URI: pipeline.get("URL", None),
+      DEEPLOY_KEYS.PIPELINE_PARAMS: pipeline_params,
+      DEEPLOY_KEYS.PLUGINS: self._pipeline_plugins_to_reconcile_request(pipeline),
+      DEEPLOY_KEYS.PROJECT_ID: deeploy_specs.get(DEEPLOY_KEYS.PROJECT_ID),
+      DEEPLOY_KEYS.PROJECT_NAME: deeploy_specs.get(DEEPLOY_KEYS.PROJECT_NAME),
+      DEEPLOY_KEYS.SPARE_NODES: deeploy_specs.get(DEEPLOY_KEYS.SPARE_NODES, []),
+      DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: deeploy_specs.get(
+        DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD,
+        False,
+      ),
+      DEEPLOY_KEYS.TARGET_NODES: target_nodes,
+      DEEPLOY_KEYS.TARGET_NODES_COUNT: len(target_nodes),
+    }
+    return self.NestedDotDict(request_data)
+
+  def _get_stale_csp_reconcile_nodes(self, job_id, new_owner):
+    """
+    Return live nodes whose Deeploy app owner does not match the new escrow owner.
+    """
+    stale_nodes = []
+    online_apps = self._get_online_apps(job_id=job_id, owner=None)
+    for node, apps in online_apps.items():
+      for _, app_data in apps.items():
+        app_owner = app_data.get(NetMonCt.OWNER)
+        if isinstance(app_owner, str) and app_owner.lower() == new_owner.lower():
+          continue
+        stale_nodes.append(node)
+        break
+    return stale_nodes
+
+  def _validate_csp_reconcile_restart_payload(
+    self,
+    inputs,
+    migrated_pipeline,
+    deeploy_specs,
+    discovered_instances,
+  ):
+    """
+    Validate the reconstructed restart request before any live pipeline is stopped.
+    """
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    self._validate_plugins_array(plugins_array)
+    self._validate_dependency_tree(inputs)
+
+    pipeline_params = self._extract_pipeline_params(inputs)
+    inputs[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
+    inputs.pipeline_params = pipeline_params
+
+    app_id = migrated_pipeline.get("NAME")
+    prepared_plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
+    self.deeploy_detect_job_app_type(prepared_plugins)
+    self._ensure_deeploy_specs_job_config(
+      deeploy_specs,
+      pipeline_params=pipeline_params,
+    )
+    self._ensure_plugin_instance_ids(
+      inputs,
+      discovered_plugin_instances=discovered_instances,
+      app_id=app_id,
+      job_id=inputs.get(DEEPLOY_KEYS.JOB_ID),
+    )
+    return True
+
+  # Repairs Deeploy's off-chain pipeline metadata and live node configs after
+  # PoAI Manager moves a CSP escrow to a new owner on-chain.
+  def _reconcile_csp_escrow_job_owner(self, job_id, old_owner, new_owner):
+    pipeline_cid = self._get_pipeline_from_cstore(job_id)
+    if not pipeline_cid:
+      return {
+        DEEPLOY_KEYS.STATUS: "pipeline_missing",
+        DEEPLOY_KEYS.JOB_ID: job_id,
+      }
+
+    try:
+      pipeline = self.get_pipeline_from_r1fs(
+        pipeline_cid,
+        timeout=30,
+        pin=False,
+        raise_on_error=False,
+        show_logs=True,
+      )
+    except Exception as exc:
+      return {
+        DEEPLOY_KEYS.STATUS: "failed",
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.ERROR: str(exc),
+      }
+
+    if not isinstance(pipeline, dict):
+      return {
+        DEEPLOY_KEYS.STATUS: "pipeline_missing",
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.PIPELINE_CID: pipeline_cid,
+      }
+
+    migrated_pipeline = self.deepcopy(pipeline)
+    previous_owner = migrated_pipeline.get(NetMonCt.OWNER.upper())
+    pipeline_changed = not (
+      isinstance(previous_owner, str) and previous_owner.lower() == new_owner.lower()
+    )
+    if pipeline_changed:
+      migrated_pipeline[NetMonCt.OWNER.upper()] = new_owner
+
+    deeploy_specs = migrated_pipeline.get(NetMonCt.DEEPLOY_SPECS.upper(), {})
+    if not isinstance(deeploy_specs, dict):
+      deeploy_specs = {}
+    else:
+      deeploy_specs = self.deepcopy(deeploy_specs)
+    deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+    migrated_pipeline[NetMonCt.DEEPLOY_SPECS.upper()] = deeploy_specs
+
+    stale_nodes = self._get_stale_csp_reconcile_nodes(job_id=job_id, new_owner=new_owner)
+    pipeline_to_persist = migrated_pipeline
+    response_keys = {}
+    node_update_delivered = False
+
+    if stale_nodes:
+      discovered_instances = self._discover_plugin_instances(
+        job_id=job_id,
+        owner=None,
+        target_nodes=stale_nodes,
+      )
+      target_nodes = []
+      for instance in discovered_instances:
+        node = instance.get(DEEPLOY_PLUGIN_DATA.NODE)
+        if node and node not in target_nodes:
+          target_nodes.append(node)
+
+      if not target_nodes:
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: "Stale live pipeline found but no plugin instances could be discovered",
+          "old_owner": old_owner,
+          "previous_owner": previous_owner,
+          "new_owner": new_owner,
+          "stale_nodes": stale_nodes,
+        }
+
+      chainstore_response = bool(deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS))
+      inputs = self._build_csp_reconcile_inputs(
+        pipeline=migrated_pipeline,
+        job_id=job_id,
+        target_nodes=target_nodes,
+        chainstore_response=chainstore_response,
+      )
+      try:
+        self._validate_csp_reconcile_restart_payload(
+          inputs=inputs,
+          migrated_pipeline=migrated_pipeline,
+          deeploy_specs=deeploy_specs,
+          discovered_instances=discovered_instances,
+        )
+      except Exception as exc:
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: f"Reconstructed restart payload is invalid: {exc}",
+          "old_owner": old_owner,
+          "previous_owner": previous_owner,
+          "new_owner": new_owner,
+          "stale_nodes": stale_nodes,
+        }
+
+      self.delete_pipeline_from_nodes(
+        job_id=job_id,
+        owner=None,
+        target_nodes=target_nodes,
+        allow_missing=True,
+        discovered_instances=discovered_instances,
+      )
+      _, _, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
+        owner=new_owner,
+        inputs=inputs,
+        app_id=migrated_pipeline.get("NAME"),
+        app_alias=migrated_pipeline.get("APP_ALIAS") or migrated_pipeline.get("NAME"),
+        app_type=migrated_pipeline.get("TYPE", "void"),
+        update_nodes=target_nodes,
+        new_nodes=[],
+        discovered_plugin_instances=discovered_instances,
+        dct_deeploy_specs=deeploy_specs,
+        job_app_type=deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
+        wait_for_responses=False,
+      )
+      node_update_delivered = True
+
+    if isinstance(pipeline_to_persist, dict):
+      pipeline_to_persist[NetMonCt.OWNER.upper()] = new_owner
+      pipeline_specs = pipeline_to_persist.get(NetMonCt.DEEPLOY_SPECS.upper())
+      if isinstance(pipeline_specs, dict):
+        pipeline_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+    else:
+      pipeline_to_persist = migrated_pipeline
+
+    if pipeline_changed or node_update_delivered:
+      saved = self.persist_job_pipeline_metadata(
+        pipeline=pipeline_to_persist,
+        job_id=job_id,
+        previous_cid=pipeline_cid,
+        delete_previous=True,
+      )
+      if not saved:
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: "Failed to persist reconciled pipeline metadata",
+        }
+
+    if node_update_delivered:
+      status = "node_update_delivered"
+    elif pipeline_changed:
+      status = "updated"
+    else:
+      status = "already_current"
+
+    return {
+      DEEPLOY_KEYS.STATUS: status,
+      DEEPLOY_KEYS.JOB_ID: job_id,
+      "old_owner": old_owner,
+      "previous_owner": previous_owner,
+      "new_owner": new_owner,
+      "stale_nodes": stale_nodes,
+      "response_keys": response_keys,
+    }
+
   def _gather_running_pipeline_context(self, owner, app_id=None, job_id=None):
     """
     Collect information about currently running pipeline instances for a job/app.
