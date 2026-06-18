@@ -31,6 +31,7 @@ class ModelTestJobConfig:
   raw_evidence: dict
   selected_peers: list
   model_test_node_selection: dict
+  job_id: str = ""
   scan_type: str = "model_test"
 
   def to_dict(self) -> dict:
@@ -42,6 +43,7 @@ class ModelTestJobConfig:
       schema_version=d.get("schema_version", MODEL_TEST_JOB_CONFIG_SCHEMA),
       job_type=d["job_type"],
       scan_type=d.get("scan_type", "model_test"),
+      job_id=d.get("job_id", ""),
       task_name=d.get("task_name", ""),
       task_description=d.get("task_description", ""),
       created_by_name=d.get("created_by_name", ""),

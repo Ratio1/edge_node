@@ -26,6 +26,12 @@ def _owner(**kwargs):
   defaults = {
     "CONFIG": {},
     "config_data": {},
+    "cfg_chainstore_peers": ["node-a"],
+    "cfg_instance_id": "instance",
+    "ee_addr": "launcher-node",
+    "ee_id": "Launcher",
+    "uuid": MagicMock(return_value="job-123"),
+    "time": MagicMock(return_value=123.0),
     "r1fs": MagicMock(),
     "chainstore_hset": MagicMock(),
     "chainstore_hgetall": MagicMock(return_value={}),
@@ -195,10 +201,14 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
         self.assertEqual(err["error_class"], "credential_unavailable")
         self.assertNotIn(ref, str(err))
 
-  def test_enabled_launch_validates_but_does_not_persist_or_echo_secret(self):
-    owner = _owner(cfg_model_testing={"ENABLED": True})
+  def test_enabled_launch_persists_one_worker_entry_and_does_not_echo_secret(self):
+    owner = _owner(
+      cfg_model_testing={"ENABLED": True},
+      cfg_chainstore_peers=["node-a", "node-b"],
+    )
     secret = "sentinel-model-api-key"
     kwargs = _valid_launch_kwargs(secret=secret)
+    kwargs["selected_peers"] = ["node-b"]
     kwargs["limits"] = {
       "tested_max_tokens": 128,
       "api_key": secret,
@@ -207,14 +217,57 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
 
     result = launch_model_test(owner, **kwargs)
 
-    self.assertEqual(result["error"], "not_implemented")
+    self.assertNotIn("error", result)
     self.assertEqual(result["job_type"], "model_test")
+    self.assertEqual(result["worker"], "node-b")
     self.assertNotIn(secret, str(result))
     self.assertTrue(result["job_config"]["tested_model"]["credential_ref_present"] is False)
     self.assertEqual(result["job_config"]["limits"]["tested_max_tokens"], 128)
     self.assertNotIn("api_key", result["job_config"]["limits"])
     self.assertNotIn("unknown_secret_field", result["job_config"]["limits"])
+    self.assertEqual(result["model_test_node_selection"]["selection_mode"], "manual")
+    self.assertEqual(result["model_test_node_selection"]["selected_execution_node"], "node-b")
+
+    owner.r1fs.add_json.assert_called_once()
+    stored_config = owner.r1fs.add_json.call_args.args[0]
+    self.assertEqual(stored_config["job_type"], "model_test")
+    self.assertEqual(stored_config["scan_type"], "model_test")
+    self.assertEqual(stored_config["job_id"], "job-123")
+    self.assertEqual(stored_config["model_test_node_selection"]["selected_execution_node"], "node-b")
+    self.assertNotIn(secret, str(stored_config))
+
+    owner.chainstore_hset.assert_called_once()
+    stored_job = owner.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(stored_job["job_type"], "model_test")
+    self.assertEqual(stored_job["scan_type"], "model_test")
+    self.assertEqual(set(stored_job["workers"]), {"node-b"})
+    self.assertEqual(stored_job["workers"]["node-b"]["worker_type"], "model_test")
+    self.assertEqual(stored_job["workers"]["node-b"]["model_test_worker_status"], "queued")
+    self.assertNotIn("node-a", stored_job["workers"])
+
+  def test_enabled_launch_rejects_invalid_selected_peer_before_persistence(self):
+    owner = _owner(
+      cfg_model_testing={"ENABLED": True},
+      cfg_chainstore_peers=["node-a"],
+    )
+    kwargs = _valid_launch_kwargs()
+    kwargs["selected_peers"] = ["node-x"]
+
+    result = launch_model_test(owner, **kwargs)
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("Invalid peer addresses", result["message"])
     owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
+  def test_enabled_launch_returns_storage_error_before_cstore_write(self):
+    r1fs = MagicMock()
+    r1fs.add_json.return_value = ""
+    owner = _owner(cfg_model_testing={"ENABLED": True}, r1fs=r1fs)
+
+    result = launch_model_test(owner, **_valid_launch_kwargs())
+
+    self.assertEqual(result["error"], "storage_error")
     owner.chainstore_hset.assert_not_called()
 
   def test_enabled_launch_rejects_limits_above_v1_caps(self):
@@ -505,3 +558,38 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(payload["job_type"], "model_test")
     self.assertEqual(payload["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(payload["model_test_node_selection"]["selected_execution_node"], "node-a")
+
+  def test_scan_poller_ignores_model_test_jobs(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.time.return_value = 10
+    plugin._PentesterApi01Plugin__last_checked_jobs = 0
+    plugin.cfg_check_jobs_each = 1
+    plugin.cfg_instance_id = "instance"
+    plugin.ee_addr = "node-a"
+    plugin.scan_jobs = {}
+    plugin.completed_jobs_reports = {}
+    plugin.chainstore_hgetall.return_value = {
+      "job-1": {
+        "job_id": "job-1",
+        "job_type": "model_test",
+        "scan_type": "model_test",
+        "target": "Unit Provider / unit-model",
+        "workers": {
+          "node-a": {
+            "worker_type": "model_test",
+            "start_port": 0,
+            "end_port": 0,
+            "finished": False,
+          },
+        },
+      },
+    }
+    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+
+    PentesterApi01Plugin._maybe_launch_jobs(plugin)
+
+    self.assertEqual(plugin.scan_jobs, {})
+    plugin._get_worker_entry.assert_not_called()
