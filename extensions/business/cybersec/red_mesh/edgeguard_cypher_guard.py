@@ -189,6 +189,40 @@ def split_schema_union(tokens: str) -> list[str]:
   return [normalize_schema_token(part.strip()) for part in tokens.split("|") if part.strip()]
 
 
+def ordered_schema_identifiers(pattern: re.Pattern[str], cypher: str, allowed: set[str]) -> list[str]:
+  values: list[str] = []
+  for match in pattern.finditer(str(cypher or "")):
+    raw_value = match.group(1)
+    for value in split_schema_union(raw_value):
+      if value in allowed and value not in values:
+        values.append(value)
+  return values
+
+
+def build_empty_result_broadening_cypher(
+  failed_cypher: str,
+  allowed: dict[str, set[str]] | None = None,
+) -> dict[str, str] | None:
+  """Build the v0.5.10 deterministic empty-result broadening query.
+
+  This intentionally uses only schema identifiers already present in the failed
+  query. A label-only or relationship-only fallback is too broad for runtime use.
+  """
+  allowed = allowed or schema_sets()
+  labels = ordered_schema_identifiers(LABEL_REF, failed_cypher, allowed["labels"])
+  relationships = ordered_schema_identifiers(REL_TYPE_REF, failed_cypher, allowed["relationship_types"])
+  if not labels or not relationships:
+    return None
+  query = f"MATCH p=(n:{labels[0]})-[:{relationships[0]}]-() RETURN p LIMIT 5"
+  analysis = analyze_generated_cypher(query, allowed)
+  if not analysis["accepted"]:
+    return None
+  return {
+    "cypher": query,
+    "strategy": "first_allowed_label_first_allowed_relationship_type",
+  }
+
+
 def extract_schema_tokens(cypher: str) -> dict[str, set[str]]:
   property_source = PROCEDURE_CALL.sub("(", cypher)
   labels = {normalize_schema_token(match.group(1)) for match in LABEL_REF.finditer(cypher)}

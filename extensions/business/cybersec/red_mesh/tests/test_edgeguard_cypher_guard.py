@@ -2,6 +2,7 @@ import unittest
 
 from extensions.business.cybersec.red_mesh.edgeguard_cypher_guard import (
   analyze_generated_cypher,
+  build_empty_result_broadening_cypher,
   build_direct_cypher_system_prompt,
   build_schema_correction_prompt,
   extract_schema_tokens,
@@ -52,6 +53,24 @@ class EdgeGuardCypherGuardTests(unittest.TestCase):
     tokens = extract_schema_tokens("MATCH (n) RETURN labels(n) AS labels, count(n) AS count")
 
     self.assertEqual(tokens["properties"], set())
+
+  def test_empty_result_broadening_uses_first_allowed_label_and_relationship(self):
+    broadened = build_empty_result_broadening_cypher(
+      "MATCH (i:Indicator)-[:INDICATES]->(a:Alert) WHERE i.value = 'x' RETURN i.value AS value"
+    )
+
+    self.assertEqual(
+      broadened,
+      {
+        "cypher": "MATCH p=(n:Indicator)-[:INDICATES]-() RETURN p LIMIT 5",
+        "strategy": "first_allowed_label_first_allowed_relationship_type",
+      },
+    )
+
+  def test_empty_result_broadening_requires_label_and_relationship_pair(self):
+    self.assertIsNone(
+      build_empty_result_broadening_cypher("MATCH (i:Indicator) RETURN i.value AS value")
+    )
 
   def test_prompts_include_schema_and_output_contract(self):
     prompt = build_direct_cypher_system_prompt()

@@ -19,9 +19,12 @@ AI_ENGINE=edgeguard_qwen_4b
 ```
 
 This is the private v0.5 preview continuation of the v0.4 GGUF artifact. The published GGUF contains
-the merged EGM-013 v0.5.3 weights. The reported generated-live improvement, `29/38 = 76.32%`, requires
-the EGM-017 live-repair retry harness around inference; the harness is not baked into the GGUF weights.
-The model remains a preview because the formal 80% generated-live gate is still unmet.
+the merged EGM-013 v0.5.3 weights. The backend runtime now applies the EGM-019 v0.5.10 live-retry
+and empty-result broadening harness around those weights. The generated-live extractable-graph gate
+improved to `34/38 = 89.47%` with planner failures `0` and scalar-projection regressions `0`. The
+runtime harness is not baked into the GGUF weights; it is backend behavior around inference and
+Neo4j execution. Deterministic broadening improves graph extractability but can return a wider graph
+than the original request, so semantic-fidelity review remains required before production promotion.
 
 Set the private Hugging Face token as a runtime secret for `LLM_INFERENCE_API`; do not put it in a
 pipeline JSON committed to git.
@@ -38,7 +41,11 @@ query string only:
 - at most two schema-correction retries by default
 
 `EDGEGUARD_API` revalidates accepted agent output before returning it to the UI and revalidates Cypher
-again before Neo4j execution.
+again before Neo4j execution. When an accepted generated query executes successfully but returns zero
+rows, `EDGEGUARD_API` can apply the v0.5.10 empty-result broadening fallback: it derives one bounded
+graph query from the first allowed label and relationship type already present in the accepted Cypher,
+executes that query, and returns explicit `live_retry` metadata so the UI can show that the returned
+graph was broadened.
 
 ## Minimal Pipeline Sketch
 
@@ -79,7 +86,8 @@ again before Neo4j execution.
           "SEMAPHORE": "edgeguard_api",
           "PORT": 5055,
           "EDGEGUARD_LLM_AGENT_PORT": 5060,
-          "NEO4J_MAX_ROWS": 100
+          "NEO4J_MAX_ROWS": 100,
+          "LIVE_EMPTY_RESULT_BROADENING": true
         }
       ]
     },

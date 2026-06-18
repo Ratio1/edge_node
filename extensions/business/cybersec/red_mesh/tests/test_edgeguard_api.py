@@ -45,8 +45,12 @@ class _Response:
 
 
 class _Result(list):
+  def __init__(self, rows=None, keys=None):
+    super().__init__(rows or [])
+    self._keys = keys or ["value"]
+
   def keys(self):
-    return ["value"]
+    return self._keys
 
 
 def _make_agent(**overrides):
@@ -95,6 +99,7 @@ def _make_api(**overrides):
   plugin.cfg_edgeguard_llm_agent_token_env = overrides.get("edgeguard_llm_agent_token_env", "EDGEGUARD_LLM_AGENT_TOKEN")
   plugin.cfg_neo4j_max_rows = overrides.get("neo4j_max_rows", 100)
   plugin.cfg_neo4j_query_timeout_seconds = overrides.get("neo4j_query_timeout_seconds", 30)
+  plugin.cfg_live_empty_result_broadening = overrides.get("live_empty_result_broadening", True)
   plugin.cfg_request_timeout_seconds = overrides.get("request_timeout_seconds", 120)
   plugin.cfg_edgeguard_verbose = 0
   plugin.os_environ = overrides.get("os_environ", {})
@@ -248,8 +253,9 @@ class EdgeGuardApiTests(unittest.TestCase):
     self.assertEqual(model["display_name"], "EdgeGuard Cypher Qwen3 4B v0.5 Preview GGUF")
     self.assertEqual(model["model_repo"], "ratio1/edgeguard-cypher-qwen3-4b-v0.5-preview-gguf")
     self.assertEqual(model["model_file"], "edgeguard-cypher-qwen3-4b-v0.5-preview.Q4_K_M.gguf")
-    self.assertEqual(model["quality"]["generated_live_with_live_repair"], "29 / 38 = 76.32%")
+    self.assertEqual(model["quality"]["generated_live_with_empty_result_broadening"], "34 / 38 = 89.47%")
     self.assertEqual(model["quality"]["planner_failures"], 0)
+    self.assertTrue(model["runtime_harness"]["empty_result_broadening"])
 
   def test_api_revalidates_agent_accepted_cypher(self):
     plugin = _make_api()
@@ -318,6 +324,72 @@ class EdgeGuardApiTests(unittest.TestCase):
 
     self.assertTrue(result["executed"])
     self.assertEqual(result["rows"], [{"value": "1.2.3.4"}])
+    self.assertFalse(result["live_retry"]["attempted"])
     mocked_driver.assert_called_once()
     fake_session.run.assert_called_once_with("MATCH (i:Indicator) RETURN i.value AS value LIMIT 10")
     fake_driver.close.assert_called_once()
+
+  def test_neo4j_query_broadens_empty_result_once(self):
+    plugin = _make_api()
+    fake_record = MagicMock()
+    fake_record.data.return_value = {"p": "graph-path"}
+    empty_result = _Result([], keys=["value"])
+    broadened_result = _Result([fake_record], keys=["p"])
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.side_effect = [empty_result, broadened_result]
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.red_mesh.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
+        )
+
+    self.assertTrue(result["executed"])
+    self.assertEqual(result["columns"], ["p"])
+    self.assertEqual(result["rows"], [{"p": "graph-path"}])
+    self.assertTrue(result["live_retry"]["attempted"])
+    self.assertTrue(result["live_retry"]["applied"])
+    self.assertEqual(
+      result["live_retry"]["deterministic_empty_result_broadening_strategy"],
+      "first_allowed_label_first_allowed_relationship_type",
+    )
+    self.assertEqual(fake_session.run.call_count, 2)
+    self.assertEqual(
+      fake_session.run.call_args_list[1].args[0],
+      "MATCH p=(n:Indicator)-[:INDICATES]-() RETURN p LIMIT 5",
+    )
+
+  def test_neo4j_query_can_disable_empty_result_broadening(self):
+    plugin = _make_api()
+    empty_result = _Result([], keys=["value"])
+    fake_session = MagicMock()
+    fake_session.__enter__.return_value = fake_session
+    fake_session.run.return_value = empty_result
+    fake_driver = MagicMock()
+    fake_driver.session.return_value = fake_session
+
+    with patch("extensions.business.cybersec.red_mesh.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10",
+          enable_empty_result_broadening=False,
+        )
+
+    self.assertTrue(result["executed"])
+    self.assertEqual(result["rows"], [])
+    self.assertFalse(result["live_retry"]["enabled"])
+    self.assertFalse(result["live_retry"]["attempted"])
+    fake_session.run.assert_called_once_with(
+      "MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10"
+    )

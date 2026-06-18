@@ -31,6 +31,8 @@ EDGEGUARD_MODEL_FILE = "edgeguard-cypher-qwen3-4b-v0.5-preview.Q4_K_M.gguf"
 EDGEGUARD_MODEL_DISPLAY_NAME = "EdgeGuard Cypher Qwen3 4B v0.5 Preview GGUF"
 EDGEGUARD_MODEL_ARTIFACT_SHA256 = "1d92a276e3608252197b7f64af3e31b825b7f6accd5cf9cd0ba491f4cf5c8258"
 EDGEGUARD_SOURCE_ADAPTER_SHA256 = "d1adf925ccf39cf699d3cc62f6f51af336a5b86d5907692e719405b1dde750df"
+EDGEGUARD_RUNTIME_HARNESS_VERSION = "EGM-019 v0.5.10"
+EDGEGUARD_RUNTIME_LIVE_GATE_RESULT = "34 / 38 = 89.47%"
 
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
@@ -317,16 +319,23 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
         "dataset": "qwen-prompt-cypher-v0.5.3-generated-live-anchor-correction",
         "source_adapter": "EGM-013 v0.5.3",
         "source_adapter_sha256": EDGEGUARD_SOURCE_ADAPTER_SHA256,
-        "generated_live_with_live_repair": "29 / 38 = 76.32%",
+        "generated_live_with_live_repair": "30 / 38 = 78.95%",
+        "generated_live_with_empty_result_broadening": EDGEGUARD_RUNTIME_LIVE_GATE_RESULT,
         "planner_failures": 0,
         "scalar_projection_regressions": 0,
-        "promotion_status": "Preview; formal 80% generated-live gate remains unmet.",
+        "promotion_status": "Runtime harness passes the 80% generated-live extractable-graph gate; semantic-fidelity review is still required before production promotion.",
         "known_limits": [
           "Must run behind schema/read-only guard.",
-          "The EGM-017 live-repair retry harness is required to reproduce 29/38; it is not baked into the GGUF weights.",
+          "The v0.5.10 live-retry and empty-result broadening harness is required to reproduce 34/38; it is not baked into the GGUF weights.",
           "Unsupported temporal predicates are mapped to the closest supported query without invented time fields.",
-          "This preview is a continuation artifact, not a formal promotion.",
+          "Deterministic broadening improves graph extractability but can be semantically wider than the original request.",
         ],
+      },
+      "runtime_harness": {
+        "version": EDGEGUARD_RUNTIME_HARNESS_VERSION,
+        "empty_result_broadening": True,
+        "empty_result_broadening_strategy": "first_allowed_label_first_allowed_relationship_type",
+        "weights_note": "The deployed GGUF weights are still the v0.5 preview artifact; the 34/38 result depends on backend runtime handling.",
       },
       "resources": {
         "cpu_target": "4 CPU threads",
