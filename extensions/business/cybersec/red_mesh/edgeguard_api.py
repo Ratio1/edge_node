@@ -20,8 +20,11 @@ from .edgeguard_cypher_guard import (
   canonical_schema_surface,
 )
 from .edgeguard_llm_agent_api import (
+  EDGEGUARD_MODEL_ARTIFACT_SHA256,
+  EDGEGUARD_MODEL_DISPLAY_NAME,
   EDGEGUARD_MODEL_FILE,
   EDGEGUARD_MODEL_REPO,
+  EDGEGUARD_SOURCE_ADAPTER_SHA256,
   STATUS_ACCEPTED,
   STATUS_ERROR,
   STATUS_OK,
@@ -175,11 +178,14 @@ class EdgeguardApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="GET")
   def model(self) -> Dict[str, Any]:
     return {
+      "display_name": EDGEGUARD_MODEL_DISPLAY_NAME,
       "model_repo": EDGEGUARD_MODEL_REPO,
       "model_file": EDGEGUARD_MODEL_FILE,
       "format": "GGUF",
       "quantization": "Q4_K_M",
       "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+      "continuation_of": "ratio1/edgeguard-cypher-qwen3-4b-v0.4-gguf",
+      "artifact_sha256": EDGEGUARD_MODEL_ARTIFACT_SHA256,
       "schema_version": SCHEMA_VERSION,
       "schema": canonical_schema_surface(),
       "guard": {
@@ -190,12 +196,16 @@ class EdgeguardApiPlugin(BasePlugin):
       },
       "fine_tuning": {
         "method": "QLoRA SFT",
-        "dataset": "qwen-prompt-cypher-v0.4",
-        "source_adapter_sha256": "cfa7d84b71b95e076f6d7e85719db1da39e65812cb84b489255a49b31fd4f2e8",
+        "dataset": "qwen-prompt-cypher-v0.5.3-generated-live-anchor-correction",
+        "source_adapter": "EGM-013 v0.5.3",
+        "source_adapter_sha256": EDGEGUARD_SOURCE_ADAPTER_SHA256,
       },
       "quality": {
-        "combined_post_retry_acceptance": "2386 / 2410",
-        "final_rejects_after_two_retries": 24,
+        "generated_live_with_live_repair": "29 / 38 = 76.32%",
+        "planner_failures": 0,
+        "scalar_projection_regressions": 0,
+        "promotion_status": "Preview; formal 80% generated-live gate remains unmet.",
+        "live_repair_note": "The EGM-017 live-repair retry harness is required to reproduce 29/38; it is not baked into the GGUF weights.",
       },
     }
 

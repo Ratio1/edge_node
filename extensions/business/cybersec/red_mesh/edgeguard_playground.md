@@ -13,10 +13,15 @@ The playground uses three edge-node runtime pieces:
 The model artifact is private in Hugging Face:
 
 ```text
-MODEL_NAME=ratio1/edgeguard-cypher-qwen3-4b-v0.4-gguf
-MODEL_FILENAME=edgeguard-cypher-qwen3-4b-v0.4.Q4_K_M.gguf
+MODEL_NAME=ratio1/edgeguard-cypher-qwen3-4b-v0.5-preview-gguf
+MODEL_FILENAME=edgeguard-cypher-qwen3-4b-v0.5-preview.Q4_K_M.gguf
 AI_ENGINE=edgeguard_qwen_4b
 ```
+
+This is the private v0.5 preview continuation of the v0.4 GGUF artifact. The published GGUF contains
+the merged EGM-013 v0.5.3 weights. The reported generated-live improvement, `29/38 = 76.32%`, requires
+the EGM-017 live-repair retry harness around inference; the harness is not baked into the GGUF weights.
+The model remains a preview because the formal 80% generated-live gate is still unmet.
 
 Set the private Hugging Face token as a runtime secret for `LLM_INFERENCE_API`; do not put it in a
 pipeline JSON committed to git.

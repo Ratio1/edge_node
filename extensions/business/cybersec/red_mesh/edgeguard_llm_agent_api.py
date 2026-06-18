@@ -26,8 +26,11 @@ from .edgeguard_cypher_guard import (
 
 __VER__ = '0.1.0.0'
 
-EDGEGUARD_MODEL_REPO = "ratio1/edgeguard-cypher-qwen3-4b-v0.4-gguf"
-EDGEGUARD_MODEL_FILE = "edgeguard-cypher-qwen3-4b-v0.4.Q4_K_M.gguf"
+EDGEGUARD_MODEL_REPO = "ratio1/edgeguard-cypher-qwen3-4b-v0.5-preview-gguf"
+EDGEGUARD_MODEL_FILE = "edgeguard-cypher-qwen3-4b-v0.5-preview.Q4_K_M.gguf"
+EDGEGUARD_MODEL_DISPLAY_NAME = "EdgeGuard Cypher Qwen3 4B v0.5 Preview GGUF"
+EDGEGUARD_MODEL_ARTIFACT_SHA256 = "1d92a276e3608252197b7f64af3e31b825b7f6accd5cf9cd0ba491f4cf5c8258"
+EDGEGUARD_SOURCE_ADAPTER_SHA256 = "d1adf925ccf39cf699d3cc62f6f51af336a5b86d5907692e719405b1dde750df"
 
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
@@ -293,11 +296,14 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
   @BasePlugin.endpoint(method="GET")
   def model(self) -> Dict[str, Any]:
     return {
+      "display_name": EDGEGUARD_MODEL_DISPLAY_NAME,
       "model_repo": EDGEGUARD_MODEL_REPO,
       "model_file": EDGEGUARD_MODEL_FILE,
       "format": "GGUF",
       "quantization": "Q4_K_M",
       "base_model": "Qwen/Qwen3-4B-Instruct-2507",
+      "continuation_of": "ratio1/edgeguard-cypher-qwen3-4b-v0.4-gguf",
+      "artifact_sha256": EDGEGUARD_MODEL_ARTIFACT_SHA256,
       "schema_version": SCHEMA_VERSION,
       "schema": canonical_schema_surface(),
       "guard": {
@@ -308,12 +314,18 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
       },
       "quality": {
         "training_method": "QLoRA SFT",
-        "dataset": "qwen-prompt-cypher-v0.4",
-        "combined_post_retry_acceptance": "2386 / 2410",
+        "dataset": "qwen-prompt-cypher-v0.5.3-generated-live-anchor-correction",
+        "source_adapter": "EGM-013 v0.5.3",
+        "source_adapter_sha256": EDGEGUARD_SOURCE_ADAPTER_SHA256,
+        "generated_live_with_live_repair": "29 / 38 = 76.32%",
+        "planner_failures": 0,
+        "scalar_projection_regressions": 0,
+        "promotion_status": "Preview; formal 80% generated-live gate remains unmet.",
         "known_limits": [
           "Must run behind schema/read-only guard.",
+          "The EGM-017 live-repair retry harness is required to reproduce 29/38; it is not baked into the GGUF weights.",
           "Unsupported temporal predicates are mapped to the closest supported query without invented time fields.",
-          "Final EGM-007 eval still had 24 / 2410 schema-gate rejects after two retries.",
+          "This preview is a continuation artifact, not a formal promotion.",
         ],
       },
       "resources": {

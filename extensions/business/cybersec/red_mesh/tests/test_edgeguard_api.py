@@ -59,7 +59,7 @@ def _make_agent(**overrides):
   plugin.cfg_local_llm_api_token_env = overrides.get("local_llm_api_token_env", "LLM_API_TOKEN")
   plugin.cfg_local_llm_model = overrides.get(
     "local_llm_model",
-    "edgeguard-cypher-qwen3-4b-v0.4.Q4_K_M.gguf",
+    "edgeguard-cypher-qwen3-4b-v0.5-preview.Q4_K_M.gguf",
   )
   plugin.cfg_default_temperature = overrides.get("default_temperature", 0.0)
   plugin.cfg_default_max_tokens = overrides.get("default_max_tokens", 512)
@@ -157,7 +157,7 @@ class EdgeGuardAgentTests(unittest.TestCase):
     payload = {
       "result": {
         "REQUEST_ID": "req-1",
-        "MODEL_NAME": "edgeguard-cypher-qwen3-4b-v0.4.Q4_K_M.gguf",
+        "MODEL_NAME": "edgeguard-cypher-qwen3-4b-v0.5-preview.Q4_K_M.gguf",
         "TEXT_RESPONSE": "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
       },
     }
@@ -239,6 +239,17 @@ class EdgeGuardApiTests(unittest.TestCase):
       AI_ENGINES["edgeguard_qwen_4b"],
       {"SERVING_PROCESS": "llama_cpp_edgeguard_qwen_4b"},
     )
+
+  def test_api_model_metadata_uses_v05_preview_artifact(self):
+    plugin = _make_api()
+
+    model = plugin.model()
+
+    self.assertEqual(model["display_name"], "EdgeGuard Cypher Qwen3 4B v0.5 Preview GGUF")
+    self.assertEqual(model["model_repo"], "ratio1/edgeguard-cypher-qwen3-4b-v0.5-preview-gguf")
+    self.assertEqual(model["model_file"], "edgeguard-cypher-qwen3-4b-v0.5-preview.Q4_K_M.gguf")
+    self.assertEqual(model["quality"]["generated_live_with_live_repair"], "29 / 38 = 76.32%")
+    self.assertEqual(model["quality"]["planner_failures"], 0)
 
   def test_api_revalidates_agent_accepted_cypher(self):
     plugin = _make_api()
