@@ -393,3 +393,24 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_session.run.assert_called_once_with(
       "MATCH (i:Indicator)-[:INDICATES]->(a:Alert) RETURN i.value AS value LIMIT 10"
     )
+
+  def test_neo4j_query_returns_structured_error_when_driver_fails(self):
+    plugin = _make_api()
+    fake_driver = MagicMock()
+    fake_driver.session.side_effect = RuntimeError("connection failed for secret")
+    fake_driver.close.side_effect = RuntimeError("close failed")
+
+    with patch("extensions.business.cybersec.red_mesh.edgeguard_api.GraphDatabase", object()):
+      with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
+        result = plugin.neo4j_query(
+          uri="example.com:7687",
+          scheme="bolt+s",
+          username="neo4j",
+          password="secret",
+          cypher="MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
+        )
+
+    self.assertEqual(result["status"], "error")
+    self.assertFalse(result["ok"])
+    self.assertFalse(result["executed"])
+    self.assertNotIn("secret", result["error"])

@@ -326,6 +326,14 @@ class EdgeguardApiPlugin(BasePlugin):
       return None
     return GraphDatabase.driver(uri, auth=(username, password))
 
+  def _close_neo4j_driver(self, driver) -> None:
+    if driver is None:
+      return
+    try:
+      driver.close()
+    except Exception as exc:
+      self.Pd(f"Failed to close Neo4j driver cleanly: {exc}", color='y')
+
   def _run_neo4j_query(self, driver, cypher: str, row_limit: int) -> Dict[str, Any]:
     rows = []
     columns = []
@@ -393,8 +401,7 @@ class EdgeguardApiPlugin(BasePlugin):
     except Exception as exc:
       return {"status": STATUS_ERROR, "ok": False, "error": self._sanitize_error(exc, password)}
     finally:
-      if driver is not None:
-        driver.close()
+      self._close_neo4j_driver(driver)
 
   @BasePlugin.endpoint(method="POST")
   def neo4j_query(
@@ -487,5 +494,4 @@ class EdgeguardApiPlugin(BasePlugin):
         "validation": analysis,
       }
     finally:
-      if driver is not None:
-        driver.close()
+      self._close_neo4j_driver(driver)
