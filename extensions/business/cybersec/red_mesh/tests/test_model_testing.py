@@ -6,9 +6,16 @@ from unittest.mock import MagicMock
 from extensions.business.cybersec.red_mesh.model_testing import (
   get_capability_status,
   launch_model_test,
+  select_model_test_execution_node,
   validate_model_provider_credentials,
   validate_provider_url,
 )
+from extensions.business.cybersec.red_mesh.models import (
+  CStoreJobFinalized,
+  CStoreJobRunning,
+  CStoreWorker,
+)
+from extensions.business.cybersec.red_mesh.repositories import ArtifactRepository
 from extensions.business.cybersec.red_mesh.tests.conftest import mock_plugin_modules
 
 
@@ -279,3 +286,222 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
 
     self.assertEqual(result["error"], "forbidden")
     self.assertNotIn("cases", str(result))
+
+
+class TestModelTestNodeSelection(unittest.TestCase):
+
+  def test_manual_one_peer_selects_that_execution_node(self):
+    owner = _owner(cfg_chainstore_peers=["node-a", "node-b"])
+
+    selection, err = select_model_test_execution_node(
+      owner,
+      selected_peers=[" node-b "],
+      resource_scores_getter=lambda _owner, _candidates: {"node-a": 100},
+    )
+
+    self.assertIsNone(err)
+    self.assertEqual(selection["selection_mode"], "manual")
+    self.assertEqual(selection["selection_reason"], "manual_single_peer")
+    self.assertEqual(selection["selected_execution_node"], "node-b")
+    self.assertEqual(selection["candidate_peer_ids"], ["node-b"])
+    self.assertFalse(selection["telemetry_used"])
+    self.assertFalse(selection["random_fallback"])
+
+  def test_auto_all_chooses_highest_resource_chainstore_peer(self):
+    owner = _owner(cfg_chainstore_peers=["node-a", "node-b", "node-c"])
+
+    selection, err = select_model_test_execution_node(
+      owner,
+      selected_peers=[],
+      resource_scores_getter=lambda _owner, _candidates: {
+        "node-a": 10,
+        "node-b": 50,
+        "node-c": 20,
+      },
+    )
+
+    self.assertIsNone(err)
+    self.assertEqual(selection["selection_mode"], "auto_all")
+    self.assertEqual(selection["selection_reason"], "highest_resource_score")
+    self.assertEqual(selection["selected_execution_node"], "node-b")
+    self.assertEqual(selection["candidate_count"], 3)
+    self.assertEqual(selection["telemetry_available_count"], 3)
+    self.assertTrue(selection["telemetry_used"])
+    self.assertFalse(selection["random_fallback"])
+
+  def test_auto_subset_uses_selected_candidate_pool(self):
+    owner = _owner(cfg_chainstore_peers=["node-a", "node-b", "node-c"])
+
+    selection, err = select_model_test_execution_node(
+      owner,
+      selected_peers=["node-a", "node-c", "node-a"],
+      resource_scores_getter=lambda _owner, _candidates: {
+        "node-b": 100,
+        "node-c": 25,
+        "node-a": 20,
+      },
+    )
+
+    self.assertIsNone(err)
+    self.assertEqual(selection["selection_mode"], "auto_subset")
+    self.assertEqual(selection["requested_peer_ids"], ["node-a", "node-c"])
+    self.assertEqual(selection["candidate_peer_ids"], ["node-a", "node-c"])
+    self.assertEqual(selection["selected_execution_node"], "node-c")
+
+  def test_resource_ties_use_stable_lexical_peer_id_order(self):
+    owner = _owner(cfg_chainstore_peers=["node-b", "node-a"])
+
+    selection, err = select_model_test_execution_node(
+      owner,
+      selected_peers=[],
+      resource_scores_getter=lambda _owner, _candidates: {
+        "node-b": 10,
+        "node-a": 10,
+      },
+    )
+
+    self.assertIsNone(err)
+    self.assertEqual(selection["selected_execution_node"], "node-a")
+
+  def test_random_fallback_when_resource_telemetry_unavailable(self):
+    owner = _owner(cfg_chainstore_peers=["node-a", "node-b", "node-c"])
+
+    selection, err = select_model_test_execution_node(
+      owner,
+      selected_peers=[],
+      resource_scores_getter=lambda _owner, _candidates: {},
+      random_source=lambda candidates: candidates[-1],
+    )
+
+    self.assertIsNone(err)
+    self.assertEqual(selection["selection_mode"], "auto_all")
+    self.assertEqual(selection["selection_reason"], "random_no_usable_telemetry")
+    self.assertEqual(selection["selected_execution_node"], "node-c")
+    self.assertFalse(selection["telemetry_used"])
+    self.assertEqual(selection["telemetry_available_count"], 0)
+    self.assertTrue(selection["random_fallback"])
+
+  def test_invalid_selected_peer_rejected_before_selection(self):
+    owner = _owner(cfg_chainstore_peers=["node-a"])
+
+    selection, err = select_model_test_execution_node(owner, selected_peers=["node-x"])
+
+    self.assertIsNone(selection)
+    self.assertEqual(err["error"], "validation_error")
+    self.assertIn("Invalid peer addresses", err["message"])
+
+  def test_falsey_non_list_selected_peers_rejected(self):
+    owner = _owner(cfg_chainstore_peers=["node-a"])
+
+    selection, err = select_model_test_execution_node(owner, selected_peers="")
+
+    self.assertIsNone(selection)
+    self.assertEqual(err["error"], "validation_error")
+    self.assertIn("selected_peers must be a list", err["message"])
+
+
+class TestModelTestingPersistenceContracts(unittest.TestCase):
+
+  def test_artifact_repository_preserves_model_test_config_without_scan_defaults(self):
+    owner = _owner()
+    owner.r1fs.add_json.return_value = "cid-config"
+    config = {
+      "schema_version": "model_test_job_config_v1",
+      "job_type": "model_test",
+      "task_name": "CBRN smoke",
+      "task_description": "Run reviewed CBRN safety pack",
+      "created_by_name": "tester",
+      "created_by_id": "user-123",
+      "test_set_id": "cbrn_safety_v1",
+      "tested_model": {"provider_label": "Tested"},
+      "evaluator_model": {"provider_label": "Evaluator"},
+      "limits": {"max_cases": 12},
+      "raw_evidence": {"requested": False},
+      "selected_peers": ["node-a"],
+      "model_test_node_selection": {
+        "selected_execution_node": "node-a",
+        "selection_mode": "manual",
+      },
+    }
+
+    cid = ArtifactRepository(owner).put_job_config(config)
+
+    self.assertEqual(cid, "cid-config")
+    stored = owner.r1fs.add_json.call_args.args[0]
+    self.assertEqual(stored["job_type"], "model_test")
+    self.assertEqual(stored["scan_type"], "model_test")
+    self.assertEqual(stored["model_test_node_selection"]["selected_execution_node"], "node-a")
+    self.assertNotIn("target", stored)
+    self.assertNotIn("start_port", stored)
+    self.assertNotIn("end_port", stored)
+
+  def test_cstore_models_preserve_model_test_fields(self):
+    worker = CStoreWorker(
+      start_port=0,
+      end_port=0,
+      worker_type="model_test",
+      model_test_worker_status="queued",
+    )
+    running = CStoreJobRunning(
+      job_id="job-1",
+      job_status="RUNNING",
+      job_pass=1,
+      run_mode="SINGLEPASS",
+      launcher="launcher-node",
+      launcher_alias="Launcher",
+      target="Tested",
+      scan_type="model_test",
+      target_url="",
+      task_name="CBRN smoke",
+      start_port=0,
+      end_port=0,
+      date_created=123.0,
+      job_config_cid="cid-config",
+      workers={"node-a": worker.to_dict()},
+      timeline=[],
+      pass_reports=[],
+      job_type="model_test",
+      model_test_summary={"overall_status": "queued"},
+      model_test_node_selection={"selected_execution_node": "node-a"},
+    )
+
+    payload = running.to_dict()
+    round_tripped = CStoreJobRunning.from_dict(payload).to_dict()
+
+    self.assertEqual(round_tripped["job_type"], "model_test")
+    self.assertEqual(round_tripped["model_test_summary"]["overall_status"], "queued")
+    self.assertEqual(round_tripped["model_test_node_selection"]["selected_execution_node"], "node-a")
+    self.assertEqual(round_tripped["workers"]["node-a"]["worker_type"], "model_test")
+    self.assertEqual(round_tripped["workers"]["node-a"]["model_test_worker_status"], "queued")
+
+  def test_finalized_cstore_model_preserves_model_test_fields(self):
+    finalized = CStoreJobFinalized(
+      job_id="job-1",
+      job_status="FINALIZED",
+      target="Tested",
+      scan_type="model_test",
+      target_url="",
+      task_name="CBRN smoke",
+      risk_score=0,
+      run_mode="SINGLEPASS",
+      duration=10,
+      pass_count=0,
+      launcher="launcher-node",
+      launcher_alias="Launcher",
+      worker_count=1,
+      start_port=0,
+      end_port=0,
+      date_created=123.0,
+      date_completed=133.0,
+      job_cid="cid-archive",
+      job_config_cid="cid-config",
+      job_type="model_test",
+      model_test_summary={"overall_status": "complete"},
+      model_test_node_selection={"selected_execution_node": "node-a"},
+    )
+
+    payload = CStoreJobFinalized.from_dict(finalized.to_dict()).to_dict()
+
+    self.assertEqual(payload["job_type"], "model_test")
+    self.assertEqual(payload["model_test_summary"]["overall_status"], "complete")
+    self.assertEqual(payload["model_test_node_selection"]["selected_execution_node"], "node-a")

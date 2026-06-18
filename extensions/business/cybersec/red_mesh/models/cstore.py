@@ -44,6 +44,8 @@ class CStoreWorker:
   budget_scope: str = None
   assignment_hash: str = None
   stateful_policy: str = None
+  worker_type: str = None
+  model_test_worker_status: str = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -71,6 +73,8 @@ class CStoreWorker:
       budget_scope=d.get("budget_scope"),
       assignment_hash=d.get("assignment_hash"),
       stateful_policy=d.get("stateful_policy"),
+      worker_type=d.get("worker_type"),
+      model_test_worker_status=d.get("model_test_worker_status"),
     )
 
 
@@ -129,6 +133,9 @@ class CStoreJobRunning:
   opencti_export: dict = None
   taxii_export: dict = None
   graybox_assignment_summary: dict = None
+  job_type: str = None
+  model_test_summary: dict = None
+  model_test_node_selection: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -164,6 +171,9 @@ class CStoreJobRunning:
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
       graybox_assignment_summary=d.get("graybox_assignment_summary"),
+      job_type=d.get("job_type"),
+      model_test_summary=d.get("model_test_summary"),
+      model_test_node_selection=d.get("model_test_node_selection"),
     )
 
 
@@ -201,6 +211,9 @@ class CStoreJobFinalized:
   opencti_export: dict = None
   taxii_export: dict = None
   graybox_assignment_summary: dict = None
+  job_type: str = None
+  model_test_summary: dict = None
+  model_test_node_selection: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -234,6 +247,9 @@ class CStoreJobFinalized:
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
       graybox_assignment_summary=d.get("graybox_assignment_summary"),
+      job_type=d.get("job_type"),
+      model_test_summary=d.get("model_test_summary"),
+      model_test_node_selection=d.get("model_test_node_selection"),
     )
 
 
