@@ -63,6 +63,8 @@ def maybe_finalize_pass(owner):
     normalized_key, job_specs = owner._normalize_job_record(job_key, job_specs)
     if normalized_key is None:
       continue
+    if job_specs.get("job_type") == "model_test":
+      continue
 
     is_launcher = job_specs.get("launcher") == owner.ee_addr
     if not is_launcher:

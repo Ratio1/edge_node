@@ -10,6 +10,7 @@ from extensions.business.cybersec.red_mesh.model_testing import (
   validate_model_provider_credentials,
   validate_provider_url,
 )
+from extensions.business.cybersec.red_mesh.model_testing.worker import ModelTestWorker
 from extensions.business.cybersec.red_mesh.models import (
   CStoreJobFinalized,
   CStoreJobRunning,
@@ -593,3 +594,158 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
 
     self.assertEqual(plugin.scan_jobs, {})
     plugin._get_worker_entry.assert_not_called()
+
+  def test_only_selected_node_launches_model_test_worker(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "launcher": "launcher-node",
+      "job_config_cid": "cid-config",
+      "workers": {
+        "node-b": {
+          "worker_type": "model_test",
+          "start_port": 0,
+          "end_port": 0,
+          "finished": False,
+        },
+      },
+    }
+
+    selected = MagicMock()
+    selected.cfg_instance_id = "instance"
+    selected.ee_addr = "node-b"
+    selected.model_test_jobs = {}
+    selected.scan_jobs = {}
+    selected.chainstore_hgetall.return_value = {"job-1": job_specs}
+    selected._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    selected._get_worker_entry.side_effect = lambda _job_id, specs: specs["workers"].get(selected.ee_addr)
+    selected._get_artifact_repository.return_value.get_job_config.return_value = {
+      "job_id": "job-1",
+      "job_type": "model_test",
+      "limits": {"max_cases": 12},
+    }
+    selected._write_job_record.side_effect = lambda job_id, specs, context="": specs
+    selected._publish_model_test_progress = MagicMock()
+
+    other = MagicMock()
+    other.cfg_instance_id = "instance"
+    other.ee_addr = "node-a"
+    other.model_test_jobs = {}
+    other.chainstore_hgetall.return_value = {"job-1": job_specs}
+    other._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    other._get_worker_entry.side_effect = lambda _job_id, specs: specs["workers"].get(other.ee_addr)
+
+    PentesterApi01Plugin._maybe_launch_model_test_jobs(other)
+    PentesterApi01Plugin._maybe_launch_model_test_jobs(selected)
+
+    self.assertEqual(other.model_test_jobs, {})
+    self.assertIn("job-1", selected.model_test_jobs)
+    worker = selected.model_test_jobs["job-1"]
+    self.assertIsInstance(worker, ModelTestWorker)
+    worker.thread.join(timeout=1)
+    self.assertEqual(worker.state["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(selected.scan_jobs, {})
+
+  def test_close_model_test_worker_writes_result_and_removes_tracking(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    worker = MagicMock()
+    worker.thread.is_alive.return_value = False
+    worker.state = {"done": True, "completed_tests": ["case-1"]}
+    worker.get_status.return_value = {
+      "done": True,
+      "canceled": False,
+      "model_test_results": {
+        "overall_status": "not_implemented",
+        "cases": [],
+      },
+      "model_test_summary": {
+        "overall_status": "not_implemented",
+        "cases_total": 12,
+        "cases_completed": 0,
+      },
+      "completed_tests": ["case-1"],
+    }
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "model_test_summary": {
+        "overall_status": "queued",
+      },
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "start_port": 0,
+          "end_port": 0,
+          "finished": False,
+          "assignment_revision": 1,
+          "assigned_at": 123.0,
+        },
+      },
+    }
+    plugin = MagicMock()
+    plugin.ee_addr = "node-a"
+    plugin.cfg_instance_id = "instance"
+    plugin.model_test_jobs = {"job-1": worker}
+    plugin.scan_jobs = {}
+    plugin.time.return_value = 130.0
+    plugin.chainstore_hget.return_value = job_specs
+    plugin.chainstore_hset = MagicMock()
+    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._write_job_record.side_effect = lambda job_id, specs, context="": specs
+    plugin.r1fs.add_json.return_value = "cid-result"
+
+    PentesterApi01Plugin._maybe_close_model_test_jobs(plugin)
+
+    self.assertEqual(plugin.model_test_jobs, {})
+    plugin.r1fs.add_json.assert_called_once()
+    stored_result = plugin.r1fs.add_json.call_args.args[0]
+    self.assertEqual(stored_result["schema_version"], "model_test_worker_result_v1")
+    self.assertEqual(stored_result["job_id"], "job-1")
+    self.assertEqual(stored_result["worker_addr"], "node-a")
+    persisted_specs = plugin._write_job_record.call_args.args[1]
+    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "queued")
+    worker_entry = persisted_specs["workers"]["node-a"]
+    self.assertTrue(worker_entry["finished"])
+    self.assertEqual(worker_entry["model_test_worker_status"], "finished")
+    self.assertEqual(worker_entry["report_cid"], "cid-result")
+    self.assertEqual(plugin.scan_jobs, {})
+
+  def test_scan_finalizer_ignores_finished_model_test_jobs(self):
+    from extensions.business.cybersec.red_mesh.services.finalization import maybe_finalize_pass
+
+    owner = MagicMock()
+    owner.cfg_instance_id = "instance"
+    owner.ee_addr = "launcher-node"
+    owner.chainstore_hgetall.return_value = {
+      "job-1": {
+        "job_id": "job-1",
+        "job_status": "RUNNING",
+        "job_type": "model_test",
+        "scan_type": "model_test",
+        "launcher": "launcher-node",
+        "workers": {
+          "node-a": {
+            "worker_type": "model_test",
+            "finished": True,
+            "report_cid": "cid-result",
+          },
+        },
+      },
+    }
+    owner._normalize_job_record.side_effect = lambda key, specs: (key, specs)
+
+    maybe_finalize_pass(owner)
+
+    owner._collect_node_reports.assert_not_called()
+    owner._get_aggregated_report.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
