@@ -109,6 +109,21 @@ class R1fsSecretStore:
     }
     return _artifact_repo(self.owner).put_json(secret_doc, show_logs=False, secret=secret_key)
 
+  def save_model_test_provider_credentials(self, job_id: str, payload: dict) -> str:
+    secret_key, key_metadata = self._resolve_secret_store_key()
+    self.last_key_metadata = dict(key_metadata or {})
+    secret_doc = {
+      "kind": "redmesh_model_test_provider_credentials",
+      "job_id": job_id,
+      "storage_mode": "encrypted_r1fs_json_v1",
+      "key_id": key_metadata.get("key_id", ""),
+      "key_version": key_metadata.get("key_version", ""),
+      "key_source": key_metadata.get("key_source", ""),
+      "unsafe_key_fallback": bool(key_metadata.get("unsafe_fallback", False)),
+      "payload": payload,
+    }
+    return _artifact_repo(self.owner).put_json(secret_doc, show_logs=False, secret=secret_key)
+
   def load_graybox_credentials(self, secret_ref: str, *, expected_job_id: str = "") -> dict | None:
     if not secret_ref:
       return None
@@ -134,6 +149,34 @@ class R1fsSecretStore:
     payload = secret_doc.get("payload")
     if not isinstance(payload, dict):
       self.owner.P(f"Invalid graybox secret payload for ref {secret_ref}", color='r')
+      return None
+    return payload
+
+  def load_model_test_provider_credentials(self, secret_ref: str, *, expected_job_id: str = "") -> dict | None:
+    if not secret_ref:
+      return None
+    repo = _artifact_repo(self.owner)
+    secret_key, key_metadata = self._resolve_secret_store_key()
+    self.last_key_metadata = dict(key_metadata or {})
+    secret_doc = repo.get_json(secret_ref, secret=secret_key)
+    if not isinstance(secret_doc, dict):
+      self.owner.P(f"Failed to fetch model-test provider secret payload from R1FS (CID: {secret_ref})", color='r')
+      return None
+    if secret_doc.get("kind") != "redmesh_model_test_provider_credentials":
+      self.owner.P(f"Invalid model-test provider secret kind for ref {secret_ref}", color='r')
+      return None
+    if secret_doc.get("storage_mode") != "encrypted_r1fs_json_v1":
+      self.owner.P(f"Invalid model-test provider secret storage mode for ref {secret_ref}", color='r')
+      return None
+    if expected_job_id and secret_doc.get("job_id") != expected_job_id:
+      self.owner.P(
+        f"Model-test provider secret ref {secret_ref} belongs to job_id={secret_doc.get('job_id')}, expected {expected_job_id}",
+        color='r',
+      )
+      return None
+    payload = secret_doc.get("payload")
+    if not isinstance(payload, dict):
+      self.owner.P(f"Invalid model-test provider secret payload for ref {secret_ref}", color='r')
       return None
     return payload
 

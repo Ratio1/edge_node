@@ -15,6 +15,10 @@ from .constants import (
   MODEL_TEST_PROGRESS_SCHEMA,
 )
 from .node_selection import select_model_test_execution_node
+from .secrets import (
+  attach_model_test_provider_secret,
+  sanitize_model_test_job_config_for_archive,
+)
 from .security import (
   validate_provider_config_shape,
   validate_model_provider_credentials,
@@ -356,7 +360,22 @@ def launch_model_test(
     "model_test_node_selection": node_selection,
   }
 
-  job_config_cid = _artifact_repo(owner).put_job_config(sanitized_config, show_logs=False)
+  persisted_config, secret_ref = attach_model_test_provider_secret(
+    owner,
+    job_id=job_id,
+    sanitized_config=sanitized_config,
+    tested_model=tested_model,
+    tested_model_secret_payload=tested_model_secret_payload,
+    evaluator_model=evaluator_model,
+    evaluator_model_secret_payload=evaluator_model_secret_payload,
+  )
+  if not secret_ref or not isinstance(persisted_config, dict):
+    return {
+      "error": "storage_error",
+      "message": "Failed to store model test provider credentials in R1FS",
+    }
+
+  job_config_cid = _artifact_repo(owner).put_job_config(persisted_config, show_logs=False)
   if not job_config_cid:
     return {
       "error": "storage_error",
@@ -424,6 +443,6 @@ def launch_model_test(
     "job_specs": persisted_specs,
     "worker": execution_node,
     "job_type": MODEL_TEST_JOB_TYPE,
-    "job_config": sanitized_config,
+    "job_config": sanitize_model_test_job_config_for_archive(sanitized_config),
     "model_test_node_selection": node_selection,
   }

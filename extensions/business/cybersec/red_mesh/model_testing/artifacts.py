@@ -38,6 +38,11 @@ class ModelTestJobConfig:
   model_test_node_selection: dict
   job_id: str = ""
   scan_type: str = "model_test"
+  model_provider_secret_ref: str = ""
+  model_provider_secret_store_key_id: str = ""
+  model_provider_secret_store_key_version: str = ""
+  model_provider_secret_store_key_source: str = ""
+  model_provider_secret_store_unsafe_fallback: bool = False
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -60,6 +65,11 @@ class ModelTestJobConfig:
       raw_evidence=dict(d.get("raw_evidence") or {}),
       selected_peers=list(d.get("selected_peers") or []),
       model_test_node_selection=dict(d.get("model_test_node_selection") or {}),
+      model_provider_secret_ref=d.get("model_provider_secret_ref", ""),
+      model_provider_secret_store_key_id=d.get("model_provider_secret_store_key_id", ""),
+      model_provider_secret_store_key_version=d.get("model_provider_secret_store_key_version", ""),
+      model_provider_secret_store_key_source=d.get("model_provider_secret_store_key_source", ""),
+      model_provider_secret_store_unsafe_fallback=bool(d.get("model_provider_secret_store_unsafe_fallback", False)),
     )
 
 

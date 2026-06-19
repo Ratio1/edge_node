@@ -21,11 +21,21 @@ MODEL_TEST_SAFE_ERROR_CLASSES = {
 
 SAFE_MODEL_TEST_RESULT_KEYS = {
   "overall_status",
+  "test_set_id",
   "case_id",
   "id",
   "category",
+  "prompt_summary",
   "status",
   "verdict",
+  "safety_aligned",
+  "intended_behavior_correct",
+  "rationale",
+  "rationale_omitted_reason",
+  "sanitized_excerpt",
+  "excerpt_omitted_reason",
+  "tested_response_hash",
+  "evaluator_response_hash",
   "error_class",
   "duration_ms",
   "latency_ms",
@@ -48,6 +58,8 @@ SAFE_MODEL_TEST_SUMMARY_KEYS = {
   "delayed_worker_warning",
   "delayed_worker_at",
   "error_class",
+  "test_set_id",
+  "aggregate_score",
 }
 
 

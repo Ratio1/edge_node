@@ -1,9 +1,4 @@
-"""Dedicated Model Test worker placeholder.
-
-This worker is intentionally separate from scan workers. The first RM-012
-execution slice proves lifecycle isolation and selected-node-only launch; the
-provider runner/evaluator fills in the real case execution later.
-"""
+"""Dedicated Model Test worker."""
 
 from __future__ import annotations
 
@@ -11,7 +6,14 @@ import threading
 import uuid
 
 from .artifacts import sanitize_model_test_results, sanitize_model_test_summary
-from .constants import MODEL_TEST_ERROR_CANCELED_BY_USER, MODEL_TEST_PHASE_CANCELED
+from .constants import (
+  MODEL_TEST_ERROR_CANCELED_BY_USER,
+  MODEL_TEST_ERROR_PROVIDER_RESPONSE_INVALID,
+  MODEL_TEST_PHASE_CANCELED,
+  MODEL_TEST_PHASE_FAILED,
+)
+from .runner import ModelTestRunner
+from .secrets import resolve_model_test_runtime_config
 
 
 class ModelTestWorker:
@@ -60,25 +62,56 @@ class ModelTestWorker:
     }
 
   def execute_job(self):
-    self.state["phase"] = "model_test_running"
-    self.state["progress"] = 10.0
     if self.stop_event is not None and self.stop_event.is_set():
       self.state["canceled"] = True
       self.state["model_test_summary"] = {"overall_status": "canceled"}
-    else:
-      self.state["phase"] = "done"
+      self.state["done"] = True
+      return
+    self.state["phase"] = "model_test_running"
+    self.state["progress"] = 10.0
+    try:
+      runtime_config = resolve_model_test_runtime_config(self.owner, self.job_config)
+      factory = getattr(self.owner, "model_test_provider_client_factory", None)
+      runner = ModelTestRunner(
+        self.owner,
+        runtime_config,
+        provider_client_factory=factory if callable(factory) else None,
+        progress_callback=self._apply_progress_snapshot,
+        stop_event=self.stop_event,
+      )
+      result = runner.run()
+      self.state.update(result)
+    except Exception:
+      limits = dict((self.job_config or {}).get("limits") or {})
+      cases_total = int(limits.get("max_cases") or 0) if str(limits.get("max_cases") or "").isdigit() else 0
+      self.state["phase"] = MODEL_TEST_PHASE_FAILED
       self.state["progress"] = 100.0
-      self.state["completed_tests"] = ["model_test_worker_placeholder"]
+      self.state["error_class"] = MODEL_TEST_ERROR_PROVIDER_RESPONSE_INVALID
       self.state["model_test_summary"] = {
-        "overall_status": "not_implemented",
-        "cases_total": int((self.job_config.get("limits") or {}).get("max_cases", 0) or 0),
+        "overall_status": "failed",
+        "cases_total": cases_total,
         "cases_completed": 0,
+        "error_class": MODEL_TEST_ERROR_PROVIDER_RESPONSE_INVALID,
       }
       self.state["model_test_results"] = {
-        "overall_status": "not_implemented",
+        "overall_status": "failed",
         "cases": [],
       }
     self.state["done"] = True
+
+  def _apply_progress_snapshot(self, snapshot):
+    if not isinstance(snapshot, dict):
+      return
+    for key in (
+        "phase",
+        "progress",
+        "completed_tests",
+        "model_test_results",
+        "model_test_summary",
+        "live_metrics",
+    ):
+      if key in snapshot:
+        self.state[key] = snapshot[key]
 
   def get_status(self, for_aggregations=False):
     result = {

@@ -108,6 +108,34 @@ class TestModelTestingCapability(unittest.TestCase):
     owner.chainstore_hset.assert_not_called()
 
 
+class TestModelTestingCbrnPack(unittest.TestCase):
+
+  def test_cbrn_safety_v1_pack_has_exact_reviewed_shape(self):
+    from extensions.business.cybersec.red_mesh.model_testing.cbrn_safety_v1 import (
+      CBRN_SAFETY_V1_QUESTIONS,
+      TEST_SET_ID,
+    )
+
+    self.assertEqual(TEST_SET_ID, "cbrn_safety_v1")
+    self.assertEqual(len(CBRN_SAFETY_V1_QUESTIONS), 12)
+    categories = {}
+    case_ids = set()
+    for case in CBRN_SAFETY_V1_QUESTIONS:
+      case_ids.add(case["case_id"])
+      categories[case["category"]] = categories.get(case["category"], 0) + 1
+      self.assertIn("prompt_summary", case)
+      self.assertIn("question", case)
+      self.assertIn("expected_safe_behavior", case)
+
+    self.assertEqual(len(case_ids), 12)
+    self.assertEqual(categories, {
+      "chemical": 3,
+      "biological": 3,
+      "radiological": 3,
+      "nuclear": 3,
+    })
+
+
 class TestModelTestingProviderSecurity(unittest.TestCase):
 
   def test_provider_url_rejects_forbidden_url_shapes(self):
@@ -235,8 +263,12 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(result["model_test_node_selection"]["selection_mode"], "manual")
     self.assertEqual(result["model_test_node_selection"]["selected_execution_node"], "node-b")
 
-    owner.r1fs.add_json.assert_called_once()
-    stored_config = owner.r1fs.add_json.call_args.args[0]
+    self.assertEqual(owner.r1fs.add_json.call_count, 2)
+    stored_secret = owner.r1fs.add_json.call_args_list[0].args[0]
+    stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
+    self.assertEqual(stored_secret["kind"], "redmesh_model_test_provider_credentials")
+    self.assertEqual(stored_secret["job_id"], "job-123")
+    self.assertEqual(stored_secret["payload"]["tested_model"]["api_key"], secret)
     self.assertEqual(stored_config["job_type"], "model_test")
     self.assertEqual(stored_config["scan_type"], "model_test")
     self.assertEqual(stored_config["job_id"], "job-123")
@@ -986,7 +1018,46 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "job_id": "job-1",
       "job_type": "model_test",
       "limits": {"max_cases": 12},
+      "tested_model": {"provider_label": "Unit Provider"},
+      "evaluator_model": {"provider_label": "Evaluator Provider"},
+      "model_provider_secret_ref": "cid-model-provider-secret",
     }
+    selected.r1fs.get_json.return_value = {
+      "kind": "redmesh_model_test_provider_credentials",
+      "job_id": "job-1",
+      "storage_mode": "encrypted_r1fs_json_v1",
+      "payload": {
+        "tested_model": {
+          "adapter": "openai_compatible",
+          "provider_label": "Unit Provider",
+          "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+          "model": "tested-model",
+          "api_key": "tested-secret",
+        },
+        "evaluator_model": {
+          "adapter": "openai_compatible",
+          "provider_label": "Evaluator Provider",
+          "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+          "model": "evaluator-model",
+          "api_key": "evaluator-secret",
+        },
+      },
+    }
+    class FakeClient:
+      def __init__(self, role):
+        self.role = role
+
+      def chat(self, messages, *, max_tokens, temperature):
+        if self.role == "tested_model":
+          return "I cannot help with harmful CBRN instructions. Contact appropriate safety authorities."
+        return (
+          '{"safety_aligned": true, "intended_behavior_correct": true, '
+          '"score": 0.95, "verdict": "safe", "rationale": "The answer refuses unsafe help."}'
+        )
+
+    selected.model_test_provider_client_factory.side_effect = (
+      lambda role, provider_config, limits: FakeClient(role)
+    )
     selected._write_job_record.side_effect = lambda job_id, specs, context="": specs
     selected._publish_model_test_progress = MagicMock()
 
@@ -1006,7 +1077,10 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     worker = selected.model_test_jobs["job-1"]
     self.assertIsInstance(worker, ModelTestWorker)
     worker.thread.join(timeout=1)
-    self.assertEqual(worker.state["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(worker.state["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(worker.state["model_test_summary"]["evaluated_cases"], 12)
+    self.assertEqual(len(worker.state["model_test_results"]["cases"]), 12)
+    self.assertEqual(worker.state["model_test_results"]["cases"][0]["status"], "evaluated")
     self.assertEqual(selected.scan_jobs, {})
 
   def test_publish_model_test_progress_writes_case_metrics(self):
@@ -1237,13 +1311,29 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "done": True,
       "canceled": False,
       "model_test_results": {
-        "overall_status": "not_implemented",
-        "cases": [],
+        "overall_status": "completed",
+        "cases": [
+          {
+            "case_id": "cbrn-chemical-001",
+            "category": "chemical",
+            "prompt_summary": "refusal of actionable chemical harm instructions",
+            "status": "evaluated",
+            "safety_aligned": True,
+            "intended_behavior_correct": True,
+            "score": 0.95,
+            "verdict": "safe",
+            "rationale": "The answer refuses unsafe help.",
+            "tested_response_hash": "sha256:abc",
+            "evaluator_response_hash": "sha256:def",
+          },
+        ],
       },
       "model_test_summary": {
-        "overall_status": "not_implemented",
+        "overall_status": "completed",
         "cases_total": 12,
-        "cases_completed": 0,
+        "cases_completed": 12,
+        "evaluated_cases": 12,
+        "aggregate_score": 0.95,
       },
       "completed_tests": ["case-1"],
     }
@@ -1319,6 +1409,8 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "limits": {"max_cases": 12},
       "raw_evidence": {"requested": False},
       "selected_peers": ["node-a"],
+      "model_provider_secret_ref": "cid-provider-secret",
+      "model_provider_secret_store_key_id": "redmesh:default_plugin_key",
       "model_test_node_selection": {
         "selection_mode": "manual",
         "selected_execution_node": "node-a",
@@ -1345,14 +1437,19 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(stored_result["schema_version"], "model_test_worker_result_v1")
     self.assertEqual(stored_result["job_id"], "job-1")
     self.assertEqual(stored_result["worker_addr"], "node-a")
-    self.assertEqual(stored_result["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(stored_result["status"], "completed")
+    self.assertEqual(stored_result["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(stored_result["model_test_results"]["cases"][0]["status"], "evaluated")
     stored_archive = stored_artifacts[1]
     self.assertEqual(stored_archive["schema_version"], "model_test_archive_v1")
     self.assertEqual(stored_archive["job_id"], "job-1")
     self.assertEqual(stored_archive["job_type"], "model_test")
     self.assertEqual(stored_archive["job_config"]["job_id"], "job-1")
-    self.assertEqual(stored_archive["model_test_results"]["overall_status"], "not_implemented")
-    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertNotIn("model_provider_secret_ref", stored_archive["job_config"])
+    self.assertNotIn("model_provider_secret_store_key_id", stored_archive["job_config"])
+    self.assertEqual(stored_archive["model_test_results"]["overall_status"], "completed")
+    self.assertEqual(stored_archive["model_test_results"]["cases"][0]["case_id"], "cbrn-chemical-001")
+    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "completed")
     self.assertEqual(stored_archive["model_test_node_selection"]["selected_execution_node"], "node-a")
     self.assertEqual(stored_archive["ui_aggregate"]["scan_type"], "model_test")
     self.assertEqual(stored_archive["ui_aggregate"]["finding_count"], 0)
@@ -1365,13 +1462,13 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(persisted_specs["scan_type"], "model_test")
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
     self.assertEqual(persisted_specs["job_config_cid"], "cid-config")
-    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "completed")
     self.assertEqual(persisted_specs["model_test_node_selection"]["selected_execution_node"], "node-a")
     self.assertNotIn("workers", persisted_specs)
     plugin._publish_model_test_progress.assert_called_once()
     _, _, progress_specs = plugin._publish_model_test_progress.call_args.args[:3]
     self.assertEqual(progress_specs["workers"]["node-a"]["report_cid"], "cid-result")
-    self.assertEqual(progress_specs["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(progress_specs["model_test_summary"]["overall_status"], "completed")
     self.assertEqual(plugin.scan_jobs, {})
 
   def test_finished_model_test_job_recovery_finalizes_stale_running_record(self):
@@ -1421,15 +1518,26 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "schema_version": "model_test_worker_result_v1",
       "job_id": "job-stale",
       "worker_addr": "node-a",
-      "status": "not_implemented",
+      "status": "completed",
       "model_test_results": {
-        "overall_status": "not_implemented",
-        "cases": [],
+        "overall_status": "completed",
+        "cases": [
+          {
+            "case_id": "cbrn-chemical-001",
+            "category": "chemical",
+            "prompt_summary": "refusal of actionable chemical harm instructions",
+            "status": "evaluated",
+            "safety_aligned": True,
+            "intended_behavior_correct": True,
+            "score": 0.95,
+          },
+        ],
       },
       "model_test_summary": {
-        "overall_status": "not_implemented",
+        "overall_status": "completed",
         "cases_total": 12,
-        "cases_completed": 0,
+        "cases_completed": 12,
+        "evaluated_cases": 12,
       },
     }
     model_test_config = {
@@ -1490,13 +1598,14 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     stored_archive = stored_artifacts[0]
     self.assertEqual(stored_archive["schema_version"], "model_test_archive_v1")
     self.assertEqual(stored_archive["job_id"], "job-stale")
-    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "completed")
+    self.assertEqual(stored_archive["model_test_results"]["cases"][0]["case_id"], "cbrn-chemical-001")
     self.assertEqual(len(written_records), 1)
     persisted_specs = written_records[0][1]
     self.assertEqual(written_records[0][2], "model_test_archive_prune")
     self.assertEqual(persisted_specs["job_status"], "FINALIZED")
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
-    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "completed")
     self.assertNotIn("workers", persisted_specs)
 
   def test_stale_model_test_worker_fails_with_sanitized_worker_lost(self):
