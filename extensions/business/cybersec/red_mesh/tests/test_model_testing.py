@@ -1,5 +1,6 @@
 import socket
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -678,9 +679,25 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "job_type": "model_test",
       "scan_type": "model_test",
       "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "target": "Unit Provider / unit-model",
+      "target_url": "",
+      "task_name": "CBRN smoke",
+      "start_port": 0,
+      "end_port": 0,
+      "date_created": 120.0,
+      "job_config_cid": "cid-config",
       "model_test_summary": {
         "overall_status": "queued",
       },
+      "model_test_node_selection": {
+        "selection_mode": "manual",
+        "selected_execution_node": "node-a",
+      },
+      "timeline": [],
+      "pass_reports": [],
       "workers": {
         "node-a": {
           "worker_type": "model_test",
@@ -701,24 +718,212 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     plugin.chainstore_hget.return_value = job_specs
     plugin.chainstore_hset = MagicMock()
     plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
-    plugin._write_job_record.side_effect = lambda job_id, specs, context="": specs
-    plugin.r1fs.add_json.return_value = "cid-result"
+    written_records = []
+
+    def write_record(job_id, specs, context=""):
+      written_records.append((job_id, deepcopy(specs), context))
+      return specs
+
+    stored_artifacts = []
+
+    def add_json(payload, show_logs=False):
+      stored_artifacts.append(deepcopy(payload))
+      return "cid-result" if len(stored_artifacts) == 1 else "cid-archive"
+
+    model_test_config = {
+      "schema_version": "model_test_job_config_v1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_id": "job-1",
+      "task_name": "CBRN smoke",
+      "task_description": "Run reviewed CBRN safety pack",
+      "created_by_name": "tester",
+      "created_by_id": "user-123",
+      "test_set_id": "cbrn_safety_v1",
+      "tested_model": {"provider_label": "Unit Provider"},
+      "evaluator_model": {"provider_label": "Evaluator Provider"},
+      "limits": {"max_cases": 12},
+      "raw_evidence": {"requested": False},
+      "selected_peers": ["node-a"],
+      "model_test_node_selection": {
+        "selection_mode": "manual",
+        "selected_execution_node": "node-a",
+      },
+    }
+
+    def get_json(cid):
+      if cid == "cid-config":
+        return model_test_config
+      if cid == "cid-archive" and len(stored_artifacts) > 1:
+        return stored_artifacts[1]
+      return None
+
+    plugin._write_job_record.side_effect = write_record
+    plugin.r1fs.add_json.side_effect = add_json
+    plugin.r1fs.get_json.side_effect = get_json
+    plugin.cfg_archive_verify_retries = 1
 
     PentesterApi01Plugin._maybe_close_model_test_jobs(plugin)
 
     self.assertEqual(plugin.model_test_jobs, {})
-    plugin.r1fs.add_json.assert_called_once()
-    stored_result = plugin.r1fs.add_json.call_args.args[0]
+    self.assertEqual(plugin.r1fs.add_json.call_count, 2)
+    stored_result = stored_artifacts[0]
     self.assertEqual(stored_result["schema_version"], "model_test_worker_result_v1")
     self.assertEqual(stored_result["job_id"], "job-1")
     self.assertEqual(stored_result["worker_addr"], "node-a")
-    persisted_specs = plugin._write_job_record.call_args.args[1]
-    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "queued")
-    worker_entry = persisted_specs["workers"]["node-a"]
-    self.assertTrue(worker_entry["finished"])
-    self.assertEqual(worker_entry["model_test_worker_status"], "finished")
-    self.assertEqual(worker_entry["report_cid"], "cid-result")
+    self.assertEqual(stored_result["model_test_summary"]["overall_status"], "not_implemented")
+    stored_archive = stored_artifacts[1]
+    self.assertEqual(stored_archive["schema_version"], "model_test_archive_v1")
+    self.assertEqual(stored_archive["job_id"], "job-1")
+    self.assertEqual(stored_archive["job_type"], "model_test")
+    self.assertEqual(stored_archive["job_config"]["job_id"], "job-1")
+    self.assertEqual(stored_archive["model_test_results"]["overall_status"], "not_implemented")
+    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(stored_archive["model_test_node_selection"]["selected_execution_node"], "node-a")
+    self.assertEqual(stored_archive["ui_aggregate"]["scan_type"], "model_test")
+    self.assertEqual(stored_archive["ui_aggregate"]["finding_count"], 0)
+    self.assertEqual(stored_archive["duration"], 10.0)
+    self.assertEqual(len(written_records), 1)
+    persisted_specs = written_records[0][1]
+    self.assertEqual(written_records[0][2], "model_test_archive_prune")
+    self.assertEqual(persisted_specs["job_status"], "FINALIZED")
+    self.assertEqual(persisted_specs["job_type"], "model_test")
+    self.assertEqual(persisted_specs["scan_type"], "model_test")
+    self.assertEqual(persisted_specs["job_cid"], "cid-archive")
+    self.assertEqual(persisted_specs["job_config_cid"], "cid-config")
+    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(persisted_specs["model_test_node_selection"]["selected_execution_node"], "node-a")
+    self.assertNotIn("workers", persisted_specs)
+    plugin._publish_model_test_progress.assert_called_once()
+    _, _, progress_specs = plugin._publish_model_test_progress.call_args.args[:3]
+    self.assertEqual(progress_specs["workers"]["node-a"]["report_cid"], "cid-result")
+    self.assertEqual(progress_specs["model_test_summary"]["overall_status"], "not_implemented")
     self.assertEqual(plugin.scan_jobs, {})
+
+  def test_finished_model_test_job_recovery_finalizes_stale_running_record(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    job_specs = {
+      "job_id": "job-stale",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "target": "Unit Provider / unit-model",
+      "target_url": "",
+      "task_name": "CBRN smoke",
+      "start_port": 0,
+      "end_port": 0,
+      "date_created": 120.0,
+      "job_config_cid": "cid-config",
+      "model_test_summary": {
+        "overall_status": "queued",
+      },
+      "model_test_node_selection": {
+        "selection_mode": "manual",
+        "selected_execution_node": "node-a",
+      },
+      "timeline": [],
+      "pass_reports": [],
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "start_port": 0,
+          "end_port": 0,
+          "finished": True,
+          "canceled": False,
+          "model_test_worker_status": "finished",
+          "report_cid": "cid-result",
+          "assignment_revision": 1,
+          "assigned_at": 123.0,
+        },
+      },
+    }
+    worker_result = {
+      "schema_version": "model_test_worker_result_v1",
+      "job_id": "job-stale",
+      "worker_addr": "node-a",
+      "status": "not_implemented",
+      "model_test_results": {
+        "overall_status": "not_implemented",
+        "cases": [],
+      },
+      "model_test_summary": {
+        "overall_status": "not_implemented",
+        "cases_total": 12,
+        "cases_completed": 0,
+      },
+    }
+    model_test_config = {
+      "schema_version": "model_test_job_config_v1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_id": "job-stale",
+      "task_name": "CBRN smoke",
+      "task_description": "Run reviewed CBRN safety pack",
+      "created_by_name": "tester",
+      "created_by_id": "user-123",
+      "test_set_id": "cbrn_safety_v1",
+      "tested_model": {"provider_label": "Unit Provider"},
+      "evaluator_model": {"provider_label": "Evaluator Provider"},
+      "limits": {"max_cases": 12},
+      "raw_evidence": {"requested": False},
+      "selected_peers": ["node-a"],
+      "model_test_node_selection": {
+        "selection_mode": "manual",
+        "selected_execution_node": "node-a",
+      },
+    }
+    plugin = MagicMock()
+    plugin.ee_addr = "node-a"
+    plugin.cfg_instance_id = "instance"
+    plugin.time.return_value = 130.0
+    plugin.chainstore_hgetall.return_value = {"job-stale": job_specs}
+    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    written_records = []
+    stored_artifacts = []
+
+    def write_record(job_id, specs, context=""):
+      written_records.append((job_id, deepcopy(specs), context))
+      return specs
+
+    def add_json(payload, show_logs=False):
+      stored_artifacts.append(deepcopy(payload))
+      return "cid-archive"
+
+    def get_json(cid):
+      if cid == "cid-result":
+        return worker_result
+      if cid == "cid-config":
+        return model_test_config
+      if cid == "cid-archive" and stored_artifacts:
+        return stored_artifacts[0]
+      return None
+
+    plugin._write_job_record.side_effect = write_record
+    plugin.r1fs.add_json.side_effect = add_json
+    plugin.r1fs.get_json.side_effect = get_json
+    plugin.cfg_archive_verify_retries = 1
+
+    finalized = PentesterApi01Plugin._maybe_finalize_finished_model_test_jobs(plugin)
+
+    self.assertEqual(finalized, ["job-stale"])
+    plugin.r1fs.add_json.assert_called_once()
+    stored_archive = stored_artifacts[0]
+    self.assertEqual(stored_archive["schema_version"], "model_test_archive_v1")
+    self.assertEqual(stored_archive["job_id"], "job-stale")
+    self.assertEqual(stored_archive["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertEqual(len(written_records), 1)
+    persisted_specs = written_records[0][1]
+    self.assertEqual(written_records[0][2], "model_test_archive_prune")
+    self.assertEqual(persisted_specs["job_status"], "FINALIZED")
+    self.assertEqual(persisted_specs["job_cid"], "cid-archive")
+    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "not_implemented")
+    self.assertNotIn("workers", persisted_specs)
 
   def test_scan_finalizer_ignores_finished_model_test_jobs(self):
     from extensions.business.cybersec.red_mesh.services.finalization import maybe_finalize_pass
