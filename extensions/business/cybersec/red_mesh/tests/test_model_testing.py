@@ -646,9 +646,25 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       completed_tests=["case-1"],
       updated_at=124.0,
       live_metrics={"total_cases": 12, "completed_cases": 4},
-      model_test_summary={"overall_status": "running", "cases_total": 12},
-      model_test_results={"overall_status": "running", "cases": []},
+      model_test_summary={
+        "overall_status": "running",
+        "cases_total": 12,
+        "error_message": "raw provider message secret-token",
+      },
+      model_test_results={
+        "overall_status": "running",
+        "provider_url": "https://provider.example/v1",
+        "cases": [
+          {
+            "case_id": "case-1",
+            "raw_prompt": "secret prompt",
+            "raw_response": "secret response",
+          },
+        ],
+      },
+      error="raw worker error secret-token",
       error_class="provider_timeout",
+      error_message="raw worker message secret-token",
     )
 
     payload = WorkerProgress.from_dict(progress.to_dict()).to_dict()
@@ -663,6 +679,14 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(payload["model_test_summary"]["overall_status"], "running")
     self.assertEqual(payload["model_test_results"]["overall_status"], "running")
     self.assertEqual(payload["error_class"], "provider_timeout")
+    payload_text = str(payload)
+    self.assertNotIn("raw worker error", payload_text)
+    self.assertNotIn("raw worker message", payload_text)
+    self.assertNotIn("raw provider message", payload_text)
+    self.assertNotIn("secret prompt", payload_text)
+    self.assertNotIn("secret response", payload_text)
+    self.assertNotIn("secret-token", payload_text)
+    self.assertNotIn("provider.example", payload_text)
 
   def test_model_test_progress_readback_synthesizes_case_progress_without_live_row(self):
     from extensions.business.cybersec.red_mesh.services.query import get_job_progress
@@ -711,6 +735,107 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(worker["ports_total"], 0)
     self.assertEqual(worker["live_metrics"]["total_cases"], 12)
     self.assertEqual(worker["model_test_summary"]["overall_status"], "queued")
+
+  def test_model_test_progress_readback_strips_raw_error_fields_from_live_row(self):
+    from extensions.business.cybersec.red_mesh.services.query import get_job_progress
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "target": "Unit Provider / unit-model",
+      "start_port": 0,
+      "end_port": 0,
+      "date_created": 123.0,
+      "job_config_cid": "cid-config",
+      "model_test_summary": {
+        "overall_status": "running",
+        "cases_total": 12,
+        "cases_completed": 4,
+      },
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "model_test_worker_status": "running",
+          "assignment_revision": 1,
+          "assigned_at": 123.0,
+          "finished": False,
+        },
+      },
+    }
+    live_payload = {
+      "job_id": "job-1",
+      "worker_addr": "node-a",
+      "pass_nr": 1,
+      "assignment_revision_seen": 1,
+      "event_id": "job-1:node-a:1:000003",
+      "progress_sequence": 3,
+      "progress": 50.0,
+      "phase": "model_test_running",
+      "scan_type": "model_test",
+      "job_type": "model_test",
+      "schema_version": "model_test_progress_v1",
+      "phase_index": 3,
+      "total_phases": 5,
+      "ports_scanned": 0,
+      "ports_total": 0,
+      "open_ports_found": [],
+      "completed_tests": ["case-1"],
+      "updated_at": 124.0,
+      "started_at": 123.0,
+      "last_seen_at": 124.0,
+      "error": "raw provider exception secret-token",
+      "error_message": "raw traceback secret-token",
+      "error_class": "not-an-allowlisted-error",
+      "model_test_summary": {
+        "overall_status": "running",
+        "cases_total": 12,
+        "cases_completed": 4,
+        "error_message": "summary leaked secret-token",
+        "error_class": "not-an-allowlisted-error",
+      },
+      "model_test_results": {
+        "overall_status": "running",
+        "provider_url": "https://provider.example/v1",
+        "cases": [
+          {
+            "case_id": "case-1",
+            "status": "running",
+            "raw_prompt": "secret prompt",
+            "raw_response": "secret model output",
+          },
+        ],
+      },
+    }
+    owner = _owner()
+    owner.chainstore_hget = MagicMock()
+    owner.chainstore_hget.side_effect = lambda hkey, key: job_specs if key == "job-1" else None
+    owner.chainstore_hgetall.side_effect = (
+      lambda hkey: {"job-1:node-a": live_payload} if hkey.endswith(":live") else {"job-1": job_specs}
+    )
+
+    response = get_job_progress(owner, "job-1")
+
+    worker = response["workers"]["node-a"]
+    self.assertEqual(worker["worker_state"], "failed")
+    self.assertEqual(worker["error_class"], "unknown_error")
+    self.assertNotIn("error", worker)
+    self.assertNotIn("error_message", worker)
+    self.assertEqual(worker["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(worker["model_test_results"]["cases"][0]["case_id"], "case-1")
+    payload_text = str(worker)
+    self.assertNotIn("raw provider exception", payload_text)
+    self.assertNotIn("raw traceback", payload_text)
+    self.assertNotIn("summary leaked", payload_text)
+    self.assertNotIn("secret prompt", payload_text)
+    self.assertNotIn("secret model output", payload_text)
+    self.assertNotIn("secret-token", payload_text)
+    self.assertNotIn("provider.example", payload_text)
 
   def test_model_test_listing_preserves_summary_and_node_selection(self):
     from extensions.business.cybersec.red_mesh.services.query import list_network_jobs

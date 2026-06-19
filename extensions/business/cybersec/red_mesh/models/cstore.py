@@ -13,6 +13,13 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
+from extensions.business.cybersec.red_mesh.model_test_sanitization import (
+  MODEL_TEST_JOB_TYPE,
+  MODEL_TEST_PROGRESS_SCHEMA,
+  sanitize_model_test_error_class,
+  sanitize_model_test_results,
+  sanitize_model_test_summary,
+)
 
 
 @dataclass(frozen=True)
@@ -299,7 +306,31 @@ class WorkerProgress:
   threads: dict = None              # {thread_id: {phase, ports_scanned, ports_total, open_ports_found}}
 
   def to_dict(self) -> dict:
-    return _strip_none(asdict(self))
+    payload = asdict(self)
+    if self._is_model_test_progress():
+      payload["scan_type"] = MODEL_TEST_JOB_TYPE
+      payload["job_type"] = MODEL_TEST_JOB_TYPE
+      payload["schema_version"] = payload.get("schema_version") or MODEL_TEST_PROGRESS_SCHEMA
+      payload["ports_scanned"] = 0
+      payload["ports_total"] = 0
+      payload["open_ports_found"] = []
+      payload["model_test_results"] = sanitize_model_test_results(payload.get("model_test_results"))
+      payload["model_test_summary"] = sanitize_model_test_summary(payload.get("model_test_summary"))
+      error_class = sanitize_model_test_error_class(payload.get("error_class"))
+      if error_class:
+        payload["error_class"] = error_class
+      else:
+        payload.pop("error_class", None)
+      payload.pop("error", None)
+      payload.pop("error_message", None)
+    return _strip_none(payload)
+
+  def _is_model_test_progress(self) -> bool:
+    return (
+      self.job_type == MODEL_TEST_JOB_TYPE
+      or self.scan_type == MODEL_TEST_JOB_TYPE
+      or self.schema_version == MODEL_TEST_PROGRESS_SCHEMA
+    )
 
   @classmethod
   def from_dict(cls, d: dict) -> WorkerProgress:

@@ -9,114 +9,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 
 from ..models.shared import _strip_none
-from .constants import MODEL_TEST_SAFE_ERROR_CLASSES
+from ..model_test_sanitization import (
+  sanitize_model_test_error_class,
+  sanitize_model_test_results,
+  sanitize_model_test_summary,
+)
 
 
 MODEL_TEST_JOB_CONFIG_SCHEMA = "model_test_job_config_v1"
 MODEL_TEST_ARCHIVE_SCHEMA = "model_test_archive_v1"
 MODEL_TEST_WORKER_RESULT_SCHEMA = "model_test_worker_result_v1"
-
-SAFE_MODEL_TEST_RESULT_KEYS = {
-  "overall_status",
-  "case_id",
-  "id",
-  "category",
-  "status",
-  "verdict",
-  "error_class",
-  "duration_ms",
-  "latency_ms",
-  "attempts",
-  "score",
-}
-
-SAFE_MODEL_TEST_SUMMARY_KEYS = {
-  "overall_status",
-  "total_cases",
-  "cases_total",
-  "completed_cases",
-  "cases_completed",
-  "evaluated_cases",
-  "execution_failed_cases",
-  "evaluation_failed_cases",
-  "passed_cases",
-  "failed_cases",
-  "skipped_cases",
-  "delayed_worker_warning",
-  "delayed_worker_at",
-  "error_class",
-}
-
-
-def _safe_scalar(value):
-  if isinstance(value, bool) or value is None:
-    return value
-  if isinstance(value, (int, float)):
-    return value
-  if isinstance(value, str):
-    return value[:512]
-  return None
-
-
-def _safe_error_class(value):
-  if not isinstance(value, str) or not value:
-    return None
-  return value if value in MODEL_TEST_SAFE_ERROR_CLASSES else "unknown_error"
-
-
-def sanitize_model_test_summary(summary) -> dict:
-  """Return a bounded summary that never contains raw provider/evaluator output."""
-  if not isinstance(summary, dict):
-    return {}
-  sanitized = {}
-  for key in SAFE_MODEL_TEST_SUMMARY_KEYS:
-    if key not in summary:
-      continue
-    if key == "error_class":
-      error_class = _safe_error_class(summary.get(key))
-      if error_class:
-        sanitized[key] = error_class
-      continue
-    value = _safe_scalar(summary.get(key))
-    if value is not None:
-      sanitized[key] = value
-  return sanitized
-
-
-def _sanitize_model_test_case(case) -> dict:
-  if not isinstance(case, dict):
-    return {}
-  sanitized = {}
-  for key in SAFE_MODEL_TEST_RESULT_KEYS:
-    if key not in case:
-      continue
-    if key == "error_class":
-      error_class = _safe_error_class(case.get(key))
-      if error_class:
-        sanitized[key] = error_class
-      continue
-    value = _safe_scalar(case.get(key))
-    if value is not None:
-      sanitized[key] = value
-  return sanitized
-
-
-def sanitize_model_test_results(results) -> dict:
-  """Allowlist model-test result fields safe for CStore, archive, and UI download."""
-  if not isinstance(results, dict):
-    return {}
-  sanitized = {}
-  overall_status = _safe_scalar(results.get("overall_status"))
-  if overall_status is not None:
-    sanitized["overall_status"] = overall_status
-  cases = results.get("cases")
-  if isinstance(cases, list):
-    sanitized["cases"] = [
-      case
-      for case in (_sanitize_model_test_case(entry) for entry in cases)
-      if case
-    ]
-  return sanitized
 
 
 @dataclass(frozen=True)
@@ -178,6 +80,11 @@ class ModelTestWorkerResult:
     payload = asdict(self)
     payload["model_test_results"] = sanitize_model_test_results(payload.get("model_test_results"))
     payload["model_test_summary"] = sanitize_model_test_summary(payload.get("model_test_summary"))
+    error_class = sanitize_model_test_error_class(payload.get("error_class"))
+    if error_class:
+      payload["error_class"] = error_class
+    else:
+      payload.pop("error_class", None)
     payload.pop("error_message", None)
     return _strip_none(payload)
 
@@ -192,7 +99,7 @@ class ModelTestWorkerResult:
       model_test_summary=sanitize_model_test_summary(d.get("model_test_summary") or {}),
       started_at=d.get("started_at"),
       completed_at=d.get("completed_at"),
-      error_class=d.get("error_class"),
+      error_class=sanitize_model_test_error_class(d.get("error_class")),
       error_message=d.get("error_message"),
     )
 
