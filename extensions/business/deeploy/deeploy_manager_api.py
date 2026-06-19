@@ -349,6 +349,17 @@ class DeeployManagerApiPlugin(
       new_owner = transfer["new_owner"]
       active_jobs = self.bc.get_escrow_active_jobs(escrow)
 
+      try:
+        preferred_nodes_result = self.migrate_preferred_nodes_for_csp_owner_transfer(
+          old_owner=old_owner,
+          new_owner=new_owner,
+        )
+      except Exception as exc:
+        preferred_nodes_result = {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.ERROR: str(exc),
+        }
+
       job_results = {}
       for active_job in active_jobs:
         job_id = int(active_job["jobId"])
@@ -369,9 +380,10 @@ class DeeployManagerApiPlugin(
         job_result for job_result in job_results.values()
         if job_result.get(DEEPLOY_KEYS.STATUS) == "failed"
       ]
-      if not failed_jobs:
+      preferred_nodes_failed = preferred_nodes_result.get(DEEPLOY_KEYS.STATUS) == "failed"
+      if not failed_jobs and not preferred_nodes_failed:
         status = DEEPLOY_STATUS.SUCCESS
-      elif len(failed_jobs) == len(job_results):
+      elif preferred_nodes_failed and len(failed_jobs) == len(job_results):
         status = DEEPLOY_STATUS.FAIL
       else:
         status = DEEPLOY_STATUS.PARTIAL_SUCCESS
@@ -379,6 +391,7 @@ class DeeployManagerApiPlugin(
       result = {
         DEEPLOY_KEYS.STATUS: status,
         DEEPLOY_KEYS.TRANSFER: transfer,
+        "preferred_nodes_migration": preferred_nodes_result,
         DEEPLOY_KEYS.RESULTS: job_results,
       }
     except Exception as e:
