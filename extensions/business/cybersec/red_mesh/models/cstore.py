@@ -277,6 +277,8 @@ class WorkerProgress:
   open_ports_found: list            # [int] — discovered so far
   completed_tests: list             # [str] — which probes finished
   updated_at: float                 # unix timestamp
+  event_id: str = None
+  progress_sequence: int = 0
   started_at: float = None
   first_seen_live_at: float = None
   last_seen_at: float = None
@@ -306,6 +308,8 @@ class WorkerProgress:
       worker_addr=d["worker_addr"],
       pass_nr=d.get("pass_nr", 1),
       assignment_revision_seen=d.get("assignment_revision_seen", 1),
+      event_id=d.get("event_id"),
+      progress_sequence=d.get("progress_sequence", 0),
       progress=d.get("progress", 0),
       phase=d.get("phase", ""),
       started_at=d.get("started_at"),

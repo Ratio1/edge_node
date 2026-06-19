@@ -125,12 +125,69 @@ class JobStateRepository:
     self.owner.chainstore_hset(hkey=self._live_hkey, key=key, value=value)
     return value
 
+  @staticmethod
+  def _safe_int(value, default=0):
+    try:
+      return int(value)
+    except (TypeError, ValueError):
+      return default
+
+  @staticmethod
+  def _uses_ordered_progress(payload):
+    if not isinstance(payload, dict):
+      return False
+    return (
+      payload.get("job_type") == "model_test"
+      or payload.get("scan_type") == "model_test"
+      or payload.get("schema_version") == "model_test_progress_v1"
+      or "progress_sequence" in payload
+    )
+
+  @staticmethod
+  def _is_terminal_progress(payload):
+    if not isinstance(payload, dict):
+      return False
+    phase = str(payload.get("phase") or "").lower()
+    return bool(payload.get("finished")) or phase in {"done", "failed", "canceled"}
+
+  def _should_accept_live_progress(self, key, payload):
+    existing = self.get_live_progress(key)
+    if not isinstance(existing, dict):
+      return True, existing
+    if not (
+      self._uses_ordered_progress(existing)
+      or self._uses_ordered_progress(payload)
+    ):
+      return True, existing
+
+    existing_revision = self._safe_int(existing.get("assignment_revision_seen"), 1)
+    incoming_revision = self._safe_int(payload.get("assignment_revision_seen"), 1)
+    if incoming_revision < existing_revision:
+      return False, existing
+    if incoming_revision > existing_revision:
+      return True, existing
+
+    existing_sequence = self._safe_int(existing.get("progress_sequence"), 0)
+    incoming_sequence = self._safe_int(payload.get("progress_sequence"), 0)
+    if existing_sequence and not incoming_sequence:
+      return False, existing
+    if incoming_sequence and existing_sequence and incoming_sequence <= existing_sequence:
+      return False, existing
+
+    if self._is_terminal_progress(existing) and not self._is_terminal_progress(payload):
+      return False, existing
+
+    return True, existing
+
   def put_live_progress_model(self, progress):
     if isinstance(progress, WorkerProgress):
       payload = progress.to_dict()
     else:
       payload = WorkerProgress.from_dict(progress).to_dict()
     key = f"{payload['job_id']}:{payload['worker_addr']}"
+    accepted, existing = self._should_accept_live_progress(key, payload)
+    if not accepted:
+      return existing
     return self.put_live_progress(key, payload)
 
   def delete_live_progress(self, key):

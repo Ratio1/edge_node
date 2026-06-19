@@ -8,6 +8,7 @@ from ..models import CStoreJobRunning
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..services.config import get_model_testing_config
 from .artifacts import MODEL_TEST_JOB_CONFIG_SCHEMA
+from .constants import MODEL_TEST_JOB_TYPE
 from .node_selection import select_model_test_execution_node
 from .security import (
   validate_provider_config_shape,
@@ -17,8 +18,6 @@ from .security import (
 
 
 TEST_SET_ID = "cbrn_safety_v1"
-MODEL_TEST_JOB_TYPE = "model_test"
-
 
 def _validation_error(message: str, *, error_class=None):
   result = {"error": "validation_error", "message": message}

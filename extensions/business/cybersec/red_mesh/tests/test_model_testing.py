@@ -11,6 +11,10 @@ from extensions.business.cybersec.red_mesh.model_testing import (
   validate_model_provider_credentials,
   validate_provider_url,
 )
+from extensions.business.cybersec.red_mesh.model_testing.constants import (
+  MODEL_TEST_ERROR_CANCELED_BY_USER,
+  MODEL_TEST_ERROR_WORKER_LOST,
+)
 from extensions.business.cybersec.red_mesh.model_testing.worker import ModelTestWorker
 from extensions.business.cybersec.red_mesh.models import (
   CStoreJobFinalized,
@@ -536,6 +540,8 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       worker_addr="node-a",
       pass_nr=1,
       assignment_revision_seen=1,
+      event_id="job-1:node-a:1:000007",
+      progress_sequence=7,
       progress=50.0,
       phase="model_test_running",
       scan_type="model_test",
@@ -557,6 +563,8 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     payload = WorkerProgress.from_dict(progress.to_dict()).to_dict()
 
     self.assertEqual(payload["schema_version"], "model_test_progress_v1")
+    self.assertEqual(payload["event_id"], "job-1:node-a:1:000007")
+    self.assertEqual(payload["progress_sequence"], 7)
     self.assertEqual(payload["job_type"], "model_test")
     self.assertEqual(payload["scan_type"], "model_test")
     self.assertEqual(payload["phase"], "model_test_running")
@@ -825,6 +833,8 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(plugin.chainstore_hset.call_args.kwargs["hkey"], "instance:live")
     self.assertEqual(plugin.chainstore_hset.call_args.kwargs["key"], "job-1:node-a")
     self.assertEqual(payload["schema_version"], "model_test_progress_v1")
+    self.assertEqual(payload["event_id"], "job-1:node-a:1:000001")
+    self.assertEqual(payload["progress_sequence"], 1)
     self.assertEqual(payload["job_type"], "model_test")
     self.assertEqual(payload["phase"], "model_test_running")
     self.assertEqual(payload["phase_index"], 3)
@@ -833,6 +843,162 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(payload["live_metrics"]["total_cases"], 12)
     self.assertEqual(payload["model_test_summary"]["overall_status"], "running")
     self.assertEqual(payload["model_test_results"]["overall_status"], "running")
+
+  def test_publish_model_test_progress_rejects_non_selected_peer(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "node-b"
+    plugin.cfg_instance_id = "instance"
+    plugin.time.return_value = 130.0
+    plugin.chainstore_hset = MagicMock()
+    worker = MagicMock()
+    worker.state = {"phase": "model_test_running", "progress": 40.0}
+    job_specs = {
+      "job_id": "job-1",
+      "job_pass": 1,
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "assignment_revision": 1,
+          "assigned_at": 123.0,
+        },
+      },
+    }
+
+    result = PentesterApi01Plugin._publish_model_test_progress(plugin, "job-1", worker, job_specs)
+
+    self.assertIsNone(result)
+    plugin.chainstore_hset.assert_not_called()
+
+  def test_model_test_worker_stop_reports_canceled_error_class(self):
+    worker = ModelTestWorker(
+      owner=MagicMock(),
+      job_id="job-1",
+      initiator="launcher-node",
+      job_config={"limits": {"max_cases": 12}},
+    )
+
+    worker.stop()
+    status = worker.get_status()
+
+    self.assertTrue(status["canceled"])
+    self.assertEqual(status["error_class"], MODEL_TEST_ERROR_CANCELED_BY_USER)
+    self.assertEqual(status["model_test_summary"]["overall_status"], "canceled")
+
+  def test_stop_monitoring_marks_selected_model_test_worker_cancel_requested(self):
+    from extensions.business.cybersec.red_mesh.services.control import stop_monitoring
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "date_created": 100.0,
+      "model_test_summary": {"overall_status": "running"},
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "assignment_revision": 1,
+          "finished": False,
+        },
+      },
+    }
+    owner = _owner(ee_addr="launcher-node", chainstore_hget=MagicMock(return_value=job_specs))
+    owner.scan_jobs = {}
+    owner.model_test_jobs = {}
+    owner.chainstore_hget.return_value = job_specs
+    owner._normalize_job_record = MagicMock(side_effect=lambda key, specs: (key, specs))
+    owner._emit_timeline_event = MagicMock()
+    owner.P = MagicMock()
+
+    result = stop_monitoring(owner, "job-1", stop_type="HARD")
+
+    self.assertEqual(result["job_status"], "SCHEDULED_FOR_STOP")
+    self.assertEqual(set(job_specs["workers"]), {"node-a"})
+    worker_entry = job_specs["workers"]["node-a"]
+    self.assertTrue(worker_entry["cancel_requested"])
+    self.assertEqual(worker_entry["error_class"], MODEL_TEST_ERROR_CANCELED_BY_USER)
+    self.assertEqual(job_specs["model_test_summary"]["overall_status"], "cancel_requested")
+    self.assertNotIn("launcher-node", job_specs["workers"])
+
+  def test_maybe_stop_canceled_jobs_stops_active_model_test_worker(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "SCHEDULED_FOR_STOP",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "launcher": "launcher-node",
+      "model_test_summary": {"overall_status": "running"},
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "assignment_revision": 1,
+          "assigned_at": 123.0,
+          "finished": False,
+          "cancel_requested": True,
+        },
+      },
+    }
+    plugin = MagicMock()
+    plugin.ee_addr = "node-a"
+    plugin.cfg_instance_id = "instance"
+    plugin.scan_jobs = {}
+    plugin.time.return_value = 130.0
+    plugin.chainstore_hget.side_effect = (
+      lambda hkey, key: job_specs if hkey == "instance" and key == "job-1" else None
+    )
+    plugin.chainstore_hset = MagicMock()
+    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._write_job_record.side_effect = lambda job_id, specs, context="": specs
+    plugin._publish_model_test_progress.side_effect = (
+      lambda job_id, worker_arg, specs, **kwargs: PentesterApi01Plugin._publish_model_test_progress(
+        plugin,
+        job_id,
+        worker_arg,
+        specs,
+        **kwargs,
+      )
+    )
+    worker = MagicMock()
+    worker.thread.is_alive.return_value = True
+    worker.stop_event.is_set.return_value = False
+    worker.state = {
+      "phase": "model_test_running",
+      "progress": 40.0,
+      "model_test_summary": {"overall_status": "running"},
+      "model_test_results": {"overall_status": "running", "cases": []},
+    }
+
+    def stop_worker():
+      worker.state["canceled"] = True
+      worker.state["phase"] = "canceled"
+      worker.state["error_class"] = MODEL_TEST_ERROR_CANCELED_BY_USER
+
+    worker.stop.side_effect = stop_worker
+    plugin.model_test_jobs = {"job-1": worker}
+
+    PentesterApi01Plugin._maybe_stop_canceled_jobs(plugin)
+
+    worker.stop.assert_called_once()
+    self.assertTrue(job_specs["workers"]["node-a"]["cancel_requested"])
+    self.assertEqual(job_specs["workers"]["node-a"]["model_test_worker_status"], "cancel_requested")
+    self.assertEqual(job_specs["model_test_summary"]["overall_status"], "cancel_requested")
+    payload = plugin.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(payload["phase"], "canceled")
+    self.assertEqual(payload["error_class"], MODEL_TEST_ERROR_CANCELED_BY_USER)
 
   def test_close_model_test_worker_writes_result_and_removes_tracking(self):
     mock_plugin_modules()
@@ -1106,6 +1272,228 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
     self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "not_implemented")
     self.assertNotIn("workers", persisted_specs)
+
+  def test_stale_model_test_worker_fails_with_sanitized_worker_lost(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    job_specs = {
+      "job_id": "job-stale",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "target": "Unit Provider / unit-model",
+      "target_url": "",
+      "task_name": "CBRN smoke",
+      "start_port": 0,
+      "end_port": 0,
+      "date_created": 100.0,
+      "job_config_cid": "cid-config",
+      "model_test_summary": {"overall_status": "running"},
+      "model_test_node_selection": {
+        "selection_mode": "manual",
+        "selected_execution_node": "node-a",
+      },
+      "timeline": [],
+      "pass_reports": [],
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "assignment_revision": 1,
+          "assigned_at": 100.0,
+          "finished": False,
+        },
+      },
+    }
+    model_test_config = {
+      "schema_version": "model_test_job_config_v1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_id": "job-stale",
+      "task_name": "CBRN smoke",
+      "task_description": "Run reviewed CBRN safety pack",
+      "created_by_name": "tester",
+      "created_by_id": "user-123",
+      "test_set_id": "cbrn_safety_v1",
+      "tested_model": {"provider_label": "Unit Provider"},
+      "evaluator_model": {"provider_label": "Evaluator Provider"},
+      "limits": {
+        "max_cases": 12,
+        "per_call_timeout_seconds": 45,
+        "total_timeout_seconds": 600,
+      },
+      "raw_evidence": {"requested": False},
+      "selected_peers": ["node-a"],
+      "model_test_node_selection": {
+        "selection_mode": "manual",
+        "selected_execution_node": "node-a",
+      },
+    }
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.cfg_instance_id = "instance"
+    plugin.cfg_check_jobs_each = 10
+    plugin.cfg_model_testing = {"ENABLED": True}
+    plugin.time.return_value = 200.0
+    plugin._get_artifact_repository.return_value.get_job_config.return_value = model_test_config
+    plugin.chainstore_hgetall.side_effect = (
+      lambda hkey: {} if hkey.endswith(":live") else {"job-stale": job_specs}
+    )
+    plugin.chainstore_hget.side_effect = (
+      lambda hkey, key: None if hkey.endswith(":live") else job_specs
+    )
+    plugin.chainstore_hset = MagicMock()
+    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    plugin._emit_timeline_event.side_effect = (
+      lambda specs, event_type, message, actor_type="system", meta=None: specs.setdefault("timeline", []).append({
+        "event_type": event_type,
+        "message": message,
+        "meta": meta or {},
+      })
+    )
+    written_records = []
+    stored_artifacts = []
+
+    def write_record(job_id, specs, context=""):
+      written_records.append((job_id, deepcopy(specs), context))
+      return specs
+
+    def add_json(payload, show_logs=False):
+      stored_artifacts.append(deepcopy(payload))
+      return "cid-result" if len(stored_artifacts) == 1 else "cid-archive"
+
+    def get_json(cid):
+      if cid == "cid-config":
+        return model_test_config
+      if cid == "cid-archive" and len(stored_artifacts) > 1:
+        return stored_artifacts[1]
+      return None
+
+    plugin._write_job_record.side_effect = write_record
+    plugin.r1fs.add_json.side_effect = add_json
+    plugin.r1fs.get_json.side_effect = get_json
+    plugin.cfg_archive_verify_retries = 1
+
+    failed = PentesterApi01Plugin._maybe_fail_stale_model_test_jobs(plugin)
+
+    self.assertEqual(failed, ["job-stale"])
+    self.assertEqual(stored_artifacts[0]["schema_version"], "model_test_worker_result_v1")
+    self.assertEqual(stored_artifacts[0]["status"], "failed")
+    self.assertEqual(stored_artifacts[0]["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
+    self.assertEqual(stored_artifacts[0]["model_test_summary"]["overall_status"], "failed")
+    self.assertEqual(stored_artifacts[1]["schema_version"], "model_test_archive_v1")
+    persisted_specs = written_records[-1][1]
+    self.assertEqual(persisted_specs["job_status"], "STOPPED")
+    self.assertEqual(persisted_specs["model_test_summary"]["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
+    self.assertEqual(persisted_specs["job_cid"], "cid-archive")
+    progress_payload = plugin.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(progress_payload["phase"], "failed")
+    self.assertEqual(progress_payload["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
+
+  def test_canceled_model_test_before_worker_start_finalizes_canceled(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    job_specs = {
+      "job_id": "job-cancel",
+      "job_status": "SCHEDULED_FOR_STOP",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "target": "Unit Provider / unit-model",
+      "target_url": "",
+      "task_name": "CBRN smoke",
+      "start_port": 0,
+      "end_port": 0,
+      "date_created": 100.0,
+      "job_config_cid": "cid-config",
+      "model_test_summary": {"overall_status": "cancel_requested"},
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "timeline": [],
+      "pass_reports": [],
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "assignment_revision": 1,
+          "assigned_at": 100.0,
+          "finished": False,
+          "cancel_requested": True,
+        },
+      },
+    }
+    model_test_config = {
+      "schema_version": "model_test_job_config_v1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_id": "job-cancel",
+      "task_name": "CBRN smoke",
+      "task_description": "Run reviewed CBRN safety pack",
+      "created_by_name": "tester",
+      "created_by_id": "user-123",
+      "test_set_id": "cbrn_safety_v1",
+      "tested_model": {"provider_label": "Unit Provider"},
+      "evaluator_model": {"provider_label": "Evaluator Provider"},
+      "limits": {"max_cases": 12},
+      "raw_evidence": {"requested": False},
+      "selected_peers": ["node-a"],
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+    }
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.cfg_instance_id = "instance"
+    plugin.cfg_check_jobs_each = 10
+    plugin.cfg_model_testing = {"ENABLED": True}
+    plugin.time.return_value = 110.0
+    plugin._get_artifact_repository.return_value.get_job_config.return_value = model_test_config
+    plugin.chainstore_hgetall.side_effect = (
+      lambda hkey: {} if hkey.endswith(":live") else {"job-cancel": job_specs}
+    )
+    plugin.chainstore_hget.side_effect = (
+      lambda hkey, key: None if hkey.endswith(":live") else job_specs
+    )
+    plugin.chainstore_hset = MagicMock()
+    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+    written_records = []
+    stored_artifacts = []
+
+    def write_record(job_id, specs, context=""):
+      written_records.append((job_id, deepcopy(specs), context))
+      return specs
+
+    def add_json(payload, show_logs=False):
+      stored_artifacts.append(deepcopy(payload))
+      return "cid-result" if len(stored_artifacts) == 1 else "cid-archive"
+
+    def get_json(cid):
+      if cid == "cid-config":
+        return model_test_config
+      if cid == "cid-archive" and len(stored_artifacts) > 1:
+        return stored_artifacts[1]
+      return None
+
+    plugin._write_job_record.side_effect = write_record
+    plugin.r1fs.add_json.side_effect = add_json
+    plugin.r1fs.get_json.side_effect = get_json
+    plugin.cfg_archive_verify_retries = 1
+
+    failed = PentesterApi01Plugin._maybe_fail_stale_model_test_jobs(plugin)
+
+    self.assertEqual(failed, [])
+    self.assertEqual(stored_artifacts[0]["status"], "canceled")
+    self.assertEqual(stored_artifacts[0]["error_class"], MODEL_TEST_ERROR_CANCELED_BY_USER)
+    persisted_specs = written_records[-1][1]
+    self.assertEqual(persisted_specs["job_status"], "STOPPED")
+    self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "canceled")
+    progress_payload = plugin.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(progress_payload["phase"], "canceled")
+    self.assertTrue(progress_payload["canceled"])
 
   def test_scan_finalizer_ignores_finished_model_test_jobs(self):
     from extensions.business.cybersec.red_mesh.services.finalization import maybe_finalize_pass

@@ -10,6 +10,8 @@ from __future__ import annotations
 import threading
 import uuid
 
+from .constants import MODEL_TEST_ERROR_CANCELED_BY_USER, MODEL_TEST_PHASE_CANCELED
+
 
 class ModelTestWorker:
   """Lifecycle-compatible worker tracked under ``owner.model_test_jobs``."""
@@ -46,6 +48,15 @@ class ModelTestWorker:
     if self.stop_event:
       self.stop_event.set()
     self.state["canceled"] = True
+    self.state["phase"] = MODEL_TEST_PHASE_CANCELED
+    self.state["progress"] = 100.0
+    self.state["error_class"] = MODEL_TEST_ERROR_CANCELED_BY_USER
+    self.state["error_message"] = "Model test cancellation requested"
+    self.state["model_test_summary"] = {
+      **dict(self.state.get("model_test_summary") or {}),
+      "overall_status": "canceled",
+      "error_class": MODEL_TEST_ERROR_CANCELED_BY_USER,
+    }
 
   def execute_job(self):
     self.state["phase"] = "model_test_running"
@@ -81,7 +92,10 @@ class ModelTestWorker:
       "completed_tests": list(self.state.get("completed_tests") or []),
       "model_test_results": dict(self.state.get("model_test_results") or {}),
       "model_test_summary": dict(self.state.get("model_test_summary") or {}),
+      "live_metrics": dict(self.state.get("live_metrics") or {}),
       "error": self.state.get("error"),
+      "error_class": self.state.get("error_class"),
+      "error_message": self.state.get("error_message"),
     }
     if not for_aggregations:
       result["local_worker_id"] = self.local_worker_id
