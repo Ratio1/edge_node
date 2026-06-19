@@ -121,10 +121,23 @@ def _sanitize_model_test_job_specs(job_specs: dict) -> dict:
   if not _is_model_test_specs(job_specs):
     return job_specs
   sanitized = dict(job_specs)
+  had_raw_error = bool(sanitized.get("error") or sanitized.get("error_message"))
   summary = sanitize_model_test_summary(sanitized.get("model_test_summary"))
   sanitized["model_test_summary"] = summary
   if "model_test_results" in sanitized:
     sanitized["model_test_results"] = sanitize_model_test_results(sanitized.get("model_test_results"))
+  error_class = sanitize_model_test_error_class(
+    sanitized.get("error_class")
+    or summary.get("error_class")
+  )
+  if error_class:
+    sanitized["error_class"] = error_class
+  elif had_raw_error:
+    sanitized["error_class"] = "unknown_error"
+  else:
+    sanitized.pop("error_class", None)
+  sanitized.pop("error", None)
+  sanitized.pop("error_message", None)
   for workers_key in ("workers", "workers_reconciled"):
     workers = sanitized.get(workers_key)
     if isinstance(workers, dict):
@@ -184,6 +197,8 @@ def get_job_data(owner, job_id: str):
       "message": "Job not found in network store.",
     }
 
+  job_specs = _sanitize_model_test_job_specs(job_specs)
+
   if job_specs.get("job_cid"):
     return {
       "job_id": job_id,
@@ -209,8 +224,6 @@ def get_job_data(owner, job_id: str):
       live_payloads=_job_repo(owner).list_live_progress() or {},
       now=now,
     )
-
-  job_specs = _sanitize_model_test_job_specs(job_specs)
 
   return {
     "job_id": job_id,
@@ -442,7 +455,7 @@ def list_network_jobs(owner):
     normalized_key, normalized_spec = owner._normalize_job_record(job_key, job_spec)
     if normalized_key and normalized_spec:
       if normalized_spec.get("job_cid"):
-        normalized_jobs[normalized_key] = normalized_spec
+        normalized_jobs[normalized_key] = _sanitize_model_test_job_specs(normalized_spec)
         continue
 
       normalized_jobs[normalized_key] = {
