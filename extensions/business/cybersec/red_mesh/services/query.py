@@ -1,4 +1,10 @@
 from ..models import JobArchive, render_legacy_llm_fields
+from ..model_test_sanitization import (
+  MODEL_TEST_JOB_TYPE,
+  sanitize_model_test_error_class,
+  sanitize_model_test_results,
+  sanitize_model_test_summary,
+)
 from ..repositories import ArtifactRepository, JobStateRepository
 from .reconciliation import reconcile_job_workers
 from .triage import get_job_archive_with_triage
@@ -80,16 +86,72 @@ def _model_test_live_metrics(summary: dict) -> dict:
   return metrics
 
 
+def _is_model_test_specs(job_specs: dict) -> bool:
+  return isinstance(job_specs, dict) and (
+    job_specs.get("job_type") == MODEL_TEST_JOB_TYPE
+    or job_specs.get("scan_type") == MODEL_TEST_JOB_TYPE
+  )
+
+
+def _sanitize_model_test_worker_payload(payload: dict, fallback_summary: dict) -> dict:
+  sanitized = dict(payload or {})
+  had_raw_error = bool(sanitized.get("error") or sanitized.get("error_message"))
+  summary = sanitize_model_test_summary(sanitized.get("model_test_summary") or fallback_summary)
+  sanitized["model_test_summary"] = summary
+  if "model_test_results" in sanitized:
+    sanitized["model_test_results"] = sanitize_model_test_results(sanitized.get("model_test_results"))
+  error_class = sanitize_model_test_error_class(
+    sanitized.get("error_class")
+    or summary.get("error_class")
+  )
+  if error_class:
+    sanitized["error_class"] = error_class
+  elif had_raw_error:
+    sanitized["error_class"] = "unknown_error"
+  else:
+    sanitized.pop("error_class", None)
+  sanitized.pop("error", None)
+  sanitized.pop("error_message", None)
+  sanitized["scan_type"] = MODEL_TEST_JOB_TYPE
+  sanitized["job_type"] = MODEL_TEST_JOB_TYPE
+  return sanitized
+
+
+def _sanitize_model_test_job_specs(job_specs: dict) -> dict:
+  if not _is_model_test_specs(job_specs):
+    return job_specs
+  sanitized = dict(job_specs)
+  summary = sanitize_model_test_summary(sanitized.get("model_test_summary"))
+  sanitized["model_test_summary"] = summary
+  if "model_test_results" in sanitized:
+    sanitized["model_test_results"] = sanitize_model_test_results(sanitized.get("model_test_results"))
+  for workers_key in ("workers", "workers_reconciled"):
+    workers = sanitized.get(workers_key)
+    if isinstance(workers, dict):
+      sanitized[workers_key] = {
+        worker_addr: _sanitize_model_test_worker_payload(worker_entry, summary)
+        if isinstance(worker_entry, dict) and (
+          worker_entry.get("worker_type") == MODEL_TEST_JOB_TYPE
+          or worker_entry.get("model_test_worker_status")
+          or worker_entry.get("scan_type") == MODEL_TEST_JOB_TYPE
+          or worker_entry.get("job_type") == MODEL_TEST_JOB_TYPE
+        )
+        else worker_entry
+        for worker_addr, worker_entry in workers.items()
+      }
+  return sanitized
+
+
 def _augment_model_test_progress(job_specs: dict, workers: dict) -> dict:
-  summary = dict(job_specs.get("model_test_summary") or {})
+  summary = sanitize_model_test_summary(job_specs.get("model_test_summary") or {})
   for worker_addr, payload in list((workers or {}).items()):
     if not isinstance(payload, dict):
       continue
-    enriched = dict(payload)
+    enriched = _sanitize_model_test_worker_payload(payload, summary)
     enriched.setdefault("job_id", job_specs.get("job_id"))
     enriched.setdefault("worker_addr", worker_addr)
-    enriched.setdefault("job_type", "model_test")
-    enriched.setdefault("scan_type", "model_test")
+    enriched.setdefault("job_type", MODEL_TEST_JOB_TYPE)
+    enriched.setdefault("scan_type", MODEL_TEST_JOB_TYPE)
     enriched.setdefault("pass_nr", job_specs.get("job_pass", 1))
     enriched.setdefault("progress", 0)
     enriched.setdefault("phase", "model_test_node_selected")
@@ -99,8 +161,10 @@ def _augment_model_test_progress(job_specs: dict, workers: dict) -> dict:
     enriched.setdefault("ports_total", 0)
     enriched.setdefault("open_ports_found", [])
     enriched.setdefault("completed_tests", [])
-    enriched.setdefault("model_test_summary", summary)
-    enriched.setdefault("live_metrics", _model_test_live_metrics(summary))
+    enriched["model_test_summary"] = sanitize_model_test_summary(
+      enriched.get("model_test_summary") or summary
+    )
+    enriched.setdefault("live_metrics", _model_test_live_metrics(enriched["model_test_summary"]))
     workers[worker_addr] = enriched
   return workers
 
@@ -145,6 +209,8 @@ def get_job_data(owner, job_id: str):
       live_payloads=_job_repo(owner).list_live_progress() or {},
       now=now,
     )
+
+  job_specs = _sanitize_model_test_job_specs(job_specs)
 
   return {
     "job_id": job_id,
@@ -342,10 +408,12 @@ def get_job_progress(owner, job_id: str):
   scan_type = None
   result = {}
   if isinstance(job_specs, dict):
+    is_model_test = _is_model_test_specs(job_specs)
     status = job_specs.get("job_status")
     scan_type = job_specs.get("scan_type")
     result = reconcile_job_workers(owner, job_specs, live_payloads=all_progress)
-    if job_specs.get("job_type") == "model_test" or scan_type == "model_test":
+    if is_model_test:
+      job_specs = _sanitize_model_test_job_specs(job_specs)
       result = _augment_model_test_progress(job_specs, result)
   else:
     prefix = f"{job_id}:"
@@ -354,11 +422,11 @@ def get_job_progress(owner, job_id: str):
         worker_addr = key[len(prefix):]
         result[worker_addr] = value
   response = {"job_id": job_id, "status": status, "scan_type": scan_type, "workers": result}
-  if isinstance(job_specs, dict) and (job_specs.get("job_type") == "model_test" or scan_type == "model_test"):
+  if isinstance(job_specs, dict) and _is_model_test_specs(job_specs):
     response.update({
-      "job_type": "model_test",
-      "task_kind": "model_test",
-      "model_test_summary": job_specs.get("model_test_summary"),
+      "job_type": MODEL_TEST_JOB_TYPE,
+      "task_kind": MODEL_TEST_JOB_TYPE,
+      "model_test_summary": sanitize_model_test_summary(job_specs.get("model_test_summary")),
       "model_test_node_selection": job_specs.get("model_test_node_selection"),
     })
   return response
@@ -395,7 +463,9 @@ def list_network_jobs(owner):
         "worker_count": len(normalized_spec.get("workers", {}) or {}),
         "pass_count": len(normalized_spec.get("pass_reports", []) or []),
         "job_pass": normalized_spec.get("job_pass", 1),
-        "model_test_summary": normalized_spec.get("model_test_summary"),
+        "model_test_summary": sanitize_model_test_summary(normalized_spec.get("model_test_summary"))
+        if _is_model_test_specs(normalized_spec)
+        else normalized_spec.get("model_test_summary"),
         "model_test_node_selection": normalized_spec.get("model_test_node_selection"),
       }
   return normalized_jobs

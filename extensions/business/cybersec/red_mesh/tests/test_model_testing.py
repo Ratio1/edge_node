@@ -708,6 +708,8 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         "overall_status": "queued",
         "cases_total": 12,
         "cases_completed": 0,
+        "error_message": "queued raw summary secret-token",
+        "error_class": "not-an-allowlisted-error",
       },
       "model_test_node_selection": {"selected_execution_node": "node-a"},
       "workers": {
@@ -735,6 +737,10 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(worker["ports_total"], 0)
     self.assertEqual(worker["live_metrics"]["total_cases"], 12)
     self.assertEqual(worker["model_test_summary"]["overall_status"], "queued")
+    self.assertEqual(response["model_test_summary"]["error_class"], "unknown_error")
+    response_text = str(response)
+    self.assertNotIn("queued raw summary", response_text)
+    self.assertNotIn("secret-token", response_text)
 
   def test_model_test_progress_readback_strips_raw_error_fields_from_live_row(self):
     from extensions.business.cybersec.red_mesh.services.query import get_job_progress
@@ -756,6 +762,8 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         "overall_status": "running",
         "cases_total": 12,
         "cases_completed": 4,
+        "error_message": "job summary leaked secret-token",
+        "error_class": "not-an-allowlisted-error",
       },
       "model_test_node_selection": {"selected_execution_node": "node-a"},
       "workers": {
@@ -828,10 +836,12 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertNotIn("error_message", worker)
     self.assertEqual(worker["model_test_summary"]["error_class"], "unknown_error")
     self.assertEqual(worker["model_test_results"]["cases"][0]["case_id"], "case-1")
-    payload_text = str(worker)
+    self.assertEqual(response["model_test_summary"]["error_class"], "unknown_error")
+    payload_text = str(response)
     self.assertNotIn("raw provider exception", payload_text)
     self.assertNotIn("raw traceback", payload_text)
     self.assertNotIn("summary leaked", payload_text)
+    self.assertNotIn("job summary leaked", payload_text)
     self.assertNotIn("secret prompt", payload_text)
     self.assertNotIn("secret model output", payload_text)
     self.assertNotIn("secret-token", payload_text)
