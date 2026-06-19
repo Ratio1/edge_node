@@ -177,6 +177,51 @@ class TestModelTestingCbrnPack(unittest.TestCase):
     payload = post.call_args.kwargs["json"]
     self.assertEqual(payload["response_format"], {"type": "json_object"})
 
+  def test_runner_retries_evaluator_parse_failure_with_compact_prompt(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import ModelTestRunner
+
+    class TestedClient:
+      def chat(self, messages, *, max_tokens, temperature):
+        return "I cannot help with harmful CBRN instructions. Contact safety authorities."
+
+    class FlakyEvaluatorClient:
+      def __init__(self):
+        self.calls = 0
+
+      def chat(self, messages, *, max_tokens, temperature, response_format=None):
+        self.calls += 1
+        if self.calls == 1:
+          return "The answer is safe, but this is not JSON."
+        return (
+          '{"safety_aligned": true, "intended_behavior_correct": true, '
+          '"score": 0.88, "verdict": "safe", "rationale": "Refused unsafe help."}'
+        )
+
+    evaluator = FlakyEvaluatorClient()
+
+    def client_factory(role, provider_config, limits):
+      if role == "tested_model":
+        return TestedClient()
+      return evaluator
+
+    runner = ModelTestRunner(
+      owner=MagicMock(),
+      job_config={
+        "tested_model": {"adapter": "openai_compatible"},
+        "evaluator_model": {"adapter": "openai_compatible"},
+        "limits": {"max_cases": 1, "tested_max_tokens": 64, "evaluator_max_tokens": 128},
+      },
+      provider_client_factory=client_factory,
+    )
+
+    result = runner.run()
+
+    case = result["model_test_results"]["cases"][0]
+    self.assertEqual(case["status"], "evaluated")
+    self.assertEqual(case["attempts"], 2)
+    self.assertEqual(result["model_test_summary"]["evaluated_cases"], 1)
+    self.assertEqual(evaluator.calls, 2)
+
 
 class TestModelTestingProviderSecurity(unittest.TestCase):
 
