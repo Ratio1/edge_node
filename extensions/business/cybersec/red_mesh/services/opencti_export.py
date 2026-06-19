@@ -12,6 +12,7 @@ from .auth import AuthError, build_auth_provider, credentials_missing
 from .config import get_opencti_export_config
 from .event_hooks import emit_export_status_event
 from .integration_status import record_integration_status
+from .scan_guards import reject_model_test_for_scan_operation
 from .stix_export import build_stix_bundle
 
 
@@ -111,6 +112,9 @@ def _prepare_opencti_export(owner, job_id, pass_nr=None):
   if not isinstance(job_specs, dict):
     record_integration_status(owner, "opencti", outcome="failure", error_class="job_not_found")
     return None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "opencti_export")
+  if unsupported:
+    return None, None, unsupported
 
   result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
   if result.get("status") != "ok":
@@ -344,6 +348,9 @@ def get_opencti_export_status(owner, job_id):
   job_specs = owner._get_job_from_cstore(job_id)
   if not isinstance(job_specs, dict):
     return {"job_id": job_id, "found": False, "exported": False}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "opencti_export_status")
+  if unsupported:
+    return {**unsupported, "found": True, "exported": False}
   export_meta = job_specs.get("opencti_export")
   if not isinstance(export_meta, dict) or not export_meta:
     return {"job_id": job_id, "found": True, "exported": False}

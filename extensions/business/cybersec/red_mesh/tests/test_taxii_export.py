@@ -159,6 +159,24 @@ class TestTaxiiExport(unittest.TestCase):
 
     self.assertEqual(result["status"], "disabled")
     owner.r1fs.add_json.assert_not_called()
+
+  def test_model_test_job_rejected_before_taxii_bundle_build(self):
+    owner = _owner(job_specs={
+      "job_id": "job-1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_cid": "model-archive",
+    })
+
+    dry_run = dry_run_taxii_export(owner, "job-1")
+    published = publish_to_taxii(owner, "job-1")
+    status = get_taxii_export_status(owner, "job-1")
+
+    self.assertEqual(dry_run["error"], "unsupported_job_type")
+    self.assertEqual(published["error"], "unsupported_job_type")
+    self.assertEqual(status["error"], "unsupported_job_type")
+    self.assertFalse(status["exported"])
+    owner.r1fs.add_json.assert_not_called()
     self.assertNotIn("taxii_export", owner.job_specs)
 
   def test_missing_collection_updates_taxii_status_only(self):
