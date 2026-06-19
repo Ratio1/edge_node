@@ -16,6 +16,7 @@ from extensions.business.cybersec.red_mesh.models import (
   CStoreJobFinalized,
   CStoreJobRunning,
   CStoreWorker,
+  WorkerProgress,
 )
 from extensions.business.cybersec.red_mesh.repositories import ArtifactRepository
 from extensions.business.cybersec.red_mesh.tests.conftest import mock_plugin_modules
@@ -529,6 +530,128 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(round_tripped["workers"]["node-a"]["worker_type"], "model_test")
     self.assertEqual(round_tripped["workers"]["node-a"]["model_test_worker_status"], "queued")
 
+  def test_worker_progress_preserves_model_test_fields(self):
+    progress = WorkerProgress(
+      job_id="job-1",
+      worker_addr="node-a",
+      pass_nr=1,
+      assignment_revision_seen=1,
+      progress=50.0,
+      phase="model_test_running",
+      scan_type="model_test",
+      job_type="model_test",
+      schema_version="model_test_progress_v1",
+      phase_index=3,
+      total_phases=5,
+      ports_scanned=0,
+      ports_total=0,
+      open_ports_found=[],
+      completed_tests=["case-1"],
+      updated_at=124.0,
+      live_metrics={"total_cases": 12, "completed_cases": 4},
+      model_test_summary={"overall_status": "running", "cases_total": 12},
+      model_test_results={"overall_status": "running", "cases": []},
+      error_class="provider_timeout",
+    )
+
+    payload = WorkerProgress.from_dict(progress.to_dict()).to_dict()
+
+    self.assertEqual(payload["schema_version"], "model_test_progress_v1")
+    self.assertEqual(payload["job_type"], "model_test")
+    self.assertEqual(payload["scan_type"], "model_test")
+    self.assertEqual(payload["phase"], "model_test_running")
+    self.assertEqual(payload["live_metrics"]["total_cases"], 12)
+    self.assertEqual(payload["model_test_summary"]["overall_status"], "running")
+    self.assertEqual(payload["model_test_results"]["overall_status"], "running")
+    self.assertEqual(payload["error_class"], "provider_timeout")
+
+  def test_model_test_progress_readback_synthesizes_case_progress_without_live_row(self):
+    from extensions.business.cybersec.red_mesh.services.query import get_job_progress
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "target": "Unit Provider / unit-model",
+      "start_port": 0,
+      "end_port": 0,
+      "date_created": 123.0,
+      "job_config_cid": "cid-config",
+      "model_test_summary": {
+        "overall_status": "queued",
+        "cases_total": 12,
+        "cases_completed": 0,
+      },
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "model_test_worker_status": "queued",
+          "assignment_revision": 1,
+          "assigned_at": 123.0,
+          "finished": False,
+        },
+      },
+    }
+    owner = _owner()
+    owner.chainstore_hget = MagicMock()
+    owner.chainstore_hget.side_effect = lambda hkey, key: job_specs if key == "job-1" else None
+    owner.chainstore_hgetall.side_effect = lambda hkey: {} if hkey.endswith(":live") else {"job-1": job_specs}
+
+    response = get_job_progress(owner, "job-1")
+
+    self.assertEqual(response["job_type"], "model_test")
+    self.assertEqual(response["task_kind"], "model_test")
+    self.assertEqual(response["scan_type"], "model_test")
+    worker = response["workers"]["node-a"]
+    self.assertEqual(worker["phase"], "model_test_node_selected")
+    self.assertEqual(worker["ports_total"], 0)
+    self.assertEqual(worker["live_metrics"]["total_cases"], 12)
+    self.assertEqual(worker["model_test_summary"]["overall_status"], "queued")
+
+  def test_model_test_listing_preserves_summary_and_node_selection(self):
+    from extensions.business.cybersec.red_mesh.services.query import list_network_jobs
+
+    job_specs = {
+      "job_id": "job-1",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "target": "Unit Provider / unit-model",
+      "target_url": "",
+      "start_port": 0,
+      "end_port": 0,
+      "date_created": 123.0,
+      "risk_score": 0,
+      "pass_reports": [],
+      "model_test_summary": {"overall_status": "queued"},
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "model_test_worker_status": "queued",
+        },
+      },
+    }
+    owner = _owner()
+    owner._normalize_job_record = MagicMock(side_effect=lambda key, specs: (key, specs))
+    owner.chainstore_hgetall.return_value = {"job-1": job_specs}
+
+    jobs = list_network_jobs(owner)
+
+    self.assertEqual(jobs["job-1"]["job_type"], "model_test")
+    self.assertEqual(jobs["job-1"]["scan_type"], "model_test")
+    self.assertEqual(jobs["job-1"]["model_test_summary"]["overall_status"], "queued")
+    self.assertEqual(jobs["job-1"]["model_test_node_selection"]["selected_execution_node"], "node-a")
+
   def test_finalized_cstore_model_preserves_model_test_fields(self):
     finalized = CStoreJobFinalized(
       job_id="job-1",
@@ -651,6 +774,65 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     worker.thread.join(timeout=1)
     self.assertEqual(worker.state["model_test_summary"]["overall_status"], "not_implemented")
     self.assertEqual(selected.scan_jobs, {})
+
+  def test_publish_model_test_progress_writes_case_metrics(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "node-a"
+    plugin.cfg_instance_id = "instance"
+    plugin.time.return_value = 130.0
+    plugin.chainstore_hset = MagicMock()
+    worker = MagicMock()
+    worker.state = {
+      "phase": "model_test_running",
+      "progress": 40.0,
+      "completed_tests": ["case-1"],
+      "live_metrics": {
+        "total_cases": 12,
+        "completed_cases": 4,
+        "evaluated_cases": 2,
+      },
+      "model_test_summary": {
+        "overall_status": "running",
+        "cases_total": 12,
+        "cases_completed": 4,
+      },
+      "model_test_results": {
+        "overall_status": "running",
+        "cases": [],
+      },
+    }
+    job_specs = {
+      "job_id": "job-1",
+      "job_pass": 1,
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "assignment_revision": 1,
+          "assigned_at": 123.0,
+        },
+      },
+    }
+
+    PentesterApi01Plugin._publish_model_test_progress(plugin, "job-1", worker, job_specs)
+
+    plugin.chainstore_hset.assert_called_once()
+    payload = plugin.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(plugin.chainstore_hset.call_args.kwargs["hkey"], "instance:live")
+    self.assertEqual(plugin.chainstore_hset.call_args.kwargs["key"], "job-1:node-a")
+    self.assertEqual(payload["schema_version"], "model_test_progress_v1")
+    self.assertEqual(payload["job_type"], "model_test")
+    self.assertEqual(payload["phase"], "model_test_running")
+    self.assertEqual(payload["phase_index"], 3)
+    self.assertEqual(payload["total_phases"], 5)
+    self.assertEqual(payload["ports_total"], 0)
+    self.assertEqual(payload["live_metrics"]["total_cases"], 12)
+    self.assertEqual(payload["model_test_summary"]["overall_status"], "running")
+    self.assertEqual(payload["model_test_results"]["overall_status"], "running")
 
   def test_close_model_test_worker_writes_result_and_removes_tracking(self):
     mock_plugin_modules()

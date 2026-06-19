@@ -281,12 +281,19 @@ class WorkerProgress:
   first_seen_live_at: float = None
   last_seen_at: float = None
   error: str = None
+  error_class: str = None
+  error_message: str = None
   report_cid: str = None
-  scan_type: str = "network"        # network | webapp
+  scan_type: str = "network"        # network | webapp | model_test compatibility shim
+  job_type: str = None
+  schema_version: str = None
   phase_index: int = 0              # 1-based current stage index; 0 when unknown
   total_phases: int = 0             # number of stages in the active phase family
   finished: bool = False
+  canceled: bool = False
   live_metrics: dict = None         # ScanMetrics.to_dict() — partial snapshot, progressively fills in
+  model_test_results: dict = None
+  model_test_summary: dict = None
   threads: dict = None              # {thread_id: {phase, ports_scanned, ports_total, open_ports_found}}
 
   def to_dict(self) -> dict:
@@ -305,8 +312,12 @@ class WorkerProgress:
       first_seen_live_at=d.get("first_seen_live_at"),
       last_seen_at=d.get("last_seen_at", d.get("updated_at", 0)),
       error=d.get("error"),
+      error_class=d.get("error_class"),
+      error_message=d.get("error_message"),
       report_cid=d.get("report_cid"),
       scan_type=d.get("scan_type", "network"),
+      job_type=d.get("job_type"),
+      schema_version=d.get("schema_version"),
       phase_index=d.get("phase_index", 0),
       total_phases=d.get("total_phases", 0),
       ports_scanned=d.get("ports_scanned", 0),
@@ -315,6 +326,9 @@ class WorkerProgress:
       completed_tests=d.get("completed_tests", []),
       updated_at=d.get("updated_at", 0),
       finished=d.get("finished", False),
+      canceled=d.get("canceled", False),
       live_metrics=d.get("live_metrics"),
+      model_test_results=d.get("model_test_results"),
+      model_test_summary=d.get("model_test_summary"),
       threads=d.get("threads"),
     )

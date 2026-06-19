@@ -60,6 +60,51 @@ def _paginate_archive_passes(archive: dict, *, summary_only: bool, pass_offset: 
   return archive
 
 
+def _model_test_live_metrics(summary: dict) -> dict:
+  if not isinstance(summary, dict):
+    return {}
+  metrics = {}
+  aliases = {
+    "cases_total": "total_cases",
+    "total_cases": "total_cases",
+    "cases_completed": "completed_cases",
+    "completed_cases": "completed_cases",
+    "evaluated_cases": "evaluated_cases",
+    "execution_failed_cases": "execution_failed_cases",
+    "evaluation_failed_cases": "evaluation_failed_cases",
+  }
+  for src, dst in aliases.items():
+    value = summary.get(src)
+    if isinstance(value, (int, float)):
+      metrics[dst] = value
+  return metrics
+
+
+def _augment_model_test_progress(job_specs: dict, workers: dict) -> dict:
+  summary = dict(job_specs.get("model_test_summary") or {})
+  for worker_addr, payload in list((workers or {}).items()):
+    if not isinstance(payload, dict):
+      continue
+    enriched = dict(payload)
+    enriched.setdefault("job_id", job_specs.get("job_id"))
+    enriched.setdefault("worker_addr", worker_addr)
+    enriched.setdefault("job_type", "model_test")
+    enriched.setdefault("scan_type", "model_test")
+    enriched.setdefault("pass_nr", job_specs.get("job_pass", 1))
+    enriched.setdefault("progress", 0)
+    enriched.setdefault("phase", "model_test_node_selected")
+    enriched.setdefault("phase_index", 2)
+    enriched.setdefault("total_phases", 5)
+    enriched.setdefault("ports_scanned", 0)
+    enriched.setdefault("ports_total", 0)
+    enriched.setdefault("open_ports_found", [])
+    enriched.setdefault("completed_tests", [])
+    enriched.setdefault("model_test_summary", summary)
+    enriched.setdefault("live_metrics", _model_test_live_metrics(summary))
+    workers[worker_addr] = enriched
+  return workers
+
+
 def get_job_data(owner, job_id: str):
   """
   Retrieve job data from CStore.
@@ -298,13 +343,23 @@ def get_job_progress(owner, job_id: str):
     status = job_specs.get("job_status")
     scan_type = job_specs.get("scan_type")
     result = reconcile_job_workers(owner, job_specs, live_payloads=all_progress)
+    if job_specs.get("job_type") == "model_test" or scan_type == "model_test":
+      result = _augment_model_test_progress(job_specs, result)
   else:
     prefix = f"{job_id}:"
     for key, value in all_progress.items():
       if key.startswith(prefix) and value is not None:
         worker_addr = key[len(prefix):]
         result[worker_addr] = value
-  return {"job_id": job_id, "status": status, "scan_type": scan_type, "workers": result}
+  response = {"job_id": job_id, "status": status, "scan_type": scan_type, "workers": result}
+  if isinstance(job_specs, dict) and (job_specs.get("job_type") == "model_test" or scan_type == "model_test"):
+    response.update({
+      "job_type": "model_test",
+      "task_kind": "model_test",
+      "model_test_summary": job_specs.get("model_test_summary"),
+      "model_test_node_selection": job_specs.get("model_test_node_selection"),
+    })
+  return response
 
 
 def list_network_jobs(owner):
@@ -323,6 +378,7 @@ def list_network_jobs(owner):
       normalized_jobs[normalized_key] = {
         "job_id": normalized_spec.get("job_id"),
         "job_status": normalized_spec.get("job_status"),
+        "job_type": normalized_spec.get("job_type"),
         "target": normalized_spec.get("target"),
         "scan_type": normalized_spec.get("scan_type", "network"),
         "target_url": normalized_spec.get("target_url", ""),
@@ -337,6 +393,8 @@ def list_network_jobs(owner):
         "worker_count": len(normalized_spec.get("workers", {}) or {}),
         "pass_count": len(normalized_spec.get("pass_reports", []) or []),
         "job_pass": normalized_spec.get("job_pass", 1),
+        "model_test_summary": normalized_spec.get("model_test_summary"),
+        "model_test_node_selection": normalized_spec.get("model_test_node_selection"),
       }
   return normalized_jobs
 
