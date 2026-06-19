@@ -161,6 +161,52 @@ class DeeployPreferredNodesTests(unittest.TestCase):
       0,
     )
 
+  def test_owner_transfer_migration_moves_preferred_nodes_to_new_owner(self):
+    plugin = make_preferred_nodes_plugin()
+    payload = json.dumps({
+      "version": 1,
+      "nodes": [
+        {
+          "address": "0xai_node_alpha",
+          "alias": "Alpha",
+        },
+      ],
+    })
+    plugin._chainstore[(PLUS_HKEY, "0xold")] = payload
+
+    result = plugin.migrate_preferred_nodes_for_csp_owner_transfer(
+      old_owner="0xOld",
+      new_owner="0xNew",
+    )
+
+    self.assertEqual(result["status"], "moved")
+    self.assertIsNone(plugin._chainstore[(PLUS_HKEY, "0xold")])
+    self.assertEqual(plugin._chainstore[(PLUS_HKEY, "0xnew")], payload)
+
+  def test_owner_transfer_migration_reports_missing_preferred_nodes(self):
+    plugin = make_preferred_nodes_plugin()
+
+    result = plugin.migrate_preferred_nodes_for_csp_owner_transfer(
+      old_owner="0xOld",
+      new_owner="0xNew",
+    )
+
+    self.assertEqual(result["status"], "missing")
+    self.assertNotIn((PLUS_HKEY, "0xnew"), plugin._chainstore)
+
+  def test_owner_transfer_migration_does_not_move_invalid_payload(self):
+    plugin = make_preferred_nodes_plugin()
+    plugin._chainstore[(PLUS_HKEY, "0xold")] = "{"
+
+    with self.assertRaisesRegex(ValueError, "Invalid Preferred Nodes CStore JSON"):
+      plugin.migrate_preferred_nodes_for_csp_owner_transfer(
+        old_owner="0xOld",
+        new_owner="0xNew",
+      )
+
+    self.assertEqual(plugin._chainstore[(PLUS_HKEY, "0xold")], "{")
+    self.assertNotIn((PLUS_HKEY, "0xnew"), plugin._chainstore)
+
 
 if __name__ == "__main__":
   unittest.main()
