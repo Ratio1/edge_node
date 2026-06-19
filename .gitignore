@@ -196,3 +196,6 @@ blur_debugger/blur_debugger_draw__BLUR_DEBUGGER_DRAW_STEP__Tracking/
 
 .prompt.md
 prompt.md
+
+# RedMesh LLM probe benchmark artifacts
+extensions/business/cybersec/red_mesh/test_results/

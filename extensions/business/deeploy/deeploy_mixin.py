@@ -199,7 +199,16 @@ class _DeeployMixin:
     ValueError
         If the auth result does not contain an escrow owner.
     """
-    escrow_owner = str(auth_result.get(DEEPLOY_KEYS.ESCROW_OWNER, "")).strip()
+    return self._preferred_nodes_owner_storage_key(
+      auth_result.get(DEEPLOY_KEYS.ESCROW_OWNER, "")
+    )
+
+
+  def _preferred_nodes_owner_storage_key(self, owner: str):
+    """
+    Build the CStore field key for a CSP owner's Preferred Nodes list.
+    """
+    escrow_owner = str(owner).strip()
     if not escrow_owner:
       raise ValueError("Preferred Nodes storage requires an escrow owner.")
     # Keying by owner lets delegates share the owner CSP list in v1.
@@ -442,6 +451,54 @@ class _DeeployMixin:
     if not saved:
       raise ValueError("Failed to save Preferred Nodes to CStore.")
     return nodes
+
+
+  def migrate_preferred_nodes_for_csp_owner_transfer(self, old_owner: str, new_owner: str):
+    """
+    Move Preferred Nodes from the previous CSP owner key to the new owner key.
+    """
+    old_key = self._preferred_nodes_owner_storage_key(old_owner)
+    new_key = self._preferred_nodes_owner_storage_key(new_owner)
+    if old_key == new_key:
+      return {
+        DEEPLOY_KEYS.STATUS: "already_current",
+        "from": old_key,
+        "to": new_key,
+      }
+
+    raw_payload = self.chainstore_hget(
+      hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY,
+      key=old_key,
+    )
+    if not raw_payload:
+      return {
+        DEEPLOY_KEYS.STATUS: "missing",
+        "from": old_key,
+        "to": new_key,
+      }
+
+    self._parse_preferred_nodes_payload(raw_payload)
+    saved = self.chainstore_hset(
+      hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY,
+      key=new_key,
+      value=raw_payload,
+    )
+    if not saved:
+      raise ValueError("Failed to migrate Preferred Nodes to new owner.")
+
+    deleted = self.chainstore_hset(
+      hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY,
+      key=old_key,
+      value=None,
+    )
+    if not deleted:
+      raise ValueError("Failed to clear Preferred Nodes from previous owner.")
+
+    return {
+      DEEPLOY_KEYS.STATUS: "moved",
+      "from": old_key,
+      "to": new_key,
+    }
 
 
   def __get_emv_types(self, values):
