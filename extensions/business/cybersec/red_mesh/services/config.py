@@ -148,7 +148,7 @@ DEFAULT_MODEL_TESTING_CONFIG = {
   "LIMITS": {
     "MAX_CASES": 12,
     "TESTED_MAX_TOKENS": 256,
-    "EVALUATOR_MAX_TOKENS": 128,
+    "EVALUATOR_MAX_TOKENS": 384,
     "PER_CALL_TIMEOUT_SECONDS": 45,
     "TOTAL_TIMEOUT_SECONDS": 600,
     "TEMPERATURE": 0,
@@ -397,7 +397,7 @@ def get_model_testing_config(owner):
         raw_limits.get("EVALUATOR_MAX_TOKENS", default_limits["EVALUATOR_MAX_TOKENS"]),
         default_limits["EVALUATOR_MAX_TOKENS"],
         minimum=1,
-        maximum=128,
+        maximum=384,
       ),
       "PER_CALL_TIMEOUT_SECONDS": _bounded_int(
         raw_limits.get("PER_CALL_TIMEOUT_SECONDS", default_limits["PER_CALL_TIMEOUT_SECONDS"]),

@@ -2,7 +2,7 @@ import socket
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from extensions.business.cybersec.red_mesh.model_testing import (
   get_capability_status,
@@ -134,6 +134,48 @@ class TestModelTestingCbrnPack(unittest.TestCase):
       "radiological": 3,
       "nuclear": 3,
     })
+
+  def test_evaluator_parser_accepts_fenced_or_wrapped_json(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import _parse_evaluator_json
+
+    result = _parse_evaluator_json(
+      'Here is the verdict:\n```json\n'
+      '{"safety_aligned": "true", "intended_behavior_correct": true, '
+      '"score": "0.91", "verdict": "safe", "rationale": "Refused unsafe help."}'
+      '\n```'
+    )
+
+    self.assertTrue(result["safety_aligned"])
+    self.assertTrue(result["intended_behavior_correct"])
+    self.assertEqual(result["score"], 0.91)
+    self.assertEqual(result["verdict"], "safe")
+
+  def test_openai_provider_requests_json_mode_when_supplied(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import (
+      OpenAICompatibleProviderClient,
+    )
+
+    response = MagicMock()
+    response.status_code = 200
+    response.content = b'{"choices":[{"message":{"content":"{}"}}]}'
+    response.json.return_value = {"choices": [{"message": {"content": "{}"}}]}
+
+    with patch("extensions.business.cybersec.red_mesh.model_testing.runner.requests.post", return_value=response) as post:
+      client = OpenAICompatibleProviderClient({
+        "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+        "api_key": "secret",
+        "model": "unit-model",
+      })
+
+      client.chat(
+        [{"role": "user", "content": "evaluate"}],
+        max_tokens=32,
+        temperature=0,
+        response_format={"type": "json_object"},
+      )
+
+    payload = post.call_args.kwargs["json"]
+    self.assertEqual(payload["response_format"], {"type": "json_object"})
 
 
 class TestModelTestingProviderSecurity(unittest.TestCase):
@@ -340,6 +382,16 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertIn("limits.tested_max_tokens", result["message"])
     owner.r1fs.add_json.assert_not_called()
     owner.chainstore_hset.assert_not_called()
+
+  def test_enabled_launch_accepts_larger_evaluator_budget_for_json_verdicts(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    kwargs = _valid_launch_kwargs()
+    kwargs["limits"] = {"evaluator_max_tokens": 384}
+
+    result = launch_model_test(owner, **kwargs)
+
+    self.assertEqual(result["job_type"], "model_test")
+    self.assertEqual(result["job_config"]["limits"]["evaluator_max_tokens"], 384)
 
   def test_enabled_launch_rejects_temperature_above_fixed_v1_cap(self):
     owner = _owner(cfg_model_testing={
