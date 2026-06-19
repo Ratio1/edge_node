@@ -10,6 +10,7 @@ from __future__ import annotations
 import threading
 import uuid
 
+from .artifacts import sanitize_model_test_results, sanitize_model_test_summary
 from .constants import MODEL_TEST_ERROR_CANCELED_BY_USER, MODEL_TEST_PHASE_CANCELED
 
 
@@ -90,8 +91,8 @@ class ModelTestWorker:
       "done": self.state.get("done", False),
       "canceled": self.state.get("canceled", False),
       "completed_tests": list(self.state.get("completed_tests") or []),
-      "model_test_results": dict(self.state.get("model_test_results") or {}),
-      "model_test_summary": dict(self.state.get("model_test_summary") or {}),
+      "model_test_results": sanitize_model_test_results(self.state.get("model_test_results") or {}),
+      "model_test_summary": sanitize_model_test_summary(self.state.get("model_test_summary") or {}),
       "live_metrics": dict(self.state.get("live_metrics") or {}),
       "error": self.state.get("error"),
       "error_class": self.state.get("error_class"),

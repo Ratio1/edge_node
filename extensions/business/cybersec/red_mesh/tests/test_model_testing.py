@@ -243,14 +243,34 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stored_config["model_test_node_selection"]["selected_execution_node"], "node-b")
     self.assertNotIn(secret, str(stored_config))
 
-    owner.chainstore_hset.assert_called_once()
-    stored_job = owner.chainstore_hset.call_args.kwargs["value"]
+    self.assertEqual(owner.chainstore_hset.call_count, 2)
+    job_writes = [
+      call.kwargs
+      for call in owner.chainstore_hset.call_args_list
+      if call.kwargs["hkey"] == "instance"
+    ]
+    live_writes = [
+      call.kwargs
+      for call in owner.chainstore_hset.call_args_list
+      if call.kwargs["hkey"] == "instance:live"
+    ]
+    self.assertEqual(len(job_writes), 1)
+    self.assertEqual(len(live_writes), 1)
+    stored_job = job_writes[0]["value"]
     self.assertEqual(stored_job["job_type"], "model_test")
     self.assertEqual(stored_job["scan_type"], "model_test")
     self.assertEqual(set(stored_job["workers"]), {"node-b"})
     self.assertEqual(stored_job["workers"]["node-b"]["worker_type"], "model_test")
     self.assertEqual(stored_job["workers"]["node-b"]["model_test_worker_status"], "queued")
     self.assertNotIn("node-a", stored_job["workers"])
+    initial_progress = live_writes[0]["value"]
+    self.assertEqual(live_writes[0]["key"], "job-123:node-b")
+    self.assertEqual(initial_progress["schema_version"], "model_test_progress_v1")
+    self.assertEqual(initial_progress["phase"], "model_test_node_selected")
+    self.assertEqual(initial_progress["progress_sequence"], 1)
+    self.assertEqual(initial_progress["ports_total"], 0)
+    self.assertEqual(initial_progress["model_test_summary"]["overall_status"], "queued")
+    self.assertEqual(initial_progress["model_test_results"]["cases"], [])
 
   def test_enabled_launch_rejects_invalid_selected_peer_before_persistence(self):
     owner = _owner(
@@ -461,6 +481,77 @@ class TestModelTestNodeSelection(unittest.TestCase):
 
 
 class TestModelTestingPersistenceContracts(unittest.TestCase):
+
+  def test_model_test_artifact_serializers_strip_raw_payload_fields(self):
+    from extensions.business.cybersec.red_mesh.model_testing.artifacts import (
+      ModelTestArchive,
+      ModelTestWorkerResult,
+    )
+
+    raw_results = {
+      "overall_status": "running",
+      "provider_url": "https://provider.example/v1",
+      "raw_evidence_cid": "cid-raw-secret",
+      "cases": [
+        {
+          "case_id": "case-1",
+          "category": "safety",
+          "status": "failed",
+          "verdict": "blocked",
+          "raw_prompt": "secret prompt text",
+          "raw_response": "secret model response",
+          "evaluator_output": {"reasoning": "private rubric output"},
+          "headers": {"Authorization": "Bearer secret-token"},
+          "error_class": "provider_timeout",
+        },
+      ],
+    }
+    raw_summary = {
+      "overall_status": "running",
+      "cases_total": 12,
+      "cases_completed": 4,
+      "error_message": "raw provider exception with secret-token",
+      "raw_response_excerpt": "private model output",
+      "error_class": "not-in-allowlist",
+    }
+
+    worker_result = ModelTestWorkerResult.from_dict({
+      "job_id": "job-1",
+      "worker_addr": "node-a",
+      "status": "failed",
+      "model_test_results": raw_results,
+      "model_test_summary": raw_summary,
+      "error_message": "do not persist this",
+    }).to_dict()
+    archive = ModelTestArchive.from_dict({
+      "schema_version": "model_test_archive_v1",
+      "archive_version": 1,
+      "job_id": "job-1",
+      "job_type": "model_test",
+      "job_config": {},
+      "timeline": [],
+      "model_test_results": raw_results,
+      "model_test_summary": raw_summary,
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "ui_aggregate": {},
+      "duration": 0,
+      "date_created": 0,
+      "date_completed": 0,
+    }).to_dict()
+
+    for payload in (worker_result, archive):
+      self.assertEqual(payload["model_test_summary"]["cases_completed"], 4)
+      self.assertEqual(payload["model_test_summary"]["error_class"], "unknown_error")
+      self.assertEqual(payload["model_test_results"]["cases"][0]["case_id"], "case-1")
+      self.assertEqual(payload["model_test_results"]["cases"][0]["error_class"], "provider_timeout")
+      payload_text = str(payload)
+      self.assertNotIn("secret prompt text", payload_text)
+      self.assertNotIn("secret model response", payload_text)
+      self.assertNotIn("private rubric output", payload_text)
+      self.assertNotIn("secret-token", payload_text)
+      self.assertNotIn("provider.example", payload_text)
+      self.assertNotIn("cid-raw-secret", payload_text)
+      self.assertNotIn("error_message", payload_text)
 
   def test_artifact_repository_preserves_model_test_config_without_scan_defaults(self):
     owner = _owner()
@@ -1333,6 +1424,59 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         "selected_execution_node": "node-a",
       },
     }
+    live_progress = WorkerProgress(
+      job_id="job-stale",
+      worker_addr="node-a",
+      pass_nr=1,
+      assignment_revision_seen=1,
+      event_id="job-stale:node-a:1:000004",
+      progress_sequence=4,
+      progress=40.0,
+      phase="model_test_running",
+      scan_type="model_test",
+      job_type="model_test",
+      schema_version="model_test_progress_v1",
+      phase_index=3,
+      total_phases=5,
+      ports_scanned=0,
+      ports_total=0,
+      open_ports_found=[],
+      completed_tests=["case-1"],
+      updated_at=110.0,
+      started_at=100.0,
+      first_seen_live_at=100.0,
+      last_seen_at=110.0,
+      live_metrics={
+        "total_cases": 12,
+        "completed_cases": 4,
+        "evaluated_cases": 3,
+        "execution_failed_cases": 1,
+        "evaluation_failed_cases": 2,
+      },
+      model_test_summary={
+        "overall_status": "running",
+        "cases_total": 12,
+        "cases_completed": 4,
+        "evaluated_cases": 3,
+        "execution_failed_cases": 1,
+        "evaluation_failed_cases": 2,
+        "error_message": "raw provider message secret-token",
+      },
+      model_test_results={
+        "overall_status": "running",
+        "provider_url": "https://provider.example/v1",
+        "cases": [
+          {
+            "case_id": "case-1",
+            "category": "safety",
+            "status": "running",
+            "raw_prompt": "secret prompt text",
+            "raw_response": "secret model response",
+            "headers": {"Authorization": "Bearer secret-token"},
+          },
+        ],
+      },
+    ).to_dict()
     plugin = MagicMock()
     plugin.ee_addr = "launcher-node"
     plugin.cfg_instance_id = "instance"
@@ -1341,7 +1485,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     plugin.time.return_value = 200.0
     plugin._get_artifact_repository.return_value.get_job_config.return_value = model_test_config
     plugin.chainstore_hgetall.side_effect = (
-      lambda hkey: {} if hkey.endswith(":live") else {"job-stale": job_specs}
+      lambda hkey: {"job-stale:node-a": live_progress} if hkey.endswith(":live") else {"job-stale": job_specs}
     )
     plugin.chainstore_hget.side_effect = (
       lambda hkey, key: None if hkey.endswith(":live") else job_specs
@@ -1385,14 +1529,30 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(stored_artifacts[0]["status"], "failed")
     self.assertEqual(stored_artifacts[0]["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
     self.assertEqual(stored_artifacts[0]["model_test_summary"]["overall_status"], "failed")
+    self.assertEqual(stored_artifacts[0]["model_test_summary"]["cases_completed"], 4)
+    self.assertEqual(stored_artifacts[0]["model_test_summary"]["evaluated_cases"], 3)
+    self.assertEqual(stored_artifacts[0]["model_test_summary"]["execution_failed_cases"], 1)
+    self.assertEqual(stored_artifacts[0]["model_test_summary"]["evaluation_failed_cases"], 2)
+    self.assertEqual(stored_artifacts[0]["model_test_results"]["cases"][0]["case_id"], "case-1")
     self.assertEqual(stored_artifacts[1]["schema_version"], "model_test_archive_v1")
+    self.assertEqual(stored_artifacts[1]["model_test_summary"]["cases_completed"], 4)
+    self.assertEqual(stored_artifacts[1]["model_test_results"]["cases"][0]["case_id"], "case-1")
     persisted_specs = written_records[-1][1]
     self.assertEqual(persisted_specs["job_status"], "STOPPED")
     self.assertEqual(persisted_specs["model_test_summary"]["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
+    self.assertEqual(persisted_specs["model_test_summary"]["cases_completed"], 4)
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
     progress_payload = plugin.chainstore_hset.call_args.kwargs["value"]
     self.assertEqual(progress_payload["phase"], "failed")
     self.assertEqual(progress_payload["error_class"], MODEL_TEST_ERROR_WORKER_LOST)
+    self.assertEqual(progress_payload["model_test_summary"]["cases_completed"], 4)
+    self.assertEqual(progress_payload["model_test_results"]["cases"][0]["case_id"], "case-1")
+    for payload in (stored_artifacts[0], stored_artifacts[1], persisted_specs, progress_payload):
+      payload_text = str(payload)
+      self.assertNotIn("secret prompt text", payload_text)
+      self.assertNotIn("secret model response", payload_text)
+      self.assertNotIn("secret-token", payload_text)
+      self.assertNotIn("provider.example", payload_text)
 
   def test_canceled_model_test_before_worker_start_finalizes_canceled(self):
     mock_plugin_modules()

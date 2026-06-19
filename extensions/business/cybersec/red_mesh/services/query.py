@@ -160,6 +160,8 @@ def get_job_archive(owner, job_id: str, summary_only: bool = False, pass_offset:
   result = get_job_archive_with_triage(owner, job_id)
   if "archive" not in result:
     return result
+  if result["archive"].get("job_type") == "model_test":
+    return result
   if summary_only or int(pass_offset or 0) > 0 or int(pass_limit or 0) > 0:
     result = dict(result)
     result["archive"] = _paginate_archive_passes(

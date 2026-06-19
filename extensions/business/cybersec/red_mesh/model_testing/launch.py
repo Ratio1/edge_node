@@ -4,11 +4,16 @@ import uuid
 from math import isfinite
 
 from ..constants import JOB_STATUS_RUNNING, RUN_MODE_SINGLEPASS
-from ..models import CStoreJobRunning
+from ..models import CStoreJobRunning, WorkerProgress
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..services.config import get_model_testing_config
 from .artifacts import MODEL_TEST_JOB_CONFIG_SCHEMA
-from .constants import MODEL_TEST_JOB_TYPE
+from .constants import (
+  MODEL_TEST_JOB_TYPE,
+  MODEL_TEST_PHASE_INDEX,
+  MODEL_TEST_PHASE_NODE_SELECTED,
+  MODEL_TEST_PROGRESS_SCHEMA,
+)
 from .node_selection import select_model_test_execution_node
 from .security import (
   validate_provider_config_shape,
@@ -173,6 +178,47 @@ def _write_job_record(owner, job_id, job_specs):
   if callable(writer):
     return writer(owner, job_id, job_specs, context="launch_model_test")
   return _job_repo(owner).put_job(job_id, job_specs)
+
+
+def _write_initial_progress(owner, job_id, execution_node, created_at):
+  progress = WorkerProgress(
+    job_id=job_id,
+    worker_addr=execution_node,
+    pass_nr=1,
+    assignment_revision_seen=1,
+    event_id=f"{job_id}:{execution_node}:1:000001",
+    progress_sequence=1,
+    progress=0.0,
+    phase=MODEL_TEST_PHASE_NODE_SELECTED,
+    scan_type=MODEL_TEST_JOB_TYPE,
+    job_type=MODEL_TEST_JOB_TYPE,
+    schema_version=MODEL_TEST_PROGRESS_SCHEMA,
+    phase_index=MODEL_TEST_PHASE_INDEX[MODEL_TEST_PHASE_NODE_SELECTED],
+    total_phases=5,
+    ports_scanned=0,
+    ports_total=0,
+    open_ports_found=[],
+    completed_tests=[],
+    updated_at=created_at,
+    started_at=created_at,
+    first_seen_live_at=created_at,
+    last_seen_at=created_at,
+    finished=False,
+    canceled=False,
+    live_metrics={},
+    model_test_results={"overall_status": "queued", "cases": []},
+    model_test_summary={"overall_status": "queued"},
+  )
+  repo = _job_repo(owner)
+  if callable(getattr(owner, "chainstore_hget", None)):
+    return repo.put_live_progress_model(progress)
+  payload = progress.to_dict()
+  owner.chainstore_hset(
+    hkey=getattr(repo, "_live_hkey", f"{getattr(owner, 'cfg_instance_id', 'default')}:live"),
+    key=f"{job_id}:{execution_node}",
+    value=payload,
+  )
+  return payload
 
 
 def _new_job_id(owner):
@@ -373,6 +419,7 @@ def launch_model_test(
     actor_type="node",
   )
   persisted_specs = _write_job_record(owner, job_id, job_specs)
+  _write_initial_progress(owner, job_id, execution_node, created_at)
   return {
     "job_specs": persisted_specs,
     "worker": execution_node,
