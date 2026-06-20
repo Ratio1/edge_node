@@ -8,6 +8,12 @@ from ..models import CStoreJobRunning, WorkerProgress
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..services.config import get_model_testing_config
 from .artifacts import MODEL_TEST_JOB_CONFIG_SCHEMA
+from .catalog import (
+  CBRN_SAFETY_V1_ID,
+  normalize_model_test_selection,
+  sanitized_model_test_catalog,
+  selection_metadata,
+)
 from .constants import (
   MODEL_TEST_JOB_TYPE,
   MODEL_TEST_PHASE_INDEX,
@@ -26,7 +32,7 @@ from .security import (
 )
 
 
-TEST_SET_ID = "cbrn_safety_v1"
+TEST_SET_ID = CBRN_SAFETY_V1_ID
 
 def _validation_error(message: str, *, error_class=None):
   result = {"error": "validation_error", "message": message}
@@ -90,7 +96,6 @@ def _normalize_limits(limits, cfg):
   caps = cfg["LIMITS"]
   normalized = {}
   int_fields = (
-    ("max_cases", "MAX_CASES", 1),
     ("tested_max_tokens", "TESTED_MAX_TOKENS", 1),
     ("evaluator_max_tokens", "EVALUATOR_MAX_TOKENS", 1),
     ("per_call_timeout_seconds", "PER_CALL_TIMEOUT_SECONDS", 1),
@@ -270,7 +275,8 @@ def launch_model_test(
   created_by_name="",
   created_by_id="",
   authorized=False,
-  test_set_id=TEST_SET_ID,
+  test_set_id=None,
+  test_sets=None,
   tested_model=None,
   tested_model_secret_payload=None,
   use_default_evaluator_model=False,
@@ -301,8 +307,12 @@ def launch_model_test(
   created_by_id, err = _bounded_text(created_by_id, "created_by_id")
   if err:
     return err
-  if test_set_id != TEST_SET_ID:
-    return _validation_error("test_set_id must be cbrn_safety_v1")
+  normalized_test_sets, selection_err = normalize_model_test_selection(
+    test_sets,
+    legacy_test_set_id=test_set_id if test_sets is None else None,
+  )
+  if selection_err:
+    return _validation_error(selection_err)
   if _raw_evidence_requested(raw_evidence) and not cfg["RAW_EVIDENCE_ENABLED"]:
     return _validation_error(
       "raw_evidence is disabled by policy",
@@ -349,7 +359,10 @@ def launch_model_test(
     "task_description": task_description,
     "created_by_name": created_by_name,
     "created_by_id": created_by_id,
-    "test_set_id": test_set_id,
+    "test_set_id": normalized_test_sets[0]["id"] if len(normalized_test_sets) == 1 else "",
+    "test_sets": normalized_test_sets,
+    "test_set_catalog": sanitized_model_test_catalog(),
+    "selected_test_set_metadata": selection_metadata(normalized_test_sets),
     "tested_model": tested_model_config,
     "evaluator_model": evaluator_model_config or {"source": "default_config"},
     "limits": normalized_limits,

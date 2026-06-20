@@ -22,6 +22,10 @@ MODEL_TEST_SAFE_ERROR_CLASSES = {
 SAFE_MODEL_TEST_RESULT_KEYS = {
   "overall_status",
   "test_set_id",
+  "test_sets",
+  "test_set_name",
+  "topic_id",
+  "topic_label",
   "case_id",
   "id",
   "category",
@@ -59,6 +63,8 @@ SAFE_MODEL_TEST_SUMMARY_KEYS = {
   "delayed_worker_at",
   "error_class",
   "test_set_id",
+  "test_sets",
+  "selected_test_set_metadata",
   "aggregate_score",
 }
 
@@ -96,6 +102,10 @@ def sanitize_model_test_summary(summary) -> dict:
     value = _safe_scalar(summary.get(key))
     if value is not None:
       sanitized[key] = value
+  if isinstance(summary.get("test_sets"), list):
+    sanitized["test_sets"] = _sanitize_test_sets(summary.get("test_sets"))
+  if isinstance(summary.get("selected_test_set_metadata"), list):
+    sanitized["selected_test_set_metadata"] = _sanitize_test_set_metadata(summary.get("selected_test_set_metadata"))
   return sanitized
 
 
@@ -117,6 +127,60 @@ def _sanitize_model_test_case(case) -> dict:
   return sanitized
 
 
+def _sanitize_test_sets(entries):
+  sanitized = []
+  for entry in entries or []:
+    if not isinstance(entry, dict):
+      continue
+    set_id = _safe_scalar(entry.get("id"))
+    if not isinstance(set_id, str) or not set_id:
+      continue
+    topics = []
+    if isinstance(entry.get("topic_ids"), list):
+      topics = [
+        topic for topic in (_safe_scalar(topic) for topic in entry.get("topic_ids"))
+        if isinstance(topic, str) and topic
+      ]
+    sanitized.append({"id": set_id, "topic_ids": topics})
+  return sanitized
+
+
+def _sanitize_test_set_metadata(entries):
+  sanitized = []
+  for entry in entries or []:
+    if not isinstance(entry, dict):
+      continue
+    set_id = _safe_scalar(entry.get("id"))
+    if not isinstance(set_id, str) or not set_id:
+      continue
+    payload = {"id": set_id}
+    name = _safe_scalar(entry.get("name"))
+    if isinstance(name, str) and name:
+      payload["name"] = name
+    case_count = _safe_scalar(entry.get("case_count"))
+    if isinstance(case_count, (int, float)) and not isinstance(case_count, bool):
+      payload["case_count"] = case_count
+    topics = []
+    if isinstance(entry.get("topics"), list):
+      for topic in entry.get("topics"):
+        if not isinstance(topic, dict):
+          continue
+        topic_id = _safe_scalar(topic.get("id"))
+        if not isinstance(topic_id, str) or not topic_id:
+          continue
+        topic_payload = {"id": topic_id}
+        topic_name = _safe_scalar(topic.get("name"))
+        if isinstance(topic_name, str) and topic_name:
+          topic_payload["name"] = topic_name
+        topic_count = _safe_scalar(topic.get("case_count"))
+        if isinstance(topic_count, (int, float)) and not isinstance(topic_count, bool):
+          topic_payload["case_count"] = topic_count
+        topics.append(topic_payload)
+    payload["topics"] = topics
+    sanitized.append(payload)
+  return sanitized
+
+
 def sanitize_model_test_results(results) -> dict:
   """Allowlist model-test result fields safe for CStore, archive, and UI download."""
   if not isinstance(results, dict):
@@ -125,6 +189,9 @@ def sanitize_model_test_results(results) -> dict:
   overall_status = _safe_scalar(results.get("overall_status"))
   if overall_status is not None:
     sanitized["overall_status"] = overall_status
+  test_set_id = _safe_scalar(results.get("test_set_id"))
+  if isinstance(test_set_id, str) and test_set_id:
+    sanitized["test_set_id"] = test_set_id
   cases = results.get("cases")
   if isinstance(cases, list):
     sanitized["cases"] = [
@@ -132,4 +199,6 @@ def sanitize_model_test_results(results) -> dict:
       for case in (_sanitize_model_test_case(entry) for entry in cases)
       if case
     ]
+  if isinstance(results.get("test_sets"), list):
+    sanitized["test_sets"] = _sanitize_test_sets(results.get("test_sets"))
   return sanitized

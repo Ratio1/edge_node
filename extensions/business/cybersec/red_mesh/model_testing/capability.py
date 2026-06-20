@@ -1,6 +1,7 @@
 """Sanitized Model Testing capability status."""
 
 from ..services.config import get_model_testing_config
+from .catalog import sanitized_model_test_catalog
 
 
 def _disabled_reason(cfg):
@@ -42,6 +43,7 @@ def get_capability_status(owner):
       "remote_provider_preflight_enabled": bool(cfg["REMOTE_PROVIDER_PREFLIGHT_ENABLED"]),
       "default_evaluator_model_available": bool(default_evaluator),
       "default_evaluator_model_label": default_label,
+      "question_sets": sanitized_model_test_catalog(),
       "restricted_raw_permission": "job:view_raw_model_evidence",
       "restricted_raw_purge_permission": "job:purge_raw_model_evidence",
       "policy_source": "pentester_config",

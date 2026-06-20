@@ -13,6 +13,7 @@ from .constants import (
   MODEL_TEST_PHASE_FAILED,
 )
 from .runner import ModelTestRunner
+from .catalog import selected_model_test_cases
 from .secrets import resolve_model_test_runtime_config
 
 
@@ -82,8 +83,11 @@ class ModelTestWorker:
       result = runner.run()
       self.state.update(result)
     except Exception:
-      limits = dict((self.job_config or {}).get("limits") or {})
-      cases_total = int(limits.get("max_cases") or 0) if str(limits.get("max_cases") or "").isdigit() else 0
+      cases, _err = selected_model_test_cases(
+        (self.job_config or {}).get("test_sets"),
+        legacy_test_set_id=(self.job_config or {}).get("test_set_id"),
+      )
+      cases_total = len(cases or [])
       self.state["phase"] = MODEL_TEST_PHASE_FAILED
       self.state["progress"] = 100.0
       self.state["error_class"] = MODEL_TEST_ERROR_PROVIDER_RESPONSE_INVALID

@@ -110,6 +110,26 @@ class TestModelTestingCapability(unittest.TestCase):
 
 class TestModelTestingCbrnPack(unittest.TestCase):
 
+  def test_catalog_exposes_built_in_sets_and_topics_without_prompts(self):
+    from extensions.business.cybersec.red_mesh.model_testing.catalog import (
+      default_model_test_selection,
+      sanitized_model_test_catalog,
+      selected_model_test_cases,
+    )
+
+    catalog = sanitized_model_test_catalog()
+
+    self.assertEqual([entry["id"] for entry in catalog], ["cbrn_safety_v1", "prompt_injection_v1"])
+    self.assertEqual(catalog[0]["case_count"], 12)
+    self.assertGreater(catalog[1]["case_count"], 0)
+    self.assertNotIn("question", str(catalog))
+    self.assertNotIn("system_prompt", str(catalog))
+
+    cases, err = selected_model_test_cases(default_model_test_selection())
+    self.assertIsNone(err)
+    self.assertEqual(len(cases), catalog[0]["case_count"] + catalog[1]["case_count"])
+    self.assertTrue(any(case.get("system_prompt") for case in cases if case["test_set_id"] == "prompt_injection_v1"))
+
   def test_cbrn_safety_v1_pack_has_exact_reviewed_shape(self):
     from extensions.business.cybersec.red_mesh.model_testing.cbrn_safety_v1 import (
       CBRN_SAFETY_V1_QUESTIONS,
@@ -209,7 +229,8 @@ class TestModelTestingCbrnPack(unittest.TestCase):
       job_config={
         "tested_model": {"adapter": "openai_compatible"},
         "evaluator_model": {"adapter": "openai_compatible"},
-        "limits": {"max_cases": 1, "tested_max_tokens": 64, "evaluator_max_tokens": 128},
+        "test_sets": [{"id": "cbrn_safety_v1", "topic_ids": ["chemical"]}],
+        "limits": {"tested_max_tokens": 64, "evaluator_max_tokens": 128},
       },
       provider_client_factory=client_factory,
     )
@@ -219,8 +240,9 @@ class TestModelTestingCbrnPack(unittest.TestCase):
     case = result["model_test_results"]["cases"][0]
     self.assertEqual(case["status"], "evaluated")
     self.assertEqual(case["attempts"], 2)
-    self.assertEqual(result["model_test_summary"]["evaluated_cases"], 1)
-    self.assertEqual(evaluator.calls, 2)
+    self.assertEqual(result["model_test_summary"]["evaluated_cases"], 3)
+    self.assertEqual(result["model_test_results"]["test_sets"], [{"id": "cbrn_safety_v1", "topic_ids": ["chemical"]}])
+    self.assertEqual(evaluator.calls, 4)
 
 
 class TestModelTestingProviderSecurity(unittest.TestCase):
@@ -345,6 +367,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertNotIn(secret, str(result))
     self.assertTrue(result["job_config"]["tested_model"]["credential_ref_present"] is False)
     self.assertEqual(result["job_config"]["limits"]["tested_max_tokens"], 128)
+    self.assertNotIn("max_cases", result["job_config"]["limits"])
     self.assertNotIn("api_key", result["job_config"]["limits"])
     self.assertNotIn("unknown_secret_field", result["job_config"]["limits"])
     self.assertEqual(result["model_test_node_selection"]["selection_mode"], "manual")
@@ -359,6 +382,9 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stored_config["job_type"], "model_test")
     self.assertEqual(stored_config["scan_type"], "model_test")
     self.assertEqual(stored_config["job_id"], "job-123")
+    self.assertEqual(stored_config["test_sets"], [{"id": "cbrn_safety_v1", "topic_ids": ["chemical", "biological", "radiological", "nuclear"]}])
+    self.assertIn("selected_test_set_metadata", stored_config)
+    self.assertNotIn("max_cases", stored_config["limits"])
     self.assertEqual(stored_config["model_test_node_selection"]["selected_execution_node"], "node-b")
     self.assertNotIn(secret, str(stored_config))
 
@@ -390,6 +416,43 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(initial_progress["ports_total"], 0)
     self.assertEqual(initial_progress["model_test_summary"]["overall_status"], "queued")
     self.assertEqual(initial_progress["model_test_results"]["cases"], [])
+
+  def test_enabled_launch_defaults_to_all_built_in_sets_when_selection_omitted(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    kwargs = _valid_launch_kwargs()
+    kwargs.pop("test_set_id")
+    kwargs["limits"] = {"max_cases": 1, "tested_max_tokens": 128}
+
+    result = launch_model_test(owner, **kwargs)
+
+    self.assertNotIn("error", result)
+    self.assertEqual(
+      [entry["id"] for entry in result["job_config"]["test_sets"]],
+      ["cbrn_safety_v1", "prompt_injection_v1"],
+    )
+    self.assertNotIn("max_cases", result["job_config"]["limits"])
+
+  def test_enabled_launch_accepts_legacy_test_set_id_alias(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    kwargs = _valid_launch_kwargs()
+    kwargs["test_set_id"] = "cbrn_safety_v1"
+
+    result = launch_model_test(owner, **kwargs)
+
+    self.assertNotIn("error", result)
+    self.assertEqual(result["job_config"]["test_set_id"], "cbrn_safety_v1")
+    self.assertEqual([entry["id"] for entry in result["job_config"]["test_sets"]], ["cbrn_safety_v1"])
+
+  def test_enabled_launch_rejects_unknown_question_set(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    kwargs = _valid_launch_kwargs()
+    kwargs["test_sets"] = [{"id": "unknown"}]
+
+    result = launch_model_test(owner, **kwargs)
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("unknown test set", result["message"])
+    owner.r1fs.add_json.assert_not_called()
 
   def test_enabled_launch_rejects_invalid_selected_peer_before_persistence(self):
     owner = _owner(

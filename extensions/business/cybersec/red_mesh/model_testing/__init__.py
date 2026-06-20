@@ -20,6 +20,7 @@ from .constants import (
   MODEL_TEST_SAFE_ERROR_CLASSES,
 )
 from .launch import launch_model_test
+from .catalog import sanitized_model_test_catalog
 from .node_selection import select_model_test_execution_node
 from .raw_evidence import is_restricted_raw_evidence_artifact
 from .security import (
@@ -49,6 +50,7 @@ __all__ = [
   "get_capability_status",
   "is_restricted_raw_evidence_artifact",
   "launch_model_test",
+  "sanitized_model_test_catalog",
   "select_model_test_execution_node",
   "validate_model_provider_credentials",
   "validate_provider_url",

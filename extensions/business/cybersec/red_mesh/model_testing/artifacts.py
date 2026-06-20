@@ -29,7 +29,7 @@ class ModelTestJobConfig:
   task_description: str
   created_by_name: str
   created_by_id: str
-  test_set_id: str
+  test_sets: list
   tested_model: dict
   evaluator_model: dict
   limits: dict
@@ -43,6 +43,9 @@ class ModelTestJobConfig:
   model_provider_secret_store_key_version: str = ""
   model_provider_secret_store_key_source: str = ""
   model_provider_secret_store_unsafe_fallback: bool = False
+  test_set_id: str = ""
+  test_set_catalog: list = None
+  selected_test_set_metadata: list = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -59,6 +62,9 @@ class ModelTestJobConfig:
       created_by_name=d.get("created_by_name", ""),
       created_by_id=d.get("created_by_id", ""),
       test_set_id=d.get("test_set_id", ""),
+      test_sets=list(d.get("test_sets") or []),
+      test_set_catalog=list(d.get("test_set_catalog") or []),
+      selected_test_set_metadata=list(d.get("selected_test_set_metadata") or []),
       tested_model=dict(d.get("tested_model") or {}),
       evaluator_model=dict(d.get("evaluator_model") or {}),
       limits=dict(d.get("limits") or {}),
