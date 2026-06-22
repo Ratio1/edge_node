@@ -37,7 +37,8 @@
             },
             "PASS": "$EE_MQTT",
             "PAYLOADS_CHANNEL": {
-                "TOPIC": "naeural_test/payloads"
+                "TOPIC": "naeural_test/payloads",
+                "TARGETED_TOPIC": "naeural_test/{}/payloads"
             },
             "PORT": "$EE_MQTT_PORT",
             "QOS": 0,

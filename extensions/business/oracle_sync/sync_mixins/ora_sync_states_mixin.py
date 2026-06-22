@@ -49,21 +49,31 @@ class _OraSyncStatesCallbacksMixin:
         not_added_to_r1fs = current_epoch_is_valid and (agreement_cid is None or signatures_cid is None)
         if (not self.cfg_use_r1fs) or not_added_to_r1fs:
           # The agreement or the signatures were never uploaded in the R1FS, so we try to upload them now.
-          agreement_success, newly_added_agreement = self.maybe_add_data_to_message(
-            message_dict=dct_epoch__agreed_median_table,
-            data_dict=availability_table,
-            data_key=epoch_key,
-            data_cid=agreement_cid,
-            debug=self.cfg_debug_sync_full,
-          )
+          # If there are no signatures, we consider that there is no agreement to upload, thus we do not upload an empty agreement.
+          if len(dct_signatures) > 0:
+            agreement_success, newly_added_agreement = self.maybe_add_data_to_message(
+              message_dict=dct_epoch__agreed_median_table,
+              data_dict=availability_table,
+              data_key=epoch_key,
+              data_cid=agreement_cid,
+              debug=self.cfg_debug_sync_full,
+            )
 
-          signatures_success, newly_added_signatures = self.maybe_add_data_to_message(
-            message_dict=dct_epoch__signatures,
-            data_dict=dct_signatures,
-            data_key=epoch_key,
-            data_cid=signatures_cid,
-            debug=self.cfg_debug_sync_full,
-          )
+            signatures_success, newly_added_signatures = self.maybe_add_data_to_message(
+              message_dict=dct_epoch__signatures,
+              data_dict=dct_signatures,
+              data_key=epoch_key,
+              data_cid=signatures_cid,
+              debug=self.cfg_debug_sync_full,
+            )
+          else:
+            # If there are no signatures, we consider that there is no agreement to upload.
+            agreement_success, newly_added_agreement = False, False
+            signatures_success, newly_added_signatures = False, False
+            epochs_with_empty.append(epoch)
+            dct_epoch__signatures[epoch_key] = {}
+            dct_epoch__agreed_median_table[epoch_key] = {}
+          # endif there are signatures to upload
 
           if newly_added_signatures or newly_added_agreement:
             newly_uploaded_epochs.append(epoch)
@@ -117,6 +127,9 @@ class _OraSyncStatesCallbacksMixin:
         stats_msg += f' | {len(added_agreement_success)}a {len(added_signatures_success)}s added'
         stats_msg += f' | {len(added_agreement_failed)}a {len(added_signatures_failed)}s failed'
         stats_msg += f' | {len(already_uploaded)} already uploaded | {len(epochs_with_empty)} empty'
+        if len(epochs_with_empty):
+          stats_msg += f'\n\t{len(epochs_with_empty)} invalid epochs(no signatures or no agreement): {epochs_with_empty}'
+        # endif epochs not added to epm
         self.P(f"Epochs: {stats_msg}.")
       # endif debug_sync
 
@@ -1565,7 +1578,7 @@ class _OraSyncStatesCallbacksMixin:
       -------
       bool: True if the agreed median table for the last epoch has been received, False otherwise
       """
-      return self._last_epoch_synced == self._current_epoch - 1
+      return self._last_epoch_synced == self.netmon.epoch_manager.get_current_epoch() - 1
 
     def _last_epoch_synced_is_not_previous_epoch(self):
       """

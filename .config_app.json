@@ -26,10 +26,12 @@
         },
         "PARAMS": {
             "CONFIG_CHANNEL": {
-                "TOPIC": "naeural/{}/config"
+                "TOPIC": "naeural/{}/config",
+                "QOS": 2
             },
             "CTRL_CHANNEL": {
-                "TOPIC": "naeural/ctrl"
+                "TOPIC": "naeural/ctrl",
+                "QOS": 1
             },
             "HOST": "$EE_MQTT_HOST",
             "NOTIF_CHANNEL": {
@@ -37,7 +39,8 @@
             },
             "PASS": "$EE_MQTT",
             "PAYLOADS_CHANNEL": {
-                "TOPIC": "naeural/payloads"
+                "TOPIC": "naeural/payloads",
+                "TARGETED_TOPIC": "naeural/{}/payloads"
             },
             "PORT": "$EE_MQTT_PORT",
             "QOS": 2,

@@ -192,6 +192,8 @@ class CvInferenceApiPlugin(BasePlugin):
         "results": results
       }
 
+    # Override only to attach balanced endpoint metadata to the inherited handler.
+    @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict(
         self,
@@ -226,12 +228,15 @@ class CvInferenceApiPlugin(BasePlugin):
         **kwargs
       )
 
+    # Override only to attach balanced endpoint metadata to the inherited handler.
+    @BasePlugin.balanced_endpoint
     @BasePlugin.endpoint(method="POST")
     def predict_async(
         self,
         image_data: str = '',
         metadata: Optional[Dict[str, Any]] = None,
         authorization: Optional[str] = None,
+        request_id: Optional[str] = None,
         **kwargs
     ):
       """
@@ -245,6 +250,9 @@ class CvInferenceApiPlugin(BasePlugin):
         Optional metadata accompanying the request.
       authorization : str or None, optional
         Bearer token used for authentication.
+      request_id : str or None, optional
+        Caller-provided id to use for request tracking. If omitted, the API
+        keeps the legacy generated-id behavior.
       **kwargs
         Extra parameters forwarded to the base handler.
 
@@ -257,6 +265,7 @@ class CvInferenceApiPlugin(BasePlugin):
         image_data=image_data,
         metadata=metadata,
         authorization=authorization,
+        request_id=request_id,
         **kwargs
       )
   """END API ENDPOINTS"""
@@ -293,10 +302,14 @@ class CvInferenceApiPlugin(BasePlugin):
         'error': error_message,
         'request_id': request_id,
       }
+      self._annotate_result_with_node_roles(
+        result_payload=request_data['result'],
+        request_data=request_data,
+      )
       request_data['finished_at'] = now_ts
       request_data['updated_at'] = now_ts
       self._metrics['requests_failed'] += 1
-      self._metrics['requests_active'] -= 1
+      self._decrement_active_requests()
       return
 
     def _mark_request_completed(
@@ -330,8 +343,12 @@ class CvInferenceApiPlugin(BasePlugin):
       request_data['finished_at'] = now_ts
       request_data['updated_at'] = now_ts
       request_data['result'] = inference_payload
+      self._annotate_result_with_node_roles(
+        result_payload=request_data['result'],
+        request_data=request_data,
+      )
       self._metrics['requests_completed'] += 1
-      self._metrics['requests_active'] -= 1
+      self._decrement_active_requests()
       return
 
     def _extract_request_id(self, payload: Optional[Dict[str, Any]], inference: Any):

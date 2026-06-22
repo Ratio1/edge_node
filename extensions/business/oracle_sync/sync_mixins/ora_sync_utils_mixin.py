@@ -867,6 +867,11 @@ class _OraSyncUtilsMixin:
       else:
         if self.cfg_use_r1fs:
           message_dict[data_key] = data_cid
+        else:
+          # At least for now, if R1FS is not used, we will add the data directly to the message, even if a CID is provided.
+          # Maybe in the future this will change, but it would be counterintuitive to pass a CID from R1FS when
+          # it is disabled.
+          message_dict[data_key] = data_dict
         success = True
       # endif data_cid is provided
       return success, newly_added

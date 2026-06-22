@@ -1,3 +1,5 @@
+import math
+
 from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import (
@@ -72,6 +74,105 @@ class _DeeployTargetNodesMixin:
       return int(float(mem[:-2]) * 1024 * 1024 * 1024)  # GB to bytes
     else:
       return int(float(mem))  # assume bytes
+
+  def _parse_node_telemetry_cpu(self, value):
+    """
+    Parse node CPU telemetry. Missing or malformed node telemetry must fail
+    closed as zero capacity instead of crashing deployment preflight.
+    """
+    try:
+      cpu = self._parse_cpu_value(value, default=0.0)
+    except ValueError:
+      return 0.0
+    if cpu is None or not math.isfinite(cpu) or cpu < 0:
+      return 0.0
+    return cpu
+
+  def _parse_node_telemetry_memory_bytes(self, value):
+    """
+    Parse node memory telemetry. NetMon reports memory in GB, but mixed-version
+    or malformed summaries must fail closed as zero capacity, not abort deploy.
+    """
+    try:
+      memory_bytes = self._parse_memory(value)
+    except (AttributeError, OverflowError, TypeError, ValueError):
+      return 0
+    if not math.isfinite(memory_bytes) or memory_bytes < 0:
+      return 0
+    return int(memory_bytes)
+
+  def _parse_node_telemetry_bytes(self, value):
+    """
+    Parse byte-valued node telemetry with the same fail-closed policy.
+    """
+    try:
+      parsed = float(value)
+    except (TypeError, ValueError):
+      return 0
+    if not math.isfinite(parsed) or parsed < 0:
+      return 0
+    return int(parsed)
+
+  def _parse_node_telemetry_disk_bytes(self, value):
+    """
+    Parse NetMon disk telemetry.
+
+    NetMon reports total/available disk in GB for display-facing node specs,
+    while Deeploy resource requests are compared in bytes. Keep malformed
+    values fail-closed as zero capacity, but convert valid GB values first.
+    """
+    try:
+      disk_gb = float(value)
+    except (TypeError, ValueError):
+      return 0
+    if not math.isfinite(disk_gb) or disk_gb < 0:
+      return 0
+    return int(disk_gb * 1024 * 1024 * 1024)
+
+  def _parse_node_telemetry_bool(self, value):
+    """
+    Parse boolean node telemetry with a fail-closed policy. This protects
+    Deeploy against mixed-version NetMon summaries returning "false"/"0" as
+    strings, which Python would otherwise treat as truthy.
+    """
+    if isinstance(value, bool):
+      return value
+    if isinstance(value, str):
+      value = value.strip().lower()
+      if value in {"1", "true", "yes", "y"}:
+        return True
+      if value in {"0", "false", "no", "n", ""}:
+        return False
+      return False
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+      return math.isfinite(value) and value == 1
+    return False
+
+
+  def _parse_node_supervisor_state(self, value):
+    """
+    Parse supervisor telemetry for target selection.
+
+    Unlike generic capability booleans, unknown supervisor state must not be
+    coerced to False: deploying to a supervisor is unsafe, so missing/malformed
+    summary data is treated as "unknown" and filtered out by callers.
+    """
+    if isinstance(value, bool):
+      return value
+    if isinstance(value, str):
+      value = value.strip().lower()
+      if value == "":
+        return None
+      if value in {"1", "true", "yes", "y"}:
+        return True
+      if value in {"0", "false", "no", "n"}:
+        return False
+      return None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+      if math.isfinite(value) and value in (0, 1):
+        return bool(value)
+      return None
+    return None
 
   def _get_request_plugin_signatures_from_pipeline(self, inputs):
     """
@@ -190,8 +291,13 @@ class _DeeployTargetNodesMixin:
     )
     required_mem = container_requested_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
     required_mem_bytes = self._parse_memory(required_mem)
+    required_storage = container_requested_resources.get(DEEPLOY_RESOURCES.STORAGE)
+    required_storage_bytes = self._parse_memory(required_storage) if required_storage else 0
 
-    self.Pd(f"Required resources: CPU={required_cpu} cores, Memory={required_mem} ({required_mem_bytes} bytes)")
+    self.Pd(
+      f"Required resources: CPU={required_cpu} cores, Memory={required_mem} "
+      f"({required_mem_bytes} bytes), Storage={required_storage} ({required_storage_bytes} bytes)"
+    )
 
     for addr, node_resources in nodes_with_resources.items():
       self.Pd(f"Evaluating node {addr}")
@@ -268,14 +374,27 @@ class _DeeployTargetNodesMixin:
       self.Pd(f"Node {addr} projected usage (with new app): CPU={used_cpu} cores, Memory={used_memory} bytes")
 
       # Check if the node has enough resources
-      self.Pd(f"Node {addr} total resources: CPU={node_resources['cpu']} cores, Memory={node_resources['memory']} bytes")
+      node_cpu = self._parse_node_telemetry_cpu(node_resources.get('cpu'))
+      node_memory = self._parse_node_telemetry_bytes(node_resources.get('memory'))
+      node_storage = self._parse_node_telemetry_bytes(node_resources.get(DEEPLOY_RESOURCES.STORAGE))
+      self.Pd(
+        f"Node {addr} total resources: CPU={node_cpu} cores, Memory={node_memory} bytes, "
+        f"Available storage={node_storage} bytes"
+      )
       has_failed = False
-      if used_cpu > node_resources['cpu']:
-        self.Pd(f"Node {addr} has not enough CPU cores. used_cpu ({used_cpu}) > node_cpu ({node_resources['cpu']})")
+      if used_cpu > node_cpu:
+        self.Pd(f"Node {addr} has not enough CPU cores. used_cpu ({used_cpu}) > node_cpu ({node_cpu})")
         has_failed = True
 
-      if used_memory > node_resources['memory']:
-        self.Pd(f"Node {addr} has not enough RAM. used_memory ({used_memory}) > node_memory ({node_resources['memory']})")
+      if used_memory > node_memory:
+        self.Pd(f"Node {addr} has not enough RAM. used_memory ({used_memory}) > node_memory ({node_memory})")
+        has_failed = True
+
+      if required_storage_bytes > 0 and required_storage_bytes > node_storage:
+        self.Pd(
+          f"Node {addr} has not enough disk. required_storage "
+          f"({required_storage_bytes}) > available_storage ({node_storage})"
+        )
         has_failed = True
 
       if has_failed:
@@ -371,7 +490,7 @@ class _DeeployTargetNodesMixin:
     for addr in nodes:
       # Check if the node supports the requested plugin
       if requires_container_capabilities:
-        is_did_supported = self.netmon.network_node_has_did(addr=addr)
+        is_did_supported = self._parse_node_telemetry_bool(self.netmon.network_node_has_did(addr=addr))
         if not is_did_supported:
           self.Pd(f"Node {addr} does not support container deployments. Skipping...")
           continue
@@ -383,23 +502,25 @@ class _DeeployTargetNodesMixin:
           continue
 
       self.Pd(f"Node {addr} cont in function.")
-      total_cpu = self.netmon.network_node_total_cpu_cores(addr)
+      total_cpu = self._parse_node_telemetry_cpu(self.netmon.network_node_total_cpu_cores(addr))
 
       total_memory = self.netmon.network_node_total_mem(addr)
-      total_memory_bytes = self._parse_memory(total_memory)
+      total_memory_bytes = self._parse_node_telemetry_memory_bytes(total_memory)
 
       current_node_total_resources = {
         'cpu': total_cpu,
         'memory': total_memory_bytes,
+        DEEPLOY_RESOURCES.STORAGE: self._parse_node_telemetry_disk_bytes(self.netmon.network_node_available_disk(addr)),
       }
 
       if node_res_req:
+        node_req_cpu = self._parse_cpu_value(node_req_cpu, default=None)
 
-        if total_cpu < node_req_cpu:
+        if node_req_cpu is not None and total_cpu < node_req_cpu:
           self.Pd(f"Node {addr} has not enough CPU cores in total. Skipping...")
           continue
 
-        if total_memory_bytes < node_req_memory_bytes:
+        if node_req_memory_bytes > 0 and total_memory_bytes < node_req_memory_bytes:
           self.Pd(f"Node {addr} has not enought RAM in total. Skipping...")
           continue
 
@@ -426,8 +547,9 @@ class _DeeployTargetNodesMixin:
     for addr, value in network_nodes.items():
       ai_addr = self.bc.maybe_add_prefix(addr)
 
-      is_online = self.netmon.network_node_is_online(ai_addr)
-      if value.get('is_supervisor') is True or not is_online:
+      is_online = self._netmon_node_is_online_for_control(ai_addr)
+      is_supervisor = self._parse_node_supervisor_state(self.netmon.network_node_is_supervisor(ai_addr))
+      if is_supervisor is not False or not is_online:
       # FIXME: Disabled for now, as the most of the nodes are are marked as non-trusted.
       # if value.get('is_supervisor') is True or not value.get('trusted', False) or not is_online:
         continue
@@ -537,11 +659,11 @@ class _DeeployTargetNodesMixin:
 
     for node in inputs.target_nodes:
       addr = self._check_and_maybe_convert_address(node)
-      is_supervisor = self.netmon.network_node_is_supervisor(addr=addr)
-      if is_supervisor:
-        msg = f"{DEEPLOY_ERRORS.NODES6}: Node {addr} is a supervisor node and cannot be used for deeployment"
+      is_supervisor = self._parse_node_supervisor_state(self.netmon.network_node_is_supervisor(addr=addr))
+      if is_supervisor is not False:
+        msg = f"{DEEPLOY_ERRORS.NODES6}: Node {addr} is a supervisor node or has unknown supervisor state and cannot be used for deeployment"
         raise ValueError(msg)
-      is_online = self.netmon.network_node_is_online(addr)
+      is_online = self._netmon_node_is_online_for_control(addr)
       if is_online:
         if skip_resources:
           self.Pd(f"Skipping resource validation for node {addr}")
@@ -588,17 +710,22 @@ class _DeeployTargetNodesMixin:
       return result
 
     # Get available resources
-    avail_cpu = self.netmon.network_node_get_cpu_avail_cores(addr)
+    avail_cpu = self._parse_node_telemetry_cpu(self.netmon.network_node_get_cpu_avail_cores(addr))
     avail_mem = self.netmon.network_node_available_memory(addr)  # in GB
-    avail_mem_bytes = self._parse_memory(f"{avail_mem}g")
-    avail_disk = self.netmon.network_node_available_disk(addr)  # in bytes
+    avail_mem_bytes = self._parse_node_telemetry_memory_bytes(avail_mem)
+    avail_disk = self._parse_node_telemetry_disk_bytes(self.netmon.network_node_available_disk(addr))  # in bytes
 
     # Get required resources from the request
     required_resources = self._aggregate_container_resources(inputs) or {}
     required_mem = required_resources.get(DEEPLOY_RESOURCES.MEMORY, DEFAULT_CONTAINER_RESOURCES.MEMORY)
-    required_cpu = required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU)
+    required_cpu = self._parse_cpu_value(
+      required_resources.get(DEEPLOY_RESOURCES.CPU, DEFAULT_CONTAINER_RESOURCES.CPU),
+      default=DEFAULT_CONTAINER_RESOURCES.CPU,
+    )
+    required_storage = required_resources.get(DEEPLOY_RESOURCES.STORAGE)
 
     required_mem_bytes = self._parse_memory(required_mem)
+    required_disk_bytes = self._parse_memory(required_storage) if required_storage else 0
 
     # CPU check
     if avail_cpu < required_cpu:
@@ -625,6 +752,21 @@ class _DeeployTargetNodesMixin:
           DEEPLOY_RESOURCES.RESOURCE: DEEPLOY_RESOURCES.MEMORY,
           DEEPLOY_RESOURCES.AVAILABLE_VALUE: avail_mem_mb,
           DEEPLOY_RESOURCES.REQUIRED_VALUE: required_mem_mb,
+          DEEPLOY_RESOURCES.UNIT: DEEPLOY_RESOURCES.MB
+      })
+
+    # Check Volume Storage / disk availability.
+    if required_disk_bytes > 0 and avail_disk < required_disk_bytes:
+      result[DEEPLOY_RESOURCES.AVAILABLE][DEEPLOY_RESOURCES.STORAGE] = avail_disk
+      result[DEEPLOY_RESOURCES.REQUIRED][DEEPLOY_RESOURCES.STORAGE] = required_disk_bytes
+
+      result[DEEPLOY_RESOURCES.STATUS] = False
+      avail_disk_mb = avail_disk / (1024 * 1024)
+      required_disk_mb = required_disk_bytes / (1024 * 1024)
+      result[DEEPLOY_RESOURCES.DETAILS].append({
+          DEEPLOY_RESOURCES.RESOURCE: DEEPLOY_RESOURCES.STORAGE,
+          DEEPLOY_RESOURCES.AVAILABLE_VALUE: avail_disk_mb,
+          DEEPLOY_RESOURCES.REQUIRED_VALUE: required_disk_mb,
           DEEPLOY_RESOURCES.UNIT: DEEPLOY_RESOURCES.MB
       })
 

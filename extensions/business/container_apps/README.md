@@ -9,6 +9,9 @@ Container application plugins for running Docker containers with Cloudflare tunn
 - [Features](#features)
   - [Health Check Configuration](#health-check-configuration)
 - [Configuration Reference](#configuration-reference)
+  - [Local Env Overrides](#local-env-overrides)
+  - [Reset](#reset)
+  - [Volume Sync](#volume-sync)
 - [Future Enhancements](#future-enhancements)
   - [Continuous Health Monitoring](#continuous-health-monitoring)
   - [Per-Port Health Checks](#per-port-health-checks)
@@ -36,6 +39,11 @@ The Container Apps module provides plugins for managing Docker containers with i
 ---
 
 ## Features
+
+- **Normalized exposed ports**: `EXPOSED_PORTS` is the forward-looking config surface for container port exposure and per-port tunnel settings.
+- **Explicit semaphore networking keys**: container apps now publish `HOST_IP`, `HOST_PORT`, `CONTAINER_IP`, and `CONTAINER_PORT` in addition to legacy `HOST`, `PORT`, and `URL`.
+- **UI-friendly dynamic env support**: Deeploy can compile `DYNAMIC_ENV_UI` fragments to backend `DYNAMIC_ENV` entries, including generic plugin semaphore lookups.
+- **App-local control files**: apps can request local env overrides and fixed-volume resets through `/r1en_system`.
 
 ### Health Check Configuration
 
@@ -143,6 +151,215 @@ The plugin uses a consolidated `HEALTH_CHECK` configuration dict to determine wh
 ## Configuration Reference
 
 See `ContainerAppRunnerPlugin.CONFIG` for full configuration options.
+
+### Exposed Ports
+
+`EXPOSED_PORTS` is a dictionary keyed by internal container port:
+
+```python
+"EXPOSED_PORTS": {
+    "3000": {
+        "is_main_port": True,
+        "host_port": None,
+        "tunnel": {
+            "enabled": True,
+            "engine": "cloudflare",
+            "token": "cf_token_for_3000",
+        },
+    },
+    "3001": {
+        "host_port": None,
+        "tunnel": {
+            "enabled": False,
+        },
+    },
+}
+```
+
+Notes:
+
+- `is_main_port` marks the port used for default health checks, semaphore networking exports, and the primary app URL.
+- `host_port` is optional; when omitted, CAR allocates a host port automatically.
+- `tunnel.enabled=true` currently requires `engine="cloudflare"` and a token.
+- Legacy `PORT`, `CONTAINER_RESOURCES["ports"]`, `CLOUDFLARE_TOKEN`, and `EXTRA_TUNNELS` are still accepted as compatibility inputs and normalized internally to `EXPOSED_PORTS`.
+
+### Dynamic Env and Semaphore Values
+
+Deeploy accepts a UI-facing `DYNAMIC_ENV_UI` payload and compiles it to backend `DYNAMIC_ENV` entries:
+
+- `static` -> `{"type": "static", "value": "..."}`
+- `host_ip` -> `{"type": "host_ip"}`
+- `container_ip(provider)` -> `{"type": "shmem", "path": [provider, "CONTAINER_IP"]}`
+- `plugin_value(provider, key)` -> `{"type": "shmem", "path": [provider, key]}`
+
+When a container app acts as the provider, new consumers should prefer these explicit exported keys:
+
+- `HOST_IP`
+- `HOST_PORT`
+- `CONTAINER_IP`
+- `CONTAINER_PORT`
+
+Legacy `HOST`, `PORT`, and `URL` remain available for backward compatibility.
+
+### Local Env Overrides
+
+`ENV_OVERRIDES` lets an app add or override its own container environment
+without changing Deeploy/config. The feature is enabled by default:
+
+```python
+"ENV_OVERRIDES": {
+    "ENABLED": True,
+}
+```
+
+Apps write one request to `/r1en_system/env-overrides/request.json`:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "env-001",
+  "apply": "restart_now",
+  "set": {
+    "LOG_LEVEL": "trace",
+    "FEATURE_FLAGS": ["fast", "debug"]
+  },
+  "remove": ["OLD_LOCAL_OVERRIDE"]
+}
+```
+
+`apply` defaults to `"next_restart"` and also accepts `"restart_now"`.
+`request_id` is correlation only; repeating the same request processes it again.
+Unknown top-level fields are rejected; `clear_all` and secrets are not part of v1.
+
+`set` accepts strings, numbers, booleans, arrays, and objects. Docker receives
+strings: strings are unchanged, booleans become `true`/`false`, numbers become
+decimal strings, and arrays/objects become compact JSON strings. `null` is
+invalid; use `remove` instead. Variable names must match
+`^[A-Za-z_][A-Za-z0-9_]*$`. CAR rejects reserved control/system variables,
+including `R1EN_*`, `R1_*`, `EE_*`, `CONTAINER_NAME`, and CAR networking keys.
+
+Overrides are stored host-private as `plugin_data/env_overrides.json`, survive
+container restarts, CAR restarts, config updates, and reset requests, and are
+applied after default env, semaphore env, config `ENV`, and `DYNAMIC_ENV`.
+Invalid requests write `request.json.invalid` and `response.json` with
+`status="error"`; successful requests write `response.json` with changed keys
+and active override count, not a full effective env dump.
+
+### Reset
+
+`RESET` lets an app request a local destructive reset of CAR-managed fixed-size
+app data volumes followed by a container restart. The feature is enabled by default:
+
+```python
+"RESET": {
+    "ENABLED": True,
+}
+```
+
+Apps write one request to `/r1en_system/reset/request.json`:
+
+```json
+{
+  "schema_version": 1,
+  "request_id": "reset-001",
+  "mode": "volumes",
+  "apply": "restart_now",
+  "volumes": ["data"]
+}
+```
+
+V1 supports only `mode="volumes"` and only `apply="restart_now"`; both fields
+default to those values when omitted. `volumes` is optional; when omitted, CAR
+resets all active `FIXED_SIZE_VOLUMES`. When present, entries must be logical
+`FIXED_SIZE_VOLUMES` names, not paths. Unknown top-level request fields are
+rejected.
+
+Reset scope is deliberately narrow: v1 clears the contents inside selected
+fixed-size volume mount roots without deleting the mount root itself. It does
+not reset legacy `VOLUMES`, `FILE_VOLUMES`, `/r1en_system`, CAR plugin
+metadata, or `plugin_data/env_overrides.json`. CAR validates the plan before
+stopping the runtime and aborts without filesystem mutation if it cannot prove
+the container stopped/removed. Invalid requests write `request.json.invalid`
+and `response.json` with `status="error"`.
+
+### Volume Sync
+
+`SYNC` lets one CAR publish mounted application state to R1FS/ChainStore and
+lets another CAR apply the latest snapshot for the same key. It is available on
+`ContainerAppRunnerPlugin` and inherited runners such as `WorkerAppRunnerPlugin`.
+
+```python
+"SYNC": {
+    "ENABLED": False,
+    "KEY": None,                         # shared ChainStore key
+    "TYPE": None,                        # "provider" | "consumer"
+    "POLL_INTERVAL": 10,                 # provider/consumer tick cadence
+    "HSYNC_POLL_INTERVAL": 60,           # consumer network refresh cadence, min 10
+    "ALLOW_ONLINE_PROVIDER_CAPTURE": False,
+    "CONSUMER_APPLY_MODE": "offline_restart",
+}
+```
+
+Provider apps request a publish by writing JSON to
+`/r1en_system/volume-sync/request.json`:
+
+```json
+{
+  "archive_paths": ["/app/data/"],
+  "metadata": {"epoch": 1},
+  "runtime": {
+    "provider_capture": "offline",
+    "consumer_apply": "offline_restart"
+  }
+}
+```
+
+`archive_paths` must be a non-empty list of absolute paths inside CAR-managed
+volumes. Offline capture rejects symlinks and unsupported special files. Online
+provider capture can read from the live container filesystem, including
+non-persistent paths, but only when the provider operator locally sets
+`ALLOW_ONLINE_PROVIDER_CAPTURE=True`.
+
+CAR writes provider results to `/r1en_system/volume-sync/response.json` and
+consumer apply results to `/r1en_system/volume-sync/last_apply.json`. Invalid
+requests are preserved as `request.json.invalid` with a sanitized error.
+`/r1en_system` is CAR-owned control plane: the mount root and `volume-sync/`
+directory are enforced as root-owned. Apps can write requests through the sticky
+`01777` `volume-sync/` directory, but cannot own or replace the control
+directory. CAR-owned result files are app-readable but not app-writable.
+
+Consumer lifecycle is local policy. Providers may publish runtime metadata, but
+consumers apply according to their own `CONSUMER_APPLY_MODE`:
+
+| Mode | Behavior |
+|------|----------|
+| `offline_restart` | Stop container, apply snapshot, restart container. Default. |
+| `online_no_restart` | Accepted for compatibility, but currently forced to `offline_restart` for filesystem safety. |
+| `online_restart` | Accepted for compatibility, but currently forced to `offline_restart` for filesystem safety. |
+
+Published manifests include `schema_version`, `archive_format`, `encryption`,
+and `archive_paths`. Consumers validate these before downloading/applying a CID.
+In `offline_restart` mode the consumer validates the ChainStore record,
+downloads the CID, validates the tar, and prepares an apply plan before stopping
+the container. Bad CIDs or corrupt archives are quarantined with retry backoff,
+so a bad publish does not repeatedly stop a consumer. Offline provider capture
+and offline consumer apply both abort without filesystem mutation if CAR cannot
+confirm the container stopped/removed.
+
+Consumer apply state is tracked in host-private plugin data. `last_apply.json`
+is app-visible notification only; CAR deduplicates from durable internal apply
+state and leaves the container stopped if rollback cannot prove the volume is
+consistent.
+
+Provider publishes require a positive `chainstore_hset` acknowledgement. If the
+record is not confirmed, CAR reports an error, removes the just-uploaded CID
+best-effort, and does not append sent history. Provider CID retirement may
+remote-unpin old CIDs it published; consumer retirement only removes local
+downloaded files and does not remote-unpin provider content.
+
+Restored files and directories are owned by the target consumer volume root
+owner/group, with unsafe special mode bits stripped. This keeps replicated state
+modifiable for non-root app images whose fixed-size data volume is app-owned.
 
 ---
 

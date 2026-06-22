@@ -137,10 +137,18 @@ class LocalServingApiPlugin(FastApiWebAppPlugin):
 
   def _setup_semaphore_env(self):
     """Set semaphore environment variables for bundled plugins."""
+    super(LocalServingApiPlugin, self)._setup_semaphore_env()
     localhost_ip = self.log.get_localhost_ip()
-    port = self.cfg_port
+    try:
+      port = self.port or self.cfg_port
+    except Exception as exc:
+      self.P(f"Failed to resolve runtime port: {exc}", color='y')
+      port = None
+    self.semaphore_set_env('HOST', localhost_ip)
     self.semaphore_set_env('API_HOST', localhost_ip)
     if port:
+      self.semaphore_set_env('PORT', str(port))
+      self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, port))
       self.semaphore_set_env('API_PORT', str(port))
       self.semaphore_set_env('API_URL', 'http://{}:{}'.format(localhost_ip, port))
     return

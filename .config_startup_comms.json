@@ -1,0 +1,108 @@
+{
+  "EE_ID": "E2dkr",
+  "SECURED": false,
+  "IO_FORMATTER": "",
+  "MAIN_LOOP_RESOLUTION": 10,
+  "SYSTEM_TEMPERATURE_CHECK": false,
+  "COMPRESS_HEARTBEAT": true,
+  "MIN_AVAIL_MEM_THR": -10.09,
+  "MIN_AVAIL_DISK_SIZE_GB": -100,
+  "CRITICAL_RESTART_LOW_MEM": -10.20,
+  "CHECK_RAM_ON_SHUTDOWN": false,
+  "SECONDS_HEARTBEAT": 5,
+  "HEARTBEAT_TIMERS": false,
+  "HEARTBEAT_LOG": false,
+  "PLUGINS_ON_THREADS": true,
+  "ADMIN_PIPELINE_ASYNC_DISPATCH": true,
+  "CAPTURE_STATS_DISPLAY": 60,
+  "SHUTDOWN_NO_STREAMS": false,
+  "TIMERS_DUMP_INTERVAL": 654,
+  "EXTENDED_TIMERS_DUMP": true,
+  "PLUGINS_DEBUG_CONFIG_CHANGES": false,
+  "BLOCKCHAIN_CONFIG": {
+    "PEM_FILE": "e2.pem",
+    "PASSWORD": null,
+    "PEM_LOCATION": "data"
+  },
+  "CAPTURE_ENVIRONMENT": {
+    "FORCE_CAP_RESOLUTION": -1,
+    "DEFAULT_PLUGIN": false,
+    "DISALLOWED_URL_DUPLICATES": [
+      "VideoStream"
+    ]
+  },
+  "SERVING_ENVIRONMENT": {
+    "LOG_TIMEOUTS_PERIOD": 3600,
+    "COMM_ENGINE": "queue",
+    "USE_AMP": false,
+    "MAX_WAIT_TIME_MULTIPLIER": 50,
+    "AUTO_WARMUPS": {},
+    "COMM_METHOD": "default",
+    "SERVING_IN_PROCESS": false,
+    "SERVING_TIMERS_IDLE_DUMP": 1801,
+    "SERVING_TIMERS_PREDICT_DUMP": 601,
+    "CHECK_BLOCKED_INPROCESS_SERVING": true,
+    "MODEL_ZOO_CONFIG": {
+      "endpoint": "",
+      "access_key": "",
+      "secret_key": "",
+      "secure": false,
+      "bucket_name": ""
+    }
+  },
+  "PLUGINS_ENVIRONMENT": {
+    "DEMO_MODE": false,
+    "DEBUG_OBJECTS": false,
+    "SEND_MANIFEST_EACH": 290,
+    "ADD_ORIGINAL_IMAGE": true,
+    "DEBUG_CONFIG_CHANGES": false
+  },
+  "ADMIN_PIPELINE": {
+    "NET_CONFIG_MONITOR": {
+      "PROCESS_DELAY": 0
+    },
+    "NET_MON_01": {
+      "PROCESS_DELAY": 5,
+      "SAVE_STATUS_SNAPSHOT": true,
+      "STATUS_SNAPSHOT_FILE": "netmon_status.json"
+    },
+    "NETMON_API_PROBE": {
+      "PROCESS_DELAY": 0,
+      "PORT": 3000,
+      "TUNNEL_ENGINE_ENABLED": false,
+      "NGROK_ENABLED": false,
+      "NGROK_USE_API": false,
+      "LOG_REQUESTS": false,
+      "DEBUG_TIMINGS": false,
+      "PROFILE_LOG_PER_REQUEST": false
+    }
+  },
+  "COMMUNICATION_ENVIRONMENT": {
+    "ENCRYPTED_COMMS": false,
+    "ACCEPT_UNENCRYPTED_COMMANDS": true,
+    "LOCAL_COMMAND_BYPASS": true,
+    "QOS": 0,
+    "CONN_MAX_RETRY_ITERS": 5,
+    "LOG_SEND_COMMANDS": false,
+    "SAVE_RECEIVED_COMMANDS": true,
+    "DEBUG_COMM_ERRORS": false,
+    "DEBUG_LOG_PAYLOADS": false,
+    "DEBUG_LOG_PAYLOADS_PIPELINES": [],
+    "DEBUG_LOG_PAYLOADS_SIGNATURES": [],
+    "DEBUG_LOG_PAYLOADS_SAVE_FILTER": null,
+    "DEBUG_LOG_PAYLOADS_REVALIDATE": false
+  },
+  "HEAVY_OPS_CONFIG": {
+    "ACTIVE_COMM_ASYNC": [
+      "send_mail",
+      "save_image_dataset"
+    ],
+    "ACTIVE_ON_COMM_THREAD": []
+  },
+  "CONFIG_RETRIEVE": [
+    {
+      "TYPE": "local",
+      "APP_CONFIG_ENDPOINT": "./.config_app_comms.json"
+    }
+  ]
+}

@@ -1,6 +1,7 @@
 BASE_AGENT_MIXIN_CONFIG = {
   'OBJECT_TYPE': [],
-  "ALLOW_EMPTY_INPUTS": False,  # if this is set to true the on-idle will be triggered continuously the process
+  "ALLOW_EMPTY_INPUTS": True,  # This is done in order to trigger _semaphore_maybe_auto_signal and
+  # _semaphore_maybe_auto_send when this runs alongside a container plugin that is waiting for semaphore.
   "DEBUG_LOGGING_ENABLED": True,
 
   "VALIDATION_RULES": {
@@ -71,7 +72,8 @@ class _BaseAgentMixin(object):
     model_name = inferences[0].get('MODEL_NAME', None) if len(inferences) > 0 else None
     cnt_initial_inferences = len(inferences)
     inferences, valid_idxs = self.filter_valid_inferences(inferences, return_idxs=True)
-    self.Pd(f"Filtered {cnt_initial_inferences} inferences to {len(inferences)} valid inferences.")
+    if cnt_initial_inferences > 0:
+      self.Pd(f"Filtered {cnt_initial_inferences} inferences to {len(inferences)} valid inferences.")
     filtered_data = None
     if data is not None:
       filtered_data = [

@@ -1,17 +1,43 @@
+import json
+import re
+from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
+from math import isfinite
+
 from naeural_core.constants import BASE_CT
 from naeural_core.main.net_mon import NetMonCt
 from naeural_core import constants as ct
+from ratio1.bc.base import compact_canonical_sha256
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
   DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL, \
-  CONTAINERIZED_APPS_SIGNATURES
+  CONTAINERIZED_APPS_SIGNATURES, DEEPLOY_PLUS_PREFERRED_NODES_HKEY
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
 DEEPLOY_DEBUG = True
+STACK_CPU_QUANTUM = Decimal("0.01")
 
 MESSAGE_PREFIX = "Please sign this message for Deeploy: "
+DEEPLOY_WRAPPER_HEADER = "Please sign this Deeploy request:"
+DEEPLOY_WRAPPER_HASH_LABEL = "Request hash"
+DEEPLOY_V3_HASH_EXCLUDED_KEYS = {
+  "address",
+  "signature",
+  BASE_CT.BCctbase.SIGN,
+  BASE_CT.BCctbase.SENDER,
+  BASE_CT.BCctbase.HASH,
+  BASE_CT.BCctbase.SIGN_CANON_V,
+  BASE_CT.BCctbase.ETH_SIGN,
+  BASE_CT.BCctbase.ETH_SENDER,
+}
+PREFERRED_NODE_ADDRESS_RE = re.compile(r"^0xai_[A-Za-z0-9_-]+$")
+PREFERRED_NODES_SCHEMA_VERSION = 1
+PREFERRED_NODES_MAX_COUNT = 100
+PREFERRED_NODES_MAX_PAYLOAD_BYTES = 32 * 1024
+PREFERRED_NODE_ALIAS_MAX_LENGTH = 128
+PREFERRED_NODE_DESCRIPTION_MAX_LENGTH = 512
 
 class _DeeployMixin:
   def __init__(self):
@@ -27,6 +53,452 @@ class _DeeployMixin:
       s = "[DEPDBG] " + s
       self.P(s, *args, **kwargs)
     return  
+
+  @staticmethod
+  def _node_specs_number(value):
+    """
+    Normalize resource telemetry numbers for JSON responses.
+    """
+    if value is None or isinstance(value, bool):
+      return None
+    try:
+      number = float(value)
+    except (TypeError, ValueError):
+      return None
+    if not isfinite(number) or number < 0:
+      return None
+    if number.is_integer():
+      return int(number)
+    return round(number, 3)
+
+
+  def _normalize_node_specs_address(self, node_addr):
+    """
+    Normalize a caller-provided node address to the prefixed internal form.
+    """
+    if node_addr is None:
+      return None
+
+    raw_addr = str(node_addr).strip()
+    if not raw_addr:
+      return None
+
+    if hasattr(self, 'bc') and hasattr(self.bc, 'maybe_add_prefix'):
+      return self.bc.maybe_add_prefix(raw_addr)
+
+    return raw_addr if raw_addr.startswith("0xai_") else f"0xai_{raw_addr}"
+
+
+  def _netmon_node_is_online_for_control(self, node_addr):
+    """
+    Use NetMon's explicit command/control liveness predicate when available.
+
+    Summary-backed liveness is only a preflight for control/deploy requests; the
+    actual mutation still depends on command dispatch and response handling.
+    """
+    checker = getattr(self.netmon, "network_node_is_online_for_control", None)
+    if callable(checker):
+      return checker(node_addr)
+    return self.netmon.network_node_is_online(node_addr)
+
+
+  def _get_node_specs(self, target_nodes):
+    """
+    Return total and live-available CPU, memory, and disk specs for nodes.
+    Values are reported in cores and GB, matching heartbeat telemetry units.
+    """
+    if not isinstance(target_nodes, (list, tuple, set)):
+      raise ValueError("'target_nodes' must be a list of node addresses.")
+
+    result = {}
+    seen = set()
+
+    for node in target_nodes:
+      node_addr = self._normalize_node_specs_address(node)
+      if not node_addr or node_addr in seen:
+        continue
+      seen.add(node_addr)
+
+      try:
+        result[node_addr] = {
+          "node_alias": self.netmon.network_node_eeid(node_addr),
+          "node_is_online": self._netmon_node_is_online_for_control(node_addr),
+          "cpu": {
+            "total": self._node_specs_number(self.netmon.network_node_total_cpu_cores(node_addr)),
+            "available": self._node_specs_number(self.netmon.network_node_avail_cpu_cores(node_addr)),
+          },
+          "memory": {
+            "total": self._node_specs_number(self.netmon.network_node_total_mem(node_addr)),
+            "available": self._node_specs_number(self.netmon.network_node_avail_mem(node_addr)),
+          },
+          "disk": {
+            "total": self._node_specs_number(self.netmon.network_node_total_disk(node_addr)),
+            "available": self._node_specs_number(self.netmon.network_node_avail_disk(node_addr)),
+          },
+        }
+      except Exception as exc:
+        result[node_addr] = {
+          "error": str(exc),
+        }
+    # endfor target_nodes
+
+    return result
+
+
+  def _preferred_nodes_now(self):
+    """
+    Return the current timestamp for Preferred Nodes metadata.
+
+    Returns
+    -------
+    str
+        UTC ISO-8601 timestamp with millisecond precision. The format matches
+        the dApp's existing `Date.toISOString()` values so old local-cache
+        entries and CStore entries can be compared lexicographically.
+    """
+    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+  def _preferred_node_default_alias(self, address: str):
+    """
+    Return the fallback alias for a preferred node address.
+
+    Parameters
+    ----------
+    address : str
+        Normalized Ratio1 node address.
+
+    Returns
+    -------
+    str
+        Compact address alias used only when live node metadata does not expose
+        `node_alias` yet.
+    """
+    if len(address) <= 18:
+      return address
+    return f"{address[:12]}...{address[-6:]}"
+
+
+  def _preferred_nodes_storage_key(self, auth_result: dict):
+    """
+    Build the CStore field key for a CSP's Preferred Nodes list.
+
+    Parameters
+    ----------
+    auth_result : dict
+        Deeploy auth result containing `escrow_owner`.
+
+    Returns
+    -------
+    str
+        Lowercase escrow owner address used as the first implementation's CSP
+        storage key.
+
+    Raises
+    ------
+    ValueError
+        If the auth result does not contain an escrow owner.
+    """
+    return self._preferred_nodes_owner_storage_key(
+      auth_result.get(DEEPLOY_KEYS.ESCROW_OWNER, "")
+    )
+
+
+  def _preferred_nodes_owner_storage_key(self, owner: str):
+    """
+    Build the CStore field key for a CSP owner's Preferred Nodes list.
+    """
+    escrow_owner = str(owner).strip()
+    if not escrow_owner:
+      raise ValueError("Preferred Nodes storage requires an escrow owner.")
+    # Keying by owner lets delegates share the owner CSP list in v1.
+    return escrow_owner.lower()
+
+
+  def get_plus_level_for_escrow(self, sender: str, sender_escrow: str, escrow_owner: str):
+    """
+    Return the Plus+ entitlement level for an active CSP escrow.
+
+    Parameters
+    ----------
+    sender : str
+        Wallet address that signed the Deeploy request.
+    sender_escrow : str
+        Escrow contract resolved by Deeploy auth.
+    escrow_owner : str
+        CSP owner resolved by Deeploy auth.
+
+    Returns
+    -------
+    int
+        Plus+ level. If the blockchain adapter exposes a Plus+ helper, that
+        helper is used. Otherwise active escrow users temporarily fall back to
+        level `1` until the escrow ABI exposes the storage getter everywhere.
+    """
+    if hasattr(self, "bc"):
+      get_csp_plus_level = getattr(self.bc, "get_csp_plus_level", None)
+      if callable(get_csp_plus_level):
+        return int(get_csp_plus_level(sender_escrow))
+
+      get_escrow_plus_level = getattr(self.bc, "get_escrow_plus_level", None)
+      if callable(get_escrow_plus_level):
+        return int(get_escrow_plus_level(sender_escrow))
+
+      get_sender_plus_level = getattr(self.bc, "get_plus_level_for_escrow", None)
+      if callable(get_sender_plus_level):
+        return int(get_sender_plus_level(sender, sender_escrow, escrow_owner))
+
+    return 1
+
+
+  def _normalize_preferred_node_entry(self, node: dict, now: str):
+    """
+    Normalize and validate one Preferred Nodes entry.
+
+    Parameters
+    ----------
+    node : dict
+        Raw preferred-node entry from API request or CStore payload.
+    now : str
+        Timestamp fallback for missing `createdAt` or `updatedAt` fields.
+
+    Returns
+    -------
+    dict
+        Normalized entry with address, alias, optional description, and
+        timestamps.
+
+    Raises
+    ------
+    ValueError
+        If the entry is not a dictionary, the address is invalid, or metadata
+        exceeds configured limits.
+    """
+    if not isinstance(node, dict):
+      raise ValueError("Preferred node entries must be dictionaries.")
+
+    address = str(node.get("address", "")).strip()
+    if not PREFERRED_NODE_ADDRESS_RE.match(address):
+      raise ValueError(f"Invalid preferred node address: {address}")
+
+    legacy_label = str(node.get("label", "")).strip()
+    alias = str(node.get("alias", "")).strip() or legacy_label or self._preferred_node_default_alias(address)
+    if len(alias) > PREFERRED_NODE_ALIAS_MAX_LENGTH:
+      raise ValueError("Preferred node alias is too long.")
+
+    description = str(node.get("description", "")).strip()
+    if len(description) > PREFERRED_NODE_DESCRIPTION_MAX_LENGTH:
+      raise ValueError("Preferred node description is too long.")
+
+    created_at = str(node.get("createdAt", "")).strip() or now
+    updated_at = str(node.get("updatedAt", "")).strip() or now
+
+    normalized = {
+      "address": address,
+      "alias": alias,
+      "createdAt": created_at,
+      "updatedAt": updated_at,
+    }
+    if description:
+      normalized["description"] = description
+    return normalized
+
+
+  def normalize_preferred_nodes(self, preferred_nodes):
+    """
+    Normalize a full Preferred Nodes list.
+
+    Parameters
+    ----------
+    preferred_nodes : list[dict]
+        Raw preferred-node list from API input or CStore.
+
+    Returns
+    -------
+    list[dict]
+        Normalized, deduplicated entries. If duplicate addresses are supplied,
+        the last entry wins while preserving the position of first occurrence.
+
+    Raises
+    ------
+    ValueError
+        If the list shape, list length, entry address, or entry metadata is
+        invalid.
+    """
+    if not isinstance(preferred_nodes, list):
+      raise ValueError("'preferred_nodes' must be a list.")
+    if len(preferred_nodes) > PREFERRED_NODES_MAX_COUNT:
+      raise ValueError(f"too many preferred nodes: {len(preferred_nodes)} > {PREFERRED_NODES_MAX_COUNT}")
+
+    now = self._preferred_nodes_now()
+    ordered_addresses = []
+    by_address = {}
+    for raw_node in preferred_nodes:
+      node = self._normalize_preferred_node_entry(raw_node, now)
+      address = node["address"]
+      if address not in by_address:
+        ordered_addresses.append(address)
+      by_address[address] = node
+    return [by_address[address] for address in ordered_addresses]
+
+
+  def _parse_preferred_nodes_payload(self, raw_payload):
+    """
+    Parse a Preferred Nodes CStore value.
+
+    Parameters
+    ----------
+    raw_payload : str | dict | list | None
+        Value returned by CStore. Versioned JSON text is preferred, while dict
+        and list values are accepted for compatibility with older or manual
+        writes.
+
+    Returns
+    -------
+    list[dict]
+        Normalized preferred-node entries.
+
+    Raises
+    ------
+    ValueError
+        If the stored payload cannot be parsed or has an unsupported shape.
+    """
+    if raw_payload is None:
+      return []
+
+    payload = raw_payload
+    if isinstance(raw_payload, str):
+      if not raw_payload.strip():
+        return []
+      try:
+        payload = json.loads(raw_payload)
+      except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid Preferred Nodes CStore JSON: {exc}") from exc
+
+    if isinstance(payload, dict):
+      nodes = payload.get(DEEPLOY_KEYS.PREFERRED_NODES, payload.get("nodes", []))
+    elif isinstance(payload, list):
+      nodes = payload
+    else:
+      raise ValueError("Unsupported Preferred Nodes CStore payload.")
+
+    return self.normalize_preferred_nodes(nodes)
+
+
+  def deeploy_load_preferred_nodes(self, auth_result: dict):
+    """
+    Load Preferred Nodes for the authenticated CSP from CStore.
+
+    Parameters
+    ----------
+    auth_result : dict
+        Deeploy auth result. The `escrow_owner` field determines the CStore
+        field key for this first implementation.
+
+    Returns
+    -------
+    list[dict]
+        Normalized preferred-node entries. Missing storage returns an empty
+        list.
+    """
+    key = self._preferred_nodes_storage_key(auth_result)
+    raw_payload = self.chainstore_hget(hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY, key=key)
+    return self._parse_preferred_nodes_payload(raw_payload)
+
+
+  def deeploy_save_preferred_nodes(self, sender: str, auth_result: dict, preferred_nodes):
+    """
+    Save Preferred Nodes for the authenticated CSP in CStore.
+
+    Parameters
+    ----------
+    sender : str
+        Wallet address that signed the save request.
+    auth_result : dict
+        Deeploy auth result. The `escrow_owner` field determines the CStore
+        field key.
+    preferred_nodes : list[dict]
+        Full replacement Preferred Nodes list.
+
+    Returns
+    -------
+    list[dict]
+        Normalized entries written to CStore.
+
+    Raises
+    ------
+    ValueError
+        If validation fails or the serialized CStore payload exceeds the
+        configured maximum size.
+    """
+    key = self._preferred_nodes_storage_key(auth_result)
+    nodes = self.normalize_preferred_nodes(preferred_nodes)
+    payload = {
+      "version": PREFERRED_NODES_SCHEMA_VERSION,
+      "updated_at": self._preferred_nodes_now(),
+      "updated_by": sender,
+      "nodes": nodes,
+    }
+    serialized_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if len(serialized_payload.encode("utf-8")) > PREFERRED_NODES_MAX_PAYLOAD_BYTES:
+      raise ValueError("Preferred Nodes payload is too large.")
+
+    saved = self.chainstore_hset(
+      hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY,
+      key=key,
+      value=serialized_payload,
+    )
+    if not saved:
+      raise ValueError("Failed to save Preferred Nodes to CStore.")
+    return nodes
+
+
+  def migrate_preferred_nodes_for_csp_owner_transfer(self, old_owner: str, new_owner: str):
+    """
+    Move Preferred Nodes from the previous CSP owner key to the new owner key.
+    """
+    old_key = self._preferred_nodes_owner_storage_key(old_owner)
+    new_key = self._preferred_nodes_owner_storage_key(new_owner)
+    if old_key == new_key:
+      return {
+        DEEPLOY_KEYS.STATUS: "already_current",
+        "from": old_key,
+        "to": new_key,
+      }
+
+    raw_payload = self.chainstore_hget(
+      hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY,
+      key=old_key,
+    )
+    if not raw_payload:
+      return {
+        DEEPLOY_KEYS.STATUS: "missing",
+        "from": old_key,
+        "to": new_key,
+      }
+
+    self._parse_preferred_nodes_payload(raw_payload)
+    saved = self.chainstore_hset(
+      hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY,
+      key=new_key,
+      value=raw_payload,
+    )
+    if not saved:
+      raise ValueError("Failed to migrate Preferred Nodes to new owner.")
+
+    deleted = self.chainstore_hset(
+      hkey=DEEPLOY_PLUS_PREFERRED_NODES_HKEY,
+      key=old_key,
+      value=None,
+    )
+    if not deleted:
+      raise ValueError("Failed to clear Preferred Nodes from previous owner.")
+
+    return {
+      DEEPLOY_KEYS.STATUS: "moved",
+      "from": old_key,
+      "to": new_key,
+    }
 
 
   def __get_emv_types(self, values):
@@ -51,12 +523,136 @@ class _DeeployMixin:
     """
     Verify the signature of the request.
     """
+    claimed_sender = payload.get("EE_ETH_SENDER", "unknown")
+    signature = payload.get("EE_ETH_SIGN", "missing")
+    self.Pd(
+      "Verifying signature for claimed sender={}, sig={}..., no_hash={}, prefix='{}'".format(
+        claimed_sender, signature[:20] if isinstance(signature, str) else signature, no_hash, MESSAGE_PREFIX
+      )
+    )
     sender = self.bc.eth_verify_payload_signature(
       payload=payload,
       message_prefix=MESSAGE_PREFIX,
       no_hash=no_hash,
       indent=1,
+      verify_safe=True,
     )
+    if sender is None:
+      self.P(
+        "Signature verification FAILED for claimed sender={}. "
+        "Recovered address is None. Check that the signing key matches the sender address "
+        "and that the payload was not modified after signing.".format(claimed_sender),
+        color='r'
+      )
+    elif sender.lower() != claimed_sender.lower():
+      self.P(
+        "Signature verification MISMATCH: recovered={} != claimed={}".format(sender, claimed_sender),
+        color='r'
+      )
+    else:
+      self.Pd("Signature verification OK: recovered={}".format(sender))
+    return sender
+
+
+  def _deeploy_payload_hash(self, payload):
+    """
+    Return the v3 compact-canonical SHA-256 hash for a Deeploy request.
+    """
+    return compact_canonical_sha256(payload, excluded_keys=DEEPLOY_V3_HASH_EXCLUDED_KEYS)
+
+
+  @staticmethod
+  def _deeploy_wrapper_nodes_count(payload):
+    """
+    Return the node count shown in the v3 wallet-readable wrapper.
+    """
+    target_nodes = payload.get(DEEPLOY_KEYS.TARGET_NODES)
+    if isinstance(target_nodes, list) and len(target_nodes) > 0:
+      return len(target_nodes)
+
+    target_nodes_count = payload.get(DEEPLOY_KEYS.TARGET_NODES_COUNT)
+    if isinstance(target_nodes_count, (int, float, str)) and not isinstance(target_nodes_count, bool):
+      return target_nodes_count
+
+    return 0
+
+
+  def _deeploy_wrapper_message(self, request_type, payload, hash_value):
+    """
+    Build the exact v3 Deeploy message signed by the dApp wallet flow.
+    """
+    lines = [
+      DEEPLOY_WRAPPER_HEADER,
+      "",
+      f"Request type: {request_type}",
+    ]
+
+    plugins = payload.get(DEEPLOY_KEYS.PLUGINS)
+    if isinstance(plugins, list):
+      lines.append(f"Plugins: {len(plugins)}")
+
+    lines.append(f"Nodes: {self._deeploy_wrapper_nodes_count(payload)}")
+    lines.append(f"{DEEPLOY_WRAPPER_HASH_LABEL}: {hash_value}")
+    return "\n".join(lines)
+
+
+  def __verify_signature_v3(self, payload, request_type):
+    """
+    Verify a Deeploy v3 request signed as a readable wrapper around EE_HASH.
+    """
+    if not request_type:
+      raise ValueError("Request type is required for Deeploy v3 signature verification.")
+
+    claimed_sender = payload.get(BASE_CT.BCctbase.ETH_SENDER, "unknown")
+    signature = payload.get(BASE_CT.BCctbase.ETH_SIGN, "missing")
+    claimed_hash = payload.get(BASE_CT.BCctbase.HASH)
+
+    if not isinstance(claimed_hash, str) or len(claimed_hash.strip()) == 0:
+      raise ValueError(f"{BASE_CT.BCctbase.HASH} is required for Deeploy v3 signed requests.")
+
+    claimed_hash = claimed_hash.strip()
+    expected_hash = self._deeploy_payload_hash(payload)
+    if expected_hash != claimed_hash:
+      raise ValueError(
+        "Invalid payload hash: received {} != computed {}".format(
+          claimed_hash,
+          expected_hash,
+        )
+      )
+
+    expected_message = self._deeploy_wrapper_message(
+      request_type=request_type,
+      payload=payload,
+      hash_value=expected_hash,
+    )
+    self.Pd(
+      "Verifying v3 Deeploy signature for claimed sender={}, sig={}..., hash={}".format(
+        claimed_sender,
+        signature[:20] if isinstance(signature, str) else signature,
+        expected_hash,
+      )
+    )
+    sender = self.bc.eth_verify_text_signature(
+      text=expected_message,
+      signature=signature,
+      no_hash=True,
+      message_prefix="",
+      expected_signer=claimed_sender,
+    )
+    if sender is None:
+      self.P(
+        "V3 signature verification FAILED for claimed sender={}. "
+        "Recovered address is None. Check that the signing key matches the sender address "
+        "and that the payload hash was not modified after signing.".format(claimed_sender),
+        color='r'
+      )
+    elif sender.lower() != claimed_sender.lower():
+      self.P(
+        "V3 signature verification MISMATCH: recovered={} != claimed={}".format(sender, claimed_sender),
+        color='r'
+      )
+    else:
+      self.Pd("V3 signature verification OK: recovered={}".format(sender))
     return sender
 
 
@@ -100,7 +696,8 @@ class _DeeployMixin:
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
-    plugins = self.deeploy_prepare_plugins(inputs)
+    plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
+    self._validate_dependency_tree(inputs)
     plugins = self._ensure_runner_cstore_auth_env(
       app_id=app_id,
       prepared_plugins=plugins,
@@ -193,7 +790,12 @@ class _DeeployMixin:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+    self._reset_chainstore_response_keys(
+      prepared_response_keys,
+      context=f"create pipeline '{app_alias}'",
+    )
 
+    saved_pipeline = None
     for addr, node_plugins in node_plugins_by_addr.items():
       msg = ''
       if self.cfg_deeploy_verbose > 1:
@@ -202,7 +804,7 @@ class _DeeployMixin:
 
       if addr is not None:
 
-        pipeline = self.cmdapi_start_pipeline_by_params(
+        saved_pipeline = self.cmdapi_start_pipeline_by_params(
           name=app_id,
           app_alias=app_alias,
           pipeline_type=app_type,
@@ -215,17 +817,11 @@ class _DeeployMixin:
           **pipeline_kwargs,
         )
 
-        self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
-        try:
-          save_result = self.save_job_pipeline_in_cstore(pipeline, job_id)
-          self.P(f"Pipeline saved in CSTORE: {save_result}")
-        except Exception as e:
-          self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
       # endif addr is valid
     # endfor each target node
 
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
-    return cleaned_response_keys
+    return cleaned_response_keys, saved_pipeline
 
   def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
     """
@@ -370,7 +966,12 @@ class _DeeployMixin:
           )
           plugins_by_node[addr].append(prepared_plugin)
 
+    # Resolve shmem and autowire per-node (not across all nodes),
+    # because multi-node jobs have the same logical plugin_names on each
+    # node, which would cause duplicate plugin_name errors if flattened.
     for addr, node_plugins in plugins_by_node.items():
+      if self._has_shmem_dynamic_env(node_plugins):
+        node_plugins = self._resolve_shmem_in_plugins(node_plugins, app_id)
       plugins_by_node[addr] = self._autowire_native_container_semaphore(
         app_id=app_id,
         plugins=node_plugins,
@@ -417,6 +1018,10 @@ class _DeeployMixin:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
+    self._reset_chainstore_response_keys(
+      prepared_response_keys,
+      context=f"update pipeline '{app_alias}'",
+    )
 
     for addr, node_plugins in node_plugins_ready.items():
       msg = ''
@@ -441,14 +1046,9 @@ class _DeeployMixin:
 
         self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
         pipeline[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
-        pipelin_to_save = pipeline
+        pipeline_to_save = pipeline
       # endif addr is valid
     # endfor each target node
-    try:
-      save_result = self.save_job_pipeline_in_cstore(pipelin_to_save, job_id)
-      self.P(f"Pipeline saved in CSTORE: {save_result}")
-    except Exception as e:
-      self.P(f"Error saving pipeline in CSTORE: {e}", color="r")
     if inputs.chainstore_response:
       if prepared_response_keys:
         dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
@@ -458,7 +1058,7 @@ class _DeeployMixin:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
     cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
-    return cleaned_response_keys
+    return cleaned_response_keys, pipeline_to_save
 
   def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
     """
@@ -501,6 +1101,273 @@ class _DeeployMixin:
     refreshed_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     refreshed_specs = self._ensure_deeploy_specs_job_config(refreshed_specs)
     return refreshed_specs
+
+  def _pipeline_plugins_to_reconcile_request(self, pipeline):
+    """
+    Convert persisted pipeline plugin config back to Deeploy request plugin entries.
+    """
+    request_plugins = []
+    for plugin in pipeline.get(NetMonCt.PLUGINS.upper(), []):
+      signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE) or plugin.get("signature")
+      if not signature:
+        continue
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES, []):
+        if not isinstance(instance, dict):
+          continue
+        request_plugin = {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: signature,
+          **self.deepcopy(instance),
+        }
+        instance_id = request_plugin.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+        if instance_id:
+          request_plugin[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
+        request_plugins.append(request_plugin)
+    return request_plugins
+
+  def _build_csp_reconcile_inputs(self, pipeline, job_id, target_nodes, chainstore_response):
+    """
+    Build internal Deeploy inputs from persisted pipeline data, not from the public request.
+    """
+    deeploy_specs = pipeline.get(NetMonCt.DEEPLOY_SPECS.upper(), {})
+    if not isinstance(deeploy_specs, dict):
+      deeploy_specs = {}
+    pipeline_params = (
+      pipeline.get(DEEPLOY_KEYS.PIPELINE_PARAMS)
+      or deeploy_specs.get(DEEPLOY_KEYS.JOB_CONFIG, {}).get(DEEPLOY_KEYS.PIPELINE_PARAMS)
+      or {}
+    )
+    request_data = {
+      DEEPLOY_KEYS.APP_ALIAS: pipeline.get("APP_ALIAS") or pipeline.get("NAME"),
+      DEEPLOY_KEYS.APP_ID: pipeline.get("NAME"),
+      DEEPLOY_KEYS.CHAINSTORE_RESPONSE: bool(chainstore_response),
+      DEEPLOY_KEYS.JOB_ID: job_id,
+      DEEPLOY_KEYS.JOB_APP_TYPE: deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
+      DEEPLOY_KEYS.JOB_TAGS: deeploy_specs.get(DEEPLOY_KEYS.JOB_TAGS, []),
+      DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: pipeline.get("TYPE", "void"),
+      DEEPLOY_KEYS.PIPELINE_INPUT_URI: pipeline.get("URL", None),
+      DEEPLOY_KEYS.PIPELINE_PARAMS: pipeline_params,
+      DEEPLOY_KEYS.PLUGINS: self._pipeline_plugins_to_reconcile_request(pipeline),
+      DEEPLOY_KEYS.PROJECT_ID: deeploy_specs.get(DEEPLOY_KEYS.PROJECT_ID),
+      DEEPLOY_KEYS.PROJECT_NAME: deeploy_specs.get(DEEPLOY_KEYS.PROJECT_NAME),
+      DEEPLOY_KEYS.SPARE_NODES: deeploy_specs.get(DEEPLOY_KEYS.SPARE_NODES, []),
+      DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD: deeploy_specs.get(
+        DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD,
+        False,
+      ),
+      DEEPLOY_KEYS.TARGET_NODES: target_nodes,
+      DEEPLOY_KEYS.TARGET_NODES_COUNT: len(target_nodes),
+    }
+    return self.NestedDotDict(request_data)
+
+  def _get_stale_csp_reconcile_nodes(self, job_id, new_owner):
+    """
+    Return live nodes whose Deeploy app owner does not match the new escrow owner.
+    """
+    stale_nodes = []
+    online_apps = self._get_online_apps(job_id=job_id, owner=None)
+    for node, apps in online_apps.items():
+      for _, app_data in apps.items():
+        app_owner = app_data.get(NetMonCt.OWNER)
+        if isinstance(app_owner, str) and app_owner.lower() == new_owner.lower():
+          continue
+        stale_nodes.append(node)
+        break
+    return stale_nodes
+
+  def _validate_csp_reconcile_restart_payload(
+    self,
+    inputs,
+    migrated_pipeline,
+    deeploy_specs,
+    discovered_instances,
+  ):
+    """
+    Validate the reconstructed restart request before any live pipeline is stopped.
+    """
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    self._validate_plugins_array(plugins_array)
+    self._validate_dependency_tree(inputs)
+
+    pipeline_params = self._extract_pipeline_params(inputs)
+    inputs[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
+    inputs.pipeline_params = pipeline_params
+
+    app_id = migrated_pipeline.get("NAME")
+    prepared_plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
+    self.deeploy_detect_job_app_type(prepared_plugins)
+    self._ensure_deeploy_specs_job_config(
+      deeploy_specs,
+      pipeline_params=pipeline_params,
+    )
+    self._ensure_plugin_instance_ids(
+      inputs,
+      discovered_plugin_instances=discovered_instances,
+      app_id=app_id,
+      job_id=inputs.get(DEEPLOY_KEYS.JOB_ID),
+    )
+    return True
+
+  # Repairs Deeploy's off-chain pipeline metadata and live node configs after
+  # PoAI Manager moves a CSP escrow to a new owner on-chain.
+  def _reconcile_csp_escrow_job_owner(self, job_id, old_owner, new_owner):
+    pipeline_cid = self._get_pipeline_from_cstore(job_id)
+    if not pipeline_cid:
+      return {
+        DEEPLOY_KEYS.STATUS: "pipeline_missing",
+        DEEPLOY_KEYS.JOB_ID: job_id,
+      }
+
+    try:
+      pipeline = self.get_pipeline_from_r1fs(
+        pipeline_cid,
+        timeout=30,
+        pin=False,
+        raise_on_error=False,
+        show_logs=True,
+      )
+    except Exception as exc:
+      return {
+        DEEPLOY_KEYS.STATUS: "failed",
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.ERROR: str(exc),
+      }
+
+    if not isinstance(pipeline, dict):
+      return {
+        DEEPLOY_KEYS.STATUS: "pipeline_missing",
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.PIPELINE_CID: pipeline_cid,
+      }
+
+    migrated_pipeline = self.deepcopy(pipeline)
+    previous_owner = migrated_pipeline.get(NetMonCt.OWNER.upper())
+    pipeline_changed = not (
+      isinstance(previous_owner, str) and previous_owner.lower() == new_owner.lower()
+    )
+    if pipeline_changed:
+      migrated_pipeline[NetMonCt.OWNER.upper()] = new_owner
+
+    deeploy_specs = migrated_pipeline.get(NetMonCt.DEEPLOY_SPECS.upper(), {})
+    if not isinstance(deeploy_specs, dict):
+      deeploy_specs = {}
+    else:
+      deeploy_specs = self.deepcopy(deeploy_specs)
+    deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+    migrated_pipeline[NetMonCt.DEEPLOY_SPECS.upper()] = deeploy_specs
+
+    stale_nodes = self._get_stale_csp_reconcile_nodes(job_id=job_id, new_owner=new_owner)
+    pipeline_to_persist = migrated_pipeline
+    response_keys = {}
+    node_update_delivered = False
+
+    if stale_nodes:
+      discovered_instances = self._discover_plugin_instances(
+        job_id=job_id,
+        owner=None,
+        target_nodes=stale_nodes,
+      )
+      target_nodes = []
+      for instance in discovered_instances:
+        node = instance.get(DEEPLOY_PLUGIN_DATA.NODE)
+        if node and node not in target_nodes:
+          target_nodes.append(node)
+
+      if not target_nodes:
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: "Stale live pipeline found but no plugin instances could be discovered",
+          "old_owner": old_owner,
+          "previous_owner": previous_owner,
+          "new_owner": new_owner,
+          "stale_nodes": stale_nodes,
+        }
+
+      chainstore_response = bool(deeploy_specs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS))
+      inputs = self._build_csp_reconcile_inputs(
+        pipeline=migrated_pipeline,
+        job_id=job_id,
+        target_nodes=target_nodes,
+        chainstore_response=chainstore_response,
+      )
+      try:
+        self._validate_csp_reconcile_restart_payload(
+          inputs=inputs,
+          migrated_pipeline=migrated_pipeline,
+          deeploy_specs=deeploy_specs,
+          discovered_instances=discovered_instances,
+        )
+      except Exception as exc:
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: f"Reconstructed restart payload is invalid: {exc}",
+          "old_owner": old_owner,
+          "previous_owner": previous_owner,
+          "new_owner": new_owner,
+          "stale_nodes": stale_nodes,
+        }
+
+      self.delete_pipeline_from_nodes(
+        job_id=job_id,
+        owner=None,
+        target_nodes=target_nodes,
+        allow_missing=True,
+        discovered_instances=discovered_instances,
+      )
+      _, _, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
+        owner=new_owner,
+        inputs=inputs,
+        app_id=migrated_pipeline.get("NAME"),
+        app_alias=migrated_pipeline.get("APP_ALIAS") or migrated_pipeline.get("NAME"),
+        app_type=migrated_pipeline.get("TYPE", "void"),
+        update_nodes=target_nodes,
+        new_nodes=[],
+        discovered_plugin_instances=discovered_instances,
+        dct_deeploy_specs=deeploy_specs,
+        job_app_type=deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE),
+        wait_for_responses=False,
+      )
+      node_update_delivered = True
+
+    if isinstance(pipeline_to_persist, dict):
+      pipeline_to_persist[NetMonCt.OWNER.upper()] = new_owner
+      pipeline_specs = pipeline_to_persist.get(NetMonCt.DEEPLOY_SPECS.upper())
+      if isinstance(pipeline_specs, dict):
+        pipeline_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
+    else:
+      pipeline_to_persist = migrated_pipeline
+
+    if pipeline_changed or node_update_delivered:
+      saved = self.persist_job_pipeline_metadata(
+        pipeline=pipeline_to_persist,
+        job_id=job_id,
+        previous_cid=pipeline_cid,
+        delete_previous=True,
+      )
+      if not saved:
+        return {
+          DEEPLOY_KEYS.STATUS: "failed",
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.ERROR: "Failed to persist reconciled pipeline metadata",
+        }
+
+    if node_update_delivered:
+      status = "node_update_delivered"
+    elif pipeline_changed:
+      status = "updated"
+    else:
+      status = "already_current"
+
+    return {
+      DEEPLOY_KEYS.STATUS: status,
+      DEEPLOY_KEYS.JOB_ID: job_id,
+      "old_owner": old_owner,
+      "previous_owner": previous_owner,
+      "new_owner": new_owner,
+      "stale_nodes": stale_nodes,
+      "response_keys": response_keys,
+    }
 
   def _gather_running_pipeline_context(self, owner, app_id=None, job_id=None):
     """
@@ -568,6 +1435,50 @@ class _DeeployMixin:
     
     return instances_by_node, base_plugin
 
+  def _check_pipeline_responses_once(self, response_keys, dct_status=None):
+    """
+    Check pipeline responses once without blocking.
+
+    Parameters
+    ----------
+    response_keys : dict
+        Mapping of node address to list of chainstore response keys.
+    dct_status : dict, optional
+        Accumulator of responses already received.
+
+    Returns
+    -------
+    tuple
+        (dct_status, str_status, done) with updated status and completion flag.
+    """
+    if dct_status is None:
+      dct_status = {}
+
+    if len(response_keys) == 0:
+      return dct_status, DEEPLOY_STATUS.COMMAND_DELIVERED, True
+
+    for node_addr, response_keys_list in response_keys.items():
+      for response_key in response_keys_list:
+        if response_key in dct_status:
+          continue
+        res = self.chainstore_get(response_key)
+        if res is not None:
+          self.Pd(
+            f"Received response for {response_key} from {node_addr}: {self.json_dumps(res)}. Node Addr: {node_addr}"
+          )
+          dct_status[response_key] = {
+            'node': node_addr,
+            'details': res
+          }
+        # endif response key present
+      # endfor response keys of one node
+    # endfor nodes
+
+    total_response_keys = sum(len(keys) for keys in response_keys.values())
+    done = len(dct_status) == total_response_keys
+    str_status = DEEPLOY_STATUS.SUCCESS if done else DEEPLOY_STATUS.PENDING
+    return dct_status, str_status, done
+
   def _get_pipeline_responses(self, response_keys, timeout_seconds=300):
     """
     Wait until all the responses are received via CSTORE and compose status response.
@@ -600,37 +1511,26 @@ class _DeeployMixin:
     done = False if len(response_keys) > 0 else True
     start_time = self.time()
 
-    self.Pd("Waiting for responses from nodes...")
-    self.Pd(f"Response keys to wait for: {self.json_dumps(response_keys, indent=2)}")
+    self.P(f"Response keys to wait for: {self.json_dumps(response_keys, indent=2)}")
 
     if len(response_keys) == 0:
       str_status = DEEPLOY_STATUS.COMMAND_DELIVERED
       return dct_status, str_status
 
+    self.P(f"Waiting for responses from {len(response_keys)} plugin instances...")
+
     while not done:
       current_time = self.time()
       if current_time - start_time > timeout_seconds:
         str_status = DEEPLOY_STATUS.TIMEOUT
-        self.P(f"Timeout reached ({timeout_seconds} seconds) while waiting for responses. Current status: {self.json_dumps(dct_status, indent=2)}")
-        self.P(f"Response keys: {self.json_dumps(response_keys, indent=2)}")
+        self.P(f"Timeout reached ({timeout_seconds} seconds) while waiting for responses. Current status: {self.json_dumps(dct_status, indent=2)}", color='r')
+        self.P(f"Response keys: {self.json_dumps(response_keys, indent=2)}", color='r')
         break
-        
-      for node_addr, response_keys_list in response_keys.items():
-        for response_key in response_keys_list:
-          if response_key in dct_status:
-            continue
-          res = self.chainstore_get(response_key)
-          if res is not None:
-            self.Pd(
-              f"Received response for {response_key} from {node_addr}: {self.json_dumps(res)}. Node Addr: {node_addr}")
-            dct_status[response_key] = {
-              'node': node_addr,
-              'details': res
-            }
-      total_response_keys = sum(len(keys) for keys in response_keys.values())
-      if len(dct_status) == total_response_keys:
-        str_status = DEEPLOY_STATUS.SUCCESS
-        done = True
+
+      dct_status, str_status, done = self._check_pipeline_responses_once(
+        response_keys=response_keys,
+        dct_status=dct_status,
+      )
       # end for each response key
     # endwhile cycle until all responses are received
     return dct_status, str_status
@@ -654,7 +1554,13 @@ class _DeeployMixin:
     return str_timestamp
   
   
-  def deeploy_verify_and_get_inputs(self, request: dict, require_sender_is_oracle: bool = False, no_hash: bool = True):
+  def deeploy_verify_and_get_inputs(
+    self,
+    request: dict,
+    require_sender_is_oracle: bool = False,
+    no_hash: bool = True,
+    request_type: str = None,
+  ):
     sender = request.get(BASE_CT.BCctbase.ETH_SENDER)
     assert self.bc.is_valid_eth_address(sender), f"Invalid sender address: {sender}"
 
@@ -674,7 +1580,12 @@ class _DeeployMixin:
     inputs = self.NestedDotDict(request_with_defaults)
     self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
 
-    addr = self.__verify_signature(request, no_hash=no_hash)
+    if BASE_CT.BCctbase.HASH in request:
+      addr = self.__verify_signature_v3(request, request_type=request_type)
+    else:
+      addr = self.__verify_signature(request, no_hash=no_hash)
+    if addr is None:
+      raise ValueError("Signature verification failed: could not recover address from signature")
     if addr.lower() != sender.lower():
       raise ValueError("Invalid signature: recovered {} != {}".format(addr, sender))
 
@@ -702,7 +1613,7 @@ class _DeeployMixin:
     index_str = f" at index {index}" if index is not None else ""
 
     # Type-specific validation
-    if signature == CONTAINER_APP_RUNNER_SIGNATURE:
+    if signature in CONTAINERIZED_APPS_SIGNATURES:
       # Check IMAGE field
       if not plugin_instance.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE):
         raise ValueError(
@@ -738,6 +1649,12 @@ class _DeeployMixin:
       if DEEPLOY_RESOURCES.MEMORY not in resources:
         raise ValueError(
           f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'CONTAINER_RESOURCES.memory' is required."
+        )
+
+      exposed_ports = plugin_instance.get("EXPOSED_PORTS")
+      if exposed_ports is not None and not isinstance(exposed_ports, dict):
+        raise ValueError(
+          f"{DEEPLOY_ERRORS.REQUEST6}. Plugin instance{index_str} with signature '{signature}': 'EXPOSED_PORTS' must be a dictionary."
         )
 
     # Add validation for other plugin types here as needed
@@ -960,6 +1877,24 @@ class _DeeployMixin:
 
     return merged
 
+  def _reset_chainstore_response_keys(self, response_keys, context: str = "pipeline commands"):
+    """
+    Clear chainstore response keys before dispatch so early confirmations are not lost.
+    """
+    normalized_keys = self._normalize_chainstore_response_mapping(response_keys)
+    if not normalized_keys:
+      return normalized_keys
+
+    self.P(f"Resetting response keys in chainstore before dispatching {context}...")
+    reset_kwargs = self._get_chainstore_response_local_reset_write_kwargs()
+    for _, node_response_keys in normalized_keys.items():
+      for response_key in node_response_keys:
+        self._reset_chainstore_response_key(response_key, write_kwargs=reset_kwargs)
+      # end for
+    # end for
+
+    return normalized_keys
+
   def _get_pipeline_params_from_deeploy_specs(self, deeploy_specs):
     """
     Retrieve pipeline_params from deeploy_specs, preferring the job_config payload.
@@ -1105,10 +2040,124 @@ class _DeeployMixin:
     except (TypeError, ValueError):
       raise ValueError(f"{DEEPLOY_ERRORS.REQUEST6}. 'CONTAINER_RESOURCES.cpu' must be a number.")
 
+  def _parse_cpu_decimal(self, value, default=None):
+    """
+    Parse CPU using decimal arithmetic so Stack paid-tier boundary checks do
+    not reject valid two-decimal allocations because of binary float drift.
+    """
+    if value is None:
+      return default
+    try:
+      return Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST6}. 'CONTAINER_RESOURCES.cpu' must be a number.")
+
+  def _format_cpu_decimal(self, value):
+    return float(value.quantize(STACK_CPU_QUANTUM))
+
+  def _parse_stack_storage_mb(self, value, context=""):
+    raw_value = str(value).strip()
+    if not re.fullmatch(r"\d+(?:\.\d+)?\s*[bkmg]?", raw_value, flags=re.IGNORECASE):
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container Volume Storage is invalid "
+        f"{'in ' + context if context else ''}."
+      )
+    return parse_memory_to_mb(raw_value)
+
+  def _aggregate_fixed_size_volumes_storage_mb(self, params):
+    """
+    Sum FIXED_SIZE_VOLUMES sizes from a plugin instance or app_params dict.
+
+    Args:
+        params: dict containing an optional FIXED_SIZE_VOLUMES key
+
+    Returns:
+        int: Total storage in MB across all fixed-size volumes
+    """
+    fixed_volumes = params.get('FIXED_SIZE_VOLUMES', {})
+    if not isinstance(fixed_volumes, dict):
+      return 0
+    total_mb = 0
+    for vol_name, vol_config in fixed_volumes.items():
+      if not isinstance(vol_config, dict):
+        continue
+      size_str = vol_config.get('SIZE', '0')
+      try:
+        total_mb += parse_memory_to_mb(str(size_str))
+      except Exception:
+        self.Pd(f"  Failed to parse FIXED_SIZE_VOLUMES['{vol_name}'].SIZE='{size_str}'")
+    return total_mb
+
+
+  def _validate_fixed_size_volumes(self, params, context=""):
+    """
+    Validate FIXED_SIZE_VOLUMES structure in a plugin config or app_params.
+
+    Checks:
+    - Each entry is a dict with SIZE (parseable, > 0) and MOUNTING_POINT (non-empty)
+    - No duplicate volume names
+
+    Args:
+        params: dict that may contain FIXED_SIZE_VOLUMES key
+        context: string for error context (e.g., "plugin 0")
+
+    Raises:
+        ValueError: If validation fails
+    """
+    fixed_volumes = params.get('FIXED_SIZE_VOLUMES')
+    if not fixed_volumes:
+      return
+    if not isinstance(fixed_volumes, dict):
+      raise ValueError(f"FIXED_SIZE_VOLUMES must be a dict{' in ' + context if context else ''}")
+
+    for vol_name, vol_config in fixed_volumes.items():
+      ctx = f"FIXED_SIZE_VOLUMES['{vol_name}']{' in ' + context if context else ''}"
+      if not isinstance(vol_config, dict):
+        raise ValueError(f"{ctx} must be a dict with SIZE and MOUNTING_POINT")
+
+      size_str = vol_config.get('SIZE')
+      if not size_str:
+        raise ValueError(f"{ctx} missing required 'SIZE' field")
+      try:
+        size_mb = parse_memory_to_mb(str(size_str))
+      except Exception:
+        raise ValueError(f"{ctx} has unparseable SIZE='{size_str}'")
+      if size_mb <= 0:
+        raise ValueError(f"{ctx} SIZE must be > 0 (got '{size_str}')")
+
+      mounting_point = vol_config.get('MOUNTING_POINT')
+      if not mounting_point or not str(mounting_point).strip():
+        raise ValueError(f"{ctx} missing required 'MOUNTING_POINT' field")
+
+
+  def _validate_stack_fixed_volume_storage_cap(self, resources, params, context=""):
+    """
+    Stack storage is selected Volume Storage. Fixed-size volumes reserve that
+    selected budget; they are not additional storage on top of it.
+    """
+    fixed_volume_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(params)
+    if fixed_volume_storage_mb <= 0:
+      return
+
+    selected_storage = resources.get(DEEPLOY_RESOURCES.STORAGE) if isinstance(resources, dict) else None
+    try:
+      selected_storage_mb = self._parse_stack_storage_mb(selected_storage, context=context)
+    except ValueError:
+      raise
+
+    if fixed_volume_storage_mb > selected_storage_mb:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: FIXED_SIZE_VOLUMES reserve {fixed_volume_storage_mb}m "
+        f"but selected Volume Storage is {selected_storage_mb}m{' in ' + context if context else ''}."
+      )
+
+
   def _aggregate_container_resources(self, inputs):
     """
     Aggregate container resources across all CONTAINER_APP_RUNNER plugin instances.
-    Sums CPU and memory requirements for all container instances.
+    Sums CPU, memory, and storage requirements. Stack treats fixed-size
+    volumes as reservations inside selected Volume Storage; other app types
+    keep the legacy additive FIXED_SIZE_VOLUMES behavior.
 
     Args:
         inputs: Request inputs
@@ -1117,29 +2166,48 @@ class _DeeployMixin:
         dict: Aggregated resources in format:
           {
             "cpu": <total_cpu>,
-            "memory": "<total_memory_mb>m"
+            "memory": "<total_memory_mb>m",
+            "storage": "<total_storage_mb>m"  (only if > 0)
           }
     """
     self.Pd("Aggregating container resources...")
     plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+    is_stack_app = isinstance(job_app_type, str) and job_app_type.lower() == JOB_APP_TYPES.STACK
 
     # For legacy format, use existing app_params
     if not plugins_array:
       self.Pd("Using legacy format (app_params) for resource aggregation")
       app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
       legacy_resources = app_params.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+      storage_mb = 0
+      has_storage_resource = False
       if isinstance(legacy_resources, dict):
         legacy_resources = self.deepcopy(legacy_resources)
         if DEEPLOY_RESOURCES.CPU in legacy_resources:
-          legacy_resources[DEEPLOY_RESOURCES.CPU] = self._parse_cpu_value(
+          legacy_resources[DEEPLOY_RESOURCES.CPU] = self._format_cpu_decimal(self._parse_cpu_decimal(
             legacy_resources.get(DEEPLOY_RESOURCES.CPU)
-          )
+          ))
+        container_storage = legacy_resources.get(DEEPLOY_RESOURCES.STORAGE)
+        if DEEPLOY_RESOURCES.STORAGE in legacy_resources:
+          has_storage_resource = True
+          storage_mb = self._parse_stack_storage_mb(container_storage)
+      if not is_stack_app:
+        fixed_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(app_params)
+        if fixed_storage_mb > 0:
+          storage_mb += fixed_storage_mb
+          has_storage_resource = True
+      if has_storage_resource:
+        legacy_resources[DEEPLOY_RESOURCES.STORAGE] = f"{storage_mb}m"
+        self.Pd(f"Legacy storage requirement: {storage_mb}MB")
       self.Pd(f"Legacy resources: {legacy_resources}")
       return legacy_resources
 
     self.Pd(f"Processing {len(plugins_array)} plugin instances from plugins array")
-    total_cpu = 0.0
+    total_cpu = Decimal("0")
     total_memory_mb = 0
+    total_storage_mb = 0
+    has_storage_resource = False
 
     # Iterate through plugins array (simplified format - each object is an instance)
     for idx, plugin_instance in enumerate(plugins_array):
@@ -1149,8 +2217,9 @@ class _DeeployMixin:
       # Only aggregate for CONTAINER_APP_RUNNER and WORKER_APP_RUNNER plugins
       if signature in CONTAINERIZED_APPS_SIGNATURES:
         resources = plugin_instance.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
-        cpu = self._parse_cpu_value(resources.get(DEEPLOY_RESOURCES.CPU, 0))
+        cpu = self._parse_cpu_decimal(resources.get(DEEPLOY_RESOURCES.CPU, 0), default=Decimal("0"))
         memory = resources.get(DEEPLOY_RESOURCES.MEMORY, "0m")
+        container_storage = resources.get(DEEPLOY_RESOURCES.STORAGE)
 
         self.Pd(f"  Container resources: cpu={cpu}, memory={memory}")
 
@@ -1158,14 +2227,28 @@ class _DeeployMixin:
         memory_mb = parse_memory_to_mb(memory)
         self.Pd(f"  Parsed memory: {memory_mb}MB")
         total_memory_mb += memory_mb
+
+        if DEEPLOY_RESOURCES.STORAGE in resources:
+          has_storage_resource = True
+          storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}")
+          self.Pd(f"  Container storage: {storage_mb}MB")
+          total_storage_mb += storage_mb
+        if not is_stack_app:
+          storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
+          if storage_mb > 0:
+            self.Pd(f"  FIXED_SIZE_VOLUMES storage: {storage_mb}MB")
+            total_storage_mb += storage_mb
+            has_storage_resource = True
       else:
         self.Pd(f"  Skipping non-container plugin: {signature}")
 
     # Return aggregated resources in standard format
     aggregated = {
-      DEEPLOY_RESOURCES.CPU: total_cpu,
-      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m"
+      DEEPLOY_RESOURCES.CPU: self._format_cpu_decimal(total_cpu),
+      DEEPLOY_RESOURCES.MEMORY: f"{total_memory_mb}m",
     }
+    if has_storage_resource:
+      aggregated[DEEPLOY_RESOURCES.STORAGE] = f"{total_storage_mb}m"
     self.Pd(f"Aggregated resources: {aggregated}")
     return aggregated
 
@@ -1308,6 +2391,42 @@ class _DeeployMixin:
       else:
         self.Pd(f"  Validating resources for non-native job (type={job_app_type})...")
 
+        # Validate FIXED_SIZE_VOLUMES format (if present in any plugin)
+        plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+        if plugins_array:
+          for idx, pi in enumerate(plugins_array):
+            self._validate_fixed_size_volumes(pi, context=f"plugin {idx}")
+            signature = pi.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, "").upper()
+            resources = pi.get(DEEPLOY_RESOURCES.CONTAINER_RESOURCES, {})
+            if (
+              job_app_type == JOB_APP_TYPES.STACK and
+              signature in CONTAINERIZED_APPS_SIGNATURES and
+              (not isinstance(resources, dict) or DEEPLOY_RESOURCES.STORAGE not in resources)
+            ):
+              msg = (
+                f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container storage resources are required "
+                f"for plugin {idx}."
+              )
+              self.P(msg)
+              raise ValueError(msg)
+            if job_app_type == JOB_APP_TYPES.STACK and signature in CONTAINERIZED_APPS_SIGNATURES:
+              try:
+                storage_mb = self._parse_stack_storage_mb(resources.get(DEEPLOY_RESOURCES.STORAGE), context=f"plugin {idx}")
+              except ValueError as exc:
+                self.P(str(exc))
+                raise
+              if storage_mb < 0:
+                msg = (
+                  f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack container Volume Storage cannot be negative "
+                  f"for plugin {idx}."
+                )
+                self.P(msg)
+                raise ValueError(msg)
+              self._validate_stack_fixed_volume_storage_cap(resources, pi, context=f"plugin {idx}")
+        else:
+          app_params = inputs.get(DEEPLOY_KEYS.APP_PARAMS, {})
+          self._validate_fixed_size_volumes(app_params, context="app_params")
+
         # Aggregate container resources across all plugins (for multi-plugin support)
         aggregated_resources = self._aggregate_container_resources(inputs)
         requested_cpu = aggregated_resources.get(DEEPLOY_RESOURCES.CPU)
@@ -1318,17 +2437,41 @@ class _DeeployMixin:
         self.Pd(f"  Requested: cpu={requested_cpu}, memory={requested_memory}")
         self.Pd(f"  Expected: cpu={expected_cpu}, memory={expected_memory}")
 
-        #TODO should also check disk and gpu as soon as they are supported and sent in the request
+        # Validate storage (FIXED_SIZE_VOLUMES total <= job type allocation)
+        requested_storage = aggregated_resources.get(DEEPLOY_RESOURCES.STORAGE)
+        expected_storage = expected_resources.get(DEEPLOY_RESOURCES.STORAGE)
+        if job_app_type == JOB_APP_TYPES.STACK and (requested_storage is None or expected_storage is None):
+          msg = (
+            f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Stack storage resources are required "
+            f"for job type {job_type}."
+          )
+          self.P(msg)
+          raise ValueError(msg)
+        if requested_storage and expected_storage:
+          requested_storage_mb = parse_memory_to_mb(requested_storage)
+          expected_storage_mb = parse_memory_to_mb(expected_storage)
+          self.Pd(f"  Storage: requested={requested_storage_mb}MB, allowed={expected_storage_mb}MB")
+          if requested_storage_mb > expected_storage_mb:
+            msg = (
+              f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Requested storage {requested_storage} "
+              f"exceeds allowed storage {expected_storage} for job type {job_type}."
+            )
+            self.P(msg)
+            raise ValueError(msg)
+          else:
+            self.Pd(f"  Storage validation passed ({requested_storage_mb}MB <= {expected_storage_mb}MB)")
+
+        #TODO should also check gpu as soon as it is supported and sent in the request
         # Normalize numeric values before comparison
         try:
-          requested_cpu_val = None if requested_cpu is None else float(requested_cpu)
-        except (TypeError, ValueError) as e:
+          requested_cpu_val = None if requested_cpu is None else self._parse_cpu_decimal(requested_cpu)
+        except (TypeError, ValueError, InvalidOperation) as e:
           self.Pd(f"  Failed to parse requested CPU: {e}")
           requested_cpu_val = None
 
         try:
-          expected_cpu_val = None if expected_cpu is None else float(expected_cpu)
-        except (TypeError, ValueError) as e:
+          expected_cpu_val = None if expected_cpu is None else self._parse_cpu_decimal(expected_cpu)
+        except (TypeError, ValueError, InvalidOperation) as e:
           self.Pd(f"  Failed to parse expected CPU: {e}")
           expected_cpu_val = None
 
@@ -1342,24 +2485,43 @@ class _DeeployMixin:
         self.Pd(f"  Normalized: requested_cpu={requested_cpu_val}, expected_cpu={expected_cpu_val}")
         self.Pd(f"  Normalized: requested_memory={requested_memory_mb}MB, expected_memory={expected_memory_mb}MB")
 
-        resources_match = (
-          requested_cpu_val is not None and
-          expected_cpu_val is not None and
-          requested_memory_mb is not None and
-          expected_memory_mb is not None and
-          requested_cpu_val == expected_cpu_val and
-          requested_memory_mb == expected_memory_mb
-        )
+        if job_app_type == JOB_APP_TYPES.STACK:
+          requested_storage_mb = (
+            None if requested_storage is None else parse_memory_to_mb(requested_storage)
+          )
+          expected_storage_mb = (
+            None if expected_storage is None else parse_memory_to_mb(expected_storage)
+          )
+          resources_match = (
+            requested_cpu_val is not None and
+            expected_cpu_val is not None and
+            requested_memory_mb is not None and
+            expected_memory_mb is not None and
+            requested_storage_mb is not None and
+            expected_storage_mb is not None and
+            requested_cpu_val <= expected_cpu_val and
+            requested_memory_mb <= expected_memory_mb and
+            requested_storage_mb <= expected_storage_mb
+          )
+        else:
+          resources_match = (
+            requested_cpu_val is not None and
+            expected_cpu_val is not None and
+            requested_memory_mb is not None and
+            expected_memory_mb is not None and
+            requested_cpu_val == expected_cpu_val and
+            requested_memory_mb == expected_memory_mb
+          )
 
         self.Pd(f"  Resources match: {resources_match}")
 
         if not resources_match:
           self.P(
-            f"Requested resources {aggregated_resources} do not match paid resources "
+            f"Requested resources {aggregated_resources} do not fit paid resources "
             f"{expected_resources} for job type {job_type}."
           )
           msg = (f"{DEEPLOY_ERRORS.JOB_RESOURCES3}: Requested resources {aggregated_resources} " +
-                 f"do not match paid resources {expected_resources} for job type {job_type}.")
+                 f"do not fit paid resources {expected_resources} for job type {job_type}.")
           raise ValueError(msg)
         else:
           self.Pd(f"  Resource validation passed!")
@@ -1419,35 +2581,252 @@ class _DeeployMixin:
     signature, instances = normalized_plugins[0]
     normalized_signature = signature.upper() if isinstance(signature, str) else ''
 
-    if normalized_signature == CONTAINER_APP_RUNNER_SIGNATURE:
-      service_keywords = ('postgresql', 'postgres', 'mongo', 'mongodb', 'mysql', 'mssql')
-      for instance_conf in instances:
-        if not isinstance(instance_conf, dict):
-          continue
-        image_value = (
-          instance_conf.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE)
-          or instance_conf.get('IMAGE')
-          or instance_conf.get('image')
-        )
-        if image_value and any(keyword in str(image_value).lower() for keyword in service_keywords):
-          return JOB_APP_TYPES.SERVICE
-      return JOB_APP_TYPES.GENERIC
+    if normalized_signature in (CONTAINER_APP_RUNNER_SIGNATURE, WORKER_APP_RUNNER_SIGNATURE):
+      # Multiple instances under one containerized signature → native multi-container
+      if len(instances) > 1:
+        return JOB_APP_TYPES.NATIVE
 
-    if normalized_signature == WORKER_APP_RUNNER_SIGNATURE:
+      if normalized_signature == CONTAINER_APP_RUNNER_SIGNATURE:
+        service_keywords = ('postgresql', 'postgres', 'mongo', 'mongodb', 'mysql', 'mssql')
+        for instance_conf in instances:
+          if not isinstance(instance_conf, dict):
+            continue
+          image_value = (
+            instance_conf.get(DEEPLOY_KEYS.APP_PARAMS_IMAGE)
+            or instance_conf.get('IMAGE')
+            or instance_conf.get('image')
+          )
+          if image_value and any(keyword in str(image_value).lower() for keyword in service_keywords):
+            return JOB_APP_TYPES.SERVICE
+
       return JOB_APP_TYPES.GENERIC
 
     return JOB_APP_TYPES.NATIVE
 
+  def _has_shmem_dynamic_env(self, plugins):
+    """Check if any plugin instance has shmem-type DYNAMIC_ENV entries."""
+    for plugin in plugins:
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      if not isinstance(instances, list):
+        continue
+      for instance in instances:
+        if not isinstance(instance, dict):
+          continue
+        dynamic_env = instance.get("DYNAMIC_ENV")
+        if not isinstance(dynamic_env, dict):
+          continue
+        for _key, entries in dynamic_env.items():
+          if not isinstance(entries, list):
+            continue
+          for entry in entries:
+            if isinstance(entry, dict) and entry.get("type") == "shmem":
+              return True
+    return False
+
+  @staticmethod
+  def _validate_plugin_name(plugin_name):
+    """
+    Validate that a plugin_name contains only safe characters for use in
+    semaphore keys. Allowed: letters, digits, hyphens, underscores.
+
+    Raises
+    ------
+    ValueError
+      If plugin_name contains invalid characters.
+    """
+    import re
+    if not re.fullmatch(r'[a-zA-Z0-9_-]+', plugin_name):
+      raise ValueError(
+        "Invalid plugin_name '{}'. Only letters, digits, hyphens and underscores are allowed.".format(plugin_name)
+      )
+
+  def _validate_plugin_names(self, plugins):
+    """
+    Validate all plugin_name values across prepared plugins for charset
+    and uniqueness.
+
+    Parameters
+    ----------
+    plugins : list
+      Prepared plugins payload with INSTANCES.
+
+    Raises
+    ------
+    ValueError
+      If a plugin_name has invalid characters or is duplicated.
+    """
+    used_names = set()
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        if not pname:
+          continue
+        self._validate_plugin_name(pname)
+        if pname in used_names:
+          raise ValueError(
+            "Duplicate plugin_name '{}'. Each plugin must have a unique name.".format(pname)
+          )
+        used_names.add(pname)
+
+  def _resolve_shmem_in_plugins(self, plugins, app_id):
+    """
+    Resolve shmem-type DYNAMIC_ENV entries inline using plugin_name-based semaphore keys.
+
+    For each named instance: sets SEMAPHORE = "app_id__plugin_name".
+    For each shmem path: rewrites path[0] from plugin_name to the semaphore key.
+    For each consumer: sets SEMAPHORED_KEYS with all referenced semaphore keys.
+
+    Parameters
+    ----------
+    plugins : list
+      Prepared plugins payload. Instances must have plugin_name in payload for shmem to work.
+    app_id : str
+      Application identifier used to namespace semaphore keys.
+
+    Returns
+    -------
+    list
+      Modified plugins with shmem references resolved.
+    """
+    # Build plugin_name -> semaphore_key map from all instances
+    name_to_key = {}
+    used_names = set()
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        if not pname:
+          continue
+        self._validate_plugin_name(pname)
+        if pname in used_names:
+          raise ValueError(
+            "Duplicate plugin_name '{}'. Each plugin must have a unique name.".format(pname)
+          )
+        used_names.add(pname)
+        sem_key = "{}__{}".format(app_id, pname)
+        existing_sem = instance.get("SEMAPHORE")
+        if existing_sem and existing_sem != sem_key:
+          raise ValueError(
+            "plugin_name '{}' implies SEMAPHORE '{}' but instance already has '{}'.".format(
+              pname, sem_key, existing_sem
+            )
+          )
+        instance["SEMAPHORE"] = sem_key
+        name_to_key[pname] = sem_key
+
+    if not name_to_key:
+      return plugins
+
+    # Resolve shmem paths and collect consumer dependencies
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        dynamic_env = instance.get("DYNAMIC_ENV")
+        if not isinstance(dynamic_env, dict):
+          continue
+
+        consumer_sem_keys = set()
+        for _var_name, entries in dynamic_env.items():
+          if not isinstance(entries, list):
+            continue
+          for entry in entries:
+            if not isinstance(entry, dict) or entry.get("type") != "shmem":
+              continue
+            path = entry.get("path")
+            if not isinstance(path, (list, tuple)) or len(path) < 2:
+              continue
+            provider_name = path[0]
+            if provider_name not in name_to_key:
+              raise ValueError(
+                "DYNAMIC_ENV shmem references unknown plugin '{}'. "
+                "Available plugins: {}".format(provider_name, sorted(name_to_key.keys()))
+              )
+            sem_key = name_to_key[provider_name]
+            entry["path"] = [sem_key, path[1]]
+            consumer_sem_keys.add(sem_key)
+
+        if consumer_sem_keys:
+          instance["SEMAPHORED_KEYS"] = sorted(consumer_sem_keys)
+
+    return plugins
+
+  def _validate_dependency_tree(self, inputs):
+    """
+    Validate dependency_tree from inputs for circular dependencies.
+    Raises ValueError if a cycle is detected.
+    """
+    dep_tree = inputs.get(DEEPLOY_KEYS.DEPENDENCY_TREE)
+    if not dep_tree or not isinstance(dep_tree, list):
+      return
+
+    # Validate structure
+    for edge in dep_tree:
+      if not isinstance(edge, (list, tuple)) or len(edge) != 2:
+        raise ValueError(
+          f"{DEEPLOY_ERRORS.DEPENDENCY_TREE1}: Invalid dependency_tree entry: {edge}. Each entry must be a [from, to] pair."
+        )
+
+    # DFS cycle detection
+    graph = {}
+    for from_node, to_node in dep_tree:
+      if from_node not in graph:
+        graph[from_node] = []
+      graph[from_node].append(to_node)
+
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color = {node: WHITE for node in graph}
+
+    def dfs(node):
+      color[node] = GRAY
+      for neighbor in graph.get(node, []):
+        if neighbor not in color:
+          color[neighbor] = WHITE
+        c = color[neighbor]
+        if c == GRAY:
+          return True
+        if c == WHITE and dfs(neighbor):
+          return True
+      color[node] = BLACK
+      return False
+
+    for node in list(graph.keys()):
+      if color.get(node, WHITE) == WHITE:
+        if dfs(node):
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.DEPENDENCY_TREE2}: Circular dependency detected in dependency_tree."
+          )
+    return
+
   def _autowire_native_container_semaphore(self, app_id, plugins, job_app_type):
     """
-    Auto-configure semaphore settings for native + container pairs.
+    Auto-configure semaphore settings for a native job that has one native plugin
+    and one containerized plugin (CONTAINER_APP_RUNNER or WORKER_APP_RUNNER).
+
+    The native plugin acts as the orchestrator — it receives a SEMAPHORE key so that
+    containerized plugins can wait for it to be ready. Each containerized plugin
+    instance receives SEMAPHORED_KEYS containing all native semaphore keys.
+
+    This is only meant for the simple native + CAR/WAR pattern. When the user
+    provides explicit shmem DYNAMIC_ENV references or manual SEMAPHORE /
+    SEMAPHORED_KEYS config, this autowiring is skipped entirely and the user's
+    explicit dependency tree takes precedence.
+
+    Skips autowiring when:
+    - job_app_type is not NATIVE
+    - Fewer than 2 signature groups (need both a native and a containerized group)
+    - SEMAPHORE / SEMAPHORED_KEYS already present on any instance
+    - Explicit shmem DYNAMIC_ENV entries detected (user-defined dependency tree)
 
     Parameters
     ----------
     app_id : str
       Application identifier used to build deterministic semaphore keys.
     plugins : list
-      Prepared plugins payload (expected to be a two-item native/container pair).
+      Prepared plugins payload (one entry per signature group, each with INSTANCES).
     job_app_type : str
       Detected job application type.
 
@@ -1459,85 +2838,110 @@ class _DeeployMixin:
     try:
       if job_app_type != JOB_APP_TYPES.NATIVE:
         return plugins
-      # endif native job app type
+      # end if
 
-      if not isinstance(plugins, list) or len(plugins) != 2:
+      if not isinstance(plugins, list) or len(plugins) < 2:
         return plugins
-      # endif plugin pair check
+      # end if
 
       def has_semaphore_config(plugin_list):
         for plugin in plugin_list:
           instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
           if not isinstance(instances, list):
             continue
-          # endif instances is list
+          # end if
           for instance in instances:
             if not isinstance(instance, dict):
               continue
-            # endif instance is dict
+            # end if
             if "SEMAPHORE" in instance or "SEMAPHORED_KEYS" in instance:
               return True
-            # endif instance has semaphore config
-          # endfor each instance
-        # endfor each plugin
+            # end if
+          # end for instance
+        # end for plugin
         return False
+      # end has_semaphore_config
 
       if has_semaphore_config(plugins):
         self.Pd("Skipping semaphore autowire; semaphore config already provided.")
         return plugins
-      # endif skip when provided
+      # end if
 
-      container_plugin = None
-      native_plugin = None
+      # Skip autowiring if explicit shmem references are present
+      if self._has_shmem_dynamic_env(plugins):
+        self.Pd("Skipping semaphore autowire; explicit shmem references detected.")
+        return plugins
+      # end if
+
+      # Collect all native and container plugins
+      native_plugins = []
+      container_plugins = []
 
       for plugin in plugins:
         signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
         if not signature:
           continue
-        # endif signature check
+        # end if
         normalized_signature = str(signature).upper()
         if normalized_signature in CONTAINERIZED_APPS_SIGNATURES:
-          container_plugin = container_plugin or plugin
+          container_plugins.append(plugin)
         else:
-          native_plugin = native_plugin or plugin
-        # endif signature type
-      # endfor each plugin
+          native_plugins.append(plugin)
+        # end if
+      # end for plugin
 
-      if not container_plugin or not native_plugin:
+      if not container_plugins or not native_plugins:
         return plugins
-      # endif both plugin types found
+      # end if
 
-      native_instances = native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-      container_instances = container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-
-      if not isinstance(native_instances, list) or not isinstance(container_instances, list):
-        return plugins
-      # endif instance lists
-
+      # Set SEMAPHORE on all native instances
       semaphore_keys = []
-      for instance in native_instances:
-        if not isinstance(instance, dict):
+      for native_plugin in native_plugins:
+        native_instances = native_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+        if not isinstance(native_instances, list):
           continue
-        # endif instance is dict
-        instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
-        if not instance_id:
-          continue
-        # endif instance id
-        semaphore_key = self.sanitize_name("{}__{}".format(app_id, instance_id))
-        instance["SEMAPHORE"] = semaphore_key
-        semaphore_keys.append(semaphore_key)
-      # endfor each native instance
+        # end if
+        for instance in native_instances:
+          if not isinstance(instance, dict):
+            continue
+          # end if
+          instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+          if not instance_id:
+            continue
+          # end if
+          plugin_name = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          if plugin_name:
+            self._validate_plugin_name(plugin_name)
+          semaphore_key = "{}__{}".format(app_id, plugin_name) if plugin_name else self.sanitize_name("{}__{}".format(app_id, instance_id))
+          existing_sem = instance.get("SEMAPHORE")
+          if existing_sem and existing_sem != semaphore_key:
+            raise ValueError(
+              "plugin_name '{}' implies SEMAPHORE '{}' but instance already has '{}'.".format(
+                plugin_name or instance_id, semaphore_key, existing_sem
+              )
+            )
+          instance["SEMAPHORE"] = semaphore_key
+          semaphore_keys.append(semaphore_key)
+        # end for instance
+      # end for native_plugin
 
       if not semaphore_keys:
         return plugins
-      # endif semaphore keys found
+      # end if
 
-      for instance in container_instances:
-        if not isinstance(instance, dict):
+      # Set SEMAPHORED_KEYS on all container instances
+      for container_plugin in container_plugins:
+        container_instances = container_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+        if not isinstance(container_instances, list):
           continue
-        # endif container instance dict
-        instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
-      # endfor each container instance
+        # end if
+        for instance in container_instances:
+          if not isinstance(instance, dict):
+            continue
+          # end if
+          instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
+        # end for instance
+      # end for container_plugin
 
       return plugins
     except Exception as exc:
@@ -1653,13 +3057,14 @@ class _DeeployMixin:
     response_key = instance_id + '_' + self.uuid(8)
     return response_key
 
-  def deeploy_prepare_plugins(self, inputs):
+  def deeploy_prepare_plugins(self, inputs, app_id=None):
     """
     Prepare the plugins for the pipeline creation.
     Converts simplified plugins array format to node-expected format with grouped instances.
 
     Args:
         inputs: Request inputs containing plugins array (simplified format) or legacy plugin_signature
+        app_id: Optional application identifier for shmem resolution.
 
     Input Format (simplified):
         plugins: [
@@ -1699,6 +3104,7 @@ class _DeeployMixin:
         signature = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE)
 
         # Extract instance config (everything except metadata keys)
+        # Note: plugin_name is intentionally kept so it can be recovered during job editing
         instance_config = {
           k: v for k, v in plugin_instance.items()
           if k not in {
@@ -1741,6 +3147,12 @@ class _DeeployMixin:
         }
         prepared_plugins.append(prepared_plugin)
 
+      # Validate plugin_name uniqueness and charset (independent of shmem)
+      self._validate_plugin_names(prepared_plugins)
+
+      if app_id and self._has_shmem_dynamic_env(prepared_plugins):
+        prepared_plugins = self._resolve_shmem_in_plugins(prepared_plugins, app_id)
+
       return prepared_plugins
 
     # Legacy single-plugin format - use existing method
@@ -1748,9 +3160,49 @@ class _DeeployMixin:
     plugins = [plugin]
     return plugins
 
-  def check_and_deploy_pipelines(self, owner, inputs, app_id, app_alias, app_type, update_nodes, new_nodes, discovered_plugin_instances=[], dct_deeploy_specs=None, job_app_type=None, dct_deeploy_specs_create=None):
+  def check_and_deploy_pipelines(
+      self, owner, inputs, app_id,
+      app_alias, app_type,
+      update_nodes, new_nodes,
+      discovered_plugin_instances=[],
+      dct_deeploy_specs=None, job_app_type=None,
+      dct_deeploy_specs_create=None,
+      wait_for_responses=True
+  ):
     """
     Validate the inputs and deploy the pipeline on the target nodes.
+
+    Parameters
+    ----------
+    owner : str
+        Escrow owner address.
+    inputs : dict-like
+        Normalized request inputs.
+    app_id : str
+        Application identifier.
+    app_alias : str
+        Application alias for display.
+    app_type : str
+        Pipeline type (capture type).
+    update_nodes : list[str]
+        Nodes that should receive update operations.
+    new_nodes : list[str]
+        Nodes that should receive create operations.
+    discovered_plugin_instances : list, optional
+        Discovered plugin instances used for update operations.
+    dct_deeploy_specs : dict, optional
+        Deeploy specs used for update operations.
+    job_app_type : str, optional
+        Detected or provided job app type.
+    dct_deeploy_specs_create : dict, optional
+        Deeploy specs used for create operations.
+    wait_for_responses : bool, optional
+        When True, block until responses are collected or timeout.
+
+    Returns
+    -------
+    tuple
+        (dct_status, str_status, response_keys)
     """
     # Phase 1: Check if nodes are available
 
@@ -1760,24 +3212,40 @@ class _DeeployMixin:
 
     # Phase 2: Launch the pipeline on each node and set CSTORE `response_key`` for the "callback" action
     response_keys = {}
+    pipeline_to_persist = None
     if len(update_nodes) > 0:
-      update_response_keys = self.__update_pipeline_on_nodes(update_nodes, inputs, app_id, app_alias, app_type, owner, discovered_plugin_instances, dct_deeploy_specs, job_app_type=job_app_type)
+      update_response_keys, update_pipeline_to_persist = self.__update_pipeline_on_nodes(
+        update_nodes, inputs, app_id, app_alias, app_type,
+        owner, discovered_plugin_instances, dct_deeploy_specs,
+        job_app_type=job_app_type
+      )
       response_keys.update(update_response_keys)
+      if update_pipeline_to_persist is not None:
+        pipeline_to_persist = update_pipeline_to_persist
     if len(new_nodes) > 0:
-      new_response_keys = self.__create_pipeline_on_nodes(new_nodes, inputs, app_id, app_alias, app_type, owner, job_app_type=job_app_type, dct_deeploy_specs=dct_deeploy_specs_create)
+      new_response_keys, created_pipeline_to_persist = self.__create_pipeline_on_nodes(
+        new_nodes, inputs, app_id, app_alias, app_type, owner,
+        job_app_type=job_app_type,
+        dct_deeploy_specs=dct_deeploy_specs_create
+      )
       response_keys.update(new_response_keys)
+      if created_pipeline_to_persist is not None:
+        pipeline_to_persist = created_pipeline_to_persist
 
     # Phase 3: Wait until all the responses are received via CSTORE and compose status response
-    dct_status, str_status = self._get_pipeline_responses(response_keys, 300)
+    if wait_for_responses:
+      dct_status, str_status = self._get_pipeline_responses(response_keys, 300)
+    else:
+      dct_status, str_status = {}, DEEPLOY_STATUS.PENDING
 
     self.P(f"Pipeline responses: str_status = {str_status} | dct_status =\n {self.json_dumps(dct_status, indent=2)}")
-    
+
     # if pipelines to not use CHAINSTORE_RESPONSE, we can assume nodes reveived the command (BLIND) - to be modified in native plugins
     # else we consider all good if str_status is SUCCESS
 
-    return dct_status, str_status
+    return dct_status, str_status, response_keys, pipeline_to_persist
 
-  def scale_up_job(self, new_nodes, update_nodes, job_id, owner, running_apps_for_job):
+  def scale_up_job(self, new_nodes, update_nodes, job_id, owner, running_apps_for_job, wait_for_responses=True):
     """
     Scale up the job workers.
     """
@@ -1796,22 +3264,23 @@ class _DeeployMixin:
     self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")
 
     # RESET chainstore_response_keys here
-    try:
-      self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
-      for node_addr, response_keys in chainstore_response_keys.items():
-        for response_key in response_keys:
-          self.chainstore_set(response_key, None)
-    except Exception as e:
-      self.P(f"Error resetting chainstore keys: {e}", color='r')
+    self.P(f"Resetting chainstore keys: {self.json_dumps(chainstore_response_keys)}")
+    self._reset_chainstore_response_keys(
+      chainstore_response_keys,
+      context=f"scale up job {job_id}",
+    )
 
     # Start pipelines on nodes.
     self._start_create_update_pipelines(create_pipelines=create_pipelines,
                                         update_pipelines=update_pipelines,
                                         owner=owner)
 
-    dct_status, str_status = self._get_pipeline_responses(chainstore_response_keys, 300)
+    if wait_for_responses:
+      dct_status, str_status = self._get_pipeline_responses(chainstore_response_keys, 300)
+    else:
+      dct_status, str_status = {}, DEEPLOY_STATUS.PENDING
 
-    return dct_status, str_status
+    return dct_status, str_status, chainstore_response_keys
 
   def _discover_plugin_instances(
     self,
@@ -2365,7 +3834,9 @@ class _DeeployMixin:
   def check_running_pipelines_and_add_to_r1fs(self):
     self.P(f"Checking running pipelines and adding them to R1FS...")
     running_pipelines = self.netmon.network_known_pipelines()
+    self.P(f"Retrieved pipelines from {len(running_pipelines)} nodes from NetMon.")
     listed_job_ids = self.list_all_deployed_jobs_from_cstore()
+    self.P(f"Retrieved {len(listed_job_ids)} listed job IDs from CSTORE.")
     netmon_job_ids = {}
     for node, pipelines in running_pipelines.items():
       for pipeline in pipelines:
@@ -2375,17 +3846,31 @@ class _DeeployMixin:
           if job_id in netmon_job_ids or not job_id:
             continue
           netmon_job_ids[job_id] = pipeline
+    # endfor running pipelines
+    self.P(f"Identified {len(netmon_job_ids)} unique job IDs from running pipelines in NetMon.")
     for netmon_job_id, pipeline in netmon_job_ids.items():
       listed_job_cid = listed_job_ids.get(str(netmon_job_id), None)
       if listed_job_cid and len(listed_job_cid)  == 46:
         continue
       self.save_job_pipeline_in_cstore(pipeline, netmon_job_id)
-    
+    # endfor job IDs
+    # This should log how many new job pipelines were added to R1FS and how many were already listed,
+    # but at the moment save_job_pipeline_in_cstore does not return a value to determine that, so we log
+    # that we checked all job IDs.
+    self.P(f"Checked all job IDs.")
     return netmon_job_ids
   
-  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, allow_missing=False, discovered_instances=None):
+  def delete_pipeline_from_nodes(self, app_id=None, job_id=None, owner=None, target_nodes=None, allow_missing=False, discovered_instances=None):
+    if not target_nodes:
+      target_nodes = None
+
     if discovered_instances is None:
-      discovered_instances = self._discover_plugin_instances(app_id=app_id, job_id=job_id, owner=owner)
+      discovered_instances = self._discover_plugin_instances(
+        app_id=app_id,
+        job_id=job_id,
+        owner=owner,
+        target_nodes=target_nodes,
+      )
 
     if len(discovered_instances) == 0:
       if allow_missing:
@@ -2395,11 +3880,32 @@ class _DeeployMixin:
       msg += f"{f'app_id {app_id}' if app_id else f'job_id {job_id}'} and owner '{owner}'."
       raise ValueError(msg)
     #endif
+
+    seen_targets = set()
+    unique_targets = []
+    duplicate_count = 0
     for instance in discovered_instances:
-      self.P(f"Stopping pipeline '{instance[DEEPLOY_PLUGIN_DATA.APP_ID]}' on {instance[DEEPLOY_PLUGIN_DATA.NODE]}")
+      node = instance[DEEPLOY_PLUGIN_DATA.NODE]
+      pipeline_app_id = instance[DEEPLOY_PLUGIN_DATA.APP_ID]
+      target_key = (node, pipeline_app_id)
+      if target_key in seen_targets:
+        duplicate_count += 1
+        continue
+      seen_targets.add(target_key)
+      unique_targets.append(target_key)
+
+    if duplicate_count:
+      self.P(
+        f"Collapsed {duplicate_count} duplicate Deeploy delete target(s) from "
+        f"{len(discovered_instances)} discovered plugin instance(s).",
+        color='y',
+      )
+
+    for node, pipeline_app_id in unique_targets:
+      self.P(f"Stopping pipeline '{pipeline_app_id}' on {node}")
       self.cmdapi_stop_pipeline(
-        node_address=instance[DEEPLOY_PLUGIN_DATA.NODE],
-        name=instance[DEEPLOY_PLUGIN_DATA.APP_ID],
+        node_address=node,
+        name=pipeline_app_id,
       )
     #endfor each target node
     return discovered_instances
@@ -2439,10 +3945,19 @@ class _DeeployMixin:
           filtered_result[node][app_name] = app_data
       result = filtered_result
     if job_id is not None:
+      if isinstance(job_id, int):
+        unique_job_ids = {job_id}
+      elif isinstance(job_id, list):
+        if not all(isinstance(value, int) for value in job_id):
+          raise ValueError("job_id must be int or list of int")
+        unique_job_ids = set(job_id)
+      else:
+        raise ValueError("job_id must be int or list of int")
       filtered_result = self.defaultdict(dict)
       for node, apps in result.items():
         for app_name, app_data in apps.items():
-          if app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None) != job_id:
+          app_job_id = app_data.get(NetMonCt.DEEPLOY_SPECS, {}).get(DEEPLOY_KEYS.JOB_ID, None)
+          if app_job_id not in unique_job_ids:
             continue
           filtered_result[node][app_name] = app_data
       result = filtered_result
@@ -2459,6 +3974,140 @@ class _DeeployMixin:
       node_alias = self.netmon.network_node_eeid(node)
       for _, app_data in apps.items():
         app_data["node_alias"] = node_alias
+    return result
+
+  def _serialize_chain_job(self, raw_job):
+    """
+    Serialize chain job details for JSON APIs, keeping bigint-like values as strings.
+    """
+    serialized = {
+      "id": str(raw_job.get("jobId", "")),
+      "projectHash": raw_job.get("projectHash"),
+      "requestTimestamp": str(raw_job.get("requestTimestamp", 0)),
+      "startTimestamp": str(raw_job.get("startTimestamp", 0)),
+      "lastNodesChangeTimestamp": str(raw_job.get("lastNodesChangeTimestamp", 0)),
+      "jobType": str(raw_job.get("jobType", 0)),
+      "pricePerEpoch": str(raw_job.get("pricePerEpoch", 0)),
+      "lastExecutionEpoch": str(raw_job.get("lastExecutionEpoch", 0)),
+      "numberOfNodesRequested": str(raw_job.get("numberOfNodesRequested", 0)),
+      "balance": str(raw_job.get("balance", 0)),
+      "lastAllocatedEpoch": str(raw_job.get("lastAllocatedEpoch", 0)),
+      "activeNodes": [str(node) for node in raw_job.get("activeNodes", [])],
+      "network": raw_job.get("network"),
+      "escrowAddress": raw_job.get("escrowAddress"),
+    }
+    return serialized
+
+  def _get_apps_by_escrow_active_jobs(self, sender_escrow, owner, project_id=None):
+    """
+    Build get_apps payload using active SC job IDs as source of truth,
+    with snapshots from online nodes, if any.
+
+    Response shape:
+      {
+        "<job_id>": {
+          "job_id": <int>,
+          "pipeline": <dict>,       # raw R1FS payload
+          "chain_job": <dict>,      # serialized chain job details
+          "online": <dict>,         # online apps snapshot keyed by node
+        }
+      }
+    """
+    get_apps_r1fs_timeout = 30
+    result = {}
+    failed_pipeline_cids = {}
+
+    active_jobs = self.bc.get_escrow_active_jobs(sender_escrow)
+    active_job_ids = [int(job["jobId"]) for job in active_jobs]
+    self.Pd(f"Fetched {len(active_job_ids)} active jobs from escrow {sender_escrow}, fetching details")
+
+    # Fetch online apps once, then reuse grouped entries per job_id.
+    all_online_apps = self._get_online_apps(
+      owner=owner,
+      job_id=active_job_ids,
+      project_id=project_id
+    )
+    self.Pd(f"Fetched {len(all_online_apps)} online apps snapshot for active jobs")
+
+    online_apps_by_job_id = self.defaultdict(lambda: self.defaultdict(dict))
+    for node, apps in all_online_apps.items():
+      for app_name, app_data in apps.items():
+        app_job_id = int(app_data[NetMonCt.DEEPLOY_SPECS][DEEPLOY_KEYS.JOB_ID])
+        online_apps_by_job_id[app_job_id][node][app_name] = app_data
+
+    self.Pd(f"Iterating over active jobs and correlating with online apps")
+    for active_job in active_jobs:
+      job_id = int(active_job["jobId"])
+      chain_job = self._serialize_chain_job(active_job)
+      grouped_online_apps = online_apps_by_job_id.get(job_id, {})
+      online_apps = {node: dict(apps) for node, apps in grouped_online_apps.items()}
+      pipeline_cid = self._get_pipeline_from_cstore(job_id)
+
+      self.Pd(f"Fetching R1FS payload for job {job_id}")
+      pipeline = None
+      if pipeline_cid:
+        try:
+          pipeline = self.get_pipeline_from_r1fs(
+            pipeline_cid,
+            timeout=get_apps_r1fs_timeout,
+            pin=False,
+            raise_on_error=False,
+            show_logs=True,
+          )
+        except Exception as exc:
+          self.Pd(f"Failed to load R1FS payload for job {job_id}: {exc}", color='y')
+          pipeline = None
+
+      if pipeline is None:
+        if pipeline_cid:
+          failed_pipeline_cids[str(job_id)] = pipeline_cid
+        if project_id is not None and chain_job.get("projectHash") != project_id:
+          self.Pd(
+            f"Skipping job {job_id}: project_id mismatch and pipeline payload is unavailable.",
+            color='y'
+          )
+          continue
+
+        self.Pd(
+          f"Returning partial get_apps data for job {job_id}: pipeline payload unavailable after "
+          f"{get_apps_r1fs_timeout}s R1FS fetch timeout.",
+          color='y'
+        )
+        result[str(job_id)] = {
+          DEEPLOY_KEYS.JOB_ID: job_id,
+          DEEPLOY_KEYS.PIPELINE: None,
+          DEEPLOY_KEYS.ONLINE: online_apps,
+          DEEPLOY_KEYS.CHAIN_JOB: chain_job,
+        }
+        continue
+
+      self.Pd(f"Loaded R1FS payload for job {job_id}")
+      pipeline_owner = pipeline[NetMonCt.OWNER.upper()]
+      if pipeline_owner != owner:
+        self.Pd(
+          f"Skipping R1FS payload for job {job_id}: owner mismatch "
+          f"(expected {owner}, got {pipeline_owner}).",
+          color='y'
+        )
+        continue
+
+      if project_id is not None and pipeline.get(NetMonCt.DEEPLOY_SPECS.upper(), {}).get(DEEPLOY_KEYS.PROJECT_ID) != project_id:
+        self.Pd(f"Skipping R1FS payload for job {job_id}: project_id mismatch.", color='y')
+        continue
+
+      result[str(job_id)] = {
+        DEEPLOY_KEYS.JOB_ID: job_id,
+        DEEPLOY_KEYS.PIPELINE: pipeline,
+        DEEPLOY_KEYS.ONLINE: online_apps,
+        DEEPLOY_KEYS.CHAIN_JOB: chain_job,
+      }
+
+    if failed_pipeline_cids:
+      self.P(
+        f"These job pipeline fetches failed during get_apps: {failed_pipeline_cids}",
+        color='r'
+      )
+
     return result
 
   # TODO: REMOVE THIS, once instance_id is coming from ui for instances that have to be updated

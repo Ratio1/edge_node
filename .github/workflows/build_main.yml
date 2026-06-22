@@ -1,0 +1,112 @@
+name: Build mainnet images (CPU + GPU) and tag commit
+
+on:
+  push:
+    branches:
+      - "main"
+  workflow_dispatch:
+
+concurrency:
+  group: edge-node-build
+  cancel-in-progress: false
+
+jobs:
+  # 1. mainnet CPU (also tags the commit with the edge node version)
+  mainnet-cpu:
+    name: Build mainnet CPU
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure Git
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+
+      - name: Retrieve edge node version
+        run: |
+          VERSION=$(cat ver.py | grep -o "'.*'" | tr -d "'")
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "IMAGE_TAG=ratio1/edge_node:${VERSION}" >> $GITHUB_ENV
+          echo "Edge node version: $VERSION"
+
+      - name: Tag main commit with version
+        run: |
+          git tag -a "$VERSION" -m "Version $VERSION"
+          git push origin "$VERSION"
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: "lab:latest"
+          driver: cloud
+          endpoint: "naeural/naeural-builder"
+
+      - name: Cleanup builder cache
+        run: |
+          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
+          docker buildx prune -f --verbose --builder "${{ steps.buildx.outputs.name }}"
+          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
+
+      - name: Build and push MAINNET CPU image
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile_mainnet
+          push: true
+          tags: |
+            ${{ env.IMAGE_TAG }}
+            ratio1/edge_node:latest
+            ratio1/edge_node:mainnet
+
+  # 2. mainnet GPU (prunes the buildx-cloud cache first to free CPU layers)
+  mainnet-gpu:
+    name: Build mainnet GPU
+    needs: mainnet-cpu
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        id: buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          version: "lab:latest"
+          driver: cloud
+          endpoint: "naeural/naeural-builder"
+
+      - name: Prune buildx cache before GPU build
+        run: |
+          echo "=========== buildx du (before GPU prune) ==========="
+          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
+          docker buildx prune -af --verbose --builder "${{ steps.buildx.outputs.name }}"
+          echo "=========== buildx du (after GPU prune) ==========="
+          docker buildx du --builder "${{ steps.buildx.outputs.name }}"
+
+      - name: Build and push MAINNET GPU image
+        uses: docker/build-push-action@v6
+        with:
+          builder: ${{ steps.buildx.outputs.name }}
+          context: .
+          file: ./Dockerfile_mainnet
+          build-args: |
+            BASE_IMAGE=ratio1/base_edge_node_amd64_gpu:latest
+          push: true
+          tags: |
+            ratio1/edge_node_gpu:mainnet
+            ratio1/edge_node_gpu:latest

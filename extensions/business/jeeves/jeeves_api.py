@@ -96,9 +96,13 @@ class JeevesApiPlugin(BasePlugin, _NetworkProcessorMixin):
     data = super()._get_chainstore_response_data()
 
     # Add Jeeves API-specific information
+    try:
+      port = self.port or self.cfg_port
+    except Exception:
+      port = None
     data.update({
-      'api_port': getattr(self, 'cfg_port', None),
-      'api_endpoint': f"http://{self.log.get_localhost_ip()}:{self.cfg_port}" if hasattr(self, 'cfg_port') else None,
+      'api_port': port,
+      'api_endpoint': f"http://{self.log.get_localhost_ip()}:{port}" if port else None,
       'predefined_domains': list(self.cfg_predefined_domains.keys()) if hasattr(self, 'cfg_predefined_domains') and self.cfg_predefined_domains else [],
       'status': 'ready',
     })

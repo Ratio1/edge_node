@@ -63,7 +63,10 @@ EXTRA_TUNNELS Feature:
 """
 
 import docker
+import os
 import requests
+import shutil
+import signal
 import threading
 import time
 import socket
@@ -77,16 +80,30 @@ from docker.types import DeviceRequest
 from naeural_core.business.base.web_app.base_tunnel_engine_plugin import BaseTunnelEnginePlugin as BasePlugin
 
 from .container_utils import _ContainerUtilsMixin # provides container management support currently empty it is embedded in the plugin
+from .fixed_volume import safe_path_component
+from .mixins import (
+  _FixedSizeVolumesMixin,
+  _ImagePullBackoffMixin,
+  _RestartBackoffMixin,
+  _TunnelBackoffMixin,
+)
+from .env_overrides import _EnvOverridesMixin
+from .reset import _ResetMixin
+from .sync import _SyncMixin
 
 __VER__ = "0.7.1"
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
-# Persistent state filename (stored in instance-specific subfolder)
+# Persistent state filename (stored under the plugin's auto-routed plugin_data/ folder)
 _PERSISTENT_STATE_FILE = "persistent_state.pkl"
 
-# Subfolder prefix for container app data
-_CONTAINER_APPS_SUBFOLDER = "container_apps"
+# Container logs filename (stored under the plugin's logs/ sibling folder)
+_CONTAINER_LOGS_FILE = "container_logs.pkl"
+
+# Pre-refactor persistent-state / logs subfolder relative to the data folder.
+# Kept here only so we can migrate content once; do not use for new writes.
+_LEGACY_CONTAINER_APPS_SUBFOLDER = "container_apps"
 
 
 class ContainerState(Enum):
@@ -129,6 +146,8 @@ class StopReason(Enum):
   IMAGE_UPDATE = "image_update"     # Restarting for image update
   CONFIG_UPDATE = "config_update"   # Restarting for config change
   EXTERNAL_UPDATE = "external_update"  # Generic external trigger (VCS, DB, file watch, etc.)
+  ENV_OVERRIDE = "env_override"     # Restarting for accepted local env override patch
+  RESET_FAILED = "reset_failed"     # Reset stopped the app, but volume mutation failed
 
 
 class RestartPolicy(Enum):
@@ -156,11 +175,13 @@ class HealthCheckMode(Enum):
     TCP: TCP port check - works for any protocol (HTTP, WebSocket, gRPC, raw TCP)
     ENDPOINT: HTTP probe to HEALTH_ENDPOINT_PATH - expects 2xx response
     DELAY: Simple time-based delay using TUNNEL_START_DELAY
+    DISABLED: No health probing - app is considered ready as soon as container is running
   """
   AUTO = "auto"
   TCP = "tcp"
   ENDPOINT = "endpoint"
   DELAY = "delay"
+  DISABLED = "disabled"
 
 
 @dataclass
@@ -242,15 +263,6 @@ _CONFIG = {
 
   "TUNNEL_ENGINE_ENABLED": True,
   "TUNNEL_ENGINE_PING_INTERVAL": 30,  # seconds
-  "TUNNEL_ENGINE_PARAMETERS": {
-  },
-
-  # Cloudflare token for main tunnel (backward compatibility)
-  "CLOUDFLARE_TOKEN": None,
-  "CLOUDFLARE_PROTOCOL": "http", # protocol to use for cloudflare tunnel (http or tcp)
-
-  # Extra tunnels for additional ports: {container_port: "cloudflare_token"}
-  "EXTRA_TUNNELS": {},
   "EXTRA_TUNNELS_PING_INTERVAL": 30,  # seconds to ping extra tunnel URLs
 
 
@@ -260,7 +272,9 @@ _CONFIG = {
 
   # Container-specific config options
   "IMAGE": None,            # Required container image, e.g. "my_repo/my_app:latest"
+  "CONTAINER_ENTRYPOINT": None,        # Optional entrypoint override for the container
   "CONTAINER_START_COMMAND": None,  # Optional command list executed when launching the container
+  "CONTAINER_USER": None,          # Optional user override for the container (e.g. "root", "0:0")
   "BUILD_AND_RUN_COMMANDS": [],     # Optional commands executed inside the running container
   "CR_DATA": {              # dict of container registry data
     "SERVER": 'docker.io',  # Optional container registry URL
@@ -268,8 +282,14 @@ _CONFIG = {
     "PASSWORD": None,       # Optional registry password or token
   },
   "ENV": {},                # dict of env vars for the container
-  "DYNAMIC_ENV": {},        # dict of dynamic env vars for the container
-  "PORT": None,             # internal container port if it's a web app (int)
+  "DYNAMIC_ENV": {},        # backend dynamic env definition; Deeploy may compile DYNAMIC_ENV_UI into this
+  "ENV_OVERRIDES": {
+    "ENABLED": True,        # app-local request.json patches under /r1en_system/env-overrides
+  },
+  "RESET": {
+    "ENABLED": True,        # app-local request.json reset under /r1en_system/reset
+  },
+  "EXPOSED_PORTS": {},      # normalized container-port config keyed by internal container port
   "CONTAINER_RESOURCES" : {
     "cpu": 1,          # e.g. "0.5" for half a CPU, or "1.0" for one CPU core
     "gpu": 0,          # 0 - no GPU, 1 - use GPU
@@ -281,10 +301,14 @@ _CONFIG = {
   "AUTOUPDATE" : True, # If True, will check for image updates and pull them if available
   "AUTOUPDATE_INTERVAL": 100,
 
+  # Image pull retry configuration (exponential backoff with jitter)
+  "IMAGE_PULL_MAX_RETRIES": 100,      # Max pull attempts before giving up (0 = unlimited)
+  "IMAGE_PULL_BACKOFF_BASE": 20,      # Base delay in seconds for exponential backoff
+
   # Restart retry configuration (exponential backoff)
   "RESTART_MAX_RETRIES": 5,     # Max consecutive restart attempts before giving up (0 = unlimited)
-  "RESTART_BACKOFF_INITIAL": 2,  # Initial backoff delay in seconds
-  "RESTART_BACKOFF_MAX": 300,    # Maximum backoff delay in seconds (5 minutes)
+  "RESTART_BACKOFF_INITIAL": 10,  # Initial backoff delay in seconds
+  "RESTART_BACKOFF_MAX": 600,    # Maximum backoff delay in seconds (5 minutes)
   "RESTART_BACKOFF_MULTIPLIER": 2,  # Backoff multiplier for exponential backoff
   "RESTART_RESET_INTERVAL": 300,  # Reset retry count after this many seconds of successful run
 
@@ -295,8 +319,30 @@ _CONFIG = {
   "TUNNEL_RESTART_BACKOFF_MULTIPLIER": 2,  # Tunnel backoff multiplier
   "TUNNEL_RESTART_RESET_INTERVAL": 300,  # Reset tunnel retry count after successful run
 
-  "VOLUMES": {},                # dict mapping host paths to container paths, e.g. {"/host/path": "/container/path"}
+  "VOLUMES": {},                # @deprecated -- use FIXED_SIZE_VOLUMES instead. Dict mapping host paths to container paths.
   "FILE_VOLUMES": {},           # dict mapping host paths to file configs: {"host_path": {"content": "...", "mounting_point": "..."}}
+  "FIXED_SIZE_VOLUMES": {},     # dict mapping logical names to fixed-size volume configs:
+                                #   {"vol_name": {"SIZE": "100M", "MOUNTING_POINT": "/app/data", "FS_TYPE": "ext4",
+                                #                 "OWNER_UID": None, "OWNER_GID": None, "FORCE_RECREATE": False}}
+
+  # Volume-sync (cross-node state replication). Always-on /r1en_system system
+  # volume is provisioned regardless; SYNC.ENABLED only controls the
+  # provider/consumer orchestration on top of it. See the sync/ subpackage
+  # (constants.py + manager.py + mixin.py) for the full contract.
+  "SYNC": {
+    "ENABLED": False,             # master switch
+    "KEY": None,                  # shared UUID across the sync set (provider+consumer)
+    "TYPE": None,                 # "provider" | "consumer"
+    "POLL_INTERVAL": 10,          # seconds between sync ticks
+    "ALLOW_ONLINE_PROVIDER_CAPTURE": False,  # provider-local opt-in for live container fs capture
+    "CONSUMER_APPLY_MODE": "offline_restart",  # consumer-local apply lifecycle policy
+    "HSYNC_POLL_INTERVAL": 60,    # seconds between chainstore_hsync refreshes
+                                  # (consumer only; provider only calls hset, never hsync).
+                                  # Clamped to min 10s. The cheap local-replica hget
+                                  # still runs on every tick; only the network round-trip
+                                  # is rate-limited here. Failed hsync attempts retry
+                                  # sooner than the full interval.
+  },
 
   # Health check configuration (consolidated)
   # Controls how app readiness is determined before starting tunnels
@@ -330,6 +376,9 @@ _CONFIG = {
   "MAX_LOG_LINES" : 10_000,   # max lines to keep in memory
   # When container is STOPPED_MANUALLY (PAUSED state), this will define how often we log its existance
   "PAUSED_STATE_LOG_INTERVAL": 60,
+  # Container apps can need more than the core plugin default to stop Docker,
+  # tunnel processes, runtime readers, and loop-backed fixed volumes safely.
+  "PLUGIN_STOP_TIMEOUT": 45,
 
   # Semaphore synchronization for paired plugins
   # List of semaphore keys to wait for before starting container
@@ -339,6 +388,14 @@ _CONFIG = {
 
   # end of container-specific config options
 
+  # @deprecated — Legacy fields superseded by EXPOSED_PORTS.
+  # Kept for backward compatibility. New deployments should use EXPOSED_PORTS.
+  "PORT": None,                    # Use EXPOSED_PORTS[port].is_main_port
+  "CLOUDFLARE_TOKEN": None,        # Use EXPOSED_PORTS[port].token
+  "CLOUDFLARE_PROTOCOL": "http",   # Use EXPOSED_PORTS[port].protocol
+  "EXTRA_TUNNELS": {},             # Use EXPOSED_PORTS with per-port token
+  "TUNNEL_ENGINE_PARAMETERS": {},  # Use EXPOSED_PORTS[port].engine
+
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -346,6 +403,13 @@ _CONFIG = {
 
 
 class ContainerAppRunnerPlugin(
+  _RestartBackoffMixin,
+  _ImagePullBackoffMixin,
+  _TunnelBackoffMixin,
+  _FixedSizeVolumesMixin,
+  _EnvOverridesMixin,
+  _ResetMixin,
+  _SyncMixin,
   _ContainerUtilsMixin,
   BasePlugin,
 ):
@@ -399,10 +463,122 @@ class ContainerAppRunnerPlugin(
     return
 
 
+  @staticmethod
+  def _compute_container_name(stream_id, instance_id):
+    # Qualify with stream_id so two pipelines that happen to reuse the same
+    # INSTANCE_ID get distinct container names and cannot stomp each other
+    # through _ensure_no_stale_container's force-remove-by-name path. The
+    # "car_" prefix guarantees a Docker-valid leading character even when
+    # stream_id / instance_id are empty or sanitized down to "_".
+    return "car_" + safe_path_component(f"{stream_id}_{instance_id}")
+
+
+  def _migrate_legacy_car_data(self):
+    """One-shot move from the pre-refactor CAR data location to the new
+    auto-routed plugin_data/ folder.
+
+    Pre-refactor, persistent state and logs lived under
+      {data_folder}/container_apps/{plugin_id}/
+    Current layout auto-routes them to
+      {data_folder}/pipelines_data/{sid}/{iid}/plugin_data/
+
+    Without migration, `manually_stopped` flags and any co-located logs
+    reset on upgrade. This method moves each legacy entry once, deletes
+    the legacy directory, and is idempotent (the `is_dir()` guard
+    short-circuits on every subsequent run). Failure-tolerant: any
+    exception is logged and container startup proceeds.
+    """
+    try:
+      get_df = getattr(self, 'get_data_folder', None)
+      if get_df is None:
+        return
+      data_folder = get_df()
+      plugin_id = getattr(self, 'plugin_id', None)
+      if not plugin_id:
+        return
+      legacy_dir = os.path.join(data_folder, _LEGACY_CONTAINER_APPS_SUBFOLDER, plugin_id)
+      if not os.path.isdir(legacy_dir):
+        return  # nothing to migrate -- idempotent no-op
+
+      # Resolve the new auto-routed plugin_data/ directory and the sibling
+      # logs/ directory. Persistent state (persistent_state.pkl) lives in
+      # plugin_data/ at the new layout; container_logs.pkl is written to
+      # the sibling logs/ folder (see _stop_container_and_save_logs_to_disk).
+      # Routing the legacy log file into plugin_data/ would strand it under
+      # a subfolder nothing reads or rewrites. Prefer the plugin-base
+      # accessor from the diskapi mixin; fall back to the subfolder resolver
+      # when unavailable (plain tests).
+      new_dir = None
+      logs_dir = None
+      get_base = getattr(self, '_get_plugin_absolute_base', None)
+      if callable(get_base):
+        base = get_base()
+        if base:
+          new_dir = os.path.join(base, 'plugin_data')
+          logs_dir = os.path.join(base, 'logs')
+      if new_dir is None:
+        sub_fn = getattr(self, '_resolve_data_subfolder', None)
+        if callable(sub_fn):
+          resolved = sub_fn(None)
+          if resolved:
+            new_dir = os.path.join(data_folder, resolved)
+            logs_resolved = sub_fn('logs')
+            if logs_resolved:
+              logs_dir = os.path.join(data_folder, logs_resolved)
+      if new_dir is None:
+        self.P(
+          f"Legacy CAR data migration skipped: cannot resolve new plugin_data dir",
+          color='y',
+        )
+        return
+      os.makedirs(new_dir, exist_ok=True)
+
+      moved = 0
+      for entry in sorted(os.listdir(legacy_dir)):
+        src = os.path.join(legacy_dir, entry)
+        if entry == _CONTAINER_LOGS_FILE and logs_dir is not None:
+          dest_dir = logs_dir
+          os.makedirs(dest_dir, exist_ok=True)
+        else:
+          dest_dir = new_dir
+        dest = os.path.join(dest_dir, entry)
+        if os.path.exists(dest):
+          self.P(
+            f"Legacy CAR data migration: destination {dest} already exists, "
+            f"keeping new and discarding legacy {src}",
+            color='y',
+          )
+          continue
+        shutil.move(src, dest)
+        moved += 1
+
+      shutil.rmtree(legacy_dir, ignore_errors=True)
+      # Drop the empty wrapper dir too if no other plugin's data lives there.
+      parent = os.path.dirname(legacy_dir)
+      try:
+        os.rmdir(parent)
+      except OSError:
+        pass
+
+      self.P(
+        f"Legacy CAR data migration complete: moved {moved} entries from {legacy_dir}"
+      )
+    except Exception as exc:
+      self.P(f"Legacy CAR data migration skipped: {exc}", color='y')
+
+
   def __reset_vars(self):
     self.container = None
     self.container_id = None
-    self.container_name = self.cfg_instance_id + "_" + self.uuid(4)
+    self.container_name = self._compute_container_name(
+      self._stream_id, self.cfg_instance_id,
+    )
+
+    # One-shot migration from pre-refactor container_apps/{plugin_id}/ to
+    # the auto-routed plugin_data/. Runs before any diskapi read/write so
+    # legacy persistent_state.pkl / container_logs.pkl are in place at the
+    # new location by the time we load them.
+    self._migrate_legacy_car_data()
 
     # Initialize Docker client with proper error handling
     try:
@@ -430,12 +606,18 @@ class ContainerAppRunnerPlugin(
     self.inverted_ports_mapping = {} # inverted mapping for docker-py container_port -> host_port
 
     self.volumes = {}
+    self._fixed_volumes = []  # list of FixedVolume instances for cleanup tracking
     self.env = {}
     self.dynamic_env = {}
+    self._normalized_exposed_ports = {}
+    self._normalized_main_exposed_port = None
 
     # Container state machine
     self.container_state = ContainerState.UNINITIALIZED
     self.stop_reason = StopReason.UNKNOWN
+    self._cleanup_failed = False
+    self._cleanup_retry_abandoned_logged = False
+    self._manual_stop_pending = False
 
     # Restart policy and retry logic
     self._consecutive_failures = 0
@@ -472,9 +654,24 @@ class ContainerAppRunnerPlugin(
     self._last_image_check = 0
     self._last_extra_tunnels_ping = 0
     self._last_paused_log = 0  # Track when we last logged the paused message
+    self._last_sync_check = 0  # _SyncMixin throttle
+
+    # Volume-sync state. SyncManager is lazy-init'd by _ensure_sync_manager
+    # the first time a tick fires (or on_init for early provisioning).
+    self._sync_manager = None
+    self._sync_unavailable = False
+    self._runtime_stop_degraded = False
+    self._env_overrides_manager = None
+    self._env_overrides_unavailable = False
+    self._reset_manager = None
+    self._reset_unavailable = False
 
     # Image update tracking
     self.current_image_hash = None
+
+    # Image pull backoff tracking
+    self._image_pull_failures = 0
+    self._next_image_pull_time = 0
 
     # Command execution state
     self._commands_started = False
@@ -511,25 +708,6 @@ class ContainerAppRunnerPlugin(
   # ============================================================================
 
 
-  def _get_instance_data_subfolder(self):
-    """
-    Get instance-specific subfolder for persistent data.
-
-    Uses plugin_id to ensure each plugin instance has its own data folder,
-    preventing collisions when multiple containers run on the same node.
-
-    Structure: container_apps/{plugin_id}/
-      - persistent_state.pkl
-      - (future: logs, etc.)
-
-    Returns
-    -------
-    str
-        Subfolder path: container_apps/{plugin_id}
-    """
-    return f"{_CONTAINER_APPS_SUBFOLDER}/{self.plugin_id}"
-
-
   def _load_persistent_state(self):
     """
     Load persistent state from disk.
@@ -539,10 +717,7 @@ class ContainerAppRunnerPlugin(
     dict
         Persistent state dictionary (empty dict if no state exists)
     """
-    state = self.diskapi_load_pickle_from_data(
-      _PERSISTENT_STATE_FILE,
-      subfolder=self._get_instance_data_subfolder()
-    )
+    state = self.diskapi_load_pickle_from_data(_PERSISTENT_STATE_FILE)
     return state if state is not None else {}
 
 
@@ -567,12 +742,8 @@ class ContainerAppRunnerPlugin(
     state = self._load_persistent_state()
     # Update with new values
     state.update(kwargs)
-    # Save back to disk
-    self.diskapi_save_pickle_to_data(
-      state,
-      _PERSISTENT_STATE_FILE,
-      subfolder=self._get_instance_data_subfolder()
-    )
+    # Save back to disk (diskapi auto-routes to pipelines_data/{sid}/{iid}/plugin_data/)
+    self.diskapi_save_pickle_to_data(state, _PERSISTENT_STATE_FILE)
     return
 
 
@@ -672,6 +843,10 @@ class ContainerAppRunnerPlugin(
       self.Pd(f"Container manually stopped, restart policy '{policy.value}' will not trigger restart")
       return False
 
+    if stop_reason == StopReason.RESET_FAILED:
+      self.Pd("Container stopped after failed reset; restart policy will not trigger restart")
+      return False
+
     # Check if we're in PAUSED state
     if self.container_state == ContainerState.PAUSED:
       self.Pd("Container is paused, restart policy will not trigger restart")
@@ -702,144 +877,6 @@ class ContainerAppRunnerPlugin(
     return False
 
 
-  def _calculate_restart_backoff(self):
-    """
-    Calculate exponential backoff delay for restart attempts.
-
-    Returns
-    -------
-    float
-        Seconds to wait before next restart attempt
-    """
-    if self._consecutive_failures == 0:
-      return 0
-
-    # Exponential backoff: initial * (multiplier ^ (failures - 1))
-    backoff = self.cfg_restart_backoff_initial * (
-      self.cfg_restart_backoff_multiplier ** (self._consecutive_failures - 1)
-    )
-
-    # Cap at maximum backoff
-    backoff = min(backoff, self.cfg_restart_backoff_max)
-
-    return backoff
-
-
-  def _should_reset_retry_counter(self):
-    """
-    Check if container has been running long enough to reset retry counter.
-
-    Returns
-    -------
-    bool
-        True if retry counter should be reset
-    """
-    if not self._last_successful_start:
-      return False
-
-    uptime = self.time() - self._last_successful_start
-    return uptime >= self.cfg_restart_reset_interval
-
-
-  def _record_restart_failure(self):
-    """
-    Record a restart failure and update backoff state.
-
-    Returns
-    -------
-    None
-    """
-    self._consecutive_failures += 1
-    self._last_failure_time = self.time()
-    self._restart_backoff_seconds = self._calculate_restart_backoff()
-    self._next_restart_time = self.time() + self._restart_backoff_seconds
-
-    self.P(
-      f"Container restart failure #{self._consecutive_failures}. "
-      f"Next retry in {self._restart_backoff_seconds:.1f}s",
-      color='r'
-    )
-    return
-
-
-  def _record_restart_success(self):
-    """
-    Record a successful restart and reset failure counters if appropriate.
-
-    Returns
-    -------
-    None
-    """
-    self._last_successful_start = self.time()
-
-    # Reset failure counter after first successful start
-    if self._consecutive_failures > 0:
-      self.P(
-        f"Container started successfully after {self._consecutive_failures} failure(s). "
-        f"Retry counter will reset after {self.cfg_restart_reset_interval}s of uptime.",
-      )
-      # Don't reset immediately - wait for reset interval
-      # self._consecutive_failures = 0  # This happens in _maybe_reset_retry_counter
-    # end if
-    return
-
-
-  def _maybe_reset_retry_counter(self):
-    """
-    Reset retry counter if container has been running successfully.
-
-    Returns
-    -------
-    None
-    """
-    if self._consecutive_failures > 0 and self._should_reset_retry_counter():
-      old_failures = self._consecutive_failures
-      self._consecutive_failures = 0
-      self._restart_backoff_seconds = 0
-      self.P(
-        f"Container running successfully for {self.cfg_restart_reset_interval}s. "
-        f"Reset failure counter (was {old_failures})"
-      )
-    # end if
-    return
-
-
-  def _is_restart_backoff_active(self):
-    """
-    Check if we're currently in backoff period.
-
-    Returns
-    -------
-    bool
-        True if we should wait before restarting
-    """
-    if self._next_restart_time == 0:
-      return False
-
-    current_time = self.time()
-    if current_time < self._next_restart_time:
-      remaining = self._next_restart_time - current_time
-      self.Pd(f"Restart backoff active: {remaining:.1f}s remaining")
-      return True
-
-    return False
-
-
-  def _has_exceeded_max_retries(self):
-    """
-    Check if max retry attempts exceeded.
-
-    Returns
-    -------
-    bool
-        True if max retries exceeded (and max_retries > 0)
-    """
-    if self.cfg_restart_max_retries <= 0:
-      return False  # Unlimited retries
-
-    return self._consecutive_failures >= self.cfg_restart_max_retries
-
-
   def _set_container_state(self, new_state, stop_reason=None):
     """
     Update container state and optionally stop reason.
@@ -863,6 +900,24 @@ class ContainerAppRunnerPlugin(
     # end if
 
     self.Pd(f"Container state: {old_state.value} -> {new_state.value}", score=0)
+    return
+
+
+  def _is_reset_failure_halt_active(self):
+    """Return True when a failed reset must block implicit container starts."""
+    return (
+      getattr(self, "container_state", None) == ContainerState.FAILED
+      and getattr(self, "stop_reason", None) == StopReason.RESET_FAILED
+    )
+
+
+  def _mark_reset_volume_reset_failed(self, error=None):
+    """Keep the app stopped after reset volume mutation fails."""
+    message = "Reset volume mutation failed; keeping container stopped until explicit RESTART"
+    if error:
+      message = f"{message}: {error}"
+    self.P(message, color='r')
+    self._set_container_state(ContainerState.FAILED, StopReason.RESET_FAILED)
     return
 
   # ============================================================================
@@ -933,194 +988,23 @@ class ContainerAppRunnerPlugin(
           "Falling back to 'tcp' mode.",
           color='y'
         )
-        return HealthCheckMode.TCP if self.cfg_port else HealthCheckMode.DELAY
+        return HealthCheckMode.TCP if self._get_main_container_port() else HealthCheckMode.DELAY
       return HealthCheckMode.ENDPOINT
 
     # Direct modes pass through
-    if mode_enum in (HealthCheckMode.TCP, HealthCheckMode.DELAY):
+    if mode_enum in (HealthCheckMode.TCP, HealthCheckMode.DELAY, HealthCheckMode.DISABLED):
       return mode_enum
 
     # Auto mode: smart detection
     if health_config.path:
       return HealthCheckMode.ENDPOINT
-    elif self.cfg_port:
+    elif self._get_main_container_port():
       return HealthCheckMode.TCP
     return HealthCheckMode.DELAY
 
   # ============================================================================
   # End of Health Check Configuration
   # ============================================================================
-
-  # ============================================================================
-  # Tunnel Restart Backoff Logic
-  # ============================================================================
-
-
-  def _calculate_tunnel_backoff(self, container_port):
-    """
-    Calculate exponential backoff delay for tunnel restart attempts.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    float
-        Seconds to wait before next tunnel restart attempt
-    """
-    failures = self._tunnel_consecutive_failures.get(container_port, 0)
-    if failures == 0:
-      return 0
-
-    # Exponential backoff: initial * (multiplier ^ (failures - 1))
-    backoff = self.cfg_tunnel_restart_backoff_initial * (
-      self.cfg_tunnel_restart_backoff_multiplier ** (failures - 1)
-    )
-
-    # Cap at maximum backoff
-    backoff = min(backoff, self.cfg_tunnel_restart_backoff_max)
-
-    return backoff
-
-
-  def _record_tunnel_restart_failure(self, container_port):
-    """
-    Record a tunnel restart failure and update backoff state.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    None
-    """
-    self._tunnel_consecutive_failures[container_port] = \
-      self._tunnel_consecutive_failures.get(container_port, 0) + 1
-    self._tunnel_last_failure_time[container_port] = self.time()
-
-    backoff = self._calculate_tunnel_backoff(container_port)
-    self._tunnel_next_restart_time[container_port] = self.time() + backoff
-
-    failures = self._tunnel_consecutive_failures[container_port]
-    self.P(
-      f"Tunnel restart failure for port {container_port} (#{failures}). "
-      f"Next retry in {backoff:.1f}s",
-      color='r'
-    )
-    return
-
-
-  def _record_tunnel_restart_success(self, container_port):
-    """
-    Record a successful tunnel restart.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    None
-    """
-    self._tunnel_last_successful_start[container_port] = self.time()
-
-    # Note success if there were previous failures
-    failures = self._tunnel_consecutive_failures.get(container_port, 0)
-    if failures > 0:
-      self.P(
-        f"Tunnel for port {container_port} started successfully after {failures} failure(s)."
-      )
-    return
-
-
-  def _is_tunnel_backoff_active(self, container_port):
-    """
-    Check if tunnel is currently in backoff period.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    bool
-        True if we should wait before restarting tunnel
-    """
-    next_restart = self._tunnel_next_restart_time.get(container_port, 0)
-    if next_restart == 0:
-      return False
-
-    current_time = self.time()
-    if current_time < next_restart:
-      remaining = next_restart - current_time
-      self.Pd(f"Tunnel {container_port} backoff active: {remaining:.1f}s remaining")
-      return True
-
-    return False
-
-
-  def _has_tunnel_exceeded_max_retries(self, container_port):
-    """
-    Check if tunnel has exceeded max retry attempts.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    bool
-        True if max retries exceeded (and max_retries > 0)
-    """
-    if self.cfg_tunnel_restart_max_retries <= 0:
-      return False  # Unlimited retries
-
-    failures = self._tunnel_consecutive_failures.get(container_port, 0)
-    return failures >= self.cfg_tunnel_restart_max_retries
-
-
-  def _maybe_reset_tunnel_retry_counter(self, container_port):
-    """
-    Reset tunnel retry counter if it has been running successfully.
-
-    Parameters
-    ----------
-    container_port : int
-        Container port for the tunnel
-
-    Returns
-    -------
-    None
-    """
-    failures = self._tunnel_consecutive_failures.get(container_port, 0)
-    if failures == 0:
-      return
-
-    last_start = self._tunnel_last_successful_start.get(container_port, 0)
-    if not last_start:
-      return
-
-    uptime = self.time() - last_start
-    if uptime >= self.cfg_tunnel_restart_reset_interval:
-      self.P(
-        f"Tunnel {container_port} running successfully for {self.cfg_tunnel_restart_reset_interval}s. "
-        f"Reset failure counter (was {failures})",
-      )
-      self._tunnel_consecutive_failures[container_port] = 0
-
-    return
-
-  # ============================================================================
-  # End of Tunnel Restart Backoff Logic
-  # ============================================================================
-
 
   def _normalize_container_command(self, value, *, field_name):
     """
@@ -1209,6 +1093,15 @@ class ContainerAppRunnerPlugin(
     ValueError
         If configuration is invalid
     """
+    image = getattr(self, 'cfg_image', None)
+    if not image or not isinstance(image, str) or not image.strip():
+      raise ValueError("IMAGE is required and must be a non-empty string")
+
+    self._entrypoint = self._normalize_container_command(
+      getattr(self, 'cfg_container_entrypoint', None),
+      field_name='CONTAINER_ENTRYPOINT',
+    )
+
     self._start_command = self._normalize_container_command(
       getattr(self, 'cfg_container_start_command', None),
       field_name='CONTAINER_START_COMMAND',
@@ -1219,10 +1112,45 @@ class ContainerAppRunnerPlugin(
       field_name='BUILD_AND_RUN_COMMANDS',
     )
 
+    self._refresh_normalized_exposed_ports_state()
+
     # Validate health endpoint port (soft error - disables health probing if invalid)
     self._validate_health_endpoint_port()
 
     self._validate_subclass_config()
+    return
+
+
+  def _validate_sync_config(self):
+    """
+    Validate the SYNC config block when ENABLED. Disables SYNC with a
+    warning rather than raising; the system volume itself is independent
+    and the rest of the plugin must keep running.
+    """
+    if not self._sync_enabled():
+      return
+    sync = self._sync_cfg()
+    key = sync.get("KEY")
+    role = sync.get("TYPE")
+    if not key or not isinstance(key, str):
+      self.P(
+        "[sync] SYNC.ENABLED but SYNC.KEY missing/empty; disabling SYNC.",
+        color="r",
+      )
+      sync["ENABLED"] = False
+      return
+    if role not in ("provider", "consumer"):
+      self.P(
+        f"[sync] SYNC.TYPE must be 'provider' or 'consumer' (got {role!r}); disabling SYNC.",
+        color="r",
+      )
+      sync["ENABLED"] = False
+      return
+    self.P(
+      f"[sync] SYNC enabled: role={role}, key={key}, "
+      f"poll={self._sync_poll_interval()}s",
+      color="g",
+    )
     return
 
 
@@ -1282,15 +1210,38 @@ class ContainerAppRunnerPlugin(
 
     self.reset_tunnel_engine()
 
-    self._configure_dynamic_env() # setup dynamic env vars for the container
     self._setup_resource_limits_and_ports() # setup container resource limits (CPU, GPU, memory, ports)
-    self._configure_volumes() # setup container volumes
+
+    # Ensure image is available locally BEFORE configuring volumes so
+    # FIXED_SIZE_VOLUMES can introspect the image's USER directive to
+    # auto-detect OWNER_UID/OWNER_GID. _ensure_image_available is
+    # idempotent; the second call inside start_container will be a cache hit.
+    if not self._ensure_image_available():
+      raise RuntimeError(
+        f"Image '{self.cfg_image}' not available; cannot prepare container volumes."
+      )
+
+    self._configure_volumes() # setup container volumes (deprecated)
     self._configure_file_volumes() # setup file volumes with dynamic content
+    self._configure_fixed_size_volumes() # setup fixed-size file-backed volumes
+    self._configure_system_volume() # always-on /r1en_system control-plane volume
+    self._configure_env_overrides_control_dir()
+    self._configure_reset_control_dir()
+
+    # If a prior plugin run crashed mid-publish, request.json.processing may
+    # be left over inside volume-sync/. Rename it back so the next tick retries.
+    self._recover_stale_processing()
+    self._recover_env_overrides_processing()
+    self._recover_reset_processing()
+    self._validate_sync_config()
 
     # If we have semaphored keys, defer _setup_env_and_ports() until semaphores are ready
     # This ensures we get the env vars from provider plugins before starting the container
     if not self._semaphore_get_keys():
       self._setup_env_and_ports()
+      self._inject_sync_env_vars()
+      self._inject_env_overrides_env_vars()
+      self._inject_reset_env_vars()
     else:
       self.Pd("Deferring _setup_env_and_ports() until semaphores are ready")
 
@@ -1360,16 +1311,27 @@ class ContainerAppRunnerPlugin(
     if data == "RESTART":
       self.P("Restarting container...")
       self._clear_manual_stop_state()  # Clear persistent stop state
+      # RESTART is an explicit operator override for a previously failed STOP.
+      # Clear the in-memory pause intent too, otherwise a later cleanup retry
+      # could incorrectly persist PAUSED instead of relaunching the container.
+      self._manual_stop_pending = False
       self._set_container_state(ContainerState.RESTARTING, StopReason.CONFIG_UPDATE)
-      self._stop_container_and_save_logs_to_disk()
       self._restart_container(StopReason.CONFIG_UPDATE)
       return
 
     elif data == "STOP":
       self.P("Stopping container (manual stop - restart policy will not trigger)...")
-      self._save_persistent_state(manually_stopped=True)  # Save persistent stop state
-      self._stop_container_and_save_logs_to_disk()
-      self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
+      self._manual_stop_pending = True
+      cleanup_ok = self._stop_container_and_save_logs_to_disk()
+      if cleanup_ok:
+        self._save_persistent_state(manually_stopped=True)  # Persist only after cleanup succeeds.
+        self._manual_stop_pending = False
+        self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
+      else:
+        # Keep the failed cleanup retryable without persisting a paused state
+        # that would later make config restarts look intentionally ignored.
+        self._clear_manual_stop_state()
+        self._set_container_state(ContainerState.FAILED, StopReason.UNKNOWN)
       return
     else:
       self.P(f"Unknown plugin command: {data}")
@@ -1408,6 +1370,24 @@ class ContainerAppRunnerPlugin(
       )
       return
 
+    if self._manual_stop_pending:
+      self.P(
+        "Manual STOP cleanup is still pending. Ignoring config restart; "
+        "send RESTART to override the pending stop intent.",
+        color='y',
+      )
+      if self._cleanup_failed:
+        self._retry_failed_cleanup()
+      return
+
+    if self._is_reset_failure_halt_active():
+      self.P(
+        "Container is stopped after a failed reset. Ignoring config restart; "
+        "send RESTART to resume after inspecting the reset error.",
+        color='y',
+      )
+      return
+
     # Check persistent state as fallback (in case container_state not yet set)
     if self._load_manual_stop_state():
       self.P(
@@ -1417,7 +1397,12 @@ class ContainerAppRunnerPlugin(
       )
       return
 
-    self._stop_container_and_save_logs_to_disk()
+    cleanup_ok = self._stop_container_and_save_logs_to_disk()
+    if not cleanup_ok:
+      self.P("Config restart aborted because previous runtime cleanup failed.", color='r')
+      self._set_container_state(ContainerState.FAILED, StopReason.UNKNOWN)
+      self._record_restart_failure()
+      return
     restart_callable()
     return
 
@@ -1439,7 +1424,12 @@ class ContainerAppRunnerPlugin(
     -------
     None
     """
-    return self._handle_config_restart(lambda: self._restart_container(StopReason.CONFIG_UPDATE))
+    return self._handle_config_restart(lambda: self._restart_container(StopReason.CONFIG_UPDATE, cleanup_first=False))
+
+
+  def _on_config(self, *args, **kwargs):
+    """Compatibility alias for runtimes that call the underscored hook."""
+    return self.on_config(*args, **kwargs)
 
 
   def on_post_container_start(self):
@@ -1490,6 +1480,206 @@ class ContainerAppRunnerPlugin(
     # end if
     return
 
+  def _get_main_tunnel_config(self):
+    """
+    Return the normalized tunnel config for the main exposed port, if enabled.
+    Reads flat fields (token, protocol, engine) from the normalized main port entry.
+    """
+    main = self._normalized_main_exposed_port
+    if not main:
+      return None
+    token = main.get("token")
+    if not token:
+      return None
+    return {
+      "token": token,
+      "protocol": main.get("protocol", "http"),
+      "engine": main.get("engine", "cloudflare"),
+    }
+
+  def get_cloudflare_token(self):
+    """
+    Prefer the normalized main-port tunnel token over legacy config fields.
+    """
+    tunnel_config = self._get_main_tunnel_config()
+    if tunnel_config and tunnel_config.get("engine") == "cloudflare":
+      return tunnel_config.get("token")
+    return super(ContainerAppRunnerPlugin, self).get_cloudflare_token()
+
+  def get_cloudflare_protocol(self):
+    """
+    Return the protocol for the main tunnel from normalized config,
+    falling back to the base class implementation.
+    """
+    main = self._normalized_main_exposed_port
+    if main:
+      return main.get("protocol", "http")
+    return super(ContainerAppRunnerPlugin, self).get_cloudflare_protocol()
+
+
+  def _remember_process_group(self, process):
+    """
+    Record tunnel process-group ids even when deployed with an older core.
+
+    Newer cores provide this on ``BaseTunnelEnginePlugin``. Keeping a local
+    fallback lets the edge PR roll out before the matching core PR without
+    breaking extra tunnel startup after ``subprocess.Popen`` succeeds.
+    """
+    base_method = getattr(super(ContainerAppRunnerPlugin, self), "_remember_process_group", None)
+    if callable(base_method):
+      return base_method(process)
+    if process is not None and os.name != "nt":
+      try:
+        process._r1_process_group_id = os.getpgid(process.pid)
+      except Exception as exc:
+        self.P(f"Could not record tunnel process group: {exc}", color='r')
+    return process
+
+
+  def _terminate_subprocess_tree(self, process, label="subprocess", terminate_timeout=5, kill_timeout=5):
+    """
+    Terminate a tunnel subprocess tree with edge-local compatibility behavior.
+
+    Keep this implementation local instead of delegating to core. Deployed edge
+    images can temporarily run with an older core that has a process-group helper
+    but does not understand zombie-only tunnel groups, which was enough to keep
+    cleanup permanently latched on drs1.
+    """
+    if process is None:
+      return True
+
+    pgid = getattr(process, "_r1_process_group_id", None)
+
+    def process_group_has_live_members():
+      """
+      Return True only when the process group still has non-zombie members.
+
+      POSIX reports zombie members through ``killpg(pgid, 0)`` until their
+      parent reaps them. Zombie-only tunnel groups cannot serve traffic or be
+      killed again, so treating them as alive would keep cleanup retries stuck.
+      """
+      proc_root = "/proc"
+      if os.name == "nt" or pgid is None or not os.path.isdir(proc_root):
+        return None
+      try:
+        pid_names = os.listdir(proc_root)
+      except OSError as exc:
+        self.P(f"Could not inspect {label} process group {pgid}: {exc}", color='r')
+        return None
+
+      found_member = False
+      for pid_name in pid_names:
+        if not pid_name.isdigit():
+          continue
+        try:
+          with open(os.path.join(proc_root, pid_name, "stat"), "r") as fh:
+            stat = fh.read()
+          stat_tail = stat.rsplit(")", 1)[1].strip().split()
+          state = stat_tail[0]
+          member_pgid = int(stat_tail[2])
+        except (FileNotFoundError, ProcessLookupError, IndexError, ValueError):
+          continue
+        except Exception as exc:
+          self.P(f"Could not inspect {label} process {pid_name}: {exc}", color='r')
+          continue
+        if member_pgid != pgid:
+          continue
+        found_member = True
+        # Stopped/traced members can resume later, so only zombies are treated as inert.
+        if state != "Z":
+          return True
+      return False if found_member else None
+
+    def is_process_group_alive():
+      if os.name == "nt" or pgid is None:
+        return False
+      try:
+        os.killpg(pgid, 0)
+      except ProcessLookupError:
+        return False
+      except Exception as exc:
+        self.P(f"Could not probe {label} process group {pgid}: {exc}", color='r')
+        return True
+      live_members = process_group_has_live_members()
+      if live_members is not None:
+        return live_members
+      return True
+
+    def wait_process_tree(timeout):
+      deadline = time.monotonic() + timeout
+      process_stopped = process.poll() is not None
+      if not process_stopped:
+        try:
+          process.wait(timeout=timeout)
+          process_stopped = True
+        except subprocess.TimeoutExpired:
+          process_stopped = False
+        except Exception as exc:
+          self.P(f"Error waiting for {label}: {exc}", color='r')
+          process_stopped = process.poll() is not None
+      if os.name == "nt" or pgid is None:
+        return process_stopped
+      while time.monotonic() < deadline:
+        if not is_process_group_alive():
+          return process_stopped
+        time.sleep(0.05)
+      return process_stopped and not is_process_group_alive()
+
+    def send_signal(sig, fallback):
+      if os.name != "nt" and pgid is not None and sig is not None:
+        try:
+          os.killpg(pgid, sig)
+          return True
+        except ProcessLookupError:
+          return True
+        except Exception as exc:
+          self.P(f"Error signaling {label} process group {pgid}: {exc}", color='r')
+      if process.poll() is None:
+        try:
+          fallback()
+          return True
+        except Exception as exc:
+          self.P(f"Error signaling {label}: {exc}", color='r')
+          return False
+      return True
+
+    if process.poll() is None or is_process_group_alive():
+      if not send_signal(signal.SIGTERM, process.terminate):
+        return False
+    if wait_process_tree(terminate_timeout):
+      return True
+
+    self.P(f"{label} did not stop after terminate; killing it.", color='r')
+    kill_signal = getattr(signal, "SIGKILL", None)
+    if not send_signal(kill_signal, process.kill):
+      return False
+    if wait_process_tree(kill_timeout):
+      return True
+    self.P(f"{label} did not exit after kill; continuing shutdown.", color='r')
+    return False
+
+
+  def _schedule_abandoned_cleanup_probe(self):
+    """
+    Schedule a low-noise cleanup probe after retry exhaustion.
+
+    Max restart retries should stop aggressive relaunch attempts, not freeze the
+    cleanup state forever. A stale live tunnel can disappear later, and the app
+    should self-heal without requiring a node restart.
+    """
+    configured_delay = self.cfg_restart_backoff_max
+    if configured_delay is None:
+      configured_delay = self.cfg_restart_backoff_initial
+    if configured_delay is None:
+      configured_delay = 1.0
+    probe_delay = max(1.0, float(configured_delay))
+    self._restart_backoff_seconds = probe_delay
+    self._next_restart_time = self.time() + probe_delay
+    self.Pd(
+      "Abandoned cleanup probe scheduled in {:.1f}s".format(probe_delay)
+    )
+    return
+
 
   def stop_tunnel_engine(self):
     """
@@ -1499,16 +1689,28 @@ class ContainerAppRunnerPlugin(
 
     Returns
     -------
-    None
+    bool
+        True when the tunnel process and log readers stopped, False otherwise.
     """
     if self.tunnel_process:
       engine_name = "Cloudflare" if self.use_cloudflare() else "ngrok"
       self.P(f"Stopping {engine_name} tunnel...")
-      self.stop_tunnel_command(self.tunnel_process)
-      self.tunnel_process = None
-      self.P(f"{engine_name} tunnel stopped")
+      process = self.tunnel_process
+      result = True
+      try:
+        result = self.stop_tunnel_command(process)
+      except Exception as exc:
+        result = False
+        self.P(f"Error stopping {engine_name} tunnel: {exc}", color='r')
+      finally:
+        if result:
+          self.tunnel_process = None
+          self.P(f"{engine_name} tunnel stopped")
+        else:
+          self.P(f"{engine_name} tunnel did not fully stop; preserving process handle for retry.", color='r')
+      return result
     # end if
-    return
+    return True
 
 
   def get_tunnel_engine_ping_data(self):
@@ -1610,11 +1812,6 @@ class ContainerAppRunnerPlugin(
     int or None
         Host port if found, None otherwise
     """
-    # Check main port first
-    if container_port == self.cfg_port:
-      return self.port
-
-    # Check extra ports mapping
     for host_port, c_port in self.extra_ports_mapping.items():
       if c_port == container_port:
         return host_port
@@ -1634,16 +1831,10 @@ class ContainerAppRunnerPlugin(
     set of int
         Set of valid container ports
     """
-    valid_ports = set()
-
-    # Main port
-    if self.cfg_port:
-      valid_ports.add(self.cfg_port)
-
-    # Extra ports (container ports from mapping)
-    for container_port in self.extra_ports_mapping.values():
-      valid_ports.add(container_port)
-
+    valid_ports = set(self.extra_ports_mapping.values())
+    normalized_exposed_ports = self._normalized_exposed_ports or self._normalize_exposed_ports_config()
+    if normalized_exposed_ports:
+      valid_ports.update(normalized_exposed_ports.keys())
     return valid_ports
 
 
@@ -1678,7 +1869,7 @@ class ContainerAppRunnerPlugin(
     return True
 
 
-  def _build_tunnel_command(self, container_port, token):
+  def _build_tunnel_command(self, container_port, token, protocol="http"):
     """
     Build Cloudflare tunnel command for a specific port.
 
@@ -1688,6 +1879,8 @@ class ContainerAppRunnerPlugin(
         Container port to tunnel
     token : str
         Cloudflare tunnel token
+    protocol : str, optional
+        Tunnel origin protocol (default "http")
 
     Returns
     -------
@@ -1708,7 +1901,7 @@ class ContainerAppRunnerPlugin(
       "--token",
       str(token),
       "--url",
-      f"http://127.0.0.1:{host_port}"
+      f"{protocol}://127.0.0.1:{host_port}"
     ]
 
 
@@ -1726,29 +1919,20 @@ class ContainerAppRunnerPlugin(
     bool
         True if main tunnel should start
     """
-    # Check if we have a token (backward compatibility)
-    has_cloudflare_token = bool(getattr(self, 'cfg_cloudflare_token', None))
-    has_params_token = bool(
-      self.cfg_tunnel_engine_parameters and
-      self.cfg_tunnel_engine_parameters.get("CLOUDFLARE_TOKEN")
+    main_container_port = self._get_main_container_port(
+      self._normalized_exposed_ports or self._normalize_exposed_ports_config()
     )
-
-    has_main_token = has_cloudflare_token or has_params_token
-
-    # If no token at all, no main tunnel
-    if not has_main_token:
-      # self.Pd("No main tunnel token configured, skipping main tunnel")
+    if main_container_port is None:
       return False
 
-    # If PORT is defined and in EXTRA_TUNNELS, skip main tunnel
-    if self.cfg_port and self.cfg_port in self.extra_tunnel_configs:
-      self.P(f"Main PORT {self.cfg_port} is defined in EXTRA_TUNNELS, using extra tunnel instead")
+    if main_container_port in self.extra_tunnel_configs:
+      self.P(f"Main PORT {main_container_port} is defined in EXTRA_TUNNELS, using extra tunnel instead")
       return False
 
-    return True
+    return self._get_main_tunnel_config() is not None
 
 
-  def _start_extra_tunnel(self, container_port, token):
+  def _start_extra_tunnel(self, container_port, tunnel_config):
     """
     Start a single extra tunnel for a specific container port.
 
@@ -1756,20 +1940,27 @@ class ContainerAppRunnerPlugin(
     ----------
     container_port : int
         Container port to expose
-    token : str
-        Cloudflare tunnel token
+    tunnel_config : dict or str
+        Tunnel config dict with token/protocol/engine keys, or legacy string token
 
     Returns
     -------
     bool
         True if tunnel started successfully, False otherwise
     """
+    if isinstance(tunnel_config, dict):
+      token = tunnel_config.get("token")
+      protocol = tunnel_config.get("protocol", "http")
+    else:
+      token = tunnel_config  # legacy compat
+      protocol = "http"
+
     if not token:
       self.P(f"No token provided for extra tunnel on port {container_port}", color='r')
       return False
 
     # Build tunnel command
-    command = self._build_tunnel_command(container_port, token)
+    command = self._build_tunnel_command(container_port, token, protocol)
     if not command:
       return False
 
@@ -1780,12 +1971,16 @@ class ContainerAppRunnerPlugin(
       self.Pd(f"  Command: {' '.join(command)}")
 
       # Use list-based subprocess to prevent shell injection
-      process = subprocess.Popen(
-        command,
+      popen_kwargs = dict(
+        args=command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        bufsize=0
+        bufsize=0,
       )
+      if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+      process = subprocess.Popen(**popen_kwargs)
+      self._remember_process_group(process)
 
       # Create log readers for this tunnel
       logs_reader = self.LogReader(process.stdout, size=100, daemon=None)
@@ -1835,8 +2030,8 @@ class ContainerAppRunnerPlugin(
     self.P(f"Starting {len(self.extra_tunnel_configs)} extra tunnel(s)...")
 
     started_count = 0
-    for container_port, token in self.extra_tunnel_configs.items():
-      if self._start_extra_tunnel(container_port, token):
+    for container_port, tunnel_config in self.extra_tunnel_configs.items():
+      if self._start_extra_tunnel(container_port, tunnel_config):
         started_count += 1
 
     self.P(f"Started {started_count}/{len(self.extra_tunnel_configs)} extra tunnels")
@@ -1854,26 +2049,29 @@ class ContainerAppRunnerPlugin(
 
     Returns
     -------
-    None
+    bool
+        True when the tunnel process and log readers stopped, False otherwise.
     """
     process = self.extra_tunnel_processes.get(container_port)
     if not process:
-      return
+      return True
 
+    result = True
+    process_stopped = process.poll() is not None
+    readers_stopped = True
     try:
       self.P(f"Stopping extra tunnel for port {container_port}...")
 
       # Read remaining logs before stopping
       self._read_extra_tunnel_logs(container_port)
 
-      # Stop process
-      if process.poll() is None:  # Still running
-        process.terminate()
-        try:
-          process.wait(timeout=5)
-        except Exception:
-          process.kill()
-          process.wait()
+      # Stop the recorded process group even if the Popen parent has exited:
+      # shell wrappers can leave live tunnel descendants behind.
+      process_stopped = self._terminate_subprocess_tree(
+        process,
+        label=f"Extra tunnel for port {container_port}",
+      )
+      result = process_stopped and result
 
       # Clean up log readers (following base class pattern)
       log_readers = self.extra_tunnel_log_readers.get(container_port, {})
@@ -1882,36 +2080,49 @@ class ContainerAppRunnerPlugin(
       stdout_reader = log_readers.get("stdout")
       if stdout_reader:
         try:
-          stdout_reader.stop()
+          reader_stopped = stdout_reader.stop()
+          readers_stopped = reader_stopped and readers_stopped
+          result = reader_stopped and result
           # Read any remaining logs before cleanup
           remaining_logs = stdout_reader.get_next_characters()
           if remaining_logs:
             self._process_extra_tunnel_log(container_port, remaining_logs, is_error=False)
         except Exception as e:
+          readers_stopped = False
+          result = False
           self.Pd(f"Error stopping stdout reader: {e}")
 
       # Stop stderr reader and read remaining logs
       stderr_reader = log_readers.get("stderr")
       if stderr_reader:
         try:
-          stderr_reader.stop()
+          reader_stopped = stderr_reader.stop()
+          readers_stopped = reader_stopped and readers_stopped
+          result = reader_stopped and result
           # Read any remaining error logs before cleanup
           remaining_err_logs = stderr_reader.get_next_characters()
           if remaining_err_logs:
             self._process_extra_tunnel_log(container_port, remaining_err_logs, is_error=True)
         except Exception as e:
+          readers_stopped = False
+          result = False
           self.Pd(f"Error stopping stderr reader: {e}")
 
-      # Clean up references
-      self.extra_tunnel_processes.pop(container_port, None)
-      self.extra_tunnel_log_readers.pop(container_port, None)
-      self.extra_tunnel_urls.pop(container_port, None)
-      self.extra_tunnel_start_times.pop(container_port, None)
+      if result:
+        self.extra_tunnel_processes.pop(container_port, None)
+        self.extra_tunnel_log_readers.pop(container_port, None)
+        self.extra_tunnel_urls.pop(container_port, None)
+        self.extra_tunnel_start_times.pop(container_port, None)
 
-      self.P(f"Extra tunnel for port {container_port} stopped")
+      if result:
+        self.P(f"Extra tunnel for port {container_port} stopped")
+      else:
+        self.P(f"Extra tunnel for port {container_port} did not fully stop; preserving live handles for retry.", color='r')
 
     except Exception as e:
+      result = False
       self.P(f"Error stopping extra tunnel for port {container_port}: {e}", color='r')
+    return result
 
 
   def stop_extra_tunnels(self):
@@ -1923,17 +2134,23 @@ class ContainerAppRunnerPlugin(
 
     Returns
     -------
-    None
+    bool
+        True when all extra tunnels stopped, False otherwise.
     """
     if not self.extra_tunnel_processes:
-      return
+      return True
 
     self.P(f"Stopping {len(self.extra_tunnel_processes)} extra tunnel(s)...")
 
+    result = True
     for container_port in list(self.extra_tunnel_processes.keys()):
-      self._stop_extra_tunnel(container_port)
+      result = self._stop_extra_tunnel(container_port) and result
 
-    self.P("All extra tunnels stopped")
+    if result:
+      self.P("All extra tunnels stopped", color='g')
+    else:
+      self.P("One or more extra tunnels failed to stop; preserving live handles for retry.", color='r')
+    return result
 
 
   def _read_extra_tunnel_logs(self, container_port):
@@ -2032,6 +2249,30 @@ class ContainerAppRunnerPlugin(
         self.Pd(f"Error reading logs for tunnel {container_port}: {e}")
 
 
+  def _ensure_no_stale_container(self):
+    """
+    Remove any existing Docker container with this plugin's name.
+
+    Queries Docker by container name (not by self.container object reference,
+    which is lost after a crash). Force-removes any existing container regardless
+    of its state (running, stopped, created). This is a guardrail for deterministic
+    container naming -- it handles crash recovery, incomplete cleanup, and any state
+    where self.container is None but a Docker container still exists.
+    """
+    try:
+      stale = self.docker_client.containers.get(self.container_name)
+      self.P(
+        f"Found stale container '{self.container_name}' "
+        f"(id={stale.short_id}, status={stale.status}), removing..."
+      )
+      stale.remove(force=True)
+      self.P("Stale container removed.")
+    except docker.errors.NotFound:
+      pass
+    except Exception as exc:
+      self.P(f"Failed to remove stale container: {exc}", color='r')
+
+
   def start_container(self):
     """
     Start the Docker container with configured settings.
@@ -2061,13 +2302,21 @@ class ContainerAppRunnerPlugin(
     log_str += f"  Resources: {self.json_dumps(self.cfg_container_resources) if self.cfg_container_resources else 'None'}\n"
     log_str += f"  Restart policy: {self.cfg_restart_policy}\n"
     log_str += f"  Pull policy: {self.cfg_image_pull_policy}\n"
+    log_str += f"  Entrypoint: {self._entrypoint if self._entrypoint else 'Image default'}\n"
     log_str += f"  Start command: {self._start_command if self._start_command else 'Image default'}\n"
+    log_str += f"  User: {self.cfg_container_user if self.cfg_container_user else 'Image default'}\n"
 
     self.P(log_str)
 
     nano_cpu_limit = int(self._cpu_limit * 1_000_000_000)
     mem_reservation = f"{parse_memory_to_mb(self._mem_limit, 0.9)}m"
 
+    # Intentionally NO auto_remove=True: exited containers stay inspectable
+    # in `docker ps -a` until the next start cycle, which preserves
+    # post-mortem observability. `_ensure_no_stale_container()` force-removes
+    # any prior container with this name before each launch, and
+    # stop_container() explicitly removes on graceful stop -- so the
+    # cleanup story is covered without Docker auto-removing.
     run_kwargs = dict(
       detach=True,
       ports=self.inverted_ports_mapping,
@@ -2099,16 +2348,28 @@ class ContainerAppRunnerPlugin(
     # endif
 
     try:
+      if self._entrypoint:
+        run_kwargs['entrypoint'] = self._entrypoint
+
       if self._start_command:
         run_kwargs['command'] = self._start_command
 
+      if self.cfg_container_user:
+        run_kwargs['user'] = self.cfg_container_user
+
+      # Guardrail: remove any stale container with the same name (crash recovery)
+      self._ensure_no_stale_container()
+
       self.container = self.docker_client.containers.run(
-        self.cfg_image,
+        self._get_full_image_ref(),
         **run_kwargs,
       )
 
       self.container_id = self.container.short_id
       self.P(f"Container started (ID: {self.container.short_id})")
+
+      # Get container IP now that the container is running
+      self._update_container_ip()
 
       # Container started successfully
       self._set_container_state(ContainerState.RUNNING)
@@ -2136,23 +2397,29 @@ class ContainerAppRunnerPlugin(
 
     Returns
     -------
-    None
+    bool
+      True when there is no container or the container was removed from Docker.
+      False when Docker reported a remove failure and the container may still
+      exist/running.
 
     Notes
     -----
     If no container exists, logs a warning and returns.
-    Clears container and container_id attributes after removal.
+    Clears container and container_id attributes after successful removal.
     """
     if not self.container:
       self.P("No container to stop", color='r')
-      return
+      return True
 
+    stopped_ok = True
+    removed_ok = True
     try:
       # Stop the container (gracefully)
       self.P(f"Stopping container {self.container.short_id}...")
       self.container.stop(timeout=5)
       self.P(f"Container {self.container.short_id} stopped successfully")
     except Exception as e:
+      stopped_ok = False
       self.P(f"Error stopping container: {e}", color='r')
     # end try
 
@@ -2161,15 +2428,26 @@ class ContainerAppRunnerPlugin(
       self.container.remove()
       self.P(f"Container {self.container.short_id} removed successfully")
     except Exception as e:
+      removed_ok = False
       self.P(f"Error removing container: {e}", color='r')
-    finally:
+    if removed_ok:
+      if not stopped_ok:
+        self.P(
+          "Container stop reported an error, but remove succeeded; treating "
+          "container as stopped for restart/cleanup purposes.",
+          color='y',
+        )
       self.container = None
       self.container_id = None
+    else:
+      # Keep the handle so a later cleanup retry can remove the same Docker
+      # object instead of losing track of a possibly still-running container.
+      self.P("Preserving container handle after failed stop/remove for retry.", color='r')
     # end try
-    return
+    return removed_ok
 
 
-  def _stream_logs(self, log_stream):
+  def _stream_logs(self, log_stream, stop_event=None):
     """
     Consume a log iterator from container logs and print its output.
 
@@ -2186,6 +2464,9 @@ class ContainerAppRunnerPlugin(
       self.P("No log stream provided", color='r')
       return
 
+    if stop_event is None:
+      stop_event = self._stop_event
+
     try:
       for log_bytes in log_stream:
         if log_bytes is None:
@@ -2199,7 +2480,7 @@ class ContainerAppRunnerPlugin(
         self.P(f"[CONTAINER] {log_str}", end='')
         self.container_logs.append(log_str)
 
-        if self._stop_event.is_set():
+        if stop_event.is_set():
           self.P("Log streaming stopped by stop event")
           break
     except Exception as e:
@@ -2226,7 +2507,7 @@ class ContainerAppRunnerPlugin(
       log_stream = self.container.logs(stream=True, follow=True)
       self.log_thread = threading.Thread(
         target=self._stream_logs,
-        args=(log_stream,),
+        args=(log_stream, self._stop_event),
         daemon=True,
       )
       self.log_thread.start()
@@ -2301,14 +2582,19 @@ class ContainerAppRunnerPlugin(
         return
 
       self.P(f"Running container exec command: {shell_cmd}")
-      exec_result = self.container.exec_run(
-        ["sh", "-c", shell_cmd],
+      exec_kwargs = dict(
         stream=True,
         detach=False,
       )
+      if self.cfg_container_user:
+        exec_kwargs['user'] = self.cfg_container_user
+      exec_result = self.container.exec_run(
+        ["sh", "-c", shell_cmd],
+        **exec_kwargs,
+      )
       thread = threading.Thread(
         target=self._stream_logs,
-        args=(exec_result.output,),
+        args=(exec_result.output, self._stop_event),
         daemon=True,
       )
       thread.start()
@@ -2372,7 +2658,7 @@ class ContainerAppRunnerPlugin(
     path = health.path if health.path.startswith('/') else '/' + health.path
 
     # Get container port (default to main port)
-    container_port = health.port or self.cfg_port
+    container_port = health.port or self._get_main_container_port()
     if not container_port:
       self.Pd("Health URL: no container port (HEALTH_CHECK.PORT or PORT not set)")
       return None
@@ -2431,7 +2717,7 @@ class ContainerAppRunnerPlugin(
         Host port for health checking, or None if not configured
     """
     health = self._get_health_config()
-    container_port = health.port or self.cfg_port
+    container_port = health.port or self._get_main_container_port()
     if not container_port:
       self.Pd("Health check port: no container port configured (HEALTH_CHECK.PORT or PORT)")
       return None
@@ -2511,6 +2797,12 @@ class ContainerAppRunnerPlugin(
     # Get consolidated health config
     health = self._get_health_config()
     mode = self._get_effective_health_mode(health)
+
+    # Mode: DISABLED - app is ready immediately when container is running
+    if mode == HealthCheckMode.DISABLED:
+      self._app_ready = True
+      self._semaphore_set_ready_flag()
+      return True
 
     # Mode: DELAY - simple time-based waiting
     if mode == HealthCheckMode.DELAY or self._health_probing_disabled:
@@ -2594,13 +2886,33 @@ class ContainerAppRunnerPlugin(
     return self._app_ready
 
   def _setup_semaphore_env(self):
-    """Set semaphore environment variables for bundled plugins."""
+    """
+    Set semaphore environment variables for bundled plugins.
+
+    Legacy keys stay unchanged for compatibility. New code should prefer the
+    explicit host/container keys added here.
+    """
     localhost_ip = self.log.get_localhost_ip()
-    port = self.cfg_port
+    container_port = self._get_main_container_port()
+    host_port = self._get_host_port_for_container_port(container_port) if container_port else None
     self.semaphore_set_env('HOST', localhost_ip)
-    if port:
-      self.semaphore_set_env('PORT', str(port))
-      self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, port))
+    self.semaphore_set_env('HOST_IP', localhost_ip)
+    if container_port:
+      # Keep legacy PORT/URL semantics unchanged.
+      self.semaphore_set_env('PORT', str(container_port))
+      self.semaphore_set_env('URL', 'http://{}:{}'.format(localhost_ip, container_port))
+      self.semaphore_set_env('CONTAINER_PORT', str(container_port))
+    # Derive protocol from main port config
+    main_port_config = self._normalized_main_exposed_port or {}
+    protocol = main_port_config.get("protocol", "http")
+    self.semaphore_set_env('HOST_PROTOCOL', protocol)
+    if host_port:
+      self.semaphore_set_env('HOST_PORT', str(host_port))
+      self.semaphore_set_env('HOST_URL', '{}://{}:{}'.format(protocol, localhost_ip, host_port))
+    container_ip = self._get_container_ip()
+    self.Pd(f"Container IP address: {container_ip}")
+    if container_ip:
+      self.semaphore_set_env('CONTAINER_IP', container_ip)
     return
 
 
@@ -2713,75 +3025,181 @@ class ContainerAppRunnerPlugin(
           continue
 
         # All checks passed - attempt restart
-        token = self.extra_tunnel_configs.get(container_port)
-        if token:
+        tunnel_config = self.extra_tunnel_configs.get(container_port)
+        if tunnel_config:
           failures = self._tunnel_consecutive_failures.get(container_port, 0)
           self.P(
             f"Restarting extra tunnel for port {container_port} (attempt {failures})...",
             color='r'
           )
-          self._start_extra_tunnel(container_port, token)
+          self._start_extra_tunnel(container_port, tunnel_config)
       else:
         # Tunnel is running - maybe reset retry counter
         self._maybe_reset_tunnel_retry_counter(container_port)
 
 
-  def _stop_container_and_save_logs_to_disk(self):
+  def _stop_container_runtime_for_restart(self):
     """
-    Stop the container and all tunnels, then save logs to disk.
+    Stop runtime sidecars and remove the Docker container.
 
-    Performs full shutdown sequence:
+    Performs the shared pre-restart shutdown sequence:
     - Clears semaphore (signals dependent plugins container is stopping)
     - Stops log streaming threads
     - Stops main tunnel engine
     - Stops all extra tunnels
     - Stops and removes container
-    - Saves logs to disk
 
     Returns
     -------
-    None
+    bool
+      True when all runtime cleanup steps completed. False can mean either the
+      Docker container may still be present (tracked by ``_runtime_stop_degraded``)
+      or a sidecar/log-reader step still needs retry after Docker removal.
     """
     self.P(f"Stopping container app '{self.container_id}' ...")
 
+    cleanup_errors = []
+
+    def safe_cleanup_step(step_name, callback):
+      try:
+        result = callback()
+        if result is False:
+          cleanup_errors.append(step_name)
+          self.P(f"Container cleanup step '{step_name}' reported failure.", color='r')
+      except Exception as exc:
+        cleanup_errors.append(step_name)
+        self.P(f"Container cleanup step '{step_name}' failed: {exc}", color='r')
+
     # Clear semaphore and reset signaling state for potential restart
-    self._semaphore_reset_signal()
+    safe_cleanup_step("semaphore reset", self._semaphore_reset_signal)
 
-    # Stop log streaming
-    self._stop_event.set()
-    if self.log_thread:
-      self.log_thread.join(timeout=5)
-      self.log_thread = None
+    def signal_runtime_threads():
+      self._stop_event.set()
+      self._commands_started = False
+      return True
 
-    if getattr(self, 'exec_threads', None):
-      for thread in self.exec_threads:
-        if thread and thread.is_alive():
-          thread.join(timeout=5)
-      self.exec_threads = []
+    def join_runtime_threads():
+      result = True
+      stop_deadline = time.monotonic() + 5
 
-    self._stop_event = threading.Event()
-    self._commands_started = False
+      if self.log_thread:
+        self.log_thread.join(timeout=max(0, stop_deadline - time.monotonic()))
+        if self.log_thread.is_alive():
+          result = False
+          self.P("Container log thread is still alive after stop timeout.", color='r')
+        else:
+          self.log_thread = None
+
+      if getattr(self, 'exec_threads', None):
+        alive_threads = []
+        for thread in self.exec_threads:
+          remaining = max(0, stop_deadline - time.monotonic())
+          if thread and thread.is_alive() and remaining > 0:
+            thread.join(timeout=remaining)
+          if thread and thread.is_alive():
+            result = False
+            alive_threads.append(thread)
+        self.exec_threads = alive_threads
+
+      if result:
+        self._stop_event = threading.Event()
+      self._commands_started = False
+      return result
+
+    # Signal log/exec readers early, but join after Docker stop; quiet Docker
+    # streams usually unblock only when the container stops.
+    safe_cleanup_step("runtime thread signal", signal_runtime_threads)
 
     # Stop tunnel engine if needed
-    self.stop_tunnel_engine()
+    safe_cleanup_step("main tunnel", self.stop_tunnel_engine)
 
     # Stop extra tunnels
-    self.stop_extra_tunnels()
+    safe_cleanup_step("extra tunnels", self.stop_extra_tunnels)
 
-    # Stop the container if it's running
-    self.stop_container()
+    def stop_runtime_container():
+      stopped = self.stop_container()
+      self._runtime_stop_degraded = not stopped
+      if not stopped:
+        self.P(
+          "Container runtime stop failed after sidecars were stopped; container "
+          "may still be running and volume mutation/cleanup must be skipped.",
+          color='r',
+        )
+      return stopped
 
-    # Save logs to disk (in instance-specific subfolder alongside persistent state)
+    # Stop the container if it's running. A false result preserves the Docker
+    # handle for retry and prevents volume mutation against a possibly live app.
+    safe_cleanup_step("docker container", stop_runtime_container)
+
+    # Stop log streaming threads after Docker stop has had a chance to unblock
+    # the log/exec streams.
+    safe_cleanup_step("runtime threads", join_runtime_threads)
+
+    if cleanup_errors:
+      self._cleanup_failed = True
+      self.P("Container runtime cleanup completed with failed step(s): {}.".format(", ".join(cleanup_errors)), color='r')
+      return False
+    self._runtime_stop_degraded = False
+    self._cleanup_failed = False
+    return True
+
+
+  def _stop_container_and_save_logs_to_disk(self):
+    """
+    Stop the container, all tunnels, fixed volumes, then save logs to disk.
+
+    Returns
+    -------
+    bool
+        True when cleanup completed without required-step failures, False otherwise.
+    """
+    runtime_ok = self._stop_container_runtime_for_restart()
+    cleanup_errors = []
+
+    if runtime_ok or not self._runtime_stop_degraded:
+      try:
+        if not runtime_ok:
+          # Fixed-size volume mutation only depends on the Docker container no
+          # longer owning the mount. Tunnel/log-reader failures remain retryable,
+          # but they should not keep loop devices mounted after Docker removal.
+          cleanup_errors.append("runtime")
+          self.P(
+            "Fixed-size volume cleanup is safe because Docker container stop/remove "
+            "succeeded; runtime sidecar cleanup still needs retry.",
+            color='y',
+          )
+        if self._cleanup_fixed_size_volumes() is False:
+          cleanup_errors.append("fixed-size volumes")
+      except Exception as exc:
+        cleanup_errors.append("fixed-size volumes")
+        self.P(f"Container cleanup step 'fixed-size volumes' failed: {exc}", color='r')
+    else:
+      cleanup_errors.append("runtime")
+      self.P(
+        "Skipping fixed-size volume cleanup because container stop/remove failed.",
+        color='r',
+      )
+
+    # Save logs to disk even when cleanup is degraded; logs are diagnostic data
+    # and should not be lost just because Docker/tunnel teardown needs a retry.
     try:
       self.diskapi_save_pickle_to_data(
         obj=list(self.container_logs),
-        filename="container_logs.pkl",
-        subfolder=self._get_instance_data_subfolder()
+        filename=_CONTAINER_LOGS_FILE,
+        subfolder="logs",
       )
       self.P("Container logs saved to disk.")
     except Exception as exc:
       self.P(f"Failed to save logs: {exc}", color='r')
-    return
+
+    if cleanup_errors:
+      self._cleanup_failed = True
+      self._cleanup_retry_abandoned_logged = False
+      self.P("Container cleanup completed with failed step(s): {}.".format(", ".join(cleanup_errors)), color='r')
+      return False
+    self._cleanup_failed = False
+    self._cleanup_retry_abandoned_logged = False
+    return True
 
 
   def on_close(self):
@@ -2815,8 +3233,9 @@ class ContainerAppRunnerPlugin(
     if not self.cfg_image:
       return None
 
+    full_image = self._get_full_image_ref()
     try:
-      img = self.docker_client.images.get(self.cfg_image)
+      img = self.docker_client.images.get(full_image)
       return img
     except Exception:
       return None
@@ -2824,35 +3243,53 @@ class ContainerAppRunnerPlugin(
 
   def _pull_image_from_registry(self):
     """
-    Pull image from registry (assumes authentication already done).
+    Pull image from registry with exponential backoff and jitter.
+
+    Implements rate-limit-aware pulling: when a pull fails (e.g. DockerHub 429),
+    subsequent attempts are delayed with exponential backoff plus random jitter.
+    This prevents multiple plugins on the same edge node from hammering the
+    registry simultaneously (thundering herd).
 
     Returns
     -------
     Image or None
-        Image object or None if pull failed
-
-    Raises
-    ------
-    RuntimeError
-        If authentication hasn't been performed
+        Image object or None if pull failed or in backoff
     """
     if not self.cfg_image:
       self.P("No Docker image configured", color='r')
       return None
 
+    # Check if we've exhausted all retries
+    if self._has_exceeded_image_pull_retries():
+      self.P(
+        f"Image pull abandoned after {self._image_pull_failures} consecutive failures "
+        f"(max: {self.cfg_image_pull_max_retries})",
+        color='r'
+      )
+      return None
+
+    # Check if we're in backoff period
+    if self._is_image_pull_backoff_active():
+      remaining = self._next_image_pull_time - self.time()
+      self.Pd(f"Image pull backoff active: {remaining:.1f}s remaining")
+      return None
+
+    full_image = self._get_full_image_ref()
     try:
-      self.P(f"Pulling image '{self.cfg_image}'...")
-      img = self.docker_client.images.pull(self.cfg_image)
+      self.P(f"Pulling image '{full_image}'...")
+      img = self.docker_client.images.pull(full_image)
 
       # docker-py may return Image or list[Image]
       if isinstance(img, list) and img:
         img = img[-1]
 
-      self.P(f"Successfully pulled image '{self.cfg_image}'")
+      self.P(f"Successfully pulled image '{full_image}'")
+      self._record_image_pull_success()
       return img
 
     except Exception as e:
       self.P(f"Image pull failed: {e}", color='r')
+      self._record_image_pull_failure()
       return None
 
 
@@ -2876,13 +3313,15 @@ class ContainerAppRunnerPlugin(
     RuntimeError
         If authentication fails and no local image exists
     """
+    full_image = self._get_full_image_ref()
+
     # Step 1: Authenticate with registry
     if not self._login_to_registry():
       self.P("Registry authentication failed", color='r')
       # Try to use local image if authentication fails
       local_img = self._get_local_image()
       if local_img:
-        self.P(f"Using local image (registry login failed): {self.cfg_image}", color='r')
+        self.P(f"Using local image (registry login failed): {full_image}", color='r')
         return local_img
       raise RuntimeError("Failed to authenticate with registry and no local image available.")
 
@@ -2892,14 +3331,14 @@ class ContainerAppRunnerPlugin(
       return img
 
     # Step 3: Fallback to local image
-    self.P(f"Pull failed, checking for local image: {self.cfg_image}", color='r')
+    self.P(f"Pull failed, checking for local image: {full_image}", color='r')
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Using local image as fallback: {self.cfg_image}", color='r')
+      self.P(f"Using local image as fallback: {full_image}", color='r')
       return local_img
 
     # Step 4: No image available
-    self.P(f"No image available (pull failed and no local image): {self.cfg_image}", color='r')
+    self.P(f"No image available (pull failed and no local image): {full_image}", color='r')
     return None
 
 
@@ -3057,7 +3496,37 @@ class ContainerAppRunnerPlugin(
     return
 
 
-  def _restart_container(self, stop_reason=None):
+  def _reset_runtime_state_post_start(self):
+    """Bring per-restart runtime markers back to a fresh-boot baseline.
+
+    Called after a successful ``start_container()`` to:
+      - stamp ``container_start_time`` so health-probe elapsed timers measure
+        from this new boot
+      - clear readiness gates (``_app_ready``, ``_health_probe_start``,
+        ``_tunnel_start_allowed``) so health checks re-run against the new
+        container's state and tunnels gate on the new readiness probe
+      - clear the command-rerun gate (``_commands_started``) so
+        BUILD_AND_RUN_COMMANDS rerun against the new container
+      - re-attach log capture (the prior log thread was stopped at
+        ``stop_container`` time)
+      - run image-defined build/run commands
+
+    Shared between ``_restart_container`` and the volume-sync ticks
+    (``_SyncMixin._sync_safe_start_container``) so they stay in lockstep;
+    sync slices stop+start the container inline (to keep the system volume
+    mounted), and without this helper the readiness/probe state would still
+    point at the previous container instance.
+    """
+    self.container_start_time = self.time()
+    self._app_ready = False
+    self._health_probe_start = None
+    self._tunnel_start_allowed = False
+    self._commands_started = False
+    self._start_container_log_stream()
+    self._maybe_execute_build_and_run()
+
+
+  def _restart_container(self, stop_reason=None, cleanup_first=True):
     """
     Restart the container from scratch.
 
@@ -3065,10 +3534,15 @@ class ContainerAppRunnerPlugin(
     ----------
     stop_reason : StopReason, optional
         Optional StopReason enum indicating why restart was triggered
+    cleanup_first : bool, optional
+        If True, stop the existing runtime before resetting state. Set to False
+        when the caller already performed cleanup and checked its result.
 
     Returns
     -------
-    None
+    bool
+        True when restart setup succeeded or was deferred waiting for
+        semaphores, False when cleanup or start failed.
     """
     self.P("Restarting container from scratch...")
 
@@ -3078,7 +3552,14 @@ class ContainerAppRunnerPlugin(
     preserved_last_image_check = self._last_image_check
     preserved_current_hash = self.current_image_hash
 
-    self._stop_container_and_save_logs_to_disk()
+    if cleanup_first:
+      cleanup_ok = self._stop_container_and_save_logs_to_disk()
+      if not cleanup_ok:
+        self.P("Restart aborted because previous runtime cleanup failed.", color='r')
+        self._set_container_state(ContainerState.FAILED, stop_reason or StopReason.UNKNOWN)
+        self._record_restart_failure()
+        return False
+
     self.__reset_vars()
 
     # Reset chainstore response for restart cycle
@@ -3094,11 +3575,41 @@ class ContainerAppRunnerPlugin(
     # Set state after reset
     self._set_container_state(ContainerState.RESTARTING, stop_reason or StopReason.UNKNOWN)
 
-    self._configure_dynamic_env()
+    # Re-login to registry (reset_vars creates a new Docker client, losing the session)
+    self._login_to_registry()
+
     self._setup_resource_limits_and_ports()
     self._configure_volumes()
     self._configure_file_volumes()
+    self._configure_fixed_size_volumes()
+    self._configure_system_volume()
+    self._configure_env_overrides_control_dir()
+    self._configure_reset_control_dir()
+    self._recover_stale_processing()
+    self._recover_env_overrides_processing()
+    self._recover_reset_processing()
+    self._validate_sync_config()
+
+    # For semaphored containers (consumers), defer env setup and container start
+    # to _handle_initial_launch() which properly waits for provider semaphores.
+    # This is critical when all containers in a pipeline restart simultaneously
+    # (e.g., via RESTART command) — providers need time to publish shmem values.
+    if self._semaphore_get_keys():
+      # Reset semaphore wait state so _wait_for_semaphores logs fresh status
+      if hasattr(self, '_semaphore_wait_logged'):
+        del self._semaphore_wait_logged
+
+      self._validate_extra_tunnels_config()
+      self._validate_runner_config()
+      self.P("Consumer container with semaphore dependencies: deferring start until providers are ready")
+      return True
+
+    # Non-semaphored containers (providers): configure env and start immediately
+    self._configure_dynamic_env()
     self._setup_env_and_ports()
+    self._inject_sync_env_vars()
+    self._inject_env_overrides_env_vars()
+    self._inject_reset_env_vars()
 
     # Revalidate extra tunnels
     self._validate_extra_tunnels_config()
@@ -3110,17 +3621,15 @@ class ContainerAppRunnerPlugin(
       self.P("Failed to ensure image availability during restart, cannot start container", color='r')
       self._set_container_state(ContainerState.FAILED, StopReason.CRASH)
       self._record_restart_failure()
-      return
+      return False
 
     self.container = self.start_container()
     if not self.container:
       # start_container already recorded the failure
-      return
+      return False
 
-    self.container_start_time = self.time()
-    self._start_container_log_stream()
-    self._maybe_execute_build_and_run()
-    return
+    self._reset_runtime_state_post_start()
+    return True
 
 
   def _ensure_image_always_pull(self):
@@ -3150,14 +3659,15 @@ class ContainerAppRunnerPlugin(
     bool
         True if image is available (locally or after pull), False otherwise
     """
+    full_image = self._get_full_image_ref()
     # Check if image exists locally
     local_img = self._get_local_image()
     if local_img:
-      self.P(f"Image '{self.cfg_image}' found locally")
+      self.P(f"Image '{full_image}' found locally")
       return True
 
     # Image not found locally, pull it
-    self.P(f"Image not found locally, pulling '{self.cfg_image}'...")
+    self.P(f"Image not found locally, pulling '{full_image}'...")
     img = self._pull_image_with_fallback()
     return img is not None
 
@@ -3278,8 +3788,12 @@ class ContainerAppRunnerPlugin(
       if not self._wait_for_semaphores():
         return  # Still
       # end if
-      # Semaphores ready - now setup env vars with semaphore values
+      # Semaphores ready - dynamic env to resolve shmem values, then setup env
+      self._configure_dynamic_env()
       self._setup_env_and_ports()
+      self._inject_sync_env_vars()
+      self._inject_env_overrides_env_vars()
+      self._inject_reset_env_vars()
     # end if
 
     try:
@@ -3298,6 +3812,7 @@ class ContainerAppRunnerPlugin(
       self._start_container_log_stream()
       self._maybe_execute_build_and_run()
 
+      self._last_image_check = self.time()
       self.P("Container launched successfully")
       self.P(self.container)
       if self.current_image_hash:
@@ -3371,7 +3886,89 @@ class ContainerAppRunnerPlugin(
         return StopReason.EXTERNAL_UPDATE
       return None
     """
+    # Volume-sync drives stop_container/start_container INLINE so the loopback
+    # mount survives the archive/extract window. We must not return a
+    # StopReason from here because that would route through _restart_container,
+    # which calls _cleanup_fixed_size_volumes() and unmounts before our work
+    # can run.
+    self._reset_processed_this_tick = False
+    if self._env_overrides_tick(current_time):
+      return StopReason.ENV_OVERRIDE
+
+    if self._reset_tick(current_time):
+      self._reset_processed_this_tick = True
+      return None
+
+    if self._sync_enabled():
+      role = self._sync_role()
+      if role == "provider":
+        self._sync_provider_tick(current_time)
+      elif role == "consumer":
+        self._sync_consumer_tick(current_time)
     return None
+
+
+  def _retry_failed_cleanup(self):
+    """
+    Retry a previously failed cleanup cycle from the normal process loop.
+
+    Cleanup failure is a backoff/retry state, not a permanent latch. This keeps
+    transient Docker, tunnel, log-reader, or fixed-volume failures visible while
+    still giving the plugin an automatic recovery path.
+    """
+    if not self._cleanup_failed:
+      return True
+
+    if self._has_exceeded_max_retries():
+      if not self._cleanup_retry_abandoned_logged:
+        self.P(
+          "Container cleanup retry abandoned after {} consecutive failure(s).".format(
+            self._consecutive_failures
+          ),
+          color='r',
+        )
+        self._cleanup_retry_abandoned_logged = True
+      if self._is_restart_backoff_active():
+        return False
+      self.P("Rechecking abandoned container cleanup after backoff...", color='y')
+      cleanup_ok = self._stop_container_and_save_logs_to_disk()
+      if cleanup_ok:
+        self._cleanup_failed = False
+        self._cleanup_retry_abandoned_logged = False
+        # Cleanup recovered after max-retry abandonment; clear retry accounting before relaunch.
+        self._consecutive_failures = 0
+        self._last_failure_time = 0
+        self._restart_backoff_seconds = 0
+        self._next_restart_time = 0
+        self.P("Previously abandoned container cleanup succeeded.", color='g')
+        if self._manual_stop_pending:
+          self._save_persistent_state(manually_stopped=True)
+          self._manual_stop_pending = False
+          self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
+          return False
+        return True
+      self._schedule_abandoned_cleanup_probe()
+      self._set_container_state(ContainerState.FAILED, self.stop_reason or StopReason.UNKNOWN)
+      return False
+
+    if self._is_restart_backoff_active():
+      return False
+
+    self.P("Retrying previously failed container cleanup...", color='y')
+    cleanup_ok = self._stop_container_and_save_logs_to_disk()
+    if cleanup_ok:
+      self._cleanup_failed = False
+      self.P("Previously failed container cleanup succeeded.", color='g')
+      if self._manual_stop_pending:
+        self._save_persistent_state(manually_stopped=True)
+        self._manual_stop_pending = False
+        self._set_container_state(ContainerState.PAUSED, StopReason.MANUAL_STOP)
+        return False
+      return True
+
+    self._record_restart_failure()
+    self._set_container_state(ContainerState.FAILED, self.stop_reason or StopReason.UNKNOWN)
+    return False
 
 
   def process(self):
@@ -3405,7 +4002,24 @@ class ContainerAppRunnerPlugin(
         self._last_paused_log = current_time
       return
 
+    if self._cleanup_failed:
+      if not self._retry_failed_cleanup():
+        return
+      if not self.container:
+        self._restart_container(self.stop_reason or StopReason.UNKNOWN, cleanup_first=False)
+        return
+
     if not self.container:
+      if self._is_reset_failure_halt_active():
+        self.Pd(
+          "Container remains stopped after failed reset; send RESTART to resume "
+          "after inspecting response.json."
+        )
+        return
+      # Check if we're in backoff period
+      if self._is_restart_backoff_active():
+        self.Pd("Container initial launch delayed due to active backoff period")
+        return
       self._handle_initial_launch()
       # If still no container (e.g., waiting for semaphores), return early
       # to avoid triggering restart logic

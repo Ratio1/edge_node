@@ -1,0 +1,452 @@
+"""
+R1FS persistent models — job config, pass reports, and job archive.
+
+  JobConfig        — immutable config written once at launch
+  WorkerReportMeta — per-worker summary inside PassReport
+  PassReport       — consolidated pass report (one CID per pass)
+  UiAggregate      — pre-computed aggregate for frontend
+  JobArchive       — complete job archive (the one CID)
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, asdict
+
+from extensions.business.cybersec.red_mesh.models.shared import _strip_none
+from extensions.business.cybersec.red_mesh.constants import (
+  DISTRIBUTION_SLICE, PORT_ORDER_SEQUENTIAL, RUN_MODE_SINGLEPASS, JOB_ARCHIVE_VERSION,
+)
+
+
+@dataclass(frozen=True)
+class JobConfig:
+  """
+  Static job configuration stored in R1FS.
+
+  Written once at launch, never modified. Referenced by job_config_cid.
+  """
+  target: str
+  start_port: int
+  end_port: int
+  exceptions: list                  # [int]
+  distribution_strategy: str        # SLICE | MIRROR
+  port_order: str                   # SHUFFLE | SEQUENTIAL
+  nr_local_workers: int
+  enabled_features: list            # [str]
+  excluded_features: list           # [str]
+  run_mode: str                     # SINGLEPASS | CONTINUOUS_MONITORING
+  scan_min_delay: float = 0
+  scan_max_delay: float = 0
+  ics_safe_mode: bool = False
+  redact_credentials: bool = True
+  scanner_identity: str = ""
+  scanner_user_agent: str = ""
+  task_name: str = ""
+  task_description: str = ""
+  monitor_interval: int = 0
+  selected_peers: list = None       # [str] or None
+  created_by_name: str = ""
+  created_by_id: str = ""
+  authorized: bool = False
+  target_confirmation: str = ""
+  scope_id: str = ""
+  authorization_ref: str = ""
+  engagement_metadata: dict = None
+  target_allowlist: list = None
+  safety_policy: dict = None
+  # ── Phase 3 PR-3.3: typed engagement context ──
+  # The three legacy fields above (scope_id, authorization_ref,
+  # engagement_metadata) remain for backward-compat with existing
+  # archives in R1FS. New launches populate the typed fields below.
+  # Both shapes serialize alongside each other; consumers prefer the
+  # typed shape when present.
+  engagement: dict = None        # EngagementContext.to_dict() output
+  roe: dict = None               # RulesOfEngagement.to_dict() output
+  authorization: dict = None     # AuthorizationRef.to_dict() output
+  # ── graybox fields ──
+  scan_type: str = "network"          # "network" | "webapp"
+  target_url: str = ""                # required when scan_type == "webapp"
+  secret_ref: str = ""                # reference to separately persisted graybox secrets
+  has_regular_credentials: bool = False
+  has_weak_candidates: bool = False
+  # OWASP API Top 10 (Subphase 1.5 commit #8) — non-secret capability flags.
+  # Raw bearer_token / api_key / bearer_refresh_token values are blanked
+  # before persistence by `_blank_graybox_secret_fields` and instead live
+  # in the R1FS secret payload (resolved at worker startup via
+  # `resolve_job_config_secrets`).
+  has_bearer_token: bool = False
+  has_api_key: bool = False
+  has_bearer_refresh_token: bool = False
+  has_regular_bearer_token: bool = False
+  has_regular_api_key: bool = False
+  has_regular_bearer_refresh_token: bool = False
+  has_gateway_api_key: bool = False
+  has_gateway_bearer_token: bool = False
+  has_gateway_bearer_refresh_token: bool = False
+  secret_store_key_id: str = ""
+  secret_store_key_version: str = ""
+  secret_store_key_source: str = ""
+  secret_store_unsafe_fallback: bool = False
+  official_username: str = ""
+  official_password: str = ""
+  regular_username: str = ""
+  regular_password: str = ""
+  bearer_token: str = ""              # blanked before persistence; runtime-only
+  api_key: str = ""                   # blanked before persistence; runtime-only
+  bearer_refresh_token: str = ""      # blanked before persistence; runtime-only
+  regular_bearer_token: str = ""      # blanked before persistence; runtime-only
+  regular_api_key: str = ""           # blanked before persistence; runtime-only
+  regular_bearer_refresh_token: str = ""  # blanked before persistence; runtime-only
+  gateway_api_key: str = ""           # blanked before persistence; runtime-only
+  gateway_bearer_token: str = ""      # blanked before persistence; runtime-only
+  gateway_bearer_refresh_token: str = ""  # blanked before persistence; runtime-only
+  weak_candidates: list = None        # legacy inline payload; new launches use secret_ref
+  max_weak_attempts: int = 5
+  app_routes: list = None             # user-supplied known routes
+  verify_tls: bool = True             # TLS cert verification
+  target_config: dict = None          # GrayboxTargetConfig.to_dict()
+  allow_stateful_probes: bool = False # gate for A06 workflow probes
+  graybox_assignment_strategy: str = "MIRROR"
+  assigned_scenario_ids: list = None
+  assigned_request_budget: int = 0
+  budget_scope: str = ""
+  assignment_revision: int = 0
+  assignment_hash: str = ""
+  stateful_policy: str = ""
+
+  def to_dict(self) -> dict:
+    return _strip_none(asdict(self))
+
+  @classmethod
+  def from_dict(cls, d: dict) -> JobConfig:
+    return cls(
+      target=d["target"],
+      start_port=d["start_port"],
+      end_port=d["end_port"],
+      exceptions=d.get("exceptions", []),
+      distribution_strategy=d.get("distribution_strategy", DISTRIBUTION_SLICE),
+      port_order=d.get("port_order", PORT_ORDER_SEQUENTIAL),
+      nr_local_workers=d.get("nr_local_workers", 2),
+      enabled_features=d.get("enabled_features", []),
+      excluded_features=d.get("excluded_features", []),
+      run_mode=d.get("run_mode", RUN_MODE_SINGLEPASS),
+      scan_min_delay=d.get("scan_min_delay", 0),
+      scan_max_delay=d.get("scan_max_delay", 0),
+      ics_safe_mode=d.get("ics_safe_mode", False),
+      redact_credentials=d.get("redact_credentials", True),
+      scanner_identity=d.get("scanner_identity", ""),
+      scanner_user_agent=d.get("scanner_user_agent", ""),
+      task_name=d.get("task_name", ""),
+      task_description=d.get("task_description", ""),
+      monitor_interval=d.get("monitor_interval", 0),
+      selected_peers=d.get("selected_peers"),
+      created_by_name=d.get("created_by_name", ""),
+      created_by_id=d.get("created_by_id", ""),
+      authorized=d.get("authorized", False),
+      target_confirmation=d.get("target_confirmation", ""),
+      scope_id=d.get("scope_id", ""),
+      authorization_ref=d.get("authorization_ref", ""),
+      engagement_metadata=d.get("engagement_metadata"),
+      target_allowlist=d.get("target_allowlist"),
+      safety_policy=d.get("safety_policy"),
+      scan_type=d.get("scan_type", "network"),
+      target_url=d.get("target_url", ""),
+      secret_ref=d.get("secret_ref", ""),
+      has_regular_credentials=d.get("has_regular_credentials", False),
+      has_weak_candidates=d.get("has_weak_candidates", False),
+      has_bearer_token=d.get("has_bearer_token", False),
+      has_api_key=d.get("has_api_key", False),
+      has_bearer_refresh_token=d.get("has_bearer_refresh_token", False),
+      has_regular_bearer_token=d.get("has_regular_bearer_token", False),
+      has_regular_api_key=d.get("has_regular_api_key", False),
+      has_regular_bearer_refresh_token=d.get("has_regular_bearer_refresh_token", False),
+      has_gateway_api_key=d.get("has_gateway_api_key", False),
+      has_gateway_bearer_token=d.get("has_gateway_bearer_token", False),
+      has_gateway_bearer_refresh_token=d.get("has_gateway_bearer_refresh_token", False),
+      secret_store_key_id=d.get("secret_store_key_id", ""),
+      secret_store_key_version=d.get("secret_store_key_version", ""),
+      secret_store_key_source=d.get("secret_store_key_source", ""),
+      secret_store_unsafe_fallback=d.get("secret_store_unsafe_fallback", False),
+      official_username=d.get("official_username", ""),
+      official_password=d.get("official_password", ""),
+      regular_username=d.get("regular_username", ""),
+      regular_password=d.get("regular_password", ""),
+      bearer_token=d.get("bearer_token", ""),
+      api_key=d.get("api_key", ""),
+      bearer_refresh_token=d.get("bearer_refresh_token", ""),
+      regular_bearer_token=d.get("regular_bearer_token", ""),
+      regular_api_key=d.get("regular_api_key", ""),
+      regular_bearer_refresh_token=d.get("regular_bearer_refresh_token", ""),
+      gateway_api_key=d.get("gateway_api_key", ""),
+      gateway_bearer_token=d.get("gateway_bearer_token", ""),
+      gateway_bearer_refresh_token=d.get("gateway_bearer_refresh_token", ""),
+      weak_candidates=d.get("weak_candidates"),
+      max_weak_attempts=d.get("max_weak_attempts", 5),
+      app_routes=d.get("app_routes"),
+      verify_tls=d.get("verify_tls", True),
+      target_config=d.get("target_config"),
+      allow_stateful_probes=d.get("allow_stateful_probes", False),
+      graybox_assignment_strategy=d.get("graybox_assignment_strategy", "MIRROR"),
+      assigned_scenario_ids=d.get("assigned_scenario_ids"),
+      assigned_request_budget=d.get("assigned_request_budget", 0),
+      budget_scope=d.get("budget_scope", ""),
+      assignment_revision=d.get("assignment_revision", 0),
+      assignment_hash=d.get("assignment_hash", ""),
+      stateful_policy=d.get("stateful_policy", ""),
+      engagement=d.get("engagement"),
+      roe=d.get("roe"),
+      authorization=d.get("authorization"),
+    )
+
+  # -- Phase 3 PR-3.3: convenience accessors for the typed shape --
+
+  def get_engagement(self):
+    """Return EngagementContext or None. Resolves the typed `engagement`
+    field first; falls back to the legacy free-form `engagement_metadata`
+    dict for backward compat with archives created before PR-3.3."""
+    from .engagement import EngagementContext
+    if self.engagement:
+      return EngagementContext.from_dict(self.engagement)
+    if self.engagement_metadata:
+      return EngagementContext.from_dict(self.engagement_metadata)
+    return None
+
+  def get_roe(self):
+    """Return RulesOfEngagement or None."""
+    from .engagement import RulesOfEngagement
+    return RulesOfEngagement.from_dict(self.roe) if self.roe else None
+
+  def get_authorization(self):
+    """Return AuthorizationRef or None. Falls back to the legacy
+    string `authorization_ref` (just a CID, no signer) when the typed
+    field is absent."""
+    from .engagement import AuthorizationRef
+    if self.authorization:
+      return AuthorizationRef.from_dict(self.authorization)
+    if self.authorization_ref:
+      return AuthorizationRef(document_cid=self.authorization_ref)
+    return None
+
+  def get_kickoff_questionnaire(self):
+    """Return a KickoffQuestionnaire bundling engagement/roe/authorization
+    or None when none of the three fields carry data."""
+    from .engagement import KickoffQuestionnaire
+    eng = self.get_engagement()
+    roe = self.get_roe()
+    auth = self.get_authorization()
+    if all(x is None or (hasattr(x, 'is_empty') and x.is_empty())
+           for x in (eng, roe, auth)):
+      return None
+    return KickoffQuestionnaire(
+      engagement=eng, roe=roe, authorization=auth,
+    )
+
+
+@dataclass(frozen=True)
+class WorkerReportMeta:
+  """
+  Per-worker summary inside a PassReport.
+
+  Lightweight metadata for attribution. The full raw report
+  is available via report_cid (Layer 3).
+  """
+  report_cid: str                   # nested CID -> WorkerReport in R1FS
+  start_port: int
+  end_port: int
+  ports_scanned: int = 0
+  open_ports: list = None           # [int]
+  nr_findings: int = 0
+  node_ip: str = ""                 # worker node's IP address
+
+  def to_dict(self) -> dict:
+    d = asdict(self)
+    if d["open_ports"] is None:
+      d["open_ports"] = []
+    return d
+
+  @classmethod
+  def from_dict(cls, d: dict) -> WorkerReportMeta:
+    return cls(
+      report_cid=d["report_cid"],
+      start_port=d["start_port"],
+      end_port=d["end_port"],
+      ports_scanned=d.get("ports_scanned", 0),
+      open_ports=d.get("open_ports", []),
+      nr_findings=d.get("nr_findings", 0),
+      node_ip=d.get("node_ip", ""),
+    )
+
+
+@dataclass(frozen=True)
+class PassReport:
+  """
+  Consolidated pass report stored in R1FS (one CID per pass).
+
+  Contains aggregated scan data from all workers, risk assessment,
+  LLM analysis (inline), and per-worker attribution with nested CIDs.
+  """
+  pass_nr: int
+  date_started: float
+  date_completed: float
+  duration: float
+
+  # Aggregated scan data — stored as separate CID, not inline
+  aggregated_report_cid: str        # CID -> AggregatedScanData in R1FS
+
+  # Per-worker attribution
+  worker_reports: dict              # { addr: WorkerReportMeta.to_dict() }
+
+  # Risk
+  risk_score: float = 0
+  risk_breakdown: dict = None       # RiskBreakdown.to_dict()
+
+  # LLM (inline text)
+  llm_analysis: str = None          # markdown — legacy
+  quick_summary: str = None         # 2-4 sentences
+  llm_failed: bool = None           # True if LLM API was unavailable — absent on success (_strip_none)
+
+  # Phase 4 PR-4.1 structured LLM payload — LlmReportSections.to_dict()
+  # output. Consumed by the Phase 6/7 PDF Executive Summary, Exploitation
+  # attack-chain narratives, Coverage gaps, and Conclusion. Absent (None)
+  # when the LLM Agent isn't enabled or when generate_exec_summary
+  # produced a fallback skeleton on a validation failure.
+  llm_report_sections: dict = None
+
+  # Flat findings (enriched dicts extracted from service_info/web_tests_info/correlation_findings)
+  findings: list = None             # [ { severity, confidence, port, protocol, probe, category, evidence, ... } ]
+
+  # Scan metrics (pass-level aggregate across all nodes)
+  scan_metrics: dict = None         # ScanMetrics.to_dict()
+
+  # Per-node scan metrics (node_address -> ScanMetrics.to_dict())
+  worker_scan_metrics: dict = None
+
+  # Attestation
+  redmesh_test_attestation: dict = None
+
+  def to_dict(self) -> dict:
+    return _strip_none(asdict(self))
+
+  @classmethod
+  def from_dict(cls, d: dict) -> PassReport:
+    return cls(
+      pass_nr=d["pass_nr"],
+      date_started=d["date_started"],
+      date_completed=d["date_completed"],
+      duration=d.get("duration", 0),
+      aggregated_report_cid=d["aggregated_report_cid"],
+      worker_reports=d.get("worker_reports", {}),
+      risk_score=d.get("risk_score", 0),
+      risk_breakdown=d.get("risk_breakdown"),
+      llm_analysis=d.get("llm_analysis"),
+      quick_summary=d.get("quick_summary"),
+      llm_failed=d.get("llm_failed"),
+      llm_report_sections=d.get("llm_report_sections"),
+      findings=d.get("findings"),
+      scan_metrics=d.get("scan_metrics"),
+      worker_scan_metrics=d.get("worker_scan_metrics"),
+      redmesh_test_attestation=d.get("redmesh_test_attestation"),
+    )
+
+
+@dataclass(frozen=True)
+class UiAggregate:
+  """
+  Pre-computed aggregate view for the frontend.
+
+  Embedded inside JobArchive so the detail page renders
+  without client-side recomputation.
+  """
+  total_open_ports: list            # sorted unique [int]
+  total_services: int
+  total_findings: int
+  latest_risk_score: float = None     # None while scan is in progress
+  latest_risk_breakdown: dict = None  # RiskBreakdown.to_dict()
+  latest_quick_summary: str = None
+  findings_count: dict = None       # { CRITICAL: int, HIGH: int, MEDIUM: int, LOW: int, INFO: int }
+  top_findings: list = None         # top 10 CRITICAL+HIGH findings for dashboard display
+  finding_timeline: dict = None     # { finding_id: { first_seen, last_seen, pass_count } }
+  worker_activity: list = None      # [ { id, start_port, end_port, open_ports } ]
+  # ── graybox-aware ──
+  scan_type: str = "network"
+  total_routes_discovered: int = 0          # webapp: discovered routes
+  total_forms_discovered: int = 0           # webapp: discovered forms
+  total_scenarios: int = 0                  # webapp: probe scenarios run
+  total_scenarios_vulnerable: int = 0       # webapp: vulnerable count
+
+  def to_dict(self) -> dict:
+    return _strip_none(asdict(self))
+
+  @classmethod
+  def from_dict(cls, d: dict) -> UiAggregate:
+    return cls(
+      total_open_ports=d.get("total_open_ports", []),
+      total_services=d.get("total_services", 0),
+      total_findings=d.get("total_findings", 0),
+      latest_risk_score=d.get("latest_risk_score", 0),
+      latest_risk_breakdown=d.get("latest_risk_breakdown"),
+      latest_quick_summary=d.get("latest_quick_summary"),
+      findings_count=d.get("findings_count"),
+      top_findings=d.get("top_findings"),
+      finding_timeline=d.get("finding_timeline"),
+      worker_activity=d.get("worker_activity"),
+      scan_type=d.get("scan_type", "network"),
+      total_routes_discovered=d.get("total_routes_discovered", 0),
+      total_forms_discovered=d.get("total_forms_discovered", 0),
+      total_scenarios=d.get("total_scenarios", 0),
+      total_scenarios_vulnerable=d.get("total_scenarios_vulnerable", 0),
+    )
+
+
+@dataclass(frozen=True)
+class JobArchive:
+  """
+  Complete job archive stored in R1FS.
+
+  Written once when job reaches FINALIZED or STOPPED.
+  The CStore stub holds only job_cid pointing here.
+  One fetch gives the frontend everything it needs.
+  """
+  job_id: str
+  job_config: dict                  # JobConfig.to_dict()
+  timeline: list                    # [ TimelineEvent.to_dict() ]
+  passes: list                      # [ PassReport.to_dict() ]
+  ui_aggregate: dict                # UiAggregate.to_dict()
+  duration: float
+  date_created: float
+  date_completed: float
+  archive_version: int = JOB_ARCHIVE_VERSION
+  start_attestation: dict = None
+  soc_event_status: dict = None
+  detection_correlation: dict = None
+  stix_export: dict = None
+  opencti_export: dict = None
+  taxii_export: dict = None
+
+  def to_dict(self) -> dict:
+    return _strip_none(asdict(self))
+
+  @classmethod
+  def from_dict(cls, d: dict) -> JobArchive:
+    archive_version = d.get("archive_version", JOB_ARCHIVE_VERSION)
+    if archive_version != JOB_ARCHIVE_VERSION:
+      raise ValueError(
+        f"Unsupported archive_version {archive_version}; expected {JOB_ARCHIVE_VERSION}"
+      )
+    return cls(
+      archive_version=archive_version,
+      job_id=d["job_id"],
+      job_config=d.get("job_config", {}),
+      timeline=d.get("timeline", []),
+      passes=d.get("passes", []),
+      ui_aggregate=d.get("ui_aggregate", {}),
+      duration=d.get("duration", 0),
+      date_created=d.get("date_created", 0),
+      date_completed=d.get("date_completed", 0),
+      start_attestation=d.get("start_attestation"),
+      soc_event_status=d.get("soc_event_status"),
+      detection_correlation=d.get("detection_correlation"),
+      stix_export=d.get("stix_export"),
+      opencti_export=d.get("opencti_export"),
+      taxii_export=d.get("taxii_export"),
+    )

@@ -158,9 +158,6 @@ config_startup*.yaml
 config_startup*.yml
 inference/model_testing/_local_cache/_logs/MPTF.txt
 inference/model_testing/_local_cache/_logs/20211224_102325_MPTF_001_log.txt
-vectordb
-_vector_db_cache
-_vector_db_cache_HNSWVectorDB
 db_cache
 
 plugins/libs/_cache/
@@ -199,3 +196,6 @@ blur_debugger/blur_debugger_draw__BLUR_DEBUGGER_DRAW_STEP__Tracking/
 
 .prompt.md
 prompt.md
+
+# RedMesh LLM probe benchmark artifacts
+extensions/business/cybersec/red_mesh/test_results/

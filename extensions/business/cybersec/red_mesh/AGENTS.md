@@ -1,0 +1,375 @@
+# RedMesh Backend Agent Memory
+
+Last updated: 2026-03-16T17:05:00Z
+
+## Purpose
+
+This file is the durable, append-only long-term memory for future agents working in the RedMesh backend implementation directory:
+
+- [`extensions/business/cybersec/red_mesh/`](./)
+
+Use it to preserve:
+- code-level architecture facts
+- backend-specific invariants
+- important debugging references
+- critical pitfalls
+- timestamped memory entries for meaningful backend changes and major development stages
+
+Do not rewrite history. Corrections belong in new log entries that reference earlier ones.
+
+## Scope
+
+This `AGENTS.md` is RedMesh-backend-specific.
+
+Use the workspace-level memory for cross-repo planning and project-wide context:
+- project-level RedMesh workspace `AGENTS.md`
+
+Use this file for:
+- backend implementation memory
+- module boundaries
+- orchestration and persistence invariants
+- testing and debugging conventions
+- significant backend change history
+
+## Stable References
+
+### Core Entry Points
+
+- [`pentester_api_01.py`](./pentester_api_01.py)
+- [`redmesh_llm_agent_api.py`](./redmesh_llm_agent_api.py)
+
+### Core Subsystems
+
+- [`services/`](./services)
+- [`repositories/`](./repositories)
+- [`models/`](./models)
+- [`mixins/`](./mixins)
+- [`worker/`](./worker)
+- [`graybox/`](./graybox)
+
+### Key Supporting Modules
+
+- [`constants.py`](./constants.py)
+- [`findings.py`](./findings.py)
+- [`cve_db.py`](./cve_db.py)
+
+### Tests
+
+- [`tests/`](./tests)
+- [`test_redmesh.py`](./test_redmesh.py)
+
+### Historical Context
+
+- [`.old_docs/HISTORY.md`](./.old_docs/HISTORY.md)
+
+## Architecture Snapshot
+
+RedMesh is a distributed pentest backend running on Ratio1 edge nodes. It coordinates scans across nodes, stores job state in CStore, persists large artifacts in R1FS, and exposes FastAPI endpoints consumed by Navigator and local operators.
+
+High-level responsibilities:
+- launch and coordinate network and graybox jobs
+- distribute work across edge nodes
+- track runtime progress
+- aggregate worker reports
+- finalize archives and derived metadata
+- optionally run LLM analysis on aggregated reports
+- expose audit, archive, report, progress, triage, and analysis APIs
+
+### Current Major Boundaries
+
+- `pentester_api_01.py`
+  - main orchestration plugin
+  - launch endpoints
+  - process-loop coordination
+  - API read paths
+
+- `services/`
+  - extracted lifecycle, query, launch, state-machine, control, finalization, resilience, and secret-handling logic
+
+- `repositories/`
+  - storage boundaries for CStore and R1FS-style artifacts
+
+- `models/`
+  - typed job/config/archive/report/triage structures
+
+- `worker/`
+  - network worker implementation and feature-specific probe modules
+
+- `graybox/`
+  - authenticated webapp scan models, runtime flow, auth lifecycle, safety gates, and probe families
+
+- `mixins/`
+  - live progress, reporting, risk scoring, attestation, and LLM behavior extracted from the main plugin
+
+## Critical Invariants
+
+### Storage and Ownership
+
+- CStore job records are the shared orchestration state for distributed work.
+- R1FS stores large immutable artifacts such as reports, configs, and archives.
+- Finalized jobs are represented in CStore as stubs plus `job_cid`; archive payloads are authoritative for finalized history.
+- Read paths for finalized data should prefer archive-backed retrieval over assuming live CStore detail still exists.
+
+### Job Lifecycle
+
+- Launcher node is responsible for distributed orchestration and finalization.
+- Workers are selected per job and assigned explicit ranges/config.
+- Aggregated analysis should run on the combined multi-worker report, not a single-worker report.
+- A job should converge to an explicit terminal state; indefinite `RUNNING` due to a missing worker is a bug.
+
+### Findings and Reports
+
+- Structured findings are the backend contract; string-only vulnerability outputs are legacy history, not the target model.
+- Severity, evidence, remediation, and typed finding metadata should remain normalized across network and graybox paths.
+- Mutable analyst triage state must remain separate from immutable scan/archive records.
+
+### Security and Secret Handling
+
+- Archive/report redaction is not equivalent to secure secret persistence.
+- Graybox secret storage boundaries are security-sensitive and should be treated as architecture, not cosmetic cleanup.
+- Safe defaults matter for redaction, ICS-safe behavior, rate limiting, and authorization confirmation.
+
+### Distributed Runtime State
+
+- Shared job blobs are vulnerable to lost-update races if multiple nodes write unrelated fields concurrently.
+- Worker-owned runtime state should prefer isolated records over concurrent writes into the same job document.
+- Launcher-side reconciliation is safer than trusting many workers to merge shared orchestration state correctly.
+- Nested config blocks should resolve through one shared shallow merge helper, with validation kept in subsystem-specific wrappers.
+
+## Testing and Verification
+
+Primary backend test commands:
+
+```bash
+cd edge_node
+python -m pytest extensions/business/cybersec/red_mesh/test_redmesh.py -v
+```
+
+```bash
+cd edge_node
+python -m pytest extensions/business/cybersec/red_mesh/tests -v
+```
+
+Useful targeted runs:
+
+```bash
+cd edge_node
+python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -v
+```
+
+```bash
+cd edge_node
+python -m pytest extensions/business/cybersec/red_mesh/tests/test_regressions.py -v
+```
+
+```bash
+cd edge_node
+python -m pytest extensions/business/cybersec/red_mesh/tests/test_state_machine.py -v
+```
+
+## Debugging Conventions
+
+- Prefer reading both live API state and persisted logs when investigating distributed-job issues.
+- For finalized-job read bugs, verify whether the true source of truth is CStore stub data or archive data in R1FS.
+- For stuck distributed jobs, inspect:
+  - launcher job record
+  - per-worker status/progress visibility
+  - whether every assigned worker actually observed the job
+  - whether missing workers were unhealthy at assignment time
+- Distinguish clearly between:
+  - scan execution failures
+  - orchestration failures
+  - archive/read-path failures
+  - LLM post-processing failures
+
+## Pitfalls
+
+- `get_job_status` can look locally “complete” while the distributed job is still incomplete.
+- Finalized jobs are pruned to CStore stubs; assuming live pass reports remain in CStore is incorrect.
+- Shared CStore writes without guarded semantics can lose unrelated updates.
+- LLM failure and analysis retrieval are separate problems; missing analysis text is not always a UI issue.
+- Graybox and network paths now share more contracts than before; avoid fixing one while silently breaking the other.
+
+## Mandatory BUILDER-CRITIC Loop
+
+For every meaningful RedMesh backend modification, future agents must record and follow this loop in their work output and, for critical/fundamental changes, summarize the result in the Memory Log.
+
+### 1. BUILDER
+
+State:
+- intent
+- files or systems to change
+- expected behavioral change
+
+### 2. CRITIC
+
+Adversarially try to break the change:
+- wrong assumptions
+- orchestration/storage mismatches
+- regressions
+- security impact
+- distributed-state edge cases
+- missing tests
+- missing docs
+- operational risks
+
+### 3. BUILDER Response
+
+Refine or defend the change:
+- what changed after critique
+- what remains risky
+- exact verification commands
+- actual verification results
+
+Minimum bar:
+- no meaningful RedMesh backend change is complete without a documented CRITIC pass
+- no critical orchestration/storage change is complete without verification commands and results
+- if verification cannot run, record that explicitly
+
+## Memory Log (append-only)
+
+Only append entries for critical or fundamental RedMesh backend changes, discoveries, or horizontal insights. Do not add routine edits.
+
+### 2025-08-27 to 2025-10-04
+
+- Stage: initial RedMesh backend creation and early productionization.
+- Change: established the original distributed pentest backend with `pentester_api_01.py`, `PentestLocalWorker`, basic service probes, and early web checks.
+- Change: added the first test suite and expanded protocol/web coverage beyond basic banner grabbing.
+- Horizontal insight: RedMesh started as a network-first scanning backend and only later grew into a richer orchestration and analysis platform.
+
+### 2025-12-08 to 2025-12-22
+
+- Stage: distributed orchestration hardening and feature-catalog expansion.
+- Change: added startup coordination fixes, chainstore handling fixes, and a major overhaul of multi-node job coordination.
+- Change: introduced the feature catalog and explicit capability-driven execution model in [`constants.py`](./constants.py).
+- Horizontal insight: the December 2025 update was the major transition from a simple scanner plugin to a configurable distributed scanning platform.
+
+### 2026-01-28 to 2026-02-19
+
+- Stage: worker-state fixes, LLM integration, deep probes, structured findings, and web architecture refactor.
+- Change: fixed worker-entry handling from CStore, then added DeepSeek-backed LLM analysis through a dedicated agent path.
+- Change: expanded deep service probes across SSH, FTP, Telnet, HTTP, TLS, databases, and infrastructure protocols.
+- Change: split monolithic web logic into OWASP-aligned mixins and completed the migration to structured findings plus CVE matching.
+- Horizontal insight: by 2026-02-19, structured findings became the core backend contract and should be treated as foundational rather than optional formatting.
+
+### 2026-02-20
+
+- Stage: security-control baseline added across backend and Navigator integration.
+- Change: added credential redaction, ICS safe mode, rate limiting, scanner identity controls, audit logging, and authorization gating.
+- Horizontal insight: RedMesh security controls affect the full path from UI input to backend runtime and archive persistence; future changes should be reviewed end-to-end, not only in the plugin code.
+
+### 2026-03-07 to 2026-03-10
+
+- Stage: observability and backend decomposition.
+- Change: added live worker progress endpoints, per-thread metrics/ports visibility, node IP stamping, hard stop support, purge/delete flows, and improved progress loading.
+- Change: refactored a growing monolith into more granular mixins, worker modules, and split tests.
+- Horizontal insight: progress and observability became first-class runtime concerns, not just UI convenience features.
+
+### 2026-03-10 to 2026-03-11
+
+- Stage: graybox architecture introduction and typed execution boundaries.
+- Change: introduced graybox core modules, auth/discovery/safety flows, worker/API integration, launch API split by scan type, feature capability modeling by scan type, and extracted launch strategies/state machine.
+- Change: expanded graybox probes and tests, including access control, business logic, misconfiguration, and injection families.
+- Horizontal insight: RedMesh is no longer only a distributed port scanner; it is a dual-mode backend with both network and authenticated webapp execution paths.
+- Critical continuity rule: future agents must treat network and graybox paths as coupled contracts wherever findings, progress, launch state, and archive/read behavior overlap.
+
+### 2026-03-12
+
+- Stage: service extraction, repository/model boundaries, pass-cap hardening, and stronger storage design.
+- Change: extracted query, launch, lifecycle, repository, and service boundaries from `pentester_api_01.py`.
+- Change: enforced continuous-pass caps, normalized running-job state, introduced repository boundaries, and split graybox secrets from plain job config.
+- Horizontal insight: after this stage, RedMesh backend work should prefer service/repository/model boundaries over adding more behavior directly to the monolithic plugin file.
+- Critical continuity rule: storage-affecting work should flow through the typed repository/model/service boundaries unless there is a clear reason not to.
+
+### 2026-03-13
+
+- Stage: secret-boundary hardening, typed graybox artifacts, finding triage, resilience, and regression coverage.
+- Change: hardened secret-storage boundaries, typed graybox runtime/probe/evidence flows, normalized graybox finding contracts, added finding triage state and CVSS metadata, and strengthened resilience/launch policy.
+- Change: added regression and contract suites, hardened live progress metadata, hardened LLM failure handling, and preserved pass reports during finalization.
+- Horizontal insight: RedMesh now has explicit architecture around evidence artifacts, triage state, and regression protection; future work should extend those contracts rather than bypass them.
+
+### 2026-03-16
+
+- Change: added this backend-local [`AGENTS.md`](./AGENTS.md) to keep RedMesh-specific implementation memory separate from workspace-level planning memory.
+- Change: identified a distributed-job orchestration gap where an assigned worker can miss the initial CStore job announcement and the launcher can wait indefinitely.
+- Change: added a companion implementation tracker for distributed job reconciliation in the shared RedMesh project docs.
+- Horizontal insight: current launcher/worker orchestration is strong enough to distribute work, but not yet strong enough to guarantee convergence when a peer misses assignment visibility; future agents should treat worker-owned runtime state and launcher-side reconciliation as the preferred fix direction.
+
+### 2026-03-16T17:05:00Z
+
+- Change: extracted a generic nested-config resolver in [`services/config.py`](./services/config.py) and moved distributed job reconciliation config onto that shared path.
+- Horizontal insight: RedMesh should centralize nested config block merge semantics, but keep validation local to each subsystem wrapper rather than introducing a broad deep-merge config framework prematurely.
+
+### 2026-03-16T20:40:00Z
+
+- Change: introduced a dedicated LLM payload-shaping boundary in [`mixins/llm_agent.py`](./mixins/llm_agent.py) so RedMesh no longer sends the full aggregated report directly to the LLM path.
+- Change: added network and webapp-specific compact payload shaping, finding deduplication/ranking/capping, analysis-type budgets, and runtime payload-size observability.
+- Verification: the known failing job `a3a357bc` dropped from `303,760` raw bytes to `21,559` shaped bytes for `security_assessment` and completed manually in `38.97s` on rm1 instead of timing out.
+- Horizontal insight: RedMesh archive/report data and LLM reasoning data must remain separate contracts; future LLM work should extend the bounded payload model rather than re-coupling the agent to raw archived aggregates.
+
+### 2026-05-05T22:10:00Z
+
+- Change: remediated PTES reporting backend contracts: typed engagement/RoE/authorization now persist through launch/finalization, PTES narrative uses structured LLM sections without legacy raw scan-output LLM paths, production finding enrichment is load-bearing, dynamic reference cache data is threaded into scan records, engagement deletion uses real `JobStateRepository.get_job`/`put_job` semantics, and the e2e harness reads current `JobArchive.passes`.
+- Change: engagement deletion now writes sanitized JobConfig state before deleting authorization documents, reports document-delete failures as unsuccessful, avoids deleting documents if CStore state persistence fails, and explicitly rejects immutable finalized archives with `unsupported_finalized_job`.
+- Verification: `PYTHONPATH=/home/vitalii/remote-dev/repos/edge_node pytest -q extensions/business/cybersec/red_mesh/tests/test_api.py extensions/business/cybersec/red_mesh/tests/test_engagement_deletion.py extensions/business/cybersec/red_mesh/tests/test_e2e_harness.py extensions/business/cybersec/red_mesh/tests/test_authorization_upload.py extensions/business/cybersec/red_mesh/tests/test_finding_schema.py extensions/business/cybersec/red_mesh/tests/test_check_cves_enrichment.py extensions/business/cybersec/red_mesh/tests/test_dynamic_references.py extensions/business/cybersec/red_mesh/tests/test_probe_registry.py extensions/business/cybersec/red_mesh/tests/test_base_worker.py extensions/business/cybersec/red_mesh/tests/test_llm_input_isolation.py extensions/business/cybersec/red_mesh/tests/test_llm_output_validator.py extensions/business/cybersec/red_mesh/tests/test_llm_structured_service.py extensions/business/cybersec/red_mesh/tests/test_llm_fixture_cache.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_structured_report.py` passed with 313 tests, 1 skipped, and 4 subtests; `python extensions/business/cybersec/red_mesh/tests/e2e/run_e2e.py --help` passed.
+- Horizontal insight: PTES report data, LLM narrative input, finding identity/enrichment, and deletion semantics are coupled production contracts; future backend changes should preserve typed JobConfig as the source of truth and avoid side effects, such as document deletion, before durable state pointers are updated.
+
+### 2026-05-07T08:43:00Z
+
+- Change: moved finalized-job live-progress cleanup into the archive commit point, after the archive CID is verified and before CStore is pruned to the finalized stub.
+- Change: updated the native semaphore contract test to read the current LLM mixin path after the mixin refactor.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 100 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_integration.py -q` passed with 51 tests; `python -m pytest extensions/business/cybersec/red_mesh/test_native_api_semaphore_contract.py -q` passed with 4 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests extensions/business/cybersec/red_mesh/test_native_api_semaphore_contract.py -q` passed with 1112 tests, 1 skipped, 3 warnings, and 4 subtests.
+- Horizontal insight: finalized-job archive pruning should clear worker-owned runtime state only after archive durability is verified, while the full worker map is still available.
+
+### 2026-05-07T10:13:09Z
+
+- Change: removed the dev fixture-cache wrapper from the production structured LLM `/chat` adapter in [`mixins/llm_agent.py`](./mixins/llm_agent.py), while keeping `llm_fixture_cache` available for explicit test-only use.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_llm_agent_injection.py extensions/business/cybersec/red_mesh/tests/test_llm_fixture_cache.py extensions/business/cybersec/red_mesh/tests/test_llm_structured_service.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_validator.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_structured_report.py extensions/business/cybersec/red_mesh/tests/test_llm_agent_shape.py extensions/business/cybersec/red_mesh/tests/test_llm_input_isolation.py extensions/business/cybersec/red_mesh/tests/test_llm_output_validator.py -q` passed with 107 tests and 6 subtests.
+- Horizontal insight: production LLM availability must not depend on `LIVE_LLM` or checked-in prompt fixtures; fixture replay belongs at explicit test boundaries, not inside runtime adapters.
+
+### 2026-05-07T13:08:47Z
+
+- Change: added deterministic packed participant-node IP metadata for RedMesh test/pass attestations. Each worker contributes one obfuscated bytes2 value and the packed form concatenates them, e.g. `0x0a030a040000`.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_hardening.py -q` passed with 15 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 101 tests.
+- Horizontal insight: until the on-chain attestation contract accepts participant IP bytes directly, RedMesh should preserve full participant-IP evidence in attestation metadata/timeline/archive without changing deployed contract function signatures.
+
+### 2026-05-07T19:12:33Z
+
+- Change: reverted the packed participant-node IP metadata implementation from RedMesh test/pass attestation records after confirming the current on-chain `ipObfuscated` field already represents the scanned target.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_hardening.py -q` passed with 14 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests/test_api.py -q` passed with 100 tests.
+- Horizontal insight: keep the current distinction clear: `ip_obfuscated` is target IP obfuscation, while participant node IPs should only be reintroduced if the attestation contract/event schema explicitly requires them.
+
+### 2026-05-09T14:09:57Z
+
+- Change: introduced the first SOC/SIEM delivery boundary for canonical `redmesh.event.v1` events: Wazuh/generic SIEM HTTP JSON and syslog JSON delivery, bounded retries, idempotency headers/fields, HMAC signing, redacted failed-payload artifacts, and per-integration status updates.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_log_export.py extensions/business/cybersec/red_mesh/tests/test_wazuh_export.py extensions/business/cybersec/red_mesh/tests/test_integration_status.py extensions/business/cybersec/red_mesh/tests/test_integration_config.py -q` passed with 23 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed with 1205 tests, 1 skipped, 3 warnings, and 6 subtests.
+- Horizontal insight: SOC adapters should remain isolated delivery boundaries fed by the canonical event contract; missing signing/configuration dependencies must be visible in integration status and must not block scan execution.
+
+### 2026-05-09T14:22:55Z
+
+- Change: added non-blocking SOC event hooks for launcher job-start events, pass completion, finding creation/triage, MISP export status, attestation status, and hard/terminal stop paths. Job/archive/stub models now preserve summary-only `soc_event_status`.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_event_lifecycle_hooks.py extensions/business/cybersec/red_mesh/tests/test_misp_export.py extensions/business/cybersec/red_mesh/tests/test_state_machine.py extensions/business/cybersec/red_mesh/tests/test_finalization_aggregation.py extensions/business/cybersec/red_mesh/tests/test_api.py extensions/business/cybersec/red_mesh/tests/test_integration.py extensions/business/cybersec/red_mesh/tests/test_regressions.py extensions/business/cybersec/red_mesh/tests/test_repositories.py -q` passed with 224 tests; `python -m pytest extensions/business/cybersec/red_mesh/tests -q` passed with 1211 tests, 1 skipped, 3 warnings, and 6 subtests.
+- Horizontal insight: lifecycle hooks should mutate only summary status and call isolated adapters through `services/event_hooks.py`; hook failures must degrade to SOC status/timeline metadata, never scan lifecycle exceptions.
+
+### 2026-05-13T20:45:39Z
+
+- Change: hardened OWASP API Top 10 graybox launch/runtime contracts: regular bearer/API-key credentials now flow through the existing encrypted `secret_ref` lane, secret refs fail closed when kind/storage/job ownership is invalid, API-native sessions validate with configured authenticated requests, and flat finding identity includes `scenario_id` plus endpoint evidence.
+- Change: API probe families now emit explicit `INFO/inconclusive` findings for missing target inventory, require low-privilege sessions for BOLA/API6 checks, gate higher-risk API4/API8 probes behind operator opt-ins, and treat mutated-but-unverified stateful checks as inconclusive rather than clean.
+- Verification: `python -m pytest extensions/business/cybersec/red_mesh/tests/test_secret_isolation.py extensions/business/cybersec/red_mesh/tests/test_api.py extensions/business/cybersec/red_mesh/tests/test_auth.py extensions/business/cybersec/red_mesh/tests/test_target_config.py extensions/business/cybersec/red_mesh/tests/test_graybox_finding.py extensions/business/cybersec/red_mesh/tests/test_stateful_contract.py extensions/business/cybersec/red_mesh/tests/test_probes_api_access.py extensions/business/cybersec/red_mesh/tests/test_probes_api_data.py extensions/business/cybersec/red_mesh/tests/test_probes_api_abuse.py extensions/business/cybersec/red_mesh/tests/test_probes_api_config.py extensions/business/cybersec/red_mesh/tests/test_probes_api_auth.py extensions/business/cybersec/red_mesh/tests/test_finalization_aggregation.py extensions/business/cybersec/red_mesh/tests/test_findings_redaction.py -q` passed with 302 tests and 10 subtests.
+- Horizontal insight: API Top 10 graybox coverage is only meaningful when skipped scenarios are reported, low-privilege principals are real, and secret/runtime config boundaries line up from Navigator launch through worker resume and archive/report flattening.
+
+### 2026-06-04T18:45:00Z
+
+- Change: moved local CyberSecQwen structured report generation to local-only, schema-free chunks in [`services/llm_structured.py`](./services/llm_structured.py) and kept remote-provider structured output behavior unchanged.
+- Change: [`mixins/redmesh_llm_agent.py`](./mixins/redmesh_llm_agent.py) now omits `response_format` for local structured chunks, caps local chunk wrapper calls at 120s, and persists chunk failure diagnostics without hiding completed scan findings.
+- Verification: live rm3 precheck before implementation completed schema-free chunks in `61.892s`, `79.903s`, and `62.033s`; post-implementation live rm3 generation completed chunks in `77.623s`, `89.560s`, and `78.467s` with `response_format_seen=false`, final validation ok, `5090/metrics.requests_active=0`, and no grammar/schema parse errors in logs.
+- Verification: `docker exec rm3 bash -lc 'cd /edge_node && python3 -m unittest extensions.business.cybersec.red_mesh.tests.test_llm_structured_service extensions.business.cybersec.red_mesh.tests.test_llm_agent_structured_report extensions.business.cybersec.red_mesh.tests.test_redmesh_llm_agent_api_provider'` passed with 43 tests; API Top10 vulnerable e2e job `2e7fb6a6` passed with 44 findings and persisted separate `llm_report_sections`.
+- Horizontal insight: local CPU LLM report generation should be treated as a constrained orchestration path, not as a smaller copy of remote structured-output prompting; keep schema enforcement in Python and preserve scan findings independently from AI report success.
+
+### 2026-05-14T05:14:40Z
+
+- Change: closed a secret-ref ownership gap in OWASP API Top 10 graybox worker startup by passing the expected job id explicitly into secret resolution before `JobConfig` coercion can drop non-archived fields.
+- Change: moved `PT-OAPI5-03` method-override control traffic fully under the `run_stateful()` gate, so `allow_stateful_probes=false` prevents all mutating requests, and added specific inconclusive-reason callbacks for stateful probes that need attribution-preserving outcomes.
+- Change: bounded API4 high-limit probing at an effective request limit of `1000` and changed API3 mass-assignment rollback to fail when the probe introduced a previously absent field instead of writing `false` and claiming rollback success.
+- Verification: targeted API/graybox suite passed with `306 passed, 10 subtests`; broad `extensions/business/cybersec/red_mesh/tests -q` run passed `1461` tests and `36` subtests with one unrelated pre-existing failure for missing `docs/suricata-security-onion-examples.md`.
+- Horizontal insight: RedMesh stateful probe safety must be enforced at the first target-mutating byte, not only around the vulnerability-attribution request; request-count budgets also need per-request work bounds for resource-consumption probes.

@@ -1,5 +1,3 @@
-from ratio1.ipfs import R1FSEngine
-
 from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess
 from transformers import AutoTokenizer, AutoModel
 import re
@@ -7,9 +5,7 @@ import pickle
 from pypdf import PdfReader
 from docx import Document
 
-from docarray import BaseDoc, DocList
-from docarray.typing import NdArray
-from vectordb import HNSWVectorDB
+from extensions.utils.faiss_vectordb import FaissVectorDB
 
 
 """
@@ -66,9 +62,6 @@ _CONFIG = {
   'MAX_BATCH_SIZE': 32,
 
   "SUPPORTED_REQUEST_TYPES": DocEmbCt.REQUEST_TYPES,
-  # TODO: activate this after fixing r1fs init in base_serving_process
-  #  (fix log parameter name)
-  "R1FS_ENABLED": False,
 
   'VALIDATION_RULES': {
     **BaseServingProcess.CONFIG['VALIDATION_RULES'],
@@ -76,15 +69,6 @@ _CONFIG = {
 
 }
 
-
-class NaeuralDoc(BaseDoc):
-  # TODO: find how the size of this can be configurable in case of different model.
-  #  this should be done at initialization time only in order to avoid vectordb issues.
-  # TODO: encrypt the text for db and decrypt it when needed.
-  text: str = ''
-  embedding: NdArray[DOC_EMBEDDING_SIZE]
-  idx: int = -1
-# endclass
 
 
 class DocSplitter:
@@ -241,18 +225,23 @@ class BaseDocEmbServing(BaseServingProcess):
       embedding_size = saved_data.get('embedding_size', None)
       for context in contexts:
         if context not in self.__dbs:
-          self.__dbs[context] = HNSWVectorDB[NaeuralDoc](workspace=self.__db_cache_workspace(context))
+          self.__dbs[context] = FaissVectorDB(workspace=self.__db_cache_workspace(context), embedding_size=DOC_EMBEDDING_SIZE)
         # endif sanity check in case of db already loaded
       # endfor each context
     # endif saved data available
     return
 
   def on_init(self):
+    """Finalize document-embedding startup after the base serving initialization.
+
+    Returns
+    -------
+    None
+        The method restores persisted vector database state in-place.
+    """
+
     super(BaseDocEmbServing, self).on_init()
     self.__maybe_load_backup()
-    self.r1fs = R1FSEngine(
-      logger=self.log
-    )
     return
 
   def _setup_llm(self):
@@ -744,21 +733,19 @@ class BaseDocEmbServing(BaseServingProcess):
       # endif context is None
       if context not in self.__dbs:
         self.P(f"Creating new context: {context}")
-        self.__dbs[context] = HNSWVectorDB[NaeuralDoc](
-          workspace=self.__db_cache_workspace(context)
-        )
+        self.__dbs[context] = FaissVectorDB(workspace=self.__db_cache_workspace(context), embedding_size=DOC_EMBEDDING_SIZE)
         self.__backup_contexts()
       # endif context not in dbs
       segments = self.__doc_splitter.split_documents(docs)
       segments_embeddings = self.embed_texts(segments)
-      curr_size = self.__dbs[context].num_docs()['num_docs']
+      curr_size = self.__dbs[context].num_docs()
       lst_docs = [
-        NaeuralDoc(text=segment, embedding=emb, idx=curr_size + i)
+        {"text": segment, "embedding": emb, "idx": curr_size + i}
         for i, (segment, emb) in enumerate(zip(segments, segments_embeddings))
       ]
       # TODO: maybe check for duplicates
       self.P(f"Indexing {len(lst_docs)} documents in context '{context}'...")
-      self.__dbs[context].index(inputs=DocList[NaeuralDoc](lst_docs))
+      self.__dbs[context].index(lst_docs)
       return
 
     def get_result_dict(self, request_id, docs=None, query=None, context_list=None, error_message=None, **kwargs):
@@ -860,22 +847,13 @@ class BaseDocEmbServing(BaseServingProcess):
           # endif context not in dbs
           # Embed the query.
           query_embedding = self.embed_texts(query)
-          query_doc = NaeuralDoc(text=query, embedding=query_embedding, idx=-1)
           # Search for the closest documents.
           self.P(f"Searching for the closest {k} documents to the query in context '{context}'...")
-          search_results = self.__dbs[context].search(
-            inputs=DocList[NaeuralDoc]([query_doc]), limit=k
-          )[0]
+          search_results = self.__dbs[context].search(query_embedding, limit=k)
           self.P(f"Search results: {search_results}")
-          matches, scores = search_results.matches, search_results.scores
-          matches_with_scores = [
-            (match, score) for match, score in zip(matches, scores)
-          ]
-          matches_ordered_by_idx = sorted(matches_with_scores, key=lambda x: x[0].idx)
-          # Sort the results by the index.
-          result_texts = [
-            res[0].text for res in matches_ordered_by_idx
-          ]
+          # Sort the results by the document index.
+          results_ordered_by_idx = sorted(search_results, key=lambda r: r.idx)
+          result_texts = [r.text for r in results_ordered_by_idx]
           self.P(f"Result texts: {result_texts}")
           results.append(
             self.get_result_dict(request_id=req_id, docs=result_texts, query=query)
@@ -908,4 +886,3 @@ class BaseDocEmbServing(BaseServingProcess):
     # endfor each total input
     return final_result
 # endclass BaseDocEmbServing
-

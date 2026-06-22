@@ -10,6 +10,8 @@ This plugin:
   - Streams logs and manages tunnel lifecycle through the base runner
 """
 
+import shlex
+
 import requests
 from urllib.parse import urlsplit
 
@@ -30,7 +32,9 @@ _CONFIG = {
 
   "CAR_VERBOSE": 10,
   "IMAGE": "node:22",
-  "CONTAINER_START_COMMAND": ["sh", "-c", "while true; do sleep 3600; done"],
+  "CONTAINER_ENTRYPOINT": "sh",
+  "CONTAINER_START_COMMAND": ["-c", "while true; do sleep 3600; done"],
+  "CONTAINER_USER": "root",
   "BUILD_AND_RUN_COMMANDS": ["npm install", "npm run build", "npm start"],
   "SETUP_REPO": True, # defines if we have to set up the repo (should add git clone commands or not)
 
@@ -43,6 +47,7 @@ _CONFIG = {
     "REPO_URL": None,
     "BRANCH": "main",
     "POLL_INTERVAL": 60,
+    "RATE_LIMIT_BACKOFF": 5 * 60,
   },
 
   # Disable image auto-update; Git monitoring drives restarts
@@ -97,6 +102,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     self.branch = None
     self.repo_url = None
     self._last_git_check = 0
+    self._git_backoff_until = 0
     self._repo_configured = False
     self._repo_owner = None
     self._repo_name = None
@@ -207,6 +213,16 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     inner_block = " ".join(f"{part};" for part in checks) + " fi;"
     return f"if ! command -v git >/dev/null 2>&1; then {inner_block} fi"
 
+  def _build_git_clone_command(self, repo_path):
+    repo_url = shlex.quote(self.repo_url)
+    repo_path = shlex.quote(repo_path)
+    if self.branch:
+      branch = shlex.quote(self.branch)
+      # Fetch only the configured branch; this keeps startup clones smaller
+      # and avoids accidentally running code from a different branch.
+      return f"git clone --branch {branch} --single-branch {repo_url} {repo_path}"
+    return f"git clone {repo_url} {repo_path}"
+
   def _collect_exec_commands(self):
     """
     Collect commands to execute inside container.
@@ -237,7 +253,7 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     ]
     if self.cfg_setup_repo:
       commands.append(f"rm -rf {repo_path}")
-      commands.append(f"git clone {self.repo_url} {repo_path}")
+      commands.append(self._build_git_clone_command(repo_path))
     # endif
     # last_commit = commit
     commands.extend([f"cd {repo_path} && {cmd}" for cmd in base_commands])
@@ -259,6 +275,11 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     StopReason or None
         StopReason.EXTERNAL_UPDATE if new commit detected, None otherwise
     """
+    sync_reason = super()._perform_additional_checks(current_time)
+    if sync_reason:
+      return sync_reason
+    if getattr(self, "_reset_processed_this_tick", False):
+      return None
     return self._check_git_updates(current_time)
 
   def _check_git_updates(self, current_time=None):
@@ -279,21 +300,19 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       return None
 
     self._last_git_check = current_time
+    previous_commit = self.current_commit
     latest_commit = self._get_latest_commit()
 
     if not latest_commit:
       return None
 
-    if self.current_commit and latest_commit != self.current_commit:
+    if previous_commit and latest_commit != previous_commit:
       self.P(
-        f"New commit detected ({latest_commit[:7]} != {self.current_commit[:7]}). Restart required.",
+        f"New commit detected ({latest_commit[:7]} != {previous_commit[:7]}). Restart required.",
         color='y',
       )
-      self.current_commit = latest_commit
       return StopReason.EXTERNAL_UPDATE  # Git update triggers external update restart
     else:
-      if not self.current_commit:
-        self.current_commit = latest_commit
       self.P(f"Commit check ({self.branch}): {latest_commit}", color='d')
     return None
 
@@ -338,8 +357,9 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     self._configure_repo_url()
 
     latest_commit = self._get_latest_commit()
+    self._last_git_check = self.time()
+
     if latest_commit:
-      self.current_commit = latest_commit
       self.P(f"Latest commit on {self.branch}: {latest_commit}", color='d')
     else:
       self.P("Unable to determine latest commit during initialization", color='y')
@@ -368,8 +388,10 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     username = vcs_data.get('USERNAME')
     token = vcs_data.get('TOKEN')
 
-    owner = self._repo_owner
-    repo = self._repo_name
+    owner = getattr(self, "_repo_owner", None)
+    repo = getattr(self, "_repo_name", None)
+    if not owner or not repo:
+      owner, repo = self._extract_repo_identifier(vcs_data)
 
     if not owner or not repo:
       self.repo_url = None
@@ -407,8 +429,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
     """
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
     repo_branch = vcs_data.get('BRANCH')
-    repo_owner = self._repo_owner or vcs_data.get('REPO_OWNER')
-    repo_name = self._repo_name or vcs_data.get('REPO_NAME')
+    repo_owner = getattr(self, "_repo_owner", None) or vcs_data.get('REPO_OWNER')
+    repo_name = getattr(self, "_repo_name", None) or vcs_data.get('REPO_NAME')
 
     self.branch = repo_branch or self.branch
 
@@ -429,8 +451,8 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
   def _get_latest_commit(self, return_data=False):
     vcs_data = getattr(self, 'cfg_vcs_data', {}) or {}
-    repo_owner = self._repo_owner or vcs_data.get('REPO_OWNER')
-    repo_name = self._repo_name or vcs_data.get('REPO_NAME')
+    repo_owner = getattr(self, "_repo_owner", None) or vcs_data.get('REPO_OWNER')
+    repo_name = getattr(self, "_repo_name", None) or vcs_data.get('REPO_NAME')
     token = vcs_data.get('TOKEN')
 
     if not repo_owner or not repo_name:
@@ -444,6 +466,9 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
 
     headers = {"Authorization": f"token {token}"} if token else {}
 
+    if self.time() < self._git_backoff_until:
+      return (None, None) if return_data else None
+
     try:
       self.Pd(f"Commit check URL: {api_url}", score=5, color='b')
       resp = requests.get(api_url, headers=headers, timeout=10)
@@ -451,13 +476,17 @@ class WorkerAppRunnerPlugin(ContainerAppRunnerPlugin):
       if resp.status_code == 200:
         data = resp.json()
         latest_sha = data.get("commit", {}).get("sha", None)
+        if latest_sha:
+          self.current_commit = latest_sha
         if return_data:
           return latest_sha, data
         return latest_sha
       if resp.status_code == 404:
         self.P(f"Repository or branch not found: {api_url}", color='r')
       elif resp.status_code == 403:
-        self.P("GitHub API rate limit exceeded or access denied", color='r')
+        vcs_backoff = (getattr(self, 'cfg_vcs_data', {}) or {}).get('RATE_LIMIT_BACKOFF', 300)
+        self._git_backoff_until = self.time() + vcs_backoff
+        self.P(f"GitHub API rate limit exceeded or access denied. Backing off for {vcs_backoff}s.", color='r')
       else:
         self.P(f"Failed to fetch latest commit (HTTP {resp.status_code}): {resp.text}", color='r')
     except requests.RequestException as exc:

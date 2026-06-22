@@ -21,6 +21,10 @@ AI_ENGINES['llama_cpp_large'] = {
   'SERVING_PROCESS': 'llama_cpp_llama_8b'
 }
 
+AI_ENGINES['cybersec_qwen_4b'] = {
+  'SERVING_PROCESS': 'llama_cpp_cybersec_qwen_4b'
+}
+
 AI_ENGINES['llm_reason'] = {
   'SERVING_PROCESS': 'deepseek_r1_qwen_7b'
 }
@@ -49,6 +53,15 @@ AI_ENGINES['doc_embed'] = {
   'SERVING_PROCESS': 'mxbai_embed'
 }
 
+
+AI_ENGINES['text_classifier'] = {
+  'SERVING_PROCESS': 'th_text_classifier'
+}
+
+AI_ENGINES['privacy_filter'] = {
+  'SERVING_PROCESS': 'th_privacy_filter'
+}
+
 # AI_ENGINES['cerviguard_analyzer'] = {
 #   'SERVING_PROCESS': 'cerviguard_image_analyzer'
 # }
@@ -56,4 +69,3 @@ AI_ENGINES['doc_embed'] = {
 AI_ENGINES['aspire_analyzer'] = {
   'SERVING_PROCESS': 'aspire_analyzer'
 }
-
