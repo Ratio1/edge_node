@@ -106,6 +106,37 @@ class DeeployPreferredNodesEndpointTests(unittest.TestCase):
     self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.FAIL)
     self.assertIn("Plus+", res[DEEPLOY_KEYS.ERROR])
 
+  def test_reconcile_csp_escrow_jobs_moves_preferred_nodes(self):
+    plugin = make_endpoint_plugin()
+    payload = json.dumps({
+      "version": 1,
+      "nodes": [
+        {
+          "address": "0xai_node_alpha",
+          "alias": "Alpha",
+        },
+      ],
+    })
+    plugin._chainstore[("plus_preferred_nodes", "0xold")] = payload
+    plugin.bc = type("BCStub", (), {
+      "get_csp_escrow_owner_transfer_from_tx": lambda self, tx_hash, log_index=None: {
+        "escrow": "0xEscrow",
+        "old_owner": "0xOld",
+        "new_owner": "0xNew",
+        "tx_hash": tx_hash,
+        "log_index": log_index,
+      },
+      "get_escrow_active_jobs": lambda self, escrow: [],
+    })()
+
+    res = plugin.reconcile_csp_escrow_jobs({"tx_hash": "0xTx"})
+
+    self.assertEqual(res[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.SUCCESS)
+    self.assertEqual(res["preferred_nodes_migration"][DEEPLOY_KEYS.STATUS], "moved")
+    self.assertIsNone(plugin._chainstore[("plus_preferred_nodes", "0xold")])
+    self.assertEqual(plugin._chainstore[("plus_preferred_nodes", "0xnew")], payload)
+    self.assertEqual(res[DEEPLOY_KEYS.RESULTS], {})
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -45,6 +45,13 @@ class ArtifactRepository:
     if isinstance(job_config, JobConfig):
       payload = job_config.to_dict()
     else:
+      if isinstance(job_config, dict) and job_config.get("job_type") == "model_test":
+        from ..model_testing.artifacts import ModelTestArtifactRepository
+
+        return ModelTestArtifactRepository(self.owner).put_job_config(
+          job_config,
+          show_logs=show_logs,
+        )
       payload = JobConfig.from_dict(_coerce_job_config_dict(job_config)).to_dict()
     return self.put_json(payload, show_logs=show_logs)
 

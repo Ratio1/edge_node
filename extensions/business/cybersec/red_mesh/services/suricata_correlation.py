@@ -9,6 +9,7 @@ from ..repositories import ArtifactRepository, JobStateRepository
 from .config import get_suricata_correlation_config
 from .event_redaction import stable_hmac_pseudonym
 from .integration_status import record_integration_status
+from .scan_guards import reject_model_test_for_scan_operation
 
 
 DETECTION_CORRELATION_SCHEMA_VERSION = "1.0.0"
@@ -230,6 +231,9 @@ def get_detection_correlation(owner, job_id):
   job_specs = owner._get_job_from_cstore(job_id)
   if not isinstance(job_specs, dict):
     return {"job_id": job_id, "found": False, "status": "not_found"}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "detection_correlation")
+  if unsupported:
+    return {**unsupported, "found": True}
   summary = job_specs.get("detection_correlation")
   return {
     "job_id": job_id,
@@ -243,6 +247,9 @@ def correlate_suricata_eve(owner, job_id, *, eve_jsonl="", pass_nr=None, source_
   if not isinstance(job_specs, dict):
     record_integration_status(owner, "suricata", outcome="failure", error_class="job_not_found")
     return {"status": "error", "error": "job_not_found", "job_id": job_id}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "detection_correlation")
+  if unsupported:
+    return unsupported
 
   cfg = get_suricata_correlation_config(owner)
   hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-suricata-correlation")

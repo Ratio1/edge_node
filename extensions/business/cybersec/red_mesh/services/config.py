@@ -1,3 +1,4 @@
+from math import isfinite
 from urllib.parse import urlsplit
 
 
@@ -134,6 +135,27 @@ DEFAULT_TAXII_EXPORT_CONFIG = {
   "TIMEOUT_SECONDS": 30.0,
 }
 
+DEFAULT_MODEL_TESTING_CONFIG = {
+  "ENABLED": False,
+  "RAW_EVIDENCE_ENABLED": False,
+  "RAW_EVALUATOR_EVIDENCE_ENABLED": False,
+  "RAW_EVIDENCE_DEFAULT_RETENTION_DAYS": 7,
+  "RAW_EVIDENCE_MAX_RETENTION_DAYS": 30,
+  "RAW_EVIDENCE_SECRET_REF": "",
+  "REMOTE_PROVIDER_URLS_ENABLED": True,
+  "REMOTE_PROVIDER_PREFLIGHT_ENABLED": True,
+  "DEFAULT_EVALUATOR_MODEL": None,
+  "LIMITS": {
+    "MAX_CASES": 12,
+    "TESTED_MAX_TOKENS": 256,
+    "EVALUATOR_MAX_TOKENS": 384,
+    "PER_CALL_TIMEOUT_SECONDS": 45,
+    "TOTAL_TIMEOUT_SECONDS": 600,
+    "TEMPERATURE": 0,
+    "MAX_RETRIES": 1,
+  },
+}
+
 _WAZUH_AUTH_MODES = {"static", "wazuh_jwt"}
 _TAXII_AUTH_MODES = {"static", "basic"}
 _OPENCTI_AUTH_MODES = {"static"}
@@ -168,12 +190,16 @@ def _bounded_int(value, default, *, minimum=None, maximum=None):
   return result
 
 
-def _bounded_float(value, default, *, minimum=None):
+def _bounded_float(value, default, *, minimum=None, maximum=None):
   try:
     result = float(value)
   except (TypeError, ValueError):
     return default
+  if not isfinite(result):
+    return default
   if minimum is not None and result < minimum:
+    return default
+  if maximum is not None and result > maximum:
     return default
   return result
 
@@ -345,6 +371,105 @@ def get_graybox_budgets_config(owner):
     owner,
     "GRAYBOX_BUDGETS",
     DEFAULT_GRAYBOX_BUDGETS_CONFIG,
+    normalizer=_normalize,
+  )
+
+
+def get_model_testing_config(owner):
+  """Return normalized Model Testing capability config."""
+  def _normalize_limits(value, defaults):
+    raw_limits = value if isinstance(value, dict) else {}
+    default_limits = defaults["LIMITS"]
+    return {
+      "MAX_CASES": _bounded_int(
+        raw_limits.get("MAX_CASES", default_limits["MAX_CASES"]),
+        default_limits["MAX_CASES"],
+        minimum=1,
+        maximum=12,
+      ),
+      "TESTED_MAX_TOKENS": _bounded_int(
+        raw_limits.get("TESTED_MAX_TOKENS", default_limits["TESTED_MAX_TOKENS"]),
+        default_limits["TESTED_MAX_TOKENS"],
+        minimum=1,
+        maximum=256,
+      ),
+      "EVALUATOR_MAX_TOKENS": _bounded_int(
+        raw_limits.get("EVALUATOR_MAX_TOKENS", default_limits["EVALUATOR_MAX_TOKENS"]),
+        default_limits["EVALUATOR_MAX_TOKENS"],
+        minimum=1,
+        maximum=384,
+      ),
+      "PER_CALL_TIMEOUT_SECONDS": _bounded_int(
+        raw_limits.get("PER_CALL_TIMEOUT_SECONDS", default_limits["PER_CALL_TIMEOUT_SECONDS"]),
+        default_limits["PER_CALL_TIMEOUT_SECONDS"],
+        minimum=1,
+        maximum=45,
+      ),
+      "TOTAL_TIMEOUT_SECONDS": _bounded_int(
+        raw_limits.get("TOTAL_TIMEOUT_SECONDS", default_limits["TOTAL_TIMEOUT_SECONDS"]),
+        default_limits["TOTAL_TIMEOUT_SECONDS"],
+        minimum=1,
+        maximum=600,
+      ),
+      "TEMPERATURE": _bounded_float(
+        raw_limits.get("TEMPERATURE", default_limits["TEMPERATURE"]),
+        default_limits["TEMPERATURE"],
+        minimum=0,
+        maximum=0,
+      ),
+      "MAX_RETRIES": _bounded_int(
+        raw_limits.get("MAX_RETRIES", default_limits["MAX_RETRIES"]),
+        default_limits["MAX_RETRIES"],
+        minimum=0,
+        maximum=1,
+      ),
+    }
+
+  def _normalize(merged, defaults):
+    default_retention = _bounded_int(
+      merged.get("RAW_EVIDENCE_DEFAULT_RETENTION_DAYS"),
+      defaults["RAW_EVIDENCE_DEFAULT_RETENTION_DAYS"],
+      minimum=1,
+      maximum=30,
+    )
+    max_retention = _bounded_int(
+      merged.get("RAW_EVIDENCE_MAX_RETENTION_DAYS"),
+      defaults["RAW_EVIDENCE_MAX_RETENTION_DAYS"],
+      minimum=1,
+      maximum=30,
+    )
+    if default_retention > max_retention:
+      default_retention = max_retention
+    default_evaluator = merged.get("DEFAULT_EVALUATOR_MODEL")
+    if not isinstance(default_evaluator, dict):
+      default_evaluator = None
+    return {
+      "ENABLED": bool(merged.get("ENABLED", defaults["ENABLED"])),
+      "RAW_EVIDENCE_ENABLED": bool(
+        merged.get("RAW_EVIDENCE_ENABLED", defaults["RAW_EVIDENCE_ENABLED"])
+      ),
+      "RAW_EVALUATOR_EVIDENCE_ENABLED": bool(
+        merged.get("RAW_EVALUATOR_EVIDENCE_ENABLED", defaults["RAW_EVALUATOR_EVIDENCE_ENABLED"])
+      ),
+      "RAW_EVIDENCE_DEFAULT_RETENTION_DAYS": default_retention,
+      "RAW_EVIDENCE_MAX_RETENTION_DAYS": max_retention,
+      "RAW_EVIDENCE_SECRET_REF": str(
+        merged.get("RAW_EVIDENCE_SECRET_REF") or defaults["RAW_EVIDENCE_SECRET_REF"]
+      ).strip(),
+      "REMOTE_PROVIDER_URLS_ENABLED": bool(
+        merged.get("REMOTE_PROVIDER_URLS_ENABLED", defaults["REMOTE_PROVIDER_URLS_ENABLED"])
+      ),
+      "REMOTE_PROVIDER_PREFLIGHT_ENABLED": bool(
+        merged.get("REMOTE_PROVIDER_PREFLIGHT_ENABLED", defaults["REMOTE_PROVIDER_PREFLIGHT_ENABLED"])
+      ),
+      "DEFAULT_EVALUATOR_MODEL": default_evaluator,
+      "LIMITS": _normalize_limits(merged.get("LIMITS"), defaults),
+    }
+
+  return resolve_config_block(
+    owner,
+    "MODEL_TESTING",
+    DEFAULT_MODEL_TESTING_CONFIG,
     normalizer=_normalize,
   )
 

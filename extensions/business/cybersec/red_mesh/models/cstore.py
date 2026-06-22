@@ -13,6 +13,13 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 
 from extensions.business.cybersec.red_mesh.models.shared import _strip_none
+from extensions.business.cybersec.red_mesh.model_test_sanitization import (
+  MODEL_TEST_JOB_TYPE,
+  MODEL_TEST_PROGRESS_SCHEMA,
+  sanitize_model_test_error_class,
+  sanitize_model_test_results,
+  sanitize_model_test_summary,
+)
 
 
 @dataclass(frozen=True)
@@ -44,6 +51,8 @@ class CStoreWorker:
   budget_scope: str = None
   assignment_hash: str = None
   stateful_policy: str = None
+  worker_type: str = None
+  model_test_worker_status: str = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -71,6 +80,8 @@ class CStoreWorker:
       budget_scope=d.get("budget_scope"),
       assignment_hash=d.get("assignment_hash"),
       stateful_policy=d.get("stateful_policy"),
+      worker_type=d.get("worker_type"),
+      model_test_worker_status=d.get("model_test_worker_status"),
     )
 
 
@@ -129,6 +140,9 @@ class CStoreJobRunning:
   opencti_export: dict = None
   taxii_export: dict = None
   graybox_assignment_summary: dict = None
+  job_type: str = None
+  model_test_summary: dict = None
+  model_test_node_selection: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -164,6 +178,9 @@ class CStoreJobRunning:
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
       graybox_assignment_summary=d.get("graybox_assignment_summary"),
+      job_type=d.get("job_type"),
+      model_test_summary=d.get("model_test_summary"),
+      model_test_node_selection=d.get("model_test_node_selection"),
     )
 
 
@@ -201,6 +218,9 @@ class CStoreJobFinalized:
   opencti_export: dict = None
   taxii_export: dict = None
   graybox_assignment_summary: dict = None
+  job_type: str = None
+  model_test_summary: dict = None
+  model_test_node_selection: dict = None
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -234,6 +254,9 @@ class CStoreJobFinalized:
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
       graybox_assignment_summary=d.get("graybox_assignment_summary"),
+      job_type=d.get("job_type"),
+      model_test_summary=d.get("model_test_summary"),
+      model_test_node_selection=d.get("model_test_node_selection"),
     )
 
 
@@ -261,20 +284,53 @@ class WorkerProgress:
   open_ports_found: list            # [int] — discovered so far
   completed_tests: list             # [str] — which probes finished
   updated_at: float                 # unix timestamp
+  event_id: str = None
+  progress_sequence: int = 0
   started_at: float = None
   first_seen_live_at: float = None
   last_seen_at: float = None
   error: str = None
+  error_class: str = None
+  error_message: str = None
   report_cid: str = None
-  scan_type: str = "network"        # network | webapp
+  scan_type: str = "network"        # network | webapp | model_test compatibility shim
+  job_type: str = None
+  schema_version: str = None
   phase_index: int = 0              # 1-based current stage index; 0 when unknown
   total_phases: int = 0             # number of stages in the active phase family
   finished: bool = False
+  canceled: bool = False
   live_metrics: dict = None         # ScanMetrics.to_dict() — partial snapshot, progressively fills in
+  model_test_results: dict = None
+  model_test_summary: dict = None
   threads: dict = None              # {thread_id: {phase, ports_scanned, ports_total, open_ports_found}}
 
   def to_dict(self) -> dict:
-    return _strip_none(asdict(self))
+    payload = asdict(self)
+    if self._is_model_test_progress():
+      payload["scan_type"] = MODEL_TEST_JOB_TYPE
+      payload["job_type"] = MODEL_TEST_JOB_TYPE
+      payload["schema_version"] = payload.get("schema_version") or MODEL_TEST_PROGRESS_SCHEMA
+      payload["ports_scanned"] = 0
+      payload["ports_total"] = 0
+      payload["open_ports_found"] = []
+      payload["model_test_results"] = sanitize_model_test_results(payload.get("model_test_results"))
+      payload["model_test_summary"] = sanitize_model_test_summary(payload.get("model_test_summary"))
+      error_class = sanitize_model_test_error_class(payload.get("error_class"))
+      if error_class:
+        payload["error_class"] = error_class
+      else:
+        payload.pop("error_class", None)
+      payload.pop("error", None)
+      payload.pop("error_message", None)
+    return _strip_none(payload)
+
+  def _is_model_test_progress(self) -> bool:
+    return (
+      self.job_type == MODEL_TEST_JOB_TYPE
+      or self.scan_type == MODEL_TEST_JOB_TYPE
+      or self.schema_version == MODEL_TEST_PROGRESS_SCHEMA
+    )
 
   @classmethod
   def from_dict(cls, d: dict) -> WorkerProgress:
@@ -283,14 +339,20 @@ class WorkerProgress:
       worker_addr=d["worker_addr"],
       pass_nr=d.get("pass_nr", 1),
       assignment_revision_seen=d.get("assignment_revision_seen", 1),
+      event_id=d.get("event_id"),
+      progress_sequence=d.get("progress_sequence", 0),
       progress=d.get("progress", 0),
       phase=d.get("phase", ""),
       started_at=d.get("started_at"),
       first_seen_live_at=d.get("first_seen_live_at"),
       last_seen_at=d.get("last_seen_at", d.get("updated_at", 0)),
       error=d.get("error"),
+      error_class=d.get("error_class"),
+      error_message=d.get("error_message"),
       report_cid=d.get("report_cid"),
       scan_type=d.get("scan_type", "network"),
+      job_type=d.get("job_type"),
+      schema_version=d.get("schema_version"),
       phase_index=d.get("phase_index", 0),
       total_phases=d.get("total_phases", 0),
       ports_scanned=d.get("ports_scanned", 0),
@@ -299,6 +361,9 @@ class WorkerProgress:
       completed_tests=d.get("completed_tests", []),
       updated_at=d.get("updated_at", 0),
       finished=d.get("finished", False),
+      canceled=d.get("canceled", False),
       live_metrics=d.get("live_metrics"),
+      model_test_results=d.get("model_test_results"),
+      model_test_summary=d.get("model_test_summary"),
       threads=d.get("threads"),
     )

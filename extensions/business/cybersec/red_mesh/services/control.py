@@ -5,6 +5,11 @@ from ..constants import (
   JOB_STATUS_STOPPED,
   RUN_MODE_CONTINUOUS_MONITORING,
 )
+from ..model_testing.constants import (
+  MODEL_TEST_ERROR_CANCELED_BY_USER,
+  is_model_test_job,
+  selected_model_test_worker_addr,
+)
 from ..repositories import ArtifactRepository, JobStateRepository
 from .event_hooks import emit_lifecycle_event
 from .secrets import collect_secret_refs_from_job_config
@@ -59,11 +64,23 @@ def stop_and_delete_job(owner, job_id: str):
   if isinstance(raw_job_specs, dict):
     _, job_specs = owner._normalize_job_record(job_id, raw_job_specs)
     workers_map = job_specs.setdefault("workers", {})
-    workers_map.setdefault(owner.ee_addr, {})
+    if is_model_test_job(job_specs):
+      selected_worker = selected_model_test_worker_addr(job_specs, fallback=getattr(owner, "ee_addr", None))
+      if selected_worker:
+        workers_map.setdefault(selected_worker, {})
+      local_model_worker = getattr(owner, "model_test_jobs", {}).get(job_id)
+      if local_model_worker:
+        local_model_worker.stop()
+        getattr(owner, "model_test_jobs", {}).pop(job_id, None)
+    else:
+      workers_map.setdefault(owner.ee_addr, {})
     for worker_entry in workers_map.values():
       if not worker_entry.get("finished"):
         worker_entry["finished"] = True
         worker_entry["canceled"] = True
+        worker_entry["cancel_requested"] = True
+        if is_model_test_job(job_specs):
+          worker_entry["error_class"] = MODEL_TEST_ERROR_CANCELED_BY_USER
     set_job_status(job_specs, JOB_STATUS_STOPPED)
     owner._emit_timeline_event(job_specs, "stopped", "Job stopped and deleted", actor_type="user")
     emit_lifecycle_event(
@@ -438,19 +455,37 @@ def stop_monitoring(owner, job_id: str, stop_type: str = "SOFT"):
   passes_completed = job_specs.get("job_pass", 1)
 
   if stop_type == "HARD":
-    local_workers = owner.scan_jobs.get(job_id)
-    if local_workers:
-      for local_worker_id, job in local_workers.items():
-        owner.P(f"Stopping job {job_id} on local worker {local_worker_id}.")
-        job.stop()
-      owner.scan_jobs.pop(job_id, None)
+    if is_model_test_job(job_specs):
+      selected_worker = selected_model_test_worker_addr(job_specs, fallback=getattr(owner, "ee_addr", None))
+      worker_entry = job_specs.setdefault("workers", {}).setdefault(selected_worker, {})
+      worker_entry["cancel_requested"] = True
+      worker_entry["error_class"] = MODEL_TEST_ERROR_CANCELED_BY_USER
+      worker_entry["model_test_worker_status"] = "cancel_requested"
+      job_specs["model_test_summary"] = {
+        **dict(job_specs.get("model_test_summary") or {}),
+        "overall_status": "cancel_requested",
+        "error_class": MODEL_TEST_ERROR_CANCELED_BY_USER,
+      }
+      local_model_worker = getattr(owner, "model_test_jobs", {}).get(job_id)
+      if local_model_worker:
+        owner.P(f"Stopping model-test job {job_id} on local worker {selected_worker}.")
+        local_model_worker.stop()
+      set_job_status(job_specs, JOB_STATUS_SCHEDULED_FOR_STOP)
+      owner._emit_timeline_event(job_specs, "cancel_requested", "Model test cancellation requested", actor_type="user")
+    else:
+      local_workers = owner.scan_jobs.get(job_id)
+      if local_workers:
+        for local_worker_id, job in local_workers.items():
+          owner.P(f"Stopping job {job_id} on local worker {local_worker_id}.")
+          job.stop()
+        owner.scan_jobs.pop(job_id, None)
 
-    worker_entry = job_specs.setdefault("workers", {}).setdefault(owner.ee_addr, {})
-    worker_entry["finished"] = True
-    worker_entry["canceled"] = True
+      worker_entry = job_specs.setdefault("workers", {}).setdefault(owner.ee_addr, {})
+      worker_entry["finished"] = True
+      worker_entry["canceled"] = True
 
-    set_job_status(job_specs, JOB_STATUS_STOPPED)
-    owner._emit_timeline_event(job_specs, "stopped", "Job stopped", actor_type="user")
+      set_job_status(job_specs, JOB_STATUS_STOPPED)
+      owner._emit_timeline_event(job_specs, "stopped", "Job stopped", actor_type="user")
     emit_lifecycle_event(
       owner,
       job_specs,
