@@ -2894,6 +2894,73 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["archive"]["archive_version"], JOB_ARCHIVE_VERSION)
     self.assertEqual(result["archive"]["passes"][0]["findings"][0]["triage"]["status"], "accepted_risk")
 
+  def test_get_job_archive_model_test_preserves_sanitized_model_fields(self):
+    """Model-test archives bypass scan JobArchive coercion and strip raw payload fields."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("model-job")
+    stub.update({
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "target": "Unit Provider / unit-model",
+      "target_url": "",
+      "start_port": 0,
+      "end_port": 0,
+      "risk_score": 0,
+      "pass_count": 0,
+      "worker_count": 1,
+      "model_test_summary": {"overall_status": "failed"},
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+    })
+    plugin = self._build_plugin({"model-job": stub})
+    plugin.r1fs.get_json.return_value = {
+      "schema_version": "model_test_archive_v1",
+      "archive_version": 1,
+      "job_id": "model-job",
+      "job_type": "model_test",
+      "job_config": {"job_id": "model-job", "job_type": "model_test"},
+      "timeline": [],
+      "model_test_results": {
+        "overall_status": "failed",
+        "provider_url": "https://provider.example/v1",
+        "cases": [
+          {
+            "case_id": "case-1",
+            "category": "safety",
+            "status": "failed",
+            "verdict": "blocked",
+            "raw_prompt": "secret prompt text",
+            "raw_response": "secret model response",
+          },
+        ],
+      },
+      "model_test_summary": {
+        "overall_status": "failed",
+        "cases_total": 12,
+        "cases_completed": 4,
+        "error_message": "secret-token",
+      },
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "ui_aggregate": {"scan_type": "model_test", "finding_count": 0},
+      "duration": 20.0,
+      "date_created": 100.0,
+      "date_completed": 120.0,
+    }
+
+    result = Plugin.get_job_archive(plugin, job_id="model-job", summary_only=True, pass_limit=1)
+
+    self.assertEqual(result["job_id"], "model-job")
+    archive = result["archive"]
+    self.assertEqual(archive["job_type"], "model_test")
+    self.assertEqual(archive["model_test_node_selection"]["selected_execution_node"], "node-a")
+    self.assertEqual(archive["model_test_summary"]["cases_completed"], 4)
+    self.assertEqual(archive["model_test_results"]["cases"][0]["case_id"], "case-1")
+    self.assertNotIn("passes", archive)
+    archive_text = str(archive)
+    self.assertNotIn("secret prompt text", archive_text)
+    self.assertNotIn("secret model response", archive_text)
+    self.assertNotIn("secret-token", archive_text)
+    self.assertNotIn("provider.example", archive_text)
+
   def test_get_job_archive_running(self):
     """get_job_archive for running job returns not_available error."""
     Plugin = self._get_plugin_class()
@@ -3322,6 +3389,56 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["job"]["job_cid"], "QmArchiveCID")
     self.assertEqual(result["job"]["pass_count"], 1)
 
+  def test_get_job_data_finalized_model_test_stub_is_sanitized(self):
+    """Finalized model-test stubs are defensively redacted before readback."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("model-job")
+    stub.update({
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "model_test_summary": {
+        "overall_status": "failed",
+        "error_message": "raw provider summary secret-token",
+        "error_class": "not-allowlisted",
+      },
+      "model_test_results": {
+        "overall_status": "failed",
+        "provider_url": "https://provider.example/v1",
+        "cases": [{
+          "case_id": "case-1",
+          "raw_prompt": "secret prompt",
+          "raw_response": "secret response",
+          "error_class": "not-allowlisted",
+        }],
+      },
+      "error_message": "top-level raw secret-token",
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "error": "raw worker exception secret-token",
+          "model_test_summary": {"overall_status": "failed"},
+        },
+      },
+    })
+    plugin = self._build_plugin({"model-job": stub})
+
+    result = Plugin.get_job_data(plugin, job_id="model-job")
+
+    payload = result["job"]
+    self.assertEqual(payload["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(payload["model_test_results"]["cases"][0]["case_id"], "case-1")
+    self.assertEqual(payload["model_test_results"]["cases"][0]["error_class"], "unknown_error")
+    self.assertEqual(payload["error_class"], "unknown_error")
+    payload_text = str(payload)
+    self.assertNotIn("error_message", payload_text)
+    self.assertNotIn("raw provider summary", payload_text)
+    self.assertNotIn("top-level raw", payload_text)
+    self.assertNotIn("raw worker exception", payload_text)
+    self.assertNotIn("secret-token", payload_text)
+    self.assertNotIn("secret prompt", payload_text)
+    self.assertNotIn("secret response", payload_text)
+    self.assertNotIn("provider.example", payload_text)
+
   def test_list_jobs_finalized_as_is(self):
     """Finalized stubs returned unmodified with all CStoreJobFinalized fields."""
     Plugin = self._get_plugin_class()
@@ -3338,6 +3455,37 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(job["duration"], 200.0)
     self.assertEqual(job["scan_type"], "webapp")
     self.assertEqual(job["target_url"], "https://example.com/app")
+
+  def test_list_jobs_finalized_model_test_stub_is_sanitized(self):
+    """Finalized model-test listings do not leak raw model-test payload fields."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("model-job")
+    stub.update({
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "model_test_summary": {
+        "overall_status": "failed",
+        "error_message": "listing summary secret-token",
+        "error_class": "not-allowlisted",
+      },
+      "model_test_results": {
+        "cases": [{"case_id": "case-1", "raw_response": "secret response"}],
+      },
+      "error": "listing raw exception secret-token",
+    })
+    plugin = self._build_plugin({"model-job": stub})
+
+    result = Plugin.list_network_jobs(plugin)
+
+    job = result["model-job"]
+    self.assertEqual(job["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(job["error_class"], "unknown_error")
+    payload_text = str(job)
+    self.assertNotIn("error_message", payload_text)
+    self.assertNotIn("listing summary", payload_text)
+    self.assertNotIn("listing raw exception", payload_text)
+    self.assertNotIn("secret-token", payload_text)
+    self.assertNotIn("secret response", payload_text)
 
   def test_list_jobs_running_stripped(self):
     """Running jobs have counts but no timeline, workers, or pass_reports."""
@@ -3437,6 +3585,47 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     self.assertEqual(result["status"], "network_tracked")
     self.assertEqual(result["workers"]["worker-B"]["worker_state"], "unseen")
+
+  def test_get_job_status_model_test_network_state_is_sanitized(self):
+    """Status readback redacts raw finalized model-test CStore state."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("model-job")
+    stub.update({
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "model_test_summary": {
+        "overall_status": "failed",
+        "error_message": "status summary secret-token",
+        "error_class": "not-allowlisted",
+      },
+      "model_test_results": {
+        "cases": [{"case_id": "case-1", "raw_prompt": "secret prompt"}],
+      },
+      "error_message": "status raw exception secret-token",
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "error_message": "worker raw exception secret-token",
+        },
+      },
+    })
+    plugin = self._build_plugin({"model-job": stub})
+    plugin.scan_jobs = {}
+    plugin.completed_jobs_reports = {}
+    plugin.lst_completed_jobs = []
+
+    result = Plugin._get_job_status(plugin, "model-job")
+
+    self.assertEqual(result["status"], "network_tracked")
+    self.assertEqual(result["job"]["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(result["job"]["error_class"], "unknown_error")
+    payload_text = str(result)
+    self.assertNotIn("error_message", payload_text)
+    self.assertNotIn("status summary", payload_text)
+    self.assertNotIn("status raw exception", payload_text)
+    self.assertNotIn("worker raw exception", payload_text)
+    self.assertNotIn("secret-token", payload_text)
+    self.assertNotIn("secret prompt", payload_text)
 
   def test_get_job_data_includes_reconciled_workers(self):
     """get_job_data includes reconciled worker state for active jobs."""

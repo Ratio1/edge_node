@@ -479,6 +479,23 @@ class TestBuildMispEventIntegration(unittest.TestCase):
     result = build_misp_event(owner, "nonexistent")
     self.assertEqual(result["status"], "error")
 
+  def test_model_test_job_rejected_before_scan_pass_resolution(self):
+    owner = _make_integration_owner(
+      {"ENABLED": True, "MISP_URL": "https://misp.test", "MISP_API_KEY": "key"},
+      job_specs={
+        "job_id": "test_job_1",
+        "job_type": "model_test",
+        "scan_type": "model_test",
+        "job_cid": "model-archive",
+      },
+    )
+
+    result = build_misp_event(owner, "test_job_1")
+
+    self.assertEqual(result["status"], "error")
+    self.assertEqual(result["error"], "unsupported_job_type")
+    self.assertEqual(result["job_type"], "model_test")
+
 
 class TestExportMispJson(unittest.TestCase):
 
@@ -494,6 +511,19 @@ class TestExportMispJson(unittest.TestCase):
     result = export_misp_json(owner, "test_job_1")
     self.assertEqual(result["status"], "ok")
     self.assertIn("misp_event", result)
+
+  def test_model_test_job_rejected_for_json_export(self):
+    owner = _make_integration_owner(job_specs={
+      "job_id": "test_job_1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_cid": "model-archive",
+    })
+
+    result = export_misp_json(owner, "test_job_1")
+
+    self.assertEqual(result["error"], "unsupported_job_type")
+    self.assertEqual(result["operation"], "misp_export")
 
 
 class TestGetMispExportStatus(unittest.TestCase):
@@ -519,6 +549,19 @@ class TestGetMispExportStatus(unittest.TestCase):
     self.assertTrue(result["exported"])
     self.assertEqual(result["event_uuid"], "uuid-123")
     self.assertEqual(result["passes_exported"], [1])
+
+  def test_model_test_status_reports_unsupported(self):
+    owner = _make_integration_owner(job_specs={
+      "job_id": "j1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+    })
+
+    result = get_misp_export_status(owner, "j1")
+
+    self.assertTrue(result["found"])
+    self.assertFalse(result["exported"])
+    self.assertEqual(result["error"], "unsupported_job_type")
 
   def test_job_not_found(self):
     class NoJobOwner:
@@ -550,6 +593,21 @@ class TestPushToMisp(unittest.TestCase):
     owner = self._setup_owner({"MISP_URL": "", "MISP_API_KEY": ""})
     result = push_to_misp(owner, "test_job_1")
     self.assertEqual(result["status"], "not_configured")
+
+  @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
+  def test_model_test_job_rejected_before_misp_client(self, MockPyMISP):
+    owner = self._setup_owner(job_specs={
+      "job_id": "test_job_1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_cid": "model-archive",
+    })
+
+    result = push_to_misp(owner, "test_job_1")
+
+    self.assertEqual(result["error"], "unsupported_job_type")
+    self.assertEqual(result["job_type"], "model_test")
+    MockPyMISP.assert_not_called()
 
   @patch("extensions.business.cybersec.red_mesh.services.misp_export.PyMISP")
   def test_successful_push(self, MockPyMISP):

@@ -12,6 +12,7 @@ from .config import get_stix_export_config
 from .event_hooks import emit_export_status_event
 from .event_redaction import stable_hmac_pseudonym, stable_sha256, strip_sensitive_fields
 from .integration_status import record_integration_status
+from .scan_guards import reject_model_test_for_scan_operation
 
 
 STIX_EXPORT_SCHEMA_VERSION = "1.0.0"
@@ -57,6 +58,9 @@ def _resolve_pass_data(owner, job_id, pass_nr=None):
   job_specs = owner._get_job_from_cstore(job_id)
   if not isinstance(job_specs, dict):
     return None, None, None, {"status": "error", "error": "job_not_found", "job_id": job_id}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export")
+  if unsupported:
+    return None, None, None, unsupported
 
   artifacts = _artifact_repo(owner)
   job_cid = job_specs.get("job_cid")
@@ -374,6 +378,9 @@ def build_stix_bundle(owner, job_id, pass_nr=None):
   job_specs = owner._get_job_from_cstore(job_id)
   if not isinstance(job_specs, dict):
     return {"status": "error", "error": "job_not_found", "job_id": job_id}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export")
+  if unsupported:
+    return unsupported
 
   job_config, pass_data, aggregated, err = _resolve_pass_data(owner, job_id, pass_nr)
   if err:
@@ -483,6 +490,9 @@ def export_stix_bundle(owner, job_id, pass_nr=None, persist=True):
   if not isinstance(job_specs, dict):
     record_integration_status(owner, "stix", outcome="failure", error_class="job_not_found")
     return {"status": "error", "error": "job_not_found", "job_id": job_id}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export")
+  if unsupported:
+    return unsupported
 
   result = build_stix_bundle(owner, job_id, pass_nr=pass_nr)
   if result.get("status") != "ok":
@@ -543,6 +553,9 @@ def get_stix_export_status(owner, job_id):
   job_specs = owner._get_job_from_cstore(job_id)
   if not isinstance(job_specs, dict):
     return {"job_id": job_id, "found": False, "exported": False}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "stix_export_status")
+  if unsupported:
+    return {**unsupported, "found": True, "exported": False}
 
   export_meta = job_specs.get("stix_export")
   if not isinstance(export_meta, dict) or not export_meta:

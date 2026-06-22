@@ -19,6 +19,7 @@ from pymisp import MISPEvent, MISPObject, MISPAttribute, PyMISP
 from ..repositories import ArtifactRepository, JobStateRepository
 from .misp_config import get_misp_export_config, SEVERITY_LEVELS
 from .event_hooks import emit_export_status_event
+from .scan_guards import reject_model_test_for_scan_operation
 
 
 def _job_repo(owner):
@@ -240,6 +241,9 @@ def _resolve_pass_data(owner, job_id, pass_nr=None):
   job_specs = owner._get_job_from_cstore(job_id)
   if not job_specs:
     return None, None, None, {"status": "error", "error": f"Job {job_id} not found"}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "misp_export")
+  if unsupported:
+    return None, None, None, unsupported
 
   job_cid = job_specs.get("job_cid")
   if not job_cid:
@@ -373,6 +377,9 @@ def push_to_misp(owner, job_id, pass_nr=None):
   """
   cfg = get_misp_export_config(owner)
   job_specs = owner._get_job_from_cstore(job_id)
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "misp_export")
+  if unsupported:
+    return unsupported
 
   def _record_export_status(status, artifact_refs=None):
     if not job_specs:
@@ -533,6 +540,9 @@ def get_misp_export_status(owner, job_id):
   job_specs = owner._get_job_from_cstore(job_id)
   if not job_specs:
     return {"job_id": job_id, "found": False, "exported": False}
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "misp_export_status")
+  if unsupported:
+    return {**unsupported, "found": True, "exported": False}
 
   export_meta = job_specs.get("misp_export")
   if not export_meta or not isinstance(export_meta, dict):
