@@ -1105,6 +1105,82 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertNotIn(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID, legacy)
     self.assertNotIn(DEEPLOY_KEYS.PLUGIN_NAME, legacy)
 
+  def test_process_update_preserves_same_node_nameless_no_id_legacy_multiplicity(self):
+    discovered_instances = [
+      {
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+    ]
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=["node-1"],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "api-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 10,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+
+    redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
+    self.assertEqual(len(redeploy_plugins), 3)
+    legacy_plugins = [
+      entry for entry in redeploy_plugins
+      if entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) != "api-instance"
+    ]
+    self.assertEqual(len(legacy_plugins), 2)
+    for legacy in legacy_plugins:
+      self.assertEqual(legacy["PROCESS_DELAY"], 5)
+      self.assertNotIn(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID, legacy)
+      self.assertNotIn(DEEPLOY_KEYS.PLUGIN_NAME, legacy)
+
   def test_process_update_materializes_one_logical_plugin_set_for_multinode_redeploy(self):
     discovered_instances = [
       {
