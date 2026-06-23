@@ -42,7 +42,8 @@ from .secrets import persist_job_config_with_secrets
 PRODUCTION_SCAN_MIN_DELAY_SECONDS = 30.0
 PRODUCTION_SCAN_MAX_DELAY_SECONDS = 80.0
 PRODUCTION_LOCAL_WORKERS = 1
-LOW_MONITOR_INTERVAL_SECONDS = 60
+DEFAULT_MONITOR_INTERVAL_SECONDS = 24 * 60 * 60
+LOW_MONITOR_INTERVAL_SECONDS = DEFAULT_MONITOR_INTERVAL_SECONDS
 
 UNSAFE_CONFIRMATION_DUNE_DISABLED = "dune-disabled"
 UNSAFE_CONFIRMATION_DUNE_DELAY_BELOW_PRODUCTION = "dune-delay-below-production"
@@ -703,12 +704,12 @@ def normalize_common_launch_options(
     run_mode = RUN_MODE_CONTINUOUS_MONITORING
 
   monitor_interval, err = _parse_int_setting(
-    monitor_interval, "monitor_interval", default=getattr(owner, "cfg_monitor_interval", 60),
+    monitor_interval, "monitor_interval", default=DEFAULT_MONITOR_INTERVAL_SECONDS,
   )
   if err:
     return err
   if monitor_interval <= 0:
-    monitor_interval = getattr(owner, "cfg_monitor_interval", 60) or 60
+    monitor_interval = DEFAULT_MONITOR_INTERVAL_SECONDS
 
   scan_min_delay, err = _parse_float_setting(scan_min_delay, "scan_min_delay", default=0.0)
   if err:
