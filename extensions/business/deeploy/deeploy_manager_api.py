@@ -11,6 +11,7 @@ from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
 
 from .deeploy_mixin import _DeeployMixin
+from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
@@ -59,6 +60,7 @@ _CONFIG = {
 class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
+  _DeeployChainstoreResponseMixin,
   _DeeployTargetNodesMixin,
   _NodeTagsMixin,
   _DeeployJobMixin,
@@ -652,6 +654,8 @@ class DeeployManagerApiPlugin(
       nodes_changed = False
       deeploy_specs_for_update = None
       deeploy_specs_payload = None
+      prepared_create_deploy_plan = None
+      skip_create_response_key_reset = False
       previous_pipeline_cid = None
       if is_create:
         deployment_nodes = self._check_nodes_availability(inputs)
@@ -747,19 +751,6 @@ class DeeployManagerApiPlugin(
           pipeline_params=pipeline_params,
         )
 
-        # Validate prepared update payloads before deleting existing pipelines.
-        self._validate_update_pipeline_request(
-          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-          inputs=inputs,
-          app_id=app_id,
-          app_alias=app_alias,
-          app_type=app_type,
-          update_nodes=validated_nodes,
-          discovered_plugin_instances=discovered_plugin_instances,
-          dct_deeploy_specs=deeploy_specs_payload,
-          job_app_type=job_app_type,
-        )
-
         plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
         if isinstance(plugins_array, list):
           materialized_plugins = self._materialize_update_plugins_for_redeploy(
@@ -769,7 +760,22 @@ class DeeployManagerApiPlugin(
           inputs[DEEPLOY_KEYS.PLUGINS] = materialized_plugins
           inputs.plugins = materialized_plugins
 
-        # All validations passed; remove the running job and immediately redeploy.
+        # Validate and prepare the exact create payload before any destructive action.
+        prepared_create_deploy_plan = self._prepare_create_pipeline_deploy_plan(
+          nodes=validated_nodes,
+          inputs=inputs,
+          app_id=app_id,
+          job_app_type=job_app_type,
+          dct_deeploy_specs=deeploy_specs_payload,
+        )
+        if prepared_create_deploy_plan.get("enable_chainstore_response"):
+          self._reset_chainstore_response_keys(
+            prepared_create_deploy_plan.get("response_keys", {}),
+            context=f"replacement create pipeline '{app_alias}'",
+          )
+          skip_create_response_key_reset = True
+
+        # All validations and response-key resets passed; remove the running job and redeploy.
         self.delete_pipeline_from_nodes(
           app_id=app_id,
           job_id=job_id,
@@ -814,6 +820,8 @@ class DeeployManagerApiPlugin(
         update_nodes=[],
         discovered_plugin_instances=discovered_plugin_instances,
         dct_deeploy_specs_create=deeploy_specs_payload,
+        prepared_create_deploy_plan=prepared_create_deploy_plan,
+        skip_create_response_key_reset=skip_create_response_key_reset,
         job_app_type=job_app_type,
         wait_for_responses=not async_mode,
       )

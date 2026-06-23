@@ -175,6 +175,32 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "Duplicate semaphore key"):
       plugin.deeploy_prepare_plugins(inputs)
 
+  def test_prepare_plugins_rejects_invalid_semaphore_shape(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native-1", SEMAPHORE=123),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "SEMAPHORE"):
+      plugin.deeploy_prepare_plugins(inputs)
+
+  def test_prepare_plugins_rejects_invalid_semaphored_keys_shape(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          instance_id="container-1",
+          SEMAPHORED_KEYS=["valid-key", ""],
+        ),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "SEMAPHORED_KEYS"):
+      plugin.deeploy_prepare_plugins(inputs)
+
   def test_prepare_plugins_rejects_shmem_referencing_unknown_plugin(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(

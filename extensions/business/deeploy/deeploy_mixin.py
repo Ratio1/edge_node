@@ -692,10 +692,22 @@ class _DeeployMixin:
       raise ValueError("Sender {} is not an oracle".format(sender))
     return True
 
-  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, job_app_type=None, dct_deeploy_specs=None):
+  def _prepare_create_pipeline_deploy_plan(
+    self,
+    nodes,
+    inputs,
+    app_id,
+    job_app_type=None,
+    dct_deeploy_specs=None,
+  ):
     """
-    Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
+    Build the exact create payload that will be sent to target nodes.
+
+    The returned plan is safe to validate and then reuse for dispatch. This is
+    critical for update redeploys because response keys are generated here and
+    must not be regenerated after the live app has been deleted.
     """
+    nodes = list(nodes or [])
     enable_chainstore_response = bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False))
     plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
     self._validate_dependency_tree(inputs)
@@ -775,7 +787,9 @@ class _DeeployMixin:
           
           # Configure response keys if needed
           if enable_chainstore_response:
-            response_key = self._generate_chainstore_response_key(plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID])
+            response_key = self._generate_chainstore_response_key(
+              plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
+            )
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
             response_keys[addr].append(response_key)
           else:
@@ -794,7 +808,51 @@ class _DeeployMixin:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
-    if enable_chainstore_response:
+
+    return {
+      "enable_chainstore_response": enable_chainstore_response,
+      "response_keys": prepared_response_keys if enable_chainstore_response else {},
+      "node_plugins_by_addr": node_plugins_by_addr,
+      "deeploy_specs": dct_deeploy_specs,
+      "pipeline_kwargs": pipeline_kwargs,
+      "pipeline_params": pipeline_params,
+      "nodes": nodes,
+    }
+
+  def __create_pipeline_on_nodes(
+    self,
+    nodes,
+    inputs,
+    app_id,
+    app_alias,
+    app_type,
+    owner,
+    job_app_type=None,
+    dct_deeploy_specs=None,
+    prepared_deploy_plan=None,
+    skip_response_key_reset=False,
+  ):
+    """
+    Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
+    """
+    if prepared_deploy_plan is None:
+      prepared_deploy_plan = self._prepare_create_pipeline_deploy_plan(
+        nodes=nodes,
+        inputs=inputs,
+        app_id=app_id,
+        job_app_type=job_app_type,
+        dct_deeploy_specs=dct_deeploy_specs,
+      )
+
+    enable_chainstore_response = bool(prepared_deploy_plan.get("enable_chainstore_response"))
+    prepared_response_keys = self._normalize_chainstore_response_mapping(
+      prepared_deploy_plan.get("response_keys", {})
+    )
+    dct_deeploy_specs = self.deepcopy(prepared_deploy_plan.get("deeploy_specs", {}))
+    pipeline_kwargs = self.deepcopy(prepared_deploy_plan.get("pipeline_kwargs", {}))
+    node_plugins_by_addr = prepared_deploy_plan.get("node_plugins_by_addr", {})
+
+    if enable_chainstore_response and not skip_response_key_reset:
       self._reset_chainstore_response_keys(
         prepared_response_keys,
         context=f"create pipeline '{app_alias}'",
@@ -802,6 +860,7 @@ class _DeeployMixin:
 
     saved_pipeline = None
     for addr, node_plugins in node_plugins_by_addr.items():
+      node_plugins = self.deepcopy(node_plugins)
       msg = ''
       if self.cfg_deeploy_verbose > 1:
         msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
@@ -2416,36 +2475,26 @@ class _DeeployMixin:
     instance_id_key = self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID
     chainstore_response_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
     chainstore_peers_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS
-    # Discovery returns one row per node, but create/redeploy inputs are a
-    # node-agnostic list of logical plugin instances.
-    seen_discovered_plugins = set()
+    discovered_records = []
+    discovered_by_key = {}
     config_occurrences_by_node = {}
+    nameless_record_counts = self.defaultdict(int)
 
-    def get_discovered_materialization_key(discovered_plugin, signature, instance_id):
+    def get_plugin_name_from_conf(discovered_plugin, extracted_config):
+      return (
+        extracted_config.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        or discovered_plugin.get(DEEPLOY_KEYS.PLUGIN_NAME)
+      )
+
+    def get_discovered_materialization_key(discovered_plugin, signature, instance_id, extracted_config):
       normalized_sig = signature.upper() if isinstance(signature, str) else signature
       if instance_id:
         return (normalized_sig, "instance_id", str(instance_id))
 
-      plugin_instance = discovered_plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE, {})
-      instance_conf = {}
-      if isinstance(plugin_instance, dict):
-        instance_conf = plugin_instance.get("instance_conf", plugin_instance)
-        if not isinstance(instance_conf, dict):
-          instance_conf = {}
-
-      plugin_name = (
-        instance_conf.get(DEEPLOY_KEYS.PLUGIN_NAME)
-        or discovered_plugin.get(DEEPLOY_KEYS.PLUGIN_NAME)
-      )
+      plugin_name = get_plugin_name_from_conf(discovered_plugin, extracted_config)
       if plugin_name:
         return (normalized_sig, "plugin_name", str(plugin_name))
 
-      extracted_config = self._extract_discovered_plugin_conf(
-        discovered_plugin,
-        instance_id_key=instance_id_key,
-        chainstore_response_key=chainstore_response_key,
-        chainstore_peers_key=chainstore_peers_key,
-      )
       config_hash = compact_canonical_sha256(extracted_config)
       node = discovered_plugin.get(DEEPLOY_PLUGIN_DATA.NODE, "")
       occurrence_bucket = (node, normalized_sig, config_hash)
@@ -2460,43 +2509,139 @@ class _DeeployMixin:
 
       normalized_signature = signature.upper() if isinstance(signature, str) else signature
       instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
-      plugin_config = None
-      materialization_key = get_discovered_materialization_key(plugin, signature, instance_id)
+      if instance_id:
+        instance_id = str(instance_id)
+      extracted_config = self._extract_discovered_plugin_conf(
+        plugin,
+        instance_id_key=instance_id_key,
+        chainstore_response_key=chainstore_response_key,
+        chainstore_peers_key=chainstore_peers_key,
+      )
+      plugin_name = get_plugin_name_from_conf(plugin, extracted_config)
+      config_hash = compact_canonical_sha256(extracted_config)
+      materialization_key = get_discovered_materialization_key(
+        plugin,
+        signature,
+        instance_id,
+        extracted_config,
+      )
 
-      if materialization_key is not None:
-        if materialization_key in seen_discovered_plugins:
-          continue
-        seen_discovered_plugins.add(materialization_key)
+      compatibility_key = (normalized_signature, str(plugin_name or ""), config_hash)
+      existing_record = discovered_by_key.get(materialization_key)
+      if existing_record is not None:
+        if existing_record["compatibility_key"] != compatibility_key:
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.PLUGINS3}: Corrupt live discovery for plugin identity "
+            f"{materialization_key}. Incompatible plugin instances were reported."
+          )
+        continue
+
+      record = {
+        "key": materialization_key,
+        "compatibility_key": compatibility_key,
+        "signature": signature,
+        "normalized_signature": normalized_signature,
+        "instance_id": instance_id,
+        "plugin_name": str(plugin_name) if plugin_name else None,
+        "config": extracted_config,
+        "config_hash": config_hash,
+      }
+      discovered_by_key[materialization_key] = record
+      discovered_records.append(record)
+
+    for record in discovered_records:
+      if record["instance_id"] or record["plugin_name"]:
+        continue
+      nameless_match_key = (record["normalized_signature"], record["config_hash"])
+      nameless_record_counts[nameless_match_key] += 1
+
+    def candidate_has_instance_id(candidate):
+      return bool(
+        candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or candidate.get("instance_id")
+        or candidate.get(instance_id_key)
+      )
+
+    def consume_signature_candidate(record):
+      candidate_list = requested_by_signature.get(record["normalized_signature"], [])
+      if not candidate_list:
+        return None
+
+      if record["plugin_name"]:
+        candidates = [
+          candidate for candidate in candidate_list
+          if not candidate_has_instance_id(candidate)
+          and candidate.get(DEEPLOY_KEYS.PLUGIN_NAME) == record["plugin_name"]
+        ]
+        if len(candidates) > 1:
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.PLUGINS3}: Ambiguous update request for plugin_name "
+            f"'{record['plugin_name']}'."
+          )
+      else:
+        match_key = (record["normalized_signature"], record["config_hash"])
+        candidates = []
+        for candidate in candidate_list:
+          if candidate_has_instance_id(candidate) or candidate.get(DEEPLOY_KEYS.PLUGIN_NAME):
+            continue
+          requested_conf = self._extract_plugin_request_conf(
+            candidate,
+            instance_id_key=instance_id_key,
+            chainstore_response_key=chainstore_response_key,
+            chainstore_peers_key=chainstore_peers_key,
+          )
+          if self._plugin_update_request_matches_identity(
+            requested_conf,
+            discovered_plugin_name=record["plugin_name"],
+            discovered_config_hash=record["config_hash"],
+          ):
+            candidates.append(candidate)
+
+        if candidates and nameless_record_counts[match_key] > 1:
+          self._raise_ambiguous_plugin_update_match(
+            requested_name=None,
+            signature=record["signature"],
+          )
+
+      self._validate_single_plugin_update_match(
+        candidates,
+        requested_name=record["plugin_name"],
+        signature=record["signature"],
+      )
+
+      if not candidates:
+        return None
+
+      plugin_config = candidates[0]
+      for idx, candidate in enumerate(candidate_list):
+        if candidate is plugin_config:
+          candidate_list.pop(idx)
+          break
+      self._remove_consumed_new_plugin_config(new_plugin_configs, plugin_config)
+      return plugin_config
+
+    for record in discovered_records:
+      instance_id = record["instance_id"]
+      plugin_config = None
 
       if instance_id:
         plugin_config = requested_by_instance_id.pop(instance_id, None)
-        candidate_list = requested_by_signature.get(normalized_signature, [])
+        candidate_list = requested_by_signature.get(record["normalized_signature"], [])
         if plugin_config and candidate_list:
           for idx, candidate in enumerate(candidate_list):
             if candidate is plugin_config:
               candidate_list.pop(idx)
               break
       else:
-        candidate_list = requested_by_signature.get(normalized_signature, [])
-        for idx, candidate in enumerate(candidate_list):
-          candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-          if not candidate_instance_id:
-            plugin_config = candidate_list.pop(idx)
-            self._remove_consumed_new_plugin_config(new_plugin_configs, plugin_config)
-            break
+        plugin_config = consume_signature_candidate(record)
 
       if plugin_config:
         plugin_entry = self.deepcopy(plugin_config)
         plugin_entry.pop("signature", None)
       else:
-        plugin_entry = self._extract_discovered_plugin_conf(
-          plugin,
-          instance_id_key=instance_id_key,
-          chainstore_response_key=chainstore_response_key,
-          chainstore_peers_key=chainstore_peers_key,
-        )
+        plugin_entry = self.deepcopy(record["config"])
 
-      plugin_entry[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = signature
+      plugin_entry[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = record["signature"]
       if instance_id:
         plugin_entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
       materialized_plugins.append(plugin_entry)
@@ -2934,6 +3079,19 @@ class _DeeployMixin:
           )
         used_names.add(pname)
 
+  def _validate_runtime_key_shapes(self, instance):
+    sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
+    if sem is not None and (not isinstance(sem, str) or not sem.strip()):
+      raise ValueError("SEMAPHORE, when present, must be a non-empty string.")
+
+    semaphored_keys = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS)
+    if semaphored_keys is not None:
+      if not isinstance(semaphored_keys, list):
+        raise ValueError("SEMAPHORED_KEYS, when present, must be a list of non-empty strings.")
+      for key in semaphored_keys:
+        if not isinstance(key, str) or not key.strip():
+          raise ValueError("SEMAPHORED_KEYS, when present, must be a list of non-empty strings.")
+
   def _validate_plugin_runtime_keys(self, plugins):
     """
     Validate runtime metadata before shmem resolution/autowire.
@@ -2953,6 +3111,7 @@ class _DeeployMixin:
       for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
         if not isinstance(instance, dict):
           continue
+        self._validate_runtime_key_shapes(instance)
         if instance.get(DEEPLOY_KEYS.PLUGIN_NAME):
           continue
         sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
@@ -2989,6 +3148,7 @@ class _DeeployMixin:
       for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
         if not isinstance(instance, dict):
           continue
+        self._validate_runtime_key_shapes(instance)
         sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
         if sem is None:
           continue
@@ -3594,6 +3754,8 @@ class _DeeployMixin:
       discovered_plugin_instances=[],
       dct_deeploy_specs=None, job_app_type=None,
       dct_deeploy_specs_create=None,
+      prepared_create_deploy_plan=None,
+      skip_create_response_key_reset=False,
       wait_for_responses=True
   ):
     """
@@ -3623,6 +3785,11 @@ class _DeeployMixin:
         Detected or provided job app type.
     dct_deeploy_specs_create : dict, optional
         Deeploy specs used for create operations.
+    prepared_create_deploy_plan : dict, optional
+        Prevalidated create payload to dispatch without rebuilding generated
+        response keys.
+    skip_create_response_key_reset : bool, optional
+        When True, the caller already reset the plan response keys.
     wait_for_responses : bool, optional
         When True, block until responses are collected or timeout.
 
@@ -3653,7 +3820,9 @@ class _DeeployMixin:
       new_response_keys, created_pipeline_to_persist = self.__create_pipeline_on_nodes(
         new_nodes, inputs, app_id, app_alias, app_type, owner,
         job_app_type=job_app_type,
-        dct_deeploy_specs=dct_deeploy_specs_create
+        dct_deeploy_specs=dct_deeploy_specs_create,
+        prepared_deploy_plan=prepared_create_deploy_plan,
+        skip_response_key_reset=skip_create_response_key_reset,
       )
       response_keys.update(new_response_keys)
       if created_pipeline_to_persist is not None:
@@ -4649,9 +4818,9 @@ class _DeeployMixin:
       chainstore_response_key=chainstore_response_key,
       chainstore_peers_key=chainstore_peers_key,
     )
+    requested_name = requested_conf.get(DEEPLOY_KEYS.PLUGIN_NAME)
+    matches = []
 
-    best_candidate = None
-    best_score = -1
     for candidate in candidates:
       candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
       if not candidate_instance_id or candidate_instance_id in used_instance_ids:
@@ -4662,19 +4831,66 @@ class _DeeployMixin:
         chainstore_response_key=chainstore_response_key,
         chainstore_peers_key=chainstore_peers_key,
       )
-      score = self._score_plugin_config_match(requested_conf, candidate_conf)
-      if score > best_score:
-        best_score = score
-        best_candidate = candidate
+      candidate_name = (
+        candidate_conf.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        or candidate.get(DEEPLOY_KEYS.PLUGIN_NAME)
+      )
+      if self._plugin_update_request_matches_identity(
+        requested_conf,
+        discovered_plugin_name=candidate_name,
+        discovered_config_hash=compact_canonical_sha256(candidate_conf),
+      ):
+        matches.append(candidate)
 
-    if best_candidate is None:
-      for candidate in candidates:
-        candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
-        if candidate_instance_id and candidate_instance_id not in used_instance_ids:
-          best_candidate = candidate
-          break
+    self._validate_single_plugin_update_match(
+      matches,
+      requested_name=requested_name,
+    )
 
-    return best_candidate
+    return matches[0] if matches else None
+
+  def _plugin_update_request_matches_identity(self, requested_conf, discovered_plugin_name, discovered_config_hash):
+    """
+    Match an update payload to one discovered logical identity.
+
+    Existing-instance updates without an explicit instance_id are intentionally
+    strict: plugin_name wins when present; nameless legacy payloads match only
+    by exact sanitized configuration fingerprint.
+    """
+    requested_name = requested_conf.get(DEEPLOY_KEYS.PLUGIN_NAME)
+    if requested_name:
+      return discovered_plugin_name == requested_name
+
+    if discovered_plugin_name:
+      return False
+
+    return compact_canonical_sha256(requested_conf) == discovered_config_hash
+
+  def _validate_single_plugin_update_match(self, matches, requested_name=None, signature=None):
+    if len(matches) <= 1:
+      return
+
+    unique_instance_ids = {
+      str(candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID))
+      for candidate in matches
+      if candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+    }
+    if len(unique_instance_ids) > 1 or not unique_instance_ids:
+      self._raise_ambiguous_plugin_update_match(
+        requested_name=requested_name,
+        signature=signature,
+      )
+
+  def _raise_ambiguous_plugin_update_match(self, requested_name=None, signature=None):
+    if requested_name:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.PLUGINS3}: Ambiguous update request for plugin_name "
+        f"'{requested_name}'."
+      )
+    msg = f"{DEEPLOY_ERRORS.PLUGINS3}: Ambiguous no-ID/no-name update request"
+    if signature:
+      msg += f" for plugin signature '{signature}'"
+    raise ValueError(f"{msg}.")
 
   def _extract_plugin_request_conf(self, plugin_entry, instance_id_key, chainstore_response_key, chainstore_peers_key):
     """
@@ -4724,30 +4940,3 @@ class _DeeployMixin:
       result[key] = value
 
     return result
-
-  # TODO: Remove this once instance_ids are sent and make sure instance_id is mandatory.
-  # Update should be done strictly by instance_id.
-  def _score_plugin_config_match(self, requested_conf, existing_conf):
-    """
-    Compute a similarity score between a request payload and an existing instance configuration.
-    """
-    if not requested_conf:
-      return 0
-
-    score = 0
-    for key, value in requested_conf.items():
-      if key not in existing_conf:
-        continue
-      existing_value = existing_conf[key]
-      if isinstance(value, (dict, list)) and isinstance(existing_value, (dict, list)):
-        try:
-          if self.json_dumps(value, sort_keys=True) == self.json_dumps(existing_value, sort_keys=True):
-            score += 3
-        except TypeError:
-          continue
-      elif value == existing_value:
-        score += 2
-      elif str(value) == str(existing_value):
-        score += 1
-
-    return score

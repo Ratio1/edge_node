@@ -967,6 +967,22 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
     self.assertEqual(worker["IMAGE"], "repo/worker:1.0")
     self.assertEqual(worker[DEEPLOY_KEYS.PLUGIN_NAME], "worker")
+    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertIsNotNone(prepared_plan)
+    prepared_instances = [
+      instance
+      for plugin_entry in prepared_plan["node_plugins_by_addr"]["node-1"]
+      for instance in plugin_entry[plugin.ct.CONFIG_PLUGIN.K_INSTANCES]
+    ]
+    self.assertEqual(
+      {instance[plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID] for instance in prepared_instances},
+      {"api-instance", "worker-instance"},
+    )
+    prepared_api = next(
+      instance for instance in prepared_instances
+      if instance[plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID] == "api-instance"
+    )
+    self.assertEqual(prepared_api["PROCESS_DELAY"], 10)
 
   def test_process_update_does_not_append_consumed_no_id_update_as_new_plugin(self):
     plugin, called = self._make_process_update_plugin(
@@ -1282,6 +1298,252 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(api["PROCESS_DELAY"], 10)
     self.assertEqual(worker["IMAGE"], "repo/worker:1.0")
     self.assertEqual(worker[DEEPLOY_KEYS.PLUGIN_NAME], "worker")
+
+  def test_process_update_rejects_corrupt_duplicate_live_instance_id_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "shared-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "api",
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "shared-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-2",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "PROCESS_DELAY": 10,
+            },
+          },
+        },
+      ],
+      nodes=["node-1", "node-2"],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1", "node-2"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 2,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "shared-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 5,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("Corrupt live discovery", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
+  def test_process_update_rejects_ambiguous_nameless_no_id_update_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+        {
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            "PROCESS_DELAY": 5,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("Ambiguous no-ID/no-name update request", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
+  def test_ensure_plugin_instance_ids_rejects_ambiguous_nameless_config_match(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          "PROCESS_DELAY": 5,
+        },
+      ],
+    )
+
+    with self.assertRaisesRegex(ValueError, "Ambiguous no-ID/no-name update request"):
+      plugin._ensure_plugin_instance_ids(
+        inputs,
+        discovered_plugin_instances=[
+          {
+            DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "instance-a",
+            DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+              "instance_conf": {"PROCESS_DELAY": 5},
+            },
+          },
+          {
+            DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "instance-b",
+            DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+              "instance_conf": {"PROCESS_DELAY": 5},
+            },
+          },
+        ],
+      )
+
+  def test_process_update_resets_chainstore_response_before_delete_and_reuses_plan(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "api",
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+      ],
+    )
+    reset_calls = []
+
+    def reset_response_keys(response_keys, **kwargs):
+      reset_calls.append({
+        "delete_count": called["delete"],
+        "response_keys": copy.deepcopy(response_keys),
+        "kwargs": kwargs,
+      })
+      return response_keys
+
+    plugin._reset_chainstore_response_keys = reset_response_keys
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "api-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 10,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(len(reset_calls), 1)
+    self.assertEqual(reset_calls[0]["delete_count"], 0)
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    self.assertTrue(called["deploy_kwargs"]["skip_create_response_key_reset"])
+    prepared_plan = called["deploy_kwargs"]["prepared_create_deploy_plan"]
+    self.assertEqual(prepared_plan["response_keys"], reset_calls[0]["response_keys"])
+
+  def test_process_update_aborts_before_delete_when_chainstore_reset_fails(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "api",
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+      ],
+    )
+
+    def reset_response_keys(*args, **kwargs):
+      raise ValueError("reset failed before delete")
+
+    plugin._reset_chainstore_response_keys = reset_response_keys
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: True,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "api-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 10,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("reset failed before delete", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
 
   def test_process_update_rejects_malformed_dynamic_env_before_delete(self):
     plugin, called = self._make_process_update_plugin(

@@ -1,5 +1,6 @@
 import copy
 import importlib.util
+from collections import defaultdict
 from pathlib import Path
 import sys
 import types
@@ -23,7 +24,13 @@ def _load_deeploy_chainstore_response_mixin():
   that require optional runtime dependencies such as cv2, which are unrelated
   to these focused tests.
   """
+  required_helpers = {
+    "_get_chainstore_response_local_reset_peers",
+    "_get_chainstore_response_local_reset_write_kwargs",
+    "_reset_chainstore_response_key",
+  }
   checked_paths = []
+  rejected = []
   for module_path in _iter_deeploy_chainstore_response_mixin_paths():
     if module_path in checked_paths:
       continue
@@ -36,15 +43,24 @@ def _load_deeploy_chainstore_response_mixin():
     )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    if hasattr(module, "_DeeployChainstoreResponseMixin"):
-      return module._DeeployChainstoreResponseMixin
-    if hasattr(module, "_ChainstoreResponseMixin"):
-      return module._ChainstoreResponseMixin
+    for class_name in ("_DeeployChainstoreResponseMixin", "_ChainstoreResponseMixin"):
+      candidate = getattr(module, class_name, None)
+      if candidate is None:
+        continue
+      missing = sorted(
+        helper for helper in required_helpers
+        if not callable(getattr(candidate, helper, None))
+      )
+      if not missing:
+        return candidate
+      rejected.append(f"{module_path}: {class_name} missing {missing}")
 
   formatted_paths = "\n".join(f"- {path}" for path in checked_paths)
+  formatted_rejected = "\n".join(f"- {item}" for item in rejected)
+  rejected_section = f"\nRejected:\n{formatted_rejected}" if formatted_rejected else ""
   raise FileNotFoundError(
-    "Could not locate a supported Deeploy/chainstore response mixin for tests. "
-    f"Checked:\n{formatted_paths}"
+    "Could not locate a Deeploy-capable chainstore response mixin for tests. "
+    f"Checked:\n{formatted_paths}{rejected_section}"
   )
 
 
@@ -53,29 +69,29 @@ def _iter_deeploy_chainstore_response_mixin_paths():
   Yield likely source paths for the installed, nested, or sibling naeural_core.
   """
   constants_file = getattr(ct, "__file__", None)
+  edge_root = Path(__file__).resolve().parents[4]
+  yield (
+    edge_root
+    / "extensions"
+    / "business"
+    / "deeploy"
+    / "deeploy_chainstore_response_mixin.py"
+  )
+
   if constants_file:
-    yield (
-      Path(constants_file).resolve().parent
-      / "business"
-      / "mixins_base"
-      / "chainstore_response_mixin.py"
-    )
     yield (
       Path(constants_file).resolve().parent
       / "business"
       / "mixins_base"
       / "deeploy_chainstore_response_mixin.py"
     )
+    yield (
+      Path(constants_file).resolve().parent
+      / "business"
+      / "mixins_base"
+      / "chainstore_response_mixin.py"
+    )
 
-  edge_root = Path(__file__).resolve().parents[4]
-  yield (
-    edge_root
-    / "naeural_core"
-    / "naeural_core"
-    / "business"
-    / "mixins_base"
-    / "chainstore_response_mixin.py"
-  )
   yield (
     edge_root
     / "naeural_core"
@@ -85,7 +101,7 @@ def _iter_deeploy_chainstore_response_mixin_paths():
     / "deeploy_chainstore_response_mixin.py"
   )
   yield (
-    edge_root.parent
+    edge_root
     / "naeural_core"
     / "naeural_core"
     / "business"
@@ -99,6 +115,14 @@ def _iter_deeploy_chainstore_response_mixin_paths():
     / "business"
     / "mixins_base"
     / "deeploy_chainstore_response_mixin.py"
+  )
+  yield (
+    edge_root.parent
+    / "naeural_core"
+    / "naeural_core"
+    / "business"
+    / "mixins_base"
+    / "chainstore_response_mixin.py"
   )
 
   for entry in sys.path:
@@ -109,14 +133,14 @@ def _iter_deeploy_chainstore_response_mixin_paths():
       / "naeural_core"
       / "business"
       / "mixins_base"
-      / "chainstore_response_mixin.py"
+      / "deeploy_chainstore_response_mixin.py"
     )
     yield (
       Path(entry).resolve()
       / "naeural_core"
       / "business"
       / "mixins_base"
-      / "deeploy_chainstore_response_mixin.py"
+      / "chainstore_response_mixin.py"
     )
 
 
@@ -140,6 +164,7 @@ def make_deeploy_plugin():
   plugin.ct = ct
   plugin.cfg_deeploy_verbose = 10
   plugin.deepcopy = copy.deepcopy
+  plugin.defaultdict = defaultdict
   plugin.sanitize_name = lambda value: str(value).replace("/", "_").replace(" ", "_")
   plugin.P = lambda *args, **kwargs: None
   plugin.Pd = lambda *args, **kwargs: None
