@@ -38,10 +38,12 @@ def _load_deeploy_chainstore_response_mixin():
     spec.loader.exec_module(module)
     if hasattr(module, "_DeeployChainstoreResponseMixin"):
       return module._DeeployChainstoreResponseMixin
+    if hasattr(module, "_ChainstoreResponseMixin"):
+      return module._ChainstoreResponseMixin
 
   formatted_paths = "\n".join(f"- {path}" for path in checked_paths)
   raise FileNotFoundError(
-    "Could not locate _DeeployChainstoreResponseMixin for Deeploy tests. "
+    "Could not locate a supported Deeploy/chainstore response mixin for tests. "
     f"Checked:\n{formatted_paths}"
   )
 
@@ -56,10 +58,24 @@ def _iter_deeploy_chainstore_response_mixin_paths():
       Path(constants_file).resolve().parent
       / "business"
       / "mixins_base"
+      / "chainstore_response_mixin.py"
+    )
+    yield (
+      Path(constants_file).resolve().parent
+      / "business"
+      / "mixins_base"
       / "deeploy_chainstore_response_mixin.py"
     )
 
   edge_root = Path(__file__).resolve().parents[4]
+  yield (
+    edge_root
+    / "naeural_core"
+    / "naeural_core"
+    / "business"
+    / "mixins_base"
+    / "chainstore_response_mixin.py"
+  )
   yield (
     edge_root
     / "naeural_core"
@@ -74,12 +90,27 @@ def _iter_deeploy_chainstore_response_mixin_paths():
     / "naeural_core"
     / "business"
     / "mixins_base"
+    / "chainstore_response_mixin.py"
+  )
+  yield (
+    edge_root.parent
+    / "naeural_core"
+    / "naeural_core"
+    / "business"
+    / "mixins_base"
     / "deeploy_chainstore_response_mixin.py"
   )
 
   for entry in sys.path:
     if not entry:
       continue
+    yield (
+      Path(entry).resolve()
+      / "naeural_core"
+      / "business"
+      / "mixins_base"
+      / "chainstore_response_mixin.py"
+    )
     yield (
       Path(entry).resolve()
       / "naeural_core"
