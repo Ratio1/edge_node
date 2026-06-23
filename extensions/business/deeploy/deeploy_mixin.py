@@ -927,16 +927,8 @@ class _DeeployMixin:
           candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
           if not candidate_instance_id:
             plugin_config = candidate_list.pop(idx)
+            self._remove_consumed_new_plugin_config(new_plugin_configs, plugin_config)
             break
-
-      if not plugin_config:
-        config_candidates = requested_by_signature.get(normalized_signature, [])
-        if config_candidates:
-          for idx, candidate in enumerate(config_candidates):
-            candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-            if candidate_instance_id:
-              plugin_config = config_candidates.pop(idx)
-              break
 
       prepared_plugin = self.deeploy_prepare_single_plugin_instance_update(
         inputs=inputs,
@@ -2376,6 +2368,8 @@ class _DeeployMixin:
         or plugin_instance.get("instance_id")
         or plugin_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
       )
+      if instance_id:
+        instance_id = str(instance_id)
 
       plugin_copy = self.deepcopy(plugin_instance)
       legacy_signature_value = plugin_copy.pop("signature", None)
@@ -2384,6 +2378,10 @@ class _DeeployMixin:
       plugin_copy[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = plugin_copy.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, signature)
 
       if instance_id:
+        if instance_id in plugins_by_instance_id:
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.PLUGINS3}: Duplicate plugin_instance_id '{instance_id}' in plugins array."
+          )
         plugin_copy[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
         plugins_by_instance_id[instance_id] = plugin_copy
       else:
@@ -2394,6 +2392,14 @@ class _DeeployMixin:
 
     return plugins_by_instance_id, plugins_by_signature, new_plugin_configs
   # TODO: END FIXME
+
+  @staticmethod
+  def _remove_consumed_new_plugin_config(new_plugin_configs, plugin_config):
+    for idx, candidate in enumerate(new_plugin_configs):
+      if candidate is plugin_config:
+        new_plugin_configs.pop(idx)
+        return True
+    return False
 
   def _materialize_update_plugins_for_redeploy(self, inputs, discovered_plugin_instances):
     """
@@ -2410,6 +2416,42 @@ class _DeeployMixin:
     instance_id_key = self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID
     chainstore_response_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
     chainstore_peers_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS
+    # Discovery returns one row per node, but create/redeploy inputs are a
+    # node-agnostic list of logical plugin instances.
+    seen_discovered_plugins = set()
+    config_occurrences_by_node = {}
+
+    def get_discovered_materialization_key(discovered_plugin, signature, instance_id):
+      normalized_sig = signature.upper() if isinstance(signature, str) else signature
+      if instance_id:
+        return (normalized_sig, "instance_id", str(instance_id))
+
+      plugin_instance = discovered_plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE, {})
+      instance_conf = {}
+      if isinstance(plugin_instance, dict):
+        instance_conf = plugin_instance.get("instance_conf", plugin_instance)
+        if not isinstance(instance_conf, dict):
+          instance_conf = {}
+
+      plugin_name = (
+        instance_conf.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        or discovered_plugin.get(DEEPLOY_KEYS.PLUGIN_NAME)
+      )
+      if plugin_name:
+        return (normalized_sig, "plugin_name", str(plugin_name))
+
+      extracted_config = self._extract_discovered_plugin_conf(
+        discovered_plugin,
+        instance_id_key=instance_id_key,
+        chainstore_response_key=chainstore_response_key,
+        chainstore_peers_key=chainstore_peers_key,
+      )
+      config_hash = compact_canonical_sha256(extracted_config)
+      node = discovered_plugin.get(DEEPLOY_PLUGIN_DATA.NODE, "")
+      occurrence_bucket = (node, normalized_sig, config_hash)
+      occurrence_idx = config_occurrences_by_node.get(occurrence_bucket, 0)
+      config_occurrences_by_node[occurrence_bucket] = occurrence_idx + 1
+      return (normalized_sig, "config", config_hash, occurrence_idx)
 
     for plugin in discovered_plugin_instances:
       signature = plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE)
@@ -2419,6 +2461,12 @@ class _DeeployMixin:
       normalized_signature = signature.upper() if isinstance(signature, str) else signature
       instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
       plugin_config = None
+      materialization_key = get_discovered_materialization_key(plugin, signature, instance_id)
+
+      if materialization_key is not None:
+        if materialization_key in seen_discovered_plugins:
+          continue
+        seen_discovered_plugins.add(materialization_key)
 
       if instance_id:
         plugin_config = requested_by_instance_id.pop(instance_id, None)
@@ -2434,16 +2482,8 @@ class _DeeployMixin:
           candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
           if not candidate_instance_id:
             plugin_config = candidate_list.pop(idx)
+            self._remove_consumed_new_plugin_config(new_plugin_configs, plugin_config)
             break
-
-      if not plugin_config:
-        config_candidates = requested_by_signature.get(normalized_signature, [])
-        if config_candidates:
-          for idx, candidate in enumerate(config_candidates):
-            candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-            if candidate_instance_id:
-              plugin_config = config_candidates.pop(idx)
-              break
 
       if plugin_config:
         plugin_entry = self.deepcopy(plugin_config)

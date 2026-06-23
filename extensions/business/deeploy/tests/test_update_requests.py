@@ -43,6 +43,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin.deepcopy = copy.deepcopy
     plugin.defaultdict = defaultdict
     plugin.time = lambda: 1_000.0
+    plugin.uuid = lambda size: "x" * size
     plugin.sanitize_name = lambda value: str(value).replace("/", "_").replace(" ", "_")
     plugin.P = lambda *args, **kwargs: None
     plugin.Pd = lambda *args, **kwargs: None
@@ -848,6 +849,56 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 0)
 
+  def test_process_update_rejects_duplicate_instance_ids_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "native-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "native",
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "native",
+            "PROCESS_DELAY": 5,
+          },
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "native-copy",
+            "PROCESS_DELAY": 10,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("Duplicate plugin_instance_id", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
   def test_process_update_materializes_omitted_live_plugins_before_redeploy(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
@@ -914,6 +965,245 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       entry for entry in redeploy_plugins
       if entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] == "worker-instance"
     )
+    self.assertEqual(worker["IMAGE"], "repo/worker:1.0")
+    self.assertEqual(worker[DEEPLOY_KEYS.PLUGIN_NAME], "worker")
+
+  def test_process_update_does_not_append_consumed_no_id_update_as_new_plugin(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "legacy",
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_NAME: "legacy",
+            "PROCESS_DELAY": 10,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    redeploy_plugins = redeploy_inputs[DEEPLOY_KEYS.PLUGINS]
+    self.assertEqual(len(redeploy_plugins), 1)
+    self.assertEqual(redeploy_plugins[0][DEEPLOY_KEYS.PLUGIN_NAME], "legacy")
+    self.assertEqual(redeploy_plugins[0]["PROCESS_DELAY"], 10)
+
+  def test_process_update_dedupes_nameless_no_id_legacy_plugin_across_nodes(self):
+    discovered_instances = [
+      {
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-2",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-2",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+    ]
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=["node-1", "node-2"],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1", "node-2"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 2,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "api-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 10,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+
+    redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
+    self.assertEqual(len(redeploy_plugins), 2)
+    api = next(
+      entry for entry in redeploy_plugins
+      if entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) == "api-instance"
+    )
+    legacy = next(
+      entry for entry in redeploy_plugins
+      if entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) != "api-instance"
+    )
+    self.assertEqual(api["PROCESS_DELAY"], 10)
+    self.assertEqual(legacy["PROCESS_DELAY"], 5)
+    self.assertNotIn(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID, legacy)
+    self.assertNotIn(DEEPLOY_KEYS.PLUGIN_NAME, legacy)
+
+  def test_process_update_materializes_one_logical_plugin_set_for_multinode_redeploy(self):
+    discovered_instances = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "worker-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+            "IMAGE": "repo/worker:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-2",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "worker-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-2",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+            "IMAGE": "repo/worker:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          },
+        },
+      },
+    ]
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=discovered_instances,
+      nodes=["node-1", "node-2"],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1", "node-2"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 2,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "api-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 10,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(called["deploy_kwargs"]["new_nodes"], ["node-1", "node-2"])
+
+    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    redeploy_plugins = redeploy_inputs[DEEPLOY_KEYS.PLUGINS]
+    self.assertEqual(len(redeploy_plugins), 2)
+    self.assertEqual(
+      {entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] for entry in redeploy_plugins},
+      {"api-instance", "worker-instance"},
+    )
+
+    api = next(
+      entry for entry in redeploy_plugins
+      if entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] == "api-instance"
+    )
+    worker = next(
+      entry for entry in redeploy_plugins
+      if entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] == "worker-instance"
+    )
+    self.assertEqual(api["PROCESS_DELAY"], 10)
     self.assertEqual(worker["IMAGE"], "repo/worker:1.0")
     self.assertEqual(worker[DEEPLOY_KEYS.PLUGIN_NAME], "worker")
 
