@@ -696,6 +696,7 @@ class _DeeployMixin:
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
+    enable_chainstore_response = bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False))
     plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
     self._validate_dependency_tree(inputs)
     plugins = self._ensure_runner_cstore_auth_env(
@@ -772,7 +773,7 @@ class _DeeployMixin:
           # endif
           
           # Configure response keys if needed
-          if inputs.chainstore_response:
+          if enable_chainstore_response:
             response_key = self._generate_chainstore_response_key(plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID])
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
             response_keys[addr].append(response_key)
@@ -783,17 +784,18 @@ class _DeeployMixin:
       node_plugins_by_addr[addr] = node_plugins
 
     prepared_response_keys = self._normalize_chainstore_response_mapping(response_keys)
-    if inputs.chainstore_response:
+    if enable_chainstore_response:
       if prepared_response_keys:
         dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
       else:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
-    self._reset_chainstore_response_keys(
-      prepared_response_keys,
-      context=f"create pipeline '{app_alias}'",
-    )
+    if enable_chainstore_response:
+      self._reset_chainstore_response_keys(
+        prepared_response_keys,
+        context=f"create pipeline '{app_alias}'",
+      )
 
     saved_pipeline = None
     for addr, node_plugins in node_plugins_by_addr.items():
@@ -2779,6 +2781,22 @@ class _DeeployMixin:
     used_names = set()
     normalized_app_id = app_id.strip() if isinstance(app_id, str) else None
 
+    def validate_shmem_path(path, var_name):
+      if not isinstance(path, (list, tuple)) or len(path) != 2:
+        raise ValueError(
+          "DYNAMIC_ENV shmem path for '{}' must be [provider, key].".format(var_name)
+        )
+      provider_name, target_key = path
+      if not isinstance(provider_name, str) or not provider_name.strip():
+        raise ValueError(
+          "DYNAMIC_ENV shmem path for '{}' has empty provider.".format(var_name)
+        )
+      if not isinstance(target_key, str) or not target_key.strip():
+        raise ValueError(
+          "DYNAMIC_ENV shmem path for '{}' has empty target key.".format(var_name)
+        )
+      return provider_name, target_key
+
     for plugin in plugins:
       for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
         if not isinstance(instance, dict):
@@ -2856,23 +2874,21 @@ class _DeeployMixin:
             continue
 
           consumer_sem_keys = set()
-          for _var_name, entries in dynamic_env.items():
+          for var_name, entries in dynamic_env.items():
             if not isinstance(entries, list):
               continue
             for entry in entries:
               if not isinstance(entry, dict) or entry.get("type") != "shmem":
                 continue
               path = entry.get("path")
-              if not isinstance(path, (list, tuple)) or len(path) < 2:
-                continue
-              provider_name = path[0]
+              provider_name, target_key = validate_shmem_path(path, var_name)
               if provider_name not in key_to_name:
                 raise ValueError(
                   "DYNAMIC_ENV shmem references unknown plugin '{}'. "
                   "Available providers: {}".format(provider_name, known_keys)
                 )
               sem_key = provider_name
-              entry["path"] = [sem_key, path[1]]
+              entry["path"] = [sem_key, target_key]
               consumer_sem_keys.add(sem_key)
 
           instance["SEMAPHORED_KEYS"] = sorted(consumer_sem_keys)
@@ -2889,16 +2905,14 @@ class _DeeployMixin:
           continue
 
         consumer_sem_keys = set()
-        for _var_name, entries in dynamic_env.items():
+        for var_name, entries in dynamic_env.items():
           if not isinstance(entries, list):
             continue
           for entry in entries:
             if not isinstance(entry, dict) or entry.get("type") != "shmem":
               continue
             path = entry.get("path")
-            if not isinstance(path, (list, tuple)) or len(path) < 2:
-              continue
-            provider_name = path[0]
+            provider_name, target_key = validate_shmem_path(path, var_name)
             if provider_name in name_to_key:
               sem_key = name_to_key[provider_name]
             elif provider_name in key_to_name:
@@ -2912,7 +2926,7 @@ class _DeeployMixin:
                   sorted(set(name_to_key.keys()) | set(key_to_name.keys())),
                 )
               )
-            entry["path"] = [sem_key, path[1]]
+            entry["path"] = [sem_key, target_key]
             consumer_sem_keys.add(sem_key)
 
         instance["SEMAPHORED_KEYS"] = sorted(consumer_sem_keys)

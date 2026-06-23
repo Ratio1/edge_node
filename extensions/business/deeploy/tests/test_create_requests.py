@@ -1,4 +1,5 @@
 import unittest
+from collections import defaultdict
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs, make_plugin_entry
@@ -192,6 +193,50 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
 
     instance = prepared[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
     self.assertNotIn("SEMAPHORE", instance)
+
+  def test_create_pipeline_on_nodes_without_chainstore_response_returns_empty_keys(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"start": 0, "reset": 0}
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+
+    def start_pipeline(**kwargs):
+      called["start"] += 1
+      return {
+        "NAME": kwargs["name"],
+        "APP_ALIAS": kwargs["app_alias"],
+        "PLUGINS": kwargs["plugins"],
+        "DEEPLOY_SPECS": kwargs["deeploy_specs"],
+      }
+
+    plugin.cmdapi_start_pipeline_by_params = start_pipeline
+    inputs = make_inputs(
+      app_alias="native-app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=False,
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", plugin_name="native-api", PROCESS_DELAY=5),
+      ],
+    )
+
+    response_keys, saved_pipeline = plugin._DeeployMixin__create_pipeline_on_nodes(
+      ["node-1"],
+      inputs,
+      "native-app_abc123",
+      "native-app",
+      "void",
+      "owner",
+      job_app_type="native",
+      dct_deeploy_specs={"job_id": 11},
+    )
+
+    self.assertEqual(response_keys, {})
+    self.assertEqual(called["start"], 1)
+    self.assertEqual(called["reset"], 0)
+    self.assertEqual(saved_pipeline["NAME"], "native-app_abc123")
 
 
 if __name__ == "__main__":

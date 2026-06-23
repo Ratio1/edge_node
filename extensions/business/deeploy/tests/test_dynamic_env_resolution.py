@@ -90,6 +90,46 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "unknown plugin 'nonexistent'"):
       plugin._resolve_shmem_in_plugins(plugins, "app-1")
 
+  def test_resolve_shmem_in_plugins_rejects_malformed_shmem_path(self):
+    plugin = make_deeploy_plugin()
+    malformed_paths = [
+      ["provider"],
+      ["provider", "PORT", "extra"],
+      ["provider", ""],
+      ["", "PORT"],
+      [123, "PORT"],
+    ]
+
+    for path in malformed_paths:
+      plugins = [
+        {
+          plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "A_SIMPLE_PLUGIN",
+          plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+            {
+              plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-1",
+              DEEPLOY_KEYS.PLUGIN_NAME: "provider",
+            }
+          ],
+        },
+        {
+          plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
+          plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+            {
+              plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "car-1",
+              DEEPLOY_KEYS.PLUGIN_NAME: "frontend",
+              "DYNAMIC_ENV": {
+                "API_HOST": [
+                  {"type": "shmem", "path": path}
+                ]
+              },
+            }
+          ],
+        },
+      ]
+
+      with self.assertRaisesRegex(ValueError, "DYNAMIC_ENV shmem path"):
+        plugin._resolve_shmem_in_plugins(plugins, "app-1")
+
   def test_resolve_shmem_in_plugins_rejects_duplicate_names(self):
     plugin = make_deeploy_plugin()
     plugins = [
