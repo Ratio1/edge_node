@@ -219,6 +219,50 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "unknown plugin 'nonexistent'"):
       plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
 
+  def test_prepare_plugins_rejects_backend_source_shmem_shape(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", plugin_name="provider", PROCESS_DELAY=5),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          DYNAMIC_ENV={
+            "API_HOST": [{"source": "shmem", "path": ["provider", "PORT"]}]
+          },
+        ),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "source='shmem'"):
+      plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
+
+  def test_normalize_plugins_input_moves_legacy_top_level_per_node_config_to_generated_plugin(self):
+    plugin = make_deeploy_plugin()
+    request = {
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+      DEEPLOY_KEYS.APP_PARAMS: {"IMAGE": "repo/app:latest"},
+      "perNodeConfig": {"node-1": {"ENV": {"REGION": "eu"}}},
+    }
+
+    normalized = plugin._normalize_plugins_input(request)
+
+    self.assertEqual(normalized[DEEPLOY_KEYS.PLUGINS][0]["perNodeConfig"], request["perNodeConfig"])
+    self.assertNotIn("perNodeConfig", normalized[DEEPLOY_KEYS.APP_PARAMS])
+
+  def test_normalize_plugins_input_rejects_top_level_per_node_config_with_explicit_plugins(self):
+    plugin = make_deeploy_plugin()
+    request = {
+      DEEPLOY_KEYS.PLUGINS: [
+        make_plugin_entry("CONTAINER_APP_RUNNER", IMAGE="repo/app:latest"),
+      ],
+      "PER_NODE_CONFIG": {"node-1": {"ENV": {"REGION": "eu"}}},
+    }
+
+    with self.assertRaisesRegex(ValueError, "Top-level perNodeConfig"):
+      plugin._normalize_plugins_input(request)
+
   def test_prepare_plugins_rejects_malformed_dynamic_env_entries(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(

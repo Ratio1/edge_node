@@ -262,15 +262,34 @@ class DeeployManagerApiPlugin(
         f"to cover gas fees. Please top up the address and retry."
       )
 
+  def _redact_failed_request_payload(self, payload):
+    """
+    Redact request fields that can carry large or sensitive per-node overrides.
+    """
+    redacted_keys = {"perNodeConfig", "PER_NODE_CONFIG"}
+    if isinstance(payload, dict):
+      return {
+        key: "<redacted>"
+        if key in redacted_keys
+        else self._redact_failed_request_payload(value)
+        for key, value in payload.items()
+      }
+    if isinstance(payload, list):
+      return [self._redact_failed_request_payload(value) for value in payload]
+    if isinstance(payload, tuple):
+      return tuple(self._redact_failed_request_payload(value) for value in payload)
+    return payload
+
   def __handle_error(self, exc, request, extra_error_code=DEEPLOY_ERRORS.GENERIC):
     """
     Handle the error and return a response.
     """
-    self.Pd("Error processing request: {}, Inputs: {}".format(exc, request), color='r')
+    redacted_request = self._redact_failed_request_payload(request)
+    self.Pd("Error processing request: {}, Inputs: {}".format(exc, redacted_request), color='r')
     result = {
       DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.FAIL,
       DEEPLOY_KEYS.ERROR : str(exc),
-      DEEPLOY_KEYS.REQUEST : request,
+      DEEPLOY_KEYS.REQUEST : redacted_request,
     }
     if self.cfg_deeploy_verbose > 1:
       lines = self.trace_info().splitlines()
@@ -1393,7 +1412,11 @@ class DeeployManagerApiPlugin(
     - See create_pipeline endpoint for detailed parameter documentation and examples
 
     """
-    self.P(f"Received an update_pipeline request with body: {self.json_dumps(request)}")
+    self.P(
+      "Received an update_pipeline request with body: {}".format(
+        self.json_dumps(self._redact_failed_request_payload(request))
+      )
+    )
     result = self._process_pipeline_request(request, is_create=False, async_mode=True)
     if isinstance(result, dict) and result.get('__pending__') is not None:
       return self._register_pending_deploy_request(result['__pending__'])

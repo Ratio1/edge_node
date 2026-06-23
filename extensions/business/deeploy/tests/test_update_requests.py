@@ -1593,6 +1593,99 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 0)
 
+  def test_process_update_rejects_source_shmem_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "current-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "frontend",
+              "IMAGE": "repo/app:1.0",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "current-instance",
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            "DYNAMIC_ENV": {
+              "API_URL": [{"source": "shmem", "path": ["provider", "PORT"]}],
+            },
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("source='shmem'", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
+  def test_handle_error_redacts_per_node_config_recursively(self):
+    plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
+    plugin.cfg_deeploy_verbose = 0
+    log_lines = []
+    plugin.Pd = lambda message, **kwargs: log_lines.append(message)
+
+    request = {
+      "perNodeConfig": {"node-1": {"secret": "top-secret"}},
+      "plugins": [
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          "PER_NODE_CONFIG": {"node-1": {"secret": "nested-secret"}},
+        },
+      ],
+    }
+
+    response = plugin._DeeployManagerApiPlugin__handle_error(ValueError("boom"), request)
+
+    self.assertEqual(response[DEEPLOY_KEYS.REQUEST]["perNodeConfig"], "<redacted>")
+    self.assertEqual(response[DEEPLOY_KEYS.REQUEST]["plugins"][0]["PER_NODE_CONFIG"], "<redacted>")
+    self.assertNotIn("top-secret", str(response))
+    self.assertNotIn("nested-secret", str(response))
+    self.assertNotIn("top-secret", "\n".join(log_lines))
+    self.assertNotIn("nested-secret", "\n".join(log_lines))
+
+  def test_update_pipeline_log_redacts_per_node_config(self):
+    plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
+    log_lines = []
+    plugin.P = lambda message, **kwargs: log_lines.append(message)
+    plugin.json_dumps = lambda payload, **kwargs: str(payload)
+    plugin._process_pipeline_request = lambda request, **kwargs: {"ok": True}
+
+    response = plugin.update_pipeline(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        "perNodeConfig": {"node-1": {"secret": "top-secret"}},
+        "nested": {"PER_NODE_CONFIG": {"node-1": {"secret": "nested-secret"}}},
+      }
+    )
+
+    self.assertEqual(response, {"ok": True})
+    self.assertIn("<redacted>", "\n".join(log_lines))
+    self.assertNotIn("top-secret", "\n".join(log_lines))
+    self.assertNotIn("nested-secret", "\n".join(log_lines))
+
 
 if __name__ == "__main__":
   unittest.main()

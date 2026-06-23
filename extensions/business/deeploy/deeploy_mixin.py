@@ -1864,8 +1864,26 @@ class _DeeployMixin:
     Raises:
         ValueError: If neither plugins array nor legacy format is found
     """
+    per_node_config_keys = ("perNodeConfig", "PER_NODE_CONFIG")
+    top_level_per_node_config = [
+      key for key in per_node_config_keys
+      if key in request
+    ]
+    if len(top_level_per_node_config) > 1:
+      first_value = request.get(top_level_per_node_config[0])
+      for key in top_level_per_node_config[1:]:
+        if request.get(key) != first_value:
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.REQUEST3}. Conflicting top-level perNodeConfig values were provided."
+          )
+
     # Check if already using new format (plugins array)
     if DEEPLOY_KEYS.PLUGINS in request and request[DEEPLOY_KEYS.PLUGINS]:
+      if top_level_per_node_config:
+        raise ValueError(
+          f"{DEEPLOY_ERRORS.REQUEST3}. Top-level perNodeConfig is supported only with legacy single-plugin requests; "
+          "move it into the target plugins[] entry."
+        )
       return request
 
     # Try to convert from legacy format
@@ -1882,6 +1900,9 @@ class _DeeployMixin:
           **app_params
         }
       ]
+      if top_level_per_node_config:
+        key = top_level_per_node_config[0]
+        request[DEEPLOY_KEYS.PLUGINS][0][key] = request.get(key)
       return request
 
     # If neither format is present, raise error
@@ -3003,6 +3024,11 @@ class _DeeployMixin:
             if not isinstance(entry, dict):
               raise ValueError(
                 "DYNAMIC_ENV entry for '{}' must be a dictionary.".format(var_name)
+              )
+            if entry.get("source") == "shmem":
+              raise ValueError(
+                "DYNAMIC_ENV entry for '{}' uses unsupported source='shmem'; "
+                "backend shmem entries must use {{'type': 'shmem', 'path': [provider, key]}}.".format(var_name)
               )
             entry_type = entry.get("type")
             if not isinstance(entry_type, str) or not entry_type.strip():
