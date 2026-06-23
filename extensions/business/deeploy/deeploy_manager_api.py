@@ -771,6 +771,9 @@ class DeeployManagerApiPlugin(
           )
           inputs[DEEPLOY_KEYS.PLUGINS] = materialized_plugins
           inputs.plugins = materialized_plugins
+          # Validate the exact replacement payload, including omitted live plugins
+          # that were materialized from discovery, before any payment/node/delete work.
+          self._validate_plugins_array(materialized_plugins)
 
           if not has_request_job_app_type:
             replacement_job_app_type = deeploy_specs_payload.get(DEEPLOY_KEYS.JOB_APP_TYPE)
