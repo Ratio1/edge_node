@@ -250,6 +250,46 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
     self.assertEqual(producer.get("SEMAPHORED_KEYS", []), [])
     self.assertEqual(consumer["SEMAPHORED_KEYS"], ["app-1__native-api"])
 
+  def test_resolve_shmem_in_plugins_rewrites_stale_alias_to_current_provider_key(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "A_SIMPLE_PLUGIN",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-1",
+            DEEPLOY_KEYS.PLUGIN_NAME: "native-api",
+            "SEMAPHORE": "old-runtime-key",
+          }
+        ],
+      },
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "consumer-1",
+            DEEPLOY_KEYS.PLUGIN_NAME: "frontend",
+            "DYNAMIC_ENV": {
+              "API_HOST": [
+                {"type": "shmem", "path": ["old-runtime-key", "CONTAINER_IP"]},
+              ]
+            },
+          }
+        ],
+      },
+    ]
+
+    resolved = plugin._resolve_shmem_in_plugins(plugins, "app-1")
+    producer = resolved[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    consumer = resolved[1][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+
+    self.assertEqual(producer["SEMAPHORE"], "app-1__native-api")
+    self.assertEqual(
+      consumer["DYNAMIC_ENV"]["API_HOST"][0]["path"],
+      ["app-1__native-api", "CONTAINER_IP"],
+    )
+    self.assertEqual(consumer["SEMAPHORED_KEYS"], ["app-1__native-api"])
+
   def test_resolve_shmem_in_plugins_rejects_cross_app_provider_key(self):
     plugin = make_deeploy_plugin()
     plugins = [

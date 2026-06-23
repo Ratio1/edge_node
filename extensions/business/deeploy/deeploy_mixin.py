@@ -2902,7 +2902,8 @@ class _DeeployMixin:
             if provider_name in name_to_key:
               sem_key = name_to_key[provider_name]
             elif provider_name in key_to_name:
-              sem_key = provider_name
+              mapped_name = key_to_name.get(provider_name)
+              sem_key = name_to_key.get(mapped_name, provider_name)
             else:
               raise ValueError(
                 "DYNAMIC_ENV shmem references unknown plugin '{}'. "
