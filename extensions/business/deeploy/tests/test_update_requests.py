@@ -551,6 +551,182 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertNotIn(response_key_field, instance)
     self.assertNotIn(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, saved_pipeline["DEEPLOY_SPECS"])
 
+  def test_update_pipeline_on_nodes_recovers_duplicate_stale_named_semaphores_with_autowire(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"start": 0, "reset": 0}
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+
+    def start_pipeline(**kwargs):
+      called["start"] += 1
+      return {
+        "PLUGINS": kwargs["plugins"],
+        "DEEPLOY_SPECS": kwargs["deeploy_specs"],
+      }
+
+    plugin.cmdapi_start_pipeline_by_params = start_pipeline
+    response_key_field = plugin.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
+    inputs = make_inputs(
+      app_alias="app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=True,
+      plugins=[
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native-1",
+          DEEPLOY_KEYS.PLUGIN_NAME: "alpha",
+          "SEMAPHORE": "old-app__shared-api",
+          "PROCESS_DELAY": 5,
+        },
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native-2",
+          DEEPLOY_KEYS.PLUGIN_NAME: "beta",
+          "SEMAPHORE": "old-app__shared-api",
+          "PROCESS_DELAY": 5,
+        },
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "car-1",
+          DEEPLOY_KEYS.PLUGIN_NAME: "frontend",
+          "IMAGE": "repo/app:2.0",
+          "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+        },
+      ],
+    )
+    discovered = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "native-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: "resp-native-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {"instance_conf": {"PROCESS_DELAY": 5}},
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "native-2",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: "resp-native-2",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {"instance_conf": {"PROCESS_DELAY": 5}},
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "car-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: "resp-car-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          },
+        },
+      },
+    ]
+
+    response_keys, saved_pipeline = plugin._DeeployMixin__update_pipeline_on_nodes(
+      ["node-1"],
+      inputs,
+      "app-123",
+      "app",
+      "void",
+      "owner",
+      discovered,
+      dct_deeploy_specs={"job_id": 11},
+      job_app_type="native",
+    )
+
+    native_alpha = saved_pipeline["PLUGINS"][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    native_beta = saved_pipeline["PLUGINS"][1][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    container_instance = saved_pipeline["PLUGINS"][2][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(native_alpha["SEMAPHORE"], "app-123__alpha")
+    self.assertEqual(native_beta["SEMAPHORE"], "app-123__beta")
+    self.assertEqual(container_instance["SEMAPHORED_KEYS"], ["app-123__alpha", "app-123__beta"])
+    self.assertEqual(native_alpha[response_key_field], "resp-native-1")
+    self.assertEqual(native_beta[response_key_field], "resp-native-2")
+    self.assertEqual(container_instance[response_key_field], "resp-car-1")
+    self.assertEqual(response_keys, {"node-1": ["resp-native-1", "resp-native-2", "resp-car-1"]})
+    self.assertEqual(saved_pipeline["DEEPLOY_SPECS"][DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS], response_keys)
+    self.assertEqual(called["start"], 1)
+    self.assertEqual(called["reset"], 1)
+
+  def test_update_pipeline_on_nodes_rejects_duplicate_final_autowire_semaphores(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"start": 0, "reset": 0}
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+    plugin.cmdapi_start_pipeline_by_params = lambda **kwargs: called.__setitem__("start", called["start"] + 1)
+
+    inputs = make_inputs(
+      app_alias="app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=False,
+      plugins=[
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native/a",
+          "PROCESS_DELAY": 5,
+        },
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native a",
+          "PROCESS_DELAY": 5,
+        },
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "car-1",
+          "IMAGE": "repo/app:2.0",
+          "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+        },
+      ],
+    )
+    discovered = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "native/a",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {"instance_conf": {"PROCESS_DELAY": 5}},
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "native a",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {"instance_conf": {"PROCESS_DELAY": 5}},
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "car-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          },
+        },
+      },
+    ]
+
+    with self.assertRaisesRegex(ValueError, "Duplicate final semaphore key"):
+      plugin._DeeployMixin__update_pipeline_on_nodes(
+        ["node-1"],
+        inputs,
+        "app-123",
+        "app",
+        "void",
+        "owner",
+        discovered,
+        dct_deeploy_specs={"job_id": 11},
+        job_app_type="native",
+      )
+
+    self.assertEqual(called["start"], 0)
+    self.assertEqual(called["reset"], 0)
+
   def test_process_update_rejects_dependency_tree_before_delete(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[

@@ -250,6 +250,120 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["reset"], 0)
     self.assertEqual(saved_pipeline["NAME"], "native-app_abc123")
 
+  def test_create_pipeline_on_nodes_recovers_duplicate_stale_named_semaphores_with_autowire(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"start": 0, "reset": 0}
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+
+    def start_pipeline(**kwargs):
+      called["start"] += 1
+      return {
+        "PLUGINS": kwargs["plugins"],
+        "DEEPLOY_SPECS": kwargs["deeploy_specs"],
+      }
+
+    plugin.cmdapi_start_pipeline_by_params = start_pipeline
+    inputs = make_inputs(
+      app_alias="native-app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=True,
+      plugins=[
+        make_plugin_entry(
+          "A_SIMPLE_PLUGIN",
+          instance_id="native-1",
+          plugin_name="alpha",
+          SEMAPHORE="old-app__shared-api",
+          PROCESS_DELAY=5,
+        ),
+        make_plugin_entry(
+          "A_SIMPLE_PLUGIN",
+          instance_id="native-2",
+          plugin_name="beta",
+          SEMAPHORE="old-app__shared-api",
+          PROCESS_DELAY=5,
+        ),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          instance_id="car-1",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "256m"},
+        ),
+      ],
+    )
+
+    response_keys, saved_pipeline = plugin._DeeployMixin__create_pipeline_on_nodes(
+      ["node-1"],
+      inputs,
+      "native-app_abc123",
+      "native-app",
+      "void",
+      "owner",
+      job_app_type="native",
+      dct_deeploy_specs={"job_id": 11},
+    )
+
+    native_instances = saved_pipeline["PLUGINS"][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES]
+    container_instance = saved_pipeline["PLUGINS"][1][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(native_instances[0]["SEMAPHORE"], "native-app_abc123__alpha")
+    self.assertEqual(native_instances[1]["SEMAPHORE"], "native-app_abc123__beta")
+    self.assertEqual(
+      container_instance["SEMAPHORED_KEYS"],
+      ["native-app_abc123__alpha", "native-app_abc123__beta"],
+    )
+    self.assertEqual(called["start"], 1)
+    self.assertEqual(called["reset"], 1)
+    self.assertEqual(len(response_keys["node-1"]), 3)
+    self.assertEqual(
+      saved_pipeline["DEEPLOY_SPECS"][DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS],
+      response_keys,
+    )
+
+  def test_create_pipeline_on_nodes_rejects_duplicate_final_autowire_semaphores(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"start": 0, "reset": 0}
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+    plugin.cmdapi_start_pipeline_by_params = lambda **kwargs: called.__setitem__("start", called["start"] + 1)
+
+    inputs = make_inputs(
+      app_alias="native-app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=False,
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native/a", PROCESS_DELAY=5),
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native a", PROCESS_DELAY=5),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          instance_id="car-1",
+          IMAGE="repo/app:latest",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "256m"},
+        ),
+      ],
+    )
+
+    with self.assertRaisesRegex(ValueError, "Duplicate final semaphore key"):
+      plugin._DeeployMixin__create_pipeline_on_nodes(
+        ["node-1"],
+        inputs,
+        "native-app_abc123",
+        "native-app",
+        "void",
+        "owner",
+        job_app_type="native",
+        dct_deeploy_specs={"job_id": 11},
+      )
+
+    self.assertEqual(called["start"], 0)
+    self.assertEqual(called["reset"], 0)
+
   def test_create_pipeline_on_nodes_strips_stale_chainstore_response_key_when_disabled(self):
     plugin = make_deeploy_plugin()
     plugin.time = lambda: 1_000.0

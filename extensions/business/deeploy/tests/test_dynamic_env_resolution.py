@@ -159,19 +159,52 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
       with self.assertRaisesRegex(ValueError, "Invalid plugin_name"):
         plugin._resolve_shmem_in_plugins(plugins, "app-1")
 
-  def test_resolve_shmem_in_plugins_rejects_conflicting_semaphore(self):
+  def test_resolve_shmem_in_plugins_accepts_duplicate_stale_named_semaphore_with_plugin_name_consumer(self):
     plugin = make_deeploy_plugin()
     plugins = [
       {
         plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "SOME_PLUGIN",
         plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
-          {plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "p-1", "plugin_name": "alpha", "SEMAPHORE": "shared-key"},
-          {plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "p-2", "plugin_name": "beta", "SEMAPHORE": "shared-key"},
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "p-1",
+            "plugin_name": "alpha",
+            "SEMAPHORE": "old-app__shared-provider",
+          },
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "p-2",
+            "plugin_name": "beta",
+            "SEMAPHORE": "old-app__shared-provider",
+          },
+        ],
+      },
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "consumer-1",
+            "plugin_name": "frontend",
+            "DYNAMIC_ENV": {
+              "API_PORT": [
+                {"type": "shmem", "path": ["alpha", "PORT"]},
+              ]
+            },
+          }
         ],
       },
     ]
-    with self.assertRaisesRegex(ValueError, "Duplicate semaphore key"):
-      plugin._resolve_shmem_in_plugins(plugins, "app-1")
+
+    resolved = plugin._resolve_shmem_in_plugins(plugins, "app-1")
+    alpha = resolved[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    beta = resolved[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][1]
+    consumer = resolved[1][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+
+    self.assertEqual(alpha["SEMAPHORE"], "app-1__alpha")
+    self.assertEqual(beta["SEMAPHORE"], "app-1__beta")
+    self.assertEqual(
+      consumer["DYNAMIC_ENV"]["API_PORT"][0]["path"],
+      ["app-1__alpha", "PORT"],
+    )
+    self.assertEqual(consumer["SEMAPHORED_KEYS"], ["app-1__alpha"])
 
   def test_resolve_shmem_in_plugins_accepts_explicit_semaphore_reference(self):
     plugin = make_deeploy_plugin()
@@ -384,6 +417,81 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
       ["app-1__native-api", "CONTAINER_IP"],
     )
     self.assertEqual(consumer["SEMAPHORED_KEYS"], ["app-1__native-api"])
+
+  def test_resolve_shmem_in_plugins_rewrites_stale_app_alias_to_current_provider_key(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "A_SIMPLE_PLUGIN",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-1",
+            DEEPLOY_KEYS.PLUGIN_NAME: "native-api",
+            "SEMAPHORE": "old-app__native-api",
+          }
+        ],
+      },
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "consumer-1",
+            DEEPLOY_KEYS.PLUGIN_NAME: "frontend",
+            "DYNAMIC_ENV": {
+              "API_HOST": [
+                {"type": "shmem", "path": ["old-app__native-api", "CONTAINER_IP"]},
+              ]
+            },
+          }
+        ],
+      },
+    ]
+
+    resolved = plugin._resolve_shmem_in_plugins(plugins, "app-1")
+    consumer = resolved[1][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+
+    self.assertEqual(
+      consumer["DYNAMIC_ENV"]["API_HOST"][0]["path"],
+      ["app-1__native-api", "CONTAINER_IP"],
+    )
+    self.assertEqual(consumer["SEMAPHORED_KEYS"], ["app-1__native-api"])
+
+  def test_resolve_shmem_in_plugins_rejects_ambiguous_duplicate_stale_alias_consumer(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "A_SIMPLE_PLUGIN",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-1",
+            DEEPLOY_KEYS.PLUGIN_NAME: "alpha",
+            "SEMAPHORE": "old-app__shared-api",
+          },
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-2",
+            DEEPLOY_KEYS.PLUGIN_NAME: "beta",
+            "SEMAPHORE": "old-app__shared-api",
+          },
+        ],
+      },
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "consumer-1",
+            DEEPLOY_KEYS.PLUGIN_NAME: "frontend",
+            "DYNAMIC_ENV": {
+              "API_HOST": [
+                {"type": "shmem", "path": ["old-app__shared-api", "CONTAINER_IP"]},
+              ]
+            },
+          }
+        ],
+      },
+    ]
+
+    with self.assertRaisesRegex(ValueError, "ambiguous semaphore key 'old-app__shared-api'"):
+      plugin._resolve_shmem_in_plugins(plugins, "app-1")
 
   def test_resolve_shmem_in_plugins_rejects_cross_app_provider_key(self):
     plugin = make_deeploy_plugin()

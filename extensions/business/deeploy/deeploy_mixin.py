@@ -757,6 +757,7 @@ class _DeeployMixin:
       plugins=plugins,
       job_app_type=detected_job_app_type,
     )
+    self._validate_final_emitted_semaphore_keys(plugins)
 
     node_plugins_by_addr = {}
     for addr in nodes:
@@ -947,7 +948,9 @@ class _DeeployMixin:
 
       chainstore_key = plugin.get(DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY)
       if chainstore_key:
-        prepared_plugin[DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_key
+        prepared_instances = prepared_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+        if prepared_instances and isinstance(prepared_instances[0], dict):
+          prepared_instances[0][self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_key
 
       plugins_by_node[addr].append(prepared_plugin)
 
@@ -993,11 +996,13 @@ class _DeeployMixin:
       self._validate_plugin_runtime_keys(node_plugins)
       if self._has_shmem_dynamic_env(node_plugins):
         node_plugins = self._resolve_shmem_in_plugins(node_plugins, app_id)
-      plugins_by_node[addr] = self._autowire_native_container_semaphore(
+      node_plugins = self._autowire_native_container_semaphore(
         app_id=app_id,
         plugins=node_plugins,
         job_app_type=detected_job_app_type,
       )
+      self._validate_final_emitted_semaphore_keys(node_plugins)
+      plugins_by_node[addr] = node_plugins
 
     pipeline_to_save = None
     node_plugins_ready = {}
@@ -2761,11 +2766,51 @@ class _DeeployMixin:
 
   def _validate_plugin_runtime_keys(self, plugins):
     """
-    Validate runtime metadata that can affect cross-plugin wiring.
+    Validate runtime metadata before shmem resolution/autowire.
 
-    Explicit semaphore keys are provider namespaces. They must be unique even
-    when no shmem DYNAMIC_ENV consumer is present, because duplicate providers
-    collide once deployed.
+    Named instances can carry stale SEMAPHORE runtime metadata from a previous
+    deployment. That metadata is rewritten later from app_id + plugin_name, so
+    duplicate inbound SEMAPHORE values on named instances are not final yet.
+
+    Unnamed instances have no logical name to recompute from. Their SEMAPHORE
+    values are explicit provider namespaces and must be unique before any
+    dispatch path can continue.
+    """
+    self._validate_plugin_names(plugins)
+    used_semaphores = {}
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        if instance.get(DEEPLOY_KEYS.PLUGIN_NAME):
+          continue
+        sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
+        if sem is None:
+          continue
+        sem = str(sem)
+        if not sem:
+          continue
+        provider_id = (
+          instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          or instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+          or sem
+        )
+        if sem in used_semaphores:
+          raise ValueError(
+            "Duplicate semaphore key '{}'. Provider '{}' already uses this key.".format(
+              sem,
+              used_semaphores[sem],
+            )
+          )
+        used_semaphores[sem] = provider_id
+
+  def _validate_final_emitted_semaphore_keys(self, plugins):
+    """
+    Validate final SEMAPHORE values after shmem resolution/autowire.
+
+    At this point named providers have had stale runtime values replaced with
+    current derived keys, so any duplicate SEMAPHORE value is a real deployment
+    collision and must fail before node payload assembly.
     """
     self._validate_plugin_names(plugins)
     used_semaphores = {}
@@ -2786,7 +2831,7 @@ class _DeeployMixin:
         )
         if sem in used_semaphores:
           raise ValueError(
-            "Duplicate semaphore key '{}'. Provider '{}' already uses this key.".format(
+            "Duplicate final semaphore key '{}'. Provider '{}' already emits this key.".format(
               sem,
               used_semaphores[sem],
             )
@@ -2813,11 +2858,14 @@ class _DeeployMixin:
     list
       Modified plugins with shmem references resolved.
     """
-    # Build provider lookup tables. We allow both plugin names and explicit
-    # semaphore keys for shmem providers.
+    # Build provider lookup tables. We allow plugin names, current derived
+    # semaphore keys, explicit unnamed semaphore keys, and stale inbound aliases
+    # carried by named providers.
     # For named instances, SEMAPHORE is always derived from app_id + plugin_name.
     name_to_key = {}
-    key_to_name = {}
+    canonical_key_to_name = {}
+    stale_alias_to_names = {}
+    explicit_key_to_provider = {}
     used_names = set()
     normalized_app_id = app_id.strip() if isinstance(app_id, str) else None
 
@@ -2836,6 +2884,14 @@ class _DeeployMixin:
           "DYNAMIC_ENV shmem path for '{}' has empty target key.".format(var_name)
         )
       return provider_name, target_key
+
+    def add_stale_alias(alias, provider_name):
+      if alias is None:
+        return
+      alias = str(alias)
+      if not alias:
+        return
+      stale_alias_to_names.setdefault(alias, set()).add(provider_name)
 
     for plugin in plugins:
       for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
@@ -2859,7 +2915,7 @@ class _DeeployMixin:
           instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORE] = sem_key
           name_to_key[pname] = sem_key
 
-          existing_name = key_to_name.get(sem_key)
+          existing_name = canonical_key_to_name.get(sem_key)
           if existing_name is not None and existing_name != pname:
             raise ValueError(
               "Duplicate semaphore key '{}'. plugin_name '{}' and '{}' resolve to the same key.".format(
@@ -2868,43 +2924,27 @@ class _DeeployMixin:
                 pname,
               )
             )
-          key_to_name[sem_key] = pname
+          canonical_key_to_name[sem_key] = pname
 
           if sem:
-            existing_name = key_to_name.get(sem)
-            if existing_name is not None and existing_name != pname:
-              raise ValueError(
-                "Duplicate semaphore key '{}'. plugin_name '{}' and '{}' resolve to the same key.".format(
-                  sem,
-                  existing_name,
-                  pname,
-                )
-              )
-            # Keep only explicit keys from the same app as compatibility aliases.
-            if normalized_app_id is None or sem == sem_key or sem == pname or not "__" in sem or sem.startswith(
-              "{}__".format(normalized_app_id)
-            ):
-              key_to_name[sem] = pname
+            add_stale_alias(sem, pname)
 
         elif sem:
-          is_legacy_sem = not "__" in sem
-          is_current_app_sem = normalized_app_id is not None and sem.startswith("{}__".format(normalized_app_id))
-          if is_legacy_sem or is_current_app_sem:
-            if sem in key_to_name:
-              existing_name = key_to_name.get(sem)
-              raise ValueError(
-                "Duplicate semaphore key '{}'. Unresolved provider key '{}' already maps to '{}'.".format(
-                  sem,
-                  sem,
-                  existing_name,
-                )
+          provider_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID) or sem
+          if sem in explicit_key_to_provider:
+            existing_name = explicit_key_to_provider.get(sem)
+            raise ValueError(
+              "Duplicate semaphore key '{}'. Unresolved provider key '{}' already maps to '{}'.".format(
+                sem,
+                sem,
+                existing_name,
               )
-            provider_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID) or sem
-            key_to_name[sem] = provider_id
+            )
+          explicit_key_to_provider[sem] = provider_id
 
     if not name_to_key:
       # Still allow semaphored references when only direct SEMAPHORE references exist.
-      known_keys = sorted(key_to_name.keys())
+      known_keys = sorted(explicit_key_to_provider.keys())
       for plugin in plugins:
         for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
           if not isinstance(instance, dict):
@@ -2923,7 +2963,7 @@ class _DeeployMixin:
                 continue
               path = entry.get("path")
               provider_name, target_key = validate_shmem_path(path, var_name)
-              if provider_name not in key_to_name:
+              if provider_name not in explicit_key_to_provider:
                 raise ValueError(
                   "DYNAMIC_ENV shmem references unknown plugin '{}'. "
                   "Available providers: {}".format(provider_name, known_keys)
@@ -2956,15 +2996,41 @@ class _DeeployMixin:
             provider_name, target_key = validate_shmem_path(path, var_name)
             if provider_name in name_to_key:
               sem_key = name_to_key[provider_name]
-            elif provider_name in key_to_name:
-              mapped_name = key_to_name.get(provider_name)
+            elif provider_name in canonical_key_to_name:
+              mapped_name = canonical_key_to_name.get(provider_name)
               sem_key = name_to_key.get(mapped_name, provider_name)
+            elif (
+              provider_name in stale_alias_to_names
+              or provider_name in explicit_key_to_provider
+            ):
+              target_keys = set()
+              provider_labels = set()
+              for mapped_name in stale_alias_to_names.get(provider_name, set()):
+                provider_labels.add(mapped_name)
+                target_keys.add(name_to_key.get(mapped_name, provider_name))
+              if provider_name in explicit_key_to_provider:
+                provider_labels.add(explicit_key_to_provider[provider_name])
+                target_keys.add(provider_name)
+              if len(target_keys) > 1:
+                raise ValueError(
+                  "DYNAMIC_ENV shmem references ambiguous semaphore key '{}'. "
+                  "It matches providers: {}. Use plugin_name instead.".format(
+                    provider_name,
+                    sorted(provider_labels),
+                  )
+                )
+              sem_key = next(iter(target_keys))
             else:
               raise ValueError(
                 "DYNAMIC_ENV shmem references unknown plugin '{}'. "
                 "Available providers: {}".format(
                   provider_name,
-                  sorted(set(name_to_key.keys()) | set(key_to_name.keys())),
+                  sorted(
+                    set(name_to_key.keys())
+                    | set(canonical_key_to_name.keys())
+                    | set(stale_alias_to_names.keys())
+                    | set(explicit_key_to_provider.keys())
+                  ),
                 )
               )
             entry["path"] = [sem_key, target_key]
@@ -3346,6 +3412,7 @@ class _DeeployMixin:
 
       if app_id and self._has_shmem_dynamic_env(prepared_plugins):
         prepared_plugins = self._resolve_shmem_in_plugins(prepared_plugins, app_id)
+        self._validate_final_emitted_semaphore_keys(prepared_plugins)
 
       return prepared_plugins
 
