@@ -989,6 +989,149 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
     self.assertEqual(prepared_api["PROCESS_DELAY"], 10)
 
+  def test_process_update_validates_materialized_replacement_payload_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "api",
+              "IMAGE": "repo/api:1.0",
+              "CONTAINER_RESOURCES": {"cpu": "0.5", "memory": "256m", "storage": "1g"},
+            },
+          },
+        },
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "worker-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "IMAGE": "repo/worker:1.0",
+              "CONTAINER_RESOURCES": {"cpu": "0.5", "memory": "256m", "storage": "1g"},
+            },
+          },
+        },
+      ],
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "stack",
+      },
+    )
+    validation_calls = []
+
+    def assert_full_replacement_payload(inputs, context):
+      plugins = inputs.get(DEEPLOY_KEYS.PLUGINS)
+      plugin_ids = [
+        entry.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        for entry in plugins
+      ]
+      validation_calls.append((context, plugin_ids, inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE)))
+      self.assertEqual(set(plugin_ids), {"api-instance", "worker-instance"})
+      self.assertEqual(inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE), "stack")
+
+    def check_payment_and_owner(inputs, *args, **kwargs):
+      assert_full_replacement_payload(inputs, "payment")
+      return True
+
+    def check_nodes_availability(inputs):
+      assert_full_replacement_payload(inputs, "nodes")
+      return ["node-1"]
+
+    plugin.deeploy_check_payment_and_job_owner = check_payment_and_owner
+    plugin._check_nodes_availability = check_nodes_availability
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "api-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "IMAGE": "repo/api:2.0",
+            "CONTAINER_RESOURCES": {"cpu": "0.5", "memory": "256m", "storage": "1g"},
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    self.assertEqual([context for context, _, _ in validation_calls], ["payment", "nodes"])
+
+  def test_process_update_rejects_ambiguous_containerized_replacement_type_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "api",
+              "IMAGE": "repo/api:1.0",
+              "CONTAINER_RESOURCES": {"cpu": "0.5", "memory": "256m", "storage": "1g"},
+            },
+          },
+        },
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "worker-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "IMAGE": "repo/worker:1.0",
+              "CONTAINER_RESOURCES": {"cpu": "0.5", "memory": "256m", "storage": "1g"},
+            },
+          },
+        },
+      ],
+      deeploy_specs={DEEPLOY_KEYS.JOB_ID: 11},
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "api-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "IMAGE": "repo/api:2.0",
+            "CONTAINER_RESOURCES": {"cpu": "0.5", "memory": "256m", "storage": "1g"},
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("omitted job_app_type", response[DEEPLOY_KEYS.ERROR])
+    self.assertIn("containerized replacement payload", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
   def test_process_update_does_not_append_consumed_no_id_update_as_new_plugin(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[

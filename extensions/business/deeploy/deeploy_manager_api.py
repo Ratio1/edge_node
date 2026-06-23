@@ -21,6 +21,7 @@ from .deeploy_const import (
   DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST,
   DEEPLOY_NODE_SPECS_REQUEST, DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
   DEEPLOY_GET_PREFERRED_NODES_REQUEST, DEEPLOY_SAVE_PREFERRED_NODES_REQUEST,
+  CONTAINERIZED_APPS_SIGNATURES,
 )
   
 
@@ -636,6 +637,7 @@ class DeeployManagerApiPlugin(
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
       job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE, None)
+      has_request_job_app_type = bool(job_app_type)
       if job_app_type:
         job_app_type = str(job_app_type).lower()
         if job_app_type not in JOB_APP_TYPES_ALL:
@@ -659,13 +661,6 @@ class DeeployManagerApiPlugin(
           msg = f"{DEEPLOY_ERRORS.REQUEST13}: App ID is required."
           raise ValueError(msg)
 
-      # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
-      if not is_valid:
-        msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
-        raise ValueError(msg)
-      # TODO: Add check if jobType resources match the requested resources.
-
       # Get nodes based on operation type
       discovered_plugin_instances = []
       deployment_nodes = []
@@ -677,6 +672,12 @@ class DeeployManagerApiPlugin(
       skip_create_response_key_reset = False
       previous_pipeline_cid = None
       if is_create:
+        is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
+        if not is_valid:
+          msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
+          raise ValueError(msg)
+        # TODO: Add check if jobType resources match the requested resources.
+
         deployment_nodes = self._check_nodes_availability(inputs)
         confirmation_nodes = list(deployment_nodes)
         nodes_changed = True
@@ -746,14 +747,6 @@ class DeeployManagerApiPlugin(
           job_id=job_id,
         )
 
-        validated_nodes = self._check_nodes_availability(inputs)
-        if set(validated_nodes) != set(deployment_targets):
-          msg = (
-            f"{DEEPLOY_ERRORS.NODES2}: Failed to validate requested target nodes. "
-            f"Expected {deployment_targets}, validated {validated_nodes}."
-          )
-          raise ValueError(msg)
-
         if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
           msg = (
             f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
@@ -778,6 +771,48 @@ class DeeployManagerApiPlugin(
           )
           inputs[DEEPLOY_KEYS.PLUGINS] = materialized_plugins
           inputs.plugins = materialized_plugins
+
+          if not has_request_job_app_type:
+            replacement_job_app_type = deeploy_specs_payload.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+            if isinstance(replacement_job_app_type, str):
+              replacement_job_app_type = replacement_job_app_type.lower()
+            if replacement_job_app_type in JOB_APP_TYPES_ALL:
+              job_app_type = replacement_job_app_type
+            else:
+              plugins_for_detection = self.deeploy_prepare_plugins(inputs)
+              job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
+              has_containerized_replacement = any(
+                isinstance(plugin_entry, dict) and
+                isinstance(plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE), str) and
+                plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE).upper() in CONTAINERIZED_APPS_SIGNATURES
+                for plugin_entry in materialized_plugins
+              )
+              if job_app_type == JOB_APP_TYPES.NATIVE and has_containerized_replacement:
+                msg = (
+                  f"{DEEPLOY_ERRORS.REQUEST3}. Update request omitted job_app_type and the live "
+                  "deeploy_specs do not identify the replacement job_app_type for a containerized "
+                  "replacement payload. Provide job_app_type explicitly."
+                )
+                raise ValueError(msg)
+              if job_app_type not in JOB_APP_TYPES_ALL:
+                job_app_type = JOB_APP_TYPES.NATIVE
+            inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
+            inputs.job_app_type = job_app_type
+            self.P(f"Detected replacement job app type: {job_app_type}")
+
+        is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
+        if not is_valid:
+          msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
+          raise ValueError(msg)
+        # TODO: Add check if jobType resources match the requested resources.
+
+        validated_nodes = self._check_nodes_availability(inputs)
+        if set(validated_nodes) != set(deployment_targets):
+          msg = (
+            f"{DEEPLOY_ERRORS.NODES2}: Failed to validate requested target nodes. "
+            f"Expected {deployment_targets}, validated {validated_nodes}."
+          )
+          raise ValueError(msg)
 
         # Validate and prepare the exact create payload before any destructive action.
         prepared_create_deploy_plan = self._prepare_create_pipeline_deploy_plan(
