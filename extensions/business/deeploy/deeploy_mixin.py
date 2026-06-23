@@ -1130,6 +1130,7 @@ class _DeeployMixin:
       validation_inputs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE] = False
     except Exception:
       setattr(validation_inputs, DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False)
+    self._validate_dependency_tree(validation_inputs)
     return self.__update_pipeline_on_nodes(
       update_nodes,
       validation_inputs,
@@ -2990,14 +2991,14 @@ class _DeeployMixin:
     instance receives SEMAPHORED_KEYS containing all native semaphore keys.
 
     This is only meant for the simple native + CAR/WAR pattern. When the user
-    provides explicit shmem DYNAMIC_ENV references or manual SEMAPHORE /
-    SEMAPHORED_KEYS config, this autowiring is skipped entirely and the user's
-    explicit dependency tree takes precedence.
+    provides explicit shmem DYNAMIC_ENV references, this autowiring is skipped
+    and the user's explicit dependency tree takes precedence. Inbound SEMAPHORE
+    / SEMAPHORED_KEYS values are treated as runtime metadata and replaced with
+    values derived for the current app.
 
     Skips autowiring when:
     - job_app_type is not NATIVE
     - Fewer than 2 signature groups (need both a native and a containerized group)
-    - SEMAPHORE / SEMAPHORED_KEYS already present on any instance
     - Explicit shmem DYNAMIC_ENV entries detected (user-defined dependency tree)
 
     Parameters
@@ -3020,29 +3021,6 @@ class _DeeployMixin:
       # end if
 
       if not isinstance(plugins, list) or len(plugins) < 2:
-        return plugins
-      # end if
-
-      def has_semaphore_config(plugin_list):
-        for plugin in plugin_list:
-          instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-          if not isinstance(instances, list):
-            continue
-          # end if
-          for instance in instances:
-            if not isinstance(instance, dict):
-              continue
-            # end if
-            if "SEMAPHORE" in instance or "SEMAPHORED_KEYS" in instance:
-              return True
-            # end if
-          # end for instance
-        # end for plugin
-        return False
-      # end has_semaphore_config
-
-      if has_semaphore_config(plugins):
-        self.Pd("Skipping semaphore autowire; semaphore config already provided.")
         return plugins
       # end if
 
@@ -3084,6 +3062,8 @@ class _DeeployMixin:
           if not isinstance(instance, dict):
             continue
           # end if
+          instance.pop("SEMAPHORE", None)
+          instance.pop("SEMAPHORED_KEYS", None)
           instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
           if not instance_id:
             continue
@@ -3092,13 +3072,6 @@ class _DeeployMixin:
           if plugin_name:
             self._validate_plugin_name(plugin_name)
           semaphore_key = "{}__{}".format(app_id, plugin_name) if plugin_name else self.sanitize_name("{}__{}".format(app_id, instance_id))
-          existing_sem = instance.get("SEMAPHORE")
-          if existing_sem and existing_sem != semaphore_key:
-            raise ValueError(
-              "plugin_name '{}' implies SEMAPHORE '{}' but instance already has '{}'.".format(
-                plugin_name or instance_id, semaphore_key, existing_sem
-              )
-            )
           instance["SEMAPHORE"] = semaphore_key
           semaphore_keys.append(semaphore_key)
         # end for instance
@@ -3118,6 +3091,8 @@ class _DeeployMixin:
           if not isinstance(instance, dict):
             continue
           # end if
+          instance.pop("SEMAPHORE", None)
+          instance.pop("SEMAPHORED_KEYS", None)
           instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
         # end for instance
       # end for container_plugin
