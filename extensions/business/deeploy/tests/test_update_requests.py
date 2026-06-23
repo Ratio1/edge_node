@@ -1,6 +1,7 @@
 import unittest
+from collections import defaultdict
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS
+from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS, DEEPLOY_PLUGIN_DATA
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs
 
 
@@ -167,6 +168,60 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(instance["DYNAMIC_ENV"]["UPSTREAM_PORT"], [
       {"type": "shmem", "path": ["native-agent", "PORT"]},
     ])
+
+  def test_validate_update_request_fails_without_dispatching_changes(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"cmd": 0, "reset": 0}
+    plugin.cmdapi_start_pipeline_by_params = lambda **kwargs: called.__setitem__("cmd", called["cmd"] + 1)
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+
+    inputs = make_inputs(
+      app_alias="app",
+      job_id=11,
+      pipeline_input_type="void",
+      chainstore_response=True,
+      plugins=[
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "missing-instance",
+          "IMAGE": "repo/app:1.0",
+          "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+        },
+      ],
+    )
+    discovered = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "current-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: "resp-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          },
+        },
+      },
+    ]
+
+    with self.assertRaisesRegex(ValueError, "Unknown plugin instance_id"):
+      plugin._validate_update_pipeline_request(
+        owner="owner",
+        inputs=inputs,
+        app_id="app-123",
+        app_alias="app",
+        app_type="void",
+        update_nodes=["node-1"],
+        discovered_plugin_instances=discovered,
+        dct_deeploy_specs={"job_id": 11},
+        job_app_type="generic",
+      )
+
+    self.assertEqual(called["cmd"], 0)
+    self.assertEqual(called["reset"], 0)
 
 
 if __name__ == "__main__":

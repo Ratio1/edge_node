@@ -651,6 +651,7 @@ class DeeployManagerApiPlugin(
       confirmation_nodes = []
       nodes_changed = False
       deeploy_specs_for_update = None
+      deeploy_specs_payload = None
       previous_pipeline_cid = None
       if is_create:
         deployment_nodes = self._check_nodes_availability(inputs)
@@ -730,6 +731,35 @@ class DeeployManagerApiPlugin(
           )
           raise ValueError(msg)
 
+        if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
+          msg = (
+            f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
+            f"{type(deeploy_specs_for_update).__name__}."
+          )
+          raise ValueError(msg)
+        deeploy_specs_payload = (
+          self.deepcopy(deeploy_specs_for_update)
+          if isinstance(deeploy_specs_for_update, dict)
+          else {}
+        )
+        deeploy_specs_payload = self._ensure_deeploy_specs_job_config(
+          deeploy_specs_payload,
+          pipeline_params=pipeline_params,
+        )
+
+        # Validate prepared update payloads before deleting existing pipelines.
+        self._validate_update_pipeline_request(
+          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+          inputs=inputs,
+          app_id=app_id,
+          app_alias=app_alias,
+          app_type=app_type,
+          update_nodes=validated_nodes,
+          discovered_plugin_instances=discovered_plugin_instances,
+          dct_deeploy_specs=deeploy_specs_payload,
+          job_app_type=job_app_type,
+        )
+
         # All validations passed; remove the running job and immediately redeploy.
         self.delete_pipeline_from_nodes(
           app_id=app_id,
@@ -748,21 +778,22 @@ class DeeployManagerApiPlugin(
       inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_nodes)
       inputs.target_nodes_count = len(deployment_nodes)
 
-      if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
-        msg = (
-          f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
-          f"{type(deeploy_specs_for_update).__name__}."
+      if deeploy_specs_payload is None:
+        if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
+          msg = (
+            f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
+            f"{type(deeploy_specs_for_update).__name__}."
+          )
+          raise ValueError(msg)
+        deeploy_specs_payload = (
+          self.deepcopy(deeploy_specs_for_update)
+          if isinstance(deeploy_specs_for_update, dict)
+          else {}
         )
-        raise ValueError(msg)
-      deeploy_specs_payload = (
-        self.deepcopy(deeploy_specs_for_update)
-        if isinstance(deeploy_specs_for_update, dict)
-        else {}
-      )
-      deeploy_specs_payload = self._ensure_deeploy_specs_job_config(
-        deeploy_specs_payload,
-        pipeline_params=pipeline_params,
-      )
+        deeploy_specs_payload = self._ensure_deeploy_specs_job_config(
+          deeploy_specs_payload,
+          pipeline_params=pipeline_params,
+        )
 
       dct_status, str_status, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
