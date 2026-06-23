@@ -1345,7 +1345,7 @@ class DeeployManagerApiPlugin(
     - See create_pipeline endpoint for detailed parameter documentation and examples
 
     """
-    self.P(f"Received an update_pipeline request with body: {self.json_dumps(request)}")
+    self.P(f"Received an update_pipeline request with body: {self.json_dumps(self._redact_per_node_config_for_log(request))}")
     result = self._process_pipeline_request(request, is_create=False, async_mode=True)
     if isinstance(result, dict) and result.get('__pending__') is not None:
       return self._register_pending_deploy_request(result['__pending__'])
