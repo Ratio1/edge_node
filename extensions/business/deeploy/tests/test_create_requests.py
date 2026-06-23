@@ -163,6 +163,18 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "Duplicate plugin_name"):
       plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
 
+  def test_prepare_plugins_rejects_duplicate_explicit_semaphore_without_shmem(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native-1", SEMAPHORE="shared"),
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native-2", SEMAPHORE="shared"),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "Duplicate semaphore key"):
+      plugin.deeploy_prepare_plugins(inputs)
+
   def test_prepare_plugins_rejects_shmem_referencing_unknown_plugin(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
@@ -237,6 +249,52 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["start"], 1)
     self.assertEqual(called["reset"], 0)
     self.assertEqual(saved_pipeline["NAME"], "native-app_abc123")
+
+  def test_create_pipeline_on_nodes_strips_stale_chainstore_response_key_when_disabled(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: None
+
+    def start_pipeline(**kwargs):
+      return {
+        "PLUGINS": kwargs["plugins"],
+        "DEEPLOY_SPECS": kwargs["deeploy_specs"],
+      }
+
+    plugin.cmdapi_start_pipeline_by_params = start_pipeline
+    response_key_field = plugin.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
+    inputs = make_inputs(
+      app_alias="native-app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=False,
+      plugins=[
+        make_plugin_entry(
+          "A_SIMPLE_PLUGIN",
+          plugin_name="native-api",
+          PROCESS_DELAY=5,
+          **{response_key_field: "stale-response-key"},
+        ),
+      ],
+    )
+
+    response_keys, saved_pipeline = plugin._DeeployMixin__create_pipeline_on_nodes(
+      ["node-1"],
+      inputs,
+      "native-app_abc123",
+      "native-app",
+      "void",
+      "owner",
+      job_app_type="native",
+      dct_deeploy_specs={"job_id": 11, DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS: {"node-1": ["old-key"]}},
+    )
+
+    instance = saved_pipeline["PLUGINS"][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(response_keys, {})
+    self.assertNotIn(response_key_field, instance)
+    self.assertNotIn(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, saved_pipeline["DEEPLOY_SPECS"])
 
 
 if __name__ == "__main__":

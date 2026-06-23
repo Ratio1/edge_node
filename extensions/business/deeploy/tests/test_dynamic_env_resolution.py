@@ -211,6 +211,61 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
     )
     self.assertEqual(consumer["SEMAPHORED_KEYS"], ["app-1__legacy-api"])
 
+  def test_resolve_shmem_in_plugins_rejects_duplicate_explicit_semaphore_providers(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "NATIVE_APP",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-1",
+            "SEMAPHORE": "shared",
+          },
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-2",
+            "SEMAPHORE": "shared",
+          },
+        ],
+      },
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "car-1",
+            "DYNAMIC_ENV": {
+              "API_PORT": [
+                {"type": "shmem", "path": ["shared", "PORT"]}
+              ]
+            },
+          }
+        ],
+      },
+    ]
+
+    with self.assertRaisesRegex(ValueError, "Duplicate semaphore key"):
+      plugin._resolve_shmem_in_plugins(plugins, "app-1")
+
+  def test_validate_plugin_runtime_keys_rejects_duplicate_explicit_semaphore_without_shmem(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "NATIVE_APP",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-1",
+            "SEMAPHORE": "shared",
+          },
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-2",
+            "SEMAPHORE": "shared",
+          },
+        ],
+      },
+    ]
+
+    with self.assertRaisesRegex(ValueError, "Duplicate semaphore key"):
+      plugin._validate_plugin_runtime_keys(plugins)
+
   def test_resolve_shmem_in_plugins_recomputes_named_semaphore(self):
     plugin = make_deeploy_plugin()
     plugins = [

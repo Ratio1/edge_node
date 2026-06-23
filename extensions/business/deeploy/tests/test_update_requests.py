@@ -27,12 +27,55 @@ sys.modules.setdefault(
   _supervisor_module,
 )
 
+from naeural_core import constants as ct
+
 from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS, DEEPLOY_PLUGIN_DATA
 from extensions.business.deeploy.deeploy_manager_api import DeeployManagerApiPlugin
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs
 
 
 class DeeployUpdateRequestPreparationTests(unittest.TestCase):
+
+  def _make_process_update_plugin(self, discovered_instances, nodes=None, deeploy_specs=None):
+    plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
+    plugin.ct = ct
+    plugin.cfg_deeploy_verbose = 0
+    plugin.deepcopy = copy.deepcopy
+    plugin.defaultdict = defaultdict
+    plugin.time = lambda: 1_000.0
+    plugin.sanitize_name = lambda value: str(value).replace("/", "_").replace(" ", "_")
+    plugin.P = lambda *args, **kwargs: None
+    plugin.Pd = lambda *args, **kwargs: None
+    plugin.json_dumps = lambda obj, **kwargs: str(obj)
+    plugin._get_response = lambda dct_data: dct_data
+    plugin._DeeployManagerApiPlugin__ensure_eth_balance = lambda: None
+    plugin._DeeployManagerApiPlugin__handle_error = lambda exc, request: {
+      DEEPLOY_KEYS.STATUS: "failed",
+      DEEPLOY_KEYS.ERROR: str(exc),
+    }
+    plugin.deeploy_verify_and_get_inputs = lambda request, **kwargs: ("0xSender", make_inputs(**request))
+    plugin._normalize_plugins_input = lambda request: request
+    plugin.deeploy_get_auth_result = lambda inputs: {
+      DEEPLOY_KEYS.SENDER: "0xSender",
+      DEEPLOY_KEYS.SENDER_ESCROW: "0xEscrow",
+      DEEPLOY_KEYS.ESCROW_OWNER: "0xOwner",
+    }
+    plugin.deeploy_check_payment_and_job_owner = lambda *args, **kwargs: True
+    plugin._extract_pipeline_params = lambda inputs: {}
+    plugin._check_and_maybe_convert_address = lambda node: node
+    plugin._gather_running_pipeline_context = lambda **kwargs: {
+      "discovered_instances": discovered_instances,
+      "nodes": nodes or ["node-1"],
+      "deeploy_specs": deeploy_specs or {"job_id": 11},
+    }
+    plugin._get_pipeline_from_cstore = lambda job_id: None
+    plugin._ensure_plugin_instance_ids = lambda *args, **kwargs: None
+    plugin._check_nodes_availability = lambda inputs: nodes or ["node-1"]
+
+    called = {"delete": 0, "deploy": 0}
+    plugin.delete_pipeline_from_nodes = lambda **kwargs: called.__setitem__("delete", called["delete"] + 1)
+    plugin.check_and_deploy_pipelines = lambda **kwargs: called.__setitem__("deploy", called["deploy"] + 1)
+    return plugin, called
 
   def test_prepare_single_plugin_instance_update_uses_plugin_config_and_strips_signature_fields(self):
     plugin = make_deeploy_plugin()
@@ -308,31 +351,209 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["cmd"], 0)
     self.assertEqual(called["reset"], 0)
 
+  def test_validate_update_request_rejects_duplicate_plugin_names_before_dispatch(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"cmd": 0, "reset": 0}
+    plugin.cmdapi_start_pipeline_by_params = lambda **kwargs: called.__setitem__("cmd", called["cmd"] + 1)
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+
+    inputs = make_inputs(
+      app_alias="app",
+      job_id=11,
+      pipeline_input_type="void",
+      chainstore_response=False,
+      plugins=[
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native-instance",
+          DEEPLOY_KEYS.PLUGIN_NAME: "duplicate",
+          "PROCESS_DELAY": 5,
+        },
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "container-instance",
+          DEEPLOY_KEYS.PLUGIN_NAME: "duplicate",
+          "IMAGE": "repo/app:1.0",
+          "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+        },
+      ],
+    )
+    discovered = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "native-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "native",
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "container-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            DEEPLOY_KEYS.PLUGIN_NAME: "frontend",
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          },
+        },
+      },
+    ]
+
+    with self.assertRaisesRegex(ValueError, "Duplicate plugin_name"):
+      plugin._validate_update_pipeline_request(
+        owner="owner",
+        inputs=inputs,
+        app_id="app-123",
+        app_alias="app",
+        app_type="void",
+        update_nodes=["node-1"],
+        discovered_plugin_instances=discovered,
+        dct_deeploy_specs={"job_id": 11},
+        job_app_type="native",
+      )
+
+    self.assertEqual(called["cmd"], 0)
+    self.assertEqual(called["reset"], 0)
+
+  def test_validate_update_request_rejects_duplicate_explicit_semaphore_without_shmem_before_dispatch(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"cmd": 0, "reset": 0}
+    plugin.cmdapi_start_pipeline_by_params = lambda **kwargs: called.__setitem__("cmd", called["cmd"] + 1)
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+
+    inputs = make_inputs(
+      app_alias="app",
+      job_id=11,
+      pipeline_input_type="void",
+      chainstore_response=False,
+      plugins=[
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native-instance-1",
+          "SEMAPHORE": "shared",
+          "PROCESS_DELAY": 5,
+        },
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native-instance-2",
+          "SEMAPHORE": "shared",
+          "PROCESS_DELAY": 5,
+        },
+      ],
+    )
+    discovered = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "native-instance-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "native-instance-2",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "PROCESS_DELAY": 5,
+          },
+        },
+      },
+    ]
+
+    with self.assertRaisesRegex(ValueError, "Duplicate semaphore key"):
+      plugin._validate_update_pipeline_request(
+        owner="owner",
+        inputs=inputs,
+        app_id="app-123",
+        app_alias="app",
+        app_type="void",
+        update_nodes=["node-1"],
+        discovered_plugin_instances=discovered,
+        dct_deeploy_specs={"job_id": 11},
+        job_app_type="generic",
+      )
+
+    self.assertEqual(called["cmd"], 0)
+    self.assertEqual(called["reset"], 0)
+
+  def test_update_pipeline_on_nodes_strips_stale_chainstore_response_key_when_disabled(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: None
+    response_key_field = plugin.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
+
+    def start_pipeline(**kwargs):
+      return {
+        "PLUGINS": kwargs["plugins"],
+        "DEEPLOY_SPECS": kwargs["deeploy_specs"],
+      }
+
+    plugin.cmdapi_start_pipeline_by_params = start_pipeline
+    inputs = make_inputs(
+      app_alias="app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=False,
+      plugins=[
+        {
+          DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "current-instance",
+          "IMAGE": "repo/app:2.0",
+          "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          response_key_field: "stale-from-request",
+        },
+      ],
+    )
+    discovered = [
+      {
+        DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "current-instance",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+        DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+        DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: "stale-from-discovery",
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          },
+        },
+      },
+    ]
+
+    response_keys, saved_pipeline = plugin._DeeployMixin__update_pipeline_on_nodes(
+      ["node-1"],
+      inputs,
+      "app-123",
+      "app",
+      "void",
+      "owner",
+      discovered,
+      dct_deeploy_specs={"job_id": 11, DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS: {"node-1": ["old-key"]}},
+      job_app_type="generic",
+    )
+
+    instance = saved_pipeline["PLUGINS"][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(response_keys, {})
+    self.assertNotIn(response_key_field, instance)
+    self.assertNotIn(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, saved_pipeline["DEEPLOY_SPECS"])
+
   def test_process_update_rejects_dependency_tree_before_delete(self):
-    plugin = DeeployManagerApiPlugin.__new__(DeeployManagerApiPlugin)
-    plugin.cfg_deeploy_verbose = 0
-    plugin.deepcopy = copy.deepcopy
-    plugin.P = lambda *args, **kwargs: None
-    plugin.Pd = lambda *args, **kwargs: None
-    plugin.json_dumps = lambda obj, **kwargs: str(obj)
-    plugin._get_response = lambda dct_data: dct_data
-    plugin._DeeployManagerApiPlugin__ensure_eth_balance = lambda: None
-    plugin._DeeployManagerApiPlugin__handle_error = lambda exc, request: {
-      DEEPLOY_KEYS.STATUS: "failed",
-      DEEPLOY_KEYS.ERROR: str(exc),
-    }
-    plugin.deeploy_verify_and_get_inputs = lambda request, **kwargs: ("0xSender", make_inputs(**request))
-    plugin._normalize_plugins_input = lambda request: request
-    plugin.deeploy_get_auth_result = lambda inputs: {
-      DEEPLOY_KEYS.SENDER: "0xSender",
-      DEEPLOY_KEYS.SENDER_ESCROW: "0xEscrow",
-      DEEPLOY_KEYS.ESCROW_OWNER: "0xOwner",
-    }
-    plugin.deeploy_check_payment_and_job_owner = lambda *args, **kwargs: True
-    plugin._extract_pipeline_params = lambda inputs: {}
-    plugin._check_and_maybe_convert_address = lambda node: node
-    plugin._gather_running_pipeline_context = lambda **kwargs: {
-      "discovered_instances": [
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
         {
           DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "current-instance",
           DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
@@ -347,16 +568,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
           },
         },
       ],
-      "nodes": ["node-1"],
-      "deeploy_specs": {"job_id": 11},
-    }
-    plugin._get_pipeline_from_cstore = lambda job_id: None
-    plugin._ensure_plugin_instance_ids = lambda *args, **kwargs: None
-    plugin._check_nodes_availability = lambda inputs: ["node-1"]
-
-    called = {"delete": 0, "deploy": 0}
-    plugin.delete_pipeline_from_nodes = lambda **kwargs: called.__setitem__("delete", called["delete"] + 1)
-    plugin.check_and_deploy_pipelines = lambda **kwargs: called.__setitem__("deploy", called["deploy"] + 1)
+    )
 
     response = plugin._process_pipeline_request(
       {
@@ -386,6 +598,69 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
 
     self.assertIn("Circular dependency", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
+  def test_process_update_rejects_duplicate_plugin_names_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "native-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "native",
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "container-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "frontend",
+              "IMAGE": "repo/app:1.0",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "native-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "duplicate",
+            "PROCESS_DELAY": 5,
+          },
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "container-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "duplicate",
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("Duplicate plugin_name", response[DEEPLOY_KEYS.ERROR])
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 0)
 

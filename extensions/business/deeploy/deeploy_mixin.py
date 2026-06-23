@@ -12,7 +12,7 @@ from ratio1.bc.base import compact_canonical_sha256
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
   DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL, \
-  CONTAINERIZED_APPS_SIGNATURES, DEEPLOY_PLUS_PREFERRED_NODES_HKEY
+  CONTAINERIZED_APPS_SIGNATURES, DEEPLOY_PLUS_PREFERRED_NODES_HKEY, DEEPLOY_RUNTIME_KEYS
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
@@ -777,6 +777,8 @@ class _DeeployMixin:
             response_key = self._generate_chainstore_response_key(plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID])
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
             response_keys[addr].append(response_key)
+          else:
+            plugin_instance.pop(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, None)
           # endif
         # endfor each plugin instance
       # endfor each plugin
@@ -988,6 +990,7 @@ class _DeeployMixin:
     # because multi-node jobs have the same logical plugin_names on each
     # node, which would cause duplicate plugin_name errors if flattened.
     for addr, node_plugins in plugins_by_node.items():
+      self._validate_plugin_runtime_keys(node_plugins)
       if self._has_shmem_dynamic_env(node_plugins):
         node_plugins = self._resolve_shmem_in_plugins(node_plugins, app_id)
       plugins_by_node[addr] = self._autowire_native_container_semaphore(
@@ -1023,6 +1026,8 @@ class _DeeployMixin:
               plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
             if isinstance(response_key, str) and response_key:
               response_keys[addr].append(response_key)
+          else:
+            plugin_instance.pop(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, None)
           # endif
         # endfor each plugin instance
       # endfor each plugin
@@ -2696,7 +2701,7 @@ class _DeeployMixin:
       for instance in instances:
         if not isinstance(instance, dict):
           continue
-        dynamic_env = instance.get("DYNAMIC_ENV")
+        dynamic_env = instance.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
         if not isinstance(dynamic_env, dict):
           continue
         for _key, entries in dynamic_env.items():
@@ -2754,6 +2759,40 @@ class _DeeployMixin:
           )
         used_names.add(pname)
 
+  def _validate_plugin_runtime_keys(self, plugins):
+    """
+    Validate runtime metadata that can affect cross-plugin wiring.
+
+    Explicit semaphore keys are provider namespaces. They must be unique even
+    when no shmem DYNAMIC_ENV consumer is present, because duplicate providers
+    collide once deployed.
+    """
+    self._validate_plugin_names(plugins)
+    used_semaphores = {}
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
+        if sem is None:
+          continue
+        sem = str(sem)
+        if not sem:
+          continue
+        provider_id = (
+          instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          or instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+          or sem
+        )
+        if sem in used_semaphores:
+          raise ValueError(
+            "Duplicate semaphore key '{}'. Provider '{}' already uses this key.".format(
+              sem,
+              used_semaphores[sem],
+            )
+          )
+        used_semaphores[sem] = provider_id
+
   def _resolve_shmem_in_plugins(self, plugins, app_id):
     """
     Resolve shmem-type DYNAMIC_ENV entries inline using plugin names or existing semaphore keys.
@@ -2804,7 +2843,7 @@ class _DeeployMixin:
           continue
 
         pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
-        sem = instance.get("SEMAPHORE")
+        sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
         sem = str(sem) if sem is not None else None
 
         if pname:
@@ -2817,7 +2856,7 @@ class _DeeployMixin:
 
         if pname:
           sem_key = "{}__{}".format(normalized_app_id, pname) if normalized_app_id else pname
-          instance["SEMAPHORE"] = sem_key
+          instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORE] = sem_key
           name_to_key[pname] = sem_key
 
           existing_name = key_to_name.get(sem_key)
@@ -2851,8 +2890,8 @@ class _DeeployMixin:
           is_legacy_sem = not "__" in sem
           is_current_app_sem = normalized_app_id is not None and sem.startswith("{}__".format(normalized_app_id))
           if is_legacy_sem or is_current_app_sem:
-            existing_name = key_to_name.get(sem)
-            if existing_name is not None and existing_name != pname:
+            if sem in key_to_name:
+              existing_name = key_to_name.get(sem)
               raise ValueError(
                 "Duplicate semaphore key '{}'. Unresolved provider key '{}' already maps to '{}'.".format(
                   sem,
@@ -2860,7 +2899,8 @@ class _DeeployMixin:
                   existing_name,
                 )
               )
-            key_to_name[sem] = pname
+            provider_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID) or sem
+            key_to_name[sem] = provider_id
 
     if not name_to_key:
       # Still allow semaphored references when only direct SEMAPHORE references exist.
@@ -2869,8 +2909,8 @@ class _DeeployMixin:
         for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
           if not isinstance(instance, dict):
             continue
-          instance.pop("SEMAPHORED_KEYS", None)
-          dynamic_env = instance.get("DYNAMIC_ENV")
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS, None)
+          dynamic_env = instance.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
           if not isinstance(dynamic_env, dict):
             continue
 
@@ -2892,7 +2932,7 @@ class _DeeployMixin:
               entry["path"] = [sem_key, target_key]
               consumer_sem_keys.add(sem_key)
 
-          instance["SEMAPHORED_KEYS"] = sorted(consumer_sem_keys)
+          instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS] = sorted(consumer_sem_keys)
       return plugins
 
     # Resolve shmem paths and collect consumer dependencies.
@@ -2900,8 +2940,8 @@ class _DeeployMixin:
       for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
         if not isinstance(instance, dict):
           continue
-        instance.pop("SEMAPHORED_KEYS", None)
-        dynamic_env = instance.get("DYNAMIC_ENV")
+        instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS, None)
+        dynamic_env = instance.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
         if not isinstance(dynamic_env, dict):
           continue
 
@@ -2930,7 +2970,7 @@ class _DeeployMixin:
             entry["path"] = [sem_key, target_key]
             consumer_sem_keys.add(sem_key)
 
-        instance["SEMAPHORED_KEYS"] = sorted(consumer_sem_keys)
+        instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS] = sorted(consumer_sem_keys)
 
     return plugins
 
@@ -3062,8 +3102,8 @@ class _DeeployMixin:
           if not isinstance(instance, dict):
             continue
           # end if
-          instance.pop("SEMAPHORE", None)
-          instance.pop("SEMAPHORED_KEYS", None)
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORE, None)
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS, None)
           instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
           if not instance_id:
             continue
@@ -3072,7 +3112,7 @@ class _DeeployMixin:
           if plugin_name:
             self._validate_plugin_name(plugin_name)
           semaphore_key = "{}__{}".format(app_id, plugin_name) if plugin_name else self.sanitize_name("{}__{}".format(app_id, instance_id))
-          instance["SEMAPHORE"] = semaphore_key
+          instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORE] = semaphore_key
           semaphore_keys.append(semaphore_key)
         # end for instance
       # end for native_plugin
@@ -3091,9 +3131,9 @@ class _DeeployMixin:
           if not isinstance(instance, dict):
             continue
           # end if
-          instance.pop("SEMAPHORE", None)
-          instance.pop("SEMAPHORED_KEYS", None)
-          instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORE, None)
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS, None)
+          instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS] = list(semaphore_keys)
         # end for instance
       # end for container_plugin
 
@@ -3301,8 +3341,8 @@ class _DeeployMixin:
         }
         prepared_plugins.append(prepared_plugin)
 
-      # Validate plugin_name uniqueness and charset (independent of shmem)
-      self._validate_plugin_names(prepared_plugins)
+      # Validate runtime names and semaphore keys independent of shmem consumers.
+      self._validate_plugin_runtime_keys(prepared_plugins)
 
       if app_id and self._has_shmem_dynamic_env(prepared_plugins):
         prepared_plugins = self._resolve_shmem_in_plugins(prepared_plugins, app_id)
