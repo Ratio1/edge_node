@@ -12,7 +12,8 @@ from ratio1.bc.base import compact_canonical_sha256
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
   DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL, \
-  CONTAINERIZED_APPS_SIGNATURES, DEEPLOY_PLUS_PREFERRED_NODES_HKEY, DEEPLOY_RUNTIME_KEYS
+  CONTAINERIZED_APPS_SIGNATURES, DEEPLOY_PLUS_PREFERRED_NODES_HKEY, DEEPLOY_RUNTIME_KEYS, \
+  DEEPLOY_DYNAMIC_ENV_KEYS, DEEPLOY_DYNAMIC_ENV_TYPES
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
@@ -3025,18 +3026,24 @@ class _DeeployMixin:
               raise ValueError(
                 "DYNAMIC_ENV entry for '{}' must be a dictionary.".format(var_name)
               )
-            if entry.get("source") == "shmem":
+            if entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.SOURCE) == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM:
               raise ValueError(
-                "DYNAMIC_ENV entry for '{}' uses unsupported source='shmem'; "
-                "backend shmem entries must use {{'type': 'shmem', 'path': [provider, key]}}.".format(var_name)
+                "DYNAMIC_ENV entry for '{}' uses unsupported source='{}'; "
+                "backend shmem entries must use {{'{}': '{}', '{}': [provider, key]}}.".format(
+                  var_name,
+                  DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+                  DEEPLOY_DYNAMIC_ENV_KEYS.TYPE,
+                  DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+                  DEEPLOY_DYNAMIC_ENV_KEYS.PATH,
+                )
               )
-            entry_type = entry.get("type")
+            entry_type = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE)
             if not isinstance(entry_type, str) or not entry_type.strip():
               raise ValueError(
                 "DYNAMIC_ENV entry for '{}' must include a non-empty type.".format(var_name)
               )
-            if entry_type == "shmem":
-              self._validate_dynamic_env_shmem_path(entry.get("path"), var_name)
+            if entry_type == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM:
+              self._validate_dynamic_env_shmem_path(entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH), var_name)
 
   def _has_shmem_dynamic_env(self, plugins):
     """Check if any plugin instance has shmem-type DYNAMIC_ENV entries."""
@@ -3054,7 +3061,7 @@ class _DeeployMixin:
           if not isinstance(entries, list):
             continue
           for entry in entries:
-            if isinstance(entry, dict) and entry.get("type") == "shmem":
+            if isinstance(entry, dict) and entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE) == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM:
               return True
     return False
 
@@ -3336,9 +3343,12 @@ class _DeeployMixin:
             if not isinstance(entries, list):
               continue
             for entry in entries:
-              if not isinstance(entry, dict) or entry.get("type") != "shmem":
+              if (
+                not isinstance(entry, dict)
+                or entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE) != DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM
+              ):
                 continue
-              path = entry.get("path")
+              path = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH)
               provider_name, target_key = self._validate_dynamic_env_shmem_path(path, var_name)
               if provider_name not in explicit_key_to_provider:
                 raise ValueError(
@@ -3367,9 +3377,12 @@ class _DeeployMixin:
           if not isinstance(entries, list):
             continue
           for entry in entries:
-            if not isinstance(entry, dict) or entry.get("type") != "shmem":
+            if (
+              not isinstance(entry, dict)
+              or entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE) != DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM
+            ):
               continue
-            path = entry.get("path")
+            path = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH)
             provider_name, target_key = self._validate_dynamic_env_shmem_path(path, var_name)
             sem_key = resolve_provider_key(provider_name)
             if sem_key is None:

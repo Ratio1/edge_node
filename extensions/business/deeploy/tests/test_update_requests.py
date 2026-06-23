@@ -29,7 +29,12 @@ sys.modules.setdefault(
 
 from naeural_core import constants as ct
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS, DEEPLOY_PLUGIN_DATA
+from extensions.business.deeploy.deeploy_const import (
+  DEEPLOY_DYNAMIC_ENV_KEYS,
+  DEEPLOY_DYNAMIC_ENV_TYPES,
+  DEEPLOY_KEYS,
+  DEEPLOY_PLUGIN_DATA,
+)
 from extensions.business.deeploy.deeploy_manager_api import DeeployManagerApiPlugin
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs
 
@@ -1628,7 +1633,12 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
             "IMAGE": "repo/app:1.0",
             "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
             "DYNAMIC_ENV": {
-              "API_URL": [{"source": "shmem", "path": ["provider", "PORT"]}],
+              "API_URL": [
+                {
+                  DEEPLOY_DYNAMIC_ENV_KEYS.SOURCE: DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+                  DEEPLOY_DYNAMIC_ENV_KEYS.PATH: ["provider", "PORT"],
+                }
+              ],
             },
           },
         ],

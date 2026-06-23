@@ -1,7 +1,7 @@
 import unittest
 from collections import defaultdict
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS
+from extensions.business.deeploy.deeploy_const import DEEPLOY_DYNAMIC_ENV_KEYS, DEEPLOY_DYNAMIC_ENV_TYPES, DEEPLOY_KEYS
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs, make_plugin_entry
 
 
@@ -229,7 +229,12 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
           plugin_name="frontend",
           IMAGE="repo/app:latest",
           DYNAMIC_ENV={
-            "API_HOST": [{"source": "shmem", "path": ["provider", "PORT"]}]
+            "API_HOST": [
+              {
+                DEEPLOY_DYNAMIC_ENV_KEYS.SOURCE: DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+                DEEPLOY_DYNAMIC_ENV_KEYS.PATH: ["provider", "PORT"],
+              }
+            ]
           },
         ),
       ]
