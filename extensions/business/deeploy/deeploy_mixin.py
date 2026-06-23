@@ -2395,6 +2395,87 @@ class _DeeployMixin:
     return plugins_by_instance_id, plugins_by_signature, new_plugin_configs
   # TODO: END FIXME
 
+  def _materialize_update_plugins_for_redeploy(self, inputs, discovered_plugin_instances):
+    """
+    Build a full plugin request array for delete/redeploy updates.
+
+    Update preflight can reconstruct omitted live plugin configs from discovery.
+    The post-delete create path only sees inputs, so partial update requests must
+    be expanded before deletion to keep the deployed replacement equivalent to
+    the validated update payload.
+    """
+    requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
+    materialized_plugins = []
+
+    instance_id_key = self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID
+    chainstore_response_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
+    chainstore_peers_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS
+
+    for plugin in discovered_plugin_instances:
+      signature = plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE)
+      if not signature:
+        continue
+
+      normalized_signature = signature.upper() if isinstance(signature, str) else signature
+      instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      plugin_config = None
+
+      if instance_id:
+        plugin_config = requested_by_instance_id.pop(instance_id, None)
+        candidate_list = requested_by_signature.get(normalized_signature, [])
+        if plugin_config and candidate_list:
+          for idx, candidate in enumerate(candidate_list):
+            if candidate is plugin_config:
+              candidate_list.pop(idx)
+              break
+      else:
+        candidate_list = requested_by_signature.get(normalized_signature, [])
+        for idx, candidate in enumerate(candidate_list):
+          candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+          if not candidate_instance_id:
+            plugin_config = candidate_list.pop(idx)
+            break
+
+      if not plugin_config:
+        config_candidates = requested_by_signature.get(normalized_signature, [])
+        if config_candidates:
+          for idx, candidate in enumerate(config_candidates):
+            candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+            if candidate_instance_id:
+              plugin_config = config_candidates.pop(idx)
+              break
+
+      if plugin_config:
+        plugin_entry = self.deepcopy(plugin_config)
+        plugin_entry.pop("signature", None)
+      else:
+        plugin_entry = self._extract_discovered_plugin_conf(
+          plugin,
+          instance_id_key=instance_id_key,
+          chainstore_response_key=chainstore_response_key,
+          chainstore_peers_key=chainstore_peers_key,
+        )
+
+      plugin_entry[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = signature
+      if instance_id:
+        plugin_entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
+      materialized_plugins.append(plugin_entry)
+
+    if requested_by_instance_id:
+      missing_ids = list(requested_by_instance_id.keys())
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.PLUGINS3}: Unknown plugin instance_id(s) in update request: {missing_ids}"
+      )
+
+    for plugin_config in new_plugin_configs:
+      plugin_entry = self.deepcopy(plugin_config)
+      if DEEPLOY_KEYS.PLUGIN_SIGNATURE not in plugin_entry and plugin_entry.get("signature"):
+        plugin_entry[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = plugin_entry.get("signature")
+      plugin_entry.pop("signature", None)
+      materialized_plugins.append(plugin_entry)
+
+    return materialized_plugins
+
   def deeploy_check_payment_and_job_owner(self, inputs, owner, is_create, debug=False):
     """
     Check if the payment is valid for the given job.
@@ -2697,6 +2778,55 @@ class _DeeployMixin:
 
     return JOB_APP_TYPES.NATIVE
 
+  def _validate_dynamic_env_shmem_path(self, path, var_name):
+    if not isinstance(path, (list, tuple)) or len(path) != 2:
+      raise ValueError(
+        "DYNAMIC_ENV shmem path for '{}' must be [provider, key].".format(var_name)
+      )
+    provider_name, target_key = path
+    if not isinstance(provider_name, str) or not provider_name.strip():
+      raise ValueError(
+        "DYNAMIC_ENV shmem path for '{}' has empty provider.".format(var_name)
+      )
+    if not isinstance(target_key, str) or not target_key.strip():
+      raise ValueError(
+        "DYNAMIC_ENV shmem path for '{}' has empty target key.".format(var_name)
+      )
+    return provider_name, target_key
+
+  def _validate_dynamic_env_config(self, plugins):
+    for plugin in plugins:
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      if not isinstance(instances, list):
+        continue
+      for instance in instances:
+        if not isinstance(instance, dict):
+          continue
+        dynamic_env = instance.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
+        if dynamic_env is None:
+          continue
+        if not isinstance(dynamic_env, dict):
+          raise ValueError("DYNAMIC_ENV must be a dictionary.")
+        for var_name, entries in dynamic_env.items():
+          if not isinstance(var_name, str) or not var_name.strip():
+            raise ValueError("DYNAMIC_ENV variable names must be non-empty strings.")
+          if not isinstance(entries, list):
+            raise ValueError(
+              "DYNAMIC_ENV entries for '{}' must be a list.".format(var_name)
+            )
+          for entry in entries:
+            if not isinstance(entry, dict):
+              raise ValueError(
+                "DYNAMIC_ENV entry for '{}' must be a dictionary.".format(var_name)
+              )
+            entry_type = entry.get("type")
+            if not isinstance(entry_type, str) or not entry_type.strip():
+              raise ValueError(
+                "DYNAMIC_ENV entry for '{}' must include a non-empty type.".format(var_name)
+              )
+            if entry_type == "shmem":
+              self._validate_dynamic_env_shmem_path(entry.get("path"), var_name)
+
   def _has_shmem_dynamic_env(self, plugins):
     """Check if any plugin instance has shmem-type DYNAMIC_ENV entries."""
     for plugin in plugins:
@@ -2777,6 +2907,7 @@ class _DeeployMixin:
     dispatch path can continue.
     """
     self._validate_plugin_names(plugins)
+    self._validate_dynamic_env_config(plugins)
     used_semaphores = {}
     for plugin in plugins:
       for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
@@ -2858,6 +2989,7 @@ class _DeeployMixin:
     list
       Modified plugins with shmem references resolved.
     """
+    self._validate_dynamic_env_config(plugins)
     # Build provider lookup tables. We allow plugin names, current derived
     # semaphore keys, explicit unnamed semaphore keys, and stale inbound aliases
     # carried by named providers.
@@ -2869,22 +3001,6 @@ class _DeeployMixin:
     used_names = set()
     normalized_app_id = app_id.strip() if isinstance(app_id, str) else None
 
-    def validate_shmem_path(path, var_name):
-      if not isinstance(path, (list, tuple)) or len(path) != 2:
-        raise ValueError(
-          "DYNAMIC_ENV shmem path for '{}' must be [provider, key].".format(var_name)
-        )
-      provider_name, target_key = path
-      if not isinstance(provider_name, str) or not provider_name.strip():
-        raise ValueError(
-          "DYNAMIC_ENV shmem path for '{}' has empty provider.".format(var_name)
-        )
-      if not isinstance(target_key, str) or not target_key.strip():
-        raise ValueError(
-          "DYNAMIC_ENV shmem path for '{}' has empty target key.".format(var_name)
-        )
-      return provider_name, target_key
-
     def add_stale_alias(alias, provider_name):
       if alias is None:
         return
@@ -2892,6 +3008,41 @@ class _DeeployMixin:
       if not alias:
         return
       stale_alias_to_names.setdefault(alias, set()).add(provider_name)
+
+    def resolve_provider_key(provider_name):
+      target_keys = set()
+      provider_labels = set()
+
+      if provider_name in name_to_key:
+        provider_labels.add(provider_name)
+        target_keys.add(name_to_key[provider_name])
+
+      if provider_name in canonical_key_to_name:
+        mapped_name = canonical_key_to_name.get(provider_name)
+        provider_labels.add(mapped_name)
+        target_keys.add(name_to_key.get(mapped_name, provider_name))
+
+      for mapped_name in stale_alias_to_names.get(provider_name, set()):
+        provider_labels.add(mapped_name)
+        target_keys.add(name_to_key.get(mapped_name, provider_name))
+
+      if provider_name in explicit_key_to_provider:
+        provider_labels.add(explicit_key_to_provider[provider_name])
+        target_keys.add(provider_name)
+
+      if len(target_keys) > 1:
+        raise ValueError(
+          "DYNAMIC_ENV shmem references ambiguous semaphore key '{}'. "
+          "It matches providers: {}. Use plugin_name instead.".format(
+            provider_name,
+            sorted(provider_labels),
+          )
+        )
+
+      if target_keys:
+        return next(iter(target_keys))
+
+      return None
 
     for plugin in plugins:
       for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
@@ -2962,7 +3113,7 @@ class _DeeployMixin:
               if not isinstance(entry, dict) or entry.get("type") != "shmem":
                 continue
               path = entry.get("path")
-              provider_name, target_key = validate_shmem_path(path, var_name)
+              provider_name, target_key = self._validate_dynamic_env_shmem_path(path, var_name)
               if provider_name not in explicit_key_to_provider:
                 raise ValueError(
                   "DYNAMIC_ENV shmem references unknown plugin '{}'. "
@@ -2993,34 +3144,9 @@ class _DeeployMixin:
             if not isinstance(entry, dict) or entry.get("type") != "shmem":
               continue
             path = entry.get("path")
-            provider_name, target_key = validate_shmem_path(path, var_name)
-            if provider_name in name_to_key:
-              sem_key = name_to_key[provider_name]
-            elif provider_name in canonical_key_to_name:
-              mapped_name = canonical_key_to_name.get(provider_name)
-              sem_key = name_to_key.get(mapped_name, provider_name)
-            elif (
-              provider_name in stale_alias_to_names
-              or provider_name in explicit_key_to_provider
-            ):
-              target_keys = set()
-              provider_labels = set()
-              for mapped_name in stale_alias_to_names.get(provider_name, set()):
-                provider_labels.add(mapped_name)
-                target_keys.add(name_to_key.get(mapped_name, provider_name))
-              if provider_name in explicit_key_to_provider:
-                provider_labels.add(explicit_key_to_provider[provider_name])
-                target_keys.add(provider_name)
-              if len(target_keys) > 1:
-                raise ValueError(
-                  "DYNAMIC_ENV shmem references ambiguous semaphore key '{}'. "
-                  "It matches providers: {}. Use plugin_name instead.".format(
-                    provider_name,
-                    sorted(provider_labels),
-                  )
-                )
-              sem_key = next(iter(target_keys))
-            else:
+            provider_name, target_key = self._validate_dynamic_env_shmem_path(path, var_name)
+            sem_key = resolve_provider_key(provider_name)
+            if sem_key is None:
               raise ValueError(
                 "DYNAMIC_ENV shmem references unknown plugin '{}'. "
                 "Available providers: {}".format(

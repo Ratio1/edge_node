@@ -760,6 +760,15 @@ class DeeployManagerApiPlugin(
           job_app_type=job_app_type,
         )
 
+        plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+        if isinstance(plugins_array, list):
+          materialized_plugins = self._materialize_update_plugins_for_redeploy(
+            inputs,
+            discovered_plugin_instances,
+          )
+          inputs[DEEPLOY_KEYS.PLUGINS] = materialized_plugins
+          inputs.plugins = materialized_plugins
+
         # All validations passed; remove the running job and immediately redeploy.
         self.delete_pipeline_from_nodes(
           app_id=app_id,

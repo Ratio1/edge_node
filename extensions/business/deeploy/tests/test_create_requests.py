@@ -193,6 +193,25 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "unknown plugin 'nonexistent'"):
       plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
 
+  def test_prepare_plugins_rejects_malformed_dynamic_env_entries(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "256m"},
+          DYNAMIC_ENV={
+            "API_URL": {"type": "shmem", "path": ["provider", "PORT"]},
+          },
+        ),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "DYNAMIC_ENV entries for 'API_URL' must be a list"):
+      plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
+
   def test_prepare_plugins_without_app_id_skips_resolution(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(

@@ -72,9 +72,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin._ensure_plugin_instance_ids = lambda *args, **kwargs: None
     plugin._check_nodes_availability = lambda inputs: nodes or ["node-1"]
 
-    called = {"delete": 0, "deploy": 0}
+    called = {"delete": 0, "deploy": 0, "deploy_kwargs": None, "queued": 0}
     plugin.delete_pipeline_from_nodes = lambda **kwargs: called.__setitem__("delete", called["delete"] + 1)
-    plugin.check_and_deploy_pipelines = lambda **kwargs: called.__setitem__("deploy", called["deploy"] + 1)
+
+    def check_and_deploy_pipelines(**kwargs):
+      called["deploy"] += 1
+      called["deploy_kwargs"] = kwargs
+      return {}, "success", {}, {"NAME": kwargs.get("app_id")}
+
+    plugin.check_and_deploy_pipelines = check_and_deploy_pipelines
+    plugin._build_pipeline_persistence_state = lambda **kwargs: {"state": kwargs}
+    plugin._queue_pipeline_persistence = lambda state: called.__setitem__("queued", called["queued"] + 1)
     return plugin, called
 
   def test_prepare_single_plugin_instance_update_uses_plugin_config_and_strips_signature_fields(self):
@@ -837,6 +845,123 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
 
     self.assertIn("Duplicate plugin_name", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
+  def test_process_update_materializes_omitted_live_plugins_before_redeploy(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "api",
+              "PROCESS_DELAY": 5,
+            },
+          },
+        },
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "worker-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "IMAGE": "repo/worker:1.0",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "A_SIMPLE_PLUGIN",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "api-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "PROCESS_DELAY": 10,
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "command_delivered")
+    self.assertEqual(called["delete"], 1)
+    self.assertEqual(called["deploy"], 1)
+    redeploy_inputs = called["deploy_kwargs"]["inputs"]
+    redeploy_plugins = redeploy_inputs[DEEPLOY_KEYS.PLUGINS]
+    self.assertEqual(len(redeploy_plugins), 2)
+    self.assertEqual(
+      {entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] for entry in redeploy_plugins},
+      {"api-instance", "worker-instance"},
+    )
+    worker = next(
+      entry for entry in redeploy_plugins
+      if entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] == "worker-instance"
+    )
+    self.assertEqual(worker["IMAGE"], "repo/worker:1.0")
+    self.assertEqual(worker[DEEPLOY_KEYS.PLUGIN_NAME], "worker")
+
+  def test_process_update_rejects_malformed_dynamic_env_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "current-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "IMAGE": "repo/app:1.0",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "current-instance",
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            "DYNAMIC_ENV": {
+              "API_URL": {"type": "shmem", "path": ["provider", "PORT"]},
+            },
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("DYNAMIC_ENV entries for 'API_URL' must be a list", response[DEEPLOY_KEYS.ERROR])
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 0)
 

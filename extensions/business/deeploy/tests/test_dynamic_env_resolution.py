@@ -206,6 +206,41 @@ class DeeployDynamicEnvResolutionTests(unittest.TestCase):
     )
     self.assertEqual(consumer["SEMAPHORED_KEYS"], ["app-1__alpha"])
 
+  def test_resolve_shmem_in_plugins_rejects_plugin_name_explicit_semaphore_ambiguity(self):
+    plugin = make_deeploy_plugin()
+    plugins = [
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "A_SIMPLE_PLUGIN",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "named-provider",
+            DEEPLOY_KEYS.PLUGIN_NAME: "shared",
+          },
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "explicit-provider",
+            "SEMAPHORE": "shared",
+          },
+        ],
+      },
+      {
+        plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
+        plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "consumer-1",
+            DEEPLOY_KEYS.PLUGIN_NAME: "frontend",
+            "DYNAMIC_ENV": {
+              "API_PORT": [
+                {"type": "shmem", "path": ["shared", "PORT"]},
+              ]
+            },
+          }
+        ],
+      },
+    ]
+
+    with self.assertRaisesRegex(ValueError, "ambiguous semaphore key 'shared'"):
+      plugin._resolve_shmem_in_plugins(plugins, "app-1")
+
   def test_resolve_shmem_in_plugins_accepts_explicit_semaphore_reference(self):
     plugin = make_deeploy_plugin()
     plugins = [
