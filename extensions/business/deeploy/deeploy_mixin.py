@@ -3419,7 +3419,8 @@ class _DeeployMixin:
     return materialized
 
   def _validate_materialized_plugins_for_node(self, plugins, node_addr=None):
-    self._validate_plugin_names(plugins)
+    self._validate_dynamic_env_config(plugins)
+    self._validate_final_emitted_semaphore_keys(plugins)
     validation_index = 0
     for plugin in plugins or []:
       signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
