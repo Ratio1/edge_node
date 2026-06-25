@@ -539,6 +539,123 @@ class TestApiOperationAccessAndState(unittest.TestCase):
     self.assertEqual(owner._jobs["job-1"]["pass_reports"][-1]["report_cid"], "QmPassReport")
     self.assertEqual(owner.r1fs.added_payloads, [])
 
+  def test_worker_recovers_expired_running_lease_after_restart(self):
+    owner = _Owner()
+    owner.add_job()
+    created = create_analyze_job_operation(owner, "good-token", "job-1")
+    operation_id = created["operation"]["operation_id"]
+    repo = ApiOperationRepository(owner)
+    raw = repo.get_operation(operation_id)
+    raw.update({
+      "state": "running",
+      "phase": "llm_pending",
+      "attempt": 1,
+      "lease": {
+        "owner_node": owner.ee_addr,
+        "token": "stale-worker-token",
+        "acquired_at": "2000-01-01T00:00:00Z",
+        "heartbeat_at": "2000-01-01T00:00:00Z",
+        "expires_at": "2000-01-01T00:00:01Z",
+      },
+    })
+    repo.put_operation(raw, expected_revision=raw["revision"], context="test_stale_running")
+
+    started = maybe_start_api_operation_worker(owner)
+    _join_worker(owner)
+
+    status = get_api_operation_status(owner, "good-token", operation_id)
+    self.assertTrue(started)
+    self.assertEqual(status["operation"]["state"], "succeeded")
+    self.assertEqual(status["operation"]["attempt"], 2)
+    self.assertEqual(owner.llm_calls, 1)
+
+  def test_worker_finalizes_expired_cancel_requested_lease_after_restart(self):
+    owner = _Owner()
+    owner.add_job()
+    created = create_analyze_job_operation(owner, "good-token", "job-1")
+    operation_id = created["operation"]["operation_id"]
+    repo = ApiOperationRepository(owner)
+    raw = repo.get_operation(operation_id)
+    raw.update({
+      "state": "cancel_requested",
+      "phase": "cancel_requested",
+      "attempt": 1,
+      "cancel": {
+        "requested": True,
+        "requested_at": "2000-01-01T00:00:00Z",
+        "side_effects": "none",
+      },
+      "lease": {
+        "owner_node": owner.ee_addr,
+        "token": "stale-worker-token",
+        "acquired_at": "2000-01-01T00:00:00Z",
+        "heartbeat_at": "2000-01-01T00:00:00Z",
+        "expires_at": "2000-01-01T00:00:01Z",
+      },
+    })
+    repo.put_operation(raw, expected_revision=raw["revision"], context="test_stale_cancel")
+
+    started = maybe_start_api_operation_worker(owner)
+    status = get_api_operation_status(owner, "good-token", operation_id)
+
+    self.assertFalse(started)
+    self.assertEqual(status["operation"]["state"], "canceled")
+    self.assertEqual(status["operation"]["cancel"]["side_effects"], "unknown_after_restart")
+
+  def test_operation_ttl_takes_precedence_over_stale_running_lease_recovery(self):
+    owner = _Owner()
+    owner.add_job()
+    created = create_analyze_job_operation(owner, "good-token", "job-1")
+    operation_id = created["operation"]["operation_id"]
+    repo = ApiOperationRepository(owner)
+    raw = repo.get_operation(operation_id)
+    raw.update({
+      "state": "running",
+      "phase": "llm_pending",
+      "attempt": 1,
+      "expires_at": "2000-01-01T00:00:00Z",
+      "lease": {
+        "owner_node": owner.ee_addr,
+        "token": "stale-worker-token",
+        "acquired_at": "2000-01-01T00:00:00Z",
+        "heartbeat_at": "2000-01-01T00:00:00Z",
+        "expires_at": "2000-01-01T00:00:01Z",
+      },
+    })
+    repo.put_operation(raw, expected_revision=raw["revision"], context="test_expired_running")
+
+    started = maybe_start_api_operation_worker(owner)
+    status = get_api_operation_status(owner, "good-token", operation_id)
+
+    self.assertFalse(started)
+    self.assertEqual(status["operation"]["state"], "expired")
+    self.assertEqual(owner.llm_calls, 0)
+
+  def test_expired_running_lease_does_not_consume_backpressure(self):
+    owner = _Owner(max_queue_global=1)
+    owner.add_job("job-1")
+    owner.add_job("job-2")
+    created = create_analyze_job_operation(owner, "good-token", "job-1")
+    repo = ApiOperationRepository(owner)
+    raw = repo.get_operation(created["operation"]["operation_id"])
+    raw.update({
+      "state": "running",
+      "phase": "llm_pending",
+      "attempt": raw["max_attempts"],
+      "lease": {
+        "owner_node": owner.ee_addr,
+        "token": "stale-worker-token",
+        "acquired_at": "2000-01-01T00:00:00Z",
+        "heartbeat_at": "2000-01-01T00:00:00Z",
+        "expires_at": "2000-01-01T00:00:01Z",
+      },
+    })
+    repo.put_operation(raw, expected_revision=raw["revision"], context="test_stale_backpressure")
+
+    second = create_analyze_job_operation(owner, "good-token", "job-2")
+
+    self.assertEqual(second["status"], "accepted")
+
   def test_worker_cancel_after_r1fs_write_does_not_update_job_record(self):
     owner = _Owner()
     owner.add_job()

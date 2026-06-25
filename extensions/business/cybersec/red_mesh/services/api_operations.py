@@ -386,6 +386,16 @@ def _operation_expired(operation: dict) -> bool:
   return datetime.now(timezone.utc) >= expires_at
 
 
+def _lease_expired(operation: dict) -> bool:
+  lease = (operation or {}).get("lease")
+  if not isinstance(lease, dict):
+    return False
+  expires_at = _parse_utc_timestamp(lease.get("expires_at"))
+  if expires_at is None:
+    return False
+  return datetime.now(timezone.utc) >= expires_at
+
+
 def _expire_operation_if_needed(repo: ApiOperationRepository, operation: dict) -> dict:
   if not isinstance(operation, dict) or not _operation_expired(operation):
     return operation
@@ -399,6 +409,68 @@ def _expire_operation_if_needed(repo: ApiOperationRepository, operation: dict) -
     updated,
     expected_revision=operation.get("revision"),
     context="expire_api_operation",
+  )
+
+
+def _recover_stale_operation_if_needed(repo: ApiOperationRepository, operation: dict) -> dict:
+  operation = _expire_operation_if_needed(repo, operation)
+  if not isinstance(operation, dict):
+    return operation
+  if operation.get("operation_type") != OPERATION_TYPE_ANALYZE_JOB:
+    return operation
+  if not _operation_owned_by_node(repo.owner, operation):
+    return operation
+  if not _operation_job_visible(repo.owner, operation):
+    return operation
+  if operation.get("state") in TERMINAL_OPERATION_STATES:
+    return operation
+  if operation.get("state") not in {STATE_RUNNING, STATE_CANCEL_REQUESTED}:
+    return operation
+  if not _lease_expired(operation):
+    return operation
+
+  updated = dict(operation)
+  now = _utc_timestamp()
+  if operation.get("state") == STATE_CANCEL_REQUESTED:
+    cancel = dict(updated.get("cancel") or {})
+    cancel["requested"] = True
+    cancel["observed_at"] = now
+    cancel["side_effects"] = "unknown_after_restart"
+    updated.update({
+      "state": STATE_CANCELED,
+      "phase": "canceled",
+      "finished_at": now,
+      "lease": {},
+      "cancel": cancel,
+    })
+  elif _safe_int(operation.get("attempt"), 0) < _safe_int(operation.get("max_attempts"), 1):
+    updated.update({
+      "state": STATE_QUEUED,
+      "phase": "recovered",
+      "lease": {},
+      "retryable": True,
+      "recovered_at": now,
+    })
+  else:
+    updated.update({
+      "state": STATE_FAILED,
+      "phase": "lease_expired",
+      "finished_at": now,
+      "lease": {},
+      "retryable": False,
+      "failure": _failure_payload(
+        "operation_failed",
+        "lease_expired",
+        "Operation worker lease expired",
+        retryable=False,
+        attempt_count=operation.get("attempt"),
+      ),
+    })
+
+  return repo.put_operation(
+    updated,
+    expected_revision=operation.get("revision"),
+    context="recover_stale_api_operation",
   )
 
 
@@ -719,6 +791,7 @@ def _active_operations(repo: ApiOperationRepository):
       isinstance(operation, dict)
       and operation.get("state") in ACTIVE_OPERATION_STATES
       and not _operation_expired(operation)
+      and not _lease_expired(operation)
     )
   ]
 
@@ -929,7 +1002,7 @@ def _claim_next_api_operation_locked(owner):
     key=lambda item: str((item or {}).get("created_at") or ""),
   )
   for operation in operations:
-    operation = _expire_operation_if_needed(repo, operation)
+    operation = _recover_stale_operation_if_needed(repo, operation)
     if not isinstance(operation, dict):
       continue
     if operation.get("state") != STATE_QUEUED:
