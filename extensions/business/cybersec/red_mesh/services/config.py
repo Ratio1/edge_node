@@ -156,6 +156,23 @@ DEFAULT_MODEL_TESTING_CONFIG = {
   },
 }
 
+DEFAULT_API_OPERATIONS_CONFIG = {
+  "ENABLED": False,
+  "TOKEN_HASHES": [],
+  "TOKEN_ENV": "REDMESH_API_OPERATION_TOKEN",
+  "HMAC_SECRET": "",
+  "HMAC_SECRET_ENV": "REDMESH_API_OPERATION_HMAC_SECRET",
+  "MAX_IDEMPOTENCY_KEY_LENGTH": 128,
+  "MAX_FOCUS_AREAS": 8,
+  "MAX_FOCUS_AREA_LENGTH": 80,
+  "MAX_QUEUE_GLOBAL": 32,
+  "MAX_QUEUE_PER_ACTOR": 8,
+  "MAX_QUEUE_PER_JOB": 1,
+  "OPERATION_TTL_SECONDS": 86400,
+  "LEASE_SECONDS": 300,
+  "POLL_AFTER_MS": 1000,
+}
+
 _WAZUH_AUTH_MODES = {"static", "wazuh_jwt"}
 _TAXII_AUTH_MODES = {"static", "basic"}
 _OPENCTI_AUTH_MODES = {"static"}
@@ -470,6 +487,91 @@ def get_model_testing_config(owner):
     owner,
     "MODEL_TESTING",
     DEFAULT_MODEL_TESTING_CONFIG,
+    normalizer=_normalize,
+  )
+
+
+def get_api_operations_config(owner):
+  """Return normalized RedMesh async API operation config."""
+  def _normalize_hashes(value):
+    if isinstance(value, str):
+      values = [item.strip() for item in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+      values = [str(item or "").strip() for item in value]
+    else:
+      values = []
+    return [item.lower() for item in values if item]
+
+  def _normalize(merged, defaults):
+    return {
+      "ENABLED": bool(merged.get("ENABLED", defaults["ENABLED"])),
+      "TOKEN_HASHES": _normalize_hashes(merged.get("TOKEN_HASHES", defaults["TOKEN_HASHES"])),
+      "TOKEN_ENV": _safe_secret_env(merged.get("TOKEN_ENV"), defaults["TOKEN_ENV"]),
+      "HMAC_SECRET": str(merged.get("HMAC_SECRET") or defaults["HMAC_SECRET"]),
+      "HMAC_SECRET_ENV": _safe_secret_env(
+        merged.get("HMAC_SECRET_ENV"),
+        defaults["HMAC_SECRET_ENV"],
+      ),
+      "MAX_IDEMPOTENCY_KEY_LENGTH": _bounded_int(
+        merged.get("MAX_IDEMPOTENCY_KEY_LENGTH"),
+        defaults["MAX_IDEMPOTENCY_KEY_LENGTH"],
+        minimum=16,
+        maximum=512,
+      ),
+      "MAX_FOCUS_AREAS": _bounded_int(
+        merged.get("MAX_FOCUS_AREAS"),
+        defaults["MAX_FOCUS_AREAS"],
+        minimum=0,
+        maximum=32,
+      ),
+      "MAX_FOCUS_AREA_LENGTH": _bounded_int(
+        merged.get("MAX_FOCUS_AREA_LENGTH"),
+        defaults["MAX_FOCUS_AREA_LENGTH"],
+        minimum=8,
+        maximum=256,
+      ),
+      "MAX_QUEUE_GLOBAL": _bounded_int(
+        merged.get("MAX_QUEUE_GLOBAL"),
+        defaults["MAX_QUEUE_GLOBAL"],
+        minimum=1,
+        maximum=1024,
+      ),
+      "MAX_QUEUE_PER_ACTOR": _bounded_int(
+        merged.get("MAX_QUEUE_PER_ACTOR"),
+        defaults["MAX_QUEUE_PER_ACTOR"],
+        minimum=1,
+        maximum=256,
+      ),
+      "MAX_QUEUE_PER_JOB": _bounded_int(
+        merged.get("MAX_QUEUE_PER_JOB"),
+        defaults["MAX_QUEUE_PER_JOB"],
+        minimum=1,
+        maximum=16,
+      ),
+      "OPERATION_TTL_SECONDS": _bounded_int(
+        merged.get("OPERATION_TTL_SECONDS"),
+        defaults["OPERATION_TTL_SECONDS"],
+        minimum=60,
+        maximum=30 * 86400,
+      ),
+      "LEASE_SECONDS": _bounded_int(
+        merged.get("LEASE_SECONDS"),
+        defaults["LEASE_SECONDS"],
+        minimum=10,
+        maximum=3600,
+      ),
+      "POLL_AFTER_MS": _bounded_int(
+        merged.get("POLL_AFTER_MS"),
+        defaults["POLL_AFTER_MS"],
+        minimum=250,
+        maximum=60000,
+      ),
+    }
+
+  return resolve_config_block(
+    owner,
+    "API_OPERATIONS",
+    DEFAULT_API_OPERATIONS_CONFIG,
     normalizer=_normalize,
   )
 
