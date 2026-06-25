@@ -46,6 +46,9 @@ class ModelTestJobConfig:
   test_set_id: str = ""
   test_set_catalog: list = None
   selected_test_set_metadata: list = None
+  blockchain_attestation_enabled: bool = False
+  start_attestation_required: bool = False
+  end_attestation_required: bool = False
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -76,6 +79,9 @@ class ModelTestJobConfig:
       model_provider_secret_store_key_version=d.get("model_provider_secret_store_key_version", ""),
       model_provider_secret_store_key_source=d.get("model_provider_secret_store_key_source", ""),
       model_provider_secret_store_unsafe_fallback=bool(d.get("model_provider_secret_store_unsafe_fallback", False)),
+      blockchain_attestation_enabled=bool(d.get("blockchain_attestation_enabled", False)),
+      start_attestation_required=bool(d.get("start_attestation_required", False)),
+      end_attestation_required=bool(d.get("end_attestation_required", False)),
     )
 
 
@@ -135,6 +141,7 @@ class ModelTestArchive:
   date_completed: float
   schema_version: str = MODEL_TEST_ARCHIVE_SCHEMA
   archive_version: int = 1
+  redmesh_test_attestation: dict = None
 
   def to_dict(self) -> dict:
     payload = asdict(self)
@@ -164,6 +171,7 @@ class ModelTestArchive:
       duration=d.get("duration", 0),
       date_created=d.get("date_created", 0),
       date_completed=d.get("date_completed", 0),
+      redmesh_test_attestation=d.get("redmesh_test_attestation"),
     )
 
 

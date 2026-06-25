@@ -417,6 +417,227 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(initial_progress["model_test_summary"]["overall_status"], "queued")
     self.assertEqual(initial_progress["model_test_results"]["cases"], [])
 
+  def test_launch_attestation_disabled_does_not_submit_model_test_start_attestation(self):
+    owner = _owner(
+      cfg_model_testing={"ENABLED": True},
+      _submit_redmesh_job_start_attestation=MagicMock(),
+    )
+
+    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=False)
+
+    self.assertNotIn("error", result)
+    owner._submit_redmesh_job_start_attestation.assert_not_called()
+    stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
+    self.assertFalse(stored_config["blockchain_attestation_enabled"])
+
+  def test_launch_requires_model_test_start_attestation_when_enabled(self):
+    owner = _owner(
+      cfg_model_testing={"ENABLED": True},
+      _submit_redmesh_job_start_attestation=MagicMock(return_value=None),
+    )
+
+    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=True)
+
+    self.assertEqual(result["error"], "attestation_failed")
+    owner._submit_redmesh_job_start_attestation.assert_called_once()
+    owner.chainstore_hset.assert_not_called()
+
+  def test_launch_start_attestation_exception_fails_closed(self):
+    owner = _owner(
+      cfg_model_testing={"ENABLED": True},
+      _submit_redmesh_job_start_attestation=MagicMock(side_effect=RuntimeError("chain offline")),
+    )
+
+    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=True)
+
+    self.assertEqual(result["error"], "attestation_failed")
+    self.assertIn("chain offline", result["message"])
+    owner.chainstore_hset.assert_not_called()
+
+  def test_launch_persists_model_test_start_attestation_when_enabled(self):
+    owner = _owner(
+      cfg_model_testing={"ENABLED": True},
+      _submit_redmesh_job_start_attestation=MagicMock(
+        return_value={"tx_hash": "0xstart", "job_id": "job-123"}
+      ),
+    )
+
+    result = launch_model_test(owner, **_valid_launch_kwargs(), blockchain_attestation_enabled=True)
+
+    self.assertNotIn("error", result)
+    stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
+    self.assertTrue(stored_config["blockchain_attestation_enabled"])
+    self.assertTrue(stored_config["start_attestation_required"])
+    self.assertTrue(stored_config["end_attestation_required"])
+    job_writes = [
+      call.kwargs
+      for call in owner.chainstore_hset.call_args_list
+      if call.kwargs["hkey"] == "instance"
+    ]
+    self.assertEqual(job_writes[0]["value"]["redmesh_job_start_attestation"]["tx_hash"], "0xstart")
+    self.assertTrue(job_writes[0]["value"]["blockchain_attestation_enabled"])
+
+  def test_model_test_finalization_requires_end_attestation_for_success(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "Launcher"
+    plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
+    plugin.time.return_value = 200.0
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.get_json.return_value = {
+      "job_type": "model_test",
+      "blockchain_attestation_enabled": True,
+    }
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    job_specs = {
+      "job_id": "job-123",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "run_mode": "SINGLEPASS",
+      "target": "Unit Provider / unit-model",
+      "task_name": "CBRN smoke",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "date_created": 100.0,
+      "job_config_cid": "QmConfigCID",
+      "workers": {"launcher-node": {"finished": True}},
+      "timeline": [],
+      "blockchain_attestation_enabled": True,
+    }
+
+    result = PentesterApi01Plugin._finalize_model_test_job(
+      plugin,
+      "job-123",
+      job_specs,
+      {
+        "status": "finished",
+        "model_test_results": {"overall_status": "passed", "cases": []},
+        "model_test_summary": {"overall_status": "passed"},
+      },
+      "QmWorkerResult",
+    )
+
+    self.assertFalse(result)
+    plugin._submit_redmesh_test_attestation.assert_called_once()
+    plugin.r1fs.add_json.assert_not_called()
+    plugin._write_job_record.assert_called_with(
+      "job-123",
+      job_specs,
+      context="model_test_attestation_failed",
+    )
+    self.assertEqual(job_specs["job_status"], "FAILED")
+    self.assertEqual(job_specs["failure_class"], "attestation_failed")
+
+  def test_model_test_finalization_end_attestation_exception_marks_failed(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "Launcher"
+    plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
+    plugin.time.return_value = 200.0
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.get_json.return_value = {
+      "job_type": "model_test",
+      "blockchain_attestation_enabled": True,
+    }
+    plugin._submit_redmesh_test_attestation = MagicMock(side_effect=RuntimeError("chain offline"))
+    job_specs = {
+      "job_id": "job-123",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "run_mode": "SINGLEPASS",
+      "target": "Unit Provider / unit-model",
+      "task_name": "CBRN smoke",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "date_created": 100.0,
+      "job_config_cid": "QmConfigCID",
+      "workers": {"launcher-node": {"finished": True}},
+      "timeline": [],
+      "blockchain_attestation_enabled": True,
+    }
+
+    result = PentesterApi01Plugin._finalize_model_test_job(
+      plugin,
+      "job-123",
+      job_specs,
+      {
+        "status": "finished",
+        "model_test_results": {"overall_status": "passed", "cases": []},
+        "model_test_summary": {"overall_status": "passed"},
+      },
+      "QmWorkerResult",
+    )
+
+    self.assertFalse(result)
+    plugin.r1fs.add_json.assert_not_called()
+    self.assertEqual(job_specs["job_status"], "FAILED")
+    self.assertEqual(job_specs["failure_class"], "attestation_failed")
+
+  def test_model_test_finalization_stores_successful_end_attestation(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "Launcher"
+    plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
+    plugin.time.return_value = 200.0
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.add_json.return_value = "QmArchiveCID"
+    plugin.r1fs.get_json.side_effect = [
+      {
+        "job_type": "model_test",
+        "blockchain_attestation_enabled": True,
+      },
+      {"job_id": "job-123"},
+    ]
+    plugin._submit_redmesh_test_attestation = MagicMock(
+      return_value={"tx_hash": "0xend", "job_id": "job-123"}
+    )
+    job_specs = {
+      "job_id": "job-123",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "run_mode": "SINGLEPASS",
+      "target": "Unit Provider / unit-model",
+      "task_name": "CBRN smoke",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "date_created": 100.0,
+      "job_config_cid": "QmConfigCID",
+      "workers": {"launcher-node": {"finished": True}},
+      "timeline": [],
+      "blockchain_attestation_enabled": True,
+    }
+
+    result = PentesterApi01Plugin._finalize_model_test_job(
+      plugin,
+      "job-123",
+      job_specs,
+      {
+        "status": "finished",
+        "model_test_results": {"overall_status": "passed", "cases": []},
+        "model_test_summary": {"overall_status": "passed"},
+      },
+      "QmWorkerResult",
+    )
+
+    self.assertTrue(result)
+    archive_payload = plugin.r1fs.add_json.call_args.args[0]
+    self.assertEqual(archive_payload["redmesh_test_attestation"]["tx_hash"], "0xend")
+    stub = plugin._write_job_record.call_args.args[1]
+    self.assertEqual(stub["job_status"], "FINALIZED")
+    self.assertTrue(stub["blockchain_attestation_enabled"])
+
   def test_enabled_launch_defaults_to_all_built_in_sets_when_selection_omitted(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
     kwargs = _valid_launch_kwargs()
@@ -1767,6 +1988,57 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(persisted_specs["job_cid"], "cid-archive")
     self.assertEqual(persisted_specs["model_test_summary"]["overall_status"], "completed")
     self.assertNotIn("workers", persisted_specs)
+
+  def test_finished_model_test_recovery_skips_failed_attestation_record(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    job_specs = {
+      "job_id": "job-failed-attestation",
+      "job_status": "FAILED",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_pass": 1,
+      "run_mode": "SINGLEPASS",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "target": "Unit Provider / unit-model",
+      "target_url": "",
+      "task_name": "CBRN smoke",
+      "start_port": 0,
+      "end_port": 0,
+      "date_created": 120.0,
+      "job_config_cid": "cid-config",
+      "failure_class": "attestation_failed",
+      "failure_message": "Required terminal blockchain attestation failed for model-test job.",
+      "model_test_summary": {"overall_status": "completed"},
+      "model_test_node_selection": {
+        "selection_mode": "manual",
+        "selected_execution_node": "node-a",
+      },
+      "timeline": [],
+      "pass_reports": [],
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "finished": True,
+          "model_test_worker_status": "finished",
+          "report_cid": "cid-result",
+        },
+      },
+    }
+    plugin = MagicMock()
+    plugin.ee_addr = "node-a"
+    plugin.cfg_instance_id = "instance"
+    plugin.chainstore_hgetall.return_value = {"job-failed-attestation": job_specs}
+    plugin._normalize_job_record.side_effect = lambda key, specs, migrate=False: (key, specs)
+
+    finalized = PentesterApi01Plugin._maybe_finalize_finished_model_test_jobs(plugin)
+
+    self.assertEqual(finalized, [])
+    plugin.r1fs.get_json.assert_not_called()
+    plugin.r1fs.add_json.assert_not_called()
+    plugin._write_job_record.assert_not_called()
 
   def test_stale_model_test_worker_fails_with_sanitized_worker_lost(self):
     mock_plugin_modules()
