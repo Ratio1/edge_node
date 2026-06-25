@@ -1,3 +1,4 @@
+import copy
 import json
 import re
 from datetime import datetime, timezone
@@ -71,6 +72,19 @@ PER_NODE_CONFIG_STRUCTURED_KEYS = {
   "byNode",
   "BY_NODE",
 }
+SENSITIVE_LOG_KEY_PARTS = (
+  "TOKEN",
+  "PASSWORD",
+  "PASS",
+  "PWD",
+  "SECRET",
+  "PRIVATE_KEY",
+  "PRIVATEKEY",
+  "API_KEY",
+  "APIKEY",
+  "ACCESS_KEY",
+  "ACCESSKEY",
+)
 
 class _DeeployMixin:
   def __init__(self):
@@ -1795,6 +1809,30 @@ class _DeeployMixin:
     """
     # Check if already using new format (plugins array)
     if DEEPLOY_KEYS.PLUGINS in request and request[DEEPLOY_KEYS.PLUGINS]:
+      request_key, request_config = self._get_request_per_node_config(request)
+      if request_key is not None:
+        plugins_array = request[DEEPLOY_KEYS.PLUGINS]
+        if not isinstance(plugins_array, list) or len(plugins_array) != 1:
+          raise ValueError(
+            "Top-level perNodeConfig with plugins[] requires exactly one plugin instance; "
+            "put PER_NODE_CONFIG inside the target plugin for multi-plugin requests."
+          )
+        plugin_instance = plugins_array[0]
+        if not isinstance(plugin_instance, dict):
+          raise ValueError(
+            "Top-level perNodeConfig with plugins[] requires the single plugin instance to be a dictionary."
+          )
+        existing_keys = [
+          key for key in PER_NODE_CONFIG_KEYS
+          if key in plugin_instance
+        ]
+        if existing_keys:
+          raise ValueError(
+            f"Top-level perNodeConfig cannot be combined with plugin-level PER_NODE_CONFIG: {existing_keys}."
+          )
+        plugin_instance["PER_NODE_CONFIG"] = self.deepcopy(request_config)
+        for key in PER_NODE_CONFIG_KEYS:
+          request.pop(key, None)
       return request
 
     # Try to convert from legacy format
@@ -1830,6 +1868,17 @@ class _DeeployMixin:
     raise ValueError(
       f"{DEEPLOY_ERRORS.REQUEST3}. Neither 'plugins' array nor 'plugin_signature' provided."
     )
+
+  def _sync_normalized_plugins_input(self, inputs, normalized_request):
+    if DEEPLOY_KEYS.PLUGINS in normalized_request:
+      inputs[DEEPLOY_KEYS.PLUGINS] = normalized_request[DEEPLOY_KEYS.PLUGINS]
+    for key in PER_NODE_CONFIG_KEYS:
+      if key not in normalized_request:
+        try:
+          inputs.pop(key, None)
+        except Exception:
+          pass
+    return inputs
 
 
   def _ensure_runner_cstore_auth_env(self, app_id, prepared_plugins):
@@ -2747,16 +2796,31 @@ class _DeeployMixin:
     return plugin_instance
 
   def _get_request_per_node_config(self, inputs):
+    found_configs = []
     for key in PER_NODE_CONFIG_KEYS:
+      value = None
+      found = False
       try:
-        if key in inputs and inputs.get(key) is not None:
-          return key, inputs.get(key)
+        if key in inputs:
+          value = inputs.get(key)
+          found = True
       except Exception:
         pass
-      if hasattr(inputs, key):
-        value = getattr(inputs, key)
-        if value is not None:
-          return key, value
+      if not found:
+        try:
+          value = getattr(inputs, key)
+          found = True
+        except Exception:
+          pass
+      if found and value is not None:
+        found_configs.append((key, value))
+
+    if len(found_configs) > 1:
+      raise ValueError(
+        f"Only one top-level perNodeConfig spelling is allowed: {[key for key, _ in found_configs]}."
+      )
+    if found_configs:
+      return found_configs[0]
     return None, None
 
   def _apply_request_per_node_config_to_payload(self, inputs, instance_payload):
@@ -2870,13 +2934,19 @@ class _DeeployMixin:
         yield overlay
 
   def _redact_per_node_config_for_log(self, plugins):
-    redacted = self.deepcopy(plugins)
+    deepcopy = getattr(self, "deepcopy", copy.deepcopy)
+    redacted = deepcopy(plugins)
 
     def redact(value):
       if isinstance(value, dict):
         for key, item in list(value.items()):
           if key in PER_NODE_CONFIG_KEYS and item:
             value[key] = "***"
+          elif any(
+            part in re.sub(r"[^A-Z0-9]", "", str(key).upper())
+            for part in SENSITIVE_LOG_KEY_PARTS
+          ):
+            value[key] = "***" if item else item
           else:
             redact(item)
       elif isinstance(value, list):
