@@ -961,15 +961,11 @@ class _DeeployMixin:
     discovered_plugin_instances,
     dct_deeploy_specs = None,
     job_app_type=None,
-    dispatch=True
   ):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
     enable_chainstore_response = bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False))
-    if not dispatch:
-      # Validation-only path must avoid touching live chainstore keys.
-      enable_chainstore_response = False
 
     # for plugin_instan
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
@@ -1191,8 +1187,6 @@ class _DeeployMixin:
         context=f"update pipeline '{app_alias}'",
       )
     cleaned_response_keys = prepared_response_keys if enable_chainstore_response else {}
-    if not dispatch:
-      return cleaned_response_keys, pipeline_to_save
 
     for addr, node_plugins in node_plugins_ready.items():
       msg = ''
@@ -1230,68 +1224,6 @@ class _DeeployMixin:
 
     cleaned_response_keys = prepared_response_keys if enable_chainstore_response else {}
     return cleaned_response_keys, pipeline_to_save
-
-  def _validate_update_pipeline_request(
-    self,
-    owner,
-    inputs,
-    app_id,
-    app_alias,
-    app_type,
-    update_nodes,
-    discovered_plugin_instances,
-    dct_deeploy_specs = None,
-    job_app_type = None,
-  ):
-    """
-    Validate update request inputs and plugin wiring before destructive deployment.
-
-    Parameters
-    ----------
-    owner : str
-      Escrow owner address.
-    inputs : dict-like
-      Normalized request inputs.
-    app_id : str
-      Application identifier.
-    app_alias : str
-      Application alias.
-    app_type : str
-      Pipeline type.
-    update_nodes : list[str]
-      Nodes that should receive update operations.
-    discovered_plugin_instances : list
-      Discovered running plugin instances used for matching existing IDs.
-    dct_deeploy_specs : dict, optional
-      Deeploy specs used for update operations.
-    job_app_type : str, optional
-      Detected or provided job app type.
-
-    Returns
-    -------
-    tuple
-      (response_keys, pipeline_to_persist) with command dispatch skipped.
-    """
-    validation_inputs = self.deepcopy(inputs)
-    if validation_inputs is None:
-      validation_inputs = {}
-    try:
-      validation_inputs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE] = False
-    except Exception:
-      setattr(validation_inputs, DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False)
-    self._validate_dependency_tree(validation_inputs)
-    return self.__update_pipeline_on_nodes(
-      update_nodes,
-      validation_inputs,
-      app_id,
-      app_alias,
-      app_type,
-      owner,
-      discovered_plugin_instances,
-      dct_deeploy_specs=dct_deeploy_specs,
-      job_app_type=job_app_type,
-      dispatch=False,
-    )
 
   def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
     """
