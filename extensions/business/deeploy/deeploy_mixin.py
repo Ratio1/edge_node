@@ -20,6 +20,11 @@ from extensions.utils.memory_formatter import parse_memory_to_mb
 
 DEEPLOY_DEBUG = True
 STACK_CPU_QUANTUM = Decimal("0.01")
+DEEPLOY_BACKEND_DYNAMIC_ENV_TYPES = (
+  DEEPLOY_DYNAMIC_ENV_TYPES.STATIC,
+  DEEPLOY_DYNAMIC_ENV_TYPES.HOST_IP,
+  DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+)
 
 MESSAGE_PREFIX = "Please sign this message for Deeploy: "
 DEEPLOY_WRAPPER_HEADER = "Please sign this Deeploy request:"
@@ -2226,6 +2231,7 @@ class _DeeployMixin:
 
       # Check signature validity (forbidden signatures, etc)
       self._check_plugin_signature(signature)
+      self._validate_dynamic_env_instance(plugin_instance)
 
       # Validate required fields for this specific plugin signature
       self._validate_plugin_instance_for_signature(signature, plugin_instance, index=idx)
@@ -3048,49 +3054,115 @@ class _DeeployMixin:
       )
     return provider_name, target_key
 
+  @staticmethod
+  def _normalized_dynamic_env_entry_type(entry):
+    entry_type = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE)
+    if isinstance(entry_type, str):
+      return entry_type.strip()
+    return entry_type
+
+  def _canonicalize_dynamic_env_entry_type(self, entry, var_name):
+    entry_type = self._normalized_dynamic_env_entry_type(entry)
+    if not isinstance(entry_type, str) or not entry_type:
+      raise ValueError(
+        "DYNAMIC_ENV entry for '{}' must include a non-empty type.".format(var_name)
+      )
+    if entry_type not in DEEPLOY_BACKEND_DYNAMIC_ENV_TYPES:
+      raise ValueError(
+        "DYNAMIC_ENV entry for '{}' has unsupported type '{}'. "
+        "Supported backend types: {}.".format(
+          var_name,
+          entry_type,
+          ", ".join(DEEPLOY_BACKEND_DYNAMIC_ENV_TYPES),
+        )
+      )
+    entry[DEEPLOY_DYNAMIC_ENV_KEYS.TYPE] = entry_type
+    return entry_type
+
+  def _is_shmem_dynamic_env_entry(self, entry):
+    return (
+      isinstance(entry, dict)
+      and self._normalized_dynamic_env_entry_type(entry) == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM
+    )
+
+  def _validate_dynamic_env_container(self, container):
+    if not isinstance(container, dict):
+      return
+    dynamic_env = container.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
+    if dynamic_env is None:
+      return
+    if not isinstance(dynamic_env, dict):
+      raise ValueError("DYNAMIC_ENV must be a dictionary.")
+    for var_name, entries in dynamic_env.items():
+      if not isinstance(var_name, str) or not var_name.strip():
+        raise ValueError("DYNAMIC_ENV variable names must be non-empty strings.")
+      if not isinstance(entries, list):
+        raise ValueError(
+          "DYNAMIC_ENV entries for '{}' must be a list.".format(var_name)
+        )
+      for entry in entries:
+        if not isinstance(entry, dict):
+          raise ValueError(
+            "DYNAMIC_ENV entry for '{}' must be a dictionary.".format(var_name)
+          )
+        if entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.SOURCE) == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM:
+          raise ValueError(
+            "DYNAMIC_ENV entry for '{}' uses unsupported source='{}'; "
+            "backend shmem entries must use {{'{}': '{}', '{}': [provider, key]}}.".format(
+              var_name,
+              DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+              DEEPLOY_DYNAMIC_ENV_KEYS.TYPE,
+              DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+              DEEPLOY_DYNAMIC_ENV_KEYS.PATH,
+            )
+          )
+        entry_type = self._canonicalize_dynamic_env_entry_type(entry, var_name)
+        if entry_type == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM:
+          self._validate_dynamic_env_shmem_path(entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH), var_name)
+
+  def _validate_dynamic_env_instance(self, instance):
+    self._validate_dynamic_env_container(instance)
+    if not isinstance(instance, dict):
+      return
+    for key in PER_NODE_CONFIG_KEYS:
+      if key not in instance:
+        continue
+      for overlay in self._iter_per_node_dynamic_env_containers(instance[key]):
+        self._validate_dynamic_env_container(overlay)
+
   def _validate_dynamic_env_config(self, plugins):
     for plugin in plugins:
       instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
       if not isinstance(instances, list):
         continue
       for instance in instances:
-        if not isinstance(instance, dict):
+        self._validate_dynamic_env_instance(instance)
+
+  def _iter_per_node_dynamic_env_containers(self, raw_config):
+    if not isinstance(raw_config, dict):
+      return
+
+    has_structured_keys = any(
+      key in raw_config
+      for key in PER_NODE_CONFIG_STRUCTURED_KEYS
+    )
+    if has_structured_keys:
+      for key in ("default", "DEFAULT"):
+        overlay = raw_config.get(key)
+        if isinstance(overlay, dict):
+          yield overlay
+      for section_key in ("byIndex", "BY_INDEX", "byNode", "BY_NODE"):
+        section = raw_config.get(section_key)
+        if not isinstance(section, dict):
           continue
-        dynamic_env = instance.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
-        if dynamic_env is None:
-          continue
-        if not isinstance(dynamic_env, dict):
-          raise ValueError("DYNAMIC_ENV must be a dictionary.")
-        for var_name, entries in dynamic_env.items():
-          if not isinstance(var_name, str) or not var_name.strip():
-            raise ValueError("DYNAMIC_ENV variable names must be non-empty strings.")
-          if not isinstance(entries, list):
-            raise ValueError(
-              "DYNAMIC_ENV entries for '{}' must be a list.".format(var_name)
-            )
-          for entry in entries:
-            if not isinstance(entry, dict):
-              raise ValueError(
-                "DYNAMIC_ENV entry for '{}' must be a dictionary.".format(var_name)
-              )
-            if entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.SOURCE) == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM:
-              raise ValueError(
-                "DYNAMIC_ENV entry for '{}' uses unsupported source='{}'; "
-                "backend shmem entries must use {{'{}': '{}', '{}': [provider, key]}}.".format(
-                  var_name,
-                  DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
-                  DEEPLOY_DYNAMIC_ENV_KEYS.TYPE,
-                  DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
-                  DEEPLOY_DYNAMIC_ENV_KEYS.PATH,
-                )
-              )
-            entry_type = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE)
-            if not isinstance(entry_type, str) or not entry_type.strip():
-              raise ValueError(
-                "DYNAMIC_ENV entry for '{}' must include a non-empty type.".format(var_name)
-              )
-            if entry_type == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM:
-              self._validate_dynamic_env_shmem_path(entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH), var_name)
+        for overlay in section.values():
+          if isinstance(overlay, dict):
+            yield overlay
+      return
+
+    for overlay in raw_config.values():
+      if isinstance(overlay, dict):
+        yield overlay
 
   def _has_shmem_dynamic_env(self, plugins):
     """Check if any plugin instance has shmem-type DYNAMIC_ENV entries."""
@@ -3104,10 +3176,7 @@ class _DeeployMixin:
         if not isinstance(entries, list):
           continue
         for entry in entries:
-          if (
-            isinstance(entry, dict)
-            and entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE) == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM
-          ):
+          if self._is_shmem_dynamic_env_entry(entry):
             return True
       return False
 
@@ -3716,8 +3785,7 @@ class _DeeployMixin:
               continue
             for entry in entries:
               if (
-                not isinstance(entry, dict)
-                or entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE) != DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM
+                not self._is_shmem_dynamic_env_entry(entry)
               ):
                 continue
               path = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH)
@@ -3747,8 +3815,7 @@ class _DeeployMixin:
           continue
         for entry in entries:
           if (
-            not isinstance(entry, dict)
-            or entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE) != DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM
+            not self._is_shmem_dynamic_env_entry(entry)
           ):
             continue
           path = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH)

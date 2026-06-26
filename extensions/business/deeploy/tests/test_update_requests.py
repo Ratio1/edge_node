@@ -1714,6 +1714,127 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 0)
 
+  def test_process_update_rejects_unsupported_dynamic_env_type_before_payment_or_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "current-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "IMAGE": "repo/app:1.0",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            },
+          },
+        },
+      ],
+    )
+    called["payment"] = 0
+
+    def check_payment(*args, **kwargs):
+      called["payment"] += 1
+      return True
+
+    plugin.deeploy_check_payment_and_job_owner = check_payment
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "current-instance",
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            "DYNAMIC_ENV": {
+              "API_URL": [
+                {"type": "container_ip", "provider": "api"}
+              ],
+            },
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("unsupported type 'container_ip'", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["payment"], 0)
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
+  def test_process_update_rejects_per_node_unsupported_dynamic_env_type_before_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "current-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "IMAGE": "repo/app:1.0",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            },
+          },
+        },
+      ],
+    )
+    called["payment"] = 0
+
+    def check_payment(*args, **kwargs):
+      called["payment"] += 1
+      return True
+
+    plugin.deeploy_check_payment_and_job_owner = check_payment
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "current-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+            "IMAGE": "repo/app:1.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            "perNodeConfig": {
+              "node-1": {
+                "DYNAMIC_ENV": {
+                  "API_URL": [
+                    {"type": "plugin_value", "provider": "api", "key": "PORT"}
+                  ],
+                },
+              },
+            },
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertIn("unsupported type 'plugin_value'", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(called["payment"], 0)
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+
   def test_process_update_rejects_source_shmem_before_delete(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[
