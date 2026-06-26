@@ -1,7 +1,12 @@
 import unittest
 from collections import defaultdict
 
-from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS, JOB_APP_TYPES
+from extensions.business.deeploy.deeploy_const import (
+  DEEPLOY_DYNAMIC_ENV_KEYS,
+  DEEPLOY_DYNAMIC_ENV_TYPES,
+  DEEPLOY_KEYS,
+  JOB_APP_TYPES,
+)
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs, make_plugin_entry
 
 
@@ -384,6 +389,44 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "Duplicate plugin_name"):
       plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
 
+  def test_prepare_plugins_rejects_duplicate_explicit_semaphore_without_shmem(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native-1", SEMAPHORE="shared"),
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native-2", SEMAPHORE="shared"),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "Duplicate semaphore key"):
+      plugin.deeploy_prepare_plugins(inputs)
+
+  def test_prepare_plugins_rejects_invalid_semaphore_shape(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native-1", SEMAPHORE=123),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "SEMAPHORE"):
+      plugin.deeploy_prepare_plugins(inputs)
+
+  def test_prepare_plugins_rejects_invalid_semaphored_keys_shape(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          instance_id="container-1",
+          SEMAPHORED_KEYS=["valid-key", ""],
+        ),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "SEMAPHORED_KEYS"):
+      plugin.deeploy_prepare_plugins(inputs)
+
   def test_prepare_plugins_rejects_shmem_referencing_unknown_plugin(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
@@ -402,6 +445,122 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "unknown plugin 'nonexistent'"):
       plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
 
+  def test_prepare_plugins_rejects_backend_source_shmem_shape(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", plugin_name="provider", PROCESS_DELAY=5),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          DYNAMIC_ENV={
+            "API_HOST": [
+              {
+                DEEPLOY_DYNAMIC_ENV_KEYS.SOURCE: DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+                DEEPLOY_DYNAMIC_ENV_KEYS.PATH: ["provider", "PORT"],
+              }
+            ]
+          },
+        ),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "source='shmem'"):
+      plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
+
+  def test_normalize_plugins_input_moves_legacy_top_level_per_node_config_to_generated_plugin(self):
+    plugin = make_deeploy_plugin()
+    request = {
+      DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+      DEEPLOY_KEYS.APP_PARAMS: {"IMAGE": "repo/app:latest"},
+      "perNodeConfig": {"node-1": {"ENV": {"REGION": "eu"}}},
+    }
+
+    normalized = plugin._normalize_plugins_input(request)
+
+    self.assertEqual(normalized[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"], {"node-1": {"ENV": {"REGION": "eu"}}})
+    self.assertNotIn("perNodeConfig", normalized)
+    self.assertNotIn("perNodeConfig", normalized[DEEPLOY_KEYS.APP_PARAMS])
+
+  def test_normalize_plugins_input_moves_single_explicit_plugin_top_level_per_node_config(self):
+    plugin = make_deeploy_plugin()
+    request = {
+      DEEPLOY_KEYS.PLUGINS: [
+        make_plugin_entry("CONTAINER_APP_RUNNER", IMAGE="repo/app:latest"),
+      ],
+      "PER_NODE_CONFIG": {"node-1": {"ENV": {"REGION": "eu"}}},
+    }
+
+    normalized = plugin._normalize_plugins_input(request)
+
+    self.assertNotIn("PER_NODE_CONFIG", normalized)
+    self.assertEqual(
+      normalized[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"],
+      {"node-1": {"ENV": {"REGION": "eu"}}},
+    )
+
+  def test_prepare_plugins_rejects_malformed_dynamic_env_entries(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "256m"},
+          DYNAMIC_ENV={
+            "API_URL": {"type": "shmem", "path": ["provider", "PORT"]},
+          },
+        ),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "DYNAMIC_ENV entries for 'API_URL' must be a list"):
+      plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
+
+  def test_prepare_plugins_rejects_unknown_dynamic_env_backend_type(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "256m"},
+          DYNAMIC_ENV={
+            "API_URL": [
+              {"type": "container_ip", "provider": "api"}
+            ],
+          },
+        ),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "unsupported type 'container_ip'"):
+      plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
+
+  def test_prepare_plugins_rejects_ui_only_plugin_value_dynamic_env_type(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "256m"},
+          DYNAMIC_ENV={
+            "API_URL": [
+              {"type": "plugin_value", "provider": "api", "key": "PORT"}
+            ],
+          },
+        ),
+      ]
+    )
+
+    with self.assertRaisesRegex(ValueError, "unsupported type 'plugin_value'"):
+      plugin.deeploy_prepare_plugins(inputs, app_id="app-1")
+
   def test_prepare_plugins_without_app_id_skips_resolution(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
@@ -414,6 +573,210 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
 
     instance = prepared[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
     self.assertNotIn("SEMAPHORE", instance)
+
+  def test_create_pipeline_on_nodes_without_chainstore_response_returns_empty_keys(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"start": 0, "reset": 0}
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+
+    def start_pipeline(**kwargs):
+      called["start"] += 1
+      return {
+        "NAME": kwargs["name"],
+        "APP_ALIAS": kwargs["app_alias"],
+        "PLUGINS": kwargs["plugins"],
+        "DEEPLOY_SPECS": kwargs["deeploy_specs"],
+      }
+
+    plugin.cmdapi_start_pipeline_by_params = start_pipeline
+    inputs = make_inputs(
+      app_alias="native-app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=False,
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", plugin_name="native-api", PROCESS_DELAY=5),
+      ],
+    )
+
+    response_keys, saved_pipeline = plugin._DeeployMixin__create_pipeline_on_nodes(
+      ["node-1"],
+      inputs,
+      "native-app_abc123",
+      "native-app",
+      "void",
+      "owner",
+      job_app_type="native",
+      dct_deeploy_specs={"job_id": 11},
+    )
+
+    self.assertEqual(response_keys, {})
+    self.assertEqual(called["start"], 1)
+    self.assertEqual(called["reset"], 0)
+    self.assertEqual(saved_pipeline["NAME"], "native-app_abc123")
+
+  def test_create_pipeline_on_nodes_recovers_duplicate_stale_named_semaphores_with_autowire(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"start": 0, "reset": 0}
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+
+    def start_pipeline(**kwargs):
+      called["start"] += 1
+      return {
+        "PLUGINS": kwargs["plugins"],
+        "DEEPLOY_SPECS": kwargs["deeploy_specs"],
+      }
+
+    plugin.cmdapi_start_pipeline_by_params = start_pipeline
+    inputs = make_inputs(
+      app_alias="native-app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=True,
+      plugins=[
+        make_plugin_entry(
+          "A_SIMPLE_PLUGIN",
+          instance_id="native-1",
+          plugin_name="alpha",
+          SEMAPHORE="old-app__shared-api",
+          PROCESS_DELAY=5,
+        ),
+        make_plugin_entry(
+          "A_SIMPLE_PLUGIN",
+          instance_id="native-2",
+          plugin_name="beta",
+          SEMAPHORE="old-app__shared-api",
+          PROCESS_DELAY=5,
+        ),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          instance_id="car-1",
+          plugin_name="frontend",
+          IMAGE="repo/app:latest",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "256m"},
+        ),
+      ],
+    )
+
+    response_keys, saved_pipeline = plugin._DeeployMixin__create_pipeline_on_nodes(
+      ["node-1"],
+      inputs,
+      "native-app_abc123",
+      "native-app",
+      "void",
+      "owner",
+      job_app_type="native",
+      dct_deeploy_specs={"job_id": 11},
+    )
+
+    native_instances = saved_pipeline["PLUGINS"][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES]
+    container_instance = saved_pipeline["PLUGINS"][1][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(native_instances[0]["SEMAPHORE"], "native-app_abc123__alpha")
+    self.assertEqual(native_instances[1]["SEMAPHORE"], "native-app_abc123__beta")
+    self.assertEqual(
+      container_instance["SEMAPHORED_KEYS"],
+      ["native-app_abc123__alpha", "native-app_abc123__beta"],
+    )
+    self.assertEqual(called["start"], 1)
+    self.assertEqual(called["reset"], 1)
+    self.assertEqual(len(response_keys["node-1"]), 3)
+    self.assertEqual(
+      saved_pipeline["DEEPLOY_SPECS"][DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS],
+      response_keys,
+    )
+
+  def test_create_pipeline_on_nodes_rejects_duplicate_final_autowire_semaphores(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    called = {"start": 0, "reset": 0}
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: called.__setitem__("reset", called["reset"] + 1)
+    plugin.cmdapi_start_pipeline_by_params = lambda **kwargs: called.__setitem__("start", called["start"] + 1)
+
+    inputs = make_inputs(
+      app_alias="native-app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=False,
+      plugins=[
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native/a", PROCESS_DELAY=5),
+        make_plugin_entry("A_SIMPLE_PLUGIN", instance_id="native a", PROCESS_DELAY=5),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          instance_id="car-1",
+          IMAGE="repo/app:latest",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "256m"},
+        ),
+      ],
+    )
+
+    with self.assertRaisesRegex(ValueError, "Duplicate final semaphore key"):
+      plugin._DeeployMixin__create_pipeline_on_nodes(
+        ["node-1"],
+        inputs,
+        "native-app_abc123",
+        "native-app",
+        "void",
+        "owner",
+        job_app_type="native",
+        dct_deeploy_specs={"job_id": 11},
+      )
+
+    self.assertEqual(called["start"], 0)
+    self.assertEqual(called["reset"], 0)
+
+  def test_create_pipeline_on_nodes_strips_stale_chainstore_response_key_when_disabled(self):
+    plugin = make_deeploy_plugin()
+    plugin.time = lambda: 1_000.0
+    plugin.defaultdict = defaultdict
+    plugin._reset_chainstore_response_keys = lambda *args, **kwargs: None
+
+    def start_pipeline(**kwargs):
+      return {
+        "PLUGINS": kwargs["plugins"],
+        "DEEPLOY_SPECS": kwargs["deeploy_specs"],
+      }
+
+    plugin.cmdapi_start_pipeline_by_params = start_pipeline
+    response_key_field = plugin.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
+    inputs = make_inputs(
+      app_alias="native-app",
+      job_id=11,
+      pipeline_input_type="void",
+      pipeline_input_uri="",
+      chainstore_response=False,
+      plugins=[
+        make_plugin_entry(
+          "A_SIMPLE_PLUGIN",
+          plugin_name="native-api",
+          PROCESS_DELAY=5,
+          **{response_key_field: "stale-response-key"},
+        ),
+      ],
+    )
+
+    response_keys, saved_pipeline = plugin._DeeployMixin__create_pipeline_on_nodes(
+      ["node-1"],
+      inputs,
+      "native-app_abc123",
+      "native-app",
+      "void",
+      "owner",
+      job_app_type="native",
+      dct_deeploy_specs={"job_id": 11, DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS: {"node-1": ["old-key"]}},
+    )
+
+    instance = saved_pipeline["PLUGINS"][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(response_keys, {})
+    self.assertNotIn(response_key_field, instance)
+    self.assertNotIn(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, saved_pipeline["DEEPLOY_SPECS"])
 
   def test_per_node_config_materializes_container_and_worker_configs(self):
     plugin = make_deeploy_plugin()
