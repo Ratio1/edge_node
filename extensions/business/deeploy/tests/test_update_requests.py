@@ -1965,6 +1965,35 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(instance["ENV"], {"WORKER_NODE": "node-b"})
     self.assertNotIn("perNodeConfig", instance)
 
+  def test_prepare_single_plugin_instance_update_inherits_public_redacted_per_node_marker(self):
+    plugin = make_deeploy_plugin()
+    existing_config = {
+      "byNode": {
+        "0xai_node_a": {"ENV": {"WORKER_NODE": "node-a"}},
+        "0xai_node_b": {"ENV": {"WORKER_NODE": "node-b"}},
+      },
+    }
+    fallback_instance = {
+      "instance_conf": {
+        "IMAGE": "node:22",
+        "PER_NODE_CONFIG": existing_config,
+      },
+    }
+
+    prepared = plugin.deeploy_prepare_single_plugin_instance_update(
+      inputs=make_inputs(),
+      instance_id="instance-6",
+      plugin_config={
+        DEEPLOY_KEYS.PLUGIN_SIGNATURE: "WORKER_APP_RUNNER",
+        "IMAGE": "node:22",
+        "PER_NODE_CONFIG": "***",
+      },
+      fallback_instance=fallback_instance,
+    )
+
+    instance = prepared[plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(instance["PER_NODE_CONFIG"], existing_config)
+
   def test_per_node_config_update_uses_persisted_target_node_order(self):
     plugin = make_deeploy_plugin()
 

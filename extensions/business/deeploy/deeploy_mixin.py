@@ -1,7 +1,9 @@
 import copy
 import json
+import ipaddress
 import re
 from datetime import datetime, timezone
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 
@@ -79,6 +81,26 @@ PER_NODE_CONFIG_STRUCTURED_KEYS = {
   "BY_NODE",
 }
 SENSITIVE_LOG_KEY_PARTS = (
+  "BEGINPRIVATEKEY",
+  "BEGINRSAPRIVATEKEY",
+  "BEGINOPENSSHPRIVATEKEY",
+  "CERTIFICATE",
+  "CA_CRT",
+  "CA_KEY",
+  "NODE_CRT",
+  "NODE_KEY",
+  "CLIENT_CRT",
+  "CLIENT_KEY",
+  "CRDB_CA_CRT",
+  "CRDB_NODE_CRT",
+  "CRDB_NODE_KEY",
+  "CRDB_CLIENT_ROOT_CRT",
+  "CRDB_CLIENT_ROOT_KEY",
+  "CRDBCACRT",
+  "CRDBNODECRT",
+  "CRDBNODEKEY",
+  "CRDBCLIENTROOTCRT",
+  "CRDBCLIENTROOTKEY",
   "TOKEN",
   "PASSWORD",
   "PASS",
@@ -90,6 +112,27 @@ SENSITIVE_LOG_KEY_PARTS = (
   "APIKEY",
   "ACCESS_KEY",
   "ACCESSKEY",
+)
+PUBLIC_REDACTION_MARKERS = ("***", "[redacted]")
+COCKROACHDB_IMAGE_MARKER = "deeploy-cockroachdb-service"
+COCKROACHDB_CERT_ENV_KEYS = (
+  "CRDB_CA_CRT",
+  "CRDB_NODE_CRT",
+  "CRDB_NODE_KEY",
+)
+COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS = (
+  "CRDB_CLIENT_ROOT_CRT",
+  "CRDB_CLIENT_ROOT_KEY",
+)
+COCKROACHDB_INHERITABLE_PER_NODE_ENV_KEYS = (
+  "CF_TUNNEL_TOKEN",
+  *COCKROACHDB_CERT_ENV_KEYS,
+  *COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS,
+)
+COCKROACHDB_REQUIRED_AUTH_ENV_KEYS = (
+  "CRDB_DATABASE",
+  "CRDB_USER",
+  "CRDB_PASSWORD",
 )
 
 class _DeeployMixin:
@@ -762,6 +805,7 @@ class _DeeployMixin:
     """
     nodes = list(nodes or [])
     enable_chainstore_response = bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False))
+    self._prepare_cockroachdb_secure_config(inputs, nodes)
     plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
     self._validate_dependency_tree(inputs)
     plugins = self._ensure_runner_cstore_auth_env(
@@ -1015,6 +1059,8 @@ class _DeeployMixin:
       dct_deeploy_specs,
       pipeline_params=pipeline_params,
     )
+    self._inherit_cockroachdb_secure_config_from_discovered(inputs, discovered_plugin_instances)
+    self._prepare_cockroachdb_secure_config(inputs, nodes)
 
     requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
 
@@ -1393,7 +1439,7 @@ class _DeeployMixin:
         timeout=30,
         pin=False,
         raise_on_error=False,
-        show_logs=True,
+        show_logs=False,
       )
     except Exception as exc:
       return {
@@ -1572,10 +1618,12 @@ class _DeeployMixin:
       job_id=job_id,
       discovered_plugin_instances=discovered_instances,
     )
+    durable_nodes = self._ordered_nodes_for_per_node_config(nodes, deeploy_specs)
 
     return {
       "discovered_instances": discovered_instances,
-      "nodes": nodes,
+      "nodes": durable_nodes,
+      "discovered_nodes": nodes,
       "deeploy_specs": deeploy_specs,
     }
 
@@ -2763,7 +2811,11 @@ class _DeeployMixin:
     # Check if the job is paid
     self.Pd(f"  Fetching job details for job_id={job_id}...")
     job = self.bc.get_job_details(job_id=job_id)
-    self.Pd(f"Job details: {self.json_dumps(job, indent=2)}")
+    self.Pd(
+      "Job details: {}".format(
+        self.json_dumps(self._redact_per_node_config_for_log(job), indent=2)
+      )
+    )
 
     if not job:
       self.P(f"Job {job_id} not found.")
@@ -3277,6 +3329,639 @@ class _DeeployMixin:
       return merged
     return self.deepcopy(overlay)
 
+  def _is_cockroachdb_plugin_instance(self, instance):
+    if not isinstance(instance, dict):
+      return False
+    image = instance.get("IMAGE")
+    if isinstance(image, str) and COCKROACHDB_IMAGE_MARKER in image.lower():
+      return True
+    env = instance.get("ENV")
+    if isinstance(env, dict) and (
+      "CRDB_NODE_COUNT" in env or "CRDB_HOSTNAMES" in env
+    ):
+      return True
+    plugin_name = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+    return isinstance(plugin_name, str) and plugin_name.lower() == "cockroachdb"
+
+  def _request_has_cockroachdb_plugin(self, inputs):
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if isinstance(plugins_array, list):
+      for plugin_instance in plugins_array:
+        if self._is_cockroachdb_plugin_instance(plugin_instance):
+          return True
+    return False
+
+  def _discovered_has_cockroachdb_plugin(self, discovered_plugin_instances):
+    for discovered in discovered_plugin_instances or []:
+      if not isinstance(discovered, dict):
+        continue
+      instance_data = discovered.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE)
+      if not isinstance(instance_data, dict):
+        continue
+      instance_conf = instance_data.get("instance_conf")
+      if self._is_cockroachdb_plugin_instance(instance_conf):
+        return True
+    return False
+
+  def _validate_cockroachdb_target_change(self, current_nodes, requested_nodes, inputs, discovered_plugin_instances=None):
+    is_cockroachdb = (
+      self._request_has_cockroachdb_plugin(inputs)
+      or self._discovered_has_cockroachdb_plugin(discovered_plugin_instances)
+    )
+    if not is_cockroachdb:
+      return True
+
+    current_nodes = list(current_nodes or [])
+    requested_nodes = list(requested_nodes or [])
+    if len(requested_nodes) < 2:
+      raise ValueError("CockroachDB requires at least 2 target nodes.")
+    if current_nodes and len(requested_nodes) < len(current_nodes):
+      raise ValueError("CockroachDB scale-down is not supported in v1.")
+    same_count_changed = (
+      current_nodes
+      and len(requested_nodes) == len(current_nodes)
+      and requested_nodes != current_nodes
+    )
+    if same_count_changed:
+      raise ValueError("CockroachDB node replacement or reordering is not supported in v1.")
+    if current_nodes and len(requested_nodes) > len(current_nodes):
+      existing_prefix = requested_nodes[:len(current_nodes)]
+      if existing_prefix != current_nodes:
+        raise ValueError("CockroachDB scale-up must append new nodes after the existing node order in v1.")
+    return True
+
+  def _validate_cockroachdb_auth_env(self, env):
+    if not isinstance(env, dict):
+      raise ValueError("CockroachDB service requires ENV configuration.")
+    missing = [
+      key for key in COCKROACHDB_REQUIRED_AUTH_ENV_KEYS
+      if not isinstance(env.get(key), str) or not env.get(key).strip()
+    ]
+    if missing:
+      raise ValueError(
+        "CockroachDB service requires non-empty database, user, and password fields: {}.".format(missing)
+      )
+
+    identifier_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+    for key in ("CRDB_DATABASE", "CRDB_USER"):
+      value = env.get(key)
+      if not identifier_re.fullmatch(value):
+        raise ValueError(
+          "CockroachDB {} must be a SQL identifier: letters, digits, and underscores, not starting with a digit.".format(key)
+        )
+    if env.get("CRDB_USER", "").lower() == "root":
+      raise ValueError("CockroachDB CRDB_USER must not be root.")
+    return True
+
+  def _cockroachdb_cert_bundle_complete(self, instance, target_nodes):
+    if not isinstance(instance, dict) or not target_nodes:
+      return False
+    raw_config = instance.get("PER_NODE_CONFIG")
+    if not isinstance(raw_config, dict):
+      return False
+    try:
+      for index, node in enumerate(target_nodes):
+        overlay = self._overlay_for_node(raw_config, node, index)
+        env = overlay.get("ENV")
+        if not isinstance(env, dict):
+          return False
+        for key in COCKROACHDB_CERT_ENV_KEYS:
+          if not isinstance(env.get(key), str) or "-----BEGIN" not in env.get(key):
+            return False
+        if index == 0:
+          for key in COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS:
+            if not isinstance(env.get(key), str) or "-----BEGIN" not in env.get(key):
+              return False
+    except Exception:
+      return False
+    return True
+
+  def _pem_private_key(self, key):
+    from cryptography.hazmat.primitives import serialization
+    return key.private_bytes(
+      encoding=serialization.Encoding.PEM,
+      format=serialization.PrivateFormat.TraditionalOpenSSL,
+      encryption_algorithm=serialization.NoEncryption(),
+    ).decode("ascii")
+
+  def _pem_certificate(self, cert):
+    from cryptography.hazmat.primitives import serialization
+    return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+  def _cockroachdb_name(self, value):
+    from cryptography.x509.oid import NameOID
+    from cryptography import x509
+    return x509.Name([
+      x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Ratio1 Deeploy"),
+      x509.NameAttribute(NameOID.COMMON_NAME, value),
+    ])
+
+  def _generate_cockroachdb_cert_bundle(self, target_nodes):
+    """
+    Generate a temporary CA and per-node CockroachDB certificates.
+
+    The CA private key is intentionally kept only in memory for this call. The
+    returned payload contains the CA certificate, per-node cert/key pairs, and
+    a bootstrap-only root client certificate/key for node 1.
+    """
+    try:
+      from cryptography import x509
+      from cryptography.hazmat.primitives import hashes
+      from cryptography.hazmat.primitives.asymmetric import rsa
+      from cryptography.x509.oid import ExtendedKeyUsageOID
+    except Exception as exc:
+      raise ValueError(
+        "CockroachDB secure deployment requires the Python 'cryptography' package."
+      ) from exc
+
+    now = datetime.now(timezone.utc)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_subject = self._cockroachdb_name("deeploy-cockroachdb-ca")
+    ca_cert = (
+      x509.CertificateBuilder()
+      .subject_name(ca_subject)
+      .issuer_name(ca_subject)
+      .public_key(ca_key.public_key())
+      .serial_number(x509.random_serial_number())
+      .not_valid_before(now - timedelta(minutes=5))
+      .not_valid_after(now + timedelta(days=3650))
+      .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+      .add_extension(
+        x509.KeyUsage(
+          digital_signature=True,
+          key_cert_sign=True,
+          crl_sign=True,
+          key_encipherment=False,
+          content_commitment=False,
+          data_encipherment=False,
+          key_agreement=False,
+          encipher_only=False,
+          decipher_only=False,
+        ),
+        critical=True,
+      )
+      .sign(private_key=ca_key, algorithm=hashes.SHA256())
+    )
+    ca_crt = self._pem_certificate(ca_cert)
+
+    roach_names = [f"roach{i}" for i in range(1, len(target_nodes) + 1)]
+    dns_sans = [*roach_names, "localhost"]
+    ip_sans = ["127.0.0.1"]
+
+    def build_signed_cert(common_name, public_key, san_dns=None, san_ips=None, client=False, server=False):
+      san_items = []
+      for dns_name in san_dns or []:
+        san_items.append(x509.DNSName(dns_name))
+      for ip_value in san_ips or []:
+        san_items.append(x509.IPAddress(ipaddress.ip_address(ip_value)))
+      usages = []
+      if client:
+        usages.append(ExtendedKeyUsageOID.CLIENT_AUTH)
+      if server:
+        usages.append(ExtendedKeyUsageOID.SERVER_AUTH)
+      builder = (
+        x509.CertificateBuilder()
+        .subject_name(self._cockroachdb_name(common_name))
+        .issuer_name(ca_cert.subject)
+        .public_key(public_key)
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+      )
+      if san_items:
+        builder = builder.add_extension(x509.SubjectAlternativeName(san_items), critical=False)
+      if usages:
+        builder = builder.add_extension(x509.ExtendedKeyUsage(usages), critical=False)
+      return builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
+
+    node_bundles = {}
+    for index, node in enumerate(target_nodes):
+      node_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+      node_cert = build_signed_cert(
+        common_name="node",
+        public_key=node_key.public_key(),
+        san_dns=dns_sans,
+        san_ips=ip_sans,
+        client=True,
+        server=True,
+      )
+      node_bundles[node] = {
+        "CRDB_CA_CRT": ca_crt,
+        "CRDB_NODE_CRT": self._pem_certificate(node_cert),
+        "CRDB_NODE_KEY": self._pem_private_key(node_key),
+      }
+      if index == 0:
+        root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        root_cert = build_signed_cert(
+          common_name="root",
+          public_key=root_key.public_key(),
+          client=True,
+          server=False,
+        )
+        node_bundles[node]["CRDB_CLIENT_ROOT_CRT"] = self._pem_certificate(root_cert)
+        node_bundles[node]["CRDB_CLIENT_ROOT_KEY"] = self._pem_private_key(root_key)
+
+    return node_bundles
+
+  def _prepare_cockroachdb_secure_config(self, inputs, target_nodes):
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if not isinstance(plugins_array, list):
+      return inputs
+    target_nodes = list(target_nodes or [])
+    if not target_nodes:
+      return inputs
+
+    for plugin_instance in plugins_array:
+      if not self._is_cockroachdb_plugin_instance(plugin_instance):
+        continue
+      env = plugin_instance.setdefault("ENV", {})
+      self._validate_cockroachdb_auth_env(env)
+      env["CRDB_SECURE"] = "true"
+
+      raw_config = plugin_instance.get("PER_NODE_CONFIG")
+      existing_complete = self._cockroachdb_cert_bundle_complete(plugin_instance, target_nodes)
+      cert_bundle = None if existing_complete else self._generate_cockroachdb_cert_bundle(target_nodes)
+
+      by_node = {}
+      for index, node in enumerate(target_nodes):
+        overlay = self._overlay_for_node(raw_config, node, index) if raw_config else {}
+        overlay = self.deepcopy(overlay) if isinstance(overlay, dict) else {}
+        overlay_env = overlay.get("ENV")
+        if not isinstance(overlay_env, dict):
+          overlay_env = {}
+        else:
+          overlay_env = self.deepcopy(overlay_env)
+        if cert_bundle is not None:
+          overlay_env.update(cert_bundle[node])
+        overlay["ENV"] = overlay_env
+        by_node[node] = overlay
+      plugin_instance["PER_NODE_CONFIG"] = {"byNode": by_node}
+
+    return inputs
+
+  def _prepare_cockroachdb_secure_config_for_pipeline(self, pipeline, target_nodes):
+    if not isinstance(pipeline, dict):
+      return pipeline
+    plugins = pipeline.get(NetMonCt.PLUGINS)
+    if not isinstance(plugins, list):
+      return pipeline
+    target_nodes = list(target_nodes or [])
+    if not target_nodes:
+      return pipeline
+
+    has_cockroachdb = False
+    for plugin in plugins:
+      if not isinstance(plugin, dict):
+        continue
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or plugin.get("INSTANCES")
+      if not isinstance(instances, list):
+        continue
+      for instance in instances:
+        if self._is_cockroachdb_plugin_instance(instance):
+          has_cockroachdb = True
+          break
+      if has_cockroachdb:
+        break
+
+    if not has_cockroachdb:
+      return pipeline
+    if len(target_nodes) < 2:
+      raise ValueError("CockroachDB requires at least 2 target nodes.")
+
+    cert_bundle = self._generate_cockroachdb_cert_bundle(target_nodes)
+    for plugin in plugins:
+      if not isinstance(plugin, dict):
+        continue
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or plugin.get("INSTANCES")
+      if not isinstance(instances, list):
+        continue
+      for instance in instances:
+        if not self._is_cockroachdb_plugin_instance(instance):
+          continue
+        env = instance.setdefault("ENV", {})
+        self._validate_cockroachdb_auth_env(env)
+        hostnames = [
+          item.strip()
+          for item in str(env.get("CRDB_HOSTNAMES", "")).split(",")
+          if item.strip()
+        ]
+        if len(hostnames) != len(target_nodes):
+          raise ValueError(
+            "CockroachDB legacy scale-up requires CRDB_HOSTNAMES to contain "
+            f"{len(target_nodes)} hostnames before redeploying the cluster."
+          )
+        env["CRDB_SECURE"] = "true"
+        env["CRDB_NODE_COUNT"] = str(len(target_nodes))
+        env["CRDB_HOSTNAMES"] = ",".join(hostnames)
+
+        raw_config = instance.get("PER_NODE_CONFIG")
+        by_node = {}
+        for index, node in enumerate(target_nodes):
+          overlay = self._overlay_for_node(raw_config, node, index) if raw_config else {}
+          overlay = self.deepcopy(overlay) if isinstance(overlay, dict) else {}
+          overlay_env = overlay.get("ENV")
+          if not isinstance(overlay_env, dict):
+            overlay_env = {}
+          else:
+            overlay_env = self.deepcopy(overlay_env)
+          overlay_env.update(cert_bundle[node])
+          overlay["ENV"] = overlay_env
+          by_node[node] = overlay
+        instance["PER_NODE_CONFIG"] = {"byNode": by_node}
+    return pipeline
+
+  def _inherit_existing_cockroachdb_cert_config(self, instance_payload, fallback_instance):
+    if not self._is_cockroachdb_plugin_instance(instance_payload):
+      return instance_payload
+    if instance_payload.get("PER_NODE_CONFIG"):
+      return instance_payload
+    if not isinstance(fallback_instance, dict):
+      return instance_payload
+    instance_conf = fallback_instance.get("instance_conf")
+    if not isinstance(instance_conf, dict):
+      return instance_payload
+    raw_config = instance_conf.get("PER_NODE_CONFIG")
+    if isinstance(raw_config, dict):
+      instance_payload["PER_NODE_CONFIG"] = self.deepcopy(raw_config)
+    return instance_payload
+
+  def _is_public_redaction_marker(self, value):
+    return isinstance(value, str) and value.strip().lower() in PUBLIC_REDACTION_MARKERS
+
+  def _inherit_existing_per_node_config_marker(self, instance_payload, fallback_instance):
+    if not isinstance(instance_payload, dict):
+      return instance_payload
+    marker_key = None
+    for key in PER_NODE_CONFIG_KEYS:
+      if self._is_public_redaction_marker(instance_payload.get(key)):
+        marker_key = key
+        break
+    if marker_key is None:
+      return instance_payload
+    if not isinstance(fallback_instance, dict):
+      return instance_payload
+    instance_conf = fallback_instance.get("instance_conf")
+    if not isinstance(instance_conf, dict):
+      return instance_payload
+    raw_config = instance_conf.get("PER_NODE_CONFIG")
+    if isinstance(raw_config, dict):
+      instance_payload[marker_key] = self.deepcopy(raw_config)
+    return instance_payload
+
+  def _inherit_cockroachdb_secure_config_from_discovered(self, inputs, discovered_plugin_instances):
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if not isinstance(plugins_array, list):
+      return inputs
+    discovered_configs = []
+    for discovered in discovered_plugin_instances or []:
+      if not isinstance(discovered, dict):
+        continue
+      instance_data = discovered.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE)
+      if not isinstance(instance_data, dict):
+        continue
+      instance_conf = instance_data.get("instance_conf")
+      if not isinstance(instance_conf, dict):
+        continue
+      if self._is_cockroachdb_plugin_instance(instance_conf) and isinstance(instance_conf.get("PER_NODE_CONFIG"), dict):
+        discovered_configs.append({
+          "record": discovered,
+          "config": instance_conf,
+        })
+
+    if not discovered_configs:
+      return inputs
+
+    for plugin_instance in plugins_array:
+      if not isinstance(plugin_instance, dict):
+        continue
+      if not self._is_cockroachdb_plugin_instance(plugin_instance):
+        continue
+      self._canonicalize_per_node_config_key(plugin_instance)
+      discovered_entry = self._match_discovered_cockroachdb_config(plugin_instance, discovered_configs)
+      if not discovered_entry:
+        continue
+      discovered_instance = discovered_entry["config"]
+      discovered_config = discovered_instance.get("PER_NODE_CONFIG")
+      discovered_env = discovered_instance.get("ENV")
+      if not isinstance(discovered_env, dict):
+        discovered_env = {}
+      plugin_env = plugin_instance.get("ENV")
+      if isinstance(plugin_env, dict):
+        password = plugin_env.get("CRDB_PASSWORD")
+        if password in ("***", "[redacted]", "") and isinstance(discovered_env.get("CRDB_PASSWORD"), str):
+          plugin_env["CRDB_PASSWORD"] = discovered_env["CRDB_PASSWORD"]
+      self._inherit_redacted_exposed_port_tokens(plugin_instance, discovered_instance)
+      raw_request_config = plugin_instance.get("PER_NODE_CONFIG")
+      if self._is_public_redaction_marker(raw_request_config):
+        plugin_instance["PER_NODE_CONFIG"] = self.deepcopy(discovered_config)
+        continue
+      if not raw_request_config:
+        plugin_instance["PER_NODE_CONFIG"] = self.deepcopy(discovered_config)
+        continue
+
+      try:
+        request_default, request_by_index, request_by_node = self._normalize_per_node_config(raw_request_config)
+        _disc_default, _disc_by_index, disc_by_node = self._normalize_per_node_config(discovered_config)
+      except Exception:
+        continue
+
+      target_order = self._get_cockroachdb_per_node_target_order(inputs, request_by_node, disc_by_node)
+      if target_order:
+        merged_by_node = {}
+        for request_index, node in enumerate(target_order):
+          request_overlay = self._overlay_for_node(raw_request_config, node, request_index)
+          discovered_overlay = self._overlay_for_node(discovered_config, node, request_index)
+          merged_overlay = self._inherit_redacted_cockroachdb_per_node_env(request_overlay, discovered_overlay)
+          merged_by_node[node] = merged_overlay
+        plugin_instance["PER_NODE_CONFIG"] = {"byNode": merged_by_node}
+        continue
+
+      merged_by_node = {}
+      for node, request_overlay in request_by_node.items():
+        merged_overlay = self.deepcopy(request_overlay)
+        discovered_overlay = disc_by_node.get(node)
+        if isinstance(discovered_overlay, dict):
+          merged_overlay = self._inherit_redacted_cockroachdb_per_node_env(merged_overlay, discovered_overlay)
+          discovered_env = discovered_overlay.get("ENV")
+          if isinstance(discovered_env, dict):
+            cert_env = {
+              key: value
+              for key, value in discovered_env.items()
+              if key in COCKROACHDB_CERT_ENV_KEYS or key in COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS
+            }
+            if cert_env:
+              merged_env = merged_overlay.get("ENV")
+              if not isinstance(merged_env, dict):
+                merged_env = {}
+              else:
+                merged_env = self.deepcopy(merged_env)
+              for key, value in cert_env.items():
+                merged_env.setdefault(key, value)
+              merged_overlay["ENV"] = merged_env
+        merged_by_node[node] = merged_overlay
+
+      # Preserve structured defaults/index overlays if callers use them, but
+      # materialize byNode because Cockroach slots are node-address based.
+      next_config = {}
+      if request_default:
+        next_config["default"] = self._inherit_redacted_cockroachdb_per_node_env(
+          request_default,
+          self._overlay_for_node(discovered_config, None, 0),
+        )
+      if request_by_index:
+        next_config["byIndex"] = {
+          str(index): self._inherit_redacted_cockroachdb_per_node_env(
+            overlay,
+            self._overlay_for_node(discovered_config, None, index),
+          )
+          for index, overlay in request_by_index.items()
+        }
+      next_config["byNode"] = merged_by_node
+      plugin_instance["PER_NODE_CONFIG"] = next_config
+    return inputs
+
+  def _get_cockroachdb_per_node_target_order(self, inputs, request_by_node, disc_by_node):
+    for key in (
+      DEEPLOY_KEYS.CURRENT_TARGET_NODES,
+      DEEPLOY_KEYS.TARGET_NODES,
+      "target_nodes",
+      "current_target_nodes",
+    ):
+      nodes = inputs.get(key) if hasattr(inputs, "get") else None
+      if not isinstance(nodes, list):
+        continue
+      normalized = []
+      for node in nodes:
+        if isinstance(node, dict):
+          address = node.get("address") or node.get("node") or node.get("id")
+        else:
+          address = node
+        if address:
+          normalized.append(str(address))
+      if normalized:
+        return normalized
+
+    fallback_nodes = []
+    for node in list(request_by_node.keys()) + list(disc_by_node.keys()):
+      node = str(node)
+      if node not in fallback_nodes:
+        fallback_nodes.append(node)
+    return fallback_nodes
+
+  def _match_discovered_cockroachdb_config(self, plugin_instance, discovered_configs):
+    if not discovered_configs:
+      return None
+
+    request_instance_id = (
+      plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+      or plugin_instance.get("instance_id")
+      or plugin_instance.get(getattr(self.ct.BIZ_PLUGIN_DATA, "INSTANCE_ID", "instance_id"))
+    )
+    if request_instance_id:
+      for entry in discovered_configs:
+        record = entry["record"]
+        config = entry["config"]
+        discovered_instance_id = (
+          record.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+          or config.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+          or config.get("instance_id")
+          or config.get(getattr(self.ct.BIZ_PLUGIN_DATA, "INSTANCE_ID", "instance_id"))
+        )
+        if discovered_instance_id and str(discovered_instance_id) == str(request_instance_id):
+          return entry
+      return None
+
+    request_plugin_name = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+    if request_plugin_name:
+      matches = []
+      for entry in discovered_configs:
+        record = entry["record"]
+        config = entry["config"]
+        discovered_plugin_name = (
+          config.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          or record.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        )
+        if discovered_plugin_name and str(discovered_plugin_name) == str(request_plugin_name):
+          matches.append(entry)
+      if len(matches) == 1:
+        return matches[0]
+      if len(matches) > 1:
+        config_hashes = {
+          self._cockroachdb_discovered_config_hash(match["record"])
+          for match in matches
+        }
+        if len(config_hashes) == 1:
+          return matches[0]
+      return None
+
+    if len(discovered_configs) == 1:
+      return discovered_configs[0]
+    return None
+
+  def _cockroachdb_discovered_config_hash(self, discovered_record):
+    return compact_canonical_sha256(
+      self._extract_discovered_plugin_conf(
+        discovered_record,
+        instance_id_key=self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID,
+        chainstore_response_key=self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY,
+        chainstore_peers_key=self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS,
+      )
+    )
+
+  def _inherit_redacted_exposed_port_tokens(self, plugin_instance, discovered_instance):
+    request_ports = plugin_instance.get("EXPOSED_PORTS")
+    discovered_ports = discovered_instance.get("EXPOSED_PORTS") if isinstance(discovered_instance, dict) else None
+    if not isinstance(request_ports, dict) or not isinstance(discovered_ports, dict):
+      return plugin_instance
+
+    for port, port_conf in request_ports.items():
+      if not isinstance(port_conf, dict):
+        continue
+      discovered_port_conf = discovered_ports.get(port)
+      if not isinstance(discovered_port_conf, dict):
+        discovered_port_conf = discovered_ports.get(str(port))
+      if not isinstance(discovered_port_conf, dict):
+        continue
+      token = port_conf.get("token")
+      discovered_token = discovered_port_conf.get("token")
+      if token in ("***", "[redacted]", "") and isinstance(discovered_token, str) and discovered_token:
+        port_conf["token"] = discovered_token
+      tunnel = port_conf.get("tunnel")
+      discovered_tunnel = discovered_port_conf.get("tunnel")
+      if isinstance(tunnel, dict) and isinstance(discovered_tunnel, dict):
+        tunnel_token = tunnel.get("token")
+        discovered_tunnel_token = discovered_tunnel.get("token")
+        if tunnel_token in ("***", "[redacted]", "") and isinstance(discovered_tunnel_token, str) and discovered_tunnel_token:
+          tunnel["token"] = discovered_tunnel_token
+    return plugin_instance
+
+  def _inherit_redacted_cockroachdb_per_node_env(self, merged_overlay, discovered_overlay):
+    if not isinstance(merged_overlay, dict) or not isinstance(discovered_overlay, dict):
+      return merged_overlay
+    discovered_env = discovered_overlay.get("ENV")
+    if not isinstance(discovered_env, dict):
+      return merged_overlay
+    merged_env = merged_overlay.get("ENV")
+    if not isinstance(merged_env, dict):
+      merged_env = {}
+    else:
+      merged_env = self.deepcopy(merged_env)
+
+    for key in COCKROACHDB_INHERITABLE_PER_NODE_ENV_KEYS:
+      discovered_value = discovered_env.get(key)
+      if not isinstance(discovered_value, str) or not discovered_value:
+        continue
+      request_value = merged_env.get(key)
+      if self._is_public_redaction_marker(request_value) or request_value == "":
+        merged_env[key] = discovered_value
+      elif key in COCKROACHDB_CERT_ENV_KEYS or key in COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS:
+        merged_env.setdefault(key, discovered_value)
+
+    if merged_env:
+      merged_overlay["ENV"] = merged_env
+    return merged_overlay
+
   def _normalize_per_node_config(self, raw_config):
     if raw_config is None:
       return {}, {}, {}
@@ -3368,6 +4053,27 @@ class _DeeployMixin:
           if key in PER_NODE_CONFIG_KEYS and item:
             value[key] = "***"
           elif any(
+            part in re.sub(r"[^A-Z0-9]", "", str(key).upper())
+            for part in SENSITIVE_LOG_KEY_PARTS
+          ):
+            value[key] = "***" if item else item
+          else:
+            redact(item)
+      elif isinstance(value, list):
+        for item in value:
+          redact(item)
+
+    redact(redacted)
+    return redacted
+
+  def _redact_deeploy_status_payload(self, payload):
+    deepcopy = getattr(self, "deepcopy", copy.deepcopy)
+    redacted = deepcopy(payload)
+
+    def redact(value):
+      if isinstance(value, dict):
+        for key, item in list(value.items()):
+          if any(
             part in re.sub(r"[^A-Z0-9]", "", str(key).upper())
             for part in SENSITIVE_LOG_KEY_PARTS
           ):
@@ -4088,6 +4794,7 @@ class _DeeployMixin:
       config_copy.pop(DEEPLOY_KEYS.PLUGIN_SIGNATURE, None)
       config_copy.pop("signature", None)
       instance_payload = config_copy
+      self._inherit_existing_cockroachdb_cert_config(instance_payload, fallback_instance)
     else:
       app_params = None
       try:
@@ -4124,6 +4831,7 @@ class _DeeployMixin:
       ]
     }
     self._canonicalize_per_node_config_key(plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES][0])
+    self._inherit_existing_per_node_config_marker(plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES][0], fallback_instance)
     return plugin
 
   def _generate_plugin_instance_id(self, signature: str):
@@ -4418,7 +5126,13 @@ class _DeeployMixin:
       List of discovered plugin instances with details.
     """
     apps = self._get_online_apps(owner=owner, target_nodes=target_nodes)
-    self.P(f"online apps for owner {owner} and target_nodes {target_nodes}: {self.json_dumps(apps)}")
+    self.P(
+      "online apps for owner {} and target_nodes {}: {}".format(
+        owner,
+        target_nodes,
+        self.json_dumps(self._redact_per_node_config_for_log(apps)),
+      )
+    )
     discovered_plugins = []
     for node, pipelines in apps.items():
       iter_plugins = []
@@ -4501,7 +5215,7 @@ class _DeeployMixin:
     """
     self.Pd("Sending instance command to targets...")
     for plugin in plugins:
-      self.Pd(self.json_dumps(plugin))
+      self.Pd(self.json_dumps(self._redact_per_node_config_for_log(plugin)))
       self.cmdapi_send_instance_command(pipeline=plugin[DEEPLOY_PLUGIN_DATA.APP_ID],
                                         signature=plugin[DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE],
                                         instance_id=plugin[DEEPLOY_PLUGIN_DATA.INSTANCE_ID],
@@ -4763,6 +5477,7 @@ class _DeeployMixin:
       deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
       deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
+    self._prepare_cockroachdb_secure_config_for_pipeline(base_pipeline, chainstore_peers)
 
     chainstore_response_keys = self.defaultdict(list)
 
@@ -5021,7 +5736,11 @@ class _DeeployMixin:
     """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
-      self.Pd(f"Full data:\n{self.json_dumps(full_data, indent=2)}")
+      self.Pd(
+        "Full data:\n{}".format(
+          self.json_dumps(self._redact_per_node_config_for_log(full_data), indent=2)
+        )
+      )
     pipelines = self.netmon.network_known_configs()
     non_admin_pipelines = {
       node : [x for x in pipelines[node] if x['NAME'].lower() != 'admin_pipeline']
@@ -5159,7 +5878,7 @@ class _DeeployMixin:
             timeout=get_apps_r1fs_timeout,
             pin=False,
             raise_on_error=False,
-            show_logs=True,
+            show_logs=False,
           )
         except Exception as exc:
           self.Pd(f"Failed to load R1FS payload for job {job_id}: {exc}", color='y')
