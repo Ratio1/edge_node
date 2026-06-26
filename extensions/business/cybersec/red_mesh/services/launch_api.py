@@ -37,6 +37,7 @@ from ..graybox.scenario_runtime import (
 from .config import get_graybox_budgets_config
 from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
+from .soc_export_policy import required_soc_launch_error
 
 
 PRODUCTION_SCAN_MIN_DELAY_SECONDS = 30.0
@@ -1251,6 +1252,9 @@ def launch_network_scan(
   )
   if typed_error:
     return typed_error
+  soc_error = required_soc_launch_error(owner)
+  if soc_error:
+    return soc_error
 
   max_weak_attempts, target_config, allow_stateful_probes, safety_policy = _apply_launch_safety_policy(
     owner,
@@ -1492,6 +1496,9 @@ def launch_webapp_scan(
   )
   if typed_error:
     return typed_error
+  soc_error = required_soc_launch_error(owner)
+  if soc_error:
+    return soc_error
 
   options = normalize_common_launch_options(
     owner,

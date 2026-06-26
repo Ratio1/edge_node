@@ -72,6 +72,7 @@ DEFAULT_EVENT_EXPORT_CONFIG = {
 
 DEFAULT_WAZUH_EXPORT_CONFIG = {
   "ENABLED": False,
+  "IS_REQUIRED": False,
   "MODE": "syslog",
   "SYSLOG_HOST": "",
   "SYSLOG_PORT": 514,
@@ -91,6 +92,7 @@ DEFAULT_WAZUH_EXPORT_CONFIG = {
   "INCLUDE_SERVICE_OBSERVATIONS": True,
   "TIMEOUT_SECONDS": 5.0,
   "RETRY_ATTEMPTS": 2,
+  "FAILURE_COOLDOWN_SECONDS": 300,
   "PERSIST_FAILED_PAYLOADS": False,
   "FAILED_PAYLOAD_SAMPLE_BYTES": 2048,
 }
@@ -627,6 +629,7 @@ def get_wazuh_export_config(owner):
     )
     return {
       "ENABLED": bool(merged.get("ENABLED", defaults["ENABLED"])),
+      "IS_REQUIRED": bool(merged.get("IS_REQUIRED", defaults["IS_REQUIRED"])),
       "MODE": mode,
       "SYSLOG_HOST": str(merged.get("SYSLOG_HOST") or defaults["SYSLOG_HOST"]).strip(),
       "SYSLOG_PORT": _bounded_int(
@@ -675,6 +678,12 @@ def get_wazuh_export_config(owner):
         merged.get("RETRY_ATTEMPTS", defaults["RETRY_ATTEMPTS"]),
         defaults["RETRY_ATTEMPTS"],
         minimum=0,
+      ),
+      "FAILURE_COOLDOWN_SECONDS": _bounded_int(
+        merged.get("FAILURE_COOLDOWN_SECONDS", defaults["FAILURE_COOLDOWN_SECONDS"]),
+        defaults["FAILURE_COOLDOWN_SECONDS"],
+        minimum=1,
+        maximum=3600,
       ),
       "PERSIST_FAILED_PAYLOADS": bool(merged.get("PERSIST_FAILED_PAYLOADS", defaults["PERSIST_FAILED_PAYLOADS"])),
       "FAILED_PAYLOAD_SAMPLE_BYTES": _bounded_int(

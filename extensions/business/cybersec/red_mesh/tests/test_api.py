@@ -1137,6 +1137,65 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("authorization", result["message"].lower())
 
+  def test_required_soc_rejects_network_launch_before_persistence(self):
+    plugin = self._build_mock_plugin(job_id="soc-required-network")
+    plugin.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    plugin.cfg_wazuh_export = {
+      "ENABLED": True,
+      "IS_REQUIRED": True,
+      "MODE": "http",
+      "HTTP_URL": "https://wazuh.example/events",
+      "AUTH_MODE": "static",
+      "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+    }
+
+    result = self._launch_network(plugin)
+
+    self.assertEqual(result["error"], "soc_export_required_unavailable")
+    self.assertEqual(result["integration_id"], "wazuh")
+    self.assertEqual(result["error_class"], "missing_token")
+    plugin.r1fs.add_json.assert_not_called()
+    plugin.chainstore_hset.assert_not_called()
+
+  def test_non_required_soc_does_not_block_network_launch(self):
+    plugin = self._build_mock_plugin(job_id="soc-optional-network")
+    plugin.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    plugin.cfg_wazuh_export = {
+      "ENABLED": True,
+      "IS_REQUIRED": False,
+      "MODE": "http",
+      "HTTP_URL": "https://wazuh.example/events",
+      "AUTH_MODE": "static",
+      "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+      "RETRY_ATTEMPTS": 0,
+    }
+
+    result = self._launch_network(plugin)
+
+    self.assertNotIn("error", result)
+    self.assertTrue(plugin.r1fs.add_json.called)
+    self.assertTrue(plugin.chainstore_hset.called)
+
+  def test_required_soc_rejects_webapp_launch_before_persistence(self):
+    plugin = self._build_mock_plugin(job_id="soc-required-webapp")
+    plugin.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    plugin.cfg_wazuh_export = {
+      "ENABLED": True,
+      "IS_REQUIRED": True,
+      "MODE": "wazuh_api",
+      "HTTP_URL": "https://wazuh.example/events",
+      "AUTH_MODE": "wazuh_jwt",
+      "USERNAME": "",
+      "PASSWORD_ENV": "REDMESH_WAZUH_PASSWORD",
+    }
+
+    result = self._launch_webapp(plugin)
+
+    self.assertEqual(result["error"], "soc_export_required_unavailable")
+    self.assertEqual(result["error_class"], "missing_credentials")
+    plugin.r1fs.add_json.assert_not_called()
+    plugin.chainstore_hset.assert_not_called()
+
   def test_launch_network_scan_rejects_target_confirmation_mismatch(self):
     """Target confirmation must echo the resolved target host."""
     plugin = self._build_mock_plugin(job_id="test-job-confirm")

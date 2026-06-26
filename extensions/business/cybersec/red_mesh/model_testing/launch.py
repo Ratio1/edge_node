@@ -7,6 +7,7 @@ from ..constants import JOB_STATUS_RUNNING, RUN_MODE_SINGLEPASS
 from ..models import CStoreJobRunning, WorkerProgress
 from ..repositories import ArtifactRepository, JobStateRepository
 from ..services.config import get_model_testing_config
+from ..services.soc_export_policy import required_soc_launch_error
 from .artifacts import MODEL_TEST_JOB_CONFIG_SCHEMA
 from .catalog import (
   CBRN_SAFETY_V1_ID,
@@ -308,6 +309,9 @@ def launch_model_test(
   created_by_id, err = _bounded_text(created_by_id, "created_by_id")
   if err:
     return err
+  soc_error = required_soc_launch_error(owner)
+  if soc_error:
+    return soc_error
   normalized_test_sets, selection_err = normalize_model_test_selection(
     test_sets,
     legacy_test_set_id=test_set_id if test_sets is None else None,

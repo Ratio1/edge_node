@@ -216,6 +216,67 @@ class TestIntegrationStatus(unittest.TestCase):
     self.assertFalse(status["configured"])
     self.assertEqual(status["last_error_class"], "missing_credentials")
 
+  def test_wazuh_api_mode_missing_credentials_is_not_configured(self):
+    self.owner.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    self.owner.cfg_wazuh_export = {
+      "ENABLED": True,
+      "MODE": "wazuh_api",
+      "HTTP_URL": "https://wazuh-api.example/events",
+      "AUTH_MODE": "wazuh_jwt",
+      "USERNAME": "",
+      "PASSWORD_ENV": "REDMESH_WAZUH_PASSWORD",
+    }
+    os.environ["REDMESH_WAZUH_PASSWORD"] = "pw"
+
+    status = get_integration_status(self.owner)["integrations"]["wazuh"]
+
+    self.assertFalse(status["configured"])
+    self.assertEqual(status["status"], "not_configured")
+    self.assertEqual(status["last_error_class"], "missing_credentials")
+
+  def test_repeated_wazuh_config_failure_enters_cooldown(self):
+    self.owner.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    self.owner.cfg_wazuh_export = {
+      "ENABLED": True,
+      "IS_REQUIRED": True,
+      "MODE": "http",
+      "HTTP_URL": "https://wazuh-api.example/events",
+      "AUTH_MODE": "static",
+      "FAILURE_COOLDOWN_SECONDS": 300,
+    }
+
+    record_integration_status(self.owner, "wazuh", outcome="failure", error_class="invalid_auth_config")
+    record_integration_status(self.owner, "wazuh", outcome="failure", error_class="invalid_auth_config")
+    status = get_integration_status(self.owner)["integrations"]["wazuh"]
+
+    self.assertEqual(status["integration_status"], "cooling_down")
+    self.assertEqual(status["failure_count"], 2)
+    self.assertEqual(status["consecutive_failure_count"], 2)
+    self.assertEqual(status["last_error_class"], "invalid_auth_config")
+    self.assertIsNotNone(status["first_failure_at"])
+    self.assertIsNotNone(status["cooldown_until"])
+    self.assertGreater(status["retry_after_seconds"], 0)
+
+  def test_repeated_wazuh_http_5xx_failure_enters_cooldown(self):
+    self.owner.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    self.owner.cfg_wazuh_export = {
+      "ENABLED": True,
+      "MODE": "http",
+      "HTTP_URL": "https://wazuh-api.example/events",
+      "AUTH_MODE": "static",
+      "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+      "FAILURE_COOLDOWN_SECONDS": 300,
+    }
+    os.environ["REDMESH_WAZUH_TOKEN"] = "token"
+
+    record_integration_status(self.owner, "wazuh", outcome="failure", error_class="http_503")
+    record_integration_status(self.owner, "wazuh", outcome="failure", error_class="http_503")
+    status = get_integration_status(self.owner)["integrations"]["wazuh"]
+
+    self.assertEqual(status["integration_status"], "cooling_down")
+    self.assertEqual(status["last_error_class"], "http_503")
+    self.assertIsNotNone(status["cooldown_until"])
+
   def test_taxii_basic_mode_is_configured_with_username_and_password(self):
     self.owner.cfg_taxii_export = {
       "ENABLED": True,

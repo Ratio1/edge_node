@@ -107,6 +107,27 @@ class TestModelTestingCapability(unittest.TestCase):
     owner.r1fs.add_json.assert_not_called()
     owner.chainstore_hset.assert_not_called()
 
+  def test_required_soc_rejects_model_test_before_persistence(self):
+    owner = _owner(
+      cfg_model_testing={"ENABLED": True},
+      cfg_event_export={"ENABLED": True, "SIGN_PAYLOADS": False},
+      cfg_wazuh_export={
+        "ENABLED": True,
+        "IS_REQUIRED": True,
+        "MODE": "http",
+        "HTTP_URL": "https://wazuh.example/events",
+        "AUTH_MODE": "static",
+        "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+      },
+    )
+
+    result = launch_model_test(owner, **_valid_launch_kwargs())
+
+    self.assertEqual(result["error"], "soc_export_required_unavailable")
+    self.assertEqual(result["error_class"], "missing_token")
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
 
 class TestModelTestingCbrnPack(unittest.TestCase):
 
