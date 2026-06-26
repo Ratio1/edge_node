@@ -5,6 +5,7 @@ from ..constants import (
   JOB_STATUS_COLLECTING,
   JOB_STATUS_FINALIZED,
   JOB_STATUS_FINALIZING,
+  JOB_STATUS_FAILED,
   JOB_STATUS_RUNNING,
   JOB_STATUS_SCHEDULED_FOR_STOP,
   JOB_STATUS_STOPPED,
@@ -50,6 +51,38 @@ def _write_job_record(owner, job_key, job_specs, context):
   if callable(write_job_record):
     return write_job_record(owner, job_key, job_specs, context=context)
   return job_specs
+
+
+def _attestation_required(job_specs, job_config) -> bool:
+  if isinstance(job_specs, dict) and "blockchain_attestation_enabled" in job_specs:
+    return bool(job_specs.get("blockchain_attestation_enabled"))
+  if isinstance(job_config, dict):
+    return bool(job_config.get("blockchain_attestation_enabled", False))
+  return False
+
+
+def _mark_attestation_failed(owner, job_key, job_specs, *, job_id, pass_nr, message):
+  job_specs["failure_class"] = "attestation_failed"
+  job_specs["failure_message"] = message
+  set_job_status(job_specs, JOB_STATUS_FAILED)
+  owner._emit_timeline_event(
+    job_specs,
+    "attestation_failed",
+    message,
+    actor_type="system",
+    meta={"pass_nr": pass_nr, "failure_class": "attestation_failed"},
+  )
+  emit_lifecycle_event(
+    owner,
+    job_specs,
+    event_type="redmesh.job.failed",
+    event_action="failed",
+    event_outcome="failure",
+    pass_nr=pass_nr,
+  )
+  _write_job_record(owner, job_key, job_specs, context="attestation_failed")
+  owner._build_job_archive(job_key, job_specs)
+  owner._clear_live_progress(job_id, list((job_specs.get("workers") or {}).keys()))
 
 
 def maybe_finalize_pass(owner):
@@ -189,8 +222,17 @@ def maybe_finalize_pass(owner):
           continue
 
       redmesh_test_attestation = None
-      should_submit_attestation = True
-      if run_mode == RUN_MODE_CONTINUOUS_MONITORING:
+      required_attestation = _attestation_required(job_specs, job_config)
+      required_attestation_failed = False
+      terminal_after_pass = (
+        run_mode == RUN_MODE_SINGLEPASS
+        or job_status == JOB_STATUS_SCHEDULED_FOR_STOP
+        or job_pass >= MAX_CONTINUOUS_PASSES
+      )
+      should_submit_attestation = bool(required_attestation and terminal_after_pass)
+      if not should_submit_attestation:
+        pass
+      elif run_mode == RUN_MODE_CONTINUOUS_MONITORING and not terminal_after_pass:
         last_attestation_at = job_specs.get("last_attestation_at")
         min_interval = get_attestation_config(owner)["MIN_SECONDS_BETWEEN_SUBMITS"]
         if last_attestation_at is not None and now_ts - last_attestation_at < min_interval:
@@ -250,11 +292,14 @@ def maybe_finalize_pass(owner):
             network=owner.REDMESH_ATTESTATION_NETWORK,
             pass_nr=job_pass,
           )
-      else:
+      if required_attestation and terminal_after_pass and not (
+        isinstance(redmesh_test_attestation, dict) and redmesh_test_attestation.get("tx_hash")
+      ):
+        required_attestation_failed = True
         emit_attestation_status_event(
           owner,
           job_specs,
-          state="skipped",
+          state="failed",
           network=owner.REDMESH_ATTESTATION_NETWORK,
           pass_nr=job_pass,
         )
@@ -328,6 +373,17 @@ def maybe_finalize_pass(owner):
 
       set_job_status(job_specs, JOB_STATUS_FINALIZING)
       job_specs = _write_job_record(owner, job_key, job_specs, context="finalize_finalizing")
+
+      if required_attestation_failed:
+        _mark_attestation_failed(
+          owner,
+          job_key,
+          job_specs,
+          job_id=job_id,
+          pass_nr=job_pass,
+          message="Required terminal blockchain attestation was not submitted",
+        )
+        continue
 
       if run_mode == RUN_MODE_SINGLEPASS:
         set_job_status(job_specs, JOB_STATUS_FINALIZED)

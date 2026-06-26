@@ -10,6 +10,14 @@ from extensions.business.deeploy.deeploy_const import (
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs, make_plugin_entry
 
 
+class _KeyErrorOnMissingAttrInputs(dict):
+  def __getattr__(self, item):
+    try:
+      return self[item]
+    except KeyError:
+      raise KeyError(item)
+
+
 class DeeployCreateRequestPreparationTests(unittest.TestCase):
 
   def test_prepare_single_plugin_instance_uses_signature_and_app_params(self):
@@ -84,6 +92,112 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       },
     })
 
+  def test_plugins_array_normalization_moves_single_top_level_per_node_config_into_plugin(self):
+    plugin = make_deeploy_plugin()
+    request = {
+      DEEPLOY_KEYS.PLUGINS: [
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="cockroachdb",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+        ),
+      ],
+      "PER_NODE_CONFIG": {
+        "byNode": {
+          "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1"}},
+          "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2"}},
+        },
+      },
+    }
+
+    normalized = plugin._normalize_plugins_input(request)
+
+    self.assertNotIn("PER_NODE_CONFIG", normalized)
+    self.assertEqual(
+      normalized[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"],
+      {
+        "byNode": {
+          "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1"}},
+          "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2"}},
+        },
+      },
+    )
+
+  def test_plugins_array_normalization_rejects_ambiguous_top_level_per_node_config(self):
+    plugin = make_deeploy_plugin()
+    request = {
+      DEEPLOY_KEYS.PLUGINS: [
+        make_plugin_entry("CONTAINER_APP_RUNNER", plugin_name="db"),
+        make_plugin_entry("WORKER_APP_RUNNER", plugin_name="worker"),
+      ],
+      "PER_NODE_CONFIG": {
+        "byIndex": {
+          "0": {"ENV": {"NODE_ID": "1"}},
+        },
+      },
+    }
+
+    with self.assertRaisesRegex(ValueError, "exactly one plugin"):
+      plugin._normalize_plugins_input(request)
+
+  def test_top_level_per_node_config_rejects_duplicate_spellings(self):
+    plugin = make_deeploy_plugin()
+    request = {
+      DEEPLOY_KEYS.PLUGINS: [
+        make_plugin_entry("CONTAINER_APP_RUNNER", plugin_name="db"),
+      ],
+      "perNodeConfig": {
+        "byIndex": {
+          "0": {"ENV": {"NODE_ID": "camel"}},
+        },
+      },
+      "PER_NODE_CONFIG": {
+        "byIndex": {
+          "0": {"ENV": {"NODE_ID": "upper"}},
+        },
+      },
+    }
+
+    with self.assertRaisesRegex(ValueError, "Only one top-level perNodeConfig"):
+      plugin._normalize_plugins_input(request)
+
+  def test_normalized_plugins_input_sync_removes_stale_top_level_per_node_config(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="cockroachdb",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+        ),
+      ],
+      PER_NODE_CONFIG={
+        "byIndex": {
+          "0": {"ENV": {"CRDB_NODE_ID": "1"}},
+        },
+      },
+    )
+    normalized = plugin._normalize_plugins_input(plugin.deepcopy(inputs))
+
+    plugin._sync_normalized_plugins_input(inputs, normalized)
+    prepared = plugin.deeploy_prepare_plugins(inputs)
+
+    self.assertNotIn("PER_NODE_CONFIG", inputs)
+    instance = prepared[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    self.assertEqual(instance["PER_NODE_CONFIG"]["byIndex"], {
+      "0": {"ENV": {"CRDB_NODE_ID": "1"}},
+    })
+
+  def test_get_request_per_node_config_tolerates_keyerror_missing_attributes(self):
+    plugin = make_deeploy_plugin()
+    inputs = _KeyErrorOnMissingAttrInputs({
+      DEEPLOY_KEYS.PLUGINS: [
+        make_plugin_entry("CONTAINER_APP_RUNNER", plugin_name="db"),
+      ],
+    })
+
+    self.assertEqual(plugin._get_request_per_node_config(inputs), (None, None))
+
   def test_per_node_config_rejects_malformed_structured_sections(self):
     plugin = make_deeploy_plugin()
 
@@ -93,6 +207,46 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       plugin._normalize_per_node_config({"byIndex": ""})
     with self.assertRaisesRegex(ValueError, "duplicate aliases"):
       plugin._normalize_per_node_config({"byIndex": {}, "BY_INDEX": {}})
+
+  def test_log_redaction_masks_per_node_config_and_token_keys(self):
+    plugin = make_deeploy_plugin()
+
+    redacted = plugin._redact_per_node_config_for_log({
+      DEEPLOY_KEYS.PLUGINS: [{
+        "EXPOSED_PORTS": {
+          "26257": {
+            "token": "cf-token",
+            "apiKey": "api-key",
+            "privateKey": "private-key",
+            "protocol": "tcp",
+          },
+        },
+        "ENV": {
+          "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD": "admin-pwd",
+        },
+        "PER_NODE_CONFIG": {
+          "byNode": {
+            "0xai_node_a": {
+              "ENV": {
+                "CF_TUNNEL_TOKEN": "node-token",
+              },
+            },
+          },
+        },
+      }],
+    })
+
+    serialized = str(redacted)
+    self.assertNotIn("cf-token", serialized)
+    self.assertNotIn("api-key", serialized)
+    self.assertNotIn("private-key", serialized)
+    self.assertNotIn("admin-pwd", serialized)
+    self.assertNotIn("node-token", serialized)
+    self.assertIn("'token': '***'", serialized)
+    self.assertIn("'apiKey': '***'", serialized)
+    self.assertIn("'privateKey': '***'", serialized)
+    self.assertIn("'R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD': '***'", serialized)
+    self.assertIn("'PER_NODE_CONFIG': '***'", serialized)
 
   def test_prepare_plugins_groups_instances_by_signature(self):
     plugin = make_deeploy_plugin()
@@ -329,7 +483,7 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertNotIn("perNodeConfig", normalized)
     self.assertNotIn("perNodeConfig", normalized[DEEPLOY_KEYS.APP_PARAMS])
 
-  def test_normalize_plugins_input_rejects_top_level_per_node_config_with_explicit_plugins(self):
+  def test_normalize_plugins_input_moves_single_explicit_plugin_top_level_per_node_config(self):
     plugin = make_deeploy_plugin()
     request = {
       DEEPLOY_KEYS.PLUGINS: [
@@ -338,8 +492,13 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
       "PER_NODE_CONFIG": {"node-1": {"ENV": {"REGION": "eu"}}},
     }
 
-    with self.assertRaisesRegex(ValueError, "Top-level perNodeConfig"):
-      plugin._normalize_plugins_input(request)
+    normalized = plugin._normalize_plugins_input(request)
+
+    self.assertNotIn("PER_NODE_CONFIG", normalized)
+    self.assertEqual(
+      normalized[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"],
+      {"node-1": {"ENV": {"REGION": "eu"}}},
+    )
 
   def test_prepare_plugins_rejects_malformed_dynamic_env_entries(self):
     plugin = make_deeploy_plugin()

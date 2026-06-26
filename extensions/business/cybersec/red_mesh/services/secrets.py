@@ -323,6 +323,15 @@ def persist_job_config_with_secrets(
       persisted_config["secret_store_key_source"] = key_metadata.get("key_source", "")
       persisted_config["secret_store_unsafe_fallback"] = bool(key_metadata.get("unsafe_fallback", False))
       persisted_config["has_regular_credentials"] = bool(payload["regular_username"] or payload["regular_password"])
+      persisted_config["has_admin_credentials"] = bool(
+        payload["official_username"]
+        or payload["official_password"]
+        or payload["bearer_token"]
+        or payload["api_key"]
+      )
+      persisted_config["admin_context_status"] = (
+        "provided" if persisted_config["has_admin_credentials"] else "absent"
+      )
       persisted_config["has_weak_candidates"] = bool(payload["weak_candidates"])
       # OWASP API Top 10 (Subphase 1.5 commit #8) — non-secret capability flags.
       persisted_config["has_bearer_token"] = bool(payload["bearer_token"])

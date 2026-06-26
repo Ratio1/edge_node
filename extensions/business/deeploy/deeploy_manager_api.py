@@ -265,21 +265,9 @@ class DeeployManagerApiPlugin(
 
   def _redact_failed_request_payload(self, payload):
     """
-    Redact request fields that can carry large or sensitive per-node overrides.
+    Redact request fields that can carry large or sensitive values.
     """
-    redacted_keys = {"perNodeConfig", "PER_NODE_CONFIG"}
-    if isinstance(payload, dict):
-      return {
-        key: "<redacted>"
-        if key in redacted_keys
-        else self._redact_failed_request_payload(value)
-        for key, value in payload.items()
-      }
-    if isinstance(payload, list):
-      return [self._redact_failed_request_payload(value) for value in payload]
-    if isinstance(payload, tuple):
-      return tuple(self._redact_failed_request_payload(value) for value in payload)
-    return payload
+    return self._redact_per_node_config_for_log(payload)
 
   def __handle_error(self, exc, request, extra_error_code=DEEPLOY_ERRORS.GENERIC):
     """
@@ -617,8 +605,7 @@ class DeeployManagerApiPlugin(
       request_type = "create pipeline" if is_create else "update pipeline"
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=request_type)
       normalized_request = self._normalize_plugins_input(self.deepcopy(request))
-      if DEEPLOY_KEYS.PLUGINS in normalized_request:
-        inputs[DEEPLOY_KEYS.PLUGINS] = normalized_request[DEEPLOY_KEYS.PLUGINS]
+      self._sync_normalized_plugins_input(inputs, normalized_request)
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       is_confirmable_job = inputs.chainstore_response
@@ -909,6 +896,7 @@ class DeeployManagerApiPlugin(
           dct_request['plugins_count'] = len(plugins_array)
         # if pipeline_params:
         #   dct_request[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
+      dct_request = self._redact_per_node_config_for_log(dct_request)
 
       if async_mode:
         if len(response_keys) == 0:

@@ -1931,8 +1931,8 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
 
     response = plugin._DeeployManagerApiPlugin__handle_error(ValueError("boom"), request)
 
-    self.assertEqual(response[DEEPLOY_KEYS.REQUEST]["perNodeConfig"], "<redacted>")
-    self.assertEqual(response[DEEPLOY_KEYS.REQUEST]["plugins"][0]["PER_NODE_CONFIG"], "<redacted>")
+    self.assertEqual(response[DEEPLOY_KEYS.REQUEST]["perNodeConfig"], "***")
+    self.assertEqual(response[DEEPLOY_KEYS.REQUEST]["plugins"][0]["PER_NODE_CONFIG"], "***")
     self.assertNotIn("top-secret", str(response))
     self.assertNotIn("nested-secret", str(response))
     self.assertNotIn("top-secret", "\n".join(log_lines))
@@ -1954,7 +1954,7 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     )
 
     self.assertEqual(response, {"ok": True})
-    self.assertIn("<redacted>", "\n".join(log_lines))
+    self.assertIn("***", "\n".join(log_lines))
     self.assertNotIn("top-secret", "\n".join(log_lines))
     self.assertNotIn("nested-secret", "\n".join(log_lines))
 

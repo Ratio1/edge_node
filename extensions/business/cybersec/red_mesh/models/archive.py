@@ -68,6 +68,8 @@ class JobConfig:
   target_url: str = ""                # required when scan_type == "webapp"
   secret_ref: str = ""                # reference to separately persisted graybox secrets
   has_regular_credentials: bool = False
+  has_admin_credentials: bool = False
+  admin_context_status: str = ""      # "provided" | "absent" for webapp graybox probes
   has_weak_candidates: bool = False
   # OWASP API Top 10 (Subphase 1.5 commit #8) — non-secret capability flags.
   # Raw bearer_token / api_key / bearer_refresh_token values are blanked
@@ -113,6 +115,9 @@ class JobConfig:
   assignment_revision: int = 0
   assignment_hash: str = ""
   stateful_policy: str = ""
+  blockchain_attestation_enabled: bool = False
+  start_attestation_required: bool = False
+  end_attestation_required: bool = False
 
   def to_dict(self) -> dict:
     return _strip_none(asdict(self))
@@ -153,6 +158,8 @@ class JobConfig:
       target_url=d.get("target_url", ""),
       secret_ref=d.get("secret_ref", ""),
       has_regular_credentials=d.get("has_regular_credentials", False),
+      has_admin_credentials=d.get("has_admin_credentials", False),
+      admin_context_status=d.get("admin_context_status", ""),
       has_weak_candidates=d.get("has_weak_candidates", False),
       has_bearer_token=d.get("has_bearer_token", False),
       has_api_key=d.get("has_api_key", False),
@@ -193,6 +200,9 @@ class JobConfig:
       assignment_revision=d.get("assignment_revision", 0),
       assignment_hash=d.get("assignment_hash", ""),
       stateful_policy=d.get("stateful_policy", ""),
+      blockchain_attestation_enabled=d.get("blockchain_attestation_enabled", False),
+      start_attestation_required=d.get("start_attestation_required", False),
+      end_attestation_required=d.get("end_attestation_required", False),
       engagement=d.get("engagement"),
       roe=d.get("roe"),
       authorization=d.get("authorization"),
@@ -417,6 +427,8 @@ class JobArchive:
   date_completed: float
   archive_version: int = JOB_ARCHIVE_VERSION
   start_attestation: dict = None
+  failure_class: str = ""
+  failure_message: str = ""
   soc_event_status: dict = None
   detection_correlation: dict = None
   stix_export: dict = None
@@ -444,6 +456,8 @@ class JobArchive:
       date_created=d.get("date_created", 0),
       date_completed=d.get("date_completed", 0),
       start_attestation=d.get("start_attestation"),
+      failure_class=d.get("failure_class", ""),
+      failure_message=d.get("failure_message", ""),
       soc_event_status=d.get("soc_event_status"),
       detection_correlation=d.get("detection_correlation"),
       stix_export=d.get("stix_export"),
