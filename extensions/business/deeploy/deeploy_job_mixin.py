@@ -133,7 +133,7 @@ class _DeeployJobMixin:
     timeout: int = None,
     pin: bool = True,
     raise_on_error: bool = False,
-    show_logs: bool = True,
+    show_logs: bool = False,
   ):
     """
     Get the pipeline from CSTORE and download it from R1FS.
@@ -162,7 +162,7 @@ class _DeeployJobMixin:
     timeout: int = None,
     pin: bool = True,
     raise_on_error: bool = False,
-    show_logs: bool = True,
+    show_logs: bool = False,
   ):
     """
     Get the pipeline from R1FS.
@@ -181,10 +181,14 @@ class _DeeployJobMixin:
     """
 
     try:
-      self.Pd(f"Saving pipeline to R1FS: {self.json_dumps(pipeline)}")
-      cid = self.r1fs.add_json(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
+      self.Pd(
+        "Saving pipeline to R1FS: {}".format(
+          self.json_dumps(self._redact_per_node_config_for_log(pipeline))
+        )
+      )
+      cid = self.r1fs.add_json(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=False)
       self.Pd(f"Pipeline saved to R1FS with CID: {cid}")
-      calc_cid = self.r1fs.calculate_json_cid(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=True)
+      calc_cid = self.r1fs.calculate_json_cid(pipeline, nonce=NONCE, fn=R1FS_FILENAME, show_logs=False)
       self.Pd(f"Calculated CID: {calc_cid}")
     except Exception as e:
       self.Pd(f"Error saving pipeline to R1FS: {e}")

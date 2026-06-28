@@ -326,7 +326,7 @@ class DeeployManagerApiPlugin(
       
       result = {
         DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
-        DEEPLOY_KEYS.APPS: apps,
+        DEEPLOY_KEYS.APPS: self._redact_deeploy_status_payload(apps),
         DEEPLOY_KEYS.AUTH : auth_result,
       }
     except Exception as e:
@@ -666,6 +666,11 @@ class DeeployManagerApiPlugin(
         # TODO: Add check if jobType resources match the requested resources.
 
         deployment_nodes = self._check_nodes_availability(inputs)
+        self._validate_cockroachdb_target_change(
+          current_nodes=[],
+          requested_nodes=deployment_nodes,
+          inputs=inputs,
+        )
         confirmation_nodes = list(deployment_nodes)
         nodes_changed = True
       else:
@@ -678,7 +683,11 @@ class DeeployManagerApiPlugin(
         discovered_plugin_instances = pipeline_context["discovered_instances"]
         current_nodes = pipeline_context["nodes"]
         deeploy_specs_for_update = pipeline_context["deeploy_specs"]
-        self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
+        self.P(
+          "Discovered plugin instances: {}".format(
+            self.json_dumps(self._redact_per_node_config_for_log(discovered_plugin_instances))
+          )
+        )
 
         requested_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None)
         normalized_requested_nodes = [
@@ -713,17 +722,23 @@ class DeeployManagerApiPlugin(
         if not deployment_targets:
           msg = f"{DEEPLOY_ERRORS.NODES2}: Update request must include at least one target node."
           raise ValueError(msg)
+        self._validate_cockroachdb_target_change(
+          current_nodes=current_nodes,
+          requested_nodes=deployment_targets,
+          inputs=inputs,
+          discovered_plugin_instances=discovered_plugin_instances,
+        )
+        inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_targets
+        inputs.target_nodes = deployment_targets
+        inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
+        inputs.target_nodes_count = len(deployment_targets)
+        self._inherit_cockroachdb_secure_config_from_discovered(inputs, discovered_plugin_instances)
 
         if job_id is not None:
           try:
             previous_pipeline_cid = self._get_pipeline_from_cstore(job_id)
           except Exception as exc:
             self.Pd(f"Unable to read previous pipeline CID for job {job_id}: {exc}", color='y')
-
-        inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_targets
-        inputs.target_nodes = deployment_targets
-        inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
-        inputs.target_nodes_count = len(deployment_targets)
 
         # Ensure plugin IDs are preserved for existing instances before any destructive action.
         self._ensure_plugin_instance_ids(
@@ -1497,7 +1512,11 @@ class DeeployManagerApiPlugin(
 
       # todo: check the count of running workers and compare with the amount of allowed workers count from blockchain.
       
-      self.P(f"Discovered running apps for job: {self.json_dumps(running_apps_for_job)}")
+      self.P(
+        "Discovered running apps for job: {}".format(
+          self.json_dumps(self._redact_per_node_config_for_log(running_apps_for_job))
+        )
+      )
 
       if not running_apps_for_job or not len(running_apps_for_job):
         msg = f"{DEEPLOY_ERRORS.NODES3}: No running workers found for provided job_id and owner '{auth_result[DEEPLOY_KEYS.ESCROW_OWNER]}'."
@@ -1520,6 +1539,7 @@ class DeeployManagerApiPlugin(
         dct_request = self.deepcopy(request)
       else:
         dct_request = None
+      dct_request = self._redact_per_node_config_for_log(dct_request) if dct_request is not None else None
 
       if len(response_keys) == 0:
         if not is_confirmable_job:
@@ -1606,7 +1626,7 @@ class DeeployManagerApiPlugin(
       )
       request_payload = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
-        DEEPLOY_KEYS.TARGETS: discovered_instances,
+        DEEPLOY_KEYS.TARGETS: self._redact_deeploy_status_payload(discovered_instances),
       }
 
       if job_id is not None:
@@ -1864,7 +1884,7 @@ class DeeployManagerApiPlugin(
       result = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
         DEEPLOY_KEYS.JOB_ID: job_id,
-        DEEPLOY_KEYS.PIPELINE: pipeline,
+        DEEPLOY_KEYS.PIPELINE: self._redact_deeploy_status_payload(pipeline),
         DEEPLOY_KEYS.AUTH: auth_result,
       }
     except Exception as e:

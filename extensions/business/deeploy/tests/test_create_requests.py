@@ -1,10 +1,19 @@
 import unittest
 from collections import defaultdict
+import sys
+import types
+
+
+for _mod_name in ("torch", "torch.nn", "torch.nn.functional"):
+  sys.modules.setdefault(_mod_name, types.ModuleType(_mod_name))
+
+from naeural_core.main.net_mon import NetMonCt
 
 from extensions.business.deeploy.deeploy_const import (
   DEEPLOY_DYNAMIC_ENV_KEYS,
   DEEPLOY_DYNAMIC_ENV_TYPES,
   DEEPLOY_KEYS,
+  DEEPLOY_PLUGIN_DATA,
   JOB_APP_TYPES,
 )
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs, make_plugin_entry
@@ -247,6 +256,882 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertIn("'privateKey': '***'", serialized)
     self.assertIn("'R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD': '***'", serialized)
     self.assertIn("'PER_NODE_CONFIG': '***'", serialized)
+
+  def test_cockroachdb_secure_config_generates_node_certs_and_redacts_them(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="cockroachdb",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+            },
+          },
+        ),
+      ],
+    )
+
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+
+    instance = inputs[DEEPLOY_KEYS.PLUGINS][0]
+    self.assertEqual(instance["ENV"]["CRDB_SECURE"], "true")
+    by_node = instance["PER_NODE_CONFIG"]["byNode"]
+    node_a_env = by_node["0xai_node_a"]["ENV"]
+    node_b_env = by_node["0xai_node_b"]["ENV"]
+    for env in (node_a_env, node_b_env):
+      self.assertIn("-----BEGIN CERTIFICATE-----", env["CRDB_CA_CRT"])
+      self.assertIn("-----BEGIN CERTIFICATE-----", env["CRDB_NODE_CRT"])
+      self.assertIn("-----BEGIN RSA PRIVATE KEY-----", env["CRDB_NODE_KEY"])
+      self.assertNotIn("CRDB_CA_KEY", env)
+    self.assertIn("CRDB_CLIENT_ROOT_CRT", node_a_env)
+    self.assertIn("CRDB_CLIENT_ROOT_KEY", node_a_env)
+    self.assertNotIn("CRDB_CLIENT_ROOT_CRT", node_b_env)
+    self.assertNotIn("CRDB_CLIENT_ROOT_KEY", node_b_env)
+    self.assertEqual(node_a_env["CF_TUNNEL_TOKEN"], "token-a")
+
+    redacted = plugin._redact_per_node_config_for_log(inputs)
+    serialized = str(redacted)
+    self.assertNotIn("secret-password", serialized)
+    self.assertNotIn("BEGIN RSA PRIVATE KEY", serialized)
+    self.assertIn("'PER_NODE_CONFIG': '***'", serialized)
+
+  def test_cockroachdb_secure_config_reuses_existing_bundle_for_same_nodes(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+            },
+          },
+        ),
+      ],
+    )
+
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+    node_a_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
+
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+
+    reused_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
+    self.assertEqual(node_a_key, reused_key)
+
+  def test_cockroachdb_secure_config_regenerates_for_scale_up(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+            },
+          },
+        ),
+      ],
+    )
+
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+    first_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
+    inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_c"] = {
+      "ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}
+    }
+
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b", "0xai_node_c"])
+
+    by_node = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]
+    self.assertNotEqual(first_key, by_node["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"])
+    self.assertIn("CRDB_NODE_KEY", by_node["0xai_node_c"]["ENV"])
+    self.assertEqual(by_node["0xai_node_c"]["ENV"]["CF_TUNNEL_TOKEN"], "token-c")
+
+  def test_cockroachdb_pipeline_secure_config_regenerates_for_legacy_scale_up(self):
+    plugin = make_deeploy_plugin()
+    pipeline = {
+      NetMonCt.PLUGINS: [{
+        "SIGNATURE": "CONTAINER_APP_RUNNER",
+        "INSTANCES": [{
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "ENV": {
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+            "CRDB_NODE_COUNT": "2",
+            "CRDB_HOSTNAMES": "roach1.example,roach2.example",
+          },
+          "PER_NODE_CONFIG": {
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+            },
+          },
+        }],
+      }],
+    }
+
+    plugin._prepare_cockroachdb_secure_config_for_pipeline(pipeline, ["0xai_node_a", "0xai_node_b"])
+    first_key = pipeline[NetMonCt.PLUGINS][0]["INSTANCES"][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
+    pipeline[NetMonCt.PLUGINS][0]["INSTANCES"][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_c"] = {
+      "ENV": {"CRDB_NODE_ID": "3", "CF_TUNNEL_TOKEN": "token-c"}
+    }
+
+    with self.assertRaisesRegex(ValueError, "CRDB_HOSTNAMES"):
+      plugin._prepare_cockroachdb_secure_config_for_pipeline(
+        pipeline,
+        ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+      )
+
+    pipeline[NetMonCt.PLUGINS][0]["INSTANCES"][0]["ENV"]["CRDB_HOSTNAMES"] = (
+      "roach1.example,roach2.example,roach3.example"
+    )
+    plugin._prepare_cockroachdb_secure_config_for_pipeline(
+      pipeline,
+      ["0xai_node_a", "0xai_node_b", "0xai_node_c"],
+    )
+
+    instance = pipeline[NetMonCt.PLUGINS][0]["INSTANCES"][0]
+    by_node = instance["PER_NODE_CONFIG"]["byNode"]
+    self.assertEqual(instance["ENV"]["CRDB_SECURE"], "true")
+    self.assertEqual(instance["ENV"]["CRDB_NODE_COUNT"], "3")
+    self.assertEqual(instance["ENV"]["CRDB_HOSTNAMES"], "roach1.example,roach2.example,roach3.example")
+    self.assertNotEqual(first_key, by_node["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"])
+    self.assertIn("CRDB_NODE_KEY", by_node["0xai_node_c"]["ENV"])
+    self.assertEqual(by_node["0xai_node_c"]["ENV"]["CF_TUNNEL_TOKEN"], "token-c")
+
+  def test_cockroachdb_secure_config_rejects_root_or_unsafe_identifiers(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "app-db",
+            "CRDB_USER": "root",
+            "CRDB_PASSWORD": "secret-password",
+          },
+        ),
+      ],
+    )
+
+    with self.assertRaisesRegex(ValueError, "SQL identifier"):
+      plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+
+    inputs[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["CRDB_DATABASE"] = "appdb"
+    with self.assertRaisesRegex(ValueError, "must not be root"):
+      plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+
+  def test_update_preparation_inherits_existing_cockroachdb_cert_bundle(self):
+    plugin = make_deeploy_plugin()
+    existing_config = {
+      "byNode": {
+        "0xai_node_a": {"ENV": {"CRDB_CA_CRT": "crt", "CRDB_NODE_CRT": "node", "CRDB_NODE_KEY": "key"}},
+      },
+    }
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+        ),
+      ],
+    )
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "PER_NODE_CONFIG": existing_config,
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(inputs, discovered)
+
+    self.assertEqual(inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"], existing_config)
+
+  def test_cockroachdb_same_node_update_reuses_inherited_bundle_after_prepare(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+        ),
+      ],
+    )
+    existing_inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+            },
+          },
+        ),
+      ],
+    )
+    plugin._prepare_cockroachdb_secure_config(existing_inputs, ["0xai_node_a", "0xai_node_b"])
+    existing_config = existing_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]
+    existing_node_key = existing_config["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "PER_NODE_CONFIG": existing_config,
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(inputs, discovered)
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+
+    reused_node_key = inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
+    self.assertEqual(existing_node_key, reused_node_key)
+
+  def test_cockroachdb_same_node_update_merges_certs_into_existing_request_per_node_config(self):
+    plugin = make_deeploy_plugin()
+    existing_inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+            },
+          },
+        ),
+      ],
+    )
+    plugin._prepare_cockroachdb_secure_config(existing_inputs, ["0xai_node_a", "0xai_node_b"])
+    existing_config = existing_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]
+    existing_node_key = existing_config["byNode"]["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"]
+    request_inputs = make_inputs(
+      current_target_nodes=["0xai_node_a", "0xai_node_b"],
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "new-secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "new-token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "new-token-b"}},
+            },
+          },
+        ),
+      ],
+    )
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "PER_NODE_CONFIG": existing_config,
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+    plugin._prepare_cockroachdb_secure_config(request_inputs, ["0xai_node_a", "0xai_node_b"])
+
+    merged_env = request_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]
+    self.assertEqual(merged_env["CRDB_NODE_ID"], "1")
+    self.assertEqual(merged_env["CF_TUNNEL_TOKEN"], "new-token-a")
+    self.assertEqual(merged_env["CRDB_NODE_KEY"], existing_node_key)
+
+  def test_cockroachdb_update_inherits_discovered_password_when_ui_sends_redacted_marker(self):
+    plugin = make_deeploy_plugin()
+    request_inputs = make_inputs(
+      current_target_nodes=["0xai_node_a", "0xai_node_b"],
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "***",
+          },
+        ),
+      ],
+    )
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "ENV": {
+            "CRDB_PASSWORD": "real-secret-password",
+          },
+          "PER_NODE_CONFIG": {
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2"}},
+            },
+          },
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+
+    env = request_inputs[DEEPLOY_KEYS.PLUGINS][0]["ENV"]
+    self.assertEqual(env["CRDB_PASSWORD"], "real-secret-password")
+
+  def test_deeploy_status_payload_redacts_cockroachdb_secrets(self):
+    plugin = make_deeploy_plugin()
+    payload = {
+      DEEPLOY_KEYS.PIPELINE: {
+        NetMonCt.PLUGINS.upper(): [{
+          "SIGNATURE": "CONTAINER_APP_RUNNER",
+          "INSTANCES": [{
+            "ENV": {
+              "CRDB_PASSWORD": "secret-password",
+              "CRDB_NODE_KEY": "-----BEGIN RSA PRIVATE KEY-----private",
+            },
+            "EXPOSED_PORTS": [{
+              "token": "client-facing-token",
+            }],
+            "PER_NODE_CONFIG": {
+              "byNode": {
+                "0xai_node_a": {
+                  "ENV": {
+                    "CF_TUNNEL_TOKEN": "internal-token",
+                    "CRDB_CLIENT_ROOT_KEY": "-----BEGIN RSA PRIVATE KEY-----root",
+                  },
+                },
+              },
+            },
+          }],
+        }],
+      },
+    }
+
+    redacted = plugin._redact_deeploy_status_payload(payload)
+    serialized = str(redacted)
+    self.assertNotIn("secret-password", serialized)
+    self.assertNotIn("client-facing-token", serialized)
+    self.assertNotIn("internal-token", serialized)
+    self.assertNotIn("BEGIN RSA PRIVATE KEY", serialized)
+    instance = redacted[DEEPLOY_KEYS.PIPELINE][NetMonCt.PLUGINS.upper()][0]["INSTANCES"][0]
+    self.assertIsInstance(instance["PER_NODE_CONFIG"], dict)
+    self.assertEqual(
+      instance["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"],
+      "***",
+    )
+    self.assertEqual(
+      instance["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CRDB_CLIENT_ROOT_KEY"],
+      "***",
+    )
+    self.assertEqual(instance["ENV"]["CRDB_PASSWORD"], "***")
+    self.assertEqual(instance["ENV"]["CRDB_NODE_KEY"], "***")
+    self.assertEqual(instance["EXPOSED_PORTS"][0]["token"], "***")
+
+  def test_cockroachdb_public_status_per_node_config_round_trips_to_update(self):
+    plugin = make_deeploy_plugin()
+    existing_config = {
+      "byNode": {
+        "0xai_node_a": {
+          "ENV": {
+            "CRDB_NODE_ID": "1",
+            "CF_TUNNEL_TOKEN": "token-a",
+            "CRDB_NODE_KEY": "node-key-a",
+          },
+        },
+        "0xai_node_b": {
+          "ENV": {
+            "CRDB_NODE_ID": "2",
+            "CF_TUNNEL_TOKEN": "token-b",
+            "CRDB_NODE_KEY": "node-key-b",
+          },
+        },
+      },
+    }
+    public_payload = plugin._redact_deeploy_status_payload({
+      DEEPLOY_KEYS.PLUGINS: [
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG=existing_config,
+        ),
+      ],
+    })
+    request_inputs = make_inputs(
+      plugins=public_payload[DEEPLOY_KEYS.PLUGINS],
+    )
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "PER_NODE_CONFIG": existing_config,
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+    plugin._prepare_cockroachdb_secure_config(request_inputs, ["0xai_node_a", "0xai_node_b"])
+
+    by_node = request_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]
+    self.assertEqual(by_node["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"], "token-a")
+    self.assertEqual(by_node["0xai_node_b"]["ENV"]["CF_TUNNEL_TOKEN"], "token-b")
+    self.assertNotEqual(by_node["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"], "***")
+    self.assertNotEqual(by_node["0xai_node_a"]["ENV"]["CRDB_NODE_KEY"], "***")
+
+  def test_cockroachdb_update_inherits_by_index_redacted_per_node_leaf(self):
+    plugin = make_deeploy_plugin()
+    existing_config = {
+      "byIndex": {
+        "0": {"ENV": {"CF_TUNNEL_TOKEN": "token-a"}},
+        "1": {"ENV": {"CF_TUNNEL_TOKEN": "token-b"}},
+      },
+    }
+    request_inputs = make_inputs(
+      current_target_nodes=["0xai_node_a", "0xai_node_b"],
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="cockroachdb",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byIndex": {
+              "0": {"ENV": {"CF_TUNNEL_TOKEN": "***"}},
+              "1": {"ENV": {"CF_TUNNEL_TOKEN": "[redacted]"}},
+            },
+          },
+        ),
+      ],
+    )
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "plugin_name": "cockroachdb",
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "PER_NODE_CONFIG": existing_config,
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+    plugin._prepare_cockroachdb_secure_config(request_inputs, ["0xai_node_a", "0xai_node_b"])
+
+    by_node = request_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]
+    self.assertEqual(by_node["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"], "token-a")
+    self.assertEqual(by_node["0xai_node_b"]["ENV"]["CF_TUNNEL_TOKEN"], "token-b")
+
+  def test_cockroachdb_update_inherits_by_node_redacted_leaf_from_discovered_by_index(self):
+    plugin = make_deeploy_plugin()
+    existing_config = {
+      "byIndex": {
+        "0": {"ENV": {"CF_TUNNEL_TOKEN": "token-a"}},
+        "1": {"ENV": {"CF_TUNNEL_TOKEN": "token-b"}},
+      },
+    }
+    request_inputs = make_inputs(
+      current_target_nodes=["0xai_node_a", "0xai_node_b"],
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="cockroachdb",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CF_TUNNEL_TOKEN": "***"}},
+              "0xai_node_b": {"ENV": {"CF_TUNNEL_TOKEN": "***"}},
+            },
+          },
+        ),
+      ],
+    )
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "plugin_name": "cockroachdb",
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "PER_NODE_CONFIG": existing_config,
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+    plugin._prepare_cockroachdb_secure_config(request_inputs, ["0xai_node_a", "0xai_node_b"])
+
+    by_node = request_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]
+    self.assertEqual(by_node["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"], "token-a")
+    self.assertEqual(by_node["0xai_node_b"]["ENV"]["CF_TUNNEL_TOKEN"], "token-b")
+
+  def test_cockroachdb_update_inherits_redacted_per_node_leaf_from_matching_instance_only(self):
+    plugin = make_deeploy_plugin()
+    request_inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="db-b",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CF_TUNNEL_TOKEN": "***"}},
+            },
+          },
+        ),
+      ],
+    )
+    discovered = [
+      {
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "plugin_name": "db-a",
+            "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+            "PER_NODE_CONFIG": {
+              "byNode": {
+                "0xai_node_a": {"ENV": {"CF_TUNNEL_TOKEN": "token-a-wrong"}},
+              },
+            },
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "plugin_name": "db-b",
+            "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+            "PER_NODE_CONFIG": {
+              "byNode": {
+                "0xai_node_a": {"ENV": {"CF_TUNNEL_TOKEN": "token-b-correct"}},
+              },
+            },
+          },
+        },
+      },
+    ]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+    plugin._prepare_cockroachdb_secure_config(request_inputs, ["0xai_node_a"])
+
+    by_node = request_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]
+    self.assertEqual(by_node["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"], "token-b-correct")
+    self.assertNotEqual(by_node["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"], "token-a-wrong")
+
+  def test_cockroachdb_update_matches_duplicate_discovered_records_for_same_named_instance(self):
+    plugin = make_deeploy_plugin()
+    existing_config = {
+      "byNode": {
+        "0xai_node_a": {"ENV": {"CF_TUNNEL_TOKEN": "token-a"}},
+      },
+    }
+    request_inputs = make_inputs(
+      current_target_nodes=["0xai_node_a"],
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="db",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CF_TUNNEL_TOKEN": "***"}},
+            },
+          },
+        ),
+      ],
+    )
+    discovered = [
+      {
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "plugin_name": "db",
+            "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+            plugin.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: "node-a-response-key",
+            "PER_NODE_CONFIG": existing_config,
+          },
+        },
+      },
+      {
+        DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+          "instance_conf": {
+            "plugin_name": "db",
+            "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+            plugin.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: "node-b-response-key",
+            "PER_NODE_CONFIG": existing_config,
+          },
+        },
+      },
+    ]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+
+    by_node = request_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]
+    self.assertEqual(by_node["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"], "token-a")
+
+  def test_cockroachdb_update_does_not_fallback_for_unknown_named_instance(self):
+    plugin = make_deeploy_plugin()
+    request_inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="db-missing",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CF_TUNNEL_TOKEN": "***"}},
+            },
+          },
+        ),
+      ],
+    )
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "plugin_name": "db-existing",
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "PER_NODE_CONFIG": {
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CF_TUNNEL_TOKEN": "token-existing"}},
+            },
+          },
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+
+    by_node = request_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["byNode"]
+    self.assertEqual(by_node["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"], "***")
+
+  def test_cockroachdb_update_inherits_public_redacted_per_node_marker(self):
+    plugin = make_deeploy_plugin()
+    request_inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          PER_NODE_CONFIG="***",
+        ),
+      ],
+    )
+    existing_config = {
+      "byNode": {
+        "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+        "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+      },
+    }
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "ENV": {"CRDB_PASSWORD": "secret-password"},
+          "PER_NODE_CONFIG": existing_config,
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+
+    self.assertEqual(request_inputs[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"], existing_config)
+
+  def test_cockroachdb_target_change_policy_blocks_scale_down_reorder_and_replacement(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+        ),
+      ],
+    )
+
+    self.assertTrue(plugin._validate_cockroachdb_target_change([], ["0xai_a", "0xai_b"], inputs))
+    self.assertTrue(
+      plugin._validate_cockroachdb_target_change(
+        ["0xai_a", "0xai_b"],
+        ["0xai_a", "0xai_b", "0xai_c"],
+        inputs,
+      )
+    )
+    with self.assertRaisesRegex(ValueError, "must append"):
+      plugin._validate_cockroachdb_target_change(
+        ["0xai_a", "0xai_b"],
+        ["0xai_replacement", "0xai_b", "0xai_c"],
+        inputs,
+      )
+    with self.assertRaisesRegex(ValueError, "must append"):
+      plugin._validate_cockroachdb_target_change(
+        ["0xai_a", "0xai_b"],
+        ["0xai_b", "0xai_a", "0xai_c"],
+        inputs,
+      )
+    with self.assertRaisesRegex(ValueError, "at least 2"):
+      plugin._validate_cockroachdb_target_change([], ["0xai_a"], inputs)
+    with self.assertRaisesRegex(ValueError, "scale-down"):
+      plugin._validate_cockroachdb_target_change(
+        ["0xai_a", "0xai_b", "0xai_c"],
+        ["0xai_a", "0xai_b"],
+        inputs,
+      )
+    with self.assertRaisesRegex(ValueError, "reordering"):
+      plugin._validate_cockroachdb_target_change(
+        ["0xai_a", "0xai_b"],
+        ["0xai_b", "0xai_a"],
+        inputs,
+      )
+    with self.assertRaisesRegex(ValueError, "replacement or reordering"):
+      plugin._validate_cockroachdb_target_change(
+        ["0xai_a", "0xai_b"],
+        ["0xai_a", "0xai_replacement"],
+        inputs,
+      )
+
+  def test_cockroachdb_update_inherits_redacted_public_tunnel_token(self):
+    plugin = make_deeploy_plugin()
+    request_inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          EXPOSED_PORTS={
+            "26257": {
+              "token": "***",
+              "tunnel": {"token": "[redacted]"},
+            },
+          },
+        ),
+      ],
+    )
+    discovered = [{
+      DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+        "instance_conf": {
+          "IMAGE": "ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          "ENV": {"CRDB_PASSWORD": "secret-password"},
+          "EXPOSED_PORTS": {
+            "26257": {
+              "token": "real-client-token",
+              "tunnel": {"token": "real-nested-token"},
+            },
+          },
+          "PER_NODE_CONFIG": {
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2"}},
+            },
+          },
+        },
+      },
+    }]
+
+    plugin._inherit_cockroachdb_secure_config_from_discovered(request_inputs, discovered)
+
+    ports = request_inputs[DEEPLOY_KEYS.PLUGINS][0]["EXPOSED_PORTS"]
+    self.assertEqual(ports["26257"]["token"], "real-client-token")
+    self.assertEqual(ports["26257"]["tunnel"]["token"], "real-nested-token")
+
+  def test_running_pipeline_context_uses_persisted_target_order_over_discovery_order(self):
+    plugin = make_deeploy_plugin()
+    plugin._discover_plugin_instances = lambda **kwargs: [
+      {DEEPLOY_PLUGIN_DATA.NODE: "0xai_node_b"},
+      {DEEPLOY_PLUGIN_DATA.NODE: "0xai_node_a"},
+    ]
+    plugin._prepare_updated_deeploy_specs = lambda **kwargs: {
+      DEEPLOY_KEYS.CURRENT_TARGET_NODES: ["0xai_node_a", "0xai_node_b"],
+    }
+
+    context = plugin._gather_running_pipeline_context(owner="0xowner", job_id=1)
+
+    self.assertEqual(context["discovered_nodes"], ["0xai_node_b", "0xai_node_a"])
+    self.assertEqual(context["nodes"], ["0xai_node_a", "0xai_node_b"])
 
   def test_prepare_plugins_groups_instances_by_signature(self):
     plugin = make_deeploy_plugin()
