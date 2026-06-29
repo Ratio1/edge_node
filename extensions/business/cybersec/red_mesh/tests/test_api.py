@@ -1785,6 +1785,29 @@ class TestPhase2PassFinalization(unittest.TestCase):
       }
     return report
 
+  def _configure_successful_pass_finalization(self, plugin, job_specs):
+    report_a = self._sample_node_report(1, 512, [80])
+    report_b = self._sample_node_report(513, 1024, [443])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a, "worker-B": report_b})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80, 443],
+      "service_info": {},
+      "web_tests_info": {},
+      "completed_tests": ["port_scan"],
+      "ports_scanned": 1024,
+      "nr_open_ports": 2,
+      "port_protocols": {"80": "http", "443": "https"},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com", "monitor_interval": 60})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 25, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin._build_job_archive = MagicMock()
+    plugin._clear_live_progress = MagicMock()
+    plugin._log_audit_event = MagicMock()
+
   def test_single_aggregation(self):
     """_collect_node_reports called exactly once per pass finalization."""
     PentesterApi01Plugin = self._get_plugin_class()
@@ -2324,6 +2347,111 @@ class TestPhase2PassFinalization(unittest.TestCase):
       value = call_args.kwargs.get("value") or call_args[1].get("value") if len(call_args) > 1 else None
       if isinstance(value, dict):
         self.assertNotEqual(value.get("job_status"), "FINALIZED")
+
+  def test_launcher_recovers_stale_analyzing_job_with_all_reports(self):
+    """Launcher-owned ANALYZING job with all worker reports re-enters finalization."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    job_specs["job_status"] = "ANALYZING"
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    plugin._collect_node_reports.assert_called_once()
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    plugin._log_audit_event.assert_called_once_with(
+      "stale_intermediate_finalization_recovery",
+      {
+        "job_id": job_specs["job_id"],
+        "launcher": "launcher-node",
+        "previous_status": "ANALYZING",
+        "pass_nr": 1,
+        "worker_count": 2,
+      },
+    )
+
+  def test_non_launcher_does_not_recover_stale_intermediate_job(self):
+    """Worker/non-launcher nodes must observe stale jobs without mutating them."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    plugin.ee_addr = "worker-A"
+    job_specs["job_status"] = "ANALYZING"
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    plugin._collect_node_reports.assert_not_called()
+    plugin._build_job_archive.assert_not_called()
+    plugin._log_audit_event.assert_not_called()
+
+  def test_launcher_does_not_recover_stale_intermediate_with_unfinished_worker(self):
+    """Recovery waits until every expected worker is finished."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    job_specs["job_status"] = "ANALYZING"
+    job_specs["workers"]["worker-B"]["finished"] = False
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    plugin._collect_node_reports.assert_not_called()
+    plugin._log_audit_event.assert_not_called()
+
+  def test_launcher_does_not_recover_stale_intermediate_with_missing_report_cid(self):
+    """Recovery waits until every expected worker has a persisted report CID."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    job_specs["job_status"] = "ANALYZING"
+    job_specs["workers"]["worker-B"]["report_cid"] = None
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    plugin._collect_node_reports.assert_not_called()
+    plugin._log_audit_event.assert_not_called()
+
+  def test_pass_report_write_failure_retries_on_later_launcher_loop(self):
+    """A failed pass-report write leaves a retryable intermediate job."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(r1fs_returns={
+      1: "QmAggCID",
+      2: None,
+      3: "QmAggRetryCID",
+      4: "QmPassRetryCID",
+    })
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "COLLECTING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    plugin._build_job_archive.assert_not_called()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertEqual(job_specs["pass_reports"][0]["report_cid"], "QmPassRetryCID")
+    self.assertEqual(plugin._collect_node_reports.call_count, 2)
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    plugin._log_audit_event.assert_called_once_with(
+      "stale_intermediate_finalization_recovery",
+      {
+        "job_id": job_specs["job_id"],
+        "launcher": "launcher-node",
+        "previous_status": "COLLECTING",
+        "pass_nr": 1,
+        "worker_count": 2,
+      },
+    )
 
   def test_cstore_risk_score_updated(self):
     """After pass, risk_score on CStore matches pass result."""

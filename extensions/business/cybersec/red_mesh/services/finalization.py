@@ -53,6 +53,50 @@ def _write_job_record(owner, job_key, job_specs, context):
   return job_specs
 
 
+def _all_workers_finished_with_reports(workers):
+  if not isinstance(workers, dict) or not workers:
+    return False
+  for worker in workers.values():
+    if not isinstance(worker, dict):
+      return False
+    if not worker.get("finished") or not worker.get("report_cid"):
+      return False
+  return True
+
+
+def _is_stale_intermediate_recovery_candidate(job_specs, workers, job_status, next_pass_at):
+  if not is_intermediate_job_status(job_status):
+    return False
+  if job_specs.get("job_cid"):
+    return False
+  if job_specs.get("pass_reports"):
+    return False
+  if next_pass_at is not None:
+    return False
+  return _all_workers_finished_with_reports(workers)
+
+
+def _record_stale_intermediate_recovery(owner, job_specs, previous_status, worker_count):
+  job_id = job_specs.get("job_id")
+  pass_nr = job_specs.get("job_pass", 1)
+  launcher = job_specs.get("launcher")
+  owner.P(
+    "[STUCK RECOVERY] launcher retrying stale intermediate job "
+    f"job_id={job_id} launcher={launcher} previous_status={previous_status} "
+    f"pass={pass_nr} workers={worker_count}",
+    color='y',
+  )
+  log_audit_event = getattr(owner, "_log_audit_event", None)
+  if callable(log_audit_event):
+    log_audit_event("stale_intermediate_finalization_recovery", {
+      "job_id": job_id,
+      "launcher": launcher,
+      "previous_status": previous_status,
+      "pass_nr": pass_nr,
+      "worker_count": worker_count,
+    })
+
+
 def _attestation_required(job_specs, job_config) -> bool:
   if isinstance(job_specs, dict) and "blockchain_attestation_enabled" in job_specs:
     return bool(job_specs.get("blockchain_attestation_enabled"))
@@ -119,7 +163,11 @@ def maybe_finalize_pass(owner):
         owner._build_job_archive(job_id, job_specs)
       continue
     if is_intermediate_job_status(job_status):
-      continue
+      if not _is_stale_intermediate_recovery_candidate(job_specs, workers, job_status, next_pass_at):
+        continue
+      _record_stale_intermediate_recovery(owner, job_specs, job_status, len(workers))
+      set_job_status(job_specs, JOB_STATUS_COLLECTING)
+      job_status = job_specs.get("job_status", JOB_STATUS_COLLECTING)
 
     if all_finished and next_pass_at is None:
       pass_date_started = owner._get_timeline_date(job_specs, "pass_started") or owner._get_timeline_date(job_specs, "created")
