@@ -35,6 +35,11 @@ from .models import (
 from .probes.business_logic import BusinessLogicProbes
 
 
+PROBE_LEVEL_SKIP_OWASP = {
+  "_graybox_business_logic": "A04:2021",
+}
+
+
 def _first_non_empty_str(values):
   """Aggregation helper: return the first truthy string in values.
 
@@ -145,6 +150,7 @@ class GrayboxLocalWorker(BaseLocalWorker):
     # Modules (composition)
     self.safety = SafetyControls(
       request_delay=job_config.scan_min_delay or None,
+      request_delay_max=job_config.scan_max_delay or None,
       target_is_local=SafetyControls.is_local_target(target_url),
     )
     self.auth = AuthManager(
@@ -528,7 +534,8 @@ class GrayboxLocalWorker(BaseLocalWorker):
       self._store_findings(store_key, [GrayboxFinding(
         scenario_id=f"SKIP-{store_key}",
         title="Probe skipped: stateful probes disabled",
-        status="inconclusive", severity="INFO", owasp="",
+        status="inconclusive", severity="INFO",
+        owasp=PROBE_LEVEL_SKIP_OWASP.get(store_key, ""),
         evidence=["stateful_probes_disabled=True"],
       )])
       return

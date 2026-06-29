@@ -434,9 +434,20 @@ class TestPhase1ConfigCID(unittest.TestCase):
 
     config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
     self.assertEqual(config_dict["run_mode"], "CONTINUOUS_MONITORING")
-    self.assertEqual(config_dict["scan_min_delay"], 30.0)
-    self.assertEqual(config_dict["scan_max_delay"], 80.0)
+    self.assertEqual(config_dict["scan_min_delay"], 25.0)
+    self.assertEqual(config_dict["scan_max_delay"], 70.0)
     self.assertEqual(config_dict["nr_local_workers"], 1)
+
+  def test_launch_webapp_defaults_to_webapp_dune_profile(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-dune-defaults")
+
+    result = self._launch_webapp(plugin)
+
+    self.assertNotIn("error", result)
+    config_dict = self._latest_job_config(plugin)
+    self.assertEqual(config_dict["scan_type"], "webapp")
+    self.assertEqual(config_dict["scan_min_delay"], 3.0)
+    self.assertEqual(config_dict["scan_max_delay"], 10.0)
 
   def test_launch_accepts_confirmed_singlepass_warning_id(self):
     plugin = self._build_mock_plugin(job_id="test-job-singlepass-confirmed")
@@ -465,6 +476,20 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(config_dict["scan_min_delay"], 15.0)
     self.assertEqual(config_dict["scan_max_delay"], 15.0)
 
+  def test_launch_webapp_accepts_3_second_dune_delay_without_confirmation(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-dune-3")
+
+    result = self._launch_webapp(
+      plugin,
+      scan_min_delay=3,
+      scan_max_delay=10,
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = self._latest_job_config(plugin)
+    self.assertEqual(config_dict["scan_min_delay"], 3.0)
+    self.assertEqual(config_dict["scan_max_delay"], 10.0)
+
   def test_launch_rejects_unconfirmed_unsafe_network_settings_before_persistence(self):
     plugin = self._build_mock_plugin(job_id="test-job-unsafe-network")
 
@@ -482,6 +507,19 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertIn("redact-credentials-off", result["message"])
     self.assertIn("ics-safe-mode-off", result["message"])
     self.assertIn("threads-per-node-raised", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_rejects_dune_delay_below_webapp_threshold(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-dune-2")
+
+    result = self._launch_webapp(
+      plugin,
+      scan_min_delay=2,
+      scan_max_delay=10,
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("dune-delay-below-production", result["message"])
     self.assertFalse(plugin.r1fs.add_json.called)
 
   def test_launch_accepts_confirmed_unsafe_network_settings(self):

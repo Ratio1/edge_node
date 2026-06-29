@@ -40,9 +40,24 @@ from .secrets import persist_job_config_with_secrets
 from .soc_export_policy import required_soc_launch_error
 
 
-PRODUCTION_SCAN_MIN_DELAY_SECONDS = 30.0
-PRODUCTION_SCAN_MAX_DELAY_SECONDS = 80.0
-LOW_SCAN_DELAY_WARNING_SECONDS = 15.0
+NETWORK_SCAN_MIN_DELAY_SECONDS = 25.0
+NETWORK_SCAN_MAX_DELAY_SECONDS = 70.0
+NETWORK_LOW_SCAN_DELAY_WARNING_SECONDS = 15.0
+WEBAPP_SCAN_MIN_DELAY_SECONDS = 3.0
+WEBAPP_SCAN_MAX_DELAY_SECONDS = 10.0
+WEBAPP_LOW_SCAN_DELAY_WARNING_SECONDS = 3.0
+DUNE_DELAY_PROFILES = {
+  ScanType.NETWORK.value: {
+    "min_seconds": NETWORK_SCAN_MIN_DELAY_SECONDS,
+    "max_seconds": NETWORK_SCAN_MAX_DELAY_SECONDS,
+    "low_seconds": NETWORK_LOW_SCAN_DELAY_WARNING_SECONDS,
+  },
+  ScanType.WEBAPP.value: {
+    "min_seconds": WEBAPP_SCAN_MIN_DELAY_SECONDS,
+    "max_seconds": WEBAPP_SCAN_MAX_DELAY_SECONDS,
+    "low_seconds": WEBAPP_LOW_SCAN_DELAY_WARNING_SECONDS,
+  },
+}
 PRODUCTION_LOCAL_WORKERS = 1
 DEFAULT_MONITOR_INTERVAL_SECONDS = 24 * 60 * 60
 LOW_MONITOR_INTERVAL_SECONDS = DEFAULT_MONITOR_INTERVAL_SECONDS
@@ -170,6 +185,13 @@ def _parse_positive_int(value, field_path: str, *, default=None,
       f"{field_path} must be less than or equal to {maximum}"
     )
   return parsed, None
+
+
+def _dune_delay_profile(scan_type):
+  return DUNE_DELAY_PROFILES.get(
+    str(scan_type or ScanType.NETWORK.value),
+    DUNE_DELAY_PROFILES[ScanType.NETWORK.value],
+  )
 
 
 def _validate_positive_int_field(container, key, field_path: str, *,
@@ -691,10 +713,12 @@ def normalize_common_launch_options(
   scan_min_delay,
   scan_max_delay,
   nr_local_workers,
+  scan_type=ScanType.NETWORK.value,
   unsafe_confirmation_ids=None,
 ):
   """Apply defaults and bounds to common launch settings."""
   unsafe_confirmation_ids = unsafe_confirmation_ids or set()
+  dune_profile = _dune_delay_profile(scan_type)
   distribution_strategy = str(distribution_strategy or "").upper()
   if not distribution_strategy or distribution_strategy not in [DISTRIBUTION_MIRROR, DISTRIBUTION_SLICE]:
     distribution_strategy = owner.cfg_distribution_strategy
@@ -734,9 +758,9 @@ def normalize_common_launch_options(
     scan_max_delay = 0.0
   else:
     if scan_min_delay <= 0:
-      scan_min_delay = PRODUCTION_SCAN_MIN_DELAY_SECONDS
+      scan_min_delay = dune_profile["min_seconds"]
     if scan_max_delay <= 0:
-      scan_max_delay = PRODUCTION_SCAN_MAX_DELAY_SECONDS
+      scan_max_delay = dune_profile["max_seconds"]
   if scan_min_delay > scan_max_delay:
     return validation_error("scan_max_delay must be greater than or equal to scan_min_delay")
 
@@ -773,11 +797,12 @@ def required_unsafe_confirmation_ids(
   auth_desc=None,
 ):
   required = set()
+  low_scan_delay_warning_seconds = _dune_delay_profile(scan_type)["low_seconds"]
   if not options.get("dune_sand_walking_enabled", True):
     required.add(UNSAFE_CONFIRMATION_DUNE_DISABLED)
   elif (
-    float(options.get("scan_min_delay") or 0) < LOW_SCAN_DELAY_WARNING_SECONDS
-    or float(options.get("scan_max_delay") or 0) < LOW_SCAN_DELAY_WARNING_SECONDS
+    float(options.get("scan_min_delay") or 0) < low_scan_delay_warning_seconds
+    or float(options.get("scan_max_delay") or 0) < low_scan_delay_warning_seconds
   ):
     required.add(UNSAFE_CONFIRMATION_DUNE_DELAY_BELOW_PRODUCTION)
   if (
@@ -1213,6 +1238,7 @@ def launch_network_scan(
     scan_min_delay=scan_min_delay,
     scan_max_delay=scan_max_delay,
     nr_local_workers=nr_local_workers,
+    scan_type=ScanType.NETWORK.value,
     unsafe_confirmation_ids=confirmation_ids,
   )
   if "error" in options:
@@ -1512,6 +1538,7 @@ def launch_webapp_scan(
     scan_min_delay=scan_min_delay,
     scan_max_delay=scan_max_delay,
     nr_local_workers=1,
+    scan_type=ScanType.WEBAPP.value,
     unsafe_confirmation_ids=confirmation_ids,
   )
   if "error" in options:
