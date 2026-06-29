@@ -42,6 +42,7 @@ from .soc_export_policy import required_soc_launch_error
 
 PRODUCTION_SCAN_MIN_DELAY_SECONDS = 30.0
 PRODUCTION_SCAN_MAX_DELAY_SECONDS = 80.0
+LOW_SCAN_DELAY_WARNING_SECONDS = 15.0
 PRODUCTION_LOCAL_WORKERS = 1
 DEFAULT_MONITOR_INTERVAL_SECONDS = 24 * 60 * 60
 LOW_MONITOR_INTERVAL_SECONDS = DEFAULT_MONITOR_INTERVAL_SECONDS
@@ -773,8 +774,8 @@ def required_unsafe_confirmation_ids(
   if not options.get("dune_sand_walking_enabled", True):
     required.add(UNSAFE_CONFIRMATION_DUNE_DISABLED)
   elif (
-    float(options.get("scan_min_delay") or 0) < PRODUCTION_SCAN_MIN_DELAY_SECONDS
-    or float(options.get("scan_max_delay") or 0) < PRODUCTION_SCAN_MIN_DELAY_SECONDS
+    float(options.get("scan_min_delay") or 0) < LOW_SCAN_DELAY_WARNING_SECONDS
+    or float(options.get("scan_max_delay") or 0) < LOW_SCAN_DELAY_WARNING_SECONDS
   ):
     required.add(UNSAFE_CONFIRMATION_DUNE_DELAY_BELOW_PRODUCTION)
   if (

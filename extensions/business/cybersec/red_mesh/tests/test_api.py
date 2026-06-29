@@ -438,13 +438,27 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(config_dict["scan_max_delay"], 80.0)
     self.assertEqual(config_dict["nr_local_workers"], 1)
 
+  def test_launch_accepts_15_second_dune_delay_without_confirmation(self):
+    plugin = self._build_mock_plugin(job_id="test-job-dune-15")
+
+    result = self._launch_network(
+      plugin,
+      scan_min_delay=15,
+      scan_max_delay=15,
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["scan_min_delay"], 15.0)
+    self.assertEqual(config_dict["scan_max_delay"], 15.0)
+
   def test_launch_rejects_unconfirmed_unsafe_network_settings_before_persistence(self):
     plugin = self._build_mock_plugin(job_id="test-job-unsafe-network")
 
     result = self._launch_network(
       plugin,
-      scan_min_delay=5,
-      scan_max_delay=10,
+      scan_min_delay=14,
+      scan_max_delay=15,
       redact_credentials=False,
       ics_safe_mode=False,
       nr_local_workers=2,
