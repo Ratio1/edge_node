@@ -438,6 +438,19 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(config_dict["scan_max_delay"], 80.0)
     self.assertEqual(config_dict["nr_local_workers"], 1)
 
+  def test_launch_accepts_confirmed_singlepass_warning_id(self):
+    plugin = self._build_mock_plugin(job_id="test-job-singlepass-confirmed")
+
+    result = self._launch_network(
+      plugin,
+      run_mode="SINGLEPASS",
+      unsafe_launch_confirmations=["continuous-monitoring-off"],
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["run_mode"], "SINGLEPASS")
+
   def test_launch_accepts_15_second_dune_delay_without_confirmation(self):
     plugin = self._build_mock_plugin(job_id="test-job-dune-15")
 
