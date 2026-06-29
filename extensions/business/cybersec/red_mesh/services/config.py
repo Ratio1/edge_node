@@ -146,6 +146,8 @@ DEFAULT_MODEL_TESTING_CONFIG = {
   "RAW_EVIDENCE_SECRET_REF": "",
   "REMOTE_PROVIDER_URLS_ENABLED": True,
   "REMOTE_PROVIDER_PREFLIGHT_ENABLED": True,
+  "EVALUATOR_MODELS": [],
+  "DEFAULT_EVALUATOR_ID": "",
   "DEFAULT_EVALUATOR_MODEL": None,
   "LIMITS": {
     "MAX_CASES": 12,
@@ -396,6 +398,46 @@ def get_graybox_budgets_config(owner):
 
 def get_model_testing_config(owner):
   """Return normalized Model Testing capability config."""
+  def _bounded_text(value, *, maximum=200):
+    text = str(value or "").strip()
+    if not text or len(text) > maximum:
+      return ""
+    return text
+
+  def _normalize_evaluator_models(value):
+    if not isinstance(value, list):
+      return []
+    normalized = []
+    seen_ids = set()
+    for entry in value:
+      if not isinstance(entry, dict):
+        continue
+      evaluator_id = _bounded_text(entry.get("id"), maximum=80)
+      if not evaluator_id or evaluator_id in seen_ids or evaluator_id == "heuristic_v1":
+        continue
+      adapter = str(entry.get("adapter") or "openai_compatible").strip().lower()
+      if adapter != "openai_compatible":
+        continue
+      label = _bounded_text(entry.get("label"), maximum=120)
+      provider_label = _bounded_text(entry.get("provider_label"), maximum=120)
+      base_url = str(entry.get("base_url") or "").strip()
+      model = _bounded_text(entry.get("model"), maximum=200)
+      api_key_env = _bounded_text(entry.get("api_key_env"), maximum=120)
+      if not all((label, provider_label, base_url, model, api_key_env)):
+        continue
+      normalized.append({
+        "id": evaluator_id,
+        "label": label,
+        "provider_label": provider_label,
+        "adapter": adapter,
+        "base_url": base_url,
+        "model": model,
+        "api_key_env": api_key_env,
+        "enabled": bool(entry.get("enabled", True)),
+      })
+      seen_ids.add(evaluator_id)
+    return normalized
+
   def _normalize_limits(value, defaults):
     raw_limits = value if isinstance(value, dict) else {}
     default_limits = defaults["LIMITS"]
@@ -459,6 +501,13 @@ def get_model_testing_config(owner):
     )
     if default_retention > max_retention:
       default_retention = max_retention
+    evaluator_models = _normalize_evaluator_models(
+      merged.get("EVALUATOR_MODELS", defaults["EVALUATOR_MODELS"])
+    )
+    default_evaluator_id = _bounded_text(
+      merged.get("DEFAULT_EVALUATOR_ID", defaults["DEFAULT_EVALUATOR_ID"]),
+      maximum=80,
+    )
     default_evaluator = merged.get("DEFAULT_EVALUATOR_MODEL")
     if not isinstance(default_evaluator, dict):
       default_evaluator = None
@@ -481,6 +530,8 @@ def get_model_testing_config(owner):
       "REMOTE_PROVIDER_PREFLIGHT_ENABLED": bool(
         merged.get("REMOTE_PROVIDER_PREFLIGHT_ENABLED", defaults["REMOTE_PROVIDER_PREFLIGHT_ENABLED"])
       ),
+      "EVALUATOR_MODELS": evaluator_models,
+      "DEFAULT_EVALUATOR_ID": default_evaluator_id,
       "DEFAULT_EVALUATOR_MODEL": default_evaluator,
       "LIMITS": _normalize_limits(merged.get("LIMITS"), defaults),
     }

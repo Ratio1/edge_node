@@ -21,6 +21,7 @@ from .constants import (
   MODEL_TEST_PHASE_NODE_SELECTED,
   MODEL_TEST_PROGRESS_SCHEMA,
 )
+from .evaluators import resolve_evaluator_option
 from .node_selection import select_model_test_execution_node
 from .secrets import (
   attach_model_test_provider_secret,
@@ -280,7 +281,8 @@ def launch_model_test(
   test_sets=None,
   tested_model=None,
   tested_model_secret_payload=None,
-  use_default_evaluator_model=False,
+  evaluator_id=None,
+  use_default_evaluator_model=None,
   evaluator_model=None,
   evaluator_model_secret_payload=None,
   limits=None,
@@ -326,6 +328,16 @@ def launch_model_test(
   normalized_limits, err = _normalize_limits(limits, cfg)
   if err:
     return err
+  if evaluator_model is not None or evaluator_model_secret_payload is not None:
+    return _validation_error(
+      "evaluator_model custom provider fields are not supported; select evaluator_id",
+      error_class="unsupported_evaluator_config",
+    )
+  if use_default_evaluator_model is not None:
+    return _validation_error(
+      "use_default_evaluator_model is not supported; select evaluator_id",
+      error_class="unsupported_evaluator_config",
+    )
 
   tested_model_config, err = _validate_provider(
     "tested_model",
@@ -336,17 +348,7 @@ def launch_model_test(
   if err:
     return err
 
-  evaluator_model_config = None
-  if use_default_evaluator_model:
-    if not cfg.get("DEFAULT_EVALUATOR_MODEL"):
-      return _validation_error("default evaluator model is unavailable")
-  else:
-    evaluator_model_config, err = _validate_provider(
-      "evaluator_model",
-      evaluator_model,
-      evaluator_model_secret_payload,
-      created_by_id=created_by_id,
-    )
+  evaluator_model_config, evaluator_runtime_model, err = resolve_evaluator_option(cfg, evaluator_id)
   if err:
     return err
 
@@ -369,7 +371,8 @@ def launch_model_test(
     "test_set_catalog": sanitized_model_test_catalog(),
     "selected_test_set_metadata": selection_metadata(normalized_test_sets),
     "tested_model": tested_model_config,
-    "evaluator_model": evaluator_model_config or {"source": "default_config"},
+    "evaluator_id": evaluator_model_config["id"],
+    "evaluator_model": evaluator_model_config,
     "limits": normalized_limits,
     "raw_evidence": {
       "requested": _raw_evidence_requested(raw_evidence),
@@ -389,6 +392,7 @@ def launch_model_test(
     tested_model_secret_payload=tested_model_secret_payload,
     evaluator_model=evaluator_model,
     evaluator_model_secret_payload=evaluator_model_secret_payload,
+    evaluator_runtime_model=evaluator_runtime_model,
   )
   if not secret_ref or not isinstance(persisted_config, dict):
     return {
