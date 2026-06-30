@@ -34,6 +34,7 @@ from extensions.business.deeploy.deeploy_const import (
   DEEPLOY_DYNAMIC_ENV_TYPES,
   DEEPLOY_KEYS,
   DEEPLOY_PLUGIN_DATA,
+  DEEPLOY_STATUS,
   JOB_APP_TYPES,
 )
 from extensions.business.deeploy.deeploy_manager_api import DeeployManagerApiPlugin
@@ -541,6 +542,62 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertIn("Circular dependency", response[DEEPLOY_KEYS.ERROR])
     self.assertEqual(called["delete"], 0)
     self.assertEqual(called["deploy"], 0)
+
+  def test_process_update_return_request_preserves_config_values(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "current-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "IMAGE": "repo/app:1.0",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            },
+          },
+        },
+      ],
+    )
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.RETURN_REQUEST: True,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "current-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+            "IMAGE": "repo/app:2.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            "ENV": {"API_TOKEN": "raw-token"},
+            "PER_NODE_CONFIG": {
+              "node-1": {"ENV": {"NODE_PASSWORD": "raw-password"}},
+            },
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(called["deploy"], 1)
+    request_payload = response[DEEPLOY_KEYS.REQUEST]
+    self.assertEqual(request_payload[DEEPLOY_KEYS.PLUGINS][0]["ENV"]["API_TOKEN"], "raw-token")
+    self.assertEqual(
+      request_payload[DEEPLOY_KEYS.PLUGINS][0]["PER_NODE_CONFIG"]["node-1"]["ENV"]["NODE_PASSWORD"],
+      "raw-password",
+    )
 
   def test_process_update_rejects_duplicate_plugin_names_before_delete(self):
     plugin, called = self._make_process_update_plugin(
@@ -1964,35 +2021,6 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(instance["VCS_DATA"]["BRANCH"], "develop")
     self.assertEqual(instance["ENV"], {"WORKER_NODE": "node-b"})
     self.assertNotIn("perNodeConfig", instance)
-
-  def test_prepare_single_plugin_instance_update_inherits_public_redacted_per_node_marker(self):
-    plugin = make_deeploy_plugin()
-    existing_config = {
-      "byNode": {
-        "0xai_node_a": {"ENV": {"WORKER_NODE": "node-a"}},
-        "0xai_node_b": {"ENV": {"WORKER_NODE": "node-b"}},
-      },
-    }
-    fallback_instance = {
-      "instance_conf": {
-        "IMAGE": "node:22",
-        "PER_NODE_CONFIG": existing_config,
-      },
-    }
-
-    prepared = plugin.deeploy_prepare_single_plugin_instance_update(
-      inputs=make_inputs(),
-      instance_id="instance-6",
-      plugin_config={
-        DEEPLOY_KEYS.PLUGIN_SIGNATURE: "WORKER_APP_RUNNER",
-        "IMAGE": "node:22",
-        "PER_NODE_CONFIG": "***",
-      },
-      fallback_instance=fallback_instance,
-    )
-
-    instance = prepared[plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
-    self.assertEqual(instance["PER_NODE_CONFIG"], existing_config)
 
   def test_per_node_config_update_uses_persisted_target_node_order(self):
     plugin = make_deeploy_plugin()

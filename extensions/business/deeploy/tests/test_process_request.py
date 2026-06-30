@@ -162,9 +162,9 @@ class DeeployProcessRequestTests(unittest.TestCase):
       "2",
     )
     self.assertEqual(plugin.bc.submitted, [(97, ["eth_0xai_node_a", "eth_0xai_node_b"])])
-    self.assertNotIn("token-a", str(res))
-    self.assertNotIn("token-b", str(res))
-    self.assertIn("'PER_NODE_CONFIG': '***'", str(res[DEEPLOY_KEYS.REQUEST]))
+    self.assertIn("token-a", str(res[DEEPLOY_KEYS.REQUEST]))
+    self.assertIn("token-b", str(res[DEEPLOY_KEYS.REQUEST]))
+    self.assertIsInstance(res[DEEPLOY_KEYS.REQUEST]["PER_NODE_CONFIG"], dict)
 
   def test_error_handler_redacts_secret_request_values(self):
     plugin = _ProcessRequestStub.__new__(_ProcessRequestStub)
