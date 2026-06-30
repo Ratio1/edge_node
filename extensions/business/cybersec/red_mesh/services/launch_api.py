@@ -39,6 +39,37 @@ from .event_hooks import emit_attestation_status_event, emit_lifecycle_event
 from .secrets import persist_job_config_with_secrets
 
 
+PRODUCTION_SCAN_MIN_DELAY_SECONDS = 30.0
+PRODUCTION_SCAN_MAX_DELAY_SECONDS = 80.0
+PRODUCTION_LOCAL_WORKERS = 1
+DEFAULT_MONITOR_INTERVAL_SECONDS = 24 * 60 * 60
+LOW_MONITOR_INTERVAL_SECONDS = DEFAULT_MONITOR_INTERVAL_SECONDS
+
+UNSAFE_CONFIRMATION_DUNE_DISABLED = "dune-disabled"
+UNSAFE_CONFIRMATION_DUNE_DELAY_BELOW_PRODUCTION = "dune-delay-below-production"
+UNSAFE_CONFIRMATION_CONTINUOUS_INTERVAL_LOW = "continuous-interval-low"
+UNSAFE_CONFIRMATION_REDACT_CREDENTIALS_OFF = "redact-credentials-off"
+UNSAFE_CONFIRMATION_ICS_SAFE_MODE_OFF = "ics-safe-mode-off"
+UNSAFE_CONFIRMATION_TLS_VERIFICATION_OFF = "tls-verification-off"
+UNSAFE_CONFIRMATION_STATEFUL_PROBES_ON = "stateful-probes-on"
+UNSAFE_CONFIRMATION_MIRROR_STATEFUL_ON = "mirror-stateful-on"
+UNSAFE_CONFIRMATION_UNVERIFIED_AUTH_ON = "unverified-auth-on"
+UNSAFE_CONFIRMATION_THREADS_PER_NODE_RAISED = "threads-per-node-raised"
+
+UNSAFE_CONFIRMATION_IDS = {
+  UNSAFE_CONFIRMATION_DUNE_DISABLED,
+  UNSAFE_CONFIRMATION_DUNE_DELAY_BELOW_PRODUCTION,
+  UNSAFE_CONFIRMATION_CONTINUOUS_INTERVAL_LOW,
+  UNSAFE_CONFIRMATION_REDACT_CREDENTIALS_OFF,
+  UNSAFE_CONFIRMATION_ICS_SAFE_MODE_OFF,
+  UNSAFE_CONFIRMATION_TLS_VERIFICATION_OFF,
+  UNSAFE_CONFIRMATION_STATEFUL_PROBES_ON,
+  UNSAFE_CONFIRMATION_MIRROR_STATEFUL_ON,
+  UNSAFE_CONFIRMATION_UNVERIFIED_AUTH_ON,
+  UNSAFE_CONFIRMATION_THREADS_PER_NODE_RAISED,
+}
+
+
 def _job_repo(owner):
   getter = getattr(type(owner), "_get_job_state_repository", None)
   if callable(getter):
@@ -49,6 +80,61 @@ def _job_repo(owner):
 def validation_error(message: str):
   """Return a consistent validation error payload."""
   return {"error": "validation_error", "message": message}
+
+
+def _parse_confirmation_ids(value):
+  if value in (None, ""):
+    return set(), None
+  if not isinstance(value, (list, tuple, set)):
+    return None, validation_error("unsafe_launch_confirmations must be a list of strings")
+  confirmation_ids = set()
+  for item in value:
+    if not isinstance(item, str) or not item.strip():
+      return None, validation_error("unsafe_launch_confirmations must contain non-empty strings")
+    confirmation_ids.add(item.strip())
+  unknown = sorted(confirmation_ids - UNSAFE_CONFIRMATION_IDS)
+  if unknown:
+    return None, validation_error(
+      "unsafe_launch_confirmations contains unknown id(s): " + ", ".join(unknown)
+    )
+  return confirmation_ids, None
+
+
+def _parse_float_setting(value, field_path: str, *, default: float | None = None):
+  if value is None or value == "":
+    value = default
+  if isinstance(value, bool):
+    return None, validation_error(f"{field_path} must be a number")
+  try:
+    parsed = float(value)
+  except (TypeError, ValueError):
+    return None, validation_error(f"{field_path} must be a number")
+  return parsed, None
+
+
+def _parse_int_setting(value, field_path: str, *, default: int | None = None):
+  if value is None or value == "":
+    value = default
+  if isinstance(value, bool):
+    return None, validation_error(f"{field_path} must be an integer")
+  try:
+    parsed = int(value)
+  except (TypeError, ValueError):
+    return None, validation_error(f"{field_path} must be an integer")
+  return parsed, None
+
+
+def _validate_unsafe_confirmations(*, required_ids: set[str], provided_ids: set[str]):
+  missing = sorted(required_ids - provided_ids)
+  if missing:
+    return validation_error(
+      "Unsafe launch setting(s) require confirmation: " + ", ".join(missing)
+    )
+  return None
+
+
+def _auth_allows_unverified(auth_desc) -> bool:
+  return bool(getattr(auth_desc, "allow_unverified_auth", False))
 
 
 def _parse_positive_int(value, field_path: str, *, default=None,
@@ -601,32 +687,62 @@ def normalize_common_launch_options(
   scan_min_delay,
   scan_max_delay,
   nr_local_workers,
+  unsafe_confirmation_ids=None,
 ):
   """Apply defaults and bounds to common launch settings."""
-  distribution_strategy = str(distribution_strategy).upper()
+  unsafe_confirmation_ids = unsafe_confirmation_ids or set()
+  distribution_strategy = str(distribution_strategy or "").upper()
   if not distribution_strategy or distribution_strategy not in [DISTRIBUTION_MIRROR, DISTRIBUTION_SLICE]:
     distribution_strategy = owner.cfg_distribution_strategy
 
-  port_order = str(port_order).upper()
+  port_order = str(port_order or "").upper()
   if not port_order or port_order not in [PORT_ORDER_SHUFFLE, PORT_ORDER_SEQUENTIAL]:
     port_order = owner.cfg_port_order
 
-  run_mode = str(run_mode).upper()
+  run_mode = str(run_mode or "").upper()
   if not run_mode or run_mode not in [RUN_MODE_SINGLEPASS, RUN_MODE_CONTINUOUS_MONITORING]:
-    run_mode = owner.cfg_run_mode
+    run_mode = RUN_MODE_CONTINUOUS_MONITORING
+
+  monitor_interval, err = _parse_int_setting(
+    monitor_interval, "monitor_interval", default=DEFAULT_MONITOR_INTERVAL_SECONDS,
+  )
+  if err:
+    return err
   if monitor_interval <= 0:
-    monitor_interval = owner.cfg_monitor_interval
+    monitor_interval = DEFAULT_MONITOR_INTERVAL_SECONDS
 
-  if scan_min_delay <= 0:
-    scan_min_delay = owner.cfg_scan_min_rnd_delay
-  if scan_max_delay <= 0:
-    scan_max_delay = owner.cfg_scan_max_rnd_delay
+  scan_min_delay, err = _parse_float_setting(scan_min_delay, "scan_min_delay", default=0.0)
+  if err:
+    return err
+  scan_max_delay, err = _parse_float_setting(scan_max_delay, "scan_max_delay", default=0.0)
+  if err:
+    return err
+  if scan_min_delay < 0 or scan_max_delay < 0:
+    return validation_error("scan_min_delay and scan_max_delay must be greater than or equal to 0")
+
+  dune_disabled = (
+    UNSAFE_CONFIRMATION_DUNE_DISABLED in unsafe_confirmation_ids
+    and scan_min_delay <= 0
+    and scan_max_delay <= 0
+  )
+  if dune_disabled:
+    scan_min_delay = 0.0
+    scan_max_delay = 0.0
+  else:
+    if scan_min_delay <= 0:
+      scan_min_delay = PRODUCTION_SCAN_MIN_DELAY_SECONDS
+    if scan_max_delay <= 0:
+      scan_max_delay = PRODUCTION_SCAN_MAX_DELAY_SECONDS
   if scan_min_delay > scan_max_delay:
-    scan_min_delay, scan_max_delay = scan_max_delay, scan_min_delay
+    return validation_error("scan_max_delay must be greater than or equal to scan_min_delay")
 
-  nr_local_workers = int(nr_local_workers)
+  nr_local_workers, err = _parse_int_setting(
+    nr_local_workers, "nr_local_workers", default=PRODUCTION_LOCAL_WORKERS,
+  )
+  if err:
+    return err
   if nr_local_workers <= 0:
-    nr_local_workers = owner.cfg_nr_local_workers
+    nr_local_workers = PRODUCTION_LOCAL_WORKERS
   nr_local_workers = max(LOCAL_WORKERS_MIN, min(LOCAL_WORKERS_MAX, nr_local_workers))
 
   return {
@@ -637,7 +753,50 @@ def normalize_common_launch_options(
     "scan_min_delay": scan_min_delay,
     "scan_max_delay": scan_max_delay,
     "nr_local_workers": nr_local_workers,
+    "dune_sand_walking_enabled": not dune_disabled,
   }
+
+
+def required_unsafe_confirmation_ids(
+  *,
+  scan_type,
+  options,
+  redact_credentials,
+  ics_safe_mode,
+  verify_tls,
+  allow_stateful_probes,
+  allow_mirror_stateful=False,
+  auth_desc=None,
+):
+  required = set()
+  if not options.get("dune_sand_walking_enabled", True):
+    required.add(UNSAFE_CONFIRMATION_DUNE_DISABLED)
+  elif (
+    float(options.get("scan_min_delay") or 0) < PRODUCTION_SCAN_MIN_DELAY_SECONDS
+    or float(options.get("scan_max_delay") or 0) < PRODUCTION_SCAN_MIN_DELAY_SECONDS
+  ):
+    required.add(UNSAFE_CONFIRMATION_DUNE_DELAY_BELOW_PRODUCTION)
+  if (
+    options.get("run_mode") == RUN_MODE_CONTINUOUS_MONITORING
+    and int(options.get("monitor_interval") or 0) < LOW_MONITOR_INTERVAL_SECONDS
+  ):
+    required.add(UNSAFE_CONFIRMATION_CONTINUOUS_INTERVAL_LOW)
+  if not bool(redact_credentials):
+    required.add(UNSAFE_CONFIRMATION_REDACT_CREDENTIALS_OFF)
+  if int(options.get("nr_local_workers") or 1) > PRODUCTION_LOCAL_WORKERS:
+    required.add(UNSAFE_CONFIRMATION_THREADS_PER_NODE_RAISED)
+  if scan_type == ScanType.NETWORK.value and not bool(ics_safe_mode):
+    required.add(UNSAFE_CONFIRMATION_ICS_SAFE_MODE_OFF)
+  if scan_type == ScanType.WEBAPP.value:
+    if not bool(verify_tls):
+      required.add(UNSAFE_CONFIRMATION_TLS_VERIFICATION_OFF)
+    if bool(allow_stateful_probes):
+      required.add(UNSAFE_CONFIRMATION_STATEFUL_PROBES_ON)
+    if bool(allow_mirror_stateful):
+      required.add(UNSAFE_CONFIRMATION_MIRROR_STATEFUL_ON)
+    if auth_desc is not None and _auth_allows_unverified(auth_desc):
+      required.add(UNSAFE_CONFIRMATION_UNVERIFIED_AUTH_ON)
+  return required
 
 
 def build_network_workers(owner, active_peers, start_port, end_port, distribution_strategy):
@@ -768,6 +927,7 @@ def announce_launch(
   gateway_bearer_token="",
   gateway_bearer_refresh_token="",
   target_config_secrets=None,
+  blockchain_attestation_enabled=False,
 ):
   """Persist immutable config, announce job in CStore, and return launch response."""
   excluded_features, enabled_features = resolve_enabled_features(
@@ -844,6 +1004,9 @@ def announce_launch(
     gateway_api_key=gateway_api_key,
     gateway_bearer_token=gateway_bearer_token,
     gateway_bearer_refresh_token=gateway_bearer_refresh_token,
+    blockchain_attestation_enabled=bool(blockchain_attestation_enabled),
+    start_attestation_required=bool(blockchain_attestation_enabled),
+    end_attestation_required=bool(blockchain_attestation_enabled),
   )
 
   persisted_config, job_config_cid = persist_job_config_with_secrets(
@@ -880,6 +1043,9 @@ def announce_launch(
     next_pass_at=None,
     risk_score=0,
     graybox_assignment_summary=assignment_summary or None,
+    blockchain_attestation_enabled=bool(blockchain_attestation_enabled),
+    start_attestation_required=bool(blockchain_attestation_enabled),
+    end_attestation_required=bool(blockchain_attestation_enabled),
   ).to_dict()
   owner._emit_timeline_event(
     job_specs, "created",
@@ -897,13 +1063,21 @@ def announce_launch(
     pass_nr=1,
   )
 
-  try:
-    redmesh_job_start_attestation = owner._submit_redmesh_job_start_attestation(
-      job_id=job_id,
-      job_specs=job_specs,
-      workers=workers,
-    )
-    if isinstance(redmesh_job_start_attestation, dict):
+  if blockchain_attestation_enabled:
+    try:
+      redmesh_job_start_attestation = owner._submit_redmesh_job_start_attestation(
+        job_id=job_id,
+        job_specs=job_specs,
+        workers=workers,
+      )
+      if not (
+        isinstance(redmesh_job_start_attestation, dict)
+        and redmesh_job_start_attestation.get("tx_hash")
+      ):
+        return {
+          "error": "attestation_failed",
+          "message": "Required job-start blockchain attestation was not submitted",
+        }
       job_specs["redmesh_job_start_attestation"] = redmesh_job_start_attestation
       owner._emit_timeline_event(
         job_specs, "blockchain_submit",
@@ -919,30 +1093,26 @@ def announce_launch(
         tx_hash=redmesh_job_start_attestation.get("tx_hash"),
         pass_nr=1,
       )
-    elif redmesh_job_start_attestation is None:
+    except Exception as exc:
+      import traceback
+      owner.P(
+        f"[ATTESTATION] Failed to submit required job-start attestation for job {job_id}: {exc}\n"
+        f"  Type: {type(exc).__name__}\n"
+        f"  Args: {exc.args}\n"
+        f"  Traceback:\n{traceback.format_exc()}",
+        color='r'
+      )
       emit_attestation_status_event(
         owner,
         job_specs,
-        state="skipped",
+        state="failed",
         network=owner.REDMESH_ATTESTATION_NETWORK,
         pass_nr=1,
       )
-  except Exception as exc:
-    import traceback
-    owner.P(
-      f"[ATTESTATION] Failed to submit job-start attestation for job {job_id}: {exc}\n"
-      f"  Type: {type(exc).__name__}\n"
-      f"  Args: {exc.args}\n"
-      f"  Traceback:\n{traceback.format_exc()}",
-      color='r'
-    )
-    emit_attestation_status_event(
-      owner,
-      job_specs,
-      state="failed",
-      network=owner.REDMESH_ATTESTATION_NETWORK,
-      pass_nr=1,
-    )
+      return {
+        "error": "attestation_failed",
+        "message": "Required job-start blockchain attestation failed",
+      }
 
   write_job_record = getattr(type(owner), "_write_job_record", None)
   if callable(write_job_record):
@@ -1014,6 +1184,8 @@ def launch_network_scan(
   engagement=None,
   roe=None,
   authorization=None,
+  unsafe_launch_confirmations=None,
+  blockchain_attestation_enabled=False,
 ):
   """Launch a network scan using network-specific validation and worker slicing."""
   if not target:
@@ -1024,6 +1196,10 @@ def launch_network_scan(
   if start_port > end_port:
     return validation_error("start_port must be less than end_port")
 
+  confirmation_ids, confirmation_error = _parse_confirmation_ids(unsafe_launch_confirmations)
+  if confirmation_error:
+    return confirmation_error
+
   options = normalize_common_launch_options(
     owner,
     distribution_strategy=distribution_strategy,
@@ -1033,7 +1209,25 @@ def launch_network_scan(
     scan_min_delay=scan_min_delay,
     scan_max_delay=scan_max_delay,
     nr_local_workers=nr_local_workers,
+    unsafe_confirmation_ids=confirmation_ids,
   )
+  if "error" in options:
+    return options
+  required_confirmation_ids = required_unsafe_confirmation_ids(
+    scan_type=ScanType.NETWORK.value,
+    options=options,
+    redact_credentials=redact_credentials,
+    ics_safe_mode=ics_safe_mode,
+    verify_tls=True,
+    allow_stateful_probes=False,
+  )
+  confirmation_error = _validate_unsafe_confirmations(
+    required_ids=required_confirmation_ids,
+    provided_ids=confirmation_ids,
+  )
+  if confirmation_error:
+    return confirmation_error
+
   active_peers, peer_error = resolve_active_peers(owner, selected_peers)
   if peer_error:
     return peer_error
@@ -1125,6 +1319,7 @@ def launch_network_scan(
     engagement=typed_context["engagement"],
     roe=typed_context["roe"],
     authorization=typed_context["authorization"],
+    blockchain_attestation_enabled=blockchain_attestation_enabled,
   )
 
 
@@ -1185,6 +1380,8 @@ def launch_webapp_scan(
   graybox_assignment_strategy=GRAYBOX_ASSIGNMENT_SLICE,
   allow_mirror_stateful=False,
   allow_mirror_per_worker_budget=False,
+  unsafe_launch_confirmations=None,
+  blockchain_attestation_enabled=False,
 ):
   """Launch a graybox webapp scan using webapp-specific validation and mirrored worker assignment.
 
@@ -1220,20 +1417,25 @@ def launch_webapp_scan(
   if config_error:
     return config_error
 
-  # Form auth still requires username+password; Bearer / API-key targets
-  # set auth_type via target_config.api_security.auth and supply the
-  # secret as a top-level param instead.
+  confirmation_ids, confirmation_error = _parse_confirmation_ids(unsafe_launch_confirmations)
+  if confirmation_error:
+    return confirmation_error
+
+  # Regular user credentials are mandatory for the selected application
+  # auth mode. Admin/privileged credentials are optional comparison context.
   auth_desc = typed_target_config.api_security.auth
   auth_type = auth_desc.auth_type
   if auth_type == "form":
-    if not official_username or not official_password:
-      return validation_error("official credentials required for webapp scan")
+    if not regular_username or not regular_password:
+      return validation_error("regular credentials required for webapp form auth")
+    if bool(official_username) != bool(official_password):
+      return validation_error("official_username and official_password must be supplied together")
   elif auth_type == "bearer":
-    if not bearer_token:
-      return validation_error("bearer_token required when auth_type='bearer'")
+    if not regular_bearer_token:
+      return validation_error("regular_bearer_token required when auth_type='bearer'")
   elif auth_type == "api_key":
-    if not api_key:
-      return validation_error("api_key required when auth_type='api_key'")
+    if not regular_api_key:
+      return validation_error("regular_api_key required when auth_type='api_key'")
   else:
     return validation_error(f"unknown auth_type: {auth_type!r}")
   auth_validation_error = _validate_api_auth_descriptor(auth_desc)
@@ -1300,7 +1502,27 @@ def launch_webapp_scan(
     scan_min_delay=scan_min_delay,
     scan_max_delay=scan_max_delay,
     nr_local_workers=1,
+    unsafe_confirmation_ids=confirmation_ids,
   )
+  if "error" in options:
+    return options
+  required_confirmation_ids = required_unsafe_confirmation_ids(
+    scan_type=ScanType.WEBAPP.value,
+    options=options,
+    redact_credentials=redact_credentials,
+    ics_safe_mode=ics_safe_mode,
+    verify_tls=verify_tls,
+    allow_stateful_probes=allow_stateful_probes,
+    allow_mirror_stateful=allow_mirror_stateful,
+    auth_desc=auth_desc,
+  )
+  confirmation_error = _validate_unsafe_confirmations(
+    required_ids=required_confirmation_ids,
+    provided_ids=confirmation_ids,
+  )
+  if confirmation_error:
+    return confirmation_error
+
   active_peers, peer_error = resolve_active_peers(owner, selected_peers)
   if peer_error:
     return peer_error
@@ -1409,6 +1631,7 @@ def launch_webapp_scan(
     gateway_bearer_token=gateway_bearer_token,
     gateway_bearer_refresh_token=gateway_bearer_refresh_token,
     target_config_secrets=target_config_secrets,
+    blockchain_attestation_enabled=blockchain_attestation_enabled,
   )
 
 
@@ -1471,6 +1694,8 @@ def launch_test(
   engagement=None,
   roe=None,
   authorization=None,
+  unsafe_launch_confirmations=None,
+  blockchain_attestation_enabled=False,
 ):
   """Compatibility shim that routes to scan-type-specific launch endpoints."""
   try:
@@ -1528,6 +1753,8 @@ def launch_test(
       engagement=engagement,
       roe=roe,
       authorization=authorization,
+      unsafe_launch_confirmations=unsafe_launch_confirmations,
+      blockchain_attestation_enabled=blockchain_attestation_enabled,
     )
 
   return owner.launch_network_scan(
@@ -1561,4 +1788,6 @@ def launch_test(
     engagement=engagement,
     roe=roe,
     authorization=authorization,
+    unsafe_launch_confirmations=unsafe_launch_confirmations,
+    blockchain_attestation_enabled=blockchain_attestation_enabled,
   )

@@ -74,6 +74,7 @@ import subprocess
 from enum import Enum
 from dataclasses import dataclass
 from typing import Optional
+from copy import deepcopy
 
 from docker.types import DeviceRequest
 
@@ -104,6 +105,39 @@ _CONTAINER_LOGS_FILE = "container_logs.pkl"
 # Pre-refactor persistent-state / logs subfolder relative to the data folder.
 # Kept here only so we can migrate content once; do not use for new writes.
 _LEGACY_CONTAINER_APPS_SUBFOLDER = "container_apps"
+_PER_NODE_CONFIG_KEYS = ("PER_NODE_CONFIG",)
+_PER_NODE_CONFIG_STRUCTURED_KEYS = {
+  "default",
+  "DEFAULT",
+  "byIndex",
+  "BY_INDEX",
+  "byNode",
+  "BY_NODE",
+}
+_PER_NODE_CONFIG_SYSTEM_KEYS = {
+  "INSTANCE_ID",
+  "CHAINSTORE_PEERS",
+  "CHAINSTORE_RESPONSE_KEY",
+  "CONTAINER_RESOURCES",
+  "CONTAINER_USER",
+  "CLOUDFLARE_TOKEN",
+  "CR",
+  "CR_DATA",
+  "ENV_OVERRIDES",
+  "FIXED_SIZE_VOLUMES",
+  "IMAGE",
+  "NGROK_AUTH_TOKEN",
+  "PER_NODE_TARGET_NODES",
+  "PLUGIN_NAME",
+  "PLUGIN_SIGNATURE",
+  "RESET",
+  "SIGNATURE",
+  "SEMAPHORE",
+  "SEMAPHORED_KEYS",
+  "SYNC",
+  "TUNNEL_ENGINE",
+  "TUNNEL_ENGINE_ENABLED",
+}
 
 
 class ContainerState(Enum):
@@ -283,6 +317,8 @@ _CONFIG = {
   },
   "ENV": {},                # dict of env vars for the container
   "DYNAMIC_ENV": {},        # backend dynamic env definition; Deeploy may compile DYNAMIC_ENV_UI into this
+  "PER_NODE_CONFIG": {},    # Deeploy per-node overlays; materialized locally by node address/index
+  "PER_NODE_TARGET_NODES": [], # Full Deeploy target order used for PER_NODE_CONFIG.byIndex
   "ENV_OVERRIDES": {
     "ENABLED": True,        # app-local request.json patches under /r1en_system/env-overrides
   },
@@ -1093,6 +1129,7 @@ class ContainerAppRunnerPlugin(
     ValueError
         If configuration is invalid
     """
+    self._apply_per_node_config()
     image = getattr(self, 'cfg_image', None)
     if not image or not isinstance(image, str) or not image.strip():
       raise ValueError("IMAGE is required and must be a non-empty string")
@@ -1172,6 +1209,190 @@ class ContainerAppRunnerPlugin(
     """
     return
 
+  def _deep_merge_per_node_config(self, base, overlay):
+    if isinstance(base, dict) and isinstance(overlay, dict):
+      merged = deepcopy(base)
+      for key, value in overlay.items():
+        if key == "SEMAPHORED_KEYS" and isinstance(merged.get(key), list) and isinstance(value, list):
+          merged[key] = sorted(set(merged[key]) | set(value))
+        elif key in merged:
+          merged[key] = self._deep_merge_per_node_config(merged[key], value)
+        else:
+          merged[key] = deepcopy(value)
+      return merged
+    return deepcopy(overlay)
+
+
+  def _normalize_per_node_config(self, raw_config):
+    if raw_config is None:
+      return {}, {}, {}
+    if not isinstance(raw_config, dict):
+      raise ValueError("PER_NODE_CONFIG must be a dictionary.")
+
+    has_structured_keys = any(
+      key in raw_config
+      for key in _PER_NODE_CONFIG_STRUCTURED_KEYS
+    )
+    if has_structured_keys:
+      extra_keys = [key for key in raw_config if key not in _PER_NODE_CONFIG_STRUCTURED_KEYS]
+      if extra_keys:
+        raise ValueError(
+          f"PER_NODE_CONFIG cannot mix structured keys with direct node selectors: {extra_keys}."
+        )
+      default_overlay = self._get_per_node_structured_section(
+        raw_config, "default", ("default", "DEFAULT")
+      )
+      by_index = self._get_per_node_structured_section(
+        raw_config, "byIndex", ("byIndex", "BY_INDEX")
+      )
+      by_node = self._get_per_node_structured_section(
+        raw_config, "byNode", ("byNode", "BY_NODE")
+      )
+    else:
+      default_overlay = {}
+      by_index = {}
+      by_node = raw_config
+
+    if not isinstance(default_overlay, dict):
+      raise ValueError("PER_NODE_CONFIG.default must be a dictionary.")
+    if not isinstance(by_index, dict):
+      raise ValueError("PER_NODE_CONFIG.byIndex must be a dictionary.")
+    if not isinstance(by_node, dict):
+      raise ValueError("PER_NODE_CONFIG.byNode must be a dictionary.")
+
+    normalized_by_index = {}
+    for raw_index, overlay in by_index.items():
+      if not isinstance(overlay, dict):
+        raise ValueError(f"PER_NODE_CONFIG.byIndex[{raw_index!r}] must be a dictionary.")
+      try:
+        index = int(raw_index)
+      except (TypeError, ValueError) as exc:
+        raise ValueError(f"PER_NODE_CONFIG.byIndex key {raw_index!r} must be an integer index.") from exc
+      if index < 0:
+        raise ValueError(f"PER_NODE_CONFIG.byIndex key {raw_index!r} must be non-negative.")
+      normalized_by_index[index] = overlay
+
+    normalized_by_node = {}
+    for raw_node, overlay in by_node.items():
+      if not isinstance(overlay, dict):
+        raise ValueError(f"PER_NODE_CONFIG.byNode[{raw_node!r}] must be a dictionary.")
+      normalized_by_node[str(raw_node)] = overlay
+
+    for overlay in [default_overlay, *normalized_by_index.values(), *normalized_by_node.values()]:
+      self._validate_per_node_overlay(overlay)
+
+    return default_overlay, normalized_by_index, normalized_by_node
+
+
+  def _get_per_node_structured_section(self, raw_config, section_name, aliases):
+    present_aliases = [key for key in aliases if key in raw_config]
+    if len(present_aliases) > 1:
+      raise ValueError(
+        f"PER_NODE_CONFIG.{section_name} has duplicate aliases: {present_aliases}."
+      )
+    if not present_aliases:
+      return {}
+    value = raw_config[present_aliases[0]]
+    if value is None:
+      return {}
+    if not isinstance(value, dict):
+      raise ValueError(f"PER_NODE_CONFIG.{section_name} must be a dictionary.")
+    return value
+
+
+  def _validate_per_node_overlay(self, overlay):
+    for key in overlay:
+      normalized_key = str(key).upper()
+      if key in _PER_NODE_CONFIG_KEYS:
+        raise ValueError("Nested PER_NODE_CONFIG overlays are not supported.")
+      if normalized_key in _PER_NODE_CONFIG_SYSTEM_KEYS:
+        raise ValueError(
+          f"PER_NODE_CONFIG cannot override system-managed or preflighted key '{key}'."
+        )
+    return True
+
+
+  def _per_node_lookup_keys(self, node_addr):
+    values = []
+    if node_addr is not None:
+      values.append(str(node_addr))
+      if str(node_addr).startswith("0xai_"):
+        values.append(str(node_addr)[5:])
+      else:
+        values.append(f"0xai_{node_addr}")
+
+    result = []
+    seen = set()
+    for value in values:
+      if value and value not in seen:
+        result.append(value)
+        seen.add(value)
+    return result
+
+
+  def _per_node_target_index(self, target_nodes):
+    node_addr = getattr(self, "ee_addr", None)
+    if not isinstance(target_nodes, list):
+      target_nodes = []
+    for lookup_key in self._per_node_lookup_keys(node_addr):
+      if lookup_key in target_nodes:
+        return target_nodes.index(lookup_key)
+    return None
+
+
+  def _apply_per_node_config(self):
+    config_data = getattr(self, "config_data", None)
+    if not isinstance(config_data, dict):
+      return False
+
+    raw_config = None
+    present_keys = []
+    for key in _PER_NODE_CONFIG_KEYS:
+      if key in config_data and config_data[key] is not None:
+        present_keys.append(key)
+    if len(present_keys) > 1:
+      raise ValueError(
+        f"Only one PER_NODE_CONFIG spelling can be non-empty: {present_keys}."
+      )
+    if present_keys:
+      raw_config = config_data[present_keys[0]]
+    if raw_config is None:
+      return False
+
+    target_nodes = (
+      config_data.get("PER_NODE_TARGET_NODES")
+      or getattr(self, "cfg_per_node_target_nodes", [])
+      or config_data.get("CHAINSTORE_PEERS")
+      or getattr(self, "cfg_chainstore_peers", [])
+      or []
+    )
+    node_index = self._per_node_target_index(target_nodes)
+    default_overlay, by_index, by_node = self._normalize_per_node_config(raw_config)
+    config_data.pop("PER_NODE_CONFIG", None)
+    overlay = deepcopy(default_overlay)
+    if node_index is not None and node_index in by_index:
+      overlay = self._deep_merge_per_node_config(overlay, by_index[node_index])
+    for lookup_key in self._per_node_lookup_keys(getattr(self, "ee_addr", None)):
+      if lookup_key in by_node:
+        overlay = self._deep_merge_per_node_config(overlay, by_node[lookup_key])
+        break
+
+    if not overlay:
+      return False
+
+    for key, value in overlay.items():
+      config_data[key] = self._deep_merge_per_node_config(config_data.get(key), value)
+      try:
+        setattr(self, f"cfg_{str(key).lower()}", config_data[key])
+      except AttributeError:
+        # Runtime cfg_* accessors may be read-only properties backed by config_data.
+        pass
+    self.Pd(
+      f"Applied PER_NODE_CONFIG overlay for node={getattr(self, 'ee_addr', None)} index={node_index}",
+      score=1,
+    )
+    return True
+
 
   def on_init(self):
     """
@@ -1198,6 +1419,7 @@ class ContainerAppRunnerPlugin(
     self.__reset_vars()
 
     super(ContainerAppRunnerPlugin, self).on_init()
+    self._apply_per_node_config()
 
     # Defer chainstore response until container is healthy
     self.set_plugin_ready(False)
@@ -3561,6 +3783,7 @@ class ContainerAppRunnerPlugin(
         return False
 
     self.__reset_vars()
+    self._apply_per_node_config()
 
     # Reset chainstore response for restart cycle
     self.reset_chainstore_response()

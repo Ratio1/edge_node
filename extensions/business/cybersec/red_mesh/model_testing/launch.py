@@ -284,6 +284,7 @@ def launch_model_test(
   evaluator_model_secret_payload=None,
   limits=None,
   raw_evidence=None,
+  blockchain_attestation_enabled: bool = False,
 ):
   """Validate Model Testing launch input and fail closed until execution lands."""
   cfg = get_model_testing_config(owner)
@@ -371,6 +372,9 @@ def launch_model_test(
     },
     "selected_peers": node_selection["requested_peer_ids"],
     "model_test_node_selection": node_selection,
+    "blockchain_attestation_enabled": bool(blockchain_attestation_enabled),
+    "start_attestation_required": bool(blockchain_attestation_enabled),
+    "end_attestation_required": bool(blockchain_attestation_enabled),
   }
 
   persisted_config, secret_ref = attach_model_test_provider_secret(
@@ -433,7 +437,32 @@ def launch_model_test(
     job_type=MODEL_TEST_JOB_TYPE,
     model_test_summary={"overall_status": "queued"},
     model_test_node_selection=node_selection,
+    blockchain_attestation_enabled=bool(blockchain_attestation_enabled),
+    start_attestation_required=bool(blockchain_attestation_enabled),
+    end_attestation_required=bool(blockchain_attestation_enabled),
   ).to_dict()
+  if blockchain_attestation_enabled:
+    submit_start_attestation = getattr(owner, "_submit_redmesh_job_start_attestation", None)
+    try:
+      redmesh_job_start_attestation = (
+        submit_start_attestation(job_id, job_specs, workers)
+        if callable(submit_start_attestation)
+        else None
+      )
+    except Exception as exc:
+      return {
+        "error": "attestation_failed",
+        "message": f"Blockchain attestation is required but the model-test start attestation failed: {exc}",
+      }
+    if not (
+      isinstance(redmesh_job_start_attestation, dict)
+      and redmesh_job_start_attestation.get("tx_hash")
+    ):
+      return {
+        "error": "attestation_failed",
+        "message": "Blockchain attestation is required but the model-test start attestation failed.",
+      }
+    job_specs["redmesh_job_start_attestation"] = redmesh_job_start_attestation
   _emit_timeline(
     owner,
     job_specs,

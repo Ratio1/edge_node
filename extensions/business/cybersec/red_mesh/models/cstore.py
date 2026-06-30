@@ -140,6 +140,11 @@ class CStoreJobRunning:
   opencti_export: dict = None
   taxii_export: dict = None
   graybox_assignment_summary: dict = None
+  blockchain_attestation_enabled: bool = False
+  start_attestation_required: bool = False
+  end_attestation_required: bool = False
+  failure_class: str = ""
+  failure_message: str = ""
   job_type: str = None
   model_test_summary: dict = None
   model_test_node_selection: dict = None
@@ -178,6 +183,11 @@ class CStoreJobRunning:
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
       graybox_assignment_summary=d.get("graybox_assignment_summary"),
+      blockchain_attestation_enabled=d.get("blockchain_attestation_enabled", False),
+      start_attestation_required=d.get("start_attestation_required", False),
+      end_attestation_required=d.get("end_attestation_required", False),
+      failure_class=d.get("failure_class", ""),
+      failure_message=d.get("failure_message", ""),
       job_type=d.get("job_type"),
       model_test_summary=d.get("model_test_summary"),
       model_test_node_selection=d.get("model_test_node_selection"),
@@ -218,6 +228,11 @@ class CStoreJobFinalized:
   opencti_export: dict = None
   taxii_export: dict = None
   graybox_assignment_summary: dict = None
+  blockchain_attestation_enabled: bool = False
+  start_attestation_required: bool = False
+  end_attestation_required: bool = False
+  failure_class: str = ""
+  failure_message: str = ""
   job_type: str = None
   model_test_summary: dict = None
   model_test_node_selection: dict = None
@@ -254,6 +269,11 @@ class CStoreJobFinalized:
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
       graybox_assignment_summary=d.get("graybox_assignment_summary"),
+      blockchain_attestation_enabled=d.get("blockchain_attestation_enabled", False),
+      start_attestation_required=d.get("start_attestation_required", False),
+      end_attestation_required=d.get("end_attestation_required", False),
+      failure_class=d.get("failure_class", ""),
+      failure_message=d.get("failure_message", ""),
       job_type=d.get("job_type"),
       model_test_summary=d.get("model_test_summary"),
       model_test_node_selection=d.get("model_test_node_selection"),

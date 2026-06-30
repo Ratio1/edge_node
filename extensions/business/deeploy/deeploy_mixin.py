@@ -1,6 +1,9 @@
+import copy
 import json
+import ipaddress
 import re
 from datetime import datetime, timezone
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 from math import isfinite
 
@@ -12,12 +15,18 @@ from ratio1.bc.base import compact_canonical_sha256
 from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KEYS, \
   DEEPLOY_STATUS, DEEPLOY_PLUGIN_DATA, DEEPLOY_FORBIDDEN_SIGNATURES, CONTAINER_APP_RUNNER_SIGNATURE, \
   DEEPLOY_RESOURCES, JOB_TYPE_RESOURCE_SPECS, WORKER_APP_RUNNER_SIGNATURE, JOB_APP_TYPES, JOB_APP_TYPES_ALL, \
-  CONTAINERIZED_APPS_SIGNATURES, DEEPLOY_PLUS_PREFERRED_NODES_HKEY
+  CONTAINERIZED_APPS_SIGNATURES, DEEPLOY_PLUS_PREFERRED_NODES_HKEY, DEEPLOY_RUNTIME_KEYS, \
+  DEEPLOY_DYNAMIC_ENV_KEYS, DEEPLOY_DYNAMIC_ENV_TYPES
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
 
 DEEPLOY_DEBUG = True
 STACK_CPU_QUANTUM = Decimal("0.01")
+DEEPLOY_BACKEND_DYNAMIC_ENV_TYPES = (
+  DEEPLOY_DYNAMIC_ENV_TYPES.STATIC,
+  DEEPLOY_DYNAMIC_ENV_TYPES.HOST_IP,
+  DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+)
 
 MESSAGE_PREFIX = "Please sign this message for Deeploy: "
 DEEPLOY_WRAPPER_HEADER = "Please sign this Deeploy request:"
@@ -38,6 +47,93 @@ PREFERRED_NODES_MAX_COUNT = 100
 PREFERRED_NODES_MAX_PAYLOAD_BYTES = 32 * 1024
 PREFERRED_NODE_ALIAS_MAX_LENGTH = 128
 PREFERRED_NODE_DESCRIPTION_MAX_LENGTH = 512
+PER_NODE_CONFIG_KEYS = ("perNodeConfig", "PER_NODE_CONFIG")
+PER_NODE_CONFIG_SYSTEM_KEYS = {
+  "INSTANCE_ID",
+  "CHAINSTORE_PEERS",
+  "CHAINSTORE_RESPONSE_KEY",
+  "CONTAINER_RESOURCES",
+  "CONTAINER_USER",
+  "CLOUDFLARE_TOKEN",
+  "CR",
+  "CR_DATA",
+  "ENV_OVERRIDES",
+  "FIXED_SIZE_VOLUMES",
+  "IMAGE",
+  "NGROK_AUTH_TOKEN",
+  "PER_NODE_TARGET_NODES",
+  "PLUGIN_NAME",
+  "PLUGIN_SIGNATURE",
+  "RESET",
+  "SIGNATURE",
+  "SEMAPHORE",
+  "SEMAPHORED_KEYS",
+  "SYNC",
+  "TUNNEL_ENGINE",
+  "TUNNEL_ENGINE_ENABLED",
+}
+PER_NODE_CONFIG_STRUCTURED_KEYS = {
+  "default",
+  "DEFAULT",
+  "byIndex",
+  "BY_INDEX",
+  "byNode",
+  "BY_NODE",
+}
+SENSITIVE_LOG_KEY_PARTS = (
+  "BEGINPRIVATEKEY",
+  "BEGINRSAPRIVATEKEY",
+  "BEGINOPENSSHPRIVATEKEY",
+  "CERTIFICATE",
+  "CA_CRT",
+  "CA_KEY",
+  "NODE_CRT",
+  "NODE_KEY",
+  "CLIENT_CRT",
+  "CLIENT_KEY",
+  "CRDB_CA_CRT",
+  "CRDB_NODE_CRT",
+  "CRDB_NODE_KEY",
+  "CRDB_CLIENT_ROOT_CRT",
+  "CRDB_CLIENT_ROOT_KEY",
+  "CRDBCACRT",
+  "CRDBNODECRT",
+  "CRDBNODEKEY",
+  "CRDBCLIENTROOTCRT",
+  "CRDBCLIENTROOTKEY",
+  "TOKEN",
+  "PASSWORD",
+  "PASS",
+  "PWD",
+  "SECRET",
+  "PRIVATE_KEY",
+  "PRIVATEKEY",
+  "API_KEY",
+  "APIKEY",
+  "ACCESS_KEY",
+  "ACCESSKEY",
+)
+PUBLIC_REDACTION_MARKERS = ("***", "[redacted]")
+COCKROACHDB_IMAGE_MARKER = "deeploy-cockroachdb-service"
+COCKROACHDB_CERT_ENV_KEYS = (
+  "CRDB_CA_CRT",
+  "CRDB_NODE_CRT",
+  "CRDB_NODE_KEY",
+)
+COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS = (
+  "CRDB_CLIENT_ROOT_CRT",
+  "CRDB_CLIENT_ROOT_KEY",
+)
+COCKROACHDB_INHERITABLE_PER_NODE_ENV_KEYS = (
+  "CF_TUNNEL_TOKEN",
+  *COCKROACHDB_CERT_ENV_KEYS,
+  *COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS,
+)
+COCKROACHDB_REQUIRED_AUTH_ENV_KEYS = (
+  "CRDB_DATABASE",
+  "CRDB_USER",
+  "CRDB_PASSWORD",
+)
 
 class _DeeployMixin:
   def __init__(self):
@@ -692,10 +788,24 @@ class _DeeployMixin:
       raise ValueError("Sender {} is not an oracle".format(sender))
     return True
 
-  def __create_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, job_app_type=None, dct_deeploy_specs=None):
+  def _prepare_create_pipeline_deploy_plan(
+    self,
+    nodes,
+    inputs,
+    app_id,
+    job_app_type=None,
+    dct_deeploy_specs=None,
+  ):
     """
-    Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
+    Build the exact create payload that will be sent to target nodes.
+
+    The returned plan is safe to validate and then reuse for dispatch. This is
+    critical for update redeploys because response keys are generated here and
+    must not be regenerated after the live app has been deleted.
     """
+    nodes = list(nodes or [])
+    enable_chainstore_response = bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False))
+    self._prepare_cockroachdb_secure_config(inputs, nodes)
     plugins = self.deeploy_prepare_plugins(inputs, app_id=app_id)
     self._validate_dependency_tree(inputs)
     plugins = self._ensure_runner_cstore_auth_env(
@@ -715,6 +825,7 @@ class _DeeployMixin:
       reserved_keys={"app_alias", "owner", "is_deeployed", "deeploy_specs"},
     )
     ts = self.time()
+    original_deeploy_specs = self.deepcopy(dct_deeploy_specs) if isinstance(dct_deeploy_specs, dict) else None
     if dct_deeploy_specs:
       dct_deeploy_specs = self.deepcopy(dct_deeploy_specs)
       dct_deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = ts
@@ -737,8 +848,6 @@ class _DeeployMixin:
       dct_deeploy_specs[DEEPLOY_KEYS.PROJECT_ID] = project_id
     if project_name is not None or DEEPLOY_KEYS.PROJECT_NAME not in dct_deeploy_specs:
       dct_deeploy_specs[DEEPLOY_KEYS.PROJECT_NAME] = project_name
-    dct_deeploy_specs[DEEPLOY_KEYS.NR_TARGET_NODES] = len(nodes)
-    dct_deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = nodes
     dct_deeploy_specs[DEEPLOY_KEYS.JOB_TAGS] = job_tags
     dct_deeploy_specs[DEEPLOY_KEYS.SPARE_NODES] = spare_nodes
     dct_deeploy_specs[DEEPLOY_KEYS.ALLOW_REPLICATION_IN_THE_WILD] = allow_replication_in_the_wild
@@ -751,17 +860,33 @@ class _DeeployMixin:
     if detected_job_app_type in JOB_APP_TYPES_ALL:
       dct_deeploy_specs[DEEPLOY_KEYS.JOB_APP_TYPE] = detected_job_app_type
 
-    plugins = self._autowire_native_container_semaphore(
-      app_id=app_id,
-      plugins=plugins,
-      job_app_type=detected_job_app_type,
-    )
-
+    per_node_order_nodes = self._ordered_nodes_for_per_node_config(nodes, original_deeploy_specs)
+    dct_deeploy_specs[DEEPLOY_KEYS.NR_TARGET_NODES] = len(per_node_order_nodes)
+    dct_deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = self.deepcopy(per_node_order_nodes)
+    self._validate_per_node_config_selectors(plugins, per_node_order_nodes)
     node_plugins_by_addr = {}
-    for addr in nodes:
+    for fallback_index, addr in enumerate(nodes):
+      try:
+        node_index = per_node_order_nodes.index(addr)
+      except ValueError:
+        node_index = fallback_index
       # Nodes to peer with for CHAINSTORE
       nodes_to_peer = nodes
       node_plugins = self.deepcopy(plugins)
+      if self._has_shmem_dynamic_env(node_plugins):
+        node_plugins = self._resolve_shmem_in_plugins(node_plugins, app_id)
+      node_plugins = self._autowire_native_container_semaphore(
+        app_id=app_id,
+        plugins=node_plugins,
+        job_app_type=detected_job_app_type,
+      )
+      self._validate_final_emitted_semaphore_keys(node_plugins)
+      validation_plugins = self._materialize_plugins_for_node(
+        plugins=node_plugins,
+        node_addr=addr,
+        node_index=node_index,
+      )
+      self._validate_materialized_plugins_for_node(validation_plugins, node_addr=addr)
       
       # Configure chainstore peers and response keys
       for plugin in node_plugins:
@@ -769,13 +894,18 @@ class _DeeployMixin:
           # Configure peers if there are any
           if len(nodes_to_peer) > 0:
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
+            plugin_instance["PER_NODE_TARGET_NODES"] = self.deepcopy(per_node_order_nodes)
           # endif
           
           # Configure response keys if needed
-          if inputs.chainstore_response:
-            response_key = self._generate_chainstore_response_key(plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID])
+          if enable_chainstore_response:
+            response_key = self._generate_chainstore_response_key(
+              plugin_instance[self.ct.CONFIG_INSTANCE.K_INSTANCE_ID]
+            )
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
             response_keys[addr].append(response_key)
+          else:
+            plugin_instance.pop(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, None)
           # endif
         # endfor each plugin instance
       # endfor each plugin
@@ -783,23 +913,69 @@ class _DeeployMixin:
       node_plugins_by_addr[addr] = node_plugins
 
     prepared_response_keys = self._normalize_chainstore_response_mapping(response_keys)
-    if inputs.chainstore_response:
+    if enable_chainstore_response:
       if prepared_response_keys:
         dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
       else:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
-    self._reset_chainstore_response_keys(
-      prepared_response_keys,
-      context=f"create pipeline '{app_alias}'",
+
+    return {
+      "enable_chainstore_response": enable_chainstore_response,
+      "response_keys": prepared_response_keys if enable_chainstore_response else {},
+      "node_plugins_by_addr": node_plugins_by_addr,
+      "deeploy_specs": dct_deeploy_specs,
+      "pipeline_kwargs": pipeline_kwargs,
+      "pipeline_params": pipeline_params,
+      "nodes": nodes,
+    }
+
+  def __create_pipeline_on_nodes(
+    self,
+    nodes,
+    inputs,
+    app_id,
+    app_alias,
+    app_type,
+    owner,
+    job_app_type=None,
+    dct_deeploy_specs=None,
+    prepared_deploy_plan=None,
+    skip_response_key_reset=False,
+  ):
+    """
+    Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
+    """
+    if prepared_deploy_plan is None:
+      prepared_deploy_plan = self._prepare_create_pipeline_deploy_plan(
+        nodes=nodes,
+        inputs=inputs,
+        app_id=app_id,
+        job_app_type=job_app_type,
+        dct_deeploy_specs=dct_deeploy_specs,
+      )
+
+    enable_chainstore_response = bool(prepared_deploy_plan.get("enable_chainstore_response"))
+    prepared_response_keys = self._normalize_chainstore_response_mapping(
+      prepared_deploy_plan.get("response_keys", {})
     )
+    dct_deeploy_specs = self.deepcopy(prepared_deploy_plan.get("deeploy_specs", {}))
+    pipeline_kwargs = self.deepcopy(prepared_deploy_plan.get("pipeline_kwargs", {}))
+    node_plugins_by_addr = prepared_deploy_plan.get("node_plugins_by_addr", {})
+
+    if enable_chainstore_response and not skip_response_key_reset:
+      self._reset_chainstore_response_keys(
+        prepared_response_keys,
+        context=f"create pipeline '{app_alias}'",
+      )
 
     saved_pipeline = None
     for addr, node_plugins in node_plugins_by_addr.items():
+      node_plugins = self.deepcopy(node_plugins)
       msg = ''
       if self.cfg_deeploy_verbose > 1:
-        msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
+        msg = f":\n {self.json_dumps(self._redact_per_node_config_for_log(node_plugins), indent=2)}"
       self.P(f"Creating pipeline '{app_alias}' on {addr}{msg}")
 
       if addr is not None:
@@ -820,13 +996,25 @@ class _DeeployMixin:
       # endif addr is valid
     # endfor each target node
 
-    cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
+    cleaned_response_keys = prepared_response_keys if enable_chainstore_response else {}
     return cleaned_response_keys, saved_pipeline
 
-  def __update_pipeline_on_nodes(self, nodes, inputs, app_id, app_alias, app_type, owner, discovered_plugin_instances, dct_deeploy_specs = None, job_app_type=None):
+  def __update_pipeline_on_nodes(
+    self,
+    nodes,
+    inputs,
+    app_id,
+    app_alias,
+    app_type,
+    owner,
+    discovered_plugin_instances,
+    dct_deeploy_specs = None,
+    job_app_type=None,
+  ):
     """
     Create new pipelines on each node and set CSTORE `response_key` for the "callback" action
     """
+    enable_chainstore_response = bool(inputs.get(DEEPLOY_KEYS.CHAINSTORE_RESPONSE, False))
 
     # for plugin_instan
     job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
@@ -871,10 +1059,13 @@ class _DeeployMixin:
       dct_deeploy_specs,
       pipeline_params=pipeline_params,
     )
+    self._inherit_cockroachdb_secure_config_from_discovered(inputs, discovered_plugin_instances)
+    self._prepare_cockroachdb_secure_config(inputs, nodes)
 
     requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
 
     nodes = []
+    matched_requested_instance_ids = set()
     plugins_by_node = self.defaultdict(list)
     for plugin in discovered_plugin_instances:
       addr = plugin.get(DEEPLOY_PLUGIN_DATA.NODE)
@@ -891,7 +1082,9 @@ class _DeeployMixin:
       plugin_config = None
 
       if instance_id:
-        plugin_config = requested_by_instance_id.pop(instance_id, None)
+        plugin_config = requested_by_instance_id.get(instance_id)
+        if plugin_config:
+          matched_requested_instance_ids.add(instance_id)
         candidate_list = requested_by_signature.get(normalized_signature, [])
         if plugin_config and candidate_list:
           # Safe to modify list during iteration here because we break immediately after pop
@@ -906,16 +1099,8 @@ class _DeeployMixin:
           candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
           if not candidate_instance_id:
             plugin_config = candidate_list.pop(idx)
+            self._remove_consumed_new_plugin_config(new_plugin_configs, plugin_config)
             break
-
-      if not plugin_config:
-        config_candidates = requested_by_signature.get(normalized_signature, [])
-        if config_candidates:
-          for idx, candidate in enumerate(config_candidates):
-            candidate_instance_id = candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
-            if candidate_instance_id:
-              plugin_config = config_candidates.pop(idx)
-              break
 
       prepared_plugin = self.deeploy_prepare_single_plugin_instance_update(
         inputs=inputs,
@@ -927,7 +1112,9 @@ class _DeeployMixin:
 
       chainstore_key = plugin.get(DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY)
       if chainstore_key:
-        prepared_plugin[DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_key
+        prepared_instances = prepared_plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+        if prepared_instances and isinstance(prepared_instances[0], dict):
+          prepared_instances[0][self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = chainstore_key
 
       plugins_by_node[addr].append(prepared_plugin)
 
@@ -940,8 +1127,13 @@ class _DeeployMixin:
       if isinstance(target_nodes, list):
         unique_nodes = list(target_nodes)
 
-    if requested_by_instance_id:
-      missing_ids = list(requested_by_instance_id.keys())
+    missing_requested_instance_ids = [
+      instance_id
+      for instance_id in requested_by_instance_id
+      if instance_id not in matched_requested_instance_ids
+    ]
+    if missing_requested_instance_ids:
+      missing_ids = missing_requested_instance_ids
       raise ValueError(
         f"{DEEPLOY_ERRORS.PLUGINS3}: Unknown plugin instance_id(s) in update request: {missing_ids}"
       )
@@ -966,17 +1158,36 @@ class _DeeployMixin:
           )
           plugins_by_node[addr].append(prepared_plugin)
 
+    unique_nodes = self._ordered_nodes_for_per_node_config(unique_nodes, dct_deeploy_specs)
+    self._validate_per_node_config_selectors(
+      [plugin for plugins in plugins_by_node.values() for plugin in plugins],
+      unique_nodes,
+    )
+
     # Resolve shmem and autowire per-node (not across all nodes),
     # because multi-node jobs have the same logical plugin_names on each
     # node, which would cause duplicate plugin_name errors if flattened.
     for addr, node_plugins in plugins_by_node.items():
+      self._validate_plugin_runtime_keys(node_plugins)
+      try:
+        node_index = unique_nodes.index(addr)
+      except ValueError:
+        node_index = 0
       if self._has_shmem_dynamic_env(node_plugins):
         node_plugins = self._resolve_shmem_in_plugins(node_plugins, app_id)
-      plugins_by_node[addr] = self._autowire_native_container_semaphore(
+      node_plugins = self._autowire_native_container_semaphore(
         app_id=app_id,
         plugins=node_plugins,
         job_app_type=detected_job_app_type,
       )
+      self._validate_final_emitted_semaphore_keys(node_plugins)
+      validation_plugins = self._materialize_plugins_for_node(
+        plugins=node_plugins,
+        node_addr=addr,
+        node_index=node_index,
+      )
+      self._validate_materialized_plugins_for_node(validation_plugins, node_addr=addr)
+      plugins_by_node[addr] = node_plugins
 
     pipeline_to_save = None
     node_plugins_ready = {}
@@ -990,10 +1201,11 @@ class _DeeployMixin:
           # Configure peers if there are any
           if len(nodes_to_peer) > 0:
             plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = nodes_to_peer
+            plugin_instance["PER_NODE_TARGET_NODES"] = self.deepcopy(unique_nodes)
           # endif
 
           # Configure response keys if needed
-          if inputs.chainstore_response:
+          if enable_chainstore_response:
             instance_id = plugin_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
             if not instance_id:
               continue
@@ -1005,28 +1217,32 @@ class _DeeployMixin:
               plugin_instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY] = response_key
             if isinstance(response_key, str) and response_key:
               response_keys[addr].append(response_key)
+          else:
+            plugin_instance.pop(self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY, None)
           # endif
         # endfor each plugin instance
       # endfor each plugin
 
       node_plugins_ready[addr] = node_plugins
     prepared_response_keys = self._normalize_chainstore_response_mapping(response_keys)
-    if inputs.chainstore_response:
+    if enable_chainstore_response:
       if prepared_response_keys:
         dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
       else:
         dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
-    self._reset_chainstore_response_keys(
-      prepared_response_keys,
-      context=f"update pipeline '{app_alias}'",
-    )
+    if enable_chainstore_response:
+      self._reset_chainstore_response_keys(
+        prepared_response_keys,
+        context=f"update pipeline '{app_alias}'",
+      )
+    cleaned_response_keys = prepared_response_keys if enable_chainstore_response else {}
 
     for addr, node_plugins in node_plugins_ready.items():
       msg = ''
       if self.cfg_deeploy_verbose > 1:
-        msg = f":\n {self.json_dumps(node_plugins, indent=2)}"
+        msg = f":\n {self.json_dumps(self._redact_per_node_config_for_log(node_plugins), indent=2)}"
       self.P(f"Creating pipeline '{app_alias}' on {addr}{msg}")
 
       if addr is not None:
@@ -1044,12 +1260,12 @@ class _DeeployMixin:
           **pipeline_kwargs,
         )
 
-        self.Pd(f"Pipeline started: {self.json_dumps(pipeline)}")
+        self.Pd(f"Pipeline started: {self.json_dumps(self._redact_per_node_config_for_log(pipeline))}")
         pipeline[DEEPLOY_KEYS.PIPELINE_PARAMS] = self.deepcopy(pipeline_params)
         pipeline_to_save = pipeline
       # endif addr is valid
     # endfor each target node
-    if inputs.chainstore_response:
+    if enable_chainstore_response:
       if prepared_response_keys:
         dct_deeploy_specs[DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS] = self.deepcopy(prepared_response_keys)
       else:
@@ -1057,7 +1273,7 @@ class _DeeployMixin:
     else:
       dct_deeploy_specs.pop(DEEPLOY_KEYS.CHAINSTORE_RESPONSE_KEYS, None)
 
-    cleaned_response_keys = prepared_response_keys if inputs.chainstore_response else {}
+    cleaned_response_keys = prepared_response_keys if enable_chainstore_response else {}
     return cleaned_response_keys, pipeline_to_save
 
   def _prepare_updated_deeploy_specs(self, owner, app_id, job_id, discovered_plugin_instances):
@@ -1223,7 +1439,7 @@ class _DeeployMixin:
         timeout=30,
         pin=False,
         raise_on_error=False,
-        show_logs=True,
+        show_logs=False,
       )
     except Exception as exc:
       return {
@@ -1402,10 +1618,12 @@ class _DeeployMixin:
       job_id=job_id,
       discovered_plugin_instances=discovered_instances,
     )
+    durable_nodes = self._ordered_nodes_for_per_node_config(nodes, deeploy_specs)
 
     return {
       "discovered_instances": discovered_instances,
-      "nodes": nodes,
+      "nodes": durable_nodes,
+      "discovered_nodes": nodes,
       "deeploy_specs": deeploy_specs,
     }
 
@@ -1577,8 +1795,9 @@ class _DeeployMixin:
       **request
     }
 
+    redacted_inputs = self._redact_per_node_config_for_log(request_with_defaults)
     inputs = self.NestedDotDict(request_with_defaults)
-    self.Pd(f"Received request from {sender}{': ' + str(inputs) if DEEPLOY_DEBUG else '.'}")
+    self.Pd(f"Received request from {sender}{': ' + str(redacted_inputs) if DEEPLOY_DEBUG else '.'}")
 
     if BASE_CT.BCctbase.HASH in request:
       addr = self.__verify_signature_v3(request, request_type=request_type)
@@ -1721,6 +1940,30 @@ class _DeeployMixin:
     """
     # Check if already using new format (plugins array)
     if DEEPLOY_KEYS.PLUGINS in request and request[DEEPLOY_KEYS.PLUGINS]:
+      request_key, request_config = self._get_request_per_node_config(request)
+      if request_key is not None:
+        plugins_array = request[DEEPLOY_KEYS.PLUGINS]
+        if not isinstance(plugins_array, list) or len(plugins_array) != 1:
+          raise ValueError(
+            "Top-level perNodeConfig with plugins[] requires exactly one plugin instance; "
+            "put PER_NODE_CONFIG inside the target plugin for multi-plugin requests."
+          )
+        plugin_instance = plugins_array[0]
+        if not isinstance(plugin_instance, dict):
+          raise ValueError(
+            "Top-level perNodeConfig with plugins[] requires the single plugin instance to be a dictionary."
+          )
+        existing_keys = [
+          key for key in PER_NODE_CONFIG_KEYS
+          if key in plugin_instance
+        ]
+        if existing_keys:
+          raise ValueError(
+            f"Top-level perNodeConfig cannot be combined with plugin-level PER_NODE_CONFIG: {existing_keys}."
+          )
+        plugin_instance["PER_NODE_CONFIG"] = self.deepcopy(request_config)
+        for key in PER_NODE_CONFIG_KEYS:
+          request.pop(key, None)
       return request
 
     # Try to convert from legacy format
@@ -1731,18 +1974,42 @@ class _DeeployMixin:
       # Convert legacy format to simplified plugins array
       # Each object in array represents ONE plugin instance with its config
       self.Pd(f"Converting legacy plugin format to plugins array for signature: {plugin_signature}")
-      request[DEEPLOY_KEYS.PLUGINS] = [
-        {
-          DEEPLOY_KEYS.PLUGIN_SIGNATURE: plugin_signature,
-          **app_params
-        }
-      ]
+      plugin_instance = {
+        DEEPLOY_KEYS.PLUGIN_SIGNATURE: plugin_signature,
+        **app_params
+      }
+      request_key, request_config = self._get_request_per_node_config(request)
+      if request_key is not None:
+        existing_keys = [
+          key for key in PER_NODE_CONFIG_KEYS
+          if isinstance(plugin_instance, dict) and key in plugin_instance
+        ]
+        if existing_keys:
+          raise ValueError(
+            f"Top-level perNodeConfig cannot be combined with plugin-level PER_NODE_CONFIG: {existing_keys}."
+          )
+        plugin_instance["PER_NODE_CONFIG"] = self.deepcopy(request_config)
+        for key in PER_NODE_CONFIG_KEYS:
+          request.pop(key, None)
+
+      request[DEEPLOY_KEYS.PLUGINS] = [plugin_instance]
       return request
 
     # If neither format is present, raise error
     raise ValueError(
       f"{DEEPLOY_ERRORS.REQUEST3}. Neither 'plugins' array nor 'plugin_signature' provided."
     )
+
+  def _sync_normalized_plugins_input(self, inputs, normalized_request):
+    if DEEPLOY_KEYS.PLUGINS in normalized_request:
+      inputs[DEEPLOY_KEYS.PLUGINS] = normalized_request[DEEPLOY_KEYS.PLUGINS]
+    for key in PER_NODE_CONFIG_KEYS:
+      if key not in normalized_request:
+        try:
+          inputs.pop(key, None)
+        except Exception:
+          pass
+    return inputs
 
 
   def _ensure_runner_cstore_auth_env(self, app_id, prepared_plugins):
@@ -2012,6 +2279,7 @@ class _DeeployMixin:
 
       # Check signature validity (forbidden signatures, etc)
       self._check_plugin_signature(signature)
+      self._validate_dynamic_env_instance(plugin_instance)
 
       # Validate required fields for this specific plugin signature
       self._validate_plugin_instance_for_signature(signature, plugin_instance, index=idx)
@@ -2282,6 +2550,8 @@ class _DeeployMixin:
         or plugin_instance.get("instance_id")
         or plugin_instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
       )
+      if instance_id:
+        instance_id = str(instance_id)
 
       plugin_copy = self.deepcopy(plugin_instance)
       legacy_signature_value = plugin_copy.pop("signature", None)
@@ -2290,6 +2560,10 @@ class _DeeployMixin:
       plugin_copy[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = plugin_copy.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, signature)
 
       if instance_id:
+        if instance_id in plugins_by_instance_id:
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.PLUGINS3}: Duplicate plugin_instance_id '{instance_id}' in plugins array."
+          )
         plugin_copy[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
         plugins_by_instance_id[instance_id] = plugin_copy
       else:
@@ -2300,6 +2574,215 @@ class _DeeployMixin:
 
     return plugins_by_instance_id, plugins_by_signature, new_plugin_configs
   # TODO: END FIXME
+
+  @staticmethod
+  def _remove_consumed_new_plugin_config(new_plugin_configs, plugin_config):
+    for idx, candidate in enumerate(new_plugin_configs):
+      if candidate is plugin_config:
+        new_plugin_configs.pop(idx)
+        return True
+    return False
+
+  def _materialize_update_plugins_for_redeploy(self, inputs, discovered_plugin_instances):
+    """
+    Build a full plugin request array for delete/redeploy updates.
+
+    Update preflight can reconstruct omitted live plugin configs from discovery.
+    The post-delete create path only sees inputs, so partial update requests must
+    be expanded before deletion to keep the deployed replacement equivalent to
+    the validated update payload.
+    """
+    requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
+    materialized_plugins = []
+
+    instance_id_key = self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID
+    chainstore_response_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY
+    chainstore_peers_key = self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS
+    discovered_records = []
+    discovered_by_key = {}
+    config_occurrences_by_node = {}
+    nameless_record_counts = self.defaultdict(int)
+
+    def get_plugin_name_from_conf(discovered_plugin, extracted_config):
+      return (
+        extracted_config.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        or discovered_plugin.get(DEEPLOY_KEYS.PLUGIN_NAME)
+      )
+
+    def get_discovered_materialization_key(discovered_plugin, signature, instance_id, extracted_config):
+      normalized_sig = signature.upper() if isinstance(signature, str) else signature
+      if instance_id:
+        return (normalized_sig, "instance_id", str(instance_id))
+
+      plugin_name = get_plugin_name_from_conf(discovered_plugin, extracted_config)
+      if plugin_name:
+        return (normalized_sig, "plugin_name", str(plugin_name))
+
+      config_hash = compact_canonical_sha256(extracted_config)
+      node = discovered_plugin.get(DEEPLOY_PLUGIN_DATA.NODE, "")
+      occurrence_bucket = (node, normalized_sig, config_hash)
+      occurrence_idx = config_occurrences_by_node.get(occurrence_bucket, 0)
+      config_occurrences_by_node[occurrence_bucket] = occurrence_idx + 1
+      return (normalized_sig, "config", config_hash, occurrence_idx)
+
+    for plugin in discovered_plugin_instances:
+      signature = plugin.get(DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE)
+      if not signature:
+        continue
+
+      normalized_signature = signature.upper() if isinstance(signature, str) else signature
+      instance_id = plugin.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+      if instance_id:
+        instance_id = str(instance_id)
+      extracted_config = self._extract_discovered_plugin_conf(
+        plugin,
+        instance_id_key=instance_id_key,
+        chainstore_response_key=chainstore_response_key,
+        chainstore_peers_key=chainstore_peers_key,
+      )
+      plugin_name = get_plugin_name_from_conf(plugin, extracted_config)
+      config_hash = compact_canonical_sha256(extracted_config)
+      materialization_key = get_discovered_materialization_key(
+        plugin,
+        signature,
+        instance_id,
+        extracted_config,
+      )
+
+      compatibility_key = (normalized_signature, str(plugin_name or ""), config_hash)
+      existing_record = discovered_by_key.get(materialization_key)
+      if existing_record is not None:
+        if existing_record["compatibility_key"] != compatibility_key:
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.PLUGINS3}: Corrupt live discovery for plugin identity "
+            f"{materialization_key}. Incompatible plugin instances were reported."
+          )
+        continue
+
+      record = {
+        "key": materialization_key,
+        "compatibility_key": compatibility_key,
+        "signature": signature,
+        "normalized_signature": normalized_signature,
+        "instance_id": instance_id,
+        "plugin_name": str(plugin_name) if plugin_name else None,
+        "config": extracted_config,
+        "config_hash": config_hash,
+      }
+      discovered_by_key[materialization_key] = record
+      discovered_records.append(record)
+
+    for record in discovered_records:
+      if record["instance_id"] or record["plugin_name"]:
+        continue
+      nameless_match_key = (record["normalized_signature"], record["config_hash"])
+      nameless_record_counts[nameless_match_key] += 1
+
+    def candidate_has_instance_id(candidate):
+      return bool(
+        candidate.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        or candidate.get("instance_id")
+        or candidate.get(instance_id_key)
+      )
+
+    def consume_signature_candidate(record):
+      candidate_list = requested_by_signature.get(record["normalized_signature"], [])
+      if not candidate_list:
+        return None
+
+      if record["plugin_name"]:
+        candidates = [
+          candidate for candidate in candidate_list
+          if not candidate_has_instance_id(candidate)
+          and candidate.get(DEEPLOY_KEYS.PLUGIN_NAME) == record["plugin_name"]
+        ]
+        if len(candidates) > 1:
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.PLUGINS3}: Ambiguous update request for plugin_name "
+            f"'{record['plugin_name']}'."
+          )
+      else:
+        match_key = (record["normalized_signature"], record["config_hash"])
+        candidates = []
+        for candidate in candidate_list:
+          if candidate_has_instance_id(candidate) or candidate.get(DEEPLOY_KEYS.PLUGIN_NAME):
+            continue
+          requested_conf = self._extract_plugin_request_conf(
+            candidate,
+            instance_id_key=instance_id_key,
+            chainstore_response_key=chainstore_response_key,
+            chainstore_peers_key=chainstore_peers_key,
+          )
+          if self._plugin_update_request_matches_identity(
+            requested_conf,
+            discovered_plugin_name=record["plugin_name"],
+            discovered_config_hash=record["config_hash"],
+          ):
+            candidates.append(candidate)
+
+        if candidates and nameless_record_counts[match_key] > 1:
+          self._raise_ambiguous_plugin_update_match(
+            requested_name=None,
+            signature=record["signature"],
+          )
+
+      self._validate_single_plugin_update_match(
+        candidates,
+        requested_name=record["plugin_name"],
+        signature=record["signature"],
+      )
+
+      if not candidates:
+        return None
+
+      plugin_config = candidates[0]
+      for idx, candidate in enumerate(candidate_list):
+        if candidate is plugin_config:
+          candidate_list.pop(idx)
+          break
+      self._remove_consumed_new_plugin_config(new_plugin_configs, plugin_config)
+      return plugin_config
+
+    for record in discovered_records:
+      instance_id = record["instance_id"]
+      plugin_config = None
+
+      if instance_id:
+        plugin_config = requested_by_instance_id.pop(instance_id, None)
+        candidate_list = requested_by_signature.get(record["normalized_signature"], [])
+        if plugin_config and candidate_list:
+          for idx, candidate in enumerate(candidate_list):
+            if candidate is plugin_config:
+              candidate_list.pop(idx)
+              break
+      else:
+        plugin_config = consume_signature_candidate(record)
+
+      if plugin_config:
+        plugin_entry = self.deepcopy(plugin_config)
+        plugin_entry.pop("signature", None)
+      else:
+        plugin_entry = self.deepcopy(record["config"])
+
+      plugin_entry[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = record["signature"]
+      if instance_id:
+        plugin_entry[DEEPLOY_KEYS.PLUGIN_INSTANCE_ID] = instance_id
+      materialized_plugins.append(plugin_entry)
+
+    if requested_by_instance_id:
+      missing_ids = list(requested_by_instance_id.keys())
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.PLUGINS3}: Unknown plugin instance_id(s) in update request: {missing_ids}"
+      )
+
+    for plugin_config in new_plugin_configs:
+      plugin_entry = self.deepcopy(plugin_config)
+      if DEEPLOY_KEYS.PLUGIN_SIGNATURE not in plugin_entry and plugin_entry.get("signature"):
+        plugin_entry[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = plugin_entry.get("signature")
+      plugin_entry.pop("signature", None)
+      materialized_plugins.append(plugin_entry)
+
+    return materialized_plugins
 
   def deeploy_check_payment_and_job_owner(self, inputs, owner, is_create, debug=False):
     """
@@ -2328,7 +2811,11 @@ class _DeeployMixin:
     # Check if the job is paid
     self.Pd(f"  Fetching job details for job_id={job_id}...")
     job = self.bc.get_job_details(job_id=job_id)
-    self.Pd(f"Job details: {self.json_dumps(job, indent=2)}")
+    self.Pd(
+      "Job details: {}".format(
+        self.json_dumps(self._redact_per_node_config_for_log(job), indent=2)
+      )
+    )
 
     if not job:
       self.P(f"Job {job_id} not found.")
@@ -2603,8 +3090,148 @@ class _DeeployMixin:
 
     return JOB_APP_TYPES.NATIVE
 
+  def _validate_dynamic_env_shmem_path(self, path, var_name):
+    if not isinstance(path, (list, tuple)) or len(path) != 2:
+      raise ValueError(
+        "DYNAMIC_ENV shmem path for '{}' must be [provider, key].".format(var_name)
+      )
+    provider_name, target_key = path
+    if not isinstance(provider_name, str) or not provider_name.strip():
+      raise ValueError(
+        "DYNAMIC_ENV shmem path for '{}' has empty provider.".format(var_name)
+      )
+    if not isinstance(target_key, str) or not target_key.strip():
+      raise ValueError(
+        "DYNAMIC_ENV shmem path for '{}' has empty target key.".format(var_name)
+      )
+    return provider_name, target_key
+
+  @staticmethod
+  def _normalized_dynamic_env_entry_type(entry):
+    entry_type = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.TYPE)
+    if isinstance(entry_type, str):
+      return entry_type.strip()
+    return entry_type
+
+  def _canonicalize_dynamic_env_entry_type(self, entry, var_name):
+    entry_type = self._normalized_dynamic_env_entry_type(entry)
+    if not isinstance(entry_type, str) or not entry_type:
+      raise ValueError(
+        "DYNAMIC_ENV entry for '{}' must include a non-empty type.".format(var_name)
+      )
+    if entry_type not in DEEPLOY_BACKEND_DYNAMIC_ENV_TYPES:
+      raise ValueError(
+        "DYNAMIC_ENV entry for '{}' has unsupported type '{}'. "
+        "Supported backend types: {}.".format(
+          var_name,
+          entry_type,
+          ", ".join(DEEPLOY_BACKEND_DYNAMIC_ENV_TYPES),
+        )
+      )
+    entry[DEEPLOY_DYNAMIC_ENV_KEYS.TYPE] = entry_type
+    return entry_type
+
+  def _is_shmem_dynamic_env_entry(self, entry):
+    return (
+      isinstance(entry, dict)
+      and self._normalized_dynamic_env_entry_type(entry) == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM
+    )
+
+  def _validate_dynamic_env_container(self, container):
+    if not isinstance(container, dict):
+      return
+    dynamic_env = container.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
+    if dynamic_env is None:
+      return
+    if not isinstance(dynamic_env, dict):
+      raise ValueError("DYNAMIC_ENV must be a dictionary.")
+    for var_name, entries in dynamic_env.items():
+      if not isinstance(var_name, str) or not var_name.strip():
+        raise ValueError("DYNAMIC_ENV variable names must be non-empty strings.")
+      if not isinstance(entries, list):
+        raise ValueError(
+          "DYNAMIC_ENV entries for '{}' must be a list.".format(var_name)
+        )
+      for entry in entries:
+        if not isinstance(entry, dict):
+          raise ValueError(
+            "DYNAMIC_ENV entry for '{}' must be a dictionary.".format(var_name)
+          )
+        if entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.SOURCE) == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM:
+          raise ValueError(
+            "DYNAMIC_ENV entry for '{}' uses unsupported source='{}'; "
+            "backend shmem entries must use {{'{}': '{}', '{}': [provider, key]}}.".format(
+              var_name,
+              DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+              DEEPLOY_DYNAMIC_ENV_KEYS.TYPE,
+              DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM,
+              DEEPLOY_DYNAMIC_ENV_KEYS.PATH,
+            )
+          )
+        entry_type = self._canonicalize_dynamic_env_entry_type(entry, var_name)
+        if entry_type == DEEPLOY_DYNAMIC_ENV_TYPES.SHMEM:
+          self._validate_dynamic_env_shmem_path(entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH), var_name)
+
+  def _validate_dynamic_env_instance(self, instance):
+    self._validate_dynamic_env_container(instance)
+    if not isinstance(instance, dict):
+      return
+    for key in PER_NODE_CONFIG_KEYS:
+      if key not in instance:
+        continue
+      for overlay in self._iter_per_node_dynamic_env_containers(instance[key]):
+        self._validate_dynamic_env_container(overlay)
+
+  def _validate_dynamic_env_config(self, plugins):
+    for plugin in plugins:
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      if not isinstance(instances, list):
+        continue
+      for instance in instances:
+        self._validate_dynamic_env_instance(instance)
+
+  def _iter_per_node_dynamic_env_containers(self, raw_config):
+    if not isinstance(raw_config, dict):
+      return
+
+    has_structured_keys = any(
+      key in raw_config
+      for key in PER_NODE_CONFIG_STRUCTURED_KEYS
+    )
+    if has_structured_keys:
+      for key in ("default", "DEFAULT"):
+        overlay = raw_config.get(key)
+        if isinstance(overlay, dict):
+          yield overlay
+      for section_key in ("byIndex", "BY_INDEX", "byNode", "BY_NODE"):
+        section = raw_config.get(section_key)
+        if not isinstance(section, dict):
+          continue
+        for overlay in section.values():
+          if isinstance(overlay, dict):
+            yield overlay
+      return
+
+    for overlay in raw_config.values():
+      if isinstance(overlay, dict):
+        yield overlay
+
   def _has_shmem_dynamic_env(self, plugins):
     """Check if any plugin instance has shmem-type DYNAMIC_ENV entries."""
+    def has_shmem(container):
+      if not isinstance(container, dict):
+        return False
+      dynamic_env = container.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
+      if not isinstance(dynamic_env, dict):
+        return False
+      for _key, entries in dynamic_env.items():
+        if not isinstance(entries, list):
+          continue
+        for entry in entries:
+          if self._is_shmem_dynamic_env_entry(entry):
+            return True
+      return False
+
     for plugin in plugins:
       instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
       if not isinstance(instances, list):
@@ -2612,16 +3239,978 @@ class _DeeployMixin:
       for instance in instances:
         if not isinstance(instance, dict):
           continue
-        dynamic_env = instance.get("DYNAMIC_ENV")
-        if not isinstance(dynamic_env, dict):
-          continue
-        for _key, entries in dynamic_env.items():
-          if not isinstance(entries, list):
+        if has_shmem(instance):
+          return True
+        for key in PER_NODE_CONFIG_KEYS:
+          if key not in instance:
             continue
-          for entry in entries:
-            if isinstance(entry, dict) and entry.get("type") == "shmem":
+          for overlay in self._iter_per_node_overlays(instance[key]):
+            if has_shmem(overlay):
               return True
     return False
+
+  def _pop_per_node_config(self, plugin_instance):
+    for key in PER_NODE_CONFIG_KEYS:
+      if key in plugin_instance:
+        return plugin_instance.pop(key)
+    return None
+
+  def _canonicalize_per_node_config_key(self, plugin_instance):
+    present_keys = [
+      key for key in PER_NODE_CONFIG_KEYS
+      if key in plugin_instance
+    ]
+    if len(present_keys) > 1:
+      raise ValueError(
+        f"Only one perNodeConfig spelling is allowed per plugin instance: {present_keys}."
+      )
+    if not present_keys:
+      return plugin_instance
+
+    key = present_keys[0]
+    if key != "PER_NODE_CONFIG":
+      plugin_instance["PER_NODE_CONFIG"] = plugin_instance.pop(key)
+    return plugin_instance
+
+  def _get_request_per_node_config(self, inputs):
+    found_configs = []
+    for key in PER_NODE_CONFIG_KEYS:
+      value = None
+      found = False
+      try:
+        if key in inputs:
+          value = inputs.get(key)
+          found = True
+      except Exception:
+        pass
+      if not found:
+        try:
+          value = getattr(inputs, key)
+          found = True
+        except Exception:
+          pass
+      if found and value is not None:
+        found_configs.append((key, value))
+
+    if len(found_configs) > 1:
+      raise ValueError(
+        f"Only one top-level perNodeConfig spelling is allowed: {[key for key, _ in found_configs]}."
+      )
+    if found_configs:
+      return found_configs[0]
+    return None, None
+
+  def _apply_request_per_node_config_to_payload(self, inputs, instance_payload):
+    request_key, request_config = self._get_request_per_node_config(inputs)
+    if request_key is None:
+      return instance_payload
+
+    existing_keys = [
+      key for key in PER_NODE_CONFIG_KEYS
+      if isinstance(instance_payload, dict) and key in instance_payload
+    ]
+    if existing_keys:
+      raise ValueError(
+        f"Top-level perNodeConfig cannot be combined with plugin-level PER_NODE_CONFIG: {existing_keys}."
+      )
+    instance_payload["PER_NODE_CONFIG"] = self.deepcopy(request_config)
+    return instance_payload
+
+  def _deep_merge_plugin_config(self, base, overlay):
+    if isinstance(base, dict) and isinstance(overlay, dict):
+      merged = self.deepcopy(base)
+      for key, value in overlay.items():
+        if key == "SEMAPHORED_KEYS" and isinstance(merged.get(key), list) and isinstance(value, list):
+          merged[key] = sorted(set(merged[key]) | set(value))
+        elif key in merged:
+          merged[key] = self._deep_merge_plugin_config(merged[key], value)
+        else:
+          merged[key] = self.deepcopy(value)
+      return merged
+    return self.deepcopy(overlay)
+
+  def _is_cockroachdb_plugin_instance(self, instance):
+    if not isinstance(instance, dict):
+      return False
+    image = instance.get("IMAGE")
+    if isinstance(image, str) and COCKROACHDB_IMAGE_MARKER in image.lower():
+      return True
+    env = instance.get("ENV")
+    if isinstance(env, dict) and (
+      "CRDB_NODE_COUNT" in env or "CRDB_HOSTNAMES" in env
+    ):
+      return True
+    plugin_name = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+    return isinstance(plugin_name, str) and plugin_name.lower() == "cockroachdb"
+
+  def _request_has_cockroachdb_plugin(self, inputs):
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if isinstance(plugins_array, list):
+      for plugin_instance in plugins_array:
+        if self._is_cockroachdb_plugin_instance(plugin_instance):
+          return True
+    return False
+
+  def _discovered_has_cockroachdb_plugin(self, discovered_plugin_instances):
+    for discovered in discovered_plugin_instances or []:
+      if not isinstance(discovered, dict):
+        continue
+      instance_data = discovered.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE)
+      if not isinstance(instance_data, dict):
+        continue
+      instance_conf = instance_data.get("instance_conf")
+      if self._is_cockroachdb_plugin_instance(instance_conf):
+        return True
+    return False
+
+  def _validate_cockroachdb_target_change(self, current_nodes, requested_nodes, inputs, discovered_plugin_instances=None):
+    is_cockroachdb = (
+      self._request_has_cockroachdb_plugin(inputs)
+      or self._discovered_has_cockroachdb_plugin(discovered_plugin_instances)
+    )
+    if not is_cockroachdb:
+      return True
+
+    current_nodes = list(current_nodes or [])
+    requested_nodes = list(requested_nodes or [])
+    if len(requested_nodes) < 2:
+      raise ValueError("CockroachDB requires at least 2 target nodes.")
+    if current_nodes and len(requested_nodes) < len(current_nodes):
+      raise ValueError("CockroachDB scale-down is not supported in v1.")
+    same_count_changed = (
+      current_nodes
+      and len(requested_nodes) == len(current_nodes)
+      and requested_nodes != current_nodes
+    )
+    if same_count_changed:
+      raise ValueError("CockroachDB node replacement or reordering is not supported in v1.")
+    if current_nodes and len(requested_nodes) > len(current_nodes):
+      existing_prefix = requested_nodes[:len(current_nodes)]
+      if existing_prefix != current_nodes:
+        raise ValueError("CockroachDB scale-up must append new nodes after the existing node order in v1.")
+    return True
+
+  def _validate_cockroachdb_auth_env(self, env):
+    if not isinstance(env, dict):
+      raise ValueError("CockroachDB service requires ENV configuration.")
+    missing = [
+      key for key in COCKROACHDB_REQUIRED_AUTH_ENV_KEYS
+      if not isinstance(env.get(key), str) or not env.get(key).strip()
+    ]
+    if missing:
+      raise ValueError(
+        "CockroachDB service requires non-empty database, user, and password fields: {}.".format(missing)
+      )
+
+    identifier_re = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,62}$")
+    for key in ("CRDB_DATABASE", "CRDB_USER"):
+      value = env.get(key)
+      if not identifier_re.fullmatch(value):
+        raise ValueError(
+          "CockroachDB {} must be a SQL identifier: letters, digits, and underscores, not starting with a digit.".format(key)
+        )
+    if env.get("CRDB_USER", "").lower() == "root":
+      raise ValueError("CockroachDB CRDB_USER must not be root.")
+    return True
+
+  def _cockroachdb_cert_bundle_complete(self, instance, target_nodes):
+    if not isinstance(instance, dict) or not target_nodes:
+      return False
+    raw_config = instance.get("PER_NODE_CONFIG")
+    if not isinstance(raw_config, dict):
+      return False
+    try:
+      for index, node in enumerate(target_nodes):
+        overlay = self._overlay_for_node(raw_config, node, index)
+        env = overlay.get("ENV")
+        if not isinstance(env, dict):
+          return False
+        for key in COCKROACHDB_CERT_ENV_KEYS:
+          if not isinstance(env.get(key), str) or "-----BEGIN" not in env.get(key):
+            return False
+        if index == 0:
+          for key in COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS:
+            if not isinstance(env.get(key), str) or "-----BEGIN" not in env.get(key):
+              return False
+    except Exception:
+      return False
+    return True
+
+  def _pem_private_key(self, key):
+    from cryptography.hazmat.primitives import serialization
+    return key.private_bytes(
+      encoding=serialization.Encoding.PEM,
+      format=serialization.PrivateFormat.TraditionalOpenSSL,
+      encryption_algorithm=serialization.NoEncryption(),
+    ).decode("ascii")
+
+  def _pem_certificate(self, cert):
+    from cryptography.hazmat.primitives import serialization
+    return cert.public_bytes(serialization.Encoding.PEM).decode("ascii")
+
+  def _cockroachdb_name(self, value):
+    from cryptography.x509.oid import NameOID
+    from cryptography import x509
+    return x509.Name([
+      x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Ratio1 Deeploy"),
+      x509.NameAttribute(NameOID.COMMON_NAME, value),
+    ])
+
+  def _generate_cockroachdb_cert_bundle(self, target_nodes):
+    """
+    Generate a temporary CA and per-node CockroachDB certificates.
+
+    The CA private key is intentionally kept only in memory for this call. The
+    returned payload contains the CA certificate, per-node cert/key pairs, and
+    a bootstrap-only root client certificate/key for node 1.
+    """
+    try:
+      from cryptography import x509
+      from cryptography.hazmat.primitives import hashes
+      from cryptography.hazmat.primitives.asymmetric import rsa
+      from cryptography.x509.oid import ExtendedKeyUsageOID
+    except Exception as exc:
+      raise ValueError(
+        "CockroachDB secure deployment requires the Python 'cryptography' package."
+      ) from exc
+
+    now = datetime.now(timezone.utc)
+    ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    ca_subject = self._cockroachdb_name("deeploy-cockroachdb-ca")
+    ca_cert = (
+      x509.CertificateBuilder()
+      .subject_name(ca_subject)
+      .issuer_name(ca_subject)
+      .public_key(ca_key.public_key())
+      .serial_number(x509.random_serial_number())
+      .not_valid_before(now - timedelta(minutes=5))
+      .not_valid_after(now + timedelta(days=3650))
+      .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+      .add_extension(
+        x509.KeyUsage(
+          digital_signature=True,
+          key_cert_sign=True,
+          crl_sign=True,
+          key_encipherment=False,
+          content_commitment=False,
+          data_encipherment=False,
+          key_agreement=False,
+          encipher_only=False,
+          decipher_only=False,
+        ),
+        critical=True,
+      )
+      .sign(private_key=ca_key, algorithm=hashes.SHA256())
+    )
+    ca_crt = self._pem_certificate(ca_cert)
+
+    roach_names = [f"roach{i}" for i in range(1, len(target_nodes) + 1)]
+    dns_sans = [*roach_names, "localhost"]
+    ip_sans = ["127.0.0.1"]
+
+    def build_signed_cert(common_name, public_key, san_dns=None, san_ips=None, client=False, server=False):
+      san_items = []
+      for dns_name in san_dns or []:
+        san_items.append(x509.DNSName(dns_name))
+      for ip_value in san_ips or []:
+        san_items.append(x509.IPAddress(ipaddress.ip_address(ip_value)))
+      usages = []
+      if client:
+        usages.append(ExtendedKeyUsageOID.CLIENT_AUTH)
+      if server:
+        usages.append(ExtendedKeyUsageOID.SERVER_AUTH)
+      builder = (
+        x509.CertificateBuilder()
+        .subject_name(self._cockroachdb_name(common_name))
+        .issuer_name(ca_cert.subject)
+        .public_key(public_key)
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(minutes=5))
+        .not_valid_after(now + timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+      )
+      if san_items:
+        builder = builder.add_extension(x509.SubjectAlternativeName(san_items), critical=False)
+      if usages:
+        builder = builder.add_extension(x509.ExtendedKeyUsage(usages), critical=False)
+      return builder.sign(private_key=ca_key, algorithm=hashes.SHA256())
+
+    node_bundles = {}
+    for index, node in enumerate(target_nodes):
+      node_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+      node_cert = build_signed_cert(
+        common_name="node",
+        public_key=node_key.public_key(),
+        san_dns=dns_sans,
+        san_ips=ip_sans,
+        client=True,
+        server=True,
+      )
+      node_bundles[node] = {
+        "CRDB_CA_CRT": ca_crt,
+        "CRDB_NODE_CRT": self._pem_certificate(node_cert),
+        "CRDB_NODE_KEY": self._pem_private_key(node_key),
+      }
+      if index == 0:
+        root_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        root_cert = build_signed_cert(
+          common_name="root",
+          public_key=root_key.public_key(),
+          client=True,
+          server=False,
+        )
+        node_bundles[node]["CRDB_CLIENT_ROOT_CRT"] = self._pem_certificate(root_cert)
+        node_bundles[node]["CRDB_CLIENT_ROOT_KEY"] = self._pem_private_key(root_key)
+
+    return node_bundles
+
+  def _prepare_cockroachdb_secure_config(self, inputs, target_nodes):
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if not isinstance(plugins_array, list):
+      return inputs
+    target_nodes = list(target_nodes or [])
+    if not target_nodes:
+      return inputs
+
+    for plugin_instance in plugins_array:
+      if not self._is_cockroachdb_plugin_instance(plugin_instance):
+        continue
+      env = plugin_instance.setdefault("ENV", {})
+      self._validate_cockroachdb_auth_env(env)
+      env["CRDB_SECURE"] = "true"
+
+      raw_config = plugin_instance.get("PER_NODE_CONFIG")
+      existing_complete = self._cockroachdb_cert_bundle_complete(plugin_instance, target_nodes)
+      cert_bundle = None if existing_complete else self._generate_cockroachdb_cert_bundle(target_nodes)
+
+      by_node = {}
+      for index, node in enumerate(target_nodes):
+        overlay = self._overlay_for_node(raw_config, node, index) if raw_config else {}
+        overlay = self.deepcopy(overlay) if isinstance(overlay, dict) else {}
+        overlay_env = overlay.get("ENV")
+        if not isinstance(overlay_env, dict):
+          overlay_env = {}
+        else:
+          overlay_env = self.deepcopy(overlay_env)
+        if cert_bundle is not None:
+          overlay_env.update(cert_bundle[node])
+        overlay["ENV"] = overlay_env
+        by_node[node] = overlay
+      plugin_instance["PER_NODE_CONFIG"] = {"byNode": by_node}
+
+    return inputs
+
+  def _prepare_cockroachdb_secure_config_for_pipeline(self, pipeline, target_nodes):
+    if not isinstance(pipeline, dict):
+      return pipeline
+    plugins = pipeline.get(NetMonCt.PLUGINS)
+    if not isinstance(plugins, list):
+      return pipeline
+    target_nodes = list(target_nodes or [])
+    if not target_nodes:
+      return pipeline
+
+    has_cockroachdb = False
+    for plugin in plugins:
+      if not isinstance(plugin, dict):
+        continue
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or plugin.get("INSTANCES")
+      if not isinstance(instances, list):
+        continue
+      for instance in instances:
+        if self._is_cockroachdb_plugin_instance(instance):
+          has_cockroachdb = True
+          break
+      if has_cockroachdb:
+        break
+
+    if not has_cockroachdb:
+      return pipeline
+    if len(target_nodes) < 2:
+      raise ValueError("CockroachDB requires at least 2 target nodes.")
+
+    cert_bundle = self._generate_cockroachdb_cert_bundle(target_nodes)
+    for plugin in plugins:
+      if not isinstance(plugin, dict):
+        continue
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or plugin.get("INSTANCES")
+      if not isinstance(instances, list):
+        continue
+      for instance in instances:
+        if not self._is_cockroachdb_plugin_instance(instance):
+          continue
+        env = instance.setdefault("ENV", {})
+        self._validate_cockroachdb_auth_env(env)
+        hostnames = [
+          item.strip()
+          for item in str(env.get("CRDB_HOSTNAMES", "")).split(",")
+          if item.strip()
+        ]
+        if len(hostnames) != len(target_nodes):
+          raise ValueError(
+            "CockroachDB legacy scale-up requires CRDB_HOSTNAMES to contain "
+            f"{len(target_nodes)} hostnames before redeploying the cluster."
+          )
+        env["CRDB_SECURE"] = "true"
+        env["CRDB_NODE_COUNT"] = str(len(target_nodes))
+        env["CRDB_HOSTNAMES"] = ",".join(hostnames)
+
+        raw_config = instance.get("PER_NODE_CONFIG")
+        by_node = {}
+        for index, node in enumerate(target_nodes):
+          overlay = self._overlay_for_node(raw_config, node, index) if raw_config else {}
+          overlay = self.deepcopy(overlay) if isinstance(overlay, dict) else {}
+          overlay_env = overlay.get("ENV")
+          if not isinstance(overlay_env, dict):
+            overlay_env = {}
+          else:
+            overlay_env = self.deepcopy(overlay_env)
+          overlay_env.update(cert_bundle[node])
+          overlay["ENV"] = overlay_env
+          by_node[node] = overlay
+        instance["PER_NODE_CONFIG"] = {"byNode": by_node}
+    return pipeline
+
+  def _inherit_existing_cockroachdb_cert_config(self, instance_payload, fallback_instance):
+    if not self._is_cockroachdb_plugin_instance(instance_payload):
+      return instance_payload
+    if instance_payload.get("PER_NODE_CONFIG"):
+      return instance_payload
+    if not isinstance(fallback_instance, dict):
+      return instance_payload
+    instance_conf = fallback_instance.get("instance_conf")
+    if not isinstance(instance_conf, dict):
+      return instance_payload
+    raw_config = instance_conf.get("PER_NODE_CONFIG")
+    if isinstance(raw_config, dict):
+      instance_payload["PER_NODE_CONFIG"] = self.deepcopy(raw_config)
+    return instance_payload
+
+  def _is_public_redaction_marker(self, value):
+    return isinstance(value, str) and value.strip().lower() in PUBLIC_REDACTION_MARKERS
+
+  def _inherit_existing_per_node_config_marker(self, instance_payload, fallback_instance):
+    if not isinstance(instance_payload, dict):
+      return instance_payload
+    marker_key = None
+    for key in PER_NODE_CONFIG_KEYS:
+      if self._is_public_redaction_marker(instance_payload.get(key)):
+        marker_key = key
+        break
+    if marker_key is None:
+      return instance_payload
+    if not isinstance(fallback_instance, dict):
+      return instance_payload
+    instance_conf = fallback_instance.get("instance_conf")
+    if not isinstance(instance_conf, dict):
+      return instance_payload
+    raw_config = instance_conf.get("PER_NODE_CONFIG")
+    if isinstance(raw_config, dict):
+      instance_payload[marker_key] = self.deepcopy(raw_config)
+    return instance_payload
+
+  def _inherit_cockroachdb_secure_config_from_discovered(self, inputs, discovered_plugin_instances):
+    plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+    if not isinstance(plugins_array, list):
+      return inputs
+    discovered_configs = []
+    for discovered in discovered_plugin_instances or []:
+      if not isinstance(discovered, dict):
+        continue
+      instance_data = discovered.get(DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE)
+      if not isinstance(instance_data, dict):
+        continue
+      instance_conf = instance_data.get("instance_conf")
+      if not isinstance(instance_conf, dict):
+        continue
+      if self._is_cockroachdb_plugin_instance(instance_conf) and isinstance(instance_conf.get("PER_NODE_CONFIG"), dict):
+        discovered_configs.append({
+          "record": discovered,
+          "config": instance_conf,
+        })
+
+    if not discovered_configs:
+      return inputs
+
+    for plugin_instance in plugins_array:
+      if not isinstance(plugin_instance, dict):
+        continue
+      if not self._is_cockroachdb_plugin_instance(plugin_instance):
+        continue
+      self._canonicalize_per_node_config_key(plugin_instance)
+      discovered_entry = self._match_discovered_cockroachdb_config(plugin_instance, discovered_configs)
+      if not discovered_entry:
+        continue
+      discovered_instance = discovered_entry["config"]
+      discovered_config = discovered_instance.get("PER_NODE_CONFIG")
+      discovered_env = discovered_instance.get("ENV")
+      if not isinstance(discovered_env, dict):
+        discovered_env = {}
+      plugin_env = plugin_instance.get("ENV")
+      if isinstance(plugin_env, dict):
+        password = plugin_env.get("CRDB_PASSWORD")
+        if password in ("***", "[redacted]", "") and isinstance(discovered_env.get("CRDB_PASSWORD"), str):
+          plugin_env["CRDB_PASSWORD"] = discovered_env["CRDB_PASSWORD"]
+      self._inherit_redacted_exposed_port_tokens(plugin_instance, discovered_instance)
+      raw_request_config = plugin_instance.get("PER_NODE_CONFIG")
+      if self._is_public_redaction_marker(raw_request_config):
+        plugin_instance["PER_NODE_CONFIG"] = self.deepcopy(discovered_config)
+        continue
+      if not raw_request_config:
+        plugin_instance["PER_NODE_CONFIG"] = self.deepcopy(discovered_config)
+        continue
+
+      try:
+        request_default, request_by_index, request_by_node = self._normalize_per_node_config(raw_request_config)
+        _disc_default, _disc_by_index, disc_by_node = self._normalize_per_node_config(discovered_config)
+      except Exception:
+        continue
+
+      target_order = self._get_cockroachdb_per_node_target_order(inputs, request_by_node, disc_by_node)
+      if target_order:
+        merged_by_node = {}
+        for request_index, node in enumerate(target_order):
+          request_overlay = self._overlay_for_node(raw_request_config, node, request_index)
+          discovered_overlay = self._overlay_for_node(discovered_config, node, request_index)
+          merged_overlay = self._inherit_redacted_cockroachdb_per_node_env(request_overlay, discovered_overlay)
+          merged_by_node[node] = merged_overlay
+        plugin_instance["PER_NODE_CONFIG"] = {"byNode": merged_by_node}
+        continue
+
+      merged_by_node = {}
+      for node, request_overlay in request_by_node.items():
+        merged_overlay = self.deepcopy(request_overlay)
+        discovered_overlay = disc_by_node.get(node)
+        if isinstance(discovered_overlay, dict):
+          merged_overlay = self._inherit_redacted_cockroachdb_per_node_env(merged_overlay, discovered_overlay)
+          discovered_env = discovered_overlay.get("ENV")
+          if isinstance(discovered_env, dict):
+            cert_env = {
+              key: value
+              for key, value in discovered_env.items()
+              if key in COCKROACHDB_CERT_ENV_KEYS or key in COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS
+            }
+            if cert_env:
+              merged_env = merged_overlay.get("ENV")
+              if not isinstance(merged_env, dict):
+                merged_env = {}
+              else:
+                merged_env = self.deepcopy(merged_env)
+              for key, value in cert_env.items():
+                merged_env.setdefault(key, value)
+              merged_overlay["ENV"] = merged_env
+        merged_by_node[node] = merged_overlay
+
+      # Preserve structured defaults/index overlays if callers use them, but
+      # materialize byNode because Cockroach slots are node-address based.
+      next_config = {}
+      if request_default:
+        next_config["default"] = self._inherit_redacted_cockroachdb_per_node_env(
+          request_default,
+          self._overlay_for_node(discovered_config, None, 0),
+        )
+      if request_by_index:
+        next_config["byIndex"] = {
+          str(index): self._inherit_redacted_cockroachdb_per_node_env(
+            overlay,
+            self._overlay_for_node(discovered_config, None, index),
+          )
+          for index, overlay in request_by_index.items()
+        }
+      next_config["byNode"] = merged_by_node
+      plugin_instance["PER_NODE_CONFIG"] = next_config
+    return inputs
+
+  def _get_cockroachdb_per_node_target_order(self, inputs, request_by_node, disc_by_node):
+    for key in (
+      DEEPLOY_KEYS.CURRENT_TARGET_NODES,
+      DEEPLOY_KEYS.TARGET_NODES,
+      "target_nodes",
+      "current_target_nodes",
+    ):
+      nodes = inputs.get(key) if hasattr(inputs, "get") else None
+      if not isinstance(nodes, list):
+        continue
+      normalized = []
+      for node in nodes:
+        if isinstance(node, dict):
+          address = node.get("address") or node.get("node") or node.get("id")
+        else:
+          address = node
+        if address:
+          normalized.append(str(address))
+      if normalized:
+        return normalized
+
+    fallback_nodes = []
+    for node in list(request_by_node.keys()) + list(disc_by_node.keys()):
+      node = str(node)
+      if node not in fallback_nodes:
+        fallback_nodes.append(node)
+    return fallback_nodes
+
+  def _match_discovered_cockroachdb_config(self, plugin_instance, discovered_configs):
+    if not discovered_configs:
+      return None
+
+    request_instance_id = (
+      plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+      or plugin_instance.get("instance_id")
+      or plugin_instance.get(getattr(self.ct.BIZ_PLUGIN_DATA, "INSTANCE_ID", "instance_id"))
+    )
+    if request_instance_id:
+      for entry in discovered_configs:
+        record = entry["record"]
+        config = entry["config"]
+        discovered_instance_id = (
+          record.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+          or config.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+          or config.get("instance_id")
+          or config.get(getattr(self.ct.BIZ_PLUGIN_DATA, "INSTANCE_ID", "instance_id"))
+        )
+        if discovered_instance_id and str(discovered_instance_id) == str(request_instance_id):
+          return entry
+      return None
+
+    request_plugin_name = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+    if request_plugin_name:
+      matches = []
+      for entry in discovered_configs:
+        record = entry["record"]
+        config = entry["config"]
+        discovered_plugin_name = (
+          config.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          or record.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        )
+        if discovered_plugin_name and str(discovered_plugin_name) == str(request_plugin_name):
+          matches.append(entry)
+      if len(matches) == 1:
+        return matches[0]
+      if len(matches) > 1:
+        config_hashes = {
+          self._cockroachdb_discovered_config_hash(match["record"])
+          for match in matches
+        }
+        if len(config_hashes) == 1:
+          return matches[0]
+      return None
+
+    if len(discovered_configs) == 1:
+      return discovered_configs[0]
+    return None
+
+  def _cockroachdb_discovered_config_hash(self, discovered_record):
+    return compact_canonical_sha256(
+      self._extract_discovered_plugin_conf(
+        discovered_record,
+        instance_id_key=self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID,
+        chainstore_response_key=self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY,
+        chainstore_peers_key=self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS,
+      )
+    )
+
+  def _inherit_redacted_exposed_port_tokens(self, plugin_instance, discovered_instance):
+    request_ports = plugin_instance.get("EXPOSED_PORTS")
+    discovered_ports = discovered_instance.get("EXPOSED_PORTS") if isinstance(discovered_instance, dict) else None
+    if not isinstance(request_ports, dict) or not isinstance(discovered_ports, dict):
+      return plugin_instance
+
+    for port, port_conf in request_ports.items():
+      if not isinstance(port_conf, dict):
+        continue
+      discovered_port_conf = discovered_ports.get(port)
+      if not isinstance(discovered_port_conf, dict):
+        discovered_port_conf = discovered_ports.get(str(port))
+      if not isinstance(discovered_port_conf, dict):
+        continue
+      token = port_conf.get("token")
+      discovered_token = discovered_port_conf.get("token")
+      if token in ("***", "[redacted]", "") and isinstance(discovered_token, str) and discovered_token:
+        port_conf["token"] = discovered_token
+      tunnel = port_conf.get("tunnel")
+      discovered_tunnel = discovered_port_conf.get("tunnel")
+      if isinstance(tunnel, dict) and isinstance(discovered_tunnel, dict):
+        tunnel_token = tunnel.get("token")
+        discovered_tunnel_token = discovered_tunnel.get("token")
+        if tunnel_token in ("***", "[redacted]", "") and isinstance(discovered_tunnel_token, str) and discovered_tunnel_token:
+          tunnel["token"] = discovered_tunnel_token
+    return plugin_instance
+
+  def _inherit_redacted_cockroachdb_per_node_env(self, merged_overlay, discovered_overlay):
+    if not isinstance(merged_overlay, dict) or not isinstance(discovered_overlay, dict):
+      return merged_overlay
+    discovered_env = discovered_overlay.get("ENV")
+    if not isinstance(discovered_env, dict):
+      return merged_overlay
+    merged_env = merged_overlay.get("ENV")
+    if not isinstance(merged_env, dict):
+      merged_env = {}
+    else:
+      merged_env = self.deepcopy(merged_env)
+
+    for key in COCKROACHDB_INHERITABLE_PER_NODE_ENV_KEYS:
+      discovered_value = discovered_env.get(key)
+      if not isinstance(discovered_value, str) or not discovered_value:
+        continue
+      request_value = merged_env.get(key)
+      if self._is_public_redaction_marker(request_value) or request_value == "":
+        merged_env[key] = discovered_value
+      elif key in COCKROACHDB_CERT_ENV_KEYS or key in COCKROACHDB_BOOTSTRAP_CERT_ENV_KEYS:
+        merged_env.setdefault(key, discovered_value)
+
+    if merged_env:
+      merged_overlay["ENV"] = merged_env
+    return merged_overlay
+
+  def _normalize_per_node_config(self, raw_config):
+    if raw_config is None:
+      return {}, {}, {}
+    if not isinstance(raw_config, dict):
+      raise ValueError("perNodeConfig must be a dictionary.")
+
+    has_structured_keys = any(
+      key in raw_config
+      for key in PER_NODE_CONFIG_STRUCTURED_KEYS
+    )
+    if has_structured_keys:
+      extra_keys = [key for key in raw_config if key not in PER_NODE_CONFIG_STRUCTURED_KEYS]
+      if extra_keys:
+        raise ValueError(
+          f"perNodeConfig cannot mix structured keys with direct node selectors: {extra_keys}."
+        )
+      default_overlay = self._get_per_node_structured_section(
+        raw_config, "default", ("default", "DEFAULT")
+      )
+      by_index = self._get_per_node_structured_section(
+        raw_config, "byIndex", ("byIndex", "BY_INDEX")
+      )
+      by_node = self._get_per_node_structured_section(
+        raw_config, "byNode", ("byNode", "BY_NODE")
+      )
+    else:
+      default_overlay = {}
+      by_index = {}
+      by_node = raw_config
+
+    if not isinstance(default_overlay, dict):
+      raise ValueError("perNodeConfig.default must be a dictionary.")
+    if not isinstance(by_index, dict):
+      raise ValueError("perNodeConfig.byIndex must be a dictionary.")
+    if not isinstance(by_node, dict):
+      raise ValueError("perNodeConfig.byNode must be a dictionary.")
+
+    normalized_by_index = {}
+    for raw_index, overlay in by_index.items():
+      if not isinstance(overlay, dict):
+        raise ValueError(f"perNodeConfig.byIndex[{raw_index!r}] must be a dictionary.")
+      try:
+        index = int(raw_index)
+      except (TypeError, ValueError) as exc:
+        raise ValueError(f"perNodeConfig.byIndex key {raw_index!r} must be an integer index.") from exc
+      if index < 0:
+        raise ValueError(f"perNodeConfig.byIndex key {raw_index!r} must be non-negative.")
+      normalized_by_index[index] = overlay
+
+    normalized_by_node = {}
+    for raw_node, overlay in by_node.items():
+      if not isinstance(overlay, dict):
+        raise ValueError(f"perNodeConfig.byNode[{raw_node!r}] must be a dictionary.")
+      normalized_by_node[str(raw_node)] = overlay
+
+    for overlay in [default_overlay, *normalized_by_index.values(), *normalized_by_node.values()]:
+      self._validate_per_node_overlay(overlay)
+
+    return default_overlay, normalized_by_index, normalized_by_node
+
+  def _get_per_node_structured_section(self, raw_config, section_name, aliases):
+    present_aliases = [key for key in aliases if key in raw_config]
+    if len(present_aliases) > 1:
+      raise ValueError(
+        f"perNodeConfig.{section_name} has duplicate aliases: {present_aliases}."
+      )
+    if not present_aliases:
+      return {}
+    value = raw_config[present_aliases[0]]
+    if value is None:
+      return {}
+    if not isinstance(value, dict):
+      raise ValueError(f"perNodeConfig.{section_name} must be a dictionary.")
+    return value
+
+  def _iter_per_node_overlays(self, raw_config):
+    default_overlay, by_index, by_node = self._normalize_per_node_config(raw_config)
+    for overlay in [default_overlay, *by_index.values(), *by_node.values()]:
+      if overlay:
+        yield overlay
+
+  def _redact_per_node_config_for_log(self, plugins):
+    deepcopy = getattr(self, "deepcopy", copy.deepcopy)
+    redacted = deepcopy(plugins)
+
+    def redact(value):
+      if isinstance(value, dict):
+        for key, item in list(value.items()):
+          if key in PER_NODE_CONFIG_KEYS and item:
+            value[key] = "***"
+          elif any(
+            part in re.sub(r"[^A-Z0-9]", "", str(key).upper())
+            for part in SENSITIVE_LOG_KEY_PARTS
+          ):
+            value[key] = "***" if item else item
+          else:
+            redact(item)
+      elif isinstance(value, list):
+        for item in value:
+          redact(item)
+
+    redact(redacted)
+    return redacted
+
+  def _redact_deeploy_status_payload(self, payload):
+    deepcopy = getattr(self, "deepcopy", copy.deepcopy)
+    redacted = deepcopy(payload)
+
+    def redact(value):
+      if isinstance(value, dict):
+        for key, item in list(value.items()):
+          if any(
+            part in re.sub(r"[^A-Z0-9]", "", str(key).upper())
+            for part in SENSITIVE_LOG_KEY_PARTS
+          ):
+            value[key] = "***" if item else item
+          else:
+            redact(item)
+      elif isinstance(value, list):
+        for item in value:
+          redact(item)
+
+    redact(redacted)
+    return redacted
+
+  def _validate_per_node_overlay(self, overlay):
+    for key in overlay:
+      normalized_key = str(key).upper()
+      if key in PER_NODE_CONFIG_KEYS:
+        raise ValueError("Nested perNodeConfig overlays are not supported.")
+      if normalized_key in PER_NODE_CONFIG_SYSTEM_KEYS:
+        raise ValueError(
+          f"perNodeConfig cannot override system-managed or preflighted key '{key}'."
+        )
+    return True
+
+  def _per_node_lookup_keys(self, node_addr):
+    values = []
+    if node_addr is not None:
+      values.append(str(node_addr))
+      if str(node_addr).startswith("0xai_"):
+        values.append(str(node_addr)[5:])
+      else:
+        values.append(f"0xai_{node_addr}")
+
+    result = []
+    seen = set()
+    for value in values:
+      if value and value not in seen:
+        result.append(value)
+        seen.add(value)
+    return result
+
+  def _per_node_target_lookup_set(self, nodes):
+    lookup = set()
+    for node in nodes or []:
+      lookup.update(self._per_node_lookup_keys(node))
+    return lookup
+
+  def _iter_per_node_configs(self, plugins):
+    for plugin in plugins or []:
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      for instance in instances:
+        if not isinstance(instance, dict):
+          continue
+        for key in PER_NODE_CONFIG_KEYS:
+          if key in instance:
+            yield instance[key]
+
+  def _validate_per_node_config_selectors(self, plugins, nodes):
+    node_count = len(nodes or [])
+    node_lookup = self._per_node_target_lookup_set(nodes)
+    for raw_config in self._iter_per_node_configs(plugins):
+      _default_overlay, by_index, by_node = self._normalize_per_node_config(raw_config)
+      out_of_range = [idx for idx in by_index if idx >= node_count]
+      if out_of_range:
+        raise ValueError(
+          f"perNodeConfig.byIndex contains indexes outside target nodes: {out_of_range}."
+        )
+      unknown_nodes = [node for node in by_node if node not in node_lookup]
+      if unknown_nodes:
+        raise ValueError(
+          f"perNodeConfig.byNode contains unknown target node selector(s): {unknown_nodes}."
+        )
+    return True
+
+  def _overlay_for_node(self, raw_config, node_addr, node_index):
+    default_overlay, by_index, by_node = self._normalize_per_node_config(raw_config)
+    overlay = self.deepcopy(default_overlay)
+
+    if node_index in by_index:
+      overlay = self._deep_merge_plugin_config(overlay, by_index[node_index])
+
+    for lookup_key in self._per_node_lookup_keys(node_addr):
+      if lookup_key in by_node:
+        overlay = self._deep_merge_plugin_config(overlay, by_node[lookup_key])
+        break
+
+    return overlay
+
+  def _materialize_plugins_for_node(self, plugins, node_addr, node_index):
+    materialized = self.deepcopy(plugins)
+    for plugin in materialized:
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      for instance in instances:
+        if not isinstance(instance, dict):
+          continue
+        raw_config = self._pop_per_node_config(instance)
+        overlay = self._overlay_for_node(raw_config, node_addr, node_index)
+        if overlay:
+          merged = self._deep_merge_plugin_config(instance, overlay)
+          instance.clear()
+          instance.update(merged)
+    return materialized
+
+  def _validate_materialized_plugins_for_node(self, plugins, node_addr=None):
+    self._validate_dynamic_env_config(plugins)
+    self._validate_final_emitted_semaphore_keys(plugins)
+    validation_index = 0
+    for plugin in plugins or []:
+      signature = plugin.get(self.ct.CONFIG_PLUGIN.K_SIGNATURE)
+      self._check_plugin_signature(signature)
+      instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
+      if not isinstance(instances, list):
+        raise ValueError("Prepared plugin INSTANCES must be a list.")
+      for instance in instances:
+        if not isinstance(instance, dict):
+          raise ValueError("Prepared plugin instance must be a dictionary.")
+        self._validate_plugin_instance_for_signature(
+          signature=signature,
+          plugin_instance=instance,
+          index=validation_index,
+        )
+        validation_index += 1
+    return True
+
+  def _ordered_nodes_for_per_node_config(self, nodes, dct_deeploy_specs=None):
+    nodes = list(nodes or [])
+    persisted_nodes = []
+    if isinstance(dct_deeploy_specs, dict):
+      raw_nodes = dct_deeploy_specs.get(DEEPLOY_KEYS.CURRENT_TARGET_NODES)
+      if isinstance(raw_nodes, list):
+        persisted_nodes = list(raw_nodes)
+    if persisted_nodes:
+      for node in nodes:
+        if node not in persisted_nodes:
+          persisted_nodes.append(node)
+      return persisted_nodes
+    return nodes
 
   @staticmethod
   def _validate_plugin_name(plugin_name):
@@ -2670,18 +4259,108 @@ class _DeeployMixin:
           )
         used_names.add(pname)
 
+  def _validate_runtime_key_shapes(self, instance):
+    sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
+    if sem is not None and (not isinstance(sem, str) or not sem.strip()):
+      raise ValueError("SEMAPHORE, when present, must be a non-empty string.")
+
+    semaphored_keys = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS)
+    if semaphored_keys is not None:
+      if not isinstance(semaphored_keys, list):
+        raise ValueError("SEMAPHORED_KEYS, when present, must be a list of non-empty strings.")
+      for key in semaphored_keys:
+        if not isinstance(key, str) or not key.strip():
+          raise ValueError("SEMAPHORED_KEYS, when present, must be a list of non-empty strings.")
+
+  def _validate_plugin_runtime_keys(self, plugins):
+    """
+    Validate runtime metadata before shmem resolution/autowire.
+
+    Named instances can carry stale SEMAPHORE runtime metadata from a previous
+    deployment. That metadata is rewritten later from app_id + plugin_name, so
+    duplicate inbound SEMAPHORE values on named instances are not final yet.
+
+    Unnamed instances have no logical name to recompute from. Their SEMAPHORE
+    values are explicit provider namespaces and must be unique before any
+    dispatch path can continue.
+    """
+    self._validate_plugin_names(plugins)
+    self._validate_dynamic_env_config(plugins)
+    used_semaphores = {}
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        self._validate_runtime_key_shapes(instance)
+        if instance.get(DEEPLOY_KEYS.PLUGIN_NAME):
+          continue
+        sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
+        if sem is None:
+          continue
+        sem = str(sem)
+        if not sem:
+          continue
+        provider_id = (
+          instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          or instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+          or sem
+        )
+        if sem in used_semaphores:
+          raise ValueError(
+            "Duplicate semaphore key '{}'. Provider '{}' already uses this key.".format(
+              sem,
+              used_semaphores[sem],
+            )
+          )
+        used_semaphores[sem] = provider_id
+
+  def _validate_final_emitted_semaphore_keys(self, plugins):
+    """
+    Validate final SEMAPHORE values after shmem resolution/autowire.
+
+    At this point named providers have had stale runtime values replaced with
+    current derived keys, so any duplicate SEMAPHORE value is a real deployment
+    collision and must fail before node payload assembly.
+    """
+    self._validate_plugin_names(plugins)
+    used_semaphores = {}
+    for plugin in plugins:
+      for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+        if not isinstance(instance, dict):
+          continue
+        self._validate_runtime_key_shapes(instance)
+        sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
+        if sem is None:
+          continue
+        sem = str(sem)
+        if not sem:
+          continue
+        provider_id = (
+          instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+          or instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
+          or sem
+        )
+        if sem in used_semaphores:
+          raise ValueError(
+            "Duplicate final semaphore key '{}'. Provider '{}' already emits this key.".format(
+              sem,
+              used_semaphores[sem],
+            )
+          )
+        used_semaphores[sem] = provider_id
+
   def _resolve_shmem_in_plugins(self, plugins, app_id):
     """
-    Resolve shmem-type DYNAMIC_ENV entries inline using plugin_name-based semaphore keys.
+    Resolve shmem-type DYNAMIC_ENV entries inline using plugin names or existing semaphore keys.
 
-    For each named instance: sets SEMAPHORE = "app_id__plugin_name".
-    For each shmem path: rewrites path[0] from plugin_name to the semaphore key.
-    For each consumer: sets SEMAPHORED_KEYS with all referenced semaphore keys.
+    For each named instance: recomputes SEMAPHORE from app_id + plugin_name.
+    For each shmem path: resolves path[0] from either plugin_name or a known semaphore key.
+    For each consumer: rebuilds SEMAPHORED_KEYS from referenced semaphore keys.
 
     Parameters
     ----------
     plugins : list
-      Prepared plugins payload. Instances must have plugin_name in payload for shmem to work.
+      Prepared plugins payload. Instances can include plugin_name for shmem resolution.
     app_id : str
       Application identifier used to namespace semaphore keys.
 
@@ -2690,67 +4369,198 @@ class _DeeployMixin:
     list
       Modified plugins with shmem references resolved.
     """
-    # Build plugin_name -> semaphore_key map from all instances
+    self._validate_dynamic_env_config(plugins)
+    # Build provider lookup tables. We allow plugin names, current derived
+    # semaphore keys, explicit unnamed semaphore keys, and stale inbound aliases
+    # carried by named providers.
+    # For named instances, SEMAPHORE is always derived from app_id + plugin_name.
     name_to_key = {}
+    canonical_key_to_name = {}
+    stale_alias_to_names = {}
+    explicit_key_to_provider = {}
     used_names = set()
+    normalized_app_id = app_id.strip() if isinstance(app_id, str) else None
+
+    def add_stale_alias(alias, provider_name):
+      if alias is None:
+        return
+      alias = str(alias)
+      if not alias:
+        return
+      stale_alias_to_names.setdefault(alias, set()).add(provider_name)
+
+    def resolve_provider_key(provider_name):
+      target_keys = set()
+      provider_labels = set()
+
+      if provider_name in name_to_key:
+        provider_labels.add(provider_name)
+        target_keys.add(name_to_key[provider_name])
+
+      if provider_name in canonical_key_to_name:
+        mapped_name = canonical_key_to_name.get(provider_name)
+        provider_labels.add(mapped_name)
+        target_keys.add(name_to_key.get(mapped_name, provider_name))
+
+      for mapped_name in stale_alias_to_names.get(provider_name, set()):
+        provider_labels.add(mapped_name)
+        target_keys.add(name_to_key.get(mapped_name, provider_name))
+
+      if provider_name in explicit_key_to_provider:
+        provider_labels.add(explicit_key_to_provider[provider_name])
+        target_keys.add(provider_name)
+
+      if len(target_keys) > 1:
+        raise ValueError(
+          "DYNAMIC_ENV shmem references ambiguous semaphore key '{}'. "
+          "It matches providers: {}. Use plugin_name instead.".format(
+            provider_name,
+            sorted(provider_labels),
+          )
+        )
+
+      if target_keys:
+        return next(iter(target_keys))
+
+      return None
+
     for plugin in plugins:
       for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
         if not isinstance(instance, dict):
           continue
+
         pname = instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
-        if not pname:
-          continue
-        self._validate_plugin_name(pname)
-        if pname in used_names:
-          raise ValueError(
-            "Duplicate plugin_name '{}'. Each plugin must have a unique name.".format(pname)
-          )
-        used_names.add(pname)
-        sem_key = "{}__{}".format(app_id, pname)
-        existing_sem = instance.get("SEMAPHORE")
-        if existing_sem and existing_sem != sem_key:
-          raise ValueError(
-            "plugin_name '{}' implies SEMAPHORE '{}' but instance already has '{}'.".format(
-              pname, sem_key, existing_sem
+        sem = instance.get(DEEPLOY_RUNTIME_KEYS.SEMAPHORE)
+        sem = str(sem) if sem is not None else None
+
+        if pname:
+          self._validate_plugin_name(pname)
+          if pname in used_names:
+            raise ValueError(
+              "Duplicate plugin_name '{}'. Each plugin must have a unique name.".format(pname)
             )
-          )
-        instance["SEMAPHORE"] = sem_key
-        name_to_key[pname] = sem_key
+          used_names.add(pname)
+
+        if pname:
+          sem_key = "{}__{}".format(normalized_app_id, pname) if normalized_app_id else pname
+          instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORE] = sem_key
+          name_to_key[pname] = sem_key
+
+          existing_name = canonical_key_to_name.get(sem_key)
+          if existing_name is not None and existing_name != pname:
+            raise ValueError(
+              "Duplicate semaphore key '{}'. plugin_name '{}' and '{}' resolve to the same key.".format(
+                sem_key,
+                existing_name,
+                pname,
+              )
+            )
+          canonical_key_to_name[sem_key] = pname
+
+          if sem:
+            add_stale_alias(sem, pname)
+
+        elif sem:
+          provider_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID) or sem
+          if sem in explicit_key_to_provider:
+            existing_name = explicit_key_to_provider.get(sem)
+            raise ValueError(
+              "Duplicate semaphore key '{}'. Unresolved provider key '{}' already maps to '{}'.".format(
+                sem,
+                sem,
+                existing_name,
+              )
+            )
+          explicit_key_to_provider[sem] = provider_id
 
     if not name_to_key:
+      # Still allow semaphored references when only direct SEMAPHORE references exist.
+      known_keys = sorted(explicit_key_to_provider.keys())
+      for plugin in plugins:
+        for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
+          if not isinstance(instance, dict):
+            continue
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS, None)
+          dynamic_env = instance.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
+          if not isinstance(dynamic_env, dict):
+            continue
+
+          consumer_sem_keys = set()
+          for var_name, entries in dynamic_env.items():
+            if not isinstance(entries, list):
+              continue
+            for entry in entries:
+              if (
+                not self._is_shmem_dynamic_env_entry(entry)
+              ):
+                continue
+              path = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH)
+              provider_name, target_key = self._validate_dynamic_env_shmem_path(path, var_name)
+              if provider_name not in explicit_key_to_provider:
+                raise ValueError(
+                  "DYNAMIC_ENV shmem references unknown plugin '{}'. "
+                  "Available providers: {}".format(provider_name, known_keys)
+                )
+              sem_key = provider_name
+              entry["path"] = [sem_key, target_key]
+              consumer_sem_keys.add(sem_key)
+
+          instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS] = sorted(consumer_sem_keys)
       return plugins
 
-    # Resolve shmem paths and collect consumer dependencies
+    def resolve_dynamic_env(container, update_container_keys=True):
+      if update_container_keys:
+        container.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS, None)
+      dynamic_env = container.get(DEEPLOY_RUNTIME_KEYS.DYNAMIC_ENV)
+      if not isinstance(dynamic_env, dict):
+        return set()
+
+      consumer_sem_keys = set()
+      for var_name, entries in dynamic_env.items():
+        if not isinstance(entries, list):
+          continue
+        for entry in entries:
+          if (
+            not self._is_shmem_dynamic_env_entry(entry)
+          ):
+            continue
+          path = entry.get(DEEPLOY_DYNAMIC_ENV_KEYS.PATH)
+          provider_name, target_key = self._validate_dynamic_env_shmem_path(path, var_name)
+          sem_key = resolve_provider_key(provider_name)
+          if sem_key is None:
+            raise ValueError(
+              "DYNAMIC_ENV shmem references unknown plugin '{}'. "
+              "Available providers: {}".format(
+                provider_name,
+                sorted(
+                  set(name_to_key.keys())
+                  | set(canonical_key_to_name.keys())
+                  | set(stale_alias_to_names.keys())
+                  | set(explicit_key_to_provider.keys())
+                ),
+              )
+            )
+          entry[DEEPLOY_DYNAMIC_ENV_KEYS.PATH] = [sem_key, target_key]
+          consumer_sem_keys.add(sem_key)
+
+      if update_container_keys:
+        container[DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS] = sorted(consumer_sem_keys)
+      return consumer_sem_keys
+
+    # Resolve shmem paths and collect consumer dependencies.
+    # Per-node overlays are resolved in place but not otherwise materialized.
     for plugin in plugins:
       for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
         if not isinstance(instance, dict):
           continue
-        dynamic_env = instance.get("DYNAMIC_ENV")
-        if not isinstance(dynamic_env, dict):
-          continue
-
-        consumer_sem_keys = set()
-        for _var_name, entries in dynamic_env.items():
-          if not isinstance(entries, list):
+        consumer_sem_keys = resolve_dynamic_env(instance)
+        for key in PER_NODE_CONFIG_KEYS:
+          if key not in instance:
             continue
-          for entry in entries:
-            if not isinstance(entry, dict) or entry.get("type") != "shmem":
-              continue
-            path = entry.get("path")
-            if not isinstance(path, (list, tuple)) or len(path) < 2:
-              continue
-            provider_name = path[0]
-            if provider_name not in name_to_key:
-              raise ValueError(
-                "DYNAMIC_ENV shmem references unknown plugin '{}'. "
-                "Available plugins: {}".format(provider_name, sorted(name_to_key.keys()))
-              )
-            sem_key = name_to_key[provider_name]
-            entry["path"] = [sem_key, path[1]]
-            consumer_sem_keys.add(sem_key)
-
+          for overlay in self._iter_per_node_overlays(instance[key]):
+            consumer_sem_keys.update(resolve_dynamic_env(overlay, update_container_keys=False))
         if consumer_sem_keys:
-          instance["SEMAPHORED_KEYS"] = sorted(consumer_sem_keys)
+          instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS] = sorted(consumer_sem_keys)
 
     return plugins
 
@@ -2811,14 +4621,14 @@ class _DeeployMixin:
     instance receives SEMAPHORED_KEYS containing all native semaphore keys.
 
     This is only meant for the simple native + CAR/WAR pattern. When the user
-    provides explicit shmem DYNAMIC_ENV references or manual SEMAPHORE /
-    SEMAPHORED_KEYS config, this autowiring is skipped entirely and the user's
-    explicit dependency tree takes precedence.
+    provides explicit shmem DYNAMIC_ENV references, this autowiring is skipped
+    and the user's explicit dependency tree takes precedence. Inbound SEMAPHORE
+    / SEMAPHORED_KEYS values are treated as runtime metadata and replaced with
+    values derived for the current app.
 
     Skips autowiring when:
     - job_app_type is not NATIVE
     - Fewer than 2 signature groups (need both a native and a containerized group)
-    - SEMAPHORE / SEMAPHORED_KEYS already present on any instance
     - Explicit shmem DYNAMIC_ENV entries detected (user-defined dependency tree)
 
     Parameters
@@ -2841,29 +4651,6 @@ class _DeeployMixin:
       # end if
 
       if not isinstance(plugins, list) or len(plugins) < 2:
-        return plugins
-      # end if
-
-      def has_semaphore_config(plugin_list):
-        for plugin in plugin_list:
-          instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
-          if not isinstance(instances, list):
-            continue
-          # end if
-          for instance in instances:
-            if not isinstance(instance, dict):
-              continue
-            # end if
-            if "SEMAPHORE" in instance or "SEMAPHORED_KEYS" in instance:
-              return True
-            # end if
-          # end for instance
-        # end for plugin
-        return False
-      # end has_semaphore_config
-
-      if has_semaphore_config(plugins):
-        self.Pd("Skipping semaphore autowire; semaphore config already provided.")
         return plugins
       # end if
 
@@ -2905,6 +4692,8 @@ class _DeeployMixin:
           if not isinstance(instance, dict):
             continue
           # end if
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORE, None)
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS, None)
           instance_id = instance.get(self.ct.CONFIG_INSTANCE.K_INSTANCE_ID)
           if not instance_id:
             continue
@@ -2913,14 +4702,7 @@ class _DeeployMixin:
           if plugin_name:
             self._validate_plugin_name(plugin_name)
           semaphore_key = "{}__{}".format(app_id, plugin_name) if plugin_name else self.sanitize_name("{}__{}".format(app_id, instance_id))
-          existing_sem = instance.get("SEMAPHORE")
-          if existing_sem and existing_sem != semaphore_key:
-            raise ValueError(
-              "plugin_name '{}' implies SEMAPHORE '{}' but instance already has '{}'.".format(
-                plugin_name or instance_id, semaphore_key, existing_sem
-              )
-            )
-          instance["SEMAPHORE"] = semaphore_key
+          instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORE] = semaphore_key
           semaphore_keys.append(semaphore_key)
         # end for instance
       # end for native_plugin
@@ -2939,7 +4721,9 @@ class _DeeployMixin:
           if not isinstance(instance, dict):
             continue
           # end if
-          instance["SEMAPHORED_KEYS"] = list(semaphore_keys)
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORE, None)
+          instance.pop(DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS, None)
+          instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS] = list(semaphore_keys)
         # end for instance
       # end for container_plugin
 
@@ -2953,15 +4737,18 @@ class _DeeployMixin:
     Prepare the a single plugin instance for the pipeline creation.
     """
     instance_id = self._generate_plugin_instance_id(signature=inputs.plugin_signature)
+    app_params = self.deepcopy(inputs.app_params)
+    self._apply_request_per_node_config_to_payload(inputs, app_params)
     plugin = {
       self.ct.CONFIG_PLUGIN.K_SIGNATURE : inputs.plugin_signature,
       self.ct.CONFIG_PLUGIN.K_INSTANCES : [
         {
           self.ct.CONFIG_INSTANCE.K_INSTANCE_ID : instance_id,
-          **inputs.app_params
+          **app_params
         }
       ]
     }
+    self._canonicalize_per_node_config_key(plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES][0])
     return plugin
 
   def deeploy_prepare_single_plugin_instance_update(self, inputs, instance_id, plugin_signature=None, plugin_config=None, fallback_instance=None):
@@ -3007,6 +4794,7 @@ class _DeeployMixin:
       config_copy.pop(DEEPLOY_KEYS.PLUGIN_SIGNATURE, None)
       config_copy.pop("signature", None)
       instance_payload = config_copy
+      self._inherit_existing_cockroachdb_cert_config(instance_payload, fallback_instance)
     else:
       app_params = None
       try:
@@ -3031,6 +4819,8 @@ class _DeeployMixin:
       else:
         instance_payload = {}
 
+      self._apply_request_per_node_config_to_payload(inputs, instance_payload)
+
     plugin = {
       self.ct.CONFIG_PLUGIN.K_SIGNATURE: signature,
       self.ct.CONFIG_PLUGIN.K_INSTANCES: [
@@ -3040,6 +4830,8 @@ class _DeeployMixin:
         }
       ]
     }
+    self._canonicalize_per_node_config_key(plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES][0])
+    self._inherit_existing_per_node_config_marker(plugin[self.ct.CONFIG_PLUGIN.K_INSTANCES][0], fallback_instance)
     return plugin
 
   def _generate_plugin_instance_id(self, signature: str):
@@ -3095,6 +4887,12 @@ class _DeeployMixin:
     plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
 
     if plugins_array and isinstance(plugins_array, list):
+      request_key, _request_config = self._get_request_per_node_config(inputs)
+      if request_key is not None:
+        raise ValueError(
+          "Top-level perNodeConfig is only supported for legacy single-plugin requests; "
+          "put PER_NODE_CONFIG inside the target plugin when using plugins[]."
+        )
       # Group plugin instances by signature
       plugins_by_signature = {}
 
@@ -3132,6 +4930,7 @@ class _DeeployMixin:
           self.ct.CONFIG_INSTANCE.K_INSTANCE_ID: instance_id,
           **instance_config
         }
+        self._canonicalize_per_node_config_key(prepared_instance)
 
         # Group by signature
         if signature not in plugins_by_signature:
@@ -3147,11 +4946,12 @@ class _DeeployMixin:
         }
         prepared_plugins.append(prepared_plugin)
 
-      # Validate plugin_name uniqueness and charset (independent of shmem)
-      self._validate_plugin_names(prepared_plugins)
+      # Validate runtime names and semaphore keys independent of shmem consumers.
+      self._validate_plugin_runtime_keys(prepared_plugins)
 
       if app_id and self._has_shmem_dynamic_env(prepared_plugins):
         prepared_plugins = self._resolve_shmem_in_plugins(prepared_plugins, app_id)
+        self._validate_final_emitted_semaphore_keys(prepared_plugins)
 
       return prepared_plugins
 
@@ -3167,6 +4967,8 @@ class _DeeployMixin:
       discovered_plugin_instances=[],
       dct_deeploy_specs=None, job_app_type=None,
       dct_deeploy_specs_create=None,
+      prepared_create_deploy_plan=None,
+      skip_create_response_key_reset=False,
       wait_for_responses=True
   ):
     """
@@ -3196,6 +4998,11 @@ class _DeeployMixin:
         Detected or provided job app type.
     dct_deeploy_specs_create : dict, optional
         Deeploy specs used for create operations.
+    prepared_create_deploy_plan : dict, optional
+        Prevalidated create payload to dispatch without rebuilding generated
+        response keys.
+    skip_create_response_key_reset : bool, optional
+        When True, the caller already reset the plan response keys.
     wait_for_responses : bool, optional
         When True, block until responses are collected or timeout.
 
@@ -3226,7 +5033,9 @@ class _DeeployMixin:
       new_response_keys, created_pipeline_to_persist = self.__create_pipeline_on_nodes(
         new_nodes, inputs, app_id, app_alias, app_type, owner,
         job_app_type=job_app_type,
-        dct_deeploy_specs=dct_deeploy_specs_create
+        dct_deeploy_specs=dct_deeploy_specs_create,
+        prepared_deploy_plan=prepared_create_deploy_plan,
+        skip_response_key_reset=skip_create_response_key_reset,
       )
       response_keys.update(new_response_keys)
       if created_pipeline_to_persist is not None:
@@ -3259,8 +5068,8 @@ class _DeeployMixin:
                                             update_nodes,
                                             running_apps_for_job))
 
-    self.P(f"Prepared create pipelines: {self.json_dumps(create_pipelines)}")
-    self.P(f"Prepared update pipelines: {self.json_dumps(update_pipelines)}")
+    self.P(f"Prepared create pipelines: {self.json_dumps(self._redact_per_node_config_for_log(create_pipelines))}")
+    self.P(f"Prepared update pipelines: {self.json_dumps(self._redact_per_node_config_for_log(update_pipelines))}")
     self.P(f"Prepared chainstore response keys: {self.json_dumps(chainstore_response_keys)}")
 
     # RESET chainstore_response_keys here
@@ -3317,7 +5126,13 @@ class _DeeployMixin:
       List of discovered plugin instances with details.
     """
     apps = self._get_online_apps(owner=owner, target_nodes=target_nodes)
-    self.P(f"online apps for owner {owner} and target_nodes {target_nodes}: {self.json_dumps(apps)}")
+    self.P(
+      "online apps for owner {} and target_nodes {}: {}".format(
+        owner,
+        target_nodes,
+        self.json_dumps(self._redact_per_node_config_for_log(apps)),
+      )
+    )
     discovered_plugins = []
     for node, pipelines in apps.items():
       iter_plugins = []
@@ -3400,7 +5215,7 @@ class _DeeployMixin:
     """
     self.Pd("Sending instance command to targets...")
     for plugin in plugins:
-      self.Pd(self.json_dumps(plugin))
+      self.Pd(self.json_dumps(self._redact_per_node_config_for_log(plugin)))
       self.cmdapi_send_instance_command(pipeline=plugin[DEEPLOY_PLUGIN_DATA.APP_ID],
                                         signature=plugin[DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE],
                                         instance_id=plugin[DEEPLOY_PLUGIN_DATA.INSTANCE_ID],
@@ -3624,7 +5439,7 @@ class _DeeployMixin:
     {"0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g":{"xxxxxxxxxxxxx_74524a2":{"deeploy_specs":{"allow_replication_in_the_wild":false,"current_target_nodes":["0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g"],"date_created":1759258054.05717,"date_updated":1759258054.05717,"job_id":66,"job_tags":[],"nr_target_nodes":1,"project_id":null,"project_name":null,"spare_nodes":[]},"initiator":"0xai_AzMjCS6GuOV8Q3O-XvQfkvy9J-9F20M_yCGDzLFOd4mn","is_deeployed":true,"last_config":"2025-09-30 21:17:50.119197","owner":"0x311a63B88df90f19cd9bD7D9000B70480d842472","plugins":{"CONTAINER_APP_RUNNER":[{"instance":"CONTAINER_APP_52d2c8","instance_conf":{"CHAINSTORE_PEERS":["0xai_A5UKxpSizb-O-4nE23vog8ioR-kQy64W3iePncYo4Jfc","0xai_Avvuy6USRwVfbbxEG2HPiCz85mSJle3zo2MbDh5kBD-g"],"CHAINSTORE_RESPONSE_KEY":"CONTAINER_APP_52d2c8_4280c161","CLOUDFLARE_TOKEN":"some-test-token","CONTAINER_RESOURCES":{"cpu":1,"memory":"128m"},"CR":"docker.io","ENV":{"env3":3,"env4":4,"upd":"ok1","var1":2222222},"IMAGE":"tvitalii/ratio1-drive","IMAGE_PULL_POLICY":"always","INSTANCE_ID":"CONTAINER_APP_52d2c8","NGROK_USE_API":true,"PORT":3333,"RESTART_POLICY":"always","TUNNEL_ENGINE":"cloudflare"},"last_alive":null,"last_error":null,"start":"2025-09-30 21:53:01.643950"}]}}}}
     """
     self.Pd("Preparing create and update pipelines...")
-    self.Pd(f"Base pipeline: {self.json_dumps(base_pipeline)}")
+    self.Pd(f"Base pipeline: {self.json_dumps(self._redact_per_node_config_for_log(base_pipeline))}")
     self.Pd(f"New nodes {type(new_nodes)}: {self.json_dumps(new_nodes)}")
     self.Pd(f"Update nodes{type(update_nodes)}: {self.json_dumps(update_nodes)}")
 
@@ -3640,9 +5455,13 @@ class _DeeployMixin:
       pipeline_params = {}
     base_pipeline["pipeline_params"] = self.deepcopy(pipeline_params)
 
-    chainstore_peers = list(set(new_nodes + update_nodes))
     raw_deeploy_specs = base_pipeline.get(NetMonCt.DEEPLOY_SPECS, {})
     deeploy_specs = self.deepcopy(raw_deeploy_specs) if isinstance(raw_deeploy_specs, dict) else {}
+    requested_nodes = []
+    for node in list(update_nodes or []) + list(new_nodes or []):
+      if node not in requested_nodes:
+        requested_nodes.append(node)
+    chainstore_peers = self._ordered_nodes_for_per_node_config(requested_nodes, deeploy_specs)
     job_app_type = None
     if isinstance(deeploy_specs, dict):
       job_app_type = deeploy_specs.get(DEEPLOY_KEYS.JOB_APP_TYPE)
@@ -3658,6 +5477,7 @@ class _DeeployMixin:
       deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
       deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
+    self._prepare_cockroachdb_secure_config_for_pipeline(base_pipeline, chainstore_peers)
 
     chainstore_response_keys = self.defaultdict(list)
 
@@ -3670,6 +5490,7 @@ class _DeeployMixin:
         plugin_instances = plugin["INSTANCES"]
         for instance in plugin_instances:
           instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = chainstore_peers
+          instance["PER_NODE_TARGET_NODES"] = self.deepcopy(chainstore_peers)
           instance_id = self._generate_plugin_instance_id(signature=plugin_signature)
           chainstore_response_key = self._generate_chainstore_response_key(
             instance_id=instance_id)
@@ -3697,6 +5518,7 @@ class _DeeployMixin:
           
           for i, instance in enumerate(plugin_instances):
             instance[self.ct.BIZ_PLUGIN_DATA.CHAINSTORE_PEERS] = chainstore_peers
+            instance["PER_NODE_TARGET_NODES"] = self.deepcopy(chainstore_peers)
             
             # Use instance data from running_apps_for_job if available
             if i < len(running_plugin_instances):
@@ -3914,7 +5736,11 @@ class _DeeployMixin:
     """
     if self.cfg_deeploy_verbose:
       full_data = self.netmon.network_known_nodes()
-      self.Pd(f"Full data:\n{self.json_dumps(full_data, indent=2)}")
+      self.Pd(
+        "Full data:\n{}".format(
+          self.json_dumps(self._redact_per_node_config_for_log(full_data), indent=2)
+        )
+      )
     pipelines = self.netmon.network_known_configs()
     non_admin_pipelines = {
       node : [x for x in pipelines[node] if x['NAME'].lower() != 'admin_pipeline']
@@ -4052,7 +5878,7 @@ class _DeeployMixin:
             timeout=get_apps_r1fs_timeout,
             pin=False,
             raise_on_error=False,
-            show_logs=True,
+            show_logs=False,
           )
         except Exception as exc:
           self.Pd(f"Failed to load R1FS payload for job {job_id}: {exc}", color='y')
@@ -4222,9 +6048,9 @@ class _DeeployMixin:
       chainstore_response_key=chainstore_response_key,
       chainstore_peers_key=chainstore_peers_key,
     )
+    requested_name = requested_conf.get(DEEPLOY_KEYS.PLUGIN_NAME)
+    matches = []
 
-    best_candidate = None
-    best_score = -1
     for candidate in candidates:
       candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
       if not candidate_instance_id or candidate_instance_id in used_instance_ids:
@@ -4235,19 +6061,66 @@ class _DeeployMixin:
         chainstore_response_key=chainstore_response_key,
         chainstore_peers_key=chainstore_peers_key,
       )
-      score = self._score_plugin_config_match(requested_conf, candidate_conf)
-      if score > best_score:
-        best_score = score
-        best_candidate = candidate
+      candidate_name = (
+        candidate_conf.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        or candidate.get(DEEPLOY_KEYS.PLUGIN_NAME)
+      )
+      if self._plugin_update_request_matches_identity(
+        requested_conf,
+        discovered_plugin_name=candidate_name,
+        discovered_config_hash=compact_canonical_sha256(candidate_conf),
+      ):
+        matches.append(candidate)
 
-    if best_candidate is None:
-      for candidate in candidates:
-        candidate_instance_id = candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
-        if candidate_instance_id and candidate_instance_id not in used_instance_ids:
-          best_candidate = candidate
-          break
+    self._validate_single_plugin_update_match(
+      matches,
+      requested_name=requested_name,
+    )
 
-    return best_candidate
+    return matches[0] if matches else None
+
+  def _plugin_update_request_matches_identity(self, requested_conf, discovered_plugin_name, discovered_config_hash):
+    """
+    Match an update payload to one discovered logical identity.
+
+    Existing-instance updates without an explicit instance_id are intentionally
+    strict: plugin_name wins when present; nameless legacy payloads match only
+    by exact sanitized configuration fingerprint.
+    """
+    requested_name = requested_conf.get(DEEPLOY_KEYS.PLUGIN_NAME)
+    if requested_name:
+      return discovered_plugin_name == requested_name
+
+    if discovered_plugin_name:
+      return False
+
+    return compact_canonical_sha256(requested_conf) == discovered_config_hash
+
+  def _validate_single_plugin_update_match(self, matches, requested_name=None, signature=None):
+    if len(matches) <= 1:
+      return
+
+    unique_instance_ids = {
+      str(candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID))
+      for candidate in matches
+      if candidate.get(DEEPLOY_PLUGIN_DATA.INSTANCE_ID)
+    }
+    if len(unique_instance_ids) > 1 or not unique_instance_ids:
+      self._raise_ambiguous_plugin_update_match(
+        requested_name=requested_name,
+        signature=signature,
+      )
+
+  def _raise_ambiguous_plugin_update_match(self, requested_name=None, signature=None):
+    if requested_name:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.PLUGINS3}: Ambiguous update request for plugin_name "
+        f"'{requested_name}'."
+      )
+    msg = f"{DEEPLOY_ERRORS.PLUGINS3}: Ambiguous no-ID/no-name update request"
+    if signature:
+      msg += f" for plugin signature '{signature}'"
+    raise ValueError(f"{msg}.")
 
   def _extract_plugin_request_conf(self, plugin_entry, instance_id_key, chainstore_response_key, chainstore_peers_key):
     """
@@ -4297,30 +6170,3 @@ class _DeeployMixin:
       result[key] = value
 
     return result
-
-  # TODO: Remove this once instance_ids are sent and make sure instance_id is mandatory.
-  # Update should be done strictly by instance_id.
-  def _score_plugin_config_match(self, requested_conf, existing_conf):
-    """
-    Compute a similarity score between a request payload and an existing instance configuration.
-    """
-    if not requested_conf:
-      return 0
-
-    score = 0
-    for key, value in requested_conf.items():
-      if key not in existing_conf:
-        continue
-      existing_value = existing_conf[key]
-      if isinstance(value, (dict, list)) and isinstance(existing_value, (dict, list)):
-        try:
-          if self.json_dumps(value, sort_keys=True) == self.json_dumps(existing_value, sort_keys=True):
-            score += 3
-        except TypeError:
-          continue
-      elif value == existing_value:
-        score += 2
-      elif str(value) == str(existing_value):
-        score += 1
-
-    return score

@@ -91,7 +91,7 @@ class DeeploySemaphoreWiringTests(unittest.TestCase):
     self.assertNotIn("SEMAPHORE", native_instance)
     self.assertNotIn("SEMAPHORED_KEYS", car_instance)
 
-  def test_autowire_skips_when_manual_semaphore_config_already_present(self):
+  def test_autowire_replaces_inbound_runtime_semaphore_config(self):
     plugin = make_deeploy_plugin()
     plugins = [
       {
@@ -99,14 +99,20 @@ class DeeploySemaphoreWiringTests(unittest.TestCase):
         plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
           {
             plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "native-1",
+            DEEPLOY_KEYS.PLUGIN_NAME: "native-agent",
             "SEMAPHORE": "manual-key",
+            "SEMAPHORED_KEYS": ["old-consumer-key"],
           }
         ],
       },
       {
         plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
         plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
-          {plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "car-1"}
+          {
+            plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "car-1",
+            "SEMAPHORE": "old-container-key",
+            "SEMAPHORED_KEYS": ["manual-key"],
+          }
         ],
       },
     ]
@@ -116,8 +122,10 @@ class DeeploySemaphoreWiringTests(unittest.TestCase):
     native_instance = wired[0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
     car_instance = wired[1][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
 
-    self.assertEqual(native_instance["SEMAPHORE"], "manual-key")
-    self.assertNotIn("SEMAPHORED_KEYS", car_instance)
+    self.assertEqual(native_instance["SEMAPHORE"], "job-001__native-agent")
+    self.assertNotIn("SEMAPHORED_KEYS", native_instance)
+    self.assertNotIn("SEMAPHORE", car_instance)
+    self.assertEqual(car_instance["SEMAPHORED_KEYS"], ["job-001__native-agent"])
 
 
 if __name__ == "__main__":

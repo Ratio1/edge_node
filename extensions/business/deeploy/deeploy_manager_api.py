@@ -11,6 +11,7 @@ from naeural_core import constants as ct
 from .deeploy_job_mixin import _DeeployJobMixin
 
 from .deeploy_mixin import _DeeployMixin
+from .deeploy_chainstore_response_mixin import _DeeployChainstoreResponseMixin
 from .deeploy_target_nodes_mixin import _DeeployTargetNodesMixin
 from extensions.business.mixins.node_tags_mixin import _NodeTagsMixin
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
@@ -20,6 +21,7 @@ from .deeploy_const import (
   DEEPLOY_APP_COMMAND_REQUEST, DEEPLOY_GET_ORACLE_JOB_DETAILS_REQUEST, DEEPLOY_GET_R1FS_JOB_PIPELINE_REQUEST,
   DEEPLOY_NODE_SPECS_REQUEST, DEEPLOY_PLUGIN_DATA, JOB_APP_TYPES, JOB_APP_TYPES_ALL,
   DEEPLOY_GET_PREFERRED_NODES_REQUEST, DEEPLOY_SAVE_PREFERRED_NODES_REQUEST,
+  CONTAINERIZED_APPS_SIGNATURES,
 )
   
 
@@ -59,6 +61,7 @@ _CONFIG = {
 class DeeployManagerApiPlugin(
   BasePlugin,
   _DeeployMixin,
+  _DeeployChainstoreResponseMixin,
   _DeeployTargetNodesMixin,
   _NodeTagsMixin,
   _DeeployJobMixin,
@@ -260,15 +263,22 @@ class DeeployManagerApiPlugin(
         f"to cover gas fees. Please top up the address and retry."
       )
 
+  def _redact_failed_request_payload(self, payload):
+    """
+    Redact request fields that can carry large or sensitive values.
+    """
+    return self._redact_per_node_config_for_log(payload)
+
   def __handle_error(self, exc, request, extra_error_code=DEEPLOY_ERRORS.GENERIC):
     """
     Handle the error and return a response.
     """
-    self.Pd("Error processing request: {}, Inputs: {}".format(exc, request), color='r')
+    redacted_request = self._redact_failed_request_payload(request)
+    self.Pd("Error processing request: {}, Inputs: {}".format(exc, redacted_request), color='r')
     result = {
       DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.FAIL,
       DEEPLOY_KEYS.ERROR : str(exc),
-      DEEPLOY_KEYS.REQUEST : request,
+      DEEPLOY_KEYS.REQUEST : redacted_request,
     }
     if self.cfg_deeploy_verbose > 1:
       lines = self.trace_info().splitlines()
@@ -316,7 +326,7 @@ class DeeployManagerApiPlugin(
       
       result = {
         DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
-        DEEPLOY_KEYS.APPS: apps,
+        DEEPLOY_KEYS.APPS: self._redact_deeploy_status_payload(apps),
         DEEPLOY_KEYS.AUTH : auth_result,
       }
     except Exception as e:
@@ -595,8 +605,7 @@ class DeeployManagerApiPlugin(
       request_type = "create pipeline" if is_create else "update pipeline"
       sender, inputs = self.deeploy_verify_and_get_inputs(request, request_type=request_type)
       normalized_request = self._normalize_plugins_input(self.deepcopy(request))
-      if DEEPLOY_KEYS.PLUGINS in normalized_request:
-        inputs[DEEPLOY_KEYS.PLUGINS] = normalized_request[DEEPLOY_KEYS.PLUGINS]
+      self._sync_normalized_plugins_input(inputs, normalized_request)
       auth_result = self.deeploy_get_auth_result(inputs)
       job_id = inputs.get(DEEPLOY_KEYS.JOB_ID, None)
       is_confirmable_job = inputs.chainstore_response
@@ -615,6 +624,7 @@ class DeeployManagerApiPlugin(
       app_alias = inputs.app_alias
       app_type = inputs.pipeline_input_type
       job_app_type = inputs.get(DEEPLOY_KEYS.JOB_APP_TYPE, None)
+      has_request_job_app_type = bool(job_app_type)
       if job_app_type:
         job_app_type = str(job_app_type).lower()
         if job_app_type not in JOB_APP_TYPES_ALL:
@@ -638,22 +648,29 @@ class DeeployManagerApiPlugin(
           msg = f"{DEEPLOY_ERRORS.REQUEST13}: App ID is required."
           raise ValueError(msg)
 
-      # check payment
-      is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
-      if not is_valid:
-        msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
-        raise ValueError(msg)
-      # TODO: Add check if jobType resources match the requested resources.
-
       # Get nodes based on operation type
       discovered_plugin_instances = []
       deployment_nodes = []
       confirmation_nodes = []
       nodes_changed = False
       deeploy_specs_for_update = None
+      deeploy_specs_payload = None
+      prepared_create_deploy_plan = None
+      skip_create_response_key_reset = False
       previous_pipeline_cid = None
       if is_create:
+        is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
+        if not is_valid:
+          msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
+          raise ValueError(msg)
+        # TODO: Add check if jobType resources match the requested resources.
+
         deployment_nodes = self._check_nodes_availability(inputs)
+        self._validate_cockroachdb_target_change(
+          current_nodes=[],
+          requested_nodes=deployment_nodes,
+          inputs=inputs,
+        )
         confirmation_nodes = list(deployment_nodes)
         nodes_changed = True
       else:
@@ -666,7 +683,11 @@ class DeeployManagerApiPlugin(
         discovered_plugin_instances = pipeline_context["discovered_instances"]
         current_nodes = pipeline_context["nodes"]
         deeploy_specs_for_update = pipeline_context["deeploy_specs"]
-        self.P(f"Discovered plugin instances: {self.json_dumps(discovered_plugin_instances)}")
+        self.P(
+          "Discovered plugin instances: {}".format(
+            self.json_dumps(self._redact_per_node_config_for_log(discovered_plugin_instances))
+          )
+        )
 
         requested_nodes = inputs.get(DEEPLOY_KEYS.TARGET_NODES, None)
         normalized_requested_nodes = [
@@ -701,17 +722,23 @@ class DeeployManagerApiPlugin(
         if not deployment_targets:
           msg = f"{DEEPLOY_ERRORS.NODES2}: Update request must include at least one target node."
           raise ValueError(msg)
+        self._validate_cockroachdb_target_change(
+          current_nodes=current_nodes,
+          requested_nodes=deployment_targets,
+          inputs=inputs,
+          discovered_plugin_instances=discovered_plugin_instances,
+        )
+        inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_targets
+        inputs.target_nodes = deployment_targets
+        inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
+        inputs.target_nodes_count = len(deployment_targets)
+        self._inherit_cockroachdb_secure_config_from_discovered(inputs, discovered_plugin_instances)
 
         if job_id is not None:
           try:
             previous_pipeline_cid = self._get_pipeline_from_cstore(job_id)
           except Exception as exc:
             self.Pd(f"Unable to read previous pipeline CID for job {job_id}: {exc}", color='y')
-
-        inputs[DEEPLOY_KEYS.TARGET_NODES] = deployment_targets
-        inputs.target_nodes = deployment_targets
-        inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
-        inputs.target_nodes_count = len(deployment_targets)
 
         # Ensure plugin IDs are preserved for existing instances before any destructive action.
         self._ensure_plugin_instance_ids(
@@ -722,6 +749,68 @@ class DeeployManagerApiPlugin(
           job_id=job_id,
         )
 
+        if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
+          msg = (
+            f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
+            f"{type(deeploy_specs_for_update).__name__}."
+          )
+          raise ValueError(msg)
+        deeploy_specs_payload = (
+          self.deepcopy(deeploy_specs_for_update)
+          if isinstance(deeploy_specs_for_update, dict)
+          else {}
+        )
+        deeploy_specs_payload = self._ensure_deeploy_specs_job_config(
+          deeploy_specs_payload,
+          pipeline_params=pipeline_params,
+        )
+
+        plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
+        if isinstance(plugins_array, list):
+          materialized_plugins = self._materialize_update_plugins_for_redeploy(
+            inputs,
+            discovered_plugin_instances,
+          )
+          inputs[DEEPLOY_KEYS.PLUGINS] = materialized_plugins
+          inputs.plugins = materialized_plugins
+          # Validate the exact replacement payload, including omitted live plugins
+          # that were materialized from discovery, before any payment/node/delete work.
+          self._validate_plugins_array(materialized_plugins)
+
+          if not has_request_job_app_type:
+            replacement_job_app_type = deeploy_specs_payload.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+            if isinstance(replacement_job_app_type, str):
+              replacement_job_app_type = replacement_job_app_type.lower()
+            if replacement_job_app_type in JOB_APP_TYPES_ALL:
+              job_app_type = replacement_job_app_type
+            else:
+              plugins_for_detection = self.deeploy_prepare_plugins(inputs)
+              job_app_type = self.deeploy_detect_job_app_type(plugins_for_detection)
+              has_containerized_replacement = any(
+                isinstance(plugin_entry, dict) and
+                isinstance(plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE), str) and
+                plugin_entry.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE).upper() in CONTAINERIZED_APPS_SIGNATURES
+                for plugin_entry in materialized_plugins
+              )
+              if job_app_type == JOB_APP_TYPES.NATIVE and has_containerized_replacement:
+                msg = (
+                  f"{DEEPLOY_ERRORS.REQUEST3}. Update request omitted job_app_type and the live "
+                  "deeploy_specs do not identify the replacement job_app_type for a containerized "
+                  "replacement payload. Provide job_app_type explicitly."
+                )
+                raise ValueError(msg)
+              if job_app_type not in JOB_APP_TYPES_ALL:
+                job_app_type = JOB_APP_TYPES.NATIVE
+            inputs[DEEPLOY_KEYS.JOB_APP_TYPE] = job_app_type
+            inputs.job_app_type = job_app_type
+            self.P(f"Detected replacement job app type: {job_app_type}")
+
+        is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
+        if not is_valid:
+          msg = f"{DEEPLOY_ERRORS.PAYMENT1}: The request job is not paid, or the job is not sent by the job owner."
+          raise ValueError(msg)
+        # TODO: Add check if jobType resources match the requested resources.
+
         validated_nodes = self._check_nodes_availability(inputs)
         if set(validated_nodes) != set(deployment_targets):
           msg = (
@@ -730,7 +819,22 @@ class DeeployManagerApiPlugin(
           )
           raise ValueError(msg)
 
-        # All validations passed; remove the running job and immediately redeploy.
+        # Validate and prepare the exact create payload before any destructive action.
+        prepared_create_deploy_plan = self._prepare_create_pipeline_deploy_plan(
+          nodes=validated_nodes,
+          inputs=inputs,
+          app_id=app_id,
+          job_app_type=job_app_type,
+          dct_deeploy_specs=deeploy_specs_payload,
+        )
+        if prepared_create_deploy_plan.get("enable_chainstore_response"):
+          self._reset_chainstore_response_keys(
+            prepared_create_deploy_plan.get("response_keys", {}),
+            context=f"replacement create pipeline '{app_alias}'",
+          )
+          skip_create_response_key_reset = True
+
+        # All validations and response-key resets passed; remove the running job and redeploy.
         self.delete_pipeline_from_nodes(
           app_id=app_id,
           job_id=job_id,
@@ -748,21 +852,22 @@ class DeeployManagerApiPlugin(
       inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_nodes)
       inputs.target_nodes_count = len(deployment_nodes)
 
-      if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
-        msg = (
-          f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
-          f"{type(deeploy_specs_for_update).__name__}."
+      if deeploy_specs_payload is None:
+        if deeploy_specs_for_update is not None and not isinstance(deeploy_specs_for_update, dict):
+          msg = (
+            f"{DEEPLOY_ERRORS.REQUEST3}. Unexpected 'deeploy_specs' payload type "
+            f"{type(deeploy_specs_for_update).__name__}."
+          )
+          raise ValueError(msg)
+        deeploy_specs_payload = (
+          self.deepcopy(deeploy_specs_for_update)
+          if isinstance(deeploy_specs_for_update, dict)
+          else {}
         )
-        raise ValueError(msg)
-      deeploy_specs_payload = (
-        self.deepcopy(deeploy_specs_for_update)
-        if isinstance(deeploy_specs_for_update, dict)
-        else {}
-      )
-      deeploy_specs_payload = self._ensure_deeploy_specs_job_config(
-        deeploy_specs_payload,
-        pipeline_params=pipeline_params,
-      )
+        deeploy_specs_payload = self._ensure_deeploy_specs_job_config(
+          deeploy_specs_payload,
+          pipeline_params=pipeline_params,
+        )
 
       dct_status, str_status, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
@@ -774,6 +879,8 @@ class DeeployManagerApiPlugin(
         update_nodes=[],
         discovered_plugin_instances=discovered_plugin_instances,
         dct_deeploy_specs_create=deeploy_specs_payload,
+        prepared_create_deploy_plan=prepared_create_deploy_plan,
+        skip_create_response_key_reset=skip_create_response_key_reset,
         job_app_type=job_app_type,
         wait_for_responses=not async_mode,
       )
@@ -804,6 +911,7 @@ class DeeployManagerApiPlugin(
           dct_request['plugins_count'] = len(plugins_array)
         # if pipeline_params:
         #   dct_request[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
+      dct_request = self._redact_per_node_config_for_log(dct_request)
 
       if async_mode:
         if len(response_keys) == 0:
@@ -1345,7 +1453,11 @@ class DeeployManagerApiPlugin(
     - See create_pipeline endpoint for detailed parameter documentation and examples
 
     """
-    self.P(f"Received an update_pipeline request with body: {self.json_dumps(request)}")
+    self.P(
+      "Received an update_pipeline request with body: {}".format(
+        self.json_dumps(self._redact_failed_request_payload(request))
+      )
+    )
     result = self._process_pipeline_request(request, is_create=False, async_mode=True)
     if isinstance(result, dict) and result.get('__pending__') is not None:
       return self._register_pending_deploy_request(result['__pending__'])
@@ -1400,7 +1512,11 @@ class DeeployManagerApiPlugin(
 
       # todo: check the count of running workers and compare with the amount of allowed workers count from blockchain.
       
-      self.P(f"Discovered running apps for job: {self.json_dumps(running_apps_for_job)}")
+      self.P(
+        "Discovered running apps for job: {}".format(
+          self.json_dumps(self._redact_per_node_config_for_log(running_apps_for_job))
+        )
+      )
 
       if not running_apps_for_job or not len(running_apps_for_job):
         msg = f"{DEEPLOY_ERRORS.NODES3}: No running workers found for provided job_id and owner '{auth_result[DEEPLOY_KEYS.ESCROW_OWNER]}'."
@@ -1423,6 +1539,7 @@ class DeeployManagerApiPlugin(
         dct_request = self.deepcopy(request)
       else:
         dct_request = None
+      dct_request = self._redact_per_node_config_for_log(dct_request) if dct_request is not None else None
 
       if len(response_keys) == 0:
         if not is_confirmable_job:
@@ -1509,7 +1626,7 @@ class DeeployManagerApiPlugin(
       )
       request_payload = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
-        DEEPLOY_KEYS.TARGETS: discovered_instances,
+        DEEPLOY_KEYS.TARGETS: self._redact_deeploy_status_payload(discovered_instances),
       }
 
       if job_id is not None:
@@ -1767,7 +1884,7 @@ class DeeployManagerApiPlugin(
       result = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
         DEEPLOY_KEYS.JOB_ID: job_id,
-        DEEPLOY_KEYS.PIPELINE: pipeline,
+        DEEPLOY_KEYS.PIPELINE: self._redact_deeploy_status_payload(pipeline),
         DEEPLOY_KEYS.AUTH: auth_result,
       }
     except Exception as e:
