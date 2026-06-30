@@ -16,6 +16,11 @@ from .catalog import (
   selection_metadata,
 )
 from .constants import (
+  MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED,
+  MODEL_TEST_ERROR_PROVIDER_RATE_LIMITED,
+  MODEL_TEST_ERROR_PROVIDER_RESPONSE_INVALID,
+  MODEL_TEST_ERROR_PROVIDER_TIMEOUT,
+  MODEL_TEST_ERROR_PROVIDER_UNREACHABLE,
   MODEL_TEST_JOB_TYPE,
   MODEL_TEST_PHASE_INDEX,
   MODEL_TEST_PHASE_NODE_SELECTED,
@@ -23,11 +28,14 @@ from .constants import (
 )
 from .evaluators import resolve_evaluator_option
 from .node_selection import select_model_test_execution_node
+from .runner import ModelTestProviderError, OpenAICompatibleProviderClient
 from .secrets import (
+  _runtime_provider,
   attach_model_test_provider_secret,
   sanitize_model_test_job_config_for_archive,
 )
 from .security import (
+  MODEL_PROVIDER_CREDENTIAL_UNAVAILABLE,
   validate_provider_config_shape,
   validate_model_provider_credentials,
   validate_provider_url,
@@ -41,6 +49,19 @@ def _validation_error(message: str, *, error_class=None):
   if error_class:
     result["error_class"] = error_class
   return result
+
+
+def _preflight_error_message(error_class, http_status=None):
+  suffix = f" (HTTP {http_status})" if http_status else ""
+  messages = {
+    MODEL_PROVIDER_CREDENTIAL_UNAVAILABLE: "Provider preflight requires an API key payload.",
+    MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED: f"Provider rejected the request. Check the API key, URL, or provider access policy{suffix}.",
+    MODEL_TEST_ERROR_PROVIDER_RATE_LIMITED: f"Provider rate limited the preflight request{suffix}.",
+    MODEL_TEST_ERROR_PROVIDER_TIMEOUT: "Provider preflight timed out.",
+    MODEL_TEST_ERROR_PROVIDER_UNREACHABLE: f"Provider endpoint was unreachable or redirected unexpectedly{suffix}.",
+    MODEL_TEST_ERROR_PROVIDER_RESPONSE_INVALID: f"Provider returned an invalid chat-completions response{suffix}.",
+  }
+  return messages.get(error_class) or "Provider preflight failed."
 
 
 def _bounded_text(value, field_path, *, minimum=1, maximum=120):
@@ -268,6 +289,83 @@ def _target_label(model_config):
   return label or model or "Model Test"
 
 
+def preflight_model_test_provider(
+  owner,
+  *,
+  created_by_id="",
+  tested_model=None,
+  tested_model_secret_payload=None,
+  limits=None,
+):
+  """Validate and transiently exercise a tested-model provider before launch."""
+  cfg = get_model_testing_config(owner)
+  if not cfg["ENABLED"]:
+    return {
+      "ok": False,
+      "error": "model_testing_disabled",
+      "message": "Model Testing is disabled by policy.",
+      "disabled_reason": "disabled_by_policy",
+    }
+  if not cfg["REMOTE_PROVIDER_PREFLIGHT_ENABLED"]:
+    return {
+      "ok": False,
+      "error": "provider_preflight_disabled",
+      "message": "Remote provider preflight is disabled by policy.",
+    }
+  created_by_id, err = _bounded_text(created_by_id, "created_by_id")
+  if err:
+    return {"ok": False, **err}
+  normalized_limits, err = _normalize_limits(limits, cfg)
+  if err:
+    return {"ok": False, **err}
+  tested_model_config, err = _validate_provider(
+    "tested_model",
+    tested_model,
+    tested_model_secret_payload,
+    created_by_id=created_by_id,
+  )
+  if err:
+    return {"ok": False, **err}
+  runtime_provider = _runtime_provider(tested_model, tested_model_secret_payload)
+  if not str(runtime_provider.get("api_key") or "").strip():
+    return {
+      "ok": False,
+      "error": "validation_error",
+      "error_class": MODEL_PROVIDER_CREDENTIAL_UNAVAILABLE,
+      "message": _preflight_error_message(MODEL_PROVIDER_CREDENTIAL_UNAVAILABLE),
+      "provider": tested_model_config,
+    }
+  client = OpenAICompatibleProviderClient(
+    runtime_provider,
+    timeout_seconds=normalized_limits.get("per_call_timeout_seconds", 45),
+    max_retries=0,
+    max_response_bytes=4096,
+  )
+  try:
+    client.chat(
+      [{"role": "user", "content": "Return the single word ok."}],
+      max_tokens=min(int(normalized_limits.get("tested_max_tokens", 256) or 256), 8),
+      temperature=0,
+    )
+  except ModelTestProviderError as exc:
+    result = {
+      "ok": False,
+      "error": "provider_preflight_failed",
+      "error_class": exc.error_class,
+      "message": _preflight_error_message(exc.error_class, getattr(exc, "http_status", None)),
+      "provider": tested_model_config,
+    }
+    if getattr(exc, "http_status", None):
+      result["http_status"] = exc.http_status
+    return result
+  return {
+    "ok": True,
+    "status": "ok",
+    "message": "Provider accepted a minimal chat-completions request.",
+    "provider": tested_model_config,
+  }
+
+
 def launch_model_test(
   owner,
   *,
@@ -376,6 +474,9 @@ def launch_model_test(
     "limits": normalized_limits,
     "raw_evidence": {
       "requested": _raw_evidence_requested(raw_evidence),
+    },
+    "provider_preflight": {
+      "enabled": bool(cfg["REMOTE_PROVIDER_PREFLIGHT_ENABLED"]),
     },
     "selected_peers": node_selection["requested_peer_ids"],
     "model_test_node_selection": node_selection,

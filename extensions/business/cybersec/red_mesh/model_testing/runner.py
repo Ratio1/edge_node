@@ -29,6 +29,7 @@ from .constants import (
   MODEL_TEST_ERROR_PROVIDER_UNREACHABLE,
   MODEL_TEST_PHASE_DONE,
   MODEL_TEST_PHASE_EVALUATING,
+  MODEL_TEST_PHASE_FAILED,
   MODEL_TEST_PHASE_RUNNING,
 )
 from .evaluators import HEURISTIC_EVALUATOR_ID
@@ -36,9 +37,10 @@ from .security import validate_provider_url
 
 
 class ModelTestProviderError(RuntimeError):
-  def __init__(self, error_class):
+  def __init__(self, error_class, *, http_status=None):
     super().__init__(error_class)
     self.error_class = error_class
+    self.http_status = http_status
 
 
 def _sha256_text(value):
@@ -100,14 +102,26 @@ class OpenAICompatibleProviderClient:
         last_error = exc
         continue
       if response.status_code in {401, 403}:
-        raise ModelTestProviderError(MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED)
+        raise ModelTestProviderError(
+          MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED,
+          http_status=response.status_code,
+        )
       if response.status_code == 429:
-        raise ModelTestProviderError(MODEL_TEST_ERROR_PROVIDER_RATE_LIMITED)
+        raise ModelTestProviderError(
+          MODEL_TEST_ERROR_PROVIDER_RATE_LIMITED,
+          http_status=response.status_code,
+        )
       if response.status_code >= 500 or response.status_code in {301, 302, 303, 307, 308}:
-        last_error = ModelTestProviderError(MODEL_TEST_ERROR_PROVIDER_UNREACHABLE)
+        last_error = ModelTestProviderError(
+          MODEL_TEST_ERROR_PROVIDER_UNREACHABLE,
+          http_status=response.status_code,
+        )
         continue
       if response.status_code < 200 or response.status_code >= 300:
-        raise ModelTestProviderError(MODEL_TEST_ERROR_PROVIDER_RESPONSE_INVALID)
+        raise ModelTestProviderError(
+          MODEL_TEST_ERROR_PROVIDER_RESPONSE_INVALID,
+          http_status=response.status_code,
+        )
       if len(response.content or b"") > self.max_response_bytes:
         raise ModelTestProviderError(MODEL_TEST_ERROR_PROVIDER_RESPONSE_INVALID)
       try:
@@ -420,6 +434,56 @@ class ModelTestRunner:
       max_response_bytes=max(65536, int(limits.get(max_tokens_key, 256) or 256) * 256),
     )
 
+  def _provider_preflight_enabled(self):
+    preflight = self.job_config.get("provider_preflight")
+    return isinstance(preflight, dict) and bool(preflight.get("enabled"))
+
+  def _preflight_failed_result(self, error_class, cases, normalized_test_sets, evaluator_fields):
+    metrics = {
+      "total_cases": len(cases),
+      "completed_cases": 0,
+      "evaluated_cases": 0,
+      "execution_failed_cases": 0,
+      "evaluation_failed_cases": 0,
+    }
+    summary = {
+      "overall_status": "failed",
+      "error_class": error_class,
+      "test_set_id": normalized_test_sets[0]["id"] if len(normalized_test_sets) == 1 else "",
+      "test_sets": normalized_test_sets,
+      "selected_test_set_metadata": selection_metadata(normalized_test_sets),
+      "cases_total": metrics["total_cases"],
+      "total_cases": metrics["total_cases"],
+      "cases_completed": 0,
+      "completed_cases": 0,
+      "evaluated_cases": 0,
+      "execution_failed_cases": 0,
+      "evaluation_failed_cases": 0,
+      **evaluator_fields,
+    }
+    return {
+      "phase": MODEL_TEST_PHASE_FAILED,
+      "progress": 100.0,
+      "completed_tests": [],
+      "live_metrics": metrics,
+      "model_test_results": {
+        "overall_status": "failed",
+        "error_class": error_class,
+        "test_set_id": summary["test_set_id"],
+        "test_sets": normalized_test_sets,
+        **evaluator_fields,
+        "cases": [],
+      },
+      "model_test_summary": summary,
+    }
+
+  def _preflight_tested_provider(self, tested_client, limits):
+    tested_client.chat(
+      [{"role": "user", "content": "Return the single word ok."}],
+      max_tokens=min(int(limits.get("tested_max_tokens", 256) or 256), 8),
+      temperature=0,
+    )
+
   def run(self):
     limits = dict(self.job_config.get("limits") or {})
     normalized_test_sets, selection_err = normalize_model_test_selection(
@@ -440,6 +504,11 @@ class ModelTestRunner:
       self.job_config.get("evaluator_model") or {},
       limits,
     )
+    if self._provider_preflight_enabled():
+      try:
+        self._preflight_tested_provider(tested_client, limits)
+      except ModelTestProviderError as exc:
+        return self._preflight_failed_result(exc.error_class, cases, normalized_test_sets, evaluator_fields)
     results = []
     metrics = {
       "total_cases": len(cases),

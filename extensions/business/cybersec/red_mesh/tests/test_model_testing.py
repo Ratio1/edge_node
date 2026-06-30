@@ -7,12 +7,14 @@ from unittest.mock import MagicMock, patch
 from extensions.business.cybersec.red_mesh.model_testing import (
   get_capability_status,
   launch_model_test,
+  preflight_model_test_provider,
   select_model_test_execution_node,
   validate_model_provider_credentials,
   validate_provider_url,
 )
 from extensions.business.cybersec.red_mesh.model_testing.constants import (
   MODEL_TEST_ERROR_CANCELED_BY_USER,
+  MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED,
   MODEL_TEST_ERROR_WORKER_LOST,
 )
 from extensions.business.cybersec.red_mesh.model_testing.worker import ModelTestWorker
@@ -363,6 +365,54 @@ class TestModelTestingCbrnPack(unittest.TestCase):
     self.assertTrue(case["safety_aligned"])
     self.assertEqual(result["model_test_summary"]["evaluator_id"], "heuristic_v1")
 
+  def test_runner_preflight_failure_fails_before_case_rows(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import (
+      ModelTestProviderError,
+      ModelTestRunner,
+    )
+
+    class TestedClient:
+      def __init__(self):
+        self.calls = 0
+
+      def chat(self, messages, *, max_tokens, temperature):
+        self.calls += 1
+        raise ModelTestProviderError(MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED)
+
+    tested = TestedClient()
+
+    def client_factory(role, provider_config, limits):
+      if role == "evaluator_model":
+        raise AssertionError("heuristic evaluator must not create evaluator client")
+      return tested
+
+    runner = ModelTestRunner(
+      owner=MagicMock(),
+      job_config={
+        "tested_model": {"adapter": "openai_compatible"},
+        "evaluator_id": "heuristic_v1",
+        "evaluator_model": {
+          "id": "heuristic_v1",
+          "kind": "heuristic",
+          "method": "local_heuristic_v1",
+        },
+        "provider_preflight": {"enabled": True},
+        "test_sets": [{"id": "cbrn_safety_v1", "topic_ids": ["chemical"]}],
+        "limits": {"tested_max_tokens": 64, "evaluator_max_tokens": 128},
+      },
+      provider_client_factory=client_factory,
+    )
+
+    result = runner.run()
+
+    self.assertEqual(tested.calls, 1)
+    self.assertEqual(result["phase"], "failed")
+    self.assertEqual(result["model_test_summary"]["overall_status"], "failed")
+    self.assertEqual(result["model_test_summary"]["error_class"], MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED)
+    self.assertEqual(result["model_test_summary"]["cases_total"], 3)
+    self.assertEqual(result["model_test_summary"]["cases_completed"], 0)
+    self.assertEqual(result["model_test_results"]["cases"], [])
+
   def test_heuristic_failure_rationale_omits_unsafe_excerpt(self):
     from extensions.business.cybersec.red_mesh.model_testing.runner import ModelTestRunner
 
@@ -504,6 +554,70 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
         self.assertEqual(err["error_class"], "credential_unavailable")
         self.assertNotIn(ref, str(err))
 
+  def test_preflight_model_test_provider_accepts_valid_remote_provider(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    secret = "sentinel-model-api-key"
+    response = MagicMock()
+    response.status_code = 200
+    response.content = b'{"choices":[{"message":{"content":"ok"}}]}'
+    response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+
+    with patch("extensions.business.cybersec.red_mesh.model_testing.runner.requests.post", return_value=response):
+      result = preflight_model_test_provider(
+        owner,
+        created_by_id="user-123",
+        tested_model=_provider(),
+        tested_model_secret_payload={"api_key": secret},
+        limits={"tested_max_tokens": 64},
+      )
+
+    self.assertTrue(result["ok"])
+    self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["provider"]["safe_hostname"], PUBLIC_TEST_IP)
+    self.assertNotIn(secret, str(result))
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
+  def test_preflight_model_test_provider_returns_sanitized_provider_auth_failure(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    secret = "sentinel-model-api-key"
+    response = MagicMock()
+    response.status_code = 403
+    response.content = b"forbidden"
+
+    with patch("extensions.business.cybersec.red_mesh.model_testing.runner.requests.post", return_value=response):
+      result = preflight_model_test_provider(
+        owner,
+        created_by_id="user-123",
+        tested_model=_provider(),
+        tested_model_secret_payload={"api_key": secret},
+      )
+
+    self.assertFalse(result["ok"])
+    self.assertEqual(result["error"], "provider_preflight_failed")
+    self.assertEqual(result["error_class"], MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED)
+    self.assertEqual(result["http_status"], 403)
+    self.assertIn("HTTP 403", result["message"])
+    self.assertNotIn(secret, str(result))
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
+  def test_preflight_model_test_provider_requires_api_key_payload(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+
+    result = preflight_model_test_provider(
+      owner,
+      created_by_id="user-123",
+      tested_model=_provider(credential_ref="model_provider/operator/user-123/provider-a"),
+      tested_model_secret_payload=None,
+    )
+
+    self.assertFalse(result["ok"])
+    self.assertEqual(result["error_class"], "credential_unavailable")
+    self.assertIn("requires an API key", result["message"])
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
   def test_enabled_launch_persists_one_worker_entry_and_does_not_echo_secret(self):
     owner = _owner(
       cfg_model_testing={"ENABLED": True},
@@ -529,6 +643,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertNotIn("max_cases", result["job_config"]["limits"])
     self.assertNotIn("api_key", result["job_config"]["limits"])
     self.assertNotIn("unknown_secret_field", result["job_config"]["limits"])
+    self.assertEqual(result["job_config"]["provider_preflight"], {"enabled": True})
     self.assertEqual(result["model_test_node_selection"]["selection_mode"], "manual")
     self.assertEqual(result["model_test_node_selection"]["selected_execution_node"], "node-b")
 
