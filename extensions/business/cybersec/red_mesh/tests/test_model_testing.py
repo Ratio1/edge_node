@@ -106,6 +106,58 @@ class TestModelTestingCapability(unittest.TestCase):
     self.assertNotIn("REDMESH_EVALUATOR_API_KEY", str(status))
     self.assertNotIn("raw-secret-name", str(status))
 
+  def test_capability_status_omits_llm_evaluator_without_credentials_when_enabled(self):
+    owner = _owner(cfg_model_testing={
+      "ENABLED": True,
+      "EVALUATOR_MODELS": [{
+        "id": "eval-primary",
+        "label": "Primary evaluator",
+        "provider_label": "Evaluator Provider",
+        "adapter": "openai_compatible",
+        "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+        "model": "evaluator-model",
+        "api_key_env": "RM_TEST_MISSING_EVALUATOR_KEY",
+        "enabled": True,
+      }],
+      "DEFAULT_EVALUATOR_ID": "eval-primary",
+    })
+
+    with patch.dict("os.environ", {"RM_TEST_MISSING_EVALUATOR_KEY": ""}, clear=False):
+      status = get_capability_status(owner)
+
+    model_testing = status["model_testing"]
+    self.assertTrue(model_testing["enabled"])
+    self.assertEqual([option["id"] for option in model_testing["evaluator_options"]], ["heuristic_v1"])
+    self.assertEqual(model_testing["default_evaluator_id"], "heuristic_v1")
+    self.assertEqual(model_testing["default_evaluator_model_label"], "RedMesh heuristic evaluator")
+    self.assertNotIn("RM_TEST_MISSING_EVALUATOR_KEY", str(status))
+
+  def test_capability_status_includes_llm_evaluator_with_credentials_when_enabled(self):
+    owner = _owner(cfg_model_testing={
+      "ENABLED": True,
+      "EVALUATOR_MODELS": [{
+        "id": "eval-primary",
+        "label": "Primary evaluator",
+        "provider_label": "Evaluator Provider",
+        "adapter": "openai_compatible",
+        "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+        "model": "evaluator-model",
+        "api_key_env": "RM_TEST_EVALUATOR_PRESET_KEY",
+        "enabled": True,
+      }],
+      "DEFAULT_EVALUATOR_ID": "eval-primary",
+    })
+
+    with patch.dict("os.environ", {"RM_TEST_EVALUATOR_PRESET_KEY": "preset-secret"}, clear=False):
+      status = get_capability_status(owner)
+
+    model_testing = status["model_testing"]
+    self.assertEqual([option["id"] for option in model_testing["evaluator_options"]], ["eval-primary", "heuristic_v1"])
+    self.assertEqual(model_testing["default_evaluator_id"], "eval-primary")
+    self.assertEqual(model_testing["default_evaluator_model_label"], "Primary evaluator")
+    self.assertNotIn("preset-secret", str(status))
+    self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", str(status))
+
   def test_launch_model_test_disabled_fails_before_persistence(self):
     owner = _owner()
 

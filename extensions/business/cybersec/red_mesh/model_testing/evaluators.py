@@ -38,6 +38,10 @@ def _enabled_llm_presets(cfg):
   ]
 
 
+def _preset_credentials_available(preset):
+  return bool(_api_key_from_env(str(preset.get("api_key_env") or "").strip()))
+
+
 def _safe_llm_option(preset):
   return {
     "id": str(preset.get("id") or "").strip(),
@@ -52,7 +56,10 @@ def _safe_llm_option(preset):
 def evaluator_options_for_status(cfg):
   """Return UI-safe evaluator options; never include env names or URLs."""
   options = []
+  include_unavailable_presets = not bool(cfg.get("ENABLED"))
   for preset in _enabled_llm_presets(cfg):
+    if not include_unavailable_presets and not _preset_credentials_available(preset):
+      continue
     option = _safe_llm_option(preset)
     if option["id"] and option["label"] and option["provider_label"] and option["model"]:
       options.append(option)
