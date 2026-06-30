@@ -19,7 +19,7 @@ from .constants import (
   MODEL_TEST_PROGRESS_SCHEMA,
   MODEL_TEST_SAFE_ERROR_CLASSES,
 )
-from .launch import launch_model_test
+from .launch import launch_model_test, preflight_model_test_provider
 from .catalog import sanitized_model_test_catalog
 from .node_selection import select_model_test_execution_node
 from .raw_evidence import is_restricted_raw_evidence_artifact
@@ -50,6 +50,7 @@ __all__ = [
   "get_capability_status",
   "is_restricted_raw_evidence_artifact",
   "launch_model_test",
+  "preflight_model_test_provider",
   "sanitized_model_test_catalog",
   "select_model_test_execution_node",
   "validate_model_provider_credentials",

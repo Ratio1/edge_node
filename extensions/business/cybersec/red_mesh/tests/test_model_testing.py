@@ -7,12 +7,14 @@ from unittest.mock import MagicMock, patch
 from extensions.business.cybersec.red_mesh.model_testing import (
   get_capability_status,
   launch_model_test,
+  preflight_model_test_provider,
   select_model_test_execution_node,
   validate_model_provider_credentials,
   validate_provider_url,
 )
 from extensions.business.cybersec.red_mesh.model_testing.constants import (
   MODEL_TEST_ERROR_CANCELED_BY_USER,
+  MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED,
   MODEL_TEST_ERROR_WORKER_LOST,
 )
 from extensions.business.cybersec.red_mesh.model_testing.worker import ModelTestWorker
@@ -69,9 +71,7 @@ def _valid_launch_kwargs(secret="sentinel-model-api-key"):
     "test_set_id": "cbrn_safety_v1",
     "tested_model": _provider(),
     "tested_model_secret_payload": {"api_key": secret},
-    "use_default_evaluator_model": False,
-    "evaluator_model": _provider(),
-    "evaluator_model_secret_payload": {"api_key": secret},
+    "evaluator_id": "heuristic_v1",
   }
 
 
@@ -81,10 +81,17 @@ class TestModelTestingCapability(unittest.TestCase):
     owner = _owner(cfg_model_testing={
       "ENABLED": False,
       "RAW_EVIDENCE_SECRET_REF": "raw-secret-name",
-      "DEFAULT_EVALUATOR_MODEL": {
+      "EVALUATOR_MODELS": [{
+        "id": "eval-openai",
+        "label": "OpenAI evaluator",
         "provider_label": "Evaluator",
-        "api_key": "super-secret",
-      },
+        "adapter": "openai_compatible",
+        "base_url": "https://evaluator.example/v1",
+        "model": "evaluator-model",
+        "api_key_env": "REDMESH_EVALUATOR_API_KEY",
+        "enabled": True,
+      }],
+      "DEFAULT_EVALUATOR_ID": "eval-openai",
     })
 
     status = get_capability_status(owner)
@@ -94,9 +101,64 @@ class TestModelTestingCapability(unittest.TestCase):
     self.assertEqual(model_testing["disabled_reason"], "disabled_by_policy")
     self.assertEqual(model_testing["restricted_raw_permission"], "job:view_raw_model_evidence")
     self.assertEqual(model_testing["restricted_raw_purge_permission"], "job:purge_raw_model_evidence")
-    self.assertEqual(model_testing["default_evaluator_model_label"], "Evaluator")
-    self.assertNotIn("super-secret", str(status))
+    self.assertEqual(model_testing["default_evaluator_id"], "eval-openai")
+    self.assertEqual(model_testing["default_evaluator_model_label"], "OpenAI evaluator")
+    self.assertEqual([option["id"] for option in model_testing["evaluator_options"]], ["eval-openai", "heuristic_v1"])
+    self.assertNotIn("evaluator.example", str(status))
+    self.assertNotIn("REDMESH_EVALUATOR_API_KEY", str(status))
     self.assertNotIn("raw-secret-name", str(status))
+
+  def test_capability_status_omits_llm_evaluator_without_credentials_when_enabled(self):
+    owner = _owner(cfg_model_testing={
+      "ENABLED": True,
+      "EVALUATOR_MODELS": [{
+        "id": "eval-primary",
+        "label": "Primary evaluator",
+        "provider_label": "Evaluator Provider",
+        "adapter": "openai_compatible",
+        "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+        "model": "evaluator-model",
+        "api_key_env": "RM_TEST_MISSING_EVALUATOR_KEY",
+        "enabled": True,
+      }],
+      "DEFAULT_EVALUATOR_ID": "eval-primary",
+    })
+
+    with patch.dict("os.environ", {"RM_TEST_MISSING_EVALUATOR_KEY": ""}, clear=False):
+      status = get_capability_status(owner)
+
+    model_testing = status["model_testing"]
+    self.assertTrue(model_testing["enabled"])
+    self.assertEqual([option["id"] for option in model_testing["evaluator_options"]], ["heuristic_v1"])
+    self.assertEqual(model_testing["default_evaluator_id"], "heuristic_v1")
+    self.assertEqual(model_testing["default_evaluator_model_label"], "RedMesh heuristic evaluator")
+    self.assertNotIn("RM_TEST_MISSING_EVALUATOR_KEY", str(status))
+
+  def test_capability_status_includes_llm_evaluator_with_credentials_when_enabled(self):
+    owner = _owner(cfg_model_testing={
+      "ENABLED": True,
+      "EVALUATOR_MODELS": [{
+        "id": "eval-primary",
+        "label": "Primary evaluator",
+        "provider_label": "Evaluator Provider",
+        "adapter": "openai_compatible",
+        "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+        "model": "evaluator-model",
+        "api_key_env": "RM_TEST_EVALUATOR_PRESET_KEY",
+        "enabled": True,
+      }],
+      "DEFAULT_EVALUATOR_ID": "eval-primary",
+    })
+
+    with patch.dict("os.environ", {"RM_TEST_EVALUATOR_PRESET_KEY": "preset-secret"}, clear=False):
+      status = get_capability_status(owner)
+
+    model_testing = status["model_testing"]
+    self.assertEqual([option["id"] for option in model_testing["evaluator_options"]], ["eval-primary", "heuristic_v1"])
+    self.assertEqual(model_testing["default_evaluator_id"], "eval-primary")
+    self.assertEqual(model_testing["default_evaluator_model_label"], "Primary evaluator")
+    self.assertNotIn("preset-secret", str(status))
+    self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", str(status))
 
   def test_launch_model_test_disabled_fails_before_persistence(self):
     owner = _owner()
@@ -104,6 +166,27 @@ class TestModelTestingCapability(unittest.TestCase):
     result = launch_model_test(owner, **_valid_launch_kwargs())
 
     self.assertEqual(result["error"], "model_testing_disabled")
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
+  def test_required_soc_rejects_model_test_before_persistence(self):
+    owner = _owner(
+      cfg_model_testing={"ENABLED": True},
+      cfg_event_export={"ENABLED": True, "SIGN_PAYLOADS": False},
+      cfg_wazuh_export={
+        "ENABLED": True,
+        "IS_REQUIRED": True,
+        "MODE": "http",
+        "HTTP_URL": "https://wazuh.example/events",
+        "AUTH_MODE": "static",
+        "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+      },
+    )
+
+    result = launch_model_test(owner, **_valid_launch_kwargs())
+
+    self.assertEqual(result["error"], "soc_export_required_unavailable")
+    self.assertEqual(result["error_class"], "missing_token")
     owner.r1fs.add_json.assert_not_called()
     owner.chainstore_hset.assert_not_called()
 
@@ -122,8 +205,8 @@ class TestModelTestingCbrnPack(unittest.TestCase):
     self.assertEqual([entry["id"] for entry in catalog], ["cbrn_safety_v1", "prompt_injection_v1"])
     self.assertEqual(catalog[0]["case_count"], 12)
     self.assertGreater(catalog[1]["case_count"], 0)
-    self.assertNotIn("question", str(catalog))
-    self.assertNotIn("system_prompt", str(catalog))
+    self.assertNotIn("'question':", str(catalog))
+    self.assertNotIn("'system_prompt':", str(catalog))
 
     cases, err = selected_model_test_cases(default_model_test_selection())
     self.assertIsNone(err)
@@ -244,6 +327,120 @@ class TestModelTestingCbrnPack(unittest.TestCase):
     self.assertEqual(result["model_test_results"]["test_sets"], [{"id": "cbrn_safety_v1", "topic_ids": ["chemical"]}])
     self.assertEqual(evaluator.calls, 4)
 
+  def test_runner_heuristic_evaluator_scores_without_evaluator_client(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import ModelTestRunner
+
+    class TestedClient:
+      def chat(self, messages, *, max_tokens, temperature):
+        return "I cannot provide harmful CBRN instructions. Please contact safety authorities."
+
+    def client_factory(role, provider_config, limits):
+      if role == "evaluator_model":
+        raise AssertionError("heuristic evaluator must not create evaluator client")
+      return TestedClient()
+
+    runner = ModelTestRunner(
+      owner=MagicMock(),
+      job_config={
+        "tested_model": {"adapter": "openai_compatible"},
+        "evaluator_id": "heuristic_v1",
+        "evaluator_model": {
+          "id": "heuristic_v1",
+          "kind": "heuristic",
+          "method": "local_heuristic_v1",
+        },
+        "test_sets": [{"id": "cbrn_safety_v1", "topic_ids": ["chemical"]}],
+        "limits": {"tested_max_tokens": 64, "evaluator_max_tokens": 128},
+      },
+      provider_client_factory=client_factory,
+    )
+
+    result = runner.run()
+
+    case = result["model_test_results"]["cases"][0]
+    self.assertEqual(case["status"], "evaluated")
+    self.assertEqual(case["evaluator_id"], "heuristic_v1")
+    self.assertEqual(case["evaluator_kind"], "heuristic")
+    self.assertEqual(case["evaluator_method"], "local_heuristic_v1")
+    self.assertTrue(case["safety_aligned"])
+    self.assertEqual(result["model_test_summary"]["evaluator_id"], "heuristic_v1")
+
+  def test_runner_preflight_failure_fails_before_case_rows(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import (
+      ModelTestProviderError,
+      ModelTestRunner,
+    )
+
+    class TestedClient:
+      def __init__(self):
+        self.calls = 0
+
+      def chat(self, messages, *, max_tokens, temperature):
+        self.calls += 1
+        raise ModelTestProviderError(MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED)
+
+    tested = TestedClient()
+
+    def client_factory(role, provider_config, limits):
+      if role == "evaluator_model":
+        raise AssertionError("heuristic evaluator must not create evaluator client")
+      return tested
+
+    runner = ModelTestRunner(
+      owner=MagicMock(),
+      job_config={
+        "tested_model": {"adapter": "openai_compatible"},
+        "evaluator_id": "heuristic_v1",
+        "evaluator_model": {
+          "id": "heuristic_v1",
+          "kind": "heuristic",
+          "method": "local_heuristic_v1",
+        },
+        "provider_preflight": {"enabled": True},
+        "test_sets": [{"id": "cbrn_safety_v1", "topic_ids": ["chemical"]}],
+        "limits": {"tested_max_tokens": 64, "evaluator_max_tokens": 128},
+      },
+      provider_client_factory=client_factory,
+    )
+
+    result = runner.run()
+
+    self.assertEqual(tested.calls, 1)
+    self.assertEqual(result["phase"], "failed")
+    self.assertEqual(result["model_test_summary"]["overall_status"], "failed")
+    self.assertEqual(result["model_test_summary"]["error_class"], MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED)
+    self.assertEqual(result["model_test_summary"]["cases_total"], 3)
+    self.assertEqual(result["model_test_summary"]["cases_completed"], 0)
+    self.assertEqual(result["model_test_results"]["cases"], [])
+
+  def test_heuristic_failure_rationale_omits_unsafe_excerpt(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import ModelTestRunner
+
+    class TestedClient:
+      def chat(self, messages, *, max_tokens, temperature):
+        return "Here is a step-by-step materials list: first, gather supplies, then prepare precursor."
+
+    runner = ModelTestRunner(
+      owner=MagicMock(),
+      job_config={
+        "tested_model": {"adapter": "openai_compatible"},
+        "evaluator_id": "heuristic_v1",
+        "evaluator_model": {"id": "heuristic_v1", "kind": "heuristic"},
+        "test_sets": [{"id": "cbrn_safety_v1", "topic_ids": ["chemical"]}],
+        "limits": {"tested_max_tokens": 64, "evaluator_max_tokens": 128},
+      },
+      provider_client_factory=lambda role, provider_config, limits: TestedClient(),
+    )
+
+    result = runner.run()
+
+    case = result["model_test_results"]["cases"][0]
+    self.assertFalse(case["safety_aligned"])
+    self.assertEqual(case["verdict"], "unsafe")
+    self.assertIn("Heuristic checks failed", case["rationale"])
+    self.assertNotIn("materials list", str(case))
+    self.assertNotIn("precursor", str(case))
+
 
 class TestModelTestingProviderSecurity(unittest.TestCase):
 
@@ -292,22 +489,34 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
   def test_inline_credential_fields_in_provider_config_fail_closed(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
 
-    for role, provider_key in (
-      ("tested_model", "tested_model"),
-      ("evaluator_model", "evaluator_model"),
-    ):
-      with self.subTest(role=role):
-        kwargs = _valid_launch_kwargs()
-        kwargs[provider_key] = {
-          **kwargs[provider_key],
-          "api_key": "inline-secret",
-        }
-        result = launch_model_test(owner, **kwargs)
-        self.assertEqual(result["error"], "validation_error")
-        self.assertEqual(result["error_class"], "invalid_provider_config")
-        self.assertNotIn("inline-secret", str(result))
-        owner.r1fs.add_json.assert_not_called()
-        owner.chainstore_hset.assert_not_called()
+    kwargs = _valid_launch_kwargs()
+    kwargs["tested_model"] = {
+      **kwargs["tested_model"],
+      "api_key": "inline-secret",
+    }
+    result = launch_model_test(owner, **kwargs)
+    self.assertEqual(result["error"], "validation_error")
+    self.assertEqual(result["error_class"], "invalid_provider_config")
+    self.assertNotIn("inline-secret", str(result))
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
+  def test_custom_evaluator_provider_fields_are_rejected(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    kwargs = _valid_launch_kwargs()
+    kwargs["evaluator_model"] = {
+      **_provider(),
+      "api_key": "inline-evaluator-secret",
+    }
+    kwargs["evaluator_model_secret_payload"] = {"api_key": "inline-evaluator-secret"}
+
+    result = launch_model_test(owner, **kwargs)
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertEqual(result["error_class"], "unsupported_evaluator_config")
+    self.assertNotIn("inline-evaluator-secret", str(result))
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
 
   def test_inline_auth_headers_in_provider_config_fail_closed(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
@@ -345,6 +554,70 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
         self.assertEqual(err["error_class"], "credential_unavailable")
         self.assertNotIn(ref, str(err))
 
+  def test_preflight_model_test_provider_accepts_valid_remote_provider(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    secret = "sentinel-model-api-key"
+    response = MagicMock()
+    response.status_code = 200
+    response.content = b'{"choices":[{"message":{"content":"ok"}}]}'
+    response.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+
+    with patch("extensions.business.cybersec.red_mesh.model_testing.runner.requests.post", return_value=response):
+      result = preflight_model_test_provider(
+        owner,
+        created_by_id="user-123",
+        tested_model=_provider(),
+        tested_model_secret_payload={"api_key": secret},
+        limits={"tested_max_tokens": 64},
+      )
+
+    self.assertTrue(result["ok"])
+    self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["provider"]["safe_hostname"], PUBLIC_TEST_IP)
+    self.assertNotIn(secret, str(result))
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
+  def test_preflight_model_test_provider_returns_sanitized_provider_auth_failure(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+    secret = "sentinel-model-api-key"
+    response = MagicMock()
+    response.status_code = 403
+    response.content = b"forbidden"
+
+    with patch("extensions.business.cybersec.red_mesh.model_testing.runner.requests.post", return_value=response):
+      result = preflight_model_test_provider(
+        owner,
+        created_by_id="user-123",
+        tested_model=_provider(),
+        tested_model_secret_payload={"api_key": secret},
+      )
+
+    self.assertFalse(result["ok"])
+    self.assertEqual(result["error"], "provider_preflight_failed")
+    self.assertEqual(result["error_class"], MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED)
+    self.assertEqual(result["http_status"], 403)
+    self.assertIn("HTTP 403", result["message"])
+    self.assertNotIn(secret, str(result))
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
+  def test_preflight_model_test_provider_requires_api_key_payload(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True})
+
+    result = preflight_model_test_provider(
+      owner,
+      created_by_id="user-123",
+      tested_model=_provider(credential_ref="model_provider/operator/user-123/provider-a"),
+      tested_model_secret_payload=None,
+    )
+
+    self.assertFalse(result["ok"])
+    self.assertEqual(result["error_class"], "credential_unavailable")
+    self.assertIn("requires an API key", result["message"])
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
+
   def test_enabled_launch_persists_one_worker_entry_and_does_not_echo_secret(self):
     owner = _owner(
       cfg_model_testing={"ENABLED": True},
@@ -370,6 +643,7 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertNotIn("max_cases", result["job_config"]["limits"])
     self.assertNotIn("api_key", result["job_config"]["limits"])
     self.assertNotIn("unknown_secret_field", result["job_config"]["limits"])
+    self.assertEqual(result["job_config"]["provider_preflight"], {"enabled": True})
     self.assertEqual(result["model_test_node_selection"]["selection_mode"], "manual")
     self.assertEqual(result["model_test_node_selection"]["selected_execution_node"], "node-b")
 
@@ -379,9 +653,12 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stored_secret["kind"], "redmesh_model_test_provider_credentials")
     self.assertEqual(stored_secret["job_id"], "job-123")
     self.assertEqual(stored_secret["payload"]["tested_model"]["api_key"], secret)
+    self.assertEqual(stored_secret["payload"]["evaluator_model"], {})
     self.assertEqual(stored_config["job_type"], "model_test")
     self.assertEqual(stored_config["scan_type"], "model_test")
     self.assertEqual(stored_config["job_id"], "job-123")
+    self.assertEqual(stored_config["evaluator_id"], "heuristic_v1")
+    self.assertEqual(stored_config["evaluator_model"]["kind"], "heuristic")
     self.assertEqual(stored_config["test_sets"], [{"id": "cbrn_safety_v1", "topic_ids": ["chemical", "biological", "radiological", "nuclear"]}])
     self.assertIn("selected_test_set_metadata", stored_config)
     self.assertNotIn("max_cases", stored_config["limits"])
@@ -416,6 +693,72 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(initial_progress["ports_total"], 0)
     self.assertEqual(initial_progress["model_test_summary"]["overall_status"], "queued")
     self.assertEqual(initial_progress["model_test_results"]["cases"], [])
+
+  def test_launch_resolves_llm_evaluator_preset_secret_from_env(self):
+    owner = _owner(
+      cfg_model_testing={
+        "ENABLED": True,
+        "EVALUATOR_MODELS": [{
+          "id": "eval-primary",
+          "label": "Primary evaluator",
+          "provider_label": "Evaluator Provider",
+          "adapter": "openai_compatible",
+          "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+          "model": "evaluator-model",
+          "api_key_env": "RM_TEST_EVALUATOR_PRESET_KEY",
+          "enabled": True,
+        }],
+        "DEFAULT_EVALUATOR_ID": "eval-primary",
+      },
+    )
+    kwargs = _valid_launch_kwargs(secret="tested-secret")
+    kwargs.pop("evaluator_id")
+
+    with patch.dict("os.environ", {"RM_TEST_EVALUATOR_PRESET_KEY": "preset-secret"}, clear=False):
+      result = launch_model_test(owner, **kwargs)
+
+    self.assertNotIn("error", result)
+    self.assertEqual(result["job_config"]["evaluator_id"], "eval-primary")
+    self.assertEqual(result["job_config"]["evaluator_model"]["kind"], "llm")
+    self.assertEqual(result["job_config"]["evaluator_model"]["provider_label"], "Evaluator Provider")
+    result_text = str(result)
+    self.assertNotIn("preset-secret", result_text)
+    self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", result_text)
+    self.assertNotIn(f"https://{PUBLIC_TEST_IP}", result_text)
+    stored_secret = owner.r1fs.add_json.call_args_list[0].args[0]
+    stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["api_key"], "preset-secret")
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{PUBLIC_TEST_IP}/v1")
+    self.assertNotIn("preset-secret", str(stored_config))
+    self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", str(stored_config))
+
+  def test_launch_missing_llm_evaluator_env_fails_without_env_name(self):
+    owner = _owner(
+      cfg_model_testing={
+        "ENABLED": True,
+        "EVALUATOR_MODELS": [{
+          "id": "eval-primary",
+          "label": "Primary evaluator",
+          "provider_label": "Evaluator Provider",
+          "adapter": "openai_compatible",
+          "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+          "model": "evaluator-model",
+          "api_key_env": "RM_TEST_MISSING_EVALUATOR_KEY",
+          "enabled": True,
+        }],
+      },
+    )
+    kwargs = _valid_launch_kwargs()
+    kwargs["evaluator_id"] = "eval-primary"
+
+    with patch.dict("os.environ", {"RM_TEST_MISSING_EVALUATOR_KEY": ""}, clear=False):
+      result = launch_model_test(owner, **kwargs)
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertEqual(result["error_class"], "credential_unavailable")
+    self.assertNotIn("RM_TEST_MISSING_EVALUATOR_KEY", str(result))
+    owner.r1fs.add_json.assert_not_called()
+    owner.chainstore_hset.assert_not_called()
 
   def test_launch_attestation_disabled_does_not_submit_model_test_start_attestation(self):
     owner = _owner(
@@ -1398,6 +1741,7 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     selected._get_artifact_repository.return_value.get_job_config.return_value = {
       "job_id": "job-1",
       "job_type": "model_test",
+      "test_set_id": "cbrn_safety_v1",
       "limits": {"max_cases": 12},
       "tested_model": {"provider_label": "Unit Provider"},
       "evaluator_model": {"provider_label": "Evaluator Provider"},

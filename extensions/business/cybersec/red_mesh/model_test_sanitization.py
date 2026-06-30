@@ -45,6 +45,9 @@ SAFE_MODEL_TEST_RESULT_KEYS = {
   "latency_ms",
   "attempts",
   "score",
+  "evaluator_id",
+  "evaluator_kind",
+  "evaluator_method",
 }
 
 SAFE_MODEL_TEST_SUMMARY_KEYS = {
@@ -66,6 +69,9 @@ SAFE_MODEL_TEST_SUMMARY_KEYS = {
   "test_sets",
   "selected_test_set_metadata",
   "aggregate_score",
+  "evaluator_id",
+  "evaluator_kind",
+  "evaluator_method",
 }
 
 

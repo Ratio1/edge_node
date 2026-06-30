@@ -47,6 +47,8 @@ class TestIntegrationConfig(unittest.TestCase):
     self.assertFalse(event_cfg["INCLUDE_CREDENTIALS"])
     self.assertTrue(event_cfg["SIGN_PAYLOADS"])
     self.assertFalse(wazuh_cfg["ENABLED"])
+    self.assertFalse(wazuh_cfg["IS_REQUIRED"])
+    self.assertEqual(wazuh_cfg["FAILURE_COOLDOWN_SECONDS"], 300)
     self.assertFalse(wazuh_cfg["PERSIST_FAILED_PAYLOADS"])
     self.assertEqual(wazuh_cfg["FAILED_PAYLOAD_SAMPLE_BYTES"], 2048)
     self.assertFalse(suricata_cfg["ENABLED"])
@@ -95,6 +97,7 @@ class TestIntegrationConfig(unittest.TestCase):
       "MIN_SEVERITY": "bad",
       "TIMEOUT_SECONDS": 0,
       "RETRY_ATTEMPTS": -1,
+      "FAILURE_COOLDOWN_SECONDS": 0,
       "PERSIST_FAILED_PAYLOADS": True,
       "FAILED_PAYLOAD_SAMPLE_BYTES": 1,
     })
@@ -108,6 +111,7 @@ class TestIntegrationConfig(unittest.TestCase):
     self.assertEqual(cfg["MIN_SEVERITY"], "INFO")
     self.assertEqual(cfg["TIMEOUT_SECONDS"], 5.0)
     self.assertEqual(cfg["RETRY_ATTEMPTS"], 2)
+    self.assertEqual(cfg["FAILURE_COOLDOWN_SECONDS"], 300)
     self.assertTrue(cfg["PERSIST_FAILED_PAYLOADS"])
     self.assertEqual(cfg["FAILED_PAYLOAD_SAMPLE_BYTES"], 2048)
 

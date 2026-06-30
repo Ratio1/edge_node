@@ -2,6 +2,7 @@
 
 import time
 import unittest
+from unittest.mock import patch
 
 from extensions.business.cybersec.red_mesh.graybox.safety import SafetyControls
 from extensions.business.cybersec.red_mesh.constants import (
@@ -83,6 +84,39 @@ class TestSafetyControls(unittest.TestCase):
     sc.throttle()
     t2 = time.time()
     self.assertGreaterEqual(t2 - t1, 0.04)  # small tolerance
+
+  def test_throttle_preserves_fixed_delay_when_only_min_delay_is_set(self):
+    """Single-delay callers retain fixed delay behavior."""
+    sc = SafetyControls(request_delay=0.05, target_is_local=True)
+
+    with patch("extensions.business.cybersec.red_mesh.graybox.safety.random.uniform") as uniform:
+      self.assertEqual(sc._next_request_delay(), 0.05)
+
+    uniform.assert_not_called()
+
+  def test_throttle_randomizes_with_configured_delay_range(self):
+    """Dune min/max delay is randomized when a range is configured."""
+    sc = SafetyControls(
+      request_delay=0.05,
+      request_delay_max=0.10,
+      target_is_local=True,
+    )
+    sc._last_request_at = 100.0
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.graybox.safety.random.uniform",
+      return_value=0.07,
+    ) as uniform:
+      with patch(
+        "extensions.business.cybersec.red_mesh.graybox.safety.time.time",
+        side_effect=[100.01, 100.08],
+      ):
+        with patch("extensions.business.cybersec.red_mesh.graybox.safety.time.sleep") as sleep:
+          sc.throttle()
+
+    uniform.assert_called_once_with(0.05, 0.10)
+    self.assertAlmostEqual(sleep.call_args[0][0], 0.06)
+    self.assertEqual(sc._last_request_at, 100.08)
 
   def test_min_delay_enforced_non_local(self):
     """Non-local target gets GRAYBOX_DEFAULT_DELAY minimum."""

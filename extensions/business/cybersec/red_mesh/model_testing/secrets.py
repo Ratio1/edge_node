@@ -31,7 +31,7 @@ def _runtime_provider(provider, secret_payload):
     "base_url": provider.get("base_url") or "",
     "model": provider.get("model") or "",
   }
-  api_key = _api_key_from_payload(secret_payload)
+  api_key = _api_key_from_payload(secret_payload) or str(provider.get("api_key") or "").strip()
   if api_key:
     runtime["api_key"] = api_key
   credential_ref = str(provider.get("credential_ref") or "").strip()
@@ -49,14 +49,16 @@ def attach_model_test_provider_secret(
     tested_model_secret_payload: dict | None,
     evaluator_model: dict | None,
     evaluator_model_secret_payload: dict | None,
+    evaluator_runtime_model: dict | None = None,
 ):
   """Persist provider runtime material separately and return persisted config."""
   persisted = deepcopy(sanitized_config or {})
   payload = {
     "tested_model": _runtime_provider(tested_model, tested_model_secret_payload),
-    "evaluator_model": _runtime_provider(evaluator_model, evaluator_model_secret_payload)
-    if evaluator_model
-    else {},
+    "evaluator_model": _runtime_provider(
+      evaluator_runtime_model if evaluator_runtime_model is not None else evaluator_model,
+      evaluator_model_secret_payload,
+    ) if (evaluator_runtime_model or evaluator_model) else {},
   }
   store = R1fsSecretStore(owner)
   ref = store.save_model_test_provider_credentials(job_id, payload)

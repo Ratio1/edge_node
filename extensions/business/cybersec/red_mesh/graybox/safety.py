@@ -4,6 +4,7 @@ Safety controls for graybox scanning.
 Rate limiting, attempt budgeting, and target validation.
 """
 
+import random
 import time
 from urllib.parse import urlparse
 
@@ -17,19 +18,28 @@ from ..constants import (
 class SafetyControls:
   """Rate limiting, attempt budgeting, and target validation."""
 
-  def __init__(self, request_delay=None, weak_auth_delay=None,
+  def __init__(self, request_delay=None, request_delay_max=None, weak_auth_delay=None,
                target_is_local=False):
     self._request_delay = request_delay or GRAYBOX_DEFAULT_DELAY
+    self._request_delay_max = request_delay_max or self._request_delay
     self._weak_auth_delay = weak_auth_delay or GRAYBOX_WEAK_AUTH_DELAY
     self._last_request_at = 0.0
     # Enforce minimum delay for non-local targets to avoid
     # triggering WAF blocking or causing DoS on resource-constrained targets.
     if not target_is_local and self._request_delay < GRAYBOX_DEFAULT_DELAY:
       self._request_delay = GRAYBOX_DEFAULT_DELAY
+    if self._request_delay_max < self._request_delay:
+      self._request_delay_max = self._request_delay
+
+  def _next_request_delay(self):
+    """Return a fixed or randomized Dune delay for ordinary requests."""
+    if self._request_delay_max <= self._request_delay:
+      return self._request_delay
+    return random.uniform(self._request_delay, self._request_delay_max)
 
   def throttle(self, min_delay=None):
     """Enforce minimum delay between requests."""
-    delay = min_delay or self._request_delay
+    delay = min_delay if min_delay is not None else self._next_request_delay()
     elapsed = time.time() - self._last_request_at
     if elapsed < delay:
       time.sleep(delay - elapsed)

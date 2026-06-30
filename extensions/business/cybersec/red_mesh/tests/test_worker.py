@@ -37,6 +37,7 @@ def _make_job_config(**overrides):
   cfg.allow_stateful_probes = False
   cfg.excluded_features = []
   cfg.scan_min_delay = 0.0
+  cfg.scan_max_delay = 0.0
   cfg.authorized = True
   assignments, error = build_graybox_worker_assignments(["node-1"])
   if error is None:
@@ -98,6 +99,29 @@ class TestBaseLocalWorkerIntegration(unittest.TestCase):
     """state['ports_scanned'] is a list."""
     worker = _make_worker()
     self.assertIsInstance(worker.state["ports_scanned"], list)
+
+  def test_safety_receives_dune_delay_range(self):
+    """Graybox worker passes scan_min_delay/scan_max_delay to SafetyControls."""
+    owner = MagicMock()
+    cfg = _make_job_config(scan_min_delay=3.0, scan_max_delay=10.0)
+    with patch("extensions.business.cybersec.red_mesh.graybox.worker.SafetyControls") as safety_cls:
+      safety_cls.is_local_target.return_value = False
+      with patch("extensions.business.cybersec.red_mesh.graybox.worker.AuthManager"):
+        with patch("extensions.business.cybersec.red_mesh.graybox.worker.DiscoveryModule"):
+          GrayboxLocalWorker(
+            owner=owner,
+            job_id="test-job-1",
+            target_url=cfg.target_url,
+            job_config=cfg,
+            local_id="1",
+            initiator="test-node",
+          )
+
+    safety_cls.assert_called_once_with(
+      request_delay=3.0,
+      request_delay_max=10.0,
+      target_is_local=False,
+    )
 
 
 class TestStateShape(unittest.TestCase):
@@ -938,6 +962,34 @@ class TestProbeDispatch(unittest.TestCase):
     skip = worker.state["graybox_results"]["8000"].get("_stateful_probe", {}).get("findings", [])
     self.assertEqual(len(skip), 1)
     self.assertIn("stateful_probes_disabled=True", skip[0]["evidence"])
+
+  def test_business_logic_stateful_skip_sets_owasp_category(self):
+    """Probe-level business-logic skip is still OWASP-classified."""
+    worker = _make_worker(allow_stateful_probes=False)
+    worker.safety.validate_target.return_value = None
+    worker.auth.preflight_check.return_value = None
+    worker.auth.authenticate.return_value = True
+    worker.auth.official_session = MagicMock()
+    worker.auth.regular_session = MagicMock()
+    worker.auth._auth_errors = []
+    worker.auth.ensure_sessions = MagicMock()
+    worker.auth.cleanup = MagicMock()
+    worker.discovery.discover.return_value = ([], [])
+
+    mock_cls = MagicMock()
+    mock_cls.is_stateful = True
+    mock_cls.requires_auth = True
+    mock_cls.requires_regular_session = True
+
+    with patch("extensions.business.cybersec.red_mesh.graybox.worker.GRAYBOX_PROBE_REGISTRY",
+               [{"key": "_graybox_business_logic", "cls": "test.BusinessLogic"}]):
+      with patch.object(GrayboxLocalWorker, '_import_probe', staticmethod(lambda cls_path: mock_cls)):
+        worker.execute_job()
+
+    skip = worker.state["graybox_results"]["8000"].get("_graybox_business_logic", {}).get("findings", [])
+    self.assertEqual(len(skip), 1)
+    self.assertEqual(skip[0]["scenario_id"], "SKIP-_graybox_business_logic")
+    self.assertEqual(skip[0]["owasp"], "A04:2021")
 
   def test_import_probe(self):
     """_import_probe resolves cls_path to class."""

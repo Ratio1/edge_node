@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 from extensions.business.cybersec.red_mesh.services.event_builder import build_test_event
 from extensions.business.cybersec.red_mesh.services.integration_status import (
   get_integration_status,
+  record_integration_status,
   test_event_export as build_integration_test_event,
 )
 from extensions.business.cybersec.red_mesh.services.log_export import (
@@ -298,6 +299,32 @@ class TestWazuhHttpExportAuth(unittest.TestCase):
     self.assertEqual(result["status"], "error")
     self.assertEqual(result["error"], "invalid_auth_config")
     self.assertEqual(event_call_count["n"], 0, "AuthError must skip transport attempts entirely")
+
+  def test_repeated_config_failure_sets_cooldown_and_success_clears_it(self):
+    owner = _http_owner({
+      "AUTH_MODE": "wazuh_jwt",
+      "USERNAME": "",
+      "LOGIN_URL": "https://wazuh.example",
+      "FAILURE_COOLDOWN_SECONDS": 300,
+      "RETRY_ATTEMPTS": 0,
+    })
+    event = _event()
+
+    first = deliver_wazuh_event(owner, event)
+    second = deliver_wazuh_event(owner, event)
+
+    self.assertEqual(first["error"], "invalid_auth_config")
+    self.assertEqual(second["error"], "invalid_auth_config")
+    self.assertIn("cooldown_until", second)
+    self.assertGreater(second["retry_after_seconds"], 0)
+    status = get_integration_status(owner)["integrations"]["wazuh"]
+    self.assertEqual(status["integration_status"], "cooling_down")
+    self.assertIsNotNone(status["cooldown_until"])
+
+    record_integration_status(owner, "wazuh", outcome="success", event_id="event-ok")
+    recovered = get_integration_status(owner)["integrations"]["wazuh"]
+    self.assertEqual(recovered["integration_status"], "ok")
+    self.assertIsNone(recovered["cooldown_until"])
 
 
 def urllib_error_HTTPError(url, code, msg):
