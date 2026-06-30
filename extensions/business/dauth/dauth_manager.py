@@ -25,7 +25,7 @@ from naeural_core.business.default.web_app.supervisor_fast_api_web_app import Su
 from extensions.business.mixins.request_tracking_mixin import _RequestTrackingMixin
 from extensions.business.dauth.dauth_mixin import _DauthMixin
 
-__VER__ = '0.2.2'
+__VER__ = '0.2.3'
 
 _CONFIG = {
   **BasePlugin.CONFIG,
@@ -77,8 +77,12 @@ _CONFIG = {
     "EE_CLOUDFLARE_TOKEN_LIVENESS_API",
     
     "EE_MQTT_HOST_SEED" # this generates dynamically the EE_MQTT_HOST
-],
-  
+  ],
+
+  "DAUTH_ORACLE_ONLY_SUPERVISOR_KEYS": [
+    "EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER",
+  ],
+
   'VALIDATION_RULES': {
     **BasePlugin.CONFIG['VALIDATION_RULES'],
   },
@@ -104,6 +108,8 @@ class DauthManagerPlugin(
   
 
   def on_init(self):
+    self._dauth_server_enabled = None
+    self._dauth_server_enabled_message = None
     super(DauthManagerPlugin, self).on_init()
     my_address = self.bc.address
     my_eth_address = self.bc.eth_address
@@ -112,7 +118,37 @@ class DauthManagerPlugin(
       self.cfg_auth_env_keys, self.cfg_auth_predefined_keys)
     )
     self._init_request_tracking()
+    self._check_dauth_server_enabled_on_start()
     return
+
+  def _check_dauth_server_enabled_on_start(self):
+    error = None
+    try:
+      enabled = self.bc.is_dauth_oracle()
+    except Exception as e:
+      enabled = False
+      error = str(e)
+    # end try
+
+    message = None if enabled else error or "current node is not registered as a dAuth oracle"
+    self._dauth_server_enabled = enabled
+    self._dauth_server_enabled_message = message
+    if enabled:
+      self.P(f"{self.__class__.__name__} dAuth registry gate is enabled")
+    else:
+      self.P(
+        f"{self.__class__.__name__} dAuth registry gate is disabled. "
+        f"(cause: {message})",
+        color='r',
+        boxed=True
+      )
+    # endif
+    if not enabled:
+      self.maybe_stop_tunnel_engine()
+    return enabled
+
+  def _is_dauth_server_enabled(self):
+    return self._dauth_server_enabled is True
     
   
   def on_request(self, request):
@@ -128,6 +164,11 @@ class DauthManagerPlugin(
     if False:
       self._maybe_log_and_save_tracked_requests()
     return
+
+  def _process(self):
+    if not self._is_dauth_server_enabled():
+      return None
+    return super(DauthManagerPlugin, self)._process()
 
   def __get_current_epoch(self):
     """
@@ -212,6 +253,12 @@ class DauthManagerPlugin(
       }      
     }    
     """
+    if not self._is_dauth_server_enabled():
+      response = self.__get_response({
+        'error': 'dAuth server is not registered as a dAuth oracle'
+      })
+      return response
+
     try:
       data = self.process_dauth_request(body)
     except Exception as e:
