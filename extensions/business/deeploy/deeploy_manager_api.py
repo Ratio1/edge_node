@@ -326,7 +326,7 @@ class DeeployManagerApiPlugin(
       
       result = {
         DEEPLOY_KEYS.STATUS : DEEPLOY_STATUS.SUCCESS,
-        DEEPLOY_KEYS.APPS: self._redact_deeploy_status_payload(apps),
+        DEEPLOY_KEYS.APPS: apps,
         DEEPLOY_KEYS.AUTH : auth_result,
       }
     except Exception as e:
@@ -732,8 +732,6 @@ class DeeployManagerApiPlugin(
         inputs.target_nodes = deployment_targets
         inputs[DEEPLOY_KEYS.TARGET_NODES_COUNT] = len(deployment_targets)
         inputs.target_nodes_count = len(deployment_targets)
-        self._inherit_cockroachdb_secure_config_from_discovered(inputs, discovered_plugin_instances)
-
         if job_id is not None:
           try:
             previous_pipeline_cid = self._get_pipeline_from_cstore(job_id)
@@ -911,8 +909,6 @@ class DeeployManagerApiPlugin(
           dct_request['plugins_count'] = len(plugins_array)
         # if pipeline_params:
         #   dct_request[DEEPLOY_KEYS.PIPELINE_PARAMS] = pipeline_params
-      dct_request = self._redact_per_node_config_for_log(dct_request)
-
       if async_mode:
         if len(response_keys) == 0:
           self._queue_pipeline_persistence(persistence_state)
@@ -1539,8 +1535,6 @@ class DeeployManagerApiPlugin(
         dct_request = self.deepcopy(request)
       else:
         dct_request = None
-      dct_request = self._redact_per_node_config_for_log(dct_request) if dct_request is not None else None
-
       if len(response_keys) == 0:
         if not is_confirmable_job:
           nodes = list(set(update_nodes + new_nodes))
@@ -1626,7 +1620,7 @@ class DeeployManagerApiPlugin(
       )
       request_payload = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
-        DEEPLOY_KEYS.TARGETS: self._redact_deeploy_status_payload(discovered_instances),
+        DEEPLOY_KEYS.TARGETS: discovered_instances,
       }
 
       if job_id is not None:
@@ -1884,7 +1878,7 @@ class DeeployManagerApiPlugin(
       result = {
         DEEPLOY_KEYS.STATUS: DEEPLOY_STATUS.SUCCESS,
         DEEPLOY_KEYS.JOB_ID: job_id,
-        DEEPLOY_KEYS.PIPELINE: self._redact_deeploy_status_payload(pipeline),
+        DEEPLOY_KEYS.PIPELINE: pipeline,
         DEEPLOY_KEYS.AUTH: auth_result,
       }
     except Exception as e:
