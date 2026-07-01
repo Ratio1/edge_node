@@ -300,9 +300,8 @@ class _DauthMixin(object):
 
     # set supervisor secrets if this is a protocol oracle; dAuth-only secrets
     # are additionally gated by the dAuth oracle registry.
-    requester_is_oracle = is_node and requester_node_address in oracles
-    requester_is_dauth_oracle = False
-    if requester_is_oracle:
+    if is_node and requester_node_address in oracles:
+      requester_is_dauth_oracle = False
       try:
         requester_is_dauth_oracle = self.bc.is_dauth_oracle(node_address_eth=sender_eth_address)
       except Exception as e:
@@ -312,12 +311,10 @@ class _DauthMixin(object):
         )
       # end try
 
-    if requester_is_oracle:
       dauth_data["EE_SUPERVISOR"] = True
-      dauth_oracle_only_keys = getattr(self, "cfg_dauth_oracle_only_supervisor_keys", [])
       for key in self.cfg_supervisor_keys:
         if isinstance(key, str) and len(key) > 0:
-          if key in dauth_oracle_only_keys and not requester_is_dauth_oracle:
+          if key in self.cfg_dauth_oracle_only_supervisor_keys and not requester_is_dauth_oracle:
             continue
           dauth_data[key] = self.os_environ.get(key)
         # end if
