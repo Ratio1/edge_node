@@ -298,11 +298,24 @@ class _DauthMixin(object):
     # end if is_node
     # end set node tags
 
-    # set the supervisor flag if this is identified as an oracle
+    # set supervisor secrets if this is a protocol oracle; dAuth-only secrets
+    # are additionally gated by the dAuth oracle registry.
     if is_node and requester_node_address in oracles:
+      requester_is_dauth_oracle = False
+      try:
+        requester_is_dauth_oracle = self.bc.is_dauth_oracle(node_address_eth=sender_eth_address)
+      except Exception as e:
+        self.P(
+          f"dAuth oracle check failed for {sender_eth_address}; omitting supervisor keys: {e}",
+          color='r'
+        )
+      # end try
+
       dauth_data["EE_SUPERVISOR"] = True
       for key in self.cfg_supervisor_keys:
         if isinstance(key, str) and len(key) > 0:
+          if key in self.cfg_dauth_oracle_only_supervisor_keys and not requester_is_dauth_oracle:
+            continue
           dauth_data[key] = self.os_environ.get(key)
         # end if
       # end for
@@ -556,4 +569,3 @@ if __name__ == '__main__':
   res = eng.process_dauth_request(request_sdk)
   # res = eng.process_dauth_request(request_bad)
   l.P(f"Result:\n{json.dumps(res, indent=2)}")
-      
