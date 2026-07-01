@@ -985,6 +985,64 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["deploy"], 1)
     self.assertEqual([context for context, _, _ in validation_calls], ["payment", "nodes"])
 
+  def test_process_update_rejects_job_app_type_change_before_payment_or_delete(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[
+        {
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: "api-instance",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+          DEEPLOY_PLUGIN_DATA.NODE: "node-1",
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": {
+              DEEPLOY_KEYS.PLUGIN_NAME: "api",
+              "IMAGE": "repo/api:1.0",
+              "CONTAINER_RESOURCES": {"cpu": "0.5", "memory": "256m", "storage": "1g"},
+            },
+          },
+        },
+      ],
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "stack",
+      },
+    )
+    payment_calls = []
+    node_calls = []
+    plugin.deeploy_check_payment_and_job_owner = lambda *args, **kwargs: payment_calls.append(args) or True
+    plugin._check_nodes_availability = lambda inputs: node_calls.append(inputs) or ["node-1"]
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.JOB_APP_TYPE: "native",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "api-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "api",
+            "IMAGE": "repo/api:2.0",
+            "CONTAINER_RESOURCES": {"cpu": "0.5", "memory": "256m", "storage": "1g"},
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], "failed")
+    self.assertIn("job_app_type cannot be changed", response[DEEPLOY_KEYS.ERROR])
+    self.assertEqual(payment_calls, [])
+    self.assertEqual(node_calls, [])
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 0)
+    self.assertEqual(called["queued"], 0)
+
   def test_process_update_rejects_invalid_materialized_omitted_plugin_before_payment_and_delete(self):
     plugin, called = self._make_process_update_plugin(
       discovered_instances=[

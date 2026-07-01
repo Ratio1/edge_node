@@ -766,6 +766,19 @@ class DeeployManagerApiPlugin(
           deeploy_specs_payload,
           pipeline_params=pipeline_params,
         )
+        existing_job_app_type = deeploy_specs_payload.get(DEEPLOY_KEYS.JOB_APP_TYPE)
+        if isinstance(existing_job_app_type, str):
+          existing_job_app_type = existing_job_app_type.lower()
+        if (
+          existing_job_app_type in JOB_APP_TYPES_ALL
+          and has_request_job_app_type
+          and job_app_type != existing_job_app_type
+        ):
+          msg = (
+            f"{DEEPLOY_ERRORS.REQUEST3}. job_app_type cannot be changed for an existing job "
+            f"from '{existing_job_app_type}' to '{job_app_type}'."
+          )
+          raise ValueError(msg)
 
         plugins_array = inputs.get(DEEPLOY_KEYS.PLUGINS)
         if isinstance(plugins_array, list):
