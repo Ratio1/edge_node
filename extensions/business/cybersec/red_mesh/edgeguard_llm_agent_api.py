@@ -22,6 +22,7 @@ from .edgeguard_cypher_guard import (
   build_direct_cypher_system_prompt,
   build_schema_correction_prompt,
   canonical_schema_surface,
+  normalize_user_literal_text,
 )
 
 __VER__ = '0.1.0.0'
@@ -359,12 +360,13 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
       self._error_count += 1
       return {"status": STATUS_ERROR, "accepted": False, "error": err, "attempts": []}
 
+    normalized_request = normalize_user_literal_text(request)
     retries = int(self.cfg_schema_retry_limit if retry_limit is None else retry_limit)
     retries = max(0, min(retries, int(self.cfg_schema_retry_limit)))
     attempts = []
     messages = [
       {"role": "system", "content": build_direct_cypher_system_prompt()},
-      {"role": "user", "content": request.strip()},
+      {"role": "user", "content": normalized_request},
     ]
     last_feedback = ""
     last_candidate = ""
@@ -378,7 +380,7 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
           {
             "role": "user",
             "content": build_schema_correction_prompt(
-              original_user_prompt=request.strip(),
+              original_user_prompt=normalized_request,
               rejected_cypher=last_candidate,
               validation_feedback=last_feedback,
               retry_index=attempt_idx,

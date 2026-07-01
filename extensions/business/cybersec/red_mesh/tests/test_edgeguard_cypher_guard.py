@@ -1,11 +1,15 @@
 import unittest
 
 from extensions.business.cybersec.red_mesh.edgeguard_cypher_guard import (
+  SCHEMA_VERSION,
   analyze_generated_cypher,
   build_empty_result_broadening_cypher,
   build_direct_cypher_system_prompt,
+  build_schema_prompt_context,
   build_schema_correction_prompt,
   extract_schema_tokens,
+  normalize_user_literal_text,
+  unsupported_temporal_behavior,
 )
 
 
@@ -79,6 +83,47 @@ class EdgeGuardCypherGuardTests(unittest.TestCase):
     self.assertIn("Indicator", prompt)
     self.assertIn("EXPLOITS", prompt)
     self.assertIn("confidence_score", prompt)
+
+  def test_v09_schema_prompt_includes_temporal_and_graph_guidance(self):
+    prompt = build_schema_prompt_context()
+
+    self.assertEqual(SCHEMA_VERSION, "edgeguard-cypher-schema-v0.9")
+    self.assertIn("CVSSv30", prompt)
+    self.assertIn("CVSSv40", prompt)
+    self.assertIn("(i:Indicator)-[:TARGETS]->(s:Sector)", prompt)
+    self.assertIn("(c:CVE)-[:AFFECTS]->(s:Sector)", prompt)
+    self.assertIn("Sector guidance: use `Sector.name`", prompt)
+    self.assertIn("Temporal predicates: supported only on whitelisted properties", prompt)
+    self.assertIn("last_updated", prompt)
+    self.assertIn("recently=P30D", prompt)
+    self.assertNotIn("Unsupported temporal predicates", prompt)
+
+  def test_temporal_behavior_uses_whitelisted_windows(self):
+    behavior = unsupported_temporal_behavior()
+
+    self.assertIn("supported_for_whitelisted_properties", behavior)
+    self.assertIn("last_week=P7D", behavior)
+    self.assertIn("whitelisted temporal property", behavior)
+
+  def test_accepts_whitelisted_temporal_property(self):
+    analysis = analyze_generated_cypher(
+      "MATCH (i:Indicator) WHERE datetime(i.last_updated) >= datetime() - duration('P7D') RETURN i LIMIT 10"
+    )
+
+    self.assertTrue(analysis["accepted"])
+
+  def test_rejects_hallucinated_temporal_property(self):
+    analysis = analyze_generated_cypher(
+      "MATCH (i:Indicator) WHERE i.timestamp >= datetime() - duration('P7D') RETURN i LIMIT 10"
+    )
+
+    self.assertFalse(analysis["accepted"])
+    self.assertEqual(analysis["invented_temporal_properties"], ["timestamp"])
+
+  def test_normalizes_common_user_literals(self):
+    normalized = normalize_user_literal_text("  hxxps://evil[.]example/path and cve-2024-12345. ")
+
+    self.assertEqual(normalized, "https://evil.example/path and CVE-2024-12345")
 
   def test_correction_prompt_includes_feedback(self):
     prompt = build_schema_correction_prompt(

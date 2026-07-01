@@ -6,10 +6,10 @@ import difflib
 import re
 from typing import Any
 
-__VER__ = '0.1.0.0'
+__VER__ = '0.2.0.0'
 
 
-SCHEMA_VERSION = "edgeguard-cypher-schema-v0.3"
+SCHEMA_VERSION = "edgeguard-cypher-schema-v0.9"
 DEFAULT_SCHEMA_RETRY_LIMIT = 2
 SCHEMA_KEYS = ("labels", "relationship_types", "properties")
 SCHEMA_KIND_LABELS = {
@@ -24,6 +24,39 @@ TEMPORAL_HALLUCINATION_PROPERTIES = (
   "suspicious_until",
   "timestamp",
 )
+SUPPORTED_TEMPORAL_PROPERTIES = (
+  "created_at",
+  "first_imported_at",
+  "imported_at",
+  "last_modified",
+  "last_updated",
+  "published",
+  "source_reported_first_at",
+  "source_reported_last_at",
+  "updated_at",
+)
+TEMPORAL_WINDOW_DEFAULTS = {
+  "today": "P1D",
+  "past_24_hours": "P1D",
+  "last_week": "P7D",
+  "past_7_days": "P7D",
+  "recently": "P30D",
+  "last_month": "P30D",
+  "past_30_days": "P30D",
+}
+HIGH_VALUE_GRAPH_PATTERNS = (
+  "(i:Indicator)-[:TARGETS]->(s:Sector)",
+  "(c:CVE)-[:AFFECTS]->(s:Sector)",
+  "(i:Indicator)-[:SOURCED_FROM]->(src:Source)",
+  "(c:CVE)-[:SOURCED_FROM]->(src:Source)",
+  "(i:Indicator)-[:EXPLOITS]->(c:CVE)",
+  "(i:Indicator)-[:INDICATES]->(m:Malware)",
+  "(m:Malware)-[:ATTRIBUTED_TO]->(ta:ThreatActor)",
+  "(ta:ThreatActor)-[:EMPLOYS_TECHNIQUE]->(t:Technique)",
+  "(c:CVE)-[:HAS_CVSS_v31]->(cvss:CVSSv31)",
+  "(c:CVE)-[:HAS_CVSS_v40]->(cvss:CVSSv40)",
+  "(c:CVE)-[:HAS_CVSS_v30]->(cvss:CVSSv30)",
+)
 
 EDGEGUARD_SCHEMA = {
   "schema_version": SCHEMA_VERSION,
@@ -33,6 +66,8 @@ EDGEGUARD_SCHEMA = {
       "Application",
       "CVE",
       "CVSSv31",
+      "CVSSv30",
+      "CVSSv40",
       "Campaign",
       "Component",
       "Device",
@@ -61,18 +96,35 @@ EDGEGUARD_SCHEMA = {
       "address",
       "alert_id",
       "aliases",
+      "attack_complexity",
+      "attack_vector",
+      "availability_impact",
       "base_score",
       "base_severity",
+      "cisa_action_due",
       "cisa_exploit_add",
+      "cisa_required_action",
       "cisa_vulnerability_name",
       "confidence_score",
+      "confidentiality_impact",
+      "created_at",
       "cve_id",
       "cvss_score",
       "dependency_id",
+      "description",
       "device_id",
       "domain",
+      "edgeguard_managed",
+      "exploitability_score",
+      "first_imported_at",
       "hostname",
+      "impact_score",
+      "imported_at",
       "indicator_type",
+      "integrity_impact",
+      "last_imported_from",
+      "last_modified",
+      "last_updated",
       "misp_event_ids",
       "mitre_id",
       "name",
@@ -81,14 +133,23 @@ EDGEGUARD_SCHEMA = {
       "port",
       "protocol",
       "range",
+      "raw_data",
       "reliability",
       "severity",
       "shortname",
       "source",
       "source_id",
+      "source_reported_first_at",
+      "source_reported_last_at",
       "tactic_phases",
+      "tag",
+      "tags",
+      "type",
+      "updated_at",
       "username",
+      "uuid",
       "value",
+      "vector_string",
       "version",
       "zone",
     ],
@@ -101,6 +162,8 @@ EDGEGUARD_SCHEMA = {
       "FOR",
       "HAS_ASSIGNED",
       "HAS_CVSS_v31",
+      "HAS_CVSS_v30",
+      "HAS_CVSS_v40",
       "HAS_IDENTITY",
       "IMPLEMENTS_TECHNIQUE",
       "IN",
@@ -122,7 +185,9 @@ EDGEGUARD_SCHEMA = {
   },
   "unsupported": {
     "temporal_predicates": {
-      "status": "unsupported_in_current_direct_cypher_catalog",
+      "status": "supported_for_whitelisted_properties",
+      "allowed_properties": list(SUPPORTED_TEMPORAL_PROPERTIES),
+      "rolling_window_defaults": dict(TEMPORAL_WINDOW_DEFAULTS),
       "known_hallucinated_properties_rejected": list(TEMPORAL_HALLUCINATION_PROPERTIES),
     },
   },
@@ -158,10 +223,27 @@ TEMPORAL_REQUEST = re.compile(
   r"years?|hours?|date|time|timestamp|first seen|seen since|until)\b",
   re.I,
 )
+DEFANGED_DOT = re.compile(r"\[\s*\.\s*\]|\(\s*\.\s*\)|\{\s*\.\s*\}", re.I)
+CVE_TOKEN = re.compile(r"\bcve-\d{4}-\d{4,}\b", re.I)
 
 
 class EdgeGuardCypherGuardError(Exception):
   """Raised for invalid EdgeGuard Cypher guard inputs."""
+
+
+def normalize_user_literal_text(text: str) -> str:
+  """Normalize common pasted IOC/CVE forms before prompting the Cypher model."""
+  normalized = str(text or "").strip()
+  normalized = normalized.replace("hxxps://", "https://").replace("hxxp://", "http://")
+  normalized = normalized.replace("HXXPS://", "https://").replace("HXXP://", "http://")
+  normalized = DEFANGED_DOT.sub(".", normalized)
+  normalized = re.sub(r"\s+", " ", normalized)
+
+  def uppercase_cve(match: re.Match[str]) -> str:
+    return match.group(0).upper()
+
+  normalized = CVE_TOKEN.sub(uppercase_cve, normalized)
+  return normalized.strip(" \t\r\n\"'`.,;")
 
 
 def canonical_schema_surface(artifact: dict[str, Any] | None = None) -> dict[str, list[str]]:
@@ -395,23 +477,57 @@ def build_schema_prompt_context(artifact: dict[str, Any] | None = None) -> str:
   artifact = artifact or EDGEGUARD_SCHEMA
   surface = canonical_schema_surface(artifact)
   temporal = artifact.get("unsupported", {}).get("temporal_predicates", {})
+  temporal_status = temporal.get("status", "unknown")
+  allowed_temporal = temporal.get("allowed_properties", [])
+  rolling_defaults = temporal.get("rolling_window_defaults", {})
   rejected_temporal = temporal.get("known_hallucinated_properties_rejected", [])
-  return "\n".join([
+  lines = [
     "Allowed EdgeGuard Cypher schema:",
     "Labels: " + ", ".join(surface["labels"]),
     "Relationship types: " + ", ".join(surface["relationship_types"]),
     "Properties: " + ", ".join(surface["properties"]),
-    (
+    "High-probability graph patterns: " + "; ".join(HIGH_VALUE_GRAPH_PATTERNS),
+    "Sector guidance: use `Sector.name`; do not use `Sector.zone`.",
+  ]
+  if temporal_status == "supported_for_whitelisted_properties":
+    defaults = "; ".join(
+      f"{key}={value}" for key, value in sorted(rolling_defaults.items())
+    )
+    lines.extend([
+      "Temporal predicates: supported only on whitelisted properties: "
+      + ", ".join(str(value) for value in allowed_temporal),
+      "Rolling temporal windows: " + defaults,
+      (
+        "Rejected temporal property examples: "
+        + ", ".join(str(value) for value in rejected_temporal)
+      ),
+    ])
+  else:
+    lines.append(
       "Unsupported temporal predicates: do not invent time-like properties. "
       "Rejected examples: " + ", ".join(str(value) for value in rejected_temporal)
-    ),
-  ])
+    )
+  return "\n".join(lines)
 
 
 def unsupported_temporal_behavior(artifact: dict[str, Any] | None = None) -> str:
   artifact = artifact or EDGEGUARD_SCHEMA
   temporal = artifact.get("unsupported", {}).get("temporal_predicates", {})
   status = temporal.get("status", "unknown")
+  if status == "supported_for_whitelisted_properties":
+    allowed = ", ".join(str(value) for value in temporal.get("allowed_properties", []))
+    defaults = "; ".join(
+      f"{key}={value}"
+      for key, value in sorted(temporal.get("rolling_window_defaults", {}).items())
+    )
+    return (
+      f"Temporal status: {status}. Use only these temporal properties: {allowed}. "
+      f"Default natural-language windows: {defaults}. For latest requests, order by a "
+      "whitelisted temporal property descending and keep a LIMIT. For recency filters, use a "
+      "bounded duration predicate such as `datetime() - duration('P7D')` with a whitelisted "
+      "property. If no matching temporal property exists for the requested entity, omit the "
+      "temporal predicate rather than inventing a property."
+    )
   return (
     f"Temporal status: {status}. If the user asks for a hard time window or recency filter and "
     "the allowed schema has no matching temporal property, return the closest valid read-only "
@@ -432,6 +548,7 @@ def build_direct_cypher_system_prompt(artifact: dict[str, Any] | None = None) ->
     "- Inline user-provided values directly as escaped Cypher literals when needed.",
     "- Use only the allowed labels, relationship types, and properties listed above.",
     "- Do not invent labels, relationship types, properties, procedures, or temporal fields.",
+    "- Prefer graph/path returns for investigations, neighborhoods, provenance, sector, CVE, indicator, ATT&CK, and relationship questions unless the user clearly asks for a count or table.",
     "- The query must be read-only and must not contain CREATE, MERGE, SET, DELETE, REMOVE, DROP, or LOAD CSV.",
     unsupported_temporal_behavior(artifact),
   ])

@@ -157,6 +157,30 @@ class EdgeGuardAgentTests(unittest.TestCase):
     self.assertEqual(call_payload["temperature"], 0.0)
     self.assertIn("Allowed EdgeGuard Cypher schema", call_payload["messages"][0]["content"])
 
+  def test_agent_normalizes_user_literals_before_model_call(self):
+    plugin = _make_agent()
+    payload = {
+      "model": "edgeguard_qwen_4b",
+      "choices": [{
+        "message": {
+          "content": "MATCH (c:CVE) WHERE c.cve_id = 'CVE-2024-12345' RETURN c LIMIT 5",
+        },
+      }],
+    }
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api.requests.post",
+      return_value=_Response(payload=payload),
+    ) as mocked_post:
+      result = plugin.generate(request="Find cve-2024-12345 from hxxp://bad[.]test")
+
+    self.assertTrue(result["accepted"])
+    call_payload = mocked_post.call_args.kwargs["json"]
+    self.assertEqual(
+      call_payload["messages"][1]["content"],
+      "Find CVE-2024-12345 from http://bad.test",
+    )
+
   def test_agent_unwraps_local_inference_api_result_envelope(self):
     plugin = _make_agent()
     payload = {
