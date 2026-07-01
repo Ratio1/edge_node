@@ -308,6 +308,36 @@ class TestModelTestingCbrnPack(unittest.TestCase):
 
     payload = post.call_args.kwargs["json"]
     self.assertEqual(payload["response_format"], {"type": "json_object"})
+    self.assertEqual(post.call_args.kwargs["headers"]["User-Agent"], "RedMesh-ModelTesting/1.0")
+
+  def test_openai_provider_moderation_uses_moderations_endpoint_and_user_agent(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import (
+      OpenAICompatibleProviderClient,
+    )
+
+    response = MagicMock()
+    response.status_code = 200
+    response.content = b'{"results":[{"flagged":false,"categories":{},"category_scores":{}}]}'
+    response.json.return_value = {
+      "results": [{
+        "flagged": False,
+        "categories": {},
+        "category_scores": {},
+      }],
+    }
+
+    with patch("extensions.business.cybersec.red_mesh.model_testing.runner.requests.post", return_value=response) as post:
+      client = OpenAICompatibleProviderClient({
+        "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+        "api_key": "secret",
+        "model": "moderation-model",
+      })
+
+      data = client.moderate("safe input")
+
+    self.assertEqual(data["results"][0]["flagged"], False)
+    self.assertTrue(post.call_args.args[0].endswith("/v1/moderations"))
+    self.assertEqual(post.call_args.kwargs["headers"]["User-Agent"], "RedMesh-ModelTesting/1.0")
 
   def test_runner_retries_evaluator_parse_failure_with_compact_prompt(self):
     from extensions.business.cybersec.red_mesh.model_testing.runner import ModelTestRunner

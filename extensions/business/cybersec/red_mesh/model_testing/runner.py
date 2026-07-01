@@ -36,6 +36,9 @@ from .evaluators import HEURISTIC_EVALUATOR_ID, MODERATION_EVALUATOR_METHOD
 from .security import validate_provider_url
 
 
+MODEL_TEST_HTTP_USER_AGENT = "RedMesh-ModelTesting/1.0"
+
+
 class ModelTestProviderError(RuntimeError):
   def __init__(self, error_class, *, http_status=None):
     super().__init__(error_class)
@@ -92,6 +95,7 @@ class OpenAICompatibleProviderClient:
     headers = {
       "Authorization": f"Bearer {api_key}",
       "Content-Type": "application/json",
+      "User-Agent": MODEL_TEST_HTTP_USER_AGENT,
     }
     last_error = None
     for _attempt in range(self.max_retries + 1):
@@ -160,6 +164,7 @@ class OpenAICompatibleProviderClient:
     headers = {
       "Authorization": f"Bearer {api_key}",
       "Content-Type": "application/json",
+      "User-Agent": MODEL_TEST_HTTP_USER_AGENT,
     }
     last_error = None
     for _attempt in range(self.max_retries + 1):
