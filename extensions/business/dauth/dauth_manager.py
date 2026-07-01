@@ -271,3 +271,54 @@ class DauthManagerPlugin(
       **data
     })
     return response
+
+  @BasePlugin.endpoint(method="post")
+  # /add_secrets
+  def add_secrets(self, body: dict):
+    """
+    Store the full dAuth secret bundle for a job. Only protocol oracles can write.
+    """
+    if not self._is_dauth_server_enabled():
+      response = self.__get_response({
+        'error': 'dAuth server is not registered as a dAuth oracle'
+      })
+      return response
+
+    try:
+      data = self.process_dauth_add_secrets_request(body)
+    except Exception as e:
+      self.P("Error processing add_secrets request: {}".format(e), color='r')
+      data = {
+        'error' : str(e)
+      }
+
+    response = self.__get_response({
+      **data
+    })
+    return response
+
+  @BasePlugin.endpoint(method="post")
+  # /get_secrets
+  def get_secrets(self, body: dict):
+    """
+    Return the full dAuth secret bundle for a job. Only nodes currently running the
+    job in the R1FS-stored pipeline can read.
+    """
+    if not self._is_dauth_server_enabled():
+      response = self.__get_response({
+        'error': 'dAuth server is not registered as a dAuth oracle'
+      })
+      return response
+
+    try:
+      data = self.process_dauth_get_secret_request(body)
+    except Exception as e:
+      self.P("Error processing get_secrets request: {}".format(e), color='r')
+      data = {
+        'error' : str(e)
+      }
+
+    response = self.__get_response({
+      **data
+    })
+    return response
