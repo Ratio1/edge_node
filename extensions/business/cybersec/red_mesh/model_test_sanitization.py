@@ -3,6 +3,40 @@
 MODEL_TEST_JOB_TYPE = "model_test"
 MODEL_TEST_PROGRESS_SCHEMA = "model_test_progress_v1"
 
+RAW_EVIDENCE_STATUS_NOT_REQUESTED = "not_requested"
+RAW_EVIDENCE_STATUS_DISABLED_BY_POLICY = "disabled_by_policy"
+RAW_EVIDENCE_STATUS_PENDING = "pending"
+RAW_EVIDENCE_STATUS_AVAILABLE = "available"
+RAW_EVIDENCE_STATUS_CAPTURE_FAILED = "capture_failed"
+RAW_EVIDENCE_STATUS_EXPIRED = "expired"
+RAW_EVIDENCE_STATUS_DELETE_PENDING = "delete_pending"
+RAW_EVIDENCE_STATUS_DELETED = "deleted"
+RAW_EVIDENCE_STATUS_DELETE_FAILED = "delete_failed"
+
+RAW_EVIDENCE_STATUSES = {
+  RAW_EVIDENCE_STATUS_NOT_REQUESTED,
+  RAW_EVIDENCE_STATUS_DISABLED_BY_POLICY,
+  RAW_EVIDENCE_STATUS_PENDING,
+  RAW_EVIDENCE_STATUS_AVAILABLE,
+  RAW_EVIDENCE_STATUS_CAPTURE_FAILED,
+  RAW_EVIDENCE_STATUS_EXPIRED,
+  RAW_EVIDENCE_STATUS_DELETE_PENDING,
+  RAW_EVIDENCE_STATUS_DELETED,
+  RAW_EVIDENCE_STATUS_DELETE_FAILED,
+}
+
+RAW_EVIDENCE_ERROR_DISABLED = "raw_evidence_disabled"
+RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE = "raw_evidence_capture_unavailable"
+RAW_EVIDENCE_ERROR_STORAGE_UNAVAILABLE = "raw_evidence_storage_unavailable"
+RAW_EVIDENCE_ERROR_DELETE_FAILED = "raw_evidence_delete_failed"
+
+RAW_EVIDENCE_SAFE_ERROR_CLASSES = {
+  RAW_EVIDENCE_ERROR_DISABLED,
+  RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE,
+  RAW_EVIDENCE_ERROR_STORAGE_UNAVAILABLE,
+  RAW_EVIDENCE_ERROR_DELETE_FAILED,
+}
+
 MODEL_TEST_SAFE_ERROR_CLASSES = {
   "provider_auth_failed",
   "provider_timeout",
@@ -90,6 +124,76 @@ def sanitize_model_test_error_class(value):
   if not isinstance(value, str) or not value:
     return None
   return value if value in MODEL_TEST_SAFE_ERROR_CLASSES else "unknown_error"
+
+
+def raw_evidence_requested(raw_evidence):
+  """Return whether launch/config metadata requested restricted raw evidence."""
+  return isinstance(raw_evidence, dict) and bool(
+    raw_evidence.get("enabled") or raw_evidence.get("requested")
+  )
+
+
+def sanitize_raw_evidence_error_class(value):
+  if not isinstance(value, str) or not value:
+    return None
+  return value if value in RAW_EVIDENCE_SAFE_ERROR_CLASSES else None
+
+
+def sanitize_raw_evidence_status(value):
+  if not isinstance(value, str) or not value:
+    return None
+  return value if value in RAW_EVIDENCE_STATUSES else None
+
+
+def sanitize_raw_evidence_metadata(metadata, *, request_config=None, backend_enabled=False):
+  """Return safe raw-evidence metadata for normal job/archive surfaces."""
+  meta = metadata if isinstance(metadata, dict) else {}
+  requested = (
+    raw_evidence_requested(meta)
+    or raw_evidence_requested(request_config)
+  )
+  backend_enabled = bool(
+    meta.get("backend_enabled")
+    or meta.get("raw_evidence_enabled")
+    or backend_enabled
+  )
+  status = sanitize_raw_evidence_status(meta.get("status") or meta.get("raw_evidence_status"))
+  available = bool(meta.get("available") or meta.get("raw_evidence_available"))
+  if not requested:
+    status = status or RAW_EVIDENCE_STATUS_NOT_REQUESTED
+    available = False
+  elif not backend_enabled:
+    status = status or RAW_EVIDENCE_STATUS_DISABLED_BY_POLICY
+    available = False
+  elif not status:
+    status = RAW_EVIDENCE_STATUS_AVAILABLE if available else RAW_EVIDENCE_STATUS_PENDING
+  if status != RAW_EVIDENCE_STATUS_AVAILABLE:
+    available = False
+
+  payload = {
+    "requested": requested,
+    "backend_enabled": backend_enabled,
+    "status": status,
+    "available": available,
+  }
+  retention_until = meta.get("retention_until") or meta.get("retentionUntil")
+  if isinstance(retention_until, str) and retention_until.strip():
+    payload["retention_until"] = retention_until.strip()[:80]
+  hashes = meta.get("hashes")
+  if isinstance(hashes, list):
+    safe_hashes = [
+      item[:160]
+      for item in hashes
+      if isinstance(item, str) and item.startswith("sha256:") and len(item) <= 160
+    ]
+    if safe_hashes:
+      payload["hashes"] = safe_hashes
+  error_class = sanitize_raw_evidence_error_class(
+    meta.get("error_class") or meta.get("raw_evidence_error_class")
+  )
+  if error_class:
+    payload["error_class"] = error_class
+  return payload
 
 
 def sanitize_model_test_summary(summary) -> dict:

@@ -42,6 +42,10 @@ class JobStateRepository:
   def _triage_audit_hkey(self):
     return f"{self.owner.cfg_instance_id}:triage:audit"
 
+  @property
+  def _model_test_raw_evidence_hkey(self):
+    return f"{self.owner.cfg_instance_id}:model_test_raw_evidence"
+
   def get_job(self, job_id):
     return self.owner.chainstore_hget(hkey=self._jobs_hkey, key=job_id)
 
@@ -192,6 +196,28 @@ class JobStateRepository:
 
   def delete_live_progress(self, key):
     self.owner.chainstore_hset(hkey=self._live_hkey, key=key, value=None)
+    return
+
+  def get_model_test_raw_evidence(self, job_id):
+    return self.owner.chainstore_hget(
+      hkey=self._model_test_raw_evidence_hkey,
+      key=job_id,
+    )
+
+  def put_model_test_raw_evidence(self, job_id, value):
+    self.owner.chainstore_hset(
+      hkey=self._model_test_raw_evidence_hkey,
+      key=job_id,
+      value=value,
+    )
+    return value
+
+  def delete_model_test_raw_evidence(self, job_id):
+    self.owner.chainstore_hset(
+      hkey=self._model_test_raw_evidence_hkey,
+      key=job_id,
+      value=None,
+    )
     return
 
   @staticmethod

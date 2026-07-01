@@ -19,7 +19,14 @@ from extensions.business.cybersec.red_mesh.model_test_sanitization import (
   sanitize_model_test_error_class,
   sanitize_model_test_results,
   sanitize_model_test_summary,
+  sanitize_raw_evidence_metadata,
 )
+
+
+def _sanitize_raw_evidence_if_present(metadata):
+  if not isinstance(metadata, dict):
+    return None
+  return sanitize_raw_evidence_metadata(metadata)
 
 
 @dataclass(frozen=True)
@@ -148,9 +155,15 @@ class CStoreJobRunning:
   job_type: str = None
   model_test_summary: dict = None
   model_test_node_selection: dict = None
+  model_test_raw_evidence: dict = None
 
   def to_dict(self) -> dict:
-    return _strip_none(asdict(self))
+    payload = asdict(self)
+    if payload.get("model_test_raw_evidence") is not None:
+      payload["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(
+        payload.get("model_test_raw_evidence")
+      )
+    return _strip_none(payload)
 
   @classmethod
   def from_dict(cls, d: dict) -> CStoreJobRunning:
@@ -191,6 +204,9 @@ class CStoreJobRunning:
       job_type=d.get("job_type"),
       model_test_summary=d.get("model_test_summary"),
       model_test_node_selection=d.get("model_test_node_selection"),
+      model_test_raw_evidence=_sanitize_raw_evidence_if_present(
+        d.get("model_test_raw_evidence") or d.get("model_test_raw_evidence_metadata")
+      ),
     )
 
 
@@ -236,9 +252,15 @@ class CStoreJobFinalized:
   job_type: str = None
   model_test_summary: dict = None
   model_test_node_selection: dict = None
+  model_test_raw_evidence: dict = None
 
   def to_dict(self) -> dict:
-    return _strip_none(asdict(self))
+    payload = asdict(self)
+    if payload.get("model_test_raw_evidence") is not None:
+      payload["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(
+        payload.get("model_test_raw_evidence")
+      )
+    return _strip_none(payload)
 
   @classmethod
   def from_dict(cls, d: dict) -> CStoreJobFinalized:
@@ -277,6 +299,9 @@ class CStoreJobFinalized:
       job_type=d.get("job_type"),
       model_test_summary=d.get("model_test_summary"),
       model_test_node_selection=d.get("model_test_node_selection"),
+      model_test_raw_evidence=_sanitize_raw_evidence_if_present(
+        d.get("model_test_raw_evidence") or d.get("model_test_raw_evidence_metadata")
+      ),
     )
 
 

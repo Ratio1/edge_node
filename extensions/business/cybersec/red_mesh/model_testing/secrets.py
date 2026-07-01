@@ -31,6 +31,9 @@ def _runtime_provider(provider, secret_payload):
     "base_url": provider.get("base_url") or "",
     "model": provider.get("model") or "",
   }
+  method = str(provider.get("method") or "").strip()
+  if method:
+    runtime["method"] = method
   api_key = _api_key_from_payload(secret_payload) or str(provider.get("api_key") or "").strip()
   if api_key:
     runtime["api_key"] = api_key

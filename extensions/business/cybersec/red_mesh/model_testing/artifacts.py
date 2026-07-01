@@ -14,6 +14,7 @@ from ..model_test_sanitization import (
   sanitize_model_test_results,
   sanitize_model_test_summary,
 )
+from .raw_evidence import sanitize_raw_evidence_metadata
 
 
 MODEL_TEST_JOB_CONFIG_SCHEMA = "model_test_job_config_v1"
@@ -144,11 +145,16 @@ class ModelTestArchive:
   schema_version: str = MODEL_TEST_ARCHIVE_SCHEMA
   archive_version: int = 1
   redmesh_test_attestation: dict = None
+  model_test_raw_evidence: dict = None
 
   def to_dict(self) -> dict:
     payload = asdict(self)
     payload["model_test_results"] = sanitize_model_test_results(payload.get("model_test_results"))
     payload["model_test_summary"] = sanitize_model_test_summary(payload.get("model_test_summary"))
+    payload["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(
+      payload.get("model_test_raw_evidence"),
+      request_config=(payload.get("job_config") or {}).get("raw_evidence"),
+    )
     return _strip_none(payload)
 
   @classmethod
@@ -174,6 +180,10 @@ class ModelTestArchive:
       date_created=d.get("date_created", 0),
       date_completed=d.get("date_completed", 0),
       redmesh_test_attestation=d.get("redmesh_test_attestation"),
+      model_test_raw_evidence=sanitize_raw_evidence_metadata(
+        d.get("model_test_raw_evidence") or d.get("model_test_raw_evidence_metadata"),
+        request_config=(d.get("job_config") or {}).get("raw_evidence"),
+      ),
     )
 
 

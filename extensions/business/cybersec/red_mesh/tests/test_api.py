@@ -3950,6 +3950,15 @@ class TestPhase5Endpoints(unittest.TestCase):
           "error_class": "not-allowlisted",
         }],
       },
+      "model_test_raw_evidence": {
+        "requested": True,
+        "backend_enabled": True,
+        "status": "capture_failed",
+        "available": False,
+        "error_class": "raw_evidence_capture_unavailable",
+        "cid": "cid-raw-secret",
+        "artifact_id": "artifact-secret",
+      },
       "error_message": "top-level raw secret-token",
       "workers": {
         "node-a": {
@@ -3967,6 +3976,8 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(payload["model_test_summary"]["error_class"], "unknown_error")
     self.assertEqual(payload["model_test_results"]["cases"][0]["case_id"], "case-1")
     self.assertEqual(payload["model_test_results"]["cases"][0]["error_class"], "unknown_error")
+    self.assertEqual(payload["model_test_raw_evidence"]["status"], "capture_failed")
+    self.assertEqual(payload["model_test_raw_evidence"]["error_class"], "raw_evidence_capture_unavailable")
     self.assertEqual(payload["error_class"], "unknown_error")
     payload_text = str(payload)
     self.assertNotIn("error_message", payload_text)
@@ -3977,6 +3988,8 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertNotIn("secret prompt", payload_text)
     self.assertNotIn("secret response", payload_text)
     self.assertNotIn("provider.example", payload_text)
+    self.assertNotIn("cid-raw-secret", payload_text)
+    self.assertNotIn("artifact-secret", payload_text)
 
   def test_list_jobs_finalized_as_is(self):
     """Finalized stubs returned unmodified with all CStoreJobFinalized fields."""
@@ -4010,6 +4023,15 @@ class TestPhase5Endpoints(unittest.TestCase):
       "model_test_results": {
         "cases": [{"case_id": "case-1", "raw_response": "secret response"}],
       },
+      "model_test_raw_evidence": {
+        "requested": True,
+        "backend_enabled": True,
+        "status": "capture_failed",
+        "available": False,
+        "error_class": "raw_evidence_capture_unavailable",
+        "cid": "cid-raw-secret",
+        "artifact_id": "artifact-secret",
+      },
       "error": "listing raw exception secret-token",
     })
     plugin = self._build_plugin({"model-job": stub})
@@ -4018,6 +4040,7 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     job = result["model-job"]
     self.assertEqual(job["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(job["model_test_raw_evidence"]["status"], "capture_failed")
     self.assertEqual(job["error_class"], "unknown_error")
     payload_text = str(job)
     self.assertNotIn("error_message", payload_text)
@@ -4025,6 +4048,8 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertNotIn("listing raw exception", payload_text)
     self.assertNotIn("secret-token", payload_text)
     self.assertNotIn("secret response", payload_text)
+    self.assertNotIn("cid-raw-secret", payload_text)
+    self.assertNotIn("artifact-secret", payload_text)
 
   def test_list_jobs_running_stripped(self):
     """Running jobs have counts but no timeline, workers, or pass_reports."""
@@ -4140,6 +4165,15 @@ class TestPhase5Endpoints(unittest.TestCase):
       "model_test_results": {
         "cases": [{"case_id": "case-1", "raw_prompt": "secret prompt"}],
       },
+      "model_test_raw_evidence": {
+        "requested": True,
+        "backend_enabled": True,
+        "status": "capture_failed",
+        "available": False,
+        "error_class": "raw_evidence_capture_unavailable",
+        "cid": "cid-raw-secret",
+        "artifact_id": "artifact-secret",
+      },
       "error_message": "status raw exception secret-token",
       "workers": {
         "node-a": {
@@ -4157,6 +4191,7 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     self.assertEqual(result["status"], "network_tracked")
     self.assertEqual(result["job"]["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(result["job"]["model_test_raw_evidence"]["status"], "capture_failed")
     self.assertEqual(result["job"]["error_class"], "unknown_error")
     payload_text = str(result)
     self.assertNotIn("error_message", payload_text)
@@ -4165,6 +4200,8 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertNotIn("worker raw exception", payload_text)
     self.assertNotIn("secret-token", payload_text)
     self.assertNotIn("secret prompt", payload_text)
+    self.assertNotIn("cid-raw-secret", payload_text)
+    self.assertNotIn("artifact-secret", payload_text)
 
   def test_get_job_data_includes_reconciled_workers(self):
     """get_job_data includes reconciled worker state for active jobs."""

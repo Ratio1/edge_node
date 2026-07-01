@@ -398,6 +398,8 @@ def get_graybox_budgets_config(owner):
 
 def get_model_testing_config(owner):
   """Return normalized Model Testing capability config."""
+  from ..model_testing.evaluators import infer_evaluator_method
+
   def _bounded_text(value, *, maximum=200):
     text = str(value or "").strip()
     if not text or len(text) > maximum:
@@ -423,6 +425,7 @@ def get_model_testing_config(owner):
       base_url = str(entry.get("base_url") or "").strip()
       model = _bounded_text(entry.get("model"), maximum=200)
       api_key_env = _bounded_text(entry.get("api_key_env"), maximum=120)
+      method = infer_evaluator_method(entry)
       if not all((label, provider_label, base_url, model, api_key_env)):
         continue
       normalized.append({
@@ -433,6 +436,7 @@ def get_model_testing_config(owner):
         "base_url": base_url,
         "model": model,
         "api_key_env": api_key_env,
+        "method": method,
         "enabled": bool(entry.get("enabled", True)),
       })
       seen_ids.add(evaluator_id)
