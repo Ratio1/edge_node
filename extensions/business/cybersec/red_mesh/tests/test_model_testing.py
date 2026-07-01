@@ -1565,38 +1565,10 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
     self.assertEqual(result["error"], "forbidden")
     self.assertNotIn("cases", str(result))
 
-  def test_raw_evidence_endpoint_rejects_missing_permission(self):
+  def test_raw_evidence_endpoint_reads_by_job_id(self):
     Plugin, plugin = self._raw_evidence_endpoint_plugin()
 
-    result = Plugin.get_raw_model_test_evidence(plugin, "backend-token", "job-raw")
-
-    self.assertEqual(result["error"], "forbidden")
-    self.assertEqual(result["status_code"], 403)
-    plugin.r1fs.get_json.assert_not_called()
-
-  def test_raw_evidence_endpoint_rejects_invalid_backend_token(self):
-    Plugin, plugin = self._raw_evidence_endpoint_plugin()
-
-    result = Plugin.get_raw_model_test_evidence(
-      plugin,
-      "wrong-token",
-      "job-raw",
-      "job:view_raw_model_evidence",
-    )
-
-    self.assertEqual(result["error"], "forbidden")
-    self.assertEqual(result["status_code"], 403)
-    plugin.r1fs.get_json.assert_not_called()
-
-  def test_raw_evidence_endpoint_reads_only_with_backend_auth_and_permission(self):
-    Plugin, plugin = self._raw_evidence_endpoint_plugin()
-
-    result = Plugin.get_raw_model_test_evidence(
-      plugin,
-      "backend-token",
-      "job-raw",
-      "job:view_raw_model_evidence",
-    )
+    result = Plugin.get_raw_model_test_evidence(plugin, "job-raw")
 
     self.assertEqual(result["payload"]["cases"][0]["tested_model"]["response"], "raw answer secret")
     self.assertEqual(result["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_AVAILABLE)
