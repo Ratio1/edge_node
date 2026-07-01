@@ -15,6 +15,10 @@ plugin to provide a complete decentralized authentication solution.
 """
 
 
+DAUTH_JOB_SECRETS_CSTORE_HKEY = "DAUTH_JOB_SECRETS"
+DEEPLOY_JOBS_CSTORE_HKEY = "DEEPLOY_DEPLOYED_JOBS"
+
+
 def version_to_int(version):
   """
   Convert a version string to an integer.
@@ -159,8 +163,146 @@ class _DauthMixin(object):
           node_address_eth, self.evm_network, e
         )
     return result, msg
-  
-  
+
+  def _verify_signed_dauth_body(self, body):
+    if not isinstance(body, dict):
+      raise ValueError("Invalid request body.")
+
+    bcct = self.const.BASE_CT.BCctbase
+    requester = body.get(bcct.SENDER)
+    requester_send_eth = body.get(bcct.ETH_SENDER)
+    if not requester:
+      raise ValueError("No sender address in request.")
+    if not requester_send_eth:
+      raise ValueError("No sender ETH address in request.")
+
+    requester_eth = self.bc.node_address_to_eth_address(requester)
+    if requester_eth.lower() != requester_send_eth.lower():
+      raise ValueError("Sender ETH address and recovered ETH address do not match.")
+
+    verify_data = self.bc.verify(body, return_full_info=True)
+    if not verify_data.valid:
+      raise ValueError("Invalid request signature: {}".format(verify_data.message))
+
+    return requester, requester_eth
+
+  def _is_protocol_oracle_eth(self, node_address_eth):
+    eth_oracles = self.bc.get_eth_oracles()
+    if len(eth_oracles) == 0:
+      raise ValueError("No oracles found - this is a critical issue!")
+    return node_address_eth.lower() in [addr.lower() for addr in eth_oracles]
+
+  def _normalize_dauth_job_id(self, job_id):
+    if job_id in [None, ""]:
+      raise ValueError("Job ID is required.")
+    return str(job_id)
+
+  def _build_secret_bundle_from_request(self, body, job_id):
+    secret_bundle = body.get("secret_bundle")
+    if secret_bundle is None:
+      plugin_secrets = body.get("plugin_secrets")
+      if plugin_secrets is None:
+        raise ValueError("Secret bundle is required.")
+      secret_bundle = {
+        "job_id": job_id,
+        "plugin_secrets": plugin_secrets,
+      }
+    if not isinstance(secret_bundle, dict):
+      raise ValueError("Secret bundle must be a dictionary.")
+
+    bundle_job_id = secret_bundle.get("job_id", job_id)
+    if str(bundle_job_id) != job_id:
+      raise ValueError("Secret bundle job_id does not match request job_id.")
+
+    secret_bundle = self.deepcopy(secret_bundle)
+    secret_bundle["job_id"] = job_id
+    return secret_bundle
+
+  def _save_dauth_job_secret_bundle(self, job_id, secret_bundle):
+    result = self.chainstore_hset(
+      hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
+      key=job_id,
+      value=secret_bundle,
+    )
+    if not result:
+      raise ValueError(f"Failed to store dAuth secrets for job {job_id}.")
+    return result
+
+  def _load_dauth_job_secret_bundle(self, job_id):
+    return self.chainstore_hget(
+      hkey=DAUTH_JOB_SECRETS_CSTORE_HKEY,
+      key=job_id,
+    )
+
+  def _load_dauth_job_pipeline(self, job_id):
+    cid = self.chainstore_hget(
+      hkey=DEEPLOY_JOBS_CSTORE_HKEY,
+      key=job_id,
+    )
+    if not cid:
+      return None
+    return self.r1fs.get_json(cid, show_logs=False)
+
+  def _pipeline_runner_nodes(self, pipeline):
+    if not isinstance(pipeline, dict):
+      return []
+    specs = pipeline.get("DEEPLOY_SPECS") or pipeline.get("deeploy_specs") or {}
+    if not isinstance(specs, dict):
+      return []
+    nodes = specs.get("current_target_nodes") or specs.get("CURRENT_TARGET_NODES") or []
+    if isinstance(nodes, str):
+      nodes = [nodes]
+    if not isinstance(nodes, list):
+      return []
+    return [node for node in nodes if isinstance(node, str) and len(node) > 0]
+
+  def _normalize_node_address_for_compare(self, node_address):
+    try:
+      return self.bc.maybe_add_prefix(node_address)
+    except Exception:
+      return node_address
+
+  def _is_node_running_dauth_job(self, job_id, node_address):
+    pipeline = self._load_dauth_job_pipeline(job_id)
+    runner_nodes = self._pipeline_runner_nodes(pipeline)
+    requester = self._normalize_node_address_for_compare(node_address)
+    runner_nodes = [
+      self._normalize_node_address_for_compare(node)
+      for node in runner_nodes
+    ]
+    return requester in runner_nodes
+
+  def process_dauth_add_secrets_request(self, body):
+    requester, requester_eth = self._verify_signed_dauth_body(body)
+    if not self._is_protocol_oracle_eth(requester_eth):
+      raise ValueError(f"Sender {requester_eth} is not an oracle.")
+
+    job_id = self._normalize_dauth_job_id(body.get("job_id"))
+    secret_bundle = self._build_secret_bundle_from_request(body, job_id)
+    self._save_dauth_job_secret_bundle(job_id, secret_bundle)
+    self.Pd(f"dAuth stored secret bundle for job {job_id} from oracle {requester}.")
+    return {
+      "status": "success",
+      "job_id": job_id,
+    }
+
+  def process_dauth_get_secret_request(self, body):
+    requester, _ = self._verify_signed_dauth_body(body)
+    job_id = self._normalize_dauth_job_id(body.get("job_id"))
+
+    if not self._is_node_running_dauth_job(job_id, requester):
+      raise ValueError(f"Sender {requester} is not running job {job_id}.")
+
+    secret_bundle = self._load_dauth_job_secret_bundle(job_id)
+    if not isinstance(secret_bundle, dict):
+      raise ValueError(f"No dAuth secret bundle found for job {job_id}.")
+
+    return {
+      "status": "success",
+      "job_id": job_id,
+      "secret_bundle": secret_bundle,
+    }
+
   def chainstore_store_dauth_request(
     self, 
     node_address : str, 
