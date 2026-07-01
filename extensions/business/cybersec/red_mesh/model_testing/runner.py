@@ -15,6 +15,7 @@ from ..llm_security_probe import (
   ProbeCase,
   _score_case,
 )
+from ..model_test_sanitization import raw_evidence_requested
 from .catalog import (
   normalize_model_test_selection,
   selected_model_test_cases,
@@ -614,6 +615,9 @@ class ModelTestRunner:
       temperature=0,
     )
 
+  def _raw_evidence_requested(self):
+    return raw_evidence_requested((self.job_config or {}).get("raw_evidence"))
+
   def run(self):
     limits = dict(self.job_config.get("limits") or {})
     normalized_test_sets, selection_err = normalize_model_test_selection(
@@ -641,6 +645,7 @@ class ModelTestRunner:
       except ModelTestProviderError as exc:
         return self._preflight_failed_result(exc.error_class, cases, normalized_test_sets, evaluator_fields)
     results = []
+    raw_evidence_cases = [] if self._raw_evidence_requested() else None
     metrics = {
       "total_cases": len(cases),
       "completed_cases": 0,
@@ -665,23 +670,49 @@ class ModelTestRunner:
         "attempts": 1,
         **evaluator_fields,
       }
+      case_evidence = None
       try:
         tested_messages = []
         if case.get("system_prompt"):
           tested_messages.append({"role": "system", "content": case["system_prompt"]})
         tested_messages.append({"role": "user", "content": case["question"]})
+        if raw_evidence_cases is not None:
+          case_evidence = {
+            "case_id": case["case_id"],
+            "test_set_id": case.get("test_set_id"),
+            "test_set_name": case.get("test_set_name"),
+            "category": case["category"],
+            "topic_id": case.get("topic_id"),
+            "topic_label": case.get("topic_label"),
+            "prompt_summary": case["prompt_summary"],
+            "tested_model": {
+              "messages": list(tested_messages),
+            },
+            "evaluator": {
+              **evaluator_fields,
+              "raw_included": False,
+            },
+          }
         tested_answer = tested_client.chat(
           tested_messages,
           max_tokens=limits.get("tested_max_tokens", 256),
           temperature=limits.get("temperature", 0),
         )
         case_result["tested_response_hash"] = _sha256_text(tested_answer)
+        if case_evidence is not None:
+          case_evidence["tested_model"]["response"] = tested_answer
+          case_evidence["tested_model"]["response_hash"] = case_result["tested_response_hash"]
       except ModelTestProviderError as exc:
         case_result.update({
           "status": "execution_failed",
           "error_class": exc.error_class,
           "duration_ms": _now_ms(case_started),
         })
+        if case_evidence is not None:
+          case_evidence["status"] = "execution_failed"
+          case_evidence["error_class"] = exc.error_class
+          case_evidence["duration_ms"] = case_result["duration_ms"]
+          raw_evidence_cases.append(case_evidence)
         metrics["execution_failed_cases"] += 1
         metrics["completed_cases"] += 1
         results.append(case_result)
@@ -712,6 +743,13 @@ class ModelTestRunner:
           "attempts": max(case_result["attempts"], evaluator_attempts),
           "duration_ms": _now_ms(case_started),
         })
+        if case_evidence is not None:
+          case_evidence["status"] = "evaluated"
+          case_evidence["verdict"] = case_result.get("verdict")
+          case_evidence["safety_aligned"] = case_result.get("safety_aligned")
+          case_evidence["intended_behavior_correct"] = case_result.get("intended_behavior_correct")
+          case_evidence["score"] = case_result.get("score")
+          case_evidence["duration_ms"] = case_result["duration_ms"]
         metrics["evaluated_cases"] += 1
       except ModelTestProviderError as exc:
         case_result.update({
@@ -719,7 +757,13 @@ class ModelTestRunner:
           "error_class": exc.error_class,
           "duration_ms": _now_ms(case_started),
         })
+        if case_evidence is not None:
+          case_evidence["status"] = "evaluation_failed"
+          case_evidence["error_class"] = exc.error_class
+          case_evidence["duration_ms"] = case_result["duration_ms"]
         metrics["evaluation_failed_cases"] += 1
+      if case_evidence is not None:
+        raw_evidence_cases.append(case_evidence)
       metrics["completed_cases"] += 1
       results.append(case_result)
     overall_status = "completed" if metrics["evaluated_cases"] == metrics["total_cases"] else "incomplete"
@@ -741,7 +785,7 @@ class ModelTestRunner:
     }
     if metrics["evaluated_cases"] == metrics["total_cases"] and results:
       summary["aggregate_score"] = sum(float(case.get("score") or 0.0) for case in results) / len(results)
-    return {
+    result_payload = {
       "phase": MODEL_TEST_PHASE_DONE,
       "progress": 100.0,
       "completed_tests": [case["case_id"] for case in results],
@@ -755,6 +799,11 @@ class ModelTestRunner:
       },
       "model_test_summary": summary,
     }
+    if raw_evidence_cases is not None:
+      result_payload["raw_evidence_payload"] = {
+        "cases": raw_evidence_cases,
+      }
+    return result_payload
 
   def _publish(self, phase, results, metrics, *, progress):
     if not callable(self.progress_callback):

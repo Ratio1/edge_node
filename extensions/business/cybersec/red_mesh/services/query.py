@@ -453,6 +453,10 @@ def get_job_progress(owner, job_id: str):
       "model_test_summary": sanitize_model_test_summary(job_specs.get("model_test_summary")),
       "model_test_node_selection": job_specs.get("model_test_node_selection"),
     })
+    if "model_test_raw_evidence" in job_specs:
+      response["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(
+        job_specs.get("model_test_raw_evidence")
+      )
   return response
 
 

@@ -19,8 +19,10 @@ from extensions.business.cybersec.red_mesh.model_testing.constants import (
 )
 from extensions.business.cybersec.red_mesh.model_testing.raw_evidence import (
   RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE,
+  RAW_EVIDENCE_STATUS_AVAILABLE,
   RAW_EVIDENCE_STATUS_CAPTURE_FAILED,
   RAW_EVIDENCE_STATUS_PENDING,
+  RAW_MODEL_TEST_EVIDENCE_KIND,
 )
 from extensions.business.cybersec.red_mesh.model_testing.evaluators import (
   MODERATION_EVALUATOR_METHOD,
@@ -566,6 +568,39 @@ class TestModelTestingCbrnPack(unittest.TestCase):
     self.assertIn("Heuristic checks failed", case["rationale"])
     self.assertNotIn("materials list", str(case))
     self.assertNotIn("precursor", str(case))
+
+  def test_runner_captures_restricted_raw_evidence_only_when_requested(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import ModelTestRunner
+
+    class TestedClient:
+      def chat(self, messages, *, max_tokens, temperature):
+        return "raw tested answer secret"
+
+    def build_runner(raw_evidence):
+      return ModelTestRunner(
+        owner=MagicMock(),
+        job_config={
+          "tested_model": {"adapter": "openai_compatible"},
+          "evaluator_id": "heuristic_v1",
+          "evaluator_model": {"id": "heuristic_v1", "kind": "heuristic"},
+          "test_sets": [{"id": "cbrn_safety_v1", "topic_ids": ["chemical"]}],
+          "limits": {"tested_max_tokens": 64, "evaluator_max_tokens": 128},
+          "raw_evidence": raw_evidence,
+        },
+        provider_client_factory=lambda role, provider_config, limits: TestedClient(),
+      )
+
+    without_raw = build_runner({"requested": False}).run()
+    with_raw = build_runner({"requested": True}).run()
+
+    self.assertNotIn("raw_evidence_payload", without_raw)
+    raw_case = with_raw["raw_evidence_payload"]["cases"][0]
+    self.assertEqual(raw_case["tested_model"]["messages"][0]["role"], "user")
+    self.assertEqual(raw_case["tested_model"]["response"], "raw tested answer secret")
+    self.assertFalse(raw_case["evaluator"]["raw_included"])
+    normal_results = str(with_raw["model_test_results"])
+    self.assertIn("tested_response_hash", normal_results)
+    self.assertNotIn("raw tested answer secret", normal_results)
 
 
 class TestModelTestingProviderSecurity(unittest.TestCase):
@@ -1199,6 +1234,139 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     stub = plugin._write_job_record.call_args.args[1]
     self.assertEqual(stub["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_CAPTURE_FAILED)
     self.assertEqual(stub["model_test_raw_evidence"]["error_class"], RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE)
+    event_types = [event["type"] for event in archive_payload["timeline"]]
+    self.assertIn("completed", event_types)
+    self.assertIn("finalized", event_types)
+
+  def test_model_test_finalization_stores_requested_raw_evidence_in_restricted_lane(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "Launcher"
+    plugin.cfg_instance_id = "instance"
+    plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
+    plugin.time.return_value = 200.0
+    plugin.cfg_model_testing = {
+      "ENABLED": True,
+      "RAW_EVIDENCE_ENABLED": True,
+      "RAW_EVIDENCE_DEFAULT_RETENTION_DAYS": 7,
+      "RAW_EVIDENCE_MAX_RETENTION_DAYS": 30,
+    }
+    plugin.cfg_archive_verify_retries = 1
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.get_json.side_effect = [
+      {
+        "schema_version": "model_test_job_config_v1",
+        "job_type": "model_test",
+        "raw_evidence": {"requested": True},
+      },
+      {"job_id": "job-raw"},
+    ]
+    stored = []
+
+    def add_json(payload, show_logs=False, secret=None):
+      stored.append({"payload": payload, "show_logs": show_logs, "secret": secret})
+      return "QmRawEvidenceCID" if secret else "QmArchiveCID"
+
+    plugin.r1fs.add_json.side_effect = add_json
+    job_specs = {
+      "job_id": "job-raw",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "run_mode": "SINGLEPASS",
+      "target": "Unit Provider / unit-model",
+      "task_name": "CBRN smoke",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "date_created": 100.0,
+      "job_config_cid": "QmConfigCID",
+      "workers": {"launcher-node": {"finished": True}},
+      "timeline": [],
+    }
+
+    result = PentesterApi01Plugin._finalize_model_test_job(
+      plugin,
+      "job-raw",
+      job_specs,
+      {
+        "status": "completed",
+        "model_test_results": {"overall_status": "completed", "cases": []},
+        "model_test_summary": {"overall_status": "completed", "cases_completed": 1, "cases_total": 1},
+      },
+      "QmWorkerResult",
+      raw_evidence_payload={
+        "cases": [{
+          "case_id": "case-1",
+          "tested_model": {
+            "messages": [{"role": "user", "content": "raw prompt secret"}],
+            "response": "raw answer secret",
+          },
+        }],
+      },
+    )
+
+    self.assertTrue(result)
+    raw_write = next(entry for entry in stored if entry["secret"])
+    archive_write = next(entry for entry in stored if not entry["secret"])
+    self.assertFalse(raw_write["show_logs"])
+    self.assertEqual(raw_write["payload"]["kind"], RAW_MODEL_TEST_EVIDENCE_KIND)
+    self.assertEqual(raw_write["payload"]["cases"][0]["tested_model"]["response"], "raw answer secret")
+
+    archive_payload = archive_write["payload"]
+    raw_meta = archive_payload["model_test_raw_evidence"]
+    self.assertEqual(raw_meta["status"], RAW_EVIDENCE_STATUS_AVAILABLE)
+    self.assertTrue(raw_meta["available"])
+    self.assertIn("hashes", raw_meta)
+    self.assertNotIn("QmRawEvidenceCID", str(archive_payload))
+    self.assertNotIn("raw prompt secret", str(archive_payload))
+    self.assertNotIn("raw answer secret", str(archive_payload))
+    event_types = [event["type"] for event in archive_payload["timeline"]]
+    self.assertIn("completed", event_types)
+    self.assertIn("finalized", event_types)
+
+    raw_metadata_write = next(
+      call.kwargs["value"]
+      for call in plugin.chainstore_hset.call_args_list
+      if call.kwargs["hkey"] == "instance:model_test_raw_evidence"
+    )
+    self.assertEqual(raw_metadata_write["artifact_cid"], "QmRawEvidenceCID")
+    stub = plugin._write_job_record.call_args.args[1]
+    self.assertEqual(stub["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_AVAILABLE)
+    self.assertNotIn("QmRawEvidenceCID", str(stub))
+
+  def test_restricted_raw_evidence_read_uses_backend_metadata(self):
+    from extensions.business.cybersec.red_mesh.model_testing.raw_evidence import get_raw_evidence_artifact
+
+    owner = _owner(cfg_instance_id="instance", chainstore_hget=MagicMock())
+    raw_payload = {
+      "kind": RAW_MODEL_TEST_EVIDENCE_KIND,
+      "schema_version": "model_test_raw_evidence_v1",
+      "job_id": "job-raw",
+      "cases": [{"case_id": "case-1", "tested_model": {"response": "raw answer secret"}}],
+    }
+    owner.chainstore_hget.side_effect = lambda hkey, key: {
+      "job_id": "job-raw",
+      "requested": True,
+      "backend_enabled": True,
+      "status": RAW_EVIDENCE_STATUS_AVAILABLE,
+      "available": True,
+      "artifact_cid": "QmRawEvidenceCID",
+      "hashes": ["sha256:" + "a" * 64],
+    } if hkey == "instance:model_test_raw_evidence" else None
+    owner.r1fs.get_json.return_value = raw_payload
+
+    response = get_raw_evidence_artifact(owner, "job-raw")
+
+    self.assertEqual(response["payload"]["cases"][0]["tested_model"]["response"], "raw answer secret")
+    self.assertEqual(response["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_AVAILABLE)
+    self.assertNotIn("QmRawEvidenceCID", str(response["model_test_raw_evidence"]))
+    owner.r1fs.get_json.assert_called_once_with(
+      "QmRawEvidenceCID",
+      secret="redmesh-default-plugin-key-v1",
+    )
 
   def test_enabled_launch_defaults_to_all_built_in_sets_when_selection_omitted(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
@@ -1729,6 +1897,14 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
         "error_class": "not-an-allowlisted-error",
       },
       "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "model_test_raw_evidence": {
+        "requested": True,
+        "backend_enabled": True,
+        "status": RAW_EVIDENCE_STATUS_CAPTURE_FAILED,
+        "available": False,
+        "error_class": RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE,
+        "artifact_cid": "QmRawSecret",
+      },
       "workers": {
         "node-a": {
           "worker_type": "model_test",
@@ -1755,9 +1931,11 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(worker["live_metrics"]["total_cases"], 12)
     self.assertEqual(worker["model_test_summary"]["overall_status"], "queued")
     self.assertEqual(response["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(response["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_CAPTURE_FAILED)
     response_text = str(response)
     self.assertNotIn("queued raw summary", response_text)
     self.assertNotIn("secret-token", response_text)
+    self.assertNotIn("QmRawSecret", response_text)
 
   def test_model_test_progress_readback_strips_raw_error_fields_from_live_row(self):
     from extensions.business.cybersec.red_mesh.services.query import get_job_progress
