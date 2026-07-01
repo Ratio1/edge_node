@@ -2563,6 +2563,7 @@ class _DeeployMixin:
     the validated update payload.
     """
     requested_by_instance_id, requested_by_signature, new_plugin_configs = self._organize_requested_plugins(inputs)
+    consumed_new_plugin_ids = set()
     materialized_plugins = []
 
     instance_id_key = self.ct.BIZ_PLUGIN_DATA.INSTANCE_ID
@@ -2656,7 +2657,10 @@ class _DeeployMixin:
       )
 
     def consume_signature_candidate(record):
-      candidate_list = requested_by_signature.get(record["normalized_signature"], [])
+      candidate_list = [
+        candidate for candidate in requested_by_signature.get(record["normalized_signature"], [])
+        if id(candidate) not in consumed_new_plugin_ids
+      ]
       if not candidate_list:
         return None
 
@@ -2706,11 +2710,7 @@ class _DeeployMixin:
         return None
 
       plugin_config = candidates[0]
-      for idx, candidate in enumerate(candidate_list):
-        if candidate is plugin_config:
-          candidate_list.pop(idx)
-          break
-      self._remove_consumed_new_plugin_config(new_plugin_configs, plugin_config)
+      consumed_new_plugin_ids.add(id(plugin_config))
       return plugin_config
 
     for record in discovered_records:
@@ -2719,12 +2719,6 @@ class _DeeployMixin:
 
       if instance_id:
         plugin_config = requested_by_instance_id.pop(instance_id, None)
-        candidate_list = requested_by_signature.get(record["normalized_signature"], [])
-        if plugin_config and candidate_list:
-          for idx, candidate in enumerate(candidate_list):
-            if candidate is plugin_config:
-              candidate_list.pop(idx)
-              break
       else:
         plugin_config = consume_signature_candidate(record)
 
@@ -2746,6 +2740,8 @@ class _DeeployMixin:
       )
 
     for plugin_config in new_plugin_configs:
+      if id(plugin_config) in consumed_new_plugin_ids:
+        continue
       plugin_entry = self.deepcopy(plugin_config)
       if DEEPLOY_KEYS.PLUGIN_SIGNATURE not in plugin_entry and plugin_entry.get("signature"):
         plugin_entry[DEEPLOY_KEYS.PLUGIN_SIGNATURE] = plugin_entry.get("signature")
