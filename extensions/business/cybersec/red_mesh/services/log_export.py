@@ -13,6 +13,7 @@ from ..repositories import ArtifactRepository
 from .auth import AuthError, build_auth_provider
 from .config import get_event_export_config, get_wazuh_export_config
 from .integration_status import record_integration_status
+from .soc_export_policy import current_integration_cooldown
 
 
 WAZUH_EVENT_GROUPS = (
@@ -159,6 +160,16 @@ def _record_failure(owner, integration_id, event, error_class, payload_bytes=Non
   return artifact_cid
 
 
+def _cooldown_fields(owner, integration_id):
+  cooldown = current_integration_cooldown(owner, integration_id)
+  if not cooldown:
+    return {}
+  return {
+    "cooldown_until": cooldown["cooldown_until"],
+    "retry_after_seconds": cooldown["retry_after_seconds"],
+  }
+
+
 def deliver_wazuh_event(owner, event, *, dry_run=False):
   """Deliver one canonical RedMesh event to the Wazuh/generic SIEM adapter."""
   integration_id = "wazuh"
@@ -210,6 +221,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
         "event_id": _event_id(event),
         "mode": mode,
         "error": "missing_http_url",
+        **_cooldown_fields(owner, integration_id),
       }
     try:
       provider = build_auth_provider(cfg)
@@ -222,6 +234,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
         "mode": mode,
         "error": "invalid_auth_config",
         "detail": str(exc),
+        **_cooldown_fields(owner, integration_id),
       }
 
     # In wazuh_api mode we re-shape the payload to match Wazuh manager
@@ -245,6 +258,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
         "event_id": _event_id(event),
         "mode": mode,
         "error": "missing_syslog_host",
+        **_cooldown_fields(owner, integration_id),
       }
     syslog_line = format_syslog_json_line(event, signature=signature)
     send = lambda: _send_syslog_json(cfg["SYSLOG_HOST"], cfg["SYSLOG_PORT"], syslog_line, timeout_seconds)
@@ -299,6 +313,7 @@ def deliver_wazuh_event(owner, event, *, dry_run=False):
     "attempts": attempt,
     "error": last_error or "delivery_failed",
     "artifact_cid": artifact_cid,
+    **_cooldown_fields(owner, integration_id),
   }
 
 

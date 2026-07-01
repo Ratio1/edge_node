@@ -189,6 +189,24 @@ class TestStixExport(unittest.TestCase):
     self.assertIn("target:", serialized)
     self.assertIn("x_redmesh_banner_hash", serialized)
 
+  def test_model_test_job_rejected_before_scan_archive_mapping(self):
+    owner = _owner(job_specs={
+      "job_id": "job-1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_cid": "model-archive",
+    })
+
+    result = build_stix_bundle(owner, "job-1")
+    exported = export_stix_bundle(owner, "job-1")
+    status = get_stix_export_status(owner, "job-1")
+
+    self.assertEqual(result["error"], "unsupported_job_type")
+    self.assertEqual(exported["error"], "unsupported_job_type")
+    self.assertEqual(status["error"], "unsupported_job_type")
+    self.assertFalse(status["exported"])
+    owner.r1fs.add_json.assert_not_called()
+
   @patch("extensions.business.cybersec.red_mesh.services.stix_export.emit_export_status_event")
   def test_export_persists_bundle_and_updates_isolated_status(self, emit_status):
     owner = _owner()

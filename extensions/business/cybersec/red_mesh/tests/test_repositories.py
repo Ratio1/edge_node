@@ -91,6 +91,98 @@ class TestJobStateRepository(unittest.TestCase):
     self.assertEqual(persisted["assignment_revision_seen"], 2)
     owner.chainstore_hset.assert_called_once()
 
+  def test_model_test_live_progress_rejects_stale_sequence(self):
+    owner = self._make_owner()
+    existing = {
+      "job_id": "job-1",
+      "worker_addr": "node-a",
+      "pass_nr": 1,
+      "assignment_revision_seen": 1,
+      "event_id": "job-1:node-a:1:000002",
+      "progress_sequence": 2,
+      "progress": 50.0,
+      "phase": "model_test_running",
+      "scan_type": "model_test",
+      "job_type": "model_test",
+      "schema_version": "model_test_progress_v1",
+      "ports_scanned": 0,
+      "ports_total": 0,
+      "open_ports_found": [],
+      "completed_tests": [],
+      "updated_at": 2.0,
+    }
+    owner.chainstore_hget.return_value = existing
+    repo = JobStateRepository(owner)
+    stale = WorkerProgress(
+      job_id="job-1",
+      worker_addr="node-a",
+      pass_nr=1,
+      assignment_revision_seen=1,
+      event_id="job-1:node-a:1:000001",
+      progress_sequence=1,
+      progress=10.0,
+      phase="model_test_queued",
+      scan_type="model_test",
+      job_type="model_test",
+      schema_version="model_test_progress_v1",
+      ports_scanned=0,
+      ports_total=0,
+      open_ports_found=[],
+      completed_tests=[],
+      updated_at=1.0,
+    )
+
+    persisted = repo.put_live_progress_model(stale)
+
+    self.assertEqual(persisted, existing)
+    owner.chainstore_hset.assert_not_called()
+
+  def test_model_test_live_progress_accepts_new_assignment_revision(self):
+    owner = self._make_owner()
+    owner.chainstore_hget.return_value = {
+      "job_id": "job-1",
+      "worker_addr": "node-a",
+      "pass_nr": 1,
+      "assignment_revision_seen": 1,
+      "event_id": "job-1:node-a:1:000005",
+      "progress_sequence": 5,
+      "progress": 50.0,
+      "phase": "model_test_running",
+      "scan_type": "model_test",
+      "job_type": "model_test",
+      "schema_version": "model_test_progress_v1",
+      "ports_scanned": 0,
+      "ports_total": 0,
+      "open_ports_found": [],
+      "completed_tests": [],
+      "updated_at": 5.0,
+    }
+    repo = JobStateRepository(owner)
+    reassigned = WorkerProgress(
+      job_id="job-1",
+      worker_addr="node-a",
+      pass_nr=1,
+      assignment_revision_seen=2,
+      event_id="job-1:node-a:2:000001",
+      progress_sequence=1,
+      progress=0.0,
+      phase="model_test_node_selected",
+      scan_type="model_test",
+      job_type="model_test",
+      schema_version="model_test_progress_v1",
+      ports_scanned=0,
+      ports_total=0,
+      open_ports_found=[],
+      completed_tests=[],
+      updated_at=6.0,
+    )
+
+    persisted = repo.put_live_progress_model(reassigned)
+
+    self.assertEqual(persisted["assignment_revision_seen"], 2)
+    self.assertEqual(persisted["progress_sequence"], 1)
+    owner.chainstore_hset.assert_called_once()
+
   def test_cstore_worker_roundtrip_preserves_assignment_metadata(self):
     worker = CStoreWorker(
       start_port=1,

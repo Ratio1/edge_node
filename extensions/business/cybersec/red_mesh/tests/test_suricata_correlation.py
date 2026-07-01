@@ -166,6 +166,23 @@ class TestSuricataCorrelation(unittest.TestCase):
     self.assertTrue(result["found"])
     self.assertEqual(result["correlation"]["artifact_cid"], "QmCorrelation")
 
+  def test_model_test_job_rejected_before_detection_parsing(self):
+    job_specs = _job_specs()
+    job_specs.update({
+      "job_type": "model_test",
+      "scan_type": "model_test",
+    })
+    owner = _owner(job_specs)
+
+    result = correlate_suricata_eve(owner, "job-1", eve_jsonl="{not-json}")
+    status = get_detection_correlation(owner, "job-1")
+
+    self.assertEqual(result["error"], "unsupported_job_type")
+    self.assertEqual(result["operation"], "detection_correlation")
+    self.assertEqual(status["error"], "unsupported_job_type")
+    self.assertTrue(status["found"])
+    owner.r1fs.add_json.assert_not_called()
+
 
 if __name__ == "__main__":
   unittest.main()

@@ -13,6 +13,7 @@ from .event_builder import (
 )
 from .integration_status import record_integration_status
 from .log_export import deliver_redmesh_event
+from .soc_export_policy import current_integration_cooldown
 
 
 SOC_EVENT_STATUS_SCHEMA_VERSION = "1.0.0"
@@ -84,6 +85,37 @@ def _is_disabled_skip(result):
   return isinstance(reason, str) and reason.endswith("_disabled")
 
 
+def _failure_signature(adapter, error_class):
+  if not adapter or not error_class:
+    return None
+  return f"{adapter}:{error_class}"
+
+
+def _update_duplicate_history(status, event, result, signature):
+  history = list(status.get("history") or [])
+  if not signature:
+    return history, False
+  for idx in range(len(history) - 1, -1, -1):
+    entry = dict(history[idx] or {})
+    if entry.get("failure_signature") != signature:
+      continue
+    entry.setdefault("first_at", entry.get("at"))
+    entry.setdefault("first_event_type", entry.get("event_type"))
+    entry["latest_at"] = status["last_updated_at"]
+    entry["last_event_type"] = event.get("event_type")
+    entry["last_event_id"] = event.get("event_id")
+    entry["status"] = result.get("status")
+    entry["error_class"] = result.get("error")
+    entry["suppressed_count"] = int(entry.get("suppressed_count") or 0) + 1
+    if result.get("cooldown_until"):
+      entry["cooldown_until"] = result.get("cooldown_until")
+    if result.get("retry_after_seconds") is not None:
+      entry["retry_after_seconds"] = result.get("retry_after_seconds")
+    history[idx] = entry
+    return history, True
+  return history, False
+
+
 def _safe_timeline(owner, job_specs, event_type, label, meta):
   emit = getattr(owner, "_emit_timeline_event", None)
   if not callable(emit) or not isinstance(job_specs, dict):
@@ -106,12 +138,25 @@ def _record_job_soc_status(owner, job_specs, event, result):
   status["last_event_id"] = event.get("event_id")
   status["last_event_type"] = event.get("event_type")
   status["last_error_class"] = result.get("error")
+  if result.get("cooldown_until"):
+    status["cooldown_until"] = result.get("cooldown_until")
+  elif result.get("status") == "sent":
+    status.pop("cooldown_until", None)
+  if result.get("retry_after_seconds") is not None:
+    status["retry_after_seconds"] = result.get("retry_after_seconds")
+  elif result.get("status") == "sent":
+    status.pop("retry_after_seconds", None)
   if result.get("artifact_cid"):
     status["last_artifact_cid"] = result.get("artifact_cid")
   if result.get("status") == "sent":
     status["last_success_at"] = status["last_updated_at"]
+    status["integration_status"] = "ok"
+    status["consecutive_failure_count"] = 0
+    status.pop("last_failure_signature", None)
   elif result.get("status") in {"error", "disabled"}:
     status["last_failure_at"] = status["last_updated_at"]
+    status.setdefault("first_failure_at", status["last_updated_at"])
+    status["integration_status"] = "cooling_down" if result.get("cooldown_until") else "degraded"
 
   event_type = str(event.get("event_type") or "")
   if event_type == "redmesh.job.started":
@@ -124,6 +169,28 @@ def _record_job_soc_status(owner, job_specs, event, result):
     status["last_attestation_event_id"] = event.get("event_id")
 
   if _is_disabled_skip(result):
+    status["integration_status"] = "disabled"
+    job_specs["soc_event_status"] = status
+    return
+
+  failure_signature = None
+  if result.get("status") in {"error", "disabled"} and result.get("error"):
+    failure_signature = _failure_signature(status["last_adapter"], result.get("error"))
+  previous_signature = status.get("last_failure_signature")
+  if failure_signature:
+    status["failure_count"] = int(status.get("failure_count") or 0) + 1
+    status["consecutive_failure_count"] = (
+      int(status.get("consecutive_failure_count") or 0) + 1
+      if previous_signature == failure_signature
+      else 1
+    )
+    status["last_failure_signature"] = failure_signature
+    if previous_signature != failure_signature or not status.get("current_failure_first_at"):
+      status["current_failure_first_at"] = status["last_updated_at"]
+  history, updated_duplicate = _update_duplicate_history(status, event, result, failure_signature)
+  if updated_duplicate:
+    status["history"] = history[-SOC_EVENT_HISTORY_LIMIT:]
+    status["suppressed_duplicate_count"] = int(status.get("suppressed_duplicate_count") or 0) + 1
     job_specs["soc_event_status"] = status
     return
 
@@ -136,6 +203,10 @@ def _record_job_soc_status(owner, job_specs, event, result):
     "event_type": event.get("event_type"),
     "error_class": result.get("error"),
     "artifact_cid": result.get("artifact_cid"),
+    "failure_signature": failure_signature,
+    "suppressed_count": 0,
+    "cooldown_until": result.get("cooldown_until"),
+    "retry_after_seconds": result.get("retry_after_seconds"),
   })
   status["history"] = history[-SOC_EVENT_HISTORY_LIMIT:]
   job_specs["soc_event_status"] = status
@@ -196,6 +267,19 @@ def emit_redmesh_event(owner, job_specs, event):
     return result
 
   try:
+    cooldown = current_integration_cooldown(owner, "wazuh")
+    if cooldown:
+      result = {
+        "status": "error",
+        "integration_id": "wazuh",
+        "event_id": (event or {}).get("event_id"),
+        "error": cooldown["error_class"],
+        "cooldown_until": cooldown["cooldown_until"],
+        "retry_after_seconds": cooldown["retry_after_seconds"],
+        "suppressed": True,
+      }
+      _record_job_soc_status(owner, job_specs, event, result)
+      return result
     result = deliver_redmesh_event(owner, event, integration_id="wazuh")
   except Exception as exc:
     result = {

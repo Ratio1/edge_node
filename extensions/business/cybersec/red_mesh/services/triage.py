@@ -1,5 +1,7 @@
 from copy import deepcopy
 
+from ..model_testing.artifacts import ModelTestArchive
+from ..model_testing.constants import is_model_test_job
 from ..models import FindingTriageAuditEntry, FindingTriageState, VALID_TRIAGE_STATUSES
 from ..repositories import ArtifactRepository, JobStateRepository
 from .event_hooks import emit_finding_event
@@ -134,6 +136,29 @@ def get_job_archive_with_triage(owner, job_id: str):
   job_cid = job_specs.get("job_cid")
   if not job_cid:
     return {"error": "not_available", "message": f"Job {job_id} is still running (no archive yet)."}
+
+  if is_model_test_job(job_specs):
+    try:
+      payload = _artifact_repo(owner).get_archive(job_specs)
+      if not isinstance(payload, dict):
+        return {"error": "fetch_failed", "message": f"Failed to fetch archive from R1FS (CID: {job_cid})."}
+      archive = ModelTestArchive.from_dict(payload).to_dict()
+    except (KeyError, TypeError, ValueError) as exc:
+      return {
+        "error": "unsupported_archive_version",
+        "message": str(exc),
+        "job_id": job_id,
+        "job_cid": job_cid,
+      }
+
+    if archive.get("job_id") != job_id:
+      owner.P(
+        f"[INTEGRITY] Archive CID {job_cid} has job_id={archive.get('job_id')}, expected {job_id}",
+        color='r'
+      )
+      return {"error": "integrity_mismatch", "message": "Archive job_id does not match requested job_id."}
+
+    return {"job_id": job_id, "archive": archive, "triage": {}}
 
   try:
     archive = _artifact_repo(owner).get_archive_model(job_specs)

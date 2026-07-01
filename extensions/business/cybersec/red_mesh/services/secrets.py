@@ -109,6 +109,21 @@ class R1fsSecretStore:
     }
     return _artifact_repo(self.owner).put_json(secret_doc, show_logs=False, secret=secret_key)
 
+  def save_model_test_provider_credentials(self, job_id: str, payload: dict) -> str:
+    secret_key, key_metadata = self._resolve_secret_store_key()
+    self.last_key_metadata = dict(key_metadata or {})
+    secret_doc = {
+      "kind": "redmesh_model_test_provider_credentials",
+      "job_id": job_id,
+      "storage_mode": "encrypted_r1fs_json_v1",
+      "key_id": key_metadata.get("key_id", ""),
+      "key_version": key_metadata.get("key_version", ""),
+      "key_source": key_metadata.get("key_source", ""),
+      "unsafe_key_fallback": bool(key_metadata.get("unsafe_fallback", False)),
+      "payload": payload,
+    }
+    return _artifact_repo(self.owner).put_json(secret_doc, show_logs=False, secret=secret_key)
+
   def load_graybox_credentials(self, secret_ref: str, *, expected_job_id: str = "") -> dict | None:
     if not secret_ref:
       return None
@@ -134,6 +149,34 @@ class R1fsSecretStore:
     payload = secret_doc.get("payload")
     if not isinstance(payload, dict):
       self.owner.P(f"Invalid graybox secret payload for ref {secret_ref}", color='r')
+      return None
+    return payload
+
+  def load_model_test_provider_credentials(self, secret_ref: str, *, expected_job_id: str = "") -> dict | None:
+    if not secret_ref:
+      return None
+    repo = _artifact_repo(self.owner)
+    secret_key, key_metadata = self._resolve_secret_store_key()
+    self.last_key_metadata = dict(key_metadata or {})
+    secret_doc = repo.get_json(secret_ref, secret=secret_key)
+    if not isinstance(secret_doc, dict):
+      self.owner.P(f"Failed to fetch model-test provider secret payload from R1FS (CID: {secret_ref})", color='r')
+      return None
+    if secret_doc.get("kind") != "redmesh_model_test_provider_credentials":
+      self.owner.P(f"Invalid model-test provider secret kind for ref {secret_ref}", color='r')
+      return None
+    if secret_doc.get("storage_mode") != "encrypted_r1fs_json_v1":
+      self.owner.P(f"Invalid model-test provider secret storage mode for ref {secret_ref}", color='r')
+      return None
+    if expected_job_id and secret_doc.get("job_id") != expected_job_id:
+      self.owner.P(
+        f"Model-test provider secret ref {secret_ref} belongs to job_id={secret_doc.get('job_id')}, expected {expected_job_id}",
+        color='r',
+      )
+      return None
+    payload = secret_doc.get("payload")
+    if not isinstance(payload, dict):
+      self.owner.P(f"Invalid model-test provider secret payload for ref {secret_ref}", color='r')
       return None
     return payload
 
@@ -280,6 +323,15 @@ def persist_job_config_with_secrets(
       persisted_config["secret_store_key_source"] = key_metadata.get("key_source", "")
       persisted_config["secret_store_unsafe_fallback"] = bool(key_metadata.get("unsafe_fallback", False))
       persisted_config["has_regular_credentials"] = bool(payload["regular_username"] or payload["regular_password"])
+      persisted_config["has_admin_credentials"] = bool(
+        payload["official_username"]
+        or payload["official_password"]
+        or payload["bearer_token"]
+        or payload["api_key"]
+      )
+      persisted_config["admin_context_status"] = (
+        "provided" if persisted_config["has_admin_credentials"] else "absent"
+      )
       persisted_config["has_weak_candidates"] = bool(payload["weak_candidates"])
       # OWASP API Top 10 (Subphase 1.5 commit #8) — non-secret capability flags.
       persisted_config["has_bearer_token"] = bool(payload["bearer_token"])

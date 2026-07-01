@@ -102,6 +102,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
     plugin = MagicMock()
     plugin.ee_addr = "node-1"
     plugin.ee_id = "node-alias-1"
+    plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
     plugin.cfg_instance_id = "test-instance"
     plugin.cfg_redmesh_secret_store_key = "unit-test-redmesh-secret-key"
     plugin.cfg_port_order = "SEQUENTIAL"
@@ -215,6 +216,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
       target_url="https://example.com/app",
       official_username="admin",
       official_password="secret",
+      regular_username="user",
+      regular_password="pass",
       authorized=True,
     )
     defaults.update(kwargs)
@@ -406,6 +409,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       selected_peers=["node-1", "node-2"],
       allow_stateful_probes=True,
       graybox_assignment_strategy="MIRROR",
+      unsafe_launch_confirmations=["stateful-probes-on", "mirror-stateful-on"],
     )
 
     self.assertEqual(result["error"], "validation_error")
@@ -422,6 +426,249 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(config_dict["distribution_strategy"], "MIRROR")
     self.assertEqual(config_dict["nr_local_workers"], 1)
     self.assertEqual(config_dict["target_url"], "https://example.com/app")
+
+  def test_launch_defaults_to_production_continuous_timing_and_one_worker(self):
+    plugin = self._build_mock_plugin(job_id="test-job-prod-defaults")
+
+    self._launch_network(plugin)
+
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["run_mode"], "CONTINUOUS_MONITORING")
+    self.assertEqual(config_dict["scan_min_delay"], 25.0)
+    self.assertEqual(config_dict["scan_max_delay"], 70.0)
+    self.assertEqual(config_dict["nr_local_workers"], 1)
+
+  def test_launch_webapp_defaults_to_webapp_dune_profile(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-dune-defaults")
+
+    result = self._launch_webapp(plugin)
+
+    self.assertNotIn("error", result)
+    config_dict = self._latest_job_config(plugin)
+    self.assertEqual(config_dict["scan_type"], "webapp")
+    self.assertEqual(config_dict["scan_min_delay"], 3.0)
+    self.assertEqual(config_dict["scan_max_delay"], 10.0)
+
+  def test_launch_accepts_confirmed_singlepass_warning_id(self):
+    plugin = self._build_mock_plugin(job_id="test-job-singlepass-confirmed")
+
+    result = self._launch_network(
+      plugin,
+      run_mode="SINGLEPASS",
+      unsafe_launch_confirmations=["continuous-monitoring-off"],
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["run_mode"], "SINGLEPASS")
+
+  def test_launch_accepts_15_second_dune_delay_without_confirmation(self):
+    plugin = self._build_mock_plugin(job_id="test-job-dune-15")
+
+    result = self._launch_network(
+      plugin,
+      scan_min_delay=15,
+      scan_max_delay=15,
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["scan_min_delay"], 15.0)
+    self.assertEqual(config_dict["scan_max_delay"], 15.0)
+
+  def test_launch_webapp_accepts_3_second_dune_delay_without_confirmation(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-dune-3")
+
+    result = self._launch_webapp(
+      plugin,
+      scan_min_delay=3,
+      scan_max_delay=10,
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = self._latest_job_config(plugin)
+    self.assertEqual(config_dict["scan_min_delay"], 3.0)
+    self.assertEqual(config_dict["scan_max_delay"], 10.0)
+
+  def test_launch_rejects_unconfirmed_unsafe_network_settings_before_persistence(self):
+    plugin = self._build_mock_plugin(job_id="test-job-unsafe-network")
+
+    result = self._launch_network(
+      plugin,
+      scan_min_delay=14,
+      scan_max_delay=15,
+      redact_credentials=False,
+      ics_safe_mode=False,
+      nr_local_workers=2,
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("dune-delay-below-production", result["message"])
+    self.assertIn("redact-credentials-off", result["message"])
+    self.assertIn("ics-safe-mode-off", result["message"])
+    self.assertIn("threads-per-node-raised", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_rejects_dune_delay_below_webapp_threshold(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-dune-2")
+
+    result = self._launch_webapp(
+      plugin,
+      scan_min_delay=2,
+      scan_max_delay=10,
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("dune-delay-below-production", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_accepts_confirmed_unsafe_network_settings(self):
+    plugin = self._build_mock_plugin(job_id="test-job-confirmed-network")
+
+    result = self._launch_network(
+      plugin,
+      scan_min_delay=5,
+      scan_max_delay=10,
+      nr_local_workers=2,
+      unsafe_launch_confirmations=[
+        "dune-delay-below-production",
+        "threads-per-node-raised",
+      ],
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertEqual(config_dict["scan_min_delay"], 5.0)
+    self.assertEqual(config_dict["scan_max_delay"], 10.0)
+    self.assertEqual(config_dict["nr_local_workers"], 2)
+
+  def test_launch_webapp_requires_regular_form_credentials_but_not_admin(self):
+    plugin = self._build_mock_plugin(job_id="test-job-form-regular-required")
+    result = self._launch_webapp(plugin, regular_username="", regular_password="")
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("regular credentials", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+    plugin = self._build_mock_plugin(job_id="test-job-form-admin-optional")
+    plugin.r1fs.add_json.side_effect = ["QmSecretCID", "QmConfigCID"]
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      app_routes=[],
+    )
+
+    self.assertNotIn("error", result)
+    config_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(config_dict["app_routes"], [])
+    self.assertFalse(config_dict["has_admin_credentials"])
+    self.assertEqual(config_dict["admin_context_status"], "absent")
+    self.assertTrue(config_dict["has_regular_credentials"])
+
+  def test_launch_webapp_requires_regular_bearer_and_api_key_credentials(self):
+    plugin = self._build_mock_plugin(job_id="test-job-bearer-regular-required")
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      bearer_token="ADMIN-BEARER",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "authenticated_probe_path": "/api/me/",
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("regular_bearer_token", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+    plugin = self._build_mock_plugin(job_id="test-job-api-key-regular-required")
+    result = self._launch_webapp(
+      plugin,
+      official_username="",
+      official_password="",
+      api_key="ADMIN-KEY",
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "api_key",
+            "api_key_header_name": "X-App-Key",
+            "authenticated_probe_path": "/api/me/",
+          },
+        },
+      },
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("regular_api_key", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_webapp_rejects_unconfirmed_security_downgrades(self):
+    plugin = self._build_mock_plugin(job_id="test-job-webapp-unsafe")
+
+    result = self._launch_webapp(
+      plugin,
+      verify_tls=False,
+      allow_stateful_probes=True,
+      target_config={
+        "api_security": {
+          "auth": {
+            "auth_type": "bearer",
+            "allow_unverified_auth": True,
+          },
+        },
+      },
+      regular_bearer_token="REGULAR-BEARER",
+    )
+
+    self.assertEqual(result["error"], "validation_error")
+    self.assertIn("tls-verification-off", result["message"])
+    self.assertIn("stateful-probes-on", result["message"])
+    self.assertIn("unverified-auth-on", result["message"])
+    self.assertFalse(plugin.r1fs.add_json.called)
+
+  def test_launch_attestation_disabled_does_not_submit_start_attestation(self):
+    plugin = self._build_mock_plugin(job_id="test-job-attestation-disabled")
+    plugin._submit_redmesh_job_start_attestation = MagicMock()
+
+    result = self._launch_network(plugin, blockchain_attestation_enabled=False)
+
+    self.assertNotIn("error", result)
+    plugin._submit_redmesh_job_start_attestation.assert_not_called()
+    job_specs = self._extract_job_specs(plugin, "test-job-attestation-disabled")
+    self.assertFalse(job_specs["blockchain_attestation_enabled"])
+
+  def test_launch_requires_start_attestation_when_enabled(self):
+    plugin = self._build_mock_plugin(job_id="test-job-attestation-required")
+    plugin._submit_redmesh_job_start_attestation = MagicMock(return_value=None)
+
+    result = self._launch_network(plugin, blockchain_attestation_enabled=True)
+
+    self.assertEqual(result["error"], "attestation_failed")
+    plugin._submit_redmesh_job_start_attestation.assert_called_once()
+    self.assertFalse(plugin.chainstore_hset.called)
+
+  def test_launch_persists_start_attestation_when_enabled(self):
+    plugin = self._build_mock_plugin(job_id="test-job-attestation-start")
+    plugin._submit_redmesh_job_start_attestation = MagicMock(
+      return_value={"tx_hash": "0xstart", "job_id": "test-job-attestation-start"}
+    )
+
+    result = self._launch_network(plugin, blockchain_attestation_enabled=True)
+
+    self.assertNotIn("error", result)
+    job_specs = self._extract_job_specs(plugin, "test-job-attestation-start")
+    config_dict = plugin.r1fs.add_json.call_args_list[0][0][0]
+    self.assertTrue(config_dict["blockchain_attestation_enabled"])
+    self.assertTrue(config_dict["start_attestation_required"])
+    self.assertTrue(config_dict["end_attestation_required"])
+    self.assertEqual(job_specs["redmesh_job_start_attestation"]["tx_hash"], "0xstart")
+    self.assertTrue(job_specs["blockchain_attestation_enabled"])
 
   def test_launch_webapp_scan_persists_secret_ref_not_inline_passwords(self):
     """Webapp launch stores a separate secret blob and persists only secret_ref in JobConfig."""
@@ -473,6 +720,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       official_username="",
       official_password="",
       bearer_token="BEARER-TOKEN-MUST-NOT-PERSIST",
+      regular_bearer_token="REGULAR-BEARER-TOKEN-MUST-NOT-PERSIST",
       target_config={
         "api_security": {
           "auth": {
@@ -509,6 +757,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       official_username="",
       official_password="",
       bearer_token="APP-BEARER-TOKEN-MUST-NOT-PERSIST",
+      regular_bearer_token="REGULAR-BEARER-TOKEN-MUST-NOT-PERSIST",
       gateway_api_key="GATEWAY-KEY-MUST-NOT-PERSIST",
       target_config={
         "api_security": {
@@ -574,6 +823,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       official_username="",
       official_password="",
       bearer_token="APP-BEARER",
+      regular_bearer_token="REGULAR-BEARER",
       gateway_bearer_token="GATEWAY-BEARER",
       target_config={
         "api_security": {
@@ -601,7 +851,9 @@ class TestPhase1ConfigCID(unittest.TestCase):
       official_username="",
       official_password="",
       api_key="APP-QUERY-KEY",
+      regular_api_key="REGULAR-QUERY-KEY",
       gateway_api_key="GATEWAY-QUERY-KEY",
+      unsafe_launch_confirmations=["unverified-auth-on"],
       target_config={
         "api_security": {
           "auth": {
@@ -633,6 +885,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       official_username="",
       official_password="",
       bearer_token="APP-BEARER",
+      regular_bearer_token="REGULAR-BEARER",
       gateway_api_key="GATEWAY-QUERY-KEY",
       target_config={
         "api_security": {
@@ -687,6 +940,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       official_username="",
       official_password="",
       bearer_token="BEARER-TOKEN",
+      regular_bearer_token="REGULAR-BEARER-TOKEN",
       target_config={
         "api_security": {
           "auth": {"auth_type": "bearer"},
@@ -708,6 +962,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
       official_username="",
       official_password="",
       bearer_token="BEARER-TOKEN",
+      regular_bearer_token="REGULAR-BEARER-TOKEN",
+      unsafe_launch_confirmations=["unverified-auth-on"],
       target_config={
         "api_security": {
           "auth": {
@@ -732,6 +988,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       official_username="",
       official_password="",
       bearer_token="BEARER-TOKEN",
+      regular_bearer_token="REGULAR-BEARER-TOKEN",
       target_config={
         "api_security": {
           "auth": {
@@ -755,6 +1012,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       official_username="",
       official_password="",
       bearer_token="BEARER-TOKEN",
+      regular_bearer_token="REGULAR-BEARER-TOKEN",
       target_config={
         "api_security": {
           "auth": {
@@ -944,6 +1202,65 @@ class TestPhase1ConfigCID(unittest.TestCase):
     self.assertEqual(result["error"], "validation_error")
     self.assertIn("authorization", result["message"].lower())
 
+  def test_required_soc_rejects_network_launch_before_persistence(self):
+    plugin = self._build_mock_plugin(job_id="soc-required-network")
+    plugin.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    plugin.cfg_wazuh_export = {
+      "ENABLED": True,
+      "IS_REQUIRED": True,
+      "MODE": "http",
+      "HTTP_URL": "https://wazuh.example/events",
+      "AUTH_MODE": "static",
+      "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+    }
+
+    result = self._launch_network(plugin)
+
+    self.assertEqual(result["error"], "soc_export_required_unavailable")
+    self.assertEqual(result["integration_id"], "wazuh")
+    self.assertEqual(result["error_class"], "missing_token")
+    plugin.r1fs.add_json.assert_not_called()
+    plugin.chainstore_hset.assert_not_called()
+
+  def test_non_required_soc_does_not_block_network_launch(self):
+    plugin = self._build_mock_plugin(job_id="soc-optional-network")
+    plugin.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    plugin.cfg_wazuh_export = {
+      "ENABLED": True,
+      "IS_REQUIRED": False,
+      "MODE": "http",
+      "HTTP_URL": "https://wazuh.example/events",
+      "AUTH_MODE": "static",
+      "TOKEN_ENV": "REDMESH_WAZUH_TOKEN",
+      "RETRY_ATTEMPTS": 0,
+    }
+
+    result = self._launch_network(plugin)
+
+    self.assertNotIn("error", result)
+    self.assertTrue(plugin.r1fs.add_json.called)
+    self.assertTrue(plugin.chainstore_hset.called)
+
+  def test_required_soc_rejects_webapp_launch_before_persistence(self):
+    plugin = self._build_mock_plugin(job_id="soc-required-webapp")
+    plugin.cfg_event_export = {"ENABLED": True, "SIGN_PAYLOADS": False}
+    plugin.cfg_wazuh_export = {
+      "ENABLED": True,
+      "IS_REQUIRED": True,
+      "MODE": "wazuh_api",
+      "HTTP_URL": "https://wazuh.example/events",
+      "AUTH_MODE": "wazuh_jwt",
+      "USERNAME": "",
+      "PASSWORD_ENV": "REDMESH_WAZUH_PASSWORD",
+    }
+
+    result = self._launch_webapp(plugin)
+
+    self.assertEqual(result["error"], "soc_export_required_unavailable")
+    self.assertEqual(result["error_class"], "missing_credentials")
+    plugin.r1fs.add_json.assert_not_called()
+    plugin.chainstore_hset.assert_not_called()
+
   def test_launch_network_scan_rejects_target_confirmation_mismatch(self):
     """Target confirmation must echo the resolved target host."""
     plugin = self._build_mock_plugin(job_id="test-job-confirm")
@@ -1107,6 +1424,7 @@ class TestPhase1ConfigCID(unittest.TestCase):
       max_weak_attempts=9,
       allow_stateful_probes=True,
       verify_tls=False,
+      unsafe_launch_confirmations=["stateful-probes-on", "tls-verification-off"],
       target_config={"discovery": {"scope_prefix": "/api/", "max_pages": 50}},
     )
 
@@ -1219,6 +1537,8 @@ class TestPhase1ConfigCID(unittest.TestCase):
       bearer_token="TOKEN-123",
       api_key="KEY-123",
       bearer_refresh_token="REFRESH-123",
+      regular_bearer_token="REGULAR-TOKEN-123",
+      regular_api_key="REGULAR-KEY-123",
       gateway_api_key="GATEWAY-KEY-123",
       gateway_bearer_token="GATEWAY-TOKEN-123",
       gateway_bearer_refresh_token="GATEWAY-REFRESH-123",
@@ -1401,6 +1721,7 @@ class TestPhase2PassFinalization(unittest.TestCase):
     plugin = MagicMock()
     plugin.ee_addr = "launcher-node"
     plugin.ee_id = "launcher-alias"
+    plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
     plugin.cfg_instance_id = "test-instance"
     plugin.cfg_llm_agent = {
       "ENABLED": llm_enabled,
@@ -1514,6 +1835,29 @@ class TestPhase2PassFinalization(unittest.TestCase):
         }
       }
     return report
+
+  def _configure_successful_pass_finalization(self, plugin, job_specs):
+    report_a = self._sample_node_report(1, 512, [80])
+    report_b = self._sample_node_report(513, 1024, [443])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a, "worker-B": report_b})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80, 443],
+      "service_info": {},
+      "web_tests_info": {},
+      "completed_tests": ["port_scan"],
+      "ports_scanned": 1024,
+      "nr_open_ports": 2,
+      "port_protocols": {"80": "http", "443": "https"},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com", "monitor_interval": 60})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 25, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin._build_job_archive = MagicMock()
+    plugin._clear_live_progress = MagicMock()
+    plugin._log_audit_event = MagicMock()
 
   def test_single_aggregation(self):
     """_collect_node_reports called exactly once per pass finalization."""
@@ -2055,6 +2399,111 @@ class TestPhase2PassFinalization(unittest.TestCase):
       if isinstance(value, dict):
         self.assertNotEqual(value.get("job_status"), "FINALIZED")
 
+  def test_launcher_recovers_stale_analyzing_job_with_all_reports(self):
+    """Launcher-owned ANALYZING job with all worker reports re-enters finalization."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    job_specs["job_status"] = "ANALYZING"
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    plugin._collect_node_reports.assert_called_once()
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    plugin._log_audit_event.assert_called_once_with(
+      "stale_intermediate_finalization_recovery",
+      {
+        "job_id": job_specs["job_id"],
+        "launcher": "launcher-node",
+        "previous_status": "ANALYZING",
+        "pass_nr": 1,
+        "worker_count": 2,
+      },
+    )
+
+  def test_non_launcher_does_not_recover_stale_intermediate_job(self):
+    """Worker/non-launcher nodes must observe stale jobs without mutating them."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    plugin.ee_addr = "worker-A"
+    job_specs["job_status"] = "ANALYZING"
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    plugin._collect_node_reports.assert_not_called()
+    plugin._build_job_archive.assert_not_called()
+    plugin._log_audit_event.assert_not_called()
+
+  def test_launcher_does_not_recover_stale_intermediate_with_unfinished_worker(self):
+    """Recovery waits until every expected worker is finished."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    job_specs["job_status"] = "ANALYZING"
+    job_specs["workers"]["worker-B"]["finished"] = False
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    plugin._collect_node_reports.assert_not_called()
+    plugin._log_audit_event.assert_not_called()
+
+  def test_launcher_does_not_recover_stale_intermediate_with_missing_report_cid(self):
+    """Recovery waits until every expected worker has a persisted report CID."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    job_specs["job_status"] = "ANALYZING"
+    job_specs["workers"]["worker-B"]["report_cid"] = None
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "ANALYZING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    plugin._collect_node_reports.assert_not_called()
+    plugin._log_audit_event.assert_not_called()
+
+  def test_pass_report_write_failure_retries_on_later_launcher_loop(self):
+    """A failed pass-report write leaves a retryable intermediate job."""
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin(r1fs_returns={
+      1: "QmAggCID",
+      2: None,
+      3: "QmAggRetryCID",
+      4: "QmPassRetryCID",
+    })
+    self._configure_successful_pass_finalization(plugin, job_specs)
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "COLLECTING")
+    self.assertEqual(job_specs["pass_reports"], [])
+    plugin._build_job_archive.assert_not_called()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    self.assertEqual(len(job_specs["pass_reports"]), 1)
+    self.assertEqual(job_specs["pass_reports"][0]["report_cid"], "QmPassRetryCID")
+    self.assertEqual(plugin._collect_node_reports.call_count, 2)
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    plugin._log_audit_event.assert_called_once_with(
+      "stale_intermediate_finalization_recovery",
+      {
+        "job_id": job_specs["job_id"],
+        "launcher": "launcher-node",
+        "previous_status": "COLLECTING",
+        "pass_nr": 1,
+        "worker_count": 2,
+      },
+    )
+
   def test_cstore_risk_score_updated(self):
     """After pass, risk_score on CStore matches pass result."""
     PentesterApi01Plugin = self._get_plugin_class()
@@ -2085,6 +2534,96 @@ class TestPhase2PassFinalization(unittest.TestCase):
     self.assertEqual(ref["risk_score"], 42)
     self.assertIn("report_cid", ref)
     self.assertEqual(ref["pass_nr"], 1)
+
+  def test_finalization_attestation_disabled_does_not_submit_end_attestation(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={"target": "example.com"})
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 0, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value={"tx_hash": "0xunexpected"})
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    plugin._submit_redmesh_test_attestation.assert_not_called()
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+
+  def test_finalization_required_end_attestation_success_allows_finalize(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    job_specs["blockchain_attestation_enabled"] = True
+    job_specs["end_attestation_required"] = True
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={
+      "target": "example.com",
+      "blockchain_attestation_enabled": True,
+    })
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 12, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value={"tx_hash": "0xend"})
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin._build_job_archive = MagicMock()
+    plugin._clear_live_progress = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FINALIZED")
+    plugin._submit_redmesh_test_attestation.assert_called_once()
+    pass_report_dict = plugin.r1fs.add_json.call_args_list[1][0][0]
+    self.assertEqual(pass_report_dict["redmesh_test_attestation"]["tx_hash"], "0xend")
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+
+  def test_finalization_required_end_attestation_failure_marks_failed(self):
+    PentesterApi01Plugin = self._get_plugin_class()
+    plugin, job_specs = self._build_finalize_plugin()
+    job_specs["blockchain_attestation_enabled"] = True
+    job_specs["end_attestation_required"] = True
+
+    report_a = self._sample_node_report(1, 512, [80])
+    plugin._collect_node_reports = MagicMock(return_value={"worker-A": report_a})
+    plugin._get_aggregated_report = MagicMock(return_value={
+      "open_ports": [80], "service_info": {}, "web_tests_info": {},
+      "completed_tests": [], "ports_scanned": 512, "nr_open_ports": 1,
+      "port_protocols": {},
+    })
+    plugin._normalize_job_record = MagicMock(return_value=(job_specs["job_id"], job_specs))
+    plugin._get_job_config = MagicMock(return_value={
+      "target": "example.com",
+      "blockchain_attestation_enabled": True,
+    })
+    plugin._compute_risk_and_findings = MagicMock(return_value=({"score": 12, "breakdown": {}}, []))
+    plugin._submit_redmesh_test_attestation = MagicMock(return_value=None)
+    plugin._get_timeline_date = MagicMock(return_value=1000000.0)
+    plugin._emit_timeline_event = MagicMock()
+    plugin._build_job_archive = MagicMock()
+    plugin._clear_live_progress = MagicMock()
+
+    PentesterApi01Plugin._maybe_finalize_pass(plugin)
+
+    self.assertEqual(job_specs["job_status"], "FAILED")
+    self.assertEqual(job_specs["failure_class"], "attestation_failed")
+    self.assertIn("terminal blockchain attestation", job_specs["failure_message"])
+    plugin._build_job_archive.assert_called_once_with(job_specs["job_id"], job_specs)
+    event_types = [c.args[1] for c in plugin._emit_timeline_event.call_args_list]
+    self.assertIn("attestation_failed", event_types)
 
 
 
@@ -2894,6 +3433,73 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["archive"]["archive_version"], JOB_ARCHIVE_VERSION)
     self.assertEqual(result["archive"]["passes"][0]["findings"][0]["triage"]["status"], "accepted_risk")
 
+  def test_get_job_archive_model_test_preserves_sanitized_model_fields(self):
+    """Model-test archives bypass scan JobArchive coercion and strip raw payload fields."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("model-job")
+    stub.update({
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "target": "Unit Provider / unit-model",
+      "target_url": "",
+      "start_port": 0,
+      "end_port": 0,
+      "risk_score": 0,
+      "pass_count": 0,
+      "worker_count": 1,
+      "model_test_summary": {"overall_status": "failed"},
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+    })
+    plugin = self._build_plugin({"model-job": stub})
+    plugin.r1fs.get_json.return_value = {
+      "schema_version": "model_test_archive_v1",
+      "archive_version": 1,
+      "job_id": "model-job",
+      "job_type": "model_test",
+      "job_config": {"job_id": "model-job", "job_type": "model_test"},
+      "timeline": [],
+      "model_test_results": {
+        "overall_status": "failed",
+        "provider_url": "https://provider.example/v1",
+        "cases": [
+          {
+            "case_id": "case-1",
+            "category": "safety",
+            "status": "failed",
+            "verdict": "blocked",
+            "raw_prompt": "secret prompt text",
+            "raw_response": "secret model response",
+          },
+        ],
+      },
+      "model_test_summary": {
+        "overall_status": "failed",
+        "cases_total": 12,
+        "cases_completed": 4,
+        "error_message": "secret-token",
+      },
+      "model_test_node_selection": {"selected_execution_node": "node-a"},
+      "ui_aggregate": {"scan_type": "model_test", "finding_count": 0},
+      "duration": 20.0,
+      "date_created": 100.0,
+      "date_completed": 120.0,
+    }
+
+    result = Plugin.get_job_archive(plugin, job_id="model-job", summary_only=True, pass_limit=1)
+
+    self.assertEqual(result["job_id"], "model-job")
+    archive = result["archive"]
+    self.assertEqual(archive["job_type"], "model_test")
+    self.assertEqual(archive["model_test_node_selection"]["selected_execution_node"], "node-a")
+    self.assertEqual(archive["model_test_summary"]["cases_completed"], 4)
+    self.assertEqual(archive["model_test_results"]["cases"][0]["case_id"], "case-1")
+    self.assertNotIn("passes", archive)
+    archive_text = str(archive)
+    self.assertNotIn("secret prompt text", archive_text)
+    self.assertNotIn("secret model response", archive_text)
+    self.assertNotIn("secret-token", archive_text)
+    self.assertNotIn("provider.example", archive_text)
+
   def test_get_job_archive_running(self):
     """get_job_archive for running job returns not_available error."""
     Plugin = self._get_plugin_class()
@@ -3322,6 +3928,56 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(result["job"]["job_cid"], "QmArchiveCID")
     self.assertEqual(result["job"]["pass_count"], 1)
 
+  def test_get_job_data_finalized_model_test_stub_is_sanitized(self):
+    """Finalized model-test stubs are defensively redacted before readback."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("model-job")
+    stub.update({
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "model_test_summary": {
+        "overall_status": "failed",
+        "error_message": "raw provider summary secret-token",
+        "error_class": "not-allowlisted",
+      },
+      "model_test_results": {
+        "overall_status": "failed",
+        "provider_url": "https://provider.example/v1",
+        "cases": [{
+          "case_id": "case-1",
+          "raw_prompt": "secret prompt",
+          "raw_response": "secret response",
+          "error_class": "not-allowlisted",
+        }],
+      },
+      "error_message": "top-level raw secret-token",
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "error": "raw worker exception secret-token",
+          "model_test_summary": {"overall_status": "failed"},
+        },
+      },
+    })
+    plugin = self._build_plugin({"model-job": stub})
+
+    result = Plugin.get_job_data(plugin, job_id="model-job")
+
+    payload = result["job"]
+    self.assertEqual(payload["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(payload["model_test_results"]["cases"][0]["case_id"], "case-1")
+    self.assertEqual(payload["model_test_results"]["cases"][0]["error_class"], "unknown_error")
+    self.assertEqual(payload["error_class"], "unknown_error")
+    payload_text = str(payload)
+    self.assertNotIn("error_message", payload_text)
+    self.assertNotIn("raw provider summary", payload_text)
+    self.assertNotIn("top-level raw", payload_text)
+    self.assertNotIn("raw worker exception", payload_text)
+    self.assertNotIn("secret-token", payload_text)
+    self.assertNotIn("secret prompt", payload_text)
+    self.assertNotIn("secret response", payload_text)
+    self.assertNotIn("provider.example", payload_text)
+
   def test_list_jobs_finalized_as_is(self):
     """Finalized stubs returned unmodified with all CStoreJobFinalized fields."""
     Plugin = self._get_plugin_class()
@@ -3338,6 +3994,37 @@ class TestPhase5Endpoints(unittest.TestCase):
     self.assertEqual(job["duration"], 200.0)
     self.assertEqual(job["scan_type"], "webapp")
     self.assertEqual(job["target_url"], "https://example.com/app")
+
+  def test_list_jobs_finalized_model_test_stub_is_sanitized(self):
+    """Finalized model-test listings do not leak raw model-test payload fields."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("model-job")
+    stub.update({
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "model_test_summary": {
+        "overall_status": "failed",
+        "error_message": "listing summary secret-token",
+        "error_class": "not-allowlisted",
+      },
+      "model_test_results": {
+        "cases": [{"case_id": "case-1", "raw_response": "secret response"}],
+      },
+      "error": "listing raw exception secret-token",
+    })
+    plugin = self._build_plugin({"model-job": stub})
+
+    result = Plugin.list_network_jobs(plugin)
+
+    job = result["model-job"]
+    self.assertEqual(job["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(job["error_class"], "unknown_error")
+    payload_text = str(job)
+    self.assertNotIn("error_message", payload_text)
+    self.assertNotIn("listing summary", payload_text)
+    self.assertNotIn("listing raw exception", payload_text)
+    self.assertNotIn("secret-token", payload_text)
+    self.assertNotIn("secret response", payload_text)
 
   def test_list_jobs_running_stripped(self):
     """Running jobs have counts but no timeline, workers, or pass_reports."""
@@ -3437,6 +4124,47 @@ class TestPhase5Endpoints(unittest.TestCase):
 
     self.assertEqual(result["status"], "network_tracked")
     self.assertEqual(result["workers"]["worker-B"]["worker_state"], "unseen")
+
+  def test_get_job_status_model_test_network_state_is_sanitized(self):
+    """Status readback redacts raw finalized model-test CStore state."""
+    Plugin = self._get_plugin_class()
+    stub = self._build_finalized_stub("model-job")
+    stub.update({
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "model_test_summary": {
+        "overall_status": "failed",
+        "error_message": "status summary secret-token",
+        "error_class": "not-allowlisted",
+      },
+      "model_test_results": {
+        "cases": [{"case_id": "case-1", "raw_prompt": "secret prompt"}],
+      },
+      "error_message": "status raw exception secret-token",
+      "workers": {
+        "node-a": {
+          "worker_type": "model_test",
+          "error_message": "worker raw exception secret-token",
+        },
+      },
+    })
+    plugin = self._build_plugin({"model-job": stub})
+    plugin.scan_jobs = {}
+    plugin.completed_jobs_reports = {}
+    plugin.lst_completed_jobs = []
+
+    result = Plugin._get_job_status(plugin, "model-job")
+
+    self.assertEqual(result["status"], "network_tracked")
+    self.assertEqual(result["job"]["model_test_summary"]["error_class"], "unknown_error")
+    self.assertEqual(result["job"]["error_class"], "unknown_error")
+    payload_text = str(result)
+    self.assertNotIn("error_message", payload_text)
+    self.assertNotIn("status summary", payload_text)
+    self.assertNotIn("status raw exception", payload_text)
+    self.assertNotIn("worker raw exception", payload_text)
+    self.assertNotIn("secret-token", payload_text)
+    self.assertNotIn("secret prompt", payload_text)
 
   def test_get_job_data_includes_reconciled_workers(self):
     """get_job_data includes reconciled worker state for active jobs."""

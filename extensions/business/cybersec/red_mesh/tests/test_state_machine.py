@@ -5,6 +5,7 @@ from extensions.business.cybersec.red_mesh.constants import (
   JOB_STATUS_COLLECTING,
   JOB_STATUS_FINALIZED,
   JOB_STATUS_FINALIZING,
+  JOB_STATUS_FAILED,
   JOB_STATUS_RUNNING,
   JOB_STATUS_SCHEDULED_FOR_STOP,
   JOB_STATUS_STOPPED,
@@ -39,6 +40,20 @@ class TestJobStateMachine(unittest.TestCase):
 
     self.assertEqual(job_specs["job_status"], JOB_STATUS_RUNNING)
 
+  def test_allows_analyzing_retry_to_collecting(self):
+    job_specs = {"job_status": JOB_STATUS_ANALYZING}
+
+    set_job_status(job_specs, JOB_STATUS_COLLECTING)
+
+    self.assertEqual(job_specs["job_status"], JOB_STATUS_COLLECTING)
+
+  def test_allows_finalizing_retry_to_collecting(self):
+    job_specs = {"job_status": JOB_STATUS_FINALIZING}
+
+    set_job_status(job_specs, JOB_STATUS_COLLECTING)
+
+    self.assertEqual(job_specs["job_status"], JOB_STATUS_COLLECTING)
+
   def test_rejects_invalid_transition(self):
     job_specs = {"job_status": JOB_STATUS_RUNNING}
 
@@ -50,6 +65,18 @@ class TestJobStateMachine(unittest.TestCase):
     self.assertTrue(can_transition_job_status(JOB_STATUS_ANALYZING, JOB_STATUS_STOPPED))
     self.assertTrue(can_transition_job_status(JOB_STATUS_FINALIZING, JOB_STATUS_STOPPED))
 
+  def test_failed_is_allowed_from_active_states_and_is_terminal(self):
+    for status in (
+      JOB_STATUS_RUNNING,
+      JOB_STATUS_SCHEDULED_FOR_STOP,
+      JOB_STATUS_COLLECTING,
+      JOB_STATUS_ANALYZING,
+      JOB_STATUS_FINALIZING,
+    ):
+      self.assertTrue(can_transition_job_status(status, JOB_STATUS_FAILED))
+
+    self.assertTrue(is_terminal_job_status(JOB_STATUS_FAILED))
+
   def test_state_classification_helpers(self):
     self.assertTrue(is_intermediate_job_status(JOB_STATUS_COLLECTING))
     self.assertTrue(is_intermediate_job_status(JOB_STATUS_ANALYZING))
@@ -57,3 +84,4 @@ class TestJobStateMachine(unittest.TestCase):
     self.assertFalse(is_intermediate_job_status(JOB_STATUS_RUNNING))
     self.assertFalse(is_terminal_job_status(JOB_STATUS_SCHEDULED_FOR_STOP))
     self.assertTrue(is_terminal_job_status(JOB_STATUS_STOPPED))
+    self.assertTrue(is_terminal_job_status(JOB_STATUS_FAILED))

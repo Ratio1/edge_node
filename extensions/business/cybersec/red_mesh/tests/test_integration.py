@@ -7,6 +7,121 @@ from unittest.mock import MagicMock, patch
 from .conftest import DummyOwner, MANUAL_RUN, PentestLocalWorker, color_print, mock_plugin_modules
 
 
+def _install_pymisp_stub():
+  if "pymisp" in sys.modules:
+    return
+
+  class _FakeMISPObject:
+    def __init__(self, *args, **kwargs):
+      self.args = args
+      self.kwargs = kwargs
+      self.attributes = []
+
+    def add_attribute(self, *args, **kwargs):
+      self.attributes.append((args, kwargs))
+
+  class _FakeMISPEvent(_FakeMISPObject):
+    def add_object(self, *args, **kwargs):
+      self.attributes.append((args, kwargs))
+
+  module = MagicMock()
+  module.MISPEvent = _FakeMISPEvent
+  module.MISPObject = _FakeMISPObject
+  module.MISPAttribute = _FakeMISPObject
+  module.PyMISP = MagicMock
+  sys.modules["pymisp"] = module
+
+
+class TestLaunchOptionDefaults(unittest.TestCase):
+  """Launch-option defaults and production guardrails."""
+
+  def test_continuous_monitor_interval_defaults_to_one_day(self):
+    mock_plugin_modules()
+    _install_pymisp_stub()
+    from extensions.business.cybersec.red_mesh.constants import (
+      DISTRIBUTION_SLICE,
+      PORT_ORDER_SEQUENTIAL,
+      RUN_MODE_CONTINUOUS_MONITORING,
+    )
+    from extensions.business.cybersec.red_mesh.services.launch_api import (
+      DEFAULT_MONITOR_INTERVAL_SECONDS,
+      UNSAFE_CONFIRMATION_CONTINUOUS_INTERVAL_LOW,
+      normalize_common_launch_options,
+      required_unsafe_confirmation_ids,
+    )
+
+    owner = MagicMock()
+    owner.cfg_distribution_strategy = DISTRIBUTION_SLICE
+    owner.cfg_port_order = PORT_ORDER_SEQUENTIAL
+
+    options = normalize_common_launch_options(
+      owner,
+      distribution_strategy="",
+      port_order="",
+      run_mode=RUN_MODE_CONTINUOUS_MONITORING,
+      monitor_interval=0,
+      scan_min_delay=30,
+      scan_max_delay=80,
+      nr_local_workers=1,
+      unsafe_confirmation_ids=set(),
+    )
+
+    self.assertEqual(options["monitor_interval"], DEFAULT_MONITOR_INTERVAL_SECONDS)
+    self.assertNotIn(
+      UNSAFE_CONFIRMATION_CONTINUOUS_INTERVAL_LOW,
+      required_unsafe_confirmation_ids(
+        scan_type="network",
+        options=options,
+        redact_credentials=True,
+        ics_safe_mode=True,
+        verify_tls=True,
+        allow_stateful_probes=False,
+      ),
+    )
+
+  def test_continuous_monitor_interval_below_one_day_requires_confirmation(self):
+    mock_plugin_modules()
+    _install_pymisp_stub()
+    from extensions.business.cybersec.red_mesh.constants import (
+      DISTRIBUTION_SLICE,
+      PORT_ORDER_SEQUENTIAL,
+      RUN_MODE_CONTINUOUS_MONITORING,
+    )
+    from extensions.business.cybersec.red_mesh.services.launch_api import (
+      UNSAFE_CONFIRMATION_CONTINUOUS_INTERVAL_LOW,
+      normalize_common_launch_options,
+      required_unsafe_confirmation_ids,
+    )
+
+    owner = MagicMock()
+    owner.cfg_distribution_strategy = DISTRIBUTION_SLICE
+    owner.cfg_port_order = PORT_ORDER_SEQUENTIAL
+
+    options = normalize_common_launch_options(
+      owner,
+      distribution_strategy="",
+      port_order="",
+      run_mode=RUN_MODE_CONTINUOUS_MONITORING,
+      monitor_interval=3600,
+      scan_min_delay=30,
+      scan_max_delay=80,
+      nr_local_workers=1,
+      unsafe_confirmation_ids=set(),
+    )
+
+    self.assertIn(
+      UNSAFE_CONFIRMATION_CONTINUOUS_INTERVAL_LOW,
+      required_unsafe_confirmation_ids(
+        scan_type="network",
+        options=options,
+        redact_credentials=True,
+        ics_safe_mode=True,
+        verify_tls=True,
+        allow_stateful_probes=False,
+      ),
+    )
+
+
 class TestPhase12LiveProgress(unittest.TestCase):
   """Phase 12: Live Worker Progress."""
 

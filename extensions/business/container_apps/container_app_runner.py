@@ -94,6 +94,14 @@ from .sync import _SyncMixin
 __VER__ = "0.7.1"
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
+from extensions.utils.per_node_config import (
+  CANONICAL_PER_NODE_CONFIG_KEY,
+  PER_NODE_TARGET_NODES_KEY,
+  deep_merge_config,
+  lookup_keys,
+  normalize_config,
+  overlay_for_node,
+)
 
 # Persistent state filename (stored under the plugin's auto-routed plugin_data/ folder)
 _PERSISTENT_STATE_FILE = "persistent_state.pkl"
@@ -283,6 +291,8 @@ _CONFIG = {
   },
   "ENV": {},                # dict of env vars for the container
   "DYNAMIC_ENV": {},        # backend dynamic env definition; Deeploy may compile DYNAMIC_ENV_UI into this
+  "PER_NODE_CONFIG": {},    # Deeploy per-node overlays; materialized locally by node address/index
+  "PER_NODE_TARGET_NODES": [], # Full Deeploy target order used for PER_NODE_CONFIG.byIndex
   "ENV_OVERRIDES": {
     "ENABLED": True,        # app-local request.json patches under /r1en_system/env-overrides
   },
@@ -1093,6 +1103,7 @@ class ContainerAppRunnerPlugin(
     ValueError
         If configuration is invalid
     """
+    self._apply_per_node_config()
     image = getattr(self, 'cfg_image', None)
     if not image or not isinstance(image, str) or not image.strip():
       raise ValueError("IMAGE is required and must be a non-empty string")
@@ -1172,6 +1183,62 @@ class ContainerAppRunnerPlugin(
     """
     return
 
+  def _normalize_per_node_config(self, raw_config):
+    return normalize_config(
+      raw_config,
+      label=CANONICAL_PER_NODE_CONFIG_KEY,
+      config_keys=(CANONICAL_PER_NODE_CONFIG_KEY,),
+    )
+
+
+  def _apply_per_node_config(self):
+    config_data = getattr(self, "config_data", None)
+    if not isinstance(config_data, dict):
+      return False
+
+    raw_config = config_data.get(CANONICAL_PER_NODE_CONFIG_KEY)
+    if raw_config is None:
+      return False
+
+    target_nodes = (
+      config_data.get(PER_NODE_TARGET_NODES_KEY)
+      or getattr(self, f"cfg_{PER_NODE_TARGET_NODES_KEY.lower()}", [])
+      or config_data.get("CHAINSTORE_PEERS")
+      or getattr(self, "cfg_chainstore_peers", [])
+      or []
+    )
+    if not isinstance(target_nodes, list):
+      target_nodes = []
+    node_index = None
+    for lookup_key in lookup_keys(getattr(self, "ee_addr", None)):
+      if lookup_key in target_nodes:
+        node_index = target_nodes.index(lookup_key)
+        break
+    overlay = overlay_for_node(
+      raw_config,
+      getattr(self, "ee_addr", None),
+      node_index,
+      label=CANONICAL_PER_NODE_CONFIG_KEY,
+      config_keys=(CANONICAL_PER_NODE_CONFIG_KEY,),
+    )
+    config_data.pop(CANONICAL_PER_NODE_CONFIG_KEY, None)
+
+    if not overlay:
+      return False
+
+    for key, value in overlay.items():
+      config_data[key] = deep_merge_config(config_data.get(key), value)
+      try:
+        setattr(self, f"cfg_{str(key).lower()}", config_data[key])
+      except AttributeError:
+        # Runtime cfg_* accessors may be read-only properties backed by config_data.
+        pass
+    self.Pd(
+      f"Applied PER_NODE_CONFIG overlay for node={getattr(self, 'ee_addr', None)} index={node_index}",
+      score=1,
+    )
+    return True
+
 
   def on_init(self):
     """
@@ -1198,6 +1265,7 @@ class ContainerAppRunnerPlugin(
     self.__reset_vars()
 
     super(ContainerAppRunnerPlugin, self).on_init()
+    self._apply_per_node_config()
 
     # Defer chainstore response until container is healthy
     self.set_plugin_ready(False)
@@ -3561,6 +3629,7 @@ class ContainerAppRunnerPlugin(
         return False
 
     self.__reset_vars()
+    self._apply_per_node_config()
 
     # Reset chainstore response for restart cycle
     self.reset_chainstore_response()

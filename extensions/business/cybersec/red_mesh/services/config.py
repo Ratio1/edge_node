@@ -1,3 +1,4 @@
+from math import isfinite
 from urllib.parse import urlsplit
 
 
@@ -71,6 +72,7 @@ DEFAULT_EVENT_EXPORT_CONFIG = {
 
 DEFAULT_WAZUH_EXPORT_CONFIG = {
   "ENABLED": False,
+  "IS_REQUIRED": False,
   "MODE": "syslog",
   "SYSLOG_HOST": "",
   "SYSLOG_PORT": 514,
@@ -90,6 +92,7 @@ DEFAULT_WAZUH_EXPORT_CONFIG = {
   "INCLUDE_SERVICE_OBSERVATIONS": True,
   "TIMEOUT_SECONDS": 5.0,
   "RETRY_ATTEMPTS": 2,
+  "FAILURE_COOLDOWN_SECONDS": 300,
   "PERSIST_FAILED_PAYLOADS": False,
   "FAILED_PAYLOAD_SAMPLE_BYTES": 2048,
 }
@@ -134,6 +137,46 @@ DEFAULT_TAXII_EXPORT_CONFIG = {
   "TIMEOUT_SECONDS": 30.0,
 }
 
+DEFAULT_MODEL_TESTING_CONFIG = {
+  "ENABLED": False,
+  "RAW_EVIDENCE_ENABLED": False,
+  "RAW_EVALUATOR_EVIDENCE_ENABLED": False,
+  "RAW_EVIDENCE_DEFAULT_RETENTION_DAYS": 7,
+  "RAW_EVIDENCE_MAX_RETENTION_DAYS": 30,
+  "RAW_EVIDENCE_SECRET_REF": "",
+  "REMOTE_PROVIDER_URLS_ENABLED": True,
+  "REMOTE_PROVIDER_PREFLIGHT_ENABLED": True,
+  "EVALUATOR_MODELS": [],
+  "DEFAULT_EVALUATOR_ID": "",
+  "DEFAULT_EVALUATOR_MODEL": None,
+  "LIMITS": {
+    "MAX_CASES": 12,
+    "TESTED_MAX_TOKENS": 256,
+    "EVALUATOR_MAX_TOKENS": 384,
+    "PER_CALL_TIMEOUT_SECONDS": 45,
+    "TOTAL_TIMEOUT_SECONDS": 600,
+    "TEMPERATURE": 0,
+    "MAX_RETRIES": 1,
+  },
+}
+
+DEFAULT_API_OPERATIONS_CONFIG = {
+  "ENABLED": False,
+  "TOKEN_HASHES": [],
+  "TOKEN_ENV": "REDMESH_API_OPERATION_TOKEN",
+  "HMAC_SECRET": "",
+  "HMAC_SECRET_ENV": "REDMESH_API_OPERATION_HMAC_SECRET",
+  "MAX_IDEMPOTENCY_KEY_LENGTH": 128,
+  "MAX_FOCUS_AREAS": 8,
+  "MAX_FOCUS_AREA_LENGTH": 80,
+  "MAX_QUEUE_GLOBAL": 32,
+  "MAX_QUEUE_PER_ACTOR": 8,
+  "MAX_QUEUE_PER_JOB": 1,
+  "OPERATION_TTL_SECONDS": 86400,
+  "LEASE_SECONDS": 300,
+  "POLL_AFTER_MS": 1000,
+}
+
 _WAZUH_AUTH_MODES = {"static", "wazuh_jwt"}
 _TAXII_AUTH_MODES = {"static", "basic"}
 _OPENCTI_AUTH_MODES = {"static"}
@@ -168,12 +211,16 @@ def _bounded_int(value, default, *, minimum=None, maximum=None):
   return result
 
 
-def _bounded_float(value, default, *, minimum=None):
+def _bounded_float(value, default, *, minimum=None, maximum=None):
   try:
     result = float(value)
   except (TypeError, ValueError):
     return default
+  if not isfinite(result):
+    return default
   if minimum is not None and result < minimum:
+    return default
+  if maximum is not None and result > maximum:
     return default
   return result
 
@@ -349,6 +396,239 @@ def get_graybox_budgets_config(owner):
   )
 
 
+def get_model_testing_config(owner):
+  """Return normalized Model Testing capability config."""
+  def _bounded_text(value, *, maximum=200):
+    text = str(value or "").strip()
+    if not text or len(text) > maximum:
+      return ""
+    return text
+
+  def _normalize_evaluator_models(value):
+    if not isinstance(value, list):
+      return []
+    normalized = []
+    seen_ids = set()
+    for entry in value:
+      if not isinstance(entry, dict):
+        continue
+      evaluator_id = _bounded_text(entry.get("id"), maximum=80)
+      if not evaluator_id or evaluator_id in seen_ids or evaluator_id == "heuristic_v1":
+        continue
+      adapter = str(entry.get("adapter") or "openai_compatible").strip().lower()
+      if adapter != "openai_compatible":
+        continue
+      label = _bounded_text(entry.get("label"), maximum=120)
+      provider_label = _bounded_text(entry.get("provider_label"), maximum=120)
+      base_url = str(entry.get("base_url") or "").strip()
+      model = _bounded_text(entry.get("model"), maximum=200)
+      api_key_env = _bounded_text(entry.get("api_key_env"), maximum=120)
+      if not all((label, provider_label, base_url, model, api_key_env)):
+        continue
+      normalized.append({
+        "id": evaluator_id,
+        "label": label,
+        "provider_label": provider_label,
+        "adapter": adapter,
+        "base_url": base_url,
+        "model": model,
+        "api_key_env": api_key_env,
+        "enabled": bool(entry.get("enabled", True)),
+      })
+      seen_ids.add(evaluator_id)
+    return normalized
+
+  def _normalize_limits(value, defaults):
+    raw_limits = value if isinstance(value, dict) else {}
+    default_limits = defaults["LIMITS"]
+    return {
+      "MAX_CASES": _bounded_int(
+        raw_limits.get("MAX_CASES", default_limits["MAX_CASES"]),
+        default_limits["MAX_CASES"],
+        minimum=1,
+        maximum=12,
+      ),
+      "TESTED_MAX_TOKENS": _bounded_int(
+        raw_limits.get("TESTED_MAX_TOKENS", default_limits["TESTED_MAX_TOKENS"]),
+        default_limits["TESTED_MAX_TOKENS"],
+        minimum=1,
+        maximum=256,
+      ),
+      "EVALUATOR_MAX_TOKENS": _bounded_int(
+        raw_limits.get("EVALUATOR_MAX_TOKENS", default_limits["EVALUATOR_MAX_TOKENS"]),
+        default_limits["EVALUATOR_MAX_TOKENS"],
+        minimum=1,
+        maximum=384,
+      ),
+      "PER_CALL_TIMEOUT_SECONDS": _bounded_int(
+        raw_limits.get("PER_CALL_TIMEOUT_SECONDS", default_limits["PER_CALL_TIMEOUT_SECONDS"]),
+        default_limits["PER_CALL_TIMEOUT_SECONDS"],
+        minimum=1,
+        maximum=45,
+      ),
+      "TOTAL_TIMEOUT_SECONDS": _bounded_int(
+        raw_limits.get("TOTAL_TIMEOUT_SECONDS", default_limits["TOTAL_TIMEOUT_SECONDS"]),
+        default_limits["TOTAL_TIMEOUT_SECONDS"],
+        minimum=1,
+        maximum=600,
+      ),
+      "TEMPERATURE": _bounded_float(
+        raw_limits.get("TEMPERATURE", default_limits["TEMPERATURE"]),
+        default_limits["TEMPERATURE"],
+        minimum=0,
+        maximum=0,
+      ),
+      "MAX_RETRIES": _bounded_int(
+        raw_limits.get("MAX_RETRIES", default_limits["MAX_RETRIES"]),
+        default_limits["MAX_RETRIES"],
+        minimum=0,
+        maximum=1,
+      ),
+    }
+
+  def _normalize(merged, defaults):
+    default_retention = _bounded_int(
+      merged.get("RAW_EVIDENCE_DEFAULT_RETENTION_DAYS"),
+      defaults["RAW_EVIDENCE_DEFAULT_RETENTION_DAYS"],
+      minimum=1,
+      maximum=30,
+    )
+    max_retention = _bounded_int(
+      merged.get("RAW_EVIDENCE_MAX_RETENTION_DAYS"),
+      defaults["RAW_EVIDENCE_MAX_RETENTION_DAYS"],
+      minimum=1,
+      maximum=30,
+    )
+    if default_retention > max_retention:
+      default_retention = max_retention
+    evaluator_models = _normalize_evaluator_models(
+      merged.get("EVALUATOR_MODELS", defaults["EVALUATOR_MODELS"])
+    )
+    default_evaluator_id = _bounded_text(
+      merged.get("DEFAULT_EVALUATOR_ID", defaults["DEFAULT_EVALUATOR_ID"]),
+      maximum=80,
+    )
+    default_evaluator = merged.get("DEFAULT_EVALUATOR_MODEL")
+    if not isinstance(default_evaluator, dict):
+      default_evaluator = None
+    return {
+      "ENABLED": bool(merged.get("ENABLED", defaults["ENABLED"])),
+      "RAW_EVIDENCE_ENABLED": bool(
+        merged.get("RAW_EVIDENCE_ENABLED", defaults["RAW_EVIDENCE_ENABLED"])
+      ),
+      "RAW_EVALUATOR_EVIDENCE_ENABLED": bool(
+        merged.get("RAW_EVALUATOR_EVIDENCE_ENABLED", defaults["RAW_EVALUATOR_EVIDENCE_ENABLED"])
+      ),
+      "RAW_EVIDENCE_DEFAULT_RETENTION_DAYS": default_retention,
+      "RAW_EVIDENCE_MAX_RETENTION_DAYS": max_retention,
+      "RAW_EVIDENCE_SECRET_REF": str(
+        merged.get("RAW_EVIDENCE_SECRET_REF") or defaults["RAW_EVIDENCE_SECRET_REF"]
+      ).strip(),
+      "REMOTE_PROVIDER_URLS_ENABLED": bool(
+        merged.get("REMOTE_PROVIDER_URLS_ENABLED", defaults["REMOTE_PROVIDER_URLS_ENABLED"])
+      ),
+      "REMOTE_PROVIDER_PREFLIGHT_ENABLED": bool(
+        merged.get("REMOTE_PROVIDER_PREFLIGHT_ENABLED", defaults["REMOTE_PROVIDER_PREFLIGHT_ENABLED"])
+      ),
+      "EVALUATOR_MODELS": evaluator_models,
+      "DEFAULT_EVALUATOR_ID": default_evaluator_id,
+      "DEFAULT_EVALUATOR_MODEL": default_evaluator,
+      "LIMITS": _normalize_limits(merged.get("LIMITS"), defaults),
+    }
+
+  return resolve_config_block(
+    owner,
+    "MODEL_TESTING",
+    DEFAULT_MODEL_TESTING_CONFIG,
+    normalizer=_normalize,
+  )
+
+
+def get_api_operations_config(owner):
+  """Return normalized RedMesh async API operation config."""
+  def _normalize_hashes(value):
+    if isinstance(value, str):
+      values = [item.strip() for item in value.split(",")]
+    elif isinstance(value, (list, tuple, set)):
+      values = [str(item or "").strip() for item in value]
+    else:
+      values = []
+    return [item.lower() for item in values if item]
+
+  def _normalize(merged, defaults):
+    return {
+      "ENABLED": bool(merged.get("ENABLED", defaults["ENABLED"])),
+      "TOKEN_HASHES": _normalize_hashes(merged.get("TOKEN_HASHES", defaults["TOKEN_HASHES"])),
+      "TOKEN_ENV": _safe_secret_env(merged.get("TOKEN_ENV"), defaults["TOKEN_ENV"]),
+      "HMAC_SECRET": str(merged.get("HMAC_SECRET") or defaults["HMAC_SECRET"]),
+      "HMAC_SECRET_ENV": _safe_secret_env(
+        merged.get("HMAC_SECRET_ENV"),
+        defaults["HMAC_SECRET_ENV"],
+      ),
+      "MAX_IDEMPOTENCY_KEY_LENGTH": _bounded_int(
+        merged.get("MAX_IDEMPOTENCY_KEY_LENGTH"),
+        defaults["MAX_IDEMPOTENCY_KEY_LENGTH"],
+        minimum=16,
+        maximum=512,
+      ),
+      "MAX_FOCUS_AREAS": _bounded_int(
+        merged.get("MAX_FOCUS_AREAS"),
+        defaults["MAX_FOCUS_AREAS"],
+        minimum=0,
+        maximum=32,
+      ),
+      "MAX_FOCUS_AREA_LENGTH": _bounded_int(
+        merged.get("MAX_FOCUS_AREA_LENGTH"),
+        defaults["MAX_FOCUS_AREA_LENGTH"],
+        minimum=8,
+        maximum=256,
+      ),
+      "MAX_QUEUE_GLOBAL": _bounded_int(
+        merged.get("MAX_QUEUE_GLOBAL"),
+        defaults["MAX_QUEUE_GLOBAL"],
+        minimum=1,
+        maximum=1024,
+      ),
+      "MAX_QUEUE_PER_ACTOR": _bounded_int(
+        merged.get("MAX_QUEUE_PER_ACTOR"),
+        defaults["MAX_QUEUE_PER_ACTOR"],
+        minimum=1,
+        maximum=256,
+      ),
+      "MAX_QUEUE_PER_JOB": _bounded_int(
+        merged.get("MAX_QUEUE_PER_JOB"),
+        defaults["MAX_QUEUE_PER_JOB"],
+        minimum=1,
+        maximum=16,
+      ),
+      "OPERATION_TTL_SECONDS": _bounded_int(
+        merged.get("OPERATION_TTL_SECONDS"),
+        defaults["OPERATION_TTL_SECONDS"],
+        minimum=60,
+        maximum=30 * 86400,
+      ),
+      "LEASE_SECONDS": _bounded_int(
+        merged.get("LEASE_SECONDS"),
+        defaults["LEASE_SECONDS"],
+        minimum=10,
+        maximum=3600,
+      ),
+      "POLL_AFTER_MS": _bounded_int(
+        merged.get("POLL_AFTER_MS"),
+        defaults["POLL_AFTER_MS"],
+        minimum=250,
+        maximum=60000,
+      ),
+    }
+
+  return resolve_config_block(
+    owner,
+    "API_OPERATIONS",
+    DEFAULT_API_OPERATIONS_CONFIG,
+    normalizer=_normalize,
+  )
+
+
 def get_event_export_config(owner):
   """Return normalized canonical RedMesh event export config."""
   def _normalize(merged, defaults):
@@ -400,6 +680,7 @@ def get_wazuh_export_config(owner):
     )
     return {
       "ENABLED": bool(merged.get("ENABLED", defaults["ENABLED"])),
+      "IS_REQUIRED": bool(merged.get("IS_REQUIRED", defaults["IS_REQUIRED"])),
       "MODE": mode,
       "SYSLOG_HOST": str(merged.get("SYSLOG_HOST") or defaults["SYSLOG_HOST"]).strip(),
       "SYSLOG_PORT": _bounded_int(
@@ -448,6 +729,12 @@ def get_wazuh_export_config(owner):
         merged.get("RETRY_ATTEMPTS", defaults["RETRY_ATTEMPTS"]),
         defaults["RETRY_ATTEMPTS"],
         minimum=0,
+      ),
+      "FAILURE_COOLDOWN_SECONDS": _bounded_int(
+        merged.get("FAILURE_COOLDOWN_SECONDS", defaults["FAILURE_COOLDOWN_SECONDS"]),
+        defaults["FAILURE_COOLDOWN_SECONDS"],
+        minimum=1,
+        maximum=3600,
       ),
       "PERSIST_FAILED_PAYLOADS": bool(merged.get("PERSIST_FAILED_PAYLOADS", defaults["PERSIST_FAILED_PAYLOADS"])),
       "FAILED_PAYLOAD_SAMPLE_BYTES": _bounded_int(

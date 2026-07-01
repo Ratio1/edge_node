@@ -153,6 +153,25 @@ class TestOpenCtiExport(unittest.TestCase):
     owner.r1fs.add_json.assert_not_called()
     self.assertNotIn("opencti_export", owner.job_specs)
 
+  def test_model_test_job_rejected_before_opencti_bundle_build(self):
+    owner = _owner(job_specs={
+      "job_id": "job-1",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "job_cid": "model-archive",
+    })
+
+    dry_run = dry_run_opencti_export(owner, "job-1")
+    pushed = push_to_opencti(owner, "job-1")
+    status = get_opencti_export_status(owner, "job-1")
+
+    self.assertEqual(dry_run["error"], "unsupported_job_type")
+    self.assertEqual(pushed["error"], "unsupported_job_type")
+    self.assertEqual(status["error"], "unsupported_job_type")
+    self.assertFalse(status["exported"])
+    owner.r1fs.add_json.assert_not_called()
+    self.assertNotIn("opencti_export", owner.job_specs)
+
   def test_missing_token_updates_opencti_status_only(self):
     os.environ.pop("REDMESH_OPENCTI_TOKEN_TEST", None)
     owner = _owner()
