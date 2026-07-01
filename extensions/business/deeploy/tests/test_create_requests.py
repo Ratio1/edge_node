@@ -304,6 +304,38 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertNotIn("BEGIN RSA PRIVATE KEY", serialized)
     self.assertIn("'PER_NODE_CONFIG': '***'", serialized)
 
+  def test_cockroachdb_secure_config_accepts_camelcase_per_node_config(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="cockroachdb",
+          IMAGE="ghcr.io/ratio1/deeploy-cockroachdb-service:main",
+          ENV={
+            "CRDB_DATABASE": "appdb",
+            "CRDB_USER": "app_user",
+            "CRDB_PASSWORD": "secret-password",
+          },
+          perNodeConfig={
+            "byNode": {
+              "0xai_node_a": {"ENV": {"CRDB_NODE_ID": "1", "CF_TUNNEL_TOKEN": "token-a"}},
+              "0xai_node_b": {"ENV": {"CRDB_NODE_ID": "2", "CF_TUNNEL_TOKEN": "token-b"}},
+            },
+          },
+        ),
+      ],
+    )
+
+    plugin._prepare_cockroachdb_secure_config(inputs, ["0xai_node_a", "0xai_node_b"])
+
+    instance = inputs[DEEPLOY_KEYS.PLUGINS][0]
+    self.assertNotIn("perNodeConfig", instance)
+    by_node = instance["PER_NODE_CONFIG"]["byNode"]
+    self.assertEqual(by_node["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"], "token-a")
+    self.assertEqual(by_node["0xai_node_b"]["ENV"]["CRDB_NODE_ID"], "2")
+    self.assertIn("CRDB_NODE_KEY", by_node["0xai_node_a"]["ENV"])
+
   def test_cockroachdb_secure_config_reuses_existing_bundle_for_same_nodes(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
