@@ -17,6 +17,9 @@ from extensions.business.cybersec.red_mesh.model_testing.constants import (
   MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED,
   MODEL_TEST_ERROR_WORKER_LOST,
 )
+from extensions.business.cybersec.red_mesh.model_testing.evaluators import (
+  MODERATION_EVALUATOR_METHOD,
+)
 from extensions.business.cybersec.red_mesh.model_testing.worker import ModelTestWorker
 from extensions.business.cybersec.red_mesh.models import (
   CStoreJobFinalized,
@@ -133,6 +136,32 @@ class TestModelTestingCapability(unittest.TestCase):
     self.assertEqual(model_testing["default_evaluator_id"], "heuristic_v1")
     self.assertEqual(model_testing["default_evaluator_model_label"], "RedMesh heuristic evaluator")
     self.assertNotIn("RM_TEST_MISSING_EVALUATOR_KEY", str(status))
+
+  def test_capability_status_infers_koala_moderation_evaluator_method(self):
+    owner = _owner(cfg_model_testing={
+      "ENABLED": True,
+      "EVALUATOR_MODELS": [{
+        "id": "koala_text_moderation",
+        "label": "Koala text moderation",
+        "provider_label": "Koala",
+        "adapter": "openai_compatible",
+        "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+        "model": "koala-text-moderation",
+        "api_key_env": "RM_TEST_KOALA_KEY",
+        "enabled": True,
+      }],
+      "DEFAULT_EVALUATOR_ID": "koala_text_moderation",
+    })
+
+    with patch.dict("os.environ", {"RM_TEST_KOALA_KEY": "preset-secret"}, clear=False):
+      status = get_capability_status(owner)
+
+    options = status["model_testing"]["evaluator_options"]
+    self.assertEqual(options[0]["id"], "koala_text_moderation")
+    self.assertEqual(options[0]["method"], MODERATION_EVALUATOR_METHOD)
+    self.assertEqual(status["model_testing"]["default_evaluator_id"], "koala_text_moderation")
+    self.assertEqual(status["model_testing"]["default_evaluator_model_label"], "Koala text moderation")
+    self.assertNotIn("RM_TEST_KOALA_KEY", str(status))
 
   def test_capability_status_includes_llm_evaluator_with_credentials_when_enabled(self):
     owner = _owner(cfg_model_testing={
@@ -364,6 +393,68 @@ class TestModelTestingCbrnPack(unittest.TestCase):
     self.assertEqual(case["evaluator_method"], "local_heuristic_v1")
     self.assertTrue(case["safety_aligned"])
     self.assertEqual(result["model_test_summary"]["evaluator_id"], "heuristic_v1")
+
+  def test_runner_moderation_evaluator_scores_without_chat_json_judge(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import ModelTestRunner
+
+    class TestedClient:
+      def chat(self, messages, *, max_tokens, temperature):
+        return "I cannot provide harmful CBRN instructions. Please contact safety authorities."
+
+    class ModerationClient:
+      def __init__(self):
+        self.calls = 0
+
+      def chat(self, *args, **kwargs):
+        raise AssertionError("moderation evaluator must not use chat completions")
+
+      def moderate(self, input_text):
+        self.calls += 1
+        self.last_input = input_text
+        return {
+          "id": "modr-unit",
+          "model": "koala-text-moderation",
+          "results": [{
+            "flagged": False,
+            "categories": {"harassment": False, "violence": False},
+            "category_scores": {"harassment": 0.01, "violence": 0.02},
+          }],
+        }
+
+    evaluator = ModerationClient()
+
+    def client_factory(role, provider_config, limits):
+      if role == "tested_model":
+        return TestedClient()
+      return evaluator
+
+    runner = ModelTestRunner(
+      owner=MagicMock(),
+      job_config={
+        "tested_model": {"adapter": "openai_compatible"},
+        "evaluator_id": "koala_text_moderation",
+        "evaluator_model": {
+          "id": "koala_text_moderation",
+          "kind": "llm",
+          "method": MODERATION_EVALUATOR_METHOD,
+        },
+        "test_sets": [{"id": "cbrn_safety_v1", "topic_ids": ["chemical"]}],
+        "limits": {"tested_max_tokens": 64, "evaluator_max_tokens": 128},
+      },
+      provider_client_factory=client_factory,
+    )
+
+    result = runner.run()
+
+    case = result["model_test_results"]["cases"][0]
+    self.assertEqual(case["status"], "evaluated")
+    self.assertEqual(case["evaluator_id"], "koala_text_moderation")
+    self.assertEqual(case["evaluator_method"], MODERATION_EVALUATOR_METHOD)
+    self.assertTrue(case["safety_aligned"])
+    self.assertEqual(case["verdict"], "safe")
+    self.assertEqual(result["model_test_summary"]["evaluated_cases"], 3)
+    self.assertEqual(result["model_test_summary"]["evaluation_failed_cases"], 0)
+    self.assertEqual(evaluator.calls, 3)
 
   def test_runner_preflight_failure_fails_before_case_rows(self):
     from extensions.business.cybersec.red_mesh.model_testing.runner import (
@@ -731,6 +822,37 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{PUBLIC_TEST_IP}/v1")
     self.assertNotIn("preset-secret", str(stored_config))
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", str(stored_config))
+
+  def test_launch_persists_koala_moderation_evaluator_method(self):
+    owner = _owner(
+      cfg_model_testing={
+        "ENABLED": True,
+        "EVALUATOR_MODELS": [{
+          "id": "koala_text_moderation",
+          "label": "Koala text moderation",
+          "provider_label": "Koala",
+          "adapter": "openai_compatible",
+          "base_url": f"https://{PUBLIC_TEST_IP}/v1",
+          "model": "koala-text-moderation",
+          "api_key_env": "RM_TEST_KOALA_KEY",
+          "enabled": True,
+        }],
+        "DEFAULT_EVALUATOR_ID": "koala_text_moderation",
+      },
+    )
+    kwargs = _valid_launch_kwargs(secret="tested-secret")
+    kwargs["evaluator_id"] = "koala_text_moderation"
+
+    with patch.dict("os.environ", {"RM_TEST_KOALA_KEY": "preset-secret"}, clear=False):
+      result = launch_model_test(owner, **kwargs)
+
+    self.assertNotIn("error", result)
+    self.assertEqual(result["job_config"]["evaluator_id"], "koala_text_moderation")
+    self.assertEqual(result["job_config"]["evaluator_model"]["method"], MODERATION_EVALUATOR_METHOD)
+    stored_secret = owner.r1fs.add_json.call_args_list[0].args[0]
+    stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["method"], MODERATION_EVALUATOR_METHOD)
+    self.assertEqual(stored_config["evaluator_model"]["method"], MODERATION_EVALUATOR_METHOD)
 
   def test_launch_missing_llm_evaluator_env_fails_without_env_name(self):
     owner = _owner(
