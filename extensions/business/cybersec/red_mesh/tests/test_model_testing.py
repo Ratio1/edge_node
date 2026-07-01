@@ -17,6 +17,11 @@ from extensions.business.cybersec.red_mesh.model_testing.constants import (
   MODEL_TEST_ERROR_PROVIDER_AUTH_FAILED,
   MODEL_TEST_ERROR_WORKER_LOST,
 )
+from extensions.business.cybersec.red_mesh.model_testing.raw_evidence import (
+  RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE,
+  RAW_EVIDENCE_STATUS_CAPTURE_FAILED,
+  RAW_EVIDENCE_STATUS_PENDING,
+)
 from extensions.business.cybersec.red_mesh.model_testing.evaluators import (
   MODERATION_EVALUATOR_METHOD,
 )
@@ -1133,6 +1138,68 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stub["job_status"], "FINALIZED")
     self.assertTrue(stub["blockchain_attestation_enabled"])
 
+  def test_model_test_finalization_records_raw_evidence_capture_failed_when_requested_without_artifact(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.ee_addr = "launcher-node"
+    plugin.ee_id = "Launcher"
+    plugin.REDMESH_ATTESTATION_NETWORK = "unit-test"
+    plugin.time.return_value = 200.0
+    plugin.cfg_model_testing = {"ENABLED": True, "RAW_EVIDENCE_ENABLED": True}
+    plugin.cfg_archive_verify_retries = 1
+    plugin.r1fs = MagicMock()
+    plugin.r1fs.add_json.return_value = "QmArchiveCID"
+    plugin.r1fs.get_json.side_effect = [
+      {
+        "schema_version": "model_test_job_config_v1",
+        "job_type": "model_test",
+        "raw_evidence": {"requested": True},
+      },
+      {"job_id": "job-raw"},
+    ]
+    job_specs = {
+      "job_id": "job-raw",
+      "job_status": "RUNNING",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "run_mode": "SINGLEPASS",
+      "target": "Unit Provider / unit-model",
+      "task_name": "CBRN smoke",
+      "launcher": "launcher-node",
+      "launcher_alias": "Launcher",
+      "date_created": 100.0,
+      "job_config_cid": "QmConfigCID",
+      "workers": {"launcher-node": {"finished": True}},
+      "timeline": [],
+    }
+
+    result = PentesterApi01Plugin._finalize_model_test_job(
+      plugin,
+      "job-raw",
+      job_specs,
+      {
+        "status": "completed",
+        "model_test_results": {"overall_status": "completed", "cases": []},
+        "model_test_summary": {"overall_status": "completed"},
+      },
+      "QmWorkerResult",
+    )
+
+    self.assertTrue(result)
+    archive_payload = plugin.r1fs.add_json.call_args.args[0]
+    raw_meta = archive_payload["model_test_raw_evidence"]
+    self.assertEqual(raw_meta["requested"], True)
+    self.assertEqual(raw_meta["backend_enabled"], True)
+    self.assertEqual(raw_meta["status"], RAW_EVIDENCE_STATUS_CAPTURE_FAILED)
+    self.assertEqual(raw_meta["available"], False)
+    self.assertEqual(raw_meta["error_class"], RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE)
+    self.assertNotIn("cid", str(raw_meta))
+    stub = plugin._write_job_record.call_args.args[1]
+    self.assertEqual(stub["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_CAPTURE_FAILED)
+    self.assertEqual(stub["model_test_raw_evidence"]["error_class"], RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE)
+
   def test_enabled_launch_defaults_to_all_built_in_sets_when_selection_omitted(self):
     owner = _owner(cfg_model_testing={"ENABLED": True})
     kwargs = _valid_launch_kwargs()
@@ -1255,6 +1322,23 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(result["error_class"], "raw_evidence_disabled")
     owner.r1fs.add_json.assert_not_called()
     owner.chainstore_hset.assert_not_called()
+
+  def test_raw_evidence_opt_in_records_pending_safe_metadata_at_launch(self):
+    owner = _owner(cfg_model_testing={"ENABLED": True, "RAW_EVIDENCE_ENABLED": True})
+    owner.r1fs.add_json.side_effect = ["cid-secret", "cid-config"]
+    kwargs = _valid_launch_kwargs()
+    kwargs["raw_evidence"] = {"enabled": True, "reason": "debug"}
+
+    result = launch_model_test(owner, **kwargs)
+
+    self.assertNotIn("error", result)
+    job_specs = result["job_specs"]
+    self.assertEqual(result["job_config"]["raw_evidence"]["requested"], True)
+    self.assertEqual(job_specs["model_test_raw_evidence"]["requested"], True)
+    self.assertEqual(job_specs["model_test_raw_evidence"]["backend_enabled"], True)
+    self.assertEqual(job_specs["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_PENDING)
+    self.assertEqual(job_specs["model_test_raw_evidence"]["available"], False)
+    self.assertNotIn("cid", str(job_specs["model_test_raw_evidence"]))
 
 
 class TestModelTestingRawEvidenceGuards(unittest.TestCase):
@@ -1445,6 +1529,15 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       "duration": 0,
       "date_created": 0,
       "date_completed": 0,
+      "model_test_raw_evidence": {
+        "requested": True,
+        "backend_enabled": True,
+        "status": "available",
+        "available": True,
+        "cid": "cid-raw-secret",
+        "artifact_id": "artifact-secret",
+        "hashes": ["sha256:" + "a" * 64],
+      },
     }).to_dict()
 
     for payload in (worker_result, archive):
@@ -1459,7 +1552,12 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       self.assertNotIn("secret-token", payload_text)
       self.assertNotIn("provider.example", payload_text)
       self.assertNotIn("cid-raw-secret", payload_text)
+      self.assertNotIn("artifact-secret", payload_text)
       self.assertNotIn("error_message", payload_text)
+
+    self.assertTrue(archive["model_test_raw_evidence"]["available"])
+    self.assertEqual(archive["model_test_raw_evidence"]["status"], "available")
+    self.assertEqual(archive["model_test_raw_evidence"]["hashes"], ["sha256:" + "a" * 64])
 
   def test_artifact_repository_preserves_model_test_config_without_scan_defaults(self):
     owner = _owner()
@@ -1522,6 +1620,14 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       job_type="model_test",
       model_test_summary={"overall_status": "queued"},
       model_test_node_selection={"selected_execution_node": "node-a"},
+      model_test_raw_evidence={
+        "requested": True,
+        "backend_enabled": True,
+        "status": "available",
+        "available": True,
+        "cid": "cid-raw-secret",
+        "artifact_id": "artifact-secret",
+      },
     )
 
     payload = running.to_dict()
@@ -1530,6 +1636,9 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(round_tripped["job_type"], "model_test")
     self.assertEqual(round_tripped["model_test_summary"]["overall_status"], "queued")
     self.assertEqual(round_tripped["model_test_node_selection"]["selected_execution_node"], "node-a")
+    self.assertEqual(round_tripped["model_test_raw_evidence"]["status"], "available")
+    self.assertNotIn("cid-raw-secret", str(round_tripped))
+    self.assertNotIn("artifact-secret", str(round_tripped))
     self.assertEqual(round_tripped["workers"]["node-a"]["worker_type"], "model_test")
     self.assertEqual(round_tripped["workers"]["node-a"]["model_test_worker_status"], "queued")
 
@@ -1818,6 +1927,15 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
       job_type="model_test",
       model_test_summary={"overall_status": "complete"},
       model_test_node_selection={"selected_execution_node": "node-a"},
+      model_test_raw_evidence={
+        "requested": True,
+        "backend_enabled": True,
+        "status": RAW_EVIDENCE_STATUS_CAPTURE_FAILED,
+        "available": False,
+        "error_class": RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE,
+        "cid": "cid-raw-secret",
+        "artifact_id": "artifact-secret",
+      },
     )
 
     payload = CStoreJobFinalized.from_dict(finalized.to_dict()).to_dict()
@@ -1825,6 +1943,10 @@ class TestModelTestingPersistenceContracts(unittest.TestCase):
     self.assertEqual(payload["job_type"], "model_test")
     self.assertEqual(payload["model_test_summary"]["overall_status"], "complete")
     self.assertEqual(payload["model_test_node_selection"]["selected_execution_node"], "node-a")
+    self.assertEqual(payload["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_CAPTURE_FAILED)
+    self.assertEqual(payload["model_test_raw_evidence"]["error_class"], RAW_EVIDENCE_ERROR_CAPTURE_UNAVAILABLE)
+    self.assertNotIn("cid-raw-secret", str(payload))
+    self.assertNotIn("artifact-secret", str(payload))
 
   def test_scan_poller_ignores_model_test_jobs(self):
     mock_plugin_modules()
