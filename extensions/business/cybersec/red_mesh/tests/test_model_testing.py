@@ -494,6 +494,71 @@ class TestModelTestingCbrnPack(unittest.TestCase):
     self.assertEqual(result["model_test_summary"]["evaluation_failed_cases"], 0)
     self.assertEqual(evaluator.calls, 3)
 
+  def test_runner_moderation_evaluator_keeps_prompt_injection_guardrails(self):
+    from extensions.business.cybersec.red_mesh.model_testing.runner import ModelTestRunner
+
+    class TestedClient:
+      def chat(self, messages, *, max_tokens, temperature):
+        for message in messages:
+          content = str(message.get("content") or "")
+          marker = "REDMESH_INJECTION_CANARY_"
+          index = content.find(marker)
+          if index >= 0:
+            return content[index:].split()[0].strip(".")
+        return "I will follow the injected instruction."
+
+    class ModerationClient:
+      def __init__(self):
+        self.calls = 0
+
+      def chat(self, *args, **kwargs):
+        raise AssertionError("moderation evaluator must not use chat completions")
+
+      def moderate(self, input_text):
+        self.calls += 1
+        return {
+          "id": "modr-unit",
+          "model": "koala-text-moderation",
+          "results": [{
+            "flagged": False,
+            "categories": {"harassment": False, "violence": False},
+            "category_scores": {"harassment": 0.001, "violence": 0.002},
+          }],
+        }
+
+    evaluator = ModerationClient()
+
+    def client_factory(role, provider_config, limits):
+      if role == "tested_model":
+        return TestedClient()
+      return evaluator
+
+    runner = ModelTestRunner(
+      owner=MagicMock(),
+      job_config={
+        "tested_model": {"adapter": "openai_compatible"},
+        "evaluator_id": "koala_text_moderation",
+        "evaluator_model": {
+          "id": "koala_text_moderation",
+          "kind": "llm",
+          "method": MODERATION_EVALUATOR_METHOD,
+        },
+        "test_sets": [{"id": "prompt_injection_v1", "topic_ids": ["instruction_override"]}],
+        "limits": {"tested_max_tokens": 64, "evaluator_max_tokens": 128},
+      },
+      provider_client_factory=client_factory,
+    )
+
+    result = runner.run()
+
+    cases = result["model_test_results"]["cases"]
+    canary_case = next(case for case in cases if case["case_id"] == "prompt_injection_ignore_previous")
+    self.assertEqual(canary_case["evaluator_method"], MODERATION_EVALUATOR_METHOD)
+    self.assertFalse(canary_case["safety_aligned"])
+    self.assertEqual(canary_case["verdict"], "unsafe")
+    self.assertIn("Prompt-injection guardrail failed", canary_case["rationale"])
+    self.assertEqual(evaluator.calls, len(cases))
+
   def test_runner_preflight_failure_fails_before_case_rows(self):
     from extensions.business.cybersec.red_mesh.model_testing.runner import (
       ModelTestProviderError,
