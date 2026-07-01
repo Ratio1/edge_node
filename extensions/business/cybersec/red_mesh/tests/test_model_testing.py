@@ -1,3 +1,4 @@
+import hashlib
 import socket
 import unittest
 from copy import deepcopy
@@ -1511,6 +1512,43 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
 
 class TestModelTestingRawEvidenceGuards(unittest.TestCase):
 
+  def _raw_evidence_endpoint_plugin(self):
+    mock_plugin_modules()
+    from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
+
+    plugin = MagicMock()
+    plugin.cfg_instance_id = "instance"
+    plugin.cfg_api_operations = {
+      "ENABLED": True,
+      "TOKEN_HASHES": [hashlib.sha256(b"backend-token").hexdigest()],
+      "HMAC_SECRET": "unit-test-hmac-secret",
+    }
+    job_specs = {
+      "job_id": "job-raw",
+      "job_type": "model_test",
+      "scan_type": "model_test",
+      "model_test_summary": {"overall_status": "completed"},
+    }
+    plugin._get_job_from_cstore.return_value = job_specs
+    plugin._get_all_network_jobs.return_value = {"job-raw": job_specs}
+    plugin._normalize_job_record.side_effect = lambda key, spec: (key, spec)
+    plugin.chainstore_hget.side_effect = lambda hkey, key: {
+      "job_id": "job-raw",
+      "requested": True,
+      "backend_enabled": True,
+      "status": RAW_EVIDENCE_STATUS_AVAILABLE,
+      "available": True,
+      "artifact_cid": "QmRawEvidenceCID",
+      "hashes": ["sha256:" + "a" * 64],
+    } if hkey == "instance:model_test_raw_evidence" else None
+    plugin.r1fs.get_json.return_value = {
+      "kind": RAW_MODEL_TEST_EVIDENCE_KIND,
+      "schema_version": "model_test_raw_evidence_v1",
+      "job_id": "job-raw",
+      "cases": [{"case_id": "case-1", "tested_model": {"response": "raw answer secret"}}],
+    }
+    return PentesterApi01Plugin, plugin
+
   def test_get_report_denies_raw_model_test_evidence_artifact(self):
     mock_plugin_modules()
     from extensions.business.cybersec.red_mesh.pentester_api_01 import PentesterApi01Plugin
@@ -1526,6 +1564,43 @@ class TestModelTestingRawEvidenceGuards(unittest.TestCase):
 
     self.assertEqual(result["error"], "forbidden")
     self.assertNotIn("cases", str(result))
+
+  def test_raw_evidence_endpoint_rejects_missing_permission(self):
+    Plugin, plugin = self._raw_evidence_endpoint_plugin()
+
+    result = Plugin.get_raw_model_test_evidence(plugin, "backend-token", "job-raw")
+
+    self.assertEqual(result["error"], "forbidden")
+    self.assertEqual(result["status_code"], 403)
+    plugin.r1fs.get_json.assert_not_called()
+
+  def test_raw_evidence_endpoint_rejects_invalid_backend_token(self):
+    Plugin, plugin = self._raw_evidence_endpoint_plugin()
+
+    result = Plugin.get_raw_model_test_evidence(
+      plugin,
+      "wrong-token",
+      "job-raw",
+      "job:view_raw_model_evidence",
+    )
+
+    self.assertEqual(result["error"], "forbidden")
+    self.assertEqual(result["status_code"], 403)
+    plugin.r1fs.get_json.assert_not_called()
+
+  def test_raw_evidence_endpoint_reads_only_with_backend_auth_and_permission(self):
+    Plugin, plugin = self._raw_evidence_endpoint_plugin()
+
+    result = Plugin.get_raw_model_test_evidence(
+      plugin,
+      "backend-token",
+      "job-raw",
+      "job:view_raw_model_evidence",
+    )
+
+    self.assertEqual(result["payload"]["cases"][0]["tested_model"]["response"], "raw answer secret")
+    self.assertEqual(result["model_test_raw_evidence"]["status"], RAW_EVIDENCE_STATUS_AVAILABLE)
+    self.assertNotIn("QmRawEvidenceCID", str(result["model_test_raw_evidence"]))
 
 
 class TestModelTestNodeSelection(unittest.TestCase):
