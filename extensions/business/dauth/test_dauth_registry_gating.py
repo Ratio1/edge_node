@@ -1,7 +1,12 @@
 import unittest
+from copy import deepcopy
 from pathlib import Path
 
-from extensions.business.dauth.dauth_mixin import _DauthMixin
+from extensions.business.dauth.dauth_mixin import (
+  DAUTH_JOB_SECRETS_CSTORE_HKEY,
+  DEEPLOY_JOBS_CSTORE_HKEY,
+  _DauthMixin,
+)
 
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -73,7 +78,13 @@ class _FakeDauthConst:
   DAUTH_WHITELIST = "DAUTH_WHITELIST"
 
 
+class _FakeBCBaseConst:
+  SENDER = "EE_SENDER"
+  ETH_SENDER = "EE_ETH_SENDER"
+
+
 class _FakeBaseConst:
+  BCctbase = _FakeBCBaseConst
   dAuth = _FakeDauthConst
 
 
@@ -90,9 +101,15 @@ class _FakeConst:
 
 class _FakeBC:
 
-  def __init__(self, *, dauth_oracle=True, protocol_oracles=None):
+  def __init__(self, *, dauth_oracle=True, protocol_oracles=None, valid_signature=True):
     self.dauth_oracle = dauth_oracle
     self.protocol_oracles = protocol_oracles or ["node-oracle"]
+    self.valid_signature = valid_signature
+    self.node_eth = {
+      "node-oracle": "0xORACLE",
+      "node-runner": "0xRUNNER",
+      "node-other": "0xOTHER",
+    }
 
   def get_oracles(self, include_eth_addrs=False):
     names = ["Oracle"] * len(self.protocol_oracles)
@@ -109,18 +126,52 @@ class _FakeBC:
       raise self.dauth_oracle
     return self.dauth_oracle
 
+  def get_eth_oracles(self):
+    return [self.node_eth.get(node, "0xORACLE") for node in self.protocol_oracles]
+
+  def node_address_to_eth_address(self, node_address):
+    return self.node_eth[node_address]
+
+  def verify(self, body, return_full_info=False):  # pylint: disable=unused-argument
+    class _VerifyData:
+      pass
+
+    data = _VerifyData()
+    data.valid = self.valid_signature
+    data.message = "ok" if self.valid_signature else "bad signature"
+    return data
+
+  def maybe_add_prefix(self, node_address):
+    if node_address.startswith("0xai_"):
+      return node_address
+    return "0xai_" + node_address
+
+
+class _FakeR1FS:
+
+  def __init__(self, data):
+    self.data = data
+
+  def get_json(self, cid, show_logs=False):  # pylint: disable=unused-argument
+    return self.data[cid]
+
 
 class _DauthHarness(_DauthMixin):
   pass
 
 
-def _make_dauth_harness(*, dauth_oracle=True, protocol_oracles=None):
+def _make_dauth_harness(*, dauth_oracle=True, protocol_oracles=None, valid_signature=True):
   plugin = _DauthHarness()
   plugin.const = _FakeConst
   plugin.bc = _FakeBC(
     dauth_oracle=dauth_oracle,
     protocol_oracles=protocol_oracles,
+    valid_signature=valid_signature,
   )
+  plugin.deepcopy = deepcopy
+  plugin._chainstore = {}
+  plugin._r1fs_data = {}
+  plugin.r1fs = _FakeR1FS(plugin._r1fs_data)
   plugin.evm_network = "devnet"
   plugin.cfg_auth_env_keys = []
   plugin.cfg_auth_node_env_keys = []
@@ -146,6 +197,11 @@ def _make_dauth_harness(*, dauth_oracle=True, protocol_oracles=None):
   plugin.fetch_node_tags = lambda node_address_eth=None: {}
   plugin.P = lambda *args, **kwargs: None
   plugin.Pd = lambda *args, **kwargs: None
+  plugin.chainstore_hset = lambda hkey, key, value: plugin._chainstore.__setitem__(
+    (hkey, str(key)),
+    deepcopy(value),
+  ) or True
+  plugin.chainstore_hget = lambda hkey, key: plugin._chainstore.get((hkey, str(key)))
   return plugin
 
 
@@ -209,6 +265,128 @@ class DauthRegistrySecretGatingTests(unittest.TestCase):
     self.assertNotIn("EE_CLOUDFLARE_TOKEN_DAUTH_MANAGER", data)
     self.assertEqual(data["EE_NGROK_EDGE_LABEL_DAUTH_MANAGER"], "ngrok-label")
     self.assertEqual(data["EE_CLOUDFLARE_TOKEN_DEEPLOY_MANAGER"], "deeploy-secret")
+
+
+class DauthJobSecretEndpointTests(unittest.TestCase):
+
+  def test_add_secrets_allows_protocol_oracle_and_overwrites_bundle(self):
+    plugin = _make_dauth_harness(protocol_oracles=["node-oracle"])
+    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
+      "job_id": "7",
+      "old": True,
+    }
+    body = {
+      "EE_SENDER": "node-oracle",
+      "EE_ETH_SENDER": "0xORACLE",
+      "job_id": 7,
+      "plugin_secrets": {
+        "plugins": {
+          "CONTAINER_APP_RUNNER": [{
+            "instance_conf": {
+              "ENV": {
+                "API_KEY": "secret",
+              },
+            },
+          }],
+        },
+      },
+    }
+
+    response = plugin.process_dauth_add_secrets_request(body)
+
+    self.assertEqual(response["status"], "success")
+    self.assertEqual(response["job_id"], "7")
+    self.assertEqual(
+      plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")],
+      {
+        "job_id": "7",
+        "plugin_secrets": body["plugin_secrets"],
+      },
+    )
+
+  def test_add_secrets_rejects_non_oracle_writer(self):
+    plugin = _make_dauth_harness(protocol_oracles=["node-oracle"])
+    body = {
+      "EE_SENDER": "node-runner",
+      "EE_ETH_SENDER": "0xRUNNER",
+      "job_id": "7",
+      "plugin_secrets": {"plugins": {}},
+    }
+
+    with self.assertRaisesRegex(ValueError, "not an oracle"):
+      plugin.process_dauth_add_secrets_request(body)
+
+    self.assertNotIn((DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"), plugin._chainstore)
+
+  def test_add_secrets_rejects_invalid_signature(self):
+    plugin = _make_dauth_harness(valid_signature=False)
+    body = {
+      "EE_SENDER": "node-oracle",
+      "EE_ETH_SENDER": "0xORACLE",
+      "job_id": "7",
+      "plugin_secrets": {"plugins": {}},
+    }
+
+    with self.assertRaisesRegex(ValueError, "Invalid request signature"):
+      plugin.process_dauth_add_secrets_request(body)
+
+    self.assertNotIn((DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"), plugin._chainstore)
+
+  def test_get_secrets_returns_bundle_for_node_running_job_from_r1fs_pipeline(self):
+    plugin = _make_dauth_harness()
+    bundle = {
+      "job_id": "7",
+      "plugin_secrets": {
+        "plugins": {
+          "CONTAINER_APP_RUNNER": [{
+            "instance_conf": {
+              "ENV": {
+                "API_KEY": "secret",
+              },
+            },
+          }],
+        },
+      },
+    }
+    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = bundle
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
+    plugin._r1fs_data["cid-7"] = {
+      "deeploy_specs": {
+        "current_target_nodes": ["node-runner"],
+      },
+    }
+    body = {
+      "EE_SENDER": "node-runner",
+      "EE_ETH_SENDER": "0xRUNNER",
+      "job_id": "7",
+    }
+
+    response = plugin.process_dauth_get_secret_request(body)
+
+    self.assertEqual(response["status"], "success")
+    self.assertEqual(response["job_id"], "7")
+    self.assertEqual(response["secret_bundle"], bundle)
+
+  def test_get_secrets_rejects_node_not_running_job(self):
+    plugin = _make_dauth_harness()
+    plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
+      "job_id": "7",
+      "plugin_secrets": {"plugins": {}},
+    }
+    plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
+    plugin._r1fs_data["cid-7"] = {
+      "DEEPLOY_SPECS": {
+        "current_target_nodes": ["node-runner"],
+      },
+    }
+    body = {
+      "EE_SENDER": "node-other",
+      "EE_ETH_SENDER": "0xOTHER",
+      "job_id": "7",
+    }
+
+    with self.assertRaisesRegex(ValueError, "not running job"):
+      plugin.process_dauth_get_secret_request(body)
 
 
 class DauthServerRegistryGateTests(unittest.TestCase):
