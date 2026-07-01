@@ -2,6 +2,7 @@
 
 from ..services.config import get_model_testing_config
 from .catalog import sanitized_model_test_catalog
+from .evaluators import default_evaluator_id, evaluator_options_for_status
 
 
 def _disabled_reason(cfg):
@@ -13,14 +14,13 @@ def _disabled_reason(cfg):
 def get_capability_status(owner):
   """Return the sanitized RedMesh capability registry."""
   cfg = get_model_testing_config(owner)
-  default_evaluator = cfg.get("DEFAULT_EVALUATOR_MODEL")
-  default_label = None
-  if isinstance(default_evaluator, dict):
-    default_label = str(
-      default_evaluator.get("provider_label")
-      or default_evaluator.get("PROVIDER_LABEL")
-      or ""
-    ).strip() or None
+  evaluator_options = evaluator_options_for_status(cfg)
+  selected_default_evaluator_id = default_evaluator_id(cfg)
+  default_option = next(
+    (option for option in evaluator_options if option.get("id") == selected_default_evaluator_id),
+    None,
+  )
+  default_label = default_option.get("label") if isinstance(default_option, dict) else None
   return {
     "network_scan": {
       "enabled": True,
@@ -41,7 +41,9 @@ def get_capability_status(owner):
       "raw_evidence_max_retention_days": cfg["RAW_EVIDENCE_MAX_RETENTION_DAYS"],
       "remote_provider_urls_enabled": bool(cfg["REMOTE_PROVIDER_URLS_ENABLED"]),
       "remote_provider_preflight_enabled": bool(cfg["REMOTE_PROVIDER_PREFLIGHT_ENABLED"]),
-      "default_evaluator_model_available": bool(default_evaluator),
+      "evaluator_options": evaluator_options,
+      "default_evaluator_id": selected_default_evaluator_id,
+      "default_evaluator_model_available": bool(evaluator_options),
       "default_evaluator_model_label": default_label,
       "question_sets": sanitized_model_test_catalog(),
       "restricted_raw_permission": "job:view_raw_model_evidence",

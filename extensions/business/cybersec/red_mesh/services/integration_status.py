@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
 
 from .auth import credentials_missing
 from .config import (
@@ -14,6 +13,12 @@ from .config import (
   get_wazuh_export_config,
 )
 from .event_builder import build_test_event
+from .soc_export_policy import (
+  apply_integration_outcome_policy,
+  redacted_url_host as _redacted_url_host,
+  retry_after_seconds,
+  wazuh_readiness,
+)
 
 
 INTEGRATION_STATUS_SCHEMA_VERSION = "1.0.0"
@@ -52,17 +57,6 @@ def _save_status_record(owner, integration_id, record):
   return True
 
 
-def _redacted_url_host(url):
-  raw = str(url or "").strip()
-  if not raw:
-    return ""
-  try:
-    parsed = urlsplit(raw)
-  except ValueError:
-    return ""
-  return parsed.hostname or ""
-
-
 def _has_env_secret(env_name):
   return bool(str(os.environ.get(str(env_name or ""), "")).strip())
 
@@ -77,12 +71,15 @@ _INTEGRATIONS_WITH_TEST = {"wazuh", "opencti", "taxii"}
 
 
 def _base_status(integration_id, *, enabled, configured, destination_type, destination_label,
-                 redacted_host="", redaction_mode="hash_only", error_class=None, config=None):
+                 redacted_host="", redaction_mode="hash_only", error_class=None, config=None,
+                 required=False, status=None):
   return {
     "id": integration_id,
     "label": INTEGRATION_LABELS[integration_id],
     "enabled": bool(enabled),
     "configured": bool(configured),
+    "required": bool(required),
+    "status": status or ("ready" if configured else ("disabled" if not enabled else "not_configured")),
     "destination_type": destination_type,
     "destination_label": destination_label,
     "redacted_host": redacted_host,
@@ -94,6 +91,13 @@ def _base_status(integration_id, *, enabled, configured, destination_type, desti
     "last_error_class": error_class,
     "last_event_id": None,
     "last_artifact_cid": None,
+    "first_failure_at": None,
+    "current_failure_first_at": None,
+    "failure_count": 0,
+    "consecutive_failure_count": 0,
+    "cooldown_until": None,
+    "retry_after_seconds": None,
+    "integration_status": status or ("ready" if configured else ("disabled" if not enabled else "not_configured")),
     "config": config or {},
   }
 
@@ -107,10 +111,23 @@ def _merge_record(base, record):
     "last_error_class",
     "last_event_id",
     "last_artifact_cid",
+    "first_failure_at",
+    "current_failure_first_at",
+    "failure_count",
+    "consecutive_failure_count",
+    "cooldown_until",
+    "integration_status",
   ):
     if key in record:
       merged[key] = record.get(key)
-  if base.get("last_error_class") and not base.get("configured"):
+  retry_after = retry_after_seconds(merged.get("cooldown_until"))
+  if retry_after is not None and retry_after > 0:
+    merged["retry_after_seconds"] = retry_after
+    merged["status"] = "cooling_down"
+    merged["integration_status"] = "cooling_down"
+  elif merged.get("integration_status") == "cooling_down":
+    merged["integration_status"] = "degraded" if merged.get("last_error_class") else merged["status"]
+  if base.get("last_error_class") and not base.get("configured") and not merged.get("last_error_class"):
     merged["last_error_class"] = base["last_error_class"]
   return merged
 
@@ -138,43 +155,28 @@ def _event_export_status(owner):
 
 def _wazuh_status(owner):
   cfg = get_wazuh_export_config(owner)
-  event_cfg = get_event_export_config(owner)
-  mode = cfg["MODE"]
-  host = cfg["SYSLOG_HOST"] if mode == "syslog" else _redacted_url_host(cfg["HTTP_URL"])
-  missing_secret = event_cfg["SIGN_PAYLOADS"] and not _has_env_secret(event_cfg["HMAC_SECRET_ENV"])
-  # Credential check only applies to http mode; syslog over UDP/TCP is
-  # authenticated by network position, not by token or username.
-  credentials_error = credentials_missing(cfg) if mode == "http" else None
-  configured = (
-    bool(cfg["ENABLED"])
-    and bool(host)
-    and not missing_secret
-    and credentials_error is None
-  )
-  if cfg["ENABLED"] and host:
-    if missing_secret:
-      error_class = "missing_hmac_secret"
-    elif credentials_error:
-      error_class = credentials_error
-    else:
-      error_class = None
-  else:
-    error_class = None
+  readiness = wazuh_readiness(owner)
+  mode = readiness["mode"]
+  host = readiness["host"]
   return _base_status(
     "wazuh",
     enabled=cfg["ENABLED"],
-    configured=configured,
+    configured=readiness["configured"],
+    required=cfg["IS_REQUIRED"],
+    status=readiness["status"],
     destination_type=mode,
     destination_label="wazuh",
     redacted_host=host,
-    error_class=error_class,
+    error_class=readiness["error_class"],
     config={
       "mode": mode,
       "auth_mode": cfg["AUTH_MODE"],
+      "is_required": cfg["IS_REQUIRED"],
       "min_severity": cfg["MIN_SEVERITY"],
       "include_service_observations": cfg["INCLUDE_SERVICE_OBSERVATIONS"],
       "timeout_seconds": cfg["TIMEOUT_SECONDS"],
       "retry_attempts": cfg["RETRY_ATTEMPTS"],
+      "failure_cooldown_seconds": cfg["FAILURE_COOLDOWN_SECONDS"],
       "persist_failed_payloads": cfg["PERSIST_FAILED_PAYLOADS"],
     },
   )
@@ -290,6 +292,7 @@ def record_integration_status(owner, integration_id, *, outcome, event_id=None,
     return False
   now = _utc_timestamp()
   record = _load_status_record(owner, integration_id)
+  previous_error_class = record.get("last_error_class")
   if dry_run:
     record["last_dry_run_at"] = now
   if outcome == "success":
@@ -300,6 +303,15 @@ def record_integration_status(owner, integration_id, *, outcome, event_id=None,
     record["last_error_class"] = error_class or "unknown_error"
   elif error_class:
     record["last_error_class"] = error_class
+  record = apply_integration_outcome_policy(
+    owner,
+    integration_id,
+    record,
+    outcome=outcome,
+    error_class=record.get("last_error_class") or error_class,
+    previous_error_class=previous_error_class,
+    now=now,
+  )
   if event_id:
     record["last_event_id"] = event_id
   if artifact_cid:

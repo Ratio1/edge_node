@@ -19,6 +19,16 @@ from extensions.business.deeploy.deeploy_const import DEEPLOY_ERRORS, DEEPLOY_KE
   DEEPLOY_DYNAMIC_ENV_KEYS, DEEPLOY_DYNAMIC_ENV_TYPES
 
 from extensions.utils.memory_formatter import parse_memory_to_mb
+from extensions.utils.per_node_config import (
+  CANONICAL_PER_NODE_CONFIG_KEY,
+  PER_NODE_CONFIG_KEYS,
+  PER_NODE_CONFIG_STRUCTURED_KEYS,
+  deep_merge_config,
+  iter_overlays as iter_per_node_overlays,
+  normalize_config as normalize_per_node_config,
+  overlay_for_node as per_node_overlay_for_node,
+  validate_selectors as validate_per_node_selectors,
+)
 
 DEEPLOY_DEBUG = True
 STACK_CPU_QUANTUM = Decimal("0.01")
@@ -47,39 +57,6 @@ PREFERRED_NODES_MAX_COUNT = 100
 PREFERRED_NODES_MAX_PAYLOAD_BYTES = 32 * 1024
 PREFERRED_NODE_ALIAS_MAX_LENGTH = 128
 PREFERRED_NODE_DESCRIPTION_MAX_LENGTH = 512
-PER_NODE_CONFIG_KEYS = ("perNodeConfig", "PER_NODE_CONFIG")
-PER_NODE_CONFIG_SYSTEM_KEYS = {
-  "INSTANCE_ID",
-  "CHAINSTORE_PEERS",
-  "CHAINSTORE_RESPONSE_KEY",
-  "CONTAINER_RESOURCES",
-  "CONTAINER_USER",
-  "CLOUDFLARE_TOKEN",
-  "CR",
-  "CR_DATA",
-  "ENV_OVERRIDES",
-  "FIXED_SIZE_VOLUMES",
-  "IMAGE",
-  "NGROK_AUTH_TOKEN",
-  "PER_NODE_TARGET_NODES",
-  "PLUGIN_NAME",
-  "PLUGIN_SIGNATURE",
-  "RESET",
-  "SIGNATURE",
-  "SEMAPHORE",
-  "SEMAPHORED_KEYS",
-  "SYNC",
-  "TUNNEL_ENGINE",
-  "TUNNEL_ENGINE_ENABLED",
-}
-PER_NODE_CONFIG_STRUCTURED_KEYS = {
-  "default",
-  "DEFAULT",
-  "byIndex",
-  "BY_INDEX",
-  "byNode",
-  "BY_NODE",
-}
 SENSITIVE_LOG_KEY_PARTS = (
   "BEGINPRIVATEKEY",
   "BEGINRSAPRIVATEKEY",
@@ -3237,7 +3214,7 @@ class _DeeployMixin:
         for key in PER_NODE_CONFIG_KEYS:
           if key not in instance:
             continue
-          for overlay in self._iter_per_node_overlays(instance[key]):
+          for overlay in iter_per_node_overlays(instance[key]):
             if has_shmem(overlay):
               return True
     return False
@@ -3261,8 +3238,8 @@ class _DeeployMixin:
       return plugin_instance
 
     key = present_keys[0]
-    if key != "PER_NODE_CONFIG":
-      plugin_instance["PER_NODE_CONFIG"] = plugin_instance.pop(key)
+    if key != CANONICAL_PER_NODE_CONFIG_KEY:
+      plugin_instance[CANONICAL_PER_NODE_CONFIG_KEY] = plugin_instance.pop(key)
     return plugin_instance
 
   def _get_request_per_node_config(self, inputs):
@@ -3306,21 +3283,8 @@ class _DeeployMixin:
       raise ValueError(
         f"Top-level perNodeConfig cannot be combined with plugin-level PER_NODE_CONFIG: {existing_keys}."
       )
-    instance_payload["PER_NODE_CONFIG"] = self.deepcopy(request_config)
+    instance_payload[CANONICAL_PER_NODE_CONFIG_KEY] = self.deepcopy(request_config)
     return instance_payload
-
-  def _deep_merge_plugin_config(self, base, overlay):
-    if isinstance(base, dict) and isinstance(overlay, dict):
-      merged = self.deepcopy(base)
-      for key, value in overlay.items():
-        if key == "SEMAPHORED_KEYS" and isinstance(merged.get(key), list) and isinstance(value, list):
-          merged[key] = sorted(set(merged[key]) | set(value))
-        elif key in merged:
-          merged[key] = self._deep_merge_plugin_config(merged[key], value)
-        else:
-          merged[key] = self.deepcopy(value)
-      return merged
-    return self.deepcopy(overlay)
 
   def _is_cockroachdb_plugin_instance(self, instance):
     if not isinstance(instance, dict):
@@ -3409,7 +3373,7 @@ class _DeeployMixin:
   def _cockroachdb_cert_bundle_complete(self, instance, target_nodes):
     if not isinstance(instance, dict) or not target_nodes:
       return False
-    raw_config = instance.get("PER_NODE_CONFIG")
+    raw_config = instance.get(CANONICAL_PER_NODE_CONFIG_KEY)
     if not isinstance(raw_config, dict):
       return False
     try:
@@ -3572,7 +3536,8 @@ class _DeeployMixin:
       self._validate_cockroachdb_auth_env(env)
       env["CRDB_SECURE"] = "true"
 
-      raw_config = plugin_instance.get("PER_NODE_CONFIG")
+      self._canonicalize_per_node_config_key(plugin_instance)
+      raw_config = plugin_instance.get(CANONICAL_PER_NODE_CONFIG_KEY)
       existing_complete = self._cockroachdb_cert_bundle_complete(plugin_instance, target_nodes)
       cert_bundle = None if existing_complete else self._generate_cockroachdb_cert_bundle(target_nodes)
 
@@ -3589,7 +3554,7 @@ class _DeeployMixin:
           overlay_env.update(cert_bundle[node])
         overlay["ENV"] = overlay_env
         by_node[node] = overlay
-      plugin_instance["PER_NODE_CONFIG"] = {"byNode": by_node}
+      plugin_instance[CANONICAL_PER_NODE_CONFIG_KEY] = {"byNode": by_node}
 
     return inputs
 
@@ -3648,7 +3613,8 @@ class _DeeployMixin:
         env["CRDB_NODE_COUNT"] = str(len(target_nodes))
         env["CRDB_HOSTNAMES"] = ",".join(hostnames)
 
-        raw_config = instance.get("PER_NODE_CONFIG")
+        self._canonicalize_per_node_config_key(instance)
+        raw_config = instance.get(CANONICAL_PER_NODE_CONFIG_KEY)
         by_node = {}
         for index, node in enumerate(target_nodes):
           overlay = self._overlay_for_node(raw_config, node, index) if raw_config else {}
@@ -3661,89 +3627,11 @@ class _DeeployMixin:
           overlay_env.update(cert_bundle[node])
           overlay["ENV"] = overlay_env
           by_node[node] = overlay
-        instance["PER_NODE_CONFIG"] = {"byNode": by_node}
+        instance[CANONICAL_PER_NODE_CONFIG_KEY] = {"byNode": by_node}
     return pipeline
 
   def _normalize_per_node_config(self, raw_config):
-    if raw_config is None:
-      return {}, {}, {}
-    if not isinstance(raw_config, dict):
-      raise ValueError("perNodeConfig must be a dictionary.")
-
-    has_structured_keys = any(
-      key in raw_config
-      for key in PER_NODE_CONFIG_STRUCTURED_KEYS
-    )
-    if has_structured_keys:
-      extra_keys = [key for key in raw_config if key not in PER_NODE_CONFIG_STRUCTURED_KEYS]
-      if extra_keys:
-        raise ValueError(
-          f"perNodeConfig cannot mix structured keys with direct node selectors: {extra_keys}."
-        )
-      default_overlay = self._get_per_node_structured_section(
-        raw_config, "default", ("default", "DEFAULT")
-      )
-      by_index = self._get_per_node_structured_section(
-        raw_config, "byIndex", ("byIndex", "BY_INDEX")
-      )
-      by_node = self._get_per_node_structured_section(
-        raw_config, "byNode", ("byNode", "BY_NODE")
-      )
-    else:
-      default_overlay = {}
-      by_index = {}
-      by_node = raw_config
-
-    if not isinstance(default_overlay, dict):
-      raise ValueError("perNodeConfig.default must be a dictionary.")
-    if not isinstance(by_index, dict):
-      raise ValueError("perNodeConfig.byIndex must be a dictionary.")
-    if not isinstance(by_node, dict):
-      raise ValueError("perNodeConfig.byNode must be a dictionary.")
-
-    normalized_by_index = {}
-    for raw_index, overlay in by_index.items():
-      if not isinstance(overlay, dict):
-        raise ValueError(f"perNodeConfig.byIndex[{raw_index!r}] must be a dictionary.")
-      try:
-        index = int(raw_index)
-      except (TypeError, ValueError) as exc:
-        raise ValueError(f"perNodeConfig.byIndex key {raw_index!r} must be an integer index.") from exc
-      if index < 0:
-        raise ValueError(f"perNodeConfig.byIndex key {raw_index!r} must be non-negative.")
-      normalized_by_index[index] = overlay
-
-    normalized_by_node = {}
-    for raw_node, overlay in by_node.items():
-      if not isinstance(overlay, dict):
-        raise ValueError(f"perNodeConfig.byNode[{raw_node!r}] must be a dictionary.")
-      normalized_by_node[str(raw_node)] = overlay
-
-    for overlay in [default_overlay, *normalized_by_index.values(), *normalized_by_node.values()]:
-      self._validate_per_node_overlay(overlay)
-
-    return default_overlay, normalized_by_index, normalized_by_node
-
-  def _get_per_node_structured_section(self, raw_config, section_name, aliases):
-    present_aliases = [key for key in aliases if key in raw_config]
-    if len(present_aliases) > 1:
-      raise ValueError(
-        f"perNodeConfig.{section_name} has duplicate aliases: {present_aliases}."
-      )
-    if not present_aliases:
-      return {}
-    value = raw_config[present_aliases[0]]
-    if value is None:
-      return {}
-    if not isinstance(value, dict):
-      raise ValueError(f"perNodeConfig.{section_name} must be a dictionary.")
-    return value
-
-  def _iter_per_node_overlays(self, raw_config):
-    default_overlay, by_index, by_node = self._normalize_per_node_config(raw_config)
-    for overlay in [default_overlay, *by_index.values(), *by_node.values()]:
-      if overlay:
-        yield overlay
+    return normalize_per_node_config(raw_config)
 
   def _redact_per_node_config_for_log(self, plugins):
     deepcopy = getattr(self, "deepcopy", copy.deepcopy)
@@ -3768,40 +3656,6 @@ class _DeeployMixin:
     redact(redacted)
     return redacted
 
-  def _validate_per_node_overlay(self, overlay):
-    for key in overlay:
-      normalized_key = str(key).upper()
-      if key in PER_NODE_CONFIG_KEYS:
-        raise ValueError("Nested perNodeConfig overlays are not supported.")
-      if normalized_key in PER_NODE_CONFIG_SYSTEM_KEYS:
-        raise ValueError(
-          f"perNodeConfig cannot override system-managed or preflighted key '{key}'."
-        )
-    return True
-
-  def _per_node_lookup_keys(self, node_addr):
-    values = []
-    if node_addr is not None:
-      values.append(str(node_addr))
-      if str(node_addr).startswith("0xai_"):
-        values.append(str(node_addr)[5:])
-      else:
-        values.append(f"0xai_{node_addr}")
-
-    result = []
-    seen = set()
-    for value in values:
-      if value and value not in seen:
-        result.append(value)
-        seen.add(value)
-    return result
-
-  def _per_node_target_lookup_set(self, nodes):
-    lookup = set()
-    for node in nodes or []:
-      lookup.update(self._per_node_lookup_keys(node))
-    return lookup
-
   def _iter_per_node_configs(self, plugins):
     for plugin in plugins or []:
       instances = plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []
@@ -3813,35 +3667,10 @@ class _DeeployMixin:
             yield instance[key]
 
   def _validate_per_node_config_selectors(self, plugins, nodes):
-    node_count = len(nodes or [])
-    node_lookup = self._per_node_target_lookup_set(nodes)
-    for raw_config in self._iter_per_node_configs(plugins):
-      _default_overlay, by_index, by_node = self._normalize_per_node_config(raw_config)
-      out_of_range = [idx for idx in by_index if idx >= node_count]
-      if out_of_range:
-        raise ValueError(
-          f"perNodeConfig.byIndex contains indexes outside target nodes: {out_of_range}."
-        )
-      unknown_nodes = [node for node in by_node if node not in node_lookup]
-      if unknown_nodes:
-        raise ValueError(
-          f"perNodeConfig.byNode contains unknown target node selector(s): {unknown_nodes}."
-        )
-    return True
+    return validate_per_node_selectors(self._iter_per_node_configs(plugins), nodes)
 
   def _overlay_for_node(self, raw_config, node_addr, node_index):
-    default_overlay, by_index, by_node = self._normalize_per_node_config(raw_config)
-    overlay = self.deepcopy(default_overlay)
-
-    if node_index in by_index:
-      overlay = self._deep_merge_plugin_config(overlay, by_index[node_index])
-
-    for lookup_key in self._per_node_lookup_keys(node_addr):
-      if lookup_key in by_node:
-        overlay = self._deep_merge_plugin_config(overlay, by_node[lookup_key])
-        break
-
-    return overlay
+    return per_node_overlay_for_node(raw_config, node_addr, node_index, copy_fn=self.deepcopy)
 
   def _materialize_plugins_for_node(self, plugins, node_addr, node_index):
     materialized = self.deepcopy(plugins)
@@ -3853,7 +3682,7 @@ class _DeeployMixin:
         raw_config = self._pop_per_node_config(instance)
         overlay = self._overlay_for_node(raw_config, node_addr, node_index)
         if overlay:
-          merged = self._deep_merge_plugin_config(instance, overlay)
+          merged = deep_merge_config(instance, overlay, copy_fn=self.deepcopy)
           instance.clear()
           instance.update(merged)
     return materialized
@@ -4156,6 +3985,8 @@ class _DeeployMixin:
 
     if not name_to_key:
       # Still allow semaphored references when only direct SEMAPHORE references exist.
+      # Known limitation: this fallback scans only top-level DYNAMIC_ENV. Per-node
+      # DYNAMIC_ENV overlays are resolved in the plugin_name provider path below.
       known_keys = sorted(explicit_key_to_provider.keys())
       for plugin in plugins:
         for instance in plugin.get(self.ct.CONFIG_PLUGIN.K_INSTANCES) or []:
@@ -4238,7 +4069,7 @@ class _DeeployMixin:
         for key in PER_NODE_CONFIG_KEYS:
           if key not in instance:
             continue
-          for overlay in self._iter_per_node_overlays(instance[key]):
+          for overlay in iter_per_node_overlays(instance[key]):
             consumer_sem_keys.update(resolve_dynamic_env(overlay, update_container_keys=False))
         if consumer_sem_keys:
           instance[DEEPLOY_RUNTIME_KEYS.SEMAPHORED_KEYS] = sorted(consumer_sem_keys)

@@ -373,3 +373,10 @@ Only append entries for critical or fundamental RedMesh backend changes, discove
 - Change: bounded API4 high-limit probing at an effective request limit of `1000` and changed API3 mass-assignment rollback to fail when the probe introduced a previously absent field instead of writing `false` and claiming rollback success.
 - Verification: targeted API/graybox suite passed with `306 passed, 10 subtests`; broad `extensions/business/cybersec/red_mesh/tests -q` run passed `1461` tests and `36` subtests with one unrelated pre-existing failure for missing `docs/suricata-security-onion-examples.md`.
 - Horizontal insight: RedMesh stateful probe safety must be enforced at the first target-mutating byte, not only around the vulnerability-attribution request; request-count budgets also need per-request work bounds for resource-consumption probes.
+
+### 2026-06-29T10:54:33Z
+
+- Change: made launcher-owned scan finalization recover stale intermediate `COLLECTING`, `ANALYZING`, and `FINALIZING` jobs when no pass report has been committed, no archive CID exists, all expected workers are finished, and every worker report CID is present.
+- Change: added explicit state-machine retry transitions from `ANALYZING` and `FINALIZING` back to `COLLECTING`; non-launcher nodes continue to skip finalization recovery.
+- Verification: `docker exec rm3 bash -lc 'cd /edge_node && python3 -m unittest extensions.business.cybersec.red_mesh.tests.test_state_machine extensions.business.cybersec.red_mesh.tests.test_api.TestPhase2PassFinalization extensions.business.cybersec.red_mesh.tests.test_api.TestPhase3Archive'` passed with 51 tests.
+- Horizontal insight: launcher-side finalization recovery should re-enter the existing pass aggregation/report/archive path only after worker-owned report artifacts are durable; worker and observer nodes must not mutate launcher-owned finalization state.

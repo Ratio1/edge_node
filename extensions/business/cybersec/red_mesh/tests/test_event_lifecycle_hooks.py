@@ -174,6 +174,53 @@ class TestEventLifecycleHooks(unittest.TestCase):
     self.assertIsNotNone(status["last_failure_at"])
 
   @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
+  def test_repeated_invalid_auth_failures_collapse_history_and_timeline(self, deliver):
+    def _invalid_auth(_owner, event, integration_id="wazuh"):
+      return {
+        "status": "error",
+        "integration_id": integration_id,
+        "event_id": event["event_id"],
+        "error": "invalid_auth_config",
+      }
+
+    deliver.side_effect = _invalid_auth
+    owner = _owner()
+    job_specs = _job_specs()
+
+    emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.job.started",
+      event_action="started",
+      pass_nr=1,
+    )
+    emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.attestation.submitted",
+      event_action="submitted",
+      pass_nr=1,
+    )
+    emit_lifecycle_event(
+      owner,
+      job_specs,
+      event_type="redmesh.job.pass_completed",
+      event_action="pass_completed",
+      pass_nr=1,
+    )
+
+    soc_status = job_specs["soc_event_status"]
+    self.assertEqual(len(soc_status["history"]), 1)
+    self.assertEqual(soc_status["history"][0]["error_class"], "invalid_auth_config")
+    self.assertEqual(soc_status["history"][0]["suppressed_count"], 2)
+    self.assertEqual(soc_status["history"][0]["last_event_type"], "redmesh.job.pass_completed")
+    self.assertEqual(soc_status["failure_count"], 3)
+    self.assertEqual(soc_status["consecutive_failure_count"], 3)
+    self.assertEqual(soc_status["suppressed_duplicate_count"], 2)
+    self.assertEqual(soc_status["last_error_class"], "invalid_auth_config")
+    self.assertEqual(owner._emit_timeline_event.call_count, 1)
+
+  @patch("extensions.business.cybersec.red_mesh.services.event_hooks.deliver_redmesh_event")
   def test_export_attestation_and_finding_hooks_use_specific_event_types(self, deliver):
     seen = []
 

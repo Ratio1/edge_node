@@ -43,6 +43,7 @@ class ModelTestJobConfig:
   model_provider_secret_store_key_version: str = ""
   model_provider_secret_store_key_source: str = ""
   model_provider_secret_store_unsafe_fallback: bool = False
+  evaluator_id: str = ""
   test_set_id: str = ""
   test_set_catalog: list = None
   selected_test_set_metadata: list = None
@@ -64,6 +65,7 @@ class ModelTestJobConfig:
       task_description=d.get("task_description", ""),
       created_by_name=d.get("created_by_name", ""),
       created_by_id=d.get("created_by_id", ""),
+      evaluator_id=d.get("evaluator_id", ""),
       test_set_id=d.get("test_set_id", ""),
       test_sets=list(d.get("test_sets") or []),
       test_set_catalog=list(d.get("test_set_catalog") or []),
