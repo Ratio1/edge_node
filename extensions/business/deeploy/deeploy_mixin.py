@@ -3286,6 +3286,10 @@ class _DeeployMixin:
     instance_payload[CANONICAL_PER_NODE_CONFIG_KEY] = self.deepcopy(request_config)
     return instance_payload
 
+  # TODO: Move CockroachDB-specific service detection, target policy, credential
+  # validation, certificate generation, and per-node materialization behind a
+  # generic Deeploy managed-service abstraction when a second stateful service
+  # needs the same lifecycle hooks.
   def _is_cockroachdb_plugin_instance(self, instance):
     if not isinstance(instance, dict):
       return False
@@ -4987,6 +4991,9 @@ class _DeeployMixin:
       deeploy_specs[DEEPLOY_KEYS.CURRENT_TARGET_NODES] = chainstore_peers
       deeploy_specs[DEEPLOY_KEYS.DATE_UPDATED] = self.time()
     base_pipeline[NetMonCt.DEEPLOY_SPECS] = self.deepcopy(deeploy_specs)
+    # TODO: Delegate service-specific persisted-pipeline preparation through
+    # the managed-service abstraction when CockroachDB is no longer the only
+    # service with generated per-node runtime material.
     self._prepare_cockroachdb_secure_config_for_pipeline(base_pipeline, chainstore_peers)
 
     chainstore_response_keys = self.defaultdict(list)
