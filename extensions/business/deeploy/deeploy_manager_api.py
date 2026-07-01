@@ -666,6 +666,8 @@ class DeeployManagerApiPlugin(
         # TODO: Add check if jobType resources match the requested resources.
 
         deployment_nodes = self._check_nodes_availability(inputs)
+        # TODO: Abstract service-specific target-change validation once Deeploy
+        # supports more stateful services beyond CockroachDB.
         self._validate_cockroachdb_target_change(
           current_nodes=[],
           requested_nodes=deployment_nodes,
@@ -722,6 +724,8 @@ class DeeployManagerApiPlugin(
         if not deployment_targets:
           msg = f"{DEEPLOY_ERRORS.NODES2}: Update request must include at least one target node."
           raise ValueError(msg)
+        # TODO: Route service-specific update constraints through a generic
+        # service policy layer once additional managed services are added.
         self._validate_cockroachdb_target_change(
           current_nodes=current_nodes,
           requested_nodes=deployment_targets,
