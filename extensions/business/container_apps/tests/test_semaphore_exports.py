@@ -1,4 +1,5 @@
 import unittest
+import json
 
 from extensions.business.container_apps.tests.support import make_container_app_runner
 
@@ -48,6 +49,30 @@ class ContainerAppRunnerSemaphoreExportTests(unittest.TestCase):
     self.assertEqual(plugin.semaphore_env["CONTAINER_IP"], "172.18.0.5")
     self.assertEqual(plugin.semaphore_env["PORT"], "3005")
     self.assertEqual(plugin.semaphore_env["URL"], "http://127.0.0.1:3005")
+
+  def test_setup_env_and_ports_sanitizes_hyphenated_semaphore_env_names(self):
+    plugin = make_container_app_runner()
+    plugin.ee_id = "node-id"
+    plugin.ee_addr = "0xai_node"
+    plugin.dynamic_env = {}
+    plugin.cfg_env = {}
+    plugin.cfg_semaphored_keys = ["my-semaphore-key"]
+    plugin.extra_ports_mapping = {}
+    plugin.json_dumps = json.dumps
+    plugin.semaphore_get_env = lambda: {
+      "my-semaphore-key_API_HOST": "127.0.0.1",
+      "my-semaphore-key_API_PORT": "8000",
+      "UNCHANGED_API_URL": "http://127.0.0.1:8000",
+    }
+
+    plugin._setup_env_and_ports()
+
+    self.assertEqual(plugin.env["MY_SEMAPHORE_KEY_API_HOST"], "127.0.0.1")
+    self.assertEqual(plugin.env["MY_SEMAPHORE_KEY_API_PORT"], "8000")
+    self.assertEqual(plugin.env["UNCHANGED_API_URL"], "http://127.0.0.1:8000")
+    self.assertEqual(plugin.env["R1EN_SEMAPHORED_KEYS"], '["MY_SEMAPHORE_KEY"]')
+    self.assertNotIn("my-semaphore-key_API_HOST", plugin.env)
+    self.assertNotIn("my-semaphore-key_API_PORT", plugin.env)
 
 
 if __name__ == "__main__":
