@@ -94,6 +94,11 @@ class R1fsSecretStore:
     key, _metadata = self._resolve_secret_store_key()
     return key
 
+  def resolve_secret_store_key(self) -> tuple[str, dict]:
+    secret_key, key_metadata = self._resolve_secret_store_key()
+    self.last_key_metadata = dict(key_metadata or {})
+    return secret_key, dict(key_metadata or {})
+
   def save_graybox_credentials(self, job_id: str, payload: dict) -> str:
     secret_key, key_metadata = self._resolve_secret_store_key()
     self.last_key_metadata = dict(key_metadata or {})

@@ -28,6 +28,7 @@ from .constants import (
 )
 from .evaluators import resolve_evaluator_option
 from .node_selection import select_model_test_execution_node
+from .raw_evidence import initial_raw_evidence_metadata
 from .runner import ModelTestProviderError, OpenAICompatibleProviderClient
 from .secrets import (
   _runtime_provider,
@@ -546,6 +547,7 @@ def launch_model_test(
     job_type=MODEL_TEST_JOB_TYPE,
     model_test_summary={"overall_status": "queued"},
     model_test_node_selection=node_selection,
+    model_test_raw_evidence=initial_raw_evidence_metadata(sanitized_config, cfg),
     blockchain_attestation_enabled=bool(blockchain_attestation_enabled),
     start_attestation_required=bool(blockchain_attestation_enabled),
     end_attestation_required=bool(blockchain_attestation_enabled),

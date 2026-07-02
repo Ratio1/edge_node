@@ -4,6 +4,7 @@ from ..model_test_sanitization import (
   sanitize_model_test_error_class,
   sanitize_model_test_results,
   sanitize_model_test_summary,
+  sanitize_raw_evidence_metadata,
 )
 from ..repositories import ArtifactRepository, JobStateRepository
 from .reconciliation import reconcile_job_workers
@@ -100,6 +101,11 @@ def _sanitize_model_test_worker_payload(payload: dict, fallback_summary: dict) -
   sanitized["model_test_summary"] = summary
   if "model_test_results" in sanitized:
     sanitized["model_test_results"] = sanitize_model_test_results(sanitized.get("model_test_results"))
+  if "model_test_raw_evidence" in sanitized or "model_test_raw_evidence_metadata" in sanitized:
+    sanitized["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(
+      sanitized.get("model_test_raw_evidence") or sanitized.get("model_test_raw_evidence_metadata")
+    )
+    sanitized.pop("model_test_raw_evidence_metadata", None)
   error_class = sanitize_model_test_error_class(
     sanitized.get("error_class")
     or summary.get("error_class")
@@ -126,6 +132,11 @@ def _sanitize_model_test_job_specs(job_specs: dict) -> dict:
   sanitized["model_test_summary"] = summary
   if "model_test_results" in sanitized:
     sanitized["model_test_results"] = sanitize_model_test_results(sanitized.get("model_test_results"))
+  if "model_test_raw_evidence" in sanitized or "model_test_raw_evidence_metadata" in sanitized:
+    sanitized["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(
+      sanitized.get("model_test_raw_evidence") or sanitized.get("model_test_raw_evidence_metadata")
+    )
+    sanitized.pop("model_test_raw_evidence_metadata", None)
   error_class = sanitize_model_test_error_class(
     sanitized.get("error_class")
     or summary.get("error_class")
@@ -442,6 +453,10 @@ def get_job_progress(owner, job_id: str):
       "model_test_summary": sanitize_model_test_summary(job_specs.get("model_test_summary")),
       "model_test_node_selection": job_specs.get("model_test_node_selection"),
     })
+    if "model_test_raw_evidence" in job_specs:
+      response["model_test_raw_evidence"] = sanitize_raw_evidence_metadata(
+        job_specs.get("model_test_raw_evidence")
+      )
   return response
 
 
