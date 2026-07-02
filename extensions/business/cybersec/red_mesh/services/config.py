@@ -398,6 +398,8 @@ def get_graybox_budgets_config(owner):
 
 def get_model_testing_config(owner):
   """Return normalized Model Testing capability config."""
+  from ..model_testing.evaluators import infer_evaluator_method
+
   def _bounded_text(value, *, maximum=200):
     text = str(value or "").strip()
     if not text or len(text) > maximum:
@@ -423,18 +425,27 @@ def get_model_testing_config(owner):
       base_url = str(entry.get("base_url") or "").strip()
       model = _bounded_text(entry.get("model"), maximum=200)
       api_key_env = _bounded_text(entry.get("api_key_env"), maximum=120)
-      if not all((label, provider_label, base_url, model, api_key_env)):
+      api_key = _bounded_text(entry.get("API_KEY"), maximum=4096)
+      if not api_key:
+        api_key = _bounded_text(entry.get("api_key"), maximum=4096)
+      method = infer_evaluator_method(entry)
+      if not all((label, provider_label, base_url, model)) or not (api_key_env or api_key):
         continue
-      normalized.append({
+      normalized_entry = {
         "id": evaluator_id,
         "label": label,
         "provider_label": provider_label,
         "adapter": adapter,
         "base_url": base_url,
         "model": model,
-        "api_key_env": api_key_env,
+        "method": method,
         "enabled": bool(entry.get("enabled", True)),
-      })
+      }
+      if api_key_env:
+        normalized_entry["api_key_env"] = api_key_env
+      if api_key:
+        normalized_entry["API_KEY"] = api_key
+      normalized.append(normalized_entry)
       seen_ids.add(evaluator_id)
     return normalized
 

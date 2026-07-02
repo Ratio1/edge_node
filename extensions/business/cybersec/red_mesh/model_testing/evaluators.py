@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from urllib.parse import urlsplit
 
 from .security import validate_provider_url
 
@@ -10,6 +11,11 @@ from .security import validate_provider_url
 HEURISTIC_EVALUATOR_ID = "heuristic_v1"
 HEURISTIC_EVALUATOR_METHOD = "local_heuristic_v1"
 LLM_EVALUATOR_METHOD = "openai_compatible_json_judge"
+MODERATION_EVALUATOR_METHOD = "openai_compatible_moderation"
+OPENAI_COMPATIBLE_EVALUATOR_METHODS = {
+  LLM_EVALUATOR_METHOD,
+  MODERATION_EVALUATOR_METHOD,
+}
 
 
 def _validation_error(message: str, *, error_class=None):
@@ -38,8 +44,36 @@ def _enabled_llm_presets(cfg):
   ]
 
 
+def infer_evaluator_method(preset):
+  method = str((preset or {}).get("method") or "").strip().lower()
+  if method in OPENAI_COMPATIBLE_EVALUATOR_METHODS:
+    return method
+
+  endpoint = str(
+    (preset or {}).get("endpoint")
+    or (preset or {}).get("endpoint_path")
+    or ""
+  ).strip().lower()
+  endpoint = endpoint.strip("/")
+  if endpoint in {"moderations", "v1/moderations"}:
+    return MODERATION_EVALUATOR_METHOD
+
+  parsed = urlsplit(str((preset or {}).get("base_url") or "").strip())
+  if parsed.path.rstrip("/").lower().endswith("/moderations"):
+    return MODERATION_EVALUATOR_METHOD
+
+  searchable = " ".join(
+    str((preset or {}).get(key) or "").strip().lower()
+    for key in ("id", "model", "label", "provider_label")
+  )
+  if "moderation" in searchable:
+    return MODERATION_EVALUATOR_METHOD
+
+  return LLM_EVALUATOR_METHOD
+
+
 def _preset_credentials_available(preset):
-  return bool(_api_key_from_env(str(preset.get("api_key_env") or "").strip()))
+  return bool(_api_key_from_preset(preset))
 
 
 def _safe_llm_option(preset):
@@ -49,7 +83,7 @@ def _safe_llm_option(preset):
     "kind": "llm",
     "provider_label": str(preset.get("provider_label") or "").strip(),
     "model": str(preset.get("model") or "").strip(),
-    "method": LLM_EVALUATOR_METHOD,
+    "method": infer_evaluator_method(preset),
   }
 
 
@@ -89,6 +123,14 @@ def _api_key_from_env(env_name):
   return value
 
 
+def _api_key_from_preset(preset):
+  for key in ("API_KEY", "api_key"):
+    value = str((preset or {}).get(key) or "").strip()
+    if value:
+      return value
+  return _api_key_from_env(str((preset or {}).get("api_key_env") or "").strip())
+
+
 def resolve_evaluator_option(cfg, evaluator_id=None):
   """Resolve an evaluator id into safe metadata and optional runtime provider."""
   selected_id = str(evaluator_id or "").strip() or default_evaluator_id(cfg)
@@ -104,7 +146,7 @@ def resolve_evaluator_option(cfg, evaluator_id=None):
         "selected evaluator provider URL is unavailable",
         error_class="provider_unreachable",
       )
-    api_key = _api_key_from_env(str(preset.get("api_key_env") or "").strip())
+    api_key = _api_key_from_preset(preset)
     if not api_key:
       return None, None, _validation_error(
         "selected evaluator credentials are unavailable",
@@ -116,6 +158,7 @@ def resolve_evaluator_option(cfg, evaluator_id=None):
       "provider_label": safe_option["provider_label"],
       "base_url": url_info["base_url"],
       "model": safe_option["model"],
+      "method": safe_option["method"],
       "api_key": api_key,
     }
     return safe_option, runtime_provider, None
