@@ -131,7 +131,9 @@ class _ContainerUtilsMixin:
     # Add semaphore keys if present
     semaphored_keys = getattr(self, 'cfg_semaphored_keys', None)
     if semaphored_keys:
-      dct_env["R1EN_SEMAPHORED_KEYS"] = self.json_dumps(semaphored_keys)
+      dct_env["R1EN_SEMAPHORED_KEYS"] = self.json_dumps(
+        self._sanitize_final_semaphored_keys(semaphored_keys)
+      )
 
     return dct_env
 
@@ -718,6 +720,20 @@ class _ContainerUtilsMixin:
     return "some_other_value"
 
 
+  @staticmethod
+  def _sanitize_semaphore_env_var_name(name):
+    return str(name).replace("-", "_").upper()
+
+
+  def _sanitize_final_semaphored_keys(self, semaphored_keys):
+    if isinstance(semaphored_keys, (list, tuple)):
+      return [
+        self._sanitize_semaphore_env_var_name(key)
+        for key in semaphored_keys
+      ]
+    return self._sanitize_semaphore_env_var_name(semaphored_keys)
+
+
   def _configure_dynamic_env(self):
     """
     Set up dynamic environment variables based on configuration.
@@ -1127,6 +1143,7 @@ class _ContainerUtilsMixin:
     if hasattr(self, 'semaphore_get_env'):
       semaphore_env = self.semaphore_get_env()
       if semaphore_env:
+        sanitized_semaphore_env = {}
         log_lines = [
           "=" * 60,
           "SEMAPHORE ENV INJECTION",
@@ -1134,10 +1151,12 @@ class _ContainerUtilsMixin:
           f"  Adding {len(semaphore_env)} env vars from semaphored plugins:",
         ]
         for key, value in semaphore_env.items():
-          log_lines.append(f"    {key} = {value}")
+          sanitized_key = self._sanitize_semaphore_env_var_name(key)
+          sanitized_semaphore_env[sanitized_key] = value
+          log_lines.append(f"    {sanitized_key} = {value}")
         log_lines.append("=" * 60)
         self.Pd("\n".join(log_lines))
-        self.env.update(semaphore_env)
+        self.env.update(sanitized_semaphore_env)
     # endif semaphore env
 
     if self.cfg_env:

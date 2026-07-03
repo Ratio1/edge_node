@@ -73,7 +73,7 @@ def infer_evaluator_method(preset):
 
 
 def _preset_credentials_available(preset):
-  return bool(_api_key_from_env(str(preset.get("api_key_env") or "").strip()))
+  return bool(_api_key_from_preset(preset))
 
 
 def _safe_llm_option(preset):
@@ -123,6 +123,14 @@ def _api_key_from_env(env_name):
   return value
 
 
+def _api_key_from_preset(preset):
+  for key in ("API_KEY", "api_key"):
+    value = str((preset or {}).get(key) or "").strip()
+    if value:
+      return value
+  return _api_key_from_env(str((preset or {}).get("api_key_env") or "").strip())
+
+
 def resolve_evaluator_option(cfg, evaluator_id=None):
   """Resolve an evaluator id into safe metadata and optional runtime provider."""
   selected_id = str(evaluator_id or "").strip() or default_evaluator_id(cfg)
@@ -138,7 +146,7 @@ def resolve_evaluator_option(cfg, evaluator_id=None):
         "selected evaluator provider URL is unavailable",
         error_class="provider_unreachable",
       )
-    api_key = _api_key_from_env(str(preset.get("api_key_env") or "").strip())
+    api_key = _api_key_from_preset(preset)
     if not api_key:
       return None, None, _validation_error(
         "selected evaluator credentials are unavailable",

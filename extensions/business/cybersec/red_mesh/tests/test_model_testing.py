@@ -172,6 +172,38 @@ class TestModelTestingCapability(unittest.TestCase):
     self.assertEqual(status["model_testing"]["default_evaluator_model_label"], "Koala text moderation")
     self.assertNotIn("RM_TEST_KOALA_KEY", str(status))
 
+  def test_capability_status_includes_inline_key_koala_without_env(self):
+    secret = "inline-koala-secret"
+    owner = _owner(cfg_model_testing={
+      "ENABLED": True,
+      "EVALUATOR_MODELS": [{
+        "id": "koala_text_moderation",
+        "label": "Koala text moderation",
+        "provider_label": "Koala",
+        "adapter": "openai_compatible",
+        "base_url": f"https://{PUBLIC_TEST_IP}/v1/moderations",
+        "model": "koala-text-moderation",
+        "API_KEY": secret,
+        "enabled": True,
+      }],
+      "DEFAULT_EVALUATOR_ID": "koala_text_moderation",
+    })
+
+    with patch.dict("os.environ", {"RM_TEST_KOALA_KEY": ""}, clear=False):
+      status = get_capability_status(owner)
+
+    options = status["model_testing"]["evaluator_options"]
+    self.assertEqual(options[0]["id"], "koala_text_moderation")
+    self.assertEqual(options[0]["method"], MODERATION_EVALUATOR_METHOD)
+    self.assertEqual(status["model_testing"]["default_evaluator_id"], "koala_text_moderation")
+    self.assertEqual(status["model_testing"]["default_evaluator_model_label"], "Koala text moderation")
+    status_text = str(status)
+    self.assertNotIn(secret, status_text)
+    self.assertNotIn("API_KEY", status_text)
+    self.assertNotIn("api_key", status_text)
+    self.assertNotIn("api_key_env", status_text)
+    self.assertNotIn(f"https://{PUBLIC_TEST_IP}", status_text)
+
   def test_capability_status_includes_llm_evaluator_with_credentials_when_enabled(self):
     owner = _owner(cfg_model_testing={
       "ENABLED": True,
@@ -1159,6 +1191,60 @@ class TestModelTestingProviderSecurity(unittest.TestCase):
     self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{PUBLIC_TEST_IP}/v1")
     self.assertNotIn("preset-secret", str(stored_config))
     self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", str(stored_config))
+
+  def test_launch_resolves_llm_evaluator_preset_secret_from_inline_key(self):
+    inline_secret = "inline-evaluator-secret"
+    env_secret = "env-evaluator-secret"
+    owner = _owner(
+      cfg_model_testing={
+        "ENABLED": True,
+        "EVALUATOR_MODELS": [{
+          "id": "koala_text_moderation",
+          "label": "Koala text moderation",
+          "provider_label": "Koala",
+          "adapter": "openai_compatible",
+          "base_url": f"https://{PUBLIC_TEST_IP}/v1/moderations",
+          "model": "koala-text-moderation",
+          "API_KEY": inline_secret,
+          "api_key_env": "RM_TEST_EVALUATOR_PRESET_KEY",
+          "enabled": True,
+        }],
+        "DEFAULT_EVALUATOR_ID": "koala_text_moderation",
+      },
+    )
+    kwargs = _valid_launch_kwargs(secret="tested-secret")
+    kwargs.pop("evaluator_id")
+
+    with patch.dict("os.environ", {"RM_TEST_EVALUATOR_PRESET_KEY": env_secret}, clear=False):
+      result = launch_model_test(owner, **kwargs)
+
+    self.assertNotIn("error", result)
+    self.assertEqual(result["job_config"]["evaluator_id"], "koala_text_moderation")
+    self.assertEqual(result["job_config"]["evaluator_model"]["kind"], "llm")
+    self.assertEqual(result["job_config"]["evaluator_model"]["provider_label"], "Koala")
+    self.assertEqual(result["job_config"]["evaluator_model"]["method"], MODERATION_EVALUATOR_METHOD)
+    result_text = str(result)
+    self.assertNotIn(inline_secret, result_text)
+    self.assertNotIn(env_secret, result_text)
+    self.assertNotIn("API_KEY", result_text)
+    self.assertNotIn("api_key", result_text)
+    self.assertNotIn("api_key_env", result_text)
+    self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", result_text)
+    self.assertNotIn(f"https://{PUBLIC_TEST_IP}", result_text)
+    stored_secret = owner.r1fs.add_json.call_args_list[0].args[0]
+    stored_config = owner.r1fs.add_json.call_args_list[1].args[0]
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["api_key"], inline_secret)
+    self.assertNotEqual(stored_secret["payload"]["evaluator_model"]["api_key"], env_secret)
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["base_url"], f"https://{PUBLIC_TEST_IP}/v1/moderations")
+    self.assertEqual(stored_secret["payload"]["evaluator_model"]["method"], MODERATION_EVALUATOR_METHOD)
+    stored_config_text = str(stored_config)
+    self.assertNotIn(inline_secret, stored_config_text)
+    self.assertNotIn(env_secret, stored_config_text)
+    self.assertNotIn("API_KEY", stored_config_text)
+    self.assertNotIn("api_key", stored_config_text)
+    self.assertNotIn("api_key_env", stored_config_text)
+    self.assertNotIn("RM_TEST_EVALUATOR_PRESET_KEY", stored_config_text)
+    self.assertNotIn(f"https://{PUBLIC_TEST_IP}", stored_config_text)
 
   def test_launch_persists_koala_moderation_evaluator_method(self):
     owner = _owner(
