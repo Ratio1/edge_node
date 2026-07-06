@@ -2,6 +2,8 @@
 TODO: example pipeline with additional explanations
 """
 import os
+from fnmatch import fnmatch
+from pathlib import Path
 
 from extensions.serving.base.base_llm_serving import BaseLlmServing as BaseServingProcess
 from llama_cpp import Llama, llama_cpp as llama_cpp_lib
@@ -203,10 +205,43 @@ class LlamaCppBaseServingProcess(BaseServingProcess):
           **model_params,
         )
       # endif local model path
-      return Llama.from_pretrained(
+      try:
+        from huggingface_hub import HfApi, hf_hub_download
+      except ImportError:
+        raise ImportError(
+          "Downloading Llama_cpp models from Hugging Face requires the huggingface-hub package. "
+          "Install it or configure MODEL_PATH to an existing local GGUF file."
+        )
+      # endtry
+
+      hf_api = HfApi(token=self.hf_token)
+      repo_files = hf_api.list_repo_files(repo_id=model_id, token=self.hf_token)
+      matching_files = [file for file in repo_files if fnmatch(file, model_filename)]
+      if len(matching_files) == 0:
+        raise ValueError(
+          f"No file found in {model_id} that matches {model_filename}. "
+          f"Available files: {self.json_dumps(repo_files)}"
+        )
+      # endif no matching files
+      if len(matching_files) > 1:
+        raise ValueError(
+          f"Multiple files found in {model_id} that match {model_filename}. "
+          f"Matching files: {self.json_dumps(matching_files)}"
+        )
+      # endif multiple matching files
+
+      matching_file = matching_files[0]
+      subfolder_path = Path(matching_file).parent
+      subfolder = None if str(subfolder_path) == "." else str(subfolder_path)
+      downloaded_model_path = hf_hub_download(
         repo_id=model_id,
-        filename=model_filename,
+        filename=Path(matching_file).name,
+        subfolder=subfolder,
         cache_dir=self.cache_dir,
+        token=self.hf_token,
+      )
+      return Llama(
+        model_path=downloaded_model_path,
         **model_params,
       )
 
