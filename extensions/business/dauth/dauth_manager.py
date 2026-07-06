@@ -227,7 +227,6 @@ class DauthManagerPlugin(
     self._start_request_monitor_thread()
     return
     
-  
   def on_request(self, request):
     self._track_request(request)
     return
@@ -325,7 +324,7 @@ class DauthManagerPlugin(
       }      
     }    
     """
-    if not self._is_dauth_server_enabled():
+    if not self._dauth_server_enabled:
       response = self.__get_response({
         'error': 'dAuth server is not registered as a dAuth oracle'
       })
@@ -350,7 +349,7 @@ class DauthManagerPlugin(
     """
     Store the full dAuth secret bundle for a job. Only protocol oracles can write.
     """
-    if not self._is_dauth_server_enabled():
+    if not self._dauth_server_enabled:
       response = self.__get_response({
         'error': 'dAuth server is not registered as a dAuth oracle'
       })
@@ -376,7 +375,7 @@ class DauthManagerPlugin(
     Return the full dAuth secret bundle for a job. Only nodes currently running the
     job in the R1FS-stored pipeline can read.
     """
-    if not self._is_dauth_server_enabled():
+    if not self._dauth_server_enabled:
       response = self.__get_response({
         'error': 'dAuth server is not registered as a dAuth oracle'
       })
