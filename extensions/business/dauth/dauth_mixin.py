@@ -198,25 +198,13 @@ class _DauthMixin(object):
     return str(job_id)
 
   def _build_secret_bundle_from_request(self, body, job_id):
-    secret_bundle = body.get("secret_bundle")
-    if secret_bundle is None:
-      plugin_secrets = body.get("plugin_secrets")
-      if plugin_secrets is None:
-        raise ValueError("Secret bundle is required.")
-      secret_bundle = {
-        "job_id": job_id,
-        "plugin_secrets": plugin_secrets,
-      }
-    if not isinstance(secret_bundle, dict):
-      raise ValueError("Secret bundle must be a dictionary.")
-
-    bundle_job_id = secret_bundle.get("job_id", job_id)
-    if str(bundle_job_id) != job_id:
-      raise ValueError("Secret bundle job_id does not match request job_id.")
-
-    secret_bundle = self.deepcopy(secret_bundle)
-    secret_bundle["job_id"] = job_id
-    return secret_bundle
+    job_secrets = body.get("job_secrets")
+    if not isinstance(job_secrets, dict):
+      raise ValueError("job_secrets must be a dictionary.")
+    return {
+      "job_id": job_id,
+      "job_secrets": self.deepcopy(job_secrets),
+    }
 
   def _save_dauth_job_secret_bundle(self, job_id, secret_bundle):
     result = self.chainstore_hset(

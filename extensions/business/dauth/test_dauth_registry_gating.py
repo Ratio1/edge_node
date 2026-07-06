@@ -344,7 +344,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       "EE_SENDER": "node-oracle",
       "EE_ETH_SENDER": "0xORACLE",
       "job_id": 7,
-      "plugin_secrets": {
+      "job_secrets": {
         "plugins": {
           "CONTAINER_APP_RUNNER": [{
             "instance_conf": {
@@ -365,7 +365,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")],
       {
         "job_id": "7",
-        "plugin_secrets": body["plugin_secrets"],
+        "job_secrets": body["job_secrets"],
       },
     )
 
@@ -375,7 +375,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       "EE_SENDER": "node-runner",
       "EE_ETH_SENDER": "0xRUNNER",
       "job_id": "7",
-      "plugin_secrets": {"plugins": {}},
+      "job_secrets": {"plugins": {}},
     }
 
     with self.assertRaisesRegex(ValueError, "not an oracle"):
@@ -389,10 +389,24 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
       "EE_SENDER": "node-oracle",
       "EE_ETH_SENDER": "0xORACLE",
       "job_id": "7",
-      "plugin_secrets": {"plugins": {}},
+      "job_secrets": {"plugins": {}},
     }
 
     with self.assertRaisesRegex(ValueError, "Invalid request signature"):
+      plugin.process_dauth_add_secrets_request(body)
+
+    self.assertNotIn((DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"), plugin._chainstore)
+
+  def test_add_secrets_rejects_legacy_plugin_secrets_shape(self):
+    plugin = _make_dauth_harness()
+    body = {
+      "EE_SENDER": "node-oracle",
+      "EE_ETH_SENDER": "0xORACLE",
+      "job_id": "7",
+      "plugin_secrets": {"plugins": {}},
+    }
+
+    with self.assertRaisesRegex(ValueError, "job_secrets must be a dictionary"):
       plugin.process_dauth_add_secrets_request(body)
 
     self.assertNotIn((DAUTH_JOB_SECRETS_CSTORE_HKEY, "7"), plugin._chainstore)
@@ -401,7 +415,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     plugin = _make_dauth_harness()
     bundle = {
       "job_id": "7",
-      "plugin_secrets": {
+      "job_secrets": {
         "plugins": {
           "CONTAINER_APP_RUNNER": [{
             "instance_conf": {
@@ -436,7 +450,7 @@ class DauthJobSecretEndpointTests(unittest.TestCase):
     plugin = _make_dauth_harness()
     plugin._chainstore[(DAUTH_JOB_SECRETS_CSTORE_HKEY, "7")] = {
       "job_id": "7",
-      "plugin_secrets": {"plugins": {}},
+      "job_secrets": {"plugins": {}},
     }
     plugin._chainstore[(DEEPLOY_JOBS_CSTORE_HKEY, "7")] = "cid-7"
     plugin._r1fs_data["cid-7"] = {
