@@ -27,13 +27,13 @@ from .edgeguard_cypher_guard import (
 
 __VER__ = '0.1.0.0'
 
-EDGEGUARD_MODEL_REPO = "ratio1/edgeguard-cypher-qwen3-4b-v0.5-preview-gguf"
-EDGEGUARD_MODEL_FILE = "edgeguard-cypher-qwen3-4b-v0.5-preview.Q4_K_M.gguf"
-EDGEGUARD_MODEL_DISPLAY_NAME = "EdgeGuard Cypher Qwen3 4B v0.5 Preview GGUF"
-EDGEGUARD_MODEL_ARTIFACT_SHA256 = "1d92a276e3608252197b7f64af3e31b825b7f6accd5cf9cd0ba491f4cf5c8258"
-EDGEGUARD_SOURCE_ADAPTER_SHA256 = "d1adf925ccf39cf699d3cc62f6f51af336a5b86d5907692e719405b1dde750df"
-EDGEGUARD_RUNTIME_HARNESS_VERSION = "EGM-019 v0.5.10"
-EDGEGUARD_RUNTIME_LIVE_GATE_RESULT = "34 / 38 = 89.47%"
+EDGEGUARD_MODEL_REPO = "ratio1/edgeguard-cypher-qwen3-4b-v0.9-graph-intent-gguf"
+EDGEGUARD_MODEL_FILE = "edgeguard-cypher-qwen3-4b-v0.9-graph-intent.Q4_K_M.gguf"
+EDGEGUARD_MODEL_DISPLAY_NAME = "EdgeGuard Cypher Qwen3 4B v0.9 Graph-Intent GGUF"
+EDGEGUARD_MODEL_ARTIFACT_SHA256 = "3fa90a71d1d0a1e1f91f05eb82a62dc345618849710c139aa76d0c820d644fbd"
+EDGEGUARD_SOURCE_ADAPTER_SHA256 = "128276d9425838afed9bf4bf9a185fccabedd1658c3ebe1030b3337ad3d8f88a"
+EDGEGUARD_RUNTIME_HARNESS_VERSION = "EGM-028 v0.9"
+EDGEGUARD_RUNTIME_LIVE_GATE_RESULT = "44 / 45 = 97.78%"
 
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
@@ -305,7 +305,7 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
       "format": "GGUF",
       "quantization": "Q4_K_M",
       "base_model": "Qwen/Qwen3-4B-Instruct-2507",
-      "continuation_of": "ratio1/edgeguard-cypher-qwen3-4b-v0.4-gguf",
+      "continuation_of": "ratio1/edgeguard-cypher-qwen3-4b-v0.8-feedback-validated-gguf",
       "artifact_sha256": EDGEGUARD_MODEL_ARTIFACT_SHA256,
       "schema_version": SCHEMA_VERSION,
       "schema": canonical_schema_surface(),
@@ -317,17 +317,17 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
       },
       "quality": {
         "training_method": "QLoRA SFT",
-        "dataset": "qwen-prompt-cypher-v0.5.3-generated-live-anchor-correction",
-        "source_adapter": "EGM-013 v0.5.3",
+        "dataset": "qwen-prompt-cypher-v0.9-graph-intent-coverage-v1",
+        "source_adapter": "EGM-028 v0.9 graph-intent stratified",
         "source_adapter_sha256": EDGEGUARD_SOURCE_ADAPTER_SHA256,
-        "generated_live_with_live_repair": "30 / 38 = 78.95%",
+        "generated_live_with_live_repair": "not applicable",
         "generated_live_with_empty_result_broadening": EDGEGUARD_RUNTIME_LIVE_GATE_RESULT,
         "planner_failures": 0,
         "scalar_projection_regressions": 0,
-        "promotion_status": "Runtime harness passes the 80% generated-live extractable-graph gate; semantic-fidelity review is still required before production promotion.",
+        "promotion_status": "Private v0.9 graph-intent candidate for EdgeGuard playground text-to-Cypher testing.",
         "known_limits": [
           "Must run behind schema/read-only guard.",
-          "The v0.5.10 live-retry and empty-result broadening harness is required to reproduce 34/38; it is not baked into the GGUF weights.",
+          "The v0.9 graph-intent GGUF is the deployed model artifact.",
           "Unsupported temporal predicates are mapped to the closest supported query without invented time fields.",
           "Deterministic broadening improves graph extractability but can be semantically wider than the original request.",
         ],
@@ -336,7 +336,7 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
         "version": EDGEGUARD_RUNTIME_HARNESS_VERSION,
         "empty_result_broadening": True,
         "empty_result_broadening_strategy": "first_allowed_label_first_allowed_relationship_type",
-        "weights_note": "The deployed GGUF weights are still the v0.5 preview artifact; the 34/38 result depends on backend runtime handling.",
+        "weights_note": "The deployed GGUF weights are the v0.9 graph-intent artifact.",
       },
       "resources": {
         "cpu_target": "4 CPU threads",
