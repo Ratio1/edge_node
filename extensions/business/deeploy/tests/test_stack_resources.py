@@ -53,6 +53,52 @@ class DeeployStackResourceTests(unittest.TestCase):
     self.assertEqual(resources[DEEPLOY_RESOURCES.MEMORY], "1536m")
     self.assertEqual(resources[DEEPLOY_RESOURCES.STORAGE], "12288m")
 
+  def test_aggregate_container_resources_counts_replicated_plugin_name_once_per_node(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      job_app_type=JOB_APP_TYPES.STACK,
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="container-1",
+          CONTAINER_RESOURCES={"cpu": 0.5, "memory": "512m", "storage": "4g"},
+        ),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          plugin_name="container-1",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "1g", "storage": "8g"},
+        ),
+      ],
+    )
+
+    resources = plugin._aggregate_container_resources(inputs)
+
+    self.assertEqual(resources[DEEPLOY_RESOURCES.CPU], 1)
+    self.assertEqual(resources[DEEPLOY_RESOURCES.MEMORY], "1024m")
+    self.assertEqual(resources[DEEPLOY_RESOURCES.STORAGE], "8192m")
+
+  def test_aggregate_container_resources_keeps_unnamed_occurrences_additive(self):
+    plugin = make_deeploy_plugin()
+    inputs = make_inputs(
+      job_app_type=JOB_APP_TYPES.STACK,
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          CONTAINER_RESOURCES={"cpu": 0.5, "memory": "512m", "storage": "4g"},
+        ),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          CONTAINER_RESOURCES={"cpu": 0.5, "memory": "512m", "storage": "4g"},
+        ),
+      ],
+    )
+
+    resources = plugin._aggregate_container_resources(inputs)
+
+    self.assertEqual(resources[DEEPLOY_RESOURCES.CPU], 1)
+    self.assertEqual(resources[DEEPLOY_RESOURCES.MEMORY], "1024m")
+    self.assertEqual(resources[DEEPLOY_RESOURCES.STORAGE], "8192m")
+
   def test_aggregate_container_resources_uses_two_decimal_cpu_boundaries(self):
     plugin = make_deeploy_plugin()
     inputs = make_inputs(
@@ -109,6 +155,29 @@ class DeeployStackResourceTests(unittest.TestCase):
     )
 
     self.assertTrue(plugin.deeploy_check_payment_and_job_owner(inputs, "0xowner", is_create=True))
+
+  def test_generic_duplicate_instance_id_is_rejected_before_paid_tier(self):
+    plugin = make_deeploy_plugin()
+    plugin.bc = _FakeBlockchain(job_type=1)  # ENTRY: 1 CPU, 2GB RAM, 8GB storage
+    inputs = make_inputs(
+      job_id=123,
+      job_app_type=JOB_APP_TYPES.GENERIC,
+      plugins=[
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          instance_id="container-1",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "2g", "storage": "8g"},
+        ),
+        make_plugin_entry(
+          "CONTAINER_APP_RUNNER",
+          instance_id="container-1",
+          CONTAINER_RESOURCES={"cpu": 1, "memory": "2g", "storage": "8g"},
+        ),
+      ],
+    )
+
+    with self.assertRaisesRegex(ValueError, DEEPLOY_ERRORS.PLUGINS3):
+      plugin.deeploy_check_payment_and_job_owner(inputs, "0xowner", is_create=True)
 
   def test_stack_resources_reject_when_over_paid_tier(self):
     plugin = make_deeploy_plugin()

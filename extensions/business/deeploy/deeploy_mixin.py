@@ -2442,15 +2442,22 @@ class _DeeployMixin:
       return legacy_resources
 
     self.Pd(f"Processing {len(plugins_array)} plugin instances from plugins array")
-    total_cpu = Decimal("0")
-    total_memory_mb = 0
-    total_storage_mb = 0
-    has_storage_resource = False
+    resource_footprints_by_key = {}
+    used_instance_ids = set()
+    instance_id_key = getattr(getattr(getattr(self, "ct", None), "CONFIG_INSTANCE", None), "K_INSTANCE_ID", "INSTANCE_ID")
 
     # Iterate through plugins array (simplified format - each object is an instance)
     for idx, plugin_instance in enumerate(plugins_array):
       signature = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, "").upper()
       self.Pd(f"Plugin {idx}: signature={signature}")
+      instance_id = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) or plugin_instance.get(instance_id_key)
+      if instance_id:
+        instance_id = str(instance_id)
+        if instance_id in used_instance_ids:
+          raise ValueError(
+            f"{DEEPLOY_ERRORS.PLUGINS3}: Duplicate plugin_instance_id '{instance_id}' in plugins array."
+          )
+        used_instance_ids.add(instance_id)
 
       # Only aggregate for CONTAINER_APP_RUNNER and WORKER_APP_RUNNER plugins
       if signature in CONTAINERIZED_APPS_SIGNATURES:
@@ -2460,25 +2467,54 @@ class _DeeployMixin:
         container_storage = resources.get(DEEPLOY_RESOURCES.STORAGE)
 
         self.Pd(f"  Container resources: cpu={cpu}, memory={memory}")
-
-        total_cpu += cpu
         memory_mb = parse_memory_to_mb(memory)
         self.Pd(f"  Parsed memory: {memory_mb}MB")
-        total_memory_mb += memory_mb
-
+        storage_mb = 0
+        has_storage_resource = False
         if DEEPLOY_RESOURCES.STORAGE in resources:
           has_storage_resource = True
           storage_mb = self._parse_stack_storage_mb(container_storage, context=f"plugin {idx}")
           self.Pd(f"  Container storage: {storage_mb}MB")
-          total_storage_mb += storage_mb
         if not is_stack_app:
-          storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
-          if storage_mb > 0:
-            self.Pd(f"  FIXED_SIZE_VOLUMES storage: {storage_mb}MB")
-            total_storage_mb += storage_mb
+          fixed_storage_mb = self._aggregate_fixed_size_volumes_storage_mb(plugin_instance)
+          if fixed_storage_mb > 0:
+            self.Pd(f"  FIXED_SIZE_VOLUMES storage: {fixed_storage_mb}MB")
+            storage_mb += fixed_storage_mb
             has_storage_resource = True
+
+        plugin_name = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_NAME)
+        if instance_id:
+          resource_key = (signature, DEEPLOY_KEYS.PLUGIN_INSTANCE_ID, str(instance_id))
+        elif plugin_name:
+          resource_key = (signature, DEEPLOY_KEYS.PLUGIN_NAME, str(plugin_name))
+        else:
+          resource_key = (signature, "occurrence", idx)
+
+        footprint = resource_footprints_by_key.get(resource_key)
+        if footprint is None:
+          resource_footprints_by_key[resource_key] = {
+            DEEPLOY_RESOURCES.CPU: cpu,
+            "memory_mb": memory_mb,
+            "storage_mb": storage_mb,
+            "has_storage_resource": has_storage_resource,
+          }
+        else:
+          footprint[DEEPLOY_RESOURCES.CPU] = max(footprint[DEEPLOY_RESOURCES.CPU], cpu)
+          footprint["memory_mb"] = max(footprint["memory_mb"], memory_mb)
+          footprint["storage_mb"] = max(footprint["storage_mb"], storage_mb)
+          footprint["has_storage_resource"] = footprint["has_storage_resource"] or has_storage_resource
       else:
         self.Pd(f"  Skipping non-container plugin: {signature}")
+
+    total_cpu = Decimal("0")
+    total_memory_mb = 0
+    total_storage_mb = 0
+    has_storage_resource = False
+    for footprint in resource_footprints_by_key.values():
+      total_cpu += footprint[DEEPLOY_RESOURCES.CPU]
+      total_memory_mb += footprint["memory_mb"]
+      total_storage_mb += footprint["storage_mb"]
+      has_storage_resource = has_storage_resource or footprint["has_storage_resource"]
 
     # Return aggregated resources in standard format
     aggregated = {
