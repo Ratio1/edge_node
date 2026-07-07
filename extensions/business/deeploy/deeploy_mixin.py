@@ -2444,13 +2444,12 @@ class _DeeployMixin:
     self.Pd(f"Processing {len(plugins_array)} plugin instances from plugins array")
     resource_footprints_by_key = {}
     used_instance_ids = set()
-    runtime_instance_id_key = getattr(getattr(self, "ct", ct).CONFIG_INSTANCE, "K_INSTANCE_ID", ct.CONFIG_INSTANCE.K_INSTANCE_ID)
 
     # Iterate through plugins array (simplified format - each object is an instance)
     for idx, plugin_instance in enumerate(plugins_array):
       signature = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, "").upper()
       self.Pd(f"Plugin {idx}: signature={signature}")
-      instance_id = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) or plugin_instance.get(runtime_instance_id_key)
+      instance_id = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) or plugin_instance.get(ct.CONFIG_INSTANCE.K_INSTANCE_ID)
       if instance_id:
         instance_id = str(instance_id)
         if instance_id in used_instance_ids:
