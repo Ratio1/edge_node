@@ -2444,13 +2444,13 @@ class _DeeployMixin:
     self.Pd(f"Processing {len(plugins_array)} plugin instances from plugins array")
     resource_footprints_by_key = {}
     used_instance_ids = set()
-    instance_id_key = getattr(getattr(getattr(self, "ct", None), "CONFIG_INSTANCE", None), "K_INSTANCE_ID", "INSTANCE_ID")
+    runtime_instance_id_key = getattr(getattr(self, "ct", ct).CONFIG_INSTANCE, "K_INSTANCE_ID", ct.CONFIG_INSTANCE.K_INSTANCE_ID)
 
     # Iterate through plugins array (simplified format - each object is an instance)
     for idx, plugin_instance in enumerate(plugins_array):
       signature = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_SIGNATURE, "").upper()
       self.Pd(f"Plugin {idx}: signature={signature}")
-      instance_id = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) or plugin_instance.get(instance_id_key)
+      instance_id = plugin_instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID) or plugin_instance.get(runtime_instance_id_key)
       if instance_id:
         instance_id = str(instance_id)
         if instance_id in used_instance_ids:
@@ -2488,21 +2488,19 @@ class _DeeployMixin:
         elif plugin_name:
           resource_key = (signature, DEEPLOY_KEYS.PLUGIN_NAME, str(plugin_name))
         else:
-          resource_key = (signature, "occurrence", idx)
+          resource_key = (signature, idx)
 
         footprint = resource_footprints_by_key.get(resource_key)
         if footprint is None:
-          resource_footprints_by_key[resource_key] = {
-            DEEPLOY_RESOURCES.CPU: cpu,
-            "memory_mb": memory_mb,
-            "storage_mb": storage_mb,
-            "has_storage_resource": has_storage_resource,
-          }
+          resource_footprints_by_key[resource_key] = (cpu, memory_mb, storage_mb, has_storage_resource)
         else:
-          footprint[DEEPLOY_RESOURCES.CPU] = max(footprint[DEEPLOY_RESOURCES.CPU], cpu)
-          footprint["memory_mb"] = max(footprint["memory_mb"], memory_mb)
-          footprint["storage_mb"] = max(footprint["storage_mb"], storage_mb)
-          footprint["has_storage_resource"] = footprint["has_storage_resource"] or has_storage_resource
+          prev_cpu, prev_memory_mb, prev_storage_mb, prev_has_storage_resource = footprint
+          resource_footprints_by_key[resource_key] = (
+            max(prev_cpu, cpu),
+            max(prev_memory_mb, memory_mb),
+            max(prev_storage_mb, storage_mb),
+            prev_has_storage_resource or has_storage_resource,
+          )
       else:
         self.Pd(f"  Skipping non-container plugin: {signature}")
 
@@ -2510,11 +2508,11 @@ class _DeeployMixin:
     total_memory_mb = 0
     total_storage_mb = 0
     has_storage_resource = False
-    for footprint in resource_footprints_by_key.values():
-      total_cpu += footprint[DEEPLOY_RESOURCES.CPU]
-      total_memory_mb += footprint["memory_mb"]
-      total_storage_mb += footprint["storage_mb"]
-      has_storage_resource = has_storage_resource or footprint["has_storage_resource"]
+    for cpu, memory_mb, storage_mb, footprint_has_storage_resource in resource_footprints_by_key.values():
+      total_cpu += cpu
+      total_memory_mb += memory_mb
+      total_storage_mb += storage_mb
+      has_storage_resource = has_storage_resource or footprint_has_storage_resource
 
     # Return aggregated resources in standard format
     aggregated = {
