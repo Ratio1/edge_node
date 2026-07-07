@@ -84,10 +84,10 @@ class EdgeGuardCypherGuardTests(unittest.TestCase):
     self.assertIn("EXPLOITS", prompt)
     self.assertIn("confidence_score", prompt)
 
-  def test_v09_schema_prompt_includes_temporal_and_graph_guidance(self):
+  def test_v010_schema_prompt_includes_temporal_and_graph_guidance(self):
     prompt = build_schema_prompt_context()
 
-    self.assertEqual(SCHEMA_VERSION, "edgeguard-cypher-schema-v0.9")
+    self.assertEqual(SCHEMA_VERSION, "edgeguard-cypher-schema-v0.10")
     self.assertIn("CVSSv30", prompt)
     self.assertIn("CVSSv40", prompt)
     self.assertIn("(i:Indicator)-[:TARGETS]->(s:Sector)", prompt)
@@ -95,6 +95,8 @@ class EdgeGuardCypherGuardTests(unittest.TestCase):
     self.assertIn("Sector guidance: use `Sector.name`", prompt)
     self.assertIn("Temporal predicates: supported only on whitelisted properties", prompt)
     self.assertIn("last_updated", prompt)
+    self.assertIn("published", prompt)
+    self.assertIn("active", prompt)
     self.assertIn("recently=P30D", prompt)
     self.assertNotIn("Unsupported temporal predicates", prompt)
 
@@ -108,6 +110,14 @@ class EdgeGuardCypherGuardTests(unittest.TestCase):
   def test_accepts_whitelisted_temporal_property(self):
     analysis = analyze_generated_cypher(
       "MATCH (i:Indicator) WHERE datetime(i.last_updated) >= datetime() - duration('P7D') RETURN i LIMIT 10"
+    )
+
+    self.assertTrue(analysis["accepted"])
+
+  def test_accepts_v010_graph_intent_properties(self):
+    analysis = analyze_generated_cypher(
+      "MATCH (i:Indicator)-[:EXPLOITS]->(c:CVE) "
+      "WHERE i.active = true AND c.published >= '2025-01-01' RETURN i, c LIMIT 10"
     )
 
     self.assertTrue(analysis["accepted"])

@@ -695,3 +695,12 @@ Entry format:
 - Details: `ThHfModelBase` keeps Transformers/PT as the default GPU and fallback path, but CPU-only `HF_RUNTIME=auto` now loads `artifact_manifest.json`, selects a declared ONNX Runtime artifact, downloads only safe allow-patterns, loads schema and contract decoder from HF artifacts, and exposes the decoded artifact contract through the existing text-classifier flow. Business API response shaping now passes through generic model/runtime metadata emitted by serving.
 - Verification: `python3 -m unittest extensions.serving.test_th_hf_model_base extensions.serving.test_th_text_classifier extensions.serving.test_th_privacy_filter extensions.business.edge_inference_api.test_text_classifier_inference_api extensions.business.edge_inference_api.test_privacy_filter_inference_api`; `python3 -m py_compile extensions/serving/default_inference/nlp/th_hf_model_base.py extensions/business/edge_inference_api/text_classifier_inference_api.py`; required serving gate `python3 -m unittest extensions.serving.model_testing.test_llm_servings` currently fails at import with `ImportError: cannot import name 'Logger' from 'naeural_core'`.
 - Links: `extensions/serving/default_inference/nlp/th_hf_model_base.py`, `extensions/business/edge_inference_api/text_classifier_inference_api.py`, `extensions/serving/test_th_hf_model_base.py`
+
+- ID: `ML-20260707-001`
+- Timestamp: `2026-07-07T20:44:27Z`
+- Type: `discovery`
+- Summary: EdgeGuard playground stream config can override serving-profile model defaults.
+- Criticality: Operational deployment risk for EdgeGuard model cutovers; source constants and `/model` metadata can report a new target while the active inference stream still loads an older GGUF from persisted stream parameters.
+- Details: During the EGM-029 v0.10 retarget, source defaults and `/model` metadata showed the v0.10 repo/file, but a live generation payload still identified the v0.9 GGUF until the active stream config `STARTUP_AI_ENGINE_PARAMS` was updated. For future cutovers, update both source defaults and the active stream configuration, then verify the returned generation `model` field, not only `/health` or `/model`.
+- Verification: `curl -fsS http://127.0.0.1:5055/model`; `curl -fsS http://127.0.0.1:5055/generate` with an accepted prompt and inspection of the response `model` field.
+- Links: `extensions/business/cybersec/red_mesh/edgeguard_llm_agent_api.py`, `extensions/serving/default_inference/nlp/llama_cpp_edgeguard_qwen_4b.py`

@@ -13,18 +13,18 @@ The playground uses three edge-node runtime pieces:
 The model artifact is private in Hugging Face:
 
 ```text
-MODEL_NAME=ratio1/edgeguard-cypher-qwen3-4b-v0.5-preview-gguf
-MODEL_FILENAME=edgeguard-cypher-qwen3-4b-v0.5-preview.Q4_K_M.gguf
+MODEL_NAME=ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf
+MODEL_FILENAME=edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf
 AI_ENGINE=edgeguard_qwen_4b
 ```
 
-This is the private v0.5 preview continuation of the v0.4 GGUF artifact. The published GGUF contains
-the merged EGM-013 v0.5.3 weights. The backend runtime now applies the EGM-019 v0.5.10 live-retry
-and empty-result broadening harness around those weights. The generated-live extractable-graph gate
-improved to `34/38 = 89.47%` with planner failures `0` and scalar-projection regressions `0`. The
-runtime harness is not baked into the GGUF weights; it is backend behavior around inference and
-Neo4j execution. Deterministic broadening improves graph extractability but can return a wider graph
-than the original request, so semantic-fidelity review remains required before production promotion.
+This is the private EGM-029 v0.10 graph-intent continuation of the v0.9 GGUF artifact. The published
+Q4_K_M GGUF has SHA256 `7f7ed0f4d3341d36204d17343a07e3b6d99ec135a4ce67da66ad09b8eba2a91b`.
+The v0.10 schema surface adds the live `active` and `published` properties to the v0.9 label and
+relationship inventory. The backend runtime keeps the deterministic empty-result broadening harness
+around guarded inference. Deterministic broadening improves graph extractability but can return a
+wider graph than the original request, so semantic-fidelity review remains required before production
+promotion.
 
 Set the private Hugging Face token as a runtime secret for `LLM_INFERENCE_API`; do not put it in a
 pipeline JSON committed to git.
@@ -42,8 +42,8 @@ query string only:
 
 `EDGEGUARD_API` revalidates accepted agent output before returning it to the UI and revalidates Cypher
 again before Neo4j execution. When an accepted generated query executes successfully but returns zero
-rows, `EDGEGUARD_API` can apply the v0.5.10 empty-result broadening fallback: it derives one bounded
-graph query from the first allowed label and relationship type already present in the accepted Cypher,
+rows, `EDGEGUARD_API` can apply the empty-result broadening fallback: it derives one bounded graph
+query from the first allowed label and relationship type already present in the accepted Cypher,
 executes that query, and returns explicit `live_retry` metadata so the UI can show that the returned
 graph was broadened.
 
@@ -62,6 +62,8 @@ graph was broadened.
           "AI_ENGINE": "edgeguard_qwen_4b",
           "PORT": 5090,
           "STARTUP_AI_ENGINE_PARAMS": {
+            "MODEL_NAME": "ratio1/edgeguard-cypher-qwen3-4b-v0.10-graph-intent-gguf",
+            "MODEL_FILENAME": "edgeguard-cypher-qwen3-4b-v0.10-graph-intent.Q4_K_M.gguf",
             "HF_TOKEN": "$HF_TOKEN"
           }
         }

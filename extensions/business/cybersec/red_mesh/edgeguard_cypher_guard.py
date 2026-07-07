@@ -9,7 +9,7 @@ from typing import Any
 __VER__ = '0.2.0.0'
 
 
-SCHEMA_VERSION = "edgeguard-cypher-schema-v0.9"
+SCHEMA_VERSION = "edgeguard-cypher-schema-v0.10"
 DEFAULT_SCHEMA_RETRY_LIMIT = 2
 SCHEMA_KEYS = ("labels", "relationship_types", "properties")
 SCHEMA_KIND_LABELS = {
@@ -93,6 +93,7 @@ EDGEGUARD_SCHEMA = {
       "Vulnerability",
     ],
     "properties": [
+      "active",
       "address",
       "alert_id",
       "aliases",
@@ -132,6 +133,7 @@ EDGEGUARD_SCHEMA = {
       "permission",
       "port",
       "protocol",
+      "published",
       "range",
       "raw_data",
       "reliability",
