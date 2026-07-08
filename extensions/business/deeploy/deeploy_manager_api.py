@@ -781,6 +781,7 @@ class DeeployManagerApiPlugin(
       skip_create_response_key_reset = False
       previous_pipeline_cid = None
       update_context_from_persisted_pipeline = False
+      dauth_secrets_stored = False
       if is_create:
         is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
         if not is_valid:
@@ -959,7 +960,12 @@ class DeeployManagerApiPlugin(
           )
           skip_create_response_key_reset = True
 
-        # All validations and response-key resets passed; remove the running job and redeploy.
+        job_secrets = self._extract_dauth_job_secrets_from_prepared_deploy_plan(
+          prepared_create_deploy_plan
+        )
+        dauth_secrets_stored = self._store_deeploy_dauth_job_secrets(job_id, job_secrets)
+
+        # All validations, response-key resets, and dAuth writes passed; remove the running job and redeploy.
         if update_context_from_persisted_pipeline:
           # TODO: stop stale offline old-node pipelines through ChainDist reconciliation when they return.
           self.Pd(
@@ -1002,6 +1008,20 @@ class DeeployManagerApiPlugin(
           pipeline_params=pipeline_params,
         )
 
+      if prepared_create_deploy_plan is None:
+        prepared_create_deploy_plan = self._prepare_create_pipeline_deploy_plan(
+          nodes=deployment_nodes,
+          inputs=inputs,
+          app_id=app_id,
+          job_app_type=job_app_type,
+          dct_deeploy_specs=deeploy_specs_payload,
+        )
+      if not dauth_secrets_stored:
+        job_secrets = self._extract_dauth_job_secrets_from_prepared_deploy_plan(
+          prepared_create_deploy_plan
+        )
+        self._store_deeploy_dauth_job_secrets(job_id, job_secrets)
+
       dct_status, str_status, response_keys, pipeline_to_persist = self.check_and_deploy_pipelines(
         owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
         inputs=inputs,
@@ -1027,7 +1047,7 @@ class DeeployManagerApiPlugin(
 
       return_request = request.get(DEEPLOY_KEYS.RETURN_REQUEST, False)
       if return_request:
-        dct_request = self.deepcopy(request)
+        dct_request = self._redact_deeploy_dauth_secrets_for_response(request)
         dct_request.pop(DEEPLOY_KEYS.APP_PARAMS, None)
       else:
         # Build simplified request summary (no app_params - data is in plugins array now)

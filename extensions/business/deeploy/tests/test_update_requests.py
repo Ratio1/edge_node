@@ -79,6 +79,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     }
     plugin._get_pipeline_from_cstore = lambda job_id: None
     plugin._check_nodes_availability = lambda inputs: nodes or ["node-1"]
+    plugin.chainstore_writes = []
+
+    def chainstore_hset(hkey, key, value):
+      plugin.chainstore_writes.append({
+        "hkey": hkey,
+        "key": key,
+        "value": copy.deepcopy(value),
+      })
+      return True
+
+    plugin.chainstore_hset = chainstore_hset
 
     called = {"delete": 0, "deploy": 0, "deploy_kwargs": None, "queued": 0, "bc_update": 0}
     plugin.bc = types.SimpleNamespace(
