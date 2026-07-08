@@ -269,6 +269,85 @@ class DeeployManagerApiPlugin(
     """
     return self._redact_per_node_config_for_log(payload)
 
+  def _gather_persisted_pipeline_update_context(self, owner, app_id, job_id, project_id=None):
+    pipeline_cid = self._get_pipeline_from_cstore(job_id) if job_id is not None else None
+    if not pipeline_cid:
+      raise ValueError(
+        f"{DEEPLOY_ERRORS.NODES3}: No running workers or persisted pipeline found for "
+        f"{f'app_id {app_id}' if app_id else f'job_id {job_id}'} and owner '{owner}'."
+      )
+
+    pipeline = self.get_pipeline_from_r1fs(
+      pipeline_cid,
+      timeout=30,
+      pin=False,
+      raise_on_error=False,
+      show_logs=False,
+    )
+    if not isinstance(pipeline, dict):
+      raise ValueError(f"{DEEPLOY_ERRORS.NODES3}: Persisted pipeline '{pipeline_cid}' is unavailable.")
+
+    pipeline_owner = pipeline.get(NetMonCt.OWNER.upper())
+    if str(pipeline_owner).lower() != str(owner).lower():
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST3}. Persisted pipeline owner does not match request owner.")
+
+    pipeline_app_id = pipeline.get("NAME")
+    if str(pipeline_app_id).lower() != str(app_id).lower():
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST3}. Persisted pipeline app_id does not match request app_id.")
+
+    deeploy_specs = pipeline.get(NetMonCt.DEEPLOY_SPECS.upper()) or {}
+    if not isinstance(deeploy_specs, dict):
+      deeploy_specs = {}
+
+    if str(deeploy_specs.get(DEEPLOY_KEYS.JOB_ID)).lower() != str(job_id).lower():
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST3}. Persisted pipeline job_id does not match request job_id.")
+    if project_id is not None and str(deeploy_specs.get(DEEPLOY_KEYS.PROJECT_ID)).lower() != str(project_id).lower():
+      raise ValueError(f"{DEEPLOY_ERRORS.REQUEST3}. Persisted pipeline project_id does not match request project_id.")
+
+    nodes = deeploy_specs.get(DEEPLOY_KEYS.CURRENT_TARGET_NODES) or []
+    if not isinstance(nodes, list):
+      nodes = []
+
+    discovered_instances = []
+    plugins = pipeline.get(NetMonCt.PLUGINS.upper()) or []
+    if not isinstance(plugins, list):
+      plugins = []
+
+    for plugin in plugins:
+      if not isinstance(plugin, dict):
+        continue
+      signature = plugin.get(ct.CONFIG_PLUGIN.K_SIGNATURE) or plugin.get("signature")
+      if not signature:
+        continue
+      instances = plugin.get(ct.CONFIG_PLUGIN.K_INSTANCES, [])
+      if not isinstance(instances, list):
+        continue
+      for instance in instances:
+        if not isinstance(instance, dict):
+          continue
+        instance_id = instance.get(ct.CONFIG_INSTANCE.K_INSTANCE_ID) or instance.get(DEEPLOY_KEYS.PLUGIN_INSTANCE_ID)
+        discovered_instances.append({
+          DEEPLOY_PLUGIN_DATA.APP_ID: pipeline_app_id,
+          DEEPLOY_PLUGIN_DATA.INSTANCE_ID: instance_id,
+          DEEPLOY_PLUGIN_DATA.PLUGIN_SIGNATURE: signature,
+          DEEPLOY_PLUGIN_DATA.PLUGIN_INSTANCE: {
+            "instance_conf": self.deepcopy(instance),
+          },
+          DEEPLOY_PLUGIN_DATA.NODE: nodes[0] if nodes else None,
+          DEEPLOY_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY: instance.get(ct.BIZ_PLUGIN_DATA.CHAINSTORE_RESPONSE_KEY),
+        })
+
+    if not discovered_instances:
+      raise ValueError(f"{DEEPLOY_ERRORS.NODES3}: Persisted pipeline '{pipeline_cid}' has no plugin instances.")
+
+    return {
+      "discovered_instances": discovered_instances,
+      "nodes": nodes,
+      "discovered_nodes": [],
+      "deeploy_specs": deeploy_specs,
+      "from_persisted_pipeline": True,
+    }
+
   def __handle_error(self, exc, request, extra_error_code=DEEPLOY_ERRORS.GENERIC):
     """
     Handle the error and return a response.
@@ -658,6 +737,7 @@ class DeeployManagerApiPlugin(
       prepared_create_deploy_plan = None
       skip_create_response_key_reset = False
       previous_pipeline_cid = None
+      update_context_from_persisted_pipeline = False
       if is_create:
         is_valid = self.deeploy_check_payment_and_job_owner(inputs, auth_result[DEEPLOY_KEYS.ESCROW_OWNER], is_create=is_create, debug=self.cfg_deeploy_verbose > 1)
         if not is_valid:
@@ -677,11 +757,22 @@ class DeeployManagerApiPlugin(
         nodes_changed = True
       else:
         # Discover the live deployment so we can validate node affinity and reuse existing specs.
-        pipeline_context = self._gather_running_pipeline_context(
-          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-          app_id=app_id,
-          job_id=job_id,
-        )
+        try:
+          pipeline_context = self._gather_running_pipeline_context(
+            owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+            app_id=app_id,
+            job_id=job_id,
+          )
+        except ValueError as exc:
+          if DEEPLOY_ERRORS.NODES3 not in str(exc):
+            raise
+          pipeline_context = self._gather_persisted_pipeline_update_context(
+            owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+            app_id=app_id,
+            job_id=job_id,
+            project_id=inputs.get(DEEPLOY_KEYS.PROJECT_ID, None),
+          )
+          update_context_from_persisted_pipeline = True
         discovered_plugin_instances = pipeline_context["discovered_instances"]
         current_nodes = pipeline_context["nodes"]
         deeploy_specs_for_update = pipeline_context["deeploy_specs"]
@@ -850,12 +941,20 @@ class DeeployManagerApiPlugin(
           skip_create_response_key_reset = True
 
         # All validations and response-key resets passed; remove the running job and redeploy.
-        self.delete_pipeline_from_nodes(
-          app_id=app_id,
-          job_id=job_id,
-          owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
-          discovered_instances=discovered_plugin_instances,
-        )
+        if update_context_from_persisted_pipeline:
+          # TODO: stop stale offline old-node pipelines through ChainDist reconciliation when they return.
+          self.Pd(
+            f"Skipping live pipeline stop for offline update fallback on job_id={job_id}; "
+            "new pipeline will be deployed to validated target nodes.",
+            color='y',
+          )
+        else:
+          self.delete_pipeline_from_nodes(
+            app_id=app_id,
+            job_id=job_id,
+            owner=auth_result[DEEPLOY_KEYS.ESCROW_OWNER],
+            discovered_instances=discovered_plugin_instances,
+          )
 
         deployment_nodes = list(validated_nodes)
         confirmation_nodes = list(validated_nodes)
