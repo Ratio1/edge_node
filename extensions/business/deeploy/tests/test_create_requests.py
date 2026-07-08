@@ -16,6 +16,7 @@ from extensions.business.deeploy.deeploy_const import (
   DEEPLOY_PLUGIN_DATA,
   JOB_APP_TYPES,
 )
+from extensions.business.deeploy.deeploy_mixin import DEEPLOY_DAUTH_SECRET_PLACEHOLDER
 from extensions.business.deeploy.tests.support import make_deeploy_plugin, make_inputs, make_plugin_entry
 
 
@@ -256,6 +257,68 @@ class DeeployCreateRequestPreparationTests(unittest.TestCase):
     self.assertIn("'privateKey': '***'", serialized)
     self.assertIn("'R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD': '***'", serialized)
     self.assertIn("'PER_NODE_CONFIG': '***'", serialized)
+
+  def test_dauth_secret_extraction_redacts_only_mandatory_paths(self):
+    plugin = make_deeploy_plugin()
+    payload = {
+      "PLUGINS": [{
+        "INSTANCES": [{
+          "CLOUDFLARE_TOKEN": "cf-token",
+          "NGROK_AUTH_TOKEN": "ngrok-token",
+          "EXPOSED_PORTS": {
+            "26257": {
+              "token": "port-token",
+              "tunnel": {"token": "tunnel-token"},
+            },
+          },
+          "VCS_DATA": {"TOKEN": "github-token", "BRANCH": "main"},
+          "CR_DATA": {"USERNAME": "user", "PASSWORD": "registry-password"},
+          "ENV": {
+            "R1EN_CSTORE_AUTH_SECRET": "cstore-secret",
+            "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD": "admin-password",
+            "CF_TUNNEL_TOKEN": "node-tunnel-token",
+            "CRDB_PASSWORD": "crdb-password",
+            "CRDB_CA_CRT": "ca-crt",
+            "CRDB_NODE_CRT": "node-crt",
+            "CRDB_NODE_KEY": "node-key",
+            "CRDB_CLIENT_ROOT_CRT": "root-crt",
+            "CRDB_CLIENT_ROOT_KEY": "root-key",
+            "POSTGRES_PASSWORD": "user-env-password",
+          },
+          "CHAINSTORE_RESPONSE_KEY": "response-key",
+        }],
+      }],
+    }
+
+    redacted, secrets = plugin._extract_and_redact_deeploy_dauth_secrets(payload)
+    serialized_redacted = str(redacted)
+    serialized_secrets = str(secrets)
+
+    for value in (
+      "cf-token",
+      "ngrok-token",
+      "port-token",
+      "tunnel-token",
+      "github-token",
+      "registry-password",
+      "cstore-secret",
+      "admin-password",
+      "node-tunnel-token",
+      "crdb-password",
+      "ca-crt",
+      "node-crt",
+      "node-key",
+      "root-crt",
+      "root-key",
+    ):
+      self.assertNotIn(value, serialized_redacted)
+      self.assertIn(value, serialized_secrets)
+
+    self.assertIn(DEEPLOY_DAUTH_SECRET_PLACEHOLDER, serialized_redacted)
+    self.assertIn("user-env-password", serialized_redacted)
+    self.assertIn("response-key", serialized_redacted)
+    self.assertNotIn("user-env-password", serialized_secrets)
+    self.assertNotIn("response-key", serialized_secrets)
 
   def test_cockroachdb_secure_config_generates_node_certs_and_redacts_them(self):
     plugin = make_deeploy_plugin()

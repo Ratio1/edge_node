@@ -2,10 +2,15 @@ import copy
 import sys
 import types
 import unittest
+from collections import defaultdict
 
 from naeural_core import constants as ct
 
 from extensions.business.deeploy.deeploy_const import DEEPLOY_KEYS, DEEPLOY_STATUS
+from extensions.business.deeploy.deeploy_mixin import (
+  DEEPLOY_DAUTH_JOB_SECRETS_HKEY,
+  DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+)
 
 
 class _BasePluginStub:
@@ -95,6 +100,16 @@ class _ProcessRequestStub(DeeployManagerApiPlugin):
     self.queued_persistence = persistence_state
     return True
 
+  def chainstore_hset(self, hkey, key, value):
+    if not hasattr(self, "chainstore_writes"):
+      self.chainstore_writes = []
+    self.chainstore_writes.append({
+      "hkey": hkey,
+      "key": key,
+      "value": copy.deepcopy(value),
+    })
+    return True
+
 
 class DeeployProcessRequestTests(unittest.TestCase):
 
@@ -103,15 +118,16 @@ class DeeployProcessRequestTests(unittest.TestCase):
     plugin.ct = ct
     plugin.bc = _BCStub()
     plugin.deepcopy = copy.deepcopy
+    plugin.defaultdict = defaultdict
     plugin.sanitize_name = lambda value: str(value).replace("/", "_").replace(" ", "_")
     plugin.uuid = lambda size=7: "abc1234"[:size]
     plugin.cfg_deeploy_verbose = 0
     plugin.queued_persistence = None
+    plugin.chainstore_writes = []
     captured = {}
 
     def check_and_deploy_pipelines(**kwargs):
       captured.update(kwargs)
-      captured["prepared_plugins"] = plugin.deeploy_prepare_plugins(kwargs["inputs"])
       return {}, DEEPLOY_STATUS.COMMAND_DELIVERED, {}, {
         "CONFIG_STREAMS": [{"NAME": kwargs["app_id"]}],
       }
@@ -152,7 +168,10 @@ class DeeployProcessRequestTests(unittest.TestCase):
     deployed_inputs = captured["inputs"]
     self.assertNotIn("PER_NODE_CONFIG", deployed_inputs)
     deployed_plugin = deployed_inputs[DEEPLOY_KEYS.PLUGINS][0]
-    prepared_plugin = captured["prepared_plugins"][0][plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    prepared_plugin = (
+      captured["prepared_create_deploy_plan"]["node_plugins_by_addr"]["0xai_node_a"][0]
+      [plugin.ct.CONFIG_PLUGIN.K_INSTANCES][0]
+    )
     self.assertEqual(
       deployed_plugin["PER_NODE_CONFIG"]["byNode"]["0xai_node_b"]["ENV"]["CRDB_NODE_ID"],
       "2",
@@ -162,9 +181,20 @@ class DeeployProcessRequestTests(unittest.TestCase):
       "2",
     )
     self.assertEqual(plugin.bc.submitted, [(97, ["eth_0xai_node_a", "eth_0xai_node_b"])])
-    self.assertIn("token-a", str(res[DEEPLOY_KEYS.REQUEST]))
-    self.assertIn("token-b", str(res[DEEPLOY_KEYS.REQUEST]))
+    self.assertNotIn("token-a", str(res[DEEPLOY_KEYS.REQUEST]))
+    self.assertNotIn("token-b", str(res[DEEPLOY_KEYS.REQUEST]))
+    self.assertIn(DEEPLOY_DAUTH_SECRET_PLACEHOLDER, str(res[DEEPLOY_KEYS.REQUEST]))
     self.assertIsInstance(res[DEEPLOY_KEYS.REQUEST]["PER_NODE_CONFIG"], dict)
+    self.assertEqual(plugin.chainstore_writes[0]["hkey"], DEEPLOY_DAUTH_JOB_SECRETS_HKEY)
+    self.assertEqual(plugin.chainstore_writes[0]["key"], "97")
+    stored = str(plugin.chainstore_writes[0]["value"])
+    self.assertIn("token-a", stored)
+    self.assertIn("token-b", stored)
+    self.assertNotIn(DEEPLOY_DAUTH_SECRET_PLACEHOLDER, stored)
+    self.assertEqual(
+      prepared_plugin["PER_NODE_CONFIG"]["byNode"]["0xai_node_a"]["ENV"]["CF_TUNNEL_TOKEN"],
+      DEEPLOY_DAUTH_SECRET_PLACEHOLDER,
+    )
 
   def test_error_handler_redacts_secret_request_values(self):
     plugin = _ProcessRequestStub.__new__(_ProcessRequestStub)

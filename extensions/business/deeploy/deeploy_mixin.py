@@ -57,6 +57,25 @@ PREFERRED_NODES_MAX_COUNT = 100
 PREFERRED_NODES_MAX_PAYLOAD_BYTES = 32 * 1024
 PREFERRED_NODE_ALIAS_MAX_LENGTH = 128
 PREFERRED_NODE_DESCRIPTION_MAX_LENGTH = 512
+DEEPLOY_DAUTH_SECRET_PLACEHOLDER = "__R1_DAUTH_SECRET__"
+DEEPLOY_DAUTH_JOB_SECRETS_HKEY = "DAUTH_JOB_SECRETS"
+DEEPLOY_DAUTH_SECRET_PATH_SUFFIXES = (
+  ("CLOUDFLARE_TOKEN",),
+  ("NGROK_AUTH_TOKEN",),
+  ("EXPOSED_PORTS", "*", "token"),
+  ("EXPOSED_PORTS", "*", "tunnel", "token"),
+  ("VCS_DATA", "TOKEN"),
+  ("CR_DATA", "PASSWORD"),
+  ("ENV", "R1EN_CSTORE_AUTH_SECRET"),
+  ("ENV", "R1EN_CSTORE_AUTH_BOOTSTRAP_ADMIN_PWD"),
+  ("ENV", "CF_TUNNEL_TOKEN"),
+  ("ENV", "CRDB_PASSWORD"),
+  ("ENV", "CRDB_CA_CRT"),
+  ("ENV", "CRDB_NODE_CRT"),
+  ("ENV", "CRDB_NODE_KEY"),
+  ("ENV", "CRDB_CLIENT_ROOT_CRT"),
+  ("ENV", "CRDB_CLIENT_ROOT_KEY"),
+)
 SENSITIVE_LOG_KEY_PARTS = (
   "BEGINPRIVATEKEY",
   "BEGINRSAPRIVATEKEY",
@@ -3715,6 +3734,114 @@ class _DeeployMixin:
 
     redact(redacted)
     return redacted
+
+  def _matches_deeploy_dauth_secret_path(self, path):
+    path = [str(part) for part in path]
+    for suffix in DEEPLOY_DAUTH_SECRET_PATH_SUFFIXES:
+      if len(path) < len(suffix):
+        continue
+      tail = path[-len(suffix):]
+      if all(expected == "*" or expected == actual for expected, actual in zip(suffix, tail)):
+        return True
+    return False
+
+  def _has_deeploy_dauth_secret_value(self, value):
+    if isinstance(value, (dict, list)):
+      return False
+    if value is None or value == "":
+      return False
+    return value != DEEPLOY_DAUTH_SECRET_PLACEHOLDER
+
+  def _merge_deeploy_dauth_secret_fragments(self, target, source):
+    if source is None:
+      return target
+    if target is None:
+      return self.deepcopy(source)
+    if isinstance(target, dict) and isinstance(source, dict):
+      for key, value in source.items():
+        target[key] = self._merge_deeploy_dauth_secret_fragments(target.get(key), value)
+      return target
+    if isinstance(target, list) and isinstance(source, list):
+      while len(target) < len(source):
+        target.append(None)
+      for idx, value in enumerate(source):
+        target[idx] = self._merge_deeploy_dauth_secret_fragments(target[idx], value)
+      return target
+    return self.deepcopy(source)
+
+  def _extract_and_redact_deeploy_dauth_secrets(self, payload):
+    redacted = self.deepcopy(payload)
+
+    def walk(value, path):
+      if isinstance(value, dict):
+        secrets = {}
+        for key, item in list(value.items()):
+          item_path = path + [key]
+          if (
+            self._matches_deeploy_dauth_secret_path(item_path)
+            and self._has_deeploy_dauth_secret_value(item)
+          ):
+            secrets[key] = self.deepcopy(item)
+            value[key] = DEEPLOY_DAUTH_SECRET_PLACEHOLDER
+            continue
+          child_secrets = walk(item, item_path)
+          if child_secrets is not None:
+            secrets[key] = child_secrets
+        return secrets or None
+      if isinstance(value, list):
+        secrets = [None] * len(value)
+        found = False
+        for idx, item in enumerate(value):
+          child_secrets = walk(item, path + [idx])
+          if child_secrets is not None:
+            secrets[idx] = child_secrets
+            found = True
+        return secrets if found else None
+      return None
+
+    return redacted, walk(redacted, [])
+
+  def _redact_deeploy_dauth_secrets_for_response(self, payload):
+    redacted, _ = self._extract_and_redact_deeploy_dauth_secrets(payload)
+    return redacted
+
+  def _extract_dauth_job_secrets_from_prepared_deploy_plan(self, prepared_deploy_plan):
+    if not isinstance(prepared_deploy_plan, dict):
+      return None
+    node_plugins_by_addr = prepared_deploy_plan.get("node_plugins_by_addr")
+    if not isinstance(node_plugins_by_addr, dict):
+      return None
+
+    merged_plugins_secrets = None
+    for node, plugins in list(node_plugins_by_addr.items()):
+      redacted_plugins, plugins_secrets = self._extract_and_redact_deeploy_dauth_secrets(plugins)
+      node_plugins_by_addr[node] = redacted_plugins
+      merged_plugins_secrets = self._merge_deeploy_dauth_secret_fragments(
+        merged_plugins_secrets,
+        plugins_secrets,
+      )
+    if merged_plugins_secrets is None:
+      return None
+    return {"PLUGINS": merged_plugins_secrets}
+
+  def _store_deeploy_dauth_job_secrets(self, job_id, job_secrets):
+    if not job_secrets:
+      return False
+    if job_id in [None, ""]:
+      raise ValueError("Cannot store dAuth secrets without job_id.")
+    job_id = str(job_id)
+    bundle = {
+      "job_id": job_id,
+      "job_secrets": self.deepcopy(job_secrets),
+    }
+    ok = self.chainstore_hset(
+      hkey=DEEPLOY_DAUTH_JOB_SECRETS_HKEY,
+      key=job_id,
+      value=bundle,
+    )
+    if not ok:
+      raise ValueError(f"Failed to store dAuth secrets for job {job_id}.")
+    return True
 
   def _iter_per_node_configs(self, plugins):
     for plugin in plugins or []:
