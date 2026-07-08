@@ -84,6 +84,17 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
       "DEEPLOY_SPECS": copy.deepcopy(deeploy_specs or {"job_id": 11}),
     }
     plugin._check_nodes_availability = lambda inputs: nodes or ["node-1"]
+    plugin.chainstore_writes = []
+
+    def chainstore_hset(hkey, key, value):
+      plugin.chainstore_writes.append({
+        "hkey": hkey,
+        "key": key,
+        "value": copy.deepcopy(value),
+      })
+      return True
+
+    plugin.chainstore_hset = chainstore_hset
 
     called = {
       "delete": 0,
