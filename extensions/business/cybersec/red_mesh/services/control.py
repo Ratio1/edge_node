@@ -151,6 +151,12 @@ def purge_job(owner, job_id: str):
   for addr, w in workers.items():
     _track(w.get("report_cid"), f"workers[{addr}].report_cid")
 
+  rulebook_assessments = job_specs.get("rulebook_assessments")
+  if isinstance(rulebook_assessments, dict):
+    for profile_id, meta in rulebook_assessments.items():
+      if isinstance(meta, dict):
+        _track(meta.get("artifact_cid"), f"rulebook_assessments[{profile_id}].artifact_cid")
+
   for ri, ref in enumerate(job_specs.get("pass_reports", [])):
     report_cid = ref.get("report_cid")
     if report_cid:
@@ -202,6 +208,7 @@ def purge_job(owner, job_id: str):
         _job_repo(owner).delete_live_progress(key)
 
   _job_repo(owner).delete_job_triage(job_id)
+  _job_repo(owner).delete_job_rulebook_reviews(job_id)
   _delete_job_record(owner, job_id)
 
   owner.P(f"Purged job {job_id}: {deleted}/{len(cids)} CIDs deleted.")
@@ -252,7 +259,13 @@ def _force_purge_job(owner, job_id, raw_payload, errors):
   cfg_instance_id = owner.cfg_instance_id
   prefix = f"{job_id}:"
 
-  for hkey in (f"{cfg_instance_id}:live", f"{cfg_instance_id}:triage", f"{cfg_instance_id}:triage:audit"):
+  for hkey in (
+    f"{cfg_instance_id}:live",
+    f"{cfg_instance_id}:triage",
+    f"{cfg_instance_id}:triage:audit",
+    f"{cfg_instance_id}:rulebook_review",
+    f"{cfg_instance_id}:rulebook_review:audit",
+  ):
     try:
       rows = owner.chainstore_hgetall(hkey=hkey)
     except Exception as exc:
@@ -359,6 +372,8 @@ def purge_all_jobs(owner):
   live_hkey = f"{cfg_instance_id}:live"
   triage_hkey = f"{cfg_instance_id}:triage"
   triage_audit_hkey = f"{cfg_instance_id}:triage:audit"
+  rulebook_review_hkey = f"{cfg_instance_id}:rulebook_review"
+  rulebook_review_audit_hkey = f"{cfg_instance_id}:rulebook_review:audit"
   integrations_hkey = f"{cfg_instance_id}:integrations"
 
   def _job_id_from_compound_key(key):
@@ -390,6 +405,8 @@ def purge_all_jobs(owner):
   _sweep_hash(live_hkey, dict)
   _sweep_hash(triage_hkey, dict)
   _sweep_hash(triage_audit_hkey, list)
+  _sweep_hash(rulebook_review_hkey, dict)
+  _sweep_hash(rulebook_review_audit_hkey, list)
   integration_status_rows_deleted = 0
   if jobs_failed == 0 and cids_failed == 0:
     integration_status_rows_deleted = _sweep_hash(integrations_hkey, dict)

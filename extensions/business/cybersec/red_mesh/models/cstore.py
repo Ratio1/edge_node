@@ -146,6 +146,7 @@ class CStoreJobRunning:
   stix_export: dict = None
   opencti_export: dict = None
   taxii_export: dict = None
+  rulebook_assessments: dict = None
   graybox_assignment_summary: dict = None
   blockchain_attestation_enabled: bool = False
   start_attestation_required: bool = False
@@ -195,6 +196,7 @@ class CStoreJobRunning:
       stix_export=d.get("stix_export"),
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
+      rulebook_assessments=d.get("rulebook_assessments"),
       graybox_assignment_summary=d.get("graybox_assignment_summary"),
       blockchain_attestation_enabled=d.get("blockchain_attestation_enabled", False),
       start_attestation_required=d.get("start_attestation_required", False),
@@ -243,6 +245,7 @@ class CStoreJobFinalized:
   stix_export: dict = None
   opencti_export: dict = None
   taxii_export: dict = None
+  rulebook_assessments: dict = None
   graybox_assignment_summary: dict = None
   blockchain_attestation_enabled: bool = False
   start_attestation_required: bool = False
@@ -290,6 +293,7 @@ class CStoreJobFinalized:
       stix_export=d.get("stix_export"),
       opencti_export=d.get("opencti_export"),
       taxii_export=d.get("taxii_export"),
+      rulebook_assessments=d.get("rulebook_assessments"),
       graybox_assignment_summary=d.get("graybox_assignment_summary"),
       blockchain_attestation_enabled=d.get("blockchain_attestation_enabled", False),
       start_attestation_required=d.get("start_attestation_required", False),

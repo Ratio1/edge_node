@@ -52,6 +52,15 @@ from extensions.business.cybersec.red_mesh.models.triage import (
   FindingTriageState,
   VALID_TRIAGE_STATUSES,
 )
+from extensions.business.cybersec.red_mesh.models.rulebook import (
+  RULEBOOK_ASSESSMENT_SCHEMA,
+  RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
+  RulebookReviewAuditEntry,
+  RulebookReviewState,
+  VALID_RULEBOOK_ANSWER_VALUES,
+  VALID_RULEBOOK_CHECK_STATUSES,
+  VALID_RULEBOOK_REVIEW_STATES,
+)
 from extensions.business.cybersec.red_mesh.models.engagement import (
   ASSET_EXPOSURES,
   AuthorizationRef,
@@ -109,6 +118,13 @@ __all__ = [
   "FindingTriageState",
   "FindingTriageAuditEntry",
   "VALID_TRIAGE_STATUSES",
+  "RULEBOOK_ASSESSMENT_SCHEMA",
+  "RULEBOOK_ASSESSMENT_SCHEMA_VERSION",
+  "RulebookReviewState",
+  "RulebookReviewAuditEntry",
+  "VALID_RULEBOOK_ANSWER_VALUES",
+  "VALID_RULEBOOK_CHECK_STATUSES",
+  "VALID_RULEBOOK_REVIEW_STATES",
   # engagement
   "Contact",
   "EngagementContext",
