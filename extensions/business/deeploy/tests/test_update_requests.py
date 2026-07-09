@@ -32,6 +32,7 @@ from naeural_core import constants as ct
 from extensions.business.deeploy.deeploy_const import (
   DEEPLOY_DYNAMIC_ENV_KEYS,
   DEEPLOY_DYNAMIC_ENV_TYPES,
+  DEEPLOY_ERRORS,
   DEEPLOY_KEYS,
   DEEPLOY_PLUGIN_DATA,
   DEEPLOY_STATUS,
@@ -80,7 +81,11 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     plugin._ensure_plugin_instance_ids = lambda *args, **kwargs: None
     plugin._check_nodes_availability = lambda inputs: nodes or ["node-1"]
 
-    called = {"delete": 0, "deploy": 0, "deploy_kwargs": None, "queued": 0}
+    called = {"delete": 0, "deploy": 0, "deploy_kwargs": None, "queued": 0, "bc_update": 0}
+    plugin.bc = types.SimpleNamespace(
+      node_addr_to_eth_addr=lambda node: node,
+      submit_node_update=lambda **kwargs: called.__setitem__("bc_update", called["bc_update"] + 1),
+    )
     plugin.delete_pipeline_from_nodes = lambda **kwargs: called.__setitem__("delete", called["delete"] + 1)
 
     def check_and_deploy_pipelines(**kwargs):
@@ -984,6 +989,80 @@ class DeeployUpdateRequestPreparationTests(unittest.TestCase):
     self.assertEqual(called["delete"], 1)
     self.assertEqual(called["deploy"], 1)
     self.assertEqual([context for context, _, _ in validation_calls], ["payment", "nodes"])
+
+  def test_process_update_uses_persisted_pipeline_when_all_old_nodes_are_offline(self):
+    plugin, called = self._make_process_update_plugin(
+      discovered_instances=[],
+      nodes=["old-node-1", "old-node-2"],
+      deeploy_specs={
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.PROJECT_ID: "0xProject",
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: ["old-node-1", "old-node-2"],
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+      },
+    )
+    plugin._gather_running_pipeline_context = lambda **kwargs: (_ for _ in ()).throw(
+      ValueError(f"{DEEPLOY_ERRORS.NODES3}: No running workers found")
+    )
+    plugin._get_pipeline_from_cstore = lambda job_id: "cid-old-pipeline"
+    plugin.get_pipeline_from_r1fs = lambda *args, **kwargs: {
+      "NAME": "app-123",
+      "OWNER": "0xOwner",
+      "DEEPLOY_SPECS": {
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.PROJECT_ID: "0xProject",
+        DEEPLOY_KEYS.CURRENT_TARGET_NODES: ["old-node-1", "old-node-2"],
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+      },
+      "PLUGINS": [
+        {
+          plugin.ct.CONFIG_PLUGIN.K_SIGNATURE: "CONTAINER_APP_RUNNER",
+          plugin.ct.CONFIG_PLUGIN.K_INSTANCES: [
+            {
+              plugin.ct.CONFIG_INSTANCE.K_INSTANCE_ID: "current-instance",
+              DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+              "IMAGE": "repo/app:1.0",
+              "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+            },
+          ],
+        },
+      ],
+    }
+    plugin._check_nodes_availability = lambda inputs: ["new-node-1"]
+
+    response = plugin._process_pipeline_request(
+      {
+        DEEPLOY_KEYS.APP_ID: "app-123",
+        DEEPLOY_KEYS.APP_ALIAS: "app",
+        DEEPLOY_KEYS.JOB_ID: 11,
+        DEEPLOY_KEYS.PROJECT_ID: "0xProject",
+        DEEPLOY_KEYS.JOB_APP_TYPE: "generic",
+        DEEPLOY_KEYS.PIPELINE_INPUT_TYPE: "void",
+        DEEPLOY_KEYS.CHAINSTORE_RESPONSE: False,
+        DEEPLOY_KEYS.TARGET_NODES: ["new-node-1"],
+        DEEPLOY_KEYS.TARGET_NODES_COUNT: 1,
+        DEEPLOY_KEYS.PLUGINS: [
+          {
+            DEEPLOY_KEYS.PLUGIN_SIGNATURE: "CONTAINER_APP_RUNNER",
+            DEEPLOY_KEYS.PLUGIN_INSTANCE_ID: "current-instance",
+            DEEPLOY_KEYS.PLUGIN_NAME: "worker",
+            "IMAGE": "repo/app:2.0",
+            "CONTAINER_RESOURCES": {"cpu": 1, "memory": "256m"},
+          },
+        ],
+      },
+      is_create=False,
+      async_mode=True,
+    )
+
+    self.assertEqual(response[DEEPLOY_KEYS.STATUS], DEEPLOY_STATUS.COMMAND_DELIVERED)
+    self.assertEqual(called["delete"], 0)
+    self.assertEqual(called["deploy"], 1)
+    self.assertEqual(called["queued"], 1)
+    self.assertEqual(called["bc_update"], 1)
+    self.assertEqual(called["deploy_kwargs"]["new_nodes"], ["new-node-1"])
+    redeploy_plugins = called["deploy_kwargs"]["inputs"][DEEPLOY_KEYS.PLUGINS]
+    self.assertEqual(redeploy_plugins[0]["IMAGE"], "repo/app:2.0")
 
   def test_process_update_rejects_job_app_type_change_before_payment_or_delete(self):
     plugin, called = self._make_process_update_plugin(
