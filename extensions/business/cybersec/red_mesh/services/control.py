@@ -156,6 +156,9 @@ def purge_job(owner, job_id: str):
     for profile_id, meta in rulebook_assessments.items():
       if isinstance(meta, dict):
         _track(meta.get("artifact_cid"), f"rulebook_assessments[{profile_id}].artifact_cid")
+        for hi, historical in enumerate(meta.get("history") or []):
+          if isinstance(historical, dict):
+            _track(historical.get("artifact_cid"), f"rulebook_assessments[{profile_id}].history[{hi}].artifact_cid")
 
   for ri, ref in enumerate(job_specs.get("pass_reports", [])):
     report_cid = ref.get("report_cid")

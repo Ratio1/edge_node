@@ -246,6 +246,20 @@ def _error(code, job_id, **extra):
   }
 
 
+def _error_message(payload):
+  return str(payload.get("message") or payload.get("error") or "Rulebook assessment failed.")
+
+
+def _sanitize_error(owner, payload):
+  hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-rulebook")
+  return {
+    "error": _safe_text(payload.get("error") or "rulebook_assessment_failed", hmac_secret=hmac_secret, max_len=120),
+    "message": _safe_text(_error_message(payload), hmac_secret=hmac_secret, max_len=280),
+    "retryable": bool(payload.get("retryable", True)),
+    "at": _utc_timestamp(),
+  }
+
+
 def _profile(profile_id):
   return _PROFILES.get(profile_id or DEFAULT_RULEBOOK_PROFILE_ID)
 
@@ -274,13 +288,6 @@ def _resolve_scan_context(owner, job_id, pass_nr=None):
       "error": "model_test_not_supported",
       "error_class": unsupported.get("error_class") or unsupported.get("error"),
     }
-
-  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
-    return None, _error(
-      "job_not_finalized",
-      job_id,
-      job_status=job_specs.get("job_status"),
-    )
 
   artifacts = _artifact_repo(owner)
   job_cid = job_specs.get("job_cid")
@@ -574,6 +581,107 @@ def _review_view(review, *, hmac_secret):
   return payload
 
 
+def _profile_meta(job_specs, profile_id):
+  assessments = job_specs.get("rulebook_assessments") or {}
+  if not isinstance(assessments, dict):
+    return {}
+  meta = assessments.get(profile_id)
+  return meta if isinstance(meta, dict) else {}
+
+
+def _meta_pass_nr(meta):
+  value = meta.get("latest_pass_nr", meta.get("pass_nr"))
+  try:
+    return int(value)
+  except (TypeError, ValueError):
+    return None
+
+
+def _existing_same_pass_artifact(owner, job_id, profile_id, pass_nr):
+  job_specs = owner._get_job_from_cstore(job_id)
+  if not isinstance(job_specs, dict):
+    return None
+  meta = _profile_meta(job_specs, profile_id)
+  artifact_cid = meta.get("artifact_cid")
+  if not artifact_cid or _meta_pass_nr(meta) != int(pass_nr):
+    return None
+  if meta.get("run_state") not in (None, "succeeded"):
+    return None
+  assessment = _artifact_repo(owner).get_json(artifact_cid)
+  if not isinstance(assessment, dict):
+    return None
+  return meta, assessment
+
+
+def _history_with_previous(existing_meta, new_meta):
+  history = []
+  for item in existing_meta.get("history") or []:
+    if isinstance(item, dict):
+      history.append(dict(item))
+  previous_cid = existing_meta.get("artifact_cid")
+  if previous_cid and previous_cid != new_meta.get("artifact_cid"):
+    previous = {
+      "artifact_cid": previous_cid,
+      "pass_nr": existing_meta.get("latest_pass_nr", existing_meta.get("pass_nr")),
+      "profile_version": existing_meta.get("profile_version"),
+      "schema_version": existing_meta.get("schema_version"),
+      "last_generated_at": existing_meta.get("last_generated_at"),
+      "status_counts": existing_meta.get("status_counts"),
+      "review_state": existing_meta.get("review_state"),
+    }
+    if not any(item.get("artifact_cid") == previous_cid for item in history):
+      history.append({key: value for key, value in previous.items() if value not in (None, "", [])})
+  return history[-20:]
+
+
+def _write_assessment_meta(owner, job_id, profile_id, meta, *, context):
+  job_specs = owner._get_job_from_cstore(job_id)
+  if not isinstance(job_specs, dict):
+    return None
+  assessments = dict(job_specs.get("rulebook_assessments") or {})
+  existing_meta = assessments.get(profile_id) if isinstance(assessments.get(profile_id), dict) else {}
+  if meta.get("run_state") == "succeeded":
+    meta = dict(meta)
+    meta["history"] = _history_with_previous(existing_meta, meta)
+  assessments[profile_id] = meta
+  job_specs["rulebook_assessments"] = assessments
+  return _write_job_record(owner, job_id, job_specs, context=context)
+
+
+def _success_meta(result, artifact_cid):
+  generated_at = result["assessment"]["generated_at"]
+  return {
+    "schema": RULEBOOK_ASSESSMENT_SCHEMA,
+    "schema_version": RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
+    "profile_id": result["profile_id"],
+    "profile_version": result["profile_version"],
+    "artifact_cid": artifact_cid,
+    "last_generated_at": generated_at,
+    "pass_nr": result["pass_nr"],
+    "latest_pass_nr": result["pass_nr"],
+    "status_counts": result["status_counts"],
+    "review_state": result["assessment"]["review_state"].get("review_state", "draft"),
+    "auto_enabled": True,
+    "run_state": "succeeded",
+  }
+
+
+def _failed_meta(owner, job_id, profile_id, payload):
+  profile = _profile(profile_id)
+  existing = _profile_meta(owner._get_job_from_cstore(job_id) or {}, profile_id)
+  meta = dict(existing)
+  meta.update({
+    "schema": RULEBOOK_ASSESSMENT_SCHEMA,
+    "schema_version": RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
+    "profile_id": profile_id,
+    "profile_version": profile["profile_version"] if profile else existing.get("profile_version"),
+    "auto_enabled": True,
+    "run_state": "failed",
+    "last_error": _sanitize_error(owner, payload),
+  })
+  return meta
+
+
 def build_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None):
   profile = _profile(profile_id)
   if not profile:
@@ -648,41 +756,69 @@ def build_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE
   }
 
 
-def generate_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None, persist=True):
+def generate_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None, persist=True, force=True):
   result = build_rulebook_assessment(owner, job_id, profile_id=profile_id, pass_nr=pass_nr)
   if result.get("status") != "ok":
+    profile = _profile(profile_id)
+    if profile and persist:
+      _write_assessment_meta(
+        owner,
+        job_id,
+        profile["profile_id"],
+        _failed_meta(owner, job_id, profile["profile_id"], result),
+        context="rulebook_assessment_failed",
+      )
     return result
 
   artifact_cid = None
   if persist:
+    existing = None if force else _existing_same_pass_artifact(owner, job_id, result["profile_id"], result["pass_nr"])
+    if existing:
+      meta, assessment = existing
+      return {
+        **result,
+        "assessment": assessment,
+        "artifact_cid": meta.get("artifact_cid"),
+        "generated": True,
+        "cached": True,
+      }
+
     artifact_cid = _artifact_repo(owner).put_json(result["assessment"], show_logs=False)
     if not artifact_cid:
-      return _error("artifact_write_failed", job_id, profile_id=profile_id)
+      failed = _error("artifact_write_failed", job_id, profile_id=profile_id)
+      _write_assessment_meta(
+        owner,
+        job_id,
+        result["profile_id"],
+        _failed_meta(owner, job_id, result["profile_id"], failed),
+        context="rulebook_assessment_failed",
+      )
+      return failed
 
-    job_specs = owner._get_job_from_cstore(job_id)
-    if isinstance(job_specs, dict):
-      generated_at = result["assessment"]["generated_at"]
-      meta = {
-        "schema": RULEBOOK_ASSESSMENT_SCHEMA,
-        "schema_version": RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
-        "profile_id": result["profile_id"],
-        "profile_version": result["profile_version"],
-        "artifact_cid": artifact_cid,
-        "last_generated_at": generated_at,
-        "pass_nr": result["pass_nr"],
-        "status_counts": result["status_counts"],
-        "review_state": result["assessment"]["review_state"].get("review_state", "draft"),
-      }
-      assessments = dict(job_specs.get("rulebook_assessments") or {})
-      assessments[result["profile_id"]] = meta
-      job_specs["rulebook_assessments"] = assessments
-      _write_job_record(owner, job_id, job_specs, context="rulebook_assessment")
+    _write_assessment_meta(
+      owner,
+      job_id,
+      result["profile_id"],
+      _success_meta(result, artifact_cid),
+      context="rulebook_assessment",
+    )
 
   return {
     **result,
     "artifact_cid": artifact_cid,
     "generated": bool(artifact_cid),
   }
+
+
+def ensure_rulebook_assessment(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID, pass_nr=None):
+  return generate_rulebook_assessment(
+    owner,
+    job_id,
+    profile_id=profile_id,
+    pass_nr=pass_nr,
+    persist=True,
+    force=False,
+  )
 
 
 def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
@@ -715,7 +851,7 @@ def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PR
   return {
     "job_id": job_id,
     "found": True,
-    "generated": True,
+    "generated": bool(meta.get("artifact_cid")) and meta.get("run_state") != "failed",
     **meta,
   }
 

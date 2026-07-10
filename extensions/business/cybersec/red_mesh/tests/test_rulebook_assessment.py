@@ -23,6 +23,7 @@ from extensions.business.cybersec.red_mesh.services.control import purge_job
 from extensions.business.cybersec.red_mesh.services.rulebook_assessment import (
   DEFAULT_RULEBOOK_PROFILE_ID,
   build_rulebook_assessment,
+  ensure_rulebook_assessment,
   generate_rulebook_assessment,
   get_rulebook_assessment_status,
   get_rulebook_review,
@@ -214,6 +215,11 @@ class TestRulebookAssessment(unittest.TestCase):
       owner.job_specs["rulebook_assessments"][DEFAULT_RULEBOOK_PROFILE_ID]["artifact_cid"],
       "QmRulebook1",
     )
+    meta = owner.job_specs["rulebook_assessments"][DEFAULT_RULEBOOK_PROFILE_ID]
+    self.assertTrue(meta["auto_enabled"])
+    self.assertEqual(meta["run_state"], "succeeded")
+    self.assertEqual(meta["latest_pass_nr"], 3)
+    self.assertEqual(meta["history"], [])
     assessment = owner.artifacts["QmRulebook1"]
     self.assertEqual(assessment["schema"], "redmesh.rulebook_assessment.v1")
     self.assertEqual(assessment["profile"]["profile_id"], DEFAULT_RULEBOOK_PROFILE_ID)
@@ -233,6 +239,56 @@ class TestRulebookAssessment(unittest.TestCase):
     self.assertTrue(status["found"])
     self.assertTrue(status["generated"])
     self.assertEqual(status["artifact_cid"], "QmRulebook1")
+    self.assertEqual(status["run_state"], "succeeded")
+
+  def test_ensure_is_idempotent_for_existing_same_pass_and_force_regenerates(self):
+    owner = _Owner()
+
+    first = ensure_rulebook_assessment(owner, "job-1")
+    second = ensure_rulebook_assessment(owner, "job-1")
+    forced = generate_rulebook_assessment(owner, "job-1", force=True)
+
+    self.assertEqual(first["artifact_cid"], "QmRulebook1")
+    self.assertEqual(second["artifact_cid"], "QmRulebook1")
+    self.assertTrue(second["cached"])
+    self.assertEqual(forced["artifact_cid"], "QmRulebook2")
+    self.assertEqual(owner.r1fs.add_json.call_count, 2)
+
+    meta = owner.job_specs["rulebook_assessments"][DEFAULT_RULEBOOK_PROFILE_ID]
+    self.assertEqual(meta["artifact_cid"], "QmRulebook2")
+    self.assertEqual(meta["history"][0]["artifact_cid"], "QmRulebook1")
+
+  def test_running_job_with_completed_pass_report_is_eligible(self):
+    owner = _Owner(job_specs=_sample_job_specs(
+      job_status="RUNNING",
+      job_cid="",
+      pass_reports=[{"pass_nr": 3, "report_cid": "pass-cid", "risk_score": 75}],
+    ))
+    owner.artifacts["pass-cid"] = _sample_pass_report()
+
+    result = build_rulebook_assessment(owner, "job-1")
+
+    self.assertEqual(result["status"], "ok")
+    self.assertEqual(result["pass_nr"], 3)
+    self.assertEqual(result["assessment"]["scan_context"]["job_status"], "RUNNING")
+
+  def test_artifact_write_failure_persists_failed_status_without_generated_flag(self):
+    owner = _Owner()
+    owner.r1fs.add_json.side_effect = None
+    owner.r1fs.add_json.return_value = None
+
+    result = generate_rulebook_assessment(owner, "job-1")
+
+    self.assertEqual(result["status"], "error")
+    self.assertEqual(result["error"], "artifact_write_failed")
+    meta = owner.job_specs["rulebook_assessments"][DEFAULT_RULEBOOK_PROFILE_ID]
+    self.assertEqual(meta["run_state"], "failed")
+    self.assertTrue(meta["auto_enabled"])
+    self.assertNotIn("artifact_cid", meta)
+    status = get_rulebook_assessment_status(owner, "job-1")
+    self.assertFalse(status["generated"])
+    self.assertEqual(status["run_state"], "failed")
+    self.assertEqual(status["last_error"]["error"], "artifact_write_failed")
 
   def test_reviewer_answer_cannot_hide_automated_gap_but_can_support_manual_check(self):
     owner = _Owner()
@@ -290,7 +346,7 @@ class TestRulebookAssessment(unittest.TestCase):
     )
     self.assertEqual(
       build_rulebook_assessment(running_owner, "job-1")["error"],
-      "job_not_finalized",
+      "no_completed_passes",
     )
     self.assertEqual(
       update_rulebook_review(running_owner, "job-1", answers={})["error"],
@@ -305,7 +361,10 @@ class TestRulebookAssessment(unittest.TestCase):
     owner = _Owner(job_specs=_sample_job_specs(
       job_cid="",
       rulebook_assessments={
-        DEFAULT_RULEBOOK_PROFILE_ID: {"artifact_cid": "QmRulebookAssessment"},
+        DEFAULT_RULEBOOK_PROFILE_ID: {
+          "artifact_cid": "QmRulebookAssessment",
+          "history": [{"artifact_cid": "QmRulebookAssessmentOld"}],
+        },
       },
     ))
     owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
@@ -317,6 +376,7 @@ class TestRulebookAssessment(unittest.TestCase):
 
     self.assertEqual(result["status"], "success")
     self.assertIn("QmRulebookAssessment", owner.artifact_repo.deleted)
+    self.assertIn("QmRulebookAssessmentOld", owner.artifact_repo.deleted)
     self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review", review_key)])
     self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review:audit", review_key)])
 
