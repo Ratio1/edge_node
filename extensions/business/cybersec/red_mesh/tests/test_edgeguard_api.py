@@ -30,6 +30,7 @@ mock_plugin_modules()
 
 from extensions.business.cybersec.red_mesh.edgeguard_api import EdgeguardApiPlugin  # noqa: E402
 from extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api import (  # noqa: E402
+  EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   EdgeguardLlmAgentApiPlugin,
 )
 
@@ -120,6 +121,13 @@ def _make_api(**overrides):
 
 
 class EdgeGuardAgentTests(unittest.TestCase):
+  def test_edgeguard_api_timeout_defaults_share_long_generation_budget(self):
+    self.assertEqual(EDGEGUARD_REQUEST_TIMEOUT_SECONDS, 600)
+    self.assertEqual(EdgeguardLlmAgentApiPlugin.CONFIG["REQUEST_TIMEOUT"], 600)
+    self.assertEqual(EdgeguardLlmAgentApiPlugin.CONFIG["REQUEST_TIMEOUT_SECONDS"], 600)
+    self.assertEqual(EdgeguardApiPlugin.CONFIG["REQUEST_TIMEOUT"], 600)
+    self.assertEqual(EdgeguardApiPlugin.CONFIG["REQUEST_TIMEOUT_SECONDS"], 600)
+
   def test_agent_exports_api_url_for_semaphore_consumers(self):
     plugin = _make_agent(port=5060)
 
@@ -203,6 +211,26 @@ class EdgeGuardAgentTests(unittest.TestCase):
       result["accepted_cypher"],
       "MATCH (i:Indicator) RETURN i.value AS value LIMIT 10",
     )
+
+  def test_agent_propagates_local_inference_failure_envelope(self):
+    plugin = _make_agent()
+    payload = {
+      "result": {
+        "request_id": "req-1",
+        "status": "failed",
+        "error": "Local LLM returned an invalid empty response.",
+      },
+    }
+
+    with patch(
+      "extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api.requests.post",
+      return_value=_Response(payload=payload),
+    ):
+      result = plugin.generate(request="Show indicators")
+
+    self.assertFalse(result["accepted"])
+    self.assertEqual(result["status"], "error")
+    self.assertEqual(result["error"], "Local LLM returned an invalid empty response.")
 
   def test_agent_retries_after_schema_rejection(self):
     plugin = _make_agent()

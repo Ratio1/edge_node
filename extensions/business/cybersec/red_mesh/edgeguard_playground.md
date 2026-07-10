@@ -76,6 +76,8 @@ graph was broadened.
           "INSTANCE_ID": "edgeguard_llm_agent",
           "PORT": 5060,
           "LOCAL_LLM_API_PORT": 5090,
+          "REQUEST_TIMEOUT": 600,
+          "REQUEST_TIMEOUT_SECONDS": 600,
           "SCHEMA_RETRY_LIMIT": 2
         }
       ]
@@ -88,6 +90,8 @@ graph was broadened.
           "SEMAPHORE": "edgeguard_api",
           "PORT": 5055,
           "EDGEGUARD_LLM_AGENT_PORT": 5060,
+          "REQUEST_TIMEOUT": 600,
+          "REQUEST_TIMEOUT_SECONDS": 600,
           "NEO4J_MAX_ROWS": 100,
           "LIVE_EMPTY_RESULT_BROADENING": true
         }

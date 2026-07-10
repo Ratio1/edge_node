@@ -42,6 +42,7 @@ EDGEGUARD_ROBUSTNESS_SUBGRAPH_ACCEPTED = "100% (+7.09pp vs v0.9)"
 EDGEGUARD_TEST_LABEL_COVERAGE = "97.50% (+16.25pp vs v0.9)"
 EDGEGUARD_TEST_RELATIONSHIP_COVERAGE = "76.25% (+5.00pp vs v0.9)"
 EDGEGUARD_CORPUS = "3,588 accepted graph rows (2,868 train / 360 validation / 360 test)"
+EDGEGUARD_REQUEST_TIMEOUT_SECONDS = 600
 
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
@@ -75,7 +76,8 @@ _CONFIG = {
   "SCHEMA_RETRY_LIMIT": DEFAULT_SCHEMA_RETRY_LIMIT,
   "MAX_REQUEST_CHARS": 4000,
 
-  "REQUEST_TIMEOUT_SECONDS": 120,
+  "REQUEST_TIMEOUT": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
+  "REQUEST_TIMEOUT_SECONDS": EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   "EDGEGUARD_VERBOSE": 10,
 
   'VALIDATION_RULES': {
@@ -183,6 +185,12 @@ class EdgeguardLlmAgentApiPlugin(BasePlugin):
   def _normalize_local_response(self, response: Dict[str, Any]) -> Dict[str, Any]:
     if isinstance(response, dict) and isinstance(response.get("result"), dict):
       response = response["result"]
+    if isinstance(response, dict) and response.get("status") in {STATUS_ERROR, STATUS_TIMEOUT, "failed", "config_error"}:
+      return {
+        "status": STATUS_TIMEOUT if response.get("status") == STATUS_TIMEOUT else STATUS_ERROR,
+        "provider": "local",
+        "error": response.get("error") or response.get("result") or "Local LLM provider failed",
+      }
     if "choices" in response and isinstance(response.get("choices"), list):
       response.setdefault("model", self.cfg_local_llm_model)
       response.setdefault("provider", "local")

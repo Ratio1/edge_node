@@ -172,6 +172,23 @@ class LLMInferenceApiPluginTests(unittest.TestCase):
     self.assertTrue(plugin.filter_valid_inference(inference))
     self.assertEqual(inference["REQUEST_ID"], "req-8")
 
+  def test_filter_valid_inference_fails_single_pending_on_invalid_empty_output(self):
+    plugin = LLMInferenceApiPlugin()
+    plugin._requests = {"req-9": {"status": "pending"}}  # pylint: disable=protected-access
+    failed = {}
+    plugin._fail_request = lambda request_id, error_message: failed.update({  # pylint: disable=protected-access
+      "request_id": request_id,
+      "error_message": error_message,
+    }) or True
+    inference = {
+      "text": "",
+      "IS_VALID": False,
+    }
+
+    self.assertFalse(plugin.filter_valid_inference(inference))
+    self.assertEqual(failed["request_id"], "req-9")
+    self.assertEqual(failed["error_message"], "Local LLM returned an invalid empty response.")
+
 
 if __name__ == "__main__":
   unittest.main()

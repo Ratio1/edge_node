@@ -733,12 +733,26 @@ class LLMInferenceApiPlugin(BasePlugin):
       full_output = inference.get(LlmCT.FULL_OUTPUT, None)
       return full_output is not None
 
+    def _fail_invalid_empty_inference(self, inference):
+      request_id = self._extract_request_id_from_inference(inference)
+      if request_id is None:
+        request_id = self._get_single_pending_request_id()
+      if request_id is None:
+        return False
+      if request_id not in self._requests:
+        return False
+      return self._fail_request(
+        request_id=request_id,
+        error_message="Local LLM returned an invalid empty response.",
+      )
+
     def filter_valid_inference(self, inference):
       if not isinstance(inference, dict):
         return False
       if not inference.get("IS_VALID", True):
         if not self._has_text_result(inference=inference):
           self.P(f"Rejected invalid LLM inference without text output: {self.shorten_str(inference)}")
+          self._fail_invalid_empty_inference(inference)
           return False
         self.P("Accepting text-bearing LLM inference despite IS_VALID=False.")
       request_id = self._extract_request_id_from_inference(inference)
