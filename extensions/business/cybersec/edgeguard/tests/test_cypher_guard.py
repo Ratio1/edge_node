@@ -1,6 +1,6 @@
 import unittest
 
-from extensions.business.cybersec.red_mesh.edgeguard_cypher_guard import (
+from extensions.business.cybersec.edgeguard.edgeguard_cypher_guard import (
   SCHEMA_VERSION,
   analyze_generated_cypher,
   build_empty_result_broadening_cypher,

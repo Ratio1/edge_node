@@ -28,8 +28,8 @@ def mock_plugin_modules():
 
 mock_plugin_modules()
 
-from extensions.business.cybersec.red_mesh.edgeguard_api import EdgeguardApiPlugin  # noqa: E402
-from extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api import (  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_api import EdgeguardApiPlugin  # noqa: E402
+from extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api import (  # noqa: E402
   EDGEGUARD_REQUEST_TIMEOUT_SECONDS,
   EdgeguardLlmAgentApiPlugin,
 )
@@ -149,7 +149,7 @@ class EdgeGuardAgentTests(unittest.TestCase):
     }
 
     with patch(
-      "extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api.requests.post",
+      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
       return_value=_Response(payload=payload),
     ) as mocked_post:
       result = plugin.generate(request="Show indicators")
@@ -177,7 +177,7 @@ class EdgeGuardAgentTests(unittest.TestCase):
     }
 
     with patch(
-      "extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api.requests.post",
+      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
       return_value=_Response(payload=payload),
     ) as mocked_post:
       result = plugin.generate(request="Find cve-2024-12345 from hxxp://bad[.]test")
@@ -200,7 +200,7 @@ class EdgeGuardAgentTests(unittest.TestCase):
     }
 
     with patch(
-      "extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api.requests.post",
+      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
       return_value=_Response(payload=payload),
     ):
       result = plugin.generate(request="Show internet-facing hosts and their IP addresses")
@@ -223,7 +223,7 @@ class EdgeGuardAgentTests(unittest.TestCase):
     }
 
     with patch(
-      "extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api.requests.post",
+      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
       return_value=_Response(payload=payload),
     ):
       result = plugin.generate(request="Show indicators")
@@ -252,7 +252,7 @@ class EdgeGuardAgentTests(unittest.TestCase):
     ]
 
     with patch(
-      "extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api.requests.post",
+      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
       side_effect=responses,
     ) as mocked_post:
       result = plugin.generate(request="Show internet-facing assets with critical vulnerabilities")
@@ -267,7 +267,7 @@ class EdgeGuardAgentTests(unittest.TestCase):
     plugin = _make_agent(schema_retry_limit=1)
 
     with patch(
-      "extensions.business.cybersec.red_mesh.edgeguard_llm_agent_api.requests.post",
+      "extensions.business.cybersec.edgeguard.edgeguard_llm_agent_api.requests.post",
       return_value=_Response(payload={
         "choices": [{"message": {"content": "Here is the query: MATCH (i:Indicator) RETURN i.value"}}],
       }),
@@ -322,7 +322,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     }
 
     with patch(
-      "extensions.business.cybersec.red_mesh.edgeguard_api.requests.post",
+      "extensions.business.cybersec.edgeguard.edgeguard_api.requests.post",
       return_value=_Response(payload=agent_payload),
     ):
       result = plugin.generate(request="Show hosts")
@@ -367,7 +367,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_driver = MagicMock()
     fake_driver.session.return_value = fake_session
 
-    with patch("extensions.business.cybersec.red_mesh.edgeguard_api.GraphDatabase", object()):
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver) as mocked_driver:
         result = plugin.neo4j_query(
           uri="example.com:7687",
@@ -396,7 +396,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_driver = MagicMock()
     fake_driver.session.return_value = fake_session
 
-    with patch("extensions.business.cybersec.red_mesh.edgeguard_api.GraphDatabase", object()):
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
         result = plugin.neo4j_query(
           uri="example.com:7687",
@@ -430,7 +430,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_driver = MagicMock()
     fake_driver.session.return_value = fake_session
 
-    with patch("extensions.business.cybersec.red_mesh.edgeguard_api.GraphDatabase", object()):
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
         result = plugin.neo4j_query(
           uri="example.com:7687",
@@ -455,7 +455,7 @@ class EdgeGuardApiTests(unittest.TestCase):
     fake_driver.session.side_effect = RuntimeError("connection failed for secret")
     fake_driver.close.side_effect = RuntimeError("close failed")
 
-    with patch("extensions.business.cybersec.red_mesh.edgeguard_api.GraphDatabase", object()):
+    with patch("extensions.business.cybersec.edgeguard.edgeguard_api.GraphDatabase", object()):
       with patch.object(plugin, "_neo4j_driver", return_value=fake_driver):
         result = plugin.neo4j_query(
           uri="example.com:7687",
