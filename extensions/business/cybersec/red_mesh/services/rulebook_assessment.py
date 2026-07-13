@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
+import json
 import re
+import threading
 import time as _time
 from datetime import datetime, timezone
 from urllib.parse import urlsplit
@@ -10,8 +13,12 @@ from ..constants import JOB_STATUS_FINALIZED
 from ..models import (
   RULEBOOK_ASSESSMENT_SCHEMA,
   RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
+  RULEBOOK_SUBMISSION_CONTRACT_VERSION,
+  RulebookPendingSubmission,
   RulebookReviewAuditEntry,
   RulebookReviewState,
+  RulebookSubmissionReference,
+  RulebookSubmissionRegistry,
   VALID_RULEBOOK_ANSWER_VALUES,
   VALID_RULEBOOK_CHECK_STATUSES,
   VALID_RULEBOOK_REVIEW_STATES,
@@ -23,6 +30,9 @@ from .scan_guards import reject_model_test_for_scan_operation
 
 DEFAULT_RULEBOOK_PROFILE_ID = "nis2.eu_baseline.v1"
 RULEBOOK_PROFILE_VERSION = "1.0.0"
+
+_SUBMISSION_LOCKS = {}
+_SUBMISSION_LOCKS_GUARD = threading.Lock()
 
 _IPV4_RE = re.compile(
   r"(?<![\w.])"
@@ -864,7 +874,7 @@ def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PR
     }
   meta = (job_specs.get("rulebook_assessments") or {}).get(profile["profile_id"])
   if not isinstance(meta, dict) or not meta:
-    return {
+    result = {
       "job_id": job_id,
       "found": True,
       "generated": False,
@@ -873,12 +883,146 @@ def get_rulebook_assessment_status(owner, job_id, profile_id=DEFAULT_RULEBOOK_PR
       "schema": RULEBOOK_ASSESSMENT_SCHEMA,
       "schema_version": RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
     }
+  else:
+    result = {
+      "job_id": job_id,
+      "found": True,
+      "generated": bool(meta.get("artifact_cid")) and meta.get("run_state") != "failed",
+      **meta,
+    }
+  result["submission_contract_version"] = RULEBOOK_SUBMISSION_CONTRACT_VERSION
+  try:
+    review = _job_repo(owner).get_rulebook_review_model(job_id, profile["profile_id"])
+    result.update(_submission_public_state(owner, job_id, job_specs, profile, review))
+  except ValueError:
+    result.update({
+      "submission_contract_version": None,
+      "submission_contract_unsupported": True,
+    })
+  return result
+
+
+def _submission_lock(owner, job_id, profile_id):
+  key = f"{getattr(owner, 'cfg_instance_id', '')}:{job_id}:{profile_id}"
+  with _SUBMISSION_LOCKS_GUARD:
+    lock = _SUBMISSION_LOCKS.get(key)
+    if lock is None:
+      lock = threading.RLock()
+      _SUBMISSION_LOCKS[key] = lock
+  return lock
+
+
+def _empty_submission_registry():
+  return RulebookSubmissionRegistry()
+
+
+def _submission_registry(repo, job_id, profile_id):
+  return repo.get_rulebook_submission_registry_model(job_id, profile_id) or _empty_submission_registry()
+
+
+def _owner_time(owner):
+  return float(getattr(owner, "time", _time.time)())
+
+
+def _latest_pass_nr(owner, job_id):
+  ctx, err = _resolve_scan_context(owner, job_id)
+  if err:
+    return None, err
+  raw = ctx["pass_data"].get("pass_nr") or 1
+  try:
+    return int(raw), None
+  except (TypeError, ValueError):
+    return None, _error("pass_not_found", job_id)
+
+
+def _legacy_submission_reference(job_specs, profile, review):
+  if review is None or review.review_state != "reviewed":
+    return None
+  meta = _profile_meta(job_specs, profile["profile_id"])
+  cid = str(meta.get("artifact_cid") or "").strip()
+  if not cid:
+    return None
+  try:
+    pass_nr = int(meta.get("latest_pass_nr", meta.get("pass_nr", 0)) or 0)
+  except (TypeError, ValueError):
+    pass_nr = 0
+  return RulebookSubmissionReference(
+    revision=0,
+    cid=cid,
+    submitted_at=review.updated_at,
+    actor=review.reviewer,
+    pass_nr=pass_nr,
+    profile_id=profile["profile_id"],
+    profile_version=str(meta.get("profile_version") or review.profile_version or profile["profile_version"]),
+    schema_version=str(meta.get("schema_version") or "1.0.0"),
+    review_revision=review.review_revision,
+    legacy=True,
+  ).to_dict()
+
+
+def _submission_reference_view(reference, *, latest_pass_nr, profile_version):
+  payload = reference.to_dict() if isinstance(reference, RulebookSubmissionReference) else dict(reference)
+  stale_reasons = []
+  if latest_pass_nr is not None and int(payload.get("pass_nr", 0) or 0) != int(latest_pass_nr):
+    stale_reasons.append("newer_scan_pass")
+  if payload.get("profile_version") != profile_version:
+    stale_reasons.append("newer_profile_version")
   return {
-    "job_id": job_id,
-    "found": True,
-    "generated": bool(meta.get("artifact_cid")) and meta.get("run_state") != "failed",
-    **meta,
+    **payload,
+    "artifact_cid": payload.get("cid"),
+    "stale": bool(stale_reasons),
+    "stale_reasons": stale_reasons,
   }
+
+
+def _submission_public_state(owner, job_id, job_specs, profile, review):
+  repo = _job_repo(owner)
+  registry = _submission_registry(repo, job_id, profile["profile_id"])
+  registry_payload = registry.to_dict()
+  latest_pass_nr, _ = _latest_pass_nr(owner, job_id)
+  references = list(registry_payload.get("submissions") or [])
+  legacy_reference = _legacy_submission_reference(job_specs, profile, review)
+  if legacy_reference and not any(item.get("cid") == legacy_reference["cid"] for item in references):
+    references.append(legacy_reference)
+  views = [
+    _submission_reference_view(
+      reference,
+      latest_pass_nr=latest_pass_nr,
+      profile_version=profile["profile_version"],
+    )
+    for reference in sorted(references, key=lambda item: int(item.get("revision", 0) or 0), reverse=True)
+  ]
+  pending = registry_payload.get("pending")
+  latest = views[0] if views else None
+  migration_required = bool(review and review.review_state == "reviewed" and legacy_reference is None)
+  effective_state = "draft"
+  if not pending and latest and review and review.review_state in {"submitted", "reviewed"}:
+    effective_state = "submitted"
+  operation_state = None
+  if pending:
+    operation_state = "failed" if pending.get("last_error") else "submitting"
+  return {
+    "submission_contract_version": RULEBOOK_SUBMISSION_CONTRACT_VERSION,
+    "effective_review_state": effective_state,
+    "review_revision": review.review_revision if review else 0,
+    "latest_submission": latest,
+    "submissions": views,
+    "submission_operation_state": operation_state,
+    "submission_error": (pending or {}).get("last_error") if isinstance(pending, dict) else None,
+    "migration_submission_required": migration_required,
+  }
+
+
+def _submission_error(code, job_id, profile_id, message, *, retryable=False, **extra):
+  return _error(
+    code,
+    job_id,
+    profile_id=profile_id,
+    submission_contract_version=RULEBOOK_SUBMISSION_CONTRACT_VERSION,
+    message=message,
+    retryable=retryable,
+    **extra,
+  )
 
 
 def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
@@ -905,6 +1049,15 @@ def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
   hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-rulebook")
   repo = _job_repo(owner)
   review = repo.get_rulebook_review_model(job_id, profile["profile_id"])
+  try:
+    submission_state = _submission_public_state(owner, job_id, job_specs, profile, review)
+  except ValueError:
+    return _submission_error(
+      "submission_contract_unsupported",
+      job_id,
+      profile["profile_id"],
+      "Submission registry contract version is not supported by this backend.",
+    )
   return {
     "status": "ok",
     "job_id": job_id,
@@ -927,6 +1080,7 @@ def get_rulebook_review(owner, job_id, profile_id=DEFAULT_RULEBOOK_PROFILE_ID):
     "found": review is not None,
     "review": _review_view(review, hmac_secret=hmac_secret),
     "audit": repo.get_rulebook_review_audit(job_id, profile["profile_id"]),
+    **submission_state,
   }
 
 
@@ -953,6 +1107,700 @@ def _validate_review_answers(profile, answers):
       "note": str(payload.get("note") or "")[:1000],
     }
   return validated
+
+
+def _validated_expected_revision(value, job_id, profile_id):
+  if value is None:
+    return None, _submission_error(
+      "review_revision_conflict",
+      job_id,
+      profile_id,
+      "expected_review_revision is required.",
+    )
+  try:
+    revision = int(value)
+  except (TypeError, ValueError):
+    return None, _submission_error(
+      "review_revision_conflict",
+      job_id,
+      profile_id,
+      "expected_review_revision must be a non-negative integer.",
+    )
+  if revision < 0:
+    return None, _submission_error(
+      "review_revision_conflict",
+      job_id,
+      profile_id,
+      "expected_review_revision must be a non-negative integer.",
+    )
+  return revision, None
+
+
+def _sanitize_review_patch(owner, answers, actor, note):
+  hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-rulebook")
+  actor = _safe_text(actor or "", hmac_secret=hmac_secret, max_len=200)
+  note = _safe_text(note or "", hmac_secret=hmac_secret, max_len=1000)
+  now = _owner_time(owner)
+  sanitized_answers = {}
+  for question_id, answer in answers.items():
+    sanitized_answers[question_id] = {
+      "value": answer["value"],
+      "note": _safe_text(answer.get("note") or "", hmac_secret=hmac_secret, max_len=1000),
+      "reviewer": actor,
+      "updated_at": now,
+    }
+  return sanitized_answers, actor, note, now
+
+
+def _put_review_with_audit(
+  owner,
+  repo,
+  *,
+  job_id,
+  profile,
+  previous,
+  state,
+  changed_question_ids,
+  event_type,
+):
+  previous_answers = (previous.to_dict().get("answers") if previous else {}) or {}
+  current_answers = (state.to_dict().get("answers") if state else {}) or {}
+  review_payload = repo.put_rulebook_review(state)
+  audit_payload = repo.append_rulebook_review_audit(RulebookReviewAuditEntry(
+    job_id=job_id,
+    profile_id=profile["profile_id"],
+    profile_version=profile["profile_version"],
+    review_state=state.review_state,
+    reviewer=state.reviewer,
+    note=state.note,
+    changed_question_ids=list(changed_question_ids or []),
+    previous_answers={question_id: previous_answers.get(question_id) for question_id in changed_question_ids or []},
+    current_answers={question_id: current_answers.get(question_id) for question_id in changed_question_ids or []},
+    timestamp=state.updated_at,
+    review_revision=state.review_revision,
+  ))
+  if hasattr(owner, "_log_audit_event"):
+    owner._log_audit_event(event_type, {
+      "job_id": job_id,
+      "profile_id": profile["profile_id"],
+      "review_state": state.review_state,
+      "review_revision": state.review_revision,
+      "changed_question_ids": list(changed_question_ids or []),
+    })
+  return review_payload, audit_payload
+
+
+def save_rulebook_review_draft(
+  owner,
+  job_id,
+  profile_id=DEFAULT_RULEBOOK_PROFILE_ID,
+  answers=None,
+  actor="",
+  note="",
+  expected_review_revision=None,
+):
+  profile = _profile(profile_id)
+  if not profile:
+    return _error("invalid_profile", job_id, profile_id=profile_id)
+  expected_revision, err = _validated_expected_revision(
+    expected_review_revision,
+    job_id,
+    profile["profile_id"],
+  )
+  if err:
+    return err
+  job_specs = owner._get_job_from_cstore(job_id)
+  if not isinstance(job_specs, dict):
+    return _error("job_not_found", job_id, profile_id=profile["profile_id"])
+  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
+  if unsupported:
+    return {**unsupported, "error": "model_test_not_supported"}
+  try:
+    validated_answers = _validate_review_answers(profile, answers)
+  except ValueError as exc:
+    return _error("invalid_review_answer", job_id, profile_id=profile["profile_id"], message=str(exc))
+
+  with _submission_lock(owner, job_id, profile["profile_id"]):
+    repo = _job_repo(owner)
+    previous = repo.get_rulebook_review_model(job_id, profile["profile_id"])
+    registry = _submission_registry(repo, job_id, profile["profile_id"]).to_dict()
+    if registry.get("pending"):
+      return _submission_error(
+        "submission_in_progress",
+        job_id,
+        profile["profile_id"],
+        "A submission retry must finish before the draft can change.",
+        retryable=True,
+      )
+    current_revision = previous.review_revision if previous else 0
+    if expected_revision != current_revision:
+      return _submission_error(
+        "review_revision_conflict",
+        job_id,
+        profile["profile_id"],
+        "The review changed. Reload before saving this draft.",
+        expected_review_revision=expected_revision,
+        current_review_revision=current_revision,
+      )
+    legacy_reference = _legacy_submission_reference(job_specs, profile, previous)
+    if (previous and previous.review_state == "submitted") or legacy_reference:
+      return _submission_error(
+        "review_already_submitted",
+        job_id,
+        profile["profile_id"],
+        "Reopen the submitted review before editing it.",
+      )
+
+    sanitized_answers, actor, note, now = _sanitize_review_patch(owner, validated_answers, actor, note)
+    previous_answers = (previous.to_dict().get("answers") if previous else {}) or {}
+    current_answers = dict(previous_answers)
+    current_answers.update(sanitized_answers)
+    changed = sorted(
+      question_id
+      for question_id in set(previous_answers) | set(current_answers)
+      if previous_answers.get(question_id) != current_answers.get(question_id)
+    )
+    state = RulebookReviewState(
+      job_id=job_id,
+      profile_id=profile["profile_id"],
+      profile_version=profile["profile_version"],
+      review_state="draft",
+      reviewer=actor,
+      note=note,
+      answers=current_answers,
+      updated_at=now,
+      review_revision=current_revision + 1,
+    )
+    try:
+      _put_review_with_audit(
+        owner,
+        repo,
+        job_id=job_id,
+        profile=profile,
+        previous=previous,
+        state=state,
+        changed_question_ids=changed,
+        event_type="rulebook_review_draft_saved",
+      )
+    except Exception:
+      return _submission_error(
+        "review_draft_save_failed",
+        job_id,
+        profile["profile_id"],
+        "Unable to save the review draft.",
+        retryable=True,
+      )
+  return get_rulebook_review(owner, job_id, profile["profile_id"])
+
+
+def _validate_submission_answers(profile, review):
+  answers = (review.to_dict().get("answers") if review else {}) or {}
+  missing = []
+  comments_required = []
+  for check in profile["checks"]:
+    question_id = check.get("review_question_id")
+    if not question_id:
+      continue
+    answer = answers.get(question_id)
+    if not isinstance(answer, dict) or answer.get("value") not in VALID_RULEBOOK_ANSWER_VALUES:
+      missing.append(question_id)
+      continue
+    if answer.get("value") in {"no", "unknown", "not_applicable"} and not str(answer.get("note") or "").strip():
+      comments_required.append(question_id)
+  return missing, comments_required
+
+
+def _submission_fingerprint(assessment):
+  canonical = json.dumps(assessment, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+  return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _registry_with(registry, *, submissions=None, pending=None, keep_pending=False):
+  payload = registry.to_dict() if isinstance(registry, RulebookSubmissionRegistry) else dict(registry)
+  if submissions is not None:
+    payload["submissions"] = submissions
+  if keep_pending or pending is not None:
+    payload["pending"] = pending
+  else:
+    payload.pop("pending", None)
+  return RulebookSubmissionRegistry.from_dict(payload)
+
+
+def _persist_pending_error(repo, job_id, profile_id, registry, pending, payload):
+  try:
+    next_pending = dict(pending)
+    next_pending["last_error"] = payload
+    next_pending["updated_at"] = payload.get("at_epoch", next_pending.get("updated_at", 0.0))
+    repo.put_rulebook_submission_registry(
+      job_id,
+      profile_id,
+      _registry_with(registry, pending=next_pending, keep_pending=True),
+    )
+  except Exception:
+    pass
+
+
+def submit_rulebook_review(
+  owner,
+  job_id,
+  profile_id=DEFAULT_RULEBOOK_PROFILE_ID,
+  expected_review_revision=None,
+  expected_pass_nr=None,
+  expected_profile_version=None,
+  idempotency_key="",
+  actor="",
+):
+  profile = _profile(profile_id)
+  if not profile:
+    return _error("invalid_profile", job_id, profile_id=profile_id)
+  expected_revision, err = _validated_expected_revision(
+    expected_review_revision,
+    job_id,
+    profile["profile_id"],
+  )
+  if err:
+    return err
+  try:
+    expected_pass = int(expected_pass_nr)
+  except (TypeError, ValueError):
+    return _submission_error(
+      "submission_pass_stale",
+      job_id,
+      profile["profile_id"],
+      "expected_pass_nr must identify the latest completed pass.",
+    )
+  idempotency_key = str(idempotency_key or "").strip()
+  if not idempotency_key or len(idempotency_key) > 200:
+    return _submission_error(
+      "submission_idempotency_conflict",
+      job_id,
+      profile["profile_id"],
+      "A bounded idempotency key is required.",
+    )
+  if str(expected_profile_version or "") != profile["profile_version"]:
+    return _submission_error(
+      "submission_profile_stale",
+      job_id,
+      profile["profile_id"],
+      "The rulebook profile changed. Reload before submitting.",
+      current_profile_version=profile["profile_version"],
+    )
+  job_specs = owner._get_job_from_cstore(job_id)
+  if not isinstance(job_specs, dict):
+    return _error("job_not_found", job_id, profile_id=profile["profile_id"])
+  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
+  if unsupported:
+    return {**unsupported, "error": "model_test_not_supported"}
+  hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-rulebook")
+  actor = _safe_text(actor or "", hmac_secret=hmac_secret, max_len=200)
+  if not actor:
+    return _submission_error(
+      "invalid_review_actor",
+      job_id,
+      profile["profile_id"],
+      "A server-derived review actor is required.",
+    )
+
+  with _submission_lock(owner, job_id, profile["profile_id"]):
+    repo = _job_repo(owner)
+    review = repo.get_rulebook_review_model(job_id, profile["profile_id"])
+    registry = _submission_registry(repo, job_id, profile["profile_id"])
+    registry_payload = registry.to_dict()
+    existing_pending = registry_payload.get("pending")
+
+    for reference in registry_payload.get("submissions") or []:
+      if reference.get("idempotency_key") != idempotency_key:
+        continue
+      if existing_pending:
+        break
+      if (
+        int(reference.get("review_revision", -1)) == expected_revision
+        and int(reference.get("pass_nr", -1)) == expected_pass
+        and reference.get("profile_version") == profile["profile_version"]
+        and reference.get("actor") == actor
+      ):
+        result = get_rulebook_review(owner, job_id, profile["profile_id"])
+        result.update({"submission": _submission_reference_view(
+          reference,
+          latest_pass_nr=expected_pass,
+          profile_version=profile["profile_version"],
+        ), "idempotent_replay": True})
+        return result
+      return _submission_error(
+        "submission_idempotency_conflict",
+        job_id,
+        profile["profile_id"],
+        "The idempotency key was already used for different submission inputs.",
+      )
+
+    current_revision = review.review_revision if review else 0
+    if expected_revision != current_revision:
+      return _submission_error(
+        "review_revision_conflict",
+        job_id,
+        profile["profile_id"],
+        "The review changed. Reload before submitting.",
+        expected_review_revision=expected_revision,
+        current_review_revision=current_revision,
+      )
+    latest_pass, pass_error = _latest_pass_nr(owner, job_id)
+    if pass_error:
+      return pass_error
+    if expected_pass != latest_pass:
+      return _submission_error(
+        "submission_pass_stale",
+        job_id,
+        profile["profile_id"],
+        "Newer scan evidence exists. Reload before submitting.",
+        expected_pass_nr=expected_pass,
+        current_pass_nr=latest_pass,
+      )
+
+    pending = existing_pending
+    if pending and pending.get("idempotency_key") != idempotency_key:
+      return _submission_error(
+        "submission_in_progress",
+        job_id,
+        profile["profile_id"],
+        "Another submission is pending for this review.",
+        retryable=True,
+      )
+    if review and review.review_state == "submitted" and not pending:
+      return _submission_error(
+        "review_already_submitted",
+        job_id,
+        profile["profile_id"],
+        "Reopen the review before creating another submission revision.",
+      )
+    legacy_reference = _legacy_submission_reference(job_specs, profile, review)
+    if legacy_reference and not pending:
+      return _submission_error(
+        "review_already_submitted",
+        job_id,
+        profile["profile_id"],
+        "Reopen the legacy submitted review before creating a native revision.",
+      )
+
+    missing, comments_required = _validate_submission_answers(profile, review)
+    if missing or comments_required:
+      return _submission_error(
+        "submission_comments_required",
+        job_id,
+        profile["profile_id"],
+        "Every review question must be answered; No, Unknown, and Not applicable require comments.",
+        missing_question_ids=missing,
+        comment_required_question_ids=comments_required,
+      )
+
+    now = _owner_time(owner)
+    target_revision = int((pending or {}).get("target_revision") or (registry.latest_revision + 1))
+    submitted_at = float((pending or {}).get("created_at") or now)
+    submission_meta = {
+      "contract_version": RULEBOOK_SUBMISSION_CONTRACT_VERSION,
+      "revision": target_revision,
+      "submitted_at": submitted_at,
+      "actor": actor,
+      "pass_nr": latest_pass,
+      "profile_id": profile["profile_id"],
+      "profile_version": profile["profile_version"],
+      "review_revision": expected_revision,
+    }
+    built = build_rulebook_assessment(
+      owner,
+      job_id,
+      profile_id=profile["profile_id"],
+      pass_nr=latest_pass,
+      include_review=True,
+      artifact_kind="review_submission",
+      submission=submission_meta,
+    )
+    if built.get("status") != "ok":
+      return built
+    assessment = built["assessment"]
+    assessment["generated_at"] = _utc_timestamp(submitted_at)
+    assessment["review_state"].update({
+      "review_state": "submitted",
+      "reviewer": actor,
+      "updated_at": submitted_at,
+      "review_revision": expected_revision,
+    })
+    fingerprint = _submission_fingerprint(assessment)
+
+    if pending:
+      if pending.get("fingerprint") != fingerprint:
+        return _submission_error(
+          "submission_idempotency_conflict",
+          job_id,
+          profile["profile_id"],
+          "The pending submission no longer matches the canonical review snapshot.",
+        )
+      pending = {
+        **pending,
+        "attempt_count": int(pending.get("attempt_count", 1) or 1) + 1,
+        "updated_at": now,
+        "last_error": None,
+      }
+    else:
+      pending = RulebookPendingSubmission(
+        target_revision=target_revision,
+        expected_review_revision=expected_revision,
+        expected_pass_nr=latest_pass,
+        expected_profile_version=profile["profile_version"],
+        actor=actor,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
+        state="prepared",
+        created_at=submitted_at,
+        updated_at=now,
+      ).to_dict()
+      try:
+        registry = _registry_with(registry, pending=pending, keep_pending=True)
+        repo.put_rulebook_submission_registry(job_id, profile["profile_id"], registry)
+      except Exception:
+        return _submission_error(
+          "submission_record_failed",
+          job_id,
+          profile["profile_id"],
+          "Unable to record pending submission state.",
+          retryable=True,
+        )
+
+    state_order = {"prepared": 0, "artifact_written": 1, "reference_recorded": 2}
+    if state_order[pending["state"]] < state_order["artifact_written"]:
+      try:
+        cid = _artifact_repo(owner).put_json(assessment, show_logs=False)
+      except Exception:
+        cid = None
+      if not cid:
+        failure = {
+          "error": "submission_persist_failed",
+          "message": "Unable to persist the review submission artifact.",
+          "retryable": True,
+          "at": _utc_timestamp(),
+          "at_epoch": now,
+        }
+        _persist_pending_error(repo, job_id, profile["profile_id"], registry, pending, failure)
+        return _submission_error(
+          "submission_persist_failed",
+          job_id,
+          profile["profile_id"],
+          failure["message"],
+          retryable=True,
+        )
+      pending = {**pending, "state": "artifact_written", "cid": cid, "updated_at": now}
+      try:
+        registry = _registry_with(registry, pending=pending, keep_pending=True)
+        repo.put_rulebook_submission_registry(job_id, profile["profile_id"], registry)
+      except Exception:
+        return _submission_error(
+          "submission_record_failed",
+          job_id,
+          profile["profile_id"],
+          "The artifact exists but its CID could not be recorded. Retry with the same key.",
+          retryable=True,
+        )
+
+    submissions = list(registry.to_dict().get("submissions") or [])
+    reference = next((item for item in submissions if int(item.get("revision", -1)) == target_revision), None)
+    if reference is None:
+      reference = RulebookSubmissionReference(
+        revision=target_revision,
+        cid=pending["cid"],
+        submitted_at=submitted_at,
+        actor=actor,
+        pass_nr=latest_pass,
+        profile_id=profile["profile_id"],
+        profile_version=profile["profile_version"],
+        schema_version=RULEBOOK_ASSESSMENT_SCHEMA_VERSION,
+        review_revision=expected_revision,
+        idempotency_key=idempotency_key,
+        fingerprint=fingerprint,
+      ).to_dict()
+      submissions.append(reference)
+    if state_order[pending["state"]] < state_order["reference_recorded"]:
+      pending = {**pending, "state": "reference_recorded", "updated_at": now}
+      try:
+        registry = _registry_with(registry, submissions=submissions, pending=pending, keep_pending=True)
+        repo.put_rulebook_submission_registry(job_id, profile["profile_id"], registry)
+      except Exception:
+        failure = {
+          "error": "submission_record_failed",
+          "message": "The submission reference could not be recorded.",
+          "retryable": True,
+          "at": _utc_timestamp(),
+          "at_epoch": now,
+        }
+        _persist_pending_error(repo, job_id, profile["profile_id"], registry, pending, failure)
+        return _submission_error(
+          "submission_record_failed",
+          job_id,
+          profile["profile_id"],
+          "The submission reference could not be recorded. Retry with the same key.",
+          retryable=True,
+        )
+
+    submitted_state = RulebookReviewState(
+      job_id=job_id,
+      profile_id=profile["profile_id"],
+      profile_version=profile["profile_version"],
+      review_state="submitted",
+      reviewer=actor,
+      note=review.note if review else "",
+      answers=(review.to_dict().get("answers") if review else {}) or {},
+      updated_at=submitted_at,
+      review_revision=expected_revision,
+    )
+    try:
+      if not review or review.review_state != "submitted":
+        _put_review_with_audit(
+          owner,
+          repo,
+          job_id=job_id,
+          profile=profile,
+          previous=review,
+          state=submitted_state,
+          changed_question_ids=[],
+          event_type="rulebook_review_submitted",
+        )
+      committed_registry = RulebookSubmissionRegistry(
+        contract_version=RULEBOOK_SUBMISSION_CONTRACT_VERSION,
+        latest_revision=max(registry.latest_revision, target_revision),
+        submissions=submissions,
+        pending=None,
+      )
+      repo.put_rulebook_submission_registry(job_id, profile["profile_id"], committed_registry)
+    except Exception:
+      failure = {
+        "error": "submission_record_failed",
+        "message": "The final submission state was not committed.",
+        "retryable": True,
+        "at": _utc_timestamp(),
+        "at_epoch": now,
+      }
+      _persist_pending_error(repo, job_id, profile["profile_id"], registry, pending, failure)
+      return _submission_error(
+        "submission_record_failed",
+        job_id,
+        profile["profile_id"],
+        "The submission is recoverable but its final state was not committed. Retry with the same key.",
+        retryable=True,
+      )
+
+  result = get_rulebook_review(owner, job_id, profile["profile_id"])
+  result.update({
+    "submission": _submission_reference_view(
+      reference,
+      latest_pass_nr=latest_pass,
+      profile_version=profile["profile_version"],
+    ),
+    "idempotent_replay": False,
+  })
+  return result
+
+
+def reopen_rulebook_review(
+  owner,
+  job_id,
+  profile_id=DEFAULT_RULEBOOK_PROFILE_ID,
+  expected_review_revision=None,
+  actor="",
+):
+  profile = _profile(profile_id)
+  if not profile:
+    return _error("invalid_profile", job_id, profile_id=profile_id)
+  expected_revision, err = _validated_expected_revision(
+    expected_review_revision,
+    job_id,
+    profile["profile_id"],
+  )
+  if err:
+    return err
+  job_specs = owner._get_job_from_cstore(job_id)
+  if not isinstance(job_specs, dict):
+    return _error("job_not_found", job_id, profile_id=profile["profile_id"])
+  if job_specs.get("job_status") != JOB_STATUS_FINALIZED:
+    return _error("job_not_finalized", job_id, profile_id=profile["profile_id"])
+  unsupported = reject_model_test_for_scan_operation(job_specs, job_id, "rulebook_review")
+  if unsupported:
+    return {**unsupported, "error": "model_test_not_supported"}
+  hmac_secret = str(getattr(owner, "cfg_instance_id", "") or "redmesh-rulebook")
+  actor = _safe_text(actor or "", hmac_secret=hmac_secret, max_len=200)
+  if not actor:
+    return _submission_error("invalid_review_actor", job_id, profile["profile_id"], "A server-derived actor is required.")
+
+  with _submission_lock(owner, job_id, profile["profile_id"]):
+    repo = _job_repo(owner)
+    review = repo.get_rulebook_review_model(job_id, profile["profile_id"])
+    registry = _submission_registry(repo, job_id, profile["profile_id"])
+    registry_payload = registry.to_dict()
+    if registry_payload.get("pending"):
+      return _submission_error(
+        "submission_in_progress",
+        job_id,
+        profile["profile_id"],
+        "Finish the pending submission before reopening.",
+        retryable=True,
+      )
+    current_revision = review.review_revision if review else 0
+    if expected_revision != current_revision:
+      return _submission_error(
+        "review_revision_conflict",
+        job_id,
+        profile["profile_id"],
+        "The review changed. Reload before reopening.",
+        current_review_revision=current_revision,
+      )
+    legacy_reference = _legacy_submission_reference(job_specs, profile, review)
+    if not registry_payload.get("submissions") and not legacy_reference:
+      return _submission_error(
+        "review_not_submitted",
+        job_id,
+        profile["profile_id"],
+        "Only a submitted review can be reopened.",
+      )
+    if not review or review.review_state not in {"submitted", "reviewed"}:
+      return _submission_error(
+        "review_not_submitted",
+        job_id,
+        profile["profile_id"],
+        "Only a submitted review can be reopened.",
+      )
+    now = _owner_time(owner)
+    reopened = RulebookReviewState(
+      job_id=job_id,
+      profile_id=profile["profile_id"],
+      profile_version=profile["profile_version"],
+      review_state="draft",
+      reviewer=actor,
+      note=review.note,
+      answers=review.to_dict().get("answers") or {},
+      updated_at=now,
+      review_revision=current_revision + 1,
+    )
+    try:
+      _put_review_with_audit(
+        owner,
+        repo,
+        job_id=job_id,
+        profile=profile,
+        previous=review,
+        state=reopened,
+        changed_question_ids=[],
+        event_type="rulebook_review_reopened",
+      )
+    except Exception:
+      return _submission_error(
+        "review_reopen_failed",
+        job_id,
+        profile["profile_id"],
+        "Unable to reopen the submitted review.",
+        retryable=True,
+      )
+  return get_rulebook_review(owner, job_id, profile["profile_id"])
 
 
 def update_rulebook_review(
@@ -987,6 +1835,25 @@ def update_rulebook_review(
       job_status=job_specs.get("job_status"),
     )
 
+  repo = _job_repo(owner)
+  previous = repo.get_rulebook_review_model(job_id, profile["profile_id"])
+  try:
+    registry = _submission_registry(repo, job_id, profile["profile_id"]).to_dict()
+  except ValueError:
+    return _submission_error(
+      "submission_contract_unsupported",
+      job_id,
+      profile["profile_id"],
+      "Submission registry contract version is not supported by this backend.",
+    )
+  if registry.get("pending") or registry.get("submissions") or _legacy_submission_reference(job_specs, profile, previous):
+    return _submission_error(
+      "review_already_submitted",
+      job_id,
+      profile["profile_id"],
+      "Use the explicit reopen operation before changing a submitted review.",
+    )
+
   try:
     validated_answers = _validate_review_answers(profile, answers)
   except ValueError as exc:
@@ -1005,8 +1872,6 @@ def update_rulebook_review(
       "updated_at": now,
     }
 
-  repo = _job_repo(owner)
-  previous = repo.get_rulebook_review_model(job_id, profile["profile_id"])
   previous_answers = (previous.to_dict().get("answers") if previous else {}) or {}
   current_answers = dict(previous_answers)
   current_answers.update(sanitized_answers)
@@ -1024,6 +1889,7 @@ def update_rulebook_review(
     note=note,
     answers=current_answers,
     updated_at=now,
+    review_revision=(previous.review_revision if previous else 0) + 1,
   )
   review_payload = repo.put_rulebook_review(state)
   audit_payload = repo.append_rulebook_review_audit(RulebookReviewAuditEntry(
@@ -1037,12 +1903,14 @@ def update_rulebook_review(
     previous_answers={question_id: previous_answers.get(question_id) for question_id in changed},
     current_answers={question_id: current_answers.get(question_id) for question_id in changed},
     timestamp=now,
+    review_revision=state.review_revision,
   ))
   if hasattr(owner, "_log_audit_event"):
     owner._log_audit_event("rulebook_review_updated", {
       "job_id": job_id,
       "profile_id": profile["profile_id"],
       "review_state": review_state,
+      "review_revision": state.review_revision,
       "changed_question_ids": changed,
     })
   return {

@@ -3,6 +3,7 @@ import sys
 import time
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 
@@ -35,6 +36,9 @@ from extensions.business.cybersec.red_mesh.services.rulebook_assessment import (
   generate_rulebook_assessment,
   get_rulebook_assessment_status,
   get_rulebook_review,
+  reopen_rulebook_review,
+  save_rulebook_review_draft,
+  submit_rulebook_review,
   update_rulebook_review,
 )
 
@@ -118,6 +122,19 @@ def _sample_job_specs(**overrides):
   }
   payload.update(overrides)
   return payload
+
+
+def _complete_review_answers():
+  return {
+    "nis2.risk.risk_treatment_reviewed": {"value": "yes"},
+    "nis2.incident.incident_process": {"value": "yes"},
+    "nis2.bcm.business_continuity": {"value": "yes"},
+    "nis2.supply.supplier_risk_reviewed": {"value": "yes"},
+    "nis2.access.access_controls_reviewed": {"value": "yes"},
+    "nis2.crypto.crypto_policy_reviewed": {"value": "yes"},
+    "nis2.effectiveness.assessment_reviewed": {"value": "yes"},
+    "nis2.reporting.reporting_process": {"value": "yes"},
+  }
 
 
 class _FakeArtifactRepo:
@@ -325,6 +342,341 @@ class TestRulebookAssessment(unittest.TestCase):
     )
     self.assertEqual(loaded.to_dict(), stored)
 
+  def test_save_draft_is_revisioned_and_never_writes_r1fs(self):
+    owner = _Owner()
+
+    saved = save_rulebook_review_draft(
+      owner,
+      "job-1",
+      answers={"nis2.bcm.business_continuity": {"value": "yes", "note": "Plan reviewed."}},
+      actor="alice",
+      expected_review_revision=0,
+    )
+    stale = save_rulebook_review_draft(
+      owner,
+      "job-1",
+      answers={},
+      actor="alice",
+      expected_review_revision=0,
+    )
+
+    self.assertEqual(saved["status"], "ok")
+    self.assertEqual(saved["review"]["review_revision"], 1)
+    self.assertEqual(saved["effective_review_state"], "draft")
+    self.assertEqual(stale["error"], "review_revision_conflict")
+    self.assertEqual(owner.r1fs.add_json.call_count, 0)
+
+  def test_submit_persists_complete_snapshot_and_replays_idempotently(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner,
+      "job-1",
+      answers=_complete_review_answers(),
+      actor="alice",
+      expected_review_revision=0,
+    )
+
+    submitted = submit_rulebook_review(
+      owner,
+      "job-1",
+      expected_review_revision=saved["review_revision"],
+      expected_pass_nr=3,
+      expected_profile_version="1.0.0",
+      idempotency_key="submission-1",
+      actor="alice",
+    )
+    replay = submit_rulebook_review(
+      owner,
+      "job-1",
+      expected_review_revision=saved["review_revision"],
+      expected_pass_nr=3,
+      expected_profile_version="1.0.0",
+      idempotency_key="submission-1",
+      actor="alice",
+    )
+    conflict = submit_rulebook_review(
+      owner,
+      "job-1",
+      expected_review_revision=saved["review_revision"],
+      expected_pass_nr=3,
+      expected_profile_version="1.0.0",
+      idempotency_key="submission-1",
+      actor="mallory",
+    )
+
+    self.assertEqual(submitted["effective_review_state"], "submitted")
+    self.assertEqual(submitted["submission"]["revision"], 1)
+    self.assertEqual(replay["submission"]["cid"], submitted["submission"]["cid"])
+    self.assertTrue(replay["idempotent_replay"])
+    self.assertEqual(conflict["error"], "submission_idempotency_conflict")
+    self.assertEqual(owner.r1fs.add_json.call_count, 1)
+    snapshot = owner.artifacts[submitted["submission"]["cid"]]
+    self.assertEqual(snapshot["schema_version"], "1.1.0")
+    self.assertEqual(snapshot["artifact_kind"], "review_submission")
+    self.assertEqual(snapshot["submission"]["revision"], 1)
+    self.assertEqual(snapshot["review_state"]["review_state"], "submitted")
+
+  def test_submission_requires_complete_answers_and_comments(self):
+    owner = _Owner()
+    answers = _complete_review_answers()
+    answers["nis2.reporting.reporting_process"] = {"value": "unknown", "note": ""}
+    saved = save_rulebook_review_draft(
+      owner,
+      "job-1",
+      answers=answers,
+      actor="alice",
+      expected_review_revision=0,
+    )
+
+    result = submit_rulebook_review(
+      owner,
+      "job-1",
+      expected_review_revision=saved["review_revision"],
+      expected_pass_nr=3,
+      expected_profile_version="1.0.0",
+      idempotency_key="submission-comments",
+      actor="alice",
+    )
+
+    self.assertEqual(result["error"], "submission_comments_required")
+    self.assertEqual(
+      result["comment_required_question_ids"],
+      ["nis2.reporting.reporting_process"],
+    )
+    self.assertEqual(owner.r1fs.add_json.call_count, 0)
+
+  def test_r1fs_failure_keeps_draft_and_same_key_retry_recovers(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner,
+      "job-1",
+      answers=_complete_review_answers(),
+      actor="alice",
+      expected_review_revision=0,
+    )
+    owner.r1fs.add_json.side_effect = None
+    owner.r1fs.add_json.return_value = None
+
+    failed = submit_rulebook_review(
+      owner,
+      "job-1",
+      expected_review_revision=saved["review_revision"],
+      expected_pass_nr=3,
+      expected_profile_version="1.0.0",
+      idempotency_key="submission-retry",
+      actor="alice",
+    )
+    visible = get_rulebook_review(owner, "job-1")
+    owner.r1fs.add_json.side_effect = owner._add_json
+    recovered = submit_rulebook_review(
+      owner,
+      "job-1",
+      expected_review_revision=saved["review_revision"],
+      expected_pass_nr=3,
+      expected_profile_version="1.0.0",
+      idempotency_key="submission-retry",
+      actor="alice",
+    )
+
+    self.assertEqual(failed["error"], "submission_persist_failed")
+    self.assertEqual(visible["effective_review_state"], "draft")
+    self.assertEqual(visible["submission_operation_state"], "failed")
+    self.assertEqual(recovered["effective_review_state"], "submitted")
+    self.assertEqual(recovered["submission"]["revision"], 1)
+
+  def test_partial_final_registry_write_recovers_without_second_r1fs_write(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner,
+      "job-1",
+      answers=_complete_review_answers(),
+      actor="alice",
+      expected_review_revision=0,
+    )
+    original_hset = owner.chainstore_hset
+    failed_once = {"value": False}
+
+    def fail_final_registry_write(hkey, key, value):
+      if (
+        hkey.endswith(":rulebook_review:submissions")
+        and isinstance(value, dict)
+        and value.get("submissions")
+        and not value.get("pending")
+        and not failed_once["value"]
+      ):
+        failed_once["value"] = True
+        raise RuntimeError("simulated final registry failure")
+      return original_hset(hkey, key, value)
+
+    owner.chainstore_hset = fail_final_registry_write
+    failed = submit_rulebook_review(
+      owner,
+      "job-1",
+      expected_review_revision=saved["review_revision"],
+      expected_pass_nr=3,
+      expected_profile_version="1.0.0",
+      idempotency_key="submission-partial",
+      actor="alice",
+    )
+    owner.chainstore_hset = original_hset
+    recovered = submit_rulebook_review(
+      owner,
+      "job-1",
+      expected_review_revision=saved["review_revision"],
+      expected_pass_nr=3,
+      expected_profile_version="1.0.0",
+      idempotency_key="submission-partial",
+      actor="alice",
+    )
+
+    self.assertEqual(failed["error"], "submission_record_failed")
+    self.assertEqual(recovered["effective_review_state"], "submitted")
+    self.assertEqual(owner.r1fs.add_json.call_count, 1)
+
+  def test_concurrent_duplicate_submission_allocates_one_revision(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner,
+      "job-1",
+      answers=_complete_review_answers(),
+      actor="alice",
+      expected_review_revision=0,
+    )
+
+    def submit():
+      return submit_rulebook_review(
+        owner,
+        "job-1",
+        expected_review_revision=saved["review_revision"],
+        expected_pass_nr=3,
+        expected_profile_version="1.0.0",
+        idempotency_key="submission-concurrent",
+        actor="alice",
+      )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+      results = list(executor.map(lambda _: submit(), range(2)))
+
+    self.assertEqual([result["status"] for result in results], ["ok", "ok"])
+    self.assertEqual(owner.r1fs.add_json.call_count, 1)
+    self.assertEqual(len(get_rulebook_review(owner, "job-1")["submissions"]), 1)
+
+  def test_submit_rejects_stale_revision_pass_and_profile(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner,
+      "job-1",
+      answers=_complete_review_answers(),
+      actor="alice",
+      expected_review_revision=0,
+    )
+
+    stale_revision = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=0, expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="stale-revision", actor="alice",
+    )
+    stale_pass = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=2,
+      expected_profile_version="1.0.0", idempotency_key="stale-pass", actor="alice",
+    )
+    stale_profile = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="0.9.0", idempotency_key="stale-profile", actor="alice",
+    )
+
+    self.assertEqual(stale_revision["error"], "review_revision_conflict")
+    self.assertEqual(stale_pass["error"], "submission_pass_stale")
+    self.assertEqual(stale_profile["error"], "submission_profile_stale")
+
+  def test_reopen_and_resubmit_preserve_both_revisions(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=_complete_review_answers(), actor="alice", expected_review_revision=0,
+    )
+    first = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="revision-1", actor="alice",
+    )
+    reopened = reopen_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], actor="alice",
+    )
+    second = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=reopened["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="revision-2", actor="alice",
+    )
+
+    self.assertEqual(first["submission"]["revision"], 1)
+    self.assertEqual(reopened["effective_review_state"], "draft")
+    self.assertEqual(reopened["review_revision"], 2)
+    self.assertEqual(second["submission"]["revision"], 2)
+    history = get_rulebook_review(owner, "job-1")["submissions"]
+    self.assertEqual([item["revision"] for item in history], [2, 1])
+    self.assertNotEqual(history[0]["cid"], history[1]["cid"])
+
+  def test_newer_scan_evidence_marks_prior_submission_stale(self):
+    owner = _Owner()
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=_complete_review_answers(), actor="alice", expected_review_revision=0,
+    )
+    submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="stale-after-pass", actor="alice",
+    )
+    owner.archive["passes"].append({**_sample_pass_report(), "pass_nr": 4})
+
+    current = get_rulebook_review(owner, "job-1")
+
+    self.assertTrue(current["submissions"][0]["stale"])
+    self.assertEqual(current["submissions"][0]["stale_reasons"], ["newer_scan_pass"])
+
+  def test_formal_submission_redacts_sensitive_review_comments(self):
+    owner = _Owner()
+    answers = _complete_review_answers()
+    answers["nis2.bcm.business_continuity"] = {
+      "value": "unknown",
+      "note": "password=supersecret observed at 10.0.0.4",
+    }
+    saved = save_rulebook_review_draft(
+      owner, "job-1", answers=answers, actor="alice", expected_review_revision=0,
+    )
+    submitted = submit_rulebook_review(
+      owner, "job-1", expected_review_revision=saved["review_revision"], expected_pass_nr=3,
+      expected_profile_version="1.0.0", idempotency_key="redacted-submission", actor="alice",
+    )
+
+    serialized = json.dumps(owner.artifacts[submitted["submission"]["cid"]], sort_keys=True).lower()
+    self.assertNotIn("supersecret", serialized)
+    self.assertNotIn("10.0.0.4", serialized)
+    self.assertIn("<redacted>", serialized)
+    self.assertIn("ip:", serialized)
+
+  def test_legacy_reviewed_records_surface_revision_zero_or_migration(self):
+    owner = _Owner()
+    updated = update_rulebook_review(
+      owner,
+      "job-1",
+      answers=_complete_review_answers(),
+      reviewer="legacy-reviewer",
+      review_state="reviewed",
+    )
+    migration = get_rulebook_review(owner, "job-1")
+    owner.job_specs["rulebook_assessments"] = {
+      DEFAULT_RULEBOOK_PROFILE_ID: {
+        "artifact_cid": "QmLegacyReviewed",
+        "pass_nr": 3,
+        "profile_version": "1.0.0",
+        "schema_version": "1.0.0",
+      },
+    }
+    referenced = get_rulebook_review(owner, "job-1")
+
+    self.assertEqual(updated["review"]["review_state"], "reviewed")
+    self.assertTrue(migration["migration_submission_required"])
+    self.assertEqual(migration["effective_review_state"], "draft")
+    self.assertEqual(referenced["effective_review_state"], "submitted")
+    self.assertEqual(referenced["submissions"][0]["revision"], 0)
+    self.assertTrue(referenced["submissions"][0]["legacy"])
+
   def test_ensure_is_idempotent_for_existing_same_pass_and_force_regenerates(self):
     owner = _Owner()
 
@@ -478,14 +830,45 @@ class TestRulebookAssessment(unittest.TestCase):
     review_key = f"job-1:{DEFAULT_RULEBOOK_PROFILE_ID}"
     owner.records[(f"{owner.cfg_instance_id}:rulebook_review", review_key)] = {"job_id": "job-1"}
     owner.records[(f"{owner.cfg_instance_id}:rulebook_review:audit", review_key)] = [{"job_id": "job-1"}]
+    owner.records[(f"{owner.cfg_instance_id}:rulebook_review:submissions", review_key)] = {
+      "contract_version": "1.0.0",
+      "latest_revision": 2,
+      "submissions": [
+        {"revision": 1, "cid": "QmSubmission1"},
+        {"revision": 2, "cid": "QmSubmission2"},
+      ],
+      "pending": {"cid": "QmPendingSubmission"},
+    }
 
     result = purge_job(owner, "job-1")
 
     self.assertEqual(result["status"], "success")
     self.assertIn("QmRulebookAssessment", owner.artifact_repo.deleted)
     self.assertIn("QmRulebookAssessmentOld", owner.artifact_repo.deleted)
+    self.assertIn("QmSubmission1", owner.artifact_repo.deleted)
+    self.assertIn("QmSubmission2", owner.artifact_repo.deleted)
+    self.assertIn("QmPendingSubmission", owner.artifact_repo.deleted)
     self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review", review_key)])
     self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review:audit", review_key)])
+    self.assertIsNone(owner.records[(f"{owner.cfg_instance_id}:rulebook_review:submissions", review_key)])
+
+  def test_purge_fails_closed_for_submission_cid_shared_with_another_job(self):
+    owner = _Owner(job_specs=_sample_job_specs(job_cid=""))
+    owner.records[(owner.cfg_instance_id, "job-1")] = owner.job_specs
+    hkey = f"{owner.cfg_instance_id}:rulebook_review:submissions"
+    owner.records[(hkey, f"job-1:{DEFAULT_RULEBOOK_PROFILE_ID}")] = {
+      "submissions": [{"revision": 1, "cid": "QmSharedSubmission"}],
+    }
+    owner.records[(hkey, f"job-2:{DEFAULT_RULEBOOK_PROFILE_ID}")] = {
+      "submissions": [{"revision": 1, "cid": "QmSharedSubmission"}],
+    }
+
+    result = purge_job(owner, "job-1")
+
+    self.assertEqual(result["status"], "partial")
+    self.assertEqual(result["cids_deleted"], 0)
+    self.assertNotIn("QmSharedSubmission", owner.artifact_repo.deleted)
+    self.assertIsNotNone(owner.records[(owner.cfg_instance_id, "job-1")])
 
 
 if __name__ == "__main__":

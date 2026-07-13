@@ -50,6 +50,9 @@ from .rulebook_assessment import (
   get_rulebook_assessment_status,
   get_rulebook_review,
   list_rulebook_profiles,
+  reopen_rulebook_review,
+  save_rulebook_review_draft,
+  submit_rulebook_review,
   update_rulebook_review,
 )
 from .opencti_export import (
@@ -283,6 +286,9 @@ __all__ = [
   "list_local_jobs",
   "list_network_jobs",
   "list_rulebook_profiles",
+  "reopen_rulebook_review",
+  "save_rulebook_review_draft",
+  "submit_rulebook_review",
   "maybe_finalize_pass",
   "normalize_common_launch_options",
   "parse_exceptions",
